@@ -616,19 +616,22 @@ class PromoteTests(_Base):
 class ApplyFormatPlanTakesTheSameGateTests(_Base):
     """§15's fourth destroyer path: apply-format-plan with `non_matching='remove'`.
 
-    Structurally the same breach as removing members by hand - it deletes membership rows
-    in bulk - and it is the path whose gate call was added last, so it is the one a
-    regression would most plausibly hit. Mirrors RemovalTakesTheSameGateTests above.
+    **This path can no longer construct a breach, and that is the fix, not a gap**
+    (dev/changelog/890). A strategy now ranks only over buckets holding at least one
+    recording-enabled member, so the winning format always has one - and a member in the
+    winning bucket is never in `non_matching_ids`. The removal therefore always leaves a
+    recording source behind. The gate call stays wired anyway (defense in depth, and
+    CLAUDE.md's rule is that all four paths ask the one function), and
+    `test_the_gate_is_still_asked` holds that wiring down.
     """
 
     def _group(self):
-        """An in-guide group whose ONLY recording-enabled member is the format outlier.
+        """The exact shape that used to strand a group, kept as the fixture.
 
-        Two members at 1280x720@30 with Recording off make `most_channels` pick that
-        format, which leaves the single 1920x1080@60 member as the one to remove - and it
-        is the only one the group can record from. The group keeps members afterwards, so
-        the route's "this would remove every member" check does not fire: that check is a
-        different and weaker question than the invariant's.
+        An in-guide group whose only recording-enabled member is the format outlier: two
+        members at 1280x720@30 with Recording OFF, one at 1920x1080@60 with Recording ON.
+        `most_channels` used to pick 720p30 on raw membership - a bucket holding nothing
+        the group could record from - and then offer to delete the one member that could.
         """
         from app import db
         hd = make_channel(self.acct, name='HD')
@@ -649,36 +652,35 @@ class ApplyFormatPlanTakesTheSameGateTests(_Base):
         return self.client.post(
             f'/api/channel-groups/{group.id}/apply-format-plan', json=body)
 
-    def test_removing_the_last_enabled_member_is_refused_without_confirm(self):
-        from app import db
-        grp, hd = self._group()
-        resp = self._apply(grp)
-        self.assertEqual(409, resp.status_code, _json(resp))
-        self.assertIn('confirm_required', _json(resp))
-        db.session.expire_all()
-        self.assertEqual(3, len(list(grp.memberships)), 'a refused plan removes nothing')
-        self.assertTrue(grp.in_guide)
+    def test_the_only_recording_source_is_never_the_member_removed(self):
+        """dev/docs/BUGS.md 2026-09-09 07:02. The 2-vs-1 majority does not win the lock.
 
-    def test_confirming_removes_the_member_and_the_guide_row_together(self):
+        `most_channels` sees two 720p30 members and one 1080p60 member, but the group
+        records only from the 1080p60 one, so 720p30 is not a candidate at all. The plan
+        keeps HD and removes the two members that were never recording sources.
+        """
         from app import db
         grp, hd = self._group()
         resp = self._apply(grp, confirm=True)
         self.assertEqual(200, resp.status_code, _json(resp))
-        self.assertTrue(_json(resp)['left_guide'])
+        self.assertEqual('1920x1080', _json(resp)['format']['resolution'])
         db.session.expire_all()
-        self.assertNotIn(hd.id, [m.channel_id for m in grp.memberships])
-        self.assertEqual(2, len(list(grp.memberships)))
-        self.assertFalse(grp.in_guide)
+        self.assertEqual([hd.id], [m.channel_id for m in grp.memberships])
+        self.assertTrue(grp.in_guide, 'nothing was stranded, so nothing was demoted')
+        self.assertFalse(_json(resp)['left_guide'])
 
-    def test_the_demotion_is_logged_like_every_other_one(self):
-        from app.database import ChannelGroupEvent, GROUP_GUIDE_REMOVED
-        grp, _ = self._group()
-        self._apply(grp, confirm=True)
-        self.assertEqual(1, ChannelGroupEvent.query.filter_by(
-            group_id=grp.id, event_type=GROUP_GUIDE_REMOVED).count())
+    def test_no_confirm_is_demanded_because_nothing_is_stranded(self):
+        """The 409 the old ranking forced was a dialog about damage the user never had to
+        accept - the plan simply removes the members that are not recording sources."""
+        grp, _hd = self._group()
+        resp = self._apply(grp)
+        self.assertEqual(200, resp.status_code, _json(resp))
+        self.assertNotIn('confirm_required', _json(resp))
 
-    def test_a_live_capture_refuses_outright_and_confirm_does_not_override(self):
-        """§15.1 again. A plan is not a reason to kill a recording either."""
+    def test_a_live_capture_is_untouched_when_the_plan_cannot_strand_it(self):
+        """§15.1's refusal exists for a plan that would empty the recording-enabled set.
+        This one cannot, and the member being recorded is the one the plan keeps, so the
+        capture is not a reason to refuse work that does not threaten it."""
         from app import db
         grp, hd = self._group()
         make_recording(status='IN_PROGRESS', group_id=grp.id, channel_id=hd.id,
@@ -686,12 +688,47 @@ class ApplyFormatPlanTakesTheSameGateTests(_Base):
         db.session.commit()
 
         resp = self._apply(grp, confirm=True)
-        self.assertEqual(409, resp.status_code, _json(resp))
-        self.assertIn('recording_in_progress', _json(resp))
-        self.assertNotIn('confirm_required', _json(resp))
+        self.assertEqual(200, resp.status_code, _json(resp))
         db.session.expire_all()
-        self.assertEqual(3, len(list(grp.memberships)))
+        self.assertIn(hd.id, [m.channel_id for m in grp.memberships])
         self.assertTrue(grp.in_guide)
+
+    def test_the_gate_is_still_asked(self):
+        """CLAUDE.md: all four destroyer paths go through `_invariant_gate`, and a route
+        that counted members its own way has reintroduced the breach.
+
+        The ranking fix means no real input reaches a breach through this path any more,
+        so the wiring is what is asserted: with the invariant check reporting a breach,
+        the route must refuse rather than carry on. Without the call this test goes green
+        on a 200 and §15 is silently unenforced here.
+        """
+        from unittest.mock import patch
+        grp, hd = self._group()
+        breach = {'breaches': True, 'live': [], 'in_guide': True,
+                  'losing': [hd], 'scheduled': [], 'remaining': []}
+        with patch('app.routes.channel_groups.guide_invariant_check',
+                   return_value=breach):
+            resp = self._apply(grp)
+        self.assertEqual(409, resp.status_code, _json(resp))
+        self.assertIn('confirm_required', _json(resp))
+
+    def test_every_recording_member_unhealthy_is_refused_with_the_reason(self):
+        """dev/docs/BUGS.md 2026-09-09 07:02. A group whose recording-enabled members have
+        no usable measurement has no candidate format, and the 400 says which of the three
+        no-winner situations it is rather than one sentence covering all of them."""
+        from app import db
+        hd = make_channel(self.acct, name='HD')
+        sd = make_channel(self.acct, name='SD')
+        make_channel_test(hd, all_null=False, status='FAILED', connected=False)
+        make_channel_test(sd, all_null=False, status='COMPLETED', connected=True,
+                          resolution='1280x720', fps=30.0, bitrate_kbps=5000)
+        grp = make_group(name='G2', members=[hd, sd], recording=True, disabled=[sd.id])
+        db.session.commit()
+
+        resp = self.client.post(f'/api/channel-groups/{grp.id}/apply-format-plan',
+                                json={'strategy': 'most_channels', 'non_matching': 'keep'})
+        self.assertEqual(400, resp.status_code, _json(resp))
+        self.assertIn('set to record from', _json(resp)['error'].lower())
 
     def test_the_keep_path_is_never_gated(self):
         """'keep' removes nothing, so it cannot empty anything - the lock filters instead

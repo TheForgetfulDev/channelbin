@@ -23,7 +23,7 @@ PLAN_JS = os.path.join(REPO, 'static', 'js', 'format-plan.js')
 _EXPORTS = ('formatPlanOptionLabel, formatPlanTable, FORMAT_STRATEGY_KEYS, '
             'GROUP_FORMAT_STRATEGIES, groupStrategyLabel, groupStrategyHelp, '
             'groupStrategyManagesFormat, formatPlanEntry, formatPlanSummary, '
-            'formatPlanPinSelect')
+            'formatPlanPinSelect, formatPlanCounts, formatPlanStatus, fetchFormatPlan')
 
 _HARNESS = f"""
 const fs = require('fs');
@@ -40,15 +40,35 @@ console.log(JSON.stringify(eval(process.argv[2])));
 # tests/test_format_selection.py uses server-side.
 _PLAN = ('{buckets: ['
          '{key: ["1920x1080", 60], label: "1920x1080 @ 60", resolution: "1920x1080", fps: 60, '
-         'pixels: 2073600, channel_ids: [1, 2], count: 27, median_bitrate_kbps: 3740, median_bpp: 0.03}, '
+         'pixels: 2073600, channel_ids: [1, 2], count: 27, rank_count: 27, pass_count: 27, '
+         'warn_count: 0, median_bitrate_kbps: 3740, median_bpp: 0.03}, '
          '{key: ["1280x720", 60], label: "1280x720 @ 60", resolution: "1280x720", fps: 60, '
-         'pixels: 921600, channel_ids: [3], count: 22, median_bitrate_kbps: null, median_bpp: null}], '
+         'pixels: 921600, channel_ids: [3], count: 22, rank_count: 22, pass_count: 22, '
+         'warn_count: 0, median_bitrate_kbps: null, median_bpp: null}], '
          'strategies: {'
          'highest_bitrate: {key: ["1920x1080", 60], label: "1920x1080 @ 60", resolution: "1920x1080", '
-         'fps: 60, channel_ids: [1, 2], count: 27, rationale: "27 healthy channels at a median 3.74 Mb/s"}, '
+         'fps: 60, channel_ids: [1, 2], count: 27, rank_count: 27, pass_count: 27, warn_count: 0, '
+         'rationale: "27 recordable channels at a median 3.74 Mb/s"}, '
          'balanced: {key: null, label: null, resolution: null, fps: null, channel_ids: [], count: 0, '
+         'rank_count: 0, pass_count: 0, warn_count: 0, '
          'rationale: "No format has enough healthy channels to build a group on."}'
          '}}')
+
+# The group-5 shape: a big bucket the group records from none of, and a smaller one it
+# records from entirely. `rank_total` differs from `total`, which is what puts the
+# consequence line onto the recording population.
+_NARROWED = ('{total: 105, rank_total: 29, rank_measured: 26, buckets: ['
+             '{key: ["1280x720", 30], label: "1280x720 @ 30", resolution: "1280x720", fps: 30, '
+             'pixels: 921600, channel_ids: [1], count: 40, rank_count: 0, pass_count: 40, '
+             'warn_count: 0, median_bitrate_kbps: 3691, median_bpp: null}, '
+             '{key: ["1920x1080", 60], label: "1920x1080 @ 60", resolution: "1920x1080", fps: 60, '
+             'pixels: 2073600, channel_ids: [2], count: 26, rank_count: 26, pass_count: 0, '
+             'warn_count: 26, median_bitrate_kbps: 3439, median_bpp: null}], '
+             'strategies: {'
+             'highest_bitrate: {key: ["1920x1080", 60], label: "1920x1080 @ 60", '
+             'resolution: "1920x1080", fps: 60, channel_ids: [2], count: 26, rank_count: 26, '
+             'pass_count: 0, warn_count: 26, rationale: "26 recordable channels"}'
+             '}}')
 
 
 @unittest.skipIf(shutil.which('node') is None, 'node not installed')
@@ -272,6 +292,132 @@ class PinSelectTests(_Base):
         html = self.evaluate("formatPlanPinSelect('p', {buckets: []}, null)")
         self.assertIn('disabled', html)
         self.assertIn('No format measured yet', html)
+
+
+class CountDisclosureTests(_Base):
+    """dev/docs/BUGS.md 2026-09-09 07:02, raised against group 7's picker: the
+    dropdown offered "Highest bitrate - 3840x2160 @ 50 (5 channels)" where all five were
+    warning, and turning Recording off on all five left the same "5 channels" on screen.
+    A count the user cannot act on is worth less than none (product principle 1)."""
+
+    def test_a_recording_count_that_matches_the_total_is_not_repeated(self):
+        got = self.evaluate(f"formatPlanOptionLabel({_PLAN}, 'highest_bitrate')")
+        self.assertEqual('Highest bitrate - 1920x1080 @ 60 (27 channels)', got)
+
+    def test_a_differing_recording_count_is_named(self):
+        plan = _PLAN.replace('count: 27, rank_count: 27', 'count: 27, rank_count: 4')
+        got = self.evaluate(f"formatPlanOptionLabel({plan}, 'highest_bitrate')")
+        self.assertIn('27 channels, 4 recording', got)
+
+    def test_an_all_warning_winner_says_so_in_the_option_itself(self):
+        got = self.evaluate(f"formatPlanOptionLabel({_NARROWED}, 'highest_bitrate')")
+        self.assertIn('all warning', got)
+
+    def test_a_mixed_bucket_does_not_claim_all_warning(self):
+        plan = _PLAN.replace('pass_count: 27, warn_count: 0',
+                             'pass_count: 20, warn_count: 7')
+        got = self.evaluate(f"formatPlanOptionLabel({plan}, 'highest_bitrate')")
+        self.assertNotIn('warning', got)
+
+    def test_counts_render_for_the_two_synthesized_entries_too(self):
+        """`manual` and `highest_score` are answered client-side from a bucket lookup, and
+        they carry the same fields so one formatter describes all eight values."""
+        manual = self.evaluate(
+            f"formatPlanEntry({_NARROWED}, 'manual', '1920x1080 @ 60', null)")
+        self.assertEqual(26, manual['count'])
+        self.assertEqual(0, manual['pass_count'])
+        score = self.evaluate(
+            f"formatPlanEntry({_NARROWED}, 'highest_score', null, '1280x720 @ 30')")
+        self.assertEqual(0, score['rank_count'])
+
+    def test_a_pin_no_bucket_matches_reports_zeros_rather_than_undefined(self):
+        entry = self.evaluate(f"formatPlanEntry({_PLAN}, 'manual', '640x480 @ 24', null)")
+        self.assertEqual(0, entry['count'])
+        self.assertEqual(0, entry['rank_count'])
+
+
+class StatusColumnTests(_Base):
+    """The bucket table has to show the pass/warn split, because a WARN counts toward the
+    format decision and the row is the only place that fact can be seen."""
+
+    def test_all_warning_is_called_out(self):
+        html = self.evaluate(f"formatPlanTable({_NARROWED}, 'highest_bitrate')")
+        self.assertIn('fp-all-warn', html)
+        self.assertIn('26 warn', html)
+
+    def test_a_clean_bucket_reads_as_pass(self):
+        self.assertEqual('27 pass', self.evaluate(
+            "formatPlanStatus({pass_count: 27, warn_count: 0})"))
+
+    def test_a_mixed_bucket_names_both(self):
+        self.assertEqual('20 pass, 7 warn', self.evaluate(
+            "formatPlanStatus({pass_count: 20, warn_count: 7})"))
+
+    def test_a_bucket_the_group_cannot_record_from_is_dimmed_not_hidden(self):
+        """It is the answer to "why did the 40-channel format lose to the 26-channel
+        one", so removing it from the table would remove the explanation."""
+        html = self.evaluate(f"formatPlanTable({_NARROWED}, 'highest_bitrate')")
+        self.assertIn('fp-unrankable', html)
+        self.assertIn('1280x720 @ 30', html)
+        self.assertIn('data-tip', html)
+
+    def test_recordable_buckets_sort_above_unrecordable_ones(self):
+        html = self.evaluate(f"formatPlanTable({_NARROWED}, 'highest_bitrate')")
+        self.assertLess(html.index('1920x1080 @ 60'), html.index('1280x720 @ 30'),
+                        'the 26-channel candidate must outrank the 40-channel non-candidate')
+
+
+class NarrowedSummaryTests(_Base):
+    """When the server ranked over the recording-enabled members, the consequence line
+    describes THAT population - "records from 26 of 105 members" describes a group whose
+    other 79 members were never recording sources."""
+
+    def test_the_sentence_counts_members_set_to_record(self):
+        got = self.evaluate(f"formatPlanSummary({_NARROWED}, 'highest_bitrate', null, null, 105, 90)")
+        self.assertIn('Records from 26 of 29 members set to record.', got)
+
+    def test_the_split_uses_the_servers_measured_count_not_the_callers(self):
+        """rank_measured is 26 of 29, so 3 are untested and none measures a different
+        format. The caller's own 90-of-105 would have claimed 64 mismatches."""
+        got = self.evaluate(f"formatPlanSummary({_NARROWED}, 'highest_bitrate', null, null, 105, 90)")
+        self.assertIn('3 have never been tested', got)
+        self.assertNotIn('different format', got)
+
+    def test_an_unnarrowed_plan_still_trusts_the_caller(self):
+        """The create/clone preview edits a kept set the server has never seen, so its own
+        counts must keep winning there."""
+        got = self.evaluate(f"formatPlanSummary({_PLAN}, 'highest_bitrate', null, null, 30, 27)")
+        self.assertIn('Records from 27 of 30 members.', got)
+
+    def test_no_winner_repeats_the_servers_specific_reason(self):
+        """Three situations produce no winner and take three different actions to fix, so
+        the client must not flatten them back into one sentence."""
+        plan = ('{buckets: [{label: "x", count: 1, rank_count: 0, pass_count: 1, warn_count: 0}], '
+                'strategies: {highest_bitrate: {key: null, count: 0, '
+                'rationale: "No measured format holds a member this group is set to record from."}}}')
+        got = self.evaluate(f"formatPlanSummary({plan}, 'highest_bitrate', null, null, 5, 5)")
+        self.assertIn('set to record from', got)
+
+
+class FetchScopeTests(_Base):
+    """dev/docs/BUGS.md 2026-09-09 07:02 - the preview must read what the engine reads, so
+    the endpoint is never asked for one job's results."""
+
+    def test_no_job_id_is_ever_sent(self):
+        self.assertEqual('/api/channel-groups/7/format-plan',
+                         self.evaluate('(() => { let u; global.jsonFetch = (x) => { u = x; }; '
+                                       'fetchFormatPlan(7); return u; })()'))
+        self.assertEqual('/api/channel-groups/7/format-plan',
+                         self.evaluate('(() => { let u; global.jsonFetch = (x) => { u = x; }; '
+                                       'fetchFormatPlan(7, {jobId: 3}); return u; })()'))
+
+    def test_the_clone_preview_opts_out_of_the_recording_narrowing(self):
+        """A clone's members all start Recording-off, so its own engine ranks over
+        everyone and a preview narrowed to the SOURCE group's recording-enabled members
+        would describe neither group."""
+        self.assertEqual('/api/channel-groups/7/format-plan?rank_scope=all',
+                         self.evaluate('(() => { let u; global.jsonFetch = (x) => { u = x; }; '
+                                       "fetchFormatPlan(7, {rankScope: 'all'}); return u; })()"))
 
 
 if __name__ == '__main__':

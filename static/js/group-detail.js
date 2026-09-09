@@ -1950,14 +1950,22 @@
   // "measures a different format, so it is skipped" apart from "never tested, so it is
   // still eligible" - the two behave differently and one number covering both was wrong
   // in the direction that matters (dev/changelog/757).
+  //
+  // Taken from the plan, not from ROWS: the rows are scoped to the attached health check
+  // while the lock is decided from each member's own latest test, so counting them here
+  // answered a different question than the sentence it appears in (dev/changelog/890).
   function measuredMemberCount() {
-    return ROWS.filter(r => (r.last_test || {}).resolution).length;
+    return fmtEdit.plan ? fmtEdit.plan.rank_measured : null;
   }
 
   function drawFormatBlock(host, focus) {
     const strategy = fmtEdit.strategy;
     const manages = groupStrategyManagesFormat(strategy);
-    const derived = G.lockLabel || G.referenceLabel || null;
+    // The format the group's DATA points at, never its lock. `G.lockLabel ||
+    // G.referenceLabel` was used here and labelled "Healthiest member's format" with the
+    // group's existing lock - on a group locked to 3840x2160 @ 50 it offered that back
+    // while the healthiest member measured 1920x1080 @ 50 (dev/changelog/890).
+    const derived = G.derivedReferenceLabel || null;
     const plan = fmtEdit.plan;
     let h = `<fieldset class="gd-fset${focus === 'format' ? ' hi' : ''}">` +
       '<div class="gd-fset-head">Format</div>';
@@ -2090,7 +2098,7 @@
       fmtEdit.plan = null;
       fmtEdit.planState = 'loading';
       drawFormatBlock(fmtHost, focus);
-      fetchFormatPlan(G.groupId, G.jobId)
+      fetchFormatPlan(G.groupId)
         .then(plan => { fmtEdit.plan = plan; fmtEdit.planState = 'ready'; })
         .catch(() => { fmtEdit.planState = 'error'; })
         // Redrawn either way: leaving the picker stuck on "Loading..." because the plan
@@ -2613,7 +2621,7 @@
       groupId: G.groupId,
       groupName: G.groupName,
       rows: ROWS,
-      derived: G.lockLabel || G.referenceLabel || null,
+      derived: G.derivedReferenceLabel || null,
       inGuide: !!G.inGuide,
       trigger,
       pendingIds: pendingIds || [],
@@ -2791,6 +2799,9 @@
         // is no longer locked to.
         G.referenceLabel = data.reference_label;
         G.lockLabel = data.lock_label;
+        // Moves for the same reason and is a different value: the format the data alone
+        // points at, which is what "Healthiest member's format" follows.
+        G.derivedReferenceLabel = data.derived_reference_label;
         // Same reason as the lock label above, one level up: moving a Recording switch
         // changes who is format-blocked, which formats the group spans and which EPG ids
         // are in play, so §16's banners are re-decided server-side on every refresh

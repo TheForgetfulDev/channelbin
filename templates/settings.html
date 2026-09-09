@@ -393,6 +393,12 @@
       {{ field_number('watchdog.max_consecutive_failures', 'Max consecutive failures',
          'Abort the recording after this many consecutive restarts with no progress. Resets on any successful restart.',
          '10', wd.get('max_consecutive_failures', 10)) }}
+      {{ field_number('watchdog.stall_move_count', 'Stalls before moving to another member',
+         'Move a group recording onto another member of its group once the one it is on stalls this many times inside the window below, even though every restart succeeds - the case none of the other limits catch, because a successful restart resets them. The member is demoted rather than dropped: it ranks below the members not yet moved off and stays selectable, so a small group cycles back around to it. 0 turns this off.',
+         '3', wd.get('stall_move_count', 3)) }}
+      {{ field_number('watchdog.stall_move_window_minutes', 'Stall window (minutes)',
+         'The rolling window those stalls must fall inside. A wider window is a looser trigger, not a stricter one - the count is the same and there is more time to reach it.',
+         '30', wd.get('stall_move_window_minutes', 30)) }}
       {{ field_number('watchdog.early_fail_window_seconds', 'Dead-stream: early-failure window (seconds)',
          'A segment that stalls within this many seconds of starting is a candidate "early failure" for dead-stream detection.',
          '60', wd.get('early_fail_window_seconds', 60)) }}

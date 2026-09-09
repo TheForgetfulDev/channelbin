@@ -133,6 +133,11 @@ CHANNEL_UNGROUPED               = 'CHANNEL_UNGROUPED'
 # member when a group-backed recording fails over mid-flight - the score hit that member
 # takes is otherwise invisible on its own Activity Timeline (dev/docs/BUGS.md 2026-08-10).
 CHANNEL_FAILOVER_HEALTH_OBSERVATION = 'CHANNEL_FAILOVER_HEALTH_OBSERVATION'
+# The sibling of the above for a member a recording moved off VOLUNTARILY because it kept
+# stalling (dev/changelog/889). A separate type because the two carry different scores and
+# mean different things: that one is the recording fail floor on a feed that died, this one
+# is the member's own measured share on a feed that was still delivering.
+CHANNEL_STALL_DEMOTION_HEALTH_OBSERVATION = 'CHANNEL_STALL_DEMOTION_HEALTH_OBSERVATION'
 # Written by _write_channel_url_drift_events (app/accounts.py) for every channel a sync
 # rewrote Channel.stream_url on (DESIGN-url-drift.md 4/3) - the per-channel counterpart to
 # the account-level PROVIDER_URLS_CHANGED alert, which only fires above a channel-count
@@ -239,6 +244,11 @@ class RecordingProfile(db.Model):
     stall_timeout_seconds     = db.Column(db.Integer)
     restart_delay_seconds     = db.Column(db.Integer)
     max_consecutive_failures  = db.Column(db.Integer)
+    # None = use global watchdog.stall_move_count / stall_move_window_minutes. The
+    # stall-rate demotion trigger (dev/changelog/889); 0 on the count disables it for
+    # this profile even when a global trigger is set.
+    stall_move_count          = db.Column(db.Integer)
+    stall_move_window_minutes = db.Column(db.Integer)
     # None = use global recording.retention_days; 0 = never auto-delete (overrides a
     # nonzero global back to "keep forever" for this profile's recordings)
     retention_days            = db.Column(db.Integer)

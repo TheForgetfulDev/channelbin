@@ -1645,6 +1645,23 @@ def _m048_channel_standing_index(conn, cur):
                 'ON channels (hidden, in_guide, url_normalizable, account_id, health_score)')
 
 
+def _m049_profile_stall_move_trigger(conn, cur):
+    """recording_profiles: stall_move_count/stall_move_window_minutes, the per-profile
+    override of the stall-rate demotion trigger (dev/changelog/889), same nullable
+    "None = use the global watchdog.* value" convention as the three columns beside them.
+
+    Guarded ADD COLUMN, idempotent. No backfill and no obligation to register
+    (dev/changelog/686): NULL is exactly what an existing profile should mean here - it
+    inherits the global trigger, which is what it did before the columns existed."""
+    existing = {row[1] for row in cur.execute(
+        'PRAGMA table_info(recording_profiles)').fetchall()}
+    if 'stall_move_count' not in existing:
+        cur.execute('ALTER TABLE recording_profiles ADD COLUMN stall_move_count INTEGER')
+    if 'stall_move_window_minutes' not in existing:
+        cur.execute(
+            'ALTER TABLE recording_profiles ADD COLUMN stall_move_window_minutes INTEGER')
+
+
 SCHEMA_MIGRATIONS = [
     (1, 'baseline: pre-versioning additive migrations + backfills', _m001_baseline),
     (2, 'recordings: program_title/program_sub_title snapshot columns + backfill', _m002_program_title),
@@ -1730,6 +1747,8 @@ SCHEMA_MIGRATIONS = [
      'alerts; the state is per-membership now', _m047_drop_channel_scoped_format_events),
     (48, 'channels: ix_channels_standing, the standing breakdown\'s covering index',
      _m048_channel_standing_index),
+    (49, 'recording_profiles: stall_move_count/stall_move_window_minutes, the per-profile '
+     'stall-rate demotion trigger', _m049_profile_stall_move_trigger),
 ]
 
 CURRENT_SCHEMA_VERSION = SCHEMA_MIGRATIONS[-1][0]

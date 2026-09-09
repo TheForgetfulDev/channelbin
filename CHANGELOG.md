@@ -5,6 +5,33 @@ Notable changes to ChannelBin, newest first. This project follows
 release is tagged `v<version>` in git, and the version the app is running is shown in the
 page footer.
 
+## 0.4.1 - 2026-09-09
+
+**Added**
+
+- Recordings from a channel group now move to another member when the one they are on keeps
+  stalling, even when every restart succeeds. Previously only a feed that stopped answering
+  triggered failover, so a feed that stalled constantly and always came back never did. The
+  trigger is a rate (by default 3 stalls within 30 minutes, configurable globally and per
+  recording profile), and the member being left is demoted rather than dropped, so it stays
+  selectable if nothing better is available.
+
+**Fixed**
+
+- Deleting a recording whose conversion had failed left the partial output file and the
+  conversion scratch files on disk, with nothing in the app pointing at them. For a long
+  recording that could be several gigabytes. Both are now removed with the rest of the
+  recording.
+- A channel group's format lock could be won by a format that none of the members the group
+  actually records from had, because the ranking counted every member rather than the
+  recording-enabled ones.
+- The format strategy picker previewed a different set of health check results than the
+  engine ranked on, so its preview could disagree with the lock that was applied.
+- The "Healthiest member's format" option was labeled with the group's existing lock instead
+  of that member's measured format, and a bucket whose channels were all in warning was
+  described as healthy.
+- A bucket that cannot be ranked now dims, as the rest of the list already did.
+
 ## 0.4.0 - 2026-09-08
 
 Initial public release.

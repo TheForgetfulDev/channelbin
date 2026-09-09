@@ -128,6 +128,16 @@ const RECORDING_PROFILE_SECTIONS = [
         inheritable: true,
         meta: 'How many restarts in a row may fail before the recording is given up on ' +
           'and marked FAILED.' },
+      { key: 'stall_move_count', label: 'Stalls before moving on', type: 'int',
+        inheritable: true,
+        meta: 'For a recording from a channel group: how many stalls the current member ' +
+          'may take inside the window below before the recording moves to another ' +
+          'member, even when every restart works. The member is demoted, not dropped - ' +
+          'a small group cycles back around to it. 0 turns this off.' },
+      { key: 'stall_move_window_minutes', label: 'Stall window', type: 'int',
+        inheritable: true, unit: ' min',
+        meta: 'The rolling window those stalls have to fall inside. Wider is a looser ' +
+          'trigger, not a stricter one.' },
     ],
   },
   {

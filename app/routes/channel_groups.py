@@ -13,7 +13,7 @@ from ..database import (
     Channel, ChannelGroup, ChannelGroupMember, ChannelEvent, ChannelTest, Tag,
     Recording, RecordingEvent, HealthCheckProfile, OnDemandTestJob,
     CHANNEL_GROUPED, CHANNEL_UNGROUPED, GROUP_MEMBER_SELECTED, GROUP_FAILOVER,
-    CHANNEL_FAILOVER_HEALTH_OBSERVATION,
+    CHANNEL_FAILOVER_HEALTH_OBSERVATION, CHANNEL_STALL_DEMOTION_HEALTH_OBSERVATION,
     ChannelGroupEvent,
     GROUP_FORMAT_STRATEGIES,
     GROUP_FORMAT_HEALTH_CHECK_ONLY, GROUP_FORMAT_MANUAL,
@@ -27,6 +27,7 @@ from ..accounts import (
 )
 from ..channel_groups import (
     effective_score, rank_members, suggest_candidates, group_reference_key,
+    derived_reference_key, lock_ranking_ids,
     classify_group_formats, group_format_outliers, format_key, format_label,
     member_channels, recording_members, test_member_ids, pick_best_member,
     participation_is_recording, participating_member_ids, group_manages_format,
@@ -724,7 +725,8 @@ def _build_group_timeline(group, pinned_job=None):
                   .filter(ChannelEvent.channel_id.in_(member_ids))
                   .filter(ChannelEvent.event_type.in_(
                       [CHANNEL_GROUPED, CHANNEL_UNGROUPED,
-                       CHANNEL_FAILOVER_HEALTH_OBSERVATION])).all()):
+                       CHANNEL_FAILOVER_HEALTH_OBSERVATION,
+                       CHANNEL_STALL_DEMOTION_HEALTH_OBSERVATION])).all()):
             extra = json.loads(e.extra_data) if e.extra_data else {}
             entries.append({'kind': 'channel_event', 'ts': e.timestamp, 'obj': e,
                             'source': names[e.channel_id], 'source_url': urls[e.channel_id],
@@ -933,14 +935,31 @@ def group_detail_rows(group, job):
         channel_ids = [ch.id for ch in channels]
         latest = _latest_tests_by_channel(channel_ids, for_job_id=job.id if job else ANY_JOB)
 
-    ref_key = group_reference_key(group, memberships, latest, streak_threshold) if stored else None
-    _, outliers = (group_format_outliers(channels, latest, reference_key=ref_key,
+    # Two maps, deliberately. `latest` is scoped to the attached check and is what the
+    # ROWS render - the table's job scope is a real feature. `latest_any` is each
+    # channel's own newest test whatever produced it, and every lock-derived fact below
+    # reads it, because that is what the recorder, evaluate_and_reconcile_group() and
+    # apply_format_strategy() read. Deriving them from the job-scoped map made this page
+    # answer "which members may serve" differently from the code that actually serves
+    # them - a disagreement the user sees as a page claiming nobody is blocked while
+    # every recording falls through the zero-survivor override (dev/changelog/890,
+    # CLAUDE.md "Format lock filters, health score ranks"). Reuses `latest` outright when
+    # there is no job to scope to, so the second query only exists when the two differ.
+    latest_any = latest if job is None else _latest_tests_by_channel(channel_ids,
+                                                                    for_job_id=ANY_JOB)
+
+    ref_key = (group_reference_key(group, memberships, latest_any, streak_threshold)
+               if stored else None)
+    derived_ref_key = (derived_reference_key(memberships, latest_any, streak_threshold)
+                       if stored else None)
+    _, outliers = (group_format_outliers(channels, latest_any, reference_key=ref_key,
                                          streak_threshold=streak_threshold)
                    if stored else (None, []))
     outlier_ids = {ch.id for ch in outliers}
     best_active_id = None
     if stored:
-        best = pick_best_member(recording_members(memberships), latest, streak_threshold=streak_threshold)
+        best = pick_best_member(recording_members(memberships), latest_any,
+                                streak_threshold=streak_threshold)
         best_active_id = best.id if best else None
 
     # Which members the format lock would drop at selection time, asked of the one helper
@@ -951,7 +970,7 @@ def group_detail_rows(group, job):
     format_blocked_ids = set()
     format_override = False
     if stored:
-        sel = format_eligible_members(group, recording_members(memberships), latest)
+        sel = format_eligible_members(group, recording_members(memberships), latest_any)
         format_blocked_ids = {ch.id for ch in sel.filtered}
         format_override = sel.override
     recording_ids = {m.channel_id for m in memberships if m.recording_enabled}
@@ -1021,17 +1040,24 @@ def group_detail_rows(group, job):
         # actually filtered this member rather than a value nothing enforces.
         'lock_label': (format_label(group.locked_format_key)
                        if stored and group.locked_format_key else None),
+        # What the data alone points at, with any lock ignored - the format the
+        # `highest_score` strategy would follow. Separate from both of the above because
+        # the settings picker labelled that strategy from `lock_label or reference_label`
+        # and so named the group's existing lock back at it (dev/changelog/890).
+        'derived_reference_label': format_label(derived_ref_key) if derived_ref_key else None,
         'mismatch_count': len(outlier_ids),
         'unmonitored_count': sum(1 for ch in channels if ch.id not in monitored_ids) if stored else 0,
-        'warnings': _banner_facts(group, channels, latest, recording_ids,
+        'warnings': _banner_facts(group, channels, latest_any, recording_ids,
                                   format_blocked_ids, format_override, best_active_id,
-                                  monitored_ids, job is not None, ref_key)
+                                  monitored_ids, job is not None, ref_key,
+                                  lock_ranking_ids(memberships) if stored else None)
         if stored else None,
     }
 
 
 def _banner_facts(group, channels, latest, recording_ids, format_blocked_ids,
-                  format_override, best_active_id, monitored_ids, has_check, ref_key):
+                  format_override, best_active_id, monitored_ids, has_check, ref_key,
+                  rank_ids=None):
     """Everything section 16's warning banners need, decided server-side.
 
     The banners are gated and counted here rather than in group-detail.js because every
@@ -1043,6 +1069,11 @@ def _banner_facts(group, channels, latest, recording_ids, format_blocked_ids,
     disabled then no need to show the same warnings, because it isn't set to record
     anyways" - a member sitting out is not part of what this group would record, so it is
     not part of what a warning about that recording describes.
+
+    `latest` is the ANY_JOB map, not the job-scoped one the rows render: every banner here
+    describes what the lock and the recorder would do, and those read each member's own
+    newest test whatever job produced it (dev/changelog/890). `rank_ids` narrows the
+    strategy ranking the same way apply_format_strategy() narrows it.
 
     Every value is derived from data the caller already loaded; nothing here queries."""
     recording = [ch for ch in channels if ch.id in recording_ids]
@@ -1063,8 +1094,11 @@ def _banner_facts(group, channels, latest, recording_ids, format_blocked_ids,
     # GROUP_FORMAT_STRATEGY_BLOCKED event written on the way into it. Right after a
     # database wipe every group is here, so a banner that only appeared at the transition
     # would be missing for exactly the users who need it. Same pure engine call
-    # apply_format_strategy() makes, over the same member list, so the two agree.
-    plan = strategy_lock_plan(group, channels, latest)
+    # apply_format_strategy() makes, over the same member list AND the same ranking
+    # population, so the two agree - passing everything here while the engine ranked over
+    # the recording-enabled members is how this banner came to describe a different
+    # group's lock than the one on the row (dev/changelog/890).
+    plan = strategy_lock_plan(group, channels, latest, rank_ids=rank_ids)
     entry = plan['entry'] or {}
     no_winner = plan['manages_lock'] and entry.get('key') is None
 
@@ -1380,23 +1414,36 @@ def group_detail_rows_api(group_id):
 def group_format_plan(group_id):
     """Read-only: for each auto-select-format strategy, which video format wins and
     why, over the group's current members (or a check-only group's computed target
-    channels). Resolves membership exactly the way group_detail_rows does, so this can
-    never disagree with the table the user is looking at. `job_id` is optional - the
-    create-group modal opens without one (no attached health check yet), in which case
-    ANY_JOB scopes to each channel's own latest test regardless of job."""
+    channels).
+
+    **Always scoped ANY_JOB, and always ranked over the lock population.** This endpoint
+    exists to answer "what would applying this strategy do", and apply_format_strategy()
+    is the thing that would do it - so it reads what that reads or it is previewing a
+    different app. It used to take a `job_id` and narrow to that health check's results,
+    which is right for the member TABLE and wrong here: on group 5 the job-scoped view
+    ranked 1080p60 first at a median 3957 kbps while the engine's any-job view ranked
+    720p30 first, and refreshing never reconciled them because they were not stale copies
+    of one answer (dev/changelog/890).
+
+    `rank_scope=all` opts out of the recording-enabled narrowing, for the clone preview:
+    a clone's members are all Recording-off by model default, so the new group's own
+    engine will rank over everyone and a preview narrowed to the SOURCE's recording-enabled
+    members would describe neither group."""
     group = db.session.get(ChannelGroup, group_id)
     if group is None:
         return jsonify({'error': 'Group not found'}), 404
 
+    memberships = list(group.memberships)
     if group.is_system:
         channels, _excluded_ids = check_target_channels(group)
+        rank_ids = None
     else:
-        channels = member_channels(list(group.memberships))
+        channels = member_channels(memberships)
+        rank_ids = (None if request.args.get('rank_scope') == 'all'
+                    else lock_ranking_ids(memberships))
 
-    job_id = request.args.get('job_id', type=int)
-    latest = _latest_tests_by_channel(
-        [ch.id for ch in channels], for_job_id=job_id if job_id is not None else ANY_JOB)
-    plan = plan_format_selection(channels, latest)
+    latest = _latest_tests_by_channel([ch.id for ch in channels], for_job_id=ANY_JOB)
+    plan = plan_format_selection(channels, latest, rank_ids=rank_ids)
     return jsonify({'success': True, **plan})
 
 
@@ -2228,9 +2275,9 @@ def apply_format_plan(group_id):
     ChannelEvent), then locks.
 
     Uses each member's own latest test regardless of job (the same ANY_JOB default
-    evaluate_and_reconcile_group itself uses), not a specific job_id - there is no single
-    "the" health check for an existing group's ongoing membership the way there is for a
-    fresh create-group preview, which is scoped to the health check it was opened from."""
+    evaluate_and_reconcile_group and apply_format_strategy use), never a specific job_id -
+    every surface that decides or describes a lock reads the same data or it is deciding
+    about a different app (dev/changelog/890)."""
     group = db.session.get(ChannelGroup, group_id)
     if group is None:
         return jsonify({'error': 'Group not found'}), 404
@@ -2245,9 +2292,15 @@ def apply_format_plan(group_id):
     if non_matching not in ('keep', 'remove'):
         return jsonify({'error': "non_matching must be 'keep' or 'remove'"}), 400
 
-    members = member_channels(group.memberships)
+    memberships = list(group.memberships)
+    members = member_channels(memberships)
     latest = _latest_tests_by_channel([ch.id for ch in members])
-    plan = plan_format_selection(members, latest)
+    # Ranked over the lock population, exactly as apply_format_strategy() ranks it, but
+    # the winning entry's `channel_ids` still covers every member measuring that format.
+    # That split is load-bearing here and nowhere else: `non_matching_ids` below can
+    # DELETE members, so narrowing the membership half would delete every health-check-only
+    # member as a side effect of a ranking change (dev/changelog/890).
+    plan = plan_format_selection(members, latest, rank_ids=lock_ranking_ids(memberships))
     entry = plan['strategies'][strategy]
     if entry['key'] is None:
         return jsonify({'error': entry['rationale']}), 400

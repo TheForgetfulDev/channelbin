@@ -47,30 +47,60 @@ def is_streaking(channel, streak_threshold=DEFAULT_FAILING_STREAK_THRESHOLD) -> 
     return streak_threshold > 0 and (channel.consecutive_test_failures or 0) >= streak_threshold
 
 
+def resolution_pixels(resolution) -> int:
+    """width * height off a "1920x1080" string, 0 when it cannot be parsed. One spelling
+    of the parse, shared by the member ranking and the bucket ranking so the two cannot
+    disagree about which of two formats is the larger picture."""
+    try:
+        w_str, h_str = resolution.split('x', 1)
+        return int(w_str) * int(h_str)
+    except (ValueError, AttributeError):
+        return 0
+
+
 def rank_members(members, latest_by_channel=None, exclude_ids=frozenset(),
                   streak_threshold=DEFAULT_FAILING_STREAK_THRESHOLD):
-    """Members sorted best-first: non-streaking members by effective score first, then
-    by latest measured bitrate (unmeasured sorts last - same convention as
-    _format_sort_key's own bitrate handling below), then id ascending as the final
-    tie-break - then streaking members the same way. A streaking member ranks
-    last-resort, never excluded outright, so a group where every member is streaking
-    still hands back its best-scoring one rather than nothing (CLAUDE.md Product
-    Principle 2: complete the recording at almost all costs).
+    """Members sorted best-first: non-streaking members by effective score, then by the
+    quality signals in _format_sort_key's own order - measured bitrate, then picture
+    size, then frame rate - and only then id ascending; then streaking members the same
+    way. A streaking member ranks last-resort, never excluded outright, so a group where
+    every member is streaking still hands back its best-scoring one rather than nothing
+    (CLAUDE.md Product Principle 2: complete the recording at almost all costs).
+
+    **Health score strictly dominates; the quality signals only break its exact ties.**
+    That is the difference between this and the blended quality score CLAUDE.md's "Format
+    lock filters, health score ranks" rule forbids - ranking on bitrate would pick a dead
+    8 Mb/s feed over a live 3 Mb/s one, which is the failure this app exists to prevent.
+    Two members that score identically have already passed that test equally, and there
+    the goal is the higher-quality recording, so every signal that indicates quality is
+    consulted before falling back to insertion order (dev/changelog/890).
+
+    Unmeasured sorts last in each of the three, matching _format_sort_key's -1
+    convention: an untested member must never sort as if it had the highest bitrate.
 
     `latest_by_channel` is an optional channel_id -> ChannelTest map (e.g. from
-    _latest_tests_by_channel) supplying the bitrate tie-break; omit it (or pass None)
-    to fall straight through to the id tie-break, as before this param existed."""
+    _latest_tests_by_channel) supplying those tie-breaks; omit it (or pass None) to fall
+    straight through to the id tie-break, as before this param existed."""
     latest_by_channel = latest_by_channel or {}
 
-    def _bitrate(ch):
+    def _quality(ch):
         test = latest_by_channel.get(ch.id)
-        b = getattr(test, 'bitrate_kbps', None) if test else None
-        return -1 if b is None else b
+        if test is None:
+            return (-1, 0, -1)
+        bitrate = getattr(test, 'bitrate_kbps', None)
+        fps = getattr(test, 'fps', None)
+        return (-1 if bitrate is None else bitrate,
+                resolution_pixels(getattr(test, 'resolution', None)),
+                -1 if fps is None else fps)
 
     candidates = [ch for ch in members if ch.id not in exclude_ids]
-    return sorted(candidates,
-                  key=lambda ch: (is_streaking(ch, streak_threshold), -effective_score(ch),
-                                   -_bitrate(ch), ch.id))
+
+    def _key(ch):
+        bitrate, pixels, fps = _quality(ch)
+        return (is_streaking(ch, streak_threshold), -effective_score(ch),
+                -bitrate, -pixels, -fps, ch.id)
+
+    return sorted(candidates, key=_key)
 
 
 def pick_best_member(members, latest_by_channel=None, exclude_ids=frozenset(),
@@ -211,43 +241,71 @@ def healthy_channels(channels, latest_by_channel) -> list:
             if _test_status_label(latest_by_channel.get(ch.id)) in HEALTHY_TEST_LABELS]
 
 
-def format_buckets(channels, latest_by_channel) -> list:
+def format_buckets(channels, latest_by_channel, rank_ids=None) -> list:
     """Healthy channels grouped by video format (format_key) - one bucket per distinct
     (resolution, fps). A channel with an unknown format is dropped; a bucket needs a
     known format to be selectable. Each bucket:
       {'key', 'label', 'resolution', 'fps', 'pixels', 'channel_ids', 'count',
-       'median_bitrate_kbps', 'median_bpp'}
+       'pass_count', 'warn_count', 'median_bitrate_kbps', 'median_bpp',
+       'rank_count', 'rank_median_bitrate_kbps', 'rank_median_bpp'}
     'pixels' = width * height parsed off the resolution string (so each strategy's sort
     key doesn't re-parse it). Medians are statistics.median over non-None values, None
-    when the bucket has none - never silently substitute a number. Pure/DB-free."""
+    when the bucket has none - never silently substitute a number. Pure/DB-free.
+
+    **The bucket answers two different questions and keeps them apart.** `count`,
+    `channel_ids` and `median_*` describe every channel handed in: that is the MEMBERSHIP
+    question ("who matches this format"), and apply_format_plan can delete the members a
+    winning bucket leaves out, so narrowing it would delete members nobody asked about.
+    `rank_count` and `rank_median_*` describe only `rank_ids` - the members the lock will
+    actually filter, i.e. the recording-enabled ones - and are what the strategies rank
+    on. `rank_ids=None` ranks over everyone, which is the right answer for a group with
+    nothing recording-enabled yet (a clone starts that way) and reproduces the behavior
+    that predates the split.
+
+    `pass_count`/`warn_count` split the healthy set by test label. A WARN still counts as
+    healthy - see HEALTHY_TEST_LABELS - so a bucket can win on channels that are every
+    one of them warning, and the surfaces that show a bucket owe the user that number
+    rather than the word "healthy" on its own (dev/changelog/890)."""
+    from .routes.channel_tests import _test_status_label
     by_key = {}
-    for ch in healthy_channels(channels, latest_by_channel):
+    for ch in channels:
         test = latest_by_channel.get(ch.id)
+        label = _test_status_label(test)
+        if label not in HEALTHY_TEST_LABELS:
+            continue
         key = format_key(test)
         if key is None:
             continue
-        by_key.setdefault(key, []).append((ch, test))
+        by_key.setdefault(key, []).append((ch, test, label))
+
+    def _median(values):
+        return statistics.median(values) if values else None
 
     buckets = []
-    for key, pairs in by_key.items():
+    for key, rows in by_key.items():
         res, fps = key
-        try:
-            w_str, h_str = res.split('x', 1)
-            pixels = int(w_str) * int(h_str)
-        except (ValueError, AttributeError):
-            pixels = 0
-        bitrates = [t.bitrate_kbps for _ch, t in pairs if t.bitrate_kbps is not None]
-        bpps = [t.bits_per_pixel_frame for _ch, t in pairs if t.bits_per_pixel_frame is not None]
+        ranked = rows if rank_ids is None else [r for r in rows if r[0].id in rank_ids]
         buckets.append({
             'key': key,
             'label': format_label(key),
             'resolution': res,
             'fps': fps,
-            'pixels': pixels,
-            'channel_ids': [ch.id for ch, _t in pairs],
-            'count': len(pairs),
-            'median_bitrate_kbps': statistics.median(bitrates) if bitrates else None,
-            'median_bpp': statistics.median(bpps) if bpps else None,
+            'pixels': resolution_pixels(res),
+            'channel_ids': [ch.id for ch, _t, _l in rows],
+            'count': len(rows),
+            'pass_count': sum(1 for _ch, _t, lbl in rows if lbl == 'PASS'),
+            'warn_count': sum(1 for _ch, _t, lbl in rows if lbl != 'PASS'),
+            'median_bitrate_kbps': _median(
+                [t.bitrate_kbps for _ch, t, _l in rows if t.bitrate_kbps is not None]),
+            'median_bpp': _median(
+                [t.bits_per_pixel_frame for _ch, t, _l in rows
+                 if t.bits_per_pixel_frame is not None]),
+            'rank_count': len(ranked),
+            'rank_median_bitrate_kbps': _median(
+                [t.bitrate_kbps for _ch, t, _l in ranked if t.bitrate_kbps is not None]),
+            'rank_median_bpp': _median(
+                [t.bits_per_pixel_frame for _ch, t, _l in ranked
+                 if t.bits_per_pixel_frame is not None]),
         })
     return buckets
 
@@ -255,78 +313,148 @@ def format_buckets(channels, latest_by_channel) -> list:
 def _format_sort_key(strategy, bucket):
     """Ascending sort key tuple for `strategy` - the winner is min(buckets, key=this).
     A None median substitutes -1 so an unmeasured bucket can never silently sort as if
-    it had the highest bitrate; never leave a tie resolving to insertion order."""
-    bitrate = bucket['median_bitrate_kbps']
+    it had the highest bitrate; never leave a tie resolving to insertion order.
+
+    Reads the `rank_*` statistics, never `count`/`median_bitrate_kbps`: a lock exists to
+    filter recording candidates, so it is ranked over the members it will actually filter
+    (format_buckets' `rank_ids`). The membership figures stay on the bucket for the
+    surfaces that report who matches."""
+    bitrate = bucket['rank_median_bitrate_kbps']
     bitrate = -1 if bitrate is None else bitrate
     if strategy == 'highest_bitrate':
         return (-bitrate, -bucket['pixels'], -bucket['fps'], bucket['resolution'])
     if strategy == 'highest_resolution':
         return (-bucket['pixels'], -bucket['fps'], -bitrate, bucket['resolution'])
     if strategy == 'most_channels':
-        return (-bucket['count'], -bitrate, -bucket['pixels'], -bucket['fps'], bucket['resolution'])
+        return (-bucket['rank_count'], -bitrate, -bucket['pixels'], -bucket['fps'],
+                bucket['resolution'])
     raise ValueError(f'unknown format strategy: {strategy}')
+
+
+def _rankable_buckets(buckets):
+    """The buckets a strategy may pick from: those holding at least one of the members
+    the lock will filter (`rank_count`).
+
+    A bucket with none of them cannot be a correct answer to the question a lock exists
+    to answer - it would filter out every member the group could record from, so every
+    recording would fall through the zero-survivor override from the moment the lock was
+    written rather than as the stale-lock exception that override was built for
+    (dev/changelog/890). With `rank_ids=None` every bucket has rank_count == count and
+    nothing is excluded."""
+    return [b for b in buckets if b['rank_count'] > 0]
 
 
 def _pick_format_bucket(strategy, buckets):
     """The winning bucket for `strategy`, or None when no bucket qualifies (no healthy
-    formats at all, or - balanced only - no bucket clears the coverage floor)."""
+    formats at all, none holding a member the lock would filter, or - balanced only - no
+    bucket clears the coverage floor)."""
+    buckets = _rankable_buckets(buckets)
     if not buckets:
         return None
     if strategy == 'balanced':
-        max_count = max(b['count'] for b in buckets)
+        max_count = max(b['rank_count'] for b in buckets)
         floor = math.ceil(BALANCED_COVERAGE_FLOOR * max_count)
-        eligible = [b for b in buckets if b['count'] >= floor]
+        eligible = [b for b in buckets if b['rank_count'] >= floor]
         if not eligible:
             return None
         return min(eligible, key=lambda b: _format_sort_key('highest_bitrate', b))
     return min(buckets, key=lambda b: _format_sort_key(strategy, b))
 
 
+def _no_winner_rationale(strategy, buckets):
+    """Why `strategy` picked nothing, naming the specific reason rather than one sentence
+    covering three different situations - the three are fixed by three different actions,
+    so a user told only "no eligible format" cannot act on it (CLAUDE.md: failure paths
+    must be observable)."""
+    if not buckets:
+        return 'No format has enough healthy channels to build a group on.'
+    if not _rankable_buckets(buckets):
+        return ('No measured format holds a member this group is set to record from. '
+                'Turn Recording on for a member, or pin a format by hand.')
+    return (f'No format holds at least {int(BALANCED_COVERAGE_FLOOR * 100)}% as many '
+            f'recordable channels as the largest one, so Balanced has nothing broad '
+            f'enough to settle on.')
+
+
 def _format_strategy_entry(strategy, buckets):
     """One FORMAT_STRATEGIES entry: the winning bucket restated as
-    {'key', 'label', 'resolution', 'fps', 'channel_ids', 'count', 'rationale'}, or the
-    no-winner shape with a plain-English reason (CLAUDE.md: failure paths must be
-    observable - never an empty pick with no explanation)."""
+    {'key', 'label', 'resolution', 'fps', 'channel_ids', 'count', 'rank_count',
+    'pass_count', 'warn_count', 'rationale'}, or the no-winner shape with a plain-English
+    reason.
+
+    `count`/`channel_ids` are the MEMBERSHIP figures (every member measuring this format);
+    `rank_count` is how many of those the group would actually record from, and is what
+    the strategy ranked on. Both are reported because they answer different questions and
+    one standing in for the other is how a bucket holding nothing recordable came to win
+    a lock in the first place."""
     winner = _pick_format_bucket(strategy, buckets)
     if winner is None:
         return {'key': None, 'label': None, 'resolution': None, 'fps': None,
-                'channel_ids': [], 'count': 0,
-                'rationale': 'No format has enough healthy channels to build a group on.'}
-    total_formats = len(buckets)
-    bitrate = winner['median_bitrate_kbps']
-    bitrate_txt = f'a median {bitrate / 1000:.2f} Mb/s' if bitrate is not None else 'an unmeasured bitrate'
+                'channel_ids': [], 'count': 0, 'rank_count': 0,
+                'pass_count': 0, 'warn_count': 0,
+                'rationale': _no_winner_rationale(strategy, buckets)}
+    candidates = len(_rankable_buckets(buckets))
+    bitrate = winner['rank_median_bitrate_kbps']
+    bitrate_txt = (f'a median {bitrate / 1000:.2f} Mb/s' if bitrate is not None
+                   else 'an unmeasured bitrate')
+    # "channels" here is always the ranked population - the number that decided it. Saying
+    # "healthy" and stopping there is what let a bucket whose every channel is warning read
+    # as a clean win (dev/changelog/890).
+    n = winner['rank_count']
+    channels_txt = f'{n} recordable channel{"" if n == 1 else "s"}'
+    if winner['pass_count'] == 0:
+        channels_txt += ' (every one of them warning)'
     if strategy == 'highest_bitrate':
-        rationale = (f"{winner['count']} healthy channels at {bitrate_txt}, "
-                     f"the highest of {total_formats} formats")
+        rationale = (f'{channels_txt} at {bitrate_txt}, the highest of '
+                     f'{candidates} candidate formats')
     elif strategy == 'highest_resolution':
-        rationale = (f"{winner['count']} healthy channels at {winner['label']}, "
-                     f"the largest picture of {total_formats} formats")
+        rationale = (f"{channels_txt} at {winner['label']}, the largest picture of "
+                     f'{candidates} candidate formats')
     elif strategy == 'most_channels':
-        rationale = f"{winner['count']} healthy channels, the most of {total_formats} formats"
+        rationale = (f'{channels_txt}, the most of {candidates} candidate formats - '
+                     f'a tie is broken by median bitrate, then picture size, then frame rate')
     else:
-        rationale = (f"{winner['count']} healthy channels at {bitrate_txt}, the highest "
-                     f"bitrate among formats holding at least "
-                     f"{int(BALANCED_COVERAGE_FLOOR * 100)}% as many channels as the largest")
+        rationale = (f'{channels_txt} at {bitrate_txt}, the highest bitrate among formats '
+                     f'holding at least {int(BALANCED_COVERAGE_FLOOR * 100)}% as many '
+                     f'recordable channels as the largest')
     return {'key': winner['key'], 'label': winner['label'], 'resolution': winner['resolution'],
-            'fps': winner['fps'], 'channel_ids': winner['channel_ids'], 'count': winner['count'],
+            'fps': winner['fps'], 'channel_ids': winner['channel_ids'],
+            'count': winner['count'], 'rank_count': winner['rank_count'],
+            'pass_count': winner['pass_count'], 'warn_count': winner['warn_count'],
             'rationale': rationale}
 
 
-def plan_format_selection(channels, latest_by_channel) -> dict:
+def plan_format_selection(channels, latest_by_channel, rank_ids=None) -> dict:
     """The auto-select-format engine: for each of FORMAT_STRATEGIES, which format wins
     and why. Returns {'buckets', 'eligible_count', 'excluded_count', 'total',
-    'strategies': {strategy: entry, ...}}. Pure/DB-free - the caller supplies the test
-    map (channel_id -> latest ChannelTest). See format_buckets for what counts as
-    healthy and how buckets are built, and _format_sort_key for the deterministic
-    tie-break per strategy."""
+    'rank_total', 'strategies': {strategy: entry, ...}}. Pure/DB-free - the caller
+    supplies the test map (channel_id -> latest ChannelTest). See format_buckets for what
+    counts as healthy, how buckets are built and what `rank_ids` narrows, and
+    _format_sort_key for the deterministic tie-break per strategy.
+
+    `total` counts every channel handed in; `rank_total` counts the ones the lock would
+    actually filter. The two differ on a group whose members are not all set to record,
+    and a surface that shows one as if it were the other is describing a group the user
+    does not have."""
     total = len(channels)
-    buckets = format_buckets(channels, latest_by_channel)
+    buckets = format_buckets(channels, latest_by_channel, rank_ids=rank_ids)
     eligible_count = sum(b['count'] for b in buckets)
     return {
         'buckets': buckets,
         'eligible_count': eligible_count,
         'excluded_count': total - eligible_count,
         'total': total,
+        'rank_total': total if rank_ids is None else sum(1 for ch in channels
+                                                         if ch.id in rank_ids),
+        # How many of the ranking population have a measured format at all. The consequence
+        # line needs it to tell "measures a different format, so it is skipped" apart from
+        # "never tested, so it is still eligible" - the two behave differently and one
+        # number covering both is wrong in the direction that matters. Counted here rather
+        # than client-side because the page's own rows are scoped to one health check and
+        # would answer a different question (dev/changelog/890).
+        'rank_measured': sum(1 for ch in channels
+                             if (rank_ids is None or ch.id in rank_ids)
+                             and format_key(latest_by_channel.get(ch.id)) is not None),
         'strategies': {s: _format_strategy_entry(s, buckets) for s in FORMAT_STRATEGIES},
     }
 
@@ -404,6 +532,28 @@ def recording_members(memberships):
     not match the group's lock is filtered out where members are CHOSEN, not here, and
     is never unticked in the database (DESIGN-channel-groups-model.md 4.1)."""
     return [m.channel for m in memberships if m.recording_enabled]
+
+
+def lock_ranking_ids(memberships):
+    """The channel ids a format lock is DECIDED over: the recording-enabled members when
+    the group has any, else every member.
+
+    A lock's only job is to filter recording candidates (format_eligible_members), so a
+    format holding none of them cannot be a correct answer to it - group 5 was locked to a
+    720p30 bucket of 40 healthy channels holding zero recording-enabled ones, which
+    filtered out all 29 members the group could record from and sent every recording
+    through the zero-survivor override from the moment it was written (dev/changelog/890).
+
+    The fallback is not a nicety: a clone's members are all Recording-off by model default
+    (DESIGN-channel-groups-model.md 14), so a group with nothing enabled has no recording
+    population to rank over yet and ranking over everyone is the only answer that
+    describes it. Read-only - deciding a lock never writes a participation switch (4.1).
+
+    Handed to format_buckets/plan_format_selection as `rank_ids`; the membership figures
+    those return still cover every member, which is what apply_format_plan's remove
+    option must keep reading."""
+    return {m.channel_id for m in memberships if m.recording_enabled} or {
+        m.channel_id for m in memberships}
 
 
 def test_member_ids(memberships):
@@ -1138,10 +1288,31 @@ def group_reference_key(group, memberships, latest_by_channel,
     source, and the format warnings that consume this are gated off for it anyway
     (DESIGN-channel-groups-model.md 16).
 
-    Lock-aware - the one place callers should source "the group format" from."""
+    Lock-aware - the one place callers should source "the group format" from. A caller
+    that needs the format the data alone points at, with any lock ignored, wants
+    derived_reference_key() instead: this function answering both questions is how the
+    settings picker came to label "Healthiest member's format" with the group's existing
+    lock (dev/changelog/890)."""
     locked = group.locked_format_key if group is not None else None
     if locked is not None:
         return locked
+    return derived_reference_key(memberships, latest_by_channel, streak_threshold)
+
+
+def derived_reference_key(memberships, latest_by_channel,
+                          streak_threshold=DEFAULT_FAILING_STREAK_THRESHOLD):
+    """The format the group's own data points at, with any lock ignored: the format_key
+    of the highest-ranked RECORDING-ENABLED member (rank_members order) that has a known
+    format, or None when no such candidate has one.
+
+    This is what the `highest_score` strategy actually follows - it pins nothing and lets
+    whichever member is healthiest serve the group - so it is what a surface offering that
+    strategy must name. group_reference_key() returns the LOCK when one is set, which is
+    correct for its own callers and wrong for this question: on a group locked to
+    3840x2160 @ 50 the picker offered "Healthiest member's format - 3840x2160 @ 50" while
+    its healthiest member measured 1920x1080 @ 50, and no member of the named format
+    scored above 92 (dev/changelog/890). One value cannot answer both questions - CLAUDE.md
+    'one flag, one meaning'."""
     for ch in rank_members(recording_members(memberships), latest_by_channel,
                            streak_threshold=streak_threshold):
         key = format_key(latest_by_channel.get(ch.id))
@@ -1485,7 +1656,7 @@ def apply_lock_and_log(group, strategy, entry, non_matching, removed_count):
         })))
 
 
-def strategy_lock_plan(group, members, latest_by_channel) -> dict:
+def strategy_lock_plan(group, members, latest_by_channel, rank_ids=None) -> dict:
     """What `group`'s standing format strategy would do to its lock right now - layer 1
     of the three-layer story (DESIGN-channel-groups-model.md 4.4, 5).
 
@@ -1499,11 +1670,15 @@ def strategy_lock_plan(group, members, latest_by_channel) -> dict:
         group has any test history: it carries the plain-English rationale rather than
         leaving the caller with a silent nothing.
 
+    `rank_ids` narrows which members the ranking is decided over - see lock_ranking_ids();
+    every caller that is describing a real group's lock passes it, so the answer here and
+    the answer apply_format_strategy() writes cannot differ.
+
     Pure/DB-free - the caller supplies the test map, as plan_format_selection() does."""
     strategy = group.format_strategy
     if strategy not in FORMAT_STRATEGIES:
         return {'strategy': strategy, 'manages_lock': False, 'entry': None}
-    buckets = format_buckets(members, latest_by_channel)
+    buckets = format_buckets(members, latest_by_channel, rank_ids=rank_ids)
     return {'strategy': strategy, 'manages_lock': True,
             'entry': _format_strategy_entry(strategy, buckets)}
 
@@ -1537,7 +1712,8 @@ def apply_format_strategy(group, streak_threshold=None):
     memberships = list(group.memberships)
     members = member_channels(memberships)
     latest_by_channel = _latest_tests_by_channel([m.channel_id for m in memberships])
-    plan = strategy_lock_plan(group, members, latest_by_channel)
+    plan = strategy_lock_plan(group, members, latest_by_channel,
+                              rank_ids=lock_ranking_ids(memberships))
     plan['moved'] = False
     if not plan['manages_lock']:
         # A pin found under a strategy that owns none is cleared here, which is the

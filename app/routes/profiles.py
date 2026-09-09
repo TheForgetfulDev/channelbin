@@ -24,6 +24,8 @@ _FIELDS = (
     ProfileField('stall_timeout_seconds', 'Stall timeout', INT),
     ProfileField('restart_delay_seconds', 'Restart delay', INT),
     ProfileField('max_consecutive_failures', 'Max consecutive failures', INT),
+    ProfileField('stall_move_count', 'Stalls before moving on', INT),
+    ProfileField('stall_move_window_minutes', 'Stall window', INT),
     ProfileField('retention_days', 'Auto-delete after', INT),
     ProfileField('pre_check_enabled', 'Pre-recording health check', BOOL),
 )
@@ -55,6 +57,8 @@ def _global_defaults(cfg):
         'stall_timeout_seconds': cfg['watchdog']['stall_timeout_seconds'],
         'restart_delay_seconds': cfg['watchdog']['restart_delay_seconds'],
         'max_consecutive_failures': cfg['watchdog']['max_consecutive_failures'],
+        'stall_move_count': cfg['watchdog']['stall_move_count'],
+        'stall_move_window_minutes': cfg['watchdog']['stall_move_window_minutes'],
         'retention_days': cfg['recording']['retention_days'],
         'pre_check_enabled': cfg['channel_testing']['pre_check']['enabled'],
     }
@@ -80,6 +84,8 @@ _OVERRIDE_ROWS = (
     ('stall_timeout_seconds', 'Stall timeout', lambda v: f'{v}s'),
     ('restart_delay_seconds', 'Restart delay', lambda v: f'{v}s'),
     ('max_consecutive_failures', 'Max failures', str),
+    ('stall_move_count', 'Stalls before moving on', str),
+    ('stall_move_window_minutes', 'Stall window', lambda v: f'{v}m'),
     ('retention_days', 'Auto-delete', _retention),
     ('pre_check_enabled', 'Pre-recording check', lambda v: 'On' if v else 'Off'),
 )

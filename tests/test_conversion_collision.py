@@ -1,4 +1,4 @@
-"""Guards dev/changelog/NNN "mp4 conversion collision avoidance"
+"""Guards dev/changelog/672 "mp4 conversion collision avoidance"
 (recording.post_process.collision_policy).
 
 Conversion is local CPU/disk work with no coordination against the recorder before this -

@@ -327,6 +327,140 @@ def apply_failover_health_observation(app, channel_id: int, recording_id: int, r
         db.session.commit()
 
 
+def _departed_member_share(recording_id: int):
+    """(downtime_seconds, restart_count, duration_seconds) for the member a recording has
+    JUST moved off, read from its GROUP_FAILOVER events.
+
+    Called after failover_group_member has committed its event, so the newest one carries
+    `counters_at_failover` = the recording's cumulative counters through the departing
+    member, and the one before it (if any) marks where that member's window started. The
+    difference is the member's own share - the same subtraction _final_member_success_quality
+    does for the member a recording ENDS on, one event earlier.
+
+    Requires an app context. Returns None when the newest event carries no snapshot, which
+    is the caller's signal that there is nothing measured to score.
+    """
+    from .database import RecordingEvent, GROUP_FAILOVER, Recording
+    from . import db
+
+    events = (RecordingEvent.query
+              .filter_by(recording_id=recording_id, event_type=GROUP_FAILOVER)
+              .order_by(RecordingEvent.timestamp.desc(), RecordingEvent.id.desc())
+              .limit(2).all())
+    if not events:
+        return None
+
+    def _snap(ev):
+        if ev is None or not ev.extra_data:
+            return None
+        try:
+            return json.loads(ev.extra_data).get('counters_at_failover')
+        except (ValueError, TypeError):
+            return None
+
+    latest = _snap(events[0])
+    if not latest:
+        return None
+    prior = _snap(events[1]) if len(events) > 1 else None
+    start_counters = prior or {}
+
+    downtime = max(0.0, (latest.get('total_downtime_seconds') or 0)
+                   - (start_counters.get('total_downtime_seconds') or 0))
+    restarts = max(0, (latest.get('total_restart_count') or 0)
+                   - (start_counters.get('total_restart_count') or 0))
+
+    # Window start: the previous failover, or the recording's own start for the first
+    # member. Both ends come from event timestamps rather than utcnow() so a slow commit
+    # cannot stretch the window and flatter the member's instability rate.
+    start_at = None
+    if len(events) > 1 and prior is not None:
+        start_at = events[1].timestamp
+    if start_at is None:
+        recording = db.session.get(Recording, recording_id)
+        start_at = recording.start_time if recording is not None else None
+    duration = 0.0
+    if start_at is not None and events[0].timestamp is not None:
+        duration = max((events[0].timestamp - start_at).total_seconds(), 0.0)
+    return downtime, restarts, duration
+
+
+@retry_on_locked()
+def apply_stall_demotion_health_observation(app, channel_id: int, recording_id: int,
+                                            reason: str = ''):
+    """Blend a MEASURED observation into a group member a recording moved off because it
+    kept stalling (app/recorder.py::failover_group_member with demote=True).
+
+    Deliberately not apply_failover_health_observation, which hands the channel the flat
+    recording fail floor. That is the right answer for a feed that died and the wrong one
+    here: the member that motivated this feature delivered 104% of its expected content
+    across 27 stalls, so a fail floor would have been a lie about a working feed. This
+    scores it through score_recording_metrics_quality on its own share instead, where the
+    stalls still hit both terms - every stall banks its dead air into downtime and forces
+    a restart the instability term charges for - so a member that stalls more scores worse,
+    proportionally rather than categorically (dev/changelog/889).
+
+    Never touches the Recording row: the recording is still running on another member and
+    gets its own terminal observation later.
+    """
+    with app.app_context():
+        from . import db
+        from .config import load_config
+        from .database import (Channel, ChannelEvent,
+                               CHANNEL_STALL_DEMOTION_HEALTH_OBSERVATION)
+        from datetime import datetime
+
+        channel = db.session.get(Channel, channel_id)
+        if channel is None:
+            return
+        share = _departed_member_share(recording_id)
+        if share is None:
+            # No snapshot means nothing measured to score. Silence here is safe: the
+            # demotion itself is already on the recording's event log, and inventing a
+            # score from counters that span other members would be worse than none.
+            log.warning('Recording %d: no failover snapshot for channel %d - stall '
+                        'demotion recorded no health observation', recording_id, channel_id)
+            return
+        downtime, restarts, duration = share
+
+        cfg = load_config()
+        quality, quality_breakdown = score_recording_metrics_quality(
+            downtime, restarts, duration, cfg)
+        quality_breakdown['member_share'] = {
+            'reason': 'stall-rate demotion - departing member share only',
+            'downtime_seconds': round(downtime), 'restarts': restarts,
+            'duration_seconds': round(duration),
+        }
+        weight = observation_weight(duration, cfg)
+        observed_at = datetime.utcnow()
+        new_score, new_count, new_updated_at, blend_breakdown = blend_health_score(
+            channel, quality, observed_at, weight, cfg
+        )
+        channel.health_score = new_score
+        channel.health_score_sample_count = new_count
+        channel.health_score_updated_at = new_updated_at
+
+        if blend_breakdown['first_observation']:
+            score_note = f'score set to {new_score:.0f}'
+        else:
+            score_note = f'health score {blend_breakdown["old_score"]:.0f} -> {new_score:.0f}'
+        detail = (f'Kept stalling during a recording ({reason}) - moved to another group '
+                  f'member and demoted for the rest of that recording. Scored {quality}/100 '
+                  f'on its own share: {downtime:.0f}s lost and {restarts} restarts over '
+                  f'{duration / 60:.0f} min - {score_note}')
+        db.session.add(ChannelEvent(
+            channel_id=channel_id,
+            timestamp=observed_at,
+            event_type=CHANNEL_STALL_DEMOTION_HEALTH_OBSERVATION,
+            detail=detail,
+            extra_data=json.dumps({
+                'recording_id': recording_id, 'reason': reason,
+                'quality': quality, 'quality_breakdown': quality_breakdown,
+                'blend_breakdown': blend_breakdown,
+            }),
+        ))
+        db.session.commit()
+
+
 def _final_member_success_quality(recording, cfg: dict) -> Tuple[int, dict]:
     """Quality score for the channel a COMPLETED recording *ended* on.
 

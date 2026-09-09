@@ -7,6 +7,7 @@ import os
 import time
 import threading
 from datetime import datetime, timedelta
+from typing import NamedTuple
 
 from .database import add_recording_event, REC_STATUS_FAILED, REC_STATUS_RETRYING
 from .db_utils import retry_on_locked
@@ -34,11 +35,36 @@ def _dead_stream_retry_delay_minutes(attempt_number: int) -> int:
     return 60
 
 
+def stalls_within_window(times, now_mono: float, window_seconds: float) -> list:
+    """The stall timestamps in `times` still inside a rolling window ending at `now_mono`.
+
+    The stall-rate demotion trigger (dev/changelog/889) is a RATE, not a total: a flat
+    total cannot tell a bad feed from a long recording, since 5 stalls is a broken feed in
+    an hour and a healthy one across four. Note which way the window moves the trigger -
+    widening it LOOSENS it, because the count is unchanged and there is more time to reach
+    it. Measured against recording 14's real stall times, 3-in-30 first fires at +24.2 min
+    and 3-in-10 not until +65.0.
+    """
+    return [t for t in times if t >= now_mono - window_seconds]
+
+
 def _first_line(tail: str) -> str:
     """The first line of a (possibly multi-line, already credential-masked) stderr
     tail - the single most specific thing ffmpeg said, for folding into a one-line
     event/alert message. '' for an empty tail."""
     return tail.split('\n', 1)[0] if tail else ''
+
+
+class WatchdogThresholds(NamedTuple):
+    """The tunables one recording's watchdog runs on. A NamedTuple rather than a bare
+    tuple because the arity is now past what a reader can keep straight positionally, and
+    because a field added here should not silently break an existing unpack - both callers
+    read what they need by name."""
+    stall_timeout: int
+    restart_delay: int
+    max_failures: int
+    stall_move_count: int
+    stall_move_window_minutes: int
 
 
 def _resolve_watchdog_thresholds(cfg, recording_id):
@@ -59,6 +85,8 @@ def _resolve_watchdog_thresholds(cfg, recording_id):
     stall_timeout = cfg['watchdog']['stall_timeout_seconds']
     restart_delay = cfg['watchdog']['restart_delay_seconds']
     max_failures = cfg['watchdog']['max_consecutive_failures']
+    stall_move_count = cfg['watchdog']['stall_move_count']
+    stall_move_window = cfg['watchdog']['stall_move_window_minutes']
 
     rec = db.session.get(Recording, recording_id)
     profile = rec.profile if rec else None
@@ -69,7 +97,12 @@ def _resolve_watchdog_thresholds(cfg, recording_id):
             restart_delay = profile.restart_delay_seconds
         if profile.max_consecutive_failures is not None:
             max_failures = profile.max_consecutive_failures
-    return stall_timeout, restart_delay, max_failures
+        if profile.stall_move_count is not None:
+            stall_move_count = profile.stall_move_count
+        if profile.stall_move_window_minutes is not None:
+            stall_move_window = profile.stall_move_window_minutes
+    return WatchdogThresholds(stall_timeout, restart_delay, max_failures,
+                              stall_move_count, stall_move_window)
 
 
 class WatchdogThread(threading.Thread):
@@ -98,6 +131,14 @@ class WatchdogThread(threading.Thread):
             # from the restart branch to the next outer-loop pass. See where it is consumed
             # below for why re-deriving it instead cost ~11s per dead segment.
             restart_no_data_segment = None
+            # Stall-rate demotion (dev/changelog/889): monotonic timestamps of the stalls
+            # charged to the member currently being recorded, and which member that is.
+            # Keyed on the member rather than cleared at each failover site: a move that
+            # arrives from any of the three give-up points below must not carry the old
+            # feed's stalls onto the new one, and a .clear() at each of them would be four
+            # places for the fifth site to forget.
+            member_stall_times = []
+            member_stall_channel_id = None
 
             log.info('Watchdog started for recording %d', self.recording_id)
 
@@ -105,7 +146,10 @@ class WatchdogThread(threading.Thread):
                 # Refresh config each outer loop in case settings were changed
                 cfg = load_config()
                 poll = cfg['watchdog']['poll_interval_seconds']
-                stall_timeout, restart_delay, max_failures = _resolve_watchdog_thresholds(cfg, self.recording_id)
+                thresholds = _resolve_watchdog_thresholds(cfg, self.recording_id)
+                stall_timeout = thresholds.stall_timeout
+                restart_delay = thresholds.restart_delay
+                max_failures = thresholds.max_failures
                 early_fail_window = cfg['watchdog']['early_fail_window_seconds']
                 early_fail_min_bytes = cfg['watchdog']['early_fail_min_bytes']
                 early_fail_abort_count = cfg['watchdog']['early_fail_abort_count']
@@ -398,6 +442,53 @@ class WatchdogThread(threading.Thread):
                             self._give_up(lambda: self._fail_recording(
                                 rec, max_failures, cause=_first_line(stderr_tail)))
                             return
+
+                        # ── Stall-rate demotion (dev/changelog/889) ─────────────
+                        # The three trip-wires above are all "the feed is dead" shaped, and
+                        # a member that stalls constantly but always comes back reaches
+                        # none of them: the successful restart below zeroes the very
+                        # counter that would trip max_consecutive_failures. Checked here,
+                        # after both of them, because they burn the member for the run and
+                        # a dead feed deserves that; this one only demotes.
+                        #
+                        # A stall closes this segment and opens the next one either way, so
+                        # the move rides a boundary that was happening anyway - and skips
+                        # the restart delay below, making it cheaper than staying put.
+                        if rec.channel_id != member_stall_channel_id:
+                            member_stall_times = []
+                            member_stall_channel_id = rec.channel_id
+                        now_mono = time.monotonic()
+                        member_stall_times.append(now_mono)
+                        member_stall_times = stalls_within_window(
+                            member_stall_times, now_mono,
+                            thresholds.stall_move_window_minutes * 60)
+                        if (rec.group_id is not None
+                                and thresholds.stall_move_count > 0
+                                and len(member_stall_times) >= thresholds.stall_move_count):
+                            from .recorder import failover_group_member, _launch_segment
+                            move_reason = (f'{len(member_stall_times)} stalls in '
+                                           f'{thresholds.stall_move_window_minutes} minutes')
+                            if failover_group_member(self.app, self.recording_id,
+                                                     move_reason, demote=True):
+                                self.state.stall_moves += 1
+                                member_stall_times = []
+                                member_stall_channel_id = None
+                                early_fail_times.clear()
+                                _launch_segment(self.app, self.recording_id, seg_num + 1)
+                                break
+                            # Nowhere better to go - a one-member group, or every other
+                            # member held back by its account's connection limit.
+                            # Deliberately NOT a give-up: nothing died, so the recording
+                            # stays where it is and takes its normal restart below, exactly
+                            # as it would have without this trip-wire.
+                            #
+                            # The stall clock is reset on a refusal too, so the member has
+                            # to re-earn the whole window before asking again. Leaving it
+                            # armed would re-ask on every single stall from here on, and
+                            # the connection-limit refusal writes an event each time it is
+                            # asked - a recording riding a stalling feed would fill its own
+                            # timeline with them.
+                            member_stall_times = []
 
                         # Second half of the downtime gap (see the stall commit above):
                         # everything from here until the replacement segment writes its
