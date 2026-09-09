@@ -1,0 +1,59 @@
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+.venv/
+venv/
+env/
+
+# Database
+dvr.db
+dvr.db-shm
+dvr.db-wal
+dvr.db-journal
+
+# Logs
+dvr.log
+dvr.log.*
+*.log
+
+# User config - config.yaml is your own machine's live config (paths, tokens),
+# never committed. config.example.yaml is the shipped template; copy it to
+# config.yaml and edit. The app also runs on built-in defaults with no file at all.
+config.yaml
+config.local.yaml
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# DVR output (bind-mounted in Docker)
+/dvr/
+
+# Playwright - playwright.config.ts still points its output at dev/, matching the dev repo's
+# convention that all working/scratch folders live there. That path doesn't exist in this
+# checkout; Playwright creates it on demand and these lines keep the results out of git.
+node_modules/
+/dev/test-results/
+/dev/playwright-report/
+/blob-report/
+/playwright/.cache/
+/playwright/.auth/
+
+# Auto-generated Flask secret key (see app/__init__.py _resolve_secret_key)
+/instance/
+
+# Per-segment ffmpeg stderr spools (recording.capture_log_dir) - transient, deleted at
+# each segment close and swept at startup.
+/capture-logs/

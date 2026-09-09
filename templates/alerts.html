@@ -1,0 +1,162 @@
+{% extends "base.html" %}
+{% block title %}Alerts - ChannelBin{% endblock %}
+
+{#  Alert center (dev/changelog/446).
+
+    Converted against the generic components - DESIGN.md 3.3 (card), 3.4 (badge +
+    left edge, never a row tint), 3.6 (row actions behind a kebab), 3.10 (one h1),
+    3.14 (empty state). No page-specific DESIGN.md section governs it; section 16
+    covers the Dashboard, Logs and Maintenance only.
+
+    The severity badge (.alert-severity + .sev-*) is style.css's, shared with the
+    nav alert banner and notifications_settings.html. It used to be restated in
+    this file's own <style> block in old rgba() literals, which silently won over
+    the shared rule for this page alone. #}
+
+{% block content %}
+<style>
+/* ══════════════════════════════════════════════════════════════════════════
+   Alerts. Everything generic (.card, .btn, .menu, .badge, .alert-severity,
+   .page-head, .empty-state) comes from style.css; what lives here is the one
+   thing only this page has - the alert row.
+   ══════════════════════════════════════════════════════════════════════════ */
+
+/* ── The alert row ────────────────────────────────────────────────────────
+   Same anatomy as the recordings list's `.rows .row` (style.css): the severity
+   colour is a 3px inset bar (::before below), clipped by the row's own
+   overflow:hidden so it follows the rounded corner instead of fading out
+   partway around it like a real border-left of mismatched width does
+   (measured, dev/changelog/878). `padding-left` reserves the bar's width so
+   the body stays put. Keep the two in step if either changes.
+
+   Severity comes off a data attribute rather than a `sev-ERROR` class, because
+   `.sev-*` is already the shared BADGE rule - putting it on the row would give
+   the row that badge's background, which is exactly the status tint DESIGN.md
+   3.4 rules out. Same shape as `.grp-item[data-health]`. */
+.al-row {
+  display: flex; gap: 12px; align-items: flex-start; padding: 11px 14px 11px 15px;
+  background: var(--bg1); border: 1px solid var(--border-soft); border-left: none;
+  border-radius: var(--radius); position: relative; overflow: hidden; margin-bottom: 8px;
+}
+.al-row::before { content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: 3px; background: transparent; }
+.al-row:last-child { margin-bottom: 0; }
+/* Read alerts keep the severity in the badge only - the edge is what says
+   "this one still wants you". Every severity has an explicit rule; a severity
+   the app adds later draws no edge rather than an arbitrary one. */
+.al-row.unread[data-sev="CRIT"]::before  { background: var(--bad); }
+.al-row.unread[data-sev="ERROR"]::before { background: var(--bad); }
+.al-row.unread[data-sev="WARN"]::before  { background: var(--warn); }
+.al-row.unread[data-sev="INFO"]::before  { background: var(--accent); }
+
+.al-body { flex: 1; min-width: 0; }
+.al-title { font-size: var(--fs-lg); font-weight: 500; word-break: break-word; }
+.al-row.unread .al-title { font-weight: 700; }
+.al-meta { font-size: var(--fs-xs); color: var(--text-faint); margin-top: 3px; }
+.al-meta code { font-family: var(--font-mono); font-size: .95em; }
+.al-link { display: inline-block; font-size: var(--fs-sm); margin-top: 5px; }
+/* Disclosure for the alert body. The body is a raw multi-line string (a
+   traceback, an ffmpeg tail), so it keeps its own newlines and wraps rather
+   than being clipped to a line. */
+.al-toggle {
+  display: block; margin-top: 5px; padding: 0; background: none; border: none;
+  font: inherit; font-size: var(--fs-sm); color: var(--accent-text); cursor: pointer;
+}
+.al-detail {
+  margin-top: 6px; padding-top: 6px; border-top: 1px solid var(--border-soft);
+  font-size: var(--fs-sm); color: var(--text-muted); white-space: pre-wrap; word-break: break-word;
+}
+.al-actions { flex: none; }
+
+@media (max-width: 480px) {
+  .al-row { flex-wrap: wrap; }
+  .al-body { flex-basis: 100%; order: 3; }
+}
+</style>
+
+<div class="page-head">
+  <h1>Alerts
+    <span class="sub" id="al-unread">{{ unread_count }} unread</span>
+  </h1>
+  <div class="card-head-actions">
+    <button class="btn btn-sm" id="al-read-all">Mark all read</button>
+    <span class="menu-wrap">
+      <button class="btn btn-sm btn-icon" data-menu aria-label="More actions">&#8943;</button>
+      <div class="menu pop-left">
+        {% if include_dismissed %}
+        <a href="{{ url_for('alerts.alert_center') }}">Hide dismissed</a>
+        {% else %}
+        <a href="{{ url_for('alerts.alert_center', include_dismissed=1) }}">Show dismissed</a>
+        {% endif %}
+        <a href="{{ url_for('settings.notifications_settings') }}">Notification settings</a>
+        <a href="{{ url_for('alerts.ignored_alerts') }}">Manage ignored alerts</a>
+        <div class="sep"></div>
+        <button class="menu-item danger" id="al-dismiss-all">Dismiss all read</button>
+      </div>
+    </span>
+  </div>
+</div>
+<p class="page-sub">Everything the app decided you should know about, newest first. Dismissing
+  an alert only hides it here - it is never what deletes a recording or a log line.</p>
+
+{% if alerts %}
+<div class="card">
+  <div class="card-head">
+    <h2>{{ 'All alerts' if include_dismissed else 'Active alerts' }}
+      <span class="cnt">{{ alerts | length }}</span></h2>
+  </div>
+  <div class="card-body">
+    <div id="alerts-list">
+      {% for a in alerts %}
+      <div class="al-row{% if a.read_at is none %} unread{% endif %}" data-sev="{{ a.severity }}"
+           id="alert-{{ a.id }}" data-id="{{ a.id }}">
+        <span class="alert-severity sev-{{ a.severity }}">{{ a.severity }}</span>
+        <div class="al-body">
+          <div class="al-title">{{ a.title }}</div>
+          <div class="al-meta">
+            {{ a.created_at | local_time if a.created_at else '' }}
+            {% if a.source %}&nbsp;&middot;&nbsp;<code>{{ a.source }}</code>{% endif %}
+            {% if a.alert_type %}&nbsp;&middot;&nbsp;{{ a.alert_type }}{% endif %}
+            {% if a.dismissed_at %}&nbsp;&middot;&nbsp;<em>dismissed</em>{% endif %}
+          </div>
+          {% set link = alert_links.get(a.id) %}
+          {% if link %}
+          <a class="al-link" href="{{ link[0] }}">{{ link[1] }} &rarr;</a>
+          {% endif %}
+          {% if a.body and a.body != a.title %}
+          <button class="al-toggle" data-act="detail">Show details</button>
+          <div class="al-detail" hidden>{{ a.body }}</div>
+          {% endif %}
+        </div>
+        <span class="menu-wrap al-actions">
+          <button class="btn btn-sm btn-icon" data-menu aria-label="More actions">&#8943;</button>
+          <div class="menu pop-left">
+            {% if a.read_at is none %}
+            <button class="menu-item" data-act="read">Mark read</button>
+            {% endif %}
+            {% if a.dismissed_at is none %}
+            <button class="menu-item" data-act="ignore">Ignore future alerts like this</button>
+            <button class="menu-item danger" data-act="dismiss">Dismiss</button>
+            {% endif %}
+            {% if a.read_at is not none and a.dismissed_at is not none %}
+            <span class="pop-title">Nothing left to do</span>
+            {% endif %}
+          </div>
+        </span>
+      </div>
+      {% endfor %}
+    </div>
+  </div>
+</div>
+{% else %}
+<div class="empty-state">
+  <p>No alerts{% if include_dismissed %}, dismissed ones included{% endif %}.</p>
+  {% if not include_dismissed %}
+  <a class="btn" href="{{ url_for('alerts.alert_center', include_dismissed=1) }}">Show dismissed alerts</a>
+  {% endif %}
+</div>
+{% endif %}
+{% endblock %}
+
+{% block scripts %}
+<script src="{{ url_for('static', filename='js/alerts.js') }}"></script>
+{% endblock %}

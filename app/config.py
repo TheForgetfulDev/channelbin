@@ -1,0 +1,1295 @@
+import copy
+import logging
+import os
+import re
+import shutil
+import tempfile
+import threading
+from ruamel.yaml import YAML
+from ruamel.yaml.comments import CommentedMap
+
+log = logging.getLogger(__name__)
+
+# Round-trip YAML: preserves comments/key order on read so save_config() can merge new
+# values into the existing file structure instead of re-serializing from scratch (which is
+# what plain PyYAML dropped, and why it lost every hand-written comment - BUGS.md
+# 2026-08-12). One shared instance, and ruamel's YAML() carries per-instance representer/
+# serializer state, so a concurrent load and dump on it can corrupt either - every use of
+# it, read and write alike, is therefore taken under config_write_lock below.
+_yaml_rt = YAML(typ='rt')
+
+_APP_ROOT = os.path.dirname(os.path.dirname(__file__))
+_CONFIG_PATH = os.path.join(_APP_ROOT, 'config.yaml')
+
+# config.yaml is the app's one shared mutable store outside the database, and it holds
+# flask.secret_key and auth.password_hash - losing it locks the user out. Every writer
+# takes this lock across its WHOLE read-merge-write unit, not just the final write: the
+# same rule retry_on_locked applies to DB commits, for the same reason. Without it two
+# concurrent saves each load, mutate and write, and the loser's field vanishes with no
+# error anywhere - trivially reachable, since settings.js auto-saves per field against a
+# threaded server. _parse_config_file() takes it too, so the shared _yaml_rt instance is
+# never loading and dumping at the same time.
+#
+# RLock, not Lock: config_backup.apply_backup() holds it across a migrate_config() that
+# takes it again, which a plain Lock would deadlock on.
+config_write_lock = threading.RLock()
+
+# Backup destinations default under the app's own instance/ dir, never /dvr: a config
+# backup is config.yaml verbatim (flask.secret_key, notification webhook tokens) and a DB
+# snapshot carries the accounts table's plaintext provider credentials, so both belong on
+# local disk with private permissions rather than on a shared/network mount that every
+# reader of the recordings share can also read (DESIGN-secrets.md §5).
+DEFAULT_CONFIG_BACKUP_DIR = 'instance/config-backups'
+DEFAULT_DB_BACKUP_DIR = 'instance/db-backups'
+
+# Xtream dump/debug-replay files carry the account's plaintext username/password (every
+# stream URL in a dumped playlist embeds them), so this default lives under instance/ for
+# the same reason as the two backup dirs above - not dev/samples/, which is excluded from
+# the shipped tree and would also leave dumps world-readable (dev/changelog/550).
+DEFAULT_XTREAM_DUMP_DIR = 'instance/xtream-dumps'
+
+# Cached channel logo images (app/logo_cache.py) are not secret, but instance/ is the
+# established home for "app-managed local state that isn't a recording" (the two backup
+# dirs and the xtream dump dir above), and Docker already bind-mounts it to a persistent
+# volume - see docker/config.docker.yaml's override to /config/instance/logo-cache.
+DEFAULT_LOGO_CACHE_DIR = 'instance/logo-cache'
+
+# Claimed by app/scheduler.py::init_scheduler() to detect a second live process already
+# running the scheduler/startup-recovery pass against the same database (dev/docs/BUGS.md
+# 2026-08-14) - same instance/ home as the state above, and same reason tests need their
+# own sandboxed path (tests/support/app.py overrides flask.pidfile_path per TestApp).
+DEFAULT_PIDFILE_PATH = 'instance/channelbin.pid'
+
+# Fields that require a service restart to take effect (running code only reads these at
+# startup). Consulted by save_config()/record_config_changes() to decide whether a diffed
+# change should raise the "restart required" flag.
+RESTART_REQUIRED_KEYS = {
+    'logging.level',
+    'logging.file',
+    'channel_testing.enabled',
+    'channel_testing.schedule_hour',
+    'channel_testing.test_days',
+    'channel_testing.window.dispatch_interval_minutes',
+    'config_backup.enabled',
+    'config_backup.backup_hour_et',
+    # flask.* and database.path are read-only in the GUI (behind_proxy renders in the
+    # System card; serve_mockups is raw-YAML-only), but the config.yaml tab writes them
+    # all the same - and each is read exactly once, inside create_app(), so an unflagged
+    # write reports success and silently does nothing. behind_proxy wires ProxyFix and
+    # serve_mockups registers a blueprint; neither is re-read per request
+    # (dev/changelog/586).
+    'flask.port',
+    'flask.host',
+    'flask.debug',
+    'flask.secret_key',
+    'flask.behind_proxy',
+    'flask.serve_mockups',
+    # Resolved into app.config['PIDFILE_PATH'] once at create_app() time; init_scheduler()
+    # reads it from app.config, never a fresh load_config().
+    'flask.pidfile_path',
+    'database.path',
+    # Applied by configure_sqlite_pragmas() when an engine is built, so existing
+    # connections keep the old value until the process restarts.
+    'database.cache_size_mb',
+    'database.wal_size_limit_mb',
+    # The engine's pool is built once by db.init_app(); Flask-SQLAlchemy's own docs say
+    # config changes after that call are not reflected (dev/changelog/423's pool split).
+    'database.pool_size',
+    'database.max_overflow',
+    'database.pool_timeout',
+    'database.background_pool_size',
+    'database.background_max_overflow',
+    'database.background_pool_timeout',
+    # Resolved into app.config['CAPTURE_LOG_DIR'] once at create_app() time; recorder.py
+    # reads it from app.config, never a fresh load_config().
+    'recording.capture_log_dir',
+    # Both consumed once by _setup_logging()'s RotatingFileHandler construction.
+    # logging.level/logging.file (above) already covered the same function; these two were
+    # missed in the original pass.
+    'logging.max_bytes',
+    'logging.backup_count',
+    # Becomes SESSION_COOKIE_SECURE, read once at create_app(). auth.enabled,
+    # auth.password_hash and auth.session_timeout_minutes are deliberately NOT here -
+    # app/auth.py::refresh_auth() re-reads app.config['AUTH'] on every write to those,
+    # so they take effect immediately with no restart.
+    'auth.cookie_secure',
+    # display.nav_poll_interval_seconds is deliberately NOT here, despite looking like a
+    # sibling of the create_app()-time keys above: it's read inside inject_globals(), a
+    # @app.context_processor that calls load_config() fresh on every request, so it
+    # already takes effect with no restart (dev/changelog/619).
+}
+
+# Leaf paths whose values should never be written to the log verbatim (secrets/tokens).
+_SENSITIVE_EXACT_PATHS = {'flask.secret_key', 'auth.password_hash',
+                          'integrations.home_assistant.api_key_hash'}
+
+# One fixed mask string rendered by every settings READ surface for a sensitive leaf, and
+# recognized by save_config() on WRITE to mean "keep the stored secret" (round-trip). ASCII
+# only, never derived per-value (no length hints). Because it is restored on write, the
+# literal string is unusable as a real secret value - clear a secret with '' instead.
+MASK_SENTINEL = '********'
+
+
+def _is_sensitive_path(path: str) -> bool:
+    if path in _SENSITIVE_EXACT_PATHS:
+        return True
+    parts = path.split('.')
+    # notifications.services.<name>.url - webhook URLs embed tokens/keys
+    return len(parts) == 4 and parts[0] == 'notifications' and parts[1] == 'services' and parts[3] == 'url'
+
+
+_DEFAULTS = {
+    # Config schema version - bumped by CONFIG_MIGRATIONS (see migrate_config below).
+    # Present in defaults so GUI/API saves always write the stamp back to config.yaml.
+    'config_version': 1,
+    'recording': {
+        'dvr_output_dir': '/dvr',
+        # Where each capture ffmpeg's stderr is spooled while its segment runs, so the exit
+        # code and the last thing ffmpeg said can be attributed to the segment that died
+        # (dev/changelog/430). Files are tiny, per-segment, and unlinked at segment close.
+        #
+        # Deliberately NOT under dvr_output_dir: /dvr is a `soft` CIFS mount whose writes can
+        # return EIO, and the diagnostic that explains a write failure must not live on the
+        # filesystem that failed. Relative paths anchor to the app root via resolve_app_path().
+        'capture_log_dir': 'capture-logs',
+        'segment_duration_seconds': 0,
+        # Auto-delete terminal recordings (COMPLETED/FAILED/ABORTED) once this many days
+        # old. 0 = never delete. Overridable per Recording Profile
+        # (RecordingProfile.retention_days). Swept by the daily recording_retention job.
+        'retention_days': 0,
+        # Whether the retention sweep also deletes the recording's file on disk, or only
+        # its database row. Defaults to off (files kept) - deleting a user's recorded
+        # video is the higher-cost mistake, so it requires an explicit opt-in rather than
+        # being bundled into retention_days by default.
+        'retention_delete_file': False,
+        # {sub_title} renders the episode/segment name where the EPG supplies one, and
+        # collapses out cleanly when it does not - render_filename_template() trims the
+        # separator an empty substitution leaves behind.
+        'filename_template': '{date} - {title} - {sub_title} - {channel}',
+        # Tag names (see Tag/TagPattern in database.py) whose patterns get scrubbed from the
+        # fully-rendered filename regardless of where they land - 'remove' deletes the
+        # matched text, 'replace' swaps it for the tag's plain name. A tag name should only
+        # ever appear in one of these two lists.
+        'filename_tags_remove': [],
+        'filename_tags_replace': [],
+        'post_process': {
+            'enabled': True,
+            'format': 'mp4',        # 'mp4' or 'mkv'
+            'delete_source': True,  # delete .ts after successful conversion
+            # How long a conversion may run WITHOUT muxing its first output frame. It is
+            # not a budget for the job: once output starts, stall_seconds below is the only
+            # authority and the conversion runs as long as it keeps advancing
+            # (dev/changelog/865). This bounds the one case stall detection deliberately
+            # cannot see - ffmpeg seeking and analyzing a badly-damaged source, where
+            # out_time legitimately sits at 0 for minutes.
+            'pre_output_timeout_seconds': 1800,
+            # Video re-encode policy for mp4 output (fixes Plex seek/FF/RW freezes caused by
+            # timeline gaps captured during stream drops - see changelog 149):
+            #   'damaged' - scan the .ts for timeline damage; re-encode only if found
+            #   'always'  - re-encode every recording
+            #   'never'   - always stream-copy video (fast, but damaged files seek poorly)
+            'reencode_mode': 'damaged',
+            # Compression tuning for mp4 output. video_crf only applies when a video
+            # re-encode actually happens (reencode_mode 'always', or 'damaged' finding
+            # damage) - the plain stream-copy path ignores it. audio_bitrate_kbps applies to
+            # every mp4 conversion, re-encoded or not, since AAC audio is always re-encoded
+            # from ADTS to raw AAC for mp4 output regardless of the video path.
+            'video_crf': 20,            # libx264 CRF, 0-51, lower = better quality/larger file
+            'audio_bitrate_kbps': 192,  # AAC bitrate for mp4 output
+            # Conversion resilience (app/postprocessor.py supervised runner). A conversion
+            # can be killed mid-flight (ffmpeg crash, a service restart, a stall); these
+            # control whether the app restarts it and how it detects a stall.
+            'auto_restart': True,             # restart a conversion that dies/stalls
+            'max_restart_attempts': 3,        # give up after this many restarts; 0 disables auto-restart
+            # The only bound on a conversion that has started producing output. 0 disables
+            # it, which leaves no liveness signal at all - so pre_output_timeout_seconds
+            # above reverts to a whole-job wall clock in that case rather than leaving a
+            # hung conversion to run forever.
+            'stall_seconds': 300,             # kill+count a conversion whose output stops advancing; 0 disables
+            'progress_interval_seconds': 5,   # how often ffmpeg writes -progress and we poll/publish
+            # mp4 conversion vs. an imminent/active recording - local CPU/disk contention,
+            # not covered by DESIGN-concurrency.md's tester/sync/recorder precedence doctrine
+            # (conversion isn't one of that doc's four actors). 'off' = no collision
+            # avoidance. 'cancel' = the conversion yields: it kills its own ffmpeg and
+            # auto-resumes once clear, so the recording is never delayed (recordings always
+            # win). 'wait' = the opposite - a recording whose start_time arrives while a
+            # conversion is running waits for it to finish, UNLESS its own stop_time would
+            # already have passed by then, in which case it is marked FAILED with a loud
+            # alert instead of silently missed.
+            'collision_policy': 'cancel',
+            # Pre-start/resume lookahead window, in units of the recording-being-converted's
+            # own duration: window_seconds = duration / this multiplier. >= 0.1, no upper
+            # bound. 1.0 assumes the conversion runs at 1x realtime (always safe, the
+            # default); 2.0 assumes 2x realtime and only needs to look ahead half the
+            # duration.
+            'collision_lookahead_multiplier': 1.0,
+        },
+        'move_on_complete': {
+            'enabled': False,
+            'destination': '',      # absolute path to destination folder
+        },
+        'post_script': {
+            # A post-script runs an arbitrary executable as a subprocess after every
+            # recording (app/postprocessor.py) - a code-execution setting, so it ships
+            # OFF with a blank path. Someone who never configured it must not have it run.
+            'enabled': False,
+            'path': '',
+            'timeout_seconds': 300,
+        },
+        'live_thumbnail': {
+            'enabled': True,
+            'dir': '/dvr/live_thumbnails',
+            'min_regen_interval_seconds': 10,
+            'capture_timeout_seconds': 12,
+            'auto_refresh_seconds': 60,   # frontend polling cadence; user-configurable in Settings
+        },
+        # Local caching of Channel.logo_url images instead of hotlinking the provider/CDN
+        # on every page view (dev/changelog/601).
+        # Off by default: an install with no need for it shouldn't get a background job and
+        # a growing cache directory it never asked for. The scheduled job (app/logo_cache.py,
+        # app/scheduler.py::_logo_cache_job) only fetches logos for channels that are in the
+        # TV Guide or belong to a channel/health-check group - never the whole catalog.
+        # A deliberate scope choice, not an oversight.
+        'logo_cache': {
+            'enabled': False,
+            'dir': DEFAULT_LOGO_CACHE_DIR,
+        },
+        'gather_health_data': True,  # run ffprobe on completed .ts to capture resolution/fps/frames
+        # If true, only one concat+conversion job runs at a time, and none run while
+        # any recording is IN_PROGRESS - a queued concat waits rather than failing.
+        # Local CPU/disk contention control; unrelated to accounts.default_max_connections.
+        'serialize_concat': False,
+    },
+    'watchdog': {
+        'poll_interval_seconds': 5,
+        'stall_timeout_seconds': 30,
+        'restart_delay_seconds': 30,
+        'max_consecutive_failures': 10,
+        # Dead-stream fast-fail: a stream that reconnects but immediately dies again
+        # (identical low byte counts each time) never trips max_consecutive_failures
+        # because each restart looks "successful". This is an independent trip-wire.
+        'early_fail_window_seconds': 60,          # segment must stall within this long to be a candidate
+        'early_fail_min_bytes': 1048576,          # ...and produce fewer than this many bytes (1MB)
+        'early_fail_abort_count': 3,               # consecutive early-failure segments before auto-abort
+        'early_fail_abort_window_seconds': 180,    # the streak must occur within this window
+        # Dead-stream retry (Product Principle 2): once the fast-fail trip-wire above fires,
+        # retry at 1/2/5/15 minutes then hourly (hardcoded cadence) instead of giving up
+        # immediately, up to this many total attempts - whichever comes first against the
+        # recording's own scheduled window. 0 = no retries, same as pre-retry behavior.
+        'dead_stream_max_retry_attempts': 10,
+    },
+    'ffmpeg': {
+        'path': 'ffmpeg',
+        'extra_input_args': [],
+        'extra_output_args': [],
+        'concat_timeout_seconds': 300,
+    },
+    'flask': {
+        'port': 5000,
+        'host': '0.0.0.0',
+        'debug': False,
+        'secret_key': 'change-me-in-production',
+        # True = trust X-Forwarded-For/-Proto/-Host from a reverse proxy (ProxyFix).
+        # Must stay False when no proxy fronts the app - otherwise any client can
+        # spoof its own scheme/host/IP via those headers.
+        'behind_proxy': False,
+        # True = serve the gitignored dev/mockups/ folder at /mockups/ (a dev-only
+        # convenience for reviewing static UI mockups in the browser). Stays False on
+        # any shared/proxied deploy; the route is not registered at all when False.
+        'serve_mockups': False,
+        # None → DEFAULT_PIDFILE_PATH (instance/channelbin.pid). Raw-YAML-only, same as
+        # serve_mockups - not something a normal install ever needs to change.
+        'pidfile_path': None,
+    },
+    # A door on something that was standing open, not a hardened auth system: one shared
+    # password, no usernames/accounts/roles/2FA. Off by default so existing installs are
+    # unaffected. See app/auth.py and dev/docs/DESIGN-secrets.md §6.
+    'auth': {
+        'enabled': False,
+        'password_hash': '',              # werkzeug scrypt hash - NEVER the plaintext
+        'session_timeout_minutes': 0,      # 0 = stay logged in indefinitely on that device
+        'cookie_secure': False,            # set true only when always served over HTTPS
+    },
+    # Inbound-facing integrations that poll ChannelBin's own state (as opposed to
+    # notifications.services.<name>, which is ChannelBin pushing OUT to a service - the two
+    # are unrelated despite both naming 'home_assistant'). Off by default; see app/routes/ha.py.
+    'integrations': {
+        'home_assistant': {
+            'enabled': False,
+            'api_key_hash': '',           # werkzeug scrypt hash - NEVER the plaintext
+        },
+    },
+    'database': {
+        'path': os.path.join(_APP_ROOT, 'dvr.db'),
+        # Pre-migration DB snapshots (app/migrations.py): before any pending schema
+        # migration runs at startup, the DB is copied via VACUUM INTO. This is the whole
+        # rollback story - there are no down-migrations.
+        'pre_migration_backup': True,
+        'backup_dir': DEFAULT_DB_BACKUP_DIR,
+        'migration_backups_keep': 3,   # 0 = keep all
+        # SQLite page cache per connection, in MB (app/db_utils.py converts it to the
+        # pragma's negative-KiB form). SQLite's own default is 2MB, which is not a
+        # considered figure for a database this size - see dev/changelog/363.
+        'cache_size_mb': 64,
+
+        # How much of dvr.db-wal SQLite is allowed to KEEP once it no longer needs it
+        # (PRAGMA journal_size_limit, in MB). Read the next paragraph before tuning this.
+        #
+        # IT IS NOT A QUOTA AND MUST NEVER BE TREATED AS ONE. A transaction always grows the
+        # WAL to whatever it needs and always succeeds - measured on this box at 20x and 32x
+        # this setting, both committing fine (dev/changelog/424). The limit only takes effect
+        # on the first commit AFTER a checkpoint has rewound the WAL, and all it does then is
+        # give the unused tail back to the filesystem. So a user with 20 accounts whose sync
+        # legitimately needs a 900MB WAL gets a 900MB WAL; they just do not keep it forever.
+        # Set it too LOW and a workload that routinely exceeds it pays truncate-then-re-extend
+        # churn on every cycle; a WAL that stays under the limit is never touched at all.
+        #
+        # Before this existed the value was SQLite's default of -1, "never truncate", and
+        # dvr.db-wal sat at 2758.7MB against a 1598.6MB database with only 1.2MB of it live -
+        # the high-water mark of one 16-minute incident, kept forever. The failure that
+        # matters is not the size, it is that nothing bounded it: this box had 41GB free, a
+        # Raspberry Pi on a 32GB card would have filled up.
+        #
+        # 256 is ~64x the 4MB autocheckpoint threshold, so ordinary operation never approaches
+        # it and nothing is ever truncated; it is a ceiling for the pathological case, not a
+        # working size. 0 means no limit (SQLite's -1), i.e. the old behavior, for anyone who
+        # wants it back.
+        'wal_size_limit_mb': 256,
+
+        # TWO CONNECTION POOLS on one dvr.db, and the split is the point: the UI pool serves
+        # requests, the background pool serves everything with no request behind it - the
+        # account sync, the search index rebuild, every scheduled job, the recorder threads.
+        # Drawing from separate sets is what makes "browsing cannot starve a recording or a
+        # sync of its connection" structural rather than lucky. Until 2026-08-01 there was one
+        # pool and no setting at all, so SQLAlchemy's 5 + 10 default applied by accident, and
+        # search scans holding every connection killed an account sync outright
+        # (dev/changelog/423). Restart to apply - engines are built once, at startup.
+        #
+        # THE CEILING COSTS MEMORY. cache_size_mb above is per CONNECTION, so the worst case
+        # is (pool_size + max_overflow) x cache_size_mb per pool - here (8+8 + 4+8) x 64MB =
+        # 1.8GB - and this box has 10GB with NO SWAP, where running out is a livelock rather
+        # than a slowdown. SQLite fills a cache lazily, so only connections that actually scan
+        # approach it, but RAISING EITHER CEILING MEANS REDOING THAT ARITHMETIC FIRST.
+        'pool_size': 8,          # UI connections kept warm (a warm page cache is the win in 363)
+        'max_overflow': 8,       # UI burst on top, closed after use; ceiling 16
+        # 16 because a browser opens ~6 connections per host per tab, so 2-3 tabs is the real
+        # worst case, and since dev/changelog/418 no request can camp on a connection - a
+        # search is capped at search.timeout_seconds. Deliberately only one above the 15 that
+        # used to apply by accident: the fix here is the split, not a bigger number.
+        'pool_timeout': 30,      # seconds a UI request waits for a connection before failing
+        # 30 is longer than the longest a request may hold one (20s), so ordinary turnover
+        # always wins the wait. A UI request still waiting after 30s is facing something
+        # pathological and should fail loudly rather than pile up.
+
+        'background_pool_size': 4,
+        'background_max_overflow': 8,   # ceiling 12
+        # 12 covers APScheduler's 10 worker threads plus the recorder watchdogs, the
+        # concatenator and the post-processor, which is every background consumer there is.
+        'background_pool_timeout': 60,  # a sync would rather be late than fail
+    },
+    'logging': {
+        'level': 'INFO',
+        'file': None,
+        'max_bytes': 10485760,   # rotate the log file at 10 MB; <= 0 disables rotation
+        'backup_count': 5,       # keep this many rotated files (~60 MB total with the default size)
+    },
+    'search': {
+        # Wall-clock budget for one /api/channels/search request, enforced inside SQLite so
+        # it can stop a statement already running (app/db_utils.py::query_deadline). Blowing
+        # it is a 503, never a silently short result. Either value at 0 disables its half.
+        #
+        # TWO BUDGETS, because a healthy slow search and a degraded one are different
+        # problems and one number cannot serve both (dev/changelog/418):
+        #
+        # * a request whose index is USABLE gets the backstop. It has to clear the slowest
+        #   legitimate request there is. Two defects set this number in turn: the airing
+        #   grain's first-paint facet request at 32-64s (90s, fixed in dev/changelog/420),
+        #   then the rail's Today chip at 40s (60s, fixed in dev/changelog/421). With both
+        #   gone the slowest legitimate request measured over HTTP on the live database is
+        #   **9.3s** - an unbounded `custom:` window, i.e. the widest search the page can
+        #   express - with Today at 6.7s and the unfiltered rail at 6.6s. 20s is ~2x that
+        #   ceiling. Re-measure before moving it again; the number is a measurement, not a
+        #   preference.
+        # * a request running UNINDEXED gets the tight one. That is the sync-window state
+        #   the incident happened in - a LIKE scan over 1.9M epg_entries rows, ten of them
+        #   at once - where the request has no business grinding on and shedding it early is
+        #   the point. 15s is ~13x the 1.2s that scan costs on an idle box.
+        'timeout_seconds': 20,
+        'degraded_timeout_seconds': 15,
+        # How many searches may run WITHOUT their index at once. The other half of the same
+        # incident: one unindexed scan is survivable, ten together are what saturated the
+        # box, exhausted the pool, killed the sync and starved the rebuild that would have
+        # ended the degraded window (dev/changelog/422). Waiting for a slot is charged
+        # against the budget above, not added to it, and a request that never gets one is a
+        # 503 that says so. 0 disables the cap.
+        #
+        # 1, on a two-core box, and the reasoning is that the scan is CPU-bound and
+        # single-threaded: running two at once does not raise throughput, it just makes both
+        # take twice as long, so serializing costs the second requester nothing it was not
+        # already going to pay - while it keeps a core free for the rebuild and the sync that
+        # END the degradation. Measured before the cap: eight concurrent degraded airing
+        # searches ALL failed at the 15s budget having returned nothing, against 10.6s for
+        # the same search alone.
+        'max_concurrent_unindexed': 1,
+        # Memoize each tag's "channels carrying it" id set (app/channel_search.py -
+        # _cached_tag_channel_ids), instead of recomputing it live on every search/facet
+        # count. A common-word tag pattern (`live`, `new`) can otherwise make the query
+        # planner pick it as the driving predicate over far more selective filters and blow
+        # past the timeout above (dev/changelog/597). Costs kilobytes to low tens of MB in
+        # practice (bounded by channel count, not EPG row count - measured in the same
+        # changelog); on by default. Exposed in Settings so a RAM-constrained install can
+        # turn it off, which also frees whatever is currently cached.
+        'tag_id_cache_enabled': True,
+        # How long the airing grain's UNFILTERED standing-breakdown result (the total + the
+        # four default "Hide X" counts, app/channel_search.py::_cached_standing_breakdown) may
+        # be served from cache before recomputing, on top of its watermark invalidation
+        # (a channel/EPG sync landing). Load-bearing, not a nicety: the watermark cannot see a
+        # health-check score update, a channel-group membership edit, or wall-clock time
+        # passing (the "hide past airings" toggle) - all three feed the default-on toggles, and
+        # this bounds how stale the cached numbers can get from any of them
+        # (dev/changelog/598). 300s (5 minutes), deliberately chosen. Exposed in Settings.
+        'standing_breakdown_cache_ttl_seconds': 300,
+        # Budget for an OPTIONAL aggregate - the totals and the facet rail - while search is
+        # running unindexed. Rows are never optional and never use this; they keep
+        # `degraded_timeout_seconds` above.
+        #
+        # A degraded aggregate is attempted, not refused outright, because "degraded" covers
+        # a fresh install whose index has never been built - where these counts cost
+        # microseconds over a few hundred channels. A blanket refusal would leave that
+        # install with no totals forever. So the cost decides, and this is the cut-point:
+        # anything that cannot answer within it is declined and labeled as declined.
+        #
+        # 2s, measured. On this database one degraded aggregate is 3.6-3.8s (the LIKE COUNT
+        # over 1.48M epg_entries rows, and the grouped facet scan) against ~3.4s for the row
+        # page that the user is actually waiting on - so they are declined here, and served
+        # on any install where they are genuinely cheap. 0 = never attempt.
+        'degraded_aggregate_timeout_seconds': 2,
+        # The same lever for the other reason an optional aggregate gets expensive: the index
+        # is perfectly healthy, but it cannot answer the question that was asked, so counting
+        # means reading the whole table (app/channel_search.py::full_scan_reason - today that
+        # is the airing grain with "Show airings that have ended" ticked).
+        #
+        # Separate from the key above because the two states are not the same fact. A degraded
+        # window repairs itself in minutes and waiting is the remedy, so 2s is generous. This
+        # one never repairs - it lasts exactly as long as the user leaves the option off - so
+        # the budget is set by how long an optional number is worth waiting for rather than by
+        # how soon it will be cheap again.
+        #
+        # 8s, measured. There is no cost cliff to aim at: with the option off, the facet rail
+        # measures 1.2s / 1.3s / 3.5s / 4.8s / 7.6s / 8.0s / 9.2s / 17.3s / 19.4s as filters
+        # narrow it, then 24.4s unfiltered - a continuous spread, so any cut point is a choice
+        # about waiting, not a classifier. 8s is what the ordinary DEFAULT airing rail already
+        # costs on this database (7.6s), i.e. the slowest wait this page already asks for;
+        # past that the number is declined rather than waited on. 0 = never attempt.
+        'full_scan_aggregate_timeout_seconds': 8,
+        # How long a search index may sit unusable with nobody rebuilding it before the
+        # index janitor rebuilds it itself (app/search_index.py::run_index_janitor, run every
+        # 10 minutes by scheduler.py::schedule_index_janitor). 0 = never, which puts index
+        # repair back on the next account sync alone.
+        #
+        # The grace is not a throttle, it is a right-of-way rule: the janitor is the LAST
+        # resort, and a sync's own close-out rebuild is the first. A sync already in flight
+        # refuses the janitor through admission, but one about to start does not - and at
+        # startup APScheduler fires every missed sync interval immediately, so the sync that
+        # will fix this is often seconds away. 15 minutes leaves that window clear while
+        # still capping the degraded window at 15-25 minutes, against the 6.5 hours measured
+        # on 2026-08-15 when a restart mid-sync left the repair to nobody (dev/changelog/680).
+        'index_janitor_grace_minutes': 15,
+    },
+    'accounts': {
+        # Fallback per-account "max simultaneous connections" cap when an account's own
+        # Account.max_connections override is unset. Shared by recordings + channel tests
+        # (see app/connection_limits.py); does not apply to account sync.
+        'default_max_connections': 1,
+    },
+    'sync': {
+        'sync_interval_hours': 12,
+        # Days of future EPG to import AND the width of the TV Guide grid, so the guide can
+        # never span more time than it has data for (DESIGN.md 12.1 - the day count in every
+        # visible string is generated from this, never typed).
+        'epg_days_ahead': 3,
+        'epg_keep_days': 1,
+        'sync_log_keep_days': 30,   # delete AccountSyncLog rows older than this; 0 = keep forever
+        'request_timeout_seconds': 30,
+        # Stream-URL normalization mode, the global default every account inherits unless it
+        # overrides (changelog/258 Spec §1): 'disabled' | 'mpegts' | 'mpegts_live' |
+        # 'hls'. Ships disabled - never rewrite a user's stream URLs unless they ask.
+        # Legacy booleans from a pre-dropdown config are still accepted (True -> 'mpegts').
+        'url_normalization': 'disabled',
+        'epg_case_sensitive_matching': False,  # False = merge case-variant EPG IDs when matching XMLTV
+        'skip_sync_if_recording_active': True,
+        'skip_sync_if_recording_within_minutes': 5,
+        'tester_defer_retry_minutes': 20,  # defer sync past an active test run, retry after this; 0 = skip with no retry
+        'url_drift_alert_min_channels': 50,  # WARN when a sync rewrites this many channels' stream URLs; 0 = disabled
+        # Refuse an EPG import when the projected entry count is below this percent of the
+        # prior sync's cached epg_entry_count (DESIGN-sync-resilience.md §4) - guards against
+        # a transient garbage/empty XMLTV fetch wiping future EPG. 0 = disabled.
+        'epg_collapse_threshold_percent': 20,
+        # Refuse to apply the provider's live-channel catalog when doing so would cut the
+        # account below this percent of its prior channel_count (DESIGN-live-vod.md §4.1) -
+        # a truncated catalog must not silently decimate a working channel list. The
+        # playlist is then imported unfiltered and an alert is raised. 0 = disabled.
+        'live_classify_collapse_threshold_percent': 20,
+        # Channel lifecycle tracking (DESIGN-sync-resilience.md §5) - display thresholds
+        # only, sync never deletes/disables a channel based on these. 0 = feature off.
+        'channel_missing_after_days': 7,
+        'channel_new_within_days': 3,
+        # WARN when >= this percent of the account's prior channel_count baseline went
+        # unseen in one sync (advisory only - channels are never deleted). 0 = disabled.
+        'feed_shrink_percent': 50,
+    },
+    'display': {
+        'timezone': 'America/New_York',  # IANA timezone identifier (DST-aware)
+        'time_format': '12h',            # '12h' (AM/PM) or '24h'
+        'nav_poll_interval_seconds': 15, # how often the nav bar (stats/alerts/activity) polls
+        'guide_collapse_gaps': True,     # TV Guide: collapse non-matching time gaps when a search filter is active
+    },
+    'debug': {
+        'xtream_debug_mode': False,  # shows Fetch & Dump / Sync from Dump buttons in UI
+        'xtream_dump_dir': None,     # None → DEFAULT_XTREAM_DUMP_DIR (instance/xtream-dumps)
+    },
+    'http': {
+        'user_agent': 'VLC/3.0.18 LibVLC/3.0.18',
+    },
+    'channel_testing': {
+        # Enable/schedule for the automatic guide run live on the 'TV Guide Channels'
+        # system health-check row (OnDemandTestJob.is_system), not in config.
+        'skip_if_recording_active': True,       # skip the TV Guide Channels run if a recording is IN_PROGRESS
+        'skip_if_recording_within_minutes': 10, # skip ANY run (system or custom) if a recording starts this soon; 0 = off
+        'test_duration_seconds': 30,
+        'wait_between_channels_seconds': 30,
+        'screenshots_enabled': True,
+        'screenshots_keep_count': 5,            # per channel, oldest pruned
+        'screenshot_dir': '/dvr/channel_test_screenshots',
+        'capture_scratch_dir': '',              # '' -> system temp dir; set to redirect large capture clips elsewhere
+        'test_history_keep': 0,                 # 0=keep forever, N=keep last N tests per channel
+        'connect_retries': 2,                   # extra connection attempts after first failure
+        'connect_timeout_seconds': 15,          # seconds to wait for first byte per attempt
+        'connect_retry_delay_seconds': 10,      # seconds to wait between retry attempts
+        'bitrate_fail_720p_kbps': 1000,         # fail if height ≤720 and bitrate ≤ this (kbps)
+        'bitrate_fail_1080p_kbps': 2000,        # fail if 720 < height ≤1080 and bitrate ≤ this (kbps)
+        'bitrate_fail_4k_kbps': 3000,           # fail if height >1080 and bitrate ≤ this (kbps)
+        # Lifetime channel health score (app/health_score.py) - undertuned defaults,
+        # expect to retune once more real test/recording data accumulates.
+        'health_score_half_life_samples': 5,        # score decay half-life, in observations (not days)
+        'reference_minutes': 2,                     # duration that gets observation weight 1.0 (sqrt scaling)
+        'instability_penalty_per_hr': 2.0,           # per restart/drop-per-hour, on top of proportional time-lost
+        'health_score_test_fail_floor': 10,         # quality score for a FAILED test
+        'health_score_warn_penalty': 10,            # any WARN on an otherwise-COMPLETED test
+        # Where the four health bands start (app/health_bands.py). Poor is always 0 - a band
+        # scale needs a bottom nothing can fall through. Must descend: great > good > fair.
+        'health_bands': {
+            'great': 90,
+            'good': 80,
+            'fair': 50,
+        },
+        # Which band counts as failing for scheduled-recording warnings
+        # (app/health_score.py::channel_failing_reason): the named band or any band below it.
+        # 'none' = only hard test failures and streaks count. Replaced the numeric
+        # failing_score_threshold in config_version 2 (dev/changelog/771).
+        'failing_band': 'poor',
+        # N-or-more consecutive FAILED tests (CANCELLED skipped) = failing, independent of
+        # the score above - a channel with a good prior history can sit well above
+        # failing_score_threshold through weeks of hard failures (dev/changelog/478).
+        # Feeds Channel.consecutive_test_failures via channel_groups.is_streaking /
+        # rank_members (last-resort failover ranking) and channel_failing_reason
+        # (schedule-time + reactive warnings). 0 disables streak-based failing.
+        'failing_streak_threshold': 3,
+        'recording_score': {
+            'fail_floor': 5,                          # quality score for a channel-attributable FAILED recording
+            'near_empty_bitrate_ratio': 0.20,         # segment flagged near-empty/slate below this fraction of the recording's average bitrate
+            'near_empty_min_span_seconds': 30,        # segments shorter than this are never flagged (avoid noise)
+            'damage_penalty_per_pct_missing': 3,      # capture-quality correction: per % of window timeline-damaged
+            'near_empty_penalty_per_pct': 2,          # capture-quality correction: per % of window near-empty/slate
+            'capture_quality_source_weight': 1.0,     # fixed weight for the capture-quality correction bolt-on (not duration-scaled)
+        },
+        # Pre-recording health check (DESIGN-prerecord-checks.md §3): optionally test a
+        # recording's channel a lead time before it starts. Off by default - it spends a
+        # provider connection. RecordingProfile.pre_check_enabled overrides 'enabled' per
+        # profile (None = inherit this).
+        'pre_check': {
+            'enabled': False,
+            'lead_minutes': 15,           # fire this long before recording start
+            'retry_minutes': 5,           # tester-busy retry cadence (0 = skip instead of retry)
+            'min_margin_seconds': 60,     # extra slack required beyond worst-case test duration
+        },
+        # Maintenance window for recurring health checks marked recur_use_window=True
+        # (app/check_window.py): the dispatcher runs them back-to-back inside this
+        # display-timezone clock range instead of at an exact time, so they can never
+        # collide. No 'enabled' flag - a window with no checks assigned costs nothing.
+        'window': {
+            'start': '02:00',                 # display timezone, HH:MM
+            'end':   '06:00',                 # <= start means the window crosses midnight
+            'dispatch_interval_minutes': 5,   # how often the dispatcher looks for the next due check
+        },
+    },
+    'config_backup': {
+        'enabled': True,
+        'backup_hour_et': 1,   # Hour in configured display timezone (DST-aware)
+        'backup_retention_days': 14,
+        'backup_dir': DEFAULT_CONFIG_BACKUP_DIR,
+    },
+    'alerts': {
+        # Daily db-maintenance sweep deletes dismissed alerts older than this many days.
+        # Only dismissed (resolved) alerts are ever removed - active/unread ones are kept
+        # regardless of age. 0 = keep forever.
+        'keep_days': 90,
+    },
+    'notifications': {
+        'push_rate_limit_seconds': 60,
+        'base_url': '',   # e.g. http://192.168.1.50:5000 - used to build links in push notifications
+        'services': {
+            'discord':        {'enabled': False, 'url': ''},
+            'home_assistant': {'enabled': False, 'url': ''},
+            'pushover':       {'enabled': False, 'url': ''},
+            'smtp2go':        {'enabled': False, 'url': ''},
+            'whatsapp':       {'enabled': False, 'url': ''},
+        },
+        'routing': {
+            'LOG_ERROR':   {'in_app': True, 'push_services': []},
+            'LOG_CRIT':    {'in_app': True, 'push_services': []},
+            'JOB_SKIPPED': {'in_app': True, 'push_services': []},
+            'HEALTH_CHECK_WINDOW': {'in_app': True, 'push_services': []},
+        },
+    },
+}
+
+
+# ---------------------------------------------------------------------------
+# Filesystem paths derived from config values. Config paths may be written relative
+# (the backup-dir defaults above are), and the app's CWD is not guaranteed - systemd,
+# a Docker ENTRYPOINT and a shell all start it differently - so a relative value must
+# be anchored to the app root rather than resolved by the process CWD.
+# ---------------------------------------------------------------------------
+
+def resolve_app_path(path: str) -> str:
+    """Absolutize a config-supplied path against the app root. Absolute paths pass
+    through unchanged, so a user-pointed directory is never rewritten."""
+    if not path:
+        return path
+    return path if os.path.isabs(path) else os.path.join(_APP_ROOT, path)
+
+
+def ensure_private_dir(path: str) -> str:
+    """makedirs(path) and, only when this call created it, chmod 0700.
+
+    Backup dirs hold secrets (DESIGN-secrets.md §5), so a dir we create is private from
+    birth. A dir that already exists is left alone: its permissions are the user's
+    choice, and on a network mount (CIFS forces dir_mode) a chmod would fail or be
+    silently ignored anyway."""
+    created = not os.path.isdir(path)
+    os.makedirs(path, exist_ok=True)
+    if created:
+        try:
+            os.chmod(path, 0o700)
+        except OSError as exc:
+            log.warning('Could not set 0700 permissions on %s: %s', path, exc)
+    return path
+
+
+_restart_needed: bool = False
+
+
+def set_restart_needed(value: bool = True):
+    global _restart_needed
+    _restart_needed = value
+
+
+def is_restart_needed() -> bool:
+    return _restart_needed
+
+
+_MISSING = object()
+
+
+def _flatten(d, prefix=''):
+    """Yield (dot.path, value) for every leaf in a nested dict."""
+    if isinstance(d, dict):
+        for key, val in d.items():
+            path = f'{prefix}.{key}' if prefix else str(key)
+            yield from _flatten(val, path)
+    else:
+        yield (prefix, d)
+
+
+def set_nested(d: dict, path: str, value):
+    """Set a value in a nested dict using a dot-separated path, creating intermediate
+    dicts as needed. Shared by the settings routes and the secret round-trip below."""
+    keys = path.split('.')
+    for key in keys[:-1]:
+        d = d.setdefault(key, {})
+    d[keys[-1]] = value
+
+
+# ---------------------------------------------------------------------------
+# Settings-surface secret masking (DESIGN-secrets.md §6). _is_sensitive_path is THE
+# authority for "this leaf is secret"; these helpers key off it so a new secret key is
+# covered the moment it is added there.
+# ---------------------------------------------------------------------------
+
+def mask_config(cfg: dict) -> dict:
+    """Return a deep copy of `cfg` with every sensitive leaf that holds a non-empty value
+    replaced by MASK_SENTINEL. Every settings READ surface (API JSON, the YAML editor dump,
+    the notification service URL inputs) renders this, never the raw config. An empty/unset
+    secret is left empty so the UI can still show it as not-set."""
+    masked = copy.deepcopy(cfg)
+    for path, value in _flatten(cfg):
+        if _is_sensitive_path(path) and isinstance(value, str) and value:
+            set_nested(masked, path, MASK_SENTINEL)
+    return masked
+
+
+def restore_masked_secrets(new: dict, old: dict):
+    """Round-trip guard (mutates `new` in place): for every sensitive leaf whose incoming
+    value equals MASK_SENTINEL, replace it with the value stored in `old` so a masked read
+    saved back unchanged is a no-op and the mask string never overwrites a real secret. If
+    nothing is stored for that leaf, store '' and warn (never persist the sentinel)."""
+    old_flat = dict(_flatten(old))
+    for path, value in list(_flatten(new)):
+        if value == MASK_SENTINEL and _is_sensitive_path(path):
+            stored = old_flat.get(path)
+            if isinstance(stored, str) and stored and stored != MASK_SENTINEL:
+                set_nested(new, path, stored)
+            else:
+                log.warning('Mask sentinel received for unset/unknown secret %r; storing '
+                            'empty string instead of the sentinel', path)
+                set_nested(new, path, '')
+
+
+def redact_sensitive_diff_lines(lines):
+    """Redact secret values on unified-diff lines from the config-backup diff surface. Keyed
+    off the known config structure per DESIGN-secrets.md §6 (no YAML re-parse): a `secret_key:`
+    line, a `password_hash:` line, or a bare `url:` line (the notifications.services.<name>.url
+    leaves - `base_url:` and other `*_url:` keys do not match). The diff prefix (+/-/space) and
+    key are preserved; only a non-empty value is replaced with MASK_SENTINEL."""
+    out = []
+    for line in lines:
+        m = _DIFF_SECRET_RE.match(line)
+        if m and m.group('val').strip():
+            out.append(f"{m.group('pre')}{m.group('key')}: {MASK_SENTINEL}")
+        else:
+            out.append(line)
+    return out
+
+
+# Diff line = one +/-/space prefix, indentation, the bare key, ': ', then the value.
+# Keyed on literal key names rather than _is_sensitive_path() (unlike every other masker
+# here) because a unified diff line has no path context to check against - it is one
+# indented `key: value` line with no parent keys visible. A new _SENSITIVE_EXACT_PATHS
+# leaf whose bare key differs from its full path (as auth.password_hash's does not, but
+# integrations.home_assistant.api_key_hash's does) needs its own alternative added here
+# explicitly.
+_DIFF_SECRET_RE = re.compile(
+    r'^(?P<pre>[+\- ]\s*)(?P<key>secret_key|password_hash|api_key_hash|url):\s*(?P<val>.*)$')
+
+
+def _diff_leaves(old: dict, new: dict) -> list:
+    """Return [(path, old_value, new_value), ...] for every leaf that differs between
+    two nested config dicts. old_value/new_value is _MISSING if the leaf's path only
+    exists on one side (key added/removed)."""
+    old_flat = dict(_flatten(old))
+    new_flat = dict(_flatten(new))
+    changed = []
+    for path in sorted(set(old_flat) | set(new_flat)):
+        ov = old_flat.get(path, _MISSING)
+        nv = new_flat.get(path, _MISSING)
+        if ov != nv:
+            changed.append((path, ov, nv))
+    return changed
+
+
+def record_config_changes(old: dict, new: dict) -> list:
+    """Diff two config dicts, log one line per changed leaf, and raise the restart-needed
+    flag if any changed leaf is restart-required. Returns the list of (path, old, new)
+    changes found (empty if nothing changed)."""
+    changed = _diff_leaves(old, new)
+    restart_triggered = False
+    for path, ov, nv in changed:
+        needs_restart = path in RESTART_REQUIRED_KEYS
+        restart_triggered = restart_triggered or needs_restart
+        if _is_sensitive_path(path):
+            ov_disp = '<redacted>' if ov is not _MISSING else '<unset>'
+            nv_disp = '<redacted>' if nv is not _MISSING else '<unset>'
+        else:
+            ov_disp = '<unset>' if ov is _MISSING else ov
+            nv_disp = '<unset>' if nv is _MISSING else nv
+        log.info('Config changed: %s: %r -> %r%s', path, ov_disp, nv_disp,
+                  ' [restart required]' if needs_restart else '')
+    if restart_triggered:
+        set_restart_needed(True)
+    return changed
+
+
+def _deep_merge(base, override):
+    result = dict(base)
+    for key, val in override.items():
+        if key in result and isinstance(result[key], dict) and isinstance(val, dict):
+            result[key] = _deep_merge(result[key], val)
+        else:
+            result[key] = val
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Config migrations - versioned transforms for renames/moves/semantic changes.
+# New keys need no migration: load_config() deep-merges _DEFAULTS underneath the
+# file, so additions appear automatically. Append only, never edit a shipped step.
+# ---------------------------------------------------------------------------
+
+def _cfg_m001_xtream_to_sync(cfg: dict) -> dict:
+    """The pre-versioning 'xtream' section was renamed 'sync' - carry old files
+    (and restored config backups from that era) forward."""
+    if 'xtream' in cfg and 'sync' not in cfg:
+        cfg['sync'] = cfg.pop('xtream')
+    return cfg
+
+
+def _cfg_m002_failing_band(cfg: dict) -> dict:
+    """`channel_testing.failing_score_threshold` (a raw score) became
+    `channel_testing.failing_band` (a band name) - dev/changelog/771.
+
+    The app had two vocabularies for one judgment: badges said Poor/Fair/Good while the
+    scheduled-recording warning compared against a bare number nothing else in the UI
+    mentioned. The band is now the setting and the number is derived from it.
+
+    The old threshold maps to whichever band a score just below it fell into, so an
+    untouched default (25) becomes `poor`. That does move the effective cut point - 25 to
+    the Poor band's ceiling of 50 - so the transform says so at WARNING rather than
+    migrating silently.
+    """
+    from .health_bands import BAND_KEYS, DEFAULT_FLOORS, FAILING_NONE, POOR
+
+    ct = cfg.get('channel_testing')
+    if not isinstance(ct, dict) or 'failing_score_threshold' not in ct:
+        return cfg
+    old = ct.pop('failing_score_threshold')
+    try:
+        threshold = int(old)
+    except (TypeError, ValueError):
+        threshold = None
+
+    if threshold is None:
+        band = POOR
+    elif threshold <= 0:
+        band = FAILING_NONE
+    else:
+        floors = (ct.get('health_bands') or {}) if isinstance(ct.get('health_bands'), dict) else {}
+        # The band that a score one point below the old threshold fell into.
+        probe = threshold - 1
+        band = POOR
+        for key in BAND_KEYS[:-1]:
+            floor = floors.get(key, DEFAULT_FLOORS[key])
+            if isinstance(floor, int) and probe >= floor:
+                band = key
+                break
+    ct['failing_band'] = band
+    log.warning('config migration: channel_testing.failing_score_threshold (%r) is now '
+                'channel_testing.failing_band: %r - a channel counts as failing at that '
+                "band's ceiling rather than at the old raw score", old, band)
+    return cfg
+
+
+def _cfg_m003_conversion_pre_output_timeout(cfg: dict) -> dict:
+    """`recording.post_process.timeout_seconds` and `reencode_timeout_seconds` (whole-job
+    deadlines) are gone; `pre_output_timeout_seconds` bounds only the phase before ffmpeg
+    muxes its first frame - dev/changelog/865.
+
+    Neither old value can be carried across. They answered "how long may this whole job
+    take", a question the app no longer asks: a conversion that is still advancing now runs
+    to completion. Reusing one as the new key would turn a deliberately generous whole-job
+    number into an absurd pre-output budget - the config this migration was written against
+    carried a hand-raised timeout_seconds of 90800, i.e. a 25-hour wait for a first frame
+    that a healthy job produces in seconds. So both are dropped and the new key takes its
+    default, and the transform says which values it discarded rather than deleting silently.
+    """
+    pp = (cfg.get('recording') or {}).get('post_process')
+    if not isinstance(pp, dict):
+        return cfg
+    dropped = {k: pp.pop(k) for k in ('timeout_seconds', 'reencode_timeout_seconds') if k in pp}
+    if dropped:
+        log.warning('config migration: recording.post_process %s dropped - a conversion is no '
+                    'longer bounded by a whole-job deadline, only by stall_seconds once it is '
+                    'producing output. pre_output_timeout_seconds now bounds the phase before '
+                    'the first output frame and takes its default (%ds)',
+                    ', '.join(f'{k}={v!r}' for k, v in dropped.items()),
+                    _DEFAULTS['recording']['post_process']['pre_output_timeout_seconds'])
+    return cfg
+
+
+CONFIG_MIGRATIONS = [
+    (1, "rename legacy 'xtream' section to 'sync'", _cfg_m001_xtream_to_sync),
+    (2, "channel_testing.failing_score_threshold -> failing_band", _cfg_m002_failing_band),
+    (3, 'post_process conversion deadlines -> pre_output_timeout_seconds',
+     _cfg_m003_conversion_pre_output_timeout),
+]
+
+CURRENT_CONFIG_VERSION = CONFIG_MIGRATIONS[-1][0]
+# Keep the default stamp in lockstep with the migration list (defined above it in the file).
+_DEFAULTS['config_version'] = CURRENT_CONFIG_VERSION
+
+
+def migrate_config(config_overrides=None):
+    """Bring config.yaml to CURRENT_CONFIG_VERSION. Runs once at startup (create_app),
+    NOT inside load_config() - load_config is called constantly at runtime. The file is
+    backed up via the existing config-backup subsystem before any transform touches it.
+
+    config_overrides: the same dict create_app() was given, so the pre-migration backup
+    honors a test's redirected config_backup.backup_dir instead of falling back to the
+    real instance/config-backups/ - a bare do_backup() call ignored it and copied the
+    developer's real config.yaml into the real backup dir on every test-app build
+    (dev/changelog/620).
+
+    Reads through _load_config_file() (the mtime cache), never a direct yaml.safe_load: a
+    second uncached parse here cost every create_app() ~13ms, which the test suite pays 751
+    times over. The deep copy _load_config_file() returns is what makes mutating `raw` and
+    writing it back below safe, and the write invalidates the cache by mtime.
+    round_trip=True so the rewrite below preserves any hand-written comments.
+
+    Holds config_write_lock across the whole read-transform-write, same as save_config():
+    a save landing between this read and this write would be overwritten by the migrated
+    structure built from the pre-save file."""
+    with config_write_lock:
+        raw = _load_config_file(round_trip=True)
+        if raw is None:
+            return  # fresh install - first save_config() writes the current stamp from _DEFAULTS
+        file_version = raw.get('config_version', 0)
+        if file_version > CURRENT_CONFIG_VERSION:
+            # Unlike the DB (hard refusal), config is forgiving: defaults deep-merge under it
+            # and unknown keys are ignored, so warn and continue rather than refuse to start.
+            log.warning('config.yaml is config_version %d but this build only knows %d - '
+                        'running anyway; some settings may be ignored',
+                        file_version, CURRENT_CONFIG_VERSION)
+            return
+        if file_version == CURRENT_CONFIG_VERSION:
+            return
+        from .config_backup import do_backup, get_backup_dir
+        do_backup(backup_dir=get_backup_dir(load_config(overrides=config_overrides)))
+        for version, description, fn in CONFIG_MIGRATIONS:
+            if version <= file_version:
+                continue
+            raw = fn(raw)
+            log.info('Applied config migration %d: %s', version, description)
+        raw['config_version'] = CURRENT_CONFIG_VERSION
+        # `raw` is the round-trip structure _load_config_file() returned (comment-carrying,
+        # mutated in place above) - must go through _write_config_file()'s ruamel dump, not
+        # plain yaml.dump, which can't represent a CommentedMap at all.
+        _write_config_file(raw)
+        log.info('config.yaml migrated to config_version %d', CURRENT_CONFIG_VERSION)
+
+
+# Parsed-config.yaml cache, keyed on (st_mtime_ns, st_size). load_config() is reachable
+# from template filters inside per-row loops (the local_time* filters call it 4x per row
+# on /), and an uncached yaml.safe_load costs ~13ms on this box - the cache turns each
+# call into a stat(). Swapped as one tuple so concurrent threads need no lock: the worst
+# race is a redundant re-parse, never a torn read.
+_yaml_cache = None  # (stat_key, parsed_dict) or None
+
+
+def _parse_config_file():
+    """The actual disk read + YAML parse - kept as its own seam so the scaling
+    regression test can count real parses (cache hits must not reach this).
+
+    Round-trip parse (not yaml.safe_load): the result is a comment-carrying CommentedMap,
+    not a plain dict. This is what lets save_config()/migrate_config() merge new values
+    into the existing structure in place so untouched keys keep their comments, instead of
+    the whole file being re-serialized from scratch. _load_config_file() converts back to
+    plain dict/list/int/float/str/bool for every caller except those three - see _to_plain()
+    below for why that conversion has to happen.
+
+    Holds config_write_lock for the parse itself - not to protect the file (os.replace()
+    below makes every write atomic), but because _yaml_rt is one shared instance and a
+    dump running concurrently on it can corrupt this load. The mtime cache means this runs
+    on a miss, not per call, so the lock is not on any hot path."""
+    with config_write_lock:
+        with open(_CONFIG_PATH, 'r') as f:
+            return _yaml_rt.load(f) or {}
+
+
+def _fsync_dir(directory):
+    """Best-effort fsync of a directory, so a rename into it survives a power loss.
+    Not fatal if it fails - the rename itself is already atomic against a process crash,
+    which is the failure this app can actually do something about."""
+    try:
+        fd = os.open(directory, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except OSError as exc:
+        log.warning('Could not fsync %s after writing config.yaml: %s', directory, exc)
+
+
+def _config_tmp_file(dest):
+    """(fd, path) for a new temp file in `dest`'s OWN directory.
+
+    Same directory, deliberately, not the system temp dir: os.replace() is only atomic
+    within a single filesystem, and _CONFIG_PATH can sit anywhere (the app root in
+    production, a per-test temp dir under ConfigSandbox). A cross-filesystem replace
+    would silently degrade back into the copy-then-truncate hazard this exists to remove.
+
+    mkstemp creates it 0600, so a config.yaml written for the first time is private from
+    birth rather than umask-derived - it carries flask.secret_key and the auth hash."""
+    return tempfile.mkstemp(prefix='.config.yaml.', suffix='.tmp',
+                            dir=os.path.dirname(dest) or '.')
+
+
+def _finish_replace(tmp_path, dest):
+    """Carry `dest`'s existing permissions onto tmp_path, then os.replace() it over dest.
+    os.replace() moves the temp file's own mode with it, so without this a 0600
+    config.yaml would silently widen or narrow on every save."""
+    try:
+        os.chmod(tmp_path, os.stat(dest).st_mode & 0o7777)
+    except OSError:
+        pass  # no file yet (first write) - keep mkstemp's private 0600
+    os.replace(tmp_path, dest)
+    _fsync_dir(os.path.dirname(dest) or '.')
+
+
+def _write_config_file(data):
+    """THE writer of config.yaml - every path that rewrites the file goes through here or
+    _replace_config_file_from() below (enforced by
+    tests/test_static_invariants.py::ConfigWriteBypassTests), the write-side counterpart to
+    _parse_config_file() being its one reader.
+
+    Dumps to a temp file, fsyncs it, and os.replace()s it into place, so the file is never
+    observable half-written. What this replaced - open(_CONFIG_PATH, 'w') followed by a
+    dump - truncated first and wrote after, so a crash, an OOM-kill or an exception raised
+    mid-dump left an empty or truncated config.yaml: no secret_key, no auth hash, every
+    session invalid and the user locked out. A concurrent reader could also parse the
+    truncated file and get a config missing whole sections.
+
+    `data` may be a ruamel CommentedMap (the round-trip structure, comments preserved) or
+    a plain dict. Callers must hold config_write_lock across their whole read-merge-write.
+    """
+    fd, tmp_path = _config_tmp_file(_CONFIG_PATH)
+    try:
+        with os.fdopen(fd, 'w') as f:
+            _yaml_rt.dump(data, f)
+            f.flush()
+            os.fsync(f.fileno())
+        _finish_replace(tmp_path, _CONFIG_PATH)
+    except BaseException:
+        # A failed write must leave both the temp file and the previous config.yaml
+        # exactly as they were - never a half-written file under either name.
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+def _replace_config_file_from(src, dest=None):
+    """Atomically make config.yaml (or `dest`) a byte-for-byte copy of `src` (a config
+    backup).
+
+    Separate from _write_config_file() because a restore must reproduce the backup's exact
+    bytes - re-serializing a parsed structure would silently reformat the file the user
+    asked to be put back. copy2 semantics, so the backup's own mode/timestamps carry over
+    exactly as they did when this was a direct copy2 onto the live path.
+
+    Callers must hold config_write_lock."""
+    if dest is None:
+        dest = _CONFIG_PATH
+    fd, tmp_path = _config_tmp_file(dest)
+    try:
+        # copyfileobj + copystat is what copy2 does; decomposed only so the fsync lands
+        # on the temp file's own write handle before anything is renamed into place.
+        with os.fdopen(fd, 'wb') as f:
+            with open(src, 'rb') as srcf:
+                shutil.copyfileobj(srcf, f)
+            f.flush()
+            os.fsync(f.fileno())
+        shutil.copystat(src, tmp_path)
+        os.replace(tmp_path, dest)
+        _fsync_dir(os.path.dirname(dest) or '.')
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+def _to_plain(obj):
+    """Recursively strip ruamel's round-trip wrapper types (CommentedMap/CommentedSeq,
+    ScalarInt/ScalarFloat, the ScalarString family) down to plain dict/list/int/float/str.
+
+    These wrapper types are real subclasses of the builtins (isinstance checks and normal
+    dict/list operations all still work), so nothing inside this module needed to change -
+    but a subclass PyYAML has no representer for gets dumped by the *non-safe* yaml.Dumper
+    as a generic `!!python/object/new:...` tag, which yaml.safe_load() then refuses to
+    construct at all. load_config()'s result is read by code far outside this module
+    (JSON API responses, the raw-YAML-editor's own yaml.dump(), plain equality/repr in
+    logs) that has every reason to expect the exact plain types yaml.safe_load() always
+    returned - so nothing downstream of load_config() should ever see a wrapper type."""
+    if isinstance(obj, dict):
+        return {k: _to_plain(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_to_plain(v) for v in obj]
+    if isinstance(obj, bool):
+        return obj
+    if isinstance(obj, int):
+        return int(obj)
+    if isinstance(obj, float):
+        return float(obj)
+    if isinstance(obj, str):
+        return str(obj)
+    return obj
+
+
+def _load_config_file(round_trip=False):
+    """Parsed config.yaml dict, or None if the file doesn't exist. Callers can mutate
+    their result freely (the settings save flow does) without corrupting the cache -
+    preserving the semantics of a fresh parse per call.
+
+    round_trip=True returns a deep copy of the comment-carrying round-trip structure the
+    cache already holds, for a caller about to mutate and rewrite the file that wants
+    existing comments preserved (save_config(), migrate_config(), the legacy
+    channel_testing key strip in app/__init__.py). Every other caller - notably
+    load_config() - gets plain types back via _to_plain(), which already builds brand-new
+    dicts/lists at every level, so no separate deep copy is needed on that path."""
+    global _yaml_cache
+    try:
+        st = os.stat(_CONFIG_PATH)
+    except OSError:
+        _yaml_cache = None
+        return None
+    key = (st.st_mtime_ns, st.st_size)
+    cached = _yaml_cache
+    if cached is None or cached[0] != key:
+        cached = (key, _parse_config_file())
+        _yaml_cache = cached
+    if round_trip:
+        return copy.deepcopy(cached[1])
+    return _to_plain(cached[1])
+
+
+def load_config(overrides=None):
+    """Load config with defaults, then config.yaml, then optional `overrides` on top.
+
+    `overrides` (a nested dict, deep-merged last) is the test seam: it lets a throwaway
+    test app point database.path at a temp file, redirect output dirs, etc., without
+    touching config.yaml. Default None → today's exact behavior (defaults + file only),
+    so the production no-arg call is byte-identical.
+
+    Must be copy.deepcopy, not .copy(): a shallow copy shares every nested dict (e.g.
+    config['auth']) with _DEFAULTS itself by reference. _deep_merge() only replaces a
+    nested dict when the same key exists in `override` too - a top-level section absent
+    from config.yaml (true of every install until its first save, and forever true of a
+    section nobody has touched yet) passes straight through as that same shared
+    reference. set_nested()'s dict.setdefault() then mutates it in place, permanently
+    corrupting the process-wide _DEFAULTS - the next load_config() anywhere in the
+    process, for any config.yaml, inherits the poisoned value as its "default" (dev/docs/BUGS.md
+    2026-08-06 - caught via auth.password_hash, the first-ever brand-new top-level
+    section to hit this path in production use).
+    """
+    config = copy.deepcopy(_DEFAULTS)
+    file_config = _load_config_file()
+    if file_config is not None:
+        config = _deep_merge(config, file_config)
+    if overrides:
+        config = _deep_merge(config, overrides)
+    return config
+
+
+def load_for_edit():
+    """Return `(merged, file_cfg)` for a settings save that changes one or a few leaves.
+
+    `merged` is the effective config (defaults under config.yaml) and is what a route
+    validates against - a value the user has never set exists only as a default, so
+    validating against the file dict alone would read it as absent. `file_cfg` is the raw
+    config.yaml dict: mutate **that** one and hand it to save_config().
+
+    Writing load_config()'s merged result back is the thing this exists to prevent - it
+    bakes every untouched default into config.yaml as if the user had chosen it, so a later
+    change to a shipped default never reaches that install again and a deliberately-minimal
+    seed file (docker/config.docker.yaml) becomes a full dump on the first save
+    (dev/changelog/727).
+
+    Caller holds config_write_lock across both loads, its mutation, and the save - the whole
+    read-modify-write is one unit (dev/docs/BUGS.md 2026-08-15 @ 05:32:07 PM ET)."""
+    return load_config(), (_load_config_file() or {})
+
+
+def _merge_into_yaml_map(base, new):
+    """Apply `new`'s values onto `base` (a ruamel CommentedMap, or a plain dict for a
+    fresh-install file that doesn't exist yet) in place, recursing into nested dicts.
+    Preserves whatever comment ruamel attached to a key that survives the merge - only the
+    value changes, the key node itself (and its comment) is untouched. A key present in
+    `base` but absent from `new` is deleted, matching save_config()'s existing full-replace
+    semantics (today's plain yaml.dump(data) already writes exactly `data` and nothing
+    left over from a prior save)."""
+    for key, val in new.items():
+        if isinstance(val, dict) and key in base and isinstance(base[key], dict):
+            _merge_into_yaml_map(base[key], val)
+        else:
+            base[key] = val
+    for key in list(base.keys()):
+        if key not in new:
+            del base[key]
+    return base
+
+
+def save_config(data):
+    """Write config.yaml and log/flag whatever actually changed vs. the previous config.
+    Returns the list of (path, old, new) changes found (empty if the save was a no-op).
+
+    Merges `data` into the file's own existing structure (via _load_config_file(), the
+    same single reader every other caller uses) rather than dumping `data` on its own -
+    that's what lets untouched keys keep their hand-written comments (BUGS.md 2026-08-12)
+    instead of the whole file being re-serialized from scratch.
+
+    The lock spans the whole read-merge-write, not just the write: two concurrent saves
+    that each read before either writes both merge onto the same stale base, and the
+    second write drops the first's change silently (BUGS.md 2026-08-15).
+
+    The change list is diffed EFFECTIVE against EFFECTIVE - the old merged config against
+    `data` with the defaults merged underneath it - never against `data` on its own. `data`
+    may legitimately be the sparse config.yaml dict (load_for_edit()'s contract), and
+    diffing a sparse file dict against the merged old config reports every unset key as
+    removed: on a minimal config.yaml that is ~170 phantom 'Config changed' lines and a
+    false restart banner, the same defect dev/changelog/110 fixed. A key absent from `data`
+    means "use the default", so the default is what its new effective value is
+    (dev/changelog/727). config_backup.py::apply_backup already diffs this way."""
+    with config_write_lock:
+        old = load_config()
+        # Round-trip guard: any sensitive leaf submitted as MASK_SENTINEL keeps its stored
+        # value, so saving a masked read surface back unchanged never overwrites a real secret.
+        restore_masked_secrets(data, old)
+        existing = _load_config_file(round_trip=True)
+        if existing is None:
+            existing = CommentedMap()  # fresh install - no file, and so no comments, yet
+        merged = _merge_into_yaml_map(existing, data)
+        _write_config_file(merged)
+        return record_config_changes(old, _deep_merge(copy.deepcopy(_DEFAULTS), data))
+
+
+def resolve_ffmpeg_path(configured_path: str = 'ffmpeg') -> str:
+    """Return the best available ffmpeg binary path.
+
+    Priority:
+    1. configured_path if it resolves in PATH
+    2. imageio-ffmpeg bundled binary (installed with pip)
+    3. configured_path as-is (let the caller fail with a clear OS error)
+    """
+    import shutil
+    if shutil.which(configured_path):
+        return configured_path
+    try:
+        import imageio_ffmpeg
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        return configured_path
+
+
+def parse_tristate_bool(val: str):
+    """Convert a form value ('true'/'false'/'') to Boolean or None - the shared
+    'blank = use global default' convention for nullable Boolean override fields
+    (HealthCheckProfile.screenshots_enabled). Account.url_normalization used this before
+    _m014 turned it into a four-way mode; it now goes through
+    accounts.coerce_normalization_mode instead."""
+    if val == 'true':
+        return True
+    if val == 'false':
+        return False
+    return None

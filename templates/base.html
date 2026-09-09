@@ -1,0 +1,739 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>{% block title %}ChannelBin{% endblock %}</title>
+  <meta name="csrf-token" content="{{ csrf_token() }}">
+  {# The display timezone and clock format, for the CLIENT half of time rendering (util.js's
+     displayTz()/displayHour12()). Server-rendered content goes through app/tz_utils.py and
+     never reads these. One pair of tags on every page, rather than each page injecting the
+     same two values into its own JS config global - eleven templates used to do exactly that,
+     in four different spellings, and the page that forgot rendered the browser's timezone
+     instead of the configured one (dev/changelog/654). hour12 is spelled `!= '24h'` to match
+     app/routes/settings.py, so an unrecognized time_format value lands on 12h everywhere
+     rather than 12h on some pages and 24h on others. #}
+  <meta name="display-tz" content="{{ display_timezone }}">
+  <meta name="display-hour12" content="{{ 'false' if display_time_format == '24h' else 'true' }}">
+  {# The health bands (app/health_bands.py), served the same way the timezone is: the browser
+     bands a score from the SAME declared list the server does, so a badge drawn by JS and one
+     rendered by Jinja can never disagree about where Fair ends. `| forceescape` because a
+     tojson inside a double-quoted attribute is not otherwise attribute-safe. #}
+  <meta name="health-bands" content="{{ health_bands_json | tojson | forceescape }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+  <script src="{{ url_for('static', filename='js/util.js') }}"></script>
+  <link rel="apple-touch-icon" sizes="180x180" href="{{ url_for('static', filename='img/logo/channelbin-favicon/apple-touch-icon.png') }}">
+  <link rel="icon" type="image/png" sizes="32x32" href="{{ url_for('static', filename='img/logo/channelbin-favicon/favicon-32x32.png') }}">
+  <link rel="icon" type="image/png" sizes="16x16" href="{{ url_for('static', filename='img/logo/channelbin-favicon/favicon-16x16.png') }}">
+  <link rel="manifest" href="{{ url_for('static', filename='img/logo/channelbin-favicon/site.webmanifest') }}">
+  <link rel="shortcut icon" href="{{ url_for('static', filename='img/logo/channelbin-favicon/favicon.ico') }}">
+</head>
+{# A page that has to change the SHELL rather than its own content declares itself
+   here - the Logs page is the first, because DESIGN.md 16.1's fixed log box means
+   .shell stops being taller than the viewport. Page-local rules then scope
+   themselves to `body.<class>`. Anything that only affects the content column
+   belongs in `main_class` below, not here. #}
+{% set page_body_class %}{% block body_class %}{% endblock %}{% endset %}
+{% set body_classes = (('nav-min' if nav_collapsed else '') ~ ' ' ~ page_body_class) | trim %}
+<body{% if body_classes %} class="{{ body_classes }}"{% endif %}>
+  {# One nav definition rendered twice (sidebar + mobile menu) - classes only,
+     no ids, so the two copies can't collide. #}
+
+  {# One glyph per destination, shared by both shells by construction: a glyph
+     that differed between the sidebar and the drawer would be a defect (DESIGN.md
+     2 / 9.7). The dict lives inside the macro so it cannot be shadowed by a
+     page-level {% set %}; keys are read with [] because dot-notation would
+     collide with dict methods on any key named items/values/get. #}
+  {% macro nav_icon(key) -%}
+    {%- set icons = {
+      'recordings': '<circle cx="9" cy="9" r="6.6"/><circle cx="9" cy="9" r="2.6" fill="currentColor" stroke="none"/>',
+      'guide': '<rect x="2" y="3.5" width="14" height="11" rx="1.5"/><path d="M2 7.5h14M7 7.5v7M11.5 7.5v7"/>',
+      'live': '<circle cx="9" cy="9" r="1.9" fill="currentColor" stroke="none"/><path d="M5.8 5.8a4.6 4.6 0 0 0 0 6.4M12.2 12.2a4.6 4.6 0 0 0 0-6.4"/><path d="M3.4 3.4a8 8 0 0 0 0 11.2M14.6 14.6a8 8 0 0 0 0-11.2"/>',
+      'browse': '<rect x="2" y="5.5" width="14" height="10" rx="1.5"/><path d="M6 2.5 9 5.5l3-3"/>',
+      'groups': '<path d="M9 2.2 16 6 9 9.8 2 6z"/><path d="M2.4 9.6 9 13.2l6.6-3.6"/>',
+      'accounts': '<circle cx="9" cy="6.2" r="3.1"/><path d="M3.3 15.6c0-3.1 2.5-4.9 5.7-4.9s5.7 1.8 5.7 4.9"/>',
+      'recprofile': '<path d="M3 5.5h2.2M9.4 5.5h5.6"/><circle cx="7.3" cy="5.5" r="2"/><path d="M3 12.5h6.1M13.5 12.5h1.5"/><circle cx="11.5" cy="12.5" r="2"/>',
+      'hcprofile': '<rect x="2" y="3.5" width="14" height="11" rx="2"/><path d="M4.6 9h2.1l1.2-2.8L10 11.4l1.1-2.4h2.3"/>',
+      'tags': '<path d="M2.6 8.2V2.6h5.6l7 7-5.6 5.6z"/><circle cx="5.5" cy="5.5" r="1.1"/>',
+      'hiderules': '<path d="M1.8 9S4.6 4.4 9 4.4 16.2 9 16.2 9 13.4 13.6 9 13.6 1.8 9 1.8 9z"/><circle cx="9" cy="9" r="2.1"/><path d="M3.4 15.2 14.6 2.8"/>',
+      'jobs': '<path d="M15 9a6 6 0 1 1-1.9-4.4"/><path d="M15.4 2.6v3.4h-3.4"/>',
+      'alerts': '<path d="M4.6 12.2V8a4.4 4.4 0 0 1 8.8 0v4.2l1.4 1.9H3.2z"/><path d="M7.4 14.1a1.6 1.6 0 0 0 3.2 0"/>',
+      'logs': '<path d="M4 2.4h6.4L14 6v9.6H4z"/><path d="M10.2 2.6V6H14"/><path d="M6.4 9.4h5.2M6.4 12h3.6"/>',
+      'maint': '<path d="M11.6 2.6a3.9 3.9 0 0 0-4.4 5.2L2.6 12.4l2 2 4.6-4.6a3.9 3.9 0 0 0 5.2-4.4l-2.3 2.3-2-.6-.6-2z"/>',
+      'settings': '<circle cx="9" cy="9" r="2.6"/><path d="M9 1.4v2.2M9 14.4v2.2M16.6 9h-2.2M3.6 9H1.4M14.4 3.6l-1.6 1.6M5.2 12.8l-1.6 1.6M14.4 14.4l-1.6-1.6M5.2 5.2 3.6 3.6"/>',
+      'logout': '<path d="M7.4 2.6H3.6a1 1 0 0 0-1 1v10.8a1 1 0 0 0 1 1h3.8"/><path d="M12.2 5.6 15.4 9l-3.2 3.4M6.4 9h9"/>',
+    } -%}
+    <svg class="nav-i" viewBox="0 0 18 18" aria-hidden="true">{{ icons[key] | safe }}</svg>
+  {%- endmacro %}
+
+  {# Setup renders inline like every other section in both shells (DESIGN.md 2,
+     amended 2026-07-29). The desktop flyout it used to hide behind is gone.
+     .nav-pip is the mark a count badge leaves behind on the collapsed rail,
+     where the badge itself no longer fits - it tracks the badge's visibility. #}
+  {% macro nav_sections() %}
+    <div class="nav-section"><span class="nav-t">Library</span></div>
+    <a class="nav-link{% if request.endpoint == 'dashboard.dashboard' %} active{% endif %}" href="{{ url_for('dashboard.dashboard') }}">{{ nav_icon('live') }}<span class="nav-t">Dashboard</span> <span class="nav-count nav-count-live"{% if not nav_live_count %} style="display:none"{% endif %}>{{ nav_live_count }}</span><span class="nav-pip pip-live"{% if not nav_live_count %} style="display:none"{% endif %}></span></a>
+    <a class="nav-link{% if request.endpoint == 'guide.guide' %} active{% endif %}" href="{{ url_for('guide.guide') }}">{{ nav_icon('guide') }}<span class="nav-t">TV Guide</span></a>
+    <a class="nav-link{% if request.endpoint == 'recordings.index' %} active{% endif %}" href="{{ url_for('recordings.index') }}">{{ nav_icon('recordings') }}<span class="nav-t">Recordings</span> <span class="nav-count">{{ nav_recordings_total }}</span><span class="nav-pip"></span></a>
+    <div class="nav-section"><span class="nav-t">Channels</span></div>
+    <a class="nav-link{% if request.endpoint in ('channels.channel_browser', 'channels.channel_detail') %} active{% endif %}" href="{{ url_for('channels.channel_browser') }}">{{ nav_icon('browse') }}<span class="nav-t">Browse</span></a>
+    {# No separate Health Checks link (DESIGN.md §14.1) - health checks live on the
+       Groups tab now, alongside channel groups. #}
+    <a class="nav-link{% if request.endpoint in ('channel_groups.groups_page', 'channel_groups.group_detail', 'channels.channels_health_checks', 'channels.channels_health_checks_guide', 'channels.health_check_detail') %} active{% endif %}" href="{{ url_for('channel_groups.groups_page') }}">{{ nav_icon('groups') }}<span class="nav-t">Groups</span></a>
+    <div class="nav-section"><span class="nav-t">Setup</span></div>
+    <a class="nav-link{% if request.endpoint and request.endpoint.startswith('accounts.') %} active{% endif %}" href="{{ url_for('accounts.accounts_list') }}">{{ nav_icon('accounts') }}<span class="nav-t">Accounts</span></a>
+    <a class="nav-link{% if request.endpoint and request.endpoint.startswith('profiles.') %} active{% endif %}" href="{{ url_for('profiles.profiles_list') }}">{{ nav_icon('recprofile') }}<span class="nav-t">Recording Profiles</span></a>
+    <a class="nav-link{% if request.endpoint and request.endpoint.startswith('health_check_profiles.') %} active{% endif %}" href="{{ url_for('health_check_profiles.health_check_profiles_list') }}">{{ nav_icon('hcprofile') }}<span class="nav-t">Health Check Profiles</span></a>
+    <a class="nav-link{% if request.endpoint and request.endpoint.startswith('tags.') %} active{% endif %}" href="{{ url_for('tags.tags_list') }}">{{ nav_icon('tags') }}<span class="nav-t">Tags</span></a>
+    {# Setup, not Channels: hide rules configure what the provider's feed offers you, in the
+       same way an account or a tag does. The Channels hub's tabs are on their way out, so a
+       tab there would be a destination with no menu entry (dev/changelog/782). #}
+    <a class="nav-link{% if request.endpoint == 'channel_hide_rules.hide_rules_page' %} active{% endif %}" href="{{ url_for('channel_hide_rules.hide_rules_page') }}">{{ nav_icon('hiderules') }}<span class="nav-t">Hide Rules</span></a>
+    <div class="nav-section"><span class="nav-t">System</span></div>
+    <a class="nav-link{% if request.endpoint and request.endpoint.startswith('jobs.') %} active{% endif %}" href="{{ url_for('jobs.jobs_page') }}">{{ nav_icon('jobs') }}<span class="nav-t">Jobs</span></a>
+    <a class="nav-link{% if request.endpoint and request.endpoint.startswith('alerts.') %} active{% endif %}" href="{{ url_for('alerts.alert_center') }}">{{ nav_icon('alerts') }}<span class="nav-t">Alerts</span> <span class="nav-count nav-count-alerts" style="display:none"></span><span class="nav-pip pip-alert" style="display:none"></span></a>
+    <a class="nav-link{% if request.endpoint and request.endpoint.startswith('logs.') %} active{% endif %}" href="{{ url_for('logs.logs_page') }}">{{ nav_icon('logs') }}<span class="nav-t">Logs</span></a>
+    {# Second to last, between Logs and Settings (DESIGN.md 16.1). Matched on the
+       endpoint rather than the blueprint: system_bp also owns the /api/system/*
+       endpoints, which render no nav. #}
+    <a class="nav-link{% if request.endpoint == 'system.maintenance' %} active{% endif %}" href="{{ url_for('system.maintenance') }}">{{ nav_icon('maint') }}<span class="nav-t">Maintenance</span></a>
+    <a class="nav-link{% if request.endpoint and request.endpoint.startswith('settings.') %} active{% endif %}" href="{{ url_for('settings.settings') }}">{{ nav_icon('settings') }}<span class="nav-t">Settings</span></a>
+    {% if auth_enabled %}
+    <form method="post" action="{{ url_for('auth.logout') }}" class="nav-logout-form">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <button type="submit" class="nav-link nav-logout-btn">{{ nav_icon('logout') }}<span class="nav-t">Log out</span></button>
+    </form>
+    {% endif %}
+  {% endmacro %}
+  {# Compact layout (DESIGN.md 2): CPU+RAM share a line. Every data-ss hook is
+     load-bearing - the stats updater below selects by attribute, not structure. #}
+  {% macro sys_mini() %}
+    <div class="sys-mini">
+      <div class="sm-row">CPU <span class="sm-val" data-ss="cpu">-</span>% &middot; RAM <span class="sm-val" data-ss="ram">-</span>%</div>
+      <div class="sm-row"><span data-ss="disk-label">Disk</span> <span class="sm-val" data-ss="disk">-</span> free</div>
+      <div class="sm-row" data-ss="disk2-wrap" style="display:none"><span data-ss="disk2-label">Dest</span> <span class="sm-val" data-ss="disk2">-</span> free</div>
+      <div class="sm-row">v{{ app_version }}</div>
+    </div>
+  {% endmacro %}
+  {# Both shells render this same group (DESIGN.md 2 / 9.2, amended 2026-07-29) -
+     real touch targets, the two activity ones hidden when their count is zero.
+     No ids: the desktop top bar and the mobile top bar both render it, and
+     duplicate ids would leave getElementById updating only the first copy. The
+     stats chip is neutral on purpose - red and blue mean "happening right now",
+     and a readout that is always there must not claim the same urgency. #}
+  {% macro activity_chips() %}
+    <button class="actchip chip-stats" type="button" aria-label="System stats"><svg class="chip-i" viewBox="0 0 16 16" aria-hidden="true"><path d="M3 13V7.4M8 13V3.2M13 13V9.6"/></svg></button>
+    <a class="actchip chip-rec" href="{{ url_for('dashboard.dashboard') }}" style="display:none"><span class="pulse"></span><span class="chip-n">0</span></a>
+    <a class="actchip chip-job" href="{{ url_for('jobs.jobs_page') }}" style="display:none"><span class="pulse"></span><span class="chip-n">0</span></a>
+  {% endmacro %}
+
+  {# Hamburger first in the DOM, not floated left, so reading order matches paint
+     order and tab order stays sane (DESIGN.md 9.2, amended 2026-07-29). #}
+  <nav class="topnav">
+    <button class="topnav-toggle" id="topnav-toggle" aria-label="Menu" aria-expanded="false">&#9776;</button>
+    <a class="brand" href="{{ url_for('dashboard.dashboard') }}"><img src="{{ url_for('static', filename='img/logo/channelbin-logo.png') }}" alt="" width="26" height="26"><span class="nav-t">ChannelBin</span></a>
+    <div class="spacer"></div>
+    <div class="nav-indicators">{{ activity_chips() }}</div>
+  </nav>
+  <div class="menu-scrim" id="menu-scrim"></div>
+  {# No sys_mini here: the readout is the top bar's stats chip on mobile
+     (DESIGN.md 9.7, amended 2026-07-29). It stays in the desktop sidebar. #}
+  <div class="topnav-menu" id="topnav-menu">
+    {{ nav_sections() }}
+  </div>
+
+  <div class="shell">
+    <aside class="sidebar">
+      {# DOM order is brand -> rule -> button in both states; CSS `order` lifts the
+         button above the logo when collapsed, and the divider is the only element
+         that appears with it. #}
+      <div class="brand-row">
+        <a class="brand" href="{{ url_for('dashboard.dashboard') }}"><img src="{{ url_for('static', filename='img/logo/channelbin-logo.png') }}" alt="" width="22" height="22"><span class="nav-t">ChannelBin</span></a>
+        <hr class="brand-rule">
+        <button class="navcollapse" type="button"
+                aria-label="{% if nav_collapsed %}Expand the main menu{% else %}Collapse the main menu{% endif %}"
+                data-tip="{% if nav_collapsed %}Show the main menu again{% else %}Shrink the main menu to icons and give the page the extra width{% endif %}"><svg class="ncx" viewBox="0 0 18 18" aria-hidden="true">{% if nav_collapsed %}<path d="M7 4l5 5-5 5"/><path d="M15 4v10"/>{% else %}<path d="M11 4 6 9l5 5"/><path d="M3 4v10"/>{% endif %}</svg></button>
+      </div>
+      {{ nav_sections() }}
+      {{ sys_mini() }}
+    </aside>
+
+    {# The top bar is the first row of the MAIN COLUMN, not a sibling of the
+       sidebar - the sidebar has to keep starting at the top of the page and the
+       bar comes off it. Deliberately not sticky: it scrolls away with the
+       page, so it must never acquire a position or a z-index. Left side empty by
+       decision - the page title stays in .page-head. #}
+    <div class="colmain">
+      <div class="topbar">
+        <div class="spacer"></div>
+        <div class="nav-indicators">{{ activity_chips() }}</div>
+      </div>
+
+    <main class="main {% block main_class %}{% endblock %}">
+      {% if request.endpoint != 'alerts.alert_center' %}
+      <div id="alert-banner" class="alert-banner" style="display:none">
+        <span id="alert-banner-text"></span>
+        <a href="#" class="alert-banner-link" id="alert-banner-goto-link" style="display:none"></a>
+        <button class="alert-banner-link alert-banner-details" id="alert-banner-details-btn" onclick="showAlertBannerDetails()" style="display:none">Show details</button>
+        <a href="{{ url_for('alerts.alert_center') }}" class="alert-banner-link" id="alert-banner-view-all-link">View all</a>
+        <button class="alert-banner-dismiss" id="alert-banner-btn" onclick="dismissAlertBanner()" title="Mark read">&#x2715;</button>
+      </div>
+      {% endif %}
+      {# The static (server-rendered) banner and the JS poller's banner are two
+         renderings of ONE message - set once here so a future edit can't drift
+         them apart; the JS side clones #restart-banner-msg's innerHTML instead
+         of carrying its own copy of the sentence. #}
+      {% set restart_banner_msg %}&#9888; Restart required - some changes won't take effect until the service is restarted.
+        Restart it from the <a href="{{ url_for('system.maintenance') }}">Maintenance</a> page.{% endset %}
+      <template id="restart-banner-msg">{{ restart_banner_msg | safe }}</template>
+      {% if restart_needed %}
+      <div id="restart-banner" class="restart-banner">{{ restart_banner_msg | safe }}</div>
+      {% else %}
+      <div id="restart-banner" class="restart-banner" style="display:none"></div>
+      {% endif %}
+
+      {% block content %}{% endblock %}
+
+      <footer class="app-footer">ChannelBin v{{ app_version }}</footer>
+    </main>
+    </div>
+  </div>
+  <div id="dot-tooltip" class="dot-tooltip" style="display:none"></div>
+
+  {# Server flash messages render as toasts (DESIGN.md 3.15); multiple flashes
+     queue sequentially so none is lost to the single toast element. #}
+  {% with messages = get_flashed_messages(with_categories=true) %}
+    {% if messages %}
+    <script>
+      document.addEventListener('DOMContentLoaded', () => {
+        const flashes = {{ messages | tojson }};
+        const typeMap = { success: 'success', error: 'error', warning: 'warning', message: 'success' };
+        flashes.forEach(([category, msg], i) => {
+          setTimeout(() => showToast(msg, { type: typeMap[category] || 'success', durationMs: 4000 }), i * 4300);
+        });
+      });
+    </script>
+    {% endif %}
+  {% endwith %}
+
+  {% block scripts %}{% endblock %}
+  <script>
+  (function() {
+    // Not util.js fmtBytes - this takes a GB-unit number (disk API), not raw bytes.
+    function fmtGb(gb) {
+      if (gb === null || gb === undefined) return '-';
+      if (gb >= 1000) return (gb / 1000).toFixed(1) + ' TB';
+      if (gb >= 1)    return gb.toFixed(1) + ' GB';
+      return Math.round(gb * 1024) + ' MB';
+    }
+    function setAll(key, text, title, colorPct, warnAt, dangerAt) {
+      document.querySelectorAll('[data-ss="' + key + '"]').forEach(function(el) {
+        el.textContent = text;
+        if (title) el.title = title;
+        if (colorPct !== undefined) {
+          el.style.color = colorPct >= dangerAt ? 'var(--bad)' : colorPct >= warnAt ? 'var(--warn)' : '';
+        }
+      });
+    }
+    function applyStats(d) {
+      if (d.cpu_percent !== null && d.cpu_percent !== undefined) {
+        setAll('cpu', d.cpu_percent.toFixed(0), 'CPU usage', d.cpu_percent, 70, 85);
+      }
+      if (d.memory) {
+        setAll('ram', d.memory.percent.toFixed(0),
+               'Memory: ' + d.memory.used_gb + ' GB / ' + d.memory.total_gb + ' GB',
+               d.memory.percent, 70, 85);
+      }
+      if (d.disk_dvr) {
+        setAll('disk', fmtGb(d.disk_dvr.free_gb),
+               d.disk_dvr.path + ': ' + d.disk_dvr.used_gb + ' GB used / ' + d.disk_dvr.total_gb + ' GB total',
+               d.disk_dvr.percent_used, 80, 90);
+        setAll('disk-label', d.same_drive ? 'Disk' : d.disk_dvr.path);
+      }
+      document.querySelectorAll('[data-ss="disk2-wrap"]').forEach(function(w) {
+        w.style.display = d.disk_complete ? '' : 'none';
+      });
+      if (d.disk_complete) {
+        setAll('disk2', fmtGb(d.disk_complete.free_gb),
+               d.disk_complete.path + ': ' + d.disk_complete.used_gb + ' GB used / ' + d.disk_complete.total_gb + ' GB total',
+               d.disk_complete.percent_used, 80, 90);
+        setAll('disk2-label', d.disk_complete.path);
+      }
+      _tipHtml = buildStatsTip(d);
+    }
+    // The sidebar block and the top bar's stats chip are two renderings of ONE
+    // payload (DESIGN.md 2 / 9.7, amended 2026-07-29) - built here, from the same
+    // `d`, so they can never disagree. Same vocabulary as the activity tooltips
+    // below (<strong> heading, .tt-name, .tt-detail), never a fourth one.
+    var _tipHtml = null;
+    function buildStatsTip(d) {
+      var lines = ['<strong>System</strong>'];
+      if (d.cpu_percent !== null && d.cpu_percent !== undefined && d.memory) {
+        lines.push('<span class="tt-name">CPU ' + d.cpu_percent.toFixed(0) +
+                   '% &middot; RAM ' + d.memory.percent.toFixed(0) + '%</span>');
+      }
+      if (d.disk_dvr) {
+        lines.push('<span class="tt-name">' + escHtml(d.same_drive ? 'Disk' : d.disk_dvr.path) +
+                   ' ' + fmtGb(d.disk_dvr.free_gb) + ' free</span>');
+      }
+      if (d.disk_complete) {
+        lines.push('<span class="tt-name">' + escHtml(d.disk_complete.path) +
+                   ' ' + fmtGb(d.disk_complete.free_gb) + ' free</span>');
+      }
+      lines.push('<span class="tt-detail">v{{ app_version }}</span>');
+      return lines.join('');
+    }
+    window.__applyStats = applyStats;
+    window.__statsTipHtml = function() { return _tipHtml; };
+  })();
+  </script>
+  <script>
+    function checkRestartStatus() {
+      fetch('/api/settings/restart-status')
+        .then(function(r) { return r.json(); })
+        .then(function(d) {
+          var el = document.getElementById('restart-banner');
+          if (!el) return;
+          if (d.restart_needed) {
+            var tpl = document.getElementById('restart-banner-msg');
+            el.innerHTML = tpl ? tpl.innerHTML : '';
+            el.style.display = '';
+          } else {
+            el.style.display = 'none';
+          }
+        })
+        .catch(function() {});
+    }
+  </script>
+  <script>
+  (function() {
+    var _bannerAlertId = null;
+    var _bannerAlert = null;
+
+    function applyAlerts(d) {
+      // Unread count on the Alerts nav link (both sidebar and mobile copies).
+      document.querySelectorAll('.nav-count-alerts').forEach(function(badge) {
+        if (d.count > 0) {
+          badge.textContent = d.count;
+          badge.style.display = '';
+        } else {
+          badge.style.display = 'none';
+        }
+      });
+      // The rail's pip is the badge's stand-in when the badge no longer fits, so
+      // it hides with it - a mark that never clears would claim an alert forever.
+      document.querySelectorAll('.nav-pip.pip-alert').forEach(function(pip) {
+        pip.style.display = d.count > 0 ? '' : 'none';
+      });
+
+      var banner = document.getElementById('alert-banner');
+      var textEl = document.getElementById('alert-banner-text');
+      var detailsBtn = document.getElementById('alert-banner-details-btn');
+      var gotoLink = document.getElementById('alert-banner-goto-link');
+      if (!banner || !textEl) return;
+      if (d.banner) {
+        var a = d.banner;
+        _bannerAlertId = a.id;
+        _bannerAlert = a;
+        textEl.textContent = '';
+        var sevBadge = document.createElement('span');
+        sevBadge.className = 'alert-severity sev-' + a.severity;
+        sevBadge.textContent = a.severity;
+        textEl.appendChild(sevBadge);
+        textEl.appendChild(document.createTextNode(a.title));
+        banner.className = 'alert-banner alert-banner-sev-' + a.severity;
+        banner.style.display = '';
+        if (detailsBtn) detailsBtn.style.display = (a.body && a.body !== a.title) ? '' : 'none';
+        if (gotoLink) {
+          if (a.link) {
+            gotoLink.href = a.link;
+            gotoLink.textContent = a.link_label || 'View';
+            gotoLink.style.display = '';
+          } else {
+            gotoLink.style.display = 'none';
+          }
+        }
+      } else {
+        banner.style.display = 'none';
+        _bannerAlertId = null;
+        _bannerAlert = null;
+        if (detailsBtn) detailsBtn.style.display = 'none';
+        if (gotoLink) gotoLink.style.display = 'none';
+      }
+    }
+
+    window.showAlertBannerDetails = function() {
+      if (!_bannerAlert) return;
+      var body = document.createElement('div');
+      body.style.whiteSpace = 'pre-wrap';
+      body.style.wordBreak = 'break-word';
+      body.textContent = _bannerAlert.body;
+      var footer = [
+        { label: 'Mark as read', class: 'btn btn-primary', onClick: function(close) { dismissAlertBanner(); close(); } }
+      ];
+      if (_bannerAlert.link) {
+        footer.push({ label: _bannerAlert.link_label || 'View', class: 'btn', onClick: function(close) {
+            close();
+            window.location.href = _bannerAlert.link;
+          } });
+      }
+      footer.push({ label: 'Ignore future alerts like this', class: 'btn', onClick: function(close) {
+          close();
+          confirmIgnoreAlert(_bannerAlert.id, _bannerAlert.title, function() { dismissAlertBanner(); });
+        } });
+      footer.push({ label: 'View all', class: 'btn', onClick: function(close) {
+          close();
+          window.location.href = document.getElementById('alert-banner-view-all-link').href;
+        } });
+      buildModal({
+        title: _bannerAlert.title,
+        body: body,
+        footer: footer
+      });
+    };
+
+    window.dismissAlertBanner = function() {
+      var banner = document.getElementById('alert-banner');
+      if (_bannerAlertId) {
+        jsonFetch('/api/alerts/' + _bannerAlertId + '/read', {method: 'POST'}).catch(function() {});
+      }
+      if (banner) banner.style.display = 'none';
+      _bannerAlertId = null;
+      // Give the read POST a moment to land, then refresh the shared nav-status
+      // payload so the badge count (and stats/activity) reflect the change.
+      setTimeout(function() {
+        if (window.fetchNavStatus) window.fetchNavStatus();
+      }, 300);
+    };
+
+    window.__applyAlerts = applyAlerts;
+  })();
+  </script>
+  <script>
+    (function() {
+      var toggle = document.getElementById('topnav-toggle');
+      var menu = document.getElementById('topnav-menu');
+      var scrim = document.getElementById('menu-scrim');
+      if (!toggle) return;
+      function setOpen(open) {
+        menu.classList.toggle('open', open);
+        if (scrim) scrim.classList.toggle('open', open);
+        toggle.setAttribute('aria-expanded', open ? 'true' : 'false');
+        toggle.innerHTML = open ? '&#x2715;' : '&#9776;';
+        // Single mutator for the drawer and its scrim, so one sync answers for every close
+        // path: scrim click, nav-link click, the toggle, and the >900px resize close.
+        syncScrollLock();
+      }
+      toggle.addEventListener('click', function() {
+        setOpen(!menu.classList.contains('open'));
+      });
+      if (scrim) scrim.addEventListener('click', function() { setOpen(false); });
+      // Escape closes the drawer, like every other overlay in the app. Two things keep it
+      // from stealing the key from something stacked over it: util.js's own menu handler
+      // already swallows Escape (stopImmediatePropagation) before this listener runs when a
+      // .menu is open, and overlayOpenAboveDrawer() covers the rest - the drawer is the
+      // outermost overlay on mobile, so it is always the last one that should close.
+      document.addEventListener('keydown', function(e) {
+        if (e.key !== 'Escape' || !menu.classList.contains('open')) return;
+        if (overlayOpenAboveDrawer()) return;
+        setOpen(false);
+      });
+      menu.querySelectorAll('a').forEach(function(a) {
+        a.addEventListener('click', function() { setOpen(false); });
+      });
+      // The open menu is position:fixed, so widening past the ≤900px shell
+      // breakpoint would strand it on top of the now-visible desktop sidebar.
+      window.addEventListener('resize', function() {
+        if (window.innerWidth > 900 && menu.classList.contains('open')) setOpen(false);
+      });
+    })();
+  </script>
+  <script>
+    // The collapsed rail (DESIGN.md 2, amended 2026-07-29). ONE writer for
+    // body.nav-min: the class is server-rendered from the nav_collapsed pref so
+    // there is no flash of the 212px sidebar, and only setNavMin changes it after.
+    (function() {
+      const btn = document.querySelector('.navcollapse');
+      if (!btn) return;
+      const CHEV_LEFT = '<path d="M11 4 6 9l5 5"/><path d="M3 4v10"/>';
+      const CHEV_RIGHT = '<path d="M7 4l5 5-5 5"/><path d="M15 4v10"/>';
+
+      // A rail row's tooltip is DERIVED from the row it replaces - never a second
+      // hardcoded list of names and counts. The count is read off the badge, and
+      // only when the badge is actually showing, so the tip cannot claim an alert
+      // the sidebar isn't claiming.
+      const applyRailTips = (on) => {
+        document.querySelectorAll('.sidebar .nav-link').forEach((a) => {
+          if (!on) { a.removeAttribute('data-tip'); return; }
+          const label = a.querySelector('.nav-t');
+          const cnt = a.querySelector('.nav-count');
+          const name = label ? label.textContent.trim() : '';
+          const n = (cnt && cnt.style.display !== 'none') ? cnt.textContent.trim() : '';
+          a.setAttribute('data-tip', n ? `${name} (${n})` : name);
+        });
+        const brand = document.querySelector('.sidebar .brand');
+        if (!brand) return;
+        if (on) brand.setAttribute('data-tip', 'ChannelBin');
+        else brand.removeAttribute('data-tip');
+      };
+
+      const setNavMin = (on) => {
+        document.body.classList.toggle('nav-min', on);
+        // The chevron points the way the bar will move, so it tracks the state
+        // rather than the action.
+        btn.querySelector('.ncx').innerHTML = on ? CHEV_RIGHT : CHEV_LEFT;
+        btn.setAttribute('aria-label', on ? 'Expand the main menu' : 'Collapse the main menu');
+        btn.setAttribute('data-tip', on
+          ? 'Show the main menu again'
+          : 'Shrink the main menu to icons and give the page the extra width');
+        applyRailTips(on);
+      };
+
+      btn.addEventListener('click', () => {
+        const on = !document.body.classList.contains('nav-min');
+        setNavMin(on);
+        // Server-side, not localStorage: the template needs it at first paint.
+        jsonFetch('/api/user-prefs/nav_collapsed', {
+          method: 'POST', body: JSON.stringify({ value: on }),
+        }).catch(() => {});
+      });
+
+      // A page that loaded already collapsed needs its tips derived once; this
+      // must not toggle anything - the server already rendered the class.
+      applyRailTips(document.body.classList.contains('nav-min'));
+      // The counts change under the poll, so the tips are re-derived with them.
+      window.__applyRailTips = () => applyRailTips(document.body.classList.contains('nav-min'));
+    })();
+  </script>
+  <script>
+  (function() {
+    // The chip group exists twice (desktop top bar + mobile top bar), so everything
+    // here selects by class and applies to every copy - duplicate ids would leave
+    // one bar stale. The chips replaced the sidebar's activity dots in round 6; the
+    // two builders below are the dots' own tooltips, re-pointed rather than rewritten.
+    var chipRec   = Array.prototype.slice.call(document.querySelectorAll('.chip-rec'));
+    var chipJob   = Array.prototype.slice.call(document.querySelectorAll('.chip-job'));
+    var chipStats = Array.prototype.slice.call(document.querySelectorAll('.chip-stats'));
+    var tooltip = document.getElementById('dot-tooltip');
+    var activeChip = null;
+
+    function fmtSecs(s) {
+      s = Math.round(s);
+      var h = Math.floor(s / 3600);
+      var m = Math.floor((s % 3600) / 60);
+      var ss = s % 60;
+      if (h > 0) return h + 'h ' + m + 'm remaining';
+      if (m > 0) return m + 'm ' + (ss > 0 ? ss + 's ' : '') + 'remaining';
+      return ss + 's remaining';
+    }
+
+    function buildRecTooltip(data) {
+      var lines = [];
+      if (data.state === 'active') {
+        lines.push('<strong>&#x25CF; Recording</strong>');
+        // state_label names what each row is actually doing - a stream that died and is
+        // backing off toward a reconnect reads as "Waiting to retry", not as a capture.
+        data.active.forEach(function(r) {
+          lines.push('<span class="tt-name">' + escHtml(r.name) + '</span>');
+          lines.push('<span class="tt-detail">' + escHtml(r.state_label) + ' &middot; stops ' +
+                     r.stop_time_et + ' &mdash; ' + fmtSecs(r.seconds_remaining) + '</span>');
+        });
+      } else if (data.state === 'dim') {
+        lines.push('<strong>&#x25CB; No active recording</strong>');
+        if (data.next_scheduled) {
+          var ns = data.next_scheduled;
+          lines.push('<span class="tt-name">Next: ' + escHtml(ns.name) + '</span>');
+          lines.push('<span class="tt-detail">' + ns.start_et + ' &mdash; ' + ns.start_relative + '</span>');
+        }
+        if (data.scheduled_count > 1) {
+          lines.push('<span class="tt-detail">' + data.scheduled_count + ' recording' + (data.scheduled_count !== 1 ? 's' : '') + ' scheduled</span>');
+        }
+      }
+      return lines.join('');
+    }
+
+    function buildBgTooltip(data) {
+      var lines = [];
+      if (data.state === 'active') {
+        lines.push('<strong>&#x25CF; Background activity</strong>');
+        data.tasks.forEach(function(t) {
+          lines.push('<span class="tt-name">' + escHtml(t.label) + '</span>');
+          if (t.detail) lines.push('<span class="tt-detail">' + escHtml(t.detail) + '</span>');
+        });
+      } else if (data.state === 'dim') {
+        lines.push('<strong>&#x25CB; Background jobs scheduled</strong>');
+        if (data.next_scheduled) {
+          var ns = data.next_scheduled;
+          lines.push('<span class="tt-name">Next: ' + escHtml(ns.label) + '</span>');
+          lines.push('<span class="tt-detail">' + ns.time_et + ' &mdash; ' + ns.relative + '</span>');
+        }
+      }
+      return lines.join('');
+    }
+
+    function showTooltip(el, html) {
+      tooltip.innerHTML = html;
+      tooltip.style.display = 'block';
+      var rect = el.getBoundingClientRect();
+      var tw = tooltip.offsetWidth;
+      var left = rect.left + window.scrollX + rect.width / 2 - tw / 2;
+      left = Math.max(8, Math.min(left, window.innerWidth - tw - 8));
+      tooltip.style.left = left + 'px';
+      tooltip.style.top = (rect.bottom + window.scrollY + 8) + 'px';
+      if (activeChip && activeChip !== el) activeChip.classList.remove('on');
+      el.classList.add('on');
+      activeChip = el;
+    }
+
+    function hideTooltip() {
+      tooltip.style.display = 'none';
+      if (activeChip) {
+        activeChip.classList.remove('on');
+        delete activeChip.dataset.pinned;
+      }
+      activeChip = null;
+    }
+
+    var _lastRec = null;
+    var _lastBg  = null;
+
+    // A chip's state, count, tooltip and link target are one fact from one
+    // /api/nav-status payload. Three states, branched explicitly (CLAUDE.md
+    // one-flag-one-meaning): active = filled pulsing dot + count, dim = hollow
+    // static ring with no count (something's scheduled but nothing is running),
+    // hidden = chip gone entirely (DESIGN.md 9.2).
+    function applyChip(els, mode, count) {
+      els.forEach(function(el) {
+        var chipN = el.querySelector('.chip-n');
+        if (mode === 'active') {
+          chipN.textContent = count;
+          chipN.style.display = '';
+          el.classList.remove('dim');
+          el.style.display = '';
+        } else if (mode === 'dim') {
+          chipN.style.display = 'none';
+          el.classList.add('dim');
+          el.style.display = '';
+        } else {
+          el.style.display = 'none';
+          el.classList.remove('dim');
+          if (activeChip === el) hideTooltip();
+        }
+      });
+    }
+
+    function applyIndicators(d) {
+      _lastRec = d.recording;
+      _lastBg  = d.background;
+      applyChip(chipRec, d.recording.state, d.recording.active.length);
+      applyChip(chipJob, d.background.state, d.background.tasks.length);
+      // Refresh (or drop) an open tooltip in place rather than leaving stale numbers
+      // up. applyStats has already run this cycle, so the stats tip is fresh too.
+      if (activeChip) {
+        var html = activeChip.__tipHtml ? activeChip.__tipHtml() : null;
+        if (html) tooltip.innerHTML = html;
+        else hideTooltip();
+      }
+    }
+
+    // clickPins is for the stats chip only: it is a button, so a tap has no
+    // other job. The other two are links and a tap navigates, which is their
+    // shipped mobile behavior - hover is the only way they open a tip.
+    function bindTip(el, htmlFn, clickPins) {
+      el.__tipHtml = htmlFn;
+      if (clickPins) {
+        el.addEventListener('click', function(e) {
+          e.stopPropagation();
+          // Keyed on PINNED, never on "already open": mouseenter fires before
+          // click on a real pointer, and touch synthesizes hover before the tap,
+          // so an is-it-open test closes the tip hover just opened - every click
+          // would open and close it inside one tick, which is what shipped for
+          // an afternoon and made the numbers unreachable on a phone.
+          if (el.dataset.pinned) { delete el.dataset.pinned; hideTooltip(); return; }
+          var html = htmlFn();
+          if (html) { showTooltip(el, html); el.dataset.pinned = '1'; }
+        });
+      }
+      el.addEventListener('mouseenter', function() {
+        var html = htmlFn();
+        if (html) showTooltip(el, html);
+      });
+      el.addEventListener('mouseleave', function(e) {
+        // Hover-out only closes what hover opened; a pinned tip waits for a click.
+        if (!el.dataset.pinned && !tooltip.contains(e.relatedTarget)) hideTooltip();
+      });
+    }
+
+    chipRec.forEach(function(el) {
+      bindTip(el, function() {
+        return (_lastRec && _lastRec.state !== 'hidden') ? buildRecTooltip(_lastRec) : null;
+      }, false);
+    });
+    chipJob.forEach(function(el) {
+      bindTip(el, function() {
+        return (_lastBg && _lastBg.state !== 'hidden') ? buildBgTooltip(_lastBg) : null;
+      }, false);
+    });
+    chipStats.forEach(function(el) {
+      bindTip(el, function() {
+        return window.__statsTipHtml ? window.__statsTipHtml() : null;
+      }, true);
+    });
+
+    tooltip.addEventListener('mouseleave', function(e) {
+      if (activeChip && activeChip.dataset.pinned) return;
+      if (!e.relatedTarget || !e.relatedTarget.closest || !e.relatedTarget.closest('.actchip')) hideTooltip();
+    });
+
+    document.addEventListener('click', function(e) {
+      if (!tooltip.contains(e.target) && !(e.target.closest && e.target.closest('.actchip'))) {
+        hideTooltip();
+      }
+    });
+    // The tooltip is positioned in document coordinates and neither top bar keeps
+    // its chip underneath it while the page scrolls, so scrolling closes it
+    // rather than leaving it stranded (DESIGN.md 9.6).
+    document.addEventListener('scroll', hideTooltip, true);
+
+    window.__applyIndicators = applyIndicators;
+  })();
+  </script>
+  <script>
+  (function() {
+    function applyLiveCount(activity) {
+      // Dashboard sidebar count = every Dashboard-visible in-progress activity
+      // (live/converting/concatenating recordings, account syncs, a running
+      // channel health check) - not just recordings actively capturing. The
+      // server computes the combined total.
+      var n = (activity && typeof activity.dashboard_activity_count === 'number')
+        ? activity.dashboard_activity_count : 0;
+      document.querySelectorAll('.nav-count-live').forEach(function(el) {
+        el.textContent = n;
+        el.style.display = n > 0 ? '' : 'none';
+      });
+      document.querySelectorAll('.nav-pip.pip-live').forEach(function(pip) {
+        pip.style.display = n > 0 ? '' : 'none';
+      });
+    }
+    function fetchNavStatus() {
+      fetch('/api/nav-status')
+        .then(function(r) { return r.json(); })
+        .then(function(d) {
+          if (window.__applyStats)      window.__applyStats(d.stats);
+          if (window.__applyAlerts)     window.__applyAlerts(d.alerts);
+          if (window.__applyIndicators) window.__applyIndicators(d.activity);
+          if (window.__applySearchReadiness) window.__applySearchReadiness(d.search);
+          applyLiveCount(d.activity);
+          // Rail tooltips carry the counts, so they are re-derived after the
+          // badges move - one writer, run last.
+          if (window.__applyRailTips) window.__applyRailTips();
+        })
+        .catch(function() {});
+    }
+    window.fetchNavStatus = fetchNavStatus;
+    fetchNavStatus();
+    setInterval(fetchNavStatus, Math.max(5, {{ nav_poll_interval_ms // 1000 }}) * 1000);
+  })();
+  </script>
+</body>
+</html>

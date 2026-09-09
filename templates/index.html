@@ -1,0 +1,433 @@
+{% extends "base.html" %}
+{% block title %}Recordings - ChannelBin{% endblock %}
+
+{% from "_macros.html" import status_badge, channel_pill, csrf_field %}
+
+{% block content %}
+<div class="page-head">
+  <h1>Recordings <span class="sub">{{ total }} total{% if live_now %} · {{ live_now }} recording now{% endif %}</span></h1>
+  <a href="{{ url_for('recordings.new_recording') }}" class="btn btn-primary head-action-schedule">+ Schedule recording</a>
+  {# Mobile only (DESIGN.md 9.3): scheduling happens from the guide at mobile widths,
+     so the header action links there instead of a "+ Schedule" button with no destination. #}
+  <a href="{{ url_for('guide.guide') }}" class="btn btn-primary head-action-guide">TV Guide</a>
+</div>
+
+{% if total == 0 %}
+  <div class="empty-state">
+    <p>No recordings yet.</p>
+    <p style="margin-top:12px"><a href="{{ url_for('recordings.new_recording') }}" class="btn btn-primary">+ Schedule recording</a></p>
+  </div>
+{% else %}
+
+<div class="toolbar rec-toolbar">
+  <input class="search" id="rec-search" placeholder="Search recordings...">
+  <div class="chips" id="filter-chips">
+    <div class="menu-wrap">
+      <button class="chip" data-menu>+ Filter</button>
+      {# Filled by static/js/filter-bar.js from the dimension registry below, so the
+         list of filters and the predicate they drive cannot drift apart. #}
+      <div class="menu pop-left" id="filter-menu"></div>
+    </div>
+    {# Mobile only (DESIGN.md 9.4): desktop sorts via the column headers, which
+       don't exist at mobile widths - this chip is the mobile sort control. #}
+    <div class="menu-wrap sort-chip-wrap">
+      <button class="chip" id="sort-chip" data-menu>Sort: Time &#9662;</button>
+      <div class="menu" id="sort-menu">
+        <div class="pop-title">Sort by</div>
+        <button class="menu-item" data-sortfield="start">Date</button>
+        <button class="menu-item" data-sortfield="name">Name</button>
+        <button class="menu-item" data-sortfield="dur">Duration</button>
+        <button class="menu-item" data-sortfield="size">Size</button>
+      </div>
+    </div>
+  </div>
+  <div class="right">
+    <div class="menu-wrap">
+      <button class="btn btn-sm" data-menu>&#9881; Columns</button>
+      <div class="menu" id="columns-menu">
+        <div class="pop-title">Columns - drag &#8942;&#8942; to reorder</div>
+        <div class="pop-note">Saved to the server - follows you across browsers.</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+{# Sidebar-width overflow (dev/docs/BUGS.md): the fixed-track grid below has no give,
+   so a scroll container is needed once the sidebar leaves less room than the columns'
+   own minimum - header and rows share this one box so they scroll in lockstep. #}
+<div class="list-scroll rec-list">
+<div class="list-head" id="list-head">
+  <span class="sortable" data-sort="name">Recording name<span class="sort-ind"></span></span>
+  <span class="sortable" data-col="time" data-sort="start">Time<span class="sort-ind"></span></span>
+  <span class="sortable num" data-col="duration" data-sort="dur">Duration<span class="sort-ind"></span></span>
+  <span class="sortable num" data-col="size" data-sort="size">Size<span class="sort-ind"></span></span>
+  <span class="sortable num tip" data-col="health" data-sort="health" data-tip="Segments / stalls.&#10;A stall is a moment the stream stopped and the watchdog restarted ffmpeg - each restart starts a new segment.">Health<span class="sort-ind"></span></span>
+  <span data-col="account">Account</span>
+  <span data-col="output">Output file</span>
+  {# Spacer over the row kebab. Needs .c-actions: applyColumns() gives every
+     [data-col] header an explicit order, so an unclassed span keeps order 0 and
+     would sort into column 2, shifting every header label off its column. #}
+  <span class="c-actions"></span>
+</div>
+
+{% for title, sec_key, rows in sections %}
+{% if rows %}
+<div class="sec-head" data-section="{{ sec_key }}">{{ title }} <span class="cnt">{{ rows|length }}</span><span class="line"></span></div>
+<div class="rows" data-section="{{ sec_key }}">
+  {% for r in rows %}
+  <div class="row {{ r.st_class }}" data-href="{{ url_for('recordings.recording_detail', recording_id=r.id) }}"
+       data-name="{{ r.name|lower }}" data-status="{{ r.status }}"
+       data-channel="{{ r.pill.label if r.pill else '' }}" data-account="{{ r.acct_name or '' }}"
+       data-start="{{ r.sort_start }}" data-dur="{{ r.sort_dur }}" data-size="{{ r.sort_size }}" data-health="{{ r.sort_health }}">
+    <div class="c-title">
+      {% if r.thumb_url %}
+      <div class="thumb has-img" data-shot="{{ r.thumb_url }}"><img src="{{ r.thumb_url }}" alt="" loading="lazy" onerror="this.parentElement.classList.remove('has-img'); this.remove();"></div>
+      {% elif r.pill and r.pill.logo_url %}
+      <div class="thumb logo-fallback"><img src="{{ r.pill.logo_url }}" alt="" loading="lazy" onerror="this.parentElement.classList.remove('logo-fallback'); this.remove(); this.parentElement.textContent='-';"></div>
+      {% else %}
+      <div class="thumb">-</div>
+      {% endif %}
+      <div class="txt">
+        <div class="name">{{ r.name }}</div>
+        {% if r.tech_line %}
+        <div class="tech-line{% if r.tech_source == 'output' %} tip-plain" data-tip="From the final output file (recorded before capture-time probing existed).{% endif %}">{{ r.tech_line }}</div>
+        {% endif %}
+        <div class="meta">
+          {{ status_badge(r.badge_class, r.badge_label, pulse=r.badge_pulse) }}
+          {% if r.pill %}{{ channel_pill(r.pill.label, r.pill.url, logo_url=r.pill.logo_url, initials=r.pill.initials, acct_color=r.pill.acct_color) }}{% endif %}
+        </div>
+      </div>
+    </div>
+    <div class="c-time" data-col="time"><span class="day">{{ r.day }}</span><br>{{ r.start|local_time_only }} - {{ r.stop|local_time_only }}<br><span class="rel">{{ r.rel }}</span></div>
+    {# .c-stats is display:contents on desktop (each cell keeps its own grid column via
+       data-col order, per applyColumns()) and becomes one mono stats line at mobile
+       widths (DESIGN.md 9.4), grouping duration/size/health the way mockup 03 does. #}
+    <div class="c-stats">
+    <div class="c-num" data-col="duration">{% if r.dur_flag %}<span class="dur-flag tip-plain" data-tip="{{ r.dur_tip }}">&#9685;</span>{% endif %}{{ r.dur_str or '-' }}</div>
+    <div class="c-num" data-col="size">{% if r.size_num %}{{ r.size_num }} <span class="unit">{{ r.size_unit }}</span>{% if r.rate %}<span class="sub">{{ r.rate }}</span>{% endif %}{% else %}-{% endif %}</div>
+    <div class="c-health" data-col="health">
+      {% if r.health.tip %}<span class="h-mini {{ r.health.cls }} tip-plain" data-tip="{{ r.health.tip }}">{{ r.health.label }}</span>
+      {% else %}<span class="h-mini na">-</span>{% endif %}
+    </div>
+    </div>
+    <div class="c-time" data-col="account">{% if r.acct_name %}{{ r.acct_name }}{% else %}<span class="rel">-</span>{% endif %}</div>
+    <div class="c-time" data-col="output">{% if r.output_file %}<span style="font-family:var(--font-mono);font-size:.74rem;word-break:break-all">{{ r.output_file }}</span>{% else %}<span class="rel">-</span>{% endif %}</div>
+    <div class="c-actions">
+      <button class="btn btn-sm btn-icon" data-menu>&#8943;</button>
+      <div class="menu">
+        <a href="{{ url_for('recordings.recording_detail', recording_id=r.id) }}">Details</a>
+        {% if r.status == 'SCHEDULED' %}
+        <button class="menu-item" data-act="edit-schedule" data-id="{{ r.id }}"
+                data-rec-name="{{ r.name }}"
+                data-edit="{{ r.edit | tojson | forceescape }}">Edit schedule</button>
+        <div class="sep"></div>
+        <button class="menu-item danger" data-act="cancel" data-id="{{ r.id }}" data-rec-name="{{ r.name }}">Cancel recording</button>
+        {% elif r.status in ('IN_PROGRESS', 'PAUSED', 'RETRYING') %}
+        <div class="sep"></div>
+        <button class="menu-item danger" data-act="stop" data-id="{{ r.id }}" data-rec-name="{{ r.name }}">Stop recording</button>
+        {% elif r.status in ('COMPLETED', 'FAILED', 'ABORTED') %}
+        <div class="sep"></div>
+        <button class="menu-item danger" data-act="delete" data-id="{{ r.id }}" data-rec-name="{{ r.name }}">Delete</button>
+        {% endif %}
+      </div>
+    </div>
+    {% if r.progress_pct is not none %}
+    <div class="prog"><div style="width: {{ '%.1f'|format(r.progress_pct) }}%"></div></div>
+    {% endif %}
+  </div>
+  {% endfor %}
+</div>
+{% endif %}
+{% endfor %}
+</div>
+
+<div id="rec-no-results" class="empty-state" style="display:none">No recordings match the current filter.</div>
+
+{# Edit-schedule modal - shared with the TV Guide, see DESIGN.md's "Schedule Recording
+   page" ruling: editing a SCHEDULED recording opens the same record-modal the guide uses. #}
+{% include "_record_modal.html" %}
+
+<link rel="stylesheet" href="{{ url_for('static', filename='css/guide.css') }}">
+<script>
+const GUIDE_CONFIG = {
+  {# no epgUrl - this page has no guide grid; guide.js's grid paths are guarded on that.
+     fetchSavedSearches() etc. run unconditionally though, so this mirrors
+     recording_detail.html's full config shape rather than a page-specific subset. #}
+  savedSearchesUrl: '{{ url_for("guide.list_saved_searches") }}',  // GET list / POST create
+  deleteSavedSearchUrlBase: '/api/guide/saved-searches/',  // + id + /delete
+  addChannelUrlBase: '/api/guide/channels/',  // + channel_id + /add
+  newRecordingUrl: '{{ url_for("recordings.new_recording") }}',
+  editRecordingUrlBase: '/recordings/',  // + id + /edit
+  recDetailUrlBase: '/recordings/',  // + id
+  profiles: {
+    {% for p in profiles %}
+    '{{ p.id }}': { prePaddingMinutes: {{ p.pre_padding_minutes }}, postPaddingMinutes: {{ p.post_padding_minutes }} },
+    {% endfor %}
+  },
+};
+window.onScheduleSaved = () => window.location.reload();
+</script>
+<script src="{{ url_for('static', filename='js/guide.js') }}"></script>
+{# The shared filter bar (DESIGN.md 3.11); the page script below registers its dimensions. #}
+<script src="{{ url_for('static', filename='js/filter-bar.js') }}"></script>
+<script>
+(() => {
+  'use strict';
+
+  // ── Columns: visibility + order, persisted server-side (DESIGN.md 3.11) ──
+  const COLUMNS = [
+    { key: 'time',     label: 'Time',        width: '150px' },
+    { key: 'duration', label: 'Duration',    width: '90px'  },
+    { key: 'size',     label: 'Size',        width: '90px'  },
+    { key: 'health',   label: 'Health',      width: '62px'  },
+    { key: 'account',  label: 'Account',     width: '110px', off: true },
+    { key: 'output',   label: 'Output file', width: 'minmax(140px, 1fr)', off: true },
+  ];
+  const savedPrefs = {{ col_prefs | tojson }};
+  let colState = savedPrefs && Array.isArray(savedPrefs.order)
+    ? savedPrefs
+    : { order: COLUMNS.map(c => c.key), hidden: COLUMNS.filter(c => c.off).map(c => c.key) };
+  // tolerate prefs saved before a column existed
+  COLUMNS.forEach(c => { if (!colState.order.includes(c.key)) colState.order.push(c.key); });
+
+  const colStyle = document.createElement('style');
+  document.head.appendChild(colStyle);
+
+  const applyColumns = () => {
+    const visible = colState.order.filter(k => !colState.hidden.includes(k));
+    const widths = visible.map(k => COLUMNS.find(c => c.key === k).width);
+    let css = `@media (min-width: 769px) { .list-head, .rows .row { grid-template-columns: minmax(240px,2.2fr) ${widths.join(' ')} 44px; } }\n`;
+    colState.order.forEach((k, i) => {
+      css += `[data-col="${k}"] { order: ${i + 1}; ${colState.hidden.includes(k) ? 'display: none;' : ''} }\n`;
+    });
+    css += '.c-title { order: 0; } .c-actions { order: 98; } .prog { order: 99; }\n';
+    colStyle.textContent = css;
+  };
+  applyColumns();
+
+  const saveColumns = () => {
+    jsonFetch('/api/user-prefs/recordings_columns', {
+      method: 'POST',
+      body: JSON.stringify({ value: colState }),
+    }).catch(() => showToast('Could not save column setup', { type: 'error' }));
+  };
+
+  // Columns popover: checkbox list with drag-to-reorder grips
+  const colMenu = document.getElementById('columns-menu');
+  const buildColMenu = () => {
+    colMenu.querySelectorAll('.col-item').forEach(el => el.remove());
+    const note = colMenu.querySelector('.pop-note');
+    colState.order.forEach(key => {
+      const col = COLUMNS.find(c => c.key === key);
+      const item = document.createElement('label');
+      item.className = 'col-item';
+      item.draggable = true;
+      item.dataset.key = key;
+      item.innerHTML = `<span class="grip">&#8942;&#8942;</span><input type="checkbox" ${colState.hidden.includes(key) ? '' : 'checked'}> ${col.label}`;
+      item.querySelector('input').addEventListener('change', (e) => {
+        if (e.target.checked) colState.hidden = colState.hidden.filter(k => k !== key);
+        else if (!colState.hidden.includes(key)) colState.hidden.push(key);
+        applyColumns();
+        saveColumns();
+      });
+      item.addEventListener('dragstart', (e) => { e.dataTransfer.setData('text/plain', key); });
+      item.addEventListener('dragover', (e) => e.preventDefault());
+      item.addEventListener('drop', (e) => {
+        e.preventDefault();
+        const from = e.dataTransfer.getData('text/plain');
+        if (!from || from === key) return;
+        const order = colState.order.filter(k => k !== from);
+        order.splice(order.indexOf(key), 0, from);
+        colState.order = order;
+        applyColumns();
+        saveColumns();
+        buildColMenu();
+      });
+      colMenu.insertBefore(item, note);
+    });
+  };
+  buildColMenu();
+
+  // ── Sort: clickable headers on desktop (DESIGN.md 3.1/10.3), a Sort chip on
+  //    mobile where there are no column headers to click (DESIGN.md 9.4) - both
+  //    drive the same sortKey/sortDir state, applied inside each section. ──
+  const sections = Array.from(document.querySelectorAll('.rows'));
+  let sortKey = 'start', sortDir = 'desc';
+  const SORT_NUMERIC = { start: 1, dur: 1, size: 1, health: 1 };
+  const SORT_LABEL = { start: 'Time', name: 'Name', dur: 'Duration', size: 'Size' };
+  const sortChip = document.getElementById('sort-chip');
+
+  const applySort = () => {
+    sections.forEach(sec => {
+      sortChildren(sec, '.row', row => {
+        const v = row.dataset[{ name: 'name', start: 'start', dur: 'dur', size: 'size', health: 'health' }[sortKey]];
+        return SORT_NUMERIC[sortKey] ? parseInt(v || '0', 10) : (v || '');
+      }, sortDir);
+    });
+    document.querySelectorAll('.list-head .sortable').forEach(h => {
+      const active = h.dataset.sort === sortKey;
+      h.classList.toggle('sorted', active);
+      h.querySelector('.sort-ind').textContent = active ? (sortDir === 'desc' ? ' ▾' : ' ▴') : '';
+    });
+    if (sortChip) {
+      const label = SORT_LABEL[sortKey] || sortKey;
+      sortChip.textContent = `Sort: ${label} ${sortDir === 'desc' ? '▾' : '▴'}`;
+    }
+  };
+  const setSort = (key) => {
+    if (sortKey === key) sortDir = sortDir === 'desc' ? 'asc' : 'desc';
+    else { sortKey = key; sortDir = SORT_NUMERIC[key] ? 'desc' : 'asc'; }
+    applySort();
+  };
+  document.querySelectorAll('.list-head .sortable').forEach(h => {
+    h.addEventListener('click', () => setSort(h.dataset.sort));
+  });
+  document.querySelectorAll('#sort-menu [data-sortfield]').forEach(b => {
+    b.addEventListener('click', () => setSort(b.dataset.sortfield));
+  });
+  applySort();
+
+  // ── Search + filter chips ──
+  const allRows = Array.from(document.querySelectorAll('.rows .row'));
+  const searchInput = document.getElementById('rec-search');
+  const chipsWrap = document.getElementById('filter-chips');
+  const filterMenu = document.getElementById('filter-menu');
+  const noResults = document.getElementById('rec-no-results');
+
+  // The dimension registry for the shared filter bar (static/js/filter-bar.js,
+  // DESIGN.md 3.11). Values inside one dimension OR together (Channel: FS1 or FS2) while
+  // different dimensions AND (Channel: FS1 and Status: recording). Every value is
+  // whatever the rows actually carry, so a filter can never offer a choice that matches
+  // nothing.
+  const rowValues = (attr) => [...new Set(allRows.map(r => r.dataset[attr]).filter(Boolean))]
+    .sort().map(v => ({ v, label: v }));
+  const FILTER_DIMS = [
+    { k: 'status', label: 'Status', values: () => rowValues('status'),
+      match: (row, v) => row.dataset.status === v },
+    { k: 'channel', label: 'Channel', values: () => rowValues('channel'),
+      match: (row, v) => row.dataset.channel === v },
+    { k: 'account', label: 'Account', values: () => rowValues('account'),
+      match: (row, v) => row.dataset.account === v },
+  ];
+
+  const applyFilter = () => {
+    const q = searchInput.value.trim().toLowerCase();
+    let visible = 0;
+    allRows.forEach(row => {
+      const searchMatch = !q || row.dataset.name.includes(q) || (row.dataset.channel || '').toLowerCase().includes(q);
+      const show = searchMatch && filterBar.matches(row);
+      row.style.display = show ? '' : 'none';
+      if (show) visible++;
+    });
+    sections.forEach(sec => {
+      const shown = Array.from(sec.children).filter(r => r.style.display !== 'none').length;
+      sec.style.display = shown ? '' : 'none';
+      const head = document.querySelector(`.sec-head[data-section="${sec.dataset.section}"]`);
+      if (!head) return;
+      head.style.display = shown ? '' : 'none';
+      // The count must track what is actually visible - a section reading "55"
+      // above a single search hit states a number the page is contradicting.
+      const cnt = head.querySelector('.cnt');
+      if (cnt) cnt.textContent = shown;
+    });
+    noResults.style.display = visible === 0 ? '' : 'none';
+  };
+  searchInput.addEventListener('input', applyFilter);
+
+  const filterBar = createFilterBar({
+    chipsEl: chipsWrap,
+    menuEl: filterMenu,
+    dims: FILTER_DIMS,
+    rows: () => allRows,
+    note: 'Choices inside one filter are an "or"; different filters are an "and".',
+    onChange: applyFilter,
+  });
+
+  // ── Click targets (DESIGN.md 3.9): row -> details; thumb -> lightbox;
+  //    pills are real links; the actions cell swallows its clicks ──
+  // The kebab handler is delegated on document (util.js), so nothing inside a row
+  // may stopPropagation on the way up - that would swallow the event before it
+  // reaches document and the menu would never open. The row guards itself instead.
+  const NO_NAV = '.c-actions, .ch-pill, .thumb.has-img, .menu, [data-tip]';
+  allRows.forEach(row => {
+    row.addEventListener('click', (e) => {
+      if (e.target.closest(NO_NAV)) return;
+      window.location = row.dataset.href;
+    });
+    const thumb = row.querySelector('.thumb.has-img');
+    if (thumb) thumb.addEventListener('click', () => openLightbox(thumb.dataset.shot));
+  });
+
+  // ── Kebab actions (confirm anatomy per DESIGN.md section 4) ──
+  const ACTIONS = {
+    stop: {
+      title: 'Stop recording',
+      body: (name) => `Capture of "${escHtml(name)}" will end now and its segments will be joined into the final file. It can't be resumed.`,
+      verb: 'Stop recording',
+      url: (id) => `/recordings/${id}/stop-json`,
+    },
+    cancel: {
+      title: 'Cancel scheduled recording',
+      body: (name) => `"${escHtml(name)}" will be removed.`,
+      verb: 'Cancel recording',
+      url: (id) => `/recordings/${id}/cancel-json`,
+    },
+    delete: {
+      title: 'Delete recording',
+      // Complete markup rather than a prose sentence: the delete confirm carries the
+      // "delete the files" switch, and a <label> cannot live inside the <p> wrapper the
+      // other specs get.
+      bodyHtml: (name) => deleteRecordingBody(`"${escHtml(name)}" will be removed from ChannelBin.`),
+      verb: 'Delete',
+      url: (id) => `/recordings/${id}/delete-json`,
+      payload: () => ({ delete_files: deleteRecordingWantsFiles() }),
+    },
+  };
+  document.querySelectorAll('[data-act]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      if (btn.dataset.act === 'edit-schedule') {
+        const d = JSON.parse(btn.dataset.edit);
+        openModal({
+          has_recording: true,
+          recording_id: Number(btn.dataset.id),
+          recording_status: 'SCHEDULED',
+          recording_start_time: d.start_iso,
+          recording_stop_time: d.stop_iso,
+          recording_profile_id: d.profile_id,
+          suggested_name: btn.dataset.recName,
+          title: btn.dataset.recName,
+          stream_url: d.url,
+          channel_id: d.channel_id,
+          group_id: d.group_id,
+          id: null,
+          description: null,
+        }, null);
+        return;
+      }
+      const spec = ACTIONS[btn.dataset.act];
+      if (!spec) return;
+      buildModal({
+        title: spec.title,
+        body: spec.bodyHtml
+          ? spec.bodyHtml(btn.dataset.recName)
+          : `<p style="font-size:.9rem">${spec.body(btn.dataset.recName)}</p>`,
+        footer: [
+          { label: 'Cancel', class: 'btn', onClick: (close) => { close(); } },
+          { label: spec.verb, class: 'btn btn-danger', onClick: (close) => {
+              // Body read before the request goes out; `return false` keeps the modal (and
+              // so the delete confirm's switch) mounted while it is in flight.
+              const opts = { method: 'POST' };
+              if (spec.payload) opts.body = JSON.stringify(spec.payload());
+              jsonFetch(spec.url(btn.dataset.id), opts)
+                .then(() => window.location.reload())
+                .catch(err => { close(); showToast(err.message, { type: 'error' }); });
+              return false;
+            } },
+        ],
+      });
+    });
+  });
+})();
+</script>
+{% endif %}
+{% endblock %}

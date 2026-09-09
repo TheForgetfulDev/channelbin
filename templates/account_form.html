@@ -1,0 +1,257 @@
+{% extends "base.html" %}
+{% from '_macros.html' import csrf_field, secret_reveal_btn %}
+{% block title %}Add Account - ChannelBin{% endblock %}
+
+{#  Add an account (DESIGN.md §17.1, §17.4).
+
+    ADD ONLY. Editing an account is a modal over the JSON API on both Accounts surfaces
+    (static/js/account-modal.js), so `accounts.edit_account` and this page's edit half were
+    deleted together in dev/changelog/456 - a GET-only edit route would have served a form
+    whose Save button 405s. `+ Add Account` stays a page because it is the one account
+    action with nothing to overlay: there is no account yet.
+
+    The password eyeball is the LOCAL one (no `path` on the macro): it swaps the input's
+    type so you can read what you are typing, and never requests a stored value, because no
+    endpoint returns an account password (§17.4). #}
+
+{% block content %}
+<div class="page-head">
+  <h1>Add Account</h1>
+</div>
+<p class="page-sub">
+  An account is one IPTV provider connection. ChannelBin syncs its channel list and guide
+  data on a schedule; nothing is fetched until you sync it for the first time.
+</p>
+
+<div class="form-card">
+  <form method="post">
+      {{ csrf_field() }}
+
+    <div class="form-group">
+      <label>Account Type <span class="required">*</span></label>
+      <select name="account_type" id="account-type" class="form-control">
+        <option value="m3u" {% if form.get('account_type', 'm3u') == 'm3u' %}selected{% endif %}>
+          M3U Playlist + XMLTV EPG
+        </option>
+        <option value="xtream" {% if form.get('account_type') == 'xtream' %}selected{% endif %}>
+          Xtream API
+        </option>
+      </select>
+      <span class="form-hint">M3U works with any IPTV provider. Xtream API uses the provider's Xtream Codes login.</span>
+    </div>
+
+    <div class="form-group">
+      <label>Name <span class="required">*</span></label>
+      <input type="text" name="name" class="form-control" required
+             value="{{ form.get('name', '') }}"
+             placeholder="e.g. My IPTV Provider">
+      <span class="form-hint">A friendly label shown in the UI to identify this account.</span>
+    </div>
+
+    {# ── M3U fields ── #}
+    <div id="fields-m3u">
+      <div class="form-group">
+        <label>M3U URL <span class="required">*</span></label>
+        <input type="url" name="m3u_url" id="m3u-url" class="form-control"
+               value="{{ form.get('m3u_url', '') }}"
+               placeholder="http://provider.com/get.php?username=...&password=...&type=m3u_plus">
+        <span class="form-hint">Full M3U playlist URL from your IPTV provider.</span>
+      </div>
+      <div class="form-group">
+        <label>XMLTV EPG URL <span class="form-hint-inline">(optional)</span></label>
+        <input type="url" name="epg_url" class="form-control"
+               value="{{ form.get('epg_url', '') }}"
+               placeholder="http://provider.com/xmltv.php?username=...&password=...">
+        <span class="form-hint">TV guide data URL. Leave blank to skip EPG import.</span>
+      </div>
+    </div>
+
+    {# ── Xtream fields ── #}
+    <div id="fields-xtream" style="display:none">
+      <div class="form-group">
+        <label>Base URL <span class="required">*</span></label>
+        <input type="text" name="base_url" id="xtream-base-url" class="form-control"
+               value="{{ form.get('base_url', '') }}"
+               placeholder="http://your-provider.com">
+        <span class="form-hint">Provider URL without trailing slash. Example: <code>http://provider.com:8080</code></span>
+      </div>
+      <div class="form-row">
+        <div class="form-group">
+          <label>Username <span class="required">*</span></label>
+          <input type="text" name="username" id="xtream-username" class="form-control"
+                 value="{{ form.get('username', '') }}"
+                 autocomplete="off">
+        </div>
+        <div class="form-group">
+          <label>Password</label>
+          <div class="secret-field">
+            <input type="password" name="password" class="form-control"
+                   autocomplete="new-password" placeholder="Password">
+            {{ secret_reveal_btn(local=true) }}
+          </div>
+          <span class="form-hint">
+            ChannelBin never shows a stored password back to you - the eye only reveals what
+            you type here.
+          </span>
+        </div>
+      </div>
+    </div>
+
+    {# ── Shared fields ── #}
+    <div class="form-group">
+      <label>URL Normalization</label>
+      <select name="url_normalization" class="form-control" id="url-norm-select">
+        {% for val, label, example in norm_options %}
+        <option value="{{ val }}" data-example="{{ example }}"
+                {% if form.get('url_normalization', '') == val %}selected{% endif %}>{{ label }}</option>
+        {% endfor %}
+      </select>
+      <span class="form-hint">
+        Rewrites every stream URL into one consistent form. Only the URL's shape changes -
+        the address and credentials the provider supplied are always kept as-is, and a URL
+        that has no <code>user/password/id</code> in it is left untouched.
+        The global default is set in Settings under <code>sync.url_normalization</code>.
+      </span>
+      {# Server-rendered to match the current selection, so the "nothing active" state is
+         already correct before any JS runs (CLAUDE.md Frontend rendering). #}
+      <div class="form-hint" id="url-norm-example"
+           style="margin-top:.35rem;{% if not norm_example %}display:none;{% endif %}">
+        Example: <code id="url-norm-example-url">{{ norm_example }}</code>
+      </div>
+    </div>
+
+    <div class="form-group">
+      <label>Sync Interval</label>
+      <select name="sync_interval_hours" class="form-control">
+        <option value="" {% if not form.get('sync_interval_hours') %}selected{% endif %}>
+          Default ({{ global_sync_hours }}h - follows global setting)
+        </option>
+        {% for h in [1, 2, 4, 6, 12, 24] %}
+        <option value="{{ h }}" {% if form.get('sync_interval_hours')|string == h|string %}selected{% endif %}>
+          Every {{ h }} hour{% if h != 1 %}s{% endif %}
+        </option>
+        {% endfor %}
+      </select>
+      <span class="form-hint">
+        How often to refresh channels and EPG data for this account.
+        "Default" follows <code>sync.sync_interval_hours</code> in Settings.
+      </span>
+    </div>
+
+    <div class="form-group">
+      <label>Max Simultaneous Connections</label>
+      <input type="number" name="max_connections" class="form-control" min="1" step="1"
+             value="{{ form.get('max_connections', '') }}"
+             placeholder="Default ({{ global_max_connections }})">
+      <span class="form-hint">
+        Maximum concurrent connections this app will open to this provider - recordings
+        and channel tests combined (account sync does not count against this). Leave
+        blank to use the global default (<code>accounts.default_max_connections</code>
+        in Settings).
+      </span>
+    </div>
+
+    <div class="form-group">
+      {# The shipped .switch (style.css), the same control the settings modal renders - this
+         page carried a hand-rolled .toggle-switch of its own until dev/changelog/456. #}
+      <label style="display:flex;align-items:center;gap:0.6rem;cursor:pointer">
+        <span class="switch">
+          <input type="checkbox" name="sync_enabled"
+                 {% if form.get('sync_enabled', True) %}checked{% endif %}>
+          <span class="knob"></span>
+        </span>
+        Enable automatic sync
+      </label>
+      <span class="form-hint">
+        When disabled, this account will never be automatically synced.
+        You can still sync manually with Sync now.
+      </span>
+    </div>
+
+    <div class="form-group">
+      <label>Color</label>
+      <div class="color-picker">
+        {% for hex, label in preset_colors %}
+        <label class="color-swatch-label" title="{{ label }}">
+          <input type="radio" name="color" value="{{ hex }}"
+                 {% if form.get('color', '#58a6ff') == hex %}checked{% endif %}
+                 class="color-radio">
+          <span class="color-swatch" style="background: {{ hex }}"></span>
+        </label>
+        {% endfor %}
+        <div class="color-custom">
+          <label style="font-size: 12px; color: var(--text-muted);">Custom:</label>
+          <input type="text" name="color" id="color-custom-input" class="form-control"
+                 style="width: 100px; font-family: var(--font-mono);"
+                 value="{{ form.get('color', '') if form.get('color', '') not in (preset_colors | map(attribute=0) | list) else '' }}"
+                 placeholder="#rrggbb">
+        </div>
+      </div>
+      <span class="form-hint">Color used to identify this account's channels in the TV guide.</span>
+    </div>
+
+    <div class="form-actions">
+      <button type="submit" class="btn btn-primary">Add Account</button>
+      <a href="{{ url_for('accounts.accounts_list') }}" class="btn">Cancel</a>
+    </div>
+  </form>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<style>
+/* The colour picker's own rules moved to style.css when tag_form.html was deleted and the
+   tag modal became a second caller (dev/changelog/448) - a class styled in one page's
+   block may not be borrowed by another. What is left here is scoped to this page. */
+.form-hint-inline {
+  font-size: var(--fs-sm);
+  color: var(--text-muted);
+  font-weight: normal;
+}
+code {
+  background: var(--bg3);
+  padding: 0 4px;
+  border-radius: var(--radius-sm);
+  font-family: var(--font-mono);
+  font-size: var(--fs-sm);
+}
+</style>
+<script>
+const typeSelect = document.getElementById('account-type');
+const m3uFields = document.getElementById('fields-m3u');
+const xtreamFields = document.getElementById('fields-xtream');
+
+// Required is toggled with the visible half, not left on both: a hidden required input
+// makes the browser refuse to submit while pointing at something nobody can see.
+const switchType = (v) => {
+  m3uFields.style.display = v === 'm3u' ? '' : 'none';
+  xtreamFields.style.display = v === 'xtream' ? '' : 'none';
+  document.getElementById('m3u-url').required = (v === 'm3u');
+  document.getElementById('xtream-base-url').required = (v === 'xtream');
+  document.getElementById('xtream-username').required = (v === 'xtream');
+};
+typeSelect.addEventListener('change', () => switchType(typeSelect.value));
+switchType(typeSelect.value);
+
+// Typing a custom color clears the preset picked above it - two color inputs both claiming
+// name="color" means the last non-empty one wins, so leaving a radio checked would be a
+// silent disagreement with what the field shows.
+document.getElementById('color-custom-input').addEventListener('input', () => {
+  document.querySelectorAll('.color-radio').forEach((r) => { r.checked = false; });
+});
+
+// Live example under the URL-normalization dropdown. Purely an upgrade of an already
+// correct server-rendered state - it never has to calm anything down.
+const normSelect = document.getElementById('url-norm-select');
+const normBox = document.getElementById('url-norm-example');
+const normUrl = document.getElementById('url-norm-example-url');
+if (normSelect && normBox && normUrl) {
+  const showNormExample = () => {
+    const example = normSelect.selectedOptions[0]?.dataset.example || '';
+    normUrl.textContent = example;
+    normBox.style.display = example ? '' : 'none';
+  };
+  normSelect.addEventListener('change', showNormExample);
+}
+</script>
+{% endblock %}

@@ -1,0 +1,271 @@
+{% extends "base.html" %}
+{% block title %}Groups - ChannelBin{% endblock %}
+
+{% from "_macros.html" import channel_pill, account_pill, status_badge, recur_schedule_fields %}
+
+{% block content %}
+<div class="page-head">
+  <h1>Channels</h1>
+  <div style="display:flex; gap:.5rem;">
+    <a href="{{ url_for('guide.guide') }}" class="btn">&larr; TV Guide</a>
+    <button class="btn btn-primary" id="btn-new-group">+ New Group</button>
+  </div>
+</div>
+
+{% include 'channels/_tabs.html' %}
+
+<p class="text-muted" style="font-size:13px; margin-bottom:1rem;">
+  A <strong>channel group</strong> bundles identical feeds of one channel. Turn on
+  <strong>Recording</strong> for the members you would record from and the group can be a single TV
+  Guide row: recordings start on the healthiest enabled member and fail over to the next-best one if
+  it dies. A <strong>health check</strong> is a schedule the group carries, testing its members to
+  confirm they still play &mdash; a group can carry more than one, and a group with no member
+  enabled for recording is simply a health check.
+</p>
+
+{% if not group_rows %}
+<div class="empty-state">
+  <p>No groups yet.</p>
+  <p class="text-muted" style="font-size:13px;">
+    Create one from the <a href="{{ url_for('channels.channel_browser') }}">Browse</a> tab
+    (select channels &rarr; &ldquo;&#9939; Group Selected&rdquo;), or with the button above.
+  </p>
+</div>
+{% else %}
+
+<div class="toolbar">
+  <span class="search-wrap" id="search-wrap">
+    <input class="search" id="grp-search" placeholder="Search groups and channels...">
+    <button class="search-clear" id="search-clear" type="button" aria-label="Clear search"
+            data-tip="Clear search.&#10;Empties the box and shows every group again. Escape does the same while the box is focused.">&times;</button>
+  </span>
+  <div class="chips" id="filter-chips">
+    <div class="menu-wrap">
+      <button class="chip" data-menu>+ Filter</button>
+      <div class="menu pop-left" id="filter-menu"></div>
+    </div>
+  </div>
+  <span class="text-muted small" id="filter-count" style="margin-left:auto;"></span>
+</div>
+
+<div id="grp-no-results" class="empty-state" style="display:none">
+  <p>No groups match your filters.</p>
+  <button class="btn btn-primary" id="grp-clear-filters">Clear filters</button>
+</div>
+
+{% macro member_table(g) %}
+{% if not g.members %}
+<p class="text-muted small" style="padding:.5rem .25rem;">No channels yet.</p>
+{% else %}
+<p class="grp-mnote" data-mnote="{{ g.id }}">
+  {% if g.system %}
+  This list is built automatically from your TV Guide: every guide channel with testing enabled
+  ({{ g.members | length }} right now). Add or remove a guide channel and it updates itself &mdash;
+  there is nothing to edit here. Sorted by score, best first. Click any column to sort.
+  {% else %}
+  Sorted by score, best first. A recording starts on the channel marked &#9733; and fails over
+  downward &mdash; that is the best member with Recording on, so it is not always the top row.
+  Click any column to sort.
+  {% endif %}
+</p>
+<div class="table-scroll">
+<table class="grp-mtable" data-mtable="{{ g.id }}">
+  <thead>
+    <tr>
+      <th class="sortable" data-msort="name" data-tip="Sort by channel.&#10;Click again to reverse. Untested channels stay at the bottom either way.">Channel<span class="arr"></span></th>
+      <th class="sortable" data-msort="status" data-tip="Sort by status.&#10;Click again to reverse. Untested channels stay at the bottom either way.">Status<span class="arr"></span></th>
+      <th class="sortable" data-msort="score" data-tip="Sort by score.&#10;Click again to reverse. Untested channels stay at the bottom either way.">Score<span class="arr"></span></th>
+      <th class="sortable" data-msort="res" data-tip="Sort by resolution.&#10;Click again to reverse. Untested channels stay at the bottom either way.">Resolution<span class="arr"></span></th>
+      <th class="sortable" data-msort="fps" data-tip="Sort by FPS.&#10;Click again to reverse. Untested channels stay at the bottom either way.">FPS<span class="arr"></span></th>
+      <th class="sortable" data-msort="bitrate" data-tip="Sort by bitrate.&#10;Click again to reverse. Untested channels stay at the bottom either way.">Bitrate<span class="arr"></span></th>
+      <th class="sortable" data-msort="tested" data-tip="Sort by last tested.&#10;Click again to reverse. Untested channels stay at the bottom either way.">Last tested<span class="arr"></span></th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for m in g.members %}
+    <tr class="grp-mrow{% if m.disabled %} is-disabled{% endif %}"
+        data-name="{{ m.name | lower }}" data-status="{{ m.status }}"
+        data-score="{{ m.score if m.score is not none else '' }}"
+        data-res="{{ (m.resolution.split('x')[1] | int) if m.resolution else '' }}"
+        data-fps="{{ m.fps if m.fps is not none else '' }}"
+        data-bitrate="{{ m.bitrate_kbps if m.bitrate_kbps is not none else '' }}"
+        data-tested="{{ m.tested_iso }}">
+      <td>
+        {{ channel_pill(m.name, m.url, logo_url=m.logo_url, initials=m.initials, acct_color=m.account_color) }}
+        {% if m.is_best %}<span class="grp-best" data-tip="Best active channel.&#10;Highest effective score of the channels that are not disabled, so a recording from this group starts here and fails over downward. A higher-scored feed above it means that one is disabled.">&#9733;</span>{% endif %}
+        {% if m.disabled %}<span class="badge b-fail tip-plain" data-tip="Disabled.&#10;{{ m.disabled }}">&#10005; disabled</span>{% endif %}
+      </td>
+      <td>
+        {% if m.status == 'PASS' %}<span class="badge b-done tip-plain" data-tip="Pass.&#10;The last health check connected to this feed and it played cleanly for the whole test.">Pass</span>
+        {% elif m.status == 'WARN' %}<span class="badge b-warn tip-plain" data-tip="Warn.&#10;It played, but not cleanly - a slow connect, a stall, or a low bitrate. Usable, but the first thing failover should skip.">Warn</span>
+        {% elif m.status == 'FAIL' %}<span class="badge b-fail tip-plain" data-tip="Fail.&#10;The last health check could not play this feed at all.">Fail</span>
+        {% else %}<span class="badge b-abort tip-plain" data-tip="Untested.&#10;No health check has reached this channel yet, so nothing is known about it.">Untested</span>{% endif %}
+      </td>
+      <td>{% if m.score is not none %}<span class="tip-plain" data-tip="Score {{ m.score }}.&#10;Health score 0-100 from this feed's own check history: connect time, stalls, and whether the stream held its declared format.">{{ m.score }}</span>{% else %}<span class="text-muted">&#8212;</span>{% endif %}</td>
+      <td class="text-muted">{{ m.resolution or '-' }}</td>
+      <td class="text-muted">{{ m.fps or '-' }}</td>
+      <td class="text-muted">{{ (m.bitrate_kbps / 1000) | round(1) ~ ' Mbps' if m.bitrate_kbps else '-' }}</td>
+      <td class="text-muted">{{ m.tested_et or 'never tested' }}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+</div>
+{% endif %}
+{% endmacro %}
+
+{% macro check_chip(g, c) %}
+{% if c.status == 'RUNNING' %}
+<span class="badge b-running tip-plain" data-menu-check="{{ g.id }}:{{ c.job_id }}" style="cursor:pointer;" data-tip="{{ c.name }}.&#10;Running now. Click for the live results page."><span class="pulse"></span>Running</span>
+{% elif c.has_schedule %}
+<span class="grp-check-chip{% if c.inherited %} grp-chip-none{% endif %}" data-menu-check="{{ g.id }}:{{ c.job_id }}" data-tip="{{ c.name }}.&#10;{% if c.recurring %}{{ c.recur_description }}{% if c.recur_paused %} (paused){% endif %}{% else %}Next run {{ c.scheduled_et or 'unknown' }}{% endif %}{% if c.profile_name %}. Profile: {{ c.profile_name }}{% endif %}{% if c.inherited %}. Inherited: the automatic TV Guide check tests one channel per guide row, so it covers the member serving this group - not its other members.{% endif %}">{% if c.inherited %}Inherited coverage{% elif c.recurring %}&#8635; {{ c.recur_description }}{% else %}{{ c.scheduled_et }}{% endif %}</span>
+{% elif c.status == 'CANCELLED' %}
+<span class="grp-check-chip" data-menu-check="{{ g.id }}:{{ c.job_id }}" data-tip="{{ c.name }}.&#10;This health check was cancelled before it finished. It has no results.">Cancelled</span>
+{% else %}
+<span class="grp-check-chip" data-menu-check="{{ g.id }}:{{ c.job_id }}" data-tip="{{ c.name }}.&#10;One-off health check, ran {{ c.completed_et or 'never' }}. Click for its results page.">ran {{ c.completed_et or 'never' }}</span>
+{% endif %}
+{% endmacro %}
+
+{% macro results_span(c) %}
+{% if not c or (c.pass_count + c.warn_count + c.fail_count) == 0 %}
+<span class="text-muted small">&#8212;</span>
+{% else %}
+<span class="grp-check-results tip-plain" data-tip="Results of the last run over {{ c.pass_count + c.warn_count + c.fail_count }} channel(s): {{ c.pass_count }} passed, {{ c.warn_count }} had warnings, {{ c.fail_count }} failed. Open the row to see which.">
+  <span style="color:var(--ok)">{{ c.pass_count }}P</span>
+  {% if c.warn_count %}<span style="color:var(--warn)">{{ c.warn_count }}W</span>{% endif %}
+  {% if c.fail_count %}<span style="color:var(--bad)">{{ c.fail_count }}F</span>{% endif %}
+</span>
+{% endif %}
+{% endmacro %}
+
+{% macro group_row(g) %}
+<div class="grp-item" data-group="{{ g.id }}" data-system="{{ '1' if g.system else '0' }}"
+     data-strategy="{{ g.format_strategy }}"
+     data-health="st-{{ g.health_cls }}" data-healths="{{ g.health_set | join(' ') }}"
+     data-guide="{{ 'in' if g.in_guide else 'out' }}"
+     data-check="{{ g.check_dim }}" data-issues="{{ g.issues | join(' ') }}"
+     data-accounts="{{ g.accounts | join('|') }}" data-name="{{ g.name | lower }}"
+     data-search="{{ (g.name ~ ' ' ~ (g.members | map(attribute='name') | join(' '))) | lower }}"
+     data-members-count="{{ g.member_count }}" data-checks-count="{{ g.checks | length }}"
+     data-activity="{{ g.last_activity }}"
+     data-payload="{{ g | tojson | forceescape }}">
+  <div class="grp-summary">
+    <button type="button" class="grp-expand" aria-expanded="false" aria-label="Toggle channels"
+            {% if not g.members %}disabled{% endif %}><span class="grp-caret"></span></button>
+    <div class="grp-row" data-expand="{{ g.id }}"{% if g.detail_url %} data-detail-url="{{ g.detail_url }}"{% endif %}>
+      <span class="grp-kind tip-plain" data-tip="Channel group.&#10;Duplicate feeds of one channel. Turn Recording on for the members you would record from; whichever is healthiest serves the guide row and starts a recording.">&#9939;</span>
+      <span class="grp-name">{{ g.name }}</span>
+      {% if g.system %}<span class="badge b-auto tip-plain" data-tip="Automatic group.&#10;ChannelBin maintains this one. Its channels are every TV Guide channel with testing enabled, recalculated whenever the guide changes. You cannot edit or delete it.">Automatic</span>{% endif %}
+      {% if g.health_score is not none %}<span class="badge {{ g.health_score | health_css(health_bands) }}{{ ' tip-plain' if g.health_n < 3 else '' }}"{% if g.health_n < 3 %} data-tip="Group health {{ g.health_score }}.&#10;Built from only {{ g.health_n }} recording(s) - dimmed because under 3 is not yet a trend." style="opacity:.55;"{% endif %}>&#9733;{{ g.health_score }}</span>{% endif %}
+      <span class="grp-meta">{{ g.member_count }} channel{{ 's' if g.member_count != 1 else '' }}{% if g.recording_count %} &middot; {{ g.recording_count }} recording{% endif %}</span>
+      {% if g.reference_label %}<span class="group-list-fmt tip-plain" data-tip="Group reference format.&#10;{{ 'Locked. Channels that do not match are not used for a recording.' if g.locked else 'Auto - taken from the healthiest member.' }}">{{ g.reference_label }}{% if g.locked %} &#128274;{% endif %}</span>{% endif %}
+      {% if g.best_active %}<span class="grp-meta tip-plain" data-tip="Best channel.&#10;Recordings start on this feed and fail over from here.">
+        <span class="acct-dot" style="background:{{ g.best_active.account_color }}"></span>{{ g.best_active.name }}</span>{% endif %}
+      {% if g.mismatch %}<span class="badge b-fail tip-plain" data-tip="Mixed format.&#10;Channels have differing resolution or frame rate. Mixed formats break failover recordings.">&#9940; Mixed format</span>{% endif %}
+      {% if g.unmonitored_count %}<span class="badge b-warn tip-plain" data-tip="{{ g.unmonitored_count }} not monitored.&#10;No recurring health check covers these channels, so format drift will not be re-checked automatically.">&#9888; {{ g.unmonitored_count }} not monitored</span>{% endif %}
+      {% if g.in_guide %}<span class="badge b-done tip-plain" data-tip="In Guide.&#10;This group renders as a single TV Guide row, filled by whichever member is serving it. A member that also has its own guide row keeps it.">In Guide</span>{% endif %}
+      {% if g.checks %}
+        {% for c in g.checks %}{{ check_chip(g, c) }}{% endfor %}
+        {% if g.system %}{{ results_span(g.checks[-1]) }}{% endif %}
+      {% endif %}
+      {# A health check is a schedule this group carries, so the pill adds one rather than
+         creating an object (DESIGN-channel-groups-model.md DECIDED 2). "another" when the
+         automatic check already covers a member on the group's behalf - which is no longer
+         gated on the group being in the guide, because the scheduleless-group fallback
+         covers groups that are not (dev/changelog/752). #}
+      {% if not g.system and not (g.checks | rejectattr('inherited') | list) %}
+        {% if g.checks | selectattr('inherited') | list %}
+        <span class="grp-check-chip grp-chip-none" data-act="create-check" data-group="{{ g.id }}">+ Add another health check</span>
+        {% else %}
+        <span class="grp-check-chip grp-chip-none" data-act="create-check" data-group="{{ g.id }}">+ Add health check</span>
+        {% endif %}
+      {% endif %}
+      <div class="grp-actions">
+        <button class="btn btn-sm btn-icon" data-menu aria-label="More actions">&#8943;</button>
+        <div class="menu">
+          {% if g.detail_url %}<a href="{{ g.detail_url }}">Details</a>
+          {% else %}<button class="menu-item" disabled title="No health check attached yet - nothing to show">Details</button>{% endif %}
+          {% if not g.system %}
+          <button class="menu-item" data-act="guide-toggle" data-group="{{ g.id }}">{{ 'Remove from TV Guide' if g.in_guide else 'Add to TV Guide' }}</button>
+          {% endif %}
+          <div class="sep"></div>
+          {% if not g.system %}
+          <button class="menu-item" data-act="create-check" data-group="{{ g.id }}">Schedule health check</button>
+          {% endif %}
+          {% for c in g.checks if not c.inherited %}
+          <button class="menu-item" data-act="run-check" data-group="{{ g.id }}" data-job="{{ c.job_id }}">Run {{ ('"' ~ c.name ~ '" ') if (g.checks | rejectattr('inherited') | list | length) > 1 else '' }}now</button>
+          {% endfor %}
+          <div class="sep"></div>
+          <button class="menu-item" data-act="clone" data-group="{{ g.id }}">Clone</button>
+          <div class="sep"></div>
+          <button class="menu-item danger" data-act="delete" data-group="{{ g.id }}"{% if g.system %} disabled{% endif %}>Delete group</button>
+        </div>
+      </div>
+    </div>
+  </div>
+  <div class="grp-detail" hidden>
+    {{ member_table(g) }}
+  </div>
+</div>
+{% endmacro %}
+
+<div class="sec-head" data-section="groups">Groups <span class="cnt">{{ group_rows | length }}</span><span class="line"></span>
+  <span class="menu-wrap">
+    <button class="chip" id="sort-chip-groups" data-menu>Sort: Group name &#9662;</button>
+    <div class="menu" id="sort-menu-groups">
+      <div class="pop-title">Sort by</div>
+      <button class="menu-item" data-gsort="name">Group name</button>
+      <button class="menu-item" data-gsort="members">Number of channels</button>
+      <button class="menu-item" data-gsort="health">Health (worst first)</button>
+      <button class="menu-item" data-gsort="activity">Last tested</button>
+      <button class="menu-item" data-gsort="checks">Health checks attached</button>
+      <button class="menu-item" data-gsort="guide">In the TV Guide</button>
+    </div>
+  </span>
+</div>
+<div class="grp-list-compact" id="grp-list-groups" data-section="groups">
+  {% for g in group_rows %}{{ group_row(g) }}{% endfor %}
+</div>
+
+{% endif %}
+
+<style>
+.grp-list-compact { display: flex; flex-direction: column; gap: 0.5rem; margin-bottom: 1.5rem; }
+</style>
+
+{# The one-off / recurring schedule picker for the Create-health-check modal. Its own
+   prefix, because the detail page renders the same macro with `gdsched` for its
+   Settings modal and two copies of one id on a page is a defect. #}
+<template id="cc-schedule-fields">
+  {{ recur_schedule_fields('ccsched', 'Start Time', window_label) }}
+</template>
+
+<script>
+window.GROUPS_CONFIG = {
+  createGroupUrl: '{{ url_for("channel_groups.create_group") }}',
+  guideToggleUrlBase: '/api/channel-groups/',    // + id + /guide-toggle
+  deleteUrlBase: '/api/channel-groups/',     // + id + /delete
+  groupNames: {{ group_names | tojson }},
+  resolutionOptions: {{ resolution_options | tojson }},
+  fpsOptions: {{ fps_options | tojson }},
+  startJobUrlBase: '/api/channel-tests/on-demand/',  // + id + /start
+  checkProfiles: {{ check_profiles | tojson }},
+  profilesUrl: {{ url_for('health_check_profiles.health_check_profiles_list') | tojson }},
+  testerBusy: {{ 'true' if tester_status.is_running else 'false' }},
+  {# Where the maintenance window's hours live. The settings page reads ?q= off its own
+     URL and applies it as the page search (static/js/settings.js) - there is no anchor
+     to link at. #}
+  windowSettingsUrl: {{ (url_for('settings.settings') ~ '?q=Maintenance+window') | tojson }},
+};
+</script>
+<script src="{{ url_for('static', filename='js/format-plan.js') }}"></script>
+<script src="{{ url_for('static', filename='js/create-group-modal.js') }}"></script>
+<script src="{{ url_for('static', filename='js/schedule-fields.js') }}"></script>
+<script src="{{ url_for('static', filename='js/check-modal.js') }}"></script>
+<script src="{{ url_for('static', filename='js/clone-check-modal.js') }}"></script>
+<script src="{{ url_for('static', filename='js/clone-modal.js') }}"></script>
+<script src="{{ url_for('static', filename='js/group-delete.js') }}"></script>
+{# Ahead of groups.js, which builds its filter bar at load (DESIGN.md 3.11). #}
+<script src="{{ url_for('static', filename='js/filter-bar.js') }}"></script>
+<script src="{{ url_for('static', filename='js/groups.js') }}"></script>
+{% endblock %}

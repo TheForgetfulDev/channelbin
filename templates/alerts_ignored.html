@@ -1,0 +1,70 @@
+{% extends "base.html" %}
+{% block title %}Ignored Alerts - ChannelBin{% endblock %}
+
+{#  Ignored-alert-pattern management (dev/changelog/539).
+
+    Reuses the tags.html shape (.card + .table-scroll + table.tbl) rather than inventing a
+    new list component - no page-local CSS needed. #}
+
+{% block content %}
+<a class="back" href="{{ url_for('alerts.alert_center') }}">&larr; Alerts</a>
+<div class="page-head">
+  <h1>Ignored Alerts
+    <span class="sub">{{ patterns | length }} pattern{{ 's' if patterns | length != 1 else '' }}</span>
+  </h1>
+</div>
+<p class="page-sub">Alerts matching one of these patterns are suppressed before they ever
+  reach the alert center - the underlying condition still gets logged normally, it just
+  stops being surfaced here or pushed. Removing a pattern lets matching alerts start
+  appearing again.</p>
+
+{% if not patterns %}
+<div class="empty-state">
+  <p>No ignored alert patterns.</p>
+  <p class="text-muted" style="font-size:13px;">
+    Use <strong>Ignore future alerts like this</strong> on any active alert to create one.
+  </p>
+</div>
+{% else %}
+<div class="card">
+  <div class="card-head"><h2>Ignored patterns <span class="cnt">{{ patterns | length }}</span></h2></div>
+  <div class="card-body table-scroll">
+    <table class="tbl">
+      <thead>
+        <tr>
+          <th>Alert type</th>
+          <th>Example</th>
+          <th>Ignored since</th>
+          <th>Times suppressed</th>
+          <th>Last matched</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody id="ignored-list">
+        {% for p in patterns %}
+        <tr data-id="{{ p.id }}">
+          <td>{{ type_labels.get(p.alert_type, p.alert_type) }}</td>
+          <td class="muted">{{ p.example_title or p.title_pattern }}</td>
+          <td class="muted small">{{ p.created_at | local_time if p.created_at else '' }}</td>
+          <td class="muted small">{{ p.match_count }}</td>
+          <td class="muted small">{{ p.last_matched_at | local_time if p.last_matched_at else 'Never' }}</td>
+          <td style="text-align:right;">
+            <span class="menu-wrap">
+              <button class="btn btn-sm btn-icon" data-menu aria-label="More actions">&#8943;</button>
+              <div class="menu pop-left">
+                <button class="menu-item" data-act="remove" data-id="{{ p.id }}">Remove</button>
+              </div>
+            </span>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+{% endif %}
+{% endblock %}
+
+{% block scripts %}
+<script src="{{ url_for('static', filename='js/alerts-ignored.js') }}"></script>
+{% endblock %}

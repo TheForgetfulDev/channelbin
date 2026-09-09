@@ -1,0 +1,259 @@
+{% extends "base.html" %}
+{% block title %}Logs - ChannelBin{% endblock %}
+
+{# The log region fills the viewport and the page itself does not scroll
+   (DESIGN.md 16.1), which is a rule about the SHELL rather than about this
+   page's content - hence a body class rather than main_class. #}
+{% block body_class %}on-logs{% endblock %}
+
+{#  Log viewer (dev/changelog/447).
+
+    DESIGN.md section 16 governs this page: 16.1 settles the fixed box and
+    rule-plus-tint severity, 16.5 items 4 and 5 settle the phone treatment (the
+    filters become a summary bar plus a sheet, and the source column is KEPT -
+    hiding a column at a breakpoint deletes information rather than rearranging
+    it). Everything generic - .page-head, .chip, .search-wrap, .badge, .btn,
+    .modal - comes from style.css; this file styles only the log row, the log
+    box and the phone filter bar.
+
+    The page's script is static/js/logs.js. There is deliberately no second
+    overlay component for the phone sheet: buildModal() already becomes a bottom
+    sheet at these widths (9.6), and the filter controls are MOVED into it rather
+    than re-rendered, so there is exactly one set of chips with one set of
+    listeners no matter which breakpoint is showing. #}
+
+{% block content %}
+<style>
+/* ══════════════════════════════════════════════════════════════════════════
+   THE SHELL - the log box fills the viewport and the page does not scroll.
+
+   Taken by flex off .shell, never by a calc() that subtracts the chrome above
+   it: .main can grow an alert banner or a restart banner at any moment, and a
+   hand-totalled offset (this page shipped `calc(100vh - 310px)`) stops matching
+   the instant either appears. Nothing here needs to know how tall anything
+   above it is.
+   ══════════════════════════════════════════════════════════════════════════ */
+/* `min-height: 0` is load-bearing, not tidiness: style.css gives .shell
+   `min-height: 100vh`, and min-height beats height outright. Without this the
+   height below is ignored at any width where it resolves to less than 100vh -
+   which is every width with the mobile top bar, since .topnav sits ABOVE .shell
+   in the flow and is sticky rather than fixed, so it still takes its 52px. */
+body.on-logs .shell { min-height: 0; height: 100vh; height: 100dvh; }
+body.on-logs .main {
+  min-height: 0; display: flex; flex-direction: column;
+  /* The box is what scrolls. Anything that escapes .main here is a layout bug
+     rather than something to be scrolled to. */
+  overflow: hidden;
+  padding-bottom: 10px;
+}
+.logs-page { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+
+/* ══════════════════════════════════════════════════════════════════════════
+   THE FILTER TOOLBAR
+   Five grid children rather than two nested rows, so the phone sheet can
+   reorder them with `order` alone - one markup, two arrangements, no second
+   copy of the chips to keep in step.
+   ══════════════════════════════════════════════════════════════════════════ */
+.log-toolbar {
+  display: grid; grid-template-columns: 3.6rem minmax(0, 1fr) auto;
+  gap: 9px 10px; align-items: center; margin: 14px 0 12px;
+}
+.log-toollabel {
+  font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: .07em;
+  color: var(--text-faint); font-weight: 700;
+}
+.log-toolbar > .lt-lbl-src { grid-area: 1 / 1; }
+.log-toolbar > .lt-src     { grid-area: 1 / 2 / auto / 4; }
+.log-toolbar > .lt-lbl-lv  { grid-area: 2 / 1; }
+.log-toolbar > .lt-lv      { grid-area: 2 / 2; }
+.log-toolbar > .search-wrap { grid-area: 2 / 3; }
+.log-toolbar .search { width: 240px; }
+.log-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+/* The compact spelling of .chip: the source row holds fourteen of them, and at
+   the full control height they wrap to three rows before any log is visible.
+   Padding only - the type size stays on the scale. */
+.log-chips .chip { padding: 3px 10px; font-size: var(--fs-sm); }
+.log-chips .chip .cn { color: var(--text-faint); font-variant-numeric: tabular-nums; font-size: var(--fs-xs); }
+.log-chips .chip.active .cn { color: inherit; }
+/* An active chip is RINGED in its own color, not merely tinted (design
+   round 2: the Debug chip "looks too close to the same when it's enabled or
+   disabled"). Tint alone cannot carry on/off for DEBUG, because muted IS
+   DEBUG's color - its lit state landed on the same grey as every chip's
+   resting state. The ring says "on"; the tint only says which level. */
+.log-chips .chip.active { font-weight: 600; box-shadow: inset 0 0 0 1px currentColor; }
+.chip.lv.active[data-level="DEBUG"]    { background: var(--bg3); border-color: var(--text-faint); color: var(--text); }
+.chip.lv.active[data-level="INFO"]     { background: var(--accent-soft); border-color: var(--accent); color: var(--accent-text); }
+.chip.lv.active[data-level="WARNING"]  { background: var(--warn-soft); border-color: var(--warn); color: var(--warn); }
+.chip.lv.active[data-level="ERROR"],
+.chip.lv.active[data-level="CRITICAL"] { background: var(--bad-soft); border-color: var(--bad); color: var(--bad); }
+
+/* ══════════════════════════════════════════════════════════════════════════
+   THE LOG BOX AND ITS ROWS
+   ══════════════════════════════════════════════════════════════════════════ */
+.log-wrap { position: relative; flex: 1; min-height: 0; display: flex; }
+.log-box {
+  flex: 1; min-height: 0; overflow: auto;
+  background: var(--bg1); border: 1px solid var(--border-soft); border-radius: var(--radius);
+  font-family: var(--font-mono); font-size: var(--fs-sm);
+}
+/* Fixed lengths and one fr only: each row is its own grid container, so a
+   content-dependent track (auto/max-content) would size itself per row and the
+   timestamp column would jitter line to line (CLAUDE.md, CSS defect class). */
+.log-row {
+  display: grid; grid-template-columns: 8ch 8.5ch 13ch minmax(0, 1fr);
+  gap: 0 14px; padding: 3px 14px;
+  border-bottom: 1px solid var(--border-soft); line-height: 1.5; min-width: 0;
+}
+.log-row:hover { background: var(--bg2); }
+.log-ts { color: var(--text-faint); white-space: nowrap; }
+.log-lv { font-weight: 700; white-space: nowrap; }
+.log-lv.DEBUG { color: var(--text-faint); }
+.log-lv.INFO { color: var(--accent-text); }
+.log-lv.WARNING { color: var(--warn); }
+.log-lv.ERROR, .log-lv.CRITICAL { color: var(--bad); }
+.log-src { color: var(--text-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.log-msg { color: var(--text); min-width: 0; overflow-wrap: break-word; white-space: pre-wrap; word-break: break-word; }
+/* DESIGN.md 16.1: rule + tint on the row itself, so a failure is findable while
+   scrolling past without reading the level column. This is the one place the
+   3.4 no-status-tint rule is deliberately lifted, and section 16 lifts it by
+   name. COUPLED: the 2px rule plus 12px padding has to total the 14px the
+   unmarked rows carry, or a marked row's text steps sideways. */
+.log-row.sev { border-left: 2px solid var(--bad); padding-left: 12px; background: rgba(var(--bad-rgb), .06); }
+.log-row.sev.warn { border-left-color: var(--warn); background: rgba(var(--warn-rgb), .06); }
+.log-empty { padding: 40px 20px; text-align: center; color: var(--text-muted); font-family: var(--font); font-size: var(--fs-lg); }
+/* Positioned against the box rather than the page: in the normal flow it lands
+   somewhere different depending on how much of the box the rows fill. */
+.btn-tobottom { position: absolute; right: 16px; bottom: 12px; box-shadow: var(--shadow-pop); }
+.log-foot {
+  flex: none; display: flex; align-items: baseline; gap: 10px; margin-top: 9px;
+  font-size: var(--fs-sm); color: var(--text-faint); flex-wrap: wrap;
+}
+.log-foot .grow { margin-left: auto; }
+
+/* ══════════════════════════════════════════════════════════════════════════
+   THE PHONE FILTER BAR AND ITS SHEET (DESIGN.md 16.5 item 4)
+   The bar is what is always visible; it names what is currently filtered, so
+   nothing is hidden by being collapsed.
+   ══════════════════════════════════════════════════════════════════════════ */
+.logfilter { display: none; }
+.logfilter-btn {
+  display: flex; align-items: center; gap: 9px; width: 100%; min-height: 44px;
+  background: var(--bg1); border: 1px solid var(--border); border-radius: var(--radius-sm);
+  color: var(--text); font: inherit; padding: 6px 12px; cursor: pointer; text-align: left;
+}
+.logfilter-btn .lf-lbl {
+  font-size: var(--fs-2xs); text-transform: uppercase; letter-spacing: .08em;
+  color: var(--text-faint); font-weight: 700; flex: none;
+}
+.logfilter-btn .lf-cur {
+  flex: 1; min-width: 0; font-size: var(--fs-md); font-weight: 600;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+/* Lit while anything is being hidden, so "there is more than this" is readable
+   without opening the sheet. */
+.logfilter-btn.on { border-color: var(--accent); }
+.logfilter-btn.on .lf-cur { color: var(--accent-text); }
+.logfilter-btn .lf-caret { color: var(--text-muted); flex: none; }
+
+/* The same toolbar node, re-laid-out once it has been moved into the sheet:
+   search first, then Level, then Sources. `order` only - the DOM is untouched,
+   so the chips keep their listeners and their state across the move. */
+.modal-body .log-toolbar { display: flex; flex-direction: column; align-items: stretch; margin: 0; gap: 0; }
+.modal-body .log-toolbar > .search-wrap { order: 1; width: 100%; }
+.modal-body .log-toolbar > .lt-lbl-lv { order: 2; }
+.modal-body .log-toolbar > .lt-lv { order: 3; }
+.modal-body .log-toolbar > .lt-lbl-src { order: 4; }
+.modal-body .log-toolbar > .lt-src { order: 5; }
+.modal-body .log-toolbar > .log-toollabel { margin: 14px 0 5px; }
+/* 16px so iOS does not zoom the sheet on focus (DESIGN.md 15.5 item 2). */
+.modal-body .log-toolbar .search { width: 100%; font-size: 16px; }
+.modal-body .log-chips .chip { padding: 5px 11px; font-size: var(--fs-sm); }
+.lf-note { font-size: var(--fs-sm); color: var(--text-faint); line-height: 1.45; margin-top: 14px; }
+
+/* ══════════════════════════════════════════════════════════════════════════
+   RESPONSIVE
+   The shell switch is at 900px, where base.html drops the sidebar for the
+   .topnav bar - the same boundary Settings' section picker uses, and the only
+   width at which --topnav-h is the right sticky offset. The ROW reflow is a
+   question about how narrow the text is, so it waits for 768px.
+   ══════════════════════════════════════════════════════════════════════════ */
+@media (max-width: 900px) {
+  body.on-logs .shell { height: calc(100dvh - var(--topnav-h)); }
+  body.on-logs .main { padding-bottom: 8px; }
+  /* The toolbar itself is not hidden - only its desktop slot is. It lives in the
+     sheet while that is open, and a rule on .log-toolbar would hide it there too. */
+  #log-filter-slot { display: none; }
+  /* Not sticky, unlike Settings' section picker: nothing above the box scrolls
+     here, because the box is the page's only scroller. A sticky bar in a column
+     that never moves is a z-index waiting to fight something. */
+  .logfilter { display: block; flex: none; margin: 10px 0; }
+}
+@media (max-width: 768px) {
+  /* TWO LINES, not four columns, and the source SURVIVES (16.5 item 5): meta on
+     the first line, message wrapping full width under it. Still fixed tracks so
+     the timestamps line up down the page. */
+  .log-row { grid-template-columns: 8ch 6.5ch minmax(0, 1fr); gap: 0 8px; padding: 6px 11px; }
+  .log-row.sev { padding-left: 9px; }
+  .log-msg { grid-column: 1 / -1; margin-top: 2px; line-height: 1.45; }
+  .log-ts, .log-lv, .log-src { font-size: var(--fs-xs); }
+  .log-box { font-size: var(--fs-sm); }
+  .btn-tobottom { right: 12px; bottom: 12px; }
+}
+</style>
+
+<div class="logs-page">
+  <div class="page-head">
+    <h1>Logs
+      {%- if log_path %} <span class="sub" data-tip="Every line below is tailed from this file.">{{ log_path }}</span>{% endif %}
+    </h1>
+    <div class="card-head-actions">
+      {# Server-rendered as the state before any JS has run, per the rule that
+         initial markup must equal "nothing active" - logs.js moves it to Live
+         once the stream is actually open. #}
+      <span class="badge badge-scheduled" id="log-status">Connecting</span>
+      <button id="btn-live" class="btn btn-sm btn-secondary" type="button">Stop</button>
+      <button id="btn-copy" class="btn btn-sm btn-secondary" type="button"
+              data-tip="Copies only the rows the active filters leave visible.&#10;Copying hidden rows would hand back something other than what is on screen.">Copy</button>
+      <button id="btn-clear" class="btn btn-sm btn-secondary" type="button"
+              data-tip="Empties the view only. Nothing on disk is deleted.">Clear</button>
+    </div>
+  </div>
+
+  <div class="logfilter">
+    <button class="logfilter-btn" id="logfilter-btn" type="button">
+      <span class="lf-lbl">Filter</span>
+      <span class="lf-cur" id="lf-cur"></span>
+      <span class="lf-caret">&#9662;</span>
+    </button>
+  </div>
+
+  <div id="log-filter-slot">
+    <div class="log-toolbar" id="log-filters">
+      <span class="log-toollabel lt-lbl-src">Sources</span>
+      <div class="log-chips lt-src" id="src-chips"></div>
+      <span class="log-toollabel lt-lbl-lv">Level</span>
+      <div class="log-chips lt-lv" id="lv-chips"></div>
+      <div class="search-wrap" id="log-search-wrap">
+        <input type="search" id="log-search" class="search" placeholder="Filter messages" autocomplete="off">
+        <button class="search-clear" id="log-search-clear" type="button" aria-label="Clear the filter">&times;</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="log-wrap">
+    <div class="log-box" id="log-box">
+      <div class="log-empty" id="log-empty">Loading history...</div>
+    </div>
+    <button class="btn btn-sm btn-tobottom" id="btn-bottom" type="button" hidden>&darr; Bottom</button>
+  </div>
+
+  <div class="log-foot">
+    <span id="log-count"></span>
+    <span class="grow">Newest at the bottom. The view holds the last 5,000 lines.</span>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script src="{{ url_for('static', filename='js/logs.js') }}"></script>
+{% endblock %}

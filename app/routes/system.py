@@ -1,0 +1,268 @@
+import os
+from collections import namedtuple
+
+from flask import Blueprint, jsonify, render_template
+
+from ..alerts import update_storage_path_alert
+from ..config import load_config
+from ..config_backup import get_backup_dir
+from ..fs_utils import (DirProbe, PATH_MISSING, PATH_OK, PATH_UNREACHABLE,
+                        classify_oserror, log_dir_outcome_change, probe_dir)
+
+system_bp = Blueprint('system', __name__)
+
+# The directories the user configured for storage, and what stops working when one of
+# them stops answering. A path carrying a role gets the standing STORAGE_PATH_UNUSABLE
+# alert; a path without one is somebody asking about an arbitrary directory and is only
+# logged, which is what _disk_bytes() did for every caller before dev/changelog/868.
+StorageRole = namedtuple('StorageRole', 'what consequence')
+
+DVR_DIR_ROLE = StorageRole(
+    'DVR output directory',
+    'Recordings cannot be written while it is unusable, so any recording that starts '
+    'now will fail immediately.')
+
+MOVE_DEST_ROLE = StorageRole(
+    'Move-on-complete destination',
+    'Finished recordings cannot be filed there while it is unusable; they stay in the '
+    'DVR output directory instead.')
+
+
+def _report_storage_path(path, probe, role):
+    """Log the transition on `path` and move its standing alert along with it.
+
+    Gated on log_dir_outcome_change's own transition memory, which is what keeps this
+    free on the hot path: _disk_bytes() runs on a 15s poll per open browser tab, and the
+    alert must be one standing row per path rather than one row per poll.
+    """
+    what = role.what if role else 'Disk usage for'
+    if log_dir_outcome_change(path, probe, what) and role is not None:
+        update_storage_path_alert(path, probe, role.what, role.consequence)
+
+
+def _dir_size(path):
+    """Return total bytes used by all files directly in `path` (non-recursive for speed)."""
+    if not path or not os.path.isdir(path):
+        return None
+    total = 0
+    try:
+        with os.scandir(path) as it:
+            for entry in it:
+                try:
+                    if entry.is_file(follow_symlinks=False):
+                        total += entry.stat().st_size
+                except OSError:
+                    pass
+    except OSError:
+        return None
+    return total
+
+
+def _dir_size_recursive(path):
+    """Return total bytes used by all files under `path` (recursive)."""
+    if not path or not os.path.isdir(path):
+        return None
+    total = 0
+    try:
+        for dirpath, _dirnames, filenames in os.walk(path):
+            for fname in filenames:
+                try:
+                    total += os.path.getsize(os.path.join(dirpath, fname))
+                except OSError:
+                    pass
+    except OSError:
+        return None
+    return total
+
+
+def _disk_bytes(path, role=None):
+    """(total, free) bytes for the filesystem holding `path`, or (None, None).
+
+    The one statvfs in this file. Both the sidebar's rounded-GB readout and the
+    Maintenance page's meter read it, so a mount that reports oddly reports the
+    same way on both surfaces rather than in two spellings.
+
+    (None, None) means "no honest answer available" - the surfaces draw no meter
+    rather than a wrong one. It never means zero, and it is never another
+    filesystem's numbers wearing this path's label.
+
+    `role` is one of the StorageRole constants above when `path` is a directory the
+    user configured for storage, which is what earns it a standing alert on top of the
+    log line. Omitted, this answers about an arbitrary path and stays a log line only.
+    """
+    if not path:
+        return None, None
+    # Walk up to the nearest existing ancestor (handles uncreated subdirs), but ONLY
+    # past components that are genuinely absent - an uncreated subdir sits on the same
+    # filesystem as its parent, so the parent's numbers answer the question. An
+    # UNREACHABLE component does not: a mount point's parent is by definition a
+    # different filesystem. A stale /dvr used to answer False to os.path.exists(), so
+    # the walk climbed to / and reported the ROOT filesystem's numbers under the /dvr
+    # label - a confidently wrong figure, which principle 1 ranks below no figure at
+    # all (dev/changelog/723).
+    candidate = path
+    while True:
+        probe = probe_dir(candidate)
+        if probe.outcome == PATH_UNREACHABLE:
+            _report_storage_path(path, probe, role)
+            return None, None
+        if probe.outcome != PATH_MISSING:
+            # OK, or present-but-not-a-directory/not-readable: statvfs answers about the
+            # filesystem either way, and the try below catches it when it does not.
+            break
+        parent = os.path.dirname(candidate)
+        if parent == candidate:
+            return None, None
+        candidate = parent
+    try:
+        usage = os.statvfs(candidate)
+    except OSError as exc:
+        _report_storage_path(path, classify_oserror(exc), role)
+        return None, None
+    _report_storage_path(path, DirProbe(PATH_OK, None, None), role)
+    return usage.f_blocks * usage.f_frsize, usage.f_bavail * usage.f_frsize
+
+
+def _disk_info(path, role=None):
+    total, free = _disk_bytes(path, role)
+    if total is None:
+        return None
+    used = total - free
+    return {
+        'path': path,
+        'free_gb': round(free / 1073741824, 1),
+        'used_gb': round(used / 1073741824, 1),
+        'total_gb': round(total / 1073741824, 1),
+        'percent_used': round(used / total * 100, 1) if total else 0,
+    }
+
+
+def _system_stats_dict():
+    try:
+        import psutil
+        cpu = psutil.cpu_percent(interval=0.1)
+        mem = psutil.virtual_memory()
+        mem_info = {
+            'percent': round(mem.percent, 1),
+            'used_gb': round(mem.used / 1073741824, 1),
+            'total_gb': round(mem.total / 1073741824, 1),
+        }
+    except ImportError:
+        cpu = None
+        mem_info = None
+
+    cfg = load_config()
+    dvr_dir = cfg['recording']['dvr_output_dir']
+    mc = cfg['recording'].get('move_on_complete', {})
+
+    disk_dvr = _disk_info(dvr_dir, DVR_DIR_ROLE)
+
+    disk_complete = None
+    same_drive = True
+    if mc.get('enabled') and mc.get('destination'):
+        dest = mc['destination']
+        # Probed unconditionally rather than behind os.path.exists(dest), which is the
+        # error-swallowing predicate app/fs_utils.py exists to replace: a stale mount
+        # answers False there, so the destination used to be skipped entirely - no
+        # meter, no log line and no alert for the one storage path most likely to be a
+        # NAS (dev/changelog/868). _disk_bytes() already walks up past a merely
+        # uncreated destination to the filesystem it will be created on.
+        disk_complete = _disk_info(dest, MOVE_DEST_ROLE)
+        if disk_dvr and disk_complete:
+            try:
+                same_drive = os.stat(dvr_dir).st_dev == os.stat(dest).st_dev
+            except OSError:
+                same_drive = True
+
+    return {
+        'cpu_percent': cpu,
+        'memory': mem_info,
+        'disk_dvr': disk_dvr,
+        'disk_complete': disk_complete if not same_drive else None,
+        'same_drive': same_drive,
+    }
+
+
+@system_bp.route('/maintenance')
+def maintenance():
+    """The four operational panels that used to sit at the bottom of Settings.
+
+    DESIGN.md 7 ruled them off that page and DESIGN.md 16 settles the page they
+    landed on: named Maintenance, second to last in the nav, cards ordered
+    Storage, Index, Backup, Service. Rollout: dev/changelog/444.
+
+    Everything the page displays arrives by fetch; the only server-rendered data
+    is the backup schedule, which is config rather than measurement.
+    """
+    cfg = load_config()
+    backup_cfg = cfg.get('config_backup', {})
+    return render_template(
+        'maintenance.html',
+        backup_hour=backup_cfg.get('backup_hour_et', 1),
+        backup_enabled=backup_cfg.get('enabled', True),
+        is_docker=bool(os.environ.get('CHANNELBIN_DOCKER')),
+    )
+
+
+@system_bp.route('/api/system/stats')
+def system_stats():
+    return jsonify(**_system_stats_dict())
+
+
+@system_bp.route('/api/system/storage-details')
+def storage_details():
+    cfg = load_config()
+    db_path = cfg['database']['path']
+    dvr_dir = cfg['recording']['dvr_output_dir']
+    screenshot_dir = cfg.get('channel_testing', {}).get('screenshot_dir', '/dvr/channel_test_screenshots')
+    backup_dir = get_backup_dir()
+
+    db_bytes = None
+    if db_path and os.path.isfile(db_path):
+        try:
+            db_bytes = os.path.getsize(db_path)
+        except OSError:
+            pass
+
+    dvr_bytes = None
+    dvr_file_count = None
+    if dvr_dir and os.path.isdir(dvr_dir):
+        total = 0
+        count = 0
+        try:
+            with os.scandir(dvr_dir) as it:
+                for entry in it:
+                    try:
+                        if entry.is_file(follow_symlinks=False):
+                            total += entry.stat().st_size
+                            count += 1
+                    except OSError:
+                        pass
+        except OSError:
+            pass
+        dvr_bytes = total
+        dvr_file_count = count
+
+    screenshot_bytes = _dir_size_recursive(screenshot_dir)
+    backup_bytes = _dir_size(backup_dir)
+
+    # What the directory totals above cannot say: how much room is left. Sent in
+    # bytes rather than the sidebar's rounded GB so the meter and the "free of
+    # total" line are the same number the rest of this payload is measured in.
+    # Both are null when the path has no existing ancestor (an unmounted /dvr),
+    # and the page draws no meter rather than a meter reading zero.
+    disk_total, disk_free = _disk_bytes(dvr_dir, DVR_DIR_ROLE)
+
+    return jsonify(
+        db_bytes=db_bytes,
+        db_path=db_path,
+        dvr_dir=dvr_dir,
+        dvr_bytes=dvr_bytes,
+        dvr_file_count=dvr_file_count,
+        screenshot_dir=screenshot_dir,
+        screenshot_bytes=screenshot_bytes,
+        backup_dir=backup_dir,
+        backup_bytes=backup_bytes,
+        disk_total=disk_total,
+        disk_free=disk_free,
+    )

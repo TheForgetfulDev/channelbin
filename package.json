@@ -1,0 +1,19 @@
+{
+  "name": "channelbin",
+  "version": "0.4.0",
+  "description": "Resilient IPTV recorder with automatic stream recovery and a live monitoring dashboard.",
+  "main": "index.js",
+  "directories": {
+    "doc": "docs"
+  },
+  "scripts": {},
+  "keywords": [],
+  "author": "",
+  "license": "MIT",
+  "type": "commonjs",
+  "devDependencies": {
+    "@playwright/test": "^1.61.1",
+    "@types/node": "^26.1.1",
+    "jsdom": "^29.1.1"
+  }
+}

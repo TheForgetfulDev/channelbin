@@ -1,0 +1,1161 @@
+{% extends "base.html" %}
+{% import '_macros.html' as m %}
+{% from '_macros.html' import csrf_field %}
+{% block title %}{{ channel.name }} - ChannelBin{% endblock %}
+
+{#  Channel detail page (revamp: dev/mockups/16-channel-detail-revamp.html desktop +
+    20-channel-detail-mobile.html mobile, approved 2026-07-26; rounds logged in
+    dev/changelog/339-342 and 347).
+
+    It deliberately shares the unified group/health-check page's shell - .gd-head,
+    .gd-actionbar, .gd-sections, .gd-setbar, .card - so the two read as one system.
+    Anything with no shared equivalent is styled in style.css under "CHANNEL DETAIL PAGE".
+
+    The header, status bar and the Recovery card are NOT reorderable: they are how you know
+    what you are looking at and what is wrong with it right now. Everything inside
+    #cd-sections is, via the Customize sections modal (static/js/channel-detail.js). #}
+
+{% block content %}
+<style>
+/* Page-scoped: only this page renders a one-row guide, and only this page has this
+   table's optional columns. Everything shared lives in style.css under
+   "CHANNEL DETAIL PAGE".
+
+   The What's On card reuses the guide's real classes (guide.css) rather than restyling
+   them, so what is here is only the handful of places a one-row guide inside a card
+   differs from the full-page grid. Row height is deliberately NOT among them any more:
+   it used to be pinned at 88px here, which is a value coupled to guide.js's own
+   computeRowHeight() and to .guide-program's height, and the approved design says the row
+   sizes to its tallest cell like every other guide row does. */
+
+/* The guide's toolbar sticks to the viewport because it belongs to the page. This one
+   belongs to a card, so it scrolls with it - a bar that detaches from its own card and
+   floats over the rest of the page is the mobile divergence round 6 called out. The
+   full-bleed backdrop goes with it: there is nothing scrolling underneath to cover. */
+.cd-guide-toolbar {
+  position: static;
+  box-shadow: none;
+  /* .toolbar's own 16px top margin is sized for a bar under a page heading; inside a card
+     body it doubles up with the body's padding. */
+  margin: 4px 0 0.6rem;
+  padding-bottom: 0.6rem;
+  border-bottom: 1px solid var(--border-soft);
+}
+
+/* .guide-body is drawn as the BOTTOM half of a box whose top half is the sticky
+   .guide-head, which this page does not have (the header track stays inside the scroller
+   here - see the markup comment). So it closes its own box. */
+.channel-whats-on .guide-body {
+  border-top: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+
+/* One control, two presentations (13.3): the glyph ships at every width and the label is
+   dropped at phone widths. Written here rather than reusing guide.css's .guide-icon /
+   .guide-btn-label because guide.css is only loaded when this channel actually has EPG
+   data, and this button renders either way. */
+.cd-epg-btn .cd-epg-icon { display: none; }
+
+/* The sticky bottom action bar is a phone affordance (9.5) - above the breakpoint the
+   action bar at the top of the page is already within reach. */
+.cd-stickybar { display: none; }
+
+/* On the chip bar the label and value sit on one baseline, so the row's two halves must
+   not be a box between them. The note only exists for the mobile row form. */
+.gd-chip-main { display: contents; }
+.gd-chip-note { display: none; }
+
+/* Rows in the sticky bar's actions sheet. The app's .menu-item is styled only inside a
+   .menu popover, and guide.css's .guide-sheet-row is not loaded on a channel with no EPG
+   data, so this sheet carries its own row. */
+.cd-sheet-row {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  width: 100%;
+  padding: 13px 4px;
+  border: 0;
+  border-bottom: 1px solid var(--border-soft);
+  background: none;
+  color: var(--text);
+  font: inherit;
+  font-size: var(--fs-lg);
+  text-align: left;
+  cursor: pointer;
+}
+.cd-sheet-row:last-child { border-bottom: none; }
+.cd-sheet-row:hover { background: var(--bg2); }
+
+/* Add-to-group radio row: same row shape as the shared section-layout list
+   (.seclayout-row), but a genuinely different control - a group picker, not a
+   section-layout list - so it gets its own class rather than reusing that one. */
+.cd-grouprow {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  padding: 9px 2px; border-bottom: 1px solid var(--border-soft); cursor: pointer;
+}
+.cd-grouprow:last-child { border-bottom: none; }
+
+@media (max-width: 768px) {
+  .col-fps, .col-frames, .col-bitrate, .col-screenshot-h, .col-audio, .col-profile { display: none; }
+  .cd-epg-btn .cd-epg-icon { display: inline; }
+  .cd-epg-btn .cd-epg-label { display: none; }
+
+  /* Settings: full-width list rows, not chips (mockup 20). A 12.5px chip is not a real tap
+     target, and the row has room for the one-line note explaining what the setting does -
+     which is why the markup carries it at every width and desktop hides it. Scoped to this
+     page's bar: the group detail page shares .gd-setbar and keeps its chips until its own
+     mobile round says otherwise. */
+  #cd-setbar {
+    display: block;
+    padding: 0;
+  }
+  #cd-setbar .gd-chip {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    width: 100%;
+    padding: 11px 0;
+    border: 0;
+    border-bottom: 1px solid var(--border-soft);
+    border-radius: 0;
+    background: none;
+    text-align: left;
+  }
+  #cd-setbar .gd-chip:last-child { border-bottom: none; }
+  #cd-setbar .gd-chip-main { display: block; min-width: 0; }
+  #cd-setbar .gd-chip-lbl {
+    display: block;
+    font-size: var(--fs-md);
+    font-weight: 600;
+    text-transform: none;
+    letter-spacing: 0;
+    color: var(--text);
+  }
+  #cd-setbar .gd-chip-note {
+    display: block;
+    margin-top: 2px;
+    font-size: var(--fs-sm);
+    color: var(--text-muted);
+  }
+  #cd-setbar .gd-chip-val {
+    font-size: var(--fs-md);
+    color: var(--accent-text);
+    white-space: nowrap;
+  }
+  /* The chevron is what says the row opens something; it is the row's only affordance. */
+  #cd-setbar .gd-chip-val::after {
+    content: ' \203A';
+    margin-left: 6px;
+    color: var(--text-faint);
+    font-size: var(--fs-xl);
+  }
+
+  /* Fixed, not sticky: it must stay reachable regardless of scroll position. The body
+     reserves its height so the last card cannot end up underneath it. */
+  .cd-stickybar {
+    position: fixed;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    z-index: 45;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 11px 14px calc(11px + env(safe-area-inset-bottom));
+    background: var(--bg1);
+    border-top: 1px solid var(--border);
+    box-shadow: 0 -4px 16px rgba(0, 0, 0, 0.35);
+  }
+  .cd-stickybar .btn { padding: 11px 12px; }
+  .cd-stickybar .cd-sb-grow { flex: 1; }
+  .cd-stickybar .cd-sb-form { display: contents; }
+  body { padding-bottom: calc(74px + env(safe-area-inset-bottom)); }
+}
+</style>
+
+<div class="page-head">
+  <h1>Channels</h1>
+  <a href="{{ url_for('channels.channel_browser') }}" class="btn">&larr; Browse</a>
+</div>
+
+{% include 'channels/_tabs.html' %}
+
+{# ── Header ─────────────────────────────────────────────────────────────── #}
+<div class="gd-head">
+  <div class="gd-head-main">
+    <div class="gd-title">
+      {% if logo_url %}
+      <img src="{{ logo_url }}" class="ch-logo-lg" alt=""
+           onerror="this.style.display='none';this.nextElementSibling.style.display='flex'">
+      {% endif %}
+      <div class="ch-logo-lg-fallback" {% if logo_url %}style="display:none"{% endif %}>
+        {{ channel.name[0] | upper }}
+      </div>
+      <div class="acct-bar" style="background: {{ channel.account.color }}"></div>
+      <div>
+        <div class="cd-name">{{ channel.name }}</div>
+        <div class="cd-meta">
+          <span>{{ channel.account.name }}</span>
+          {% if channel.category_name %}
+          <span class="text-faint">&middot;</span>
+          <span>{{ channel.category_name }}</span>
+          {% endif %}
+          {% if final_health_score is not none %}
+          <span class="h-mini {{ final_health_score | health_css(health_bands) }} tip-plain"
+                data-tip="Channel health {{ final_health_score }}.&#10;Lifetime 0-100 quality score from this channel's tests and recordings. {{ channel.health_score_sample_count }} observation{{ 's' if channel.health_score_sample_count != 1 else '' }}.">&#9733; {{ final_health_score }}</span>
+          {% endif %}
+          {% if channel.in_guide %}
+          <span class="badge b-done tip-plain"
+                data-tip="In Guide.&#10;This channel renders as a TV Guide row of its own and can be scheduled for recording.">In Guide</span>
+          {% endif %}
+          {# Two SEPARATE facts, never one merged badge: a channel can have its own guide
+             row, or reach the guide through a group's row, or both at once. Joining a
+             group stopped hiding a channel's own row in dev/changelog/751, so both being
+             true is now an ordinary state rather than an impossible one. #}
+          {% if guide_via_groups %}
+          <span class="badge b-auto tip-plain"
+                data-tip="In the guide through a group.&#10;{{ 'This channel has no guide row of its own, but its' if not channel.in_guide else 'As well as its own row, this channel&#39;s' }} listings reach the TV Guide through {{ 'this group, which has a row of its own' if guide_via_groups | length == 1 else 'these groups, each of which has a row' }}:&#10;{% for g in guide_via_groups %}{{ g.name }}&#10;{% endfor %}">In guide via {{ guide_via_groups[0].name }}{% if guide_via_groups | length > 1 %} +{{ guide_via_groups | length - 1 }}{% endif %}</span>
+          {% endif %}
+          {% if channel.is_duplicate_stream_url %}
+          <span class="badge b-warn tip-plain"
+                data-tip="Duplicate stream URL.&#10;Shares its stream URL with {{ duplicate_channels | length }} other channel{{ 's' if duplicate_channels | length != 1 else '' }} - see the Stream URL section.">Duplicate URL</span>
+          {% endif %}
+          {% if lifecycle_state == 'missing' %}
+          <span class="badge b-warn tip-plain"
+                data-tip="Missing from the feed.&#10;{{ channel.account.name }} stopped listing this channel on {{ lifecycle_since | local_date }}. The stored URL may still play, but the provider no longer advertises it.">Missing since {{ lifecycle_since | local_date }}</span>
+          {% endif %}
+          {% if lifecycle_state == 'new' %}
+          <span class="badge b-auto tip-plain"
+                data-tip="New channel.&#10;First appeared in {{ channel.account.name }}'s synced feed on {{ lifecycle_since | local_date }}.">New</span>
+          {% endif %}
+          {% if not_normalizable %}
+          <span class="badge b-warn tip-plain"
+                data-tip="Not normalized.&#10;URL normalization is on for this account, but this stream URL has no user/password/id triplet to rebuild from, so it was left exactly as the provider supplied it.">Not normalized</span>
+          {% endif %}
+          {# Memberships: a channel group and a health check are separate things, so two
+             chip kinds rather than one pile (dev/changelog/323). #}
+          {# The in-guide ones are marked, so which groups put this channel in the guide is
+             readable without hovering the badge above - deliberate, see dev/changelog/759.
+             A group is only in the guide if its own flag says so - being a group is not
+             enough, and the un-marked chips are groups that render no row at all. #}
+          {% for g in channel_kind_groups %}
+          <a href="{{ url_for('channel_groups.group_detail', group_id=g.id) }}" class="mem-chip grp{{ ' grp-guided' if g.in_guide }} tip-plain"
+             data-tip="Channel group &quot;{{ g.name }}&quot;.&#10;{{ 'In the TV Guide: it renders one row, filled by whichever member is serving it, and this channel is one of them.' if g.in_guide else 'Not in the TV Guide - it renders no row. Recordings from it pick its best-scoring member and fail over.' }} Click to open it."><span class="mc-glyph">&#9939;</span> {{ g.name }}{% if g.in_guide %} <span class="mc-mark">&#10003;</span>{% endif %}</a>
+          {% endfor %}
+          {% for job in health_checks %}
+          <a href="{{ url_for('channels.health_check_detail', job_id=job.id) }}" class="mem-chip chk tip-plain"
+             data-tip="Health check &quot;{{ job.name }}&quot;.&#10;Tests this channel on a schedule to confirm it still plays. Never appears in the guide, never records. Click to open it."><span class="mc-glyph">&#10003;</span> {{ job.name }}</a>
+          {% endfor %}
+          {% if channel.notes %}
+          <span class="note-indicator tip-plain" data-tip="This channel has a note.&#10;{{ channel.notes }}">&#128221;</span>
+          {% endif %}
+        </div>
+      </div>
+    </div>
+  </div>
+  <div class="gd-dates">
+    Added {{ channel.created_at | local_date if channel.created_at else '--' }}<br>
+    Synced {{ channel.last_seen_at | local_time if channel.last_seen_at else 'never' }}
+  </div>
+</div>
+
+{# ── Status / action bar ────────────────────────────────────────────────
+     Every state is named explicitly - no trailing else renders a real state, or the
+     next one added lands in it silently (CLAUDE.md, defect-class rules). #}
+<div class="gd-actionbar">
+  {% if lifecycle_state == 'missing' %}
+  <span class="badge b-warn">Missing from feed</span>
+  <span class="gd-ab-msg">
+    {{ channel.account.name }} stopped listing this channel on {{ lifecycle_since | local_date }}.
+    {% if repoint_candidate %}The same stream is available elsewhere - see Recovery available below.
+    {% else %}The stored URL may still play, but it will not come back on its own.{% endif %}
+  </span>
+  {% elif latest_test is none and final_health_score is none %}
+  <span class="badge b-abort">Never tested</span>
+  <span class="gd-ab-msg">No health test or recording has ever observed this channel, so it has no score.</span>
+  {% elif latest_test is none %}
+  <span class="badge b-auto">Scored from recordings</span>
+  <span class="gd-ab-msg">Never health-tested - its score comes from {{ channel.health_score_sample_count }} recording observation{{ 's' if channel.health_score_sample_count != 1 else '' }}.</span>
+  {% elif latest_test.id == in_progress_test_id %}
+  {{ m.status_badge('b-running', 'Testing now', pulse=true) }}
+  <span class="gd-ab-msg">A health check started {{ latest_test.test_started_at | local_time }} is still running.</span>
+  {% elif latest_test.status == 'COMPLETED' and not latest_test.error_detail %}
+  <span class="badge b-done">Healthy</span>
+  {# All four guide states named explicitly - own row, group's row, both, neither. The
+     two-state version read Channel.in_guide alone and so told a channel whose listings
+     were on screen through its group that it was "Not in the TV Guide"
+     (dev/docs/BUGS.md 2026-08-20, dev/changelog/759). #}
+  <span class="gd-ab-msg">
+    Last tested {{ latest_test.test_started_at | local_time }} &middot; passed.
+    {% if channel.in_guide and guide_via_groups %}
+    In the guide as its own row and through {{ guide_via_groups[0].name }}{{ ' and %d more' % (guide_via_groups | length - 1) if guide_via_groups | length > 1 }}; recordable.
+    {% elif channel.in_guide %}
+    In the guide and recordable.
+    {% elif guide_via_groups %}
+    No guide row of its own - its listings are in the guide through {{ guide_via_groups[0].name }}{{ ' and %d more' % (guide_via_groups | length - 1) if guide_via_groups | length > 1 }}.
+    {% else %}
+    Not in the TV Guide.
+    {% endif %}
+  </span>
+  {% elif latest_test.status == 'COMPLETED' %}
+  <span class="badge b-warn">Passed with warnings</span>
+  <span class="gd-ab-msg">Last tested {{ latest_test.test_started_at | local_time }} &middot; {{ latest_test.error_detail }}</span>
+  {% elif latest_test.status == 'FAILED' %}
+  <span class="badge b-fail">Failing</span>
+  <span class="gd-ab-msg">Last tested {{ latest_test.test_started_at | local_time }} &middot; {{ latest_test.error_detail or 'the test failed.' }}</span>
+  {% elif latest_test.status == 'CANCELLED' %}
+  <span class="badge b-abort">Last test cancelled</span>
+  <span class="gd-ab-msg">The check running on {{ latest_test.test_started_at | local_time }} was stopped before this channel finished.</span>
+  {% else %}
+  <span class="badge b-abort">{{ latest_test.status | title }}</span>
+  <span class="gd-ab-msg">Last test {{ latest_test.test_started_at | local_time }}.</span>
+  {% endif %}
+
+  <div class="gd-ab-actions">
+    {# Guide toggle stays a form post: the route flashes the duplicate-conflict prompt and
+       the outcome, which a fire-and-forget fetch would swallow. #}
+    <form method="POST" action="{{ url_for('channels.toggle_channel', channel_id=channel.id) }}" style="display:inline">
+      {{ csrf_field() }}
+      <input type="hidden" name="next" value="{{ url_for('channels.channel_detail', channel_id=channel.id) }}">
+      <button type="submit" class="btn btn-sm tip-plain"
+              {# The button is only ever about THIS channel's own row, so the label does not
+                 change when a group already carries its listings - what changes is that
+                 the tooltip stops implying the guide has never heard of it. #}
+              data-tip="{% if channel.in_guide %}Remove from Guide.&#10;Stops this channel showing as a guide row{{ ', but its listings stay in the guide through %s.' % guide_via_groups[0].name if guide_via_groups else '.' }} Scheduled recordings are unaffected.{% elif guide_via_groups %}Add to Guide.&#10;Its listings are already in the guide through {{ guide_via_groups[0].name }}. This gives it a TV Guide row of its own as well.{% else %}Add to Guide.&#10;Makes this channel a TV Guide row so programs can be scheduled from it.{% endif %}">{{ 'Remove from Guide' if channel.in_guide else '+ Add to Guide' }}</button>
+    </form>
+    <button class="btn btn-primary btn-sm tip-plain" data-act="test-now"
+            data-tip="Test now.&#10;Runs a one-off &quot;does this play right now?&quot; check - a short capture and probe, distinct from a scheduled health check. Honors this account's connection limit.">&#9654; Test now</button>
+    <span class="menu-wrap">
+      <button class="btn btn-sm btn-icon" data-menu aria-label="More actions">&#8943;</button>
+      {# Memberships are links in the title, so the kebab is actions only. #}
+      <div class="menu" id="cd-kebab">
+        <button class="menu-item" data-act="add-group">&#9939; Add to channel group&hellip;</button>
+        <button class="menu-item" data-act="create-check">&#10003; Create health check for this channel</button>
+        <div class="sep"></div>
+        <button class="menu-item" data-act="settings">Settings&hellip;</button>
+        <button class="menu-item" data-act="sections">Customize sections&hellip;</button>
+        <div class="sep"></div>
+        {# Hide is its own verb: it is not Remove (which takes an item out of a list) and
+           not Delete (which destroys data). A hidden channel stops being offered anywhere
+           the channel search feeds, and keeps this page, its history and its recordings.
+           All three states are named rather than toggled, so "the user hid it" and "a rule
+           hid it" cannot collapse into one control that means different things.
+           `data-override` is the value posted: null hands the answer back to the rules. #}
+        {% if hide.override is sameas true %}
+        <button class="menu-item" data-act="hide-channel" data-override="null">Un-hide channel</button>
+        {% elif hide.override is sameas false %}
+        <button class="menu-item" data-act="hide-channel" data-override="null">Stop always showing this channel</button>
+        {% else %}
+        <button class="menu-item" data-act="hide-channel" data-override="true">Hide channel</button>
+        {% endif %}
+        {% if repoint_candidate %}
+        <div class="sep"></div>
+        <button class="menu-item" data-act="repoint">&#8635; Re-point channel&hellip;</button>
+        {% endif %}
+        {# Offered only while the provider has stopped listing this channel. Deleting one
+           the provider still serves would be undone by the next sync, which upserts on
+           (account_id, stream_id) - see DESIGN-sync-resilience.md 7 and
+           dev/changelog/772. The route re-derives the same condition. #}
+        {% if lifecycle_state == 'missing' %}
+        <div class="sep"></div>
+        <button class="menu-item danger" data-act="delete-channel">&#128465; Delete channel&hellip;</button>
+        {% endif %}
+      </div>
+    </span>
+  </div>
+</div>
+{# ── Hidden-state bar ───────────────────────────────────────────────────
+     Rendered only when there is something to say. Reaching this page directly by id
+     always works, hidden or not - this is where you un-hide, so it cannot be a page the
+     hiding takes away from you.
+
+     A second .gd-actionbar rather than a new class: it is the same badge + sentence +
+     action shape, and the state above is about health while this one is about where the
+     channel is offered. Two separate facts, stated separately. #}
+{% if hide.label or hide.epg_gap %}
+<div class="gd-actionbar">
+  {% if hide.deferred %}
+  <span class="badge b-warn">Hidden, deferred</span>
+  {% elif hide.hidden %}
+  <span class="badge b-abort">Hidden</span>
+  {% elif hide.override is sameas false %}
+  <span class="badge b-auto">Always shown</span>
+  {% else %}
+  <span class="badge b-warn">No guide data</span>
+  {% endif %}
+  <span class="gd-ab-msg">
+    {{ hide.label }}
+    {% if hide.deferred %}It drops out of every list the moment that is no longer true.{% endif %}
+    {# The gap a hide leaves behind: hiding deletes a channel's EPG entries and un-hiding
+       does not bring them back, so its guide is empty until the account next syncs. Said
+       out loud here because an empty guide row is otherwise indistinguishable from a
+       broken channel. The sentence lives in the template rather than in hide_state()
+       because it needs a timestamp rendered in the user's timezone. #}
+    {% if hide.epg_gap %}
+    No guide data is stored for this channel - hidden channels do not have EPG imported.
+    {{ channel.account.name }} will fill it in on its next sync
+    {%- if channel.account.sync_enabled and channel.account.next_sync_at %}, {{ channel.account.next_sync_at | time_until }}.
+    {%- elif not channel.account.sync_enabled %}, but automatic sync is off for that account.
+    {%- else %}.{% endif %}
+    {% endif %}
+  </span>
+  {% if hide.deferred %}
+  <div class="gd-ab-actions">
+    {% if channel.in_guide %}
+    <form method="POST" action="{{ url_for('channels.toggle_channel', channel_id=channel.id) }}" style="display:inline">
+      {{ csrf_field() }}
+      <input type="hidden" name="next" value="{{ url_for('channels.channel_detail', channel_id=channel.id) }}">
+      <button type="submit" class="btn btn-sm">Remove from Guide</button>
+    </form>
+    {% endif %}
+    {% for g in channel_kind_groups %}
+    <a class="btn btn-sm" href="{{ url_for('channel_groups.group_detail', group_id=g.id) }}">{{ g.name }} &rarr;</a>
+    {% endfor %}
+  </div>
+  {% endif %}
+</div>
+{% endif %}
+<div id="cd-action-error" class="gd-action-error" style="display:none;"></div>
+
+{# ── Sticky bottom action bar (DESIGN.md 9.5, mockup 20) ──────────────────
+     Phone widths only. It exists IN ADDITION to the bar above rather than instead of it,
+     so the top bar keeps its buttons and its status message and this is purely a second
+     reach: the actions land where a thumb is. Rendered at every width and
+     hidden by CSS above 768px, so there is one markup path and one set of handlers.
+
+     The kebab here opens a SHEET, not the dropdown the top bar uses - a menu opening
+     upward out of a fixed bottom bar is exactly the clipping case 9.6 warns about. It
+     builds itself from #cd-kebab's own items (channel-detail.js), so the two can never
+     list different actions. #}
+<div class="cd-stickybar">
+  {% if repoint_candidate %}
+  <button type="button" class="btn btn-primary cd-sb-grow" data-act="repoint">&#8635; Re-point</button>
+  <button type="button" class="btn" data-act="test-now">&#9654; Test</button>
+  {% else %}
+  <button type="button" class="btn btn-primary cd-sb-grow" data-act="test-now">&#9654; Test now</button>
+  <form method="POST" action="{{ url_for('channels.toggle_channel', channel_id=channel.id) }}" class="cd-sb-form">
+    {{ csrf_field() }}
+    <input type="hidden" name="next" value="{{ url_for('channels.channel_detail', channel_id=channel.id) }}">
+    <button type="submit" class="btn">{{ 'Remove' if channel.in_guide else '+ Guide' }}</button>
+  </form>
+  {% endif %}
+  <button type="button" class="btn btn-icon" data-act="actions-sheet" aria-label="More actions">&#8943;</button>
+</div>
+
+{# ── Recovery available (DESIGN-sync-resilience.md §6) ────────────────────
+     An accent-bordered card at the top of the body, not a banner (round 1). It is
+     conditional alert chrome, so it is not part of the reorderable set. #}
+{% if repoint_candidate %}
+<div class="recovery-card">
+  <div class="rc-head">&#8635; Recovery available</div>
+  <div class="rc-body">
+    This channel is missing from {{ channel.account.name }}'s synced feed, but the same stream is
+    available as
+    <a href="{{ url_for('channels.channel_detail', channel_id=repoint_candidate.id) }}">{{ repoint_candidate.name }}</a>
+    on <strong>{{ repoint_candidate.account.name }}</strong>. Re-pointing transfers the guide
+    listing, channel-group assignment, SCHEDULED recordings, and health-check enrollment to that
+    channel.
+  </div>
+  <div class="rc-actions">
+    <button type="button" class="btn btn-primary btn-sm" data-act="repoint">&#8635; Re-point to "{{ repoint_candidate.name }}"</button>
+  </div>
+</div>
+{% endif %}
+
+{# ── Reorderable sections ───────────────────────────────────────────────── #}
+<div class="gd-sections" id="cd-sections">
+
+  {# Health: the score is a full-width header; under it the screenshot and the latest test
+     are two columns split by the rule, so their labels start on the same line (round 4). #}
+  <div class="card" data-section="health">
+    <div class="card-head">
+      <h2>Channel Health</h2>
+      <div class="card-head-actions">
+        <button class="btn btn-sm" data-act="jump" data-jump-section="tests">View test history</button>
+      </div>
+    </div>
+    <div class="card-body">
+      {% if final_health_score is none and latest_test is none %}
+      <p class="card-note">
+        Not yet tested - no health tests or recordings have been observed for this channel, so it
+        has no score. Run a one-off check with <strong>Test now</strong> above, or enroll it in a
+        health check to have it tested on a schedule.
+      </p>
+      {% else %}
+
+      {% if final_health_score is not none %}
+      <div class="health-top">
+        <div class="health-score-block">
+          <div class="health-score-num {{ final_health_score | health_css(health_bands) }} tip-plain"
+               data-tip="Lifetime health {{ final_health_score }}.&#10;Computed {{ channel.health_score | round | int }}{% if channel.manual_health_adjustment %}, manual offset {{ '%+d' | format(channel.manual_health_adjustment) }}{% endif %}. Weighted across {{ channel.health_score_sample_count }} test/recording observation{{ 's' if channel.health_score_sample_count != 1 else '' }}.">{{ final_health_score }}</div>
+          <div class="health-score-meta">
+            <div class="hs-lbl">Lifetime health</div>
+            <div class="hs-line">
+              <span>Computed {{ channel.health_score | round | int }}{% if channel.manual_health_adjustment %} &middot; Manual {{ '%+d' | format(channel.manual_health_adjustment) }}{% endif %}</span>
+              <span class="text-faint">&middot;</span>
+              {% if channel.health_score_sample_count < 3 %}
+              <span class="tip-plain" data-tip="Low confidence.&#10;Based on only {{ channel.health_score_sample_count }} observation{{ 's' if channel.health_score_sample_count != 1 else '' }} - treat it with caution.">{{ channel.health_score_sample_count }} observation{{ 's' if channel.health_score_sample_count != 1 else '' }} (low confidence)</span>
+              {% else %}
+              <span>{{ channel.health_score_sample_count }} observations</span>
+              {% endif %}
+              {% if channel.health_score_updated_at %}
+              <span class="text-faint">&middot;</span>
+              <span>last observed {{ channel.health_score_updated_at | local_time }}</span>
+              {% endif %}
+            </div>
+            {% if channel.manual_health_note %}
+            <div>Note: {{ channel.manual_health_note }}</div>
+            {% endif %}
+          </div>
+        </div>
+      </div>
+      {% endif %}
+
+      {% if latest_test %}
+      <div class="health-lower">
+        <div class="hl-shot">
+          <div class="shot-lbl">Latest screenshot</div>
+          {% if latest_test.screenshot_path and latest_test.screenshot_pruned %}
+          <div class="shot-frame screenshot-placeholder pruned"
+               title="Screenshot was pruned by the retention policy. Change how many screenshots are kept per test in Settings &rarr; Channel Health Checks.">
+            Screenshot pruned
+          </div>
+          {% elif latest_test.screenshot_path %}
+          {% set shot_url = url_for('channel_tests.serve_screenshot', filename=latest_test.screenshot_path.rsplit('/', 1)[-1]) %}
+          <a class="shot-link" href="{{ shot_url }}" target="_blank">
+            <img src="{{ shot_url }}" class="shot-frame" alt="Latest screenshot" loading="lazy"
+                 onerror="this.parentElement.style.display='none';this.parentElement.nextElementSibling.style.display='flex'">
+          </a>
+          <div class="shot-frame screenshot-placeholder missing" style="display:none"
+               title="Expected a screenshot but the file is missing - not pruned by the retention policy, cause unknown.">
+            Screenshot unavailable
+          </div>
+          {% else %}
+          <div class="shot-frame screenshot-placeholder missing"
+               title="This test captured no screenshot - it never connected, or screenshots were off when it ran.">
+            No screenshot
+          </div>
+          {% endif %}
+          <div class="shot-cap">{{ latest_test.test_started_at | local_time }}, during the last test</div>
+        </div>
+        <div class="hs-rule"></div>
+        <div class="hl-tests">
+          <div class="latest-line">
+            Latest test {{ latest_test.test_started_at | local_time }}
+            {% if latest_test.id == in_progress_test_id %}
+            <span class="badge badge-in_progress">IN PROGRESS</span>
+            {% else %}
+            <span class="badge badge-{{ latest_test.status | lower }}"
+                  {% if latest_test.error_detail %}title="{{ latest_test.status }}: {{ latest_test.error_detail }}"{% endif %}>{{ latest_test.status }}</span>
+            {% endif %}
+          </div>
+          {% if latest_test.status == 'COMPLETED' %}
+          <div class="health-summary">
+            <div class="health-stat">
+              <div class="health-stat-label">Resolution</div>
+              {# coded_resolution rides as a tooltip rather than its own card - it differs
+                 from the displayed resolution only on padded encodes (1088 vs 1080). #}
+              <div class="health-stat-value{% if latest_test.coded_resolution %} tip-plain{% endif %}"
+                   {% if latest_test.coded_resolution %}data-tip="Coded {{ latest_test.coded_resolution }}.&#10;{{ coded_tip }}"{% endif %}>{{ latest_test.resolution or '--' }}</div>
+            </div>
+            <div class="health-stat">
+              <div class="health-stat-label">FPS</div>
+              <div class="health-stat-value">{% if latest_test.fps %}{{ '%.1f' | format(latest_test.fps) }}{% else %}--{% endif %}</div>
+            </div>
+            <div class="health-stat">
+              <div class="health-stat-label">Frames</div>
+              <div class="health-stat-value">
+                {% if latest_test.frame_pct is not none %}
+                  {% if latest_test.frame_pct >= 95 %}<span style="color:var(--ok)">{{ '%.0f' | format(latest_test.frame_pct) }}%</span>
+                  {% elif latest_test.frame_pct >= 80 %}<span style="color:var(--warn)">{{ '%.0f' | format(latest_test.frame_pct) }}%</span>
+                  {% else %}<span style="color:var(--bad)">{{ '%.0f' | format(latest_test.frame_pct) }}%</span>
+                  {% endif %}
+                {% else %}--{% endif %}
+              </div>
+            </div>
+            <div class="health-stat">
+              <div class="health-stat-label">Bitrate</div>
+              <div class="health-stat-value">
+                {% if latest_test.bitrate_kbps %}{{ '%.0f' | format(latest_test.bitrate_kbps) }}<span style="font-size:11px; font-weight:400"> kbps</span>{% else %}--{% endif %}
+              </div>
+            </div>
+            <div class="health-stat">
+              <div class="health-stat-label">Drops</div>
+              <div class="health-stat-value {% if latest_test.drop_count > 2 %}text-danger{% elif latest_test.drop_count > 0 %}text-warning{% endif %}">
+                {{ latest_test.drop_count }}
+              </div>
+            </div>
+            {% if latest_test.audio_codec %}
+            <div class="health-stat">
+              <div class="health-stat-label">Audio</div>
+              <div class="health-stat-value" style="font-size:13px">
+                {{ latest_test.audio_codec | upper }}{% if latest_test.audio_channels %} {{ latest_test.audio_channels }}ch{% endif %}
+              </div>
+            </div>
+            {% endif %}
+            {# Stream-quality profile: same test, same grid, no sub-header. Empty for tests
+               that predate quality capture, so the grid simply keeps its original cards.
+               Cards and tooltips are built in channels.py::_quality_profile_stats. #}
+            {% for s in quality_stats %}
+            <div class="health-stat">
+              <div class="health-stat-label">{{ s.label }}</div>
+              <div class="health-stat-value{% if s.cls %} {{ s.cls }}{% endif %}{% if s.tip %} tip-plain{% endif %}"
+                   style="font-size:13px"
+                   {% if s.tip %}data-tip="{{ s.label }}.&#10;{{ s.tip }}"{% endif %}>{{ s.value }}</div>
+            </div>
+            {% endfor %}
+          </div>
+          {% else %}
+          <p class="card-note">
+            {{ latest_test.error_detail or 'The last test produced no stream measurements.' }}
+          </p>
+          {% endif %}
+        </div>
+      </div>
+      {% endif %}
+      {% endif %}
+    </div>
+  </div>
+
+  {# Settings: one chip per setting, each opening the Settings modal focused on its block.
+     The bar is rendered by channel-detail.js from CHANNEL_DETAIL so the chip and the modal
+     read the same values - a second Jinja copy would be a second source of truth. #}
+  <div class="card" data-section="settings">
+    <div class="card-head">
+      <h2>Settings</h2>
+      <div class="card-head-actions">
+        <button class="btn btn-sm" data-act="settings">Edit settings</button>
+      </div>
+    </div>
+    <div class="card-body">
+      <div class="gd-setbar" id="cd-setbar"></div>
+    </div>
+  </div>
+
+  {# What's On: one guide row for this channel. #}
+  <div class="card" data-section="whatson">
+    <div class="card-head">
+      <h2>What's On</h2>
+      <div class="card-head-actions">
+        {# This page's equivalent of the guide toolbar's "Search all…" (DESIGN.md 12.2):
+           the filter box narrows what is already on the row, this reaches every program on
+           the channel. Same treatment as that control - the MDI magnify glyph ships at every
+           width and the label is dropped at phone widths (13.3), so it stays one link rather
+           than a mobile duplicate. Never an emoji: an emoji renders in emoji colour and
+           ignores the theme. #}
+        <a href="{{ chan_epg_search_url }}"
+           class="btn btn-sm tip-plain cd-epg-btn" aria-label="Search all EPG data for this channel"
+           data-tip="Search all EPG data.&#10;The filter box only narrows what is already on this row. This searches every program on this channel, including ones outside the guide window."><svg
+            class="cd-epg-icon" viewBox="0 0 24 24" width="16" height="16" fill="currentColor"
+            aria-hidden="true"><path d="M9.5,3A6.5,6.5 0 0,1 16,9.5C16,11.11 15.41,12.59 14.44,13.73L14.71,14H15.5L20.5,19L19,20.5L14,15.5V14.71L13.73,14.44C12.59,15.41 11.11,16 9.5,16A6.5,6.5 0 0,1 3,9.5A6.5,6.5 0 0,1 9.5,3M9.5,5C7,5 5,7 5,9.5C5,12 7,14 9.5,14C12,14 14,12 14,9.5C14,7 12,5 9.5,5Z"/></svg><span
+            class="cd-epg-label">Search all programs &rarr;</span></a>
+      </div>
+    </div>
+    <div class="card-body">
+      {% if not channel.epg_channel_id %}
+      <p class="card-note">No EPG channel ID is set - program guide data cannot be matched for this channel.</p>
+      {% elif total_epg_count == 0 %}
+      <p class="card-note">EPG channel ID is set (<code>{{ channel.epg_channel_id }}</code>) but no program data has been loaded. Try syncing the account.</p>
+      {% else %}
+      {# The guide's own toolbar (DESIGN.md 12.2), re-synced against templates/guide.html as
+         SHIPPED rather than as designed (round 6 of the revamp, dev/changelog/347). `toolbar`
+         is load-bearing, not decorative: the --ctl-h control-height token is scoped to that
+         container in style.css, and without it the Tags and Layout buttons render shorter
+         than the timenav beside them. `guide-toolbar` carries the cluster/search-affordance
+         rules in guide.css; `cd-guide-toolbar` un-sticks it, because this bar belongs to a
+         card and not to the page. #}
+      <div class="toolbar guide-toolbar cd-guide-toolbar" id="guide-toolbar">
+        <div class="guide-cluster guide-cluster-when">
+          <span class="guide-cluster-label">When</span>
+          {# One segmented control, chevrons pointing outward from the readout. Each button
+             carries its jump size in data-nav, so one delegated listener covers all four. #}
+          <div class="timenav" id="guide-timenav">
+            <button type="button" data-nav="-1440" class="tip-plain"
+                    data-tip="Back one day&#10;Scrolls the row 24 hours earlier.">&laquo; 24h</button>
+            <button type="button" data-nav="-60" class="tip-plain"
+                    data-tip="Back one hour&#10;Scrolls the row 60 minutes earlier.">&lsaquo; 1h</button>
+            <button type="button" class="timenav-readout tip-plain" id="guide-readout"
+                    data-tip="Visible window&#10;The day and time range currently on screen - it reads live from the row's scroll position.&#10;Click to jump to a day.">
+              <span class="timenav-readout-day" id="guide-readout-day">Loading&hellip;</span>
+              <span class="timenav-readout-time" id="guide-readout-time"></span>
+            </button>
+            <button type="button" data-nav="60" class="tip-plain"
+                    data-tip="Forward one hour&#10;Scrolls the row 60 minutes later.">1h &rsaquo;</button>
+            <button type="button" data-nav="1440" class="tip-plain"
+                    data-tip="Forward one day&#10;Scrolls the row 24 hours later.">24h &raquo;</button>
+            <button type="button" class="timenav-now tip-plain" id="btn-now"
+                    data-tip="Jump to now&#10;Scrolls back to the current time, marked by the red line.">Now</button>
+          </div>
+          <div class="guide-pop guide-pop-left" id="guide-daypicker" hidden></div>
+        </div>
+
+        <div class="guide-cluster guide-cluster-find">
+          <span class="guide-cluster-label">Find</span>
+          <div class="guide-search-wrap" id="guide-search-wrap">
+            <input type="text" id="guide-search" class="search guide-search-input"
+                   placeholder="Filter visible&hellip;" autocomplete="off">
+            <button type="button" class="guide-search-save" id="guide-search-save"
+                    title="Save this search" aria-label="Save this search">&#9734;</button>
+            <button type="button" class="guide-search-clear" id="guide-search-clear"
+                    title="Clear filter" aria-label="Clear filter">&times;</button>
+            <div class="saved-search-dropdown" id="guide-search-dropdown" style="display:none"></div>
+          </div>
+          {% if tags %}
+          <div class="tag-filter-wrap" id="tag-filter-wrap">
+            <button type="button" class="btn btn-sm tip-plain" id="tag-filter-toggle"
+                    data-tip="Tag filter&#10;Include or exclude programs by tag.&#10;Exclude always beats include - a program carrying an excluded tag is hidden no matter what.">
+              <span id="tag-filter-summary">Tags</span> <span class="nav-caret">&#9662;</span>
+            </button>
+            <div class="tag-filter-panel" id="tag-filter-panel" style="display:none">
+              <div class="tag-filter-section">
+                <div class="tag-filter-section-header">
+                  <span>Include</span>
+                  <span class="tag-filter-mode">
+                    <label><input type="radio" name="tag-filter-mode" value="any" checked> Any</label>
+                    <label><input type="radio" name="tag-filter-mode" value="all"> All</label>
+                  </span>
+                </div>
+                {% for tag in tags %}
+                <label class="tag-filter-row">
+                  <input type="checkbox" class="tag-filter-include" value="{{ tag.id }}">
+                  <span class="tag-filter-dot" style="background: {{ tag.color }}"></span>
+                  {{ tag.name }}
+                </label>
+                {% endfor %}
+              </div>
+              <div class="tag-filter-section">
+                <div class="tag-filter-section-header"><span>Exclude</span></div>
+                {% for tag in tags %}
+                <label class="tag-filter-row">
+                  <input type="checkbox" class="tag-filter-exclude" value="{{ tag.id }}">
+                  <span class="tag-filter-dot" style="background: {{ tag.color }}"></span>
+                  {{ tag.name }}
+                </label>
+                {% endfor %}
+              </div>
+            </div>
+          </div>
+          {% endif %}
+        </div>
+
+        {# Everything that changes what the row shows lives in here (12.3). Deliberately a
+           SUBSET of the guide's popover: "Include failed channels", the channel-column
+           fields and sort are all absent because this card is one known channel and draws no
+           channel column, so none of them has anything to act on. Every checkbox's `checked`
+           comes from the same server-side dict guide.js starts from, so the two cannot
+           disagree. #}
+        <div class="guide-cluster guide-cluster-layout">
+          <div class="guide-pop-wrap" id="guide-layout-wrap">
+            <button type="button" class="btn btn-sm tip-plain" id="btn-layout"
+                    aria-label="Layout"
+                    data-tip="Layout&#10;Choose what this row shows: which fields appear in each program cell, and how the timeline behaves. The row resizes to fit whatever you enable.">&#9881;<span class="guide-btn-label"> Layout &#9662;</span></button>
+            <div class="guide-pop" id="guide-layout-pop" hidden>
+              <h4>Grid behavior</h4>
+              <label class="tip-plain"
+                     data-tip="Collapse gaps&#10;With a filter active, cuts the empty time between matches out of the timeline so the matches sit side by side.&#10;A blue sawtooth marks every place time was removed.">
+                <input type="checkbox" data-layout="collapse_gaps" {{ 'checked' if whatson_layout.collapse_gaps }}> Collapse gaps</label>
+              <div class="guide-pop-hr"></div>
+              <h4>Program cell fields</h4>
+              <label><input type="checkbox" data-layout="rec_status" {{ 'checked' if whatson_layout.rec_status }}> Recording status</label>
+              <label class="is-fixed"><input type="checkbox" checked disabled> Title <span class="guide-pop-note">(always)</span></label>
+              <label><input type="checkbox" data-layout="subtitle" {{ 'checked' if whatson_layout.subtitle }}> Subtitle / episode</label>
+              <label><input type="checkbox" data-layout="description" {{ 'checked' if whatson_layout.description }}> Description</label>
+              <div class="guide-pop-hr"></div>
+              <h4>Time</h4>
+              <label><input type="checkbox" data-layout="start_time" {{ 'checked' if whatson_layout.start_time }}> Start time</label>
+              <label><input type="checkbox" data-layout="end_time" {{ 'checked' if whatson_layout.end_time }}> End time</label>
+              <label><input type="checkbox" data-layout="duration" {{ 'checked' if whatson_layout.duration }}> Duration</label>
+              <div class="guide-pop-hr"></div>
+              <h4>Tag indicators</h4>
+              <label><input type="checkbox" data-layout="tag_dots" {{ 'checked' if whatson_layout.tag_dots }}> Show matched-tag dots</label>
+              <div class="guide-pop-hint">The row sizes to its tallest cell, so nothing clips. The
+                guide's "Include failed channels", sort and channel-column settings are not here:
+                this card is one known channel and shows no channel column.</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {# The header track deliberately stays INSIDE .guide-program-area here, unlike
+         templates/guide.html. On the guide it had to move out so the whole grid header could
+         stick to the viewport; a card's header sticking to the viewport would detach it from
+         its own card. Nested inside the scroller its `position: sticky` does the horizontal
+         work on its own, which is why guide.css keeps those rules (see its comment above
+         .guide-day-header). #}
+      <div class="guide-outer channel-whats-on">
+        <div class="guide-body" id="guide-wrap">
+          {# Hidden - keeps guide.js's per-channel-row bookkeeping (search/filter, health
+             classes) working without showing a redundant channel sidebar; this page already
+             shows the channel above. #}
+          <div class="guide-channel-col" id="guide-channel-col" style="display:none">
+            <div class="guide-channel-row" data-channel-id="{{ channel.id }}"></div>
+          </div>
+          <div class="guide-program-area" id="guide-program-area">
+            <div class="guide-day-header" id="guide-day-header"></div>
+            <div class="guide-time-header" id="guide-time-header"></div>
+            <div class="guide-program-rows" id="guide-program-rows">
+              <div class="guide-row" data-channel-id="{{ channel.id }}"></div>
+            </div>
+          </div>
+        </div>
+      </div>
+      {# 12.6: a SIBLING of the grid, shown while the grid is hidden. Rebuilding the grid's
+         own innerHTML to render an empty state permanently destroys the nodes the renderer
+         holds references to, so clearing the filter could never restore the row. #}
+      <div class="guide-empty" id="guide-empty" hidden>
+        No programs match the current filter.
+        <span class="guide-empty-sub">Clear the text filter or the tag filter to bring the row back.</span>
+      </div>
+
+      {# 12.6: counts plus a colour key. On the guide the key is the ACCOUNT legend, because
+         channel rows carry account edge-colours; one channel has one account, so the key
+         here is the matched-tag colours instead - the dots on the program cells are
+         otherwise identifiable only by hovering them, which is nothing at all on a phone.
+         Both halves are filled by guide.js::updateStatusBar. #}
+      <div class="guide-statusbar">
+        <span id="guide-sb-counts"></span>
+        <span class="guide-sb-legend" id="guide-sb-tagkey"></span>
+      </div>
+
+      {% include "_record_modal.html" %}
+      {% endif %}
+    </div>
+  </div>
+
+  {# Activity timeline: the same event-log component the recording detail page uses
+     (channels/_timeline.html, styled in style.css). #}
+  <div class="card" data-section="timeline">
+    <div class="card-head"><h2>Activity Timeline</h2></div>
+    <div class="card-body">
+      {% if not timeline_entries %}
+      <p class="card-note">No activity recorded for this channel yet.</p>
+      {% else %}
+      <div class="test-history-controls">
+        <select class="form-control" style="width:auto" onchange="window.location.href = '{{ url_for('channels.channel_detail', channel_id=channel.id) }}?timeline_per_page=' + this.value">
+          {% for size in ['10', '25', '50', '100', 'all'] %}
+          <option value="{{ size }}" {% if size == timeline_per_page %}selected{% endif %}>{{ 'All' if size == 'all' else size + ' per page' }}</option>
+          {% endfor %}
+        </select>
+        {% if timeline_pagination and timeline_pagination.pages > 1 %}
+        <div class="test-history-pagination">
+          {% if timeline_pagination.has_prev %}
+          <a href="{{ url_for('channels.channel_detail', channel_id=channel.id, timeline_per_page=timeline_per_page, timeline_page=timeline_pagination.prev_num) }}" class="btn btn-sm">&larr; Prev</a>
+          {% endif %}
+          <span class="text-muted small">Page {{ timeline_pagination.page }} of {{ timeline_pagination.pages }}</span>
+          {% if timeline_pagination.has_next %}
+          <a href="{{ url_for('channels.channel_detail', channel_id=channel.id, timeline_per_page=timeline_per_page, timeline_page=timeline_pagination.next_num) }}" class="btn btn-sm">Next &rarr;</a>
+          {% endif %}
+        </div>
+        {% endif %}
+      </div>
+
+      {% set entries = timeline_entries %}
+      {% include 'channels/_timeline.html' with context %}
+      {% endif %}
+    </div>
+  </div>
+
+  {# Stream URL: a split card - address and meta on the left, duplicates on the right. #}
+  <div class="card" data-section="url" {% if duplicate_channels %}data-split{% endif %}>
+    <div class="card-head"><h2>Stream URL</h2></div>
+    <div class="card-body">
+      <div>
+        <div class="url-display">
+          <code id="stream-url-text" data-full-url="{{ channel.stream_url }}">{{ channel.stream_url | mask_creds(channel.raw_stream_url, channel.account) }}</code>
+          <button class="btn btn-sm" data-act="copy-url" id="copy-btn" style="flex-shrink:0">Copy</button>
+        </div>
+        {% if channel.raw_stream_url and channel.raw_stream_url != channel.stream_url %}
+        <div class="url-raw">
+          Original: <code>{{ channel.raw_stream_url | mask_creds }}</code>
+        </div>
+        {% endif %}
+        <div class="url-meta">
+          {% if channel.epg_channel_id %}
+          EPG ID: <code>{{ channel.epg_channel_id }}</code>
+          <span class="text-faint">&middot;</span>
+          {{ total_epg_count }} program{{ 's' if total_epg_count != 1 else '' }} in database
+          {% else %}
+          No EPG channel ID set
+          {% endif %}
+          {% if channel.stream_id %}
+          <span class="text-faint">&middot;</span>
+          Stream ID: {{ channel.stream_id }}
+          {% endif %}
+        </div>
+      </div>
+      {% if duplicate_channels %}
+      <div class="dup-block">
+        <div class="dup-head">
+          <strong>&#9888; Duplicate stream URL</strong><br>
+          Shared with {{ duplicate_channels | length }} other channel{{ 's' if duplicate_channels | length != 1 else '' }}.
+          They are the same provider stream under different names.
+        </div>
+        <ul class="dup-list">
+          {% for dup in duplicate_channels %}
+          <li>
+            <a href="{{ url_for('channels.channel_detail', channel_id=dup.id) }}">{{ dup.name }}</a>
+            <span class="text-muted small">{{ dup.account.name }}{% if dup.in_guide %} &middot; in guide{% endif %}</span>
+          </li>
+          {% endfor %}
+        </ul>
+      </div>
+      {% endif %}
+    </div>
+  </div>
+
+  {# Recording observations: recordings feed the lifetime score too, weighted higher than a
+     single test (a longer, real-world sample). #}
+  <div class="card" data-section="recordings">
+    <div class="card-head"><h2>Recording Observations</h2></div>
+    <div class="card-body">
+      {% if not recording_observations %}
+      <p class="card-note">No completed recording on this channel has produced a quality observation yet.</p>
+      {% else %}
+      <div class="table-scroll">
+        <table class="table">
+          <thead>
+            <tr>
+              <th>Completed</th>
+              <th>Recording</th>
+              <th>Status</th>
+              <th>Stalls</th>
+              <th>Restarts</th>
+              <th title="This recording's own 0-100 quality-score contribution">Score</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for r in recording_observations %}
+            <tr>
+              <td data-label="Completed" class="text-muted small">{{ r.completed_at | local_time if r.completed_at else '--' }}</td>
+              <td data-label="Recording"><a href="{{ url_for('recordings.recording_detail', recording_id=r.id) }}">{{ r.name }}</a></td>
+              <td data-label="Status"><span class="badge badge-{{ r.status | lower }}">{{ r.status }}</span></td>
+              <td data-label="Stalls">{{ r.total_stall_count or 0 }}</td>
+              <td data-label="Restarts">{{ r.total_restart_count or 0 }}</td>
+              <td data-label="Score" class="text-muted small">{{ r.health_quality_score }}</td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      {% endif %}
+    </div>
+  </div>
+
+  {# Test history: one row per test. A failure's detail hangs off the status pill as a
+     tooltip rather than riding on a second <tr> (round 4), so the table stays scannable. #}
+  <div class="card" data-section="tests">
+    <div class="card-head"><h2>Test History</h2></div>
+    <div class="card-body">
+      {% if not test_history %}
+      <p class="card-note">No channel tests have been run for this channel yet.</p>
+      {% else %}
+      <div class="test-history-controls">
+        <select class="form-control" style="width:auto" onchange="window.location.href = '{{ url_for('channels.channel_detail', channel_id=channel.id) }}?per_page=' + this.value">
+          {% for size in ['10', '25', '50', '100', 'all'] %}
+          <option value="{{ size }}" {% if size == per_page %}selected{% endif %}>{{ 'All' if size == 'all' else size + ' per page' }}</option>
+          {% endfor %}
+        </select>
+        {% if test_pagination and test_pagination.pages > 1 %}
+        <div class="test-history-pagination">
+          {% if test_pagination.has_prev %}
+          <a href="{{ url_for('channels.channel_detail', channel_id=channel.id, per_page=per_page, page=test_pagination.prev_num) }}" class="btn btn-sm">&larr; Prev</a>
+          {% endif %}
+          <span class="text-muted small">Page {{ test_pagination.page }} of {{ test_pagination.pages }}</span>
+          {% if test_pagination.has_next %}
+          <a href="{{ url_for('channels.channel_detail', channel_id=channel.id, per_page=per_page, page=test_pagination.next_num) }}" class="btn btn-sm">Next &rarr;</a>
+          {% endif %}
+        </div>
+        {% endif %}
+      </div>
+      <div class="table-scroll">
+        <table class="table">
+          <thead>
+            <tr>
+              <th>Tested</th>
+              <th>Status</th>
+              <th>Resolution</th>
+              <th class="col-profile" title="Codec, bit depth and chroma, plus interlaced/VFR flags. Tests that predate stream-profile capture show --.">Profile</th>
+              <th class="col-audio">Audio</th>
+              <th class="col-fps">FPS</th>
+              <th class="col-frames">Frames Received</th>
+              <th class="col-bitrate">Bitrate</th>
+              <th>Drops</th>
+              <th>Duration</th>
+              <th class="col-screenshot-h">Screenshot</th>
+              <th title="This test's own 0-100 quality score">Score</th>
+              <th title="Channel's lifetime score immediately after this test">Lifetime</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for t in test_history %}
+            <tr>
+              <td data-label="Tested" class="text-muted small">{{ t.test_started_at | local_time }}</td>
+              <td data-label="Status">
+                {% if t.id == in_progress_test_id %}
+                <span class="badge badge-in_progress">IN PROGRESS</span>
+                {% else %}
+                <span class="badge badge-{{ t.status | lower }}"
+                      {% if t.error_detail %}title="{{ t.status }}: {{ t.error_detail }}"{% endif %}>{{ t.status }}</span>
+                {% endif %}
+              </td>
+              <td data-label="Resolution">{{ t.resolution or '--' }}</td>
+              <td data-label="Profile" class="col-profile">
+                {% if test_profiles.get(t.id) %}{{ test_profiles[t.id] }}
+                {% else %}<span class="text-muted">--</span>{% endif %}
+              </td>
+              <td data-label="Audio" class="col-audio">
+                {% if t.audio_codec %}
+                  {{ t.audio_codec|upper }}{% if t.audio_channels %} {{ t.audio_channels }}ch{% endif %}{% if t.audio_sample_rate %} {{ (t.audio_sample_rate // 1000) }}kHz{% endif %}{% if t.audio_bitrate_kbps %} {{ t.audio_bitrate_kbps|int }}kbps{% endif %}{% if t.audio_language %} <span class="text-muted">({{ t.audio_language }})</span>{% endif %}
+                {% else %}
+                  <span class="text-muted">--</span>
+                {% endif %}
+              </td>
+              <td data-label="FPS" class="col-fps">
+                {% if t.fps %}{{ '%.1f' | format(t.fps) }}{% else %}--{% endif %}
+              </td>
+              <td data-label="Frames Received" class="col-frames">
+                {% if t.frame_pct is not none %}
+                  {% set tip = (t.frame_count | int) ~ ' received / ' ~ (((t.fps or 0) * (t.duration_seconds or 0)) | int) ~ ' expected over ' ~ ((t.duration_seconds or 0) | int) ~ 's captured' %}
+                  {% if t.frame_pct >= 95 %}<span style="color:var(--ok)" title="{{ tip }}">{{ '%.1f' | format(t.frame_pct) }}%</span>
+                  {% elif t.frame_pct >= 80 %}<span style="color:var(--warn)" title="{{ tip }}">{{ '%.1f' | format(t.frame_pct) }}%</span>
+                  {% else %}<span style="color:var(--bad)" title="{{ tip }}">{{ '%.1f' | format(t.frame_pct) }}%</span>
+                  {% endif %}
+                {% else %}--{% endif %}
+              </td>
+              <td data-label="Bitrate" class="col-bitrate">
+                {% if t.bitrate_kbps %}{{ '%.0f kbps' | format(t.bitrate_kbps) }}{% else %}--{% endif %}
+              </td>
+              <td data-label="Drops">
+                {% if t.drop_count == 0 %}<span class="text-muted">0</span>
+                {% elif t.drop_count <= 2 %}<span class="text-warning">{{ t.drop_count }}</span>
+                {% else %}<span class="text-danger">{{ t.drop_count }}</span>
+                {% endif %}
+              </td>
+              <td data-label="Duration" class="text-muted small">
+                {% if t.test_ended_at %}{{ ((t.test_ended_at - t.test_started_at).total_seconds() | int) }}s{% else %}--{% endif %}
+              </td>
+              <td data-label="Screenshot" class="col-screenshot-h">
+                {% if t.screenshot_path %}
+                  {% if t.screenshot_pruned %}
+                  <div class="test-row-screenshot screenshot-placeholder pruned"
+                       title="Screenshot was pruned by the retention policy. Change how many screenshots are kept per test in Settings &rarr; Channel Health Checks.">
+                    Pruned
+                  </div>
+                  {% else %}
+                  {% set row_shot = url_for('channel_tests.serve_screenshot', filename=t.screenshot_path.rsplit('/', 1)[-1]) %}
+                  <a href="{{ row_shot }}" target="_blank">
+                    <img src="{{ row_shot }}" class="test-row-screenshot" alt="Screenshot" loading="lazy"
+                         onerror="this.parentElement.style.display='none';this.parentElement.nextElementSibling.style.display='flex'">
+                  </a>
+                  <div class="test-row-screenshot screenshot-placeholder missing" style="display:none"
+                       title="Expected a screenshot but the file is missing - not pruned by the retention policy, cause unknown.">
+                    Unavailable
+                  </div>
+                  {% endif %}
+                {% else %}
+                  <span class="text-muted">--</span>
+                {% endif %}
+              </td>
+              <td data-label="Score" class="text-muted small">{{ t.quality_score if t.quality_score is not none else '--' }}</td>
+              <td data-label="Lifetime" class="text-muted small">{{ t.lifetime_score_after if t.lifetime_score_after is not none else '--' }}</td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      {% endif %}
+    </div>
+  </div>
+
+</div>
+
+{# The one-off / recurring schedule picker for the Create-health-check modal, same
+   prefix convention the Browse tab uses so the two never share input ids. #}
+<template id="cc-schedule-fields">
+  {{ m.recur_schedule_fields('ccsched', 'Start Time', window_label) }}
+</template>
+{% endblock %}
+
+{% block scripts %}
+{% if channel.epg_channel_id and total_epg_count > 0 %}
+<link rel="stylesheet" href="{{ url_for('static', filename='css/guide.css') }}">
+<script>
+const GUIDE_CONFIG = {
+  epgUrl: '{{ url_for("guide.epg_api") }}',
+  savedSearchesUrl: '{{ url_for("guide.list_saved_searches") }}',  // GET list / POST create
+  deleteSavedSearchUrlBase: '/api/guide/saved-searches/',  // + id + /delete
+  addChannelUrlBase: '/api/guide/channels/',
+  newRecordingUrl: '{{ url_for("recordings.new_recording") }}',
+  editRecordingUrlBase: '/recordings/',
+  recDetailUrlBase: '/recordings/',
+  channelId: {{ channel.id }},
+  windowDays: {{ guide_window_days }},
+  // Layout state for both breakpoints, under this page's own keys (see
+  // channels.py::WHATSON_LAYOUT_PREF_KEY). The desktop dict also rendered the popover's
+  // checkboxes above; mobile's Layout is a JS-built sheet, so its dict only reaches guide.js.
+  layout: {{ whatson_layout | tojson }},
+  layoutPrefKey: {{ whatson_layout_pref_key | tojson }},
+  layoutMobile: {{ whatson_layout_mobile | tojson }},
+  layoutMobilePrefKey: {{ whatson_layout_mobile_pref_key | tojson }},
+  // This card is one known channel with no channel column, no sort and nothing to include
+  // or hide, so guide.js must not offer any of those in the mobile Layout sheet.
+  singleChannel: true,
+  profiles: {
+    {% for p in profiles %}
+    '{{ p.id }}': { prePaddingMinutes: {{ p.pre_padding_minutes }}, postPaddingMinutes: {{ p.post_padding_minutes }} },
+    {% endfor %}
+  },
+};
+</script>
+<script src="{{ url_for('static', filename='js/guide.js') }}"></script>
+{% endif %}
+<script>
+window.CHANNEL_DETAIL = {
+  channelId: {{ channel.id }},
+  channelName: {{ channel.name | tojson }},
+  sections: {{ sections | tojson }},
+  sectionPref: {{ section_pref | tojson }},
+  notes: {{ (channel.notes or '') | tojson }},
+  healthAdjustment: {{ channel.manual_health_adjustment }},
+  healthNote: {{ (channel.manual_health_note or '') | tojson }},
+  defaultProfileId: {{ channel.default_profile_id | tojson }},
+  defaultProfileName: {{ (channel.default_profile.name if channel.default_profile else None) | tojson }},
+  testEnabled: {{ channel.test_enabled | tojson }},
+  guideCheckJobId: {{ guide_check_job_id | tojson }},
+  healthChecks: {{ health_checks | map(attribute='name') | list | tojson }},
+  profiles: [{% for p in recording_profiles %}{ id: {{ p.id }}, name: {{ p.name | tojson }} }{{ ',' if not loop.last }}{% endfor %}],
+  checkProfiles: {{ check_profiles.profiles | tojson }},
+  checkProfilesUrl: {{ url_for('health_check_profiles.health_check_profiles_list') | tojson }},
+  testerBusy: {{ tester_status.is_running | tojson }},
+  {# Where the maintenance window's hours live. The settings page reads ?q= off its own
+     URL and applies it as the page search (static/js/settings.js) - there is no anchor
+     to link at. #}
+  windowSettingsUrl: {{ (url_for('settings.settings') ~ '?q=Maintenance+window') | tojson }},
+  {# Drives whether the kebab offers Delete channel. The server re-derives it on both
+     requests regardless (dev/changelog/772) - this only decides what is offered. #}
+  isMissing: {{ (lifecycle_state == 'missing') | tojson }},
+  repoint: {% if repoint_candidate %}{
+    id: {{ repoint_candidate.id }},
+    name: {{ repoint_candidate.name | tojson }},
+    account: {{ repoint_candidate.account.name | tojson }}
+  }{% else %}null{% endif %},
+  urls: {
+    notes: '{{ url_for("channels.update_channel_notes", channel_id=channel.id) }}',
+    defaultProfile: '{{ url_for("channels.update_channel_default_profile", channel_id=channel.id) }}',
+    healthAdjustment: '{{ url_for("channels.update_health_adjustment", channel_id=channel.id) }}',
+    repoint: '/channels/{{ channel.id }}/repoint',
+    sectionPref: '/api/user-prefs/channel_detail_sections',
+    testNow: '/api/channels/{{ channel.id }}/test-now',
+    missingPreview: '{{ url_for("channels.missing_delete_preview") }}',
+    missingDelete: '{{ url_for("channels.missing_delete") }}',
+    channelsHub: '{{ url_for("channels.channel_browser") }}',
+    hide: '{{ url_for("channels.hide_channel", channel_id=channel.id) }}',
+  },
+};
+</script>
+<script src="{{ url_for('static', filename='js/schedule-fields.js') }}"></script>
+<script src="{{ url_for('static', filename='js/check-modal.js') }}"></script>
+<script src="{{ url_for('static', filename='js/missing-modal.js') }}"></script>
+<script src="{{ url_for('static', filename='js/channel-detail.js') }}"></script>
+{% endblock %}

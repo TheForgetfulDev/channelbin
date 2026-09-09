@@ -1,0 +1,168 @@
+{% extends "base.html" %}
+{% import "_macros.html" as m %}
+{% block title %}Scheduled Jobs - ChannelBin{% endblock %}
+
+{#  Scheduled jobs (dev/changelog/446).
+
+    Converted against the generic components - DESIGN.md 3.2 (.tbl inside a
+    .card, wrapped in .table-scroll), 3.4 (badge + left edge, never a row tint),
+    3.6 (row actions behind a kebab), 3.10 (one h1), 3.14 (empty state). No
+    page-specific DESIGN.md section governs it.
+
+    `jobs` is built by routes/jobs.py::_build_job_list from the live APScheduler
+    state, so a job's presence here is what the scheduler will actually do - keep
+    every key read below in step with that function. #}
+
+{% block content %}
+<style>
+/* ══════════════════════════════════════════════════════════════════════════
+   Scheduled jobs. Everything generic (.card, .tbl, .btn, .menu, .badge,
+   .page-head, .empty-state) comes from style.css; what lives here is the
+   overlap marking and the two-line Next run cell.
+   ══════════════════════════════════════════════════════════════════════════ */
+
+/* ── Overlap marking ──────────────────────────────────────────────────────
+   Two jobs firing at once is the thing this page exists to show, so it is said
+   twice: a colored dot with its own tooltip, and - for the two states that want
+   attention - a colored edge down the row.
+
+   The edge is an INSET SHADOW rather than a border-left, because a border on a
+   `td` moves that cell's content while its neighbours stay put. It is also not
+   the row tint this page used to draw: DESIGN.md 3.4 rules status tints out, and
+   a tinted row also fights `.tbl tbody tr:hover`. An inset shadow paints over
+   the cell background, so the hover still works underneath it. */
+.tbl tbody tr[data-overlap="red"] td:first-child { box-shadow: inset 3px 0 0 var(--bad); }
+.tbl tbody tr[data-overlap="yellow"] td:first-child { box-shadow: inset 3px 0 0 var(--warn); }
+
+.jb-dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; flex: none; }
+.jb-dot.red { background: var(--bad); }
+.jb-dot.yellow { background: var(--warn); }
+.jb-dot.green { background: var(--ok); }
+
+.jb-name { display: flex; align-items: center; gap: 8px; font-weight: 500; }
+.jb-rel, .jb-stop { font-size: var(--fs-xs); color: var(--text-muted); margin-top: 2px; }
+
+.jb-legend {
+  display: flex; gap: 18px; flex-wrap: wrap; align-items: center;
+  margin-top: 12px; font-size: var(--fs-sm); color: var(--text-muted);
+}
+.jb-legend span { display: inline-flex; align-items: center; gap: 6px; }
+</style>
+
+<div class="page-head">
+  <h1>Scheduled Jobs
+    <span class="sub">{{ jobs | length }} job{{ '' if jobs | length == 1 else 's' }}</span>
+  </h1>
+  <div class="card-head-actions">
+    <button class="btn btn-sm" id="jb-refresh">&#8635; Refresh</button>
+  </div>
+</div>
+<p class="page-sub">Everything the scheduler will do on its own, read from its live state rather
+  than from a stored list - so what is here is what will run.</p>
+
+{% if jobs %}
+<div class="card">
+  <div class="card-head"><h2>Jobs <span class="cnt">{{ jobs | length }}</span></h2></div>
+  <div class="card-body table-scroll">
+    <table class="tbl">
+      <thead>
+        <tr>
+          <th>Job</th>
+          <th>Type</th>
+          <th>Next run</th>
+          <th>Schedule</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for job in jobs %}
+        <tr data-overlap="{{ job.overlap }}">
+          <td>
+            <div class="jb-name">
+              <span class="jb-dot {{ job.overlap }} tip-plain"
+                    data-tip="{% if job.overlap == 'red' %}Overlaps another job&#10;This job runs at the same time as at least one other.{% elif job.overlap == 'yellow' %}Runs close to another job&#10;Another job starts within 5 minutes of this one.{% else %}No conflict&#10;Nothing else is scheduled near this job.{% endif %}"></span>
+              {{ job.display_name }}
+            </div>
+          </td>
+          <td>
+            {# Every type gets its own branch - a new one added to _build_job_list
+               must be named here rather than landing in a silent fallthrough. #}
+            {% if job.type == 'recurring' %}{{ m.status_badge('b-sched', 'Recurring') }}
+            {% elif job.type == 'active' %}{{ m.status_badge('b-warn', 'Active') }}
+            {% elif job.type == 'on_event' %}{{ m.status_badge('b-paused', 'Per Recording') }}
+            {% elif job.type == 'one_off' %}{{ m.status_badge('b-done', 'One-off') }}
+            {% else %}{{ m.status_badge('b-abort', job.type) }}
+            {% endif %}
+          </td>
+          <td>
+            <div class="mono">{{ job.next_run_et }}</div>
+            <div class="jb-rel">{{ job.next_run_relative }}</div>
+            {% if job.stop_run_et %}
+            <div class="jb-stop">stops {{ job.stop_run_et }}</div>
+            {% endif %}
+          </td>
+          <td class="muted">
+            {{ job.schedule_description or '-' }}
+            {% if job.get('duration_line') %}
+            <div class="jb-rel">{{ job.duration_line }}</div>
+            {% endif %}
+          </td>
+          <td style="text-align:right;">
+            {% set has_actions = job.edit_url or job.get('run_url') or job.get('run_disabled_reason') or job.get('skip_url') or job.get('cancel_url') %}
+            {% if has_actions %}
+            <span class="menu-wrap">
+              <button class="btn btn-sm btn-icon" data-menu aria-label="More actions">&#8943;</button>
+              <div class="menu pop-left">
+                {% if job.edit_url %}
+                <a href="{{ job.edit_url }}">{% if job.type in ('one_off', 'active') and (job.id.startswith('start_') or job.id.startswith('active_')) %}Edit{% else %}Settings{% endif %}</a>
+                {% endif %}
+                {% if job.get('run_url') %}
+                <button class="menu-item" data-act="run" data-url="{{ job.run_url }}"
+                        data-name="{{ job.display_name }}"
+                        {%- if job.get('run_keep_schedule_prompt') %} data-keep-prompt="1"{% endif %}
+                        {%- if job.get('skip_url') %} data-skip-url="{{ job.skip_url }}"
+                        data-next-run="{{ job.next_run_et }} ({{ job.next_run_relative }})"{% endif %}>Run now</button>
+                {% elif job.get('run_disabled_reason') %}
+                <button class="menu-item disabled" data-act="run-disabled"
+                        data-reason="{{ job.run_disabled_reason }}">Run now</button>
+                {% endif %}
+                {% if job.get('skip_url') %}
+                <button class="menu-item" data-act="skip" data-url="{{ job.skip_url }}"
+                        data-next-run="{{ job.next_run_et }}">Skip next run</button>
+                {% endif %}
+                {% if job.get('cancel_url') %}
+                <div class="sep"></div>
+                <button class="menu-item danger" data-act="cancel" data-url="{{ job.cancel_url }}"
+                        data-name="{{ job.display_name }}">Cancel scheduled run</button>
+                {% endif %}
+              </div>
+            </span>
+            {% else %}
+            <span class="muted">-</span>
+            {% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<div class="jb-legend">
+  <span><span class="jb-dot red"></span> Overlapping jobs</span>
+  <span><span class="jb-dot yellow"></span> Within 5 minutes</span>
+  <span><span class="jb-dot green"></span> No conflict</span>
+</div>
+{% else %}
+<div class="empty-state">
+  <p>No scheduled jobs found.</p>
+  <p class="text-muted" style="font-size:13px;">Recordings, account syncs and health checks all
+    put jobs here once they are scheduled.</p>
+  <a class="btn btn-primary" href="{{ url_for('guide.guide') }}">Go to the TV Guide</a>
+</div>
+{% endif %}
+{% endblock %}
+
+{% block scripts %}
+<script src="{{ url_for('static', filename='js/jobs.js') }}"></script>
+{% endblock %}

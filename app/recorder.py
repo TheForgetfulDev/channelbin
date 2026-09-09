@@ -1,0 +1,1886 @@
+"""
+Core recording management.
+
+Module-level _active: dict[int, RecordingState] holds live state for each
+in-progress recording. All mutations are protected by _lock.
+"""
+import glob
+import logging
+import os
+import subprocess
+import threading
+import time
+import uuid
+from collections import namedtuple
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+from typing import Optional
+
+from . import db
+from .config import load_config
+from .database import (
+    Channel, Recording, RecordingSegment, RecordingEvent, add_recording_event,
+    SEGMENT_STARTED, SEGMENT_ENDED, RECORDING_HANDOFF, DIAGNOSTICS, RESTART_ATTEMPTED,
+    GROUP_MEMBER_SELECTED, GROUP_FAILOVER, RECORDING_FORMAT_OVERRIDE,
+    RECORDING_URL_RERESOLVED, RECORDING_RESUME_REFUSED,
+    RECORDING_FAILED, RECORDING_START_DEFERRED,
+    REC_STATUS_SCHEDULED, REC_STATUS_IN_PROGRESS, REC_STATUS_PAUSED, REC_STATUS_RETRYING,
+    REC_STATUS_FAILED, REC_STATUS_ABORTED,
+)
+from .channel_groups import (effective_score, pick_best_member, recording_members,
+                             format_eligible_members, format_key, format_label,
+                             segment_format_key, DEFAULT_FAILING_STREAK_THRESHOLD)
+from .db_utils import retry_on_locked
+from .fs_utils import PATH_OK, describe_dir_problem, probe_dir
+from .proc_utils import build_capture_cmd, read_stderr_tail, terminate_or_kill
+from .url_utils import mask_creds, mask_creds_in_text
+from . import events as ev
+
+log = logging.getLogger(__name__)
+
+_lock = threading.Lock()
+
+# How long a recording waiting for a free connection slot sleeps between attempts.
+# Deliberately shorter than the conversion-collision defer in start_recording: a slot
+# frees the instant another recording ends, and every second spent waiting is content
+# this recording will never capture. Not a config key - it is a retry cadence, not a
+# policy the user has any basis to tune.
+SLOT_WAIT_POLL_SECONDS = 10
+
+
+@dataclass
+class RecordingState:
+    process: Optional[subprocess.Popen] = None
+    stop_event: threading.Event = field(default_factory=threading.Event)
+    watchdog: Optional[threading.Thread] = None
+    current_segment_num: int = 0
+    # Open spool file (and its path) receiving the current segment's ffmpeg stderr, so
+    # every terminal path can read the tail and unlink it. Held here rather than passed
+    # around because the paths that end a segment - watchdog stall, manual stop, failover,
+    # give-up - reach the process the same way. Both are None between segments and
+    # whenever spooling could not be set up (dev/changelog/430).
+    stderr_fh: Optional[object] = None
+    stderr_path: Optional[str] = None
+    # Pending relaunch after a Popen that failed below the give-up threshold. Held here so
+    # the thread is reachable from tracked state; it waits on stop_event, so every teardown
+    # path cancels it (dev/changelog/644).
+    launch_retry: Optional[threading.Thread] = None
+    # Group failover (group-backed recordings only): members whose feed already died
+    # during THIS recording - excluded when picking the next member. In-memory by
+    # design: a service restart forgets the set, worst case costing one wasted retry
+    # cycle per previously-failed member.
+    failed_member_ids: set = field(default_factory=set)
+
+
+# recording_id → RecordingState
+_active: dict = {}
+
+
+def recording_disk_paths(recording_id: int) -> list:
+    """Every on-disk file a recording owns, for teardown: the final output file, all
+    segment files, the pre-conversion .ts sibling (kept when post_process.delete_source
+    is off), and the live-thumbnail image. Paths only - no deletion. Requires an active
+    app context. Missing/None paths are omitted; the thumbnail path is always included
+    (delete_files() guards on existence)."""
+    paths = []
+    rec = db.session.get(Recording, recording_id)
+    if rec is not None and rec.output_path:
+        paths.append(rec.output_path)
+        # A converted recording (e.g. .mp4) may leave its source .ts behind when
+        # delete_source is off; the stem is unique per recording name.
+        if not rec.output_path.endswith('.ts'):
+            paths.append(os.path.splitext(rec.output_path)[0] + '.ts')
+    for seg in RecordingSegment.query.filter_by(recording_id=recording_id).all():
+        if seg.file_path:
+            paths.append(seg.file_path)
+    thumb_cfg = load_config().get('recording', {}).get('live_thumbnail', {})
+    paths.append(os.path.join(
+        thumb_cfg.get('dir', '/dvr/live_thumbnails'), f'{recording_id}.jpg'))
+    return paths
+
+
+def persist_final_thumbnail(recording_id: int):
+    """Refresh the recording's thumbnail from the last segment that has data, so a
+    finished recording keeps a final-frame screenshot at the live-thumbnail path
+    (DESIGN.md: list-row thumbs + detail hero for completed/failed rows).
+
+    Best-effort - failure only means the row shows a placeholder. Requires an app
+    context. Spawns ffmpeg, so callers must keep it OUTSIDE any retry_on_locked
+    closure."""
+    from .config import resolve_ffmpeg_path
+    from .screenshot import capture_screenshot
+
+    cfg = load_config()
+    thumb_cfg = cfg.get('recording', {}).get('live_thumbnail', {})
+    if not thumb_cfg.get('enabled', True):
+        return
+    seg = None
+    for cand in RecordingSegment.query.filter_by(recording_id=recording_id)\
+            .order_by(RecordingSegment.segment_number.desc()).all():
+        if cand.file_path and os.path.exists(cand.file_path) and os.path.getsize(cand.file_path) > 0:
+            seg = cand
+            break
+    if seg is None:
+        return
+    thumb_dir = thumb_cfg.get('dir', '/dvr/live_thumbnails')
+    try:
+        os.makedirs(thumb_dir, exist_ok=True)
+    except OSError as exc:
+        log.warning('Recording %d: cannot create thumbnail dir %s: %s', recording_id, thumb_dir, exc)
+        return
+    thumb_path = os.path.join(thumb_dir, f'{recording_id}.jpg')
+    tmp_path = os.path.join(thumb_dir, f'{recording_id}.{uuid.uuid4().hex}.tmp.jpg')
+    ffmpeg_path = resolve_ffmpeg_path(cfg.get('ffmpeg', {}).get('path', 'ffmpeg'))
+    ok = capture_screenshot(
+        seg.file_path, tmp_path, ffmpeg_path,
+        seek_args=['-sseof', '-3'],
+        timeout=thumb_cfg.get('capture_timeout_seconds', 12),
+    )
+    if ok:
+        try:
+            os.replace(tmp_path, thumb_path)
+        except OSError as exc:
+            log.warning('Recording %d: final thumbnail replace failed: %s', recording_id, exc)
+    else:
+        log.info('Recording %d: final thumbnail capture failed (seg %d)',
+                 recording_id, seg.segment_number)
+
+
+def delete_files(paths) -> int:
+    """Unlink each existing path, best-effort. A failure on one path is logged and
+    skipped (never aborts the rest). Returns the number of files actually removed.
+    Callers must run this OUTSIDE any retry_on_locked closure - it's a non-idempotent
+    side effect that must fire only after the DB delete has durably committed."""
+    removed = 0
+    for path in paths:
+        try:
+            if path and os.path.exists(path):
+                os.remove(path)
+                removed += 1
+        except OSError as exc:
+            log.warning('Could not delete file %s: %s', path, exc)
+    return removed
+
+
+def kill_all_active():
+    """Terminate every ffmpeg process this process currently owns.
+
+    Called from the shutdown signal handler so a killed/restarted run.py
+    process never leaves an orphaned ffmpeg child writing to a segment file
+    the next process doesn't know about. Deliberately does no DB work (unsafe
+    from a signal handler) - the next process's resume_recording() already
+    closes out any segment row left with ended_at IS NULL.
+
+    stop_event is set first, before any kill: it is the app-wide "this death was
+    deliberate" flag, and the watchdog now treats an exited capture process as a
+    dead feed within one poll (app/watchdog.py). Without it, shutting down would
+    look like a stall and the watchdog would spawn a replacement ffmpeg on the way
+    out - precisely the orphan this function exists to prevent. Setting an Event
+    takes no DB and no app context, so it is as signal-handler-safe as the _lock
+    this function already takes.
+    """
+    with _lock:
+        states = list(_active.values())
+    for state in states:
+        state.stop_event.set()
+    for state in states:
+        proc = state.process
+        if proc and proc.poll() is None:
+            log.info('Shutdown: terminating ffmpeg pid=%d', proc.pid)
+            proc.terminate()
+    for state in states:
+        proc = state.process
+        if proc and proc.poll() is None:
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                log.warning('Shutdown: ffmpeg pid=%d did not exit, killing', proc.pid)
+                proc.kill()
+
+
+def get_state(recording_id: int) -> Optional[RecordingState]:
+    with _lock:
+        return _active.get(recording_id)
+
+
+def get_live_segment_path(recording_id: int) -> Optional[str]:
+    """Return the file path of the currently-open segment for an active recording.
+
+    Returns None if the recording isn't in _active (not IN_PROGRESS - e.g. also
+    None while PAUSED, since pause_recording() pops it from _active), or if the
+    current segment's DB row doesn't exist yet (e.g. the instant after a fresh
+    ffmpeg launch, before RecordingSegment is committed).
+    """
+    state = get_state(recording_id)
+    if state is None:
+        return None
+    seg = (RecordingSegment.query
+           .filter_by(recording_id=recording_id, segment_number=state.current_segment_num)
+           .first())
+    if seg is None or not seg.file_path:
+        return None
+    return seg.file_path
+
+
+def _busy_channel_ids(exclude_recording_id: int) -> set:
+    """Channel ids that another IN_PROGRESS recording is currently using - the
+    busy-member skip rule (2026-07-20): group member selection prefers a
+    free member over one that would preempt/handoff a live recording, but will
+    knowingly take a busy member when no alternative active member exists."""
+    rows = (db.session.query(Recording.channel_id)
+            .filter(Recording.status == REC_STATUS_IN_PROGRESS,
+                    Recording.id != exclude_recording_id,
+                    Recording.channel_id.isnot(None)).all())
+    return {r[0] for r in rows}
+
+
+def _busy_account_channel_ids(members, exclude_recording_id: int) -> set:
+    """Of `members`, the channel ids whose account has no free connection slot right now.
+
+    The account-level sibling of the busy-channel rule above, and the same shape: prefer
+    a member the recording can start on immediately, fall back to one it cannot when
+    nothing else survives. Since the connection limit became a hard ceiling
+    (dev/changelog/854) a member on a full account no longer risks the provider account -
+    it costs capture time, because the start waits for a slot instead of connecting. So a
+    group spanning several accounts rolls over to an idle one rather than queueing behind
+    a busy one, and waiting is what is left when every eligible member is on a full
+    account (dev/changelog/855).
+
+    The recording's own slot is discounted: at failover it already holds one on its
+    current account, and a same-account swap keeps that slot rather than competing for it.
+    """
+    from . import connection_limits as connlim
+    full = connlim.accounts_without_free_recording_slot(
+        {ch.account_id for ch in members},
+        exclude_holder=('recording', exclude_recording_id))
+    return {ch.id for ch in members if ch.account_id in full}
+
+
+def start_recording(app, recording_id: int):
+    """Transition a SCHEDULED recording to IN_PROGRESS and launch ffmpeg."""
+    with app.app_context():
+        rec = db.session.get(Recording, recording_id)
+        if rec is None:
+            log.error('start_recording: recording %d not found', recording_id)
+            return
+        if rec.status not in (REC_STATUS_SCHEDULED,):
+            log.warning('start_recording: recording %d already %s, skipping', recording_id, rec.status)
+            return
+
+        # mp4 conversion collision avoidance, 'wait' policy only (recording.post_process.
+        # collision_policy). 'cancel' needs no check here - a live conversion yields to
+        # this recording on its own (app/postprocessor.py's own poll loop) without ever
+        # delaying the start; DESIGN-concurrency.md's "recordings always win" doctrine
+        # predates conversion as an actor, so this extends it rather than reopening it.
+        # Checked before any of the group-member-resolution work below, so a defer/fail
+        # doesn't waste it - a retry re-enters this function and redoes it fresh.
+        collision_policy = load_config()['recording']['post_process'].get('collision_policy', 'cancel')
+        if collision_policy == 'wait':
+            from . import postprocessor
+            if postprocessor.has_active_conversion():
+                now = datetime.utcnow()
+                if rec.stop_time <= now:
+                    log.error('Recording "%s" (#%d): stop time already passed while waiting '
+                              'for a live mp4 conversion to finish - giving up', rec.name, recording_id,
+                              extra={'recording_id': recording_id})
+
+                    @retry_on_locked()
+                    def _fail_conversion_collision_and_commit():
+                        r = db.session.get(Recording, recording_id)
+                        r.status = REC_STATUS_FAILED
+                        r.completed_at = now
+                        add_recording_event(
+                            recording_id, RECORDING_FAILED,
+                            detail="Never started: waited for a live mp4 conversion to finish "
+                                   "(recording.post_process.collision_policy: wait), but the "
+                                   "recording's own stop time passed first")
+                        db.session.commit()
+
+                    _fail_conversion_collision_and_commit()
+                    from .health_score import dismiss_recording_failing_alerts
+                    dismiss_recording_failing_alerts(recording_id)
+                    from .alerts import create_alert
+                    create_alert(
+                        'RECORDING_FAILED_CONVERSION_COLLISION',
+                        f'Recording failed: {rec.name}',
+                        body="Waited for a live mp4 conversion to finish (collision_policy: "
+                             "wait), but the recording's own window ended first.",
+                        source='recorder', recording_id=recording_id,
+                    )
+                    return
+
+                if not RecordingEvent.query.filter_by(
+                        recording_id=recording_id, event_type=RECORDING_START_DEFERRED).first():
+                    @retry_on_locked()
+                    def _mark_deferred_and_commit():
+                        add_recording_event(
+                            recording_id, RECORDING_START_DEFERRED,
+                            detail="Start deferred: a live mp4 conversion is using local "
+                                   "resources (recording.post_process.collision_policy: "
+                                   "wait) - will retry once it's clear.")
+                        db.session.commit()
+
+                    _mark_deferred_and_commit()
+
+                log.info('Recording %d: deferring start - a live mp4 conversion is running '
+                         '(collision_policy: wait)', recording_id)
+                from .scheduler import reschedule_recording_start
+                reschedule_recording_start(recording_id, now + timedelta(seconds=30))
+                return
+
+        # Group-backed recording: re-resolve the best member NOW (scores may have
+        # shifted since creation) and point channel_id/url at it before anything
+        # else reads them (handoff check, slot acquisition, ffmpeg launch).
+        if rec.group_id is not None and rec.group is not None:
+            cfg = load_config()
+            streak_threshold = cfg.get('channel_testing', {}).get(
+                'failing_streak_threshold', DEFAULT_FAILING_STREAK_THRESHOLD)
+            # Recording-enabled members only - a member the user has not enabled for
+            # recording is not a failover candidate
+            # (app/channel_groups.py::recording_members).
+            members = recording_members(rec.group.memberships)
+            from .routes.channel_tests import _latest_tests_by_channel
+            latest_by_channel = _latest_tests_by_channel([ch.id for ch in members])
+            # Format lock filters, health score ranks (DESIGN-channel-groups-model.md 5).
+            # A member whose measured format differs from the lock is skipped HERE, where
+            # the member is chosen - never by unticking its Recording switch, which is
+            # user intent and is written by a human alone (4.1).
+            selection = format_eligible_members(rec.group, members, latest_by_channel)
+            members = selection.members
+            busy = _busy_channel_ids(recording_id)
+            # Two preferences, relaxed one at a time and both applied HERE, after the
+            # format filter - so neither can empty the candidate list ahead of the
+            # format lock's own zero-survivors override (dev/changelog/754).
+            busy_account = _busy_account_channel_ids(members, recording_id)
+            best = pick_best_member(members, latest_by_channel,
+                                    exclude_ids=busy | busy_account,
+                                    streak_threshold=streak_threshold)
+            if best is None:
+                # Nothing on an account with a free slot. Take a free *channel* on a
+                # full account and wait for the slot rather than handing off a live
+                # recording - the pre-rollover behavior, unchanged.
+                best = pick_best_member(members, latest_by_channel, exclude_ids=busy,
+                                        streak_threshold=streak_threshold)
+            if best is None:
+                # No free active member - knowingly take the busy one (the handoff
+                # check below gracefully stops the recording occupying it).
+                best = pick_best_member(members, latest_by_channel, streak_threshold=streak_threshold)
+            # Derived from what was actually picked, not from which branch ran: one fact,
+            # read the same way by the note and by the event's extra_data.
+            took_busy = best is not None and best.id in busy
+            took_busy_account = best is not None and best.id in busy_account
+            if best is not None:
+                from .accounts import normalize_url
+                skipped_busy = [ch for ch in members if ch.id in busy and ch.id != best.id]
+                skipped_busy_account = [ch for ch in members if ch.id in busy_account
+                                        and ch.id not in busy and ch.id != best.id]
+                if took_busy:
+                    busy_note = (' - channel is busy with another recording but no free '
+                                 'active channel exists; taking it (same-channel handoff)')
+                elif skipped_busy:
+                    busy_note = (' - skipped busy channel(s): '
+                                 + ', '.join(f'"{ch.name}"' for ch in skipped_busy))
+                else:
+                    busy_note = ''
+                if took_busy_account:
+                    busy_note += (f' - no member on an account with a free connection slot, '
+                                  f'so the start waits for one on "{best.account.name}"')
+                elif skipped_busy_account:
+                    busy_note += (' - rolled over to a free account, past: '
+                                  + ', '.join(f'"{ch.name}"' for ch in skipped_busy_account))
+
+                # The group's lock left nothing eligible and we are recording anyway
+                # (DESIGN-channel-groups-model.md 15.2). Principle 2 says complete the
+                # recording; principle 1 says never hide the damage - so the fact rides
+                # on the recording itself, not only on an alert the user may never open.
+                override_detail = None
+                if selection.override:
+                    got = format_label(format_key(latest_by_channel.get(best.id)))
+                    override_detail = (
+                        f'Recorded from "{best.name}" at {got}. This group is locked to '
+                        f'{format_label(selection.reference)} and no member matched.')
+
+                @retry_on_locked()
+                def _select_group_member_and_commit():
+                    rec.channel_id = best.id
+                    rec.url = normalize_url(best.stream_url, best.account)
+                    add_recording_event(recording_id, GROUP_MEMBER_SELECTED,
+                        detail=(f'Group "{rec.group.name}": recording from "{best.name}" '
+                                f'({best.account.name}, score {effective_score(best)})'
+                                f'{busy_note}'),
+                        extra={'group_id': rec.group_id, 'channel_id': best.id,
+                               'effective_score': effective_score(best),
+                               'took_busy': took_busy,
+                               'skipped_busy_channel_ids': [ch.id for ch in skipped_busy],
+                               'took_busy_account': took_busy_account,
+                               'skipped_busy_account_channel_ids': [
+                                   ch.id for ch in skipped_busy_account]})
+                    if override_detail:
+                        add_recording_event(recording_id, RECORDING_FORMAT_OVERRIDE,
+                            detail=override_detail,
+                            extra={'group_id': rec.group_id, 'channel_id': best.id,
+                                   'locked_format': list(selection.reference),
+                                   'recorded_format': list(
+                                       format_key(latest_by_channel.get(best.id)) or [])})
+                    db.session.commit()
+
+                _select_group_member_and_commit()
+
+                if override_detail:
+                    # Outside the retried closure: create_alert commits separately, so a
+                    # commit retry above must not be able to fire it twice.
+                    from .alerts import create_alert
+                    create_alert(
+                        'RECORDING_FORMAT_OVERRIDE',
+                        f'Recording "{rec.name}" started off the group format',
+                        body=override_detail,
+                        source=f'rec_{recording_id}',
+                        recording_id=recording_id)
+
+        # Case 2: if a recording on this same channel - or the same channel group
+        # (two group recordings may have resolved to different members) - is already
+        # running, this is a planned handoff, not a conflict - gracefully stop it.
+        handoff_from_id = None
+        if rec.channel_id is not None or rec.group_id is not None:
+            same_source = []
+            if rec.channel_id is not None:
+                same_source.append(Recording.channel_id == rec.channel_id)
+            if rec.group_id is not None:
+                same_source.append(Recording.group_id == rec.group_id)
+            old = Recording.query.filter(
+                db.or_(*same_source),
+                Recording.status == REC_STATUS_IN_PROGRESS,
+                Recording.id != recording_id,
+            ).first()
+            if old is not None:
+                log.info('Recording %d: same-channel handoff from recording %d', recording_id, old.id)
+                _handoff_stop_old_recording(app, old.id, recording_id)
+                handoff_from_id = old.id
+
+        cfg = load_config()
+        dvr_dir = cfg['recording']['dvr_output_dir']
+        # Not os.path.isdir(): it answers False for a stale mount too, so a dead NAS
+        # used to fail the recording with "does not exist" and send the operator off to
+        # mkdir a directory that was already there (dev/changelog/723).
+        dvr_probe = probe_dir(dvr_dir)
+        if dvr_probe.outcome != PATH_OK:
+            dvr_reason = describe_dir_problem(dvr_dir, dvr_probe)
+            log.error('Cannot start recording "%s" (#%d): DVR output directory %s', rec.name, recording_id, dvr_reason,
+                      extra={'recording_id': recording_id})
+
+            @retry_on_locked()
+            def _mark_missing_dvr_dir_and_commit():
+                rec.status = REC_STATUS_FAILED
+                rec.completed_at = datetime.utcnow()
+                add_recording_event(recording_id, RECORDING_FAILED,
+                                    detail=f'DVR output directory {dvr_reason}')
+                db.session.commit()
+
+            _mark_missing_dvr_dir_and_commit()
+            from .health_score import dismiss_recording_failing_alerts
+            dismiss_recording_failing_alerts(recording_id)
+            return
+
+        account_id = rec.channel.account_id if (rec.channel_id and rec.channel) else None
+        if account_id is not None:
+            if not _try_acquire_slot_with_preemption(app, recording_id, account_id):
+                _defer_start_for_slot(app, recording_id, account_id)
+                return
+            # Fairness, checked only now that a slot is actually held: yielding on the
+            # mere existence of an earlier waiter would defer this recording even when
+            # the account has slots to spare. at_limit() is advisory and racy by its own
+            # docstring, which is exactly what it is used for here - it orders two
+            # waiters, it never decides whether this recording may connect. The acquire
+            # above already decided that.
+            #
+            # A handoff is exempt: its predecessor released this very slot moments ago at
+            # :404, and yielding it to a third recording would leave the gap the handoff
+            # exists to avoid.
+            if handoff_from_id is None:
+                from . import connection_limits as connlim
+                ahead = _earlier_waiter_for_slot(recording_id, account_id, rec.start_time)
+                if ahead is not None and connlim.at_limit(account_id):
+                    connlim.release(account_id, 'recording', recording_id)
+                    _defer_start_for_slot(app, recording_id, account_id, waiting_on=ahead)
+                    return
+
+        @retry_on_locked()
+        def _mark_in_progress_and_commit():
+            rec.status = REC_STATUS_IN_PROGRESS
+            now = datetime.utcnow()
+            rec.started_at = now
+            if rec.start_time < now and (now - rec.start_time).total_seconds() > 60:
+                late_secs = (now - rec.start_time).total_seconds()
+                log.warning('Recording %d: starting %.0fs after scheduled start (system delay); adjusting start_time',
+                            recording_id, late_secs)
+                from .database import RECORDING_STARTED_LATE
+                add_recording_event(recording_id, RECORDING_STARTED_LATE,
+                                    detail=f'Started {late_secs/60:.1f} min after scheduled time due to system delay; start_time adjusted to actual start')
+                rec.start_time = now
+            if handoff_from_id is not None:
+                add_recording_event(recording_id, RECORDING_HANDOFF,
+                                    detail=f'Started via handoff from recording #{handoff_from_id} on the same channel')
+            _snapshot_channel_health(rec)
+            db.session.commit()
+
+        _mark_in_progress_and_commit()
+        from .health_score import dismiss_recording_failing_alerts
+        dismiss_recording_failing_alerts(recording_id)
+
+        state = RecordingState()
+        with _lock:
+            _active[recording_id] = state
+
+        # 1-based segment numbering for new recordings (DESIGN.md section 5 -
+        # display matches filenames); pre-existing recordings keep 0-based files.
+        _launch_segment(app, recording_id, seg_num=1)
+
+
+def _segment_file_is_growing(path: str, wait_seconds: float = 2.0) -> bool:
+    """Read-only liveness probe: True if `path` grew between two size samples taken
+    wait_seconds apart. Pure stat() reads - never opens or touches the file - so it
+    cannot interfere with whatever process might be writing it (CLAUDE.md: a diagnostic
+    must never be able to harm the capture it is diagnosing). False (not growing) for a
+    missing path or a file that can't be stat'd, which keeps this a no-op for the
+    ordinary post-crash case where nothing is writing any more."""
+    if not path:
+        return False
+    try:
+        before = os.path.getsize(path)
+    except OSError:
+        return False
+    time.sleep(wait_seconds)
+    try:
+        after = os.path.getsize(path)
+    except OSError:
+        return False
+    return after > before
+
+
+def _find_open_segment(recording_id: int):
+    """The highest-numbered segment row still left open (ended_at IS NULL), or None.
+
+    An open row means the process that owned the capture never got to close it - either
+    it is still running right now, or it died without a graceful shutdown. Only the
+    caller's own liveness probe can tell those apart (_segment_file_is_growing)."""
+    return RecordingSegment.query.filter_by(
+        recording_id=recording_id, ended_at=None
+    ).order_by(RecordingSegment.segment_number.desc()).first()
+
+
+def _capture_stopped_at(seg) -> datetime:
+    """Best evidence for when this segment's capture actually stopped.
+
+    The file's mtime is ffmpeg's own last write; utcnow() is only when *we* noticed. The
+    two agree when the app was restarted promptly, and they can be an hour apart when the
+    host itself went down and nothing came back up until well after the recording's stop
+    time (dev/docs/BUGS.md 2026-08-17). Writing "when we noticed" into ended_at inflates
+    the segment's rendered duration by exactly the length of the outage, which is the
+    "number the user cannot explain" case Product Principle 1 exists to prevent.
+
+    Clamped to [started_at, now]: an mtime outside that window is describing something
+    other than this capture (a restored file, a clock that moved), so fall back to now."""
+    now = datetime.utcnow()
+    if not seg.file_path:
+        return now
+    try:
+        mtime = datetime.utcfromtimestamp(os.path.getmtime(seg.file_path))
+    except OSError:
+        return now
+    if seg.started_at and mtime < seg.started_at:
+        return now
+    return min(mtime, now)
+
+
+def _refuse_open_segment_still_growing(recording_id: int, open_seg, action: str):
+    """Shared refusal for "another live process is still writing this segment".
+
+    Two independent create_app() calls against the same DB (e.g. an ad-hoc diagnostic
+    script run against production - dev/docs/BUGS.md 2026-08-14) each start with an empty
+    in-process _active dict, so nothing in memory can tell that another process owns this
+    recording. The file's own growth is the only signal visible across processes.
+
+    `action` names what was refused ('resume', 'concatenate'). The condition and the
+    remedy are identical either way: touching these rows or these files while another
+    process is mid-capture corrupts what it is doing, so nothing is changed here."""
+    log.error(
+        'Recording %d: segment %d is still growing on disk - refusing to %s (another '
+        'process is almost certainly already recording it). No state was changed.',
+        recording_id, open_seg.segment_number, action)
+    from .alerts import create_alert
+    create_alert(
+        'RECORDING_RESUME_REFUSED',
+        title=f'Resume refused - recording #{recording_id} looks already active',
+        body=(f'Startup recovery wanted to {action} recording #{recording_id}, but its '
+              f'open segment ({open_seg.segment_number}) is still growing on disk, so '
+              'another process is almost certainly already recording it. Refused to '
+              'close the segment or launch a second capture; no state was changed. '
+              'This usually means two app instances are running against the same '
+              'database.'),
+        source=f'recording:{recording_id}:resume-refused',
+        recording_id=recording_id,
+    )
+
+    seg_num = open_seg.segment_number
+
+    @retry_on_locked()
+    def _log_resume_refused_and_commit():
+        add_recording_event(
+            recording_id, RECORDING_RESUME_REFUSED,
+            detail=f'Segment {seg_num} is still growing on disk - '
+                   f'refused to {action} (likely a second live process)',
+            segment_number=seg_num)
+        db.session.commit()
+
+    _log_resume_refused_and_commit()
+
+
+def _close_open_segment(recording_id: int, seg_id: int, seg_num: int, detail: str) -> datetime:
+    """Finalize a segment row the crash left open, and return its ended_at.
+
+    Caller must already have proven the file is not still growing."""
+    @retry_on_locked()
+    def _close_open_segment_and_commit():
+        seg = db.session.get(RecordingSegment, seg_id)
+        seg.ended_at = _capture_stopped_at(seg)
+        seg.exit_reason = 'SERVICE_RESTART'
+        if seg.file_path and os.path.exists(seg.file_path):
+            seg.bytes_recorded = os.path.getsize(seg.file_path)
+        add_recording_event(recording_id, SEGMENT_ENDED, detail=detail,
+                            segment_number=seg_num)
+        db.session.commit()
+        return seg.ended_at
+
+    return _close_open_segment_and_commit()
+
+
+def _abandon_raced_segment(recording_id: int, seg_id: int, seg_num: int, seg_path: str):
+    """Release a segment row created after its recording was already torn down.
+
+    Only _launch_segment's `state is None` branch reaches this: the row was committed a moment
+    after a concurrent abort/stop had already closed every open segment, so no other path knows
+    it exists. Left alone it keeps ended_at NULL forever and the detail page's
+    `(seg.ended_at or now)` fallback renders an ever-growing duration for a segment that never
+    captured anything, next to a partial .ts the abort's own delete pass had already walked past.
+
+    The caller has already killed ffmpeg, so the file is not still being written when it goes.
+    """
+    @retry_on_locked()
+    def _close_raced_segment_and_commit():
+        seg = db.session.get(RecordingSegment, seg_id)
+        if seg is None:
+            return
+        seg.ended_at = datetime.utcnow()
+        seg.exit_reason = 'TEARDOWN_RACE'
+        add_recording_event(
+            recording_id, SEGMENT_ENDED,
+            detail=(f'Segment {seg_num} was discarded - the recording was torn down while this '
+                    f'segment was launching, so it captured nothing and its file was deleted'),
+            segment_number=seg_num)
+        db.session.commit()
+
+    _close_raced_segment_and_commit()
+
+    try:
+        os.unlink(seg_path)
+    except FileNotFoundError:
+        pass  # ffmpeg may never have created it - nothing to release
+    except OSError as exc:
+        log.warning('Recording %d seg %d: could not delete the raced segment file %s: %s',
+                    recording_id, seg_num, seg_path, exc)
+
+
+# Outcome of close_open_segment_after_unclean_stop(). `outcome` is one of the three
+# states below and is never inferred from the other fields being None.
+OpenSegmentClose = namedtuple('OpenSegmentClose', 'outcome segment_number stopped_at')
+OPEN_SEG_NOTHING_OPEN = 'nothing_open'   # no row left open; nothing to do
+OPEN_SEG_CLOSED = 'closed'               # row finalized; stopped_at is when capture ended
+OPEN_SEG_REFUSED = 'refused'             # file still growing; nothing was changed
+
+
+def close_open_segment_after_unclean_stop(recording_id: int) -> OpenSegmentClose:
+    """Close a segment row left open because the app died mid-capture, without resuming.
+
+    The recovery half of resume_recording() for callers that are NOT going to record any
+    more (app/scheduler.py's past-stop-time branch, which goes straight to concatenation).
+    Same liveness probe, same exit_reason, same SEGMENT_ENDED event - a segment left open
+    by an unclean stop must not stay open just because the recording's window has already
+    closed (dev/docs/BUGS.md 2026-08-17).
+
+    Requires an app context. A `refused` outcome means another process owns this
+    recording and the caller must not finalize it either."""
+    open_seg = _find_open_segment(recording_id)
+    if open_seg is None:
+        return OpenSegmentClose(OPEN_SEG_NOTHING_OPEN, None, None)
+
+    seg_id, seg_num = open_seg.id, open_seg.segment_number
+    if _segment_file_is_growing(open_seg.file_path):
+        _refuse_open_segment_still_growing(recording_id, open_seg, 'concatenate')
+        return OpenSegmentClose(OPEN_SEG_REFUSED, seg_num, None)
+
+    stopped_at = _close_open_segment(
+        recording_id, seg_id, seg_num,
+        detail=f'Segment {seg_num} closed at service restart (capture had already stopped)')
+    return OpenSegmentClose(OPEN_SEG_CLOSED, seg_num, stopped_at)
+
+
+def resume_recording(app, recording_id: int):
+    """Resume an IN_PROGRESS, PAUSED, or RETRYING recording."""
+    with app.app_context():
+        rec = db.session.get(Recording, recording_id)
+        if rec is None:
+            return
+
+        # Look for a segment left "open" (no ended_at) BEFORE touching status or launching
+        # anything, and probe it read-only before assuming this is a genuine post-crash
+        # resume - see _refuse_open_segment_still_growing() for why growth is the only
+        # signal available here.
+        open_seg = _find_open_segment(recording_id)
+        if open_seg and _segment_file_is_growing(open_seg.file_path):
+            _refuse_open_segment_still_growing(recording_id, open_seg, 'resume')
+            return
+
+        # The slot is taken BEFORE any status write, not after it as this did until
+        # dev/changelog/854. A refusal now has nothing to unwind: the recording stays
+        # PAUSED / RETRYING / IN_PROGRESS-awaiting-resume exactly as it was, and the
+        # re-armed resume job re-enters here. Acquiring after the flip would leave a
+        # recording marked IN_PROGRESS with no slot and no ffmpeg.
+        account_id = rec.channel.account_id if (rec.channel_id and rec.channel) else None
+        if account_id is not None:
+            if not _try_acquire_slot_with_preemption(app, recording_id, account_id):
+                _defer_resume_for_slot(app, recording_id, account_id)
+                return
+
+        if rec.status == REC_STATUS_PAUSED:
+            @retry_on_locked()
+            def _mark_resumed_and_commit():
+                from .database import RECORDING_RESUMED
+                rec.status = REC_STATUS_IN_PROGRESS
+                add_recording_event(recording_id, RECORDING_RESUMED, detail='Recording manually resumed from pause')
+                db.session.commit()
+
+            _mark_resumed_and_commit()
+        elif rec.status == REC_STATUS_RETRYING:
+            @retry_on_locked()
+            def _mark_retry_resumed_and_commit():
+                from .database import RECORDING_RESUMED
+                r = db.session.get(Recording, recording_id)
+                r.status = REC_STATUS_IN_PROGRESS
+                r.next_retry_at = None
+                add_recording_event(recording_id, RECORDING_RESUMED,
+                                    detail=f'Retry attempt {r.dead_stream_retry_count} - reconnecting')
+                db.session.commit()
+
+            _mark_retry_resumed_and_commit()
+
+        # Next segment number comes from this recording's OWN segment rows. Deriving it
+        # from a directory listing of `{safe_name}_seg_*` instead - as this did until
+        # dev/changelog/643 - counted a same-named sibling recording's segment files into
+        # this recording's numbering, because Recording.name is not unique and nothing at
+        # create time makes it so.
+        highest = db.session.query(db.func.max(RecordingSegment.segment_number)).filter(
+            RecordingSegment.recording_id == recording_id).scalar()
+        next_seg = (highest or 0) + 1
+
+        # Close out the segment found open above, if any (left that way by the crash).
+        if open_seg:
+            _close_open_segment(
+                recording_id, open_seg.id, open_seg.segment_number,
+                detail=f'Segment {open_seg.segment_number} closed at service restart')
+
+        state = RecordingState(current_segment_num=next_seg)
+        with _lock:
+            _active[recording_id] = state
+
+        _launch_segment(app, recording_id, seg_num=next_seg)
+
+
+def fire_dead_stream_retry(app, recording_id: int):
+    """Target of the retry_<id> APScheduler job (app/scheduler.py::schedule_dead_stream_retry) -
+    fires after a dead-stream backoff wait. No-ops if the recording moved on in the meantime
+    (aborted/deleted, or somehow already resumed by another path) - status is re-checked fresh
+    rather than assumed from when the job was scheduled, since a wait can be up to an hour.
+
+    Gives up (rather than relaunching) if the recording's own scheduled window ended during the
+    wait - the retry budget having attempts left does not mean there is still anything left to
+    record. Otherwise reuses resume_recording(), the same "bring a non-running recording back to
+    IN_PROGRESS" path already used for a PAUSED resume and for crash recovery.
+    """
+    with app.app_context():
+        rec = db.session.get(Recording, recording_id)
+        if rec is None or rec.status != REC_STATUS_RETRYING:
+            return
+        if rec.stop_time <= datetime.utcnow():
+            from .watchdog import finalize_dead_stream_retry_exhausted
+            finalize_dead_stream_retry_exhausted(
+                app, recording_id, cause='scheduled window ended during the retry wait')
+            return
+        resume_recording(app, recording_id)
+
+
+def _reresolve_channel_url(recording_id: int, cfg: dict) -> None:
+    """Repoint a channel-backed recording's frozen url at its channel's current stream_url.
+
+    Providers rewrite their stream domain and/or the creds embedded in every stream URL with
+    no notice. Sync repairs the Channel row in place (identity is matched on stream_id, not
+    URL), but Recording.url is snapshotted at creation, so without this a SCHEDULED recording
+    made before the drift records from the dead old URL and stall-loops to FAILED.
+
+    Called from _launch_segment because that is the ONLY consumer of rec.url - which makes
+    this one call site cover record start, service-restart resume, and every watchdog segment
+    relaunch (so a sync landing mid-recording rescues a stalling one). Group-backed recordings
+    are excluded: they re-resolve their member at start and have failover_group_member() for
+    the mid-recording case, and both write rec.url themselves. Manual URL-only recordings
+    (channel_id None) have no channel to resolve against and are left alone.
+    """
+    rec = db.session.get(Recording, recording_id)
+    if rec is None or rec.group_id is not None or rec.channel_id is None:
+        return
+    channel = rec.channel
+    if channel is None or not channel.stream_url:
+        return
+
+    from .accounts import normalize_url
+    fresh = normalize_url(channel.stream_url, channel.account, cfg)
+    if fresh == rec.url:
+        return
+
+    stale = rec.url
+
+    @retry_on_locked()
+    def _apply_resolved_url_and_commit():
+        r = db.session.get(Recording, recording_id)
+        r.url = fresh
+        add_recording_event(recording_id, RECORDING_URL_RERESOLVED,
+            detail=(f'Stream URL for channel "{channel.name}" changed since this recording '
+                    f'was created; recording from the channel\'s current URL '
+                    f'({mask_creds(stale)} -> {mask_creds(fresh)})'),
+            extra={'channel_id': channel.id,
+                   'old_url': mask_creds(stale),
+                   'new_url': mask_creds(fresh)})
+        db.session.commit()
+
+    _apply_resolved_url_and_commit()
+    log.info('Recording %d: re-resolved stale stream URL %s -> %s',
+             recording_id, mask_creds(stale), mask_creds(fresh))
+
+
+def _open_segment_stderr_spool(app, recording_id: int, seg_num: int):
+    """Open the file this segment's ffmpeg stderr is spooled to; (path, handle) or (None, None).
+
+    The directory comes from app.config, resolved once in create_app() where config_overrides
+    are honored - never from a runtime load_config(), which reads the real config.yaml and
+    would spool a test's capture stderr into the production directory (BUGS.md 2026-07-18).
+
+    The filename carries a per-attempt token and stale files for this recording are reaped
+    first, both copied from postprocessor.py's conversion spool: on a fixed filename a
+    shutdown that skips the unlink leaves a file the NEXT attempt reads as its own
+    (BUGS.md 2026-07-23). The reap is what covers kill_all_active, which deliberately does no
+    cleanup because it runs in a signal handler.
+
+    Never raises. Returning (None, None) costs the diagnostic, not the recording.
+    """
+    log_dir = app.config.get('CAPTURE_LOG_DIR')
+    if not log_dir:
+        return None, None
+    try:
+        # Listed per id, not as a bare f'{recording_id}*' glob - that would let id 6 reap
+        # id 64's live spool.
+        for stale in glob.glob(os.path.join(log_dir, f'.cap-stderr-{recording_id}-*.log')):
+            try:
+                os.unlink(stale)
+            except OSError:
+                pass  # best-effort reap; the token below is what actually guarantees safety
+        path = os.path.join(log_dir,
+                            f'.cap-stderr-{recording_id}-{seg_num}-{uuid.uuid4().hex[:8]}.log')
+        return path, open(path, 'wb')
+    except OSError as exc:
+        log.warning('Recording %d seg %d: could not open stderr spool in %s: %s - '
+                    'capture continues without diagnostics', recording_id, seg_num, log_dir, exc)
+        return None, None
+
+
+def _discard_stderr_spool(path, fh):
+    """Close and delete a spool whose contents will never be read. Never raises."""
+    if fh is not None:
+        try:
+            fh.close()
+        except OSError:
+            pass  # nothing further to do; the unlink below is what matters
+    if path:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass  # best-effort; the glob reap in _open_segment_stderr_spool collects strays
+
+
+def collect_segment_diagnostics(recording_id: int):
+    """(ffmpeg_exit_code, stderr_tail) for the segment that just ended; releases its spool.
+
+    Call AFTER terminating the process. poll() is read rather than wait()ed, so a child that
+    is somehow still alive yields None - honest, since we genuinely do not know how it ended.
+    A negative code is the signal that killed it (-15 = our own SIGTERM), a positive one is
+    ffmpeg's own error status; that distinction is the whole point, because it separates
+    "we gave up on it" from "it died on us".
+
+    Idempotent: the spool is forgotten here, so a second call returns ('' for the tail).
+    The tail is credential-masked - ffmpeg echoes its input URL on error and those URLs
+    carry the provider username and password in the path.
+
+    Never raises. A diagnostic that can break a teardown path is worse than no diagnostic
+    (CLAUDE.md Product Principle 2).
+    """
+    state = get_state(recording_id)
+    if state is None:
+        return None, ''
+    exit_code = state.process.poll() if state.process is not None else None
+    path, fh = state.stderr_path, state.stderr_fh
+    state.stderr_path, state.stderr_fh = None, None
+    if fh is not None:
+        try:
+            fh.close()
+        except OSError:
+            pass  # the tail read below still tries; a partial spool is better than none
+    tail = ''
+    if path:
+        tail = mask_creds_in_text(read_stderr_tail(path))
+        try:
+            os.unlink(path)
+        except OSError:
+            pass  # best-effort; the glob reap in _open_segment_stderr_spool collects strays
+    return exit_code, tail
+
+
+def record_segment_diagnostics(recording_id: int, seg, exit_code, tail):
+    """Write exit_code onto seg and, when there is something to say, add a DIAGNOSTICS event.
+
+    Inserts only - the CALLER commits. This joins the caller's existing retry_on_locked unit
+    rather than opening a second one: two commits inside one decorated closure can duplicate
+    rows when the first succeeds and the second retries (CLAUDE.md § Agent Behavior).
+
+    The exit code goes in the column and in the event's detail string, NEVER in extra_data -
+    a stat with a column does not also live there (CLAUDE.md § Measurements). extra_data
+    carries only the stderr tail, which has no column because nothing sorts on a blob.
+
+    Stays quiet when the exit is uninformative: a negative code is a signal we sent, which
+    seg.exit_reason already names, so with no stderr to show there is nothing an event would
+    add that the segment row does not already say.
+    """
+    if seg is not None:
+        seg.ffmpeg_exit_code = exit_code
+    if not tail and not (exit_code is not None and exit_code > 0):
+        return
+    seg_num = seg.segment_number if seg is not None else None
+    if exit_code is None:
+        code_str = 'ffmpeg exit code unknown'
+    elif exit_code < 0:
+        code_str = f'ffmpeg killed by signal {-exit_code}'
+    else:
+        code_str = f'ffmpeg exited {exit_code}'
+    detail = f'Segment {seg_num} capture ended: {code_str}' if seg_num is not None \
+        else f'Capture ended: {code_str}'
+    add_recording_event(recording_id, DIAGNOSTICS, detail=detail, segment_number=seg_num,
+                        extra={'kind': 'capture_stderr', 'stderr_tail': tail} if tail
+                              else {'kind': 'capture_stderr'})
+
+
+def _launch_segment(app, recording_id: int, seg_num: int):
+    """Spawn a new ffmpeg process for segment seg_num and start the watchdog."""
+    with app.app_context():
+        cfg = load_config()
+        _reresolve_channel_url(recording_id, cfg)
+        rec = db.session.get(Recording, recording_id)
+        dvr_dir = cfg['recording']['dvr_output_dir']
+        safe_name = _safe_name(rec.name)
+        # The recording id is in the filename because Recording.name is not unique: two
+        # same-named recordings capturing at once would otherwise be handed the identical
+        # segment path and run two ffmpegs writing the same file (dev/changelog/643). It is
+        # safe to expose here in a way it is not for the final output - segments are
+        # internal, and a successful concat deletes them.
+        seg_path = os.path.join(dvr_dir, f'{safe_name}_{recording_id}_seg_{seg_num:03d}.ts')
+
+        # -re only when segment_duration_seconds bounds this segment: -t is a content-time
+        # limit and -re is what makes it a wall-clock one, so a configured segment length
+        # without pacing would be satisfied from a provider's backlog in seconds and spin
+        # us through reconnects. Unbounded (the default, and today's config) captures
+        # without it - see build_capture_cmd's flag comment and dev/changelog/437.
+        segment_duration = cfg['recording']['segment_duration_seconds']
+        cmd = build_capture_cmd(cfg, rec.url, seg_path, segment_duration,
+                                pace_realtime=bool(segment_duration))
+        log.info('Recording %d seg %d: %s', recording_id, seg_num,
+                 mask_creds_in_text(' '.join(cmd)))
+
+        stderr_path, stderr_fh = _open_segment_stderr_spool(app, recording_id, seg_num)
+
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                # Never a pipe: an undrained 64KB pipe buffer deadlocked every recording in
+                # this app at ~7.8 minutes (CLAUDE.md subprocess discipline). A plain file
+                # needs no reader thread and cannot block the child. DEVNULL when the spool
+                # could not be opened - capture always outranks its own diagnostics.
+                stderr=(stderr_fh or subprocess.DEVNULL),
+            )
+        except Exception as exc:
+            log.error('Recording "%s" (#%d): failed to launch ffmpeg: %s', rec.name, recording_id, exc,
+                      extra={'recording_id': recording_id})
+            # No child was spawned, so nothing will ever be written to the spool and no
+            # terminal path below will run to clean it up - release it here.
+            _discard_stderr_spool(stderr_path, stderr_fh)
+            # Same thresholds the watchdog resolves for its own restarts, so a recording
+            # profile's overrides apply to a failed spawn exactly as they do to a stall.
+            from .watchdog import _resolve_watchdog_thresholds
+            _, restart_delay, max_failures = _resolve_watchdog_thresholds(cfg, recording_id)
+            if _handle_launch_failure(app, recording_id, seg_num, str(exc),
+                                      max_failures, restart_delay):
+                # A give-up here is terminal, so it owes the same releases every other
+                # terminal path performs. Outside _handle_launch_failure's retried
+                # closure, mirroring how _fail_recording releases after
+                # _mark_recording_failed commits (dev/changelog/731).
+                if rec.channel_id and rec.channel:
+                    from . import connection_limits as connlim
+                    connlim.release(rec.channel.account_id, 'recording', recording_id)
+                from .health_score import apply_recording_health_observation
+                apply_recording_health_observation(app, recording_id, 'failed')
+            else:
+                # Non-idempotent side effects, so they follow the commit rather than
+                # sitting inside _handle_launch_failure's retried closure.
+                ev.publish(recording_id, RESTART_ATTEMPTED, {
+                    'delay': restart_delay,
+                    'segment_number': seg_num,
+                })
+                _schedule_launch_retry(app, recording_id, seg_num, restart_delay)
+            return
+
+        # Create segment row. Only this DB tail is wrapped in retry_on_locked - proc
+        # is already spawned above, so retrying must never re-run Popen (that would
+        # launch a second ffmpeg for the same segment).
+        @retry_on_locked()
+        def _record_segment_started_and_commit():
+            seg = RecordingSegment(
+                recording_id=recording_id,
+                channel_id=rec.channel_id,
+                segment_number=seg_num,
+                file_path=seg_path,
+                started_at=datetime.utcnow(),
+                stall_count=0,
+            )
+            db.session.add(seg)
+            add_recording_event(recording_id, SEGMENT_STARTED,
+                                detail=f'Segment {seg_num} started, pid={proc.pid}',
+                                segment_number=seg_num)
+            db.session.commit()
+            return seg.id
+
+        seg_id = _record_segment_started_and_commit()
+
+        state = get_state(recording_id)
+        if state is None:
+            # A teardown ran concurrently: it closed every open segment and popped _active
+            # BEFORE the row above was committed, so nothing else will ever close this one.
+            # Releasing it here is the create path's own teardown obligation - the kill and
+            # the unlink stay outside the retried closure, since neither is idempotent.
+            terminate_or_kill(proc, hard=True)
+            _discard_stderr_spool(stderr_path, stderr_fh)
+            _abandon_raced_segment(recording_id, seg_id, seg_num, seg_path)
+            return
+
+        state.process = proc
+        state.current_segment_num = seg_num
+        # The previous segment's spool is closed and unlinked by whichever terminal path
+        # ended it, which always runs before the next _launch_segment. Overwriting a
+        # non-None value here would therefore leak a file - assert the invariant loudly
+        # rather than silently dropping the handle.
+        if state.stderr_fh is not None or state.stderr_path:
+            log.warning('Recording %d seg %d: previous stderr spool was not released (%s) - '
+                        'discarding it now', recording_id, seg_num, state.stderr_path)
+            _discard_stderr_spool(state.stderr_path, state.stderr_fh)
+        state.stderr_fh = stderr_fh
+        state.stderr_path = stderr_path
+
+        ev.publish(recording_id, SEGMENT_STARTED, {
+            'segment_number': seg_num,
+            'file_path': seg_path,
+            'pid': proc.pid,
+        })
+
+        # Start (or restart) watchdog
+        if state.watchdog is None or not state.watchdog.is_alive():
+            from .watchdog import WatchdogThread
+            state.watchdog = WatchdogThread(recording_id, state, app)
+            state.watchdog.daemon = True
+            state.watchdog.start()
+
+
+def _teardown_active_ffmpeg(app, recording_id: int, exit_reason: str, hard_kill: bool = False) -> bool:
+    """Terminate ffmpeg (if running; hard_kill skips straight to SIGKILL), close the
+    active segment, pop from _active, and release any held connection-limit slot.
+    Does NOT touch Recording.status and does NOT start concatenation - callers do
+    both afterward. Returns True if there was live state to tear down, False if
+    _active had no entry."""
+    state = get_state(recording_id)
+    if state is None:
+        return False
+    state.stop_event.set()
+
+    proc = state.process
+    if proc and proc.poll() is None:
+        log.info('Recording %d: stopping ffmpeg (pid=%d) reason=%s', recording_id, proc.pid, exit_reason)
+        terminate_or_kill(proc, hard=hard_kill)
+
+    # Finalise the active segment
+    _close_active_segment(app, recording_id, exit_reason=exit_reason)
+
+    with _lock:
+        _active.pop(recording_id, None)
+
+    rec = db.session.get(Recording, recording_id)
+    if rec is not None and rec.channel_id and rec.channel:
+        from . import connection_limits as connlim
+        connlim.release(rec.channel.account_id, 'recording', recording_id)
+
+    return True
+
+
+def _handoff_stop_old_recording(app, old_recording_id: int, new_recording_id: int):
+    """Case 2: gracefully stop an old same-channel recording so a new one can
+    start immediately. Reuses the synchronous teardown from stop_recording();
+    concatenation continues in the background exactly as a normal clean stop -
+    old_rec.status flows through CONCATENATING -> COMPLETED, never FAILED/ABORTED.
+    """
+    _teardown_active_ffmpeg(app, old_recording_id, exit_reason='RECORDING_HANDOFF')
+
+    @retry_on_locked()
+    def _log_old_handoff_and_commit():
+        add_recording_event(old_recording_id, RECORDING_HANDOFF,
+                            detail=f'Handed off to new recording #{new_recording_id} on the same channel')
+        db.session.commit()
+
+    _log_old_handoff_and_commit()
+
+    from .concatenator import do_concatenation
+    threading.Thread(target=do_concatenation, args=(app, old_recording_id), daemon=True).start()
+    ev.publish(old_recording_id, RECORDING_HANDOFF, {'handed_off_to': new_recording_id})
+
+
+def recording_format_pin(recording_id: int):
+    """The format this recording is committed to for the rest of its run - the
+    format_key of the EARLIEST segment that carries a capture-time probe
+    (DESIGN-channel-groups-model.md 5.1, DECIDED 12). None when no segment has been
+    probed yet, which reads as "not pinned": unknown is never treated as different.
+
+    Derived, never stored. The segment rows are the record, so the pin costs no column
+    and survives a service restart - a restart mid-recording that forgot the pin would
+    silently drop the constraint on exactly the long recording that needs it most.
+
+    Earliest *probed*, not literally segment 1: a segment that never carried enough data
+    to probe also carries no data into the concatenated file, so what the output actually
+    opens as is the first segment that did. Requires an app context."""
+    seg = (RecordingSegment.query
+           .filter(RecordingSegment.recording_id == recording_id,
+                   RecordingSegment.probe_resolution.isnot(None),
+                   RecordingSegment.probe_fps.isnot(None))
+           .order_by(RecordingSegment.segment_number.asc())
+           .first())
+    return segment_format_key(seg)
+
+
+def _pin_eligible_members(members, pin, latest_by_channel):
+    """Filter failover candidates down to the recording's format pin, returning
+    (members, pin_override). Composes with format_eligible_members() rather than
+    replacing it: the lock is the group's standing rule, the pin is this run's, and a
+    recording can be constrained by the pin while its group manages no format at all.
+
+    Same three rules as the lock filter, for the same reasons (channel_groups.py::
+    format_eligible_members): no pin filters nothing, an untested candidate is never
+    filtered out, and zero survivors is an override rather than a skip. That last one is
+    measured rather than assumed - a mid-file format change concatenates and converts
+    without error on this machine (dev/changelog/754), so refusing a failover over it
+    would trade a complete recording for an incomplete one to avoid damage ffmpeg
+    absorbs. Principle 2 wins; principle 1 is served by naming the change, which
+    app/watchdog.py does off the next segment's own probe."""
+    if pin is None:
+        return list(members), False
+    keep = []
+    for ch in members:
+        key = format_key(latest_by_channel.get(ch.id))
+        if key is None or key == pin:
+            keep.append(ch)
+    if not keep and members:
+        return list(members), True
+    return keep, False
+
+
+def failover_group_member(app, recording_id: int, reason: str) -> bool:
+    """Switch a group-backed recording to its next-best untried member after its
+    active feed died (failed restart / dead-stream trip / max consecutive
+    failures - the watchdog's three give-up points). Returns True if switched -
+    the caller relaunches a segment and keeps going - or False when the recording
+    isn't group-backed or every member has already failed, in which case the
+    caller falls through to its normal abort path.
+
+    Only rewrites channel_id/url and swaps connection slots; the caller owns
+    killing/launching ffmpeg (this keeps every non-idempotent side effect out of
+    the retry-wrapped DB closure below).
+    """
+    with app.app_context():
+        rec = db.session.get(Recording, recording_id)
+        if rec is None or rec.group_id is None or rec.group is None:
+            return False
+        state = get_state(recording_id)
+        if state is None:
+            return False
+
+        old_channel = rec.channel
+        if rec.channel_id is not None:
+            state.failed_member_ids.add(rec.channel_id)
+
+        cfg = load_config()
+        streak_threshold = cfg.get('channel_testing', {}).get(
+            'failing_streak_threshold', DEFAULT_FAILING_STREAK_THRESHOLD)
+        # Members whose feed already died this run are dropped BEFORE either format
+        # filter, not merely excluded from the ranking afterwards. Both filters treat
+        # "zero survivors" as the override that keeps the recording alive (15.2), and a
+        # survivor that has already failed is not one - counting it suppresses the
+        # override and aborts a recording that had a working member left
+        # (dev/docs/BUGS.md 2026-08-19, dev/changelog/754).
+        members = [ch for ch in recording_members(rec.group.memberships)
+                   if ch.id not in state.failed_member_ids]
+        from .routes.channel_tests import _latest_tests_by_channel
+        latest_by_channel = _latest_tests_by_channel([ch.id for ch in members])
+        # Same filter as record start, so a failover cannot land on a format the group
+        # would have refused to start on. When the lock leaves nothing, it hands back the
+        # unfiltered list rather than an empty one - a live capture is never abandoned to
+        # a format rule (15.2, principle 2).
+        selection = format_eligible_members(rec.group, members, latest_by_channel)
+        members = selection.members
+        # Then this run's own constraint: a recording does not change format mid-run
+        # (DECIDED 12). Independent of the lock - it holds even when the group manages no
+        # format - and applied after it, so the lock's survivors are what the pin ranks
+        # over rather than the other way round.
+        pin = recording_format_pin(recording_id)
+        members, pin_override = _pin_eligible_members(members, pin, latest_by_channel)
+        busy = _busy_channel_ids(recording_id)
+        # Prefer a member whose account can actually take the swap. The cross-account
+        # branch below refuses rather than exceeding the target's limit
+        # (dev/changelog/854), so without this the ranking sends the failover straight
+        # into that refusal while an idle account sits a row lower (dev/changelog/855).
+        # Applied after both format filters, so it cannot pre-empt their own
+        # zero-survivors overrides.
+        busy_account = _busy_account_channel_ids(members, recording_id)
+        best = pick_best_member(members, latest_by_channel,
+                                exclude_ids=busy | busy_account,
+                                streak_threshold=streak_threshold)
+        if best is None:
+            best = pick_best_member(members, latest_by_channel, exclude_ids=busy,
+                                    streak_threshold=streak_threshold)
+        if best is None:
+            # Every untried member is busy - knowingly take the best busy one rather
+            # than abort (busy-member skip rule; no handoff fires mid-recording, so
+            # both recordings share the feed's provider connection).
+            best = pick_best_member(members, latest_by_channel,
+                                    streak_threshold=streak_threshold)
+        took_busy = best is not None and best.id in busy
+        took_busy_account = best is not None and best.id in busy_account
+        if best is None:
+            log.warning('Recording %d: group "%s" has no untried members left (%s)',
+                        recording_id, rec.group.name, reason)
+            return False
+        # `members` already excludes the failed ones (see above), so this is only the
+        # busy-and-not-chosen filter.
+        skipped_busy = [ch for ch in members if ch.id in busy and ch.id != best.id]
+        skipped_busy_account = [ch for ch in members if ch.id in busy_account
+                                and ch.id not in busy and ch.id != best.id]
+
+        # Cross-account switch: swap connection slots. The acquire can now refuse rather
+        # than exceed the target account's limit (dev/changelog/854), so the release is
+        # undone when it does - re-acquiring the slot this same recording released a line
+        # earlier cannot fail, which is what keeps a live recording from ever being left
+        # holding no slot at all.
+        #
+        # Refusing the swap is the whole answer here, and deliberately not a wait: this
+        # runs on the watchdog thread with the capture already dead, and blocking it would
+        # stall the recording's own supervision. Returning False drops the caller into its
+        # existing dead-stream retry/abort path, which is itself a wait-and-retry loop and
+        # re-enters this function with the accounts re-read.
+        old_account_id = old_channel.account_id if old_channel else None
+        if old_account_id is not None and best.account_id != old_account_id:
+            from . import connection_limits as connlim
+            connlim.release(old_account_id, 'recording', recording_id)
+            if not _try_acquire_slot_with_preemption(app, recording_id, best.account_id):
+                connlim.try_acquire(old_account_id, 'recording', recording_id)
+                log.warning('Recording %d: cannot fail over to "%s" - account "%s" is at its '
+                            'connection limit and every slot is held by another recording; '
+                            'not exceeding it (%s)',
+                            recording_id, best.name, best.account.name, reason)
+
+                @retry_on_locked()
+                def _log_failover_blocked_and_commit():
+                    add_recording_event(
+                        recording_id, DIAGNOSTICS,
+                        detail=(f'Failover to "{best.name}" was held back: account '
+                                f'"{best.account.name}" is at its connection limit and every '
+                                f'slot is held by another recording. The recording was not '
+                                f'moved rather than opening a connection over the limit.'),
+                        extra={'kind': 'failover_blocked_by_connection_limit',
+                               'group_id': rec.group_id, 'to_channel_id': best.id,
+                               'to_account_id': best.account_id})
+                    db.session.commit()
+
+                _log_failover_blocked_and_commit()
+                return False
+
+        from .accounts import normalize_url
+        old_name = old_channel.name if old_channel else '?'
+        if took_busy:
+            busy_note = (' - channel is busy with another recording but no free '
+                         'untried channel exists; taking it anyway')
+        elif skipped_busy:
+            busy_note = (' - skipped busy channel(s): '
+                         + ', '.join(f'"{ch.name}"' for ch in skipped_busy))
+        else:
+            busy_note = ''
+        if took_busy_account:
+            busy_note += (' - no untried member sits on an account with a free '
+                          'connection slot')
+        elif skipped_busy_account:
+            busy_note += (' - rolled over to a free account, past: '
+                          + ', '.join(f'"{ch.name}"' for ch in skipped_busy_account))
+        override_note = ''
+        if selection.override:
+            override_note = (f' - no member matches the locked format '
+                             f'{format_label(selection.reference)}, so the lock was '
+                             f'overridden to keep the recording going')
+        if pin_override:
+            override_note += (f' - no member is still recording at {format_label(pin)}, '
+                              f'so this recording changes format part-way through rather '
+                              f'than stopping here')
+        detail = (f'Group "{rec.group.name}": feed "{old_name}" died ({reason}) - '
+                  f'failing over to "{best.name}" ({best.account.name}, '
+                  f'score {effective_score(best)}){busy_note}{override_note}')
+        log.warning('Recording %d: %s', recording_id, detail)
+
+        @retry_on_locked()
+        def _switch_member_and_commit():
+            rec.channel_id = best.id
+            rec.url = normalize_url(best.stream_url, best.account)
+            rec.consecutive_failures = 0
+            add_recording_event(recording_id, GROUP_FAILOVER, detail=detail,
+                extra={'group_id': rec.group_id, 'reason': reason,
+                       'from_channel_id': old_channel.id if old_channel else None,
+                       'to_channel_id': best.id,
+                       'to_effective_score': effective_score(best),
+                       'took_busy': took_busy,
+                       'skipped_busy_channel_ids': [ch.id for ch in skipped_busy],
+                       'took_busy_account': took_busy_account,
+                       'skipped_busy_account_channel_ids': [
+                           ch.id for ch in skipped_busy_account],
+                       'format_pin': list(pin) if pin else None,
+                       'pin_override': pin_override,
+                       # Cumulative counters through the just-abandoned member - lets the
+                       # terminal observation score the final member from only its own share
+                       # (health_score.py::apply_recording_health_observation). Snapshotted
+                       # before the consecutive_failures reset below.
+                       'counters_at_failover': {
+                           'total_stall_count': rec.total_stall_count or 0,
+                           'total_restart_count': rec.total_restart_count or 0,
+                           'consecutive_failures_peak': rec.consecutive_failures_peak or 0,
+                           'total_downtime_seconds': rec.total_downtime_seconds or 0,
+                       }})
+            db.session.commit()
+
+        _switch_member_and_commit()
+
+        # The abandoned feed demonstrably died mid-recording - real quality signal
+        # for that member, independent of the recording's own terminal observation.
+        if old_channel is not None:
+            from .health_score import apply_failover_health_observation
+            apply_failover_health_observation(app, old_channel.id, recording_id, reason=reason)
+
+        ev.publish(recording_id, GROUP_FAILOVER, {
+            'group_id': rec.group_id,
+            'from_channel': old_name,
+            'to_channel': best.name,
+            'reason': reason,
+        })
+        return True
+
+
+def _preempt_sync_for_recording(recording_id: int, account_id: int):
+    """Cancel an in-flight sync on this account (DESIGN-concurrency.md 5.3, gap G11).
+
+    A sync's HTTP fetch can count against the account's provider connection limit, and
+    recordings always win. Deliberately unconditional rather than gated on the slot
+    acquire failing: sync holds no connection slot, so a successful acquire proves
+    nothing about a sync being in flight.
+
+    Never waits on the sync thread - the stop event makes it abandon promptly, and a
+    recording must not block on anything. The cancelled sync self-heals at its next
+    interval fire.
+    """
+    from .database import Account
+    account = db.session.get(Account, account_id)
+    if account is None or account.status != 'SYNCING':
+        return
+
+    from .accounts import cancel_sync
+    result = cancel_sync(account_id, reason='Cancelled - a recording needed this account')
+    if result == 'cancelled':
+        log.warning('Recording %d: cancelled in-flight sync on account %d (%s) - recordings win',
+                    recording_id, account_id, account.name)
+    else:
+        # 'reset': SYNCING status with no live thread, i.e. stale state from a crash.
+        # Nothing to preempt; the next sync clears it.
+        log.info('Recording %d: account %d (%s) was marked SYNCING with no live sync thread',
+                 recording_id, account_id, account.name)
+
+
+def _try_acquire_slot_with_preemption(app, recording_id: int, account_id: int) -> bool:
+    """Acquire a connection slot on account_id for this recording, or return False.
+
+    Recordings still always win over the two actors that do not hold a stream open on
+    the user's behalf: an in-flight sync on this account is cancelled, and a running
+    channel test is preempted so the recording can take its slot. What this will NOT do
+    is exceed the account's limit. When every slot is held by another *recording*, it
+    returns False and the caller waits for one to free
+    (dev/docs/DESIGN-concurrency.md 1 doctrine 1, amended - dev/changelog/854).
+
+    The limit is a provider-side ceiling, so crossing it risks the whole account rather
+    than this one recording: a provider that throttles or bans over concurrent-connection
+    abuse takes down every channel on it, including the recording already running
+    legitimately. That is the clause CLAUDE.md principle 2 already carried - complete the
+    recording, "never by hammering a provider hard enough to risk the account".
+    """
+    _preempt_sync_for_recording(recording_id, account_id)
+
+    from . import connection_limits as connlim
+    if connlim.try_acquire(account_id, 'recording', recording_id):
+        return True
+    preempted = connlim.preempt_tests_for_slot(account_id)
+    for _channel_id in preempted:
+        from . import channel_tester
+        channel_tester.kill_active_test_for_account(app, account_id)
+        log.warning('Recording %d: preempted a running channel test on account %d',
+                    recording_id, account_id)
+    return connlim.try_acquire(account_id, 'recording', recording_id)
+
+
+def _earlier_waiter_for_slot(recording_id: int, account_id: int, start_time: datetime):
+    """The recording that has been waiting longer than this one for a slot on account_id.
+
+    Fairness for the wait loop: without an ordering rule, whichever waiter happens to
+    poll first when a slot frees takes it, and the recording that has been waiting
+    longest can be starved indefinitely by later arrivals. A waiter is a SCHEDULED
+    recording on this account whose own start time has passed and whose window is still
+    open - i.e. its start job has fired at least once and deferred. Ordered on
+    (start_time, id) so two recordings scheduled for the same instant still have a total
+    order rather than each yielding to the other forever.
+
+    Bounded by construction: the recording ahead can only hold this one back until its
+    own stop_time passes, at which point it stops matching.
+    """
+    now = datetime.utcnow()
+    return (Recording.query
+            .join(Channel, Recording.channel_id == Channel.id)
+            .filter(Channel.account_id == account_id,
+                    Recording.status == REC_STATUS_SCHEDULED,
+                    Recording.id != recording_id,
+                    Recording.start_time <= now,
+                    Recording.stop_time > now,
+                    db.or_(Recording.start_time < start_time,
+                           db.and_(Recording.start_time == start_time,
+                                   Recording.id < recording_id)))
+            .order_by(Recording.start_time, Recording.id)
+            .first())
+
+
+def _slot_wait_reason(account_id: int, waiting_on=None) -> str:
+    """Plain-language why-this-recording-is-waiting, shared by every surface that says so.
+
+    Written once here rather than at each site so the event, the alert and the log line
+    cannot drift into describing the wait three different ways.
+    """
+    from .database import Account
+    account = db.session.get(Account, account_id)
+    account_name = account.name if account else f'#{account_id}'
+    if waiting_on is not None:
+        return (f'recording "{waiting_on.name}" (#{waiting_on.id}) has been waiting longer '
+                f'for a connection slot on account "{account_name}"')
+    return (f'every connection slot on account "{account_name}" is in use by another '
+            f'recording')
+
+
+def _note_slot_wait_once(recording_id: int, account_id: int, why: str, waiting_on=None):
+    """Write the deferral event and its alert the FIRST time this recording waits.
+
+    The wait re-enters every SLOT_WAIT_POLL_SECONDS, so writing these per attempt would
+    bury the recording's real history under identical rows. Keyed on the reason rather
+    than the event type alone: a recording can legitimately defer once for a conversion
+    collision and once for a connection slot, and both facts are worth having.
+    """
+    already = [e for e in RecordingEvent.query.filter_by(
+        recording_id=recording_id, event_type=RECORDING_START_DEFERRED).all()
+        if 'connection_limit' in (e.extra_data or '')]
+    if already:
+        return
+
+    @retry_on_locked()
+    def _mark_slot_deferred_and_commit():
+        add_recording_event(
+            recording_id, RECORDING_START_DEFERRED,
+            detail=(f'Start deferred: {why}. Waiting for a slot rather than exceeding the '
+                    f'account\'s connection limit - will start as soon as one frees, if '
+                    f'this recording\'s window is still open.'),
+            extra={'kind': 'connection_limit', 'account_id': account_id,
+                   'waiting_on_recording_id': waiting_on.id if waiting_on else None})
+        db.session.commit()
+
+    _mark_slot_deferred_and_commit()
+    rec = db.session.get(Recording, recording_id)
+    rec_name = rec.name if rec else f'#{recording_id}'
+    from .alerts import create_alert
+    create_alert(
+        'RECORDING_WAITING_FOR_CONNECTION_SLOT',
+        f'Recording waiting for a connection slot: {rec_name}',
+        body=(f'Recording "{rec_name}" (#{recording_id}) has not started because {why}. It '
+              f'will start as soon as a slot frees, provided its own scheduled window has '
+              f'not ended by then. Nothing is being recorded in the meantime.'),
+        source=f'account:{account_id}:slot-wait',
+        recording_id=recording_id,
+    )
+
+
+def _defer_start_for_slot(app, recording_id: int, account_id: int, waiting_on=None):
+    """Hold a SCHEDULED recording that cannot have a connection slot yet, or fail it loudly.
+
+    Same shape as the mp4-conversion collision defer in start_recording, and for the same
+    reason: re-arming the start job costs no thread and no new status, and each retry
+    re-enters start_recording from the top so the group member, the handoff check and the
+    slot acquire are all re-decided against current state rather than replayed.
+
+    `waiting_on` is the recording ahead of this one in the queue, when the wait is the
+    fairness yield rather than a full account.
+    """
+    now = datetime.utcnow()
+    rec = db.session.get(Recording, recording_id)
+    if rec is None:
+        return
+    why = _slot_wait_reason(account_id, waiting_on)
+
+    if rec.stop_time <= now:
+        log.error('Recording "%s" (#%d): %s, and this recording\'s own stop time passed '
+                  'while it waited - giving up', rec.name, recording_id, why,
+                  extra={'recording_id': recording_id})
+
+        @retry_on_locked()
+        def _fail_slot_wait_and_commit():
+            r = db.session.get(Recording, recording_id)
+            r.status = REC_STATUS_FAILED
+            r.completed_at = now
+            add_recording_event(
+                recording_id, RECORDING_FAILED,
+                detail=(f'Never started: {why}, so starting would have exceeded the '
+                        f'account\'s connection limit. Waited for a free slot instead, and '
+                        f'this recording\'s own window ended first'))
+            db.session.commit()
+
+        _fail_slot_wait_and_commit()
+        from .health_score import dismiss_recording_failing_alerts
+        dismiss_recording_failing_alerts(recording_id)
+        from .alerts import create_alert
+        create_alert(
+            'RECORDING_FAILED_CONNECTION_LIMIT',
+            f'Recording failed: {rec.name}',
+            body=(f'Recording "{rec.name}" (#{recording_id}) never started: {why}. It waited '
+                  f'for a slot rather than opening a connection the account is not entitled '
+                  f'to, and its own scheduled window ended first.'),
+            source='recorder', recording_id=recording_id,
+        )
+        return
+
+    _note_slot_wait_once(recording_id, account_id, why, waiting_on)
+    log.info('Recording %d: deferring start - %s', recording_id, why)
+    from .scheduler import reschedule_recording_start
+    reschedule_recording_start(
+        recording_id, now + timedelta(seconds=SLOT_WAIT_POLL_SECONDS))
+
+
+def _defer_resume_for_slot(app, recording_id: int, account_id: int) -> None:
+    """Hold a recording that is resuming (crash recovery, unpause, dead-stream retry) but
+    cannot have a connection slot yet.
+
+    Unlike the SCHEDULED path this writes no terminal state when the window has passed:
+    the recording's own stop_<id> job fires at stop_time independently and concatenates
+    whatever was already captured, which is the right answer for a recording that has
+    segments on disk (principle 2 - salvage what exists). All this owes the user is to
+    stop re-arming and say why.
+    """
+    now = datetime.utcnow()
+    rec = db.session.get(Recording, recording_id)
+    if rec is None:
+        return
+    why = _slot_wait_reason(account_id)
+
+    if rec.stop_time <= now:
+        log.error('Recording "%s" (#%d): %s, and its window ended before a slot freed - '
+                  'not resuming; whatever was already captured is finalized by its stop job',
+                  rec.name, recording_id, why, extra={'recording_id': recording_id})
+        _note_slot_wait_once(recording_id, account_id, why)
+        return
+
+    _note_slot_wait_once(recording_id, account_id, why)
+    log.info('Recording %d: deferring resume - %s', recording_id, why)
+    from .scheduler import reschedule_recording_resume
+    reschedule_recording_resume(
+        recording_id, now + timedelta(seconds=SLOT_WAIT_POLL_SECONDS))
+
+
+@retry_on_locked()
+def _log_manual_stop_and_commit(recording_id: int):
+    """MANUAL_STOP bookkeeping: pull stop_time back to now when stopping early, and
+    log the manual-stop event. Re-fetches the row inside the retry unit."""
+    from .database import RECORDING_MANUALLY_STOPPED, RECORDING_STOPPED_EARLY
+    rec = db.session.get(Recording, recording_id)
+    if rec is None:
+        return
+    now = datetime.utcnow()
+    if rec.stop_time > now and (rec.stop_time - now).total_seconds() > 60:
+        early_secs = (rec.stop_time - now).total_seconds()
+        log.info('Recording %d: stopped %.0fs before scheduled end; adjusting stop_time',
+                 recording_id, early_secs)
+        add_recording_event(recording_id, RECORDING_STOPPED_EARLY,
+                            detail=f'Stopped {early_secs/60:.1f} min before scheduled end; stop_time updated to actual stop')
+        rec.stop_time = now
+    add_recording_event(recording_id, RECORDING_MANUALLY_STOPPED,
+                        detail='Recording manually stopped by user')
+    db.session.commit()
+
+
+def stop_recording(app, recording_id: int, reason: str = 'STOP_TIME_REACHED'):
+    """Signal the watchdog to stop and kill the current ffmpeg process."""
+    with app.app_context():
+        had_state = _teardown_active_ffmpeg(app, recording_id, exit_reason=reason)
+
+        if not had_state:
+            # May already be done, paused, or waiting on a dead-stream retry; concat only
+            # applies while the recording is still alive in one of those senses. RETRYING has
+            # no active ffmpeg either (same as PAUSED), so it reaches this branch too.
+            rec = db.session.get(Recording, recording_id)
+            if not (rec and rec.status in (REC_STATUS_IN_PROGRESS, REC_STATUS_PAUSED, REC_STATUS_RETRYING)):
+                return
+
+        if reason == 'MANUAL_STOP':
+            _log_manual_stop_and_commit(recording_id)
+
+        from .concatenator import do_concatenation
+        threading.Thread(
+            target=do_concatenation, args=(app, recording_id), daemon=True
+        ).start()
+
+
+def abort_recording(app, recording_id: int):
+    """Cancel an in-progress or scheduled recording."""
+    with app.app_context():
+        _teardown_active_ffmpeg(app, recording_id, exit_reason='MANUAL_CANCEL', hard_kill=True)
+
+        rec = db.session.get(Recording, recording_id)
+        if rec:
+            from .database import RECORDING_ABORTED
+            from .scheduler import unschedule_recording
+
+            @retry_on_locked()
+            def _mark_aborted_and_commit():
+                add_recording_event(recording_id, RECORDING_ABORTED, detail='Recording manually cancelled')
+                now = datetime.utcnow()
+                rec.status = REC_STATUS_ABORTED
+                rec.stop_time = now
+                rec.completed_at = now
+                db.session.commit()
+
+            _mark_aborted_and_commit()
+            unschedule_recording(recording_id)
+            from .health_score import dismiss_recording_failing_alerts
+            dismiss_recording_failing_alerts(recording_id)
+
+        ev.publish(recording_id, 'RECORDING_ABORTED', {'status': REC_STATUS_ABORTED})
+
+
+def pause_recording(app, recording_id: int):
+    """Pause an in-progress recording: stop ffmpeg, keep files, no concatenation."""
+    with app.app_context():
+        _teardown_active_ffmpeg(app, recording_id, exit_reason='MANUAL_PAUSE')
+
+        rec = db.session.get(Recording, recording_id)
+        if rec:
+            from .database import RECORDING_PAUSED
+
+            @retry_on_locked()
+            def _mark_paused_and_commit():
+                add_recording_event(recording_id, RECORDING_PAUSED, detail='Recording manually paused')
+                rec.status = REC_STATUS_PAUSED
+                db.session.commit()
+
+            _mark_paused_and_commit()
+
+        ev.publish(recording_id, 'RECORDING_PAUSED', {'status': REC_STATUS_PAUSED})
+
+
+@retry_on_locked()
+def _handle_launch_failure(app, recording_id, seg_num, error_msg, max_failures, restart_delay):
+    """Called when Popen itself fails (ffmpeg not found, etc.).
+
+    Returns True if this call caused a terminal FAILED status, so the caller can decide
+    whether to feed a health-score observation (never done inside this closure itself -
+    that's a second commit and would duplicate the RESTART_FAILED/RECORDING_FAILED events
+    on a retry, see CLAUDE.md's commit-discipline rule).
+
+    Both outcomes are named in the same commit - the give-up, and the retry the caller is
+    about to schedule. A recording left IN_PROGRESS with no process and no event saying a
+    relaunch is coming is the unexplainable state Product Principle 1 exists to prevent.
+    """
+    from .database import RESTART_FAILED
+    with app.app_context():
+        rec = db.session.get(Recording, recording_id)
+        if rec is None:
+            return False
+        rec.consecutive_failures += 1
+        if rec.consecutive_failures > rec.consecutive_failures_peak:
+            rec.consecutive_failures_peak = rec.consecutive_failures
+        add_recording_event(recording_id, RESTART_FAILED,
+                            detail=f'Launch failed: {error_msg}', segment_number=seg_num)
+        failed = rec.consecutive_failures >= max_failures
+        if failed:
+            rec.status = REC_STATUS_FAILED
+            rec.completed_at = datetime.utcnow()
+            add_recording_event(recording_id, RECORDING_FAILED, detail='Max consecutive failures reached')
+            with _lock:
+                dead_state = _active.pop(recording_id, None)
+            if dead_state is not None:
+                # Cancels a launch-retry still waiting out its delay and winds down a
+                # watchdog that reached here through its own restart branch - both hold
+                # this state object directly, so popping _active alone does not reach
+                # them. Idempotent, so it is safe inside this retried closure.
+                dead_state.stop_event.set()
+        else:
+            add_recording_event(recording_id, RESTART_ATTEMPTED,
+                                detail=(f'Waiting {restart_delay}s before retrying the launch '
+                                        f'of segment {seg_num} '
+                                        f'(attempt {rec.consecutive_failures} of {max_failures})'),
+                                segment_number=seg_num)
+        db.session.commit()
+        return failed
+
+
+def _schedule_launch_retry(app, recording_id: int, seg_num: int, delay):
+    """Relaunch seg_num after `delay` seconds when Popen itself failed.
+
+    A launch failure below the give-up threshold leaves no process and no segment row, so
+    the watchdog cannot own the retry the way it owns a stall: its loop keys off
+    state.current_segment_num, which _launch_segment only advances after a successful
+    spawn, so it either waits forever for a row that will never appear or re-reads the
+    previous, already-ended segment. On the very first launch there is no watchdog at all.
+    Without this the recording sits IN_PROGRESS with nothing capturing until its stop-time
+    job fires and concatenation runs over zero segments (dev/changelog/644).
+
+    Distinct from the dead-stream retry in app/watchdog.py: that one answers "the stream
+    itself is gone", parks the recording in RETRYING for minutes and releases its
+    connection slot. This is a spawn that failed while the recording is still live and
+    holding everything it acquired, so it stays IN_PROGRESS and retries on the watchdog's
+    own restart cadence.
+
+    The thread waits on stop_event rather than sleeping, so every teardown path cancels it
+    (_teardown_active_ffmpeg and kill_all_active both set it before anything else).
+    """
+    state = get_state(recording_id)
+    if state is None or state.stop_event.is_set():
+        return
+
+    def _retry():
+        if state.stop_event.wait(timeout=delay):
+            return  # torn down while waiting - deliberate, not a failure to report
+        # A recording that ended and was resumed under us has a different state object;
+        # relaunching against the old one would attach the process where nothing reads it.
+        if get_state(recording_id) is not state:
+            return
+        with app.app_context():
+            rec = db.session.get(Recording, recording_id)
+            if rec is None or rec.status != REC_STATUS_IN_PROGRESS:
+                return
+        _launch_segment(app, recording_id, seg_num)
+
+    thread = threading.Thread(target=_retry, name=f'launch-retry-{recording_id}-{seg_num}',
+                              daemon=True)
+    state.launch_retry = thread
+    thread.start()
+
+
+def _close_active_segment(app, recording_id: int, exit_reason: str):
+    # Read outside the retried closure: it consumes the spool (closes and unlinks it), so a
+    # lock-retry of the closure would find it already gone and record an empty tail. Reading
+    # first makes the values plain locals the retry can safely reuse.
+    exit_code, tail = collect_segment_diagnostics(recording_id)
+
+    @retry_on_locked()
+    def _close_and_commit():
+        with app.app_context():
+            seg = RecordingSegment.query.filter_by(
+                recording_id=recording_id, ended_at=None
+            ).order_by(RecordingSegment.segment_number.desc()).first()
+            if seg:
+                seg.ended_at = datetime.utcnow()
+                seg.exit_reason = exit_reason
+                if os.path.exists(seg.file_path):
+                    seg.bytes_recorded = os.path.getsize(seg.file_path)
+                add_recording_event(recording_id, SEGMENT_ENDED,
+                                    detail=f'Segment {seg.segment_number} ended: {exit_reason}',
+                                    segment_number=seg.segment_number)
+                record_segment_diagnostics(recording_id, seg, exit_code, tail)
+                db.session.commit()
+
+    _close_and_commit()
+
+
+def _snapshot_channel_health(rec):
+    """Store the most recent ChannelTest for rec.channel_id as a JSON snapshot.
+
+    Called right before db.session.commit() in start_recording, so the caller
+    handles the commit.
+    """
+    import json
+    if not rec.channel_id:
+        return
+    try:
+        from .database import ChannelTest
+        latest = (
+            ChannelTest.query
+            .filter_by(channel_id=rec.channel_id, job_id=None)
+            .order_by(ChannelTest.id.desc())
+            .first()
+        )
+        if latest is None:
+            return
+        from .tz_utils import UTC
+        rec.channel_health_snapshot = json.dumps({
+            'resolution':      latest.resolution,
+            'fps':             latest.fps,
+            'bitrate_kbps':    latest.bitrate_kbps,
+            'frame_pct':       latest.frame_pct,
+            'drop_count':      latest.drop_count,
+            'audio_codec':     latest.audio_codec,
+            'audio_channels':  latest.audio_channels,
+            'connected':       latest.connected,
+            'test_started_at': (
+                latest.test_started_at.replace(tzinfo=UTC).isoformat()
+                if latest.test_started_at else None
+            ),
+        })
+    except Exception as exc:
+        log.warning('Could not snapshot channel health for recording %d: %s', rec.id, exc)
+
+
+def _safe_name(name: str) -> str:
+    """Sanitize a recording name for use as a filename component."""
+    import re
+    safe = re.sub(r'[^\w\-.]', '_', name)
+    return safe.strip('._') or 'recording'

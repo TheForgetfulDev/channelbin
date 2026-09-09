@@ -1,0 +1,390 @@
+# ChannelBin example configuration.
+#
+# The app runs with sensible built-in defaults and needs NO config file to start.
+# To customize, copy this file to config.yaml and edit - your config.yaml is
+# gitignored (it's yours), this file is the shipped template:
+#
+#     cp config.example.yaml config.yaml
+#
+# Any key you omit falls back to the built-in default (app/config.py::_DEFAULTS),
+# so config.yaml only needs the values you actually want to change.
+#
+# Every value below IS that built-in default, so copying this file changes nothing
+# until you edit it. Four keys are left out on purpose, because a normal install has
+# no reason to set them and a wrong value breaks startup rather than a feature:
+# flask.serve_mockups and flask.pidfile_path (raw-YAML-only), and database.path and
+# logging.file, which appear below as commented-out examples because their defaults
+# are paths derived from wherever the app is installed.
+
+config_version: 3
+
+recording:
+  # Where segments, the in-progress file and the finished recording are written.
+  # A common alternative is a two-directory workflow: point this at an "incomplete"
+  # directory and enable move_on_complete below, so only finished files land in the
+  # directory you browse.
+  dvr_output_dir: /dvr
+  # Per-segment ffmpeg stderr spools, so a failed capture can say why. Tiny, deleted at each
+  # segment close. Relative paths resolve against the app root. Keep this on LOCAL disk, not
+  # under dvr_output_dir - if that mount is what failed, its error message must not live there.
+  capture_log_dir: capture-logs
+  segment_duration_seconds: 0           # 0 = disabled; >0 forces periodic clean restarts
+  retention_days: 0                     # 0 = never auto-delete terminal recordings
+  retention_delete_file: false          # true = also delete the file on disk, not just the DB row
+  # {sub_title} is the episode name where the EPG supplies one, and collapses out
+  # cleanly when it does not. Other tokens: {description} {category} {start_time}
+  # {end_time}, plus {tag:name} for a configured tag.
+  filename_template: '{date} - {title} - {sub_title} - {channel}'
+  filename_tags_remove: []
+  filename_tags_replace: []
+  post_process:
+    enabled: true
+    format: mp4                         # 'mp4' or 'mkv'
+    delete_source: true                 # delete the .ts after a successful conversion
+    # How long a conversion may run without muxing its first output frame. NOT a budget for
+    # the whole job: once output is advancing, stall_seconds below is the only thing that can
+    # end it, so a long re-encode on a slow machine runs to completion.
+    pre_output_timeout_seconds: 1800
+    reencode_mode: damaged              # 'damaged' | 'always' | 'never'
+    video_crf: 20                       # libx264 CRF (0-51, lower = better quality/larger file)
+                                         # - only applies when a re-encode actually happens
+    audio_bitrate_kbps: 192             # AAC bitrate for mp4 output (always re-encoded)
+    # A conversion can die or stall mid-flight (an ffmpeg crash, a service restart).
+    # These decide whether the app restarts it and how it notices a stall.
+    auto_restart: true
+    max_restart_attempts: 3             # give up after this many restarts; 0 disables auto-restart
+    stall_seconds: 300                  # kill and count a conversion whose output stops advancing; 0 disables
+                                         # (0 leaves no liveness signal, so pre_output_timeout_seconds
+                                         # above reverts to a whole-job deadline in that case)
+    progress_interval_seconds: 5        # how often ffmpeg reports progress and the UI updates
+    # What a conversion does when a recording is about to start on the same machine.
+    # 'cancel' = the conversion yields and resumes once clear, so a recording is never
+    # delayed. 'wait' = the recording waits for the conversion instead, unless its own
+    # stop time would already have passed, in which case it fails loudly. 'off' = neither.
+    collision_policy: cancel
+    # Lookahead window, in units of the recording's own duration: a conversion looks
+    # ahead duration / this multiplier. 1.0 assumes the conversion runs at 1x realtime
+    # and is always safe; 2.0 assumes 2x and looks ahead half as far.
+    collision_lookahead_multiplier: 1.0
+  move_on_complete:
+    enabled: false
+    destination: ''                     # absolute path to move finished files into, e.g. /dvr/complete
+  post_script:
+    # Runs an arbitrary executable after every recording (a code-execution setting).
+    # Ships OFF with a blank path - set both to enable.
+    enabled: false
+    path: ''
+    timeout_seconds: 300
+  live_thumbnail:
+    enabled: true
+    dir: /dvr/live_thumbnails
+    min_regen_interval_seconds: 10
+    capture_timeout_seconds: 12
+    auto_refresh_seconds: 60
+  logo_cache:
+    # Cache channel logos locally instead of hotlinking the provider on every page view.
+    # Off by default so an install that does not need it gets no background job and no
+    # growing cache directory. Only logos for channels in the TV Guide or in a group are
+    # ever fetched, never the whole catalog. A relative path resolves against the app root.
+    enabled: false
+    dir: instance/logo-cache
+  gather_health_data: true
+  serialize_concat: false
+
+watchdog:
+  poll_interval_seconds: 5
+  stall_timeout_seconds: 30
+  restart_delay_seconds: 30
+  max_consecutive_failures: 10
+  # Dead-stream fast-fail. A stream that reconnects and immediately dies again never trips
+  # max_consecutive_failures, because each restart looks successful; this catches it instead.
+  early_fail_window_seconds: 60
+  early_fail_min_bytes: 1048576
+  early_fail_abort_count: 3
+  early_fail_abort_window_seconds: 180
+  # Once fast-fail trips, retry at 1/2/5/15 minutes then hourly, up to this many attempts
+  # or until the recording's own scheduled window ends. 0 = give up immediately.
+  dead_stream_max_retry_attempts: 10
+
+ffmpeg:
+  path: ffmpeg                          # binary name or absolute path
+  extra_input_args: []                  # e.g. ['-timeout', '5000000']
+  extra_output_args: []
+  concat_timeout_seconds: 300
+
+flask:
+  port: 5000
+  host: 0.0.0.0                         # reachable from every device on your LAN (see README)
+  debug: false
+  secret_key: change-me-in-production   # left as-is → a generated key in instance/secret_key is used
+  behind_proxy: false                   # true ONLY when a reverse proxy fronts the app (trusts X-Forwarded-*); restart required
+
+# An optional password gate over the whole app: every page and API endpoint requires
+# signing in. One shared password, no usernames or roles - a door on something that was
+# otherwise standing open, not a hardened auth system. Read the README's network section
+# before relying on it.
+auth:
+  enabled: false
+  # Set the password from Settings > Security, which stores a hash here. NEVER write a
+  # plaintext password into this file, and never copy someone else's hash.
+  password_hash: ''
+  session_timeout_minutes: 0            # 0 = stay signed in indefinitely on that device
+  # true ONLY when the app is always reached over HTTPS. A Secure cookie is never sent
+  # over plain HTTP, so turning this on without TLS in front locks everyone out. Restart required.
+  cookie_secure: false
+
+# Inbound-facing integrations that poll ChannelBin's own state - not to be confused with
+# notifications.services.home_assistant below, which is ChannelBin pushing OUT to a
+# Home Assistant webhook. Off by default; api_key_hash is generated from Settings >
+# Integrations (shown once, then stored hashed - never write the plaintext key here).
+integrations:
+  home_assistant:
+    enabled: false
+    api_key_hash: ''
+
+database:
+  # path and logging.file default to repo-relative locations (dvr.db beside the app,
+  # logs to stdout). Uncomment/set these to override - e.g. inside Docker where you
+  # mount a volume:
+  # path: /data/dvr.db
+  pre_migration_backup: true
+  # A snapshot is the whole database, including the accounts table's plaintext provider
+  # credentials. Keep it on local disk (created 0700); a relative path resolves against
+  # the app directory. Pointing this at a shared/network mount exposes those credentials
+  # to everyone who can read that share.
+  backup_dir: instance/db-backups
+  migration_backups_keep: 3
+  # SQLite page cache, in MB. SQLite's stock default is 2MB, which is far too small for a
+  # database of this size - raising it to 64MB roughly halves search times on a ~800MB DB.
+  # This is a per-CONNECTION cap, not a process total: SQLAlchemy pools connections for
+  # both the main engine and APScheduler's jobstore, so the theoretical ceiling is this
+  # figure times the number of open connections. SQLite fills the cache lazily as pages are
+  # actually read, so idle connections cost nothing near the cap. Takes effect on restart.
+  cache_size_mb: 64
+
+  # How much of the write-ahead log SQLite may KEEP once it no longer needs it, in MB.
+  # IT IS NOT A QUOTA: a transaction always grows the WAL to whatever it needs and always
+  # succeeds. This only decides how much of the unused tail is handed back afterward. Set it
+  # too low and a workload that routinely exceeds it pays truncate-and-re-extend churn every
+  # cycle; a WAL that stays under it is never touched at all. Without a limit the file keeps
+  # the high-water mark of the worst minute it ever had, forever. 0 = no limit. Restart required.
+  wal_size_limit_mb: 256
+
+  # TWO CONNECTION POOLS on one database file, and the split is the feature. The UI pool
+  # serves web requests; the background pool serves everything with no request behind it -
+  # the account sync, search index rebuilds, scheduled jobs, the recorder. Because they draw
+  # from separate sets, a burst of browsing cannot take the connection a recording or a sync
+  # needs. Takes effect on restart (the pools are built once, at startup).
+  #
+  # RAISING A CEILING COSTS MEMORY. cache_size_mb above is per connection, so the worst case
+  # is (pool_size + max_overflow) x cache_size_mb per pool. With the values below that is
+  # (16 + 12) x 64MB = 1.8GB if every connection scans at once. Do the arithmetic for your
+  # machine before raising either ceiling, especially if it has no swap.
+  pool_size: 8              # UI connections kept warm
+  max_overflow: 8           # extra UI connections under burst, closed after use
+  pool_timeout: 30          # seconds a request waits for a connection before giving up
+  background_pool_size: 4
+  background_max_overflow: 8
+  background_pool_timeout: 60   # background work waits longer - it would rather be late
+
+logging:
+  level: INFO
+  # file: /var/log/channelbin/dvr.log   # omit → log to stdout (ideal for Docker)
+  max_bytes: 10485760                    # rotate the log file at 10 MB; <= 0 disables rotation
+  backup_count: 5                        # keep this many rotated files (~60 MB total at the default size)
+
+search:
+  # Wall-clock budget for one channel/airing search request, enforced inside SQLite so it can
+  # stop a scan already running. Blowing it returns 503 with an explanation, never a silently
+  # short result. Either value at 0 disables its half.
+  timeout_seconds: 20            # backstop for a search whose index is usable (~2x the 9.3s ceiling)
+  degraded_timeout_seconds: 15   # tighter: a search running unindexed (an account sync is rebuilding)
+  # How many searches may run WITHOUT their index at once; the rest queue, and a request that
+  # waits out its budget above is a 503 saying so. 1 on a two-core box: the scan is CPU-bound, so
+  # a second concurrent one adds no throughput and only starves the rebuild that ends the
+  # degraded window. 0 disables the cap.
+  max_concurrent_unindexed: 1
+  # Memoize each tag's "which channels carry it" result instead of recomputing it live on
+  # every search. Fixes a real slowdown (a common-word tag pattern like `live` could time
+  # out a search); costs a small amount of RAM (kilobytes to low tens of MB in practice).
+  # Turn off if the box is RAM constrained - it also frees whatever is currently cached.
+  tag_id_cache_enabled: true
+  # How long the airing view's unfiltered summary counts may be served from cache. They are
+  # also recomputed whenever a sync lands, but a sync cannot see a health score changing, a
+  # group edit, or simply time passing, so this bounds how stale those counts can get.
+  standing_breakdown_cache_ttl_seconds: 300
+  # Budget for the OPTIONAL parts of a search - the totals and the facet counts - in the two
+  # states where they get expensive. Rows are never optional and never use these budgets; a
+  # count that blows one is declined and labeled as declined rather than waited on.
+  degraded_aggregate_timeout_seconds: 2   # while the index is rebuilding; 0 = never attempt
+  # ...and when the index is healthy but cannot answer the question asked, so counting means
+  # reading the whole table. That state lasts as long as the option causing it stays set, so
+  # the budget is about how long an optional number is worth waiting for. 0 = never attempt.
+  full_scan_aggregate_timeout_seconds: 8
+  # How long a search index may sit unusable with nobody rebuilding it before a janitor job
+  # rebuilds it. A sync's own rebuild is the first resort and this is the last, so the grace
+  # leaves room for a sync that is about to start anyway. 0 = never, which leaves index repair
+  # to the next account sync alone.
+  index_janitor_grace_minutes: 15
+
+accounts:
+  default_max_connections: 1            # per-account cap on simultaneous connections (recordings + tests)
+
+sync:
+  sync_interval_hours: 12
+  epg_days_ahead: 3                      # days of future EPG to import; also the TV Guide grid's width
+  epg_keep_days: 1
+  sync_log_keep_days: 30                 # delete account sync-log rows older than this; 0 = keep forever
+  request_timeout_seconds: 30
+  # Rewrite provider stream URLs into a chosen form. The global default every account
+  # inherits unless it overrides. One of:
+  #   disabled     - never rewrite (the default, and what you want unless a provider's
+  #                  own URLs are actually broken)
+  #   mpegts       - /<user>/<pass>/<id>.ts
+  #   mpegts_live  - /live/<user>/<pass>/<id>.ts
+  #   hls          - /<user>/<pass>/<id>.m3u8
+  url_normalization: disabled
+  epg_case_sensitive_matching: false
+  skip_sync_if_recording_active: true
+  skip_sync_if_recording_within_minutes: 5
+  # A sync defers past an active health-check run and retries after this many minutes.
+  # 0 = skip the sync entirely instead of retrying.
+  tester_defer_retry_minutes: 20
+  # Warn when one sync rewrites this many channels' stream URLs. A provider changing every
+  # URL at once is worth knowing about before recordings start failing. 0 = disabled.
+  url_drift_alert_min_channels: 50
+  # Refuse an EPG import when it would land below this percent of the previous sync's entry
+  # count, so one bad XMLTV fetch cannot wipe your future guide. 0 = disabled.
+  epg_collapse_threshold_percent: 20
+  # Refuse to apply the provider's live-channel list when doing so would cut the account
+  # below this percent of its previous channel count. The playlist is then imported
+  # unfiltered and an alert is raised instead. 0 = disabled.
+  live_classify_collapse_threshold_percent: 20
+  # Channel lifecycle display only - a channel is never deleted or disabled because of these.
+  # 0 = do not track that state.
+  channel_missing_after_days: 7          # flag a channel this long after it stops appearing
+  channel_new_within_days: 3             # flag a channel as new for this long after it first appears
+  # Warn when this percent or more of an account's channels went unseen in one sync.
+  # Advisory only. 0 = disabled.
+  feed_shrink_percent: 50
+
+display:
+  timezone: America/New_York            # any IANA timezone identifier (DST-aware)
+  time_format: 12h                      # '12h' (AM/PM) or '24h'
+  nav_poll_interval_seconds: 15
+  guide_collapse_gaps: true
+
+debug:
+  xtream_debug_mode: false
+  xtream_dump_dir: null
+
+http:
+  # How this app identifies itself to providers, on every outbound request: account sync
+  # (playlist + XMLTV fetches) AND every ffmpeg capture - recordings, health checks, and
+  # the manual URL test. Some providers filter on it, so one setting covers all of them.
+  # Left unset, ffmpeg would announce its own 'Lavf/<version>' default, which is widely
+  # blocked. To override it for captures only, put your own -user_agent in
+  # ffmpeg.extra_input_args; the later value wins.
+  user_agent: VLC/3.0.18 LibVLC/3.0.18
+
+channel_testing:
+  skip_if_recording_active: true         # skip the automatic TV Guide Channels run while a recording is in progress
+  skip_if_recording_within_minutes: 10   # skip ANY run if a recording starts this soon; 0 = off
+  test_duration_seconds: 30
+  wait_between_channels_seconds: 30
+  screenshots_enabled: true
+  screenshots_keep_count: 5
+  screenshot_dir: /dvr/channel_test_screenshots
+  # '' = system temp dir; set to redirect the test's temporary capture clip elsewhere.
+  capture_scratch_dir: ''
+  test_history_keep: 0
+  connect_retries: 2
+  connect_timeout_seconds: 15
+  connect_retry_delay_seconds: 10
+  bitrate_fail_720p_kbps: 1000
+  bitrate_fail_1080p_kbps: 2000
+  bitrate_fail_4k_kbps: 3000
+  health_score_half_life_samples: 5
+  reference_minutes: 2
+  instability_penalty_per_hr: 2.0
+  health_score_test_fail_floor: 10
+  health_score_warn_penalty: 10
+  # Where each health band starts. A 0-100 score is shown as one of four bands everywhere
+  # in the UI; Poor always starts at 0, and these must descend.
+  health_bands:
+    great: 90
+    good: 80
+    fair: 50
+  # What counts as a failing channel for scheduled-recording warnings. The two are
+  # independent: a channel with a long good history can sit well above the failing band
+  # through weeks of hard failures, which is what the streak catches.
+  failing_band: poor                     # this band and every band below it = failing; 'none' = only hard test failures count
+  failing_streak_threshold: 3            # this many consecutive failed tests = failing; 0 = disabled
+  recording_score:
+    fail_floor: 5
+    near_empty_bitrate_ratio: 0.20
+    near_empty_min_span_seconds: 30
+    damage_penalty_per_pct_missing: 3
+    near_empty_penalty_per_pct: 2
+    capture_quality_source_weight: 1.0
+  pre_check:
+    # Optionally health-check a recording's channel shortly before it starts. Off by
+    # default because it spends one of the account's provider connections. A recording
+    # profile can override 'enabled' for the recordings that use it.
+    enabled: false
+    lead_minutes: 15                     # run this long before the recording starts
+    retry_minutes: 5                     # retry cadence when the tester is busy; 0 = skip instead
+    min_margin_seconds: 60               # extra slack required beyond the worst-case test duration
+  window:
+    # Maintenance window for recurring health checks that ask to use it. They run
+    # back-to-back inside this clock range (in the display timezone) instead of at an exact
+    # time, so two of them can never collide.
+    start: "02:00"
+    end: "06:00"                         # an end at or before start means the window crosses midnight
+    dispatch_interval_minutes: 5         # how often to look for the next due check; restart required
+
+alerts:
+  keep_days: 90                          # daily sweep deletes dismissed alerts older than this; 0 = keep forever
+
+config_backup:
+  enabled: true
+  backup_hour_et: 1
+  backup_retention_days: 14
+  # Backups are this file verbatim, secrets included - same warning as database.backup_dir.
+  backup_dir: instance/config-backups
+
+notifications:
+  push_rate_limit_seconds: 60
+  base_url: ''                          # e.g. http://192.168.1.50:5000 - used to build links in push notifications
+  services:
+    # Each url is an Apprise-style service URL. Fill one in and flip enabled: true.
+    discord:
+      enabled: false
+      url: ''
+    home_assistant:
+      enabled: false
+      url: ''
+    pushover:
+      enabled: false
+      url: ''
+    smtp2go:
+      enabled: false
+      url: ''
+    whatsapp:
+      enabled: false
+      url: ''
+  routing:
+    # Which alert kinds reach which surface. push_services lists names from services above;
+    # an empty list means in-app only.
+    LOG_ERROR:
+      in_app: true
+      push_services: []
+    LOG_CRIT:
+      in_app: true
+      push_services: []
+    JOB_SKIPPED:
+      in_app: true
+      push_services: []
+    HEALTH_CHECK_WINDOW:
+      in_app: true
+      push_services: []

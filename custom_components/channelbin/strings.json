@@ -1,0 +1,36 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "data": {
+          "host": "Host",
+          "port": "Port",
+          "scheme": "Scheme",
+          "api_key": "API key"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Failed to connect",
+      "invalid_auth": "Invalid API key"
+    },
+    "abort": {
+      "already_configured": "Device is already configured"
+    }
+  },
+  "entity": {
+    "sensor": {
+      "capturing": { "name": "Capturing" },
+      "converting": { "name": "Converting" },
+      "next_recording": { "name": "Next recording" },
+      "disk_free": { "name": "Disk free" },
+      "disk_used_percent": { "name": "Disk used" },
+      "unread_alerts": { "name": "Unread alerts" },
+      "accounts_ok": { "name": "Accounts OK" }
+    },
+    "binary_sensor": {
+      "recording": { "name": "Recording" },
+      "has_alerts": { "name": "Has alerts" }
+    }
+  }
+}

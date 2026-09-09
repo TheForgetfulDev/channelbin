@@ -1,0 +1,250 @@
+{% macro secret_reveal_btn(path='', local=false) %}
+  {# In-field eyeball for a secret input. Two modes, and the difference is load-bearing:
+
+     DEFAULT - a STORED secret (settings + notifications): the input renders MASK_SENTINEL
+     and util.js::initSecretReveal fetches the real value from /api/settings/reveal on
+     click. `path` is the sensitive config leaf (e.g. flask.secret_key,
+     notifications.services.pushover.url). It may be blank when the caller fills it in
+     itself - notifications.js clones this button per service card and sets
+     `dataset.secretPath` before wiring it - so a blank path is NOT what selects the other
+     mode.
+
+     `local=true` - an account's provider password: there IS no endpoint that serves the
+     stored value back, by design (DESIGN.md §17.4). util.js::initLocalReveal wires it as a
+     plain `type` swap, so it only ever reveals what is being typed right now, and the
+     label says so. Never add a path to one of these to "make it work" - that is a request
+     for a value this app deliberately does not return. #}
+  <button type="button" class="secret-reveal-btn"{% if path %} data-secret-path="{{ path }}"{% endif %}
+          aria-label="{{ 'Show what I am typing' if local else 'Reveal value' }}"
+          title="{{ 'Show what I am typing' if local else 'Reveal' }}">
+    <svg class="eye-on" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+         stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/>
+    </svg>
+    <svg class="eye-off" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+         stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"/><line x1="1" y1="1" x2="23" y2="23"/>
+    </svg>
+  </button>
+{% endmacro %}
+
+{% macro recur_schedule_fields(prefix, oneoff_label, window_label='') %}
+  {# Recurring toggle + either a one-off datetime picker or a Test Day + time picker,
+     mirroring the TV Guide health check's day/hour settings (Settings > channel_testing)
+     but with minute granularity. JS toggles which row is visible based on the checkbox.
+
+     window_label (e.g. "2:00-6:00 AM"): when set, adds a "Run at" radio letting a
+     recurring check run inside the maintenance window (app/check_window.py) instead of
+     at an exact time. Left empty, no radio renders and the macro behaves exactly as
+     before - how a caller with no window to offer opts out for free.
+
+     The window is the RENDERED default (dev/changelog/830): it is the answer this app
+     recommends, so a caller that never prefills lands on it without JS switching the
+     radio after mount. schedule-fields.js::prefill() only moves it when the caller
+     states a use_window of its own, so a cloned or edited schedule still wins. #}
+  <div class="form-group" style="margin:0 0 0.5rem;">
+    <label style="font-size:12px; display:flex; align-items:center; gap:6px; cursor:pointer; width:fit-content;">
+      <input type="checkbox" id="{{ prefix }}-recurring-cb"> Recurring
+    </label>
+  </div>
+  <div id="{{ prefix }}-oneoff-row" style="display:flex; gap:0.75rem; align-items:flex-end; flex-wrap:wrap; margin-bottom:0.5rem;">
+    <div class="form-group" style="margin:0; flex:1; min-width:200px;">
+      <label style="font-size:12px;">{{ oneoff_label }} <span class="tz-label" data-tz-label></span></label>
+      <input type="datetime-local" id="{{ prefix }}-dt" class="form-control">
+    </div>
+  </div>
+  <div id="{{ prefix }}-recurring-row" style="display:none; flex-direction:column; gap:0.5rem; margin-bottom:0.5rem;">
+    {% if window_label %}
+    <div class="form-group" style="margin:0;">
+      <label class="gd-field-lbl" style="display:block;">Run at</label>
+      <label style="font-size:12px; display:flex; align-items:center; gap:6px; cursor:pointer; margin-bottom:2px;">
+        <input type="radio" name="{{ prefix }}-run-at" id="{{ prefix }}-run-window" value="window" checked>
+        Maintenance window ({{ window_label }})
+      </label>
+      <label style="font-size:12px; display:flex; align-items:center; gap:6px; cursor:pointer;">
+        <input type="radio" name="{{ prefix }}-run-at" id="{{ prefix }}-run-time" value="time">
+        A specific time
+      </label>
+    </div>
+    {% endif %}
+    <div style="display:flex; gap:0.75rem; align-items:flex-end; flex-wrap:wrap;">
+      <div class="form-group" style="margin:0; flex:1; min-width:140px;">
+        <label style="font-size:12px;">Test Day</label>
+        <select id="{{ prefix }}-recur-day" class="form-control">
+          <option value="0">Every day</option>
+          <option value="1">Sunday</option>
+          <option value="2">Monday</option>
+          <option value="3">Tuesday</option>
+          <option value="4">Wednesday</option>
+          <option value="5">Thursday</option>
+          <option value="6">Friday</option>
+          <option value="7">Saturday</option>
+        </select>
+      </div>
+      <div class="form-group" id="{{ prefix }}-recur-time-field" style="margin:0; flex:1; min-width:110px;">
+        <label style="font-size:12px;">Time <span class="tz-label" data-tz-label></span></label>
+        <input type="time" id="{{ prefix }}-recur-time" class="form-control">
+      </div>
+    </div>
+  </div>
+{% endmacro %}
+
+{# CSRF token field - required inside every <form method="post"> (see CLAUDE.md security rules). #}
+{% macro csrf_field() %}<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">{% endmacro %}
+
+{# ── App design-system macros (DESIGN.md section 3) ── #}
+
+{# Status badge (3.4): cls = b-live/b-done/b-sched/b-fail/b-abort/b-concat/b-paused #}
+{% macro status_badge(cls, label, pulse=false, lg=false) -%}
+<span class="badge {{ cls }}{% if lg %} lg{% endif %}">{% if pulse %}<span class="pulse"></span>{% endif %}{{ label }}</span>
+{%- endmacro %}
+
+{# Channel pill (3.4/3.9): logo image or colored-initials fallback; navigates to url. #}
+{% macro channel_pill(label, url, logo_url=none, initials='?', acct_color=none) -%}
+<a class="ch-pill" href="{{ url }}">
+  {%- if logo_url %}<img class="ch-logo" src="{{ logo_url }}" alt="" loading="lazy">
+  {%- else %}<span class="ch-logo" style="background: {{ acct_color or 'var(--bg3)' }}">{{ initials }}</span>{% endif %}
+  {{- label -}}
+  {%- if acct_color %}<span class="acct-dot" style="background: {{ acct_color }}"></span>{% endif -%}
+</a>
+{%- endmacro %}
+
+{# Account pill (3.4/3.9): color dot + name, navigates to the account page. #}
+{% macro account_pill(name, url, color, tip=none) -%}
+<a class="ch-pill acct-pill{% if tip %} tip-plain" data-tip="{{ tip }}{% endif %}" href="{{ url }}"><span class="acct-dot" style="background: {{ color or 'var(--text-faint)' }}"></span>{{ name }}</a>
+{%- endmacro %}
+
+{# ── Account badges (DESIGN.md 17) ───────────────────────────────────────
+   One vocabulary for both Accounts surfaces. The list row and the account page have to
+   agree about what "Syncing" or "Constructed URLs" looks like and says, so these live
+   here rather than in either template.
+
+   `tip` is the only difference between the two callers: the account page explains every
+   badge, and a LIST ROW CARRIES NO TOOLTIPS AT ALL (17.5 item 6) - the row is already the
+   tap target that opens the account, and both cannot own the same 40px of badge. #}
+
+{# Every status is named; the trailing branch renders the raw value rather than quietly
+   becoming the home for the next status anybody adds (CLAUDE.md, enumerated states). #}
+{% macro account_status_badge(status, tip=true) -%}
+  {%- if status == 'OK' %}
+  <span class="badge b-done{% if tip %} tip-plain" data-tip="OK.&#10;The last sync finished and this account's channels and EPG are current.{% endif %}">OK</span>
+  {%- elif status == 'SYNCING' %}
+  {# b-running, not b-live: a sync in progress is not an alarm (dev/changelog/816). #}
+  <span class="badge b-running{% if tip %} tip-plain" data-tip="Syncing.&#10;A sync is running right now. The counts shown are from the previous run until it finishes.{% endif %}"><span class="pulse"></span>Syncing</span>
+  {%- elif status == 'ERROR' %}
+  <span class="badge b-fail{% if tip %} tip-plain" data-tip="Error.&#10;The last sync failed. The channels imported by the previous successful sync are still here and still record; the provider's own reason is on this account's page.{% endif %}">Error</span>
+  {%- elif status == 'UNSYNCED' %}
+  <span class="badge b-abort{% if tip %} tip-plain" data-tip="Never synced.&#10;This account has been added but has never been fetched, so it has no channels yet.{% endif %}">Never synced</span>
+  {%- else %}
+  <span class="badge b-abort">{{ status }}</span>
+  {%- endif %}
+{%- endmacro %}
+
+{# The account list row's left edge (§17.2: sync status and nothing else). Shared with the
+   dashboard's Account sync status section so the two surfaces cannot color the same status
+   two different ways. No trailing else that quietly becomes home for the next status
+   somebody adds (CLAUDE.md, "states are enumerated") - an unknown status gets the neutral
+   "nothing known" edge deliberately. #}
+{% macro account_edge_class(status) -%}
+{% if status == 'OK' %}st-ok{% elif status == 'SYNCING' %}st-sync{% elif status == 'ERROR' %}st-bad{% else %}st-none{% endif %}
+{%- endmacro %}
+
+{% macro account_type_badge(account_type, tip=true) -%}
+  {%- if account_type == 'xtream' %}
+  <span class="badge b-auto{% if tip %} tip-plain" data-tip="Xtream API.&#10;ChannelBin talks to the provider's player_api.php with a username and password.{% endif %}">Xtream</span>
+  {%- else %}
+  <span class="badge b-auto{% if tip %} tip-plain" data-tip="M3U playlist.&#10;ChannelBin fetches a playlist file, and an XMLTV file for the guide if one is configured.{% endif %}">M3U</span>
+  {%- endif %}
+{%- endmacro %}
+
+{# The badges that are true of an account rather than of its status. Both are conditions a
+   user has to be able to see without opening the account. #}
+{% macro account_extra_badges(account, tip=true) -%}
+  {%- if account.constructed_stream_url_count %}
+  <span class="badge b-warn{% if tip %} tip-plain" data-tip="Constructed URLs.&#10;This provider supplied no stream URL for {{ account.constructed_stream_url_count }} of its channels, so ChannelBin built them from the stream origin the provider declares. Often normal, and not a problem while the channels play.{% endif %}">Constructed URLs</span>
+  {%- endif %}
+  {%- if not account.sync_enabled %}
+  <span class="badge b-abort{% if tip %} tip-plain" data-tip="Auto-sync off.&#10;This account is never synced on a schedule. Sync now still works.{% endif %}">Auto-sync off</span>
+  {%- endif %}
+{%- endmacro %}
+
+{# Card header (3.3). #}
+{% macro stat_row(key, value, sv_cls=none, wide=false, tip=none) -%}
+<div class="srow{% if wide %} wide{% endif %}"><span class="sk">{{ key }}</span><span class="sv{% if sv_cls %} {{ sv_cls }}{% endif %}{% if tip %} tip-plain" data-tip="{{ tip }}{% endif %}">{{ value }}</span></div>
+{%- endmacro %}
+
+{# ── Field row (DESIGN.md 3.13/15.1) ─────────────────────────────────────
+   One shell for the left column so the label/description/default/config-key
+   anatomy exists once; each field kind supplies only its control through
+   {% call %}. `hay` adds search terms a field's own text does not carry (the
+   Settings search reads data-hay; a page without a search just ignores it).
+   Lived in settings.html until Notifications' Delivery card became the second
+   caller - dev/changelog/440. The CSS is in style.css under the same heading. #}
+{% macro field_shell(path, label, description, default_disp='', restart=false, readonly=false, hay='', full=false, row_class='') %}
+<div class="frow{{ ' full' if full else '' }}{{ ' ' ~ row_class if row_class else '' }}"{% if path %} data-path="{{ path }}"{% endif %}
+     data-hay="{{ (label ~ ' ' ~ description ~ ' ' ~ default_disp ~ ' ' ~ path ~ ' ' ~ hay)|lower }}">
+  <div class="fl">
+    <div class="fl-label">{{ label }}{% if restart %} <span class="restart-badge">&#8635; restart required</span>{% endif %}{% if readonly %} <span class="restart-badge">read-only - edit in config.yaml</span>{% endif %}</div>
+    <div class="fl-desc">{{ description }}</div>
+    {% if default_disp %}<div class="fl-default">Default: <code>{{ default_disp }}</code></div>{% endif %}
+    {% if path %}<div class="fl-key">{{ path }}</div>{% endif %}
+  </div>
+  {% if not full %}<div class="fr-ctl">{{ caller() }}</div>{% endif %}
+</div>
+{% endmacro %}
+
+{% macro field_text(path, label, description, default_disp, value, nullable=false, restart=false) %}
+{% call field_shell(path, label, description, default_disp, restart) %}
+<input type="text" data-setting-path="{{ path }}"{% if nullable %} data-nullable="true"{% endif %} value="{{ value if value is not none else '' }}">
+{% endcall %}
+{% endmacro %}
+
+{% macro field_number(path, label, description, default_disp, value, restart=false, step=none) %}
+{% call field_shell(path, label, description, default_disp, restart) %}
+<input type="number"{% if step %} step="{{ step }}"{% endif %} data-setting-path="{{ path }}" value="{{ value }}">
+{% endcall %}
+{% endmacro %}
+
+{% macro field_time(path, label, description, default_disp, value, restart=false) %}
+{% call field_shell(path, label, description, default_disp, restart) %}
+<input type="time" data-setting-path="{{ path }}" value="{{ value }}">
+{% endcall %}
+{% endmacro %}
+
+{% macro field_bool(path, label, description, default_disp, value, restart=false) %}
+{% call field_shell(path, label, description, default_disp, restart) %}
+<label class="switch">
+  <input type="checkbox" data-setting-path="{{ path }}"{{ ' checked' if value else '' }}>
+  <span class="knob"></span>
+</label>
+{% endcall %}
+{% endmacro %}
+
+{% macro field_select(path, label, description, default_disp, value, options, restart=false) %}
+{% call field_shell(path, label, description, default_disp, restart) %}
+<select data-setting-path="{{ path }}">
+  {% for opt in options %}
+  <option value="{{ opt[0] }}"{{ ' selected' if value|string == opt[0]|string else '' }}>{{ opt[1] }}</option>
+  {% endfor %}
+</select>
+{% endcall %}
+{% endmacro %}
+
+{% macro field_list(path, label, description, default_disp, value, restart=false) %}
+{% call field_shell(path, label, description, default_disp, restart) %}
+<textarea data-setting-path="{{ path }}" data-setting-type="list" rows="3">{{ value | join('\n') if value else '' }}</textarea>
+{% endcall %}
+{% endmacro %}
+
+{% macro field_readonly(path, label, description, value, secret=false) %}
+{% call field_shell(path, label, description, '', false, true) %}
+{% if secret and value %}
+<div class="secret-field">
+  <input type="text" value="{{ value }}" readonly>
+  {{ secret_reveal_btn(path) }}
+</div>
+{% else %}
+<input type="text" value="{{ value if value is not none else '(not set)' }}" readonly>
+{% endif %}
+{% endcall %}
+{% endmacro %}

@@ -1,0 +1,104 @@
+{% extends "base.html" %}
+{% block title %}Recording Profiles - ChannelBin{% endblock %}
+
+{#  Recording Profiles list (dev/changelog/356, redesigned dev/changelog/864).
+
+    Add and Edit are the SAME modal, opened from static/js/profile-modal.js - there are
+    no standalone form pages any more.
+
+    A row shows what the profile CHANGES and nothing else. The nine-column table this
+    replaced spent seven cells per row saying "Default (N)", which is why it was 731px
+    wider than a portrait phone. What a profile inherits is stated ONCE, under the list.
+    Both the override pairs and that line are built in app/routes/profiles.py off the same
+    `defaults` dict and the same render functions - never re-spell a fallback here, or the
+    list, the line and the modal drift apart. #}
+
+{% block content %}
+<div class="page-head">
+  <h1>Recording Profiles
+    <span class="sub">{{ profiles | length }} profile{{ 's' if profiles | length != 1 else '' }}</span>
+  </h1>
+  <button class="btn btn-primary" id="rp-add">+ Add Profile</button>
+</div>
+
+{% if not profiles %}
+<div class="empty-state">
+  <p>No recording profiles yet.</p>
+  <p class="text-muted" style="font-size:13px;">
+    A profile bundles a filename template, pre-/post-record padding, and the
+    failure/timeout thresholds a recording runs with, so you can pick them by name when
+    scheduling - or set one as a channel's default.
+  </p>
+  <button class="btn btn-primary" id="rp-add-empty">+ Add Profile</button>
+</div>
+{% else %}
+{# Same fixed-track grid shape as the Accounts and Recordings lists, same .list-scroll
+   backstop - header and rows scroll together rather than the excess bleeding past .main.
+   The @container reflow below turns the row into a card before this ever engages. #}
+<div class="list-scroll prof-list">
+<div class="prof-head">
+  <span>Profile</span>
+  <span>Overrides</span>
+  <span class="num">Used by</span>
+  <span></span>
+</div>
+<div class="prof-rows">
+  {% for p in profiles %}
+  <div class="prow">
+    <span class="p-title">
+      <span class="p-name">{{ p.name }}</span>
+      {# The one override too long for a pair, so it gets the meta line to itself - and
+         only when the profile actually sets one. #}
+      {% if p.filename_template %}
+      <span class="p-meta"><span class="p-mk">Filename</span>{{ p.filename_template }}</span>
+      {% endif %}
+    </span>
+    <span class="p-over">
+      {% for o in overrides.get(p.id, []) %}
+      <span class="p-ov"><span class="p-ok">{{ o.label }}</span>{{ o.value }}</span>
+      {% else %}
+      {# "every other" when the filename template above is the profile's one override -
+         an empty cell reads as a failure to render, and "every default" would be a lie. #}
+      <span class="p-inherit">Inherits every {{ 'other ' if p.filename_template }}default</span>
+      {% endfor %}
+    </span>
+    {# Literal "·", not &middot; - tests/test_recording_stats.py asserts on this exact
+       string as the marker for the per-profile usage count. #}
+    <span class="p-num"><span class="p-k">Used by</span>{{ rec_counts.get(p.id, 0) }} recording{{ 's' if rec_counts.get(p.id, 0) != 1 else '' }} · {{ channel_counts.get(p.id, 0) }} channel{{ 's' if channel_counts.get(p.id, 0) != 1 else '' }}</span>
+    {# Keeps its own class even though it holds one button: an unclassed cell takes the
+       default grid order and shifts every header label off its column. #}
+    <span class="p-actions">
+      <span class="menu-wrap">
+        <button class="btn btn-sm btn-icon" data-menu aria-label="Actions for {{ p.name }}">&#8943;</button>
+        <div class="menu pop-left">
+          <button class="menu-item" data-act="edit" data-profile="{{ p.id }}">Edit</button>
+          <div class="sep"></div>
+          <button class="menu-item danger" data-act="delete" data-profile="{{ p.id }}">Delete profile</button>
+        </div>
+      </span>
+    </span>
+  </div>
+  {% endfor %}
+</div>
+</div>
+{# Outside .list-scroll on purpose: it must wrap, never scroll sideways with the rows. #}
+<p class="prof-defaults">
+  <span class="p-dk">Anything a profile does not set follows your global settings:</span>
+  {% for d in default_summary %}<span class="p-ov"><span class="p-ok">{{ d.label }}</span>{{ d.value }}</span>{% endfor %}
+  <span class="p-ov"><span class="p-ok">Filename</span>{{ defaults.filename_template }}</span>
+</p>
+{% endif %}
+{% endblock %}
+
+{% block scripts %}
+<script>
+window.RP_CONFIG = {
+  profiles: {{ profiles_json | tojson }},
+  defaults: {{ defaults | tojson }},
+  recCounts: {{ rec_counts | tojson }},
+  channelCounts: {{ channel_counts | tojson }},
+};
+</script>
+<script src="{{ url_for('static', filename='js/profile-modal.js') }}"></script>
+<script src="{{ url_for('static', filename='js/recording-profiles.js') }}"></script>
+{% endblock %}

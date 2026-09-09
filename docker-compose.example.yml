@@ -1,0 +1,31 @@
+# ChannelBin - example compose file.
+#
+#   cp docker-compose.example.yml docker-compose.yml
+#   docker compose up -d
+#   docker compose logs -f
+#
+# Then open http://<host>:5000. On first start the container writes a starter
+# config.yaml into ./config; edit it there or from Settings in the web UI.
+
+services:
+  channelbin:
+    container_name: channelbin
+    # Built from this checkout. No prebuilt image is published.
+    build: .
+    restart: unless-stopped
+    ports:
+      - "5000:5000"
+    environment:
+      # The uid/gid your recordings should be owned by - run `id -u` and `id -g`.
+      # The container writes to the mounts as this user rather than as root.
+      - PUID=1000
+      - PGID=1000
+      # Sets the container clock. It does NOT set the app's display timezone - that is
+      # `display.timezone` in config.yaml, so schedules read the same either way.
+      - TZ=America/New_York
+    volumes:
+      # Your data: config.yaml, the database, the generated secret key, and backups.
+      - ./config:/config
+      # Your recordings. Point this at wherever you keep them; it must be writable by
+      # PUID/PGID above, or the container says so in its log at startup.
+      - ./recordings:/dvr

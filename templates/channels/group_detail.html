@@ -1,0 +1,721 @@
+{% extends "base.html" %}
+{% block title %}{{ group.name }} - {{ 'Health Check' if not is_stored else 'Channel Group' }} - ChannelBin{% endblock %}
+
+{% import '_macros.html' as m %}
+
+{#  Unified group / health-check detail page (dev/changelog/273, design 272 +
+    dev/mockups/14 desktop + dev/mockups/15 mobile).
+
+    ONE page serves `/channel-groups/<id>` and `/channels/health-checks/<job_id>`.
+    A ChannelGroup is the primary object; a health check is a facet it may or may not
+    have, so everything below is gated on three booleans from the route:
+      is_stored - an ordinary group, with stored membership: everything except the
+                  pinned system group, whose membership is computed at display time.
+                  Structural only - what may be renamed, dissolved, cloned, added to
+                  the guide. It says nothing about what the group does (dev/changelog/741)
+      records   - at least one member has Recording on, so a recording can actually
+                  start from this group. This is the flag the page's own description of
+                  itself is built on: a group with none records nothing, whatever its
+                  format strategy is set to, and the Groups list page already calls that
+                  state a health check (dev/changelog/750)
+      has_check - an OnDemandTestJob is attached
+    Structure and behavior are separate questions, and every combination of the three
+    must render cleanly on its own.
+
+    The header, banners and status bar are NOT reorderable - they are how you know what
+    you are looking at and what is wrong with it right now. Everything inside
+    `#gd-sections` is, via the Customize sections modal.
+
+    The Channels table is rendered entirely by static/js/group-detail.js from the JSON
+    blob below, and re-rendered from the same shape by the live-refresh endpoint. One
+    renderer, so the first paint and a refresh can never disagree (the old
+    health-check page kept a Jinja copy of every row alongside the JS one). #}
+
+{% block content %}
+<div class="page-head">
+  <h1>Channels</h1>
+  <a href="{{ url_for('channel_groups.groups_page') }}" class="btn">&larr; All Groups</a>
+</div>
+
+{% include 'channels/_tabs.html' %}
+
+{# ── Header ─────────────────────────────────────────────────────────────── #}
+<div class="gd-head">
+  <div class="gd-head-main">
+    <div class="gd-title">
+      {# The glyph is the noun and does not change: every stored group is a channel
+         group, recording is a facet it may or may not have turned on
+         (DESIGN-channel-groups-model.md DECIDED 2). What changes is the claim the
+         tooltip makes, which has to match what `records` says. #}
+      {% if is_stored and records %}
+      <span class="gd-kind tip-plain" data-tip="Channel group.&#10;Appears in the TV Guide as one row. Records the best enabled channel and fails over to the next-best feed.">&#9939;</span>
+      {% elif is_stored %}
+      <span class="gd-kind tip-plain" data-tip="Channel group.&#10;Duplicate feeds of one channel. No member is enabled for recording, so nothing records from it and it holds no guide row - it is a health check until Recording is turned on for a member.">&#9939;</span>
+      {% else %}
+      <span class="gd-kind tip-plain" data-tip="Health check.&#10;A set of channels tested on a schedule to confirm they still play. Never appears in the guide, never records.">&#10003;</span>
+      {% endif %}
+      <h2>{{ group.name }}</h2>
+      {% if is_system %}
+      <span class="badge b-auto tip-plain" data-tip="Automatic group.&#10;ChannelBin maintains this one. Its channels are every TV Guide channel with testing enabled, recalculated whenever the guide changes. You cannot edit or delete it.">Automatic</span>
+      {% endif %}
+      {% if is_stored and group.health_score is not none %}
+      {% set hscore = [[group.health_score | round | int, 100] | min, 0] | max %}
+      <span class="h-mini {{ hscore | health_css(health_bands) }} tip-plain"
+            data-tip="Group health {{ hscore }}.&#10;Total-churn recording quality across all channels, weighted toward the feeds recordings actually use. Built from {{ group.health_score_sample_count }} recording observation{{ 's' if group.health_score_sample_count != 1 else '' }}.">&#9733; {{ hscore }}</span>
+      {% endif %}
+      {% if is_stored and group.in_guide %}
+      {# Group membership stopped hiding a member's own guide row in dev/changelog/751 -
+         a channel and a group it belongs to may both hold one, which is the user's call
+         to make and to undo. #}
+      <span class="badge b-done tip-plain" data-tip="In Guide.&#10;This group renders as a single TV Guide row. A member that also has its own guide row keeps it.">In Guide</span>
+      {% endif %}
+      {# The paired half, named. It scrolls to the `linked` section rather than
+         navigating, because one page already carries both halves (changelog 323). #}
+      {% if is_stored and checks %}
+      {% set other_name = checks[0].name if checks | length == 1 else (checks | length) ~ ' health checks' %}
+      <span class="gd-pair-badge tip-plain" data-jump="gd-linked"
+            data-tip="Linked health check.&#10;&quot;{{ other_name }}&quot; is paired with this channel group. They are separate things sharing one channel list - click to jump to it.">&#10003; {{ other_name }}</span>
+      {% endif %}
+    </div>
+    {# What this group IS, in the model's one noun. `records` leads because it is the
+       only one of the three flags that says whether anything comes out of this group;
+       a group with no member enabled for recording is a health check, which is the
+       sentence the Groups list page already uses for the same state. The system group
+       is the terminal branch because `is_stored` is exactly `not is_system` - there is
+       no fourth state to fall through to. #}
+    <p class="gd-sub-lead">
+      {% if is_stored and records and has_check %}
+      A channel group of {{ payload.total }} feed{{ 's' if payload.total != 1 else '' }} that records with failover,
+      plus {{ 'one paired health check testing' if checks | length == 1 else (checks | length) ~ ' paired health checks testing' }}
+      those same feeds on a schedule.
+      {% elif is_stored and records %}
+      A channel group. Records the best-scoring enabled channel and fails over to the next-best feed
+      if the stream drops. No health check is attached yet.
+      {% elif is_stored and has_check %}
+      A channel group of {{ payload.total }} feed{{ 's' if payload.total != 1 else '' }} with no member enabled for
+      recording, so nothing records from it yet - it is a health check, testing those feeds on a
+      schedule. Turning Recording on for a member is what promotes it.
+      {% elif is_stored %}
+      A channel group of {{ payload.total }} feed{{ 's' if payload.total != 1 else '' }} with no member enabled for
+      recording, so nothing records from it yet, and no health check is attached to test the feeds
+      either. Turning Recording on for a member is what promotes it.
+      {% else %}
+      Tests every channel currently in your <a href="{{ url_for('guide.guide') }}">TV Guide</a>. Its channel list is
+      computed from the guide and updates itself - add or remove channels from the
+      <a href="{{ url_for('channels.channel_browser') }}">Browse</a> tab.
+      {% endif %}
+    </p>
+  </div>
+  <div class="gd-dates">
+    Created {{ created_et }}<br>
+    Updated {{ updated_et }}
+    {% if cloned_from %}
+    <br>
+    {% if cloned_from.detail_url %}
+    Cloned from <a href="{{ cloned_from.detail_url }}">{{ cloned_from.name }}</a>
+    {% else %}
+    Cloned from {{ cloned_from.name }} (deleted)
+    {% endif %}
+    {% endif %}
+  </div>
+</div>
+
+{# ── The state zone: the banners and the status/action bar ──────────────────
+     One wrapper because the two swap order at phone width. On a desktop this element is
+     `display: contents` and is not a box at all, so the order below is exactly what
+     renders; at ≤768 it becomes a flex column and the status bar is pulled above the
+     banners (DESIGN-channel-groups-model.md §17, mockup 34's R5). Measured at 375px: with
+     two banners firing the bar started 1,022px down the document, so the page opened on
+     advisories with every one of its own controls below the fold. #}
+<div class="gd-statezone">
+
+{# ── Warning banners. Above the status bar on purpose (272 round 11): a problem with
+     the group should be read before the "completed / last run" line. ─────── #}
+{# The four format/EPG banners of DESIGN-channel-groups-model.md §16 and §15.2. Rendered
+   entirely by renderBanners() in group-detail.js - their gating reads the live
+   participation switches and the live format lock, both of which move without a reload,
+   so a Jinja copy would go stale the moment a switch is clicked. Server-rendered initial
+   state is therefore the "nothing active" state, which is what the empty hidden divs are. #}
+{# §16's explainer, shown once above the whole stack rather than repeated inside each
+   mutable banner (DESIGN-channel-groups-model.md:1108). #}
+<div class="gd-sub gd-bannote" id="gd-banner-explainer" style="display:none;"></div>
+<div class="notice notice-bad" id="gd-format-banner" style="display:none;"></div>
+<div class="notice notice-bad" id="gd-override-banner" style="display:none;"></div>
+<div class="notice notice-warn" id="gd-epg-banner" style="display:none;"></div>
+<div class="notice-banner" id="gd-nowinner-banner" style="display:none;"></div>
+{# §15's breach state: in the guide with nothing switched on for recording. Not mutable -
+   16.2 keeps the explanation for why a thing is not working out of the hide-able set. #}
+<div class="notice notice-bad" id="gd-broken-banner" style="display:none;"></div>
+{# The drift-coverage warning. Was server-rendered until dev/changelog/757, which meant it
+   went on claiming a member was unmonitored after its Health check switch was turned back
+   on, until the page was reloaded. Same contract as every banner above it now. #}
+<div class="notice notice-warn" id="gd-unmonitored-banner" style="display:none;"></div>
+{# Sole updater for this region is renderDupBanner() in group-detail.js, so the
+   load-time and post-refresh states cannot drift apart. #}
+<div id="gd-dup-banner" class="notice-banner" style="display:none;"></div>
+{# Sole updater for this region is renderMissingBanner() in group-detail.js, same
+   contract as the duplicates banner above. #}
+<div id="gd-missing-banner" class="notice-banner" style="display:none;"></div>
+
+{# ── Status / action bar ────────────────────────────────────────────────── #}
+<div class="gd-actionbar" id="gd-inline-actionbar">
+  <span id="gd-status-badge">
+    {% if has_check %}
+      {% if job.status == 'RUNNING' and tester_status.is_running and tester_status.current_job_id == job.id %}
+      {# b-running, not b-live: b-live is the recording red, and a health check that is
+         simply doing its job must not read as an alarm (§17.1 group C). #}
+      <span class="badge b-running"><span class="pulse"></span>Running</span>
+      {% elif job.status == 'RUNNING' %}
+      <span class="badge b-warn">Stuck</span>
+      {% elif job.status == 'SCHEDULED' %}<span class="badge b-auto">Scheduled</span>
+      {% elif job.status == 'CANCELLED' %}<span class="badge b-abort">Cancelled</span>
+      {% elif job.status == 'QUEUED' %}<span class="badge b-abort">Queued</span>
+      {% else %}<span class="badge b-done">Completed</span>{% endif %}
+    {% else %}
+    <span class="badge b-auto">&#9939; Channel group</span>
+    {% endif %}
+  </span>
+  <span class="gd-ab-msg">
+    {% if has_check %}
+      {% if job.status == 'RUNNING' and tester_status.is_running and tester_status.current_job_id == job.id %}
+      {# Live region. group-detail.js::updateActionBarMsg is the sole updater once the page
+         is up - this is only the first frame of it, and both must render the same sentence
+         for each phase or the bar rewords itself on the first poll. #}
+      {% if tester_status.current_phase == 'waiting' %}
+      Between channels - {{ tester_status.completed_channels }} of {{ tester_status.total_channels }} done.
+      {% else %}
+      Testing channel {{ tester_status.completed_channels + 1 }} of {{ tester_status.total_channels }}.
+      {% endif %}
+      {% elif job.status == 'RUNNING' %}
+      The test process stopped unexpectedly.
+      {% elif job.status == 'SCHEDULED' %}
+      {{ schedule.label }}{% if schedule.next_run_et %} - next run <strong>{{ schedule.next_run_et }}</strong>{% endif %}.
+      {% elif job.status == 'QUEUED' %}
+      This check is waiting to run.
+      {% elif job.status == 'CANCELLED' %}
+      This check was cancelled before it finished.
+      {% else %}
+      Last run {{ last_run_et or 'never' }}.
+      {% endif %}
+    {# `in_guide` alone is not enough to claim a recording: _guide_row_entries() skips a
+       group whose recording_members() is empty, so the flag can be set and the guide
+       still draw no row. Saying so is the whole point of the state
+       (DESIGN-channel-groups-model.md 15). #}
+    {% elif group.in_guide and records %}
+    Recording from the best channel, failing over automatically.
+    {% elif group.in_guide %}
+    In the TV Guide, but no member is enabled for recording - the guide draws no row for this
+    group until one is.
+    {% else %}
+    Not in the TV Guide.
+    {% endif %}
+  </span>
+  <div class="gd-ab-actions" id="gd-inline-actions">
+    {% if has_check %}
+      {% if job.status == 'RUNNING' and tester_status.is_running and tester_status.current_job_id == job.id %}
+      <button class="btn btn-danger btn-sm" data-act="stop">Stop</button>
+      {% elif job.status == 'RUNNING' %}
+      <button class="btn btn-danger btn-sm" data-act="force-cancel">Force Cancel</button>
+      {% elif job.status == 'SCHEDULED' and not job.recurring %}
+      <button class="btn btn-primary btn-sm" data-act="run-now">&#9654; Run now</button>
+      {% elif job.status == 'CANCELLED' %}
+      <button class="btn btn-primary btn-sm" data-act="resume">Resume</button>
+      {% elif job.status == 'QUEUED' %}
+      <button class="btn btn-primary btn-sm" data-act="start">&#9654; Start now</button>
+      {% else %}
+      <button class="btn btn-primary btn-sm" data-act="restart">&#8635; Test again</button>
+      {% endif %}
+    {% endif %}
+    {# The four secondary actions leave the bar at phone width: .mobile-actbar clones this
+       element's children, and at 375px five buttons scroll sideways inside it with only two
+       reachable without a swipe (mockup 34 carries exactly three). Every one of them is
+       still one tap away in the overflow sheet, which reads the kebab and the card head. #}
+    {% if is_stored and not is_system and payload.total > 0 %}
+    <button class="btn btn-primary btn-sm gd-phone-hide" data-act="suggest"
+            data-tip="Add matching channels.&#10;Scans your channel library for feeds that look like the same channel already in this group (matched by name or EPG id) and lets you add them as extra failover sources.">+ Add Matching Channels</button>
+    {% endif %}
+    {% if not is_system %}
+    <a class="btn btn-primary btn-sm gd-phone-hide" href="{{ url_for('channels.channel_browser', add_to_group=group.id) }}"
+       data-tip="Add channels.&#10;Opens the full channel browser so you can search and hand-pick any channel to add to this group, including ones unrelated to what's already here.">+ Add Channels</a>
+    {% endif %}
+    {% if is_stored and not has_check %}
+    <button class="btn btn-sm gd-phone-hide" data-act="create-check"
+            data-tip="Create health check.&#10;Tests every feed in this group on a schedule and records how each one performed, so a dead or drifting channel is caught before a recording lands on it. Results appear in the Channels table below.">Create health check</button>
+    {% endif %}
+    {# Secondary on purpose: the primary action on a health check stays "Test again",
+       because creating a group off it is a deliberate one-off (changelog 323). #}
+    {% if not is_stored and not is_system %}
+    <button class="btn btn-sm gd-phone-hide" data-act="create-group"
+            data-tip="Create channel group.&#10;Bundles these channels into a TV Guide row that records with failover. This health check is not touched - the new group gets its own copy of the channel list.">&#9939; Create channel group</button>
+    {% endif %}
+    {% if is_stored %}
+    <button class="btn btn-sm" data-act="guide-toggle">{{ 'Remove from Guide' if group.in_guide else '+ Add to Guide' }}</button>
+    {% endif %}
+    <span class="menu-wrap">
+      <button class="btn btn-sm btn-icon" data-menu aria-label="More actions">&#8943;</button>
+      <div class="menu" id="gd-kebab">
+        {% if is_stored and not is_system %}
+        <button class="menu-item" data-act="rename">Rename</button>
+        {% endif %}
+        {% if is_stored and not has_check and not is_system %}
+        <button class="menu-item" data-act="create-check">Schedule health check</button>
+        {% endif %}
+        {% if not is_stored and not is_system %}
+        <button class="menu-item" data-act="create-group">Create a channel group&hellip;</button>
+        {% endif %}
+        {% if has_check %}
+        <button class="menu-item" data-act="schedule">Schedule health check</button>
+          {% if job.recurring and not job.recur_paused %}
+          <button class="menu-item" data-act="pause-schedule">Pause schedule</button>
+          <button class="menu-item" data-act="skip-next">Skip next run</button>
+          {% elif job.recurring %}
+          <button class="menu-item" data-act="resume-schedule">Enable schedule</button>
+          {% endif %}
+          {% if job.status == 'SCHEDULED' and not is_system %}
+          <button class="menu-item" data-act="unschedule">Unschedule</button>
+          {% endif %}
+          {% if job.status == 'CANCELLED' %}
+          <button class="menu-item" data-act="start-over">Start over</button>
+          {% endif %}
+        {% endif %}
+        {% if is_stored and not is_system %}
+        <button class="menu-item" data-act="pick-format">Pick best format&hellip;</button>
+        {% endif %}
+        <div class="sep"></div>
+        <button class="menu-item" data-act="sections">Customize sections&hellip;</button>
+        <button class="menu-item" data-act="settings">Settings</button>
+        <div class="sep"></div>
+        {% if not is_system %}
+        <button class="menu-item" data-act="clone">Clone</button>
+        {% endif %}
+        <button class="menu-item" data-act="dedup" id="gd-kebab-dedup"
+                {{ 'disabled' if is_system or not payload.dup_groups else '' }}>Review duplicates&hellip;</button>
+        <button class="menu-item" data-act="delete-missing" id="gd-kebab-missing"
+                {{ 'disabled' if not payload.missing_channels else '' }}>Delete missing channels&hellip;</button>
+        <div class="sep"></div>
+        {% if is_stored and not is_system %}
+        <button class="menu-item danger" data-act="delete-group">Delete group</button>
+        {% endif %}
+      </div>
+    </span>
+  </div>
+</div>
+<div id="gd-action-error" class="gd-action-error" style="display:none;"></div>
+</div>{# /.gd-statezone #}
+
+{# ── Live progress hero + activity log (a running check only) ───────────── #}
+{% set _live = has_check and tester_status.is_running and tester_status.current_job_id == job.id %}
+<div id="gd-hero" class="gd-hero" style="{{ '' if _live else 'display:none' }}">
+  <div class="gd-hero-top">
+    <div class="gd-hero-what">
+      <div class="gd-hero-phase" id="gd-hero-phase">Testing channel</div>
+      <div class="gd-hero-name" id="gd-hero-name">{{ tester_status.current_channel_name if _live else '' }}</div>
+      <div class="gd-hero-url" id="gd-hero-url">{{ tester_status.current_channel_url if _live else '' }}</div>
+    </div>
+    <button class="btn btn-danger btn-sm" data-act="stop">Stop</button>
+  </div>
+  <div class="hero-progress">
+    <div class="hero-progress-bar" id="gd-hero-bar"
+         style="width:{{ ((tester_status.completed_channels / tester_status.total_channels * 100) | int) if tester_status.total_channels else 0 }}%"></div>
+  </div>
+  <div class="hero-stats-row">
+    <div class="hero-stat" id="gd-hs-elapsed-stat">
+      <div class="hero-stat-val" id="gd-hs-elapsed">&mdash;</div>
+      <div class="hero-stat-lbl">Test elapsed</div>
+    </div>
+    <div class="hero-stat">
+      <div class="hero-stat-val" id="gd-hs-drops">{{ tester_status.current_test_drop_count or 0 }}</div>
+      <div class="hero-stat-lbl">Drops</div>
+    </div>
+    <div class="hero-stat">
+      <div class="hero-stat-val" id="gd-hs-data">&mdash;</div>
+      <div class="hero-stat-lbl">Data recv</div>
+    </div>
+    <div class="hero-stat">
+      <div class="hero-stat-val" id="gd-hs-run-elapsed">&mdash;</div>
+      <div class="hero-stat-lbl">Run elapsed</div>
+    </div>
+    <div class="hero-stat">
+      <div class="hero-stat-val" id="gd-hs-progress">{{ tester_status.completed_channels }}/{{ tester_status.total_channels }}</div>
+      <div class="hero-stat-lbl">Progress</div>
+    </div>
+  </div>
+  <div id="gd-hero-shot-wrap" style="display:none;">
+    <div class="gd-hero-shot-lbl">Channel screenshot</div>
+    <img id="gd-hero-shot" alt="Current channel screenshot">
+  </div>
+</div>
+
+<div id="gd-log-card" class="card gd-log-card" style="{{ '' if _live else 'display:none' }}">
+  <div class="card-head">
+    <h2>Activity log</h2>
+    <div class="card-head-actions">
+      <span class="text-muted small" id="gd-log-count"></span>
+      <button class="btn btn-sm" id="gd-log-copy">Copy</button>
+    </div>
+  </div>
+  <div class="card-body">
+    <div id="gd-test-log" class="ch-test-log"><span class="gd-log-empty text-muted">No activity yet.</span></div>
+  </div>
+</div>
+
+{# ── Reorderable sections ───────────────────────────────────────────────── #}
+<div class="gd-sections" id="gd-sections">
+
+  {# Summary: the rolling group-health score beside the last run's part-to-whole bar.
+     Both halves read the same numbers the table below renders, so they cannot
+     disagree (DESIGN.md 14.7). The vertical rule only exists when both are present. #}
+  <div class="card" data-section="summary">
+    <div class="card-head"><h2>Summary</h2></div>
+    <div class="card-body">
+      <div class="gd-sum">
+        {% if is_stored %}
+        <div class="gd-sum-score-wrap">
+          <div class="gd-sum-lbl">Group health</div>
+          {% if group.health_score is not none %}
+          {% set hscore = [[group.health_score | round | int, 100] | min, 0] | max %}
+          <div class="gd-sum-score {{ hscore | health_css(health_bands) }} tip-plain"
+               data-tip="Group health {{ hscore }}.&#10;A rolling 0-100 quality score across all recorded channels, weighted toward the feeds recordings actually use. Built from {{ group.health_score_sample_count }} recording observation{{ 's' if group.health_score_sample_count != 1 else '' }} over time - not the last run alone.">{{ hscore }}</div>
+          {% else %}
+          <div class="gd-sum-note">No health yet - record once from this group and it scores here.</div>
+          {% endif %}
+        </div>
+        {% endif %}
+        {% if is_stored and has_check %}<div class="gd-sum-rule"></div>{% endif %}
+        {% if has_check %}
+        <div class="gd-sum-bar-wrap">
+          <div class="gd-sum-lbl" id="gd-sum-lbl-run">Last run results</div>
+          <div class="gd-sum-track" id="gd-sum-track"></div>
+          <div class="gd-sum-legend" id="gd-sum-legend"></div>
+        </div>
+        {% endif %}
+      </div>
+    </div>
+  </div>
+
+  {# Linked: the schedules this group carries, as something you can see and act on rather
+     than a chip in the title bar (changelog 323). A health check is a schedule a group
+     holds, never a second object (DESIGN-channel-groups-model.md DECIDED 2), so there are
+     three states: a group with schedules, a group without, and the automatic check. #}
+  <div class="card" data-section="linked" id="gd-linked">
+    <div class="card-head">
+      <h2>{{ linked_title }}{% if is_stored %}<span class="cnt">{{ checks | length }}</span>{% endif %}</h2>
+      {% if is_stored %}
+      <div class="card-head-actions">
+        <button class="btn btn-sm" data-act="create-check">{{ '+ Add another' if checks else '+ Add health check' }}</button>
+      </div>
+      {% endif %}
+    </div>
+    <div class="card-body">
+      {% if is_stored and checks %}
+      <p class="card-note">
+        {{ 'This is a schedule' if checks | length == 1 else 'These are schedules' }} this group carries, so
+        {{ 'it tests' if checks | length == 1 else 'they test' }} whatever channels the group holds - there is one
+        channel list, not two. {{ 'It can' if checks | length == 1 else 'They can' }} be run, rescheduled or
+        removed without touching the group; removing {{ 'it' if checks | length == 1 else 'them all' }} leaves the
+        group relying on the automatic TV Guide check, which tests one member on its behalf and no others.
+      </p>
+      {% for c in checks %}
+      <div class="linked-item">
+        <span class="gd-kind">&#10003;</span>
+        <span class="li-name">{{ c.name }}</span>
+        <span class="badge {{ {'ok': 'b-done', 'bad': 'b-fail', 'warn': 'b-warn', 'run': 'b-running', 'none': 'b-abort'}[c.health_cls] }}">{{ c.health_label }}</span>
+        {% if c.profile_name %}<span class="grp-meta small">Profile: {{ c.profile_name }}</span>{% endif %}
+        <span class="li-actions">
+          <button class="btn btn-sm" data-act="run-linked-check" data-job="{{ c.job_id }}">Run now</button>
+          <a class="btn btn-sm" href="{{ c.detail_url }}">Open</a>
+        </span>
+      </div>
+      {% endfor %}
+      {% elif is_stored %}
+      <p class="card-note">
+        This group carries no schedule of its own. The automatic TV Guide check tests one member on
+        its behalf - the one currently serving the group - so a format drift on any other member
+        goes unnoticed until a recording lands on it.
+      </p>
+      {% else %}
+      <p class="card-note">
+        This is the automatic TV Guide health check. Its channel list is computed rather than stored:
+        one channel per guide row - a standalone channel, or the member currently serving a group's
+        row - plus one member of any group that carries no schedule of its own.
+      </p>
+      {% endif %}
+    </div>
+  </div>
+
+  {# Settings: a bar of chips, each opening the one Settings modal focused on its own
+     block. The chip carries the value; the tooltip carries the explanation. #}
+  <div class="card" data-section="settings">
+    <div class="card-head">
+      <h2>Settings</h2>
+      <div class="card-head-actions">
+        <button class="btn btn-sm" data-act="settings">Edit settings</button>
+      </div>
+    </div>
+    <div class="card-body">
+      <div class="gd-setbar" id="gd-setbar"></div>
+    </div>
+  </div>
+
+  {# Channels: one merged table. Each row is a member AND carries its latest test
+     result; the caret opens that feed's stream-quality profile. Columns are
+     facet-gated and user-customizable via the Columns popover. #}
+  <div class="card" data-section="channels">
+    <div class="card-head">
+      <h2>Channels<span class="cnt" id="gd-chan-count">{{ payload.total }}</span></h2>
+      <div class="card-head-actions">
+        {% if is_stored and not is_system and payload.total > 0 %}
+        <button class="btn btn-primary btn-sm gd-phone-hide" data-act="suggest"
+                data-tip="Add matching channels.&#10;Scans your channel library for feeds that look like the same channel already in this group (matched by name or EPG id) and lets you add them as extra failover sources.">+ Add Matching Channels</button>
+        {% endif %}
+        {% if not is_system %}
+        <a class="btn btn-primary btn-sm" href="{{ url_for('channels.channel_browser', add_to_group=group.id) }}"
+           data-tip="Add channels.&#10;Opens the full channel browser so you can search and hand-pick any channel to add to this group, including ones unrelated to what's already here.">+ Add Channels</a>
+        {% endif %}
+        <span class="search-wrap" id="gd-search-wrap">
+          <input class="search" id="gd-search" placeholder="Filter by channel name&hellip;">
+          <button class="search-clear" id="gd-search-clear" type="button" aria-label="Clear search"
+                  data-tip="Clear filter.&#10;Empties the box and shows every channel again.">&times;</button>
+        </span>
+        {# ONE filter control (DESIGN.md 3.11), not four standing ones. + Filter opens the
+           dimension list; every chosen value comes back as its own removable chip, so the
+           bar costs one control when nothing is filtered and names each filter that IS on
+           instead of summarizing it inside a label.
+
+           Which dimensions get offered is a registry in group-detail.js, read by the
+           shared static/js/filter-bar.js. The facet gating that used to be a Jinja
+           conditional around each control is an `available()` on the dimension now, so
+           the chip itself is unconditional here.
+
+           DECIDED 6 chose two participation checkboxes over a multiselect specifically so
+           the Recording and Health check dimensions can exist: a list that cannot answer
+           "which members record but are not being checked" has missed the point of the
+           columns. #}
+        <div class="chips gd-phone-hide" id="gd-filter-chips">
+          <div class="menu-wrap">
+            <button class="chip" id="gd-filter-add" type="button" data-menu
+                    data-tip="Filter.&#10;Narrow the list by participation, status, format, FPS, audio, account, tag or test age. Each filter you add becomes a chip you can click to remove.">&#43; Filter</button>
+            <div class="menu pop-left" id="gd-filter-menu"></div>
+          </div>
+        </div>
+        <span class="menu-wrap gd-phone-hide">
+          <button class="btn btn-sm" data-menu>&#9881; Columns</button>
+          <div class="menu" id="gd-col-menu">
+            <div class="pop-title">Columns - drag &#8942;&#8942; to reorder</div>
+            <div class="pop-note">Saved to the server - follows you across browsers. Kept separately
+              for a health-check view and a channel-group-only view.</div>
+          </div>
+        </span>
+      </div>
+    </div>
+    <div class="card-body">
+      {# Selection exists wherever there is a bulk verb to apply. A stored group always has
+         two of them (the participation switches); a check adds Test selected. #}
+      {% if has_check or is_stored %}
+      <div class="gd-bulkbar">
+        <label class="gd-bulk-lbl"><input type="checkbox" id="gd-select-all"> Select all visible</label>
+        <span class="text-muted small" id="gd-sel-count">0 selected</span>
+        <button class="btn btn-sm" id="gd-clear-selection" style="display:none;">Clear</button>
+        {% if has_check %}
+        <button class="btn btn-primary btn-sm" id="gd-test-selected" disabled>&#9654; Test selected</button>
+        {% endif %}
+        {% if is_stored %}
+        {# Setting one switch 30 times is the work the columns exist to make cheap, so the
+           selection gets the same two verbs a row does. Both go through the same route,
+           and therefore the same single writer, as the row switches. #}
+        <span class="menu-wrap">
+          <button class="btn btn-sm" id="gd-bulk-rec" data-menu disabled
+                  data-tip="Recording.&#10;Turn the Recording switch on or off for every selected member at once.">Recording &#9662;</button>
+          <div class="menu">
+            <button class="menu-item" data-bulk="rec:on">Turn on</button>
+            <button class="menu-item" data-bulk="rec:off">Turn off</button>
+          </div>
+        </span>
+        <span class="menu-wrap">
+          <button class="btn btn-sm" id="gd-bulk-test" data-menu disabled
+                  data-tip="Health check.&#10;Turn the Health check switch on or off for every selected member at once.">Health check &#9662;</button>
+          <div class="menu">
+            <button class="menu-item" data-bulk="test:on">Turn on</button>
+            <button class="menu-item" data-bulk="test:off">Turn off</button>
+          </div>
+        </span>
+        {% endif %}
+        <span class="gd-action-error" id="gd-bulk-error" style="display:none;"></span>
+        <span class="text-muted small" id="gd-row-count" style="margin-left:auto;"></span>
+      </div>
+      {% else %}
+      <div class="gd-bulkbar">
+        <span class="text-muted small" id="gd-row-count" style="margin-left:auto;"></span>
+      </div>
+      {% endif %}
+      {# ── The phone's chrome (mockup 34, M2/M3/R6) ────────────────────────────
+         The app's own .toolbar, so the chips take --ctl-h and the row gets the shared
+         gap and margins - a bare .chip is 4px of padding and lands at ~28.5px, and it
+         only reaches the control height by sitting inside a .toolbar.
+
+         Three chips, not four separate filter controls: those fit a 1440 toolbar and
+         nothing like 375, so they collapse into ONE Filters sheet carrying a count. The
+         count is what replaces being able to see four controls at once, and it is the
+         only thing the four separate controls were doing better.
+
+         The search box is NOT repeated here - #gd-search up in .card-head-actions is
+         already full width on its own line at this breakpoint (the .card-head wrap rule
+         in style.css), and two inputs would be two sources of truth for one filter. #}
+      <div class="toolbar gd-phonebar">
+        <div class="chips">
+          <button class="chip" id="gd-chip-sort" type="button"
+                  data-tip="Sort.&#10;Choose the field the list is ordered by. Tapping the field it is already on flips the direction."></button>
+          <button class="chip" id="gd-chip-filter" type="button"
+                  data-tip="Filters.&#10;Participation, status, account and test age, plus which fields each card draws. The number is how many filters are on."></button>
+          {% if has_check or is_stored %}
+          <button class="chip" id="gd-chip-select" type="button"
+                  data-tip="Select.&#10;Turn on the checkboxes so an action can be applied to several members at once."></button>
+          {% endif %}
+        </div>
+      </div>
+      {# One member per card below 768. Rendered by the same module and from the same rows
+         as the table beside it - group-detail.js draws into exactly one of the two, so
+         neither is a hidden second copy of the list. #}
+      <div class="gm-list" id="gd-list"></div>
+      <div class="table-scroll">
+        <table class="gd-table">
+          <thead id="gd-thead"></thead>
+          <tbody id="gd-tbody"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <div class="card" data-section="activity">
+    <div class="card-head"><h2>Activity timeline</h2></div>
+    <div class="card-body">
+      {# What this list is scoped to. Entering by check URL narrows its health tests to
+         that check's runs; entering by group shows every check the group ran. Said
+         rather than inferred - a reader taking one check's page for a log of that
+         check's work is the defect this replaced (dev/changelog/790). #}
+      <p class="text-muted small">{{ timeline_scope }}</p>
+      {% if not timeline_entries %}
+      <p class="text-muted small">No activity recorded for this group yet.</p>
+      {% else %}
+      <div class="test-history-controls">
+        <select class="form-control" style="width:auto"
+                onchange="window.location.href = '{{ request.path }}?timeline_per_page=' + this.value">
+          {% for size in page_sizes %}
+          <option value="{{ size }}" {% if size == timeline_per_page %}selected{% endif %}>{{ 'All' if size == 'all' else size + ' per page' }}</option>
+          {% endfor %}
+        </select>
+        {% if timeline_pagination and timeline_pagination.pages > 1 %}
+        <div class="test-history-pagination">
+          {% if timeline_pagination.has_prev %}
+          <a href="{{ request.path }}?timeline_per_page={{ timeline_per_page }}&timeline_page={{ timeline_pagination.prev_num }}" class="btn btn-sm">&larr; Prev</a>
+          {% endif %}
+          <span class="text-muted small">Page {{ timeline_pagination.page }} of {{ timeline_pagination.pages }}</span>
+          {% if timeline_pagination.has_next %}
+          <a href="{{ request.path }}?timeline_per_page={{ timeline_per_page }}&timeline_page={{ timeline_pagination.next_num }}" class="btn btn-sm">Next &rarr;</a>
+          {% endif %}
+        </div>
+        {% endif %}
+      </div>
+      {% set entries = timeline_entries %}
+      {% set show_source = true %}
+      {% include 'channels/_timeline.html' with context %}
+      {% endif %}
+    </div>
+  </div>
+</div>
+
+{# Keeps the last card clear of the sticky bar rather than under it. Reserved
+   unconditionally, never toggled with the bar - see the rule's own comment. #}
+<div class="gm-botpad"></div>
+
+{# ── The sticky bottom action bar at phone width (DESIGN.md 9.5) ────────────
+   .mobile-actbar is the app's own bar, unedited; .actbar-reveal is the accounts page's
+   scroll-reveal, promoted off its class so any page carrying both an inline bar and a
+   sticky one can use it. Filled by group-detail.js, which CLONES the inline
+   .gd-ab-actions rather than rendering a second copy of it - the guide button's label
+   changes with state, and two renderers of one control drift. #}
+<div class="mobile-actbar actbar-reveal" id="gd-bottombar" aria-hidden="true"></div>
+
+{# The one-off / recurring schedule picker, reused verbatim from the live page's
+   Schedule modal. Hidden here; the Settings modal moves it into its own body so
+   there is exactly one copy of these inputs on the page. #}
+<template id="gd-schedule-fields">
+  {{ m.recur_schedule_fields('gdsched', 'Start Time', window_label) }}
+</template>
+
+{# Same macro again for the Create-health-check modal, with its own prefix: both modals
+   can be opened from this page, so the two sets of inputs must not share ids. #}
+<template id="cc-schedule-fields">
+  {{ m.recur_schedule_fields('ccsched', 'Start Time', window_label) }}
+</template>
+{% endblock %}
+
+{% block scripts %}
+<script>
+window.GROUP_DETAIL = {
+  groupId: {{ group.id }},
+  groupName: {{ group.name | tojson }},
+  jobId: {{ job.id if has_check else 'null' }},
+  jobName: {{ (job.name if has_check else None) | tojson }},
+  jobStatus: {{ (job.status if has_check else None) | tojson }},
+  jobRecurring: {{ 'true' if has_check and job.recurring else 'false' }},
+  checks: {{ checks | tojson }},
+  linkedTitle: {{ linked_title | tojson }},
+  hasChannel: {{ 'true' if is_stored else 'false' }},
+  hasCheck: {{ 'true' if has_check else 'false' }},
+  isSystem: {{ 'true' if is_system else 'false' }},
+  inGuide: {{ 'true' if group.in_guide else 'false' }},
+  secKey: {{ sec_key | tojson }},
+  colKey: {{ col_key | tojson }},
+  sections: {{ sections | tojson }},
+  sectionPref: {{ section_pref | tojson }},
+  columns: {{ columns | tojson }},
+  columnsOff: {{ columns_off | tojson }},
+  columnPref: {{ column_pref | tojson }},
+  rows: {{ payload.rows | tojson }},
+  counts: {{ payload.counts | tojson }},
+  total: {{ payload.total }},
+  dupGroups: {{ payload.dup_groups | tojson }},
+  missingChannels: {{ payload.missing_channels | tojson }},
+  missingPreviewUrl: {{ url_for('channels.missing_delete_preview') | tojson }},
+  missingDeleteUrl: {{ url_for('channels.missing_delete') | tojson }},
+  referenceLabel: {{ payload.reference_label | tojson }},
+  lockLabel: {{ payload.lock_label | tojson }},
+  warnings: {{ payload.warnings | tojson }},
+  groupFormat: {{ group_format | tojson }},
+  resolutionOptions: {{ resolution_options | tojson }},
+  fpsOptions: {{ fps_options | tojson }},
+  schedule: {{ schedule | tojson }},
+  profiles: [{% for p in health_check_profiles %}{ id: {{ p.id }}, name: {{ p.name | tojson }} }{{ ',' if not loop.last }}{% endfor %}],
+  profileId: {{ (job.profile_id if has_check else None) | tojson }},
+  profileName: {{ ((job.profile.name if job.profile else 'Default settings') if has_check else None) | tojson }},
+  profilesUrl: {{ url_for('health_check_profiles.health_check_profiles_list') | tojson }},
+  checkProfiles: {{ check_profiles | tojson }},
+  inheritedCheck: {{ inherited_check | tojson }},
+  testerBusy: {{ 'true' if tester_status.is_running else 'false' }},
+  {# Where the maintenance window's hours live. The settings page reads ?q= off its own
+     URL and applies it as the page search (static/js/settings.js) - there is no anchor
+     to link at. #}
+  windowSettingsUrl: {{ (url_for('settings.settings') ~ '?q=Maintenance+window') | tojson }},
+  groupNames: {{ group_names | tojson }},
+  groupsUrl: {{ url_for('channel_groups.groups_page') | tojson }},
+  browseUrl: {{ url_for('channels.channel_browser') | tojson }},
+};
+</script>
+<script src="{{ url_for('static', filename='js/format-plan.js') }}"></script>
+<script src="{{ url_for('static', filename='js/create-group-modal.js') }}"></script>
+<script src="{{ url_for('static', filename='js/format-picker-modal.js') }}"></script>
+{# §14.1's promotion walkthrough. After format-plan.js, whose helpers it renders with. #}
+<script src="{{ url_for('static', filename='js/group-promote-modal.js') }}"></script>
+<script src="{{ url_for('static', filename='js/schedule-fields.js') }}"></script>
+<script src="{{ url_for('static', filename='js/check-modal.js') }}"></script>
+<script src="{{ url_for('static', filename='js/clone-check-modal.js') }}"></script>
+<script src="{{ url_for('static', filename='js/clone-modal.js') }}"></script>
+<script src="{{ url_for('static', filename='js/dup-modal.js') }}"></script>
+<script src="{{ url_for('static', filename='js/missing-modal.js') }}"></script>
+<script src="{{ url_for('static', filename='js/group-modal.js') }}"></script>
+<script src="{{ url_for('static', filename='js/group-delete.js') }}"></script>
+{# Ahead of group-detail.js, which builds its filter bar at load (DESIGN.md 3.11). #}
+<script src="{{ url_for('static', filename='js/filter-bar.js') }}"></script>
+<script src="{{ url_for('static', filename='js/group-detail.js') }}"></script>
+{% endblock %}

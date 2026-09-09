@@ -1,0 +1,15 @@
+# flake8 runs pyflakes' checks and nothing else. It is here for the two things bare pyflakes
+# structurally cannot do: honor `# noqa` and skip a directory. See CONTRIBUTING.md "Linting".
+
+[flake8]
+# E9 alongside F is deliberate. F alone would filter out E999, so a file with a syntax error
+# would be silently skipped instead of reported. No style checks are enabled: this project has
+# never had a style linter and is not adopting one here.
+select = E9,F
+
+# extend-exclude, not exclude, so flake8's own defaults (.git, __pycache__, .tox) survive.
+# dev/tmp is gitignored measurement scratch; dev/demo/.epg-src is a vendored node_modules tree.
+extend-exclude =
+    dev/tmp,
+    dev/demo/.epg-src,
+    node_modules
