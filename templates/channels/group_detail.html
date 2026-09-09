@@ -681,6 +681,7 @@ window.GROUP_DETAIL = {
   missingDeleteUrl: {{ url_for('channels.missing_delete') | tojson }},
   referenceLabel: {{ payload.reference_label | tojson }},
   lockLabel: {{ payload.lock_label | tojson }},
+  derivedReferenceLabel: {{ payload.derived_reference_label | tojson }},
   warnings: {{ payload.warnings | tojson }},
   groupFormat: {{ group_format | tojson }},
   resolutionOptions: {{ resolution_options | tojson }},

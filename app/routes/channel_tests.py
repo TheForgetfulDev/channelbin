@@ -136,8 +136,14 @@ def _latest_tests_by_channel(channel_ids, for_job_id=ANY_JOB):
     for_job_id=<id>     → tests for this specific job (incl. the system guide job)
     for_job_id=ANY_JOB  → latest test regardless of job
 
-    Every ChannelTest row belongs to a job since the _m004 backfill; the old NULL
-    scope (pre-unification guide tests) no longer exists.
+    The _m004 backfill closed the old NULL scope (pre-unification guide tests), but
+    job_id NULL did NOT stop existing: a recording's pre-check writes its tests with no
+    job, identified by `pre_check_recording_id` instead. Those rows are reachable only
+    through ANY_JOB, so they feed the format lock and every any-job surface while being
+    invisible to every job-scoped one. That is deliberate - a pre-check is a real, and
+    usually the freshest, measurement of the feed - but it means `for_job_id=None` is
+    never the same thing as "no job selected": it filters on `job_id IS NULL` and returns
+    only pre-check rows. Callers with no job in hand pass ANY_JOB.
     """
     if not channel_ids:
         return {}

@@ -17,8 +17,16 @@ const FORMAT_STRATEGY_KEYS = [
   'highest_bitrate', 'highest_resolution', 'most_channels', 'balanced',
 ];
 
-function fetchFormatPlan(groupId, jobId) {
-  const qs = jobId ? `?job_id=${encodeURIComponent(jobId)}` : '';
+/* The plan is always over each member's own latest test regardless of job, because the
+   engine that would apply it reads the same thing - a job-scoped preview and an any-job
+   engine returned different winners indefinitely, with nothing on screen explaining why
+   (dev/changelog/890). There is deliberately no jobId parameter any more.
+
+   `opts.rankScope === 'all'` ranks over every member instead of the recording-enabled
+   ones; only the create/clone preview wants it, and only because the group it describes
+   does not exist yet. */
+function fetchFormatPlan(groupId, opts) {
+  const qs = (opts && opts.rankScope === 'all') ? '?rank_scope=all' : '';
   return jsonFetch(`/api/channel-groups/${groupId}/format-plan${qs}`);
 }
 
@@ -35,7 +43,27 @@ function formatPlanOptionLabel(plan, strategy, derived) {
   if (strategy === 'manual') return `${label} - you pick the format`;
   const entry = formatPlanEntry(plan, strategy, null, derived);
   if (!entry || !entry.key) return `${label} - no eligible format`;
-  return `${label} - ${entry.label} (${entry.count} channel${entry.count === 1 ? '' : 's'})`;
+  return `${label} - ${entry.label} (${formatPlanCounts(entry)})`;
+}
+
+/* The parenthetical after a format label: how many members measure it, how many of those
+   the group would actually record from, and whether every one of them is warning.
+
+   All three are here because all three were asked for by name after a picker offered
+   "Highest bitrate - 3840x2160 @ 50 (5 channels)" where the five were every one of them
+   warning, and where turning Recording off on all five left the count unchanged
+   (dev/changelog/890). A count the user cannot act on is principle 1's own example of a
+   number worth less than none. */
+function formatPlanCounts(entry) {
+  const n = entry.count || 0;
+  const parts = [`${n} channel${n === 1 ? '' : 's'}`];
+  // Omitted when it equals the total: on a group where every member records, "5 channels,
+  // 5 recording" is noise. It is only ever news when the two differ.
+  if (entry.rank_count != null && entry.rank_count !== n) {
+    parts.push(`${entry.rank_count} recording`);
+  }
+  if (n > 0 && entry.pass_count === 0) parts.push('all warning');
+  return parts.join(', ');
 }
 
 /* ── The standing group setting (DESIGN-channel-groups-model.md §4.4) ─────────
@@ -102,15 +130,25 @@ function formatPlanEntry(plan, strategy, pin, derived) {
   if (strategy === 'health_check_only' || strategy === 'unmanaged') return null;
   const buckets = (plan && plan.buckets) || [];
   const bucketFor = (key) => buckets.find((b) => b.label === key);
+  /* Both synthesized entries carry the same count fields the server's own entries do, so
+     formatPlanCounts() can describe any of the eight values without asking which kind of
+     entry it was handed. A label that has no bucket at all (a pin whose members have gone)
+     reports zeros rather than omitting the fields. */
+  const fromBucket = (key, b) => ({
+    key, label: key,
+    count: b ? b.count : 0,
+    rank_count: b ? b.rank_count : 0,
+    pass_count: b ? b.pass_count : 0,
+    warn_count: b ? b.warn_count : 0,
+  });
   if (strategy === 'manual') {
     if (!pin) return null;
-    const b = bucketFor(pin);
-    return { key: pin, label: pin, count: b ? b.count : 0 };
+    return fromBucket(pin, bucketFor(pin));
   }
   if (strategy === 'highest_score') {
-    if (!derived) return { key: null, label: null, count: 0 };
-    const b = bucketFor(derived);
-    return { key: derived, label: derived, count: b ? b.count : 0 };
+    if (!derived) return { key: null, label: null, count: 0, rank_count: 0,
+                           pass_count: 0, warn_count: 0 };
+    return fromBucket(derived, bucketFor(derived));
   }
   return (plan && plan.strategies && plan.strategies[strategy]) || null;
 }
@@ -129,35 +167,57 @@ function formatPlanEntry(plan, strategy, pin, derived) {
    zero. Omit it and the clause stays deliberately vague rather than stating a number
    this function cannot compute. */
 function formatPlanSummary(plan, strategy, pin, derived, memberCount, measuredCount) {
-  const total = memberCount || 0;
+  /* When the server ranked over a narrower population than the members it was handed -
+     the group's recording-enabled ones - the consequence line describes THAT population,
+     because it is the one the lock actually filters. Saying "records from 26 of 105
+     members" on a group where 76 of them are health-check-only describes a group the user
+     does not have. The caller's own counts still win when nothing was narrowed, which is
+     the create/clone preview: there `memberCount` is the kept set the user is editing
+     right now and the server has never seen it (dev/changelog/890). */
+  const narrowed = !!(plan && plan.rank_total != null && plan.rank_total !== plan.total);
+  const total = narrowed ? plan.rank_total : (memberCount || 0);
+  const measured = narrowed ? plan.rank_measured : measuredCount;
+  // Pluralized on the head noun, not on the tail: "member set to records" is what
+  // appending an s to the whole phrase produces.
+  const members = (n) => (narrowed ? `member${n === 1 ? '' : 's'} set to record`
+                                   : `member${n === 1 ? '' : 's'}`);
   if (strategy === 'health_check_only') {
     return 'This group is tested and nothing else. It cannot be added to the TV Guide and no ' +
       'recording will run from it until you choose one of the other strategies.';
   }
   if (strategy === 'unmanaged') {
-    return `No format is enforced, so all ${total} member${total === 1 ? '' : 's'} stay eligible ` +
+    return `No format is enforced, so all ${total} ${members(total)} stay eligible ` +
       'whatever they measure. A failover between two formats produces one file whose format ' +
       'changes partway through.';
   }
   const entry = formatPlanEntry(plan, strategy, pin, derived);
   if (!entry || !entry.key) {
-    return strategy === 'manual'
-      ? 'No format has been measured on this group yet, so there is nothing to pin. Run a health ' +
-        'check first, or choose a strategy that follows the data.'
-      : 'No format has enough healthy channels to build a group on.';
+    if (strategy === 'manual') {
+      return 'No format has been measured on this group yet, so there is nothing to pin. Run a ' +
+        'health check first, or choose a strategy that follows the data.';
+    }
+    // The server names the specific reason - no healthy formats, none the group records
+    // from, or nothing broad enough for Balanced - and those take three different actions
+    // to fix. Restating one sentence for all three here would throw that away.
+    return (plan && plan.strategies && plan.strategies[strategy]
+      && plan.strategies[strategy].rationale)
+      || 'No format has enough healthy channels to build a group on.';
   }
-  const nonMatch = Math.max(0, total - entry.count);
-  const head = `Records from ${entry.count} of ${total} member${total === 1 ? '' : 's'}.`;
+  // The matching count from the same population `total` counts, or the two halves of the
+  // sentence describe different groups.
+  const matched = narrowed ? (entry.rank_count || 0) : entry.count;
+  const nonMatch = Math.max(0, total - matched);
+  const head = `Records from ${matched} of ${total} ${members(total)}.`;
   if (nonMatch <= 0) return head;
-  if (measuredCount == null) {
+  if (measured == null) {
     return `${head} The others are skipped when a recording picks a member only where ` +
       'their measured format differs - a member that has never been tested stays ' +
       'eligible. Nothing is turned off.';
   }
   // Split the remainder into the two groups it is actually made of. They behave
   // differently, so one number covering both is the number nobody can explain.
-  const skipped = Math.max(0, Math.min(measuredCount, total) - entry.count);
-  const untested = Math.max(0, total - Math.min(measuredCount, total));
+  const skipped = Math.max(0, Math.min(measured, total) - matched);
+  const untested = Math.max(0, total - Math.min(measured, total));
   const parts = [];
   if (skipped > 0) {
     parts.push(`${skipped} measure${skipped === 1 ? 's' : ''} a different format and ` +
@@ -198,7 +258,9 @@ function formatPlanTable(plan, strategy, pin, derived) {
   if (!plan || !plan.buckets || !plan.buckets.length) return '';
   const entry = formatPlanEntry(plan, strategy, pin, derived);
   const rows = plan.buckets.slice()
-    .sort((a, b) => b.count - a.count)
+    // Recordable count first: a format the group cannot record from is never a candidate,
+    // so it belongs below the ones that are rather than above them on raw membership.
+    .sort((a, b) => (b.rank_count - a.rank_count) || (b.count - a.count))
     .map((b) => {
       const isWinner = !!(entry && entry.key && b.label === entry.label);
       const bitrate = b.median_bitrate_kbps == null ? '--' : `${(b.median_bitrate_kbps / 1000).toFixed(2)} MB/s`;
@@ -206,10 +268,34 @@ function formatPlanTable(plan, strategy, pin, derived) {
       const label = isWinner
         ? `<strong>${escHtml(b.label)}</strong> <span class="pr-flag pr-picked">winner</span>`
         : escHtml(b.label);
-      return `<tr${isWinner ? ' class="fp-winner"' : ''}><td>${label}</td><td>${b.count}</td>` +
+      // A bucket holding none of the members the group records from cannot win, whatever
+      // its bitrate or size. Saying so on the row is what makes the winner explicable -
+      // "40 channels lost to 26" reads as a bug until the 0 next to it is visible.
+      const noCandidates = b.rank_count === 0;
+      const cls = [isWinner ? 'fp-winner' : '', noCandidates ? 'fp-unrankable' : '']
+        .filter(Boolean).join(' ');
+      const recording = noCandidates
+        ? '<span data-tip="No member the group records from measures this format, so it ' +
+          'cannot be chosen.">0</span>'
+        : String(b.rank_count);
+      return `<tr${cls ? ` class="${cls}"` : ''}><td>${label}</td><td>${b.count}</td>` +
+        `<td>${recording}</td><td>${formatPlanStatus(b)}</td>` +
         `<td>${bitrate}</td><td>${bpp}</td></tr>`;
     }).join('');
   return '<div class="table-scroll"><table class="tbl"><thead><tr>' +
-    '<th>Format</th><th>Channels</th><th>Median bitrate</th><th>Bits per pixel</th>' +
+    '<th>Format</th><th>Channels</th><th>Recording</th><th>Last test</th>' +
+    '<th>Median bitrate</th><th>Bits per pixel</th>' +
     '</tr></thead><tbody>' + rows + '</tbody></table></div>';
+}
+
+/* A bucket's healthy channels split by test label. WARN counts as healthy when buckets
+   are built (app/channel_groups.py::HEALTHY_TEST_LABELS) and that is deliberate - a
+   diagnostic defect must not be able to move a real lock - so the honest move is to show
+   the split rather than quietly drop the warning channels (dev/changelog/890). */
+function formatPlanStatus(b) {
+  const pass = b.pass_count || 0;
+  const warn = b.warn_count || 0;
+  if (!warn) return `${pass} pass`;
+  if (!pass) return `<span class="fp-all-warn">${warn} warn</span>`;
+  return `${pass} pass, ${warn} warn`;
 }

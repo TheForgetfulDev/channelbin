@@ -51,7 +51,11 @@ function openCreateGroupModal(opts) {
   // key ('' = None), `state.autoTouched` = true once the user hand-edits kept
   // membership or the format after picking a strategy (the honesty rule below).
   let planData = null, planLoading = true, planError = null;
-  fetchFormatPlan(opts.srcId, opts.jobId)
+  // rankScope 'all': this previews the format for a group that does not exist yet, whose
+  // members all start Recording-off, so its own engine will rank over every member. The
+  // default narrowing would rank over the SOURCE group's recording-enabled members, which
+  // describes neither group (dev/changelog/890).
+  fetchFormatPlan(opts.srcId, { rankScope: 'all' })
     .then((resp) => { planData = resp; planLoading = false; render(); })
     .catch((err) => { planError = err.message || 'failed to load'; planLoading = false; render(); });
 

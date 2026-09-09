@@ -199,6 +199,7 @@ class SpecTests(_Base):
         self.assertEqual(sorted(keys), sorted([
             'name', 'filename_template', 'pre_padding_minutes', 'post_padding_minutes',
             'stall_timeout_seconds', 'restart_delay_seconds', 'max_consecutive_failures',
+            'stall_move_count', 'stall_move_window_minutes',
             'retention_days', 'pre_check_enabled',
         ]))
 

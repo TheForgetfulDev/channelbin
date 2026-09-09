@@ -277,6 +277,17 @@ _DEFAULTS = {
         # immediately, up to this many total attempts - whichever comes first against the
         # recording's own scheduled window. 0 = no retries, same as pre-retry behavior.
         'dead_stream_max_retry_attempts': 10,
+        # Stall-rate demotion: move a group-backed recording off a member that stalls this
+        # many times inside a rolling window, even though every restart succeeds. The three
+        # trip-wires above are all "the feed is dead" shaped and a feed that always comes
+        # back reaches none of them - the successful restart zeroes the very counter that
+        # would trip max_consecutive_failures. 0 = never move on stall rate.
+        #
+        # A WIDER window is a LOOSER trigger, not a stricter one: the count is the same and
+        # there is more time to reach it. Measured on recording 14's 27 stalls, 3-in-30
+        # first fires at +24.2 min and 3-in-10 not until +65.0 (dev/changelog/889).
+        'stall_move_count': 3,
+        'stall_move_window_minutes': 30,
     },
     'ffmpeg': {
         'path': 'ffmpeg',

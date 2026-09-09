@@ -1635,6 +1635,12 @@ table.tbl { width: 100%; border-collapse: collapse; font-size: var(--fs-md); }
 .tbl th.num { text-align: right; }
 /* format-plan.js::formatPlanTable - the winning bucket for the active auto-select strategy. */
 .fp-winner td { background: var(--accent-soft); }
+/* A bucket no strategy can pick, because the group records from none of its channels.
+   Dimmed rather than hidden: it is the answer to "why did the 40-channel format lose".
+   Only dims against the table's own --text (set on .cg-auto-details .tbl above); this
+   rule is inert wherever the table would inherit a muted color instead. */
+.fp-unrankable td { color: var(--text-muted); }
+.fp-all-warn { color: var(--warn); }
 .tbl .mono { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
 .tbl .muted { color: var(--text-muted); }
 .exit-pill { display: inline-flex; font-size: var(--fs-xs); font-weight: 600; border-radius: 999px; padding: 1px 9px; }
@@ -2409,7 +2415,12 @@ th.gd-c-part { text-align: center; }
    Pick-best-format modal and the group's Format settings. It had callers in two shipped
    JS files and a rule in none until dev/changelog/756. */
 .cg-auto-details { margin: 4px 0 2px; }
-.cg-auto-details .tbl { font-size: var(--fs-sm); }
+/* The bucket table sits in a fieldRow's `meta` slot, which is muted description text, so
+   without an explicit color every row inherits --text-muted. That made `.fp-unrankable`'s
+   own --text-muted override a no-op - a row nothing can record from rendered identically
+   to every other row (dev/changelog/890). The table is data, not description: it gets the
+   body color, and the dim state then has something to dim against. */
+.cg-auto-details .tbl { font-size: var(--fs-sm); color: var(--text); }
 .gd-field-ctl.wide input { width: 100%; }
 .gd-field-ctl select, .gd-field-ctl input {
   width: 100%; background: var(--bg3); border: 1px solid var(--border); border-radius: var(--radius-sm);

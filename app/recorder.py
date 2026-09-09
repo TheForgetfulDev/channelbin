@@ -70,6 +70,19 @@ class RecordingState:
     # design: a service restart forgets the set, worst case costing one wasted retry
     # cycle per previously-failed member.
     failed_member_ids: set = field(default_factory=set)
+    # Members this recording moved off because they stalled repeatedly while every
+    # restart succeeded (dev/changelog/889). Deliberately NOT failed_member_ids, which is
+    # permanent for the run: nothing here died, so a demoted member merely ranks below the
+    # ones not yet demoted and stays selectable. A three-member group therefore cycles
+    # A -> B -> C -> A rather than running out of candidates, and a member whose feed
+    # settles down is reachable again without any un-demotion machinery.
+    demoted_member_ids: set = field(default_factory=set)
+    # How many stall-driven moves this recording has made. Reported, never enforced - a
+    # cap was designed and dropped once the cost was measured at zero: a stall closes the
+    # current segment and opens the next one whether or not the member changes, so the
+    # move rides a segment boundary that was happening anyway (and skips the restart
+    # delay, making it ~30s cheaper than staying put).
+    stall_moves: int = 0
 
 
 # recording_id → RecordingState
@@ -77,23 +90,54 @@ _active: dict = {}
 
 
 def recording_disk_paths(recording_id: int) -> list:
-    """Every on-disk file a recording owns, for teardown: the final output file, all
-    segment files, the pre-conversion .ts sibling (kept when post_process.delete_source
-    is off), and the live-thumbnail image. Paths only - no deletion. Requires an active
-    app context. Missing/None paths are omitted; the thumbnail path is always included
-    (delete_files() guards on existence)."""
+    """Every on-disk file a recording owns, for teardown: every file its output stem can
+    occupy, all segment files, the conversion scratch files, and the live-thumbnail image.
+    Paths only - no deletion. Requires an active app context. Missing/None paths are
+    omitted; the thumbnail and scratch paths are always included (delete_files() guards on
+    existence).
+
+    The stem is expanded through the WHOLE output-extension family rather than the one
+    sibling of whatever `output_path` currently names, and the direction that matters is
+    .ts -> .<fmt>: `output_path` is only repointed at the converted file on success, so a
+    recording whose conversion gave up still names its .ts while a multi-GB partial .mp4
+    sits beside it. Enumerating only the row's own extension deleted the .ts and the
+    segments and stranded that partial forever, with no row left pointing at it
+    (dev/changelog/888). The family comes from output_extension_family(), the same answer
+    reserve_concat_output_path() uses to stake the stem - so every path listed here is one
+    that reservation already proved belongs to this recording and not to a _2-suffixed
+    neighbour.
+
+    Its one blind spot is deliberate: the family is read from the CURRENT config, so a
+    partial left by an attempt that ran under a different post_process.format is not
+    listed. Nothing records the format an attempt actually used, and globbing the stem
+    would delete on a guess."""
+    from .postprocessor import output_extension_family
+
     paths = []
+    cfg = load_config()
     rec = db.session.get(Recording, recording_id)
     if rec is not None and rec.output_path:
         paths.append(rec.output_path)
-        # A converted recording (e.g. .mp4) may leave its source .ts behind when
-        # delete_source is off; the stem is unique per recording name.
-        if not rec.output_path.endswith('.ts'):
-            paths.append(os.path.splitext(rec.output_path)[0] + '.ts')
+        stem = os.path.splitext(rec.output_path)[0]
+        for ext in output_extension_family(cfg):
+            sibling = stem + ext
+            if sibling != rec.output_path:
+                paths.append(sibling)
+        # Conversion scratch (progress + stderr tail) is written alongside the output file
+        # and unlinked in run_conversion_supervised's finally, so these only survive a
+        # shutdown that skipped it - after which a delete is the last thing that will ever
+        # look at them. Patterns are copied from that function's own stale-reap list and
+        # listed per id for the same reason: a bare f'{recording_id}*' glob would let id 6
+        # match id 64's files.
+        scratch_dir = os.path.dirname(rec.output_path) or '.'
+        paths.extend(glob.glob(os.path.join(scratch_dir, f'.conv-progress-{recording_id}-*.txt')))
+        paths.extend(glob.glob(os.path.join(scratch_dir, f'.conv-stderr-{recording_id}-*.log')))
+        paths.append(os.path.join(scratch_dir, f'.conv-progress-{recording_id}.txt'))
+        paths.append(os.path.join(scratch_dir, f'.conv-stderr-{recording_id}.log'))
     for seg in RecordingSegment.query.filter_by(recording_id=recording_id).all():
         if seg.file_path:
             paths.append(seg.file_path)
-    thumb_cfg = load_config().get('recording', {}).get('live_thumbnail', {})
+    thumb_cfg = cfg.get('recording', {}).get('live_thumbnail', {})
     paths.append(os.path.join(
         thumb_cfg.get('dir', '/dvr/live_thumbnails'), f'{recording_id}.jpg'))
     return paths
@@ -1031,7 +1075,9 @@ def _launch_segment(app, recording_id: int, seg_num: int):
             # Same thresholds the watchdog resolves for its own restarts, so a recording
             # profile's overrides apply to a failed spawn exactly as they do to a stall.
             from .watchdog import _resolve_watchdog_thresholds
-            _, restart_delay, max_failures = _resolve_watchdog_thresholds(cfg, recording_id)
+            thresholds = _resolve_watchdog_thresholds(cfg, recording_id)
+            restart_delay = thresholds.restart_delay
+            max_failures = thresholds.max_failures
             if _handle_launch_failure(app, recording_id, seg_num, str(exc),
                                       max_failures, restart_delay):
                 # A give-up here is terminal, so it owes the same releases every other
@@ -1212,13 +1258,30 @@ def _pin_eligible_members(members, pin, latest_by_channel):
     return keep, False
 
 
-def failover_group_member(app, recording_id: int, reason: str) -> bool:
+def failover_group_member(app, recording_id: int, reason: str, demote: bool = False) -> bool:
     """Switch a group-backed recording to its next-best untried member after its
     active feed died (failed restart / dead-stream trip / max consecutive
     failures - the watchdog's three give-up points). Returns True if switched -
     the caller relaunches a segment and keeps going - or False when the recording
     isn't group-backed or every member has already failed, in which case the
     caller falls through to its normal abort path.
+
+    `demote=True` is the fourth caller, the watchdog's stall-rate trip-wire
+    (dev/changelog/889), and it is a VOLUNTARY move off a member that is still
+    delivering content - nothing died. Three things change and nothing else does, so the
+    format lock, the recording's format pin, the busy-member handling and the
+    connection-slot swap are shared rather than reimplemented in a second selection path:
+
+      1. the departing member is demoted (state.demoted_member_ids) instead of burned
+         (state.failed_member_ids), so it stays selectable and merely ranks last;
+      2. the current member is excluded outright - a voluntary move to yourself is not a
+         move, and returning False for it is what makes a one-member group a no-op rather
+         than an abort;
+      3. the departing member is scored on its own measured share rather than the
+         recording fail floor, which would be a lie about a feed that was delivering.
+
+    A False from this function is never an abort on the demote path: the caller stays put
+    and takes its normal restart, exactly as it would have without the trip-wire.
 
     Only rewrites channel_id/url and swaps connection slots; the caller owns
     killing/launching ffmpeg (this keeps every non-idempotent side effect out of
@@ -1234,7 +1297,10 @@ def failover_group_member(app, recording_id: int, reason: str) -> bool:
 
         old_channel = rec.channel
         if rec.channel_id is not None:
-            state.failed_member_ids.add(rec.channel_id)
+            if demote:
+                state.demoted_member_ids.add(rec.channel_id)
+            else:
+                state.failed_member_ids.add(rec.channel_id)
 
         cfg = load_config()
         streak_threshold = cfg.get('channel_testing', {}).get(
@@ -1269,21 +1335,51 @@ def failover_group_member(app, recording_id: int, reason: str) -> bool:
         # Applied after both format filters, so it cannot pre-empt their own
         # zero-survivors overrides.
         busy_account = _busy_account_channel_ids(members, recording_id)
-        best = pick_best_member(members, latest_by_channel,
-                                exclude_ids=busy | busy_account,
-                                streak_threshold=streak_threshold)
-        if best is None:
-            best = pick_best_member(members, latest_by_channel, exclude_ids=busy,
-                                    streak_threshold=streak_threshold)
-        if best is None:
-            # Every untried member is busy - knowingly take the best busy one rather
-            # than abort (busy-member skip rule; no handoff fires mid-recording, so
-            # both recordings share the feed's provider connection).
-            best = pick_best_member(members, latest_by_channel,
-                                    streak_threshold=streak_threshold)
+        # Preference tiers, best-first: the first that yields a member wins. The inner
+        # three are the long-standing busy cascade - prefer a member whose account has a
+        # free slot, then any free member, then knowingly take the best busy one rather
+        # than abort (busy-member skip rule; no handoff fires mid-recording, so both
+        # recordings share the feed's provider connection).
+        #
+        # A demote pass wraps a second round outside them: every tier is tried against the
+        # not-yet-demoted members first, and only then re-tried with the demoted ones
+        # allowed back in. That second round is what keeps a small group cycling instead
+        # of running dry - a three-member group goes A -> B -> C -> A - and it ranks by
+        # health score, which each demotion has just made more honest about this run.
+        demoted = state.demoted_member_ids if demote else frozenset()
+        # Excluded from every tier on the demote path: moving to the member we are already
+        # on is not a move. Nothing needs this off the demote path, where the current
+        # member is in failed_member_ids and `members` already dropped it.
+        #
+        # Excluded HERE and not before the format filters, which is the deliberate
+        # difference from the burn path: a stalling member is still a survivor of the lock
+        # and of the pin, so leaving it in is what stops it from being the sole survivor
+        # that a zero-survivors override would otherwise fire on. Staying put is the right
+        # answer to "only the member you are on matches the locked format" - the override
+        # exists to keep a dying recording alive, and this one is not dying.
+        stay_put = {rec.channel_id} if (demote and rec.channel_id is not None) else frozenset()
+        best = None
+        for preferred in ([demoted, frozenset()] if demoted else [frozenset()]):
+            base = stay_put | set(preferred)
+            for tier in (base | busy | busy_account, base | busy, base):
+                best = pick_best_member(members, latest_by_channel, exclude_ids=tier,
+                                        streak_threshold=streak_threshold)
+                if best is not None:
+                    break
+            if best is not None:
+                break
         took_busy = best is not None and best.id in busy
         took_busy_account = best is not None and best.id in busy_account
+        took_demoted = best is not None and best.id in demoted
         if best is None:
+            if demote:
+                # Not an abort and not a failure: a one-member group, or a group whose
+                # every other member is unavailable, simply stays where it is. The caller
+                # takes its normal restart from here.
+                log.info('Recording %d: group "%s" has nowhere better to move (%s) - '
+                         'staying on the current member',
+                         recording_id, rec.group.name, reason)
+                return False
             log.warning('Recording %d: group "%s" has no untried members left (%s)',
                         recording_id, rec.group.name, reason)
             return False
@@ -1356,9 +1452,22 @@ def failover_group_member(app, recording_id: int, reason: str) -> bool:
             override_note += (f' - no member is still recording at {format_label(pin)}, '
                               f'so this recording changes format part-way through rather '
                               f'than stopping here')
-        detail = (f'Group "{rec.group.name}": feed "{old_name}" died ({reason}) - '
-                  f'failing over to "{best.name}" ({best.account.name}, '
-                  f'score {effective_score(best)}){busy_note}{override_note}')
+        if took_demoted:
+            override_note += (' - every other member has already been moved off during '
+                              'this recording, so this is the best of them')
+        if demote:
+            # "Died" would be false here and the distinction is the whole point of this
+            # path: the feed is still delivering, it is just costing too much to keep.
+            detail = (f'Group "{rec.group.name}": feed "{old_name}" kept stalling '
+                      f'({reason}) - moving to "{best.name}" ({best.account.name}, '
+                      f'score {effective_score(best)}). "{old_name}" is demoted for the '
+                      f'rest of this recording, not dropped - it is still selectable if '
+                      f'the alternatives turn out worse'
+                      f'{busy_note}{override_note}')
+        else:
+            detail = (f'Group "{rec.group.name}": feed "{old_name}" died ({reason}) - '
+                      f'failing over to "{best.name}" ({best.account.name}, '
+                      f'score {effective_score(best)}){busy_note}{override_note}')
         log.warning('Recording %d: %s', recording_id, detail)
 
         @retry_on_locked()
@@ -1378,6 +1487,10 @@ def failover_group_member(app, recording_id: int, reason: str) -> bool:
                            ch.id for ch in skipped_busy_account],
                        'format_pin': list(pin) if pin else None,
                        'pin_override': pin_override,
+                       # True = a voluntary stall-rate move, so from_channel_id was
+                       # demoted rather than burned and can be selected again this run.
+                       'demoted': demote,
+                       'took_demoted': took_demoted,
                        # Cumulative counters through the just-abandoned member - lets the
                        # terminal observation score the final member from only its own share
                        # (health_score.py::apply_recording_health_observation). Snapshotted
@@ -1394,15 +1507,24 @@ def failover_group_member(app, recording_id: int, reason: str) -> bool:
 
         # The abandoned feed demonstrably died mid-recording - real quality signal
         # for that member, independent of the recording's own terminal observation.
+        # A demoted member did NOT die, so it is scored on what it actually measured
+        # instead of the fail floor (see apply_stall_demotion_health_observation).
         if old_channel is not None:
-            from .health_score import apply_failover_health_observation
-            apply_failover_health_observation(app, old_channel.id, recording_id, reason=reason)
+            if demote:
+                from .health_score import apply_stall_demotion_health_observation
+                apply_stall_demotion_health_observation(
+                    app, old_channel.id, recording_id, reason=reason)
+            else:
+                from .health_score import apply_failover_health_observation
+                apply_failover_health_observation(app, old_channel.id, recording_id,
+                                                  reason=reason)
 
         ev.publish(recording_id, GROUP_FAILOVER, {
             'group_id': rec.group_id,
             'from_channel': old_name,
             'to_channel': best.name,
             'reason': reason,
+            'demoted': demote,
         })
         return True
 

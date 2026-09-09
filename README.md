@@ -236,6 +236,8 @@ ever set. The table below is only the handful people change first.
 | `watchdog.stall_timeout_seconds` | 30 | Seconds of no file growth before declaring the stream dead |
 | `watchdog.restart_delay_seconds` | 30 | Seconds to wait before restarting after a stall |
 | `watchdog.max_consecutive_failures` | 10 | Give up (or fail over) after this many failed restarts |
+| `watchdog.stall_move_count` | 3 | Move a group recording to another member after this many stalls in the window below, even when every restart succeeds. 0 disables |
+| `watchdog.stall_move_window_minutes` | 30 | The rolling window those stalls must fall inside |
 | `accounts.default_max_connections` | 1 | Simultaneous connections allowed per provider account |
 | `sync.sync_interval_hours` | 12 | How often accounts re-sync |
 | `sync.epg_days_ahead` | 3 | Days of future EPG to import, and the width of the guide grid |
