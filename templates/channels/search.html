@@ -1,0 +1,382 @@
+{% extends "base.html" %}
+{% import '_macros.html' as m %}
+{# _record_modal.html calls csrf_field() unqualified, so it has to be in this
+   template's namespace too - `m.csrf_field` is not the same name to an include. #}
+{% from '_macros.html' import csrf_field %}
+{% block title %}Channels - ChannelBin{% endblock %}
+
+{#
+  The channel search (the Browse tab). Approved design:
+  dev/mockups/21-channel-search-desktop.html. Contract, registries and response
+  envelope: dev/docs/DESIGN-channel-search.md - read that before changing a
+  parameter name, because once other pages link in here the URL is an API.
+
+  THIS TEMPLATE IS THE SHELL AND NOTHING ELSE. Every list, count, chip, facet and
+  control below is written by static/js/channel-search.js from
+  /api/channels/search and /api/channels/search/catalog. Two rules follow, both
+  load-bearing:
+
+  * Nothing here re-types a registry. The fields, dimensions, standing options,
+    sorts, health bands and Other labels are served by the catalog endpoint,
+    generated from the engine's own tuples, so adding one stays a one-entry
+    change in app/channel_search.py instead of an edit in three files that drift.
+  * What is server-rendered IS the "nothing active" state (CLAUDE.md frontend
+    rules): empty rail, empty well, an empty table. JS only ever adds to it - it
+    is never required to calm this markup down.
+#}
+
+{% block content %}
+{# NO BACK LINK. This page carried a "&larr; TV Guide" button from when it was only
+   reachable through the guide's Manage channels. It is a top-level sidebar destination
+   now, so that arrow pointed sideways at an unrelated page rather than back the way you
+   came, which is the one thing DESIGN.md 4 reserves it for. The head is an h1 alone,
+   which is what 3.10 expects of a page whose actions all live in its own toolbar
+   (dev/changelog/810, 811). #}
+<div class="page-head">
+  <h1>Channels</h1>
+  {# Phone only (CSS): the two whole-database cleanups below are page-level actions
+     rather than search controls, so at 375 they are overflow behind this rather than
+     two danger buttons competing with the search box for the top of the screen
+     (dev/mockups/22-channel-search-mobile.html decision 6). Rendered only when it
+     would hold something. #}
+  {% if missing_count or dup_groups %}
+  <button class="page-kebab" id="page-kebab" type="button"
+          aria-label="Channel list actions">&#8943;</button>
+  {% endif %}
+</div>
+
+{# NO TAB STRIP. Browse and Groups both duplicated links the sidebar already carries,
+   and the strip sat between this page's title and its own controls saying nothing about
+   either (dev/changelog/811). #}
+
+<div class="cs-wrap">
+  {# Written entirely by renderRail(). Unconditional: the rail is half of the
+     on-ramp, the other half being the suggestion menu. #}
+  <aside class="rail" id="rail"></aside>
+
+  <div class="cs-main">
+    {# `nav-panel` draws the whole search zone as one card ABOVE the breakpoint: the
+       question, the box and the filter row read as one thing being filled in rather than
+       as four unrelated bands of chrome. Below 768 the class is inert - the panel is a
+       desktop device and the viewport does that grouping on its own down there, while a
+       sticky, opaque .cs-stick inside a tinted card fights it (DESIGN-group-search-rows.md
+       5.4). #}
+    <div class="cs-bar nav-panel" id="cs-bar">
+      {# Only the box and the chip row stick at phone width, which is why they are
+         wrapped together. The well is variable-height by construction (three
+         filters is three lines at 375), so sticking it would hand a phone a chrome
+         band that grows to a third of the viewport. Above the breakpoint this
+         element is inert and .cs-bar sticks as a whole, exactly as before. #}
+      <div class="cs-stick" id="cs-stick">
+      <div class="searchzone">
+        {# The grain selector, ABOVE the box rather than on the results card: it says what
+           a ROW IS, which is the first thing you decide and not a property of the list you
+           got back. Written by renderGrainToggles(); empty here because that IS the
+           nothing-active state - a page whose catalog never lands shows no selector rather
+           than a wrong one. #}
+        <div class="grainslot" id="grainslot-panel"></div>
+        <div class="sline" id="sline">
+          {# Match mode, as ONE control butted against the box's left edge and sharing its
+             border. It qualifies what you are typing rather than changing what a row is,
+             so it reads as part of the box. Hidden below the breakpoint, where it is
+             re-rendered inside the Searching-in sheet - one live copy at each width. #}
+          <span id="wjoin-left"></span>
+          <div class="sbox-wrap">
+            <div class="sbox" id="sbox">
+              <span class="mag" aria-hidden="true">&#128269;</span>
+              <input id="cs-q" type="text" autocomplete="off" spellcheck="false"
+                     aria-label="Search channels"
+                     placeholder="Search channels and what is on them">
+              <span class="syn" id="syn" style="display:none"></span>
+              <span class="scount" id="scount"></span>
+              <span class="spinner sspin" id="sb-spin"></span>
+              <button class="sclr" id="sb-clr" type="button" style="display:none"
+                      data-tip="Clear the text. Filters stay.">&#10005;</button>
+            </div>
+            <div class="sugg" id="sugg"></div>
+          </div>
+          {# Saved searches acts on the whole search, so it sits beside the search rather
+             than in a toolbar under it. Moves to the chip row at phone width. #}
+          <div class="menu-wrap" id="sf-wrap">
+            <button class="btn btn-sm" id="sf-btn" type="button" data-menu
+                    data-tip="Saved searches.&#10;Saves the text, the match mode, the search scope, the standing options and every filter chip under a name.">&#128190; Saved searches</button>
+            <div class="menu menu-panel pop-left" id="sf-pop"><div id="sf-pop-body"></div></div>
+          </div>
+          <span class="sf-name" id="sf-current"></span>
+          <span class="sf-dirty" id="sf-dirty" style="display:none"
+                data-tip="This saved search has been changed since it was loaded. Save it again to keep the change.">&#9679; edited</span>
+        </div>
+      </div>
+
+      {# Phone only, written by renderChipRow(). It REPLACES the toolbar below
+         rather than joining it - Saved, Clear all and + Filter are all in here at
+         that width, and two live copies of one control is how the two disagree.
+         Empty above the breakpoint, which is the "nothing active" state. #}
+      <div class="chiprow" id="chiprow"></div>
+      </div>
+
+      {# The filter row, labeled and carrying its own count. Three static slots and one
+         rewritten body: the inline + Filter is MOVED between the head and tail slots,
+         never duplicated - two buttons would mean two popovers holding the same pending
+         dimension - and #wellbody is rewritten on every render, so no slot may live
+         inside it.
+
+         `Clear all` lives HERE at both widths, at the end of the row it clears, and the
+         phone chip row deliberately does not carry a second copy. Production put it in
+         the chip row because its toolbar is hidden below the breakpoint; this well is on
+         screen at every width, so one control in one place covers both
+         (DESIGN-group-search-rows.md 5.4). #}
+      <div class="well" id="well"><span class="slot" id="well-lbl-slot"></span><span class="slot" id="addf-slot-head"><span class="menu-wrap" id="addfpw2">
+          <button class="fadd" id="addf2" type="button" data-menu>&#43; Filter</button>
+        </span></span><span id="wellbody"></span><span class="slot" id="addf-slot-tail"></span><div class="tbar-right">
+          <button class="btn btn-sm btn-ghost" id="cs-clear" type="button">Clear all</button>
+        </div></div>
+
+      {# The toolbar row is empty in this layout and collapses: its + Filter is the well's
+         chip-shaped hole, Saved searches is on the search line, and Clear all is at the
+         end of the row it clears. Kept in the DOM because #fb-pop is real page markup
+         that the well's own + Filter anchors. #}
+      <div class="tbar" id="tbar">
+        <div class="menu-wrap" id="addfpw">
+          <button class="btn btn-sm" id="fb-add" type="button" data-menu>&#43; Filter</button>
+          <div class="menu menu-panel pop-left" id="fb-pop"><div id="fb-pop-body"></div></div>
+        </div>
+      </div>
+    </div>
+
+    {# The PROACTIVE half of "search is degraded right now" - said BEFORE the user types,
+       not after a slow request comes back. The reactive half (the small `unindexed` badge
+       on the results meta line above) stays exactly as it is: that one is per-result detail
+       about a search that already ran, this one is a standing condition of the page.
+       Fed by window.__applySearchReadiness off the /api/nav-status poll, so it appears and
+       clears on its own as a sync starts and finishes. Served HIDDEN - the nothing-active
+       state, same rule as replace-bar below. dev/changelog/427. #}
+    <div class="cs-degraded-bar" id="cs-degraded" style="display:none" role="status"></div>
+
+    <div class="missing-bar">
+      {% if missing_count %}
+      <button class="btn btn-sm btn-danger" id="missing-btn" type="button"
+              data-tip="Deletes channels that have not appeared in a sync in a while. Opens a preview listing what would be deleted and what is excluded because it is in the guide, in a group, or has a recording.">&#128465; Delete Missing Channels ({{ missing_count }}{% if missing_hidden_count %}, {{ missing_hidden_count }} hidden{% endif %})</button>
+      {% endif %}
+      {% if dup_groups %}
+      <button class="btn btn-sm btn-danger" id="review-dup-btn" type="button"
+              data-tip="Resolves channels IN YOUR GUIDE that share a stream URL. That list is guide-scoped - it is not the account-global DUP flag a row's badge carries.">&#128465; Review Duplicates&#8230;</button>
+      {% endif %}
+    </div>
+
+    {# The SECOND action context (DESIGN-channel-search.md §3): "you came here to replace
+       scheduled recording X". Like `add_to_group` it narrows nothing and never becomes a
+       chip - it changes what a row's Record button does. Served HIDDEN, which is the
+       nothing-active state; renderReplaceBar() turns it on when the state carries one, so
+       JS upgrades the page rather than being required to calm it down. The name is rendered
+       from the server's own lookup, never from anything in the URL. #}
+    <div class="cs-replace-bar" id="replace-bar" style="display:none">
+      <span class="cs-replace-lbl" id="replace-lbl"></span>
+      <button class="btn btn-sm btn-ghost" id="replace-x" type="button"
+              data-tip="Stop replacing that recording. The search itself is left alone, and the scheduled recording stays as it is.">&times;</button>
+    </div>
+
+    <div class="cb-all">
+      {# The heading is the COUNT and nothing else. The grain selector moved OUT of this
+         card and above the search box (dev/changelog/811): it says what a row is, which
+         is asked before you search rather than reported after. #}
+      <h2><span class="text-faint" id="all-head-count"></span></h2>
+
+      {# The count line is this list's own meta line, so it lives with the list rather
+         than as a fifth row of search chrome under the box. #}
+      <div class="cs-count" id="cs-count"></div>
+
+      <div class="select-btns">
+        <button class="btn btn-sm" id="sel-all-btn" type="button">Select All</button>
+        <button class="btn btn-sm" id="desel-all-btn" type="button">Deselect All</button>
+        <div class="menu-wrap">
+          <button class="btn btn-sm" id="cols-btn" type="button" data-menu>&#9881; Columns</button>
+          <div class="menu menu-panel" id="cols-pop">
+            <h5>Columns - drag &#8942;&#8942; to reorder</h5>
+            <div id="cols-list"></div>
+            <div class="pnote">Saved to the server, so it follows you across browsers. The
+              Channel column is pinned first, exactly as the recordings list pins its name column.</div>
+          </div>
+        </div>
+      </div>
+
+      {# The header and every row are separate grid containers - see
+         freezeNameCol() in channel-search.js before touching the tracks. #}
+      <div class="atable" id="atable">
+        <div class="arow-head" id="ahead"></div>
+        <div id="ch-list"></div>
+      </div>
+      <div class="empty-state cs-empty" id="all-empty" style="display:none"></div>
+
+      {# Shown by renderResultsArea() while the rows on screen are not an honest answer
+         to the request that is out - see DESIGN-channel-search.md §12.2 for the two
+         circumstances and the timing of each. OUTSIDE #atable on purpose, so the header
+         above it keeps saying what is being loaded and so this works unchanged at 375,
+         where .arow-head is hidden but the table still holds the card list. Served
+         hidden, which is the nothing-active state: JS only ever turns it on. #}
+      <div class="cs-loading" id="all-loading" style="display:none" role="status" aria-live="polite">
+        <span class="spinner cs-loading-spin" aria-hidden="true"></span><span id="all-loading-lbl"></span>
+      </div>
+
+      {# The action context ("you came here to add channels to group X") leads the
+         bar and is shown independent of the selection count - group-modal's
+         fixedGroup mode still offers suggestions with nothing selected. It is not
+         a filter and never becomes a chip; DESIGN-channel-search.md §3. #}
+      <div class="sel-float-bar" id="sel-bar">
+        <span class="sel-ctx" id="sel-ctx" style="display:none">
+          <span class="sel-ctx-lbl" id="sel-ctx-lbl"></span>
+          <button class="btn btn-sm btn-primary" id="sel-ctx-add" type="button">+ Add Channels</button>
+          <button class="btn btn-sm btn-ghost" id="sel-ctx-x" type="button"
+                  data-tip="Stop adding to that group. The search itself is left alone.">&times;</button>
+        </span>
+        {# One grouping action, and the only primary on this bar. "Test selected" used to
+           sit beside it and since the groups revamp did substantially the same job - it
+           opened the health-check modal in ad hoc mode, where the server creates a group
+           anyway - behind a modal that looked nothing like this one's (dev/changelog/831).
+           The single-channel ad hoc test survives on the phone row sheet and on a
+           channel's own page, which have no group to work from. #}
+        <button class="btn btn-sm btn-primary" id="sel-group" type="button">+ Group selected (0)</button>
+        <button class="btn btn-sm" id="sel-add" type="button">+ Add selected to guide (0)</button>
+        {# Hide is not Delete and not Remove: nothing is destroyed and nothing leaves a
+           list it was put in by hand. A channel in the TV Guide or a group is not refused
+           either - its hide is recorded and deferred, and the response names it. #}
+        <button class="btn btn-sm" id="sel-hide" type="button">Hide selected (0)</button>
+        {# Shown only when the selection actually holds hidden channels, which can only
+           happen on a search with "Show hidden channels" turned on. Same rule as Delete
+           missing below: an action that would refuse most of the selection does not sit
+           there reading the whole selection's count. #}
+        <button class="btn btn-sm" id="sel-unhide" type="button" style="display:none">Un-hide selected (0)</button>
+        {# Shown only when the selection actually contains channels the provider has
+           stopped listing - nothing else is deletable (dev/changelog/772). That is what
+           keeps this bar at three buttons in the ordinary case, so the 375px ruling in
+           channel-search.css (all actions stay real buttons, none behind a second tap)
+           still holds for every selection that cannot use this one. #}
+        <button class="btn btn-sm btn-danger" id="sel-delete" type="button" style="display:none">Delete missing (0)</button>
+        {# Why the guide action is disabled, when it is. Its own note rather than a
+           data-tip on the button: a disabled button fires no mouse events, so a tooltip
+           there would never open. Empty is the nothing-active state, and an empty
+           .sel-note is display:none, so this costs no gap when there is nothing to say. #}
+        <span class="sel-note" id="sel-guide-note"></span>
+        <span class="sel-note" id="sel-note"></span>
+      </div>
+
+      <div class="pager" id="pager"></div>
+    </div>
+  </div>
+</div>
+
+{# "Test selected" opens the shared check-modal.js modal; this <template> holds its
+   recur/one-off schedule picker, the same mechanism the Groups pages use. #}
+<template id="cc-schedule-fields">
+  {{ m.recur_schedule_fields('browsesched', 'Start Time', window_label) }}
+</template>
+
+{# The Record action on the airing grain opens the SAME schedule modal the TV Guide
+   opens, driven by the same guide.js::openModal - the pattern index.html and
+   channels/detail.html already use, rather than a second schedule modal on this page.
+   guide.js's DOMContentLoaded block is fully null-guarded for pages with no grid. #}
+{% include "_record_modal.html" %}
+{% endblock %}
+
+{% block scripts %}
+<link rel="stylesheet" href="{{ url_for('static', filename='css/channel-search.css') }}">
+{# Written by applyColumns(): the grid tracks for the visible column set. Must stay
+   after the stylesheet above, or the page's own rule outranks it. #}
+<style id="col-css"></style>
+<script>
+{# window.X, NOT a bare `const`: a top-level const in a classic script is a global LEXICAL
+   binding and never becomes a property of window, so channel-search.js's
+   `window.CHANNEL_SEARCH_CONFIG` read it as undefined and the whole page's JS died on the
+   first line (BUGS.md 2026-07-30). Every other page's config global is spelled this way -
+   groups.html, health_check_profiles.html - and this one must stay spelled that way too. #}
+window.CHANNEL_SEARCH_CONFIG = {
+  searchUrl: {{ url_for('channel_search.channel_search_api') | tojson }},
+  countsUrl: {{ url_for('channel_search.channel_search_counts_api') | tojson }},
+  facetsUrl: {{ url_for('channel_search.channel_search_facets_api') | tojson }},
+  catalogUrl: {{ url_for('channel_search.channel_search_catalog_api') | tojson }},
+  channelUrlBase: '/channels/',
+  groupDetailUrlBase: '/channel-groups/',
+  {# The Account column's name is a link to the account, the same way the Groups pill links
+     to its group - a provider name on a row is an address, not a label (dev/changelog/860). #}
+  accountUrlBase: '/accounts/',
+  addGuideUrlBase: '/api/guide/channels/',            {# + <id>/add #}
+  removeGuideUrl: {{ url_for('guide.remove_channels_from_guide') | tojson }},
+  removeDupsUrl: {{ url_for('guide.remove_duplicate_channels_from_guide') | tojson }},
+  missingPreviewUrl: {{ url_for('channels.missing_delete_preview') | tojson }},
+  missingDeleteUrl: {{ url_for('channels.missing_delete') | tojson }},
+  hideUrl: {{ url_for('channels.hide_channels_bulk') | tojson }},
+  prefUrlBase: '/api/user-prefs/',
+  columnsPrefKey: {{ columns_pref_key | tojson }},
+  cardFieldsPrefKey: {{ card_fields_pref_key | tojson }},
+  savedPrefKey: {{ saved_pref_key | tojson }},
+  columnPrefs: {{ col_prefs | tojson }},
+  cardFieldPrefs: {{ card_field_prefs | tojson }},
+  {# The airing grain's column and card setups are their OWN pref rows, not a nested
+     object inside the channel grain's: one shared row would have each grain overwrite
+     the other's choice every time you flipped, which is the same reason the phone's
+     card fields are already separate from the desktop's columns. #}
+  airingColumnsPrefKey: {{ airing_columns_pref_key | tojson }},
+  airingCardFieldsPrefKey: {{ airing_card_fields_pref_key | tojson }},
+  airingColumnPrefs: {{ airing_col_prefs | tojson }},
+  airingCardFieldPrefs: {{ airing_card_field_prefs | tojson }},
+  {# What the Record button needs and the search response deliberately does not carry:
+     the raw stream URL (the row payload masks it), the recording's profile and the
+     group behind a group-backed recording. Fetched per Record CLICK, not per row. #}
+  recordContextUrlBase: '/api/channels/airings/',    {# + <epg id>/record-context #}
+  {# The replace action context, RESOLVED - null when `replace_rec` named a recording that
+     is no longer scheduled. That resolution is the authority: the JS drops the parameter
+     from its state when this is null, so a stale link cannot leave the URL claiming a
+     replace the page is not offering. #}
+  replaceRec: {{ replace_rec | tojson }},
+  savedSearches: {{ saved_searches | tojson }},
+  dupGroups: {{ dup_groups | tojson }},
+  newTagUrl: {{ (url_for('tags.tags_list') ~ '?new=1') | tojson }},
+  groupsUrl: {{ url_for('channel_groups.groups_page') | tojson }},
+  checkProfiles: {{ check_profiles.profiles | tojson }},
+  checkProfilesUrl: {{ url_for('health_check_profiles.health_check_profiles_list') | tojson }},
+  testerBusy: {{ tester_status.is_running | tojson }},
+  {# Where the maintenance window's hours live. The settings page reads ?q= off its own
+     URL and applies it as the page search (static/js/settings.js), so this lands with
+     both window fields showing - there is no anchor to link at. #}
+  windowSettingsUrl: {{ (url_for('settings.settings') ~ '?q=Maintenance+window') | tojson }},
+  groupDetailUrlBase: '/channel-groups/',
+  {# Which version of the group-create flow's intro screen this user has dismissed, so
+     the first screen is decided by the first paint rather than by a fetch made after the
+     modal is already on screen. 0 = never dismissed. #}
+  groupIntroSeenVersion: {{ group_intro_seen_version | tojson }},
+};
+
+{# What guide.js needs to drive the shared record modal. Same shape as index.html's -
+   no epgUrl, because this page has no guide grid and guide.js's grid paths are guarded
+   on that. `const`, not window.X: guide.js reads a bare GUIDE_CONFIG, which resolves
+   against the global lexical scope a top-level const lives in. #}
+const GUIDE_CONFIG = {
+  savedSearchesUrl: '{{ url_for("guide.list_saved_searches") }}',
+  deleteSavedSearchUrlBase: '/api/guide/saved-searches/',
+  addChannelUrlBase: '/api/guide/channels/',
+  newRecordingUrl: '{{ url_for("recordings.new_recording") }}',
+  editRecordingUrlBase: '/recordings/',
+  recDetailUrlBase: '/recordings/',
+  profiles: {
+    {% for p in profiles %}
+    '{{ p.id }}': { prePaddingMinutes: {{ p.pre_padding_minutes }}, postPaddingMinutes: {{ p.post_padding_minutes }} },
+    {% endfor %}
+  },
+};
+{# Re-run the search rather than reloading: a reload would throw away the search that
+   is on screen, and the only thing that changed is one row's record_state. #}
+window.onScheduleSaved = () => {
+  if (typeof window.channelSearchRefresh === 'function') window.channelSearchRefresh();
+};
+</script>
+<script src="{{ url_for('static', filename='js/guide.js') }}"></script>
+<script src="{{ url_for('static', filename='js/channel-search.js') }}"></script>
+<script src="{{ url_for('static', filename='js/schedule-fields.js') }}"></script>
+<script src="{{ url_for('static', filename='js/check-modal.js') }}"></script>
+<script src="{{ url_for('static', filename='js/dup-modal.js') }}"></script>
+<script src="{{ url_for('static', filename='js/missing-modal.js') }}"></script>
+<script src="{{ url_for('static', filename='js/group-modal.js') }}"></script>
+{# After group-modal.js: the create flow draws the server's soft warnings through that
+   file's groupWarningsHtml(), so the two cannot paraphrase one response differently. #}
+<script src="{{ url_for('static', filename='js/group-create-flow.js') }}"></script>
+{% endblock %}

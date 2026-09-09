@@ -1,0 +1,9 @@
+# Dev-only tooling. Not installed by Dockerfile or the plain `pip install -r requirements.txt`
+# a production/end-user install runs - see CONTRIBUTING.md "Linting".
+#
+# flake8 is the entry point; it drives pyflakes and adds `# noqa` and directory exclusion,
+# neither of which bare pyflakes supports. Configured in `.flake8` to run pyflakes' checks
+# only. pyflakes is pinned alongside it so the engine version stays a deliberate choice
+# rather than a transitive accident.
+flake8==7.3.0
+pyflakes==3.4.0

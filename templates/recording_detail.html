@@ -1,0 +1,1318 @@
+{% extends "base.html" %}
+{% from '_macros.html' import csrf_field, status_badge, channel_pill, account_pill, stat_row %}
+{% block title %}{{ rec.name }} - ChannelBin{% endblock %}
+{% block main_class %}detail-page{% endblock %}
+
+{% block content %}
+<a class="back" href="{{ url_for('recordings.index') }}">&larr; Recordings</a>
+
+{# ── Header (DESIGN.md 3.8/3.10): h1 + badge + pills; contextual actions right.
+   The whole slot is swapped by the 15s auto-refresh, so action handlers below
+   are delegated on document, never bound per element. #}
+<div id="detail-head-slot">
+<div class="detail-head">
+  <div>
+    <h1>{{ rec.name }}</h1>
+    <div class="dh-meta">
+      <span id="status-badge" data-status="{{ rec.status }}">{{ status_badge(row.badge_class, row.badge_label, pulse=row.badge_pulse, lg=true) }}</span>
+      {% if row.health.tip %}<span class="h-mini {{ row.health.cls }} tip-plain" data-tip="{{ row.health.tip }}">{{ row.health.label }}</span>
+      {% else %}<span class="h-mini na">-</span>{% endif %}
+      {% if row.pill %}{{ channel_pill(row.pill.label, row.pill.url, logo_url=row.pill.logo_url, initials=row.pill.initials, acct_color=row.pill.acct_color) }}{% endif %}
+      {% for acct in distinct_accounts %}{{ account_pill(acct.name, url_for('accounts.account_detail', account_id=acct.id), acct.color, tip='Recorded via account "' ~ acct.name ~ '" - click for the account page.') }}{% endfor %}
+    </div>
+  </div>
+  <div class="dh-actions">
+    {% if rec.status in ('IN_PROGRESS', 'PAUSED') %}
+      {% if rec.status == 'PAUSED' %}
+      <button class="btn" data-act="resume">&#9654; Resume</button>
+      {% else %}
+      <button class="btn tip-plain" data-act="extend" data-tip="Push the stop time 30 minutes later.">+30 min</button>
+      <button class="btn tip-plain" data-act="pause" data-tip="Pause capturing, keep the recording open.&#10;ffmpeg stops and the connection slot is freed; Resume later.&#10;The paused span becomes a gap in the output.">&#9208; Pause</button>
+      {% endif %}
+      <button class="btn btn-danger tip-plain" data-act="stop" data-tip="End the recording now, for good.&#10;Capture stops and the segments are concatenated into the final file.&#10;Can't be resumed.">&#9632; Stop</button>
+      <div class="menu-wrap">
+        <button class="btn btn-icon" data-menu>&#8943;</button>
+        <div class="menu">
+          <a href="{{ url_for('logs.logs_page') }}">View log lines</a>
+          <button class="menu-item" data-secs-open>Customize sections...</button>
+          <a href="{{ find_airing_url }}">Find another airing</a>
+          <button class="menu-item" data-copy="{{ rec.url }}">Copy stream URL</button>
+          <div class="sep"></div>
+          <button class="menu-item danger" data-act="abort">Abort (discard segments)</button>
+        </div>
+      </div>
+    {% elif rec.status == 'RETRYING' %}
+      <button class="btn btn-danger tip-plain" data-act="stop" data-tip="End the recording now, for good.&#10;Whatever was captured before the retry is joined into the final file.&#10;Can't be resumed.">&#9632; Stop</button>
+      <div class="menu-wrap">
+        <button class="btn btn-icon" data-menu>&#8943;</button>
+        <div class="menu">
+          <a href="{{ url_for('logs.logs_page') }}">View log lines</a>
+          <button class="menu-item" data-secs-open>Customize sections...</button>
+          <a href="{{ find_airing_url }}">Find another airing</a>
+          <button class="menu-item" data-copy="{{ rec.url }}">Copy stream URL</button>
+          <div class="sep"></div>
+          <button class="menu-item danger" data-act="abort">Abort (discard segments)</button>
+        </div>
+      </div>
+    {% elif rec.status == 'SCHEDULED' %}
+      <button class="btn" onclick="openEditModal()">Edit schedule</button>
+      <div class="menu-wrap">
+        <button class="btn btn-icon" data-menu>&#8943;</button>
+        <div class="menu">
+          <a href="{{ url_for('logs.logs_page') }}">View log lines</a>
+          <button class="menu-item" data-secs-open>Customize sections...</button>
+          <a href="{{ find_airing_url }}">Find another airing</a>
+          <button class="menu-item" data-copy="{{ rec.url }}">Copy stream URL</button>
+          <div class="sep"></div>
+          <button class="menu-item danger" data-act="cancel">Cancel recording</button>
+        </div>
+      </div>
+    {% elif rec.status == 'FAILED' %}
+      {# Recovery outranks re-recording whenever there is something on disk to recover
+         from. Buried in the kebab, the only visible action on a recording that had
+         finished capturing was "Record again", which re-records what the box already
+         has (dev/docs/BUGS.md 2026-08-24). Both stay visible - Record again is still the
+         right call when the recovery attempt is not the one you want. #}
+      {% if ts_source_available %}
+      <button class="btn btn-primary" data-act="retry-convert">Retry conversion</button>
+      {% elif segment_files_on_disk %}
+      <button class="btn btn-primary" data-act="retry-concat">Retry concatenation</button>
+      {% endif %}
+      <a class="btn" href="{{ find_airing_url }}">&#8635; Record again</a>
+      <div class="menu-wrap">
+        <button class="btn btn-icon" data-menu>&#8943;</button>
+        <div class="menu">
+          <a href="{{ url_for('logs.logs_page') }}">View log lines</a>
+          <button class="menu-item" data-secs-open>Customize sections...</button>
+          <button class="menu-item" data-copy="{{ rec.url }}">Copy stream URL</button>
+          {% if rec.output_path %}<button class="menu-item" data-copy="{{ rec.output_path }}">Copy output path</button>{% endif %}
+          {% if not ts_source_available and not segment_files_on_disk %}
+          <button class="menu-item" data-act="retry-concat">Retry concatenation</button>
+          {% endif %}
+          <div class="sep"></div>
+          <button class="menu-item danger" data-act="delete">Delete recording</button>
+        </div>
+      </div>
+    {% elif rec.status in ('COMPLETED', 'ABORTED') %}
+      <div class="menu-wrap">
+        <button class="btn btn-icon" data-menu>&#8943;</button>
+        <div class="menu">
+          <a href="{{ url_for('logs.logs_page') }}">View log lines</a>
+          <button class="menu-item" data-secs-open>Customize sections...</button>
+          <a href="{{ find_airing_url }}">Record again</a>
+          <button class="menu-item" data-copy="{{ rec.url }}">Copy stream URL</button>
+          {% if rec.output_path %}<button class="menu-item" data-copy="{{ rec.output_path }}">Copy output path</button>{% endif %}
+          {% if ts_source_available %}<button class="menu-item" data-act="retry-convert">Retry conversion</button>{% endif %}
+          <div class="sep"></div>
+          <button class="menu-item danger" data-act="delete">Delete recording</button>
+        </div>
+      </div>
+    {% elif rec.status in ('CONCATENATING', 'ANALYZING', 'CONVERTING') %}
+      {#- CONCATENATING offers no cancel: that step is unreachable from here and is the one
+          that makes the file. ANALYZING does, because the file is already whole on disk by
+          then and the work still running only reads it (dev/changelog/867). -#}
+      {% if rec.status == 'CONVERTING' %}<button class="btn btn-danger" data-act="cancel-convert">&#9632; Cancel conversion</button>{% endif %}
+      {% if rec.status == 'ANALYZING' %}<button class="btn btn-danger" data-act="cancel-analysis">&#9632; Cancel processing</button>{% endif %}
+      <div class="menu-wrap">
+        <button class="btn btn-icon" data-menu>&#8943;</button>
+        <div class="menu">
+          <a href="{{ url_for('logs.logs_page') }}">View log lines</a>
+          <button class="menu-item" data-secs-open>Customize sections...</button>
+          <button class="menu-item" data-copy="{{ rec.url }}">Copy stream URL</button>
+          {% if rec.status == 'CONCATENATING' %}<button class="menu-item" data-act="retry-concat">Retry concatenation</button>{% endif %}
+          {% if rec.status == 'CONVERTING' and ts_source_available %}<button class="menu-item" data-act="retry-convert">Retry conversion</button>{% endif %}
+        </div>
+      </div>
+    {% else %}
+      {# unknown status: log-visible, no actions offered #}
+      <div class="menu-wrap">
+        <button class="btn btn-icon" data-menu>&#8943;</button>
+        <div class="menu"><a href="{{ url_for('logs.logs_page') }}">View log lines</a></div>
+      </div>
+    {% endif %}
+  </div>
+</div>
+{# ── Mobile sticky bottom action bar (DESIGN.md 9.5) - supersedes the header action
+   group above at ≤768px; real buttons for the primary action(s), kebab holds
+   everything else. Same data-act/data-copy/onclick attributes as the header above,
+   so the existing delegated (document-level) handlers cover these buttons too with
+   no extra JS - every status gets an explicit branch, matching .dh-actions above. #}
+<div class="mobile-actbar">
+  {% if rec.status in ('IN_PROGRESS', 'PAUSED') %}
+    <button class="btn tip-plain" data-act="extend" data-tip="Push the stop time 30 minutes later.">+30 min</button>
+    {% if rec.status == 'PAUSED' %}
+    <button class="btn" data-act="resume">&#9654; Resume</button>
+    {% else %}
+    <button class="btn" data-act="pause">&#9208; Pause</button>
+    {% endif %}
+    <button class="btn btn-danger" data-act="stop">&#9632; Stop</button>
+    <div class="menu-wrap">
+      <button class="btn btn-icon" data-menu>&#8943;</button>
+      <div class="menu pop-up">
+        <a href="{{ url_for('logs.logs_page') }}">View log lines</a>
+        <button class="menu-item" data-secs-open>Customize sections...</button>
+        <a href="{{ find_airing_url }}">Find another airing</a>
+        <button class="menu-item" data-copy="{{ rec.url }}">Copy stream URL</button>
+        <div class="sep"></div>
+        <button class="menu-item danger" data-act="abort">Abort (discard segments)</button>
+      </div>
+    </div>
+  {% elif rec.status == 'RETRYING' %}
+    <button class="btn btn-danger" data-act="stop">&#9632; Stop</button>
+    <div class="menu-wrap">
+      <button class="btn btn-icon" data-menu>&#8943;</button>
+      <div class="menu pop-up">
+        <a href="{{ url_for('logs.logs_page') }}">View log lines</a>
+        <button class="menu-item" data-secs-open>Customize sections...</button>
+        <a href="{{ find_airing_url }}">Find another airing</a>
+        <button class="menu-item" data-copy="{{ rec.url }}">Copy stream URL</button>
+        <div class="sep"></div>
+        <button class="menu-item danger" data-act="abort">Abort (discard segments)</button>
+      </div>
+    </div>
+  {% elif rec.status == 'SCHEDULED' %}
+    <button class="btn" onclick="openEditModal()">Edit schedule</button>
+    <div class="menu-wrap">
+      <button class="btn btn-icon" data-menu>&#8943;</button>
+      <div class="menu pop-up">
+        <a href="{{ url_for('logs.logs_page') }}">View log lines</a>
+        <button class="menu-item" data-secs-open>Customize sections...</button>
+        <a href="{{ find_airing_url }}">Find another airing</a>
+        <button class="menu-item" data-copy="{{ rec.url }}">Copy stream URL</button>
+        <div class="sep"></div>
+        <button class="menu-item danger" data-act="cancel">Cancel recording</button>
+      </div>
+    </div>
+  {% elif rec.status == 'FAILED' %}
+    {# Mirrors the desktop header's promotion, within the bar's two-button budget (9.5):
+       when there is something to recover, Delete steps back into the kebab rather than
+       the recovery action staying hidden behind it. #}
+    {% set recover_act = 'retry-convert' if ts_source_available else ('retry-concat' if segment_files_on_disk else none) %}
+    {% if recover_act %}
+    <button class="btn btn-primary" data-act="{{ recover_act }}">{{ 'Retry conversion' if recover_act == 'retry-convert' else 'Retry concatenation' }}</button>
+    {% endif %}
+    <a class="btn" href="{{ find_airing_url }}">&#8635; Record again</a>
+    {% if not recover_act %}<button class="btn btn-danger" data-act="delete">Delete</button>{% endif %}
+    <div class="menu-wrap">
+      <button class="btn btn-icon" data-menu>&#8943;</button>
+      <div class="menu pop-up">
+        <a href="{{ url_for('logs.logs_page') }}">View log lines</a>
+        <button class="menu-item" data-secs-open>Customize sections...</button>
+        <button class="menu-item" data-copy="{{ rec.url }}">Copy stream URL</button>
+        {% if rec.output_path %}<button class="menu-item" data-copy="{{ rec.output_path }}">Copy output path</button>{% endif %}
+        {% if not recover_act %}
+        <button class="menu-item" data-act="retry-concat">Retry concatenation</button>
+        {% else %}
+        <div class="sep"></div>
+        <button class="menu-item danger" data-act="delete">Delete recording</button>
+        {% endif %}
+      </div>
+    </div>
+  {% elif rec.status in ('COMPLETED', 'ABORTED') %}
+    <a class="btn" href="{{ find_airing_url }}">&#8635; Record again</a>
+    <button class="btn btn-danger" data-act="delete">Delete</button>
+    <div class="menu-wrap">
+      <button class="btn btn-icon" data-menu>&#8943;</button>
+      <div class="menu pop-up">
+        <a href="{{ url_for('logs.logs_page') }}">View log lines</a>
+        <button class="menu-item" data-secs-open>Customize sections...</button>
+        <button class="menu-item" data-copy="{{ rec.url }}">Copy stream URL</button>
+        {% if rec.output_path %}<button class="menu-item" data-copy="{{ rec.output_path }}">Copy output path</button>{% endif %}
+        {% if ts_source_available %}<button class="menu-item" data-act="retry-convert">Retry conversion</button>{% endif %}
+      </div>
+    </div>
+  {% elif rec.status in ('CONCATENATING', 'ANALYZING', 'CONVERTING') %}
+    {% if rec.status == 'CONVERTING' %}<button class="btn btn-danger" data-act="cancel-convert">&#9632; Cancel conversion</button>{% endif %}
+    {% if rec.status == 'ANALYZING' %}<button class="btn btn-danger" data-act="cancel-analysis">&#9632; Cancel processing</button>{% endif %}
+    <div class="menu-wrap">
+      <button class="btn btn-icon" data-menu>&#8943;</button>
+      <div class="menu pop-up">
+        <a href="{{ url_for('logs.logs_page') }}">View log lines</a>
+        <button class="menu-item" data-secs-open>Customize sections...</button>
+        <button class="menu-item" data-copy="{{ rec.url }}">Copy stream URL</button>
+        {% if rec.status == 'CONCATENATING' %}<button class="menu-item" data-act="retry-concat">Retry concatenation</button>{% endif %}
+        {% if rec.status == 'CONVERTING' and ts_source_available %}<button class="menu-item" data-act="retry-convert">Retry conversion</button>{% endif %}
+      </div>
+    </div>
+  {% else %}
+    {# unknown status: log-visible, no actions offered - matches .dh-actions above #}
+    <div class="menu-wrap">
+      <button class="btn btn-icon" data-menu>&#8943;</button>
+      <div class="menu pop-up"><a href="{{ url_for('logs.logs_page') }}">View log lines</a></div>
+    </div>
+  {% endif %}
+</div>
+</div>
+
+{# ── Status strip (topmost card, DESIGN.md 3.8) - every status explicit.
+   While live, the strip's stat spans are owned by the SSE handler (one
+   updater per region: the auto-refresh swap skips this slot when live). #}
+<div id="status-strip-slot">
+{% if rec.status == 'IN_PROGRESS' %}
+<div class="live-strip">
+  <span class="pulse"></span>
+  <span><b>Recording</b></span>
+  <span class="sep-dot">·</span>
+  <span>elapsed <span class="mono" id="live-elapsed">-</span></span>
+  <span class="sep-dot">·</span>
+  <span>remaining <span class="mono" id="live-remaining">-</span></span>
+  <span class="sep-dot">·</span>
+  <span><span class="mono" id="live-bytes">-</span> recorded</span>
+  <span class="sep-dot">·</span>
+  <span>stalls <span class="mono" id="live-stalls">{{ rec.total_stall_count }}</span></span>
+  <span class="sep-dot">·</span>
+  <span>failures <span class="mono" id="live-failures">{{ rec.consecutive_failures }}</span></span>
+</div>
+{% elif rec.status == 'PAUSED' %}
+<div class="live-strip">
+  <span><b>Paused</b></span>
+  <span class="sep-dot">·</span>
+  <span>capture is stopped and the connection slot is freed - Resume to continue, or Stop to finalize what was captured</span>
+</div>
+{% elif rec.status == 'RETRYING' %}
+<div class="live-strip">
+  <span class="fx">&#8635;</span>
+  <span>The stream reconnected but immediately died - waiting to try again
+    {%- if rec.next_retry_at %} at <b>{{ rec.next_retry_at | local_time_sec }}</b>{% endif %}
+    (attempt <b>{{ rec.dead_stream_retry_count }}</b> of <b>{{ max_dead_stream_retry_attempts }}</b>)</span>
+  <span class="sep-dot">·</span>
+  <span>Stop to finalize what was captured, or Abort to discard it</span>
+</div>
+{% elif rec.status == 'SCHEDULED' %}
+<div class="live-strip sched-strip">
+  <span class="fx">&#128337;</span>
+  <span>Scheduled to start <b>{{ rec.start_time | local_time }}</b></span>
+  <span class="sep-dot">·</span>
+  <span>{{ row.rel }}</span>
+</div>
+{% elif rec.status == 'CONCATENATING' %}
+<div class="live-strip concat-strip">
+  <span class="pulse"></span>
+  <span>Capture finished - <b>{{ rec.segments | length }} segment{{ '' if rec.segments | length == 1 else 's' }}</b> being joined into the final file. This usually takes a few minutes.</span>
+</div>
+{% elif rec.status == 'ANALYZING' %}
+{# The long one, and the reason this status exists: two whole-file reads that scale with
+   size (~124s each on a 17.9 GB capture). Naming the size is what makes a wait that looks
+   stuck read as work instead - the file is already complete on disk by this point. #}
+<div class="live-strip concat-strip">
+  <span class="pulse"></span>
+  <span>Segments joined - the recorded file{% if rec.final_file_size %} (<b>{{ rec.final_file_size | filesize }}</b>){% endif %} is being checked for damage before conversion. This reads the whole file, so it takes longer on a large recording.</span>
+</div>
+{% elif rec.status == 'CONVERTING' %}
+{# Server-rendered from the persisted conversion_* snapshot; the page's 15s status-strip
+   swap refreshes it (this status is not is_active, so it is included in that swap). #}
+<div class="live-strip concat-strip">
+  <span class="pulse"></span>
+  <span>Conversion in progress</span>
+  {% if rec.conversion_out_size %}
+  <span class="sep-dot">·</span>
+  <span><b>{{ rec.conversion_out_size | filesize }}</b> written</span>
+  {% endif %}
+  {% if rec.conversion_progress_pct is not none %}
+  <span class="sep-dot">·</span>
+  <span><b>{{ rec.conversion_progress_pct | round(0) | int }}%</b> complete</span>
+  {% endif %}
+  <span class="sep-dot">·</span>
+  <span>{% if rec.conversion_eta_seconds is not none %}~{% if rec.conversion_eta_seconds >= 60 %}{{ rec.conversion_eta_seconds // 60 }} min{% else %}{{ rec.conversion_eta_seconds }} sec{% endif %} left{% else %}estimating time left{% endif %}</span>
+  {% if rec.conversion_attempts %}
+  <span class="sep-dot">·</span>
+  <span>attempt {{ rec.conversion_attempts }} of {{ conversion_max_attempts }}</span>
+  {% endif %}
+</div>
+{% elif rec.status == 'COMPLETED' %}
+<div class="live-strip done-strip">
+  <span class="fx">&#10003;</span>
+  <span>Concatenated <b>{{ rec.segments | length }} segment{{ '' if rec.segments | length == 1 else 's' }}</b>{% if rec.final_file_size %} &rarr; <b>{{ rec.final_file_size | filesize }}</b>{% endif %}</span>
+  {% if rec.completed_at %}
+  <span class="sep-dot">·</span>
+  <span>finished <span class="mono">{{ rec.completed_at | local_time_sec }}</span></span>
+  {% endif %}
+</div>
+{% elif rec.status == 'FAILED' %}
+<div class="live-strip fail-strip">
+  <span class="fx">&#10007;</span>
+  {# Every branch here names a real state. The trailing else must stay a state nothing
+     else can be - a FAILED recording whose capture succeeded and whose post-processing
+     died was being told its stream was never reached, while 17.9 GB of it sat on disk
+     (dev/docs/BUGS.md 2026-08-24). ts_source_available / segment_files_on_disk are
+     stat'ed by the route; the template cannot reach the filesystem. #}
+  <span>Failed{% if rec.completed_at %} at <b>{{ rec.completed_at | local_time_sec }}</b>{% endif %} -
+    {% if rec.failure_reason == 'DEAD_STREAM_DETECTED' %}the stream reconnected but immediately died each time, so it was aborted automatically rather than looping forever
+    {%- elif rec.consecutive_failures_peak > 0 %}<b>{{ rec.consecutive_failures_peak }} consecutive restart attempts</b> produced no data (max consecutive failures reached)
+    {%- elif ts_source_available %}the capture finished and was concatenated, but post-processing did not complete
+    {%- elif segment_files_on_disk %}the capture recorded data, but it was never concatenated into a finished file
+    {%- else %}the stream could not be reached before producing any segments{% endif %}</span>
+  <span class="sep-dot">·</span>
+  <span>
+    {%- if ts_source_available %}the concatenated <b>.ts</b> is still on disk - use <b>Retry conversion</b> to finish it
+    {%- elif segment_files_on_disk %}segments kept on disk - use <b>Retry concatenation</b> to finish it
+    {%- else %}nothing was captured - use <b>Record again</b> to reschedule{% endif %}</span>
+</div>
+{% elif rec.status == 'ABORTED' %}
+<div class="live-strip abort-strip">
+  <span class="fx">&#9632;</span>
+  <span>Cancelled manually{% if rec.completed_at %} at <b>{{ rec.completed_at | local_time_sec }}</b>{% endif %} - captured files were discarded</span>
+</div>
+{% else %}
+<div class="live-strip abort-strip">
+  <span class="fx">?</span>
+  <span>Status: <b>{{ rec.status }}</b> (unrecognized - check the event log below)</span>
+</div>
+{% endif %}
+</div>
+
+{# ── Run Timeline data prep: one chronological milestone list from a Start
+   anchor, curated events, and non-stall segment boundaries. Same clustering
+   as the old panel (cluster_window); rendering is the compact 3.8 bar. #}
+{% set timeline_label = {
+  'STALL_DETECTED': 'Stall',
+  'RESTART_SUCCEEDED': 'Restart',
+  'RESTART_FAILED': 'Restart failed',
+  'CAPTURE_COMPLETE': 'Stop time reached',
+  'RECORDING_FAILED': 'Recording FAILED',
+  'RECORDING_FAILED_DEAD_STREAM': 'Dead stream detected',
+  'RECORDING_RETRY_SCHEDULED': 'Retrying after dead stream',
+  'RECORDING_ABORTED': 'Cancelled',
+  'RECORDING_MANUALLY_STOPPED': 'Manually stopped',
+  'RECORDING_PAUSED': 'Paused',
+  'RECORDING_RESUMED': 'Resumed',
+  'RECORDING_EDITED': 'Edited',
+  'RECORDING_STOP_TIME_ADJUSTED': 'Stop time adjusted',
+  'RECORDING_REPLACED_OTHER': 'Replaced another recording',
+} %}
+{% set event_dot = {
+  'STALL_DETECTED': 'stall',
+  'RESTART_SUCCEEDED': 'restart',
+  'RESTART_FAILED': 'fail',
+  'SEGMENT_STARTED': 'start',
+  'CAPTURE_COMPLETE': 'stop',
+  'RECORDING_FAILED': 'fail',
+  'RECORDING_FAILED_DEAD_STREAM': 'fail',
+  'RECORDING_RETRY_SCHEDULED': 'stall',
+  'RECORDING_ABORTED': 'stop',
+  'RECORDING_PAUSED': 'paused',
+  'RECORDING_MANUALLY_STOPPED': 'stop',
+  'RECORDING_RESUMED': 'start',
+  'RECORDING_EDITED': 'neutral',
+  'RECORDING_STOP_TIME_ADJUSTED': 'neutral',
+  'RECORDING_REPLACED_OTHER': 'neutral',
+} %}
+{# Milestone `kind` distinguishes actual events (colored solid dots) from the two
+   flavors of "planned, not what happened" marker (hollow dots, per DESIGN.md 3.8):
+   'scheduled' = Scheduled Start/Stop (what the user requested when creating the
+   recording); 'program' = Program Start/End (what the EPG says the program's own
+   air time was). Both are prio 0/silent so an actual Start/Stop landing on the same
+   moment absorbs them into one dot instead of a separate "(+1 more)". #}
+{# The bar is a timeline of the RUN, so its axis may only be stretched by things that
+   happened during one. An event older than the start anchor - an edit made days earlier
+   while the recording was still SCHEDULED - is real history, but putting it on this axis
+   pushes the capture itself into a sliver: two edits made 2 days ahead once left the
+   actual 5-hour recording occupying 8% of the bar (dev/docs/BUGS.md 2026-08-24). Those
+   events keep their place in the Activity log below, which is where run-ordered history
+   belongs. The hollow scheduled/program markers are deliberately exempt - a late start is
+   exactly what they exist to show, so they may legitimately precede the anchor. #}
+{% set run_start = rec.started_at or rec.start_time %}
+{% set ns_ms = namespace(items=[]) %}
+{% if rec.events %}
+  {% if rec.program_start_time and (rec.program_start_time - (rec.started_at or rec.start_time)).total_seconds() | abs > 60 %}
+    {% set _ = ns_ms.items.append({'ts': rec.program_start_time, 'kind': 'program', 'label': 'Program start', 'prio': 0, 'silent': True}) %}
+  {% endif %}
+  {% if rec.scheduled_start_time %}
+    {% set _ = ns_ms.items.append({'ts': rec.scheduled_start_time, 'kind': 'scheduled', 'label': 'Scheduled start', 'prio': 0, 'silent': True}) %}
+  {% endif %}
+  {% set _ = ns_ms.items.append({'ts': rec.started_at or rec.start_time, 'kind': 'start', 'label': 'Start', 'prio': 1, 'silent': False}) %}
+  {# Segment exit reasons keyed by number, so a stall milestone can say which of the two
+     shapes it was without a per-event lookup. rec.segments is already loaded for the
+     Segments table below, so this costs no extra query. #}
+  {% set seg_exit = {} %}
+  {% for s in rec.segments %}
+    {% set _ = seg_exit.update({s.segment_number: s.exit_reason}) %}
+  {% endfor %}
+  {# Capture ends once, so only the first CAPTURE_COMPLETE is a capture milestone. The
+     post-capture chain reuses the type to mark its own re-entries (a restart resuming
+     concat or post-processing), and those are neither "stop time reached" nor part of the
+     run: one on recording 4 sat 10.5 hours past the capture and stretched the axis so the
+     5-hour capture rendered at 32% of the bar. #}
+  {% set cc = namespace(seen=false) %}
+  {% for evt in rec.events %}
+    {% set is_repeat_capture_complete = evt.event_type == 'CAPTURE_COMPLETE' and cc.seen %}
+    {% if evt.event_type == 'CAPTURE_COMPLETE' %}{% set cc.seen = true %}{% endif %}
+    {% if evt.event_type in timeline_label and not is_repeat_capture_complete
+          and not (run_start and evt.timestamp < run_start) %}
+      {% set lbl = timeline_label[evt.event_type] %}
+      {% if evt.event_type == 'STALL_DETECTED' and evt.segment_number is not none %}
+        {% if seg_exit.get(evt.segment_number) == 'PROCESS_EXITED' %}
+          {% set lbl = 'Capture exited (seg ' ~ (evt.segment_number + seg_offset) ~ ')' %}
+        {% elif seg_exit.get(evt.segment_number) == 'RESTART_NO_DATA' %}
+          {# We did kill it, but "stall" would imply a capture that was running and stopped.
+             This one never delivered a byte, which is a different story. #}
+          {% set lbl = 'Restart got no data (seg ' ~ (evt.segment_number + seg_offset) ~ ')' %}
+        {% else %}
+          {% set lbl = 'Stall (seg ' ~ (evt.segment_number + seg_offset) ~ ' killed)' %}
+        {% endif %}
+      {% endif %}
+      {% set prio = 2 if evt.event_type == 'RECORDING_MANUALLY_STOPPED' else 1 %}
+      {% set silent = evt.event_type == 'CAPTURE_COMPLETE' %}
+      {% set _ = ns_ms.items.append({'ts': evt.timestamp, 'kind': event_dot.get(evt.event_type, 'neutral'), 'label': lbl, 'prio': prio, 'silent': silent}) %}
+    {% endif %}
+  {% endfor %}
+  {% for seg in rec.segments %}
+    {% if not loop.first %}
+      {% set prev = rec.segments[loop.index0 - 1] %}
+      {# All three of these already put their own milestone on the timeline via the
+         STALL_DETECTED event above - a boundary marker here would double it. ERROR is
+         deliberately NOT in the list: a segment abandoned by group failover is closed by
+         _close_active_segment, which emits SEGMENT_ENDED rather than STALL_DETECTED, so
+         the boundary marker is the only thing that marks it. #}
+      {% if prev.exit_reason not in ('STALL_KILLED', 'PROCESS_EXITED', 'RESTART_NO_DATA') and seg.started_at %}
+        {% set _ = ns_ms.items.append({'ts': seg.started_at, 'kind': 'neutral', 'label': 'Segment boundary', 'prio': 1, 'silent': False}) %}
+      {% endif %}
+    {% endif %}
+  {% endfor %}
+  {% if rec.scheduled_stop_time %}
+    {% set _ = ns_ms.items.append({'ts': rec.scheduled_stop_time, 'kind': 'scheduled', 'label': 'Scheduled stop', 'prio': 0, 'silent': True}) %}
+  {% endif %}
+  {% set actual_stop = rec.completed_at or rec.stop_time %}
+  {% if rec.program_stop_time and (rec.program_stop_time - actual_stop).total_seconds() | abs > 60 %}
+    {% set _ = ns_ms.items.append({'ts': rec.program_stop_time, 'kind': 'program', 'label': 'Program end', 'prio': 0, 'silent': True}) %}
+  {% endif %}
+{% endif %}
+{% set all_milestones = ns_ms.items | sort(attribute='ts') %}
+
+{# ── Section-picker container (DESIGN.md 9.5/10.2): desktop orders/hides 3 top-level
+   [data-sec] children (details/segs/log); mobile additionally dissolves #details-section
+   into its own 3 sub-cards (shot/tl/stats) via display:contents, for 5 total. Both
+   modes reorder via flex `order` on this container - see the section-picker script
+   at the bottom of this template. #}
+<div id="detail-sections">
+
+{# ── Details section (DESIGN.md 10.2): screenshot + Run Timeline bar + statlist,
+   one card on desktop. data-sec marks the sub-regions the MOBILE section picker
+   (9.5) splits into their own cards - #details-section itself is desktop's unit.
+   The thumb cell is owned by the live-thumbnail refresher while live, so the
+   15s swap only replaces #hero-right. #}
+<div class="hero" id="details-section" data-sec="details">
+  <div class="card-head"><h2>Details</h2></div>
+  <div class="hero-grid">
+  <div id="hero-thumb" data-sec="shot">
+    <div class="sec-title">Screenshot</div>
+    {% if rec.status == 'IN_PROGRESS' and thumb_enabled %}
+    <div class="bigthumb has-img" id="live-bigthumb">
+      <img id="live-thumb-img" alt="Live frame" style="display:none">
+      <span id="live-thumb-placeholder">WAITING FOR STREAM DATA&#8230;</span>
+      <span class="live-tag"><span class="pulse"></span>LIVE</span>
+      <span class="shot-age" id="live-thumb-captured"></span>
+    </div>
+    {% elif has_shot %}
+    <div class="bigthumb has-img" id="final-bigthumb" data-shot="{{ url_for('recordings.live_thumbnail', recording_id=rec.id) }}">
+      <img src="{{ url_for('recordings.live_thumbnail', recording_id=rec.id) }}" alt="Last captured frame"
+           onerror="this.parentElement.classList.remove('has-img'); this.replaceWith('NO SCREENSHOT');">
+      {% if shot_mtime %}<span class="shot-age">captured {{ shot_mtime | local_time_only }}</span>{% endif %}
+    </div>
+    {% elif row.pill and row.pill.logo_url %}
+    <div class="bigthumb logo-fallback">
+      <img src="{{ row.pill.logo_url }}" alt="{{ row.pill.label }} logo"
+           onerror="this.parentElement.classList.remove('logo-fallback'); this.remove();">
+      <span class="shot-age">{% if rec.status == 'SCHEDULED' %}NOT STARTED YET{% else %}NO SCREENSHOT{% endif %}</span>
+    </div>
+    {% else %}
+    <div class="bigthumb">{% if rec.status == 'SCHEDULED' %}NOT STARTED YET{% else %}NO SCREENSHOT{% endif %}</div>
+    {% endif %}
+  </div>
+  <div class="hero-right" id="hero-right">
+    {% if all_milestones and all_milestones | length > 1 %}
+      {% set first_ts = all_milestones[0].ts %}
+      {% set last_ts = all_milestones[-1].ts %}
+      {% set total_span = (last_ts - first_ts).total_seconds() %}
+      {% if total_span > 0 %}
+      {% set cluster_window = [45, total_span * 0.015] | max %}
+      {# track intervals: green while capturing, red across stall/restart gaps,
+         gray for requested-vs-actual slip; a live segment is green only up to
+         `now` (the future stays empty) #}
+      {% set bg = namespace(items=[]) %}
+      {% set actual_start = rec.started_at or rec.start_time %}
+      {% if rec.scheduled_start_time and rec.scheduled_start_time < actual_start %}
+        {% set _ = bg.items.append({'start': rec.scheduled_start_time, 'end': actual_start, 'cls': 'slip'}) %}
+      {% endif %}
+      {% for seg in rec.segments %}
+        {% if seg.started_at %}
+          {% set seg_end = seg.ended_at or now %}
+          {% set _ = bg.items.append({'start': seg.started_at, 'end': seg_end, 'cls': 'rec'}) %}
+          {% if not loop.last %}
+            {% set nxt = rec.segments[loop.index0 + 1] %}
+            {% if nxt.started_at and nxt.started_at > seg_end %}
+              {% set _ = bg.items.append({'start': seg_end, 'end': nxt.started_at, 'cls': 'gap'}) %}
+            {% endif %}
+          {% endif %}
+        {% endif %}
+      {% endfor %}
+      {% set last_seg_end = (rec.segments[-1].ended_at if rec.segments else none) %}
+      {% if rec.scheduled_stop_time and last_seg_end and rec.scheduled_stop_time > last_seg_end %}
+        {% set _ = bg.items.append({'start': last_seg_end, 'end': rec.scheduled_stop_time, 'cls': 'slip'}) %}
+      {% endif %}
+      <div class="run-tl" data-sec="tl">
+        <div class="sec-title">Run timeline</div>
+        <div class="run-tl-bar">
+          {% for b in bg.items %}
+            {% set sp = (b.start - first_ts).total_seconds() / total_span * 100 %}
+            {% set ep = (b.end - first_ts).total_seconds() / total_span * 100 %}
+            {% set sp = [0, [sp, 100] | min] | max %}
+            {% set ep = [0, [ep, 100] | min] | max %}
+            {# a 30s gap in an hours-long bar would vanish under its dot - give
+               gaps/slips a minimum on-screen width #}
+            {% if b.cls in ('gap', 'slip') and (ep - sp) < 0.9 %}
+              {% set mid = (sp + ep) / 2 %}
+              {% set sp = [0, mid - 0.45] | max %}
+              {% set ep = [100, mid + 0.45] | min %}
+            {% endif %}
+            <span class="run-tl-span {{ b.cls }}{% if sp < 0.5 %} first{% endif %}{% if ep > 99.5 and b.cls == 'rec' %} last{% endif %}" style="left:{{ sp | round(2) }}%; width:{{ (ep - sp) | round(2) }}%"></span>
+          {% endfor %}
+          {# milestone dots, clustered: markers within cluster_window merge into
+             one dot whose tooltip lists everything it covers #}
+          {% set grp = namespace(items=[], pct=0, last_ts=none) %}
+          {% set groups = namespace(list=[]) %}
+          {% for m in all_milestones %}
+            {% set pct = (m.ts - first_ts).total_seconds() / total_span * 100 %}
+            {% if grp.last_ts and (m.ts - grp.last_ts).total_seconds() <= cluster_window %}
+              {% set _ = grp.items.append(m) %}
+              {% set grp.last_ts = m.ts %}
+            {% else %}
+              {% if grp.items %}{% set _ = groups.list.append({'ms': grp.items, 'pct': grp.pct}) %}{% endif %}
+              {% set grp.items = [m] %}
+              {% set grp.pct = pct %}
+              {% set grp.last_ts = m.ts %}
+            {% endif %}
+            {% if loop.last %}{% set _ = groups.list.append({'ms': grp.items, 'pct': grp.pct}) %}{% endif %}
+          {% endfor %}
+          {% for g in groups.list %}
+            {% set rep = (g.ms | sort(attribute='prio', reverse=true))[0] %}
+            {% set tns = namespace(tip='') %}
+            {% for it in g.ms %}
+              {% set line = (it.ts | local_time_sec) ~ ' - ' ~ it.label %}
+              {% set tns.tip = line if loop.first else (tns.tip ~ '\n' ~ line) %}
+            {% endfor %}
+            <span class="run-tl-dot d-{{ rep.kind }} tip-plain" style="left:{{ g.pct | round(2) }}%" data-tip="{{ tns.tip }}"></span>
+          {% endfor %}
+          {% if rec.status in ('IN_PROGRESS', 'PAUSED', 'RETRYING') and now >= first_ts and now <= last_ts %}
+          <span class="run-tl-now" style="left:{{ ((now - first_ts).total_seconds() / total_span * 100) | round(2) }}%"></span>
+          {% endif %}
+        </div>
+        <div class="run-tl-times">
+          <span>{{ first_ts | local_time_only }}</span>
+          {% if rec.status in ('IN_PROGRESS', 'PAUSED', 'RETRYING') %}
+          <span class="now">now · {{ now | local_time_only }}</span>
+          {% elif rec.status == 'FAILED' %}
+          <span class="fail">failed · {{ (rec.completed_at or last_ts) | local_time_only }}</span>
+          {% elif rec.actual_duration_seconds %}
+          <span>{{ rec.actual_duration_seconds | int | duration }} captured</span>
+          {% else %}
+          <span></span>
+          {% endif %}
+          <span>{{ last_ts | local_time_only }}</span>
+        </div>
+      </div>
+      {% endif %}
+    {% endif %}
+
+    {% set has_output_row = rec.output_path or rec.status == 'FAILED' %}
+    <div class="statlist{% if has_output_row %} has-wide{% endif %}" data-sec="stats">
+      <div class="sec-title">Stats</div>
+      {% if rec.status == 'SCHEDULED' %}
+        {{ stat_row('Starts', rec.start_time | local_time) }}
+        {{ stat_row('Stops', rec.stop_time | local_time) }}
+        {{ stat_row('Scheduled window', rec.scheduled_duration_seconds | int | duration) }}
+        {% if rec.program_duration_seconds is not none and rec.program_duration_seconds != rec.scheduled_duration_seconds %}
+        {{ stat_row('Program length', rec.program_duration_seconds | int | duration) }}
+        {% endif %}
+      {% else %}
+        <div class="srow"><span class="sk">Captured</span><span class="sv{% if row.dur_flag == 'partial' %} warn{% endif %}{% if row.dur_tip %} tip-plain" data-tip="{{ row.dur_tip }}{% endif %}">{% if row.dur_flag %}<span class="dur-flag{% if row.dur_flag == 'partial' %} dur-amber{% endif %}">&#9685;</span>{% endif %}{{ row.dur_str or '-' }} of {{ (rec.scheduled_duration_seconds | int) | duration }}</span></div>
+        {{ stat_row('Size', (row.size_num ~ ' ' ~ row.size_unit) if row.size_num else '-') }}
+        {{ stat_row('Bitrate', row.rate or '-') }}
+        {% set tech_tip = 'From the final output file (recorded before capture-time probing existed).' if tech_source == 'output' else none %}
+        {# Coded frame size rides on Video's tooltip rather than getting its own row:
+           the resolution beside it already conveys the displayed size. `select` with no
+           test drops the None halves, so a missing piece never leaves a stray newline. #}
+        {% set coded_note = ('Encoder frame size: ' ~ fmt.coded ~ '.') if fmt.coded else none %}
+        {{ stat_row('Video', video or '-', tip=([tech_tip, coded_note] | select | join('\n')) or none) }}
+        {{ stat_row('Audio', audio or '-', tip=([tech_tip, fmt.audio_note] | select | join('\n')) or none) }}
+        {# Stream format profile (dev/changelog/336): same measurements, labels and amber
+           treatment as the channel side's drawer. Rows predating format capture collapse
+           to a single explanatory row instead of six placeholders. #}
+        {% if fmt.rows %}
+          {% for f in fmt.rows %}{{ stat_row(f.label, f.value, sv_cls=f.cls, tip=f.tip) }}{% endfor %}
+        {% else %}
+          {{ stat_row('Format', '-', tip='Codec, bit depth, chroma and scan type were not recorded - this recording predates stream format capture.') }}
+        {% endif %}
+        {{ stat_row('Segments', rec.segments | length) }}
+        {{ stat_row('Stalls', rec.total_stall_count, sv_cls=('warn' if rec.total_stall_count else none)) }}
+        {% set error_segments = rec.segments | selectattr('exit_reason', 'in', ('RESTART_NO_DATA', 'ERROR')) | list %}
+        {{ stat_row('Errors', error_segments | length, sv_cls=('warn' if error_segments else none),
+                    tip='Segments where a restart attempt produced zero bytes before the recording moved on (RESTART_NO_DATA / ERROR in the Exit column) - distinct from Stalls, which counts every stall regardless of what happened next.') }}
+        {{ stat_row('Restarts', rec.total_restart_count,
+                    tip='Only counts restarts that resumed writing data after a stall. A restart that came back with zero bytes doesn\'t count here - the watchdog declares that attempt dead immediately and either retries again or the recording fails over to another channel (see the Segments list below for which). Restarts can be lower than Segments minus 1 for this reason.') }}
+        {# Downtime and Content missing are deliberately two stats, not one corrected
+           number (dev/changelog/432): downtime is a live counter that can only see gaps
+           in the write stream, the shortfall is only knowable once the finished file has
+           been probed. Each tooltip names which of the four durations it is measured
+           against, per CLAUDE.md's time-and-counter-accounting rule. #}
+        {{ stat_row('Downtime', (rec.total_downtime_seconds | int) | duration(with_seconds=true),
+                    sv_cls=('warn' if rec.total_downtime_seconds else none),
+                    tip='Wall-clock time with nothing being written: for each stall, the gap between the last byte and the stall being noticed, plus the restart delay and the wait for the replacement segment to start writing.\nA stream that stays connected but delivers almost nothing is invisible here - that loss shows up under Content missing.') }}
+        {% if rec.content_shortfall_seconds is not none %}
+        {% set short_pct = (rec.content_shortfall_seconds / rec.duration_seconds * 100) if rec.duration_seconds else none %}
+        {% set short_basis = 'measured by ffprobe of the finished file' if rec.actual_duration_source == 'file' else 'estimated from the span of the segments that captured data, which slightly over-counts content and so under-states this figure' %}
+        {# The Captured row above counts against the SCHEDULED window and this one against the
+           adjusted one, so on a recording that ended early the two look like they disagree.
+           Saying which is which is the whole point of this pair of stats. #}
+        {% set short_window_note = ('\nThe recording ended early, so this is measured against the ' ~ (rec.duration_seconds | int | duration) ~ ' it actually ran for, not the ' ~ (rec.scheduled_duration_seconds | int | duration) ~ ' originally scheduled.') if (rec.scheduled_duration_seconds - rec.duration_seconds) > 60 else '' %}
+        {{ stat_row('Content missing',
+                    ((rec.content_shortfall_seconds | int) | duration(with_seconds=true)) ~ ('' if short_pct is none else ' (%.0f%%)' | format(short_pct)),
+                    sv_cls=('warn' if short_pct and short_pct >= 2 else 'ok'),
+                    tip='The recording window (' ~ (rec.duration_seconds | int | duration) ~ ', start to stop) minus the content actually captured (' ~ (rec.actual_duration_seconds | int | duration(with_seconds=true)) ~ '), ' ~ short_basis ~ '.' ~ short_window_note ~ '\nTime the recording spent paused counts as missing content.\nThis can read near zero even after real Downtime: a stretch of downtime can be made up if the stream ran faster than real-time afterward, and an early stop shrinks the window it is measured against.') }}
+        {% endif %}
+        {% if rec.near_empty_segment_count %}
+        {{ stat_row('Near-empty segments',
+                    rec.near_empty_segment_count ~ ' segment' ~ ('' if rec.near_empty_segment_count == 1 else 's')
+                    ~ ' (' ~ ((rec.near_empty_seconds | int) | duration(with_seconds=true)) ~ ' total)',
+                    sv_cls='warn',
+                    tip='Segment(s) whose bitrate is far below the recording\'s own average - likely a blank/slate screen or error card. The timeline itself is clean (no gaps), which is why this is a separate check from Content missing.') }}
+        {% endif %}
+        {{ stat_row('Consecutive failures', rec.consecutive_failures ~ ' (peak ' ~ rec.consecutive_failures_peak ~ ')', sv_cls=('ok' if not rec.consecutive_failures else 'bad'),
+                    tip='The current run of stalls and failed restarts with no successful restart in between, and the highest that run ever reached this recording (peak). Resets to 0 on a successful restart or a channel failover. Reaching the configured limit is what triggers a failover to another channel, or gives up if there is nowhere left to go.') }}
+        {% if rec.completed_at %}{{ stat_row('Completed', rec.completed_at | local_time) }}{% endif %}
+        {% if rec.output_path %}
+        {{ stat_row('Output', rec.output_path, wide=true) }}
+        {% elif rec.status == 'FAILED' %}
+        {{ stat_row('Output', 'none - segments kept on disk', wide=true) }}
+        {% endif %}
+      {% endif %}
+    </div>
+  </div>
+  </div>
+</div>
+
+{# ── Segments (DESIGN.md 3.2/5): 1-based #, every row shown, exit pills with
+   tooltips; legacy 0-based file names appear as-is in the File column. #}
+{% set exit_pill = {
+  'STOP_TIME_REACHED':        ('ok',   'The scheduled stop time was reached - normal end of capture.'),
+  'SEGMENT_DURATION_EXPIRED': ('ok',   'Planned segment rotation (segment_duration_seconds) - the next segment continued the capture.'),
+  'STALL_KILLED':             ('warn', 'The file stopped growing. The watchdog killed ffmpeg and started a new segment after the restart delay.'),
+  'PROCESS_EXITED':           ('warn', 'ffmpeg exited on its own - ChannelBin did not kill it. The watchdog noticed within a poll and started a new segment after the restart delay. The exit code beside this pill is ffmpeg\'s own reason.'),
+  'RESTART_NO_DATA':          ('bad',  'This segment was a restart attempt and it never produced a byte. The watchdog closed it the moment the reconnect wait ran out, instead of spending a second stall timeout proving the same thing again.'),
+  'ERROR':                    ('bad',  'Restart attempt produced no data. ffmpeg reconnected but the new segment stayed empty, so the watchdog killed it.'),
+  'MANUAL_CANCEL':            ('na',   'The recording was cancelled manually.'),
+  'MANUAL_STOP':              ('na',   'The recording was stopped manually.'),
+  'MANUAL_PAUSE':             ('na',   'The recording was paused.'),
+  'SERVICE_RESTART':          ('na',   'The segment was closed because the service restarted.'),
+  'TEARDOWN_RACE':            ('na',   'This segment was starting at the exact moment the recording was torn down, so it captured nothing. Its file was deleted and the row was closed rather than left open.'),
+} %}
+<div id="panel-segments-slot" data-sec="segs">
+{% if rec.segments %}
+<div class="card">
+  <div class="card-head"><h2>Segments <span class="cnt">{{ rec.segments | length }}</span></h2></div>
+  <div class="card-body table-scroll">
+    <table class="tbl">
+      <thead><tr>
+        {# Essentials columns (#/Duration/Size/Exit) always show; the rest are marked
+           .xtra and hidden at phone widths (DESIGN.md 9.5) so the table never needs
+           sideways scroll on a 375px screen. #}
+        <th class="num">#</th><th class="xtra">Started</th><th class="xtra">Ended</th>
+        <th class="num">Duration</th><th class="num">Size</th><th class="num xtra">Avg rate</th>
+        <th class="num xtra">Stalls</th><th>Exit</th><th class="xtra">Channel</th><th class="xtra">File</th>
+      </tr></thead>
+      <tbody>
+        {% for seg in rec.segments %}
+        <tr>
+          <td class="num">{{ seg.segment_number + seg_offset }}</td>
+          <td class="mono xtra">{{ seg.started_at | local_time_sec if seg.started_at else '-' }}</td>
+          <td class="mono xtra">{% if seg.ended_at %}{{ seg.ended_at | local_time_sec }}{% else %}<span class="muted">-</span>{% endif %}</td>
+          {% set seg_secs = ((seg.ended_at or now) - seg.started_at).total_seconds() if seg.started_at else none %}
+          <td class="num">{{ (seg_secs | int) | duration(with_seconds=true) if seg_secs is not none else '-' }}</td>
+          <td class="num">{{ seg.bytes_recorded | filesize if seg.bytes_recorded else '0 B' }}</td>
+          <td class="num xtra">{% if seg.bytes_recorded and seg_secs and seg_secs > 10 %}{{ '%.1f' | format(seg.bytes_recorded * 8 / seg_secs / 1000000) }} Mb/s{% else %}<span class="muted">-</span>{% endif %}
+            {% if seg.near_empty %}<span class="badge b-warn tip-plain" data-tip="This segment's bitrate is far below the recording's own average - likely a blank/slate screen or error card, even though the timeline itself is clean.">slate?</span>{% endif %}</td>
+          <td class="num xtra">{{ seg.stall_count or 0 }}</td>
+          <td>
+            {% if seg.ended_at is none and rec.status in ('IN_PROGRESS', 'PAUSED', 'RETRYING') %}
+              <span class="exit-pill live tip-plain" data-tip="This segment is capturing right now.">RECORDING</span>
+            {% elif seg.exit_reason %}
+              {% set ep = exit_pill.get(seg.exit_reason) %}
+              {% if ep %}<span class="exit-pill {{ ep[0] }} tip-plain" data-tip="{{ ep[1] }}">{{ seg.exit_reason }}</span>
+              {% else %}<span class="exit-pill na">{{ seg.exit_reason }}</span>{% endif %}
+            {% elif seg.ffmpeg_exit_code is none %}<span class="muted">-</span>{% endif %}
+            {# ffmpeg's own verdict, next to ours. A negative code is the signal WE sent, so
+               it agrees with the pill; a positive one means ffmpeg died on its own before we
+               declared anything, which the pill alone cannot tell you. Null on every segment
+               recorded before dev/changelog/430 and on segments closed at service restart,
+               where the code is genuinely unknowable. #}
+            {% if seg.ffmpeg_exit_code is not none %}
+              {% if seg.ffmpeg_exit_code < 0 %}
+              <span class="exit-code tip-plain" data-tip="ffmpeg was stopped by signal {{ -seg.ffmpeg_exit_code }} - that is ChannelBin ending it, which is what the exit reason describes.">sig {{ -seg.ffmpeg_exit_code }}</span>
+              {% elif seg.ffmpeg_exit_code > 0 %}
+              <span class="exit-code bad tip-plain" data-tip="ffmpeg exited on its own with error code {{ seg.ffmpeg_exit_code }} - it gave up before ChannelBin stopped it.">rc {{ seg.ffmpeg_exit_code }}</span>
+              {% else %}
+              <span class="exit-code ok tip-plain" data-tip="ffmpeg finished on its own with no error.">rc 0</span>
+              {% endif %}
+            {% endif %}
+            {% set tail = seg_stderr.get(seg.segment_number) %}
+            {% if tail %}
+            {# data-seg-no keys the open-state re-apply after the 15s panel swap, the same
+               way data-ev-id does in the event log. It must be the segment number, not the
+               loop index: this panel is swapped outright while the recording is live and
+               new segments arrive at the end. #}
+            <details class="seg-why" data-seg-no="{{ seg.segment_number }}">
+              <summary>why</summary>
+              <pre class="seg-stderr">{{ tail }}</pre>
+            </details>
+            {% endif %}
+          </td>
+          <td class="xtra">
+            {% set seg_ch = seg_channels.get(seg.channel_id) %}
+            {% if seg_ch %}<a href="{{ url_for('channels.channel_detail', channel_id=seg_ch.id) }}">{{ seg_ch.name }}</a>
+            {%- if seg_ch.account %} (<a href="{{ url_for('accounts.account_detail', account_id=seg_ch.account.id) }}">{{ seg_ch.account.name }}</a>){% endif %}
+            {% else %}<span class="muted">-</span>{% endif %}
+          </td>
+          <td class="mono muted xtra" style="font-size:.72rem; overflow-wrap:anywhere">{{ seg.file_path | replace('/dvr/', '') }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+{% endif %}
+</div>
+
+{# ── Event log (DESIGN.md 3.8): vertical timeline, newest first by default. #}
+{% set ev_cls = {
+  'STALL_DETECTED': 'warn', 'RESTART_FAILED': 'warn', 'RECORDING_STOPPED_EARLY': 'warn',
+  'RECORDING_ABORTED': 'warn', 'SEEK_DAMAGE_DETECTED': 'warn', 'RECORDING_RETRY_SCHEDULED': 'warn',
+  'RECORDING_START_DEFERRED': 'warn', 'CONVERSION_YIELDED': 'warn',
+  'CAPTURE_LOST_TO_OUTAGE': 'warn',
+  'CONVERSION_RESTARTED': 'info', 'DIAGNOSTICS': 'info',
+  'POSTCAPTURE_ANALYSIS_STARTED': 'info',
+  'MIXED_FRAME_RATE_DETECTED': 'info',
+  'RESTART_SUCCEEDED': 'ok', 'CONCATENATION_DONE': 'ok', 'CONVERSION_DONE': 'ok',
+  'FILE_MOVED': 'ok', 'SCRIPT_EXECUTED': 'ok',
+  'RECORDING_FAILED': 'bad', 'RECORDING_FAILED_DEAD_STREAM': 'bad',
+} %}
+<div class="card" id="panel-eventlog" data-sec="log">
+  <div class="card-head">
+    <h2>Event log <span class="cnt">{{ rec.events | length }}</span></h2>
+    <label class="check-label"><input type="checkbox" id="ev-newest-first" checked> newest first</label>
+  </div>
+  <div class="card-body">
+    {% if rec.events %}
+    <ul class="evlog" id="evlog">
+      {% for evt in rec.events | reverse %}
+      {# data-ev-id keys the disclosure-state re-apply after the 15s panel swap. It must be
+         the DB id, not the loop index: new events arriving shift every index. #}
+      <li class="ev {{ ev_cls.get(evt.event_type, 'info') }}" data-ev-id="{{ evt.id }}">
+        <div class="ev-head">
+          <span class="ev-type">{{ evt.event_type }}</span>
+          <span class="ev-time">{{ evt.timestamp | local_time_sec }}</span>
+          {% if evt.segment_number is not none %}<span class="ev-seg">seg {{ evt.segment_number + seg_offset }}</span>{% endif %}
+        </div>
+        {% if evt.detail %}<div class="ev-detail">{{ evt.detail }}</div>{% endif %}
+        {% set links = event_channel_links.get(evt.id) %}
+        {% if links %}
+        <div class="ev-detail muted" style="font-size:.8rem">
+          {% for l in links %}<a href="{{ url_for('channels.channel_detail', channel_id=l.channel.id) }}">{{ l.channel.name }}</a>{% if l.account %} · <a href="{{ url_for('accounts.account_detail', account_id=l.account.id) }}">{{ l.account.name }}</a>{% endif %}{% if not loop.last %}<br>{% endif %}{% endfor %}
+        </div>
+        {% endif %}
+        {% set diag = evt.extra_data | diag_view %}
+        {% if diag %}
+        <details class="ev-extra">
+          <summary>{{ diag['title'] }}</summary>
+          <dl class="ev-extra-rows">
+            {% for label, value in diag['rows'] %}
+            <dt>{{ label }}</dt><dd>{{ value }}</dd>
+            {% endfor %}
+          </dl>
+        </details>
+        {% endif %}
+      </li>
+      {% endfor %}
+    </ul>
+    {% else %}
+    <div class="empty-state">No events yet.</div>
+    {% endif %}
+  </div>
+</div>
+
+</div>{# /#detail-sections #}
+
+{# The schedule modal shared with the guide. "Find another airing" is a LINK into the
+   airing search now (dev/changelog/416), so this page carries no search UI of its own. #}
+{% include "_record_modal.html" %}
+{% endblock %}
+
+{% block scripts %}
+<link rel="stylesheet" href="{{ url_for('static', filename='css/guide.css') }}">
+<script>
+const GUIDE_CONFIG = {
+  {# no epgUrl - this page has no guide grid; guide.js's grid paths are guarded on that #}
+  savedSearchesUrl: '{{ url_for("guide.list_saved_searches") }}',  // GET list / POST create
+  deleteSavedSearchUrlBase: '/api/guide/saved-searches/',  // + id + /delete
+  addChannelUrlBase: '/api/guide/channels/',  // + channel_id + /add
+  newRecordingUrl: '{{ url_for("recordings.new_recording") }}',
+  editRecordingUrlBase: '/recordings/',  // + id + /edit
+  recDetailUrlBase: '/recordings/',  // + id
+  profiles: {
+    {% for p in profiles %}
+    '{{ p.id }}': { prePaddingMinutes: {{ p.pre_padding_minutes }}, postPaddingMinutes: {{ p.post_padding_minutes }} },
+    {% endfor %}
+  },
+};
+
+{% if rec.status == 'SCHEDULED' %}
+function openEditModal() {
+  closeMenus();
+  openModal({
+    has_recording: true,
+    recording_id: {{ rec.id }},
+    recording_status: 'SCHEDULED',
+    recording_start_time: {{ rec.start_time.isoformat() | tojson }},
+    recording_stop_time: {{ rec.stop_time.isoformat() | tojson }},
+    recording_profile_id: {{ rec.profile_id | tojson }},
+    suggested_name: {{ rec.name | tojson }},
+    title: {{ rec.name | tojson }},
+    stream_url: {{ rec.url | tojson }},
+    channel_id: {{ rec.channel_id | tojson }},
+    group_id: {{ rec.group_id | tojson }},
+    id: null,
+    description: null,
+  }, null);
+}
+window.onScheduleSaved = () => window.location.reload();
+{% endif %}
+</script>
+<script src="{{ url_for('static', filename='js/guide.js') }}"></script>
+<script>
+(() => {
+  const RID = {{ rec.id }};
+  const STOP_LOCAL = {{ stop_local_input | tojson }};  // 'YYYY-MM-DDTHH:MM' in display tz
+
+  // ── Header/kebab actions: delegated on document so they survive the 15s
+  //    auto-refresh swap of #detail-head-slot (DESIGN.md section 4 confirms).
+  const ACTIONS = {
+    stop: {
+      title: 'Stop recording',
+      body: 'Capture will end now and the segments will be joined into the final file. It can\'t be resumed.',
+      verb: 'Stop recording', danger: true,
+      run: () => jsonFetch(`/recordings/${RID}/stop-json`, { method: 'POST' }),
+    },
+    pause: {
+      title: 'Pause recording',
+      body: 'Capture will pause and the connection slot is freed. The paused span becomes a gap in the output. Resume any time before the stop time.',
+      verb: 'Pause', danger: false,
+      run: () => jsonFetch(`/recordings/${RID}/pause-json`, { method: 'POST' }),
+    },
+    resume: { confirm: false, run: () => jsonFetch(`/recordings/${RID}/resume-json`, { method: 'POST' }) },
+    abort: {
+      title: 'Abort recording',
+      body: 'Capture will stop and every recorded segment will be permanently deleted from disk. This cannot be undone.',
+      verb: 'Abort', danger: true,
+      run: () => jsonFetch(`/recordings/${RID}/cancel-json`, { method: 'POST' }),
+    },
+    cancel: {
+      title: 'Cancel scheduled recording',
+      body: 'This scheduled recording will be removed.',
+      verb: 'Cancel recording', danger: true,
+      // The row is deleted (it never captured anything), so - like delete - navigate
+      // away rather than reload this same now-nonexistent recording's page.
+      run: () => jsonFetch(`/recordings/${RID}/cancel-json`, { method: 'POST' })
+        .then(() => { window.location = '/'; return null; }),
+    },
+    delete: {
+      title: 'Delete recording',
+      bodyHtml: deleteRecordingBody('This recording will be removed from ChannelBin.'),
+      verb: 'Delete', danger: true,
+      // Read the switch at click time, not at build time - buildModal renders this body
+      // string fresh on every open, so the element only exists once the modal is up.
+      run: () => jsonFetch(`/recordings/${RID}/delete-json`, {
+        method: 'POST',
+        body: JSON.stringify({ delete_files: deleteRecordingWantsFiles() }),
+      }).then(() => { window.location = '/'; return null; }),
+    },
+    'retry-concat': {
+      title: 'Retry concatenation',
+      body: 'Concatenation will run again over the segments on disk. Make sure there is enough free disk space.',
+      verb: 'Retry', danger: false,
+      run: () => postForm(`/recordings/${RID}/retry-concat`),
+    },
+    'retry-convert': {
+      title: 'Retry conversion',
+      body: 'Conversion runs again from the concatenated .ts file on disk, overwriting any partial output. A conversion that is genuinely still running is refused.',
+      verb: 'Retry', danger: false,
+      run: () => postForm(`/recordings/${RID}/retry-convert`),
+    },
+    'cancel-analysis': {
+      title: 'Cancel processing',
+      body: 'Post-processing stops at its next checkpoint and the recording is marked CANCELLED. A file check already under way finishes first, so this is not instant. The recorded .ts file is kept.',
+      verb: 'Cancel processing', danger: true,
+      run: () => postForm(`/recordings/${RID}/cancel`),
+    },
+    'cancel-convert': {
+      title: 'Cancel conversion',
+      body: 'The running conversion is stopped and the recording is marked CANCELLED. The source .ts file is kept, so you can retry the conversion later.',
+      verb: 'Cancel conversion', danger: true,
+      run: () => postForm(`/recordings/${RID}/cancel-convert`),
+    },
+    extend: {
+      confirm: false,
+      run: () => {
+        // +30 min on the current stop time, in the display timezone's wall clock
+        const [d, t] = STOP_LOCAL.split('T');
+        const [y, mo, da] = d.split('-').map(Number);
+        const [h, mi] = t.split(':').map(Number);
+        const dt = new Date(y, mo - 1, da, h, mi + 30);
+        const pad = (n) => String(n).padStart(2, '0');
+        const stop = `${dt.getFullYear()}-${pad(dt.getMonth() + 1)}-${pad(dt.getDate())}T${pad(dt.getHours())}:${pad(dt.getMinutes())}`;
+        return jsonFetch(`/recordings/${RID}/adjust-stop`, { method: 'POST', body: JSON.stringify({ stop_time: stop }) });
+      },
+    },
+  };
+  // retry-concat/retry-convert are classic form-POST routes (redirect+flash)
+  function postForm(url) {
+    const f = document.createElement('form');
+    f.method = 'POST';
+    f.action = url;
+    const tok = document.createElement('input');
+    tok.type = 'hidden'; tok.name = 'csrf_token'; tok.value = csrfToken();
+    f.appendChild(tok);
+    document.body.appendChild(f);
+    f.submit();
+    return new Promise(() => {});  // navigation takes over
+  }
+
+  document.addEventListener('click', (e) => {
+    const copyBtn = e.target.closest('[data-copy]');
+    if (copyBtn) {
+      navigator.clipboard.writeText(copyBtn.dataset.copy);
+      showToast('Copied to clipboard');
+      return;
+    }
+    const btn = e.target.closest('[data-act]');
+    if (!btn) return;
+    const spec = ACTIONS[btn.dataset.act];
+    if (!spec) return;
+    const go = () => Promise.resolve(spec.run())
+      .then((r) => { if (r !== null) window.location.reload(); })
+      .catch((err) => showToast(err.message, { type: 'error' }));
+    if (spec.confirm === false) { go(); return; }
+    buildModal({
+      title: spec.title,
+      // bodyHtml = the spec supplies complete markup (the delete confirm's switch); a
+      // plain `body` string is prose that still needs its paragraph wrapper. Wrapping the
+      // former would put a <label> inside a <p>, which the parser closes early.
+      body: spec.bodyHtml || `<p style="font-size:.9rem">${spec.body}</p>`,
+      footer: [
+        { label: 'Cancel', class: 'btn', onClick: (close) => { close(); } },
+        { label: spec.verb, class: spec.danger ? 'btn btn-danger' : 'btn btn-primary',
+          // go() before close(): a spec may read state out of the modal body (the delete
+          // confirm's "delete the files" switch), and close() detaches it from the DOM.
+          onClick: (close) => { go(); close(); } },
+      ],
+    });
+  });
+
+  // ── Screenshot lightbox (3.9) - delegated; covers live + persisted thumbs.
+  document.addEventListener('click', (e) => {
+    const bt = e.target.closest('.bigthumb.has-img');
+    if (!bt) return;
+    const img = bt.querySelector('img');
+    if (img && img.src && img.style.display !== 'none') openLightbox(img.src);
+  });
+
+  // ── Event log order toggle - delegated; state survives the panel swap.
+  let evNewestFirst = true;
+  window.__applyEvOrder = () => {
+    const cb = document.getElementById('ev-newest-first');
+    const list = document.getElementById('evlog');
+    if (!cb) return;
+    cb.checked = evNewestFirst;
+    // server (and any freshly swapped-in copy) renders newest-first
+    if (list && !list.dataset.order) list.dataset.order = 'newest';
+    if (list && (list.dataset.order === 'newest') !== evNewestFirst) {
+      Array.from(list.children).reverse().forEach((li) => list.appendChild(li));
+      list.dataset.order = evNewestFirst ? 'newest' : 'oldest';
+    }
+  };
+  document.addEventListener('change', (e) => {
+    if (e.target.id !== 'ev-newest-first') return;
+    evNewestFirst = e.target.checked;
+    window.__applyEvOrder();
+  });
+  const initList = document.getElementById('evlog');
+  if (initList) initList.dataset.order = 'newest';
+
+  // ── DIAGNOSTICS disclosures - open/closed state survives the panel swap.
+  //    refreshPage() replaces #panel-eventlog's outerHTML every 15s and keeps doing it
+  //    right through CONVERTING (not a terminal status), which is exactly when these
+  //    events are written - so without this an expanded disclosure snaps shut under the
+  //    reader. Keyed on the event's DB id: the swapped-in list can have new events at the
+  //    top, and it can be in either sort order, so nothing positional survives.
+  const evOpen = new Set();
+  window.__applyEvDisclosures = () => {
+    document.querySelectorAll('#evlog .ev[data-ev-id] > .ev-extra').forEach((d) => {
+      d.open = evOpen.has(d.parentElement.dataset.evId);
+    });
+  };
+  // Same problem, same fix, for the Segments table's per-segment "why" (the ffmpeg stderr
+  // tail - dev/changelog/430). #panel-segments-slot is swapped on the same 15s tick, and a
+  // reader who opened a stall's stderr while the recording is still going is exactly the
+  // person this feature exists for. Keyed on the segment number, which is stable across
+  // swaps; the row's position is not, since new segments append.
+  const segOpen = new Set();
+  window.__applySegDisclosures = () => {
+    document.querySelectorAll('#panel-segments-slot .seg-why[data-seg-no]').forEach((d) => {
+      d.open = segOpen.has(d.dataset.segNo);
+    });
+  };
+  // 'toggle' does not bubble, so this listens in the capture phase rather than delegating.
+  document.addEventListener('toggle', (e) => {
+    const d = e.target;
+    if (!d.classList) return;
+    if (d.classList.contains('seg-why')) {
+      const segNo = d.dataset.segNo;
+      if (!segNo) return;
+      if (d.open) segOpen.add(segNo); else segOpen.delete(segNo);
+      return;
+    }
+    if (!d.classList.contains('ev-extra')) return;
+    const id = d.parentElement && d.parentElement.dataset.evId;
+    if (!id) return;
+    if (d.open) evOpen.add(id); else evOpen.delete(id);
+  }, true);
+})();
+</script>
+<script>
+(() => {
+  'use strict';
+  // ── Section picker (DESIGN.md 9.5 mobile / 10.2 desktop): "Customize sections..."
+  //    in the header kebab, hide/show + reorder, persisted server-side. Desktop picks
+  //    over #details-section/#panel-segments-slot/#panel-eventlog directly (3 real
+  //    #detail-sections children); mobile picks over #details-section's 3 sub-regions
+  //    (display:contents at ≤768px promotes them to real flex items) plus segs/log,
+  //    so 5 total. Decided once at load - this page doesn't re-layout across a live
+  //    desktop<->mobile resize, matching how the rest of the app treats breakpoints.
+  const isMobile = window.matchMedia('(max-width: 768px)').matches;
+  const SECTIONS = isMobile
+    ? [{ key: 'shot', label: 'Screenshot' }, { key: 'tl', label: 'Run timeline' },
+       { key: 'stats', label: 'Stats' }, { key: 'segs', label: 'Segments' },
+       { key: 'log', label: 'Event log' }]
+    : [{ key: 'details', label: 'Details' }, { key: 'segs', label: 'Segments' },
+       { key: 'log', label: 'Event log' }];
+  const PREF_KEY = isMobile ? 'recording_detail_sections_mobile' : 'recording_detail_sections_desktop';
+
+  // Re-queried per call, never cached: the 15s auto-refresh replaces whole
+  // [data-sec] nodes via outerHTML, so any handle held from load time is
+  // detached afterwards and writing to it would be a silent no-op.
+  const secEl = (key) => document.querySelector(`[data-sec="${key}"]`);
+
+  let state = { order: SECTIONS.map(s => s.key), hidden: [] };
+
+  // The layout lives only in inline styles, so a swapped-in node comes back
+  // with order:auto (= 0, sorting it above every kept section) and unhidden.
+  // Anything that rebuilds a [data-sec] node must call this hook afterwards.
+  const apply = () => {
+    state.order.forEach((key, i) => {
+      const el = secEl(key);
+      if (!el) return;
+      el.style.order = i + 1;
+      el.style.display = state.hidden.includes(key) ? 'none' : '';
+    });
+  };
+  window.__applySectionLayout = apply;
+
+  jsonFetch(`/api/user-prefs/${PREF_KEY}`).then(d => {
+    if (d.value && Array.isArray(d.value.order)) {
+      state = d.value;
+      // tolerate prefs saved before a section existed
+      SECTIONS.forEach(s => { if (!state.order.includes(s.key)) state.order.push(s.key); });
+    }
+    apply();
+  }).catch(() => apply());
+
+  const save = () => {
+    jsonFetch(`/api/user-prefs/${PREF_KEY}`, { method: 'POST', body: JSON.stringify({ value: state }) })
+      .catch(() => showToast('Could not save section layout', { type: 'error' }));
+  };
+
+  function openPicker() {
+    closeMenus();
+    const listId = 'secs-list-' + Date.now();
+    buildModal({
+      title: 'Customize sections',
+      body: `<div id="${listId}"></div>`,
+      footer: [{ label: 'Done', class: 'btn btn-primary', onClick: (close) => close() }],
+    });
+    const list = document.getElementById(listId);
+    const render = () => {
+      list.innerHTML = '';
+      state.order.forEach(key => {
+        const s = SECTIONS.find(x => x.key === key);
+        if (!s || !secEl(key)) return;
+        const item = document.createElement('label');
+        item.className = 'col-item';
+        item.draggable = true;
+        item.dataset.key = key;
+        item.innerHTML = `<span class="grip">&#8942;&#8942;</span><input type="checkbox" ${state.hidden.includes(key) ? '' : 'checked'}> ${s.label}`;
+        item.querySelector('input').addEventListener('change', (e) => {
+          if (e.target.checked) state.hidden = state.hidden.filter(k => k !== key);
+          else if (!state.hidden.includes(key)) state.hidden.push(key);
+          apply();
+          save();
+        });
+        item.addEventListener('dragstart', (e) => { e.dataTransfer.setData('text/plain', key); });
+        item.addEventListener('dragover', (e) => e.preventDefault());
+        item.addEventListener('drop', (e) => {
+          e.preventDefault();
+          const from = e.dataTransfer.getData('text/plain');
+          if (!from || from === key) return;
+          const order = state.order.filter(k => k !== from);
+          order.splice(order.indexOf(key), 0, from);
+          state.order = order;
+          apply();
+          save();
+          render();
+        });
+        list.appendChild(item);
+      });
+    };
+    render();
+  }
+
+  document.addEventListener('click', (e) => {
+    if (e.target.closest('[data-secs-open]')) openPicker();
+  });
+})();
+</script>
+{% if is_active %}
+<script>
+(function() {
+  const rid = {{ rec.id }};
+
+  const sse = connectSSE(`/api/stream/${rid}`, {
+    onMessage(e) {
+      const msg = JSON.parse(e.data);
+      if (msg.recording_id !== rid) return;
+      const d = msg.data;
+      if (msg.event === 'STATS_SNAPSHOT') {
+        const elapsedEl = document.getElementById('live-elapsed');
+        if (!elapsedEl) return;
+        elapsedEl.textContent = fmtDur(d.elapsed_seconds);
+        document.getElementById('live-remaining').textContent = fmtDur(d.remaining_seconds);
+        document.getElementById('live-bytes').textContent     = fmtBytes(d.total_bytes);
+        document.getElementById('live-stalls').textContent    = d.stall_count;
+        document.getElementById('live-failures').textContent  = d.consecutive_failures;
+      }
+      if (['CAPTURE_COMPLETE','RECORDING_FAILED','RECORDING_ABORTED','CONCATENATION_DONE','RECORDING_PAUSED'].includes(msg.event)) {
+        sse.close();
+        setTimeout(() => location.reload(), 2000);
+      }
+    },
+    onError() {
+      console.warn('SSE disconnected; reconnecting in 5s.');
+    },
+  });
+})();
+</script>
+{% endif %}
+{% if rec.status == 'IN_PROGRESS' and thumb_enabled %}
+<script>
+(function() {
+  const img = document.getElementById('live-thumb-img');
+  const placeholder = document.getElementById('live-thumb-placeholder');
+  const capturedEl = document.getElementById('live-thumb-captured');
+  if (!img) return;
+  const baseUrl = "{{ url_for('recordings.live_thumbnail', recording_id=rec.id) }}";
+  const AUTO_REFRESH_MS = {{ thumb_auto_refresh_seconds }} * 1000;
+  let lastObjectUrl = null;
+
+  function formatCapturedAt(unixSeconds) {
+    return fmtTimeTz(new Date(unixSeconds * 1000), { seconds: true });
+  }
+
+  async function refresh() {
+    const url = baseUrl + '?t=' + Date.now();
+    try {
+      const res = await fetch(url, { cache: 'no-store' });
+      if (!res.ok) throw new Error('fetch failed');
+      const blob = await res.blob();
+      const objectUrl = URL.createObjectURL(blob);
+      img.src = objectUrl;
+      if (lastObjectUrl) URL.revokeObjectURL(lastObjectUrl);
+      lastObjectUrl = objectUrl;
+      const capturedAt = res.headers.get('X-Thumb-Captured-At');
+      if (capturedAt && capturedEl) capturedEl.textContent = formatCapturedAt(Number(capturedAt));
+      img.style.display = 'block';
+      placeholder.style.display = 'none';
+    } catch (e) {
+      img.style.display = 'none';
+      placeholder.style.display = '';
+    }
+  }
+  setInterval(refresh, AUTO_REFRESH_MS);
+  refresh();
+})();
+</script>
+{% endif %}
+<script>
+(function() {
+  const REFRESH_INTERVAL_MS = 15000;
+  const TERMINAL_STATUSES = ['COMPLETED', 'FAILED', 'ABORTED'];
+  // One updater per DOM region: while live, #status-strip-slot is owned by the
+  // SSE handler (its stat spans), so the swap list excludes it - the SSE
+  // handler reloads the whole page on any state change. #hero-thumb is owned
+  // by the live-thumbnail refresher and is never swapped. Anything added to
+  // SWAP_IDS that contains a [data-sec] node needs the section-layout re-apply
+  // below - a fresh node has no inline order/display.
+  const initialStatus = '{{ rec.status }}';
+  const SWAP_IDS = ['detail-head-slot', 'hero-right', 'panel-segments-slot', 'panel-eventlog'];
+  if (initialStatus !== 'IN_PROGRESS' && initialStatus !== 'PAUSED') {
+    SWAP_IDS.push('status-strip-slot');
+  }
+  let timer = null;
+
+  const initialBadge = document.getElementById('status-badge');
+  if (initialBadge && TERMINAL_STATUSES.includes(initialBadge.dataset.status)) {
+    return;
+  }
+
+  async function refreshPage() {
+    try {
+      const res = await fetch(location.href, { cache: 'no-store' });
+      const html = await res.text();
+      const doc = new DOMParser().parseFromString(html, 'text/html');
+
+      for (const id of SWAP_IDS) {
+        const current = document.getElementById(id);
+        const fresh = doc.getElementById(id);
+        if (current && fresh) {
+          current.outerHTML = fresh.outerHTML;
+        }
+      }
+      // Re-apply every piece of client-held state the swap blew away. The
+      // section layout is mandatory here: it lives in inline order/display on
+      // the [data-sec] nodes, two of which (segs/log) are swapped outright and
+      // two more (tl/stats) ride inside #hero-right, so without this the
+      // Details card sinks below them within 15s and hidden sections return.
+      if (window.__applyEvOrder) window.__applyEvOrder();
+      if (window.__applyEvDisclosures) window.__applyEvDisclosures();
+      if (window.__applySegDisclosures) window.__applySegDisclosures();
+      if (window.__applySectionLayout) window.__applySectionLayout();
+
+      const badge = document.getElementById('status-badge');
+      if (badge && TERMINAL_STATUSES.includes(badge.dataset.status)) {
+        clearInterval(timer);
+      }
+    } catch (err) {
+      console.warn('Auto-refresh fetch failed; will retry.', err);
+    }
+  }
+
+  timer = setInterval(refreshPage, REFRESH_INTERVAL_MS);
+})();
+</script>
+{% endblock %}

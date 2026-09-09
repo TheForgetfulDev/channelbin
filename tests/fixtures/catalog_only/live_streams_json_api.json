@@ -1,0 +1,242 @@
+[
+ {
+  "stream_id": 4755969,
+  "name": "##### 4K ᵁᴴᴰ ³⁸⁴⁰ᴾ #####",
+  "stream_type": "live",
+  "epg_channel_id": "",
+  "category_id": "4272655",
+  "direct_source": ""
+ },
+ {
+  "stream_id": 4755967,
+  "name": "4K: V FOXGLOVE ᵁᴴᴰ ³⁸⁴⁰ᴾ",
+  "stream_type": "live",
+  "epg_channel_id": "Marlin.timber",
+  "category_id": "4272655",
+  "direct_source": ""
+ },
+ {
+  "stream_id": 5816247,
+  "name": "4K: V FOXGLOVE+ ᵁᴴᴰ ³⁸⁴⁰ᴾ",
+  "stream_type": "live",
+  "epg_channel_id": "",
+  "category_id": "4272655",
+  "direct_source": ""
+ },
+ {
+  "stream_id": 5817800,
+  "name": "4K: ORCHARD ᴾᴸ ᵁᴴᴰ ³⁸⁴⁰ᴾ",
+  "stream_type": "live",
+  "epg_channel_id": "",
+  "category_id": "4272655",
+  "direct_source": ""
+ },
+ {
+  "stream_id": 5816294,
+  "name": "4K: ORCHARD NORTHSTAR ᴾᴸ ᵁᴴᴰ ³⁸⁴⁰ᴾ",
+  "stream_type": "live",
+  "epg_channel_id": "",
+  "category_id": "4272655",
+  "direct_source": ""
+ },
+ {
+  "stream_id": 4755966,
+  "name": "4K: ORCHARD NORTHSTAR 1 ᵁᴴᴰ ³⁸⁴⁰ᴾ",
+  "stream_type": "live",
+  "epg_channel_id": "Blue Ridge1NL.cedar",
+  "category_id": "4272655",
+  "direct_source": ""
+ },
+ {
+  "stream_id": 4755965,
+  "name": "4K: ATLAS FOXGLOVE 5 ᵁᴴᴰ ³⁸⁴⁰ᴾ",
+  "stream_type": "live",
+  "epg_channel_id": "",
+  "category_id": "4272655",
+  "direct_source": ""
+ },
+ {
+  "stream_id": 5816240,
+  "name": "4K: MERIDIAN NORTHSTAR ᵁᴴᴰ ³⁸⁴⁰ᴾ (EVENT)",
+  "stream_type": "live",
+  "epg_channel_id": "",
+  "category_id": "4272655",
+  "direct_source": ""
+ },
+ {
+  "stream_id": 5816239,
+  "name": "4K: MERIDIAN HARBOR ᵁᴴᴰ ³⁸⁴⁰ᴾ+ (LIVE-EVENT)",
+  "stream_type": "live",
+  "epg_channel_id": "",
+  "category_id": "4272655",
+  "direct_source": ""
+ },
+ {
+  "stream_id": 5816237,
+  "name": "4K: PINNACLE NORTHSTAR LANTERN ᵁᴴᴰ ³⁸⁴⁰ᴾ",
+  "stream_type": "live",
+  "epg_channel_id": "",
+  "category_id": "4272655",
+  "direct_source": ""
+ },
+ {
+  "stream_id": 5816236,
+  "name": "4K: PINNACLE NORTHSTAR F1 ᵁᴴᴰ ³⁸⁴⁰ᴾ",
+  "stream_type": "live",
+  "epg_channel_id": "",
+  "category_id": "4272655",
+  "direct_source": ""
+ },
+ {
+  "stream_id": 5816233,
+  "name": "4K: PINNACLE NORTHSTAR ᵁᴴᴰ ³⁸⁴⁰ᴾ (EVENT)",
+  "stream_type": "live",
+  "epg_channel_id": "",
+  "category_id": "4272655",
+  "direct_source": ""
+ },
+ {
+  "stream_id": 5816231,
+  "name": "4K: PINNACLE FOXGLOVE ᵁᴴᴰ ³⁸⁴⁰ᴾ (LIVE-EVENT)",
+  "stream_type": "live",
+  "epg_channel_id": "",
+  "category_id": "4272655",
+  "direct_source": ""
+ },
+ {
+  "stream_id": 5816232,
+  "name": "4K: PINNACLE NORTHSTAR SUMMIT DRIFTWOOD ᵁᴴᴰ ³⁸⁴⁰ᴾ",
+  "stream_type": "live",
+  "epg_channel_id": "",
+  "category_id": "4272655",
+  "direct_source": ""
+ },
+ {
+  "stream_id": 5828128,
+  "name": "4K: IRONWOOD NORTHSTAR CASCADE BEACON ᵁᴴᴰ ³⁸⁴⁰ᴾ ᴺᴹ",
+  "stream_type": "live",
+  "epg_channel_id": "",
+  "category_id": "4272655",
+  "direct_source": ""
+ },
+ {
+  "stream_id": 5969280,
+  "name": "4K: JUNIPER 4K ᵁᴴᴰ ³⁸⁴⁰ᴾ (EVENT ONLY)",
+  "stream_type": "live",
+  "epg_channel_id": "",
+  "category_id": "4272655",
+  "direct_source": ""
+ },
+ {
+  "stream_id": 5828131,
+  "name": "4K: JUNIPER 4K ᵁᴴᴰ ³⁸⁴⁰ᴾ ᴺᴹ",
+  "stream_type": "live",
+  "epg_channel_id": "",
+  "category_id": "4272655",
+  "direct_source": ""
+ },
+ {
+  "stream_id": 5268538,
+  "name": "4K: SANDSTONE 1 ᵁᴴᴰ ³⁸⁴⁰ᴾ",
+  "stream_type": "live",
+  "epg_channel_id": "",
+  "category_id": "4272655",
+  "direct_source": ""
+ },
+ {
+  "stream_id": 5133055,
+  "name": "4K: SANDSTONE 1 ᵁᴴᴰ ³⁸⁴⁰ᴾ",
+  "stream_type": "live",
+  "epg_channel_id": "",
+  "category_id": "4272655",
+  "direct_source": ""
+ },
+ {
+  "stream_id": 5133053,
+  "name": "4K: WILLOW FOXGLOVE ᵁᴴᴰ ³⁸⁴⁰ᴾ",
+  "stream_type": "live",
+  "epg_channel_id": "",
+  "category_id": "4272655",
+  "direct_source": ""
+ },
+ {
+  "stream_id": 5133052,
+  "name": "4K: MARLIN ᵁᴴᴰ ³⁸⁴⁰ᴾ",
+  "stream_type": "live",
+  "epg_channel_id": "",
+  "category_id": "4272655",
+  "direct_source": ""
+ },
+ {
+  "stream_id": 4779539,
+  "name": "4K: TIMBER ᵁᴴᴰ ³⁸⁴⁰ᴾ",
+  "stream_type": "live",
+  "epg_channel_id": "",
+  "category_id": "4272655",
+  "direct_source": ""
+ },
+ {
+  "stream_id": 4756442,
+  "name": "4K: ORCHARD+ ᵁᴴᴰ ³⁸⁴⁰ᴾ",
+  "stream_type": "live",
+  "epg_channel_id": "Northstar.blue ridge",
+  "category_id": "4272655",
+  "direct_source": ""
+ },
+ {
+  "stream_id": 4756455,
+  "name": "4K: CEDAR ᵁᴴᴰ ³⁸⁴⁰ᴾ",
+  "stream_type": "live",
+  "epg_channel_id": "",
+  "category_id": "4272655",
+  "direct_source": ""
+ },
+ {
+  "stream_id": 5816275,
+  "name": "4K: MARLIN ᵉˢ ᵁᴴᴰ ³⁸⁴⁰ᴾ",
+  "stream_type": "live",
+  "epg_channel_id": "",
+  "category_id": "4272655",
+  "direct_source": ""
+ },
+ {
+  "stream_id": 5816261,
+  "name": "4K: ATLAS ᵁᴴᴰ ³⁸⁴⁰ᴾ",
+  "stream_type": "live",
+  "epg_channel_id": "",
+  "category_id": "4272655",
+  "direct_source": ""
+ },
+ {
+  "stream_id": 5816260,
+  "name": "4K: FOXGLOVE ᵁᴴᴰ ³⁸⁴⁰ᴾ",
+  "stream_type": "live",
+  "epg_channel_id": "",
+  "category_id": "4272655",
+  "direct_source": ""
+ },
+ {
+  "stream_id": 5816259,
+  "name": "4K: MERIDIAN ᵁᴴᴰ ³⁸⁴⁰ᴾ",
+  "stream_type": "live",
+  "epg_channel_id": "",
+  "category_id": "4272655",
+  "direct_source": ""
+ },
+ {
+  "stream_id": 5816256,
+  "name": "4K: HARBOR ᵁᴴᴰ ³⁸⁴⁰ᴾ",
+  "stream_type": "live",
+  "epg_channel_id": "",
+  "category_id": "4272655",
+  "direct_source": ""
+ },
+ {
+  "stream_id": 5816276,
+  "name": "4K: PINNACLE ᵉˢ ᵁᴴᴰ ³⁸⁴⁰ᴾ",
+  "stream_type": "live",
+  "epg_channel_id": "",
+  "category_id": "4272655",
+  "direct_source": ""
+ }
+]

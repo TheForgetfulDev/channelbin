@@ -1,0 +1,102 @@
+{# Record/Edit modal + Active-recording control modal - included by guide.html,
+   channels/detail.html, recording_detail.html, and index.html. Both are driven by
+   static/js/guide.js (openModal / openActiveRecModal), which expects these exact element
+   IDs. Requires `profiles` (RecordingProfile list) and `display_timezone` in the template
+   context, plus a matching `profiles: {...}` map in the page's GUIDE_CONFIG. #}
+
+{# Record / Edit modal #}
+<div id="record-modal" class="modal" style="display:none" role="dialog" aria-modal="true">
+  <div class="modal-backdrop" id="modal-backdrop"></div>
+  <div class="modal-panel">
+    <div class="modal-head">
+      <h2 id="modal-title">Schedule recording</h2>
+      <button type="button" class="modal-close" id="modal-close" aria-label="Close">&#x2715;</button>
+    </div>
+    <form id="modal-form" method="post">
+      {{ csrf_field() }}
+      <input type="hidden" name="source_epg_id" id="modal-epg-id">
+      <input type="hidden" name="channel_id" id="modal-channel-id" value="">
+      <input type="hidden" name="group_id" id="modal-group-id" value="">
+      {# Set only by "Find Another Airing" replace mode (guide.js openModal) #}
+      <input type="hidden" name="replace_recording_id" id="modal-replace-id" value="">
+      <div class="modal-body">
+        <div id="modal-error" style="display:none; color: var(--bad); margin-bottom: 0.75rem; font-size: 0.875rem;"></div>
+        <div class="form-group">
+          <label>Recording Name <span class="required">*</span></label>
+          <input type="text" name="name" id="modal-name" class="form-control" required>
+          <span class="form-hint" id="modal-name-hint"></span>
+        </div>
+        <div class="form-group">
+          <label>Stream URL <span class="required">*</span></label>
+          <input type="hidden" name="url" id="modal-url" required>
+          <div class="manual-url-row">
+            <input type="text" id="modal-url-display" class="form-control" readonly>
+            <button type="button" class="btn btn-sm" id="modal-url-toggle">Show</button>
+            <button type="button" class="btn btn-sm" id="modal-url-copy">Copy</button>
+          </div>
+        </div>
+        <div class="form-row">
+          <div class="form-group">
+            <label>Start Time <span class="tz-label">{{ display_timezone }}</span></label>
+            <input type="datetime-local" name="start_time" id="modal-start" class="form-control" required>
+          </div>
+          <div class="form-group">
+            <label>Stop Time <span class="tz-label">{{ display_timezone }}</span></label>
+            <input type="datetime-local" name="stop_time" id="modal-stop" class="form-control" required>
+          </div>
+        </div>
+        <div id="modal-padding-note" class="notice notice-info" style="display:none"></div>
+        <div class="form-group">
+          <div class="form-label-row">
+            <label>Recording Profile</label>
+            <a href="{{ url_for('profiles.profiles_list') }}" target="_blank" class="form-label-link">Manage profiles →</a>
+          </div>
+          <select name="profile_id" id="modal-profile" class="form-control">
+            <option value="">None (use global defaults)</option>
+            {% for p in profiles %}
+            <option value="{{ p.id }}">{{ p.name }}</option>
+            {% endfor %}
+          </select>
+        </div>
+        <div id="modal-detail-link" style="display:none; margin-bottom: 0.75rem;">
+          <a id="modal-detail-anchor" href="#" class="btn btn-sm" target="_blank">View recording details →</a>
+        </div>
+      </div>
+      <div class="modal-foot">
+        <button type="button" class="btn" id="modal-cancel">Cancel</button>
+        <button type="button" class="btn btn-danger" id="modal-delete" style="display:none">Cancel recording</button>
+        <button type="submit" class="btn btn-primary" id="modal-submit">Schedule recording</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+{# Active recording control modal #}
+<div id="active-rec-modal" class="modal" style="display:none" role="dialog" aria-modal="true">
+  <div class="modal-backdrop" id="active-rec-backdrop"></div>
+  <div class="modal-panel">
+    <div class="modal-head">
+      <h2 id="active-rec-title">Recording in progress</h2>
+      <button type="button" class="modal-close" id="active-rec-close-x" aria-label="Close">&#x2715;</button>
+    </div>
+    <div class="modal-body">
+      <p id="active-rec-name" style="margin: 0 0 1rem; color: var(--text-muted); font-size: 0.9rem;"></p>
+      <div id="active-rec-error" style="display:none; color: var(--bad); margin-bottom: 0.75rem; font-size: 0.875rem;"></div>
+      <div class="form-group">
+        <label>End Time <span class="tz-label">{{ display_timezone }}</span></label>
+        <input type="datetime-local" id="active-rec-stop" class="form-control">
+        <span class="form-hint">Must be in the future. Changes take effect immediately.</span>
+      </div>
+      <div style="margin-bottom: 0.75rem;">
+        <a id="active-rec-detail-anchor" href="#" class="btn btn-sm" target="_blank">View recording details →</a>
+      </div>
+    </div>
+    <div class="modal-foot" style="justify-content: flex-start; flex-wrap: wrap;">
+      <button type="button" class="btn btn-primary" id="active-rec-save-stop">Save</button>
+      <button type="button" class="btn btn-warning" id="active-rec-stop-btn">Stop now</button>
+      <button type="button" class="btn btn-secondary" id="active-rec-pause-btn">Pause</button>
+      <button type="button" class="btn btn-danger" id="active-rec-cancel-btn">Abort</button>
+      <button type="button" class="btn" id="active-rec-close" style="margin-left:auto;">Close</button>
+    </div>
+  </div>
+</div>

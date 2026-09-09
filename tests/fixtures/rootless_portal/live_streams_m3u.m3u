@@ -1,0 +1,53 @@
+#EXTM3U
+#EXTINF:-1 tvg-id="" tvg-name="EN| NORTHSTAR 1 4K" tvg-logo="http://fake-logos.invalid/logo.png" group-title="",EN| NORTHSTAR 1 4K
+http://fake-portal-rootless.invalid:80/FAKEUSER0000/FAKEPASS0000/5250708
+#EXTINF:-1 tvg-id="" tvg-name="EN| NORTHSTAR 2 4K" tvg-logo="http://fake-logos.invalid/logo.png" group-title="",EN| NORTHSTAR 2 4K
+http://fake-portal-rootless.invalid:80/FAKEUSER0000/FAKEPASS0000/5250707
+#EXTINF:-1 tvg-id="" tvg-name="EN| NORTHSTAR 3 4K" tvg-logo="http://fake-logos.invalid/logo.png" group-title="",EN| NORTHSTAR 3 4K
+http://fake-portal-rootless.invalid:80/FAKEUSER0000/FAKEPASS0000/5250706
+#EXTINF:-1 tvg-id="" tvg-name="EN| NORTHSTAR 4 4K" tvg-logo="http://fake-logos.invalid/logo.png" group-title="",EN| NORTHSTAR 4 4K
+http://fake-portal-rootless.invalid:80/FAKEUSER0000/FAKEPASS0000/5250705
+#EXTINF:-1 tvg-id="" tvg-name="EN| NORTHSTAR 5 4K" tvg-logo="http://fake-logos.invalid/logo.png" group-title="",EN| NORTHSTAR 5 4K
+http://fake-portal-rootless.invalid:80/FAKEUSER0000/FAKEPASS0000/5250703
+#EXTINF:-1 tvg-id="" tvg-name="EN| NORTHSTAR 6 4K" tvg-logo="http://fake-logos.invalid/logo.png" group-title="",EN| NORTHSTAR 6 4K
+http://fake-portal-rootless.invalid:80/FAKEUSER0000/FAKEPASS0000/5250702
+#EXTINF:-1 tvg-id="" tvg-name="EN| NORTHSTAR 7 4K" tvg-logo="http://fake-logos.invalid/logo.png" group-title="",EN| NORTHSTAR 7 4K
+http://fake-portal-rootless.invalid:80/FAKEUSER0000/FAKEPASS0000/5250701
+#EXTINF:-1 tvg-id="" tvg-name="EN| NORTHSTAR 8 4K" tvg-logo="http://fake-logos.invalid/logo.png" group-title="",EN| NORTHSTAR 8 4K
+http://fake-portal-rootless.invalid:80/FAKEUSER0000/FAKEPASS0000/5250700
+#EXTINF:-1 tvg-id="" tvg-name="EN| NORTHSTAR 9 4K" tvg-logo="http://fake-logos.invalid/logo.png" group-title="",EN| NORTHSTAR 9 4K
+http://fake-portal-rootless.invalid:80/FAKEUSER0000/FAKEPASS0000/5250699
+#EXTINF:-1 tvg-id="" tvg-name="EN| NORTHSTAR 10 4K" tvg-logo="http://fake-logos.invalid/logo.png" group-title="",EN| NORTHSTAR 10 4K
+http://fake-portal-rootless.invalid:80/FAKEUSER0000/FAKEPASS0000/5250698
+#EXTINF:-1 tvg-id="" tvg-name="4K - A Blue Ridge cedar atlas Meridian Harbor (2026) (US) S01 E01" tvg-logo="https://fake-logos.invalid/logo.png" group-title="|FR| 4K/UHD PINNACLE",4K - A Blue Ridge cedar atlas Meridian Harbor (2026) (US) S01 E01
+http://fake-portal-rootless.invalid:80/series/FAKEUSER0000/FAKEPASS0000/6284183.mkv
+#EXTINF:-1 tvg-id="" tvg-name="4K - A Blue Ridge cedar atlas Meridian Harbor (2026) (US) S01 E02" tvg-logo="https://fake-logos.invalid/logo.png" group-title="|FR| 4K/UHD PINNACLE",4K - A Blue Ridge cedar atlas Meridian Harbor (2026) (US) S01 E02
+http://fake-portal-rootless.invalid:80/series/FAKEUSER0000/FAKEPASS0000/6289111.mkv
+#EXTINF:-1 tvg-id="" tvg-name="4K - A Blue Ridge cedar atlas Meridian Harbor (2026) (US) S01 E03" tvg-logo="https://fake-logos.invalid/logo.png" group-title="|FR| 4K/UHD PINNACLE",4K - A Blue Ridge cedar atlas Meridian Harbor (2026) (US) S01 E03
+http://fake-portal-rootless.invalid:80/series/FAKEUSER0000/FAKEPASS0000/6291919.mkv
+#EXTINF:-1 tvg-id="" tvg-name="4K - A Blue Ridge cedar atlas Meridian Harbor (2026) (US) S01 E04" tvg-logo="https://fake-logos.invalid/logo.png" group-title="|FR| 4K/UHD PINNACLE",4K - A Blue Ridge cedar atlas Meridian Harbor (2026) (US) S01 E04
+http://fake-portal-rootless.invalid:80/series/FAKEUSER0000/FAKEPASS0000/6291920.mkv
+#EXTINF:-1 tvg-id="" tvg-name="4K - A Blue Ridge cedar atlas Meridian Harbor (2026) (US) S01 E05" tvg-logo="https://fake-logos.invalid/logo.png" group-title="|FR| 4K/UHD PINNACLE",4K - A Blue Ridge cedar atlas Meridian Harbor (2026) (US) S01 E05
+http://fake-portal-rootless.invalid:80/series/FAKEUSER0000/FAKEPASS0000/6301236.mkv
+#EXTINF:-1 tvg-id="" tvg-name="4K - A Blue Ridge cedar atlas Meridian Harbor (2026) (US) S01 E06" tvg-logo="https://fake-logos.invalid/logo.png" group-title="|FR| 4K/UHD PINNACLE",4K - A Blue Ridge cedar atlas Meridian Harbor (2026) (US) S01 E06
+http://fake-portal-rootless.invalid:80/series/FAKEUSER0000/FAKEPASS0000/6301237.mkv
+#EXTINF:-1 tvg-id="" tvg-name="DE| LANTERN" tvg-logo="http://fake-logos.invalid/logo.png" group-title="DE| SUMMIT DRIFTWOOD",DE| LANTERN
+https://fake-cdn.invalid/v1/master/FAKEUSER0000/FAKEPASS0000/index.m3u8
+#EXTINF:-1 tvg-id="" tvg-name="DE| IRONWOOD CASCADE!" tvg-logo="http://fake-logos.invalid/logo.png" group-title="DE| SUMMIT DRIFTWOOD",DE| IRONWOOD CASCADE!
+https://fake-cdn.invalid/v1/master/FAKEUSER0000/FAKEPASS0000/index.m3u8
+#EXTINF:-1 tvg-id="" tvg-name="DE| BEACON FÜR JUNIPER" tvg-logo="http://fake-logos.invalid/logo.png" group-title="DE| SUMMIT DRIFTWOOD",DE| BEACON FÜR JUNIPER
+https://fake-cdn.invalid/v1/master/FAKEUSER0000/FAKEPASS0000/index.m3u8
+#EXTINF:-1 tvg-id="" tvg-name="DE| SANDSTONE WILLOW" tvg-logo="http://fake-logos.invalid/logo.png" group-title="DE| SUMMIT DRIFTWOOD",DE| SANDSTONE WILLOW
+https://fake-cdn.invalid/v1/stitch/embed/hls/channel/FAKEUSER0000/master.m3u8
+#EXTINF:-1 tvg-id="" tvg-name="DE| FOXGLOVE TV MARLIN" tvg-logo="http://fake-logos.invalid/logo.png" group-title="DE| SUMMIT DRIFTWOOD",DE| FOXGLOVE TV MARLIN
+https://fake-cdn.invalid/v1/stitch/embed/hls/channel/FAKEUSER0000/master.m3u8
+#EXTINF:-1 tvg-id="" tvg-name="DE| ATLAS TIMBER ORCHARD" tvg-logo="http://fake-logos.invalid/logo.png" group-title="DE| SUMMIT DRIFTWOOD",DE| ATLAS TIMBER ORCHARD
+https://fake-cdn.invalid/v1/master/FAKEUSER0000/FAKEPASS0000/playlist.m3u8
+#EXTINF:-1 tvg-id="" tvg-name="DE| NORTHSTAR" tvg-logo="http://fake-logos.invalid/logo.png" group-title="DE| SUMMIT DRIFTWOOD",DE| NORTHSTAR
+https://fake-cdn.invalid/v1/master/FAKEUSER0000/FAKEPASS0000/playlist.m3u8
+#EXTINF:-1 tvg-id="" tvg-name="DE| BLUE RIDGE CEDAR ATLAS MERIDIAN DRIFTWOOD" tvg-logo="http://fake-logos.invalid/logo.png" group-title="DE| SUMMIT DRIFTWOOD",DE| BLUE RIDGE CEDAR ATLAS MERIDIAN DRIFTWOOD
+https://fake-cdn.invalid/v1/stitch/embed/hls/channel/FAKEUSER0000/master.m3u8
+#EXTINF:-1 tvg-id="" tvg-name="DE| BLUE RIDGE CEDAR FOXGLOVE TV" tvg-logo="http://fake-logos.invalid/logo.png" group-title="DE| SUMMIT DRIFTWOOD",DE| BLUE RIDGE CEDAR FOXGLOVE TV
+https://fake-cdn.invalid/v1/stitch/embed/hls/channel/FAKEUSER0000/master.m3u8
+#EXTINF:-1 tvg-id="" tvg-name="DE| SANDSTONE HARBOR PINNACLE" tvg-logo="http://fake-logos.invalid/logo.png" group-title="DE| SUMMIT DRIFTWOOD",DE| SANDSTONE HARBOR PINNACLE
+https://fake-cdn.invalid/v1/stitch/embed/hls/channel/FAKEUSER0000/master.m3u8

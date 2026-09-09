@@ -1,0 +1,1137 @@
+/* ════════════════════════════════════════════════════════════════════
+   Channel search - the Browse tab at /channels.
+
+   The approved desktop design is dev/mockups/21-channel-search-desktop.html
+   (eleven rounds; dev/changelog/361-391). This file is that design's CSS with
+   every rule production already ships REMOVED rather than copied, so the page
+   uses the shipped component in each case:
+
+     tokens, shell, .btn*, .badge/.b-*, .h-mini    static/css/style.css
+     .switch (DESIGN.md 3.13)                      style.css - only the two
+                                                   page-scoped size overrides
+                                                   below are ours
+     popovers: [data-menu] + .menu + .menu-wrap    style.css + util.js
+                                                   (DESIGN.md 3.6) - this page
+                                                   has NO scrim and no second
+                                                   open/close implementation
+     .col-item / .grip (columns picker)            style.css
+     .empty-state, .toast, [data-tip] tooltips     style.css + util.js
+     body.scroll-locked                            style.css + util.js
+
+   The mockup's own `.chip` is renamed `.cs-chip` here: production's `.chip` is
+   the toolbar filter pill (a different component with a different shape), and
+   two meanings for one class name in one codebase is how a future promotion
+   breaks a page nobody was looking at.
+
+   Everything below is genuinely this page's. Loaded only by
+   templates/channels/search.html.
+   ════════════════════════════════════════════════════════════════════ */
+
+/* ── Layout: rail beside everything the search produces ─────────────── */
+.cs-wrap { display: flex; gap: 16px; align-items: flex-start; }
+.cs-main { flex: 1; min-width: 0; }
+
+/* The bar is always sticky. Its z-index is load-bearing: a sticky element with
+   a z-index is its own stacking context, which is why nothing on this page may
+   reintroduce a full-page scrim - util.js positions an open .menu in FIXED
+   coordinates precisely so it escapes this context (dev/changelog/367). */
+.cs-bar {
+  margin-bottom: 1rem;
+  position: sticky; top: 0; z-index: 140; background: var(--bg0);
+  padding: 10px 0 8px; margin-top: -10px; border-bottom: 1px solid var(--border-soft);
+}
+
+/* ── The search box ────────────────────────────────────────────────── */
+.searchzone { margin-bottom: 10px; }
+/* The gap is a variable because ONE control on this line has to cancel it exactly - the
+   joined match-mode button shares the box's border and must sit flush against it. Two
+   hand-written copies of one length is the coupled-values defect CLAUDE.md names; this is
+   the single definition both read. */
+.sline { --sline-gap: 8px; display: flex; align-items: flex-start; gap: var(--sline-gap); }
+/* The suggestion menu anchors to the BOX, not to the line, so the all/any
+   control beside it cannot stretch the menu wider than the input. */
+.sbox-wrap { position: relative; flex: 1; min-width: 0; }
+.sbox { display: flex; align-items: center; gap: 8px; min-height: var(--ctl-h); background: var(--bg1);
+  border: 1px solid var(--border); border-radius: var(--radius); padding: 4px 8px;
+  transition: border-color .12s, box-shadow .12s; }
+.sbox.focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(var(--accent-rgb), .13); }
+.sbox .mag { color: var(--text-faint); font-size: var(--fs-base); flex: none; }
+.sbox input { flex: 1; min-width: 130px; background: none; border: none; outline: none; color: var(--text);
+  font-family: inherit; font-size: var(--fs-base); height: 30px; }
+.sbox input::placeholder { color: var(--text-faint); }
+.sbox .sclr { background: none; border: none; color: var(--text-faint); cursor: pointer; font-size: var(--fs-base); padding: 0 4px; }
+.sbox .sclr:hover { color: var(--text); }
+.scount { flex: none; font-size: var(--fs-sm); color: var(--text-faint); font-family: var(--font-mono); padding-right: 4px; }
+.syn { flex: none; font-size: var(--fs-xs); color: var(--text-faint); font-family: var(--font-mono);
+  background: var(--bg3); border-radius: var(--radius-sm); padding: 1px 6px; }
+/* Every keystroke is a round trip to the server (F1), so the in-flight state
+   has to be visible rather than the list merely being stale for 250ms. The ring
+   itself is the shared .spinner component (style.css); this sizes it and, for
+   .sspin, hides it until the box is actually loading. */
+.sspin { flex: none; width: 13px; height: 13px; display: none; }
+.sbox.loading .sspin { display: block; }
+/* The "Narrow it down" rail heading's own spinner, while a facets fetch is in flight.
+   Not built on .sspin's display:none + parent-class toggle, because the rail is
+   rebuilt whole via innerHTML on every render rather than holding a persistent DOM
+   node to toggle a class on - simplest is a class that is just omitted from the
+   markup when not pending. */
+.rail-spin { flex: none; width: 12px; height: 12px; }
+
+/* all words / any word: a segmented control beside the box, always visible
+   whether or not anything has been typed. */
+.seg { display: inline-flex; border: 1px solid var(--border); border-radius: var(--radius-sm); overflow: hidden;
+  height: var(--ctl-h); flex: none; }
+.seg button { border: none; background: var(--bg1); color: var(--text-muted); font-size: var(--fs-sm);
+  padding: 0 11px; cursor: pointer; font-family: inherit; white-space: nowrap; }
+.seg button:hover { background: var(--bg3); color: var(--text); }
+.seg button.on { background: var(--accent); color: var(--accent-contrast); font-weight: 600; }
+
+/* ── Suggestions ───────────────────────────────────────────────────── */
+/* `show`, not `open`: `open` belongs to overlays that lock the page, and a
+   dropdown attached to a text input deliberately does not (util.js OVERLAY_SEL
+   exempts input-attached dropdowns by name). It is still an overlay for
+   dismissal purposes - see closeOverlays() in channel-search.js.
+   max-height here is a FLOOR: sizeSugg() overwrites it with the space actually
+   left below the box, so "fits without scrolling" is measured, not assumed. */
+.sugg { display: none; position: absolute; z-index: 320; top: calc(100% + 5px); left: 0; right: 0;
+  background: var(--bg2); border: 1px solid var(--border); border-radius: var(--radius);
+  box-shadow: var(--shadow-pop); padding: 6px; max-height: 400px; overflow-y: auto; }
+.sugg.show { display: block; }
+.sugg .sgroup { font-size: var(--fs-2xs); text-transform: uppercase; letter-spacing: .07em; color: var(--text-faint);
+  padding: 7px 8px 4px; font-weight: 600; }
+.sitem { display: flex; align-items: center; gap: 9px; padding: 6px 9px; border-radius: var(--radius-sm);
+  cursor: pointer; font-size: var(--fs-lg); }
+.sitem:hover, .sitem.sel { background: var(--accent-soft); }
+.sitem .sico { width: 20px; text-align: center; flex: none; color: var(--text-faint); font-size: var(--fs-lg); }
+.sitem.sel .sico { color: var(--accent-text); }
+.sitem .stxt { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sitem .skey { color: var(--text-faint); font-size: var(--fs-sm); }
+.sitem .shint { font-size: var(--fs-xs); color: var(--text-faint); font-family: var(--font-mono); flex: none; }
+.sitem kbd { font-family: var(--font-mono); font-size: var(--fs-2xs); background: var(--bg0); border: 1px solid var(--border);
+  border-bottom-width: 2px; border-radius: var(--radius-sm); padding: 1px 4px; color: var(--text-muted); }
+/* The syntax help lives under a rule in this menu rather than behind a button:
+   it is where you are already typing. */
+.sugg-syn { border-top: 1px solid var(--border); margin-top: 6px; padding: 8px 9px 3px;
+  font-size: var(--fs-xs); color: var(--text-faint); line-height: 1.7; }
+.sugg-syn code { font-family: var(--font-mono); background: var(--bg0); border-radius: var(--radius-sm);
+  padding: 0 4px; color: var(--text-muted); }
+
+/* Two PANES, not a scope section stacked over the suggestions: two panes make
+   the menu as tall as the taller one instead of as tall as both put together
+   (dev/changelog/389). The syntax footer stays outside the grid, full width. */
+.sugg-2col { display: grid; grid-template-columns: 268px 1fr; gap: 0 26px; }
+.sugg-main { min-width: 0; }
+/* `align-self: start` is what makes `sticky` mean anything here - a stretched
+   grid item is already the full row height and has nowhere to stick to. */
+.sugg-scope { position: sticky; top: -6px; align-self: start; z-index: 1; background: var(--bg2);
+  border-right: 1px solid var(--border); padding: 2px 20px 4px 3px; }
+.sugg-scope .sgroup { padding: 1px 0 4px; display: flex; align-items: center; gap: 6px; }
+.sugg-scope .scnt {
+  background: var(--accent); color: var(--accent-contrast); border-radius: 999px; padding: 0 6px;
+  font-size: var(--fs-2xs); font-weight: 700; font-family: var(--font-mono); letter-spacing: 0;
+}
+.sugg-scope .fwhat { color: var(--text-faint); font-size: var(--fs-xs); cursor: help; margin-left: 4px; }
+/* Padding, not margin: .prow:hover paints a background that must run the full
+   width of the pane. */
+.sugg-scope .prow { padding: 2px 2px 2px 14px; font-size: var(--fs-md); min-width: 0; }
+.sugg-scope .prow .pv { min-width: 0; }
+/* The gutter between a field name and its example, plus the derived EXAMPLE
+   column title, are what stop the example reading as a value you are enabling
+   (dev/changelog/391). .pv is flex:1 so a long name ellipsises INTO the gutter
+   rather than closing it. */
+.sugg-scope .prow .hint { margin-left: 18px; }
+/* Both pane titles are one style, selected by RANK rather than by wording: the
+   right-hand pane's title is whatever its first group heading says. Its later
+   group headings stay at the small .sugg .sgroup size - they are subheads. */
+.sugg-scope .stitle,
+.sugg-main .sgroup:first-child {
+  font-size: var(--fs-md); text-transform: none; letter-spacing: 0;
+  color: var(--text); font-weight: 700;
+}
+.sugg-scope .stitle { padding: 1px 0 7px; }
+.sugg-main .sgroup:first-child { padding: 1px 8px 7px; }
+.sugg-scope .fgroup {
+  font-size: var(--fs-2xs); text-transform: uppercase; letter-spacing: .07em; color: var(--text-faint);
+  font-weight: 600; padding: 6px 2px 2px; display: flex; align-items: center;
+}
+/* Rides the group heading rather than taking a row of its own, so it costs no
+   height, and it is rendered only for a group whose fields have examples. */
+.sugg-scope .fgroup .fex { margin-left: auto; }
+
+/* .prow label { flex: 1 } below is written for the RAIL's value rows, where the
+   <label> WRAPS the row text and is supposed to grow. Here the <label> IS the
+   control, and flex: 1 (grow 1, basis 0) outranks .switch's own width on the
+   main axis, so every switch stretched to whatever its row's hint left over.
+   Never let a rule written for a label-wrapping row reach a label that is
+   itself a control. */
+.prow label.switch { flex: 0 0 auto; }
+/* Smaller in the menu than in a modal: eight of them in a 268px pane. */
+.sugg-scope .switch { width: 28px; height: 16px; }
+.sugg-scope .switch .knob::after { width: 10px; height: 10px; }
+.sugg-scope .switch input:checked + .knob::after { transform: translateX(12px); }
+/* There is deliberately no "unavailable field" treatment here. The mockup disabled
+   Description and explained in a tooltip that descriptions had no index; that stopped being
+   true when they were indexed into chan_prog (dev/changelog/395, 1-72ms in production), and
+   UI text describing backend behavior that has changed is a defect rather than a leftover.
+   Every field in the registry is switchable. */
+
+/* ── The well of active filters ────────────────────────────────────── */
+.well { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; border: 1px dashed var(--border);
+  border-radius: var(--radius-sm); padding: 7px 9px; margin-bottom: 10px; min-height: 42px; }
+.well-lbl { font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: .07em; color: var(--text-faint);
+  font-weight: 600; margin-right: 2px; }
+.well-none { font-size: var(--fs-md); color: var(--text-faint); font-style: italic; }
+/* The slots and the rendered body take part in the well's flex row, not their
+   own box - the inline + Filter is MOVED between the two slots, never
+   duplicated, so there is only ever one popover holding the pending dimension. */
+.slot, #wellbody { display: contents; }
+
+/* ── Chips. One builder for every one of them. ─────────────────────── */
+.cs-chip { display: inline-flex; align-items: center; gap: 5px; height: 26px; padding: 0 4px 0 8px;
+  border-radius: 999px; background: var(--accent-soft); border: 1px solid rgba(var(--accent-rgb), .38);
+  color: var(--accent-text); font-size: var(--fs-sm); white-space: nowrap; max-width: 340px; }
+.cs-chip.neg { background: var(--bad-soft); border-color: rgba(var(--bad-rgb),.4); color: #f4938f; }
+.cs-chip.text { background: var(--bg3); border-color: var(--border); color: var(--text); }
+.cs-chip .ck { opacity: .75; font-weight: 600; }
+.cs-chip .cop { border: none; background: none; color: inherit; border-radius: var(--radius-sm); padding: 1px 5px;
+  font-size: var(--fs-xs); font-family: inherit; font-weight: 600; opacity: .55; }
+.cs-chip .cv { overflow: hidden; text-overflow: ellipsis; cursor: pointer; }
+.cs-chip .cx { border: none; background: none; color: inherit; cursor: pointer; font-size: var(--fs-base);
+  line-height: 1; padding: 0 4px; opacity: .7; }
+.cs-chip .cx:hover { opacity: 1; }
+
+/* ── Toolbar ───────────────────────────────────────────────────────── */
+.tbar { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; margin-bottom: 12px; }
+.tbar .btn { height: var(--ctl-h); }
+.tbar-right { margin-left: auto; display: flex; align-items: center; gap: 7px; }
+/* The inline one is the empty slot at the end of the well - a chip-shaped hole
+   waiting for the next filter, which is why it is the only dashed one. The
+   toolbar keeps a normal button: a dashed toolbar button reads as disabled. */
+.fadd { height: 26px; padding: 0 10px; border-radius: 999px; border: 1px dashed var(--border);
+  background: transparent; color: var(--text-muted); font-size: var(--fs-sm); font-family: inherit; cursor: pointer;
+  display: inline-flex; align-items: center; gap: 5px; }
+.fadd:hover { border-color: var(--accent); color: var(--accent-text); }
+.sf-name { font-size: var(--fs-sm); color: var(--accent-text); font-weight: 600; }
+.sf-dirty { font-size: var(--fs-xs); color: var(--warn); font-weight: 700; }
+
+/* Count / status line. Under the bar, never inside it. */
+.cs-count { font-size: var(--fs-md); color: var(--text-muted); margin-top: 0.6rem; display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap; }
+.cs-count strong { color: var(--text); font-variant-numeric: tabular-nums; }
+.cs-count .sep { color: var(--text-faint); }
+/* What a standing option is hiding, with a one-click undo. */
+.cs-count .hid { color: var(--warn); cursor: pointer; text-decoration: underline dotted; }
+/* What the text is being matched against. Deliberately NOT .hid - nothing is
+   being hidden here, so it must not borrow the warning colour. */
+.cs-count .scope-say { color: var(--text-muted); cursor: pointer; text-decoration: underline dotted; }
+/* A degraded search is correct but slower, and the reason is reported rather
+   than merely logged (DESIGN-channel-search.md 8). */
+.cs-count .degraded { color: var(--warn); cursor: help; }
+/* Stronger than .degraded's warning colour on purpose: a degraded search is still
+   correct, this means the rows on screen do not reflect the active filters at all. */
+.cs-count .stale-fail { color: var(--bad); cursor: help; }
+/* Deliberately quieter than either of those: the ROWS are complete and correct, only the
+   total beside them is missing. Muted rather than a warning colour, so it reads as an
+   absent extra and not as a problem with the results (dev/changelog/676). */
+.cs-count .uncounted { color: var(--text-muted); cursor: help; }
+.cs-back {
+  font: inherit; font-size: var(--fs-sm); font-weight: 700; cursor: pointer;
+  background: var(--accent-soft); color: var(--accent-text);
+  border: 1px solid rgba(var(--accent-rgb),.45); border-radius: 999px; padding: 1px 10px;
+}
+.cs-back:hover { filter: brightness(1.15); }
+
+/* ── Panel popovers ────────────────────────────────────────────────
+   These are production .menu elements (util.js owns open/close/position/scroll
+   lock) wearing .menu-panel, because their contents are a panel of controls -
+   headings, a find box, three-state rows, a two-level drill - rather than the
+   list of actions .menu is sized for. Nothing here re-implements the menu. */
+/* max-width caps shrink-to-fit: a dimension's .pnote help paragraph (below) has no forced
+   break, so without this an unconstrained popover stretches to the viewport edge on any
+   dimension whose help text is long enough (measured on other/tag/group - dev/changelog/492). */
+.menu-panel { min-width: 250px; max-width: 420px; padding: 11px 13px; }
+.menu-panel h5 { font-size: var(--fs-2xs); text-transform: uppercase; letter-spacing: .07em; color: var(--text-faint); margin-bottom: 7px; }
+/* One value row, shared by the + Filter popover, the rail and the suggestion
+   menu, so the three-state control is the same thing in all three. */
+.prow { display: flex; align-items: center; gap: 8px; padding: 4px 2px; font-size: var(--fs-md); border-radius: var(--radius-sm); }
+.prow:hover { background: var(--bg3); }
+.prow .pv { flex: 1; overflow: hidden; text-overflow: ellipsis; }
+.prow .pcount { margin-left: auto; font-size: var(--fs-xs); color: var(--text-faint); font-family: var(--font-mono); }
+/* A zero is information, not a reason to hide the value: the control has to let
+   you exclude something you cannot currently see. */
+.prow .pcount.zero { opacity: .4; }
+/* A dimension absent from `facets` is "not counted", which is NOT a zero
+   (DESIGN-channel-search.md 6). */
+.prow .pcount.uncounted { opacity: .55; font-style: italic; }
+/* WHY those `--`s are there, said once at the top of the rail instead of eighty times
+   inside it. Eighty absent counts read as a broken page; one sentence reads as an answer
+   (dev/changelog/676). */
+.rcard .rnote {
+  margin: 0 0 9px; padding: 6px 8px; border-radius: var(--radius-sm);
+  background: var(--warn-soft); color: var(--warn); border: 1px solid rgba(var(--warn-rgb), .35);
+  font-size: var(--fs-xs); line-height: 1.35; cursor: help;
+}
+.prow label { display: flex; align-items: center; gap: 8px; flex: 1; cursor: pointer; }
+.prow input { accent-color: var(--accent); }
+.prow .hint { font-size: var(--fs-xs); color: var(--text-faint); font-family: var(--font-mono); }
+.prow.sel-on { background: rgba(var(--accent-rgb), .08); }
+.psep { height: 1px; background: var(--border); margin: 9px 0; }
+.pfoot { display: flex; gap: 6px; margin-top: 10px; }
+.pnote { font-size: var(--fs-xs); color: var(--text-faint); line-height: 1.45; margin-top: 9px;
+  border-top: 1px solid var(--border-soft); padding-top: 8px; }
+.pnote code { font-family: var(--font-mono); background: var(--bg0); border-radius: var(--radius-sm); padding: 0 4px; color: var(--text-muted); }
+.pop-scroll { max-height: 320px; overflow-y: auto; margin: 0 -4px; padding: 0 4px; }
+/* `.pop-back` lives in style.css - three pages draw one now (dev/changelog/767). */
+/* The columns picker is style.css's .col-item list; only the tighter spacing a
+   panel needs is ours. */
+.menu-panel .col-item { padding: 4px 2px; font-size: var(--fs-md); }
+.menu-panel .col-item.drag-over { outline: 1px dashed var(--accent); }
+
+/* Three-state value control: off, included, excluded, right where you are
+   looking at the value. This is how "is not" is said. */
+.tri { display: inline-flex; border: 1px solid var(--border); border-radius: var(--radius-sm); overflow: hidden; flex: none; }
+.tri button { border: none; background: var(--bg1); color: var(--text-faint); cursor: pointer;
+  font-size: var(--fs-xs); font-weight: 700; padding: 2px 7px; font-family: inherit; min-width: 22px; }
+.tri button:hover { background: var(--bg3); color: var(--text); }
+.tri button.on-inc { background: var(--accent); color: var(--accent-contrast); }
+.tri button.on-exc { background: var(--bad); color: #2a0b0a; }
+
+/* One find box everywhere: the + Filter popover and the rail facets. It clears
+   from inside itself, and the x exists only when there is something to clear. */
+.pop-search, .rsearch {
+  width: 100%; height: 30px; padding: 0 26px 0 9px;
+  background: var(--bg0); border: 1px solid var(--border); border-radius: var(--radius-sm);
+  color: var(--text); font-family: inherit; font-size: var(--fs-md); outline: none;
+}
+.pop-search:focus, .rsearch:focus { border-color: var(--accent); }
+.findwrap { position: relative; margin-bottom: 8px; display: block; }
+.findwrap .fclr { position: absolute; right: 2px; top: 0; height: 100%; width: 22px; border: none;
+  background: none; color: var(--text-faint); cursor: pointer; font-size: var(--fs-sm); line-height: 1; padding: 0; }
+.findwrap .fclr:hover { color: var(--text); }
+
+/* ── The facet rail ────────────────────────────────────────────────
+   A STACK OF CARDS, not one box, and the collapse control is a strip of the
+   RAIL itself, above every card and inside none. The standing options are the
+   last card (dev/changelog/387). */
+.rail { width: 234px; flex: none; align-self: flex-start; display: flex; flex-direction: column; gap: 10px; }
+.rcard { background: var(--bg1); border: 1px solid var(--border); border-radius: var(--radius); padding: 11px; }
+.rail h4 { font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: .07em; color: var(--text-faint);
+  margin-bottom: 9px; display: flex; align-items: center; gap: 6px; }
+.rail h4 .rclr { margin-left: auto; font-size: var(--fs-xs); text-transform: none; letter-spacing: 0;
+  color: var(--accent-text); cursor: pointer; background: none; border: none; font-family: inherit; }
+.railbar { display: flex; justify-content: flex-end; }
+.rcollapse { display: inline-flex; align-items: center; gap: 5px; background: none; border: none;
+  color: var(--text-faint); cursor: pointer; font-size: var(--fs-xs); font-family: inherit;
+  padding: 2px 3px; border-radius: var(--radius-sm); }
+.rcollapse:hover { color: var(--text); background: var(--bg2); }
+.rcollapse .rcx { font-size: var(--fs-lg); line-height: 1; }
+/* Collapsed, the whole box IS the way back - it is a <button> wearing .rcard,
+   so every pixel of it is the hit target. A chevron sitting above the box was a
+   control floating on its own (dev/changelog/374). */
+.railstub { display: block; width: 100%; font-family: inherit; cursor: pointer; color: var(--text-faint); }
+.railstub:hover { border-color: var(--accent); color: var(--text); }
+.railstub .rcx { display: block; font-size: var(--fs-lg); line-height: 1; }
+.scopewhy { font-size: var(--fs-xs); color: var(--text-faint); line-height: 1.4; padding-top: 5px; }
+/* Collapsed: a thin spine that still says how many filters are on. */
+.rail.collapsed { width: 42px; }
+.rail.collapsed .rcard { padding: 9px 6px; text-align: center; }
+.rail.collapsed .fac, .rail.collapsed .rsearch, .rail.collapsed h4 .rclr, .rail.collapsed h4 span.rt { display: none; }
+.rail.collapsed h4 { justify-content: center; margin-bottom: 0; }
+.rail.collapsed .rspine { display: block; margin-top: 9px; font-size: var(--fs-xs); color: var(--text-faint);
+  writing-mode: vertical-rl; letter-spacing: .1em; text-transform: uppercase; }
+.rspine { display: none; }
+.rail.collapsed .rspine .rn { display: block; margin-bottom: 6px; background: var(--accent); color: var(--accent-contrast);
+  border-radius: 999px; padding: 2px 0; font-weight: 700; writing-mode: horizontal-tb; }
+.fac { border-top: 1px solid var(--border-soft); padding: 7px 0; }
+.fac:first-of-type { border-top: none; }
+/* The 4px gap is MEASURED, not a preference: the rail gives this header 210px
+   and the Channel group facet asks for 216 of them, so at 6px the create button
+   hung past the rail (round-11 browser pass). Do not widen it or the .7rem
+   button without re-measuring, and do not buy the room from the rail's width -
+   the results table needs it more. */
+.fac-h { display: flex; align-items: center; gap: 4px; cursor: pointer; font-size: var(--fs-md);
+  font-weight: 600; min-width: 0; }
+.fac-h .caret { color: var(--text-faint); font-size: var(--fs-xs); transition: transform .12s; }
+/* The facet's name is an element with `nowrap`, not a bare text node: a bare
+   text node in a flex row is an anonymous flex item that shrinks to its longest
+   WORD and cannot be selected by any rule (BUGS.md 2026-07-30 06:57). The
+   ellipsis is the safety valve - with today's labels nothing truncates. */
+.fac-h .fac-name { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.fac.open .fac-h .caret { transform: rotate(90deg); }
+/* The count pill, unscoped since dev/changelog/811 so the well's "Filters N" label can
+   use the one this page already had rather than a second copy of it. `margin-left: auto`
+   stays on the facet header, where it is that header's layout and not the pill's. */
+.nsel { font-size: var(--fs-xs); background: var(--accent); color: var(--accent-contrast);
+  border-radius: 999px; padding: 0 6px; font-weight: 700; }
+.fac-h .nsel { margin-left: auto; }
+.nsel.hasneg { background: var(--bad); color: #2a0b0a; }
+.fac-b { display: none; padding: 5px 0 2px; }
+.fac.open .fac-b { display: block; }
+.fac-b .prow { font-size: var(--fs-md); }
+.fac-more { font-size: var(--fs-sm); color: var(--accent-text); cursor: pointer; background: none; border: none;
+  font-family: inherit; padding: 4px 2px; }
+.fac-none { font-size: var(--fs-sm); color: var(--text-faint); font-style: italic; padding: 4px 2px; }
+.fac-b .findwrap { margin-bottom: 5px; }
+.fac-b .rsearch { height: 26px; font-size: var(--fs-sm); }
+.fac-h .fwhat { color: var(--text-faint); font-size: var(--fs-xs); cursor: help; font-weight: 400; }
+/* `margin-left: auto` here means a following .nsel must drop its own auto
+   margin, or flexbox splits the free space between the two and the button lands
+   mid-header instead of at its right edge. */
+.fac-make { padding: 0; font-size: var(--fs-xs); font-family: inherit; font-weight: 400;
+  color: var(--accent-text); background: none; border: none; cursor: pointer;
+  white-space: nowrap; margin-left: auto; flex: none; }
+.fac-h .fac-make ~ .nsel { margin-left: 0; }
+.fac-make:hover { color: var(--text); text-decoration: underline; }
+
+/* ── The standing-option tier (the rail's footer card) ─────────────
+   Deliberately NOT chip-shaped: a chip in the well means "I picked this, for
+   this search", and a standing option is the opposite. It reads as a switch -
+   square-ish, a state dot, muted until active - which matters most here,
+   directly under a card full of include/exclude value rows. */
+.st-tog {
+  display: flex; width: 100%; align-items: center; gap: 6px; padding: 5px 8px; margin-bottom: 5px;
+  border-radius: var(--radius-sm); border: 1px solid var(--border); background: var(--bg1);
+  color: var(--text-muted); font-size: var(--fs-sm); font-family: inherit; cursor: pointer; text-align: left;
+}
+.st-tog:hover { border-color: var(--text-faint); color: var(--text); }
+/* Active is stated by a filled dot AND a border, never by colour alone. */
+.st-tog .st-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--text-faint); flex: none; }
+.st-tog.on { background: var(--bg3); border-color: rgba(var(--accent-rgb), .45); color: var(--text); }
+.st-tog.on .st-dot { background: var(--accent); box-shadow: 0 0 0 3px rgba(var(--accent-rgb), .18); }
+/* How many rows this option is hiding right now, on the control itself. */
+.st-tog .st-n { margin-left: auto; font-family: var(--font-mono); font-size: var(--fs-xs); color: var(--text-faint); }
+.st-tog.on .st-n { color: var(--accent-text); }
+.rail .rcard.st-card { margin-top: 2px; }
+.rail .rcard.st-card h4 .scnt { margin-left: 6px; }
+
+/* ── Action bar ────────────────────────────────────────────────────── */
+.missing-bar { display: flex; gap: .5rem; flex-wrap: wrap; margin-bottom: 1rem; }
+
+/* The replace action context. Accent-tinted rather than warning-coloured: arriving here
+   from "Find another airing" is an ordinary errand, and the destructive half is disclosed
+   on the button that performs it, not by making the whole page look alarming. Wraps at
+   every width - the recording's name is user text and can be long. */
+.cs-replace-bar { display: flex; align-items: center; gap: .6rem; flex-wrap: wrap;
+  margin-bottom: 1rem; padding: .55rem .75rem; border-radius: var(--radius-sm);
+  border: 1px solid var(--accent); background: var(--bg2); }
+.cs-replace-lbl { font-size: var(--fs-md); color: var(--text); flex: 1 1 auto; }
+.cs-replace-lbl b { color: var(--accent-text); }
+
+/* The proactive degraded-search notice. Warning-tinted, NOT error-coloured: the rows a
+   search returns are still correct, it is only the totals/counts that may be withheld and
+   the odd broad search that may be slower or fail to complete - dressing that as a failure
+   would teach the user to distrust results that are correct. Flows to two lines at phone
+   width rather than truncating - the engine's own reason sentence is the useful half and
+   must not be the half that gets cut. dev/changelog/427, 681. */
+.cs-degraded-bar { margin-bottom: 1rem; padding: .55rem .75rem; border-radius: var(--radius-sm);
+  border: 1px solid var(--warn); background: var(--warn-soft);
+  font-size: var(--fs-md); color: var(--text); line-height: 1.45; }
+.cs-degraded-bar .csd-why { display: block; margin-top: .2rem;
+  color: var(--text-muted); font-size: var(--fs-sm); overflow-wrap: anywhere; }
+
+/* The page-actions kebab exists only at phone width; above the breakpoint the
+   two buttons it holds are on the page itself.
+
+   THIS RULE MUST STAY ABOVE THE @media BLOCK THAT SHOWS IT. It shipped below it
+   instead, and since the two selectors are identical the later one won at every
+   width - the kebab was display:none on a phone too, which is the only place it
+   exists, so Delete Missing Channels and Review Duplicates had no reachable
+   path at all below 768px (BUGS.md 2026-07-30 08:5x PM). Specificity cannot
+   settle a tie between two copies of one selector; source order does. */
+.page-head .page-kebab { display: none; background: none; border: 1px solid var(--border);
+  border-radius: var(--radius-sm); color: var(--text-muted); font: inherit; font-size: var(--fs-base);
+  line-height: 1; cursor: pointer; padding: 8px 10px; flex: none; }
+.page-head .page-kebab:hover { color: var(--text); background: var(--bg2); }
+
+/* ════════════════════════════════════════════════════════════════════
+   All Channels, as a real table
+
+   Same construction as the shipped recordings list: a CSS grid whose
+   grid-template-columns is written by JS from the visible column set.
+
+   THE TRAP, and it is measured: the header and every row are SEPARATE grid
+   containers, so a content-dependent track (fit-content, max-content, auto)
+   sizes itself per row and slides every header label off its column. Only
+   fixed lengths and `fr` resolve identically in every container. The Channel
+   track must therefore be measured once and then FROZEN to one shared px value
+   - see freezeNameCol() in channel-search.js (CLAUDE.md CSS rules,
+   dev/changelog/390, BUGS.md 2026-07-30 06:14).
+   ════════════════════════════════════════════════════════════════════ */
+.cb-all { background: var(--bg2); border: 1px solid var(--border); border-radius: var(--radius); padding: 1rem; min-width: 0; }
+.cb-all h2 { font-size: var(--fs-lg); text-transform: uppercase; letter-spacing: .5px; color: var(--text-muted); margin-bottom: .5rem; display: flex; align-items: center; gap: .5rem; flex-wrap: wrap; }
+/* Columns sits with the table it configures, pushed to the right edge so the
+   two selection buttons still lead the row. */
+.select-btns { display: flex; align-items: center; gap: .25rem; margin-bottom: .5rem; }
+.select-btns .menu-wrap { margin-left: auto; }
+
+.atable { display: flex; flex-direction: column; min-width: 0; }
+/* Sidebar-width overflow (dev/docs/BUGS.md): #ch-list gets its own scroll box rather
+   than .atable, because .arow-head is position:sticky to the DOCUMENT scroll
+   (dev/changelog/557) - giving .atable itself overflow-x:auto would make .atable the
+   nearest scroll container for that sticky computation and re-break 557's fix (a
+   well-known CSS gotcha: ANY ancestor with non-visible overflow captures position:
+   sticky, even one that never itself scrolls). #ahead stays overflow-x:hidden so its
+   own width clips instead of stretching the page; channel-search.js mirrors #ch-list's
+   scrollLeft onto it so the header still tracks the rows horizontally. */
+#ch-list { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+/* The row's gap and padding are tokens because channel-search.js budgets against them:
+   freezeNameCol() has to know how much of the list's width the tracks it is NOT sizing
+   have already claimed, and a second hand-written copy of either number is the coupled-
+   values defect CLAUDE.md names (dev/changelog/860). Change them here and nowhere else. */
+:root { --cs-row-gap: 6px; --cs-row-pad: 6px; }
+.arow, .arow-head {
+  display: grid; align-items: center; gap: var(--cs-row-gap); padding: var(--cs-row-pad);
+  font-size: var(--fs-md);
+  grid-template-columns: 28px 30px minmax(200px, 2.4fr) 150px;   /* JS overwrites */
+}
+/* `top` is the MEASURED height of .cs-bar, not a literal. Both this and the bar
+   are sticky at the top of the same scroll container, and the bar's z-index
+   (140) is load-bearing for .pop-scrim - so it cannot be lowered to let the
+   header win. Parking the header below the bar is the only fix that keeps both.
+   A hardcoded px would desync the moment the bar changes height, which it does
+   on its own: adding a filter chip wraps it to a second line. syncBarOffset()
+   in channel-search.js re-measures on every render and on resize. */
+.arow-head {
+  font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: .05em; color: var(--text-faint);
+  border-bottom: 1px solid var(--border); position: sticky; top: var(--cs-bar-h, 0px); background: var(--bg2); z-index: 2;
+  overflow-x: hidden;
+}
+.arow { border-bottom: 1px solid var(--border-soft); cursor: pointer; }
+.arow:hover { background: var(--bg3); }
+.arow.in-guide { background: rgba(var(--ok-rgb),.06); }
+.arow.in-guide:hover { background: rgba(var(--ok-rgb),.12); }
+/* A removed row is dimmed AND struck through - both, not a choice between
+   them. The strike is the font colour, not a coloured line. */
+.arow.is-removed { opacity: .62; }
+.arow.is-removed .a-name { text-decoration: line-through; }
+
+.acell { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.acell.num { text-align: right; font-variant-numeric: tabular-nums; }
+/* A header cell is NOT an .acell, so without this nothing right-aligns the
+   label over a right-aligned number (BUGS.md 2026-07-30, dev/changelog/390).
+   Copied from style.css `.list-head .num`; both halves matter - justify-self
+   places the grid item, text-align places the text inside it. */
+.arow-head .num { justify-self: end; text-align: right; }
+.a-name { font-weight: 500; color: inherit; }
+.a-name:hover { color: var(--accent); text-decoration: none; }
+.a-name mark { background: rgba(var(--warn-rgb),.32); color: inherit; border-radius: var(--radius-sm); padding: 0 1px; }
+/* The floor the old minmax() track used to provide: a frozen/fit-content track
+   takes its minimum from the item, so without this the column could collapse
+   under a page of short names. It lives on the cell because .acell sets
+   min-width: 0 for the ellipsis and that has to stay. */
+.a-namecell { display: flex; align-items: center; gap: .4rem; min-width: 190px; }
+/* The name is the only shrinkable item in this cell - a `.badge` has no overflow of
+   its own, so its minimum size is its own text - which means the name is what gives
+   way when the badges outgrow the column, and it gives way all the way to zero. A row
+   that has lost its channel name has lost the thing it is a row ABOUT, so it keeps a
+   floor and the badges are clipped instead; their full text is in their tooltips.
+   Measured at 0px wide on a real row before this existed (BUGS.md 2026-08-20 09:12). */
+.a-namecell .a-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 3rem; }
+.a-logo {
+  width: 26px; height: 26px; border-radius: var(--radius-sm); background: var(--bg3); border: 1px solid var(--border);
+  display: flex; align-items: center; justify-content: center; font-size: var(--fs-sm); font-weight: 600;
+  color: var(--text-muted); flex-shrink: 0; cursor: pointer; overflow: hidden;
+}
+.a-logo img { max-width: 100%; max-height: 100%; object-fit: contain; }
+.arow .acct-dot, .arow-head .acct-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; cursor: help; display: inline-block; }
+.a-mono { font-family: var(--font-mono); font-size: var(--fs-sm); color: var(--text-muted); }
+/* The row action is ALWAYS visible. A control you cannot see is a control you
+   cannot find, and on a 136,000-row list that is every row. */
+.a-act { display: flex; gap: .3rem; justify-content: flex-end; }
+.arow input { accent-color: var(--accent); }
+
+/* Sortable headers, same affordance as the recordings list. Only the SORTS
+   registry's keys get this class - four columns look sortable and are not
+   (DESIGN-channel-search.md 7). */
+.arow-head .sortable { cursor: pointer; user-select: none; }
+.arow-head .sortable:hover { color: var(--text); }
+.arow-head .sortable.sorted { color: var(--accent-text); }
+.sort-ind { font-size: var(--fs-3xs); margin-left: 3px; }
+
+/* "Why it matched": makes a non-name hit legible instead of mysterious. */
+.why {
+  font-size: var(--fs-xs); font-weight: 600; border-radius: 999px; padding: 0 5px;
+  background: var(--warn-soft); color: var(--warn); font-family: var(--font-mono); cursor: help;
+}
+/* The survivor of a duplicate cluster says WHY it is the one that survived. */
+.kept { font-size: var(--fs-xs); font-weight: 700; border-radius: 999px; padding: 0 5px; background: var(--ok-soft); color: var(--ok); cursor: help; }
+.a-airing { font-size: var(--fs-xs); color: var(--text-muted); }
+.a-airing .ai-k { color: var(--text-faint); font-family: var(--font-mono); font-size: var(--fs-xs); }
+
+/* Floating selection bar - the selection survives a filter change, so this is
+   not scoped to a page of results. */
+.sel-float-bar {
+  display: none; gap: .5rem; flex-wrap: wrap; align-items: center;
+  position: sticky; bottom: 16px; z-index: 130;
+  background: var(--bg2); border: 1px solid var(--border); border-radius: var(--radius);
+  box-shadow: var(--shadow-pop); padding: 10px 14px; margin: 10px 0;
+}
+.sel-float-bar.show { display: flex; }
+.sel-float-bar .sel-note { font-size: var(--fs-sm); color: var(--warn); }
+/* The notes are written as text, not toggled, and there are two of them - so an empty one
+   sitting between the buttons would still take a flex gap of its own. */
+.sel-float-bar .sel-note:empty { display: none; }
+/* The action context leads the bar and is fenced off from the generic actions,
+   because it is the reason the user is on this page and the others are not. */
+.sel-ctx { display: flex; align-items: center; gap: .4rem;
+  padding-right: .6rem; border-right: 1px solid var(--border); }
+.sel-ctx-lbl { font-size: var(--fs-sm); color: var(--text-muted); }
+
+/* Paging is the only architecture here: client-side filtering of a loaded page
+   can only ever see 100 of 136,130 channels, so its counts would be a guess. */
+.pager { margin-top: 1rem; display: flex; gap: .5rem; align-items: center; flex-wrap: wrap; }
+.pager .pg-lbl { font-size: var(--fs-sm); color: var(--text-muted); }
+.cs-empty .es-hint { font-size: var(--fs-sm); color: var(--text-faint); margin-top: .5rem; line-height: 1.5; }
+/* At phone width the way to widen the scope is a sheet, so this sentence carries the
+   control rather than pointing at a search box that no longer holds one. */
+.cs-empty .es-hint u { cursor: pointer; text-decoration-style: dotted; color: var(--accent-text); }
+
+/* The results area's own loading state, sibling to the empty state above and shown
+   in the same place for the same reason: something has to occupy the results card
+   while it holds nothing. Which requests put this up, and why the two cases are
+   timed differently, is DESIGN-channel-search.md §12.2. */
+.cs-loading { display: flex; align-items: center; justify-content: center; gap: 10px;
+  padding: 48px 16px; color: var(--text-faint); font-size: var(--fs-lg); }
+.cs-loading-spin { flex: none; width: 18px; height: 18px; }
+
+/* ════════════════════════════════════════════════════════════════════
+   PHONE AND TABLET
+
+   The approved phone design is dev/mockups/22-channel-search-mobile.html
+   (three rounds; dev/changelog/392-394). Read those before changing anything
+   below - most of it is a decision, not a size.
+
+   ONE page serves both widths. What differs is only how the same state is
+   drawn, so the seam is `isMobile()` in channel-search.js (matchMedia, one
+   spelling) and this block; there is no second template and no second module.
+
+   The rail is NOT display:none'd into existence down here - renderRail()
+   simply does not build it below the breakpoint, and this hides the empty
+   shell. Mockup 22's "the rail is deleted" decision is about there being no
+   SECOND filter surface at a width where the rail and + Filter are the same
+   thing; a hidden-but-populated rail would leave a duplicate set of controls
+   in the accessibility tree saying otherwise.
+   ════════════════════════════════════════════════════════════════════ */
+/* ════════════════════════════════════════════════════════════════════
+   THE AIRING GRAIN (dev/changelog/414)
+
+   The second of the two result shapes this one page serves. Everything here is
+   additive: nothing above changes, because the channel grain's rendering did not.
+   ════════════════════════════════════════════════════════════════════ */
+
+/* ── The grain selector ──────────────────────────────────────────────
+   ONE spelling at both widths (dev/changelog/811), replacing the desktop tab strip and
+   the phone segmented strip that came before it. The tab strip's four predecessors were
+   all rejected for one reason - at every coordinate the control that changes what a ROW
+   IS carried the same weight as "all words / any word" - and the fix was to spend real
+   estate rather than move it a fifth time: the question is asked in words, and the two
+   answers are pills under it, at the top of the search zone (dev/changelog/807).
+
+   Everything here is a token. The pill takes .btn's height and .badge's 999px radius;
+   the track is --bg0 inside the panel's own border. */
+.grainask-lbl {
+  font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: .07em;
+  color: var(--accent-text); font-weight: 600; margin-bottom: 7px;
+}
+.grainpills {
+  display: inline-flex; gap: 4px; padding: 4px; border-radius: 999px;
+  background: var(--bg0); border: 1px solid var(--border);
+}
+.grainpill {
+  display: inline-flex; align-items: center; gap: 7px; height: var(--ctl-h);
+  padding: 0 18px; border: none; border-radius: 999px; background: none; cursor: pointer;
+  font-family: inherit; font-size: var(--fs-lg); font-weight: 600; color: var(--text-muted);
+}
+.grainpill:hover { background: var(--bg2); color: var(--text); }
+.grainpill.on { background: var(--accent); color: var(--accent-contrast); }
+/* DESIGN.md §4's glyph rule has a page-scoped exception for this page's own chrome and
+   names these pills: the rule governs controls that ACT, and a grain pill performs no
+   work (dev/changelog/809). */
+.gp-ico { font-size: var(--fs-md); }
+/* An id selector beats `.grainslot:empty`, so the slot restates it at its own
+   specificity - otherwise an empty slot keeps its margin and pushes the search zone down
+   by a row's worth of nothing. */
+.grainslot:empty, #grainslot-panel:empty { display: none; }
+#grainslot-panel { display: block; margin-bottom: 12px; }
+
+/* ── The search zone as one panel ────────────────────────────────────
+   The question, the box and the filter row are drawn inside one card so the three read
+   as one thing being filled in rather than as four unrelated bands of chrome. The border
+   and radius are .card's and the tint is the accent at two alphas (`-soft`'s single
+   opacity cannot make a gradient, which is what the `-rgb` triplet is for).
+
+   A DESKTOP DEVICE, and it stops at the breakpoint - see the ≤768 block. */
+.cs-bar.nav-panel {
+  border: 1px solid var(--border); border-radius: var(--radius);
+  background-color: var(--bg1);
+  background-image: linear-gradient(160deg, rgba(var(--accent-rgb), .10), rgba(var(--accent-rgb), 0) 62%);
+  padding: 14px 16px 4px; margin-top: 0;
+}
+/* The panel supplies the zone's edge up here, so the well drops its own dashed box -
+   what identifies the row is the "Filters" label at its head instead. The border moves
+   rather than disappearing; below the breakpoint the well takes it back. */
+.cs-bar.nav-panel .well { border: none; padding: 0; min-height: 0; margin-bottom: 10px; }
+/* The toolbar row is empty in this layout and collapses rather than sitting there as a
+   12px gap: its + Filter is the well's chip-shaped hole, Saved searches is on the search
+   line, and Clear all is at the end of the row it clears. #addfpw stays in the DOM
+   because it anchors #fb-pop, which is real page markup. */
+.cs-bar.nav-panel .tbar { display: none; }
+
+/* ── Match mode, joined to the box's left edge ───────────────────────
+   One control rather than two halves, sharing the box's border, with the button's right
+   corners and the box's left corners squared off so the line between them is single.
+
+   TWO THINGS IT OWES THE BOX IT IS JOINED TO. It must be exactly as TALL - .sbox is
+   min-height: var(--ctl-h) and grows with its padding, so the button takes its height
+   from the line rather than restating --ctl-h and coming up short. And it has to read as
+   a control rather than as more box: --bg3 is the deepest surface in the palette against
+   the box's --bg1, so the join is visible without the button claiming the accent, which
+   everywhere else in this app means "on". */
+#wjoin-left:empty { display: none; }
+#wjoin-left { display: inline-flex; flex: none; align-self: stretch; }
+#wjoin-left .menu-wrap { display: inline-flex; }
+#wjoin-left .btn.wjoin {
+  height: auto; align-self: stretch; background: var(--bg3); color: var(--text);
+  font-weight: 600; padding: 0 12px; white-space: nowrap;
+  border-top-right-radius: 0; border-bottom-right-radius: 0;
+  /* The line's own gap PLUS the 1px the two borders overlap by. Without the gap term the
+     two sit 8px apart and read as two controls, which is what a browser pass caught after
+     the first port - a shared border is the whole point of the joined spelling. */
+  margin-right: calc(-1 * var(--sline-gap) - 1px);
+  position: relative; z-index: 1;
+}
+#wjoin-left .btn.wjoin:hover { background: var(--bg2); border-color: var(--text-faint); }
+.sline.joined .sbox { border-top-left-radius: 0; border-bottom-left-radius: 0; }
+/* Saved searches sits on the search line rather than in the toolbar, so it takes the
+   height .tbar .btn used to give it there. It stays at --ctl-h rather than stretching
+   like the joined control: it is a button BESIDE the box, not part of it, and DESIGN.md
+   §3.5 gives a control on a bar that height. */
+#sf-wrap { align-self: center; }
+#sf-wrap .btn { height: var(--ctl-h); }
+
+/* The count line moved into the results card, so it is that list's own meta line rather
+   than the last row of the search chrome. */
+.cb-all .cs-count { margin-top: 0; margin-bottom: .5rem; }
+
+/* ── The airing row ──────────────────────────────────────────────────
+   The pinned cell is the PROGRAM: title, sub-title and the why-chip, wrapping onto
+   two lines exactly as the channel cell carries the name plus its badges. */
+.a-progcell { flex-wrap: wrap; row-gap: 1px; }
+.a-ptitle { font-weight: 500; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.a-ptitle mark, .a-psub mark, .ac-title mark {
+  background: rgba(var(--warn-rgb),.32); color: inherit; border-radius: var(--radius-sm); padding: 0 1px; }
+.a-psub { flex-basis: 100%; font-size: var(--fs-xs); color: var(--text-muted);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* The When cell is three stacked facts - the day, the range, and how soon - because
+   a single line of times down a long list reads as one run of numbers. */
+.a-whencell { white-space: normal; }
+.a-when { display: flex; flex-direction: column; line-height: 1.25; cursor: help; }
+.aw-day { font-size: var(--fs-xs); color: var(--text-faint); text-transform: uppercase; letter-spacing: .04em; }
+.aw-time { font-variant-numeric: tabular-nums; }
+.aw-rel { font-size: var(--fs-xs); color: var(--text-faint); }
+.aw-rel.now { color: var(--live); font-weight: 700; }
+.a-when.on-now .aw-time { color: var(--live); font-weight: 600; }
+.a-when.is-past { opacity: .7; }
+
+/* A showing already on air is marked on the row, not only in its When cell -
+   "what is on right now" is one of the two questions this grain exists for. */
+.arow-air.is-onnow { box-shadow: inset 2px 0 0 var(--live); }
+/* An ended showing is dimmed the same way a provider-removed channel is, and for the
+   same reason: it is still a real row, it is just not one you can act on. It is only
+   ever here because "Show airings that have ended" is on. */
+.arow-air.is-past { opacity: .62; }
+.a-desc { color: var(--text-muted); }
+
+/* ════════════════════════════════════════════════════════════════════
+   CHANNEL GROUPS AS ROWS (dev/changelog/811)
+
+   A group is a row kind of its own on the channel grain, and on the airing grain the
+   collapse survivor is drawn as the group it stands for. It is legible as one from
+   THREE cues, and all three are vocabulary this app already has - the proposal
+   deliberately adds no color, no radius and no type size
+   (DESIGN-group-search-rows.md §5.2):
+
+     * a 2px inset left edge, the idiom .arow-air.is-onnow above already uses - the
+       accent rather than --live, because this is an identity and not a live state;
+     * a stacked logo tile, which is a SHAPE difference rather than a new color;
+     * a `.badge b-auto` pill, the same component the "In guide via X" badge uses.
+
+   A fourth cue, if one is ever wanted, comes out of DESIGN.md §1/§3 too.
+   ════════════════════════════════════════════════════════════════════ */
+.arow.is-group {
+  box-shadow: inset 2px 0 0 var(--accent);
+  background: rgba(var(--accent-rgb), .045);
+}
+.arow.is-group:hover { background: rgba(var(--accent-rgb), .09); }
+/* On now beats group identity on the left edge: that edge means a live state everywhere
+   else in this app, and the row already says "group" three other ways. */
+.arow.arow-air.is-onnow.is-group { box-shadow: inset 2px 0 0 var(--live); }
+/* The name cell wraps for the "via <member>" line the way .a-progcell already wraps for
+   a program's sub-title - the same rule, not a second one. */
+.a-namecell.is-groupcell { flex-wrap: wrap; row-gap: 1px; }
+/* Reads exactly like .a-psub, because it is the same kind of thing: the quieter half of
+   a two-line identity. */
+.gvia {
+  flex-basis: 100%; font-size: var(--fs-xs); color: var(--text-muted);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; cursor: help;
+}
+.gvia .gvia-k { color: var(--text-faint); }
+/* Two offset squares inside the existing 26px .a-logo footprint: a group is more than
+   one channel, said as shape. The offset square uses --bg3 (the deepest surface) rather
+   than --bg1 and clears the tile by 4px - at --bg1 on a tinted row it was only visible
+   under magnification. */
+.a-logo.is-grouplogo { position: relative; overflow: visible; background: var(--bg2); }
+.a-logo.is-grouplogo::before {
+  content: ''; position: absolute; left: -4px; top: -4px; width: 26px; height: 26px;
+  border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--bg3);
+  z-index: -1;
+}
+/* The checkbox track on a row that has no checkbox. A group is not selectable - every
+   action on the selection bar is a channel action - and the dot plus its tooltip is what
+   says so in the place the tick would have been. */
+.a-nosel { color: var(--text-faint); text-align: center; cursor: help; user-select: none; }
+
+/* ── The two `when` values you fill in ───────────────────────────────
+   Each sits UNDER the value it belongs to, indented so the pairing is visible
+   without a connector. Dimmed until it holds something, because an empty control is
+   not a window and its row is not filtering. */
+.when-fill { display: flex; flex-direction: column; gap: 3px; padding: 3px 4px 6px 10px;
+  border-left: 2px solid var(--border); margin: 0 0 2px 6px; opacity: .72; }
+.when-fill.on { opacity: 1; border-left-color: var(--accent); }
+.wf-l { font-size: var(--fs-xs); color: var(--text-faint); text-transform: uppercase; letter-spacing: .05em; }
+.wf-c { display: flex; gap: 4px; align-items: center; }
+.wf-c input, .wf-c select {
+  background: var(--bg0); border: 1px solid var(--border); border-radius: var(--radius-sm);
+  color: var(--text); font-family: inherit; font-size: var(--fs-sm); padding: 3px 5px; min-width: 0;
+}
+.wf-c input:focus, .wf-c select:focus { outline: none; border-color: var(--accent); }
+.wf-n { width: 58px; }
+.wf-u { flex: 1; }
+.wf-range { flex-direction: column; align-items: stretch; }
+.fac-note { font-size: var(--fs-xs); color: var(--text-faint); padding: 2px 4px 4px; line-height: 1.35; }
+
+/* ── A parked filter chip ────────────────────────────────────────────
+   A filter belonging to the other tab: kept visible rather than hidden, because the
+   URL still carries it and a filter nothing on screen shows is exactly the silent
+   behavior this project forbids. Struck through and dimmed IS the announcement,
+   which is why neither direction of a grain flip is toasted. */
+.cs-chip.parked { opacity: .55; }
+.cs-chip.parked .ck, .cs-chip.parked .cop, .cs-chip.parked .cv { text-decoration: line-through; }
+
+/* "Your sort could not come with you", in the count line. Styled like the
+   standing-option disclosures beside it, because it is the same kind of statement:
+   something was decided for you, and here it is. */
+.cs-count .sortnote { color: var(--warn); cursor: help; border-bottom: 1px dotted var(--warn); }
+
+/* A kebab-sheet row that names a state rather than offering an action. */
+.cs-sheet .prow.off { opacity: .55; cursor: default; }
+
+@media (max-width: 900px) {
+  /* 769-900 only, in practice: below 769 the rail is not built at all. The rail
+     stops being a rail and becomes a band above the results; collapsed it still
+     collapses, to a full-width strip. */
+  /* `align-items` has to be reset WITH the direction, never after it: flipping the
+     axis reassigns what that property controls. In a row it aligns heights, where
+     flex-start is what stops the rail stretching to the length of the results; in a
+     column it aligns WIDTHS, where flex-start makes .cs-main shrink-to-fit around the
+     widest thing inside it - the table's grid - so the results box grows past the
+     viewport and takes the search bar and the rail sideways with it. Everything below
+     .cs-main is already prepared to contain that width (min-width:0 down the chain,
+     #ch-list scrolling on its own); this is the one link that was handing it upward
+     instead. .rail carries align-self:flex-start of its own, so it does not inherit
+     this and its width:100% below stays load-bearing (dev/changelog/863). */
+  .cs-wrap { flex-direction: column; align-items: stretch; }
+  .rail, .rail.collapsed { width: 100%; }
+  .rail.collapsed .fac { display: none; }
+}
+
+@media (max-width: 768px) {
+  .rail { display: none; }
+
+  /* ── THE PANEL IS A DESKTOP DEVICE AND STOPS HERE ─────────────────
+     What it buys up there is grouping - four rows that would otherwise read as four
+     unrelated bands of chrome - and at 375px the viewport does that grouping on its
+     own. Worse, the card fights the layout it wraps: .cs-stick below is sticky with
+     its own var(--bg0) fill, so it paints a solid dark block across a tinted,
+     bordered card, inset by that card's padding and misaligned with its edges.
+     Flattened here, the search zone is the plain one (dev/changelog/809). */
+  .cs-bar.nav-panel {
+    border: none; border-radius: 0; padding: 0;
+    background-color: transparent; background-image: none;
+  }
+  /* The border moves, it does not disappear: with no panel drawing the zone's edge,
+     the filter row takes back the dashed box .well carries by default. */
+  .cs-bar.nav-panel .well {
+    border: 1px dashed var(--border); padding: 7px 9px; min-height: 42px;
+  }
+
+  /* ── The grain selector at phone width ────────────────────────────
+     The two pills become two halves of one full-width control - the shape the page
+     has always given this question down here - wearing the panel's own pill styling
+     rather than a second component.
+
+     THE HEIGHT IS A FLOOR, NOT A FIXED HEIGHT, and the glyph tracks the label.
+     `Search Programs (EPG)` is long enough to wrap at 375px once the pill also has
+     to carry an emoji, and --ctl-h held the box at 36px while the second line
+     spilled out of it. The glyph was also the one thing never scaled down with the
+     pill: .gp-ico is a fixed --fs-md, so below 480 it rendered LARGER than the label
+     it labels, and an emoji's advance is wider than its nominal size. Both pills
+     then grow together, because flex stretches the sibling to the tallest. */
+  .grainpills { display: flex; }
+  .grainpill {
+    flex: 1; justify-content: center; padding: 5px 8px; gap: 5px;
+    font-size: var(--fs-md); text-align: center;
+    height: auto; min-height: var(--ctl-h);
+  }
+  .gp-ico { font-size: 1em; }
+
+  /* MATCH MODE AND SAVED SEARCHES LEAVE THE SEARCH LINE, exactly as their
+     predecessors did. Match mode is a .btn joined to the box rather than a .seg, so the
+     old `.sline .seg` rule no longer reaches it and it is hidden here by name; it is
+     RE-RENDERED as a full-width segment at the top of the Searching-in sheet, and Saved
+     searches is re-rendered in the chip row. One live copy of each, at each width. */
+  #wjoin-left, #sf-wrap, #sf-current, #sf-dirty { display: none; }
+  .sline.joined .sbox { border-radius: var(--radius); }
+
+  /* The airing card: same grid as the channel card - same checkbox, same 30px cell,
+     same kebab - so flipping the tab changes the contents and not the shape. The
+     title takes the full width and wraps; the sub-title is part of that identity
+     block rather than a field of its own, because it is what tells two showings of
+     one program apart. */
+  .acard.is-onnow { box-shadow: inset 2px 0 0 var(--live); }
+  .acard.is-past { opacity: .62; }
+
+  /* ── The group CARD ───────────────────────────────────────────────
+     The desktop row's three cues applied to the card component this list already
+     uses. No new color, no new component, and the same reason each cue is there.
+     (dev/changelog/808, 811) */
+  .ccard.is-group {
+    box-shadow: inset 2px 0 0 var(--accent);
+    background: rgba(var(--accent-rgb), .045);
+    border-radius: var(--radius-sm);
+  }
+  /* On now beats group identity on the left edge, exactly as on the desktop row. */
+  .ccard.acard.is-onnow.is-group { box-shadow: inset 2px 0 0 var(--live); }
+  /* The same offset-square tile, inside the card's 30px logo footprint rather than
+     the row's 26px one. */
+  .cc-logo.is-grouplogo { position: relative; overflow: visible; background: var(--bg2); }
+  .cc-logo.is-grouplogo::before {
+    content: ''; position: absolute; left: -4px; top: -4px; width: 30px; height: 30px;
+    border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--bg3);
+    z-index: -1;
+  }
+  /* A group card has no checkbox, so its first track holds the dot that says why. */
+  .ccard .a-nosel { padding-top: 2px; }
+  .ac-title { display: block; }
+  .ac-sub { display: block; font-size: var(--fs-sm); font-weight: 400; color: var(--text-muted); }
+  /* Stacked rather than in a row: at 375 a day, a range and a countdown side by side
+     wrap mid-value, and the countdown is the part that ends up orphaned. */
+  .cc-rows .a-when { display: inline-flex; flex-direction: row; flex-wrap: wrap; gap: 0 5px; }
+  .cc-rows .aw-day { font-size: var(--fs-xs); }
+
+  /* ── What sticks, and what deliberately does not ──────────────────
+     The box and the chip row stick; the well and the count line do not.
+     The well is variable-height by construction - three filters is three
+     lines at this width - so sticking it would hand a phone a chrome band
+     that grows to a third of the viewport. The disclosure rule is still met:
+     what a standing option hides is named in the count line, which is the
+     first thing under the box on first paint. */
+  .cs-bar { position: static; padding: 0; margin-top: 0; border-bottom: none; }
+  /* .topnav is itself sticky at top: 0, so this parks directly under it via the
+     shared --topnav-h token (style.css) rather than restating its height. */
+  .cs-stick { position: sticky; top: var(--topnav-h); z-index: 130; background: var(--bg0);
+    padding: 6px 0 8px; }
+  .searchzone { margin-bottom: 0; }
+
+  /* 16px is the floor that stops iOS Safari zooming the viewport on focus, and a
+     search box that zooms the page is worse than one a pixel off the scale. */
+  .sbox input { font-size: 16px; height: auto; padding: 7px 0; min-width: 0; }
+  .rsearch, .pop-search { font-size: 16px; height: var(--ctl-h); }
+
+  /* ── The chip row: every entry point on one line (DESIGN.md 9.4) ──
+     It replaces the toolbar rather than joining it: Saved, Clear all and the
+     + Filter button are all in here, and two copies of one control is how the
+     two disagree. #tbar keeps the desktop popovers' .menu-wraps, which is why
+     it is hidden rather than emptied. */
+  .tbar { display: none; }
+  .chiprow { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; margin-top: 8px; }
+  .mchip { display: inline-flex; align-items: center; gap: 6px; font: inherit; font-size: var(--fs-sm);
+    font-weight: 600; cursor: pointer; border-radius: 999px; border: 1px solid var(--border);
+    background: var(--bg2); color: var(--text-muted); padding: 6px 12px; min-height: 34px; }
+  .mchip.on { background: var(--accent-soft); border-color: var(--accent); color: var(--accent-text); }
+  /* One count pill, used both inside a chip and on the Filters sheet's dimension
+     rows. Unscoped on purpose - two that drift is the failure here. */
+  .mn { font-size: var(--fs-xs); font-weight: 700; font-variant-numeric: tabular-nums;
+    background: var(--accent); color: var(--accent-contrast); border-radius: 999px; padding: 0 6px; flex: none; }
+  .mchip.on .mn { background: var(--accent-text); }
+  .mn.hasneg { background: var(--bad); color: #2a0b0a; }
+  .chiprow .push { margin-left: auto; }
+  /* Clear all is the one entry on this row that is a .btn rather than a .mchip,
+     so it does not inherit the 34px floor above and measured 27.4px in a browser
+     - a sub-minimum tap target sitting between two compliant ones (3.9). */
+  .chiprow .btn { min-height: 34px; }
+
+  /* The pill is a finger target down here, not the desktop's 26px mouse target
+     - 3.9 does not allow buying fit out of tap targets. */
+  .fadd { min-height: 34px; padding: 0 13px; border-radius: 999px; }
+  .cs-chip { height: auto; min-height: 30px; max-width: 100%; }
+  .cs-chip .cx { padding: 4px 6px; }
+  .well { margin-top: 9px; }
+
+  /* Two danger buttons competing with the search box for the top of the screen;
+     they are page-level actions rather than search controls, so at this width
+     they are overflow behind the header's kebab (mockup 22 decision 6). */
+  .missing-bar { display: none; }
+  .page-head .page-kebab { display: inline-flex; }
+
+  /* ── One card per channel, not a table row ───────────────────────
+     THE NAME IS NEVER TRUNCATED (9.4) - it takes the card's full width and
+     wraps. Every track is a fixed length or an fr, for the same reason the
+     desktop grid's are: a content-dependent track sizes itself per card and the
+     logos stop lining up down the list. */
+  .arow-head { display: none; }
+  .select-btns { flex-wrap: wrap; }
+  .select-btns .menu-wrap { margin-left: auto; }
+
+  .ccard { display: grid; grid-template-columns: 22px 30px minmax(0,1fr) 34px; gap: 0 9px;
+    padding: 11px 3px; border-bottom: 1px solid var(--border-soft); }
+  .ccard:last-child { border-bottom: none; }
+  .ccard.in-guide { background: rgba(var(--ok-rgb),.06); border-radius: var(--radius-sm); }
+  .ccard.is-removed { opacity: .62; }
+  .ccard.is-removed .cc-name { text-decoration: line-through; }
+  .ccard input[type=checkbox] { accent-color: var(--accent); width: 20px; height: 20px; margin-top: 1px; }
+  .cc-logo { width: 30px; height: 30px; border-radius: var(--radius-sm); background: var(--bg3);
+    color: var(--text-muted); display: flex; align-items: center; justify-content: center;
+    font-size: var(--fs-md); font-weight: 700; overflow: hidden; }
+  .cc-logo img { max-width: 100%; max-height: 100%; object-fit: contain; }
+  .cc-body { grid-column: 3; display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+  .cc-name { font-size: var(--fs-base); font-weight: 500; color: var(--text); overflow-wrap: anywhere; }
+  .cc-name mark { background: rgba(var(--warn-rgb),.32); color: inherit; border-radius: var(--radius-sm); padding: 0 1px; }
+  .cc-badges { display: flex; align-items: center; gap: 5px; flex-wrap: wrap; }
+  /* Aligned to the TOP of the card so it sits beside the first line of the name
+     however many lines the name wraps to. */
+  .cc-kebab { grid-column: 4; grid-row: 1; align-self: start; justify-self: end;
+    width: 34px; min-height: 34px; padding: 0; border: none; background: none; cursor: pointer;
+    color: var(--text-faint); font: inherit; font-size: var(--fs-xl); line-height: 1; }
+
+  /* THE CARD BODY: labeled rows on two fixed tracks (mockup 22 round 3,
+     from four candidate arrangements). The labels line up down the whole list,
+     which is the column alignment a phone card usually throws away - and
+     throwing it away is most of why round 1's card read as noise: five values on
+     one unlabeled mono line with nothing saying which was which.
+     Nothing here truncates; a long value wraps inside its own track. */
+  .cc-rows { display: grid; grid-template-columns: 58px minmax(0,1fr); gap: 3px 8px;
+    align-items: baseline; }
+  .cc-rows .cr-l { font-size: var(--fs-2xs); text-transform: uppercase; letter-spacing: .06em;
+    color: var(--text-faint); font-weight: 700; }
+  .cc-rows .cr-v { font-size: var(--fs-md); color: var(--text-muted); min-width: 0; overflow-wrap: anywhere; }
+  .cc-rows .cr-v .h-mini { font-size: var(--fs-sm); }
+  .cc-rows .cr-v mark { background: rgba(var(--warn-rgb),.32); color: inherit; border-radius: var(--radius-sm); padding: 0 1px; }
+
+  /* ── The selection bar, fixed to the bottom (DESIGN.md 9.5's form) ─
+     THREE REAL BUTTONS, which diverges from mockup 22's two-plus-a-kebab and
+     is a smaller change than it sounds: that kebab existed to fit three LONG
+     labels beside the out-of-view note. Giving the note its own line and
+     shortening the labels (updateSelectionUI writes the short spelling below
+     the breakpoint) buys the same room without putting an action behind a
+     second tap. */
+  .sel-float-bar { position: fixed; left: 0; right: 0; bottom: 0; z-index: 150;
+    margin: 0; border-radius: 0; border-left: none; border-right: none; border-bottom: none;
+    padding: 9px 12px calc(9px + env(safe-area-inset-bottom, 0px)); gap: .4rem; }
+  .sel-float-bar .btn { flex: 1; justify-content: center; min-height: 40px; }
+  /* Both of these are their own full-width line: the note is what keeps
+     "the selection survives a filter change" honest, so it may never be the
+     thing squeezed out at 375. */
+  .sel-float-bar .sel-note, .sel-float-bar .sel-ctx { flex: 0 0 100%; }
+  .sel-ctx { padding-right: 0; border-right: none; padding-bottom: .4rem;
+    border-bottom: 1px solid var(--border); }
+  .sel-ctx .btn { flex: none; }
+  /* The bar is fixed, so the pager has to clear it rather than sit under it. */
+  body.has-selbar .main { padding-bottom: 96px; }
+
+  /* ── Sheets are buildModal() panels (9.6) ─────────────────────────
+     style.css's own <=768px block is what makes .modal-panel a bottom sheet;
+     everything here is content styling INSIDE one. There is deliberately no
+     second overlay component on this page. */
+  .cs-sheet .modal-body { padding: 8px 16px 14px; }
+  .cs-sheet .prow { padding: 9px 2px; font-size: var(--fs-lg); min-height: 44px;
+    border-bottom: 1px solid var(--border-soft); border-radius: 0; }
+  .cs-sheet .prow:last-child { border-bottom: none; }
+  .cs-sheet .prow:hover { background: none; }
+  .cs-sheet .prow.sel-on { background: rgba(var(--accent-rgb), .08); }
+  .cs-sheet .prow .pico { width: 18px; text-align: center; flex: none; color: var(--text-faint); }
+  .cs-sheet .prow .pchev { color: var(--text-faint); flex: none; font-size: var(--fs-lg); }
+  .cs-sheet .prow.drill { cursor: pointer; }
+  .cs-sheet .pnote, .cs-sheet .sh-note { font-size: var(--fs-sm); color: var(--text-faint);
+    line-height: 1.5; padding: 10px 0 6px; border-top: none; margin-top: 0; }
+  .cs-sheet .sh-note code, .cs-sheet .pnote code { font-family: var(--font-mono);
+    background: var(--bg0); border-radius: var(--radius-sm); padding: 0 4px; color: var(--text-muted); }
+  .cs-sheet .sh-back { background: none; border: none; color: var(--accent-text); font: inherit;
+    font-size: var(--fs-sm); font-weight: 600; cursor: pointer; padding: 6px 2px 8px; }
+  .cs-sheet .psep { margin: 10px 0; }
+  /* The pair has to clear 3.9, so it is bigger than the rail's. */
+  .cs-sheet .tri button { font-size: var(--fs-lg); width: 34px; height: 30px; padding: 0; }
+  .cs-sheet .fac-more { font-size: var(--fs-sm); padding: 10px 2px; }
+  .cs-sheet .fac-make { border: 1px solid var(--border); border-radius: 999px;
+    padding: 5px 11px; margin-left: 0; }
+  .cs-sheet .switch { width: 40px; height: 22px; }
+  .cs-sheet .fgroup { display: flex; align-items: baseline; gap: 6px; font-size: var(--fs-xs);
+    text-transform: uppercase; letter-spacing: .07em; color: var(--text-faint); padding: 14px 2px 4px; }
+  .cs-sheet .fgroup:first-child { padding-top: 4px; }
+  .cs-sheet .fgroup .fex { margin-left: auto; }
+  /* Full width: two equal halves is the only spelling that reads as one control
+     at 375. */
+  .cs-sheet .seg { display: flex; width: 100%; height: auto; margin: 4px 0 2px; }
+  .cs-sheet .seg button { flex: 1; font-size: var(--fs-md); font-weight: 600; padding: 9px 6px; }
+  /* The standing options are this sheet's FOOTER, below the facets - round 7's rail
+     order re-expressed: what you touch every search first, what you set once last. */
+  .cs-sheet .st-block { border-top: 1px solid var(--border); margin-top: 14px; padding-top: 12px; }
+  .cs-sheet .st-block h4 { font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: .07em;
+    color: var(--text-faint); display: flex; align-items: center; gap: 6px; margin-bottom: 7px; }
+  .cs-sheet .st-block h4 .scnt { margin-left: auto; font-family: var(--font-mono); font-size: var(--fs-xs); }
+  .cs-sheet .st-tog { gap: 9px; padding: 10px 11px; min-height: 44px; font-size: var(--fs-md); }
+  .cs-sheet .rclr { background: none; border: none; color: var(--accent-text); font: inherit;
+    font-size: var(--fs-sm); font-weight: 600; cursor: pointer; padding: 4px 2px; }
+  /* Sort rows: mockup 03's sort menu, which is 9.4's own reference. */
+  .cs-sheet .sort-opt { display: flex; align-items: center; gap: 10px; padding: 11px 2px;
+    font-size: var(--fs-lg); cursor: pointer; border-bottom: 1px solid var(--border-soft); min-height: 44px; }
+  .cs-sheet .sort-opt:last-of-type { border-bottom: none; }
+  .cs-sheet .sort-opt .pv { flex: 1; }
+  .cs-sheet .sort-opt .dir { font-size: var(--fs-sm); color: var(--text-faint); }
+  .cs-sheet .sort-opt.on-field { background: var(--accent-soft); border-radius: var(--radius-sm); }
+  .cs-sheet .sort-opt.on-field, .cs-sheet .sort-opt.on-field .dir { color: var(--accent-text); }
+  .cs-sheet .sort-opt .arrow { font-size: var(--fs-xs); width: 12px; text-align: center; }
+
+  /* ── Suggestions: ONE pane ────────────────────────────────────────
+     The scope pane became a sheet, so what is left under the box is the
+     suggestion rows plus two footers - the syntax help, and a line naming the
+     current scope with a way into that sheet. That footer is what keeps the
+     link between what you type and what it matches after the switches moved
+     out of view. */
+  .sugg-scope { display: none; }
+  .sugg-2col { display: block; }
+  .sitem { padding: 8px 9px; font-size: var(--fs-lg); }
+  .sugg-scopeline { border-top: 1px solid var(--border); margin-top: 6px; padding: 8px 9px 4px;
+    display: flex; align-items: baseline; gap: 6px; font-size: var(--fs-sm); color: var(--text-faint);
+    cursor: pointer; }
+  .sugg-scopeline .ssl-v { color: var(--text-muted); flex: 1; min-width: 0;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .sugg-scopeline .ssl-go { color: var(--accent-text); font-weight: 600; flex: none; }
+}
+
+@media (max-width: 480px) {
+  .cb-all { padding: .6rem; }
+  /* The label track is measured against the longest short label ("Health"), so it
+     shrinks with the page rather than eating the value's width. */
+  .cc-rows { grid-template-columns: 52px minmax(0,1fr); }
+
+  /* THE PILLS STEP DOWN SO THE LONGER LABEL FITS ON ONE LINE (dev/changelog/811).
+     `Search Programs (EPG)` plus its glyph is wider than half of a 375px viewport at
+     --fs-sm, and the design was approved from a screenshot where the glyph rendered
+     as tofu and therefore measured narrower than it really is. Two lines on one pill
+     of a matched pair is legible, but it is not what was approved, so the type comes
+     down instead - one line at every width this page supports. --fs-xs is the floor
+     the rest of this page already uses for a control label; anything under it stops
+     being readable before it stops fitting. */
+  .grainask-lbl { font-size: var(--fs-2xs); }
+  .grainpill { font-size: var(--fs-xs); padding: 5px 4px; gap: 4px; }
+}

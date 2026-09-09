@@ -1,0 +1,61 @@
+#EXTM3U
+#EXTINF:0 CUID="4429754" tvg-name="LANTERN Summit" tvg-id="driftwood.us" tvg-logo="https://fake-logos.invalid/logo.png" group-title="🏒 LANTERN Ironwood Cascade",LANTERN Summit
+http://fake-cdn-mixed.invalid/FAKEUSER0000/FAKEPASS0000/4876324
+#EXTINF:0 CUID="4429755" tvg-name="LANTERN Beacon" tvg-id="juniper.us" tvg-logo="https://fake-logos.invalid/logo.png" group-title="🏒 LANTERN Ironwood Cascade",LANTERN Beacon
+http://fake-cdn-mixed.invalid/FAKEUSER0000/FAKEPASS0000/4876325
+#EXTINF:0 CUID="4429756" tvg-name="LANTERN | 01 -" tvg-id="dummy-4274846" tvg-logo="https://fake-logos.invalid/logo.png" group-title="🏒 LANTERN Ironwood Cascade",LANTERN | 01 -
+http://fake-cdn-mixed.invalid/FAKEUSER0000/FAKEPASS0000/4877189
+#EXTINF:0 CUID="4429757" tvg-name="LANTERN | 02 -" tvg-id="dummy-4274847" tvg-logo="https://fake-logos.invalid/logo.png" group-title="🏒 LANTERN Ironwood Cascade",LANTERN | 02 -
+http://fake-cdn-mixed.invalid/FAKEUSER0000/FAKEPASS0000/4877188
+#EXTINF:0 CUID="4429758" tvg-name="LANTERN | 03 -" tvg-id="dummy-4274848" tvg-logo="https://fake-logos.invalid/logo.png" group-title="🏒 LANTERN Ironwood Cascade",LANTERN | 03 -
+http://fake-cdn-mixed.invalid/FAKEUSER0000/FAKEPASS0000/4877187
+#EXTINF:0 CUID="4429759" tvg-name="LANTERN | 04 -" tvg-id="dummy-4274849" tvg-logo="https://fake-logos.invalid/logo.png" group-title="🏒 LANTERN Ironwood Cascade",LANTERN | 04 -
+http://fake-cdn-mixed.invalid/FAKEUSER0000/FAKEPASS0000/4877186
+#EXTINF:0 CUID="4429760" tvg-name="LANTERN | 05 -" tvg-id="dummy-4274850" tvg-logo="https://fake-logos.invalid/logo.png" group-title="🏒 LANTERN Ironwood Cascade",LANTERN | 05 -
+http://fake-cdn-mixed.invalid/FAKEUSER0000/FAKEPASS0000/4877185
+#EXTINF:0 CUID="4429761" tvg-name="LANTERN | 06 -" tvg-id="dummy-4274851" tvg-logo="https://fake-logos.invalid/logo.png" group-title="🏒 LANTERN Ironwood Cascade",LANTERN | 06 -
+http://fake-cdn-mixed.invalid/FAKEUSER0000/FAKEPASS0000/4877184
+#EXTINF:0 CUID="4429762" tvg-name="LANTERN | 07 -" tvg-id="dummy-4274852" tvg-logo="https://fake-logos.invalid/logo.png" group-title="🏒 LANTERN Ironwood Cascade",LANTERN | 07 -
+http://fake-cdn-mixed.invalid/FAKEUSER0000/FAKEPASS0000/4877183
+#EXTINF:0 CUID="4429763" tvg-name="LANTERN | 08 -" tvg-id="dummy-4274853" tvg-logo="https://fake-logos.invalid/logo.png" group-title="🏒 LANTERN Ironwood Cascade",LANTERN | 08 -
+http://fake-cdn-mixed.invalid/FAKEUSER0000/FAKEPASS0000/4877182
+#EXTINF:0 CUID="4685794" tvg-name="SANDSTONE Summit 1080p30" tvg-id="willow.us" tvg-logo="https://fake-logos.invalid/logo.png" group-title="⚾ SANDSTONE",SANDSTONE Summit 1080p30
+http://fake-cdn-mixed.invalid/live/FAKEUSER0000/FAKEPASS0000/6176219.ts
+#EXTINF:0 CUID="4685795" tvg-name="SANDSTONE Summit 720p60" tvg-id="willow.us" tvg-logo="https://fake-logos.invalid/logo.png" group-title="⚾ SANDSTONE",SANDSTONE Summit 720p60
+http://fake-cdn-mixed.invalid/live/FAKEUSER0000/FAKEPASS0000/6176223.ts
+#EXTINF:0 CUID="4685815" tvg-name="Foxglove Marlin" tvg-id="Timber.sandstone" tvg-logo="https://fake-logos.invalid/logo.png" group-title="⚾ SANDSTONE",Foxglove Marlin
+http://fake-cdn-mixed.invalid/live/FAKEUSER0000/FAKEPASS0000/6176188.ts
+#EXTINF:0 CUID="4685817" tvg-name="Orchard" tvg-id="Orchard.sandstone" tvg-logo="https://fake-logos.invalid/logo.png" group-title="⚾ SANDSTONE",Orchard
+http://fake-cdn-mixed.invalid/live/FAKEUSER0000/FAKEPASS0000/6176207.ts
+#EXTINF:0 CUID="4685819" tvg-name="Northstar Blue Ridge" tvg-id="Cedar.sandstone" tvg-logo="https://fake-logos.invalid/logo.png" group-title="⚾ SANDSTONE",Northstar Blue Ridge
+http://fake-cdn-mixed.invalid/live/FAKEUSER0000/FAKEPASS0000/6176189.ts
+#EXTINF:0 CUID="4685821" tvg-name="Atlas Meridian" tvg-id="Harbor.sandstone" tvg-logo="https://fake-logos.invalid/logo.png" group-title="⚾ SANDSTONE",Atlas Meridian
+http://fake-cdn-mixed.invalid/live/FAKEUSER0000/FAKEPASS0000/6176190.ts
+#EXTINF:0 CUID="4685823" tvg-name="Pinnacle Lantern Summit" tvg-id="Driftwood.sandstone" tvg-logo="https://fake-logos.invalid/logo.png" group-title="⚾ SANDSTONE",Pinnacle Lantern Summit
+http://fake-cdn-mixed.invalid/live/FAKEUSER0000/FAKEPASS0000/6176191.ts
+#EXTINF:0 CUID="4685825" tvg-name="Ironwood Cascade" tvg-id="Beacon.sandstone" tvg-logo="https://fake-logos.invalid/logo.png" group-title="⚾ SANDSTONE",Ironwood Cascade
+http://fake-cdn-mixed.invalid/live/FAKEUSER0000/FAKEPASS0000/6176192.ts
+#EXTINF:0 CUID="4685827" tvg-name="Ironwood Juniper Summit" tvg-id="Sandstone.sandstone" tvg-logo="https://fake-logos.invalid/logo.png" group-title="⚾ SANDSTONE",Ironwood Juniper Summit
+http://fake-cdn-mixed.invalid/live/FAKEUSER0000/FAKEPASS0000/6176193.ts
+#EXTINF:0 CUID="4685829" tvg-name="Willow Foxglove" tvg-id="Marlin.sandstone" tvg-logo="https://fake-logos.invalid/logo.png" group-title="⚾ SANDSTONE",Willow Foxglove
+http://fake-cdn-mixed.invalid/live/FAKEUSER0000/FAKEPASS0000/6176194.ts
+#EXTINF:0 CUID="4450569" tvg-name="### FOXGLOVE TIMBER ###" tvg-id="dummy-4643685" tvg-logo="https://fake-logos.invalid/logo.png" group-title="🏈 ORCHARD Northstar Blue Ridge",### FOXGLOVE TIMBER ###
+http
+#EXTINF:0 CUID="4450574" tvg-name="### NORTHSTAR CEDAR ###" tvg-id="dummy-4643685" tvg-logo="https://fake-logos.invalid/logo.png" group-title="🏈 ORCHARD Northstar Blue Ridge",### NORTHSTAR CEDAR ###
+http
+#EXTINF:0 CUID="4450579" tvg-name="### ATLAS ATLAS ###" tvg-id="dummy-4643685" tvg-logo="https://fake-logos.invalid/logo.png" group-title="🏈 ORCHARD Northstar Blue Ridge",### ATLAS ATLAS ###
+http
+#EXTINF:0 CUID="4450584" tvg-name="### MERIDIAN HARBOR ###" tvg-id="dummy-4643685" tvg-logo="https://fake-logos.invalid/logo.png" group-title="🏈 ORCHARD Northstar Blue Ridge",### MERIDIAN HARBOR ###
+http
+#EXTINF:0 CUID="4450589" tvg-name="### PINNACLE LANTERN ###" tvg-id="dummy-4643685" tvg-logo="https://fake-logos.invalid/logo.png" group-title="🏈 ORCHARD Northstar Blue Ridge",### PINNACLE LANTERN ###
+http
+#EXTINF:0 CUID="4450594" tvg-name="### IRONWOOD SUMMIT ###" tvg-id="dummy-4643685" tvg-logo="https://fake-logos.invalid/logo.png" group-title="🏈 ORCHARD Northstar Blue Ridge",### IRONWOOD SUMMIT ###
+http
+#EXTINF:0 CUID="4450599" tvg-name="### WILLOW DRIFTWOOD ###" tvg-id="dummy-4643685" tvg-logo="https://fake-logos.invalid/logo.png" group-title="🏈 ORCHARD Northstar Blue Ridge",### WILLOW DRIFTWOOD ###
+http
+#EXTINF:0 CUID="4450604" tvg-name="### IRONWOOD CASCADE ###" tvg-id="dummy-4643685" tvg-logo="https://fake-logos.invalid/logo.png" group-title="🏈 ORCHARD Northstar Blue Ridge",### IRONWOOD CASCADE ###
+http
+#EXTINF:0 CUID="4450609" tvg-name="### BEACON JUNIPER ###" tvg-id="dummy-4643685" tvg-logo="https://fake-logos.invalid/logo.png" group-title="🏈 ORCHARD Northstar Blue Ridge",### BEACON JUNIPER ###
+http
+#EXTINF:0 CUID="4450614" tvg-name="### SANDSTONE WILLOW ###" tvg-id="dummy-4643685" tvg-logo="https://fake-logos.invalid/logo.png" group-title="🏈 ORCHARD Northstar Blue Ridge",### SANDSTONE WILLOW ###
+http

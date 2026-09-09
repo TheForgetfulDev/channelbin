@@ -1,0 +1,171 @@
+{% extends "base.html" %}
+{% import '_macros.html' as m %}
+{% block title %}Accounts - ChannelBin{% endblock %}
+
+{#  The Accounts list (standard: DESIGN.md §17.1/§17.2/§17.5).
+
+    "Mostly just a list of accounts." Everything a row used to carry and cannot now has
+    somewhere else to live: the seven loose buttons are a kebab, the red error line and the
+    inline Recent-syncs table are sections on the account page (part 1, dev/changelog/455),
+    and account_logs.html is gone. What is left is which account this is, whether it is
+    healthy, and how big it is.
+
+    Rows are server-rendered here and driven by static/js/accounts.js, the same split
+    tags.html uses. Three things about the row are load-bearing:
+
+    1. **The left edge means sync status and NOTHING else** (§17.2) - not the account color,
+       which is not on the row at all. It is the card's own border-left so the color wraps
+       the rounded corners, and :hover must never repaint it.
+    2. **Badges stay tip=false; the sparkline carries the row's one tooltip.** The row is the
+       tap/click target, so a badge's full 40px can't also be a tooltip trigger without the two
+       fighting over the same touch. The sparkline's `<i>` bars are ~5px and paired with
+       `[data-tip]`, which `accounts.js`'s `NO_NAV` excludes from row navigation the same way
+       `index.html`'s recordings list does (§17.5 item 6, corrected 2026-08-13) - hover/tap the
+       bar for detail, click/tap anywhere else in the row still opens the account.
+    3. **The badges come from _macros.html**, shared with the account page, so the two
+       surfaces cannot end up saying different things about the same status. #}
+
+{# The row's edge is `m.account_edge_class` (_macros.html), shared with the dashboard's
+   Account sync status section so the two surfaces cannot color a status two different ways. #}
+
+{# The last five syncs, oldest to newest so it reads left to right like time. Two rules:
+
+   1. Bars are a FIXED height per status, never a scaled duration (§17.6). The question a
+      row answers is "have the last few syncs been fine", and a scaled bar invites reading
+      a length that means nothing.
+   2. ALWAYS five bars. A shorter history pads on the left - the old end - with the
+      "nothing" bar rather than drawing a shorter line. Two sparklines of different lengths
+      side by side read as a measurement of something, and length is not a measurement of
+      anything here. #}
+{# One bar's detail, in the same counts/wording shape account_detail.html's activity feed
+   uses for the same statuses (so the two surfaces never say different things about one
+   sync's numbers) - without its <a> links, since a tooltip is plain text, and deliberately
+   WITHOUT the provider's raw error text. §17.1/17.6: why a sync failed stays reachable only
+   on the account page this row opens - the list row's job is "which account, healthy or
+   not, how big", never the provider's own error string. #}
+{% macro sync_detail(log) -%}
+{%- if not log.status -%}Sync started.
+{%- elif log.status == 'SUCCESS' -%}
+Sync finished: {{ '{:,}'.format(log.channels_synced or 0) }} channels{% if log.channels_added is not none and log.channels_removed is not none %} ({{ '{:,}'.format(log.channels_added) }} added, {{ '{:,}'.format(log.channels_removed) }} removed){% endif %}, {{ '{:,}'.format(log.epg_entries_synced or 0) }} program entries{% if log.completed_at and log.started_at %} in {{ (log.completed_at - log.started_at).total_seconds() | duration }}{% endif %}.
+{%- elif log.status == 'PARTIAL' -%}
+Sync finished with gaps: {{ '{:,}'.format(log.channels_synced or 0) }} channels{% if log.channels_added is not none and log.channels_removed is not none %} ({{ '{:,}'.format(log.channels_added) }} added, {{ '{:,}'.format(log.channels_removed) }} removed){% endif %}, {{ '{:,}'.format(log.epg_entries_synced or 0) }} program entries. See the account page for why.
+{%- elif log.status == 'ERROR' -%}
+Sync failed. See the account page for why.
+{%- elif log.status == 'CANCELLED' -%}
+Sync cancelled before it finished.
+{%- else -%}
+{{ log.status }}
+{%- endif -%}
+{%- endmacro %}
+
+{% macro sparkline(logs) -%}
+{% set spark_class = {'SUCCESS': '', 'ERROR': 'err', 'PARTIAL': 'part', 'CANCELLED': 'none'} -%}
+{% set recent = (logs | list)[:5] | reverse | list -%}
+<span class="spark" aria-hidden="true">
+{%- for _ in range(5 - recent | length) %}<i class="none"></i>{% endfor -%}
+{%- for log in recent %}<i class="{{ spark_class.get(log.status, 'none') }} tip-plain" data-tip="{{ log.started_at | local_time }}&#10;{{ sync_detail(log) }}"></i>{% endfor -%}
+</span>
+{%- endmacro %}
+
+{% block content %}
+<div class="page-head">
+  <h1>Accounts
+    <span class="sub">{{ accounts | length }} account{{ 's' if accounts | length != 1 else '' }}{% if total_channels %} &middot; {{ '{:,}'.format(total_channels) }} channels{% if total_hidden_channels %} ({{ '{:,}'.format(total_hidden_channels) }} hidden){% endif %}{% endif %}</span>
+  </h1>
+  <a href="{{ url_for('accounts.new_account') }}" class="btn btn-primary">+ Add Account</a>
+</div>
+<p class="page-sub">
+  An account is one IPTV provider connection. ChannelBin syncs its channel list and guide data
+  on a schedule, and every channel, recording and guide row in the app traces back to one.
+</p>
+
+{% if not accounts %}
+<div class="empty-state">
+  <p><strong>No accounts yet</strong></p>
+  <p class="text-muted" style="font-size:13px;">
+    Add one to start browsing channels and importing guide data.
+  </p>
+  <a href="{{ url_for('accounts.new_account') }}" class="btn btn-primary">+ Add Account</a>
+</div>
+{% else %}
+
+{# Sidebar-width overflow (dev/docs/BUGS.md): same fixed-track grid shape as the
+   Recordings list, same .list-scroll fix - header and rows scroll together. #}
+<div class="list-scroll acct-list">
+<div class="acct-head">
+  <span>Account</span>
+  <span>Status</span>
+  <span class="num">Channels</span>
+  <span class="num">In guide</span>
+  <span class="num">EPG</span>
+  <span class="num">Next sync</span>
+  <span></span>
+</div>
+<div class="acct-rows">
+  {% for account in accounts %}
+  {% set acct_type = account.account_type or 'm3u' %}
+  {% set syncing = account.status == 'SYNCING' %}
+  <div class="arow {{ m.account_edge_class(account.status) }}"
+       data-id="{{ account.id }}"
+       data-name="{{ account.name }}"
+       data-channels="{{ account.channel_count or 0 }}"
+       data-epg="{{ account.epg_entry_count or 0 }}"
+       data-href="{{ url_for('accounts.account_detail', account_id=account.id) }}">
+    <span class="a-title">
+      <a class="a-name" href="{{ url_for('accounts.account_detail', account_id=account.id) }}">{{ account.name }}</a>
+      <span class="a-badges">{{ m.account_type_badge(acct_type, tip=false) }}{{ m.account_extra_badges(account, tip=false) }}</span>
+      <span class="a-meta">
+        {% if account.last_sync_at %}Synced {{ account.last_sync_at | time_ago }}{% else %}Never synced{% endif %}
+        {{ sparkline(logs_by_account.get(account.id, [])) }}
+      </span>
+    </span>
+    <span class="a-status">{{ m.account_status_badge(account.status, tip=false) }}</span>
+    {# One wrapper, dissolved with display:contents on desktop so each number lands in its
+       own header column, and a real 2x2 grid of fixed halves on a phone (§17.5 item 1). #}
+    <span class="a-nums">
+      <span class="a-num"><span class="a-k">Channels</span>{{ '{:,}'.format(account.channel_count or 0) }}{% if account.hidden_channel_count %} <span class="text-faint">({{ '{:,}'.format(account.hidden_channel_count) }} hidden)</span>{% endif %}</span>
+      <span class="a-num"><span class="a-k">In guide</span>{{ '{:,}'.format(guide_counts.get(account.id, 0)) }}</span>
+      <span class="a-num"><span class="a-k">EPG</span>{{ '{:,}'.format(account.epg_entry_count or 0) }}</span>
+      <span class="a-num"><span class="a-k">Next sync</span>
+        {%- if not account.sync_enabled %}<span class="text-faint">off</span>
+        {%- elif syncing %}<span class="text-muted">running</span>
+        {%- elif account.next_sync_at %}{{ account.next_sync_at | time_until }}
+        {%- else %}<span class="text-faint">-</span>{% endif -%}
+      </span>
+    </span>
+    {# The trailing cell keeps its own class even though it holds one button, or it takes
+       the default grid order and shifts every header label off its column (§17.6). #}
+    <span class="a-actions">
+      <span class="menu-wrap">
+        <button class="btn btn-sm btn-icon" data-menu data-sheet
+                aria-label="Actions for {{ account.name }}">&#8943;</button>
+        {# The desktop kebab's list IS the phone sheet's list: accounts.js builds the sheet
+           by reading these items, so the two surfaces cannot offer different actions or a
+           different order (§17.5 item 2). Destructive last and red. #}
+        <div class="menu pop-left">
+          {% if syncing %}
+          <button class="menu-item danger" data-act="cancel-sync">Cancel sync</button>
+          {% else %}
+          <button class="menu-item" data-act="sync">Sync now</button>
+          {% endif %}
+          <button class="menu-item" data-act="force-epg"{% if syncing %} disabled{% endif %}>Force EPG resync</button>
+          <div class="sep"></div>
+          <button class="menu-item" data-act="settings">Edit settings</button>
+          <a class="menu-item" href="{{ url_for('channels.channel_browser', **{'f.acct': account.id}) }}">Browse channels</a>
+          <div class="sep"></div>
+          <button class="menu-item danger" data-act="delete">Delete account</button>
+        </div>
+      </span>
+    </span>
+  </div>
+  {% endfor %}
+</div>
+</div>
+{% endif %}
+{% endblock %}
+
+{% block scripts %}
+<script src="{{ url_for('static', filename='js/account-modal.js') }}"></script>
+<script src="{{ url_for('static', filename='js/account-actions.js') }}"></script>
+<script src="{{ url_for('static', filename='js/accounts.js') }}"></script>
+{% endblock %}

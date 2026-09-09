@@ -1,0 +1,41 @@
+# ChannelBin's container defaults - copied to /config/config.yaml on first run only.
+#
+# This is deliberately short. Every key the app knows has a built-in default
+# (app/config.py), and anything omitted here uses it - so this file carries only the
+# handful of values that differ inside a container. The fully annotated template with
+# every available setting is at /config/config.example.yaml (refreshed at each start).
+#
+# Edit this file, or use Settings in the web UI, which writes back to it. Settings marked
+# "restart required" need `docker restart channelbin`.
+
+config_version: 1
+
+recording:
+  # The recordings volume. Everything the app writes for a recording - segments, the
+  # finished file, thumbnails, test screenshots - lands under here.
+  dvr_output_dir: /dvr
+  logo_cache:
+    # On the /config volume (like the backup dirs below), so cached logos survive an
+    # image upgrade. logo_cache.enabled still defaults to false - this only matters once
+    # it's turned on in Settings.
+    dir: /config/instance/logo-cache
+
+database:
+  # On the /config volume, so an image upgrade never takes your recordings history with it.
+  path: /config/dvr.db
+  # A DB snapshot carries provider credentials in plaintext, and a config backup is this
+  # file verbatim - both stay on /config (created 0700), never on the recordings share.
+  backup_dir: /config/instance/db-backups
+
+config_backup:
+  backup_dir: /config/instance/config-backups
+
+logging:
+  # No `file:` key, on purpose - logs go to stdout, where `docker logs` can see them.
+  level: INFO
+
+display:
+  # The container's TZ environment variable does not set this. Times in the UI and in
+  # recording filenames come from here; any IANA identifier works.
+  timezone: America/New_York
+  time_format: 12h

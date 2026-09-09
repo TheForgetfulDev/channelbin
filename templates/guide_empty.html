@@ -1,0 +1,43 @@
+{% extends "base.html" %}
+{% block title %}TV Guide - ChannelBin{% endblock %}
+
+{% block content %}
+<div class="page-head">
+  <h1>TV Guide</h1>
+  <a href="#" id="btn-manual-record" class="btn btn-primary"
+     title="Schedule a one-off recording for something not yet in your TV Guide - e.g. a program with no EPG data, or a stream from an account you haven't added to ChannelBin yet.">
+    + Add Manual Recording
+  </a>
+</div>
+
+<div class="empty-state">
+  {% if reason == 'no_accounts' %}
+    <p>No accounts added yet.</p>
+    <a href="{{ url_for('accounts.new_account') }}" class="btn btn-primary">Add an Account</a>
+  {% elif reason == 'no_channels' %}
+    <p>No channels added to your guide yet.</p>
+    <a href="{{ url_for('channels.channel_browser') }}" class="btn btn-primary">Browse Channels</a>
+    <p class="text-muted small" style="margin-top: 0.75rem;">
+      You need to <a href="{{ url_for('accounts.accounts_list') }}">sync your account</a> first if channels aren't showing up.
+    </p>
+  {% endif %}
+</div>
+
+{% endblock %}
+
+{% block scripts %}
+<link rel="stylesheet" href="{{ url_for('static', filename='css/guide.css') }}">
+<script>
+const MANUAL_RECORD_CONFIG = {
+  testUrlEndpoint: '{{ url_for("recordings.test_recording_url") }}',
+  newRecordingUrl: '{{ url_for("recordings.new_recording_json") }}',
+  recDetailUrlBase: '/recordings/',
+};
+</script>
+<script src="{{ url_for('static', filename='js/manual_record.js') }}"></script>
+<script>
+  window.onManualRecordSaved = function () {
+    window.location.href = '{{ url_for("recordings.index") }}';
+  };
+</script>
+{% endblock %}

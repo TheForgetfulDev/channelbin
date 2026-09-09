@@ -1,0 +1,162 @@
+[
+ {
+  "stream_id": 5250708,
+  "name": "EN| NORTHSTAR 1 4K",
+  "stream_type": "live",
+  "epg_channel_id": "",
+  "category_id": null,
+  "direct_source": ""
+ },
+ {
+  "stream_id": 5250707,
+  "name": "EN| NORTHSTAR 2 4K",
+  "stream_type": "live",
+  "epg_channel_id": "",
+  "category_id": null,
+  "direct_source": ""
+ },
+ {
+  "stream_id": 5250706,
+  "name": "EN| NORTHSTAR 3 4K",
+  "stream_type": "live",
+  "epg_channel_id": "",
+  "category_id": null,
+  "direct_source": ""
+ },
+ {
+  "stream_id": 5250705,
+  "name": "EN| NORTHSTAR 4 4K",
+  "stream_type": "live",
+  "epg_channel_id": "",
+  "category_id": null,
+  "direct_source": ""
+ },
+ {
+  "stream_id": 5250703,
+  "name": "EN| NORTHSTAR 5 4K",
+  "stream_type": "live",
+  "epg_channel_id": "",
+  "category_id": null,
+  "direct_source": ""
+ },
+ {
+  "stream_id": 5250702,
+  "name": "EN| NORTHSTAR 6 4K",
+  "stream_type": "live",
+  "epg_channel_id": "",
+  "category_id": null,
+  "direct_source": ""
+ },
+ {
+  "stream_id": 5250701,
+  "name": "EN| NORTHSTAR 7 4K",
+  "stream_type": "live",
+  "epg_channel_id": "",
+  "category_id": null,
+  "direct_source": ""
+ },
+ {
+  "stream_id": 5250700,
+  "name": "EN| NORTHSTAR 8 4K",
+  "stream_type": "live",
+  "epg_channel_id": "",
+  "category_id": null,
+  "direct_source": ""
+ },
+ {
+  "stream_id": 5250699,
+  "name": "EN| NORTHSTAR 9 4K",
+  "stream_type": "live",
+  "epg_channel_id": "",
+  "category_id": null,
+  "direct_source": ""
+ },
+ {
+  "stream_id": 5250698,
+  "name": "EN| NORTHSTAR 10 4K",
+  "stream_type": "live",
+  "epg_channel_id": "",
+  "category_id": null,
+  "direct_source": ""
+ },
+ {
+  "stream_id": 5916963,
+  "name": "DE| LANTERN",
+  "stream_type": "live",
+  "epg_channel_id": "",
+  "category_id": "4273939",
+  "direct_source": "https://fake-cdn.invalid/v1/master/FAKEUSER0000/FAKEPASS0000/index.m3u8"
+ },
+ {
+  "stream_id": 5916962,
+  "name": "DE| IRONWOOD CASCADE!",
+  "stream_type": "live",
+  "epg_channel_id": "",
+  "category_id": "4273939",
+  "direct_source": "https://fake-cdn.invalid/v1/master/FAKEUSER0000/FAKEPASS0000/index.m3u8"
+ },
+ {
+  "stream_id": 5916960,
+  "name": "DE| BEACON FÜR JUNIPER",
+  "stream_type": "live",
+  "epg_channel_id": "",
+  "category_id": "4273939",
+  "direct_source": "https://fake-cdn.invalid/v1/master/FAKEUSER0000/FAKEPASS0000/index.m3u8"
+ },
+ {
+  "stream_id": 5916957,
+  "name": "DE| SANDSTONE WILLOW",
+  "stream_type": "live",
+  "epg_channel_id": "",
+  "category_id": "4273939",
+  "direct_source": "https://fake-cdn.invalid/v1/stitch/embed/hls/channel/FAKEUSER0000/master.m3u8"
+ },
+ {
+  "stream_id": 5916955,
+  "name": "DE| FOXGLOVE TV MARLIN",
+  "stream_type": "live",
+  "epg_channel_id": "",
+  "category_id": "4273939",
+  "direct_source": "https://fake-cdn.invalid/v1/stitch/embed/hls/channel/FAKEUSER0000/master.m3u8"
+ },
+ {
+  "stream_id": 5916954,
+  "name": "DE| ATLAS TIMBER ORCHARD",
+  "stream_type": "live",
+  "epg_channel_id": "",
+  "category_id": "4273939",
+  "direct_source": "https://fake-cdn.invalid/v1/master/FAKEUSER0000/FAKEPASS0000/playlist.m3u8"
+ },
+ {
+  "stream_id": 5916953,
+  "name": "DE| NORTHSTAR",
+  "stream_type": "live",
+  "epg_channel_id": "",
+  "category_id": "4273939",
+  "direct_source": "https://fake-cdn.invalid/v1/master/FAKEUSER0000/FAKEPASS0000/playlist.m3u8"
+ },
+ {
+  "stream_id": 5916952,
+  "name": "DE| BLUE RIDGE CEDAR ATLAS MERIDIAN DRIFTWOOD",
+  "stream_type": "live",
+  "epg_channel_id": "",
+  "category_id": "4273939",
+  "direct_source": "https://fake-cdn.invalid/v1/stitch/embed/hls/channel/FAKEUSER0000/master.m3u8"
+ },
+ {
+  "stream_id": 5916950,
+  "name": "DE| BLUE RIDGE CEDAR FOXGLOVE TV",
+  "stream_type": "live",
+  "epg_channel_id": "",
+  "category_id": "4273939",
+  "direct_source": "https://fake-cdn.invalid/v1/stitch/embed/hls/channel/FAKEUSER0000/master.m3u8"
+ },
+ {
+  "stream_id": 5916949,
+  "name": "DE| SANDSTONE HARBOR PINNACLE",
+  "stream_type": "live",
+  "epg_channel_id": "",
+  "category_id": "4273939",
+  "direct_source": "https://fake-cdn.invalid/v1/stitch/embed/hls/channel/FAKEUSER0000/master.m3u8"
+ }
+]

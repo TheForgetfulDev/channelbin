@@ -1,0 +1,242 @@
+[
+ {
+  "stream_id": 4429754,
+  "name": "LANTERN Summit",
+  "stream_type": "live",
+  "epg_channel_id": "driftwood.us",
+  "category_id": "4272210",
+  "direct_source": ""
+ },
+ {
+  "stream_id": 4429755,
+  "name": "LANTERN Beacon",
+  "stream_type": "live",
+  "epg_channel_id": "juniper.us",
+  "category_id": "4272210",
+  "direct_source": ""
+ },
+ {
+  "stream_id": 4429756,
+  "name": "LANTERN | 01 -",
+  "stream_type": "live",
+  "epg_channel_id": "dummy-4274846",
+  "category_id": "4272210",
+  "direct_source": ""
+ },
+ {
+  "stream_id": 4429757,
+  "name": "LANTERN | 02 -",
+  "stream_type": "live",
+  "epg_channel_id": "dummy-4274847",
+  "category_id": "4272210",
+  "direct_source": ""
+ },
+ {
+  "stream_id": 4429758,
+  "name": "LANTERN | 03 -",
+  "stream_type": "live",
+  "epg_channel_id": "dummy-4274848",
+  "category_id": "4272210",
+  "direct_source": ""
+ },
+ {
+  "stream_id": 4429759,
+  "name": "LANTERN | 04 -",
+  "stream_type": "live",
+  "epg_channel_id": "dummy-4274849",
+  "category_id": "4272210",
+  "direct_source": ""
+ },
+ {
+  "stream_id": 4429760,
+  "name": "LANTERN | 05 -",
+  "stream_type": "live",
+  "epg_channel_id": "dummy-4274850",
+  "category_id": "4272210",
+  "direct_source": ""
+ },
+ {
+  "stream_id": 4429761,
+  "name": "LANTERN | 06 -",
+  "stream_type": "live",
+  "epg_channel_id": "dummy-4274851",
+  "category_id": "4272210",
+  "direct_source": ""
+ },
+ {
+  "stream_id": 4429762,
+  "name": "LANTERN | 07 -",
+  "stream_type": "live",
+  "epg_channel_id": "dummy-4274852",
+  "category_id": "4272210",
+  "direct_source": ""
+ },
+ {
+  "stream_id": 4429763,
+  "name": "LANTERN | 08 -",
+  "stream_type": "live",
+  "epg_channel_id": "dummy-4274853",
+  "category_id": "4272210",
+  "direct_source": ""
+ },
+ {
+  "stream_id": 4685794,
+  "name": "SANDSTONE Summit 1080p30",
+  "stream_type": "live",
+  "epg_channel_id": "willow.us",
+  "category_id": "4272211",
+  "direct_source": ""
+ },
+ {
+  "stream_id": 4685795,
+  "name": "SANDSTONE Summit 720p60",
+  "stream_type": "live",
+  "epg_channel_id": "willow.us",
+  "category_id": "4272211",
+  "direct_source": ""
+ },
+ {
+  "stream_id": 4685815,
+  "name": "Foxglove Marlin",
+  "stream_type": "live",
+  "epg_channel_id": "Timber.sandstone",
+  "category_id": "4272211",
+  "direct_source": ""
+ },
+ {
+  "stream_id": 4685817,
+  "name": "Orchard",
+  "stream_type": "live",
+  "epg_channel_id": "Orchard.sandstone",
+  "category_id": "4272211",
+  "direct_source": ""
+ },
+ {
+  "stream_id": 4685819,
+  "name": "Northstar Blue Ridge",
+  "stream_type": "live",
+  "epg_channel_id": "Cedar.sandstone",
+  "category_id": "4272211",
+  "direct_source": ""
+ },
+ {
+  "stream_id": 4685821,
+  "name": "Atlas Meridian",
+  "stream_type": "live",
+  "epg_channel_id": "Harbor.sandstone",
+  "category_id": "4272211",
+  "direct_source": ""
+ },
+ {
+  "stream_id": 4685823,
+  "name": "Pinnacle Lantern Summit",
+  "stream_type": "live",
+  "epg_channel_id": "Driftwood.sandstone",
+  "category_id": "4272211",
+  "direct_source": ""
+ },
+ {
+  "stream_id": 4685825,
+  "name": "Ironwood Cascade",
+  "stream_type": "live",
+  "epg_channel_id": "Beacon.sandstone",
+  "category_id": "4272211",
+  "direct_source": ""
+ },
+ {
+  "stream_id": 4685827,
+  "name": "Ironwood Juniper Summit",
+  "stream_type": "live",
+  "epg_channel_id": "Sandstone.sandstone",
+  "category_id": "4272211",
+  "direct_source": ""
+ },
+ {
+  "stream_id": 4685829,
+  "name": "Willow Foxglove",
+  "stream_type": "live",
+  "epg_channel_id": "Marlin.sandstone",
+  "category_id": "4272211",
+  "direct_source": ""
+ },
+ {
+  "stream_id": 4450569,
+  "name": "### FOXGLOVE TIMBER ###",
+  "stream_type": "live",
+  "epg_channel_id": "dummy-4643685",
+  "category_id": "4272199",
+  "direct_source": ""
+ },
+ {
+  "stream_id": 4450574,
+  "name": "### NORTHSTAR CEDAR ###",
+  "stream_type": "live",
+  "epg_channel_id": "dummy-4643685",
+  "category_id": "4272199",
+  "direct_source": ""
+ },
+ {
+  "stream_id": 4450579,
+  "name": "### ATLAS ATLAS ###",
+  "stream_type": "live",
+  "epg_channel_id": "dummy-4643685",
+  "category_id": "4272199",
+  "direct_source": ""
+ },
+ {
+  "stream_id": 4450584,
+  "name": "### MERIDIAN HARBOR ###",
+  "stream_type": "live",
+  "epg_channel_id": "dummy-4643685",
+  "category_id": "4272199",
+  "direct_source": ""
+ },
+ {
+  "stream_id": 4450589,
+  "name": "### PINNACLE LANTERN ###",
+  "stream_type": "live",
+  "epg_channel_id": "dummy-4643685",
+  "category_id": "4272199",
+  "direct_source": ""
+ },
+ {
+  "stream_id": 4450594,
+  "name": "### IRONWOOD SUMMIT ###",
+  "stream_type": "live",
+  "epg_channel_id": "dummy-4643685",
+  "category_id": "4272199",
+  "direct_source": ""
+ },
+ {
+  "stream_id": 4450599,
+  "name": "### WILLOW DRIFTWOOD ###",
+  "stream_type": "live",
+  "epg_channel_id": "dummy-4643685",
+  "category_id": "4272199",
+  "direct_source": ""
+ },
+ {
+  "stream_id": 4450604,
+  "name": "### IRONWOOD CASCADE ###",
+  "stream_type": "live",
+  "epg_channel_id": "dummy-4643685",
+  "category_id": "4272199",
+  "direct_source": ""
+ },
+ {
+  "stream_id": 4450609,
+  "name": "### BEACON JUNIPER ###",
+  "stream_type": "live",
+  "epg_channel_id": "dummy-4643685",
+  "category_id": "4272199",
+  "direct_source": ""
+ },
+ {
+  "stream_id": 4450614,
+  "name": "### SANDSTONE WILLOW ###",
+  "stream_type": "live",
+  "epg_channel_id": "dummy-4643685",
+  "category_id": "4272199",
+  "direct_source": ""
+ }
+]

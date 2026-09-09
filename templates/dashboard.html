@@ -1,0 +1,274 @@
+{% extends "base.html" %}
+{% import '_macros.html' as m %}
+{% block title %}Live Dashboard - ChannelBin{% endblock %}
+
+{#
+  Live Dashboard, DESIGN.md section 16 (approved 2026-08-03). Reference mockups
+  dev/mockups/29-ops-desktop.html + 30-ops-mobile.html; rollout dev/changelog/445.
+
+  THIS TEMPLATE IS THE ONE COMPOSER FOR #dash-sections (16.6). dashboard.js never
+  rebuilds this region: Customize moves and hides the .dash-sec nodes below, and the
+  SSE handlers patch individual cells by id. A client-side re-render would wipe every
+  live value on each rebuild and would leave the page blank before its first fetch.
+
+  Section order and visibility come from the server (app/routes/dashboard.py
+  ::_section_state), so the first paint is already the arrangement the user chose -
+  JS upgrades this markup, it is never required to calm it down.
+
+  Everything generic (.card, .btn, .badge, .page-head, .sec-head, .modal) is in
+  style.css, alongside this page's own promoted components (.dash-pulse/.mtile,
+  .dash-head/.drow, .tl-*, .cz-*). Nothing page-local is needed, so there is no
+  <style> block here at all.
+#}
+
+{% macro sec_head(key, count=None) %}
+  {#- One head spelling for all five sections, the timeline included, or the
+      timeline's head and everything else's drift apart the moment one changes.
+      16.2: exactly one control, right-aligned, naming the page it goes to, with
+      the arrow as its OWN element so the destination name stays addressable to a
+      test (16.6 - a glyph baked into generated text is erased by the next
+      regeneration). -#}
+  {% set d = section_defs[key] %}
+  <div class="sec-head">
+    <h2>{{ d.label }}{% if count %} <span class="cnt">{{ count }}</span>{% endif %}</h2>
+    <span class="sec-actions">
+      <a class="btn btn-sm" href="{{ url_for(d.endpoint) }}">{{ d.to }} <span class="arw">&#8594;</span></a>
+    </span>
+  </div>
+{% endmacro %}
+
+{% macro empty(title, body) %}
+  <div class="dash-empty"><strong>{{ title }}</strong>{{ body }}</div>
+{% endmacro %}
+
+{% block content %}
+<div class="page-head">
+  <h1>Live Dashboard
+    <span class="sub">
+      {%- if live -%}
+        {{ live | length }} recording{{ '' if live | length == 1 else 's' }} in progress,
+        {{ upcoming | length }} scheduled
+      {%- else -%}
+        nothing in progress
+      {%- endif -%}
+    </span>
+  </h1>
+  <div class="card-head-actions">
+    {# Server-rendered as the settled state, per the rule that initial markup must
+       equal "nothing wrong" - dashboard.js turns it green on open and amber on drop. #}
+    <span class="badge badge-scheduled" id="sse-status"
+          data-tip="Whether this page is receiving live activity updates.">Connecting</span>
+    <button class="btn btn-sm" id="btn-customize"
+            data-tip="Choose which sections appear on this page,&#10;and what order they appear in.">Customize</button>
+  </div>
+</div>
+
+{# The timeline's data, as one blob rather than a second endpoint - it is the same
+   rows this render already read. GUIDE_CONFIG's pattern. #}
+<script type="application/json" id="dash-timeline">{{ timeline | tojson }}</script>
+<script type="application/json" id="dash-sections-pref">{{ {'key': section_pref_key, 'order': section_order, 'on': section_on, 'defs': section_defs} | tojson }}</script>
+
+<div class="dash-pulse">
+  {% for m in metrics %}
+  <div class="mtile{% if m.cls %} {{ m.cls }}{% endif %}"{% if m.tip %} data-tip="{{ m.tip }}"{% endif %}
+       {% if m.href %}data-href="{{ m.href }}"{% endif %}>
+    <div class="m-k">{{ m.key }}</div>
+    <div class="m-v">{{ m.value if m.value is not none else '-' }}</div>
+    <div class="m-s">{{ m.sub }}</div>
+  </div>
+  {% endfor %}
+</div>
+
+<div id="dash-sections">
+{% for key in section_order %}
+  <div class="dash-sec" data-sec="{{ key }}"{% if not section_on[key] %} hidden{% endif %}>
+
+  {#- ── Timeline (16.3). Its body is drawn by dashboard.js from the blob above,
+        because every bar is positioned in pixels off a scale only the client
+        knows the viewport for. The head is server-rendered like every other. -#}
+  {% if key == 'timeline' %}
+    {{ sec_head(key) }}
+    <div class="tl" id="tl"></div>
+
+  {#- ── The two record sections. Both statuses render an explicit branch; there
+        is no trailing else, so a status added later cannot land in one silently. -#}
+  {% elif key in ('live', 'upcoming') %}
+    {% set rows = live if key == 'live' else upcoming %}
+    {{ sec_head(key, rows | length) }}
+    {% if not rows %}
+      {% if key == 'live' %}
+        {{ empty('Nothing recording right now',
+                 'Schedule a recording from the TV Guide, or record a channel now from the Channels page.') }}
+      {% else %}
+        {{ empty('Nothing scheduled',
+                 'Anything you schedule from the TV Guide shows up here until it starts.') }}
+      {% endif %}
+    {% else %}
+      <div class="dash-head">
+        <span class="sortable" data-sort="name">Recording<span class="sort-ind"></span></span>
+        <span class="sortable" data-sort="status">Status<span class="sort-ind"></span></span>
+        {% if key == 'live' %}
+        <span class="sortable" data-sort="elapsed">Elapsed<span class="sort-ind"></span></span>
+        <span class="sortable" data-sort="remaining">Remaining<span class="sort-ind"></span></span>
+        <span class="sortable" data-sort="recorded">Recorded<span class="sort-ind"></span></span>
+        {% else %}
+        <span class="sortable" data-sort="starts">Starts<span class="sort-ind"></span></span>
+        <span class="sortable" data-sort="duration">Duration<span class="sort-ind"></span></span>
+        <span class="sortable" data-sort="starts">Start time<span class="sort-ind"></span></span>
+        {% endif %}
+        <span></span>
+      </div>
+      <div class="dash-rows">
+        {% for rec in rows %}
+        {#- Server-rendered from live_stats, not left as '-' for JS to fill: only a
+            capturing recording emits STATS_SNAPSHOT, so a paused, retrying or
+            concatenating row would sit on dashes forever (dev/changelog/663). -#}
+        {% set st = live_stats.get(rec.id) %}
+        {#- Sort values mirror whatever this row's status branch actually renders into its
+            three stat cells below, so the column header's meaning always matches the
+            column's content for THIS row - dashboard.js keeps them fresh as SSE ticks
+            update the visible cells. -#}
+        <div class="drow{% if rec.status != 'SCHEDULED' %} has-bar{% endif %} {{ rec_status_class.get(rec.status, 'st-abort') }}"
+             id="card-{{ rec.id }}" data-id="{{ rec.id }}" data-status="{{ rec.status }}"
+             data-name="{{ rec.name | lower }}"
+             data-href="{{ url_for('recordings.recording_detail', recording_id=rec.id) }}"
+             {%- if rec.status == 'SCHEDULED' %}
+             data-starts="{{ (rec.start_time - now).total_seconds() }}"
+             data-duration="{{ rec.duration_seconds or 0 }}"
+             {%- elif rec.status == 'CONVERTING' %}
+             data-elapsed="{{ rec.conversion_progress_pct if rec.conversion_progress_pct is not none else '' }}"
+             data-remaining="{{ rec.conversion_eta_seconds if rec.conversion_eta_seconds is not none else '' }}"
+             data-recorded="{{ rec.conversion_out_size or 0 }}"
+             {%- else %}
+             data-elapsed="{{ st[0] if st else '' }}" data-remaining="{{ st[1] if st else '' }}" data-recorded="{{ st[2] if st else '' }}"
+             {%- endif %}
+             style="--pct:{{ (rec.conversion_progress_pct or 0) | round(1) if rec.status == 'CONVERTING' else 0 }}%">
+          <span class="d-title">
+            <span class="d-name">{{ rec.name }}</span>
+            <span class="d-meta">
+              {%- if rec.channel %}{{ rec.channel.name }}{% endif -%}
+            </span>
+          </span>
+          <span class="d-cell d-badge">
+            <span class="badge badge-{{ rec.status | lower }}" id="badge-{{ rec.id }}">{{ rec.status }}</span>
+          </span>
+
+          {#- Three stats per row, and WHICH three depends on the status. The full
+              per-status stat set is unchanged from what this page has always shown;
+              what changed is that a row has room for three of them, so the rest
+              (stalls, failures, downtime, segments) moved into the tap/hover detail.
+              dashboard.js's SSE handlers write these ids. -#}
+          {% if rec.status == 'SCHEDULED' %}
+            <span class="d-cell"><span class="d-k">Starts</span>{{ rec.start_time | time_until }}</span>
+            <span class="d-cell"><span class="d-k">Duration</span>{{ rec.duration_seconds | duration }}</span>
+            <span class="d-cell"><span class="d-k">Start time</span>{{ rec.start_time | local_time }}</span>
+          {% elif rec.status == 'CONVERTING' %}
+            <span class="d-cell"><span class="d-k">Complete</span><span id="conv-pct-{{ rec.id }}">{% if rec.conversion_progress_pct is not none %}{{ rec.conversion_progress_pct | round(0) | int }}%{% else %}-{% endif %}</span></span>
+            <span class="d-cell"><span class="d-k">Time left</span><span id="conv-eta-{{ rec.id }}">{% if rec.conversion_eta_seconds is not none %}~{{ (rec.conversion_eta_seconds // 60) }} min{% else %}estimating...{% endif %}</span></span>
+            <span class="d-cell"><span class="d-k">Written</span><span id="conv-bytes-{{ rec.id }}">{{ (rec.conversion_out_size | filesize) if rec.conversion_out_size else '-' }}</span></span>
+          {% else %}
+            <span class="d-cell"><span class="d-k">Elapsed</span><span id="elapsed-{{ rec.id }}">{{ st[0] | duration(true) if st else '-' }}</span></span>
+            <span class="d-cell"><span class="d-k">Remaining</span><span id="remaining-{{ rec.id }}">{{ st[1] | duration(true) if st else '-' }}</span></span>
+            {#- Stalls has no column of its own on a row, so its warning is carried
+                by the byte count it explains. Nothing else re-colors a row cell. -#}
+            <span class="d-cell{% if rec.total_stall_count > 5 %} warn{% endif %}" id="bytes-cell-{{ rec.id }}">
+              <span class="d-k">Recorded</span><span id="bytes-{{ rec.id }}">{{ st[2] | filesize if st else '-' }}</span></span>
+          {% endif %}
+
+          <span class="c-actions">
+            <a class="btn btn-sm" href="{{ url_for('recordings.recording_detail', recording_id=rec.id) }}">Details</a>
+          </span>
+        </div>
+        {% endfor %}
+      </div>
+    {% endif %}
+
+  {#- ── Account sync status -#}
+  {% elif key == 'accounts' %}
+    {{ sec_head(key, accounts | length) }}
+    {% if not accounts %}
+      {{ empty('No accounts yet', 'Add an IPTV account to import channels and program data.') }}
+    {% else %}
+      <div class="dash-head">
+        <span class="sortable" data-sort="name">Account<span class="sort-ind"></span></span>
+        <span class="sortable" data-sort="status">Status<span class="sort-ind"></span></span>
+        <span class="sortable" data-sort="channels">Channels<span class="sort-ind"></span></span>
+        <span class="sortable" data-sort="lastsync">Last sync<span class="sort-ind"></span></span>
+        <span class="sortable" data-sort="nextsync">Next sync<span class="sort-ind"></span></span>
+        <span></span>
+      </div>
+      <div class="dash-rows">
+        {% for acc in accounts %}
+        <div class="drow {{ m.account_edge_class(acc.status) }}" data-acct="{{ acc.id }}"
+             data-name="{{ acc.name | lower }}" data-status="{{ acc.status }}"
+             data-channels="{{ acc.channel_count or 0 }}"
+             data-lastsync="{{ (now - acc.last_sync_at).total_seconds() if acc.last_sync_at else '' }}"
+             data-nextsync="{{ (acc.next_sync_at - now).total_seconds() if acc.next_sync_at else '' }}"
+             data-href="{{ url_for('accounts.account_detail', account_id=acc.id) }}">
+          <span class="d-title">
+            <span class="d-name">{{ acc.name }}</span>
+            <span class="d-meta{% if acc.last_error %} bad{% endif %}"
+                  {% if acc.last_error %}data-tip="{{ acc.last_error | truncate(300) }}"{% endif %}>
+              <span class="acct-dot" style="background: {{ acc.color }}"></span>
+              {%- if acc.last_error %}{{ acc.last_error | truncate(90) }}
+              {%- elif acc.channel_count %}{{ '{:,}'.format(acc.channel_count) }} channels
+              {%- else %}no channels imported{% endif -%}
+            </span>
+          </span>
+          <span class="d-cell d-badge">{{ m.account_status_badge(acc.status, tip=false) }}</span>
+          <span class="d-cell"><span class="d-k">Channels</span>{{ '{:,}'.format(acc.channel_count) if acc.channel_count else '-' }}{% if acc.hidden_channel_count %} <span class="text-faint">({{ '{:,}'.format(acc.hidden_channel_count) }} hidden)</span>{% endif %}</span>
+          <span class="d-cell"><span class="d-k">Last sync</span>{{ acc.last_sync_at | time_ago if acc.last_sync_at else 'never' }}</span>
+          <span class="d-cell"><span class="d-k">Next sync</span>{{ acc.next_sync_at | time_until if acc.next_sync_at else '-' }}</span>
+          <span class="c-actions">
+            <a class="btn btn-sm" href="{{ url_for('accounts.account_detail', account_id=acc.id) }}">Manage</a>
+          </span>
+        </div>
+        {% endfor %}
+      </div>
+    {% endif %}
+
+  {#- ── Channel health check. One row when a run is active, else the empty state. -#}
+  {% elif key == 'health' %}
+    {{ sec_head(key, 1 if health_check else 0) }}
+    {% if not health_check %}
+      {{ empty('No health check running',
+               'Start one from the Groups page, or wait for the nightly run.') }}
+    {% else %}
+      <div class="dash-head">
+        <span>Health check</span><span>Status</span><span>Elapsed</span>
+        <span>Channels</span><span>Results</span><span></span>
+      </div>
+      <div class="dash-rows">
+        <div class="drow has-bar" id="hc-card"
+             data-href="{{ health_check.detail_url }}"
+             style="--pct: {{ ((health_check.completed_channels / health_check.total_channels * 100) | int) if health_check.total_channels else 0 }}%">
+          <span class="d-title">
+            <span class="d-name">{{ health_check.name }}</span>
+            <span class="d-meta">{{ 'On demand' if health_check.kind == 'on_demand' else ('Pre-check' if health_check.kind == 'pre_check' else 'Guide channels') }}</span>
+          </span>
+          <span class="d-cell d-badge"><span class="badge badge-in_progress" id="hc-status-badge"><span class="pulse"></span>RUNNING</span></span>
+          <span class="d-cell"><span class="d-k">Elapsed</span><span id="hc-elapsed">-</span></span>
+          <span class="d-cell"><span class="d-k">Channels</span><span id="hc-progress-text">{{ health_check.completed_channels }} / {{ health_check.total_channels }}</span></span>
+          <span class="d-cell{% if health_check.fail_count %} warn{% endif %}"><span class="d-k">Results</span><span id="hc-results">{{ health_check.pass_count }}P {{ health_check.warn_count }}W {{ health_check.fail_count }}F</span></span>
+          <span class="c-actions">
+            <a class="btn btn-sm" href="{{ health_check.detail_url }}">Details</a>
+          </span>
+        </div>
+      </div>
+    {% endif %}
+  {% endif %}
+
+  </div>
+{% endfor %}
+
+  {#- Turning every section off is a state Customize can reach, so it gets a real
+      answer rather than a blank page. dashboard.js shows and hides this. -#}
+  <div class="dash-empty dash-none" id="dash-none" hidden>
+    <strong>Every section is hidden</strong>Use <b>Customize</b> in the header to turn at least one back on.
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script src="{{ url_for('static', filename='js/dashboard.js') }}"></script>
+{% endblock %}

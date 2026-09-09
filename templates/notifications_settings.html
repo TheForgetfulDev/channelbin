@@ -1,0 +1,182 @@
+{% extends "base.html" %}
+{% from '_macros.html' import field_shell, secret_reveal_btn %}
+{% block title %}Notifications - ChannelBin{% endblock %}
+
+{% block content %}
+<style>
+/* ══════════════════════════════════════════════════════════════════════════
+   Notifications. DESIGN.md 15.2/15.3/15.6 (approved 2026-08-02); reference
+   mockups dev/mockups/27-settings-desktop.html + 28-settings-mobile.html;
+   rollout dev/changelog/440. Everything generic (.card, .tbl, .btn, .switch,
+   .badge, .frow, .msel, .alert-severity) comes from style.css - only the
+   services region and the routing rows live here, because only this page has
+   them.
+   ══════════════════════════════════════════════════════════════════════════ */
+
+/* ── Services region (15.6) ───────────────────────────────────────────
+   A heading naming the group and counting it, owning the group's add action.
+   Deliberately NOT a .card: the service cards below it are the cards, and a
+   card wrapping a group of cards reads as one more level of box than the
+   content has levels of meaning. */
+.svc-head { display: flex; align-items: center; justify-content: space-between; gap: 10px;
+  flex-wrap: wrap; margin-top: 22px; padding-bottom: 9px; border-bottom: 1px solid var(--border-soft); }
+.svc-head h2 { font-size: var(--fs-sm); font-weight: 700; letter-spacing: .08em; text-transform: uppercase;
+  color: var(--text-muted); display: flex; align-items: center; gap: 8px; margin: 0;
+  border-bottom: none; padding-bottom: 0; }
+.svc-head .cnt { color: var(--text-faint); font-weight: 600; }
+.svc-bar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-top: 14px; }
+.svc-bar .note { font-size: var(--fs-sm); color: var(--text-faint); }
+/* The empty state keeps a FILLED .btn-primary while the bar above content uses an
+   outlined .btn-accent. That difference is intentional: alone in a dashed panel it
+   cannot disappear, and it is the only action on screen there. */
+.svc-empty { margin-top: 14px; padding: 30px 18px; text-align: center; border: 1px dashed var(--border);
+  border-radius: var(--radius); color: var(--text-muted); font-size: var(--fs-md); line-height: 1.6; }
+.svc-empty .btn { margin-top: 13px; }
+.svc-x { background: none; border: 1px solid var(--border); border-radius: var(--radius-sm);
+  color: var(--text-faint); font: inherit; font-size: var(--fs-sm); padding: 2px 8px; cursor: pointer; }
+.svc-x:hover { color: var(--bad); border-color: var(--bad); }
+.svc-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(330px, 1fr)); gap: 14px; margin-top: 14px; }
+.svc-grid .card { margin-top: 0; }
+.svc-body { padding: 12px 16px 14px; display: flex; flex-direction: column; gap: 9px; }
+.svc-enable { display: flex; align-items: center; gap: 9px; font-size: var(--fs-md); }
+.svc-lbl { font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: .07em; color: var(--text-faint);
+  font-weight: 700; margin-bottom: 4px; }
+.svc-hint { font-size: var(--fs-sm); color: var(--text-faint); font-family: var(--font-mono);
+  word-break: break-all; margin-top: 4px; }
+.svc-actions { display: flex; align-items: center; gap: 8px; margin-top: 2px; }
+.svc-body .secret-field input[type=text],
+.svc-body input[type=number] { background: var(--bg2); border: 1px solid var(--border);
+  border-radius: var(--radius-sm); color: var(--text); font: inherit; font-size: var(--fs-md);
+  padding: 6px 10px; width: 100%; }
+.svc-body input[type=number] { max-width: 140px; }
+.svc-body input:focus { outline: none; border-color: var(--accent); }
+
+/* Page-scoped cap (dev/changelog/733): the shell's own max-width is gone
+   app-wide, but .frow's label/description column is an unbounded 1fr track
+   with no cap of its own (DESIGN.md 2) - uncapped it stretches the Delivery
+   card's field descriptions the full width of an ultrawide window. Scoped to
+   the Delivery card only; Alert Routing's table benefits from the extra
+   width the same way Accounts and Recordings do. */
+.card-frow { max-width: 1400px; }
+
+/* ── Alert routing ────────────────────────────────────────────────────
+   One markup for both widths. At >768px the column headers say which control is
+   which; at <=768px the row becomes a card (15.5 item 4) and each control takes
+   the label the vanished header was carrying. */
+.rt-key { font-family: var(--font-mono); font-size: var(--fs-xs); color: var(--text-faint); word-break: break-all; }
+.rt-push { min-width: 190px; }
+.rt-none { font-size: var(--fs-sm); color: var(--text-faint); font-style: italic; }
+.rt-cl { display: none; font-size: var(--fs-sm); color: var(--text-muted); flex: none; }
+.rt-name { font-size: var(--fs-lg); font-weight: 500; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+
+/* ── Routing filter bar (21 types and growing - CLAUDE.md, item 7 of the
+   2026-08-09 easy-bugs batch). Dedicated input rather than the main /settings
+   page's search: this page has none of its own to scope into. Content and
+   visibility are written by two different functions in notifications.js
+   (renderRouting() vs. applyRoutingFilter()), same split static/js/logs.js
+   already uses for its own chip filters. */
+.rt-filter { display: flex; align-items: center; gap: 8px 10px; flex-wrap: wrap; margin-bottom: 12px; }
+.rt-filter .search-wrap { flex: none; }
+.rt-filter .chips { flex: 1 1 auto; }
+.rt-shown { font-size: var(--fs-sm); color: var(--text-faint); white-space: nowrap; }
+.chip.sev.active[data-sev="INFO"]  { background: var(--accent-soft); border-color: var(--accent); color: var(--accent-text); }
+.chip.sev.active[data-sev="WARN"]  { background: var(--warn-soft); border-color: var(--warn); color: var(--warn); }
+.chip.sev.active[data-sev="ERROR"],
+.chip.sev.active[data-sev="CRIT"]  { background: var(--bad-soft); border-color: var(--bad); color: var(--bad); }
+
+/* App URL is the one field whose control column stacks: the example link is a
+   readout of what was typed, so it belongs under the input rather than beside it.
+   Keyed off the path, the same way settings.html keys its filename-template row -
+   one row wanting a different arrangement is not worth a macro parameter. */
+.frow[data-path="notifications.base_url"] .fr-ctl { flex-direction: column; align-items: stretch; gap: 6px; }
+.url-preview { font-size: var(--fs-sm); color: var(--text-faint); word-break: break-all; text-align: right; }
+
+@media (max-width: 768px) {
+  .svc-grid { grid-template-columns: 1fr; }
+  .svc-actions .btn { flex: 1; justify-content: center; }
+  .svc-bar .msel { width: 100%; }
+  .svc-empty .btn { width: 100%; justify-content: center; }
+  #rt-tbl, #rt-tbl tbody, #rt-tbl tr, #rt-tbl td { display: block; }
+  #rt-tbl thead { display: none; }
+  #rt-tbl tr { padding: 12px 14px; border-bottom: 1px solid var(--border-soft); }
+  #rt-tbl tr:last-child { border-bottom: none; }
+  #rt-tbl td { padding: 0; border-bottom: none; }
+  #rt-tbl td + td { display: flex; align-items: center; gap: 10px; margin-top: 9px; }
+  .rt-cl { display: block; }
+  .rt-push .msel { flex: 1; min-width: 0; }
+  .url-preview { text-align: left; }
+  .rt-filter .search-wrap, .rt-filter .search { width: 100%; }
+  .rt-filter .chips { width: 100%; }
+}
+</style>
+
+<a class="back" href="{{ url_for('settings.settings') }}">&larr; Settings</a>
+<div class="page-head">
+  <h1>Notifications <span class="sub" id="notif-count"></span></h1>
+  <div class="card-head-actions">
+    <a class="btn btn-sm" href="{{ url_for('alerts.alert_center') }}">View alerts</a>
+  </div>
+</div>
+
+<div class="card card-frow">
+  <div class="card-head"><h2>Delivery</h2></div>
+  <div class="card-body">
+    {% call field_shell('notifications.push_rate_limit_seconds', 'Push rate limit',
+       'Seconds between push flushes. Alerts raised inside one window are aggregated into a single notification.',
+       '60') %}
+    <input type="number" id="rate-limit-input" min="1" max="3600" value="{{ boot.rate_limit }}">
+    {% endcall %}
+    {% call field_shell('notifications.base_url', 'App URL',
+       'Used to build clickable links in push notifications, e.g. a failed-recording alert links back to its detail page. In-app alerts always link correctly regardless of this setting. Leave blank to omit links from push notifications.') %}
+    <input type="text" id="base-url-input" placeholder="http://192.168.1.50:5000" value="{{ boot.base_url }}">
+    <div class="url-preview" id="base-url-preview"></div>
+    {% endcall %}
+  </div>
+</div>
+
+{# 15.2: a service gets a card only once it is ADDED. Both regions below are
+   written by one renderer in notifications.js - the add bar, the cards and the
+   empty state cannot describe different sets, and the heading's count comes from
+   the same computation as the cards it counts (15.7). #}
+<div id="svc-bar"></div>
+<div class="svc-grid" id="svc-grid"></div>
+
+<div class="card">
+  <div class="card-head">
+    <h2>Alert routing <span class="cnt">{{ boot.routing | length }} types</span></h2>
+    <div class="card-head-actions">
+      <button class="btn btn-sm" id="rt-save" type="button" disabled>Save routing</button>
+    </div>
+  </div>
+  <div class="card-body">
+    <div class="rt-filter">
+      <div class="search-wrap" id="rt-search-wrap">
+        <input type="search" id="rt-search" class="search" placeholder="Filter alert types" autocomplete="off">
+        <button class="search-clear" id="rt-search-clear" type="button" aria-label="Clear the filter">&times;</button>
+      </div>
+      <div class="chips" id="rt-sev-chips"></div>
+      <button class="chip" id="rt-push-chip" type="button" data-tip="Only alert types with at least one push service selected">Pushes somewhere</button>
+      <span class="rt-shown" id="rt-shown"></span>
+    </div>
+    <div class="table-scroll">
+      <table class="tbl" id="rt-tbl">
+        <thead><tr><th>Alert type</th><th style="width:90px">In-app</th><th>Push to</th></tr></thead>
+        <tbody id="rt-body"></tbody>
+      </table>
+    </div>
+    <div id="rt-no-results" class="empty-state" style="display:none">No alert types match the current filter.</div>
+  </div>
+</div>
+
+{# One copy of the in-field eyeball, cloned per service card by notifications.js.
+   The macro stays the only place that markup exists - a hand-rolled second copy in
+   JS would drift from the two SVGs the .revealed CSS toggles between. #}
+<template id="reveal-tpl">{{ secret_reveal_btn('') }}</template>
+
+<script type="application/json" id="notif-boot">{{ boot | tojson }}</script>
+{% endblock %}
+
+{% block scripts %}
+<script src="{{ url_for('static', filename='js/dropdown.js') }}"></script>
+<script src="{{ url_for('static', filename='js/notifications.js') }}"></script>
+{% endblock %}

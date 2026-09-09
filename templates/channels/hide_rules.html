@@ -1,0 +1,181 @@
+{% extends "base.html" %}
+{% block title %}Hide Rules - ChannelBin{% endblock %}
+
+{#  Hide Rules (dev/changelog/780).
+
+    Built from the approved dev/mockups/35-hide-rules.html round 4. The summary
+    tiles below are real Channel.hidden/hidden_deferred aggregates from
+    routes/channel_hide_rules.py::hide_rules_page - static per page load, refreshed by the
+    reload every mutation in hide-rules.js does afterward. The rules table and the account
+    filter are rendered entirely by hide-rules.js from window.HIDE_RULES_CONFIG (the same
+    "render the collection in JS from an embedded config blob" shape
+    static/js/channel-search.js already uses for its rail) - #rules-section and #scope-pills
+    below are the scaffold it fills in, not left-empty placeholders.
+
+    A Setup-section page, reached from the sidebar - deliberately NOT one of the Channels
+    hub's tabs, which are on their way out (dev/changelog/782).
+
+    dev/docs/DESIGN-channel-hiding.md is the settled design this implements. #}
+
+{% block content %}
+<style>
+/* ══════════════════════════════════════════════════════════════════════════
+   Hide Rules. Generic components (.page-head, .card, .tbl, .table-scroll, .btn, .menu,
+   .switch, .badge, .dash-pulse/.mtile, .clone-type-choice/.clone-type-opt, .modal-wide)
+   come from style.css; what lives here is specific to this page only, per DESIGN.md
+   ("a class styled only in one page's <style> block must never be reused elsewhere").
+   ══════════════════════════════════════════════════════════════════════════ */
+
+/* Account filter - the page-level scope row, and the same row reused inside the category
+   picker modal (.picker-scope-row tightens its top margin since it follows the flat/grouped
+   toggle rather than opening a page section). */
+.scope-row { display: flex; align-items: center; gap: 12px; margin: 18px 0 6px; flex-wrap: wrap; }
+.scope-label { font-size: var(--fs-sm); font-weight: 600; color: var(--text-muted);
+  text-transform: uppercase; letter-spacing: .06em; }
+.scope-pills { display: flex; gap: 6px; flex-wrap: wrap; }
+.scope-pill {
+  font: inherit; font-size: var(--fs-md); font-weight: 500; color: var(--text-muted);
+  background: var(--bg1); border: 1px solid var(--border); border-radius: 999px;
+  padding: 5px 13px; cursor: pointer;
+}
+.scope-pill:hover { color: var(--text); }
+.scope-pill.active { background: var(--accent-soft); border-color: var(--accent); color: var(--accent-text); font-weight: 600; }
+.picker-scope-row { margin: 0 0 12px; }
+
+/* Rules table cells */
+.rule-pattern { font-family: var(--font-mono); font-size: var(--fs-md); }
+.rule-target-badge, .rule-scope-badge {
+  font-size: var(--fs-2xs); font-weight: 600; letter-spacing: .02em; text-transform: uppercase;
+  padding: 2px 8px; border-radius: 999px; white-space: nowrap; display: inline-block;
+}
+.rule-target-badge.t-category_glob, .rule-target-badge.t-category_exact { background: var(--accent-soft); color: var(--accent-text); }
+.rule-target-badge.t-name_glob { background: rgba(159,201,60,.14); color: var(--band-good); }
+.rule-scope-badge { background: var(--bg2); color: var(--text-muted); border: 1px solid var(--border-soft); }
+.rule-match-n { font-family: var(--font-mono); font-variant-numeric: tabular-nums; font-weight: 600; }
+.rule-deferred-note { color: var(--warn); font-size: var(--fs-sm); margin-left: 6px; cursor: help; border-bottom: 1px dotted var(--warn); }
+.rule-disabled-row td { opacity: .5; }
+.rule-disabled-row:hover td { opacity: .75; }
+.rules-empty { padding: 22px 4px; color: var(--text-muted); font-size: var(--fs-md); }
+
+/* Sortable table headers - shared by the rules table and the category picker table. */
+.tbl th.sortable { cursor: pointer; user-select: none; white-space: nowrap; }
+.tbl th.sortable:hover { color: var(--text); }
+.sort-caret { display: inline-block; margin-left: 4px; font-size: 9px; color: var(--text-faint); opacity: 0; transition: transform .12s; }
+.sort-caret.active { opacity: 1; color: var(--text-muted); }
+.sort-caret.desc { transform: rotate(180deg); }
+
+/* Two-choice "what do you want to hide" / "pick or pattern" step reuses the shipped
+   clone-type-choice/clone-type-opt radio-card component verbatim (style.css). */
+
+/* Category picker (inside Add Rule) - a table.tbl in the shipped shape. */
+.cat-search { width: 260px; }
+.cat-list-scroll table.tbl thead th { position: sticky; top: 0; background: var(--bg1); z-index: 1; }
+.tbl .cat-check-cell { width: 30px; }
+.tbl .cat-name-cell { max-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cat-empty { padding: 18px 4px; color: var(--text-muted); font-size: var(--fs-md); }
+
+.picker-toolbar { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; flex-wrap: wrap; }
+.picker-toolbar .cat-search { flex: 1 1 200px; }
+.picker-toolbar .picked-count { color: var(--text-muted); font-size: var(--fs-sm); white-space: nowrap; }
+
+/* Grouped-by-prefix view */
+.cat-group { border: 1px solid var(--border-soft); border-radius: var(--radius-sm); margin-bottom: 8px; overflow: hidden; }
+.cat-group-head { display: flex; align-items: center; gap: 10px; padding: 9px 12px; background: var(--bg2);
+  cursor: pointer; user-select: none; }
+.cat-group-head:hover { background: var(--bg3); }
+.cat-group-caret { font-size: var(--fs-xs); color: var(--text-faint); transition: transform .12s; flex-shrink: 0; }
+.cat-group.open .cat-group-caret { transform: rotate(90deg); }
+.cat-group-name { font-weight: 600; font-size: var(--fs-lg); font-family: var(--font-mono); }
+.cat-group-meta { color: var(--text-muted); font-size: var(--fs-sm); margin-left: auto; margin-right: 4px; }
+.cat-group-body { display: none; padding: 2px 10px 4px; }
+.cat-group.open .cat-group-body { display: block; }
+
+/* Segmented toggle - the category picker's flat/grouped view switch. Flat is the default. */
+.seg-toggle { display: inline-flex; border: 1px solid var(--border); border-radius: var(--radius-sm); overflow: hidden; margin-bottom: 14px; }
+.seg-btn { font: inherit; font-size: var(--fs-md); padding: 6px 14px; background: var(--bg1); border: none;
+  color: var(--text-muted); cursor: pointer; }
+.seg-btn + .seg-btn { border-left: 1px solid var(--border); }
+.seg-btn.active { background: var(--accent-soft); color: var(--accent-text); font-weight: 600; }
+
+/* Add / edit rule form: the live preview */
+.rule-form-row { display: flex; gap: 12px; margin-bottom: 12px; }
+.rule-form-row > label { flex: 1; min-width: 0; display: block; }
+.rule-form-row .fl-label { font-size: var(--fs-md); font-weight: 600; color: var(--text); margin-bottom: 4px; display: block; }
+.rule-form-row select, .rule-form-row input[type=text] {
+  background: var(--bg2); border: 1px solid var(--border); border-radius: var(--radius-sm);
+  color: var(--text); font: inherit; font-size: var(--fs-md); padding: 7px 10px; width: 100%; }
+.rule-form-row input[type=text].mono { font-family: var(--font-mono); }
+.rule-form-row select:focus, .rule-form-row input:focus { outline: none; border-color: var(--accent); }
+
+.preview-box { border: 1px solid var(--border-soft); border-radius: var(--radius-sm); background: var(--bg2);
+  padding: 12px 14px; min-height: 46px; }
+.preview-hint { color: var(--text-muted); font-size: var(--fs-md); }
+.preview-headline { font-size: var(--fs-lg); font-weight: 600; }
+.preview-headline .n { font-family: var(--font-mono); }
+.preview-spin { display: inline-block; width: 13px; height: 13px; border-radius: 50%;
+  border: 2px solid var(--border); border-top-color: var(--accent); animation: hr-rot .6s linear infinite;
+  vertical-align: -2px; margin-right: 6px; }
+@keyframes hr-rot { to { transform: rotate(360deg); } }
+.preview-section-t { font-size: var(--fs-2xs); font-weight: 600; text-transform: uppercase; letter-spacing: .06em;
+  color: var(--text-faint); margin: 10px 0 4px; }
+.preview-table-wrap { max-height: 180px; overflow-y: auto; border: 1px solid var(--border-soft);
+  border-radius: var(--radius-sm); margin-top: 4px; }
+.preview-table-wrap table.tbl th, .preview-table-wrap table.tbl td { padding: 4px 10px; font-size: var(--fs-sm); }
+
+.warn-box { background: var(--warn-soft); border: 1px solid rgba(var(--warn-rgb),.4); border-radius: var(--radius-sm);
+  padding: 10px 12px; margin-top: 10px; font-size: var(--fs-md); color: var(--text); }
+.warn-box label { display: flex; align-items: flex-start; gap: 8px; margin-top: 8px; cursor: pointer; font-size: var(--fs-md); }
+.warn-box input[type=checkbox] { margin-top: 3px; }
+
+/* Duplicate-rule notice - unlike .warn-box, there is no checkbox to override this, so it
+   uses the danger token rather than warn to read as a hard stop, not a confirm-and-proceed. */
+.dup-box { background: var(--bad-soft); border: 1px solid rgba(var(--bad-rgb),.4); border-radius: var(--radius-sm);
+  padding: 10px 12px; margin-top: 10px; font-size: var(--fs-md); color: var(--text); }
+
+@media (max-width: 768px) {
+  .rule-form-row { flex-direction: column; }
+  .picker-toolbar .cat-search { flex-basis: 100%; }
+}
+</style>
+
+<div class="page-head">
+  <h1>Hide Rules
+    <span class="sub">{{ rules | length }} rule{{ 's' if rules | length != 1 else '' }}</span>
+  </h1>
+  <button class="btn btn-primary" id="hr-add-btn" type="button">+ Add Rule</button>
+</div>
+
+<p class="text-muted" style="font-size:13px; margin: 0 0 1rem;">
+  Take channels out of your way without deleting them - a blanket rule over a provider
+  category or a channel name, on top of hiding one channel at a time from its own page.
+  A hidden channel leaves search, the pickers and the counts, keeps its detail page, and
+  stops having EPG imported for it. A channel in your TV Guide or a channel group stays
+  visible until you remove it from there, no matter what a rule says.
+</p>
+
+<div class="dash-pulse">
+  <div class="mtile"><div class="m-k">Hidden now</div><div class="m-v">{{ '{:,}'.format(hidden_count) }}</div><div class="m-s">channels</div></div>
+  <div class="mtile"><div class="m-k">Rules active</div><div class="m-v">{{ enabled_rules }} <span style="font-size:var(--fs-lg);color:var(--text-faint);font-weight:400;">/ {{ rules | length }}</span></div><div class="m-s">enabled / total</div></div>
+  <div class="mtile{{ ' warn' if deferred_count else '' }}" data-tip="Matched by a rule, but kept visible because they're in your TV Guide or a channel group."><div class="m-k">Kept visible</div><div class="m-v">{{ '{:,}'.format(deferred_count) }}</div><div class="m-s">deferred</div></div>
+  <div class="mtile"><div class="m-k">Still offered</div><div class="m-v">{{ '{:,}'.format(total_channels - hidden_count) }}</div><div class="m-s">channels</div></div>
+</div>
+
+<div class="scope-row">
+  <div class="scope-label">Account</div>
+  <div class="scope-pills" id="scope-pills"></div>
+</div>
+
+<div id="rules-section"></div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+window.HIDE_RULES_CONFIG = {
+  rules: {{ rules_json | tojson }},
+  accounts: {{ accounts_json | tojson }},
+  targetLabels: {{ target_labels | tojson }},
+  totalChannels: {{ total_channels }},
+};
+</script>
+<script src="{{ url_for('static', filename='js/hide-rules.js') }}"></script>
+{% endblock %}

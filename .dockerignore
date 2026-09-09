@@ -1,0 +1,73 @@
+# What never enters the image build context.
+#
+# Two jobs, and the first one matters far more than image size: nothing here that holds a
+# secret may ever be baked into a layer. A config.yaml copied into an image carries the
+# provider credentials and notification webhook tokens of whoever built it, and layers are
+# readable by anyone who pulls the image.
+#
+# Guarded by tests/test_docker_packaging.py - add a secret-bearing path here and there too.
+
+# --- Secrets and live state (the leak guard) ---
+config.yaml
+config.local.yaml
+instance/
+dvr.db
+dvr.db-shm
+dvr.db-wal
+dvr.db-journal
+capture-logs/
+*.log
+dvr.log.*
+
+# --- Recordings and scratch output ---
+/dvr/
+epg.xml
+epg.txt
+
+# --- Dev-only tree (docs, backlog, changelog, mockups, samples, screenshots) ---
+dev/
+CLAUDE.md
+AGENTS.md
+CONTRIBUTING.md
+.claude/
+.mcp.json
+.playwright-mcp/
+scripts/
+
+# --- Repo docs, test and browser tooling: ship in the repo, have no job in a runtime image ---
+# docs/ is the public repo's own documentation, including the README screenshots. README.md
+# itself references those screenshots by relative path (docs/screenshots/*.png), so shipping
+# the README without docs/ would leave seven broken images with nothing in the container ever
+# reading it anyway - excluded rather than dragging docs/screenshots/ along just for this.
+docs/
+README.md
+tests/
+run_tests.sh
+node_modules/
+package.json
+package-lock.json
+playwright.config.ts
+
+# --- Git, lint and editor ---
+.git/
+.gitignore
+.gitignore.public
+.publishignore
+.flake8
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# --- Python build artifacts ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# --- Docker's own files (COPY . would otherwise put them in the image) ---
+Dockerfile
+.dockerignore
+docker-compose.yml
+docker-compose.example.yml

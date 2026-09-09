@@ -1,0 +1,799 @@
+{% extends "base.html" %}
+{% from '_macros.html' import csrf_field, secret_reveal_btn,
+   field_shell, field_text, field_number, field_time, field_bool, field_select, field_list, field_readonly %}
+{% block title %}Settings - ChannelBin{% endblock %}
+
+{% block content %}
+<style>
+/* ══════════════════════════════════════════════════════════════════════════
+   Settings page. DESIGN.md 15 (approved 2026-08-02); reference mockups
+   dev/mockups/27-settings-desktop.html + 28-settings-mobile.html; rollout
+   dev/changelog/439. Everything generic (.card, .tbl, .btn, .switch, .badge,
+   .search-wrap, .tabs, .modal-*) comes from style.css - only the rail, the
+   field row and the mobile section picker live here, because only this page
+   has them.
+   ══════════════════════════════════════════════════════════════════════════ */
+
+/* Height of the mobile section-picker bar. Read, never restated: the sticky
+   offset, the scroll-margin the jump targets use and the scrollspy's reading
+   line are all one value derived from this. */
+.set-page { --pick-h: 42px; }
+
+/* The one control on this toolbar, so it gets more room than the shared 250px. */
+.set-page .toolbar .search { width: 340px; max-width: 100%; }
+
+/* ── The rail (desktop) ───────────────────────────────────────────────── */
+/* Page-scoped cap (dev/changelog/733): the shell's own max-width is gone
+   app-wide, but .frow's label/description column is an unbounded 1fr track
+   with no cap of its own (DESIGN.md 2) - left uncapped it stretches the
+   description text the full width of an ultrawide window while the 340px
+   control column drifts away from its label. Cap the page, never the shell. */
+.set-wrap { display: flex; align-items: flex-start; gap: 22px; max-width: 1400px; }
+.set-rail { flex: 0 0 194px; position: sticky; top: 18px; align-self: flex-start; }
+.set-rail-inner { background: var(--bg1); border: 1px solid var(--border-soft);
+  border-radius: var(--radius); padding: 6px; box-shadow: var(--shadow-row); }
+.rail-lbl { font-size: var(--fs-2xs); text-transform: uppercase; letter-spacing: .08em;
+  color: var(--text-faint); font-weight: 700; padding: 7px 10px 5px; }
+.rail-a { display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  padding: 5px 10px; border-radius: var(--radius-sm); color: var(--text-muted);
+  font-size: var(--fs-md); font-weight: 500; cursor: pointer; border: none; background: none;
+  font-family: inherit; width: 100%; text-align: left; }
+.rail-a:hover { background: var(--bg2); color: var(--text); text-decoration: none; }
+.rail-a.here { background: var(--accent-soft); color: var(--accent-text); }
+.rail-a .rc { font-size: var(--fs-xs); color: var(--text-faint); font-variant-numeric: tabular-nums; }
+.rail-a.here .rc { color: var(--accent-text); }
+/* A section with no search hit dims rather than vanishing: the rail is a map of
+   the page, and a map that loses roads while you use it is worse than one that
+   greys them. Clicking a dimmed one still goes there and says why. */
+.rail-a.nohit { opacity: .38; }
+.set-body { flex: 1; min-width: 0; }
+.set-body .card:first-child { margin-top: 0; }
+
+/* ── Section cards ────────────────────────────────────────────────────── */
+/* The reading line the scrollspy uses is READ OFF this value, so a jump lands a
+   card exactly where the spy considers it current. Desktop has no sticky header,
+   but the offset still has to exist: with no scroll-margin the derived line is
+   ~2px, so a section only became "current" once its heading had scrolled off the
+   top - measured in the browser pass as the rail naming the previous section for
+   the first 50-100px of every section. */
+.sec-card { scroll-margin-top: 88px; }
+.sec-card .card-head { padding: 11px 18px; }
+.sec-card .card-head h2 { font-size: var(--fs-md); letter-spacing: .06em; }
+.sec-card .card-body { padding: 0 0 2px; }
+/* A section the query does not touch collapses to its own head rather than
+   hiding: the rail lists eleven sections and a page that shows four contradicts
+   it, and "Debug: no matches" is itself an answer. */
+.sec-card.nohit { margin-top: 6px; opacity: .6; }
+.sec-card.nohit .card-head { padding: 6px 18px; border-bottom: none; }
+.sec-card.nohit .card-body { display: none; }
+.sec-card.nohit .card-head h2 { color: var(--text-faint); }
+.sec-note { padding: 10px 18px 2px; font-size: var(--fs-sm); color: var(--text-muted); line-height: 1.5; }
+.sec-sub { padding: 16px 18px 2px; font-size: var(--fs-sm); color: var(--text-muted); line-height: 1.5;
+  border-top: 1px solid var(--border-soft); margin-top: 6px; }
+.sec-sub strong { display: block; font-size: var(--fs-md); color: var(--text); margin-bottom: 3px; }
+.auth-password-form { padding: 6px 18px 16px; max-width: 340px; }
+
+/* ── The field row's own rules. The anatomy itself (.frow / .fl* / .fr-ctl /
+      .restart-badge, and the ≤768px stack) lives in style.css as of
+      dev/changelog/440, because Notifications' Delivery card is the second page
+      to use it. What stays here is what belongs to THIS page's search, not to
+      the row. ─────────────────────────────────────────────────────────────── */
+.frow.hit { background: rgba(var(--accent-rgb), .05); }
+.frow.off { display: none; }
+/* The one row that is a warning rather than a setting: the app saying it has no
+   authentication and is bound to every interface. */
+.frow.warn { background: var(--warn-soft); }
+.frow.warn .fl-label { color: var(--warn); }
+/* The filename-template row shows the stored template above its own action, so
+   the control column stacks. Keyed off the path rather than a modifier class:
+   the shell macro emits one .fr-ctl for every field kind, and one row wanting a
+   different arrangement is not worth a parameter on all 84. */
+.frow[data-path="recording.filename_template"] .fr-ctl { flex-direction: column; align-items: flex-end; gap: 6px; }
+.fr-ctl .tpl-now { font-family: var(--font-mono); font-size: var(--fs-sm); color: var(--text-muted);
+  overflow-wrap: break-word; text-align: left; max-width: 100%; }
+
+/* ── Search answers that are not field rows. The designer, Notifications and
+      the Maintenance page are things this page can answer for, so they are
+      drawn as real results above the sections rather than as a footnote. ── */
+.sres { display: flex; flex-direction: column; gap: 8px; margin-bottom: 14px; }
+.sres-card { display: flex; align-items: center; gap: 14px; padding: 12px 16px;
+  background: var(--bg1); border: 1px solid var(--accent); border-left-width: 3px;
+  border-radius: var(--radius); box-shadow: var(--shadow-row); }
+.sres-txt { flex: 1; min-width: 0; }
+.sres-name { font-size: var(--fs-lg); font-weight: 600; color: var(--text); display: flex;
+  align-items: center; gap: 8px; flex-wrap: wrap; }
+.sres-kind { font-size: var(--fs-2xs); font-weight: 700; letter-spacing: .05em; text-transform: uppercase;
+  background: var(--accent-soft); color: var(--accent-text); border-radius: 999px; padding: 1px 8px; }
+.sres-desc { font-size: var(--fs-md); color: var(--text-muted); line-height: 1.45; margin-top: 2px; }
+.sres-card .btn { flex: none; }
+.no-hits { padding: 28px 18px; text-align: center; color: var(--text-muted); font-size: var(--fs-lg); }
+#no-hits-slot .card { margin-top: 0; margin-bottom: 14px; }
+
+/* ── The config.yaml pane ─────────────────────────────────────────────── */
+.yaml-pane textarea { width: 100%; min-height: 460px; background: var(--bg1);
+  border: 1px solid var(--border-soft); border-radius: var(--radius); color: var(--text);
+  font-family: var(--font-mono); font-size: var(--fs-sm); line-height: 1.55; padding: 14px 16px; resize: vertical; }
+.yaml-pane textarea:focus { outline: none; border-color: var(--accent); }
+.yaml-foot { display: flex; align-items: center; gap: 12px; margin-top: 12px; flex-wrap: wrap; }
+.yaml-foot .note { font-size: var(--fs-sm); color: var(--text-muted); }
+
+/* ── The mobile section picker (DESIGN.md 15.5 item 1) ─────────────────
+   Desktop's rail is a column beside the content; there is no such column on a
+   phone, and stacking it above the body pushes the first setting below the fold
+   and then scrolls away - the map is gone exactly when you are lost in the
+   middle of 84 rows. The bar is sticky under the top bar and names the section
+   you are in, driven by the same scrollspy the rail uses. Its list is a bottom
+   sheet, which is what buildModal() already becomes at these widths (9.6). */
+.secpick { display: none; }
+.secpick-btn { display: flex; align-items: center; gap: 9px; width: 100%; height: var(--pick-h);
+  background: var(--bg1); border: 1px solid var(--border); border-radius: var(--radius-sm);
+  color: var(--text); font: inherit; padding: 0 12px; cursor: pointer; text-align: left; }
+.secpick-btn .sp-lbl { font-size: var(--fs-2xs); text-transform: uppercase; letter-spacing: .08em;
+  color: var(--text-faint); font-weight: 700; flex: none; }
+.secpick-btn .sp-cur { flex: 1; min-width: 0; font-size: var(--fs-lg); font-weight: 600;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.secpick-btn .sp-n { font-size: var(--fs-xs); color: var(--text-faint);
+  font-variant-numeric: tabular-nums; flex: none; }
+.secpick-btn .sp-caret { color: var(--text-muted); flex: none; }
+.secpick.nohit .sp-cur { color: var(--text-faint); }
+.sp-row { display: flex; align-items: center; gap: 10px; width: 100%; padding: 11px 10px;
+  border: none; background: none; font: inherit; color: var(--text-muted); text-align: left;
+  border-radius: var(--radius-sm); cursor: pointer; }
+.sp-row .spr-t { flex: 1; min-width: 0; font-size: var(--fs-lg); font-weight: 500; }
+.sp-row .spr-n { font-size: var(--fs-sm); color: var(--text-faint); font-variant-numeric: tabular-nums; }
+.sp-row.here { background: var(--accent-soft); color: var(--accent-text); }
+.sp-row.here .spr-n { color: var(--accent-text); }
+.sp-row.nohit { opacity: .4; }
+.sp-note { font-size: var(--fs-sm); color: var(--text-faint); line-height: 1.45; padding: 10px 10px 2px; }
+
+/* ── Responsive ──────────────────────────────────────────────────────────
+   The switch is at 900px, not 768px: that is where base.html drops the sidebar
+   shell for the .topnav bar, and it is also where a 194px rail column stops
+   having room. Between 769 and 900 the old placeholder stacked the rail as a
+   flat eleven-item list, which is the spelling DESIGN.md 15.5 rejected. */
+@media (max-width: 900px) {
+  .set-wrap { display: block; }
+  .set-rail { display: none; }
+  .secpick { display: block; position: sticky; top: var(--topnav-h); z-index: 120;
+    margin: 12px 0 0; padding-bottom: 10px; background: var(--bg0); }
+  /* Two sticky layers sit above the content here, so a jump target has to clear
+     BOTH or the section head lands underneath them. Same one-value rule as the
+     desktop offset above: the spy reads whatever this resolves to. */
+  .sec-card { scroll-margin-top: calc(var(--topnav-h) + var(--pick-h) + 20px); }
+}
+@media (max-width: 768px) {
+  /* The row itself stacks in style.css; these are the page's own knock-ons. */
+  .sec-card .card-head { padding: 10px 14px; }
+  .sec-note { padding: 10px 14px 2px; }
+  .sec-sub { padding: 14px 14px 2px; }
+  .auth-password-form { padding: 6px 14px 16px; max-width: none; }
+  .sres-card { flex-direction: column; align-items: flex-start; }
+  .sres-card .btn { width: 100%; justify-content: center; }
+}
+</style>
+
+<div class="set-page">
+
+{# ── Set up config sub-dicts for Jinja2 access ──────────────────────── #}
+{% set rec    = cfg.get('recording', {}) %}
+{% set pp     = rec.get('post_process', {}) %}
+{% set mc     = rec.get('move_on_complete', {}) %}
+{% set ps     = rec.get('post_script', {}) %}
+{% set lt     = rec.get('live_thumbnail', {}) %}
+{% set lc     = rec.get('logo_cache', {}) %}
+{% set wd     = cfg.get('watchdog', {}) %}
+{% set ff     = cfg.get('ffmpeg', {}) %}
+{% set sync_cfg = cfg.get('sync', {}) %}
+{% set acct_cfg = cfg.get('accounts', {}) %}
+{% set search_cfg = cfg.get('search', {}) %}
+{% set http   = cfg.get('http', {}) %}
+{% set ct     = cfg.get('channel_testing', {}) %}
+{% set lgcfg  = cfg.get('logging', {}) %}
+{% set cb     = cfg.get('config_backup', {}) %}
+{% set dbg    = cfg.get('debug', {}) %}
+{% set fsk    = cfg.get('flask', {}) %}
+{% set dbcfg  = cfg.get('database', {}) %}
+{% set dsp    = cfg.get('display', {}) %}
+{% set authcfg = cfg.get('auth', {}) %}
+{% set auth_has_password = (authcfg.get('password_hash') or '').strip() != '' %}
+{% set hacfg = cfg.get('integrations', {}).get('home_assistant', {}) %}
+{% set ha_has_key = (hacfg.get('api_key_hash') or '').strip() != '' %}
+
+{# The field-row macros live in _macros.html (imported at the top of this file) as
+   of dev/changelog/440 - Notifications' Delivery card is the second caller. Only
+   this page's own section shell is local. #}
+{% macro section(id, title) %}
+<section class="card sec-card" id="sec-{{ id }}" data-sec="{{ id }}" data-sec-title="{{ title }}">
+  <div class="card-head"><h2>{{ title }} <span class="cnt" data-cnt="{{ id }}"></span></h2></div>
+  <div class="card-body">{{ caller() }}</div>
+</section>
+{% endmacro %}
+
+<div class="page-head">
+  <h1>Settings <span class="sub">ChannelBin v{{ app_version }}</span></h1>
+  <div class="card-head-actions">
+    <a class="btn btn-sm" href="{{ url_for('settings.notifications_settings') }}">Notification settings</a>
+  </div>
+</div>
+
+<div class="tabs" role="tablist">
+  <button class="tab active" type="button" data-tab="gui" role="tab" aria-selected="true">Settings</button>
+  <button class="tab" type="button" data-tab="yaml" role="tab" aria-selected="false">config.yaml</button>
+</div>
+
+{# ───────────────────────── SETTINGS TAB ─────────────────────────────── #}
+<div id="pane-gui">
+
+  <div class="toolbar">
+    <div class="search-wrap" id="swrap">
+      <input type="text" class="search" id="ssearch" autocomplete="off"
+             placeholder="Search settings by name, description or key">
+      <button class="search-clear" id="sclear" type="button" aria-label="Clear the search">&times;</button>
+    </div>
+    <span class="chip" id="shits" style="display:none"></span>
+  </div>
+
+  {# Both search answers that are not field rows live ABOVE the sections, in
+     fixed slots: a result that arrives below eleven cards is a result nobody
+     sees, and a fixed slot means ordering cannot depend on what matched. #}
+  <div id="sres"></div>
+  <div id="no-hits-slot"></div>
+
+  <div class="secpick" id="secpick">
+    <button class="secpick-btn" id="secpick-btn" type="button" aria-haspopup="dialog">
+      <span class="sp-lbl">Section</span>
+      <span class="sp-cur" id="sp-cur">Display</span>
+      <span class="sp-n" id="sp-n"></span>
+      <span class="sp-caret">&#9662;</span>
+    </button>
+  </div>
+
+  <div class="set-wrap">
+    <nav class="set-rail" aria-label="Settings sections">
+      <div class="set-rail-inner">
+        <div class="rail-lbl">Sections</div>
+        <div id="rail"></div>
+      </div>
+    </nav>
+
+    <div class="set-body" id="secs">
+
+    {% call section('display', 'Display') %}
+      {{ field_select('display.timezone', 'Timezone',
+         'IANA timezone identifier used for all displayed times. Affects display only - recordings are always stored in UTC.',
+         'America/New_York', dsp.get('timezone', 'America/New_York'), timezone_options) }}
+      {{ field_select('display.time_format', 'Time format',
+         '12-hour clock with AM/PM, or 24-hour clock.',
+         '12h', dsp.get('time_format', '12h'),
+         [('12h','12-hour (AM/PM)'), ('24h','24-hour')]) }}
+      {{ field_number('display.nav_poll_interval_seconds', 'Nav bar refresh interval (seconds)',
+         'How often the nav bar (system stats, alerts, activity indicators) polls for updates.',
+         '15', dsp.get('nav_poll_interval_seconds', 15)) }}
+      {{ field_bool('display.guide_collapse_gaps', 'Collapse guide gaps when filtering',
+         'On the TV Guide page, skips stretches of time with no matching programs when a search filter is active, with a jagged divider marking each skip.',
+         'true', dsp.get('guide_collapse_gaps', True)) }}
+    {% endcall %}
+
+    {% call section('recording', 'Recording') %}
+      {{ field_text('recording.dvr_output_dir', 'Output directory',
+         'Directory where recording files are written.',
+         '/dvr', rec.get('dvr_output_dir', '/dvr')) }}
+      {{ field_number('recording.segment_duration_seconds', 'Segment duration (seconds)',
+         'How long each recording segment runs before a clean restart. 0 = one long run per restart (disabled).',
+         '0', rec.get('segment_duration_seconds', 0)) }}
+      {{ field_number('recording.retention_days', 'Auto-delete recordings after (days)',
+         'Automatically delete completed, failed, and aborted recordings once they are this many days old. 0 = never delete. A daily sweep runs at 04:00. Overridable per Recording Profile.',
+         '0', rec.get('retention_days', 0)) }}
+      {{ field_bool('recording.retention_delete_file', 'Also delete the file on disk',
+         'When retention deletes a recording, also remove its file from disk. Off keeps the file and only deletes the database record.',
+         'false', rec.get('retention_delete_file', False)) }}
+      {% call field_shell('recording.filename_template', 'Filename template',
+         'Template for auto-generated recording names from EPG guide data.',
+         '{date} - {title} - {channel}', false, false,
+         'naming name file rename variables tag cleanup preview designer') %}
+      <code class="tpl-now">{{ rec.get('filename_template', '{date} - {title} - {channel}') }}</code>
+      <button type="button" class="btn btn-sm" data-open-fd>Open the designer</button>
+      {% endcall %}
+      {{ field_bool('recording.post_process.enabled', 'Post-process (remux)',
+         'Losslessly remux the final .ts file to another container after concatenation. Near-zero CPU usage.',
+         'true', pp.get('enabled', True)) }}
+      {{ field_select('recording.post_process.format', 'Output format',
+         'Container format for the remuxed file.',
+         'mp4', pp.get('format', 'mp4'),
+         [('mp4','MP4 (best compatibility with Plex, Android TV)'), ('mkv','MKV')]) }}
+      {{ field_bool('recording.post_process.delete_source', 'Delete source .ts',
+         'Delete the original .ts file after a successful conversion.',
+         'true', pp.get('delete_source', True)) }}
+      {{ field_number('recording.post_process.pre_output_timeout_seconds', 'No-output timeout (seconds)',
+         'How long a conversion may run without producing its first frame of output before it is treated as stuck. This is not a limit on the whole job: once output is advancing, a conversion runs for as long as it keeps advancing, however long that takes. Only the stall timeout below can end one that has started producing output.',
+         '1800', pp.get('pre_output_timeout_seconds', 1800)) }}
+      {{ field_select('recording.post_process.reencode_mode', 'Video re-encode (MP4 seek repair)',
+         'Stream drops during capture leave gaps in the video timeline that make fast-forward/rewind freeze in Plex when kept as a lossless copy. "Only when damaged" scans each recording after concatenation and re-encodes if damage is found, or if the stream came back at a different frame rate partway through and the file needs normalizing to one constant rate. Either way the reason is named in the recording event log, and they are kept apart there - a rate change is not damage. Clean recordings keep the fast lossless copy. Re-encoding is CPU-heavy and its speed depends entirely on the machine - a long recording on a slow box can take many hours, and is allowed to.',
+         'damaged', pp.get('reencode_mode', 'damaged'),
+         [('damaged','Only when damage detected (recommended)'), ('always','Always re-encode'), ('never','Never - always lossless copy')]) }}
+      {{ field_number('recording.post_process.video_crf', 'Video quality (CRF)',
+         'libx264 quality for the video re-encode path only (0-51; lower means better quality and a larger file). Has no effect unless a re-encode actually happens, per the re-encode mode above.',
+         '20', pp.get('video_crf', 20)) }}
+      {{ field_number('recording.post_process.audio_bitrate_kbps', 'Audio bitrate (kbps)',
+         'AAC bitrate for mp4 output. Applies to every mp4 conversion, re-encoded or not - audio is always re-encoded from ADTS to raw AAC for mp4 output.',
+         '192', pp.get('audio_bitrate_kbps', 192)) }}
+      <div class="sec-sub">
+        <strong>Conversion resilience</strong>
+        A conversion can be interrupted mid-flight (an ffmpeg crash, a stall, or a service restart).
+        These control whether the app monitors and restarts it, and how it shows progress.
+      </div>
+      {{ field_bool('recording.post_process.auto_restart', 'Auto-restart stopped conversions',
+         'If a conversion process dies or stalls, restart it from scratch (logged to the recording event log). If it keeps failing, the recording is marked FAILED and an alert is raised once the restart budget is spent.',
+         'true', pp.get('auto_restart', True)) }}
+      {{ field_number('recording.post_process.max_restart_attempts', 'Max restart attempts',
+         'How many times to restart a failed conversion before giving up and marking it FAILED. This counts restarts after the first try, so 3 means up to 4 total attempts. 0 disables auto-restart entirely.',
+         '3', pp.get('max_restart_attempts', 3)) }}
+      {{ field_number('recording.post_process.stall_seconds', 'Stall timeout (seconds)',
+         'If a conversion is still running but its output stops growing for this long, treat it as stalled: kill it and count a failed attempt. This is the only thing that ends a conversion once it is producing output. Setting it to 0 disables stall detection, which leaves nothing watching progress - so the no-output timeout above becomes a limit on the whole job instead.',
+         '300', pp.get('stall_seconds', 300)) }}
+      {{ field_number('recording.post_process.progress_interval_seconds', 'Progress update interval (seconds)',
+         'How often the conversion writes progress (size, % complete, ETA) that the detail page and dashboard show. Clamped to 1-60.',
+         '5', pp.get('progress_interval_seconds', 5)) }}
+      <div class="sec-sub">
+        <strong>Recording collision avoidance</strong>
+        A conversion is local CPU/disk work that can compete with a scheduled recording for
+        the same resources. These control what happens when the two collide.
+      </div>
+      {{ field_select('recording.post_process.collision_policy', 'When a conversion collides with a recording',
+         'What to do when an mp4 conversion and a scheduled/in-progress recording want the same local resources at the same time.',
+         'cancel', pp.get('collision_policy', 'cancel'),
+         [('cancel','Pause the conversion, resume once clear (recommended - the recording is never delayed)'),
+          ('wait','Delay the recording until the conversion finishes (fails the recording if its own window would already be over)'),
+          ('off','Off - no collision avoidance')]) }}
+      {{ field_number('recording.post_process.collision_lookahead_multiplier', 'Conversion speed assumption (x realtime)',
+         "How far ahead of a scheduled recording's start to avoid beginning a new conversion, expressed as a multiple of realtime. 1 assumes the conversion runs at 1x realtime and looks ahead the recording's full duration (always safe); 2 assumes 2x realtime and only looks ahead half of it. Minimum 0.1.",
+         '1', pp.get('collision_lookahead_multiplier', 1.0), step='0.1') }}
+      {{ field_bool('recording.move_on_complete.enabled', 'Move on complete',
+         'Move the finished file to a different folder after all post-processing is done.',
+         'false', mc.get('enabled', False)) }}
+      {{ field_text('recording.move_on_complete.destination', 'Move destination',
+         'Absolute path to move the final file to. Directory is created if it does not exist.',
+         '(empty)', mc.get('destination', '')) }}
+      {{ field_bool('recording.post_script.enabled', 'Run post-completion script',
+         'Execute a shell script after the recording finishes all post-processing. Non-fatal: recording is marked COMPLETED regardless of script outcome.',
+         'true', ps.get('enabled', True)) }}
+      {{ field_text('recording.post_script.path', 'Post-completion script path',
+         'Absolute path to the script. Invoked with no arguments; working directory is set to the script\'s parent folder.',
+         '(empty)', ps.get('path', '')) }}
+      {{ field_bool('recording.gather_health_data', 'Gather recording health data',
+         'After concatenation, run ffprobe on the final .ts file to capture resolution, fps, frame count, and bitrate. Runs before any format conversion. Disable to save time on very long recordings.',
+         'true', rec.get('gather_health_data', True)) }}
+      {{ field_bool('recording.serialize_concat', 'Serialize concatenation',
+         'Only run one concatenation+conversion job at a time, and none while any recording is IN_PROGRESS. A queued job waits (segments are already safely on disk) rather than failing. Local CPU/disk contention control - unrelated to per-account connection limits.',
+         'false', rec.get('serialize_concat', False)) }}
+      {{ field_bool('recording.live_thumbnail.enabled', 'Live thumbnail preview',
+         'Show a periodically-refreshed frame from the current segment on the recording detail page while a recording is in progress.',
+         'true', lt.get('enabled', True)) }}
+      {{ field_number('recording.live_thumbnail.auto_refresh_seconds', 'Live thumbnail refresh interval (seconds)',
+         'How often the preview auto-refreshes while viewing an in-progress recording. Each refresh runs a short ffmpeg capture.',
+         '60', lt.get('auto_refresh_seconds', 60)) }}
+      {{ field_bool('recording.logo_cache.enabled', 'Cache channel logos locally',
+         'Download and cache channel logos locally instead of loading them from the provider/CDN on every page view. Only caches logos for channels that are in your TV Guide or belong to a group (a channel group or a health-check group) - not your whole channel catalog, which can be tens of thousands of channels on some accounts. A background job fetches a small batch every few minutes; a logo is only re-fetched if the provider gives it a different URL.',
+         'false', lc.get('enabled', False)) }}
+      {{ field_text('recording.logo_cache.dir', 'Logo cache directory',
+         'Directory where cached logo images are stored.',
+         'instance/logo-cache', lc.get('dir', 'instance/logo-cache')) }}
+    {% endcall %}
+
+    {% call section('watchdog', 'Watchdog') %}
+      {{ field_number('watchdog.poll_interval_seconds', 'Poll interval (seconds)',
+         'How often the watchdog checks the recording file size for growth.',
+         '5', wd.get('poll_interval_seconds', 5)) }}
+      {{ field_number('watchdog.stall_timeout_seconds', 'Stall timeout (seconds)',
+         'Seconds of no file growth before the stream is declared stalled and ffmpeg is killed.',
+         '30', wd.get('stall_timeout_seconds', 30)) }}
+      {{ field_number('watchdog.restart_delay_seconds', 'Restart delay (seconds)',
+         'Seconds to wait before relaunching ffmpeg after killing a stalled process.',
+         '30', wd.get('restart_delay_seconds', 30)) }}
+      {{ field_number('watchdog.max_consecutive_failures', 'Max consecutive failures',
+         'Abort the recording after this many consecutive restarts with no progress. Resets on any successful restart.',
+         '10', wd.get('max_consecutive_failures', 10)) }}
+      {{ field_number('watchdog.early_fail_window_seconds', 'Dead-stream: early-failure window (seconds)',
+         'A segment that stalls within this many seconds of starting is a candidate "early failure" for dead-stream detection.',
+         '60', wd.get('early_fail_window_seconds', 60)) }}
+      {{ field_number('watchdog.early_fail_min_bytes', 'Dead-stream: early-failure min bytes',
+         'A candidate segment must also produce fewer than this many bytes to count as an early failure (default 1MB).',
+         '1048576', wd.get('early_fail_min_bytes', 1048576)) }}
+      {{ field_number('watchdog.early_fail_abort_count', 'Dead-stream: consecutive early failures to abort',
+         'Automatically abort the recording once this many consecutive early-failure segments occur - catches a stream that reconnects but immediately dies each time, which would otherwise never trip "Max consecutive failures" above.',
+         '3', wd.get('early_fail_abort_count', 3)) }}
+      {{ field_number('watchdog.early_fail_abort_window_seconds', 'Dead-stream: abort window (seconds)',
+         'The consecutive early failures must occur within this time window to trigger the automatic abort.',
+         '180', wd.get('early_fail_abort_window_seconds', 180)) }}
+      {{ field_number('watchdog.dead_stream_max_retry_attempts', 'Dead-stream: max retry attempts',
+         'Once the dead-stream abort above trips, retry at 1/2/5/15 minutes then hourly (fixed schedule) instead of giving up immediately, up to this many total attempts or until the recording\'s own scheduled window ends, whichever comes first. 0 disables retrying.',
+         '10', wd.get('dead_stream_max_retry_attempts', 10)) }}
+    {% endcall %}
+
+    {% call section('ffmpeg', 'FFmpeg') %}
+      {{ field_text('ffmpeg.path', 'ffmpeg binary path',
+         'Path to the ffmpeg executable. Uses system PATH if just "ffmpeg".',
+         'ffmpeg', ff.get('path', 'ffmpeg')) }}
+      {{ field_list('ffmpeg.extra_input_args', 'Extra input arguments',
+         'Extra ffmpeg arguments inserted before -i, one per line. E.g. -timeout on its own line, then 5000000 on the next.',
+         '(empty)', ff.get('extra_input_args', [])) }}
+      {{ field_list('ffmpeg.extra_output_args', 'Extra output arguments',
+         'Extra ffmpeg arguments inserted after the input URL, one per line.',
+         '(empty)', ff.get('extra_output_args', [])) }}
+      {{ field_number('ffmpeg.concat_timeout_seconds', 'Concat timeout (seconds)',
+         'Maximum time allowed for the segment concatenation step.',
+         '300', ff.get('concat_timeout_seconds', 300)) }}
+    {% endcall %}
+
+    {% call section('sync', 'Account Sync / EPG') %}
+      {{ field_number('accounts.default_max_connections', 'Default max connections per account',
+         'Fallback cap on concurrent connections (recordings + channel tests) to a single provider, for accounts with no per-account override. Does not apply to account sync.',
+         '1', acct_cfg.get('default_max_connections', 1)) }}
+      {{ field_number('sync.sync_interval_hours', 'Sync interval (hours)',
+         'How often to refresh channel lists and EPG data from M3U/Xtream accounts.',
+         '6', sync_cfg.get('sync_interval_hours', 6), restart=True) }}
+      {{ field_number('sync.epg_days_ahead', 'EPG days ahead',
+         'How many days of future EPG program data to store. Also sets how many days the TV Guide grid spans, so the guide never promises more time than there is data for.',
+         '3', sync_cfg.get('epg_days_ahead', 3)) }}
+      {{ field_number('sync.epg_keep_days', 'EPG keep days',
+         'Delete EPG entries older than this many days. 0 = keep forever.',
+         '1', sync_cfg.get('epg_keep_days', 1)) }}
+      {{ field_number('sync.request_timeout_seconds', 'Request timeout (seconds)',
+         'HTTP timeout for all Xtream API, M3U, and XMLTV fetch requests.',
+         '30', sync_cfg.get('request_timeout_seconds', 30)) }}
+      {{ field_select('sync.url_normalization', 'URL normalization',
+         'Rewrite every stream URL into one consistent form. Only the URL shape changes - the address and credentials the provider supplied are always kept, and a URL with no user/password/id in it is left untouched. Per-account setting overrides this. MPEG-TS without live is recommended: a trailing .ts is often blocked by Cloudflare.',
+         'disabled', norm_mode_value, norm_mode_options) }}
+      {{ field_bool('sync.epg_case_sensitive_matching', 'Case-sensitive EPG ID matching',
+         'Require exact-case match between channel EPG IDs and XMLTV channel ids. When off, case-variant EPG IDs (e.g. FoxSports1.us vs foxsports1.us) are treated as the same channel.',
+         'false', sync_cfg.get('epg_case_sensitive_matching', False)) }}
+      {{ field_bool('sync.skip_sync_if_recording_active', 'Skip sync during recording',
+         'Skip the scheduled EPG sync when a recording is currently in progress.',
+         'true', sync_cfg.get('skip_sync_if_recording_active', True)) }}
+      {{ field_number('sync.skip_sync_if_recording_within_minutes', 'Skip sync window (minutes)',
+         'Also skip the sync if a recording is scheduled to start within this many minutes.',
+         '5', sync_cfg.get('skip_sync_if_recording_within_minutes', 5)) }}
+      {{ field_number('sync.tester_defer_retry_minutes', 'Defer sync past test runs (minutes)',
+         'Skip the scheduled sync while a channel test run is active, then retry after this many minutes. 0 = skip with no retry.',
+         '20', sync_cfg.get('tester_defer_retry_minutes', 20)) }}
+      {{ field_number('sync.url_drift_alert_min_channels', 'URL-change alert threshold (channels)',
+         'Raise an informational alert when one sync rewrites the stream URL of this many existing channels (the provider moved its stream domain or rotated credentials). 0 = disabled.',
+         '50', sync_cfg.get('url_drift_alert_min_channels', 50)) }}
+      {{ field_number('sync.epg_collapse_threshold_percent', 'EPG collapse guard threshold (%)',
+         'Refuse an EPG import when the new data has fewer than this percent of the previous sync\'s entry count (protects against a transient empty/garbage feed wiping the guide). 0 = disabled.',
+         '20', sync_cfg.get('epg_collapse_threshold_percent', 20)) }}
+      {{ field_number('sync.channel_missing_after_days', 'Channel missing after (days)',
+         'Show a "Missing from provider" badge and raise a digest alert when a channel hasn\'t appeared in this account\'s synced feed for this many days. Display only - channels are never deleted or disabled. 0 = off.',
+         '7', sync_cfg.get('channel_missing_after_days', 7)) }}
+      {{ field_number('sync.channel_new_within_days', 'Channel new within (days)',
+         'Show a "New" badge on channels that first appeared within this many days (suppressed during an account\'s own first-sync period). 0 = off.',
+         '3', sync_cfg.get('channel_new_within_days', 3)) }}
+      {{ field_number('sync.feed_shrink_percent', 'Feed shrink alert threshold (%)',
+         'Raise an advisory alert when this percent or more of an account\'s previously-synced channels are absent from one sync (possible provider outage). Channels are never deleted. 0 = disabled.',
+         '50', sync_cfg.get('feed_shrink_percent', 50)) }}
+      {{ field_bool('search.tag_id_cache_enabled', 'Cache tag search results',
+         'Remember which channels carry each tag instead of recalculating it on every search. Fixes real slowdowns from common-word tag patterns (e.g. "live"). Costs a small amount of RAM (typically kilobytes to a few tens of MB) - turn off if the box is RAM constrained.',
+         'true', search_cfg.get('tag_id_cache_enabled', True)) }}
+      {{ field_number('search.standing_breakdown_cache_ttl_seconds', 'Airing count cache (seconds)',
+         'How long the TV Guide airing search\'s unfiltered totals and "Hide X" counts may be served from cache before recomputing. A sync always invalidates it immediately; this bounds staleness from anything a sync would not catch (a health check, a channel-group edit, or time simply passing).',
+         '300', search_cfg.get('standing_breakdown_cache_ttl_seconds', 300)) }}
+      {{ field_number('search.degraded_aggregate_timeout_seconds', 'Uncounted totals after (seconds)',
+         'While search is running without its index, how long it may spend on the optional numbers - the match total, the "Hide X" counts and the facet rail - before returning the results without them and labeling them as not counted. Matching rows are always returned and are always complete; only the counts around them are skipped. 0 = never attempt them while unindexed.',
+         '2', search_cfg.get('degraded_aggregate_timeout_seconds', 2)) }}
+      {{ field_number('search.full_scan_aggregate_timeout_seconds', 'Uncounted totals when unindexable (seconds)',
+         'The same limit for a search the index cannot answer even when it is perfectly healthy - today, an airing search with "Show airings that have ended" ticked, which puts every past showing back in scope. Counting those means reading the whole table, so past this many seconds the totals and the facet rail are returned as not counted. Matching rows are always returned and are always complete. 0 = never attempt them.',
+         '8', search_cfg.get('full_scan_aggregate_timeout_seconds', 8)) }}
+      {{ field_number('search.index_janitor_grace_minutes', 'Repair a stale index after (minutes)',
+         'How long a search index may sit unusable with nothing rebuilding it before it is rebuilt automatically. An account sync rebuilds the indexes when it finishes, so this only steps in when no sync is coming - after a restart mid-sync, a cancelled sync, or a restore from backup. 0 = leave repair to the next sync.',
+         '15', search_cfg.get('index_janitor_grace_minutes', 15)) }}
+    {% endcall %}
+
+    {% call section('http', 'HTTP') %}
+      {{ field_text('http.user_agent', 'User-Agent',
+         'User-Agent header sent on all M3U, XMLTV, and Xtream API requests. Some providers restrict access based on this.',
+         'VLC/3.0.18 LibVLC/3.0.18', http.get('user_agent', 'VLC/3.0.18 LibVLC/3.0.18')) }}
+    {% endcall %}
+
+    {% call section('channel-testing', 'Channel Health Checks') %}
+      <div class="sec-note">
+        The automatic guide run's schedule (and pausing it) is managed on the
+        <a href="{{ url_for('channels.channels_health_checks') }}">TV Guide Channels</a>
+        health check, like any other health check.
+      </div>
+      {{ field_bool('channel_testing.skip_if_recording_active', 'Skip test during recording',
+         'Skip the scheduled TV Guide Channels health check when a recording is currently in progress.',
+         'true', ct.get('skip_if_recording_active', True)) }}
+      {{ field_number('channel_testing.skip_if_recording_within_minutes', 'Skip test window (minutes)',
+         'Skip or warn before starting any health check run (system or custom) if a recording is scheduled to start within this many minutes. 0 = off.',
+         '10', ct.get('skip_if_recording_within_minutes', 10)) }}
+      {{ field_number('channel_testing.test_duration_seconds', 'Test duration (seconds)',
+         'How long to test each channel.',
+         '120', ct.get('test_duration_seconds', 120)) }}
+      {{ field_number('channel_testing.wait_between_channels_seconds', 'Wait between channels (seconds)',
+         'Delay between finishing one channel test and starting the next.',
+         '180', ct.get('wait_between_channels_seconds', 180)) }}
+      <div class="sec-note">
+        Health bands turn a 0-100 score into a word and a color everywhere it is shown - the
+        TV Guide badge, the channel page, group cards and the search filter. Each number below
+        is where that band starts; Poor always starts at 0. They must descend.
+      </div>
+      {{ field_number('channel_testing.health_bands.great', 'Great band starts at',
+         'A score at or above this reads Great.',
+         '90', ct.get('health_bands', {}).get('great', 90)) }}
+      {{ field_number('channel_testing.health_bands.good', 'Good band starts at',
+         'A score at or above this, but below the Great cut point, reads Good.',
+         '80', ct.get('health_bands', {}).get('good', 80)) }}
+      {{ field_number('channel_testing.health_bands.fair', 'Fair band starts at',
+         'A score at or above this, but below the Good cut point, reads Fair. Anything below it reads Poor.',
+         '50', ct.get('health_bands', {}).get('fair', 50)) }}
+      {{ field_select('channel_testing.failing_band', 'Counts as failing',
+         'Which band (and every band below it) means a channel is failing. This is what raises the warning on a scheduled recording whose channel has gone bad. "Nothing" leaves only hard test failures and failure streaks.',
+         'Poor', ct.get('failing_band', 'poor'),
+         [('poor', 'Poor'), ('fair', 'Fair or below'), ('good', 'Good or below'),
+          ('great', 'Great or below (everything)'), ('none', 'Nothing')]) }}
+      {{ field_bool('channel_testing.screenshots_enabled', 'Capture screenshots',
+         'Take a screenshot during each channel test.',
+         'true', ct.get('screenshots_enabled', True)) }}
+      {{ field_number('channel_testing.screenshots_keep_count', 'Screenshots to keep (per test)',
+         'Oldest screenshots are pruned per test when this count is exceeded - each guide run and each on-demand job keeps its own newest N for a channel, independently of other tests.',
+         '5', ct.get('screenshots_keep_count', 5)) }}
+      {{ field_text('channel_testing.screenshot_dir', 'Screenshot directory',
+         'Directory where channel test screenshots are saved.',
+         '/dvr/channel_test_screenshots', ct.get('screenshot_dir', '/dvr/channel_test_screenshots')) }}
+      {{ field_text('channel_testing.capture_scratch_dir', 'Capture scratch directory',
+         'Directory where a test\'s temporary video clip (100-200+ MB) is written while the test runs. Leave blank to use the system temp directory.',
+         '(system temp directory)', ct.get('capture_scratch_dir', '')) }}
+      {{ field_number('channel_testing.test_history_keep', 'Test history to keep (per test)',
+         'Number of test results to retain per test - each guide run and each on-demand job keeps its own newest N for a channel. 0 = keep all results forever.',
+         '0', ct.get('test_history_keep', 0)) }}
+      {{ field_number('channel_testing.connect_retries', 'Connect retries',
+         'Extra connection attempts after the first failure.',
+         '2', ct.get('connect_retries', 2)) }}
+      {{ field_number('channel_testing.connect_timeout_seconds', 'Connect timeout (seconds)',
+         'Seconds to wait for the first byte of data per connection attempt.',
+         '15', ct.get('connect_timeout_seconds', 15)) }}
+      {{ field_number('channel_testing.connect_retry_delay_seconds', 'Retry delay (seconds)',
+         'Seconds to wait between connection retry attempts.',
+         '10', ct.get('connect_retry_delay_seconds', 10)) }}
+      {{ field_number('channel_testing.bitrate_fail_720p_kbps', 'Bitrate fail threshold - 720p (kbps)',
+         'Mark test as failed if video height is ≤720 and measured bitrate is below this value.',
+         '1000', ct.get('bitrate_fail_720p_kbps', 1000)) }}
+      {{ field_number('channel_testing.bitrate_fail_1080p_kbps', 'Bitrate fail threshold - 1080p (kbps)',
+         'Mark test as failed if video height is 720-1080 and measured bitrate is below this value.',
+         '2000', ct.get('bitrate_fail_1080p_kbps', 2000)) }}
+      {{ field_number('channel_testing.bitrate_fail_4k_kbps', 'Bitrate fail threshold - 4K (kbps)',
+         'Mark test as failed if video height is above 1080 and measured bitrate is below this value.',
+         '3000', ct.get('bitrate_fail_4k_kbps', 3000)) }}
+      {% set pc = ct.get('pre_check', {}) %}
+      {{ field_bool('channel_testing.pre_check.enabled', 'Pre-recording health checks',
+         'Test a recording\'s channel a lead time before it starts, so a dead channel surfaces before the recording is committed to it. Off by default - it spends a provider connection. A recording profile can override this per recording.',
+         'false', pc.get('enabled', False)) }}
+      {{ field_number('channel_testing.pre_check.lead_minutes', 'Pre-check lead time (minutes)',
+         'How long before a recording\'s start time to run its pre-check.',
+         '15', pc.get('lead_minutes', 15)) }}
+      {{ field_number('channel_testing.pre_check.retry_minutes', 'Pre-check retry delay (minutes)',
+         'If the tester is busy with another run when a pre-check would fire, retry after this many minutes (if there\'s still time before the recording starts). 0 = skip instead of retry.',
+         '5', pc.get('retry_minutes', 5)) }}
+      {{ field_number('channel_testing.pre_check.min_margin_seconds', 'Pre-check minimum margin (seconds)',
+         'Extra slack required beyond the worst-case test duration before a pre-check is allowed to run - guarantees it releases the connection slot before the recording needs it.',
+         '60', pc.get('min_margin_seconds', 60)) }}
+      {% set win = ct.get('window', {}) %}
+      {{ field_time('channel_testing.window.start', 'Maintenance window start',
+         'Recurring health checks set to run "in the maintenance window" run back-to-back inside this range instead of at an exact time, so they can never collide. Takes effect immediately - no restart needed.',
+         '02:00', win.get('start', '02:00')) }}
+      {{ field_time('channel_testing.window.end', 'Maintenance window end',
+         'End of the maintenance window. A time earlier than the start means the window crosses midnight. Takes effect immediately - no restart needed.',
+         '06:00', win.get('end', '06:00')) }}
+      {{ field_number('channel_testing.window.dispatch_interval_minutes', 'Maintenance window dispatch interval (minutes)',
+         'How often the dispatcher checks for the next due maintenance-window check.',
+         '5', win.get('dispatch_interval_minutes', 5), restart=true) }}
+      {% if window_capacity_line %}
+      <div class="sec-note">{{ window_capacity_line }}</div>
+      {% endif %}
+    {% endcall %}
+
+    {% call section('logging', 'Logging') %}
+      {{ field_select('logging.level', 'Log level',
+         'Application log verbosity.',
+         'INFO', lgcfg.get('level', 'INFO'),
+         [('DEBUG','DEBUG'), ('INFO','INFO'), ('WARNING','WARNING'), ('ERROR','ERROR')],
+         restart=True) }}
+      {{ field_text('logging.file', 'Log file path',
+         'Absolute path to the log file. Leave empty to log to stdout only.',
+         '(none)', lgcfg.get('file', ''), nullable=True, restart=True) }}
+    {% endcall %}
+
+    {% call section('backups', 'Config Backups') %}
+      {{ field_bool('config_backup.enabled', 'Enable automatic backups',
+         'Run a nightly backup of config.yaml automatically.',
+         'true', cb.get('enabled', True), restart=True) }}
+      {{ field_number('config_backup.backup_hour_et', 'Backup hour',
+         'Hour of day (0-23) in your configured timezone to run the nightly backup.',
+         '1', cb.get('backup_hour_et', 1), restart=True) }}
+      {{ field_number('config_backup.backup_retention_days', 'Retention (days)',
+         'Delete backup files older than this many days.',
+         '14', cb.get('backup_retention_days', 14)) }}
+      {{ field_text('config_backup.backup_dir', 'Backup directory',
+         'Directory where backup files are saved. Created automatically (private, 0700) if it does not exist; a relative path is resolved against the app directory. Backups are config.yaml verbatim, secrets included - pointing this at a shared or network mount exposes them to everyone who can read that share.',
+         'instance/config-backups', cb.get('backup_dir', '')) }}
+    {% endcall %}
+
+    {% call section('security', 'Security') %}
+      {% call field_shell('auth.enabled', 'Require a password',
+         'When on, every page and API endpoint requires signing in with the password below. One shared password for the whole app - no usernames, no per-user access.',
+         'false', false, false, 'password login sign in gate lock require') %}
+      <label class="switch{{ ' tip-plain' if not auth_has_password else '' }}"{% if not auth_has_password %} data-tip="Set a password below first"{% endif %}>
+        <input type="checkbox" data-setting-path="auth.enabled"{{ ' checked' if authcfg.get('enabled') else '' }}{{ ' disabled' if not auth_has_password else '' }}>
+        <span class="knob"></span>
+      </label>
+      {% endcall %}
+      {{ field_number('auth.session_timeout_minutes', 'Session timeout (minutes)',
+         'How long a device stays signed in before being asked to sign in again. Counted from the moment of login and never extended by activity - a tab left open does not postpone it. 0 = stay signed in indefinitely on that device.',
+         '0', authcfg.get('session_timeout_minutes', 0)) }}
+      {{ field_bool('auth.cookie_secure', 'Secure cookie (HTTPS only)',
+         'Only send the session cookie over HTTPS. Enable this only when ChannelBin is always reached over HTTPS (e.g. behind a TLS-terminating reverse proxy) - on a plain-HTTP LAN setup the cookie would never be sent and every login would fail immediately.',
+         'false', authcfg.get('cookie_secure', False), restart=True) }}
+      <div class="sec-sub">
+        <strong>{{ 'Change password' if auth_has_password else 'Set password' }}</strong>
+        {% if auth_has_password %}Changing it signs out every other device immediately. This browser stays signed in.
+        {% else %}No password is set yet - the gate above stays off until one is set.{% endif %}
+      </div>
+      <form id="auth-password-form" class="auth-password-form" autocomplete="off">
+        {% if auth_has_password %}
+        <div class="form-group">
+          <label for="auth-current-password">Current password</label>
+          <div class="secret-field">
+            <input type="password" id="auth-current-password" class="form-control" autocomplete="current-password">
+            {{ secret_reveal_btn(local=true) }}
+          </div>
+        </div>
+        {% endif %}
+        <div class="form-group">
+          <label for="auth-new-password">New password</label>
+          <div class="secret-field">
+            <input type="password" id="auth-new-password" class="form-control" autocomplete="new-password">
+            {{ secret_reveal_btn(local=true) }}
+          </div>
+        </div>
+        <div class="form-group" style="margin-bottom: 0.6rem;">
+          <label for="auth-confirm-password">Confirm new password</label>
+          <div class="secret-field">
+            <input type="password" id="auth-confirm-password" class="form-control" autocomplete="new-password">
+            {{ secret_reveal_btn(local=true) }}
+          </div>
+        </div>
+        <button type="submit" class="btn btn-primary btn-sm">Save</button>
+      </form>
+      <div class="sec-note">
+        This is a door on something that was standing open - one shared password, no usernames,
+        no accounts, no roles, no 2FA. It raises the bar from "anyone who can reach this server"
+        to "anyone who can reach this server and knows the password." Do not expose ChannelBin to
+        the internet because this is on.
+      </div>
+    {% endcall %}
+
+    {% call section('integrations', 'Integrations') %}
+      {% call field_shell('integrations.home_assistant.enabled', 'Home Assistant integration',
+         'When on, ChannelBin exposes a read-only status API at /api/ha/v1/* for the Home Assistant custom_component to poll - recording activity, disk space, unread alerts, account health. Requires an API key below.',
+         'false', false, false, 'home assistant ha integration api key rest sensor poll') %}
+      <label class="switch{{ ' tip-plain' if not ha_has_key else '' }}"{% if not ha_has_key %} data-tip="Generate an API key below first"{% endif %}>
+        <input type="checkbox" data-setting-path="integrations.home_assistant.enabled"{{ ' checked' if hacfg.get('enabled') else '' }}{{ ' disabled' if not ha_has_key else '' }}>
+        <span class="knob"></span>
+      </label>
+      {% endcall %}
+      <div class="sec-sub">
+        <strong>{{ 'Regenerate API key' if ha_has_key else 'Generate API key' }}</strong>
+        {% if ha_has_key %}Shown once, on generation. Regenerating invalidates the old key immediately - update the Home Assistant integration's config with the new one or it stops polling.
+        {% else %}Home Assistant authenticates its polling requests with this key. It is shown once, then stored hashed - if lost, generate a new one.{% endif %}
+      </div>
+      <div class="auth-password-form">
+        <button type="button" class="btn btn-sm" id="ha-generate-key-btn">{{ 'Regenerate key' if ha_has_key else 'Generate key' }}</button>
+      </div>
+    {% endcall %}
+
+    {% call section('system', 'System') %}
+      {{ field_readonly('flask.port', 'Flask port',
+         'Port the app listens on. Edit in the config.yaml tab; restart required.',
+         fsk.get('port', 5000)) }}
+      {{ field_readonly('flask.host', 'Flask host',
+         'Bind address for the Flask server. Edit in the config.yaml tab; restart required.',
+         fsk.get('host', '0.0.0.0')) }}
+      {% if fsk.get('host', '0.0.0.0') in ('0.0.0.0', '', '::') %}
+      {% call field_shell('', '⚠ Reachable from any device on this network',
+         'Bound to ' ~ fsk.get('host', '0.0.0.0') ~ ':' ~ fsk.get('port', 5000) ~ ', so every device on your LAN can reach this app - ' ~
+         ('and the login gate below is on, but it is a shared password, not per-user auth.' if auth_has_password and authcfg.get('enabled')
+          else 'and it has no authentication (see the Security section above to turn on the password gate).') ~
+         ' If your reverse proxy runs on this same machine, you can set flask.host: 127.0.0.1 in the config.yaml tab to make the raw port unreachable except from the proxy. Do not do this if the proxy (or the devices you browse from) run on a different host - it will break access.',
+         '', false, false, 'network exposure bind reachable lan security host', true, 'warn') %}{% endcall %}
+      {% endif %}
+      {{ field_readonly('flask.behind_proxy', 'Behind a reverse proxy',
+         'Trust the X-Forwarded-* headers, so the app sees the real client IP and the real scheme (https) instead of the proxy\'s. Turn this on only when a reverse proxy actually fronts the app - with it off, an HTTPS visitor still looks like plain HTTP to the app, and the login page warns that the connection is unencrypted when it is not. Your proxy must append to X-Forwarded-For rather than pass the client\'s own copy through (nginx: $proxy_add_x_forwarded_for), or a caller can present a fresh IP per attempt and never trip the login lockout. Edit in the config.yaml tab; restart required.',
+         fsk.get('behind_proxy', False)|string|lower) }}
+      {{ field_readonly('flask.debug', 'Debug mode',
+         'Flask debug mode. Edit in the config.yaml tab; restart required.',
+         fsk.get('debug', False)|string|lower) }}
+      {{ field_readonly('flask.secret_key', 'Secret key',
+         'Session signing key. Edit in the config.yaml tab; restart required.',
+         fsk.get('secret_key'), secret=True) }}
+      {{ field_readonly('database.path', 'Database path',
+         'SQLite database file path. Edit in the config.yaml tab; restart required.',
+         dbcfg.get('path', 'dvr.db')) }}
+    {% endcall %}
+
+    {% call section('debug', 'Debug') %}
+      {{ field_bool('debug.xtream_debug_mode', 'Xtream debug mode',
+         'Show "Fetch & Dump" and "Sync from Dump" buttons on Xtream account pages. Useful for troubleshooting sync issues. '
+         'A dump stores that account\'s username/password in plaintext, since every stream URL in it embeds them.',
+         'false', dbg.get('xtream_debug_mode', False)) }}
+      {{ field_text('debug.xtream_dump_dir', 'Xtream dump directory',
+         'Directory for Xtream API debug dump files. Each account gets a subdirectory by ID, created private (0700) '
+         'since dumps carry that account\'s credentials in plaintext.',
+         '(project)/instance/xtream-dumps/', dbg.get('xtream_dump_dir', ''), nullable=True) }}
+    {% endcall %}
+
+    </div>{# end set-body #}
+  </div>{# end set-wrap #}
+
+</div>{# end pane-gui #}
+
+{# ───────────────────────── config.yaml TAB ──────────────────────────── #}
+<div id="pane-yaml" class="yaml-pane" style="display:none">
+  <form method="post" action="{{ url_for('settings.settings') }}">
+    {{ csrf_field() }}
+    <textarea name="config_yaml" spellcheck="false" rows="40">{{ cfg_yaml }}</textarea>
+    <div class="yaml-foot">
+      <button type="submit" class="btn btn-primary">Save config.yaml</button>
+      <span class="note">Saving here marks a restart as required.</span>
+    </div>
+  </form>
+</div>
+
+{# The searchable surfaces this page can answer for that are not field rows.
+   A registry, so a new one is one entry rather than an edit in three places;
+   the URLs come from url_for rather than being retyped in JS.
+
+   The last four moved onto the Maintenance page (DESIGN.md 7/16,
+   dev/changelog/444), so they are Pages with an href rather than Panels with a
+   scroll target. They stay in this registry deliberately: someone typing
+   "backup" or "disk" into Settings is asking a question this app can answer,
+   and the answer having moved to another page is not a reason to stop
+   answering it. #}
+<script type="application/json" id="settings-boot">
+{{ {
+  'surfaces': [
+    {'id': 'fd', 'kind': 'Tool', 'name': 'Filename template designer',
+     'desc': 'Build the template that names finished recordings, with a live preview and tag cleanup.',
+     'hay': 'filename template designer naming name file rename variables tag cleanup preview title channel date',
+     'btn': 'Open the designer', 'action': 'open-fd'},
+    {'id': 'notif', 'kind': 'Page', 'name': 'Notification settings',
+     'desc': 'Delivery services, the app URL used in push links, and which alert types go where.',
+     'hay': 'notification notifications push pushover discord ntfy gotify slack smtp2go whatsapp apprise alert routing email home assistant rate limit',
+     'btn': 'Open notification settings', 'href': url_for('settings.notifications_settings')},
+    {'id': 'backup', 'kind': 'Page', 'name': 'Backup & Restore',
+     'desc': 'Automatic daily backups of config.yaml, the restore picker and diff, and the support bundle.',
+     'hay': 'backup restore rollback diff config.yaml support bundle diagnostic zip snapshot maintenance',
+     'btn': 'Open Maintenance', 'href': url_for('system.maintenance')},
+    {'id': 'service', 'kind': 'Page', 'name': 'Service control',
+     'desc': 'Restart the ChannelBin service. Refuses while a capture, concatenation or conversion is running.',
+     'hay': 'service restart reboot stop start systemd restart.sh maintenance',
+     'btn': 'Open Maintenance', 'href': url_for('system.maintenance')},
+    {'id': 'index', 'kind': 'Page', 'name': 'Search index',
+     'desc': 'State of the channel and program search indexes, and a manual rebuild.',
+     'hay': 'search index rebuild fts channels airings program stale maintenance',
+     'btn': 'Open Maintenance', 'href': url_for('system.maintenance')},
+    {'id': 'storage', 'kind': 'Page', 'name': 'Storage',
+     'desc': 'How much disk the recordings, the database, screenshots and config backups are using.',
+     'hay': 'storage disk space size usage dvr database screenshots free maintenance',
+     'btn': 'Open Maintenance', 'href': url_for('system.maintenance')},
+  ],
+} | tojson }}
+</script>
+
+</div>{# end set-page #}
+{% endblock %}
+
+{% block scripts %}
+<script src="{{ url_for('static', filename='js/dropdown.js') }}"></script>
+<script src="{{ url_for('static', filename='js/filename-designer.js') }}"></script>
+<script src="{{ url_for('static', filename='js/settings.js') }}"></script>
+{% endblock %}

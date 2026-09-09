@@ -1,0 +1,7 @@
+{% set _active_ep = request.endpoint %}
+<div class="tabs">
+  <a href="{{ url_for('channels.channel_browser') }}"
+     class="tab{{ ' active' if _active_ep == 'channels.channel_browser' else '' }}">Browse</a>
+  <a href="{{ url_for('channel_groups.groups_page') }}"
+     class="tab{{ ' active' if _active_ep in ('channel_groups.groups_page', 'channel_groups.group_detail', 'channels.channels_health_checks', 'channels.channels_health_checks_guide', 'channels.health_check_detail') else '' }}">Groups</a>
+</div>

@@ -1,0 +1,91 @@
+{% extends "base.html" %}
+{% block title %}Tags - ChannelBin{% endblock %}
+
+{#  Tags list (dev/changelog/448).
+
+    Add and Edit are the SAME modal, opened from static/js/tag-modal.js - there is no
+    standalone form page any more, the way dev/changelog/356 did it for the two profile
+    types. `usage` is built once by the route (tags.py::_tag_usage) off one config read and
+    one profiles query; never ask per row where a tag is referenced. #}
+
+{% block content %}
+<div class="page-head">
+  <h1>Tags
+    <span class="sub">{{ tags | length }} tag{{ 's' if tags | length != 1 else '' }}</span>
+  </h1>
+  <button class="btn btn-primary" id="tag-add">+ Add Tag</button>
+</div>
+<p class="page-sub">
+  Tags detect text patterns - the tiny stylized <code>ᴸᶦᵛᵉ</code> / <code>ᴺᵉʷ</code> markers
+  IPTV providers embed in program titles - so they can be inserted, replaced, or removed in
+  filename templates via <code>{tag:name}</code>. They also highlight and filter programs in
+  the TV Guide and in EPG searches.
+</p>
+
+{% if not tags %}
+<div class="empty-state">
+  <p>No tags yet.</p>
+  <p class="text-muted" style="font-size:13px;">
+    A tag is a name, a color, and the literal text it looks for. Once one exists you can
+    reference it from a filename template and filter the guide by it.
+  </p>
+  <button class="btn btn-primary" id="tag-add-empty">+ Add Tag</button>
+</div>
+{% else %}
+<div class="card">
+  <div class="card-head"><h2>Tags <span class="cnt">{{ tags | length }}</span></h2></div>
+  <div class="card-body table-scroll">
+    <table class="tbl">
+      <thead>
+        <tr>
+          <th>Name</th>
+          <th>Match patterns</th>
+          <th>Used in</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for tag in tags %}
+        <tr>
+          {# The dot IS the Color column - a tag's color is how it appears everywhere else
+             (the guide paints a dot of it), so a separate column would say it twice. #}
+          <td>
+            <span class="color-dot" style="background: {{ tag.color }}"></span>
+            <strong>{{ tag.name }}</strong>
+          </td>
+          <td class="muted">
+            {% for p in tag.patterns %}<code>{{ p.pattern }}</code>{% if not loop.last %} {% endif %}{% endfor %}
+          </td>
+          {# Named, not counted: "2 places" would make the user hunt for them. A tag is
+             referenced by name, so deleting one silently changes what these render. #}
+          <td class="muted small">{{ usage.get(tag.name, []) | join(', ') or '-' }}</td>
+          <td style="text-align:right;">
+            <span class="menu-wrap">
+              <button class="btn btn-sm btn-icon" data-menu aria-label="More actions">&#8943;</button>
+              <div class="menu pop-left">
+                <button class="menu-item" data-act="edit" data-tag="{{ tag.id }}">Edit</button>
+                <div class="sep"></div>
+                <button class="menu-item danger" data-act="delete" data-tag="{{ tag.id }}">Delete tag</button>
+              </div>
+            </span>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+{% endif %}
+{% endblock %}
+
+{% block scripts %}
+<script>
+window.TAG_CONFIG = {
+  tags: {{ tags_json | tojson }},
+  presetColors: {{ preset_colors | tojson }},
+  usage: {{ usage | tojson }},
+};
+</script>
+<script src="{{ url_for('static', filename='js/tag-modal.js') }}"></script>
+<script src="{{ url_for('static', filename='js/tags.js') }}"></script>
+{% endblock %}

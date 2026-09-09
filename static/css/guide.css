@@ -1,0 +1,1637 @@
+/* Row height is computed in JS from the enabled field set and the real program data, then
+   published here, because DESIGN.md 12.5 requires rows to size to the tallest cell EITHER
+   side produces so no enabled combination of fields can clip. This declaration is the
+   no-JS fallback - an undefined custom property fails silently and would collapse every
+   row (CLAUDE.md CSS rule), so it must exist even though guide.js always overwrites it. */
+:root { --guide-rowh: 72px; }
+
+/* ── Toolbar (DESIGN.md 12.2) ───────────────────────────────────────────────── */
+/* The .toolbar class on the bar itself is what makes every control 36px: --ctl-h is scoped
+   to that container in style.css (DESIGN.md 3.5). Do not drop it. */
+
+/* --guide-topbarh is the mobile shell's own sticky top bar, measured by guide.js and 0 when
+   that bar is not displayed. It is NOT tied to a breakpoint on purpose: .topnav appears at
+   ≤900px while the guide's mobile block starts at ≤768px, so any constant is wrong across
+   the 132px in between - which is where this bar used to slide underneath it. */
+.guide-toolbar {
+  position: sticky;
+  top: var(--guide-topbarh, 0px);
+  z-index: 70;
+  background: var(--bg1);
+  /* Full-bleed backdrop so grid rows scrolling under the sticky bar are covered even
+     though .main has horizontal padding. */
+  box-shadow: 0 0 0 12px var(--bg1);
+}
+
+.guide-cluster {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  position: relative;
+}
+
+.guide-cluster-find { margin-left: auto; }
+
+/* A toolbar button's label, dropped at phone widths so the button becomes icon-only (13.3).
+   The icon ships in the markup at every width and is hidden on desktop, so there is one
+   button and one handler rather than a mobile duplicate. */
+.guide-icon { display: none; }
+.guide-btn-label { display: inline; }
+
+.guide-cluster-label {
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+  user-select: none;
+}
+
+/* One segmented control replaces the five near-duplicate nav buttons (12.2). It wraps
+   other controls, so its children are sized to --ctl-h minus its own 1px borders - the
+   wrapper then measures exactly --ctl-h and lines up with everything else on the bar
+   (DESIGN.md 3.5). */
+.timenav {
+  display: inline-flex;
+  align-items: stretch;
+  height: var(--ctl-h);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+  background: var(--bg2);
+}
+
+.timenav > button {
+  height: calc(var(--ctl-h) - 2px);
+  border: 0;
+  border-right: 1px solid var(--border);
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 12px;
+  font-family: inherit;
+  padding: 0 0.6rem;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.timenav > button:last-child { border-right: 0; }
+.timenav > button:hover:not(:disabled) { background: var(--bg3); color: var(--text); }
+.timenav > button:disabled { opacity: 0.4; cursor: default; }
+
+/* Live output, not an input: it reports the visible window from scroll position. Clicking
+   it opens a day-jump list (12.2 as amended) - the display keeps tracking scroll. */
+/* Centred, not left-aligned: this is the middle segment of a symmetric control, and the
+   readout's text is shorter than its min-width, so left-aligning left a visible gap on the
+   right that read as a rendering fault. Sizes are the approved mockup's (.88rem/.73rem),
+   which the first implementation shrank to 12/10px, harder to read
+   than the design called for. Both breakpoints keep it centred (mockups 16 and 20 agree). */
+.timenav-readout {
+  display: inline-flex;
+  flex-direction: column;
+  justify-content: center;
+  align-items: center;
+  text-align: center;
+  gap: 0;
+  min-width: 190px;
+  background: var(--bg1) !important;
+  padding: 0 0.7rem !important;
+  line-height: 1.15;
+}
+
+.timenav-readout-day {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text);
+  white-space: nowrap;
+}
+
+.timenav-readout-time {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+/* The one control on this bar that is not navigation-by-increment, so it carries the accent
+   the rest of the segmented control deliberately does not (mockups 16 and 20 both). Weight
+   alone was not enough to separate it from its four neighbours.
+
+   Selector shape is load-bearing: `.timenav-now` alone (0,1,0) LOSES to `.timenav > button`
+   (0,1,1) above, which paints every segment --text-muted, so the accent never appeared. The
+   hover pair is here for the same reason - `.timenav > button:hover:not(:disabled)` would
+   otherwise drop it back to plain text the moment the pointer arrives. */
+.timenav > button.timenav-now,
+.timenav > button.timenav-now:hover:not(:disabled) {
+  font-weight: 600;
+  color: var(--accent-text);
+}
+
+/* ── Popovers: Layout, sort, day picker ─────────────────────────────────────── */
+
+.guide-pop-wrap { position: relative; }
+
+.guide-pop {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  z-index: 200;
+  min-width: 240px;
+  max-height: 70vh;
+  overflow: auto;
+  padding: 12px;
+  background: var(--bg2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-pop);
+}
+
+.guide-pop-left { right: auto; left: 0; }
+
+.guide-pop h4 {
+  margin: 0 0 8px;
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+  font-weight: 600;
+}
+
+.guide-pop label {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 5px 2px;
+  font-size: 13px;
+  color: var(--text);
+  cursor: pointer;
+}
+
+/* A label that also carries a tooltip is a click target first, so it keeps the pointer
+   cursor rather than inheriting tip-plain's help cursor. */
+.guide-pop label.tip-plain { cursor: pointer; }
+.guide-pop label.is-fixed { color: var(--text-faint); cursor: not-allowed; }
+.guide-pop label input { accent-color: var(--accent); margin: 0; }
+.guide-pop-note { font-size: 11px; color: var(--text-faint); }
+.guide-pop-hr { height: 1px; background: var(--border); margin: 9px 0; }
+
+.guide-pop-hint {
+  margin-top: 8px;
+  font-size: 11px;
+  line-height: 1.35;
+  color: var(--text-faint);
+}
+
+.guide-pop-row {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  width: 100%;
+  padding: 6px 8px;
+  background: none;
+  border: 0;
+  border-radius: var(--radius-sm);
+  color: var(--text);
+  font: inherit;
+  font-size: 13px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.guide-pop-row:hover { background: var(--bg3); }
+.guide-pop-row.is-active { color: var(--accent-text); }
+.guide-pop-row .guide-pop-row-arrow { margin-left: auto; font-size: 11px; color: var(--accent-text); }
+.guide-pop-row:disabled { opacity: 0.4; cursor: default; }
+
+.guide-search-wrap {
+  position: relative;
+  display: inline-flex;
+  max-width: 240px;
+  margin-left: auto;
+}
+
+.guide-search-input {
+  width: 100%;
+  max-width: 100%;
+  padding-right: 2.8rem;
+}
+
+.guide-search-clear {
+  display: none;
+  position: absolute;
+  right: 0.4rem;
+  top: 50%;
+  transform: translateY(-50%);
+  border: none;
+  background: none;
+  padding: 0;
+  width: 1.2rem;
+  height: 1.2rem;
+  line-height: 1.2rem;
+  text-align: center;
+  font-size: 16px;
+  color: var(--text-muted);
+  cursor: pointer;
+}
+
+.guide-search-clear:hover {
+  color: var(--text);
+}
+
+.guide-search-wrap.has-value .guide-search-clear {
+  display: block;
+}
+
+.guide-search-save {
+  position: absolute;
+  right: 1.6rem;
+  top: 50%;
+  transform: translateY(-50%);
+  border: none;
+  background: none;
+  padding: 0;
+  width: 1.2rem;
+  height: 1.2rem;
+  line-height: 1.2rem;
+  text-align: center;
+  font-size: 14px;
+  color: var(--text-muted);
+  cursor: pointer;
+}
+
+.guide-search-save:hover {
+  color: var(--warn);
+}
+
+/* Affordances that act on a value do not appear until there is one, and the input reclaims
+   the space they reserved (DESIGN.md 3.11). Scoped to .guide-toolbar because the channel
+   detail page's copy of this control has no save-star and keeps its fixed padding. */
+.guide-toolbar .guide-search-wrap { margin-left: 0; max-width: 220px; }
+.guide-toolbar .guide-search-input { padding-right: 0.6rem; }
+.guide-toolbar .guide-search-save { display: none; }
+.guide-toolbar .guide-search-wrap.has-value .guide-search-input { padding-right: 2.8rem; }
+.guide-toolbar .guide-search-wrap.has-value .guide-search-save { display: block; }
+/* Filled star when the current text is already a saved search (13.4; same on desktop). */
+.guide-search-save.is-saved { color: var(--warn); }
+
+/* ── Saved search dropdown ──────────────────────────────────────────────────── */
+
+.saved-search-dropdown {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  right: 0;
+  z-index: 20;
+  background: var(--bg2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  max-height: 60vh;
+  overflow-y: auto;
+  box-shadow: var(--shadow-pop);
+}
+
+.saved-search-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.4rem 0.6rem;
+  cursor: pointer;
+}
+
+.saved-search-row:hover {
+  background: var(--bg3);
+}
+
+.saved-search-text {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 13px;
+  color: var(--text);
+}
+
+.saved-search-delete {
+  flex-shrink: 0;
+  border: none;
+  background: none;
+  padding: 0;
+  width: 1.2rem;
+  height: 1.2rem;
+  line-height: 1.2rem;
+  text-align: center;
+  font-size: 15px;
+  color: var(--text-muted);
+  cursor: pointer;
+}
+
+.saved-search-delete:hover {
+  color: var(--bad);
+}
+
+.saved-search-empty {
+  padding: 0.5rem 0.6rem;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+/* ── Tag filter dropdown ─────────────────────────────────────────────────────── */
+
+.tag-filter-wrap {
+  position: relative;
+}
+
+#tag-filter-summary.has-value {
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.tag-filter-panel {
+  position: absolute;
+  top: calc(100% + 4px);
+  right: 0;
+  z-index: 20;
+  background: var(--bg2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 0.6rem;
+  width: 220px;
+  max-width: calc(100vw - 2rem);
+  max-height: 60vh;
+  overflow-y: auto;
+  box-shadow: var(--shadow-pop);
+}
+
+.tag-filter-section + .tag-filter-section {
+  margin-top: 0.6rem;
+  padding-top: 0.6rem;
+  border-top: 1px solid var(--border);
+}
+
+.tag-filter-section-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  color: var(--text-muted);
+  margin-bottom: 0.4rem;
+}
+
+.tag-filter-mode {
+  display: flex;
+  gap: 0.5rem;
+  font-weight: 400;
+  text-transform: none;
+  letter-spacing: normal;
+}
+
+.tag-filter-mode label {
+  display: flex;
+  align-items: center;
+  gap: 0.2rem;
+  cursor: pointer;
+}
+
+.tag-filter-row {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.2rem 0;
+  font-size: 12.5px;
+  cursor: pointer;
+}
+
+.tag-filter-dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+/* ── Duration filter dropdown ─────────────────────────────────────────────────
+   .dur-filter-panel also carries .tag-filter-panel for its position/background/border/
+   shadow - only the row layout below is new. Shared with the mobile sheet body
+   (openLengthSheet()), which reuses .dur-filter-row rather than a second set of rules. */
+
+#dur-filter-summary.has-value {
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.dur-filter-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.25rem 0;
+  font-size: 12.5px;
+}
+
+.dur-filter-row span {
+  flex: 0 0 84px;
+  color: var(--text-faint);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+
+.dur-filter-row input,
+.dur-filter-row select {
+  flex: 1;
+  min-width: 0;
+  height: var(--ctl-h);
+  background: var(--bg2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--text);
+  padding: 0 0.5rem;
+  font: inherit;
+  font-size: 13px;
+}
+
+/* Bottom of the panel/sheet, matching a modal footer's placement (DESIGN.md primary-action
+   placement rule) even though this control isn't a modal. Shared by the mobile sheet body,
+   which reuses this class rather than a second rule. */
+.dur-filter-actions {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 0.5rem;
+  padding-top: 0.5rem;
+  border-top: 1px solid var(--border);
+}
+
+/* ── Status bar: counts + account legend (DESIGN.md 12.6 as amended) ─────────── */
+/* The legend is not optional decoration: account edge-colours on the channel rows are
+   meaningless without it, which is why it moved into the status bar rather than being
+   dropped when the guide was redesigned. Shared with mobile (13.8). */
+
+.guide-statusbar {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  flex-wrap: wrap;
+  padding: 8px 2px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-faint);
+}
+
+.guide-sb-legend {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-left: auto;
+}
+
+/* 12.6: a SIBLING of the grid, shown while the grid is hidden - the grid's own DOM is
+   never overwritten, so clearing the filter always restores the guide. */
+.guide-empty {
+  padding: 34px;
+  text-align: center;
+  font-size: 14px;
+  color: var(--text-muted);
+  background: var(--bg1);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+
+
+.guide-empty-sub {
+  display: block;
+  margin-top: 8px;
+  font-size: 12px;
+  color: var(--text-faint);
+}
+.guide-legend-item {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+}
+
+.guide-legend-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+/* ── Guide outer wrapper ─────────────────────────────────────────────────────── */
+
+/* Channel-column width. One declaration, because the corner cell and the column itself must
+   agree exactly or the header track desyncs from the rows underneath it. */
+.guide-outer { --guide-chw: 230px; }
+
+/* No border/overflow here: the grid is deliberately NOT wrapped in a scroll region.
+   overflow-x: auto computes overflow-y to auto, which creates a scrollport and breaks
+   viewport-sticky - and scroll-trapping was rejected explicitly (DESIGN.md 12.6). */
+.guide-outer { position: relative; }
+
+/* ── Header track (DESIGN.md 12.6) ──────────────────────────────────────────── */
+/* The header sits OUTSIDE the horizontal scroller so it can stick to the viewport, and
+   guide.js transform-syncs .guide-head-track to the scroller's scrollLeft. Its `top` is the
+   toolbar's height: a coupled value, so it is measured from the real rendered toolbar by JS
+   rather than guessed (the row-height/sticky-offset pairs in this file have desynced before). */
+.guide-head {
+  position: sticky;
+  top: calc(var(--guide-topbarh, 0px) + var(--guide-tbh, 60px));
+  z-index: 60;
+  display: flex;
+  background: var(--bg2);
+  border: 1px solid var(--border);
+  border-bottom: 0;
+  border-radius: var(--radius) var(--radius) 0 0;
+}
+
+
+/* overflow lives on .guide-head-vp, never on .guide-head - the corner's sort popover has
+   to escape the header box. */
+.guide-head-vp {
+  flex: 1;
+  overflow: hidden;
+  border-radius: 0 var(--radius) 0 0;
+}
+
+.guide-head-track { will-change: transform; }
+
+.guide-channel-corner {
+  flex: 0 0 var(--guide-chw);
+  width: var(--guide-chw);
+  position: relative;
+  display: flex;
+  align-items: flex-end;
+  padding: 0 8px 5px;
+  background: var(--bg2);
+  border-right: 1px solid var(--border);
+  border-radius: var(--radius) 0 0 0;
+}
+
+/* 12.4: sorting is a menu on the corner cell, matching 10.3's column-header convention. */
+.guide-sort-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 6px;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  font-family: inherit;
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  cursor: pointer;
+}
+
+.guide-sort-btn:hover {
+  background: var(--bg3);
+  color: var(--text);
+  border-color: var(--border);
+}
+
+.guide-sort-field {
+  font-size: 11px;
+  letter-spacing: 0;
+  text-transform: none;
+  color: var(--accent-text);
+}
+
+/* Sits between the sort field label and the button's own .nav-caret, so it needs air on
+   both sides or the two chevrons read as one doubled glyph. */
+.guide-sort-arrow { font-size: 11px; color: var(--accent-text); margin-left: 2px; }
+
+/* ── Grid body ──────────────────────────────────────────────────────────────── */
+
+.guide-body {
+  display: flex;
+  background: var(--bg1);
+  border: 1px solid var(--border);
+  border-top: 0;
+  border-radius: 0 0 var(--radius) var(--radius);
+  overflow: hidden;
+}
+
+
+/* ── Channel column (left) ──────────────────────────────────────────────────── */
+
+.guide-channel-col {
+  flex: 0 0 var(--guide-chw);
+  width: var(--guide-chw);
+  background: var(--bg2);
+  border-right: 1px solid var(--border);
+  z-index: 10;
+}
+
+/* Two lines: identity on top, tech readout centred underneath (12.4). */
+.guide-channel-row {
+  height: var(--guide-rowh);
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 3px;
+  padding: 0 0.6rem;
+  border-bottom: 1px solid var(--border);
+  border-left: 3px solid transparent;
+  cursor: pointer;
+  overflow: hidden;
+}
+
+.guide-channel-row:hover {
+  background: rgba(255,255,255,0.05);
+}
+
+.guide-channel-top {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  min-width: 0;
+}
+
+/* Sizing stays on the logo itself; the tile only gives a group row something to hang its
+   offset square off. An <img> is a replaced element and cannot carry a ::before, which is
+   why this wrapper exists at all. */
+.guide-logo-tile {
+  display: flex;
+  position: relative;
+  flex-shrink: 0;
+  line-height: 0;
+}
+
+.guide-logo {
+  width: 30px;
+  height: 30px;
+  object-fit: contain;
+  border-radius: var(--radius-sm);
+  flex-shrink: 0;
+}
+
+.guide-logo-fallback {
+  width: 30px;
+  height: 30px;
+  border-radius: var(--radius-sm);
+  background: var(--bg3);
+  border: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-muted);
+  flex-shrink: 0;
+}
+
+.guide-channel-name {
+  font-size: 12px;
+  font-weight: 500;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.guide-channel-meta {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-wrap: nowrap;
+  overflow: hidden;
+}
+
+.guide-channel-meta:empty { display: none; }
+
+/* ── A guide row that is a channel group (dev/changelog/856) ─────────────────
+   The channel search already settled how a group row is made legible, and this is that
+   vocabulary ported rather than a fourth one invented (dev/changelog/811,
+   DESIGN-group-search-rows.md 5.2): a tint, a stacked logo tile, and a pill. Two
+   deliberate divergences from the search's version:
+
+     * the search's inset 2px accent EDGE is dropped. The guide row's left edge is the
+       account colour and the status-bar legend reads it (13.5), so a second edge inside
+       it is noise, not a cue;
+     * the tint stops at the channel column. .guide-row alongside it is a wall of program
+       cells, and tinting those turns one row's identity into a band across the grid.
+
+   The case all three are aimed at: Channel.in_guide is independent of membership, so a
+   group and one of its own members can both hold rows, and the group draws its logo from
+   whichever member is serving it - two rows, near-identical names, the same image. Only
+   one of them can fail over. */
+.guide-channel-row.is-group { background: rgba(var(--accent-rgb), .07); }
+/* Same specificity as .guide-channel-row:hover and later in the file, so without this a
+   group row would be the one row in the guide that never acknowledges the pointer. */
+.guide-channel-row.is-group:hover { background: rgba(var(--accent-rgb), .13); }
+
+/* A shape difference rather than a colour one, which is what survives the mobile
+   mini-column and the 60px logo-only mode where the name is not rendered at all. The
+   square is isolated into the tile's own stacking context: a bare negative z-index falls
+   behind the ROW's background, and only shows through at all when that background happens
+   to be translucent. */
+.guide-logo-tile.is-grouplogo { isolation: isolate; }
+.guide-logo-tile.is-grouplogo::before {
+  content: '';
+  position: absolute;
+  left: -4px;
+  top: -4px;
+  width: 100%;
+  height: 100%;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg3);
+  z-index: -1;
+}
+/* The front tile has to be opaque or the square behind it reads through a logo with
+   transparency, and it needs its own outline or the pair reads as one smudged square.
+   --bg2 rather than the fallback's usual --bg3 for the same reason: two surfaces. */
+.is-grouplogo .guide-logo,
+.is-grouplogo .guide-logo-fallback {
+  background: var(--bg2);
+  border: 1px solid var(--border);
+}
+
+/* 11.1 keeps the guide on the dense .qbadge language, so this is the existing badge given
+   weight rather than a .badge promoted in from elsewhere. flex-shrink is pinned because
+   .guide-channel-meta is nowrap + overflow:hidden - the strip clips, and the one cue that
+   names the row must not be what it clips. */
+.guide-group-badge {
+  flex: 0 0 auto;
+  font-size: var(--fs-2xs);
+  font-weight: 600;
+  background: rgba(var(--accent-rgb), .16);
+  color: var(--accent);
+}
+
+/* Provider-removed channel (dev/changelog/626, 627) - same opacity/strikethrough treatment
+   .arow.is-removed / .ccard.is-removed already use on /channels, so a "missing" channel reads
+   the same way wherever it's seen. The "Missing" pill itself (.guide-lifecycle-badge) is the
+   one thing that must stay at full strength - it's the alert, and dimming it along with
+   everything else buried the one signal meant to stand out. Opacity on an ancestor can't be
+   reversed by a child (the ancestor composites its whole subtree as one group), so this dims
+   each piece of row content individually instead of the row as a whole; the program cells
+   alongside it in .guide-row have no pill to protect and dim wholesale. */
+.guide-channel-row.is-removed .guide-channel-name { text-decoration: line-through; }
+.guide-channel-row.is-removed > .guide-channel-top > *:not(.guide-channel-info),
+.guide-channel-row.is-removed .guide-channel-name,
+.guide-channel-row.is-removed .guide-channel-meta > *:not(.guide-lifecycle-badge),
+.guide-channel-row.is-removed .guide-channel-tech {
+  opacity: .62;
+}
+.guide-row.is-removed { opacity: .62; }
+
+/* 12.4: the health badge is the numeric score coloured by health STATE, so the colour and
+   the number can never disagree. Untested is a distinct "unknown" treatment reading `--`,
+   never a fabricated score and never styled as a bad one. */
+.guide-health-badge {
+  flex: 0 0 auto;
+  min-width: 28px;
+  padding: 2px 6px;
+  border-radius: 999px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 700;
+  text-align: center;
+  white-space: nowrap;
+  color: #0b1220;
+  /* The band modifier (.hb-*, static/css/style.css) carries the fill; this file decides only
+     that the badge is filled rather than tinted. One declared band list, five components. */
+  background: var(--hb, var(--bg3));
+}
+
+/* Desktop shows the numeric badge; the corner dot is mobile's carrier for the same state
+   (13.5), switched on in the ≤768px block below. */
+.guide-health-dot { display: none; }
+
+.guide-health-badge.hb-none {
+  background: var(--bg3);
+  border: 1px solid var(--border);
+  color: var(--text-faint);
+}
+
+/* Row two: resolution / frame rate / bitrate / audio, separated by a middot at
+   --text-muted. The separator is punctuation between two readable values; --border is a
+   hairline colour and is too faint to use for a glyph (12.4). */
+.guide-channel-tech {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  height: 15px;
+  overflow: hidden;
+}
+
+.guide-channel-tech:empty { display: none; }
+
+.guide-tech {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  line-height: 13px;
+  color: var(--text-faint);
+  white-space: nowrap;
+}
+
+.guide-tech-sep {
+  font-size: 10px;
+  color: var(--text-muted);
+  user-select: none;
+}
+
+/* ── Program area (right, scrollable) ───────────────────────────────────────── */
+
+.guide-program-area {
+  overflow-x: auto;
+  overflow-y: hidden;
+  position: relative;
+}
+
+/* On the TV Guide these two live inside .guide-head-track, which is not a scrollport, so
+   `position: sticky` is inert there - it is retained because the channel detail page's
+   "What's On" strip still nests them inside .guide-program-area, where it does the work. */
+.guide-day-header {
+  height: 28px;
+  display: flex;
+  background: var(--bg2);
+  border-bottom: 1px solid var(--border);
+  position: sticky;
+  top: 0;
+  z-index: 5;
+  min-width: max-content;
+}
+
+.guide-day-segment {
+  flex: 0 0 auto;
+  position: relative;
+  border-right: 2px solid var(--border);
+}
+.guide-day-segment:last-child { border-right: none; }
+
+/* Nested sticky label: stays pinned to the left edge of the scroll viewport for as long as
+   any part of its day is in view, instead of scrolling away with the segment's start. */
+.guide-day-segment-label {
+  position: sticky;
+  left: 0;
+  display: inline-block;
+  padding: 0 0.6rem;
+  height: 28px;
+  line-height: 28px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 100%;
+  user-select: none;
+}
+.guide-day-segment.narrow .guide-day-segment-label { font-size: 11px; padding: 0 0.4rem; }
+
+.guide-time-header {
+  height: 36px;
+  display: flex;
+  background: var(--bg3);
+  border-bottom: 1px solid var(--border);
+  position: sticky;
+  top: 28px;
+  z-index: 5;
+  min-width: max-content;
+}
+
+.guide-time-slot {
+  flex: 0 0 auto;
+  border-right: 1px solid var(--border);
+  padding: 0 0.5rem;
+  font-size: 11px;
+  color: var(--text-muted);
+  display: flex;
+  align-items: center;
+  white-space: nowrap;
+  user-select: none;
+}
+
+/* Empty spacer matching the width of a .guide-collapse-cut divider, keeping the day/time
+   header flex flow in sync with the absolutely-positioned program rows in collapse mode. */
+.guide-collapse-cut-spacer {
+  flex: 0 0 auto;
+}
+
+.guide-program-rows {
+  position: relative;
+  min-width: max-content;
+}
+
+.guide-row {
+  height: var(--guide-rowh);
+  display: block;
+  position: relative;
+  border-bottom: 1px solid var(--border);
+}
+
+.guide-row.hidden-row {
+  display: none;
+}
+
+/* ── Program cells ───────────────────────────────────────────────────────────── */
+
+.guide-program {
+  position: absolute;
+  height: calc(var(--guide-rowh) - 7px);
+  top: 3px;
+  border-radius: var(--radius-sm);
+  background: var(--bg3);
+  border: 1px solid var(--border);
+  padding: 4px 0.5rem;
+  cursor: pointer;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 1px;
+  box-sizing: border-box;
+  transition: background 0.1s, border-color 0.1s;
+}
+
+.guide-program:hover {
+  background: var(--border);
+  border-color: var(--text-muted);
+  z-index: 2;
+}
+
+.guide-program.has-recording {
+  --rec-left: 0%;
+  --rec-right: 100%;
+}
+
+/* Scheduled: outline only, no fill */
+.guide-program.has-recording.rec-scheduled {
+  background: none;
+}
+
+/* Active: green fill + breathing pulse overlay */
+.guide-program.has-recording.rec-active {
+  background: linear-gradient(
+    to right,
+    var(--bg3) var(--rec-left),
+    rgba(var(--ok-rgb), 0.12) var(--rec-left),
+    rgba(var(--ok-rgb), 0.12) var(--rec-right),
+    var(--bg3) var(--rec-right)
+  );
+}
+.guide-program.has-recording.rec-active::after {
+  content: '';
+  position: absolute;
+  left: var(--rec-left, 0%);
+  right: calc(100% - var(--rec-right, 100%));
+  top: 0;
+  bottom: 0;
+  background: rgba(var(--ok-rgb), 0.18);
+  animation: rec-breathe 2s ease-in-out infinite;
+  pointer-events: none;
+}
+
+/* Paused: dimmer fill, no animation */
+.guide-program.has-recording.rec-paused {
+  background: linear-gradient(
+    to right,
+    var(--bg3) var(--rec-left),
+    rgba(var(--ok-rgb), 0.07) var(--rec-left),
+    rgba(var(--ok-rgb), 0.07) var(--rec-right),
+    var(--bg3) var(--rec-right)
+  );
+}
+
+/* Retrying: same dimmer fill as Paused (no active capture either), warn-toned wash so it
+   reads as "waiting to see if this recovers" rather than "manually paused". */
+.guide-program.has-recording.rec-retry {
+  background: linear-gradient(
+    to right,
+    var(--bg3) var(--rec-left),
+    rgba(var(--warn-rgb), 0.10) var(--rec-left),
+    rgba(var(--warn-rgb), 0.10) var(--rec-right),
+    var(--bg3) var(--rec-right)
+  );
+}
+
+/* Done / Completed: solid green fill */
+.guide-program.has-recording.rec-done {
+  background: linear-gradient(
+    to right,
+    var(--bg3) var(--rec-left),
+    rgba(var(--ok-rgb), 0.12) var(--rec-left),
+    rgba(var(--ok-rgb), 0.12) var(--rec-right),
+    var(--bg3) var(--rec-right)
+  );
+}
+
+.guide-program.has-recording:hover {
+  background: rgba(var(--ok-rgb), 0.22);
+}
+.guide-program.has-recording.rec-active:hover::after {
+  animation: none;
+  opacity: 0;
+}
+
+@keyframes rec-breathe {
+  0%, 100% { opacity: 0.3; }
+  50%       { opacity: 1;   }
+}
+
+/* Recording status: a cell FIELD, first in the field order (12.5), not a corner glyph.
+   Its meaning is carried by colour, so it gets a tooltip with three distinct texts (12.7). */
+.rec-badge {
+  font-size: 9px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  line-height: 13px;
+  height: 13px;
+  white-space: nowrap;
+}
+.rec-badge-active { color: var(--bad); }
+.rec-badge-paused { color: var(--warn); }
+.rec-badge-retry  { color: var(--warn); }
+.rec-badge-done   { color: var(--ok); }
+.rec-badge-scheduled { color: var(--accent-text); }
+
+/* 12.5: tag dots always take their own line when shown. There is one tag layout, not two. */
+.tag-badges {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  line-height: 14px;
+  height: 14px;
+}
+
+/* A 7px dot is not reliably hoverable, so the tooltip trigger is a padded wrapper whose
+   equal negative margin cancels the padding: hit area grows, layout does not (12.7). */
+.tag-badge-hit {
+  display: flex;
+  align-items: center;
+  padding: 5px 3px;
+  margin: -5px -3px;
+  cursor: help;
+}
+
+.tag-badge-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  display: block;
+  flex: 0 0 7px;
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.4);
+}
+
+.guide-recording-band {
+  position: absolute;
+  top: 0;
+  height: 100%;
+  background: rgba(var(--ok-rgb), 0.10);
+  pointer-events: none;
+}
+
+/* Band opacity by status */
+.guide-recording-band.rec-scheduled { background: rgba(var(--ok-rgb), 0.05); }
+.guide-recording-band.rec-active    { background: rgba(var(--ok-rgb), 0.10); }
+.guide-recording-band.rec-paused    { background: rgba(var(--ok-rgb), 0.06); }
+.guide-recording-band.rec-done      { background: rgba(var(--ok-rgb), 0.08); }
+
+.guide-recording-outline {
+  position: absolute;
+  top: 3px;
+  bottom: 3px;
+  border: 1.5px solid rgba(var(--ok-rgb), 0.6);
+  border-radius: var(--radius-sm);
+  pointer-events: none;
+  z-index: 1;
+  box-sizing: border-box;
+}
+
+/* Scheduled outline: dashed to signal "not yet recording" */
+.guide-recording-outline.rec-scheduled {
+  border-style: dashed;
+  opacity: 0.7;
+}
+
+.guide-program.is-dummy {
+  opacity: 0.55;
+  border-style: dashed;
+}
+
+.guide-program.is-dummy:hover {
+  opacity: 0.8;
+}
+
+/* Field order and heights (DESIGN.md 12.5). Every line height here has a matching constant
+   in guide.js's CELL_LINE table, which is what computes --guide-rowh - change one and you
+   must change the other or rows clip. */
+.guide-program-title {
+  font-size: 12px;
+  font-weight: 500;
+  line-height: 18px;
+  height: 18px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--text);
+}
+
+.guide-program-subtitle {
+  font-size: 10px;
+  font-style: italic;
+  line-height: 15px;
+  height: 15px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--text-muted);
+}
+
+/* max-height, NOT height: a fixed two-line box reserved a second line even for a one-line
+   description, which read as a permanent blank row above the time line (12.5 bans fixed
+   heights on optional content - a field with no value must reserve no space). */
+.guide-program-desc {
+  font-size: 10px;
+  line-height: 14px;
+  max-height: 28px;
+  overflow: hidden;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  color: var(--text-faint);
+}
+
+.guide-program-time {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  line-height: 14px;
+  height: 14px;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+.guide-program.narrow .guide-program-title {
+  font-size: 10px;
+}
+
+.guide-program.narrow .guide-program-subtitle,
+.guide-program.narrow .guide-program-desc,
+.guide-program.narrow .guide-program-time {
+  display: none;
+}
+
+/* ── Midnight indicator lines ─────────────────────────────────────────────────── */
+
+.guide-midnight-line {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  background: rgba(var(--accent-rgb), 0.85);
+  z-index: 6;
+  pointer-events: none;
+}
+
+/* ── Now indicator line ──────────────────────────────────────────────────────── */
+
+.guide-now-line {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  background: var(--bad);
+  z-index: 6;
+  pointer-events: none;
+}
+
+.guide-now-line::before {
+  content: '';
+  position: absolute;
+  top: -4px;
+  left: -4px;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--bad);
+}
+
+/* ── Collapse-gaps cut divider ──────────────────────────────────────────────── */
+/* Same weight/subtlety as .guide-midnight-line (thin, blue), but jagged/zigzag
+   instead of straight, marking elided time like a tear rather than a hazard. */
+
+.guide-collapse-cut {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 8px;  /* keep in sync with CUT_WIDTH_PX in guide.js */
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='8' height='24'%3E%3Cpolyline points='6,0 2,6 6,12 2,18 6,24' fill='none' stroke='%2358a6ff' stroke-opacity='0.85' stroke-width='1.5'/%3E%3C/svg%3E");
+  background-repeat: repeat-y;
+  background-size: 8px 24px;
+  z-index: 7;
+  pointer-events: none;
+}
+
+/* ── Modal: base .modal/.modal-backdrop/.modal-panel rules now live in
+   static/css/style.css (loaded on every page) so pages without guide.css can
+   still use the modal pattern. ─────────────────────────────────────────────── */
+
+/* ── Manual "Add Recording" modal ─────────────────────────────────────────────── */
+
+.manual-record-info {
+  font-size: 12px;
+  color: var(--text-muted);
+  background: var(--bg3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 0.6rem 0.75rem;
+  margin: 0 0 1rem;
+  line-height: 1.45;
+}
+
+.manual-url-row {
+  display: flex;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+
+.manual-url-row .form-control {
+  flex: 1;
+  min-width: 180px;
+}
+
+.manual-test-result {
+  margin-top: 0.5rem;
+  padding: 0.5rem 0.65rem;
+  border-radius: var(--radius-sm);
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.manual-test-pass {
+  background: rgba(var(--ok-rgb), .12);
+  border: 1px solid rgba(var(--ok-rgb), .35);
+  color: var(--ok);
+}
+
+.manual-test-fail {
+  background: rgba(var(--bad-rgb), .12);
+  border: 1px solid rgba(var(--bad-rgb), .35);
+  color: var(--bad);
+}
+
+.btn-spinner {
+  position: relative;
+  color: transparent !important;
+}
+
+/* Overlays a spinner on top of the button's (now hidden) label - not built on
+   style.css's .spinner component since it needs absolute centering, not layout
+   sizing. Shares style.css's spin keyframe rather than defining its own. */
+.btn-spinner::after {
+  content: '';
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 12px;
+  height: 12px;
+  margin: -6px 0 0 -6px;
+  border: 2px solid rgba(255, 255, 255, 0.35);
+  border-top-color: var(--text);
+  border-radius: 999px;
+  animation: spin 0.7s linear infinite;
+}
+/* ── Mobile responsiveness (≤768px) ─────────────────────────────────────────── */
+
+@media (max-width: 768px) {
+  /* DESIGN.md 13 - the approved mobile guide. Same mini-grid paradigm as desktop (13.1),
+     shrunk: 3px/min (set in guide.js, not here), a two-row toolbar, a mini channel column,
+     and every hover tooltip replaced by a tap sheet. See dev/changelog/345. */
+
+  /* 13.5: logo + tiny name at ~84px, or logo-only at ~60px via the Layout sheet toggle. */
+  .guide-outer { --guide-chw: 84px; }
+  .guide-outer.guide-logo-only { --guide-chw: 60px; }
+
+  /* ── Toolbar: two rows (13.3) ─────────────────────────────────────────────
+     Row 1 is the full .timenav - all four jump sizes survive at 375px, padding
+     compresses instead of a size being dropped. Row 2 is Find. */
+  .guide-toolbar { gap: 0.35rem; padding: 0.4rem 0; }
+  .guide-cluster { flex-wrap: nowrap; }
+  .guide-cluster-when { width: 100%; }
+  .guide-cluster-label { display: none; }
+  .timenav { width: 100%; }
+  .timenav > button { padding: 0 0.4rem; font-size: 12px; }
+  .timenav-readout { min-width: 0; flex: 1 1 auto; }
+  .timenav-readout-day {
+    font-size: 13px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    max-width: 100%;
+  }
+  /* The readout is the day picker's only trigger at this width, so it carries the app's
+     standard "this opens something" caret (mockup 20). */
+  .timenav-readout-day::after {
+    content: ' \25BE';
+    font-size: 9px;
+    color: var(--text-faint);
+  }
+  .timenav-readout-time { font-size: 11px; }
+
+  /* Row 2 holds the filter, Tags, Length and the ⚙ together. `flex-basis` must be 0, not
+     auto: with `auto` the cluster claims its content's intrinsic width - a text input plus
+     several buttons - which fills the line and pushes the Layout cluster onto a row of its
+     own. That is what `width: 100%` did before it, and what 13.3 says must not happen.
+     Basis 0 makes it absorb whatever is left after the ⚙ instead of demanding it first.
+     `flex-wrap: wrap` lets the buttons spill onto their own line under the search box if
+     Tags and Length are both present and don't fit beside it, rather than overflowing. */
+  .guide-cluster-find {
+    margin-left: 0;
+    flex: 1 1 0;
+    min-width: 0;
+    gap: 0.35rem;
+    flex-wrap: wrap;
+  }
+  .guide-toolbar .guide-search-wrap { max-width: none; flex: 1 1 auto; min-width: 0; }
+  /* Layout's ⚙ joins the Find row rather than claiming a third one (13.3). */
+  .guide-cluster-layout { margin-left: 0; flex: 0 0 auto; }
+  .guide-cluster-layout .guide-pop-wrap { display: flex; }
+
+  /* Icon-only Search all and Layout (13.3): the label is dropped, the MDI glyph shown. */
+  .guide-btn-label { display: none; }
+  .guide-icon { display: block; }
+  #btn-airing-search, #btn-layout {
+    padding-left: 0.6rem;
+    padding-right: 0.6rem;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  /* 13.4: saved searches stay a dropdown anchored under the input, never chips. */
+  .saved-search-dropdown { max-width: calc(100vw - 28px); }
+  .guide-pop { right: auto; left: 0; max-width: calc(100vw - 32px); }
+  /* The Tags panel and the Layout popover are replaced by sheets here; the panel stays in
+     the DOM because the sheet writes through to its inputs, which remain the filter's one
+     source of state. */
+  .tag-filter-panel { display: none !important; }
+  #guide-layout-pop, #guide-daypicker { display: none !important; }
+
+  /* ── Channel mini-column (13.5) ───────────────────────────────────────────
+     Logo over a two-line name, centred, with the health state carried by a corner dot -
+     the numeric badge is desktop-only and its number lives in the channel sheet. */
+  .guide-channel-row {
+    padding: 3px 2px;
+    justify-content: center;
+    gap: 3px;
+    cursor: pointer;
+  }
+  .guide-channel-top {
+    flex-direction: column;
+    align-items: center;
+    gap: 3px;
+    position: relative;
+    width: 100%;
+  }
+  .guide-logo, .guide-logo-fallback {
+    width: 28px;
+    height: 28px;
+    flex: 0 0 28px;
+  }
+  .guide-channel-info { align-items: center; }
+  .guide-channel-row .guide-channel-name {
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+    white-space: normal;
+    text-align: center;
+    line-height: 11px;
+    font-size: 9.5px;
+  }
+  .guide-outer.guide-logo-only .guide-channel-info { display: none; }
+
+  /* The health dot: state colour only, in the logo's corner. Never-tested is its own
+     unknown treatment, never a fabricated state colour (13.5). */
+  .guide-health-dot {
+    display: block;
+    position: absolute;
+    top: -1px;
+    right: 50%;
+    margin-right: -18px;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    border: 1px solid var(--bg1);
+    background: var(--hb, var(--text-faint));
+  }
+
+  /* Touch-friendly horizontal scroll */
+  .guide-program-area { -webkit-overflow-scrolling: touch; }
+
+  /* 13.9: cells are tap targets. The 44px row floor is enforced in computeRowHeight(). */
+  .guide-program { cursor: pointer; padding: 3px 6px; }
+  .guide-program-title { font-size: 11.5px; }
+  .guide-program-subtitle, .guide-program-time { font-size: 10px; }
+
+  .guide-search-wrap {
+    max-width: none;
+    margin-left: 0;
+    flex: 1 1 100%;
+    min-width: 0;
+  }
+  .tag-filter-panel {
+    right: auto;
+    left: 0;
+  }
+}
+
+/* ── Channel info column (name + group/DUP badge row) ───────────────────────── */
+
+.guide-channel-info {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  flex: 1;
+  overflow: hidden;
+  justify-content: center;
+  gap: 2px;
+}
+
+/* The old per-channel qbadge row (resolution/fps/bitrate/drops chips) and the quality dot
+   were replaced by 12.4's numeric health badge (.guide-health-badge) plus the tech readout
+   on the row's second line (.guide-channel-tech). .qbadge itself is a shared style.css
+   component and is still used for the group and DUP badges in .guide-channel-meta. */
+
+.guide-dup-badges {
+  display: flex;
+  gap: 2px;
+  flex-wrap: nowrap;
+  overflow: hidden;
+}
+
+.guide-lifecycle-badge {
+  display: flex;
+  flex-wrap: nowrap;
+  overflow: hidden;
+}
+
+@media (max-width: 768px) {
+  /* Interim mobile treatment: the tech readout does not fit a phone-width channel column,
+     and 12.4's numeric badge is desktop-only (13.5 puts the score in the channel sheet).
+     DESIGN.md 13's real mobile guide - mini-grid, bottom sheets, logo-only column - is a
+     separate pass; see dev/changelog/344. The lifecycle badge follows the same rule - its
+     "Missing since <date>" detail moves to the channel sheet's Status line instead
+     (openChannelSheet) - but the row's own opacity/strikethrough (.is-removed) stays on,
+     since that costs no column width.
+  */
+  .guide-channel-tech { display: none; }
+  .guide-health-badge { display: none; }
+  .guide-dup-badges   { display: none; }
+  .guide-lifecycle-badge { display: none; }
+}
+
+/* ── Mobile bottom sheets (DESIGN.md 13.10) ─────────────────────────────────── */
+/* The sheets ARE modals: buildModal() builds them and style.css's ≤768px block already
+   turns .modal-panel into a bottom sheet (9.6). Everything here is content styling inside
+   that panel - no backdrop, no positioning, no second overlay component. */
+
+.guide-sheet .modal-body { padding-bottom: 4px; }
+
+.guide-sheet h4 {
+  margin: 14px 0 4px;
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+.guide-sheet h4:first-child { margin-top: 0; }
+
+.guide-sheet-sub { color: var(--text-muted); font-size: 13px; margin: 0 0 10px; }
+.guide-sheet-desc { color: var(--text-muted); font-size: 13px; line-height: 1.5; margin: 10px 0 0; }
+
+.guide-sheet-line {
+  display: flex;
+  gap: 0.6rem;
+  align-items: baseline;
+  font-size: 13px;
+  padding: 5px 0;
+  border-bottom: 1px solid var(--border-soft);
+}
+.guide-sheet-lbl { flex: 0 0 76px; color: var(--text-faint); font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; }
+.guide-sheet-val { color: var(--text); min-width: 0; overflow-wrap: anywhere; }
+
+.guide-sheet-tags { display: flex; flex-wrap: wrap; gap: 0.4rem; margin-top: 10px; }
+.guide-sheet-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 12px;
+  color: var(--text-muted);
+  background: var(--bg2);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 2px 9px;
+}
+
+/* The channel sheet's headline number - the score the mobile column has no room for. */
+.guide-sheet-health {
+  color: var(--hb, var(--text-faint));
+  font-family: var(--font-mono);
+  font-size: 30px;
+  font-weight: 700;
+  line-height: 1;
+  background: none;
+  border: 0;
+  padding: 0;
+  margin-bottom: 6px;
+}
+.guide-sheet-health span { font-size: 14px; color: var(--text-faint); font-weight: 400; }
+
+/* Rows are real touch targets (3.9 / 13.9's 44px floor). */
+.guide-sheet-row {
+  display: flex;
+  align-items: center;
+  width: 100%;
+  min-height: 44px;
+  gap: 0.5rem;
+  padding: 10px 4px;
+  background: none;
+  border: 0;
+  border-bottom: 1px solid var(--border-soft);
+  color: var(--text);
+  font: inherit;
+  font-size: 14px;
+  text-align: left;
+  cursor: pointer;
+}
+.guide-sheet-row.is-active { color: var(--accent-text); }
+.guide-sheet-row-note { margin-left: auto; font-size: 11px; color: var(--text-faint); }
+
+.guide-sheet-cb {
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+  min-height: 40px;
+  font-size: 14px;
+  cursor: pointer;
+}
+.guide-sheet-cb input { accent-color: var(--accent); width: 17px; height: 17px; margin: 0; }
+.guide-sheet-cb.is-fixed { color: var(--text-faint); cursor: not-allowed; }
+.guide-sheet-note { font-size: 11px; color: var(--text-faint); }
+
+.guide-sheet-sort { display: flex; align-items: center; gap: 0.5rem; }
+.guide-sheet-sort select {
+  flex: 1;
+  min-width: 0;
+  height: var(--ctl-h);
+  background: var(--bg2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--text);
+  padding: 0 0.5rem;
+  font: inherit;
+  font-size: 14px;
+}
+.guide-sheet-sort .btn { flex: 0 0 auto; height: var(--ctl-h); }
+
+/* 13.6: the field list's order IS the render order, so each row carries its own move
+   controls rather than relying on drag, which is not reliable inside a scrolling sheet. */
+.guide-sheet-fld { display: flex; align-items: center; gap: 0.5rem; }
+.guide-sheet-fld .guide-sheet-cb { flex: 1; min-width: 0; }
+.guide-sheet-move { display: inline-flex; gap: 4px; }
+.guide-sheet-move button {
+  width: 34px;
+  height: 34px;
+  background: var(--bg2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--text-muted);
+  font-size: 11px;
+  cursor: pointer;
+}
+.guide-sheet-move button:disabled { opacity: 0.35; cursor: default; }
+
+.guide-sheet-hint { font-size: 12px; color: var(--text-faint); line-height: 1.45; margin: 12px 0 0; }
+
+/* ── Health filter ──────────────────────────────────────────────────────────── */
+
+/* Hide failed channels when toggle is off (default) */
+#guide-wrap.hide-failed-channels .guide-channel-row.channel-health-failed,
+#guide-wrap.hide-failed-channels .guide-row.channel-health-failed {
+  display: none;
+}
+
+/* Warning: failed channel WITH a scheduled/active recording - always visible */
+.guide-channel-row.channel-health-warn {
+  box-shadow: inset 3px 0 0 var(--warn);
+  background: rgba(var(--warn-rgb), 0.12);
+}
+.guide-row.channel-health-warn {
+  background: rgba(var(--warn-rgb), 0.06);
+}
+
+.health-fail-badge {
+  display: inline-block;
+  font-size: 10px;
+  background: var(--warn);
+  color: #000;
+  padding: 1px 5px;
+  border-radius: 999px;
+  font-weight: 700;
+  margin-top: 2px;
+  white-space: nowrap;
+}

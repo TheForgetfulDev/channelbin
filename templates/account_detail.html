@@ -1,0 +1,383 @@
+{% extends "base.html" %}
+{% import '_macros.html' as m %}
+{% block title %}{{ account.name }} - Account - ChannelBin{% endblock %}
+
+{#  The account page (dev/changelog/455; standard: DESIGN.md §17).
+
+    Its anatomy is templates/channels/group_detail.html's - the in-tree implementation of
+    §3.8 + §10.2 - because an account is a sibling of a group, not a new kind of thing:
+    back link, header with badges and a lead sentence, warning banners, one status/action
+    bar, then reorderable section cards. Two deliberate departures, both from §17.3: no
+    screenshot frame (an account has no still to show) and no separate status strip (an
+    account has ONE status and it is already a badge - a strip would say "OK" twice).
+
+    ONE markup serves both breakpoints. The desktop and phone mockups drew the sync
+    history as two different tables; shipping two would mean a column could be dropped at
+    one width, which §16.5 item 5 forbids and which the error text - the only place a
+    failed sync says why - must never be on the wrong side of. It reflows instead.
+
+    The status-dependent primary action is the `status_action` macro, rendered exactly
+    twice: once in the inline bar you land on, once in the phone's sticky bottom bar
+    (§17.5 item 3). Built once so the two can never offer different things; the
+    conformance test asserts the count is two, never one or three. #}
+
+{% set st = account.status %}
+{% set is_xtream = account_type == 'xtream' %}
+
+{# The primary action, enumerated per status. No trailing else that quietly becomes the
+   home for the next status somebody adds (CLAUDE.md, "states are enumerated"). #}
+{% macro status_action(st, account) -%}
+  {% if st == 'SYNCING' %}
+  <button class="btn btn-danger btn-sm" data-act="cancel-sync">Cancel sync</button>
+  {% elif st == 'ERROR' %}
+  <button class="btn btn-primary btn-sm" data-act="sync">&#8635; Retry sync</button>
+  {% elif st == 'UNSYNCED' %}
+  <button class="btn btn-primary btn-sm" data-act="sync">Sync for the first time</button>
+  {% elif st == 'OK' %}
+  <button class="btn btn-primary btn-sm" data-act="sync">Sync now</button>
+  {% endif %}
+{%- endmacro %}
+
+{# The status, type and condition badges are the SHARED ones (_macros.html): the list row
+   and this page must not be able to disagree about what "Syncing" looks like or says. This
+   page passes tip=true (the default); a list row carries none (§17.5 item 6). #}
+{% macro status_badge(st) -%}{{ m.account_status_badge(st) }}{%- endmacro %}
+
+{% block content %}
+<div class="page-head">
+  <h1>Accounts</h1>
+  <a href="{{ url_for('accounts.accounts_list') }}" class="btn">&larr; All Accounts</a>
+</div>
+
+{# ── Header ─────────────────────────────────────────────────────────────── #}
+<div class="gd-head">
+  <div class="gd-head-main">
+    <div class="gd-title">
+      <span class="color-dot color-dot-lg" style="background: {{ account.color }}"
+            data-tip="Account color.&#10;How this account's channels are identified in the TV Guide and the channel browser."></span>
+      <h2>{{ account.name }}</h2>
+      {{ status_badge(st) }}
+      {{ m.account_type_badge(account_type) }}
+      {{ m.account_extra_badges(account) }}
+    </div>
+    <p class="gd-sub-lead">
+      {% if st == 'UNSYNCED' %}
+      {{ 'An Xtream' if is_xtream else 'An M3U' }} account that has never been synced. Nothing has
+      been imported from it yet, so it contributes no channels to the guide. Use
+      {{ 'Sync for the first time' }} to fetch it.
+      {% else %}
+      Channels and guide data come from {{ "the provider's Xtream API" if is_xtream else 'an M3U playlist' }},
+      {% if account.sync_enabled %}refreshed automatically every {{ settings.interval_hours }} hours{% else %}refreshed only when you ask for it, because automatic sync is off{% endif %}.
+      It currently supplies <strong>{{ '{:,}'.format(account.channel_count or 0) }}</strong> channels{% if account.hidden_channel_count %} (<strong>{{ '{:,}'.format(account.hidden_channel_count) }}</strong> hidden){% endif %},
+      <strong>{{ '{:,}'.format(guide_count) }}</strong> of them in your TV Guide, and
+      <strong>{{ '{:,}'.format(account.epg_entry_count or 0) }}</strong> program entries.
+      {% endif %}
+    </p>
+  </div>
+  <div class="gd-dates">
+    Added {{ account.created_at | local_date if account.created_at else '-' }}<br>
+    Updated {{ account.updated_at | local_date if account.updated_at else '-' }}
+  </div>
+</div>
+
+{# ── Banners. Above the action bar on purpose: a problem with the account should be read
+     before the line telling you when it last ran. Each says what it MEANS, not just that
+     it happened (DESIGN.md §17.3). ────────────────────────────────────────── #}
+{% if st == 'ERROR' and account.last_error %}
+<div class="notice notice-bad">
+  <strong>&#9888; The last sync failed</strong><br>
+  {{ account.last_error }}<br>
+  The channels imported by the previous successful sync are still here and still record; only new
+  channel and guide data has stopped arriving.
+  {% if last_good_sync %}Last good sync {{ last_good_sync.started_at | local_time }}.{% else %}No sync of this account has ever succeeded.{% endif %}
+</div>
+{% endif %}
+{% if account.constructed_stream_url_count %}
+<div class="notice notice-warn">
+  <strong>&#9888; {{ '{:,}'.format(account.constructed_stream_url_count) }} stream URLs were built by ChannelBin</strong><br>
+  This provider supplied no stream URL for {{ '{:,}'.format(account.constructed_stream_url_count) }}
+  of its {{ '{:,}'.format(account.channel_count or 0) }} channels, so they were constructed from the
+  stream origin the provider declares in its auth response. This is often normal and is not a problem
+  while those channels play. If they do not, the declared origin is the first thing to check.
+</div>
+{% endif %}
+{% if not account.sync_enabled and st != 'UNSYNCED' %}
+<div class="notice notice-info">
+  <strong>Automatic sync is off for this account</strong><br>
+  Its channel list and guide data will not change until you sync it by hand.
+  Last sync {{ account.last_sync_at | time_ago if account.last_sync_at else 'never' }}.
+</div>
+{% endif %}
+
+{# ── Status / action bar ────────────────────────────────────────────────── #}
+<div class="gd-actionbar" id="acct-actionbar">
+  {{ status_badge(st) }}
+  <span class="gd-ab-msg">
+    {% if st == 'SYNCING' %}
+      Syncing now{% if log_rows and log_rows[0].started_at %}, started {{ log_rows[0].started_at | time_ago }}{% endif %}.
+      Counts below are from the previous run until it finishes.
+    {% elif st == 'ERROR' %}
+      The last sync failed {{ account.last_sync_at | time_ago if account.last_sync_at else 'at an unrecorded time' }}.
+      {% if account.sync_enabled %}The next automatic attempt is {{ account.next_sync_at | time_until if account.next_sync_at else 'not scheduled' }}.{% else %}Automatic sync is off, so there is no next attempt.{% endif %}
+    {% elif st == 'UNSYNCED' %}
+      Never synced. Nothing has been imported from this account yet.
+    {% elif st == 'OK' %}
+      Synced {{ account.last_sync_at | time_ago if account.last_sync_at else 'at an unrecorded time' }},
+      {{ '{:,}'.format(account.channel_count or 0) }} channels{% if account.hidden_channel_count %} ({{ '{:,}'.format(account.hidden_channel_count) }} hidden){% endif %} and
+      {{ '{:,}'.format(account.epg_entry_count or 0) }} program entries.
+      {% if account.sync_enabled %}Next sync {{ account.next_sync_at | time_until if account.next_sync_at else 'not scheduled' }}.{% else %}Automatic sync is off.{% endif %}
+    {% else %}
+      Status {{ st }}. This is not a status this page knows how to explain - it should be reported.
+    {% endif %}
+  </span>
+  <div class="gd-ab-actions">
+    {{ status_action(st, account) }}
+    {% if st != 'SYNCING' %}
+    <button class="btn btn-sm" data-act="force-epg"
+            data-tip="Force EPG resync.&#10;Runs a normal sync but imports the guide data even if it looks much smaller than last time. The collapse guard exists to stop a truncated provider feed wiping a good guide; this bypasses it for one run.">Force EPG resync</button>
+    {% endif %}
+    <span class="menu-wrap">
+      <button class="btn btn-sm btn-icon" data-menu aria-label="More actions">&#8943;</button>
+      <div class="menu" id="acct-kebab">
+        <button class="menu-item" data-act="settings">Edit settings&hellip;</button>
+        <button class="menu-item" data-act="sections">Customize sections&hellip;</button>
+        <div class="sep"></div>
+        <a class="menu-item" href="{{ url_for('channels.channel_browser', **{'f.acct': account.id}) }}">Browse channels</a>
+        {% if xtream_debug and is_xtream %}
+        <div class="sep"></div>
+        <button class="menu-item" data-act="dump"
+                data-tip="Fetch &amp; dump.&#10;Writes every Xtream API response to files for inspection. Debug mode only.&#10;Stores your provider username/password in plaintext - the dump directory embeds them in every stream URL.">Fetch &amp; dump</button>
+        <button class="menu-item" data-act="sync-dump"
+                data-tip="Sync from dump.&#10;Runs a sync against the dumped files instead of the live API. Debug mode only.">Sync from dump</button>
+        {% endif %}
+        <div class="sep"></div>
+        <button class="menu-item danger" data-act="delete">Delete account</button>
+      </div>
+    </span>
+  </div>
+</div>
+<div id="acct-action-error" class="gd-action-error" style="display:none;"></div>
+
+{# ── Reorderable sections ───────────────────────────────────────────────── #}
+<div class="gd-sections" id="acct-sections">
+
+  {# Details: what this account IS. A value inherited from Settings says so, because
+     "6h because this account says 6h" and "6h because Settings says 6h" behave
+     differently the moment the global changes (§17.3). #}
+  <div class="card" data-section="details">
+    <div class="card-head"><h2>Details</h2>
+      <div class="card-head-actions">
+        <button class="btn btn-sm" data-act="settings">Edit settings</button>
+      </div>
+    </div>
+    <div class="card-body">
+      <div class="statlist has-wide">
+        {{ m.stat_row('Type', 'Xtream API' if is_xtream else 'M3U playlist') }}
+        {{ m.stat_row('Status', st, 'ok' if st == 'OK' else ('bad' if st == 'ERROR' else 'faint')) }}
+        <div class="srow"><span class="sk">URL normalization</span>
+          <span class="sv tip-plain" data-tip="URL normalization.&#10;Rewrites every stream URL into one consistent shape. Only the shape changes - the address and credentials the provider supplied are kept as they are, and a URL with no user/password/id in it is left alone.{% if settings.norm_example %}&#10;Example: {{ settings.norm_example }}{% endif %}">{{ settings.norm_label }}{% if settings.norm_inherited %} <span class="text-faint sv-inherit">(global)</span>{% endif %}</span></div>
+        {{ m.stat_row('Automatic sync', 'On' if account.sync_enabled else 'Off', 'ok' if account.sync_enabled else 'faint') }}
+        <div class="srow"><span class="sk">Sync interval</span>
+          <span class="sv tip-plain" data-tip="Sync interval.&#10;How often this account is refreshed. (global) means it follows sync.sync_interval_hours in Settings rather than carrying its own value.">every {{ settings.interval_hours }}h{% if settings.interval_inherited %} <span class="text-faint sv-inherit">(global)</span>{% endif %}</span></div>
+        <div class="srow"><span class="sk">Max connections</span>
+          <span class="sv tip-plain" data-tip="Max simultaneous connections.&#10;The cap on concurrent connections ChannelBin opens to this provider - recordings and channel tests combined. Account sync does not count against it.">{{ settings.max_connections }}{% if settings.max_connections_inherited %} <span class="text-faint sv-inherit">(global)</span>{% endif %}</span></div>
+        {% if is_xtream %}
+        {# What the provider itself reports in its auth response (dev/changelog/534) -
+           separate from the sync-health Status row above and the configured Max
+           connections row above. Missing fields render as faint "not reported" text
+           rather than being hidden, per this page's existing zero-is-faint convention -
+           providers vary in which fields they send. #}
+        <div class="srow"><span class="sk">Provider status</span>
+          <span class="sv{% if account.provider_status %} {{ 'ok' if account.provider_status|lower == 'active' else ('bad' if account.provider_status|lower in ('banned', 'disabled', 'expired') else 'warn') }}{% else %} faint{% endif %} tip-plain" data-tip="Provider status.&#10;The account status the provider itself reports, from its auth response - not whether ChannelBin's last sync succeeded (see Status above).">{{ account.provider_status or 'not reported' }}</span></div>
+        {{ m.stat_row('Trial account',
+                      'Yes' if account.provider_is_trial else ('No' if account.provider_is_trial is not none else 'not reported'),
+                      'warn' if account.provider_is_trial else ('faint' if account.provider_is_trial is none else none)) }}
+        {{ m.stat_row('Expires',
+                      account.provider_exp_date | local_date if account.provider_exp_date else 'not reported',
+                      none if account.provider_exp_date else 'faint') }}
+        {% set pmax = account.provider_max_connections %}
+        {% set pmax_mismatch = pmax is not none and pmax != settings.max_connections %}
+        <div class="srow"><span class="sk">Provider max connections</span>
+          <span class="sv{% if pmax is none %} faint{% elif pmax_mismatch %} warn{% else %} faint{% endif %} tip-plain" data-tip="Provider max connections.&#10;The simultaneous-connection cap this provider reports for the account - separate from the Max connections setting above, which is what ChannelBin itself enforces.{% if pmax_mismatch %} These disagree.{% endif %}">{{ pmax if pmax is not none else 'not reported' }}{% if pmax_mismatch %} <span class="text-faint">(configured: {{ settings.max_connections }})</span>{% endif %}</span></div>
+        {{ m.stat_row('Active connections (last sync)',
+                      account.provider_active_connections if account.provider_active_connections is not none else 'not reported',
+                      'faint',
+                      tip='Active connections (last sync).&#10;A snapshot of how many connections the provider reported as in use at the moment of the last sync - not a live count.') }}
+        {{ m.stat_row('Allowed output formats',
+                      account.provider_allowed_output_formats.replace(',', ', ') if account.provider_allowed_output_formats else 'not reported',
+                      'faint',
+                      tip='Allowed output formats.&#10;What the provider says it supports. Informational only - ChannelBin does not use this to decide how stream URLs are built.') }}
+        {{ m.stat_row('Declared stream origin',
+                      account.provider_stream_origin or 'not reported',
+                      'faint',
+                      tip='Declared stream origin.&#10;Where the provider says its streams are served, from its own auth response. This is NOT the Server address below, which is the API endpoint the channel list and EPG are fetched from.') }}
+        {% endif %}
+        {{ m.stat_row('Last sync', account.last_sync_at | local_time if account.last_sync_at else 'never', 'faint') }}
+        {{ m.stat_row('Next sync',
+                      (account.next_sync_at | time_until if account.next_sync_at else 'not scheduled') if account.sync_enabled else 'off',
+                      none if account.sync_enabled else 'faint') }}
+        {# The endpoint is wide, and it is MASKED: an account's own URL is secret in full,
+           because for a path-token provider the path IS the credential (§17.4). #}
+        <div class="srow wide"><span class="sk">{{ 'Server' if is_xtream else 'Playlist' }}</span>
+          <span class="sv endpoint tip-plain" data-tip="The address ChannelBin fetches this account's data from. Shown masked: an account URL is secret in full, because some providers put the credential in the path itself.&#10;&#10;This is NOT where the streams come from. The provider declares its stream origin separately and it is frequently a different host.">{{ endpoint or 'not set' }}</span></div>
+        {% if account.username %}
+        <div class="srow wide"><span class="sk">Username</span><span class="sv endpoint">{{ account.username }}</span></div>
+        {% endif %}
+        {% if not is_xtream and epg_endpoint %}
+        <div class="srow wide"><span class="sk">XMLTV</span><span class="sv endpoint">{{ epg_endpoint }}</span></div>
+        {% endif %}
+      </div>
+    </div>
+  </div>
+
+  {# Content: what this account PRODUCED. Every number is a jump-off to the page that
+     lists what it counts; a zero is faint text rather than a link to an empty page. #}
+  <div class="card" data-section="content">
+    <div class="card-head"><h2>Content</h2>
+      <div class="card-head-actions">
+        <a class="btn btn-sm" href="{{ url_for('channels.channel_browser', **{'f.acct': account.id}) }}">Browse channels <span class="arw">&#8594;</span></a>
+      </div>
+    </div>
+    <div class="card-body">
+      <div class="statlist">
+        <div class="srow"><span class="sk">Channels</span><span class="sv">
+          {% if account.channel_count %}<a class="sv-link" href="{{ url_for('channels.channel_browser', **{'f.acct': account.id}) }}">{{ '{:,}'.format(account.channel_count) }}</a>{% else %}<span class="text-faint">0</span>{% endif %}{% if account.hidden_channel_count %} <span class="text-faint">({{ '{:,}'.format(account.hidden_channel_count) }} hidden)</span>{% endif %}</span></div>
+        <div class="srow"><span class="sk">In the TV Guide</span><span class="sv">
+          {% if guide_count %}<a class="sv-link" href="{{ url_for('channels.channel_browser', **{'f.acct': account.id, 'f.other': 'guide'}) }}">{{ '{:,}'.format(guide_count) }}</a>{% else %}<span class="text-faint">0</span>{% endif %}</span></div>
+        <div class="srow"><span class="sk">Program entries</span><span class="sv">
+          {% if account.epg_entry_count %}{{ '{:,}'.format(account.epg_entry_count) }}{% else %}<span class="text-faint">0</span>{% endif %}</span></div>
+        {{ m.stat_row('Channels with EPG match',
+                      '{:,}'.format(epg_match_counts.with_epg),
+                      'ok' if epg_match_counts.with_epg else 'faint',
+                      tip='Channels with EPG match.&#10;Channels with an EPG id set that currently has a program showing in the next 24h.') }}
+        {{ m.stat_row('EPG id set, no match',
+                      '{:,}'.format(epg_match_counts.no_match),
+                      'warn' if epg_match_counts.no_match else 'faint',
+                      tip='EPG id set, no match.&#10;Channels with an EPG id set, but no program data currently matches it - likely a naming mismatch with the provider guide, or a guide the account does not carry.') }}
+        {{ m.stat_row('No EPG id',
+                      '{:,}'.format(epg_match_counts.no_id),
+                      'faint',
+                      tip='No EPG id.&#10;Channels with no EPG id at all, so no guide data can be matched to them.') }}
+        {{ m.stat_row('Constructed stream URLs',
+                      '{:,}'.format(account.constructed_stream_url_count or 0),
+                      'warn' if account.constructed_stream_url_count else 'faint',
+                      tip='Constructed stream URLs.&#10;Channels whose stream URL the provider did not supply, so ChannelBin built one from the declared stream origin.') }}
+        <div class="srow"><span class="sk">Recordings</span><span class="sv">
+          {% if rec_total %}<a class="sv-link" href="{{ url_for('recordings.index') }}">{{ '{:,}'.format(rec_total) }}</a>{% else %}<span class="text-faint">0</span>{% endif %}</span></div>
+        {{ m.stat_row('Recorded time',
+                      rec_stats.total_seconds | duration if rec_total else '-',
+                      none if rec_total else 'faint') }}
+      </div>
+    </div>
+  </div>
+
+  {# Sync history. The last {{ history_shown }} runs; "All N syncs" loads the rest into
+     this same section - account_logs.html and its route are retired (§17.1), so there is
+     no page to jump to and nothing is one navigation further away than it was.
+
+     ONE markup for both breakpoints. At =<768px the row reflows to two lines with the
+     error spanning full width; no column is dropped, because the error text is the only
+     place a failed sync says WHY (§16.5 item 5 beats §9.5, §17.5 item 5). #}
+  <div class="card" data-section="history">
+    <div class="card-head"><h2>Sync history{% if total_syncs %} <span class="cnt">{{ total_syncs }}</span>{% endif %}</h2>
+      {% if has_more_syncs %}
+      <div class="card-head-actions">
+        <button class="btn btn-sm" id="acct-hist-more" data-total="{{ total_syncs }}">All {{ '{:,}'.format(total_syncs) }} syncs</button>
+      </div>
+      {% endif %}
+    </div>
+    <div class="card-body">
+      {% if not logs %}
+      {# The empty state is server-rendered, and it renders INSIDE this card, head and all
+         (§17.3): a bare empty box floating where a card should be leaves the section
+         unlabelled, which is unidentifiable on a page whose sections the user reorders. #}
+      <div class="empty-state"><p><strong>No syncs yet</strong></p>
+        <p class="text-muted" style="font-size:13px;">This account has never been fetched.
+          Sync now runs the first one.</p></div>
+      {% else %}
+      {# One renderer for this region, in account-detail.js, fed from the JSON blob below -
+         the same shape the syncs API returns. A Jinja copy alongside the JS one is how a
+         first paint and a refresh end up disagreeing (the old health-check page did
+         exactly that). #}
+      <div class="hist" id="acct-hist"></div>
+      {% endif %}
+    </div>
+  </div>
+
+  {# Activity. Derived from data the app already has - this account's own sync log -
+     never invented (§17.3). #}
+  <div class="card" data-section="activity">
+    <div class="card-head"><h2>Activity</h2>
+      <div class="card-head-actions">
+        <a class="btn btn-sm" href="{{ url_for('logs.logs_page') }}">Logs <span class="arw">&#8594;</span></a>
+      </div>
+    </div>
+    <div class="card-body">
+      {% if not log_rows %}
+      <div class="empty-state"><p><strong>Nothing has happened yet</strong></p>
+        <p class="text-muted" style="font-size:13px;">Activity appears here once this account has been synced.</p></div>
+      {% else %}
+      {# Server-rendered, unlike the history region above: this is the page's own account
+         of what happened and it must survive with no JS. It reads the ORM rows directly -
+         a different region from the history table, and Jinja's time filters want the
+         datetimes rather than the ISO strings the JSON shape carries. #}
+      <div class="acct-activity">
+        {% for log in log_rows[:6] %}
+        <div class="acct-act">
+          <span class="acct-act-dot {{ 'bad' if log.status == 'ERROR' else ('warn' if log.status == 'PARTIAL' else ('faint' if log.status == 'CANCELLED' else ('live' if not log.status else 'ok'))) }}"></span>
+          <div class="acct-act-body">
+            <div class="acct-act-line">
+              {% if not log.status %}Sync started.
+              {% elif log.status == 'SUCCESS' %}Sync finished: {{ '{:,}'.format(log.channels_synced or 0) }} channels{% if log.channels_added is not none and log.channels_removed is not none %} ({% if log.channels_added %}<a href="{{ new_channels_url }}">{{ '{:,}'.format(log.channels_added) }} added</a>{% else %}<span class="text-faint">0 added</span>{% endif %}, {% if log.channels_removed %}<a href="{{ removed_channels_url }}">{{ '{:,}'.format(log.channels_removed) }} removed</a>{% else %}<span class="text-faint">0 removed</span>{% endif %}){% endif %}, {{ '{:,}'.format(log.epg_entries_synced or 0) }} program entries{% if log.completed_at and log.started_at %} in {{ (log.completed_at - log.started_at).total_seconds() | duration }}{% endif %}.
+              {% elif log.status == 'PARTIAL' %}Sync finished with gaps: {{ '{:,}'.format(log.channels_synced or 0) }} channels{% if log.channels_added is not none and log.channels_removed is not none %} ({% if log.channels_added %}<a href="{{ new_channels_url }}">{{ '{:,}'.format(log.channels_added) }} added</a>{% else %}<span class="text-faint">0 added</span>{% endif %}, {% if log.channels_removed %}<a href="{{ removed_channels_url }}">{{ '{:,}'.format(log.channels_removed) }} removed</a>{% else %}<span class="text-faint">0 removed</span>{% endif %}){% endif %}, {{ '{:,}'.format(log.epg_entries_synced or 0) }} program entries. {{ log.error_message or 'Part of the import did not complete.' }}
+              {% elif log.status == 'ERROR' %}Sync failed. {{ log.error_message or 'No reason was recorded.' }}
+              {% elif log.status == 'CANCELLED' %}Sync cancelled before it finished.
+              {% else %}{{ log.status }}
+              {% endif %}
+            </div>
+            <div class="acct-act-when">{{ log.started_at | local_time }}</div>
+          </div>
+        </div>
+        {% endfor %}
+      </div>
+      {% endif %}
+    </div>
+  </div>
+
+</div>
+
+{# The phone's sticky bottom bar (§17.5 item 3). Hidden until the inline bar above scrolls
+   out of view, so a short page never shows the same action twice in one viewport - the
+   failure the browser pass found (dev/changelog/453). Its primary comes from the SAME
+   macro as the inline one, so the two cannot offer different things. #}
+<div class="acct-stickybar actbar-reveal" id="acct-stickybar" aria-hidden="true">
+  <div class="acct-stickybar-in">
+    {{ status_action(st, account) }}
+    <button class="btn btn-icon" data-act="page-actions" aria-label="More actions">&#8943;</button>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+window.ACCOUNT_DETAIL = {
+  id: {{ account.id }},
+  name: {{ account.name | tojson }},
+  status: {{ account.status | tojson }},
+  accountType: {{ account_type | tojson }},
+  channels: {{ account.channel_count or 0 }},
+  epg: {{ account.epg_entry_count or 0 }},
+  totalSyncs: {{ total_syncs }},
+  historyShown: {{ logs | length }},
+  logs: {{ logs | tojson }},
+  sections: {{ sections | tojson }},
+  sectionPref: {{ section_pref | tojson }},
+  xtreamDebug: {{ 'true' if xtream_debug else 'false' }},
+  browseUrl: {{ url_for('channels.channel_browser', **{'f.acct': account.id}) | tojson }},
+  accountsUrl: {{ url_for('accounts.accounts_list') | tojson }},
+};
+</script>
+<script src="{{ url_for('static', filename='js/account-modal.js') }}"></script>
+<script src="{{ url_for('static', filename='js/account-actions.js') }}"></script>
+<script src="{{ url_for('static', filename='js/account-detail.js') }}"></script>
+{% endblock %}

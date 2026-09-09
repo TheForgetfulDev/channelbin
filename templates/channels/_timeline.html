@@ -1,0 +1,149 @@
+{# Shared activity-timeline log. Rendered by channels/detail.html (per-channel) and
+   channels/group_detail.html (per-group). Context in:
+     entries            - list of dicts: {kind, ts, obj, [quality_breakdown],
+                          [blend_breakdown], [source], [source_url], [run_label]}; kind ∈
+                          test|recording|recording_event|channel_event|group_event
+     run_label          - on a `test` entry, which run produced it (a health check's
+                          name, or "Pre-recording check"). The group page sets it; the
+                          channel page does not, since every test there is that
+                          channel's own and the label would repeat per row.
+     show_source        - when true, render each row's `source` label (which
+                          member/recording the entry came from); group page passes it,
+                          channel page does not.
+     in_progress_test_id - id of the ChannelTest row (if any) a health check is running
+                          against right now; optional, undefined on any caller that
+                          hasn't computed it.
+   The .ch-timeline-* / .ch-breakdown* / .tl-dot* classes live in static/css/style.css. #}
+{% set ch_dot = {
+  'test:COMPLETED': 'done', 'test:FAILED': 'failed', 'test:CANCELLED': 'neutral',
+  'test:IN_PROGRESS': 'start',
+  'recording:COMPLETED': 'done', 'recording:FAILED': 'failed', 'recording:ABORTED': 'aborted',
+  'recording:IN_PROGRESS': 'start', 'recording:PAUSED': 'paused',
+  'recording:SCHEDULED': 'scheduled', 'recording:CONCATENATING': 'neutral',
+  'CHANNEL_ADDED_TO_GUIDE': 'start', 'CHANNEL_REMOVED_FROM_GUIDE': 'stopped',
+  'CHANNEL_HEALTH_OVERRIDE_CHANGED': 'neutral',
+  'CHANNEL_FAILOVER_HEALTH_OBSERVATION': 'failed',
+  'CHANNEL_GROUPED': 'start', 'CHANNEL_UNGROUPED': 'stopped',
+  'CHANNEL_GROUP_FORMAT_MISMATCH': 'failed', 'CHANNEL_GROUP_FORMAT_RESOLVED': 'done',
+  'CHANNEL_URL_CHANGED': 'neutral', 'CHANNEL_HIDE_OVERRIDE_CHANGED': 'neutral',
+  'GROUP_MEMBER_SELECTED': 'start', 'GROUP_FAILOVER': 'aborted',
+  'RECORDING_FORMAT_OVERRIDE': 'failed',
+  'GROUP_MEMBER_PARTICIPATION': 'neutral', 'GROUP_FORMAT_STRATEGY_APPLIED': 'neutral',
+  'GROUP_CHECK_TARGETS_CHANGED': 'neutral', 'GROUP_FORMAT_STRATEGY_BLOCKED': 'failed',
+  'GROUP_WARNING_MUTED': 'neutral',
+  'GROUP_GUIDE_ADDED': 'start', 'GROUP_GUIDE_REMOVED': 'stopped',
+  'GROUP_GUIDE_BROKEN': 'failed',
+} %}
+{# ChannelGroupEvent types read badly through the generic underscores-to-Title-Case
+   fallback ("Group Member Participation"), so each gets a written label. The fallback
+   still covers a type added later (DESIGN-channel-groups-model.md 4.5). #}
+{% set group_ev_label = {
+  'GROUP_MEMBER_PARTICIPATION': 'Participation Changed',
+  'CHANNEL_GROUP_FORMAT_MISMATCH': 'Format Mismatch',
+  'CHANNEL_GROUP_FORMAT_RESOLVED': 'Format Resolved',
+  'GROUP_FORMAT_STRATEGY_APPLIED': 'Format Strategy Applied',
+  'GROUP_FORMAT_STRATEGY_BLOCKED': 'Format Strategy Found Nothing',
+  'GROUP_CHECK_TARGETS_CHANGED': 'Check Targets Changed',
+  'GROUP_WARNING_MUTED': 'Warning Banner Changed',
+  'GROUP_GUIDE_ADDED': 'Added To The TV Guide',
+  'GROUP_GUIDE_REMOVED': 'Removed From The TV Guide',
+  'GROUP_GUIDE_BROKEN': 'In The Guide With Nothing To Record',
+} %}
+<div class="ch-timeline-log">
+  {% for entry in entries %}
+  {# A test row is created with status='FAILED' as a placeholder and only gets its real
+     terminal status once the check finishes - the row a check is running against right
+     now must not be mistaken for a real failure (CLAUDE.md "one flag, one meaning; states
+     are enumerated"). #}
+  {% set test_in_progress = entry.kind == 'test' and in_progress_test_id is defined
+                             and in_progress_test_id and entry.obj.id == in_progress_test_id %}
+  {% set dot_key = 'test:IN_PROGRESS' if test_in_progress else
+       ((entry.kind ~ ':' ~ entry.obj.status) if entry.kind in ('test', 'recording') else entry.obj.event_type) %}
+  <div class="ch-timeline-row">
+    <span class="tl-dot ch-timeline-dot tl-dot-{{ ch_dot.get(dot_key, 'neutral') }}"></span>
+    <div class="ch-timeline-body">
+      <span class="text-muted small">{{ entry.ts | local_time }}</span>
+      {% if entry.kind == 'test' %}
+        <span>Health Test</span>
+        {% if test_in_progress %}
+        <span class="badge badge-in_progress">IN PROGRESS</span>
+        {% else %}
+        <span class="badge badge-{{ entry.obj.status | lower }}">{{ entry.obj.status }}</span>
+        {% endif %}
+        <span class="text-muted small">
+          score {{ entry.obj.quality_score if entry.obj.quality_score is not none else '-' }}
+          → lifetime {{ entry.obj.lifetime_score_after if entry.obj.lifetime_score_after is not none else '-' }}
+        </span>
+        {# Which run produced that score. A group aggregates several checks plus the
+           pre-recording checks its own recordings ran, and the numbers alone cannot say
+           which is which (dev/changelog/790). #}
+        {% if entry.run_label %}<span class="text-muted small">· {{ entry.run_label }}</span>{% endif %}
+      {% elif entry.kind == 'recording' %}
+        <span>Recording</span>
+        <a href="{{ url_for('recordings.recording_detail', recording_id=entry.obj.id) }}">{{ entry.obj.name }}</a>
+        <span class="badge badge-{{ entry.obj.status | lower }}">{{ entry.obj.status }}</span>
+        {% if entry.obj.health_quality_score is not none %}
+        <span class="text-muted small">score {{ entry.obj.health_quality_score }}</span>
+        {% endif %}
+      {% elif entry.kind == 'recording_event' %}
+        <span>{{ entry.obj.event_type | replace('_', ' ') | title }}</span>
+        {% if entry.obj.detail %}<span class="text-muted small">{{ entry.obj.detail }}</span>{% endif %}
+        {% if entry.channel_links %}
+        <div class="text-muted small">
+          {% for l in entry.channel_links %}<a href="{{ url_for('channels.channel_detail', channel_id=l.channel.id) }}">{{ l.channel.name }}</a>{% if l.account %} · <a href="{{ url_for('accounts.account_detail', account_id=l.account.id) }}">{{ l.account.name }}</a>{% endif %}{% if not loop.last %}<br>{% endif %}{% endfor %}
+        </div>
+        {% endif %}
+      {% elif entry.kind == 'channel_event' %}
+        <span>{{ entry.obj.event_type | replace('_', ' ') | title }}</span>
+        {% if entry.obj.detail %}<span class="text-muted small">{{ entry.obj.detail }}</span>{% endif %}
+      {% elif entry.kind == 'group_event' %}
+        <span>{{ group_ev_label.get(entry.obj.event_type, entry.obj.event_type | replace('_', ' ') | title) }}</span>
+        {% if entry.obj.detail %}<span class="text-muted small">{{ entry.obj.detail }}</span>{% endif %}
+      {% endif %}
+
+      {% if show_source and entry.source %}
+        <span class="text-muted small">·
+        {%- if entry.source_url %} <a href="{{ entry.source_url }}">{{ entry.source }}</a>
+        {%- else %} {{ entry.source }}{% endif %}</span>
+      {% endif %}
+
+      {% if entry.quality_breakdown or entry.correction_breakdown or entry.blend_breakdown %}
+      <details class="ch-breakdown">
+        <summary class="text-muted small" style="cursor:pointer;">Score breakdown</summary>
+        {% if entry.quality_breakdown %}
+        {% set qb = entry.quality_breakdown %}
+        <div class="ch-breakdown-row" style="margin-top:.4rem;"><b>Capture</b></div>
+        <div class="ch-breakdown-row"><b>Base:</b> {{ qb.base if qb.base is not none else '-' }}{% if qb.fail_floor_applied %} (fail floor {{ qb.fail_floor_value }} applied){% endif %}</div>
+        {% for p in qb.penalties %}
+        <div class="ch-breakdown-row">{{ p.detail or p.reason }} <b>{{ '%+.1f' | format(p.amount) }}</b></div>
+        {% endfor %}
+        <div class="ch-breakdown-row"><b>Result:</b> {{ qb.final }}</div>
+        {% endif %}
+        {% if entry.correction_breakdown %}
+        {# A second, independently-blended observation from postprocessing - the segment's
+           own stall/restart counters can be a clean 100 (above) while this one still dings
+           the score for timeline/near-empty damage the capture phase couldn't see yet
+           (app/health_score.py::apply_capture_quality_correction). #}
+        {% set cb = entry.correction_breakdown %}
+        <div class="ch-breakdown-row" style="margin-top:.4rem;"><b>Capture quality correction</b></div>
+        <div class="ch-breakdown-row"><b>Base:</b> {{ cb.base if cb.base is not none else '-' }}</div>
+        {% for p in cb.penalties %}
+        <div class="ch-breakdown-row">{{ p.detail or p.reason }} <b>{{ '%+.1f' | format(p.amount) }}</b></div>
+        {% endfor %}
+        <div class="ch-breakdown-row"><b>Result:</b> {{ cb.final }}</div>
+        {% endif %}
+        {% if entry.blend_breakdown %}
+        {% set bb = entry.blend_breakdown %}
+        <div class="ch-breakdown-row" style="margin-top:.4rem;"><b>Blend into lifetime score</b></div>
+        {% if bb.first_observation %}
+        <div class="ch-breakdown-row">First observation - score set directly to {{ bb.new_score | round(1) }}</div>
+        {% else %}
+        <div class="ch-breakdown-row">{{ bb.old_score | round(1) }} → {{ bb.new_score | round(1) }} (half-life {{ bb.half_life_samples }} samples, decay {{ bb.decay | round(3) }}, effective α {{ bb.effective_alpha | round(3) }}, weight ×{{ bb.source_weight | round(2) }})</div>
+        {% endif %}
+        {% endif %}
+      </details>
+      {% endif %}
+    </div>
+  </div>
+  {% endfor %}
+</div>

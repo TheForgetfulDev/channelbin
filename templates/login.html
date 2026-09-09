@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Sign in - ChannelBin</title>
+  <meta name="csrf-token" content="{{ csrf_token() }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+  <script src="{{ url_for('static', filename='js/util.js') }}"></script>
+  <link rel="apple-touch-icon" sizes="180x180" href="{{ url_for('static', filename='img/logo/channelbin-favicon/apple-touch-icon.png') }}">
+  <link rel="icon" type="image/png" sizes="32x32" href="{{ url_for('static', filename='img/logo/channelbin-favicon/favicon-32x32.png') }}">
+  <link rel="icon" type="image/png" sizes="16x16" href="{{ url_for('static', filename='img/logo/channelbin-favicon/favicon-16x16.png') }}">
+  <link rel="manifest" href="{{ url_for('static', filename='img/logo/channelbin-favicon/site.webmanifest') }}">
+  <link rel="shortcut icon" href="{{ url_for('static', filename='img/logo/channelbin-favicon/favicon.ico') }}">
+  {# Standalone page - does not extend base.html, since a logged-out visitor gets no nav
+     (CLAUDE.md scope note for this page). Layout is scoped here rather than promoted to
+     style.css, matching the page-local-rules convention for a class with one caller. #}
+  <style>
+    body.login-page { display: flex; align-items: center; justify-content: center; min-height: 100vh; padding: 20px; }
+    .login-card { width: 100%; max-width: 360px; }
+    .login-card .card-body { display: flex; flex-direction: column; gap: 14px; padding-top: 14px; padding-bottom: 18px; }
+    .login-brand { display: flex; align-items: center; gap: 10px; justify-content: center; margin: 6px 0 2px; }
+    .login-brand img { width: 32px; height: 32px; }
+    .login-brand span { font-weight: 700; font-size: var(--fs-xl); }
+    .login-banner { font-size: var(--fs-md); border-radius: var(--radius-sm); padding: 8px 10px; }
+    .login-banner-error { color: var(--bad); background: var(--bad-soft); }
+    .login-banner-warn { color: var(--warn); background: var(--warn-soft); }
+    @media (max-width: 480px) {
+      .login-card { max-width: 100%; }
+    }
+  </style>
+</head>
+<body class="login-page">
+  {% from '_macros.html' import csrf_field, secret_reveal_btn %}
+  <div class="card login-card">
+    <div class="card-body">
+      <div class="login-brand">
+        <img src="{{ url_for('static', filename='img/logo/channelbin-logo.png') }}" alt="">
+        <span>ChannelBin</span>
+      </div>
+      {% if insecure %}
+      <div class="login-banner login-banner-warn">This connection is not encrypted (plain HTTP) - the password below is sent unencrypted over this connection.</div>
+      {% endif %}
+      {% if error %}
+      <div class="login-banner login-banner-error">{{ error }}</div>
+      {% endif %}
+      <form method="post" action="{{ url_for('auth.login') }}">
+        {{ csrf_field() }}
+        {% if next %}<input type="hidden" name="next" value="{{ next }}">{% endif %}
+        <div class="form-group" style="margin-bottom:0;">
+          <label for="login-password">Password</label>
+          <div class="secret-field">
+            <input type="password" id="login-password" name="password" class="form-control"
+                   autocomplete="current-password" autofocus required>
+            {{ secret_reveal_btn(local=true) }}
+          </div>
+        </div>
+        <button type="submit" class="btn btn-primary" style="width:100%; margin-top:14px;">Sign in</button>
+      </form>
+    </div>
+  </div>
+</body>
+</html>

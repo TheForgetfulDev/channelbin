@@ -1,0 +1,356 @@
+{% extends "base.html" %}
+{% from '_macros.html' import csrf_field %}
+{% block title %}TV Guide - ChannelBin{% endblock %}
+
+{% block content %}
+{# DESIGN.md 12.1: the day count is generated from sync.epg_days_ahead - no visible string
+   may carry a typed day number. Manage channels is the primary (it is the common
+   destination) and sits rightmost; Add manual recording is secondary and carries no + glyph. #}
+<div class="page-head">
+  <h1>TV Guide <span class="sub">{{ guide_window_days }}-day program grid</span></h1>
+  <div class="guide-head-actions">
+  <a href="#" id="btn-manual-record" class="btn"
+     title="Schedule a one-off recording for something not yet in your TV Guide - e.g. a program with no EPG data, or a stream from an account you haven't added to ChannelBin yet.">
+    Add manual recording
+  </a>
+  {# Lands pre-filtered on guide SCOPE - every channel whose listings reach this page,
+     which includes the members of each group row. That is wider than what the grid draws
+     (a group is ONE row here, and its members are not rows at all), so this is the closest
+     honest answer the channel grain can give, not a mirror of the guide. Mirroring it needs
+     channel groups to be search results in their own right - dev/docs/DESIGN-group-search-rows.md. #}
+  <a href="{{ url_for('channels.channel_browser', **{'f.other': 'guide'}) }}" class="btn btn-primary">Manage channels</a>
+  </div>
+</div>
+
+{# Toolbar (DESIGN.md 12.2). `toolbar` is load-bearing, not decorative: the --ctl-h control
+   height token is scoped to that container (style.css, DESIGN.md 3.5), so every control on
+   this bar lines up only because the bar carries the class. #}
+<div class="toolbar guide-toolbar" id="guide-toolbar">
+  <div class="guide-cluster guide-cluster-when">
+    <span class="guide-cluster-label">When</span>
+    {# One segmented control replaces the five near-duplicate nav buttons. Each button states
+       its jump size and the chevrons point outward from the readout, so direction reads
+       without a label. Hours abbreviate as `h`, never `hr` (12.2). #}
+    <div class="timenav" id="guide-timenav">
+      <button type="button" data-nav="-1440" class="tip-plain"
+              data-tip="Back one day&#10;Scrolls the grid 24 hours earlier.">&laquo; 24h</button>
+      <button type="button" data-nav="-60" class="tip-plain"
+              data-tip="Back one hour&#10;Scrolls the grid 60 minutes earlier.">&lsaquo; 1h</button>
+      <button type="button" class="timenav-readout tip-plain" id="guide-readout"
+              data-tip="Visible window&#10;The day and time range currently on screen - it reads live from the grid's scroll position.&#10;Click to jump to a day.">
+        <span class="timenav-readout-day" id="guide-readout-day">Loading…</span>
+        <span class="timenav-readout-time" id="guide-readout-time"></span>
+      </button>
+      <button type="button" data-nav="60" class="tip-plain"
+              data-tip="Forward one hour&#10;Scrolls the grid 60 minutes later.">1h &rsaquo;</button>
+      <button type="button" data-nav="1440" class="tip-plain"
+              data-tip="Forward one day&#10;Scrolls the grid 24 hours later.">24h &raquo;</button>
+      <button type="button" class="timenav-now tip-plain" id="btn-now"
+              data-tip="Jump to now&#10;Scrolls back to the current time, marked by the red line in the grid.">Now</button>
+    </div>
+    {# Day jump list, capped to the rendered window (12.2 as amended 2026-07-20). #}
+    <div class="guide-pop guide-pop-left" id="guide-daypicker" hidden></div>
+  </div>
+
+  <div class="guide-cluster guide-cluster-find">
+    <span class="guide-cluster-label">Find</span>
+    <div class="guide-search-wrap" id="guide-search-wrap">
+      <input type="text" id="guide-search" class="search guide-search-input"
+             placeholder="Filter visible…" autocomplete="off">
+      <button type="button" class="guide-search-save" id="guide-search-save"
+              title="Save this search" aria-label="Save this search">&#9734;</button>
+      <button type="button" class="guide-search-clear" id="guide-search-clear"
+              title="Clear filter" aria-label="Clear filter">&times;</button>
+      <div class="saved-search-dropdown" id="guide-search-dropdown" style="display:none"></div>
+    </div>
+    {% if tags %}
+    <div class="tag-filter-wrap" id="tag-filter-wrap">
+      <button type="button" class="btn btn-sm tip-plain" id="tag-filter-toggle"
+              data-tip="Tag filter&#10;Include or exclude programs by tag.&#10;Exclude always beats include - a program carrying an excluded tag is hidden no matter what.">
+        <span id="tag-filter-summary">Tags</span> <span class="nav-caret">&#9662;</span>
+      </button>
+      <div class="tag-filter-panel" id="tag-filter-panel" style="display:none">
+        <div class="tag-filter-section">
+          <div class="tag-filter-section-header">
+            <span>Include</span>
+            <span class="tag-filter-mode">
+              <label><input type="radio" name="tag-filter-mode" value="any" checked> Any</label>
+              <label><input type="radio" name="tag-filter-mode" value="all"> All</label>
+            </span>
+          </div>
+          {% for tag in tags %}
+          <label class="tag-filter-row">
+            <input type="checkbox" class="tag-filter-include" value="{{ tag.id }}">
+            <span class="tag-filter-dot" style="background: {{ tag.color }}"></span>
+            {{ tag.name }}
+          </label>
+          {% endfor %}
+        </div>
+        <div class="tag-filter-section">
+          <div class="tag-filter-section-header"><span>Exclude</span></div>
+          {% for tag in tags %}
+          <label class="tag-filter-row">
+            <input type="checkbox" class="tag-filter-exclude" value="{{ tag.id }}">
+            <span class="tag-filter-dot" style="background: {{ tag.color }}"></span>
+            {{ tag.name }}
+          </label>
+          {% endfor %}
+        </div>
+      </div>
+    </div>
+    {% endif %}
+    {# Program-length filter - unlike Tags above, always rendered: it has no configuration
+       dependency the way tags do. Same button+panel shape as Tags on purpose: a popover on
+       desktop, a sheet on mobile via guide.js's openLengthSheet(). #}
+    <div class="dur-filter-wrap" id="dur-filter-wrap">
+      <button type="button" class="btn btn-sm tip-plain" id="dur-filter-toggle"
+              data-tip="Program length&#10;Show only programs longer and/or shorter than a length you set. Leave a box empty to not bound that side.">
+        <span id="dur-filter-summary">Length</span> <span class="nav-caret">&#9662;</span>
+      </button>
+      <div class="dur-filter-panel tag-filter-panel" id="dur-filter-panel" style="display:none">
+        <label class="dur-filter-row">
+          <span>Longer than</span>
+          <input type="number" min="0" inputmode="numeric" id="dur-filter-min" placeholder="e.g. 3">
+        </label>
+        <label class="dur-filter-row">
+          <span>Shorter than</span>
+          <input type="number" min="0" inputmode="numeric" id="dur-filter-max" placeholder="e.g. 30">
+        </label>
+        <label class="dur-filter-row">
+          <span>Unit</span>
+          <select id="dur-filter-unit">
+            <option value="hours" selected>hours</option>
+            <option value="minutes">minutes</option>
+          </select>
+        </label>
+        <div class="dur-filter-actions">
+          <button type="button" class="btn btn-sm" id="dur-filter-clear">Clear</button>
+        </div>
+      </div>
+    </div>
+    {# 12.2 as amended: a plain .btn, not .btn-primary - one primary per page, and that is
+       Manage channels in the header. At phone widths the label is swapped for the icon
+       (13.3) by CSS rather than by a second button, so there is still one control and one
+       handler. The glyph is the MDI "magnify" path as an inline SVG filled with
+       currentColor - never an emoji, which renders in emoji colour and ignores the theme. #}
+    {# A BUTTON and not an anchor, because it carries the filter box's live text with it -
+       an href rendered here would be frozen at page load. guide.js reads #guide-search and
+       appends `q=`; the base URL comes from the server, built through
+       SearchState.to_params(), so `q` is the one parameter spelled in JS (dev/changelog/416). #}
+    <button class="btn btn-sm tip-plain" id="btn-airing-search"
+            aria-label="Search all EPG data"
+            data-airing-search-url="{{ airing_search_url }}"
+            data-tip="Search all EPG data&#10;The filter box only narrows what is already on screen. This opens the Airings search, which searches every program on every channel, including channels not in your guide."><svg
+        class="guide-icon" viewBox="0 0 24 24" width="16" height="16" fill="currentColor"
+        aria-hidden="true"><path d="M9.5,3A6.5,6.5 0 0,1 16,9.5C16,11.11 15.41,12.59 14.44,13.73L14.71,14H15.5L20.5,19L19,20.5L14,15.5V14.71L13.73,14.44C12.59,15.41 11.11,16 9.5,16A6.5,6.5 0 0,1 3,9.5A6.5,6.5 0 0,1 9.5,3M9.5,5C7,5 5,7 5,9.5C5,12 7,14 9.5,14C12,14 14,12 14,9.5C14,7 12,5 9.5,5Z"/></svg><span
+        class="guide-btn-label">Search all…</span></button>
+  </div>
+
+  {# Everything that changes what the guide shows lives in here (12.3) - no boolean toggle
+     pills on the bar itself. Every checkbox's `checked` comes from the same server-side
+     dict guide.js starts from, so the two can never disagree. #}
+  <div class="guide-cluster guide-cluster-layout">
+    <div class="guide-pop-wrap" id="guide-layout-wrap">
+      {# One button, two presentations: the desktop popover trigger, and at phone widths a
+         gear-only control opening the Layout SHEET (13.6). The label and caret are hidden by
+         CSS at ≤768px; guide.js branches on the same breakpoint for which surface to open. #}
+      <button type="button" class="btn btn-sm tip-plain" id="btn-layout"
+              aria-label="Layout"
+              data-tip="Layout&#10;Choose what the guide shows: which fields appear in each program cell and in the channel column, and how the grid itself behaves. Rows resize to fit whatever you enable.">&#9881;<span class="guide-btn-label"> Layout &#9662;</span></button>
+      <div class="guide-pop" id="guide-layout-pop" hidden>
+        <h4>Grid behavior</h4>
+        <label class="tip-plain"
+               data-tip="Collapse gaps&#10;With a filter active, cuts the empty time between matches out of the timeline so the matches sit side by side.&#10;A blue sawtooth marks every place time was removed.">
+          <input type="checkbox" data-layout="collapse_gaps" {{ 'checked' if guide_layout.collapse_gaps }}> Collapse gaps</label>
+        <label class="tip-plain"
+               data-tip="Include failed channels&#10;Off: channels whose last health check failed are hidden.&#10;On: they are listed too.&#10;A failed channel with a recording scheduled is always shown, highlighted amber, so you never lose a recording silently.">
+          <input type="checkbox" data-layout="show_failed" {{ 'checked' if guide_layout.show_failed }}> Include failed channels</label>
+        <div class="guide-pop-hr"></div>
+        <h4>Program cell fields</h4>
+        <label><input type="checkbox" data-layout="rec_status" {{ 'checked' if guide_layout.rec_status }}> Recording status</label>
+        <label class="is-fixed"><input type="checkbox" checked disabled> Title <span class="guide-pop-note">(always)</span></label>
+        <label><input type="checkbox" data-layout="subtitle" {{ 'checked' if guide_layout.subtitle }}> Subtitle / episode</label>
+        <label><input type="checkbox" data-layout="description" {{ 'checked' if guide_layout.description }}> Description</label>
+        <div class="guide-pop-hr"></div>
+        <h4>Time</h4>
+        <label><input type="checkbox" data-layout="start_time" {{ 'checked' if guide_layout.start_time }}> Start time</label>
+        <label><input type="checkbox" data-layout="end_time" {{ 'checked' if guide_layout.end_time }}> End time</label>
+        <label><input type="checkbox" data-layout="duration" {{ 'checked' if guide_layout.duration }}> Duration</label>
+        <div class="guide-pop-hr"></div>
+        <h4>Tag indicators</h4>
+        <label><input type="checkbox" data-layout="tag_dots" {{ 'checked' if guide_layout.tag_dots }}> Show matched-tag dots</label>
+        <div class="guide-pop-hr"></div>
+        <h4>Channel column</h4>
+        <label><input type="checkbox" data-layout="ch_resolution" {{ 'checked' if guide_layout.ch_resolution }}> Resolution</label>
+        <label><input type="checkbox" data-layout="ch_fps" {{ 'checked' if guide_layout.ch_fps }}> Frame rate</label>
+        <label><input type="checkbox" data-layout="ch_bitrate" {{ 'checked' if guide_layout.ch_bitrate }}> Bitrate</label>
+        <label><input type="checkbox" data-layout="ch_audio" {{ 'checked' if guide_layout.ch_audio }}> Audio</label>
+        <div class="guide-pop-hint">Rows size to the tallest cell either side produces, so nothing clips.</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+{# Grid (DESIGN.md 12.6). The PAGE scrolls vertically and only .guide-program-area scrolls
+   horizontally; the header track therefore sits OUTSIDE that scroller and is transform-synced
+   to it by guide.js. Wrapping the whole grid in an internal scroll region would compute
+   overflow-y to auto, create a scrollport and break viewport-sticky - scroll-trapping was
+   rejected explicitly. #}
+<div class="guide-outer">
+  <div class="guide-head" id="guide-head">
+    <div class="guide-channel-corner">
+      {# 12.4: sorting happens from the Channel column header, matching 10.3's desktop
+         convention. Keys, bidirectionality and the never-tested placement rule are shared
+         verbatim with mobile (13.7). #}
+      <button type="button" class="guide-sort-btn tip-plain" id="guide-sort-btn"
+              data-tip="Sort channels&#10;Choose what the channel list is ordered by. Pick the active field again to reverse the direction.">
+        {# The trailing caret is the app's standard "this opens a menu" chrome (.nav-caret,
+           9px muted, as on the Tags button); the direction arrow next to it is the ACTIVE
+           SORT indicator (10.3's convention). They are adjacent, so the size and color
+           difference is what keeps them from reading as one doubled arrow. #}
+        Channel <span class="guide-sort-field" id="guide-sort-field"></span><span class="guide-sort-arrow" id="guide-sort-arrow"></span> <span class="nav-caret">&#9662;</span>
+      </button>
+      <div class="guide-pop guide-pop-left" id="guide-sort-pop" hidden>
+        <h4>Sort channels by</h4>
+        <div id="guide-sort-opts"></div>
+        <div class="guide-pop-hint">Pick the field that is already active to flip between ascending and descending.</div>
+      </div>
+    </div>
+    <div class="guide-head-vp" id="guide-head-vp">
+      <div class="guide-head-track" id="guide-head-track">
+        <div class="guide-day-header" id="guide-day-header"></div>
+        <div class="guide-time-header" id="guide-time-header"></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="guide-body" id="guide-wrap">
+    {# Left: channel column #}
+    <div class="guide-channel-col" id="guide-channel-col">
+      {% for row in rows %}
+      <div class="guide-channel-row{% if row.is_group %} is-group{% endif %}"
+           data-channel-id="{{ row.dom_id }}"
+           data-guide-order="{{ loop.index0 }}"
+           {% if row.is_group %}data-group-id="{{ row.group_id }}"{% endif %}
+           style="border-left-color: {{ row.account_color }}">
+        <div class="guide-channel-top">
+          {# The tile wraps the logo so a group row can hang an offset square off it. A
+             group row draws its logo from whichever member is currently serving it, so a
+             group and one of its own members - both legal guide rows at once - show the
+             SAME image; the shape is what separates them (dev/changelog/856). #}
+          <span class="guide-logo-tile{% if row.is_group %} is-grouplogo{% endif %}">
+            {% if row.logo_url %}
+            <img src="{{ row.logo_url }}" class="guide-logo" alt="" width="30" height="30"
+                 onerror="this.style.opacity=0">
+            {% else %}
+            <span class="guide-logo-fallback">{{ row.name[0] | upper }}</span>
+            {% endif %}
+          </span>
+          {# 13.5: the mobile mini-column carries health as a corner dot on the logo (the
+             numeric badge is desktop-only). Rendered at every width and hidden by CSS on
+             desktop, so guide.js has one element to colour rather than two code paths. #}
+          <span class="guide-health-dot hb-none" data-channel-id="{{ row.dom_id }}"></span>
+          <div class="guide-channel-info">
+            <span class="guide-channel-name">{{ row.name }}</span>
+            <div class="guide-channel-meta">
+              {% if row.is_group %}
+              <span class="qbadge guide-group-badge tip-plain" data-channel-id="{{ row.dom_id }}"
+                    data-tip="Channel group - records from the best of {{ row.member_count }} feeds">⛓{{ row.member_count }}</span>
+              {% endif %}
+              <span class="guide-lifecycle-badge" data-channel-id="{{ row.dom_id }}"></span>
+              {% if row.notes %}<span class="note-indicator tip-plain" data-tip="{{ row.notes }}">📝</span>{% endif %}
+              <span class="guide-dup-badges" data-channel-id="{{ row.dom_id }}"></span>
+            </div>
+          </div>
+          {# 12.4: the numeric score, coloured by health STATE, so colour and number can never
+             disagree. Untested reads `--` in a distinct unknown treatment, never a
+             fabricated score. Filled by guide.js from the EPG payload. #}
+          <span class="guide-health-badge hb-none tip-plain"
+                data-channel-id="{{ row.dom_id }}" data-tip="Not tested yet">--</span>
+        </div>
+        {# Row two: the tech readout (resolution, frame rate, bitrate, audio) #}
+        <div class="guide-channel-tech" data-channel-id="{{ row.dom_id }}"></div>
+      </div>
+      {% endfor %}
+    </div>
+
+    {# Right: horizontally scrollable program area #}
+    <div class="guide-program-area" id="guide-program-area">
+      <div class="guide-program-rows" id="guide-program-rows">
+        {% for row in rows %}
+        <div class="guide-row" data-channel-id="{{ row.dom_id }}"></div>
+        {% endfor %}
+      </div>
+    </div>
+  </div>
+</div>
+
+{# 12.6: a SIBLING of the grid, shown while the grid is hidden. Rebuilding the grid's own
+   innerHTML to render an empty state permanently destroys the nodes the renderer holds
+   references to, so clearing the filter could never restore the guide. #}
+<div class="guide-empty" id="guide-empty" hidden>
+  No programs match the current filter.
+  <span class="guide-empty-sub">Clear the text filter or the tag filter to bring the guide back.</span>
+</div>
+
+{# 12.6 as amended: counts AND the account legend. Account edge-colours on channel rows are
+   meaningless without the legend, which is why it is not optional here. #}
+<div class="guide-statusbar">
+  <span id="guide-sb-counts"></span>
+  <span class="guide-sb-legend">
+    {% for acc in accounts %}
+    <span class="guide-legend-item">
+      <span class="guide-legend-dot" style="background: {{ acc.color }}"></span>
+      {{ acc.name }}
+    </span>
+    {% endfor %}
+  </span>
+</div>
+
+{% include "_record_modal.html" %}
+{% endblock %}
+
+{% block scripts %}
+<link rel="stylesheet" href="{{ url_for('static', filename='css/guide.css') }}">
+<script>
+const GUIDE_CONFIG = {
+  epgUrl: '{{ url_for("guide.epg_api") }}',
+  savedSearchesUrl: '{{ url_for("guide.list_saved_searches") }}',  // GET list / POST create
+  deleteSavedSearchUrlBase: '/api/guide/saved-searches/',  // + id + /delete
+  addChannelUrlBase: '/api/guide/channels/',  // + channel_id + /add
+  newRecordingUrl: '{{ url_for("recordings.new_recording") }}',
+  editRecordingUrlBase: '/recordings/',  // + id + /edit
+  recDetailUrlBase: '/recordings/',  // + id
+  chDetailUrlBase: '/channels/',           // + channel id (mobile channel sheet, 13.10)
+  groupDetailUrlBase: '/channel-groups/',  // + group id, for a group row
+  windowDays: {{ guide_window_days }},
+  // Layout state and the key it persists under (DESIGN.md 12.3). This object is the SAME
+  // declaration the checkboxes above were rendered from, so a checkbox's markup cannot
+  // drift from its JS default.
+  layout: {{ guide_layout | tojson }},
+  layoutPrefKey: '{{ guide_layout_pref_key }}',
+  // Mobile's own Layout state and key (12.3 as amended: a phone's field set must not
+  // reshape the desktop grid). Both are rendered because the breakpoint is a media query
+  // the server cannot see; guide.js picks one at load and re-picks if the breakpoint is
+  // crossed. Its Layout surface is a sheet built in JS, so it has no markup here.
+  layoutMobile: {{ guide_layout_mobile | tojson }},
+  layoutMobilePrefKey: '{{ guide_layout_mobile_pref_key }}',
+  profiles: {
+    {% for p in profiles %}
+    '{{ p.id }}': { prePaddingMinutes: {{ p.pre_padding_minutes }}, postPaddingMinutes: {{ p.post_padding_minutes }} },
+    {% endfor %}
+  },
+};
+
+const MANUAL_RECORD_CONFIG = {
+  testUrlEndpoint: '{{ url_for("recordings.test_recording_url") }}',
+  newRecordingUrl: '{{ url_for("recordings.new_recording_json") }}',
+  recDetailUrlBase: '/recordings/',
+};
+</script>
+<script src="{{ url_for('static', filename='js/guide.js') }}"></script>
+<script src="{{ url_for('static', filename='js/manual_record.js') }}"></script>
+<script>
+  window.onManualRecordSaved = fetchAndRender;
+</script>
+{% endblock %}
