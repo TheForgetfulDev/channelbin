@@ -1911,7 +1911,19 @@ body.actbar-on #app-toast { bottom: 78px; }
 .modal-head h2 { font-size: var(--fs-base); font-weight: 600; margin: 0; border-bottom: none; padding-bottom: 0; }
 .modal-close { background: none; border: none; color: var(--text-muted); font-size: var(--fs-xl); cursor: pointer; line-height: 1; padding: 2px 4px; }
 .modal-close:hover { color: var(--text); }
-.modal-body { padding: 16px 18px; overflow-y: auto; }
+/* min-height: 0 is what makes overflow-y actually scroll. .modal-panel is a flex column
+   with a max-height, and a flex item's default min-height: auto refuses to shrink below its
+   content - so a body taller than the panel pushes .modal-foot out through the bottom
+   instead of scrolling, and the buttons land off screen where nothing can reach them (the
+   page behind is scroll-locked while a modal is open). Worst at 375px, where the cap is
+   85vh. dev/changelog/904, dev/docs/BUGS.md 2026-09-10. */
+.modal-body { padding: 16px 18px; overflow-y: auto; min-height: 0; }
+/* A modal whose body and foot are wrapped in a <form> puts the FORM in .modal-panel's flex
+   column, not .modal-body - so the form has to be a shrinkable flex column itself or the
+   chain breaks at the first non-flex link and the rule above never gets reached. Only the
+   record/edit modal is built that way today; measured at 375px, where skipping this left
+   .modal-foot hanging 6px below the panel's own 85vh box. */
+.modal-panel > form { display: flex; flex-direction: column; min-height: 0; }
 /* flex-wrap: wrap because .modal-panel's width is capped at 560px regardless of viewport
    (below), so a footer with 3+ buttons (the alert banner's "Show details" modal is the case
    that found this: Mark as read / a link button / Ignore future alerts like this / View all)

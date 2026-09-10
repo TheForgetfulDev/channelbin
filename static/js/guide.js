@@ -1596,6 +1596,62 @@ function addSecondsToUtcIso(isoStr, seconds) {
   return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())}T${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())}`;
 }
 
+/* Bumped on every openModal. A group note that arrives after the modal has been reopened
+   on something else belongs to a target the user has already left, so it is dropped rather
+   than painted - otherwise a slow fetch names the previous group over the current one. */
+let _modalOpenToken = 0;
+
+/* The group disclosure (#modal-group-note). A group-backed recording captures from ONE
+   member, picked by format lock + health score at record-start time and re-picked on
+   failover; this modal is where that is decided and was the one surface that never said so.
+
+   Fetched per open rather than read off the row that opened the modal, because the answer
+   is only true for this instant: app/recorder.py::start_recording re-resolves the member
+   when the recording actually begins, so a recording scheduled now can start from a
+   different feed than the one named here - which is exactly what the copy promises. */
+async function showGroupNote(groupId, token) {
+  const note = document.getElementById('modal-group-note');
+  if (!note) return;
+  if (!groupId) { note.style.display = 'none'; note.textContent = ''; return; }
+  note.style.display = 'none';
+  let data;
+  try {
+    data = await jsonFetch(`/api/channel-groups/${groupId}/record-context`);
+  } catch (e) {
+    // The name is the nice-to-have; the warning is the point. Losing the lookup must not
+    // cost the user the disclosure that a group records from a member that can change.
+    if (token !== _modalOpenToken) return;
+    note.textContent = 'This is a channel group - the member it records from can change '
+      + 'before and during the recording. That member could not be looked up just now.';
+    note.style.display = '';
+    return;
+  }
+  if (token !== _modalOpenToken) return;
+  const gname = escHtml(data.group ? data.group.name : '');
+  const parts = [];
+  if (!data.serving) {
+    parts.push(`Channel group "${gname}" has no recording-enabled member, so nothing `
+      + "would record. Turn Recording on for a member on the group's page.");
+  } else {
+    const acct = data.serving.account_name
+      ? ` (${escHtml(data.serving.account_name)})` : '';
+    // Deliberately three short clauses rather than the full ranking rule. This sits above
+    // every other field in the modal, and the long version ran to six lines at 375px.
+    parts.push(`Channel group "${gname}" would record from `
+      + `"${escHtml(data.serving.name)}"${acct} right now - its best-ranked available `
+      + 'member. That can change before and during the recording.');
+    if (data.format_override) {
+      // The lock's zero-survivors override (DESIGN-channel-groups-model.md 15.2). Its
+      // other three disclosures all land at or after record start; this is the only one
+      // the user sees while not scheduling it is still an option.
+      parts.push(`No member matches the locked ${escHtml(data.locked_format)}, so it will `
+        + 'record off-format.');
+    }
+  }
+  note.innerHTML = parts.join(' ');
+  note.style.display = '';
+}
+
 function applyProfilePadding() {
   const note = document.getElementById('modal-padding-note');
   if (!_modalPaddingApplicable || !_modalBaseStartIso || !_modalBaseStopIso) {
@@ -1689,6 +1745,12 @@ function openModal(prog, ch, opts = {}) {
   // 'g<id>' DOM key, while prog.channel_id is the group's real active member.
   document.getElementById('modal-channel-id').value = prog.channel_id || ((ch && ch.id) ? ch.id : '');
   document.getElementById('modal-group-id').value   = prog.group_id || '';
+
+  // Every surface that opens this modal passes group_id through, so the one call here is
+  // the whole disclosure - the guide, the EPG search page, the dashboard's edit action and
+  // the recording detail page all get it without knowing it exists (dev/changelog/904).
+  _modalOpenToken += 1;
+  showGroupNote(prog.group_id, _modalOpenToken);
 
   const profileSel = document.getElementById('modal-profile');
   if (profileSel) {

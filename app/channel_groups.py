@@ -997,6 +997,40 @@ def member_eager_options():
     return (selectinload(ChannelGroup.memberships).selectinload(ChannelGroupMember.channel),)
 
 
+# Who a group would record from right now, as one value. `member` is the channel a
+# recording started this instant would capture from (None when nothing is eligible);
+# `selection` is the FormatSelection behind it, so a caller that has to disclose the
+# lock's zero-survivors override already holds it rather than re-filtering to find out.
+ServingChoice = collections.namedtuple('ServingChoice', 'member selection')
+
+
+def serving_member(group, latest_by_channel=None,
+                   streak_threshold=DEFAULT_FAILING_STREAK_THRESHOLD) -> ServingChoice:
+    """The member `group` would record from right now - format lock filters, health score
+    ranks (DESIGN-channel-groups-model.md 5, dev/changelog/753).
+
+    The ONE spelling of that two-step for display surfaces. The TV Guide row, the channel
+    search page's group row and the scheduling modal's group disclosure
+    (dev/changelog/904) all ask it, so none of them can name a member the others would not
+    have picked - a row that says one feed while Record starts another is a disagreement
+    the user sees directly.
+
+    `app/recorder.py::start_recording` deliberately does NOT call this. It layers
+    busy-channel and busy-account exclusions between the filter and the ranking, which no
+    display surface has and which can only be resolved against a live recording set.
+
+    `latest_by_channel` is load bearing rather than a tie-break: a member's format is read
+    from its latest health check, so omitting the map leaves every format unknown and the
+    lock filters nothing. Callers batch it over the whole page - asking per row is the
+    per-row-I/O defect class. Must be called inside an app context."""
+    members = recording_members(group.memberships) if group is not None else []
+    selection = format_eligible_members(group, members, latest_by_channel or {})
+    return ServingChoice(
+        pick_best_member(selection.members, latest_by_channel,
+                         streak_threshold=streak_threshold),
+        selection)
+
+
 def guide_row_targets(streak_threshold=DEFAULT_FAILING_STREAK_THRESHOLD,
                       latest_by_channel=None):
     """Ordered guide rows: every in_guide channel, interleaved with every in_guide group
@@ -1022,14 +1056,12 @@ def guide_row_targets(streak_threshold=DEFAULT_FAILING_STREAK_THRESHOLD,
     entries = [((ch.guide_sort_order or 0, ch.name.lower()), ('channel', ch, None))
                for ch in Channel.query.filter(Channel.in_guide.is_(True)).all()]
     for g in ChannelGroup.query.filter_by(in_guide=True).options(*member_eager_options()).all():
-        # Format lock filters, health score ranks - the row must name the member a
-        # recording would actually start from, or clicking Record on it records a feed
-        # the guide never showed (5, dev/changelog/753). The override case still yields a
-        # member: the filter hands back the unfiltered list rather than emptying it.
-        eligible = format_eligible_members(g, recording_members(g.memberships),
-                                           latest_by_channel or {})
-        serving = pick_best_member(eligible.members, latest_by_channel,
-                                   streak_threshold=streak_threshold)
+        # The row must name the member a recording would actually start from, or clicking
+        # Record on it records a feed the guide never showed (5, dev/changelog/753). The
+        # override case still yields a member: the filter hands back the unfiltered list
+        # rather than emptying it.
+        serving = serving_member(g, latest_by_channel,
+                                 streak_threshold=streak_threshold).member
         if serving is None:
             continue
         entries.append(((g.guide_sort_order or 0, g.name.lower()), ('group', g, serving)))

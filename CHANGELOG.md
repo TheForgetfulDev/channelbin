@@ -5,6 +5,23 @@ Notable changes to ChannelBin, newest first. This project follows
 release is tagged `v<version>` in git, and the version the app is running is shown in the
 page footer.
 
+## 0.5.1 - 2026-09-10
+
+**Added**
+
+- Scheduling a recording against a channel group now says which member it would use. The
+  record modal names that member and its account, and says the choice can change before the
+  recording starts and again while it is running, so a group no longer looks identical to a
+  single channel while meaning something different.
+
+**Fixed**
+
+- The record modal's footer overflowed the panel on a phone, putting Cancel and Schedule
+  recording out of reach.
+- The Search Programs (EPG) landing page had slowed as channel group membership grew, because
+  it ranked group members over every showing on screen even when the page held none of them.
+- The test suite failed instead of skipping on a machine with no ffmpeg installed.
+
 ## 0.5.0 - 2026-09-09
 
 **Added**

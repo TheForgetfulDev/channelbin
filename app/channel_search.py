@@ -2267,11 +2267,19 @@ def _group_collapse_losers(row_preds=()):
 
     Do not expect that 2x to show up in a request, and do not read the doubled materialization
     as the reason an airings page is slow. This join is driven off `channel_group_members`, so
-    it spans only entries whose channel is in a group - 636 of 2.2M rows across 8
-    memberships when 657 measured it - which is single-digit milliseconds either way. What the
-    option actually costs a statement is the outer `NOT IN` over the whole surviving set
-    (0.341s -> 0.478s on a count stand-in), and that is unchanged by the spelling. The saving
-    here scales with how many channels are in groups, not with the size of `epg_entries`.
+    it spans only entries whose channel is in a group. What the option actually costs a
+    statement is the outer `NOT IN` over the whole surviving set (0.341s -> 0.478s on a count
+    stand-in), and that is unchanged by the spelling. The saving here scales with how many
+    channels are in groups, not with the size of `epg_entries`.
+
+    **That last sentence is the load-bearing one, and it is not a footnote.** When
+    dev/changelog/657 measured this the scope was 636 of 2.2M rows across 8 memberships, i.e.
+    single-digit milliseconds, and the numbers above were read for years as "this is free".
+    They are not a constant. At 207 memberships the same window spans 10,348 showings and the
+    option costs the airing landing page ~100ms of ~245ms - the whole of a drift that three
+    separate investigations tried and failed to pin on a commit, because no commit caused it:
+    the data grew into a cost the code had assumed away. Re-measure before quoting a figure
+    here, and do not add a fourth investigation (dev/changelog/905).
     """
     ranked = _group_ranked_entries(row_preds)
     return (select(ranked.c.id)
@@ -2279,7 +2287,7 @@ def _group_collapse_losers(row_preds=()):
             .having(func.min(ranked.c.rn) > 1))
 
 
-def group_wins_by_entry(entry_ids, row_preds=()) -> dict:
+def group_wins_by_entry(entries, member_channel_ids, row_preds=()) -> dict:
     """{entry id: (group id, ...)} - which groups each of these showings WON.
 
     The other side of `_group_collapse_losers`: the same window, the same ranking rule, asked
@@ -2291,13 +2299,33 @@ def group_wins_by_entry(entry_ids, row_preds=()) -> dict:
     ONE query for the page. The window itself is still computed over the whole scope, which is
     what makes the answer the same one the collapse gave: restricting the ranking to the page
     would let a showing win a partition its real competitors were paged out of.
+
+    `member_channel_ids` is required rather than defaulted, and the reason is that the wrong
+    default is silent: an empty set is indistinguishable from "no channel is in a group" and
+    would answer `{}` for every page forever, un-labelling every group row with nothing raised.
+    Hand it `SearchContext.group_member_channel_ids`, which is read once per request already.
+
+    **A showing on a channel that is in no group can have won no group**, so those entries are
+    dropped before the window runs and a page with none of them asks nothing at all. That is
+    the common case by a wide margin - group membership is a hand-curated handful against six
+    figures of channels - and it is what keeps this off the airing landing page's critical
+    path: measured on the live database at 207 memberships (10,348 showings in scope), the
+    default first page spent 43ms here to return an empty dict, and the four sampled page
+    shapes that carry no grouped showing go 43-46ms -> 0. A page that IS dense with grouped
+    showings is unchanged, which is what makes this a narrowing rather than a trade.
+
+    The cost this avoids grows with how many channels are in groups, NOT with `epg_entries` -
+    see `_group_collapse_losers`. That is why it arrived without a commit behind it
+    (dev/changelog/905).
     """
+    members = set(member_channel_ids)
+    entry_ids = [e.id for e in entries if e.channel_id in members]
     if not entry_ids:
         return {}
     ranked = _group_ranked_entries(row_preds)
     rows = db.session.execute(
         select(ranked.c.id, ranked.c.group_id)
-        .where(ranked.c.id.in_(list(entry_ids)), ranked.c.rn == 1))
+        .where(ranked.c.id.in_(entry_ids), ranked.c.rn == 1))
     out = {}
     for entry_id, group_id in rows:
         out.setdefault(entry_id, []).append(group_id)
@@ -3235,7 +3263,7 @@ def _search_airings(state: SearchState, ctx: SearchContext,
     airing_group_ids = {}
     if standing_applied(state.standing, 'grpdedup'):
         airing_group_ids = group_wins_by_entry(
-            [r.id for r in rows], _cluster_scope(state, ctx, narrowing))
+            rows, ctx.group_member_channel_ids, _cluster_scope(state, ctx, narrowing))
 
     return SearchResult(
         rows=rows,

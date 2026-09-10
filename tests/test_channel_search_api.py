@@ -908,12 +908,19 @@ class AiringRecordContextGroupTests(_ApiTestCase):
     def test_no_group_is_invented_for_a_plain_record_click(self):
         payload = self.context(self.airing.id)
         self.assertIsNone(payload['program']['group_id'])
-        self.assertIsNone(payload['group'])
 
-    def test_an_explicit_group_is_honoured_and_named(self):
+    def test_an_explicit_group_is_honoured(self):
         payload = self.context(self.airing.id, f'group={self.group.id}')
         self.assertEqual(payload['program']['group_id'], self.group.id)
-        self.assertEqual(payload['group']['name'], 'Fox')
+
+    def test_the_group_is_answered_by_id_and_nothing_more(self):
+        """It used to answer with the group's name too, for a modal that never read it.
+        The modal is opened from five pages and this endpoint serves one, so what it says
+        about a group target now comes from /api/channel-groups/<id>/record-context -
+        which every one of the five reaches through the same openModal
+        (dev/changelog/904)."""
+        payload = self.context(self.airing.id, f'group={self.group.id}')
+        self.assertNotIn('group', payload)
 
     def test_a_group_the_showing_is_not_on_is_refused(self):
         other = seed.make_group(name='Unrelated', members=[self.untested], in_guide=False)

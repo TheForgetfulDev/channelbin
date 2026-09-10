@@ -234,12 +234,12 @@ def build_group_rows(groups, ctx) -> list:
     * what the serving members are airing right now.
 
     The serving member is picked by the SAME rule the TV Guide row and the recorder use -
-    format lock filters, health score ranks (`channel_groups`, dev/changelog/753). A row that
+    format lock filters, health score ranks - through the one helper that spells it,
+    `channel_groups.serving_member()` (dev/changelog/753, dev/changelog/904). A row that
     named a different member than a recording would open is a row that lies about what
     clicking Record does.
     """
-    from .channel_groups import (format_eligible_members, format_label, pick_best_member,
-                                 recording_members)
+    from .channel_groups import format_label, serving_member
     from .routes.channel_tests import _latest_tests_by_channel
     if not groups:
         return []
@@ -250,9 +250,7 @@ def build_group_rows(groups, ctx) -> list:
 
     serving_by_group = {}
     for group in groups:
-        eligible = format_eligible_members(group, recording_members(group.memberships),
-                                           latest)
-        serving_by_group[group.id] = pick_best_member(eligible.members, latest)
+        serving_by_group[group.id] = serving_member(group, latest).member
 
     airing = _now_airing([s.id for s in serving_by_group.values() if s is not None])
 
