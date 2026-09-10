@@ -39,11 +39,14 @@ def make_channel(account, stream_id=None, name='Test Channel', in_guide=False, *
     if stream_id is None:
         # Unique within the account (uq_channel_account_stream) - count existing + 1.
         stream_id = Channel.query.filter_by(account_id=account.id).count() + 1
+    # A default rather than a fixture constant: "which EPG id does this channel carry" is
+    # the subject of a filter, a column and a warning banner, so a caller has to be able to
+    # seed two members sharing one id, or a member carrying none at all.
+    kw.setdefault('epg_channel_id', f'ch{stream_id}.test')
     ch = Channel(
         account_id=account.id, stream_id=stream_id, name=name,
         stream_url=f'http://example.test/live/{stream_id}',
         raw_stream_url=f'http://example.test/live/{stream_id}.ts',
-        epg_channel_id=f'ch{stream_id}.test',
         in_guide=in_guide, guide_sort_order=stream_id if in_guide else 0,
         **kw)
     db.session.add(ch)

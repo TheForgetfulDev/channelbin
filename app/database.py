@@ -149,6 +149,12 @@ CHANNEL_URL_CHANGED = 'CHANNEL_URL_CHANGED'
 # effective moves would write tens of thousands of events saying nothing a rule change does
 # not already explain (dev/changelog/775).
 CHANNEL_HIDE_OVERRIDE_CHANGED = 'CHANNEL_HIDE_OVERRIDE_CHANGED'
+# The user rolled this channel's health score back by hand - a full reset, or one
+# step-back-one-observation click (app/health_recompute.py, dev/changelog/895). ONE type for
+# both: they are the same mechanism at two sizes, and extra_data['action'] says which. The
+# score moving without an observation behind it is exactly the number a user cannot
+# otherwise explain, so this event carries what was unwound and the before/after value.
+CHANNEL_HEALTH_ROLLBACK = 'CHANNEL_HEALTH_ROLLBACK'
 
 # ── Channel group event type constants ────────────────────────────────────────
 #
@@ -1142,6 +1148,11 @@ class Channel(db.Model):
     events      = db.relationship('ChannelEvent', backref='channel', lazy=True,
                                   order_by='ChannelEvent.timestamp',
                                   cascade='all, delete-orphan')
+    # Cascaded like the two above rather than left to the database: foreign keys are OFF in
+    # this app's SQLite, so a deleted channel leaves anything not cascaded here behind, and
+    # ids are reused (CLAUDE.md teardown rule).
+    health_exclusions = db.relationship('ChannelHealthExclusion', backref='channel',
+                                        lazy=True, cascade='all, delete-orphan')
 
     # Declared here as well as in migration 24, because a FRESH database never runs
     # migrations - run_migrations() stamps it at CURRENT_SCHEMA_VERSION and returns - so an
@@ -1347,6 +1358,40 @@ class ChannelEvent(db.Model):
 
     __table_args__ = (
         db.Index('ix_channel_events_channel_ts', 'channel_id', 'timestamp'),
+    )
+
+
+class ChannelHealthExclusion(db.Model):
+    """One observation the user has taken out of a channel's health score.
+
+    `Channel.health_score` is a lossy exponential average, so an observation cannot be
+    subtracted back out - undoing one is a replay of the rest (app/health_recompute.py).
+    This table is what a replay reads to know which ones to skip.
+
+    Exclusion rather than deletion is deliberate (dev/changelog/895): an observation may be
+    a Recording, and destroying a recording to unwind its effect on a score would be a far
+    larger act than the one the user asked for. Every excluded observation stays on the
+    Activity Timeline, marked as not counted.
+
+    (source_kind, source_id) addresses the row it came from - see health_recompute.py's
+    SOURCE_* constants. The kind is part of the key because one Recording contributes two
+    separately-excludable observations (its capture, and the post-process correction).
+    """
+    __tablename__ = 'channel_health_exclusions'
+
+    id          = db.Column(db.Integer, primary_key=True)
+    channel_id  = db.Column(db.Integer, db.ForeignKey('channels.id'), nullable=False)
+    source_kind = db.Column(db.String(32), nullable=False)
+    source_id   = db.Column(db.Integer, nullable=False)
+    excluded_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+    #: 'reset' or 'step_back' - which action excluded it, for the timeline's benefit.
+    action      = db.Column(db.String(16), nullable=False)
+
+    __table_args__ = (
+        # UNIQUE, not merely an index: excluding the same observation twice would make the
+        # step-back count disagree with the replay, and every writer already checks first.
+        db.UniqueConstraint('channel_id', 'source_kind', 'source_id',
+                            name='uq_health_exclusion'),
     )
 
 

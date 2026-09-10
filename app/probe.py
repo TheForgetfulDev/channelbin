@@ -128,6 +128,35 @@ def bits_per_pixel_frame(bitrate_bps, width, height, fps):
     return round(bitrate_bps / px, 4)
 
 
+def expected_frame_count(fps, dts_span_seconds=None, fallback_duration=None):
+    """How many video frames a clip of this length should hold. None if unknowable.
+
+    Measured over the DECODE span (scan_video_timeline's dts_span_seconds) whenever one is
+    available, and only over a duration as a fallback. Both alternatives to it are biased
+    low in a way that reads as dropped frames on a complete capture, and the bias is a
+    fixed number of frames per clip - so it is invisible on a long recording and dominates
+    a short test (dev/changelog/896):
+
+    - The CONTAINER duration spans every stream, so audio that starts before the first
+      video frame lengthens it while contributing no frames.
+    - The PTS span overshoots the capture window by the reorder depth. A stream copy bounded
+      by -t cuts on DTS, so the last packets written are anchor frames presenting several
+      frames into the future while the B-frames between them fall past the cut. Measured on
+      a 4K50 HEVC feed with reorder depth 9: a 5s capture read 96.9% complete and a 20s
+      capture of the same feed in the same minute read 99.8%, with zero DTS gaps in either.
+
+    The +1 is not a fudge: N frames span N-1 intervals, so a clean 5s/50fps capture holds
+    251 frames across a 5.000s decode span. Omitting it reads 100.4%.
+    """
+    if not fps or fps <= 0:
+        return None
+    if dts_span_seconds is not None and dts_span_seconds >= 0:
+        return dts_span_seconds * fps + 1
+    if fallback_duration and fallback_duration > 0:
+        return fps * fallback_duration
+    return None
+
+
 def _rate_to_float(raw):
     """ffprobe rational string ('30000/1001') to float, or None if unparseable/zero."""
     if not raw or '/' not in raw:
@@ -462,6 +491,15 @@ def scan_video_timeline(filepath: str, gap_threshold: float = 0.25, timeout: int
     PTS-based gap counting.
 
         span_seconds     max PTS - min PTS (what players treat as the duration)
+        dts_span_seconds max DTS - min DTS: the window the capture actually covered, and
+                         the only span an expected-frame count may be derived from. The
+                         PTS span overshoots it by the reorder depth whenever a capture is
+                         cut at a DTS boundary - the trailing anchor frames present several
+                         frames into the future while the B-frames between them fall past
+                         the cut - which reads as missing frames on a complete clip
+                         (dev/changelog/896). None when DTS is absent, or when the decode
+                         timeline steps backwards (a concatenation restarts it, so max-min
+                         would span the joins rather than the capture)
         packet_count     video packets seen
         fps              nominal frame rate (r_frame_rate)
         deficit_fps      the rate deficit_seconds was actually divided by - `fps` unless
@@ -505,6 +543,8 @@ def scan_video_timeline(filepath: str, gap_threshold: float = 0.25, timeout: int
         highwater = None
         count = 0
         prev_dts = None
+        dts_low = None
+        dts_high = None
         saw_dts = False
         gap_count = 0
         gap_seconds = 0.0
@@ -565,6 +605,10 @@ def scan_video_timeline(filepath: str, gap_threshold: float = 0.25, timeout: int
                 # would manufacture a gap at every switch between them.
                 if dts is not None:
                     saw_dts = True
+                    if dts_low is None or dts < dts_low:
+                        dts_low = dts
+                    if dts_high is None or dts > dts_high:
+                        dts_high = dts
                     if prev_dts is not None:
                         step = dts - prev_dts
                         if step < 0:
@@ -587,10 +631,15 @@ def scan_video_timeline(filepath: str, gap_threshold: float = 0.25, timeout: int
             return {}
 
         span = highwater - low
+        # Withheld on a file whose decode timeline restarts: max-min then measures the
+        # widest timestamp in the file rather than the capture window, and None makes that
+        # misuse impossible instead of merely documented.
+        dts_span = (dts_high - dts_low) if (saw_dts and not backward_count) else None
         deficit_fps = expected_fps if expected_fps and expected_fps > 0 else fps
         deficit = (span - count / deficit_fps) if deficit_fps else 0.0
         return {
             'span_seconds': span,
+            'dts_span_seconds': dts_span,
             'packet_count': count,
             'fps': fps,
             'deficit_fps': deficit_fps,

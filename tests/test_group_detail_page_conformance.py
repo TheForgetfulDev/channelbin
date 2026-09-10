@@ -967,7 +967,7 @@ class StrategyControlMarkupTests(unittest.TestCase):
         in front of you has to show that same set - a different one would answer a question the
         banner did not ask."""
         js = _read('static/js/group-detail.js')
-        fn = js[js.index('function reviewMembers()'):js.index('function muteWarning(')]
+        fn = js[js.index('function reviewMembers('):js.index('function muteWarning(')]
         self.assertIn("filterBar.toggle('rec', 'on')", fn)
         # Replaces what was filtered rather than intersecting with it: the banner names one
         # set, so the list has to end up showing that set and not what is left after some
@@ -1091,7 +1091,7 @@ class GuideInvariantPageTests(unittest.TestCase):
         """§16.2: hiding a warning about a configuration you accepted is reasonable;
         hiding the explanation for why the thing is not working is not."""
         js = _read('static/js/group-detail.js')
-        banners = js[js.index('function renderBanners()'):js.index('function reviewMembers()')]
+        banners = js[js.index('function renderBanners()'):js.index('function reviewMembers(')]
         broken = banners[banners.index("if (WARN.guide_broken)"):banners.index("set('gd-broken-banner'")]
         self.assertNotIn('muteBtn(', broken)
         self.assertIn("data-act=\"walkthrough\"", broken, 'it offers the fix')

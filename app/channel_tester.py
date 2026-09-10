@@ -1245,6 +1245,7 @@ def _run_channel_test_inner(app, channel_id: int, job_id: Optional[int] = None):
         actual_duration = None
         frame_count = None
         frame_pct = None
+        expected_frames = None
         # Stream quality profile (DESIGN-stream-quality-profile.md) - informational only.
         video_codec = None
         pix_fmt = None
@@ -1455,14 +1456,11 @@ def _run_channel_test_inner(app, channel_id: int, job_id: Optional[int] = None):
                     else:
                         bitrate_kbps = (bytes_received * 8) / duration / 1000
 
-                    if frame_count and fps and actual_duration and actual_duration > 0:
-                        expected_frames = fps * actual_duration
-                        frame_pct = round(frame_count / expected_frames * 100, 1) if expected_frames > 0 else None
-
                     # Quality-profile stats (informational). bits/pixel/frame is a pure
                     # efficiency number; the timeline scan is a second ffprobe over the
                     # same clip (reuse of the seek-damage scanner), bounded by clip length.
-                    from .probe import bits_per_pixel_frame, scan_video_timeline
+                    from .probe import (bits_per_pixel_frame, expected_frame_count,
+                                        scan_video_timeline)
                     if resolution and fps and bitrate_kbps:
                         try:
                             w_px, h_px = (int(x) for x in resolution.split('x'))
@@ -1474,10 +1472,22 @@ def _run_channel_test_inner(app, channel_id: int, job_id: Optional[int] = None):
                         timeline_gap_count = timeline.get('gap_count')
                         timeline_gap_seconds = timeline.get('gap_seconds')
 
+                    # Scanned before this, not after: the decode span it measures is the
+                    # only honest denominator here, and the container duration it replaces
+                    # cost every short test a few points of health score for frames that
+                    # were never missing (dev/changelog/896).
+                    if frame_count:
+                        expected_frames = expected_frame_count(
+                            fps,
+                            dts_span_seconds=(timeline or {}).get('dts_span_seconds'),
+                            fallback_duration=actual_duration)
+                        if expected_frames and expected_frames > 0:
+                            frame_pct = round(frame_count / expected_frames * 100, 1)
+
                     if resolution:
                         fps_str = f'{fps:.1f}fps' if fps else 'unknown fps'
                         dur_str = f'{actual_duration:.0f}s' if actual_duration else '?s'
-                        frame_str = f'  |  frames: {frame_count:,}/{int(fps * actual_duration):,} ({frame_pct:.1f}%)' if frame_pct is not None else ''
+                        frame_str = f'  |  frames: {frame_count:,}/{int(expected_frames):,} ({frame_pct:.1f}%)' if frame_pct is not None else ''
                         _append_log('INFO', f'Video: {resolution} @ {fps_str}  |  bitrate: {bitrate_kbps:.0f} kbps  |  duration: {dur_str}{frame_str}')
                     else:
                         _append_log('WARN', 'ffprobe found no video stream in recording')

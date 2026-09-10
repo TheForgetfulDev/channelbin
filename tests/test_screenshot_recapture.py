@@ -39,7 +39,14 @@ class ScreenshotRecaptureTests(unittest.TestCase):
     def _gen_clip(self, name, duration, switch_at=None):
         """Build a clip whose luma is black before switch_at (seconds) and random noise
         from switch_at onward. switch_at=None means noise the whole way through;
-        switch_at >= duration means black the whole way through."""
+        switch_at >= duration means black the whole way through.
+
+        -g 1 makes every frame a keyframe, which is what keeps the seek point and the
+        grabbed frame the same thing. Captures decode keyframes only (dev/changelog/894),
+        so at this clip's natural GOP the 5s grab skipped forward to the keyframe at 6s -
+        the first noise frame - and the blank region these fixtures exist to land in
+        became unreachable.
+        """
         path = os.path.join(self._dir, name)
         if switch_at is None:
             lum_expr = 'random(1)*255'
@@ -47,7 +54,7 @@ class ScreenshotRecaptureTests(unittest.TestCase):
             lum_expr = f"if(lt(T\\,{switch_at})\\,0\\,random(1)*255)"
         source = f"nullsrc=s=64x64:d={duration}:r=1,geq=lum='{lum_expr}':cb=128:cr=128,format=yuv420p"
         subprocess.run(
-            [_FFMPEG, '-y', '-f', 'lavfi', '-i', source, '-c:v', 'mpeg4', path],
+            [_FFMPEG, '-y', '-f', 'lavfi', '-i', source, '-c:v', 'mpeg4', '-g', '1', path],
             capture_output=True, check=True)
         return path
 

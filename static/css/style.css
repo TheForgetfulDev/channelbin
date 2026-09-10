@@ -713,9 +713,10 @@ body.scroll-locked { position: fixed; left: 0; right: 0; width: 100%; overflow: 
    ═══════════════════════════════════════════════════════════════════ */
 
 /* ── App shell: left sidebar + main (DESIGN.md section 2) ──────────── */
-/* Padding fitted 2026-07-29 (mockup 09 round 5, dev/changelog/379) until the 14
-   destinations and 4 headings clear a laptop window without scrolling. Changing
-   any of these values means re-checking that fit. */
+/* Padding fitted 2026-07-29 (mockup 09 round 5, dev/changelog/379) until the
+   destinations and headings clear a laptop window without scrolling - 15 and 3 of
+   them as of dev/changelog/900. Changing any of these values, or adding a
+   destination, means re-checking that fit. */
 .shell { display: flex; min-height: 100vh; }
 .sidebar {
   width: 212px; flex: 0 0 212px; background: var(--bg1); border-right: 1px solid var(--border-soft);
@@ -733,6 +734,9 @@ body.scroll-locked { position: fixed; left: 0; right: 0; width: 100%; overflow: 
 .brand img { width: 22px; height: 22px; display: block; flex-shrink: 0; }
 .brand .nav-t { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .nav-section { font-size: var(--fs-xs); font-weight: 600; letter-spacing: .09em; color: var(--text-faint); text-transform: uppercase; padding: 9px 8px 3px; }
+/* Dashboard leads the menu with no heading above it, so it supplies the top offset
+   the first section heading used to give the nav under the brand row. */
+.brand-row + .nav-link { margin-top: 5px; }
 /* The icon joins the row, so the label takes the slack and the count stays pinned
    right - what justify-content: space-between did on its own with two children. */
 .nav-link {
@@ -1412,6 +1416,14 @@ body.scroll-locked { position: fixed; left: 0; right: 0; width: 100%; overflow: 
 /* The EPG-id breakdown inside the mismatched-EPG banner. */
 .gd-epg-list { margin: 6px 0 0; padding-left: 1.1rem; font-size: var(--fs-sm); }
 .gd-epg-list li { margin-top: 2px; }
+/* The EPG id in a member row. Clamped on the span rather than on the <td>, because a
+   sortable column's <th> carries `sortable` instead of a `gd-c-*` class and a width put on
+   one end only is the coupled-value defect the CSS rules already name. The full id is on
+   the tooltip, so clamping loses nothing. */
+.gd-epg-id {
+  display: inline-block; max-width: 170px; vertical-align: bottom;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
 
 /* ── Prune list (the clone modal's format screen) ── */
 .prune-list { border: 1px solid var(--border-soft); border-radius: var(--radius); overflow: hidden; }

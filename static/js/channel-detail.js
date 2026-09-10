@@ -433,6 +433,97 @@
     });
   }
 
+  /* Roll the health score back by hand - a full reset, or one observation at a time.
+     Both open a confirm naming exactly what will happen and what the score will become,
+     because the server has already computed both (C.healthRollback, from the same replay
+     that will run). Never a bare confirm(): the reset also clears the manual offset, and a
+     dialog that does not say so is the "UI text describing backend behavior" defect. */
+  function rollbackHealth(action) {
+    const rb = C.healthRollback || {};
+    if (!rb.available) {
+      showToast('This channel has no observations left to unwind.', { type: 'error' });
+      return;
+    }
+    const next = rb.next || {};
+    const scoreWord = (v) => (v === null || v === undefined ? 'no score' : String(v));
+
+    let title, confirmLabel, body;
+    if (action === 'reset') {
+      body = `<p>All ${rb.available} observation${rb.available === 1 ? '' : 's'} behind this `
+           + `channel's health score will stop counting, and the score goes from `
+           + `<strong>${scoreWord(rb.current_score)}</strong> to <strong>no score at all</strong> - `
+           + 'as if the channel had never been tested.</p>';
+      if (rb.manual_adjustment) {
+        body += `<p><strong>The manual adjustment of ${rb.manual_adjustment > 0 ? '+' : ''}`
+              + `${rb.manual_adjustment} will be cleared too</strong>, along with its note. `
+              + 'A hand-set offset on a channel with no observations behind it is a number '
+              + 'nothing can explain.</p>';
+      }
+      body += '<p>Nothing is deleted: every test, recording and screenshot stays on record and '
+            + 'stays visible in the Activity Timeline, marked as no longer counted. The next '
+            + 'health check or recording starts the score over from scratch.</p>';
+      title = 'Reset health score';
+      confirmLabel = 'Reset score';
+    } else {
+      body = `<p>The most recent observation - ${escHtml(next.label || 'the newest one')} - `
+           + 'will stop counting toward this channel\'s health score.</p>'
+           + `<p>The score goes from <strong>${scoreWord(rb.current_score)}</strong> to `
+           + `<strong>${scoreWord(next.score_after)}</strong>, over `
+           + `${next.observations_after} remaining observation`
+           + `${next.observations_after === 1 ? '' : 's'}. `
+           + `${rb.available - 1} further step-back${rb.available - 1 === 1 ? '' : 's'} `
+           + 'would then be available.</p>'
+           + '<p>Nothing is deleted - the observation stays on the Activity Timeline, marked '
+           + 'as no longer counted.</p>';
+      /* Observations the stored score counted but nothing can replay - a health check old
+         enough that retention has since deleted its row. Named rather than absorbed: their
+         residual leaves with them, so the projected score above is honest only if the user
+         knows what it was computed over. */
+      if (rb.unledgered) {
+        body += `<p class="text-muted small">${rb.unledgered} even older observation`
+              + `${rb.unledgered === 1 ? '' : 's'} behind the current score can no longer be `
+              + 'replayed - their test records have been deleted by retention - so their '
+              + 'small remaining influence is dropped along with this step back.</p>';
+      }
+      title = 'Step back one observation';
+      confirmLabel = 'Step back';
+    }
+
+    const el = document.createElement('div');
+    el.innerHTML = body;
+    buildModal({
+      title,
+      body: el,
+      footer: [
+        { label: 'Cancel', class: 'btn' },
+        {
+          label: confirmLabel,
+          class: action === 'reset' ? 'btn btn-danger' : 'btn btn-primary',
+          onClick: (close) => {
+            jsonFetch(C.urls.healthRollback, {
+              method: 'POST', body: JSON.stringify({ action }),
+            }).then((data) => {
+              close();
+              /* The reload is what re-renders the score, the kebab's remaining count and
+                 the timeline's excluded markers together - three regions one updater. */
+              sessionStorage.setItem('cd-rollback-toast', (data.result || {}).detail || 'Health score updated.');
+              location.reload();
+            }).catch(e => showToast(e.message || 'Could not roll the score back.', { type: 'error' }));
+            return false;
+          },
+        },
+      ],
+    });
+  }
+
+  /* The action's own sentence, carried across the reload it triggers. */
+  (function showPendingRollbackToast() {
+    const pending = sessionStorage.getItem('cd-rollback-toast');
+    if (!pending) return;
+    sessionStorage.removeItem('cd-rollback-toast');
+    showToast(pending);
+  })();
+
   function pageAction(act, el) {
     switch (act) {
       case 'settings': openSettingsModal(el && el.dataset.focus); return;
@@ -445,6 +536,8 @@
       case 'create-check': openCreateCheck(); return;
       case 'delete-channel': deleteChannel(); return;
       case 'hide-channel': setHideOverride(el); return;
+      case 'health-reset': rollbackHealth('reset'); return;
+      case 'health-step-back': rollbackHealth('step_back'); return;
       case 'jump': {
         const target = document.querySelector(`[data-section="${el.dataset.jumpSection}"]`);
         if (target) target.scrollIntoView({ behavior: 'smooth', block: 'start' });

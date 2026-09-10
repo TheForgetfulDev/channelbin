@@ -79,12 +79,28 @@ class _LaunchRetryTestCase(unittest.TestCase):
         return rec
 
     def _join_retry(self, recording_id, timeout=5):
+        """Wait for the pending relaunch, then quiesce whatever it started.
+
+        The quiesce half is load-bearing, not tidiness. A successful relaunch starts a
+        WatchdogThread, and these tests hand it a process whose poll() reports it has
+        already exited - so it correctly sees a dead capture and relaunches, which is a
+        second writer to popen.call_count and to the event log. Measured here: the count
+        is 2 the instant the retry thread joins and 4 a second later, so the assertions
+        below pass or fail on how fast the machine is (dev/changelog/903). What is under
+        test is the retry, not what the watchdog does after it succeeds.
+        """
         # getattr, so that with the fix reverted these tests fail on the behavior they
         # assert rather than on RecordingState not carrying the field yet.
         state = recorder.get_state(recording_id)
         thread = getattr(state, 'launch_retry', None) if state is not None else None
         if thread is not None:
             thread.join(timeout=timeout)
+        state = recorder.get_state(recording_id)
+        if state is not None:
+            state.stop_event.set()
+            watchdog = getattr(state, 'watchdog', None)
+            if watchdog is not None:
+                watchdog.join(timeout=timeout)
         return thread
 
     def _events(self, recording_id, event_type):

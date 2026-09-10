@@ -27,6 +27,7 @@
   'CHANNEL_GROUPED': 'start', 'CHANNEL_UNGROUPED': 'stopped',
   'CHANNEL_GROUP_FORMAT_MISMATCH': 'failed', 'CHANNEL_GROUP_FORMAT_RESOLVED': 'done',
   'CHANNEL_URL_CHANGED': 'neutral', 'CHANNEL_HIDE_OVERRIDE_CHANGED': 'neutral',
+  'CHANNEL_HEALTH_ROLLBACK': 'neutral',
   'GROUP_MEMBER_SELECTED': 'start', 'GROUP_FAILOVER': 'aborted',
   'RECORDING_FORMAT_OVERRIDE': 'failed',
   'GROUP_MEMBER_PARTICIPATION': 'neutral', 'GROUP_FORMAT_STRATEGY_APPLIED': 'neutral',
@@ -100,6 +101,20 @@
       {% elif entry.kind == 'group_event' %}
         <span>{{ group_ev_label.get(entry.obj.event_type, entry.obj.event_type | replace('_', ' ') | title) }}</span>
         {% if entry.obj.detail %}<span class="text-muted small">{{ entry.obj.detail }}</span>{% endif %}
+      {% endif %}
+
+      {# The user rolled the score back past this observation, so the "→ lifetime N" it
+         prints above is what it produced at the time and no longer describes the channel.
+         A row that silently disagrees with the score is exactly the number nobody can
+         explain, so it says so (app/health_recompute.py, dev/changelog/895). The entry is
+         never hidden: it happened. #}
+      {% if entry.excluded %}
+      <span class="badge badge-cancelled tip-plain"
+            data-tip="Rolled back by hand.&#10;This observation no longer counts toward the channel's health score. The lifetime figure beside it is what it produced when it ran.">NOT COUNTED</span>
+      {% endif %}
+      {% if entry.correction_excluded and not entry.excluded %}
+      <span class="badge badge-cancelled tip-plain"
+            data-tip="Rolled back by hand.&#10;This recording's post-process quality correction no longer counts toward the channel's health score.">CORRECTION NOT COUNTED</span>
       {% endif %}
 
       {% if show_source and entry.source %}

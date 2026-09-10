@@ -71,15 +71,16 @@
      .nav-pip is the mark a count badge leaves behind on the collapsed rail,
      where the badge itself no longer fits - it tracks the badge's visibility. #}
   {% macro nav_sections() %}
-    <div class="nav-section"><span class="nav-t">Library</span></div>
+    {# Dashboard sits above every section heading, not inside one: it is the landing
+       page, so it is the one destination that is not a category of anything. #}
     <a class="nav-link{% if request.endpoint == 'dashboard.dashboard' %} active{% endif %}" href="{{ url_for('dashboard.dashboard') }}">{{ nav_icon('live') }}<span class="nav-t">Dashboard</span> <span class="nav-count nav-count-live"{% if not nav_live_count %} style="display:none"{% endif %}>{{ nav_live_count }}</span><span class="nav-pip pip-live"{% if not nav_live_count %} style="display:none"{% endif %}></span></a>
-    <a class="nav-link{% if request.endpoint == 'guide.guide' %} active{% endif %}" href="{{ url_for('guide.guide') }}">{{ nav_icon('guide') }}<span class="nav-t">TV Guide</span></a>
+    <div class="nav-section"><span class="nav-t">Library</span></div>
     <a class="nav-link{% if request.endpoint == 'recordings.index' %} active{% endif %}" href="{{ url_for('recordings.index') }}">{{ nav_icon('recordings') }}<span class="nav-t">Recordings</span> <span class="nav-count">{{ nav_recordings_total }}</span><span class="nav-pip"></span></a>
-    <div class="nav-section"><span class="nav-t">Channels</span></div>
-    <a class="nav-link{% if request.endpoint in ('channels.channel_browser', 'channels.channel_detail') %} active{% endif %}" href="{{ url_for('channels.channel_browser') }}">{{ nav_icon('browse') }}<span class="nav-t">Browse</span></a>
+    <a class="nav-link{% if request.endpoint == 'guide.guide' %} active{% endif %}" href="{{ url_for('guide.guide') }}">{{ nav_icon('guide') }}<span class="nav-t">TV Guide</span></a>
+    <a class="nav-link{% if request.endpoint in ('channels.channel_browser', 'channels.channel_detail') %} active{% endif %}" href="{{ url_for('channels.channel_browser') }}">{{ nav_icon('browse') }}<span class="nav-t">Channel Search</span></a>
     {# No separate Health Checks link (DESIGN.md §14.1) - health checks live on the
-       Groups tab now, alongside channel groups. #}
-    <a class="nav-link{% if request.endpoint in ('channel_groups.groups_page', 'channel_groups.group_detail', 'channels.channels_health_checks', 'channels.channels_health_checks_guide', 'channels.health_check_detail') %} active{% endif %}" href="{{ url_for('channel_groups.groups_page') }}">{{ nav_icon('groups') }}<span class="nav-t">Groups</span></a>
+       Channel Groups tab now, alongside channel groups. #}
+    <a class="nav-link{% if request.endpoint in ('channel_groups.groups_page', 'channel_groups.group_detail', 'channels.channels_health_checks', 'channels.channels_health_checks_guide', 'channels.health_check_detail') %} active{% endif %}" href="{{ url_for('channel_groups.groups_page') }}">{{ nav_icon('groups') }}<span class="nav-t">Channel Groups</span></a>
     <div class="nav-section"><span class="nav-t">Setup</span></div>
     <a class="nav-link{% if request.endpoint and request.endpoint.startswith('accounts.') %} active{% endif %}" href="{{ url_for('accounts.accounts_list') }}">{{ nav_icon('accounts') }}<span class="nav-t">Accounts</span></a>
     <a class="nav-link{% if request.endpoint and request.endpoint.startswith('profiles.') %} active{% endif %}" href="{{ url_for('profiles.profiles_list') }}">{{ nav_icon('recprofile') }}<span class="nav-t">Recording Profiles</span></a>
