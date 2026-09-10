@@ -43,7 +43,7 @@ from ..channel_groups import (
     FORMAT_STRATEGY_LABELS,
     DEFAULT_FAILING_STREAK_THRESHOLD, plan_format_selection, FORMAT_STRATEGIES,
     MATCH_REASON_STRENGTH, FORMAT_STATUS_STRENGTH,
-    build_group_with_members, group_name_conflict,
+    build_group_with_members, group_name_conflict, serving_member,
 )
 from ..config import load_config
 from ..db_utils import retry_on_locked
@@ -876,7 +876,7 @@ GROUP_DETAIL_COLUMNS = {
 # (dev/changelog/769), but a column that is on for everybody would push the video stats right
 # on the many groups whose members all carry the same stereo AAC. EPG id joins them for the
 # same reason and is turned on for you by the mismatch banner's own Review members button,
-# which is the one moment it answers a question (dev/changelog/898).
+# which is the one moment it answers a question (dev/changelog/904).
 GROUP_DETAIL_COLUMNS_OFF = ('fps', 'framePct', 'audio', 'epg')
 
 
@@ -1011,7 +1011,7 @@ def group_detail_rows(group, job):
             test_enabled=stored and ch.id in test_ids,
             # The id the section 8 mismatch banner tallies, carried per row so the member
             # list can be filtered to the members that banner names rather than only being
-            # told how many there are (dev/changelog/898). Already loaded on `ch` - reading
+            # told how many there are (dev/changelog/904). Already loaded on `ch` - reading
             # it here costs no query. Empty string rather than None: it is a filter value
             # and a column, and "no EPG id" is a bucket of its own on both.
             epg_channel_id=ch.epg_channel_id or '',
@@ -2635,6 +2635,71 @@ def clone_info(group_id):
         'has_schedule': job is not None,
         'channel_settings': channel_settings,
         'check': check_payload,
+    })
+
+
+@channel_groups_bp.route('/api/channel-groups/<int:group_id>/record-context', methods=['GET'])
+def group_record_context(group_id):
+    """What the shared scheduling modal has to say out loud about a GROUP target
+    (`templates/_record_modal.html`, `static/js/guide.js::openModal`, dev/changelog/904).
+
+    A group-backed recording does not record "the group" - it records one member, chosen
+    at record-start time by the format lock and the health score, and it can hand off to
+    another member mid-run. Every one of those decisions was already made and logged; the
+    modal was simply the one surface that never mentioned them, so scheduling against a
+    group looked identical to scheduling a single channel while quietly meaning something
+    else. Product principle 1 - the app says what it is about to do on your behalf.
+
+    Answered fresh per Record click rather than carried on the row payload, and that is the
+    point: `Recording.channel_id` is stamped when the recording is created and RE-RESOLVED
+    at start (`app/recorder.py::start_recording`), so the stamped member is provisional and
+    an Edit opened days later would otherwise name a channel the recorder has already
+    stopped preferring.
+
+    `serving` is null when nothing is eligible - a group with no recording-enabled member,
+    which is what a health_check_only group is by construction. The modal says so rather
+    than falling silent; a group that cannot produce a file is exactly the state the user
+    must not have to infer.
+
+    `format_override` is the lock's zero-survivors case (DESIGN-channel-groups-model.md
+    15.2): the recording will run anyway, off the group's locked format. It has always been
+    disclosed three times, but every one of them lands at or after record start - this is
+    the only one the user sees while the choice to schedule is still theirs.
+
+    Read-only, one group, no per-row work. Refuses the pinned system group, which is a
+    health-check container and not a recording source.
+    """
+    group = db.session.get(ChannelGroup, group_id)
+    if group is None:
+        return jsonify({'error': 'Group not found'}), 404
+    if group.is_system:
+        return jsonify({'error': 'The pinned TV Guide Channels check is not a '
+                                 'recording source'}), 400
+
+    memberships = list(group.memberships)
+    cfg = load_config()
+    streak_threshold = cfg.get('channel_testing', {}).get(
+        'failing_streak_threshold', DEFAULT_FAILING_STREAK_THRESHOLD)
+    latest = _latest_tests_by_channel([m.channel_id for m in memberships], for_job_id=ANY_JOB)
+    choice = serving_member(group, latest, streak_threshold=streak_threshold)
+    serving = choice.member
+
+    return jsonify({
+        'success': True,
+        'group': {'id': group.id, 'name': group.name},
+        'serving': None if serving is None else {
+            'id': serving.id,
+            'name': serving.name,
+            'account_name': serving.account.name if serving.account else '',
+        },
+        'member_count': len(memberships),
+        'recording_member_count': sum(1 for m in memberships if m.recording_enabled),
+        'format_override': choice.selection.override,
+        # Named only when the lock actually filtered. A strategy that follows the data has
+        # no lock to show, and showing the last key it derived would read as a setting the
+        # user made (dev/changelog/762).
+        'locked_format': (format_label(choice.selection.reference)
+                          if choice.selection.reference else ''),
     })
 
 

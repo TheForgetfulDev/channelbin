@@ -653,6 +653,13 @@ def airing_record_context_api(epg_id):
     The parameter is validated rather than trusted: the group must exist, must not be the
     system group, and the showing's channel must actually be a member of it.
 
+    It answers with the group's **id only**, never its name or its serving member. This
+    response is built once per Record click on ONE page, while the modal it feeds is opened
+    from five; the disclosure it renders for a group target therefore comes from
+    `/api/channel-groups/<id>/record-context`, which every one of those five reaches through
+    the same `openModal` (dev/changelog/904). A duplicate copy here shipped unconsumed for
+    long enough to grow a docstring claiming the modal used it.
+
     So this is fetched once per Record CLICK rather than once per row. It is the same
     `_program_dict` the guide grid builds, from the same `recording_match` indexes, so the
     two surfaces cannot disagree about whether a showing is already being recorded.
@@ -737,10 +744,6 @@ def airing_record_context_api(epg_id):
         'program': prog,
         # openModal's second argument, which it reads for the channel's default profile.
         'channel': {'id': ch.id, 'default_profile_id': ch.default_profile_id},
-        # Named so the modal can say WHICH group it is about to record, rather than the user
-        # discovering it on the recording afterwards.
-        'group': None if chosen_group is None else {'id': chosen_group.id,
-                                                    'name': chosen_group.name},
     })
 
 
