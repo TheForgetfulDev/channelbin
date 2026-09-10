@@ -866,16 +866,18 @@ GROUP_DETAIL_SECTIONS = ('summary', 'linked', 'settings', 'channels', 'activity'
 # hidden from (dev/changelog/758). The client keeps it out of the <td> list and
 # out of the drag-to-reorder set - it has no column position to move.
 GROUP_DETAIL_COLUMNS = {
-    'check': ('rec', 'test', 'status', 'score', 'res', 'fps', 'audio', 'framePct', 'bitrate', 'drops', 'shot', 'account'),
-    'channel': ('rec', 'test', 'score', 'res', 'fps', 'audio', 'bitrate', 'account'),
-    'system': ('status', 'score', 'res', 'fps', 'audio', 'framePct', 'bitrate', 'drops', 'shot', 'account'),
+    'check': ('rec', 'test', 'status', 'score', 'res', 'fps', 'audio', 'framePct', 'bitrate', 'drops', 'shot', 'epg', 'account'),
+    'channel': ('rec', 'test', 'score', 'res', 'fps', 'audio', 'bitrate', 'epg', 'account'),
+    'system': ('status', 'score', 'res', 'fps', 'audio', 'framePct', 'bitrate', 'drops', 'shot', 'epg', 'account'),
 }
 # FPS is off by default because the Format column repeats it as a subtitle; Frames is
 # off by default too - available, just not shown until asked for. Audio joins them: a health
 # check measures five audio facts on every member and the list could show none of them
 # (dev/changelog/769), but a column that is on for everybody would push the video stats right
-# on the many groups whose members all carry the same stereo AAC.
-GROUP_DETAIL_COLUMNS_OFF = ('fps', 'framePct', 'audio')
+# on the many groups whose members all carry the same stereo AAC. EPG id joins them for the
+# same reason and is turned on for you by the mismatch banner's own Review members button,
+# which is the one moment it answers a question (dev/changelog/898).
+GROUP_DETAIL_COLUMNS_OFF = ('fps', 'framePct', 'audio', 'epg')
 
 
 def _group_detail_job(group):
@@ -1007,6 +1009,12 @@ def group_detail_rows(group, job):
             # non-stored group has no memberships at all, so its rows carry neither.
             recording_enabled=stored and ch.id in recording_ids,
             test_enabled=stored and ch.id in test_ids,
+            # The id the section 8 mismatch banner tallies, carried per row so the member
+            # list can be filtered to the members that banner names rather than only being
+            # told how many there are (dev/changelog/898). Already loaded on `ch` - reading
+            # it here costs no query. Empty string rather than None: it is a filter value
+            # and a column, and "no EPG id" is a bucket of its own on both.
+            epg_channel_id=ch.epg_channel_id or '',
             format_blocked=ch.id in format_blocked_ids,
             lifecycle=(lc := lifecycle_by_channel.get(ch.id, (None, None)))[0],
             lifecycle_date=lc[1].strftime('%Y-%m-%d') if lc[1] else '',

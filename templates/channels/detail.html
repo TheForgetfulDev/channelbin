@@ -473,6 +473,19 @@
       <h2>Channel Health</h2>
       <div class="card-head-actions">
         <button class="btn btn-sm" data-act="jump" data-jump-section="tests">View test history</button>
+        {# The two rollbacks live behind the card's own kebab rather than as bare buttons:
+           both change the score, and neither is a thing to click by accident. Offered only
+           when there is something left to unwind - a channel with no observations already
+           has no score, and an action that can only refuse is not an action. #}
+        {% if health_rollback.available %}
+        <span class="menu-wrap">
+          <button class="btn btn-sm btn-icon" data-menu aria-label="Health score actions">&#8943;</button>
+          <div class="menu">
+            <button class="menu-item" data-act="health-step-back">Step back one observation ({{ health_rollback.available }} available)</button>
+            <button class="menu-item danger" data-act="health-reset">Reset health score&hellip;</button>
+          </div>
+        </span>
+        {% endif %}
       </div>
     </div>
     <div class="card-body">
@@ -483,6 +496,18 @@
         health check to have it tested on a schedule.
       </p>
       {% else %}
+
+      {# A reset leaves a channel with tests on record but no score, which the score block
+         below cannot render and the "Not yet tested" branch above no longer matches. Saying
+         why is the whole point of the action having been loud. #}
+      {% if final_health_score is none and health_rollback.excluded_count %}
+      <p class="card-note">
+        No health score - all {{ health_rollback.excluded_count }} observation{{ 's' if health_rollback.excluded_count != 1 else '' }}
+        {{ 'have' if health_rollback.excluded_count != 1 else 'has' }} been rolled back by hand,
+        so this channel counts as never observed. The next health check or recording starts it
+        over. See the Activity Timeline below for what was unwound.
+      </p>
+      {% endif %}
 
       {% if final_health_score is not none %}
       <div class="health-top">
@@ -506,6 +531,14 @@
             </div>
             {% if channel.manual_health_note %}
             <div>Note: {{ channel.manual_health_note }}</div>
+            {% endif %}
+            {# Stated permanently, not just in the toast that follows the action: a score
+               computed over fewer observations than the timeline shows is otherwise a
+               number nobody can account for six months later. #}
+            {% if health_rollback.excluded_count %}
+            <div class="hs-line text-muted">{{ health_rollback.excluded_count }} earlier
+              observation{{ 's' if health_rollback.excluded_count != 1 else '' }} rolled back by
+              hand and no longer counted</div>
             {% endif %}
           </div>
         </div>
@@ -1016,7 +1049,10 @@
               </td>
               <td data-label="Frames Received" class="col-frames">
                 {% if t.frame_pct is not none %}
-                  {% set tip = (t.frame_count | int) ~ ' received / ' ~ (((t.fps or 0) * (t.duration_seconds or 0)) | int) ~ ' expected over ' ~ ((t.duration_seconds or 0) | int) ~ 's captured' %}
+                  {# Expected comes back out of the stored pair rather than fps x duration -
+                     the server measures it over the clip's decode span, so recomputing it
+                     here would contradict the percentage it labels (dev/changelog/896). #}
+                  {% set tip = (t.frame_count | int) ~ ' received / ' ~ (((t.frame_count or 0) / t.frame_pct * 100) | round | int if t.frame_pct else 0) ~ ' expected over ' ~ ((t.duration_seconds or 0) | int) ~ 's captured' %}
                   {% if t.frame_pct >= 95 %}<span style="color:var(--ok)" title="{{ tip }}">{{ '%.1f' | format(t.frame_pct) }}%</span>
                   {% elif t.frame_pct >= 80 %}<span style="color:var(--warn)" title="{{ tip }}">{{ '%.1f' | format(t.frame_pct) }}%</span>
                   {% else %}<span style="color:var(--bad)" title="{{ tip }}">{{ '%.1f' | format(t.frame_pct) }}%</span>
@@ -1119,6 +1155,9 @@ window.CHANNEL_DETAIL = {
   notes: {{ (channel.notes or '') | tojson }},
   healthAdjustment: {{ channel.manual_health_adjustment }},
   healthNote: {{ (channel.manual_health_note or '') | tojson }},
+  {# What the two confirm dialogs promise, computed by the same replay the action will run
+     (app/health_recompute.py::rollback_preview) rather than guessed at in JS. #}
+  healthRollback: {{ health_rollback | tojson }},
   defaultProfileId: {{ channel.default_profile_id | tojson }},
   defaultProfileName: {{ (channel.default_profile.name if channel.default_profile else None) | tojson }},
   testEnabled: {{ channel.test_enabled | tojson }},
@@ -1151,6 +1190,7 @@ window.CHANNEL_DETAIL = {
     missingDelete: '{{ url_for("channels.missing_delete") }}',
     channelsHub: '{{ url_for("channels.channel_browser") }}',
     hide: '{{ url_for("channels.hide_channel", channel_id=channel.id) }}',
+    healthRollback: '{{ url_for("channels.rollback_health_score", channel_id=channel.id) }}',
   },
 };
 </script>

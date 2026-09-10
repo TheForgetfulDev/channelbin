@@ -5,6 +5,35 @@ Notable changes to ChannelBin, newest first. This project follows
 release is tagged `v<version>` in git, and the version the app is running is shown in the
 page footer.
 
+## 0.5.0 - 2026-09-09
+
+**Added**
+
+- A channel's health score can be rolled back by hand from the Channel Health card: a full
+  reset that returns it to no score at all, and a repeatable step back that unwinds the single
+  most recent thing that moved it. Nothing is deleted to unwind a score - the observation
+  behind it is excluded instead, and stays on the channel's timeline marked as not counted, so
+  a recording is never destroyed to correct a number.
+- A channel group's members can be filtered by EPG id, and the member table can show it as a
+  column. The EPG-mismatch banner's Review members button now lands on the members it is
+  warning about, rather than on the recording-enabled set.
+
+**Changed**
+
+- Dashboard now leads the main menu, above any section heading. The Channels section is
+  retired and its two entries moved into Library, as Channel Search and Channel Groups.
+
+**Fixed**
+
+- HEVC channels always screenshotted as a blank gray frame, which left every one of them
+  carrying an unearned "screenshot appears solid color" warning and a health score depressed
+  by it - and, since health score is how a group ranks its members, permanently demoted in
+  group selection. Screenshots and live recording thumbnails now decode from a keyframe.
+- A channel test's frames-received percentage measured the expected frame count against the
+  container duration rather than the video stream's decode span, so a complete capture read as
+  incomplete and the shorter the test the worse it looked. Healthy high-frame-rate channels
+  were losing health score for frames that were never missing.
+
 ## 0.4.1 - 2026-09-09
 
 **Added**

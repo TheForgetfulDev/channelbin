@@ -169,8 +169,8 @@
 
   // ── Column layout, persisted server-side (DESIGN.md 3.11) ─────────────────
 
-  const COL_LABEL = { rec: 'Recording', test: 'Health check', status: 'Status', score: 'Score', res: 'Format', fps: 'FPS', audio: 'Audio', framePct: 'Frames', bitrate: 'Bitrate', drops: 'Drops', shot: 'Screenshot', account: 'Account' };
-  const COL_SORTABLE = { rec: true, test: true, status: true, score: true, res: true, fps: true, audio: true, framePct: true, bitrate: true, drops: true, shot: false, account: false };
+  const COL_LABEL = { rec: 'Recording', test: 'Health check', status: 'Status', score: 'Score', res: 'Format', fps: 'FPS', audio: 'Audio', framePct: 'Frames', bitrate: 'Bitrate', drops: 'Drops', shot: 'Screenshot', epg: 'EPG id', account: 'Account' };
+  const COL_SORTABLE = { rec: true, test: true, status: true, score: true, res: true, fps: true, audio: true, framePct: true, bitrate: true, drops: true, shot: false, epg: true, account: false };
   // Entries that are hideable FIELDS rather than columns: they render inside the Channel
   // cell (the account dot) or on the phone card's own line, so they have no <td> of their
   // own and no column position to drag. They are in `colState` regardless, because "show
@@ -184,13 +184,25 @@
       'the enabled members by health score. Nothing automatic moves this switch in either ' +
       'direction - it is yours.',
     test: "Health check.&#10;Included when this group's health check runs.",
+    epg: 'EPG id.&#10;The XMLTV channel id this member&#39;s listings are matched on. A group fills ' +
+      'one guide row per program from whichever member wins, so members carrying different ids ' +
+      'paint that row from unrelated schedules.',
   };
   const PART_COLS = { rec: 'recording_enabled', test: 'test_enabled' };
 
   let colState = (G.columnPref && Array.isArray(G.columnPref.order))
     ? { order: G.columnPref.order.slice(), hidden: (G.columnPref.hidden || []).slice() }
     : { order: G.columns.slice(), hidden: G.columns.filter(k => G.columnsOff.includes(k)) };
-  G.columns.forEach(k => { if (!colState.order.includes(k)) colState.order.push(k); });
+  // A column added after this browser stored its layout is NEW to that layout, so it takes
+  // the app's own default rather than "on": a stored `hidden` list cannot say anything about
+  // a key that did not exist when it was written, and reading its silence as "show it" ships
+  // every future default-off column switched on for exactly the users who have used the page
+  // before (dev/docs/BUGS.md 2026-09-09, dev/changelog/898).
+  G.columns.forEach(k => {
+    if (colState.order.includes(k)) return;
+    colState.order.push(k);
+    if (G.columnsOff.includes(k) && !colState.hidden.includes(k)) colState.hidden.push(k);
+  });
   colState.order = colState.order.filter(k => G.columns.includes(k));
 
   // The one reader of the shared visibility set, asked by the table, by the card and by
@@ -378,6 +390,31 @@
   // (an untested member matching no audio value is correct), so they ask this instead.
   // Account is not routed through it: every row has one whether or not it was ever tested,
   // so nothing is missing and > 1 already says the same thing (dev/changelog/770).
+  // The EPG dimension's values. Unlike a format key, an EPG id is provider-supplied text
+  // that could be anything - `none` included - so a bare sentinel for the missing bucket
+  // would be a key collision waiting on one badly-named channel. Real ids therefore carry
+  // an `id:` prefix and the sentinel stands alone, which also survives the round trip
+  // through the `data-fval` attribute the filter bar reads values back from.
+  const EPG_NONE = 'none';
+  const epgKey = (id) => `id:${id}`;
+  const epgValues = () => {
+    const seen = new Map();
+    let missing = false;
+    ROWS.forEach(r => {
+      if (r.epg_channel_id) seen.set(r.epg_channel_id, true);
+      else missing = true;
+    });
+    const out = Array.from(seen.keys())
+      .sort((a, b) => a.toLowerCase().localeCompare(b.toLowerCase()))
+      .map(id => ({ v: epgKey(id), label: id }));
+    // Its own bucket rather than nothing, for the same reason Format carries "Not measured":
+    // a member with no id would otherwise be a row no value can select, on the one page
+    // whose banner is about which ids these members carry. And it is not a mismatch -
+    // unknown is not proven-different (DESIGN-channel-groups-model.md 8).
+    if (missing) out.push({ v: EPG_NONE, label: 'No EPG id' });
+    return out;
+  };
+
   const partitions = (values, has) => {
     const n = values().length;
     return n > 1 || (n === 1 && ROWS.some(r => !has(r)));
@@ -450,6 +487,15 @@
       match: (r, v) => String(r.account_id) === v,
       // One account across every member is not a question worth a menu row.
       available: () => accountValues().length > 1 },
+    // The dimension the EPG mismatch banner points at. Gated the same way Format is - one
+    // bucket means every member already shares an id (or the lack of one), so the filter
+    // could only ever select all of them, and the banner that would send you here does not
+    // fire in that state either.
+    { k: 'epg',
+      label: 'EPG id',
+      values: epgValues,
+      match: (r, v) => (v === EPG_NONE ? !r.epg_channel_id : epgKey(r.epg_channel_id) === v),
+      available: () => epgValues().length > 1 },
     { k: 'tag',
       label: 'Tag',
       values: tagValues,
@@ -503,6 +549,11 @@
       case 'bitrate': return r.last_test && r.last_test.bitrate_kbps ? r.last_test.bitrate_kbps : -1;
       case 'drops': return r.last_test && r.last_test.drop_count !== null && r.last_test.drop_count !== undefined
         ? r.last_test.drop_count : -1;
+      // Lowercased so case-variant ids sort together - the same normalization
+      // `sync.epg_case_sensitive_matching` off makes when it decides two ids are one
+      // channel. The empty string is the no-id sentinel, matching the untested columns'
+      // -1: a first click sorts descending and puts it at the bottom.
+      case 'epg': return (r.epg_channel_id || '').toLowerCase();
       default: return -1;
     }
   }
@@ -770,7 +821,11 @@
       case 'framePct': {
         if (!t || t.frame_pct === null || t.frame_pct === undefined) return '<td class="num text-muted">&mdash;</td>';
         const cls = t.frame_pct >= 95 ? 'val-good' : (t.frame_pct >= 80 ? 'val-warn' : 'val-bad');
-        const expected = Math.round((t.fps || 0) * (t.duration_seconds || 0));
+        // Derived from the stored pair, never recomputed as fps x duration: the server
+        // measures the expected count over the clip's decode span, and a second formula
+        // here would print a total that contradicts the percentage beside it
+        // (dev/changelog/896).
+        const expected = t.frame_pct > 0 ? Math.round((t.frame_count || 0) / t.frame_pct * 100) : 0;
         return `<td class="num ${cls} tip-plain" data-tip="Frame delivery ${t.frame_pct.toFixed(1)}%.&#10;${t.frame_count || 0} frames received of ${expected} expected over ${Math.round(t.duration_seconds || 0)}s captured. Below 100% means brief stalls or dropped frames during the test itself.">${t.frame_pct.toFixed(1)}%</td>`;
       }
       case 'bitrate': return `<td class="num">${bitrateCell(t)}</td>`;
@@ -781,6 +836,14 @@
         return `<td class="num ${cls}">${d}</td>`;
       }
       case 'shot': return `<td>${shotCell(t)}</td>`;
+      case 'epg': {
+        if (!r.epg_channel_id) return '<td><span class="text-muted">&mdash;</span></td>';
+        // Truncated on an inner span rather than on the <td>: the header cell of a sortable
+        // column carries `sortable` instead of a `gd-c-*` class, so a width put on the body
+        // cell alone is a coupled value with nothing holding the two ends together.
+        return `<td><span class="gd-epg-id tip-plain" data-tip="EPG id.&#10;${escHtml(r.epg_channel_id)}">` +
+          `${escHtml(r.epg_channel_id)}</span></td>`;
+      }
       case 'acts':
         return `<td class="gd-c-acts"><span class="gd-rowacts">` +
           `<a href="/channels/${r.channel_id}" class="btn btn-sm">Details</a>` +
@@ -929,7 +992,7 @@
   // Which of the shared fields a card can draw, in `colState.order`'s order so the phone
   // and the desktop agree about what is on. `fps` is deliberately absent: the Format field
   // already carries it as a suffix, and on one wrapping line a bare number is unreadable.
-  const CARD_FIELDS = ['status', 'score', 'res', 'audio', 'bitrate', 'framePct', 'drops'];
+  const CARD_FIELDS = ['status', 'score', 'res', 'audio', 'bitrate', 'framePct', 'drops', 'epg'];
 
   // The two participation switches are never in the field picker - they are what the page
   // exists to set - and neither is the name or anything explaining why a member is flagged.
@@ -964,6 +1027,11 @@
         bits.push(`${t.frame_pct.toFixed(1)}% frames`);
       } else if (k === 'drops' && t && t.drop_count !== null && t.drop_count !== undefined) {
         bits.push(plural(t.drop_count, 'drop'));
+      } else if (k === 'epg' && r.epg_channel_id) {
+        // Labeled, unlike every other bit on this line: a bare provider id beside a
+        // resolution and a bitrate reads as neither, and the phone has no column header
+        // above it to say what it is.
+        bits.push(`EPG ${escHtml(r.epg_channel_id)}`);
       }
     });
     if (!bits.length) return '';
@@ -1620,7 +1688,8 @@
           `turned off, and ${n === 1 ? 'it becomes' : 'they become'} eligible again on ` +
           `${n === 1 ? 'its' : 'their'} own once the formats match.` +
           `<div class="gd-ban-acts">${strategyBtn('Change the format strategy')} ` +
-          '<button type="button" class="btn btn-sm" data-act="review-members">Review members</button> ' +
+          '<button type="button" class="btn btn-sm" data-act="review-members" data-review="format">' +
+          'Review members</button> ' +
           muteBtn('format', 'For when you already know these members differ.') + '</div>';
       } else if (!WARN.manages_format && WARN.format_spans > 1) {
         mixed = `<strong>&#9940; No format management, and these members differ</strong><br>` +
@@ -1664,16 +1733,22 @@
         'This group fills one guide row per program from whichever member wins, so ' +
         `${ids.length} different program schedules would paint one row. The listings would ` +
         'look plausible and be wrong.' +
+        // Each id is its own action, which is what makes the tally answerable rather than
+        // only countable: the button below shows every id at once, and this shows the one
+        // you are looking at. Same inline `<a data-act>` the unmonitored banner uses.
         '<ul class="gd-epg-list">' + shown.map(e =>
-          `<li>${escHtml(e.epg_channel_id)} - ${plural(e.count, 'member')}</li>`).join('') +
+          `<li><a href="#" data-act="review-epg" data-epg="${escHtml(e.epg_channel_id)}">` +
+          `${escHtml(e.epg_channel_id)}</a> - ${plural(e.count, 'member')}</li>`).join('') +
         (ids.length > 6 ? `<li>and ${ids.length - 6} more</li>` : '') + '</ul>' +
         (WARN.epg_missing_count
-          ? `<div class="gd-sub">${plural(WARN.epg_missing_count, 'member')} ` +
+          ? `<div class="gd-sub"><a href="#" data-act="review-epg" data-epg="">` +
+            `${plural(WARN.epg_missing_count, 'member')}</a> ` +
             `${WARN.epg_missing_count === 1 ? 'has' : 'have'} no EPG id at all, which is ` +
             'unknown rather than mismatched.</div>'
           : '') +
         '<div class="gd-ban-acts">' +
-        '<button type="button" class="btn btn-sm" data-act="review-members">Review members</button> ' +
+        '<button type="button" class="btn btn-sm" data-act="review-members" data-review="epg">' +
+        'Review members</button> ' +
         muteBtn('epg', 'For when you know these feeds are the same channel even though their EPG ids differ.') +
         '</div>';
     }
@@ -1740,19 +1815,52 @@
   // no member list to filter; here it filters the real one to the recording-enabled members -
   // exactly the set every one of these banners is counting - and scrolls to it. A button that
   // only explained itself would be the dead knob §16.1 refuses one control down.
-  function reviewMembers() {
+  //
+  // The target says WHICH set, because the button is shared and the banners are not asking
+  // the same question. Everything §16 counts is recording-enabled, so that is the floor on
+  // every target; the EPG banner adds the ids it named, and turns on the column that shows
+  // them - a filter chip reading "EPG id: x" over a table with no such column names the
+  // answer without showing it (dev/changelog/898).
+  function reviewMembers(target, epgId) {
     // Replaces whatever was filtered rather than adding to it: the banner is naming one
     // specific set, so the list has to end up showing that set and not an intersection
     // with something left on from earlier. The chip it leaves behind is what says so.
     filterBar.clear();
     filterBar.toggle('rec', 'on');
+    let revealed = false;
+    if (target === 'epg') {
+      // With no id named: every id the banner listed, never a subset. Its list is ordered
+      // by count, so "all but the most common" would read as the mismatch - but it would
+      // also hide members the banner just counted, and a filter that quietly drops rows the
+      // warning included is the thing this button exists to stop doing. Narrowing from here
+      // is a chip away, and each id in the banner's list is its own link for going straight
+      // to one. `epgId` is the empty string for the no-id bucket, which is a real answer and
+      // not the absent one.
+      const vals = epgId === undefined
+        ? epgValues().filter(o => o.v !== EPG_NONE).map(o => o.v)
+        : [epgId ? epgKey(epgId) : EPG_NONE];
+      vals.forEach(v => filterBar.toggle('epg', v));
+      if (!fieldOn('epg')) { toggleField('epg', true); revealed = true; }
+    }
     searchTerm = '';
     const box = byId('gd-search');
     if (box) {
       box.value = '';
       byId('gd-search-wrap').classList.remove('has-text');
     }
+    // apply() redraws the chips, the phone's sheet and the list from the one state. The
+    // Columns popover is not on that path - it is built once and rebuilt on demand - so a
+    // field revealed here has to put its own checkbox back in agreement.
     filterBar.apply();
+    if (revealed) {
+      buildColMenu();
+      // Turning a column on is a stored preference this button changed on the user's
+      // behalf, and a display setting that moves with nothing said is the silence this app
+      // exists to refuse. It stays on afterwards, like any other column: the Columns menu
+      // is where it goes back off.
+      showToast('Filtered the member list, and turned on the EPG id column so you can see ' +
+        'which member carries which. Turn it back off under Columns.');
+    }
     const card = document.querySelector('[data-section="channels"]');
     if (card) card.scrollIntoView({ behavior: 'smooth', block: 'start' });
   }
@@ -2303,7 +2411,7 @@
       jsonFetch(`/api/guide/channels/${r.channel_id}/add`, { method: 'POST' })
         .then(data => {
           if (data.success) { showToast(`"${r.channel_name}" added to the TV Guide.`); refreshRows(); }
-          else showToast(data.error || 'Already in the guide, or needs confirmation from the Browse tab.', { type: 'warning' });
+          else showToast(data.error || 'Already in the guide, or needs confirmation from Channel Search.', { type: 'warning' });
         })
         .catch(e => showToast(e.message || 'Could not add to the guide.', { type: 'error' }));
       return;
@@ -2375,7 +2483,11 @@
       case 'delete-missing-selected': closeSheet(); openDeleteMissingSelected(); return;
       case 'settings': openSettingsModal(el && el.dataset.focus); return;
       case 'mute': muteWarning(el.dataset.mute); return;
-      case 'review-members': reviewMembers(); return;
+      case 'review-members': reviewMembers(el && el.dataset.review); return;
+      // The EPG banner's per-id links. Same function, told which id - `dataset.epg` is the
+      // empty string on the "no EPG id at all" link, which is a bucket and not a missing
+      // argument, so it must not be collapsed into the no-id-named case above.
+      case 'review-epg': reviewMembers('epg', el.dataset.epg); return;
       case 'schedule': openSettingsModal('check'); return;
       case 'sections': sectionLayout.open(); return;
       case 'dedup': openDedup(); return;

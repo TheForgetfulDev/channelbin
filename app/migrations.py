@@ -1662,6 +1662,32 @@ def _m049_profile_stall_move_trigger(conn, cur):
             'ALTER TABLE recording_profiles ADD COLUMN stall_move_window_minutes INTEGER')
 
 
+def _m050_channel_health_exclusions(conn, cur):
+    """channel_health_exclusions: the observations a user has taken out of a channel's
+    health score, by hand (app/health_recompute.py, dev/changelog/895).
+
+    No backfill and no obligation to register (dev/changelog/686): an upgrading database has
+    no exclusions, and "every observation counts" is exactly what its stored scores already
+    mean. The first reset or step-back writes the first rows.
+
+    The UNIQUE index is what stops one observation being excluded twice, which would make
+    the step-back count disagree with the replay it drives.
+
+    CREATE TABLE/INDEX IF NOT EXISTS throughout, so this step is re-runnable from the top."""
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS channel_health_exclusions (
+            id          INTEGER PRIMARY KEY,
+            channel_id  INTEGER NOT NULL REFERENCES channels(id),
+            source_kind VARCHAR(32) NOT NULL,
+            source_id   INTEGER NOT NULL,
+            excluded_at DATETIME NOT NULL,
+            action      VARCHAR(16) NOT NULL
+        )
+    ''')
+    cur.execute('CREATE UNIQUE INDEX IF NOT EXISTS uq_health_exclusion '
+                'ON channel_health_exclusions (channel_id, source_kind, source_id)')
+
+
 SCHEMA_MIGRATIONS = [
     (1, 'baseline: pre-versioning additive migrations + backfills', _m001_baseline),
     (2, 'recordings: program_title/program_sub_title snapshot columns + backfill', _m002_program_title),
@@ -1749,6 +1775,8 @@ SCHEMA_MIGRATIONS = [
      _m048_channel_standing_index),
     (49, 'recording_profiles: stall_move_count/stall_move_window_minutes, the per-profile '
      'stall-rate demotion trigger', _m049_profile_stall_move_trigger),
+    (50, 'channel_health_exclusions: observations a user has taken out of a channel\'s '
+     'health score', _m050_channel_health_exclusions),
 ]
 
 CURRENT_SCHEMA_VERSION = SCHEMA_MIGRATIONS[-1][0]

@@ -12,8 +12,10 @@ break, if the port is edited carelessly:
   * No `setup-flyout` / `setup-trigger` / `setup_flyout` token survives anywhere.
     Teardown releases everything the create path acquired: markup, CSS and script.
   * Both shells render the same icon set from one definition, and the sidebar
-    renders exactly the 14 production destinations - no Health Checks row, which
-    lives on the Groups tab (DESIGN.md §14.1) even though both mockups drew it.
+    renders exactly the production destinations in order, under the section
+    headings of DESIGN.md §2 with Dashboard above all of them - no Health Checks
+    row, which lives on the Channel Groups tab (DESIGN.md §14.1) even though both
+    mockups drew it.
   * The sys-stats block is in the sidebar and NOT in the mobile drawer (it is the
     top bar's stats chip there, DESIGN.md 9.7 amended 2026-07-29).
   * The desktop `.topbar` renders inside `.colmain` with the `<aside>` outside it -
@@ -47,13 +49,19 @@ _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # Maintenance sits second to last, between Logs and Settings (DESIGN.md §16.1,
 # dev/changelog/444) - the slot is part of the approved design, so the order here is
 # an assertion and not just a list. Hide Rules closes Setup rather than sitting on the
-# Channels hub, whose tabs are on their way out (dev/changelog/782).
+# Channels hub, whose tabs are on their way out (dev/changelog/782). Dashboard leads
+# with no section heading above it and the former Channels section is gone, its two
+# destinations folded into Library under their full names (DESIGN.md §2,
+# dev/changelog/900).
 NAV_LABELS = [
-    'Dashboard', 'TV Guide', 'Recordings',
-    'Browse', 'Groups',
+    'Dashboard',
+    'Recordings', 'TV Guide', 'Channel Search', 'Channel Groups',
     'Accounts', 'Recording Profiles', 'Health Check Profiles', 'Tags', 'Hide Rules',
     'Jobs', 'Alerts', 'Logs', 'Maintenance', 'Settings',
 ]
+
+# The section headings, in order. Dashboard sits above all three (DESIGN.md §2).
+NAV_SECTIONS = ['Library', 'Setup', 'System']
 
 
 def _read(rel):
@@ -143,9 +151,19 @@ class RenderedShellTests(unittest.TestCase):
 
     def test_sidebar_renders_exactly_the_15_production_destinations(self):
         labels = re.findall(r'<span class="nav-t">([^<]+)</span>', self._sidebar())
-        # brand + 4 section headings + the destinations
+        # brand + 3 section headings + the destinations
         self.assertEqual([l for l in labels if l in NAV_LABELS], NAV_LABELS)
         self.assertNotIn('Health Checks<', self._sidebar())
+
+    def test_dashboard_leads_the_nav_above_every_section_heading(self):
+        """DESIGN.md §2: Dashboard is the landing page, so it is the one destination
+        that is not a category of anything and sits above the first heading. Both
+        shells, since nav_sections() renders both (§9.7)."""
+        for shell in (self._sidebar(), self._drawer()):
+            headings = re.findall(r'<div class="nav-section"><span class="nav-t">([^<]+)</span>',
+                                  shell)
+            self.assertEqual(headings, NAV_SECTIONS)
+            self.assertLess(shell.index('>Dashboard</span>'), shell.index('class="nav-section"'))
 
     def test_both_shells_render_the_same_icon_set(self):
         icons_of = lambda s: re.findall(r'<svg class="nav-i"[^>]*>(.*?)</svg>', s, re.S)

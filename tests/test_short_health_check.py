@@ -91,7 +91,12 @@ class SeekArgsForClipTests(unittest.TestCase):
 @unittest.skipUnless(_HAVE_FFMPEG, 'ffmpeg not available')
 class ShortClipScreenshotTests(unittest.TestCase):
     """A seek past the end of a clip returns no frame at all, which the tester reads as
-    'screenshot capture failed' - so the seek point has to follow the clip's length."""
+    'screenshot capture failed' - so the seek point has to follow the clip's length.
+
+    Since dev/changelog/894 a too-far seek is also survivable: capture_screenshot widens
+    to the top of the file rather than giving up. seek_args_for_clip still earns its keep,
+    because the widened grab returns the clip's first keyframe rather than a frame chosen
+    to represent it - a safety net, not a replacement for aiming."""
 
     def setUp(self):
         self._dir = tempfile.mkdtemp(prefix='dvr_short_shot_test_')
@@ -113,10 +118,24 @@ class ShortClipScreenshotTests(unittest.TestCase):
                                            seek_args=seek_args_for_clip(3.0)))
         self.assertGreater(os.path.getsize(out), 0)
 
-    def test_the_fixed_five_second_seek_yields_nothing_on_that_same_clip(self):
+    def test_the_fixed_five_second_seek_finds_nothing_where_it_was_told_to_look(self):
+        """The reason seek_args_for_clip exists: ffmpeg alone returns no frame at all."""
         clip = self._gen_clip('short_fixed_seek.mp4', 3)
         out = os.path.join(self._dir, 'fail.jpg')
-        self.assertFalse(capture_screenshot(clip, out, _FFMPEG, seek_args=['-ss', '5']))
+        subprocess.run(
+            [_FFMPEG, '-v', 'quiet', '-ss', '5', '-i', clip,
+             '-vf', 'scale=min(iw\\,1920):min(ih\\,1080):force_original_aspect_ratio=decrease',
+             '-vframes', '1', '-q:v', '3', '-y', out],
+            capture_output=True)
+        self.assertFalse(os.path.exists(out) and os.path.getsize(out) > 0)
+
+    def test_a_too_far_seek_is_recovered_rather_than_failed(self):
+        """The widened rung turns that into a frame from the top of the clip instead of
+        a missing screenshot (dev/changelog/894)."""
+        clip = self._gen_clip('short_fixed_seek_recovered.mp4', 3)
+        out = os.path.join(self._dir, 'recovered.jpg')
+        self.assertTrue(capture_screenshot(clip, out, _FFMPEG, seek_args=['-ss', '5']))
+        self.assertGreater(os.path.getsize(out), 0)
 
 
 if __name__ == '__main__':

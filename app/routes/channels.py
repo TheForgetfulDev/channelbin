@@ -506,13 +506,32 @@ class _ListPagination:
 
 def _build_channel_timeline(channel_id):
     """Merge ChannelTest + Recording + ChannelEvent rows for one channel into a single
-    chronological (newest-first) list of dicts, for the Activity Timeline section."""
+    chronological (newest-first) list of dicts, for the Activity Timeline section.
+
+    Each entry carries `excluded`: True when the user has rolled the health score back past
+    this observation (app/health_recompute.py), so the row can say it no longer counts. An
+    excluded test still displays the "lifetime score after" it produced at the time, and
+    that number no longer matches the channel's score - saying so is the point, since a row
+    that silently disagrees with the score is the unexplainable number this app exists to
+    avoid. One query for the whole set, not one per row.
+    """
+    from ..health_recompute import (excluded_keys, SOURCE_CAPTURE_CORRECTION, SOURCE_FAILOVER,
+                                    SOURCE_RECORDING, SOURCE_STALL_DEMOTION, SOURCE_TEST)
+    from ..database import (CHANNEL_FAILOVER_HEALTH_OBSERVATION,
+                            CHANNEL_STALL_DEMOTION_HEALTH_OBSERVATION)
+
+    excluded = excluded_keys(channel_id)
+    event_source_kind = {
+        CHANNEL_FAILOVER_HEALTH_OBSERVATION: SOURCE_FAILOVER,
+        CHANNEL_STALL_DEMOTION_HEALTH_OBSERVATION: SOURCE_STALL_DEMOTION,
+    }
     entries = []
     for t in ChannelTest.query.filter_by(channel_id=channel_id).all():
         entries.append({
             'kind': 'test', 'ts': t.test_started_at, 'obj': t,
             'quality_breakdown': json.loads(t.quality_breakdown) if t.quality_breakdown else None,
             'blend_breakdown': json.loads(t.blend_breakdown) if t.blend_breakdown else None,
+            'excluded': (SOURCE_TEST, t.id) in excluded,
         })
     for r in Recording.query.filter_by(channel_id=channel_id).all():
         entries.append({
@@ -520,11 +539,15 @@ def _build_channel_timeline(channel_id):
             'quality_breakdown': json.loads(r.health_quality_breakdown) if r.health_quality_breakdown else None,
             'blend_breakdown': json.loads(r.health_blend_breakdown) if r.health_blend_breakdown else None,
             'correction_breakdown': json.loads(r.capture_quality_breakdown) if r.capture_quality_breakdown else None,
+            'excluded': (SOURCE_RECORDING, r.id) in excluded,
+            'correction_excluded': (SOURCE_CAPTURE_CORRECTION, r.id) in excluded,
         })
     for e in ChannelEvent.query.filter_by(channel_id=channel_id).all():
         extra = json.loads(e.extra_data) if e.extra_data else {}
+        kind = event_source_kind.get(e.event_type)
         entries.append({'kind': 'channel_event', 'ts': e.timestamp, 'obj': e,
-                         'blend_breakdown': extra.get('blend_breakdown')})
+                         'blend_breakdown': extra.get('blend_breakdown'),
+                         'excluded': kind is not None and (kind, e.id) in excluded})
     entries.sort(key=lambda e: e['ts'], reverse=True)
     return entries
 
@@ -837,6 +860,12 @@ def channel_detail(channel_id):
     chan_epg_search_url = airing_search_url(
         filters=(DimensionFilter('chan', (str(channel.id),), ()),))
 
+    # How many step-backs are available and what the next one would leave the score at -
+    # both promised in the confirm dialogs, so both come from the same replay that will run
+    # (app/health_recompute.py). A fixed handful of queries, none of them per row.
+    from ..health_recompute import rollback_preview
+    health_rollback = rollback_preview(channel, cfg)
+
     return render_template('channels/detail.html',
         channel=channel,
         logo_url=resolve_logo_url(channel),
@@ -861,6 +890,7 @@ def channel_detail(channel_id):
         test_profiles=test_profiles,
         coded_tip=fmt_utils.CODED_TIP,
         final_health_score=final_health_score,
+        health_rollback=health_rollback,
         recording_observations=recording_observations,
         timeline_entries=timeline_entries,
         timeline_pagination=timeline_pagination,
@@ -1399,6 +1429,55 @@ def update_health_adjustment(channel_id):
     channel.manual_health_note = new_note
     db.session.commit()
     return jsonify({'success': True, 'adjustment': new_adjustment, 'note': new_note or ''})
+
+
+# ---------------------------------------------------------------------------
+# Health score rollback - reset, and step back one observation
+# ---------------------------------------------------------------------------
+
+_ROLLBACK_ACTIONS = ('reset', 'step_back')
+
+
+@channels_bp.route('/channels/<int:channel_id>/health/rollback', methods=['POST'])
+def rollback_health_score(channel_id):
+    """Unwind observations from a channel's health score, by hand.
+
+    `action` is 'reset' (stop counting every observation - the channel goes back to having
+    no score at all, as if it had never been tested) or 'step_back' (stop counting the
+    single newest one, repeatable). Both are one replay of what remains, not a subtraction:
+    app/health_recompute.py explains why, and holds the engine.
+
+    Returns the fresh preview alongside the result, so the page can restate how many
+    step-backs are left without a second round trip.
+    """
+    from ..health_recompute import apply_rollback, rollback_preview
+
+    channel = db.session.get(Channel, channel_id)
+    if channel is None:
+        return jsonify({'error': 'Channel not found'}), 404
+
+    action = (request.get_json(silent=True) or {}).get('action')
+    if action not in _ROLLBACK_ACTIONS:
+        return jsonify({'error': "action must be 'reset' or 'step_back'"}), 400
+
+    cfg = load_config()
+
+    @retry_on_locked()
+    def _rollback_and_commit():
+        ch = db.session.get(Channel, channel_id)
+        result = apply_rollback(ch, action, cfg)
+        if result is None:
+            return None
+        db.session.commit()
+        return result
+
+    result = _rollback_and_commit()
+    if result is None:
+        return jsonify({'error': 'This channel has no observations left to unwind - its '
+                                 'health score is already reset'}), 409
+
+    return jsonify({'success': True, 'result': result,
+                    'preview': rollback_preview(channel, cfg)})
 
 
 # ---------------------------------------------------------------------------

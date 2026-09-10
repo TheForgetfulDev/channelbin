@@ -1,4 +1,4 @@
-"""Tier 0 - the Format, FPS and Tag filter dimensions on the group member list.
+"""Tier 0 - the Format, FPS, Tag and EPG id filter dimensions on the group member list.
 
 `dev/changelog/767` made the member list's filter bar one "+ Filter" chip over the shared
 `static/js/filter-bar.js`, whose whole promise is that the next dimension costs one
@@ -24,6 +24,15 @@ Two halves, because the work has two:
     (without it 59.94 and 60 are two buckets and a group locked to "1920x1080 @ 60" has a
     filter value matching none of its own members), and the tag key being lowercased at
     build AND lookup rather than compared as typed with a fallback.
+
+`dev/changelog/898` added the fourth, EPG id, and it is the one that had a surface behind
+it: §8's mismatch banner tallies how many members carry each `epg_channel_id` and its
+`Review members` button used to answer with the recording-enabled set, so the page raised
+an alarm and then could not point at it. The same two halves apply - the row now carries
+`epg_channel_id`, and the dimension is one registry entry - plus a third fact this
+dimension needs and the other three do not: the banner's button and its per-id links have
+to REVEAL the column, since a chip reading "EPG id: x" over a table with no such column
+names the answer without showing it.
 
 Runs against a throwaway temp SQLite DB - never the live dvr.db.
   python3 -m unittest tests.test_group_member_filters
@@ -244,6 +253,213 @@ class FilterRegistryTests(unittest.TestCase):
             fn = js[js.index(name):js.index(name) + 600]
             self.assertIn('ROWS.forEach', fn)
             self.assertNotIn('visibleRows(', fn)
+
+
+class EpgDimensionPayloadTests(unittest.TestCase):
+    """The server half: every member row carries its own `epg_channel_id`.
+
+    The dimension derives its values from the rows and its predicate reads the same field,
+    so a row missing the key makes the whole filter unavailable - which is exactly the
+    state dev/changelog/898 was written to end.
+    """
+
+    def setUp(self):
+        self.t = make_test_app()
+        self.app = self.t.app
+        self.client = self.app.test_client()
+        with self.app.app_context():
+            acct = make_account()
+            # The live shape §8 warns about: a majority sharing one id, one odd feed on
+            # another, and one carrying none at all.
+            a = make_channel(acct, name='FS1 A', epg_channel_id='foxsports1.us')
+            b = make_channel(acct, name='FS1 B', epg_channel_id='foxsports1.us')
+            c = make_channel(acct, name='FS1 C', epg_channel_id='fs1.backup.us')
+            d = make_channel(acct, name='FS1 D', epg_channel_id=None)
+            grp = make_group('FS1', members=[a, b, c, d], in_guide=True)
+            self.gid = grp.id
+            db.session.commit()
+
+    def tearDown(self):
+        self.t.cleanup()
+
+    def _rows(self):
+        r = self.client.get(f'/api/channel-groups/{self.gid}/detail-rows')
+        self.assertEqual(r.status_code, 200)
+        return {row['channel_name']: row for row in r.get_json()['rows']}
+
+    def test_every_row_carries_its_epg_id(self):
+        rows = self._rows()
+        self.assertEqual(rows['FS1 A']['epg_channel_id'], 'foxsports1.us')
+        self.assertEqual(rows['FS1 C']['epg_channel_id'], 'fs1.backup.us')
+
+    def test_a_member_with_no_epg_id_carries_the_key_as_an_empty_string(self):
+        """Never absent and never null: it is a filter value and a column cell, and "no EPG
+        id" is a bucket of its own on both. A missing key would read as undefined in the
+        predicate and as the string "undefined" if a cell ever printed it."""
+        rows = self._rows()
+        self.assertIn('epg_channel_id', rows['FS1 D'])
+        self.assertEqual(rows['FS1 D']['epg_channel_id'], '')
+
+    def test_the_row_field_costs_no_query(self):
+        """`ch` is already loaded by the row loop, so the id is read off it. A re-fetch
+        inside the comprehension is the per-row-I/O defect class with a mandatory
+        regression test (CLAUDE.md §No hidden I/O in per-row loops)."""
+        src = _read('app/routes/channel_groups.py')
+        body = src[src.index('def group_detail_rows('):src.index('def _banner_facts(')]
+        loop = body[body.index('rows = ['):body.index('counts = _tally(')]
+        self.assertIn('epg_channel_id=ch.epg_channel_id', loop)
+        self.assertNotIn('Channel.query', loop)
+
+    def test_the_banner_and_the_filter_read_the_same_column(self):
+        """Two spellings of "which id does this member carry" is a banner counting one set
+        and a filter showing another - which the user reads as the page arguing with
+        itself."""
+        rows = self._rows()
+        warn = self.client.get(f'/api/channel-groups/{self.gid}/detail-rows').get_json()['warnings']
+        tallied = {e['epg_channel_id'] for e in warn['epg_ids']}
+        self.assertEqual(tallied, {'foxsports1.us', 'fs1.backup.us'})
+        self.assertEqual(warn['epg_missing_count'], 1)
+        self.assertEqual(tallied,
+                         {r['epg_channel_id'] for r in rows.values() if r['epg_channel_id']})
+
+
+class EpgDimensionRegistryTests(unittest.TestCase):
+    """The client half, asserted against the source for the reason the module docstring
+    gives: there is no jsdom harness for group-detail.js."""
+
+    def test_epg_is_a_registry_entry(self):
+        self.assertIn("k: 'epg'", _dims())
+
+    def test_epg_is_not_filtered_outside_the_one_predicate(self):
+        js = _read('static/js/group-detail.js')
+        matches = js[js.index('function matches(r)'):js.index('function visibleRows(')]
+        self.assertNotIn('epg', matches)
+
+    def test_a_member_with_no_epg_id_is_its_own_bucket(self):
+        """Otherwise it is a row no value can select, on the one page whose banner is about
+        which ids these members carry - and the banner says in the same breath that no id is
+        unknown rather than mismatched, so the bucket has to exist to be sayable."""
+        js = _read('static/js/group-detail.js')
+        self.assertIn("const EPG_NONE = 'none'", js)
+        self.assertIn("label: 'No EPG id'", js)
+        self.assertIn('v === EPG_NONE ? !r.epg_channel_id', _dims())
+
+    def test_a_real_id_is_prefixed_so_it_cannot_collide_with_the_sentinel(self):
+        """Format can use a bare `none` sentinel because a format key is a string this app
+        builds ("1920x1080 @ 60"). An EPG id is provider-supplied text, so one channel named
+        `none` would otherwise select the no-id bucket and hide every member that has no id
+        at all - a keyed lookup with no uniqueness argument (CLAUDE.md)."""
+        js = _read('static/js/group-detail.js')
+        self.assertIn('const epgKey = (id) => `id:${id}`', js)
+        self.assertIn('epgKey(r.epg_channel_id) === v', _dims())
+
+    def test_epg_derives_its_values_from_every_row(self):
+        """Values built from the VISIBLE rows would empty themselves as soon as one was
+        chosen, and the bar would then prune the very filter that emptied them."""
+        js = _read('static/js/group-detail.js')
+        fn = js[js.index('const epgValues ='):js.index('const partitions =')]
+        self.assertIn('ROWS.forEach', fn)
+        self.assertNotIn('visibleRows(', fn)
+
+    def test_epg_is_gated_on_having_more_than_one_bucket(self):
+        """One bucket means every member already carries the same id (or none), so the
+        filter could only ever select all of them - and the banner that would send you here
+        does not fire in that state either. Format's gate, for Format's reason: the no-id
+        bucket counts toward the length, so nothing is missing from the count."""
+        self.assertIn('available: () => epgValues().length > 1', _dims())
+
+
+class ReviewMembersTargetTests(unittest.TestCase):
+    """`Review members` is on two banners asking different questions, so it takes a target.
+
+    Before dev/changelog/898 it hardcoded the recording-enabled set, which is what the
+    FORMAT banner counts - so on the EPG banner it cleared your filters and scrolled you to
+    a list that was not the one the warning had just described.
+    """
+
+    def _fn(self):
+        js = _read('static/js/group-detail.js')
+        return js[js.index('function reviewMembers('):js.index('function muteWarning(')]
+
+    def test_the_button_carries_which_banner_asked(self):
+        js = _read('static/js/group-detail.js')
+        banners = js[js.index('function renderBanners()'):js.index('function reviewMembers(')]
+        self.assertIn('data-act="review-members" data-review="format"', banners)
+        self.assertIn('data-act="review-members" data-review="epg"', banners)
+        self.assertIn("reviewMembers(el && el.dataset.review)", js)
+
+    def test_recording_enabled_stays_the_floor_on_every_target(self):
+        """Every §16 banner counts the recording-enabled members, so no target may show
+        more than that - the EPG target narrows it, it does not replace it."""
+        fn = self._fn()
+        self.assertIn("filterBar.toggle('rec', 'on')", fn)
+        self.assertLess(fn.index("filterBar.toggle('rec', 'on')"), fn.index("target === 'epg'"))
+
+    def test_the_epg_target_selects_every_id_the_banner_named(self):
+        """Not a subset. The banner's list is ordered by count, so "all but the most common"
+        would read as the mismatch - and would also hide members the banner just counted,
+        which is the behavior this button exists to stop."""
+        fn = self._fn()
+        self.assertIn("epgValues().filter(o => o.v !== EPG_NONE).map(o => o.v)", fn)
+
+    def test_a_named_id_narrows_to_that_one_and_an_empty_string_is_the_no_id_bucket(self):
+        """The per-id links are the "filter to a specific EPG id" half. `dataset.epg` is ''
+        on the no-id link, which is an answer and not an absent argument - collapsing the
+        two would send that link to the all-ids case."""
+        js = _read('static/js/group-detail.js')
+        fn = self._fn()
+        self.assertIn('epgId === undefined', fn)
+        self.assertIn('[epgId ? epgKey(epgId) : EPG_NONE]', fn)
+        self.assertIn("case 'review-epg': reviewMembers('epg', el.dataset.epg)", js)
+
+    def test_every_id_in_the_banner_is_its_own_link(self):
+        js = _read('static/js/group-detail.js')
+        banners = js[js.index('function renderBanners()'):js.index('function reviewMembers(')]
+        self.assertIn('data-act="review-epg" data-epg="${escHtml(e.epg_channel_id)}"', banners)
+        self.assertIn('data-act="review-epg" data-epg=""', banners)
+
+    def test_the_epg_target_reveals_the_column_it_filtered_on(self):
+        """A chip reading "EPG id: x" over a table with no EPG id column names the answer
+        without showing it. The column is off by default, so the button that sends you to it
+        has to turn it on - and say so, because it is a stored preference that moved."""
+        fn = self._fn()
+        self.assertIn("if (!fieldOn('epg')) { toggleField('epg', true); revealed = true; }", fn)
+        self.assertIn('buildColMenu()', fn)
+        self.assertIn('showToast(', fn)
+
+
+class EpgColumnTests(unittest.TestCase):
+    """The column itself, and the stored-layout merge that decides whether it starts off."""
+
+    def test_the_column_is_offered_on_every_facet_and_is_off_by_default(self):
+        src = _read('app/routes/channel_groups.py')
+        block = src[src.index('GROUP_DETAIL_COLUMNS = {'):src.index('def _group_detail_job(')]
+        self.assertEqual(block.count("'epg',"), 3, 'every facet lists the EPG id column')
+        self.assertIn("GROUP_DETAIL_COLUMNS_OFF = ('fps', 'framePct', 'audio', 'epg')", block)
+
+    def test_a_column_new_to_a_stored_layout_takes_the_app_default(self):
+        """dev/docs/BUGS.md 2026-09-09 @ 06:41 - a stored `hidden` list cannot say anything
+        about a key that did not exist when it was written, so reading its silence as "show
+        it" ships every default-off column switched ON for exactly the users who have used
+        the page before."""
+        js = _read('static/js/group-detail.js')
+        merge = js[js.index('G.columns.forEach(k => {'):js.index('const fieldOn =')]
+        self.assertIn('G.columnsOff.includes(k)', merge)
+        self.assertIn('colState.hidden.push(k)', merge)
+
+    def test_the_column_renders_on_both_widths(self):
+        """One module draws the table and the phone card, so a field on in one and absent
+        from the other is the disagreement that split them."""
+        js = _read('static/js/group-detail.js')
+        self.assertIn("case 'epg': {", js)
+        self.assertIn("'drops', 'epg']", js)
+        self.assertIn("k === 'epg' && r.epg_channel_id", js)
+
+    def test_sorting_normalizes_case_once(self):
+        """Case-variant ids are the same channel when `sync.epg_case_sensitive_matching` is
+        off, so they sort together rather than into two runs."""
+        js = _read('static/js/group-detail.js')
+        self.assertIn("case 'epg': return (r.epg_channel_id || '').toLowerCase();", js)
 
 
 if __name__ == '__main__':

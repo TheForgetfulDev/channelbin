@@ -342,7 +342,7 @@ function openGroupModal(opts) {
          swallowed rejection is an empty modal that never explains itself. */
       settleSuggest(null, false);
       if (fixedGroup) showErr(`Couldn't look for channels to add: ${e.message || 'request failed'}. `
-                              + 'Close this and try again, or add channels from the Browse tab.');
+                              + 'Close this and try again, or add channels from Channel Search.');
     });
   }
 
