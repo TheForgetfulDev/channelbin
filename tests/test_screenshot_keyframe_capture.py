@@ -27,16 +27,19 @@ from unittest import mock
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app.channel_tester import _check_screenshot_uniform  # noqa: E402
-from app.config import resolve_ffmpeg_path  # noqa: E402
 from app.screenshot import (  # noqa: E402
     _capture_attempts,
     capture_screenshot,
     widened_seek_args,
 )
 
-_FFMPEG = resolve_ffmpeg_path('ffmpeg')
-_HAVE_FFMPEG = shutil.which(_FFMPEG) is not None or (
-    os.path.isabs(_FFMPEG) and os.path.exists(_FFMPEG))
+# Gated on a SYSTEM ffmpeg, which is what every other ffmpeg-dependent test file here does.
+# app.config.resolve_ffmpeg_path is deliberately not used: it falls back to the
+# imageio-ffmpeg binary pip installs as a runtime dependency, so it resolves to a path that
+# exists on a machine with no ffmpeg at all, and these fixtures produce no frame on that
+# build - the class ran instead of skipping and failed five ways (dev/changelog/903).
+_FFMPEG = 'ffmpeg'
+_HAVE_FFMPEG = bool(shutil.which('ffmpeg') and shutil.which('ffprobe'))
 
 
 def _have_encoder(name: str) -> bool:
