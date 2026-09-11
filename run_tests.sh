@@ -31,4 +31,39 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
+# Roughly 408 tests gate themselves on shutil.which('ffmpeg')/('ffprobe'), and a skip is not
+# a failure - so with neither on PATH the suite finishes in a fraction of the time, reports
+# OK, and has exercised no capture, probe, conversion or screenshot code at all. That is the
+# same silent-suite-shrinker that shipped in CI for months (dev/changelog/907), and it came
+# back the moment this box's ffmpeg moved out of /usr/bin: a shell holding a PATH from before
+# the move finds nothing, and says nothing (dev/changelog/917).
+#
+# So refuse, rather than run a smaller suite that looks identical to a whole one. Skipping
+# them is still allowed - it just has to be asked for, which is the difference between a
+# choice and an accident.
+if [ "${CHANNELBIN_ALLOW_MISSING_FFMPEG:-}" != "1" ]; then
+    missing=""
+    for bin in ffmpeg ffprobe; do
+        command -v "$bin" >/dev/null 2>&1 || missing="$missing $bin"
+    done
+    if [ -n "$missing" ]; then
+        echo "run_tests.sh: not on PATH:$missing" >&2
+        echo "  Around 408 tests gate on these and would skip themselves, so this run would" >&2
+        echo "  report green over a much smaller suite. Refusing instead." >&2
+        echo "  PATH=$PATH" >&2
+        echo "  Install ffmpeg (it ships ffprobe), or set CHANNELBIN_ALLOW_MISSING_FFMPEG=1 to" >&2
+        echo "  run the rest of the suite deliberately." >&2
+        exit 1
+    fi
+    # Not fatal: 6.1 measured identical to 7.1 and a contributor's distro decides this. But
+    # ChannelBin targets 7.1 (README.md), so a run on anything else says which series it
+    # actually measured rather than leaving it to be inferred.
+    series="$(ffmpeg -version 2>/dev/null | head -1 | awk '{print $3}')"
+    case "$series" in
+        7.1.*|n7.1.*) ;;
+        *) echo "run_tests.sh: note - ffmpeg $series, not the 7.1 series this project" \
+                "targets. Results still count; they were just measured elsewhere." >&2 ;;
+    esac
+fi
+
 exec python3 -m tests.support.timing "$@"

@@ -219,6 +219,7 @@ def reset_module_globals():
     import app.channel_tester as channel_tester
     import app.config as config
     import app.fs_utils as fs_utils
+    import app.probe as probe
     import app.routes.channel_search as channel_search_routes
     import app.search_index as search_index
 
@@ -237,6 +238,10 @@ def reset_module_globals():
     search_index._stale_since.clear()
     # Lockout counters are keyed by IP, and every test client is 127.0.0.1.
     auth._failures = {}
+    # Latched after the first probe that cannot run ffprobe, so a module that exercised the
+    # missing-binary path leaves the next one's identical probe silent - i.e. no warning and
+    # no standing alert where the test set up a freshly-missing tool.
+    probe._missing_reported = False
     # The disk-readout warning fires only on a change of outcome, so an entry left by a
     # previous module makes this module's first probe of the same path look unchanged -
     # i.e. no warning where the test set up a freshly-unreachable mount.

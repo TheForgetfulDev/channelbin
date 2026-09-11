@@ -18,8 +18,15 @@ actually building and running the image before this file was written:
     still starts and still works - and silently discards the database, the settings or the
     session key at the next image upgrade. That is exactly the class of failure this app
     exists to make loud rather than discover later.
+
+  * **The substitution guard** (dev/changelog/908). A floating base tag makes the shipped
+    ffmpeg an accident of whichever Debian release the tag currently tracks, and that already
+    moved the image's capture engine from ffmpeg 5.1 to 7.1.5 with no commit. The version
+    itself is asserted inside the build, which no unittest can reach; what is guarded here is
+    that the assertion and the release-qualified tag are still present in the Dockerfile.
 """
 import os
+import re
 import unittest
 
 import yaml
@@ -147,6 +154,70 @@ class DockerPersistencePathTests(unittest.TestCase):
             if 'chown' in code and '-R' in code:
                 self.assertNotIn('/dvr', code,
                                  'The entrypoint recursively chowns /dvr: ' + line.strip())
+
+
+class DockerFfmpegPinTests(unittest.TestCase):
+    """The image's ffmpeg may not change without a commit (dev/changelog/908).
+
+    ffmpeg is the one external tool this app's output depends on, and the container is the
+    only environment where ChannelBin picks it. Every behavior the codebase treats as settled
+    about ffmpeg was measured against one build, so a version that arrives by accident is a
+    silent substitution of the capture engine - which is what happened when Debian 13 went
+    stable and the image's ffmpeg jumped from 5.1 to 7.1.5 with nothing noticing.
+    """
+
+    # Debian release codenames a base tag may name. A tag carrying none of them is floating,
+    # whatever else it says.
+    DEBIAN_RELEASES = ('bookworm', 'trixie', 'forky', 'sid')
+
+    def _from_tag(self):
+        match = re.search(r'^FROM\s+(\S+)', _read(DOCKERFILE), re.MULTILINE)
+        self.assertIsNotNone(match, 'Dockerfile has no FROM line.')
+        return match.group(1)
+
+    def test_the_base_image_tag_names_a_debian_release(self):
+        """`python:3.12-slim` follows whatever Debian release the tag tracks, so the ffmpeg
+        under it changes major version on Debian's schedule rather than on a commit."""
+        tag = self._from_tag()
+        self.assertTrue(
+            any(rel in tag for rel in self.DEBIAN_RELEASES),
+            f'The base image is `{tag}`, which names no Debian release, so the Debian version '
+            'under it - and therefore the ffmpeg series apt installs - can move without a '
+            'commit. Pin a release-qualified tag (e.g. python:3.12-slim-trixie).')
+
+    def test_the_ffmpeg_series_is_declared_exactly_once(self):
+        """Two declarations is two sources of truth for which ffmpeg the image contains, and
+        a container smoke test reads this value to know what to expect inside the image."""
+        declarations = re.findall(r'^ARG\s+FFMPEG_SERIES=(\S+)', _read(DOCKERFILE),
+                                  re.MULTILINE)
+        self.assertEqual(
+            len(declarations), 1,
+            'The Dockerfile must declare FFMPEG_SERIES exactly once (found '
+            f'{len(declarations)}): it is the single statement of which ffmpeg this image '
+            'ships, and what the build assertion and any smoke test compare against.')
+        self.assertRegex(
+            declarations[0], r'^\d+\.\d+$',
+            f'FFMPEG_SERIES is `{declarations[0]}`, not a major.minor series. An exact patch '
+            'version would fail the build on every Debian security update; a bare major would '
+            'let a series move through unnoticed.')
+
+    def test_the_build_asserts_the_series_for_both_binaries(self):
+        """The app needs ffmpeg and ffprobe both, and a missing ffprobe is silent at runtime -
+        every probe returns an empty dict, with no error and no event."""
+        dockerfile = _read(DOCKERFILE)
+        self.assertIn(
+            '${FFMPEG_SERIES}', dockerfile,
+            'FFMPEG_SERIES is declared but never referenced, so nothing in the build checks '
+            'the version it names and the declaration is decoration.')
+        self.assertIn(
+            'for bin in ffmpeg ffprobe', dockerfile,
+            'The build no longer checks the resolved version of both binaries. Checking only '
+            'ffmpeg leaves a missing or mismatched ffprobe to be discovered at runtime, where '
+            'it reports nothing at all.')
+        self.assertIn(
+            'exit 1', dockerfile,
+            'The version check can no longer fail the build, so a substituted ffmpeg ships '
+            'with a warning in a build log nobody reads.')
 
 
 class DockerConfigKeysTests(unittest.TestCase):

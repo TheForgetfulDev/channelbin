@@ -34,10 +34,12 @@ from app.screenshot import (  # noqa: E402
 )
 
 # Gated on a SYSTEM ffmpeg, which is what every other ffmpeg-dependent test file here does.
-# app.config.resolve_ffmpeg_path is deliberately not used: it falls back to the
-# imageio-ffmpeg binary pip installs as a runtime dependency, so it resolves to a path that
-# exists on a machine with no ffmpeg at all, and these fixtures produce no frame on that
-# build - the class ran instead of skipping and failed five ways (dev/changelog/903).
+# app.config.resolve_ffmpeg_path is deliberately not used: a resolver whose job is to
+# supply a path is the wrong source for "is this tool installed", and it used to prove it -
+# its imageio-ffmpeg fallback returned a path that existed on a machine with no ffmpeg at
+# all, these fixtures produce no frame on that build, and the class ran instead of skipping
+# and failed five ways (dev/changelog/903). That fallback is gone (dev/changelog/911); the
+# reason not to gate a skip on a resolver is not.
 _FFMPEG = 'ffmpeg'
 _HAVE_FFMPEG = bool(shutil.which('ffmpeg') and shutil.which('ffprobe'))
 
@@ -131,12 +133,20 @@ class CaptureCommandShapeTests(unittest.TestCase):
         self.assertEqual(len(runs), 3)
         self.assertNotIn('-skip_frame', runs[-1])
 
-    def test_hdr_tonemap_is_not_retried_after_it_fails_once(self):
-        """A build without zscale must not pay a doomed run on every rung."""
+    def test_a_wide_frame_alone_does_not_change_the_ladder(self):
+        """Frame size is not a colorspace - the HDR branch turns on the transfer only.
+
+        This replaces a test that fed probe={'vid_width': 3840} to reach the tonemap
+        chain and asserted the chain was tried exactly once. Both halves of it were the
+        defect rather than the invariant: width is what wrongly dragged SDR content in,
+        and latching the chain off after one failure denied it to the wider seek that
+        existed precisely because the first held no frame. tests/
+        test_screenshot_hdr_tonemap.py owns that branch now (dev/changelog/915).
+        """
         runs = self._argv_of_first_run(seek_args=['-ss', '2.50'],
                                        probe={'vid_width': 3840})
-        tonemap_runs = [c for c in runs if any('tonemap' in a for a in c)]
-        self.assertEqual(len(tonemap_runs), 1)
+        self.assertEqual(len(runs), 3)
+        self.assertEqual([], [c for c in runs if any('tonemap' in a for a in c)])
 
 
 @unittest.skipUnless(_HAVE_FFMPEG and _HAVE_X265, 'ffmpeg with libx265 not available')

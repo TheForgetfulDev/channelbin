@@ -1725,6 +1725,22 @@ def _gather_recording_health(recording_id, ts_path, rec, cfg):
         from .probe import parse_ffprobe
         probe = parse_ffprobe(ts_path)
         if not probe:
+            # One empty dict, two meanings, and this event is the only record of the
+            # recording's missing numbers that survives on the artifact - so it has to say
+            # which. probe_failed described the file; probe_unavailable describes the
+            # install, and nothing about the capture can be concluded from it
+            # (dev/changelog/911).
+            from .toolchain import ffprobe_missing
+            if ffprobe_missing():
+                log.warning('Recording %d: no ffprobe on this machine, so %s has no health '
+                            'data', recording_id, ts_path)
+                return None, {
+                    'detail': 'Capture health check skipped: ffprobe is not installed, so '
+                              'the recorded file could not be inspected. This says nothing '
+                              'about the recording itself - see Maintenance > External '
+                              'tools.',
+                    'extra': {'kind': 'capture_health', 'probe_unavailable': True},
+                }
             log.warning('Recording %d: ffprobe returned no data for %s', recording_id, ts_path)
             return None, {
                 'detail': 'Capture health check failed: ffprobe returned no data for the '

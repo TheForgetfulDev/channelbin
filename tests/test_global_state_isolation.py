@@ -61,6 +61,7 @@ RESET = {
     'app/channel_tester.py': {'_state'},
     'app/config.py': {'_restart_needed'},
     'app/fs_utils.py': {'_last_logged_outcome'},
+    'app/probe.py': {'_missing_reported'},
     'app/search_index.py': {'_rebuilding', '_stale_since'},
 }
 
@@ -83,6 +84,10 @@ ALLOWED = {
     ('app/recorder.py', '_active'): 'TestApp.cleanup() tears down what it finds here; clearing it first would strand ffmpeg',
     ('app/scheduler.py', '_app'): 'owned by init_scheduler()/shutdown; _assert_jobstore_is_sandboxed guards the escape this could cause',
     ('app/scheduler.py', '_scheduler'): 'a live BackgroundScheduler - dropping the reference leaks its threads instead of stopping them',
+    ('app/toolchain.py', '_cache'): 'a fact about the machine, not about a test: the answer is identical in every module, and re-probing per module is two process spawns (~105ms each) x the module count. Keyed on the configured ffmpeg path so a changed setting re-probes anyway; a test that patches _probe_version drives describe_tools_uncached, or calls reset_cache() on both edges (tests/test_toolchain.py)',
+    ('app/toolchain.py', '_cache_key'): 'paired with _cache above - clearing one without the other is what would serve a stale answer',
+    ('app/toolchain.py', '_capabilities'): 'the same kind of machine fact as _cache: what the resolved ffmpeg build includes, keyed on that binary so a different one re-probes. Filled only by the tools endpoint, never at create_app(); a test that patches _run_listing drives describe_capabilities_uncached, or calls reset_cache() - which clears this too - on both edges (tests/test_toolchain.py)',
+    ('app/toolchain.py', '_capabilities_key'): 'paired with _capabilities above - clearing one without the other is what would serve a stale answer',
 }
 
 

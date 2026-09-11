@@ -428,6 +428,93 @@
 
   $('#btn-refresh-storage').addEventListener('click', loadStorageDetails);
 
+  // ── External tools ──────────────────────────────────────────────────────
+  // Reuses .statlist/.srow above rather than styling of its own, so the card reads
+  // as the same kind of readout Storage is and restacks at 375px for free.
+  const toolsEl = $('#tools-content');
+
+  // Where the binary came from, which is the half of the answer a path does not give.
+  // A fourth value, `bundled`, named the imageio-ffmpeg fallback until dev/changelog/911
+  // removed it - the server no longer sends it, and an unknown key already falls through
+  // to no provenance line rather than rendering `undefined`. `configured` names the setting
+  // from the payload rather than a literal, because the two binaries have different keys
+  // and a card that told an operator to edit ffmpeg.path to move ffprobe would be sending
+  // them to the wrong field (dev/changelog/914).
+  const toolSource = (t) => {
+    if (t.source === 'path') return 'found on PATH';
+    if (t.source === 'sibling') return 'found beside the configured ffmpeg';
+    if (t.source === 'configured') return `set in ${t.config_key}`;
+    return '';
+  };
+
+  // Every row is full-width, so the four read down the card as two labelled pairs
+  // (ffmpeg, its path, ffprobe, its path). The default two-column .statlist put the
+  // pair of version rows side by side above two full-width path rows, which broke the
+  // association between a binary and the path it was found at.
+  const toolVersionRow = (t) => (t.found
+    ? `<div class="srow wide"><span class="sk">${escHtml(t.name)}</span>
+      <span class="sv ok">${escHtml(t.version || 'unknown version')}</span></div>`
+    : `<div class="srow wide"><span class="sk">${escHtml(t.name)}</span>
+      <span class="sv bad">not found</span></div>`);
+
+  const toolPathRow = (t) => {
+    const suffix = t.found && toolSource(t) ? ` (${toolSource(t)})` : '';
+    return `<div class="srow wide"><span class="sk">${escHtml(t.name)} path</span>
+      <span class="sv">${escHtml(t.path)}${escHtml(suffix)}</span></div>`;
+  };
+
+  // The alert raised at startup says the same thing, but an operator who is already
+  // looking at this card should not have to go find it - and a card that shows "not
+  // found" without saying what breaks or what to do is half an answer.
+  const toolsWarning = (missing) => {
+    if (!missing.length) return '';
+    const what = missing.includes('ffmpeg')
+      ? 'Recordings and health checks cannot run at all.'
+      : 'Recording still works, but nothing can be probed: no format detection, no '
+        + 'recording health numbers, and no channel-group format matching.';
+    return `<div class="mrow"><span class="grow"><strong>${escHtml(missing.join(' and '))}</strong>
+      could not be run. ${escHtml(what)} Install ffmpeg on this machine (it supplies both
+      binaries), or set <code>ffmpeg.path</code> in Settings to an absolute path - ffprobe is
+      taken from the same directory automatically.</span></div>`;
+  };
+
+  // What the resolved ffmpeg build includes, limited to the components ChannelBin invokes.
+  // Three states, never two: `available: null` means the listing that would answer it could
+  // not be read, and rendering that as "not in this build" would be a false alarm. The line
+  // under the label says what uses the component, or what breaks when it is absent.
+  const capabilityStatus = (c) => {
+    if (c.available === true) return ['ok', 'in this build'];
+    if (c.available === false) return ['bad', 'not in this build'];
+    return ['warn', 'could not be checked'];
+  };
+
+  const capabilityRows = (caps) => {
+    if (!caps || !caps.length) return '';
+    const rows = caps.map((c) => {
+      const [cls, text] = capabilityStatus(c);
+      const sub = c.available === false ? c.without : c.used_for;
+      return `<div class="srow wide"><span class="sk">${escHtml(c.label)}<span class="srow-sub">${escHtml(sub)}</span></span>
+        <span class="sv ${cls}">${escHtml(text)}</span></div>`;
+    }).join('');
+    return `<div class="mrow"><span class="grow">What this ffmpeg build includes, limited to
+      the parts ChannelBin uses.</span></div><div class="statlist has-wide">${rows}</div>`;
+  };
+
+  const loadTools = () => {
+    toolsEl.innerHTML = '<div class="mrow"><span class="grow">Loading...</span></div>';
+    return jsonFetch('/api/system/tools')
+      .then((d) => {
+        const tools = [d.tools.ffmpeg, d.tools.ffprobe];
+        toolsEl.innerHTML = toolsWarning(d.missing || [])
+          + `<div class="statlist has-wide">${tools.map(
+            (t) => toolVersionRow(t) + toolPathRow(t)).join('')}</div>`
+          + capabilityRows(d.capabilities);
+      })
+      .catch(() => {
+        toolsEl.innerHTML = '<div class="mrow"><span class="grow">Failed to load external tool versions.</span></div>';
+      });
+  };
+
   // ── Support bundle ──────────────────────────────────────────────────────
   // The opt-in rides on the download link's href rather than a form post, so the
   // server decides from ?names=1 alone and the link keeps working with JS off (as
@@ -446,4 +533,5 @@
   loadBackups();
   loadIndexStatus();
   loadStorageDetails();
+  loadTools();
 })();

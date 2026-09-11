@@ -30,6 +30,10 @@ AUTH_GATE_INERT = 'AUTH_GATE_INERT'
 #: the three above: update_storage_path_alert() below raises and dismisses it by type.
 STORAGE_PATH_UNUSABLE = 'STORAGE_PATH_UNUSABLE'
 
+#: ffmpeg or ffprobe could not be run on this install. Named for the same reason as the
+#: four above: app/toolchain.py raises and dismisses it by type, one row per binary.
+EXTERNAL_TOOL_MISSING = 'EXTERNAL_TOOL_MISSING'
+
 # Registry of all known alert types.
 # severity: ERROR | CRIT | WARN | INFO
 ALERT_TYPES = {
@@ -141,6 +145,15 @@ ALERT_TYPES = {
     # record's own level - the condition is logged at WARNING (app/fs_utils.py).
     STORAGE_PATH_UNUSABLE: {
         'label': 'Storage Path Unusable', 'severity': 'ERROR'},
+    # ERROR for the same reason STORAGE_PATH_UNUSABLE above is, and not the WARN band the
+    # "something is degraded" types sit in: a missing ffmpeg does not degrade recording, it
+    # disables it, and every recording that starts meanwhile fails immediately. A missing
+    # ffprobe shares the band deliberately - it is silent rather than loud on every other
+    # surface, which is exactly what makes it worth the louder one here. No double-up with
+    # the log->alert handler in app/__init__.py: the condition is logged at WARNING
+    # (app/toolchain.py).
+    EXTERNAL_TOOL_MISSING: {
+        'label': 'External Tool Missing (ffmpeg/ffprobe)', 'severity': 'ERROR'},
 }
 
 

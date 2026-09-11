@@ -29,6 +29,9 @@ cheaply see:
   * a non-idempotent side effect - process spawn, thread start, network fetch, file unlink -
     reachable from inside a `retry_on_locked` closure, which every retry re-runs
     (dev/changelog/683: one locked commit re-downloading a whole M3U playlist).
+  * a CI workflow that stops installing the external tools the suite gates on, or that floats
+    its runner image - either one silently shrinks the suite CI reports green over, with no
+    failure anywhere to say so (dev/changelog/907).
 
 Plus one *advisory* scan (never fails): `db.session.commit()` sites not obviously wrapped by
 `retry_on_locked` - printed as suspects for a human to eyeball, per CLAUDE.md's note that this
@@ -3353,6 +3356,99 @@ class StandingIndexCoverageTests(unittest.TestCase):
         # SELECT - the outer CASE only tests the id. If the walk ever starts descending,
         # this is the assertion that says so.
         self.assertEqual(found['showdup'], {'id'})
+
+
+class CiWorkflowToolingTests(unittest.TestCase):
+    """The CI workflow must keep installing what the suite gates on, at the version we ship.
+
+    Roughly 408 tests skip themselves when ffmpeg/ffprobe or node_modules/jsdom are
+    absent, and a skip is not a failure - so dropping either install leaves CI green
+    over a strictly smaller suite than the one run locally, with nothing anywhere
+    saying so. That is what shipped for months (dev/changelog/907). A floating
+    `runs-on: ubuntu-latest` is the same hazard one level up: the runner image decides
+    what apt hands over, so a rollover changes the tooling under the suite with no
+    commit.
+
+    Installing *an* ffmpeg is not enough, which is the lesson of dev/changelog/916: for
+    its first weeks CI ran the runner image's 6.1.1 while the container shipped 7.1.5,
+    so every push was green over a series no user runs and a regression reaching only
+    the shipped build had no environment that could catch it. The Dockerfile's
+    FFMPEG_SERIES is the one declaration of what ChannelBin targets, so that is what
+    CI is held to here rather than a version this file re-types.
+
+    This is a text scan, not a schema check - it asserts the facts a future edit could
+    quietly drop, and deliberately asserts no action version numbers, which are supposed
+    to move.
+    """
+
+    WORKFLOW = os.path.join(ROOT, '.github', 'workflows', 'tests.yml')
+    DOCKERFILE = os.path.join(ROOT, 'Dockerfile')
+
+    def setUp(self):
+        if not os.path.exists(self.WORKFLOW):
+            self.skipTest('no .github/workflows/tests.yml in this checkout')
+        with open(self.WORKFLOW, encoding='utf-8') as fh:
+            self.text = fh.read()
+
+    def _step_containing(self, needle):
+        """The body of the workflow step whose text contains `needle`."""
+        steps = re.split(r'\n      - (?:name|uses):', self.text)
+        return next((s for s in steps if needle in s), None)
+
+    def test_ci_runs_the_ffmpeg_series_the_container_ships(self):
+        if not os.path.exists(self.DOCKERFILE):
+            self.skipTest('no Dockerfile in this checkout')
+        with open(self.DOCKERFILE, encoding='utf-8') as fh:
+            shipped = re.search(r'^ARG FFMPEG_SERIES=(\S+)', fh.read(), re.M)
+        self.assertTrue(shipped, 'the Dockerfile no longer declares ARG FFMPEG_SERIES')
+        tested = re.search(r'^\s*FFMPEG_SERIES:\s*"?([^"\s]+)"?', self.text, re.M)
+        self.assertTrue(
+            tested, 'the workflow no longer declares which ffmpeg series it pins, so CI '
+            'can drift off the shipped one the way it did before dev/changelog/916')
+        self.assertEqual(
+            tested.group(1), shipped.group(1),
+            f"CI tests ffmpeg {tested.group(1)} while the container ships "
+            f"{shipped.group(1)}: every run is green over a series no user has. Move "
+            'both together, and only once the app has been measured on the new build.')
+
+    def test_the_pinned_ffmpeg_download_is_checksummed(self):
+        if 'FFMPEG_URL' not in self.text:
+            self.skipTest('the workflow does not download a pinned ffmpeg build')
+        self.assertRegex(
+            self.text, r'sha256sum -c',
+            'the workflow downloads an ffmpeg build over the network without verifying '
+            'it, so whatever that URL serves becomes the capture engine under the suite')
+
+    def test_it_verifies_the_ffmpeg_toolchain_before_running(self):
+        # A space before the flag, so `python-version:` and `node --version` do not match.
+        step = self._step_containing(' -version')
+        self.assertIsNotNone(step, 'no workflow step resolves an external tool version')
+        for binary in ('ffmpeg', 'ffprobe'):
+            self.assertIn(
+                binary, step,
+                f'the workflow never resolves {binary}, so a run where it is missing or '
+                'is the wrong series reports green while the tests gated on it silently '
+                'skip themselves')
+        self.assertIn(
+            'exit 1', step,
+            'the workflow prints the external tool versions but no longer fails on a '
+            'wrong one, so a substituted ffmpeg is a line in a log nobody reads rather '
+            'than a red build')
+
+    def test_it_installs_the_node_dependencies(self):
+        self.assertRegex(
+            self.text, r'\bnpm (ci|install)\b',
+            'the workflow stopped installing node_modules, so every jsdom-backed '
+            'client-side test now skips itself on the runner while CI still reports green')
+
+    def test_the_runner_image_is_pinned(self):
+        runners = re.findall(r'runs-on:\s*(\S+)', self.text)
+        self.assertTrue(runners, 'no runs-on: line found in the workflow')
+        floating = [r for r in runners if r.endswith('-latest')]
+        self.assertEqual(
+            floating, [],
+            'a floating runner image changes the ffmpeg under the suite on GitHub\'s '
+            f'schedule rather than on a commit: {floating}')
 
 
 if __name__ == '__main__':

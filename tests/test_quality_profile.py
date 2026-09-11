@@ -28,9 +28,10 @@ _FFMPEG = resolve_ffmpeg_path('ffmpeg')
 _HAVE_FFMPEG = (
     (shutil.which(_FFMPEG) is not None
      or (os.path.isabs(_FFMPEG) and os.path.exists(_FFMPEG)))
-    # ffprobe is the half that can be missing on its own: resolve_ffmpeg_path falls back to
-    # the imageio-ffmpeg binary, which bundles ffmpeg and NOT ffprobe, so an ffmpeg-only
-    # check passes on a machine where parse_ffprobe can only ever return {}.
+    # ffprobe is the half that can be missing on its own - ffmpeg.path may name a binary
+    # with no ffprobe beside it - and an ffmpeg-only check would pass on a machine where
+    # parse_ffprobe can only ever return {}. This guard predates dev/changelog/911, which
+    # removed the bundled-ffmpeg fallback that used to make that state a pip install away.
     and shutil.which('ffprobe') is not None)
 
 

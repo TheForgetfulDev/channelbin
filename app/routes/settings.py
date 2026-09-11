@@ -84,6 +84,10 @@ def settings():
             if any(path.startswith('auth.') for path, _, _ in changed):
                 from ..auth import refresh_auth
                 refresh_auth(current_app._get_current_object())
+            from ..toolchain import TOOLCHAIN_CONFIG_KEYS
+            if any(path in TOOLCHAIN_CONFIG_KEYS for path, _, _ in changed):
+                from ..toolchain import report_tool_state
+                report_tool_state(source='settings')
             if any(path == 'search.tag_id_cache_enabled' for path, _, _ in changed):
                 from ..channel_search import clear_tag_channel_ids_cache
                 clear_tag_channel_ids_cache()
@@ -295,6 +299,16 @@ def api_settings_field():
     if any(p.startswith('auth.') for p, _, _ in changed):
         from ..auth import refresh_auth
         refresh_auth(current_app._get_current_object())
+
+    # Both binary paths are read at every spawn rather than at startup, so a change takes
+    # effect live - which means the answer to "which ffmpeg is this" has to be re-probed
+    # live too, and a missing-tool alert has to be raised or cleared without waiting for a
+    # restart. Asked by the shared key list, so a third key cannot reach one of these two
+    # hooks and not the other.
+    from ..toolchain import TOOLCHAIN_CONFIG_KEYS
+    if any(p in TOOLCHAIN_CONFIG_KEYS for p, _, _ in changed):
+        from ..toolchain import report_tool_state
+        report_tool_state(source='settings')
 
     # Changing the global sync interval immediately reschedules all Default accounts
     if path == 'sync.sync_interval_hours':

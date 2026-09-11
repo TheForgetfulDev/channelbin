@@ -5,6 +5,34 @@ Notable changes to ChannelBin, newest first. This project follows
 release is tagged `v<version>` in git, and the version the app is running is shown in the
 page footer.
 
+## 0.6.0 - 2026-09-11
+
+**Added**
+
+- Maintenance has an External tools card showing which ffmpeg and ffprobe the app is actually
+  using, their versions and where each was found, plus the ffmpeg components ChannelBin relies
+  on and whether this build has them. A standing alert is raised when either tool cannot be
+  run.
+- ffprobe has its own path setting beside ffmpeg's. Left blank, it follows a configured ffmpeg
+  to the ffprobe beside it, so pointing the app at a separate ffmpeg build moves both tools
+  together. Both paths expand a leading `~`.
+
+**Changed**
+
+- ChannelBin no longer bundles an ffmpeg through pip: `ffmpeg` and `ffprobe` must both be
+  installed. The app targets the ffmpeg 7.1 series, and the Docker image fails to build rather
+  than ship a different one.
+
+**Fixed**
+
+- The Docker image could not start in any earlier release: a config write failed with a
+  permission error before the app served a request.
+- With ffmpeg present but ffprobe missing, channel tests and recordings reported the empty
+  result as a fault in the stream. They now say the tool is missing.
+- 4K channels that are not HDR were tonemapped as if they were, darkening their screenshots by
+  about a third, and HDR sources that labeled only part of their color information fell back to
+  an untonemapped screenshot.
+
 ## 0.5.1 - 2026-09-10
 
 **Added**

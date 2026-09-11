@@ -1629,6 +1629,16 @@ def test_recording_url():
 
         probe = parse_ffprobe(tmp_path)
         if not probe.get('resolution') and not probe.get('audio_codec'):
+            # Which of the two empty answers this is decides who gets blamed. Bytes did
+            # arrive - the check above proved it - so with no ffprobe on the machine the
+            # stream verdict below would be ChannelBin reporting its own missing binary as
+            # a fault in the provider's feed (dev/changelog/911).
+            from ..toolchain import ffprobe_missing
+            if ffprobe_missing():
+                return jsonify({'error': f'Connected and received {bytes_received:,} bytes, '
+                                         'but ffprobe is not installed, so the stream could '
+                                         'not be inspected. See Maintenance > External '
+                                         'tools.'}), 503
             return jsonify({'error': 'Connected, but received no usable audio/video stream.'}), 502
 
         duration = probe.get('duration') or capture_seconds

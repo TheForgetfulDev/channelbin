@@ -291,6 +291,10 @@ _DEFAULTS = {
     },
     'ffmpeg': {
         'path': 'ffmpeg',
+        # Empty means "follow ffmpeg" - the ffprobe beside an ffmpeg.path that carries a
+        # directory, else PATH. Set it only for a toolchain whose halves genuinely live
+        # apart; see describe_ffprobe_resolution().
+        'ffprobe_path': '',
         'extra_input_args': [],
         'extra_output_args': [],
         'concat_timeout_seconds': 300,
@@ -1030,13 +1034,34 @@ def _fsync_dir(directory):
         log.warning('Could not fsync %s after writing config.yaml: %s', directory, exc)
 
 
+def _write_target(path):
+    """The real file a config write must land on, with every symlink in `path` resolved.
+
+    Both writers below resolve before doing anything else, because the unresolved path
+    breaks all three of the properties they exist to provide. config.yaml is a symlink
+    wherever the app's own directory is read-only or root-owned but its data has to
+    persist elsewhere - the Docker image is the shipped instance of that, symlinking
+    /app/config.yaml onto the /config volume (dev/changelog/517).
+
+    Against that layout, writing through the symlink path means: the temp file is
+    attempted in the app root, which the unprivileged runtime user cannot write; that
+    directory is a different filesystem from the real target, so os.replace() would raise
+    EXDEV even with permission; and had the rename somehow succeeded it would have
+    replaced the SYMLINK with a regular file, silently ending config persistence at the
+    next image upgrade. Three failures out of one dirname() - dev/changelog/909."""
+    return os.path.realpath(path)
+
+
 def _config_tmp_file(dest):
     """(fd, path) for a new temp file in `dest`'s OWN directory.
 
     Same directory, deliberately, not the system temp dir: os.replace() is only atomic
-    within a single filesystem, and _CONFIG_PATH can sit anywhere (the app root in
-    production, a per-test temp dir under ConfigSandbox). A cross-filesystem replace
-    would silently degrade back into the copy-then-truncate hazard this exists to remove.
+    within a single filesystem, and config.yaml can sit anywhere (the app root in
+    production, a per-test temp dir under ConfigSandbox, another filesystem entirely when
+    the app root's copy is a symlink). Callers pass a _write_target()-resolved `dest` for
+    that last reason - "the directory the path names" and "the directory the file is in"
+    are not the same place through a symlink. A cross-filesystem replace would silently
+    degrade back into the copy-then-truncate hazard this exists to remove.
 
     mkstemp creates it 0600, so a config.yaml written for the first time is private from
     birth rather than umask-derived - it carries flask.secret_key and the auth hash."""
@@ -1072,13 +1097,14 @@ def _write_config_file(data):
     `data` may be a ruamel CommentedMap (the round-trip structure, comments preserved) or
     a plain dict. Callers must hold config_write_lock across their whole read-merge-write.
     """
-    fd, tmp_path = _config_tmp_file(_CONFIG_PATH)
+    dest = _write_target(_CONFIG_PATH)
+    fd, tmp_path = _config_tmp_file(dest)
     try:
         with os.fdopen(fd, 'w') as f:
             _yaml_rt.dump(data, f)
             f.flush()
             os.fsync(f.fileno())
-        _finish_replace(tmp_path, _CONFIG_PATH)
+        _finish_replace(tmp_path, dest)
     except BaseException:
         # A failed write must leave both the temp file and the previous config.yaml
         # exactly as they were - never a half-written file under either name.
@@ -1101,6 +1127,7 @@ def _replace_config_file_from(src, dest=None):
     Callers must hold config_write_lock."""
     if dest is None:
         dest = _CONFIG_PATH
+    dest = _write_target(dest)
     fd, tmp_path = _config_tmp_file(dest)
     try:
         # copyfileobj + copystat is what copy2 does; decomposed only so the fsync lands
@@ -1275,22 +1302,115 @@ def save_config(data):
         return record_config_changes(old, _deep_merge(copy.deepcopy(_DEFAULTS), data))
 
 
-def resolve_ffmpeg_path(configured_path: str = 'ffmpeg') -> str:
-    """Return the best available ffmpeg binary path.
+# Where a resolved binary came from - the half of the answer a bare path does not give.
+# Defined here, beside the two resolvers that produce it, and re-exported by
+# app/toolchain.py, which is what carries it to the API and the Maintenance card. There
+# were two of these until dev/changelog/914 gave ffprobe a configured path of its own and
+# with it a third way to be found.
+SOURCE_CONFIGURED = 'configured'   # an absolute/relative path the user set in Settings
+SOURCE_SIBLING = 'sibling'         # found next to a configured ffmpeg, under its directory
+SOURCE_PATH = 'path'               # found on PATH under its plain name
 
-    Priority:
-    1. configured_path if it resolves in PATH
-    2. imageio-ffmpeg bundled binary (installed with pip)
-    3. configured_path as-is (let the caller fail with a clear OS error)
+
+def resolve_ffmpeg_path(configured_path: str = 'ffmpeg') -> str:
+    """Return the ffmpeg binary path - the one place that answers "which ffmpeg".
+
+    configured_path is returned whether or not it resolves, so a caller that cannot run it
+    fails with an OS error naming the tool rather than on an empty argv[0]. A leading ~ is
+    expanded, because nothing else in the stack will: the value reaches subprocess as
+    argv[0] with no shell in between, so "~/opt/ffmpeg-7.1/bin/ffmpeg" is an ENOENT rather
+    than a path, and the settings field is exactly where a user types one.
+
+    There is deliberately no bundled fallback. Until dev/changelog/911 this reached for
+    imageio-ffmpeg's static binary when nothing was on PATH, and that fallback supplied
+    exactly half a toolchain: the package ships an ffmpeg and no ffprobe, so an install
+    without a system ffmpeg captured happily while every probe failed and returned {} -
+    no format detection, no recording health numbers, no format lock. Two further costs
+    made it a net negative rather than a partial win. Screenshots do not work on that
+    binary at all (dev/docs/BUGS.md 2026-09-08: the argv that writes a 4108-byte jpg under
+    6.1.1 exits 0 having written nothing under its bundled 7.0.2), and a resolver that
+    returns a path which exists when no real ffmpeg does defeated two test files' skip
+    guards in turn (dev/docs/BUGS.md 2026-09-08). Both binaries now come from one install
+    or neither does, and app/toolchain.py says which it is.
     """
-    import shutil
-    if shutil.which(configured_path):
-        return configured_path
-    try:
-        import imageio_ffmpeg
-        return imageio_ffmpeg.get_ffmpeg_exe()
-    except Exception:
-        return configured_path
+    return os.path.expanduser(configured_path)
+
+
+def _ffprobe_beside(configured_ffmpeg_path: str):
+    """The ffprobe sitting in the same directory as a configured ffmpeg, or None.
+
+    Only applies to a configured path that carries a directory. A bare "ffmpeg" would
+    resolve through PATH to somewhere like /usr/bin, whose ffprobe is the one PATH would
+    have found anyway - so claiming SOURCE_SIBLING for it would be a provenance that
+    describes nothing.
+
+    Existence is checked rather than assumed, so a configured ffmpeg with no ffprobe
+    beside it falls through to PATH instead of pinning the probe to a path that cannot
+    run. That fall-through is what keeps this a preference rather than a trap.
+    """
+    ffmpeg_path = os.path.expanduser((configured_ffmpeg_path or '').strip())
+    if os.sep not in ffmpeg_path:
+        return None
+    candidate = os.path.join(os.path.dirname(ffmpeg_path), 'ffprobe')
+    if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+        return candidate
+    return None
+
+
+def describe_ffprobe_resolution(configured_path=None, configured_ffmpeg_path=None):
+    """(path, source) for ffprobe - the one place that answers "which ffprobe, and why".
+
+    Three answers, in this order:
+
+      1. `ffmpeg.ffprobe_path`, when set. Returned whether or not it resolves, matching
+         resolve_ffmpeg_path's contract: a caller that cannot run it fails with an OS error
+         naming the tool rather than on an empty argv[0], and app/probe.py reads exactly
+         that error as the one probe failure that is a configuration problem rather than a
+         fact about the file.
+      2. an ffprobe beside a configured `ffmpeg.path`, which is how every real install is
+         laid out - a distro's /usr/bin, a static build's bin/. This is what makes moving
+         one setting move the whole toolchain, which is the ordinary case and the reason
+         the key above can stay empty on almost every install.
+      3. PATH, else the bare name.
+
+    Until dev/changelog/914 only the third existed, justified on the grounds that ffprobe
+    ships beside ffmpeg in every real install - true of a distro install, and false the
+    moment anyone points ffmpeg.path at a side-by-side build. The result was a SPLIT
+    toolchain: captures and conversions on the configured binary while every probe, every
+    health number, every recorded format field and every format lock was measured by
+    whatever PATH held. That is not hypothetical - it is what a 7.1.5 build at
+    ~/opt/ffmpeg-7.1/ did on the machine this app is developed on, and why dev/changelog/913
+    had to A/B by prepending PATH rather than by using the setting that exists for it.
+
+    Both values are read from config when not supplied. That is a stat() against
+    load_config()'s mtime cache, against the process spawn every caller is about to pay,
+    and no call site is inside a per-row loop - app/probe.py's three are each one probe of
+    one file. A caller that already holds a config (app/toolchain.py) passes both anyway.
+    """
+    if configured_path is None or configured_ffmpeg_path is None:
+        ffmpeg_cfg = load_config().get('ffmpeg', {})
+        if configured_path is None:
+            configured_path = ffmpeg_cfg.get('ffprobe_path', '')
+        if configured_ffmpeg_path is None:
+            configured_ffmpeg_path = ffmpeg_cfg.get('path', 'ffmpeg')
+    configured_path = (configured_path or '').strip()
+    if configured_path:
+        return os.path.expanduser(configured_path), SOURCE_CONFIGURED
+    sibling = _ffprobe_beside(configured_ffmpeg_path)
+    if sibling:
+        return sibling, SOURCE_SIBLING
+    return shutil.which('ffprobe') or 'ffprobe', SOURCE_PATH
+
+
+def resolve_ffprobe_path(configured_path=None, configured_ffmpeg_path=None) -> str:
+    """The ffprobe binary path - the sibling of resolve_ffmpeg_path above.
+
+    The path half of describe_ffprobe_resolution(), which is where the reasoning lives.
+    Two entry points rather than one with a flag, so the spawn sites in app/probe.py ask
+    for what they need (a path) and app/toolchain.py asks for what it needs (a path and
+    the provenance it reports), and neither re-derives the other's answer.
+    """
+    return describe_ffprobe_resolution(configured_path, configured_ffmpeg_path)[0]
 
 
 def parse_tristate_bool(val: str):

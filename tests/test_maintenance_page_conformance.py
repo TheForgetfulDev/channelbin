@@ -55,14 +55,18 @@ class MaintenancePageConformanceTests(unittest.TestCase):
         self.assertIn('Maintenance', h1s[0])
 
     def test_the_cards_render_in_the_approved_order(self):
-        """DESIGN.md 16.1: Storage, Index, Backup, Service, plus the support bundle.
+        """DESIGN.md 16.1: Storage, Index, Backup, Service, plus two later cards.
 
         The bundle is its own card between Backup and Service rather than a row
         inside Backup - it is neither a backup nor a restore, and inside that card
         it sat between two rows of backup prose (dev/changelog/841).
+
+        External tools sits second, with Storage, on 16.1's own read-then-act split:
+        it is a readout with no controls (dev/changelog/910).
         """
         self.assertEqual(re.findall(r'<div class="card" id="(m-[a-z]+)"', self.html),
-                         ['m-storage', 'm-index', 'm-backup', 'm-bundle', 'm-service'])
+                         ['m-storage', 'm-tools', 'm-index', 'm-backup', 'm-bundle',
+                          'm-service'])
 
     def test_the_return_to_settings_is_a_back_link(self):
         """DESIGN.md 4/16.1: a back link above the h1, never a forward jump-off."""

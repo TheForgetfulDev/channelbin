@@ -418,8 +418,11 @@
 
     {% call section('ffmpeg', 'FFmpeg') %}
       {{ field_text('ffmpeg.path', 'ffmpeg binary path',
-         'Path to the ffmpeg executable. Uses system PATH if just "ffmpeg".',
+         'Path to the ffmpeg executable. Uses system PATH if just "ffmpeg". A leading ~ is expanded.',
          'ffmpeg', ff.get('path', 'ffmpeg')) }}
+      {{ field_text('ffmpeg.ffprobe_path', 'ffprobe binary path',
+         'Path to the ffprobe executable, used for every format and health measurement. Leave blank to follow ffmpeg: the ffprobe beside the path above, or system PATH. Set it only when the two live apart.',
+         'follow ffmpeg', ff.get('ffprobe_path', '')) }}
       {{ field_list('ffmpeg.extra_input_args', 'Extra input arguments',
          'Extra ffmpeg arguments inserted before -i, one per line. E.g. -timeout on its own line, then 5000000 on the next.',
          '(empty)', ff.get('extra_input_args', [])) }}
