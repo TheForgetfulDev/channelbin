@@ -23,6 +23,7 @@ from typing import List, Optional
 
 from . import admission
 from .proc_utils import GrowthMonitor, terminate_or_kill, wait_for_file_data
+from .toolchain import ffprobe_missing
 from .url_utils import mask_creds, mask_creds_in_text
 
 log = logging.getLogger(__name__)
@@ -364,6 +365,23 @@ _WARN_FRACTION = 0.8
 # requested length, close enough that container rounding alone could spend a -10 warn penalty.
 # A shortfall under half a second is not a finding at any duration.
 _SHORT_GRACE_SECONDS = 0.5
+
+
+def empty_probe_warning() -> str:
+    """The WARN line for a test whose probe reported no video stream.
+
+    A test log is the only surface that explains that test's numbers, so it must not
+    report ChannelBin's own missing binary as a fault in the channel. parse_ffprobe()
+    returns {} for both, and this test used to render the stream verdict unconditionally
+    (dev/changelog/911). Every measured field is None in the missing-ffprobe state and
+    none of them is evidence about the feed, which is why the two lines say opposite
+    things about what was learned rather than differing in wording.
+    """
+    if ffprobe_missing():
+        return ('ffprobe is not installed, so this test could not inspect the stream - '
+                'no resolution, frame or track data was measured. See Maintenance > '
+                'External tools.')
+    return 'ffprobe found no video stream in recording'
 
 
 def short_capture_verdict(actual: float, requested: float):
@@ -1490,7 +1508,7 @@ def _run_channel_test_inner(app, channel_id: int, job_id: Optional[int] = None):
                         frame_str = f'  |  frames: {frame_count:,}/{int(expected_frames):,} ({frame_pct:.1f}%)' if frame_pct is not None else ''
                         _append_log('INFO', f'Video: {resolution} @ {fps_str}  |  bitrate: {bitrate_kbps:.0f} kbps  |  duration: {dur_str}{frame_str}')
                     else:
-                        _append_log('WARN', 'ffprobe found no video stream in recording')
+                        _append_log('WARN', empty_probe_warning())
                     if probe.get('audio_codec'):
                         ach = probe.get('audio_channels') or 0
                         asr = probe.get('audio_sample_rate') or 0

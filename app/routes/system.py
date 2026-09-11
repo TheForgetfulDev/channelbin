@@ -209,6 +209,23 @@ def system_stats():
     return jsonify(**_system_stats_dict())
 
 
+@system_bp.route('/api/system/tools')
+def system_tools():
+    """The resolved ffmpeg/ffprobe and what that ffmpeg build includes, for the Maintenance
+    page's External tools card.
+
+    Deliberately its own endpoint rather than a few more keys on /api/system/stats above:
+    that one is polled every 15 seconds by every open browser tab, and answering this
+    question costs four process spawns. app/toolchain.py caches them process-wide, so this
+    route is a dict read after the first call - but hanging it off a poll would still be
+    writing down "spawn ffmpeg on a timer" as the design.
+    """
+    from ..toolchain import describe_capabilities, describe_tools, missing_tools
+    tools = describe_tools()
+    return jsonify(tools=tools, missing=missing_tools(tools),
+                   capabilities=describe_capabilities(tools['ffmpeg']))
+
+
 @system_bp.route('/api/system/storage-details')
 def storage_details():
     cfg = load_config()

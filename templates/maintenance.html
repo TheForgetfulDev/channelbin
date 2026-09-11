@@ -130,7 +130,13 @@
    Backup, Service - the two you read first, then the two you act on. The
    support bundle is a fifth card between Backup and Service: it is neither a
    backup nor a restore, and sitting inside that card put it between two rows
-   of backup prose that read as if they described it (dev/changelog/841). #}
+   of backup prose that read as if they described it (dev/changelog/841).
+
+   External tools is a sixth card, second, and the placement follows that same
+   read-then-act split: it is a diagnostic readout with no controls, so it
+   belongs beside Storage rather than down among the things that do something.
+   It exists because "which ffmpeg is this install running" had four possible
+   answers and no surface at all (dev/changelog/910). #}
 
 <div class="card" id="m-storage">
   <div class="card-head">
@@ -141,6 +147,13 @@
   </div>
   <div class="card-body">
     <div id="storage-details-content"><div class="mrow"><span class="grow">Loading...</span></div></div>
+  </div>
+</div>
+
+<div class="card" id="m-tools">
+  <div class="card-head"><h2>External tools</h2></div>
+  <div class="card-body">
+    <div id="tools-content"><div class="mrow"><span class="grow">Loading...</span></div></div>
   </div>
 </div>
 

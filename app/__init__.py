@@ -219,6 +219,15 @@ def create_app(config_overrides=None, start_scheduler=True):
         # loud at startup and not only after the next settings save.
         from .auth import report_gate_state
         report_gate_state(auth_cfg, source='startup')
+        # Which ffmpeg/ffprobe this install actually resolved, said out loud once per
+        # process. Deliberately NOT a startup refusal when one is missing
+        # (dev/changelog/910): the app still boots, and the warning goes to the UI rather
+        # than to a log nobody is reading. Two subprocess spawns, cached process-wide for
+        # the life of the process, so this is paid once and never per request.
+        from .toolchain import report_tool_state
+        report_tool_state(source='startup',
+                          configured_ffmpeg_path=cfg['ffmpeg'].get('path', 'ffmpeg'),
+                          configured_ffprobe_path=cfg['ffmpeg'].get('ffprobe_path', ''))
 
     from .routes import register_blueprints
     register_blueprints(app)

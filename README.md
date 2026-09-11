@@ -184,7 +184,17 @@ brings the app back** - without a restart policy the container simply stops.
 
 ### Running it directly
 
-Python 3.12 and ffmpeg.
+Python 3.12 and ffmpeg. Both `ffmpeg` and `ffprobe` are required and are installed together
+by the command below - ChannelBin bundles neither, and Maintenance > External tools reports
+which ones it resolved.
+
+**ChannelBin targets ffmpeg 7.1.** That is what the container ships, what Debian 13 provides,
+and the one series the test suite runs against in CI - on the full suite and on real captures,
+conversions, probes, health checks and screenshots up to 4K HEVC 10-bit. Other series are
+untested rather than known-bad, and one of them is common: Ubuntu 24.04's `apt` gives you 6.1,
+which measured identical when it was checked but is no longer exercised by anything. If your
+ffmpeg is not 7.1 and something misbehaves, the version on Maintenance > External tools is the
+first thing to report.
 
 ```bash
 sudo apt install ffmpeg

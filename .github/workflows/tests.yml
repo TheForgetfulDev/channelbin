@@ -4,18 +4,81 @@ on:
   push:
   pull_request:
 
+# The exact ffmpeg this suite runs against, pinned by URL and by the digest GitHub reports
+# for that asset. ChannelBin targets one series (README.md, and the Dockerfile's
+# FFMPEG_SERIES pin, which tests/test_static_invariants.py holds equal to the value below),
+# and no runner image's apt can supply it: ubuntu-24.04 carries 6.1.1 and ubuntu-26.04
+# carries 8.0.1. Taking whichever one a distro chose is how CI spent its first weeks green
+# over a series nothing ships. This is the build dev/changelog/913 verified the app against,
+# down to the commit.
+#
+# Moving to a new series means changing all three of these together with the Dockerfile's
+# FFMPEG_SERIES, and only after the app has been measured on the new build the way 913
+# measured this one. BtbN keeps dated autobuilds for about two years; when this URL
+# eventually 404s the download step fails loudly, which is the intended failure mode.
+env:
+  FFMPEG_SERIES: "7.1"
+  FFMPEG_URL: "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-07-31-14-10/ffmpeg-n7.1.5-12-g1fdbca85aa-linux64-gpl-7.1.tar.xz"
+  FFMPEG_SHA256: "c1e6caf48923dd8e6bc5e54d51ba70c321175b8162ae9c414c392990e72f0e79"
+
 jobs:
   run_tests:
-    runs-on: ubuntu-latest
+    # Pinned, never ubuntu-latest. ffmpeg no longer rides on this choice (it is pinned
+    # above), but everything else under the suite still does - the apt packages, the glibc
+    # the pinned build runs against, the preinstalled tooling. Letting ubuntu-latest roll to
+    # a newer image would change all of that with no commit and no notice.
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
 
-      - name: Install dependencies
+      # Pinned for the same reason as the runner: the jsdom suite is only as reproducible as
+      # the node under it, and the image's default node moves on its own schedule.
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+          cache: npm
+
+      # Without ffmpeg and ffprobe, every test that spawns one skips itself and the run still
+      # reports green over a smaller suite than the one that runs locally.
+      - name: Install ffmpeg
+        run: |
+          set -euo pipefail
+          curl -fsSL -o "$RUNNER_TEMP/ffmpeg.tar.xz" "$FFMPEG_URL"
+          echo "$FFMPEG_SHA256  $RUNNER_TEMP/ffmpeg.tar.xz" | sha256sum -c -
+          mkdir -p "$HOME/.local/bin"
+          tar -xJf "$RUNNER_TEMP/ffmpeg.tar.xz" --strip-components=2 \
+              -C "$HOME/.local/bin" --wildcards '*/bin/ffmpeg' '*/bin/ffprobe'
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      # Say out loud which external tools this run actually measured, and stop here if the
+      # ffmpeg on PATH is not the series this workflow pinned - the same check, for the same
+      # reason, as the one the Dockerfile runs after its apt install. A substituted capture
+      # engine should fail in one legible line, not as whatever it does to a test 200 files
+      # later. The static build banners its version as `n7.1.5-...`, an apt one as `7.1.5`.
+      - name: Verify external tool versions
+        run: |
+          set -euo pipefail
+          for bin in ffmpeg ffprobe; do
+            version="$("$bin" -version | head -1 | awk '{print $3}')"
+            echo "channelbin: $bin $version"
+            case "$version" in
+              "${FFMPEG_SERIES}."*|"n${FFMPEG_SERIES}."*) ;;
+              *) echo "::error::expected $bin ${FFMPEG_SERIES}.x, got '$version'"; exit 1 ;;
+            esac
+          done
+          node --version
+          npm --version
+
+      - name: Install Python dependencies
         run: pip install -r requirements.txt
+
+      # jsdom lives in devDependencies; without node_modules the client-side tests skip.
+      - name: Install Node dependencies
+        run: npm ci
 
       - name: Run test suite
         run: ./run_tests.sh

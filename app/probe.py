@@ -4,12 +4,59 @@ import logging
 import os
 import queue
 import re
-import shutil
 import subprocess
 import threading
 import time
 
+from .config import resolve_ffprobe_path
+
 log = logging.getLogger(__name__)
+
+# Latched, so a machine with no ffprobe pays for the report once rather than on every
+# probe: every capture segment, every health check and every conversion reaches one of the
+# three spawn sites below, and re-running the toolchain probe (two process spawns) for each
+# of them would turn a configuration error into a performance one.
+_missing_lock = threading.Lock()
+_missing_reported = False
+
+
+def _report_ffprobe_unusable(ffprobe_path: str, exc: OSError, context: str) -> None:
+    """Record that ffprobe itself could not be RUN.
+
+    This is the one probe failure that is a configuration error rather than a fact about
+    the file, and keeping the two apart is the whole point of it having a function. Every
+    other failure below - a non-zero exit, unparseable JSON, no video stream - describes
+    what was probed, and {} is a correct answer for it. A spawn that fails on argv[0]
+    describes this machine: ffprobe is absent, or is there and not executable. Until
+    dev/changelog/911 both arrived as the same empty dict, and three surfaces rendered a
+    verdict off it that blamed a provider's stream for ChannelBin's own install.
+
+    Conclusive rather than inferred, per CLAUDE.md's "already done is a fact you recorded":
+    the OSError is proof that the binary at that path could not be executed just now, so
+    this never has to consult a cache that might predate the tool being removed. It resets
+    that cache instead, which is what lets the standing alert appear for an ffprobe that
+    went missing AFTER startup - toolchain.report_tool_state() otherwise only ever runs at
+    create_app() and on a settings save.
+
+    Never raises. It runs inside the exception handling of a probe that has already failed,
+    and a diagnostic that can mask the failure it is describing is worse than no diagnostic.
+    """
+    global _missing_reported
+    with _missing_lock:
+        if _missing_reported:
+            return
+        _missing_reported = True
+    try:
+        from . import toolchain
+        log.warning(
+            'Could not run ffprobe (looked for it at: %s): %s. %s Probe requested by: %s',
+            ffprobe_path, exc, toolchain._CONSEQUENCE['ffprobe'], context)
+        # Outside the latch lock: this spawns two processes, and holding a module lock
+        # across them would serialize every thread that hits the same failure.
+        toolchain.reset_cache()
+        toolchain.report_tool_state(f'a probe of {context}')
+    except Exception:
+        log.exception('Could not report the missing ffprobe')
 
 
 def _bytes_read(pid: int):
@@ -201,7 +248,8 @@ def parse_ffprobe(filepath: str, count_packets: bool = True, timeout: int = 60,
     """Return dict with video/audio stream metadata and format info.
 
     Keys: resolution, fps, duration, bitrate_bps, frame_count, vid_width,
-          vid_height, color_transfer, color_primaries, video_codec, pix_fmt, bit_depth,
+          vid_height, color_transfer, color_primaries, color_space, color_range,
+          video_codec, pix_fmt, bit_depth,
           chroma_subsampling, interlaced, coded_resolution, is_vfr, audio_codec,
           audio_channels, audio_sample_rate, audio_bitrate_kbps, audio_language,
           video_tracks, audio_tracks.
@@ -224,7 +272,7 @@ def parse_ffprobe(filepath: str, count_packets: bool = True, timeout: int = 60,
     and a 19 GB capture; it is bounded by `stall_timeout` instead - seconds of no reading
     at all - with `timeout` left as the fallback for when /proc offers no progress signal.
     """
-    ffprobe_path = shutil.which('ffprobe') or 'ffprobe'
+    ffprobe_path = resolve_ffprobe_path()
     cmd = [
         ffprobe_path,
         '-v', 'quiet',
@@ -238,12 +286,21 @@ def parse_ffprobe(filepath: str, count_packets: bool = True, timeout: int = 60,
         filepath,
     ]
     try:
-        if count_packets:
-            returncode, stdout = run_probe_until_stalled(
-                cmd, stall_timeout=stall_timeout, fallback_timeout=timeout)
-        else:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-            returncode, stdout = result.returncode, result.stdout
+        # Nested deliberately, and only around the spawn: an OSError from these two lines
+        # is the binary failing to execute, which is a fact about this machine, while
+        # everything after them can only fail over what was probed. Catching both in one
+        # handler is what let "there is no ffprobe here" arrive as the same empty dict as
+        # "this file has no video stream" (dev/changelog/911).
+        try:
+            if count_packets:
+                returncode, stdout = run_probe_until_stalled(
+                    cmd, stall_timeout=stall_timeout, fallback_timeout=timeout)
+            else:
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+                returncode, stdout = result.returncode, result.stdout
+        except OSError as exc:
+            _report_ffprobe_unusable(ffprobe_path, exc, os.path.basename(filepath))
+            return {}
         if returncode != 0:
             return {}
         data = json.loads(stdout)
@@ -254,6 +311,8 @@ def parse_ffprobe(filepath: str, count_packets: bool = True, timeout: int = 60,
         vid_height = None
         color_transfer = None
         color_primaries = None
+        color_space = None
+        color_range = None
         video_codec = None
         pix_fmt = None
         bit_depth = None
@@ -289,6 +348,14 @@ def parse_ffprobe(filepath: str, count_packets: bool = True, timeout: int = 60,
                 vid_height = h
                 color_transfer = stream.get('color_transfer')
                 color_primaries = stream.get('color_primaries')
+                # The matrix and range halves of the same answer. zscale needs all four
+                # before it will build a conversion path, and refuses the whole filter
+                # graph when any one is missing (screenshot.py::hdr_input_params,
+                # dev/changelog/915). ffprobe prints 'unknown' rather than omitting the
+                # key when a stream states nothing, so a caller reading these has to
+                # treat that string as absent.
+                color_space = stream.get('color_space')
+                color_range = stream.get('color_range')
 
                 video_codec = stream.get('codec_name')
                 pix_fmt = stream.get('pix_fmt')
@@ -387,6 +454,8 @@ def parse_ffprobe(filepath: str, count_packets: bool = True, timeout: int = 60,
             'vid_height': vid_height,
             'color_transfer': color_transfer,
             'color_primaries': color_primaries,
+            'color_space': color_space,
+            'color_range': color_range,
             'video_codec': video_codec,
             'pix_fmt': pix_fmt,
             'bit_depth': bit_depth,
@@ -412,11 +481,17 @@ def nominal_video_rate(filepath: str, timeout: int = 60):
     """Nominal video frame rate as ffprobe's raw r_frame_rate rational ('60000/1001'),
     or None. r_frame_rate, not avg_frame_rate - avg is skewed low by timeline gaps in
     damaged captures, which is exactly when callers need the true rate."""
-    ffprobe_path = shutil.which('ffprobe') or 'ffprobe'
+    ffprobe_path = resolve_ffprobe_path()
     try:
         cmd = [ffprobe_path, '-v', 'quiet', '-print_format', 'json',
                '-select_streams', 'v:0', '-show_streams', filepath]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        except OSError as exc:
+            # See parse_ffprobe: a spawn that fails on argv[0] is this machine's problem,
+            # not the file's, and must not be reported as "no nominal rate".
+            _report_ffprobe_unusable(ffprobe_path, exc, os.path.basename(filepath))
+            return None
         if result.returncode != 0:
             return None
         streams = json.loads(result.stdout).get('streams', [])
@@ -532,13 +607,20 @@ def scan_video_timeline(filepath: str, gap_threshold: float = 0.25, timeout: int
     """
     if not filepath or not os.path.exists(filepath):
         return {}
-    ffprobe_path = shutil.which('ffprobe') or 'ffprobe'
+    ffprobe_path = resolve_ffprobe_path()
     try:
         fps = _nominal_fps(filepath)
 
         cmd = [ffprobe_path, '-v', 'error', '-select_streams', 'v:0',
                '-show_entries', 'packet=pts_time,dts_time', '-of', 'csv=p=0', filepath]
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+        try:
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                    stderr=subprocess.DEVNULL, text=True)
+        except OSError as exc:
+            # See parse_ffprobe: this is the binary failing to execute, not a file with no
+            # measurable timeline, and the two must not share one empty answer.
+            _report_ffprobe_unusable(ffprobe_path, exc, os.path.basename(filepath))
+            return {}
         low = None
         highwater = None
         count = 0

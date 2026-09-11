@@ -115,7 +115,11 @@ watchdog:
   stall_move_window_minutes: 30
 
 ffmpeg:
-  path: ffmpeg                          # binary name or absolute path
+  path: ffmpeg                          # binary name or absolute path (a leading ~ is expanded)
+  # Blank follows ffmpeg: the ffprobe sitting beside the path above when that path carries a
+  # directory, else system PATH. Set it only for a toolchain whose halves live apart - both
+  # binaries measure the same streams, and a mixed pair can disagree about what one is.
+  ffprobe_path: ''
   extra_input_args: []                  # e.g. ['-timeout', '5000000']
   extra_output_args: []
   concat_timeout_seconds: 300

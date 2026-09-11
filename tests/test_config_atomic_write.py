@@ -8,9 +8,11 @@ the user out. save_config() also had no lock around its read-merge-write, so two
 flight (settings.js auto-saves per field, against a threaded server) each merged onto the
 same stale base and the loser's change vanished with no error anywhere.
 
-The temp file must be created in config.yaml's own directory: os.replace() is only atomic
-within one filesystem, and _CONFIG_PATH is the repo root in production but a per-test temp
-dir under ConfigSandbox.
+The temp file must be created in the directory holding the real config.yaml: os.replace()
+is only atomic within one filesystem, and that file is the repo root's in production, a
+per-test temp dir under ConfigSandbox, and - in the Docker image - the target of a symlink
+on another filesystem entirely. SymlinkedConfigWriteTests below covers that last case,
+which took the shipped container down for three weeks (dev/changelog/909).
 """
 import contextlib
 import os
@@ -24,7 +26,7 @@ import yaml
 
 from app import config as cfgmod
 from app import config_backup as cbmod
-from tests.support.app import make_test_app
+from tests.support.app import make_test_app, write_sandbox_config
 from tests.support.config_sandbox import ConfigSandbox
 
 
@@ -362,6 +364,108 @@ class RestoreAtomicityTests(ConfigSandbox):
         litter = [n for n in os.listdir(os.path.dirname(self._cfg_path))
                   if n.startswith('.config.yaml.')]
         self.assertEqual(litter, [], 'temp file left behind by a failed restore')
+
+
+class SymlinkedConfigWriteTests(unittest.TestCase):
+    """A config.yaml reached through a symlink is written where the symlink POINTS.
+
+    Guards dev/docs/BUGS.md 2026-09-10 @ 12:14 PM: both writers derived their temp
+    directory from os.path.dirname(_CONFIG_PATH), i.e. the directory the symlink lives in
+    rather than the one holding the real file. The Docker image is exactly that layout -
+    /app/config.yaml is a symlink onto the /config volume - so create_app()'s
+    migrate_config() raised PermissionError writing /app/.config.yaml.*.tmp as the
+    unprivileged runtime user, and the container crashed at import without ever serving a
+    request. It failed DURING the migration write, so the migration never landed and every
+    restart repeated it.
+
+    Two failures hide behind that first one, which is why realpath() rather than a
+    permission fix: the two directories are different filesystems in the image, so
+    os.replace() would raise EXDEV even with permission, and a rename that did land would
+    replace the symlink itself with a regular file, ending config persistence at the next
+    image upgrade.
+    """
+
+    def setUp(self):
+        self._base = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self._base, True)
+        # Named for what they stand in for: /app is the image layer holding the symlink,
+        # /config is the volume holding the real file.
+        self._approot = os.path.join(self._base, 'app')
+        self._volume = os.path.join(self._base, 'config')
+        os.mkdir(self._approot)
+        os.mkdir(self._volume)
+        self._real = os.path.join(self._volume, 'config.yaml')
+        self._link = os.path.join(self._approot, 'config.yaml')
+        write_sandbox_config(self._real, {'flask': {'secret_key': 'seeded'}, **_stamp()})
+        os.symlink(self._real, self._link)
+
+        patch = mock.patch.object(cfgmod, '_CONFIG_PATH', self._link)
+        patch.start()
+        self.addCleanup(patch.stop)
+        cfgmod._yaml_cache = None
+        self.addCleanup(lambda: setattr(cfgmod, '_yaml_cache', None))
+
+    def _litter(self, directory):
+        return [n for n in os.listdir(directory) if n.startswith('.config.yaml.')]
+
+    def test_the_temp_file_lands_beside_the_real_file_not_beside_the_symlink(self):
+        """os.replace() is atomic only within one filesystem, and the symlink's own
+        directory is not guaranteed to be the target's - in the image it is a read-only
+        layer on a different filesystem entirely."""
+        captured = {}
+        real_mkstemp = tempfile.mkstemp
+
+        def spy(*a, **kw):
+            captured.update(kw)
+            return real_mkstemp(*a, **kw)
+
+        with mock.patch.object(tempfile, 'mkstemp', side_effect=spy):
+            cfgmod.save_config({'flask': {'secret_key': 'written'}, **_stamp()})
+
+        self.assertEqual(captured.get('dir'), self._volume)
+        self.assertEqual(self._litter(self._volume), [])
+        self.assertEqual(self._litter(self._approot), [])
+
+    def test_a_save_leaves_the_symlink_a_symlink(self):
+        """Replacing the link with a regular file would silently end config persistence:
+        the volume keeps the stale file and the container's writes live in a layer that
+        is discarded at the next image upgrade."""
+        cfgmod.save_config({'flask': {'secret_key': 'written'}, **_stamp()})
+
+        self.assertTrue(os.path.islink(self._link),
+                        'the write replaced the symlink with a regular file')
+        self.assertEqual(os.readlink(self._link), self._real)
+        with open(self._real) as f:  # direct-config-read: asserting on stored bytes
+            self.assertIn('written', f.read())
+
+    def test_a_save_succeeds_when_the_symlinks_own_directory_is_read_only(self):
+        """The container's actual symptom: /app is root-owned and the app runs as
+        PUID/PGID 1000, so a temp file resolved to the symlink's directory raises
+        PermissionError before create_app() ever returns."""
+        if os.geteuid() == 0:
+            self.skipTest('root ignores directory permissions, so this proves nothing')
+        os.chmod(self._approot, 0o555)
+        self.addCleanup(os.chmod, self._approot, 0o755)
+
+        cfgmod.save_config({'flask': {'secret_key': 'written'}, **_stamp()})
+
+        cfgmod._yaml_cache = None
+        self.assertEqual(cfgmod.load_config()['flask']['secret_key'], 'written')
+
+    def test_a_restore_through_a_symlink_lands_on_the_real_file(self):
+        """_replace_config_file_from() is the other writer and had the identical bug -
+        a config backup restored inside the container would have hit the same wall."""
+        backup = os.path.join(self._base, 'a-backup.yaml')
+        with open(backup, 'w') as f:
+            yaml.dump({'flask': {'secret_key': 'from-backup'}, **_stamp()}, f)
+
+        with cfgmod.config_write_lock:
+            cfgmod._replace_config_file_from(backup)
+
+        self.assertTrue(os.path.islink(self._link))
+        cfgmod._yaml_cache = None
+        self.assertEqual(cfgmod.load_config()['flask']['secret_key'], 'from-backup')
+        self.assertEqual(self._litter(self._approot), [])
 
 
 if __name__ == '__main__':

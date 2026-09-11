@@ -10,7 +10,27 @@
 # than patched in code. Everything else that persists (database.path, the two backup
 # dirs, dvr_output_dir) is a config value, set in docker/config.docker.yaml.
 
-FROM python:3.12-slim
+# Pinned to a named Debian release, never the floating `python:3.12-slim`. The two resolve to
+# the same image today, but the floating tag follows whatever Debian release it currently
+# tracks - and that float is how this image's ffmpeg went from 5.1 to 7.1.5 with no Dockerfile
+# edit and nothing noticing, the day Debian 13 went stable. The Debian release is what decides
+# the ffmpeg series, so moving this tag IS an ffmpeg upgrade: change it only together with
+# FFMPEG_SERIES below, and only once the app has been verified against the new series.
+#
+# 7.1 has been through that verification (dev/changelog/913): the full suite, plus real
+# captures, conversions, concatenation, probes, health checks and screenshots up to 4K HEVC
+# 10-bit, measured against 6.1.1 side by side. The pin below is a verified target, not a
+# placeholder for whatever the base image happened to carry.
+FROM python:3.12-slim-trixie
+
+# The ffmpeg series this image is built against, asserted after the install below. Debian
+# carries exactly one ffmpeg version per release and its mirrors serve only the current build,
+# so an exact `ffmpeg=7:7.1.5-0+deb13u1` apt pin would fail the build the day Debian publishes
+# a security update - it would turn every CVE backport into a broken image. Asserting the
+# series instead lets in-release patches (7.1.5 -> 7.1.6) through while a series or major move
+# fails the build loudly rather than shipping a substituted capture engine. Also the one value
+# a container smoke test reads to know which ffmpeg the image is supposed to contain.
+ARG FFMPEG_SERIES=7.1
 
 # ffmpeg: the capture/convert engine. tini: PID 1, so ffmpeg grandchildren are reaped and
 # SIGTERM reaches the app (run.py's handler kills live captures before exiting). gosu: drops
@@ -18,13 +38,29 @@ FROM python:3.12-slim
 # if an operator execs in and runs it manually - the in-app Restart button does not shell out
 # to it in a container (see docker/entrypoint.sh, app/routes/settings.py::api_restart_now).
 # tzdata: zoneinfo data for display.timezone.
+#
+# The version check covers ffprobe as well as ffmpeg because the app needs both and a missing
+# ffprobe is silent at runtime - every probe returns an empty dict. An absent binary reports an
+# empty version here and fails the same case arm as a wrong one.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ffmpeg \
         gosu \
         procps \
         tini \
         tzdata \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && for bin in ffmpeg ffprobe; do \
+           version="$("$bin" -version 2>/dev/null | head -1 | awk '{print $3}')"; \
+           echo "channelbin: $bin $version"; \
+           case "$version" in \
+               "${FFMPEG_SERIES}."*) ;; \
+               *) echo "channelbin: expected $bin ${FFMPEG_SERIES}.x, got '$version'. The base" \
+                       "image's ffmpeg moved series (or ffprobe is absent). Verify the app" \
+                       "against the new build, then update the FROM tag and FFMPEG_SERIES" \
+                       "together." >&2; \
+                  exit 1 ;; \
+           esac; \
+       done
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
