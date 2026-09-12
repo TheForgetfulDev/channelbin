@@ -425,6 +425,27 @@ class WindowCloseTests(unittest.TestCase):
         self.assertIn('Locals HD', body)
         self.assertIn('Never started', body)
 
+    def test_a_clean_window_clears_an_earlier_windows_warning(self):
+        """dev/changelog/930: window_close returns early when nothing was stopped and
+        nothing was left unstarted. Returning was all it did, so the previous window's
+        warning stayed open indefinitely - describing leftover work that had since been
+        done. A window that drains clean is exactly the evidence that clears it."""
+        stale = Alert(alert_type='HEALTH_CHECK_WINDOW', severity='WARN',
+                      title='Maintenance window closed with work left over',
+                      source='check_window')
+        db.session.add(stale)
+        db.session.commit()
+        stale_id = stale.id
+
+        with _patch_cfg():
+            check_window.window_close(self.t.app)
+
+        db.session.expire_all()
+        self.assertIsNotNone(
+            db.session.get(Alert, stale_id).dismissed_at,
+            'a window that stopped nothing and left nothing unstarted must clear the '
+            'standing leftover-work warning')
+
     def test_does_not_double_emit_for_one_occurrence(self):
         seed.make_test_job(name='Locals HD', channels=[self.channel], status='SCHEDULED',
                            recurring=True, recur_use_window=True, recur_day=0)

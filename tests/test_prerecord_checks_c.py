@@ -12,8 +12,10 @@ Covers, in order:
     removes it (needs the real jobstore).
   - DisabledTests: disabled config (global, or a profile override) is a silent no-op -
     run_channel_test is never called and nothing is logged.
-  - MarginGuardTests: not enough time before start_time skips observably
-    (PRE_CHECK_SKIPPED event + JOB_SKIPPED alert), without ever calling run_channel_test.
+  - MarginGuardTests: not enough time before start_time skips observably (a
+    PRE_CHECK_SKIPPED event on the recording), without ever calling run_channel_test.
+    Every skip path also raised a JOB_SKIPPED alert until dev/changelog/928 - a skipped
+    pre-check is a fact about its recording, so the event on the recording is the surface.
   - BusyRetryTests: tester busy with another run re-registers one collapsing retry job
     when the retry would still clear the margin guard, else skips observably.
   - ChannelResolutionTests: group-backed recording resolves to the member record-start
@@ -71,6 +73,8 @@ def _skipped_events(recording_id):
 
 
 def _job_skipped_alerts(source):
+    """Always empty since dev/changelog/928 - kept so each skip path can assert that a skip
+    is recorded on its recording and nowhere else."""
     return Alert.query.filter_by(alert_type='JOB_SKIPPED', source=source).all()
 
 
@@ -178,9 +182,8 @@ class MarginGuardTests(unittest.TestCase):
         spy.assert_not_called()
         events = _skipped_events(rec.id)
         self.assertEqual(len(events), 1)
-        alerts = _job_skipped_alerts(f'precheck_{rec.id}')
-        self.assertEqual(len(alerts), 1)
-        self.assertEqual(alerts[0].recording_id, rec.id)
+        self.assertEqual(_job_skipped_alerts(f'precheck_{rec.id}'), [],
+                         'the skip is recorded on the recording, not raised as an alert')
 
 
 class BusyRetryTests(unittest.TestCase):
@@ -250,7 +253,7 @@ class BusyRetryTests(unittest.TestCase):
 
         spy.assert_not_called()
         self.assertEqual(len(_skipped_events(rec.id)), 1)
-        self.assertEqual(len(_job_skipped_alerts(f'precheck_{rec.id}')), 1)
+        self.assertEqual(_job_skipped_alerts(f'precheck_{rec.id}'), [])
 
     def test_zero_retry_minutes_skips_with_no_retry_job(self):
         rec = seed.make_recording(
@@ -370,13 +373,13 @@ class OutcomeTests(unittest.TestCase):
         self.assertEqual(len(_skipped_events(self.rec.id)), 1)
         self.assertEqual(
             RecordingEvent.query.filter_by(recording_id=self.rec.id, event_type=PRE_CHECK_FAILED).count(), 0)
-        self.assertEqual(len(_job_skipped_alerts(f'precheck_{self.rec.id}')), 1)
+        self.assertEqual(_job_skipped_alerts(f'precheck_{self.rec.id}'), [])
 
     def test_no_slot_available_is_a_skip(self):
         self._run(None)
 
         self.assertEqual(len(_skipped_events(self.rec.id)), 1)
-        self.assertEqual(len(_job_skipped_alerts(f'precheck_{self.rec.id}')), 1)
+        self.assertEqual(_job_skipped_alerts(f'precheck_{self.rec.id}'), [])
 
 
 class ProfileOverrideTests(unittest.TestCase):

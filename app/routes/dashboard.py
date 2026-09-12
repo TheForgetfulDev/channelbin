@@ -17,7 +17,7 @@ from ..database import (
 )
 from .. import events as ev
 from ..tz_utils import UTC, to_naive_utc, format_local, relative
-from ..accounts import get_sync_progress
+from ..accounts import get_sync_progress, sync_signature
 from .channel_tests import get_active_run_summary
 from .recordings import _STATUS_ROW
 
@@ -717,6 +717,9 @@ def nav_status():
 
     Replaces what used to be 3 separate polling loops in base.html with a single
     endpoint polled at `display.nav_poll_interval_seconds`.
+
+    `account_sync` is `accounts.sync_signature()`, which /accounts compares against the one
+    its rows were rendered at to know when to re-render itself.
     """
     from .system import _system_stats_dict
     from .alerts import _unread_alert_summary
@@ -725,6 +728,7 @@ def nav_status():
         alerts=_unread_alert_summary(),
         activity=_activity_status_dict(),
         search=_search_readiness_dict(),
+        account_sync=sync_signature(),
     )
 
 

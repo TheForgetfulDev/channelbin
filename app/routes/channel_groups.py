@@ -32,12 +32,12 @@ from ..channel_groups import (
     member_channels, recording_members, test_member_ids, pick_best_member,
     participation_is_recording, participating_member_ids, group_manages_format,
     PARTICIPATION_FIELDS, set_participation, format_eligible_members,
-    set_warning_muted,
+    pinned_format_offenders, set_warning_muted,
     guide_invariant_check, demote_group_from_guide, log_guide_change,
     group_scheduled_recordings,
     group_live_recordings, cancel_scheduled_recordings,
     deregister_cancelled_recordings,
-    report_orphaned_guide_groups,
+    report_orphaned_guide_groups, resolve_broken_guide_row,
     evaluate_and_reconcile_group, check_target_channels, teardown_test_job,
     apply_lock_and_log, apply_format_strategy, strategy_lock_plan,
     FORMAT_STRATEGY_LABELS,
@@ -200,10 +200,12 @@ def _group_view(g, latest_by_channel=None, monitored_ids=None, memberships=None,
     page's single-group call), falls back to `g.memberships`.
 
     Format state (lock-aware, Part F): `latest_by_channel` for this group's members,
-    the effective `reference_key`/`reference_label` (locked or derived), `outlier_count`
-    + `mismatch` bool, a coarse `format_state` ∈ {ok, mixed, unknown}, and the empty-group
-    `no_active_match` flag (a reference exists but no *active* member reports it - e.g. a
-    locked format no live feed conforms to)."""
+    the effective `reference_key`/`reference_label` (locked or derived),
+    `format_offenders` (the recording-enabled members off a hand-pinned format, in rank
+    order - the only thing a group format warning is about, dev/changelog/925) with
+    `format_override` (the pin filtered every one of them, so a recording bypasses it),
+    and the empty-group `no_active_match` flag (a reference exists but no *active* member
+    reports it - e.g. a locked format no live feed conforms to)."""
     cfg = cfg if cfg is not None else load_config()
     memberships = list(memberships) if memberships is not None else list(g.memberships)
     unranked = member_channels(memberships)
@@ -218,8 +220,6 @@ def _group_view(g, latest_by_channel=None, monitored_ids=None, memberships=None,
     members = rank_members(unranked, latest_by_channel, streak_threshold=streak_threshold)
 
     ref_key = group_reference_key(g, memberships, latest_by_channel, streak_threshold)
-    _, outlier_channels = group_format_outliers(members, latest_by_channel, reference_key=ref_key,
-                                                streak_threshold=streak_threshold)
     recording_ids = {m.channel_id for m in memberships if m.recording_enabled}
     tested_ids = test_member_ids(memberships)
     participating_ids = participating_member_ids(g, memberships)
@@ -227,12 +227,10 @@ def _group_view(g, latest_by_channel=None, monitored_ids=None, memberships=None,
     active_matches_reference = ref_key is not None and any(
         format_key(latest_by_channel.get(ch.id)) == ref_key for ch in active)
     no_active_match = ref_key is not None and not active_matches_reference
-    if ref_key is None:
-        format_state = 'unknown'
-    elif outlier_channels:
-        format_state = 'mixed'
-    else:
-        format_state = 'ok'
+    format_offenders = pinned_format_offenders(
+        g, [ch for ch in members if ch.id in recording_ids], latest_by_channel)
+    format_override = bool(format_offenders) and format_eligible_members(
+        g, active, latest_by_channel).override
 
     # List-view summary stats: the best recording-enabled member (where a group
     # recording actually starts) and the most recent test across all members.
@@ -264,9 +262,8 @@ def _group_view(g, latest_by_channel=None, monitored_ids=None, memberships=None,
         'reference_key': ref_key,
         'reference_label': format_label(ref_key),
         'locked': g.locked_format_key is not None,
-        'outlier_count': len(outlier_channels),
-        'mismatch': bool(outlier_channels),
-        'format_state': format_state,
+        'format_offenders': format_offenders,
+        'format_override': format_override,
         'no_active_match': no_active_match,
         'active_count': len(active),
         'disabled_count': len(disabled),
@@ -434,7 +431,8 @@ def _channel_group_row(g, latest_by_channel, monitored_ids, system_job, system_c
     unmon = view['unmonitored_count'] or 0
     hscore = round(g.health_score) if g.health_score is not None else None
     band = health_bands.band_for(hscore, health_bands.resolve_bands(cfg or {}))
-    if view['mismatch']:
+    offenders = view['format_offenders']
+    if offenders:
         health_cls, health_label = 'bad', 'Mixed format'
     elif not members:
         health_cls, health_label = 'none', 'No channels'
@@ -461,7 +459,9 @@ def _channel_group_row(g, latest_by_channel, monitored_ids, system_job, system_c
         health_cls, health_label = 'none', f'Health {hscore}'
 
     issues = []
-    if view['mismatch']:
+    # The token keeps its old spelling so a saved `?issue=mismatch` link still filters;
+    # what it matches is the badge's condition, not "any member differs".
+    if offenders:
         issues.append('mismatch')
     if unmon:
         issues.append('unmon')
@@ -491,7 +491,15 @@ def _channel_group_row(g, latest_by_channel, monitored_ids, system_job, system_c
         'attached_checks': attached,
         'members': members, 'member_count': len(members),
         'recording_count': view['active_count'], 'disabled_count': view['disabled_count'],
-        'mismatch': view['mismatch'], 'unmonitored_count': unmon,
+        # What the Mixed format badge's tooltip names: the pin, and each member off it.
+        'format_warning': {
+            'lock_label': format_label(g.locked_format_key),
+            'override': view['format_override'],
+            'offenders': [{'name': ch.name,
+                           'format': format_label(format_key(view['latest_by_channel'].get(ch.id)))}
+                          for ch in offenders],
+        } if offenders else None,
+        'unmonitored_count': unmon,
         'reference_label': view['reference_label'] if view['reference_key'] else None,
         'locked': view['locked'],
         'best_active': next((m for m in members if m['is_best']), None),
@@ -540,7 +548,7 @@ def _system_group_row(g, latest_by_channel, channels, disabled_ids, jobs, tests_
         'attached_checks': checks,
         'members': members, 'member_count': len(members),
         'recording_count': 0, 'disabled_count': len(disabled_ids),
-        'mismatch': False, 'unmonitored_count': 0,
+        'format_warning': None, 'unmonitored_count': 0,
         'reference_label': None, 'locked': False, 'best_active': None,
         'checks': checks, 'check_dim': _check_dimension(checks),
         'recordings': [],
@@ -1086,11 +1094,6 @@ def _banner_facts(group, channels, latest, recording_ids, format_blocked_ids,
     Every value is derived from data the caller already loaded; nothing here queries."""
     recording = [ch for ch in channels if ch.id in recording_ids]
 
-    # Distinct format buckets across the recording-enabled members, using the same
-    # format_key rounding the lock compares against - never a second spelling of it.
-    buckets = collections.Counter(
-        k for k in (format_key(latest.get(ch.id)) for ch in recording) if k is not None)
-
     # The EPG tally behind the section 8 banner. Members with no id at all are counted
     # separately: unknown is not mismatched, and saying so is what keeps the banner from
     # reading as an accusation against a feed that simply has no listings.
@@ -1131,7 +1134,12 @@ def _banner_facts(group, channels, latest, recording_ids, format_blocked_ids,
         # so the two are read together, never one from the other.
         'format_blocked_count': len(format_blocked_ids & recording_ids),
         'format_override': bool(format_override),
-        'format_spans': len(buckets),
+        # The gate on every format warning this page shows - both banners and the loud
+        # per-member pill: a hand-pinned format with a recording-enabled member off it. The
+        # same helper answers the groups list's badge, so the two pages cannot disagree
+        # (dev/changelog/925). Distinct from `manages_format`, which says whether a lock
+        # FILTERS, a question an automatic strategy also answers yes to.
+        'format_warns': bool(pinned_format_offenders(group, recording, latest)),
         # Who the recording would actually run from under an override, so the banner can
         # name it rather than saying "some member". Same pick_best_member answer the star
         # in the table renders, so the two cannot name different feeds.
@@ -1831,6 +1839,11 @@ def set_member_participation(group_id):
         # moving it can change which members read as outliers - re-evaluate so the
         # mismatch log and alert stay honest. Detection only; it writes no membership.
         evaluate_and_reconcile_group(db.session.get(ChannelGroup, group_id))
+        # Either direction of this switch can end the broken-guide-row state: Recording
+        # back on gives the row something to record from, and a confirmed demotion took
+        # the row out of the guide. The helper re-asks the invariant rather than inferring
+        # it from which branch ran (dev/changelog/933).
+        resolve_broken_guide_row(group_id)
     # `left_guide` is what the client turns into its own sentence, and it is reported
     # rather than inferred: the client's copy of group.in_guide can be a refresh out of
     # date, and a switch that did not actually move demotes nothing.
@@ -1901,6 +1914,7 @@ def set_members_participation_bulk(group_id):
         # Same reason as the single-member route: the recording-enabled set defines the
         # derived format reference, so moving it can change who reads as an outlier.
         evaluate_and_reconcile_group(db.session.get(ChannelGroup, group_id))
+        resolve_broken_guide_row(group_id)
     return jsonify({'success': True, 'field': field, 'enabled': enabled, 'moved': moved,
                     'left_guide': bool(demoting and moved),
                     'cancelled_recordings': len(cancelled)})
@@ -1963,6 +1977,10 @@ def toggle_group_guide(group_id):
         group.guide_sort_order = _next_guide_sort_order()
         log_guide_change(group, True, 'Added to the TV Guide.')
     db.session.commit()
+    # Taking the group out of the guide ends the broken-row state outright: there is no
+    # row left to be unable to record from. Called after the commit above so the helper
+    # reads the flag this request just wrote (dev/changelog/933).
+    resolve_broken_guide_row(group_id)
     return jsonify({'success': True, 'in_guide': group.in_guide})
 
 
@@ -2209,6 +2227,9 @@ def promote_group(group_id):
 
     group = db.session.get(ChannelGroup, group_id)
     evaluate_and_reconcile_group(group)
+    # The walkthrough's whole job is turning Recording on, so it is the most likely path
+    # of all to end a broken guide row (dev/changelog/933).
+    resolve_broken_guide_row(group_id)
     return jsonify({
         'success': True,
         'format_strategy': group.format_strategy,
@@ -2461,6 +2482,9 @@ def delete_group(group_id):
     from ..recorder import delete_files
     delete_files(screenshot_paths)
     deregister_cancelled_recordings(cancelled)
+    # The group is gone, so an alert saying its guide row cannot record names a row that
+    # no longer exists - and its deep link would 404 (dev/changelog/933).
+    resolve_broken_guide_row(group_id)
     return jsonify({'success': True, 'cancelled_recordings': len(cancelled)})
 
 

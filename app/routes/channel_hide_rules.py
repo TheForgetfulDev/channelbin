@@ -104,7 +104,13 @@ def hide_rules_page():
     a second client-side derivation would just be a second, driftable copy of the same sum.
     Every mutation the page makes reloads afterward, so these numbers are never stale for
     longer than one round trip.
+
+    `pending_materialize` is the saved-but-not-applied state: a refused pass leaves a queued
+    retry, and this page is where that has to be visible, since the rules look saved and the
+    channel counts will not have moved (dev/changelog/928).
     """
+    from ..scheduler import pending_hide_materialize
+
     rules = ChannelHideRule.query.order_by(ChannelHideRule.id).all()
     accounts = Account.query.order_by(Account.name).all()
     total_channels = Channel.query.count()
@@ -123,6 +129,7 @@ def hide_rules_page():
         hidden_count=hidden_count,
         deferred_count=deferred_count,
         enabled_rules=enabled_rules,
+        pending_materialize=pending_hide_materialize(),
     )
 
 

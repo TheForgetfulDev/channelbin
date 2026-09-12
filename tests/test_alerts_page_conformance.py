@@ -98,9 +98,10 @@ class AlertsPageConformanceTests(unittest.TestCase):
         self.assertIn('Alerts', h1s[0])
 
     def test_the_list_is_a_card(self):
-        """DESIGN.md 3.3 - the rows used to sit loose on the page background."""
-        self.assertRegex(self.html, r'<div class="card">\s*<div class="card-head">')
-        self.assertIn('<div id="alerts-list">', self.html)
+        """DESIGN.md 3.3 - the rows used to sit loose on the page background. The seeded
+        alerts are all one-time types, so they render in the Past card (dev/changelog/932)."""
+        self.assertRegex(self.html, r'<div class="card" id="al-card-past">\s*<div class="card-head">')
+        self.assertIn('<div id="alerts-past">', self.html)
 
     def test_severity_is_a_row_edge_not_a_row_tint(self):
         """DESIGN.md 3.4: a status renders as a badge plus optionally the row's
@@ -241,6 +242,139 @@ class AlertsPageStaleCountTests(unittest.TestCase):
         self.assertRegex(html, r'id="al-unread"[^>]*>\s*2 unread')
 
 
+class AlertsActivePastSplitTests(unittest.TestCase):
+    """The page's two cards (dev/changelog/932).
+
+    "Active alerts" holds problems that are STILL TRUE - limited to the types the app
+    dismisses by itself, because the card offers no Dismiss and a row nothing could ever
+    clear would be stuck in it. "Past alerts" holds everything else. The governing
+    constraint, recorded at dev/changelog/932: "if something is going to be called `Active
+    Alerts` or even `Still Happening` then it needs to be limited to items that will clear
+    automatically."
+
+    The no-Dismiss half is asserted on the ROUTES as well as the markup. A hidden menu item
+    is presentation, and CLAUDE.md's "enforcement lives server-side" rule exists because a
+    stale page, a replayed request or a bulk action walks straight around presentation.
+    """
+
+    def setUp(self):
+        self.t = make_test_app()
+        self.t.app.config['WTF_CSRF_ENABLED'] = False
+        self.client = self.t.app.test_client()
+
+    def tearDown(self):
+        self.t.cleanup()
+
+    def _seed(self):
+        """One of each: a standing problem the app clears itself, and a one-time failure."""
+        with self.t.app.app_context():
+            active = _alert(alert_type='STORAGE_PATH_UNUSABLE', severity='ERROR',
+                            title='DVR output directory is unusable', source='/dvr')
+            past = _alert(alert_type='CONCATENATION_FAILED', severity='ERROR',
+                          title='Concatenation failed', source='concatenator')
+            db.session.commit()
+            return active.id, past.id
+
+    def _card(self, html, which):
+        marker = f'<div class="card" id="al-card-{which}">'
+        return _div_at(html, html.index(marker)) if marker in html else None
+
+    def _titles(self, card):
+        return re.findall(r'<div class="al-title">(.*?)</div>', card or '', re.S)
+
+    def test_a_still_true_problem_is_active_and_a_one_time_failure_is_past(self):
+        self._seed()
+        html = self.client.get('/alerts').get_data(as_text=True)
+        self.assertEqual(self._titles(self._card(html, 'active')),
+                         ['DVR output directory is unusable'])
+        self.assertEqual(self._titles(self._card(html, 'past')), ['Concatenation failed'])
+
+    def test_an_active_row_offers_no_dismiss_and_says_why(self):
+        self._seed()
+        html = self.client.get('/alerts').get_data(as_text=True)
+        card = self._card(html, 'active')
+        self.assertNotIn('data-act="dismiss"', card)
+        self.assertIn('Clears itself once fixed', card)
+        # Mark read and Ignore are untouched: neither one claims the problem is over.
+        self.assertIn('data-act="read"', card)
+        self.assertIn('data-act="ignore"', card)
+
+    def test_a_past_row_still_offers_dismiss(self):
+        self._seed()
+        card = self._card(self.client.get('/alerts').get_data(as_text=True), 'past')
+        self.assertIn('data-act="dismiss"', card)
+
+    def test_a_dismissed_self_clearing_alert_is_past_not_active(self):
+        """Dismissed means the row is no longer describing a live condition, so it is
+        history - and a card with no Dismiss is no place for a row already dismissed."""
+        with self.t.app.app_context():
+            now = datetime.utcnow()
+            _alert(alert_type='STORAGE_PATH_UNUSABLE', severity='ERROR',
+                   title='an old storage problem', source='/dvr-old',
+                   read_at=now, dismissed_at=now)
+            db.session.commit()
+        html = self.client.get('/alerts?include_dismissed=1').get_data(as_text=True)
+        self.assertIsNone(self._card(html, 'active'))
+        self.assertEqual(self._titles(self._card(html, 'past')), ['an old storage problem'])
+
+    def test_the_dismiss_route_refuses_an_active_alert(self):
+        active_id, _ = self._seed()
+        resp = self.client.post(f'/api/alerts/{active_id}/dismiss')
+        self.assertEqual(resp.status_code, 409)
+        self.assertIn('still happening', resp.get_json()['error'])
+        with self.t.app.app_context():
+            self.assertIsNone(db.session.get(Alert, active_id).dismissed_at)
+
+    def test_the_dismiss_route_still_dismisses_a_past_alert(self):
+        _, past_id = self._seed()
+        resp = self.client.post(f'/api/alerts/{past_id}/dismiss')
+        self.assertEqual(resp.status_code, 200)
+        with self.t.app.app_context():
+            self.assertIsNotNone(db.session.get(Alert, past_id).dismissed_at)
+
+    def test_dismiss_all_read_leaves_a_read_active_alert_standing(self):
+        """The bulk path is the easiest route to hiding every standing problem at once, so
+        it is excluded in the UPDATE rather than only in the row markup."""
+        with self.t.app.app_context():
+            now = datetime.utcnow()
+            active = _alert(alert_type='STORAGE_PATH_UNUSABLE', severity='ERROR',
+                            title='DVR output directory is unusable', source='/dvr',
+                            read_at=now)
+            past = _alert(alert_type='CONCATENATION_FAILED', severity='ERROR',
+                          title='Concatenation failed', source='concatenator', read_at=now)
+            db.session.commit()
+            active_id, past_id = active.id, past.id
+        self.assertEqual(self.client.post('/api/alerts/dismiss_all').status_code, 200)
+        with self.t.app.app_context():
+            self.assertIsNone(db.session.get(Alert, active_id).dismissed_at,
+                              'a problem that is still happening was dismissed in bulk')
+            self.assertIsNotNone(db.session.get(Alert, past_id).dismissed_at)
+
+    def test_the_json_list_says_which_rows_are_still_happening(self):
+        self._seed()
+        by_title = {a['title']: a for a in self.client.get('/api/alerts').get_json()}
+        active = by_title['DVR output directory is unusable']
+        past = by_title['Concatenation failed']
+        self.assertTrue(active['self_clearing'])
+        self.assertTrue(active['is_active_problem'])
+        # Typed deliberately without a clearing path: nothing re-runs a concatenation that
+        # found nothing, so it is Past by nature (dev/changelog/930).
+        self.assertFalse(past['self_clearing'])
+        self.assertFalse(past['is_active_problem'])
+
+    def test_the_intro_explains_both_cards(self):
+        html = self.client.get('/alerts').get_data(as_text=True)
+        self.assertIn('Active alerts are problems that are still true right now', html)
+        self.assertIn('so it has no Dismiss', html)
+        self.assertIn('Past alerts already happened', html)
+
+    def test_the_empty_state_still_appears_when_neither_card_has_rows(self):
+        html = self.client.get('/alerts').get_data(as_text=True)
+        self.assertIn('<div class="empty-state">', html)
+        self.assertIsNone(self._card(html, 'active'))
+        self.assertIsNone(self._card(html, 'past'))
+
+
 class AlertsChannelLifecycleLinkTests(unittest.TestCase):
     """SYNC_CHANNELS_NEW / SYNC_CHANNELS_MISSING deep-link into the channel search's
     `other` filter, pre-filtered to the account they're about (dev/changelog/479). A
@@ -267,7 +401,7 @@ class AlertsChannelLifecycleLinkTests(unittest.TestCase):
         html = self.client.get('/alerts').get_data(as_text=True)
         self.assertIn(f'/channels?f.other=new&amp;f.acct={acct_id}', html)
         self.assertIn(f'/channels?f.other=removed&amp;f.acct={acct_id}', html)
-        self.assertIn('View channels &rarr;', html)
+        self.assertIn('>Channels &rarr;', html)
 
     def test_an_alert_with_no_recognizable_source_gets_no_link(self):
         """A malformed or missing `source` must not crash the page - it just gets no
@@ -278,4 +412,4 @@ class AlertsChannelLifecycleLinkTests(unittest.TestCase):
                   source='not-the-expected-shape')
             db.session.commit()
         html = self.client.get('/alerts').get_data(as_text=True)
-        self.assertEqual(html.count('View channels &rarr;'), 0)
+        self.assertEqual(html.count('>Channels &rarr;'), 0)

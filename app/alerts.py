@@ -34,8 +34,46 @@ STORAGE_PATH_UNUSABLE = 'STORAGE_PATH_UNUSABLE'
 #: four above: app/toolchain.py raises and dismisses it by type, one row per binary.
 EXTERNAL_TOOL_MISSING = 'EXTERNAL_TOOL_MISSING'
 
+#: Types nothing raises any more, kept in ALERT_TYPES below purely so the rows already in
+#: the database still render with a label.
+#:
+#: An alert is for a real problem: content already lost, a recording that will fail, the app
+#: broken or needing a human, or guide/stream data going bad (dev/changelog/923). Each type
+#: here reports something that is none of those, and each is shown instead on the group,
+#: recording, account or page it concerns - which is both quieter and more useful, since it
+#: is where somebody asking the question already looks. In the week measured before this
+#: changed, these twelve were 189 of 198 alerts raised (dev/changelog/928).
+#:
+#: Adding a type here means its raise sites go at the same time; ALERT_TYPES keeps the entry.
+#: Enforced by tests/test_retired_alert_types.py, which fails on a create_alert() of any of
+#: them anywhere in app/.
+RETIRED_ALERT_TYPES = frozenset({
+    'GROUP_FORMAT_MISMATCH',
+    'GROUP_NO_ELIGIBLE_MEMBER',
+    'RECORDING_FORMAT_OVERRIDE',
+    'RECORDING_FORMAT_CHANGED',
+    'SYNC_CHANNELS_NEW',
+    'SYNC_CHANNELS_MISSING',
+    'SYNC_STREAM_URLS_CONSTRUCTED',
+    'MALFORMED_CHANNEL_URLS',
+    'DUPLICATE_STREAM_IDS_SKIPPED',
+    'HEALTH_CHECK_COMPLETE',
+    'JOB_SKIPPED',
+    'CHANNEL_HIDE_RULES_NOT_APPLIED',
+})
+
 # Registry of all known alert types.
 # severity: ERROR | CRIT | WARN | INFO
+#
+# self_clearing: True marks a type the app dismisses BY ITSELF once the condition stops
+# being true. It is what puts a row under the Alerts page's "Active alerts" card, which
+# carries no Dismiss - offering one would let a problem that is still happening be hidden,
+# and the card's own name would stop being true (dev/changelog/932).
+#
+# Set it on a new type only when a clearing path actually exists and you can point at it.
+# The flag lives on the entry rather than in a list elsewhere so that it is in front of
+# whoever adds the type; tests/test_self_clearing_alerts.py scans app/ for the dismiss call
+# sites and fails if the two disagree in either direction.
 ALERT_TYPES = {
     'LOG_ERROR':   {'label': 'Application Error (log)',    'severity': 'ERROR'},
     'LOG_CRIT':    {'label': 'Application Critical (log)', 'severity': 'CRIT'},
@@ -44,20 +82,21 @@ ALERT_TYPES = {
     # A stream_id repeated within one playlist/catalog - the URL-derived id can collide
     # innocuously (a .ts/.m3u8 variant of the same numeric tail) or genuinely conflict (two
     # distinct provider URLs landing on the same parsed/hashed id), and either way the second
-    # occurrence is silently dropped without this alert (dev/docs/BUGS.md 2026-08-30).
+    # occurrence is dropped (dev/docs/BUGS.md 2026-08-30). Retired: the count is a column on
+    # the sync that skipped them and is shown on the account page (dev/changelog/926).
     'DUPLICATE_STREAM_IDS_SKIPPED': {
         'label': 'Duplicate Stream IDs Skipped', 'severity': 'INFO'},
     # A hide-rule pass was refused for database contention, so the rules are saved but not
-    # yet reflected in what you are being offered. INFO rather than WARN: it retries itself
-    # within minutes and the body says so - what would be indefensible is the rules quietly
-    # doing nothing with no surface saying why (dev/changelog/776).
+    # yet reflected in what you are being offered (dev/changelog/776). Retired: the Hide
+    # Rules page itself now banners that state, naming the blocker and the retry time, which
+    # is the page the person who just saved the rule is already looking at.
     'CHANNEL_HIDE_RULES_NOT_APPLIED': {
         'label': 'Channel Hide Rules Not Applied Yet', 'severity': 'INFO'},
     'GROUP_FORMAT_MISMATCH': {'label': 'Channel Group Format Mismatch', 'severity': 'WARN'},
-    # The two voices DESIGN-channel-groups-model.md 15.2 asks for ahead of the recording
-    # itself: the moment a group's format lock leaves nothing eligible, and the moment a
-    # recording goes ahead under that override. Both are push moments the user may not be
-    # present for, which is why neither is left to a page they would have to visit.
+    # Retired along with GROUP_FORMAT_MISMATCH above: a group whose lock leaves nothing
+    # eligible says so on the group page's own override banner, and the recording made under
+    # that override carries a RECORDING_FORMAT_OVERRIDE event that survives onto the artifact
+    # - which is the disclosure that actually matters six weeks later.
     'GROUP_NO_ELIGIBLE_MEMBER': {'label': 'Channel Group Has No Eligible Member', 'severity': 'WARN'},
     # A group sitting in the TV Guide with nothing switched on for recording, reached
     # without a human to confirm it (DESIGN-channel-groups-model.md 15, breach path 3).
@@ -65,25 +104,41 @@ ALERT_TYPES = {
     # that one is a group that can still record, badly. This one cannot produce a file at
     # all, and the row will go on looking normal in the guide until somebody fixes it.
     'GROUP_GUIDE_NO_RECORDING_MEMBER': {
-        'label': 'Channel Group In Guide Has No Recording Member', 'severity': 'ERROR'},
+        'label': 'Channel Group In Guide Has No Recording Member', 'severity': 'ERROR',
+        'self_clearing': True},
     'RECORDING_FORMAT_OVERRIDE': {'label': 'Recording Started Off The Group Format', 'severity': 'WARN'},
     # A recording that actually changed format part-way through. Distinct from the override
     # above, which is about where a recording STARTED: this one is about the finished file
-    # having two formats in it, which no other surface would ever mention - the container
-    # header advertises only the first (dev/changelog/754).
+    # having two formats in it, since the container header advertises only the first
+    # (dev/changelog/754). Retired: every divergent segment still writes its own
+    # RECORDING_FORMAT_CHANGED event, and the recording's detail page is where a question
+    # about that file gets asked.
     'RECORDING_FORMAT_CHANGED': {'label': 'Recording Changed Format Mid-Run', 'severity': 'WARN'},
+    # Not self_clearing, unlike every other SYNC_* type below: _alert_url_drift refreshes a
+    # standing row but has no dismiss branch, because nothing observes the URLs going back
+    # to what they were. A drift that has been dealt with is dismissed by hand.
     'PROVIDER_URLS_CHANGED': {'label': 'Provider Stream URLs Changed', 'severity': 'WARN'},
-    'SYNC_EPG_FETCH_FAILED': {'label': 'EPG Fetch Failed', 'severity': 'WARN'},
-    'SYNC_EPG_COLLAPSE_REFUSED': {'label': 'EPG Import Refused (Collapse Guard)', 'severity': 'WARN'},
+    'SYNC_EPG_FETCH_FAILED': {
+        'label': 'EPG Fetch Failed', 'severity': 'WARN', 'self_clearing': True},
+    'SYNC_EPG_COLLAPSE_REFUSED': {
+        'label': 'EPG Import Refused (Collapse Guard)', 'severity': 'WARN', 'self_clearing': True},
     # Distinct from the two above because the old EPG is already gone by the time this
     # fires: the delete commits before the parse loop, so their "previous EPG data was
     # kept" wording would be false here (DESIGN-sync-resilience.md §3).
-    'SYNC_EPG_IMPORT_TRUNCATED': {'label': 'EPG Import Cut Short (Truncated Feed)', 'severity': 'WARN'},
-    'SYNC_FEED_SHRUNK': {'label': 'Provider Feed Shrunk', 'severity': 'WARN'},
-    'SYNC_LIVE_CLASSIFY_UNAVAILABLE': {'label': 'Live/VOD Catalog Unavailable', 'severity': 'WARN'},
-    'SYNC_LIVE_CLASSIFY_REFUSED': {'label': 'Live/VOD Filtering Refused (Collapse Guard)', 'severity': 'WARN'},
+    'SYNC_EPG_IMPORT_TRUNCATED': {
+        'label': 'EPG Import Cut Short (Truncated Feed)', 'severity': 'WARN',
+        'self_clearing': True},
+    'SYNC_FEED_SHRUNK': {
+        'label': 'Provider Feed Shrunk', 'severity': 'WARN', 'self_clearing': True},
+    'SYNC_LIVE_CLASSIFY_UNAVAILABLE': {
+        'label': 'Live/VOD Catalog Unavailable', 'severity': 'WARN', 'self_clearing': True},
+    'SYNC_LIVE_CLASSIFY_REFUSED': {
+        'label': 'Live/VOD Filtering Refused (Collapse Guard)', 'severity': 'WARN',
+        'self_clearing': True},
     'SYNC_STREAM_URLS_CONSTRUCTED': {'label': 'Stream URLs Constructed, Not Provided', 'severity': 'INFO'},
-    'SYNC_URL_CONSTRUCTION_BLOCKED': {'label': 'Cannot Build Stream URLs (No Format Set)', 'severity': 'WARN'},
+    'SYNC_URL_CONSTRUCTION_BLOCKED': {
+        'label': 'Cannot Build Stream URLs (No Format Set)', 'severity': 'WARN',
+        'self_clearing': True},
     'SYNC_CHANNELS_MISSING': {'label': 'Channels Missing From Provider', 'severity': 'INFO'},
     'SYNC_CHANNELS_NEW': {'label': 'New Channels From Provider', 'severity': 'INFO'},
     # Kept, and kept meaning what it always meant, purely so historical rows still render
@@ -95,31 +150,48 @@ ALERT_TYPES = {
     # is not INFO either - a recording that is not capturing while its window runs is
     # degrading, and the user is the only one who can free a slot or raise the limit.
     'RECORDING_WAITING_FOR_CONNECTION_SLOT': {
-        'label': 'Recording Waiting For A Connection Slot', 'severity': 'WARN'},
+        'label': 'Recording Waiting For A Connection Slot', 'severity': 'WARN',
+        'self_clearing': True},
     'RECORDING_FAILED_CONNECTION_LIMIT': {
         'label': 'Recording Failed (Waited For A Connection Slot)', 'severity': 'ERROR'},
-    'RECORDING_CHANNEL_FAILING': {'label': 'Scheduled Recording Channel Failing', 'severity': 'WARN'},
-    'SEARCH_INDEX_REBUILD_FAILED': {'label': 'Search Index Rebuild Failed', 'severity': 'ERROR'},
-    'CONVERSION_FAILED': {'label': 'Conversion Failed', 'severity': 'ERROR'},
+    'RECORDING_CHANNEL_FAILING': {
+        'label': 'Scheduled Recording Channel Failing', 'severity': 'WARN', 'self_clearing': True},
+    'SEARCH_INDEX_REBUILD_FAILED': {
+        'label': 'Search Index Rebuild Failed', 'severity': 'ERROR', 'self_clearing': True},
+    'CONVERSION_FAILED': {
+        'label': 'Conversion Failed', 'severity': 'ERROR', 'self_clearing': True},
+    # The three below name failures that used to reach the Alerts page only through the
+    # log->alert catch-all in app/__init__.py. With no type of their own they had no deep
+    # link and, more to the point, nothing that could ever clear them: one sync failure
+    # sat open through eight days of successful syncs (dev/changelog/930). ERROR because
+    # each one is work already lost, not a degradation.
+    'SYNC_FAILED': {
+        'label': 'Account Sync Failed', 'severity': 'ERROR', 'self_clearing': True},
+    'RECORDING_MOVE_FAILED': {
+        'label': 'Recording Move Failed', 'severity': 'ERROR', 'self_clearing': True},
+    # Unlike the two above, this one has no self-clearing path and is not expected to grow
+    # one: nothing re-runs a concatenation that found nothing to concatenate, so it is a
+    # record of a loss and is cleared only by deleting the recording.
+    'CONCATENATION_FAILED': {'label': 'Concatenation Failed', 'severity': 'ERROR'},
     'CONFIG_FILE_MISSING': {'label': 'Config File Missing', 'severity': 'CRIT'},
     'HEALTH_CHECK_COMPLETE': {'label': 'Health Check Completed', 'severity': 'INFO'},
-    'HEALTH_CHECK_WINDOW': {'label': 'Maintenance Window Closed With Work Left Over', 'severity': 'WARN'},
-    # One-time, on the first startup after the automatic TV Guide check was retargeted to
-    # one probe per guide row (dev/changelog/752). What a scheduled check tests is the
-    # user's business, so it is announced rather than quietly widened or narrowed.
-    'HEALTH_CHECK_TARGETS_CHANGED': {'label': 'Automatic Health Check Retargeted', 'severity': 'INFO'},
+    'HEALTH_CHECK_WINDOW': {
+        'label': 'Maintenance Window Closed With Work Left Over', 'severity': 'WARN',
+        'self_clearing': True},
     # WARN, not ERROR: the log->alert handler in app/__init__.py already creates an alert
     # for any ERROR-level log record, so this stays WARN to avoid a second, duplicate alert
     # if the lockout is also logged at ERROR - it isn't (log.warning), but the severity
     # still has to not collide with that path.
     'AUTH_LOGIN_LOCKOUT': {'label': 'Login Lockout (Too Many Failed Attempts)', 'severity': 'WARN'},
     NOTIFICATION_SERVICE_URL_PLACEHOLDER: {
-        'label': 'Notification Service URL Is Still Its Placeholder', 'severity': 'WARN'},
+        'label': 'Notification Service URL Is Still Its Placeholder', 'severity': 'WARN',
+        'self_clearing': True},
     # WARN for the same reason its placeholder sibling above is: nothing in the app
     # malfunctioned, one outbound service is degraded. ERROR would also double up with the
     # log->alert handler, since the send failure is logged on the way here.
     NOTIFICATION_SERVICE_SEND_FAILED: {
-        'label': 'Push Notification Service Failing', 'severity': 'WARN'},
+        'label': 'Push Notification Service Failing', 'severity': 'WARN',
+        'self_clearing': True},
     'SECOND_INSTANCE_DETECTED': {
         'label': 'Second Live Instance Detected', 'severity': 'CRIT'},
     'RECORDING_RESUME_REFUSED': {
@@ -137,14 +209,15 @@ ALERT_TYPES = {
     # handler in app/__init__.py, and the condition here is a configuration state rather
     # than a failure.
     AUTH_GATE_INERT: {
-        'label': 'Login Gate Enabled But Has No Password', 'severity': 'WARN'},
+        'label': 'Login Gate Enabled But Has No Password', 'severity': 'WARN',
+        'self_clearing': True},
     # ERROR, unlike the WARN band the other "configuration is degraded" types above sit
     # in: a DVR output directory that stopped answering does not degrade recording, it
     # disables it outright, and every recording that starts meanwhile fails immediately.
     # No double-up with the log->alert handler in app/__init__.py, which keys on a log
     # record's own level - the condition is logged at WARNING (app/fs_utils.py).
     STORAGE_PATH_UNUSABLE: {
-        'label': 'Storage Path Unusable', 'severity': 'ERROR'},
+        'label': 'Storage Path Unusable', 'severity': 'ERROR', 'self_clearing': True},
     # ERROR for the same reason STORAGE_PATH_UNUSABLE above is, and not the WARN band the
     # "something is degraded" types sit in: a missing ffmpeg does not degrade recording, it
     # disables it, and every recording that starts meanwhile fails immediately. A missing
@@ -153,8 +226,27 @@ ALERT_TYPES = {
     # the log->alert handler in app/__init__.py: the condition is logged at WARNING
     # (app/toolchain.py).
     EXTERNAL_TOOL_MISSING: {
-        'label': 'External Tool Missing (ffmpeg/ffprobe)', 'severity': 'ERROR'},
+        'label': 'External Tool Missing (ffmpeg/ffprobe)', 'severity': 'ERROR',
+        'self_clearing': True},
 }
+
+#: The self_clearing types above, as a set. Derived rather than written out a second time:
+#: two hand-kept copies of this membership is how the "Active alerts" card would come to
+#: claim a type nothing clears.
+SELF_CLEARING_ALERT_TYPES = frozenset(
+    name for name, meta in ALERT_TYPES.items() if meta.get('self_clearing'))
+
+
+def is_self_clearing(alert_type: str) -> bool:
+    """True if the app dismisses this type by itself once its condition stops being true.
+
+    An open alert of such a type describes a problem that is STILL HAPPENING, so the Alerts
+    page lists it under "Active alerts" and offers no Dismiss: hiding it would throw away
+    the only standing evidence of something nobody has fixed, and the app would put it
+    straight back (dev/changelog/932). An unknown type is never self-clearing - there is no
+    code that would clear it.
+    """
+    return alert_type in SELF_CLEARING_ALERT_TYPES
 
 
 def _get_routing(alert_type: str) -> dict:
@@ -222,6 +314,68 @@ def dismiss_open_alerts(alert_type: str, source: str):
             row.dismissed_at = now
         db.session.commit()
     _dismiss()
+
+
+def _dismiss_recording_alerts(recording_id: int, alert_type: str = None,
+                              unlink: bool = False) -> bool:
+    """Dismiss the open alerts carrying `recording_id` - and, when `unlink`, drop the id
+    from every row that carries it, dismissed or not.
+
+    Mutates without committing and returns whether anything changed; the two wrappers
+    below own the commit. An already-dismissed row keeps its original timestamp, per the
+    anchors-only-move-forward rule.
+    """
+    from .database import Alert
+
+    q = Alert.query.filter(Alert.recording_id == recording_id)
+    if alert_type is not None:
+        q = q.filter(Alert.alert_type == alert_type)
+    now = datetime.utcnow()
+    changed = False
+    for row in q.all():
+        if row.dismissed_at is None:
+            row.dismissed_at = now
+            changed = True
+        if unlink:
+            row.recording_id = None
+            changed = True
+    return changed
+
+
+def dismiss_open_alerts_for_recording(recording_id: int, alert_type: str = None):
+    """Dismiss every open alert carrying `recording_id`, optionally narrowed to one type -
+    the recording-keyed sibling of dismiss_open_alerts.
+
+    A condition about one recording whose raise sites do not share a single `source`
+    string cannot be cleared by the (type, source) pair, but the id column names it
+    exactly. A no-op when nothing stands.
+
+    The row keeps its recording_id: the recording still exists, and the dismissed alert is
+    part of its history. Deleting the recording is the other case, and goes through
+    database.py::detach_recording_references instead.
+    """
+    from . import db
+    from .database import Alert  # noqa: F401 - imported for the query inside the closure
+    from .db_utils import retry_on_locked
+
+    @retry_on_locked()
+    def _dismiss():
+        if _dismiss_recording_alerts(recording_id, alert_type):
+            db.session.commit()
+
+    _dismiss()
+
+
+def detach_recording_alerts(recording_id: int):
+    """Dismiss and unlink every alert naming a recording that is being deleted.
+
+    Mutates without committing: the delete paths call this inside the same
+    retry_on_locked closure that deletes the Recording row, so the row and the alerts
+    naming it cannot end up in different states. Reached through
+    database.py::detach_recording_references, which is what those paths actually call -
+    the id has to come off more tables than this one.
+    """
+    _dismiss_recording_alerts(recording_id, unlink=True)
 
 
 def update_storage_path_alert(path, probe, what: str, consequence: str):

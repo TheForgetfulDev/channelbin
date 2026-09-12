@@ -392,8 +392,9 @@ class CssDeadClassTests(unittest.TestCase):
     DYNAMIC_PREFIXES = {
         'badge-':            'dashboard.js `badge badge-${status.toLowerCase()}`; logs.js / '
                              'notifications.js setStatus(); six templates `badge-{{ status|lower }}`',
-        'sev-':              "base.html `'alert-severity sev-' + a.severity`",
-        'alert-banner-sev-': "base.html `'alert-banner alert-banner-sev-' + a.severity`",
+        'sev-':              'nav-alerts.js `alert-severity sev-${a.severity}`; '
+                             'notifications.js `sev-${escHtml(r.severity)}`',
+        'alert-banner-sev-': 'nav-alerts.js `alert-banner alert-banner-sev-${a.severity}`',
         'toast-':            'util.js::showToast `toast toast-${type}`',
         'tl-dot-':           "channels/_timeline.html `tl-dot-{{ ch_dot.get(dot_key, 'neutral') }}`",
         'd-':                'recording_detail.html `run-tl-dot d-{{ rep.kind }}` (the segment timeline)',

@@ -660,10 +660,11 @@ _DEFAULTS = {
             'smtp2go':        {'enabled': False, 'url': ''},
             'whatsapp':       {'enabled': False, 'url': ''},
         },
+        # No row for a type in alerts.RETIRED_ALERT_TYPES: nothing raises those, so routing
+        # them would be configuration that cannot do anything (dev/changelog/928).
         'routing': {
             'LOG_ERROR':   {'in_app': True, 'push_services': []},
             'LOG_CRIT':    {'in_app': True, 'push_services': []},
-            'JOB_SKIPPED': {'in_app': True, 'push_services': []},
             'HEALTH_CHECK_WINDOW': {'in_app': True, 'push_services': []},
         },
     },

@@ -16,7 +16,8 @@ from ..database import (
     Recording, Channel, ChannelGroup, Account, EPGEntry, RecordingEvent,
     RECORDING_CREATED_AFTER_EVENT_START, RECORDING_EDITED, RECORDING_STOP_TIME_ADJUSTED,
     RECORDING_REPLACED_OTHER, RESTART_BLOCKING_STATUSES, RECORDING_ABORTED,
-    DIAGNOSTICS, add_recording_event, group_event_channel_links,
+    DIAGNOSTICS, add_recording_event, detach_recording_references,
+    group_event_channel_links,
     REC_STATUS_SCHEDULED, REC_STATUS_IN_PROGRESS, REC_STATUS_PAUSED, REC_STATUS_RETRYING,
     REC_STATUS_CONCATENATING, REC_STATUS_ANALYZING, REC_STATUS_CONVERTING,
     REC_STATUS_COMPLETED, REC_STATUS_FAILED, REC_STATUS_ABORTED,
@@ -29,7 +30,7 @@ from ..db_utils import retry_on_locked
 from ..scheduler import schedule_recording, unschedule_recording
 from ..recorder import (
     abort_recording, get_state, stop_recording, pause_recording, resume_recording,
-    get_live_segment_path, recording_disk_paths, delete_files,
+    get_live_segment_path, recording_disk_paths, delete_files, end_slot_wait,
 )
 from ..tz_utils import parse_local_to_utc, local_input_value, format_local
 from ..accounts import normalize_url_loose
@@ -138,19 +139,23 @@ def _abort_and_delete_files(recording_id):
 
 
 def _unschedule_and_delete_row(recording_id):
-    """Permanently remove a Recording row: cancel any pending APScheduler job, drop
-    its failing-health alerts, then delete the row itself. Shared by the full-delete
-    route and by cancelling a SCHEDULED recording (which has captured nothing, so
-    there is no ABORTED history worth keeping instead - dev/changelog/814)."""
+    """Permanently remove a Recording row: cancel any pending APScheduler job, unlink
+    everything still naming the row, then delete it. Shared by the full-delete route and
+    by cancelling a SCHEDULED recording (which has captured nothing, so there is no
+    ABORTED history worth keeping instead - dev/changelog/814).
+
+    detach_recording_references subsumes the failing-health dismiss the other callers
+    still make on their own: those alerts carry the recording_id too, and here they have
+    to come off the row inside the delete's own commit rather than in one before it."""
     unschedule_recording(recording_id)
-    dismiss_recording_failing_alerts(recording_id)
 
     @retry_on_locked()
     def _delete_row():
         r = db.session.get(Recording, recording_id)
+        detach_recording_references(recording_id)
         if r is not None:
             db.session.delete(r)
-            db.session.commit()
+        db.session.commit()
 
     _delete_row()
 
@@ -1155,6 +1160,7 @@ def cancel_recording(recording_id):
 
         _mark_aborted_and_commit()
         dismiss_recording_failing_alerts(recording_id)
+        end_slot_wait(recording_id)
         flash(f'Recording "{rec.name}" cancelled.', 'success')
     elif rec.status in (REC_STATUS_IN_PROGRESS, REC_STATUS_PAUSED, REC_STATUS_RETRYING):
         _abort_and_delete_files(recording_id)
@@ -1371,14 +1377,14 @@ def delete_recording(recording_id):
     paths = recording_disk_paths(recording_id) if remove_files else []
     from ..scheduler import unschedule_recording
     unschedule_recording(recording_id)
-    dismiss_recording_failing_alerts(recording_id)
 
     @retry_on_locked()
     def _delete_row():
         r = db.session.get(Recording, recording_id)
+        detach_recording_references(recording_id)
         if r is not None:
             db.session.delete(r)
-            db.session.commit()
+        db.session.commit()
 
     _delete_row()
     removed = delete_files(paths)
@@ -1558,11 +1564,11 @@ def new_recording_json():
 
     if replace_recording_id is not None:
         unschedule_recording(replace_recording_id)
-        dismiss_recording_failing_alerts(replace_recording_id)
 
         @retry_on_locked()
         def _delete_replaced_and_commit():
             old = db.session.get(Recording, replace_recording_id)
+            detach_recording_references(replace_recording_id)
             detail = 'Created via Find Another Airing'
             if old is not None:
                 detail += (f', replacing scheduled recording #{old.id} "{old.name}" '

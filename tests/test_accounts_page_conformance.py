@@ -72,13 +72,15 @@ def _account(name, status='OK', **kw):
 
 
 def _sync_log(account, *, status='SUCCESS', minutes_ago=60, channels=100, epg=1000,
-              error=None, seconds=30, added=None, removed=None):
+              error=None, seconds=30, added=None, removed=None, malformed=None,
+              duplicate=None):
     started = datetime.utcnow() - timedelta(minutes=minutes_ago)
     log = AccountSyncLog(
         account_id=account.id, started_at=started,
         completed_at=started + timedelta(seconds=seconds) if seconds is not None else None,
         status=status, channels_synced=channels, epg_entries_synced=epg,
-        error_message=error, channels_added=added, channels_removed=removed)
+        error_message=error, channels_added=added, channels_removed=removed,
+        skipped_malformed_urls=malformed, skipped_duplicate_stream_ids=duplicate)
     db.session.add(log)
     db.session.flush()
     return log
@@ -345,6 +347,63 @@ class AccountPageTests(unittest.TestCase):
         self.assertNotIn('added', activity)
         self.assertNotIn('removed', activity)
 
+    def _content(self, account):
+        return self._get(account).split('data-section="content"')[1].split('data-section=')[0]
+
+    def _activity(self, account):
+        return self._get(account).split('data-section="activity"')[1].split('</div>\n\n</div>')[0]
+
+    def test_content_shows_the_last_finished_syncs_skip_counts(self):
+        """dev/changelog/926: the counts come from the newest SUCCESS or PARTIAL sync. A newer
+        failed sync records none, so reading it would blank the rows every time a sync fails."""
+        acc = _account('Skips', 'OK')
+        _sync_log(acc, status='PARTIAL', minutes_ago=120, malformed=1250, duplicate=0)
+        _sync_log(acc, status='ERROR', minutes_ago=30, error='provider returned 403')
+        db.session.commit()
+        content = self._content(acc)
+        malformed = self._srow(content, 'Malformed URLs skipped (last sync)')
+        self.assertIn('>1,250<', malformed)
+        self.assertNotIn('faint', malformed)
+        duplicate = self._srow(content, 'Duplicate stream IDs skipped (last sync)')
+        self.assertIn('>0<', duplicate)
+        self.assertIn('faint', duplicate, 'a zero is faint, the same as every other Content zero')
+
+    def test_content_skip_counts_say_not_tracked_rather_than_zero(self):
+        """Product Principle 1: a sync from before the columns, with no alert to recover its
+        count from, must never render as a false 0."""
+        acc = _account('SkipsUntracked', 'OK')
+        _sync_log(acc)
+        db.session.commit()
+        content = self._content(acc)
+        for label in ('Malformed URLs skipped (last sync)',
+                      'Duplicate stream IDs skipped (last sync)'):
+            row = self._srow(content, label)
+            self.assertIn('Not tracked', row, label)
+            self.assertNotIn('>0<', row, label)
+
+    def test_content_skip_counts_are_a_dash_when_no_sync_has_finished(self):
+        acc = _account('NeverFinished', 'ERROR')
+        _sync_log(acc, status='ERROR', error='provider returned 403')
+        db.session.commit()
+        row = self._srow(self._content(acc), 'Malformed URLs skipped (last sync)')
+        self.assertIn('>-<', row)
+        self.assertNotIn('Not tracked', row, 'there is no sync to be untracked')
+
+    def test_activity_names_skip_counts_only_when_something_was_skipped(self):
+        acc = _account('SkipsActivity', 'OK')
+        _sync_log(acc, malformed=1250, duplicate=332)
+        db.session.commit()
+        activity = self._activity(acc)
+        self.assertIn('1,250 skipped as malformed URLs', activity)
+        self.assertIn('332 skipped as duplicate stream IDs', activity)
+
+        quiet = _account('SkipsQuiet', 'OK')
+        _sync_log(quiet, minutes_ago=90, malformed=0, duplicate=0)
+        _sync_log(quiet, minutes_ago=30)
+        db.session.commit()
+        self.assertNotIn('skipped', self._activity(quiet),
+                         'a zero or an untracked sync reads as the plain line')
+
     def test_sync_history_shows_the_last_ten_and_offers_the_rest(self):
         acc = _account('Busy', 'OK')
         for i in range(14):
@@ -539,21 +598,31 @@ class AccountsListRowTests(unittest.TestCase):
     def test_the_channels_number_names_how_many_are_hidden(self):
         """dev/docs/DESIGN-channel-hiding.md §11 "Counts": hidden_channel_count is rendered
         beside channel_count everywhere the latter already is. It goes inside the existing
-        Channels cell, not a fifth .a-num - the row already asserts exactly four above."""
+        Channels cell, not a fifth .a-num - the row already asserts exactly four above.
+
+        And on a line of its own (dev/docs/BUGS.md 2026-09-11 06:39). As a parenthetical it
+        shared the number's single nowrap line in a fixed-width column, which clipped it
+        mid-number - "57,024 (12,5…" - so it said neither how many nor what they were."""
         _account('Hidden', 'OK', channel_count=1234, hidden_channel_count=9441)
         db.session.commit()
         _, rows = self._rows()
         row = rows[0]
         self.assertEqual(row.count('class="a-num"'), 4)
-        self.assertIn('9,441 hidden', row)
+        cell = row.split('<span class="a-k">Channels</span>')[1].split('class="a-num"')[0]
+        self.assertIn('<span class="a-note">9,441 hidden</span>', cell)
+        self.assertNotIn('(9,441', row)
+        css = open(os.path.join(REPO, 'static', 'css', 'style.css')).read()
+        rule = re.search(r'\.arow \.a-num \.a-note \{(.*?)\}', css, re.S)
+        self.assertIsNotNone(rule, 'the note needs its own rule')
+        self.assertIn('display: block', rule.group(1),
+                      'an inline note shares the number\'s one clipped line again')
 
     def test_no_hidden_note_when_nothing_is_hidden(self):
-        """`aria-hidden` on the sparkline legitimately contains the substring "hidden" -
-        this checks for the parenthetical note, not the bare word."""
+        """No empty note line under a number when nothing is hidden."""
         _account('NotHidden', 'OK', channel_count=1234, hidden_channel_count=0)
         db.session.commit()
         _, rows = self._rows()
-        self.assertNotIn('hidden)', rows[0])
+        self.assertNotIn('a-note', rows[0])
 
     def test_the_header_total_names_how_many_are_hidden(self):
         """The header's channel total is the sum of the column beneath it - the hidden
@@ -602,6 +671,16 @@ class AccountsListRowTests(unittest.TestCase):
             self.assertNotIn(attr, status_badge, f'{attr} must not appear on the status badge')
         self.assertIn('data-tip', row, 'the sparkline bar must carry a tooltip')
 
+    def test_the_sparkline_tooltip_names_skip_counts_like_the_activity_feed(self):
+        """sync_detail promises the tooltip and the account page's Activity line never say
+        different things about one sync's numbers (dev/changelog/926)."""
+        acc = _account('ListSkips', 'OK')
+        _sync_log(acc, malformed=1250, duplicate=332)
+        db.session.commit()
+        _, rows = self._rows()
+        self.assertIn('1,250 skipped as malformed URLs', rows[0])
+        self.assertIn('332 skipped as duplicate stream IDs', rows[0])
+
     def test_the_provider_error_text_is_not_on_the_row(self):
         """17.1: the status badge and the colored edge carry "this is broken"; the text
         that says WHY lives on the account page, which is the page this row opens."""
@@ -637,15 +716,85 @@ class AccountsListRowTests(unittest.TestCase):
         """CLAUDE.md's list-grid rule (dev/changelog/390): the header and each row are
         SEPARATE grid containers, so a content-sized track sizes itself per row and slides
         every header label off its column. jsdom computes no layout, so this is asserted on
-        the stylesheet text - it is the only place the defect is visible without a browser."""
+        the stylesheet text - it is the only place the defect is visible without a browser.
+
+        minmax() of a fixed length and a fixed length or fr is allowed (dev/changelog/921):
+        both ends resolve against the container's width alone, never a cell's content."""
         css = open(os.path.join(REPO, 'static', 'css', 'style.css')).read()
         rule = re.search(r'\.acct-head, \.acct-rows \.arow \{(.*?)\}', css, re.S)
         self.assertIsNotNone(rule, 'the head and the rows must share ONE track definition')
-        tracks = re.search(r'grid-template-columns:([^;]+);', rule.group(1)).group(1).split()
+        track_list = re.search(r'grid-template-columns:([^;]+);', rule.group(1)).group(1)
+        tracks = re.findall(r'minmax\([^)]*\)|\S+', track_list)
         self.assertEqual(len(tracks), 7)
+        length = r'(?:0|\d+(?:\.\d+)?(?:rem|px|em))'
+        flex = r'\d+(?:\.\d+)?fr'
+        allowed = rf'^(?:{length}|{flex}|minmax\(\s*{length}\s*,\s*(?:{length}|{flex})\s*\))$'
         for track in tracks:
-            self.assertRegex(track, r'^\d+(\.\d+)?(fr|rem|px|em)$',
+            self.assertRegex(track, allowed,
                              f'{track} is content-sized - it will desync the header')
+
+
+class AccountSyncSignatureTests(unittest.TestCase):
+    """`accounts.sync_signature()`, the value /accounts compares against to know its rows
+    have gone stale (dev/docs/BUGS.md 2026-09-11 06:38). The list was load-once, so a sync
+    that finished while it was open read SYNCING until a manual reload. The browser half -
+    that a changed signature re-renders the list - is tests/test_accounts_page_js.py; these
+    are the server half's promises."""
+
+    def setUp(self):
+        self.t = make_test_app()
+        self.client = self.t.app.test_client()
+
+    def tearDown(self):
+        self.t.cleanup()
+
+    def _nav_sig(self):
+        return self.client.get('/api/nav-status').get_json()['account_sync']
+
+    def _page_sig(self):
+        html = self.client.get('/accounts').get_data(as_text=True)
+        return re.search(r'id="acct-live" data-sync-sig="([^"]*)"', html).group(1)
+
+    def test_the_page_and_the_poll_agree_when_nothing_changed(self):
+        acc = _account('Quiet', 'OK')
+        _sync_log(acc)
+        db.session.commit()
+        self.assertEqual(self._page_sig(), self._nav_sig())
+
+    def test_the_empty_state_carries_a_signature_too(self):
+        """The empty state is inside the live region, so a first account can replace it."""
+        self.assertEqual(self._page_sig(), self._nav_sig())
+
+    def test_it_moves_when_a_sync_starts(self):
+        acc = _account('Starts', 'OK')
+        db.session.commit()
+        before = self._page_sig()
+        acc.status = 'SYNCING'
+        _sync_log(acc, status='IN_PROGRESS', seconds=None)
+        db.session.commit()
+        self.assertNotEqual(self._nav_sig(), before)
+
+    def test_it_moves_when_a_sync_finishes(self):
+        acc = _account('Finishes', 'SYNCING')
+        log = _sync_log(acc, status='IN_PROGRESS', seconds=None)
+        db.session.commit()
+        before = self._page_sig()
+        acc.status = 'OK'
+        log.status = 'SUCCESS'
+        db.session.commit()
+        self.assertNotEqual(self._nav_sig(), before)
+
+    def test_it_moves_for_a_sync_that_started_and_failed_between_two_polls(self):
+        """Seen from two polls, this sync never happened: the account read ERROR before it
+        and reads ERROR after, and it was never SYNCING at a poll. The new sync-log row is
+        the only trace, so a signature built from the syncing set alone misses it."""
+        acc = _account('Blink', 'ERROR')
+        _sync_log(acc, status='ERROR', minutes_ago=90, error='401')
+        db.session.commit()
+        before = self._page_sig()
+        _sync_log(acc, status='ERROR', minutes_ago=0, error='401')
+        db.session.commit()
+        self.assertNotEqual(self._nav_sig(), before)
 
 
 class AccountApiTests(unittest.TestCase):

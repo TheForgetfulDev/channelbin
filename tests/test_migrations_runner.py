@@ -53,6 +53,24 @@ def _harmless_last_step():
         M.SCHEMA_MIGRATIONS = original
 
 
+def _sandboxed_cfg(t, **database):
+    """The `cfg` run_migrations() requires, pointed at this TestApp's temp filesystem.
+
+    run_migrations() takes the merged config rather than re-reading it, so that the
+    snapshot destination belongs to the database being migrated (dev/changelog/936).
+    Passing a test app's own paths here is what makes that true for a test; the default
+    keeps snapshots off, since the temp DB is built by create_all() and has no pending
+    step to back up unless a test rewinds the stamp on purpose.
+    """
+    cfg = {
+        'path': t.db_path,
+        'backup_dir': os.path.join(t._tmpdir, 'db-backups'),
+        'pre_migration_backup': False,
+    }
+    cfg.update(database)
+    return {'database': cfg}
+
+
 def _set_user_version(v):
     conn = db.engine.raw_connection()
     try:
@@ -143,7 +161,7 @@ class DowngradeProtectionTests(unittest.TestCase):
     def test_user_version_ahead_of_code_refuses_startup(self):
         _set_user_version(M.CURRENT_SCHEMA_VERSION + 5)
         with self.assertRaises(SystemExit):
-            M.run_migrations(fresh_db=False)
+            M.run_migrations(fresh_db=False, cfg=_sandboxed_cfg(self.t))
 
 
 class SchemaMigrationsRegistryTests(unittest.TestCase):
@@ -173,26 +191,17 @@ class BackupSnapshotTests(unittest.TestCase):
         self.t.cleanup()
 
     def test_snapshot_lands_in_backup_dir_via_temp_then_move(self):
-        # migrations._backup_before_migration reads load_config() fresh (test overrides
-        # deliberately don't leak into no-arg load_config - prod parity), so patch
-        # app.config.load_config to keep the snapshot on the temp filesystem. Without
-        # this the runner would VACUUM INTO next to the REAL dvr.db and write /dvr.
-        import app.config as cfgmod
-        backup_dir = os.path.join(self.t._tmpdir, 'db-backups')
-        real = cfgmod.load_config
-        cfgmod.load_config = lambda *a, **k: cfgmod._deep_merge(real(), {'database': {
-            'path': self.t.db_path,
-            'backup_dir': backup_dir,
-            'pre_migration_backup': True,
-        }})
-        try:
-            # Rewind the stamp by one so the last shipped step is "pending", forcing the
-            # runner to snapshot before (idempotently) re-running it.
-            _set_user_version(M.CURRENT_SCHEMA_VERSION - 1)
-            with _harmless_last_step():
-                M.run_migrations(fresh_db=False)
-        finally:
-            cfgmod.load_config = real
+        # No load_config patch: the runner takes the caller's cfg, so handing it this
+        # app's own paths is the whole of what keeps the snapshot on the temp filesystem
+        # (dev/changelog/936). Before that, a re-read resolved backup_dir against the real
+        # install and this test had to patch load_config to stay out of it.
+        cfg = _sandboxed_cfg(self.t, pre_migration_backup=True)
+        backup_dir = cfg['database']['backup_dir']
+        # Rewind the stamp by one so the last shipped step is "pending", forcing the
+        # runner to snapshot before (idempotently) re-running it.
+        _set_user_version(M.CURRENT_SCHEMA_VERSION - 1)
+        with _harmless_last_step():
+            M.run_migrations(fresh_db=False, cfg=cfg)
 
         snaps = glob.glob(os.path.join(backup_dir, 'dvr-pre-schema-v*.db'))
         self.assertEqual(len(snaps), 1, f'expected exactly one snapshot, got {snaps}')
@@ -201,6 +210,31 @@ class BackupSnapshotTests(unittest.TestCase):
         self.assertEqual(tmps, [], f'temp snapshot file left behind: {tmps}')
         # Runner brought the stamp back to current.
         self.assertEqual(_user_version(), M.CURRENT_SCHEMA_VERSION)
+
+    def test_a_migrating_test_app_cannot_write_into_the_real_install(self):
+        """dev/docs/BUGS.md 2026-09-12 - the snapshot must land where the migrating
+        database lives, not where the running install keeps its own backups.
+
+        _backup_before_migration used to re-read load_config(), and database.backup_dir
+        defaults to an app-root-relative path that resolve_app_path() anchors to the REAL
+        install. So a test that rewound the stamp VACUUMed its temp database into the
+        operator's instance/db-backups, dropped a .tmp beside the real dvr.db on the way,
+        and then let the pruner evict the genuine snapshots to keep three copies of an
+        empty test database. This drives that exact scenario with nothing patched.
+        """
+        app_root = os.path.dirname(os.path.dirname(os.path.abspath(M.__file__)))
+        real_backup_dir = os.path.join(app_root, 'instance', 'db-backups')
+        before = set(glob.glob(os.path.join(real_backup_dir, '*')))
+
+        _set_user_version(M.CURRENT_SCHEMA_VERSION - 1)
+        with _harmless_last_step():
+            M.run_migrations(fresh_db=False,
+                             cfg=_sandboxed_cfg(self.t, pre_migration_backup=True))
+
+        self.assertEqual(set(glob.glob(os.path.join(real_backup_dir, '*'))), before,
+                         'a test-driven migration wrote into the real install\'s backup dir')
+        strays = glob.glob(os.path.join(app_root, '.dvr-pre-schema-*.tmp'))
+        self.assertEqual(strays, [], f'temp snapshot left beside the real dvr.db: {strays}')
 
 
 class PruneMigrationBackupsTests(unittest.TestCase):
@@ -281,7 +315,8 @@ class AuditInsertIdempotentReRunTests(unittest.TestCase):
         _set_user_version(pending_version - 1)
 
         with _harmless_last_step():
-            M.run_migrations(fresh_db=False)  # must not raise IntegrityError -> SystemExit
+            # must not raise IntegrityError -> SystemExit
+            M.run_migrations(fresh_db=False, cfg=_sandboxed_cfg(self.t))
 
         self.assertEqual(_user_version(), M.CURRENT_SCHEMA_VERSION)
         rows = SchemaMigration.query.filter_by(version=pending_version).all()
@@ -1173,6 +1208,165 @@ class SegmentChannelIdMigrationTests(unittest.TestCase):
         self.assertIn('channel_id', {c.name for c in RecordingSegment.__table__.columns})
 
 
+class SyncLogSkipCountsMigrationTests(unittest.TestCase):
+    """Migration 51 - account_sync_logs.skipped_malformed_urls/skipped_duplicate_stream_ids,
+    backfilled from the MALFORMED_CHANNEL_URLS / DUPLICATE_STREAM_IDS_SKIPPED alert titles
+    that were the counts' only record before (dev/changelog/926). Raw scratch-DB
+    characterization like m032 above - the backfill is pure SQL."""
+
+    COLS = ('skipped_malformed_urls', 'skipped_duplicate_stream_ids')
+
+    def _make_scratch_db(self, td):
+        import sqlite3
+        conn = sqlite3.connect(os.path.join(td, 'scratch.db'))
+        cur = conn.cursor()
+        cur.execute('CREATE TABLE accounts (id INTEGER PRIMARY KEY, name VARCHAR(255) NOT NULL)')
+        cur.execute('CREATE TABLE account_sync_logs (id INTEGER PRIMARY KEY, '
+                    'account_id INTEGER NOT NULL, started_at DATETIME NOT NULL, '
+                    'completed_at DATETIME, status VARCHAR(32))')
+        cur.execute('CREATE TABLE alerts (id INTEGER PRIMARY KEY, alert_type VARCHAR(64) NOT NULL, '
+                    'severity VARCHAR(16) NOT NULL, title VARCHAR(255) NOT NULL, '
+                    'created_at DATETIME NOT NULL)')
+        conn.commit()
+        return conn, cur
+
+    @staticmethod
+    def _log(cur, log_id, account_id, completed_at, status='SUCCESS'):
+        cur.execute('INSERT INTO account_sync_logs (id, account_id, started_at, completed_at, '
+                    'status) VALUES (?, ?, ?, ?, ?)',
+                    (log_id, account_id, completed_at, completed_at, status))
+
+    @staticmethod
+    def _alert(cur, alert_type, title, created_at):
+        cur.execute("INSERT INTO alerts (alert_type, severity, title, created_at) "
+                    "VALUES (?, 'INFO', ?, ?)", (alert_type, title, created_at))
+
+    def _counts(self, cur):
+        return {r[0]: (r[1], r[2]) for r in cur.execute(
+            f'SELECT id, {self.COLS[0]}, {self.COLS[1]} FROM account_sync_logs')}
+
+    def test_m051_adds_both_columns_and_is_idempotent(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            conn, cur = self._make_scratch_db(td)
+            M._m051_sync_log_skip_counts(conn, cur)
+            cols = {r[1] for r in cur.execute('PRAGMA table_info(account_sync_logs)')}
+            for col in self.COLS:
+                self.assertIn(col, cols)
+            M._m051_sync_log_skip_counts(conn, cur)
+            self.assertEqual(
+                {r[1] for r in cur.execute('PRAGMA table_info(account_sync_logs)')}, cols)
+            conn.close()
+
+    def test_m051_backfills_each_count_from_the_alert_its_sync_raised(self):
+        """The shape measured on the live database: the alert is created milliseconds after
+        the sync row is stamped complete, and names the account rather than its id."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            conn, cur = self._make_scratch_db(td)
+            cur.execute("INSERT INTO accounts (id, name) VALUES (1, 'provider-a'), "
+                        "(2, 'IPTV: main')")
+            self._log(cur, 10, 1, '2026-09-01 14:49:24.708780')
+            self._log(cur, 20, 2, '2026-09-01 14:57:05.513902', status='PARTIAL')
+            self._alert(cur, 'MALFORMED_CHANNEL_URLS',
+                        'provider-a: skipped 250 malformed channel URL(s)',
+                        '2026-09-01 14:49:24.720770')
+            self._alert(cur, 'DUPLICATE_STREAM_IDS_SKIPPED',
+                        'provider-a: skipped 332 duplicate stream ID(s)',
+                        '2026-09-01 14:49:24.731000')
+            # An account name carrying its own colon must still resolve to that account.
+            self._alert(cur, 'DUPLICATE_STREAM_IDS_SKIPPED',
+                        'IPTV: main: skipped 7 duplicate stream ID(s)',
+                        '2026-09-01 14:57:05.524886')
+            conn.commit()
+
+            M._m051_sync_log_skip_counts(conn, cur)
+
+            counts = self._counts(cur)
+            self.assertEqual(counts[10], (250, 332))
+            self.assertEqual(counts[20], (None, 7))
+            conn.close()
+
+    def test_m051_leaves_a_sync_with_no_matching_alert_untracked_not_zero(self):
+        """No alert does not prove nothing was skipped: an ignored alert writes no row, and
+        dismissed alerts are pruned after alerts.keep_days. Each case below must stay NULL."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            conn, cur = self._make_scratch_db(td)
+            cur.execute("INSERT INTO accounts (id, name) VALUES (1, 'solo'), (2, 'twin'), "
+                        "(3, 'twin')")
+            self._log(cur, 1, 1, '2026-09-01 10:00:00')          # no alert at all
+            self._log(cur, 2, 1, '2026-09-02 10:00:00')          # alert 2 minutes later
+            self._alert(cur, 'MALFORMED_CHANNEL_URLS', 'solo: skipped 5 malformed channel URL(s)',
+                        '2026-09-02 10:02:00')
+            self._log(cur, 3, 1, '2026-09-03 10:00:00', status='ERROR')
+            self._alert(cur, 'MALFORMED_CHANNEL_URLS', 'solo: skipped 6 malformed channel URL(s)',
+                        '2026-09-03 10:00:00.010000')
+            # Two accounts share the name, so the alert cannot say which one it was.
+            self._log(cur, 4, 2, '2026-09-04 10:00:00')
+            self._log(cur, 5, 3, '2026-09-04 10:00:00')
+            self._alert(cur, 'MALFORMED_CHANNEL_URLS', 'twin: skipped 8 malformed channel URL(s)',
+                        '2026-09-04 10:00:00.010000')
+            conn.commit()
+
+            M._m051_sync_log_skip_counts(conn, cur)
+
+            for log_id, pair in self._counts(cur).items():
+                self.assertEqual(pair, (None, None), f'sync log {log_id} must stay untracked')
+            conn.close()
+
+    def test_m051_resumes_a_backfill_interrupted_after_its_columns_were_added(self):
+        """dev/changelog/686: the columns existing is not evidence the backfill ran. A crash
+        between the ALTER and the backfill leaves exactly this state."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            conn, cur = self._make_scratch_db(td)
+            M._register_backfill(conn, cur, M._BF_SYNC_LOG_SKIP_COUNTS)
+            for col in self.COLS:
+                cur.execute(f'ALTER TABLE account_sync_logs ADD COLUMN {col} INTEGER')
+            cur.execute("INSERT INTO accounts (id, name) VALUES (1, 'acct')")
+            self._log(cur, 1, 1, '2026-09-01 10:00:00')
+            self._alert(cur, 'MALFORMED_CHANNEL_URLS', 'acct: skipped 3 malformed channel URL(s)',
+                        '2026-09-01 10:00:00.010000')
+            conn.commit()
+
+            M._m051_sync_log_skip_counts(conn, cur)
+
+            self.assertEqual(self._counts(cur)[1], (3, None))
+            conn.close()
+
+    def test_m051_does_not_rerun_a_finished_backfill(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            conn, cur = self._make_scratch_db(td)
+            cur.execute("INSERT INTO accounts (id, name) VALUES (1, 'acct')")
+            self._log(cur, 1, 1, '2026-09-01 10:00:00')
+            self._alert(cur, 'MALFORMED_CHANNEL_URLS', 'acct: skipped 3 malformed channel URL(s)',
+                        '2026-09-01 10:00:00.010000')
+            conn.commit()
+            M._m051_sync_log_skip_counts(conn, cur)
+
+            cur.execute(f'UPDATE account_sync_logs SET {self.COLS[0]} = 99 WHERE id = 1')
+            conn.commit()
+            M._m051_sync_log_skip_counts(conn, cur)
+
+            self.assertEqual(self._counts(cur)[1], (99, None))
+            conn.close()
+
+    def test_m051_registered_at_its_own_version(self):
+        registered = {v: fn for v, _d, fn in M.SCHEMA_MIGRATIONS}
+        self.assertIs(registered.get(51), M._m051_sync_log_skip_counts)
+        self.assertEqual(M.CURRENT_SCHEMA_VERSION, max(registered),
+                         'SCHEMA_MIGRATIONS must stay in ascending version order')
+
+    def test_m051_columns_match_the_model(self):
+        # A create_all() DB never runs this step, so the two paths must not diverge.
+        from app.database import AccountSyncLog
+        model_cols = {c.name for c in AccountSyncLog.__table__.columns}
+        for col in self.COLS:
+            self.assertIn(col, model_cols)
+
+
 class ProgramTitleBackfillDeterminismTests(unittest.TestCase):
     """Migration 2 - recordings.program_title/program_sub_title backfill
     (dev/docs/BUGS.md 2026-08-17 "m002 backfill can split title/sub_title across two rows").
@@ -1299,7 +1493,6 @@ _CURRENT_CODE_IMPORTS = {
     # nothing into the database it is backing up.
     ('_backup_before_migration', '.config.DEFAULT_DB_BACKUP_DIR'): _PLUMBING,
     ('_backup_before_migration', '.config.ensure_private_dir'): _PLUMBING,
-    ('_backup_before_migration', '.config.load_config'): _PLUMBING,
     ('_backup_before_migration', '.config.resolve_app_path'): _PLUMBING,
     ('_backup_before_migration', '.tz_utils.get_display_tz'): _PLUMBING,
 }
@@ -1470,6 +1663,598 @@ class PrefixRedundantIndexMigrationTests(unittest.TestCase):
                          'CURRENT_SCHEMA_VERSION derives from the registry tail')
         self.assertEqual(M.CURRENT_SCHEMA_VERSION, max(registered),
                          'SCHEMA_MIGRATIONS must stay in ascending version order')
+
+
+class RetiredAlertDismissMigrationTests(unittest.TestCase):
+    """Migration 52 - dismiss the open rows of the twelve types nothing raises any more
+    (dev/changelog/928), so the counter starts at a number the user can act on. Raw
+    scratch-DB characterization like m051 above - the migration is pure SQL."""
+
+    def _make_scratch_db(self, td):
+        import sqlite3
+        conn = sqlite3.connect(os.path.join(td, 'scratch.db'))
+        cur = conn.cursor()
+        cur.execute('CREATE TABLE alerts (id INTEGER PRIMARY KEY, '
+                    'alert_type VARCHAR(64) NOT NULL, severity VARCHAR(16) NOT NULL, '
+                    'title VARCHAR(255) NOT NULL, created_at DATETIME NOT NULL, '
+                    'read_at DATETIME, dismissed_at DATETIME)')
+        conn.commit()
+        return conn, cur
+
+    @staticmethod
+    def _alert(cur, alert_type, dismissed_at=None):
+        cur.execute("INSERT INTO alerts (alert_type, severity, title, created_at, "
+                    "dismissed_at) VALUES (?, 'WARN', 'x', '2026-09-11 00:00:00', ?)",
+                    (alert_type, dismissed_at))
+
+    def _rows(self, cur):
+        return {r[0]: (r[1], r[2]) for r in cur.execute(
+            'SELECT alert_type, dismissed_at, read_at FROM alerts')}
+
+    def test_m052_dismisses_open_retired_rows_and_leaves_live_types_alone(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            conn, cur = self._make_scratch_db(td)
+            self._alert(cur, 'GROUP_FORMAT_MISMATCH')
+            self._alert(cur, 'JOB_SKIPPED')
+            self._alert(cur, 'CONVERSION_FAILED')
+            conn.commit()
+
+            M._m052_dismiss_retired_alert_type_rows(conn, cur)
+            rows = self._rows(cur)
+
+            self.assertIsNotNone(rows['GROUP_FORMAT_MISMATCH'][0])
+            self.assertIsNotNone(rows['JOB_SKIPPED'][0])
+            self.assertIsNone(rows['CONVERSION_FAILED'][0],
+                              'a type still raised must keep its open alert')
+            conn.close()
+
+    def test_m052_does_not_mark_anything_read(self):
+        """Dismissing is the action a user would have taken; claiming they read it is not."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            conn, cur = self._make_scratch_db(td)
+            self._alert(cur, 'HEALTH_CHECK_COMPLETE')
+            conn.commit()
+
+            M._m052_dismiss_retired_alert_type_rows(conn, cur)
+
+            self.assertIsNone(self._rows(cur)['HEALTH_CHECK_COMPLETE'][1])
+            conn.close()
+
+    def test_m052_is_rerunnable_and_does_not_move_an_existing_dismissal(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            conn, cur = self._make_scratch_db(td)
+            self._alert(cur, 'SYNC_CHANNELS_NEW', dismissed_at='2026-01-01 00:00:00')
+            self._alert(cur, 'SYNC_CHANNELS_MISSING')
+            conn.commit()
+
+            M._m052_dismiss_retired_alert_type_rows(conn, cur)
+            first = self._rows(cur)
+            M._m052_dismiss_retired_alert_type_rows(conn, cur)
+
+            self.assertEqual(self._rows(cur), first,
+                             'a re-run after an interrupted attempt must change nothing')
+            self.assertEqual(first['SYNC_CHANNELS_NEW'][0], '2026-01-01 00:00:00',
+                             'an already-dismissed row keeps its original timestamp')
+            conn.close()
+
+    def test_m052_covers_every_type_retired_when_it_shipped(self):
+        """The migration spells its twelve names out rather than reading
+        RETIRED_ALERT_TYPES, so that its effect stays what it was when it shipped.
+
+        This is the tripwire for that choice: it fails if the two ever diverge. When they
+        do because a thirteenth type has been retired, the fix is a NEW migration for that
+        type's rows - never an edit to this one, which existing installs have already run
+        and will never run again.
+        """
+        import tempfile
+        from app.alerts import RETIRED_ALERT_TYPES
+        with tempfile.TemporaryDirectory() as td:
+            conn, cur = self._make_scratch_db(td)
+            for alert_type in sorted(RETIRED_ALERT_TYPES):
+                self._alert(cur, alert_type)
+            conn.commit()
+
+            M._m052_dismiss_retired_alert_type_rows(conn, cur)
+
+            still_open = [t for t, (dismissed, _read) in self._rows(cur).items()
+                          if dismissed is None]
+            self.assertEqual(
+                [], still_open,
+                f'these types are retired but migration 52 does not dismiss them: '
+                f'{still_open}. Add a new migration for them rather than editing 52.')
+            conn.close()
+
+    def test_m052_registered_at_its_own_version(self):
+        registered = {v: fn for v, _d, fn in M.SCHEMA_MIGRATIONS}
+        self.assertIs(registered.get(52), M._m052_dismiss_retired_alert_type_rows)
+        self.assertEqual(M.CURRENT_SCHEMA_VERSION, max(registered))
+
+
+class StaleRecordingLinkMigrationTests(unittest.TestCase):
+    """Migration 53 - unlink the alerts and pre-check tests still naming a recording they
+    cannot be about (dev/changelog/929). Raw scratch-DB characterization like m052 above:
+    the migration is pure SQL.
+
+    The predicate that matters is the timestamp one. recordings.id is re-issued, so on the
+    database this shipped against every stale row pointed at an id that existed again -
+    a missing-row check alone would have repaired none of them.
+    """
+
+    REC_CREATED = '2026-09-11 10:26:53'
+
+    def _make_scratch_db(self, td):
+        import sqlite3
+        conn = sqlite3.connect(os.path.join(td, 'scratch.db'))
+        cur = conn.cursor()
+        cur.execute('CREATE TABLE recordings (id INTEGER PRIMARY KEY, created_at DATETIME)')
+        cur.execute('CREATE TABLE alerts (id INTEGER PRIMARY KEY, '
+                    'alert_type VARCHAR(64) NOT NULL, severity VARCHAR(16) NOT NULL, '
+                    'title VARCHAR(255) NOT NULL, created_at DATETIME NOT NULL, '
+                    'read_at DATETIME, dismissed_at DATETIME, recording_id INTEGER)')
+        cur.execute('CREATE TABLE channel_tests (id INTEGER PRIMARY KEY, '
+                    'test_started_at DATETIME NOT NULL, pre_check_recording_id INTEGER)')
+        # Recording 17 is the id that was handed out a second time; 99 is a recording that
+        # was never deleted, so the alerts naming it are genuinely about it.
+        cur.execute('INSERT INTO recordings (id, created_at) VALUES (17, ?), (99, ?)',
+                    (self.REC_CREATED, '2026-01-01 00:00:00'))
+        conn.commit()
+        return conn, cur
+
+    @staticmethod
+    def _alert(cur, alert_id, recording_id, created_at, dismissed_at=None):
+        cur.execute("INSERT INTO alerts (id, alert_type, severity, title, created_at, "
+                    "dismissed_at, recording_id) VALUES (?, 'LOG_ERROR', 'ERROR', 'x', "
+                    "?, ?, ?)", (alert_id, created_at, dismissed_at, recording_id))
+
+    def _alert_row(self, cur, alert_id):
+        return cur.execute('SELECT recording_id, dismissed_at FROM alerts WHERE id = ?',
+                           (alert_id,)).fetchone()
+
+    def test_an_alert_older_than_the_recording_it_names_is_unlinked_and_dismissed(self):
+        """The live case: the alert is about a deleted recording whose id was re-issued."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            conn, cur = self._make_scratch_db(td)
+            self._alert(cur, 665, 17, '2026-09-10 20:21:04')
+            conn.commit()
+
+            M._m053_unlink_stale_recording_references(conn, cur)
+
+            recording_id, dismissed_at = self._alert_row(cur, 665)
+            self.assertIsNone(recording_id, 'the stale alert still deep-links to #17')
+            self.assertIsNotNone(dismissed_at)
+            conn.close()
+
+    def test_an_alert_whose_recording_is_gone_is_unlinked_too(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            conn, cur = self._make_scratch_db(td)
+            self._alert(cur, 700, 4242, '2026-09-10 20:21:04')
+            conn.commit()
+
+            M._m053_unlink_stale_recording_references(conn, cur)
+
+            self.assertEqual(self._alert_row(cur, 700)[0], None)
+            conn.close()
+
+    def test_an_alert_that_really_is_about_its_recording_is_left_alone(self):
+        """The migration must not detach the 15 healthy links on the way past."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            conn, cur = self._make_scratch_db(td)
+            self._alert(cur, 701, 17, '2026-09-11 11:00:00')   # after #17 was created
+            self._alert(cur, 702, 99, '2026-06-01 00:00:00')
+            conn.commit()
+
+            M._m053_unlink_stale_recording_references(conn, cur)
+
+            self.assertEqual(self._alert_row(cur, 701), (17, None))
+            self.assertEqual(self._alert_row(cur, 702), (99, None))
+            conn.close()
+
+    def test_a_stale_row_already_dismissed_keeps_its_original_timestamp(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            conn, cur = self._make_scratch_db(td)
+            self._alert(cur, 664, 17, '2026-09-10 20:17:00',
+                        dismissed_at='2026-09-11 22:51:33')
+            conn.commit()
+
+            M._m053_unlink_stale_recording_references(conn, cur)
+
+            self.assertEqual(self._alert_row(cur, 664), (None, '2026-09-11 22:51:33'))
+            conn.close()
+
+    def test_m053_is_rerunnable(self):
+        """Nulling the column is what takes a repaired row out of the predicate, so a
+        retry after an interrupted run reaches only what the first attempt did not."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            conn, cur = self._make_scratch_db(td)
+            self._alert(cur, 665, 17, '2026-09-10 20:21:04')
+            self._alert(cur, 701, 17, '2026-09-11 11:00:00')
+            conn.commit()
+
+            M._m053_unlink_stale_recording_references(conn, cur)
+            first = cur.execute(
+                'SELECT id, recording_id, dismissed_at FROM alerts ORDER BY id').fetchall()
+            M._m053_unlink_stale_recording_references(conn, cur)
+
+            self.assertEqual(
+                cur.execute('SELECT id, recording_id, dismissed_at FROM alerts '
+                            'ORDER BY id').fetchall(), first,
+                'a re-run after an interrupted attempt must change nothing')
+            conn.close()
+
+    def test_a_pre_check_test_older_than_its_recording_is_unlinked(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            conn, cur = self._make_scratch_db(td)
+            cur.execute('INSERT INTO channel_tests (id, test_started_at, '
+                        'pre_check_recording_id) VALUES (1, ?, 17), (2, ?, 17), (3, ?, 88)',
+                        ('2026-09-10 20:00:00', '2026-09-11 12:00:00', '2026-09-11 12:00:00'))
+            conn.commit()
+
+            M._m053_unlink_stale_recording_references(conn, cur)
+
+            rows = dict(cur.execute(
+                'SELECT id, pre_check_recording_id FROM channel_tests').fetchall())
+            self.assertIsNone(rows[1], 'a test that predates #17 cannot be about it')
+            self.assertEqual(rows[2], 17, 'a genuine pre-check link was detached')
+            self.assertIsNone(rows[3], 'the recording it named is gone')
+            conn.close()
+
+    def test_m053_registered_at_its_own_version(self):
+        registered = {v: fn for v, _d, fn in M.SCHEMA_MIGRATIONS}
+        self.assertIs(registered.get(53), M._m053_unlink_stale_recording_references)
+        self.assertEqual(M.CURRENT_SCHEMA_VERSION, max(registered),
+                         'SCHEMA_MIGRATIONS must stay in ascending version order')
+
+
+class GuideCheckRetargetAnnouncementMigrationTests(unittest.TestCase):
+    """Migration 54 - remove what the one-time TV Guide retarget announcement left behind
+    (dev/changelog/931): the alert it raised, and the user_prefs flag that gated the
+    startup hook. Characterization of a new migration rather than a regression guard -
+    there was no defect, the announcement was simply spent. Raw scratch-DB style like
+    m052 above; the migration is pure SQL."""
+
+    def _make_scratch_db(self, td):
+        import sqlite3
+        conn = sqlite3.connect(os.path.join(td, 'scratch.db'))
+        cur = conn.cursor()
+        cur.execute('CREATE TABLE alerts (id INTEGER PRIMARY KEY, '
+                    'alert_type VARCHAR(64) NOT NULL, severity VARCHAR(16) NOT NULL, '
+                    'title VARCHAR(255) NOT NULL, created_at DATETIME NOT NULL, '
+                    'read_at DATETIME, dismissed_at DATETIME)')
+        cur.execute('CREATE TABLE user_prefs ("key" VARCHAR(64) NOT NULL PRIMARY KEY, '
+                    'value TEXT)')
+        conn.commit()
+        return conn, cur
+
+    @staticmethod
+    def _alert(cur, alert_type):
+        cur.execute("INSERT INTO alerts (alert_type, severity, title, created_at) "
+                    "VALUES (?, 'INFO', 'x', '2026-08-19 17:56:46')", (alert_type,))
+
+    def _state(self, cur):
+        return (sorted(r[0] for r in cur.execute('SELECT alert_type FROM alerts')),
+                sorted(r[0] for r in cur.execute('SELECT "key" FROM user_prefs')))
+
+    def test_m054_removes_the_alert_and_the_flag_and_nothing_else(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            conn, cur = self._make_scratch_db(td)
+            self._alert(cur, 'HEALTH_CHECK_TARGETS_CHANGED')
+            self._alert(cur, 'HEALTH_CHECK_WINDOW')
+            cur.execute("INSERT INTO user_prefs VALUES "
+                        "('guide_check_retarget_announced', '2')")
+            cur.execute("INSERT INTO user_prefs VALUES ('ch_logo_only', '1')")
+            conn.commit()
+
+            M._m054_drop_guide_check_retarget_announcement(conn, cur)
+
+            self.assertEqual((['HEALTH_CHECK_WINDOW'], ['ch_logo_only']),
+                             self._state(cur),
+                             'only the retarget announcement leaves; a live alert type '
+                             'and an unrelated preference both stay')
+            conn.close()
+
+    def test_m054_is_rerunnable(self):
+        """Deletes by predicate, so a retry after an interrupted run is a no-op."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            conn, cur = self._make_scratch_db(td)
+            self._alert(cur, 'HEALTH_CHECK_TARGETS_CHANGED')
+            cur.execute("INSERT INTO user_prefs VALUES "
+                        "('guide_check_retarget_announced', '2')")
+            conn.commit()
+
+            M._m054_drop_guide_check_retarget_announcement(conn, cur)
+            first = self._state(cur)
+            M._m054_drop_guide_check_retarget_announcement(conn, cur)
+
+            self.assertEqual(([], []), first)
+            self.assertEqual(first, self._state(cur))
+            conn.close()
+
+    def test_the_alert_type_is_gone_from_the_registry(self):
+        """The rows are deleted rather than kept, so unlike a retired type this one keeps
+        no label - and nothing may quietly reintroduce one."""
+        from app.alerts import ALERT_TYPES
+        self.assertNotIn('HEALTH_CHECK_TARGETS_CHANGED', ALERT_TYPES)
+
+    def test_m054_registered_at_its_own_version(self):
+        registered = {v: fn for v, _d, fn in M.SCHEMA_MIGRATIONS}
+        self.assertIs(registered.get(54),
+                      M._m054_drop_guide_check_retarget_announcement)
+
+
+class RecordingsAutoincrementMigrationTests(unittest.TestCase):
+    """Migration 55 - rebuild `recordings` with AUTOINCREMENT so SQLite stops re-issuing a
+    deleted recording's id to the next recording created (dev/changelog/937).
+
+    Raw scratch-DB style like m052/m054 above: the step is pure SQL over a table whose
+    pre-55 shape is derived from the model here, so the fixture follows the model rather
+    than freezing a column list that would drift the first time one is added.
+    """
+
+    #: A fresh build gets AUTOINCREMENT straight from the model, so the pre-55 shape has to
+    #: be reconstructed by undoing exactly what the step does - which also keeps this
+    #: fixture honest: if the two spellings ever stop being inverses, these tests say so.
+    @staticmethod
+    def _v54_recordings_ddl():
+        from sqlalchemy.schema import CreateTable
+        from sqlalchemy.dialects import sqlite as sqlite_dialect
+        from app.database import Recording
+        ddl = str(CreateTable(Recording.__table__).compile(
+            dialect=sqlite_dialect.dialect())).strip()
+        assert M._PK_COLUMN_NEW in ddl, (
+            'Recording no longer compiles to the AUTOINCREMENT primary key this fixture '
+            f'inverts - check __table_args__. Compiled:\n{ddl}')
+        ddl = ddl.replace(M._PK_COLUMN_NEW, M._PK_COLUMN_OLD, 1)
+        # The table constraint sits between the last column and the first FOREIGN KEY,
+        # which is where SQLAlchemy puts it when it is not inlined on the column.
+        first_fk = ddl.index('\n\tFOREIGN KEY')
+        return ddl[:first_fk] + M._PK_TABLE_CONSTRAINT + ddl[first_fk:]
+
+    def _make_scratch_db(self, td, rows=3):
+        import sqlite3
+        conn = sqlite3.connect(os.path.join(td, 'scratch.db'))
+        cur = conn.cursor()
+        cur.execute(self._v54_recordings_ddl())
+        # The two referencing tables that are not cascaded away with a recording. Their FK
+        # clauses name `recordings`, which is what the drop-and-rename must leave intact.
+        cur.execute('CREATE TABLE alerts (id INTEGER NOT NULL, alert_type VARCHAR(64) NOT NULL, '
+                    'title VARCHAR(255) NOT NULL, recording_id INTEGER, PRIMARY KEY (id), '
+                    'FOREIGN KEY(recording_id) REFERENCES recordings (id))')
+        cur.execute('CREATE TABLE channel_tests (id INTEGER NOT NULL, '
+                    'pre_check_recording_id INTEGER, PRIMARY KEY (id), '
+                    'FOREIGN KEY(pre_check_recording_id) REFERENCES recordings (id))')
+        for i in range(1, rows + 1):
+            cur.execute(
+                'INSERT INTO recordings (id, name, url, start_time, stop_time, status, '
+                'final_file_size) VALUES (?, ?, ?, ?, ?, ?, ?)',
+                (i, f'rec {i}', f'http://example.test/live/{i}', '2026-09-01 00:00:00',
+                 '2026-09-01 01:00:00', 'COMPLETED', i * 1000))
+        cur.execute("INSERT INTO alerts (id, alert_type, title, recording_id) "
+                    "VALUES (1, 'LOG_ERROR', 'move failed', ?)", (rows,))
+        conn.commit()
+        return conn, cur
+
+    @staticmethod
+    def _ddl(cur):
+        return cur.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='recordings'"
+        ).fetchone()[0]
+
+    @staticmethod
+    def _next_id(cur):
+        """The id SQLite would hand the next recording, observed rather than predicted."""
+        cur.execute("INSERT INTO recordings (name, url, start_time, stop_time, status) "
+                    "VALUES ('next', 'u', '2026-09-01 00:00:00', '2026-09-01 01:00:00', "
+                    "'SCHEDULED')")
+        return cur.lastrowid
+
+    def test_m055_rebuilds_with_autoincrement_and_is_idempotent(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            conn, cur = self._make_scratch_db(td)
+            self.assertNotIn('AUTOINCREMENT', self._ddl(cur),
+                             'fixture must start in the pre-55 shape')
+
+            M._m055_recordings_autoincrement(conn, cur)
+            conn.commit()
+            first = self._ddl(cur)
+            self.assertIn('AUTOINCREMENT', first)
+            self.assertNotIn('recordings_autoinc_new', {
+                r[0] for r in cur.execute("SELECT name FROM sqlite_master WHERE type='table'")},
+                'the temporary rebuild table was left behind')
+
+            M._m055_recordings_autoincrement(conn, cur)
+            conn.commit()
+            self.assertEqual(first, self._ddl(cur), 'a second run rebuilt an AUTOINCREMENT table')
+            conn.close()
+
+    def test_m055_carries_every_row_and_column_value_across(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            conn, cur = self._make_scratch_db(td)
+            before = cur.execute('SELECT * FROM recordings ORDER BY id').fetchall()
+            cols_before = [d[0] for d in cur.description]
+
+            M._m055_recordings_autoincrement(conn, cur)
+            conn.commit()
+
+            after = cur.execute('SELECT * FROM recordings ORDER BY id').fetchall()
+            self.assertEqual([d[0] for d in cur.description], cols_before,
+                             'the rebuilt table has a different column list')
+            self.assertEqual(before, after, 'the rebuild did not preserve every row verbatim')
+            conn.close()
+
+    def test_m055_stops_a_deleted_id_being_re_issued(self):
+        """The defect itself. Before the rebuild, deleting the newest recording hands its
+        number to the next one; after it, the number is retired."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            conn, cur = self._make_scratch_db(td)
+            cur.execute('DELETE FROM recordings WHERE id = 3')
+            # Re-issued straight back, which is the defect. This also puts the table back
+            # to ids 1-3, so the rebuild below starts from the shape the fixture describes.
+            self.assertEqual(self._next_id(cur), 3,
+                             'fixture must reproduce the reuse this migration closes')
+
+            M._m055_recordings_autoincrement(conn, cur)
+            conn.commit()
+
+            cur.execute('DELETE FROM recordings WHERE id = 3')
+            self.assertEqual(self._next_id(cur), 4,
+                             'a deleted recording id was handed to the next recording')
+            conn.close()
+
+    def test_m055_retires_ids_from_the_highest_one_it_finds(self):
+        """What the rebuild can and cannot promise, stated rather than assumed.
+
+        The copy leaves sqlite_sequence at the highest id present, so every id up to and
+        including that one is retired - including gaps left by recordings deleted from the
+        middle. An id deleted from the TOP before the migration ran leaves no trace of
+        itself anywhere (the referencing rows were unlinked by migration 53 and the
+        cascaded ones are gone), so it is not knowable here and can be issued once more.
+        That residual is what dev/changelog/929's unlink-on-delete already covers.
+        """
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            conn, cur = self._make_scratch_db(td)
+            cur.execute('DELETE FROM recordings WHERE id = 2')  # a gap below the maximum
+
+            M._m055_recordings_autoincrement(conn, cur)
+            conn.commit()
+
+            self.assertEqual(
+                cur.execute("SELECT seq FROM sqlite_sequence WHERE name='recordings'"
+                            ).fetchone()[0], 3,
+                'the rebuild did not carry the high-water mark across')
+            self.assertEqual(self._next_id(cur), 4,
+                             'a gap below the highest id was handed out again')
+            conn.close()
+
+    def test_m055_keeps_the_referencing_tables_pointing_at_recordings(self):
+        """Foreign keys are off, so nothing errors if the drop/rename strands a referencing
+        table - it would just silently stop describing anything."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            conn, cur = self._make_scratch_db(td)
+            M._m055_recordings_autoincrement(conn, cur)
+            conn.commit()
+
+            for table, column in (('alerts', 'recording_id'),
+                                  ('channel_tests', 'pre_check_recording_id')):
+                targets = {(r[2], r[3]) for r in cur.execute(f'PRAGMA foreign_key_list({table})')}
+                self.assertIn(('recordings', column), targets,
+                              f'{table}.{column} stopped referencing recordings')
+            self.assertEqual(cur.execute('PRAGMA foreign_key_check').fetchall(), [],
+                             'the rebuild stranded a referencing row')
+            conn.close()
+
+    def test_m055_produces_the_same_ddl_a_fresh_build_does(self):
+        """A migrated database and a create_all() one must not diverge - the model carries
+        sqlite_autoincrement, and this step is the only other way to get there.
+
+        Compared with the table name unquoted on both sides. ALTER TABLE ... RENAME TO
+        rewrites the stored CREATE TABLE with the new name quoted, so a rebuilt table reads
+        `CREATE TABLE "recordings"` where a fresh one reads `CREATE TABLE recordings`. That
+        is SQLite's own spelling of an identifier and changes nothing about the table; it is
+        also unavoidable, since the rename is what the rebuild is made of. Everything after
+        the table name - every column, type, default and constraint - must match exactly.
+        """
+        import tempfile
+        from sqlalchemy.schema import CreateTable
+        from sqlalchemy.dialects import sqlite as sqlite_dialect
+        from app.database import Recording
+        fresh = str(CreateTable(Recording.__table__).compile(
+            dialect=sqlite_dialect.dialect())).strip()
+        with tempfile.TemporaryDirectory() as td:
+            conn, cur = self._make_scratch_db(td)
+            M._m055_recordings_autoincrement(conn, cur)
+            conn.commit()
+            rebuilt = self._ddl(cur).replace('CREATE TABLE "recordings"',
+                                             'CREATE TABLE recordings', 1)
+            self.assertEqual(rebuilt, fresh,
+                             'the rebuilt table differs from what create_all() builds')
+            conn.close()
+
+    def test_m055_refuses_a_ddl_it_cannot_transform(self):
+        """Loud, not silent. A rebuild that quietly produced a table without AUTOINCREMENT
+        would leave the id still being re-issued while every presence check passed."""
+        with self.assertRaises(RuntimeError) as ctx:
+            M._recordings_autoincrement_ddl(
+                'CREATE TABLE recordings (id INTEGER PRIMARY KEY, name TEXT)', 'tmp')
+        self.assertIn('AUTOINCREMENT', str(ctx.exception))
+
+    def test_m055_leaves_nothing_behind_if_it_dies_before_the_rename(self):
+        """An interrupted rebuild must be re-runnable, which is what the step's explicit
+        BEGIN buys.
+
+        Python's sqlite3 driver opens a transaction for INSERT but not for DDL, so without
+        it the temporary table's CREATE commits on its own and survives the rollback - and
+        the retry then dies on "table already exists", aborting startup with no way past it
+        short of dropping the table by hand. `recordings` itself survives either way,
+        because the copy's implicit transaction covers the DROP.
+        """
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            conn, cur = self._make_scratch_db(td)
+            before = cur.execute('SELECT * FROM recordings ORDER BY id').fetchall()
+
+            class _DiesOnRename:
+                def __init__(self, inner):
+                    self._inner = inner
+
+                def __getattr__(self, name):
+                    return getattr(self._inner, name)
+
+                def execute(self, sql, *a):
+                    if 'RENAME TO' in sql:
+                        raise RuntimeError('simulated crash before the rename')
+                    return self._inner.execute(sql, *a)
+
+            with self.assertRaises(RuntimeError):
+                M._m055_recordings_autoincrement(conn, _DiesOnRename(cur))
+            conn.rollback()
+
+            tables = {r[0] for r in cur.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            self.assertIn('recordings', tables,
+                          'a crash mid-rebuild destroyed the recordings table')
+            self.assertNotIn('recordings_autoinc_new', tables,
+                             'the rolled-back rebuild left its temporary table behind')
+            self.assertEqual(cur.execute('SELECT * FROM recordings ORDER BY id').fetchall(),
+                             before, 'the rolled-back rebuild lost rows')
+
+            # The point of all of the above: the next startup finishes the job.
+            M._m055_recordings_autoincrement(conn, cur)
+            conn.commit()
+            self.assertIn('AUTOINCREMENT', self._ddl(cur),
+                          'an interrupted rebuild could not be re-run to completion')
+            self.assertEqual(cur.execute('SELECT * FROM recordings ORDER BY id').fetchall(),
+                             before, 'the retried rebuild lost rows')
+            conn.close()
+
+    def test_m055_registered_at_its_own_version(self):
+        registered = {v: fn for v, _d, fn in M.SCHEMA_MIGRATIONS}
+        self.assertIs(registered.get(55), M._m055_recordings_autoincrement)
+        self.assertEqual(M.CURRENT_SCHEMA_VERSION, M.SCHEMA_MIGRATIONS[-1][0],
+                         'CURRENT_SCHEMA_VERSION derives from the registry tail')
+        self.assertEqual(M.CURRENT_SCHEMA_VERSION, max(registered),
+                         'SCHEMA_MIGRATIONS must stay in ascending version order')
+
+    def test_the_model_carries_sqlite_autoincrement(self):
+        """A fresh install never runs this step, so the model is what gets it there."""
+        from app.database import Recording
+        self.assertTrue(Recording.__table__.dialect_options['sqlite']['autoincrement'],
+                        'Recording lost __table_args__ sqlite_autoincrement - a fresh '
+                        'install would re-issue deleted recording ids again')
 
 
 if __name__ == '__main__':

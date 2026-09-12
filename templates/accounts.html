@@ -43,12 +43,17 @@
    WITHOUT the provider's raw error text. §17.1/17.6: why a sync failed stays reachable only
    on the account page this row opens - the list row's job is "which account, healthy or
    not, how big", never the provider's own error string. #}
+{% macro skipped_text(log) -%}
+{%- if log.skipped_malformed_urls %}, {{ '{:,}'.format(log.skipped_malformed_urls) }} skipped as malformed URLs{% endif -%}
+{%- if log.skipped_duplicate_stream_ids %}, {{ '{:,}'.format(log.skipped_duplicate_stream_ids) }} skipped as duplicate stream IDs{% endif -%}
+{%- endmacro %}
+
 {% macro sync_detail(log) -%}
 {%- if not log.status -%}Sync started.
 {%- elif log.status == 'SUCCESS' -%}
-Sync finished: {{ '{:,}'.format(log.channels_synced or 0) }} channels{% if log.channels_added is not none and log.channels_removed is not none %} ({{ '{:,}'.format(log.channels_added) }} added, {{ '{:,}'.format(log.channels_removed) }} removed){% endif %}, {{ '{:,}'.format(log.epg_entries_synced or 0) }} program entries{% if log.completed_at and log.started_at %} in {{ (log.completed_at - log.started_at).total_seconds() | duration }}{% endif %}.
+Sync finished: {{ '{:,}'.format(log.channels_synced or 0) }} channels{% if log.channels_added is not none and log.channels_removed is not none %} ({{ '{:,}'.format(log.channels_added) }} added, {{ '{:,}'.format(log.channels_removed) }} removed){% endif %}{{ skipped_text(log) }}, {{ '{:,}'.format(log.epg_entries_synced or 0) }} program entries{% if log.completed_at and log.started_at %} in {{ (log.completed_at - log.started_at).total_seconds() | duration }}{% endif %}.
 {%- elif log.status == 'PARTIAL' -%}
-Sync finished with gaps: {{ '{:,}'.format(log.channels_synced or 0) }} channels{% if log.channels_added is not none and log.channels_removed is not none %} ({{ '{:,}'.format(log.channels_added) }} added, {{ '{:,}'.format(log.channels_removed) }} removed){% endif %}, {{ '{:,}'.format(log.epg_entries_synced or 0) }} program entries. See the account page for why.
+Sync finished with gaps: {{ '{:,}'.format(log.channels_synced or 0) }} channels{% if log.channels_added is not none and log.channels_removed is not none %} ({{ '{:,}'.format(log.channels_added) }} added, {{ '{:,}'.format(log.channels_removed) }} removed){% endif %}{{ skipped_text(log) }}, {{ '{:,}'.format(log.epg_entries_synced or 0) }} program entries. See the account page for why.
 {%- elif log.status == 'ERROR' -%}
 Sync failed. See the account page for why.
 {%- elif log.status == 'CANCELLED' -%}
@@ -70,7 +75,7 @@ Sync cancelled before it finished.
 {% block content %}
 <div class="page-head">
   <h1>Accounts
-    <span class="sub">{{ accounts | length }} account{{ 's' if accounts | length != 1 else '' }}{% if total_channels %} &middot; {{ '{:,}'.format(total_channels) }} channels{% if total_hidden_channels %} ({{ '{:,}'.format(total_hidden_channels) }} hidden){% endif %}{% endif %}</span>
+    <span class="sub" id="acct-total">{{ accounts | length }} account{{ 's' if accounts | length != 1 else '' }}{% if total_channels %} &middot; {{ '{:,}'.format(total_channels) }} channels{% if total_hidden_channels %} ({{ '{:,}'.format(total_hidden_channels) }} hidden){% endif %}{% endif %}</span>
   </h1>
   <a href="{{ url_for('accounts.new_account') }}" class="btn btn-primary">+ Add Account</a>
 </div>
@@ -79,6 +84,11 @@ Sync cancelled before it finished.
   on a schedule, and every channel, recording and guide row in the app traces back to one.
 </p>
 
+{# The live region. accounts.js swaps it, and #acct-total above, for a fresh render once
+   /api/nav-status's account_sync signature stops matching the one these rows were read at,
+   or the render is a minute old (dev/changelog/921). It wraps the empty state too, so a
+   first account appearing - or the last one going - needs no reload. #}
+<div id="acct-live" data-sync-sig="{{ sync_sig }}">
 {% if not accounts %}
 <div class="empty-state">
   <p><strong>No accounts yet</strong></p>
@@ -123,7 +133,7 @@ Sync cancelled before it finished.
     {# One wrapper, dissolved with display:contents on desktop so each number lands in its
        own header column, and a real 2x2 grid of fixed halves on a phone (§17.5 item 1). #}
     <span class="a-nums">
-      <span class="a-num"><span class="a-k">Channels</span>{{ '{:,}'.format(account.channel_count or 0) }}{% if account.hidden_channel_count %} <span class="text-faint">({{ '{:,}'.format(account.hidden_channel_count) }} hidden)</span>{% endif %}</span>
+      <span class="a-num"><span class="a-k">Channels</span>{{ '{:,}'.format(account.channel_count or 0) }}{% if account.hidden_channel_count %}<span class="a-note">{{ '{:,}'.format(account.hidden_channel_count) }} hidden</span>{% endif %}</span>
       <span class="a-num"><span class="a-k">In guide</span>{{ '{:,}'.format(guide_counts.get(account.id, 0)) }}</span>
       <span class="a-num"><span class="a-k">EPG</span>{{ '{:,}'.format(account.epg_entry_count or 0) }}</span>
       <span class="a-num"><span class="a-k">Next sync</span>
@@ -162,6 +172,7 @@ Sync cancelled before it finished.
 </div>
 </div>
 {% endif %}
+</div>
 {% endblock %}
 
 {% block scripts %}

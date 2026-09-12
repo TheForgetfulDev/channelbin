@@ -642,8 +642,7 @@ class WatchdogThread(threading.Thread):
         Best-effort diagnostics: a failure here must never touch the capture it is
         describing, so it logs and returns."""
         from . import db
-        from .database import (RecordingSegment, RecordingEvent,
-                               RECORDING_FORMAT_CHANGED)
+        from .database import RecordingSegment, RECORDING_FORMAT_CHANGED
         from .channel_groups import format_label, segment_format_key
         from .recorder import recording_format_pin
 
@@ -657,13 +656,8 @@ class WatchdogThread(threading.Thread):
                 return
 
             # Every divergent segment gets its own event - each is a distinct fact about a
-            # distinct part of the file - but only the first one alerts. create_alert does
-            # not deduplicate on `source`, so without this a feed flapping between two
-            # formats would push once per segment for one file's worth of one problem.
-            already = RecordingEvent.query.filter_by(
-                recording_id=self.recording_id,
-                event_type=RECORDING_FORMAT_CHANGED).first() is not None
-
+            # distinct part of the file, and the recording's own detail page is where a
+            # mixed-format file is disclosed (dev/changelog/928).
             detail = (f'Segment {seg_num} was captured at {format_label(got)}, but this '
                       f'recording opened at {format_label(pin)}. The finished file '
                       f'changes format part-way through - it plays, but its header '
@@ -680,17 +674,6 @@ class WatchdogThread(threading.Thread):
 
             _log_format_change_and_commit()
             log.warning('Recording %d: %s', self.recording_id, detail)
-
-            if not already:
-                # Outside the retried closure: create_alert commits separately, so a
-                # commit retry above must not be able to fire it twice.
-                from .alerts import create_alert
-                create_alert(
-                    'RECORDING_FORMAT_CHANGED',
-                    'A recording changed format part-way through',
-                    body=detail,
-                    source=f'rec_{self.recording_id}',
-                    recording_id=self.recording_id)
         except Exception:
             log.exception('Recording %d: format-pin check failed on segment %d',
                           self.recording_id, seg_num)

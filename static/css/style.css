@@ -552,14 +552,14 @@ body.scroll-locked { position: fixed; left: 0; right: 0; width: 100%; overflow: 
   white-space: nowrap;
 }
 .alert-banner-link:hover { text-decoration: underline; }
-.alert-banner-details {
-  background: none;
-  border: none;
-  padding: 0;
-  font: inherit;
-  cursor: pointer;
-}
-.alert-banner-details:hover { text-decoration: underline; }
+/* The title opens the details view. It is an <a role="button">, never a <button>: the span
+   around it truncates with text-overflow: ellipsis, and Chromium elides an inline-block
+   <button> WHOLE once it does not fit, so a long title rendered as nothing (measured on
+   mockup 39). Anything that follows the title - a repeat count, say - goes outside that
+   span: ellipsis clips paint and not layout, so a sibling inside it is laid out past the
+   clip and never seen. */
+.alert-banner-title { color: inherit; text-decoration: none; cursor: pointer; }
+.alert-banner-title:hover { color: inherit; text-decoration: underline; }
 .alert-banner-dismiss {
   margin-left: auto;
   background: none;
@@ -599,6 +599,16 @@ body.scroll-locked { position: fixed; left: 0; right: 0; width: 100%; overflow: 
 .sev-CRIT  { background: var(--bad-soft);    color: var(--bad); }
 .sev-WARN  { background: var(--warn-soft);   color: var(--warn); }
 .sev-INFO  { background: var(--accent-soft); color: var(--accent-text); }
+
+/* The banner's details view (static/js/nav-alerts.js): a severity-and-time line over the
+   body, and the ⋯ pinned left so the two real buttons keep the right-hand side. */
+.alert-detail-meta {
+  display: flex; align-items: center; flex-wrap: wrap; gap: 4px 8px;
+  font-size: var(--fs-sm); color: var(--text-muted); margin-bottom: 10px;
+}
+.alert-detail-meta .alert-severity { margin-right: 0; }
+.alert-detail-body { white-space: pre-wrap; word-break: break-word; }
+.modal-foot .alert-detail-more { margin-right: auto; }
 
 /* Danger-outline btn */
 .btn-danger-outline {
@@ -748,6 +758,14 @@ body.scroll-locked { position: fixed; left: 0; right: 0; width: 100%; overflow: 
 .nav-link.active { background: var(--accent-soft); color: var(--accent-text); }
 .nav-count { font-size: var(--fs-xs); background: var(--bg3); color: var(--text-muted); border-radius: 999px; padding: 1px 7px; }
 .nav-link.active .nav-count { background: transparent; color: var(--accent-text); }
+/* The Alerts link's unread counts, split by severity (dev/changelog/923). They keep their
+   colors on the active link, because the Alerts page is where the split is still being
+   read. The pair reads as one figure, so the second pulls in against .nav-link's gap. */
+.nav-count.nav-count-bad,
+.nav-link.active .nav-count.nav-count-bad { background: var(--bad-soft); color: var(--bad); font-weight: 600; }
+.nav-count.nav-count-warn,
+.nav-link.active .nav-count.nav-count-warn { background: var(--warn-soft); color: var(--warn); font-weight: 600; }
+.nav-count-bad + .nav-count-warn { margin-left: -5px; }
 /* Log out is a POST (state-changing), so it's a <button> in its own <form>, not an <a> -
    reset to match every .nav-link <a> around it. */
 .nav-logout-form { margin: 0; }
@@ -785,7 +803,10 @@ body.scroll-locked { position: fixed; left: 0; right: 0; width: 100%; overflow: 
 .nav-pip { display: none; position: absolute; top: 5px; right: 9px; width: 7px; height: 7px;
   border-radius: 50%; background: var(--text-muted); border: 1.5px solid var(--bg1); }
 .nav-pip.pip-live { background: var(--live); }
-.nav-pip.pip-alert { background: var(--accent); }
+/* The alert pip only shows while an error or warning is unread, so it is yellow unless
+   nav-alerts.js marks an error with pip-bad - the worst color present. */
+.nav-pip.pip-alert { background: var(--warn); }
+.nav-pip.pip-alert.pip-bad { background: var(--bad); }
 
 /* The rail is a DESKTOP-only concept: at ≤900px the sidebar is display:none and
    the drawer is already the collapsed state. Gating the whole block means a
@@ -3213,11 +3234,17 @@ a.shot-link { display: block; width: fit-content; cursor: zoom-in; }
 
    ONE markup, both breakpoints: the seven-track row reflows to §17.5 item 1's card at
    ≤768px. Per CLAUDE.md's CSS rule the head and each row are SEPARATE grid containers,
-   so the tracks are fixed lengths and fr only - a content-sized track (auto, max-content,
-   fit-content) sizes itself per row and slides every header label off its column, and
-   jsdom cannot see it happen. */
+   so the tracks are fixed lengths, fr, and minmax() of those only - a content-sized track
+   (auto, max-content, fit-content) sizes itself per row and slides every header label off
+   its column, and jsdom cannot see it happen.
+
+   The name takes a 3fr SHARE of the slack rather than all of it, so on a wide screen the
+   status sits beside the names instead of a screen-width away, and the four numbers spread
+   out evenly. Each number's minmax floor is its old fixed width, so the narrowest desktop
+   layout - and the container query's threshold below, measured against it - is unchanged. */
 .acct-head, .acct-rows .arow {
-  display: grid; grid-template-columns: 1fr 8.5rem 6.5rem 6rem 7rem 7rem 3rem;
+  display: grid;
+  grid-template-columns: minmax(0, 3fr) 8.5rem minmax(6.5rem, 1fr) minmax(6rem, 1fr) minmax(7rem, 1fr) minmax(7rem, 1fr) 3rem;
   gap: 0 var(--cell-gap); align-items: center;
 }
 .acct-head {
@@ -3276,6 +3303,15 @@ a.shot-link { display: block; width: fit-content; cursor: zoom-in; }
   display: block; font-family: var(--font); font-size: var(--fs-xs); text-transform: uppercase;
   letter-spacing: .06em; color: var(--text-faint); margin-bottom: 1px; text-align: right;
 }
+/* A qualifier on its own line under the number (the Channels cell's hidden count) rather
+   than a parenthetical beside it, which the column clipped mid-number. A row carrying one
+   top-aligns its numbers, so the four labels stay on one line instead of each cell
+   centering on its own height. */
+.arow .a-num .a-note {
+  display: block; font-family: var(--font); font-size: var(--fs-xs); color: var(--text-faint);
+  margin-top: 1px; overflow: hidden; text-overflow: ellipsis;
+}
+.acct-rows .arow:has(.a-note) .a-num { align-self: start; }
 /* The trailing cell keeps its own class even though it holds one button: an unclassed cell
    takes the default grid order and shifts every header label off its column (§17.6). */
 .arow .a-actions { display: flex; justify-content: flex-end; }

@@ -671,11 +671,20 @@
   function rowWarnings(r) {
     if (!G.hasChannel || !r.recording_enabled) return [];
     const out = [];
-    if (r.format_blocked) {
+    if (r.format_blocked && WARN && WARN.format_warns) {
       out.push({ cls: 'b-warn', pill: 'Format mismatch', title: 'Format mismatch.',
         detail: `Recording is on, but this member is ${memberFormatLabel(r)} and the group is ` +
-          `locked to ${G.lockLabel || 'another format'}. It will not be used until it matches, ` +
-          'or until you change the format strategy.' });
+          `pinned by hand to ${G.lockLabel || 'another format'}. It will not be used until it ` +
+          'matches, or until you change the format strategy.' });
+    } else if (r.format_blocked) {
+      // An automatic strategy's lock filters exactly as a pin does, so this member really is
+      // skipped and the row still has to say why - but as a note, not a warning: the
+      // strategy moving the group between formats is what it is for (dev/changelog/925).
+      out.push({ note: true, pill: 'different format', title: 'Different format.',
+        detail: `This member is ${memberFormatLabel(r)} and the group format is ` +
+          `${G.lockLabel || 'another format'}, chosen by the format strategy. It is skipped ` +
+          'when a recording picks a member until it matches, or until the strategy moves the ' +
+          'group to its format.' });
     } else if (floatingMismatch(r)) {
       // Quiet on purpose: nothing is wrong with this member being here, and it can become
       // the highest-ranked member itself - at which point the group format moves to ITS
@@ -1628,9 +1637,9 @@
      'carrying unrelated listings paint a row that looks right and is wrong. Turn this off ' +
      'for a group whose members you know are the same channel despite different EPG ids.'],
     ['format', 'Warn about mixed video formats',
-     'Members that report a different resolution or frame rate from the group format are ' +
-     'skipped when a recording picks a member, and members of a group with no format ' +
-     'management can produce one file whose format changes partway through.'],
+     'Only for a format you pinned by hand: members with Recording on that report a ' +
+     'different resolution or frame rate are skipped when a recording picks a member. An ' +
+     'automatic strategy never shows this warning, because moving between formats is its job.'],
     ['override', 'Warn when no member matches the group format',
      'ChannelBin records rather than skips when every recording-enabled member is filtered ' +
      'out, so the file exists but is not the format you asked for. Hiding this does not ' +
@@ -1673,42 +1682,33 @@
       if (html) el.innerHTML = html;
     };
 
-    // Mixed format, and its `unmanaged` sibling: the same question - do these members
-    // agree on a format - answered under a strategy that filters and under one that
-    // does not. One region and one mute, because to the user it is one concern.
+    // Both format banners fire only for a format pinned by hand with a recording-enabled
+    // member off it (`format_warns`, decided server-side, dev/changelog/925). Under an
+    // automatic strategy or `unmanaged`, members spanning formats is expected and moving
+    // between them is the point, so neither banner has anything true to say there.
     let mixed = '';
-    if (WARN.is_source && !muted.has('format')) {
-      const n = WARN.format_blocked_count;
-      if (WARN.manages_format && n) {
-        mixed = `<strong>&#9940; Mixed video format in this group</strong><br>` +
-          `Group format is <strong>${escHtml(fmt)}</strong> (chosen by "${escHtml(label)}"), and ` +
-          `${plural(n, 'member')} report a different resolution or frame rate. ` +
-          `${n === 1 ? 'It is' : 'They are'} still switched on for recording, and ` +
-          `${n === 1 ? 'is' : 'are'} skipped when a recording picks a member - nothing has been ` +
-          `turned off, and ${n === 1 ? 'it becomes' : 'they become'} eligible again on ` +
-          `${n === 1 ? 'its' : 'their'} own once the formats match.` +
-          `<div class="gd-ban-acts">${strategyBtn('Change the format strategy')} ` +
-          '<button type="button" class="btn btn-sm" data-act="review-members" data-review="format">' +
-          'Review members</button> ' +
-          muteBtn('format', 'For when you already know these members differ.') + '</div>';
-      } else if (!WARN.manages_format && WARN.format_spans > 1) {
-        mixed = `<strong>&#9940; No format management, and these members differ</strong><br>` +
-          'This group records from whichever member ranks best, whatever its format. Its ' +
-          `${plural(WARN.recording_count, 'recording-enabled member')} span ` +
-          `${WARN.format_spans} different formats, so a recording that fails over mid-run may ` +
-          'produce a file that plays back wrong.' +
-          `<div class="gd-ban-acts">${strategyBtn('Choose a format strategy')} ` +
-          muteBtn('format', 'For when you accept the risk of mixed formats in one file.') + '</div>';
-      }
+    const n = WARN.format_blocked_count;
+    if (WARN.format_warns && n && !muted.has('format')) {
+      mixed = `<strong>&#9940; Mixed video format in this group</strong><br>` +
+        `Group format is pinned by hand to <strong>${escHtml(fmt)}</strong>, and ` +
+        `${plural(n, 'member')} with Recording on report a different resolution or frame rate. ` +
+        `${n === 1 ? 'It is' : 'They are'} still switched on for recording, and ` +
+        `${n === 1 ? 'is' : 'are'} skipped when a recording picks a member - nothing has been ` +
+        `turned off, and ${n === 1 ? 'it becomes' : 'they become'} eligible again on ` +
+        `${n === 1 ? 'its' : 'their'} own once the formats match.` +
+        `<div class="gd-ban-acts">${strategyBtn('Change the format strategy')} ` +
+        '<button type="button" class="btn btn-sm" data-act="review-members" data-review="format">' +
+        'Review members</button> ' +
+        muteBtn('format', 'For when you already know these members differ.') + '</div>';
     }
     set('gd-format-banner', mixed);
 
     // §15.2: every willing member filtered out. The recording is NOT skipped - it runs
-    // from the best-ranked enabled member and says so. This banner is one of the three
-    // voices; the other two (the alerts, and the recording's own RECORDING_FORMAT_OVERRIDE
-    // event) are unaffected by hiding it, which its tooltip says out loud.
+    // from the best-ranked enabled member and says so. This banner is one of the two
+    // voices; the other (the recording's own RECORDING_FORMAT_OVERRIDE event) is
+    // unaffected by hiding it, which its tooltip says out loud.
     let override = '';
-    if (WARN.is_source && WARN.format_override && !muted.has('override')) {
+    if (WARN.format_warns && WARN.format_override && !muted.has('override')) {
       const who = WARN.override_member_name || 'the highest-ranked member';
       const at = WARN.override_member_format
         ? ` at ${escHtml(WARN.override_member_format)}` : '';
@@ -1718,7 +1718,7 @@
         `the next recording runs from <strong>${escHtml(who)}</strong>${at}, and the recording ` +
         'itself will say so on its detail page.' +
         `<div class="gd-ban-acts">${strategyBtn('Change the format strategy')} ` +
-        muteBtn('override', "The alerts and the recording's own record are unaffected by hiding this.") +
+        muteBtn('override', "The recording's own record is unaffected by hiding this.") +
         '</div>';
     }
     set('gd-override-banner', override);

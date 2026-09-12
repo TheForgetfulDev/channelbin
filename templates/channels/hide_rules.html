@@ -153,6 +153,18 @@
   visible until you remove it from there, no matter what a rule says.
 </p>
 
+{# Saved-but-not-applied. A refused pass leaves the rules committed and `Channel.hidden`
+   stale, which looks exactly like a rule that did nothing - so the reason and the retry
+   have to be visible here, on the page that just told you it saved (dev/changelog/928). #}
+{% if pending_materialize %}
+<div class="notice notice-warn">
+  <strong>&#9888; Your rules are saved, but not applied to your channels yet</strong><br>
+  The last pass did not run because {{ pending_materialize.reason or 'heavier database work was in progress' }}.
+  The counts below are from the pass before it. This retries by itself
+  {{ pending_materialize.retry_at | time_until }} - nothing is lost in the meantime.
+</div>
+{% endif %}
+
 <div class="dash-pulse">
   <div class="mtile"><div class="m-k">Hidden now</div><div class="m-v">{{ '{:,}'.format(hidden_count) }}</div><div class="m-s">channels</div></div>
   <div class="mtile"><div class="m-k">Rules active</div><div class="m-v">{{ enabled_rules }} <span style="font-size:var(--fs-lg);color:var(--text-faint);font-weight:400;">/ {{ rules | length }}</span></div><div class="m-s">enabled / total</div></div>

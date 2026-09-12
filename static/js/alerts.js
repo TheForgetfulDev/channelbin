@@ -12,32 +12,43 @@
 (() => {
   'use strict';
 
-  const list = document.getElementById('alerts-list');
+  // The page renders two cards (dev/changelog/932). Active alerts are problems still
+  // happening, which the app clears by itself, so no row there offers Dismiss - and the
+  // dismiss routes refuse one anyway, so a stale page cannot hide a live problem either.
+  const CARDS = [['alerts-active', 'al-card-active'], ['alerts-past', 'al-card-past']];
 
-  // The nav badge belongs to base.html's poller. Calling ITS updater rather than
-  // writing a second one is what keeps one updater per DOM region: this only
-  // makes the count move on the click instead of at the next poll. The alert
-  // banner is not rendered on this page, so applyAlerts returns right after the
-  // count and the rail pip.
+  // The nav counts belong to static/js/nav-alerts.js. Calling ITS updater rather than
+  // writing a second one is what keeps one updater per DOM region: this only makes the
+  // counts move on the click instead of at the next poll. The payload carries no banner
+  // (this page renders none), so only the counts, the rail pip and its tip move.
   const refreshCount = () => jsonFetch('/api/alerts/unread_count')
     .then((d) => {
       const el = document.getElementById('al-unread');
       if (el) el.textContent = `${d.count} unread`;
-      if (window.__applyAlerts) window.__applyAlerts({ count: d.count });
+      if (window.__applyAlerts) window.__applyAlerts(d);
+      if (window.__applyRailTips) window.__applyRailTips();
     })
     .catch(() => { /* cosmetic - the action this followed already reported itself */ });
 
-  // Rows leave as they are dismissed, so the card's own count is recomputed from
+  // Rows leave as they are dismissed, so each card's own count is recomputed from
   // what is actually on screen; a server-rendered total left in place would keep
-  // claiming rows that are gone.
+  // claiming rows that are gone. A card that empties hides itself - the server only
+  // renders a card that has rows, so an empty one on screen is a client-side artifact.
   function refreshRowCount() {
-    const cnt = document.querySelector('.card-head .cnt');
-    if (!list || !cnt) return;
-    const n = list.querySelectorAll('.al-row').length;
-    cnt.textContent = n;
-    // An emptied list has no empty state of its own - the server renders that
-    // branch - so re-read the page rather than leaving a card with nothing in it.
-    if (n === 0) location.reload();
+    let total = 0;
+    CARDS.forEach(([listId, cardId]) => {
+      const rows = document.getElementById(listId);
+      const card = document.getElementById(cardId);
+      if (!rows || !card) return;
+      const n = rows.querySelectorAll('.al-row').length;
+      const cnt = card.querySelector('.card-head .cnt');
+      if (cnt) cnt.textContent = n;
+      card.hidden = n === 0;
+      total += n;
+    });
+    // Nothing left in either card has no empty state of its own - the server renders
+    // that branch - so re-read the page rather than leaving two empty cards.
+    if (total === 0) location.reload();
   }
 
   function markRowRead(row) {
@@ -77,8 +88,9 @@
     buildModal({
       title: 'Dismiss all read alerts',
       body: '<p>Alerts you have already read will be hidden from this page. Nothing is deleted - ' +
-            'they stay reachable under <strong>Show dismissed</strong>, and unread alerts are ' +
-            'left alone.</p>',
+            'they stay reachable under <strong>Show dismissed</strong>. Unread alerts are left ' +
+            'alone, and so is anything under <strong>Active alerts</strong>: those are problems ' +
+            'that are still happening, and the app clears them itself once they are fixed.</p>',
       footer: [
         { label: 'Cancel', class: 'btn' },
         {
@@ -88,7 +100,12 @@
             close();
             jsonFetch('/api/alerts/dismiss_all', { method: 'POST' })
               .then(() => {
-                document.querySelectorAll('.al-row:not(.unread)').forEach((row) => row.remove());
+                // Scoped to the Past card, matching what the route actually dismissed: a
+                // sweep over every row would take the still-happening ones off the screen
+                // while they sat untouched in the database, until the next page load put
+                // them back with no explanation.
+                document.querySelectorAll('#alerts-past .al-row:not(.unread)')
+                  .forEach((row) => row.remove());
                 refreshRowCount();
                 return refreshCount();
               })

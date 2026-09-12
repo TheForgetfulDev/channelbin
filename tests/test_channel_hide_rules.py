@@ -27,14 +27,18 @@ from tests.support.app import make_test_app  # noqa: E402
 from tests.support import seed  # noqa: E402
 from app import admission, channel_hiding, db  # noqa: E402
 from app.database import (  # noqa: E402
-    Account, Alert, Channel, ChannelHideRule, HIDE_TARGET_CATEGORY_EXACT,
+    Account, Channel, ChannelHideRule, HIDE_TARGET_CATEGORY_EXACT,
     HIDE_TARGET_CATEGORY_GLOB, HIDE_TARGET_NAME_GLOB)
 
 
 class _RuleTestCase(unittest.TestCase):
 
+    #: Subclasses that assert on queued retry jobs need the real jobstore - without a
+    #: scheduler a deferral has nowhere to queue, so there is no pending state to report.
+    START_SCHEDULER = False
+
     def setUp(self):
-        self.t = make_test_app()
+        self.t = make_test_app(start_scheduler=self.START_SCHEDULER)
         # CSRF is app-wide and a token is the part a browser supplies; tests/test_csrf.py
         # owns the protection itself.
         self.t.app.config['WTF_CSRF_ENABLED'] = False
@@ -726,9 +730,18 @@ class RuleApiTests(_RuleTestCase):
 
 class RefusedSaveIsVisibleTests(_RuleTestCase):
     """A saved rule that has not been applied is invisible by construction: nothing errors,
-    the channel is simply still offered. So the refusal raises an alert and queues a retry -
-    principle 1, on the one path where staying quiet would be indistinguishable from working.
+    the channel is simply still offered. So the refusal queues a retry and says so on the
+    Hide Rules page itself - principle 1, on the one path where staying quiet would be
+    indistinguishable from working.
+
+    It raised a CHANNEL_HIDE_RULES_NOT_APPLIED alert until dev/changelog/928. The surface
+    moved to the page the person who just saved the rule is already looking at, derived from
+    the queued retry rather than stored, so nothing can leave a stale "not applied" claim
+    behind once the retry succeeds. That makes the real jobstore load-bearing here: the
+    pending retry IS the state being reported.
     """
+
+    START_SCHEDULER = True
 
     def tearDown(self):
         admission.reset_for_tests()
@@ -752,17 +765,36 @@ class RefusedSaveIsVisibleTests(_RuleTestCase):
         db.session.expire_all()
         self.assertEqual(self._hidden_names(), [])
 
-    def test_a_refused_save_raises_an_alert_naming_the_blocker(self):
+    def test_a_refused_save_is_reported_on_the_page_naming_the_blocker(self):
+        from app.scheduler import pending_hide_materialize
+
         self._channel('AR| One')
         self._channel('BBC')
         db.session.commit()
         admission.try_start(admission.KIND_SYNC, 'account 1')
         self._post('/api/channel-hide-rules',
                    {'target': HIDE_TARGET_NAME_GLOB, 'pattern': 'AR|*'})
-        alert = Alert.query.filter_by(alert_type='CHANNEL_HIDE_RULES_NOT_APPLIED').first()
-        self.assertIsNotNone(alert)
-        self.assertIn('account sync', alert.body)
-        self.assertIn('retry', alert.body)
+
+        pending = pending_hide_materialize()
+        self.assertIsNotNone(pending, 'a refused pass must leave a pending retry to report')
+        self.assertIn('account sync', pending['reason'])
+        self.assertIsNotNone(pending['retry_at'])
+
+        page = self.t.client.get('/channels/hide-rules')
+        self.assertEqual(page.status_code, 200)
+        html = page.get_data(as_text=True)
+        self.assertIn('not applied to your channels yet', html)
+        self.assertIn('account sync', html)
+
+    def test_no_refusal_means_no_banner(self):
+        self._channel('AR| One')
+        self._channel('BBC')
+        db.session.commit()
+        self._post('/api/channel-hide-rules',
+                   {'target': HIDE_TARGET_NAME_GLOB, 'pattern': 'AR|*'})
+
+        self.assertNotIn('not applied to your channels yet',
+                         self.t.client.get('/channels/hide-rules').get_data(as_text=True))
 
 
 if __name__ == '__main__':

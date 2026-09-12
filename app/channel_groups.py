@@ -748,9 +748,17 @@ def deregister_cancelled_recordings(recording_ids):
     a second chance to put the two in the wrong order (dev/changelog/869)."""
     if not recording_ids:
         return
+    from .recorder import end_slot_wait
     from .scheduler import unschedule_recording
     for rid in recording_ids:
         unschedule_recording(rid)
+        # A cancelled recording is not waiting for anything any more. One of these may
+        # have been queued behind a connection slot, and its standing slot-wait alert
+        # would otherwise sit under "Active alerts" describing a recording that was
+        # aborted (dev/changelog/933). Clearing it here rather than at each caller for
+        # the same reason the unschedule lives here: every path that cancels a group's
+        # schedule owes both, and a second copy is a second chance to forget one.
+        end_slot_wait(rid)
 
 
 def log_guide_change(group, in_guide, detail, extra=None):
@@ -798,6 +806,19 @@ def demote_group_from_guide(group, scheduled, detail):
     return ids
 
 
+def guide_row_alert_source(group_id):
+    """The `source` key GROUP_GUIDE_NO_RECORDING_MEMBER is raised and cleared under.
+
+    Written once because the raise and the clear have to agree exactly: dismiss_open_alerts
+    matches on the (type, source) pair, so a source built separately at either end would
+    leave rows standing that the app believes it took down. Carries the group id for two
+    reasons - one group's broken row must not clear another's, and `group:<id>:...` is the
+    shape routes/alerts.py::_resolve_alert_link turns into a deep link to the group, which
+    this alert had none of while its source was a bare module name (dev/changelog/933).
+    """
+    return f'group:{group_id}:guide-no-recording-member'
+
+
 def report_broken_guide_row(group, detail):
     """The no-human-present half of DESIGN-channel-groups-model.md 15's breach path 3.
 
@@ -823,7 +844,39 @@ def report_broken_guide_row(group, detail):
               'are unchanged - but a recording started from it now has no member to use. '
               'Turn Recording on for at least one member, or take the group out of the '
               'guide.'),
-        source='channel_groups')
+        source=guide_row_alert_source(group.id))
+
+
+def resolve_broken_guide_row(group_id):
+    """Take down the broken-guide-row alert once that state is over. Returns whether it
+    cleared.
+
+    The clearing half of report_broken_guide_row() above, and the reason that alert may
+    sit under "Active alerts", where the page deliberately offers no Dismiss: a row there
+    promises the problem is still happening, so something has to notice when it stops
+    (dev/changelog/933).
+
+    Re-asks the invariant rather than trusting the caller to know which way it moved. The
+    state ends three different ways - a member gets Recording back, the group leaves the
+    guide, the group is deleted outright - and a caller that inferred "I turned a switch
+    on, so it must be fixed" would be wrong whenever a second path had already changed
+    something. A missing group is the delete case and clears: the alert names a row that
+    no longer exists.
+
+    Commits through dismiss_open_alerts(), so it belongs outside the caller's
+    retry_on_locked closure, after that commit has landed - the same placement rule
+    deregister_cancelled_recordings() follows.
+    """
+    from . import db
+    from .alerts import dismiss_open_alerts
+    from .database import ChannelGroup
+    group = db.session.get(ChannelGroup, group_id)
+    if (group is not None and group.in_guide
+            and not any(m.recording_enabled for m in group.memberships)):
+        return False
+    dismiss_open_alerts('GROUP_GUIDE_NO_RECORDING_MEMBER',
+                        guide_row_alert_source(group_id))
+    return True
 
 
 def report_orphaned_guide_groups(group_ids, cause='A channel it could record from was removed.'):
@@ -1302,6 +1355,30 @@ def format_eligible_members(group, members, latest_by_channel) -> FormatSelectio
     return FormatSelection(keep, dropped, False, reference)
 
 
+def pinned_format_offenders(group, members, latest_by_channel):
+    """The members `group`'s format warnings are about: of `members` (already
+    recording-enabled), the ones whose measured format differs from a format the user
+    pinned by hand. Empty under every other strategy.
+
+    This is the whole condition for a group format warning of any kind - the groups list's
+    `Mixed format` badge and the group page's format banners both ask it
+    (dev/changelog/925). Under an automatic strategy or `unmanaged`, members spanning
+    formats is expected and moving between them is the point, so nothing there is a
+    warning; which member is *chosen* is still format_eligible_members()'s answer, and this
+    function changes nothing about it. An untested member never counts, for the same
+    reason it is never filtered: unknown is not proven-different.
+
+    Pure/DB-free apart from the constant import; the caller supplies the test map."""
+    from .database import GROUP_FORMAT_MANUAL
+    if group is None or group.format_strategy != GROUP_FORMAT_MANUAL:
+        return []
+    reference = group.locked_format_key
+    if reference is None:
+        return []
+    return [ch for ch in members
+            if (k := format_key(latest_by_channel.get(ch.id))) is not None and k != reference]
+
+
 def group_reference_key(group, memberships, latest_by_channel,
                         streak_threshold=DEFAULT_FAILING_STREAK_THRESHOLD):
     """The group's effective format reference key.
@@ -1537,7 +1614,6 @@ def _log_and_alert_reconcile(group, members, latest_by_channel, diff):
             last_state[e.channel_id] = (
                 'mismatch' if e.event_type == CHANNEL_GROUP_FORMAT_MISMATCH else 'resolved')
 
-        by_id = {ch.id: ch for ch in members}
         newly_mismatched, newly_resolved = [], []
         for cid in member_ids:
             is_outlier = cid in outlier_ids
@@ -1577,67 +1653,14 @@ def _log_and_alert_reconcile(group, members, latest_by_channel, diff):
             db.session.commit()
         _write_events()
 
-        # Auto-dismiss the standing mismatch alert for each newly-resolved member.
+        # Clear any standing mismatch alert a build before dev/changelog/928 left behind.
+        # Nothing raises them any more: a member differing from the group format is shown
+        # on the group itself - the page's format banner, the member's own amber pill and
+        # the events written just above - which is where the question is actually asked.
         if newly_resolved:
             _dismiss_format_mismatch_alerts(group, newly_resolved)
-
-        # Raise a WARN alert for each newly-mismatched member (create_alert manages its
-        # own app context + retry). Source keyed per group+channel so the resolve above
-        # can find and dismiss it.
-        if newly_mismatched:
-            from .alerts import create_alert
-            for cid in newly_mismatched:
-                ch = by_id.get(cid)
-                if ch is None:
-                    continue
-                fmt = format_label(format_key(latest_by_channel.get(cid)))
-                create_alert(
-                    'GROUP_FORMAT_MISMATCH',
-                    f'Format mismatch in group "{group.name}"',
-                    body=(f'"{ch.name}" reports {fmt}, which differs from the group\'s '
-                          f'format {ref_label}{lock_note}. It stays in the group and stays '
-                          f'switched on, and is skipped whenever a member is chosen - so '
-                          f'nothing records from it until it matches again.'),
-                    source=f'group:{group.id}:ch:{cid}')
     except Exception:
         log.exception('group format log/alert failed for group %s',
-                      getattr(group, 'id', '?'))
-
-
-def _alert_no_eligible_member(group, diff):
-    """The first of the three voices DESIGN-channel-groups-model.md 15.2 asks for: an
-    alert the moment a group's format lock leaves no eligible member. The other two fire
-    at record time (app/recorder.py).
-
-    Fires once and clears itself, using the open alert as the durable state - the same
-    idempotence _log_and_alert_reconcile() gets from its event log, without a second
-    bookkeeping column. It says nothing when the user has simply disabled every member:
-    that is a choice, and 15.2 is explicitly about the other case.
-
-    Best-effort - never raises into a health test run or the startup sweep."""
-    import logging
-    log = logging.getLogger(__name__)
-    try:
-        from .alerts import create_alert, dismiss_open_alerts, has_open_alert
-        source = f'group:{group.id}:no-eligible'
-        if not diff.get('format_override'):
-            if has_open_alert('GROUP_NO_ELIGIBLE_MEMBER', source):
-                dismiss_open_alerts('GROUP_NO_ELIGIBLE_MEMBER', source)
-            return
-        if has_open_alert('GROUP_NO_ELIGIBLE_MEMBER', source):
-            return
-        ref_label = format_label(diff.get('reference'))
-        create_alert(
-            'GROUP_NO_ELIGIBLE_MEMBER',
-            f'No eligible member in group "{group.name}"',
-            body=(f'Every member enabled for recording differs from the group format '
-                  f'{ref_label}. A recording will still run - it will use the '
-                  f'best-ranked member whatever its format, and will say so on the '
-                  f'recording. Change the format strategy, or check the members whose '
-                  f'formats drifted.'),
-            source=source)
-    except Exception:
-        log.exception('no-eligible-member alert failed for group %s',
                       getattr(group, 'id', '?'))
 
 
@@ -1856,7 +1879,6 @@ def evaluate_and_reconcile_group(group, streak_threshold=None):
     latest_by_channel = _latest_tests_by_channel([m.channel_id for m in memberships])
     diff = reconcile_group(group, memberships, latest_by_channel, streak_threshold)
     _log_and_alert_reconcile(group, member_channels(memberships), latest_by_channel, diff)
-    _alert_no_eligible_member(group, diff)
     return diff
 
 

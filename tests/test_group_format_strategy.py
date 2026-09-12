@@ -193,25 +193,31 @@ class FormatFilterTests(_GroupCase):
 
 
 class NoEligibleMemberAlertTests(_GroupCase):
-    """§15.2 voice 1: the moment a group's lock leaves nothing eligible."""
+    """§15.2: a group whose lock leaves nothing eligible raises no alert (dev/changelog/928).
+
+    It used to raise GROUP_NO_ELIGIBLE_MEMBER, once, clearing itself when a member came back
+    onto the format. That is a state, not an incident - it is shown on the group page's own
+    override banner for as long as it is true, and the recording made under the override
+    carries its own event. Kept as a guard because re-adding the alert here is the obvious
+    thing to do and is exactly what was decided against.
+    """
 
     def _open_alerts(self):
         return Alert.query.filter_by(alert_type='GROUP_NO_ELIGIBLE_MEMBER',
                                      dismissed_at=None).all()
 
-    def test_the_alert_fires_once_and_clears_itself(self):
+    def test_a_lock_that_filters_everyone_raises_no_alert(self):
         from app.channel_groups import evaluate_and_reconcile_group
         grp, chans = self._group(GROUP_FORMAT_MANUAL, [SD])
         grp.set_locked_format(*HD)
         db.session.commit()
 
         evaluate_and_reconcile_group(grp)
-        self.assertEqual(1, len(self._open_alerts()))
+        self.assertEqual([], self._open_alerts())
         evaluate_and_reconcile_group(grp)
-        self.assertEqual(1, len(self._open_alerts()), 'must not re-fire every evaluation')
+        self.assertEqual([], self._open_alerts())
 
-        # The member comes back onto the locked format - the alert clears on its own,
-        # exactly as the mismatch alert does. Nothing had to be re-enabled to get here.
+        # And still nothing once the member comes back onto the locked format.
         _tested(chans[0], HD)
         evaluate_and_reconcile_group(grp)
         self.assertEqual([], self._open_alerts())
@@ -386,22 +392,22 @@ class RunTriggerTests(_GroupCase):
     """The trigger is keyed on the channels a run tested, not on the job's own group."""
 
     def test_every_group_with_a_tested_member_is_re_evaluated(self):
-        from app.channel_tester import _apply_group_format_strategies
+        from app.channel_tester import _settle_group_formats
         grp_a, chans_a = self._group('most_channels', [HD, SD, SD])
         grp_b, chans_b = self._group('most_channels', [HD, HD, SD])
         # Only one member of each group was probed, which is what the automatic TV Guide
         # check does for a scheduleless group (dev/changelog/752).
-        _apply_group_format_strategies(self.t.app, [chans_a[0].id, chans_b[0].id])
+        _settle_group_formats(self.t.app, [chans_a[0].id, chans_b[0].id])
         db.session.expire_all()
         self.assertEqual(SD, db.session.get(type(grp_a), grp_a.id).locked_format_key)
         self.assertEqual(HD, db.session.get(type(grp_b), grp_b.id).locked_format_key)
 
     def test_a_group_with_no_member_in_the_run_is_left_alone(self):
-        from app.channel_tester import _apply_group_format_strategies
+        from app.channel_tester import _settle_group_formats
         grp, chans = self._group('most_channels', [HD, SD, SD])
         other = make_channel(self.acct, name='Unrelated')
         db.session.commit()
-        _apply_group_format_strategies(self.t.app, [other.id])
+        _settle_group_formats(self.t.app, [other.id])
         db.session.expire_all()
         self.assertIsNone(db.session.get(type(grp), grp.id).locked_format_key)
 
@@ -470,7 +476,10 @@ class RecordStartTests(unittest.TestCase):
                          'the higher-scored SD member is off the lock')
 
     def test_a_group_with_nothing_matching_records_anyway_and_says_so(self):
-        """15.2's override, and the two voices that land at record time."""
+        """15.2's override, and the voice that lands at record time.
+
+        The RECORDING_FORMAT_OVERRIDE *alert* was retired in dev/changelog/928 - the event
+        below is the one that mattered, because it survives onto the artifact."""
         from tests.support.seed import make_recording
         from app.database import Recording, RECORDING_FORMAT_OVERRIDE, Alert
         grp, chans = self._locked_group([('SD Only', SD, 80)])
@@ -484,8 +493,9 @@ class RecordStartTests(unittest.TestCase):
         self.assertEqual(1, len(events), 'the fact must survive onto the artifact')
         self.assertIn('1280x720 @ 30', events[0].detail)
         self.assertIn('1920x1080 @ 60', events[0].detail)
-        self.assertEqual(1, len(Alert.query.filter_by(
-            alert_type='RECORDING_FORMAT_OVERRIDE').all()))
+        self.assertEqual([], Alert.query.filter_by(
+            alert_type='RECORDING_FORMAT_OVERRIDE').all(),
+            'the override is disclosed on the recording, never as an alert')
 
     def test_no_override_event_when_the_lock_is_satisfied(self):
         from tests.support.seed import make_recording

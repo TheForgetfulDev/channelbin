@@ -333,6 +333,13 @@ WINDOW_OPEN_STATUSES = (REC_STATUS_IN_PROGRESS, REC_STATUS_PAUSED, REC_STATUS_RE
 
 class Recording(db.Model):
     __tablename__ = 'recordings'
+    # AUTOINCREMENT, so a deleted recording's id is never handed to the next one. Without it
+    # SQLite issues max(id)+1, which means deleting the newest recording and creating another
+    # silently gives the new one the old one's number - and anything still holding that number
+    # re-attaches to it rather than dangling. Two alerts did exactly that (dev/changelog/929).
+    # detach_recording_references() stays regardless; the two are belt and braces, and only
+    # this half protects a consumer nobody has written yet (dev/changelog/937).
+    __table_args__ = {'sqlite_autoincrement': True}
 
     id                        = db.Column(db.Integer, primary_key=True)
     name                      = db.Column(db.String(255), nullable=False)
@@ -615,6 +622,33 @@ def preserve_cancelled_status(rec, detail):
         return False
     add_recording_event(rec.id, RECORDING_ABORTED, detail=detail)
     return True
+
+
+def detach_recording_references(recording_id: int):
+    """Unlink every row that names a recordings.id but is not cascaded away with it.
+
+    Insert-only in the same sense as add_recording_event above: mutates without
+    committing, because the delete paths call this inside the same retry_on_locked
+    closure that deletes the Recording row. A separate commit would leave a window where
+    the row is gone and the rows naming it still point at its id.
+
+    Still required even though recordings.id now carries AUTOINCREMENT (dev/changelog/937),
+    and the two are belt and braces rather than alternatives. Before that, SQLite handed a
+    deleted row's number straight to the next recording created, so anything still holding
+    it did not merely dangle - it silently re-attached to an unrelated recording, and two
+    alerts about deleted test recordings deep-linked to the recordings that inherited their
+    numbers (dev/changelog/929). AUTOINCREMENT closes that for ids retired from here on; it
+    cannot speak for an id already re-issued before the rebuild ran, or for one deleted from
+    the top of the table beforehand, and it does nothing about a row naming a recording that
+    simply no longer exists.
+
+    RecordingEvent and RecordingSegment need nothing here: both relationships declare
+    cascade='all, delete-orphan', so the ORM deletes them along with the row.
+    """
+    from .alerts import detach_recording_alerts
+    detach_recording_alerts(recording_id)
+    ChannelTest.query.filter_by(pre_check_recording_id=recording_id).update(
+        {'pre_check_recording_id': None}, synchronize_session=False)
 
 
 def group_event_channel_links(events) -> dict:
@@ -1710,6 +1744,11 @@ class AccountSyncLog(db.Model):
     # (Product Principle 1).
     channels_added     = db.Column(db.Integer)
     channels_removed   = db.Column(db.Integer)
+    # Entries the channel upsert skipped: a stream URL with no "://", and a stream_id already
+    # seen earlier in the same sync (dev/changelog/926). NULL = not tracked - a sync from
+    # before the columns with no alert to recover the count from - never a false zero.
+    skipped_malformed_urls       = db.Column(db.Integer)
+    skipped_duplicate_stream_ids = db.Column(db.Integer)
 
 
 # ── Scheduled-job run history (dev/changelog/592) ─────────────────────────────

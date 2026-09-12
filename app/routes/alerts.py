@@ -3,7 +3,7 @@ Alert center routes.
 
 GET  /alerts                    - Alert center page
 GET  /api/alerts                - JSON list (?unread_only=1 &limit=N &include_dismissed=1)
-GET  /api/alerts/unread_count   - {count: N}
+GET  /api/alerts/unread_count   - {count, error_count, warn_count}
 POST /api/alerts/<id>/read      - Mark one alert read
 POST /api/alerts/read_all       - Mark all unread alerts read
 POST /api/alerts/<id>/dismiss   - Dismiss (hide) one alert
@@ -16,10 +16,12 @@ import re
 from datetime import datetime
 
 from flask import Blueprint, jsonify, render_template, request, url_for
+from sqlalchemy import case, func
 from sqlalchemy.exc import IntegrityError
 
 from .. import db
-from ..alerts import ALERT_TYPES, normalize_alert_title
+from ..alerts import (ALERT_TYPES, SELF_CLEARING_ALERT_TYPES, is_self_clearing,
+                      normalize_alert_title)
 from ..channel_search import OTHER_NEW, OTHER_REMOVED
 from ..database import Alert, IgnoredAlertPattern
 from ..db_utils import retry_on_locked
@@ -42,9 +44,12 @@ def _resolve_alert_link(a: Alert) -> tuple[str, str] | None:
     addressable applies (e.g. a bare subsystem name like 'postprocessor').
 
     This is the one place an alert becomes a URL - every surface that shows an alert
-    (the /alerts page, /api/alerts, the nav banner and its "Show details" modal) reads
-    through here rather than re-parsing `a.source` itself, per the existing "parsed
-    here, not in the template" precedent this replaces (`_channel_lifecycle_alert_link`).
+    (the /alerts page, /api/alerts, the nav banner's details view) reads through here
+    rather than re-parsing `a.source` itself, per the existing "parsed here, not in the
+    template" precedent this replaces (`_channel_lifecycle_alert_link`).
+
+    The label names the destination and every surface trails it with `→` (DESIGN.md §4's
+    forward jump-off), so it is a noun, never a "View X" verb (dev/changelog/924).
 
     Checked in priority order, each one a known shape produced by app/*.py's
     create_alert() call sites:
@@ -62,7 +67,7 @@ def _resolve_alert_link(a: Alert) -> tuple[str, str] | None:
     shape never changes.
     """
     if a.recording_id is not None:
-        return url_for('recordings.recording_detail', recording_id=a.recording_id), 'View recording'
+        return url_for('recordings.recording_detail', recording_id=a.recording_id), 'Recording'
 
     if not a.source:
         return None
@@ -71,26 +76,42 @@ def _resolve_alert_link(a: Alert) -> tuple[str, str] | None:
     other_value = _LIFECYCLE_ALERT_OTHER_VALUE.get(a.alert_type)
     if other_value is not None and len(parts) == 3 and parts[0] == 'account' and parts[1].isdigit():
         return (url_for('channels.channel_browser', **{'f.other': other_value, 'f.acct': parts[1]}),
-                'View channels')
+                'Channels')
 
     if len(parts) >= 2 and parts[1].isdigit():
         if parts[0] == 'group':
-            return url_for('channel_groups.group_detail', group_id=int(parts[1])), 'View group'
+            return url_for('channel_groups.group_detail', group_id=int(parts[1])), 'Group'
         if parts[0] == 'account':
-            return url_for('accounts.account_detail', account_id=int(parts[1])), 'View account'
+            return url_for('accounts.account_detail', account_id=int(parts[1])), 'Account'
 
     if parts[0] == 'search-index':
-        return url_for('system.maintenance'), 'View maintenance'
+        return url_for('system.maintenance'), 'Maintenance'
 
     m = _OD_JOB_SOURCE_RE.match(a.source)
     if m:
-        return url_for('channel_tests.on_demand_job_detail', job_id=int(m.group(1))), 'View health check'
+        return url_for('channel_tests.on_demand_job_detail', job_id=int(m.group(1))), 'Health check'
 
     m = _ACCOUNT_SYNC_SOURCE_RE.match(a.source)
     if m:
-        return url_for('accounts.account_detail', account_id=int(m.group(1))), 'View account'
+        return url_for('accounts.account_detail', account_id=int(m.group(1))), 'Account'
 
     return None
+
+
+def _is_active_problem(a: Alert) -> bool:
+    """True if this row belongs under the Alerts page's "Active alerts" card.
+
+    Both halves matter. The TYPE has to be one the app dismisses by itself, or nothing
+    would ever take the row out of a card that offers no Dismiss. And the ROW has to still
+    be standing: a dismissed alert is by definition no longer describing the condition it
+    was raised for, so one reached through ?include_dismissed=1 is history and belongs
+    under Past (dev/changelog/932).
+
+    This is the one place the question is answered - the page partitions on it and the two
+    dismiss routes refuse on it, and a second copy of the rule is how the card's contents
+    and its no-Dismiss promise would drift apart.
+    """
+    return a.dismissed_at is None and is_self_clearing(a.alert_type)
 
 
 def _alert_to_dict(a: Alert) -> dict:
@@ -110,6 +131,8 @@ def _alert_to_dict(a: Alert) -> dict:
         'read_at':     _fmt(a.read_at),
         'dismissed_at': _fmt(a.dismissed_at),
         'is_unread':   a.read_at is None,
+        'self_clearing': is_self_clearing(a.alert_type),
+        'is_active_problem': _is_active_problem(a),
         'link':        link[0] if link else None,
         'link_label':  link[1] if link else None,
     }
@@ -122,10 +145,18 @@ def alert_center():
     if not include_dismissed:
         q = q.filter(Alert.dismissed_at.is_(None))
     alerts = q.limit(500).all()
+    # Partitioned in Python off a frozenset lookup rather than as two queries: the rows are
+    # already loaded, and a second query here would be one more per page for no new data
+    # (CLAUDE.md, no hidden I/O in per-row loops - tests/test_scaling_pages.py measures it).
+    active_alerts, past_alerts = [], []
+    for a in alerts:
+        (active_alerts if _is_active_problem(a) else past_alerts).append(a)
     unread_count = Alert.query.filter(Alert.read_at.is_(None),
                                       Alert.dismissed_at.is_(None)).count()
     alert_links = {a.id: _resolve_alert_link(a) for a in alerts}
-    return render_template('alerts.html', alerts=alerts,
+    return render_template('alerts.html',
+                           active_alerts=active_alerts,
+                           past_alerts=past_alerts,
                            include_dismissed=include_dismissed,
                            unread_count=unread_count,
                            alert_links=alert_links)
@@ -146,25 +177,68 @@ def api_alerts():
     return jsonify([_alert_to_dict(a) for a in alerts])
 
 
+#: The banner's order, worst first. INFO is absent on purpose: it never reaches the banner
+#: or the nav counter, only the Alerts page (dev/changelog/923).
+_BANNER_SEVERITY_RANK = {'CRIT': 0, 'ERROR': 1, 'WARN': 2}
+#: What the nav's red count covers; WARN is the yellow one.
+_RED_SEVERITIES = ('CRIT', 'ERROR')
+
+
+def _unread_severity_counts():
+    """Unread alerts, counted once per severity in one query.
+
+    `count` is every unread alert, INFO included - the Alerts page's "N unread" and Home
+    Assistant's `unread_count` mean that. `error_count` and `warn_count` are the nav's red
+    and yellow counts, which never include INFO."""
+    by_severity = dict(
+        db.session.query(Alert.severity, func.count(Alert.id))
+        .filter(Alert.read_at.is_(None), Alert.dismissed_at.is_(None))
+        .group_by(Alert.severity).all())
+    return {
+        'count': sum(by_severity.values()),
+        'error_count': sum(by_severity.get(s, 0) for s in _RED_SEVERITIES),
+        'warn_count': by_severity.get('WARN', 0),
+    }
+
+
+def _summary_alert_dict(a: Alert) -> dict:
+    link = _resolve_alert_link(a)
+    return {'id': a.id, 'severity': a.severity, 'title': a.title, 'body': a.body,
+            'created_at': a.created_at.isoformat(),
+            'created_label': format_local(a.created_at),
+            'is_active_problem': _is_active_problem(a),
+            'link': link[0] if link else None, 'link_label': link[1] if link else None}
+
+
 def _unread_alert_summary():
-    """Unread count + the single most recent unread alert, for the nav-bar badge/banner."""
-    unread_q = Alert.query.filter(Alert.read_at.is_(None), Alert.dismissed_at.is_(None))
-    count = unread_q.count()
-    latest = unread_q.order_by(Alert.created_at.desc()).first()
-    banner = None
-    if latest:
-        link = _resolve_alert_link(latest)
-        banner = {'id': latest.id, 'severity': latest.severity, 'title': latest.title,
-                  'body': latest.body, 'created_at': latest.created_at.isoformat(),
-                  'link': link[0] if link else None, 'link_label': link[1] if link else None}
-    return {'count': count, 'banner': banner}
+    """The nav's alert payload: the unread counts plus the one alert the banner shows.
+
+    The banner is the MOST SEVERE unread alert, newest within a severity, and never an INFO
+    one: showing the newest let a routine note sit above four unread errors
+    (dev/changelog/923). `more` is how many other unread errors and warnings are behind it."""
+    summary = _unread_severity_counts()
+    top = (Alert.query
+           .filter(Alert.read_at.is_(None), Alert.dismissed_at.is_(None),
+                   Alert.severity.in_(tuple(_BANNER_SEVERITY_RANK)))
+           .order_by(case(_BANNER_SEVERITY_RANK, value=Alert.severity),
+                     Alert.created_at.desc(), Alert.id.desc())
+           .first())
+    summary['banner'] = _summary_alert_dict(top) if top else None
+    summary['more'] = summary['error_count'] + summary['warn_count'] - 1 if top else 0
+    return summary
+
+
+def _latest_unread_alert():
+    """The newest unread alert of any severity, for Home Assistant's `latest`. Deliberately
+    not the banner's pick: that key is an API, and it has always meant the newest one."""
+    a = (Alert.query.filter(Alert.read_at.is_(None), Alert.dismissed_at.is_(None))
+         .order_by(Alert.created_at.desc(), Alert.id.desc()).first())
+    return _summary_alert_dict(a) if a else None
 
 
 @alerts_bp.route('/api/alerts/unread_count')
 def api_unread_count():
-    count = Alert.query.filter(Alert.read_at.is_(None),
-                               Alert.dismissed_at.is_(None)).count()
-    return jsonify({'count': count})
+    return jsonify(_unread_severity_counts())
 
 
 @alerts_bp.route('/api/alerts/<int:alert_id>/read', methods=['POST'])
@@ -194,6 +268,14 @@ def api_dismiss(alert_id):
     alert = db.session.get(Alert, alert_id)
     if not alert:
         return jsonify({'error': 'Not found'}), 404
+    # Refused here, not merely hidden in the template: a problem that is still happening
+    # must not be dismissable, and the UI is not where that is enforced (CLAUDE.md,
+    # enforcement lives server-side). The app takes this row away itself when the condition
+    # clears, so dismissing it would only destroy the standing evidence for as long as it
+    # stayed broken.
+    if _is_active_problem(alert):
+        return jsonify({'error': 'This problem is still happening, so it cannot be '
+                                 'dismissed. It clears itself once it is fixed.'}), 409
     now = datetime.utcnow()
     if alert.read_at is None:
         alert.read_at = now
@@ -206,8 +288,15 @@ def api_dismiss(alert_id):
 @retry_on_locked()
 def api_dismiss_all():
     now = datetime.utcnow()
-    Alert.query.filter(Alert.read_at.isnot(None),
-                       Alert.dismissed_at.is_(None)).update({'dismissed_at': now})
+    # A bulk action a guard does not cover is not a guard: "Dismiss all read" is the easiest
+    # route there is to hiding every standing problem at once, so the still-happening rows
+    # are excluded in the UPDATE itself. Open + self-clearing IS _is_active_problem, spelled
+    # as SQL because this never loads the rows.
+    Alert.query.filter(
+        Alert.read_at.isnot(None),
+        Alert.dismissed_at.is_(None),
+        Alert.alert_type.notin_(tuple(SELF_CLEARING_ALERT_TYPES)),
+    ).update({'dismissed_at': now}, synchronize_session=False)
     db.session.commit()
     return jsonify({'success': True})
 

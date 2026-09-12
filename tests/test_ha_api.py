@@ -137,7 +137,28 @@ class StatusEndpointShapeTests(_ConfigSandbox):
     def test_no_alerts_is_null_latest(self):
         alerts = self._get()['alerts']
         self.assertEqual(alerts['unread_count'], 0)
+        self.assertEqual((alerts['error_count'], alerts['warn_count']), (0, 0))
         self.assertIsNone(alerts['latest'])
+
+    def test_latest_stays_the_newest_while_the_split_is_added(self):
+        """dev/changelog/924: the nav banner now shows the most severe unread alert, but
+        `latest` is an API the custom_component reads by name and keeps meaning the newest
+        one, INFO included. The red/yellow split is additive."""
+        t0 = datetime(2026, 9, 11, 5, 0)
+        db.session.add_all([
+            Alert(alert_type='TEST', severity='CRIT', title='Oldest crit', body='', created_at=t0),
+            Alert(alert_type='TEST', severity='WARN', title='Warn', body='',
+                  created_at=t0 + timedelta(minutes=5)),
+            Alert(alert_type='TEST', severity='INFO', title='Newest info', body='',
+                  created_at=t0 + timedelta(minutes=10)),
+        ])
+        db.session.commit()
+
+        alerts = self._get()['alerts']
+        self.assertEqual(alerts['unread_count'], 3)
+        self.assertEqual(alerts['error_count'], 1)
+        self.assertEqual(alerts['warn_count'], 1)
+        self.assertEqual(alerts['latest']['title'], 'Newest info')
 
     def test_account_status_counts(self):
         make_account(name='Good 1')  # defaults to status='OK'

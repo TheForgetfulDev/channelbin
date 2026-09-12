@@ -208,6 +208,16 @@ class RenderedShellTests(unittest.TestCase):
         self.assertEqual(sidebar.count('class="nav-pip'), 3)
         self.assertIn('<span class="nav-pip pip-alert" style="display:none"></span>', sidebar)
 
+    def test_alerts_link_carries_a_red_and_a_yellow_count_in_both_shells(self):
+        """dev/changelog/924: one grey count of every unread alert became a red count
+        (ERROR + CRIT) and a yellow one (WARN). Both start hidden - the "nothing active"
+        state - and each names its unit so the rail tip can say which number is which."""
+        pair = ('<span class="nav-count nav-count-bad" data-unit="error" style="display:none"></span>'
+                '<span class="nav-count nav-count-warn" data-unit="warning" style="display:none"></span>')
+        for shell in (self._sidebar(), self._drawer()):
+            self.assertIn(pair, shell)
+        self.assertNotIn('nav-count-alerts', self.html)
+
 
 class ShellSourceTests(unittest.TestCase):
     """Checks that belong to the source rather than to one rendered page."""

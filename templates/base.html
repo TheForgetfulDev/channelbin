@@ -92,7 +92,7 @@
     <a class="nav-link{% if request.endpoint == 'channel_hide_rules.hide_rules_page' %} active{% endif %}" href="{{ url_for('channel_hide_rules.hide_rules_page') }}">{{ nav_icon('hiderules') }}<span class="nav-t">Hide Rules</span></a>
     <div class="nav-section"><span class="nav-t">System</span></div>
     <a class="nav-link{% if request.endpoint and request.endpoint.startswith('jobs.') %} active{% endif %}" href="{{ url_for('jobs.jobs_page') }}">{{ nav_icon('jobs') }}<span class="nav-t">Jobs</span></a>
-    <a class="nav-link{% if request.endpoint and request.endpoint.startswith('alerts.') %} active{% endif %}" href="{{ url_for('alerts.alert_center') }}">{{ nav_icon('alerts') }}<span class="nav-t">Alerts</span> <span class="nav-count nav-count-alerts" style="display:none"></span><span class="nav-pip pip-alert" style="display:none"></span></a>
+    <a class="nav-link{% if request.endpoint and request.endpoint.startswith('alerts.') %} active{% endif %}" href="{{ url_for('alerts.alert_center') }}">{{ nav_icon('alerts') }}<span class="nav-t">Alerts</span> <span class="nav-count nav-count-bad" data-unit="error" style="display:none"></span><span class="nav-count nav-count-warn" data-unit="warning" style="display:none"></span><span class="nav-pip pip-alert" style="display:none"></span></a>
     <a class="nav-link{% if request.endpoint and request.endpoint.startswith('logs.') %} active{% endif %}" href="{{ url_for('logs.logs_page') }}">{{ nav_icon('logs') }}<span class="nav-t">Logs</span></a>
     {# Second to last, between Logs and Settings (DESIGN.md 16.1). Matched on the
        endpoint rather than the blueprint: system_bp also owns the /api/system/*
@@ -172,12 +172,13 @@
 
     <main class="main {% block main_class %}{% endblock %}">
       {% if request.endpoint != 'alerts.alert_center' %}
+      {# Filled by static/js/nav-alerts.js, its one updater. The title is an <a role="button">
+         inside the truncating span, and nothing else goes in that span - style.css says why. #}
       <div id="alert-banner" class="alert-banner" style="display:none">
-        <span id="alert-banner-text"></span>
-        <a href="#" class="alert-banner-link" id="alert-banner-goto-link" style="display:none"></a>
-        <button class="alert-banner-link alert-banner-details" id="alert-banner-details-btn" onclick="showAlertBannerDetails()" style="display:none">Show details</button>
-        <a href="{{ url_for('alerts.alert_center') }}" class="alert-banner-link" id="alert-banner-view-all-link">View all</a>
-        <button class="alert-banner-dismiss" id="alert-banner-btn" onclick="dismissAlertBanner()" title="Mark read">&#x2715;</button>
+        <span><span class="alert-severity" id="alert-banner-sev"></span><a href="#" role="button" class="alert-banner-title" id="alert-banner-title"></a></span>
+        <a href="{{ url_for('alerts.alert_center') }}" class="alert-banner-link" id="alert-banner-more" style="display:none"></a>
+        <button type="button" class="alert-banner-dismiss" id="alert-banner-read" aria-label="Mark read"
+                data-tip="Mark read.&#10;Takes it off the banner and out of the count. It stays on the Alerts page.">&times;</button>
       </div>
       {% endif %}
       {# The static (server-rendered) banner and the JS poller's banner are two
@@ -306,110 +307,8 @@
         .catch(function() {});
     }
   </script>
-  <script>
-  (function() {
-    var _bannerAlertId = null;
-    var _bannerAlert = null;
-
-    function applyAlerts(d) {
-      // Unread count on the Alerts nav link (both sidebar and mobile copies).
-      document.querySelectorAll('.nav-count-alerts').forEach(function(badge) {
-        if (d.count > 0) {
-          badge.textContent = d.count;
-          badge.style.display = '';
-        } else {
-          badge.style.display = 'none';
-        }
-      });
-      // The rail's pip is the badge's stand-in when the badge no longer fits, so
-      // it hides with it - a mark that never clears would claim an alert forever.
-      document.querySelectorAll('.nav-pip.pip-alert').forEach(function(pip) {
-        pip.style.display = d.count > 0 ? '' : 'none';
-      });
-
-      var banner = document.getElementById('alert-banner');
-      var textEl = document.getElementById('alert-banner-text');
-      var detailsBtn = document.getElementById('alert-banner-details-btn');
-      var gotoLink = document.getElementById('alert-banner-goto-link');
-      if (!banner || !textEl) return;
-      if (d.banner) {
-        var a = d.banner;
-        _bannerAlertId = a.id;
-        _bannerAlert = a;
-        textEl.textContent = '';
-        var sevBadge = document.createElement('span');
-        sevBadge.className = 'alert-severity sev-' + a.severity;
-        sevBadge.textContent = a.severity;
-        textEl.appendChild(sevBadge);
-        textEl.appendChild(document.createTextNode(a.title));
-        banner.className = 'alert-banner alert-banner-sev-' + a.severity;
-        banner.style.display = '';
-        if (detailsBtn) detailsBtn.style.display = (a.body && a.body !== a.title) ? '' : 'none';
-        if (gotoLink) {
-          if (a.link) {
-            gotoLink.href = a.link;
-            gotoLink.textContent = a.link_label || 'View';
-            gotoLink.style.display = '';
-          } else {
-            gotoLink.style.display = 'none';
-          }
-        }
-      } else {
-        banner.style.display = 'none';
-        _bannerAlertId = null;
-        _bannerAlert = null;
-        if (detailsBtn) detailsBtn.style.display = 'none';
-        if (gotoLink) gotoLink.style.display = 'none';
-      }
-    }
-
-    window.showAlertBannerDetails = function() {
-      if (!_bannerAlert) return;
-      var body = document.createElement('div');
-      body.style.whiteSpace = 'pre-wrap';
-      body.style.wordBreak = 'break-word';
-      body.textContent = _bannerAlert.body;
-      var footer = [
-        { label: 'Mark as read', class: 'btn btn-primary', onClick: function(close) { dismissAlertBanner(); close(); } }
-      ];
-      if (_bannerAlert.link) {
-        footer.push({ label: _bannerAlert.link_label || 'View', class: 'btn', onClick: function(close) {
-            close();
-            window.location.href = _bannerAlert.link;
-          } });
-      }
-      footer.push({ label: 'Ignore future alerts like this', class: 'btn', onClick: function(close) {
-          close();
-          confirmIgnoreAlert(_bannerAlert.id, _bannerAlert.title, function() { dismissAlertBanner(); });
-        } });
-      footer.push({ label: 'View all', class: 'btn', onClick: function(close) {
-          close();
-          window.location.href = document.getElementById('alert-banner-view-all-link').href;
-        } });
-      buildModal({
-        title: _bannerAlert.title,
-        body: body,
-        footer: footer
-      });
-    };
-
-    window.dismissAlertBanner = function() {
-      var banner = document.getElementById('alert-banner');
-      if (_bannerAlertId) {
-        jsonFetch('/api/alerts/' + _bannerAlertId + '/read', {method: 'POST'}).catch(function() {});
-      }
-      if (banner) banner.style.display = 'none';
-      _bannerAlertId = null;
-      // Give the read POST a moment to land, then refresh the shared nav-status
-      // payload so the badge count (and stats/activity) reflect the change.
-      setTimeout(function() {
-        if (window.fetchNavStatus) window.fetchNavStatus();
-      }, 300);
-    };
-
-    window.__applyAlerts = applyAlerts;
-  })();
-  </script>
+  {# Defines window.__applyAlerts, so it must load before the nav-status poller below. #}
+  <script src="{{ url_for('static', filename='js/nav-alerts.js') }}"></script>
   <script>
     (function() {
       var toggle = document.getElementById('topnav-toggle');
@@ -467,10 +366,17 @@
         document.querySelectorAll('.sidebar .nav-link').forEach((a) => {
           if (!on) { a.removeAttribute('data-tip'); return; }
           const label = a.querySelector('.nav-t');
-          const cnt = a.querySelector('.nav-count');
           const name = label ? label.textContent.trim() : '';
-          const n = (cnt && cnt.style.display !== 'none') ? cnt.textContent.trim() : '';
-          a.setAttribute('data-tip', n ? `${name} (${n})` : name);
+          // A count carrying data-unit is one of several on its link (Alerts' errors and
+          // warnings), so the tip has to say which number is which.
+          const counts = [...a.querySelectorAll('.nav-count')]
+            .filter((c) => c.style.display !== 'none' && c.textContent.trim())
+            .map((c) => {
+              const n = c.textContent.trim();
+              const unit = c.dataset.unit;
+              return unit ? `${n} ${unit}${n === '1' ? '' : 's'}` : n;
+            });
+          a.setAttribute('data-tip', counts.length ? `${name} (${counts.join(', ')})` : name);
         });
         const brand = document.querySelector('.sidebar .brand');
         if (!brand) return;
@@ -724,6 +630,7 @@
           if (window.__applyAlerts)     window.__applyAlerts(d.alerts);
           if (window.__applyIndicators) window.__applyIndicators(d.activity);
           if (window.__applySearchReadiness) window.__applySearchReadiness(d.search);
+          if (window.__applyAccountSync) window.__applyAccountSync(d.account_sync);
           applyLiveCount(d.activity);
           // Rail tooltips carry the counts, so they are re-derived after the
           // badges move - one writer, run last.

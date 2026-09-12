@@ -83,6 +83,10 @@
     PARTIAL: ['b-warn', 'Partial'],
     ERROR: ['b-fail', 'Error'],
     CANCELLED: ['b-abort', 'Cancelled'],
+    // A scheduled sync that never ran (app/accounts.py::record_skipped_sync). Neutral, not
+    // an error badge: nothing failed, the occurrence yielded to a recording or to heavier
+    // database work and the reason is on the row (dev/changelog/928).
+    SKIPPED: ['b-paused', 'Skipped'],
   };
   function logBadge(status) {
     // b-running, not b-live: a sync in progress is not an alarm (dev/changelog/816).

@@ -339,6 +339,11 @@ def _build_job_list():
         'logo_cache_fetch': ('Logo Cache Fetch', '/settings?q=logo_cache'),
         'search_index_janitor': ('Search Index Janitor',
                                  '/settings?q=index_janitor_grace_minutes'),
+        # Never a job id of its own - only ever seen as `channel_hide_materialize_retry`,
+        # the one-shot queued when a hide-rule pass was refused. Named here so the retry
+        # branch below renders it as "Hide Rules retry" rather than a raw job id
+        # (dev/changelog/928).
+        'channel_hide_materialize': ('Hide Rules', '/channels/hide-rules'),
     }
 
     # Explains, per job, what it does and why Run Now isn't offered - shown in the greyed
