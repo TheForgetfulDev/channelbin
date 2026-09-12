@@ -624,6 +624,12 @@ def resume_in_progress_recordings(app):
                 daemon=True,
             ).start()
 
+        # Post-processing alerts left standing over a recording that has since recovered.
+        # Runs after the cases above so the rows they just re-launched are CONVERTING rather
+        # than COMPLETED, and so the two that give up above keep the alert they just raised.
+        from .postprocessor import reconcile_failure_alerts
+        reconcile_failure_alerts()
+
         # Case 2a: SCHEDULED but entirely missed (past stop_time) → mark FAILED
         import threading as _t
 

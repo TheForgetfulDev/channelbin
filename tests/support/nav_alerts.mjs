@@ -32,7 +32,8 @@ const PAYLOAD = {
   banner: {
     id: 9, severity: 'ERROR', title: 'Move failed: /dvr-complete is not reachable',
     body: 'Line one\nLine two', created_at: '2026-09-11T05:07:00',
-    created_label: 'Sep 11, 2026 01:07 AM EDT', link: '/accounts/2', link_label: 'Account',
+    created_label: 'Sep 11, 2026 01:07 AM EDT', created_short: '9/11/26 1:07 AM',
+    created_age: '9d 2h ago', link: '/accounts/2', link_label: 'Account',
     is_active_problem: false,
   },
 };
@@ -97,11 +98,16 @@ async function main() {
     const b = banner();
     const title = d.getElementById('alert-banner-title');
     const more = d.getElementById('alert-banner-more');
+    const time = d.getElementById('alert-banner-time');
     return {
       shown: shownOf(b), cls: b.className,
       sev: d.getElementById('alert-banner-sev').textContent,
       sevCls: d.getElementById('alert-banner-sev').className,
       title: title.textContent, titleInFirstSpan: title.parentElement === b.firstElementChild,
+      // The stamp must stay OUT of the truncating first span: ellipsis clips paint, not
+      // layout, so a sibling inside it is laid out past the clip and never seen.
+      time: time.textContent, timeTip: time.getAttribute('data-tip'),
+      timeOutsideFirstSpan: time.parentElement === b && time !== b.firstElementChild,
       more: more.textContent, moreShown: shownOf(more), moreTip: more.getAttribute('data-tip'),
     };
   };

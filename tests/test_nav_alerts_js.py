@@ -118,6 +118,21 @@ class BannerTests(_Base):
         self.assertTrue(b['moreShown'])
         self.assertIn('2 more unread.', b['moreTip'])
 
+    def test_banner_stamps_when_the_alert_was_raised(self):
+        """Without this the banner reads the same whether the alert is a minute old or nine
+        days recovered, which is how a stale row kept looking urgent (dev/changelog/939)."""
+        b = self.obs['full']['banner']
+        self.assertEqual(b['time'], '9/11/26 1:07 AM')
+        self.assertTrue(b['timeOutsideFirstSpan'])
+        self.assertEqual(b['timeTip'], 'Raised 9d 2h ago.')
+
+    def test_a_payload_without_an_age_carries_no_stale_stamp_or_tooltip(self):
+        """One updater, so the nodes it wrote for the previous alert must not survive into
+        the next one - a stamp left behind would date the wrong alert."""
+        b = self.obs['warnOnly']['banner']
+        self.assertEqual(b['time'], '')
+        self.assertIsNone(b['timeTip'])
+
     def test_more_hides_when_nothing_is_behind_it(self):
         self.assertFalse(self.obs['warnOnly']['banner']['moreShown'])
 
@@ -145,6 +160,9 @@ class DetailsTests(_Base):
         self.assertEqual(d['modal']['body'], 'Line one\nLine two')
         self.assertIn('ERROR', d['modal']['meta'])
         self.assertIn('Sep 11, 2026 01:07 AM EDT', d['modal']['meta'])
+        # The absolute time with its age beside it (DESIGN.md §5). The banner has no second
+        # line for the age, so the details view is where the pair is shown.
+        self.assertIn('9d 2h ago', d['modal']['meta'])
 
     def test_two_buttons_with_the_destination_primary(self):
         m = self.obs['details']['modal']

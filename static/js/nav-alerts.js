@@ -49,6 +49,15 @@
     sev.className = `alert-severity sev-${a.severity}`;
     sev.textContent = a.severity;
     document.getElementById('alert-banner-title').textContent = a.title;
+    // When it happened, outside the truncating span so the ellipsis cannot swallow it. An
+    // alert that recovered weeks ago reads identically to one raised a minute ago without
+    // this, which is how a stale row went on looking urgent (dev/changelog/939).
+    const time = document.getElementById('alert-banner-time');
+    if (time) {
+      time.textContent = a.created_short || '';
+      if (a.created_age) time.setAttribute('data-tip', `Raised ${a.created_age}.`);
+      else time.removeAttribute('data-tip');
+    }
     const moreLink = document.getElementById('alert-banner-more');
     moreLink.textContent = `+${more} more`;
     moreLink.setAttribute('data-tip',
@@ -91,6 +100,13 @@
     const when = document.createElement('span');
     when.textContent = a.created_label || '';
     meta.append(sev, when);
+    // The absolute time with its age beside it, which is DESIGN.md 5's app-wide pairing.
+    // The banner itself has no second line for the age, so this is where it lands.
+    if (a.created_age) {
+      const age = document.createElement('span');
+      age.textContent = `· ${a.created_age}`;
+      meta.append(age);
+    }
     const text = document.createElement('div');
     text.className = 'alert-detail-body';
     text.textContent = a.body || a.title;
