@@ -5,6 +5,18 @@ Notable changes to ChannelBin, newest first. This project follows
 release is tagged `v<version>` in git, and the version the app is running is shown in the
 page footer.
 
+## 0.7.1 - 2026-09-12
+
+**Fixed**
+
+- An alert for a failed conversion or file move could stand forever under Active alerts, where
+  no Dismiss is offered, even after the recording had converted or moved successfully. Those
+  alerts are now re-examined when the app starts and taken down once it can see the work
+  completed, with a log line naming what it saw.
+- The alert banner above every page now says when the alert was raised, so an alert from last
+  week no longer reads exactly like one that just happened. The full date and the age are on
+  hover and in the details view.
+
 ## 0.7.0 - 2026-09-12
 
 **Added**

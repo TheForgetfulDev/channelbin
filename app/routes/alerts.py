@@ -202,10 +202,19 @@ def _unread_severity_counts():
 
 
 def _summary_alert_dict(a: Alert) -> dict:
+    # The age is rendered server-side for both of its consumers, not in the browser from
+    # `created_at`: that key is naive UTC with no offset on it, which JS Date() reads as
+    # LOCAL time, so a browser-side age would be wrong by the viewer's UTC offset.
+    from .recordings import time_ago_filter
+
     link = _resolve_alert_link(a)
     return {'id': a.id, 'severity': a.severity, 'title': a.title, 'body': a.body,
             'created_at': a.created_at.isoformat(),
             'created_label': format_local(a.created_at),
+            # The banner is one line beside a truncating title, so it gets the compact
+            # spelling; the details view has room for the full one plus the age.
+            'created_short': format_local(a.created_at, 'short_datetime'),
+            'created_age': time_ago_filter(a.created_at),
             'is_active_problem': _is_active_problem(a),
             'link': link[0] if link else None, 'link_label': link[1] if link else None}
 

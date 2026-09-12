@@ -176,6 +176,7 @@
          inside the truncating span, and nothing else goes in that span - style.css says why. #}
       <div id="alert-banner" class="alert-banner" style="display:none">
         <span><span class="alert-severity" id="alert-banner-sev"></span><a href="#" role="button" class="alert-banner-title" id="alert-banner-title"></a></span>
+        <span class="alert-banner-time" id="alert-banner-time"></span>
         <a href="{{ url_for('alerts.alert_center') }}" class="alert-banner-link" id="alert-banner-more" style="display:none"></a>
         <button type="button" class="alert-banner-dismiss" id="alert-banner-read" aria-label="Mark read"
                 data-tip="Mark read.&#10;Takes it off the banner and out of the count. It stays on the Alerts page.">&times;</button>

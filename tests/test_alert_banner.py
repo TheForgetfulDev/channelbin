@@ -84,6 +84,29 @@ class BannerPickTests(_AppCase):
         self.assertTrue(banner['created_label'])
 
 
+class BannerTimestampTests(_AppCase):
+    """The banner says WHEN, so a row that recovered weeks ago stops reading as urgent
+    (dev/changelog/939). A 9-day-old sync failure sat on every page looking exactly like a
+    live one, because the only timestamp was on the Alerts page."""
+
+    def test_the_banner_carries_a_compact_stamp_distinct_from_the_full_label(self):
+        self._alert('ERROR', 'Sync failed')
+        banner = self._summary()['banner']
+        # Not the same spelling as the details view's: the banner is one line beside a
+        # truncating title, so it takes m/d/yy, and the long label keeps its own key.
+        self.assertRegex(banner['created_short'], r'^\d{1,2}/\d{1,2}/\d{2} ')
+        self.assertNotEqual(banner['created_short'], banner['created_label'])
+
+    def test_the_age_is_rendered_server_side_and_reads_as_an_age(self):
+        """Computed in Python, not from `created_at` in the browser: that key is naive UTC
+        with no offset, so JS Date() would read it as local time and be off by the
+        viewer's offset."""
+        self._alert('ERROR', 'Sync failed')
+        db.session.query(Alert).update(
+            {'created_at': datetime.utcnow() - timedelta(hours=2, minutes=30, seconds=1)})
+        self.assertEqual(self._summary()['banner']['created_age'], '2h 30m ago')
+
+
 class CountSplitTests(_AppCase):
     def _seed(self):
         self._alert('CRIT', 'c')
@@ -130,6 +153,14 @@ class BannerMarkupTests(_AppCase):
             '<a href="#" role="button" class="alert-banner-title" id="alert-banner-title"></a></span>',
             self.banner,
             'the truncating span must hold the severity badge and the title link, and nothing else')
+
+    def test_the_timestamp_sits_outside_the_truncating_span(self):
+        """Inside it the ellipsis would clip the stamp's paint while still laying it out,
+        so it would never be seen - the same rule the title comment in style.css states."""
+        self.assertIn('<span class="alert-banner-time" id="alert-banner-time"></span>',
+                      self.banner)
+        self.assertLess(self.banner.index('id="alert-banner-title"></a></span>'),
+                        self.banner.index('id="alert-banner-time"'))
 
     def test_banner_has_more_link_and_one_click_mark_read_and_nothing_else(self):
         self.assertIn('id="alert-banner-more"', self.banner)

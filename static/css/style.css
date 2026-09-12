@@ -551,6 +551,16 @@ body.scroll-locked { position: fixed; left: 0; right: 0; width: 100%; overflow: 
   text-decoration: none;
   white-space: nowrap;
 }
+/* When the alert was raised. Outside the truncating span (see the title comment below) and
+   never shrunk: it is the one thing in the row that says whether this is happening now or
+   is weeks old, so it keeps its full width and the title gives way instead. */
+.alert-banner-time {
+  font-size: var(--fs-sm);
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
 .alert-banner-link:hover { text-decoration: underline; }
 /* The title opens the details view. It is an <a role="button">, never a <button>: the span
    around it truncates with text-overflow: ellipsis, and Chromium elides an inline-block

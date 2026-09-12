@@ -684,6 +684,91 @@ def reserve_concat_output_path(directory: str, safe_name: str, extensions) -> st
         return candidate
 
 
+#: The two post-processing failure alerts this module raises inline and clears inline, and
+#: the observation that proves each one is over. Both are self_clearing, so an open row sits
+#: under the Alerts page's "Active alerts" card, which offers no Dismiss (dev/changelog/932)
+#: - which is only safe while something actually clears them.
+_RECONCILABLE_ALERTS = ('CONVERSION_FAILED', 'RECORDING_MOVE_FAILED')
+
+
+def reconcile_failure_alerts():
+    """Dismiss open conversion/move alerts whose recording has since recovered.
+
+    Called at startup. The inline clears in do_postprocess run one call AFTER the commit
+    that records the success, so a process death in that gap - `restart.sh --force` during
+    a conversion is the ordinary way to get there - leaves the alert standing over a
+    recording that is fine, in a card with no Dismiss, forever. Deriving each row's
+    liveness from what the recording itself recorded closes that gap permanently, and is
+    the same demand CLAUDE.md's "already done is a fact you recorded" rule makes of the
+    migration ledger: do not infer state from whether one call happened to run.
+
+    Both tests are POSITIVE observations of recovery, never "no evidence of failure":
+
+    - `CONVERSION_FAILED` - the recording is COMPLETED. Every site that raises this type
+      puts the row in FAILED first (here and the two startup-recovery sites in
+      app/scheduler.py), so COMPLETED can only mean a later attempt finished.
+    - `RECORDING_MOVE_FAILED` - the file is in the configured move destination. A failed
+      move leaves output_path where it was and the successful one rewrites it, so the
+      column answers this directly. A move that is now disabled, or pointed somewhere
+      else, is not evidence either way and the row is left alone.
+
+    A recording that no longer exists is also left alone: deleting one already dismisses
+    and unlinks its alerts (dev/changelog/929), so a dangling id is not a recovery.
+    """
+    from . import db
+    from .config import load_config
+    from .database import Alert, Recording, REC_STATUS_COMPLETED
+
+    open_rows = (Alert.query
+                 .filter(Alert.dismissed_at.is_(None),
+                         Alert.alert_type.in_(_RECONCILABLE_ALERTS),
+                         Alert.recording_id.isnot(None))
+                 .all())
+    if not open_rows:
+        return 0
+
+    # Hoisted above the loop, and the recordings fetched in one keyed query rather than a
+    # db.session.get per row (CLAUDE.md, no hidden I/O in per-row loops).
+    mv = load_config()['recording']['post_process'].get('move') or {}
+    move_dest = (os.path.normpath(mv['destination'].strip())
+                 if mv.get('enabled') and mv.get('destination', '').strip() else None)
+    recs = {r.id: r for r in Recording.query.filter(
+        Recording.id.in_({a.recording_id for a in open_rows})).all()}
+
+    stale = []
+    for a in open_rows:
+        rec = recs.get(a.recording_id)
+        if rec is None:
+            continue
+        if a.alert_type == 'CONVERSION_FAILED':
+            recovered = rec.status == REC_STATUS_COMPLETED
+            observed = f'recording is {rec.status}'
+        else:
+            recovered = bool(move_dest) and bool(rec.output_path) and \
+                os.path.dirname(os.path.normpath(rec.output_path)) == move_dest
+            observed = f'file is at {rec.output_path}'
+        if recovered:
+            # Loud rather than quiet: a self-clearing alert that needed reconciling is one
+            # whose inline clear did not run, and that is worth being able to read later.
+            log.warning('Alert %d (%s, recording %d) describes a condition that is over '
+                        '(%s) - dismissing it at startup', a.id, a.alert_type, rec.id, observed)
+            stale.append(a.id)
+
+    if not stale:
+        return 0
+
+    @retry_on_locked()
+    def _dismiss():
+        rows = Alert.query.filter(Alert.id.in_(stale), Alert.dismissed_at.is_(None)).all()
+        now = datetime.utcnow()
+        for row in rows:
+            row.dismissed_at = now
+        db.session.commit()
+        return len(rows)
+
+    return _dismiss()
+
+
 def do_postprocess(app, recording_id: int, ts_path: str):
     """Run conversion and/or move after a successful concat.
 
