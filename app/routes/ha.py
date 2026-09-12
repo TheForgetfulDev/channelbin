@@ -102,10 +102,11 @@ def _account_status_summary():
 @ha_bp.route('/api/ha/v1/status')
 def status():
     """Combined recording/disk/alerts/accounts snapshot for HA to poll. Assembled from
-    existing aggregation helpers (system.py::_disk_bytes, alerts.py::_unread_alert_summary)
-    plus the two single-query helpers above - never one query per field, per CLAUDE.md's
-    no-hidden-I/O-in-loops rule (this isn't a loop, but the same "one query, not N" spirit)."""
-    from .alerts import _unread_alert_summary
+    existing aggregation helpers (system.py::_disk_bytes, alerts.py::_unread_severity_counts
+    and _latest_unread_alert) plus the two single-query helpers above - never one query per
+    field, per CLAUDE.md's no-hidden-I/O-in-loops rule (this isn't a loop, but the same "one
+    query, not N" spirit)."""
+    from .alerts import _latest_unread_alert, _unread_severity_counts
     from .system import DVR_DIR_ROLE, _disk_bytes
 
     dvr_dir = load_config()['recording']['dvr_output_dir']
@@ -118,10 +119,14 @@ def status():
         'used_pct': round(disk_used / disk_total * 100, 1) if disk_total else None,
     }
 
-    alert_summary = _unread_alert_summary()
+    # `unread_count` and `latest` keep their meanings (every unread alert, and the newest
+    # one) because the custom_component reads them by name; the split is additive.
+    counts = _unread_severity_counts()
     alerts = {
-        'unread_count': alert_summary['count'],
-        'latest': alert_summary['banner'],
+        'unread_count': counts['count'],
+        'error_count': counts['error_count'],
+        'warn_count': counts['warn_count'],
+        'latest': _latest_unread_alert(),
     }
 
     return jsonify({

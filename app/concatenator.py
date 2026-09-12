@@ -256,7 +256,7 @@ def _run_concatenation(app, recording_id: int, *, reason: str):
                 log.error('Recording "%s" (#%d): no valid segments to concatenate (%s)',
                           rec.name, recording_id,
                           'files missing after capture' if stream_delivered else 'nothing was captured',
-                          extra={'recording_id': recording_id})
+                          extra={'recording_id': recording_id, 'already_alerted': True})
 
                 @retry_on_locked()
                 def _mark_no_segments_failed_and_commit():
@@ -277,6 +277,18 @@ def _run_concatenation(app, recording_id: int, *, reason: str):
                         from .health_score import apply_recording_health_observation
                         apply_recording_health_observation(app, recording_id, 'failed')
                     ev.publish(recording_id, CONCATENATION_DONE, {'success': False, 'error': 'no valid segments'})
+                    # Typed rather than left to the log->alert catch-all, which gave this
+                    # an "Application Error (log)" label and no deep link to the recording
+                    # it is about (dev/changelog/930). Nothing clears it: there is no file
+                    # to recover and nothing re-runs this concatenation.
+                    from .alerts import create_alert
+                    create_alert(
+                        'CONCATENATION_FAILED',
+                        f'Concatenation failed: {rec.name}',
+                        body=why,
+                        source='concatenator',
+                        recording_id=recording_id,
+                    )
                 return
 
             # The capture is over and left usable segments: score it now, once, so a later

@@ -1282,17 +1282,7 @@ window.onScheduleSaved = () => window.location.reload();
 
   async function refreshPage() {
     try {
-      const res = await fetch(location.href, { cache: 'no-store' });
-      const html = await res.text();
-      const doc = new DOMParser().parseFromString(html, 'text/html');
-
-      for (const id of SWAP_IDS) {
-        const current = document.getElementById(id);
-        const fresh = doc.getElementById(id);
-        if (current && fresh) {
-          current.outerHTML = fresh.outerHTML;
-        }
-      }
+      await swapFromServer(SWAP_IDS.map((id) => `#${id}`));
       // Re-apply every piece of client-held state the swap blew away. The
       // section layout is mandatory here: it lives in inline order/display on
       // the [data-sec] nodes, two of which (segs/log) are swapped outright and

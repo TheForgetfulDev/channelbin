@@ -98,7 +98,7 @@ const GROUP_FORMAT_STRATEGIES = [
    'You pin the format. Nothing moves it, and a health check never overrides it.'],
   ['unmanaged', 'No format management',
    'Records from whichever member ranks best, whatever its format. Members may differ in ' +
-   'resolution or frame rate, which can produce a file that plays back wrong.'],
+   'resolution or frame rate; a recording keeps the format it starts on.'],
 ];
 
 function groupStrategyLabel(strategy) {

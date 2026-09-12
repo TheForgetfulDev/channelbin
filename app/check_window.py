@@ -229,7 +229,7 @@ def window_close(app):
         from .config import load_config
         from . import channel_tester
         from .database import OnDemandTestJob, Alert
-        from .alerts import create_alert
+        from .alerts import create_alert, dismiss_open_alerts
         from .fmt_utils import fmt_duration_hm, fmt_duration_phrase
 
         ct_cfg = load_config().get('channel_testing', {})
@@ -254,6 +254,11 @@ def window_close(app):
         never_started = due_jobs(occurrence_start_utc)
 
         if stopped_job is None and not never_started:
+            # Nothing was stopped and nothing was left unstarted, so this window drained
+            # cleanly - which also means an earlier window's leftover warning is no longer
+            # describing anything true. Silence alone left it standing indefinitely
+            # (dev/changelog/930).
+            dismiss_open_alerts('HEALTH_CHECK_WINDOW', 'check_window')
             return
 
         already = Alert.query.filter(

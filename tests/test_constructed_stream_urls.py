@@ -383,18 +383,23 @@ class BlockedSyncTests(unittest.TestCase):
         self.assertEqual(self.account.status, 'OK')
         self.assertEqual(Channel.query.filter_by(account_id=self.account.id).count(), 3)
 
-    def test_constructed_alert_names_the_mode_actually_used(self):
-        """The alert used to hardcode the form it described. When the form became a user
-        setting, prose describing it became part of the change surface."""
+    def test_the_account_page_names_the_mode_actually_used(self):
+        """Prose describing the constructed URL form is part of the change surface: the form
+        is a user setting, and a constructed URL that does not play is nearly always the
+        wrong form. This lived in the SYNC_STREAM_URLS_CONSTRUCTED alert body until
+        dev/changelog/928 retired it and moved it onto the account page's standing banner -
+        which is better placed, since it is true for as long as the URLs are constructed."""
         self.account.url_normalization = NORM_HLS
         db.session.commit()
         self._sync()
 
-        alert = Alert.query.filter_by(alert_type='SYNC_STREAM_URLS_CONSTRUCTED',
-                                      dismissed_at=None).one()
-        self.assertIn('HLS', alert.body)
-        self.assertIn('.m3u8', alert.body)
-        self.assertNotIn('.ts', alert.body)
+        self.assertEqual(
+            [], Alert.query.filter_by(alert_type='SYNC_STREAM_URLS_CONSTRUCTED').all(),
+            'constructed URLs are shown on the account, never raised as an alert')
+
+        html = self.t.client.get(f'/accounts/{self.account.id}').get_data(as_text=True)
+        self.assertIn('stream URLs were built by ChannelBin', html)
+        self.assertIn('HLS', html)
 
 
 if __name__ == '__main__':

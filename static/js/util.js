@@ -457,6 +457,23 @@ async function jsonFetch(url, opts = {}) {
   };
 })();
 
+// Re-fetch a page and replace each selected region with its fresh server-rendered copy, so
+// a page that keeps itself current has one renderer - the template - rather than a second
+// one in JS that can drift from it. A region missing from either side is left alone.
+// Listeners bound to anything inside a swapped region go with it (bind by delegation), and
+// inline state held on those nodes has to be re-applied once this resolves. Rejects on a
+// network error or a non-2xx answer, leaving the page as it was.
+async function swapFromServer(selectors, url = location.href) {
+  const res = await fetch(url, { cache: 'no-store' });
+  if (!res.ok) throw new Error(`${url} answered ${res.status}`);
+  const doc = new DOMParser().parseFromString(await res.text(), 'text/html');
+  selectors.forEach((sel) => {
+    const current = document.querySelector(sel);
+    const fresh = doc.querySelector(sel);
+    if (current && fresh) current.outerHTML = fresh.outerHTML;
+  });
+}
+
 /* ── App design-system behaviors (DESIGN.md sections 3.6/3.7/3.9/3.12) ──
    One delegated handler set per behavior, initialized once at load; pages only
    need the markup conventions (.tip[data-tip], [data-menu] + .menu, .thumb). */
@@ -468,7 +485,13 @@ async function jsonFetch(url, opts = {}) {
   let pop = null;
   let anchor = null;
   const show = (el) => {
-    const text = el.getAttribute('data-tip');
+    // Authored tips write their line break as "&#10;". Markup from a template or a page
+    // script is parsed as HTML, so that entity is already a real newline by the time it is
+    // read back here - but a tip passed as a Jinja MACRO ARGUMENT is autoescaped to
+    // "&amp;#10;", so the attribute genuinely holds those six characters, and textContent
+    // renders exactly what it is handed (dev/docs/BUGS.md 2026-09-11). Decoded in this one
+    // renderer rather than at 126 call sites; both spellings mean the same newline.
+    const text = (el.getAttribute('data-tip') || '').replace(/&#10;/g, '\n');
     if (!text) return;
     if (!pop) {
       pop = document.createElement('div');

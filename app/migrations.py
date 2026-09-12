@@ -72,6 +72,7 @@ concurrent writer exists yet (same exemption as _seed_default_tags in app/__init
 import glob
 import logging
 import os
+import re
 import shutil
 import time
 from datetime import datetime
@@ -125,6 +126,7 @@ _BF_HEALTH_SCORES = 'm001.health_scores'
 _BF_URL_NORMALIZABLE = 'm024.url_normalizable'
 _BF_FAILURE_STREAK = 'm026.consecutive_test_failures'
 _BF_SEGMENT_CHANNEL = 'm032.segment_channel_id'
+_BF_SYNC_LOG_SKIP_COUNTS = 'm051.sync_log_skip_counts'
 
 
 def _register_backfill(conn, cur, name: str):
@@ -1688,6 +1690,288 @@ def _m050_channel_health_exclusions(conn, cur):
                 'ON channel_health_exclusions (channel_id, source_kind, source_id)')
 
 
+# The titles app/accounts.py::_do_sync gives these two alerts, which were the counts' only
+# record before m051. They name the account rather than its id.
+_SKIP_ALERT_TITLE = re.compile(
+    r'^(?P<name>.*): skipped (?P<count>\d+) (?:malformed channel URL|duplicate stream ID)\(s\)$')
+_SKIP_ALERT_COLUMN = {
+    'MALFORMED_CHANNEL_URLS': 'skipped_malformed_urls',
+    'DUPLICATE_STREAM_IDS_SKIPPED': 'skipped_duplicate_stream_ids',
+}
+
+
+def _m051_sync_log_skip_counts(conn, cur):
+    """account_sync_logs: skipped_malformed_urls/skipped_duplicate_stream_ids, the entries each
+    sync's channel upsert skipped, so the account page can show them (dev/changelog/926).
+
+    Backfilled from the alerts through the ledger, because the columns existing is not
+    evidence the backfill ran (dev/changelog/686)."""
+    existing = {r[1] for r in cur.execute('PRAGMA table_info(account_sync_logs)').fetchall()}
+    added = any(col not in existing for col in _SKIP_ALERT_COLUMN.values())
+    if added:
+        _register_backfill(conn, cur, _BF_SYNC_LOG_SKIP_COUNTS)
+    for col in _SKIP_ALERT_COLUMN.values():
+        if col not in existing:
+            cur.execute(f'ALTER TABLE account_sync_logs ADD COLUMN {col} INTEGER')
+    conn.commit()
+    if _backfill_needed(cur, _BF_SYNC_LOG_SKIP_COUNTS, added):
+        _backfill_sync_log_skip_counts(cur)
+        _finish_backfill(conn, cur, _BF_SYNC_LOG_SKIP_COUNTS)
+
+
+def _backfill_sync_log_skip_counts(cur):
+    """Set each sync's counts from the alert it raised. A recompute - every matched column is
+    set to the count in its alert's title - so a re-run after an interrupted attempt writes
+    the same values. _finish_backfill commits it together with the ledger row.
+
+    The alert fires milliseconds after its sync is stamped complete, so it is matched to its
+    account's finished sync nearest in time, within a minute. Anything unmatched stays NULL,
+    "not tracked": no alert does not prove nothing was skipped, since an ignored alert writes
+    no row and dismissed alerts are pruned after alerts.keep_days. A name two accounts share
+    matches neither, and a renamed account's older alerts match nothing."""
+    ids_by_name = {}
+    for account_id, name in cur.execute('SELECT id, name FROM accounts').fetchall():
+        ids_by_name.setdefault(name, []).append(account_id)
+    alerts = cur.execute(
+        'SELECT alert_type, title, created_at FROM alerts WHERE alert_type IN (?, ?)',
+        tuple(_SKIP_ALERT_COLUMN)).fetchall()
+    for alert_type, title, created_at in alerts:
+        match = _SKIP_ALERT_TITLE.match(title or '')
+        account_ids = ids_by_name.get(match.group('name'), []) if match else []
+        if len(account_ids) != 1:
+            continue
+        sync = cur.execute(
+            "SELECT id FROM account_sync_logs WHERE account_id = ? "
+            "AND status IN ('SUCCESS', 'PARTIAL') "
+            "AND abs(julianday(completed_at) - julianday(?)) * 86400 <= 60 "
+            "ORDER BY abs(julianday(completed_at) - julianday(?)) LIMIT 1",
+            (account_ids[0], created_at, created_at)).fetchone()
+        if sync:
+            cur.execute(f'UPDATE account_sync_logs SET {_SKIP_ALERT_COLUMN[alert_type]} = ? '
+                        'WHERE id = ?', (int(match.group('count')), sync[0]))
+
+
+def _m052_dismiss_retired_alert_type_rows(conn, cur):
+    """Dismiss every open alert of a type nothing raises any more (dev/changelog/928).
+
+    Twelve types stopped being raised when alerts were narrowed to real problems: each
+    reported something already shown on the group, recording, account or page it concerns.
+    The rows are kept and still render with their label - the history is real - but left
+    open they would hold the counter at a number no future event can ever bring down, since
+    the code that used to dismiss them is gone too. On the database this was written
+    against, all 124 unread WARN alerts were GROUP_FORMAT_MISMATCH.
+
+    Dismissed rather than deleted, and deliberately not marked read: dismissing is the
+    action the user would have taken, it is what every other resolution path does, and
+    alerts.keep_days prunes dismissed rows on its own schedule. Marking them read would
+    claim somebody looked at them.
+
+    Re-runnable from the top: an UPDATE by predicate over the rows still open is idempotent
+    - a retry after an interrupted run dismisses whatever the first attempt did not, and
+    re-dismisses nothing - so this needs no entry in the backfill ledger above.
+
+    The twelve names are spelled out here rather than read from alerts.RETIRED_ALERT_TYPES
+    on purpose. A migration's effect must be what it was when it shipped: if a thirteenth
+    type is retired later, this step must not silently start dismissing it as well - that
+    belongs to a new migration, whose absence would otherwise be invisible.
+    """
+    types = [
+        'CHANNEL_HIDE_RULES_NOT_APPLIED',
+        'DUPLICATE_STREAM_IDS_SKIPPED',
+        'GROUP_FORMAT_MISMATCH',
+        'GROUP_NO_ELIGIBLE_MEMBER',
+        'HEALTH_CHECK_COMPLETE',
+        'JOB_SKIPPED',
+        'MALFORMED_CHANNEL_URLS',
+        'RECORDING_FORMAT_CHANGED',
+        'RECORDING_FORMAT_OVERRIDE',
+        'SYNC_CHANNELS_MISSING',
+        'SYNC_CHANNELS_NEW',
+        'SYNC_STREAM_URLS_CONSTRUCTED',
+    ]
+    placeholders = ','.join('?' * len(types))
+    cur.execute(
+        'UPDATE alerts SET dismissed_at = ? '
+        f'WHERE dismissed_at IS NULL AND alert_type IN ({placeholders})',
+        [_utc_stamp(), *types])
+    if cur.rowcount:
+        log.info('Dismissed %d open alert(s) of types nothing raises any more', cur.rowcount)
+
+
+def _m053_unlink_stale_recording_references(conn, cur):
+    """Unlink the rows still naming a recording they cannot be about (dev/changelog/929).
+
+    recordings.id is a plain INTEGER PRIMARY KEY with no AUTOINCREMENT, so SQLite re-issues
+    a deleted row's number to the next recording created. The delete paths used to leave
+    alerts - and a pre-check's channel_tests rows - holding that number, so they did not
+    dangle: they silently re-attached to whichever unrelated recording inherited it. On the
+    database this was written against, two open "move failed" alerts about test recordings
+    deleted the day before deep-linked to the two recordings scheduled the next morning
+    under the same two ids.
+
+    A row is stale when the recording it names is gone, OR when it predates that
+    recording's own created_at - a fact about a recording cannot be older than the
+    recording. The second half is what repairs the live rows: their ids exist again, so a
+    missing-row check alone would have found nothing at all.
+
+    Open alerts are dismissed as well as unlinked, and an already-dismissed row keeps its
+    original timestamp. Re-runnable from the top: nulling the column is what takes a
+    repaired row out of the predicate, so a retry after an interrupted run reaches only
+    what the first attempt did not.
+    """
+    cur.execute(
+        'UPDATE alerts SET dismissed_at = COALESCE(dismissed_at, ?), recording_id = NULL '
+        'WHERE recording_id IS NOT NULL AND ('
+        '  recording_id NOT IN (SELECT id FROM recordings)'
+        '  OR created_at < (SELECT r.created_at FROM recordings r '
+        '                   WHERE r.id = alerts.recording_id))',
+        (_utc_stamp(),))
+    if cur.rowcount:
+        log.info('Unlinked %d alert(s) from a recording they cannot be about', cur.rowcount)
+
+    cur.execute(
+        'UPDATE channel_tests SET pre_check_recording_id = NULL '
+        'WHERE pre_check_recording_id IS NOT NULL AND ('
+        '  pre_check_recording_id NOT IN (SELECT id FROM recordings)'
+        '  OR test_started_at < (SELECT r.created_at FROM recordings r '
+        '                        WHERE r.id = channel_tests.pre_check_recording_id))')
+    if cur.rowcount:
+        log.info('Unlinked %d pre-check test(s) from a recording they cannot be about',
+                 cur.rowcount)
+
+
+def _m054_drop_guide_check_retarget_announcement(conn, cur):
+    """Remove the one-time TV Guide retarget announcement's leftovers (dev/changelog/931).
+
+    dev/changelog/752 changed what the automatic "TV Guide Channels" health check probes,
+    and a startup hook announced that change once - an INFO alert, a group timeline event
+    and a log line - gated on a user_prefs row so it could never fire twice. The hook is
+    gone: it could only ever fire on an install upgrading across that one version boundary,
+    because a database with no groups of the user's own resolves the old and new rules
+    identically and stays silent, which is the shape of every fresh install. What it left
+    behind is an alert nothing will ever dismiss and a flag guarding a code path that no
+    longer exists.
+
+    Deleted rather than dismissed, unlike the retired types of migration 52. Those keep
+    their rows because the conditions they described were real and recurring, so the
+    history is worth reading. This one announced a single upgrade to the person who
+    performed it; once read, it is a release note sitting in the alert list.
+
+    The ChannelGroupEvent it wrote is deliberately NOT removed - a group's Activity
+    Timeline is where "what this check tests changed, on this date" belongs, and it costs
+    nothing. GROUP_CHECK_TARGETS_CHANGED keeps its label so that row still renders.
+
+    Re-runnable from the top: both statements are deletes by predicate, so a retry after an
+    interrupted run removes whatever the first attempt did not, and nothing else.
+    """
+    cur.execute("DELETE FROM alerts WHERE alert_type = 'HEALTH_CHECK_TARGETS_CHANGED'")
+    if cur.rowcount:
+        log.info('Removed %d one-time health check retarget alert(s)', cur.rowcount)
+    cur.execute("DELETE FROM user_prefs WHERE key = 'guide_check_retarget_announced'")
+    if cur.rowcount:
+        log.info('Removed the health check retarget announcement flag')
+
+
+#: The table-constraint primary key SQLAlchemy emits for `recordings` without
+#: sqlite_autoincrement, and the inline form it emits with it. AUTOINCREMENT is only legal on
+#: the inline spelling, so the rebuild below has to move the clause, not just append a keyword.
+_PK_TABLE_CONSTRAINT = '\n\tPRIMARY KEY (id), '
+_PK_COLUMN_OLD = 'id INTEGER NOT NULL,'
+_PK_COLUMN_NEW = 'id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,'
+
+
+def _recordings_autoincrement_ddl(old_sql: str, table_name: str) -> str:
+    """Rewrite `recordings`' CREATE TABLE so its primary key carries AUTOINCREMENT.
+
+    Derived from the DDL actually stored in sqlite_master rather than written out here, so
+    the rebuilt table is the source table's own vintage down to the column list, types and
+    defaults - nothing to drift out of step with the model, and nothing for a later step that
+    adds a column to collide with. The only difference is where the primary key is declared.
+
+    Raises if either edit finds nothing. A rebuild that quietly produced a table without
+    AUTOINCREMENT would leave the id still being re-issued while every check for the column's
+    presence passed, which is the silent half-success this app refuses on principle.
+    """
+    new_sql = old_sql.replace('CREATE TABLE recordings', f'CREATE TABLE {table_name}', 1)
+    if _PK_COLUMN_OLD not in new_sql or _PK_TABLE_CONSTRAINT not in new_sql:
+        raise RuntimeError(
+            'Cannot rebuild the recordings table with AUTOINCREMENT: its stored CREATE TABLE '
+            'does not carry the expected primary key clauses '
+            f'({_PK_COLUMN_OLD!r} and {_PK_TABLE_CONSTRAINT.strip()!r}). Stored DDL:\n{old_sql}')
+    new_sql = new_sql.replace(_PK_COLUMN_OLD, _PK_COLUMN_NEW, 1)
+    return new_sql.replace(_PK_TABLE_CONSTRAINT, '', 1)
+
+
+def _m055_recordings_autoincrement(conn, cur):
+    """Rebuild `recordings` with AUTOINCREMENT so a deleted id is never re-issued.
+
+    SQLite issues max(id)+1 for a plain INTEGER PRIMARY KEY, so deleting the newest recording
+    and creating another hands the new one the old one's number. Anything still holding that
+    number does not dangle - it silently re-attaches and describes the wrong recording. Two
+    open alerts about deleted test recordings deep-linked to the recordings that inherited
+    their ids (dev/changelog/929, which unlinked them, and migration 53, which repaired the
+    rows already stored). This closes the reuse itself, for every consumer of a recording id
+    that has not been written yet.
+
+    SQLite cannot add AUTOINCREMENT in place, so this is the documented copy/drop/rename
+    rebuild. Three things about it are load-bearing:
+
+    * **The explicit BEGIN.** Python's sqlite3 driver opens a transaction for INSERT but not
+      for DDL, so without this the CREATE of the temporary table commits on its own. An
+      interrupted rebuild then leaves recordings_autoinc_new behind - and the retry dies on
+      "table already exists", which aborts startup with no way past it short of dropping the
+      table by hand. `recordings` itself survives either way, because the copy's implicit
+      transaction covers the DROP; it is the upgrade's ability to restart itself that the
+      BEGIN buys. Measured on this machine both ways round (dev/changelog/937). The runner's
+      own rollback-on-failure only reaches this step because the step opens the transaction;
+      PRAGMA user_version is transactional too, so the stamp commits with the rebuild rather
+      than after it.
+    * **sqlite_sequence needs no seeding.** Copying the rows with their explicit ids leaves
+      the sequence at the highest id present, so every id up to it is retired - gaps left by
+      recordings deleted from the middle included. What it cannot cover is an id deleted from
+      the TOP before this ran: migration 53 unlinked the rows that named it and the cascaded
+      ones went with the recording, so nothing in the database remembers it existed and it
+      can be issued once more. That residual is what detach_recording_references() covers,
+      which is why both halves stay. Seeding by hand would only help if the rows were being
+      discarded rather than copied.
+    * **No indexes, triggers or views to recreate.** `recordings` carries none, which is why
+      the usual step 7 of the rebuild procedure is absent rather than forgotten.
+
+    The rename leaves the stored DDL reading `CREATE TABLE "recordings"` where a fresh
+    create_all() build reads it unquoted - SQLite's own spelling of the identifier it just
+    rewrote, identical in every other character. Unavoidable, since the rename is what the
+    rebuild is made of.
+
+    Foreign keys are off in this app, so the referencing tables (recording_events,
+    recording_segments, channel_tests.pre_check_recording_id, alerts.recording_id) are
+    untouched by the drop and keep pointing at `recordings` across the rename - their FK
+    clauses name the table, and nothing references the temporary name.
+
+    Idempotent: a table already carrying AUTOINCREMENT is left alone.
+    """
+    row = cur.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='recordings'").fetchone()
+    if row is None:
+        return  # nothing to rebuild; create_all() will have built it in the current shape
+    old_sql = row[0]
+    if 'AUTOINCREMENT' in old_sql:
+        return
+
+    tmp_name = 'recordings_autoinc_new'
+    new_sql = _recordings_autoincrement_ddl(old_sql, tmp_name)
+    columns = ', '.join(f'"{r[1]}"' for r in cur.execute('PRAGMA table_info(recordings)'))
+
+    if not conn.in_transaction:
+        cur.execute('BEGIN')
+    cur.execute(new_sql)
+    cur.execute(f'INSERT INTO {tmp_name} ({columns}) SELECT {columns} FROM recordings')
+    copied = cur.rowcount
+    cur.execute('DROP TABLE recordings')
+    cur.execute(f'ALTER TABLE {tmp_name} RENAME TO recordings')
+    log.info('Rebuilt the recordings table with AUTOINCREMENT (%d row(s) carried over); '
+             'a deleted recording id is no longer re-issued', copied)
+
+
 SCHEMA_MIGRATIONS = [
     (1, 'baseline: pre-versioning additive migrations + backfills', _m001_baseline),
     (2, 'recordings: program_title/program_sub_title snapshot columns + backfill', _m002_program_title),
@@ -1777,6 +2061,19 @@ SCHEMA_MIGRATIONS = [
      'stall-rate demotion trigger', _m049_profile_stall_move_trigger),
     (50, 'channel_health_exclusions: observations a user has taken out of a channel\'s '
      'health score', _m050_channel_health_exclusions),
+    (51, 'account_sync_logs: skipped_malformed_urls/skipped_duplicate_stream_ids + a backfill '
+     'from the alert titles that carried them', _m051_sync_log_skip_counts),
+    (52, 'dismiss open alerts of the twelve types nothing raises any more, so the counter '
+     'starts honest', _m052_dismiss_retired_alert_type_rows),
+    (53, 'alerts + channel_tests: unlink the rows still naming a recording they cannot be '
+     'about, whose id SQLite has since re-issued to another recording',
+     _m053_unlink_stale_recording_references),
+    (54, 'remove the one-time TV Guide retarget announcement: its alert row, and the '
+     'user_prefs flag that gated a startup hook that no longer exists',
+     _m054_drop_guide_check_retarget_announcement),
+    (55, 'recordings: rebuild with AUTOINCREMENT so a deleted recording id is never '
+     're-issued to the next recording created',
+     _m055_recordings_autoincrement),
 ]
 
 CURRENT_SCHEMA_VERSION = SCHEMA_MIGRATIONS[-1][0]
@@ -1800,10 +2097,16 @@ def is_fresh_db() -> bool:
         conn.close()
 
 
-def run_migrations(fresh_db: bool):
+def run_migrations(fresh_db: bool, cfg: dict):
     """Bring the DB to CURRENT_SCHEMA_VERSION. Called from create_app() right after
     db.create_all(). Fresh DBs are stamped current (create_all already built the full
-    schema); existing DBs run any pending steps in order, snapshotting first."""
+    schema); existing DBs run any pending steps in order, snapshotting first.
+
+    `cfg` is the merged config create_app() is already holding, and it is required rather
+    than re-read here: the snapshot's destination is a filesystem path, and a path resolved
+    from a fresh load_config() is resolved against the REAL install no matter whose database
+    is being migrated (dev/changelog/936).
+    """
     conn = db.engine.raw_connection()
     try:
         cur = conn.cursor()
@@ -1830,7 +2133,7 @@ def run_migrations(fresh_db: bool):
         if not pending:
             return
 
-        _backup_before_migration(cur, db_version, pending[0][0])
+        _backup_before_migration(cur, db_version, pending[0][0], cfg)
 
         for version, description, fn in pending:
             log.info('Applying schema migration %d: %s', version, description)
@@ -1859,14 +2162,21 @@ def run_migrations(fresh_db: bool):
         conn.close()
 
 
-def _backup_before_migration(cur, db_version: int, first_pending: int):
+def _backup_before_migration(cur, db_version: int, first_pending: int, cfg: dict):
     """Snapshot the DB via VACUUM INTO before any pending migration runs. This is the
     entire rollback story (no down-migrations exist), so a failed snapshot aborts startup
-    rather than silently migrating an un-backed-up DB."""
-    from .config import (load_config, resolve_app_path, ensure_private_dir,
-                         DEFAULT_DB_BACKUP_DIR)
+    rather than silently migrating an un-backed-up DB.
+
+    Both paths come from the caller's `cfg`, never a fresh load_config(). The two are the
+    same thing in production and are not the same thing anywhere else: database.backup_dir
+    defaults to an app-root-relative path, so a re-read resolved every snapshot to the real
+    install's instance/db-backups even when the cursor belonged to a temp database. The
+    suite ran that combination on every pass and the pruner then evicted the operator's real
+    snapshots to keep three copies of an empty test database (dev/changelog/936).
+    """
+    from .config import (resolve_app_path, ensure_private_dir, DEFAULT_DB_BACKUP_DIR)
     from .tz_utils import get_display_tz
-    db_cfg = load_config().get('database', {})
+    db_cfg = cfg.get('database', {})
     if not db_cfg.get('pre_migration_backup', True):
         log.warning('database.pre_migration_backup is false - migrating from schema version '
                     '%d without a snapshot', db_version)

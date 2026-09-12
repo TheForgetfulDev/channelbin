@@ -5,9 +5,10 @@ Channels are never deleted or disabled by sync - vanished channels used to linge
 indefinitely with no signal, and new channels were indistinguishable from old ones. This
 adds first_seen_at/last_seen_at (stamped in the one shared _upsert_channels choke point),
 pure derived display states ("missing from provider" / "new", never stored - see
-channel_lifecycle_state()), and three alerts raised at sync mark-success time:
-SYNC_FEED_SHRUNK (WARN, standing, auto-resolving), SYNC_CHANNELS_MISSING /
-SYNC_CHANNELS_NEW (INFO digests, per-transition, dismissed manually).
+channel_lifecycle_state()), and SYNC_FEED_SHRUNK (WARN, standing, auto-resolving) raised at
+sync mark-success time. The SYNC_CHANNELS_MISSING / SYNC_CHANNELS_NEW digests that used to be
+raised alongside it were retired in dev/changelog/928 - the derived states they summarized are
+shown per channel instead.
 
 Covers:
   - UpsertChannelsLifecycleTests: _upsert_channels stamps first_seen_at/last_seen_at
@@ -15,9 +16,7 @@ Covers:
   - ChannelLifecycleStateTests: the pure channel_lifecycle_state() derived-state
     function - missing/new/suppressed/disabled cases.
   - LifecycleAlertsUnitTests: _raise_channel_lifecycle_alerts() directly - feed-shrink
-    fire/disable, the missing-digest's newly-crossing-only logic (and first-ever-check
-    skip), the new-digest's first-sync-era suppression (by count and by earliest-sync
-    recency).
+    fire/disable/resolve, and a guard that neither retired digest is raised.
   - DoSyncLifecycleWiringTests: end-to-end through the real _do_sync (mocked
     requests.get, M3U path) - proves the baseline-capture/call-site wiring, not just the
     alerts function in isolation.
@@ -32,8 +31,6 @@ import threading
 import unittest
 from datetime import datetime, timedelta
 from unittest import mock
-
-from sqlalchemy import event
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -220,14 +217,9 @@ class LifecycleAlertsUnitTests(unittest.TestCase):
         return Alert.query.filter_by(
             alert_type='SYNC_FEED_SHRUNK', source=f'account:{self.account.id}:feed-shrunk').first()
 
-    def _missing_alert(self):
-        return Alert.query.filter_by(
-            alert_type='SYNC_CHANNELS_MISSING',
-            source=f'account:{self.account.id}:channels-missing').first()
-
-    def _new_alert(self):
-        return Alert.query.filter_by(
-            alert_type='SYNC_CHANNELS_NEW', source=f'account:{self.account.id}:channels-new').first()
+    def _digest_alerts(self):
+        return Alert.query.filter(Alert.alert_type.in_(
+            ['SYNC_CHANNELS_MISSING', 'SYNC_CHANNELS_NEW'])).all()
 
     # ── Feed shrink ────────────────────────────────────────────────────────────
 
@@ -282,151 +274,32 @@ class LifecycleAlertsUnitTests(unittest.TestCase):
         db.session.expire_all()
         self.assertIsNotNone(self._feed_shrunk_alert().dismissed_at)
 
-    # ── Missing digest ─────────────────────────────────────────────────────────
+    # ── The two digests, retired (dev/changelog/928) ────────────────────────────
 
-    def test_missing_digest_only_includes_newly_crossing_channels(self):
+    def test_neither_digest_is_raised_any_more(self):
+        """New and missing are derived display state, so each channel carries its own badge
+        wherever it is listed and channel search filters on them - which answers "what
+        changed" better than a digest naming five of them. The alerts were retired; the
+        states they summarized are untouched and covered by ChannelLifecycleStateTests above.
+
+        Both arms are exercised: channels newly crossing the missing threshold, and brand-new
+        channels on an account well out of its first-sync era - the exact inputs that used to
+        fire each digest.
+        """
         now = datetime.utcnow()
         self._seed_channel(last_seen_at=now - timedelta(days=8), name='JustCrossed')
-        self._seed_channel(last_seen_at=now - timedelta(days=20), name='LongMissing')
+        fresh = self._seed_channel(first_seen_at=now, name='FreshChannel')
         db.session.commit()
-        previous_last_sync_at = now - timedelta(days=7, hours=12)
-
-        _raise_channel_lifecycle_alerts(self.account, self._cfg(), now, previous_last_sync_at, 2, [])
-
-        alert = self._missing_alert()
-        self.assertIsNotNone(alert)
-        self.assertIn('JustCrossed', alert.body)
-        self.assertNotIn('LongMissing', alert.body)
-
-    def test_missing_digest_skipped_on_first_ever_check(self):
-        now = datetime.utcnow()
-        self._seed_channel(last_seen_at=now - timedelta(days=30))
-        db.session.commit()
-
-        _raise_channel_lifecycle_alerts(self.account, self._cfg(), now, None, 1, [])
-
-        self.assertIsNone(self._missing_alert())
-
-    def test_missing_days_zero_disables_digest(self):
-        now = datetime.utcnow()
-        self._seed_channel(last_seen_at=now - timedelta(days=30))
+        old = now - timedelta(days=30)
+        for _ in range(2):
+            db.session.add(AccountSyncLog(account_id=self.account.id, started_at=old,
+                                          status='SUCCESS'))
         db.session.commit()
 
         _raise_channel_lifecycle_alerts(
-            self.account, self._cfg(channel_missing_after_days=0), now,
-            now - timedelta(days=29), 1, [])
+            self.account, self._cfg(), now, now - timedelta(days=7, hours=12), 2, [fresh.id])
 
-        self.assertIsNone(self._missing_alert())
-
-    # ── New digest ─────────────────────────────────────────────────────────────
-
-    def test_new_digest_fires_when_not_suppressed(self):
-        now = datetime.utcnow()
-        ch = self._seed_channel(first_seen_at=now, name='FreshChannel')
-        db.session.commit()
-        old = now - timedelta(days=30)
-        for _ in range(2):
-            db.session.add(AccountSyncLog(account_id=self.account.id, started_at=old, status='SUCCESS'))
-        db.session.commit()
-
-        _raise_channel_lifecycle_alerts(self.account, self._cfg(), now, None, 1, [ch.id])
-
-        alert = self._new_alert()
-        self.assertIsNotNone(alert)
-        self.assertIn('FreshChannel', alert.body)
-
-    def test_new_digest_suppressed_by_low_completed_count(self):
-        now = datetime.utcnow()
-        ch = self._seed_channel(first_seen_at=now)
-        db.session.commit()
-        # No AccountSyncLog rows at all -> completed_count = 0.
-
-        _raise_channel_lifecycle_alerts(self.account, self._cfg(), now, None, 1, [ch.id])
-
-        self.assertIsNone(self._new_alert())
-
-    def test_new_digest_suppressed_by_recent_earliest_sync(self):
-        now = datetime.utcnow()
-        ch = self._seed_channel(first_seen_at=now)
-        db.session.commit()
-        recent = now - timedelta(hours=1)
-        for _ in range(2):
-            db.session.add(AccountSyncLog(account_id=self.account.id, started_at=recent, status='SUCCESS'))
-        db.session.commit()
-
-        _raise_channel_lifecycle_alerts(self.account, self._cfg(), now, None, 1, [ch.id])
-
-        self.assertIsNone(self._new_alert())
-
-    def test_new_days_zero_disables_digest(self):
-        now = datetime.utcnow()
-        ch = self._seed_channel(first_seen_at=now)
-        db.session.commit()
-        old = now - timedelta(days=30)
-        for _ in range(2):
-            db.session.add(AccountSyncLog(account_id=self.account.id, started_at=old, status='SUCCESS'))
-        db.session.commit()
-
-        _raise_channel_lifecycle_alerts(
-            self.account, self._cfg(channel_new_within_days=0), now, None, 1, [ch.id])
-
-        self.assertIsNone(self._new_alert())
-
-    def test_new_digest_count_is_exact_when_more_than_five_new_channels(self):
-        # new_channel_ids query is capped to a 5-name sample (dev/docs/BUGS.md 2026-08-15)
-        # so the reported total must come from len(new_channel_ids), not the sample rowset.
-        now = datetime.utcnow()
-        channels = [self._seed_channel(first_seen_at=now, name=f'Fresh{i}') for i in range(8)]
-        db.session.commit()
-        old = now - timedelta(days=30)
-        for _ in range(2):
-            db.session.add(AccountSyncLog(account_id=self.account.id, started_at=old, status='SUCCESS'))
-        db.session.commit()
-
-        _raise_channel_lifecycle_alerts(
-            self.account, self._cfg(), now, None, 1, [ch.id for ch in channels])
-
-        alert = self._new_alert()
-        self.assertIsNotNone(alert)
-        self.assertIn('8 new channel(s)', alert.title)
-        self.assertIn('and 3 more', alert.body)
-
-    def test_new_digest_sample_query_parameter_count_does_not_scale_with_new_channels(self):
-        # The old code queried Channel.id.in_(new_channel_ids) - one SQL parameter per new
-        # channel id. A mass re-add sync can put tens of thousands of ids in that list, which
-        # would risk the same "too many SQL variables" failure as the EPG delete
-        # (dev/docs/BUGS.md 2026-08-15). The sample query is now capped to 5 ids regardless
-        # of how many channels are new.
-        now = datetime.utcnow()
-        channels = [self._seed_channel(first_seen_at=now, name=f'Fresh{i}') for i in range(20)]
-        db.session.commit()
-        old = now - timedelta(days=30)
-        for _ in range(2):
-            db.session.add(AccountSyncLog(account_id=self.account.id, started_at=old, status='SUCCESS'))
-        db.session.commit()
-
-        captured = []
-
-        def _on_execute(conn, cursor, statement, parameters, context, executemany):
-            if 'FROM channels' in statement and ' IN (' in statement:
-                captured.append(parameters)
-
-        engines = {eng for eng in db.engines.values()}
-        for eng in engines:
-            event.listen(eng, 'before_cursor_execute', _on_execute)
-        try:
-            _raise_channel_lifecycle_alerts(
-                self.account, self._cfg(), now, None, 1, [ch.id for ch in channels])
-        finally:
-            for eng in engines:
-                event.remove(eng, 'before_cursor_execute', _on_execute)
-
-        self.assertEqual(len(captured), 1, 'expected exactly one channel-sample select')
-        param_count = len(captured[0])
-        self.assertLessEqual(
-            param_count, 5,
-            f'sample query bound {param_count} parameters for 20 new channels - it must stay '
-            'capped at 5 regardless of how many channels are new')
+        self.assertEqual([], self._digest_alerts())
 
 
 class DoSyncLifecycleWiringTests(unittest.TestCase):

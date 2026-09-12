@@ -318,8 +318,10 @@ class FormatChangeDisclosureTests(_PinCase):
         self.assertEqual(RecordingEvent.query.filter_by(
             recording_id=rec.id, event_type=RECORDING_FORMAT_CHANGED).count(), 1)
 
-    def test_every_divergent_segment_logs_but_only_the_first_alerts(self):
-        """A flapping feed is several facts about the file and one problem for the user."""
+    def test_every_divergent_segment_logs_its_own_event_and_none_alert(self):
+        """A flapping feed is several facts about one file, each its own event on the
+        recording - and no alert at all since dev/changelog/928: a mixed-format file is
+        disclosed where the file is, not in the alert counter."""
         rec = self._rec()
         self._segment(rec, 1, SD)
         seg2 = self._segment(rec, 2, HD)
@@ -330,7 +332,7 @@ class FormatChangeDisclosureTests(_PinCase):
         self.assertEqual(RecordingEvent.query.filter_by(
             recording_id=rec.id, event_type=RECORDING_FORMAT_CHANGED).count(), 2)
         self.assertEqual(Alert.query.filter_by(
-            alert_type=RECORDING_FORMAT_CHANGED).count(), 1)
+            alert_type=RECORDING_FORMAT_CHANGED).count(), 0)
 
     def test_the_check_never_harms_the_capture_it_describes(self):
         """A diagnostic must never be able to break the recording it is diagnosing

@@ -463,7 +463,7 @@ class BannerFactsTests(unittest.TestCase):
         """Without these the banner region renders nothing at all."""
         w = self._warn()
         for key in ('strategy', 'manages_format', 'is_source', 'muted', 'recording_count',
-                    'format_blocked_count', 'format_override', 'format_spans',
+                    'format_blocked_count', 'format_override', 'format_warns',
                     'no_winner', 'epg_ids', 'epg_missing_count'):
             self.assertIn(key, w)
 
@@ -483,20 +483,23 @@ class BannerFactsTests(unittest.TestCase):
         self.assertTrue(w['is_source'])
         self.assertFalse(w['manages_format'])
 
-    def test_format_spans_counts_only_recording_enabled_members(self):
+    def test_format_warns_counts_only_recording_enabled_members(self):
         """§16.1: "If record is disabled then no need to show the same warnings, because it
         isn't set to record anyways" - a member sitting out is not part of what this group
-        would record, so it is not part of what the warning describes."""
+        would record, so it is not part of what the warning describes (dev/changelog/925)."""
         self._measure(differing=True)
-        self._strategy('unmanaged')
-        self.assertEqual(self._warn()['format_spans'], 2)
+        self._strategy('manual')
+        r = self.client.post(f'/api/channel-groups/{self.gid}/format',
+                             json={'resolution': '1920x1080', 'fps': 60})
+        self.assertEqual(r.status_code, 200)
+        self.assertTrue(self._warn()['format_warns'])
 
         r = self.client.post(f'/api/channel-groups/{self.gid}/members/participation',
                              json={'channel_id': self.bid, 'field': 'recording_enabled',
                                    'enabled': False})
         self.assertEqual(r.status_code, 200)
         w = self._warn()
-        self.assertEqual(w['format_spans'], 1)
+        self.assertFalse(w['format_warns'])
         self.assertEqual(w['recording_count'], 1)
 
     def test_blocked_count_and_override_are_read_together(self):
@@ -747,12 +750,14 @@ class FloatingFormatRenderingTests(unittest.TestCase):
         """§16.2: the banners "clear on their own once the group is set up cleanly", and a
         group assembled from every FS1 feed a provider carries is already clean - §7 calls
         that the default shape of a new group. A banner it could never satisfy would be
-        crying wolf, so the mixed-format region keeps its two branches."""
+        crying wolf. Since dev/changelog/925 the region fires only for a hand-pinned format,
+        and the `unmanaged` branch is gone."""
         js = _read('static/js/group-detail.js')
         banners = js[js.index('function renderBanners()'):js.index('function muteWarning(')]
         mixed = banners[banners.index('let mixed ='):banners.index("set('gd-format-banner'")]
-        self.assertIn('WARN.manages_format && n', mixed)
-        self.assertIn('!WARN.manages_format && WARN.format_spans > 1', mixed)
+        self.assertIn('WARN.format_warns && n', mixed)
+        self.assertNotIn('format_spans', mixed)
+        self.assertNotIn('manages_format', mixed)
         self.assertNotIn('floatingMismatch', mixed)
 
     def test_the_chip_states_how_many_members_match(self):

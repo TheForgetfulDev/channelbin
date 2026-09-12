@@ -127,12 +127,15 @@ class SyncDefersToTesterTests(unittest.TestCase):
         self.assertEqual(self._retry_jobs(), [],
                          'tester_defer_retry_minutes=0 means plain skip, no retry job')
 
-    def test_deferral_is_observable_as_an_alert(self):
+    def test_deferral_is_observable_on_the_accounts_own_sync_history(self):
+        """dev/changelog/928: a deferred sync is recorded where that account's sync history
+        already lives - the account page renders these rows - rather than as an alert."""
         self._run_sync_job(tester_running=True)
-        alerts = Alert.query.filter_by(alert_type='JOB_SKIPPED').all()
-        self.assertEqual(len(alerts), 1)
-        self.assertIn('test run', (alerts[0].body or '').lower(),
-                      'the alert must name the tester as the reason for the skip')
+        rows = AccountSyncLog.query.filter_by(account_id=self.account.id,
+                                              status='SKIPPED').all()
+        self.assertEqual(len(rows), 1)
+        self.assertIn('test run', (rows[0].error_message or '').lower(),
+                      'the row must name the tester as the reason for the skip')
 
     def test_retry_job_is_removed_when_sync_is_disabled(self):
         """Teardown releases what the create path acquired: a pending retry must not
@@ -295,17 +298,20 @@ class UpcomingRecordingSkipIsObservableTests(unittest.TestCase):
         spy = self._run_sync_job()
         spy.assert_not_called()
 
-    def test_skip_is_observable_as_a_job_skipped_alert(self):
-        rec = seed.make_recording(status='SCHEDULED', channel_id=self.channel.id, name='Soon Rec',
-                                  start_time=sched.datetime.utcnow() + timedelta(minutes=2))
+    def test_skip_is_observable_on_the_accounts_own_sync_history(self):
+        """dev/changelog/928: recorded as a SKIPPED row on the account rather than alerted.
+        The reason names the recording, which is the actionable half."""
+        seed.make_recording(status='SCHEDULED', channel_id=self.channel.id, name='Soon Rec',
+                            start_time=sched.datetime.utcnow() + timedelta(minutes=2))
         db.session.commit()
         self._run_sync_job(within_minutes=5)
-        alerts = Alert.query.filter_by(alert_type='JOB_SKIPPED').all()
-        self.assertEqual(len(alerts), 1)
-        self.assertIn('Soon Rec', alerts[0].body)
-        self.assertIn('5 minutes', alerts[0].body)
-        self.assertEqual(alerts[0].recording_id, rec.id,
-                         'the alert must name the specific recording so it can deep-link to it')
+        rows = AccountSyncLog.query.filter_by(account_id=self.account.id,
+                                              status='SKIPPED').all()
+        self.assertEqual(len(rows), 1)
+        self.assertIn('Soon Rec', rows[0].error_message)
+        self.assertIn('5 minutes', rows[0].error_message)
+        self.assertIsNotNone(rows[0].completed_at,
+                             'a skipped occurrence is closed, never left looking in-progress')
 
     def test_sync_runs_when_nothing_is_imminent(self):
         seed.make_recording(status='SCHEDULED', channel_id=self.channel.id, name='Far Off',

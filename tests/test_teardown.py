@@ -38,8 +38,9 @@ from app import connection_limits as connlim  # noqa: E402
 from app import recorder  # noqa: E402
 import app.config as cfgmod  # noqa: E402
 from app.database import (  # noqa: E402
-    RECORDING_FAILED, Recording, RecordingSegment, RecordingEvent,
+    RECORDING_FAILED, Recording, RecordingSegment, RecordingEvent, Alert, ChannelTest,
 )
+from app import scheduler as sched_mod  # noqa: E402
 from app.scheduler import schedule_recording, get_scheduler  # noqa: E402
 from app.watchdog import WatchdogThread  # noqa: E402
 # The two rigs that already know how to fake a live capture cheaply, subclassed rather
@@ -579,6 +580,163 @@ class ShutdownReleasesEverythingTests(unittest.TestCase):
                          'the shutdown deleted a segment row')
         self.assertEqual(db.session.get(Recording, rid).status, 'IN_PROGRESS',
                          'the shutdown rewrote a recording status from a signal handler')
+
+
+class DeleteUnlinksWhatNamesTheRecordingTests(unittest.TestCase):
+    """Deleting a recording must take its alerts with it and leave nothing holding its id.
+
+    The teardown rule applied to the rows that reference a recording but are not cascaded
+    away with it. `recordings` was a plain INTEGER PRIMARY KEY when these were written, so
+    SQLite re-issued a deleted row's number to the next recording created: an alert left
+    holding it did not dangle, it silently re-attached to an unrelated recording and
+    deep-linked to it (dev/docs/BUGS.md 2026-09-11 @ 08:55:00 PM ET, dev/changelog/929).
+    The table now carries AUTOINCREMENT (dev/changelog/937), which retires the number
+    instead - but the unlinking is what these assert, and it is what still covers an id
+    re-issued before that shipped and every row that would otherwise name a recording that
+    no longer exists.
+    """
+
+    #: A dismissal that predates the delete, so a test can prove the delete did not move it.
+    OLD_DISMISSAL = datetime(2026, 1, 1, 0, 0, 0)
+
+    def setUp(self):
+        self.t = make_test_app(start_scheduler=True)
+        self.t.app.config['WTF_CSRF_ENABLED'] = False
+        self.acc = seed.make_account()
+        self.ch = seed.make_channel(self.acc, stream_id=1, name='Ch')
+        db.session.commit()
+
+    def tearDown(self):
+        self.t.cleanup()
+
+    def _recording_with_alerts(self, status='COMPLETED', **kw):
+        """A recording plus the two alert shapes a delete has to handle: one still open,
+        one dismissed long ago. Returns (recording_id, open_alert_id, dismissed_alert_id)."""
+        rec = seed.make_recording(status=status, channel_id=self.ch.id, **kw)
+        db.session.flush()
+        open_alert = Alert(alert_type='LOG_ERROR', severity='ERROR',
+                           title=f'Recording "{rec.name}" (#{rec.id}) move failed',
+                           source='app.postprocessor', recording_id=rec.id)
+        old_alert = Alert(alert_type='RECORDING_CHANNEL_FAILING', severity='WARN',
+                          title='Scheduled recording channel failing',
+                          source=f'recfail:rec:{rec.id}:ch:{self.ch.id}',
+                          recording_id=rec.id, dismissed_at=self.OLD_DISMISSAL)
+        db.session.add_all([open_alert, old_alert])
+        db.session.commit()
+        return rec.id, open_alert.id, old_alert.id
+
+    def test_delete_dismisses_and_unlinks_every_alert_naming_the_recording(self):
+        rid, open_id, old_id = self._recording_with_alerts()
+
+        resp = self.t.client.post(f'/recordings/{rid}/delete')
+        self.assertEqual(resp.status_code, 302, resp.get_data(as_text=True))
+
+        db.session.expire_all()
+        self.assertIsNone(db.session.get(Recording, rid))
+        self.assertEqual(Alert.query.filter_by(recording_id=rid).count(), 0,
+                         'an alert still carries the deleted recording id')
+        self.assertIsNotNone(db.session.get(Alert, open_id).dismissed_at,
+                             'the open alert about a deleted recording was left open')
+        self.assertEqual(db.session.get(Alert, old_id).dismissed_at, self.OLD_DISMISSAL,
+                         'the delete rewrote a dismissal that had already happened')
+
+    def test_the_next_recording_gets_a_fresh_id_and_no_inherited_alerts(self):
+        """Both halves of the fix, which are belt and braces rather than alternatives.
+
+        `recordings` is AUTOINCREMENT (dev/changelog/937), so the deleted recording's number
+        is retired instead of being handed to the next one - this used to assert the
+        opposite, because until that shipped the reuse was real and the test's job was to
+        pin the unlinking that made it survivable. The unlinking (dev/changelog/929) stays
+        and is still asserted here: it is what protects an id that was already re-issued
+        before the rebuild ran, and any future column that stores one.
+        """
+        rid, _open_id, _old_id = self._recording_with_alerts()
+
+        resp = self.t.client.post(f'/recordings/{rid}/delete')
+        self.assertEqual(resp.status_code, 302, resp.get_data(as_text=True))
+
+        successor = seed.make_recording(status='SCHEDULED', channel_id=self.ch.id,
+                                        name='the next recording')
+        db.session.commit()
+        self.assertGreater(successor.id, rid,
+                           'SQLite re-issued a deleted recording id - recordings lost its '
+                           'AUTOINCREMENT primary key')
+        self.assertEqual(Alert.query.filter_by(recording_id=successor.id).count(), 0,
+                         'a new recording inherited the deleted one\'s alerts with its id')
+
+    def test_cancelling_a_scheduled_recording_unlinks_its_alerts(self):
+        """Cancel deletes the row outright (dev/changelog/814), so it is a delete path."""
+        future = datetime.utcnow() + timedelta(days=3650)
+        rid, open_id, _old_id = self._recording_with_alerts(
+            status='SCHEDULED', start_time=future, stop_time=future + timedelta(hours=1))
+
+        resp = self.t.client.post(f'/recordings/{rid}/cancel-json')
+        self.assertEqual(resp.status_code, 200, resp.get_data(as_text=True))
+
+        db.session.expire_all()
+        self.assertIsNone(db.session.get(Recording, rid))
+        self.assertEqual(Alert.query.filter_by(recording_id=rid).count(), 0)
+        self.assertIsNotNone(db.session.get(Alert, open_id).dismissed_at)
+
+    def test_the_retention_sweep_unlinks_the_alerts_of_what_it_deletes(self):
+        """The delete path with nobody watching: it runs on a schedule, so the rows it
+        strands are the ones that sit for days before anyone sees them."""
+        long_ago = datetime.utcnow() - timedelta(days=90)
+        rid, open_id, _old_id = self._recording_with_alerts(
+            status='COMPLETED', completed_at=long_ago)
+
+        # A runtime load_config() reads the real config.yaml, so the retention window has
+        # to be patched rather than passed as a make_test_app override (CLAUDE.md §Testing).
+        with mock.patch.object(cfgmod, 'load_config', return_value={
+                'recording': {'retention_days': 1, 'retention_delete_file': False}}):
+            sched_mod._recording_retention_sweep()
+
+        db.session.expire_all()
+        self.assertIsNone(db.session.get(Recording, rid),
+                          'the sweep did not delete a recording past its window')
+        self.assertEqual(Alert.query.filter_by(recording_id=rid).count(), 0)
+        self.assertIsNotNone(db.session.get(Alert, open_id).dismissed_at)
+
+    def test_replacing_a_scheduled_recording_unlinks_the_one_it_deletes(self):
+        """Find Another Airing deletes the recording it replaces, in a closure of its own -
+        the fourth delete path, and the one a grep for the delete route would miss."""
+        future = datetime.utcnow() + timedelta(days=3650)
+        rid, open_id, _old_id = self._recording_with_alerts(
+            status='SCHEDULED', start_time=future, stop_time=future + timedelta(hours=1))
+
+        # The form parses local time and converts to UTC, so these are display-local.
+        start = datetime.now() + timedelta(days=2)
+        stop = start + timedelta(hours=1)
+        resp = self.t.client.post('/recordings/new-json', data={
+            'name': 'the replacement',
+            'url': 'http://example.test/live/9',
+            'start_time': start.strftime('%Y-%m-%dT%H:%M'),
+            'stop_time': stop.strftime('%Y-%m-%dT%H:%M'),
+            'replace_recording_id': str(rid),
+        })
+        self.assertEqual(resp.status_code, 200, resp.get_data(as_text=True))
+
+        db.session.expire_all()
+        self.assertIsNone(db.session.get(Recording, rid))
+        self.assertEqual(Alert.query.filter_by(recording_id=rid).count(), 0)
+        self.assertIsNotNone(db.session.get(Alert, open_id).dismissed_at)
+
+    def test_a_pre_check_test_stops_pointing_at_the_deleted_recording(self):
+        """channel_tests.pre_check_recording_id is not cascaded either, and a group page
+        scopes health checks by recording id - so a reused id would pull an old
+        recording's tests onto a new one."""
+        rid, _open_id, _old_id = self._recording_with_alerts()
+        test_row = seed.make_channel_test(self.ch, pre_check_recording_id=rid)
+        db.session.commit()
+        test_id = test_row.id
+
+        resp = self.t.client.post(f'/recordings/{rid}/delete')
+        self.assertEqual(resp.status_code, 302, resp.get_data(as_text=True))
+
+        db.session.expire_all()
+        self.assertIsNotNone(db.session.get(ChannelTest, test_id),
+                             'the measurement itself must survive; only the link goes')
+        self.assertIsNone(db.session.get(ChannelTest, test_id).pre_check_recording_id)
 
 
 if __name__ == '__main__':

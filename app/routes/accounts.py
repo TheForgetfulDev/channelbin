@@ -10,7 +10,8 @@ from .. import db
 from ..accounts import (NORM_DISABLED, NORM_MODES, coerce_normalization_mode,
                         norm_mode_example, norm_mode_label, normalize_url_with_mode,
                         resolve_normalization_mode, url_is_normalizable,
-                        recompute_duplicate_stream_urls_and_commit, finalize_sync_state)
+                        recompute_duplicate_stream_urls_and_commit, finalize_sync_state,
+                        sync_signature)
 from ..channel_groups import guide_scope_channel_ids, report_orphaned_guide_groups
 from ..channel_search import OTHER_NEW, OTHER_REMOVED
 from ..config import load_config
@@ -179,6 +180,10 @@ def accounts_list():
     Everything the old fat card needed and this one does not (recording totals, the preset
     color swatches, the debug flag) is gone rather than passed and ignored: an unused
     template variable is a query the page pays for on every load."""
+    # Read BEFORE the rows. A sync that commits in between then shows up as a mismatch at the
+    # next poll and costs one extra refresh; read after, the page would claim a signature
+    # its rows do not reflect and never refresh for that change at all.
+    sync_sig = sync_signature()
     accounts = Account.query.order_by(Account.created_at).all()
     account_ids = [a.id for a in accounts]
     logs_by_account = _recent_logs_by_account(account_ids, limit=5)
@@ -194,6 +199,7 @@ def accounts_list():
         guide_counts=guide_counts,
         total_channels=total_channels,
         total_hidden_channels=total_hidden_channels,
+        sync_sig=sync_sig,
     )
 
 
@@ -269,6 +275,13 @@ def _account_detail_payload(account, cfg):
     logs = [_sync_log_json(log) for log in rows]
     total_syncs = _sync_log_totals(account_ids).get(account.id, 0)
     last_good = next((log for log in rows if log.status == 'SUCCESS'), None)
+    # Queried rather than picked out of `rows`: the last ten runs can all be failures, and
+    # a failed or cancelled run records no skip counts for the Content card to show.
+    last_finished = (AccountSyncLog.query
+                     .filter(AccountSyncLog.account_id == account.id,
+                             AccountSyncLog.status.in_(('SUCCESS', 'PARTIAL')))
+                     .order_by(AccountSyncLog.started_at.desc())
+                     .first())
     finished = stats['completed'] + stats['failed'] + stats['aborted']
     return {
         'guide_count': _guide_counts(account_ids).get(account.id, 0),
@@ -280,15 +293,23 @@ def _account_detail_payload(account, cfg):
         'total_syncs': total_syncs,
         'has_more_syncs': total_syncs > len(logs),
         'last_good_sync': last_good,
+        'last_finished_sync': last_finished,
         'settings': _effective_settings(account, cfg),
+        # Which URL form the constructed stream URLs were built in. On the banner because a
+        # constructed URL that does not play is nearly always the wrong form, so the form is
+        # the first thing to check - it used to be named in the SYNC_STREAM_URLS_CONSTRUCTED
+        # alert body, and moved here when that was retired (dev/changelog/928).
+        'constructed_mode_label': norm_mode_label(resolve_normalization_mode(account, cfg)),
         # An account's own URL is secret in FULL - for a path-token provider the path IS
         # the credential, and no heuristic can tell (DESIGN-secrets.md §4.2, DESIGN.md §17.4).
         'endpoint': mask_url_path(account.base_url if (account.account_type or 'm3u') == 'xtream'
                                   else account.m3u_url),
         'epg_endpoint': mask_url_path(account.epg_url),
-        # Same deep-link shape as the SYNC_CHANNELS_NEW/SYNC_CHANNELS_MISSING alert links
-        # (routes/alerts.py::_channel_lifecycle_alert_link, dev/changelog/479) - the account
-        # id here is fixed to this page's own account, so no Alert.source to parse.
+        # The filtered channel-browser links the new/missing counts point at. These were also
+        # the deep-link targets of the SYNC_CHANNELS_NEW/SYNC_CHANNELS_MISSING alerts until
+        # dev/changelog/928 retired them - this page is now the only route to them, which is
+        # why the links matter more, not less. The account id is fixed to this page's own
+        # account, so there is no Alert.source to parse.
         'new_channels_url': url_for('channels.channel_browser',
                                      **{'f.other': OTHER_NEW, 'f.acct': account.id}),
         'removed_channels_url': url_for('channels.channel_browser',

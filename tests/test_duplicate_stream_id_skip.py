@@ -1,4 +1,4 @@
-"""Duplicate stream_id entries within one sync are counted, logged and alerted rather than
+"""Duplicate stream_id entries within one sync are counted, logged and recorded rather than
 silently dropped (dev/docs/BUGS.md 2026-08-30 "Duplicate stream_id entries in one playlist
 are dropped with no trace").
 
@@ -13,8 +13,10 @@ Covers:
   - UpsertDuplicateCountTests: _upsert_channels counts and samples duplicates directly, the
     first-seen entry (not the last) wins, and a clean sync reports zero.
   - DuplicateAlertWiringTests: end-to-end through _do_sync (mocked requests.get, M3U path) -
-    two playlist URLs that collide on the same numeric tail raise DUPLICATE_STREAM_IDS_SKIPPED
-    naming the count, and a collision-free playlist raises nothing.
+    two playlist URLs that collide on the same numeric tail record the count on that sync's
+    own AccountSyncLog row, and a collision-free playlist records zero. The count reached the
+    user as a DUPLICATE_STREAM_IDS_SKIPPED alert until dev/changelog/926 gave it a column and
+    dev/changelog/928 retired the alert.
 
 No network, no real ffmpeg - see CLAUDE.md §Testing.
 Run standalone:
@@ -30,7 +32,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app import db  # noqa: E402
 from app.accounts import _do_sync, _upsert_channels  # noqa: E402
-from app.database import Alert, Channel, M3uAccount  # noqa: E402
+from app.database import AccountSyncLog, Alert, Channel, M3uAccount  # noqa: E402
 from tests.support import make_test_app  # noqa: E402
 
 M3U_URL = 'http://provider.test/playlist.m3u8?user=realuser&pass=realpass'
@@ -119,7 +121,12 @@ class DuplicateAlertWiringTests(unittest.TestCase):
             _do_sync(self.account.id, threading.Event())
         db.session.expire_all()
 
-    def test_colliding_urls_raise_the_duplicate_alert(self):
+    def _last_sync_log(self):
+        return (AccountSyncLog.query
+                .filter_by(account_id=self.account.id)
+                .order_by(AccountSyncLog.id.desc()).first())
+
+    def test_colliding_urls_record_the_count_on_the_sync(self):
         # Different extensions, same numeric tail - both parse to stream_id 123
         # (app/accounts.py::_parse_m3u_as_streams's sid_match), the real collision shape
         # named in the bug, not a synthetic one.
@@ -132,14 +139,16 @@ class DuplicateAlertWiringTests(unittest.TestCase):
         )
         self._sync(playlist)
 
-        alert = Alert.query.filter_by(alert_type='DUPLICATE_STREAM_IDS_SKIPPED').first()
-        self.assertIsNotNone(alert, 'the sync must raise DUPLICATE_STREAM_IDS_SKIPPED')
-        self.assertIn('1 duplicate stream ID', alert.title)
+        self.assertEqual(self._last_sync_log().skipped_duplicate_stream_ids, 1,
+                         'the count belongs to the sync that skipped them')
         self.assertEqual(
             Channel.query.filter_by(account_id=self.account.id).count(), 1,
             'the colliding entry must be dropped, not both kept as separate channels')
+        self.assertIsNone(
+            Alert.query.filter_by(alert_type='DUPLICATE_STREAM_IDS_SKIPPED').first(),
+            'the count is shown on the account, never raised as an alert')
 
-    def test_no_collision_raises_no_alert(self):
+    def test_no_collision_records_zero(self):
         playlist = (
             '#EXTM3U\n'
             '#EXTINF:-1 tvg-id="a.test",Channel A\n'
@@ -149,9 +158,8 @@ class DuplicateAlertWiringTests(unittest.TestCase):
         )
         self._sync(playlist)
 
-        self.assertIsNone(
-            Alert.query.filter_by(alert_type='DUPLICATE_STREAM_IDS_SKIPPED').first(),
-            'a collision-free sync must not raise the duplicate alert')
+        self.assertEqual(self._last_sync_log().skipped_duplicate_stream_ids, 0,
+                         'zero is a measured answer, distinct from "not tracked"')
 
 
 if __name__ == '__main__':

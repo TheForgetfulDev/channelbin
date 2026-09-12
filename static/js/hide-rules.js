@@ -11,11 +11,11 @@
      app/channel_hiding.py already computes as one indexed column, not something a
      136,940-channel table's worth of GLOB matching should be re-run for in a browser.
    - A materialize refusal (the save succeeded but the rule pass was refused, e.g. by
-     database contention) is NOT a page-local banner here, unlike the mockup's demo one:
-     the real API path (routes/channel_hide_rules.py::_materialize_and_report) already
-     raises a CHANNEL_HIDE_RULES_NOT_APPLIED alert with the full explanation and a retry
-     timer (scheduler.py::defer_hide_materialize), so the loud, durable surface Principle 1
-     asks for already exists. This file just points at it.
+     database contention) is surfaced by the page itself: hide_rules_page() hands the
+     pending retry down as `pending_materialize` and the template paints a banner naming
+     the blocker and when it will retry (scheduler.py::pending_hide_materialize). The
+     toasts below point at that banner rather than restating the refusal, because the
+     reload every mutation already does is what paints it (dev/changelog/928).
 
    The summary tiles (#hr-summary-body) are server-rendered from real Channel.hidden /
    hidden_deferred aggregates - they are not recomputed here, and a reload is what keeps
@@ -46,11 +46,11 @@ function reloadAfter(message, type) {
 }
 
 // A save/edit/delete succeeded; `data` is the API response ({success, rule, materialized,
-// refusal?}). materialized:false means the rule is saved but not yet applied - the alert
-// already explains why and that it will retry, so this only has to point at it.
+// refusal?}). materialized:false means the rule is saved but not yet applied - the banner
+// the reload paints names the blocker and when it retries, so this only has to point at it.
 function afterSave(data, successMessage) {
   if (data.materialized === false) {
-    reloadAfter('Saved, but not applied yet - see the new alert for why. It will retry automatically.', 'warning');
+    reloadAfter('Saved, but not applied to your channels yet - see the banner for why. It will retry automatically.', 'warning');
   } else {
     reloadAfter(successMessage, 'success');
   }
@@ -683,7 +683,7 @@ function savePickerSelections(close) {
     const anyRefused = results.some(r => r.status === 'fulfilled' && r.value.materialized === false);
     if (!ok) { showToast('Could not save any of those categories.', { type: 'error' }); return; }
     const msg = `${ok} categor${ok === 1 ? 'y' : 'ies'} hidden.` + (failed ? ` ${failed} could not be saved.` : '');
-    if (anyRefused) reloadAfter(`${msg} Some rules were not applied yet - see the new alert for why.`, 'warning');
+    if (anyRefused) reloadAfter(`${msg} Some rules were not applied to your channels yet - see the banner for why.`, 'warning');
     else reloadAfter(msg, failed ? 'warning' : 'success');
   });
   return true;

@@ -189,7 +189,7 @@ def create_app(config_overrides=None, start_scheduler=True):
         fresh = is_fresh_db()  # must be checked before create_all builds the schema
         tags_table_is_new = not _table_exists('tags')
         db.create_all()
-        run_migrations(fresh_db=fresh)
+        run_migrations(fresh_db=fresh, cfg=cfg)
         # Unconditional, and it has to be: the FTS5 search indexes are raw virtual tables
         # with no ORM model, so create_all() can't build them, and run_migrations() skips
         # every step on a fresh DB. Without this a brand-new database - and the test
@@ -202,8 +202,6 @@ def create_app(config_overrides=None, start_scheduler=True):
         # so anything found BUILDING is provably stranded (dev/changelog/425).
         reconcile_interrupted_builds()
         _ensure_system_health_job()
-        # After it, never before: it needs the system group row that call guarantees.
-        _announce_guide_check_retarget()
         if tags_table_is_new:
             _seed_default_tags()
         _ensure_dvr_dir(cfg)
@@ -376,6 +374,13 @@ def _setup_logging(cfg):
         def emit(self, record):
             if getattr(_in_alert, 'active', False):
                 return
+            # A call site that already raised its own typed alert for this condition marks
+            # its record with extra={'already_alerted': True}, and one failure must not
+            # produce two alert rows. The record still logs at ERROR - the level describes
+            # the log, the marker describes the alert - and what still reaches LOG_ERROR
+            # here is an unexpected error no site knew to alert on (dev/changelog/930).
+            if getattr(record, 'already_alerted', False):
+                return
             _in_alert.active = True
             try:
                 from .alerts import create_alert
@@ -546,67 +551,6 @@ def _ensure_system_health_job():
                     log.info('Removed legacy channel_testing schedule keys from config.yaml: %s '
                              '(schedule now lives on the TV Guide Channels health check)',
                              ', '.join(removed))
-
-
-_GUIDE_CHECK_RETARGET_PREF = 'guide_check_retarget_announced'
-
-
-def _announce_guide_check_retarget():
-    """Say once, out loud, that the automatic TV Guide check now tests something different.
-
-    It used to probe every `Channel.in_guide` channel; it now probes one channel per guide
-    row plus one per group with no schedule of its own (channel_groups.system_check_targets,
-    dev/changelog/752). What a scheduled check tests is the user's business, so the change
-    is announced rather than silently widened or narrowed - the same reason the check exists
-    at all.
-
-    Once, gated on a UserPref this writes for that purpose. It is a fact recorded rather
-    than inferred: nothing here reads a side effect of the retarget and concludes the notice
-    already went out. The stamp is written after the alert deliberately, so the only reachable
-    crash state is a re-announcement on the next startup - loud, and the safe direction. A
-    later change to what is in the guide is ordinary operation and never re-announces.
-
-    Startup-only commit, deliberately outside retry_on_locked - same exemption as
-    _ensure_system_health_job above."""
-    from .alerts import create_alert
-    from .channel_groups import system_check_targets
-    from .database import (Channel, ChannelGroup, ChannelGroupEvent, UserPref,
-                           GROUP_CHECK_TARGETS_CHANGED)
-    log = logging.getLogger(__name__)
-
-    if db.session.get(UserPref, _GUIDE_CHECK_RETARGET_PREF) is not None:
-        return
-    system_group = ChannelGroup.query.filter_by(is_system=True).first()
-    if system_group is None:
-        return   # nothing to announce against; _ensure_system_health_job runs before this
-
-    before = Channel.query.filter_by(in_guide=True).count()
-    # With no group of the user's own the two rules are provably identical - guide rows
-    # are then exactly the in-guide channels and the scheduleless fallback has nothing to
-    # walk - so the resolve is skipped rather than run to reach a foregone answer. That is
-    # the shape of a brand-new install and of every throwaway app the test suite builds.
-    has_groups = (db.session.query(ChannelGroup.id)
-                  .filter(ChannelGroup.is_system.is_(False)).first() is not None)
-    after = len(system_check_targets()) if has_groups else before
-    if before != after:
-        detail = (f'The automatic TV Guide health check now tests {after} '
-                  f'channel{"" if after == 1 else "s"} per run instead of {before}.')
-        body = (detail + ' It probes one channel per guide row - a standalone channel, or '
-                'the member currently serving a group\'s row - plus one member of any group '
-                'that has no schedule of its own. A group\'s other members are only re-tested '
-                'by a schedule on that group.')
-        db.session.add(ChannelGroupEvent(
-            group_id=system_group.id, event_type=GROUP_CHECK_TARGETS_CHANGED, detail=detail,
-            extra_data=json.dumps({'channels_before': before, 'channels_after': after,
-                                   'reason': 'one probe per guide row'})))
-        db.session.commit()
-        create_alert('HEALTH_CHECK_TARGETS_CHANGED',
-                     'Automatic TV Guide health check retargeted', body=body,
-                     source='startup')
-        log.info('TV Guide health check retargeted: %d channels per run, was %d', after, before)
-
-    db.session.add(UserPref(key=_GUIDE_CHECK_RETARGET_PREF, value=str(after)))
-    db.session.commit()
 
 
 def _seed_default_tags():

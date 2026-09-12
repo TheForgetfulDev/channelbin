@@ -95,59 +95,84 @@
     </span>
   </div>
 </div>
-<p class="page-sub">Everything the app decided you should know about, newest first. Dismissing
-  an alert only hides it here - it is never what deletes a recording or a log line.</p>
+<p class="page-sub">Active alerts are problems that are still true right now. Each one clears
+  itself once it is fixed, so it has no Dismiss. Past alerts already happened and stay until you
+  dismiss them. Things only worth knowing, like a group's format moving or a provider adding
+  channels, are shown on that group or account instead. Dismissing an alert only hides it here -
+  it is never what deletes a recording or a log line.</p>
 
-{% if alerts %}
-<div class="card">
+{# `link` is passed in rather than read from `alert_links`: a Jinja macro does not see the
+   template's render context, so reaching for it here would resolve to Undefined and every
+   deep link would silently vanish. `active` drops Dismiss for a problem that is still
+   happening - the dismiss routes refuse it as well, since hiding the menu item is not
+   enforcement (dev/changelog/932). #}
+{% macro alert_row(a, link, active) %}
+<div class="al-row{% if a.read_at is none %} unread{% endif %}" data-sev="{{ a.severity }}"
+     id="alert-{{ a.id }}" data-id="{{ a.id }}">
+  <span class="alert-severity sev-{{ a.severity }}">{{ a.severity }}</span>
+  <div class="al-body">
+    <div class="al-title">{{ a.title }}</div>
+    <div class="al-meta">
+      {{ a.created_at | local_time if a.created_at else '' }}
+      {% if a.source %}&nbsp;&middot;&nbsp;<code>{{ a.source }}</code>{% endif %}
+      {% if a.alert_type %}&nbsp;&middot;&nbsp;{{ a.alert_type }}{% endif %}
+      {% if a.dismissed_at %}&nbsp;&middot;&nbsp;<em>dismissed</em>{% endif %}
+    </div>
+    {% if link %}
+    <a class="al-link" href="{{ link[0] }}">{{ link[1] }} &rarr;</a>
+    {% endif %}
+    {% if a.body and a.body != a.title %}
+    <button class="al-toggle" data-act="detail">Show details</button>
+    <div class="al-detail" hidden>{{ a.body }}</div>
+    {% endif %}
+  </div>
+  <span class="menu-wrap al-actions">
+    <button class="btn btn-sm btn-icon" data-menu aria-label="More actions">&#8943;</button>
+    <div class="menu pop-left">
+      {% if a.read_at is none %}
+      <button class="menu-item" data-act="read">Mark read</button>
+      {% endif %}
+      {% if active %}
+      <button class="menu-item" data-act="ignore">Ignore future alerts like this</button>
+      <span class="pop-title">Clears itself once fixed</span>
+      {% elif a.dismissed_at is none %}
+      <button class="menu-item" data-act="ignore">Ignore future alerts like this</button>
+      <button class="menu-item danger" data-act="dismiss">Dismiss</button>
+      {% else %}
+      <span class="pop-title">Nothing left to do</span>
+      {% endif %}
+    </div>
+  </span>
+</div>
+{% endmacro %}
+
+{% if active_alerts %}
+<div class="card" id="al-card-active">
   <div class="card-head">
-    <h2>{{ 'All alerts' if include_dismissed else 'Active alerts' }}
-      <span class="cnt">{{ alerts | length }}</span></h2>
+    <h2>Active alerts <span class="cnt">{{ active_alerts | length }}</span></h2>
   </div>
   <div class="card-body">
-    <div id="alerts-list">
-      {% for a in alerts %}
-      <div class="al-row{% if a.read_at is none %} unread{% endif %}" data-sev="{{ a.severity }}"
-           id="alert-{{ a.id }}" data-id="{{ a.id }}">
-        <span class="alert-severity sev-{{ a.severity }}">{{ a.severity }}</span>
-        <div class="al-body">
-          <div class="al-title">{{ a.title }}</div>
-          <div class="al-meta">
-            {{ a.created_at | local_time if a.created_at else '' }}
-            {% if a.source %}&nbsp;&middot;&nbsp;<code>{{ a.source }}</code>{% endif %}
-            {% if a.alert_type %}&nbsp;&middot;&nbsp;{{ a.alert_type }}{% endif %}
-            {% if a.dismissed_at %}&nbsp;&middot;&nbsp;<em>dismissed</em>{% endif %}
-          </div>
-          {% set link = alert_links.get(a.id) %}
-          {% if link %}
-          <a class="al-link" href="{{ link[0] }}">{{ link[1] }} &rarr;</a>
-          {% endif %}
-          {% if a.body and a.body != a.title %}
-          <button class="al-toggle" data-act="detail">Show details</button>
-          <div class="al-detail" hidden>{{ a.body }}</div>
-          {% endif %}
-        </div>
-        <span class="menu-wrap al-actions">
-          <button class="btn btn-sm btn-icon" data-menu aria-label="More actions">&#8943;</button>
-          <div class="menu pop-left">
-            {% if a.read_at is none %}
-            <button class="menu-item" data-act="read">Mark read</button>
-            {% endif %}
-            {% if a.dismissed_at is none %}
-            <button class="menu-item" data-act="ignore">Ignore future alerts like this</button>
-            <button class="menu-item danger" data-act="dismiss">Dismiss</button>
-            {% endif %}
-            {% if a.read_at is not none and a.dismissed_at is not none %}
-            <span class="pop-title">Nothing left to do</span>
-            {% endif %}
-          </div>
-        </span>
-      </div>
-      {% endfor %}
+    <div id="alerts-active">
+      {% for a in active_alerts %}{{ alert_row(a, alert_links.get(a.id), True) }}{% endfor %}
     </div>
   </div>
 </div>
-{% else %}
+{% endif %}
+
+{% if past_alerts %}
+<div class="card" id="al-card-past">
+  <div class="card-head">
+    <h2>Past alerts <span class="cnt">{{ past_alerts | length }}</span></h2>
+  </div>
+  <div class="card-body">
+    <div id="alerts-past">
+      {% for a in past_alerts %}{{ alert_row(a, alert_links.get(a.id), False) }}{% endfor %}
+    </div>
+  </div>
+</div>
+{% endif %}
+
+{% if not active_alerts and not past_alerts %}
 <div class="empty-state">
   <p>No alerts{% if include_dismissed %}, dismissed ones included{% endif %}.</p>
   {% if not include_dismissed %}

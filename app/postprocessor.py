@@ -1212,6 +1212,12 @@ def do_postprocess(app, recording_id: int, ts_path: str):
                     db.session.commit()
 
                 _commit_conversion_done()
+                # The conversion that had given up is over, so its alert is describing a
+                # state that no longer exists. Keyed on the recording rather than the
+                # (type, source) pair because CONVERSION_FAILED is raised under two
+                # different sources - 'postprocessor' here and 'scheduler' from startup
+                # recovery - and only the id names them both (dev/changelog/930).
+                alerts.dismiss_open_alerts_for_recording(recording_id, 'CONVERSION_FAILED')
                 log.info('Recording %d conversion complete: %s', recording_id, output_path)
 
                 if audio_copy_fallback:
@@ -1300,7 +1306,7 @@ def do_postprocess(app, recording_id: int, ts_path: str):
                         recording_id=recording_id,
                     )
                     log.error('Recording "%s" (#%d) conversion failed: %s', rec_name, recording_id, give_up_msg,
-                              extra={'recording_id': recording_id})
+                              extra={'recording_id': recording_id, 'already_alerted': True})
                 else:
                     # Cancelled while this attempt was giving up: the row stays ABORTED, so
                     # neither the FAILED alert nor the FAILED SSE frame is honest here.
@@ -1326,7 +1332,7 @@ def do_postprocess(app, recording_id: int, ts_path: str):
                     shutil.move(current_path, dest_path)
             except Exception as exc:
                 log.error('Recording "%s" (#%d) move failed: %s', rec_name, recording_id, exc,
-                          extra={'recording_id': recording_id})
+                          extra={'recording_id': recording_id, 'already_alerted': True})
                 # Plain local, not `exc` itself - Python deletes `exc` when the except
                 # block exits, so a closure must not capture it directly.
                 move_error = str(exc)
@@ -1341,6 +1347,17 @@ def do_postprocess(app, recording_id: int, ts_path: str):
                     db.session.commit()
 
                 _commit_move_failed()
+                alerts.create_alert(
+                    'RECORDING_MOVE_FAILED',
+                    f'Move failed: {rec_name}',
+                    body=(f'The recording finished and was converted, but could not be moved '
+                          f'to its destination: {move_error}. The file is still at '
+                          f'{current_path}, so nothing was lost. Nothing retries a move on '
+                          f'its own, so this clears when the recording is post-processed '
+                          f'again or deleted.'),
+                    source='postprocessor',
+                    recording_id=recording_id,
+                )
             else:
                 # Name the rename when one happened - a file that quietly landed under a
                 # different name than the recording is called is exactly the kind of thing
@@ -1365,6 +1382,10 @@ def do_postprocess(app, recording_id: int, ts_path: str):
                     db.session.commit()
 
                 _commit_moved()
+                # The file is where it belongs now, so an earlier move failure for this
+                # recording is over. This is the only path that can clear it - there is no
+                # move retry, so it takes a fresh post-process run to get here.
+                alerts.dismiss_open_alerts_for_recording(recording_id, 'RECORDING_MOVE_FAILED')
                 log.info('Recording %d: %s', recording_id, move_detail)
                 current_path = dest_path
 

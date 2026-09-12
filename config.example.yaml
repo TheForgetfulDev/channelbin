@@ -387,14 +387,12 @@ notifications:
       url: ''
   routing:
     # Which alert kinds reach which surface. push_services lists names from services above;
-    # an empty list means in-app only.
+    # an empty list means in-app only. Types in alerts.RETIRED_ALERT_TYPES are not listed
+    # and are not routable - nothing raises them.
     LOG_ERROR:
       in_app: true
       push_services: []
     LOG_CRIT:
-      in_app: true
-      push_services: []
-    JOB_SKIPPED:
       in_app: true
       push_services: []
     HEALTH_CHECK_WINDOW:

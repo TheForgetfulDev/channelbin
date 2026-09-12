@@ -326,7 +326,7 @@ def start_recording(app, recording_id: int):
                 if rec.stop_time <= now:
                     log.error('Recording "%s" (#%d): stop time already passed while waiting '
                               'for a live mp4 conversion to finish - giving up', rec.name, recording_id,
-                              extra={'recording_id': recording_id})
+                              extra={'recording_id': recording_id, 'already_alerted': True})
 
                     @retry_on_locked()
                     def _fail_conversion_collision_and_commit():
@@ -470,17 +470,6 @@ def start_recording(app, recording_id: int):
 
                 _select_group_member_and_commit()
 
-                if override_detail:
-                    # Outside the retried closure: create_alert commits separately, so a
-                    # commit retry above must not be able to fire it twice.
-                    from .alerts import create_alert
-                    create_alert(
-                        'RECORDING_FORMAT_OVERRIDE',
-                        f'Recording "{rec.name}" started off the group format',
-                        body=override_detail,
-                        source=f'rec_{recording_id}',
-                        recording_id=recording_id)
-
         # Case 2: if a recording on this same channel - or the same channel group
         # (two group recordings may have resolved to different members) - is already
         # running, this is a planned handoff, not a conflict - gracefully stop it.
@@ -570,6 +559,7 @@ def start_recording(app, recording_id: int):
         _mark_in_progress_and_commit()
         from .health_score import dismiss_recording_failing_alerts
         dismiss_recording_failing_alerts(recording_id)
+        end_slot_wait(recording_id)
 
         state = RecordingState()
         with _lock:
@@ -650,7 +640,8 @@ def _refuse_open_segment_still_growing(recording_id: int, open_seg, action: str)
     log.error(
         'Recording %d: segment %d is still growing on disk - refusing to %s (another '
         'process is almost certainly already recording it). No state was changed.',
-        recording_id, open_seg.segment_number, action)
+        recording_id, open_seg.segment_number, action,
+        extra={'recording_id': recording_id, 'already_alerted': True})
     from .alerts import create_alert
     create_alert(
         'RECORDING_RESUME_REFUSED',
@@ -816,6 +807,8 @@ def resume_recording(app, recording_id: int):
                 db.session.commit()
 
             _mark_retry_resumed_and_commit()
+
+        end_slot_wait(recording_id)
 
         # Next segment number comes from this recording's OWN segment rows. Deriving it
         # from a directory listing of `{safe_name}_seg_*` instead - as this did until
@@ -1673,6 +1666,26 @@ def _note_slot_wait_once(recording_id: int, account_id: int, why: str, waiting_o
     )
 
 
+def end_slot_wait(recording_id: int):
+    """Clear the standing slot-wait alert once this recording is no longer waiting.
+
+    The other half of _note_slot_wait_once above. RECORDING_WAITING_FOR_CONNECTION_SLOT
+    describes a condition that is still true while the row stands, so the Alerts page
+    lists it under "Active alerts" and offers no Dismiss (dev/changelog/933) - a promise
+    that only holds if EVERY way out of the wait clears it, not just the one where the
+    recording starts.
+
+    Keyed on the recording id rather than the (type, source) pair: the source names the
+    account, and a second recording still queued on that same account has to keep its own
+    row. A no-op when nothing stands, so it is safe on the paths that never waited at all
+    - which is most of them, and is why it sits beside dismiss_recording_failing_alerts at
+    each site rather than behind a "did this one wait" test of its own.
+    """
+    from .alerts import dismiss_open_alerts_for_recording
+    dismiss_open_alerts_for_recording(
+        recording_id, 'RECORDING_WAITING_FOR_CONNECTION_SLOT')
+
+
 def _defer_start_for_slot(app, recording_id: int, account_id: int, waiting_on=None):
     """Hold a SCHEDULED recording that cannot have a connection slot yet, or fail it loudly.
 
@@ -1693,7 +1706,7 @@ def _defer_start_for_slot(app, recording_id: int, account_id: int, waiting_on=No
     if rec.stop_time <= now:
         log.error('Recording "%s" (#%d): %s, and this recording\'s own stop time passed '
                   'while it waited - giving up', rec.name, recording_id, why,
-                  extra={'recording_id': recording_id})
+                  extra={'recording_id': recording_id, 'already_alerted': True})
 
         @retry_on_locked()
         def _fail_slot_wait_and_commit():
@@ -1710,6 +1723,10 @@ def _defer_start_for_slot(app, recording_id: int, account_id: int, waiting_on=No
         _fail_slot_wait_and_commit()
         from .health_score import dismiss_recording_failing_alerts
         dismiss_recording_failing_alerts(recording_id)
+        # The wait is over, badly: RECORDING_FAILED_CONNECTION_LIMIT below is what the
+        # user is owed now, and leaving "waiting for a slot" standing beside it would
+        # claim a recording is still queued when it has already given up.
+        end_slot_wait(recording_id)
         from .alerts import create_alert
         create_alert(
             'RECORDING_FAILED_CONNECTION_LIMIT',
@@ -1749,6 +1766,10 @@ def _defer_resume_for_slot(app, recording_id: int, account_id: int) -> None:
                   'not resuming; whatever was already captured is finalized by its stop job',
                   rec.name, recording_id, why, extra={'recording_id': recording_id})
         _note_slot_wait_once(recording_id, account_id, why)
+        # Noted, then cleared: the deferral event is the durable record of why the resume
+        # never happened, and it stays on the recording. The alert says the recording is
+        # waiting, which stopped being true the moment its window closed.
+        end_slot_wait(recording_id)
         return
 
     _note_slot_wait_once(recording_id, account_id, why)
@@ -1824,6 +1845,7 @@ def abort_recording(app, recording_id: int):
             unschedule_recording(recording_id)
             from .health_score import dismiss_recording_failing_alerts
             dismiss_recording_failing_alerts(recording_id)
+            end_slot_wait(recording_id)
 
         ev.publish(recording_id, 'RECORDING_ABORTED', {'status': REC_STATUS_ABORTED})
 

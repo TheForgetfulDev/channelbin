@@ -5,6 +5,54 @@ Notable changes to ChannelBin, newest first. This project follows
 release is tagged `v<version>` in git, and the version the app is running is shown in the
 page footer.
 
+## 0.7.0 - 2026-09-12
+
+**Added**
+
+- The Alerts page splits into two cards. Active alerts holds the ones the app takes down by
+  itself once the condition clears, and offers no Dismiss anywhere, so a problem that is still
+  true cannot be waved away and forgotten. Past alerts holds everything else.
+- The alert counter in the menu shows errors and warnings as separate counts rather than one
+  total, and informational notes are no longer counted at all. The banner shows the most severe
+  unread alert instead of the newest, with one-click Mark read, and its details view moves
+  "Ignore future alerts like this" one level down.
+- The account page shows how many entries each sync skipped: stream URLs with no scheme, and
+  stream ids repeated within one feed. The counts appear on the last finished sync, on each
+  line of the sync history, and in the accounts list tooltip.
+- The accounts list refreshes itself while a sync is running, instead of showing SYNCING and
+  stale counts until the page is reloaded by hand.
+- The Hide Rules page says when a rule pass was refused because other work was running, and a
+  skipped account sync is recorded in that account's own sync history.
+
+**Changed**
+
+- Twelve kinds of alerts are no longer raised. Each reported a fact that is not a problem, and
+  each is now shown on the group, recording, account or page it concerns. Existing alerts of
+  those kinds are cleared on upgrade.
+- A group format warning appears only when the format was pinned by hand and a member with
+  Recording on measures something else. Previously every group whose members spanned formats
+  wore a red badge and a banner, counted members that were not recording, and claimed that
+  mixed formats break failover, which they do not.
+- A group's automatic format is settled once at the end of a health check run, over complete
+  data, rather than re-decided after every single channel test over a half-updated picture.
+
+**Fixed**
+
+- Deleting a recording left its alerts attached to the row number, which was then reissued to
+  the next recording created, so those alerts silently re-attached to an unrelated recording
+  and deep-linked to it. A recording's number is now retired when it is deleted, and the
+  alerts are unlinked on the way out.
+- Failed syncs, file moves, concatenations and conversions reached the Alerts page only as
+  untyped application errors that nothing could ever clear, and doubled up with the typed alert
+  for the same event. Each now has its own kind and clears when the failure recovers.
+- The alerts for a recording waiting on a connection slot and for a channel group in the TV
+  Guide with no recording member stayed up after the condition had cleared. Both now take
+  themselves down, and the guide-row alert links to the group it names.
+- The database snapshot taken before a schema migration was an empty file rather than a copy of
+  the database being migrated.
+- Tooltips printed a literal character code in the middle of a sentence instead of breaking the
+  line.
+
 ## 0.6.0 - 2026-09-11
 
 **Added**

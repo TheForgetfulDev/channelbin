@@ -21,7 +21,7 @@ from ..database import (
 from ..accounts import (TEMPLATE_VARIABLES, _TAG_TOKEN_RE, render_filename_template,
                         tag_template_variables)
 from ..recorder import _safe_name
-from ..alerts import ALERT_TYPES
+from ..alerts import ALERT_TYPES, RETIRED_ALERT_TYPES
 from ..notifications import (SERVICE_LABELS, SERVICE_URL_HINTS, dismiss_placeholder_url_alert,
                              dismiss_send_failure_alert)
 from ..tz_utils import get_display_tz, format_local, to_local, to_naive_utc, parse_hhmm
@@ -1048,9 +1048,13 @@ def notifications_settings():
             'rate_limit_seconds': scfg.get('rate_limit_seconds'),
         }
 
-    # Merge routing with ALERT_TYPES so every known type appears
+    # Merge routing with ALERT_TYPES so every known type appears - except the retired ones,
+    # which nothing raises, so a row for them would be a switch that cannot do anything
+    # (dev/changelog/928). Their existing rows still render everywhere alerts are shown.
     full_routing = {}
     for key, meta in ALERT_TYPES.items():
+        if key in RETIRED_ALERT_TYPES:
+            continue
         r = routing.get(key, {})
         full_routing[key] = {
             'label': meta['label'],

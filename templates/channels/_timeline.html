@@ -14,6 +14,10 @@
                           against right now; optional, undefined on any caller that
                           hasn't computed it.
    The .ch-timeline-* / .ch-breakdown* / .tl-dot* classes live in static/css/style.css. #}
+{# CHANNEL_GROUP_FORMAT_MISMATCH/_RESOLVED are neutral: a format change is a log line, not a
+   warning (dev/changelog/925). Under an automatic strategy moving between formats is the
+   point, and the event does not record which strategy was in force, so it cannot be
+   colored by one. #}
 {% set ch_dot = {
   'test:COMPLETED': 'done', 'test:FAILED': 'failed', 'test:CANCELLED': 'neutral',
   'test:IN_PROGRESS': 'start',
@@ -25,7 +29,7 @@
   'CHANNEL_FAILOVER_HEALTH_OBSERVATION': 'failed',
   'CHANNEL_STALL_DEMOTION_HEALTH_OBSERVATION': 'aborted',
   'CHANNEL_GROUPED': 'start', 'CHANNEL_UNGROUPED': 'stopped',
-  'CHANNEL_GROUP_FORMAT_MISMATCH': 'failed', 'CHANNEL_GROUP_FORMAT_RESOLVED': 'done',
+  'CHANNEL_GROUP_FORMAT_MISMATCH': 'neutral', 'CHANNEL_GROUP_FORMAT_RESOLVED': 'neutral',
   'CHANNEL_URL_CHANGED': 'neutral', 'CHANNEL_HIDE_OVERRIDE_CHANGED': 'neutral',
   'CHANNEL_HEALTH_ROLLBACK': 'neutral',
   'GROUP_MEMBER_SELECTED': 'start', 'GROUP_FAILOVER': 'aborted',

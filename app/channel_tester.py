@@ -285,7 +285,9 @@ def _run_channel_loop(app, channels, wait_sec, job_id=None):
         _append_log('INFO', f'[{i + 1}/{n}] Testing: {ch.name}')
         _append_log('INFO', f'URL: {mask_creds(ch.stream_url)}')
 
-        run_channel_test(app, ch.id, job_id=job_id)
+        # defer_group_format: a run settles its groups' formats once at the end, over a
+        # complete test map - see _settle_group_formats (dev/changelog/934).
+        run_channel_test(app, ch.id, job_id=job_id, defer_group_format=True)
 
         with _lock:
             _state.completed_channels = i + 1
@@ -493,22 +495,23 @@ def imminent_recording_conflict() -> Optional[str]:
             'starting a health check run now may compete for the connection limit.')
 
 
-def _alert_skipped_for_busy_tester(app, job_id: int, running_kind: str,
+def _record_skipped_for_busy_tester(app, job_id: int, running_kind: str,
                                     running_job_id: Optional[int],
                                     running_pre_check_recording_id: Optional[int]):
-    """Raise the JOB_SKIPPED alert for a scheduled fire dropped because the tester was
-    already busy with something else. Called with _lock released - do all DB/alert work
-    here, never under _lock (get_status()/other lock users would deadlock on it).
+    """Record a scheduled fire dropped because the tester was already busy with something
+    else, on the run log and last-skip reason every other skip path here already writes to
+    (dev/changelog/928). Called with _lock released - do the DB work below outside _lock,
+    never under it (get_status()/other lock users would deadlock); the state write and log
+    append take _lock themselves, briefly, once that work is done.
 
     running_kind enumerates every RunState.run_kind value explicitly (CLAUDE.md "states
-    are enumerated") so the alert always names the real thing holding the slot, not just
+    are enumerated") so the reason always names the real thing holding the slot, not just
     "another health check" - a scheduled job can just as easily collide with a
     pre-recording check or a manual one-off test as with another job.
     """
     with app.app_context():
         from . import db
         from .database import OnDemandTestJob, Recording
-        from .alerts import create_alert
 
         skipped_job = db.session.get(OnDemandTestJob, job_id)
         skipped_name = skipped_job.name if skipped_job is not None else f'job {job_id}'
@@ -526,12 +529,12 @@ def _alert_skipped_for_busy_tester(app, job_id: int, running_kind: str,
         else:
             running_desc = 'Another health check'
 
-        create_alert(
-            'JOB_SKIPPED',
-            title=f'Skipped health check: {skipped_name}',
-            body=f'{running_desc} is already running - this run was skipped automatically.',
-            source=f'od_job_{job_id}',
-        )
+    # The run log only. `_state.last_skip_reason` and `current_job_id` describe the run that
+    # is currently going, and this skip belongs to a different job - writing them here would
+    # give one field two meanings and overwrite the live run's own state, which is why the
+    # log line names the skipped job explicitly instead.
+    _append_log('WARN', f'Run skipped for "{skipped_name}" - '
+                        f'{running_desc} is already running')
 
 
 def _revert_job_status_after_busy_skip(app, job_id: int):
@@ -604,8 +607,8 @@ def run_on_demand_test_job(app, job_id: int, channel_id_subset: Optional[List[in
 
     if busy:
         log.info('Channel test run already in progress - skipping on-demand job %d', job_id)
-        _alert_skipped_for_busy_tester(app, job_id, running_kind, running_job_id,
-                                        running_pre_check_recording_id)
+        _record_skipped_for_busy_tester(app, job_id, running_kind, running_job_id,
+                                         running_pre_check_recording_id)
         # Never for the job that IS the busy run: a recurring job's own trigger firing again
         # mid-run lands here with running_job_id == job_id, and reverting then would take the
         # live run's row out of RUNNING while it is still testing channels.
@@ -652,15 +655,6 @@ def run_on_demand_test_job(app, job_id: int, channel_id_subset: Optional[List[in
                 with _lock:
                     _state.last_skip_reason = msg
                 _append_log('WARN', f'Run skipped - {msg}')
-                from .alerts import create_alert
-                create_alert(
-                    'JOB_SKIPPED',
-                    title=f'Skipped health check: {job.name}',
-                    body=f'Recording "{active_rec.name}" (#{active_rec.id}) is in progress - '
-                         f'this run was skipped automatically.',
-                    source=f'od_job_{job_id}',
-                    recording_id=active_rec.id,
-                )
                 skipped = True
                 return
 
@@ -671,13 +665,6 @@ def run_on_demand_test_job(app, job_id: int, channel_id_subset: Optional[List[in
                     with _lock:
                         _state.last_skip_reason = conflict_reason
                     _append_log('WARN', f'Run skipped - {conflict_reason}')
-                    from .alerts import create_alert
-                    create_alert(
-                        'JOB_SKIPPED',
-                        title=f'Skipped health check: {job.name}',
-                        body=conflict_reason,
-                        source=f'od_job_{job_id}',
-                    )
                     skipped = True
                     return
 
@@ -725,14 +712,18 @@ def run_on_demand_test_job(app, job_id: int, channel_id_subset: Optional[List[in
                 _save_job_final_status(app, job_id, completed)
         except Exception:
             log.exception('run_on_demand_test_job: failed to save final status for job %d', job_id)
+        # In the `finally` on purpose: a run stopped, cancelled or aborted part-way still
+        # settles its groups from whatever it did measure, rather than leaving them on the
+        # half-updated state the run created.
         if not skipped and channels:
-            _apply_group_format_strategies(app, [ch.id for ch in channels])
+            _settle_group_formats(app, [ch.id for ch in channels])
         _end_run()
 
 
-def _apply_group_format_strategies(app, tested_channel_ids):
-    """Re-evaluate the standing format strategy of every group this run gathered data for
-    - the trigger half of DECIDED 9 (dev/changelog/753).
+def _settle_group_formats(app, tested_channel_ids):
+    """Settle the format state of every group this run gathered data for, once, when the
+    run is over - the trigger half of DECIDED 9 (dev/changelog/753), plus the reconcile
+    pass that used to run after every single test (dev/changelog/934).
 
     **Keyed on the channels actually tested, not on the job's own group.** The automatic
     "TV Guide Channels" job probes one member of each guide row and one member of each
@@ -740,15 +731,28 @@ def _apply_group_format_strategies(app, tested_channel_ids):
     has no strategy of its own - reading that instead would starve exactly the groups the
     fallback exists to serve.
 
-    Runs after the run rather than after each test: mid-run the data is half-fresh, and a
-    lock that moved three times in one night explains nothing. Best-effort per group - a
-    failure on one must not abort the others or the run's teardown."""
+    **Once per run, over a complete test map.** Mid-run half a group's members carry this
+    run's numbers and the rest carry the previous run's, so the ranking that picks the
+    format - the strategy's bucket, or the derived reference under highest_score - keeps
+    changing and settles only by accident. Measured on the live database: Fox Sports 1's
+    reference moved to 1080p60 and back to 720p60 inside 18 minutes on 2026-09-11, and
+    CW's lock moved 1080p60 to 720p30 and back within 15 minutes on 09-04, each move
+    changing which member a recording would start on. A format that follows the data is
+    the point; one that changes several times while the data is still arriving is not.
+
+    Both halves per group, because apply_format_strategy() reconciles only when it
+    actually moved or cleared the lock: a strategy that manages no lock (highest_score,
+    unmanaged) would otherwise never reconcile at all now that the per-test pass is gone.
+
+    Best-effort per group - a failure on one must not abort the others or the run's
+    teardown."""
     if not tested_channel_ids:
         return
     with app.app_context():
         from .config import load_config
         from .database import ChannelGroupMember
-        from .channel_groups import apply_format_strategy, DEFAULT_FAILING_STREAK_THRESHOLD
+        from .channel_groups import (apply_format_strategy, evaluate_and_reconcile_group,
+                                     DEFAULT_FAILING_STREAK_THRESHOLD)
         try:
             # Hoisted once for the whole loop (CLAUDE.md no-hidden-I/O-in-per-row-loops).
             streak_threshold = load_config().get('channel_testing', {}).get(
@@ -761,9 +765,14 @@ def _apply_group_format_strategies(app, tested_channel_ids):
             return
         for group in groups:
             try:
-                apply_format_strategy(group, streak_threshold)
+                plan = apply_format_strategy(group, streak_threshold)
+                # apply_format_strategy() reconciles for itself when it moved or cleared
+                # the lock; every other case still needs the pass that logs which members
+                # now differ from the group's format.
+                if not (plan or {}).get('moved'):
+                    evaluate_and_reconcile_group(group, streak_threshold)
             except Exception:
-                log.exception('format strategy re-evaluation failed for group %s',
+                log.exception('format settle failed for group %s',
                               getattr(group, 'id', '?'))
 
 
@@ -789,12 +798,12 @@ def _save_job_final_status(app, job_id: int, completed: bool):
                 db.session.commit()
                 return None
             # 'finished' - a genuinely-finished one-off run; a recurring job or a kept
-            # schedule returns above and stays silent. Returned rather than alerted here
-            # so a commit retry can't double-fire the alert (create_alert does its own
-            # separate commit).
+            # schedule returns above and stays silent. A finished run announces nothing:
+            # the job row it just committed carries the outcome and the time it finished,
+            # and the run log carries what was tested (dev/changelog/928).
             cancel_on_demand_job_schedule(job)
             db.session.commit()
-            return ('finished', (job.id, job.name, job.status))
+            return ('finished', None)
 
         result = _save_final_status_and_commit()
 
@@ -816,24 +825,6 @@ def _save_job_final_status(app, job_id: int, completed: bool):
                 ).start()
             return
 
-        finished_job_id, job_name, final_status = payload
-        with _lock:
-            tested = _state.completed_channels
-            total = _state.total_channels
-        from .alerts import create_alert
-        if final_status == 'COMPLETED':
-            title = f'Health check finished: {job_name}'
-            body = f'Tested {tested} of {total} channel(s).'
-        else:
-            title = f'Health check stopped: {job_name}'
-            body = f'Stopped after testing {tested} of {total} channel(s).'
-        create_alert(
-            'HEALTH_CHECK_COMPLETE',
-            title=title,
-            body=body,
-            source=f'od_job_{finished_job_id}',
-        )
-
 
 # Covers probe/screenshot/finalize time after the connect loop in the pre-check margin
 # guard's worst-case formula (DESIGN-prerecord-checks.md §3) - a module constant since it's
@@ -842,9 +833,15 @@ _PRE_CHECK_OVERHEAD_SECONDS = 60
 
 
 def _pre_check_skip(app, recording_id: int, rec_name: Optional[str], reason: str):
-    """Log PRE_CHECK_SKIPPED on the recording + a JOB_SKIPPED alert naming why - every skip
-    path in run_pre_check funnels through here so a silently-skipped pre-check is never
-    indistinguishable from a passed one (DESIGN-prerecord-checks.md §4)."""
+    """Log PRE_CHECK_SKIPPED on the recording naming why - every skip path in run_pre_check
+    funnels through here so a silently-skipped pre-check is never indistinguishable from a
+    passed one (DESIGN-prerecord-checks.md §4).
+
+    The event on the recording is the whole surface: a skipped pre-check is a fact about
+    that recording, and its detail page is where somebody asking "was this checked first"
+    already looks (dev/changelog/928). `rec_name` is kept for the log line below, which is
+    the only place a recording is identified by name rather than by row.
+    """
     from . import db
     from .database import add_recording_event, PRE_CHECK_SKIPPED
     from .db_utils import retry_on_locked
@@ -856,15 +853,8 @@ def _pre_check_skip(app, recording_id: int, rec_name: Optional[str], reason: str
             db.session.commit()
         _commit()
 
-        from .alerts import create_alert
-        create_alert(
-            'JOB_SKIPPED',
-            title=f'Skipped pre-check: {rec_name or recording_id}',
-            body=reason,
-            source=f'precheck_{recording_id}',
-            recording_id=recording_id,
-        )
-    log.info('run_pre_check: recording %d skipped - %s', recording_id, reason)
+    log.info('run_pre_check: recording %s (%d) skipped - %s',
+             rec_name or '?', recording_id, reason)
 
 
 def run_pre_check(app, recording_id: int):
@@ -1125,7 +1115,8 @@ def run_single_channel_test(app, channel_id: int) -> Optional[int]:
         _end_run()
 
 
-def run_channel_test(app, channel_id: int, job_id: Optional[int] = None) -> Optional[int]:
+def run_channel_test(app, channel_id: int, job_id: Optional[int] = None,
+                     defer_group_format: bool = False) -> Optional[int]:
     """Run a quality test for a single channel, respecting the channel's account
     connection limit (shared with recordings - see app/connection_limits.py).
 
@@ -1141,6 +1132,12 @@ def run_channel_test(app, channel_id: int, job_id: Optional[int] = None) -> Opti
     not found, or the account was at its connection limit) - run_pre_check needs
     to distinguish "ran" from "skipped at the slot"; _run_channel_loop ignores
     the return value entirely.
+
+    `defer_group_format` leaves this test's groups to the caller's own end-of-run settle
+    pass rather than reconciling them here - see _settle_group_formats. A separate
+    parameter rather than a read of `job_id`, because "which health check produced this
+    test" and "will somebody else settle the groups afterward" are two questions and one
+    flag cannot mean both.
     """
     from . import connection_limits as connlim
     with app.app_context():
@@ -1166,7 +1163,8 @@ def run_channel_test(app, channel_id: int, job_id: Optional[int] = None) -> Opti
         _state.active_test_account_id = account_id
 
     try:
-        return _run_channel_test_inner(app, channel_id, job_id=job_id)
+        return _run_channel_test_inner(app, channel_id, job_id=job_id,
+                                       defer_group_format=defer_group_format)
     finally:
         with app.app_context():
             connlim.release(account_id, 'test', channel_id)
@@ -1175,8 +1173,11 @@ def run_channel_test(app, channel_id: int, job_id: Optional[int] = None) -> Opti
             _state.active_test_account_id = None
 
 
-def _run_channel_test_inner(app, channel_id: int, job_id: Optional[int] = None):
-    """Run a quality test for a single channel and persist results to ChannelTest."""
+def _run_channel_test_inner(app, channel_id: int, job_id: Optional[int] = None,
+                            defer_group_format: bool = False):
+    """Run a quality test for a single channel and persist results to ChannelTest.
+
+    `defer_group_format`: see run_channel_test."""
     with app.app_context():
         from . import db
         from .config import load_config, resolve_ffmpeg_path
@@ -1694,7 +1695,11 @@ def _run_channel_test_inner(app, channel_id: int, job_id: Optional[int] = None):
         apply_test_health_observation(app, test_id)
         assess_scheduled_recording_impact(app, test_id)
 
-        _recheck_group_format(app, channel_id)
+        # A test inside a health check run leaves this to that run's own settle pass, which
+        # runs once at the end over a complete test map (_settle_group_formats). A one-off
+        # test or a pre-check IS the whole run, so it reconciles here and now.
+        if not defer_group_format:
+            _recheck_group_format(app, channel_id)
 
         if screenshots_enabled:
             _cleanup_old_screenshots(app, channel_id, job_id, screenshot_dir, keep_screenshots)

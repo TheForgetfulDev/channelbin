@@ -2715,7 +2715,11 @@ class SearchContext:
                 .group_by(AccountSyncLog.account_id).all())
             earliest_by_account = dict(
                 db.session.query(AccountSyncLog.account_id, func.min(AccountSyncLog.started_at))
-                .filter(AccountSyncLog.account_id.in_(account_ids))
+                # Same exclusion as accounts.py::lifecycle_states_for_channels - a SKIPPED
+                # occurrence never ran, so it is not an account's first sync.
+                .filter(AccountSyncLog.account_id.in_(account_ids),
+                        db.or_(AccountSyncLog.status.is_(None),
+                               AccountSyncLog.status != 'SKIPPED'))
                 .group_by(AccountSyncLog.account_id).all())
             new_cutoff = now - timedelta(days=new_days)
             eligible = set()

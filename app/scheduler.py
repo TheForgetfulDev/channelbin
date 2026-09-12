@@ -130,7 +130,7 @@ def init_scheduler(app):
         log.error(
             'init_scheduler: refusing to start - pid %d already holds %s. This process will '
             'keep serving requests but will not start a scheduler or run startup recovery.',
-            other_pid, pidfile_path)
+            other_pid, pidfile_path, extra={'already_alerted': True})
         with app.app_context():
             from .alerts import create_alert
             create_alert(
@@ -497,11 +497,14 @@ def resume_in_progress_recordings(app):
                     # Another live process owns this recording. Concatenating a file it is
                     # still writing would truncate the output and race its own finalize,
                     # so leave the row alone - the process that owns it will finish it.
-                    # WARNING, not ERROR: the helper above already logged this at ERROR and
-                    # raised its own alert, and app/__init__.py turns every ERROR record
-                    # into a second LOG_ERROR alert for the same condition.
-                    log.warning('Recording %d: not concatenating - segment %d is still being '
-                                'written by another process', rec.id, closed.segment_number)
+                    # ERROR, marked already_alerted: the helper above raised the typed
+                    # RECORDING_RESUME_REFUSED alert for this same condition, so the marker
+                    # is what stops the second LOG_ERROR row. This used to be logged at
+                    # WARNING to dodge that, which downgraded the log line to fix an alert
+                    # problem - the level describes the log (dev/changelog/930).
+                    log.error('Recording %d: not concatenating - segment %d is still being '
+                              'written by another process', rec.id, closed.segment_number,
+                              extra={'recording_id': rec.id, 'already_alerted': True})
                     continue
                 _report_capture_lost_to_outage(rec, closed.stopped_at)
                 threading.Thread(target=do_concatenation, args=(app, rec.id), daemon=True).start()
@@ -1115,7 +1118,8 @@ def _account_sync_job(account_id: int):
         if sync_cfg.get('skip_sync_if_recording_active', True):
             active = Recording.query.filter_by(status=REC_STATUS_IN_PROGRESS).first()
             if active:
-                _log_job_skipped(f'account_sync_{account_id}', f'Sync: {account.name}', active)
+                _log_job_skipped(f'account_sync_{account_id}', f'Sync: {account.name}', active,
+                                 account_id=account_id)
                 return
 
         within_minutes = sync_cfg.get('skip_sync_if_recording_within_minutes', 5)
@@ -1127,7 +1131,7 @@ def _account_sync_job(account_id: int):
             ).order_by(Recording.start_time).first()
             if upcoming:
                 _log_job_skipped_upcoming(f'account_sync_{account_id}', f'Sync: {account.name}',
-                                           upcoming, within_minutes)
+                                           upcoming, within_minutes, account_id=account_id)
                 return
 
         # Sync yields to an active test run (DESIGN-concurrency.md 5.2, gap G3) and to
@@ -1174,6 +1178,7 @@ def _defer_sync_for_contention(account_id: int, account_name: str, sync_cfg: dic
             job_id, f'Sync: {account_name}',
             f'{reason[0].upper()}{reason[1:]} - this sync was skipped automatically. '
             'It will run again at its next regular time.',
+            account_id=account_id,
         )
         log.info('Skipping sync for account %d - %s (no retry configured)', account_id, reason)
         return
@@ -1197,6 +1202,7 @@ def _defer_sync_for_contention(account_id: int, account_name: str, sync_cfg: dic
         job_id, f'Sync: {account_name}',
         f'{reason[0].upper()}{reason[1:]} - this sync was deferred automatically '
         f'and will retry in {retry_minutes} minutes.',
+        account_id=account_id,
     )
     log.info('Deferred sync for account %d - %s; retry at %s', account_id, reason, run_date)
 
@@ -1223,20 +1229,21 @@ def _defer_job_for_contention(job_id: str, job_label: str, func, reason: str,
         id=f'{job_id}_retry',
         replace_existing=True,
     )
-    with _app.app_context():
-        _emit_job_skipped(
-            job_id, job_label,
-            f'{reason[0].upper()}{reason[1:]} - this job was deferred automatically '
-            f'and will retry in {retry_minutes} minutes.',
-        )
+    # No object of its own to record this on, and none is needed: the retry queued just
+    # above is what /jobs renders, named after this job and dated (dev/changelog/928).
     log.info('Deferred %s - %s; retry at %s', job_id, reason, run_date)
 
 
 HIDE_MATERIALIZE_RETRY_JOB_ID = 'channel_hide_materialize_retry'
 
 
-def _hide_materialize_retry_job():
-    """Re-apply the channel hide rules after a pass was refused for database contention."""
+def _hide_materialize_retry_job(reason: str = None):
+    """Re-apply the channel hide rules after a pass was refused for database contention.
+
+    `reason` is never read here - it rides in the job's own kwargs so the Hide Rules page
+    can name what blocked the pass for as long as the retry is pending, which is what
+    pending_hide_materialize() reads back.
+    """
     from . import channel_hiding
     with _app.app_context():
         result = channel_hiding.materialize('deferred rule pass')
@@ -1250,31 +1257,47 @@ def defer_hide_materialize(reason: str, retry_minutes: int = 15) -> None:
     The rules themselves are already committed, so nothing is lost - what is stale is
     `Channel.hidden`, the answer every browse surface reads. A person who just saved a rule
     and sees nothing change is owed the reason, which is why this alerts rather than logging
-    quietly, and owed the work actually happening, which is why it retries rather than
-    waiting for the next sync to pick it up by accident.
+    quietly - the Hide Rules page reads that reason back off the queued retry - and owed the
+    work actually happening, which is why it retries rather than waiting for the next sync to
+    pick it up by accident.
 
     Same one-shot DateTrigger as the sync and maintenance deferrals, for the same APScheduler
     3.x reason, and `replace_existing` collapses a burst of rule edits into one pending
     retry. The retry re-enters `materialize()`, so admission is asked again fresh.
     """
-    from .alerts import create_alert
     run_date = datetime.utcnow() + timedelta(minutes=retry_minutes)
     if _scheduler is None:
-        # A scheduler-less app (a test app, an early-startup path) still gets the alert: the
-        # staleness is real whether or not anything is able to retry it.
+        # A scheduler-less app (a test app, an early-startup path) has nowhere to queue the
+        # retry, so there is no pending job for the page to read and the log line is the only
+        # record. Production always has a scheduler - this is the degenerate case, not the one
+        # the surface is built for.
         log.warning('Hide rules not applied - %s; no scheduler to queue a retry on', reason)
     else:
         _add_job(func=_hide_materialize_retry_job, trigger='date', run_date=run_date,
-                 id=HIDE_MATERIALIZE_RETRY_JOB_ID, replace_existing=True)
-    create_alert(
-        'CHANNEL_HIDE_RULES_NOT_APPLIED',
-        title='Channel hide rules not applied yet',
-        body=(f'{reason[0].upper()}{reason[1:]}, so the hide rules were saved but have not '
-              f'been applied to your channels yet. This will retry automatically in '
-              f'{retry_minutes} minutes.'),
-        source=HIDE_MATERIALIZE_RETRY_JOB_ID,
-    )
+                 id=HIDE_MATERIALIZE_RETRY_JOB_ID, replace_existing=True,
+                 kwargs={'reason': reason})
     log.info('Deferred hide-rule materialize - %s; retry at %s', reason, run_date)
+
+
+def pending_hide_materialize() -> dict | None:
+    """{'reason', 'retry_at'} while a refused hide-rule pass waits to retry, else None.
+
+    Derived from the jobstore, never stored: the queued retry's existence IS the fact that
+    the rules are saved but not yet applied, and it disappears once the retry succeeds - so
+    no second copy of the state can go stale, and no teardown path has to remember to clear
+    it. The reason rides in the job's kwargs because admission's prose is what names the
+    blocker and nothing else records it (dev/changelog/928).
+    """
+    if _scheduler is None:
+        return None
+    try:
+        job = _scheduler.get_job(HIDE_MATERIALIZE_RETRY_JOB_ID)
+    except JobLookupError:
+        return None
+    if job is None or job.next_run_time is None:
+        return None
+    return {'reason': (job.kwargs or {}).get('reason') or '',
+            'retry_at': to_naive_utc(job.next_run_time)}
 
 
 _DAY_MAP = {1: 'sun', 2: 'mon', 3: 'tue', 4: 'wed', 5: 'thu', 6: 'fri', 7: 'sat'}
@@ -1455,7 +1478,8 @@ def _recording_retention_sweep():
         from . import db
         from .config import load_config
         from .database import (
-            Recording, record_job_run, JOB_RUN_SUCCESS, JOB_RUN_FAILED,
+            Recording, record_job_run, detach_recording_references,
+            JOB_RUN_SUCCESS, JOB_RUN_FAILED,
             REC_STATUS_COMPLETED, REC_STATUS_FAILED, REC_STATUS_ABORTED,
         )
         from .recorder import recording_disk_paths, delete_files
@@ -1493,9 +1517,10 @@ def _recording_retention_sweep():
                 @retry_on_locked()
                 def _delete_row(rid=rid):
                     r = db.session.get(Recording, rid)
+                    detach_recording_references(rid)
                     if r is not None:
                         db.session.delete(r)
-                        db.session.commit()
+                    db.session.commit()
 
                 _delete_row()
                 if delete_file:
@@ -1748,8 +1773,15 @@ def skip_next_run(job_id: str):
     return new_next
 
 
-def _emit_job_skipped(job_id: str, job_label: str, body: str, recording_id: int = None):
-    """Record an in-app alert explaining an automatic job skip.
+def _emit_job_skipped(job_id: str, job_label: str, body: str, recording_id: int = None,
+                      account_id: int = None):
+    """Record that a scheduled job was skipped, on the thing it concerns.
+
+    An account sync (`account_id` given) writes a SKIPPED row to that account's own sync
+    history, which the account page renders - so a sync that yielded says so where somebody
+    looking at that account will see it. A maintenance job has no such object, and is
+    surfaced instead by the retry this caller queues, which /jobs names and dates
+    (dev/changelog/928). Either way the skip is logged by the caller.
 
     Does NOT touch next_run_time: by the time a job's own callback runs,
     APScheduler has already advanced next_run_time to the next occurrence
@@ -1758,29 +1790,27 @@ def _emit_job_skipped(job_id: str, job_label: str, body: str, recording_id: int 
     the current occurrence. Calling skip_next_run() here would advance an
     already-advanced time and skip an extra occurrence.
     """
-    from .alerts import create_alert
-    create_alert(
-        'JOB_SKIPPED',
-        title=f'Skipped scheduled job: {job_label}',
-        body=body,
-        source=job_id,
-        recording_id=recording_id,
-    )
+    if account_id is None:
+        return
+    from .accounts import record_skipped_sync
+    record_skipped_sync(account_id, body)
 
 
-def _log_job_skipped(job_id: str, job_label: str, active_recording):
+def _log_job_skipped(job_id: str, job_label: str, active_recording, account_id: int = None):
     """The recording-in-progress skip reason. Thin wrapper over _emit_job_skipped."""
     _emit_job_skipped(
         job_id, job_label,
         f'Recording "{active_recording.name}" (#{active_recording.id}) is in progress - '
         f'this run was skipped automatically. It will run again at its next regular time.',
         recording_id=active_recording.id,
+        account_id=account_id,
     )
     log.info('Auto-skipped %s - recording %d (%s) in progress',
              job_id, active_recording.id, active_recording.name)
 
 
-def _log_job_skipped_upcoming(job_id: str, job_label: str, upcoming_recording, within_minutes: int):
+def _log_job_skipped_upcoming(job_id: str, job_label: str, upcoming_recording, within_minutes: int,
+                              account_id: int = None):
     """The recording-starts-soon skip reason. Thin wrapper over _emit_job_skipped."""
     _emit_job_skipped(
         job_id, job_label,
@@ -1788,6 +1818,7 @@ def _log_job_skipped_upcoming(job_id: str, job_label: str, upcoming_recording, w
         f'{within_minutes} minutes - this run was skipped automatically. It will run again '
         f'at its next regular time.',
         recording_id=upcoming_recording.id,
+        account_id=account_id,
     )
     log.info('Auto-skipped %s - recording %d (%s) starts within %d min',
              job_id, upcoming_recording.id, upcoming_recording.name, within_minutes)

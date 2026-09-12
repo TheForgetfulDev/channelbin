@@ -199,8 +199,9 @@ class CrossGroupStateTests(unittest.TestCase):
         )
 
     def test_two_groups_sharing_a_member_do_not_flap(self):
-        # One health check on the shared channel reconciles every group it belongs to,
-        # back to back - app/channel_tester.py::_recheck_group_formats.
+        # One test on the shared channel reconciles every group it belongs to, back to
+        # back - app/channel_tester.py::_recheck_group_format for a one-off test, and
+        # _settle_group_formats once at the end of a health check run (dev/changelog/934).
         for _ in range(3):
             self._reconcile(self.a)
             self._reconcile(self.b)
@@ -210,24 +211,21 @@ class CrossGroupStateTests(unittest.TestCase):
         self.assertEqual(self._counts(self.b), (0, 0),
                          'group B, where the member conforms, logs nothing at all')
 
-    def test_the_shared_members_alert_is_not_dismissed_by_the_other_group(self):
-        self._reconcile(self.a)
-        self._reconcile(self.b)
-        open_alerts = Alert.query.filter(
-            Alert.alert_type == 'GROUP_FORMAT_MISMATCH',
-            Alert.source == f'group:{self.a.id}:ch:{self.shared.id}',
-            Alert.dismissed_at.is_(None)).count()
-        self.assertEqual(open_alerts, 1,
-                         "group A's standing mismatch alert survives group B's pass")
+    def test_reconciling_raises_no_alerts_at_all(self):
+        """The user-visible half: 214 undismissed duplicates had accumulated in the wild,
+        and on the live database all 124 unread warnings were this one type. Since
+        dev/changelog/928 a member differing from its group's format is shown on the group -
+        the banner, the member's pill and the events above - and raises nothing.
 
-    def test_alert_volume_does_not_grow_with_repeated_passes(self):
-        """The user-visible half: 214 undismissed duplicates had accumulated in the wild."""
+        (The per-group event assertions in the sibling test are what now carry "group B's
+        pass does not clear group A's state", which the standing alert used to also prove.)
+        """
         for _ in range(5):
             self._reconcile(self.a)
             self._reconcile(self.b)
         self.assertEqual(
-            Alert.query.filter_by(alert_type='GROUP_FORMAT_MISMATCH').count(), 1,
-            'one standing alert for one standing mismatch, however many passes run')
+            Alert.query.filter_by(alert_type='GROUP_FORMAT_MISMATCH').count(), 0,
+            'a format mismatch is shown on the group, never raised as an alert')
 
 
 class FormatWarningGateTests(unittest.TestCase):
@@ -274,12 +272,22 @@ class FormatWarningGateTests(unittest.TestCase):
         self.assertEqual(
             Alert.query.filter_by(alert_type='GROUP_FORMAT_MISMATCH').count(), 0)
 
-    def test_switching_a_group_off_recording_clears_its_standing_alerts(self):
+    def test_switching_a_group_off_recording_clears_a_straggler_alert(self):
         """Teardown releases what the create path acquired: the warning stopped applying,
-        so it clears rather than stranding an alert nothing can ever dismiss."""
-        self.group.format_strategy = GROUP_FORMAT_HIGHEST_SCORE
+        so it clears rather than stranding an alert nothing can ever dismiss.
+
+        Nothing raises GROUP_FORMAT_MISMATCH any more (dev/changelog/928), so the row is
+        seeded here the way an install upgrading from an older build would still hold one.
+        The dismissing half deliberately stayed behind: without it a pre-928 row would
+        outlive every code path able to clear it.
+        """
+        from datetime import datetime
+        db.session.add(Alert(
+            alert_type='GROUP_FORMAT_MISMATCH', severity='WARN',
+            title='Format mismatch in group "Checks only"',
+            source=f'group:{self.group.id}:ch:{self.outlier.id}',
+            created_at=datetime.utcnow()))
         db.session.commit()
-        self._reconcile()
         self.assertEqual(
             Alert.query.filter(Alert.alert_type == 'GROUP_FORMAT_MISMATCH',
                                Alert.dismissed_at.is_(None)).count(), 1)
@@ -290,7 +298,7 @@ class FormatWarningGateTests(unittest.TestCase):
         self.assertEqual(
             Alert.query.filter(Alert.alert_type == 'GROUP_FORMAT_MISMATCH',
                                Alert.dismissed_at.is_(None)).count(), 0,
-            'the standing mismatch alert is dismissed when the group stops recording')
+            'a straggler mismatch alert is dismissed when the group stops recording')
 
 
 if __name__ == '__main__':

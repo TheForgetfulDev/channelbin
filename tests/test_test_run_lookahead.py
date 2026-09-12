@@ -149,11 +149,16 @@ class RunOnDemandTestJobSkipTests(unittest.TestCase):
         job_id, loop_spy = self._run(force=False)
         loop_spy.assert_not_called()
 
-    def test_conflict_raises_a_job_skipped_alert(self):
+    def test_conflict_is_recorded_on_the_run_log_and_not_alerted(self):
+        """dev/changelog/928: a skipped run is reported where health checks report
+        everything else - the run log and last_skip_reason the status UI renders."""
         with mock.patch('app.alerts.create_alert') as alert_spy:
             self._run(force=False)
-        alert_spy.assert_called_once()
-        self.assertEqual(alert_spy.call_args.args[0], 'JOB_SKIPPED')
+        alert_spy.assert_not_called()
+        logs = [e['msg'] for e in channel_tester.get_status()['logs']]
+        self.assertTrue(any('Run skipped' in m for m in logs), logs)
+        self.assertIn('starts within 10 minutes',
+                      channel_tester.get_status()['last_skip_reason'] or '')
 
     def test_force_bypasses_the_check(self):
         job_id, loop_spy = self._run(force=True)
@@ -181,8 +186,13 @@ class RunOnDemandTestJobSkipTests(unittest.TestCase):
 
 class RunOnDemandTestJobBusyTests(unittest.TestCase):
     """The _state.is_running early return (channel_tester.py:438) - previously silent
-    (dev/docs/BUGS.md 2026-08-07), now raises a JOB_SKIPPED alert naming the check that
-    is already running, for every run_kind that can hold the slot."""
+    (dev/docs/BUGS.md 2026-08-07), now writes a run-log line naming both the job that was
+    skipped and the check already holding the slot, for every run_kind that can hold it.
+
+    It raised a JOB_SKIPPED alert until dev/changelog/928. The log is the right home and
+    always was: this is the health-check subsystem reporting on itself, and unlike
+    last_skip_reason (which belongs to the run actually going) a log line can name a
+    different job without giving one field two meanings."""
 
     def setUp(self):
         self.t = make_test_app()
@@ -199,6 +209,10 @@ class RunOnDemandTestJobBusyTests(unittest.TestCase):
             channel_tester._reset_run_state(job_id=job_id, run_kind=run_kind,
                                              pre_check_recording_id=pre_check_recording_id)
 
+    def _skip_log(self):
+        return [e['msg'] for e in channel_tester.get_status()['logs']
+                if 'Run skipped' in e['msg']]
+
     def test_busy_job_skip_names_both_jobs_and_does_not_run(self):
         running_job = seed.make_test_job(name='Running Job', channels=[self.channel],
                                           status='RUNNING')
@@ -213,13 +227,13 @@ class RunOnDemandTestJobBusyTests(unittest.TestCase):
             channel_tester.run_on_demand_test_job(self.t.app, skipped_job.id)
 
         loop_spy.assert_not_called()
-        alert_spy.assert_called_once()
-        self.assertEqual(alert_spy.call_args.args[0], 'JOB_SKIPPED')
-        kwargs = alert_spy.call_args.kwargs
-        self.assertIn('Skipped Job', kwargs['title'],
-                       'title must name the job that was skipped')
-        self.assertIn('Running Job', kwargs['body'],
-                       'body must name the job that was already running - the actionable half')
+        alert_spy.assert_not_called()
+        lines = self._skip_log()
+        self.assertEqual(len(lines), 1, lines)
+        self.assertIn('Skipped Job', lines[0],
+                      'the line must name the job that was skipped')
+        self.assertIn('Running Job', lines[0],
+                      'and the job already running - the actionable half')
 
     def test_busy_skip_does_not_corrupt_the_live_run_state(self):
         """last_skip_reason and current_job_id belong to the run that is currently going -
@@ -245,12 +259,10 @@ class RunOnDemandTestJobBusyTests(unittest.TestCase):
         db.session.commit()
         self._mark_busy(run_kind='pre_check', pre_check_recording_id=rec.id)
 
-        with mock.patch('app.channel_tester._run_channel_loop'), \
-             mock.patch('app.alerts.create_alert') as alert_spy:
+        with mock.patch('app.channel_tester._run_channel_loop'):
             channel_tester.run_on_demand_test_job(self.t.app, skipped_job.id)
 
-        alert_spy.assert_called_once()
-        self.assertIn('Protected Recording', alert_spy.call_args.kwargs['body'])
+        self.assertIn('Protected Recording', ' '.join(self._skip_log()))
 
     def test_busy_one_off_skip_uses_a_generic_description(self):
         skipped_job = seed.make_test_job(name='Skipped Job', channels=[self.channel],
@@ -258,12 +270,10 @@ class RunOnDemandTestJobBusyTests(unittest.TestCase):
         db.session.commit()
         self._mark_busy(run_kind='one_off')
 
-        with mock.patch('app.channel_tester._run_channel_loop'), \
-             mock.patch('app.alerts.create_alert') as alert_spy:
+        with mock.patch('app.channel_tester._run_channel_loop'):
             channel_tester.run_on_demand_test_job(self.t.app, skipped_job.id)
 
-        alert_spy.assert_called_once()
-        self.assertIn('manual channel test', alert_spy.call_args.kwargs['body'])
+        self.assertIn('manual channel test', ' '.join(self._skip_log()))
 
 
 class ManualRunNowGuardTests(unittest.TestCase):

@@ -43,6 +43,22 @@
    page passes tip=true (the default); a list row carries none (§17.5 item 6). #}
 {% macro status_badge(st) -%}{{ m.account_status_badge(st) }}{%- endmacro %}
 
+{# The entries a sync skipped (dev/changelog/926). On the Content card, NULL is "not tracked" -
+   that sync ran before the count was recorded and left no alert to recover it from - never
+   a false 0. On an Activity line a count is named only when it is non-zero, so zero and
+   untracked both read as the plain line; the Content card is where the two are told apart. #}
+{% macro skip_count_row(label, value, has_sync, tip) -%}
+{%- if not has_sync -%}{{ m.stat_row(label, '-', 'faint', tip=tip) }}
+{%- elif value is none -%}{{ m.stat_row(label, 'Not tracked', 'faint', tip=tip ~ '&#10;Not tracked: the last sync ran before ChannelBin recorded this count. The next sync records it.') }}
+{%- else -%}{{ m.stat_row(label, '{:,}'.format(value), none if value else 'faint', tip=tip) }}
+{%- endif -%}
+{%- endmacro %}
+
+{% macro skipped_clause(log) -%}
+{%- if log.skipped_malformed_urls %}, <span class="tip-plain" data-tip="Malformed URLs skipped.&#10;Entries whose stream URL was not a usable URL, so this sync did not import them as channels.">{{ '{:,}'.format(log.skipped_malformed_urls) }} skipped as malformed URLs</span>{% endif -%}
+{%- if log.skipped_duplicate_stream_ids %}, <span class="tip-plain" data-tip="Duplicate stream IDs skipped.&#10;Entries that repeated a stream ID already seen in this sync, so the second copy was not imported.">{{ '{:,}'.format(log.skipped_duplicate_stream_ids) }} skipped as duplicate stream IDs</span>{% endif -%}
+{%- endmacro %}
+
 {% block content %}
 <div class="page-head">
   <h1>Accounts</h1>
@@ -97,8 +113,10 @@
   <strong>&#9888; {{ '{:,}'.format(account.constructed_stream_url_count) }} stream URLs were built by ChannelBin</strong><br>
   This provider supplied no stream URL for {{ '{:,}'.format(account.constructed_stream_url_count) }}
   of its {{ '{:,}'.format(account.channel_count or 0) }} channels, so they were constructed from the
-  stream origin the provider declares in its auth response. This is often normal and is not a problem
-  while those channels play. If they do not, the declared origin is the first thing to check.
+  stream origin the provider declares in its auth response{% if constructed_mode_label %}, in the
+  <strong>{{ constructed_mode_label }}</strong> URL form{% endif %}. This is often normal and is not a
+  problem while those channels play. If they do not, the declared origin and the URL Normalization
+  mode are the first two things to check.
 </div>
 {% endif %}
 {% if not account.sync_enabled and st != 'UNSYNCED' %}
@@ -262,6 +280,14 @@
                       '{:,}'.format(account.constructed_stream_url_count or 0),
                       'warn' if account.constructed_stream_url_count else 'faint',
                       tip='Constructed stream URLs.&#10;Channels whose stream URL the provider did not supply, so ChannelBin built one from the declared stream origin.') }}
+        {{ skip_count_row('Malformed URLs skipped (last sync)',
+                          last_finished_sync.skipped_malformed_urls if last_finished_sync else none,
+                          last_finished_sync is not none,
+                          'Malformed URLs skipped (last sync).&#10;Entries in the provider feed whose stream URL was not a usable URL, so the last sync did not import them as channels.') }}
+        {{ skip_count_row('Duplicate stream IDs skipped (last sync)',
+                          last_finished_sync.skipped_duplicate_stream_ids if last_finished_sync else none,
+                          last_finished_sync is not none,
+                          'Duplicate stream IDs skipped (last sync).&#10;Entries that repeated a stream ID already seen in the same sync, so the second copy was not imported.') }}
         <div class="srow"><span class="sk">Recordings</span><span class="sv">
           {% if rec_total %}<a class="sv-link" href="{{ url_for('recordings.index') }}">{{ '{:,}'.format(rec_total) }}</a>{% else %}<span class="text-faint">0</span>{% endif %}</span></div>
         {{ m.stat_row('Recorded time',
@@ -324,14 +350,15 @@
       <div class="acct-activity">
         {% for log in log_rows[:6] %}
         <div class="acct-act">
-          <span class="acct-act-dot {{ 'bad' if log.status == 'ERROR' else ('warn' if log.status == 'PARTIAL' else ('faint' if log.status == 'CANCELLED' else ('live' if not log.status else 'ok'))) }}"></span>
+          <span class="acct-act-dot {{ 'bad' if log.status == 'ERROR' else ('warn' if log.status == 'PARTIAL' else ('faint' if log.status in ('CANCELLED', 'SKIPPED') else ('live' if not log.status else 'ok'))) }}"></span>
           <div class="acct-act-body">
             <div class="acct-act-line">
               {% if not log.status %}Sync started.
-              {% elif log.status == 'SUCCESS' %}Sync finished: {{ '{:,}'.format(log.channels_synced or 0) }} channels{% if log.channels_added is not none and log.channels_removed is not none %} ({% if log.channels_added %}<a href="{{ new_channels_url }}">{{ '{:,}'.format(log.channels_added) }} added</a>{% else %}<span class="text-faint">0 added</span>{% endif %}, {% if log.channels_removed %}<a href="{{ removed_channels_url }}">{{ '{:,}'.format(log.channels_removed) }} removed</a>{% else %}<span class="text-faint">0 removed</span>{% endif %}){% endif %}, {{ '{:,}'.format(log.epg_entries_synced or 0) }} program entries{% if log.completed_at and log.started_at %} in {{ (log.completed_at - log.started_at).total_seconds() | duration }}{% endif %}.
-              {% elif log.status == 'PARTIAL' %}Sync finished with gaps: {{ '{:,}'.format(log.channels_synced or 0) }} channels{% if log.channels_added is not none and log.channels_removed is not none %} ({% if log.channels_added %}<a href="{{ new_channels_url }}">{{ '{:,}'.format(log.channels_added) }} added</a>{% else %}<span class="text-faint">0 added</span>{% endif %}, {% if log.channels_removed %}<a href="{{ removed_channels_url }}">{{ '{:,}'.format(log.channels_removed) }} removed</a>{% else %}<span class="text-faint">0 removed</span>{% endif %}){% endif %}, {{ '{:,}'.format(log.epg_entries_synced or 0) }} program entries. {{ log.error_message or 'Part of the import did not complete.' }}
+              {% elif log.status == 'SUCCESS' %}Sync finished: {{ '{:,}'.format(log.channels_synced or 0) }} channels{% if log.channels_added is not none and log.channels_removed is not none %} ({% if log.channels_added %}<a href="{{ new_channels_url }}">{{ '{:,}'.format(log.channels_added) }} added</a>{% else %}<span class="text-faint">0 added</span>{% endif %}, {% if log.channels_removed %}<a href="{{ removed_channels_url }}">{{ '{:,}'.format(log.channels_removed) }} removed</a>{% else %}<span class="text-faint">0 removed</span>{% endif %}){% endif %}{{ skipped_clause(log) }}, {{ '{:,}'.format(log.epg_entries_synced or 0) }} program entries{% if log.completed_at and log.started_at %} in {{ (log.completed_at - log.started_at).total_seconds() | duration }}{% endif %}.
+              {% elif log.status == 'PARTIAL' %}Sync finished with gaps: {{ '{:,}'.format(log.channels_synced or 0) }} channels{% if log.channels_added is not none and log.channels_removed is not none %} ({% if log.channels_added %}<a href="{{ new_channels_url }}">{{ '{:,}'.format(log.channels_added) }} added</a>{% else %}<span class="text-faint">0 added</span>{% endif %}, {% if log.channels_removed %}<a href="{{ removed_channels_url }}">{{ '{:,}'.format(log.channels_removed) }} removed</a>{% else %}<span class="text-faint">0 removed</span>{% endif %}){% endif %}{{ skipped_clause(log) }}, {{ '{:,}'.format(log.epg_entries_synced or 0) }} program entries. {{ log.error_message or 'Part of the import did not complete.' }}
               {% elif log.status == 'ERROR' %}Sync failed. {{ log.error_message or 'No reason was recorded.' }}
               {% elif log.status == 'CANCELLED' %}Sync cancelled before it finished.
+              {% elif log.status == 'SKIPPED' %}Sync skipped - it did not run. {{ log.error_message or 'No reason was recorded.' }}
               {% else %}{{ log.status }}
               {% endif %}
             </div>

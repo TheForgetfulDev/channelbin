@@ -98,12 +98,17 @@ class NotificationsPageConformanceTests(unittest.TestCase):
         boot = self._boot(_cfg({}))
         self.assertEqual(set(boot['services']), set(SERVICE_LABELS))
 
-    def test_routing_covers_every_alert_type(self):
+    def test_routing_covers_every_alert_type_that_can_still_be_raised(self):
         """A type missing from config.yaml is still routable: the payload is
-        ALERT_TYPES merged over what is stored, never just what is stored."""
-        from app.alerts import ALERT_TYPES
+        ALERT_TYPES merged over what is stored, never just what is stored.
+
+        Minus the retired ones (dev/changelog/928): nothing raises those, so a row for them
+        would be a switch that cannot do anything. They keep their ALERT_TYPES label so
+        existing rows still render everywhere alerts are shown - this page is the one place
+        that deliberately does not list them."""
+        from app.alerts import ALERT_TYPES, RETIRED_ALERT_TYPES
         boot = self._boot(_cfg({}, {'CONVERSION_FAILED': {'in_app': False, 'push_services': []}}))
-        self.assertEqual(set(boot['routing']), set(ALERT_TYPES))
+        self.assertEqual(set(boot['routing']), set(ALERT_TYPES) - RETIRED_ALERT_TYPES)
         self.assertFalse(boot['routing']['CONVERSION_FAILED']['in_app'])
 
     def test_routing_drops_push_targets_that_are_not_services(self):

@@ -116,6 +116,22 @@ def get_sync_progress(account_id: int) -> dict | None:
         return _sync_progress.get(account_id)
 
 
+def sync_signature() -> str:
+    """A short string that changes whenever any account's sync starts, finishes, fails or is
+    cancelled. /api/nav-status carries it and /accounts renders the one its rows were read
+    at, so the list page can tell it has gone stale without polling a page of its own
+    (dev/changelog/921).
+
+    Both halves are needed. The syncing set moves when a sync starts or ends; the newest
+    sync-log id moves when one starts, which is the only trace left by a sync that starts
+    and fails inside a single poll interval - the syncing set is the same at both polls."""
+    syncing = (db.session.query(Account.id)
+               .filter(Account.status == 'SYNCING')
+               .order_by(Account.id).all())
+    latest_log_id = db.session.query(func.max(AccountSyncLog.id)).scalar() or 0
+    return f"{','.join(str(account_id) for (account_id,) in syncing)}|{latest_log_id}"
+
+
 def _request_headers(cfg: dict | None = None) -> dict:
     if cfg is None:
         cfg = load_config()
@@ -895,6 +911,37 @@ def stop_sync_and_wait(account_id: int, reason: str, timeout: float) -> bool:
     return not thread.is_alive()
 
 
+def record_skipped_sync(account_id: int, reason: str) -> None:
+    """Record that a scheduled sync for this account did not run, and why.
+
+    A skipped occurrence is part of an account's sync history, so it lands where the rest of
+    that history already lives rather than in a surface of its own: the account page's
+    Activity renders AccountSyncLog rows directly, so writing one here IS the surface
+    (dev/changelog/928). Without it a sync that yields to a recording or to database
+    contention leaves no trace on the account at all.
+
+    `completed_at` is set at insert, so this row can never be mistaken for the open
+    IN_PROGRESS row finalize_sync_state() closes, and the status is outside the
+    SUCCESS/PARTIAL pair every "a sync that actually ran" aggregate filters on - so a skip
+    moves no count, no duration estimate and no first-sync-era decision.
+    """
+    @retry_on_locked()
+    def _add_and_commit():
+        now = datetime.utcnow()
+        db.session.add(AccountSyncLog(
+            account_id=account_id,
+            started_at=now,
+            completed_at=now,
+            status='SKIPPED',
+            channels_synced=0,
+            epg_entries_synced=0,
+            error_message=reason,
+        ))
+        db.session.commit()
+
+    _add_and_commit()
+
+
 def finalize_sync_state(account_id: int, account_status: str, log_status: str,
                          account_message: str, log_message: str,
                          sync_log_id: int | None = None) -> None:
@@ -1257,6 +1304,8 @@ def _do_sync(account_id: int, stop_event: threading.Event, use_dump: bool = Fals
             sync_log.epg_entries_synced = epg_synced
             sync_log.channels_added = len(new_channel_ids)
             sync_log.channels_removed = channels_removed_count
+            sync_log.skipped_malformed_urls = skipped_malformed
+            sync_log.skipped_duplicate_stream_ids = skipped_duplicate
             sync_log.error_message = epg_degradation_reason
             db.session.commit()
 
@@ -1273,35 +1322,9 @@ def _do_sync(account_id: int, stop_event: threading.Event, use_dump: bool = Fals
             fmt_bytes(current_wal_size_bytes()),
         )
 
-        if skipped_malformed:
-            from .alerts import create_alert
-            create_alert(
-                'MALFORMED_CHANNEL_URLS',
-                title=f'{account.name}: skipped {skipped_malformed} malformed channel URL(s)',
-                body=(
-                    f'{skipped_malformed} channel(s) from account "{account.name}" had a stream '
-                    'URL with no "://" (e.g. the literal string "http") and were not imported. '
-                    'This is placeholder/template catalog noise from the source feed, not an '
-                    'error in this app.'
-                ),
-                source='accounts.sync',
-            )
-
-        if skipped_duplicate:
-            from .alerts import create_alert
-            create_alert(
-                'DUPLICATE_STREAM_IDS_SKIPPED',
-                title=f'{account.name}: skipped {skipped_duplicate} duplicate stream ID(s)',
-                body=(
-                    f'{skipped_duplicate} channel(s) from account "{account.name}" shared a '
-                    'stream_id with a channel already seen earlier in this sync and were not '
-                    'imported. Two distinct URLs can collide on the same id (see the server '
-                    'log for the affected stream_id(s)) - if so, one of them is missing from '
-                    'this account.'
-                ),
-                source='accounts.sync',
-            )
-
+        # The two skip counts are not alerted: they are written to this sync's own
+        # AccountSyncLog row and shown on the account page, which is where a fact about what
+        # one sync imported belongs (dev/changelog/926, 928).
         _alert_url_drift(account, drifted, sync_cfg)
         _write_channel_url_drift_events(drifted)
         # The EPG degradation alert types are mutually exclusive per sync (a fetch
@@ -1378,34 +1401,10 @@ def _do_sync(account_id: int, stop_event: threading.Event, use_dump: bool = Fals
             ),
         )
 
-        built_mode = resolve_normalization_mode(account, cfg)
-        _raise_or_resolve_standing_alert(
-            'SYNC_STREAM_URLS_CONSTRUCTED',
-            source=f'account:{account_id}:constructed-urls',
-            active=constructed_urls > 0,
-            title=(f'{account.name}: {constructed_urls} stream URL(s) were built, not provided'
-                   if constructed_urls else ''),
-            body=(
-                'This is often normal provider behavior - some providers intentionally '
-                'withhold their playlist endpoint to prevent their channel list from '
-                'leaking - and not necessarily a problem, as long as channels are working. '
-                f'This provider did not supply stream URLs for {constructed_urls} of its '
-                'channels - its playlist endpoint was unavailable, so only its channel '
-                'catalog could be read. Those URLs were built in the '
-                f'"{norm_mode_label(built_mode)}" form ({norm_mode_example(built_mode)}), '
-                'the URL Normalization mode in effect for this account, on '
-                + ('the stream location this provider declares for itself.'
-                   if stream_origin_used else
-                   "this account's own base URL, because the provider declared no stream "
-                   'location of its own. Note that the base URL is where the channel list '
-                   'is fetched from, which is not always where the streams are served.')
-                + ' None of this is verified against this provider: if it expects a '
-                'different form or location, affected channels will fail to record or test '
-                'even though the sync itself succeeded. If recordings on this account fail '
-                'with connection errors, this is the first thing to check - try a different '
-                'URL Normalization mode.'
-            ),
-        )
+        # Constructed stream URLs are not alerted: the count is on the account row
+        # (`constructed_stream_url_count`), and the account page carries the full
+        # explanation as a standing banner for exactly as long as it is true
+        # (templates/account_detail.html, dev/changelog/928).
 
         # This sync got far enough to import channels, so whatever blocked a previous one
         # is fixed - clear the standing alert. A sync that had to build its own URLs is
@@ -1415,6 +1414,15 @@ def _do_sync(account_id: int, stop_event: threading.Event, use_dump: bool = Fals
         _raise_or_resolve_standing_alert(
             'SYNC_URL_CONSTRUCTION_BLOCKED',
             source=f'account:{account_id}:url-construction-blocked',
+            active=False,
+        )
+
+        # This sync reached the end, so a SYNC_FAILED standing from an earlier attempt is
+        # describing a state that no longer exists. PARTIAL counts as finished here: the
+        # sync itself completed, and its EPG degradation has its own standing alert above.
+        _raise_or_resolve_standing_alert(
+            'SYNC_FAILED',
+            source=f'account:{account_id}:sync-failed',
             active=False,
         )
 
@@ -1432,12 +1440,6 @@ def _do_sync(account_id: int, stop_event: threading.Event, use_dump: bool = Fals
         _mark_sync_cancelled(account_id, sync_log, detail=str(exc) or None)
 
     except Exception as exc:
-        # log.error with a pre-rendered traceback, not log.exception: the handler-level
-        # CredentialMaskingFilter masks a traceback with the generic heuristics only, and
-        # a path-token account URL matches none of them.
-        log.error('Sync failed for account %d: %s\n%s', account_id,
-                  mask_account_urls_in_text(str(exc), *account_urls),
-                  mask_account_urls_in_text(traceback.format_exc(), *account_urls))
         # Captured into a plain local because Python deletes `exc` when the except
         # block exits - a closure reading `exc` directly only works while still
         # inside the block, which is too fragile to rely on.
@@ -1445,7 +1447,17 @@ def _do_sync(account_id: int, stop_event: threading.Event, use_dump: bool = Fals
         # this string is persisted, rendered in the UI, and can be pushed off-box as an alert.
         # The account's own URLs lose their whole path (they may BE the credential); anything
         # else in the message still gets the generic heuristics.
+        # Built here, above the log line, because the SYNC_FAILED alert raised below carries
+        # this same string as its body - masking the one message twice is two chances for the
+        # log and the alert to disagree about what was redacted.
         error_message = mask_account_urls_in_text(str(exc), *account_urls)
+        # log.error with a pre-rendered traceback, not log.exception: the handler-level
+        # CredentialMaskingFilter masks a traceback with the generic heuristics only, and
+        # a path-token account URL matches none of them. Marked already_alerted because
+        # SYNC_FAILED below is this condition's own typed alert (dev/changelog/930).
+        log.error('Sync failed for account %d: %s\n%s', account_id, error_message,
+                  mask_account_urls_in_text(traceback.format_exc(), *account_urls),
+                  extra={'already_alerted': True})
 
         # Rollback is required before touching the session again - a failed flush
         # leaves the transaction in a "needs rollback" state; any subsequent commit
@@ -1465,6 +1477,20 @@ def _do_sync(account_id: int, stop_event: threading.Event, use_dump: bool = Fals
             _mark_error_and_commit()
         except Exception:
             log.exception('Failed to persist error state for account %d', account_id)
+
+        # Raised only AFTER the rollback above, for the reason spelled out on the blocked-
+        # construction alert below: create_alert commits, and until _mark_error_and_commit
+        # has run the session can be in a needs-rollback state. Standing rather than one row
+        # per attempt, and resolved by the next sync that finishes, because a failure that
+        # has since recovered must not go on standing - "Sync failed for account 2" sat open
+        # through eight days of successful syncs (dev/changelog/930).
+        _raise_or_resolve_standing_alert(
+            'SYNC_FAILED',
+            source=f'account:{account_id}:sync-failed',
+            active=True,
+            title=f'{account_name}: sync failed',
+            body=error_message,
+        )
 
         # Raised only AFTER the rollback above: the blocked construction aborts the upsert
         # loop mid-flight, so the session is in a needs-rollback state until then and any
@@ -1790,7 +1816,12 @@ def lifecycle_states_for_channels(channels, cfg, accounts_by_id=None) -> dict:
     )
     earliest_by_account = dict(
         db.session.query(AccountSyncLog.account_id, func.min(AccountSyncLog.started_at))
-        .filter(AccountSyncLog.account_id.in_(account_ids))
+        # A SKIPPED row is an occurrence that never ran, so it is not this account's first
+        # sync however early it sits - counting one would move the first-sync era off a
+        # date nothing was ever imported on (dev/changelog/928).
+        .filter(AccountSyncLog.account_id.in_(account_ids),
+                db.or_(AccountSyncLog.status.is_(None),
+                       AccountSyncLog.status != 'SKIPPED'))
         .group_by(AccountSyncLog.account_id)
         .all()
     )
@@ -2016,64 +2047,11 @@ def _raise_channel_lifecycle_alerts(account: Account, cfg: dict, sync_time: date
         ),
     )
 
-    # Missing digest: fires only for channels newly crossing the missing threshold THIS
-    # sync - comparing age against both this sync's "now" and the previous sync's own
-    # timestamp means a channel already missing last time never re-fires, and an
-    # account's very first sync (no previous timestamp) never fires at all.
-    missing_days = sync_cfg.get('channel_missing_after_days', 7)
-    if missing_days > 0 and previous_last_sync_at is not None:
-        cutoff_now = now - timedelta(days=missing_days)
-        cutoff_before = previous_last_sync_at - timedelta(days=missing_days)
-        newly_missing = [
-            ch for ch in not_seen
-            if ch.last_seen_at is not None
-            and ch.last_seen_at < cutoff_now
-            and ch.last_seen_at >= cutoff_before
-        ]
-        if newly_missing:
-            from .alerts import create_alert
-            sample = ', '.join(ch.name for ch in newly_missing[:5])
-            more = f' and {len(newly_missing) - 5} more' if len(newly_missing) > 5 else ''
-            create_alert(
-                'SYNC_CHANNELS_MISSING',
-                title=f'{account.name}: {len(newly_missing)} channel(s) missing from provider',
-                body=f"{sample}{more} no longer appear in this account's feed.",
-                source=f'account:{account.id}:channels-missing',
-            )
-
-    # New digest: suppressed during the account's own first-sync era (same rule as the
-    # display state) - a brand-new account must not have every channel announced as new.
-    new_days = sync_cfg.get('channel_new_within_days', 3)
-    if new_days > 0 and new_channel_ids:
-        completed_count = AccountSyncLog.query.filter(
-            AccountSyncLog.account_id == account.id,
-            AccountSyncLog.status.in_(['SUCCESS', 'PARTIAL']),
-        ).count()
-        earliest = db.session.query(func.min(AccountSyncLog.started_at)).filter(
-            AccountSyncLog.account_id == account.id).scalar()
-        first_sync_marker = earliest or account.created_at
-        in_first_sync_era = (
-            completed_count < 2
-            or (first_sync_marker is not None
-                and first_sync_marker > now - timedelta(days=new_days))
-        )
-        if not in_first_sync_era:
-            # Only a 5-name sample is ever shown, so query at most 5 ids - the count
-            # itself is len(new_channel_ids), already known without touching the DB. A
-            # mass re-add sync can put tens of thousands of ids in new_channel_ids, which
-            # would otherwise bind one SQL variable per id (dev/docs/BUGS.md 2026-08-15).
-            sample_channels = Channel.query.filter(
-                Channel.id.in_(new_channel_ids[:5])).all()
-            from .alerts import create_alert
-            sample = ', '.join(ch.name for ch in sample_channels)
-            more = (f' and {len(new_channel_ids) - 5} more'
-                    if len(new_channel_ids) > 5 else '')
-            create_alert(
-                'SYNC_CHANNELS_NEW',
-                title=f'{account.name}: {len(new_channel_ids)} new channel(s) from provider',
-                body=f"{sample}{more} newly appeared in this account's feed.",
-                source=f'account:{account.id}:channels-new',
-            )
+    # Neither the newly-missing nor the newly-new set is announced. Both are derived
+    # display state (channel_lifecycle_state), so each channel carries its own new/missing
+    # badge wherever it is listed, the account page links straight to the filtered lists,
+    # and channel search filters on them - which answers "what changed" far better than a
+    # once-a-day digest naming five of them could (dev/changelog/928).
 
 
 #: The channel columns ch_fts actually indexes (app/search_index.py::SEARCH_INDEX_DDL). A
