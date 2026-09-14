@@ -102,16 +102,28 @@ DIAGNOSTICS            = 'DIAGNOSTICS'
 # closing fact: this one says the NEXT phase has begun, and it is what stops the event log
 # reading as though a finished concat had restarted (dev/changelog/867).
 POSTCAPTURE_ANALYSIS_STARTED = 'POSTCAPTURE_ANALYSIS_STARTED'
+# The same phase was reached again - a service restart, a crash resume, a Retry - and skipped
+# because Recording.analysis_completed_at says it already finished. Its own type rather than a
+# differently-worded POSTCAPTURE_ANALYSIS_STARTED: one flag, one meaning, and the timeline has
+# to be able to say "this file was not re-read" rather than implying it was
+# (dev/changelog/951).
+POSTCAPTURE_ANALYSIS_SKIPPED = 'POSTCAPTURE_ANALYSIS_SKIPPED'
 CONVERSION_STARTED     = 'CONVERSION_STARTED'
 # A supervised conversion attempt died or stalled and auto-restart re-spawned ffmpeg from
 # scratch (post_process.auto_restart). Distinct from CONVERSION_STARTED so the event log
 # reads honestly when a conversion loops - one flag, one meaning.
 CONVERSION_RESTARTED   = 'CONVERSION_RESTARTED'
 # A conversion yielded local resources to a recording (recording.post_process.
-# collision_policy) - either paused before it even started, or killed and about to resume,
-# because a recording is IN_PROGRESS or imminent. Distinct from CONVERSION_RESTARTED: this
-# is never a failure and never counts against max_restart_attempts.
+# collision_policy) - either parked before it started, or suspended mid-encode, because a
+# recording is IN_PROGRESS, imminent, or doing its own post-capture work. Distinct from
+# CONVERSION_RESTARTED: this is never a failure and never counts against
+# max_restart_attempts.
 CONVERSION_YIELDED     = 'CONVERSION_YIELDED'
+# The wait a CONVERSION_YIELDED opened is over and the conversion is working again. Its own
+# type rather than a second CONVERSION_YIELDED with different wording: a yield with no
+# resume after it means the app is still waiting, and that has to be readable off the
+# timeline rather than inferred from what follows (dev/changelog/952).
+CONVERSION_RESUMED     = 'CONVERSION_RESUMED'
 CONVERSION_DONE        = 'CONVERSION_DONE'
 FILE_MOVED             = 'FILE_MOVED'
 SCRIPT_EXECUTED        = 'SCRIPT_EXECUTED'
@@ -155,6 +167,13 @@ CHANNEL_HIDE_OVERRIDE_CHANGED = 'CHANNEL_HIDE_OVERRIDE_CHANGED'
 # score moving without an observation behind it is exactly the number a user cannot
 # otherwise explain, so this event carries what was unwound and the before/after value.
 CHANNEL_HEALTH_ROLLBACK = 'CHANNEL_HEALTH_ROLLBACK'
+# The stored score was rewritten from this channel's observation ledger with nothing newly
+# excluded, because the stored number had stopped matching what the ledger replays to
+# (app/health_recompute.py::recompute_in_place). Deliberately NOT CHANNEL_HEALTH_ROLLBACK:
+# that type asserts the user unwound an observation by hand, and nothing was unwound here.
+# The score moving with no observation behind it is the number a user cannot otherwise
+# explain, so this event carries the before/after value and the reason (dev/changelog/951).
+CHANNEL_HEALTH_RECOMPUTED = 'CHANNEL_HEALTH_RECOMPUTED'
 
 # ── Channel group event type constants ────────────────────────────────────────
 #
@@ -359,7 +378,9 @@ class Recording(db.Model):
     # last byte and the stall being declared, plus the restart delay and the reconnect
     # wait that follow it (app/watchdog.py). Rows written before 2026-08-01 carry the old
     # meaning - the sum of restart delays alone - and are not comparable
-    # (dev/changelog/432). Recording.content_shortfall_seconds is the post-capture twin.
+    # (dev/changelog/432). Recording.capture_gap_seconds is the post-capture twin, and is
+    # a strict subset: it sees only the time no segment was running at all, never the
+    # no-growth window inside a segment that had stopped delivering but was not yet killed.
     total_downtime_seconds    = db.Column(db.Float, default=0.0)
     final_file_size           = db.Column(db.Integer)
     # MAX_CONSECUTIVE_FAILURES | DEAD_STREAM_DETECTED - set only when status becomes FAILED
@@ -456,6 +477,21 @@ class Recording(db.Model):
     health_blend_breakdown   = db.Column(db.Text)           # JSON: decay/blend math for this observation
     capture_quality_breakdown = db.Column(db.Text)          # JSON: per-penalty math behind the postprocess damage/near-empty correction (app/health_score.py::apply_capture_quality_correction)
 
+    # The post-capture analysis phase finished for this recording. A RECORDED fact, and the
+    # only thing do_postprocess() reads to decide whether to run that phase again - status is
+    # not that fact and must never be read as one, exactly as concatenator.py::
+    # committed_concat_output() says of the concat one phase earlier. Written in the same
+    # commit as the phase's last and only non-idempotent step, the capture-quality blend, so
+    # no crash can leave the blend applied with the phase still looking unfinished: a resume
+    # that inferred "not analyzed yet" re-probed the whole file and blended a SECOND
+    # observation into the channel's health score every time the service restarted, leaving a
+    # stored score observation_ledger() could not reproduce (dev/changelog/951).
+    #
+    # Never cleared, including by a fresh concat: a second concat is only reachable while the
+    # segments still exist, which means the first one never committed an output, which means
+    # this phase never ran.
+    analysis_completed_at    = db.Column(db.DateTime)
+
     # Supervised-conversion monitor state (app/postprocessor.py). All nullable; see
     # migration _m016. conversion_attempts counts every death (crash/stall/restart-kill)
     # and is reset to 0 by a manual Retry. The progress snapshot lets the detail strip and
@@ -467,6 +503,71 @@ class Recording(db.Model):
     conversion_eta_seconds   = db.Column(db.Integer)        # last smoothed ETA in seconds
     conversion_started_at    = db.Column(db.DateTime)       # wall-clock start of the current attempt
     conversion_updated_at    = db.Column(db.DateTime)       # when the progress snapshot above was written
+
+    # When this recording's post-processing parked itself to let another recording have the
+    # local CPU and disk (recording.post_process.collision_policy), NULL whenever it is
+    # working. One meaning: "doing no work right now, waiting on another recording, and it
+    # will pick itself back up". Both yield sites write it - the one before conversion has
+    # started, where the chain simply polls and no ffmpeg exists, and the one mid-conversion,
+    # where the ffmpeg is SIGSTOPped and continued (dev/changelog/952).
+    #
+    # It is a ROW rather than in-memory state because the restart guard is what needs to read
+    # it: tools/check_busy.py is a separate CLI process with no view into this one, and a
+    # parked recording must not refuse a restart it would cost nothing to allow - a process
+    # that is paused is not, technically, running. Cleared on every exit from the wait, and
+    # by the startup sweep, so a row can never be left claiming to be waiting for something
+    # that is long over.
+    #
+    # It has a second reader for the same reason (dev/changelog/953): the collision check
+    # counts a CONCATENATING or ANALYZING recording as a conflict, and a parked row holds
+    # both of those statuses while consuming nothing. Two parked rows that each counted the
+    # other would wait on each other forever, which is precisely the state recordings 17 and
+    # 19 were in on 2026-09-13.
+    postprocess_waiting_since = db.Column(db.DateTime)
+
+    # WHO the park above is waiting on, snapshotted when it parked: the blocking recording's
+    # name, and what that recording was doing in the words _conflict_phrase() already uses
+    # ('is in progress', 'is joining its segments', ...). The three columns are ONE fact and
+    # move together through set_postprocess_wait() (postprocessor.py) - never assign any of
+    # them directly.
+    #
+    # They exist as columns rather than being read back out of the CONVERSION_YIELDED event
+    # because the recordings list renders them per row, and parsing prose out of the event
+    # log to display a list is the row-scaling defect CLAUDE.md's "promote a stat to a column
+    # when you would display it" rule names. Snapshots rather than a foreign key for the same
+    # reason: the list page would otherwise load the blocking row per parked row, and the
+    # answer wanted is what was true when this recording stepped aside (dev/changelog/954).
+    postprocess_waiting_on_name  = db.Column(db.String(500))
+    postprocess_waiting_on_state = db.Column(db.String(200))
+
+    # A re-encode's checkpoint: how much of the source is already encoded into part files on
+    # disk, so a killed attempt costs one stretch of encoding instead of the whole job
+    # (dev/changelog/955). The four columns are ONE fact and move together through
+    # postprocessor.set_conversion_parts() - never assign any of them directly.
+    #
+    # They are a RECORDED fact, never inferred from the part files themselves: a part on disk
+    # that no commit describes is verified from scratch (re-muxed and probed) before it is
+    # adopted, and a crash between ffmpeg writing a part and this being committed degrades to
+    # today's behavior - re-encode that stretch - rather than to a wrong splice point
+    # (CLAUDE.md "Already done is a fact you recorded").
+    #
+    #  _parts_done      how many finished parts exist; their paths are DERIVED from the output
+    #                   stem and the index, so nothing here can disagree with the filesystem.
+    #  _source_covered  how far into the source those parts reach, measured from the last
+    #                   decodable frame of each - never a container's declared duration, which
+    #                   silently overshot by exactly 1.0s when it was measured.
+    #  _source_complete the encode reached the end of the source. Its own fact rather than
+    #                   "covered >= duration", so a restart during the final join redoes only
+    #                   the join and never re-encodes a sliver off the end.
+    #  _signature       a fingerprint of the encode-relevant ffmpeg arguments. Parts made under
+    #                   different settings must never be joined: the audio-copy fallback
+    #                   changes the audio codec config mid-file, and a changed crf leaves a
+    #                   quality seam no one can see. A mismatch discards the parts and says so.
+    conversion_parts_done             = db.Column(db.Integer, default=0, server_default=db.text('0'))
+    conversion_source_covered_seconds = db.Column(db.Float)
+    conversion_source_complete        = db.Column(db.Boolean, default=False,
+                                                  server_default=db.text('0'))
+    conversion_parts_signature        = db.Column(db.String(64))
 
     channel  = db.relationship('Channel', foreign_keys=[channel_id], lazy='joined')
     group    = db.relationship('ChannelGroup', foreign_keys=[group_id], lazy='joined')
@@ -531,29 +632,90 @@ class Recording(db.Model):
         return None
 
     @property
-    def content_shortfall_seconds(self):
-        """How much shorter the capture came out than the window it was recording, or
-        None until that is knowable.
+    def covered_capture_seconds(self):
+        """Wall-clock seconds inside the recording window during which some segment was
+        actually capturing - the union of the segment spans, clipped to the window.
 
-        The adjusted window (stop_time - start_time) is the basis, not the scheduled one:
-        both ends are rewritten to the real times on an abort or an early manual stop, so
-        this is the window the app was actually trying to fill. Same basis
-        postprocessor._gather_health uses for recorded_frame_pct.
+        A union rather than a sum: overlapping spans would otherwise be counted twice and
+        push the covered time past the window itself. Clipped to the window because a
+        segment can end a second or two after stop_time (stop_time is stamped when the app
+        decides to stop, ffmpeg finishes writing just after), and time outside the window
+        is not time the window was covered.
 
-        Deliberately NOT a column - every input already has one, and deriving it keeps a
-        single source of truth (CLAUDE.md §Measurements) while staying correct for every
-        recording already in the database. Read actual_duration_source alongside it: a
-        FAILED recording has no probed file and falls back to the segment span, which
-        slightly over-counts content and so under-states this number.
+        The adjusted window (stop_time - start_time) is the basis throughout, not the
+        scheduled one: both ends are rewritten to the real times on an abort or an early
+        manual stop, so this is the window the app was actually trying to fill. Same basis
+        postprocessor._gather_recording_health uses for recorded_frame_pct.
+        """
+        start, stop = self.start_time, self.stop_time
+        if not start or not stop or stop <= start:
+            return 0.0
+        spans = []
+        for s in self.segments:
+            if not s.started_at or not s.ended_at:
+                continue
+            a = max(s.started_at, start)
+            b = min(s.ended_at, stop)
+            if b > a:
+                spans.append((a, b))
+        spans.sort()
+        covered = 0.0
+        cur_a = cur_b = None
+        for a, b in spans:
+            if cur_b is not None and a <= cur_b:
+                cur_b = max(cur_b, b)
+            else:
+                if cur_b is not None:
+                    covered += (cur_b - cur_a).total_seconds()
+                cur_a, cur_b = a, b
+        if cur_b is not None:
+            covered += (cur_b - cur_a).total_seconds()
+        return covered
 
-        This is the post-capture twin of total_downtime_seconds. They measure different
-        things and will not agree: downtime cannot see a stream that stayed connected and
-        delivered almost nothing, and this cannot be known until the recording is over.
+    @property
+    def capture_gap_seconds(self):
+        """Wall-clock seconds inside the recording window when NO segment was capturing at
+        all, or None until the recording is over. A fact about the clock, not a claim about
+        content: what the feed would have carried during a gap is unknowable from here.
+
+        Distinct from total_downtime_seconds, which is a superset - downtime also counts
+        the no-growth window inside a segment that had stopped delivering but had not yet
+        been killed, which this cannot see because that segment was still running.
+
+        Deliberately NOT a column, like the two properties around it - every input already
+        has one, and deriving it keeps a single source of truth (CLAUDE.md §Measurements)
+        while staying correct for every recording already in the database.
+        """
+        if self.actual_duration_seconds is None:
+            return None
+        return max(0.0, self.duration_seconds - self.covered_capture_seconds)
+
+    @property
+    def content_vs_capture_seconds(self):
+        """Signed: how much more (+) or less (-) content came back than the wall clock the
+        capture actually ran for. None until the recording is over.
+
+        Positive means content arrived faster than real time. The measured cause on this
+        app's providers is a buffer replayed at reconnect - every one of recording 14's 28
+        segments delivered more content than its own wall clock, by a roughly constant
+        13-29s regardless of whether the segment ran 16 seconds or 27 minutes, which is the
+        signature of a fixed back-buffer prepended at each connect (dev/changelog/942).
+        Negative means the feed stayed connected and delivered less than real time.
+
+        Deliberately NOT called overlap or duplication. That the surplus is duplicate video
+        was proven for one recording with framemd5 and is very often true, but nothing here
+        compares a single frame, so this property must not assert it. Whether the replay
+        happens to cover what a gap lost is likewise unknowable without frame-level
+        matching - which is why capture_gap_seconds and this are reported side by side and
+        never netted against each other. Netting them is the defect this replaced: the old
+        content_shortfall_seconds was max(0, window - content), so a surplus silently
+        cancelled real gap time and recording 14 reported "missing 0s (0%)" against 135.7s
+        of measured gaps.
         """
         actual = self.actual_duration_seconds
         if actual is None:
             return None
-        return max(0.0, self.duration_seconds - actual)
+        return actual - self.covered_capture_seconds
 
     @property
     def actual_duration_source(self):
@@ -762,6 +924,18 @@ class RecordingSegment(db.Model):
     probe_coded_resolution   = db.Column(db.String(32))  # coded_width x coded_height, only when != resolution
     probe_is_vfr             = db.Column(db.Boolean)     # r_frame_rate vs avg_frame_rate mismatch; NULL = undetermined
     probed_at            = db.Column(db.DateTime)
+    # How many seconds of content this segment's finished file actually holds, ffprobed
+    # once at concat time (app/concatenator.py) rather than by the watchdog: the watchdog
+    # sees a file that is still growing, so its duration would be whatever had arrived by
+    # then. Compare it against the segment's own wall clock (ended_at - started_at) to see
+    # a feed that delivered faster or slower than real time - a provider that replays its
+    # buffer on reconnect opens every replacement segment with content the previous one
+    # already had, so content exceeds wall clock (dev/changelog/942).
+    # NULL means unknown and never zero: segments captured before this column existed are
+    # not backfilled, because the only other source is a regex over a truncated stderr tail
+    # and one column holding two measurement methods of differing precision is two answers
+    # to one question.
+    content_duration_seconds = db.Column(db.Float)
     # bytes_recorded/span far below the recording's own average bitrate - a timeline-clean
     # segment (frames present, evenly spaced) that is nonetheless a blank/slate screen.
     # app/postprocessor.py::_detect_near_empty_segments. NULL = not evaluated (predates this

@@ -97,7 +97,12 @@
     {# Second to last, between Logs and Settings (DESIGN.md 16.1). Matched on the
        endpoint rather than the blueprint: system_bp also owns the /api/system/*
        endpoints, which render no nav. #}
-    <a class="nav-link{% if request.endpoint == 'system.maintenance' %} active{% endif %}" href="{{ url_for('system.maintenance') }}">{{ nav_icon('maint') }}<span class="nav-t">Maintenance</span></a>
+    {# The Readiness card's counts: blocked capabilities in red, degraded in amber, the
+       pair Alerts already shows. Their own class names, NOT .nav-count-bad/-warn - those
+       are queried app-wide by static/js/nav-alerts.js, which would write the alert numbers
+       into this badge (dev/changelog/950). Rendered hidden and filled in by the
+       /api/nav-status poll, so the first paint is the nothing-active state. #}
+    <a class="nav-link{% if request.endpoint == 'system.maintenance' %} active{% endif %}" href="{{ url_for('system.maintenance') }}">{{ nav_icon('maint') }}<span class="nav-t">Maintenance</span> <span class="nav-count nav-count-ready-bad" data-unit="blocked thing" style="display:none"></span><span class="nav-count nav-count-ready-warn" data-unit="degraded thing" style="display:none"></span><span class="nav-pip pip-ready" style="display:none"></span></a>
     <a class="nav-link{% if request.endpoint and request.endpoint.startswith('settings.') %} active{% endif %}" href="{{ url_for('settings.settings') }}">{{ nav_icon('settings') }}<span class="nav-t">Settings</span></a>
     {% if auth_enabled %}
     <form method="post" action="{{ url_for('auth.logout') }}" class="nav-logout-form">
@@ -121,11 +126,17 @@
      No ids: the desktop top bar and the mobile top bar both render it, and
      duplicate ids would leave getElementById updating only the first copy. The
      stats chip is neutral on purpose - red and blue mean "happening right now",
-     and a readout that is always there must not claim the same urgency. #}
+     and a readout that is always there must not claim the same urgency.
+
+     All three are BUTTONS, never links (dev/changelog/949). A chip's job is to open
+     its tooltip, and the tooltip's rows are the links - a chip that navigated on tap
+     meant a phone could never read it, because the tap that would reveal it left the
+     page instead. The tip carries its own `Dashboard →` / `Jobs →` footer for the
+     destination the chip itself used to be. #}
   {% macro activity_chips() %}
     <button class="actchip chip-stats" type="button" aria-label="System stats"><svg class="chip-i" viewBox="0 0 16 16" aria-hidden="true"><path d="M3 13V7.4M8 13V3.2M13 13V9.6"/></svg></button>
-    <a class="actchip chip-rec" href="{{ url_for('dashboard.dashboard') }}" style="display:none"><span class="pulse"></span><span class="chip-n">0</span></a>
-    <a class="actchip chip-job" href="{{ url_for('jobs.jobs_page') }}" style="display:none"><span class="pulse"></span><span class="chip-n">0</span></a>
+    <button class="actchip chip-rec" type="button" aria-label="Recording activity" style="display:none"><span class="pulse"></span><span class="chip-n">0</span></button>
+    <button class="actchip chip-job" type="button" aria-label="Background activity" style="display:none"><span class="pulse"></span><span class="chip-n">0</span></button>
   {% endmacro %}
 
   {# Hamburger first in the DOM, not floated left, so reading order matches paint
@@ -435,6 +446,24 @@
       return ss + 's remaining';
     }
 
+    // The two chips that list work both render it as ROWS, one per item, each a link
+    // to the thing it names. `name` is raw and escaped here; `detailHtml` is already
+    // built by the caller, which is what escapes the provider-supplied halves of it
+    // (dev/docs/BUGS.md 2026-08-15 - recording names carry EPG program titles).
+    function tipItem(href, name, detailHtml) {
+      return '<a class="tt-item" href="' + escHtml(href || '#') + '">' +
+             '<span class="tt-name">' + escHtml(name) + '</span>' +
+             (detailHtml ? '<span class="tt-detail">' + detailHtml + '</span>' : '') +
+             '</a>';
+    }
+    // Where the chip itself used to go. It is a button now, so the tip is the only
+    // route to the page that lists this kind of work.
+    function tipMore(href, label) {
+      return '<a class="tt-more" href="' + escHtml(href) + '">' + escHtml(label) + ' &rarr;</a>';
+    }
+    var MORE_REC = {{ url_for('dashboard.dashboard') | tojson }};
+    var MORE_JOB = {{ url_for('jobs.jobs_page') | tojson }};
+
     function buildRecTooltip(data) {
       var lines = [];
       if (data.state === 'active') {
@@ -442,21 +471,22 @@
         // state_label names what each row is actually doing - a stream that died and is
         // backing off toward a reconnect reads as "Waiting to retry", not as a capture.
         data.active.forEach(function(r) {
-          lines.push('<span class="tt-name">' + escHtml(r.name) + '</span>');
-          lines.push('<span class="tt-detail">' + escHtml(r.state_label) + ' &middot; stops ' +
-                     r.stop_time_et + ' &mdash; ' + fmtSecs(r.seconds_remaining) + '</span>');
+          lines.push(tipItem(r.href, r.name,
+                             escHtml(r.state_label) + ' &middot; stops ' + r.stop_time_et +
+                             ' &mdash; ' + fmtSecs(r.seconds_remaining)));
         });
       } else if (data.state === 'dim') {
         lines.push('<strong>&#x25CB; No active recording</strong>');
         if (data.next_scheduled) {
           var ns = data.next_scheduled;
-          lines.push('<span class="tt-name">Next: ' + escHtml(ns.name) + '</span>');
-          lines.push('<span class="tt-detail">' + ns.start_et + ' &mdash; ' + ns.start_relative + '</span>');
+          lines.push(tipItem(ns.href, 'Next: ' + ns.name,
+                             ns.start_et + ' &mdash; ' + ns.start_relative));
         }
         if (data.scheduled_count > 1) {
           lines.push('<span class="tt-detail">' + data.scheduled_count + ' recording' + (data.scheduled_count !== 1 ? 's' : '') + ' scheduled</span>');
         }
       }
+      lines.push(tipMore(MORE_REC, 'Dashboard'));
       return lines.join('');
     }
 
@@ -465,22 +495,33 @@
       if (data.state === 'active') {
         lines.push('<strong>&#x25CF; Background activity</strong>');
         data.tasks.forEach(function(t) {
-          lines.push('<span class="tt-name">' + escHtml(t.label) + '</span>');
-          if (t.detail) lines.push('<span class="tt-detail">' + escHtml(t.detail) + '</span>');
+          lines.push(tipItem(t.href, t.label, t.detail ? escHtml(t.detail) : ''));
         });
       } else if (data.state === 'dim') {
         lines.push('<strong>&#x25CB; Background jobs scheduled</strong>');
         if (data.next_scheduled) {
           var ns = data.next_scheduled;
-          lines.push('<span class="tt-name">Next: ' + escHtml(ns.label) + '</span>');
-          lines.push('<span class="tt-detail">' + ns.time_et + ' &mdash; ' + ns.relative + '</span>');
+          lines.push(tipItem(ns.href, 'Next: ' + ns.label,
+                             ns.time_et + ' &mdash; ' + ns.relative));
         }
       }
+      lines.push(tipMore(MORE_JOB, 'Jobs'));
       return lines.join('');
     }
 
+    // The tip sits 8px below its chip and its rows are links now, so the pointer has
+    // to cross that dead band to reach one. Closing on the chip's mouseleave would
+    // shut it mid-crossing and make every row unclickable by hover, so a leave only
+    // ARMS a close and entering either the chip or the tip cancels it.
+    var hideTimer = null;
+    function cancelHide() { if (hideTimer) { clearTimeout(hideTimer); hideTimer = null; } }
+    function scheduleHide() { cancelHide(); hideTimer = setTimeout(hideTooltip, 200); }
+
+    var _shownHtml = null;
     function showTooltip(el, html) {
+      cancelHide();
       tooltip.innerHTML = html;
+      _shownHtml = html;
       tooltip.style.display = 'block';
       var rect = el.getBoundingClientRect();
       var tw = tooltip.offsetWidth;
@@ -488,13 +529,18 @@
       left = Math.max(8, Math.min(left, window.innerWidth - tw - 8));
       tooltip.style.left = left + 'px';
       tooltip.style.top = (rect.bottom + window.scrollY + 8) + 'px';
-      if (activeChip && activeChip !== el) activeChip.classList.remove('on');
+      if (activeChip && activeChip !== el) {
+        activeChip.classList.remove('on');
+        delete activeChip.dataset.pinned;
+      }
       el.classList.add('on');
       activeChip = el;
     }
 
     function hideTooltip() {
+      cancelHide();
       tooltip.style.display = 'none';
+      _shownHtml = null;
       if (activeChip) {
         activeChip.classList.remove('on');
         delete activeChip.dataset.pinned;
@@ -537,66 +583,86 @@
       applyChip(chipJob, d.background.state, d.background.tasks.length);
       // Refresh (or drop) an open tooltip in place rather than leaving stale numbers
       // up. applyStats has already run this cycle, so the stats tip is fresh too.
+      // Only when the markup actually changed: the rows are links, and rewriting
+      // innerHTML on every poll would destroy the one under the pointer mid-click.
       if (activeChip) {
         var html = activeChip.__tipHtml ? activeChip.__tipHtml() : null;
-        if (html) tooltip.innerHTML = html;
-        else hideTooltip();
+        if (!html) hideTooltip();
+        else if (html !== _shownHtml) { tooltip.innerHTML = html; _shownHtml = html; }
       }
     }
 
-    // clickPins is for the stats chip only: it is a button, so a tap has no
-    // other job. The other two are links and a tap navigates, which is their
-    // shipped mobile behavior - hover is the only way they open a tip.
-    function bindTip(el, htmlFn, clickPins) {
+    // All three chips pin on click (dev/changelog/949). None of them navigates any
+    // more, so a tap has no other job - and a tap was the only gesture a phone has,
+    // which is why the two that used to be links were unreadable there.
+    function bindTip(el, htmlFn) {
       el.__tipHtml = htmlFn;
-      if (clickPins) {
-        el.addEventListener('click', function(e) {
-          e.stopPropagation();
-          // Keyed on PINNED, never on "already open": mouseenter fires before
-          // click on a real pointer, and touch synthesizes hover before the tap,
-          // so an is-it-open test closes the tip hover just opened - every click
-          // would open and close it inside one tick, which is what shipped for
-          // an afternoon and made the numbers unreachable on a phone.
-          if (el.dataset.pinned) { delete el.dataset.pinned; hideTooltip(); return; }
-          var html = htmlFn();
-          if (html) { showTooltip(el, html); el.dataset.pinned = '1'; }
-        });
-      }
+      el.addEventListener('click', function(e) {
+        e.stopPropagation();
+        // Keyed on PINNED, never on "already open": mouseenter fires before
+        // click on a real pointer, and touch synthesizes hover before the tap,
+        // so an is-it-open test closes the tip hover just opened - every click
+        // would open and close it inside one tick, which is what shipped for
+        // an afternoon and made the numbers unreachable on a phone.
+        if (el.dataset.pinned) { delete el.dataset.pinned; hideTooltip(); return; }
+        var html = htmlFn();
+        if (!html) return;
+        showTooltip(el, html);
+        el.dataset.pinned = '1';
+        // The tip lives at the end of <body>, so Tab from the chip walks past it.
+        // A chip reached by keyboard (click with no pointer behind it, detail 0)
+        // hands focus to the first row instead - otherwise turning these from links
+        // into buttons would put their destinations out of keyboard reach entirely.
+        if (e.detail === 0) {
+          var first = tooltip.querySelector('a');
+          if (first) first.focus();
+        }
+      });
       el.addEventListener('mouseenter', function() {
+        cancelHide();
         var html = htmlFn();
         if (html) showTooltip(el, html);
       });
-      el.addEventListener('mouseleave', function(e) {
+      el.addEventListener('mouseleave', function() {
         // Hover-out only closes what hover opened; a pinned tip waits for a click.
-        if (!el.dataset.pinned && !tooltip.contains(e.relatedTarget)) hideTooltip();
+        if (!el.dataset.pinned) scheduleHide();
       });
     }
 
     chipRec.forEach(function(el) {
       bindTip(el, function() {
         return (_lastRec && _lastRec.state !== 'hidden') ? buildRecTooltip(_lastRec) : null;
-      }, false);
+      });
     });
     chipJob.forEach(function(el) {
       bindTip(el, function() {
         return (_lastBg && _lastBg.state !== 'hidden') ? buildBgTooltip(_lastBg) : null;
-      }, false);
+      });
     });
     chipStats.forEach(function(el) {
       bindTip(el, function() {
         return window.__statsTipHtml ? window.__statsTipHtml() : null;
-      }, true);
+      });
     });
 
-    tooltip.addEventListener('mouseleave', function(e) {
+    tooltip.addEventListener('mouseenter', cancelHide);
+    tooltip.addEventListener('mouseleave', function() {
       if (activeChip && activeChip.dataset.pinned) return;
-      if (!e.relatedTarget || !e.relatedTarget.closest || !e.relatedTarget.closest('.actchip')) hideTooltip();
+      scheduleHide();
     });
 
     document.addEventListener('click', function(e) {
       if (!tooltip.contains(e.target) && !(e.target.closest && e.target.closest('.actchip'))) {
         hideTooltip();
       }
+    });
+    // Escape closes a pinned tip and puts focus back on its chip, so keyboard focus
+    // cannot be stranded inside a popup that is about to be dismissed by a click.
+    document.addEventListener('keydown', function(e) {
+      if (e.key !== 'Escape' || !activeChip) return;
+      var chip = activeChip;
+      hideTooltip();
+      chip.focus();
     });
     // The tooltip is positioned in document coordinates and neither top bar keeps
     // its chip underneath it while the page scrolls, so scrolling closes it
@@ -623,6 +689,32 @@
         pip.style.display = n > 0 ? '' : 'none';
       });
     }
+    // Maintenance's Readiness counts: blocked capabilities in red, degraded in amber -
+    // the pair Alerts shows, deliberately counting capabilities rather than checks, since
+    // one broken binary blocks four of them and a check tally would read as four alarms
+    // for one problem (dev/changelog/950). A check the user has silenced never reaches
+    // here: it was left out of every capability's state server-side.
+    function applyReadiness(readiness) {
+      var bad = (readiness && readiness.blocked) || 0;
+      var warn = (readiness && readiness.degraded) || 0;
+      var put = function(sel, value) {
+        document.querySelectorAll(sel).forEach(function(el) {
+          el.textContent = value;
+          el.style.display = value > 0 ? '' : 'none';
+        });
+      };
+      put('.nav-count-ready-bad', bad);
+      put('.nav-count-ready-warn', warn);
+      document.querySelectorAll('.nav-pip.pip-ready').forEach(function(pip) {
+        pip.classList.toggle('pip-bad', bad > 0);
+        pip.style.display = bad + warn > 0 ? '' : 'none';
+      });
+    }
+    // The ONE writer of the Maintenance counts, exposed the way nav-alerts.js exposes its
+    // own: the Readiness card calls it with the `nav` block of the payload it just fetched,
+    // so silencing a check moves the badge on the click rather than at the next poll. The
+    // card never writes these nodes itself.
+    window.__applyReadiness = applyReadiness;
     function fetchNavStatus() {
       fetch('/api/nav-status')
         .then(function(r) { return r.json(); })
@@ -633,6 +725,7 @@
           if (window.__applySearchReadiness) window.__applySearchReadiness(d.search);
           if (window.__applyAccountSync) window.__applyAccountSync(d.account_sync);
           applyLiveCount(d.activity);
+          applyReadiness(d.readiness);
           // Rail tooltips carry the counts, so they are re-derived after the
           // badges move - one writer, run last.
           if (window.__applyRailTips) window.__applyRailTips();

@@ -474,6 +474,28 @@ def resume_in_progress_recordings(app):
         _reset_stuck_accounts()
 
         @retry_on_locked()
+        def _clear_stale_postprocess_waits():
+            # postprocess_waiting_since says a post-processing chain is parked waiting on
+            # another recording, and it is read by a process that cannot see this one
+            # (tools/check_busy.py). No such chain survives a restart - the thread is gone
+            # and any suspended conversion ffmpeg died with it - so every stamp present at
+            # startup is orphaned, and one left set would tell the restart guard a working
+            # recording is idle for the rest of its life (dev/changelog/952). Cleared before
+            # any resume below re-parks a row and legitimately sets it again. All three
+            # columns of the park go together through the one writer (dev/changelog/954).
+            from .postprocessor import set_postprocess_wait
+            stale = Recording.query.filter(
+                Recording.postprocess_waiting_since.isnot(None)).all()
+            for r in stale:
+                log.info('Recording %d was parked waiting on recording "%s" at restart - '
+                         'clearing the wait', r.id, r.postprocess_waiting_on_name)
+                set_postprocess_wait(r, None)
+            if stale:
+                db.session.commit()
+
+        _clear_stale_postprocess_waits()
+
+        @retry_on_locked()
         def _record_event_and_commit(recording_id, event_type, detail=None):
             add_recording_event(recording_id, event_type, detail)
             db.session.commit()
@@ -539,6 +561,15 @@ def resume_in_progress_recordings(app):
         _pp = _load_config()['recording']['post_process']
         _auto = _pp.get('auto_restart', True)
         _max_attempts = max(0, int(_pp.get('max_restart_attempts', 3) or 0))
+        # Handed to case 1d below so it cannot pick the same row up a second time. The first
+        # thing a relaunched do_postprocess() does is write ANALYZING, which is exactly what
+        # 1d selects on - so a row resumed here reappears in 1d's query milliseconds later and
+        # gets a second chain. Both then wait out the same collision window and spawn ffmpeg
+        # on the same output, which is what this case's own is_conversion_active() guard is
+        # for: that guard is checked once at entry and cannot see across a wait that lasts as
+        # long as the recording being yielded to. Observed live on recording 17
+        # (dev/changelog/951). Not a check-then-act race - both loops run in this one thread.
+        resumed_here = set()
         for rec in Recording.query.filter_by(status=REC_STATUS_CONVERTING).all():
             ts_path = rec.output_path
             if is_conversion_active(rec.id):
@@ -594,6 +625,7 @@ def resume_in_progress_recordings(app):
                 db.session.commit()
 
             _count_restart_kill()
+            resumed_here.add(rec.id)
             threading.Thread(target=do_postprocess, args=(app, rec.id, ts_path), daemon=True).start()
 
         # Case 1d: was CONCATENATING or ANALYZING when Flask died (crash, or a restart
@@ -610,6 +642,10 @@ def resume_in_progress_recordings(app):
         from .concatenator import is_concat_active, committed_concat_output
         for rec in Recording.query.filter(
                 Recording.status.in_((REC_STATUS_CONCATENATING, REC_STATUS_ANALYZING))).all():
+            if rec.id in resumed_here:
+                # Case 1c launched this one moments ago and its chain wrote ANALYZING on the
+                # way past; this is that write, not a stranded row.
+                continue
             if is_concat_active(rec.id):
                 # Same guard as the CONVERTING case above: a live chain already owns this
                 # id, so relaunching would put a second ffmpeg on the same output.
@@ -961,7 +997,15 @@ def finalize_on_demand_job_status(job, completed, ct_cfg=None):
 
 
 def cancel_on_demand_job_schedule(job):
-    """Remove the APScheduler job for an on-demand test job, if any."""
+    """Remove the APScheduler job for an on-demand test job, if any.
+
+    The pending deferred retry goes with it: a run that was deferred past a recording has a
+    one-shot DateTrigger of its own, and leaving it behind would fire a cancelled, paused or
+    deleted job's run hours later (CLAUDE.md "teardown releases everything the create path
+    acquired"). Unconditional, because the retry exists independently of scheduler_job_id -
+    a window job has no scheduler_job_id at all and can still have been deferred.
+    """
+    remove_job_if_exists(health_check_retry_job_id(job.id))
     if job.scheduler_job_id:
         if remove_job_if_exists(job.scheduler_job_id):
             log.info('Cancelled APScheduler job %s for on-demand job %d', job.scheduler_job_id, job.id)
@@ -1107,6 +1151,194 @@ def schedule_all_account_syncs(app, *, force_reschedule_defaults: bool = False):
         schedule_account_sync(app, acc.id, force_reschedule=force)
 
 
+# ── Deferred occurrences ────────────────────────────────────────────────────────────
+#
+# A background job that yields to a recording used to simply return, dropping the occurrence
+# entirely: the next attempt was a whole interval away, and nothing said so. One 30-minute
+# recording on 2026-09-10 landed on all four accounts' staggered sync slots at once and turned
+# a 24h interval into a 48h gap (dev/changelog/941).
+#
+# These helpers are the shared half of deferring instead of dropping - they answer "when could
+# this job actually run", so a caller can queue one one-shot retry there rather than polling
+# and raising a skip record every time round. Deliberately generic: account sync and the
+# scheduled health-check jobs have the identical skip-and-drop shape and both call in here.
+
+#: What to assume an occurrence needs when nothing has ever measured it. A real account sync
+#: took 2-4 minutes across the 2026-09-09 logs, and a job with no history gets the top of that
+#: range rather than zero - a zero-length window makes every instant look free, which is the
+#: bug the existing 5-minute lookahead already has.
+DEFAULT_OCCURRENCE_SECONDS = 240
+
+#: Multiplier over a measured estimate. A gap sized to the exact average is a coin flip, since
+#: half of all runs are longer than their own average.
+OCCURRENCE_SAFETY_FACTOR = 1.5
+
+#: Stop looking for a slot past this. Beyond it the honest answer is "it cannot catch up",
+#: which is what the overdue alert says - a retry queued two days out would be a worse lie
+#: than the one this whole change removes.
+MAX_DEFERRAL_HORIZON_HOURS = 48
+
+
+def occurrence_seconds(estimate_seconds) -> float:
+    """How much clear time a job needs, from its measured average runtime."""
+    if not estimate_seconds or estimate_seconds <= 0:
+        return float(DEFAULT_OCCURRENCE_SECONDS)
+    return estimate_seconds * OCCURRENCE_SAFETY_FACTOR
+
+
+def recording_windows(*, include_active: bool = True, lead_minutes: int = 0,
+                      now: datetime = None) -> list:
+    """[(start, end)] naive-UTC intervals a recording guard would refuse to start inside.
+
+    An IN_PROGRESS recording occupies from `now` to its stop time, floored at `now` so an
+    overrunning recording (stop time already past) still blocks the present. A SCHEDULED one
+    occupies from `lead_minutes` BEFORE its start - the window the guard actually refuses in -
+    through its stop time.
+
+    The two parameters mirror the caller's own guard settings rather than re-deciding them: a
+    window here that disagreed with the guard would aim a retry straight back into a skip.
+    `include_active=False` is a caller whose in-progress guard is switched off; `lead_minutes=0`
+    is one whose lookahead guard is off, and a scheduled recording then blocks only from its
+    actual start.
+
+    Must be called inside an app context.
+    """
+    from .database import Recording, REC_STATUS_SCHEDULED, REC_STATUS_IN_PROGRESS
+
+    now = now or datetime.utcnow()
+    windows = []
+
+    if include_active:
+        for rec in Recording.query.filter_by(status=REC_STATUS_IN_PROGRESS).all():
+            windows.append((now, max(rec.stop_time or now, now)))
+
+    for rec in Recording.query.filter(
+        Recording.status == REC_STATUS_SCHEDULED,
+        Recording.stop_time > now,
+    ).all():
+        start = rec.start_time - timedelta(minutes=lead_minutes)
+        windows.append((start, max(rec.stop_time, start)))
+
+    return windows
+
+
+def _merge_windows(windows: list) -> list:
+    """Sorted, non-overlapping copy of [(start, end)]. Touching intervals merge."""
+    ordered = sorted((w for w in windows if w[1] > w[0]), key=lambda w: w[0])
+    merged = []
+    for start, end in ordered:
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    return merged
+
+
+def first_free_slot(needed_seconds: float, windows: list, *, now: datetime = None,
+                    horizon_hours: int = MAX_DEFERRAL_HORIZON_HOURS):
+    """First moment from `now` where `needed_seconds` clears every window, or None.
+
+    None means "no such gap within the horizon" - a real answer the caller reports, not a
+    failure. Queueing a retry anyway would just re-run the guard and defer again.
+
+    The gap is sized to the whole run, not to its start: a job that begins in a five-minute
+    hole and needs four minutes still has to FINISH before the next recording's guard window
+    opens, which is what the existing lookahead never checked.
+    """
+    now = now or datetime.utcnow()
+    deadline = now + timedelta(hours=horizon_hours)
+    needed = timedelta(seconds=needed_seconds)
+
+    candidate = now
+    for start, end in _merge_windows(windows):
+        if end <= candidate:
+            continue
+        if start - candidate >= needed:
+            break
+        candidate = max(candidate, end)
+
+    return None if candidate > deadline else candidate
+
+
+def _sync_job_times(pattern: str) -> dict:
+    """{account_id: earliest naive-UTC next_run_time} over the sync jobs matching `pattern`.
+
+    One get_jobs() call per caller. Never reach for this per row - the two public wrappers
+    below are batched for exactly that reason.
+    """
+    if _scheduler is None:
+        return {}
+    times = {}
+    for job in _scheduler.get_jobs():
+        m = re.match(pattern, job.id)
+        if not m or job.next_run_time is None:
+            continue
+        account_id = int(m.group(1))
+        when = to_naive_utc(job.next_run_time)
+        if account_id not in times or when < times[account_id]:
+            times[account_id] = when
+    return times
+
+
+def pending_sync_retries() -> dict:
+    """{account_id: naive-UTC run time} for every queued deferred-sync retry.
+
+    Derived from the jobstore, never stored: the queued retry's existence IS the fact that this
+    account owes a sync, so no second copy can go stale and no teardown path has to remember to
+    clear it. Same argument as pending_hide_materialize() below, and the reason this change adds
+    no column - Account.next_sync_at could not carry a catch-up time anyway, because
+    schedule_account_sync() seeds the INTERVAL trigger from it and would re-anchor the regular
+    schedule on the catch-up.
+    """
+    return _sync_job_times(r'^account_sync_retry_(\d+)$')
+
+
+def next_sync_attempts() -> dict:
+    """{account_id: when a sync will next actually be attempted}, naive UTC.
+
+    The earliest of an account's regular interval job and any deferred-retry one-shot, read off
+    the jobs that will really fire. Account.next_sync_at cannot answer this: it is written only
+    when a sync succeeds and when the interval job is re-registered, so it goes stale the moment
+    an occurrence is deferred - and it was already capable of sitting in the past, which is the
+    "overdue" every surface displayed while the real job was hours away (dev/changelog/941).
+
+    Empty when no scheduler is running, which is a real state (a test app, early startup) and
+    not an error - accounts.next_sync_map() falls back to the stored column there.
+    """
+    return _sync_job_times(r'^account_sync(?:_retry)?_(\d+)$')
+
+
+def _reserved_sync_windows(exclude_account_id: int) -> list:
+    """Windows other accounts' syncs already claim, so a catch-up lands in a gap of its own.
+
+    Admission refuses sync-while-sync, so four accounts released into one gap would produce one
+    sync and three refusals - three more deferrals, three more skip records, and no catch-up.
+    Spacing them is the cheaper half of the "one at a time" rule; the alternative was chaining
+    each release off the previous sync's completion, which needs a completion hook and a queue
+    that a restart could strand.
+
+    Each window is sized by that account's own runtime estimate, not a shared constant: a
+    34,012-channel sync and an 8,804-channel one are not the same job.
+    """
+    from .accounts import get_sync_duration_estimate
+
+    if _scheduler is None:
+        return []
+
+    reserved = []
+    for job in _scheduler.get_jobs():
+        m = re.match(r'^account_sync(?:_retry)?_(\d+)$', job.id)
+        if not m or job.next_run_time is None:
+            continue
+        other_id = int(m.group(1))
+        if other_id == exclude_account_id:
+            continue
+        start = to_naive_utc(job.next_run_time)
+        estimate, _ = get_sync_duration_estimate(other_id)
+        reserved.append((start, start + timedelta(seconds=occurrence_seconds(estimate))))
+    return reserved
+
+
 def _account_sync_job(account_id: int):
     with _app.app_context():
         from . import db
@@ -1120,15 +1352,17 @@ def _account_sync_job(account_id: int):
 
         cfg = load_config()
         sync_cfg = cfg.get('sync', {})
+        within_minutes = sync_cfg.get('skip_sync_if_recording_within_minutes', 5)
+        guard_active = sync_cfg.get('skip_sync_if_recording_active', True)
 
-        if sync_cfg.get('skip_sync_if_recording_active', True):
+        if guard_active:
             active = Recording.query.filter_by(status=REC_STATUS_IN_PROGRESS).first()
             if active:
-                _log_job_skipped(f'account_sync_{account_id}', f'Sync: {account.name}', active,
-                                 account_id=account_id)
+                _defer_sync_past_recording(
+                    account_id, account.name, sync_cfg,
+                    f'Recording "{active.name}" (#{active.id}) is in progress')
                 return
 
-        within_minutes = sync_cfg.get('skip_sync_if_recording_within_minutes', 5)
         if within_minutes > 0:
             cutoff = datetime.utcnow() + timedelta(minutes=within_minutes)
             upcoming = Recording.query.filter(
@@ -1136,8 +1370,10 @@ def _account_sync_job(account_id: int):
                 Recording.start_time <= cutoff,
             ).order_by(Recording.start_time).first()
             if upcoming:
-                _log_job_skipped_upcoming(f'account_sync_{account_id}', f'Sync: {account.name}',
-                                           upcoming, within_minutes, account_id=account_id)
+                _defer_sync_past_recording(
+                    account_id, account.name, sync_cfg,
+                    f'Recording "{upcoming.name}" (#{upcoming.id}) starts within '
+                    f'{within_minutes} minutes')
                 return
 
         # Sync yields to an active test run (DESIGN-concurrency.md 5.2, gap G3) and to
@@ -1165,6 +1401,72 @@ def sync_retry_job_id(account_id: int) -> str:
     """Job id of an account's pending deferred-sync retry. Public so the teardown
     paths that remove account_sync_<id> can remove this one in the same breath."""
     return f'account_sync_retry_{account_id}'
+
+
+def _defer_sync_past_recording(account_id: int, account_name: str, sync_cfg: dict, reason: str):
+    """A recording blocks this sync: queue one retry at the first gap long enough to finish
+    it, instead of dropping the occurrence for a whole sync interval (dev/changelog/941).
+
+    Why one dated retry rather than a poll: a 20-minute poll across a 4-hour recording writes
+    a dozen SKIPPED rows into the account's sync history to say the same thing twelve times.
+    The slot is computed from the recordings already on the books, so one retry lands where
+    the job can actually run - and because it re-enters _account_sync_job, a recording
+    scheduled in the meantime simply defers it again rather than forcing a sync through.
+
+    Same one-shot DateTrigger and same job id as the contention deferral above, for the same
+    APScheduler 3.x reason (never modify_job() on the interval trigger, which would drift every
+    later fire). Sharing the id means `replace_existing` collapses a contention deferral and a
+    recording deferral into one pending retry, /jobs already renders it, and the teardown paths
+    in schedule_account_sync() already remove it.
+    """
+    from .accounts import get_sync_duration_estimate, record_skipped_sync, update_overdue_alert
+    from .tz_utils import format_local
+
+    run_date = None
+    if _scheduler is None:
+        # A scheduler-less app (a test app, an early-startup path) has nowhere to queue the
+        # retry, so the skip record is the only surface - same degenerate case the hide-rule
+        # deferral below names. Production always has a scheduler.
+        why = 'There was nowhere to queue a retry'
+        log.warning('Sync for account %d not deferred - %s; no scheduler to queue a retry on',
+                    account_id, reason)
+    else:
+        needed = occurrence_seconds(get_sync_duration_estimate(account_id)[0])
+        windows = recording_windows(
+            include_active=sync_cfg.get('skip_sync_if_recording_active', True),
+            lead_minutes=sync_cfg.get('skip_sync_if_recording_within_minutes', 5),
+        ) + _reserved_sync_windows(account_id)
+        run_date = first_free_slot(needed, windows)
+        why = (f'No gap long enough to finish a sync was found in the next '
+               f'{MAX_DEFERRAL_HORIZON_HOURS} hours')
+
+    if run_date is None:
+        # Nothing within the horizon is clear enough to finish a sync in. Saying so beats
+        # queueing a retry that would only defer again on arrival; update_overdue_alert()
+        # below is what carries this to a surface once the account is actually behind.
+        remove_job_if_exists(sync_retry_job_id(account_id))
+        record_skipped_sync(
+            account_id,
+            f'{reason} - this sync was skipped automatically. {why}, so it will run at its '
+            'next regular time.')
+        log.warning('Skipped sync for account %d - %s; no retry queued (%s)',
+                    account_id, reason, why)
+    else:
+        _add_job(
+            func=_account_sync_job,
+            trigger='date',
+            run_date=run_date,
+            id=sync_retry_job_id(account_id),
+            replace_existing=True,
+            kwargs={'account_id': account_id},
+        )
+        record_skipped_sync(
+            account_id,
+            f'{reason} - this sync was deferred automatically and will retry at '
+            f'{format_local(run_date)}.')
+        log.info('Deferred sync for account %d - %s; retry at %s', account_id, reason, run_date)
+
+    update_overdue_alert(account_id, sync_cfg)
 
 
 def _defer_sync_for_contention(account_id: int, account_name: str, sync_cfg: dict, reason: str):
@@ -1211,6 +1513,60 @@ def _defer_sync_for_contention(account_id: int, account_name: str, sync_cfg: dic
         account_id=account_id,
     )
     log.info('Deferred sync for account %d - %s; retry at %s', account_id, reason, run_date)
+
+
+def health_check_retry_job_id(job_id: int) -> str:
+    """Job id of a health-check job's pending deferred retry. Public so every teardown path
+    that removes od_job_<id> removes this one in the same breath - a DateTrigger left behind
+    would fire against a job that has been cancelled, paused or deleted."""
+    return f'od_job_retry_{job_id}'
+
+
+def defer_health_check_past_recording(job_id: int, ct_cfg: dict, reason: str):
+    """A recording blocks this scheduled health-check run: queue one retry at the first gap
+    long enough to finish it. Returns the retry time, or None when there is no such gap.
+
+    The sync half of this is _defer_sync_past_recording above, and both exist for the same
+    reason - a scheduled run that yields to a recording used to be dropped outright, so the
+    next attempt was a whole schedule away with nothing saying so (dev/changelog/941).
+
+    Sized from the run's own measured history rather than a constant: a 4-channel group and a
+    400-channel one are not the same job. The retry re-enters the job through the same trigger
+    the schedule uses, so every guard - the recording checks, the busy-tester check, admission -
+    is asked again fresh.
+    """
+    from .database import get_job_duration_estimate
+
+    if _scheduler is None:
+        # Nowhere to queue the retry - a test app or an early-startup path. The caller's own
+        # run-log line is then the only record, which is what the None return tells it.
+        log.warning('Health check job %d not deferred - %s; no scheduler to queue a retry on',
+                    job_id, reason)
+        return None
+
+    needed = occurrence_seconds(get_job_duration_estimate(f'od_job_{job_id}')[0])
+    windows = recording_windows(
+        include_active=ct_cfg.get('skip_if_recording_active', True),
+        lead_minutes=ct_cfg.get('skip_if_recording_within_minutes', 10),
+    )
+    run_date = first_free_slot(needed, windows)
+
+    if run_date is None:
+        remove_job_if_exists(health_check_retry_job_id(job_id))
+        log.warning('Skipped health check job %d - %s; no free slot within %dh',
+                    job_id, reason, MAX_DEFERRAL_HORIZON_HOURS)
+        return None
+
+    _add_job(
+        func=_on_demand_job_trigger,
+        trigger='date',
+        run_date=run_date,
+        args=[job_id],
+        id=health_check_retry_job_id(job_id),
+        replace_existing=True,
+    )
+    log.info('Deferred health check job %d - %s; retry at %s', job_id, reason, run_date)
+    return run_date
 
 
 def _defer_job_for_contention(job_id: str, job_label: str, func, reason: str,
@@ -1802,30 +2158,4 @@ def _emit_job_skipped(job_id: str, job_label: str, body: str, recording_id: int 
     record_skipped_sync(account_id, body)
 
 
-def _log_job_skipped(job_id: str, job_label: str, active_recording, account_id: int = None):
-    """The recording-in-progress skip reason. Thin wrapper over _emit_job_skipped."""
-    _emit_job_skipped(
-        job_id, job_label,
-        f'Recording "{active_recording.name}" (#{active_recording.id}) is in progress - '
-        f'this run was skipped automatically. It will run again at its next regular time.',
-        recording_id=active_recording.id,
-        account_id=account_id,
-    )
-    log.info('Auto-skipped %s - recording %d (%s) in progress',
-             job_id, active_recording.id, active_recording.name)
-
-
-def _log_job_skipped_upcoming(job_id: str, job_label: str, upcoming_recording, within_minutes: int,
-                              account_id: int = None):
-    """The recording-starts-soon skip reason. Thin wrapper over _emit_job_skipped."""
-    _emit_job_skipped(
-        job_id, job_label,
-        f'Recording "{upcoming_recording.name}" (#{upcoming_recording.id}) starts within '
-        f'{within_minutes} minutes - this run was skipped automatically. It will run again '
-        f'at its next regular time.',
-        recording_id=upcoming_recording.id,
-        account_id=account_id,
-    )
-    log.info('Auto-skipped %s - recording %d (%s) starts within %d min',
-             job_id, upcoming_recording.id, upcoming_recording.name, within_minutes)
 

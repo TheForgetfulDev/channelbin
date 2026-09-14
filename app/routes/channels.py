@@ -21,8 +21,8 @@ from ..database import (
 from ..accounts import (
     duplicate_groups_within, lifecycle_states_for_channels,
     NORM_DISABLED, resolve_normalization_mode, url_is_normalizable,
-    missing_channels_query, repoint_candidates_for_channels, _recompute_duplicate_stream_urls,
-    transfer_channel_state,
+    missing_channels_query, next_sync_map, repoint_candidates_for_channels,
+    _recompute_duplicate_stream_urls, transfer_channel_state,
 )
 from ..channel_groups import group_channel_ids, report_orphaned_guide_groups
 from .. import channel_hiding
@@ -868,6 +868,8 @@ def channel_detail(channel_id):
 
     return render_template('channels/detail.html',
         channel=channel,
+        next_sync_at=(next_sync_map([channel.account])[channel.account_id]
+                      if channel.account is not None else None),
         logo_url=resolve_logo_url(channel),
         window_label=window_label,
         channel_kind_groups=channel_kind_groups,

@@ -39,7 +39,7 @@ def _pp_config(**recording_overrides):
             'dvr_output_dir': '/nonexistent-test-dir',
             'serialize_concat': False,
         },
-        'ffmpeg': {'path': 'ffmpeg', 'concat_timeout_seconds': 60},
+        'ffmpeg': {'path': 'ffmpeg', 'concat_pre_output_timeout_seconds': 60, 'concat_stall_seconds': 60},
     }
     cfg['recording'].update(recording_overrides)
     return lambda *a, **kw: cfg

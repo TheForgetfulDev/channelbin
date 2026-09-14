@@ -62,6 +62,21 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
            esac; \
        done
 
+# OCI image metadata. `org.opencontainers.image.source` is load-bearing rather than
+# decorative: a registry uses it to link a published package back to its repository, and on
+# GitHub's container registry that link is what lets the package take the repository's
+# visibility instead of staying private and unattached. Reasoning and the rest of the publish
+# contract: dev/docs/DESIGN-public-image-publish.md.
+#
+# No version label. app/version.py's __version__ is the only source of the tag a publish
+# uses, and a second copy here could disagree with what the running container reports about
+# itself.
+LABEL org.opencontainers.image.title="ChannelBin" \
+      org.opencontainers.image.description="Self-hosted IPTV channel tester and recorder (DVR)." \
+      org.opencontainers.image.source="https://github.com/TheForgetfulDev/channelbin" \
+      org.opencontainers.image.url="https://github.com/TheForgetfulDev/channelbin" \
+      org.opencontainers.image.licenses="MIT"
+
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 

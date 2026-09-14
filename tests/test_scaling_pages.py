@@ -184,6 +184,30 @@ def _seed_guide_channels(n):
     db.session.commit()
 
 
+def _seed_readiness_shape(n):
+    """n accounts, n guide groups with a recording-enabled member each, and n guide channels
+    with a program - the three things the Readiness check counts over.
+
+    Its checks look at accounts, at guide groups' memberships, at which recording members
+    have ever been health checked, and at the EPG. Every one of those is a place a per-row
+    query would go unnoticed, because the card renders a fixed eleven capability rows
+    whatever the numbers behind them are (dev/changelog/950).
+    """
+    for i in range(n):
+        acc = seed.make_account(name=f'Provider {i}')
+        member = seed.make_channel(acc, name=f'Member {i}')
+        grp = seed.make_group(name=f'Guide group {i}', members=[member])
+        grp.in_guide = True
+        for m in grp.memberships:
+            m.recording_enabled = True
+        ch = seed.make_channel(acc, name=f'Guide channel {i}', in_guide=True)
+        db.session.add(seed.EPGEntry(
+            channel_id=ch.id, title='Show',
+            start_time=datetime.utcnow(),
+            stop_time=datetime.utcnow() + timedelta(hours=1)))
+    db.session.commit()
+
+
 def _seed_search_channels(n):
     """n channels with a program each, plus the three things the channel search's row
     payload enriches beyond the channel row itself (dev/changelog/398): a duplicate cluster,
@@ -504,6 +528,12 @@ class PageScalingTests(unittest.TestCase):
         # duplicate review set and the missing-channel count), which is what this seeds.
         self._assert_row_independent(_seed_guide_channels, '/channels')
 
+    def test_readiness_report(self):
+        # Not a page: the Readiness card lives on Maintenance, whose contents all arrive by
+        # fetch, so this endpoint is where the per-account and per-group work actually
+        # happens and where the guard belongs.
+        self._assert_row_independent(_seed_readiness_shape, '/api/readiness')
+
     def test_groups_page(self):
         self._assert_row_independent(_seed_groups, '/channel-groups')
 
@@ -727,8 +757,10 @@ NOT_ROW_SCALING = {
         'arrive from /api/logs/history, which is a file tail hard-capped at 5000 lines and '
         'touches no database row.'),
     'system.maintenance': (
-        'Four cards whose contents all arrive by fetch. The only server-rendered values are '
-        'the backup schedule and the Docker flag, which are config, not measurement.'),
+        'Seven cards whose contents all arrive by fetch. The only server-rendered values are '
+        'the backup schedule and the Docker flag, which are config, not measurement. The '
+        'Readiness card is the one whose payload counts rows, and /api/readiness carries its '
+        'own case above (test_readiness_report).'),
     'settings.settings': (
         'Renders config.yaml, whose size is bounded by the key set in app/config.py. Nothing '
         'on it grows with a database table.'),

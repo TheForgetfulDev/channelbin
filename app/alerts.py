@@ -92,6 +92,13 @@ ALERT_TYPES = {
     # is the page the person who just saved the rule is already looking at.
     'CHANNEL_HIDE_RULES_NOT_APPLIED': {
         'label': 'Channel Hide Rules Not Applied Yet', 'severity': 'INFO'},
+    # A one-time startup repair moved stored health scores back onto the observations on
+    # record, after a repeated post-capture analysis had counted some of them twice
+    # (app/health_recompute.py::repair_duplicated_capture_corrections, dev/changelog/951). The
+    # scores move with nothing the user did behind them, which is precisely the number a user
+    # cannot otherwise explain, so it is announced rather than left on each channel's timeline.
+    'HEALTH_SCORES_REPAIRED': {
+        'label': 'Channel Health Scores Recomputed', 'severity': 'INFO'},
     'GROUP_FORMAT_MISMATCH': {'label': 'Channel Group Format Mismatch', 'severity': 'WARN'},
     # Retired along with GROUP_FORMAT_MISMATCH above: a group whose lock leaves nothing
     # eligible says so on the group page's own override banner, and the recording made under
@@ -167,6 +174,13 @@ ALERT_TYPES = {
     # each one is work already lost, not a degradation.
     'SYNC_FAILED': {
         'label': 'Account Sync Failed', 'severity': 'ERROR', 'self_clearing': True},
+    # An account that has fallen a whole sync interval past due because its scheduled syncs
+    # keep being deferred past recordings (dev/changelog/941). WARN, not ERROR: nothing has
+    # been lost yet, the channel list and guide are just going stale. An individual deferred
+    # sync is deliberately NOT an alert - it is shown on the account's own sync history and in
+    # the corrected "next sync" time (dev/changelog/923 decision 8).
+    'SYNC_ACCOUNT_OVERDUE': {
+        'label': 'Account Sync Overdue', 'severity': 'WARN', 'self_clearing': True},
     'RECORDING_MOVE_FAILED': {
         'label': 'Recording Move Failed', 'severity': 'ERROR', 'self_clearing': True},
     # Unlike the two above, this one has no self-clearing path and is not expected to grow

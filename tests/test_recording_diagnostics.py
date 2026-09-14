@@ -371,14 +371,20 @@ class RecordingDiagnosticsTests(unittest.TestCase):
         self.assertIn('output format:', detail)
         self.assertIn('h264', detail)
 
-    def test_capture_health_detail_names_the_content_shortfall(self):
-        """dev/changelog/432: the fixture is 20s of content in a 40s window, so half the
-        recording is missing and the one line the user reads has to say so. It rides in
-        the detail string rather than extra_data because both inputs already have columns
-        (the partition test above is the guard on that half)."""
+    def test_capture_health_detail_names_the_capture_gaps(self):
+        """dev/changelog/432, 942: the fixture is 20s of content in a 40s window with no
+        segment rows, so the whole window reads as time nothing was capturing and the one
+        line the user reads has to say so. It rides in the detail string rather than
+        extra_data because both inputs already have columns (the partition test above is
+        the guard on that half).
+
+        The clause used to read "missing 20s (50%)" - one subtraction of content from
+        window, clamped at zero. That is the figure dev/changelog/942 retired: a feed that
+        replays its buffer on reconnect makes it read zero over real gap time."""
         detail = self._run_and_health_detail()
 
-        self.assertIn('missing 20s (50%)', detail)
+        self.assertIn('40s not capturing (100%)', detail)
+        self.assertIn('content +20s against 0s of capture time', detail)
 
     def _run_and_health_detail(self):
         self._run(self._ts(self.clean_src), self._config())

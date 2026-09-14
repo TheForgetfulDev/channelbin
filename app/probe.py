@@ -813,13 +813,16 @@ def assess_seek_damage(filepath: str, *, joined_segments: int = 1, segment_rates
     if metrics['gap_basis'] == 'dts-post-concat':
         # Appended after the verdict rather than folded into the gap clause: on a clean
         # multi-segment recording this sentence IS the finding, and it has to be readable
-        # on its own. Names "Content missing" on purpose - that stat sits on the same
-        # recording detail page (dev/changelog/432) and reports a much larger number,
-        # because the concatenated span excludes the time between segments entirely.
-        # Saying so is what stops the two from reading as a contradiction.
+        # on its own. Names "Capture gaps" on purpose - that stat sits on the same
+        # recording detail page and is the one measurement that CAN see the time between
+        # segments, because it reads the segment clocks rather than the joined file.
+        # Saying so is what stops the two from reading as a contradiction. It used to
+        # name "Content missing", which could not answer the question it was handed: that
+        # stat netted the gaps against a buffered feed's replay and reported zero
+        # (dev/changelog/942).
         summary += (f'. Gaps are not measurable across {joined_segments} concatenated '
                     f'segments: concat re-timestamps every join, so that count is only '
                     f'what survived inside a segment, and time lost between segments is '
-                    f'not part of this timeline at all - that loss is reported as '
-                    f'Content missing')
+                    f'not part of this timeline at all - that time is reported as '
+                    f'Capture gaps')
     return damaged, metrics, summary

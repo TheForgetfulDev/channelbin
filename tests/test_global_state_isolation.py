@@ -62,6 +62,7 @@ RESET = {
     'app/config.py': {'_restart_needed'},
     'app/fs_utils.py': {'_last_logged_outcome'},
     'app/probe.py': {'_missing_reported'},
+    'app/readiness.py': {'_ondemand', '_nav_cache'},
     'app/search_index.py': {'_rebuilding', '_stale_since'},
 }
 

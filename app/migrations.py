@@ -127,6 +127,13 @@ _BF_URL_NORMALIZABLE = 'm024.url_normalizable'
 _BF_FAILURE_STREAK = 'm026.consecutive_test_failures'
 _BF_SEGMENT_CHANNEL = 'm032.segment_channel_id'
 _BF_SYNC_LOG_SKIP_COUNTS = 'm051.sync_log_skip_counts'
+_BF_ANALYSIS_COMPLETED = 'm057.analysis_completed_at'
+#: Not a column backfill - an obligation to repair channel health scores that a repeated
+#: analysis phase double-counted, discharged by health_recompute.repair_duplicated_capture_
+#: corrections() from create_app() once the ORM is available. The ledger is used for the
+#: same reason a column backfill uses it: the obligation is committed before the work, so
+#: an interrupted repair is retried rather than inferred complete (dev/changelog/951).
+_BF_DUPLICATE_CAPTURE_CORRECTIONS = 'm057.duplicate_capture_corrections'
 
 
 def _register_backfill(conn, cur, name: str):
@@ -165,6 +172,41 @@ def _finish_backfill(conn, cur, name: str):
     cur.execute('UPDATE migration_backfills SET completed_at = ? WHERE name = ?',
                 (_utc_stamp(), name))
     conn.commit()
+
+
+def obligation_pending(name: str) -> bool:
+    """Whether `name`'s ledger entry is registered and not yet finished, asked through the
+    ORM's own connection rather than a raw migration cursor.
+
+    For an obligation a migration step registers but cannot discharge itself, because the
+    work is ORM code that only exists once create_app() has built the models - see
+    _BF_DUPLICATE_CAPTURE_CORRECTIONS. The gating rule is the same one the private helpers
+    above enforce: the obligation is a recorded fact, never inferred from whether the work
+    looks done.
+    """
+    from sqlalchemy import text
+    # Asked of sqlite_master rather than by running the CREATE TABLE IF NOT EXISTS the private
+    # helpers use: this runs on every startup for the life of the obligation, and a read has
+    # no business taking a write lock to answer a question about a table a fresh database
+    # legitimately does not have yet.
+    present = db.session.execute(text(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='migration_backfills'"
+    )).fetchone()
+    if present is None:
+        return False
+    row = db.session.execute(
+        text('SELECT completed_at FROM migration_backfills WHERE name = :n'),
+        {'n': name}).fetchone()
+    return row is not None and row[0] is None
+
+
+def finish_obligation(name: str):
+    """Mark `name` discharged. Executes; does NOT commit - the caller owns the commit so the
+    work and its completion stamp land as one retry_on_locked unit."""
+    from sqlalchemy import text
+    db.session.execute(
+        text('UPDATE migration_backfills SET completed_at = :t WHERE name = :n'),
+        {'t': _utc_stamp(), 'n': name})
 
 
 def _utc_stamp() -> str:
@@ -1972,6 +2014,127 @@ def _m055_recordings_autoincrement(conn, cur):
              'a deleted recording id is no longer re-issued', copied)
 
 
+def _m056_segment_content_duration(conn, cur):
+    """recording_segments: content_duration_seconds - how many seconds of content the
+    segment's finished file holds, ffprobed once at concat time (app/concatenator.py).
+    Compared against the segment's own wall clock it shows a feed delivering faster or
+    slower than real time (dev/changelog/942).
+
+    No backfill, deliberately. The segment .ts files are deleted after a successful
+    conversion, so the only remaining source for an existing row is ffmpeg's last
+    `time=` progress line inside the stored capture_stderr diagnostic - a regex over a
+    tail that read_stderr_tail may have truncated. Filling the column from that would put
+    two measurement methods of different precision behind one name, and a NULL that means
+    "not measured" is worth more than a number nobody can reproduce."""
+    seg_cols = [r[1] for r in cur.execute('PRAGMA table_info(recording_segments)').fetchall()]
+    if 'content_duration_seconds' not in seg_cols:
+        cur.execute('ALTER TABLE recording_segments ADD COLUMN content_duration_seconds FLOAT')
+    conn.commit()
+
+
+def _m057_analysis_completion_stamp(conn, cur):
+    """recordings: analysis_completed_at - the recorded fact that the post-capture analysis
+    phase finished, so a service restart resumes at the conversion instead of re-probing the
+    whole file and blending a duplicate capture-quality observation into the channel's health
+    score (dev/changelog/951).
+
+    The backfill keys on capture_quality_breakdown, which is the column the phase's final
+    commit writes. That artifact is deliberately NOT what the running app gates on - it is
+    absent whenever recording.gather_health_data is off, which is why the stamp exists - but
+    for rows written before this column existed it is the only evidence there is, and it is
+    exact in the one direction that matters: a row carrying it reached the end of the phase.
+    Leaving those rows NULL is not the neutral choice - the two recordings still parked in
+    ANALYZING when this shipped would have re-analyzed and re-blended on the very next
+    restart, re-corrupting the scores this same migration's repair obligation exists to fix.
+
+    The stamp's value is the recording's last POSTCAPTURE_ANALYSIS_STARTED event, the closest
+    recorded moment to the completion nobody wrote down; it is never later than the true one.
+    """
+    rec_cols = [r[1] for r in cur.execute('PRAGMA table_info(recordings)').fetchall()]
+    added = False
+    if 'analysis_completed_at' not in rec_cols:
+        _register_backfill(conn, cur, _BF_ANALYSIS_COMPLETED)
+        cur.execute('ALTER TABLE recordings ADD COLUMN analysis_completed_at DATETIME')
+        added = True
+    if _backfill_needed(cur, _BF_ANALYSIS_COMPLETED, added):
+        cur.execute(
+            'UPDATE recordings SET analysis_completed_at = COALESCE('
+            '  (SELECT MAX(e.timestamp) FROM recording_events e '
+            '    WHERE e.recording_id = recordings.id '
+            "      AND e.event_type = 'POSTCAPTURE_ANALYSIS_STARTED'), "
+            '  completed_at, ?) '
+            'WHERE capture_quality_breakdown IS NOT NULL '
+            '  AND analysis_completed_at IS NULL', (_utc_stamp(),))
+        _finish_backfill(conn, cur, _BF_ANALYSIS_COMPLETED)
+
+    # The scores already double-counted cannot be repaired from here: undoing a blend is a
+    # full replay of the channel's observation ledger, which is ORM code (health_score is a
+    # lossy exponential average - nothing can be subtracted back out of it). So this step
+    # records the obligation and create_app() discharges it once the ORM is up.
+    _register_backfill(conn, cur, _BF_DUPLICATE_CAPTURE_CORRECTIONS)
+    conn.commit()
+
+
+def _m058_postprocess_waiting_stamp(conn, cur):
+    """recordings: postprocess_waiting_since - when this recording's post-processing parked
+    itself to let another recording have the local CPU and disk, NULL while it is working.
+    It is what lets tools/check_busy.py tell a parked recording from a working one, which it
+    cannot do from status alone (dev/changelog/952).
+
+    No backfill: NULL already means "not waiting", which is true of every row that exists
+    when this runs. A row genuinely parked at upgrade time is mid-flight in a process this
+    migration is about to replace, and the startup sweep clears the column for those anyway.
+    """
+    rec_cols = [r[1] for r in cur.execute('PRAGMA table_info(recordings)').fetchall()]
+    if 'postprocess_waiting_since' not in rec_cols:
+        cur.execute('ALTER TABLE recordings ADD COLUMN postprocess_waiting_since DATETIME')
+    conn.commit()
+
+
+def _m059_postprocess_waiting_blocker(conn, cur):
+    """recordings: postprocess_waiting_on_name / postprocess_waiting_on_state - who the park
+    recorded by migration 58 is waiting on, and what that recording was doing.
+
+    The wait was already recorded; only the pages could not say what it was for, so a parked
+    recording kept describing the phase it had stopped in (dev/changelog/954).
+
+    No backfill, for the same reason 58 has none: NULL beside a NULL
+    postprocess_waiting_since means "not waiting", which is true of every row at upgrade
+    time, and the startup sweep clears all three together for anything mid-flight.
+    """
+    rec_cols = [r[1] for r in cur.execute('PRAGMA table_info(recordings)').fetchall()]
+    if 'postprocess_waiting_on_name' not in rec_cols:
+        cur.execute('ALTER TABLE recordings ADD COLUMN postprocess_waiting_on_name VARCHAR(500)')
+    if 'postprocess_waiting_on_state' not in rec_cols:
+        cur.execute('ALTER TABLE recordings ADD COLUMN postprocess_waiting_on_state VARCHAR(200)')
+    conn.commit()
+
+
+def _m060_conversion_parts_checkpoint(conn, cur):
+    """recordings: conversion_parts_done / conversion_source_covered_seconds /
+    conversion_source_complete / conversion_parts_signature - the recorded checkpoint that
+    lets a killed re-encode resume where it stopped instead of starting over
+    (dev/changelog/955).
+
+    No backfill, and the defaults are what make that safe: 0 parts covering NULL seconds is
+    "nothing is checkpointed", which is true of every row that exists when this runs. A row
+    genuinely mid-conversion at upgrade time was converting under the old whole-file command,
+    so its partial has no moov atom and is not a checkpoint under any reading - it re-encodes
+    from the start exactly as it would have before, which is the behavior this migration is
+    replacing rather than a regression from it.
+    """
+    rec_cols = [r[1] for r in cur.execute('PRAGMA table_info(recordings)').fetchall()]
+    if 'conversion_parts_done' not in rec_cols:
+        cur.execute('ALTER TABLE recordings ADD COLUMN conversion_parts_done INTEGER DEFAULT 0')
+    if 'conversion_source_covered_seconds' not in rec_cols:
+        cur.execute('ALTER TABLE recordings ADD COLUMN conversion_source_covered_seconds FLOAT')
+    if 'conversion_source_complete' not in rec_cols:
+        cur.execute('ALTER TABLE recordings ADD COLUMN conversion_source_complete BOOLEAN DEFAULT 0')
+    if 'conversion_parts_signature' not in rec_cols:
+        cur.execute('ALTER TABLE recordings ADD COLUMN conversion_parts_signature VARCHAR(64)')
+    conn.commit()
+
+
 SCHEMA_MIGRATIONS = [
     (1, 'baseline: pre-versioning additive migrations + backfills', _m001_baseline),
     (2, 'recordings: program_title/program_sub_title snapshot columns + backfill', _m002_program_title),
@@ -2074,6 +2237,18 @@ SCHEMA_MIGRATIONS = [
     (55, 'recordings: rebuild with AUTOINCREMENT so a deleted recording id is never '
      're-issued to the next recording created',
      _m055_recordings_autoincrement),
+    (56, 'recording_segments: content_duration_seconds, the segment\'s own content length '
+     'measured at concat time', _m056_segment_content_duration),
+    (57, 'recordings: analysis_completed_at, the recorded fact that the post-capture '
+     'analysis phase finished + repair obligation for the health scores a repeated '
+     'analysis double-counted', _m057_analysis_completion_stamp),
+    (58, 'recordings: postprocess_waiting_since, the recorded fact that post-processing is '
+     'parked waiting on another recording', _m058_postprocess_waiting_stamp),
+    (59, 'recordings: postprocess_waiting_on_name/_state, who that park is waiting on and '
+     'what it is doing', _m059_postprocess_waiting_blocker),
+    (60, 'recordings: conversion_parts_done/_source_covered_seconds/_source_complete/'
+     '_parts_signature, the recorded checkpoint a killed re-encode resumes from',
+     _m060_conversion_parts_checkpoint),
 ]
 
 CURRENT_SCHEMA_VERSION = SCHEMA_MIGRATIONS[-1][0]

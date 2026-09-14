@@ -33,7 +33,7 @@ from .database import (
 )
 from .db_utils import current_wal_size_bytes, retry_on_locked
 from .fmt_utils import fmt_bytes
-from .tz_utils import parse_epoch_utc, to_naive_utc
+from .tz_utils import format_local, parse_epoch_utc, to_naive_utc
 from .url_utils import mask_account_urls_in_text, mask_creds, mask_creds_in_text, mask_url_path
 
 log = logging.getLogger(__name__)
@@ -1426,6 +1426,12 @@ def _do_sync(account_id: int, stop_event: threading.Event, use_dump: bool = Fals
             active=False,
         )
 
+        # The account just synced, so it is by definition no longer overdue. This is the
+        # self-clearing half the overdue alert promises (dev/changelog/923 decision 8) and it
+        # belongs on the success path rather than on a sweep: nothing else knows the account
+        # caught up.
+        update_overdue_alert(account_id, sync_cfg)
+
         _raise_channel_lifecycle_alerts(account, cfg, sync_time, previous_last_sync_at,
                                         channel_count_baseline, new_channel_ids)
 
@@ -1722,6 +1728,83 @@ def _raise_or_resolve_standing_alert(alert_type: str, source: str, active: bool,
 
     from .alerts import create_alert
     create_alert(alert_type, title=title, body=body, source=source)
+
+
+#: How far past due an account has to fall before the overdue alert fires, in multiples of its
+#: own sync interval. A sync is due at last_sync_at + interval, so 2 means "a whole interval has
+#: gone by since it should have run" - the threshold decided in dev/changelog/923 (decision 8).
+#: One interval would fire on every ordinary deferral, which is exactly the noise that decision
+#: was written to avoid; an individual deferred sync is shown on the account, not alerted.
+OVERDUE_INTERVAL_MULTIPLE = 2
+
+
+def update_overdue_alert(account_id: int, sync_cfg: dict) -> None:
+    """Raise or clear this account's standing "sync is overdue" alert.
+
+    Called from both ends of the condition: scheduler.py when a sync is deferred past a
+    recording (the only path that can let an account fall behind) and from the success path
+    above (the only path that can bring it back). Nothing polls - a condition alert that has to
+    be swept for is a condition alert that can go stale.
+
+    An account with automatic sync switched off is never overdue: there is nothing it is late
+    for. Neither is one that has never synced - that is UNSYNCED, a different state with its own
+    surfaces, and calling a brand-new account "overdue" would be wrong on its first day.
+    """
+    account = db.session.get(Account, account_id)
+    if account is None:
+        return
+
+    interval_hours = account.sync_interval_hours or sync_cfg.get('sync_interval_hours', 6)
+    overdue_by = timedelta(hours=interval_hours * OVERDUE_INTERVAL_MULTIPLE)
+    active = bool(
+        account.sync_enabled
+        and account.last_sync_at is not None
+        and datetime.utcnow() - account.last_sync_at >= overdue_by
+    )
+
+    body = ''
+    if active:
+        body = (
+            f'This account syncs every {interval_hours}h, but its last successful sync '
+            f'finished {format_local(account.last_sync_at)} - more than '
+            f'{interval_hours * OVERDUE_INTERVAL_MULTIPLE}h ago. Scheduled syncs are being '
+            'deferred past recordings and have not yet found a gap long enough to run in, so '
+            'this account\'s channel list and guide data are getting stale. Sync it by hand '
+            'from the account page, or widen the gap by turning off "Skip sync during '
+            'recording" in Settings. This alert clears itself on the next successful sync.'
+        )
+
+    _raise_or_resolve_standing_alert(
+        'SYNC_ACCOUNT_OVERDUE',
+        source=f'account:{account_id}:overdue',
+        active=active,
+        title=f'{account.name}: sync is overdue',
+        body=body,
+    )
+
+
+def next_sync_map(accounts) -> dict:
+    """{account_id: the next sync attempt, naive UTC or None} for a batch of accounts.
+
+    The answer comes from the scheduler, because that is what decides it: the earliest of the
+    account's interval job and any deferred-retry one-shot. `Account.next_sync_at` is only the
+    fallback for an app with no scheduler running, and it is deliberately not preferred - it is
+    written just when a sync succeeds and when the interval job is re-registered, so an account
+    whose sync was deferred past a recording kept showing a time that had already gone by. Every
+    "next sync" on the dashboard, the accounts list, the account page and the channel page read
+    "overdue" while the real attempt was hours away (dev/changelog/941).
+
+    Batched deliberately: one jobstore read serves a whole page, and the returned dict is what a
+    per-row template loop indexes into. Never ask per row.
+    """
+    from .scheduler import next_sync_attempts
+
+    scheduled = next_sync_attempts()
+    return {
+        account.id: (scheduled.get(account.id, account.next_sync_at)
+                     if account.sync_enabled else None)
+        for account in accounts
+    }
 
 
 def channel_lifecycle_state(channel: Channel, account: Account, cfg: dict,

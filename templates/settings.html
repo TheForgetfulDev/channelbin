@@ -346,7 +346,7 @@
           ('wait','Delay the recording until the conversion finishes (fails the recording if its own window would already be over)'),
           ('off','Off - no collision avoidance')]) }}
       {{ field_number('recording.post_process.collision_lookahead_multiplier', 'Conversion speed assumption (x realtime)',
-         "How far ahead of a scheduled recording's start to avoid beginning a new conversion, expressed as a multiple of realtime. 1 assumes the conversion runs at 1x realtime and looks ahead the recording's full duration (always safe); 2 assumes 2x realtime and only looks ahead half of it. Minimum 0.1.",
+         "How far ahead of a scheduled recording's start to avoid beginning - or to pause - a conversion, expressed as a multiple of realtime. 1 assumes the conversion runs at 1x realtime and looks ahead however much source is still left to encode (always safe); 2 assumes 2x realtime and only looks ahead half of it. The window shrinks as the conversion progresses, so a job that is nearly finished steps aside for almost nothing. Minimum 0.1.",
          '1', pp.get('collision_lookahead_multiplier', 1.0), step='0.1') }}
       {{ field_bool('recording.move_on_complete.enabled', 'Move on complete',
          'Move the finished file to a different folder after all post-processing is done.',
@@ -429,9 +429,12 @@
       {{ field_list('ffmpeg.extra_output_args', 'Extra output arguments',
          'Extra ffmpeg arguments inserted after the input URL, one per line.',
          '(empty)', ff.get('extra_output_args', [])) }}
-      {{ field_number('ffmpeg.concat_timeout_seconds', 'Concat timeout (seconds)',
-         'Maximum time allowed for the segment concatenation step.',
-         '300', ff.get('concat_timeout_seconds', 300)) }}
+      {{ field_number('ffmpeg.concat_pre_output_timeout_seconds', 'Concat start timeout (seconds)',
+         'How long the join may run without writing anything before it is given up on. It is not a budget for the join itself - once the output file is growing, the stall timeout below is the only bound and a join that keeps writing is never stopped, however large the recording.',
+         '300', ff.get('concat_pre_output_timeout_seconds', 300)) }}
+      {{ field_number('ffmpeg.concat_stall_seconds', 'Concat stall timeout (seconds)',
+         'Give up on the join if its output file stops growing for this long. 0 turns stall detection off, which leaves nothing watching the join at all - the start timeout above then applies to the whole job instead.',
+         '300', ff.get('concat_stall_seconds', 300)) }}
     {% endcall %}
 
     {% call section('sync', 'Account Sync / EPG') %}

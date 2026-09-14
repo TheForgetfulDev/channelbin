@@ -333,7 +333,16 @@ class CssClassDefinedTests(unittest.TestCase):
                           # channel-search.js's Groups column badge (dev/changelog/821) -
                           # a prior 'b-mute' call site had no matching rule anywhere and
                           # rendered unstyled; renamed to the existing muted-badge class.
-                          'b-abort')
+                          'b-abort',
+                          # The Readiness card (static/js/readiness.js, dev/changelog/950).
+                          # Every one of these is emitted only from a template literal, so
+                          # a missing rule is invisible to a grep of templates/ - which is
+                          # exactly how the two shipped invisible-UI bugs above got in.
+                          'rd-verdict', 'rd-vmark', 'rd-vhead', 'rd-vsub', 'rd-vmeta',
+                          'rd-caps', 'rd-caprow', 'rd-capmark', 'rd-capname', 'rd-capwhy',
+                          'rd-capact', 'rd-whylist', 'rd-row', 'rd-rname', 'rd-rcaret',
+                          'rd-rfound', 'rd-ract', 'rd-muted', 'rd-detail', 'rd-dk', 'rd-dv',
+                          'rd-comp', 'rd-progress', 'rd-bar', 'rd-intro')
 
     def test_js_emitted_component_classes_are_defined(self):
         text = '\n'.join(t for _p, t in _css_sources())

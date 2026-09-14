@@ -220,6 +220,7 @@ def reset_module_globals():
     import app.config as config
     import app.fs_utils as fs_utils
     import app.probe as probe
+    import app.readiness as readiness
     import app.routes.channel_search as channel_search_routes
     import app.search_index as search_index
 
@@ -246,6 +247,12 @@ def reset_module_globals():
     # previous module makes this module's first probe of the same path look unchanged -
     # i.e. no warning where the test set up a freshly-unreachable mount.
     fs_utils._last_logged_outcome.clear()
+    # The Readiness card's on-demand answers and its 30s nav-count cache are both keyed on
+    # nothing but the check id, so a result from a previous module's install (a provider
+    # login that "passed" against a patched client) would be served to this one as though
+    # it had been asked for here - and the cached nav counts would survive a test that
+    # seeds a completely different database.
+    readiness.reset_for_tests()
     # save_config() latches this for any RESTART_REQUIRED_KEYS write, so one module's
     # settings save leaves the next module's pages rendering a restart-required banner.
     config._restart_needed = False

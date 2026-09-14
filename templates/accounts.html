@@ -139,7 +139,7 @@ Sync cancelled before it finished.
       <span class="a-num"><span class="a-k">Next sync</span>
         {%- if not account.sync_enabled %}<span class="text-faint">off</span>
         {%- elif syncing %}<span class="text-muted">running</span>
-        {%- elif account.next_sync_at %}{{ account.next_sync_at | time_until }}
+        {%- elif next_sync[account.id] %}{{ next_sync[account.id] | time_until }}
         {%- else %}<span class="text-faint">-</span>{% endif -%}
       </span>
     </span>

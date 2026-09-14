@@ -495,6 +495,42 @@ def imminent_recording_conflict() -> Optional[str]:
             'starting a health check run now may compete for the connection limit.')
 
 
+def _defer_run_past_recording(job_id: int, ct_cfg: dict, reason: str) -> None:
+    """A recording blocks this scheduled run: queue one retry at the first gap long enough to
+    finish it, and say so on the run log and the last-skip reason every other skip path here
+    already writes to.
+
+    The occurrence used to be dropped outright, so a recurring daily check that collided with
+    a recording waited another full day and a one-off waited forever, with nothing anywhere
+    saying the run had been lost (dev/changelog/941). The slot itself is found by the shared
+    helper in app/scheduler.py, which the account sync's deferral also uses - the two had the
+    identical skip-and-drop shape, so they get one implementation rather than two.
+
+    A run that cannot be placed still says so rather than pretending: `retry_at` is None and
+    the reason names it, which is the only honest answer when every hour in the horizon is
+    inside a recording.
+
+    Called with _lock released, like every other skip path in this file - `_append_log` and
+    the state write take _lock themselves, briefly.
+    """
+    from .scheduler import defer_health_check_past_recording
+    from .tz_utils import format_local
+
+    retry_at = defer_health_check_past_recording(job_id, ct_cfg, reason)
+    if retry_at is None:
+        # Deliberately does not name WHY no retry was queued: no gap inside the horizon and no
+        # scheduler to queue one on are two different causes, both logged at their own site,
+        # and a run-log line that picked one would be wrong half the time.
+        detail = (f'{reason} - this run was skipped and could not be deferred, so it will '
+                  'run at its next scheduled time.')
+    else:
+        detail = f'{reason} - this run was deferred and will retry at {format_local(retry_at)}.'
+
+    with _lock:
+        _state.last_skip_reason = detail
+    _append_log('WARN', f'Run deferred - {detail}')
+
+
 def _record_skipped_for_busy_tester(app, job_id: int, running_kind: str,
                                     running_job_id: Optional[int],
                                     running_pre_check_recording_id: Optional[int]):
@@ -637,8 +673,9 @@ def run_on_demand_test_job(app, job_id: int, channel_id_subset: Optional[List[in
                 # Self-heal: whatever registered this run (almost always a stray recurring
                 # CronTrigger left behind after the DB row is gone - dev/docs/BUGS.md
                 # 2026-08-10) would otherwise keep firing this same error forever.
-                from .scheduler import remove_job_if_exists
+                from .scheduler import health_check_retry_job_id, remove_job_if_exists
                 remove_job_if_exists(f'od_job_{job_id}')
+                remove_job_if_exists(health_check_retry_job_id(job_id))
                 skipped = True
                 return
             is_system = job.is_system
@@ -651,20 +688,16 @@ def run_on_demand_test_job(app, job_id: int, channel_id_subset: Optional[List[in
                 active_rec = Recording.query.filter_by(status=REC_STATUS_IN_PROGRESS).first()
             if active_rec is not None:
                 msg = 'A recording is currently in progress'
-                log.info('Skipping TV Guide Channels run - %s', msg)
-                with _lock:
-                    _state.last_skip_reason = msg
-                _append_log('WARN', f'Run skipped - {msg}')
+                log.info('Deferring TV Guide Channels run - %s', msg)
+                _defer_run_past_recording(job_id, ct_cfg, msg)
                 skipped = True
                 return
 
             if not force:
                 conflict_reason = imminent_recording_conflict()
                 if conflict_reason:
-                    log.info('Skipping on-demand job %d - %s', job_id, conflict_reason)
-                    with _lock:
-                        _state.last_skip_reason = conflict_reason
-                    _append_log('WARN', f'Run skipped - {conflict_reason}')
+                    log.info('Deferring on-demand job %d - %s', job_id, conflict_reason)
+                    _defer_run_past_recording(job_id, ct_cfg, conflict_reason)
                     skipped = True
                     return
 

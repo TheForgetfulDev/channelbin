@@ -31,8 +31,9 @@ from tests.support import timing  # noqa: E402
 from tests.support.timing import (  # noqa: E402
     CEILINGS_MS_PER_TEST, DRIFT_MIN_PRIOR, DRIFT_RECENT, MAX_LOG_RUNS, STATUS_PREFIX, _Tee,
     _assert_no_module_was_dropped, _charged, _cpu_snapshot, _discover_modules, _failed_ids,
-    _foreign_cpu, _module_weights, _ms_per_test, _open_log, _pack_shards, _passing_same_tier,
-    _per_module, _per_test_drift, _prepare_log_dir, _pump, _status_line, _TimingResult,
+    _foreign_cpu, _history_safe_ids, _module_weights, _ms_per_test, _open_log, _pack_shards,
+    _passing_same_tier, _per_module, _per_test_drift, _prepare_log_dir, _pump, _status_line,
+    _TimingResult,
 )
 
 FIXTURE_SLEEP = 0.30
@@ -634,6 +635,64 @@ class FailedIdTests(unittest.TestCase):
                            errors=[(_Test('a'), '')])
 
         self.assertEqual(_failed_ids(result), ['a', 'b'])
+
+
+class HistorySafeIdTests(unittest.TestCase):
+    """What reaches tests/timing_history.jsonl is bounded - dev/docs/BUGS.md 2026-09-13.
+
+    That file is committed and published, so a failing subTest's parameter suffix is
+    published text. `dev/changelog/881` scrubbed one such leak by hand and deliberately left
+    the write path alone, trusting the scanner as the control; thirteen days later the same
+    test parametrized on the same `blocked_by` value put a personal name back in.
+    """
+
+    def test_a_subtest_suffix_is_dropped(self):
+        # The dev/tasks/ name below is sample subTest text, not a citation - the whole
+        # point of the test is that it must NOT reach timing_history.jsonl.
+        leaked = ('tests.test_worklog.WorklogFrontMatterTests.test_blocked_by_resolves '
+                  '(file=\'dev/tasks/TASKS-x-do-next.md\', dep="{\'somebody\': \'a note\'}")')  # task-ref-ok: sample text
+
+        self.assertEqual(
+            _history_safe_ids([leaked]),
+            ['tests.test_worklog.WorklogFrontMatterTests.test_blocked_by_resolves'])
+
+    def test_a_multiline_suffix_is_dropped_too(self):
+        """A subTest parametrized on a multi-line value is still one id, and a regex that
+        stops at the first newline would leave the rest of it in the file."""
+        self.assertEqual(
+            _history_safe_ids(['tests.test_x.FooTests.test_y (msg=\'one\ntwo\')']),
+            ['tests.test_x.FooTests.test_y'])
+
+    def test_a_fixture_id_keeps_its_class(self):
+        """`setUpClass (tests.test_x.FooTests)` is an _ErrorHolder id, not a subTest - the
+        parenthesis names the class, which is the only useful half."""
+        self.assertEqual(_history_safe_ids(['setUpClass (tests.test_x.FooTests)']),
+                         ['setUpClass (tests.test_x.FooTests)'])
+
+    def test_a_plain_id_is_untouched(self):
+        self.assertEqual(_history_safe_ids(['tests.test_x.FooTests.test_y']),
+                         ['tests.test_x.FooTests.test_y'])
+
+    def test_truncation_collapses_subtests_of_one_test_into_one_id(self):
+        """Otherwise a test parametrized 40 ways spends the whole MAX_FAILED_IDS budget
+        saying the same thing, and order still has to be stable across shards."""
+        ids = _history_safe_ids([
+            'tests.test_x.FooTests.test_y (case=1)',
+            'tests.test_x.FooTests.test_y (case=2)',
+            'tests.test_x.FooTests.test_z',
+        ])
+
+        self.assertEqual(ids, ['tests.test_x.FooTests.test_y', 'tests.test_x.FooTests.test_z'])
+
+    def test_the_committed_history_carries_no_suffix_today(self):
+        """The file itself, not just the function - the leak that prompted this was already
+        committed, so a green function with a dirty file would still block a publish."""
+        path = os.path.join(timing._REPO, 'tests', 'timing_history.jsonl')
+        with open(path, encoding='utf-8') as fh:
+            for lineno, line in enumerate(fh, 1):
+                ids = json.loads(line).get('failed_ids') or []
+                self.assertEqual(_history_safe_ids(ids), ids,
+                                 'timing_history.jsonl:%d carries a subTest suffix' % lineno)
 
 
 class LogCaptureTests(unittest.TestCase):

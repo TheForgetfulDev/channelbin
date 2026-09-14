@@ -665,11 +665,19 @@ def score_capture_quality_correction(timeline_deficit_seconds: float, near_empty
 
 
 @retry_on_locked()
-def apply_capture_quality_correction(app, recording_id: int):
+def apply_capture_quality_correction(app, recording_id: int, analysis_completed_at=None):
     """Blend a small, second observation once postprocessing has measured timeline damage
     and near-empty/slate content - information the primary capture-phase observation
     (apply_recording_health_observation) never had, since it runs before the file is probed.
     Always called (not gated on damage found) - see score_capture_quality_correction().
+
+    `analysis_completed_at`, when given, is written to the recording in THIS function's
+    commit. It belongs here rather than in the caller because this blend is the one step of
+    the post-capture analysis phase that increments rather than recomputes, so the phase's
+    completion stamp and the blend have to land together or a crash between them lets the
+    resume blend a second time - which is how two channels ended up holding scores their own
+    observation ledger could not reproduce (dev/changelog/951). The caller owns the meaning of
+    the stamp; this function owns only its atomicity.
     """
     with app.app_context():
         from . import db
@@ -698,6 +706,8 @@ def apply_capture_quality_correction(app, recording_id: int):
         channel.health_score_sample_count = new_count
         channel.health_score_updated_at = new_updated_at
         recording.capture_quality_breakdown = json.dumps(breakdown)
+        if analysis_completed_at is not None:
+            recording.analysis_completed_at = analysis_completed_at
         db.session.commit()
 
 

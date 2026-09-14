@@ -210,6 +210,31 @@ def _failed_ids(result):
     return sorted({t.id() for t, _ in result.failures} | {t.id() for t, _ in result.errors})
 
 
+# A failing subTest's id is the test id plus whatever the assertion was parametrized on:
+# `tests.test_x.FooTests.test_y (file='dev/tasks/...', dep="...")`. Group 1 requires a dot,
+# which is what separates a dotted test id from an `_ErrorHolder`'s `setUpClass (tests.x.Y)`
+# - there the parenthesis names the class and is the useful half, so it must survive.
+_SUBTEST_ID = re.compile(r'^([\w.]+\.[\w.]+) \(.*\)$', re.DOTALL)
+
+
+def _history_safe_ids(failed_ids):
+    """Failed-test ids with any subTest parameter suffix dropped, deduplicated in order.
+
+    tests/timing_history.jsonl is committed AND published, so every byte written here is
+    published text. A subTest suffix is arbitrary - it carries whatever the test happened to
+    be parametrized on - and twice now that has been a path under `dev/tasks/` and a personal
+    name, which the leak scanner then refuses (`dev/changelog/881`, and again on 2026-09-13).
+    The bare id still answers the question the field exists for: which test failed.
+    """
+    seen = []
+    for tid in failed_ids:
+        m = _SUBTEST_ID.match(tid)
+        safe = m.group(1) if m else tid
+        if safe not in seen:
+            seen.append(safe)
+    return seen
+
+
 def _prepare_log_dir():
     """Make this run's capture directory and prune old ones. None if it cannot be made.
 
@@ -878,7 +903,10 @@ def main(argv=None):
     if failed_ids:
         # Written only on a red run, so `grep failed_ids` over the history file lists every
         # one of them. A green record carries no such key and nothing may require it.
-        record['failed_ids'] = failed_ids[:MAX_FAILED_IDS]
+        # Sanitized on the way into the file and nowhere else: the stderr lines below keep
+        # the full subTest suffix, which is what a developer debugging the red run needs,
+        # while the committed file gets only bare ids.
+        record['failed_ids'] = _history_safe_ids(failed_ids)[:MAX_FAILED_IDS]
 
     # Baseline is computed from prior runs only; this run is appended afterward so it does
     # not compare against itself. A failed run is still recorded (for history) but never

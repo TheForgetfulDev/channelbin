@@ -17,7 +17,7 @@ from ..database import (
 )
 from .. import events as ev
 from ..tz_utils import UTC, to_naive_utc, format_local, relative
-from ..accounts import get_sync_progress, sync_signature
+from ..accounts import get_sync_progress, next_sync_map, sync_signature
 from .channel_tests import get_active_run_summary
 from .recordings import _STATUS_ROW
 
@@ -360,6 +360,7 @@ def dashboard():
     return render_template(
         'dashboard.html',
         recordings=active, accounts=accounts, health_check=health_check,
+        next_sync=next_sync_map(accounts),
         live=live, upcoming=upcoming, now=now, live_stats=_live_row_stats(live, now),
         rec_status_class=REC_ROW_STATUS_CLASS,
         section_defs=DASHBOARD_SECTIONS, section_order=order, section_on=enabled,
@@ -497,6 +498,7 @@ def _activity_status_dict():
         active_rec_data.append({
             'id': r.id,
             'name': r.name,
+            'href': url_for('recordings.recording_detail', recording_id=r.id),
             'status': r.status,
             # Named, not just counted: "3 recordings" is a lie when one of them is a dead
             # stream backing off toward a reconnect. Same wording the recordings list uses.
@@ -511,6 +513,7 @@ def _activity_status_dict():
         next_sched = {
             'id': r.id,
             'name': r.name,
+            'href': url_for('recordings.recording_detail', recording_id=r.id),
             'start_et': _fmt_et(r.start_time),
             'start_relative': _relative(r.start_time),
         }
@@ -526,6 +529,10 @@ def _activity_status_dict():
     from ..channel_tester import get_status as ct_status
     ct = ct_status()
 
+    # Every row carries an `href`: the chip's tooltip renders each task as a link to the
+    # thing it is about, so a job the user can see is a job the user can reach in one click
+    # (dev/changelog/949). A task whose work has no page of its own points at the page that
+    # lists its kind - /jobs or /maintenance - never at nothing.
     bg_tasks = []
 
     # Dashboard-visible subset of bg_tasks, i.e. items that also show up as a row in a
@@ -542,7 +549,8 @@ def _activity_status_dict():
             detail = f'Testing {ch_name} ({done + 1} of {total})' if total else f'Testing {ch_name}'
         else:
             detail = f'{done} of {total} channels tested' if total else 'Starting…'
-        bg_tasks.append({'label': 'Channel health test', 'detail': detail})
+        bg_tasks.append({'label': 'Channel health test', 'detail': detail,
+                         'href': url_for('jobs.jobs_page')})
         dashboard_bg_count += 1
 
     # Account sync
@@ -555,7 +563,8 @@ def _activity_status_dict():
             detail = f"Syncing {acc.name} - {progress['done']:,} EPG entries"
         else:
             detail = f'Syncing {acc.name}'
-        bg_tasks.append({'label': 'Account sync', 'detail': detail})
+        bg_tasks.append({'label': 'Account sync', 'detail': detail,
+                         'href': url_for('accounts.account_detail', account_id=acc.id)})
         dashboard_bg_count += 1
 
     # The three post-capture phases - already counted via `live` on the Dashboard's own
@@ -569,9 +578,21 @@ def _activity_status_dict():
         recs_in_status = Recording.query.filter_by(status=status_val).all()
         for r in recs_in_status:
             detail = r.name
-            if status_val == REC_STATUS_CONVERTING:
+            # Per-row, never rebinding the loop's own `label` - a second recording in the
+            # same status would otherwise inherit the first one's parked wording.
+            row_label = label
+            if r.postprocess_waiting_since and status_val in (REC_STATUS_ANALYZING,
+                                                              REC_STATUS_CONVERTING):
+                # Parked to let another recording have the machine, so the phase labels
+                # above describe work that has stopped. Same display-only derivation the
+                # recordings list makes; the row's status is untouched (dev/changelog/954).
+                row_label = ('Conversion paused' if status_val == REC_STATUS_CONVERTING
+                             else 'Waiting to convert')
+                detail = f'{r.name} - waiting on "{r.postprocess_waiting_on_name}"'
+            elif status_val == REC_STATUS_CONVERTING:
                 detail = _converting_detail(r)
-            bg_tasks.append({'label': label, 'detail': detail})
+            bg_tasks.append({'label': row_label, 'detail': detail,
+                             'href': url_for('recordings.recording_detail', recording_id=r.id)})
             dashboard_bg_count += 1
 
     # Search index rebuild - the window between "sync complete" and "index rebuilt" (up to
@@ -579,7 +600,8 @@ def _activity_status_dict():
     # (dev/changelog/461). Not part of dashboard_bg_count: no Dashboard page section shows it.
     from ..search_index import rebuilding_index_names
     for name in rebuilding_index_names():
-        bg_tasks.append({'label': 'Search index rebuild', 'detail': f'Rebuilding {name} index'})
+        bg_tasks.append({'label': 'Search index rebuild', 'detail': f'Rebuilding {name} index',
+                         'href': url_for('system.maintenance') + '#m-index'})
 
     # The admission registry (app/admission.py) is the only record of a maintenance job -
     # retention sweeps and the daily database maintenance leave no row anywhere else, so
@@ -593,7 +615,8 @@ def _activity_status_dict():
     admission_held = describe_active()
     for kind, label, _age in admission_held:
         if kind == KIND_MAINTENANCE:
-            bg_tasks.append({'label': 'Database maintenance', 'detail': label or 'Running'})
+            bg_tasks.append({'label': 'Database maintenance', 'detail': label or 'Running',
+                             'href': url_for('system.maintenance')})
 
     bg_active = bool(bg_tasks)
 
@@ -609,13 +632,17 @@ def _activity_status_dict():
         from ..scheduler import get_scheduler
         scheduler = get_scheduler()
         if scheduler:
+            # label, and the page that job's kind is managed from - the tooltip row is a
+            # link like every other one, so each entry owns its own destination rather
+            # than every scheduled job landing on the same generic list.
             _BG_SYSTEM_NAMES = {
-                'config_backup_daily': 'Config Backup',
+                'config_backup_daily': ('Config Backup', url_for('system.maintenance')),
             }
             from ..database import OnDemandTestJob
             sys_job = OnDemandTestJob.query.filter_by(is_system=True).first()
             if sys_job:
-                _BG_SYSTEM_NAMES[f'od_job_{sys_job.id}'] = 'TV Guide Channels Health Check'
+                _BG_SYSTEM_NAMES[f'od_job_{sys_job.id}'] = (
+                    'TV Guide Channels Health Check', url_for('jobs.jobs_page'))
 
             def _bg_label(job_id):
                 if job_id in _BG_SYSTEM_NAMES:
@@ -623,25 +650,26 @@ def _activity_status_dict():
                 # Real job id is per-account (`account_sync_<id>`, or its deferred-retry
                 # sibling `account_sync_retry_<id>`) - there is no single global sync job.
                 if job_id.startswith('account_sync_'):
-                    return 'Account / EPG Sync'
+                    return ('Account / EPG Sync', url_for('accounts.accounts_list'))
                 return None
 
             cutoff = now + _BG_DIM_WINDOW
             for j in scheduler.get_jobs():
                 if j.next_run_time is None:
                     continue
-                label = _bg_label(j.id)
-                if label is None:
+                named = _bg_label(j.id)
+                if named is None:
                     continue
                 nrt_utc = to_naive_utc(j.next_run_time)
                 if nrt_utc > cutoff:
                     continue
-                future_jobs.append((nrt_utc, label))
+                future_jobs.append((nrt_utc, named[0], named[1]))
             if future_jobs:
                 future_jobs.sort(key=lambda t: t[0])
-                nrt_utc, label = future_jobs[0]
+                nrt_utc, label, href = future_jobs[0]
                 next_bg_job = {
                     'label': label,
+                    'href': href,
                     'time_et': _fmt_et(nrt_utc),
                     'relative': _relative(nrt_utc),
                 }
@@ -723,12 +751,17 @@ def nav_status():
     """
     from .system import _system_stats_dict
     from .alerts import _unread_alert_summary
+    from ..readiness import nav_summary
     return jsonify(
         stats=_system_stats_dict(),
         alerts=_unread_alert_summary(),
         activity=_activity_status_dict(),
         search=_search_readiness_dict(),
         account_sync=sync_signature(),
+        # Cached for 30s inside nav_summary(), and never able to run an on-demand check -
+        # a poll that spawned a process or opened a provider connection would be the exact
+        # thing the Readiness card refuses to do on page load (dev/changelog/950).
+        readiness=nav_summary(),
     )
 
 
