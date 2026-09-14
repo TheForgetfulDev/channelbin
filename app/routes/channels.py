@@ -515,15 +515,20 @@ def _build_channel_timeline(channel_id):
     that silently disagrees with the score is the unexplainable number this app exists to
     avoid. One query for the whole set, not one per row.
     """
-    from ..health_recompute import (excluded_keys, SOURCE_CAPTURE_CORRECTION, SOURCE_FAILOVER,
+    from ..health_recompute import (excluded_keys, SOURCE_CAPTURE_CORRECTION,
+                                    SOURCE_FAILOVER, SOURCE_FAST_DELIVERY, SOURCE_PLACEHOLDER,
                                     SOURCE_RECORDING, SOURCE_STALL_DEMOTION, SOURCE_TEST)
     from ..database import (CHANNEL_FAILOVER_HEALTH_OBSERVATION,
+                            CHANNEL_PLACEHOLDER_HEALTH_OBSERVATION,
+                            CHANNEL_FAST_DELIVERY_HEALTH_OBSERVATION,
                             CHANNEL_STALL_DEMOTION_HEALTH_OBSERVATION)
 
     excluded = excluded_keys(channel_id)
     event_source_kind = {
         CHANNEL_FAILOVER_HEALTH_OBSERVATION: SOURCE_FAILOVER,
         CHANNEL_STALL_DEMOTION_HEALTH_OBSERVATION: SOURCE_STALL_DEMOTION,
+        CHANNEL_PLACEHOLDER_HEALTH_OBSERVATION: SOURCE_PLACEHOLDER,
+        CHANNEL_FAST_DELIVERY_HEALTH_OBSERVATION: SOURCE_FAST_DELIVERY,
     }
     entries = []
     for t in ChannelTest.query.filter_by(channel_id=channel_id).all():

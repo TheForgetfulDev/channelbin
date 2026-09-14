@@ -270,7 +270,7 @@
     buildModal({
       title: 'Restart the service?',
       body: `<p>Restart the ChannelBin service now? Active page connections will briefly drop.</p>
-             <p class="text-muted">The server refuses while a capture, concatenation, conversion,
+             <p class="text-muted">The server refuses while a capture, join, conversion,
              search index rebuild, health check, channel test or account sync is running, and
              will say what is blocking it.</p>`,
       footer: [

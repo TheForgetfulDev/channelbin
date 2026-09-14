@@ -57,9 +57,12 @@ SOURCE_RECORDING = 'recording'
 SOURCE_CAPTURE_CORRECTION = 'capture_correction'
 SOURCE_FAILOVER = 'failover'
 SOURCE_STALL_DEMOTION = 'stall_demotion'
+SOURCE_PLACEHOLDER = 'placeholder'
+SOURCE_FAST_DELIVERY = 'fast_delivery'
 
 SOURCE_KINDS = (SOURCE_TEST, SOURCE_RECORDING, SOURCE_CAPTURE_CORRECTION,
-                SOURCE_FAILOVER, SOURCE_STALL_DEMOTION)
+                SOURCE_FAILOVER, SOURCE_STALL_DEMOTION, SOURCE_PLACEHOLDER,
+                SOURCE_FAST_DELIVERY)
 
 
 class Observation:
@@ -131,6 +134,8 @@ def observation_ledger(channel_id, cfg) -> List[Observation]:
     """
     from .database import (ChannelEvent, ChannelTest, Recording,
                            CHANNEL_FAILOVER_HEALTH_OBSERVATION,
+                           CHANNEL_PLACEHOLDER_HEALTH_OBSERVATION,
+                           CHANNEL_FAST_DELIVERY_HEALTH_OBSERVATION,
                            CHANNEL_STALL_DEMOTION_HEALTH_OBSERVATION)
     from .tz_utils import format_local
 
@@ -193,6 +198,10 @@ def observation_ledger(channel_id, cfg) -> List[Observation]:
         CHANNEL_FAILOVER_HEALTH_OBSERVATION: (SOURCE_FAILOVER, 'Failed over away from this channel'),
         CHANNEL_STALL_DEMOTION_HEALTH_OBSERVATION: (SOURCE_STALL_DEMOTION,
                                                     'Moved off this channel for stalling'),
+        CHANNEL_PLACEHOLDER_HEALTH_OBSERVATION: (SOURCE_PLACEHOLDER,
+                                                 'Served a provider placeholder clip'),
+        CHANNEL_FAST_DELIVERY_HEALTH_OBSERVATION: (SOURCE_FAST_DELIVERY,
+                                                   'Delivered faster than real time'),
     }
     events = (ChannelEvent.query
               .filter(ChannelEvent.channel_id == channel_id,

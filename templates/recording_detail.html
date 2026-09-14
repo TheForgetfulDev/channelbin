@@ -29,7 +29,7 @@
       <button class="btn tip-plain" data-act="extend" data-tip="Push the stop time 30 minutes later.">+30 min</button>
       <button class="btn tip-plain" data-act="pause" data-tip="Pause capturing, keep the recording open.&#10;ffmpeg stops and the connection slot is freed; Resume later.&#10;The paused span becomes a gap in the output.">&#9208; Pause</button>
       {% endif %}
-      <button class="btn btn-danger tip-plain" data-act="stop" data-tip="End the recording now, for good.&#10;Capture stops and the segments are concatenated into the final file.&#10;Can't be resumed.">&#9632; Stop</button>
+      <button class="btn btn-danger tip-plain" data-act="stop" data-tip="End the recording now, for good.&#10;Capture stops and the segments are joined into the final file.&#10;Can't be resumed.">&#9632; Stop</button>
       <div class="menu-wrap">
         <button class="btn btn-icon" data-menu>&#8943;</button>
         <div class="menu">
@@ -76,7 +76,7 @@
       {% if ts_source_available %}
       <button class="btn btn-primary" data-act="retry-convert">Retry conversion</button>
       {% elif segment_files_on_disk %}
-      <button class="btn btn-primary" data-act="retry-concat">Retry concatenation</button>
+      <button class="btn btn-primary" data-act="retry-concat">Retry join</button>
       {% endif %}
       <a class="btn" href="{{ find_airing_url }}">&#8635; Record again</a>
       <div class="menu-wrap">
@@ -87,7 +87,7 @@
           <button class="menu-item" data-copy="{{ rec.url }}">Copy stream URL</button>
           {% if rec.output_path %}<button class="menu-item" data-copy="{{ rec.output_path }}">Copy output path</button>{% endif %}
           {% if not ts_source_available and not segment_files_on_disk %}
-          <button class="menu-item" data-act="retry-concat">Retry concatenation</button>
+          <button class="menu-item" data-act="retry-concat">Retry join</button>
           {% endif %}
           <div class="sep"></div>
           <button class="menu-item danger" data-act="delete">Delete recording</button>
@@ -119,7 +119,7 @@
           <a href="{{ url_for('logs.logs_page') }}">View log lines</a>
           <button class="menu-item" data-secs-open>Customize sections...</button>
           <button class="menu-item" data-copy="{{ rec.url }}">Copy stream URL</button>
-          {% if rec.status == 'CONCATENATING' %}<button class="menu-item" data-act="retry-concat">Retry concatenation</button>{% endif %}
+          {% if rec.status == 'CONCATENATING' %}<button class="menu-item" data-act="retry-concat">Retry join</button>{% endif %}
           {% if rec.status == 'CONVERTING' and ts_source_available %}<button class="menu-item" data-act="retry-convert">Retry conversion</button>{% endif %}
         </div>
       </div>
@@ -189,7 +189,7 @@
        the recovery action staying hidden behind it. #}
     {% set recover_act = 'retry-convert' if ts_source_available else ('retry-concat' if segment_files_on_disk else none) %}
     {% if recover_act %}
-    <button class="btn btn-primary" data-act="{{ recover_act }}">{{ 'Retry conversion' if recover_act == 'retry-convert' else 'Retry concatenation' }}</button>
+    <button class="btn btn-primary" data-act="{{ recover_act }}">{{ 'Retry conversion' if recover_act == 'retry-convert' else 'Retry join' }}</button>
     {% endif %}
     <a class="btn" href="{{ find_airing_url }}">&#8635; Record again</a>
     {% if not recover_act %}<button class="btn btn-danger" data-act="delete">Delete</button>{% endif %}
@@ -201,7 +201,7 @@
         <button class="menu-item" data-copy="{{ rec.url }}">Copy stream URL</button>
         {% if rec.output_path %}<button class="menu-item" data-copy="{{ rec.output_path }}">Copy output path</button>{% endif %}
         {% if not recover_act %}
-        <button class="menu-item" data-act="retry-concat">Retry concatenation</button>
+        <button class="menu-item" data-act="retry-concat">Retry join</button>
         {% else %}
         <div class="sep"></div>
         <button class="menu-item danger" data-act="delete">Delete recording</button>
@@ -230,7 +230,7 @@
         <a href="{{ url_for('logs.logs_page') }}">View log lines</a>
         <button class="menu-item" data-secs-open>Customize sections...</button>
         <button class="menu-item" data-copy="{{ rec.url }}">Copy stream URL</button>
-        {% if rec.status == 'CONCATENATING' %}<button class="menu-item" data-act="retry-concat">Retry concatenation</button>{% endif %}
+        {% if rec.status == 'CONCATENATING' %}<button class="menu-item" data-act="retry-concat">Retry join</button>{% endif %}
         {% if rec.status == 'CONVERTING' and ts_source_available %}<button class="menu-item" data-act="retry-convert">Retry conversion</button>{% endif %}
       </div>
     </div>
@@ -286,9 +286,30 @@
   <span>{{ row.rel }}</span>
 </div>
 {% elif rec.status == 'CONCATENATING' %}
+{# Two states share this status and they are not the same thing. A join with an ffmpeg
+   running reports what it has written; one still queued behind another recording
+   (serialize_concat) has not started and says so, rather than showing a 0% that never
+   moves. The count is joinable_count, never rec.segments|length - see
+   routes/recordings.py::_join_strip_context. Server-rendered; CONCATENATING is not
+   is_active, so the page's 15s status-strip swap is what advances it - no SSE, one
+   updater per region. #}
 <div class="live-strip concat-strip">
   <span class="pulse"></span>
-  <span>Capture finished - <b>{{ rec.segments | length }} segment{{ '' if rec.segments | length == 1 else 's' }}</b> being joined into the final file. This usually takes a few minutes.</span>
+  {% if concat_prog %}
+  <span>Joining <b>{{ joinable_count }} segment{{ '' if joinable_count == 1 else 's' }}</b> into the final file</span>
+  {% if concat_prog.pct is not none %}
+  <span class="sep-dot">·</span>
+  <span><b>{{ concat_prog.pct | round(0) | int }}%</b></span>
+  {% endif %}
+  <span class="sep-dot">·</span>
+  <span><b>{{ concat_prog.joined }} of {{ concat_prog.of }}</b> joined</span>
+  <span class="sep-dot">·</span>
+  <span>elapsed <span class="mono">{{ concat_prog.elapsed_seconds | duration(true) }}</span></span>
+  <span class="sep-dot">·</span>
+  <span>{% if concat_prog.eta_seconds is not none %}~{{ concat_prog.eta_seconds | duration(true) }} left{% else %}estimating time left{% endif %}</span>
+  {% else %}
+  <span>Capture finished - <b>{{ joinable_count }} segment{{ '' if joinable_count == 1 else 's' }}</b> waiting to be joined into the final file. The join starts as soon as the machine is free.</span>
+  {% endif %}
 </div>
 {% elif rec.status == 'ANALYZING' and rec.postprocess_waiting_since %}
 {# Parked before the conversion starts. The analysis itself has already finished by the time
@@ -304,10 +325,28 @@
 {% elif rec.status == 'ANALYZING' %}
 {# The long one, and the reason this status exists: two whole-file reads that scale with
    size (~124s each on a 17.9 GB capture). Naming the size is what makes a wait that looks
-   stuck read as work instead - the file is already complete on disk by this point. #}
+   stuck read as work instead - the file is already complete on disk by this point. A pass
+   that is actually reading says which one it is and how far it has got, from the bytes its
+   own ffprobe has read; an ANALYZING row with no pass reading keeps the sentence below,
+   because "no pass running" and "a pass at 0%" are different facts
+   (postprocessor.analysis_progress, dev/changelog/960). Server-rendered: ANALYZING is not
+   is_active, so the page's 15s status-strip swap is what advances it - no SSE, one updater
+   per region. #}
 <div class="live-strip concat-strip">
   <span class="pulse"></span>
+  {% if analysis_prog %}
+  <span>Checking the joined file{% if rec.final_file_size %} (<b>{{ rec.final_file_size | filesize }}</b>){% endif %} for damage</span>
+  <span class="sep-dot">·</span>
+  <span><b>{{ analysis_prog.pass_label }}</b>{% if analysis_prog.of_passes > 1 %} (pass {{ analysis_prog.pass_number }} of {{ analysis_prog.of_passes }}){% endif %}</span>
+  {% if analysis_prog.pct is not none %}
+  <span class="sep-dot">·</span>
+  <span><b>{{ analysis_prog.pct | round(0) | int }}%</b> read</span>
+  {% endif %}
+  <span class="sep-dot">·</span>
+  <span>elapsed <span class="mono">{{ analysis_prog.elapsed_seconds | duration(true) }}</span></span>
+  {% else %}
   <span>Segments joined - the recorded file{% if rec.final_file_size %} (<b>{{ rec.final_file_size | filesize }}</b>){% endif %} is being checked for damage before conversion. This reads the whole file, so it takes longer on a large recording.</span>
+  {% endif %}
 </div>
 {% elif rec.status == 'CONVERTING' and rec.postprocess_waiting_since %}
 {# Parked mid-encode. The ffmpeg is SIGSTOPped, so the ETA below is frozen rather than
@@ -344,7 +383,11 @@
 {% elif rec.status == 'COMPLETED' %}
 <div class="live-strip done-strip">
   <span class="fx">&#10003;</span>
-  <span>Concatenated <b>{{ rec.segments | length }} segment{{ '' if rec.segments | length == 1 else 's' }}</b>{% if rec.final_file_size %} &rarr; <b>{{ rec.final_file_size | filesize }}</b>{% endif %}</span>
+  {# joinable_count, not rec.segments|length: a successful concat consumes its segments, so
+     this is counted from the rows that were actually fed to it (the files are gone). The
+     row count includes zero-byte segments and discarded placeholders, which is how a join
+     of 16 used to describe itself as 19 here and on the strip above. #}
+  <span>Joined <b>{{ joinable_count }} segment{{ '' if joinable_count == 1 else 's' }}</b>{% if rec.final_file_size %} &rarr; <b>{{ rec.final_file_size | filesize }}</b>{% endif %}</span>
   {% if rec.completed_at %}
   <span class="sep-dot">·</span>
   <span>finished <span class="mono">{{ rec.completed_at | local_time_sec }}</span></span>
@@ -359,15 +402,16 @@
      (dev/docs/BUGS.md 2026-08-24). ts_source_available / segment_files_on_disk are
      stat'ed by the route; the template cannot reach the filesystem. #}
   <span>Failed{% if rec.completed_at %} at <b>{{ rec.completed_at | local_time_sec }}</b>{% endif %} -
-    {% if rec.failure_reason == 'DEAD_STREAM_DETECTED' %}the stream reconnected but immediately died each time, so it was aborted automatically rather than looping forever
+    {% if rec.failure_reason == 'FAST_DELIVERY_DETECTED' %}the feed kept delivering video faster than real time, which means it was not showing live content, and there was no other channel to record from instead
+    {%- elif rec.failure_reason == 'DEAD_STREAM_DETECTED' %}the stream reconnected but immediately died each time, so it was aborted automatically rather than looping forever
     {%- elif rec.consecutive_failures_peak > 0 %}<b>{{ rec.consecutive_failures_peak }} consecutive restart attempts</b> produced no data (max consecutive failures reached)
-    {%- elif ts_source_available %}the capture finished and was concatenated, but post-processing did not complete
-    {%- elif segment_files_on_disk %}the capture recorded data, but it was never concatenated into a finished file
+    {%- elif ts_source_available %}the capture finished and its segments were joined, but post-processing did not complete
+    {%- elif segment_files_on_disk %}the capture recorded data, but it was never joined into a finished file
     {%- else %}the stream could not be reached before producing any segments{% endif %}</span>
   <span class="sep-dot">·</span>
   <span>
-    {%- if ts_source_available %}the concatenated <b>.ts</b> is still on disk - use <b>Retry conversion</b> to finish it
-    {%- elif segment_files_on_disk %}segments kept on disk - use <b>Retry concatenation</b> to finish it
+    {%- if ts_source_available %}the joined <b>.ts</b> is still on disk - use <b>Retry conversion</b> to finish it
+    {%- elif segment_files_on_disk %}segments kept on disk - use <b>Retry join</b> to finish it
     {%- else %}nothing was captured - use <b>Record again</b> to reschedule{% endif %}</span>
 </div>
 {% elif rec.status == 'ABORTED' %}
@@ -388,6 +432,7 @@
    as the old panel (cluster_window); rendering is the compact 3.8 bar. #}
 {% set timeline_label = {
   'STALL_DETECTED': 'Stall',
+  'FAST_DELIVERY_DETECTED': 'Faster than live',
   'RESTART_SUCCEEDED': 'Restart',
   'RESTART_FAILED': 'Restart failed',
   'CAPTURE_COMPLETE': 'Stop time reached',
@@ -404,6 +449,7 @@
 } %}
 {% set event_dot = {
   'STALL_DETECTED': 'stall',
+  'FAST_DELIVERY_DETECTED': 'fail',
   'RESTART_SUCCEEDED': 'restart',
   'RESTART_FAILED': 'fail',
   'SEGMENT_STARTED': 'start',
@@ -486,7 +532,8 @@
          deliberately NOT in the list: a segment abandoned by group failover is closed by
          _close_active_segment, which emits SEGMENT_ENDED rather than STALL_DETECTED, so
          the boundary marker is the only thing that marks it. #}
-      {% if prev.exit_reason not in ('STALL_KILLED', 'PROCESS_EXITED', 'RESTART_NO_DATA') and seg.started_at %}
+      {% if prev.exit_reason not in ('STALL_KILLED', 'PROCESS_EXITED', 'RESTART_NO_DATA',
+                                     'FAST_DELIVERY_KILLED') and seg.started_at %}
         {% set _ = ns_ms.items.append({'ts': seg.started_at, 'kind': 'neutral', 'label': 'Segment boundary', 'prio': 1, 'silent': False}) %}
       {% endif %}
     {% endif %}
@@ -703,7 +750,21 @@
         {{ stat_row('Content vs capture time',
                     ('%+d' | format(rec.content_vs_capture_seconds | round | int)) ~ 's' ~ ('' if vs_pct is none else ' (%+.0f%%)' | format(vs_pct)),
                     sv_cls=('warn' if vs_pct and vs_pct | abs >= 2 else 'ok'),
-                    tip='How much more (+) or less (-) content came back than the ' ~ (rec.covered_capture_seconds | int | duration(with_seconds=true)) ~ ' the capture actually ran for. The content length is ' ~ vs_basis ~ '.\nA plus means content arrived faster than real time. Providers that buffer serve the last few seconds again when a dropped connection is re-established, so a recording with many restarts collects that surplus once per restart - it is very often duplicated video, but nothing here compares frames, so this stat does not claim it.\nA minus means the feed stayed connected and delivered less than real time.') }}
+                    tip='How much more (+) or less (-) content came back than the ' ~ (rec.covered_capture_seconds | int | duration(with_seconds=true)) ~ ' the capture actually ran for. The content length is ' ~ vs_basis ~ '.\nA plus means content arrived faster than real time, which means the provider already had it. Two causes look identical here: a buffer replayed when a dropped connection is re-established, which lands a fixed 13-29s once per restart, or a feed re-serving the same stretch of video over and over, which runs ahead without limit. Nothing here compares frames, so this stat names neither - the Segments list below flags the individual segments that ran far enough ahead to be worth checking.\nA minus means the feed stayed connected and delivered less than real time.') }}
+        {% endif %}
+        {% if rec.discarded_segment_count %}
+        {{ stat_row('Discarded segments',
+                    rec.discarded_segment_count ~ ' segment' ~ ('' if rec.discarded_segment_count == 1 else 's')
+                    ~ ' (' ~ ((rec.discarded_seconds | int) | duration(with_seconds=true)) ~ ' of placeholder video)',
+                    sv_cls='warn',
+                    tip='Segment(s) that held the provider\'s "channel offline" placeholder clip rather than the channel, so they were thrown away instead of being joined into the final file. Detected by how fast the content arrived: a finite clip drains in a few seconds and then the feed closes itself, which a live stream never does.\nTheir wall clock counts toward Capture gaps above, because nothing was being captured during them.') }}
+        {% endif %}
+        {% if rec.fast_delivery_segment_count %}
+        {{ stat_row('Arrived faster than real time',
+                    rec.fast_delivery_segment_count ~ ' segment' ~ ('' if rec.fast_delivery_segment_count == 1 else 's')
+                    ~ ' (' ~ ((rec.fast_delivery_seconds | int) | duration(with_seconds=true)) ~ ' of the file)',
+                    sv_cls='warn',
+                    tip='Segment(s) holding far more video than the seconds they ran for. Video that arrives ahead of the clock is video the provider already had: it may be buffered content served after a reconnect, or the same stretch served over and over while the feed appeared healthy.\nThese segments were kept and joined into the file - unlike a discarded placeholder, there is real content here and no way to tell from length alone which parts are which. Worth watching a few minutes of before you rely on the recording.\nThe seconds are how much of the finished file came from those segments, not how much of it is wrong.') }}
         {% endif %}
         {% if rec.near_empty_segment_count %}
         {{ stat_row('Near-empty segments',
@@ -734,12 +795,19 @@
   'STALL_KILLED':             ('warn', 'The file stopped growing. The watchdog killed ffmpeg and started a new segment after the restart delay.'),
   'PROCESS_EXITED':           ('warn', 'ffmpeg exited on its own - ChannelBin did not kill it. The watchdog noticed within a poll and started a new segment after the restart delay. The exit code beside this pill is ffmpeg\'s own reason.'),
   'RESTART_NO_DATA':          ('bad',  'This segment was a restart attempt and it never produced a byte. The watchdog closed it the moment the reconnect wait ran out, instead of spending a second stall timeout proving the same thing again.'),
+  'FAST_DELIVERY_KILLED':     ('bad',  'The feed kept delivering video faster than real time for a sustained stretch, so it was not showing live content. Usually that means the provider was re-serving the same few seconds over and over, though ChannelBin measures the delivery rate rather than the picture. The watchdog stopped this capture rather than let it keep filling the recording.'),
   'ERROR':                    ('bad',  'Restart attempt produced no data. ffmpeg reconnected but the new segment stayed empty, so the watchdog killed it.'),
   'MANUAL_CANCEL':            ('na',   'The recording was cancelled manually.'),
   'MANUAL_STOP':              ('na',   'The recording was stopped manually.'),
   'MANUAL_PAUSE':             ('na',   'The recording was paused.'),
   'SERVICE_RESTART':          ('na',   'The segment was closed because the service restarted.'),
   'TEARDOWN_RACE':            ('na',   'This segment was starting at the exact moment the recording was torn down, so it captured nothing. Its file was deleted and the row was closed rather than left open.'),
+} %}
+{# Why a row was kept out of the final file. Keyed on RecordingSegment.excluded_reason, which
+   is a different question from the exit pill above (how the segment ended) and reads beside
+   it rather than instead of it. #}
+{% set discard_tip = {
+  'PROVIDER_PLACEHOLDER': 'Discarded: this segment held the provider\'s "channel offline" placeholder clip, not the channel. It delivered far more content than the seconds it ran for and then the feed closed itself, which a live stream never does. It was not joined into the final file, and its file was deleted with the others.',
 } %}
 <div id="panel-segments-slot" data-sec="segs">
 {% if rec.segments %}
@@ -764,17 +832,31 @@
           {% set seg_secs = ((seg.ended_at or now) - seg.started_at).total_seconds() if seg.started_at else none %}
           <td class="num">{{ (seg_secs | int) | duration(with_seconds=true) if seg_secs is not none else '-' }}</td>
           {# How much content the finished segment file holds, against the Duration beside it
-             (its wall clock). A plus is content that arrived faster than real time - a
-             provider replaying its buffer after a reconnect is the measured cause here, and
-             it lands once per restart. NULL on every segment captured before this was
-             measured at concat time, and on any file ffprobe could not read. #}
+             (its wall clock). A plus is content that arrived faster than real time, which
+             means the provider already had it: a buffer replayed after a reconnect lands a
+             fixed 13-29s once per restart, while a feed re-serving the same stretch runs
+             ahead without limit. Length alone cannot tell those apart and nothing here
+             compares frames, so neither the delta nor its tooltip names a cause
+             (dev/changelog/966). NULL on every segment captured before this was measured at
+             concat time, and on any file ffprobe could not read. #}
           <td class="num xtra">{% if seg.content_duration_seconds is none %}<span class="muted tip-plain" data-tip="Not measured. Segments captured before ChannelBin recorded a per-segment content length are not backfilled - the .ts files are deleted after conversion, so there is nothing left to probe.">-</span>{% else %}{{ (seg.content_duration_seconds | int) | duration(with_seconds=true) }}{% if seg_secs %}
             {% set seg_delta = seg.content_duration_seconds - seg_secs %}
-            <span class="exit-code{{ ' bad' if seg_delta < -1 else '' }} tip-plain" data-tip="This segment holds {{ (seg.content_duration_seconds | int) | duration(with_seconds=true) }} of content but ran for {{ (seg_secs | int) | duration(with_seconds=true) }} of wall clock.">{{ '%+d' | format(seg_delta | round | int) }}s</span>
+            {% set seg_ratio = seg.content_duration_seconds / seg_secs %}
+            <span class="exit-code{{ ' bad' if seg_delta < -1 else '' }} tip-plain" data-tip="This segment holds {{ (seg.content_duration_seconds | int) | duration(with_seconds=true) }} of content but ran for {{ (seg_secs | int) | duration(with_seconds=true) }} of wall clock{% if (seg_ratio - 1) | abs >= 0.05 %} - {{ '%.2f' | format(seg_ratio) }}x real time{% endif %}.">{{ '%+d' | format(seg_delta | round | int) }}s</span>
             {% endif %}{% endif %}</td>
           <td class="num">{{ seg.bytes_recorded | filesize if seg.bytes_recorded else '0 B' }}</td>
           <td class="num xtra">{% if seg.bytes_recorded and seg_secs and seg_secs > 10 %}{{ '%.1f' | format(seg.bytes_recorded * 8 / seg_secs / 1000000) }} Mb/s{% else %}<span class="muted">-</span>{% endif %}
-            {% if seg.near_empty %}<span class="badge b-warn tip-plain" data-tip="This segment's bitrate is far below the recording's own average - likely a blank/slate screen or error card, even though the timeline itself is clean.">slate?</span>{% endif %}</td>
+            {% if seg.near_empty %}<span class="badge b-warn tip-plain" data-tip="This segment's bitrate is far below the recording's own average - likely a blank/slate screen or error card, even though the timeline itself is clean.">slate?</span>{% endif %}
+            {# Shown rather than hidden: a discarded segment is a thing the app DID, and a row
+               quietly missing from this table is how the whole defect stayed invisible in the
+               first place (dev/changelog/957). Distinct from the slate? badge beside it - that
+               one flags a segment that was kept. #}
+            {% if seg.excluded %}<span class="badge badge-danger tip-plain" data-tip="{{ discard_tip.get(seg.excluded_reason, 'This segment was discarded and not joined into the final file.') }}">discarded</span>{% endif %}
+            {# Kept, unlike a discarded placeholder: there is real content here and no way to
+               tell from length which parts are which, so it is labelled rather than thrown
+               away. A segment like this never stalls, so this badge is the only thing on the
+               row that says the capture was not clean. #}
+            {% if seg.segment_number in fast_delivery_segs %}<span class="badge b-warn tip-plain" data-tip="This segment delivered far more video than the seconds it ran for. Video arriving ahead of the clock is video the provider already had - buffered content served after a reconnect, or the same stretch served over and over. Nothing here compares frames, so this does not say which. Worth checking this part of the recording.">fast</span>{% endif %}</td>
           <td class="num xtra">{{ seg.stall_count or 0 }}</td>
           <td>
             {% if seg.ended_at is none and rec.status in ('IN_PROGRESS', 'PAUSED', 'RETRYING') %}
@@ -831,7 +913,8 @@
   'STALL_DETECTED': 'warn', 'RESTART_FAILED': 'warn', 'RECORDING_STOPPED_EARLY': 'warn',
   'RECORDING_ABORTED': 'warn', 'SEEK_DAMAGE_DETECTED': 'warn', 'RECORDING_RETRY_SCHEDULED': 'warn',
   'RECORDING_START_DEFERRED': 'warn', 'CONVERSION_YIELDED': 'warn',
-  'CAPTURE_LOST_TO_OUTAGE': 'warn',
+  'CAPTURE_LOST_TO_OUTAGE': 'warn', 'SEGMENT_DISCARDED': 'warn',
+  'FAST_DELIVERY_DETECTED': 'warn',
   'CONVERSION_RESTARTED': 'info', 'DIAGNOSTICS': 'info',
   'POSTCAPTURE_ANALYSIS_STARTED': 'info', 'POSTCAPTURE_ANALYSIS_SKIPPED': 'info',
   'MIXED_FRAME_RATE_DETECTED': 'info',
@@ -980,14 +1063,14 @@ window.onScheduleSaved = () => window.location.reload();
       }).then(() => { window.location = '/'; return null; }),
     },
     'retry-concat': {
-      title: 'Retry concatenation',
-      body: 'Concatenation will run again over the segments on disk. Make sure there is enough free disk space.',
+      title: 'Retry join',
+      body: 'The join will run again over the segments on disk. Make sure there is enough free disk space.',
       verb: 'Retry', danger: false,
       run: () => postForm(`/recordings/${RID}/retry-concat`),
     },
     'retry-convert': {
       title: 'Retry conversion',
-      body: 'Conversion runs again from the concatenated .ts file on disk, overwriting any partial output. A conversion that is genuinely still running is refused.',
+      body: 'Conversion runs again from the joined .ts file on disk, overwriting any partial output. A conversion that is genuinely still running is refused.',
       verb: 'Retry', danger: false,
       run: () => postForm(`/recordings/${RID}/retry-convert`),
     },

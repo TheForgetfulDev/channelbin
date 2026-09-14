@@ -5,6 +5,47 @@ Notable changes to ChannelBin, newest first. This project follows
 release is tagged `v<version>` in git, and the version the app is running is shown in the
 page footer.
 
+## 0.9.0 - 2026-09-14
+
+**Added**
+
+- A feed that freezes or loops is now caught while the recording is still running. ChannelBin
+  watches how much video is arriving against how much time is passing, and stops a capture that
+  has been running faster than real time, rather than letting it fill hours with one repeated
+  lap of the same content.
+- The two phases that used to look hung now report progress. Joining a recording's segments
+  shows percent, how many segments have been joined, elapsed time and an estimate; the
+  post-capture analysis names which pass is reading and how far through the file it has got.
+  Both appear on the recording, in the recordings list and on the Dashboard.
+- A finished segment that delivered more video than the time it ran for is named in plain
+  language on the recording's timeline and flagged on the recording itself. Nothing is thrown
+  away - it is there to be judged before you sit down to watch.
+
+**Fixed**
+
+- Some providers answer a dead channel with a finite black "channel offline" clip instead of
+  dropping the connection. ChannelBin recorded it: the clip drained in seconds, looked like an
+  ordinary restart, and was fetched and joined again and again, putting hours of black in the
+  middle of a recording. Such a segment is now recognized, kept out of the join and out of every
+  coverage figure, reported loudly on the recording, and counted against the channel that served
+  it. A health check spots the same thing.
+- A provider that stopped sending bytes while holding the connection open cost a killed capture,
+  a fresh connection and a new segment. The capture now times the dead socket out and reconnects
+  inside the same segment, and reports how many times it had to.
+- A health check that failed while probing a provider's offline placeholder was defining that
+  channel's format, which filtered the channel out of every recording in its group. Only a
+  completed check now sets a channel's format, and a group member row that shows one check's
+  numbers while judging on another says which check it used.
+- Damage detection weighted each segment by how long it took to arrive rather than by how much
+  video it holds, so recordings that arrived faster than real time were reported damaged and
+  sent into full re-encodes.
+- The same recording could read "Joining" on one page and "Concatenating" on another. Every
+  surface now uses one name per status.
+- A second app start-up deleted the capture log of a recording that was already running, so the
+  reason a segment ended could be lost with nothing saying so. Only the process that owns
+  startup recovery sweeps those logs now, and a lost log is reported on the recording instead of
+  looking like silence.
+
 ## 0.8.0 - 2026-09-14
 
 **Added**

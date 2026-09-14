@@ -2,6 +2,7 @@
 import glob
 import logging
 import os
+import re
 import signal
 import subprocess
 import time
@@ -53,6 +54,39 @@ def build_capture_cmd(cfg: dict, url: str, output_path: str, duration_seconds: i
     if url.startswith(('http://', 'https://')):
         cmd += ['-user_agent', cfg.get('http', {}).get('user_agent',
                                                        'VLC/3.0.18 LibVLC/3.0.18')]
+        # Bound every individual read so a provider that stops sending WITHOUT closing the
+        # socket cannot block ffmpeg forever. Two things depend on this, both measured on
+        # this box (dev/changelog/958):
+        #   * ffmpeg's first SIGTERM only sets a flag the demuxer checks BETWEEN reads, so a
+        #     read blocked on a silent socket never reaches it. Without a timeout the
+        #     watchdog's SIGTERM did nothing for the full 5s grace and terminate_or_kill()
+        #     had to SIGKILL (rc -9); with it, ffmpeg exited on its own 2.2s after the
+        #     signal, 'Exiting normally, received signal 15'.
+        #   * The timeout is what lets ffmpeg's own reconnect fire at all on a silent
+        #     socket, so the stall is repaired INSIDE the segment - no kill, no restart
+        #     delay, no new segment, no new connection to the provider, no join boundary.
+        #
+        # HLS gets it too, unlike the reconnect flags above it in this function: is_hls_url
+        # excludes those because an HLS playlist GET returns EOF by design, which is not a
+        # read that hangs. Measured over six real .m3u8 channels, with and without: byte
+        # counts, exit codes and wall clock were the same either way.
+        #
+        # Seconds in config, MICROSECONDS on the wire - a value passed in seconds would be a
+        # 1,000,000x error that reconnects continuously. 0 disables it.
+        #
+        # The cost, stated because it is real: -rw_timeout bounds the FIRST read too, and
+        # ffmpeg does not reconnect out of a timed-out open - it fails the input. A provider
+        # slower than this to send its first byte therefore fails the segment rather than
+        # waiting, where today it would be tolerated until watchdog.stall_timeout_seconds.
+        # The default is set against measurement rather than taste: the first byte arrived
+        # in 0.25-1.26s on all four of this install's accounts.
+        #
+        # Emitted BEFORE extra_input_args for the same reason -user_agent is: ffmpeg takes
+        # the last occurrence of a repeated option, so a user setting their own -rw_timeout
+        # there still overrides this one.
+        read_timeout = cfg['ffmpeg'].get('read_timeout_seconds', 0)
+        if read_timeout and read_timeout > 0:
+            cmd += ['-rw_timeout', str(int(read_timeout * 1_000_000))]
     cmd += cfg['ffmpeg'].get('extra_input_args', [])
     if url.startswith(('http://', 'https://')) and not is_hls_url(url):
         cmd += ['-reconnect', '1', '-reconnect_streamed', '1',
@@ -82,6 +116,42 @@ def build_capture_cmd(cfg: dict, url: str, output_path: str, duration_seconds: i
     cmd += cfg['ffmpeg'].get('extra_output_args', [])
     cmd += ['-c', 'copy', '-y', output_path]
     return cmd
+
+
+def read_timeout_is_inert(cfg: dict):
+    """(inert, read_timeout, stall_timeout) for the ffmpeg.read_timeout_seconds setting.
+
+    Inert means the watchdog kills a stalled capture at or before the moment ffmpeg's own
+    read timeout would have fired, so the timeout never gets to do the one thing it is for.
+    The setting is still emitted - this is a warning, not a veto - because the two numbers
+    are the user's to choose and a shorter stall timeout is a legitimate thing to want.
+    A disabled (0) read timeout is not inert; it is off on purpose.
+    """
+    read_timeout = cfg.get('ffmpeg', {}).get('read_timeout_seconds', 0) or 0
+    stall_timeout = cfg.get('watchdog', {}).get('stall_timeout_seconds', 0) or 0
+    inert = bool(read_timeout > 0 and stall_timeout > 0 and read_timeout >= stall_timeout)
+    return inert, read_timeout, stall_timeout
+
+
+def report_read_timeout_state(cfg: dict, source: str) -> bool:
+    """Log - once per observation - when the read timeout cannot fire before the watchdog
+    kills the capture. Returns whether it was inert, so a caller can say so too.
+
+    Called from the same two kinds of place as app/auth.py::report_gate_state: once at
+    startup, and again whenever a settings save moves either of the two numbers. Deliberately
+    a log line rather than an alert or a rejected save - the combination degrades to the old
+    behavior rather than breaking anything, and both values have legitimate settings that
+    collide (read_timeout 0 to disable, or a deliberately short stall timeout).
+    """
+    inert, read_timeout, stall_timeout = read_timeout_is_inert(cfg)
+    if inert:
+        log.warning(
+            'ffmpeg.read_timeout_seconds is %s but watchdog.stall_timeout_seconds is %s, so '
+            'the watchdog kills a stalled capture before ffmpeg can time out its own read '
+            'and reconnect - every silent stall will still cost a SIGKILL and a new segment '
+            '(observed at: %s). Set the read timeout comfortably below the stall timeout.',
+            read_timeout, stall_timeout, source)
+    return inert
 
 
 # Twin caps on any stderr tail read back off disk. Bytes bound the read, lines bound what a
@@ -126,6 +196,60 @@ def read_stderr_tail(path, max_bytes: int = STDERR_TAIL_MAX_BYTES,
     if max_lines and len(lines) > max_lines:
         lines = lines[-max_lines:]
     return '\n'.join(lines)
+
+
+# What ffmpeg's http protocol logs each time it drops a connection and opens a new one,
+# whatever the cause: '[http @ 0x..] Will reconnect at <byte offset> in <n> second(s),
+# error=Connection timed out.' - or 'error=End of file' when the provider served a finite
+# file. Matched as a substring of the whole line so the address, offset, delay and error
+# text are all free to vary.
+RECONNECT_MARKER = 'Will reconnect at'
+
+# Ceiling on how much of a stderr spool the counter below will read. Generous: the spool
+# grows at roughly 200 bytes/s of progress lines (2 lines/s, measured - see the tail caps
+# above), so 32MB is about 44 hours of capture and no real segment reaches it. It exists
+# because a diagnostic must never harm the capture it is diagnosing: this read sits between
+# a dead ffmpeg and its relaunch, and a spool bloated by an error storm must not be able to
+# delay the restart by more than the fraction of a second this bound costs.
+STDERR_SCAN_MAX_BYTES = 32 * 1024 * 1024
+
+
+def count_stderr_matches(path, needle: str = RECONNECT_MARKER,
+                         max_bytes: int = STDERR_SCAN_MAX_BYTES):
+    """(count, complete) for `needle` across a child's whole stderr spool; (0, True) if
+    unreadable.
+
+    The WHOLE file, deliberately, where read_stderr_tail() reads only the end. A segment
+    that reconnected in-process eight times is otherwise indistinguishable from a clean one,
+    which is the disclosure this exists for - and the tail cannot answer it, because 20 lines
+    of a capture's stderr are almost always 20 progress lines with the reconnects long
+    scrolled past.
+
+    `complete` is False when the scan hit max_bytes, so a caller can report the count as a
+    floor rather than a fact.
+
+    Never raises: an unreadable spool costs the diagnostic, not the recording.
+    """
+    if not path or not needle:
+        return 0, True
+    raw_needle = needle.encode()
+    overlap = len(raw_needle) - 1
+    count, read, tail = 0, 0, b''
+    try:
+        with open(path, 'rb') as fh:
+            while read < max_bytes:
+                chunk = fh.read(min(1 << 20, max_bytes - read))
+                if not chunk:
+                    return count, True
+                read += len(chunk)
+                # Join the previous chunk's last few bytes so a needle straddling the
+                # boundary is still seen, and cannot be counted twice: only the overlap
+                # is re-examined, never a whole chunk.
+                count += (tail + chunk).count(raw_needle)
+                tail = chunk[-overlap:] if overlap else b''
+    except OSError:
+        return count, True
+    return count, False
 
 
 def suspend_process(proc) -> bool:
@@ -237,6 +361,135 @@ class GrowthMonitor:
 
     def reset(self):
         self._stall_start = None
+
+
+# ── Delivery rate: is the CONTENT advancing, not just the file ────────────────────────
+# A stalled feed and a frozen one look nothing alike to GrowthMonitor above: a provider
+# re-serving the same few seconds forever writes bytes at full rate and advances ffmpeg's
+# frame counter, so every liveness check this app had passed it. The signal that separates
+# them is how much content time arrives per second of wall clock (dev/changelog/964).
+#
+# Measured 2026-09-14 over every segment in the database carrying a content duration:
+# segments of 60s or longer ran a median 1.03x and a maximum 1.29x, while the frozen feed
+# ran 3.76x sustained for 2h18m. The sub-60s outliers reach 2.43x, but those are the fixed
+# 13-29s per-connect back-buffer (dev/changelog/942) sitting on a short base - a CONSTANT,
+# not a rate, so its contribution decays as the window lengthens: the worst measured one
+# reads 1.48x across 60s and 1.24x across 120s. Requiring a window does not merely reduce
+# false positives, it removes the only legitimate source of a high ratio.
+#
+# KNOWN BLIND SPOT, and it must be stated wherever this is used: the ratio only means
+# anything while -re is off, which is what an unbounded capture gets today
+# (build_capture_cmd's pace_realtime). With -re, ffmpeg paces its reads at 1x and a
+# too-fast provider simply fills a socket buffer, so the ratio sits at ~1.0 while the feed
+# is exactly as dead.
+
+# ffmpeg's progress line carries the output timestamp as `time=HH:MM:SS.ss`. Anchored to
+# the full shape on purpose: a live spool's last line is often a partial write, and a
+# truncated `time=00:00:4` must fail to match so the previous complete value is used
+# instead of a short read being mistaken for a content position.
+_TIME_RE = re.compile(r'time=(\d+):([0-5]\d):([0-5]\d(?:\.\d+)?)')
+
+
+def read_capture_content_position(path, max_bytes: int = STDERR_TAIL_MAX_BYTES):
+    """Seconds of content ffmpeg has written so far, read from its LIVE stderr spool;
+    None when the spool cannot be read or has not reported a position yet.
+
+    Deliberately parses the spool the capture is already writing rather than adding
+    -progress to build_capture_cmd(): that builder is shared with the channel tester and
+    the manual URL test, and leaving the spawn untouched keeps this diagnostic unable to
+    change how anything is captured.
+
+    Unlike read_stderr_tail() this reads a file a live child is still appending to, which
+    is safe in the way a pipe is not - a reader that falls behind or stops costs nothing,
+    where an undrained pipe deadlocks the child (CLAUDE.md subprocess discipline). The
+    partial trailing line that comes with it is handled by the anchored pattern above.
+
+    None means "no opinion" and never "something is wrong": ffmpeg's banner occupies the
+    first few KB of every spool, so an early read legitimately finds no position at all.
+    """
+    if not path:
+        return None
+    try:
+        with open(path, 'rb') as fh:
+            try:
+                fh.seek(-max_bytes, os.SEEK_END)
+            except OSError:
+                fh.seek(0)  # file shorter than max_bytes - seek would land before byte 0
+            raw = fh.read()
+    except OSError:
+        return None
+    matches = _TIME_RE.findall(raw.decode('utf-8', errors='replace'))
+    if not matches:
+        return None
+    hours, minutes, seconds = matches[-1]
+    return int(hours) * 3600 + int(minutes) * 60 + float(seconds)
+
+
+def delivery_ratio(content_seconds, wall_seconds):
+    """Seconds of content per second of wall clock, or None when the pair cannot say.
+
+    The one home for this measurement. Two callers ask the same question at different
+    times - the watchdog over a rolling window during the capture, and the post-capture
+    disclosure over a finished segment - and two implementations of one number is exactly
+    the duplication that would let the live detector and the event describing it disagree.
+
+    None rather than 0 or inf for a non-positive wall clock: "not measurable" is a
+    different answer from "not fast", and a caller that treats them alike would fire on a
+    zero-length window.
+    """
+    if content_seconds is None or wall_seconds is None:
+        return None
+    if wall_seconds <= 0 or content_seconds < 0:
+        return None
+    return content_seconds / wall_seconds
+
+
+class DeliveryRateMonitor:
+    """Feed successive (content position, timestamp) samples via update(); reports the
+    delivery ratio over a ROLLING window, or None until the window is full.
+
+    Rolling, and not ffmpeg's own `speed=`, for two measured reasons. `speed=` is an
+    average since the segment began, so it carries the reconnect back-buffer's bias for
+    the whole first stretch, and it is correspondingly slow to notice a feed that runs
+    clean for an hour and then freezes - the case that costs the most.
+
+    Pure except for the clock, and the clock is injectable, so the window mechanics are
+    testable without a capture.
+    """
+
+    def __init__(self, window_seconds: float):
+        self.window_seconds = window_seconds
+        self._samples = []  # (monotonic timestamp, content seconds), oldest first
+
+    def update(self, content_seconds, now=None):
+        """Record a sample; return the ratio over the full window, else None."""
+        if content_seconds is None:
+            # A spool that could not be read this tick is a gap in the record, not a
+            # datapoint. Dropping it keeps the anchor honest: interpolating across it
+            # would attribute the missed interval's content to whichever sample landed next.
+            return None
+        now = time.monotonic() if now is None else now
+        self._samples.append((now, content_seconds))
+        # Keep exactly one sample at or before the window's start - it is the anchor the
+        # ratio is measured from. Pruning to "inside the window" instead would leave the
+        # oldest sample YOUNGER than the window and quietly measure a shorter one.
+        cutoff = now - self.window_seconds
+        while len(self._samples) > 1 and self._samples[1][0] <= cutoff:
+            self._samples.pop(0)
+        anchor_time, anchor_content = self._samples[0]
+        elapsed = now - anchor_time
+        if elapsed < self.window_seconds:
+            return None
+        return delivery_ratio(content_seconds - anchor_content, elapsed)
+
+    def reset(self):
+        """Forget every sample - the window has to refill from scratch.
+
+        Called after a restart, which is what gives the replacement segment its warm-up:
+        the per-connect back-buffer lands in a window that is not yet full and can never
+        be measured on its own.
+        """
+        self._samples.clear()
 
 
 # ── Supervised ffmpeg runs ────────────────────────────────────────────────────────────

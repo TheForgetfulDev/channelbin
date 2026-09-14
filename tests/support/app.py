@@ -217,8 +217,10 @@ def reset_module_globals():
     import app.auth as auth
     import app.channel_search as channel_search
     import app.channel_tester as channel_tester
+    import app.concatenator as concatenator
     import app.config as config
     import app.fs_utils as fs_utils
+    import app.postprocessor as postprocessor
     import app.probe as probe
     import app.readiness as readiness
     import app.routes.channel_search as channel_search_routes
@@ -274,6 +276,17 @@ def reset_module_globals():
     # against a scan that only sees `global` rebinds and empty container literals, and this
     # is an object, so naming it there would fail the "RESET still matches the source" test.
     channel_search_routes.SEARCH_GENERATIONS.reset()
+    # Display-only, unlike its _active_concats sibling on the allowlist: it tracks no
+    # thread and no child process, so nothing is orphaned by clearing it. A leftover entry
+    # is keyed on a recording id that only exists in the previous module's temp DB, and the
+    # next module's same-id row would render a join percentage for work that never ran.
+    concatenator._concat_progress.clear()
+    # Same reasoning as its _concat_progress sibling above, and the same contrast with the
+    # _active_conversions entry on the allowlist: this one tracks no child process, so
+    # clearing it orphans nothing. A leftover entry is keyed on a recording id that only
+    # exists in the previous module's temp DB, and the next module's same-id row would
+    # render an analysis percentage for a pass that never ran.
+    postprocessor._analysis_progress.clear()
 
     # NOT reset: channel_tester._log_seq. It is documented as monotonic for the process
     # lifetime (_append_log relies on it never going backwards), so resetting it would

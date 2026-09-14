@@ -113,6 +113,39 @@ watchdog:
   # A wider window is a looser trigger, not a stricter one.
   stall_move_count: 3
   stall_move_window_minutes: 30
+  # Provider placeholder detection. When a channel is down, an upstream may serve a finite
+  # "channel offline" clip instead of a live stream - ffmpeg drains the whole thing in a few
+  # seconds, exits 0, and the segment holds ten minutes of black. A segment carrying more
+  # than this many seconds of content per second of wall clock AND ending on a clean EOF is
+  # discarded rather than joined into the final file, and the recording says so.
+  # The ratio is the test, never the byte count: another provider's clip is another size.
+  # 0 disables the detector.
+  placeholder_content_ratio: 10
+  # Frozen/looping feed detection. A provider re-serving the same few seconds over and over
+  # still writes bytes at full rate and still advances ffmpeg's frame counter, so nothing
+  # above notices - one such feed produced 8h38m of a single repeated lap in 2h18m and was
+  # reported as a successful capture. The tell is content time arriving faster than wall
+  # clock and STAYING that way: a capture delivering more than this ratio across a rolling
+  # window this long is killed, the member takes a health-score hit, and after the strike
+  # count below the recording moves to another group member.
+  # The window is what makes a low ratio safe, and is why it is not shorter: a reconnect's
+  # back-buffer is a fixed 13-29 seconds of content, so it is a constant rather than a rate
+  # and its ratio decays as the window grows - the worst measured one reads 1.48x across 60
+  # seconds and 1.24x across 120. Seconds here are WALL CLOCK, not content.
+  # Only meaningful while recording.segment_duration_seconds is 0 (no -re pacing).
+  fast_delivery_ratio: 1.5              # 0 disables
+  fast_delivery_window_seconds: 120
+  fast_delivery_strike_count: 3         # strikes on one member before moving off it
+  # The post-capture half, applied by the join to each finished segment: a segment holding
+  # more content than the seconds it ran for, by more than this, FLAGS the recording for a
+  # human to check. Nothing is stopped and nothing is thrown away - a segment under the
+  # thresholds above is unexplained, not proven bad.
+  # Surplus seconds rather than a ratio because the only honest source of early content is
+  # that fixed 13-29 second back-buffer: a constant separates cleanly at every segment
+  # length, while a ratio is too tight on short segments (an ordinary 15-second one reads
+  # 2.43x) and too loose on long ones (an 8-hour segment 48 minutes ahead reads only 1.10x).
+  # The worst honest surplus measured here is +40 seconds.
+  fast_delivery_surplus_seconds: 120    # 0 disables the flag
 
 ffmpeg:
   path: ffmpeg                          # binary name or absolute path (a leading ~ is expanded)
@@ -120,6 +153,15 @@ ffmpeg:
   # directory, else system PATH. Set it only for a toolchain whose halves live apart - both
   # binaries measure the same streams, and a mixed pair can disagree about what one is.
   ffprobe_path: ''
+  # Seconds a single read off an http(s) stream may block before ffmpeg drops the connection
+  # and reconnects. A provider that stops sending but leaves the socket open otherwise blocks
+  # ffmpeg's read forever: it cannot even act on a shutdown signal (the first one is only
+  # checked between reads), so every silent stall costs a kill, a restart delay, a new
+  # segment and a new connection to the provider. Keep it comfortably below
+  # watchdog.stall_timeout_seconds or the watchdog kills the capture first and this never
+  # fires. It bounds the FIRST read too, and ffmpeg does not reconnect out of a timed-out
+  # open - so a provider slower than this to send its first byte fails rather than waiting.
+  read_timeout_seconds: 5               # 0 disables
   extra_input_args: []                  # e.g. ['-timeout', '5000000']
   extra_output_args: []
   # Joining a recording's segments reads and writes however many bytes the capture
@@ -321,6 +363,9 @@ channel_testing:
   bitrate_fail_720p_kbps: 1000
   bitrate_fail_1080p_kbps: 2000
   bitrate_fail_4k_kbps: 3000
+  # Fail a channel whose URL serves a finite file instead of a live stream - the provider's
+  # "channel offline" clip. One extra short ffprobe per connected test.
+  placeholder_source_check: true
   health_score_half_life_samples: 5
   reference_minutes: 2
   instability_penalty_per_hr: 2.0

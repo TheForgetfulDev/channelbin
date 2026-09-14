@@ -12,7 +12,8 @@ from typing import NamedTuple
 from .database import add_recording_event, REC_STATUS_FAILED, REC_STATUS_RETRYING
 from .db_utils import retry_on_locked
 from .probe import parse_ffprobe
-from .proc_utils import GrowthMonitor, terminate_or_kill, wait_for_file_data
+from .proc_utils import (DeliveryRateMonitor, GrowthMonitor, read_capture_content_position,
+                         terminate_or_kill, wait_for_file_data)
 
 log = logging.getLogger(__name__)
 
@@ -46,6 +47,85 @@ def stalls_within_window(times, now_mono: float, window_seconds: float) -> list:
     and 3-in-10 not until +65.0.
     """
     return [t for t in times if t >= now_mono - window_seconds]
+
+
+class PlaceholderVerdict(NamedTuple):
+    """What a discarded segment held, for the event that says so."""
+    content_seconds: float
+    wall_seconds: float
+    ratio: float
+
+
+def classify_placeholder_segment(content_seconds, wall_seconds, exit_code, proc_exited,
+                                 factor) -> bool:
+    """Was this segment the provider's finite "channel offline" clip rather than the channel?
+
+    Pure, so the boundaries are testable without a capture. Both conditions are load-bearing
+    and neither is sufficient alone (dev/changelog/957):
+
+      * The RATIO - content seconds per second of wall clock - and deliberately never the
+        byte count, which is what a reader reaches for first because the measured clip was
+        the same 14,472,616 bytes every single time. It is the same size only because it is
+        the same file; another provider's clip is another size, and detecting that number
+        would fit this app to one upstream.
+      * A CLEAN EOF - ffmpeg exiting 0 on its own. A live feed does not end; it is killed,
+        or it errors. The measured legitimate fast segment is a buffer replay that prepends
+        a roughly constant 13-29s at each connect, which on a short segment reaches ~6x and
+        would trip a ratio test on its own - but it never exits 0, because the feed was
+        still running when the watchdog killed it.
+
+    A caller that could not measure the content duration passes None and gets False: an
+    unreadable probe means "not evaluated", never "discard it" (fail open - the old
+    behavior keeps a real segment, and losing one to a probe hiccup is the one outcome
+    worse than keeping a placeholder).
+    """
+    if not proc_exited or exit_code != 0:
+        return False
+    if not factor or factor <= 0:
+        return False
+    if content_seconds is None or wall_seconds is None:
+        return False
+    if content_seconds <= 0 or wall_seconds <= 0:
+        return False
+    return content_seconds > wall_seconds * factor
+
+
+class FastDeliveryVerdict(NamedTuple):
+    """What a capture killed for over-delivering was measured doing, for the event that
+    says so. `window_seconds` is wall clock, and naming it is not pedantry - content, wall,
+    scheduled and window durations are four different numbers on these surfaces.
+
+    Only what was measured: the content seconds the window covered would be `ratio *
+    window_seconds`, which is a reconstruction rather than a reading, and a number a reader
+    cannot trace back to something observed is what this whole feature exists to stop."""
+    ratio: float
+    window_seconds: float
+
+
+def member_has_delivered(recording_id: int, channel_id: int, before_segment_number: int) -> bool:
+    """Has this member already produced a kept, data-bearing segment in this recording?
+
+    The whole of the difference between the two failover rules for a placeholder
+    (dev/changelog/957). A member that answers its very FIRST connect with the offline clip
+    has shown nothing and the recording moves on at once; a member that had been delivering
+    real video and serves the clip after a stall gets the ordinary three strikes, because a
+    feed that worked for two hours is worth another try. Both shapes were measured on
+    recordings 17 and 19 - five of the six member episodes were the first kind.
+
+    Derived from the segment rows rather than tracked in thread state, so it survives a
+    service restart mid-recording and cannot drift from what the database says happened.
+    Requires an app context.
+    """
+    from .database import RecordingSegment
+    if channel_id is None:
+        return False
+    return RecordingSegment.query.filter(
+        RecordingSegment.recording_id == recording_id,
+        RecordingSegment.channel_id == channel_id,
+        RecordingSegment.segment_number < before_segment_number,
+        RecordingSegment.bytes_recorded > 0,
+        RecordingSegment.excluded_reason.is_(None),
+    ).first() is not None
 
 
 def _first_line(tail: str) -> str:
@@ -118,6 +198,7 @@ class WatchdogThread(threading.Thread):
         from .database import (
             Recording, RecordingSegment,
             STALL_DETECTED, RESTART_ATTEMPTED, RESTART_SUCCEEDED, RESTART_FAILED,
+            SEGMENT_DISCARDED, SEGMENT_EXCLUDED_PLACEHOLDER, FAST_DELIVERY_DETECTED,
         )
         from . import events as ev
 
@@ -139,6 +220,15 @@ class WatchdogThread(threading.Thread):
             # places for the fifth site to forget.
             member_stall_times = []
             member_stall_channel_id = None
+            # Fast-delivery strikes (dev/changelog/964), kept on the same member-keyed
+            # pattern as the stall times above and for the same reason: a move that
+            # arrives from any branch must not carry the old feed's strikes onto the new
+            # one. Deliberately NOT folded into member_stall_times - a feed delivering
+            # faster than real time has not stalled, and sharing the counter would let
+            # either trip-wire fire on the other's evidence (CLAUDE.md, one flag one
+            # meaning).
+            member_fast_delivery_strikes = 0
+            member_fast_delivery_channel_id = None
 
             log.info('Watchdog started for recording %d', self.recording_id)
 
@@ -154,6 +244,9 @@ class WatchdogThread(threading.Thread):
                 early_fail_min_bytes = cfg['watchdog']['early_fail_min_bytes']
                 early_fail_abort_count = cfg['watchdog']['early_fail_abort_count']
                 early_fail_abort_window = cfg['watchdog']['early_fail_abort_window_seconds']
+                fast_delivery_ratio = cfg['watchdog']['fast_delivery_ratio']
+                fast_delivery_window = cfg['watchdog']['fast_delivery_window_seconds']
+                fast_delivery_strikes = cfg['watchdog']['fast_delivery_strike_count']
 
                 seg_num = self.state.current_segment_num
                 seg = RecordingSegment.query.filter_by(
@@ -168,6 +261,15 @@ class WatchdogThread(threading.Thread):
 
                 seg_path = seg.file_path
                 monitor = GrowthMonitor()
+                # Per segment, so the window always refills from scratch after a restart.
+                # That is what gives the replacement its warm-up: a reconnect's back-buffer
+                # lands in a window that is not yet full, so it can never be measured on its
+                # own (dev/changelog/964).
+                delivery = DeliveryRateMonitor(fast_delivery_window)
+                # Set by the poll loop below when this segment's feed has been delivering
+                # faster than real time across a full window. A fourth way for a segment to
+                # end, alongside a stall, a self-exit and a dead restart.
+                fast_delivery = None
                 # Consumed once, for the one segment it was recorded against: a later
                 # segment must be judged on its own growth, not on a stale verdict.
                 restart_produced_no_data = (restart_no_data_segment == seg_num)
@@ -177,6 +279,10 @@ class WatchdogThread(threading.Thread):
                 # info describes the original capture). Bounded attempts so a
                 # header ffprobe can't return empty forever and hammer every poll.
                 probe_attempts = 0 if seg.probe_resolution is None else _PROBE_MAX_ATTEMPTS
+                # Set when the capture process was already dead at probe time, so the
+                # format-pin event has to wait for the stall handling below to decide
+                # whether this segment is being kept - see where it is consumed.
+                deferred_format_pin = None
 
                 # ── Inner poll loop: watch this segment ──────────────────────
                 while not self.state.stop_event.is_set():
@@ -220,9 +326,43 @@ class WatchdogThread(threading.Thread):
 
                             _record_probe_and_commit()
                             probe_attempts = _PROBE_MAX_ATTEMPTS
-                            self._check_format_pin(seg_id, seg_num)
+                            # RECORDING_FORMAT_CHANGED asserts that the FINISHED FILE changes
+                            # format part-way through, so it must not be written for a segment
+                            # that is about to be thrown out of that file. A provider
+                            # placeholder is exactly that case and it reaches this probe
+                            # first: it delivers its 2MB within a second and ffmpeg is
+                            # usually already gone by the poll that reads the header, which
+                            # is how six of these landed on recording 17 for segments that
+                            # should never have been in the file at all (dev/changelog/957).
+                            # A dead process means the stall handling below closes this
+                            # segment on this same iteration and knows the verdict, so the
+                            # event is deferred to there rather than guessed at here.
+                            proc = self.state.process
+                            if proc is not None and proc.poll() is not None:
+                                deferred_format_pin = (seg_id, seg_num)
+                            else:
+                                self._check_format_pin(seg_id, seg_num)
 
                     stalled_for = monitor.update(current_size)
+
+                    # Is the CONTENT advancing, or only the file? A provider re-serving the
+                    # same few seconds writes bytes at full rate and keeps ffmpeg's frame
+                    # counter moving, so the growth check above passes it and so does every
+                    # other liveness test this app has - one such feed produced 8h38m of a
+                    # single repeated lap in 2h18m and was reported as a successful capture.
+                    #
+                    # Reading the spool ffmpeg is already writing costs one bounded tail read
+                    # per poll and cannot touch the capture: a reader that falls behind or
+                    # fails costs nothing, where an undrained pipe deadlocks the child. Fails
+                    # open in both directions - an unreadable or unparseable spool yields
+                    # None, which the monitor treats as a gap in the record rather than as
+                    # evidence either way.
+                    if fast_delivery is None and fast_delivery_ratio and fast_delivery_ratio > 0:
+                        observed = delivery.update(
+                            read_capture_content_position(self.state.stderr_path))
+                        if observed is not None and observed >= fast_delivery_ratio:
+                            fast_delivery = FastDeliveryVerdict(
+                                observed, fast_delivery_window)
 
                     # wait_for_file_data already proved this segment produced nothing, and
                     # GrowthMonitor started from scratch here needs another stall_timeout to
@@ -262,8 +402,25 @@ class WatchdogThread(threading.Thread):
                         except OSError:
                             pass  # the size read above stands; a missing file is 0 either way
 
-                    if stalled_for > stall_timeout or proc_exited or restart_dead:
-                        if proc_exited:
+                    # A capture that ended on its own in the same tick the ratio tripped is
+                    # described by how it ended, not by what we were about to do to it. The
+                    # verdict is dropped rather than carried, so exactly one of the four
+                    # shapes below owns this segment and the branches after it cannot both
+                    # fire - the placeholder clip is the case that reaches here, since it
+                    # is over-delivery that ends in a clean EOF.
+                    if fast_delivery is not None and (proc_exited or restart_dead):
+                        fast_delivery = None
+
+                    if (stalled_for > stall_timeout or proc_exited or restart_dead
+                            or fast_delivery is not None):
+                        if fast_delivery is not None:
+                            log.warning(
+                                'Recording %d: seg %d delivered %.2fx real time across %.0fs '
+                                '- the feed is not advancing, stopping this capture',
+                                self.recording_id, seg_num, fast_delivery.ratio,
+                                fast_delivery.window_seconds,
+                            )
+                        elif proc_exited:
                             log.warning(
                                 'Recording %d: capture process for seg %d exited on its own '
                                 '(%d bytes)', self.recording_id, seg_num, monitor.last_size,
@@ -286,17 +443,7 @@ class WatchdogThread(threading.Thread):
                         # independent of consecutive_failures, and NOT reset just because
                         # the next restart briefly produces a few bytes (see below).
                         seg_duration = (datetime.utcnow() - seg.started_at).total_seconds()
-                        is_early_failure = (
-                            seg_duration <= early_fail_window
-                            and monitor.last_size < early_fail_min_bytes
-                        )
-                        if is_early_failure:
-                            now_mono = time.monotonic()
-                            early_fail_times.append(now_mono)
-                            cutoff = now_mono - early_fail_abort_window
-                            early_fail_times[:] = [t for t in early_fail_times if t >= cutoff]
-                        else:
-                            early_fail_times.clear()
+                        seg_channel_id = seg.channel_id
 
                         # Kill current ffmpeg
                         terminate_or_kill(self.state.process)
@@ -308,7 +455,43 @@ class WatchdogThread(threading.Thread):
                         # above; a positive one means ffmpeg had already died on its own
                         # before we ever declared the stall (dev/changelog/430).
                         from .recorder import collect_segment_diagnostics, record_segment_diagnostics
-                        exit_code, stderr_tail = collect_segment_diagnostics(self.recording_id)
+                        exit_code, stderr_tail, reconnects, spool_missing = \
+                            collect_segment_diagnostics(self.recording_id)
+
+                        # Was this the provider's "channel offline" clip rather than the
+                        # channel? Measured here, on a file the dead process has finished
+                        # writing, and OUTSIDE the retry closure below because it spawns
+                        # ffprobe. Bounded and fail-open: a diagnostic must never harm the
+                        # capture it is diagnosing, so the worst a hung probe can do is delay
+                        # this restart by its timeout and then be treated as "not a
+                        # placeholder" (dev/changelog/957).
+                        placeholder = self._classify_placeholder(
+                            seg, seg_duration, exit_code, proc_exited, monitor.last_size,
+                            cfg['watchdog']['placeholder_content_ratio'])
+
+                        # Dead-stream classification, continued: a placeholder is an early
+                        # failure whatever its byte count. The byte count is precisely what
+                        # hid it - 14MB of black comfortably clears early_fail_min_bytes, so
+                        # every one of these looked like a segment that had delivered, and
+                        # none of the three dead-feed trip-wires ever saw them.
+                        # ...and a fast-delivery kill is never one, whatever the numbers say.
+                        # Such a segment is long and fat by construction, so no default
+                        # reaches this - but "the feed is dead" is the one thing this
+                        # signature proves false, and the streak it would arm ends in a
+                        # dead-stream abort naming the wrong cause (dev/changelog/964).
+                        is_early_failure = fast_delivery is None and (
+                            placeholder is not None or (
+                                seg_duration <= early_fail_window
+                                and monitor.last_size < early_fail_min_bytes
+                            )
+                        )
+                        if is_early_failure:
+                            now_mono = time.monotonic()
+                            early_fail_times.append(now_mono)
+                            cutoff = now_mono - early_fail_abort_window
+                            early_fail_times[:] = [t for t in early_fail_times if t >= cutoff]
+                        else:
+                            early_fail_times.clear()
 
                         # Update segment + recording stats. Wrapped as one retry unit
                         # so a retry redoes the read-modify-write together - the
@@ -325,7 +508,11 @@ class WatchdogThread(threading.Thread):
                         # code beside it is ffmpeg's own answer, which "produced no data"
                         # cannot give. Every state is named - a trailing else that rendered
                         # one of them would swallow the next one added.
-                        if proc_exited:
+                        if fast_delivery is not None:
+                            exit_reason = 'FAST_DELIVERY_KILLED'
+                            stall_reason = 'fast_delivery'
+                            stall_detail = None  # this shape writes its own event, below
+                        elif proc_exited:
                             exit_reason = 'PROCESS_EXITED'
                             stall_reason = 'process_exited'
                             stall_detail = (f'Capture process exited on its own at '
@@ -343,14 +530,70 @@ class WatchdogThread(threading.Thread):
                                             f'for {stalled_for:.1f}s')
 
                         @retry_on_locked()
-                        def _record_stall_and_commit():
+                        def _record_segment_end_and_commit():
                             db.session.refresh(seg)
                             seg.ended_at = datetime.utcnow()
                             seg.exit_reason = exit_reason
                             seg.bytes_recorded = monitor.last_size
-                            seg.stall_count = (seg.stall_count or 0) + 1
                             record_segment_diagnostics(self.recording_id, seg,
-                                                       exit_code, stderr_tail)
+                                                       exit_code, stderr_tail, reconnects,
+                                                       spool_missing)
+                            if fast_delivery is not None:
+                                # Everything the stall bookkeeping below does is skipped on
+                                # this path, deliberately. This feed never stopped writing -
+                                # it wrote too much - so charging it a stall, a downtime
+                                # second or a consecutive failure would file the most
+                                # expensive failure this app has under the name of a
+                                # different one, and would arm the stall-rate demotion on
+                                # evidence that is not stalls (dev/changelog/964).
+                                #
+                                # The event claims only the measurement. That the picture was
+                                # frozen is what this signature MEANS on every case seen so
+                                # far, but the ratio does not prove it and the app has not
+                                # looked at the picture - so the sentence says what was
+                                # measured and what was done about it, and stops there.
+                                r = db.session.get(Recording, self.recording_id)
+                                add_recording_event(
+                                    self.recording_id, FAST_DELIVERY_DETECTED,
+                                    detail=(
+                                        f'Segment {seg_num} stopped: the feed delivered video at '
+                                        f'{fast_delivery.ratio:.2f}x real time for '
+                                        f'{fast_delivery.window_seconds:.0f}s straight. A feed '
+                                        f'running this far ahead is not showing live content, so '
+                                        f'the capture was stopped rather than left to fill the '
+                                        f'recording with it.'),
+                                    segment_number=seg_num,
+                                    extra={'ratio': round(fast_delivery.ratio, 2),
+                                           'window_seconds': round(fast_delivery.window_seconds, 1)})
+                                db.session.commit()
+                                return r
+
+                            seg.stall_count = (seg.stall_count or 0) + 1
+                            if placeholder is not None:
+                                # exit_reason keeps answering "how did this segment end" and
+                                # PROCESS_EXITED is still the true answer - the exclusion is
+                                # its own column with its own meaning (CLAUDE.md, one flag
+                                # one meaning). The content duration is stored here rather
+                                # than left for the concat's measuring pass, which only ever
+                                # sees the segments it is about to join.
+                                seg.excluded_reason = SEGMENT_EXCLUDED_PLACEHOLDER
+                                seg.content_duration_seconds = placeholder.content_seconds
+                                add_recording_event(
+                                    self.recording_id, SEGMENT_DISCARDED,
+                                    detail=(
+                                        f'Segment {seg_num} discarded: '
+                                        f'{placeholder.content_seconds:.1f}s of video arrived in '
+                                        f'{placeholder.wall_seconds:.1f}s '
+                                        f'({placeholder.ratio:.0f}x real time) and the feed closed '
+                                        f'by itself - the provider served a placeholder clip, not '
+                                        f'the channel. Not joined into the final file.'),
+                                    segment_number=seg_num,
+                                    # content_seconds and the byte count both have columns on
+                                    # the segment row, so only the two derived numbers ride
+                                    # here (CLAUDE.md - a stat with a column does not also go
+                                    # in extra_data).
+                                    extra={'wall_seconds': round(placeholder.wall_seconds, 2),
+                                           'ratio': round(placeholder.ratio, 1)})
 
                             r = db.session.get(Recording, self.recording_id)
                             r.total_stall_count += 1
@@ -386,15 +629,124 @@ class WatchdogThread(threading.Thread):
                             db.session.commit()
                             return r
 
-                        rec = _record_stall_and_commit()
+                        rec = _record_segment_end_and_commit()
 
-                        ev.publish(self.recording_id, STALL_DETECTED, {
-                            'segment_number': seg_num,
-                            'bytes_at_stall': monitor.last_size,
-                            'stall_duration': stalled_for,
-                            'stall_count': rec.total_stall_count,
-                            'consecutive_failures': rec.consecutive_failures,
-                        })
+                        if fast_delivery is not None:
+                            ev.publish(self.recording_id, FAST_DELIVERY_DETECTED, {
+                                'segment_number': seg_num,
+                                'ratio': round(fast_delivery.ratio, 2),
+                                'window_seconds': round(fast_delivery.window_seconds, 1),
+                            })
+                        else:
+                            ev.publish(self.recording_id, STALL_DETECTED, {
+                                'segment_number': seg_num,
+                                'bytes_at_stall': monitor.last_size,
+                                'stall_duration': stalled_for,
+                                'stall_count': rec.total_stall_count,
+                                'consecutive_failures': rec.consecutive_failures,
+                            })
+
+                        # The format-pin event this segment's probe deferred (see there).
+                        # A discarded segment is not in the finished file, so the claim it
+                        # would make is simply false and is dropped rather than written and
+                        # walked back.
+                        if deferred_format_pin is not None and placeholder is None:
+                            self._check_format_pin(*deferred_format_pin)
+                        deferred_format_pin = None
+
+                        if placeholder is not None:
+                            log.warning(
+                                'Recording %d: seg %d was a provider placeholder clip '
+                                '(%.1fs of content in %.1fs, %.0fx real time) - discarded, '
+                                'not joined into the final file',
+                                self.recording_id, seg_num, placeholder.content_seconds,
+                                placeholder.wall_seconds, placeholder.ratio)
+                            # The member answered with the offline card, so it takes the
+                            # score hit whether or not there is anywhere to move
+                            # (dev/changelog/957). Written before the failover below, which is
+                            # handed score_departure=False so this stays the ONE observation
+                            # for this departure - the demotion's own scoring reads the
+                            # member's measured share, and one that served five seconds of
+                            # black would come out of it near 100.
+                            from .health_score import apply_placeholder_health_observation
+                            apply_placeholder_health_observation(
+                                self.app, seg_channel_id, self.recording_id, seg_num)
+
+                            # Two shapes, two rules, from the measured cases
+                            # (dev/changelog/957). A member that answers its first connect
+                            # this way has shown nothing and the recording moves on
+                            # immediately; one that had been delivering real video keeps the
+                            # ordinary three strikes, and falls through to them below.
+                            if not member_has_delivered(self.recording_id, seg_channel_id,
+                                                        seg_num):
+                                from .recorder import failover_group_member, _launch_segment
+                                if failover_group_member(
+                                        self.app, self.recording_id,
+                                        'provider placeholder on first connect',
+                                        demote=True, score_departure=False):
+                                    early_fail_times.clear()
+                                    _launch_segment(self.app, self.recording_id, seg_num + 1)
+                                    break
+                                # Nowhere to go - a one-member group, or no group at all.
+                                # Falls through to the normal path, where is_early_failure
+                                # above has already put this segment on the dead-stream
+                                # streak so the retry cadence can eventually apply.
+
+                        # ── Fast-delivery strikes (dev/changelog/964) ───────────
+                        # Treated the way a stall or a black screen is treated - the score
+                        # takes the hit, the same member is retried a few times, and then
+                        # the recording moves on. Retrying at all is deliberate: nothing
+                        # died here, and a provider stuck re-serving its buffer has a real
+                        # chance of coming back on a fresh connection, which is the whole
+                        # difference between this and the dead-stream trip-wire below.
+                        if fast_delivery is not None:
+                            # Every detection scores the member, including the ones that
+                            # restart on it and the ones with nowhere to move: the hit is
+                            # about what the feed served, not about whether there was
+                            # somewhere better to go. Written before any failover, which is
+                            # then handed score_departure=False so this stays the ONE
+                            # observation for the departure - the demotion's own scoring
+                            # reads the member's measured share, and a feed that wrote
+                            # 31.9 GB of the same lap would come out of it looking healthy.
+                            from .health_score import apply_fast_delivery_health_observation
+                            apply_fast_delivery_health_observation(
+                                self.app, seg_channel_id, self.recording_id, seg_num,
+                                fast_delivery.ratio, fast_delivery.window_seconds)
+
+                            if rec.channel_id != member_fast_delivery_channel_id:
+                                member_fast_delivery_strikes = 0
+                                member_fast_delivery_channel_id = rec.channel_id
+                            member_fast_delivery_strikes += 1
+
+                            if member_fast_delivery_strikes >= fast_delivery_strikes:
+                                from .recorder import failover_group_member, _launch_segment
+                                move_reason = (
+                                    f'{member_fast_delivery_strikes} fast-delivery '
+                                    f'detection(s), the last at '
+                                    f'{fast_delivery.ratio:.2f}x real time')
+                                if failover_group_member(self.app, self.recording_id,
+                                                         move_reason, demote=True,
+                                                         score_departure=False):
+                                    member_fast_delivery_strikes = 0
+                                    member_fast_delivery_channel_id = None
+                                    member_stall_times = []
+                                    member_stall_channel_id = None
+                                    early_fail_times.clear()
+                                    _launch_segment(self.app, self.recording_id, seg_num + 1)
+                                    break
+                                # Nowhere to go, and out of strikes. This is the one place
+                                # this app stops a capture that is still receiving data, and
+                                # it is deliberate: the alternative measured 31.9 GB of one
+                                # repeated lap reported as a success (dev/changelog/964). The
+                                # dead-stream retry cadence is NOT reused - it exists for a
+                                # stream that is not there, and this one is.
+                                self._give_up(lambda: self._fail_recording_fast_delivery(
+                                    rec, member_fast_delivery_strikes, fast_delivery.ratio,
+                                    fast_delivery.window_seconds,
+                                    cause=_first_line(stderr_tail)))
+                                return
+                            # Strikes left: fall through to the ordinary restart below and
+                            # try this member again on a fresh connection.
 
                         # Dead-stream fast-fail: independent trip-wire, checked before the
                         # normal max_consecutive_failures path since it's meant to catch
@@ -454,15 +806,22 @@ class WatchdogThread(threading.Thread):
                         # A stall closes this segment and opens the next one either way, so
                         # the move rides a boundary that was happening anyway - and skips
                         # the restart delay below, making it cheaper than staying put.
+                        #
+                        # Skipped entirely for a fast-delivery kill: it is not a stall, it
+                        # has its own strike ladder above, and feeding this window too
+                        # would move a recording off a member on a mixture of two different
+                        # findings, neither of which reached its own threshold.
                         if rec.channel_id != member_stall_channel_id:
                             member_stall_times = []
                             member_stall_channel_id = rec.channel_id
                         now_mono = time.monotonic()
-                        member_stall_times.append(now_mono)
+                        if fast_delivery is None:
+                            member_stall_times.append(now_mono)
                         member_stall_times = stalls_within_window(
                             member_stall_times, now_mono,
                             thresholds.stall_move_window_minutes * 60)
-                        if (rec.group_id is not None
+                        if (fast_delivery is None
+                                and rec.group_id is not None
                                 and thresholds.stall_move_count > 0
                                 and len(member_stall_times) >= thresholds.stall_move_count):
                             from .recorder import failover_group_member, _launch_segment
@@ -625,6 +984,43 @@ class WatchdogThread(threading.Thread):
 
             log.info('Watchdog exiting for recording %d (stop_event set)', self.recording_id)
 
+    def _classify_placeholder(self, seg, wall_seconds, exit_code, proc_exited, last_size,
+                              factor):
+        """A PlaceholderVerdict when this just-closed segment held the provider's "channel
+        offline" clip rather than the channel, else None.
+
+        The ffprobe half of classify_placeholder_segment(), kept out of that function so the
+        rule itself stays pure and testable. Header-only, which on MPEG-TS seeks rather than
+        scans - the same read _measure_segment_content_durations does for every segment at
+        0.04s a file - and bounded at 15s so the worst a hung probe can cost the capture is
+        that much of one restart.
+
+        Every failure here returns None, which is the old behavior: keep the segment. That
+        direction is deliberate. Discarding a real segment on a probe that could not be read
+        would destroy capture, which is the one outcome worse than joining a placeholder -
+        but a check that could not run says so in the log rather than passing silently.
+        """
+        if not proc_exited or not factor or factor <= 0 or not last_size:
+            return None
+        if exit_code != 0:
+            return None
+        try:
+            info = parse_ffprobe(seg.file_path, count_packets=False, timeout=15)
+        except Exception as exc:
+            log.warning('Recording %d seg %d: placeholder check could not probe the segment '
+                        '(%s) - keeping it', self.recording_id, seg.segment_number, exc)
+            return None
+        content = info.get('duration')
+        if content is None:
+            log.warning('Recording %d seg %d: placeholder check read no duration from the '
+                        'segment - keeping it', self.recording_id, seg.segment_number)
+            return None
+        content = float(content)
+        if not classify_placeholder_segment(content, wall_seconds, exit_code, proc_exited,
+                                            factor):
+            return None
+        return PlaceholderVerdict(content, wall_seconds, content / wall_seconds)
+
     def _check_format_pin(self, seg_id: int, seg_num: int):
         """Say so when this segment was captured at a different format than the one the
         recording opened with, so the finished file changes format part-way through
@@ -738,7 +1134,8 @@ class WatchdogThread(threading.Thread):
         from . import events as ev
         from .recorder import _active, _lock
 
-        exit_code, stderr_tail = getattr(self, '_give_up_diagnostics', (None, ''))
+        exit_code, stderr_tail, reconnects, spool_missing = getattr(
+            self, '_give_up_diagnostics', (None, '', (0, True), False))
         if cause is None:
             cause = _first_line(stderr_tail)
         # Fold the reason ffmpeg actually gave into the terminal event's detail and the
@@ -775,7 +1172,8 @@ class WatchdogThread(threading.Thread):
         open_seg = RecordingSegment.query.filter_by(
             recording_id=self.recording_id, ended_at=None
         ).order_by(RecordingSegment.segment_number.desc()).first()
-        record_segment_diagnostics(self.recording_id, open_seg, exit_code, stderr_tail)
+        record_segment_diagnostics(self.recording_id, open_seg, exit_code, stderr_tail,
+                                   reconnects, spool_missing)
         db.session.commit()
         ev.publish(self.recording_id, event_type, sse_extra)
         with _lock:
@@ -829,6 +1227,39 @@ class WatchdogThread(threading.Thread):
             },
             cause=cause,
         )
+        from . import connection_limits as connlim
+        if rec.channel_id and rec.channel:
+            connlim.release(rec.channel.account_id, 'recording', self.recording_id)
+
+    def _fail_recording_fast_delivery(self, rec, strikes, ratio, window_seconds, cause=None):
+        """Give up after a feed kept delivering faster than real time on every attempt and
+        there was nowhere to move (dev/changelog/964).
+
+        Its own failure_reason rather than MAX_CONSECUTIVE_FAILURES: nothing here failed in
+        the sense that word carries everywhere else in this file. The connection held, the
+        bytes flowed, every restart succeeded - and the recording is being stopped because
+        continuing would fill it with content that is not the channel. A row that named it
+        a consecutive-failure abort would send its reader looking for a dead stream.
+        """
+        from .database import RECORDING_FAILED
+        self._mark_recording_failed(
+            rec,
+            event_type=RECORDING_FAILED,
+            failure_reason='FAST_DELIVERY_DETECTED',
+            log_msg=(
+                'Recording "%s" (#%d): feed delivered %.2fx real time on %d attempt(s) and '
+                'there is no other member to move to - stopping'
+                % (rec.name, self.recording_id, ratio, strikes)),
+            detail=(f'Stopping: the feed delivered video at {ratio:.2f}x real time for '
+                    f'{window_seconds:.0f}s straight on {strikes} attempt(s), and there is no '
+                    f'other channel in this group to record from instead.'),
+            sse_extra={'ratio': round(ratio, 2),
+                       'window_seconds': round(window_seconds, 1),
+                       'strikes': strikes},
+            cause=cause,
+        )
+        # Same runtime connection accounting every other terminal path here performs, and
+        # outside the retried closure for the same reason (dev/docs/BUGS.md).
         from . import connection_limits as connlim
         if rec.channel_id and rec.channel:
             connlim.release(rec.channel.account_id, 'recording', self.recording_id)

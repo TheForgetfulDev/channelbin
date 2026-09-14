@@ -327,6 +327,115 @@ def apply_failover_health_observation(app, channel_id: int, recording_id: int, r
         db.session.commit()
 
 
+@retry_on_locked()
+def _apply_capture_fail_floor_observation(app, channel_id: int, recording_id: int,
+                                          segment_number: int, event_type: str,
+                                          describe, extra=None):
+    """Blend one flat fail-floor observation into a member on the strength of what its feed
+    served during a recording, and write the ChannelEvent that says so.
+
+    `describe(score_note)` returns the event's detail sentence, so each caller owns its own
+    wording while the blend, the weight and the event shape stay in one place.
+
+    Deliberately NOT weighted by how long the segment ran. These are categorical verdicts,
+    not proportional ones: a feed that says "this channel is down" takes five seconds to say
+    it, so duration-scaling them the way a recording's own observation is scaled would round
+    the finding away to nothing. Weight 1.0 makes each count as much as one reference-length
+    health check, which is the same evidence arriving by a different route.
+
+    Never touches the Recording row: the recording is still running and gets its own
+    terminal observation later.
+    """
+    with app.app_context():
+        import json
+        from . import db
+        from .config import load_config
+        from .database import Channel, ChannelEvent
+        from datetime import datetime
+
+        if channel_id is None:
+            return
+        channel = db.session.get(Channel, channel_id)
+        if channel is None:
+            return
+        cfg = load_config()
+        rs_cfg = cfg.get('channel_testing', {}).get('recording_score', {})
+        quality = rs_cfg.get('fail_floor', RECORDING_FAIL_FLOOR_DEFAULT)
+        observed_at = datetime.utcnow()
+        new_score, new_count, new_updated_at, blend_breakdown = blend_health_score(
+            channel, quality, observed_at, 1.0, cfg
+        )
+        channel.health_score = new_score
+        channel.health_score_sample_count = new_count
+        channel.health_score_updated_at = new_updated_at
+
+        if blend_breakdown['first_observation']:
+            score_note = f'score set to {new_score:.0f}'
+        else:
+            score_note = f'health score {blend_breakdown["old_score"]:.0f} -> {new_score:.0f}'
+        payload = {'recording_id': recording_id, 'segment_number': segment_number,
+                   'quality': quality, 'blend_breakdown': blend_breakdown}
+        payload.update(extra or {})
+        db.session.add(ChannelEvent(
+            channel_id=channel_id,
+            timestamp=observed_at,
+            event_type=event_type,
+            detail=describe(score_note),
+            extra_data=json.dumps(payload),
+        ))
+        db.session.commit()
+
+
+def apply_placeholder_health_observation(app, channel_id: int, recording_id: int,
+                                         segment_number: int):
+    """Blend a fail-floor observation into a member that answered a recording with the
+    provider's "channel offline" placeholder clip instead of the channel
+    (app/watchdog.py, dev/changelog/957).
+
+    Fires on every discarded segment, including the ones where nothing moves - a one-member
+    group, a non-group recording, or a member that had been delivering and is being given
+    its three strikes. The score hit is about what the feed served, not about whether there
+    was somewhere better to go.
+    """
+    from .database import CHANNEL_PLACEHOLDER_HEALTH_OBSERVATION
+
+    def describe(score_note):
+        return (f'Served a provider placeholder clip instead of the channel during a '
+                f'recording (segment {segment_number}) - the segment was discarded rather '
+                f'than joined into the final file - {score_note}')
+
+    _apply_capture_fail_floor_observation(
+        app, channel_id, recording_id, segment_number,
+        CHANNEL_PLACEHOLDER_HEALTH_OBSERVATION, describe)
+
+
+def apply_fast_delivery_health_observation(app, channel_id: int, recording_id: int,
+                                           segment_number: int, ratio: float,
+                                           window_seconds: float):
+    """Blend a fail-floor observation into a member whose feed delivered content faster
+    than real time for a sustained window during a recording (app/watchdog.py,
+    dev/changelog/964).
+
+    Same flat fail floor as the placeholder observation above, and for the same reason: the
+    capture was worth nothing whatever its byte count, so scaling the hit by how long the
+    member managed to keep it up would reward the feeds that wasted the most disk. Fires on
+    every detection, including the strikes that restart on the same member and the ones with
+    nowhere to move.
+    """
+    from .database import CHANNEL_FAST_DELIVERY_HEALTH_OBSERVATION
+
+    def describe(score_note):
+        return (f'Delivered video at {ratio:.2f}x real time for {window_seconds:.0f}s straight '
+                f'during a recording (segment {segment_number}) - a feed running this far '
+                f'ahead is not showing live content, so the capture was stopped rather than '
+                f'left to fill the recording with it - {score_note}')
+
+    _apply_capture_fail_floor_observation(
+        app, channel_id, recording_id, segment_number,
+        CHANNEL_FAST_DELIVERY_HEALTH_OBSERVATION, describe,
+        extra={'ratio': round(ratio, 2), 'window_seconds': round(window_seconds, 1)})
+
+
 def _departed_member_share(recording_id: int):
     """(downtime_seconds, restart_count, duration_seconds) for the member a recording has
     JUST moved off, read from its GROUP_FAILOVER events.

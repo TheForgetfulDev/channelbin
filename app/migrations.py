@@ -2135,6 +2135,53 @@ def _m060_conversion_parts_checkpoint(conn, cur):
     conn.commit()
 
 
+def _m061_segment_exclusion(conn, cur):
+    """recording_segments: excluded_reason, and its two Recording-level rollups
+    discarded_segment_count / discarded_seconds - a segment that was captured but kept out
+    of the final file, because the provider served its "channel offline" placeholder clip
+    instead of the channel (dev/changelog/957).
+
+    No backfill, and this is the case where that is a substantive choice rather than a
+    convenience. The rows a backfill would want are identifiable - a segment whose
+    content_duration_seconds dwarfs its wall clock and which exited 0 - but those recordings
+    have already been joined, converted and had their segment files deleted, so marking a
+    row excluded now would change what covered_capture_seconds and the capture gap report
+    about a file that demonstrably does contain those minutes. A NULL here means "not
+    evaluated", which is the truth for every row that predates the detector, and the
+    finished artifact keeps being described honestly.
+    """
+    seg_cols = [r[1] for r in cur.execute('PRAGMA table_info(recording_segments)').fetchall()]
+    if 'excluded_reason' not in seg_cols:
+        cur.execute('ALTER TABLE recording_segments ADD COLUMN excluded_reason VARCHAR(64)')
+    rec_cols = [r[1] for r in cur.execute('PRAGMA table_info(recordings)').fetchall()]
+    if 'discarded_segment_count' not in rec_cols:
+        cur.execute('ALTER TABLE recordings ADD COLUMN discarded_segment_count INTEGER')
+    if 'discarded_seconds' not in rec_cols:
+        cur.execute('ALTER TABLE recordings ADD COLUMN discarded_seconds FLOAT')
+    conn.commit()
+
+
+def _m062_fast_delivery_rollup(conn, cur):
+    """recordings: fast_delivery_segment_count / fast_delivery_seconds - how many joined
+    segments delivered more content than the seconds they ran for, and how much of the
+    finished file came from them (dev/changelog/966).
+
+    No backfill, for the same reason migration 61 gave and one more. The rows are derivable
+    (content_duration_seconds minus the segment's wall span), but the number is only
+    meaningful against the threshold in force when the join ran, and every recording old
+    enough to need a backfill was already presented to the user as clean. NULL means "not
+    evaluated", which is true of every row captured before the check existed; 0 means the
+    join looked and found none, which is a different answer and is only ever written by
+    code that actually looked.
+    """
+    rec_cols = [r[1] for r in cur.execute('PRAGMA table_info(recordings)').fetchall()]
+    if 'fast_delivery_segment_count' not in rec_cols:
+        cur.execute('ALTER TABLE recordings ADD COLUMN fast_delivery_segment_count INTEGER')
+    if 'fast_delivery_seconds' not in rec_cols:
+        cur.execute('ALTER TABLE recordings ADD COLUMN fast_delivery_seconds FLOAT')
+    conn.commit()
+
+
 SCHEMA_MIGRATIONS = [
     (1, 'baseline: pre-versioning additive migrations + backfills', _m001_baseline),
     (2, 'recordings: program_title/program_sub_title snapshot columns + backfill', _m002_program_title),
@@ -2249,6 +2296,13 @@ SCHEMA_MIGRATIONS = [
     (60, 'recordings: conversion_parts_done/_source_covered_seconds/_source_complete/'
      '_parts_signature, the recorded checkpoint a killed re-encode resumes from',
      _m060_conversion_parts_checkpoint),
+    (61, 'recording_segments: excluded_reason + the recordings rollups '
+     'discarded_segment_count/discarded_seconds, for a captured segment kept out of the '
+     'final file because the provider served its placeholder clip',
+     _m061_segment_exclusion),
+    (62, 'recordings: fast_delivery_segment_count/fast_delivery_seconds, the rollup of '
+     'joined segments whose video arrived faster than the clock',
+     _m062_fast_delivery_rollup),
 ]
 
 CURRENT_SCHEMA_VERSION = SCHEMA_MIGRATIONS[-1][0]

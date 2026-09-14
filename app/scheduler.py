@@ -144,6 +144,15 @@ def init_scheduler(app):
             )
         return
 
+    # Past the pidfile claim, so this process is the one that owns startup recovery - which
+    # is exactly the licence the spool sweep needs, since it deletes by directory listing and
+    # cannot tell a dead process's leftover from a live process's open spool. It ran from
+    # create_app() until dev/changelog/967, where every second app build against the real
+    # config destroyed a running capture's diagnostics. Before resume_in_progress_recordings
+    # below, which opens the spools this must not touch.
+    from .recorder import sweep_stale_stderr_spools
+    sweep_stale_stderr_spools(app)
+
     # The URI must come from app.config, never a fresh load_config(): create_app()
     # already resolved it (from config.yaml, or from config_overrides under a test app),
     # and reading config.yaml again here would point the jobstore at the production DB
@@ -508,7 +517,7 @@ def resume_in_progress_recordings(app):
                 log.warning(
                     'Recording %d was IN_PROGRESS and past stop_time → concatenating; the '
                     'service was not running when its stop time passed', rec.id)
-                _record_event_and_commit(rec.id, RECORDING_RESUMED, 'Resuming for concatenation (past stop time)')
+                _record_event_and_commit(rec.id, RECORDING_RESUMED, 'Resuming to join the segments (past stop time)')
                 # This branch used to go straight to concatenation, so a segment row left
                 # open by an unclean stop stayed open forever - the recording detail page
                 # then rendered it as still capturing, counting up, hours after the file
@@ -542,7 +551,7 @@ def resume_in_progress_recordings(app):
                 log.info('Recording %d was PAUSED and past stop_time → concatenating', rec.id)
                 _record_event_and_commit(
                     rec.id, RECORDING_RESUMED,
-                    'Concatenating paused recording (stop time passed at restart)',
+                    'Joining a paused recording\'s segments (stop time passed at restart)',
                 )
                 threading.Thread(target=do_concatenation, args=(app, rec.id), daemon=True).start()
             else:
@@ -651,8 +660,8 @@ def resume_in_progress_recordings(app):
                 # id, so relaunching would put a second ffmpeg on the same output.
                 continue
             resuming_postprocess = committed_concat_output(rec) is not None
-            phase = ('post-processing (concat already complete)' if resuming_postprocess
-                     else 'concatenation')
+            phase = ('post-processing (the join is already complete)' if resuming_postprocess
+                     else 'the join')
             log.info('Recording %d was %s at restart → resuming %s', rec.id, rec.status, phase)
             threading.Thread(
                 target=do_concatenation, args=(app, rec.id),

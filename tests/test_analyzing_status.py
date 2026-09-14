@@ -68,7 +68,7 @@ class AnalysisPhaseHasItsOwnStatusTests(unittest.TestCase):
         rid = self._rec('CONCATENATING')
         seen = []
 
-        def _spy(recording_id, ts_path, rec, cfg):
+        def _spy(recording_id, ts_path, rec, cfg, **kwargs):
             db.session.expire_all()
             seen.append(db.session.get(Recording, recording_id).status)
             return {}, None
@@ -187,10 +187,10 @@ class AnalyzingIsNamedByEverySurfaceTests(unittest.TestCase):
     def test_the_recordings_list_gives_it_its_own_row_rendering(self):
         """Not the st-abort/.get() fallback, which is how a real state renders as an
         unknown one without erroring."""
-        from app.routes.recordings import _STATUS_ROW
+        from app.fmt_utils import REC_STATUS_DISPLAY
         from app.database import REC_STATUS_ANALYZING
-        self.assertIn(REC_STATUS_ANALYZING, _STATUS_ROW)
-        section, _st, _badge, label, _pulse = _STATUS_ROW[REC_STATUS_ANALYZING]
+        self.assertIn(REC_STATUS_ANALYZING, REC_STATUS_DISPLAY)
+        section, _st, _badge, label, _pulse = REC_STATUS_DISPLAY[REC_STATUS_ANALYZING]
         self.assertEqual(section, 'live')
         self.assertEqual(label, 'ANALYZING')
 

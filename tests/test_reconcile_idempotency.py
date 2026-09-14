@@ -34,8 +34,13 @@ SD = ('1280x720', 30)
 
 
 class FakeTest:
-    def __init__(self, key):
+    """status is part of the fake, not decoration: only a COMPLETED check measures a
+    format (app/channel_groups.py::format_key), so a fake without one reads as untested
+    and every outlier assertion below would pass for the wrong reason."""
+
+    def __init__(self, key, status='COMPLETED'):
         self.resolution, self.fps = key
+        self.status = status
 
 
 class ReconcileIdempotencyTests(unittest.TestCase):

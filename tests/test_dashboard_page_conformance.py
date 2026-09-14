@@ -521,7 +521,7 @@ class RowHealthEdgeAndSortTests(unittest.TestCase):
     """dev/changelog/670: the Recording and Account sync status cards should carry the
     same left-edge health-status color other cards use, and their column headers should
     sort on click. Both reuse existing mappings rather than inventing new ones - the
-    recordings list's `_STATUS_ROW` for recording rows, the Accounts list's edge classes
+    the one `fmt_utils.REC_STATUS_DISPLAY` table for recording rows, the Accounts list's edge classes
     (now `m.account_edge_class`) for account rows - so a status can never be colored two
     different ways on two pages."""
 
@@ -559,6 +559,79 @@ class RowHealthEdgeAndSortTests(unittest.TestCase):
             self.assertIsNotNone(m, f'no row found for {status}')
             self.assertIn(cls, m.group(0).split('"')[1].split(),
                           f'{status} row is missing {cls}')
+
+    def test_every_reachable_recording_status_renders_its_label_not_the_raw_enum(self):
+        """dev/changelog/961: the badge text is the word every other surface uses for that
+        status, not Recording.status. This page printed the stored enum, so it said
+        CONCATENATING where the Recordings list said JOINING and IN_PROGRESS where the list
+        said RECORDING - the same state under two names on two pages, which is exactly what
+        dev/changelog/867's rename was for."""
+        now = datetime.utcnow()
+        expect = {
+            'SCHEDULED': 'SCHEDULED', 'IN_PROGRESS': 'RECORDING', 'PAUSED': 'PAUSED',
+            'RETRYING': 'RETRYING', 'CONCATENATING': 'JOINING', 'ANALYZING': 'ANALYZING',
+            'CONVERTING': 'CONVERTING',
+        }
+        with self.t.app.app_context():
+            acc = make_account()
+            ch = make_channel(acc)
+            ids = {}
+            for status in expect:
+                rec = make_recording(
+                    status=status, name=f'{status} show', channel_id=ch.id,
+                    start_time=now - timedelta(minutes=10), stop_time=now + timedelta(minutes=50),
+                    started_at=None if status == 'SCHEDULED' else now - timedelta(minutes=10))
+                ids[status] = rec.id
+            db.session.commit()
+        html = self.client.get('/').get_data(as_text=True)
+        for status, label in expect.items():
+            m = re.search(rf'<span class="badge[^"]*" id="badge-{ids[status]}">([^<]*)</span>',
+                          html)
+            self.assertIsNotNone(m, f'no badge found for {status}')
+            self.assertEqual(label, m.group(1).strip(),
+                             f'{status} badge should read {label}')
+
+    def test_a_parked_post_processing_row_badges_as_waiting(self):
+        """dev/changelog/961: the background-task chip already called a parked row
+        "Waiting to convert" (dev/changelog/954) while the row badge two inches away still
+        said ANALYZING. One derivation, in fmt_utils.rec_status_display, so the two cannot
+        disagree. A CONCATENATING row is deliberately NOT waitable - a join is never
+        parked - so it must keep reading JOINING even with the column set."""
+        now = datetime.utcnow()
+        with self.t.app.app_context():
+            acc = make_account()
+            ch = make_channel(acc)
+            parked = make_recording(
+                status='ANALYZING', name='Parked', channel_id=ch.id,
+                start_time=now - timedelta(minutes=10), stop_time=now + timedelta(minutes=50),
+                started_at=now - timedelta(minutes=10))
+            joining = make_recording(
+                status='CONCATENATING', name='Joining', channel_id=ch.id,
+                start_time=now - timedelta(minutes=10), stop_time=now + timedelta(minutes=50),
+                started_at=now - timedelta(minutes=10))
+            parked.postprocess_waiting_since = now
+            joining.postprocess_waiting_since = now
+            db.session.commit()
+            parked_id, joining_id = parked.id, joining.id
+        html = self.client.get('/').get_data(as_text=True)
+        m = re.search(rf'<span class="badge[^"]*" id="badge-{parked_id}">([^<]*)</span>', html)
+        self.assertIsNotNone(m)
+        self.assertEqual('WAITING', m.group(1).strip())
+        m = re.search(rf'<span class="badge[^"]*" id="badge-{joining_id}">([^<]*)</span>', html)
+        self.assertIsNotNone(m)
+        self.assertEqual('JOINING', m.group(1).strip())
+
+    def test_the_page_hands_its_javascript_the_same_label_table_it_rendered(self):
+        """dashboard.js relabels a badge from the status on an SSE frame. It reads the
+        server's own table out of #dash-status-labels rather than carrying a second,
+        hand-written copy that can drift from app/fmt_utils.py (dev/changelog/961)."""
+        from app.fmt_utils import REC_STATUS_DISPLAY
+        html = self.client.get('/').get_data(as_text=True)
+        m = re.search(r'<script type="application/json" id="dash-status-labels">(.*?)</script>',
+                      html, re.S)
+        self.assertIsNotNone(m, 'the page renders no status-label table for its JS')
+        labels = json.loads(m.group(1))
+        self.assertEqual({s: row[3] for s, row in REC_STATUS_DISPLAY.items()}, labels)
 
     def test_every_account_status_carries_its_own_edge_class(self):
         expect = {'OK': 'st-ok', 'SYNCING': 'st-sync', 'ERROR': 'st-bad', 'UNSYNCED': 'st-none'}

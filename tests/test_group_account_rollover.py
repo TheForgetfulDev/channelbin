@@ -122,9 +122,9 @@ class _GroupCase(unittest.TestCase):
                                            health_score=100)
         self.ch_spare = seed.make_channel(self.acct_idle, name='Spare Feed',
                                           health_score=100)
-        seed.make_channel_test(self.ch_strong, all_null=False, status='PASS',
+        seed.make_channel_test(self.ch_strong, all_null=False, status='COMPLETED',
                                bitrate_kbps=6592)
-        seed.make_channel_test(self.ch_spare, all_null=False, status='PASS',
+        seed.make_channel_test(self.ch_spare, all_null=False, status='COMPLETED',
                                bitrate_kbps=4906)
         self.group = seed.make_group(name='Fox Sports 1',
                                      members=[self.ch_strong, self.ch_spare])
@@ -221,7 +221,7 @@ class FailoverPrefersAFreeAccountTests(_GroupCase):
         self.acct_third = seed.make_account(name='Third Account', max_connections=1)
         self.ch_third = seed.make_channel(self.acct_third, name='Third Feed',
                                           health_score=100)
-        seed.make_channel_test(self.ch_third, all_null=False, status='PASS',
+        seed.make_channel_test(self.ch_third, all_null=False, status='COMPLETED',
                                bitrate_kbps=1000)
         db.session.add(ChannelGroupMember(
             group_id=self.group_id, channel_id=self.ch_third.id, position=2,

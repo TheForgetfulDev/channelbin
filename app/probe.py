@@ -59,6 +59,13 @@ def _report_ffprobe_unusable(ffprobe_path: str, exc: OSError, context: str) -> N
         log.exception('Could not report the missing ffprobe')
 
 
+# How often scan_video_timeline samples its child's read counter for a progress hook.
+# Matched to run_probe_until_stalled's 1s poll rather than to anything the scan does, so
+# the two passes of one analysis advance at the same visible cadence; the surfaces reading
+# them redraw every 15s, so a finer sample would be thrown away.
+_SCAN_PROGRESS_INTERVAL = 1.0
+
+
 def _bytes_read(pid: int):
     """Bytes this process has read via syscalls, or None when /proc can't answer.
 
@@ -77,8 +84,24 @@ def _bytes_read(pid: int):
     return None
 
 
+def _report_progress(on_progress, read_bytes):
+    """Hand one bytes-read sample to a caller's progress hook, never raising.
+
+    A progress report is a diagnostic, and a diagnostic that can kill the pass it is
+    describing is worse than no diagnostic (CLAUDE.md). The hook is supplied by a surface
+    that only wants to draw a percentage, so anything it throws is swallowed here rather
+    than propagating into a probe the recording depends on.
+    """
+    if on_progress is None or read_bytes is None:
+        return
+    try:
+        on_progress(read_bytes)
+    except Exception:
+        log.exception('A probe progress hook raised; the probe itself is unaffected')
+
+
 def run_probe_until_stalled(cmd, stall_timeout: int, fallback_timeout: int,
-                            poll_interval: float = 1.0):
+                            poll_interval: float = 1.0, on_progress=None):
     """Run a probe that reads a whole file, bounded by progress rather than wall clock.
 
     A fixed deadline is the wrong tool for a probe whose runtime scales with file size:
@@ -91,6 +114,12 @@ def run_probe_until_stalled(cmd, stall_timeout: int, fallback_timeout: int,
 
     fallback_timeout is a plain wall-clock deadline used only when /proc gives no progress
     signal - without one, an unreadable /proc would turn every probe unbounded.
+
+    on_progress(read_bytes) is called with each new sample of that same counter, so a
+    caller that wants to report how far the read has got pays nothing extra: the sample is
+    already being taken to decide whether the probe has stalled. It is not called at all on
+    a machine whose /proc gives no signal, which is the same condition that drops this
+    function back to the wall-clock deadline - absent progress reads as absent, never 0%.
 
     Returns (returncode, stdout_text). Raises subprocess.TimeoutExpired on a stall, so
     callers can treat it exactly as they treat subprocess.run's timeout.
@@ -107,6 +136,7 @@ def run_probe_until_stalled(cmd, stall_timeout: int, fallback_timeout: int,
     last_progress = started
     last_read = _bytes_read(proc.pid)
     have_signal = last_read is not None
+    _report_progress(on_progress, last_read)
     try:
         while True:
             try:
@@ -122,6 +152,7 @@ def run_probe_until_stalled(cmd, stall_timeout: int, fallback_timeout: int,
                 continue
 
             current = _bytes_read(proc.pid)
+            _report_progress(on_progress, current)
             if current is not None and current > last_read:
                 last_read = current
                 last_progress = now
@@ -244,7 +275,7 @@ RATE_SAME_TOLERANCE = 0.02
 
 
 def parse_ffprobe(filepath: str, count_packets: bool = True, timeout: int = 60,
-                  stall_timeout: int = 60) -> dict:
+                  stall_timeout: int = 60, on_progress=None) -> dict:
     """Return dict with video/audio stream metadata and format info.
 
     Keys: resolution, fps, duration, bitrate_bps, frame_count, vid_width,
@@ -271,6 +302,10 @@ def parse_ffprobe(filepath: str, count_packets: bool = True, timeout: int = 60,
     file, so its runtime scales with size and no fixed clock can be right for both a 25 MB
     and a 19 GB capture; it is bounded by `stall_timeout` instead - seconds of no reading
     at all - with `timeout` left as the fallback for when /proc offers no progress signal.
+
+    on_progress(read_bytes) reports how far that whole-file read has got, for a caller
+    reporting a long pass to a user. It applies to the count_packets shape only: a
+    header-only probe finishes in about a second and has nothing to report.
     """
     ffprobe_path = resolve_ffprobe_path()
     cmd = [
@@ -294,7 +329,8 @@ def parse_ffprobe(filepath: str, count_packets: bool = True, timeout: int = 60,
         try:
             if count_packets:
                 returncode, stdout = run_probe_until_stalled(
-                    cmd, stall_timeout=stall_timeout, fallback_timeout=timeout)
+                    cmd, stall_timeout=stall_timeout, fallback_timeout=timeout,
+                    on_progress=on_progress)
             else:
                 result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
                 returncode, stdout = result.returncode, result.stdout
@@ -553,7 +589,7 @@ def effective_capture_fps(segment_rates) -> tuple:
 
 
 def scan_video_timeline(filepath: str, gap_threshold: float = 0.25, timeout: int = 600,
-                        expected_fps: float | None = None) -> dict:
+                        expected_fps: float | None = None, on_progress=None) -> dict:
     """Scan every video packet's timestamps and measure timeline damage.
 
     Gaps are counted on the DECODE timeline (dts_time), never the presentation timeline.
@@ -602,6 +638,11 @@ def scan_video_timeline(filepath: str, gap_threshold: float = 0.25, timeout: int
     of real damage (dev/changelog/866). This function measures a file and cannot know it was
     concatenated, let alone from what - so the corrected rate is a parameter, and
     assess_seek_damage() is what derives it from the segment rows.
+
+    on_progress(read_bytes) reports how far the scan's own ffprobe has read, sampled from
+    the same /proc counter run_probe_until_stalled uses. Sampled on a clock rather than per
+    packet: this loop turns once per CSV line and a 6-hour capture is millions of them, so
+    an unthrottled read would turn one /proc open per second into one per packet.
 
     Returns {} on any error (missing file, no video stream, ffprobe failure).
     """
@@ -654,6 +695,8 @@ def scan_video_timeline(filepath: str, gap_threshold: float = 0.25, timeout: int
 
         try:
             last_progress = time.monotonic()
+            last_report = last_progress
+            _report_progress(on_progress, _bytes_read(proc.pid))
             while True:
                 try:
                     line = lines.get(timeout=1.0)
@@ -664,6 +707,9 @@ def scan_video_timeline(filepath: str, gap_threshold: float = 0.25, timeout: int
                 if line is None:
                     break
                 last_progress = time.monotonic()
+                if on_progress is not None and last_progress - last_report >= _SCAN_PROGRESS_INTERVAL:
+                    last_report = last_progress
+                    _report_progress(on_progress, _bytes_read(proc.pid))
 
                 fields = line.strip().rstrip(',').split(',')
                 pts = _packet_time(fields[0] if fields else '')
@@ -739,15 +785,21 @@ def scan_video_timeline(filepath: str, gap_threshold: float = 0.25, timeout: int
         return {}
 
 
-def assess_seek_damage(filepath: str, *, joined_segments: int = 1, segment_rates=None) -> tuple:
+def assess_seek_damage(filepath: str, *, joined_segments: int = 1, segment_rates=None,
+                       on_progress=None) -> tuple:
     """Decide whether a recording's video timeline is damaged enough to break seeking.
 
-    segment_rates is [(duration_seconds, fps), ...] for the segments that were joined, from
+    segment_rates is [(content_seconds, fps), ...] for the segments that were joined, from
     the capture-time probe already stored on recording_segments. It is used ONLY when those
     rates disagree, in which case the frame deficit is measured against their duration-
     weighted mean instead of the file header's single nominal rate - see
     scan_video_timeline's expected_fps. A recording that held one rate throughout is
     measured exactly as before, whether or not its rates were supplied.
+
+    The weight is each segment's own CONTENT length, never how long it took to arrive: the
+    deficit counts frames against content time, so a stretch that arrived faster than real
+    time must still weigh what it holds. Supplying wall clock instead reported an entire rate
+    change as missing video on the recordings that had one (dev/changelog/962).
 
     Two facts come back in the metrics when the rates disagree, because the verdict changing
     on a fact the caller cannot see is the failure this replaced: capture_fps_values (the
@@ -780,7 +832,8 @@ def assess_seek_damage(filepath: str, *, joined_segments: int = 1, segment_rates
     # correct a rate CHANGE, and applying it otherwise would silently re-target the deficit
     # of every recording in the app on the strength of a mid-capture probe.
     mixed = len(distinct_rates) > 1
-    metrics = scan_video_timeline(filepath, expected_fps=effective_fps if mixed else None)
+    metrics = scan_video_timeline(filepath, expected_fps=effective_fps if mixed else None,
+                                  on_progress=on_progress)
     if not metrics:
         return False, {}, 'timeline scan failed - assuming undamaged'
     if mixed:

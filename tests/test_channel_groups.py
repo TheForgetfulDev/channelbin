@@ -32,10 +32,15 @@ SD = ('1280x720', 30)
 
 
 class FakeTest:
-    def __init__(self, resolution=None, fps=None, bitrate_kbps=None):
+    """A stand-in ChannelTest. `status` defaults to COMPLETED because only a completed
+    check measures a format (app/channel_groups.py::format_key) - a fake without one
+    would read as "this feed's format is unknown" and quietly assert nothing."""
+
+    def __init__(self, resolution=None, fps=None, bitrate_kbps=None, status='COMPLETED'):
         self.resolution = resolution
         self.fps = fps
         self.bitrate_kbps = bitrate_kbps
+        self.status = status
 
 
 class FakeChannel:

@@ -67,6 +67,10 @@
    rows this render already read. GUIDE_CONFIG's pattern. #}
 <script type="application/json" id="dash-timeline">{{ timeline | tojson }}</script>
 <script type="application/json" id="dash-sections-pref">{{ {'key': section_pref_key, 'order': section_order, 'on': section_on, 'defs': section_defs} | tojson }}</script>
+{#- The one status -> label table (app/fmt_utils.py), handed to dashboard.js so an SSE
+    relabel uses the same words the server rendered rather than a second, hand-written
+    copy that can drift from it (dev/changelog/961). -#}
+<script type="application/json" id="dash-status-labels">{{ rec_status_labels | tojson }}</script>
 
 <div class="dash-pulse">
   {% for m in metrics %}
@@ -150,7 +154,11 @@
             </span>
           </span>
           <span class="d-cell d-badge">
-            <span class="badge badge-{{ rec.status | lower }}" id="badge-{{ rec.id }}">{{ rec.status }}</span>
+            {#- The badge CLASS keys off the stored status (it is an internal key, not
+                text); the badge TEXT is the label every other surface uses for that
+                status, so this page stops saying CONCATENATING where the Recordings list
+                says JOINING (dev/changelog/961). -#}
+            <span class="badge badge-{{ rec.status | lower }}" id="badge-{{ rec.id }}">{{ rec_status_text.get(rec.id, rec.status) }}</span>
           </span>
 
           {#- Three stats per row, and WHICH three depends on the status. The full

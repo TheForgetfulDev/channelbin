@@ -19,15 +19,22 @@ from .. import events as ev
 from ..tz_utils import UTC, to_naive_utc, format_local, relative
 from ..accounts import get_sync_progress, next_sync_map, sync_signature
 from .channel_tests import get_active_run_summary
-from .recordings import _STATUS_ROW
+from ..fmt_utils import REC_STATUS_DISPLAY, rec_status_display
 
 dashboard_bp = Blueprint('dashboard', __name__)
 log = logging.getLogger(__name__)
 
-# The dashboard's recording rows reuse the recordings list's own status -> left-edge-class
-# mapping rather than a second copy, so the two surfaces cannot silently color the same
-# status two different ways (CLAUDE.md: "one flag, one meaning; states are enumerated").
-REC_ROW_STATUS_CLASS = {status: row[1] for status, row in _STATUS_ROW.items()}
+# The dashboard's recording rows reuse the one status vocabulary rather than a second copy,
+# so the two surfaces cannot silently color - or name - the same status two different ways
+# (CLAUDE.md: "one flag, one meaning; states are enumerated"). The label half was left
+# behind here for as long as the table existed, which is why the template printed the raw
+# enum and the Dashboard said CONCATENATING where every other page said JOINING
+# (dev/changelog/961).
+REC_ROW_STATUS_CLASS = {status: row[1] for status, row in REC_STATUS_DISPLAY.items()}
+
+# For dashboard.js, which relabels a badge from the status on an SSE frame. Rendered into
+# the page as JSON rather than hand-written in the .js file, so there is one table, not two.
+REC_ROW_STATUS_LABEL = {status: row[3] for status, row in REC_STATUS_DISPLAY.items()}
 
 
 # ── DESIGN.md 16.1/16.2: the sections, their order, and their one jump-off ───
@@ -116,6 +123,46 @@ def _converting_detail(r):
         mins = eta // 60
         bits.append(f'~{mins} min left' if mins >= 1 else '~<1 min left')
     return f'{name} - {", ".join(bits)}' if bits else name
+
+
+def _joining_detail(r):
+    """Dashboard bg-task detail for a CONCATENATING row: the live join's own numbers when an
+    ffmpeg is running, else just the name.
+
+    The registry read is a dict lookup, not a query - the join's progress is in memory
+    because a join always re-runs from the top rather than resuming (see
+    concatenator._concat_progress). No entry means the row is queued behind another job,
+    which is a real state and reads as the bare name rather than a fabricated 0%."""
+    from ..concatenator import concat_progress
+    prog = concat_progress(r.id)
+    if prog is None:
+        return r.name
+    bits = []
+    if prog['pct'] is not None:
+        bits.append(f"{prog['pct']:.0f}%")
+    bits.append(f"{prog['joined']} of {prog['of']} segments")
+    return f'{r.name} - {", ".join(bits)}'
+
+
+def _analyzing_detail(r):
+    """Dashboard bg-task detail for an ANALYZING row: which whole-file read is running and
+    how far through it is, else just the name.
+
+    Same registry read and the same reasoning as _joining_detail above
+    (postprocessor._analysis_progress). No entry means no pass is reading - between the two
+    passes, or before the first one - which reads as the bare name rather than a 0% that
+    describes nothing."""
+    from ..postprocessor import analysis_progress
+    prog = analysis_progress(r.id)
+    if prog is None:
+        return r.name
+    label = prog['pass_label']
+    if prog['of_passes'] > 1:
+        label += f" ({prog['pass_number']} of {prog['of_passes']})"
+    bits = [label]
+    if prog['pct'] is not None:
+        bits.append(f"{prog['pct']:.0f}%")
+    return f'{r.name} - {", ".join(bits)}'
 
 
 # ── DESIGN.md 16.1: the metric strip ────────────────────────────────────────
@@ -363,6 +410,12 @@ def dashboard():
         next_sync=next_sync_map(accounts),
         live=live, upcoming=upcoming, now=now, live_stats=_live_row_stats(live, now),
         rec_status_class=REC_ROW_STATUS_CLASS,
+        # Per row rather than through the rec_status_label filter, because the parked
+        # derivation needs a second column off the row. Built from the rows already
+        # loaded - a dict build, no query (tests/test_scaling_pages.py::test_dashboard_page).
+        rec_status_text={r.id: rec_status_display(
+            r.status, waiting=bool(r.postprocess_waiting_since))[3] for r in active},
+        rec_status_labels=REC_ROW_STATUS_LABEL,
         section_defs=DASHBOARD_SECTIONS, section_order=order, section_on=enabled,
         section_pref_key=DASHBOARD_SECTIONS_PREF,
         metrics=_metric_tiles(active, accounts, now),
@@ -591,6 +644,10 @@ def _activity_status_dict():
                 detail = f'{r.name} - waiting on "{r.postprocess_waiting_on_name}"'
             elif status_val == REC_STATUS_CONVERTING:
                 detail = _converting_detail(r)
+            elif status_val == REC_STATUS_CONCATENATING:
+                detail = _joining_detail(r)
+            elif status_val == REC_STATUS_ANALYZING:
+                detail = _analyzing_detail(r)
             bg_tasks.append({'label': row_label, 'detail': detail,
                              'href': url_for('recordings.recording_detail', recording_id=r.id)})
             dashboard_bg_count += 1

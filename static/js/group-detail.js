@@ -633,10 +633,31 @@
   }
 
   // The format of one member's own last test, for the mismatch pill's copy.
+  //
+  // `format_source` is set only when the check this table is scoped to and the member's
+  // newest check disagree about the format. The verdict was decided on the newer one, so
+  // that is the format the pill must name - reading the rendered test instead produced
+  // "this member is 1920x1080 @ 60 and the group is pinned by hand to 1920x1080 @ 60"
+  // (dev/docs/BUGS.md 2026-09-14).
   function memberFormatLabel(r) {
+    const src = r.format_source;
+    if (src) return src.label || src.measured || 'an unmeasured format';
     const t = r.last_test;
     if (!t || !t.resolution) return 'an unmeasured format';
     return t.fps ? `${t.resolution} @ ${Math.round(t.fps)}` : t.resolution;
+  }
+
+  // Where that other measurement came from, as one sentence to append to a row's format
+  // copy. Names the check and the date, because "a different check said otherwise" that
+  // does not say which check is not something anyone can go and look at.
+  function formatSourceNote(r) {
+    const src = r.format_source;
+    if (!src) return '';
+    const who = src.pre_check ? 'a recording pre-check'
+      : (src.job_name ? `the ${src.job_name} check` : 'another check');
+    const when = src.tested_at ? ` on ${src.tested_at}` : '';
+    return ` This member's newest check is ${who}${when}, which measured`
+      + ` ${src.measured} (${src.status}); the table is showing this check's result instead.`;
   }
 
   // A member proven to differ from the format a recording would open at if one started
@@ -675,7 +696,7 @@
       out.push({ cls: 'b-warn', pill: 'Format mismatch', title: 'Format mismatch.',
         detail: `Recording is on, but this member is ${memberFormatLabel(r)} and the group is ` +
           `pinned by hand to ${G.lockLabel || 'another format'}. It will not be used until it ` +
-          'matches, or until you change the format strategy.' });
+          'matches, or until you change the format strategy.' + formatSourceNote(r) });
     } else if (r.format_blocked) {
       // An automatic strategy's lock filters exactly as a pin does, so this member really is
       // skipped and the row still has to say why - but as a note, not a warning: the
@@ -684,7 +705,7 @@
         detail: `This member is ${memberFormatLabel(r)} and the group format is ` +
           `${G.lockLabel || 'another format'}, chosen by the format strategy. It is skipped ` +
           'when a recording picks a member until it matches, or until the strategy moves the ' +
-          'group to its format.' });
+          'group to its format.' + formatSourceNote(r) });
     } else if (floatingMismatch(r)) {
       // Quiet on purpose: nothing is wrong with this member being here, and it can become
       // the highest-ranked member itself - at which point the group format moves to ITS
@@ -695,7 +716,7 @@
           `${G.referenceLabel || 'another format'}, taken from its highest-ranked member. ` +
           'Nothing is filtered - this member can become the highest-ranked one itself - but a ' +
           'recording keeps the format it starts on, so a run beginning now would not fail ' +
-          'over to it.' });
+          'over to it.' + formatSourceNote(r) });
     }
     // 4.3's two conditions, as two pills: they fail differently, and the second is the
     // more dangerous of the two because stale data is confidently wrong where missing
@@ -816,6 +837,15 @@
         // FPS is repeated here as a subtitle so Format reads at a glance without the
         // separate FPS column; sorting still keys off resolution alone.
         const sub = t.fps ? `<div class="gd-sub num">${t.fps.toFixed(1)} fps</div>` : '';
+        // The cell keeps rendering THIS check's measurement - the table's job scope is the
+        // feature, and the Format filter buckets on the same value, so the column and the
+        // filter cannot drift apart. What it may not do is state the value flat while the
+        // row's format verdict was reached on another one: that is the contradiction the
+        // tooltip exists to name (dev/docs/BUGS.md 2026-09-14).
+        if (r.format_source) {
+          return `<td class="num"><span class="val-warn tip-plain" data-tip="A newer check disagrees.` +
+            `&#10;${escHtml(formatSourceNote(r).trim())}">${escHtml(t.resolution)}</span>${sub}</td>`;
+        }
         return `<td class="num">${escHtml(t.resolution)}${sub}</td>`;
       }
       case 'fps': return `<td class="num">${t && t.fps ? t.fps.toFixed(1) : '<span class="text-muted">&mdash;</span>'}</td>`;
@@ -1020,9 +1050,17 @@
           ? '<span class="text-muted">no score</span>'
           : `<span class="hb-text ${healthBandCss(s)}">&#9733;${s}</span>`);
       } else if (k === 'res') {
-        bits.push(t && t.resolution
+        const fmt = t && t.resolution
           ? escHtml(t.resolution) + (t.fps ? ` @ ${t.fps.toFixed(0)}` : '')
-          : '<span class="text-muted">no format</span>');
+          : null;
+        if (fmt && r.format_source) {
+          // Same disclosure the desktop Format cell carries - this line is where the
+          // contradiction was actually reported from (dev/docs/BUGS.md 2026-09-14).
+          bits.push(`<span class="val-warn tip-plain" data-tip="A newer check disagrees.` +
+            `&#10;${escHtml(formatSourceNote(r).trim())}">${fmt}</span>`);
+        } else {
+          bits.push(fmt || '<span class="text-muted">no format</span>');
+        }
       } else if (k === 'audio') {
         // The summary plus the language, which is the pair the desktop cell shows on its two
         // lines - a card line has no second line to put the subtitle on.

@@ -1247,6 +1247,7 @@ def _run_channel_test_inner(app, channel_id: int, job_id: Optional[int] = None,
         bitrate_fail_720p  = ct_cfg.get('bitrate_fail_720p_kbps', 1000)
         bitrate_fail_1080p = ct_cfg.get('bitrate_fail_1080p_kbps', 2000)
         bitrate_fail_4k    = ct_cfg.get('bitrate_fail_4k_kbps', 3000)
+        placeholder_check_enabled = ct_cfg.get('placeholder_source_check', True)
         ffmpeg_path = resolve_ffmpeg_path(cfg['ffmpeg']['path'])
         stall_threshold = 15
 
@@ -1561,6 +1562,39 @@ def _run_channel_test_inner(app, channel_id: int, job_id: Optional[int] = None,
                 except Exception as exc:
                     _append_log('WARN', f'ffprobe failed: {exc}')
 
+            # Is the provider serving a FILE rather than a feed? Checked before the bitrate
+            # rule below so a placeholder is named as one instead of being reported as a
+            # channel with a bad picture - deliberate, see dev/changelog/957.
+            #
+            # The recorder detects this by ratio - ten minutes of content in five seconds -
+            # but the tester reads at 1x under -re, so that signal does not exist here and a
+            # different one is needed. This is it, and it is stronger than the bitrate
+            # heuristic it precedes: a live stream has no end, so its container declares no
+            # duration, while a served file declares one. Measured on this box 2026-09-14
+            # against the live accounts - three channels serving the clip all reported
+            # duration=600.046444 size=14472616, and two genuinely live channels reported
+            # duration=None size=None (dev/changelog/957).
+            #
+            # One extra probe per connected test, sequential with the capture (which has
+            # already closed), 1.6-2.8s measured. Fail-open: a probe that errors or times out
+            # leaves the verdict exactly as it would have been.
+            if connected and placeholder_check_enabled:
+                # The same normalized URL the capture used, never the raw column: probing a
+                # different spelling than the one under test would answer about a different
+                # endpoint.
+                source_duration = _probe_source_container_duration(stream_url, _append_log)
+                if source_duration is not None:
+                    connected = False
+                    status = TEST_STATUS_FAILED
+                    placeholder_msg = (
+                        f'Provider placeholder clip: this URL serves a finite '
+                        f'{source_duration:.0f}s file, not a live stream - the provider is '
+                        f'answering with its "channel offline" clip')
+                    error_detail = ((error_detail + '; ' + placeholder_msg)
+                                    if error_detail else placeholder_msg)
+                    quality_fail_msg = placeholder_msg
+                    _append_log('ERROR', placeholder_msg)
+
             if connected and bitrate_kbps is not None and resolution:
                 try:
                     h = int(resolution.split('x')[1])
@@ -1837,6 +1871,38 @@ def _is_preempted() -> bool:
     that result is lost and the channel reports a bare connection failure."""
     with _lock:
         return _state.preempted_by_recording
+
+
+def _probe_source_container_duration(url: str, append_log, timeout: int = 20):
+    """The finite container duration this stream URL declares, or None for a live feed.
+
+    The one test for "the provider is serving a file, not a channel". A live MPEG-TS has no
+    end and ffprobe reports no format duration for one; a served file has both a duration and
+    a size. Returns a float only when the answer is unambiguous, so every other outcome -
+    a probe that failed, timed out, or reported nothing - comes back None and changes no
+    verdict.
+
+    Deliberately not the bitrate or the black-screenshot signals that catch this today by
+    side effect: both are properties of the picture, so a provider whose placeholder is
+    encoded above the 1080p bitrate floor passes them, and neither can say what is actually
+    wrong. See app/watchdog.py::classify_placeholder_segment for the recorder's own test,
+    which measures a different signal for the same fact (dev/changelog/957).
+    """
+    from .probe import parse_ffprobe
+    try:
+        info = parse_ffprobe(url, count_packets=False, timeout=timeout)
+    except Exception as exc:
+        append_log('WARN', f'Could not check whether the source is a live stream or a '
+                           f'fixed clip: {mask_creds_in_text(str(exc))}')
+        return None
+    duration = info.get('duration')
+    if duration is None:
+        return None
+    try:
+        duration = float(duration)
+    except (TypeError, ValueError):
+        return None
+    return duration if duration > 0 else None
 
 
 def _drain_stderr(pipe, buf: collections.deque):

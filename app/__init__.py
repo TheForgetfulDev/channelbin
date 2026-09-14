@@ -71,19 +71,13 @@ def create_app(config_overrides=None, start_scheduler=True):
     # here, where config_overrides are honored, so make_test_app can sandbox it.
     capture_log_dir = resolve_app_path(cfg['recording'].get('capture_log_dir', 'capture-logs'))
     app.config['CAPTURE_LOG_DIR'] = capture_log_dir
+    # Creating the directory is every app build's business - CAPTURE_LOG_DIR has to be
+    # usable the moment one spawns a capture. Sweeping the spools inside it is NOT: that
+    # moved to init_scheduler(), behind the pidfile claim, in dev/changelog/967. Sweeping
+    # here deleted a live recording's spool whenever a second app was built against the
+    # real config while the service was up, and the segment lost its diagnostics silently.
     try:
         os.makedirs(capture_log_dir, exist_ok=True)
-        # Sweep every spool at startup. No capture can be running yet - resume_recording()
-        # has not been called - so anything here is a leftover from a process that was
-        # killed mid-capture, where kill_all_active() deliberately does no cleanup because
-        # it runs in a signal handler. Without this they accumulate for any recording that
-        # never resumes.
-        import glob as _glob
-        for stale in _glob.glob(os.path.join(capture_log_dir, '.cap-stderr-*.log')):
-            try:
-                os.unlink(stale)
-            except OSError:
-                pass  # best-effort; a stale spool is inert, and per-attempt tokens make it unreadable as a live one
     except OSError as exc:
         # Not fatal: capture must still run without its diagnostics (Product Principle 2 -
         # a diagnostic never harms the capture). _launch_segment degrades to DEVNULL.
@@ -232,6 +226,10 @@ def create_app(config_overrides=None, start_scheduler=True):
         report_tool_state(source='startup',
                           configured_ffmpeg_path=cfg['ffmpeg'].get('path', 'ffmpeg'),
                           configured_ffprobe_path=cfg['ffmpeg'].get('ffprobe_path', ''))
+        # Handed the same resolved cfg for the same reason report_gate_state is: a
+        # hand-edited config.yaml must be as loud at startup as a settings save is.
+        from .proc_utils import report_read_timeout_state
+        report_read_timeout_state(cfg, source='startup')
 
     from .routes import register_blueprints
     register_blueprints(app)
