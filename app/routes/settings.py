@@ -176,6 +176,10 @@ def api_settings_field():
         # conversion on its first poll, before ffmpeg could possibly have muxed anything.
         'recording.post_process.pre_output_timeout_seconds': (1, None),
         'recording.post_process.stall_seconds': (0, None),
+        # Same split as the conversion pair above: the pre-output budget is never a disable
+        # switch (a 0 would kill every join on its first poll), the stall budget is.
+        'ffmpeg.concat_pre_output_timeout_seconds': (1, None),
+        'ffmpeg.concat_stall_seconds': (0, None),
         'recording.post_process.progress_interval_seconds': (1, 60),
         'recording.post_process.video_crf': (0, 51),
         'recording.post_process.audio_bitrate_kbps': (32, 320),

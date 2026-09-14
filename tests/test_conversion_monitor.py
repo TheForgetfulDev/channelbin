@@ -16,6 +16,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import app.config as cfgmod  # noqa: E402
 import app.postprocessor as ppmod  # noqa: E402
+import app.proc_utils as pumod  # noqa: E402
 from tests.support.app import make_test_app  # noqa: E402
 from tests.support import seed  # noqa: E402
 from app import db  # noqa: E402
@@ -325,6 +326,12 @@ class _FakePopen:
         self._rc = returncode
         self.returncode = None
         self.terminated = False
+        self.signals = []
+
+    def send_signal(self, sig):
+        # terminate_or_kill() continues a possibly-suspended child before every teardown
+        # (dev/changelog/952), so a fake that cannot take a signal is not a faithful one.
+        self.signals.append(sig)
 
     def poll(self):
         self._polls += 1
@@ -365,8 +372,8 @@ class RunnerDetectionTests(unittest.TestCase):
         self.t.cleanup()
 
     def _run(self, fake, progress_return, stall_seconds=0, pre_output_timeout=30, interval=0.05):
-        with mock.patch.object(ppmod.subprocess, 'Popen', return_value=fake), \
-             mock.patch.object(ppmod, '_read_progress_tail', side_effect=progress_return):
+        with mock.patch.object(pumod.subprocess, 'Popen', return_value=fake), \
+             mock.patch.object(pumod, 'read_progress_tail', side_effect=progress_return):
             return run_conversion_supervised(
                 self.t.app, self.rid, self.cmd, self.out,
                 expected_duration=100, pre_output_timeout=pre_output_timeout,
@@ -454,7 +461,7 @@ class StaleProgressFileTests(unittest.TestCase):
         self.t.cleanup()
 
     def _run(self, fake, stall_seconds, pre_output_timeout, interval=0.05):
-        with mock.patch.object(ppmod.subprocess, 'Popen', return_value=fake):
+        with mock.patch.object(pumod.subprocess, 'Popen', return_value=fake):
             return run_conversion_supervised(
                 self.t.app, self.rid, self.cmd, self.out,
                 expected_duration=100, pre_output_timeout=pre_output_timeout,
@@ -485,7 +492,7 @@ class StaleProgressFileTests(unittest.TestCase):
             return _FakePopen(alive_ticks=1, returncode=0)
 
         for _ in range(3):
-            with mock.patch.object(ppmod.subprocess, 'Popen', side_effect=_record):
+            with mock.patch.object(pumod.subprocess, 'Popen', side_effect=_record):
                 run_conversion_supervised(
                     self.t.app, self.rid, self.cmd, self.out,
                     expected_duration=100, pre_output_timeout=1.0, interval=0.05,

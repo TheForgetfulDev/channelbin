@@ -879,6 +879,32 @@ def resolve_broken_guide_row(group_id):
     return True
 
 
+def guide_groups_missing_recording_member():
+    """The guide groups that currently have nobody switched on for recording.
+
+    The read-only spelling of the invariant the alert half above enforces, for surfaces
+    that only want to say so - the Readiness check is the first (dev/changelog/950). Kept
+    here rather than re-derived at the call site because two answers to "which guide rows
+    cannot produce a file" is a disagreement the user sees, which is the same reason
+    guide_scope_channel_ids() is not inlined anywhere.
+
+    One query with the memberships batched in: the caller is a page, and walking
+    `group.memberships` per row is the N+1 CLAUDE.md's no-hidden-I/O rule names.
+
+    Returns (broken, total) - the ChannelGroup rows with nothing enabled, and how many
+    guide groups were examined, since "0 of 6" and "0 of 0" are different answers.
+    """
+    from sqlalchemy.orm import selectinload
+    from .database import ChannelGroup
+    groups = (ChannelGroup.query
+              .options(selectinload(ChannelGroup.memberships))
+              .filter(ChannelGroup.in_guide.is_(True),
+                      ChannelGroup.is_system.is_(False))
+              .order_by(ChannelGroup.name).all())
+    broken = [g for g in groups if not any(m.recording_enabled for m in g.memberships)]
+    return broken, len(groups)
+
+
 def report_orphaned_guide_groups(group_ids, cause='A channel it could record from was removed.'):
     """Say so about any of `group_ids` now sitting in the TV Guide with nothing switched
     on for recording, and commit those reports.

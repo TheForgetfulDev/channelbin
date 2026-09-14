@@ -203,7 +203,7 @@
              data-name="{{ acc.name | lower }}" data-status="{{ acc.status }}"
              data-channels="{{ acc.channel_count or 0 }}"
              data-lastsync="{{ (now - acc.last_sync_at).total_seconds() if acc.last_sync_at else '' }}"
-             data-nextsync="{{ (acc.next_sync_at - now).total_seconds() if acc.next_sync_at else '' }}"
+             data-nextsync="{{ (next_sync[acc.id] - now).total_seconds() if next_sync[acc.id] else '' }}"
              data-href="{{ url_for('accounts.account_detail', account_id=acc.id) }}">
           <span class="d-title">
             <span class="d-name">{{ acc.name }}</span>
@@ -218,7 +218,7 @@
           <span class="d-cell d-badge">{{ m.account_status_badge(acc.status, tip=false) }}</span>
           <span class="d-cell"><span class="d-k">Channels</span>{{ '{:,}'.format(acc.channel_count) if acc.channel_count else '-' }}{% if acc.hidden_channel_count %} <span class="text-faint">({{ '{:,}'.format(acc.hidden_channel_count) }} hidden)</span>{% endif %}</span>
           <span class="d-cell"><span class="d-k">Last sync</span>{{ acc.last_sync_at | time_ago if acc.last_sync_at else 'never' }}</span>
-          <span class="d-cell"><span class="d-k">Next sync</span>{{ acc.next_sync_at | time_until if acc.next_sync_at else '-' }}</span>
+          <span class="d-cell"><span class="d-k">Next sync</span>{{ next_sync[acc.id] | time_until if next_sync[acc.id] else '-' }}</span>
           <span class="c-actions">
             <a class="btn btn-sm" href="{{ url_for('accounts.account_detail', account_id=acc.id) }}">Manage</a>
           </span>

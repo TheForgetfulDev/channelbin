@@ -3,13 +3,13 @@ import contextlib
 import logging
 import os
 import shutil
-import subprocess
 import tempfile
 import threading
 import time
 from datetime import datetime
 
 from .fmt_utils import fmt_bytes as _fmt_bytes
+from .proc_utils import supervise_ffmpeg
 
 log = logging.getLogger(__name__)
 
@@ -17,6 +17,12 @@ log = logging.getLogger(__name__)
 # recording.serialize_concat is enabled. Concatenation is local CPU/disk work,
 # unrelated to the per-account provider connection limits in connection_limits.py.
 _concat_lock = threading.Lock()
+
+# How often the supervised join is polled, and how often ffmpeg writes -progress.
+# Not a config key: it is a poll cadence, not a budget, and the two budgets that do
+# bound the join (ffmpeg.concat_pre_output_timeout_seconds / concat_stall_seconds)
+# are both minutes-scale, so nothing about this number is worth tuning.
+CONCAT_POLL_INTERVAL_SECONDS = 5
 
 # ── Live concat registry ──────────────────────────────────────────────────────
 # recording_id -> time.monotonic() when its chain claimed it. Mirrors
@@ -142,6 +148,56 @@ def run_postprocess_claimed(app, recording_id: int, ts_path: str):
         _release_concat(recording_id)
 
 
+def _measure_segment_content_durations(recording_id: int, valid_segments):
+    """ffprobe each segment's finished file and store its content length on the row.
+
+    Runs here rather than in the watchdog because the watchdog probes a file that is still
+    growing: its duration would be whatever had arrived by then, not what the segment ended
+    up holding. Here every file is closed and final, and this is post-capture work, so it
+    cannot delay a restart or otherwise touch the capture it is measuring (CLAUDE.md
+    Product Principles - a diagnostic must never harm the capture it is diagnosing).
+
+    Header-only (count_packets=False), which on MPEG-TS seeks rather than scans - measured
+    at 0.04s per file on this machine, flat from 10 MB to 317 MB, so 28 segments cost about
+    a second against a concat that runs for minutes.
+
+    Never raises and never fails the concat: a segment it could not read keeps its NULL,
+    which means "not measured" and is honest. Probing happens first, in full; the database
+    write is one decorated closure with one commit, so no ffprobe re-runs on a retry.
+    """
+    from . import db
+    from .database import RecordingSegment
+    from .db_utils import retry_on_locked
+    from .probe import parse_ffprobe
+
+    measured = []
+    for seg in valid_segments:
+        try:
+            info = parse_ffprobe(seg.file_path, count_packets=False, timeout=30)
+        except Exception as exc:
+            log.warning('Recording %d seg %s: content-duration probe failed: %s',
+                        recording_id, seg.segment_number, exc)
+            continue
+        duration = info.get('duration')
+        if duration is not None and duration > 0:
+            measured.append((seg.id, float(duration)))
+
+    if not measured:
+        return
+
+    @retry_on_locked()
+    def _store_content_durations_and_commit():
+        for seg_id, duration in measured:
+            row = db.session.get(RecordingSegment, seg_id)
+            if row is not None:
+                row.content_duration_seconds = duration
+        db.session.commit()
+
+    _store_content_durations_and_commit()
+    log.info('Recording %d: measured content duration on %d of %d segment(s)',
+             recording_id, len(measured), len(valid_segments))
+
+
 def _run_concatenation(app, recording_id: int, *, reason: str):
     from . import db
     from .config import load_config
@@ -158,7 +214,8 @@ def _run_concatenation(app, recording_id: int, *, reason: str):
     with app.app_context():
         cfg = load_config()
         dvr_dir = cfg['recording']['dvr_output_dir']
-        concat_timeout = cfg['ffmpeg']['concat_timeout_seconds']
+        concat_pre_output_timeout = cfg['ffmpeg']['concat_pre_output_timeout_seconds']
+        concat_stall_seconds = cfg['ffmpeg']['concat_stall_seconds']
 
         rec = db.session.get(Recording, recording_id)
         if rec is None:
@@ -298,6 +355,10 @@ def _run_concatenation(app, recording_id: int, *, reason: str):
             from .health_score import apply_capture_phase_health_observation
             apply_capture_phase_health_observation(app, recording_id)
 
+            # Before concat, while each segment is still its own closed file - afterwards
+            # the joined .ts reports one duration and the per-segment answer is gone.
+            _measure_segment_content_durations(recording_id, valid_segments)
+
             total_seg_bytes = sum(os.path.getsize(s.file_path) for s in valid_segments)
             free_bytes = shutil.disk_usage(dvr_dir).free
             if free_bytes < total_seg_bytes:
@@ -381,16 +442,23 @@ def _run_concatenation(app, recording_id: int, *, reason: str):
                 log.info('Concat command: %s', ' '.join(cmd))
 
                 try:
-                    result = subprocess.run(
-                        cmd,
-                        capture_output=True,
-                        timeout=concat_timeout,
-                    )
-                    success = result.returncode == 0
-                    error_msg = result.stderr.decode(errors='replace')[-500:] if not success else None
-                except subprocess.TimeoutExpired:
-                    success = False
-                    error_msg = f'Concat timed out after {concat_timeout}s'
+                    # Supervised, not deadlined: the join reads and writes however many
+                    # bytes the capture produced, so a fixed budget is a bet on file size
+                    # and a large recording loses it. A join that is still writing is
+                    # working (dev/changelog/947). Progress is measured as bytes landing in
+                    # the output file rather than ffmpeg's out_time, because writing bytes
+                    # is the entire job of a `-c copy` and a byte count cannot go backwards
+                    # the way a concat-demuxer timestamp can under +genpts.
+                    run = supervise_ffmpeg(
+                        cmd, output_path,
+                        scratch_prefix='concat', scratch_key=recording_id,
+                        interval=CONCAT_POLL_INTERVAL_SECONDS,
+                        pre_output_timeout=concat_pre_output_timeout,
+                        stall_seconds=concat_stall_seconds,
+                        progress_signal='size', noun='concat',
+                        label=f'Recording {recording_id} concat')
+                    success = run.success
+                    error_msg = None if success else run.error_msg
                 except Exception as exc:
                     success = False
                     error_msg = str(exc)
@@ -434,15 +502,31 @@ def _run_concatenation(app, recording_id: int, *, reason: str):
                 from .postprocessor import do_postprocess
                 do_postprocess(app, recording_id, output_path)
             else:
-                # Drop the reservation placeholder if nothing was ever written into it, so a
-                # failed concat does not leave a zero-byte file that pushes the next attempt
-                # at this recording onto a `_2` name. A partial (non-empty) output is left
-                # alone - that is captured content, and deleting it is not this path's call.
+                # Remove whatever this attempt wrote, empty placeholder or multi-gigabyte
+                # partial alike. Nothing references it: output_path is committed only on
+                # success, so a failed attempt's file is unreachable from every row, every
+                # teardown path and every retry - the 21.4 GB a killed join stranded on
+                # 2026-09-13 would have sat there forever, and reserve_concat_output_path()
+                # judges a stem by whether any file in its extension family exists, so it
+                # would also have pushed every future attempt at this recording onto a `_2`
+                # name and stepped around the garbage permanently (CLAUDE.md
+                # teardown-releases-everything, dev/changelog/947).
+                #
+                # THIS IS ONLY SAFE BECAUSE THE SEGMENTS SURVIVE A FAILED CONCAT - they are
+                # deleted on success only, a few lines up. If that ever changes, the partial
+                # becomes the sole copy of the capture and this rule inverts.
+                partial_size = 0
                 try:
-                    if os.path.exists(output_path) and os.path.getsize(output_path) == 0:
+                    if os.path.exists(output_path):
+                        partial_size = os.path.getsize(output_path)
                         os.unlink(output_path)
                 except OSError as exc:
-                    log.warning('Could not clean up empty concat output %s: %s', output_path, exc)
+                    log.warning('Could not clean up failed concat output %s: %s', output_path, exc)
+                else:
+                    if partial_size > 0:
+                        log.info('Recording %d: removed the %s partial the failed concat left '
+                                 'at %s - the segments it was built from are still on disk',
+                                 recording_id, _fmt_bytes(partial_size), output_path)
 
                 @retry_on_locked()
                 def _mark_concat_failed_and_commit():

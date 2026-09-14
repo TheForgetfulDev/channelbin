@@ -404,3 +404,147 @@ def apply_rollback(channel, action, cfg):
         'excluded': len(targets), 'remaining': count,
         'cleared_manual_adjustment': cleared_adjustment,
     }
+
+
+def recompute_in_place(channel, cfg, reason: str):
+    """Rewrite `channel`'s stored score from its ledger, excluding nothing. Mutates and adds;
+    does NOT commit - the caller owns the commit, same shape and same reason as apply_rollback
+    above.
+
+    The rollback actions answer "make this observation stop counting". This answers a
+    different question - "the stored number and the ledger disagree, take the ledger" - and it
+    is the only writer that does, because a blend cannot be un-applied arithmetically
+    (health_score is a lossy exponential average, so undoing anything is a full replay).
+
+    Use it only where the stored number is KNOWN to be wrong, never as routine hygiene.
+    rollback_preview()'s `unledgered` explains why: a channel whose old ChannelTest rows have
+    since been pruned legitimately carries residual from observations nothing can replay, and
+    a recompute drops it - correct when the stored score is corrupt, a silent unexplained move
+    when it was fine. Returns a dict describing the move, or None when the ledger has nothing
+    to replay (the score is then left exactly as it is rather than wiped).
+    """
+    from . import db
+    from .database import ChannelEvent, CHANNEL_HEALTH_RECOMPUTED
+
+    ledger = observation_ledger(channel.id, cfg)
+    counting = [o for o in ledger if not o.excluded]
+    if not counting:
+        return None
+
+    score, count, updated_at = replay(ledger, cfg)
+    before = channel.health_score
+    samples_before = channel.health_score_sample_count
+    channel.health_score = score
+    channel.health_score_sample_count = count
+    channel.health_score_updated_at = updated_at
+    channel.consecutive_test_failures = recompute_failure_streak(
+        channel.id, excluded={o.key for o in ledger if o.excluded})
+
+    detail = (f'Health score recomputed from the {count} observation'
+              f'{"s" if count != 1 else ""} on record - {reason}, '
+              f'{_score_words(before, score)}')
+    db.session.add(ChannelEvent(
+        channel_id=channel.id, timestamp=datetime.utcnow(),
+        event_type=CHANNEL_HEALTH_RECOMPUTED, detail=detail,
+        extra_data=json.dumps({
+            'reason': reason,
+            'score_before': before, 'score_after': score,
+            'observations_counted': count,
+            'sample_count_before': samples_before,
+        })))
+    return {'detail': detail, 'score_before': before, 'score_after': score,
+            'observations_counted': count, 'sample_count_before': samples_before}
+
+
+def repair_duplicated_capture_corrections(cfg):
+    """One-time repair of channel scores a repeated post-capture analysis double-counted.
+
+    Before dev/changelog/951, a service restart re-ran a finished analysis phase and blended
+    that recording's capture-quality correction into its channel a second and third time,
+    while observation_ledger() went on emitting exactly ONE correction per recording. The
+    stored score therefore stopped being reproducible from the ledger, which is the
+    number-nobody-can-explain this whole subsystem exists to prevent. The gate now makes new
+    duplicates impossible; this repairs the ones already written.
+
+    Two recorded facts decide who is affected, never an inference: more than one
+    POSTCAPTURE_ANALYSIS_STARTED event, and a committed capture_quality_breakdown (the blend's
+    own artifact, written in the phase's final commit - so a run that started and died before
+    the blend is correctly left alone). A channel only reaches recompute_in_place() when both
+    hold, which is what keeps this off channels whose stored score is merely carrying pruned
+    residual.
+
+    Gated on the _m057 ledger obligation rather than on whether the scores look wrong, so an
+    interrupted repair is retried rather than inferred complete. The work and the obligation's
+    discharge land in one commit; a replay is a recompute, so re-running it changes nothing.
+    """
+    from . import db
+    from .database import (Channel, Recording, RecordingEvent,
+                           POSTCAPTURE_ANALYSIS_STARTED)
+    from .db_utils import retry_on_locked
+    from .migrations import (_BF_DUPLICATE_CAPTURE_CORRECTIONS, finish_obligation,
+                             obligation_pending)
+    from sqlalchemy import func
+
+    if not obligation_pending(_BF_DUPLICATE_CAPTURE_CORRECTIONS):
+        return []
+
+    log.warning('Repairing channel health scores double-counted by a repeated post-capture '
+                'analysis (dev/changelog/951)')
+
+    repeated = (db.session.query(RecordingEvent.recording_id)
+                .filter(RecordingEvent.event_type == POSTCAPTURE_ANALYSIS_STARTED)
+                .group_by(RecordingEvent.recording_id)
+                .having(func.count(RecordingEvent.id) > 1)
+                .subquery())
+    affected = (Recording.query
+                .join(repeated, Recording.id == repeated.c.recording_id)
+                .filter(Recording.capture_quality_breakdown.isnot(None),
+                        Recording.channel_id.isnot(None))
+                .all())
+
+    # A channel can own more than one such recording, and each is one duplicated blend; the
+    # replay fixes all of them at once, so it runs once per channel.
+    by_channel = {}
+    for rec in affected:
+        by_channel.setdefault(rec.channel_id, []).append(rec.name)
+
+    @retry_on_locked()
+    def _repair_and_commit():
+        done = []
+        for channel_id, names in sorted(by_channel.items()):
+            channel = db.session.get(Channel, channel_id)
+            if channel is None:
+                continue
+            reason = ('a service restart re-ran the post-capture analysis of '
+                      + ', '.join(f'"{n}"' for n in names))
+            moved = recompute_in_place(channel, cfg, reason)
+            if moved is not None:
+                done.append((channel, moved))
+        finish_obligation(_BF_DUPLICATE_CAPTURE_CORRECTIONS)
+        db.session.commit()
+        return done
+
+    repaired = _repair_and_commit()
+    for channel, moved in repaired:
+        log.warning('Channel %d (%s): %s', channel.id, channel.name, moved['detail'])
+    if not repaired:
+        log.info('No channel health scores needed repairing')
+        return []
+
+    # The scores moved with nothing the user did behind them, so the move gets a surface of
+    # its own rather than only a ChannelEvent on each channel's timeline.
+    from .alerts import create_alert
+    lines = [f'{c.name}: health score '
+             f'{"none" if m["score_before"] is None else format(m["score_before"], ".0f")} -> '
+             f'{"none" if m["score_after"] is None else format(m["score_after"], ".0f")} '
+             f'({m["sample_count_before"]} -> {m["observations_counted"]} observations)'
+             for c, m in repaired]
+    create_alert(
+        'HEALTH_SCORES_REPAIRED',
+        f'{len(repaired)} channel health score{"s" if len(repaired) != 1 else ""} recomputed',
+        body='A service restart used to re-run a finished recording analysis and count its '
+             'capture-quality observation again. Those scores have been recomputed from the '
+             'observations on record, and new duplicates can no longer happen.\n\n'
+             + '\n'.join(lines),
+        source='startup')
+    return repaired

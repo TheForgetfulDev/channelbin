@@ -8,10 +8,12 @@ and nothing else, so the counter measured the app's own deliberate pause and ign
 the window spent noticing the stall and the wait for the replacement segment to start
 writing. Recording 71 (dev/changelog/429) reported 375s against a real 1814s shortfall.
 
-Two quantities ship, and these tests hold the line between them: `total_downtime_seconds`
+Three quantities ship, and these tests hold the line between them: `total_downtime_seconds`
 is the capture-time gap counter, which by construction cannot see a stream that stays
-connected and delivers almost nothing; `content_shortfall_seconds` is derived after the
-fact from the recording window and the real content length, and is the one that can.
+connected and delivers almost nothing; `capture_gap_seconds` is its post-capture subset,
+read off the segment clocks, covering only the time no capture process was running at all;
+and `content_vs_capture_seconds` compares the finished file against that capture time,
+which is the one that can see a connected feed delivering short.
 
 No network and no provider host: every child here is `sys.executable -c ...`, a local argv
 with no URL in it, which tests/support/netguard.py permits. Segment files are written under
@@ -182,9 +184,19 @@ class DowntimeCountsTheWholeGapTests(_RestartHarness):
                         f'instead of the time actually lost')
 
 
-class ContentShortfallTests(unittest.TestCase):
-    """The post-capture half. Pure model arithmetic over columns already on the row, so it
-    is correct retroactively for every recording already in the database."""
+class CaptureGapAndContentTests(unittest.TestCase):
+    """The post-capture half, rebuilt by dev/changelog/942. Pure model arithmetic over
+    columns already on the row, so it is correct retroactively for every recording already
+    in the database.
+
+    What it replaced: one property, `content_shortfall_seconds`, computing
+    max(0, window - content). That is a NET figure, and a provider that replays its buffer
+    when a dropped connection is re-established delivers more content than the wall clock
+    it ran on - so the surplus cancelled real gap time and the clamp hid the sign. On
+    recording 14 (28 segments, 27 stalls) it reported "missing 0s (0%)" against 135.7s of
+    measured gaps. Two facts are reported now and never netted: gap time from the segment
+    clocks, and the delivered length against the time the capture actually ran.
+    """
 
     def setUp(self):
         self.t = make_test_app()
@@ -199,54 +211,113 @@ class ContentShortfallTests(unittest.TestCase):
         db.session.commit()
         return rec
 
-    def test_shortfall_is_the_window_minus_the_probed_content_length(self):
-        rec = self._rec(status='COMPLETED', recorded_duration_seconds=3000.0)
-
-        self.assertEqual(rec.content_shortfall_seconds, 600.0)
-        self.assertEqual(rec.actual_duration_source, 'file')
-
-    def test_shortfall_is_unknown_while_the_recording_is_still_running(self):
-        """A number that cannot be known yet must read as unknown, not as zero - zero
-        would say 'nothing missing' about a recording halfway through a stall."""
-        rec = self._rec(status='IN_PROGRESS')
-
-        self.assertIsNone(rec.content_shortfall_seconds)
-
-    def test_a_failed_recording_falls_back_to_the_segment_span_and_says_so(self):
-        """FAILED never concatenates, so there is no file to probe. The estimate is still
-        worth showing, but actual_duration_source is what stops the UI presenting it as a
-        measurement of a finished file."""
-        rec = self._rec(status='FAILED')
+    def _seg(self, rec, start_min_ago, end_min_ago, **kw):
         db.session.add(RecordingSegment(
-            recording_id=rec.id, segment_number=0, file_path='/nonexistent.ts',
-            started_at=self.now - timedelta(hours=1),
-            ended_at=self.now - timedelta(minutes=30), bytes_recorded=4096))
+            recording_id=rec.id, segment_number=kw.pop('segment_number', 0),
+            file_path='/nonexistent.ts',
+            started_at=self.now - timedelta(minutes=start_min_ago),
+            ended_at=self.now - timedelta(minutes=end_min_ago),
+            bytes_recorded=kw.pop('bytes_recorded', 4096), **kw))
+
+    def _reload(self, rec):
         db.session.commit()
         db.session.expire_all()
-        rec = db.session.get(Recording, rec.id)
+        return db.session.get(Recording, rec.id)
 
-        self.assertAlmostEqual(rec.content_shortfall_seconds, 1800.0, delta=1)
+    def test_a_surplus_can_no_longer_cancel_gap_time(self):
+        """The defect, at recording 14's shape: two segments covering 50 of the window's
+        60 minutes, and a file LONGER than the window because the feed replayed its buffer
+        at the join. The old net figure read zero. The gap is 10 minutes and has to say so
+        whatever the content length does."""
+        rec = self._rec(status='COMPLETED', recorded_duration_seconds=3900.0)
+        self._seg(rec, 60, 35, segment_number=0)
+        self._seg(rec, 25, 0, segment_number=1)
+        rec = self._reload(rec)
+
+        self.assertAlmostEqual(rec.covered_capture_seconds, 3000.0, delta=1)
+        self.assertAlmostEqual(rec.capture_gap_seconds, 600.0, delta=1)
+        self.assertAlmostEqual(rec.content_vs_capture_seconds, 900.0, delta=1)
+
+    def test_the_two_figures_reconcile_to_the_window_minus_the_content(self):
+        """gap - content_vs_capture == window - content, exactly. The old single number is
+        still derivable from the pair, which is what lets the detail page explain why a
+        file is longer than the window it was recording."""
+        rec = self._rec(status='COMPLETED', recorded_duration_seconds=3900.0)
+        self._seg(rec, 60, 35, segment_number=0)
+        self._seg(rec, 25, 0, segment_number=1)
+        rec = self._reload(rec)
+
+        self.assertAlmostEqual(
+            rec.capture_gap_seconds - rec.content_vs_capture_seconds,
+            rec.duration_seconds - rec.actual_duration_seconds, delta=0.01)
+
+    def test_a_feed_delivering_less_than_real_time_reads_negative(self):
+        """The case content_shortfall existed to catch, and the one downtime structurally
+        cannot see: the stream stayed connected for the whole window and delivered short.
+        A signed figure keeps it visible without a second stat."""
+        rec = self._rec(status='COMPLETED', recorded_duration_seconds=3000.0)
+        self._seg(rec, 60, 0)
+        rec = self._reload(rec)
+
+        self.assertAlmostEqual(rec.capture_gap_seconds, 0.0, delta=1)
+        self.assertAlmostEqual(rec.content_vs_capture_seconds, -600.0, delta=1)
+
+    def test_overlapping_segment_spans_are_a_union_not_a_sum(self):
+        """Summing spans would count the shared time twice and push covered time past the
+        window itself, which would invent a negative gap on a recording that had none."""
+        rec = self._rec(status='COMPLETED', recorded_duration_seconds=3600.0)
+        self._seg(rec, 60, 20, segment_number=0)
+        self._seg(rec, 30, 0, segment_number=1)
+        rec = self._reload(rec)
+
+        self.assertAlmostEqual(rec.covered_capture_seconds, 3600.0, delta=1)
+        self.assertAlmostEqual(rec.capture_gap_seconds, 0.0, delta=1)
+
+    def test_a_segment_running_past_the_stop_is_clipped_to_the_window(self):
+        """stop_time is stamped when the app decides to stop; ffmpeg finishes writing just
+        after. Counting that tail as covered window would report a negative gap."""
+        rec = self._rec(status='COMPLETED', recorded_duration_seconds=3600.0)
+        self._seg(rec, 60, -2)
+        rec = self._reload(rec)
+
+        self.assertAlmostEqual(rec.covered_capture_seconds, 3600.0, delta=1)
+        self.assertEqual(rec.capture_gap_seconds, 0.0)
+
+    def test_both_are_unknown_while_the_recording_is_still_running(self):
+        """A number that cannot be known yet must read as unknown, not as zero - zero would
+        say 'nothing missing' about a recording halfway through a stall."""
+        rec = self._rec(status='IN_PROGRESS')
+
+        self.assertIsNone(rec.capture_gap_seconds)
+        self.assertIsNone(rec.content_vs_capture_seconds)
+
+    def test_a_failed_recording_falls_back_to_the_segment_span_and_says_so(self):
+        """FAILED never concatenates, so there is no file to probe and the content length
+        falls back to the segment span - which is the capture time, so the content figure
+        is structurally zero there. actual_duration_source is what stops the UI presenting
+        that zero as a measurement of a finished file."""
+        rec = self._rec(status='FAILED')
+        self._seg(rec, 60, 30)
+        rec = self._reload(rec)
+
+        self.assertAlmostEqual(rec.capture_gap_seconds, 1800.0, delta=1)
+        self.assertAlmostEqual(rec.content_vs_capture_seconds, 0.0, delta=1)
         self.assertEqual(rec.actual_duration_source, 'segments')
 
-    def test_a_file_longer_than_its_window_reports_no_shortfall_not_a_negative_one(self):
-        """ffmpeg can overrun the stop by a second or two; a negative 'missing' figure is
-        not a thing the page can render honestly."""
-        rec = self._rec(status='COMPLETED', recorded_duration_seconds=3700.0)
-
-        self.assertEqual(rec.content_shortfall_seconds, 0.0)
-
-    def test_the_shortfall_is_measured_against_the_adjusted_window(self):
+    def test_the_gap_is_measured_against_the_adjusted_window(self):
         """CLAUDE.md's time-and-counter-accounting rule: scheduled, requested, actual and
         content duration are four different values. An abort rewrites stop_time to the real
         stop, so the window we were trying to fill is start_time..stop_time - measuring
         against the untouched scheduled window would report the whole cancelled remainder
-        as content the app lost."""
+        as time the app failed to capture."""
         rec = self._rec(status='ABORTED', recorded_duration_seconds=1800.0)
         rec.stop_time = self.now - timedelta(minutes=30)
-        db.session.commit()
+        self._seg(rec, 60, 30)
+        rec = self._reload(rec)
 
         self.assertEqual(rec.scheduled_duration_seconds, 3600.0)
-        self.assertEqual(rec.content_shortfall_seconds, 0.0)
+        self.assertEqual(rec.duration_seconds, 1800.0)
+        self.assertAlmostEqual(rec.capture_gap_seconds, 0.0, delta=1)
 
 
 if __name__ == '__main__':

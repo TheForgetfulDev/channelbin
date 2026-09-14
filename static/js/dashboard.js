@@ -241,13 +241,18 @@ const jobWindow = j => [j.start, j.start + (j.est_seconds || 0) * 1000];
 /* Why a job is worth flagging, as prose, or null.
 
    16.4: the timeline exists to surface a decision the app already makes in the dark.
-   scheduler.py hard-skips a scheduled account sync when a recording is in progress,
-   or when one starts within skip_sync_if_recording_within_minutes - and today the
-   user learns this afterwards, if at all. The wording mirrors accounts.py's
-   sync_conflicts, which already names the conflict AND its consequence. */
+   scheduler.py yields a scheduled account sync when a recording is in progress, or when
+   one starts within skip_sync_if_recording_within_minutes - and today the user learns
+   this afterwards, if at all. The wording mirrors accounts.py's sync_conflicts, which
+   already names the conflict AND its consequence.
+
+   "Deferred", not "skipped": since dev/changelog/941 the occurrence is not dropped - the
+   scheduler queues one retry at the first gap long enough to finish the sync in, which
+   appears on this same timeline as its own account_sync_retry_<id> mark. A tooltip that
+   still threatened a skip would describe a behavior the backend no longer has. */
 function jobClash(job, recs, guards) {
   // Only a job that has not fired yet. Both guards are evaluated by the scheduler AT
-  // FIRE TIME, so a run already under way cannot be skipped by them - saying otherwise
+  // FIRE TIME, so a run already under way cannot be deferred by them - saying otherwise
   // would put a warning on the axis that the code behind it would never produce.
   if (!job.is_sync || job.start <= TL.data.now) return null;
   const [js] = jobWindow(job);
@@ -255,14 +260,16 @@ function jobClash(job, recs, guards) {
   for (const r of recs) {
     const [rs, re] = recWindow(r);
     if (guards.skipIfRecordingActive && r.status === 'IN_PROGRESS' && js >= rs && js < re) {
-      return `Will be skipped: "${r.name}" is recording, and syncing now would count `
-           + `against this account's connection limit.`;
+      return `Will be deferred: "${r.name}" is recording, and syncing now would count `
+           + `against this account's connection limit. It retries at the first gap long `
+           + `enough to finish in.`;
     }
     // Measured from the recording's START, not from its estimated finish, because
     // that is what scheduler.py compares against.
     if (r.status === 'SCHEDULED' && rs >= js && rs - js <= guardMs) {
-      return `Will be skipped: "${r.name}" starts within ${guards.skipWithinMinutes} `
-           + `minutes of it, and a sync that late risks the recording's first segment.`;
+      return `Will be deferred: "${r.name}" starts within ${guards.skipWithinMinutes} `
+           + `minutes of it, and a sync that late risks the recording's first segment. `
+           + `It retries at the first gap long enough to finish in.`;
     }
   }
   return null;

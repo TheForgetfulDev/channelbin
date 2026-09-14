@@ -16,7 +16,7 @@
 # logging.file, which appear below as commented-out examples because their defaults
 # are paths derived from wherever the app is installed.
 
-config_version: 3
+config_version: 4
 
 recording:
   # Where segments, the in-progress file and the finished recording are written.
@@ -122,7 +122,12 @@ ffmpeg:
   ffprobe_path: ''
   extra_input_args: []                  # e.g. ['-timeout', '5000000']
   extra_output_args: []
-  concat_timeout_seconds: 300
+  # Joining a recording's segments reads and writes however many bytes the capture
+  # produced, so no fixed whole-job deadline can be honest about it - a join that is still
+  # writing is working. Same two rules as a conversion: the first bounds only the phase
+  # before ffmpeg writes anything, and once it is writing the second is the only bound.
+  concat_pre_output_timeout_seconds: 300   # give up if the join has written nothing in this long
+  concat_stall_seconds: 300                # give up if the output file stops growing this long; 0 disables
 
 flask:
   port: 5000

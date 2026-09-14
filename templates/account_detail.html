@@ -136,14 +136,14 @@
       Counts below are from the previous run until it finishes.
     {% elif st == 'ERROR' %}
       The last sync failed {{ account.last_sync_at | time_ago if account.last_sync_at else 'at an unrecorded time' }}.
-      {% if account.sync_enabled %}The next automatic attempt is {{ account.next_sync_at | time_until if account.next_sync_at else 'not scheduled' }}.{% else %}Automatic sync is off, so there is no next attempt.{% endif %}
+      {% if account.sync_enabled %}The next automatic attempt is {{ next_sync_at | time_until if next_sync_at else 'not scheduled' }}.{% else %}Automatic sync is off, so there is no next attempt.{% endif %}
     {% elif st == 'UNSYNCED' %}
       Never synced. Nothing has been imported from this account yet.
     {% elif st == 'OK' %}
       Synced {{ account.last_sync_at | time_ago if account.last_sync_at else 'at an unrecorded time' }},
       {{ '{:,}'.format(account.channel_count or 0) }} channels{% if account.hidden_channel_count %} ({{ '{:,}'.format(account.hidden_channel_count) }} hidden){% endif %} and
       {{ '{:,}'.format(account.epg_entry_count or 0) }} program entries.
-      {% if account.sync_enabled %}Next sync {{ account.next_sync_at | time_until if account.next_sync_at else 'not scheduled' }}.{% else %}Automatic sync is off.{% endif %}
+      {% if account.sync_enabled %}Next sync {{ next_sync_at | time_until if next_sync_at else 'not scheduled' }}.{% else %}Automatic sync is off.{% endif %}
     {% else %}
       Status {{ st }}. This is not a status this page knows how to explain - it should be reported.
     {% endif %}
@@ -232,7 +232,7 @@
         {% endif %}
         {{ m.stat_row('Last sync', account.last_sync_at | local_time if account.last_sync_at else 'never', 'faint') }}
         {{ m.stat_row('Next sync',
-                      (account.next_sync_at | time_until if account.next_sync_at else 'not scheduled') if account.sync_enabled else 'off',
+                      (next_sync_at | time_until if next_sync_at else 'not scheduled') if account.sync_enabled else 'off',
                       none if account.sync_enabled else 'faint') }}
         {# The endpoint is wide, and it is MASKED: an account's own URL is secret in full,
            because for a path-token provider the path IS the credential (§17.4). #}

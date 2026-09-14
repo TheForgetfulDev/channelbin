@@ -457,8 +457,8 @@ body.scroll-locked { position: fixed; left: 0; right: 0; width: 100%; overflow: 
   border-radius: var(--radius-sm);
   padding: 0.55rem 0.75rem;
   font-size: var(--fs-sm);
-  max-width: 260px;
-  min-width: 160px;
+  max-width: 300px;
+  min-width: 180px;
   line-height: 1.5;
   box-shadow: 0 4px 16px rgba(0,0,0,0.35);
   pointer-events: auto;
@@ -469,6 +469,28 @@ body.scroll-locked { position: fixed; left: 0; right: 0; width: 100%; overflow: 
 .dot-tooltip strong { color: var(--text); display: block; margin-bottom: 0.2rem; }
 .tt-name   { color: var(--text); }
 .tt-detail { color: var(--text-muted); font-size: var(--fs-sm); }
+/* One task per row, each a link to what it names (dev/changelog/949). The rows are
+   padded blocks with a left rule rather than a flat run of spans: at two tasks the
+   old uniform 0.1rem gap between every line left nothing to say where one task ended
+   and the next began, and a wrapped recording name made four lines read as one. */
+.tt-item {
+  display: block; color: inherit; text-decoration: none;
+  padding: 0.25rem 0.1rem 0.25rem 0.45rem;
+  border-left: 2px solid var(--border);
+  border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+}
+.tt-item:hover, .tt-item:focus-visible {
+  background: var(--bg3); border-left-color: var(--text-muted); text-decoration: none;
+}
+.tt-item .tt-name, .tt-item .tt-detail { display: block; }
+/* The destination the chip itself used to be, now that tapping a chip only opens
+   this tip. Arrow = navigation, per DESIGN.md 4. */
+.tt-more {
+  display: block; text-align: right; margin-top: 0.3rem; padding-top: 0.35rem;
+  border-top: 1px solid var(--border-soft);
+  color: var(--text-muted); font-size: var(--fs-sm); text-decoration: none;
+}
+.tt-more:hover, .tt-more:focus-visible { color: var(--text); text-decoration: none; }
 .rec-empty { opacity: 0.55; }
 /* actions */
 .rc-actions { flex-shrink: 0; display: flex; gap: 4px; align-items: center; flex-wrap: wrap; }

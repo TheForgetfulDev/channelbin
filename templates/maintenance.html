@@ -38,6 +38,103 @@
    class on the disk row; the two must change together. */
 .mrow.stacked { display: block; }
 
+/* ── Readiness check (dev/changelog/950) ──────────────────────────────────
+   The card's own layout and nothing else. The expanding capability row is
+   style.css's `.grp-item` / `.grp-summary` / `.grp-expand` / `.grp-caret` /
+   `.grp-detail` used verbatim - including the left-edge state bar it draws off
+   `data-health`, which is why there is no rule for one here - and every state
+   pill is a `.badge` + `.b-done`/`.b-warn`/`.b-fail`/`.b-abort`/`.b-running`.
+   What is left is this card's own arrangement, which no other page has. */
+
+/* The list container. `.grp-list-compact` in templates/channels/groups.html is
+   the Groups page's own and carries a page-level bottom margin that would leave
+   a gap inside this card - deliberately not shared. */
+.rd-caps { display: flex; flex-direction: column; gap: 0.5rem; }
+
+/* The verdict: the sentence alone (DESIGN.md 16, round 1). Colour comes from
+   the worst capability, never from a count. */
+.rd-verdict { display: flex; gap: 0.85rem; align-items: flex-start; padding: 0.8rem 1rem;
+  border: 1px solid var(--border-soft); border-radius: var(--radius);
+  background: var(--bg2); margin-bottom: 0.9rem; }
+.rd-verdict.ok   { border-color: rgba(var(--ok-rgb), .38);   background: var(--ok-soft); }
+.rd-verdict.warn { border-color: rgba(var(--warn-rgb), .38); background: var(--warn-soft); }
+.rd-verdict.bad  { border-color: rgba(var(--bad-rgb), .38);  background: var(--bad-soft); }
+.rd-vmark { font-size: var(--fs-2xl); line-height: 1.1; flex: none; }
+.rd-verdict.ok .rd-vmark   { color: var(--ok); }
+.rd-verdict.warn .rd-vmark { color: var(--warn); }
+.rd-verdict.bad .rd-vmark  { color: var(--bad); }
+.rd-vbody { min-width: 0; }
+.rd-vhead { font-size: var(--fs-xl); font-weight: 600; letter-spacing: -.01em; }
+.rd-vsub { font-size: var(--fs-md); color: var(--text-muted); line-height: 1.45; margin-top: 3px; }
+.rd-vmeta { font-size: var(--fs-sm); color: var(--text-faint); margin-top: 6px; }
+.rd-intro { font-size: var(--fs-md); color: var(--text-muted); line-height: 1.45;
+  margin: 0 0 0.7rem; }
+
+/* One capability. The summary is a wrapping flex like `.grp-row`, but the reason
+   sentence has to take its own full line under the name, so it is its own grid
+   rather than another row of pills. */
+.rd-caprow { flex: 1; min-width: 0; display: grid; grid-template-columns: 1.6rem 1fr auto;
+  align-items: start; gap: 0.15rem 0.6rem; padding: 0.65rem 0.85rem; cursor: pointer; }
+.rd-capmark { font-size: var(--fs-lg); line-height: 1.4; text-align: center; }
+.rd-cap-can .rd-capmark      { color: var(--ok); }
+.rd-cap-cannot .rd-capmark   { color: var(--bad); }
+.rd-cap-degraded .rd-capmark { color: var(--warn); }
+.rd-cap-unknown .rd-capmark  { color: var(--warn); }
+.rd-cap-none .rd-capmark     { color: var(--text-faint); }
+.rd-capname { font-weight: 600; font-size: var(--fs-base); letter-spacing: -.01em; }
+.rd-capwhy { grid-column: 2; font-size: var(--fs-md); color: var(--text-muted); line-height: 1.5; }
+.rd-capact { grid-column: 3; grid-row: 1 / span 2; display: flex; gap: 6px; align-items: center;
+  flex-wrap: wrap; justify-content: flex-end; }
+/* Every blocker on its own line, rather than naming one and counting the rest
+   (dev/changelog/950). */
+.rd-whylist { margin: 4px 0 0; padding-left: 1.1rem; }
+.rd-whylist li { margin-bottom: 2px; }
+.rd-lead-bad  { color: var(--bad); font-weight: 600; }
+.rd-lead-warn { color: var(--warn); font-weight: 600; }
+
+/* One check inside an expanded capability. Fixed and `fr` tracks only: the head
+   and each row are separate grid containers, so a content-sized track would
+   slide every row's columns out of line with its neighbours (CLAUDE.md CSS). */
+.rd-row { display: grid; grid-template-columns: 9rem 1fr auto; gap: 0.2rem 0.7rem;
+  align-items: center; padding: 0.5rem 0; border-bottom: 1px solid var(--border-soft); }
+.rd-row:last-child { border-bottom: none; }
+.rd-rname { font-size: var(--fs-md); font-weight: 600; cursor: pointer; }
+.rd-rname .rd-rcaret { display: inline-block; width: 0.8rem; color: var(--text-faint);
+  transition: transform .15s ease; }
+.rd-row.open .rd-rname .rd-rcaret { transform: rotate(90deg); }
+.rd-rfound { grid-column: 2; font-size: var(--fs-sm); color: var(--text-muted); line-height: 1.45; }
+.rd-ract { grid-column: 3; grid-row: 1 / span 2; display: flex; gap: 6px; align-items: center;
+  flex-wrap: wrap; justify-content: flex-end; }
+/* Silenced: dimmed, never hidden, and never with its real state replaced - the
+   page still says what is wrong, it just stops counting it. */
+.rd-row.rd-muted { opacity: .55; }
+.rd-row.rd-muted:hover { opacity: 1; }
+.rd-detail { grid-column: 1 / -1; display: grid; grid-template-columns: 10rem 1fr;
+  gap: 0.3rem 0.8rem; margin: 0.45rem 0 0.2rem; padding: 0.6rem 0.8rem;
+  background: var(--bg0); border-radius: var(--radius-sm); }
+.rd-dk { font-size: var(--fs-sm); color: var(--text-faint); }
+.rd-dv { font-size: var(--fs-sm); color: var(--text); line-height: 1.5; }
+.rd-dv.bad  { color: var(--bad); }
+.rd-dv.warn { color: var(--warn); }
+.rd-comp { display: flex; gap: 6px; align-items: baseline; margin-bottom: 3px; }
+.rd-comp-x { color: var(--bad); }
+.rd-comp-ok { color: var(--ok); }
+.rd-progress { display: flex; align-items: center; gap: 0.6rem; margin-bottom: 0.8rem;
+  font-size: var(--fs-sm); color: var(--text-muted); }
+.rd-bar { flex: 1; height: 5px; background: var(--bg3); border-radius: 999px; overflow: hidden; }
+.rd-bar span { display: block; height: 100%; background: var(--accent); transition: width .2s ease; }
+
+@media (max-width: 768px) {
+  /* The action column becomes a strip under the row rather than a third track -
+     at 375px a button beside two lines of prose leaves neither enough width. */
+  .rd-caprow { grid-template-columns: 1.4rem 1fr; }
+  .rd-capact { grid-column: 1 / -1; grid-row: auto; justify-content: flex-start; margin-top: 6px; }
+  .rd-row { grid-template-columns: 1fr; }
+  .rd-rfound, .rd-ract { grid-column: 1; grid-row: auto; justify-content: flex-start; }
+  .rd-detail { grid-template-columns: 1fr; }
+  .rd-dk { margin-top: 4px; }
+}
+
 /* Support bundle card. The warning sits in its own `.mrow`, which is a flex
    container, so it needs an explicit full-width basis or it would shrink to its
    content instead of spanning the card. It is shown unconditionally, never gated
@@ -137,6 +234,24 @@
    belongs beside Storage rather than down among the things that do something.
    It exists because "which ffmpeg is this install running" had four possible
    answers and no surface at all (dev/changelog/910). #}
+
+{# Readiness check, first card, above Storage (dev/mockups/40-readiness.html,
+   dev/changelog/945): a verdict below the fold on a seven-card page is not a
+   verdict, which is also why the card head carries a state pill of its own. Everything in it arrives from /api/readiness; the three
+   checks that cost a process, a provider connection or a real message wait to be
+   asked. #}
+<div class="card" id="m-readiness">
+  <div class="card-head">
+    <h2>Readiness check <span class="badge b-abort" id="rd-head-pill">Checking</span></h2>
+    <div class="card-head-actions">
+      <button class="btn btn-sm" id="rd-copy">Copy report</button>
+      <button class="btn btn-sm btn-primary" id="rd-runall">Run the checks that cost something</button>
+    </div>
+  </div>
+  <div class="card-body">
+    <div id="rd-content"><div class="mrow"><span class="grow">Loading...</span></div></div>
+  </div>
+</div>
 
 <div class="card" id="m-storage">
   <div class="card-head">
@@ -258,4 +373,5 @@
 
 {% block scripts %}
 <script src="{{ url_for('static', filename='js/maintenance.js') }}"></script>
+<script src="{{ url_for('static', filename='js/readiness.js') }}"></script>
 {% endblock %}

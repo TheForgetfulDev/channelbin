@@ -201,6 +201,12 @@ def create_app(config_overrides=None, start_scheduler=True):
         # rather than later: no scheduler job and no request can have started a rebuild yet,
         # so anything found BUILDING is provably stranded (dev/changelog/425).
         reconcile_interrupted_builds()
+        # A repair a migration step cannot perform itself: undoing a double-counted health
+        # observation is a full replay of the channel's ledger, which is ORM code and only
+        # exists here. The step registered the obligation; this discharges it, and does
+        # nothing at all on every startup after that (dev/changelog/951).
+        from .health_recompute import repair_duplicated_capture_corrections
+        repair_duplicated_capture_corrections(cfg)
         _ensure_system_health_job()
         if tags_table_is_new:
             _seed_default_tags()

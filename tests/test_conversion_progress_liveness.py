@@ -32,6 +32,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import app.config as cfgmod  # noqa: E402
 import app.postprocessor as ppmod  # noqa: E402
+import app.proc_utils as pumod  # noqa: E402
 from app import db  # noqa: E402
 from app.config import _cfg_m003_conversion_pre_output_timeout  # noqa: E402
 from app.postprocessor import (  # noqa: E402
@@ -62,8 +63,8 @@ class _RunnerCase(unittest.TestCase):
 
     def _run(self, fake, progress_return, *, stall_seconds, pre_output_timeout,
              interval=0.05):
-        with mock.patch.object(ppmod.subprocess, 'Popen', return_value=fake), \
-             mock.patch.object(ppmod, '_read_progress_tail', side_effect=progress_return):
+        with mock.patch.object(pumod.subprocess, 'Popen', return_value=fake), \
+             mock.patch.object(pumod, 'read_progress_tail', side_effect=progress_return):
             return run_conversion_supervised(
                 self.t.app, self.rid, self.cmd, self.out,
                 expected_duration=100, pre_output_timeout=pre_output_timeout,

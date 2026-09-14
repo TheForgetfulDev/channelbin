@@ -150,13 +150,17 @@ class RunOnDemandTestJobSkipTests(unittest.TestCase):
         loop_spy.assert_not_called()
 
     def test_conflict_is_recorded_on_the_run_log_and_not_alerted(self):
-        """dev/changelog/928: a skipped run is reported where health checks report
-        everything else - the run log and last_skip_reason the status UI renders."""
+        """dev/changelog/928: a yielded run is reported where health checks report
+        everything else - the run log and last_skip_reason the status UI renders.
+
+        The verb is "deferred" since dev/changelog/941: the occurrence is no longer dropped,
+        it is queued at the first gap long enough to finish the run in. What this asserts is
+        unchanged - the run is reported on the log, and it is not an alert."""
         with mock.patch('app.alerts.create_alert') as alert_spy:
             self._run(force=False)
         alert_spy.assert_not_called()
         logs = [e['msg'] for e in channel_tester.get_status()['logs']]
-        self.assertTrue(any('Run skipped' in m for m in logs), logs)
+        self.assertTrue(any('Run deferred' in m for m in logs), logs)
         self.assertIn('starts within 10 minutes',
                       channel_tester.get_status()['last_skip_reason'] or '')
 

@@ -91,7 +91,8 @@ _active: dict = {}
 
 def recording_disk_paths(recording_id: int) -> list:
     """Every on-disk file a recording owns, for teardown: every file its output stem can
-    occupy, all segment files, the conversion scratch files, and the live-thumbnail image.
+    occupy, all segment files, the conversion scratch files, the partly-encoded parts a
+    resumable conversion checkpoints into, and the live-thumbnail image.
     Paths only - no deletion. Requires an active app context. Missing/None paths are
     omitted; the thumbnail and scratch paths are always included (delete_files() guards on
     existence).
@@ -123,17 +124,31 @@ def recording_disk_paths(recording_id: int) -> list:
             sibling = stem + ext
             if sibling != rec.output_path:
                 paths.append(sibling)
-        # Conversion scratch (progress + stderr tail) is written alongside the output file
-        # and unlinked in run_conversion_supervised's finally, so these only survive a
-        # shutdown that skipped it - after which a delete is the last thing that will ever
-        # look at them. Patterns are copied from that function's own stale-reap list and
-        # listed per id for the same reason: a bare f'{recording_id}*' glob would let id 6
-        # match id 64's files.
+        # Supervised-run scratch (progress + stderr tail) is written alongside the output
+        # file and unlinked in proc_utils.supervise_ffmpeg's finally, so these only survive
+        # a shutdown that skipped it - after which a delete is the last thing that will ever
+        # look at them. All four prefixes: 'conv' is the mp4/mkv conversion, 'concat' the
+        # segment join (dev/changelog/947), 'part' the re-mux that salvages a killed part and
+        # 'join' the assembly of those parts (dev/changelog/955). Patterns are copied from
+        # that function's own stale-reap list
+        # and listed per id for the same reason: a bare f'{recording_id}*' glob would let
+        # id 6 match id 64's files.
         scratch_dir = os.path.dirname(rec.output_path) or '.'
-        paths.extend(glob.glob(os.path.join(scratch_dir, f'.conv-progress-{recording_id}-*.txt')))
-        paths.extend(glob.glob(os.path.join(scratch_dir, f'.conv-stderr-{recording_id}-*.log')))
-        paths.append(os.path.join(scratch_dir, f'.conv-progress-{recording_id}.txt'))
-        paths.append(os.path.join(scratch_dir, f'.conv-stderr-{recording_id}.log'))
+        for prefix in ('conv', 'concat', 'part', 'join'):
+            paths.extend(glob.glob(os.path.join(scratch_dir, f'.{prefix}-progress-{recording_id}-*.txt')))
+            paths.extend(glob.glob(os.path.join(scratch_dir, f'.{prefix}-stderr-{recording_id}-*.log')))
+            paths.append(os.path.join(scratch_dir, f'.{prefix}-progress-{recording_id}.txt'))
+            paths.append(os.path.join(scratch_dir, f'.{prefix}-stderr-{recording_id}.log'))
+        # The partly-encoded parts a resumable conversion checkpoints into
+        # (dev/changelog/955). Enumerated off the SAME extension family as the stem above,
+        # for the same reason: a killed re-encode leaves the row naming its .ts with parts
+        # beside it under the converted extension, and they are multi-gigabyte. They are
+        # found on disk rather than read from conversion_parts_done, because the count is
+        # what a crash between ffmpeg and the commit gets wrong - and a part no row knows
+        # about is precisely the file nothing else will ever delete.
+        from .postprocessor import all_part_paths_on_disk
+        for ext in output_extension_family(cfg):
+            paths.extend(all_part_paths_on_disk(stem + ext))
     for seg in RecordingSegment.query.filter_by(recording_id=recording_id).all():
         if seg.file_path:
             paths.append(seg.file_path)

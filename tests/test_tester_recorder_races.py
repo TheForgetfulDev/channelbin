@@ -49,6 +49,12 @@ class FakeProc:
         self.stderr = None
         self.pid = 4242
         self._returncode = None
+        self.signals = []
+
+    def send_signal(self, sig):
+        # terminate_or_kill() continues a possibly-suspended child before terminating it
+        # (dev/changelog/952), so a stand-in that cannot take a signal is not a faithful one.
+        self.signals.append(sig)
 
     def poll(self):
         return self._returncode

@@ -5,6 +5,42 @@ Notable changes to ChannelBin, newest first. This project follows
 release is tagged `v<version>` in git, and the version the app is running is shown in the
 page footer.
 
+## 0.8.0 - 2026-09-14
+
+**Added**
+
+- Readiness check. It verifies your install to make sure everything is healthy and properly
+  set up.
+- A conversion that is waiting on an active recording moves to a paused state instead of
+  acting like it's doing something.
+- A scheduled sync that a recording blocked is caught up at the first free moment instead of
+  waiting a whole interval, and an account that falls a full interval behind raises an alert
+  that clears itself.
+- The Activity chip lists each running task as its own clickable row, and the chip itself
+  opens the tooltip rather than navigating away.
+
+**Changed**
+
+- The netted "Content missing" figure is replaced by two independently measured ones: wall
+  clock when nothing was capturing, and how the finished file compares against the time the
+  capture actually ran.
+
+**Fixed**
+
+- A conversion that had to step aside for a recording was killed and restarted from the
+  beginning, losing hours of encoding. It is now suspended in place and continues where it
+  left off.
+- A conversion killed by a stall, a crash or a restart re-encoded the whole file from the
+  start. It now resumes from the last completed part.
+- Joining a recording's segments was killed by a fixed timeout even while it was writing at
+  full speed. It is now supervised on progress, and a failed join no longer leaves a partial
+  file behind.
+- Restarting the app with a recording mid-analysis re-ran the whole analysis and counted it
+  into the channel's health score a second time.
+- The check that decides when a conversion yields to a recording used the recording's whole
+  length rather than the work left, and did not count a recording's own post-capture work as
+  a conflict.
+
 ## 0.7.1 - 2026-09-12
 
 **Fixed**

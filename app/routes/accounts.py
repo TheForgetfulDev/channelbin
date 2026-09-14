@@ -11,7 +11,7 @@ from ..accounts import (NORM_DISABLED, NORM_MODES, coerce_normalization_mode,
                         norm_mode_example, norm_mode_label, normalize_url_with_mode,
                         resolve_normalization_mode, url_is_normalizable,
                         recompute_duplicate_stream_urls_and_commit, finalize_sync_state,
-                        sync_signature)
+                        next_sync_map, sync_signature)
 from ..channel_groups import guide_scope_channel_ids, report_orphaned_guide_groups
 from ..channel_search import OTHER_NEW, OTHER_REMOVED
 from ..config import load_config
@@ -195,6 +195,7 @@ def accounts_list():
     return render_template(
         'accounts.html',
         accounts=accounts,
+        next_sync=next_sync_map(accounts),
         logs_by_account=logs_by_account,
         guide_counts=guide_counts,
         total_channels=total_channels,
@@ -332,6 +333,7 @@ def account_detail(account_id):
     return render_template(
         'account_detail.html',
         account=account,
+        next_sync_at=next_sync_map([account])[account.id],
         account_type=(account.account_type or 'm3u'),
         preset_colors=PRESET_COLORS,
         norm_options=_NORM_OPTIONS,

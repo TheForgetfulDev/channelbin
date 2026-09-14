@@ -10,7 +10,13 @@ they did not know was running, so "recoverable" is not the same as "free" and do
 itself earn an exemption (dev/changelog/732):
 
 - **Recordings** in a status that owns a live ffmpeg child or an in-flight background
-  thread (RESTART_BLOCKING_STATUSES).
+  thread (RESTART_BLOCKING_STATUSES) - **except one that is parked**, waiting on another
+  recording to finish with the machine (Recording.postprocess_waiting_since). A parked
+  recording is doing nothing: either its conversion ffmpeg is SIGSTOPped or it has not
+  spawned one yet, and it polls once every few seconds until the other recording is done.
+  Blocking on it refuses restarts for as long as that other recording runs - hours, on
+  2026-09-13 - to protect work nobody is doing. It is still printed, with what a restart
+  would cost it (dev/changelog/952).
 - **A search index mid-rebuild**: killing one mid-transaction strands it at
   STATUS_BUILDING with nobody left to finish it - self-healing
   (reconcile_interrupted_builds() fails it at the next startup) but costly: search falls
@@ -65,8 +71,45 @@ def busy_rows(db_path):
     empty and the caller should treat the app as idle, because neither a fresh install
     nor an unmigrated DB may wedge a restart.
 
+    A recording whose post-processing is parked waiting on another recording is NOT here -
+    see parked_rows() below.
+
     Callers other than main(): dev/tools/search_bench.py, which refuses to benchmark
     while work is in flight (dev/changelog/362).
+    """
+    rows, note = _recording_rows(db_path)
+    return [(rid, status, name) for rid, status, name, waiting, _pct in rows
+            if waiting is None], note
+
+
+def parked_rows(db_path):
+    """Return ``(rows, note)`` for recordings in a blocking status that are parked - doing
+    no work, waiting on another recording to finish with the machine.
+
+    ``rows`` is a list of ``(id, status, name, progress_pct)`` tuples. **These do not block
+    a restart**, which is the whole reason they are told apart from busy_rows(): a process
+    that is paused is not, technically, running. On 2026-09-13 two recordings parked in
+    ANALYZING, each polling once a minute and doing nothing at all, refused every restart
+    for hours.
+
+    They are still PRINTED, and that half is not decoration. A parked row before the
+    conversion has started has an ffmpeg nowhere and costs nothing to interrupt; one parked
+    mid-conversion holds a suspended encode, and restarting discards whatever percentage it
+    had reached. The operator is told which they are looking at instead of being quietly
+    allowed through (dev/changelog/952).
+    """
+    rows, note = _recording_rows(db_path)
+    return [(rid, status, name, pct) for rid, status, name, waiting, pct in rows
+            if waiting is not None], note
+
+
+def _recording_rows(db_path):
+    """Every recording in a blocking status, with the two columns that say whether it is
+    actually working: ``(id, status, name, postprocess_waiting_since, progress_pct)``.
+
+    Same "missing or unreadable DB reads as idle" contract as the checks below. The waiting
+    column is read defensively - a database older than its migration does not have it, and
+    an upgrade in progress must not be told a fresh install is unreadable.
     """
     if not os.path.exists(db_path):
         return [], f'no database at {db_path}, assuming idle'
@@ -74,9 +117,13 @@ def busy_rows(db_path):
     # Read-only so this can never write, and never blocks behind the app's writer.
     conn = sqlite3.connect(f'file:{db_path}?mode=ro', uri=True)
     try:
+        cols = {r[1] for r in conn.execute('PRAGMA table_info(recordings)').fetchall()}
+        waiting_col = ('postprocess_waiting_since' if 'postprocess_waiting_since' in cols
+                       else 'NULL')
         placeholders = ','.join('?' * len(RESTART_BLOCKING_STATUSES))
         rows = conn.execute(
-            f'SELECT id, status, name FROM recordings WHERE status IN ({placeholders}) ORDER BY id',
+            f'SELECT id, status, name, {waiting_col}, conversion_progress_pct '
+            f'FROM recordings WHERE status IN ({placeholders}) ORDER BY id',
             RESTART_BLOCKING_STATUSES,
         ).fetchall()
     except sqlite3.DatabaseError as e:
@@ -228,6 +275,7 @@ def main():
         # once and treat the app as idle - a fresh install must still be startable.
         print(f'check_busy: {note}')
         return 0
+    parked, _parked_note = parked_rows(db_path)
 
     # Each check below reports its own note instead of aborting the run: an older database
     # can be missing one of these tables while the others read fine, and a table that isn't
@@ -239,6 +287,14 @@ def main():
 
     for rid, status, name in rows:
         print(f'  #{rid}  {status}  {name}')
+    for rid, status, name, pct in parked:
+        # Named, never counted: these are printed whether or not anything else blocks, and
+        # they never reach the `kinds` list below. The cost line is the point - a parked
+        # conversion is holding a real encode that a restart throws away.
+        cost = (f'restarting discards the {pct:.0f}% encoded so far'
+                if status == 'CONVERTING' and pct else 'nothing is running for it yet')
+        print(f'  #{rid}  {status}  {name} - parked waiting on another recording, '
+              f'not blocking ({cost})')
     for jid, name in health_jobs:
         print(f'  health check #{jid} {name!r} is running')
     for tid, channel_name in tests:

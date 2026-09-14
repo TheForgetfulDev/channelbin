@@ -176,7 +176,7 @@ def _build_job_list():
     accounts = ({a.id: a for a in Account.query.filter(Account.id.in_(account_ids)).all()}
                 if account_ids else {})
     od_ids = {int(m.group(1)) for m in
-              (re.match(r'^od_job_(\d+)$', j.id) for j in other_jobs) if m}
+              (re.match(r'^od_job_(?:retry_)?(\d+)$', j.id) for j in other_jobs) if m}
     od_jobs = ({o.id: o for o in
                 OnDemandTestJob.query.filter(OnDemandTestJob.id.in_(od_ids)).all()}
                if od_ids else {})
@@ -250,13 +250,18 @@ def _build_job_list():
             'overlap': 'green',
         })
 
-    # On-demand test job rows
+    # On-demand test job rows, and the one-shot od_job_retry_<id> a run deferred past a
+    # recording leaves behind (dev/changelog/941). The retry is rendered by the same branch
+    # because it IS that job's next attempt - a second row named after the same health check
+    # would read as two runs booked, which is exactly what it is not. Only its schedule line
+    # differs, since a retry is one-off however the job it belongs to recurs.
     for job in other_jobs[:]:
-        m = re.match(r'^od_job_(\d+)$', job.id)
+        m = re.match(r'^od_job_(retry_)?(\d+)$', job.id)
         if not m:
             continue
         other_jobs.remove(job)
-        job_id = int(m.group(1))
+        is_retry = bool(m.group(1))
+        job_id = int(m.group(2))
         next_run = job.next_run_time
         if next_run is None:
             continue
@@ -268,7 +273,7 @@ def _build_job_list():
         label = f'Health check #{job_id}'
         if od and od.name:
             label = f'Health check: {od.name}'
-        is_recurring = bool(od and od.recurring)
+        is_recurring = bool(od and od.recurring) and not is_retry
 
         od_item = {
             '_start_utc': next_run_utc,
@@ -281,11 +286,16 @@ def _build_job_list():
             'next_run_et': _fmt_et(next_run_utc),
             'next_run_relative': _relative(next_run_utc),
             'stop_run_et': None,
-            'schedule_description': _trigger_description(job) if is_recurring else None,
+            'schedule_description': ('deferred past a recording' if is_retry
+                                     else _trigger_description(job) if is_recurring else None),
             'edit_url': f'/channels/health-checks/{job_id}',
             'overlap': 'green',
         }
-        if is_recurring:
+        if is_retry:
+            # No Run Now and no Skip: this row is already the deferral of a run that could not
+            # go ahead, and both controls address the schedule it came from, not this one-shot.
+            pass
+        elif is_recurring:
             od_item['skip_url'] = f'/api/channel-tests/on-demand/{job_id}/skip-next'
         else:
             od_item['run_url'] = f'/api/channel-tests/on-demand/{job_id}/start'
@@ -438,7 +448,8 @@ def _build_job_list():
                 'next_run_et': _fmt_et(next_run_utc),
                 'next_run_relative': _relative(next_run_utc),
                 'stop_run_et': None,
-                'schedule_description': 'deferred past a channel test run or another sync',
+                'schedule_description': 'deferred past a recording, a channel test run '
+                                        'or another sync',
                 'edit_url': f'/accounts/{account_id}/edit',
                 'run_url': None,
                 'skip_url': None,

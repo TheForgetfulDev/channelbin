@@ -210,18 +210,19 @@ _DEFAULTS = {
             # mp4 conversion vs. an imminent/active recording - local CPU/disk contention,
             # not covered by DESIGN-concurrency.md's tester/sync/recorder precedence doctrine
             # (conversion isn't one of that doc's four actors). 'off' = no collision
-            # avoidance. 'cancel' = the conversion yields: it kills its own ffmpeg and
-            # auto-resumes once clear, so the recording is never delayed (recordings always
+            # avoidance. 'cancel' = the conversion yields: it SIGSTOPs its own ffmpeg and
+            # continues once clear, so the recording is never delayed (recordings always
             # win). 'wait' = the opposite - a recording whose start_time arrives while a
             # conversion is running waits for it to finish, UNLESS its own stop_time would
             # already have passed by then, in which case it is marked FAILED with a loud
             # alert instead of silently missed.
             'collision_policy': 'cancel',
-            # Pre-start/resume lookahead window, in units of the recording-being-converted's
-            # own duration: window_seconds = duration / this multiplier. >= 0.1, no upper
-            # bound. 1.0 assumes the conversion runs at 1x realtime (always safe, the
-            # default); 2.0 assumes 2x realtime and only needs to look ahead half the
-            # duration.
+            # Lookahead window, in units of the source the conversion still has LEFT to
+            # encode: window_seconds = remaining / this multiplier. >= 0.1, no upper bound.
+            # 1.0 assumes the conversion runs at 1x realtime (always safe, the default);
+            # 2.0 assumes 2x realtime and only needs to look ahead half of it. Before the
+            # conversion starts the remainder is the whole duration; it shrinks from there,
+            # so a nearly-finished job steps aside for almost nothing (dev/changelog/953).
             'collision_lookahead_multiplier': 1.0,
         },
         'move_on_complete': {
@@ -297,7 +298,20 @@ _DEFAULTS = {
         'ffprobe_path': '',
         'extra_input_args': [],
         'extra_output_args': [],
-        'concat_timeout_seconds': 300,
+        # The concat joins however many bytes the capture produced, so its size is not
+        # knowable in advance and no whole-job deadline can be honest about it - the fixed
+        # budget these replaced killed a 42.6 GB join at roughly the halfway mark while it
+        # was writing 71 MB/s, near line rate for the mount (dev/changelog/947). Same two
+        # rules as the conversion, for the same reason (post_process above): a bound on the
+        # phase before ffmpeg writes anything, and after that a no-growth stall budget as
+        # the sole authority. A JOIN THAT IS STILL WRITING IS NEVER KILLED.
+        'concat_pre_output_timeout_seconds': 300,
+        # The only bound on a concat that has started writing - it watches bytes landing in
+        # the output file, which is the whole job of a stream copy. 0 disables it, which
+        # leaves no liveness signal at all, so concat_pre_output_timeout_seconds above
+        # reverts to a whole-job wall clock in that case rather than letting a hung ffmpeg
+        # run forever.
+        'concat_stall_seconds': 300,
     },
     'flask': {
         'port': 5000,
@@ -932,11 +946,41 @@ def _cfg_m003_conversion_pre_output_timeout(cfg: dict) -> dict:
     return cfg
 
 
+def _cfg_m004_concat_progress_supervision(cfg: dict) -> dict:
+    """`ffmpeg.concat_timeout_seconds` (a whole-job deadline) is gone; the concat is now
+    bounded by `concat_pre_output_timeout_seconds` plus `concat_stall_seconds` -
+    dev/changelog/947.
+
+    The old value cannot be carried across, for the same reason migration 3 could not carry
+    the conversion's. It answered "how long may this whole join take", a question the app no
+    longer asks: a join that is still writing now runs to completion. Reusing it as either
+    new key would be a different rule wearing the old number - as a pre-output budget it
+    would be roughly right by accident, and as a stall budget a user who had raised it to
+    survive a big recording would get a stall detector that waits hours. So it is dropped,
+    both new keys take their defaults, and the transform says what it discarded rather than
+    deleting silently.
+    """
+    ff = cfg.get('ffmpeg')
+    if not isinstance(ff, dict) or 'concat_timeout_seconds' not in ff:
+        return cfg
+    dropped = ff.pop('concat_timeout_seconds')
+    log.warning('config migration: ffmpeg.concat_timeout_seconds (%r) dropped - a concat is '
+                'no longer bounded by a whole-job deadline. concat_pre_output_timeout_seconds '
+                '(%ds) now bounds the phase before ffmpeg writes anything, and '
+                'concat_stall_seconds (%ds) is the only bound once it is writing',
+                dropped,
+                _DEFAULTS['ffmpeg']['concat_pre_output_timeout_seconds'],
+                _DEFAULTS['ffmpeg']['concat_stall_seconds'])
+    return cfg
+
+
 CONFIG_MIGRATIONS = [
     (1, "rename legacy 'xtream' section to 'sync'", _cfg_m001_xtream_to_sync),
     (2, "channel_testing.failing_score_threshold -> failing_band", _cfg_m002_failing_band),
     (3, 'post_process conversion deadlines -> pre_output_timeout_seconds',
      _cfg_m003_conversion_pre_output_timeout),
+    (4, 'ffmpeg.concat_timeout_seconds -> concat progress supervision',
+     _cfg_m004_concat_progress_supervision),
 ]
 
 CURRENT_CONFIG_VERSION = CONFIG_MIGRATIONS[-1][0]

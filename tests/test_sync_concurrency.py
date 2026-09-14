@@ -262,10 +262,11 @@ class CancelReasonPlumbingTests(unittest.TestCase):
 
 
 class UpcomingRecordingSkipIsObservableTests(unittest.TestCase):
-    """A scheduled sync skipped because a recording starts soon used to only write a
-    log line - the recording-IN_PROGRESS skip already raised a JOB_SKIPPED alert
-    (_log_job_skipped), this is the same treatment for the within-minutes branch
-    (dev/changelog/603)."""
+    """A scheduled sync yielding to a recording that starts soon used to only write a log
+    line; the recording-IN_PROGRESS branch was already recording the skip on the account, and
+    dev/changelog/603 gave the within-minutes branch the same treatment. Both branches now
+    defer rather than drop the occurrence (dev/changelog/941) - what is asserted here is the
+    unchanged half: the sync does not run, and the account's own history says why."""
 
     def setUp(self):
         self.t = make_test_app(start_scheduler=True)

@@ -92,13 +92,15 @@ class ConcatGapProseTests(unittest.TestCase):
         self.assertIn(_WITHIN, summary,
                       'the surviving gap count was not scoped to within-segment')
 
-    def test_post_concat_summary_reconciles_with_content_missing(self):
-        """The Content missing stat (dev/changelog/432) sits on the same page and reports a
-        far larger number, because the concatenated span excludes the time between segments
-        entirely. Without this clause the two read as a contradiction."""
+    def test_post_concat_summary_reconciles_with_capture_gaps(self):
+        """The Capture gaps stat sits on the same page and reports a far larger number,
+        because the concatenated span excludes the time between segments entirely. Without
+        this clause the two read as a contradiction. It named Content missing until
+        dev/changelog/942 retired that stat: netting a buffered feed's replay against the
+        gaps meant the number this clause deferred to could read zero over real loss."""
         _damaged, _metrics, summary = assess_seek_damage(self.gappy, joined_segments=4)
 
-        self.assertIn('Content missing', summary)
+        self.assertIn('Capture gaps', summary)
 
     def test_gap_basis_names_which_case_the_numbers_came_from(self):
         """One flag, one meaning: 0 means 'none found' from one source and 'none found

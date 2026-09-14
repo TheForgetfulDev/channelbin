@@ -625,6 +625,15 @@ def _index_row(rec, now, tz, thumb_ids):
     section, st_class, badge_class, badge_label, pulse = _STATUS_ROW.get(
         rec.status, ('done', 'st-abort', 'b-abort', rec.status, False))
 
+    # A parked post-processing chain badges as WAITING and stops pulsing. This is a display
+    # derivation from two stored facts, NOT a status: Recording.status stays ANALYZING or
+    # CONVERTING because the startup sweep, the collision query and the cancel route all
+    # branch on it, and a row that fell out of those would be stranded by the next restart
+    # rather than resumed (dev/changelog/954).
+    if rec.postprocess_waiting_since and rec.status in (REC_STATUS_ANALYZING,
+                                                        REC_STATUS_CONVERTING):
+        badge_label, pulse = 'WAITING', False
+
     start_l = rec.start_time.replace(tzinfo=UTC).astimezone(tz)
     today = now.replace(tzinfo=UTC).astimezone(tz).date()
     d = start_l.date()
@@ -652,6 +661,16 @@ def _index_row(rec, now, tz, thumb_ids):
                 rel = f'retrying in {retry_in} (attempt {rec.dead_stream_retry_count}) - ' + rel
             else:
                 rel = 'retrying - ' + rel
+    elif rec.postprocess_waiting_since and rec.status in (REC_STATUS_ANALYZING,
+                                                          REC_STATUS_CONVERTING):
+        # Parked, not working. Reported before the two phase branches below so neither can
+        # describe work that has stopped - a converting row would otherwise show a frozen
+        # ETA, and an analyzing one a damage scan that already finished (dev/changelog/954).
+        if rec.status == REC_STATUS_CONVERTING and rec.conversion_progress_pct is not None:
+            rel = (f'paused at {rec.conversion_progress_pct:.0f}% · '
+                   f'waiting on "{rec.postprocess_waiting_on_name}"')
+        else:
+            rel = f'waiting on "{rec.postprocess_waiting_on_name}" · resumes by itself'
     elif rec.status == REC_STATUS_CONVERTING:
         parts = ['converting']
         if rec.conversion_progress_pct is not None:
@@ -706,18 +725,24 @@ def _index_row(rec, now, tz, thumb_ids):
         rate = f'{size_bytes * 8 / dur_secs / 1e6:.1f} Mb/s'
     size_num, size_unit = _size_parts(size_bytes)
 
-    # health pill. The two loss figures are different quantities and the tooltip says so:
-    # downtime is the capture-time gap counter, the shortfall is measured after the fact
-    # against the recording window (dev/changelog/432).
-    # Gated on the same 2% the duration cell's 'partial' flag uses, so the two agree:
-    # every clean capture is a few seconds short of its window (ffmpeg start latency) and
-    # saying so on every row would be noise. The detail page shows the exact figure
-    # unconditionally.
-    shortfall = rec.content_shortfall_seconds
+    # health pill. Three different quantities and the tooltip keeps them apart: downtime is
+    # the capture-time gap counter, the gap figure is wall clock with no segment running at
+    # all (measured after the fact from the segment clocks), and the content figure compares
+    # the delivered length against that capture time (dev/changelog/432, 942).
+    # Gated on the same 2% the duration cell's 'partial' flag uses, so the two agree: every
+    # clean capture is a few seconds off its window (ffmpeg start latency, and a connect-time
+    # buffer on the other side) and saying so on every row would be noise. The detail page
+    # shows both figures unconditionally.
     window = rec.duration_seconds
-    missing = (f' {fmt_utils.fmt_duration(shortfall, with_seconds=True)} of content missing '
-               f'against the recording window.') if (
-                   shortfall and window and shortfall >= window * 0.02) else ''
+    gap_secs = rec.capture_gap_seconds
+    vs_capture = rec.content_vs_capture_seconds
+    missing = (f' {fmt_utils.fmt_duration(gap_secs, with_seconds=True)} of the recording '
+               f'window with nothing capturing at all.') if (
+                   gap_secs and window and gap_secs >= window * 0.02) else ''
+    if vs_capture and window and abs(vs_capture) >= window * 0.02:
+        missing += (
+            f' The file holds {fmt_utils.fmt_duration(abs(vs_capture), with_seconds=True)} '
+            f'{"more" if vs_capture > 0 else "less"} content than the time the capture ran.')
     # Distinct channels this recording's segments actually used - free to compute, rec.segments
     # is already loaded/iterated above for data_segs/stalls. >1 means a channel-group recording
     # had to change channels at least once (same-account restart never changes channel_id).
@@ -1837,7 +1862,8 @@ def _cancel_conversion(recording_id, rec):
     tears down recorder._active and so never reaches a conversion ffmpeg
     (dev/changelog/667).
     """
-    from ..postprocessor import request_cancel_conversion
+    from ..postprocessor import (request_cancel_conversion, set_postprocess_wait,
+                                 set_conversion_parts, discard_conversion_parts)
     from ..database import RecordingEvent, CONVERSION_DONE
 
     # A live conversion: signal its loop to abort (it sets the terminal status + deletes the
@@ -1858,12 +1884,26 @@ def _cancel_conversion(recording_id, rec):
                     os.unlink(partial)
                 except OSError as exc:
                     log.warning('cancel_convert: could not delete partial output %s: %s', partial, exc)
+            # And the partly-encoded parts a resumable conversion checkpoints into. The
+            # live-conversion branch above deletes its own; this branch is the stranded row
+            # with no loop behind it, so nothing else ever will - and they are the size of
+            # the recording (dev/changelog/955).
+            discard_conversion_parts(partial)
 
     @retry_on_locked()
     def _mark_cancelled():
         r = db.session.get(Recording, recording_id)
         r.status = REC_STATUS_ABORTED
         r.completed_at = datetime.utcnow()
+        # This branch is the one with no live chain behind it, so nothing else will ever
+        # clear a wait the stranded row is carrying - and a finished recording that
+        # still claims to be waiting on another one is a lie with no expiry
+        # (dev/changelog/952).
+        set_postprocess_wait(r, None)
+        # Same reasoning for the conversion checkpoint: the parts it describes have just been
+        # deleted, and a checkpoint naming files that are gone would send a later Retry to a
+        # splice point with nothing behind it (dev/changelog/955).
+        set_conversion_parts(r)
         db.session.add(RecordingEvent(
             recording_id=recording_id,
             event_type=CONVERSION_DONE,

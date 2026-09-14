@@ -290,6 +290,17 @@
   <span class="pulse"></span>
   <span>Capture finished - <b>{{ rec.segments | length }} segment{{ '' if rec.segments | length == 1 else 's' }}</b> being joined into the final file. This usually takes a few minutes.</span>
 </div>
+{% elif rec.status == 'ANALYZING' and rec.postprocess_waiting_since %}
+{# Parked before the conversion starts. The analysis itself has already finished by the time
+   the collision check runs, so the damage-scan wording below would describe work that is
+   over while the row sits idle for however long the other recording takes. No pulse: this
+   phase is genuinely doing nothing (dev/changelog/954). #}
+<div class="live-strip concat-strip">
+  <span class="fx">&#9208;</span>
+  <span><b>Waiting</b> - the file has been checked and is ready to convert, but recording <b>"{{ rec.postprocess_waiting_on_name }}"</b> {{ rec.postprocess_waiting_on_state }}. The conversion will start automatically when no recordings are active.</span>
+  <span class="sep-dot">·</span>
+  <span>waiting since <span class="mono">{{ rec.postprocess_waiting_since | local_time_sec }}</span></span>
+</div>
 {% elif rec.status == 'ANALYZING' %}
 {# The long one, and the reason this status exists: two whole-file reads that scale with
    size (~124s each on a 17.9 GB capture). Naming the size is what makes a wait that looks
@@ -297,6 +308,17 @@
 <div class="live-strip concat-strip">
   <span class="pulse"></span>
   <span>Segments joined - the recorded file{% if rec.final_file_size %} (<b>{{ rec.final_file_size | filesize }}</b>){% endif %} is being checked for damage before conversion. This reads the whole file, so it takes longer on a large recording.</span>
+</div>
+{% elif rec.status == 'CONVERTING' and rec.postprocess_waiting_since %}
+{# Parked mid-encode. The ffmpeg is SIGSTOPped, so the ETA below is frozen rather than
+   wrong-but-moving, and a stopped clock is the thing that misleads - it is dropped here
+   instead of shown (dev/changelog/952, 954). What IS shown is how much survived the pause,
+   because the whole point of item 2 was that none of it is thrown away. #}
+<div class="live-strip concat-strip">
+  <span class="fx">&#9208;</span>
+  <span><b>Paused{% if rec.conversion_progress_pct is not none %} at {{ rec.conversion_progress_pct | round(0) | int }}%{% endif %}</b>{% if rec.conversion_out_size %} - <b>{{ rec.conversion_out_size | filesize }}</b> written so far and kept{% endif %}, waiting on recording <b>"{{ rec.postprocess_waiting_on_name }}"</b> to complete. Conversion will resume automatically when no recordings are active.</span>
+  <span class="sep-dot">·</span>
+  <span>paused since <span class="mono">{{ rec.postprocess_waiting_since | local_time_sec }}</span></span>
 </div>
 {% elif rec.status == 'CONVERTING' %}
 {# Server-rendered from the persisted conversion_* snapshot; the page's 15s status-strip
@@ -650,32 +672,45 @@
                     tip='Segments where a restart attempt produced zero bytes before the recording moved on (RESTART_NO_DATA / ERROR in the Exit column) - distinct from Stalls, which counts every stall regardless of what happened next.') }}
         {{ stat_row('Restarts', rec.total_restart_count,
                     tip='Only counts restarts that resumed writing data after a stall. A restart that came back with zero bytes doesn\'t count here - the watchdog declares that attempt dead immediately and either retries again or the recording fails over to another channel (see the Segments list below for which). Restarts can be lower than Segments minus 1 for this reason.') }}
-        {# Downtime and Content missing are deliberately two stats, not one corrected
-           number (dev/changelog/432): downtime is a live counter that can only see gaps
-           in the write stream, the shortfall is only knowable once the finished file has
-           been probed. Each tooltip names which of the four durations it is measured
-           against, per CLAUDE.md's time-and-counter-accounting rule. #}
+        {# Downtime, Capture gaps and Content vs capture time are three stats on purpose,
+           never one corrected number (dev/changelog/432, 942). Downtime is a live counter
+           over the write stream; Capture gaps is measured after the fact from the segment
+           clocks; the content figure compares the finished file against the time the
+           capture ran. Reporting the last two separately is the whole point: they used to
+           be one subtraction clamped at zero, so a feed that replays its buffer on
+           reconnect cancelled out real gap time and the page said nothing was missing.
+           Neither one is a claim about WHICH content was lost or duplicated - nothing here
+           compares a frame, and the tooltips must not start implying otherwise.
+           Each tooltip names which of the four durations it is measured against, per
+           CLAUDE.md's time-and-counter-accounting rule. #}
         {{ stat_row('Downtime', (rec.total_downtime_seconds | int) | duration(with_seconds=true),
                     sv_cls=('warn' if rec.total_downtime_seconds else none),
-                    tip='Wall-clock time with nothing being written: for each stall, the gap between the last byte and the stall being noticed, plus the restart delay and the wait for the replacement segment to start writing.\nA stream that stays connected but delivers almost nothing is invisible here - that loss shows up under Content missing.') }}
-        {% if rec.content_shortfall_seconds is not none %}
-        {% set short_pct = (rec.content_shortfall_seconds / rec.duration_seconds * 100) if rec.duration_seconds else none %}
-        {% set short_basis = 'measured by ffprobe of the finished file' if rec.actual_duration_source == 'file' else 'estimated from the span of the segments that captured data, which slightly over-counts content and so under-states this figure' %}
-        {# The Captured row above counts against the SCHEDULED window and this one against the
-           adjusted one, so on a recording that ended early the two look like they disagree.
-           Saying which is which is the whole point of this pair of stats. #}
-        {% set short_window_note = ('\nThe recording ended early, so this is measured against the ' ~ (rec.duration_seconds | int | duration) ~ ' it actually ran for, not the ' ~ (rec.scheduled_duration_seconds | int | duration) ~ ' originally scheduled.') if (rec.scheduled_duration_seconds - rec.duration_seconds) > 60 else '' %}
-        {{ stat_row('Content missing',
-                    ((rec.content_shortfall_seconds | int) | duration(with_seconds=true)) ~ ('' if short_pct is none else ' (%.0f%%)' | format(short_pct)),
-                    sv_cls=('warn' if short_pct and short_pct >= 2 else 'ok'),
-                    tip='The recording window (' ~ (rec.duration_seconds | int | duration) ~ ', start to stop) minus the content actually captured (' ~ (rec.actual_duration_seconds | int | duration(with_seconds=true)) ~ '), ' ~ short_basis ~ '.' ~ short_window_note ~ '\nTime the recording spent paused counts as missing content.\nThis can read near zero even after real Downtime: a stretch of downtime can be made up if the stream ran faster than real-time afterward, and an early stop shrinks the window it is measured against.') }}
+                    tip='Wall-clock time with nothing being written: for each stall, the gap between the last byte and the stall being noticed, plus the restart delay and the wait for the replacement segment to start writing.\nCapture gaps below is the subset of this where no capture process was running at all; the rest is time a segment was still alive but had stopped delivering.') }}
+        {% if rec.capture_gap_seconds is not none %}
+        {% set gap_pct = (rec.capture_gap_seconds / rec.duration_seconds * 100) if rec.duration_seconds else none %}
+        {# The Captured row above counts against the SCHEDULED window and these count against
+           the adjusted one, so on a recording that ended early they look like they disagree.
+           Saying which is which is the whole point of this group of stats. #}
+        {% set early_note = ('\nThe recording ended early, so this is measured against the ' ~ (rec.duration_seconds | int | duration) ~ ' it actually ran for, not the ' ~ (rec.scheduled_duration_seconds | int | duration) ~ ' originally scheduled.') if (rec.scheduled_duration_seconds - rec.duration_seconds) > 60 else '' %}
+        {{ stat_row('Capture gaps',
+                    ((rec.capture_gap_seconds | int) | duration(with_seconds=true)) ~ ('' if gap_pct is none else ' (%.0f%%)' | format(gap_pct)),
+                    sv_cls=('warn' if gap_pct and gap_pct >= 2 else 'ok'),
+                    tip='Time inside the recording window (' ~ (rec.duration_seconds | int | duration) ~ ', start to stop) when no capture process was running at all - the window minus the ' ~ (rec.covered_capture_seconds | int | duration(with_seconds=true)) ~ ' some segment was actually capturing for.' ~ early_note ~ '\nTime the recording spent paused counts here.\nThis is wall clock, not content: whether the feed replayed any of it after reconnecting cannot be told from length alone.') }}
+        {% endif %}
+        {% if rec.content_vs_capture_seconds is not none %}
+        {% set vs_pct = (rec.content_vs_capture_seconds / rec.duration_seconds * 100) if rec.duration_seconds else none %}
+        {% set vs_basis = 'measured by ffprobe of the finished file' if rec.actual_duration_source == 'file' else 'estimated from the span of the segments that captured data, so it cannot differ from the capture time and reads zero here' %}
+        {{ stat_row('Content vs capture time',
+                    ('%+d' | format(rec.content_vs_capture_seconds | round | int)) ~ 's' ~ ('' if vs_pct is none else ' (%+.0f%%)' | format(vs_pct)),
+                    sv_cls=('warn' if vs_pct and vs_pct | abs >= 2 else 'ok'),
+                    tip='How much more (+) or less (-) content came back than the ' ~ (rec.covered_capture_seconds | int | duration(with_seconds=true)) ~ ' the capture actually ran for. The content length is ' ~ vs_basis ~ '.\nA plus means content arrived faster than real time. Providers that buffer serve the last few seconds again when a dropped connection is re-established, so a recording with many restarts collects that surplus once per restart - it is very often duplicated video, but nothing here compares frames, so this stat does not claim it.\nA minus means the feed stayed connected and delivered less than real time.') }}
         {% endif %}
         {% if rec.near_empty_segment_count %}
         {{ stat_row('Near-empty segments',
                     rec.near_empty_segment_count ~ ' segment' ~ ('' if rec.near_empty_segment_count == 1 else 's')
                     ~ ' (' ~ ((rec.near_empty_seconds | int) | duration(with_seconds=true)) ~ ' total)',
                     sv_cls='warn',
-                    tip='Segment(s) whose bitrate is far below the recording\'s own average - likely a blank/slate screen or error card. The timeline itself is clean (no gaps), which is why this is a separate check from Content missing.') }}
+                    tip='Segment(s) whose bitrate is far below the recording\'s own average - likely a blank/slate screen or error card. The timeline itself is clean (no gaps), which is why this is a separate check from Capture gaps.') }}
         {% endif %}
         {{ stat_row('Consecutive failures', rec.consecutive_failures ~ ' (peak ' ~ rec.consecutive_failures_peak ~ ')', sv_cls=('ok' if not rec.consecutive_failures else 'bad'),
                     tip='The current run of stalls and failed restarts with no successful restart in between, and the highest that run ever reached this recording (peak). Resets to 0 on a successful restart or a channel failover. Reaching the configured limit is what triggers a failover to another channel, or gives up if there is nowhere left to go.') }}
@@ -717,7 +752,7 @@
            .xtra and hidden at phone widths (DESIGN.md 9.5) so the table never needs
            sideways scroll on a 375px screen. #}
         <th class="num">#</th><th class="xtra">Started</th><th class="xtra">Ended</th>
-        <th class="num">Duration</th><th class="num">Size</th><th class="num xtra">Avg rate</th>
+        <th class="num">Duration</th><th class="num xtra">Content</th><th class="num">Size</th><th class="num xtra">Avg rate</th>
         <th class="num xtra">Stalls</th><th>Exit</th><th class="xtra">Channel</th><th class="xtra">File</th>
       </tr></thead>
       <tbody>
@@ -728,6 +763,15 @@
           <td class="mono xtra">{% if seg.ended_at %}{{ seg.ended_at | local_time_sec }}{% else %}<span class="muted">-</span>{% endif %}</td>
           {% set seg_secs = ((seg.ended_at or now) - seg.started_at).total_seconds() if seg.started_at else none %}
           <td class="num">{{ (seg_secs | int) | duration(with_seconds=true) if seg_secs is not none else '-' }}</td>
+          {# How much content the finished segment file holds, against the Duration beside it
+             (its wall clock). A plus is content that arrived faster than real time - a
+             provider replaying its buffer after a reconnect is the measured cause here, and
+             it lands once per restart. NULL on every segment captured before this was
+             measured at concat time, and on any file ffprobe could not read. #}
+          <td class="num xtra">{% if seg.content_duration_seconds is none %}<span class="muted tip-plain" data-tip="Not measured. Segments captured before ChannelBin recorded a per-segment content length are not backfilled - the .ts files are deleted after conversion, so there is nothing left to probe.">-</span>{% else %}{{ (seg.content_duration_seconds | int) | duration(with_seconds=true) }}{% if seg_secs %}
+            {% set seg_delta = seg.content_duration_seconds - seg_secs %}
+            <span class="exit-code{{ ' bad' if seg_delta < -1 else '' }} tip-plain" data-tip="This segment holds {{ (seg.content_duration_seconds | int) | duration(with_seconds=true) }} of content but ran for {{ (seg_secs | int) | duration(with_seconds=true) }} of wall clock.">{{ '%+d' | format(seg_delta | round | int) }}s</span>
+            {% endif %}{% endif %}</td>
           <td class="num">{{ seg.bytes_recorded | filesize if seg.bytes_recorded else '0 B' }}</td>
           <td class="num xtra">{% if seg.bytes_recorded and seg_secs and seg_secs > 10 %}{{ '%.1f' | format(seg.bytes_recorded * 8 / seg_secs / 1000000) }} Mb/s{% else %}<span class="muted">-</span>{% endif %}
             {% if seg.near_empty %}<span class="badge b-warn tip-plain" data-tip="This segment's bitrate is far below the recording's own average - likely a blank/slate screen or error card, even though the timeline itself is clean.">slate?</span>{% endif %}</td>
@@ -789,9 +833,10 @@
   'RECORDING_START_DEFERRED': 'warn', 'CONVERSION_YIELDED': 'warn',
   'CAPTURE_LOST_TO_OUTAGE': 'warn',
   'CONVERSION_RESTARTED': 'info', 'DIAGNOSTICS': 'info',
-  'POSTCAPTURE_ANALYSIS_STARTED': 'info',
+  'POSTCAPTURE_ANALYSIS_STARTED': 'info', 'POSTCAPTURE_ANALYSIS_SKIPPED': 'info',
   'MIXED_FRAME_RATE_DETECTED': 'info',
   'RESTART_SUCCEEDED': 'ok', 'CONCATENATION_DONE': 'ok', 'CONVERSION_DONE': 'ok',
+  'CONVERSION_RESUMED': 'ok',
   'FILE_MOVED': 'ok', 'SCRIPT_EXECUTED': 'ok',
   'RECORDING_FAILED': 'bad', 'RECORDING_FAILED_DEAD_STREAM': 'bad',
 } %}

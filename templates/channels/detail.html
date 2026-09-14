@@ -395,7 +395,7 @@
     {% if hide.epg_gap %}
     No guide data is stored for this channel - hidden channels do not have EPG imported.
     {{ channel.account.name }} will fill it in on its next sync
-    {%- if channel.account.sync_enabled and channel.account.next_sync_at %}, {{ channel.account.next_sync_at | time_until }}.
+    {%- if channel.account.sync_enabled and next_sync_at %}, {{ next_sync_at | time_until }}.
     {%- elif not channel.account.sync_enabled %}, but automatic sync is off for that account.
     {%- else %}.{% endif %}
     {% endif %}

@@ -133,7 +133,12 @@ class TooltipEscapingTests(unittest.TestCase):
     def test_activity_tooltips_escape_every_name_they_interpolate(self):
         src = open(os.path.join(REPO, 'templates', 'base.html'), encoding='utf-8').read()
         block = src.split('function buildRecTooltip(data) {', 1)[1].split('function showTooltip', 1)[0]
-        raw = re.findall(r"\+ ((?:r|ns|t)\.(?:name|label|detail|state_label)) ", block)
+        # `href` joined the list in dev/changelog/949, when the rows became links. The
+        # pattern still matches CONCATENATION into the markup only (a trailing space,
+        # i.e. `... + x.name + '</span>'`), which is the shape with no escaping behind
+        # it. A field handed to tipItem() as an argument is escaped by that helper,
+        # guarded in tests/test_activity_chip_links.py.
+        raw = re.findall(r"\+ ((?:r|ns|t)\.(?:name|label|detail|state_label|href)) ", block)
         self.assertEqual(raw, [], f'Interpolated into innerHTML without escHtml: {raw}')
 
 

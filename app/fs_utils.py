@@ -137,7 +137,60 @@ def ensure_dir(path) -> DirProbe:
 # readout every 15s per open tab) must not emit the same warning forever, but the
 # transition into and out of trouble is exactly what an operator needs timestamped.
 # Reset between tests via tests/support/app.py::reset_module_globals.
+#: Filesystem types that are a network share however they were mounted. CLAUDE.md forbids
+#: putting a SQLite database on one of these: /dvr answered `ls` with "Stale file handle"
+#: and SQLite with "unable to open database file" mid-task on 2026-08-15, and a DB there
+#: loses writes and locks unpredictably rather than failing loudly.
+#:
+#: Matched against /proc/mounts' own third field, so these are kernel filesystem names
+#: rather than anything this app chooses. `fuse.sshfs` and friends carry a subtype, so the
+#: comparison also takes the part before the first dot.
+NETWORK_FILESYSTEMS = frozenset((
+    'cifs', 'smbfs', 'smb3', 'nfs', 'nfs4', 'afs', 'ncpfs', 'coda', 'glusterfs',
+    'ceph', 'lustre', 'beegfs', 'afpfs', 'davfs', 'sshfs', 'ftpfs', '9p',
+))
+
 _last_logged_outcome: dict = {}
+
+
+def filesystem_type(path):
+    """The filesystem type `path` sits on, read from /proc/mounts, or None.
+
+    Resolved by longest matching mount point rather than by an exact hit, because the
+    answer for `/config/dvr.db` is whatever `/config`, `/` or anything between them is
+    mounted as. None means the question could not be answered at all - there is no
+    /proc/mounts (a non-Linux host), or nothing in it covers the path - and is never
+    reported as "local", since a filesystem nobody could name is not evidence of anything.
+
+    Deliberately not os.statvfs: f_fsid and f_type are not exposed by statvfs in Python,
+    and the mount table is the thing that actually names cifs vs ext4.
+    """
+    if not path:
+        return None
+    target = os.path.abspath(path)
+    best = None
+    best_len = -1
+    try:
+        with open('/proc/mounts', encoding='utf-8', errors='replace') as fh:
+            for line in fh:
+                parts = line.split()
+                if len(parts) < 3:
+                    continue
+                point, fstype = parts[1].replace('\\040', ' '), parts[2]
+                if target == point or target.startswith(point.rstrip('/') + '/'):
+                    if len(point) > best_len:
+                        best, best_len = fstype, len(point)
+    except OSError as exc:
+        log.warning('could not read /proc/mounts to place %s: %s', path, exc)
+        return None
+    return best
+
+
+def is_network_filesystem(fstype) -> bool:
+    """Whether a /proc/mounts filesystem name is a network share. False for None."""
+    if not fstype:
+        return False
+    return fstype in NETWORK_FILESYSTEMS or fstype.split('.', 1)[0] in NETWORK_FILESYSTEMS
 
 
 def log_dir_outcome_change(path, probe: DirProbe, what: str) -> bool:

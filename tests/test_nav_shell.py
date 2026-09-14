@@ -203,10 +203,15 @@ class RenderedShellTests(unittest.TestCase):
 
     def test_count_badges_carry_a_rail_pip(self):
         """The rail hides the badge, so the pip is the only mark left; a link with
-        a count must have one, and the two dynamic ones start hidden with it."""
+        a count must have one, and the dynamic ones start hidden with it.
+
+        Four: Recordings, Dashboard, Alerts, and Maintenance - the last one added with the
+        Readiness check's blocked/degraded counts (dev/changelog/950).
+        """
         sidebar = self._sidebar()
-        self.assertEqual(sidebar.count('class="nav-pip'), 3)
+        self.assertEqual(sidebar.count('class="nav-pip'), 4)
         self.assertIn('<span class="nav-pip pip-alert" style="display:none"></span>', sidebar)
+        self.assertIn('<span class="nav-pip pip-ready" style="display:none"></span>', sidebar)
 
     def test_alerts_link_carries_a_red_and_a_yellow_count_in_both_shells(self):
         """dev/changelog/924: one grey count of every unread alert became a red count
@@ -248,7 +253,7 @@ class ShellSourceTests(unittest.TestCase):
         outside = css.replace(block, '')
         self.assertNotIn('body.nav-min', outside)
 
-    def test_stats_chip_click_is_keyed_on_pinned_not_on_open(self):
+    def test_chip_click_is_keyed_on_pinned_not_on_open(self):
         """dev/docs/BUGS.md 2026-07-29 09:41 AM. mouseenter fires before click on a
         real pointer, and touch synthesizes hover before the tap, so a click handler
         that closes when the tip is *already open* closes the one hover just opened -
@@ -258,9 +263,12 @@ class ShellSourceTests(unittest.TestCase):
         Source-shape guard, not a behavioral one: this is inline DOM code in
         base.html and the repo has no jsdom to drive it (the mockup harnesses ask
         you to install it out-of-tree). It still bites - the defective version
-        spelled the condition `activeChip === el`."""
+        spelled the condition `activeChip === el`.
+
+        All three chips take this path since dev/changelog/949; which chips pin is
+        tests/test_activity_chip_links.py's question, this one is about how."""
         base = _read('templates/base.html')
-        click_handler = _slice(base, "if (clickPins) {", "el.addEventListener('mouseenter'")
+        click_handler = _slice(base, "el.addEventListener('click'", "el.addEventListener('mouseenter'")
         self.assertIn('dataset.pinned', click_handler)
         self.assertNotIn('activeChip === el', click_handler)
         # hover-out must not close a pinned tip either, or the pin lasts until the

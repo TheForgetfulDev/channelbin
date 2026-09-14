@@ -1,5 +1,4 @@
 """Post-processing after concatenation: health data, format conversion and/or file move."""
-import glob
 import logging
 import os
 import re
@@ -7,13 +6,12 @@ import shutil
 import subprocess
 import threading
 import time
-import uuid
 from datetime import datetime
 
 from .db_utils import retry_on_locked
 from .fmt_utils import fmt_bytes as _fmt_bytes, fmt_duration
 from .fs_utils import ensure_dir
-from .proc_utils import GrowthMonitor, read_stderr_tail, terminate_or_kill
+from .proc_utils import supervise_ffmpeg, terminate_or_kill
 
 log = logging.getLogger(__name__)
 
@@ -96,38 +94,87 @@ def kill_active_conversions():
         _active_conversions.clear()
 
 
-def _collision_window_seconds(expected_duration, multiplier) -> float:
-    """Pre-start/resume lookahead window: the recording-being-converted's own duration
-    divided by the configured 'runs at Nx realtime' assumption
-    (recording.post_process.collision_lookahead_multiplier). 0 when the duration is
-    unknown - degrades to reacting only to a recording that is already IN_PROGRESS or
-    already overdue, never a future one. The only place the >= 0.1 floor is enforced -
-    None means "not set" (falls back to 1.0); anything else, including 0 or negative, is
-    clamped up rather than silently swapped for the default. Pure - no I/O."""
-    if not expected_duration or expected_duration <= 0:
+def _collision_window_seconds(remaining_duration, multiplier) -> float:
+    """Lookahead window: how much source is still LEFT to encode, divided by the configured
+    'runs at Nx realtime' assumption (recording.post_process.collision_lookahead_multiplier).
+    0 when that is unknown or already exhausted - degrades to reacting only to a recording
+    that is already IN_PROGRESS or already overdue, never a future one. The only place the
+    >= 0.1 floor is enforced - None means "not set" (falls back to 1.0); anything else,
+    including 0 or negative, is clamped up rather than silently swapped for the default.
+    Pure - no I/O, and the remaining duration is passed in rather than read here.
+
+    The caller decides what "remaining" means, and the two callers differ: the pre-start
+    check has no progress to read and passes the whole duration, while the in-run check
+    passes what is left. A window that never shrinks is a window sized on work that is
+    already done - recording 17 held a 5.06h lookahead with 1.7h of source left and stepped
+    aside five hours before the recording it stepped aside for began (dev/changelog/953)."""
+    if not remaining_duration or remaining_duration <= 0:
         return 0.0
     m = multiplier if multiplier is not None else 1.0
-    return expected_duration / max(0.1, m)
+    return remaining_duration / max(0.1, m)
 
 
-def _conversion_collision_conflict(within_seconds):
-    """A Recording that argues against starting/continuing an mp4 conversion right now -
-    one that is IN_PROGRESS, or SCHEDULED to start within within_seconds. None = clear.
+# What each conflicting status is actually doing to the machine, in the user's words. Every
+# status _conversion_collision_conflict() can return has an entry; a status with none is a
+# defect, not a case to render (CLAUDE.md "states are enumerated").
+def _conflict_phrase(conflict) -> str:
+    from .database import (REC_STATUS_SCHEDULED, REC_STATUS_IN_PROGRESS,
+                           REC_STATUS_CONCATENATING, REC_STATUS_ANALYZING)
+    phrases = {
+        REC_STATUS_IN_PROGRESS: 'is in progress',
+        REC_STATUS_SCHEDULED: 'starts soon',
+        REC_STATUS_CONCATENATING: 'is joining its segments',
+        REC_STATUS_ANALYZING: 'is being checked for damage',
+    }
+    phrase = phrases.get(conflict.status)
+    if phrase is None:
+        log.warning('Recording %d is a conversion conflict in unhandled status %s',
+                    conflict.id, conflict.status)
+        return f'is busy ({conflict.status})'
+    return phrase
+
+
+def _conversion_collision_conflict(within_seconds, exclude_recording_id):
+    """A Recording that argues against starting/continuing an mp4 conversion right now, or
+    None when nothing does.
+
+    Four statuses count, and they are the four in which another recording is using this
+    machine: IN_PROGRESS (capturing), SCHEDULED to start within within_seconds (about to),
+    and CONCATENATING or ANALYZING - a whole-file join and a whole-file ffprobe, which want
+    the same two vCPUs and the same CIFS mount an mp4 conversion does. The post-capture pair
+    was invisible here until dev/changelog/953, so a conversion would wait politely for a
+    capture and then land on top of that capture's own post-processing: recording 17's
+    conversion started 09:30:05 and recording 19's 42.6 GB concat started 09:30:18, and the
+    concat was killed shortly after.
+
+    Two guards, and neither is optional:
+
+    - **exclude_recording_id is required**, because the caller's OWN row is one of the rows
+      this query matches. do_postprocess runs its pre-start check while the row is still
+      ANALYZING, so without the exclusion every conversion would wait forever on itself.
+    - **A parked row does not count.** postprocess_waiting_since is the recorded fact that a
+      row has stopped and is waiting on someone else (dev/changelog/952), so it is provably
+      consuming nothing. Two parked rows that each counted the other would deadlock, and
+      that is the exact state recordings 17 and 19 were in on 2026-09-13 - both ANALYZING,
+      both yielding, both doing no work.
 
     Mirrors channel_tester.imminent_recording_conflict() (DESIGN-concurrency.md 5.5),
-    extended to also cover IN_PROGRESS: conversion CPU/disk contention with a recording
-    matters for the recording's whole run, not just its run-up
-    (recording.post_process.collision_policy).
+    extended because conversion CPU/disk contention with a recording matters for the
+    recording's whole run, not just its run-up (recording.post_process.collision_policy).
     """
     from datetime import timedelta
-    from .database import Recording, REC_STATUS_SCHEDULED, REC_STATUS_IN_PROGRESS
+    from .database import (Recording, REC_STATUS_SCHEDULED, REC_STATUS_IN_PROGRESS,
+                           REC_STATUS_CONCATENATING, REC_STATUS_ANALYZING)
     from . import db as _db
 
     cutoff = datetime.utcnow() + timedelta(seconds=max(0.0, within_seconds))
     return Recording.query.filter(
+        Recording.id != exclude_recording_id,
         _db.or_(
             Recording.status == REC_STATUS_IN_PROGRESS,
             _db.and_(Recording.status == REC_STATUS_SCHEDULED, Recording.start_time <= cutoff),
+            _db.and_(Recording.status.in_((REC_STATUS_CONCATENATING, REC_STATUS_ANALYZING)),
+                     Recording.postprocess_waiting_since.is_(None)),
         )
     ).order_by(Recording.start_time).first()
 
@@ -137,19 +184,17 @@ def _wait_for_conversion_clear(recording_id, within_seconds, poll_seconds=5, log
     cancelled meanwhile. Mirrors concatenator._wait_for_no_active_recording, with a
     lookahead window instead of a bare IN_PROGRESS check
     (recording.post_process.collision_policy)."""
-    from .database import REC_STATUS_IN_PROGRESS
     i = 0
     while True:
-        conflict = _conversion_collision_conflict(within_seconds)
+        conflict = _conversion_collision_conflict(within_seconds, recording_id)
         if conflict is None:
             return
         if cancelled_meanwhile(recording_id):
             return
         if i % log_every == 0:
-            where = ('in progress' if conflict.status == REC_STATUS_IN_PROGRESS
-                     else f'starting at {conflict.start_time}')
-            log.info('Recording %d conversion waiting on recording "%s" (%s) - '
-                     'recording.post_process.collision_policy', recording_id, conflict.name, where)
+            log.info('Recording %d conversion waiting on recording "%s" (status %s, '
+                     'starts %s) - recording.post_process.collision_policy',
+                     recording_id, conflict.name, conflict.status, conflict.start_time)
         time.sleep(poll_seconds)
         i += 1
 
@@ -232,19 +277,23 @@ class EtaSmoother:
 class ConversionResult:
     """Outcome of one supervised conversion attempt.
 
-    `out_time` is how far into the source the attempt had encoded when it ended. The
-    restart loop compares it across attempts: a defect in the source file stops every
-    attempt at the same offset, and restarting from the top cannot get past it.
+    `out_time` is how far into the source the attempt had encoded when it ended, as an
+    ABSOLUTE source position - a resumed attempt's `-ss` offset is already added back, so the
+    figure means the same thing whatever the attempt started from. The restart loop compares
+    it across attempts: a defect in the source file stops every attempt at the same offset,
+    and restarting from the top cannot get past it.
     `decode_errors` is how many frames ffmpeg failed to decode, counted so a conversion
     that finished by concealing damage can still say the damage happened.
     """
     def __init__(self, success, reason=None, error_msg=None, out_time=None,
                  decode_errors=0):
         self.success = success
-        # 'success' | 'died' | 'stalled' | 'no_output' | 'timeout' | 'preempted'.
-        # 'no_output' is the pre-output budget expiring; 'timeout' survives only for the
-        # stall-detection-disabled fallback, and is no longer reachable in the default
-        # configuration (dev/changelog/865).
+        # 'success' | 'died' | 'stalled' | 'no_output' | 'timeout'. 'no_output' is the
+        # pre-output budget expiring; 'timeout' survives only for the stall-detection-
+        # disabled fallback, and is no longer reachable in the default configuration
+        # (dev/changelog/865). There is no 'preempted': yielding to a recording suspends the
+        # ffmpeg and continues it, so an attempt that yields still ends exactly once, on its
+        # own terms (dev/changelog/952).
         self.reason = reason
         self.error_msg = error_msg
         self.out_time = out_time
@@ -260,37 +309,6 @@ _RESTART_REASON_PHRASE = {
     'no_output': 'produced no output',
     'timeout': 'ran past its limit with stall detection disabled',
 }
-
-
-def _read_progress_tail(progress_path):
-    """Parse ffmpeg's -progress file, returning the latest value of each key it emits in
-    repeating key=value blocks. Returns (out_time_us:int|None, total_size:int|None,
-    done:bool). Missing/unreadable file yields (None, None, False)."""
-    out_time_us = None
-    total_size = None
-    done = False
-    try:
-        with open(progress_path, 'r') as fh:
-            for line in fh:
-                line = line.strip()
-                if '=' not in line:
-                    continue
-                key, _, val = line.partition('=')
-                if key == 'out_time_us':
-                    try:
-                        out_time_us = int(val)
-                    except ValueError:
-                        pass
-                elif key == 'total_size':
-                    try:
-                        total_size = int(val)
-                    except ValueError:
-                        pass
-                elif key == 'progress':
-                    done = (val == 'end')
-    except OSError:
-        return None, None, False
-    return out_time_us, total_size, done
 
 
 def _persist_conversion_snapshot(recording_id, pct, size, eta):
@@ -314,12 +332,428 @@ def _persist_conversion_snapshot(recording_id, pct, size, eta):
     _do()
 
 
+def set_postprocess_wait(rec, conflict=None):
+    """Move a recording's whole park record together: parked-since, who it is waiting on,
+    and what that recording is doing. `conflict` is the blocking Recording, or None to clear.
+
+    THE THREE COLUMNS ARE ONE FACT AND THIS IS THEIR ONLY WRITER IN app/. Never assign any
+    of them directly. A stamp without a blocker renders as a wait naming nobody, and a blocker
+    without a stamp is a finished recording still claiming to be waiting - the same defect
+    class as the participation switch, where two writers for one user-visible fact meant it
+    could move with nothing on any surface saying so (CLAUDE.md).
+
+    Mutates without committing, so the caller owns the whole read-modify-write unit and can
+    join it to whatever else it is writing under one retry_on_locked (the same shape as
+    channel_groups.set_participation).
+    """
+    rec.postprocess_waiting_since = datetime.utcnow() if conflict is not None else None
+    rec.postprocess_waiting_on_name = conflict.name if conflict is not None else None
+    rec.postprocess_waiting_on_state = _conflict_phrase(conflict) if conflict is not None else None
+
+
+def _persist_postprocess_waiting(recording_id, conflict=None):
+    """Record - or clear - the fact that this recording's post-processing is parked waiting
+    on another recording. Its own re-fetch→mutate→commit closure, per CLAUDE.md.
+
+    Written at both yield sites and cleared on every way out of either, because the one
+    consumer that cannot see this process is the one that matters: tools/check_busy.py reads
+    the row to decide whether a restart is interrupting real work, and a stamp left behind
+    by a wait that ended would tell it a working recording is idle.
+    """
+    from . import db
+    from .database import Recording
+
+    @retry_on_locked()
+    def _do():
+        r = db.session.get(Recording, recording_id)
+        if r is None:
+            return
+        set_postprocess_wait(r, conflict)
+        db.session.commit()
+
+    _do()
+
+
+# ── Re-encode checkpointing ───────────────────────────────────────────────────────────
+# A KILLED RE-ENCODE KEEPS WHAT IT ENCODED. The re-encode writes numbered part files rather
+# than the final container, and a final concat joins them; a stall, a crash or a service
+# restart therefore costs one stretch of encoding instead of the whole job. Recording 17 lost
+# 4h26m at 66.4% to the old behavior, and its partial was not even readable
+# (dev/changelog/955).
+#
+# Three findings measured on this box on 2026-09-13 shape all of it, and none is optional:
+#   1. +faststart writes moov LAST, so a killed file has none and probes as garbage. The same
+#      encode under +frag_keyframe+empty_moov+default_base_moof, killed at the same instant,
+#      probes clean. That one flag is the whole difference between a discarded partial and a
+#      usable checkpoint, which is why the final container's +faststart moves to the join.
+#   2. -ss on the source plus the concat demuxer does reassemble correctly: 120.370370s
+#      single-pass against 120.370370s of video across a two-part join, zero decode errors,
+#      about two frames of splice drift at 59.94 fps.
+#   3. THE SPLICE POINT COMES FROM THE LAST DECODABLE FRAME, NEVER THE DECLARED DURATION. A
+#      killed part claimed 6.039373s while its last clean frame was at 5.739072s, the final
+#      fragment truncated mid-NAL. Resuming at the declared duration silently lost exactly
+#      1.0s of video. Re-muxing the survivor with -c copy drops the broken tail, and the
+#      resume point is read from THAT - which is also what makes the part safe to join.
+#
+# Scope is the re-encode only. A stream copy finishes in minutes (3m to 15m47s measured on
+# real recordings), so resuming one saves nothing and it keeps writing the final file directly.
+
+# Fragmented-MP4 flags: moov up front and self-contained fragments, so a part killed mid-write
+# is still readable up to its last complete fragment. Finding 1 above.
+PART_MOVFLAGS = '+frag_keyframe+empty_moov+default_base_moof'
+
+
+def part_path(output_path: str, index: int) -> str:
+    """Where part `index` (1-based) of a resumable conversion lives.
+
+    DERIVED from the output path rather than stored, so the row and the filesystem cannot
+    disagree about which file a part number names. Dot-prefixed because recording.
+    dvr_output_dir defaults to the same directory a single-directory install points its media
+    scanner at, and a multi-gigabyte `Show.part1.mp4` sitting there is something Plex will
+    happily index as an episode. The existing .conv-progress-* scratch is hidden for the same
+    reason.
+    """
+    directory = os.path.dirname(output_path)
+    stem, ext = os.path.splitext(os.path.basename(output_path))
+    return os.path.join(directory, f'.{stem}.part{index}{ext}')
+
+
+def clean_part_path(part_file: str) -> str:
+    """Where finalize_part() re-muxes a part before replacing it.
+
+    The extension is preserved, not appended to: ffmpeg infers the muxer from the output
+    extension, so a plain `<part>.clean` gives it nothing to infer and it exits -EINVAL
+    without writing a byte - measured on this box, which is the only way anyone finds out
+    (CLAUDE.md external-tools-are-verified-empirically).
+    """
+    root, ext = os.path.splitext(part_file)
+    return f'{root}.clean{ext}'
+
+
+def existing_part_paths(output_path: str, count: int) -> list:
+    """The part files 1..count, whether or not they exist on disk."""
+    return [part_path(output_path, i) for i in range(1, count + 1)]
+
+
+def all_part_paths_on_disk(output_path: str, limit: int = 64) -> list:
+    """Every part file that actually exists for this output, for teardown.
+
+    Scans a bounded range rather than the recorded count: teardown has to remove parts the
+    row does not know about - one written by an attempt that died before its commit, or left
+    by a run whose signature was later invalidated - and a file nothing references is exactly
+    what teardown exists to catch (CLAUDE.md teardown-releases-everything). The limit is a
+    sanity bound on the scan, not a cap on how many parts may exist; a conversion reaching 64
+    restarts has been given up on long before.
+    """
+    found = []
+    for i in range(1, limit + 1):
+        p = part_path(output_path, i)
+        for candidate in (p, clean_part_path(p)):
+            # The .clean sibling is finalize_part()'s re-mux, os.replace()d over the part on
+            # success. It only outlives that call when a shutdown lands mid-re-mux, and it is
+            # the same size as the part, so teardown has to know about it too.
+            if os.path.exists(candidate):
+                found.append(candidate)
+    return found
+
+
+def parts_signature(cmd, output_path: str) -> str:
+    """A fingerprint of the encode-relevant arguments behind a set of parts.
+
+    PARTS MADE UNDER DIFFERENT SETTINGS MUST NEVER BE JOINED, and this is what notices. Two
+    real cases reach it: the audio-copy fallback swaps the audio codec mid-conversion, so a
+    joined file would carry one codec config over a track encoded two ways; and a crf or
+    bitrate edited in settings between a crash and its resume would leave a quality seam in
+    the middle of the file that nothing on any surface could explain. A mismatch discards the
+    parts and says so, which costs the re-encode this feature would have saved and is still
+    the right trade - principle 1 outranks principle 2 whenever they pull apart.
+
+    The output path and the -ss offset are excluded because they are what legitimately differs
+    BETWEEN parts of one set. Everything else is included, hashed rather than enumerated, so a
+    future flag is covered without anyone remembering to add it here.
+    """
+    import hashlib
+
+    meaningful = []
+    skip_next = False
+    for i, arg in enumerate(cmd):
+        if skip_next:
+            skip_next = False
+            continue
+        if arg == '-ss':
+            skip_next = True
+            continue
+        if i == len(cmd) - 1 and arg == output_path:
+            continue
+        meaningful.append(str(arg))
+    return hashlib.sha256('\x00'.join(meaningful).encode('utf-8')).hexdigest()[:32]
+
+
+def set_conversion_parts(rec, *, parts_done=0, source_covered=None, source_complete=False,
+                         signature=None):
+    """Move a recording's whole conversion checkpoint together: how many parts exist, how much
+    source they cover, whether the encode reached the end, and what settings made them.
+
+    THE FOUR COLUMNS ARE ONE FACT AND THIS IS THEIR ONLY WRITER IN app/. Never assign any of
+    them directly. A part count without a covered offset resumes from the wrong place; a
+    covered offset without a signature joins parts that do not belong together; and a
+    source_complete left behind by an abandoned run skips the encode entirely. The same shape
+    as set_postprocess_wait() above, and for the same reason.
+
+    Called with no arguments it clears the checkpoint, which is what a discard is.
+
+    Mutates without committing, so the caller owns the whole read-modify-write unit
+    (CLAUDE.md).
+    """
+    rec.conversion_parts_done = parts_done or 0
+    rec.conversion_source_covered_seconds = source_covered
+    rec.conversion_source_complete = bool(source_complete)
+    rec.conversion_parts_signature = signature
+
+
+def _persist_conversion_parts(recording_id, **kwargs):
+    """Record - or clear - the conversion checkpoint. Its own re-fetch→mutate→commit closure,
+    per CLAUDE.md.
+
+    THE COMMIT IS THE POINT. A part file that exists but is not committed here is not a
+    checkpoint, and the next attempt verifies it from scratch before believing anything about
+    it. That ordering is what makes the crash window safe: the worst case is re-encoding a
+    stretch that was already done, never splicing at an offset nothing measured.
+    """
+    from . import db
+    from .database import Recording
+
+    @retry_on_locked()
+    def _do():
+        r = db.session.get(Recording, recording_id)
+        if r is None:
+            return
+        set_conversion_parts(r, **kwargs)
+        db.session.commit()
+
+    _do()
+
+
+def finalize_part(part_file: str, ffmpeg_path: str, *, scratch_key, interval=5,
+                  pre_output_timeout=300, stall_seconds=300, label='part', on_spawn=None):
+    """Make a killed part joinable and measure where it really ends. Returns its content
+    duration in seconds, or None if there is nothing usable in it.
+
+    A part killed mid-write ends in a truncated fragment. Re-muxing it with -c copy drops that
+    tail, and the duration of the RESULT is the last decodable frame - which is both the only
+    honest splice point (finding 3: the declared duration overshot by exactly 1.0s) and what
+    makes the file safe to hand to the concat demuxer. The two needs are the same operation,
+    which is why this is not a probe with a repair bolted on.
+
+    Idempotent: running it against an already-clean part re-muxes it again and returns the
+    same duration, so the caller may call it without first knowing whether an earlier attempt
+    got to. That is what lets a service restart adopt a part no commit describes.
+
+    Never raises. A part too short to hold a keyframe, or damaged past re-muxing, returns None
+    and is discarded by the caller - honest degradation to "re-encode that stretch".
+    """
+    if not part_file or not os.path.exists(part_file):
+        return None
+    try:
+        if os.path.getsize(part_file) <= 0:
+            return None
+    except OSError:
+        return None
+
+    clean = clean_part_path(part_file)
+    # -fflags +discardcorrupt is what actually drops the tail, and it is not optional:
+    # measured on this box, a plain -c copy re-mux reports the right duration while copying
+    # the half-written packet through, so the file ends with "Invalid NAL unit size" and the
+    # join inherits it. The duration was honest and the bytes were not - which is the exact
+    # shape of damage this app exists to refuse to ship silently.
+    cmd = [ffmpeg_path, '-err_detect', 'ignore_err', '-fflags', '+discardcorrupt',
+           '-i', part_file, '-c', 'copy', '-movflags', PART_MOVFLAGS, '-y', clean]
+    try:
+        run = supervise_ffmpeg(
+            cmd, clean, scratch_prefix='part', scratch_key=scratch_key,
+            interval=interval, pre_output_timeout=pre_output_timeout,
+            stall_seconds=stall_seconds, progress_signal='size', noun='part remux',
+            label=label, on_spawn=on_spawn)
+    except Exception as exc:
+        log.warning('%s: could not re-mux %s: %s', label, part_file, exc)
+        run = None
+
+    if run is None or not run.success or not os.path.exists(clean) or os.path.getsize(clean) <= 0:
+        log.warning('%s: %s holds nothing that survives a re-mux - discarding it',
+                    label, os.path.basename(part_file))
+        try:
+            os.unlink(clean)
+        except OSError:
+            pass  # best-effort scratch cleanup
+        return None
+
+    duration = None
+    try:
+        from .probe import parse_ffprobe
+        info = parse_ffprobe(clean, count_packets=False, timeout=120)
+        if info:
+            duration = info.get('duration')
+    except Exception as exc:
+        log.warning('%s: could not probe the re-muxed %s: %s', label, part_file, exc)
+
+    if not duration or duration <= 0:
+        try:
+            os.unlink(clean)
+        except OSError:
+            pass  # best-effort scratch cleanup
+        return None
+
+    try:
+        os.replace(clean, part_file)
+    except OSError as exc:
+        log.warning('%s: could not put the re-muxed part back as %s: %s', label, part_file, exc)
+        try:
+            os.unlink(clean)
+        except OSError:
+            pass  # best-effort scratch cleanup
+        return None
+    return float(duration)
+
+
+class PartJoinResult:
+    """Outcome of assembling encoded parts into the final container.
+
+    `reason` is 'success', 'no_parts', 'missing_part', 'no_space' or an ffmpeg failure
+    reason. `error_msg` is already written for a person - it goes straight into the event
+    that explains a failed conversion, so a join that fails names what it needed.
+    """
+
+    def __init__(self, success, reason, *, error_msg=None, parts=0, bytes_in=0):
+        self.success = success
+        self.reason = reason
+        self.error_msg = error_msg
+        self.parts = parts
+        self.bytes_in = bytes_in
+
+
+def join_conversion_parts(parts, output_path, ffmpeg_path, *, scratch_key, interval=5,
+                          pre_output_timeout=1800, stall_seconds=300, label='join',
+                          on_progress=None, on_spawn=None) -> PartJoinResult:
+    """Assemble encoded parts into the final container with the concat demuxer.
+
+    THIS REPLACES +faststart's REWRITE RATHER THAN ADDING A PASS. A faststart mux already
+    walks the whole file a second time to move moov to the front; this walk does that and the
+    join at once, so the steady-state cost of checkpointing is wall-clock-neutral even when
+    there is only one part. What it is NOT neutral on is disk: the parts and the output exist
+    together for the length of the join, which is why the space check below is not optional.
+
+    -c copy throughout: the parts were encoded to identical settings (parts_signature() is
+    what guarantees it), so there is nothing to transcode and nothing to decide.
+
+    Supervised through proc_utils.supervise_ffmpeg() like every other long ffmpeg in this app
+    - watching bytes, because writing bytes is the entire job of a stream copy.
+    """
+    import tempfile
+
+    if not parts:
+        return PartJoinResult(False, 'no_parts',
+                              error_msg='No encoded parts to assemble.')
+    missing = [p for p in parts if not os.path.exists(p)]
+    if missing:
+        return PartJoinResult(
+            False, 'missing_part', parts=len(parts),
+            error_msg=f'{len(missing)} of {len(parts)} encoded part(s) are gone from disk - '
+                      f'the conversion has to start over.')
+
+    bytes_in = 0
+    for p in parts:
+        try:
+            bytes_in += os.path.getsize(p)
+        except OSError:
+            pass  # counted only to size the space check and the event text
+
+    directory = os.path.dirname(output_path) or '.'
+    try:
+        free_bytes = shutil.disk_usage(directory).free
+    except OSError:
+        free_bytes = None
+    # The output is a stream copy of the parts, so it lands within rounding of their combined
+    # size. Checked BEFORE the join rather than discovered as a truncated output halfway
+    # through it: the parts are the only copy of hours of encoding at this point, and an
+    # ENOSPC that leaves them in place with a clear message is recoverable where one that
+    # reads as an ffmpeg failure is not.
+    if free_bytes is not None and free_bytes < bytes_in:
+        return PartJoinResult(
+            False, 'no_space', parts=len(parts), bytes_in=bytes_in,
+            error_msg=f'Not enough disk space to assemble the converted file - need '
+                      f'{_fmt_bytes(bytes_in)}, only {_fmt_bytes(free_bytes)} free. The '
+                      f'encoded parts are kept; free space and retry.')
+
+    fd, list_path = tempfile.mkstemp(prefix='dvr_partjoin_', suffix='.txt')
+    try:
+        with os.fdopen(fd, 'w') as fh:
+            for p in parts:
+                fh.write(f"file '{p}'\n")
+        cmd = [ffmpeg_path, '-f', 'concat', '-safe', '0', '-i', list_path,
+               '-c', 'copy', '-movflags', '+faststart', '-y', output_path]
+        log.info('%s: assembling %d part(s), %s: %s', label, len(parts),
+                 _fmt_bytes(bytes_in), ' '.join(cmd))
+        run = supervise_ffmpeg(
+            cmd, output_path, scratch_prefix='join',
+            scratch_key=scratch_key, interval=interval,
+            pre_output_timeout=pre_output_timeout, stall_seconds=stall_seconds,
+            progress_signal='size', noun='assembly', label=label,
+            on_progress=on_progress, on_spawn=on_spawn)
+    finally:
+        try:
+            os.unlink(list_path)
+        except OSError:
+            pass  # best-effort list-file cleanup
+
+    if not run.success:
+        return PartJoinResult(False, run.reason, error_msg=run.error_msg,
+                              parts=len(parts), bytes_in=bytes_in)
+    return PartJoinResult(True, 'success', parts=len(parts), bytes_in=bytes_in)
+
+
+def discard_conversion_parts(output_path):
+    """Remove every part file for this output. Returns how many were deleted.
+
+    Used wherever the parts stop being a valid checkpoint - a settings change, a signature
+    mismatch, a cancel, a success that no longer needs them - and by teardown. Best-effort per
+    file: one undeletable part must not stop the rest from going.
+    """
+    removed = 0
+    for p in all_part_paths_on_disk(output_path):
+        try:
+            os.unlink(p)
+            removed += 1
+        except OSError as exc:
+            log.warning('Could not delete conversion part %s: %s', p, exc)
+    return removed
+
+
 def run_conversion_supervised(app, recording_id, cmd, output_path, *,
                               expected_duration, pre_output_timeout, interval, stall_seconds,
-                              collision_policy='off', collision_window_seconds=0):
+                              collision_policy='off', collision_multiplier=1.0,
+                              source_offset=0.0):
     """Spawn one conversion ffmpeg and supervise it: poll -progress, publish/persist a
     progress snapshot, and detect death, stall, or (collision_policy='cancel') a colliding
     recording. Returns a ConversionResult for the caller's restart loop to act on.
+
+    A YIELD IS SIZED ON THE WORK LEFT, NOT THE WHOLE JOB. `collision_multiplier` is turned
+    into a lookahead window against the source still to encode on every poll, so a
+    conversion that is nearly done steps aside for almost nothing while one that has barely
+    started still steps aside early (dev/changelog/953).
+
+    A CONVERSION THAT YIELDS IS SUSPENDED, NEVER KILLED. `collision_policy='cancel'`
+    SIGSTOPs the ffmpeg while a recording needs the machine and SIGCONTs it afterwards, so
+    stepping aside costs wall clock instead of every hour already encoded - recording 17 lost
+    4h26m at 66.4% to the kill this replaced, and its partial had no moov atom, so none of it
+    was recoverable (dev/changelog/952). The attempt is not ended, so nothing about a yield
+    reaches the caller's restart loop or its budget.
+
+    AN ATTEMPT MAY START PART-WAY INTO THE SOURCE. `source_offset` is how far in this
+    attempt's `-ss` puts it, and ffmpeg's out_time is relative to that - so every figure
+    derived from progress adds it back: the percentage, the ETA's target and the collision
+    window's work-remaining. Without that a resumed attempt's progress bar falls back to 0%
+    and stops at the fraction it re-encoded, and its collision window is sized on source that
+    is already on disk (dev/changelog/955).
 
     A CONVERSION THAT IS STILL ADVANCING IS NEVER KILLED. There is no whole-job deadline:
     `pre_output_timeout` bounds only the phase before ffmpeg muxes its first frame, and
@@ -329,10 +763,12 @@ def run_conversion_supervised(app, recording_id, cmd, output_path, *,
     calibrated on a machine that encoded twice as fast as this one, and the retry then
     re-ran the identical command from 0% twice more.
 
-    The two rules are not interchangeable and both are needed. Stall detection is gated on
-    `out_time_us > 0` because a badly-damaged source makes ffmpeg seek and analyze for
-    minutes before muxing anything (dev/docs/BUGS.md 2026-07-24), so it cannot see a
-    conversion that never starts - that is what the pre-output budget is for.
+    Both rules, the poll loop and the scratch/stderr handling now live in
+    proc_utils.supervise_ffmpeg(), which the concat shares (dev/changelog/947). What stays
+    here is what is specific to a conversion: the progress snapshot, the ETA, the live
+    registry, the collision yield and the decode-error count. Stall detection watches
+    `out_time` rather than bytes because an encode's output file can sit still while the
+    muxer buffers.
 
     The ffmpeg spawn is a non-idempotent side effect and lives OUTSIDE every
     retry_on_locked closure (CLAUDE.md). Each progress-snapshot write is its own small
@@ -340,44 +776,9 @@ def run_conversion_supervised(app, recording_id, cmd, output_path, *,
     unregistered in finally.
     """
     from . import db
-    from .database import Recording, REC_STATUS_CONVERTING, REC_STATUS_IN_PROGRESS
+    from .database import (Recording, RecordingEvent, CONVERSION_YIELDED, CONVERSION_RESUMED,
+                           REC_STATUS_CONVERTING)
     from . import events as ev
-
-    # Scratch (-progress + stderr tail) sits alongside the output file - both are tiny
-    # (KB), and this keeps them inside whatever dir the output lives in rather than a
-    # hardcoded /dvr/tmp (which would escape a test sandbox).
-    #
-    # The filename carries a per-attempt token, and leftovers from earlier attempts are
-    # reaped below, because the poll loop reads the progress file on its FIRST pass -
-    # milliseconds after Popen, inside the ~0.25s window before ffmpeg truncates it. On a
-    # fixed filename that read returns the previous attempt's out_time, GrowthMonitor
-    # latches it as a high-water mark the new attempt can never beat, and the conversion is
-    # killed as stalled at exactly stall_seconds. A shutdown mid-conversion skips the
-    # finally-block unlink, so stale files are routine. See dev/docs/BUGS.md 2026-07-23.
-    scratch_dir = os.path.dirname(output_path) or '.'
-    # Both patterns are listed explicitly per id: a bare f'{recording_id}*' glob would let
-    # id 6 match id 64's scratch files.
-    stale_paths = (glob.glob(os.path.join(scratch_dir, f'.conv-progress-{recording_id}-*.txt'))
-                   + glob.glob(os.path.join(scratch_dir, f'.conv-stderr-{recording_id}-*.log'))
-                   + [os.path.join(scratch_dir, f'.conv-progress-{recording_id}.txt'),
-                      os.path.join(scratch_dir, f'.conv-stderr-{recording_id}.log')])
-    for stale in stale_paths:
-        try:
-            os.unlink(stale)
-        except OSError:
-            pass  # best-effort reap; a unique token below is what actually guarantees safety
-    token = uuid.uuid4().hex[:8]
-    progress_path = os.path.join(scratch_dir, f'.conv-progress-{recording_id}-{token}.txt')
-    stderr_path = os.path.join(scratch_dir, f'.conv-stderr-{recording_id}-{token}.log')
-
-    # -nostdin: never block on a tty. -progress: machine-readable stats to a file. stderr is
-    # redirected to a real file below (never an undrained pipe, which would deadlock the
-    # child - CLAUDE.md subprocess-discipline); -stats_period sets how often stats are written.
-    full_cmd = cmd[:1] + ['-nostdin'] + cmd[1:]
-    # Insert -progress/-stats_period just before the output path (last arg).
-    full_cmd = full_cmd[:-1] + ['-progress', progress_path, '-stats_period', str(interval)] + full_cmd[-1:]
-
-    started = time.monotonic()
 
     @retry_on_locked()
     def _mark_attempt_started():
@@ -391,161 +792,128 @@ def run_conversion_supervised(app, recording_id, cmd, output_path, *,
 
     _mark_attempt_started()
 
-    stderr_fh = open(stderr_path, 'wb')
-    proc = subprocess.Popen(full_cmd, stdin=subprocess.DEVNULL,
-                            stdout=subprocess.DEVNULL, stderr=stderr_fh)
-    with _active_lock:
-        _active_conversions[recording_id] = proc
+    # The ETA is for the work THIS attempt has left, so it is projected against the source
+    # still to encode rather than the whole recording - the part already on disk is not
+    # waiting on anything.
+    remaining_duration = (max(0.0, expected_duration - source_offset)
+                          if expected_duration else expected_duration)
+    smoother = EtaSmoother(remaining_duration)
+    decode_errors = 0
+    # The conflict _check_collision most recently decided to yield to, so _on_suspend can
+    # record WHO the pause is for without asking the database a second question.
+    suspending_for = None
 
-    smoother = EtaSmoother(expected_duration)
-    growth = GrowthMonitor()
-    # Latched the first time out_time advances past 0, and never cleared: the pre-output
-    # budget is spent once and does not come back if ffmpeg later pauses. A pause after
-    # output has started is a stall, and stall_seconds is what judges it.
-    output_started = False
-    last_out_time_us = 0
-    stall_watching = bool(stall_seconds and stall_seconds > 0)
-    # Only reached while stall detection is disabled - see the check itself below.
-    fallback_deadline = started + pre_output_timeout
-    long_run_noted = False
-    result = None
+    def _register(proc):
+        with _active_lock:
+            _active_conversions[recording_id] = proc
+
+    def _publish(wall, out_time, size):
+        pct = None
+        # Against the SOURCE position, not this attempt's own progress: a resume that showed
+        # 0% after two hours of encoding already on disk is a number the user cannot explain.
+        source_at = out_time + source_offset
+        if expected_duration and expected_duration > 0 and source_at > 0:
+            pct = max(0.0, min(100.0, source_at / expected_duration * 100.0))
+        eta = smoother.update(wall, out_time)
+        _persist_conversion_snapshot(recording_id, pct, size, eta)
+        ev.publish(recording_id, 'CONVERSION_PROGRESS', {
+            'status': REC_STATUS_CONVERTING, 'pct': pct, 'out_size': size or None,
+            'eta_seconds': eta,
+        })
+
+    def _check_collision(wall, out_time, size):
+        """None to keep encoding; a reason string to have the ffmpeg suspended until clear.
+
+        The window is sized on the source LEFT to encode, recomputed each poll, because a
+        lookahead is a guess at how much longer this conversion needs and a job that is
+        nearly finished needs almost none. out_time is already in hand from the poll that
+        called this, so nothing is re-read (CLAUDE.md no-hidden-I/O - this is a per-poll
+        loop). While the child is suspended out_time is frozen, so the window correctly
+        stops shrinking during a pause rather than counting wall clock as progress."""
+        nonlocal suspending_for
+        if collision_policy != 'cancel':
+            return None
+        # source_offset is already encoded and on disk, so it is not work left - a resumed
+        # attempt that counted it would yield on a window sized for a job it is most of the
+        # way through.
+        remaining = (expected_duration - out_time - source_offset) if expected_duration else None
+        window = _collision_window_seconds(remaining, collision_multiplier)
+        conflict = _conversion_collision_conflict(window, recording_id)
+        if conflict is None:
+            return None
+        # Handed to _on_suspend through here rather than re-queried there: the answer is
+        # already in hand, and a second query could name a different recording than the one
+        # the pause is actually for.
+        suspending_for = conflict
+        return (f'yielding local resources to recording "{conflict.name}" '
+                f'({_conflict_phrase(conflict)})')
+
+    def _on_suspend(reason):
+        # The row is stamped BEFORE the event is written, so the window in which a restart
+        # guard could see a parked conversion as working is as short as one commit rather
+        # than as long as whatever the wait turns out to be.
+        _persist_postprocess_waiting(recording_id, suspending_for)
+
+        @retry_on_locked()
+        def _commit_yielded_event():
+            db.session.add(RecordingEvent(
+                recording_id=recording_id, event_type=CONVERSION_YIELDED,
+                detail=f'Conversion paused: {reason}. It keeps everything encoded so far '
+                       f'and continues by itself once the recording is done.'))
+            db.session.commit()
+
+        _commit_yielded_event()
+        ev.publish(recording_id, CONVERSION_YIELDED, {'status': REC_STATUS_CONVERTING})
+
+    def _on_resume():
+        nonlocal suspending_for
+        suspending_for = None
+        _persist_postprocess_waiting(recording_id, None)
+
+        @retry_on_locked()
+        def _commit_resumed_event():
+            db.session.add(RecordingEvent(
+                recording_id=recording_id, event_type=CONVERSION_RESUMED,
+                detail='Conversion resumed where it left off - local resources are free again.'))
+            db.session.commit()
+
+        _commit_resumed_event()
+        ev.publish(recording_id, CONVERSION_RESUMED, {'status': REC_STATUS_CONVERTING})
+
+    def _tally_decode_errors(stderr_path, returncode):
+        # Read while the spool still exists - supervise_ffmpeg unlinks it right after this.
+        nonlocal decode_errors
+        decode_errors = _count_decode_errors(stderr_path)
+
     try:
-        while True:
-            finished = proc.poll() is not None
-            now = time.monotonic()
-            wall = now - started
-
-            out_time_us, total_size, done = _read_progress_tail(progress_path)
-            try:
-                size = os.path.getsize(output_path)
-            except OSError:
-                size = 0
-            if total_size:
-                size = max(size, total_size)
-
-            out_time = (out_time_us / 1e6) if out_time_us else 0.0
-            pct = None
-            if expected_duration and expected_duration > 0 and out_time > 0:
-                pct = max(0.0, min(100.0, out_time / expected_duration * 100.0))
-            eta = smoother.update(wall, out_time)
-
-            _persist_conversion_snapshot(recording_id, pct, size, eta)
-            ev.publish(recording_id, 'CONVERSION_PROGRESS', {
-                'status': REC_STATUS_CONVERTING, 'pct': pct, 'out_size': size or None,
-                'eta_seconds': eta,
-            })
-
-            if finished:
-                rc = proc.returncode
-                decode_errors = _count_decode_errors(stderr_path)
-                if rc == 0:
-                    result = ConversionResult(True, reason='success', out_time=out_time,
-                                              decode_errors=decode_errors)
-                else:
-                    result = ConversionResult(False, reason='died',
-                                              error_msg=_read_stderr_tail(stderr_path, rc),
-                                              out_time=out_time, decode_errors=decode_errors)
-                break
-
-            if collision_policy == 'cancel':
-                conflict = _conversion_collision_conflict(collision_window_seconds)
-                if conflict is not None:
-                    where = ('is in progress' if conflict.status == REC_STATUS_IN_PROGRESS
-                             else 'starts soon')
-                    log.info('Recording %d conversion yielding to recording "%s" (%s) - '
-                             'killing, will resume once clear (collision_policy: cancel)',
-                             recording_id, conflict.name, where)
-                    terminate_or_kill(proc, hard=True)
-                    result = ConversionResult(
-                        False, reason='preempted',
-                        error_msg=f'yielding local resources to recording "{conflict.name}" ({where})',
-                        out_time=out_time)
-                    break
-
-            if out_time_us and out_time_us > 0:
-                output_started = True
-                last_out_time_us = out_time_us
-
-            # Stall detection tracks the encoded OUTPUT timestamp (out_time), and only once
-            # output has actually started. A heavily-damaged source (e.g. 79% timeline gaps)
-            # makes ffmpeg seek/analyze for minutes before muxing its first frame - out_time
-            # legitimately sits at 0 that whole time, which is NOT a stall (verified live on
-            # recording #64: a healthy re-encode was false-killed at 301s). The pre-output
-            # budget below is the backstop for a conversion that never produces output.
-            # stall_seconds<=0 disables stall detection.
-            if stall_watching and output_started:
-                # last_out_time_us, not out_time_us: a poll can legitimately read nothing
-                # back while ffmpeg truncates and rewrites its -progress file, and the
-                # monitor must see the high-water mark rather than a None. Feeding the last
-                # known value (not skipping the update) is deliberate - it keeps the stall
-                # clock running through an unreadable stretch, so a hung ffmpeg whose
-                # progress file has gone quiet is still caught rather than running forever.
-                stalled_for = growth.update(last_out_time_us)
-                if stalled_for >= stall_seconds:
-                    log.warning('Recording %d conversion stalled for %.0fs (output stopped advancing) - killing',
-                                recording_id, stalled_for)
-                    terminate_or_kill(proc, hard=True)
-                    result = ConversionResult(False, reason='stalled',
-                                              error_msg=f'No conversion progress for {int(stalled_for)}s',
-                                              out_time=out_time)
-                    break
-
-            if not output_started and wall >= pre_output_timeout:
-                log.warning('Recording %d conversion produced no output in %ds - killing',
-                            recording_id, pre_output_timeout)
-                terminate_or_kill(proc, hard=True)
-                result = ConversionResult(
-                    False, reason='no_output',
-                    error_msg=f'Conversion produced no output in {pre_output_timeout}s',
-                    out_time=out_time)
-                break
-
-            # Once output is advancing there is no upper bound - EXCEPT when the operator
-            # has turned stall detection off, which leaves nothing watching liveness at all.
-            # The old wall clock stands in for it there, the same way run_probe_until_stalled
-            # falls back to one when /proc offers no progress signal. Never widen this to the
-            # stall_seconds>0 case: that reinstates the deadline this function exists to
-            # remove.
-            if output_started and not stall_watching and now >= fallback_deadline:
-                log.warning('Recording %d conversion exceeded %ds with stall detection disabled '
-                            '(stall_seconds: 0) - killing', recording_id, pre_output_timeout)
-                terminate_or_kill(proc, hard=True)
-                result = ConversionResult(
-                    False, reason='timeout',
-                    error_msg=f'Conversion ran {pre_output_timeout}s with stall detection disabled',
-                    out_time=out_time)
-                break
-
-            # A conversion outliving what used to be its whole budget is now routine, so it
-            # is said out loud once rather than left as an unexplained multi-hour gap in the
-            # log - the same disclosure run_probe_until_stalled makes for a long probe.
-            if output_started and stall_watching and not long_run_noted and wall >= pre_output_timeout:
-                long_run_noted = True
-                log.info('Recording %d conversion has run %.0fs and is still advancing '
-                         '(%s done, ETA %s) - no deadline applies while it progresses',
-                         recording_id, wall,
-                         f'{pct:.1f}%' if pct is not None else 'unknown',
-                         f'{int(eta)}s' if eta else 'unknown')
-
-            time.sleep(interval)
+        run = supervise_ffmpeg(
+            cmd, output_path,
+            scratch_prefix='conv', scratch_key=recording_id,
+            interval=interval, pre_output_timeout=pre_output_timeout,
+            stall_seconds=stall_seconds, progress_signal='out_time',
+            noun='conversion', label=f'Recording {recording_id} conversion',
+            on_spawn=_register, on_progress=_publish,
+            suspend_check=_check_collision, on_suspend=_on_suspend, on_resume=_on_resume,
+            on_exit=_tally_decode_errors)
     finally:
-        terminate_or_kill(proc)
-        stderr_fh.close()
         with _active_lock:
             _active_conversions.pop(recording_id, None)
-        for p in (progress_path, stderr_path):
-            try:
-                os.unlink(p)
-            except OSError:
-                pass  # best-effort scratch cleanup
+        # A run killed while suspended (a cancel, a shutdown) never reaches _on_resume, so
+        # the stamp is cleared here too - the attempt is over either way, and a row left
+        # claiming to be waiting outlives everything that could clear it.
+        _persist_postprocess_waiting(recording_id, None)
 
-    return result
-
-
-def _read_stderr_tail(stderr_path, rc):
-    """Conversion-flavored wrapper over proc_utils.read_stderr_tail: this caller needs a
-    non-empty string for a user-facing error message, so an empty tail becomes the exit code."""
-    return read_stderr_tail(stderr_path) or f'ffmpeg exited {rc}'
+    # decode_errors is attributed only to a run that reached the end of the source; a
+    # killed attempt's count describes the part it got through, not the file.
+    #
+    # out_time is returned as a SOURCE position, offset included, because every consumer
+    # reasons about the source: the restart loop compares where two attempts stopped to tell a
+    # damaged file from a transient failure, and that comparison is meaningless between two
+    # attempts that started at different places.
+    return ConversionResult(
+        run.success, reason=run.reason, error_msg=run.error_msg,
+        out_time=(run.out_time or 0.0) + source_offset,
+        decode_errors=decode_errors if run.reason in ('success', 'died') else 0)
 
 
 # ffmpeg's own wording for a frame it could not decode. Both spellings occur: the first
@@ -784,9 +1152,10 @@ def do_postprocess(app, recording_id: int, ts_path: str):
     from .database import (
         Recording, RecordingEvent, add_recording_event, preserve_cancelled_status,
         DIAGNOSTICS, SEEK_DAMAGE_DETECTED, MIXED_FRAME_RATE_DETECTED,
-        POSTCAPTURE_ANALYSIS_STARTED, CONVERSION_STARTED, CONVERSION_RESTARTED,
-        CONVERSION_YIELDED, CONVERSION_DONE, FILE_MOVED, CONCATENATION_DONE, SCRIPT_EXECUTED,
-        REC_STATUS_ANALYZING, REC_STATUS_CONVERTING, REC_STATUS_IN_PROGRESS,
+        POSTCAPTURE_ANALYSIS_STARTED, POSTCAPTURE_ANALYSIS_SKIPPED,
+        CONVERSION_STARTED, CONVERSION_RESTARTED, CONVERSION_YIELDED, CONVERSION_RESUMED,
+        CONVERSION_DONE, FILE_MOVED, CONCATENATION_DONE, SCRIPT_EXECUTED,
+        REC_STATUS_ANALYZING, REC_STATUS_CONVERTING,
         REC_STATUS_ABORTED, REC_STATUS_FAILED, REC_STATUS_COMPLETED,
     )
     from . import events as ev
@@ -843,60 +1212,127 @@ def do_postprocess(app, recording_id: int, ts_path: str):
         # preserve_cancelled_status: a cancel can already have landed (this runs on a
         # background thread), and a status write here must never resurrect an ABORTED row.
         # Its RECORDING_ABORTED event is what explains why the chain stopped.
-        @retry_on_locked()
-        def _commit_analysis_started():
-            r = db.session.get(Recording, recording_id)
-            if preserve_cancelled_status(
-                    r, 'Post-processing did not start - the recording was cancelled first.'):
-                db.session.commit()
-                return False
-            r.status = REC_STATUS_ANALYZING
-            add_recording_event(
-                recording_id, POSTCAPTURE_ANALYSIS_STARTED,
-                detail=f'Checking the joined file before conversion: '
-                       f'{os.path.basename(ts_path)}')
-            db.session.commit()
-            return True
+        #
+        # analysis_completed_at is the recorded fact that this phase already finished, and
+        # the ONLY thing consulted - never the status, which reads ANALYZING both while the
+        # phase runs and while a finished one sits parked yielding to a live recording, i.e.
+        # exactly the state a restart finds. Before this record existed, every resume re-read
+        # the whole file and blended a SECOND capture-quality observation into the channel's
+        # health score: recording 17 did it three times and left channel 16047 holding a
+        # number observation_ledger() could not reproduce (dev/changelog/951).
+        analysis_done_at = rec.analysis_completed_at
 
-        if not _commit_analysis_started():
-            log.info('Recording %d was cancelled before post-processing started', recording_id)
-            return
-        ev.publish(recording_id, POSTCAPTURE_ANALYSIS_STARTED, {'status': REC_STATUS_ANALYZING})
+        if analysis_done_at is not None:
+            from .tz_utils import format_local
 
-        # ── Recording health data (ffprobe on the .ts file) ───────────────────
-        health_fields, health_diag = _gather_recording_health(recording_id, ts_path, rec, cfg)
-        if health_fields or health_diag:
-            # One closure, one commit: add_recording_event inserts without committing, so
-            # the event joins the field write as a single unit of work rather than adding
-            # a second commit under the same decorator (dev/changelog/332).
             @retry_on_locked()
-            def _commit_health_fields():
+            def _commit_analysis_skipped():
                 r = db.session.get(Recording, recording_id)
-                if r is not None and health_fields:
-                    for k, v in health_fields.items():
-                        setattr(r, k, v)
-                if health_diag:
-                    add_recording_event(recording_id, DIAGNOSTICS,
-                                        detail=health_diag['detail'],
-                                        extra=health_diag['extra'])
+                if preserve_cancelled_status(
+                        r, 'Post-processing did not start - the recording was cancelled first.'):
+                    db.session.commit()
+                    return False
+                r.status = REC_STATUS_ANALYZING
+                add_recording_event(
+                    recording_id, POSTCAPTURE_ANALYSIS_SKIPPED,
+                    detail=f'The joined file was already checked on '
+                           f'{format_local(analysis_done_at)} - picking back up at conversion '
+                           f'without re-reading it.')
                 db.session.commit()
+                return True
 
-            _commit_health_fields()
+            if not _commit_analysis_skipped():
+                log.info('Recording %d was cancelled before post-processing started', recording_id)
+                return
+            log.info('Recording %d: post-capture analysis already completed at %s - '
+                     'resuming at conversion', recording_id, analysis_done_at)
+            ev.publish(recording_id, POSTCAPTURE_ANALYSIS_SKIPPED,
+                       {'status': REC_STATUS_ANALYZING})
+            timeline_scan = _recorded_timeline_scan(recording_id)
+        else:
+            # An earlier attempt that started this phase and never recorded finishing it is
+            # being redone, which an operator must not have to infer - same warning the
+            # migration backfill ledger prints for the same reason.
+            redo = _analysis_attempt_count(recording_id) > 0
+            if redo:
+                log.warning('Recording %d: an earlier post-capture analysis did not finish - '
+                            'reading the joined file again from the top', recording_id)
 
-        # ── Timeline scan (MEASURE only - see the re-encode branch below) ─────
-        # Gated on gather_health_data alone, so the stats and the DIAGNOSTICS event exist
-        # for every format and every reencode_mode, not just the one combination that
-        # happens to act on the verdict. Memoized: the conversion phase reads this rather
-        # than re-running a full-file ffprobe.
-        timeline_scan = None
-        if cfg['recording'].get('gather_health_data', True):
-            timeline_scan = _scan_recording_timeline(recording_id, ts_path)
-            # Near-empty/slate detection (compute-only, no extra ffprobe) and the
-            # capture-quality score correction both depend on what the timeline scan just
-            # committed (timeline_deficit_seconds), so they run right after it, in order.
-            _detect_near_empty_segments(recording_id)
-            from .health_score import apply_capture_quality_correction
-            apply_capture_quality_correction(app, recording_id)
+            @retry_on_locked()
+            def _commit_analysis_started():
+                r = db.session.get(Recording, recording_id)
+                if preserve_cancelled_status(
+                        r, 'Post-processing did not start - the recording was cancelled first.'):
+                    db.session.commit()
+                    return False
+                r.status = REC_STATUS_ANALYZING
+                add_recording_event(
+                    recording_id, POSTCAPTURE_ANALYSIS_STARTED,
+                    detail=(f'Checking the joined file before conversion: '
+                            f'{os.path.basename(ts_path)}')
+                           + (' - an earlier check did not finish, so it runs again'
+                              if redo else ''))
+                db.session.commit()
+                return True
+
+            if not _commit_analysis_started():
+                log.info('Recording %d was cancelled before post-processing started', recording_id)
+                return
+            ev.publish(recording_id, POSTCAPTURE_ANALYSIS_STARTED, {'status': REC_STATUS_ANALYZING})
+
+            # ── Recording health data (ffprobe on the .ts file) ───────────────
+            health_fields, health_diag = _gather_recording_health(recording_id, ts_path, rec, cfg)
+            if health_fields or health_diag:
+                # One closure, one commit: add_recording_event inserts without committing, so
+                # the event joins the field write as a single unit of work rather than adding
+                # a second commit under the same decorator (dev/changelog/332).
+                @retry_on_locked()
+                def _commit_health_fields():
+                    r = db.session.get(Recording, recording_id)
+                    if r is not None and health_fields:
+                        for k, v in health_fields.items():
+                            setattr(r, k, v)
+                    if health_diag:
+                        add_recording_event(recording_id, DIAGNOSTICS,
+                                            detail=health_diag['detail'],
+                                            extra=health_diag['extra'])
+                    db.session.commit()
+
+                _commit_health_fields()
+
+            # ── Timeline scan (MEASURE only - see the re-encode branch below) ─
+            # Gated on gather_health_data alone, so the stats and the DIAGNOSTICS event exist
+            # for every format and every reencode_mode, not just the one combination that
+            # happens to act on the verdict. Memoized: the conversion phase reads this rather
+            # than re-running a full-file ffprobe.
+            timeline_scan = None
+            analysis_finished_at = datetime.utcnow()
+            if cfg['recording'].get('gather_health_data', True):
+                timeline_scan = _scan_recording_timeline(recording_id, ts_path)
+                # Near-empty/slate detection (compute-only, no extra ffprobe) and the
+                # capture-quality score correction both depend on what the timeline scan just
+                # committed (timeline_deficit_seconds), so they run right after it, in order.
+                _detect_near_empty_segments(recording_id)
+                from .health_score import apply_capture_quality_correction
+                # The completion stamp rides this call's own commit, and it has to: the blend
+                # is the one step of this phase that is an increment rather than a recompute,
+                # so a stamp written in a LATER commit leaves a crash window in which the
+                # resume re-blends. Everything above it overwrites columns and is safe to
+                # redo (CLAUDE.md, "anything reached through such a gate must be re-runnable
+                # from the top").
+                apply_capture_quality_correction(
+                    app, recording_id, analysis_completed_at=analysis_finished_at)
+            else:
+                # No blend ran, so nothing here is an increment and the stamp is free to be
+                # its own commit.
+                @retry_on_locked()
+                def _commit_analysis_completed():
+                    r = db.session.get(Recording, recording_id)
+                    if r is not None:
+                        r.analysis_completed_at = analysis_finished_at
+                    db.session.commit()
+
+                _commit_analysis_completed()
 
         # ── Conversion ────────────────────────────────────────────────────────
         if _stop_if_cancelled('Post-processing stopped before conversion started - '
@@ -938,12 +1374,14 @@ def do_postprocess(app, recording_id: int, ts_path: str):
             # own ffprobe, no sense paying for it if we're about to wait anyway.
             collision_policy = pp.get('collision_policy', 'cancel')
             collision_multiplier = float(pp.get('collision_lookahead_multiplier', 1.0))
+            # Nothing has been encoded yet on this path, so the whole duration IS the work
+            # remaining - the in-run check inside run_conversion_supervised is the one that
+            # narrows it as the encode advances (dev/changelog/953).
             collision_window_seconds = _collision_window_seconds(expected_duration, collision_multiplier)
             if collision_policy != 'off':
-                conflict = _conversion_collision_conflict(collision_window_seconds)
+                conflict = _conversion_collision_conflict(collision_window_seconds, recording_id)
                 if conflict is not None:
-                    where = ('is in progress' if conflict.status == REC_STATUS_IN_PROGRESS
-                             else 'starts soon')
+                    where = _conflict_phrase(conflict)
                     log.info('Recording %d: postponing conversion start - recording "%s" %s '
                              '(collision_policy: %s)', recording_id, conflict.name, where, collision_policy)
 
@@ -956,10 +1394,28 @@ def do_postprocess(app, recording_id: int, ts_path: str):
                         db.session.commit()
 
                     _commit_collision_yield_event()
-                    _wait_for_conversion_clear(recording_id, collision_window_seconds)
+                    # No ffmpeg exists yet on this path - the chain just polls - so there is
+                    # nothing to suspend and nothing at risk from a restart. The stamp is
+                    # what lets the restart guard tell that apart from a row that is working
+                    # (dev/changelog/952); it is cleared on BOTH ways out of the wait, the
+                    # cancelled-meanwhile one included.
+                    _persist_postprocess_waiting(recording_id, conflict)
+                    try:
+                        _wait_for_conversion_clear(recording_id, collision_window_seconds)
+                    finally:
+                        _persist_postprocess_waiting(recording_id, None)
                     if _stop_if_cancelled('Post-processing stopped while waiting for local '
                                           'resources to free up before converting.'):
                         return
+
+                    @retry_on_locked()
+                    def _commit_collision_resumed_event():
+                        add_recording_event(
+                            recording_id, CONVERSION_RESUMED,
+                            detail='Local resources are free - starting the conversion now.')
+                        db.session.commit()
+
+                    _commit_collision_resumed_event()
 
             # Re-encode decision (mp4 only). Stream drops during capture leave the .ts
             # with a gappy video timeline (missing frames, continuous audio); a straight
@@ -1067,9 +1523,21 @@ def do_postprocess(app, recording_id: int, ts_path: str):
                 from .probe import nominal_video_rate
                 rate = nominal_video_rate(ts_path)
 
-            def _build_cmd(audio_copy=False):
+            # Only a re-encode checkpoints. A stream copy finishes in minutes on files this
+            # size (3m to 15m47s measured on real recordings), so parts would buy nothing and
+            # cost a join pass; it keeps writing the final container directly, +faststart and
+            # all (dev/changelog/955).
+            resumable = (fmt == 'mp4' and reencode)
+
+            def _build_cmd(audio_copy=False, dest=None, start_at=0.0):
                 """The conversion command, optionally with audio stream-copied instead of
                 re-encoded (the fallback below).
+
+                `dest` and `start_at` are the checkpointing half: a resumable conversion writes
+                each part to its own file, seeks into the source with -ss for parts after the
+                first, and swaps +faststart for fragmented flags so a part killed mid-write is
+                still readable. The seek is an INPUT seek, before -i, which decodes from the
+                preceding keyframe and discards - accurate, and the shape finding 2 measured.
 
                 -max_error_rate 1.0 raises ffmpeg's default abort, which fires once 2/3 of
                 the frames in its window fail to decode: a burst of garbage audio trips it
@@ -1084,8 +1552,12 @@ def do_postprocess(app, recording_id: int, ts_path: str):
                 (dev/changelog/800). Trading a common working case for a rare broken one is
                 the wrong direction; the fallback handles the rare one instead.
                 """
+                target = dest or output_path
                 c = [ffmpeg_path, '-err_detect', 'ignore_err', '-fflags', '+genpts+discardcorrupt',
-                     '-max_error_rate', '1.0', '-i', ts_path]
+                     '-max_error_rate', '1.0']
+                if start_at and start_at > 0:
+                    c += ['-ss', f'{start_at:.6f}']
+                c += ['-i', ts_path]
                 if fmt == 'mp4' and reencode:
                     # yuv420p keeps hardware players (Roku/TV apps) happy; 2s forced IDRs give
                     # dense, guaranteed-clean seek points. CFR at the stream's nominal rate
@@ -1099,7 +1571,7 @@ def do_postprocess(app, recording_id: int, ts_path: str):
                 elif fmt == 'mp4':
                     c += ['-c:v', 'copy']
                 else:
-                    return c + ['-c', 'copy', '-y', output_path]
+                    return c + ['-c', 'copy', '-y', target]
                 if audio_copy:
                     # MP4/MOV needs ADTS AAC converted to raw AAC by this bitstream filter.
                     # Copying never decodes, so no bad frame can reach a decoder or a filter
@@ -1110,10 +1582,11 @@ def do_postprocess(app, recording_id: int, ts_path: str):
                     c += ['-c:a', 'copy', '-bsf:a', 'aac_adtstoasc']
                 else:
                     c += ['-c:a', 'aac', '-b:a', f'{audio_kbps}k']
-                return c + ['-movflags', '+faststart', '-y', output_path]
-
-            cmd = _build_cmd()
-            log.info('Conversion command: %s', ' '.join(cmd))
+                # A resumable run's parts are fragmented so a kill leaves a readable
+                # checkpoint; +faststart moves to the join that assembles them, so the final
+                # file is byte-for-byte the shape it has always been (dev/changelog/955).
+                movflags = PART_MOVFLAGS if resumable else '+faststart'
+                return c + ['-movflags', movflags, '-y', target]
 
             # Supervised restart loop. `attempt` is the number of restarts already performed
             # (persisted across a service restart via conversion_attempts). max_restart_attempts
@@ -1126,14 +1599,168 @@ def do_postprocess(app, recording_id: int, ts_path: str):
             prev_death_out_time = None
             repeated_at = None
             audio_copy_fallback = False
-            _consume_cancel(recording_id)  # drop any stale flag from a prior run
+            # Dropped here, before anything in this phase spawns an ffmpeg, rather than just
+            # before the loop: the salvage below is a real child that a Cancel can kill, so a
+            # flag set from this point on is a live cancel and must not be mistaken for a
+            # stale one left by a previous run.
+            _consume_cancel(recording_id)
+
+            # ── Checkpoint state ─────────────────────────────────────────────────────
+            # What a previous attempt got through, read from the row rather than inferred
+            # from the files beside it. `signature` is this run's settings; parts recorded
+            # under any other settings are not a checkpoint for this run and are discarded
+            # rather than joined into a file with a seam in it.
+            def _track_child(proc):
+                """Register a conversion-phase ffmpeg that is not the encode itself - the
+                re-mux that salvages a killed part, and the assembly that joins them.
+
+                Both are minutes-long stream copies over multi-gigabyte files, so both are
+                long-lived children and both must be reachable from tracked state: without
+                this, a Cancel during the assembly sets the flag and kills nothing, and a
+                shutdown orphans the child (CLAUDE.md subprocess-discipline). The registry is
+                the conversion's own, because from every consumer's point of view these ARE
+                the conversion - it is what kill_active_conversions() and
+                request_cancel_conversion() already reach for.
+                """
+                with _active_lock:
+                    _active_conversions[recording_id] = proc
+
+            def _untrack_child():
+                with _active_lock:
+                    _active_conversions.pop(recording_id, None)
+
+            signature = parts_signature(_build_cmd(), output_path) if resumable else None
+            parts_done = 0
+            source_covered = 0.0
+            source_complete = False
+            if not resumable:
+                # A format or mode change since the last attempt (mp4 re-encode -> mkv copy,
+                # say) leaves parts nothing will ever join. Cleared here rather than left to
+                # sit: this path writes the final file directly, so nothing downstream looks
+                # at them again.
+                if discard_conversion_parts(output_path):
+                    _persist_conversion_parts(recording_id)
+            elif rec.conversion_parts_signature == signature:
+                parts_done = rec.conversion_parts_done or 0
+                source_covered = rec.conversion_source_covered_seconds or 0.0
+                source_complete = bool(rec.conversion_source_complete)
+            elif rec.conversion_parts_signature:
+                n = discard_conversion_parts(output_path)
+                log.warning('Recording %d: conversion settings changed since its %d encoded '
+                            'part(s) were made - discarding them and re-encoding from the '
+                            'start', recording_id, n)
+
+                @retry_on_locked()
+                def _commit_parts_invalidated(count=n):
+                    r = db.session.get(Recording, recording_id)
+                    set_conversion_parts(r)
+                    add_recording_event(
+                        recording_id, DIAGNOSTICS,
+                        detail=f'Discarded {count} partly-encoded file(s) from an earlier '
+                               f'attempt: the conversion settings have changed since they were '
+                               f'made, and joining them would leave the finished recording '
+                               f'inconsistent part-way through. Re-encoding from the start.',
+                        extra={'kind': 'conversion_parts_invalidated', 'parts': count})
+                    db.session.commit()
+
+                _commit_parts_invalidated()
+
+            # THE SIGNATURE IS REGISTERED BEFORE THE FIRST PART IS WRITTEN, and the order is
+            # the whole point (CLAUDE.md "register the obligation in a commit that precedes the
+            # phase-1 write"). It makes the only crash state a recorded signature with no part
+            # yet - which the next attempt handles - instead of a part with nothing recorded
+            # about what made it, which is unanswerable: adopting it would splice settings
+            # nobody can check, and refusing it would throw away the first attempt's work in
+            # the most common interruption there is. In the resumed case this re-writes what
+            # was just read, which costs one commit and keeps the rule in one place.
+            if resumable:
+                _persist_conversion_parts(
+                    recording_id, parts_done=parts_done,
+                    source_covered=source_covered or None,
+                    source_complete=source_complete, signature=signature)
+
+            # A part file the row does not know about is what a service restart leaves: ffmpeg
+            # wrote it, nothing got to commit. It is ADOPTED only after being verified from
+            # scratch - re-muxed to drop its truncated tail and probed for where its last
+            # decodable frame actually is - so the checkpoint is measured here and now rather
+            # than assumed from the file's existence. Everything it establishes is committed
+            # before any ffmpeg runs.
+            if resumable and not source_complete:
+                stray = part_path(output_path, parts_done + 1)
+                if os.path.exists(stray):
+                    log.warning('Recording %d: found a partly-encoded file no attempt recorded '
+                                '(%s) - checking what of it survives',
+                                recording_id, os.path.basename(stray))
+                    try:
+                        kept = finalize_part(stray, ffmpeg_path, scratch_key=recording_id,
+                                             interval=interval,
+                                             pre_output_timeout=pre_output_timeout,
+                                             stall_seconds=stall_seconds,
+                                             label=f'Recording {recording_id} part',
+                                             on_spawn=_track_child)
+                    finally:
+                        _untrack_child()
+                    if kept:
+                        parts_done += 1
+                        source_covered += kept
+                        _persist_conversion_parts(
+                            recording_id, parts_done=parts_done, source_covered=source_covered,
+                            source_complete=False, signature=signature)
+
+                        @retry_on_locked()
+                        def _commit_part_adopted(where=source_covered, n=parts_done):
+                            add_recording_event(
+                                recording_id, DIAGNOSTICS,
+                                detail=f'Resuming the conversion rather than restarting it: '
+                                       f'{n} part(s) already encoded, covering the first '
+                                       f'{fmt_duration(where, with_seconds=True)} of the '
+                                       f'recording. Only the rest will be encoded.',
+                                extra={'kind': 'conversion_part_adopted', 'parts': n,
+                                       'source_covered_seconds': round(where, 3)})
+                            db.session.commit()
+
+                        _commit_part_adopted()
+                    else:
+                        try:
+                            os.unlink(stray)
+                        except OSError as exc:
+                            log.warning('Could not delete unusable conversion part %s: %s',
+                                        stray, exc)
+
             while True:
+                # A cancel that landed between attempts - during the salvage re-mux, or while
+                # the restart event was being written - has no attempt of its own to be
+                # noticed by, so it is caught here before another encode starts.
+                if _consume_cancel(recording_id):
+                    cancelled = True
+                    break
+
+                if source_complete:
+                    # Every frame is already encoded and only the assembly is left - which is
+                    # the state a service restart during the join leaves behind. Re-encoding
+                    # here would throw away the whole job to redo a stream copy.
+                    conversion_ok = True
+                    break
+
+                part_file = part_path(output_path, parts_done + 1) if resumable else output_path
+                start_at = source_covered if resumable else 0.0
+                cmd = _build_cmd(audio_copy=audio_copy_fallback, dest=part_file,
+                                 start_at=start_at)
+                if start_at:
+                    log.info('Recording %d conversion resuming at %s into the source '
+                             '(part %d): %s', recording_id,
+                             fmt_duration(start_at, with_seconds=True), parts_done + 1,
+                             ' '.join(cmd))
+                else:
+                    log.info('Conversion command: %s', ' '.join(cmd))
+
                 result = run_conversion_supervised(
-                    app, recording_id, cmd, output_path,
+                    app, recording_id, cmd, part_file,
                     expected_duration=expected_duration, pre_output_timeout=pre_output_timeout,
                     interval=interval, stall_seconds=stall_seconds,
                     collision_policy=collision_policy,
-                    collision_window_seconds=collision_window_seconds,
+                    collision_multiplier=collision_multiplier,
+                    source_offset=start_at,
                 )
                 # A user cancel (request_cancel_conversion killed the ffmpeg) reads as a
                 # death; the flag distinguishes it so we abort instead of restarting.
@@ -1141,42 +1768,81 @@ def do_postprocess(app, recording_id: int, ts_path: str):
                     cancelled = True
                     break
 
-                if result.reason == 'preempted':
-                    # Not a failure - never counts against max_restart_attempts. Wait
-                    # (blocking this chain's own thread) until clear, then restart from
-                    # scratch; -y in cmd handles the leftover partial output.
-                    log.info('Recording %d conversion paused: %s', recording_id, result.error_msg)
-
-                    @retry_on_locked()
-                    def _commit_yielded_event(msg=result.error_msg):
-                        add_recording_event(recording_id, CONVERSION_YIELDED,
-                                            detail=f'Conversion paused: {msg}')
-                        db.session.commit()
-
-                    _commit_yielded_event()
-                    ev.publish(recording_id, CONVERSION_YIELDED, {'status': REC_STATUS_CONVERTING})
-                    _wait_for_conversion_clear(recording_id, collision_window_seconds)
-                    if _stop_if_cancelled('Post-processing stopped while waiting for local '
-                                          'resources to free up before resuming conversion.'):
-                        return
-                    continue
-
+                # A mid-run collision never gets here: run_conversion_supervised suspends the
+                # ffmpeg and continues it in place, so the attempt does not end and the loop
+                # is not re-entered (dev/changelog/952). What reaches this point is only ever
+                # a real outcome - success, death, stall - which is why the restart budget
+                # below can be spent without checking whether the attempt merely yielded.
                 decode_errors = max(decode_errors, result.decode_errors or 0)
 
                 if result.success:
                     conversion_ok = True
+                    if resumable:
+                        # A part ffmpeg closed itself needs no repair - it has a proper
+                        # trailer and every fragment is complete - so it is recorded as-is.
+                        # source_complete is the fact that stops a restart during the join
+                        # below from re-encoding a sliver off the end of the source.
+                        parts_done += 1
+                        source_covered = max(source_covered, result.out_time or source_covered)
+                        source_complete = True
+                        _persist_conversion_parts(
+                            recording_id, parts_done=parts_done,
+                            source_covered=source_covered, source_complete=True,
+                            signature=signature)
                     break
 
                 last_error = result.error_msg or result.reason
 
-                # A restart re-reads the same static .ts from byte zero, so a defect IN
-                # THAT FILE stops every attempt at the same output timestamp. Recording 4
-                # died four times at 02:53:02.06 with byte-identical output sizes, burning
-                # ~40 minutes of CPU to fail the same way (dev/changelog/799). Retrying is
-                # only ever worth it for a transient cause - a killed process, a blip on
-                # the storage mount - which lands somewhere new each time. The tolerance is
-                # one poll interval: two attempts that stop within a single progress sample
-                # of each other are the same stop, not a coincidence.
+                if resumable:
+                    # THE KILLED PART IS SALVAGED BEFORE ANYTHING ELSE HAPPENS. Re-muxing it
+                    # drops the fragment that was mid-write when it died and hands back where
+                    # its last decodable frame really is - the only honest splice point, and
+                    # the reason the next attempt's -ss is trustworthy. A part with nothing
+                    # usable in it is deleted and the offset is left where it was, so the
+                    # worst case is re-encoding that stretch rather than skipping it.
+                    try:
+                        kept = finalize_part(part_file, ffmpeg_path, scratch_key=recording_id,
+                                             interval=interval,
+                                             pre_output_timeout=pre_output_timeout,
+                                             stall_seconds=stall_seconds,
+                                             label=f'Recording {recording_id} part',
+                                             on_spawn=_track_child)
+                    finally:
+                        _untrack_child()
+                    if kept:
+                        parts_done += 1
+                        source_covered += kept
+                        _persist_conversion_parts(
+                            recording_id, parts_done=parts_done,
+                            source_covered=source_covered, source_complete=False,
+                            signature=signature)
+                        log.info('Recording %d: kept %s of encoding from the attempt that '
+                                 '%s - %s of the source is now encoded across %d part(s)',
+                                 recording_id, fmt_duration(kept, with_seconds=True),
+                                 result.reason, fmt_duration(source_covered, with_seconds=True),
+                                 parts_done)
+                    else:
+                        try:
+                            os.unlink(part_file)
+                        except OSError:
+                            pass  # nothing usable in it; best-effort removal
+                        log.warning('Recording %d: the attempt that %s left nothing that can '
+                                    'be kept - the next one re-encodes from %s',
+                                    recording_id, result.reason,
+                                    fmt_duration(source_covered, with_seconds=True))
+
+                # A restart re-reads the same static .ts, so a defect IN THAT FILE stops every
+                # attempt at the same source position. Recording 4 died four times at
+                # 02:53:02.06 with byte-identical output sizes, burning ~40 minutes of CPU to
+                # fail the same way (dev/changelog/799). Retrying is only ever worth it for a
+                # transient cause - a killed process, a blip on the storage mount - which
+                # lands somewhere new each time. The tolerance is one poll interval: two
+                # attempts that stop within a single progress sample of each other are the
+                # same stop, not a coincidence.
+                #
+                # ConversionResult.out_time is an absolute source position (a resumed
+                # attempt's -ss is added back), which is what keeps this comparison meaningful
+                # once two attempts no longer start from the same place.
                 repeat = (result.reason == 'died' and result.out_time and prev_death_out_time
                           and abs(result.out_time - prev_death_out_time) <= max(interval, 1.0))
                 if repeat and fmt == 'mp4' and not audio_copy_fallback:
@@ -1189,24 +1855,52 @@ def do_postprocess(app, recording_id: int, ts_path: str):
                     # after the file itself has been shown to be the cause, because it
                     # costs a source that legitimately changes layout mid-stream.
                     audio_copy_fallback = True
-                    cmd = _build_cmd(audio_copy=True)
+                    # THE FALLBACK INVALIDATES EVERY PART ALREADY ENCODED, and there is no way
+                    # around it: the parts hold an AAC track this attempt would copy the
+                    # source's own bytes into, so one codec config would have to cover two
+                    # differently-encoded halves and the seam is undecodable in players. The
+                    # signature is what expresses that - recomputing it here is the same
+                    # judgment the resume path above makes, applied the moment the settings
+                    # change rather than at the next restart. The cost is the re-encoding that
+                    # checkpointing had saved, which is a worse outcome than resuming and a
+                    # better one than a file with a hole in it.
+                    parts_discarded = discard_conversion_parts(output_path) if resumable else 0
+                    parts_done = 0
+                    source_covered = 0.0
+                    source_complete = False
+                    if resumable:
+                        signature = parts_signature(_build_cmd(audio_copy=True), output_path)
                     # prev_death_out_time is deliberately kept: if a run that decodes
                     # nothing still stops at the same offset, nothing will get past it.
                     attempt += 1
                     log.warning('Recording %d conversion died twice at %.2fs into the source - '
-                                'retrying with audio stream-copied instead of re-encoded',
-                                recording_id, result.out_time)
+                                'retrying with audio stream-copied instead of re-encoded '
+                                '(%d encoded part(s) discarded)',
+                                recording_id, result.out_time, parts_discarded)
 
                     @retry_on_locked()
-                    def _commit_audio_fallback_event(where=result.out_time, n=attempt):
+                    def _commit_audio_fallback_event(where=result.out_time, n=attempt,
+                                                     dropped=parts_discarded, sig=signature):
                         r = db.session.get(Recording, recording_id)
                         r.conversion_attempts = n
+                        # The NEW signature is registered here, not merely cleared: this is
+                        # the same registration the phase does before its first part, and it
+                        # has to happen before this attempt writes one. Clearing alone would
+                        # leave a copied-audio part on disk with nothing recorded about it,
+                        # and a service restart would then adopt it under the re-encoded-audio
+                        # signature it recomputes - the precise splice this signature exists
+                        # to prevent.
+                        set_conversion_parts(r, signature=sig)
                         add_recording_event(
                             recording_id, CONVERSION_RESTARTED,
                             detail=f'Conversion stopped twice at the same point '
                                    f'({fmt_duration(where, with_seconds=True)} in) - the source '
                                    f'is damaged there. Retrying with the audio copied instead '
-                                   f'of re-encoded, which does not decode it.')
+                                   f'of re-encoded, which does not decode it.'
+                                   + (f' The {dropped} part(s) already encoded cannot be joined '
+                                      f'onto audio copied this way, so they were discarded and '
+                                      f'this attempt starts from the beginning.'
+                                      if dropped else ''))
                         db.session.commit()
 
                     _commit_audio_fallback_event()
@@ -1241,18 +1935,119 @@ def do_postprocess(app, recording_id: int, ts_path: str):
                          recording_id, attempt, max_attempts, result.reason, last_error)
 
                 @retry_on_locked()
-                def _commit_restart_event(n=attempt, reason=result.reason):
+                def _commit_restart_event(n=attempt, reason=result.reason,
+                                          covered=source_covered, nparts=parts_done):
+                    # What the next attempt will actually do, not a generic "restarting": a
+                    # resume that says "restarting" reads as the hours-thrown-away behavior
+                    # this replaced, and the difference is the whole point of the feature.
+                    where = (f' Resuming from {fmt_duration(covered, with_seconds=True)} in - '
+                             f'the {nparts} part(s) already encoded are kept.'
+                             if covered > 0 else '')
                     db.session.add(RecordingEvent(
                         recording_id=recording_id,
                         event_type=CONVERSION_RESTARTED,
                         detail=f'Conversion {_RESTART_REASON_PHRASE.get(reason, reason)}; '
-                               f'restarting (attempt {n} of {max_attempts}).',
+                               f'restarting (attempt {n} of {max_attempts}).{where}',
                     ))
                     db.session.commit()
 
                 _commit_restart_event()
                 ev.publish(recording_id, CONVERSION_RESTARTED,
                            {'status': REC_STATUS_CONVERTING, 'attempt': attempt, 'max': max_attempts})
+
+            if conversion_ok and resumable:
+                # ── Assembly ─────────────────────────────────────────────────────────
+                # Every frame is encoded; what exists on disk is N fragmented parts, and this
+                # turns them into the one +faststart file the rest of the app expects. It is
+                # not an extra pass - it is the pass +faststart was already doing at the end
+                # of every conversion, now doing the join as well.
+                parts = existing_part_paths(output_path, parts_done)
+                joined_bytes_in = 0
+                for _p in parts:
+                    try:
+                        joined_bytes_in += os.path.getsize(_p)
+                    except OSError:
+                        pass  # sizes only drive the progress percentage and the event text
+
+                def _publish_join(wall, out_time, size):
+                    # Byte progress against the parts' combined size. The same field the
+                    # encode publishes and the same question it answers - how far through is
+                    # this conversion - measured the way the assembly phase can measure it.
+                    # A percentage frozen at 100 for the ten minutes a multi-gigabyte join
+                    # takes is exactly the number nobody can explain.
+                    pct = None
+                    if joined_bytes_in and size:
+                        pct = max(0.0, min(100.0, size / joined_bytes_in * 100.0))
+                    _persist_conversion_snapshot(recording_id, pct, size, None)
+                    ev.publish(recording_id, 'CONVERSION_PROGRESS', {
+                        'status': REC_STATUS_CONVERTING, 'pct': pct, 'out_size': size or None,
+                        'eta_seconds': None,
+                    })
+
+                @retry_on_locked()
+                def _commit_join_started(n=len(parts), total=joined_bytes_in):
+                    # THE SPLICE COST IS NAMED, not left for someone to find by comparing
+                    # durations. Measured on this box over a real 1080p59.94 capture: a join
+                    # loses two frames and leaves one duplicated timestamp at the seam, so the
+                    # finished file runs 0.033s different from an uninterrupted conversion of
+                    # the same source. That is a thirtieth of a second against the hours of
+                    # encoding the parts represent, which is why it is the right trade - and
+                    # saying so is what makes it a disclosed trade rather than a silent one.
+                    add_recording_event(
+                        recording_id, DIAGNOSTICS,
+                        detail=f'Assembling the converted file from {n} encoded part(s) '
+                               f'({_fmt_bytes(total)}) - the conversion was interrupted and '
+                               f'resumed rather than restarted. Each of the {n - 1} join(s) '
+                               f'costs about two frames at the seam, so the finished file may '
+                               f'run a few hundredths of a second short.',
+                        extra={'kind': 'conversion_parts_join', 'parts': n,
+                               'splices': n - 1, 'bytes_in': total})
+                    db.session.commit()
+
+                if parts_done > 1:
+                    # Said out loud only when the conversion actually was interrupted. A
+                    # single-part join is the ordinary ending of every conversion and needs
+                    # no event of its own.
+                    _commit_join_started()
+
+                try:
+                    join = join_conversion_parts(
+                        parts, output_path, ffmpeg_path, scratch_key=recording_id,
+                        interval=interval,
+                        pre_output_timeout=pre_output_timeout, stall_seconds=stall_seconds,
+                        label=f'Recording {recording_id} assembly',
+                        on_progress=_publish_join, on_spawn=_track_child)
+                finally:
+                    _untrack_child()
+
+                # A Cancel during the assembly kills its ffmpeg through the registry above,
+                # which reads here as a failed join. The flag is what tells the two apart, and
+                # it is consumed on the same terms the restart loop consumes it on. This whole
+                # block sits ABOVE the cancelled handler so that one terminal path serves both
+                # a cancel during the encode and a cancel during the assembly.
+                if _consume_cancel(recording_id):
+                    cancelled = True
+                    conversion_ok = False
+                elif join.success:
+                    discard_conversion_parts(output_path)
+                    _persist_conversion_parts(recording_id)
+                else:
+                    # THE PARTS ARE KEPT. They are the only copy of the encoding, the assembly
+                    # is a stream copy that costs minutes rather than hours, and a Retry
+                    # re-enters this function, finds source_complete still recorded and goes
+                    # straight back to the join. Deleting them here would turn a recoverable
+                    # failure into the hours-lost outcome this whole feature exists to end.
+                    conversion_ok = False
+                    last_error = join.error_msg or join.reason
+                    log.error('Recording %d: converted every frame but could not assemble the '
+                              'final file: %s', recording_id, last_error,
+                              extra={'recording_id': recording_id})
+                    if os.path.exists(output_path):
+                        try:
+                            os.unlink(output_path)
+                        except OSError as exc:
+                            log.warning('Could not delete the partial assembly %s: %s',
+                                        output_path, exc)
 
             if cancelled:
                 # User cancelled: keep the source .ts (Retry conversion works from CANCELLED),
@@ -1262,12 +2057,18 @@ def do_postprocess(app, recording_id: int, ts_path: str):
                         os.unlink(output_path)
                     except OSError as exc:
                         log.warning('Could not delete partial conversion output %s: %s', output_path, exc)
+                # The parts go with it. A cancel is the user saying they do not want this
+                # conversion, not asking for it to be paused - and a Retry after one resets
+                # the attempt budget, so leaving multi-gigabyte parts behind to resume from
+                # would be keeping work nobody asked to keep (CLAUDE.md teardown).
+                discard_conversion_parts(output_path)
 
                 @retry_on_locked()
                 def _commit_conversion_cancelled():
                     r = db.session.get(Recording, recording_id)
                     r.status = REC_STATUS_ABORTED
                     r.completed_at = datetime.utcnow()
+                    set_conversion_parts(r)
                     db.session.add(RecordingEvent(
                         recording_id=recording_id,
                         event_type=CONVERSION_DONE,
@@ -1361,6 +2162,18 @@ def do_postprocess(app, recording_id: int, ts_path: str):
                 else:
                     give_up_msg = (f'FAILED after {attempt + 1} attempt(s) '
                                    f'(gave up: {last_error})')
+                # The encoding that did succeed is still on disk and a Retry picks up from it,
+                # so say so: an operator deciding whether retrying is worth hours of CPU is
+                # entitled to know it is not (dev/changelog/955).
+                if resumable and parts_done and not repeated_at:
+                    if source_complete:
+                        give_up_msg += (' - every frame was converted and only the final '
+                                        'assembly failed, so a retry picks up from there')
+                    else:
+                        give_up_msg += (f' - the first '
+                                        f'{fmt_duration(source_covered, with_seconds=True)} is '
+                                        f'already converted and kept, so a retry resumes from '
+                                        f'there rather than starting over')
 
                 @retry_on_locked()
                 def _commit_conversion_failed():
@@ -1589,7 +2402,7 @@ def _segment_capture_rates(recording_id):
     shrinks the deficit, which could in principle mask loss. That is acceptable here because
     it is not the deficit's job to catch gross loss: a dropout inside a segment is measured
     by gap_seconds, which is rate-independent, and loss BETWEEN segments is invisible to this
-    scan either way and is reported as Content missing (dev/changelog/433). What the deficit
+    scan either way and is reported as Capture gaps (dev/changelog/433, 942). What the deficit
     uniquely catches is micro-gaps under the 0.25s gap threshold, and those barely move a
     segment's wall-clock-to-content ratio at all. Weighting by wall clock is wrong by a
     start-up second or two per segment; using one rate for the whole file was wrong by 1,200
@@ -1611,6 +2424,76 @@ def _segment_capture_rates(recording_id):
         if span > 0:
             rates.append((span, probe_fps))
     return rates
+
+
+#: The one spelling of the timeline scan's event detail, so the memo below can strip it back
+#: off rather than a second literal drifting from the one _scan_recording_timeline writes.
+_TIMELINE_SCAN_DETAIL_PREFIX = 'Timeline scan: '
+
+
+def _analysis_attempt_count(recording_id) -> int:
+    """How many times the post-capture analysis phase has announced itself for this
+    recording. Read to tell a first run from a redo, never to decide whether the phase may be
+    skipped - that is analysis_completed_at's job and nothing else's (dev/changelog/951)."""
+    from .database import RecordingEvent, POSTCAPTURE_ANALYSIS_STARTED
+    return (RecordingEvent.query
+            .filter_by(recording_id=recording_id, event_type=POSTCAPTURE_ANALYSIS_STARTED)
+            .count())
+
+
+def _recorded_timeline_scan(recording_id):
+    """_scan_recording_timeline's (damaged, metrics, summary) rebuilt from what that scan
+    recorded, or None when no scan was ever recorded for this recording.
+
+    The memo has to survive a process restart, not just the call chain: without this, gating
+    the analysis phase would simply move the full-file ffprobe from the analysis phase into
+    the re-encode decision two hundred lines below, and a resumed recording would still pay
+    the 266s-434s scan this gate exists to stop paying (dev/changelog/951).
+
+    Rebuilt, not re-measured. Every value the scan produced is already durable - the five
+    stats it promotes to columns, and the rest in its DIAGNOSTICS event's extra_data, which
+    is a strict partition (CLAUDE.md, "a stat with a column does not also go in extra_data").
+    `timeline_damaged` is deliberately the stored verdict rather than a fresh evaluation: it
+    records what the app decided and acted on, which is the question a resume is asking.
+    """
+    import json
+    from . import db
+    from .database import Recording, RecordingEvent, DIAGNOSTICS
+
+    events = (RecordingEvent.query
+              .filter_by(recording_id=recording_id, event_type=DIAGNOSTICS)
+              .order_by(RecordingEvent.id.desc())
+              .all())
+    for evt in events:
+        try:
+            extra = json.loads(evt.extra_data) if evt.extra_data else {}
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(extra, dict) or extra.get('kind') != 'timeline_scan':
+            continue
+
+        detail = evt.detail or ''
+        summary = (detail[len(_TIMELINE_SCAN_DETAIL_PREFIX):]
+                   if detail.startswith(_TIMELINE_SCAN_DETAIL_PREFIX) else detail) or None
+        if extra.get('scan_failed'):
+            # The scan ran and produced nothing. Recorded as such, and replayed as such -
+            # re-probing would be guessing that a failure was transient.
+            return False, {}, summary
+
+        rec = db.session.get(Recording, recording_id)
+        metrics = {
+            'gap_count':        rec.timeline_gap_count if rec else None,
+            'gap_seconds':      rec.timeline_gap_seconds if rec else None,
+            'max_gap_seconds':  rec.timeline_max_gap_seconds if rec else None,
+            'deficit_seconds':  rec.timeline_deficit_seconds if rec else None,
+        }
+        for k in ('gap_basis', 'gap_threshold', 'backward_count', 'missing_seconds',
+                  'span_seconds', 'packet_count', 'fps', 'capture_fps_values', 'deficit_fps'):
+            if k in extra:
+                metrics[k] = extra[k]
+        damaged = bool(rec.timeline_damaged) if rec is not None else False
+        return damaged, metrics, summary
+    return None
 
 
 def _scan_recording_timeline(recording_id, ts_path):
@@ -1680,7 +2563,7 @@ def _scan_recording_timeline(recording_id, ts_path):
             r.timeline_deficit_seconds = metrics['deficit_seconds']
             r.timeline_damaged         = damaged
         add_recording_event(recording_id, DIAGNOSTICS,
-                            detail=f'Timeline scan: {summary}', extra=extra)
+                            detail=f'{_TIMELINE_SCAN_DETAIL_PREFIX}{summary}', extra=extra)
         db.session.commit()
 
     _commit_timeline_diagnostics()
@@ -1908,16 +2791,25 @@ def _gather_recording_health(recording_id, ts_path, rec, cfg):
         pct = fields.get('recorded_frame_pct')
         kbps = fields.get('recorded_bitrate_kbps')
         duration = fields.get('recorded_duration_seconds')
-        # The headline number this whole string exists to make unmissable: how much
-        # content the window did not get. Same quantity as
-        # Recording.content_shortfall_seconds and computed off the same two values -
-        # it rides in the detail string, never in extra_data, because both inputs
-        # already have columns (CLAUDE.md §Measurements).
-        missing = None if duration is None else max(0.0, adjusted_secs - duration)
-        missing_txt = (
-            '' if missing is None else
-            f", missing {missing:.0f}s"
-            f"{'' if adjusted_secs <= 0 else f' ({missing / adjusted_secs * 100:.0f}%)'}"
+        # The two facts this string exists to make unmissable, reported side by side and
+        # never netted: gap time is wall clock when no segment was capturing, and the
+        # content figure is how the delivered length compares against the wall clock the
+        # capture actually ran for. They used to be one subtraction clamped at zero, which
+        # let a buffered feed's replay cancel real gap time - recording 14 printed
+        # "missing 0s (0%)" over 135.7s of gaps (dev/changelog/942). Same quantities as
+        # Recording.capture_gap_seconds / content_vs_capture_seconds; they ride in the
+        # detail string, never in extra_data, because every input already has a column
+        # (CLAUDE.md §Measurements).
+        covered = rec.covered_capture_seconds
+        gap_secs = max(0.0, adjusted_secs - covered)
+        gap_txt = (
+            f", {gap_secs:.0f}s not capturing"
+            f"{'' if adjusted_secs <= 0 else f' ({gap_secs / adjusted_secs * 100:.0f}%)'}"
+        )
+        vs_capture = None if duration is None else duration - covered
+        accounting_txt = gap_txt + (
+            '' if vs_capture is None else
+            f", content {vs_capture:+.0f}s against {covered:.0f}s of capture time"
         )
         summary = (
             f"{fields['recorded_resolution'] or '?'} @ "
@@ -1928,7 +2820,7 @@ def _gather_recording_health(recording_id, ts_path, rec, cfg):
             f"{f'{kbps:.0f}' if kbps else '?'} kbps; "
             f"content duration {f'{duration:.1f}' if duration is not None else '?'}s "
             f"(adjusted window {adjusted_secs:.0f}s, scheduled {sched_secs:.0f}s"
-            f"{missing_txt}); "
+            f"{accounting_txt}); "
             f"{_format_profile_summary(fields)}"
         )
         log.info('Recording %d health: %s', recording_id, summary)

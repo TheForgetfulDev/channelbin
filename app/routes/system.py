@@ -1,7 +1,7 @@
 import os
 from collections import namedtuple
 
-from flask import Blueprint, jsonify, render_template
+from flask import Blueprint, jsonify, render_template, request
 
 from ..alerts import update_storage_path_alert
 from ..config import load_config
@@ -283,3 +283,55 @@ def storage_details():
         disk_total=disk_total,
         disk_free=disk_free,
     )
+
+
+@system_bp.route('/api/readiness')
+def readiness_report():
+    """Every readiness check, the capabilities behind them and the verdict.
+
+    A GET that evaluates only the cheap checks: the three that cost a process, a provider
+    connection or a real message report "not run yet" until somebody asks for them through
+    the route below. That is the rule the whole feature is built on - nothing expensive
+    happens because a page was opened (`dev/changelog/950`).
+    """
+    from ..readiness import evaluate
+    return jsonify(success=True, **evaluate())
+
+
+@system_bp.route('/api/readiness/run', methods=['POST'])
+def readiness_run():
+    """Run one on-demand check now, or every one that has not been asked for yet."""
+    from ..readiness import CHECKS_BY_ID, ON_DEMAND, evaluate, pending_ondemand_ids, run_check
+    data = request.get_json(silent=True) or {}
+    check_id = data.get('check')
+    if check_id is None:
+        payload = None
+        for pending in pending_ondemand_ids():
+            payload = run_check(pending)
+        return jsonify(success=True, **(payload or evaluate()))
+    check = CHECKS_BY_ID.get(check_id)
+    if check is None:
+        return jsonify({'error': f'Unknown check "{check_id}"'}), 404
+    if check.cost != ON_DEMAND:
+        return jsonify({'error': f'"{check.label}" runs on every load and is not asked for'}), 400
+    return jsonify(success=True, **run_check(check_id))
+
+
+@system_bp.route('/api/readiness/ignore', methods=['POST'])
+def readiness_ignore():
+    """Silence or un-silence one check.
+
+    Checked here rather than in the template: a check the page draws no Ignore button for
+    is still a route somebody can POST to, and CLAUDE.md puts enforcement server-side.
+    """
+    from ..readiness import evaluate, set_check_ignored
+    data = request.get_json(silent=True) or {}
+    check_id = data.get('check')
+    ignored = bool(data.get('ignored'))
+    try:
+        set_check_ignored(check_id, ignored)
+    except KeyError:
+        return jsonify({'error': f'Unknown check "{check_id}"'}), 404
+    except ValueError as exc:
+        return jsonify({'error': str(exc)}), 400
+    return jsonify(success=True, **evaluate())
