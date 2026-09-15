@@ -5,8 +5,8 @@ from ..channel_tester import resolve_health_check_settings
 from ..config import load_config
 from ..database import HealthCheckProfile, OnDemandTestJob
 from ..db_utils import retry_on_locked
-from ..profile_forms import (BOOL, INT, TEXT, Override, ProfileField, nullable_overrides,
-                             parse_profile_body, profile_payload)
+from ..profile_forms import (BOOL, INT, TEXT, ProfileField, default_summary,
+                             nullable_overrides, parse_profile_body, profile_payload)
 
 health_check_profiles_bp = Blueprint('health_check_profiles', __name__)
 
@@ -51,14 +51,6 @@ _OVERRIDE_ROWS = (
 )
 
 
-def _default_summary(defaults):
-    """The one statement of what an unset field falls back to, replacing the "Default (N)"
-    cell the retired table repeated on every row. Rendered through the SAME functions as
-    an override cell, so a number cannot read two ways on one page."""
-    return [Override(label, render(defaults[key]))
-            for key, label, render in _OVERRIDE_ROWS if key in defaults]
-
-
 @health_check_profiles_bp.route('/health-check-profiles')
 def health_check_profiles_list():
     profiles = HealthCheckProfile.query.order_by(HealthCheckProfile.name).all()
@@ -85,7 +77,7 @@ def health_check_profiles_list():
         # becomes truthiness and starts hiding a profile's 0 or False
         # (app/profile_forms.py).
         overrides={p.id: nullable_overrides(p, _OVERRIDE_ROWS) for p in profiles},
-        default_summary=_default_summary(defaults),
+        default_summary=default_summary(defaults, _OVERRIDE_ROWS),
         profiles_json=[_profile_payload(p) for p in profiles],
     )
 

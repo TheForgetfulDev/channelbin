@@ -155,40 +155,35 @@ def _absolute(path):
     return shutil.which(path) or path
 
 
-def _describe_ffmpeg(configured_path):
-    from .config import resolve_ffmpeg_path
-    resolved = resolve_ffmpeg_path(configured_path)
-    source = SOURCE_CONFIGURED if os.sep in configured_path else SOURCE_PATH
+def _tool_entry(name, config_key, configured_path, resolved, source):
+    """One describe_tools() entry, probed. The shape both binaries report in."""
     version, banner = _probe_version(resolved)
     return {
-        'name': 'ffmpeg',
+        'name': name,
         'configured': configured_path,
-        'config_key': 'ffmpeg.path',
+        'config_key': config_key,
         'path': _absolute(resolved),
         'found': version is not None or banner is not None,
-        # Reported only for a binary that actually ran: resolve_ffmpeg_path returns the
-        # configured name unchanged when nothing resolves, and calling that 'path' would
-        # be this module claiming a provenance it does not have.
+        # Reported only for a binary that actually ran: the resolvers return the configured
+        # name unchanged when nothing resolves, and calling that 'path' would be this
+        # module claiming a provenance it does not have.
         'source': source if banner is not None else None,
         'version': version,
         'banner': banner,
     }
+
+
+def _describe_ffmpeg(configured_path):
+    from .config import resolve_ffmpeg_path
+    resolved = resolve_ffmpeg_path(configured_path)
+    source = SOURCE_CONFIGURED if os.sep in configured_path else SOURCE_PATH
+    return _tool_entry('ffmpeg', 'ffmpeg.path', configured_path, resolved, source)
 
 
 def _describe_ffprobe(configured_path, configured_ffmpeg_path):
     from .config import describe_ffprobe_resolution
     resolved, source = describe_ffprobe_resolution(configured_path, configured_ffmpeg_path)
-    version, banner = _probe_version(resolved)
-    return {
-        'name': 'ffprobe',
-        'configured': configured_path,
-        'config_key': 'ffmpeg.ffprobe_path',
-        'path': _absolute(resolved),
-        'found': version is not None or banner is not None,
-        'source': source if banner is not None else None,
-        'version': version,
-        'banner': banner,
-    }
+    return _tool_entry('ffprobe', 'ffmpeg.ffprobe_path', configured_path, resolved, source)
 
 
 def describe_tools_uncached(configured_ffmpeg_path='ffmpeg', configured_ffprobe_path=''):

@@ -126,9 +126,10 @@ POSTCAPTURE_ANALYSIS_STARTED = 'POSTCAPTURE_ANALYSIS_STARTED'
 # (dev/changelog/951).
 POSTCAPTURE_ANALYSIS_SKIPPED = 'POSTCAPTURE_ANALYSIS_SKIPPED'
 CONVERSION_STARTED     = 'CONVERSION_STARTED'
-# A supervised conversion attempt died or stalled and auto-restart re-spawned ffmpeg from
-# scratch (post_process.auto_restart). Distinct from CONVERSION_STARTED so the event log
-# reads honestly when a conversion loops - one flag, one meaning.
+# A supervised conversion attempt died or stalled and auto-restart re-spawned ffmpeg
+# (post_process.auto_restart) - a stream copy from scratch, a re-encode from its
+# conversion_parts_* checkpoint (dev/changelog/955). Distinct from CONVERSION_STARTED so the
+# event log reads honestly when a conversion loops - one flag, one meaning.
 CONVERSION_RESTARTED   = 'CONVERSION_RESTARTED'
 # A conversion yielded local resources to a recording (recording.post_process.
 # collision_policy) - either parked before it started, or suspended mid-encode, because a
@@ -414,7 +415,8 @@ class Recording(db.Model):
     # no-growth window inside a segment that had stopped delivering but was not yet killed.
     total_downtime_seconds    = db.Column(db.Float, default=0.0)
     final_file_size           = db.Column(db.Integer)
-    # MAX_CONSECUTIVE_FAILURES | DEAD_STREAM_DETECTED - set only when status becomes FAILED
+    # MAX_CONSECUTIVE_FAILURES | DEAD_STREAM_DETECTED | FAST_DELIVERY_DETECTED - set only when
+    # status becomes FAILED, and only by app/watchdog.py::_mark_recording_failed
     failure_reason            = db.Column(db.String(64))
     # Dead-stream fast-fail retry budget (watchdog.dead_stream_max_retry_attempts). Counts
     # attempts scheduled, not just fired - incremented when status -> RETRYING, never reset
@@ -1623,7 +1625,7 @@ class ChannelTest(db.Model):
     lifetime_score_after = db.Column(db.Integer)  # snapshot of Channel.health_score immediately after this test was folded in
     quality_breakdown    = db.Column(db.Text)      # JSON: per-penalty math behind quality_score
     blend_breakdown      = db.Column(db.Text)      # JSON: decay/blend math behind lifetime_score_after
-    # ── Multi-track detection (dev/changelog/564) ──────────────────────────────
+    # ── Multi-track detection (dev/changelog/565) ──────────────────────────────
     # video_codec/audio_codec above always describe track 0; these cover tracks beyond
     # that. Counts are columns (sortable/filterable); extra_tracks is JSON since a
     # per-track list can't be flattened into scalar columns - same shape as

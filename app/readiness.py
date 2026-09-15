@@ -274,6 +274,10 @@ def _probe_db_write():
 # ─────────────────────────────────────────────────────────────────────────────
 # Formatting helpers - plain text only
 # ─────────────────────────────────────────────────────────────────────────────
+# _ago/_ahead are a fourth relative-time register beside the three that
+# tz_utils.relative's docstring names - past-tense, single-unit, rounded prose ("3 hours
+# ago") for a sentence read once, where exact combined units would be noise. Deliberate,
+# not a copy of any of them (dev/changelog/971).
 def _ago(when, now):
     if when is None:
         return 'never'
@@ -307,8 +311,9 @@ def _plural(n, one, many=None):
 # ─────────────────────────────────────────────────────────────────────────────
 # The checks
 # ─────────────────────────────────────────────────────────────────────────────
-#: How a resolved binary was found, in the same words the Maintenance card uses - the two
-#: surfaces sit on one page and must not describe the same fact differently.
+#: How a resolved binary was found. duplicated from static/js/maintenance.js::toolSource -
+#: the Maintenance card maps the same `source` key in JS because it renders from the stats
+#: payload, and the two surfaces sit on one page and must not describe one fact differently.
 _TOOL_SOURCE = {
     'path': 'found on PATH',
     'sibling': 'found beside the configured ffmpeg',
@@ -496,7 +501,7 @@ def _check_account_sync(ctx):
     stale = [a for a, _age, _iv in overdue] + never
     if stale:
         action = Action(f'Sync {len(stale)} {_plural(len(stale), "account")} now',
-                        [f'/api/accounts/{a.id}/sync' for a in stale])
+                        [_url('accounts.sync_account_api', account_id=a.id) for a in stale])
     if bad:
         return Result(PROBLEM, tested,
                       f'{len(bad)} of {len(ctx.accounts)} last failed to sync: '

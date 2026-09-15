@@ -5,6 +5,14 @@ Notable changes to ChannelBin, newest first. This project follows
 release is tagged `v<version>` in git, and the version the app is running is shown in the
 page footer.
 
+## 0.9.1 - 2026-09-15
+
+**Changed**
+
+- Internal only, with no change to how the app behaves. Code that had been duplicated without
+  being reused correctly was cleaned up, and code comments that had not been updated as the
+  code changed were brought current.
+
 ## 0.9.0 - 2026-09-14
 
 **Added**

@@ -2450,10 +2450,10 @@ function renderChannelColumn() {
 }
 
 // Provider-removed channels (dev/changelog/626, 627): the guide previously showed a channel the
-// provider stopped sending exactly like a healthy one. Mirrors the 'missing' marker /channels
-// and the EPG deep search already have (app/accounts.py::channel_lifecycle_state) - same
-// derived state, rendered here since the guide's channel column is a separate surface from
-// the channel-search engine those two go through.
+// provider stopped sending exactly like a healthy one. Mirrors the 'missing' marker both
+// grains of the channel search on /channels already carry
+// (app/accounts.py::channel_lifecycle_state) - same derived state, rendered here since the
+// guide's channel column is a separate surface from the channel-search engine.
 function renderLifecycleBadge(ch) {
   const badge = document.querySelector(`.guide-lifecycle-badge[data-channel-id="${ch.id}"]`);
   if (!badge) return;
