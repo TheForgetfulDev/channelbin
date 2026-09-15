@@ -32,7 +32,8 @@ from .channel_groups import (effective_score, pick_best_member, recording_member
                              segment_format_key, DEFAULT_FAILING_STREAK_THRESHOLD)
 from .db_utils import retry_on_locked
 from .fs_utils import PATH_OK, describe_dir_problem, probe_dir
-from .proc_utils import build_capture_cmd, read_stderr_tail, terminate_or_kill
+from .proc_utils import (build_capture_cmd, count_stderr_matches, read_stderr_tail,
+                         terminate_or_kill)
 from .url_utils import mask_creds, mask_creds_in_text
 from . import events as ev
 
@@ -917,6 +918,45 @@ def _reresolve_channel_url(recording_id: int, cfg: dict) -> None:
              recording_id, mask_creds(stale), mask_creds(fresh))
 
 
+#: Filename shape of a capture's stderr spool. Spelled once, here, because two different
+#: reapers match it and a pattern that drifts between them either misses live spools or
+#: deletes files in a directory the user also keeps their own things in.
+STDERR_SPOOL_PREFIX = '.cap-stderr-'
+
+
+def _stderr_spool_glob(log_dir: str, recording_id=None) -> str:
+    """Glob matching this recording's stderr spools, or every recording's when given None."""
+    who = f'{recording_id}-' if recording_id is not None else ''
+    return os.path.join(log_dir, f'{STDERR_SPOOL_PREFIX}{who}*.log')
+
+
+def sweep_stale_stderr_spools(app):
+    """Delete every capture stderr spool left behind by a process that is gone.
+
+    Called from init_scheduler(), and ONLY from there: it deletes by directory listing, so
+    it cannot tell a dead process's leftover from a live process's open spool, and the
+    pidfile claim just above its call site is what establishes that no other process owns
+    any of them. It lived in create_app() until dev/changelog/967, where "no capture can be
+    running yet" was true for the serving process and false for every other caller - a
+    second app build against the real config (an ad-hoc read-only check while the service
+    is up) deleted a live recording's spool with no error anywhere, and cost that segment
+    its capture-ended diagnostics for good.
+
+    Without it they accumulate forever for any recording that never resumes: kill_all_active
+    runs in a signal handler and deliberately does no cleanup.
+
+    Never raises. Losing the sweep costs disk, not a recording.
+    """
+    log_dir = app.config.get('CAPTURE_LOG_DIR')
+    if not log_dir:
+        return
+    for stale in glob.glob(_stderr_spool_glob(log_dir)):
+        try:
+            os.unlink(stale)
+        except OSError:
+            pass  # best-effort; a stale spool is inert, and per-attempt tokens make it unreadable as a live one
+
+
 def _open_segment_stderr_spool(app, recording_id: int, seg_num: int):
     """Open the file this segment's ffmpeg stderr is spooled to; (path, handle) or (None, None).
 
@@ -938,13 +978,14 @@ def _open_segment_stderr_spool(app, recording_id: int, seg_num: int):
     try:
         # Listed per id, not as a bare f'{recording_id}*' glob - that would let id 6 reap
         # id 64's live spool.
-        for stale in glob.glob(os.path.join(log_dir, f'.cap-stderr-{recording_id}-*.log')):
+        for stale in glob.glob(_stderr_spool_glob(log_dir, recording_id)):
             try:
                 os.unlink(stale)
             except OSError:
                 pass  # best-effort reap; the token below is what actually guarantees safety
-        path = os.path.join(log_dir,
-                            f'.cap-stderr-{recording_id}-{seg_num}-{uuid.uuid4().hex[:8]}.log')
+        path = os.path.join(
+            log_dir,
+            f'{STDERR_SPOOL_PREFIX}{recording_id}-{seg_num}-{uuid.uuid4().hex[:8]}.log')
         return path, open(path, 'wb')
     except OSError as exc:
         log.warning('Recording %d seg %d: could not open stderr spool in %s: %s - '
@@ -967,13 +1008,30 @@ def _discard_stderr_spool(path, fh):
 
 
 def collect_segment_diagnostics(recording_id: int):
-    """(ffmpeg_exit_code, stderr_tail) for the segment that just ended; releases its spool.
+    """(ffmpeg_exit_code, stderr_tail, reconnects, spool_missing) for the segment that just
+    ended; releases its spool.
 
     Call AFTER terminating the process. poll() is read rather than wait()ed, so a child that
     is somehow still alive yields None - honest, since we genuinely do not know how it ended.
     A negative code is the signal that killed it (-15 = our own SIGTERM), a positive one is
     ffmpeg's own error status; that distinction is the whole point, because it separates
     "we gave up on it" from "it died on us".
+
+    `reconnects` is (count, complete) for the times ffmpeg dropped the connection and opened
+    a new one WITHOUT the segment ending - the repair that ffmpeg.read_timeout_seconds exists
+    to make possible (dev/changelog/958). It is counted over the whole spool rather than the
+    tail because a capture's last 20 stderr lines are almost always 20 progress lines, so a
+    segment that reconnected eight times would otherwise be indistinguishable from a clean
+    one - which is the opposite of what an in-process repair should cost the user in
+    visibility.
+
+    `spool_missing` says the spool this segment was writing to had been deleted by the time
+    we came to read it - not that ffmpeg said nothing. The distinction is load-bearing: an
+    empty tail reads identically either way, which is how recording 18's segment 1 came to
+    have no capture-ended event at all and no trace of why (dev/changelog/967). It is
+    deliberately NOT set when no spool was ever opened - that path already logs its own
+    warning from _open_segment_stderr_spool and would otherwise raise one event per segment
+    for as long as capture_log_dir stays unwritable.
 
     Idempotent: the spool is forgotten here, so a second call returns ('' for the tail).
     The tail is credential-masked - ffmpeg echoes its input URL on error and those URLs
@@ -984,7 +1042,7 @@ def collect_segment_diagnostics(recording_id: int):
     """
     state = get_state(recording_id)
     if state is None:
-        return None, ''
+        return None, '', (0, True), False
     exit_code = state.process.poll() if state.process is not None else None
     path, fh = state.stderr_path, state.stderr_fh
     state.stderr_path, state.stderr_fh = None, None
@@ -993,17 +1051,31 @@ def collect_segment_diagnostics(recording_id: int):
             fh.close()
         except OSError:
             pass  # the tail read below still tries; a partial spool is better than none
-    tail = ''
-    if path:
+    tail, reconnects, spool_missing = '', (0, True), False
+    if path and not os.path.exists(path):
+        # Tested before the read rather than inferred from an empty tail, because
+        # read_stderr_tail returns '' for both. Nothing in this process deletes a spool
+        # between opening it and here, so this is always another process reaching into
+        # capture_log_dir.
+        spool_missing = True
+        log.warning('Recording %d: stderr spool %s was gone before the segment ended - '
+                    'another process deleted it, and this segment has no record of what '
+                    'ffmpeg said', recording_id, path)
+    elif path:
         tail = mask_creds_in_text(read_stderr_tail(path))
+        # Before the unlink, and before the relaunch: the process is already dead, so this
+        # cannot touch the capture it is describing, and count_stderr_matches is bounded so
+        # it cannot delay the restart.
+        reconnects = count_stderr_matches(path)
         try:
             os.unlink(path)
         except OSError:
             pass  # best-effort; the glob reap in _open_segment_stderr_spool collects strays
-    return exit_code, tail
+    return exit_code, tail, reconnects, spool_missing
 
 
-def record_segment_diagnostics(recording_id: int, seg, exit_code, tail):
+def record_segment_diagnostics(recording_id: int, seg, exit_code, tail, reconnects=(0, True),
+                               spool_missing=False):
     """Write exit_code onto seg and, when there is something to say, add a DIAGNOSTICS event.
 
     Inserts only - the CALLER commits. This joins the caller's existing retry_on_locked unit
@@ -1012,15 +1084,25 @@ def record_segment_diagnostics(recording_id: int, seg, exit_code, tail):
 
     The exit code goes in the column and in the event's detail string, NEVER in extra_data -
     a stat with a column does not also live there (CLAUDE.md § Measurements). extra_data
-    carries only the stderr tail, which has no column because nothing sorts on a blob.
+    carries only the stderr tail, which has no column because nothing sorts on a blob. The
+    reconnect count has no column either and nothing sorts on it, so it rides the detail
+    string where a human reads it.
 
     Stays quiet when the exit is uninformative: a negative code is a signal we sent, which
     seg.exit_reason already names, so with no stderr to show there is nothing an event would
-    add that the segment row does not already say.
+    add that the segment row does not already say. A segment that reconnected in-process is
+    NOT uninformative, however it ended - that is the whole reason the count is collected.
+
+    A LOST spool (spool_missing) is never uninformative either, whatever the exit code: the
+    absence of an event is what made recording 18's segment 1 unexplainable, because nothing
+    on any surface distinguished "ffmpeg had nothing to say" from "its output was destroyed"
+    (dev/changelog/967). Saying so is Product Principle 1 applied to the diagnostic itself.
     """
     if seg is not None:
         seg.ffmpeg_exit_code = exit_code
-    if not tail and not (exit_code is not None and exit_code > 0):
+    reconnect_count, reconnects_complete = reconnects
+    if (not tail and not reconnect_count and not spool_missing
+            and not (exit_code is not None and exit_code > 0)):
         return
     seg_num = seg.segment_number if seg is not None else None
     if exit_code is None:
@@ -1031,6 +1113,17 @@ def record_segment_diagnostics(recording_id: int, seg, exit_code, tail):
         code_str = f'ffmpeg exited {exit_code}'
     detail = f'Segment {seg_num} capture ended: {code_str}' if seg_num is not None \
         else f'Capture ended: {code_str}'
+    if reconnect_count:
+        # "at least" only when the scan was truncated, so the ordinary case reads as the
+        # fact it is rather than hedging about a bound nobody hit.
+        howmany = f'at least {reconnect_count}' if not reconnects_complete else f'{reconnect_count}'
+        times = 'time' if reconnect_count == 1 and reconnects_complete else 'times'
+        detail += (f'; the stream dropped and ffmpeg reconnected {howmany} {times} during '
+                   f'the segment, without restarting the capture')
+    if spool_missing:
+        detail += ('; ffmpeg\'s output was not captured for this segment - another process '
+                   'deleted the file it was being written to, so there is no record of what '
+                   'it reported')
     add_recording_event(recording_id, DIAGNOSTICS, detail=detail, segment_number=seg_num,
                         extra={'kind': 'capture_stderr', 'stderr_tail': tail} if tail
                               else {'kind': 'capture_stderr'})
@@ -1230,11 +1323,15 @@ def recording_format_pin(recording_id: int):
 
     Earliest *probed*, not literally segment 1: a segment that never carried enough data
     to probe also carries no data into the concatenated file, so what the output actually
-    opens as is the first segment that did. Requires an app context."""
+    opens as is the first segment that did. A discarded segment is excluded for the same
+    reason and it is not a fine point - a provider placeholder is 1080p30, so letting one
+    set the pin locks a 59.94 fps recording to 30 fps and filters out every real member for
+    the rest of the run (dev/changelog/957). Requires an app context."""
     seg = (RecordingSegment.query
            .filter(RecordingSegment.recording_id == recording_id,
                    RecordingSegment.probe_resolution.isnot(None),
-                   RecordingSegment.probe_fps.isnot(None))
+                   RecordingSegment.probe_fps.isnot(None),
+                   RecordingSegment.excluded_reason.is_(None))
            .order_by(RecordingSegment.segment_number.asc())
            .first())
     return segment_format_key(seg)
@@ -1266,7 +1363,8 @@ def _pin_eligible_members(members, pin, latest_by_channel):
     return keep, False
 
 
-def failover_group_member(app, recording_id: int, reason: str, demote: bool = False) -> bool:
+def failover_group_member(app, recording_id: int, reason: str, demote: bool = False,
+                          score_departure: bool = True) -> bool:
     """Switch a group-backed recording to its next-best untried member after its
     active feed died (failed restart / dead-stream trip / max consecutive
     failures - the watchdog's three give-up points). Returns True if switched -
@@ -1290,6 +1388,15 @@ def failover_group_member(app, recording_id: int, reason: str, demote: bool = Fa
 
     A False from this function is never an abort on the demote path: the caller stays put
     and takes its normal restart, exactly as it would have without the trip-wire.
+
+    `score_departure=False` says the caller has ALREADY written a more specific health
+    observation on the departing member, so this function must not add a second one for the
+    same departure. The placeholder discard is the one caller that does
+    (app/watchdog.py, dev/changelog/957): it scores the member at the fail floor because the
+    feed served no content at all, and the demotion's own scoring - which reads the member's
+    measured share - would otherwise blend a near-perfect score in beside it for a member
+    that delivered five seconds of black. Two observations for one departure is the defect;
+    which of the two is right is not in question.
 
     Only rewrites channel_id/url and swaps connection slots; the caller owns
     killing/launching ffmpeg (this keeps every non-idempotent side effect out of
@@ -1517,7 +1624,7 @@ def failover_group_member(app, recording_id: int, reason: str, demote: bool = Fa
         # for that member, independent of the recording's own terminal observation.
         # A demoted member did NOT die, so it is scored on what it actually measured
         # instead of the fail floor (see apply_stall_demotion_health_observation).
-        if old_channel is not None:
+        if old_channel is not None and score_departure:
             if demote:
                 from .health_score import apply_stall_demotion_health_observation
                 apply_stall_demotion_health_observation(
@@ -1978,7 +2085,7 @@ def _close_active_segment(app, recording_id: int, exit_reason: str):
     # Read outside the retried closure: it consumes the spool (closes and unlinks it), so a
     # lock-retry of the closure would find it already gone and record an empty tail. Reading
     # first makes the values plain locals the retry can safely reuse.
-    exit_code, tail = collect_segment_diagnostics(recording_id)
+    exit_code, tail, reconnects, spool_missing = collect_segment_diagnostics(recording_id)
 
     @retry_on_locked()
     def _close_and_commit():
@@ -1994,7 +2101,8 @@ def _close_active_segment(app, recording_id: int, exit_reason: str):
                 add_recording_event(recording_id, SEGMENT_ENDED,
                                     detail=f'Segment {seg.segment_number} ended: {exit_reason}',
                                     segment_number=seg.segment_number)
-                record_segment_diagnostics(recording_id, seg, exit_code, tail)
+                record_segment_diagnostics(recording_id, seg, exit_code, tail,
+                                           reconnects, spool_missing)
                 db.session.commit()
 
     _close_and_commit()

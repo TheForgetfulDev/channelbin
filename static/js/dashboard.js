@@ -81,11 +81,16 @@ function handleEvent(rid, eventType, d) {
   }
 }
 
+// The server's own status -> label table (app/fmt_utils.py), rendered into the page. Read
+// once: nothing republishes it, and a miss falls back to the raw status so an unrecognized
+// value is shown rather than swallowed - same contract as rec_status_display's default.
+const STATUS_LABELS = readJson('dash-status-labels') || {};
+
 function handleTerminal(rid, status) {
   const badge = document.getElementById(`badge-${rid}`);
   if (badge) {
     badge.className = `badge badge-${status.toLowerCase()}`;
-    badge.textContent = status;
+    badge.textContent = STATUS_LABELS[status] || status;
   }
   const row = document.getElementById(`card-${rid}`);
   if (row && status === 'COMPLETED') row.style.setProperty('--pct', '100%');

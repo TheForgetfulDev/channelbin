@@ -595,24 +595,41 @@ def _size_parts(n):
     return (f'{v:.1f}' if i >= 3 else f'{v:.0f}', units[i])
 
 
-# Every Recording.status, explicitly (no fallthrough rendering - an unknown
-# status still renders visibly via the .get default, never lands in a real
-# state's branch): (section, row edge class, badge class, badge label, pulse)
-_STATUS_ROW = {
-    REC_STATUS_SCHEDULED:     ('sched', 'st-sched',  'b-sched',  'SCHEDULED',     False),
-    REC_STATUS_IN_PROGRESS:   ('live',  'st-live',   'b-live',   'RECORDING',     True),
-    REC_STATUS_PAUSED:        ('live',  'st-paused', 'b-paused', 'PAUSED',        False),
-    REC_STATUS_RETRYING:      ('live',  'st-retry',  'b-retry',  'RETRYING',      False),
-    # Three post-capture phases, each naming its own. CONCATENATING used to read
-    # "PROCESSING", which was tolerable while it was the only one; next to a second phase
-    # that is also processing it says nothing (dev/changelog/867).
-    REC_STATUS_CONCATENATING: ('live',  'st-concat', 'b-concat', 'JOINING',       True),
-    REC_STATUS_ANALYZING:     ('live',  'st-concat', 'b-concat', 'ANALYZING',     True),
-    REC_STATUS_CONVERTING:    ('live',  'st-concat', 'b-concat', 'CONVERTING',    True),
-    REC_STATUS_COMPLETED:     ('done',  'st-done',   'b-done',   'COMPLETED',     False),
-    REC_STATUS_FAILED:        ('done',  'st-fail',   'b-fail',   'FAILED',        False),
-    REC_STATUS_ABORTED:       ('done',  'st-abort',  'b-abort',  'CANCELLED',     False),
-}
+# The status -> (section, edge class, badge class, label, pulse) table lives in
+# app/fmt_utils.py: four surfaces render a recording's status as text and two of them used
+# to print the stored enum instead of the label (dev/changelog/961).
+
+
+def _join_strip_context(rec):
+    """(live progress or None, the segment count the join is about) for the detail page.
+
+    The count is the whole point of the second half of this: the strip used to read
+    `rec.segments | length`, which is every row - zero-byte ones and the ones the app
+    deliberately discarded included - so a join of 16 announced itself as 19. Three
+    different questions, and each has exactly one answer already written:
+
+    - joining right now: the registry's own `of`, which IS the list ffmpeg was handed, so
+      the strip and the join cannot disagree even if a file disappeared since;
+    - queued or stranded at CONCATENATING with no ffmpeg: concatenator.joinable_segments(),
+      the one definition of joinable, re-asked because nothing has been handed to ffmpeg yet;
+    - finished: postprocessor._joined_segment_count(), which counts rows - a successful
+      concat deletes the segment files, so a filesystem test answers 0 for every completed
+      recording.
+
+    The file tests cost one stat per segment and run on a single recording's detail page,
+    never in a per-row loop.
+    """
+    from ..concatenator import concat_progress, joinable_segments
+    from ..postprocessor import _joined_segment_count
+
+    if rec.status == REC_STATUS_CONCATENATING:
+        prog = concat_progress(rec.id)
+        if prog is not None:
+            return prog, prog['of']
+        return None, len(joinable_segments(rec.segments))
+    if rec.status in (REC_STATUS_COMPLETED, REC_STATUS_ANALYZING, REC_STATUS_CONVERTING):
+        return None, _joined_segment_count(rec.id)
+    return None, len(joinable_segments(rec.segments))
 
 
 def _channel_initials(name):
@@ -622,17 +639,21 @@ def _channel_initials(name):
 
 def _index_row(rec, now, tz, thumb_ids):
     from ..tz_utils import UTC
-    section, st_class, badge_class, badge_label, pulse = _STATUS_ROW.get(
-        rec.status, ('done', 'st-abort', 'b-abort', rec.status, False))
+    from ..concatenator import concat_progress
+    from ..postprocessor import analysis_progress
+    # The WAITING derivation is inside rec_status_display, so this row and the Dashboard's
+    # row and chip cannot name the same parked recording three different ways.
+    section, st_class, badge_class, badge_label, pulse = fmt_utils.rec_status_display(
+        rec.status, waiting=bool(rec.postprocess_waiting_since))
 
-    # A parked post-processing chain badges as WAITING and stops pulsing. This is a display
-    # derivation from two stored facts, NOT a status: Recording.status stays ANALYZING or
-    # CONVERTING because the startup sweep, the collision query and the cancel route all
-    # branch on it, and a row that fell out of those would be stranded by the next restart
-    # rather than resumed (dev/changelog/954).
-    if rec.postprocess_waiting_since and rec.status in (REC_STATUS_ANALYZING,
-                                                        REC_STATUS_CONVERTING):
-        badge_label, pulse = 'WAITING', False
+    # A dict lookup under a lock, no I/O - safe in this per-row builder, which is what the
+    # /recordings case in tests/test_scaling_pages.py exists to keep true. Only a row that
+    # is actually joining can have an entry, so the lookup is skipped for every other status
+    # rather than paying it once per row on a page of hundreds.
+    concat_prog = (concat_progress(rec.id)
+                   if rec.status == REC_STATUS_CONCATENATING else None)
+    analysis_prog = (analysis_progress(rec.id)
+                     if rec.status == REC_STATUS_ANALYZING else None)
 
     start_l = rec.start_time.replace(tzinfo=UTC).astimezone(tz)
     today = now.replace(tzinfo=UTC).astimezone(tz).date()
@@ -680,6 +701,30 @@ def _index_row(rec, now, tz, thumb_ids):
         elif rec.conversion_progress_pct is None:
             parts.append('starting')
         rel = ' · '.join(parts)
+    elif rec.status == REC_STATUS_CONCATENATING and concat_prog:
+        # A join that is running says how far it has got; one that is only queued behind
+        # another (serialize_concat) falls through to the branch below, because "0%" and
+        # "has not started" are different facts and the strip that reads 0% forever is the
+        # thing this replaced.
+        parts = ['joining']
+        if concat_prog['pct'] is not None:
+            parts.append(f"{concat_prog['pct']:.0f}%")
+        parts.append(f"{concat_prog['joined']} of {concat_prog['of']} segments")
+        if concat_prog['eta_seconds'] is not None:
+            parts.append(f"~{_humanize_secs(concat_prog['eta_seconds'])} left")
+        rel = ' · '.join(parts)
+    elif rec.status == REC_STATUS_ANALYZING and analysis_prog:
+        # Same split as the join above: a pass that is reading says which one and how far,
+        # and an ANALYZING row with no pass running (between passes, or queued) falls
+        # through to "ended Nm ago" rather than reporting a percentage nothing is moving.
+        parts = [f"checking - {analysis_prog['pass_label']}"]
+        if analysis_prog['of_passes'] > 1:
+            parts[0] += (f" ({analysis_prog['pass_number']} of "
+                         f"{analysis_prog['of_passes']})")
+        if analysis_prog['pct'] is not None:
+            parts.append(f"{analysis_prog['pct']:.0f}%")
+        parts.append(f"{_humanize_secs(analysis_prog['elapsed_seconds'])} elapsed")
+        rel = ' · '.join(parts)
     elif rec.status in (REC_STATUS_CONCATENATING, REC_STATUS_ANALYZING):
         rel = f'ended {_humanize_secs((now - rec.stop_time).total_seconds())} ago'
     elif rec.status == REC_STATUS_SCHEDULED:
@@ -690,7 +735,10 @@ def _index_row(rec, now, tz, thumb_ids):
         rel = f'{_humanize_secs((now - anchor).total_seconds())} ago'
 
     sched_secs = rec.scheduled_duration_seconds
-    data_segs = [s for s in rec.segments if s.bytes_recorded]
+    # Discarded segments are out: this list stands in for the file, and both numbers it
+    # feeds - captured-so-far and the size shown before a final file exists - would
+    # otherwise credit the recording with content the app deliberately threw away.
+    data_segs = [s for s in rec.segments if s.bytes_recorded and not s.excluded]
     stalls = rec.total_stall_count or 0
 
     # duration cell: scheduled window for SCHEDULED rows; captured-so-far while
@@ -743,6 +791,25 @@ def _index_row(rec, now, tz, thumb_ids):
         missing += (
             f' The file holds {fmt_utils.fmt_duration(abs(vs_capture), with_seconds=True)} '
             f'{"more" if vs_capture > 0 else "less"} content than the time the capture ran.')
+    # Unconditional, unlike the two figures above: a discard is an action the app took, not a
+    # measurement that is a few seconds off on every clean capture, so there is no noise floor
+    # to clear and nothing to gate it on.
+    if rec.discarded_segment_count:
+        missing += (
+            f' {rec.discarded_segment_count} segment'
+            f'{"" if rec.discarded_segment_count == 1 else "s"} discarded '
+            f'({fmt_utils.fmt_duration(rec.discarded_seconds or 0, with_seconds=True)} of '
+            f'provider placeholder video), not joined into the file.')
+    # Unconditional for the same reason as the discard above: the threshold behind this is
+    # already three times clear of the worst honest surplus ever measured here, so there is
+    # no noise floor left for a percentage gate to clear.
+    if rec.fast_delivery_segment_count:
+        fast_secs = fmt_utils.fmt_duration(rec.fast_delivery_seconds or 0, with_seconds=True)
+        missing += (
+            f' {rec.fast_delivery_segment_count} segment'
+            f'{"" if rec.fast_delivery_segment_count == 1 else "s"} delivered video faster '
+            f'than real time ({fast_secs} of the file) - kept, but worth checking before '
+            f'you watch.')
     # Distinct channels this recording's segments actually used - free to compute, rec.segments
     # is already loaded/iterated above for data_segs/stalls. >1 means a channel-group recording
     # had to change channels at least once (same-account restart never changes channel_id).
@@ -761,6 +828,16 @@ def _index_row(rec, now, tz, thumb_ids):
         health = {'cls': 'warn', 'label': f'⚠ {stalls}',
                   'tip': (f'{len(rec.segments)} segments · {stalls} stalls, recovered '
                           f'automatically.{downtime}{missing}{spanned}')}
+    elif rec.fast_delivery_segment_count:
+        # A frozen or looping feed writes bytes at full rate and keeps ffmpeg's frame counter
+        # moving, so it never stalls and never restarts - which meant this row read a green
+        # "clean capture" tick on the worst recording in the set. The pill carries no number
+        # because the number beside a ⚠ everywhere else on this page is a stall count, and
+        # this state has none (dev/changelog/966).
+        health = {'cls': 'warn', 'label': '⚠',
+                  'tip': (f'{len(rec.segments)} segment'
+                          f'{"s" if len(rec.segments) != 1 else ""} · 0 stalls, but the '
+                          f'capture was not clean.{missing}{spanned}')}
     else:
         health = {'cls': 'ok', 'label': '✓',
                   'tip': (f'{len(rec.segments)} segment{"s" if len(rec.segments) != 1 else ""} '
@@ -1033,10 +1110,27 @@ def recording_detail(recording_id):
     seg_offset = 1 if any(s.segment_number == 0 for s in rec.segments) else 0
     seg_stderr = _segment_stderr_tails(rec)
     seg_channels = _segment_channels(rec)
+    # Which rows get the "fast" badge, decided here by the same function the join uses, so
+    # the badge and the event that explains it cannot disagree about what counts. Config is
+    # read once for the page, never per row.
+    from ..concatenator import fast_delivery_findings, segment_wall_seconds
+    fast_delivery_segs = {
+        f.segment_number for f in fast_delivery_findings(
+            [(s.id, s.segment_number, s.content_duration_seconds, segment_wall_seconds(s))
+             for s in rec.segments],
+            load_config()['watchdog']['fast_delivery_surplus_seconds'])
+    }
     distinct_accounts = _distinct_accounts(rec, seg_channels)
     event_channel_links = group_event_channel_links(rec.events)
     video, audio, tech_source = _tech_parts(rec)
     row = _index_row(rec, now, get_display_tz(), {rec.id} if has_shot else set())
+    concat_prog, joinable_count = _join_strip_context(rec)
+    # None for every status but ANALYZING, and also for an ANALYZING row whose passes are
+    # done or have not started - the strip's generic wording covers that, per
+    # postprocessor.analysis_progress.
+    from ..postprocessor import analysis_progress
+    analysis_prog = (analysis_progress(rec.id)
+                     if rec.status == REC_STATUS_ANALYZING else None)
     conversion_max_attempts = load_config()['recording']['post_process'].get('max_restart_attempts', 3)
     max_dead_stream_retry_attempts = load_config()['watchdog'].get('dead_stream_max_retry_attempts', 10)
 
@@ -1047,8 +1141,11 @@ def recording_detail(recording_id):
         conversion_max_attempts=conversion_max_attempts,
         max_dead_stream_retry_attempts=max_dead_stream_retry_attempts,
         now=now,
+        concat_prog=concat_prog, joinable_count=joinable_count,
+        analysis_prog=analysis_prog,
         row=row, video=video, audio=audio, tech_source=tech_source, fmt=_format_profile(rec),
         seg_offset=seg_offset, seg_stderr=seg_stderr, seg_channels=seg_channels,
+        fast_delivery_segs=fast_delivery_segs,
         distinct_accounts=distinct_accounts,
         event_channel_links=event_channel_links,
         shot_mtime=shot_mtime, has_shot=has_shot,
@@ -1117,12 +1214,19 @@ def live_thumbnail(recording_id):
     return resp
 
 
-# Refusing is the honest answer for a CONCATENATING row: the concat ffmpeg is spawned
-# through a blocking subprocess.run and is reachable from no registry, so nothing here can
-# stop it, and it is the step that produces the final file. Marking the row ABORTED while
-# it keeps running is what this replaced (dev/changelog/667).
+# Refusing is the honest answer for a CONCATENATING row. The join is the step that produces
+# the final file, and it runs inside a blocking supervise_ffmpeg() call on the concat thread;
+# nothing registers its child, so no route holds a handle that could stop it. Marking the row
+# ABORTED while it keeps running is what this replaced (dev/changelog/667).
+#
+# The registries next door answer different questions and neither is a way in:
+# concatenator._active_concats says a chain owns this recording (so a second one cannot
+# start) and _concat_progress says how far the join has got (dev/changelog/959). Adding an
+# on_spawn hook would make the process reachable, and would still not make cancelling it
+# right here - the output is committed only on success, so a killed join leaves the segments
+# and no file, which is what Retry concatenation is for.
 CONCAT_CANCEL_REFUSED = (
-    "Concatenation is already running and can't be interrupted. It is the step that joins "
+    "The join is already running and can't be interrupted. It is the step that joins "
     'the captured segments into the final file; wait for it to finish, then delete the '
     "recording if you don't want it."
 )
@@ -1752,7 +1856,7 @@ def retry_concat(recording_id):
         return redirect(url_for('recordings.index'))
 
     if rec.status not in (REC_STATUS_FAILED, REC_STATUS_CONCATENATING):
-        flash('Concat retry is only available for FAILED or stuck CONCATENATING recordings.', 'error')
+        flash('Retrying the join is only available for FAILED or stuck JOINING recordings.', 'error')
         return redirect(url_for('recordings.recording_detail', recording_id=recording_id))
 
     # CONCATENATING is accepted above to rescue a row stranded by a crash, but the same
@@ -1760,15 +1864,15 @@ def retry_concat(recording_id):
     # the registry can tell them apart; without this a retry starts a second ffmpeg on the
     # same output_path and both delete the same segments (dev/changelog/668).
     if is_concat_active(recording_id):
-        flash('Concatenation is already running for this recording - it may be queued behind '
-              'another recording or concat. Retry is not needed.', 'error')
+        flash('The join is already running for this recording - it may be queued behind '
+              'another recording or join. Retry is not needed.', 'error')
         return redirect(url_for('recordings.recording_detail', recording_id=recording_id))
 
     segments = RecordingSegment.query.filter_by(recording_id=recording_id).all()
     valid = [s for s in segments
              if s.file_path and os.path.exists(s.file_path) and os.path.getsize(s.file_path) > 0]
     if not valid:
-        flash('No segment files found on disk - cannot retry concat.', 'error')
+        flash('No segment files found on disk - cannot retry the join.', 'error')
         return redirect(url_for('recordings.recording_detail', recording_id=recording_id))
 
     # Commit in its own closure; the thread launch stays outside so a lock-retry
@@ -1785,11 +1889,11 @@ def retry_concat(recording_id):
     threading.Thread(
         target=do_concatenation,
         args=(app_obj, recording_id),
-        kwargs={'reason': 'Manual retry of concatenation'},
+        kwargs={'reason': 'Manual retry of the join'},
         daemon=True,
     ).start()
 
-    flash(f'Concat retry started for "{rec.name}".', 'success')
+    flash(f'Join retry started for "{rec.name}".', 'success')
     return redirect(url_for('recordings.recording_detail', recording_id=recording_id))
 
 
@@ -1823,7 +1927,7 @@ def retry_convert(recording_id):
 
     ts_path = rec.output_path
     if not ts_path or not ts_path.endswith('.ts') or not os.path.exists(ts_path):
-        flash('No concatenated .ts source file found on disk - cannot retry conversion.', 'error')
+        flash('No joined .ts source file found on disk - cannot retry conversion.', 'error')
         return redirect(url_for('recordings.recording_detail', recording_id=recording_id))
 
     # ANALYZING, not CONVERTING: do_postprocess re-reads the whole .ts before it spawns any
@@ -1963,6 +2067,15 @@ def duration_filter(seconds, with_seconds=False):
 def filesize_filter(n):
     from ..fmt_utils import fmt_bytes
     return fmt_bytes(n)
+
+
+@recordings_bp.app_template_filter('rec_status_label')
+def rec_status_label_filter(status):
+    """What a human calls this Recording.status - JOINING for CONCATENATING, CANCELLED for
+    ABORTED, and so on. For any template that has a raw status rather than a row context
+    built by _index_row (the Dashboard's rows, the channel page's observations table).
+    Pure, so it is safe inside a `{% for %}` (CLAUDE.md, no hidden I/O)."""
+    return fmt_utils.rec_status_label(status)
 
 
 @recordings_bp.app_template_filter('mask_creds')

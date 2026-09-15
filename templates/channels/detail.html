@@ -962,7 +962,9 @@
             <tr>
               <td data-label="Completed" class="text-muted small">{{ r.completed_at | local_time if r.completed_at else '--' }}</td>
               <td data-label="Recording"><a href="{{ url_for('recordings.recording_detail', recording_id=r.id) }}">{{ r.name }}</a></td>
-              <td data-label="Status"><span class="badge badge-{{ r.status | lower }}">{{ r.status }}</span></td>
+              {#- Label, not the stored enum: this table said ABORTED where the Recordings
+                  list said CANCELLED for the same row (dev/changelog/961). -#}
+              <td data-label="Status"><span class="badge badge-{{ r.status | lower }}">{{ r.status | rec_status_label }}</span></td>
               <td data-label="Stalls">{{ r.total_stall_count or 0 }}</td>
               <td data-label="Restarts">{{ r.total_restart_count or 0 }}</td>
               <td data-label="Score" class="text-muted small">{{ r.health_quality_score }}</td>

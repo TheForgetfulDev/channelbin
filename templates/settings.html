@@ -295,7 +295,7 @@
       <button type="button" class="btn btn-sm" data-open-fd>Open the designer</button>
       {% endcall %}
       {{ field_bool('recording.post_process.enabled', 'Post-process (remux)',
-         'Losslessly remux the final .ts file to another container after concatenation. Near-zero CPU usage.',
+         'Losslessly remux the final .ts file to another container after the segments are joined. Near-zero CPU usage.',
          'true', pp.get('enabled', True)) }}
       {{ field_select('recording.post_process.format', 'Output format',
          'Container format for the remuxed file.',
@@ -308,7 +308,7 @@
          'How long a conversion may run without producing its first frame of output before it is treated as stuck. This is not a limit on the whole job: once output is advancing, a conversion runs for as long as it keeps advancing, however long that takes. Only the stall timeout below can end one that has started producing output.',
          '1800', pp.get('pre_output_timeout_seconds', 1800)) }}
       {{ field_select('recording.post_process.reencode_mode', 'Video re-encode (MP4 seek repair)',
-         'Stream drops during capture leave gaps in the video timeline that make fast-forward/rewind freeze in Plex when kept as a lossless copy. "Only when damaged" scans each recording after concatenation and re-encodes if damage is found, or if the stream came back at a different frame rate partway through and the file needs normalizing to one constant rate. Either way the reason is named in the recording event log, and they are kept apart there - a rate change is not damage. Clean recordings keep the fast lossless copy. Re-encoding is CPU-heavy and its speed depends entirely on the machine - a long recording on a slow box can take many hours, and is allowed to.',
+         'Stream drops during capture leave gaps in the video timeline that make fast-forward/rewind freeze in Plex when kept as a lossless copy. "Only when damaged" scans each recording after its segments are joined and re-encodes if damage is found, or if the stream came back at a different frame rate partway through and the file needs normalizing to one constant rate. Either way the reason is named in the recording event log, and they are kept apart there - a rate change is not damage. Clean recordings keep the fast lossless copy. Re-encoding is CPU-heavy and its speed depends entirely on the machine - a long recording on a slow box can take many hours, and is allowed to.',
          'damaged', pp.get('reencode_mode', 'damaged'),
          [('damaged','Only when damage detected (recommended)'), ('always','Always re-encode'), ('never','Never - always lossless copy')]) }}
       {{ field_number('recording.post_process.video_crf', 'Video quality (CRF)',
@@ -361,10 +361,10 @@
          'Absolute path to the script. Invoked with no arguments; working directory is set to the script\'s parent folder.',
          '(empty)', ps.get('path', '')) }}
       {{ field_bool('recording.gather_health_data', 'Gather recording health data',
-         'After concatenation, run ffprobe on the final .ts file to capture resolution, fps, frame count, and bitrate. Runs before any format conversion. Disable to save time on very long recordings.',
+         'After the segments are joined, run ffprobe on the final .ts file to capture resolution, fps, frame count, and bitrate. Runs before any format conversion. Disable to save time on very long recordings.',
          'true', rec.get('gather_health_data', True)) }}
       {{ field_bool('recording.serialize_concat', 'Serialize concatenation',
-         'Only run one concatenation+conversion job at a time, and none while any recording is IN_PROGRESS. A queued job waits (segments are already safely on disk) rather than failing. Local CPU/disk contention control - unrelated to per-account connection limits.',
+         'Only run one join+conversion job at a time, and none while any recording is IN_PROGRESS. A queued job waits (segments are already safely on disk) rather than failing. Local CPU/disk contention control - unrelated to per-account connection limits.',
          'false', rec.get('serialize_concat', False)) }}
       {{ field_bool('recording.live_thumbnail.enabled', 'Live thumbnail preview',
          'Show a periodically-refreshed frame from the current segment on the recording detail page while a recording is in progress.',
@@ -423,6 +423,9 @@
       {{ field_text('ffmpeg.ffprobe_path', 'ffprobe binary path',
          'Path to the ffprobe executable, used for every format and health measurement. Leave blank to follow ffmpeg: the ffprobe beside the path above, or system PATH. Set it only when the two live apart.',
          'follow ffmpeg', ff.get('ffprobe_path', '')) }}
+      {{ field_number('ffmpeg.read_timeout_seconds', 'Stream read timeout (seconds)',
+         'How long a single read off a stream may block before ffmpeg drops the connection and reconnects. Without one, a provider that stops sending but leaves the connection open blocks ffmpeg forever, so the watchdog has to kill it - which costs a restart delay, a new segment and a new connection for every stall, where ffmpeg could have reconnected inside the same segment. Keep it well below the watchdog stall timeout or it never gets to fire. It also bounds the very first read, so a provider slower than this to answer fails instead of waiting. 0 turns it off.',
+         '5', ff.get('read_timeout_seconds', 5)) }}
       {{ field_list('ffmpeg.extra_input_args', 'Extra input arguments',
          'Extra ffmpeg arguments inserted before -i, one per line. E.g. -timeout on its own line, then 5000000 on the next.',
          '(empty)', ff.get('extra_input_args', [])) }}
@@ -786,7 +789,7 @@
      'hay': 'backup restore rollback diff config.yaml support bundle diagnostic zip snapshot maintenance',
      'btn': 'Open Maintenance', 'href': url_for('system.maintenance')},
     {'id': 'service', 'kind': 'Page', 'name': 'Service control',
-     'desc': 'Restart the ChannelBin service. Refuses while a capture, concatenation or conversion is running.',
+     'desc': 'Restart the ChannelBin service. Refuses while a capture, join or conversion is running.',
      'hay': 'service restart reboot stop start systemd restart.sh maintenance',
      'btn': 'Open Maintenance', 'href': url_for('system.maintenance')},
     {'id': 'index', 'kind': 'Page', 'name': 'Search index',

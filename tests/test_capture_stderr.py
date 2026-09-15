@@ -146,7 +146,7 @@ class SpoolLifecycleTests(unittest.TestCase):
         self.state.stderr_path, self.state.stderr_fh = path, fh
         self.state.process = _spawn_writing('Connection reset by peer\n', 3, fh)
 
-        code, tail = recorder.collect_segment_diagnostics(self.rec.id)
+        code, tail, _, _missing = recorder.collect_segment_diagnostics(self.rec.id)
         self.assertEqual(code, 3)
         self.assertIn('Connection reset by peer', tail)
 
@@ -170,7 +170,8 @@ class SpoolLifecycleTests(unittest.TestCase):
         self.state.process = _spawn_writing('once\n', 1, fh)
 
         self.assertEqual(recorder.collect_segment_diagnostics(self.rec.id)[0], 1)
-        self.assertEqual(recorder.collect_segment_diagnostics(self.rec.id), (1, ''))
+        self.assertEqual(recorder.collect_segment_diagnostics(self.rec.id),
+                         (1, '', (0, True), False))
 
     def test_credentials_in_the_tail_are_masked(self):
         """ffmpeg echoes its input URL on error, and a provider stream URL carries the
@@ -187,7 +188,7 @@ class SpoolLifecycleTests(unittest.TestCase):
         fh.flush()
         self.state.process = _spawn_writing('', 1, subprocess.DEVNULL)
 
-        _, tail = recorder.collect_segment_diagnostics(self.rec.id)
+        _, tail, _reconnects, _missing = recorder.collect_segment_diagnostics(self.rec.id)
         self.assertNotIn('s3cr3tpass', tail)
         self.assertIn('403', tail)
 
@@ -202,18 +203,61 @@ class SpoolLifecycleTests(unittest.TestCase):
         proc.kill()
         proc.wait(timeout=30)
 
-        code, _ = recorder.collect_segment_diagnostics(self.rec.id)
+        code, _, _reconnects, _missing = recorder.collect_segment_diagnostics(self.rec.id)
         self.assertEqual(code, -9)
 
     def test_collect_without_live_state_is_a_no_op(self):
         with recorder._lock:
             recorder._active.pop(self.rec.id, None)
-        self.assertEqual(recorder.collect_segment_diagnostics(self.rec.id), (None, ''))
+        self.assertEqual(recorder.collect_segment_diagnostics(self.rec.id),
+                         (None, '', (0, True), False))
 
+    def test_a_deleted_spool_is_reported_as_missing_not_as_silence(self):
+        """dev/docs/BUGS.md 2026-09-14 @ 10:42 - read_stderr_tail returns '' both when
+        ffmpeg said nothing and when its spool was destroyed, so the two were
+        indistinguishable and the destroyed case produced no event at all."""
+        path, fh = self._spool()
+        self.state.stderr_path, self.state.stderr_fh = path, fh
+        self.state.process = _spawn_writing('a lot of context\n', 0, fh)
+        os.unlink(path)  # what a second app build's sweep did to a live capture
+
+        code, tail, reconnects, spool_missing = recorder.collect_segment_diagnostics(self.rec.id)
+        self.assertTrue(spool_missing)
+        self.assertEqual(code, 0)
+        self.assertEqual(tail, '')
+        self.assertEqual(reconnects, (0, True))
+
+    def test_a_present_but_empty_spool_is_not_reported_as_missing(self):
+        """The two states this separates are only useful if silence still reads as silence."""
+        path, fh = self._spool()
+        self.state.stderr_path, self.state.stderr_fh = path, fh
+        self.state.process = _spawn_writing('', 0, fh)
+
+        _code, tail, _reconnects, spool_missing = recorder.collect_segment_diagnostics(self.rec.id)
+        self.assertFalse(spool_missing)
+        self.assertEqual(tail, '')
 
 
 class StartupSweepTests(unittest.TestCase):
-    """Builds a second app, so it pushes no context of its own - make_test_app pushes one."""
+    """Builds a second app, so it pushes no context of its own - make_test_app pushes one.
+
+    start_scheduler=True throughout, deliberately: since dev/changelog/967 the sweep runs
+    from init_scheduler() behind the singleton pidfile claim, because a process that does
+    not own startup recovery has no business deleting spools it cannot tell apart from a
+    live capture's.
+    """
+
+    def _dir(self):
+        log_dir = tempfile.mkdtemp(prefix='dvr_test_caplog_')
+        self.addCleanup(shutil.rmtree, log_dir, True)
+        return log_dir
+
+    @staticmethod
+    def _spool_in(log_dir, name='.cap-stderr-999-1-deadbeef.log'):
+        path = os.path.join(log_dir, name)
+        with open(path, 'wb') as fh:
+            fh.write(b'left over from a killed process')
+        return path
 
     def test_startup_sweep_removes_orphaned_spools(self):
         """kill_all_active() runs in a signal handler and deliberately does no cleanup, so a
@@ -222,28 +266,47 @@ class StartupSweepTests(unittest.TestCase):
 
         The dir is standalone rather than a previous TestApp's, whose cleanup() rmtrees it.
         """
-        log_dir = tempfile.mkdtemp(prefix='dvr_test_caplog_')
-        self.addCleanup(shutil.rmtree, log_dir, True)
-        orphan = os.path.join(log_dir, '.cap-stderr-999-1-deadbeef.log')
-        with open(orphan, 'wb') as fh:
-            fh.write(b'left over from a killed process')
+        log_dir = self._dir()
+        orphan = self._spool_in(log_dir)
+
+        t = make_test_app(extra_overrides={'recording': {'capture_log_dir': log_dir}},
+                          start_scheduler=True)
+        self.addCleanup(t.cleanup)
+        self.assertFalse(os.path.exists(orphan))
+
+    def test_an_app_that_owns_no_startup_recovery_sweeps_nothing(self):
+        """dev/docs/BUGS.md 2026-09-14 @ 10:42 - the defect itself. Building an app object
+        against the real config (an ad-hoc read-only check while the service is up) deleted
+        the running recording's spool, and that segment lost its diagnostics for good."""
+        log_dir = self._dir()
+        live = self._spool_in(log_dir, '.cap-stderr-18-1-abcd1234.log')
 
         t = make_test_app(extra_overrides={'recording': {'capture_log_dir': log_dir}})
         self.addCleanup(t.cleanup)
-        self.assertFalse(os.path.exists(orphan))
+        self.assertTrue(os.path.exists(live))
 
     def test_sweep_leaves_unrelated_files_alone(self):
         """The glob is anchored on the .cap-stderr- prefix: capture_log_dir is a
         user-configurable path and may not be exclusively ours."""
-        log_dir = tempfile.mkdtemp(prefix='dvr_test_caplog_')
-        self.addCleanup(shutil.rmtree, log_dir, True)
+        log_dir = self._dir()
         keep = os.path.join(log_dir, 'notes.txt')
         with open(keep, 'wb') as fh:
             fh.write(b'not mine')
 
-        t = make_test_app(extra_overrides={'recording': {'capture_log_dir': log_dir}})
+        t = make_test_app(extra_overrides={'recording': {'capture_log_dir': log_dir}},
+                          start_scheduler=True)
         self.addCleanup(t.cleanup)
         self.assertTrue(os.path.exists(keep))
+
+    def test_the_sweep_runs_before_anything_resumes(self):
+        """Ordering, not merely placement: resume_in_progress_recordings() opens the very
+        spools this deletes by directory listing, so a sweep after it would destroy the
+        spool of the segment it just launched."""
+        import inspect
+        from app import scheduler as sched
+        src = inspect.getsource(sched.init_scheduler)
+        self.assertLess(src.index('sweep_stale_stderr_spools(app)'),
+                        src.index('resume_in_progress_recordings(app)'))
 
 
 class RecordDiagnosticsTests(unittest.TestCase):
@@ -332,6 +395,36 @@ class RecordDiagnosticsTests(unittest.TestCase):
         db.session.commit()
         self.assertEqual(len(self._events()), 1)
         self.assertIsNone(self._events()[0].segment_number)
+
+    def _record_missing(self, code):
+        recorder.record_segment_diagnostics(self.rec.id, self.seg, code, '', (0, True),
+                                            spool_missing=True)
+        db.session.commit()
+
+    def test_a_lost_spool_emits_even_on_an_uninformative_signal_exit(self):
+        """dev/docs/BUGS.md 2026-09-14 @ 10:42 - recording 18's segment 1 (46 minutes,
+        exit -9) fell into the quiet branch and left the one segment worth explaining with
+        nothing on its timeline at all."""
+        self._record_missing(-9)
+        self.assertEqual(len(self._events()), 1)
+
+    def test_a_lost_spool_says_so_in_the_detail(self):
+        """Principle 1: the user is told the output was destroyed, not left to infer it
+        from an absence."""
+        self._record_missing(-9)
+        detail = self._events()[0].detail
+        self.assertIn('ffmpeg killed by signal 9', detail)
+        self.assertIn('not captured', detail)
+
+    def test_a_lost_spool_adds_no_extra_payload(self):
+        """There is no tail to carry, so extra_data stays the bare kind marker."""
+        self._record_missing(-9)
+        extra = json.loads(self._events()[0].extra_data)
+        self.assertEqual(set(extra), {'kind'})
+
+    def test_a_present_spool_never_mentions_a_missing_one(self):
+        self._record(-15, 'http error 502 from upstream')
+        self.assertNotIn('not captured', self._events()[0].detail)
 
 
 class CloseActiveSegmentTests(unittest.TestCase):

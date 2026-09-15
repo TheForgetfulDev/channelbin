@@ -180,6 +180,10 @@ def api_settings_field():
         # switch (a 0 would kill every join on its first poll), the stall budget is.
         'ffmpeg.concat_pre_output_timeout_seconds': (1, None),
         'ffmpeg.concat_stall_seconds': (0, None),
+        # 0 disables the read timeout entirely; a negative one would be emitted as a
+        # negative microsecond count, which ffmpeg reads as "no timeout" on some builds
+        # and rejects on others.
+        'ffmpeg.read_timeout_seconds': (0, None),
         'recording.post_process.progress_interval_seconds': (1, 60),
         'recording.post_process.video_crf': (0, 51),
         'recording.post_process.audio_bitrate_kbps': (32, 320),
@@ -313,6 +317,15 @@ def api_settings_field():
     if any(p in TOOLCHAIN_CONFIG_KEYS for p, _, _ in changed):
         from ..toolchain import report_tool_state
         report_tool_state(source='settings')
+
+    # Either of the two numbers can make the read timeout inert, so both are watched - a
+    # stall timeout lowered past a perfectly good read timeout is the same misconfiguration
+    # as a read timeout raised past the stall timeout, and only one of them is on the ffmpeg
+    # card. Re-read rather than reusing `cfg`, which was snapshotted before this save.
+    if any(p in ('ffmpeg.read_timeout_seconds', 'watchdog.stall_timeout_seconds')
+           for p, _, _ in changed):
+        from ..proc_utils import report_read_timeout_state
+        report_read_timeout_state(load_config(), source='settings')
 
     # Changing the global sync interval immediately reschedules all Default accounts
     if path == 'sync.sync_interval_hours':

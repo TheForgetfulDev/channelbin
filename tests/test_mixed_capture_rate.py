@@ -7,9 +7,10 @@ watchdog already stored on `recording_segments` - the app knew all four of recor
 off-rate segments had changed rate (each logged RECORDING_FORMAT_CHANGED) and the scan was
 dividing by the header rate anyway.
 
-These tests cover the reading and the labelling: which rows contribute a rate, and that a
-rate change reaches the recording's event log under its own name rather than as damage.
-The math itself is tested in tests/test_seek_damage.py.
+These tests cover the reading, the weighting and the labelling: which rows contribute a rate,
+what weight each one carries (dev/docs/BUGS.md 2026-09-14 "The mixed-frame-rate deficit weights
+segments by wall clock"), and that a rate change reaches the recording's event log under its
+own name rather than as damage. The math itself is tested in tests/test_seek_damage.py.
 """
 import json
 import os
@@ -34,6 +35,7 @@ from app.database import (  # noqa: E402
 from app.postprocessor import (  # noqa: E402
     ConversionResult, _scan_recording_timeline, _segment_capture_rates, do_postprocess,
 )
+from app.probe import effective_capture_fps  # noqa: E402
 from tests.support import seed  # noqa: E402
 from tests.support.app import make_test_app  # noqa: E402
 
@@ -93,16 +95,21 @@ class _MixedRateFixture:
         self.t.cleanup()
 
     def _segments(self, *specs):
-        """specs are (seconds, bytes_recorded, probe_fps) per segment."""
+        """specs are (seconds, bytes_recorded, probe_fps) per segment, or a 4-tuple adding
+        the measured content_duration_seconds. The 3-tuple form leaves that column NULL,
+        which is what a segment the content-duration probe could not read looks like."""
         start = datetime.utcnow()
         offset = 0
-        for i, (seconds, n, fps) in enumerate(specs):
+        for i, spec in enumerate(specs):
+            seconds, n, fps = spec[:3]
+            content = spec[3] if len(spec) > 3 else None
             db.session.add(RecordingSegment(
                 recording_id=self.rid, segment_number=i,
                 file_path=os.path.join(self.dvr_dir, f'seg_{i:03d}.ts'),
                 started_at=start + timedelta(seconds=offset),
                 ended_at=start + timedelta(seconds=offset + seconds),
-                exit_reason='STALL_KILLED', bytes_recorded=n, probe_fps=fps))
+                exit_reason='STALL_KILLED', bytes_recorded=n, probe_fps=fps,
+                content_duration_seconds=content))
             offset += seconds
         db.session.commit()
 
@@ -148,6 +155,51 @@ class SegmentCaptureRateTests(_MixedRateFixture, unittest.TestCase):
         self._segments((20, 4096, 60.0), (20, 4096, None))
 
         self.assertEqual(_segment_capture_rates(self.rid), [(20.0, 60.0)])
+
+    # ── what weights the rates (dev/docs/BUGS.md 2026-09-14 "wall clock") ──────
+    def test_the_weight_is_the_content_the_segment_holds_not_how_long_it_took(self):
+        """The deficit counts frames against content time, so a stretch that arrived faster
+        than real time still has to weigh the frames it holds. 600s of 30 fps video that
+        arrived in 5s weighed 5 against the rest of the recording and contributed 18,000
+        frames anyway, and the shortfall was reported as missing video."""
+        self._segments((20, 4096, 60.0, 20.0), (5, 8192, 30.0, 600.0))
+
+        self.assertEqual(sorted(_segment_capture_rates(self.rid)),
+                         [(20.0, 60.0), (600.0, 30.0)])
+
+    def test_a_segment_with_no_measured_content_falls_back_to_its_wall_clock(self):
+        """NULL means the content-duration probe could not read the file - which is also
+        every segment captured before migration 56. The wall span is wrong by a start-up
+        second or two on a normal feed, which is what this function shipped with; dropping
+        the row instead would discard a rate that really is in the file."""
+        self._segments((20, 4096, 60.0, None), (30, 8192, 15.0, 30.0))
+
+        self.assertEqual(sorted(_segment_capture_rates(self.rid)),
+                         [(20.0, 60.0), (30.0, 15.0)])
+
+    def test_a_zero_content_duration_falls_back_rather_than_weighing_nothing(self):
+        """A stored 0 cannot be a measurement - nothing is joined from a segment holding no
+        content - so it is read as unmeasured, not as a segment that weighs nothing. Left as
+        a 0 weight the row would vanish from the blend while its frames stayed in the file."""
+        self._segments((20, 4096, 60.0, 0.0))
+
+        self.assertEqual(_segment_capture_rates(self.rid), [(20.0, 60.0)])
+
+    def test_the_recording_17_shape_blends_to_54_fps_and_not_to_59_87(self):
+        """The measured case, at the numbers it actually ran at: recording 17's nineteen
+        59.94 fps segments held 14,611.5s of content across 14,252.4s of wall clock, and its
+        six placeholder segments held 3,600.3s across 33.1s. Weighted by content the blend is
+        54.02 fps and the deficit is 23.9s of a 18,211.8s timeline - OK. Weighted by wall
+        clock it is 59.87 fps and the deficit is 1,800.9s - DAMAGED, and an 8.1 GB full
+        re-encode on a file with nothing wrong with its timeline (dev/changelog/962)."""
+        specs = [(14252, 4 * 1024 ** 3, 59.94, 14611.5)]
+        specs += [(5, 14472616, 30.0, 600.046444)] * 6
+        self._segments(*specs)
+
+        effective, distinct = effective_capture_fps(_segment_capture_rates(self.rid))
+        self.assertAlmostEqual(effective, 54.02, places=1)
+        self.assertEqual(distinct, [30.0, 59.94],
+                         'both rates must still be reported - the blend is not the finding')
 
     # ── what the scan does with them ──────────────────────────────────────────
     def test_a_rate_change_is_not_written_as_timeline_damage(self):

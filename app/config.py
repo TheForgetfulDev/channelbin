@@ -289,6 +289,66 @@ _DEFAULTS = {
         # first fires at +24.2 min and 3-in-10 not until +65.0 (dev/changelog/889).
         'stall_move_count': 3,
         'stall_move_window_minutes': 30,
+        # Provider placeholder detection: a segment holding more than this many seconds of
+        # content per second of wall clock, which ALSO ended on a clean EOF (ffmpeg exited 0
+        # by itself), is the provider's finite "channel offline" clip rather than the
+        # channel, and is discarded instead of joined into the final file.
+        #
+        # Detection is the ratio and never the byte count - a different provider's clip is a
+        # different size, and the app must not be tuned to one of them. Measured on the
+        # recordings that prompted this: real placeholders ran 86x-150x; the worst legitimate
+        # short segment is a 13-29s buffer replay, which on a 5s segment is about 6x; the
+        # fastest sustained real delivery ever seen is 3.76x. The clean-EOF condition is
+        # load-bearing rather than decoration - a live feed never ends in EOF at 0 - because
+        # the ratio alone would misfire on a short buffer-replay segment (dev/changelog/957).
+        # 0 disables the detector entirely.
+        'placeholder_content_ratio': 10,
+        # Frozen/looping feed detection: a provider that re-serves the same few seconds
+        # forever still writes bytes at full rate and still advances ffmpeg's frame
+        # counter, so nothing above sees it. The signal that does is content time per
+        # second of wall clock, sustained - a feed delivering faster than real time for
+        # this long is not a feed (dev/changelog/964).
+        #
+        # The gap the thresholds sit in was measured, not chosen: real segments of 60s or
+        # longer ran a median 1.03x and a maximum 1.29x, while the frozen feed ran 3.76x
+        # for 2h18m. The WINDOW is what makes 1.5x safe, and it is why the window is not
+        # shorter: the per-connect back-buffer is a fixed 13-29s of content, so it is a
+        # CONSTANT rather than a rate and its ratio decays as the window lengthens. The
+        # worst measured one reads 1.48x across 60s - two hundredths under the trigger -
+        # and 1.24x across 120s. Seconds of WALL CLOCK here, not of content.
+        #
+        # Only meaningful while -re is off, which is what an unbounded capture gets today.
+        # Set recording.segment_duration_seconds and ffmpeg paces at 1x, a fast provider
+        # just fills a socket buffer, and this detector goes blind. 0 disables it.
+        'fast_delivery_ratio': 1.5,
+        'fast_delivery_window_seconds': 120,
+        # Strikes on one member before the recording moves off it - the same "retry a few
+        # times, then move on" the other trip-wires use, because a frozen feed has a
+        # decent chance of resuming on a reconnect. 0 moves on at the first detection.
+        'fast_delivery_strike_count': 3,
+        # The post-capture half of the same question, and the one knob here the watchdog
+        # does not read: app/concatenator.py applies it to each finished segment just
+        # before the join, to FLAG a recording whose video arrived faster than the clock
+        # without stopping anything. A segment under the live thresholds above is not
+        # proven bad - it is only unexplained - so it is kept, labelled, and left for a
+        # human to judge before they sit down to watch it (dev/changelog/966).
+        #
+        # SURPLUS SECONDS, not a ratio, and the shape is the measurement rather than a
+        # preference. The per-connect back-buffer is a fixed 13-29s of content, so it is a
+        # CONSTANT: a constant threshold separates it at every segment length, while a
+        # ratio's sensitivity drifts with length in both directions at once. Measured over
+        # every segment in this app's database carrying a content duration, the worst
+        # honest surplus is +40.1s (on a 47-minute segment reading 1.01x) and nothing sits
+        # between there and the placeholder clips at +594s; meanwhile two ordinary 15s
+        # back-buffer segments read 2.43x and 1.60x, and an 8-hour segment running 10%
+        # fast would be +48 minutes of suspect video at only 1.10x. 120 is three times
+        # clear of the worst honest case and needs no minimum-length gate to stay there.
+        #
+        # Raise it if in-process reconnects make it noisy: since dev/changelog/958 a
+        # segment survives a silent socket without ending, so one long segment can collect
+        # several back-buffers where it used to collect one. Its own DIAGNOSTICS detail
+        # reports how many times it reconnected. 0 disables the flag.
+        'fast_delivery_surplus_seconds': 120,
     },
     'ffmpeg': {
         'path': 'ffmpeg',
@@ -298,6 +358,16 @@ _DEFAULTS = {
         'ffprobe_path': '',
         'extra_input_args': [],
         'extra_output_args': [],
+        # Seconds any single read off an http(s) stream may block before ffmpeg gives up on
+        # the connection and reconnects. Without it a provider that stops sending but leaves
+        # the socket open blocks ffmpeg's read forever, which costs a SIGKILL and a whole new
+        # segment for every stall - see the comment at the flag in proc_utils.build_capture_cmd
+        # for what was measured (dev/changelog/958). 0 disables it.
+        #
+        # Keep it comfortably BELOW watchdog.stall_timeout_seconds or it is inert: the
+        # watchdog kills the process at that point regardless, so a read timeout at or above
+        # it never gets to fire. report_read_timeout_state() says so at startup and on save.
+        'read_timeout_seconds': 5,
         # The concat joins however many bytes the capture produced, so its size is not
         # knowable in advance and no whole-job deadline can be honest about it - the fixed
         # budget these replaced killed a 42.6 GB join at roughly the halfway mark while it
@@ -598,6 +668,12 @@ _DEFAULTS = {
         'bitrate_fail_720p_kbps': 1000,         # fail if height ≤720 and bitrate ≤ this (kbps)
         'bitrate_fail_1080p_kbps': 2000,        # fail if 720 < height ≤1080 and bitrate ≤ this (kbps)
         'bitrate_fail_4k_kbps': 3000,           # fail if height >1080 and bitrate ≤ this (kbps)
+        # After the capture closes, ffprobe the stream URL once and fail the channel when it
+        # declares a finite container duration - a live stream has no end, so a duration at
+        # all means the provider answered with a fixed clip rather than the channel. Costs
+        # one short extra probe per connected test (1.6-2.8s measured) and names a failure
+        # the bitrate rule below only ever caught by side effect.
+        'placeholder_source_check': True,
         # Lifetime channel health score (app/health_score.py) - undertuned defaults,
         # expect to retune once more real test/recording data accumulates.
         'health_score_half_life_samples': 5,        # score decay half-life, in observations (not days)

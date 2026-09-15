@@ -2,6 +2,74 @@
 for Python-side display formatting (the JS equivalents live in static/js/util.js).
 Keep fmt_bytes' output in sync with util.js fmtBytes where they surface side by side."""
 
+from .database import (
+    REC_STATUS_SCHEDULED, REC_STATUS_IN_PROGRESS, REC_STATUS_PAUSED, REC_STATUS_RETRYING,
+    REC_STATUS_CONCATENATING, REC_STATUS_ANALYZING, REC_STATUS_CONVERTING,
+    REC_STATUS_COMPLETED, REC_STATUS_FAILED, REC_STATUS_ABORTED,
+)
+
+
+# ── Recording status vocabulary (dev/changelog/961) ─────────────────────────
+# Every Recording.status, explicitly (no fallthrough rendering - an unknown status still
+# renders visibly via rec_status_display's default, never lands in a real state's branch):
+# (section, row edge class, badge class, badge label, pulse).
+#
+# The LABEL is the half that makes this shared rather than a recordings-list detail. A
+# status is stored under one name and shown under another - CONCATENATING is shown as
+# JOINING, ABORTED as CANCELLED - so a surface that renders the stored value prints a word
+# no other page uses for that state. That was live on the Dashboard and the channel page
+# for as long as the rename existed (dev/changelog/867 relabeled the badge but reached only
+# two of four surfaces), and it is the reason this table is here and not in a route module.
+#
+# Three post-capture phases, each naming its own. CONCATENATING used to read "PROCESSING",
+# which was tolerable while it was the only one; next to a second phase that is also
+# processing it says nothing (dev/changelog/867).
+REC_STATUS_DISPLAY = {
+    REC_STATUS_SCHEDULED:     ('sched', 'st-sched',  'b-sched',  'SCHEDULED',     False),
+    REC_STATUS_IN_PROGRESS:   ('live',  'st-live',   'b-live',   'RECORDING',     True),
+    REC_STATUS_PAUSED:        ('live',  'st-paused', 'b-paused', 'PAUSED',        False),
+    REC_STATUS_RETRYING:      ('live',  'st-retry',  'b-retry',  'RETRYING',      False),
+    REC_STATUS_CONCATENATING: ('live',  'st-concat', 'b-concat', 'JOINING',       True),
+    REC_STATUS_ANALYZING:     ('live',  'st-concat', 'b-concat', 'ANALYZING',     True),
+    REC_STATUS_CONVERTING:    ('live',  'st-concat', 'b-concat', 'CONVERTING',    True),
+    REC_STATUS_COMPLETED:     ('done',  'st-done',   'b-done',   'COMPLETED',     False),
+    REC_STATUS_FAILED:        ('done',  'st-fail',   'b-fail',   'FAILED',        False),
+    REC_STATUS_ABORTED:       ('done',  'st-abort',  'b-abort',  'CANCELLED',     False),
+}
+
+# The two statuses in which a recording can be parked waiting for another one to give up
+# the machine. Narrower than "any post-capture phase" on purpose: a join is never parked.
+_WAITABLE_STATUSES = (REC_STATUS_ANALYZING, REC_STATUS_CONVERTING)
+
+
+def rec_status_display(status, waiting=False):
+    """(section, edge class, badge class, badge label, pulse) for one Recording.status.
+
+    Pure - a dict lookup and a comparison, so it is safe inside a per-row loop and inside a
+    Jinja `{% for %}` (CLAUDE.md, no hidden I/O).
+
+    `waiting` is `Recording.postprocess_waiting_since` made boolean. A parked post-processing
+    chain badges as WAITING and stops pulsing. That is a display derivation from two stored
+    facts, NOT a status: Recording.status stays ANALYZING or CONVERTING because the startup
+    sweep, the collision query and the cancel route all branch on it, and a row that fell out
+    of those would be stranded by the next restart rather than resumed (dev/changelog/954).
+    It lives here so the Recordings list, the Dashboard row and the Dashboard's own
+    background-task chip cannot name the same parked row three different ways.
+    """
+    row = REC_STATUS_DISPLAY.get(status)
+    if row is None:
+        return ('done', 'st-abort', 'b-abort', status, False)
+    if waiting and status in _WAITABLE_STATUSES:
+        section, st_class, badge_class, _label, _pulse = row
+        return (section, st_class, badge_class, 'WAITING', False)
+    return row
+
+
+def rec_status_label(status):
+    """Just the badge label - what a human calls this status. Unknown in, unknown out, so an
+    unrecognized value is shown rather than swallowed."""
+    return rec_status_display(status)[3]
+
 
 # ── Stream quality profile vocabulary (dev/changelog/351) ───────────────────
 # Three surfaces render the same seven measurements: the recording detail page

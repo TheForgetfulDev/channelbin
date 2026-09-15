@@ -6,6 +6,7 @@ import shutil
 import subprocess
 import threading
 import time
+from contextlib import contextmanager
 from datetime import datetime
 
 from .db_utils import retry_on_locked
@@ -40,6 +41,124 @@ def has_active_conversion() -> bool:
     whether a freshly-due recording must wait for local resources to free up."""
     with _active_lock:
         return bool(_active_conversions)
+
+
+# ── Live post-capture analysis progress ───────────────────────────────────────
+# recording_id -> which whole-file read is running and how far through it is, for the
+# surfaces that report the ANALYZING phase while it runs. Same shape and the same reasoning
+# as concatenator._concat_progress (dev/changelog/959): in memory rather than on the row,
+# because an interrupted analysis re-runs from the top rather than resuming, so a stored
+# number could only ever describe an attempt that no longer exists.
+#
+# Absent means "no pass is reading right now", which is a real state with its own wording
+# and not a 0%: an ANALYZING row can be parked behind another recording, or between passes.
+_analysis_progress: dict = {}
+_analysis_progress_lock = threading.Lock()
+
+# The passes are named for what they answer, not for the function that runs them - this is
+# the text a user reads while waiting on one.
+ANALYSIS_PASS_HEALTH = 'capture health'
+ANALYSIS_PASS_TIMELINE = 'damage scan'
+
+
+def analysis_pass_plan(cfg, pp) -> list:
+    """The whole-file reads this recording's ANALYZING phase will actually run, in order.
+
+    "Pass 1 of 2" is a promise, so the denominator is derived from the same two settings the
+    phase branches on rather than hardcoded: with gather_health_data off there is no health
+    pass, and the damage scan then runs only because the re-encode decision needs it - which
+    requires mp4 output and reencode_mode 'damaged' (do_postprocess's own conditions, kept
+    in step with them). A plan of zero passes is the honest answer for a configuration whose
+    analysis reads nothing, and the surfaces show no progress rather than an empty bar.
+    """
+    if cfg['recording'].get('gather_health_data', True):
+        return [ANALYSIS_PASS_HEALTH, ANALYSIS_PASS_TIMELINE]
+    if (pp.get('enabled') and pp.get('format', 'mp4').lower().lstrip('.') == 'mp4'
+            and pp.get('reencode_mode', 'damaged') == 'damaged'):
+        return [ANALYSIS_PASS_TIMELINE]
+    return []
+
+
+def _start_analysis_pass(recording_id: int, label: str, plan: list, total_bytes: int):
+    """Seed (or re-seed) the entry as a pass begins, so the strip names the pass from the
+    moment it starts rather than staying blank until the first sample arrives.
+
+    Every pass reads the same joined file, so one size serves all of them; percent is per
+    pass, which is what makes "pass 2 of 2, 43%" mean something a reader can act on - a
+    blended figure across passes of unequal cost would move at a rate nothing explains.
+    """
+    number = (plan.index(label) + 1) if label in plan else 1
+    with _analysis_progress_lock:
+        _analysis_progress[recording_id] = {
+            'pass_label': label, 'pass_number': number, 'of_passes': max(len(plan), number),
+            'pct': None, 'bytes': 0, 'total_bytes': total_bytes,
+            'started': time.monotonic(),
+        }
+
+
+def _publish_analysis_progress(recording_id: int, read_bytes: int):
+    """One sample. Clamped at 99 because the counter is bytes the process has read, not
+    bytes of the file: ffprobe seeks and re-reads, so it can pass the file's size before it
+    is done, and a bar that sits at 100% through the rest of a pass is the thing this
+    replaced."""
+    with _analysis_progress_lock:
+        entry = _analysis_progress.get(recording_id)
+        if entry is None:
+            return
+        total = entry['total_bytes']
+        entry['bytes'] = read_bytes
+        entry['pct'] = min(99.0, read_bytes / total * 100.0) if total > 0 else None
+
+
+def _clear_analysis_progress(recording_id: int):
+    with _analysis_progress_lock:
+        _analysis_progress.pop(recording_id, None)
+
+
+def analysis_progress(recording_id: int):
+    """Which analysis pass is reading this recording's file and how far it has got, or None
+    when none is.
+
+    A plain dict lookup with no I/O of its own, so the recordings list can call it per row
+    (CLAUDE.md - no hidden I/O in per-row loops). Elapsed is derived here rather than
+    stored, so it is current at the moment it is read.
+    """
+    with _analysis_progress_lock:
+        entry = _analysis_progress.get(recording_id)
+        if entry is None:
+            return None
+        out = {k: v for k, v in entry.items() if not k.startswith('_')}
+    out['elapsed_seconds'] = max(0.0, time.monotonic() - out.pop('started'))
+    return out
+
+
+@contextmanager
+def _analysis_pass(recording_id: int, label: str, ts_path: str, plan):
+    """Publish one whole-file analysis read for as long as it is running, and yield the hook
+    that feeds it.
+
+    The entry is cleared in a `finally`, so a pass that raises leaves no progress behind
+    claiming to be running - and because each pass owns its own entry, the gap between two
+    passes reports as "nothing reading" rather than as a stalled percentage.
+
+    plan falsy (a caller outside the ANALYZING phase, or a configuration whose analysis
+    reads nothing) publishes nothing at all and yields None, which every probe treats as
+    "no progress hook".
+    """
+    if not plan:
+        yield None
+        return
+    try:
+        total = os.path.getsize(ts_path)
+    except OSError:
+        # Only the denominator is lost: the pass still runs and still names itself, and
+        # _publish_analysis_progress reports pct None rather than dividing by zero.
+        total = 0
+    _start_analysis_pass(recording_id, label, plan, total)
+    try:
+        yield lambda read_bytes: _publish_analysis_progress(recording_id, read_bytes)
+    finally:
+        _clear_analysis_progress(recording_id)
 
 
 def request_cancel_conversion(recording_id: int) -> bool:
@@ -1173,6 +1292,10 @@ def do_postprocess(app, recording_id: int, ts_path: str):
         cfg = load_config()
         pp = cfg['recording']['post_process']
         mv = cfg['recording']['move_on_complete']
+        # Resolved once, from the same settings the phase branches on below, so every pass
+        # reports the same denominator - a plan recomputed per pass could name "1 of 2" and
+        # then "1 of 1" on one recording.
+        analysis_plan = analysis_pass_plan(cfg, pp)
 
         rec = db.session.get(Recording, recording_id)
         if rec is None:
@@ -1281,7 +1404,8 @@ def do_postprocess(app, recording_id: int, ts_path: str):
             ev.publish(recording_id, POSTCAPTURE_ANALYSIS_STARTED, {'status': REC_STATUS_ANALYZING})
 
             # ── Recording health data (ffprobe on the .ts file) ───────────────
-            health_fields, health_diag = _gather_recording_health(recording_id, ts_path, rec, cfg)
+            health_fields, health_diag = _gather_recording_health(
+                recording_id, ts_path, rec, cfg, analysis_plan=analysis_plan)
             if health_fields or health_diag:
                 # One closure, one commit: add_recording_event inserts without committing, so
                 # the event joins the field write as a single unit of work rather than adding
@@ -1308,7 +1432,8 @@ def do_postprocess(app, recording_id: int, ts_path: str):
             timeline_scan = None
             analysis_finished_at = datetime.utcnow()
             if cfg['recording'].get('gather_health_data', True):
-                timeline_scan = _scan_recording_timeline(recording_id, ts_path)
+                timeline_scan = _scan_recording_timeline(recording_id, ts_path,
+                                                         analysis_plan=analysis_plan)
                 # Near-empty/slate detection (compute-only, no extra ffprobe) and the
                 # capture-quality score correction both depend on what the timeline scan just
                 # committed (timeline_deficit_seconds), so they run right after it, in order.
@@ -1336,7 +1461,7 @@ def do_postprocess(app, recording_id: int, ts_path: str):
 
         # ── Conversion ────────────────────────────────────────────────────────
         if _stop_if_cancelled('Post-processing stopped before conversion started - '
-                              'the concatenated .ts file was kept.'):
+                              'the joined .ts file was kept.'):
             return
 
         if pp.get('enabled'):
@@ -1441,7 +1566,8 @@ def do_postprocess(app, recording_id: int, ts_path: str):
                 # always run the scan regardless of gather_health_data, and it still must,
                 # or turning health data off would silently disable damage repair.
                 if timeline_scan is None:
-                    timeline_scan = _scan_recording_timeline(recording_id, ts_path)
+                    timeline_scan = _scan_recording_timeline(
+                        recording_id, ts_path, analysis_plan=analysis_plan)
                 damaged, _metrics, summary = timeline_scan
                 if damaged:
                     reencode = True
@@ -2369,11 +2495,11 @@ def do_postprocess(app, recording_id: int, ts_path: str):
 def _joined_segment_count(recording_id):
     """How many capture segments were fed to the concat that produced this recording's .ts.
 
-    Counted from rows that recorded bytes, which is the same test concatenator.py applies
-    when it picks its valid_segments (file present and non-empty) - and rows are all that
-    survives, because a successful concat deletes the segment files. Above 1 means the
-    timestamps were regenerated at every join, which is what blinds the timeline scan's
-    gap count (dev/changelog/433).
+    Counted from rows that recorded bytes and were not excluded, which is the same test
+    concatenator.joinable_segments() applies - and rows are all that survives, because a
+    successful concat deletes the segment files. Above 1 means the timestamps were
+    regenerated at every join, which is what blinds the timeline scan's gap count
+    (dev/changelog/433).
 
     Under-counting is the safe direction: it claims less blindness than there is, rather
     than explaining away a gap count that was in fact honest.
@@ -2382,43 +2508,62 @@ def _joined_segment_count(recording_id):
     return RecordingSegment.query.filter(
         RecordingSegment.recording_id == recording_id,
         RecordingSegment.bytes_recorded > 0,
+        RecordingSegment.excluded_reason.is_(None),
     ).count()
 
 
 def _segment_capture_rates(recording_id):
-    """[(duration_seconds, probe_fps), ...] for the segments that were joined - what
+    """[(content_seconds, probe_fps), ...] for the segments that were joined - what
     probe.assess_seek_damage() needs to measure the frame deficit against the rate the
     footage was actually captured at rather than the one in the concatenated file's header.
 
-    Same row test as _joined_segment_count (bytes recorded), plus the two fields the weight
-    needs. A segment with no probe_fps contributes nothing: the watchdog probes a segment
+    Same row test as _joined_segment_count (bytes recorded, not excluded), plus the two
+    fields the weight needs. A segment with no probe_fps contributes nothing: the watchdog probes a segment
     that is still growing and leaves a field it could not read NULL rather than guessing, and
     inventing a rate for it would put the corrected number back where the wrong one was.
 
-    Wall clock, not content duration - there is no per-segment content-duration column, so
-    this is an approximation, and worth being precise about which way it errs. A segment
-    whose wall clock exceeds the content it produced pulls the weighted rate toward its own
-    rate more than it should. On a LOWER-rate segment that drags the effective rate down and
-    shrinks the deficit, which could in principle mask loss. That is acceptable here because
-    it is not the deficit's job to catch gross loss: a dropout inside a segment is measured
-    by gap_seconds, which is rate-independent, and loss BETWEEN segments is invisible to this
-    scan either way and is reported as Capture gaps (dev/changelog/433, 942). What the deficit
-    uniquely catches is micro-gaps under the 0.25s gap threshold, and those barely move a
-    segment's wall-clock-to-content ratio at all. Weighting by wall clock is wrong by a
-    start-up second or two per segment; using one rate for the whole file was wrong by 1,200
-    seconds on the recording that prompted this (dev/changelog/866).
+    THE WEIGHT IS CONTENT DURATION, NOT WALL CLOCK, and the difference is not academic. The
+    deficit counts frames against content time, so the blended rate has to be the rate that
+    each of the file's own seconds was captured at - how long a segment took to arrive is a
+    fact about the network, not about the footage. The two diverge whenever a provider sends
+    faster than real time: a placeholder clip is 600s of 30 fps video that arrives in 5s, so
+    by wall clock it weighs 5 against a 59.94 fps recording's thousands and moves the blend
+    from 59.94 to 59.87 while contributing 18,000 frames at half that rate. Everything those
+    frames are short by is then reported as missing video. Measured on the two recordings
+    that prompted this: 1800.9s of "missing" video became 23.9s, and 2354.1s became 1.3s,
+    both flipping DAMAGED to OK and both having been sent into a full re-encode by the wrong
+    number (dev/changelog/962).
+
+    recording_segments.content_duration_seconds is the column (migration 56), filled by
+    concatenator._measure_segment_content_durations() from a header-only ffprobe of each
+    closed segment file immediately before the join - so it is already on the row by the time
+    the analysis phase asks, on the single-segment rename path as well as the concat.
+
+    The wall span is the fallback, for the one case the column cannot answer: a segment whose
+    file the probe could not read keeps its NULL, which honestly means "not measured", and
+    that includes every segment captured before migration 56 existed. Falling back is wrong
+    by a start-up second or two per segment on a normal feed, which is the error this function
+    shipped with and lived with (dev/changelog/866); it is only the fast-delivery case that
+    made it catastrophic, and a segment fast enough to matter is a segment the probe read.
     """
     from . import db
     from .database import RecordingSegment
     rows = db.session.query(
-        RecordingSegment.started_at, RecordingSegment.ended_at, RecordingSegment.probe_fps
+        RecordingSegment.started_at, RecordingSegment.ended_at, RecordingSegment.probe_fps,
+        RecordingSegment.content_duration_seconds,
     ).filter(
         RecordingSegment.recording_id == recording_id,
         RecordingSegment.bytes_recorded > 0,
+        RecordingSegment.excluded_reason.is_(None),
     ).all()
     rates = []
-    for started_at, ended_at, probe_fps in rows:
-        if not started_at or not ended_at or not probe_fps:
+    for started_at, ended_at, probe_fps, content_seconds in rows:
+        if not probe_fps:
+            continue
+        if content_seconds and content_seconds > 0:
+            rates.append((content_seconds, probe_fps))
+            continue
+        if not started_at or not ended_at:
             continue
         span = (ended_at - started_at).total_seconds()
         if span > 0:
@@ -2496,9 +2641,13 @@ def _recorded_timeline_scan(recording_id):
     return None
 
 
-def _scan_recording_timeline(recording_id, ts_path):
+def _scan_recording_timeline(recording_id, ts_path, analysis_plan=None):
     """Scan the concatenated .ts for timeline damage, persist what was measured, and
     return assess_seek_damage()'s (damaged, metrics, summary).
+
+    analysis_plan is analysis_pass_plan()'s list when this runs as part of the ANALYZING
+    phase, which is what makes the read publish its progress; omitted, the scan behaves
+    exactly as before and reports nothing.
 
     Emits a DIAGNOSTICS event on BOTH verdicts - a healthy recording saying "checked, 0
     gaps" is the point (dev/changelog/331); silence used to mean either "clean" or "never
@@ -2519,8 +2668,10 @@ def _scan_recording_timeline(recording_id, ts_path):
 
     # ffprobe is a non-idempotent side effect and stays OUTSIDE the retry closure below.
     joined = _joined_segment_count(recording_id)
-    damaged, metrics, summary = assess_seek_damage(
-        ts_path, joined_segments=joined, segment_rates=_segment_capture_rates(recording_id))
+    with _analysis_pass(recording_id, ANALYSIS_PASS_TIMELINE, ts_path, analysis_plan) as hook:
+        damaged, metrics, summary = assess_seek_damage(
+            ts_path, joined_segments=joined,
+            segment_rates=_segment_capture_rates(recording_id), on_progress=hook)
     log.info('Recording %d seek-damage scan: %s', recording_id, summary)
 
     # Columns get the five stats worth sorting/filtering/displaying on; extra_data carries the
@@ -2617,10 +2768,20 @@ def _detect_near_empty_segments(recording_id):
     # attribute mutation, so this whole block can safely sit outside the retry closure below
     # (CLAUDE.md: a rolled-back session expires pending attribute changes on retry, so the
     # mutate step must happen on a fresh fetch inside the decorated closure, not out here).
+    # Excluded rows are out of the average AND out of the flagging. They are not in the file
+    # this scan describes, and a placeholder in particular reads as a 23 Mbps segment here -
+    # 14MB over 5 wall seconds - which both pulls the recording's own average up and means
+    # the clip itself is never flagged. That is why the near-empty scan reported "no
+    # near-empty segments detected" on two recordings that were an hour of black
+    # (dev/changelog/957). Distinct feature from the discard, and the two must not read as
+    # the same thing: this one finds a slate inside a segment that was kept.
     rows = db.session.query(
         RecordingSegment.segment_number, RecordingSegment.bytes_recorded,
         RecordingSegment.started_at, RecordingSegment.ended_at
-    ).filter_by(recording_id=recording_id).all()
+    ).filter(
+        RecordingSegment.recording_id == recording_id,
+        RecordingSegment.excluded_reason.is_(None),
+    ).all()
 
     spans = []  # (segment_number, span_seconds, bytes_per_sec)
     for seg_number, bytes_recorded, started_at, ended_at in rows:
@@ -2651,6 +2812,10 @@ def _detect_near_empty_segments(recording_id):
     @retry_on_locked()
     def _commit_near_empty():
         for seg in RecordingSegment.query.filter_by(recording_id=recording_id).all():
+            # An excluded segment keeps its NULL - it was never evaluated, and writing False
+            # would claim this scan had looked at it and cleared it.
+            if seg.excluded:
+                continue
             seg.near_empty = seg.segment_number in flagged_numbers
         r = db.session.get(Recording, recording_id)
         if r is not None:
@@ -2693,7 +2858,7 @@ def _format_profile_summary(fields):
     return f"output format: {' '.join(parts) if parts else 'unknown'}"
 
 
-def _gather_recording_health(recording_id, ts_path, rec, cfg):
+def _gather_recording_health(recording_id, ts_path, rec, cfg, analysis_plan=None):
     """Run ffprobe on the completed .ts and return (fields, diagnostics): a dict of
     Recording field values to persist (or None), and a {'detail', 'extra'} payload for
     one DIAGNOSTICS event (or None).
@@ -2712,7 +2877,8 @@ def _gather_recording_health(recording_id, ts_path, rec, cfg):
         return None, None
     try:
         from .probe import parse_ffprobe
-        probe = parse_ffprobe(ts_path)
+        with _analysis_pass(recording_id, ANALYSIS_PASS_HEALTH, ts_path, analysis_plan) as hook:
+            probe = parse_ffprobe(ts_path, on_progress=hook)
         if not probe:
             # One empty dict, two meanings, and this event is the only record of the
             # recording's missing numbers that survives on the artifact - so it has to say

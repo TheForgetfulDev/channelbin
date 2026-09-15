@@ -90,6 +90,23 @@ SEEK_DAMAGE_DETECTED   = 'SEEK_DAMAGE_DETECTED'
 # intact, and reporting a rate change as missing video is the exact defect this pair of
 # events replaced (dev/changelog/866). One flag, one meaning.
 MIXED_FRAME_RATE_DETECTED = 'MIXED_FRAME_RATE_DETECTED'
+# A captured segment was thrown away instead of being joined into the final file, because
+# what came back was the provider's "channel offline" placeholder clip rather than the
+# channel. Detected by ratio, never by byte count: a finite clip drained at 250-500x real
+# time delivers ten minutes of content in five seconds of wall clock and then ends on a
+# clean EOF, which no live feed does (dev/changelog/957). An action the app took, so it is
+# its own type rather than a DIAGNOSTICS measurement - and a loud one, because the
+# alternative is 60 minutes of black in the middle of a race that nothing on any surface
+# explains.
+SEGMENT_DISCARDED      = 'SEGMENT_DISCARDED'
+# A capture was killed because its feed kept delivering content faster than real time for a
+# sustained window - the signature of a provider re-serving the same few seconds over and
+# over (dev/changelog/964). Named for what was MEASURED and not for what it is believed to
+# mean: the ratio proves the delivery rate, it does not prove the picture is frozen, and an
+# event asserting a diagnosis this app cannot make would be the unexplainable number
+# Product Principle 1 forbids, pointed the other way. Its own type rather than a
+# DIAGNOSTICS measurement for the same reason SEGMENT_DISCARDED is - the app acted.
+FAST_DELIVERY_DETECTED = 'FAST_DELIVERY_DETECTED'
 # Generic carrier for "here is something the app measured", emitted on both good and bad
 # verdicts so a healthy recording still says what was checked (dev/changelog/330). The
 # specific measurement is named in extra_data['kind'] ('timeline_scan', 'capture_health',
@@ -150,6 +167,20 @@ CHANNEL_FAILOVER_HEALTH_OBSERVATION = 'CHANNEL_FAILOVER_HEALTH_OBSERVATION'
 # mean different things: that one is the recording fail floor on a feed that died, this one
 # is the member's own measured share on a feed that was still delivering.
 CHANNEL_STALL_DEMOTION_HEALTH_OBSERVATION = 'CHANNEL_STALL_DEMOTION_HEALTH_OBSERVATION'
+# The third of that family, for a member that answered a recording with the provider's
+# "channel offline" placeholder clip instead of the channel (app/health_score.py::
+# apply_placeholder_health_observation, dev/changelog/957). Its own type for the same reason
+# the two above are separate: this one carries the flat recording fail floor on a feed that
+# demonstrably served no content, which is a different fact from either a feed that died or
+# a feed that was still delivering while stalling.
+CHANNEL_PLACEHOLDER_HEALTH_OBSERVATION = 'CHANNEL_PLACEHOLDER_HEALTH_OBSERVATION'
+# The fourth, for a member whose feed delivered content faster than real time for a
+# sustained window during a recording (app/health_score.py::
+# apply_fast_delivery_health_observation, dev/changelog/964). Separate from the placeholder
+# type beside it although both carry the same flat fail floor: one member served a finite
+# offline clip and the other served a live-looking stream that was worthless, and a channel
+# page that could not tell those apart would send its reader looking for the wrong problem.
+CHANNEL_FAST_DELIVERY_HEALTH_OBSERVATION = 'CHANNEL_FAST_DELIVERY_HEALTH_OBSERVATION'
 # Written by _write_channel_url_drift_events (app/accounts.py) for every channel a sync
 # rewrote Channel.stream_url on (DESIGN-url-drift.md 4/3) - the per-channel counterpart to
 # the account-level PROVIDER_URLS_CHANGED alert, which only fires above a channel-count
@@ -456,6 +487,30 @@ class Recording(db.Model):
     near_empty_segment_count = db.Column(db.Integer)
     near_empty_seconds       = db.Column(db.Float)
 
+    # ── Discarded segments (app/watchdog.py, rolled up by app/concatenator.py) ──
+    # How many segments were kept out of the final file and how many seconds of content they
+    # held between them - the provider's placeholder clip, today. Columns rather than a scan
+    # of RecordingSegment.excluded_reason because both are displayed on the detail page and
+    # the count belongs in a list row's tooltip, and CLAUDE.md promotes a stat to a column
+    # the moment it would be sorted, filtered or displayed. NULL means the recording never
+    # reached the rollup (still capturing, or captured before this existed); 0 means it did
+    # and discarded nothing, which is a real answer and not the same thing.
+    discarded_segment_count  = db.Column(db.Integer)
+    discarded_seconds        = db.Column(db.Float)
+
+    # ── Segments whose video arrived faster than the clock (app/concatenator.py) ──
+    # How many joined segments hold more content than the seconds they ran for, by more than
+    # watchdog.fast_delivery_surplus_seconds, and how much content those segments put into
+    # the finished file. Kept, not discarded: under the live thresholds the content is
+    # unexplained rather than proven bad, so the recording is flagged and the file is left
+    # intact for a human to judge (dev/changelog/966).
+    #
+    # The seconds are the reason this is not just a count: they answer "how much of what I am
+    # about to watch is suspect", which is the question a flag on a week-old recording exists
+    # to answer. Same NULL/0 split as the discard rollup above.
+    fast_delivery_segment_count = db.Column(db.Integer)
+    fast_delivery_seconds       = db.Column(db.Float)
+
     # ── Stream format profile of the FINAL/CONVERTED output file ──────────────
     # Mirrors the ChannelTest quality-profile columns (DESIGN-stream-quality-profile.md)
     # but takes this model's recorded_ prefix, which is what keeps "of the output file"
@@ -609,9 +664,14 @@ class Recording(db.Model):
         the up-to-stall_timeout tail before the kill), so it's used only as the
         'actual length' signal when there is no ffprobed final file - i.e. for
         FAILED/ABORTED recordings, which never concatenate. None if nothing captured.
+
+        A discarded segment contributes nothing: it is not in the file this number is
+        standing in for, so counting its span would claim length the artifact does not have.
         """
         total = 0.0
         for s in self.segments:
+            if s.excluded:
+                continue
             if s.bytes_recorded and s.started_at and s.ended_at:
                 total += (s.ended_at - s.started_at).total_seconds()
         return total or None
@@ -646,12 +706,19 @@ class Recording(db.Model):
         scheduled one: both ends are rewritten to the real times on an abort or an early
         manual stop, so this is the window the app was actually trying to fill. Same basis
         postprocessor._gather_recording_health uses for recorded_frame_pct.
+
+        A discarded segment covers nothing, so its wall clock falls into capture_gap_seconds
+        instead. That is the point rather than a side effect: a placeholder segment used to
+        "cover" its five seconds like any other, which is why recording 19's 61s capture gap
+        read as honest while twelve placeholder windows sat inside it (dev/changelog/957).
         """
         start, stop = self.start_time, self.stop_time
         if not start or not stop or stop <= start:
             return 0.0
         spans = []
         for s in self.segments:
+            if s.excluded:
+                continue
             if not s.started_at or not s.ended_at:
                 continue
             a = max(s.started_at, start)
@@ -876,6 +943,11 @@ class UserPref(db.Model):
     value = db.Column(db.Text)
 
 
+#: RecordingSegment.excluded_reason - what came back was the provider's finite "channel
+#: offline" placeholder clip, not the channel (app/watchdog.py::classify_placeholder_segment).
+SEGMENT_EXCLUDED_PLACEHOLDER = 'PROVIDER_PLACEHOLDER'
+
+
 class RecordingSegment(db.Model):
     __tablename__ = 'recording_segments'
 
@@ -941,8 +1013,21 @@ class RecordingSegment(db.Model):
     # app/postprocessor.py::_detect_near_empty_segments. NULL = not evaluated (predates this
     # detector, or gather_health_data was off), never a false "not near-empty".
     near_empty           = db.Column(db.Boolean)
+    # Why this segment was kept out of the final file, or NULL for the normal case of a
+    # segment that was joined. Deliberately NOT folded into exit_reason, which answers a
+    # different question and stays true alongside it: a discarded placeholder really did end
+    # with PROCESS_EXITED (one flag, one meaning). The row survives with its file path,
+    # bytes and diagnostics intact - excluding beats deleting, because the discard has to be
+    # explainable six weeks later from the recording's own detail page.
+    excluded_reason      = db.Column(db.String(64))
 
     channel = db.relationship('Channel')
+
+    @property
+    def excluded(self) -> bool:
+        """Was this segment kept out of the final file? The one spelling of that test, so a
+        consumer never re-derives it from the reason string."""
+        return self.excluded_reason is not None
 
 
 # ── Account Models ────────────────────────────────────────────────────────────

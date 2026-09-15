@@ -60,7 +60,7 @@ class _Base(unittest.TestCase):
         for i, (res, fps, health) in enumerate(formats):
             ch = seed.make_channel(self.acc, name=f'{name} feed {i}')
             ch.health_score = health
-            db.session.add(ChannelTest(channel_id=ch.id, status='PASS', resolution=res,
+            db.session.add(ChannelTest(channel_id=ch.id, status='COMPLETED', resolution=res,
                                        fps=fps, test_started_at=datetime(2026, 7, 25, 12, 0)))
             chans.append(ch)
         grp = ChannelGroup(name=name)

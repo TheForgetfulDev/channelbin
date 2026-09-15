@@ -14,6 +14,7 @@ from ..database import (
     Recording, RecordingEvent, HealthCheckProfile, OnDemandTestJob,
     CHANNEL_GROUPED, CHANNEL_UNGROUPED, GROUP_MEMBER_SELECTED, GROUP_FAILOVER,
     CHANNEL_FAILOVER_HEALTH_OBSERVATION, CHANNEL_STALL_DEMOTION_HEALTH_OBSERVATION,
+    CHANNEL_PLACEHOLDER_HEALTH_OBSERVATION, CHANNEL_FAST_DELIVERY_HEALTH_OBSERVATION,
     ChannelGroupEvent,
     GROUP_FORMAT_STRATEGIES,
     GROUP_FORMAT_HEALTH_CHECK_ONLY, GROUP_FORMAT_MANUAL,
@@ -734,7 +735,9 @@ def _build_group_timeline(group, pinned_job=None):
                   .filter(ChannelEvent.event_type.in_(
                       [CHANNEL_GROUPED, CHANNEL_UNGROUPED,
                        CHANNEL_FAILOVER_HEALTH_OBSERVATION,
-                       CHANNEL_STALL_DEMOTION_HEALTH_OBSERVATION])).all()):
+                       CHANNEL_STALL_DEMOTION_HEALTH_OBSERVATION,
+                       CHANNEL_PLACEHOLDER_HEALTH_OBSERVATION,
+                       CHANNEL_FAST_DELIVERY_HEALTH_OBSERVATION])).all()):
             extra = json.loads(e.extra_data) if e.extra_data else {}
             entries.append({'kind': 'channel_event', 'ts': e.timestamp, 'obj': e,
                             'source': names[e.channel_id], 'source_url': urls[e.channel_id],
@@ -899,6 +902,67 @@ def _group_detail_job(group):
     return jobs[-1] if jobs else None
 
 
+def _format_source_map(latest, latest_any):
+    """{channel_id: {...}} describing the test a member's format verdict was decided on,
+    for the members where that is NOT the test the table renders.
+
+    The detail table is scoped to the attached health check while every lock-derived fact
+    reads each channel's newest test whatever ran it - two maps, deliberately, because the
+    table's job scope is a feature and the lock must agree with the recorder
+    (dev/changelog/890). What was missing is that the row then states one format in its
+    Format column and judges on another in its mismatch pill, with nothing on screen
+    saying so: group 5's member 4137 rendered "1920x1080 @ 60" beside a Format mismatch
+    pill whose own tooltip read "this member is 1920x1080 @ 60 and the group is pinned by
+    hand to 1920x1080 @ 60" (dev/docs/BUGS.md 2026-09-14). Neither map may move, so the
+    disagreement has to be named instead - principle 1, a number the user cannot explain
+    is worse than no number.
+
+    Empty for every member whose two tests are the same row, which is the normal case, so
+    the client renders nothing extra unless there is genuinely something to disclose. One
+    batched query for the job names; nothing per row."""
+    # Narrowed to the members where the newer check produced a competing READING - its own
+    # resolution and frame rate, differing from the rendered check's. Two narrowings, both
+    # about noise:
+    #   - A newer check measuring the same thing contradicts nothing, and flagging those
+    #     would put a tooltip on most of the table for no information.
+    #   - A newer check that measured nothing (it failed before ffprobe got a usable
+    #     answer) has not disagreed with anybody, so it is not what this says. That row is
+    #     already untested-for-format everywhere, and "unknown is not proven-different."
+    # Deliberately raw readings rather than format_key(): a failed check's numbers do not
+    # count as a format (that is the point of the status gate), but they are still a real
+    # number the user can see on the test, so a row showing a different one has to say so.
+    def _reading(t):
+        return (t.resolution, round(t.fps)) if t is not None and t.resolution and t.fps else None
+
+    differing = {cid: t for cid, t in latest_any.items()
+                 if t is not None and latest.get(cid) is not t
+                 and _reading(t) is not None
+                 and _reading(t) != _reading(latest.get(cid))}
+    if not differing:
+        return {}
+    job_ids = {t.job_id for t in differing.values() if t.job_id is not None}
+    job_names = dict(db.session.query(OnDemandTestJob.id, OnDemandTestJob.name)
+                     .filter(OnDemandTestJob.id.in_(job_ids)).all()) if job_ids else {}
+    return {
+        cid: {
+            'label': format_label(format_key(t)) if format_key(t) else None,
+            # What the newer check measured even when it does not count as a format -
+            # "it failed, and these were the numbers" is the honest sentence, and a bare
+            # "unknown" would hide the black-placeholder reading that raised the question.
+            'measured': f'{t.resolution} @ {round(t.fps)}',
+            'status': _test_status_label(t),
+            # A test with no job is a recording's pre-check, identified by
+            # pre_check_recording_id instead (routes/channel_tests.py::
+            # _latest_tests_by_channel). Naming it beats "another check": it is the
+            # freshest measurement there is, and it is not something the user scheduled.
+            'pre_check': t.job_id is None,
+            'tested_at': _fmt_et(t.test_started_at),
+            'job_name': job_names.get(t.job_id),
+        }
+        for cid, t in differing.items()
+    }
+
+
 def group_detail_rows(group, job):
     """Member rows + tallies + duplicate sets for the unified detail page.
 
@@ -986,6 +1050,11 @@ def group_detail_rows(group, job):
     recording_ids = {m.channel_id for m in memberships if m.recording_enabled}
     test_ids = test_member_ids(memberships)
 
+    # The measurement the lock-derived facts above were decided on, whenever it is NOT the
+    # one this table renders. Both maps are already loaded, so this costs one query for the
+    # job names and nothing per row.
+    format_source_by_channel = _format_source_map(latest, latest_any) if stored else {}
+
     monitored_ids = monitored_channel_ids() if stored else set()
     dup_titles = duplicates_within(channels)
     # Computed once here and handed to _serialize_dup_groups (never recomputed there) -
@@ -1024,6 +1093,7 @@ def group_detail_rows(group, job):
             # and a column, and "no EPG id" is a bucket of its own on both.
             epg_channel_id=ch.epg_channel_id or '',
             format_blocked=ch.id in format_blocked_ids,
+            format_source=format_source_by_channel.get(ch.id),
             lifecycle=(lc := lifecycle_by_channel.get(ch.id, (None, None)))[0],
             lifecycle_date=lc[1].strftime('%Y-%m-%d') if lc[1] else '',
             # Which tags this member's own NAME carries, through the one definition of

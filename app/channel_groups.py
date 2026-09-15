@@ -138,7 +138,7 @@ def normalize_channel_name(name: str) -> str:
 def format_key(test):
     """The (resolution, fps-rounded) identity used to decide whether two feeds are
     the *same video format* for grouping. Returns None when the format is unknown
-    (no test, or the test is missing resolution or fps).
+    (no test, a test that did not complete, or one missing resolution or fps).
 
     - Resolution: the exact ffprobe string ("1920x1080") - both sides come from
       ffprobe so exact-string equality is correct.
@@ -146,8 +146,22 @@ def format_key(test):
       equal to their nominal (29.97≈30, 59.94≈60, 23.976≈24). Never compare raw floats.
     - Bitrate is deliberately NOT part of the key: same-format feeds routinely differ
       in bitrate and that must never block grouping.
+    - **Only a COMPLETED test measures a format.** A failed or cancelled check may have
+      probed the provider's offline placeholder rather than the feed, and that clip has
+      its own resolution and frame rate - so honoring it lets a momentary outage restate
+      what the channel *is* and filter the member out of every recording until some later
+      check happens to succeed. The same run's damage is already priced in by the health
+      score, which is the half of the model allowed to judge a bad check (CLAUDE.md
+      "format lock filters, health score ranks"); reading it a second time here is the
+      lock doing health score's job. Erring toward not-filtering is the cheaper error:
+      a member wrongly blocked costs a recording source, while a member wrongly kept
+      costs a mixed-format concat, measured harmless on this machine (dev/changelog/754).
+      The asymmetry this removes was live - of two failed checks on the same placeholder,
+      the one ffprobe got numbers out of blocked its member and the one it did not left
+      the member eligible (dev/docs/BUGS.md 2026-09-14).
     """
-    if test is None:
+    from .database import TEST_STATUS_COMPLETED
+    if test is None or getattr(test, 'status', None) != TEST_STATUS_COMPLETED:
         return None
     return format_key_from(getattr(test, 'resolution', None), getattr(test, 'fps', None))
 

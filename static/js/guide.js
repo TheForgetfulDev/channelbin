@@ -2954,7 +2954,7 @@ document.addEventListener('DOMContentLoaded', function () {
   });
 
   document.getElementById('active-rec-stop-btn').addEventListener('click', function () {
-    activeRecAction('/stop-json', 'Stop the recording now and concatenate what was captured?');
+    activeRecAction('/stop-json', 'Stop the recording now and join what was captured?');
   });
 
   document.getElementById('active-rec-pause-btn').addEventListener('click', function () {

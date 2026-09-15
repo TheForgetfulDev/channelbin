@@ -186,7 +186,9 @@ ALERT_TYPES = {
     # Unlike the two above, this one has no self-clearing path and is not expected to grow
     # one: nothing re-runs a concatenation that found nothing to concatenate, so it is a
     # record of a loss and is cleared only by deleting the recording.
-    'CONCATENATION_FAILED': {'label': 'Concatenation Failed', 'severity': 'ERROR'},
+    # The TYPE is stored on existing rows and compared against, so it keeps its name; only
+    # the label a human reads is the phase's own word (dev/changelog/961).
+    'CONCATENATION_FAILED': {'label': 'Join Failed', 'severity': 'ERROR'},
     'CONFIG_FILE_MISSING': {'label': 'Config File Missing', 'severity': 'CRIT'},
     'HEALTH_CHECK_COMPLETE': {'label': 'Health Check Completed', 'severity': 'INFO'},
     'HEALTH_CHECK_WINDOW': {

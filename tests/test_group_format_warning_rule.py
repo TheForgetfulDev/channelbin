@@ -40,9 +40,11 @@ class PinnedFormatOffendersTests(unittest.TestCase):
         self.on = SimpleNamespace(id=1)
         self.off = SimpleNamespace(id=2)
         self.untested = SimpleNamespace(id=3)
+        # status is required, not decoration: only a COMPLETED check measures a format
+        # (app/channel_groups.py::format_key), so a fake without one reads as untested.
         self.latest = {
-            1: SimpleNamespace(resolution='1920x1080', fps=59.94),
-            2: SimpleNamespace(resolution='1280x720', fps=60.0),
+            1: SimpleNamespace(resolution='1920x1080', fps=59.94, status='COMPLETED'),
+            2: SimpleNamespace(resolution='1280x720', fps=60.0, status='COMPLETED'),
         }
         self.members = [self.on, self.off, self.untested]
 
