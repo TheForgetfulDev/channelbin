@@ -543,9 +543,7 @@ def repair_duplicated_capture_corrections(cfg):
     # The scores moved with nothing the user did behind them, so the move gets a surface of
     # its own rather than only a ChannelEvent on each channel's timeline.
     from .alerts import create_alert
-    lines = [f'{c.name}: health score '
-             f'{"none" if m["score_before"] is None else format(m["score_before"], ".0f")} -> '
-             f'{"none" if m["score_after"] is None else format(m["score_after"], ".0f")} '
+    lines = [f'{c.name}: {_score_words(m["score_before"], m["score_after"])} '
              f'({m["sample_count_before"]} -> {m["observations_counted"]} observations)'
              for c, m in repaired]
     create_alert(

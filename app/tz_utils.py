@@ -137,7 +137,9 @@ def relative(dt_utc: datetime, *, style: str = 'compact', now: datetime = None) 
     `app/routes/recordings.py` is loose/approximate wording ('3.5 hours') for the recordings
     list, where many rows are shown at once and exact seconds don't matter; the `time_ago`/
     `time_until` Jinja filters (same file) are exact combined-unit wording ('1d 4h ago') for
-    account sync timestamps, where precision is the point."""
+    account sync timestamps, where precision is the point. A fourth, `_ago`/`_ahead` in
+    `app/readiness.py`, is past-tense rounded single-unit prose ('3 hours ago') for the
+    readiness sentences (dev/changelog/971)."""
     if now is None:
         now = datetime.utcnow()
     diff = (dt_utc - now).total_seconds()

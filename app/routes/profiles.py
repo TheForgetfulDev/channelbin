@@ -4,8 +4,8 @@ from .. import db
 from ..config import load_config
 from ..database import RecordingProfile, Recording, Channel
 from ..db_utils import retry_on_locked
-from ..profile_forms import (BOOL, INT, TEXT, Override, ProfileField, nullable_overrides,
-                             parse_profile_body, profile_payload)
+from ..profile_forms import (BOOL, INT, TEXT, Override, ProfileField, default_summary,
+                             nullable_overrides, parse_profile_body, profile_payload)
 
 profiles_bp = Blueprint('profiles', __name__)
 
@@ -105,15 +105,6 @@ def _overrides(p):
     return rows
 
 
-def _default_summary(defaults):
-    """The one statement of what an unset field falls back to, replacing the "Default (N)"
-    cell the retired table repeated on every row. Rendered through the SAME functions as
-    an override cell, so a number cannot read two ways on one page. The filename template
-    is excluded for the same reason it is excluded above and is shown on its own line."""
-    return [Override(label, render(defaults[key]))
-            for key, label, render in _OVERRIDE_ROWS if key in defaults]
-
-
 @profiles_bp.route('/profiles')
 def profiles_list():
     profiles = RecordingProfile.query.order_by(RecordingProfile.name).all()
@@ -144,7 +135,9 @@ def profiles_list():
         # `is not None`, and a Jinja conditional written per field is where that quietly
         # becomes truthiness and starts hiding a profile's 0 (app/profile_forms.py).
         overrides={p.id: _overrides(p) for p in profiles},
-        default_summary=_default_summary(defaults),
+        # The filename template is excluded here for the same reason it is excluded from
+        # _OVERRIDE_ROWS, and is shown on its own line.
+        default_summary=default_summary(defaults, _OVERRIDE_ROWS),
         profiles_json=[_profile_payload(p) for p in profiles],
     )
 

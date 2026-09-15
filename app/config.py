@@ -565,7 +565,7 @@ _DEFAULTS = {
         'degraded_aggregate_timeout_seconds': 2,
         # The same lever for the other reason an optional aggregate gets expensive: the index
         # is perfectly healthy, but it cannot answer the question that was asked, so counting
-        # means reading the whole table (app/channel_search.py::full_scan_reason - today that
+        # means reading the whole table (app/routes/channel_search.py::full_scan_reason - today that
         # is the airing grain with "Show airings that have ended" ticked).
         #
         # Separate from the key above because the two states are not the same fact. A degraded

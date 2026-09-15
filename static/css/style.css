@@ -1455,8 +1455,8 @@ body.scroll-locked { position: fixed; left: 0; right: 0; width: 100%; overflow: 
 
 /* ── Inline notice / alert box (modal bodies - convert & clone flows) ── */
 .notice { border-radius: var(--radius); padding: 10px 12px; font-size: var(--fs-md); margin-bottom: 1rem; line-height: 1.5; }
-.notice-warn { background: var(--warn-soft); border: 1px solid rgba(217,166,46,.4); color: #e8c98a; }
-.notice-bad { background: var(--bad-soft); border: 1px solid rgba(239,83,80,.4); color: #f0a5a3; }
+.notice-warn { background: var(--warn-soft); border: 1px solid rgba(var(--warn-rgb),.4); color: #e8c98a; }
+.notice-bad { background: var(--bad-soft); border: 1px solid rgba(var(--bad-rgb),.4); color: #f0a5a3; }
 .notice-info { background: var(--accent-soft); border: 1px solid rgba(88,166,255,.35); color: var(--accent-text); }
 .notice-ok { background: var(--ok-soft); border: 1px solid rgba(63,185,80,.4); color: #8fd9a1; }
 .rec-block-list { margin: 0.4rem 0 0 1.1rem; font-size: var(--fs-md); }

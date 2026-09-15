@@ -144,3 +144,15 @@ def nullable_overrides(profile, rows):
         if value is not None:
             out.append(Override(label, render(value)))
     return out
+
+
+def default_summary(defaults, rows):
+    """[Override] stating what an unset field falls back to, one statement under the list
+    rather than a "Default (N)" cell repeated on every row (dev/changelog/864).
+
+    Rendered through the SAME `render` functions nullable_overrides() uses for a set
+    value, so a number cannot read two ways on one page. `rows` is the same
+    `(key, label, render)` table; a key `defaults` does not carry is left out.
+    """
+    return [Override(label, render(defaults[key]))
+            for key, label, render in rows if key in defaults]
