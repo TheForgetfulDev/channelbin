@@ -25,6 +25,7 @@ actually building and running the image before this file was written:
     itself is asserted inside the build, which no unittest can reach; what is guarded here is
     that the assertion and the release-qualified tag are still present in the Dockerfile.
 """
+import fnmatch
 import os
 import re
 import unittest
@@ -242,6 +243,88 @@ class DockerConfigKeysTests(unittest.TestCase):
             'docker/config.docker.yaml sets a key app/config.py::_DEFAULTS does not define, '
             'so it is silently ignored and the container runs on the default it meant to '
             'override: ' + ', '.join(unknown))
+
+
+class DockerFileModeTests(unittest.TestCase):
+    """Every file the build copies must be readable by a user who is not its owner.
+
+    `COPY . /app` preserves the build context's modes, and the entrypoint drops to an
+    unprivileged PUID/PGID that owns none of /app. So one file sitting at 0770 on the
+    machine that ran the build - a umask accident, an editor, a copy off a Samba share -
+    ships as root-owned and group-only, and the app cannot open it.
+
+    The failure that produced this test was a single group-only static/js/logs.js
+    (dev/changelog/981). Nothing was wrong with the page, the route or the JavaScript: the
+    Logs page rendered, its one script 500'd with a PermissionError out of Flask's static
+    handler, and the page then sat on "Loading history..." forever. Everything else in the
+    app was unaffected, which is what made it hard to attribute rather than merely broken.
+
+    The Dockerfile now normalizes modes after the COPY, so this guards the build context
+    rather than the image - the two layers fail independently, and dev/tools/docker_smoke.py
+    asserts the readability inside a running container as the third.
+    """
+
+    def _tracked_files(self):
+        import subprocess
+        try:
+            proc = subprocess.run(['git', '-C', ROOT, 'ls-files', '-z'],
+                                  capture_output=True, timeout=60)
+        except (OSError, subprocess.SubprocessError) as exc:
+            self.skipTest(f'git is not usable here, so the build context cannot be '
+                          f'enumerated: {exc}')
+        if proc.returncode != 0:
+            self.skipTest('not a git checkout, so the build context cannot be enumerated')
+        return [p.decode() for p in proc.stdout.split(b'\0') if p]
+
+    def _shipped(self, paths):
+        """Filter `paths` down to what .dockerignore lets into the build context.
+
+        Two properties of Docker's matcher that a naive fnmatch gets wrong, both in the
+        direction that would quietly shrink this test's scope: patterns are root-relative
+        (unlike .gitignore's, which float to any depth), and `*` does not cross a `/`. So
+        matching is done segment by segment, against the path and against each of its parent
+        directories - a pattern matching a directory excludes its whole subtree.
+        """
+        patterns = []
+        for pat in _ignore_patterns():
+            if pat.startswith('!'):
+                self.fail(f'.dockerignore has a re-include pattern ({pat!r}) that this '
+                          f'test does not model; teach it the pattern or scope it here.')
+            patterns.append(pat.strip('/').split('/'))
+
+        def excluded(path):
+            parts = path.split('/')
+            for pat in patterns:
+                if len(pat) > len(parts):
+                    continue
+                # A pattern matching a parent directory takes the subtree with it, so it is
+                # compared against the path's leading segments rather than the whole path.
+                if all(fnmatch.fnmatch(seg, p) for seg, p in zip(parts, pat)):
+                    return True
+            return False
+
+        return [p for p in paths if not excluded(p)]
+
+    def test_every_shipped_file_is_world_readable(self):
+        shipped = self._shipped(self._tracked_files())
+        # A sanity floor: if the ignore matcher ever over-matches into excluding the app
+        # itself, an empty result would pass this test while checking nothing.
+        self.assertIn('app/__init__.py', shipped,
+                      'the .dockerignore matcher excluded the application package, so this '
+                      'test is not looking at the build context any more')
+
+        unreadable = []
+        for rel in shipped:
+            path = os.path.join(ROOT, rel)
+            if not os.path.isfile(path):
+                continue    # a tracked file deleted in the working tree
+            mode = os.stat(path).st_mode
+            if not mode & 0o004:
+                unreadable.append(f'{rel} ({oct(mode & 0o777)})')
+        self.assertEqual(
+            unreadable, [],
+            'these files enter the image without world-read, so the container - which runs '
+            'as a user owning none of /app - cannot open them: ' + ', '.join(unreadable))
 
 
 if __name__ == '__main__':

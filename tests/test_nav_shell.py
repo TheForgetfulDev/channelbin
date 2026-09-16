@@ -122,12 +122,16 @@ class NavCollapsedRendersServerSideTests(unittest.TestCase):
 
 
 class RenderedShellTests(unittest.TestCase):
-    def setUp(self):
-        self.t = make_test_app()
-        self.html = self.t.client.get('/').get_data(as_text=True)
+    @classmethod
+    def setUpClass(cls):
+        # One app and one render for the whole class: every case reads the markup and
+        # none rewrites the state it was rendered from (dev/changelog/979).
+        cls.t = make_test_app()
+        cls.html = cls.t.client.get('/').get_data(as_text=True)
 
-    def tearDown(self):
-        self.t.cleanup()
+    @classmethod
+    def tearDownClass(cls):
+        cls.t.cleanup()
 
     def test_no_setup_flyout_token_survives(self):
         for token in ('setup-flyout', 'setup-trigger', 'setup-caret', 'setup_flyout'):

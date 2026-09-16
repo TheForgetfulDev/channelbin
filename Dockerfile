@@ -88,12 +88,21 @@ RUN pip install --no-cache-dir -r /app/requirements.txt
 
 COPY . /app
 
+# COPY preserves the build context's file modes, so a file that happens to be group-only on
+# the machine doing the build is group-only in the image - owned by root, and therefore
+# unreadable by the unprivileged user the entrypoint drops to. That is a 500 on whichever
+# page needs the file and nothing anywhere else, which makes it near-impossible to attribute
+# (dev/changelog/981). Normalizing here means the image cannot inherit a build machine's
+# umask accident. Before the symlinks below, because chmod dereferences and /config does not
+# exist at build time.
+#
 # config.yaml and instance/ are the only two paths the app pins to its own directory
 # (app/config.py::_CONFIG_PATH, app/__init__.py::_resolve_secret_key). Symlinking them into
 # the volume is what makes an image upgrade keep your settings, database and session key.
 # .dockerignore keeps a real config.yaml/instance out of the build context, so these never
 # land on top of a copied file.
-RUN ln -s /config/config.yaml /app/config.yaml \
+RUN chmod -R a+rX /app \
+    && ln -s /config/config.yaml /app/config.yaml \
     && ln -s /config/instance /app/instance \
     && mkdir -p /app/capture-logs /config /dvr \
     && groupadd -g 1000 channelbin \

@@ -18,13 +18,17 @@ from tests.support.config_sandbox import ConfigSandbox
 
 
 class SettingsPageConformanceTests(unittest.TestCase):
-    def setUp(self):
-        self.t = make_test_app()
-        self.client = self.t.app.test_client()
-        self.html = self.client.get('/settings').get_data(as_text=True)
+    @classmethod
+    def setUpClass(cls):
+        # One app and one render for the whole class: every case reads the markup and
+        # none rewrites the state it was rendered from (dev/changelog/979).
+        cls.t = make_test_app()
+        cls.client = cls.t.app.test_client()
+        cls.html = cls.client.get('/settings').get_data(as_text=True)
 
-    def tearDown(self):
-        self.t.cleanup()
+    @classmethod
+    def tearDownClass(cls):
+        cls.t.cleanup()
 
     def test_page_has_exactly_one_h1(self):
         """DESIGN.md 3.10: a page announces itself once, with an h1.

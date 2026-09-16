@@ -36,7 +36,8 @@ from app.database import (Channel, ChannelEvent, ChannelHealthExclusion, Channel
                           Recording, CHANNEL_HEALTH_ROLLBACK,
                           CHANNEL_HEALTH_OVERRIDE_CHANGED,
                           CHANNEL_FAILOVER_HEALTH_OBSERVATION)
-from app.health_recompute import (SOURCE_FAILOVER, SOURCE_RECORDING, SOURCE_TEST,  # noqa: E402
+from app.health_recompute import (SOURCE_CAPTURE_CORRECTION, SOURCE_FAILOVER,  # noqa: E402
+                                  SOURCE_RECORDING, SOURCE_TEST,
                                   apply_rollback, observation_ledger, replay,
                                   recompute_failure_streak, rollback_preview)
 from app.health_score import apply_test_health_observation, observation_weight  # noqa: E402
@@ -150,6 +151,104 @@ class ReplayFidelityTests(_Base):
         self._blended_test(minutes_ago=200)
         stamps = [o.observed_at for o in observation_ledger(self.channel.id, self.cfg)]
         self.assertEqual(stamps, sorted(stamps))
+
+
+class RecordingObservationOrderTests(_Base):
+    """A recording's two observations replay where, and in the order, they were blended.
+
+    The primary observation blends at the capture/concat boundary, before `completed_at`
+    exists; the capture-quality correction blends later, at analysis time. The ledger used to
+    stamp both at `completed_at` and break the tie on the kind name, which put the correction
+    first and any health check that ran in between on the wrong side of both - so a replay
+    with nothing excluded disagreed with the stored score (dev/docs/BUGS.md 2026-09-16
+    @ 06:57:10 AM).
+    """
+
+    def _recording(self):
+        rec = seed.make_recording(
+            status='COMPLETED', channel_id=self.channel.id,
+            total_downtime_seconds=900.0, total_restart_count=6,
+            timeline_deficit_seconds=30.0, near_empty_seconds=0.0)
+        db.session.commit()
+        return rec
+
+    def _observe_recording_with_a_test_in_between(self, rec):
+        """The real writers, in production order: primary blend, a health check while
+        post-processing runs, the correction, and only then completion."""
+        from app.health_score import (apply_capture_phase_health_observation,
+                                      apply_capture_quality_correction)
+        apply_capture_phase_health_observation(self.t.app, rec.id)
+        db.session.expire_all()
+
+        ct = seed.make_channel_test(self.channel, status='COMPLETED', duration_seconds=120,
+                                    frame_pct=100.0, drop_count=0)
+        ct.test_started_at = datetime.utcnow()
+        db.session.commit()
+        apply_test_health_observation(self.t.app, ct.id)
+
+        apply_capture_quality_correction(self.t.app, rec.id,
+                                         analysis_completed_at=datetime.utcnow())
+        db.session.expire_all()
+        rec = db.session.get(Recording, rec.id)
+        rec.completed_at = datetime.utcnow() + timedelta(hours=2)
+        db.session.commit()
+
+    def _assert_replay_matches_stored(self):
+        db.session.expire_all()
+        channel = db.session.get(Channel, self.channel.id)
+        score, count, _ = replay(observation_ledger(channel.id, self.cfg), self.cfg)
+        self.assertEqual(count, channel.health_score_sample_count)
+        self.assertAlmostEqual(score, channel.health_score, places=6)
+
+    def test_replay_reproduces_a_recording_with_a_health_check_blended_mid_postprocess(self):
+        self._blended_test(frame_pct=40.0, minutes_ago=600)
+        self._observe_recording_with_a_test_in_between(self._recording())
+        kinds = [o.kind for o in observation_ledger(self.channel.id, self.cfg)]
+        self.assertEqual(kinds, [SOURCE_TEST, SOURCE_RECORDING, SOURCE_TEST,
+                                 SOURCE_CAPTURE_CORRECTION])
+        self._assert_replay_matches_stored()
+
+    def test_a_recording_that_was_the_first_observation_stays_first(self):
+        """The first-ever blend stores its instant too, or a later health check would
+        replay ahead of it and become the observation the score was set from."""
+        self._observe_recording_with_a_test_in_between(self._recording())
+        kinds = [o.kind for o in observation_ledger(self.channel.id, self.cfg)]
+        self.assertEqual(kinds[0], SOURCE_RECORDING)
+        self._assert_replay_matches_stored()
+
+    def test_a_tie_replays_the_primary_observation_before_its_correction(self):
+        """Rows that stored no instant fall back to one shared column, so the two tie."""
+        self._blended_test(minutes_ago=600)
+        rec = self._recording()
+        rec.completed_at = datetime.utcnow() - timedelta(minutes=5)
+        rec.health_quality_score = 70
+        rec.health_blend_breakdown = json.dumps({'source_weight': 2.0})
+        rec.capture_quality_breakdown = json.dumps({'final': 20, 'penalties': []})
+        db.session.commit()
+        ledger = observation_ledger(self.channel.id, self.cfg)
+        self.assertEqual([o.kind for o in ledger],
+                         [SOURCE_TEST, SOURCE_RECORDING, SOURCE_CAPTURE_CORRECTION])
+        self.assertEqual(ledger[1].observed_at, ledger[2].observed_at)
+
+    def test_a_legacy_correction_falls_back_to_analysis_completed_at(self):
+        rec = self._recording()
+        done = datetime.utcnow() - timedelta(hours=3)
+        rec.analysis_completed_at = done
+        rec.completed_at = datetime.utcnow() - timedelta(hours=1)
+        rec.capture_quality_breakdown = json.dumps({'final': 80, 'penalties': []})
+        db.session.commit()
+        (obs,) = observation_ledger(self.channel.id, self.cfg)
+        self.assertEqual(obs.observed_at, done)
+
+    def test_an_unparseable_stored_instant_falls_back_to_the_column(self):
+        rec = self._recording()
+        rec.completed_at = datetime.utcnow() - timedelta(hours=1)
+        rec.health_quality_score = 70
+        rec.health_blend_breakdown = json.dumps({'source_weight': 2.0, 'observed_at': 'garbage'})
+        db.session.commit()
+        with self.assertLogs('app.health_recompute', level='WARNING'):
+            (obs,) = observation_ledger(self.channel.id, self.cfg)
+        self.assertEqual(obs.observed_at, rec.completed_at)
 
 
 class ResetTests(_Base):

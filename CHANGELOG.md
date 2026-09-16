@@ -5,6 +5,63 @@ Notable changes to ChannelBin, newest first. This project follows
 release is tagged `v<version>` in git, and the version the app is running is shown in the
 page footer.
 
+## 0.9.3 - 2026-09-16
+
+**Fixed**
+
+- Cancelling a recording while it was starting could leave its capture running with nothing able
+  to stop it, and after a restart a recording could be started twice, with two captures writing
+  the same file. A start now claims the recording before doing anything, so either one owner
+  starts it or the cancel wins.
+- A recording that was still retrying a dead stream when its time ended was decided by whichever
+  of two jobs ran first, and one of them failed the recording without saving what had already
+  been captured. Anything captured is now always joined into a file; a recording fails as a dead
+  stream only when nothing was captured at all.
+- A crash, restart or out-of-memory kill during a segment join left the join's ffmpeg running
+  and writing the output file while the next start began a second join beside it. The join is
+  now tracked like every other capture, stopped at shutdown, and its partial file removed.
+- A crash at the very end of a resumable conversion could leave it believing its work was still
+  to do, and the next attempt then deleted the finished file and failed the recording. The
+  finished file is now recorded before anything is cleaned up, and a complete, readable file
+  already in place is kept rather than destroyed.
+- Most failed recordings said "the stream could not be reached" whatever actually went wrong.
+  Every way a recording can fail now records its real cause, the recording page says it, and it
+  offers only the recovery actions that can work - a join that would refuse the same clips again
+  is no longer offered.
+- A stream restart that could not launch ffmpeg was counted twice, so a recording could give up on
+  its stream sooner than it should have. A recording that has already failed is also no longer
+  failed a second time, which had counted the failure against its channel's health score twice.
+- A recording with no channel - recorded from a URL, or whose channel was later deleted - never
+  recorded that its post-capture analysis had finished, so every restart read the whole file
+  again and reported an earlier check as unfinished.
+- Recomputing a channel's health score could arrive at a different number from the one stored,
+  because a recording's observations were replayed in the wrong order. Each observation now keeps
+  the moment it was applied, and a replay reproduces the stored score.
+
+## 0.9.2 - 2026-09-15
+
+Published as a container image only; these changes first reach this repository with 0.9.3.
+
+**Fixed**
+
+- The Logs page works in the Docker image. One file shipped without read permission for the
+  unprivileged user the container runs as, so the page loaded but its script did not, and it sat
+  on "Loading history..." forever. The image now normalizes file permissions as it is built, so
+  no file can arrive unreadable again.
+
+- The Logs page works in a container. It reads a log file, and a container was configured to
+  log only to standard output, so the page had nothing to show even once its script loaded.
+  Containers now write both, leaving `docker logs` unchanged, and an existing container is
+  updated automatically on its first start after upgrading - nothing to edit by hand.
+- A Logs page with no log file configured now says so and names the setting, instead of showing
+  an empty page with no explanation.
+
+**Changed**
+
+- The support bundle now records how the install is deployed - whether it is running in a
+  container, and as which user. A permission error means completely different things on a normal
+  install and in a container, and nothing in the bundle previously said which one it came from.
+
 ## 0.9.1 - 2026-09-15
 
 **Changed**

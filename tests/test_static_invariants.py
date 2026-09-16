@@ -43,6 +43,7 @@ cleanup). If a check goes red, the fix is to bring the code into compliance - no
 allowlist - unless a genuinely new legitimate exception is being added.
 """
 import ast
+import functools
 import io
 import os
 import re
@@ -67,7 +68,10 @@ def _walk(root, ext):
                 yield os.path.join(dirpath, f)
 
 
+@functools.lru_cache(maxsize=None)
 def _read(path):
+    """Memoized: the tree does not change during a run, and the scans below read the
+    same few hundred files from dozens of test methods (dev/changelog/979)."""
     with open(path, encoding='utf-8') as fh:
         return fh.read()
 
@@ -76,6 +80,7 @@ def _rel(path):
     return os.path.relpath(path, ROOT)
 
 
+@functools.lru_cache(maxsize=None)
 def _mask_comments_and_strings(source):
     """Return `source` with every COMMENT and STRING token's text replaced by spaces,
     preserving line/column layout so line-based slicing (span extraction, `.strip()`

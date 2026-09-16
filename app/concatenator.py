@@ -12,7 +12,7 @@ from collections import namedtuple
 from datetime import datetime
 
 from .fmt_utils import fmt_bytes as _fmt_bytes, fmt_duration
-from .proc_utils import delivery_ratio, supervise_ffmpeg
+from .proc_utils import delivery_ratio, supervise_ffmpeg, terminate_or_kill
 
 log = logging.getLogger(__name__)
 
@@ -40,6 +40,21 @@ CONCAT_POLL_INTERVAL_SECONDS = 5
 # chain is working this recording", not "ffmpeg is running right now".
 _active_concats: dict = {}
 _active_concats_lock = threading.Lock()
+
+
+# ── Live join child registry ──────────────────────────────────────────────────
+# recording_id -> (the ffmpeg Popen joining its segments, the path it is writing). The
+# join's own registry rather than an entry in postprocessor._active_conversions, because
+# has_active_conversion() drives start_recording's collision-wait policy and a join is not
+# a conversion - and rather than a field on _active_concats above, whose answer is "a chain
+# owns this recording" and would then be answering two questions at once.
+#
+# It exists so the shutdown handler can reach the child: without it the join lives only in
+# _run_concatenation's stack frame, and a SIGTERM mid-join orphans an ffmpeg that keeps
+# writing while the next process's CONCATENATING sweep starts a second join beside it
+# (dev/changelog/986).
+_active_join_procs: dict = {}
+_active_join_procs_lock = threading.Lock()
 
 
 # ── Live join progress ────────────────────────────────────────────────────────
@@ -124,6 +139,53 @@ def concat_progress(recording_id: int):
         out = {k: v for k, v in entry.items() if not k.startswith('_')}
     out['elapsed_seconds'] = max(0.0, time.monotonic() - out.pop('started'))
     return out
+
+
+def _track_join_child(recording_id: int, proc, output_path: str):
+    """Register the join's ffmpeg so a terminal path outside this thread can reach it."""
+    with _active_join_procs_lock:
+        _active_join_procs[recording_id] = (proc, output_path)
+
+
+def _untrack_join_child(recording_id: int):
+    with _active_join_procs_lock:
+        _active_join_procs.pop(recording_id, None)
+
+
+def kill_active_joins():
+    """Terminate every live join ffmpeg and remove the partial it was writing (called from
+    run.py on SIGTERM, beside kill_all_active and kill_active_conversions).
+
+    The partial goes too, which is where this differs from kill_active_conversions: a
+    conversion is checkpointed and the startup resume picks up its parts, while a join always
+    re-runs from the top, so its half-written output is referenced by nothing. Leaving it
+    behind is not merely untidy - reserve_concat_output_path() stakes a stem by whether any
+    file in its extension family exists, so the partial would push every future attempt at
+    this recording onto a `_2` name permanently, and nothing lists it for cleanup
+    (recorder.recording_disk_paths knows only committed paths).
+
+    Deleting it is safe for the same reason the failed-concat path a few hundred lines below
+    gives: output_path is committed only after supervise_ffmpeg returns, and the segments are
+    deleted only after that commit, so a child still running means the capture is intact on
+    disk and this file is the sole unreachable artifact. Deliberately does no DB work - a
+    signal handler cannot - and the join threads are daemons, so their own finally blocks do
+    not run once the interpreter starts shutting down.
+    """
+    with _active_join_procs_lock:
+        entries = list(_active_join_procs.items())
+        _active_join_procs.clear()
+    for rid, (proc, output_path) in entries:
+        log.info('Shutdown: killing live concat for recording %d', rid)
+        terminate_or_kill(proc, hard=True)
+        try:
+            if output_path and os.path.exists(output_path):
+                partial = os.path.getsize(output_path)
+                os.unlink(output_path)
+                log.info('Shutdown: removed recording %d\'s partial join output %s (%s)',
+                         rid, output_path, _fmt_bytes(partial))
+        except OSError as exc:
+            log.warning('Shutdown: could not remove partial join output %s: %s',
+                        output_path, exc)
 
 
 def _claim_concat(recording_id: int):
@@ -493,7 +555,9 @@ def _run_concatenation(app, recording_id: int, *, reason: str):
     from .database import (
         Recording, RecordingSegment, add_recording_event, preserve_cancelled_status,
         CAPTURE_COMPLETE, CONCATENATION_STARTED, CONCATENATION_DONE,
-        REC_STATUS_ANALYZING, REC_STATUS_CONCATENATING, REC_STATUS_FAILED,
+        REC_STATUS_ANALYZING, REC_STATUS_CONCATENATING, REC_STATUS_FAILED, REC_STATUS_PAUSED,
+        FAILURE_ALL_SEGMENTS_PLACEHOLDER, FAILURE_SEGMENT_FILES_MISSING, FAILURE_NO_VALID_SEGMENTS,
+        FAILURE_PAUSED_NOTHING_CAPTURED, FAILURE_INSUFFICIENT_DISK_SPACE, FAILURE_CONCAT_ERROR,
     )
     from . import events as ev
     from .recorder import _safe_name
@@ -544,6 +608,10 @@ def _run_concatenation(app, recording_id: int, *, reason: str):
             return
 
         log.info('Starting concatenation for recording %d (%s)', recording_id, rec.name)
+        # Read before the flip below erases it: a pause taken before any segment held data
+        # reaches the no-valid-segments branch, and "never recorded any data" alone does not
+        # say the recording was paused the whole time it could have been capturing.
+        was_paused = rec.status == REC_STATUS_PAUSED
 
         @retry_on_locked()
         def _mark_concatenating_and_commit():
@@ -606,14 +674,22 @@ def _run_concatenation(app, recording_id: int, *, reason: str):
                            f'the provider\'s placeholder clip rather than the channel, so there '
                            f'was nothing to join - the channel was down for the whole window')
                     log_why = 'every segment was a provider placeholder'
+                    failure_reason = FAILURE_ALL_SEGMENTS_PLACEHOLDER
                 elif stream_delivered:
                     why = (f'FAILED: no segment files on disk, but the capture recorded '
                            f'{_fmt_bytes(captured_bytes)} across {len(segments)} segment(s) - '
                            f'the files went missing after capture, so this is not a stream fault')
                     log_why = 'files missing after capture'
+                    failure_reason = FAILURE_SEGMENT_FILES_MISSING
+                elif was_paused:
+                    why = ('FAILED: no valid segments found - the recording was paused before '
+                           'the capture recorded any data, and its window ended while paused')
+                    log_why = 'paused before anything was captured'
+                    failure_reason = FAILURE_PAUSED_NOTHING_CAPTURED
                 else:
                     why = 'FAILED: no valid segments found - the capture never recorded any data'
                     log_why = 'nothing was captured'
+                    failure_reason = FAILURE_NO_VALID_SEGMENTS
                 log.error('Recording "%s" (#%d): no valid segments to concatenate (%s)',
                           rec.name, recording_id, log_why,
                           extra={'recording_id': recording_id, 'already_alerted': True})
@@ -628,6 +704,7 @@ def _run_concatenation(app, recording_id: int, *, reason: str):
                         return False
                     r.status = REC_STATUS_FAILED
                     r.completed_at = datetime.utcnow()
+                    r.failure_reason = failure_reason
                     add_recording_event(recording_id, CONCATENATION_DONE, detail=why)
                     db.session.commit()
                     return True
@@ -690,6 +767,7 @@ def _run_concatenation(app, recording_id: int, *, reason: str):
                         return False
                     r.status = REC_STATUS_FAILED
                     r.completed_at = datetime.utcnow()
+                    r.failure_reason = FAILURE_INSUFFICIENT_DISK_SPACE
                     add_recording_event(recording_id, CONCATENATION_DONE,
                                         detail=f'FAILED: not enough disk space - need {_fmt_bytes(total_seg_bytes)}, '
                                                f'only {_fmt_bytes(free_bytes)} free. Segments preserved. Free space and retry.')
@@ -791,6 +869,8 @@ def _run_concatenation(app, recording_id: int, *, reason: str):
                             stall_seconds=concat_stall_seconds,
                             progress_signal='size', noun='concat',
                             on_progress=_publish_join,
+                            on_spawn=lambda proc: _track_join_child(
+                                recording_id, proc, output_path),
                             label=f'Recording {recording_id} concat')
                         success = run.success
                         error_msg = None if success else run.error_msg
@@ -798,6 +878,10 @@ def _run_concatenation(app, recording_id: int, *, reason: str):
                         success = False
                         error_msg = str(exc)
                     finally:
+                        # Unregistered on every exit - success, ffmpeg failure, an exception -
+                        # so nothing outside this thread can reach a dead process or unlink an
+                        # output the success path is about to commit.
+                        _untrack_join_child(recording_id)
                         try:
                             os.unlink(concat_txt)
                         except OSError:
@@ -875,6 +959,7 @@ def _run_concatenation(app, recording_id: int, *, reason: str):
                         return False
                     r.status = REC_STATUS_FAILED
                     r.completed_at = datetime.utcnow()
+                    r.failure_reason = FAILURE_CONCAT_ERROR
                     add_recording_event(recording_id, CONCATENATION_DONE,
                                         detail=f'FAILED: {error_msg}')
                     db.session.commit()

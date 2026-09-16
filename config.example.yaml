@@ -16,7 +16,7 @@
 # logging.file, which appear below as commented-out examples because their defaults
 # are paths derived from wherever the app is installed.
 
-config_version: 4
+config_version: 5
 
 recording:
   # Where segments, the in-progress file and the finished recording are written.

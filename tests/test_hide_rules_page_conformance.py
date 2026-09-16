@@ -50,13 +50,16 @@ def _read(rel):
 
 class HideRulesPageTests(unittest.TestCase):
 
-    def setUp(self):
-        self.t = make_test_app()
-        self.app = self.t.app
-        self.client = self.app.test_client()
-        with self.app.app_context():
+    @classmethod
+    def setUpClass(cls):
+        # One app and one render for the whole class: every case reads the markup and
+        # none rewrites the state it was rendered from (dev/changelog/979).
+        cls.t = make_test_app()
+        cls.app = cls.t.app
+        cls.client = cls.app.test_client()
+        with cls.app.app_context():
             acct = seed.make_account(name='Test Provider')
-            self.acct_id = acct.id
+            cls.acct_id = acct.id
             # One channel offered, one hidden by hand, one hidden-but-deferred (in the
             # guide) - real Channel.hidden/hidden_deferred values, exactly what
             # app/channel_hiding.py::recompute() would have written.
@@ -69,11 +72,12 @@ class HideRulesPageTests(unittest.TestCase):
                                            account_id=None, enabled=True, match_count=1,
                                            deferred_count=0))
             db.session.commit()
-        self.resp = self.client.get('/channels/hide-rules')
-        self.html = self.resp.get_data(as_text=True)
+        cls.resp = cls.client.get('/channels/hide-rules')
+        cls.html = cls.resp.get_data(as_text=True)
 
-    def tearDown(self):
-        self.t.cleanup()
+    @classmethod
+    def tearDownClass(cls):
+        cls.t.cleanup()
 
     def _config(self):
         m = re.search(r'window\.HIDE_RULES_CONFIG = (\{.*?\});', self.html, re.S)

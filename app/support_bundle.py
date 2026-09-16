@@ -427,6 +427,38 @@ _MEMINFO_FIELDS = {
 }
 
 
+def _runtime_environment():
+    """How this install is deployed, which no table records and every report depends on.
+
+    A traceback reads completely differently depending on the answer. A PermissionError on
+    a file inside the application tree is a broken install on a bare-metal host and an
+    ordinary consequence of the container layout on a containerized one - /app is root-owned
+    there while the app deliberately runs as an unprivileged PUID, so a file that arrived
+    without world-read is unopenable and nothing else in the app is affected
+    (dev/changelog/981). Without these three values a reader cannot tell those apart, and
+    platform.platform() does not answer it: inside a container it reports the host's kernel.
+
+    Deliberately no absolute paths. The symlink targets are the container's own fixed paths
+    and identify nobody, while an install root is routinely a home directory carrying the
+    user's name - which is the identity the rest of this module exists to remove.
+    """
+    out = {'containerized': bool(os.environ.get('CHANNELBIN_DOCKER'))}
+    for name, fn in (('uid', 'getuid'), ('gid', 'getgid')):
+        getter = getattr(os, fn, None)
+        if getter is not None:
+            out[name] = getter()
+    base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    for name, rel in (('config_yaml_symlink', 'config.yaml'), ('instance_symlink', 'instance')):
+        path = os.path.join(base, rel)
+        try:
+            # None on a normal install, where neither is a symlink. Inside the container both
+            # must point into /config or an image upgrade silently discards what lives there.
+            out[name] = os.readlink(path) if os.path.islink(path) else None
+        except OSError as exc:
+            out[name] = f'unreadable: {exc}'
+    return out
+
+
 def _host_resources():
     """What the host had left - the numbers that let a remote reader say anything about a
     machine that died mid-recording.
@@ -681,6 +713,7 @@ def _build_meta(sanitizer, statter):
         'config_version': cfg.get('config_version'),
         'python_version': sys.version,
         'platform': platform.platform(),
+        'runtime': _runtime_environment(),
         'host': _host_resources(),
         'filesystem_check': statter.disclosure(),
         'redactions': _redaction_disclosure(sanitizer),

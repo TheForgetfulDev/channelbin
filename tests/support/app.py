@@ -313,6 +313,35 @@ def _assert_jobstore_is_sandboxed(tmpdir):
         )
 
 
+def _assert_engines_are_sandboxed(app, wanted_path):
+    """Fail loudly if this app's ORM engines aren't pointed at the DB the overrides named.
+
+    The sibling of _assert_jobstore_is_sandboxed above, and it exists for the same reason
+    in the other direction: that one guards an engine create_app() does not build, this one
+    guards the two it does. create_app() derives both the default and the background bind
+    from load_config(overrides=config_overrides), so the override reaching them is not
+    something a test can assume - anything that replaces load_config itself displaces it
+    silently, and the app comes up bound to whatever that replacement returns.
+
+    Not hypothetical: a test whose worker thread held a mock.patch on app.config.load_config
+    outlived its own test, mock.patch being process-global rather than thread-local, and the
+    NEXT make_test_app() in that process built an app on the real dvr.db while its _tmpdir
+    was a perfectly ordinary temp directory. Three junk recordings reached the live database
+    before anything noticed, and nothing in the suite could have (dev/changelog/986).
+    """
+    from app import db as _db
+    wanted = 'sqlite:///' + wanted_path
+    with app.app_context():
+        found = {name: str(engine.url) for name, engine in _db.engines.items()}
+    escaped = {name: url for name, url in found.items() if url != wanted}
+    if escaped:
+        raise AssertionError(
+            f'ORM engine(s) escaped the test sandbox: {escaped!r} - expected {wanted!r}. '
+            'create_app() builds both binds from load_config(overrides=config_overrides), '
+            'so something displaced that call - most likely a leaked thread still holding a '
+            'mock.patch on app.config.load_config from an earlier test.')
+
+
 class TestApp:
     """A live test app + client bound to a temp DB and temp dirs. Call cleanup() when done."""
 
@@ -411,6 +440,7 @@ class TestApp:
             cfgmod._yaml_cache = None
 
         self.app = create_app(config_overrides=overrides, start_scheduler=start_scheduler)
+        _assert_engines_are_sandboxed(self.app, overrides['database']['path'])
         self._started_scheduler = start_scheduler
         if start_scheduler:
             _assert_jobstore_is_sandboxed(self._tmpdir)

@@ -90,14 +90,15 @@ class LogsPageConformanceTests(unittest.TestCase):
         cls.tpl = _read(TPL)
         cls.css = _style_block(cls.tpl)
         cls.js = _read(JS)
+        # One app and one render for the whole class: every case reads the markup and
+        # none rewrites the state it was rendered from (dev/changelog/979).
+        cls.t = make_test_app()
+        cls.client = cls.t.app.test_client()
+        cls.html = cls.client.get('/logs').get_data(as_text=True)
 
-    def setUp(self):
-        self.t = make_test_app()
-        self.client = self.t.app.test_client()
-        self.html = self.client.get('/logs').get_data(as_text=True)
-
-    def tearDown(self):
-        self.t.cleanup()
+    @classmethod
+    def tearDownClass(cls):
+        cls.t.cleanup()
 
     # ── Page chrome ─────────────────────────────────────────────────────
 
@@ -136,6 +137,22 @@ class LogsPageConformanceTests(unittest.TestCase):
             resp = self.client.get('/logs')
         self.assertEqual(resp.status_code, 200)
         self.assertNotIn('None', resp.get_data(as_text=True).split('</h1>')[0])
+
+    def test_no_log_file_configured_says_so_rather_than_showing_an_empty_page(self):
+        """`logging.file` has no default, so an install that never set one renders a page
+        with no rows, nothing wrong and nothing said - which is the silence this app exists
+        to remove. It cost a first-container install a full diagnosis (dev/changelog/981).
+        The page must name the setting and say where the logs are actually going."""
+        with patch('app.routes.logs._log_file_path', return_value=None):
+            html = self.client.get('/logs').get_data(as_text=True)
+        self.assertIn('empty-state', html)
+        self.assertIn('logging.file', html)
+        self.assertIn('docker logs', html)
+
+    def test_a_configured_log_file_shows_no_such_notice(self):
+        with patch('app.routes.logs._log_file_path', return_value='/var/log/channelbin.log'):
+            html = self.client.get('/logs').get_data(as_text=True)
+        self.assertNotIn('No log file is configured', html)
 
     # ── The fixed box (16.1) ────────────────────────────────────────────
 

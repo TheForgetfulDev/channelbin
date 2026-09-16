@@ -355,6 +355,47 @@ REC_STATUS_COMPLETED     = 'COMPLETED'
 REC_STATUS_FAILED        = 'FAILED'
 REC_STATUS_ABORTED       = 'ABORTED'
 
+# Recording.failure_reason vocabulary - why a row is FAILED. Every writer of
+# REC_STATUS_FAILED sets exactly one of these in the same commit, and nothing else writes the
+# column; a Retry that takes the row out of FAILED clears it. The detail page's FAILED strip
+# has one branch per value (tests/test_failure_reason_disclosure.py checks that), so a new
+# value cannot land in the strip's fallback sentence unnoticed. NULL on a FAILED row means
+# the row predates the vocabulary (dev/changelog/990).
+#
+# The capture ran and gave up.
+FAILURE_MAX_CONSECUTIVE_FAILURES = 'MAX_CONSECUTIVE_FAILURES'
+FAILURE_DEAD_STREAM_DETECTED     = 'DEAD_STREAM_DETECTED'
+FAILURE_FAST_DELIVERY_DETECTED   = 'FAST_DELIVERY_DETECTED'
+# The failure budget ran out on an attempt where ffmpeg itself could not be started (Popen
+# raised), so the last thing that happened was local, not a stream fault.
+FAILURE_LAUNCH_FAILED            = 'LAUNCH_FAILED'
+# Never started.
+FAILURE_CONVERSION_COLLISION     = 'CONVERSION_COLLISION'
+FAILURE_CONNECTION_SLOT_TIMEOUT  = 'CONNECTION_SLOT_TIMEOUT'
+FAILURE_DVR_DIR_UNUSABLE         = 'DVR_DIR_UNUSABLE'
+FAILURE_MISSED_AT_STARTUP        = 'MISSED_AT_STARTUP'
+# The join. ALL_SEGMENTS_PLACEHOLDER leaves its files on disk, and a Retry join would refuse
+# them again for the same reason, so it offers no recovery.
+FAILURE_ALL_SEGMENTS_PLACEHOLDER = 'ALL_SEGMENTS_PLACEHOLDER'
+FAILURE_SEGMENT_FILES_MISSING    = 'SEGMENT_FILES_MISSING'
+FAILURE_NO_VALID_SEGMENTS        = 'NO_VALID_SEGMENTS'
+FAILURE_PAUSED_NOTHING_CAPTURED  = 'PAUSED_NOTHING_CAPTURED'
+FAILURE_INSUFFICIENT_DISK_SPACE  = 'INSUFFICIENT_DISK_SPACE'
+FAILURE_CONCAT_ERROR             = 'CONCAT_ERROR'
+# After the join.
+FAILURE_SOURCE_MISSING           = 'SOURCE_MISSING'
+FAILURE_CONVERSION_FAILED        = 'CONVERSION_FAILED'
+
+FAILURE_REASONS = (
+    FAILURE_MAX_CONSECUTIVE_FAILURES, FAILURE_DEAD_STREAM_DETECTED,
+    FAILURE_FAST_DELIVERY_DETECTED, FAILURE_LAUNCH_FAILED,
+    FAILURE_CONVERSION_COLLISION, FAILURE_CONNECTION_SLOT_TIMEOUT, FAILURE_DVR_DIR_UNUSABLE,
+    FAILURE_MISSED_AT_STARTUP,
+    FAILURE_ALL_SEGMENTS_PLACEHOLDER, FAILURE_SEGMENT_FILES_MISSING, FAILURE_NO_VALID_SEGMENTS,
+    FAILURE_PAUSED_NOTHING_CAPTURED, FAILURE_INSUFFICIENT_DISK_SPACE, FAILURE_CONCAT_ERROR,
+    FAILURE_SOURCE_MISSING, FAILURE_CONVERSION_FAILED,
+)
+
 # ChannelTest.status vocabulary. Shares string values with REC_STATUS_* above (and with
 # OnDemandTestJob.status, which has its own separate QUEUED/RUNNING/... vocabulary and no
 # constants of its own) - kept as distinct names because the two are different enumerations
@@ -415,9 +456,9 @@ class Recording(db.Model):
     # no-growth window inside a segment that had stopped delivering but was not yet killed.
     total_downtime_seconds    = db.Column(db.Float, default=0.0)
     final_file_size           = db.Column(db.Integer)
-    # MAX_CONSECUTIVE_FAILURES | DEAD_STREAM_DETECTED | FAST_DELIVERY_DETECTED - set only when
-    # status becomes FAILED, and only by app/watchdog.py::_mark_recording_failed
-    failure_reason            = db.Column(db.String(64))
+    # One of FAILURE_REASONS - set by every writer of REC_STATUS_FAILED, cleared when a Retry
+    # takes the row out of FAILED (dev/changelog/990)
+    failure_reason           = db.Column(db.String(64))
     # Dead-stream fast-fail retry budget (watchdog.dead_stream_max_retry_attempts). Counts
     # attempts scheduled, not just fired - incremented when status -> RETRYING, never reset
     # (a mid-window recovery that later dies again keeps counting against the same budget, so

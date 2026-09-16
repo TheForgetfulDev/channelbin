@@ -16,16 +16,20 @@ from tests.support.app import make_test_app
 
 
 class LoginPageConformanceTests(unittest.TestCase):
-    def setUp(self):
+    @classmethod
+    def setUpClass(cls):
+        # One app and one render for the whole class: every case reads the markup and
+        # none rewrites the state it was rendered from (dev/changelog/979).
         pw_hash = generate_password_hash('correcthorse-battery-staple')
-        self.t = make_test_app(extra_overrides={
+        cls.t = make_test_app(extra_overrides={
             'auth': {'enabled': True, 'password_hash': pw_hash, 'session_timeout_minutes': 0},
         })
-        self.client = self.t.app.test_client()
-        self.html = self.client.get('/login').get_data(as_text=True)
+        cls.client = cls.t.app.test_client()
+        cls.html = cls.client.get('/login').get_data(as_text=True)
 
-    def tearDown(self):
-        self.t.cleanup()
+    @classmethod
+    def tearDownClass(cls):
+        cls.t.cleanup()
 
     def test_does_not_extend_base_html(self):
         """A logged-out visitor gets no nav - the topnav/sidebar markup must be absent."""

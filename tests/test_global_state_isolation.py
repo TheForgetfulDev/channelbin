@@ -78,6 +78,7 @@ ALLOWED = {
     ('app/accounts.py', '_sync_progress'): 'popped by the sync thread itself (accounts.py finally block), keyed to its lifetime',
     ('app/accounts.py', '_sync_cancel_reasons'): 'read by the sync thread after cancellation; clearing loses the reason the UI reports',
     ('app/concatenator.py', '_active_concats'): 'each concat chain releases its own claim in its finally; clearing would let a second concat start against a recording already being concatenated',
+    ('app/concatenator.py', '_active_join_procs'): 'live ffmpeg children, same as postprocessor._active_conversions; the join unregisters its own in its finally and kill_active_joins() is what knows how to tear one down',
     ('app/config.py', '_yaml_cache'): 'self-invalidating - keyed on the parsed path plus its stat, and ConfigSandbox drops it on both edges',
     ('app/events.py', '_subscribers'): 'each SSE generator removes its own queue on disconnect; clearing strands a live stream',
     ('app/notifications.py', '_pending'): 'drained by the flush timer, which TestApp.cleanup() cancels',

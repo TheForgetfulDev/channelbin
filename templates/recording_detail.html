@@ -73,9 +73,10 @@
          finished capturing was "Record again", which re-records what the box already
          has (dev/docs/BUGS.md 2026-08-24). Both stay visible - Record again is still the
          right call when the recovery attempt is not the one you want. #}
-      {% if ts_source_available %}
+      {#- recover_act is decided once in the route (dev/changelog/990). -#}
+      {% if recover_act == 'retry-convert' %}
       <button class="btn btn-primary" data-act="retry-convert">Retry conversion</button>
-      {% elif segment_files_on_disk %}
+      {% elif recover_act == 'retry-concat' %}
       <button class="btn btn-primary" data-act="retry-concat">Retry join</button>
       {% endif %}
       <a class="btn" href="{{ find_airing_url }}">&#8635; Record again</a>
@@ -187,7 +188,6 @@
     {# Mirrors the desktop header's promotion, within the bar's two-button budget (9.5):
        when there is something to recover, Delete steps back into the kebab rather than
        the recovery action staying hidden behind it. #}
-    {% set recover_act = 'retry-convert' if ts_source_available else ('retry-concat' if segment_files_on_disk else none) %}
     {% if recover_act %}
     <button class="btn btn-primary" data-act="{{ recover_act }}">{{ 'Retry conversion' if recover_act == 'retry-convert' else 'Retry join' }}</button>
     {% endif %}
@@ -201,7 +201,7 @@
         <button class="menu-item" data-copy="{{ rec.url }}">Copy stream URL</button>
         {% if rec.output_path %}<button class="menu-item" data-copy="{{ rec.output_path }}">Copy output path</button>{% endif %}
         {% if not recover_act %}
-        <button class="menu-item" data-act="retry-concat">Retry join</button>
+        {% if not ts_source_available and not segment_files_on_disk %}<button class="menu-item" data-act="retry-concat">Retry join</button>{% endif %}
         {% else %}
         <div class="sep"></div>
         <button class="menu-item danger" data-act="delete">Delete recording</button>
@@ -396,23 +396,42 @@
 {% elif rec.status == 'FAILED' %}
 <div class="live-strip fail-strip">
   <span class="fx">&#10007;</span>
-  {# Every branch here names a real state. The trailing else must stay a state nothing
-     else can be - a FAILED recording whose capture succeeded and whose post-processing
-     died was being told its stream was never reached, while 17.9 GB of it sat on disk
-     (dev/docs/BUGS.md 2026-08-24). ts_source_available / segment_files_on_disk are
+  {# Every branch here names a real state, one per app/database.py FAILURE_* value
+     (tests/test_failure_reason_disclosure.py enforces it). The trailing else claims
+     nothing it cannot know: it used to say "the stream could not be reached" and was
+     the rendering of every FAILED writer that set no reason (dev/docs/BUGS.md
+     2026-08-24, dev/changelog/990). ts_source_available / segment_files_on_disk are
      stat'ed by the route; the template cannot reach the filesystem. #}
   <span>Failed{% if rec.completed_at %} at <b>{{ rec.completed_at | local_time_sec }}</b>{% endif %} -
     {% if rec.failure_reason == 'FAST_DELIVERY_DETECTED' %}the feed kept delivering video faster than real time, which means it was not showing live content, and there was no other channel to record from instead
     {%- elif rec.failure_reason == 'DEAD_STREAM_DETECTED' %}the stream reconnected but immediately died each time, so it was aborted automatically rather than looping forever
+    {%- elif rec.failure_reason == 'MAX_CONSECUTIVE_FAILURES' %}<b>{{ rec.consecutive_failures_peak }} consecutive restart attempts</b> produced no data (max consecutive failures reached)
+    {%- elif rec.failure_reason == 'LAUNCH_FAILED' %}the failure budget ran out on an attempt where <b>ffmpeg itself could not be started</b>, which is a problem on this machine rather than with the stream
+    {%- elif rec.failure_reason == 'CONVERSION_COLLISION' %}it <b>never started</b>: it waited for a running mp4 conversion to finish (collision policy: wait), and its own window ended first
+    {%- elif rec.failure_reason == 'CONNECTION_SLOT_TIMEOUT' %}it <b>never started</b>: the account had no free connection slot, and its own window ended while it waited for one
+    {%- elif rec.failure_reason == 'DVR_DIR_UNUSABLE' %}it <b>never started</b>: the DVR output directory could not be used, and the activity log below names the problem
+    {%- elif rec.failure_reason == 'MISSED_AT_STARTUP' %}it <b>never started</b>: the service was not running during its window, and its stop time had already passed when the service came back
+    {%- elif rec.failure_reason == 'ALL_SEGMENTS_PLACEHOLDER' %}every captured segment was the <b>provider's placeholder clip</b> rather than the channel, so there was nothing to join - the channel was down for the whole window
+    {%- elif rec.failure_reason == 'SEGMENT_FILES_MISSING' %}the capture recorded data, but its segment files <b>went missing</b> before they could be joined, which is not a stream fault
+    {%- elif rec.failure_reason == 'NO_VALID_SEGMENTS' %}the capture ran but the stream <b>never delivered any data</b>
+    {%- elif rec.failure_reason == 'PAUSED_NOTHING_CAPTURED' %}it was <b>paused</b> before the capture recorded any data, and its window ended while it was still paused
+    {%- elif rec.failure_reason == 'INSUFFICIENT_DISK_SPACE' %}there was <b>not enough free disk space</b> to join its segments
+    {%- elif rec.failure_reason == 'CONCAT_ERROR' %}the capture finished, but <b>joining its segments failed</b> - the activity log below names the ffmpeg error
+    {%- elif rec.failure_reason == 'SOURCE_MISSING' %}the joined <b>.ts was gone</b> when the service restarted, so its conversion could not be resumed
+    {%- elif rec.failure_reason == 'CONVERSION_FAILED' %}the capture finished and its segments were joined, but <b>the conversion gave up</b>
+    {#- No reason: a row from before every FAILED writer named one. Only what is still
+        measurable is said; the stream is never blamed on a guess. -#}
     {%- elif rec.consecutive_failures_peak > 0 %}<b>{{ rec.consecutive_failures_peak }} consecutive restart attempts</b> produced no data (max consecutive failures reached)
     {%- elif ts_source_available %}the capture finished and its segments were joined, but post-processing did not complete
     {%- elif segment_files_on_disk %}the capture recorded data, but it was never joined into a finished file
-    {%- else %}the stream could not be reached before producing any segments{% endif %}</span>
+    {%- else %}no failure reason was recorded for this recording - the activity log below says what happened{% endif %}</span>
   <span class="sep-dot">·</span>
   <span>
-    {%- if ts_source_available %}the joined <b>.ts</b> is still on disk - use <b>Retry conversion</b> to finish it
-    {%- elif segment_files_on_disk %}segments kept on disk - use <b>Retry join</b> to finish it
-    {%- else %}nothing was captured - use <b>Record again</b> to reschedule{% endif %}</span>
+    {%- if recover_act == 'retry-convert' %}the joined <b>.ts</b> is still on disk - use <b>Retry conversion</b> to finish it
+    {%- elif recover_act == 'retry-concat' %}segments kept on disk - use <b>Retry join</b> to finish it
+    {%- elif rec.failure_reason == 'ALL_SEGMENTS_PLACEHOLDER' %}a join would refuse the same placeholder clips again - use <b>Record again</b> to reschedule
+    {%- elif rec.failure_reason in ('CONVERSION_COLLISION', 'CONNECTION_SLOT_TIMEOUT', 'DVR_DIR_UNUSABLE', 'MISSED_AT_STARTUP', 'NO_VALID_SEGMENTS', 'PAUSED_NOTHING_CAPTURED') %}nothing was captured - use <b>Record again</b> to reschedule
+    {%- else %}nothing recoverable is left on disk - use <b>Record again</b> to reschedule{% endif %}</span>
 </div>
 {% elif rec.status == 'ABORTED' %}
 <div class="live-strip abort-strip">

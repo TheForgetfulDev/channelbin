@@ -105,12 +105,19 @@ class _WatchdogHarness(unittest.TestCase):
 
     def _stub_launch(self, new_process=None):
         """Stand-in for _launch_segment. Sets stop_event so the watchdog winds down after
-        one restart instead of looping; the real one is checked by its own tests."""
+        one restart instead of looping; the real one is checked by its own tests.
+
+        Returns LAUNCH_SPAWNED because that is what the real function returns when a child
+        is running, and the watchdog's restart branch reads it: anything else means the
+        spawn failed and the branch skips its own accounting entirely (dev/changelog/984).
+        A stub returning None would silently turn every restart in this file into a failed
+        launch."""
         def _stub(app, recording_id, seg_num):
             self.launched.append(seg_num)
             if new_process is not None:
                 self.state.process = new_process
             self.state.stop_event.set()
+            return recorder.LAUNCH_SPAWNED
         return _stub
 
     def _run_until_segment_closed(self, stall_timeout, new_process=None, timeout=45):

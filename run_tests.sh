@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Regression test runner (standalone - run before deploying when you choose to).
 #
-#   ./run_tests.sh              Runs the full suite, split across 3 worker processes (~206s).
-#   ./run_tests.sh -j 1         Runs everything in one process (~386s) - the original path.
+#   ./run_tests.sh              Runs the full suite, split across 4 worker processes (~297s).
+#   ./run_tests.sh -j 1         Runs everything in one process - the original path.
 #   ./run_tests.sh -j 6         More shards. Each worker peaks around 140MB.
 #   ./run_tests.sh --reverse-shards   A different, equally valid shard split. Use it to prove
 #                               a green run is order-independent and not just lucky.
