@@ -1050,6 +1050,45 @@ def _cfg_m004_concat_progress_supervision(cfg: dict) -> dict:
     return cfg
 
 
+CONTAINER_LOG_FILE = '/config/dvr.log'
+
+
+def _cfg_m005_container_log_file(cfg: dict) -> dict:
+    """Containers get a log file. Without one the Logs page is permanently empty, because it
+    tails `logging.file` and has no second source - dev/changelog/981.
+
+    Containers only. On any other install "no log file" is a legitimate choice (log to
+    stdout, let systemd or a supervisor keep it), so nothing is written there. Inside a
+    container it is not really a choice at all: the seeded config never set it, so the page
+    could not work on any container ever created, and the user never made the decision this
+    would be overriding.
+
+    Set-once, which is the whole reason this is a migration rather than a computed default.
+    A user who afterwards decides they want stdout alone clears the field and it stays
+    cleared - the migration has already run and will not run again. A default resolved at
+    read time could not tell "never set" from "deliberately cleared" and would keep
+    reimposing itself.
+
+    `/config` rather than anywhere else because it is a declared volume: a log on the image's
+    own layer is discarded at the next upgrade. Rotation is bounded by the existing
+    logging.max_bytes / backup_count defaults, so this cannot grow without limit.
+    """
+    if not os.environ.get('CHANNELBIN_DOCKER'):
+        return cfg
+    logging_cfg = cfg.get('logging')
+    if not isinstance(logging_cfg, dict):
+        logging_cfg = {}
+        cfg['logging'] = logging_cfg
+    if logging_cfg.get('file'):
+        return cfg
+    logging_cfg['file'] = CONTAINER_LOG_FILE
+    log.warning('config migration: logging.file set to %s - this container had none, so the '
+                'Logs page had nothing to read. Logs still go to stdout as well, so '
+                '`docker logs` is unchanged. Clear the setting if you want stdout only',
+                CONTAINER_LOG_FILE)
+    return cfg
+
+
 CONFIG_MIGRATIONS = [
     (1, "rename legacy 'xtream' section to 'sync'", _cfg_m001_xtream_to_sync),
     (2, "channel_testing.failing_score_threshold -> failing_band", _cfg_m002_failing_band),
@@ -1057,6 +1096,8 @@ CONFIG_MIGRATIONS = [
      _cfg_m003_conversion_pre_output_timeout),
     (4, 'ffmpeg.concat_timeout_seconds -> concat progress supervision',
      _cfg_m004_concat_progress_supervision),
+    (5, 'containers with no logging.file get one, so the Logs page has a source',
+     _cfg_m005_container_log_file),
 ]
 
 CURRENT_CONFIG_VERSION = CONFIG_MIGRATIONS[-1][0]

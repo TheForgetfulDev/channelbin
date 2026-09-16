@@ -31,8 +31,14 @@ config_backup:
   backup_dir: /config/instance/config-backups
 
 logging:
-  # No `file:` key, on purpose - logs go to stdout, where `docker logs` can see them.
   level: INFO
+  # Both a file and stdout, which is not the app's usual either/or: app/__init__.py adds a
+  # stream handler alongside the file handler when it sees the container environment. The
+  # file is what the Logs page reads - it tails a path and has no other source - and stdout
+  # is what `docker logs` shows, which is the only log surface there is before the UI comes
+  # up. On /config so it survives an image upgrade, and rotation is bounded by the
+  # logging.max_bytes / backup_count defaults (10 MB x 5).
+  file: /config/dvr.log
 
 display:
   # The container's TZ environment variable does not set this. Times in the UI and in

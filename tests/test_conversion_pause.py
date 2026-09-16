@@ -44,6 +44,7 @@ import app.postprocessor as ppmod  # noqa: E402
 import app.proc_utils as pumod  # noqa: E402
 from tests.support.app import make_test_app  # noqa: E402
 from tests.support import seed  # noqa: E402
+from tests.test_restart_guard import run_check_busy  # noqa: E402
 from app import db  # noqa: E402
 from app.database import (  # noqa: E402
     Recording, RecordingEvent, CONVERSION_YIELDED, CONVERSION_RESUMED,
@@ -57,8 +58,28 @@ from app.postprocessor import (  # noqa: E402
     do_postprocess, run_conversion_supervised, _active_conversions, _active_lock,
 )
 
-_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-_CHECK_BUSY = os.path.join(_REPO_ROOT, 'tools', 'check_busy.py')
+
+def _size(path):
+    """Bytes at path, 0 while it does not exist yet."""
+    try:
+        return os.path.getsize(path)
+    except OSError:
+        return 0
+
+
+def _wait_until(pred, timeout, interval=0.02):
+    """Poll pred() until it is true or timeout seconds pass. False on timeout.
+
+    A generous ceiling costs nothing when the condition is met in milliseconds, and is what
+    keeps a real-process test off the machine's clock: the assertion is that the thing
+    happens at all, not that it happened inside a margin a loaded CI runner can eat.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if pred():
+            return True
+        time.sleep(interval)
+    return pred()
 
 
 class _FakeChild:
@@ -297,25 +318,45 @@ class TerminateContinuesFirstTests(unittest.TestCase):
         # The measured behavior this design rests on: a stopped process that HANDLES SIGTERM
         # does not act on it until something continues it, so terminate_or_kill() would spend
         # its entire timeout and then SIGKILL. With the SIGCONT it exits promptly.
+        #
+        # Decided on the exit code, never on a clock: the child's handler exits 0, and the
+        # handler can only run once something has continued the process, so returncode 0 IS
+        # the SIGCONT. Without it the pending SIGTERM is never acted on, the wait times out
+        # and SIGKILL lands, giving -9. A stopwatch bound instead of this measured a shared
+        # CI runner and turned a green commit red (dev/changelog/983).
+        #
+        # The one stdout line is a handshake, not a stream: the child writes it and nothing
+        # else, and it is read immediately, so no pipe buffer can fill behind it. It has to
+        # be a handshake rather than a sleep because the outcome above is only decidable
+        # once the handler is installed - SIGSTOP landing first leaves SIGTERM at its default
+        # action, which the kernel applies to a stopped process without any SIGCONT, and the
+        # test would then pass against a teardown that never continues anything.
         proc = subprocess.Popen(
             [sys.executable, '-c',
-             'import signal, time\n'
+             'import signal, sys, time\n'
              'signal.signal(signal.SIGTERM, lambda *a: (_ for _ in ()).throw(SystemExit(0)))\n'
+             'sys.stdout.write("ready\\n"); sys.stdout.flush()\n'
              'time.sleep(60)\n'],
-            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            text=True)
         try:
-            time.sleep(0.5)  # let the handler be installed before stopping it
+            self.assertEqual('ready', proc.stdout.readline().strip(),
+                             'the child never reported its SIGTERM handler installed')
             self.assertTrue(suspend_process(proc))
-            started = time.monotonic()
-            terminate_or_kill(proc, timeout=3.0)
-            elapsed = time.monotonic() - started
+            # Deliberately generous, and free: nothing here measures the timeout, and on the
+            # passing path terminate_or_kill returns the moment the child exits. The headroom
+            # only widens the window a continued child has to be scheduled and run its
+            # handler before a loaded machine could make a SIGKILL look like a missing SIGCONT.
+            terminate_or_kill(proc, timeout=10.0)
             self.assertIsNotNone(proc.poll(), 'the stopped child outlived its teardown')
-            self.assertLess(elapsed, 2.0,
-                            'teardown waited out its whole timeout on a stopped child')
+            self.assertEqual(0, proc.returncode,
+                             'the stopped child did not exit through its SIGTERM handler, so '
+                             'teardown never continued it')
         finally:
             if proc.poll() is None:
                 proc.kill()
                 proc.wait(timeout=5)
+            proc.stdout.close()
 
     def test_suspend_and_resume_actually_stop_and_start_a_real_child(self):
         # Proves the two helpers do what they claim on this OS rather than only recording
@@ -329,17 +370,22 @@ class TerminateContinuesFirstTests(unittest.TestCase):
              '    fh.write("x"); fh.flush(); time.sleep(0.01)\n', path],
             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         try:
-            time.sleep(0.5)
+            # Bounded polls rather than fixed sleeps on both sides: a child slow to open its
+            # file made the first read raise FileNotFoundError instead of failing with a
+            # message, and half a second was not enough to prove a resumed child had picked
+            # back up on a loaded machine (dev/changelog/983). The unchanged-size check
+            # between them stays a fixed wait - absence cannot be polled for.
+            self.assertTrue(_wait_until(lambda: _size(path) > 0, 10),
+                            'the child never started writing')
             self.assertTrue(suspend_process(proc))
-            time.sleep(0.2)
+            time.sleep(0.2)  # let any write already in flight land
             frozen = os.path.getsize(path)
             time.sleep(0.5)
             self.assertEqual(frozen, os.path.getsize(path),
                              'a suspended child kept working')
             self.assertTrue(resume_process(proc))
-            time.sleep(0.5)
-            self.assertGreater(os.path.getsize(path), frozen,
-                               'a resumed child did not pick back up')
+            self.assertTrue(_wait_until(lambda: _size(path) > frozen, 10),
+                            'a resumed child did not pick back up')
         finally:
             proc.kill()
             proc.wait(timeout=5)
@@ -525,8 +571,9 @@ class RestartGuardParkedTests(unittest.TestCase):
         self.t.cleanup()
 
     def _check_busy(self):
-        return subprocess.run([sys.executable, _CHECK_BUSY, '--db', self.t.db_path],
-                              capture_output=True, text=True, cwd=_REPO_ROOT, timeout=120)
+        # In-process, like every other check_busy case; the one real spawn lives in
+        # tests/test_restart_guard.py (dev/changelog/979).
+        return run_check_busy(self.t.db_path)
 
     def test_a_parked_recording_does_not_block_a_restart(self):
         rec = seed.make_recording(status=REC_STATUS_CONVERTING, name='parked conv')

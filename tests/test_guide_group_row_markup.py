@@ -55,22 +55,26 @@ def _rows(html):
 class GuideGroupRowMarkupTests(unittest.TestCase):
     """The rendered /guide marks a group row and leaves a plain channel row alone."""
 
-    def setUp(self):
-        self.t = make_test_app()
-        self.ctx = self.t.app.app_context()
-        self.ctx.push()
+    @classmethod
+    def setUpClass(cls):
+        # One app and one render for the whole class: every case reads the markup and
+        # none rewrites the state it was rendered from (dev/changelog/979).
+        cls.t = make_test_app()
+        cls.ctx = cls.t.app.app_context()
+        cls.ctx.push()
         acct = seed.make_account()
         # The confusable pair the cues exist for: a member channel holding its own row
         # next to the group that also holds one.
-        self.member = seed.make_channel(acct, stream_id=1, name='Fox Sports 1',
+        cls.member = seed.make_channel(acct, stream_id=1, name='Fox Sports 1',
                                         in_guide=True)
-        seed.make_group(name='FS1', members=[self.member], in_guide=True)
+        seed.make_group(name='FS1', members=[cls.member], in_guide=True)
         db.session.commit()
-        self.rows = _rows(self.t.client.get('/guide').get_data(as_text=True))
+        cls.rows = _rows(cls.t.client.get('/guide').get_data(as_text=True))
 
-    def tearDown(self):
-        self.ctx.pop()
-        self.t.cleanup()
+    @classmethod
+    def tearDownClass(cls):
+        cls.ctx.pop()
+        cls.t.cleanup()
 
     def test_both_rows_render(self):
         self.assertIn('FS1', self.rows)

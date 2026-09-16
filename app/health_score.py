@@ -166,6 +166,10 @@ def score_recording_metrics_quality(downtime_seconds: float, restart_count: int,
     return final, breakdown
 
 
+def _iso(dt):
+    return dt.isoformat() if hasattr(dt, 'isoformat') else str(dt)
+
+
 def blend_health_score(channel, quality: int, observed_at, source_weight: float, cfg: dict):
     """Fold one observation into a channel's cached lifetime score. Pure - no I/O.
 
@@ -186,7 +190,7 @@ def blend_health_score(channel, quality: int, observed_at, source_weight: float,
     if channel.health_score is None:
         breakdown = {
             'quality': quality, 'source_weight': source_weight, 'first_observation': True,
-            'new_score': float(quality),
+            'observed_at': _iso(observed_at), 'new_score': float(quality),
         }
         return float(quality), 1, observed_at, breakdown
 
@@ -209,7 +213,7 @@ def blend_health_score(channel, quality: int, observed_at, source_weight: float,
 
     breakdown = {
         'quality': quality, 'source_weight': source_weight, 'first_observation': False,
-        'old_score': old_score, 'observed_at': observed_at.isoformat() if hasattr(observed_at, 'isoformat') else str(observed_at),
+        'old_score': old_score, 'observed_at': _iso(observed_at),
         'half_life_samples': half_life_samples,
         'decay': round(decay, 4), 'effective_alpha': round(effective_alpha, 4),
         'new_score': new_score,
@@ -787,6 +791,12 @@ def apply_capture_quality_correction(app, recording_id: int, analysis_completed_
     resume blend a second time - which is how two channels ended up holding scores their own
     observation ledger could not reproduce (dev/changelog/951). The caller owns the meaning of
     the stamp; this function owns only its atomicity.
+
+    A recording with no channel (URL-only, or its channel deleted since capture) has nothing
+    to blend, but its analysis still finished, so the stamp is committed on that path too -
+    otherwise every resume re-reads the file and claims an earlier check did not finish
+    (dev/changelog/991). Each path reaches exactly one commit, which is what makes the
+    whole-function retry safe.
     """
     with app.app_context():
         from . import db
@@ -795,10 +805,16 @@ def apply_capture_quality_correction(app, recording_id: int, analysis_completed_
         from datetime import datetime
 
         recording = db.session.get(Recording, recording_id)
-        if recording is None or recording.channel_id is None:
+        if recording is None:
             return
-        channel = db.session.get(Channel, recording.channel_id)
+        channel = (db.session.get(Channel, recording.channel_id)
+                   if recording.channel_id is not None else None)
         if channel is None:
+            log.info('Recording %d: no channel to score (channel_id=%s) - capture-quality '
+                     'correction not blended', recording_id, recording.channel_id)
+            if analysis_completed_at is not None:
+                recording.analysis_completed_at = analysis_completed_at
+                db.session.commit()
             return
 
         cfg = load_config()
@@ -808,9 +824,13 @@ def apply_capture_quality_correction(app, recording_id: int, analysis_completed_
             recording.duration_seconds, cfg)
 
         weight = rs_cfg.get('capture_quality_source_weight', 1.0)
+        observed_at = datetime.utcnow()
         new_score, new_count, new_updated_at, _ = blend_health_score(
-            channel, quality, datetime.utcnow(), weight, cfg
+            channel, quality, observed_at, weight, cfg
         )
+        # The blend instant is not otherwise on the row, and a replay has to place this
+        # observation where it actually ran (app/health_recompute.py::observation_ledger).
+        breakdown['observed_at'] = _iso(observed_at)
         channel.health_score = new_score
         channel.health_score_sample_count = new_count
         channel.health_score_updated_at = new_updated_at

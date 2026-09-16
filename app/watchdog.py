@@ -9,7 +9,10 @@ import threading
 from datetime import datetime, timedelta
 from typing import NamedTuple
 
-from .database import add_recording_event, REC_STATUS_FAILED, REC_STATUS_RETRYING
+from .database import (
+    add_recording_event, REC_STATUS_FAILED, REC_STATUS_RETRYING,
+    FAILURE_MAX_CONSECUTIVE_FAILURES, FAILURE_DEAD_STREAM_DETECTED, FAILURE_FAST_DELIVERY_DETECTED,
+)
 from .db_utils import retry_on_locked
 from .probe import parse_ffprobe
 from .proc_utils import (DeliveryRateMonitor, GrowthMonitor, read_capture_content_position,
@@ -876,8 +879,50 @@ class WatchdogThread(threading.Thread):
 
                         # Launch next segment
                         next_seg_num = seg_num + 1
-                        from .recorder import _launch_segment
-                        _launch_segment(self.app, self.recording_id, next_seg_num)
+                        from .recorder import (_launch_segment, LAUNCH_SPAWNED,
+                                               LAUNCH_FAILED)
+                        launch = _launch_segment(self.app, self.recording_id, next_seg_num)
+
+                        if launch is not LAUNCH_SPAWNED:
+                            # Nothing is running, so there is nothing below to judge and
+                            # no verdict to reach. A failed spawn has exactly one owner
+                            # and it is _handle_launch_failure, which has already counted
+                            # it, written its RESTART_FAILED and either given up or
+                            # started the relaunch thread. Re-deriving it here through
+                            # wait_for_file_data - which returns False on its first poll,
+                            # because state.process is still the OLD dead one - charged
+                            # one transient Popen failure a second increment and a second
+                            # RESTART_FAILED claiming a segment that was never spawned
+                            # "produced no data", then burned a group member for a local
+                            # failure (health_score.py forbids the fail floor for one) or
+                            # failed an already-FAILED recording a second time
+                            # (dev/changelog/984).
+                            #
+                            # The downtime is still charged: the clock is not what was
+                            # double-counted, and these seconds are as lost as any other
+                            # restart's. Breaking hands control to the outer loop, which
+                            # waits out the relaunch thread - or exits, because a give-up
+                            # inside _handle_launch_failure set this same state object's
+                            # stop_event before returning.
+                            if launch is LAUNCH_FAILED:
+                                # Read outside the closure for the same reason the
+                                # succeeded/failed paths below do: a lock-retry re-runs it
+                                # and would charge a longer gap each attempt.
+                                failed_gap_seconds = time.monotonic() - gap_start
+
+                                @retry_on_locked()
+                                def _record_failed_launch_downtime_and_commit():
+                                    r = db.session.get(Recording, self.recording_id)
+                                    r.total_downtime_seconds += failed_gap_seconds
+                                    db.session.commit()
+
+                                _record_failed_launch_downtime_and_commit()
+                                log.warning(
+                                    'Recording %d: the relaunch of segment %d never '
+                                    'spawned - the launch failure owns this one, so the '
+                                    'restart is not counted again here',
+                                    self.recording_id, next_seg_num)
+                            break
 
                         # Wait for new segment to start growing. path_fn queries the
                         # row each poll - it may not exist yet right after launch.
@@ -887,11 +932,11 @@ class WatchdogThread(threading.Thread):
                             ).first()
                             return s.file_path if s else None
 
-                        # proc= is read after _launch_segment, so it is the NEW process (or
-                        # the old dead one if the spawn itself failed, which is equally a
-                        # restart that will never produce data). Without it a relaunch that
-                        # dies on connect costs the full stall_timeout to notice, exactly the
-                        # latency the proc= check exists to remove.
+                        # proc= is read after _launch_segment, and the branch above means a
+                        # spawn that failed never reaches here - so this is always the NEW
+                        # process. Without it a relaunch that dies on connect costs the
+                        # full stall_timeout to notice, exactly the latency the proc= check
+                        # exists to remove.
                         restart_ok = wait_for_file_data(
                             _next_seg_path, stall_timeout,
                             stop_check=self.state.stop_event.is_set,
@@ -1124,6 +1169,10 @@ class WatchdogThread(threading.Thread):
         """Shared tail for _fail_recording / _fail_recording_dead_stream: kill the
         process, set the terminal status, log the event, and drop from _active.
 
+        Returns True when this call is what failed the recording, False when it found the
+        row already FAILED and wrote nothing - see the guard below. _give_up reads that so
+        it does not blend a second health observation behind a no-op.
+
         cause: the first line of whatever ffmpeg said, if the caller already had it in
         scope (see the two call sites that pass one). Falls back to self._give_up_diagnostics
         (set by _give_up) when the caller has none - true for the one give-up path whose
@@ -1133,6 +1182,19 @@ class WatchdogThread(threading.Thread):
         from . import db
         from . import events as ev
         from .recorder import _active, _lock
+
+        # Another owner already gave up on this recording - _handle_launch_failure is the
+        # one that reaches here in practice, having failed the row and popped _active
+        # while this thread was still on its way to the same conclusion. Re-failing it
+        # writes a second RECORDING_FAILED and, through _give_up, a second 'failed' blend
+        # into the channel's score: the duplicate-observation shape dev/changelog/951
+        # removed elsewhere. Deliberately narrow - only FAILED. A COMPLETED or ABORTED row
+        # arriving here is a different defect and must stay loud rather than be absorbed
+        # by this guard (dev/changelog/984).
+        if rec.status == REC_STATUS_FAILED:
+            log.warning('Recording %d is already FAILED - not failing it again (%s)',
+                        self.recording_id, event_type)
+            return False
 
         exit_code, stderr_tail, reconnects, spool_missing = getattr(
             self, '_give_up_diagnostics', (None, '', (0, True), False))
@@ -1178,13 +1240,14 @@ class WatchdogThread(threading.Thread):
         ev.publish(self.recording_id, event_type, sse_extra)
         with _lock:
             _active.pop(self.recording_id, None)
+        return True
 
     def _fail_recording(self, rec, max_failures, cause=None):
         from .database import RECORDING_FAILED
-        self._mark_recording_failed(
+        marked = self._mark_recording_failed(
             rec,
             event_type=RECORDING_FAILED,
-            failure_reason='MAX_CONSECUTIVE_FAILURES',
+            failure_reason=FAILURE_MAX_CONSECUTIVE_FAILURES,
             log_msg=('Recording "%s" (#%d): max consecutive failures (%d) reached, aborting'
                       % (rec.name, self.recording_id, max_failures)),
             detail=f'Aborting: {max_failures} consecutive failures',
@@ -1199,9 +1262,15 @@ class WatchdogThread(threading.Thread):
         # by this dead recording until the app restarts (dev/docs/BUGS.md). A manual
         # URL-only recording has no channel, so there's no account slot to release -
         # same guard _schedule_dead_stream_retry already uses.
+        #
+        # Unconditional even when the row was already FAILED above: release() is a no-op
+        # on a slot nobody holds, and a leaked slot blocks every other recording on the
+        # account for the life of the process. Cheap in one direction, expensive in the
+        # other.
         from . import connection_limits as connlim
         if rec.channel_id and rec.channel:
             connlim.release(rec.channel.account_id, 'recording', self.recording_id)
+        return marked
 
     def _fail_recording_dead_stream(self, rec, streak, window_seconds, cause=None):
         from .database import RECORDING_FAILED_DEAD_STREAM
@@ -1210,10 +1279,10 @@ class WatchdogThread(threading.Thread):
         # indistinguishable from the very first trip (Product Principle 1).
         retried_note = (f' after {rec.dead_stream_retry_count} retry attempt(s)'
                         if rec.dead_stream_retry_count else '')
-        self._mark_recording_failed(
+        marked = self._mark_recording_failed(
             rec,
             event_type=RECORDING_FAILED_DEAD_STREAM,
-            failure_reason='DEAD_STREAM_DETECTED',
+            failure_reason=FAILURE_DEAD_STREAM_DETECTED,
             log_msg=(
                 'Recording "%s" (#%d): %d consecutive early-failure segments within %ds - '
                 'dead stream, aborting%s'
@@ -1230,6 +1299,7 @@ class WatchdogThread(threading.Thread):
         from . import connection_limits as connlim
         if rec.channel_id and rec.channel:
             connlim.release(rec.channel.account_id, 'recording', self.recording_id)
+        return marked
 
     def _fail_recording_fast_delivery(self, rec, strikes, ratio, window_seconds, cause=None):
         """Give up after a feed kept delivering faster than real time on every attempt and
@@ -1242,10 +1312,10 @@ class WatchdogThread(threading.Thread):
         a consecutive-failure abort would send its reader looking for a dead stream.
         """
         from .database import RECORDING_FAILED
-        self._mark_recording_failed(
+        marked = self._mark_recording_failed(
             rec,
             event_type=RECORDING_FAILED,
-            failure_reason='FAST_DELIVERY_DETECTED',
+            failure_reason=FAILURE_FAST_DELIVERY_DETECTED,
             log_msg=(
                 'Recording "%s" (#%d): feed delivered %.2fx real time on %d attempt(s) and '
                 'there is no other member to move to - stopping'
@@ -1263,6 +1333,7 @@ class WatchdogThread(threading.Thread):
         from . import connection_limits as connlim
         if rec.channel_id and rec.channel:
             connlim.release(rec.channel.account_id, 'recording', self.recording_id)
+        return marked
 
     def _schedule_dead_stream_retry(self, rec, streak, window_seconds, max_attempts, cause) -> bool:
         """Instead of giving up on a dead-stream trip immediately, back off and try again
@@ -1335,7 +1406,13 @@ class WatchdogThread(threading.Thread):
         from .recorder import collect_segment_diagnostics
         terminate_or_kill(self.state.process)
         self._give_up_diagnostics = collect_segment_diagnostics(self.recording_id)
-        fail_fn()
+        # False means the row was already FAILED and the terminal write was refused, so
+        # another owner has already blended this recording's one 'failed' observation.
+        # Blending a second one behind a no-op moves the channel's score twice for a
+        # single failure, and Channel.health_score is a lossy exponential average - there
+        # is no subtracting it back out (dev/changelog/984).
+        if not fail_fn():
+            return
         from .health_score import apply_recording_health_observation
         apply_recording_health_observation(self.app, self.recording_id, 'failed')
         from .recorder import persist_final_thumbnail
@@ -1364,7 +1441,7 @@ def finalize_dead_stream_retry_exhausted(app, recording_id: int, cause: str = No
             return None
         r.status = REC_STATUS_FAILED
         r.completed_at = datetime.utcnow()
-        r.failure_reason = 'DEAD_STREAM_DETECTED'
+        r.failure_reason = FAILURE_DEAD_STREAM_DETECTED
         r.next_retry_at = None
         detail = (f'Aborting: exhausted {r.dead_stream_retry_count} retry attempt(s) - '
                   f'scheduled window ended before the stream came back'

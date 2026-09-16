@@ -32,13 +32,17 @@ from tests.support.app import make_test_app
 
 
 class MaintenancePageConformanceTests(unittest.TestCase):
-    def setUp(self):
-        self.t = make_test_app()
-        self.client = self.t.app.test_client()
-        self.html = self.client.get('/maintenance').get_data(as_text=True)
+    @classmethod
+    def setUpClass(cls):
+        # One app and one render for the whole class: every case reads the markup and
+        # none rewrites the state it was rendered from (dev/changelog/979).
+        cls.t = make_test_app()
+        cls.client = cls.t.app.test_client()
+        cls.html = cls.client.get('/maintenance').get_data(as_text=True)
 
-    def tearDown(self):
-        self.t.cleanup()
+    @classmethod
+    def tearDownClass(cls):
+        cls.t.cleanup()
 
     def test_the_page_renders(self):
         self.assertEqual(self.client.get('/maintenance').status_code, 200)
@@ -176,13 +180,17 @@ class ReadinessCardConformanceTests(unittest.TestCase):
     is a call a careless edit would quietly undo.
     """
 
-    def setUp(self):
-        self.t = make_test_app()
-        self.client = self.t.app.test_client()
-        self.html = self.client.get('/maintenance').get_data(as_text=True)
+    @classmethod
+    def setUpClass(cls):
+        # One app and one render for the whole class: every case reads the markup and
+        # none rewrites the state it was rendered from (dev/changelog/979).
+        cls.t = make_test_app()
+        cls.client = cls.t.app.test_client()
+        cls.html = cls.client.get('/maintenance').get_data(as_text=True)
 
-    def tearDown(self):
-        self.t.cleanup()
+    @classmethod
+    def tearDownClass(cls):
+        cls.t.cleanup()
 
     def test_the_card_head_carries_its_own_state_pill(self):
         """On this page the verdict sits below a heading that says Maintenance, so the head

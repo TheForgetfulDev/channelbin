@@ -161,12 +161,15 @@ def _scan():
 
 
 class SelfClearingFlagMatchesTheCodeTests(unittest.TestCase):
-    def setUp(self):
-        self.sites = _scan()
+    @classmethod
+    def setUpClass(cls):
+        # One parse of app/ for the class: the scan reads a tree that does not change
+        # during the run, and the three cases below only read its result (dev/changelog/979).
+        cls.sites = _scan()
         # A retired type keeps its dismiss call sites so the rows already in the database
         # can still be cleared, but nothing raises it any more, so it can never appear
         # under Active alerts and is not flagged (dev/changelog/928).
-        self.cleared = set(self.sites) - RETIRED_ALERT_TYPES
+        cls.cleared = set(cls.sites) - RETIRED_ALERT_TYPES
 
     def test_every_type_the_app_clears_by_itself_is_flagged(self):
         missing = sorted(self.cleared - SELF_CLEARING_ALERT_TYPES)

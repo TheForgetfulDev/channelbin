@@ -219,6 +219,20 @@ body.on-logs .main {
     </div>
   </div>
 
+  {# Every row on this page is tailed from logging.file, and that setting has no default -
+     so an install that never set one shows an empty page with nothing wrong and nothing
+     said, which is the silence this app exists to not have. State the reason and name the
+     setting. Server-rendered because it is a fact about configuration, not active state. #}
+  {% if not log_path %}
+  <div class="empty-state">
+    <p>No log file is configured, so there is nothing for this page to read.</p>
+    <p>Set <strong>logging.file</strong> in Settings to a writable path and restart. The
+      application is still logging - without a file it writes to standard output, which is
+      wherever this process's output goes (<code>docker logs</code> for a container).</p>
+    <a class="btn" href="{{ url_for('settings.settings') }}">Settings &rarr;</a>
+  </div>
+  {% endif %}
+
   <div class="logfilter">
     <button class="logfilter-btn" id="logfilter-btn" type="button">
       <span class="lf-lbl">Filter</span>

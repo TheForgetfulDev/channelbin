@@ -45,19 +45,23 @@ from tests.support.seed import make_account, make_channel, make_recording
 
 
 class DashboardPageConformanceTests(unittest.TestCase):
-    def setUp(self):
-        self.t = make_test_app()
-        self.client = self.t.app.test_client()
-        with self.t.app.app_context():
+    @classmethod
+    def setUpClass(cls):
+        # One app and one render for the whole class: every case reads the markup and
+        # none rewrites the state it was rendered from (dev/changelog/979).
+        cls.t = make_test_app()
+        cls.client = cls.t.app.test_client()
+        with cls.t.app.app_context():
             acc = make_account(name='Acct One')
             ch = make_channel(acc, name='Channel One')
             make_recording(status='SCHEDULED', name='Booked show', channel_id=ch.id)
             make_recording(status='IN_PROGRESS', name='Capturing now', channel_id=ch.id)
             db.session.commit()
-        self.html = self.client.get('/').get_data(as_text=True)
+        cls.html = cls.client.get('/').get_data(as_text=True)
 
-    def tearDown(self):
-        self.t.cleanup()
+    @classmethod
+    def tearDownClass(cls):
+        cls.t.cleanup()
 
     def test_the_page_renders(self):
         self.assertEqual(self.client.get('/').status_code, 200)
@@ -205,10 +209,13 @@ class WindowOpenRowTests(unittest.TestCase):
     and vanished from the page entirely - while the recordings list rendered it as live.
     """
 
-    def setUp(self):
-        self.t = make_test_app()
-        self.client = self.t.app.test_client()
-        with self.t.app.app_context():
+    @classmethod
+    def setUpClass(cls):
+        # One app and one render for the whole class: every case reads the markup and
+        # none rewrites the state it was rendered from (dev/changelog/979).
+        cls.t = make_test_app()
+        cls.client = cls.t.app.test_client()
+        with cls.t.app.app_context():
             acc = make_account(name='Acct One')
             ch = make_channel(acc, name='Channel One')
             now = datetime.utcnow()
@@ -218,10 +225,11 @@ class WindowOpenRowTests(unittest.TestCase):
                                stop_time=now + timedelta(minutes=40),
                                started_at=now - timedelta(minutes=20), with_segment=True)
             db.session.commit()
-        self.html = self.client.get('/').get_data(as_text=True)
+        cls.html = cls.client.get('/').get_data(as_text=True)
 
-    def tearDown(self):
-        self.t.cleanup()
+    @classmethod
+    def tearDownClass(cls):
+        cls.t.cleanup()
 
     def _live_block(self):
         return re.search(r'data-sec="live".*?(?=data-sec="upcoming")', self.html, re.S).group(0)

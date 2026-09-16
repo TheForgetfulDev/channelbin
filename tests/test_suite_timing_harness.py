@@ -278,9 +278,15 @@ class PerTestCeilingTests(unittest.TestCase):
         """The unit is the whole change, so it gets an assertion rather than a comment. The
         wall-clock ceilings this replaced were 450 and 400; the serial suite's own measured
         per-test cost is ~155ms, so anything in the hundreds is still a wall clock."""
-        self.assertEqual(set(CEILINGS_MS_PER_TEST), {('0-2', 1), ('0-2', 3)})
+        self.assertEqual(set(CEILINGS_MS_PER_TEST), {('0-2', 1), ('0-2', 3), ('0-2', 4)})
         for value in CEILINGS_MS_PER_TEST.values():
             self.assertLess(value, 300.0, 'a ceiling this large is still a wall clock')
+
+    def test_the_default_shard_count_has_a_ceiling(self):
+        """The lookup is a .get() that quietly skips the check on a miss, so moving
+        DEFAULT_JOBS without adding its ceiling would leave every default run unjudged
+        (dev/changelog/989)."""
+        self.assertIn(('0-2', timing.DEFAULT_JOBS), CEILINGS_MS_PER_TEST)
 
     def test_a_suite_that_only_grew_does_not_trip_the_ceiling(self):
         """The headline defect. The same per-test cost over twice the tests doubles the wall

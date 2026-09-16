@@ -13,8 +13,8 @@ agent running the suite can relay it every time (CLAUDE.md ## Testing).
 
 ## Sharding (added 2026-08-11, dev/changelog/583)
 
-By default the suite is split across `DEFAULT_JOBS` worker processes and takes ~218s
-instead of ~386s. `-j 1` restores the original single-process path exactly and is the
+By default the suite is split across `DEFAULT_JOBS` worker processes (4 since
+dev/changelog/989, when this box went from 2 cores to 4). `-j 1` restores the original single-process path exactly and is the
 escape hatch for debugging anything order-dependent.
 
 Sharding is here rather than in a second runner because this module already owns the run,
@@ -23,7 +23,7 @@ thread-based, for two independent reasons: the tests patch module-level state
 (`app.config._CONFIG_PATH`, `recorder._active`) that is process-global, and roughly a third
 of the suite's wall clock is a single process *waiting* - 59s in `time.sleep` and 74s on
 379 child processes - so the win comes from overlapping idle time, not from cores. That is
-also why 3 shards beat 2 on a 2-core box.
+also why 3 shards beat 2 on the old 2-core box.
 
 Shards are built from whole **modules**, never individual tests, so a class keeps its
 `setUpClass` in one worker; they are packed by measured cost from the last passing history
@@ -106,9 +106,13 @@ BASELINE_WINDOW = 10
 #     That measurement itself carried 10% foreign CPU, so it reads a little high and the
 #     ceiling derived from it is correspondingly loose - the right direction for the
 #     diagnostic path, where a WARNING nobody is acting on costs more than it earns.
+#   -j 4: 49.5ms/test x 1.30 = 65, from the first 4-shard run on the 4-core box (297.3s /
+#     6,002 tests, green, 5% foreign CPU; dev/changelog/989). ONE run, so this is the least
+#     measured of the three and the first to re-derive once the history holds 30 green -j 4
+#     records.
 # Full reasoning, the replay table, and the history of the wall-clock era:
 # `dev/docs/PERF-test-suite.md` §6 - that file is the record, not this comment.
-CEILINGS_MS_PER_TEST = {('0-2', 1): 210.0, ('0-2', 3): 110.0}
+CEILINGS_MS_PER_TEST = {('0-2', 1): 210.0, ('0-2', 3): 110.0, ('0-2', 4): 65.0}
 
 # ── Per-test drift (added 2026-08-21, dev/changelog/777) ─────────────────────
 # Neither check above can see a permanent step that lands under TOL: the slower run joins the
@@ -151,9 +155,10 @@ MAX_LOG_RUNS = 10
 # tests/timing_history.jsonl is committed; `failures` + `errors` still carry the true totals,
 # so a stored list shorter than their sum means it was truncated here.
 MAX_FAILED_IDS = 50
-# Shards for a default run. 3 beats 2 (205.7s vs ~220s) on this 2-core box because a third
-# of the suite is idle waiting on sleeps and child processes; see the module docstring.
-DEFAULT_JOBS = 3
+# Shards for a default run. On 4 cores, 4 shards ran 297.3s against 366.6s for 3 on the same
+# box (dev/changelog/989). Must have an entry in CEILINGS_MS_PER_TEST, or the default run is
+# never judged against a ceiling at all.
+DEFAULT_JOBS = 4
 
 STATUS_PREFIX = '[SUITE-TIMING]'
 

@@ -70,10 +70,11 @@ class _LiveRestartHarness(_RestartHarness):
         inner = super()._stub_launch_next(produces_data=produces_data)
 
         def _stub(app, recording_id, seg_num):
-            inner(app, recording_id, seg_num)
+            outcome = inner(app, recording_id, seg_num)
             # After the row exists, so the watchdog reads this process (not the old dead
             # one) when it passes proc= to wait_for_file_data.
             self.state.process = self._live()
+            return outcome
         return _stub
 
     def _run_until_segment_closed(self, seg_num, *, stall_timeout, restart_delay=0,

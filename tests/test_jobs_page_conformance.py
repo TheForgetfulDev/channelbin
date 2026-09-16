@@ -64,16 +64,20 @@ def _tr_rows(html):
 
 
 class JobsPageConformanceTests(unittest.TestCase):
-    def setUp(self):
-        self.t = make_test_app()
-        self.client = self.t.app.test_client()
-        self.patcher = mock.patch('app.routes.jobs._build_job_list', return_value=JOBS)
-        self.patcher.start()
-        self.html = self.client.get('/jobs').get_data(as_text=True)
+    @classmethod
+    def setUpClass(cls):
+        # One app and one render for the whole class: every case reads the markup and
+        # none rewrites the state it was rendered from (dev/changelog/979).
+        cls.t = make_test_app()
+        cls.client = cls.t.app.test_client()
+        cls.patcher = mock.patch('app.routes.jobs._build_job_list', return_value=JOBS)
+        cls.patcher.start()
+        cls.html = cls.client.get('/jobs').get_data(as_text=True)
 
-    def tearDown(self):
-        self.patcher.stop()
-        self.t.cleanup()
+    @classmethod
+    def tearDownClass(cls):
+        cls.patcher.stop()
+        cls.t.cleanup()
 
     def test_the_page_renders(self):
         self.assertEqual(self.client.get('/jobs').status_code, 200)

@@ -83,12 +83,15 @@ class FailedRecordingRecoveryTests(unittest.TestCase):
         html = self._page(rec)
         self.assertIn('post-processing did not complete', html)
 
-    def test_a_capture_that_produced_nothing_still_says_so(self):
-        """The trailing else keeps its one real meaning."""
+    def test_a_row_with_no_reason_does_not_guess_one(self):
+        """The trailing else claims only what it can know. It used to say the stream could
+        not be reached, which was the rendering of every FAILED writer that set no reason
+        (dev/changelog/990)."""
         rec = seed.make_recording(status='FAILED', name='dead feed')
         db.session.commit()
         html = self._page(rec)
-        self.assertIn('could not be reached before producing any segments', html)
+        self.assertNotIn('could not be reached', html)
+        self.assertIn('no failure reason was recorded', html)
 
     # ── the recovery action is visible ───────────────────────────────────────
     def test_retry_conversion_is_a_visible_button_not_a_kebab_item(self):

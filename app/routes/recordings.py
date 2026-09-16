@@ -21,6 +21,7 @@ from ..database import (
     REC_STATUS_SCHEDULED, REC_STATUS_IN_PROGRESS, REC_STATUS_PAUSED, REC_STATUS_RETRYING,
     REC_STATUS_CONCATENATING, REC_STATUS_ANALYZING, REC_STATUS_CONVERTING,
     REC_STATUS_COMPLETED, REC_STATUS_FAILED, REC_STATUS_ABORTED,
+    FAILURE_ALL_SEGMENTS_PLACEHOLDER,
 )
 from ..channel_groups import (pick_best_member, recording_members,
                               format_eligible_members,
@@ -1061,6 +1062,15 @@ def recording_detail(recording_id):
         s.file_path and os.path.exists(s.file_path) and os.path.getsize(s.file_path) > 0
         for s in rec.segments
     )
+    # The one answer to "what recovers this FAILED recording", read by the header, the mobile
+    # action bar and the status strip alike. Placeholder segments are on disk but a Retry join
+    # refuses them again for the same reason, so they recover nothing (dev/changelog/990).
+    recover_act = None
+    if rec.status == REC_STATUS_FAILED:
+        if ts_source_available:
+            recover_act = 'retry-convert'
+        elif segment_files_on_disk and rec.failure_reason != FAILURE_ALL_SEGMENTS_PLACEHOLDER:
+            recover_act = 'retry-concat'
     thumb_cfg = load_config().get('recording', {}).get('live_thumbnail', {})
 
     # "Find another airing" prefill: stored program title snapshot, else a live EPG
@@ -1138,6 +1148,7 @@ def recording_detail(recording_id):
         'recording_detail.html', rec=rec, is_active=is_active,
         ts_source_available=ts_source_available,
         segment_files_on_disk=segment_files_on_disk,
+        recover_act=recover_act,
         conversion_max_attempts=conversion_max_attempts,
         max_dead_stream_retry_attempts=max_dead_stream_retry_attempts,
         now=now,
@@ -1881,6 +1892,8 @@ def retry_concat(recording_id):
     def _mark_concatenating_and_commit():
         r = db.session.get(Recording, recording_id)
         r.status = REC_STATUS_CONCATENATING
+        # Holds a value only while the row is FAILED; the next terminal writer names its own.
+        r.failure_reason = None
         db.session.commit()
 
     _mark_concatenating_and_commit()
@@ -1942,6 +1955,7 @@ def retry_convert(recording_id):
         r = db.session.get(Recording, recording_id)
         r.status = REC_STATUS_ANALYZING
         r.conversion_attempts = 0
+        r.failure_reason = None
         db.session.commit()
 
     _mark_analyzing_and_commit()

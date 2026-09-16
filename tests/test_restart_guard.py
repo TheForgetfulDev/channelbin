@@ -21,9 +21,15 @@ entry (a killed rebuild stranded the index at BUILDING). Invariants:
   (f) Nothing the guard blocks on can wedge restarts forever - a channel_tests row left
       open by a hard kill is closed at the next startup (dev/docs/BUGS.md 2026-08-18).
 
-check_busy.py is invoked as a subprocess against the test app's temp DB - never the real
-dvr.db - because that is exactly how restart.sh calls it.
+check_busy.py runs against the test app's temp DB - never the real dvr.db. Its main() is
+called in-process with the same argv restart.sh would pass, stdout captured, exit code
+returned; ONE test still spawns it as a real child, exactly as restart.sh does, and holds
+the in-process answer to the spawned one. Every spawn used to pay a full app import
+(~1s), and this file made 20 of them (dev/changelog/979).
 """
+import contextlib
+import importlib.util
+import io
 import os
 import subprocess
 import sys
@@ -44,9 +50,33 @@ _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _CHECK_BUSY = os.path.join(_REPO_ROOT, 'tools', 'check_busy.py')
 
 
-def run_check_busy(db_path):
+def _load_check_busy():
+    """The script as a module. It is not importable by name (tools/ is not a package and
+    the file is meant to be run), so load it from its path the way its own shebang would."""
+    spec = importlib.util.spec_from_file_location('check_busy', _CHECK_BUSY)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+_check_busy = _load_check_busy()
+
+
+def spawn_check_busy(db_path):
+    """The real thing: a child process, the way restart.sh invokes it."""
     return subprocess.run([sys.executable, _CHECK_BUSY, '--db', db_path],
                           capture_output=True, text=True, cwd=_REPO_ROOT, timeout=120)
+
+
+def run_check_busy(db_path):
+    """main() in-process with the argv restart.sh would pass; same stdout, same exit code,
+    handed back in the CompletedProcess shape the assertions were written against."""
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out), \
+         patch.object(sys, 'argv', ['check_busy.py', '--db', db_path]):
+        code = _check_busy.main()
+    return subprocess.CompletedProcess(['check_busy.py', '--db', db_path], code,
+                                       stdout=out.getvalue(), stderr='')
 
 
 class CheckBusyTests(unittest.TestCase):
@@ -96,6 +126,22 @@ class CheckBusyTests(unittest.TestCase):
         run_check_busy(self.t.db_path)
         self.assertEqual(os.stat(self.t.db_path).st_mtime_ns, before)
 
+    def test_the_spawned_cli_agrees_with_the_in_process_answer(self):
+        """The one real child process in this class. Everything else calls main()
+        in-process, which cannot notice a broken shebang, a sys.path that no longer finds
+        `app`, or an exit code that stopped reaching the shell - so one seeded, blocking
+        run goes through the CLI exactly as restart.sh runs it and must say the same thing."""
+        rec = seed.make_recording(status='CONVERTING', name='busy_cli')
+        seed.make_test_job(name='Nightly guide check', status='RUNNING')
+        db.session.commit()
+        spawned = spawn_check_busy(self.t.db_path)
+        local = run_check_busy(self.t.db_path)
+        self.assertEqual(spawned.returncode, 1, spawned.stdout + spawned.stderr)
+        self.assertEqual(spawned.returncode, local.returncode)
+        self.assertEqual(spawned.stdout, local.stdout)
+        self.assertIn(f'#{rec.id}', spawned.stdout)
+        self.assertIn('blocking-kinds: recordings health-checks', spawned.stdout)
+
     def test_a_rebuilding_index_exits_nonzero_and_is_named(self):
         """The actual root cause of dev/changelog/461: killing a rebuild mid-transaction
         strands it at BUILDING with nobody left to finish it."""
@@ -126,7 +172,7 @@ class CheckBusyTests(unittest.TestCase):
         self.assertIn('Provider Two', proc.stdout)
         self.assertIn('syncing', proc.stdout)
         # Both accounts in one run on purpose: this asserts the line discriminates on status
-        # rather than merely printing accounts, and each run here costs a subprocess.
+        # rather than merely printing accounts.
         self.assertNotIn('Provider Idle', proc.stdout)
 
     def test_a_syncing_account_is_still_named_alongside_a_blocking_recording(self):

@@ -847,6 +847,68 @@ def discard_conversion_parts(output_path):
     return removed
 
 
+# How far the assembled file's duration may sit from the span it should cover before it stops
+# being recognisable as this conversion's output. Generous deliberately: each join seam loses
+# about two frames, and the covered span is itself read from ffmpeg's progress output, so a
+# tight bound would refuse healthy files - while what this has to exclude (a half-written
+# assembly, a stale file left by an earlier format) is unreadable or wrong by minutes.
+_ADOPT_SLACK_SECONDS = 5.0
+_ADOPT_SLACK_FRACTION = 0.02
+
+
+def _adoptable_assembly(output_path: str, expected_seconds: float) -> bool:
+    """Is the file already sitting at `output_path` the finished assembly of an encode whose
+    parts have since been deleted?
+
+    Answered from the file, never from the row - the row is the thing in doubt wherever this
+    gets asked. A header-only probe settles the case that actually arises: +faststart writes
+    moov LAST and only relocates it once the write finishes, so an assembly killed mid-write
+    has no moov atom and ffprobe reports nothing about it at all (measured on this box, and
+    what the original incident saw as "moov atom not found"). Reading the whole file with
+    -count_packets would walk up to 19 GB to learn what the header already says.
+
+    ITS ONE BLIND SPOT, STATED RATHER THAN IMPLIED: a file truncated AFTER a successful
+    faststart write still carries a valid moov at the front and probes clean, and ffprobe
+    derives the format bitrate from the actual size, so no header field separates it from the
+    complete original. Only a whole-file read would. That shape is not what the crash this
+    guards against produces - the parts are deleted only once the assembly finished - so the
+    trade is deliberate.
+
+    Returns False for anything it cannot positively confirm - unreadable, zero-length, no
+    video stream, no duration, a duration that does not match, or no span to match it against
+    - so every unconfirmed case falls through to the caller's existing failure path rather
+    than adopting a file on a guess.
+    """
+    from .probe import parse_ffprobe
+
+    if not output_path or not os.path.exists(output_path):
+        return False
+    try:
+        if os.path.getsize(output_path) <= 0:
+            return False
+    except OSError:
+        return False
+    if not expected_seconds or expected_seconds <= 0:
+        log.warning('Cannot judge whether %s is a finished assembly: nothing recorded how '
+                    'much of the source it should cover', output_path)
+        return False
+
+    probe = parse_ffprobe(output_path, count_packets=False)
+    if not probe or not probe.get('video_codec'):
+        return False
+    duration = probe.get('duration')
+    if not duration or duration <= 0:
+        return False
+
+    slack = max(_ADOPT_SLACK_SECONDS, expected_seconds * _ADOPT_SLACK_FRACTION)
+    if abs(duration - expected_seconds) > slack:
+        log.warning('%s is readable but runs %.1fs against the %.1fs it should cover, so it '
+                    'is not the finished assembly of this conversion',
+                    output_path, duration, expected_seconds)
+        return False
+    return True
+
+
 def run_conversion_supervised(app, recording_id, cmd, output_path, *,
                               expected_duration, pre_output_timeout, interval, stall_seconds,
                               collision_policy='off', collision_multiplier=1.0,
@@ -1276,6 +1338,7 @@ def do_postprocess(app, recording_id: int, ts_path: str):
         CONVERSION_DONE, FILE_MOVED, CONCATENATION_DONE, SCRIPT_EXECUTED,
         REC_STATUS_ANALYZING, REC_STATUS_CONVERTING,
         REC_STATUS_ABORTED, REC_STATUS_FAILED, REC_STATUS_COMPLETED,
+        FAILURE_CONVERSION_FAILED,
     )
     from . import events as ev
     from . import alerts
@@ -2154,26 +2217,63 @@ def do_postprocess(app, recording_id: int, ts_path: str):
                 if _consume_cancel(recording_id):
                     cancelled = True
                     conversion_ok = False
-                elif join.success:
-                    discard_conversion_parts(output_path)
-                    _persist_conversion_parts(recording_id)
-                else:
-                    # THE PARTS ARE KEPT. They are the only copy of the encoding, the assembly
-                    # is a stream copy that costs minutes rather than hours, and a Retry
-                    # re-enters this function, finds source_complete still recorded and goes
-                    # straight back to the join. Deleting them here would turn a recoverable
-                    # failure into the hours-lost outcome this whole feature exists to end.
-                    conversion_ok = False
-                    last_error = join.error_msg or join.reason
-                    log.error('Recording %d: converted every frame but could not assemble the '
-                              'final file: %s', recording_id, last_error,
-                              extra={'recording_id': recording_id})
-                    if os.path.exists(output_path):
-                        try:
-                            os.unlink(output_path)
-                        except OSError as exc:
-                            log.warning('Could not delete the partial assembly %s: %s',
-                                        output_path, exc)
+                elif not join.success:
+                    # What a finished assembly of this conversion would have to run to: the
+                    # span the parts covered, or the source's own duration when an attempt
+                    # finished without the supervisor ever reporting an out_time.
+                    adopt_span = source_covered or expected_duration or 0.0
+                    if (join.reason == 'missing_part'
+                            and _adoptable_assembly(output_path, adopt_span)):
+                        # THE FINISHED FILE IS ADOPTED, NOT DELETED. Reaching here means the
+                        # row records a complete encode whose parts are gone while a
+                        # probe-clean file of the right length sits at the output path -
+                        # which is exactly what a crash between the discard and the
+                        # completion commit used to leave, and is not a state the deletion
+                        # below can improve. Destroying an hours-long re-encode's finished
+                        # output to satisfy a bookkeeping check is the opposite of completing
+                        # the recording at almost all costs. Gated on missing_part alone:
+                        # 'no_parts' cannot co-occur with a recorded complete encode (the two
+                        # move in one commit), and 'no_space' means the parts are still on
+                        # disk and the file at the output path is a half-written assembly.
+                        log.warning('Recording %d: the encoded parts are gone but the '
+                                    'assembled file is already at %s and probes clean - '
+                                    'adopting it rather than re-encoding',
+                                    recording_id, output_path)
+
+                        @retry_on_locked()
+                        def _commit_output_adopted(covered=adopt_span):
+                            add_recording_event(
+                                recording_id, DIAGNOSTICS,
+                                detail=f'Adopted the converted file already on disk: the '
+                                       f'encoded parts it was assembled from are gone, but '
+                                       f'the finished file is there and covers the expected '
+                                       f'{fmt_duration(covered, with_seconds=True)}. An '
+                                       f'earlier attempt was interrupted between deleting '
+                                       f'the parts and recording that the conversion was '
+                                       f'done.',
+                                extra={'kind': 'conversion_output_adopted',
+                                       'source_covered_seconds': round(covered, 3)})
+                            db.session.commit()
+
+                        _commit_output_adopted()
+                    else:
+                        # THE PARTS ARE KEPT. They are the only copy of the encoding, the
+                        # assembly is a stream copy that costs minutes rather than hours, and
+                        # a Retry re-enters this function, finds source_complete still
+                        # recorded and goes straight back to the join. Deleting them here
+                        # would turn a recoverable failure into the hours-lost outcome this
+                        # whole feature exists to end.
+                        conversion_ok = False
+                        last_error = join.error_msg or join.reason
+                        log.error('Recording %d: converted every frame but could not '
+                                  'assemble the final file: %s', recording_id, last_error,
+                                  extra={'recording_id': recording_id})
+                        if os.path.exists(output_path):
+                            try:
+                                os.unlink(output_path)
+                            except OSError as exc:
+                                log.warning('Could not delete the partial assembly %s: %s',
+                                            output_path, exc)
 
             if cancelled:
                 # User cancelled: keep the source .ts (Retry conversion works from CANCELLED),
@@ -2216,6 +2316,16 @@ def do_postprocess(app, recording_id: int, ts_path: str):
                     r = db.session.get(Recording, recording_id)
                     r.output_path = output_path
                     r.final_file_size = converted_size
+                    # THE CHECKPOINT IS CLEARED IN THE SAME COMMIT THAT NAMES THE OUTPUT, and
+                    # the parts are deleted only after it returns. Clearing it separately -
+                    # or, as this did, unlinking the parts first and recording it afterwards -
+                    # leaves a window where the row describes N parts that no longer exist,
+                    # and the next attempt believes that checkpoint and deletes the finished
+                    # file to satisfy it (dev/docs/BUGS.md 2026-09-15 @ 09:23:59 PM ET). One
+                    # commit for one fact means the only crash state left is an orphan part
+                    # beside a correctly-finished recording, which recording_disk_paths()
+                    # already enumerates for teardown.
+                    set_conversion_parts(r)
                     db.session.add(RecordingEvent(
                         recording_id=recording_id,
                         event_type=CONVERSION_DONE,
@@ -2224,6 +2334,9 @@ def do_postprocess(app, recording_id: int, ts_path: str):
                     db.session.commit()
 
                 _commit_conversion_done()
+                # Costs no extra disk headroom over the old ordering: the parts and the
+                # finished output already coexisted for the whole length of the join.
+                discard_conversion_parts(output_path)
                 # The conversion that had given up is over, so its alert is describing a
                 # state that no longer exists. Keyed on the recording rather than the
                 # (type, source) pair because CONVERSION_FAILED is raised under two
@@ -2311,6 +2424,7 @@ def do_postprocess(app, recording_id: int, ts_path: str):
                         return False
                     r.status = REC_STATUS_FAILED
                     r.completed_at = datetime.utcnow()
+                    r.failure_reason = FAILURE_CONVERSION_FAILED
                     db.session.add(RecordingEvent(
                         recording_id=recording_id,
                         event_type=CONVERSION_DONE,

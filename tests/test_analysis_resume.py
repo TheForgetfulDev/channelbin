@@ -305,6 +305,67 @@ class TheHealthObservationIsBlendedOnceTests(unittest.TestCase):
                           'a blend ran with gather_health_data off')
 
 
+class ChannellessAnalysisIsStampedTests(unittest.TestCase):
+    """Guards dev/docs/BUGS.md 2026-09-16 @ 06:41:00 AM ET. The completion stamp rode the
+    capture-quality blend's commit, and the blend returned before committing when the
+    recording had no channel - so a URL-only recording never recorded finishing its analysis
+    and every resume re-read the file under a false "did not finish" warning."""
+
+    def setUp(self):
+        self.t = make_test_app()
+        self.ts_path = os.path.join(self.t._tmpdir, 'show.ts')
+        with open(self.ts_path, 'wb') as fh:
+            fh.write(b'x' * 64)
+
+    def tearDown(self):
+        self.t.cleanup()
+
+    def _run(self, rid):
+        """do_postprocess with the probes patched and the REAL capture-quality blend."""
+        from app.postprocessor import do_postprocess
+        gather = mock.Mock(return_value=({}, None))
+        with mock.patch('app.config.load_config', _pp_config()), \
+             mock.patch('app.postprocessor._gather_recording_health', gather), \
+             mock.patch('app.postprocessor._scan_recording_timeline',
+                        return_value=(False, {}, 'clean')), \
+             mock.patch('app.postprocessor._detect_near_empty_segments'):
+            do_postprocess(self.t.app, rid, self.ts_path)
+        db.session.expire_all()
+        return gather
+
+    def _assert_analyzed_once(self, rid):
+        self._run(rid)
+        self.assertIsNotNone(db.session.get(Recording, rid).analysis_completed_at,
+                             'the analysis finished but nothing recorded that it did')
+
+        with self.assertNoLogs('app.postprocessor', level='WARNING'):
+            gather = self._run(rid)
+
+        self.assertFalse(gather.called, 'the joined file was read again on resume')
+        self.assertEqual(RecordingEvent.query.filter_by(
+            recording_id=rid, event_type=POSTCAPTURE_ANALYSIS_STARTED).count(), 1)
+        self.assertEqual(RecordingEvent.query.filter_by(
+            recording_id=rid, event_type=POSTCAPTURE_ANALYSIS_SKIPPED).count(), 1)
+
+    def test_a_url_only_recording_is_analyzed_once(self):
+        rec = seed.make_recording(status='ANALYZING', channel_id=None,
+                                  output_path=self.ts_path)
+        db.session.commit()
+        self._assert_analyzed_once(rec.id)
+
+    def test_a_recording_whose_channel_was_deleted_is_analyzed_once(self):
+        acc = seed.make_account()
+        ch = seed.make_channel(acc, stream_id=1, name='Gone')
+        db.session.commit()
+        rec = seed.make_recording(status='ANALYZING', channel_id=ch.id,
+                                  output_path=self.ts_path)
+        db.session.commit()
+        rid = rec.id
+        db.session.delete(db.session.get(Channel, ch.id))
+        db.session.commit()
+        self._assert_analyzed_once(rid)
+
+
 class RecordedTimelineScanTests(unittest.TestCase):
     """Skipping the phase must not simply move its ffprobe into the re-encode decision two
     hundred lines below, which is the only other caller of the scan."""

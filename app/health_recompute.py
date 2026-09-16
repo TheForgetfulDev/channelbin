@@ -23,6 +23,13 @@ score rather than re-deriving weights from durations that may since have been re
 The `observation_weight()` fallback covers only the rows that predate those columns and the
 capture-quality correction, which never stored its blend.
 
+**It places each observation at the instant it was blended, not at a column that happens to
+be nearby.** A recording's primary observation runs at the capture/concat boundary, hours
+before `completed_at` exists when a re-encode follows, and its capture-quality correction
+runs later still, at analysis time. Both blends store the instant they ran with, and the
+ledger reads it back; a health check that ran between them therefore replays between them,
+as it was blended (dev/changelog/992).
+
 Two places a replay legitimately differs from the number history produced, both surfaced
 rather than absorbed:
 
@@ -111,6 +118,23 @@ def _loads(raw):
         return {}
 
 
+def _stored_instant(breakdown, fallback):
+    """The observed_at a blend actually ran with, or `fallback` for a row that stored none."""
+    raw = breakdown.get('observed_at')
+    if isinstance(raw, str):
+        try:
+            return datetime.fromisoformat(raw)
+        except ValueError:
+            log.warning('Unparseable stored observed_at %r - using the row column instead', raw)
+    return fallback
+
+
+#: Tie-break between observations at the same instant. A recording's capture-quality
+#: correction is blended after its own primary observation by construction, so on a tie it
+#: must replay after it too - the kind names sort the other way round alphabetically.
+_KIND_RANK = {SOURCE_CAPTURE_CORRECTION: 1}
+
+
 def _stored_weight(breakdown, fallback):
     """The source_weight a blend actually ran with, or `fallback` for a row that stored none."""
     weight = breakdown.get('source_weight')
@@ -165,9 +189,12 @@ def observation_ledger(channel_id, cfg) -> List[Observation]:
                               Recording.capture_quality_breakdown.isnot(None)))
                   .all())
     for r in recordings:
-        observed_at = r.completed_at or r.start_time
+        # The column fallback serves only rows that stored no instant of their own; for them
+        # it is the best guess on record, never the blend's real time.
+        column_instant = r.completed_at or r.start_time
         if r.health_quality_score is not None:
             breakdown = _loads(r.health_blend_breakdown)
+            observed_at = _stored_instant(breakdown, column_instant)
             quality_breakdown = _loads(r.health_quality_breakdown)
             share = quality_breakdown.get('member_share')
             duration = r.duration_seconds
@@ -181,16 +208,17 @@ def observation_ledger(channel_id, cfg) -> List[Observation]:
                 (SOURCE_RECORDING, r.id) in excluded))
         correction = _loads(r.capture_quality_breakdown)
         if correction.get('final') is not None:
-            # The correction blends at postprocess time and stored no blend_breakdown, so
-            # neither its weight nor its timestamp is on the row. Its weight is the config
-            # constant it was read from, and it always follows its own recording's primary
-            # observation - which is all the ordering a replay needs.
+            # The correction stores no blend_breakdown, so its weight is the config constant
+            # it was read from. Its instant is stored in its own breakdown; a row that predates
+            # that falls back to analysis_completed_at, taken just before the blend ran.
             rs_cfg = cfg.get('channel_testing', {}).get('recording_score', {})
+            correction_at = _stored_instant(
+                correction, r.analysis_completed_at or column_instant)
             obs.append(Observation(
-                SOURCE_CAPTURE_CORRECTION, r.id, observed_at,
+                SOURCE_CAPTURE_CORRECTION, r.id, correction_at,
                 correction['final'],
                 float(rs_cfg.get('capture_quality_source_weight', 1.0)),
-                f'Post-process check of recording "{r.name}" on {format_local(observed_at)} '
+                f'Post-process check of recording "{r.name}" on {format_local(correction_at)} '
                 f'(scored {correction["final"]}/100)',
                 (SOURCE_CAPTURE_CORRECTION, r.id) in excluded))
 
@@ -223,7 +251,7 @@ def observation_ledger(channel_id, cfg) -> List[Observation]:
     # A NULL timestamp cannot be ordered against a real one and would crash the sort; such a
     # row also cannot be placed in the replay, so it is dropped rather than guessed at.
     obs = [o for o in obs if o.observed_at is not None]
-    obs.sort(key=lambda o: (o.observed_at, o.kind, o.source_id))
+    obs.sort(key=lambda o: (o.observed_at, _KIND_RANK.get(o.kind, 0), o.kind, o.source_id))
     return obs
 
 

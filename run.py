@@ -6,6 +6,7 @@ from app import create_app
 from app.config import load_config
 from app.recorder import kill_all_active
 from app.postprocessor import kill_active_conversions
+from app.concatenator import kill_active_joins
 from app.scheduler import release_pidfile
 
 app = create_app()
@@ -17,8 +18,14 @@ def _handle_shutdown(signum, frame):
     # segment file the next process doesn't know about. Conversions get the same
     # treatment; the killed conversion's row stays CONVERTING and the startup
     # resume path re-launches it (counting the restart-kill against its budget).
+    #
+    # The join is killed on the same terms but loses its half-written output, because
+    # unlike a conversion it keeps no checkpoint and always re-runs from the top - so
+    # the partial is referenced by nothing and would only push the next attempt onto a
+    # `_2` name (dev/changelog/986).
     kill_all_active()
     kill_active_conversions()
+    kill_active_joins()
     release_pidfile()
     sys.exit(0)
 

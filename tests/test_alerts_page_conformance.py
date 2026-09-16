@@ -65,22 +65,26 @@ def _alert(**kw):
 
 
 class AlertsPageConformanceTests(unittest.TestCase):
-    def setUp(self):
-        self.t = make_test_app()
-        self.client = self.t.app.test_client()
-        with self.t.app.app_context():
+    @classmethod
+    def setUpClass(cls):
+        # One app and one render for the whole class: every case reads the markup and
+        # none rewrites the state it was rendered from (dev/changelog/979).
+        cls.t = make_test_app()
+        cls.client = cls.t.app.test_client()
+        with cls.t.app.app_context():
             _alert(severity='CRIT', title='Capture died', body='a long traceback\nsecond line')
             _alert(severity='WARN', title='Stream stalled', read_at=datetime.utcnow())
             _alert(severity='INFO', title='Sync finished',
                    read_at=datetime.utcnow(), dismissed_at=datetime.utcnow())
             db.session.commit()
-        self.html = self.client.get('/alerts').get_data(as_text=True)
+        cls.html = cls.client.get('/alerts').get_data(as_text=True)
         # The dismissed alert is only on the page that asks for it, so the
         # "what can this row still do" cases read the include_dismissed view.
-        self.html_all = self.client.get('/alerts?include_dismissed=1').get_data(as_text=True)
+        cls.html_all = cls.client.get('/alerts?include_dismissed=1').get_data(as_text=True)
 
-    def tearDown(self):
-        self.t.cleanup()
+    @classmethod
+    def tearDownClass(cls):
+        cls.t.cleanup()
 
     def _rows(self, html=None):
         """Each rendered .al-row, as its own balanced chunk of markup."""
@@ -205,10 +209,13 @@ class AlertsPageConformanceTests(unittest.TestCase):
 
     def test_the_empty_state_is_the_shared_component(self):
         """DESIGN.md 3.14 - the page had its own `.alerts-empty` variant."""
-        with self.t.app.app_context():
-            Alert.query.delete()
-            db.session.commit()
-        html = self.client.get('/alerts').get_data(as_text=True)
+        # A fresh app has no alerts; deleting the class's rows would rewrite the state the
+        # shared render came from.
+        empty = make_test_app()
+        try:
+            html = empty.client.get('/alerts').get_data(as_text=True)
+        finally:
+            empty.cleanup()
         self.assertIn('<div class="empty-state">', html)
         self.assertNotIn('alerts-empty', html)
 

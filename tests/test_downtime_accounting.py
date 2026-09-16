@@ -54,7 +54,11 @@ class _RestartHarness(_WatchdogHarness):
         """Stand-in for _launch_segment that creates the next segment row, optionally
         writes a byte to it, and leaves stop_event alone so the restart resolves normally.
         A non-producing restart is handed an already-dead process, which is what makes
-        wait_for_file_data give up at once instead of burning the stall timeout."""
+        wait_for_file_data give up at once instead of burning the stall timeout.
+
+        Returns LAUNCH_SPAWNED, the real function's answer when a child is running - the
+        watchdog's restart branch skips all of its own accounting for any other value
+        (dev/changelog/984), which is the whole scenario this harness exists to drive."""
         def _stub(app, recording_id, seg_num):
             self.launched.append(seg_num)
             path = os.path.join(self.t._tmpdir, f'rec_{self.rid}_seg_{seg_num:03d}.ts')
@@ -69,6 +73,7 @@ class _RestartHarness(_WatchdogHarness):
                                             started_at=datetime.utcnow()))
             db.session.commit()
             self.state.current_segment_num = seg_num
+            return recorder.LAUNCH_SPAWNED
         return _stub
 
     def _run_until_event(self, event_type, *, stall_timeout, restart_delay,

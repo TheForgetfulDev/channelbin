@@ -39,10 +39,24 @@ def create_app(config_overrides=None, start_scheduler=True):
     logging.getLogger(__name__).info('ChannelBin %s starting', __version__)
 
     # Bring config.yaml forward across key renames/moves, then re-read it so the rest
-    # of startup sees the migrated values. (The pre-migration load above only feeds
-    # _setup_logging, whose keys have never been migrated.)
+    # of startup sees the migrated values. Logging is deliberately configured BEFORE this
+    # rather than after: a migration rewrites the user's config.yaml and says what it did,
+    # and those lines have to land somewhere.
+    pre_migration_log_file = cfg['logging'].get('file')
     migrate_config(config_overrides)
     cfg = load_config(overrides=config_overrides)
+
+    # The one exception to "logging keys are never migrated" (config migration 5 moves
+    # logging.file on a container that had none). Without this the migration would write the
+    # setting and the boot that performed it would still log nowhere but stdout, so the Logs
+    # page stays empty until a second restart - the same symptom the migration exists to fix,
+    # just delayed past the point where anyone would connect the two (dev/changelog/981).
+    # Guarded on the value actually moving, so the ordinary startup re-configures nothing.
+    if cfg['logging'].get('file') != pre_migration_log_file:
+        _setup_logging(cfg, force=True)
+        logging.getLogger(__name__).info(
+            'Logging reconfigured by a config migration - now writing %s',
+            cfg['logging'].get('file') or 'stdout only')
 
     app.secret_key = _resolve_secret_key(cfg)
     db_uri = 'sqlite:///' + cfg['database']['path']
@@ -339,7 +353,15 @@ def _resolve_secret_key(cfg):
     return key
 
 
-def _setup_logging(cfg):
+def _setup_logging(cfg, force=False):
+    """Configure the root logger from `cfg`.
+
+    force: tear down the handlers a previous call installed and replace them, rather
+    than the no-op logging.basicConfig performs once the root logger has any. Used
+    once, for a config migration that moves logging.file on the very boot that
+    applies it - see create_app. basicConfig(force=True) also removes the _AlertHandler
+    installed below, which is why exactly one is attached afterwards rather than two.
+    """
     level = getattr(logging, cfg['logging'].get('level', 'INFO').upper(), logging.INFO)
     log_file = cfg['logging'].get('file')
     if log_file:
@@ -357,10 +379,24 @@ def _setup_logging(cfg):
             handlers = [logging.FileHandler(log_file)]
     else:
         handlers = [logging.StreamHandler()]
+
+    # In a container, both - and that is not the same either/or the branch above makes.
+    # `docker logs` is the only log surface an operator has before the UI is reachable, and
+    # the Logs page reads a file and nothing else (app/routes/logs.py::_log_file_path), so
+    # picking one silences the other: a fileless container left the Logs page permanently
+    # empty while `docker logs` was full, and pointing the app at a file would have emptied
+    # `docker logs` instead (dev/changelog/981). Guarded by the env var docker/entrypoint.sh
+    # exports rather than applied everywhere, because an install whose process manager
+    # already redirects stdout into the same path this writes - which is exactly what
+    # restart.sh does on the dev box - would log every line to that file twice.
+    if log_file and os.environ.get('CHANNELBIN_DOCKER'):
+        handlers.append(logging.StreamHandler())
+
     logging.basicConfig(
         level=level,
         format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
         handlers=handlers,
+        force=force,
     )
 
     # Attached per-handler, not to the root logger: a logger's filters only run for records

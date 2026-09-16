@@ -430,6 +430,35 @@ class BundleContentsTests(_BundleTestCase):
         self.assertIn('python_version', meta)
         self.assertIn('platform', meta)
 
+    def test_meta_json_reports_the_deployment_shape(self):
+        """A traceback means different things on a bare-metal install and in a container,
+        and platform.platform() cannot tell them apart - inside a container it reports the
+        host's kernel. The uid is what turned a PermissionError inside the application tree
+        from unattributable into obvious (dev/changelog/981)."""
+        meta = json.loads(_unzip(sb.build_support_bundle()).read('meta.json'))
+        runtime = meta['runtime']
+        self.assertIs(runtime['containerized'], False)
+        self.assertEqual(runtime['uid'], os.getuid())
+        self.assertEqual(runtime['gid'], os.getgid())
+        # Not a container, so neither path is a symlink - and the key is present saying so
+        # rather than absent, which would read as "this bundle predates the check".
+        self.assertIsNone(runtime['config_yaml_symlink'])
+        self.assertIsNone(runtime['instance_symlink'])
+
+    def test_meta_json_reports_a_containerized_install(self):
+        with patch.dict(os.environ, {'CHANNELBIN_DOCKER': '1'}):
+            meta = json.loads(_unzip(sb.build_support_bundle()).read('meta.json'))
+        self.assertIs(meta['runtime']['containerized'], True)
+
+    def test_the_deployment_shape_carries_no_install_path(self):
+        """The symlink targets are the container's own fixed paths. An install root is
+        routinely a home directory carrying the user's name, which is exactly the identity
+        the rest of this module exists to remove."""
+        runtime = json.loads(
+            _unzip(sb.build_support_bundle()).read('meta.json'))['runtime']
+        base = os.path.dirname(os.path.dirname(os.path.abspath(sb.__file__)))
+        self.assertNotIn(base, json.dumps(runtime))
+
     def test_log_tail_is_capped(self):
         """Patches the cap down to a small, test-owned value rather than deriving the
         write count from the real production constant: writing "cap + 500" lines when

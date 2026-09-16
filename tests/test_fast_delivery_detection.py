@@ -355,30 +355,55 @@ class WatchdogFastDeliveryTests(unittest.TestCase):
         return RecordingSegment.query.filter_by(
             recording_id=self.rid, segment_number=0).first()
 
+    # The default detection - a 5x feed, three strikes left, nowhere asked to fail over -
+    # performed ONCE for the whole class and read by five tests. Same one-expensive-fixture
+    # shape as tests/test_downtime_accounting.py::_growth_stall_run: the real WatchdogThread
+    # has to watch a real window fill, so each run costs ~2s and five identical runs proved
+    # nothing the five separate assertions do not already prove (dev/changelog/979). The
+    # assertions stay separate so a partial fix cannot pass one and be excused by another.
+    # Do not inline it back into the tests; a test that needs a different rate, ratio or
+    # strike count still calls _run() itself.
+    _default_run = None
+
+    def _default_detection(self):
+        if WatchdogFastDeliveryTests._default_run is None:
+            seg = self._run(rate=5.0)
+            evt = RecordingEvent.query.filter_by(
+                recording_id=self.rid, event_type=FAST_DELIVERY_DETECTED).first()
+            rec = db.session.get(Recording, self.rid)
+            WatchdogFastDeliveryTests._default_run = {
+                'ended': seg.ended_at is not None,
+                'exit_reason': seg.exit_reason,
+                'event_detail': evt.detail if evt is not None else None,
+                'event_segment': evt.segment_number if evt is not None else None,
+                'observations': ChannelEvent.query.filter_by(
+                    channel_id=self.ch.id,
+                    event_type=CHANNEL_FAST_DELIVERY_HEALTH_OBSERVATION).count(),
+                'failovers': list(self.failovers),
+                'launched': list(self.launched),
+                'status': rec.status,
+            }
+        return WatchdogFastDeliveryTests._default_run
+
     def test_a_fast_feed_has_its_capture_stopped(self):
-        seg = self._run(rate=5.0)
-        self.assertIsNotNone(seg.ended_at)
-        self.assertEqual(seg.exit_reason, 'FAST_DELIVERY_KILLED')
+        run = self._default_detection()
+        self.assertTrue(run['ended'])
+        self.assertEqual(run['exit_reason'], 'FAST_DELIVERY_KILLED')
 
     def test_the_detection_is_announced_on_the_recording(self):
         """Failure paths must be observable - stopping a capture that was still receiving
         data is the loudest thing this watchdog does."""
-        self._run(rate=5.0)
-        evt = RecordingEvent.query.filter_by(
-            recording_id=self.rid, event_type=FAST_DELIVERY_DETECTED).first()
-        self.assertIsNotNone(evt)
-        self.assertIn('real time', evt.detail)
-        self.assertEqual(evt.segment_number, 0)
+        run = self._default_detection()
+        self.assertIsNotNone(run['event_detail'])
+        self.assertIn('real time', run['event_detail'])
+        self.assertEqual(run['event_segment'], 0)
 
     def test_the_event_claims_only_what_the_ratio_measured(self):
         """The ratio proves the delivery rate. It does not prove the picture is frozen,
         and the app never looks at the picture - an event asserting a diagnosis this app
         cannot make is the unexplainable number Product Principle 1 forbids, pointed the
         other way (dev/changelog/964, and the correction it carries)."""
-        self._run(rate=5.0)
-        evt = RecordingEvent.query.filter_by(
-            recording_id=self.rid, event_type=FAST_DELIVERY_DETECTED).first()
-        lowered = evt.detail.lower()
+        lowered = self._default_detection()['event_detail'].lower()
         for claim in ('frozen', 'buffer', 'repeat', 'same few seconds', 'looping'):
             self.assertNotIn(claim, lowered, f'event should not claim {claim!r}')
 
@@ -400,10 +425,7 @@ class WatchdogFastDeliveryTests(unittest.TestCase):
             recording_id=self.rid, event_type=STALL_DETECTED).count(), 0)
 
     def test_the_member_takes_the_score_hit(self):
-        self._run(rate=5.0)
-        self.assertEqual(ChannelEvent.query.filter_by(
-            channel_id=self.ch.id,
-            event_type=CHANNEL_FAST_DELIVERY_HEALTH_OBSERVATION).count(), 1)
+        self.assertEqual(self._default_detection()['observations'], 1)
 
     def test_a_real_time_feed_is_left_alone(self):
         """The detector has to sit still through an ordinary capture. 1.0x for the whole
@@ -422,11 +444,10 @@ class WatchdogFastDeliveryTests(unittest.TestCase):
     def test_strikes_left_means_the_same_member_is_retried(self):
         """Nothing died here, and a provider stuck re-serving its buffer has a real chance
         of coming back on a fresh connection - deliberate, see dev/changelog/964."""
-        self._run(rate=5.0, strikes=3)
-        self.assertEqual(self.failovers, [])
-        self.assertEqual(self.launched, [1])
-        rec = db.session.get(Recording, self.rid)
-        self.assertEqual(rec.status, 'IN_PROGRESS')
+        run = self._default_detection()
+        self.assertEqual(run['failovers'], [])
+        self.assertEqual(run['launched'], [1])
+        self.assertEqual(run['status'], 'IN_PROGRESS')
 
     def test_the_last_strike_moves_off_the_member(self):
         self.failover_result = True

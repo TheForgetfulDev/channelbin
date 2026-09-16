@@ -446,12 +446,14 @@ def resume_in_progress_recordings(app):
             Recording, RECORDING_RESUMED, RECORDING_FAILED, Account,
             add_recording_event,
             REC_STATUS_SCHEDULED, REC_STATUS_IN_PROGRESS, REC_STATUS_PAUSED,
+            REC_STATUS_RETRYING,
             REC_STATUS_CONCATENATING, REC_STATUS_ANALYZING, REC_STATUS_CONVERTING,
             REC_STATUS_FAILED,
+            FAILURE_SOURCE_MISSING, FAILURE_CONVERSION_FAILED, FAILURE_MISSED_AT_STARTUP,
         )
-        from .recorder import (start_recording, resume_recording,
+        from .recorder import (start_recording, resume_recording, stop_recording,
                                close_open_segment_after_unclean_stop, OPEN_SEG_REFUSED)
-        from .concatenator import do_concatenation
+        from .concatenator import do_concatenation, run_postprocess_claimed
         from .accounts import finalize_sync_state
         import threading
 
@@ -558,13 +560,38 @@ def resume_in_progress_recordings(app):
                 log.info('Recording %d was PAUSED at restart → leaving as PAUSED', rec.id)
                 _register_stop_job(rec)
 
+        # Case 1b': was RETRYING (waiting out a dead-stream backoff) when Flask died. Without
+        # this case the row's two persisted jobs both misfired on scheduler start and whichever
+        # committed first decided the recording: stop_<id> joined what was captured, retry_<id>
+        # failed it with no join (dev/changelog/988). stop_recording() is where both jobs now
+        # land and where the join-or-give-up decision lives, so the sweep goes there too.
+        for rec in Recording.query.filter_by(status=REC_STATUS_RETRYING).all():
+            if rec.stop_time <= now:
+                log.warning('Recording %d was RETRYING and past stop_time → joining what was '
+                            'captured; the service was not running when its stop time passed',
+                            rec.id)
+                remove_job_if_exists(f'retry_{rec.id}')
+                remove_job_if_exists(f'stop_{rec.id}')
+                _record_event_and_commit(
+                    rec.id, RECORDING_RESUMED,
+                    'Ending a recording that was waiting to retry (stop time passed at restart)',
+                )
+                stop_recording(app, rec.id)
+            else:
+                # Re-registered rather than trusted to have survived in the jobstore: a row
+                # left RETRYING with no retry job waits for nothing until its window closes.
+                log.info('Recording %d was RETRYING at restart → leaving it waiting to retry',
+                         rec.id)
+                schedule_dead_stream_retry(rec.id, rec.next_retry_at or now)
+                _register_stop_job(rec)
+
         # Case 1c: was CONVERTING when Flask died (e.g. restart.sh killed the conversion
         # ffmpeg - the origin of this whole feature). Nothing else resumes a CONVERTING row,
         # so this is the safety net. The restart-kill counts against the budget: increment
         # conversion_attempts first, and if that exhausts the budget mark FAILED (same
         # give-up path as the supervised loop) rather than resurrecting it forever.
         from .config import load_config as _load_config
-        from .postprocessor import do_postprocess, is_conversion_active
+        from .postprocessor import is_conversion_active
         from .database import CONVERSION_DONE
         from . import alerts as _alerts
         _pp = _load_config()['recording']['post_process']
@@ -593,6 +620,7 @@ def resume_in_progress_recordings(app):
                     r = db.session.get(Recording, rid)
                     r.status = REC_STATUS_FAILED
                     r.completed_at = datetime.utcnow()
+                    r.failure_reason = FAILURE_SOURCE_MISSING
                     add_recording_event(rid, CONVERSION_DONE,
                                         'FAILED: source .ts missing at restart - cannot resume conversion')
                     db.session.commit()
@@ -613,6 +641,7 @@ def resume_in_progress_recordings(app):
                     r.status = REC_STATUS_FAILED
                     r.completed_at = datetime.utcnow()
                     r.conversion_attempts = n
+                    r.failure_reason = FAILURE_CONVERSION_FAILED
                     add_recording_event(rid, CONVERSION_DONE,
                                         f'FAILED: conversion budget exhausted after {n} attempt(s) '
                                         f'(interrupted by service restart)')
@@ -635,7 +664,13 @@ def resume_in_progress_recordings(app):
 
             _count_restart_kill()
             resumed_here.add(rec.id)
-            threading.Thread(target=do_postprocess, args=(app, rec.id, ts_path), daemon=True).start()
+            # Under the live-chain claim, like every other launch of this chain. A resumed run
+            # can park in the conversion collision wait for hours reading ANALYZING, and the
+            # Retry-conversion route refuses only on that claim or a spawned ffmpeg - neither of
+            # which existed for a bare do_postprocess() thread, so a Retry during the wait
+            # started a second chain onto the same output (dev/changelog/988).
+            threading.Thread(target=run_postprocess_claimed, args=(app, rec.id, ts_path),
+                             daemon=True).start()
 
         # Case 1d: was CONCATENATING or ANALYZING when Flask died (crash, or a restart
         # killing the process mid-phase). Same safety net as CONVERTING above, and both
@@ -683,6 +718,7 @@ def resume_in_progress_recordings(app):
             for rec in expired_recs:
                 rec.status = REC_STATUS_FAILED
                 rec.completed_at = now
+                rec.failure_reason = FAILURE_MISSED_AT_STARTUP
                 add_recording_event(rec.id, RECORDING_FAILED,
                                     'Recording missed entirely - stop time already passed at startup')
             if expired_recs:
@@ -705,6 +741,13 @@ def resume_in_progress_recordings(app):
         for rec in missed:
             missed_by = (now - rec.start_time).total_seconds()
             log.info('Recording %d missed start by %.0fs → starting now', rec.id, missed_by)
+            # The persisted start_<id> job is overdue and misfire_grace_time is None, so
+            # APScheduler dispatches it on its first pass - which init_scheduler triggers
+            # by starting the scheduler immediately before this sweep runs. Dropping it here
+            # means this sweep is the only starter in the ordinary case rather than one of
+            # two; the claim inside start_recording is what covers the case where the job
+            # already fired (dev/changelog/987).
+            remove_job_if_exists(f'start_{rec.id}')
             _record_event_and_commit(
                 rec.id, RECORDING_RESUMED,
                 f'Started late by {missed_by:.0f}s after service restart',

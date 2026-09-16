@@ -167,31 +167,50 @@ class _StallTriggerHarness(_RestartHarness):
 
 class StallTriggerTests(_StallTriggerHarness):
 
+    # The two-stall run under the shipped trigger, performed ONCE for the whole class and
+    # read by the three tests below. Same one-expensive-fixture shape as
+    # tests/test_downtime_accounting.py::_growth_stall_run: a real WatchdogThread against
+    # real stall timeouts costs ~4.4s per run, and three identical runs proved nothing the
+    # three separate assertions do not already prove (dev/changelog/979). The assertions
+    # stay separate so a partial fix cannot pass one and be excused by another. Do not
+    # inline it back into the tests.
+    _two_stall_run = None
+
     def _demote_calls(self, n=2):
         """Only the stall-rate requests. Under load a restart can fail to produce data in
         time, and that is one of the three DEAD-feed triggers asking for its own
         (non-demoting) failover - a real event these tests are not about."""
         return [c for c in self._run_until_stalls(n) if c['demote']]
 
+    def _shipped_trigger_run(self):
+        if StallTriggerTests._two_stall_run is None:
+            calls = self._demote_calls()
+            rec = db.session.get(Recording, self.rid)
+            StallTriggerTests._two_stall_run = {
+                'calls': calls,
+                'consecutive_failures': rec.consecutive_failures,
+            }
+        return StallTriggerTests._two_stall_run
+
     def test_repeated_stalls_move_the_recording_even_though_every_restart_succeeds(self):
         """The whole defect in one assertion: consecutive_failures never reaches its
         threshold because each restart works, so before this trigger nothing ever asked
         for a failover."""
-        calls = self._demote_calls()
-        rec = db.session.get(Recording, self.rid)
-        self.assertLess(rec.consecutive_failures, 10,
+        run = self._shipped_trigger_run()
+        self.assertLess(run['consecutive_failures'], 10,
                         'the restarts were meant to succeed - the dead-feed triggers must '
                         'not be what fired here')
-        self.assertTrue(calls, 'no stall-rate move was requested despite repeated stalls')
+        self.assertTrue(run['calls'],
+                        'no stall-rate move was requested despite repeated stalls')
 
     def test_the_move_is_not_requested_before_the_count_is_reached(self):
-        calls = self._demote_calls()
+        calls = self._shipped_trigger_run()['calls']
         self.assertTrue(calls)
         self.assertGreaterEqual(calls[0]['stalls_so_far'], 2,
                                 'the trigger fired before its stall count was reached')
 
     def test_the_reason_names_the_rate_that_fired(self):
-        calls = self._demote_calls()
+        calls = self._shipped_trigger_run()['calls']
         self.assertTrue(calls)
         self.assertIn('stalls in 30 minutes', calls[0]['reason'])
 
