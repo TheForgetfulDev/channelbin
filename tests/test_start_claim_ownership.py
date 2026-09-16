@@ -252,12 +252,26 @@ class LiveSchedulerDoubleStartTests(unittest.TestCase):
     """(b) as it actually arrives: an overdue persisted start_<id> job and the startup
     sweep's case 2b, against a real running APScheduler.
 
-    This is the reproduction the defect was filed with. It reproduced on every run before
-    the fix - two callers, always - which is why it is here rather than in a comment.
+    This is the reproduction the defect was filed with, but it is a real race and so a
+    probabilistic guard: with the fix reverted it catches two starters on most runs, not all
+    of them, because the job can commit IN_PROGRESS before the sweep's thread reads the row.
+    TwoCallersOneStartTests is the deterministic guard; this one proves the fix against the
+    real scheduler, and it can only miss a duplicate, never fail a correct run.
     """
 
     def setUp(self):
         self.t = make_test_app(start_scheduler=True)
+        # The DVR dir is read by a runtime load_config() inside start_recording, so without
+        # the sandbox it resolves to the real default. Where that path does not exist (a CI
+        # runner) the start fails the recording before either caller launches, and the test
+        # reports 0 starters instead of testing ownership at all.
+        dvr = os.path.join(self.t._tmpdir, 'dvr')
+        os.makedirs(dvr, exist_ok=True)
+        self.t.sandbox_config({'recording': {
+            'dvr_output_dir': dvr,
+            'capture_log_dir': os.path.join(self.t._tmpdir, 'caplogs'),
+            'live_thumbnail': {'enabled': False},
+        }})
 
     def tearDown(self):
         self.t.cleanup()
@@ -288,6 +302,12 @@ class LiveSchedulerDoubleStartTests(unittest.TestCase):
                 # startup - and then init_scheduler's very next line runs the sweep.
                 scheduler.reschedule_recording_start(rid, now - timedelta(minutes=2))
                 scheduler.resume_in_progress_recordings(self.t.app)
+                # Wait for the first launch however slow the machine is, then give a
+                # duplicate starter time to show itself. A slow machine can only make the
+                # settle miss a second launch, never fail a correct run.
+                deadline = time.monotonic() + 30
+                while not launches and time.monotonic() < deadline:
+                    time.sleep(0.05)
                 time.sleep(3)
 
             self.assertEqual(

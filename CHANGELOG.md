@@ -44,14 +44,12 @@ Published as a container image only; these changes first reach this repository w
 
 **Fixed**
 
-- The Logs page works in the Docker image. One file shipped without read permission for the
-  unprivileged user the container runs as, so the page loaded but its script did not, and it sat
-  on "Loading history..." forever. The image now normalizes file permissions as it is built, so
-  no file can arrive unreadable again.
-
-- The Logs page works in a container. It reads a log file, and a container was configured to
-  log only to standard output, so the page had nothing to show even once its script loaded.
-  Containers now write both, leaving `docker logs` unchanged, and an existing container is
+- The Logs page works in the Docker image, where it had two separate problems. One file shipped
+  without read permission for the unprivileged user the container runs as, so the page loaded
+  but its script did not, and it sat on "Loading history..." forever. And containers logged only
+  to standard output, so even with the script loaded there was no log file to show. The image
+  now normalizes file permissions as it is built, so no file can arrive unreadable again, and
+  containers write a log file as well, leaving `docker logs` unchanged. An existing container is
   updated automatically on its first start after upgrading - nothing to edit by hand.
 - A Logs page with no log file configured now says so and names the setting, instead of showing
   an empty page with no explanation.
