@@ -34,6 +34,7 @@ It's actually been really fun using the search and surfacing channels that I did
 - [Features](#features)
 - [Install](#install)
   - [Docker](#docker-recommended)
+  - [Unraid](#unraid)
   - [Running it directly](#running-it-directly)
 - [First run](#first-run)
 - [Configuration](#configuration)
@@ -144,7 +145,8 @@ and hands them to whatever you already use to watch them.
 ### Docker (recommended)
 
 ```bash
-cp docker-compose.example.yml docker-compose.yml
+curl -fsSLo docker-compose.yml \
+  https://raw.githubusercontent.com/TheForgetfulDev/channelbin/main/docker-compose.example.yml
 # edit the two volume paths and PUID/PGID, then:
 docker compose up -d
 docker compose logs -f
@@ -152,6 +154,11 @@ docker compose logs -f
 
 Open [http://localhost:5000](http://localhost:5000). ffmpeg is in the image; nothing else to
 install.
+
+The image is `ghcr.io/theforgetfuldev/channelbin`, published for amd64. The example compose
+file pins a release version rather than `latest`, so an update happens when you move the pin
+and never in the middle of a recording. `:latest` exists for trying it out by hand. To build
+the image yourself, clone the repo and replace the `image:` line with `build: .`.
 
 #### Volumes
 
@@ -181,6 +188,30 @@ and the UI still comes up to be fixed.
 Some settings need a restart, and Settings has a Restart button. Inside a container it works by
 exiting the process, so **`restart: unless-stopped` (as in the example compose file) is what
 brings the app back** - without a restart policy the container simply stops.
+
+### Unraid
+
+The Unraid template is [`docker/unraid-template.xml`](docker/unraid-template.xml). It maps the
+same two volumes, defaults PUID/PGID to Unraid's `99`/`100`, and sets `--restart=unless-stopped`
+under Extra Parameters - keep that, for the reason above. Unraid's autostart toggle is not a
+restart policy.
+
+- **Appdata (`/config`) holds the database, so keep it off the array.** Use an appdata share
+  that lives on a pool only, or point it at the pool path directly
+  (`/mnt/cache/appdata/channelbin`).
+- **Map `/dvr` itself, not subfolders of it.** Live thumbnails and health check screenshots
+  default to folders directly under `/dvr`. With only subfolders mapped, they land in an
+  unmapped volume inside `docker.img` and are lost when the container is updated.
+- **Completed recordings** is an optional second path, mounted at `/dvr-complete`, for filing
+  finished recordings somewhere outside the recordings share. Turn on **Move on complete** in
+  Settings with that as the destination. A subfolder of `/dvr` works just as well and is
+  faster, because the move is then a rename rather than a copy.
+- **Health check screenshots** is another optional path, mounted at `/screenshots`, for keeping
+  screenshots off the recordings share. Set **Screenshot directory** in Settings to
+  `/screenshots`; left unmapped, they go to `/dvr/channel_test_screenshots`.
+
+Unlike the compose example, the template tracks `latest`: Unraid keeps the tag a container was
+created with, so a pinned template would never show an update. Update between recordings.
 
 ### Running it directly
 

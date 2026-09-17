@@ -865,6 +865,7 @@
       <p class="card-note">No activity recorded for this channel yet.</p>
       {% else %}
       <div class="test-history-controls">
+        {# nav-ok: per-page select #}
         <select class="form-control" style="width:auto" onchange="window.location.href = '{{ url_for('channels.channel_detail', channel_id=channel.id) }}?timeline_per_page=' + this.value">
           {% for size in ['10', '25', '50', '100', 'all'] %}
           <option value="{{ size }}" {% if size == timeline_per_page %}selected{% endif %}>{{ 'All' if size == 'all' else size + ' per page' }}</option>
@@ -986,6 +987,7 @@
       <p class="card-note">No channel tests have been run for this channel yet.</p>
       {% else %}
       <div class="test-history-controls">
+        {# nav-ok: per-page select #}
         <select class="form-control" style="width:auto" onchange="window.location.href = '{{ url_for('channels.channel_detail', channel_id=channel.id) }}?per_page=' + this.value">
           {% for size in ['10', '25', '50', '100', 'all'] %}
           <option value="{{ size }}" {% if size == per_page %}selected{% endif %}>{{ 'All' if size == 'all' else size + ' per page' }}</option>
@@ -1163,6 +1165,8 @@ window.CHANNEL_DETAIL = {
   defaultProfileId: {{ channel.default_profile_id | tojson }},
   defaultProfileName: {{ (channel.default_profile.name if channel.default_profile else None) | tojson }},
   testEnabled: {{ channel.test_enabled | tojson }},
+  paceRealtime: {{ channel.pace_realtime | tojson }},
+  paceRealtimeDefault: {{ pace_realtime_default | tojson }},
   guideCheckJobId: {{ guide_check_job_id | tojson }},
   healthChecks: {{ health_checks | map(attribute='name') | list | tojson }},
   profiles: [{% for p in recording_profiles %}{ id: {{ p.id }}, name: {{ p.name | tojson }} }{{ ',' if not loop.last }}{% endfor %}],
@@ -1184,6 +1188,7 @@ window.CHANNEL_DETAIL = {
   urls: {
     notes: '{{ url_for("channels.update_channel_notes", channel_id=channel.id) }}',
     defaultProfile: '{{ url_for("channels.update_channel_default_profile", channel_id=channel.id) }}',
+    paceRealtime: '{{ url_for("channels.update_channel_pace_realtime", channel_id=channel.id) }}',
     healthAdjustment: '{{ url_for("channels.update_health_adjustment", channel_id=channel.id) }}',
     repoint: '/channels/{{ channel.id }}/repoint',
     sectionPref: '/api/user-prefs/channel_detail_sections',

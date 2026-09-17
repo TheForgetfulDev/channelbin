@@ -1211,6 +1211,50 @@ async function airingScenario() {
   return obs;
 }
 
+/* ── 8b. Ctrl-click and middle-click open a new tab, on both grains ─────────
+   The airing grain's program title was a <span> and its row navigated by assigning
+   location.href, so Ctrl-click replaced the page (dev/docs/BUGS.md 2026-09-16 @ 10:27:44 AM,
+   dev/changelog/996). Only MODIFIED clicks are driven here: jsdom implements no navigation
+   and reports a plain one as an error, which this harness counts as a page failure. */
+async function navClickScenario() {
+  const obs = {};
+  const probe = async (url, rowSel) => {
+    const c = boot({ url });
+    await c.settle();
+    const opened = [];
+    c.window.open = (u, target) => { opened.push({ url: u, target }); return {}; };
+    const CFG = c.window.CHANNEL_SEARCH_CONFIG;
+    const row = c.$$(`#ch-list ${rowSel}`).find((r) => !r.dataset.group);
+    const out = { row_found: !!row, opened_by: {} };
+    if (!row) { out.errors = c.errors; return out; }
+    out.expected_url = `${CFG.channelUrlBase}${row.dataset.id}`;
+    // A cell with no link, button or input in it: the row itself is what is clicked.
+    const cell = Array.from(row.querySelectorAll('.acell'))
+      .find((el) => !el.querySelector('a, button, input, label') && !el.closest('a'));
+    const fire = (el, type, init) => {
+      opened.length = 0;
+      el.dispatchEvent(new c.window.MouseEvent(type, { bubbles: true, cancelable: true, ...init }));
+      return opened.slice();
+    };
+    if (cell) {
+      out.opened_by.ctrl = fire(cell, 'click', { button: 0, ctrlKey: true });
+      out.opened_by.meta = fire(cell, 'click', { button: 0, metaKey: true });
+      out.opened_by.middle = fire(cell, 'auxclick', { button: 1 });
+    }
+    const box = row.querySelector('input[type=checkbox]');
+    if (box) out.opened_by.ctrl_on_checkbox = fire(box, 'click', { button: 0, ctrlKey: true });
+    const title = row.querySelector('.a-ptitle, .a-name');
+    out.title_tag = title ? title.tagName : null;
+    out.title_href = title ? title.getAttribute('href') : null;
+    out.errors = c.errors;
+    return out;
+  };
+  obs.airings = await probe('http://localhost:5000/channels?grain=airings', '.arow-air');
+  obs.channels = await probe('http://localhost:5000/channels', '.arow');
+  obs.errors = [...obs.airings.errors, ...obs.channels.errors];
+  return obs;
+}
+
 /* ── 9. A `when` filter, and what parking one does to it ───────────────── */
 async function whenScenario() {
   const obs = {};
@@ -1699,6 +1743,7 @@ const run = async () => {
   out.mobile = await mobileScenario();
   out.mobile_sheets = await mobileSheetsScenario();
   out.airing = await airingScenario();
+  out.nav_click = await navClickScenario();
   out.when = await whenScenario();
   out.airing_mobile = await airingMobileScenario();
   out.loading = await loadingScenario();

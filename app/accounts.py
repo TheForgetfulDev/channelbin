@@ -23,7 +23,7 @@ import requests
 from sqlalchemy import func, select, update
 from sqlalchemy.exc import SQLAlchemyError
 
-from .config import load_config
+from .config import load_config, config_default
 from . import admission, db
 from .database import (
     Account, Alert, Channel, ChannelEvent, ChannelGroupMember, EPGEntry, AccountSyncLog,
@@ -609,7 +609,7 @@ def effective_filename_template(cfg, channel) -> str:
     """The template a recording of this channel would be named with: the channel's default
     profile's own template if it sets one, else the global recording.filename_template."""
     global_template = cfg.get('recording', {}).get(
-        'filename_template', '{date} - {title} - {channel}')
+        'filename_template', config_default('recording.filename_template'))
     profile = getattr(channel, 'default_profile', None)
     if profile is not None and profile.filename_template:
         return profile.filename_template
@@ -1279,7 +1279,7 @@ def _do_sync(account_id: int, stop_event: threading.Event, use_dump: bool = Fals
         @retry_on_locked()
         def _mark_success_and_commit():
             now = datetime.utcnow()
-            interval_hours = account.sync_interval_hours or sync_cfg.get('sync_interval_hours', 6)
+            interval_hours = account.sync_interval_hours or sync_cfg.get('sync_interval_hours', config_default('sync.sync_interval_hours'))
             account.status = 'OK'
             account.last_sync_at = now
             account.next_sync_at = now + timedelta(hours=interval_hours)
@@ -1754,7 +1754,7 @@ def update_overdue_alert(account_id: int, sync_cfg: dict) -> None:
     if account is None:
         return
 
-    interval_hours = account.sync_interval_hours or sync_cfg.get('sync_interval_hours', 6)
+    interval_hours = account.sync_interval_hours or sync_cfg.get('sync_interval_hours', config_default('sync.sync_interval_hours'))
     overdue_by = timedelta(hours=interval_hours * OVERDUE_INTERVAL_MULTIPLE)
     active = bool(
         account.sync_enabled

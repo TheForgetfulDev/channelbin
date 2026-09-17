@@ -120,7 +120,7 @@ def observation_weight(duration_seconds: float, cfg: dict) -> float:
     Replaces the old flat source_weight (recording=3, test=1): a 30-minute test observed
     twice as much real time as a 15-minute recording and should outweigh it, not
     automatically lose 3-to-1. reference_minutes is the duration that gets weight 1.0 -
-    default 2, matching the real test_duration_seconds default (120s).
+    default 2.
     """
     ref = cfg.get('channel_testing', {}).get('reference_minutes', 2)
     minutes = max((duration_seconds or 0) / 60.0, 0.1)

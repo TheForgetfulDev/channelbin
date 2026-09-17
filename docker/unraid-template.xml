@@ -1,0 +1,30 @@
+<?xml version="1.0"?>
+<Container version="2">
+  <Name>ChannelBin</Name>
+  <Repository>ghcr.io/theforgetfuldev/channelbin:latest</Repository>
+  <Registry>https://github.com/TheForgetfulDev/channelbin/pkgs/container/channelbin</Registry>
+  <Network>bridge</Network>
+  <Shell>bash</Shell>
+  <Privileged>false</Privileged>
+  <Support>https://github.com/TheForgetfulDev/channelbin/issues</Support>
+  <Project>https://github.com/TheForgetfulDev/channelbin</Project>
+  <ReadMe>https://github.com/TheForgetfulDev/channelbin#readme</ReadMe>
+  <Overview>ChannelBin is a self-hosted IPTV recorder (DVR) and channel tester for Xtream and M3U providers. It watches every recording and restarts the stream whenever it stalls, fails over to alternate channels and accounts, and labels a recording honestly when something could not be recovered. Health checks connect to each channel, measure what it actually delivers, take a screenshot and keep a quality score over time. It also includes a TV guide, and search across channels and EPG listings.
+
+The display timezone is set in Settings, not by the container's TZ. Some settings need a restart: the in-app Restart button relies on the --restart=unless-stopped extra parameter this template sets, so keep it.</Overview>
+  <Category>MediaServer:Video</Category>
+  <WebUI>http://[IP]:[PORT:5000]/</WebUI>
+  <TemplateURL>https://raw.githubusercontent.com/TheForgetfulDev/channelbin/main/docker/unraid-template.xml</TemplateURL>
+  <Icon>https://raw.githubusercontent.com/TheForgetfulDev/channelbin/main/static/img/logo/channelbin-logo.png</Icon>
+  <ExtraParams>--restart=unless-stopped</ExtraParams>
+  <PostArgs/>
+  <Requires>An IPTV provider account (Xtream Codes API or an M3U playlist).</Requires>
+  <License>MIT</License>
+  <Config Name="WebUI port" Target="5000" Default="5000" Mode="tcp" Description="Port the web interface listens on." Type="Port" Display="always" Required="true" Mask="false">5000</Config>
+  <Config Name="Appdata" Target="/config" Default="/mnt/user/appdata/channelbin" Mode="rw" Description="config.yaml, the database, the secret key and backups. The database must not sit on the array: keep the appdata share on a pool only, or use the pool path directly (for example /mnt/cache/appdata/channelbin)." Type="Path" Display="always" Required="true" Mask="false">/mnt/user/appdata/channelbin</Config>
+  <Config Name="Recordings" Target="/dvr" Default="/mnt/user/data/dvr" Mode="rw" Description="Recordings in progress and finished, live thumbnails and health check screenshots. Must be writable by PUID/PGID. To file finished recordings into a separate folder, prefer a subfolder of this path (set it in Settings as the move-on-complete destination, e.g. /dvr/complete): moving within one mount is instant." Type="Path" Display="always" Required="true" Mask="false">/mnt/user/data/dvr</Config>
+  <Config Name="Completed recordings (optional)" Target="/dvr-complete" Default="" Mode="rw" Description="Optional. A folder outside the Recordings path to file finished recordings into, such as a media library. Enable Move on complete in Settings with destination /dvr-complete. Each finished recording is copied across, so leave this empty if a subfolder of Recordings will do." Type="Path" Display="always" Required="false" Mask="false"></Config>
+  <Config Name="Health check screenshots (optional)" Target="/screenshots" Default="" Mode="rw" Description="Optional. A folder outside the Recordings path for health check screenshots, which otherwise go to /dvr/channel_test_screenshots. Set Screenshot directory in Settings to /screenshots. Must be writable by PUID/PGID." Type="Path" Display="always" Required="false" Mask="false"></Config>
+  <Config Name="PUID" Target="PUID" Default="99" Mode="" Description="User ID files are written as. 99 is Unraid's nobody." Type="Variable" Display="advanced" Required="true" Mask="false">99</Config>
+  <Config Name="PGID" Target="PGID" Default="100" Mode="" Description="Group ID files are written as. 100 is Unraid's users." Type="Variable" Display="advanced" Required="true" Mask="false">100</Config>
+</Container>

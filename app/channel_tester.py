@@ -22,6 +22,7 @@ from datetime import datetime, timedelta
 from typing import List, Optional
 
 from . import admission
+from .config import config_default
 from .proc_utils import GrowthMonitor, terminate_or_kill, wait_for_file_data
 from .toolchain import ffprobe_missing
 from .url_utils import mask_creds, mask_creds_in_text
@@ -326,17 +327,21 @@ def _run_channel_loop(app, channels, wait_sec, job_id=None):
     return True  # completed normally
 
 
-# (HealthCheckProfile attribute, channel_testing.* config key, hardcoded default).
+# (HealthCheckProfile attribute, channel_testing.* config key, built-in default).
 # One list so resolve_health_check_settings() and health_check_profile_payload() can
 # never disagree about which fields a profile overrides - the payload's `from_default`
-# is exactly the inverse of the resolver's per-field pick.
-_HEALTH_CHECK_SETTINGS = (
-    ('test_duration_seconds',         'test_duration_seconds',         120),
-    ('wait_between_channels_seconds', 'wait_between_channels_seconds', 180),
-    ('screenshots_enabled',           'screenshots_enabled',           True),
-    ('connect_retries',               'connect_retries',               2),
-    ('connect_timeout_seconds',       'connect_timeout_seconds',       15),
-    ('connect_retry_delay_seconds',   'connect_retry_delay_seconds',   10),
+# is exactly the inverse of the resolver's per-field pick. The defaults are read from
+# _DEFAULTS, never restated: two of them had drifted to 120 and 180 (dev/changelog/1003).
+_HEALTH_CHECK_SETTINGS = tuple(
+    (field, key, config_default(f'channel_testing.{key}'))
+    for field, key in (
+        ('test_duration_seconds',         'test_duration_seconds'),
+        ('wait_between_channels_seconds', 'wait_between_channels_seconds'),
+        ('screenshots_enabled',           'screenshots_enabled'),
+        ('connect_retries',               'connect_retries'),
+        ('connect_timeout_seconds',       'connect_timeout_seconds'),
+        ('connect_retry_delay_seconds',   'connect_retry_delay_seconds'),
+    )
 )
 
 
@@ -946,7 +951,7 @@ def run_pre_check(app, recording_id: int):
         connect_retries = ct_cfg.get('connect_retries', 2)
         connect_timeout = ct_cfg.get('connect_timeout_seconds', 15)
         retry_delay = ct_cfg.get('connect_retry_delay_seconds', 10)
-        test_duration = ct_cfg.get('test_duration_seconds', 120)
+        test_duration = ct_cfg.get('test_duration_seconds', config_default('channel_testing.test_duration_seconds'))
         min_margin = pc_cfg.get('min_margin_seconds', 60)
         retry_minutes = pc_cfg.get('retry_minutes', 5)
         worst_case = ((1 + connect_retries) * connect_timeout

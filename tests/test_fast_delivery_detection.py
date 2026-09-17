@@ -29,7 +29,7 @@ import app.config as cfgmod  # noqa: E402
 import app.recorder as recorder  # noqa: E402
 from app import db  # noqa: E402
 from app.database import (  # noqa: E402
-    FAST_DELIVERY_DETECTED, CHANNEL_FAST_DELIVERY_HEALTH_OBSERVATION,
+    CAPTURE_PACING_ENABLED, FAST_DELIVERY_DETECTED, CHANNEL_FAST_DELIVERY_HEALTH_OBSERVATION,
     STALL_DETECTED, Channel, ChannelEvent, Recording, RecordingEvent, RecordingSegment,
 )
 from app.proc_utils import (  # noqa: E402
@@ -237,6 +237,9 @@ class FastDeliveryHealthObservationTests(unittest.TestCase):
 _FAKE_CAPTURE = (
     'import sys, time\n'
     'rate = float(sys.argv[1])\n'
+    'for _ in range(int(sys.argv[2]) if len(sys.argv) > 2 else 0):\n'
+    '    sys.stderr.write("[http @ 0x1] Will reconnect at 22474200 in 0 second(s), '
+    'error=Connection timed out.\\n")\n'
     'step = 0.1\n'
     'content = 0.0\n'
     'while True:\n'
@@ -291,10 +294,10 @@ class WatchdogFastDeliveryTests(unittest.TestCase):
             recorder._active.pop(self.rid, None)
         self.t.cleanup()
 
-    def _start_fake_capture(self, rate):
+    def _start_fake_capture(self, rate, reconnects=0):
         path, fh = recorder._open_segment_stderr_spool(self.t.app, self.rid, 0)
         self.state.stderr_path, self.state.stderr_fh = path, fh
-        proc = subprocess.Popen([sys.executable, '-c', _FAKE_CAPTURE, str(rate)],
+        proc = subprocess.Popen([sys.executable, '-c', _FAKE_CAPTURE, str(rate), str(reconnects)],
                                 stdout=subprocess.DEVNULL,
                                 stderr=(fh or subprocess.DEVNULL))
         self.state.process = proc
@@ -316,7 +319,8 @@ class WatchdogFastDeliveryTests(unittest.TestCase):
             'fast_delivery_strike_count': strikes,
         }})
 
-    def _run(self, rate=5.0, ratio=1.5, window=1.0, strikes=3, early_fail=99, timeout=30):
+    def _run(self, rate=5.0, ratio=1.5, window=1.0, strikes=3, early_fail=99, timeout=30,
+             reconnects=0):
         def _stub_launch(app, recording_id, seg_num):
             self.launched.append(seg_num)
 
@@ -324,7 +328,7 @@ class WatchdogFastDeliveryTests(unittest.TestCase):
             self.failovers.append((reason, demote, score_departure))
             return self.failover_result
 
-        self._start_fake_capture(rate)
+        self._start_fake_capture(rate, reconnects)
         # The replacement segment is never really launched here, so the reconnect wait is
         # answered rather than left to time out against a row that will never exist. Without
         # it the stub turns every retry into a failed restart, which is the harness's
@@ -382,6 +386,9 @@ class WatchdogFastDeliveryTests(unittest.TestCase):
                 'failovers': list(self.failovers),
                 'launched': list(self.launched),
                 'status': rec.status,
+                'pacing_events': RecordingEvent.query.filter_by(
+                    recording_id=self.rid, event_type=CAPTURE_PACING_ENABLED).count(),
+                'auto_paced': set(self.state.auto_paced_channel_ids),
             }
         return WatchdogFastDeliveryTests._default_run
 
@@ -493,6 +500,64 @@ class WatchdogFastDeliveryTests(unittest.TestCase):
         self.assertEqual(rec.status, 'IN_PROGRESS')
         self.assertEqual(RecordingEvent.query.filter_by(
             recording_id=self.rid, event_type='RECORDING_FAILED_DEAD_STREAM').count(), 0)
+
+
+    # ── Automatic real-time pacing (dev/changelog/997) ───────────────────────────────
+    # A fast-delivery stop on a segment that reconnected in-process turns on -re for that
+    # member for the rest of the recording. The detection itself is untouched; only the
+    # relaunch changes. Guards dev/docs/BUGS.md 2026-09-16 @ 12:44:22 PM "An unpaced capture replays a
+    # provider's back-buffer on every read-timeout reconnect".
+
+    def _pacing_events(self):
+        return RecordingEvent.query.filter_by(
+            recording_id=self.rid, event_type=CAPTURE_PACING_ENABLED).all()
+
+    def test_reconnects_before_a_fast_delivery_stop_turn_on_pacing(self):
+        self._run(rate=5.0, reconnects=3)
+        events = self._pacing_events()
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].segment_number, 0)
+        self.assertIn('reconnected 3 times', events[0].detail)
+        self.assertIn(self.ch.id, self.state.auto_paced_channel_ids)
+        # The detection and its ordinary restart still happened exactly as before.
+        self.assertEqual(RecordingEvent.query.filter_by(
+            recording_id=self.rid, event_type=FAST_DELIVERY_DETECTED).count(), 1)
+        self.assertEqual(self.launched, [1])
+
+    def test_automatic_pacing_never_writes_the_channel_setting(self):
+        """Channel.pace_realtime is the user's answer - the participation-switch rule."""
+        self._run(rate=5.0, reconnects=2)
+        db.session.expire_all()
+        self.assertIsNone(db.session.get(Channel, self.ch.id).pace_realtime)
+
+    def test_no_reconnects_means_no_pacing(self):
+        """Without an in-process reconnect the replay is not ours to cause, and pacing
+        would only hide it from the detector."""
+        run = self._default_detection()
+        self.assertEqual(run['pacing_events'], 0)
+        self.assertEqual(run['auto_paced'], set())
+
+    def test_an_explicit_off_on_the_channel_suppresses_it(self):
+        ch = db.session.get(Channel, self.ch.id)
+        ch.pace_realtime = False
+        db.session.commit()
+        self._run(rate=5.0, reconnects=3)
+        self.assertEqual(self._pacing_events(), [])
+        self.assertEqual(self.state.auto_paced_channel_ids, set())
+
+    def test_an_already_paced_segment_is_not_escalated_again(self):
+        self.state.current_segment_paced = True
+        self._run(rate=5.0, reconnects=3)
+        self.assertEqual(self._pacing_events(), [])
+
+    def test_the_last_strike_still_gives_up_rather_than_pacing(self):
+        """The strike ladder is unchanged: out of strikes with nowhere to go, the recording
+        stops as it always did."""
+        self.failover_result = False
+        self._run(rate=5.0, strikes=1, reconnects=3)
+        db.session.expire_all()
+        self.assertEqual(db.session.get(Recording, self.rid).status, 'FAILED')
+        self.assertEqual(self._pacing_events(), [])
 
 
 if __name__ == '__main__':

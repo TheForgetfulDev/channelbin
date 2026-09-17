@@ -14,7 +14,7 @@ from ..accounts import (NORM_DISABLED, NORM_MODES, coerce_normalization_mode,
                         next_sync_map, sync_signature)
 from ..channel_groups import guide_scope_channel_ids, report_orphaned_guide_groups
 from ..channel_search import OTHER_NEW, OTHER_REMOVED
-from ..config import load_config
+from ..config import load_config, config_default
 from ..database import (
     Account, Channel, AccountSyncLog, ChannelGroupMember, EPGEntry, Recording,
     REC_STATUS_COMPLETED, REC_STATUS_FAILED, REC_STATUS_ABORTED,
@@ -246,7 +246,7 @@ def _effective_settings(account, cfg):
     An inherited value is labelled `(global)` on the page (DESIGN.md §17.3), so "6h because
     this account says 6h" and "6h because Settings says 6h" are distinguishable at a glance -
     they behave differently the moment the global changes."""
-    global_hours = cfg.get('sync', {}).get('sync_interval_hours', 6)
+    global_hours = cfg.get('sync', {}).get('sync_interval_hours', config_default('sync.sync_interval_hours'))
     global_conn = cfg.get('accounts', {}).get('default_max_connections', 1)
     mode = resolve_normalization_mode(account, cfg)
     return {
@@ -350,7 +350,7 @@ def account_detail(account_id):
 @accounts_bp.route('/accounts/new', methods=['GET', 'POST'])
 def new_account():
     cfg = load_config()
-    global_sync_hours = cfg.get('sync', {}).get('sync_interval_hours', 6)
+    global_sync_hours = cfg.get('sync', {}).get('sync_interval_hours', config_default('sync.sync_interval_hours'))
     global_max_connections = cfg.get('accounts', {}).get('default_max_connections', 1)
 
     if request.method == 'POST':
@@ -712,7 +712,7 @@ def account_settings_api(account_id):
                          for v, label, example in _NORM_OPTIONS],
         'sync_hours_choices': _SYNC_HOURS_CHOICES,
         'preset_colors': [{'hex': hexval, 'label': label} for hexval, label in PRESET_COLORS],
-        'global_sync_hours': cfg.get('sync', {}).get('sync_interval_hours', 6),
+        'global_sync_hours': cfg.get('sync', {}).get('sync_interval_hours', config_default('sync.sync_interval_hours')),
         'global_max_connections': cfg.get('accounts', {}).get('default_max_connections', 1),
         'global_xtream_debug': cfg.get('debug', {}).get('xtream_debug_mode', False),
     })

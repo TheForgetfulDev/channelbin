@@ -51,14 +51,6 @@
 .svc-body input[type=number] { max-width: 140px; }
 .svc-body input:focus { outline: none; border-color: var(--accent); }
 
-/* Page-scoped cap (dev/changelog/733): the shell's own max-width is gone
-   app-wide, but .frow's label/description column is an unbounded 1fr track
-   with no cap of its own (DESIGN.md 2) - uncapped it stretches the Delivery
-   card's field descriptions the full width of an ultrawide window. Scoped to
-   the Delivery card only; Alert Routing's table benefits from the extra
-   width the same way Accounts and Recordings do. */
-.card-frow { max-width: 1400px; }
-
 /* ── Alert routing ────────────────────────────────────────────────────
    One markup for both widths. At >768px the column headers say which control is
    which; at <=768px the row becomes a card (15.5 item 4) and each control takes
@@ -118,16 +110,15 @@
   </div>
 </div>
 
-<div class="card card-frow">
+<div class="card">
   <div class="card-head"><h2>Delivery</h2></div>
   <div class="card-body">
     {% call field_shell('notifications.push_rate_limit_seconds', 'Push rate limit',
-       'Seconds between push flushes. Alerts raised inside one window are aggregated into a single notification.',
-       '60') %}
+       'Seconds between push flushes. Alerts raised inside one window are aggregated into a single notification.', tier='advanced') %}
     <input type="number" id="rate-limit-input" min="1" max="3600" value="{{ boot.rate_limit }}">
     {% endcall %}
     {% call field_shell('notifications.base_url', 'App URL',
-       'Used to build clickable links in push notifications, e.g. a failed-recording alert links back to its detail page. In-app alerts always link correctly regardless of this setting. Leave blank to omit links from push notifications.') %}
+       'Used to build clickable links in push notifications, e.g. a failed-recording alert links back to its detail page. In-app alerts always link correctly regardless of this setting. Leave blank to omit links from push notifications.', tier='basic') %}
     <input type="text" id="base-url-input" placeholder="http://192.168.1.50:5000" value="{{ boot.base_url }}">
     <div class="url-preview" id="base-url-preview"></div>
     {% endcall %}

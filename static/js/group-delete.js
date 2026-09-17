@@ -50,7 +50,7 @@ function openDeleteGroupModal(opts) {
     ],
     confirm: 'Open the recording',
     confirmClass: 'btn btn-primary',
-    onConfirm: () => { location.href = recUrl(info.recording_id); },
+    onConfirm: () => { location.href = recUrl(info.recording_id); },  // nav-ok: confirm-dialog button
   });
 
   // Scheduled recordings cannot survive the group: a SCHEDULED row pointing at a group

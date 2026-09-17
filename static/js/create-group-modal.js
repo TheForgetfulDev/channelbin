@@ -43,7 +43,7 @@ function openCreateGroupModal(opts) {
   const channels = (opts.channels || []).slice();
   const taken = new Set((opts.existingNames || []).map(n => n.toLowerCase()));
   const kept = new Set(channels.map(c => c.id));
-  const onDone = opts.onDone || ((resp) => { if (resp && resp.detail_url) location.href = resp.detail_url; });
+  const onDone = opts.onDone || ((resp) => { if (resp && resp.detail_url) location.href = resp.detail_url; });  // nav-ok: redirect after creating a group
   const seed = opts.initialSettings || null;
 
   // Auto-select-format plan (app/channel_groups.py::plan_format_selection via

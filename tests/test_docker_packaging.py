@@ -29,6 +29,7 @@ import fnmatch
 import os
 import re
 import unittest
+import xml.etree.ElementTree as ET
 
 import yaml
 
@@ -64,6 +65,8 @@ class DockerignoreLeakTests(unittest.TestCase):
         ('dvr.db', 'the whole database, including plaintext account passwords'),
         ('capture-logs/', 'ffmpeg stderr spools, which can quote a credentialed stream URL'),
         ('*.log', 'the application log'),
+        ('channelbin-support-*.zip', 'support bundles - account and channel names, the log and '
+                                     'the masked config, downloaded into the repo root'),
         ('.git/', 'the full history, which predates config.yaml being untracked'),
     ]
 
@@ -145,6 +148,19 @@ class DockerPersistencePathTests(unittest.TestCase):
             self.assertIn(vol, targets,
                           f'docker-compose.example.yml stops mounting {vol}, so a user who '
                           'copies it loses that data whenever the container is recreated.')
+
+    def test_the_compose_example_pins_the_published_image_at_this_version(self):
+        """The example compose file is what a new install copies, so its image pin is what
+        they run. A pin left behind at a release installs last release; a floating `latest`
+        can swap the capture engine under a running recording (dev/changelog/994)."""
+        compose = yaml.safe_load(_read(COMPOSE))
+        image = compose['services']['channelbin'].get('image', '')
+        version = re.search(r"^__version__\s*=\s*'([^']+)'",
+                            _read(os.path.join(ROOT, 'app', 'version.py')), re.M).group(1)
+        self.assertEqual(
+            image, f'ghcr.io/theforgetfuldev/channelbin:{version}',
+            'docker-compose.example.yml does not pin the published image at app/version.py\'s '
+            'version, so a new install pulls a different release than the one it came with')
 
     def test_the_entrypoint_never_walks_the_recordings_volume(self):
         """/dvr is routinely a multi-terabyte share. A recursive chown of it at every
@@ -325,6 +341,62 @@ class DockerFileModeTests(unittest.TestCase):
             unreadable, [],
             'these files enter the image without world-read, so the container - which runs '
             'as a user owning none of /app - cannot open them: ' + ', '.join(unreadable))
+
+
+class UnraidTemplateTests(unittest.TestCase):
+    """The Unraid Community Apps template is a second install path beside the compose example,
+    and Unraid users copy it the same way (dev/changelog/995). Unlike compose it tracks
+    `latest`: an installed container keeps the tag it was created with, so a pinned template
+    would never offer an update."""
+
+    RAW = 'https://raw.githubusercontent.com/TheForgetfulDev/channelbin/main/'
+    TEMPLATE = os.path.join(ROOT, 'docker', 'unraid-template.xml')
+
+    def setUp(self):
+        self.root = ET.parse(self.TEMPLATE).getroot()
+
+    def _paths(self):
+        return {c.get('Target'): c for c in self.root.findall('Config') if c.get('Type') == 'Path'}
+
+    def test_the_image_is_the_published_one(self):
+        self.assertEqual(self.root.findtext('Repository'),
+                         'ghcr.io/theforgetfuldev/channelbin:latest')
+
+    def test_both_volumes_are_required_mappings(self):
+        """The Dockerfile declares both as VOLUMEs, so an unmapped one becomes an anonymous
+        volume inside docker.img that Unraid orphans at every update. Mapping only
+        subdirectories of /dvr does the same to live thumbnails and health check screenshots,
+        whose defaults sit directly under /dvr."""
+        paths = self._paths()
+        for vol in VOLUMES:
+            self.assertIn(vol, paths, f'the Unraid template does not map {vol}')
+            self.assertEqual(paths[vol].get('Required'), 'true',
+                             f'the Unraid template lets {vol} go unmapped')
+
+    def test_every_other_path_is_optional(self):
+        """Completed recordings and screenshots only move files the app would otherwise keep
+        under /dvr, and only once Settings points at them, so neither may block an install."""
+        required = [t for t, c in self._paths().items()
+                    if t not in VOLUMES and c.get('Required') != 'false']
+        self.assertEqual(required, [], 'the Unraid template requires an extra mount')
+
+    def test_the_restart_policy_is_set(self):
+        """The in-app Restart exits the process and relies on the restart policy; Unraid's
+        autostart toggle is not one, so without this the container just stops."""
+        self.assertIn('--restart=unless-stopped', self.root.findtext('ExtraParams') or '')
+
+    def test_urls_point_at_files_the_repo_carries(self):
+        self.assertEqual(self.root.findtext('TemplateURL'),
+                         self.RAW + 'docker/unraid-template.xml')
+        icon = self.root.findtext('Icon')
+        self.assertTrue(icon.startswith(self.RAW), 'Icon is not a raw URL on main')
+        self.assertTrue(os.path.isfile(os.path.join(ROOT, icon[len(self.RAW):])),
+                        f'Icon points at {icon}, which is not a file in this repository')
+
+    def test_the_catalog_profile_is_not_empty(self):
+        """Community Apps refuses a repository whose ca_profile.xml has an empty <Profile>."""
+        profile = ET.parse(os.path.join(ROOT, 'ca_profile.xml')).getroot().findtext('Profile')
+        self.assertTrue((profile or '').strip())
 
 
 if __name__ == '__main__':

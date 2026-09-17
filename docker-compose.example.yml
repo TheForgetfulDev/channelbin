@@ -1,6 +1,7 @@
 # ChannelBin - example compose file.
 #
-#   cp docker-compose.example.yml docker-compose.yml
+#   curl -fsSLo docker-compose.yml \
+#     https://raw.githubusercontent.com/TheForgetfulDev/channelbin/main/docker-compose.example.yml
 #   docker compose up -d
 #   docker compose logs -f
 #
@@ -10,8 +11,11 @@
 services:
   channelbin:
     container_name: channelbin
-    # Built from this checkout. No prebuilt image is published.
-    build: .
+    # Pinned to a release on purpose. An image that changes under a `latest` tag can swap
+    # the capture engine in the middle of a long recording; move this pin when you choose to.
+    image: ghcr.io/theforgetfuldev/channelbin:0.10.0
+    # To build from a checkout instead, replace the line above with:
+    # build: .
     restart: unless-stopped
     ports:
       - "5000:5000"

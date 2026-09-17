@@ -350,10 +350,7 @@ window.onScheduleSaved = () => window.location.reload();
   // reaches document and the menu would never open. The row guards itself instead.
   const NO_NAV = '.c-actions, .ch-pill, .thumb.has-img, .menu, [data-tip]';
   allRows.forEach(row => {
-    row.addEventListener('click', (e) => {
-      if (e.target.closest(NO_NAV)) return;
-      window.location = row.dataset.href;
-    });
+    bindNavClicks(row, (e) => (e.target.closest(NO_NAV) ? null : row.dataset.href));
     const thumb = row.querySelector('.thumb.has-img');
     if (thumb) thumb.addEventListener('click', () => openLightbox(thumb.dataset.shot));
   });

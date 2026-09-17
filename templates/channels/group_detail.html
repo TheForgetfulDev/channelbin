@@ -599,6 +599,7 @@
       {% else %}
       <div class="test-history-controls">
         <select class="form-control" style="width:auto"
+                {# nav-ok: per-page select #}
                 onchange="window.location.href = '{{ request.path }}?timeline_per_page=' + this.value">
           {% for size in page_sizes %}
           <option value="{{ size }}" {% if size == timeline_per_page %}selected{% endif %}>{{ 'All' if size == 'all' else size + ' per page' }}</option>

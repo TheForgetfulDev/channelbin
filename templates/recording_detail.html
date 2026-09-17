@@ -934,7 +934,7 @@
   'RECORDING_START_DEFERRED': 'warn', 'CONVERSION_YIELDED': 'warn',
   'CAPTURE_LOST_TO_OUTAGE': 'warn', 'SEGMENT_DISCARDED': 'warn',
   'FAST_DELIVERY_DETECTED': 'warn',
-  'CONVERSION_RESTARTED': 'info', 'DIAGNOSTICS': 'info',
+  'CONVERSION_RESTARTED': 'info', 'DIAGNOSTICS': 'info', 'CAPTURE_PACING_ENABLED': 'info',
   'POSTCAPTURE_ANALYSIS_STARTED': 'info', 'POSTCAPTURE_ANALYSIS_SKIPPED': 'info',
   'MIXED_FRAME_RATE_DETECTED': 'info',
   'RESTART_SUCCEEDED': 'ok', 'CONCATENATION_DONE': 'ok', 'CONVERSION_DONE': 'ok',
@@ -1068,7 +1068,7 @@ window.onScheduleSaved = () => window.location.reload();
       // The row is deleted (it never captured anything), so - like delete - navigate
       // away rather than reload this same now-nonexistent recording's page.
       run: () => jsonFetch(`/recordings/${RID}/cancel-json`, { method: 'POST' })
-        .then(() => { window.location = '/'; return null; }),
+        .then(() => { window.location = '/'; return null; }),  // nav-ok: redirect after deleting the recording
     },
     delete: {
       title: 'Delete recording',
@@ -1079,7 +1079,7 @@ window.onScheduleSaved = () => window.location.reload();
       run: () => jsonFetch(`/recordings/${RID}/delete-json`, {
         method: 'POST',
         body: JSON.stringify({ delete_files: deleteRecordingWantsFiles() }),
-      }).then(() => { window.location = '/'; return null; }),
+      }).then(() => { window.location = '/'; return null; }),  // nav-ok: redirect after deleting the recording
     },
     'retry-concat': {
       title: 'Retry join',

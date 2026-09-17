@@ -2432,7 +2432,7 @@
   }
 
   function rowAction(act, r) {
-    if (act === 'details') { location.href = `/channels/${r.channel_id}`; return; }
+    if (act === 'details') { location.href = `/channels/${r.channel_id}`; return; }  // nav-ok: kebab menu item
     if (act === 'group') {
       openGroupModal({
         channels: [{
@@ -2592,7 +2592,7 @@
           groupName: G.groupName,
           deleteUrl: api('delete'),
           attachedChecks: G.checks || [],
-          onDeleted: () => { reloading = true; location.href = G.groupsUrl; },
+          onDeleted: () => { reloading = true; location.href = G.groupsUrl; },  // nav-ok: redirect after deleting the group
           onError: (msg) => showActionError(msg),
         });
         return;
@@ -2702,7 +2702,7 @@
       confirm: 'Open the recording',
       confirmClass: 'btn btn-primary',
       onCancel,
-      onConfirm: () => { location.href = `/recordings/${info.recording_id}`; },
+      onConfirm: () => { location.href = `/recordings/${info.recording_id}`; },  // nav-ok: confirm-dialog button
     });
   }
 

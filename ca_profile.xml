@@ -1,0 +1,12 @@
+<?xml version="1.0"?>
+<CommunityApplications>
+  <Profile>
+**ChannelBin** - a self-hosted IPTV recorder (DVR) and channel tester for Xtream and M3U providers.
+
+This repository is ChannelBin's own source, and its one Unraid template is `docker/unraid-template.xml`. The image is `ghcr.io/theforgetfuldev/channelbin`, published for amd64.
+
+For help, bug reports and feature requests, open an issue on GitHub.
+  </Profile>
+  <Icon>https://raw.githubusercontent.com/TheForgetfulDev/channelbin/main/static/img/logo/channelbin-logo.png</Icon>
+  <WebPage>https://github.com/TheForgetfulDev/channelbin</WebPage>
+</CommunityApplications>

@@ -459,11 +459,15 @@ function wireScroller() {
    so this is buildModal(), not a second component. On desktop the hover tooltip
    already carries that same detail, so a click there goes straight to the item
    instead of showing a sheet only to make the reader tap Open a second time. */
+const sheetHref = el => (el.dataset.sheet === 'rec' ? `/recordings/${el.dataset.id}` : '/jobs');
+bindNavClicks(document, e => {
+  const el = e.target.closest('[data-sheet]');
+  return el && !isPhone() ? sheetHref(el) : null;
+});
 document.addEventListener('click', e => {
   const el = e.target.closest('[data-sheet]');
-  if (!el) return;
-  const href = el.dataset.sheet === 'rec' ? `/recordings/${el.dataset.id}` : '/jobs';
-  if (!isPhone()) { location.href = href; return; }
+  if (!el || !isPhone()) return;
+  const href = sheetHref(el);
   const lines = (el.getAttribute('data-tip') || '').split('\n').filter(Boolean);
   if (!lines.length) return;
   buildModal({
@@ -471,7 +475,7 @@ document.addEventListener('click', e => {
     body: lines.slice(1).map(l => `<p class="page-sub">${escHtml(l)}</p>`).join(''),
     footer: [
       { label: 'Close', class: 'btn' },
-      { label: 'Open', class: 'btn btn-primary', onClick: () => { location.href = href; return false; } },
+      { label: 'Open', class: 'btn btn-primary', onClick: () => { location.href = href; return false; } },  // nav-ok: the phone sheet's Open button, a tap
     ],
   });
 });
@@ -482,11 +486,11 @@ document.addEventListener('click', e => {
    interactive descendant to guard against - its own [data-tip] is the tile's own
    attribute, not a nested one, so it is handled as a direct click-through. ── */
 const ROW_NO_NAV = '.c-actions, [data-tip]';
-document.addEventListener('click', e => {
+bindNavClicks(document, e => {
   const tile = e.target.closest('.mtile[data-href]');
-  if (tile) { location.href = tile.dataset.href; return; }
+  if (tile) return tile.dataset.href;
   const row = e.target.closest('.drow[data-href]');
-  if (row && !e.target.closest(ROW_NO_NAV)) location.href = row.dataset.href;
+  return row && !e.target.closest(ROW_NO_NAV) ? row.dataset.href : null;
 });
 
 /* ── Sortable dash-head columns ───────────────────────────────────────────────

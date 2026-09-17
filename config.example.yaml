@@ -161,7 +161,13 @@ ffmpeg:
   # watchdog.stall_timeout_seconds or the watchdog kills the capture first and this never
   # fires. It bounds the FIRST read too, and ffmpeg does not reconnect out of a timed-out
   # open - so a provider slower than this to send its first byte fails rather than waiting.
-  read_timeout_seconds: 5               # 0 disables
+  read_timeout_seconds: 20              # 0 disables; above a 5s chunk gap (dev/changelog/998)
+  # Read recordings at real-time speed (-re) by default. Each channel can override it. Most
+  # feeds record identically either way; it helps a provider that answers every reconnect by
+  # re-sending its buffered video, which an unpaced read keeps triggering by racing to the
+  # live edge and timing out there. A recording also turns it on for one channel by itself
+  # when a fast-delivery stop follows in-process reconnects.
+  pace_realtime: false
   extra_input_args: []                  # e.g. ['-timeout', '5000000']
   extra_output_args: []
   # Joining a recording's segments reads and writes however many bytes the capture

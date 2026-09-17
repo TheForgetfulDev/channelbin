@@ -2,11 +2,14 @@
    Design: DESIGN.md 15, mockups dev/mockups/27-settings-desktop.html +
    28-settings-mobile.html; rollout dev/changelog/439.
 
-   One updater per DOM region, per CLAUDE.md's frontend rules: applySearch() is
+   One updater per DOM region, per CLAUDE.md's frontend rules: applyFilters() is
    the sole writer for the field rows, the section counts, the rail, the mobile
-   picker bar, the open section sheet, the surface results, the hit chip and the
-   empty state - so a keystroke can never leave one of them describing the
-   previous query. */
+   picker bar, the open section sheet, the group headings, the "more in Advanced"
+   footers, the Basic/Advanced switch, the surface results, the hit chip, the
+   cross-tier notice, the changed-from-default chip, the gated-row dim and the empty
+   state. Its inputs are the search query, the Basic/Advanced view and the
+   changed-from-default filter (DESIGN.md 15.9), so a row can never be hidden by one of
+   them and counted by another; the live values of the gating controls decide the dim. */
 (() => {
   'use strict';
 
@@ -24,16 +27,42 @@
     title: el.dataset.secTitle,
     el,
     total: $$('.frow[data-path]', el).length,
+    basic: $$('.frow[data-path]:not([data-tier="advanced"])', el).length,
   }));
+  // Every field, whatever the view: search reaches all of them, so the search box and
+  // the hit chip count all of them.
   const FIELD_TOTAL = SECTIONS.reduce((n, s) => n + s.total, 0);
   const secById = (id) => SECTIONS.find((s) => s.id === id);
 
-  const state = { cur: SECTIONS.length ? SECTIONS[0].id : '', q: '', hits: {} };
+  const page = $('.set-page');
+  // The server stamped the saved view; this is the only place it is read back.
+  const state = {
+    cur: SECTIONS.length ? SECTIONS[0].id : '',
+    q: '',
+    view: page.dataset.view === 'advanced' ? 'advanced' : 'basic',
+    changed: false,
+    hits: {},
+    empty: {},
+  };
+
+  // An element with no tier (the LAN-exposure warning) is never filtered by view.
+  const inView = (el) => state.view === 'advanced' || el.dataset.tier !== 'advanced';
+  const viewTotal = (sec) => (state.view === 'advanced' ? sec.total : sec.basic);
 
   const toast = (msg, isError) =>
     showToast(msg, { type: isError ? 'error' : 'success', durationMs: 2500 });
 
-  const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
+  // `many` is for words that do not take a bare s ("match" -> "matches").
+  const plural = (n, word, many = `${word}s`) => `${n} ${n === 1 ? word : many}`;
+
+  // A section's count while a filter is on, the one wording the head, the picker bar and
+  // the sheet all use. Null when nothing filters, where each shows its own plain count.
+  const filterCount = (n) => {
+    if (state.q.trim()) return n ? plural(n, 'match', 'matches') : 'no matches';
+    if (state.changed) return n ? `${n} changed` : 'none changed';
+    return null;
+  };
+  const isFiltering = () => !!state.q.trim() || state.changed;
 
   // ── Tabs ────────────────────────────────────────────────────────────────
   $$('.tab[data-tab]').forEach((btn) => {
@@ -57,6 +86,7 @@
     })
       .then((d) => {
         toast('Saved');
+        markChanged(path, d.changed_from_default);
         if (d.restart_required && typeof checkRestartStatus === 'function') checkRestartStatus();
       })
       .catch((e) => toast(`Error: ${e.message || 'Save failed'}`, true));
@@ -256,7 +286,7 @@
   // ── The rail ────────────────────────────────────────────────────────────
   $('#rail').innerHTML = SECTIONS.map((sec) => `
     <button class="rail-a${sec.id === state.cur ? ' here' : ''}" type="button" data-rail="${escHtml(sec.id)}">
-      <span>${escHtml(sec.title)}</span><span class="rc" data-rc="${escHtml(sec.id)}">${sec.total}</span>
+      <span>${escHtml(sec.title)}</span><span class="rc" data-rc="${escHtml(sec.id)}">${viewTotal(sec)}</span>
     </button>`).join('');
 
   // ── The mobile section picker (DESIGN.md 15.5 item 1) ───────────────────
@@ -267,16 +297,19 @@
   const sheetBodyHtml = () => {
     const q = state.q.trim();
     const rows = SECTIONS.map((sec) => {
-      const n = q ? (state.hits[sec.id] || 0) : sec.total;
-      return `<button class="sp-row${sec.id === state.cur ? ' here' : ''}${q && !n ? ' nohit' : ''}"
+      const n = isFiltering() ? (state.hits[sec.id] || 0) : viewTotal(sec);
+      return `<button class="sp-row${sec.id === state.cur ? ' here' : ''}${state.empty[sec.id] ? ' nohit' : ''}"
         type="button" data-sec-go="${escHtml(sec.id)}">
         <span class="spr-t">${escHtml(sec.title)}</span>
-        <span class="spr-n">${q ? (n ? plural(n, 'match') : 'no matches') : n}</span>
+        <span class="spr-n">${filterCount(n) ?? n}</span>
       </button>`;
     }).join('');
     const note = q
       ? `Counts are matches for <strong>${escHtml(state.q)}</strong>. A section with none still jumps there.`
-      : 'Counts are how many settings each section holds.';
+      : state.changed ? 'Counts are the settings in each section changed from their default.'
+      : (state.view === 'advanced'
+        ? 'Counts are how many settings each section holds.'
+        : 'Counts are the Basic settings in each section. Switch to Advanced to see the rest.');
     return `${rows}<div class="sp-note">${note}</div>`;
   };
 
@@ -288,11 +321,10 @@
   const syncPicker = () => {
     const sec = secById(state.cur) || SECTIONS[0];
     if (!sec) return;
-    const q = state.q.trim();
-    const n = q ? (state.hits[sec.id] || 0) : sec.total;
+    const n = isFiltering() ? (state.hits[sec.id] || 0) : viewTotal(sec);
     $('#sp-cur').textContent = sec.title;
-    $('#sp-n').textContent = q ? (n ? plural(n, 'match') : 'no matches') : String(n);
-    $('#secpick').classList.toggle('nohit', !!q && !n);
+    $('#sp-n').textContent = filterCount(n) ?? String(n);
+    $('#secpick').classList.toggle('nohit', !!state.empty[sec.id]);
   };
 
   // While a smooth jump is in flight the spy would name every section the page
@@ -324,6 +356,10 @@
   const goToSection = (id) => {
     if (state.q.trim() && !state.hits[id]) {
       toast('No settings in that section match the current search.');
+    } else if (state.changed && !state.hits[id]) {
+      toast('No setting in that section is changed from its default.');
+    } else if (state.empty[id]) {
+      toast('Every setting in that section is Advanced. Switch to Advanced to see them.');
     }
     markCurrent(id);
     pinJump(id);
@@ -359,6 +395,18 @@
   const swrap = $('#swrap');
   const searchEl = $('#ssearch');
   const chip = $('#shits');
+  const changedChip = $('#schanged');
+
+  // The server stamps data-changed at render; a save reports whether the field still
+  // differs from its default, so the mark follows without a reload.
+  function markChanged(path, changed) {
+    if (typeof changed !== 'boolean') return;
+    const row = $(`.frow[data-path="${CSS.escape(path)}"]`);
+    if (!row) return;
+    if (changed) row.dataset.changed = 'true';
+    else delete row.dataset.changed;
+    applyFilters();
+  }
 
   searchEl.placeholder = `Search ${FIELD_TOTAL} settings by name, description or key`;
 
@@ -384,86 +432,245 @@
     return `<button class="btn btn-sm btn-primary" type="button" data-scroll="${escHtml(s.scroll)}">${escHtml(s.btn)}</button>`;
   }
 
-  function applySearch() {
+  // A gated row names the fields that decide whether anything reads it (DESIGN.md 15.9):
+  // 'path' needs that switch on, 'path!=value' needs that dropdown off the value. Each is
+  // read from the control's live state, so flipping a switch un-dims its rows before the
+  // save comes back.
+  const GATED = $$('.frow[data-gated-by]');
+  const rowOf = (path) => $(`.frow[data-path="${CSS.escape(path)}"]`);
+  const labelOf = (path) => {
+    const row = rowOf(path);
+    const name = row && $('.fl-name', row);
+    return name ? name.textContent.trim() : path;
+  };
+  // An option's name without its explanation: "Never - always lossless copy" -> "Never".
+  const optionName = (opt) => opt.textContent.split(/ - | \(/)[0].trim();
+  // The phrase naming an unmet predicate, or null when it holds. A predicate whose field is
+  // not on the page never dims: tests/test_static_invariants.py fails that declaration.
+  function unmetGate(pred) {
+    const ne = pred.indexOf('!=');
+    const path = ne < 0 ? pred : pred.slice(0, ne);
+    const ctl = $(`[data-setting-path="${CSS.escape(path)}"]`);
+    if (!ctl) return null;
+    if (ne < 0) return ctl.checked ? null : `${labelOf(path)} is off`;
+    const value = pred.slice(ne + 2);
+    if (ctl.value !== value) return null;
+    const opt = [...ctl.options].find((o) => o.value === value);
+    return `${labelOf(path)} is ${opt ? optionName(opt) : value}`;
+  }
+
+  function applyFilters() {
+    // Gating is its own state, not a fourth visibility input: a gated row still shows, still
+    // counts and can still be a search hit or changed from default.
+    GATED.forEach((row) => {
+      const unmet = row.dataset.gatedBy.split(' ').map(unmetGate).filter(Boolean);
+      row.classList.toggle('gated', unmet.length > 0);
+      const badge = $('.gate-badge', row);
+      if (badge) {
+        badge.textContent = unmet.length
+          ? `Not used while ${unmet.length > 1 ? `${unmet.slice(0, -1).join(', ')} and ${unmet[unmet.length - 1]}` : unmet[0]}`
+          : '';
+        badge.hidden = !unmet.length;
+      }
+    });
+
     const q = state.q.trim().toLowerCase();
+    const onlyChanged = state.changed;
+    // Either filter reaches every row whatever the view (DESIGN.md 15.9 rule 6).
+    const filtering = !!q || onlyChanged;
     swrap.classList.toggle('has-text', q.length > 0);
 
     let total = 0;
+    let crossTier = 0;
     state.hits = {};
+    state.empty = {};
     SECTIONS.forEach((sec) => {
       let hits = 0;
+      let hiddenByView = 0;
+      let visible = 0;
       $$('.frow', sec.el).forEach((row) => {
-        const on = !q || (row.dataset.hay || '').includes(q);
+        const matches = (!q || (row.dataset.hay || '').includes(q))
+          && (!onlyChanged || row.dataset.changed === 'true');
+        // The filters cross tiers: a match shows whatever the view, and the tier badge
+        // (CSS, keyed on .hit) says why it is there.
+        const on = filtering ? matches : inView(row);
+        // .off means "not on screen right now", whichever input decided it.
         row.classList.toggle('off', !on);
-        row.classList.toggle('hit', !!q && on);
-        if (on && row.dataset.path) hits++;
+        row.classList.toggle('hit', filtering && on);
+        if (on) visible++;
+        if (on && row.dataset.path) {
+          hits++;
+          if (filtering && !inView(row)) crossTier++;
+        }
+        if (!on && !filtering && row.dataset.path) hiddenByView++;
       });
+      // The password and API-key forms filter as units, never by the query. They hold no
+      // value a default could describe, so the changed filter hides them.
+      $$('[data-tier]:not(.frow)', sec.el).forEach((unit) => {
+        unit.hidden = onlyChanged || (!q && !inView(unit));
+      });
+      // A group heading over zero visible rows reads as an empty group, not a miss.
+      $$('[data-sub]', sec.el).forEach((group) => {
+        group.hidden = !$$('.frow', group).some((row) => !row.classList.contains('off'));
+      });
+      // A section nothing on screen belongs to collapses to its own head rather than
+      // hiding: the rail lists every section and a page showing fewer contradicts it.
+      const empty = filtering ? hits === 0 : visible === 0;
       state.hits[sec.id] = hits;
+      state.empty[sec.id] = empty;
       total += hits;
       const cnt = $(`[data-cnt="${CSS.escape(sec.id)}"]`);
-      if (cnt) cnt.textContent = q ? (hits ? plural(hits, 'match') : 'no matches') : '';
+      if (cnt) {
+        cnt.textContent = filterCount(hits)
+          ?? (empty && sec.total ? plural(sec.total, 'advanced setting') : '');
+      }
       const rc = $(`[data-rc="${CSS.escape(sec.id)}"]`);
-      if (rc) rc.textContent = q ? hits : sec.total;
+      if (rc) rc.textContent = filtering ? hits : viewTotal(sec);
       const rail = $(`[data-rail="${CSS.escape(sec.id)}"]`);
-      if (rail) rail.classList.toggle('nohit', !!q && hits === 0);
-      // A section the query does not touch collapses to its own head rather than
-      // hiding: the rail lists eleven sections and a page showing four contradicts it.
-      sec.el.classList.toggle('nohit', !!q && hits === 0);
+      if (rail) rail.classList.toggle('nohit', empty);
+      sec.el.classList.toggle('nohit', empty);
+      const more = $(`[data-more="${CSS.escape(sec.id)}"]`);
+      if (more) {
+        const show = !filtering && !empty && hiddenByView > 0;
+        more.hidden = !show;
+        more.innerHTML = show
+          ? `<span>${hiddenByView} more in Advanced</span>
+             <button class="btn btn-sm" type="button" data-view-go="advanced">Show Advanced</button>`
+          : '';
+      }
+    });
+
+    page.dataset.view = state.view;
+    $$('[data-view-set]').forEach((b) => {
+      const on = b.dataset.viewSet === state.view;
+      b.classList.toggle('on', on);
+      b.setAttribute('aria-checked', on ? 'true' : 'false');
     });
 
     syncPicker();
     syncSheet();
 
-    const surfaces = q
+    // A page or a tool has no value to have changed, so the changed filter hides them.
+    const surfaces = q && !onlyChanged
       ? BOOT.surfaces.filter((s) => `${s.name} ${s.desc} ${s.hay}`.toLowerCase().includes(q))
       : [];
     const sres = $('#sres');
     sres.className = surfaces.length ? 'sres' : '';
     sres.innerHTML = surfaces.map(surfaceHtml).join('');
 
-    chip.style.display = q ? '' : 'none';
+    const changedTotal = $$('.frow[data-path][data-changed="true"]').length;
+    changedChip.classList.toggle('active', onlyChanged);
+    changedChip.setAttribute('aria-pressed', onlyChanged ? 'true' : 'false');
+    // Nothing to filter to is still an answer, so the chip stays and says 0. It stays
+    // usable while on, or the last change reverted would strand the page filtered.
+    changedChip.disabled = !onlyChanged && changedTotal === 0;
+    $('#schanged-n').textContent = changedTotal;
+
+    chip.style.display = filtering ? '' : 'none';
     // The two kinds are counted separately. Folding a page into "85 of 84 settings"
     // would be a lie about what was found.
-    chip.textContent = q
+    chip.textContent = filtering
       ? `${total} of ${FIELD_TOTAL} settings` +
         (surfaces.length ? ` + ${plural(surfaces.length, 'page')}` : '')
+      : '';
+
+    // A filter in Basic that reached Advanced rows says so above the results, with the
+    // way to keep them: otherwise clearing it makes the setting just found vanish.
+    const badge = '<span class="tier-badge tier-badge-on">Advanced</span>';
+    const whileOn = q ? 'while you search' : 'while Changed from default is on';
+    const one = crossTier === 1;
+    const lead = q
+      ? (one ? '1 match is an Advanced setting.' : `${crossTier} matches are Advanced settings.`)
+      : (one ? '1 changed setting is Advanced.' : `${crossTier} changed settings are Advanced.`);
+    $('#xtier-slot').innerHTML = crossTier
+      ? `<div class="xtier"><span>${lead} ${one ? 'It is' : 'They are'} marked ${badge} and ${one ? 'shows' : 'show'} only ${whileOn}.</span>
+          <button class="btn btn-sm" type="button" data-view-go="advanced">Show Advanced</button></div>`
       : '';
 
     // The verdict goes at the top, and only when BOTH kinds found nothing - a page
     // that says "no results" in the same view as a designer link is two answers
     // disagreeing.
-    $('#no-hits-slot').innerHTML = (q && total === 0 && surfaces.length === 0)
-      ? `<div class="card no-hits">Nothing matches <strong>${escHtml(state.q)}</strong>.
-          <div style="margin-top:10px"><button class="btn btn-sm" type="button" id="nh-clear">Clear the search</button></div></div>`
-      : '';
+    let verdict = '';
+    if (filtering && total === 0 && surfaces.length === 0) {
+      const what = !q ? 'No setting on this page is changed from its default.'
+        : onlyChanged ? `Nothing changed from its default matches <strong>${escHtml(state.q)}</strong>.`
+          : `Nothing matches <strong>${escHtml(state.q)}</strong>.`;
+      const btn = q ? '<button class="btn btn-sm" type="button" id="nh-clear">Clear the search</button>'
+        : '<button class="btn btn-sm" type="button" id="nh-changed-off">Show all settings</button>';
+      verdict = `<div class="card no-hits">${what}
+          <div style="margin-top:10px">${btn}</div></div>`;
+    }
+    $('#no-hits-slot').innerHTML = verdict;
   }
+
+  // Switching view keeps what the reader clicked from where it is on screen. Anchoring to a
+  // section's top was measured wrong in the browser pass: rows revealed inside a tall card,
+  // above the footer that was clicked, pushed the reader far down the page.
+  function setView(view, anchorEl) {
+    if (view === state.view) return;
+    const anchor = anchorEl && anchorEl.getClientRects().length ? anchorEl : null;
+    const before = anchor ? anchor.getBoundingClientRect().top : 0;
+    state.view = view;
+    applyFilters();
+    if (anchor) window.scrollBy(0, anchor.getBoundingClientRect().top - before);
+    // The choice follows the user across browsers (DESIGN.md 3.11), so it is stored
+    // server-side and stays until they switch again.
+    jsonFetch(`/api/user-prefs/${encodeURIComponent(BOOT.view_pref_key)}`, {
+      method: 'POST',
+      body: JSON.stringify({ value: view === 'advanced' }),
+    }).catch((e) => toast(`Error: ${e.message || 'Could not save the view'}`, true));
+  }
+
+  document.addEventListener('click', (e) => {
+    const set = e.target.closest('[data-view-set]');
+    if (set) { setView(set.dataset.viewSet, set); return; }
+    const go = e.target.closest('[data-view-go]');
+    if (!go) return;
+    // A card footer vanishes in Advanced, so the row above it is what stays put. The
+    // search notice changes no row, so it needs no anchor.
+    const card = go.closest('.sec-card');
+    const rows = card ? $$('.frow', card).filter((r) => !r.classList.contains('off')) : [];
+    setView(go.dataset.viewGo, rows[rows.length - 1]);
+  });
 
   // Keeps `?q=` in the address bar in sync with the live search, so any of the page's
   // several post-action `window.location.reload()` calls (turn off login gate, set
   // password, HA API key "shown once" modal close) land back on the same filtered view
-  // instead of the unfiltered page. Not called from the boot-time applySearch() or the
+  // instead of the unfiltered page. Not called from the boot-time applyFilters() or the
   // ?q= prefill below - that sequence reads an incoming q param and syncing there first
   // risks stripping it before it's read.
   function syncUrlQ() {
     const url = new URL(window.location.href);
     if (state.q) url.searchParams.set('q', state.q);
     else url.searchParams.delete('q');
+    if (state.changed) url.searchParams.set('changed', '1');
+    else url.searchParams.delete('changed');
     history.replaceState(null, '', url);
   }
 
   const clearSearch = () => {
     state.q = '';
     searchEl.value = '';
-    applySearch();
+    applyFilters();
     syncUrlQ();
     searchEl.focus();
   };
 
-  searchEl.addEventListener('input', () => { state.q = searchEl.value; applySearch(); syncUrlQ(); });
+  searchEl.addEventListener('input', () => { state.q = searchEl.value; applyFilters(); syncUrlQ(); });
+  // One listener for every gating control. It runs after the control's own handler, which
+  // is what lets the login gate's toggle put itself back before this reads it.
+  $('#secs').addEventListener('change', (e) => {
+    if (e.target.matches('[data-setting-path]')) applyFilters();
+  });
   searchEl.addEventListener('keydown', (e) => { if (e.key === 'Escape' && searchEl.value) clearSearch(); });
   $('#sclear').addEventListener('click', clearSearch);
+  // Not saved like the view: it is a question asked of the page, like a search. The
+  // address bar carries it only so the page's own reloads land on the same list.
+  const setChanged = (on) => { state.changed = on; applyFilters(); syncUrlQ(); };
+  changedChip.addEventListener('click', () => { if (!changedChip.disabled) setChanged(!state.changed); });
   document.addEventListener('click', (e) => {
     if (e.target.closest('#nh-clear')) { clearSearch(); return; }
+    if (e.target.closest('#nh-changed-off')) { setChanged(false); return; }
     // Both entry points to the designer - the Recording field row's button and the search
     // result's - go through the one openFilenameDesigner call, so the two cannot open
     // different things.
@@ -476,6 +683,7 @@
         onSave: (d) => {
           const now = $('.frow[data-path="recording.filename_template"] .tpl-now');
           if (now) now.textContent = d.template;
+          markChanged('recording.filename_template', d.changed_from_default);
         },
       });
       return;
@@ -512,14 +720,18 @@
 
   // ── Boot ────────────────────────────────────────────────────────────────
   syncPicker();
-  applySearch();
+  applyFilters();
+  page.classList.add('ready');
   syncSpy();
 
-  // Pre-fill the search from ?q= (the Jobs page links in this way).
-  const urlQuery = new URLSearchParams(window.location.search).get('q');
+  // Pre-fill the search from ?q= (the Jobs page links in this way), and the changed
+  // filter from the ?changed=1 syncUrlQ() leaves for a reload.
+  const params = new URLSearchParams(window.location.search);
+  const urlQuery = params.get('q');
   if (urlQuery) {
     searchEl.value = urlQuery;
     state.q = urlQuery;
-    applySearch();
   }
+  state.changed = params.get('changed') === '1';
+  if (urlQuery || state.changed) applyFilters();
 })();

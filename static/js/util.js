@@ -303,6 +303,42 @@ function hasSelectionIn(el) {
   return false;
 }
 
+// A row, tile or label that navigates on click is not a link, so the browser gives it none of
+// a link's modifiers: without this, Ctrl/Cmd/Shift-click and middle-click all replaced the
+// current page (dev/changelog/996). `followHref` is the one place a click-driven navigation
+// decides between this tab and a new one; `bindNavClicks` wires a surface for both the click
+// and the middle button, which arrives as `auxclick` and never as `click`. `resolve(e)` returns
+// the URL the click means, or a falsy value when this click is not a navigation - it runs for
+// both events, so it must not do anything but decide.
+function wantsNewTab(e) {
+  return !!e && (e.ctrlKey || e.metaKey || e.shiftKey || e.button === 1);
+}
+
+function followHref(e, url) {
+  if (!url) return;
+  if (!wantsNewTab(e)) { window.location.href = url; return; }
+  // No features string: any string at all - 'noopener' included - makes the HTML spec's
+  // popup check answer "popup", and a popup window is not the tab Ctrl-click promises.
+  const tab = window.open(url, '_blank');
+  if (tab) tab.opener = null;
+}
+
+function bindNavClicks(root, resolve) {
+  if (!root) return;
+  root.addEventListener('click', (e) => {
+    if (e.button !== 0) return;
+    const url = resolve(e);
+    if (url) followHref(e, url);
+  });
+  root.addEventListener('auxclick', (e) => {
+    if (e.button !== 1) return;
+    const url = resolve(e);
+    if (!url) return;
+    e.preventDefault();
+    followHref(e, url);
+  });
+}
+
 let _toastTimer = null;
 function showToast(message, { type = 'success', html = false, durationMs = 5000 } = {}) {
   let t = document.getElementById('app-toast');
@@ -450,7 +486,7 @@ async function jsonFetch(url, opts = {}) {
       // itself. Keyed on the header, never the bare status, so it can never fire on
       // a 401 an endpoint returns for its own unrelated reasons.
       if (res.status === 401 && res.headers.get('X-Auth-Required') === '1') {
-        window.location.href = '/login?next=' + encodeURIComponent(location.pathname + location.search);
+        window.location.href = '/login?next=' + encodeURIComponent(location.pathname + location.search);  // nav-ok: session expired, redirect to login
       }
       return res;
     });

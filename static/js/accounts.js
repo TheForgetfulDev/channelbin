@@ -41,10 +41,9 @@
   // same way index.html's recordings-list NO_NAV does it: hovering a tooltip target shows
   // the tooltip, clicking it does nothing, and the rest of the row still navigates.
   const NO_NAV = '.a-actions, .menu, a, [data-tip]';
-  document.addEventListener('click', (e) => {
+  bindNavClicks(document, (e) => {
     const row = e.target.closest('.acct-rows .arow');
-    if (!row || e.target.closest(NO_NAV)) return;
-    window.location = row.dataset.href;
+    return row && !e.target.closest(NO_NAV) ? row.dataset.href : null;
   });
 
   // ── Actions ──────────────────────────────────────────────────────────────

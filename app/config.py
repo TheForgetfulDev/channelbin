@@ -367,7 +367,20 @@ _DEFAULTS = {
         # Keep it comfortably BELOW watchdog.stall_timeout_seconds or it is inert: the
         # watchdog kills the process at that point regardless, so a read timeout at or above
         # it never gets to fire. report_read_timeout_state() says so at startup and on save.
-        'read_timeout_seconds': 5,
+        #
+        # 20 rather than the original 5: a provider delivering 5-second chunks waits about
+        # that long between reads at the live edge, and 5 reconnected on those gaps, each
+        # reconnect replaying the provider's buffer (dev/changelog/998).
+        'read_timeout_seconds': 20,
+        # Whether a recording reads the stream at real-time speed (-re) by default. Each
+        # channel may override it (Channel.pace_realtime). Off by default: on a steady feed it
+        # changes nothing measurable (dev/changelog/437). On a provider that sends a burst of
+        # buffered video and then trickles, an unpaced read drains the burst, waits at the
+        # live edge long enough for read_timeout_seconds to fire, and each reconnect is
+        # answered with the same buffer again - pacing keeps the read behind the live edge
+        # the way a player does (dev/changelog/997). A bounded segment
+        # (recording.segment_duration_seconds) is always paced whatever this says.
+        'pace_realtime': False,
         # The concat joins however many bytes the capture produced, so its size is not
         # knowable in advance and no whole-job deadline can be honest about it - the fixed
         # budget these replaced killed a 42.6 GB join at roughly the halfway mark while it
@@ -816,6 +829,54 @@ def _flatten(d, prefix=''):
             yield from _flatten(val, path)
     else:
         yield (prefix, d)
+
+
+_DEFAULT_LEAVES = dict(_flatten(_DEFAULTS))
+
+
+def config_default(path: str):
+    """The built-in default for a dotted config path, straight from _DEFAULTS.
+
+    A fallback that restates a default as a literal drifts from it - four Settings rows
+    and nine code fallbacks had (dev/changelog/1003). Raises KeyError for a path that is
+    not a leaf of _DEFAULTS, so a typo fails loudly instead of rendering a blank.
+    """
+    return _DEFAULT_LEAVES[path]
+
+
+def changed_from_default(cfg: dict) -> list:
+    """Every _DEFAULTS leaf whose value in the merged `cfg` differs from its default.
+
+    Compared the way save_config() decides a change (_diff_leaves, plain !=), so a value
+    saved back equal to its default is not a change. Paths only: the Settings page's
+    changed-from-default filter needs nothing else, and a value here would be a secret
+    leaving through a surface mask_config() never sees (dev/changelog/1006).
+    """
+    return [path for path, _, new in _diff_leaves(_DEFAULTS, cfg)
+            if path in _DEFAULT_LEAVES and new is not _MISSING]
+
+
+def default_display(path: str) -> str:
+    """The text of a Settings row's `Default:` line: the value as config.yaml spells it.
+
+    The one reader of "what does the page say the default is" (dev/changelog/1003).
+    Pure - it reads the _DEFAULTS constant and nothing else, so the field macro may call
+    it once per row. A pathless row (a notice, not a setting) gets no line.
+    """
+    if not path:
+        return ''
+    value = config_default(path)
+    if value is None:
+        return '(none)'
+    if isinstance(value, bool):
+        return 'true' if value else 'false'
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    if value == '' or value == []:
+        return '(empty)'
+    if isinstance(value, list):
+        return ', '.join(str(v) for v in value)
+    return str(value)
 
 
 def set_nested(d: dict, path: str, value):

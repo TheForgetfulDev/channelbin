@@ -898,6 +898,7 @@ def channel_detail(channel_id):
         coded_tip=fmt_utils.CODED_TIP,
         final_health_score=final_health_score,
         health_rollback=health_rollback,
+        pace_realtime_default=bool(cfg.get('ffmpeg', {}).get('pace_realtime', False)),
         recording_observations=recording_observations,
         timeline_entries=timeline_entries,
         timeline_pagination=timeline_pagination,
@@ -1404,6 +1405,25 @@ def update_channel_default_profile(channel_id):
     channel.default_profile_id = profile_id
     db.session.commit()
     return jsonify({'success': True, 'default_profile_id': channel.default_profile_id})
+
+
+@channels_bp.route('/channels/<int:channel_id>/pace-realtime', methods=['POST'])
+@retry_on_locked()
+def update_channel_pace_realtime(channel_id):
+    """Body {pace_realtime: true | false | null}; null follows ffmpeg.pace_realtime.
+
+    The one writer of Channel.pace_realtime - a user's answer, which the watchdog's
+    automatic pacing never writes (dev/changelog/997)."""
+    channel = db.session.get(Channel, channel_id)
+    if channel is None:
+        return jsonify({'error': 'Channel not found'}), 404
+    data = request.get_json(silent=True) or {}
+    value = data.get('pace_realtime', 'missing')
+    if not (value is None or isinstance(value, bool)):
+        return jsonify({'error': 'pace_realtime must be true, false or null'}), 400
+    channel.pace_realtime = value
+    db.session.commit()
+    return jsonify({'success': True, 'pace_realtime': channel.pace_realtime})
 
 
 @channels_bp.route('/channels/<int:channel_id>/health-adjustment', methods=['POST'])

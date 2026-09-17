@@ -25,7 +25,7 @@ from ..channel_groups import (effective_score, check_target_channels, teardown_t
                               cancel_scheduled_recordings, member_channels,
                               deregister_cancelled_recordings)
 from .. import channel_hiding
-from ..config import load_config
+from ..config import load_config, config_default
 from ..db_utils import retry_on_locked
 from ..logo_cache import resolve_logo_url
 from ..tz_utils import to_naive_utc, parse_local_to_utc, format_local, parse_hhmm, format_clock
@@ -160,7 +160,7 @@ def _latest_tests_by_channel(channel_ids, for_job_id=ANY_JOB):
     return {t.channel_id: t for t in tests}
 
 
-def _build_test_dict(t, test_duration_seconds=120):
+def _build_test_dict(t, test_duration_seconds=config_default('channel_testing.test_duration_seconds')):
     """Serialize a ChannelTest to a JSON-safe dict for API responses."""
     if t is None:
         return None
@@ -748,7 +748,7 @@ def on_demand_job_results(job_id):
         return jsonify({'error': 'Job not found'}), 404
 
     cfg = load_config()
-    test_duration_seconds = cfg.get('channel_testing', {}).get('test_duration_seconds', 120)
+    test_duration_seconds = cfg.get('channel_testing', {}).get('test_duration_seconds', config_default('channel_testing.test_duration_seconds'))
 
     channels, disabled_ids = job_channel_lists(job)
     channel_ids = [ch.id for ch in channels]
