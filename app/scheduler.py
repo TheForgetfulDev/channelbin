@@ -17,6 +17,7 @@ from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
 from apscheduler.jobstores.base import JobLookupError
 
 from . import admission
+from .config import config_default
 from .db_utils import configure_sqlite_pragmas, retry_on_locked
 from .tz_utils import to_naive_utc
 
@@ -1073,7 +1074,7 @@ def _get_account_interval(account, cfg) -> int:
     """Return the effective sync interval hours for an account."""
     if account.sync_interval_hours:
         return account.sync_interval_hours
-    return cfg.get('sync', {}).get('sync_interval_hours', 6)
+    return cfg.get('sync', {}).get('sync_interval_hours', config_default('sync.sync_interval_hours'))
 
 
 def _find_safe_next_run(candidate: datetime, existing_times: list, gap_minutes: int = 5) -> datetime:

@@ -1190,6 +1190,179 @@ class JinjaBuiltinTests(unittest.TestCase):
             'template:\n' + '\n'.join(offenders))
 
 
+class HandTypedSettingsDefaultTests(unittest.TestCase):
+    """Guards BUGS.md 2026-09-17 @ 05:56:42 AM "Settings Default: lines had drifted from the code".
+
+    Every settings row's `Default:` line was a string typed into the template, and four of
+    them had drifted from `_DEFAULTS` far enough to mislead (sync interval said 6 hours, the
+    code said 12). The macro now looks the default up by path (`config.default_display`,
+    dev/changelog/1003), so no field macro may take a default argument and no call may pass
+    one where the old argument sat - fourth position, straight after the description.
+    """
+
+    _FIELD_MACROS = ('field_shell', 'field_text', 'field_number', 'field_time', 'field_bool',
+                     'field_select', 'field_list', 'field_readonly')
+    _PAGES = ('settings.html', 'notifications_settings.html')
+
+    def _parse(self, name):
+        from jinja2 import Environment
+        return Environment().parse(_read(os.path.join(TPL_DIR, name)))
+
+    def test_no_field_macro_takes_a_default_argument(self):
+        from jinja2 import nodes
+        macros = {m.name: [a.name for a in m.args]
+                  for m in self._parse('_macros.html').find_all(nodes.Macro)
+                  if m.name in self._FIELD_MACROS}
+        self.assertEqual(set(macros), set(self._FIELD_MACROS))
+        for name, params in macros.items():
+            with self.subTest(macro=name):
+                self.assertNotIn('default_disp', params)
+
+    def test_no_field_call_passes_a_typed_default(self):
+        from jinja2 import nodes
+        offenders = []
+        calls = 0
+        for page in self._PAGES:
+            for call in self._parse(page).find_all(nodes.Call):
+                if not (isinstance(call.node, nodes.Name) and call.node.name in self._FIELD_MACROS):
+                    continue
+                calls += 1
+                arg = call.args[3] if len(call.args) > 3 else None
+                typed = isinstance(arg, nodes.Const) and isinstance(arg.value, str)
+                if typed or any(k.key == 'default_disp' for k in call.kwargs):
+                    offenders.append(f'{page}:{call.lineno} {call.node.name}')
+        self.assertGreater(calls, 100, 'found almost no field calls - has the macro set moved?')
+        self.assertEqual(
+            offenders, [],
+            'A settings field call passes a hand-typed default. The Default: line is looked up '
+            'from _DEFAULTS by path; a typed one drifts:\n' + '\n'.join(offenders))
+
+
+class SettingsTierDeclaredTests(unittest.TestCase):
+    """Every Settings field declares its Basic/Advanced tier where it is declared.
+
+    The tier lives on the field call (`tier='basic'` / `tier='advanced'`), beside the label
+    and description, rather than in a Python registry keyed by path - the restart badge
+    already has two homes for one fact. The macro cannot make the argument required (Jinja
+    refuses a bare argument after defaulted ones), so a call that forgets it renders an
+    empty data-tier and shows in both views. This is the enforcement point (DESIGN.md 15.9,
+    dev/changelog/1005). A call with an empty path (the LAN-exposure warning) is not a
+    setting and has no tier.
+    """
+
+    _FIELD_MACROS = HandTypedSettingsDefaultTests._FIELD_MACROS
+    _PAGES = HandTypedSettingsDefaultTests._PAGES
+
+    def test_every_field_call_with_a_path_declares_its_tier(self):
+        from jinja2 import Environment, nodes
+        offenders = []
+        calls = 0
+        for page in self._PAGES:
+            tree = Environment().parse(_read(os.path.join(TPL_DIR, page)))
+            for call in tree.find_all(nodes.Call):
+                if not (isinstance(call.node, nodes.Name) and call.node.name in self._FIELD_MACROS):
+                    continue
+                path = call.args[0] if call.args else None
+                if isinstance(path, nodes.Const) and path.value == '':
+                    continue
+                calls += 1
+                tier = next((k.value for k in call.kwargs if k.key == 'tier'), None)
+                if not (isinstance(tier, nodes.Const) and tier.value in ('basic', 'advanced')):
+                    offenders.append(f'{page}:{call.lineno} {call.node.name}')
+        self.assertGreater(calls, 100, 'found almost no field calls - has the macro set moved?')
+        self.assertEqual(
+            offenders, [],
+            "A settings field call does not declare tier='basic' or tier='advanced' "
+            '(DESIGN.md 15.9 says how to choose; Advanced is the resting state):\n'
+            + '\n'.join(offenders))
+
+
+class SettingsGateDeclarationTests(unittest.TestCase):
+    """Every `gated_by=` on a Settings field names a gate the page's script can read.
+
+    A gate is a claim that nothing in app/ reads the field while another field on the same
+    page is off or on one value (DESIGN.md 15.9, dev/changelog/1007). The script reads the
+    gate from that field's own control, so a predicate naming a path the page does not
+    render, a switch form pointed at a dropdown or a value the dropdown does not offer would
+    never dim anything, silently. And a gate that a profile, channel or account can override
+    may not dim at all (rule 8), so a gating field may not also declare `overridable_by`.
+    """
+
+    _FIELD_MACROS = HandTypedSettingsDefaultTests._FIELD_MACROS
+    _PAGES = HandTypedSettingsDefaultTests._PAGES
+
+    @staticmethod
+    def _kw(call, key):
+        return next((k.value for k in call.kwargs if k.key == key), None)
+
+    def _fields(self, tree):
+        """{path: (macro name, call, body text)} for every field call on one page."""
+        from jinja2 import nodes
+        bodies = {}
+        for block in tree.find_all(nodes.CallBlock):
+            bodies[id(block.call)] = ''.join(
+                d.data for d in block.find_all(nodes.TemplateData))
+        fields = {}
+        for call in tree.find_all(nodes.Call):
+            if not (isinstance(call.node, nodes.Name) and call.node.name in self._FIELD_MACROS):
+                continue
+            path = call.args[0] if call.args else None
+            if isinstance(path, nodes.Const) and path.value:
+                fields[path.value] = (call.node.name, call, bodies.get(id(call), ''))
+        return fields
+
+    def test_every_gate_names_a_readable_field_on_the_same_page(self):
+        from jinja2 import Environment, nodes
+        offenders = []
+        gates = 0
+        for page in self._PAGES:
+            fields = self._fields(Environment().parse(_read(os.path.join(TPL_DIR, page))))
+            for path, (_, call, _) in fields.items():
+                declared = self._kw(call, 'gated_by')
+                if declared is None:
+                    continue
+                if not (isinstance(declared, nodes.List)
+                        and all(isinstance(i, nodes.Const) for i in declared.items)):
+                    offenders.append(f'{page} {path}: gated_by must be a literal list of strings')
+                    continue
+                for pred in (i.value for i in declared.items):
+                    gates += 1
+                    gate, _, value = pred.partition('!=')
+                    if gate not in fields:
+                        offenders.append(f'{page} {path}: {pred} names no field on this page')
+                        continue
+                    macro, gcall, body = fields[gate]
+                    if self._kw(gcall, 'overridable_by') is not None:
+                        offenders.append(f'{page} {path}: {gate} can be overridden, so it '
+                                         'may not dim anything')
+                    if not value:
+                        if not (macro == 'field_bool' or 'type="checkbox"' in body):
+                            offenders.append(f'{page} {path}: {pred} is the switch form but '
+                                             f'{gate} is not a switch')
+                        continue
+                    options = gcall.args[4] if macro == 'field_select' and len(gcall.args) > 4 else None
+                    offered = ([o.items[0].value for o in options.items]
+                               if isinstance(options, nodes.List) else [])
+                    if value not in offered:
+                        offenders.append(f'{page} {path}: {pred} but {gate} offers no '
+                                         f'literal option {value!r}')
+        self.assertGreater(gates, 15, 'found almost no gates - has the macro argument moved?')
+        self.assertEqual(offenders, [], 'A Settings gate the page cannot read:\n' + '\n'.join(offenders))
+
+    def test_overridable_by_names_a_known_kind(self):
+        from jinja2 import Environment, nodes
+        offenders = []
+        for page in self._PAGES:
+            fields = self._fields(Environment().parse(_read(os.path.join(TPL_DIR, page))))
+            for path, (_, call, _) in fields.items():
+                kind = self._kw(call, 'overridable_by')
+                if kind is not None and not (isinstance(kind, nodes.Const)
+                                             and kind.value in ('recording_profile', 'health_check_profile',
+                                                                'channel', 'account')):
+                    offenders.append(f'{page} {path}')
+        self.assertEqual(offenders, [], "overridable_by must be 'recording_profile', "
+                         "'health_check_profile', 'channel' or 'account':\n" + '\n'.join(offenders))
+
 class PageConfigGlobalTests(unittest.TestCase):
     """Guards BUGS.md 2026-07-30 "the channel search page's JS never ran".
 
@@ -3464,6 +3637,58 @@ class CiWorkflowToolingTests(unittest.TestCase):
             floating, [],
             'a floating runner image changes the ffmpeg under the suite on GitHub\'s '
             f'schedule rather than on a commit: {floating}')
+
+
+class DirectNavigationBypassTests(unittest.TestCase):
+    """A click that navigates goes through util.js, so Ctrl-click still opens a new tab.
+
+    Guards dev/docs/BUGS.md 2026-09-16 @ 10:27:44 AM. A row, tile or label that navigates by
+    assigning `location.href` from a click listener is not a link, so the browser gives it
+    none of a link's modifiers: Ctrl/Cmd-click and middle-click replaced the current page on
+    Search Programs, the recordings list, the accounts and groups lists, the dashboard and
+    the TV Guide's channel column, while the same click on a real `<a>` worked. The fix
+    routes every one through `util.js::bindNavClicks` / `followHref` (dev/changelog/996).
+
+    Every remaining direct assignment is a navigation no modifier could apply to - a modal
+    button, a redirect after a save or delete, a per-page select - and says so with a
+    `nav-ok: <reason>` marker on the line or in the comment block directly above it. A new
+    unmarked one is either a click that should go through the helper or a site that owes
+    the reader that sentence.
+    """
+
+    _MARKER = 'nav-ok:'
+    _PATTERN = re.compile(r'\blocation(?:\.href)?\s*=(?!=)')
+    _COMMENT_START = ('//', '/*', '*', '{#', '<!--')
+
+    @classmethod
+    def _marked(cls, lines, idx):
+        if cls._MARKER in lines[idx]:
+            return True
+        for j in range(idx - 1, -1, -1):
+            stripped = lines[j].strip()
+            if not stripped.startswith(cls._COMMENT_START):
+                return False
+            if cls._MARKER in stripped:
+                return True
+        return False
+
+    def test_no_unmarked_direct_navigation(self):
+        offenders = []
+        paths = list(_walk(JS_DIR, '.js')) + list(_walk(TPL_DIR, '.html'))
+        for path in sorted(paths):
+            lines = _read(path).splitlines()
+            for i, line in enumerate(lines):
+                if not self._PATTERN.search(line) or self._marked(lines, i):
+                    continue
+                if _rel(path) == 'static/js/util.js' and 'window.location.href = url; return;' in line:
+                    continue
+                offenders.append(f'{_rel(path)}:{i + 1}: {line.strip()}')
+        self.assertEqual(
+            offenders, [],
+            'a direct location assignment with no nav-ok: marker. A click that navigates '
+            'must go through util.js::bindNavClicks/followHref so Ctrl/Cmd-click and '
+            'middle-click open a new tab (dev/changelog/996); anything else says why '
+            'no modifier applies in a `nav-ok: <reason>` comment')
 
 
 if __name__ == '__main__':

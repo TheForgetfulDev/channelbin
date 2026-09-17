@@ -1858,9 +1858,14 @@
            ? `${row.group.name}\nA channel group of ${row.group.member_count} members.`
            : `${ch.name}\nThe channel this showing is on.`)}"
          >${esc(((row.group ? row.group.name : ch.name) || '?')[0])}</span></div>`,
+      /* A real link, like the channel grain's name: it is where a person clicks, and only
+         an <a> gets Ctrl-click, middle-click and "Open in new tab" from the browser for free
+         (dev/changelog/996). It opens what the row opens. */
       `<div class="acell a-namecell a-progcell">
-         <span class="a-ptitle" data-tip="${tipAttr(row.title + (row.sub_title ? `\n${row.sub_title}` : ''))}"
-           >${highlight(row.title)}</span>
+         <a href="${row.group ? `${CFG.groupDetailUrlBase}${row.group.id}` : `${CFG.channelUrlBase}${ch.id}`}"
+           class="a-ptitle" data-tip="${tipAttr(row.title + (row.sub_title ? `\n${row.sub_title}` : '')
+             + (row.group ? '\n\nOpens the group.' : '\n\nOpens this channel.'))}"
+           >${highlight(row.title)}</a>
          ${row.sub_title ? `<span class="a-psub">${highlight(row.sub_title)}</span>` : ''}
          ${airingWhy(row)}
        </div>`,
@@ -2758,7 +2763,7 @@
       closeSheet();
       if (act.dataset.act === 'add-guide') addRowToGuide(rid);
       else if (act.dataset.act === 'in-guide') removeRowFromGuide(rid);
-      else if (act.dataset.act === 'open-channel') location.href = `${CFG.channelUrlBase}${rid}`;
+      else if (act.dataset.act === 'open-channel') location.href = `${CFG.channelUrlBase}${rid}`;  // nav-ok: phone bottom-sheet button, a tap
       else if (REC_ACT_KEYS.has(act.dataset.act)) openRecordModal(Number(act.dataset.air), null);
     });
   }
@@ -2797,7 +2802,7 @@
       const act = e.target.closest('[data-act]');
       if (!act) return;
       closeSheet();
-      location.href = `${CFG.groupDetailUrlBase}${Number(act.dataset.id)}`;
+      location.href = `${CFG.groupDetailUrlBase}${Number(act.dataset.id)}`;  // nav-ok: phone bottom-sheet button, a tap
     });
   }
 
@@ -3312,13 +3317,13 @@
     // Plain navigation to the tag list with its create modal open (?new=1). Creating a
     // tag leaves you on that list rather than back here - there is no return-address
     // parameter, so linking one would promise a return that does not happen.
-    tag: { label: '+ Create tag', run: () => { location.href = CFG.newTagUrl; } },
+    tag: { label: '+ Create tag', run: () => { location.href = CFG.newTagUrl; } },  // nav-ok: menu item
     // Groups are made FROM channels - there is no blank-group screen, and
     // create-group-modal.js clones an existing health check rather than starting
     // empty. So this goes to the Groups page. B5 should point it at the same
     // "Group selected" modal the selection bar uses once a selection exists,
     // which is the flow that actually creates one from here.
-    group: { label: '+ Create group', run: () => { location.href = CFG.groupsUrl; } },
+    group: { label: '+ Create group', run: () => { location.href = CFG.groupsUrl; } },  // nav-ok: menu item
   };
 
   /* ── Filter state helpers ────────────────────────────────────────────
@@ -4881,18 +4886,27 @@
          (dev/changelog/860). The phone's kebab sheet still does, and it has its own
          handler - a branch kept here "in case" would be a second, unreachable copy of it. */
       if (act.dataset.act === 'dup-badge') { if (isMobile()) openDupSheet(id); else dupDrillIn(id); }
-      else if (act.dataset.act === 'open-channel') location.href = `${CFG.channelUrlBase}${id}`;
       /* A group row's only action is opening the group. Its guide toggle used to be here
          too, spelled two ways, and both did nothing but navigate: adding a group to the
          guide has an invariant behind it (a guide group must keep a recording-enabled
          member, `dev/changelog/757`) and removing one can cancel scheduled recordings, so
          neither was ever done from a search result. The whole affordance went with the
          channel row's "+ Add to Guide" (dev/changelog/860) - the group's page is where a
-         guide row is decided, and this is what opens it. */
-      else if (act.dataset.act === 'open-group') {
-        location.href = `${CFG.groupDetailUrlBase}${id}`;
-      } else if (REC_ACT_KEYS.has(act.dataset.act)) openRecordModal(Number(act.dataset.air), act);
-      return;
+         guide row is decided, and this is what opens it - bindNavClicks below. */
+      else if (REC_ACT_KEYS.has(act.dataset.act)) openRecordModal(Number(act.dataset.air), act);
+    }
+  });
+
+  /* Every NAVIGATION out of the results region, answered once for the click and the
+     middle button alike, so Ctrl/Cmd-click opens a new tab here the way it does on a real
+     link (util.js::bindNavClicks, dev/changelog/996). */
+  bindNavClicks($('#atable'), (e) => {
+    if (e.target.closest('[data-sort], [data-rowkebab], [data-groupkebab]')) return null;
+    const act = e.target.closest('[data-act]');
+    if (act) {
+      if (act.dataset.act === 'open-channel') return `${CFG.channelUrlBase}${Number(act.dataset.id)}`;
+      if (act.dataset.act === 'open-group') return `${CFG.groupDetailUrlBase}${Number(act.dataset.id)}`;
+      return null;
     }
     // The whole row opens the channel, which is what .arow's cursor promises -
     // but only where nothing else claimed the click, and never while text is
@@ -4900,10 +4914,10 @@
     const row = e.target.closest('.arow');
     // Interactive things only: a cell that merely carries a tooltip is inert
     // text, and excluding those would make most of the row dead.
-    if (!row || e.target.closest('a, button, input, label')) return;
-    if (hasSelectionIn(row)) return;
+    if (!row || e.target.closest('a, button, input, label')) return null;
+    if (hasSelectionIn(row)) return null;
     // A group row opens its group; everything else opens its channel.
-    location.href = row.dataset.group
+    return row.dataset.group
       ? `${CFG.groupDetailUrlBase}${row.dataset.group}`
       : `${CFG.channelUrlBase}${row.dataset.id}`;
   });
@@ -5234,7 +5248,7 @@
     openGroupModal({
       channels: selectedChannels(),
       fixedGroup: { id: state.addToGroup, name: addToGroupName() },
-      onDone: () => { location.href = `${CFG.groupDetailUrlBase}${state.addToGroup}`; },
+      onDone: () => { location.href = `${CFG.groupDetailUrlBase}${state.addToGroup}`; },  // nav-ok: redirect after adding to the group
     });
   });
   $('#sel-ctx-x').addEventListener('click', () => {

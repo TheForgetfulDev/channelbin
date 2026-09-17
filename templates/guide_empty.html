@@ -37,7 +37,7 @@ const MANUAL_RECORD_CONFIG = {
 <script src="{{ url_for('static', filename='js/manual_record.js') }}"></script>
 <script>
   window.onManualRecordSaved = function () {
-    window.location.href = '{{ url_for("recordings.index") }}';
+    window.location.href = '{{ url_for("recordings.index") }}';  // nav-ok: redirect after scheduling
   };
 </script>
 {% endblock %}

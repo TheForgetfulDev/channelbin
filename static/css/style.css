@@ -2006,7 +2006,7 @@ body.actbar-on #app-toast { bottom: 78px; }
    one page's block may not be borrowed by another. Settings keeps only its
    search modifiers (.frow.hit / .off / .warn) and its filename-template row,
    which are behavior of that page's search rather than of the row. */
-.frow { display: grid; grid-template-columns: minmax(0, 1fr) 340px; gap: 18px; align-items: start;
+.frow { display: grid; grid-template-columns: minmax(0, 1fr) 340px; gap: 18px 40px; align-items: start;
   padding: 11px 18px; border-bottom: 1px solid var(--border-soft); }
 .frow:last-child { border-bottom: none; }
 .frow.full { grid-template-columns: minmax(0, 1fr); }
@@ -2023,7 +2023,29 @@ body.actbar-on #app-toast { bottom: 78px; }
 .restart-badge { font-size: var(--fs-2xs); font-weight: 600; background: var(--warn-soft);
   border: 1px solid rgba(var(--warn-rgb), .4); color: var(--warn); border-radius: 999px;
   padding: 1px 6px; white-space: nowrap; }
+/* Rendered on every advanced row and shown only where a page says so: Settings shows it
+   on a search hit outside the Basic view (DESIGN.md 15.9). A page with no view switch
+   (Notifications) never shows it. */
+.tier-badge { display: none; align-items: center; font-size: var(--fs-2xs); font-weight: 600;
+  background: var(--accent-soft); border: 1px solid var(--accent); color: var(--accent-text);
+  border-radius: 999px; padding: 1px 6px; white-space: nowrap; vertical-align: middle; }
+/* Two neutral badges in the label line (DESIGN.md 15.9, dev/changelog/1007): where else a
+   value can be set (a link to that page), and the gate that means nothing reads it right now.
+   Facts, not warnings. The gate badge renders hidden and empty; the page's script fills and
+   shows it. It may name two gates, so it wraps rather than overflowing a phone. */
+.override-badge, .gate-badge { font-size: var(--fs-2xs); font-weight: 600; background: var(--bg2);
+  border: 1px solid var(--border); color: var(--text-muted); border-radius: 999px; padding: 1px 6px; }
+.override-badge { white-space: nowrap; text-decoration: none; }
+.override-badge:hover { color: var(--text); border-color: var(--text-faint); }
 .fr-ctl { display: flex; align-items: center; justify-content: flex-end; gap: 8px; min-width: 0; }
+/* The right column: the control, and under it the mark a row whose value differs from its
+   default carries (dev/changelog/1006). The attribute, not a class, turns the mark on, so
+   the search and view filters can never strip it. */
+.fr-side { display: flex; flex-direction: column; gap: 12px; min-width: 0; }
+.fr-changed { display: none; align-self: flex-end; align-items: center; font-size: var(--fs-2xs);
+  font-weight: 600; background: var(--accent-soft); border: 1px solid var(--accent); color: var(--accent-text);
+  border-radius: 999px; padding: 1px 8px; white-space: nowrap; }
+.frow[data-changed] .fr-changed { display: inline-flex; }
 .fr-ctl input[type=text], .fr-ctl input[type=number], .fr-ctl input[type=time], .fr-ctl select {
   background: var(--bg2); border: 1px solid var(--border); border-radius: var(--radius-sm);
   color: var(--text); font: inherit; font-size: var(--fs-md); padding: 6px 10px; width: 100%; min-width: 0; }
@@ -2104,6 +2126,7 @@ body.actbar-on #app-toast { bottom: 78px; }
      16px controls so iOS does not zoom the page on focus. */
   .frow { display: block; padding: 12px 14px; }
   .fr-ctl { justify-content: flex-start; margin-top: 9px; }
+  .fr-changed { align-self: flex-start; }
   .fr-ctl input[type=text], .fr-ctl input[type=number], .fr-ctl select,
   .fr-ctl textarea { font-size: 16px; padding: 8px 10px; }
   /* Recording list card (DESIGN.md 9.4, mockup 03): one card per row - name wraps

@@ -46,12 +46,19 @@
     healthNote: C.healthNote,
     notes: C.notes,
     testEnabled: C.testEnabled,
+    paceRealtime: C.paceRealtime,
     checks: (C.healthChecks || []).slice(),
   };
 
   function enrollmentValue() {
     if (!state.checks.length) return 'Not enrolled';
     return state.checks.length === 1 ? state.checks[0] : `${state.checks.length} checks`;
+  }
+
+  // null follows ffmpeg.pace_realtime in Settings, so the chip names the default it follows.
+  function paceValue() {
+    if (state.paceRealtime === null) return `Default (${C.paceRealtimeDefault ? 'on' : 'off'})`;
+    return state.paceRealtime ? 'On' : 'Off';
   }
 
   // `note` is the one-line "what is this setting" the mobile list row shows under the label
@@ -62,6 +69,9 @@
       { focus: 'profile', label: 'Profile', value: state.profileName || 'None',
         note: 'Pre-selected when scheduling from the guide',
         tip: 'The recording profile pre-selected when you schedule this channel from the guide. It can still be changed per recording.' },
+      { focus: 'pace', label: 'Real-time read', value: paceValue(),
+        note: 'Record no faster than the stream plays',
+        tip: 'Whether recordings read this stream at real-time speed, the way a video player does. Helps a provider that re-sends its buffered video on every reconnect.' },
       { focus: 'health', label: 'Health offset',
         value: state.adjustment ? (state.adjustment > 0 ? `+${state.adjustment}` : String(state.adjustment)) : 'None',
         note: 'Nudges the computed score',
@@ -94,12 +104,27 @@
     ).join('');
 
     let h = '';
-    h += `<fieldset class="gd-fset${focus === 'profile' ? ' hi' : ''}"><div class="gd-fset-head">Recording</div>`;
+    h += `<fieldset class="gd-fset${focus === 'profile' || focus === 'pace' ? ' hi' : ''}"><div class="gd-fset-head">Recording</div>`;
     h += fieldRow({
       label: 'Default recording profile',
       meta: 'Pre-selected when scheduling a recording for this channel from the TV Guide. It can still ' +
         'be changed per recording in the record modal.',
       control: `<select id="cd-profile">${profileOpts}</select>`,
+    });
+    const paceOpts = [
+      ['default', `Default (${C.paceRealtimeDefault ? 'on' : 'off'})`],
+      ['on', 'On'],
+      ['off', 'Off'],
+    ];
+    const paceSel = state.paceRealtime === null ? 'default' : (state.paceRealtime ? 'on' : 'off');
+    h += fieldRow({
+      label: 'Read at real-time speed',
+      meta: 'Record no faster than the stream plays, the way a video player does. Most channels record ' +
+        'the same either way; it helps a provider that answers every reconnect by sending its buffered ' +
+        'video again. Default follows the setting in Settings. With Default and that setting off, a ' +
+        'recording still switches this on by itself when the replay pattern shows up; Off stops that too.',
+      control: `<select id="cd-pace">${paceOpts.map(([v, l]) =>
+        `<option value="${v}"${v === paceSel ? ' selected' : ''}>${l}</option>`).join('')}</select>`,
     });
     h += '</fieldset>';
 
@@ -162,8 +187,8 @@
     modal.querySelector('.modal-panel').classList.add('modal-wide');
   }
 
-  // Each block is its own request - the profile, the offset, the notes and the guide-check
-  // enrollment are four different endpoints, and one failing must not silently swallow the
+  // Each block is its own request - the profile, the pacing, the offset, the notes and the
+  // guide-check enrollment are five different endpoints, and one failing must not silently swallow the
   // others. Only what actually changed is sent.
   function saveSettings(body, close) {
     const profileRaw = body.querySelector('#cd-profile').value;
@@ -172,6 +197,8 @@
     const healthNote = body.querySelector('#cd-adjust-note').value.trim();
     const notes = body.querySelector('#cd-notes').value;
     const testToggle = body.querySelector('#cd-test-enabled');
+    const paceRaw = body.querySelector('#cd-pace').value;
+    const paceRealtime = paceRaw === 'default' ? null : paceRaw === 'on';
 
     const reqs = [];
     if (profileId !== state.profileId) {
@@ -182,6 +209,11 @@
         const p = C.profiles.find(x => x.id === profileId);
         state.profileName = p ? p.name : null;
       }));
+    }
+    if (paceRealtime !== state.paceRealtime) {
+      reqs.push(jsonFetch(C.urls.paceRealtime, {
+        method: 'POST', body: JSON.stringify({ pace_realtime: paceRealtime }),
+      }).then(() => { state.paceRealtime = paceRealtime; }));
     }
     if (adjustment !== state.adjustment || healthNote !== (state.healthNote || '')) {
       reqs.push(jsonFetch(C.urls.healthAdjustment, {
@@ -254,7 +286,7 @@
     })
       .then(data => {
         showToast(data.message || 'Re-pointed successfully.');
-        setTimeout(() => { location.href = `/channels/${r.id}`; }, 900);
+        setTimeout(() => { location.href = `/channels/${r.id}`; }, 900);  // nav-ok: redirect after a save
       })
       .catch(e => showActionError(e.message || 'Re-point failed.'));
   }
@@ -275,7 +307,7 @@
       deleteBody: { channel_ids: [C.channelId] },
       // This page is about to describe a row that no longer exists, so it cannot be the
       // thing that reloads.
-      onDone: () => { location.href = C.urls.channelsHub; },
+      onDone: () => { location.href = C.urls.channelsHub; },  // nav-ok: redirect after deleting the channel
     });
   }
 

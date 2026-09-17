@@ -78,8 +78,14 @@ def build_capture_cmd(cfg: dict, url: str, output_path: str, duration_seconds: i
         # ffmpeg does not reconnect out of a timed-out open - it fails the input. A provider
         # slower than this to send its first byte therefore fails the segment rather than
         # waiting, where today it would be tolerated until watchdog.stall_timeout_seconds.
-        # The default is set against measurement rather than taste: the first byte arrived
-        # in 0.25-1.26s on all four of this install's accounts.
+        # The default is 20s, set against two measurements. The floor: the first byte
+        # arrived in 0.25-1.26s on all four of this install's accounts. The reason it is not
+        # lower: a provider delivering 5-second chunks at the live edge routinely waits
+        # about that long between reads, and the original 5s default timed out on those
+        # gaps - each reconnect was answered with the provider's buffer again, replaying
+        # video (dev/changelog/997, 998). The cost of 20s: a SIGTERM during a silent read
+        # now outlasts terminate_or_kill's grace and ends in a SIGKILL, and it must still
+        # sit below watchdog.stall_timeout_seconds (30 by default).
         #
         # Emitted BEFORE extra_input_args for the same reason -user_agent is: ffmpeg takes
         # the last occurrence of a repeated option, so a user setting their own -rw_timeout

@@ -123,7 +123,7 @@
     if (a.link) {
       footer.push({
         label: `${a.link_label} →`, class: 'btn btn-primary',
-        onClick: (close) => { close(); window.location.href = a.link; },
+        onClick: (close) => { close(); window.location.href = a.link; },  // nav-ok: modal button
       });
     }
     const overlay = buildModal({ title: a.title, body, footer });

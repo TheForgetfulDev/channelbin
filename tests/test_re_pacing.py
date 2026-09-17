@@ -68,11 +68,12 @@ class RecorderPacingTests(unittest.TestCase):
         self.ctx.pop()
         self.t.cleanup()
 
-    def _argv(self, segment_duration):
+    def _argv(self, segment_duration, default_pace=False):
         """Real ffmpeg argv the recorder would have spawned, at a given segment length."""
         with mock.patch('app.recorder.load_config') as load_cfg:
             base = _real_config()
             base['recording']['segment_duration_seconds'] = segment_duration
+            base['ffmpeg']['pace_realtime'] = default_pace
             base['recording']['dvr_output_dir'] = self.t._tmpdir
             load_cfg.return_value = base
             with mock.patch('app.recorder.subprocess.Popen',
@@ -113,6 +114,133 @@ class RecorderPacingTests(unittest.TestCase):
             if '-t' in argv:
                 self.assertIn('-re', argv,
                               f'-t without -re at segment_duration={segment_duration}')
+
+
+    # ── Per-channel and default pacing (dev/changelog/997) ──────────────────────────
+    # Guards dev/docs/BUGS.md 2026-09-16 @ 12:44:22 PM "An unpaced capture replays a provider's
+    # back-buffer on every read-timeout reconnect".
+
+    def _set_channel_pace(self, value):
+        self.channel.pace_realtime = value
+        db.session.commit()
+
+    def test_default_on_paces_an_unbounded_segment(self):
+        self.assertIn('-re', self._argv(0, default_pace=True))
+
+    def test_channel_on_beats_default_off(self):
+        self._set_channel_pace(True)
+        self.assertIn('-re', self._argv(0, default_pace=False))
+
+    def test_channel_off_beats_default_on(self):
+        self._set_channel_pace(False)
+        self.assertNotIn('-re', self._argv(0, default_pace=True))
+
+    def test_channel_off_never_strips_a_bounded_segment(self):
+        """-t without -re must never ship, whatever the channel says."""
+        self._set_channel_pace(False)
+        argv = self._argv(600)
+        self.assertIn('-re', argv)
+        self.assertIn('-t', argv)
+
+    def test_automatic_pacing_reaches_the_next_launch(self):
+        """The watchdog's per-run choice lands on the relaunched segment, and the segment's
+        start event says why it is paced."""
+        from app import recorder
+        from app.database import RecordingEvent, SEGMENT_STARTED
+        state = recorder.RecordingState()
+        state.stop_event.set()   # the watchdog this launch starts exits at once
+        state.auto_paced_channel_ids.add(self.channel.id)
+        with recorder._lock:
+            recorder._active[self.rec.id] = state
+        try:
+            argv = self._argv(0)
+        finally:
+            if state.watchdog is not None:
+                state.watchdog.join(timeout=10)
+            recorder._discard_stderr_spool(state.stderr_path, state.stderr_fh)
+            state.stderr_path, state.stderr_fh = None, None
+            with recorder._lock:
+                recorder._active.pop(self.rec.id, None)
+        self.assertIn('-re', argv)
+        self.assertTrue(state.current_segment_paced)
+        ev = RecordingEvent.query.filter_by(recording_id=self.rec.id,
+                                            event_type=SEGMENT_STARTED).one()
+        self.assertIn('real-time speed', ev.detail)
+        self.assertIn('automatically', ev.detail)
+
+    def test_automatic_pacing_does_not_override_channel_off(self):
+        from app.recorder import resolve_capture_pacing, PACING_CHANNEL_OFF
+        self.assertEqual(resolve_capture_pacing({'ffmpeg': {}}, False, 0, True),
+                         (False, PACING_CHANNEL_OFF))
+
+
+class PacingResolutionTests(unittest.TestCase):
+    """recorder.resolve_capture_pacing, every source named."""
+
+    def test_every_source(self):
+        from app import recorder as r
+        on, off = {'ffmpeg': {'pace_realtime': True}}, {'ffmpeg': {'pace_realtime': False}}
+        cases = [
+            ((off, False, 600, False), (True, r.PACING_BOUNDED)),
+            ((off, True, 0, False), (True, r.PACING_CHANNEL_ON)),
+            ((on, False, 0, True), (False, r.PACING_CHANNEL_OFF)),
+            ((on, None, 0, False), (True, r.PACING_DEFAULT_ON)),
+            ((off, None, 0, True), (True, r.PACING_AUTOMATIC)),
+            ((off, None, 0, False), (False, r.PACING_DEFAULT_OFF)),
+            (({}, None, 0, False), (False, r.PACING_DEFAULT_OFF)),
+        ]
+        for args, expected in cases:
+            self.assertEqual(r.resolve_capture_pacing(*args), expected, args)
+
+
+class ChannelPaceRouteTests(unittest.TestCase):
+    """POST /channels/<id>/pace-realtime - the one writer of Channel.pace_realtime."""
+
+    def setUp(self):
+        self.t = make_test_app()
+        # This suite targets the route body, not CSRF.
+        self.t.app.config['WTF_CSRF_ENABLED'] = False
+        self.client = self.t.app.test_client()
+        with self.t.app.app_context():
+            acct = make_account(name='Route Acct')
+            self.cid = make_channel(acct, stream_id=93, name='Route Channel').id
+            db.session.commit()
+
+    def tearDown(self):
+        self.t.cleanup()
+
+    def _post(self, body):
+        return self.client.post(f'/channels/{self.cid}/pace-realtime', json=body)
+
+    def _stored(self):
+        from app.database import Channel
+        with self.t.app.app_context():
+            return db.session.get(Channel, self.cid).pace_realtime
+
+    def test_true_false_and_null_round_trip(self):
+        for value in (True, False, None):
+            resp = self._post({'pace_realtime': value})
+            self.assertEqual(resp.status_code, 200, resp.get_json())
+            self.assertEqual(resp.get_json()['pace_realtime'], value)
+            self.assertIs(self._stored(), value)
+
+    def test_anything_else_is_refused(self):
+        # 1 and 0 are refused too: `1 in (True, False, None)` is True in Python, so a
+        # membership test alone would store an integer in a Boolean column.
+        for body in ({}, {'pace_realtime': 'on'}, {'pace_realtime': 1}, {'pace_realtime': 0}):
+            self.assertEqual(self._post(body).status_code, 400, body)
+        self.assertIsNone(self._stored())
+
+    def test_unknown_channel_is_404(self):
+        resp = self.client.post('/channels/999999/pace-realtime', json={'pace_realtime': True})
+        self.assertEqual(resp.status_code, 404)
+
+    def test_channel_page_offers_the_setting(self):
+        resp = self.client.get(f'/channels/{self.cid}')
+        self.assertEqual(resp.status_code, 200)
+        html = resp.get_data(as_text=True)
+        self.assertIn('paceRealtime: null', html)
+        self.assertIn('paceRealtimeDefault:', html)
 
 
 class BoundedCallerPacingTests(unittest.TestCase):

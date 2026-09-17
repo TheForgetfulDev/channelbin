@@ -1090,22 +1090,17 @@ function wireChannelTaps() {
   if (!col) return;
   col.addEventListener('click', e => {
     const row = e.target.closest('.guide-channel-row');
-    if (!row) return;
-
-    if (isMobileGuide()) {
-      const ch = channelData.find(c => String(c.id) === row.dataset.channelId);
-      if (ch) openChannelSheet(ch);
-      return;
-    }
+    if (!row || !isMobileGuide()) return;
+    const ch = channelData.find(c => String(c.id) === row.dataset.channelId);
+    if (ch) openChannelSheet(ch);
+  });
+  bindNavClicks(col, e => {
+    const row = e.target.closest('.guide-channel-row');
+    if (!row || isMobileGuide()) return null;
     // Group rows carry a synthetic 'g<id>' channel-id; they navigate to the group detail
     // page, not /channels/<id> (which would 404 on the 'g<id>' string).
-    if (row.dataset.groupId) {
-      window.location.href = GUIDE_CONFIG.groupDetailUrlBase + row.dataset.groupId;
-      return;
-    }
-    if (row.dataset.channelId) {
-      window.location.href = GUIDE_CONFIG.chDetailUrlBase + row.dataset.channelId;
-    }
+    if (row.dataset.groupId) return GUIDE_CONFIG.groupDetailUrlBase + row.dataset.groupId;
+    return row.dataset.channelId ? GUIDE_CONFIG.chDetailUrlBase + row.dataset.channelId : null;
   });
 }
 
@@ -1216,14 +1211,14 @@ function programSheetActions(prog, ch) {
   if (hasRec && (status === 'IN_PROGRESS' || status === 'PAUSED' || status === 'RETRYING')) {
     return [
       { label: 'Dashboard →', class: 'btn btn-primary',
-        onClick: () => { window.location.href = '/'; return false; } },
+        onClick: () => { window.location.href = '/'; return false; } },  // nav-ok: modal button
       { label: '■ Stop', class: 'btn btn-danger',
         onClick: (close) => { close(); openActiveRecModal(prog); return false; } },
     ];
   }
   if (hasRec && TERMINAL_STATUSES.has(status)) {
     return [{ label: 'View recording', class: 'btn btn-primary',
-      onClick: () => { window.location.href = GUIDE_CONFIG.recDetailUrlBase + prog.recording_id; return false; } }];
+      onClick: () => { window.location.href = GUIDE_CONFIG.recDetailUrlBase + prog.recording_id; return false; } }];  // nav-ok: modal button
   }
   if (hasRec) {
     return [{ label: 'Cancel recording', class: 'btn btn-danger',
@@ -1278,7 +1273,7 @@ function openChannelSheet(ch) {
     title: ch.name,
     body,
     footer: [{ label: ch.is_group ? 'Open group' : 'Open channel', class: 'btn btn-primary',
-      onClick: () => { window.location.href = detailUrl; return false; } }],
+      onClick: () => { window.location.href = detailUrl; return false; } }],  // nav-ok: modal button
   });
 }
 
@@ -1828,7 +1823,7 @@ async function submitModalForm(form, data) {
       return;
     }
     if (isReplace && resp && resp.id) {
-      window.location.href = GUIDE_CONFIG.recDetailUrlBase + resp.id;
+      window.location.href = GUIDE_CONFIG.recDetailUrlBase + resp.id;  // nav-ok: redirect after scheduling
       return;
     }
     closeModal();
@@ -2905,12 +2900,12 @@ document.addEventListener('DOMContentLoaded', function () {
      is the only parameter spelled here. */
   const btnAiringSearch = document.getElementById('btn-airing-search');
   if (btnAiringSearch) {
-    btnAiringSearch.addEventListener('click', () => {
+    bindNavClicks(btnAiringSearch, () => {
       const base = btnAiringSearch.dataset.airingSearchUrl;
-      if (!base) return;
+      if (!base) return null;
       const box = document.getElementById('guide-search');
       const q = box ? box.value.trim() : '';
-      location.href = q
+      return q
         ? `${base}${base.includes('?') ? '&' : '?'}q=${encodeURIComponent(q)}`
         : base;
     });

@@ -255,23 +255,19 @@
       const open = detail.hidden;
       detail.hidden = !open;
       caret.setAttribute('aria-expanded', open ? 'true' : 'false');
-      return;
     }
-    const row = e.target.closest('[data-expand]');
-    if (!row) return;
-    // Real action elements (kebab, check chips, attach chip, channel links) inside the
-    // row swallow the click and must not trigger navigation.
-    if (e.target.closest('.menu, [data-menu], [data-menu-check], [data-act], .ch-pill')) return;
-    const url = row.dataset.detailUrl;
-    if (url) window.location = url;
   });
-
-  // Check chips navigate to the check's results page.
-  document.body.addEventListener('click', (e) => {
+  bindNavClicks(document.body, (e) => {
+    if (e.target.closest('.grp-expand')) return null;
+    // Check chips navigate to the check's results page.
     const chip = e.target.closest('[data-menu-check]');
-    if (!chip) return;
-    const [, jobId] = chip.dataset.menuCheck.split(':');
-    window.location = `/channels/health-checks/${jobId}`;
+    if (chip) return `/channels/health-checks/${chip.dataset.menuCheck.split(':')[1]}`;
+    const row = e.target.closest('[data-expand]');
+    if (!row) return null;
+    // Real action elements (kebab, attach chip, channel links) inside the row swallow the
+    // click and must not trigger navigation.
+    if (e.target.closest('.menu, [data-menu], [data-act], .ch-pill')) return null;
+    return row.dataset.detailUrl || null;
   });
 
   // ── Kebab actions ─────────────────────────────────────────────────────
@@ -354,7 +350,7 @@
           jsonFetch(CFG.createGroupUrl, { method: 'POST', body: JSON.stringify({ name }) })
             .then((resp) => {
               showToast(`Created "${name}".`);
-              if (resp && resp.detail_url) window.location = resp.detail_url;
+              if (resp && resp.detail_url) window.location = resp.detail_url;  // nav-ok: redirect after creating a group
               else reload();
             })
             .catch(err => showToast(err.message, { type: 'error' }));

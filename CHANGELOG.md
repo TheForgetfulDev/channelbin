@@ -5,6 +5,35 @@ Notable changes to ChannelBin, newest first. This project follows
 release is tagged `v<version>` in git, and the version the app is running is shown in the
 page footer.
 
+## 0.10.0 - 2026-09-17
+
+**Added**
+
+- Settings opens in a Basic view with the settings a new user is most likely to need (or want) to
+  change, and a Basic/Advanced switch. Search still finds every setting from either view.
+- Every setting changed from its default is marked, and a filter shows only those.
+- A setting that has no effect while a switch or mode is off fades and names what it depends on.
+  Settings that can be overridden by a profile, channel, or account have an indicator and a link
+  to where that override can be set.
+- Recordings can read a stream at real-time speed, as a default or per channel, and switch to it
+  on their own when a provider replays its buffer after a reconnect.
+- A published container image at `ghcr.io/theforgetfuldev/channelbin`, which the example compose
+  file now uses, and an Unraid Community Apps template.
+
+**Changed**
+
+- The capture read timeout now defaults to 20 seconds instead of 5, so a stream is no longer
+  dropped during the normal wait between a provider's chunks. An install that set its own value
+  keeps it.
+- Settings fills the page width, and the larger cards group their fields by what they control.
+
+**Fixed**
+
+- Ctrl/Cmd-click and middle-click on list rows, dashboard tiles and program titles open a new tab
+  instead of replacing the page.
+- Several "Default:" lines on the Settings page showed the wrong value, and some descriptions no
+  longer matched what the app does. Both now match the app.
+
 ## 0.9.3 - 2026-09-16
 
 **Fixed**

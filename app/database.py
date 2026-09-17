@@ -107,6 +107,14 @@ SEGMENT_DISCARDED      = 'SEGMENT_DISCARDED'
 # Product Principle 1 forbids, pointed the other way. Its own type rather than a
 # DIAGNOSTICS measurement for the same reason SEGMENT_DISCARDED is - the app acted.
 FAST_DELIVERY_DETECTED = 'FAST_DELIVERY_DETECTED'
+# The watchdog turned on real-time pacing (-re) for one channel for the rest of a recording,
+# because a segment on it was stopped for fast delivery AND ffmpeg had reconnected inside
+# that segment. Some providers answer a reconnect by re-sending their whole back-buffer, so
+# an unpaced read that keeps timing out at the live edge replays the same stretch over and
+# over; pacing keeps the read behind the live edge the way a player does (dev/changelog/997).
+# Its own type because the app acted - and it never writes Channel.pace_realtime, which is
+# the user's answer and not the engine's.
+CAPTURE_PACING_ENABLED = 'CAPTURE_PACING_ENABLED'
 # Generic carrier for "here is something the app measured", emitted on both good and bad
 # verdicts so a healthy recording still says what was checked (dev/changelog/330). The
 # specific measurement is named in extra_data['kind'] ('timeline_scan', 'capture_health',
@@ -1420,6 +1428,12 @@ class Channel(db.Model):
     hidden_deferred  = db.Column(db.Boolean, nullable=False, default=False,
                                  server_default=db.text('0'))
     notes            = db.Column(db.Text)
+    # Whether recordings of this channel read the stream at real-time speed (ffmpeg -re):
+    # NULL = follow ffmpeg.pace_realtime in Settings, True/False = this channel's own answer.
+    # A user's answer to a judgment call, so the participation-switch rule applies - the
+    # watchdog's automatic pacing (CAPTURE_PACING_ENABLED) lives on the running recording's
+    # state and never writes here, and an explicit False is what stops it (dev/changelog/997).
+    pace_realtime    = db.Column(db.Boolean)
     # Channel lifecycle tracking (DESIGN-sync-resilience.md §5): first_seen_at is set once
     # at row creation; last_seen_at is updated on every sync whose feed includes the
     # channel (both stamped in app/accounts.py::_upsert_channels, the one shared M3U/

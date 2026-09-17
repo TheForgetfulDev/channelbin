@@ -18,6 +18,10 @@ dvr.db-journal
 capture-logs/
 *.log
 dvr.log.*
+# Support bundles download into the repo root and hold account and channel names, dvr.log and
+# the (masked) config. Two of them shipped in private images before this line existed
+# (dev/changelog/994).
+channelbin-support-*.zip
 
 # --- Recordings and scratch output ---
 /dvr/
@@ -60,8 +64,10 @@ playwright.config.ts
 *.swo
 
 # --- Python build artifacts ---
-__pycache__/
-*.py[cod]
+# `**/` because a .dockerignore pattern is anchored at the context root: a bare
+# `__pycache__/` only ever matched a root-level directory and let app/__pycache__ through.
+**/__pycache__/
+**/*.py[cod]
 *.egg-info/
 .venv/
 venv/
@@ -71,3 +77,6 @@ Dockerfile
 .dockerignore
 docker-compose.yml
 docker-compose.example.yml
+# The Unraid Community Apps listing, read from the repository by the catalog's scanner.
+ca_profile.xml
+docker/unraid-template.xml

@@ -255,7 +255,7 @@ def create_app(config_overrides=None, start_scheduler=True):
         app.register_blueprint(mockups_bp)
         logging.getLogger(__name__).info('Dev mockups route enabled at /mockups/')
 
-    from .config import is_restart_needed
+    from .config import is_restart_needed, default_display
     from .tz_utils import get_display_tz_name, get_time_format
     from . import health_bands as _health_bands
 
@@ -277,6 +277,10 @@ def create_app(config_overrides=None, start_scheduler=True):
             return _health_bands.UNTESTED_LABEL
         band = _health_bands.band_by_key(bands, _health_bands.band_for(score, bands))
         return band.label if band is not None else ''
+
+    # A global rather than a context value so the imported field macros see it without
+    # `with context`. Pure: reads the _DEFAULTS constant only (dev/changelog/1003).
+    app.jinja_env.globals['default_display'] = default_display
 
     @app.context_processor
     def inject_globals():

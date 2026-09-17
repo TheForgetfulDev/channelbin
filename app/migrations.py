@@ -2182,6 +2182,18 @@ def _m062_fast_delivery_rollup(conn, cur):
     conn.commit()
 
 
+def _m063_channel_pace_realtime(conn, cur):
+    """channels: pace_realtime, the per-channel answer to "read this stream at real-time
+    speed" (dev/changelog/997).
+
+    No backfill: NULL means "follow ffmpeg.pace_realtime in Settings", which is exactly how
+    every existing channel behaved before the column existed.
+    """
+    ch_cols = [r[1] for r in cur.execute('PRAGMA table_info(channels)').fetchall()]
+    if 'pace_realtime' not in ch_cols:
+        cur.execute('ALTER TABLE channels ADD COLUMN pace_realtime BOOLEAN')
+    conn.commit()
+
 SCHEMA_MIGRATIONS = [
     (1, 'baseline: pre-versioning additive migrations + backfills', _m001_baseline),
     (2, 'recordings: program_title/program_sub_title snapshot columns + backfill', _m002_program_title),
@@ -2303,6 +2315,8 @@ SCHEMA_MIGRATIONS = [
     (62, 'recordings: fast_delivery_segment_count/fast_delivery_seconds, the rollup of '
      'joined segments whose video arrived faster than the clock',
      _m062_fast_delivery_rollup),
+    (63, 'channels: pace_realtime, the per-channel override of ffmpeg.pace_realtime',
+     _m063_channel_pace_realtime),
 ]
 
 CURRENT_SCHEMA_VERSION = SCHEMA_MIGRATIONS[-1][0]

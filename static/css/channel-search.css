@@ -717,6 +717,7 @@
    two lines exactly as the channel cell carries the name plus its badges. */
 .a-progcell { flex-wrap: wrap; row-gap: 1px; }
 .a-ptitle { font-weight: 500; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.a-ptitle:hover { color: var(--accent); text-decoration: none; }
 .a-ptitle mark, .a-psub mark, .ac-title mark {
   background: rgba(var(--warn-rgb),.32); color: inherit; border-radius: var(--radius-sm); padding: 0 1px; }
 .a-psub { flex-basis: 100%; font-size: var(--fs-xs); color: var(--text-muted);

@@ -1276,6 +1276,37 @@ class CountsSplitChannelGrainTests(_PageJs, unittest.TestCase):
         self.assertNotRegex(self.obs['head_count'], r'\d\+')
 
 
+class NavClickTests(_PageJs, unittest.TestCase):
+    """Ctrl/Cmd-click and middle-click on a result row open a new tab, on both grains.
+
+    Guards dev/docs/BUGS.md 2026-09-16 @ 10:27:44 AM: on Search Programs the program title
+    was a <span> and the row navigated by assigning location.href, so a Ctrl-click replaced
+    the page, while Search Channels' name was a real link and worked (dev/changelog/996)."""
+
+    SCENARIO = 'nav_click'
+
+    def _check_grain(self, grain):
+        o = self.obs[grain]
+        self.assertTrue(o['row_found'], f'{grain}: no channel row rendered to click')
+        want = [{'url': o['expected_url'], 'target': '_blank'}]
+        for how in ('ctrl', 'meta', 'middle'):
+            self.assertEqual(o['opened_by'].get(how), want,
+                             f'{grain}: a {how}-click on the row must open the channel in a new tab')
+        self.assertEqual(o['opened_by'].get('ctrl_on_checkbox'), [],
+                         f'{grain}: a Ctrl-click on the checkbox is a selection, not a navigation')
+
+    def test_the_airing_grain_row_opens_a_new_tab_on_a_modified_click(self):
+        self._check_grain('airings')
+
+    def test_the_channel_grain_row_opens_a_new_tab_on_a_modified_click(self):
+        self._check_grain('channels')
+
+    def test_the_program_title_is_a_real_link_to_what_the_row_opens(self):
+        o = self.obs['airings']
+        self.assertEqual(o['title_tag'], 'A')
+        self.assertEqual(o['title_href'], o['expected_url'])
+
+
 class AiringMobileTests(_PageJs, unittest.TestCase):
     """The airing grain at 375px: 25's rows in 22's phone arrangement."""
 

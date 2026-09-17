@@ -199,7 +199,7 @@
       channels: A.channels,
       epg: A.epg,
       syncs: A.totalSyncs,
-      onDone: () => { window.location.href = A.accountsUrl; },
+      onDone: () => { window.location.href = A.accountsUrl; },  // nav-ok: redirect after deleting the account
     })),
   };
 

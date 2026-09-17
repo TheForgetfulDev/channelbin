@@ -749,7 +749,10 @@ class WatchdogThread(threading.Thread):
                                     cause=_first_line(stderr_tail)))
                                 return
                             # Strikes left: fall through to the ordinary restart below and
-                            # try this member again on a fresh connection.
+                            # try this member again on a fresh connection - paced, when the
+                            # segment's own reconnects are the likely cause of the replay.
+                            self._auto_pace_after_fast_delivery(seg_num, seg_channel_id,
+                                                                reconnects)
 
                         # Dead-stream fast-fail: independent trip-wire, checked before the
                         # normal max_consecutive_failures path since it's meant to catch
@@ -1300,6 +1303,64 @@ class WatchdogThread(threading.Thread):
         if rec.channel_id and rec.channel:
             connlim.release(rec.channel.account_id, 'recording', self.recording_id)
         return marked
+
+    def _auto_pace_after_fast_delivery(self, seg_num, channel_id, reconnects) -> bool:
+        """Turn on real-time pacing for this channel for the rest of the recording, when a
+        segment stopped for fast delivery had also reconnected in-process. True if it did.
+
+        Why the reconnects are the condition: some providers answer every new connection by
+        re-sending their whole back-buffer. An unpaced read drains that burst, waits at the
+        live edge, ffmpeg's read timeout fires, and the reconnect is answered with the same
+        buffer again - measured on a real capture as 65% of the file being byte-identical
+        repeats while the channel itself advanced at 1x (dev/changelog/997). A paced read
+        stays behind the live edge the way a player does, so the timeout never fires. Without
+        reconnects the replay is not ours, and pacing would only hide it from the detector.
+
+        Changes only how the next segment is launched. The detection, its strike and its
+        score hit are untouched, and Channel.pace_realtime is never written: an explicit
+        False there is the user's answer and suppresses this.
+        """
+        from . import db
+        from . import events as ev
+        from .database import Channel, CAPTURE_PACING_ENABLED
+        reconnect_count, reconnects_complete = reconnects
+        if (channel_id is None or not reconnect_count or self.state.current_segment_paced
+                or channel_id in self.state.auto_paced_channel_ids):
+            return False
+        channel = db.session.get(Channel, channel_id)
+        if channel is not None and channel.pace_realtime is False:
+            log.warning('Recording %d: seg %d reconnected %d time(s) before its fast-delivery '
+                        'stop, but channel %d is set to never read at real-time speed - '
+                        'restarting it unpaced', self.recording_id, seg_num, reconnect_count,
+                        channel_id)
+            return False
+        self.state.auto_paced_channel_ids.add(channel_id)
+        howmany = reconnect_count if reconnects_complete else f'at least {reconnect_count}'
+        times = 'time' if reconnect_count == 1 and reconnects_complete else 'times'
+        detail = (f'Reading this channel at real-time speed for the rest of the recording: '
+                  f'segment {seg_num} was stopped for fast delivery, and ffmpeg had reconnected '
+                  f'{howmany} {times} inside it. Some providers answer a reconnect by sending '
+                  f'their buffered video again, so a read that races to the live edge and '
+                  f'times out can replay the same stretch; a paced read stays behind the live '
+                  f'edge instead. Change it for good under the channel\'s Settings.')
+
+        @retry_on_locked()
+        def _record_pacing_and_commit():
+            add_recording_event(self.recording_id, CAPTURE_PACING_ENABLED, detail=detail,
+                                segment_number=seg_num,
+                                extra={'reconnects': reconnect_count,
+                                       'reconnects_complete': reconnects_complete})
+            db.session.commit()
+
+        _record_pacing_and_commit()
+        log.warning('Recording %d: seg %d was stopped for fast delivery after %s in-process '
+                    'reconnect(s) - reading channel %d at real-time speed from the next '
+                    'segment', self.recording_id, seg_num, howmany, channel_id)
+        ev.publish(self.recording_id, CAPTURE_PACING_ENABLED, {
+            'segment_number': seg_num, 'channel_id': channel_id,
+            'reconnects': reconnect_count,
+        })
+        return True
 
     def _fail_recording_fast_delivery(self, rec, strikes, ratio, window_seconds, cause=None):
         """Give up after a feed kept delivering faster than real time on every attempt and

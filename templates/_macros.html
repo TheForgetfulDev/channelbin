@@ -179,40 +179,62 @@
    {% call %}. `hay` adds search terms a field's own text does not carry (the
    Settings search reads data-hay; a page without a search just ignores it).
    Lived in settings.html until Notifications' Delivery card became the second
-   caller - dev/changelog/440. The CSS is in style.css under the same heading. #}
-{% macro field_shell(path, label, description, default_disp='', restart=false, readonly=false, hay='', full=false, row_class='') %}
-<div class="frow{{ ' full' if full else '' }}{{ ' ' ~ row_class if row_class else '' }}"{% if path %} data-path="{{ path }}"{% endif %}
+   caller - dev/changelog/440. The CSS is in style.css under the same heading.
+   `tier` is 'basic' or 'advanced' on every call with a path (DESIGN.md 15.9). It
+   has a default only because Jinja refuses a bare argument after defaulted ones:
+   a missing tier renders an empty data-tier, and
+   tests/test_static_invariants.py::SettingsTierDeclaredTests fails the build.
+   `changed_paths` comes from the page's context when it imports this macro `with
+   context` (Settings does; dev/changelog/1006): a changed row carries data-changed, which
+   shows the "Changed from default" mark under its control. Every row renders the mark so
+   a save can set or clear the attribute without rebuilding the row.
+   `gated_by` is a list of predicates on other fields of the same page - 'path' (that
+   switch is on) or 'path!=value' (that dropdown is not on value) - all required for the
+   field to be read; the page's script dims the row and fills and shows its gate badge while
+   one is unmet. Declared only where the gate has no override anywhere in the app (DESIGN.md
+   15.9 rule 8). `overridable_by` names what can override the field and renders a badge
+   linking to where that is set (dev/changelog/1007). #}
+{%- set OVERRIDE_BADGES = {
+  'recording_profile': ('Profile can override', 'profiles.profiles_list'),
+  'health_check_profile': ('Profile can override', 'health_check_profiles.health_check_profiles_list'),
+  'channel': ('Channel can override', 'channels.channel_browser'),
+  'account': ('Account can override', 'accounts.accounts_list'),
+} %}
+{% macro field_shell(path, label, description, restart=false, readonly=false, hay='', full=false, row_class='', tier=none, gated_by=none, overridable_by=none) %}
+{%- set changed = path and changed_paths is defined and path in changed_paths %}
+{%- set default_disp = '' if readonly else default_display(path) %}
+<div class="frow{{ ' full' if full else '' }}{{ ' ' ~ row_class if row_class else '' }}"{% if path %} data-path="{{ path }}" data-tier="{{ tier or '' }}"{% endif %}{% if changed %} data-changed="true"{% endif %}{% if gated_by %} data-gated-by="{{ gated_by|join(' ') }}"{% endif %}
      data-hay="{{ (label ~ ' ' ~ description ~ ' ' ~ default_disp ~ ' ' ~ path ~ ' ' ~ hay)|lower }}">
   <div class="fl">
-    <div class="fl-label">{{ label }}{% if restart %} <span class="restart-badge">&#8635; restart required</span>{% endif %}{% if readonly %} <span class="restart-badge">read-only - edit in config.yaml</span>{% endif %}</div>
+    <div class="fl-label"><span class="fl-name">{{ label }}</span>{% if restart %} <span class="restart-badge">&#8635; restart required</span>{% endif %}{% if readonly %} <span class="restart-badge">read-only - edit in config.yaml</span>{% endif %}{% if overridable_by %} <a class="override-badge" href="{{ url_for(OVERRIDE_BADGES[overridable_by][1]) }}">{{ OVERRIDE_BADGES[overridable_by][0] }}</a>{% endif %}{% if gated_by %} <span class="gate-badge" hidden></span>{% endif %}{% if tier == 'advanced' %} <span class="tier-badge">Advanced</span>{% endif %}</div>
     <div class="fl-desc">{{ description }}</div>
     {% if default_disp %}<div class="fl-default">Default: <code>{{ default_disp }}</code></div>{% endif %}
     {% if path %}<div class="fl-key">{{ path }}</div>{% endif %}
   </div>
-  {% if not full %}<div class="fr-ctl">{{ caller() }}</div>{% endif %}
+  {% if not full %}<div class="fr-side"><div class="fr-ctl">{{ caller() }}</div>{% if path %}<div class="fr-changed">Changed from default</div>{% endif %}</div>{% endif %}
 </div>
 {% endmacro %}
 
-{% macro field_text(path, label, description, default_disp, value, nullable=false, restart=false) %}
-{% call field_shell(path, label, description, default_disp, restart) %}
+{% macro field_text(path, label, description, value, nullable=false, restart=false, tier=none, gated_by=none, overridable_by=none) %}
+{% call field_shell(path, label, description, restart, tier=tier, gated_by=gated_by, overridable_by=overridable_by) %}
 <input type="text" data-setting-path="{{ path }}"{% if nullable %} data-nullable="true"{% endif %} value="{{ value if value is not none else '' }}">
 {% endcall %}
 {% endmacro %}
 
-{% macro field_number(path, label, description, default_disp, value, restart=false, step=none) %}
-{% call field_shell(path, label, description, default_disp, restart) %}
+{% macro field_number(path, label, description, value, restart=false, step=none, tier=none, gated_by=none, overridable_by=none) %}
+{% call field_shell(path, label, description, restart, tier=tier, gated_by=gated_by, overridable_by=overridable_by) %}
 <input type="number"{% if step %} step="{{ step }}"{% endif %} data-setting-path="{{ path }}" value="{{ value }}">
 {% endcall %}
 {% endmacro %}
 
-{% macro field_time(path, label, description, default_disp, value, restart=false) %}
-{% call field_shell(path, label, description, default_disp, restart) %}
+{% macro field_time(path, label, description, value, restart=false, tier=none, gated_by=none, overridable_by=none) %}
+{% call field_shell(path, label, description, restart, tier=tier, gated_by=gated_by, overridable_by=overridable_by) %}
 <input type="time" data-setting-path="{{ path }}" value="{{ value }}">
 {% endcall %}
 {% endmacro %}
 
-{% macro field_bool(path, label, description, default_disp, value, restart=false) %}
-{% call field_shell(path, label, description, default_disp, restart) %}
+{% macro field_bool(path, label, description, value, restart=false, tier=none, gated_by=none, overridable_by=none) %}
+{% call field_shell(path, label, description, restart, tier=tier, gated_by=gated_by, overridable_by=overridable_by) %}
 <label class="switch">
   <input type="checkbox" data-setting-path="{{ path }}"{{ ' checked' if value else '' }}>
   <span class="knob"></span>
@@ -220,8 +242,8 @@
 {% endcall %}
 {% endmacro %}
 
-{% macro field_select(path, label, description, default_disp, value, options, restart=false) %}
-{% call field_shell(path, label, description, default_disp, restart) %}
+{% macro field_select(path, label, description, value, options, restart=false, tier=none, gated_by=none, overridable_by=none) %}
+{% call field_shell(path, label, description, restart, tier=tier, gated_by=gated_by, overridable_by=overridable_by) %}
 <select data-setting-path="{{ path }}">
   {% for opt in options %}
   <option value="{{ opt[0] }}"{{ ' selected' if value|string == opt[0]|string else '' }}>{{ opt[1] }}</option>
@@ -230,14 +252,14 @@
 {% endcall %}
 {% endmacro %}
 
-{% macro field_list(path, label, description, default_disp, value, restart=false) %}
-{% call field_shell(path, label, description, default_disp, restart) %}
+{% macro field_list(path, label, description, value, restart=false, tier=none, gated_by=none, overridable_by=none) %}
+{% call field_shell(path, label, description, restart, tier=tier, gated_by=gated_by, overridable_by=overridable_by) %}
 <textarea data-setting-path="{{ path }}" data-setting-type="list" rows="3">{{ value | join('\n') if value else '' }}</textarea>
 {% endcall %}
 {% endmacro %}
 
-{% macro field_readonly(path, label, description, value, secret=false) %}
-{% call field_shell(path, label, description, '', false, true) %}
+{% macro field_readonly(path, label, description, value, secret=false, tier=none, gated_by=none, overridable_by=none) %}
+{% call field_shell(path, label, description, readonly=true, tier=tier, gated_by=gated_by, overridable_by=overridable_by) %}
 {% if secret and value %}
 <div class="secret-field">
   <input type="text" value="{{ value }}" readonly>

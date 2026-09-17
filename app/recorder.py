@@ -102,6 +102,54 @@ class RecordingState:
     # move rides a segment boundary that was happening anyway (and skips the restart
     # delay, making it ~30s cheaper than staying put).
     stall_moves: int = 0
+    # Channels this recording has switched to real-time pacing on its own, because a segment
+    # on them was stopped for fast delivery after in-process reconnects (dev/changelog/997).
+    # Keyed on the member, so a failover does not carry it to a feed that never showed the
+    # problem. In-memory by design: it is a recovery for this run, never a stored setting -
+    # Channel.pace_realtime is the user's answer and nothing here writes it. A pause/resume
+    # or service restart forgets it, costing at most one more fast-delivery kill to re-learn.
+    auto_paced_channel_ids: set = field(default_factory=set)
+    # Whether the segment now running was launched with -re, so the watchdog can tell a
+    # paced capture that still misbehaved (pacing is not the fix) from an unpaced one.
+    current_segment_paced: bool = False
+
+
+# Where a segment's real-time pacing decision came from. Every value is named, and the
+# segment-start event says which one applied (dev/changelog/997).
+PACING_BOUNDED = 'bounded'           # a segment length is set, so -re is mandatory
+PACING_CHANNEL_ON = 'channel_on'     # Channel.pace_realtime is True
+PACING_CHANNEL_OFF = 'channel_off'   # Channel.pace_realtime is False
+PACING_DEFAULT_ON = 'default_on'     # the channel follows ffmpeg.pace_realtime, which is on
+PACING_DEFAULT_OFF = 'default_off'   # the channel follows ffmpeg.pace_realtime, which is off
+PACING_AUTOMATIC = 'automatic'       # the watchdog turned it on for this channel this run
+
+_PACING_NOTES = {
+    PACING_BOUNDED: 'required by the configured segment length',
+    PACING_CHANNEL_ON: "this channel's setting",
+    PACING_DEFAULT_ON: 'the default in Settings',
+    PACING_AUTOMATIC: 'turned on automatically earlier in this recording',
+}
+
+
+def resolve_capture_pacing(cfg: dict, channel_pace, segment_duration, auto_paced: bool):
+    """(pace, source) for one recording segment's -re flag.
+
+    Order matters. A bounded segment is always paced, because -t without -re is satisfied
+    from a provider's backlog in seconds (dev/changelog/437). An explicit per-channel answer
+    beats everything else, including the watchdog's automatic pacing - the user said no.
+    Automatic pacing only ever turns pacing ON for a channel following the default.
+    """
+    if segment_duration:
+        return True, PACING_BOUNDED
+    if channel_pace is True:
+        return True, PACING_CHANNEL_ON
+    if channel_pace is False:
+        return False, PACING_CHANNEL_OFF
+    if cfg.get('ffmpeg', {}).get('pace_realtime', False):
+        return True, PACING_DEFAULT_ON
+    if auto_paced:
+        return True, PACING_AUTOMATIC
+    return False, PACING_DEFAULT_OFF
 
 
 # recording_id → RecordingState
@@ -1305,14 +1353,18 @@ def _launch_segment(app, recording_id: int, seg_num: int) -> str:
         # internal, and a successful concat deletes them.
         seg_path = os.path.join(dvr_dir, f'{safe_name}_{recording_id}_seg_{seg_num:03d}.ts')
 
-        # -re only when segment_duration_seconds bounds this segment: -t is a content-time
-        # limit and -re is what makes it a wall-clock one, so a configured segment length
-        # without pacing would be satisfied from a provider's backlog in seconds and spin
-        # us through reconnects. Unbounded (the default, and today's config) captures
-        # without it - see build_capture_cmd's flag comment and dev/changelog/437.
+        # -re is mandatory when segment_duration_seconds bounds this segment (-t is a
+        # content-time limit, dev/changelog/437); otherwise it is the channel's setting, the
+        # Settings default, or the watchdog's automatic pacing for this run - see
+        # resolve_capture_pacing and dev/changelog/997.
         segment_duration = cfg['recording']['segment_duration_seconds']
+        pace_state = get_state(recording_id)
+        channel = rec.channel if rec.channel_id else None
+        pace, pace_source = resolve_capture_pacing(
+            cfg, channel.pace_realtime if channel is not None else None, segment_duration,
+            pace_state is not None and rec.channel_id in pace_state.auto_paced_channel_ids)
         cmd = build_capture_cmd(cfg, rec.url, seg_path, segment_duration,
-                                pace_realtime=bool(segment_duration))
+                                pace_realtime=pace)
         log.info('Recording %d seg %d: %s', recording_id, seg_num,
                  mask_creds_in_text(' '.join(cmd)))
 
@@ -1375,8 +1427,11 @@ def _launch_segment(app, recording_id: int, seg_num: int) -> str:
                 stall_count=0,
             )
             db.session.add(seg)
-            add_recording_event(recording_id, SEGMENT_STARTED,
-                                detail=f'Segment {seg_num} started, pid={proc.pid}',
+            detail = f'Segment {seg_num} started, pid={proc.pid}'
+            if pace:
+                detail += (f', reading the stream at real-time speed '
+                           f'({_PACING_NOTES[pace_source]})')
+            add_recording_event(recording_id, SEGMENT_STARTED, detail=detail,
                                 segment_number=seg_num)
             db.session.commit()
             return seg.id
@@ -1396,6 +1451,7 @@ def _launch_segment(app, recording_id: int, seg_num: int) -> str:
 
         state.process = proc
         state.current_segment_num = seg_num
+        state.current_segment_paced = pace
         # The previous segment's spool is closed and unlinked by whichever terminal path
         # ended it, which always runs before the next _launch_segment. Overwriting a
         # non-None value here would therefore leak a file - assert the invariant loudly

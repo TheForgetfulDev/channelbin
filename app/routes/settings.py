@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 import re
@@ -11,9 +12,9 @@ from flask import (Blueprint, render_template, request, redirect, url_for, flash
                    jsonify, send_file, current_app, session)
 
 from .. import health_bands
-from ..config import (load_config, save_config, is_restart_needed, RESTART_REQUIRED_KEYS,
-                      set_nested, mask_config, redact_sensitive_diff_lines, _is_sensitive_path,
-                      _load_config_file, config_write_lock, load_for_edit)
+from ..config import (load_config, save_config, config_default, is_restart_needed,
+                      RESTART_REQUIRED_KEYS, set_nested, mask_config, redact_sensitive_diff_lines, _is_sensitive_path,
+                      _load_config_file, config_write_lock, load_for_edit, changed_from_default)
 from ..database import (
     REC_STATUS_IN_PROGRESS, REC_STATUS_PAUSED, REC_STATUS_RETRYING,
     REC_STATUS_CONCATENATING, REC_STATUS_ANALYZING, REC_STATUS_CONVERTING,
@@ -27,6 +28,12 @@ from ..notifications import (SERVICE_LABELS, SERVICE_URL_HINTS, dismiss_placehol
 from ..tz_utils import get_display_tz, format_local, to_local, to_naive_utc, parse_hhmm
 
 settings_bp = Blueprint('settings', __name__)
+
+# The /api/user-prefs key holding the Settings page's Basic/Advanced choice: true shows
+# Advanced, anything else (including never chosen) shows Basic. Named once here - the
+# route stamps the first paint from it and hands it to settings.js to write back, so the
+# two cannot disagree on the spelling (DESIGN.md 15.9).
+SETTINGS_VIEW_PREF = 'settings_show_advanced'
 
 
 @settings_bp.route('/settings', methods=['GET', 'POST'])
@@ -136,8 +143,17 @@ def settings():
                 f" {over_count} check{'s' if over_count != 1 else ''} may not finish."
             )
 
+    # Server-rendered so the page paints in the saved view instead of flashing the other
+    # one first. One row, one query - it does not grow with anything.
+    from ..database import db, UserPref
+    view_pref = db.session.get(UserPref, SETTINGS_VIEW_PREF)
+    show_advanced = bool(view_pref and view_pref.value and json.loads(view_pref.value) is True)
+
     return render_template(
         'settings.html', cfg=cfg, cfg_yaml=cfg_yaml,
+        show_advanced=show_advanced, view_pref_key=SETTINGS_VIEW_PREF,
+        # Paths only - the unmasked config is compared, but no value leaves this line.
+        changed_paths=set(changed_from_default(unmasked_cfg)),
         restart_needed=is_restart_needed(),
         norm_mode_options=[(value, label) for value, label, _ex in NORM_MODES],
         norm_mode_value=(coerce_normalization_mode(cfg.get('sync', {}).get('url_normalization'))
@@ -301,6 +317,10 @@ def api_settings_field():
 
         set_nested(file_cfg, path, value)
         changed = save_config(file_cfg)
+        # Read back under the same lock, so the answer describes this save and not one that
+        # landed after it. The page marks a changed row from it, so setting a field back to
+        # its default clears the mark without a reload.
+        still_changed = path in changed_from_default(load_config())
 
     needs_restart = any(p in RESTART_REQUIRED_KEYS for p, _, _ in changed)
 
@@ -354,7 +374,8 @@ def api_settings_field():
         from ..channel_search import clear_standing_breakdown_cache
         clear_standing_breakdown_cache()
 
-    return jsonify({'success': True, 'restart_required': needs_restart})
+    return jsonify({'success': True, 'restart_required': needs_restart,
+                    'changed_from_default': still_changed})
 
 
 @settings_bp.route('/api/settings/password', methods=['POST'])
@@ -918,7 +939,7 @@ def filename_designer_boot_api():
             for t in Tag.query.order_by(Tag.name).all()]
     return jsonify({
         'success': True,
-        'template': rec.get('filename_template', '{date} - {title} - {channel}'),
+        'template': rec.get('filename_template', config_default('recording.filename_template')),
         'remove': list(rec.get('filename_tags_remove', []) or []),
         'replace': list(rec.get('filename_tags_replace', []) or []),
         'tags': tags,
@@ -1010,8 +1031,10 @@ def filename_template_save_api():
         cfg['recording']['filename_tags_remove'] = remove
         cfg['recording']['filename_tags_replace'] = replace
         save_config(cfg)
+        still_changed = 'recording.filename_template' in changed_from_default(load_config())
     return jsonify({'success': True, 'template': template,
-                    'remove': remove, 'replace': replace})
+                    'remove': remove, 'replace': replace,
+                    'changed_from_default': still_changed})
 
 
 # ---------------------------------------------------------------------------
