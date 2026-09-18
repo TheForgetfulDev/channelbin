@@ -24,6 +24,7 @@ T0 = datetime(2026, 9, 11, 5, 0)
 class _AppCase(unittest.TestCase):
     def setUp(self):
         self.t = make_test_app()
+        self.t.sandbox_output_dirs()
         self.client = self.t.app.test_client()
 
     def tearDown(self):

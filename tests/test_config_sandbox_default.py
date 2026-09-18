@@ -243,3 +243,19 @@ class SandboxFailuresAreNamedTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)
+
+
+class SandboxOutputDirsTests(unittest.TestCase):
+    """dev/docs/BUGS.md 2026-09-18: a runtime load_config() in a test app saw the default
+    /dvr, so a request probing it raised a real storage alert on a machine without /dvr.
+    sandbox_output_dirs() is the opt-in that points those runtime reads at the temp dirs."""
+
+    def setUp(self):
+        self.t = make_test_app()
+        self.addCleanup(self.t.cleanup)
+
+    def test_runtime_load_config_points_every_output_dir_into_the_temp_dir(self):
+        self.t.sandbox_output_dirs()
+        rec = cfgmod.load_config()['recording']
+        for key in ('dvr_output_dir', 'capture_log_dir', 'images_dir'):
+            self.assertTrue(rec[key].startswith(self.t._tmpdir), f'{key} = {rec[key]}')

@@ -564,6 +564,7 @@ class TestApp:
             cfgmod._CONFIG_PATH = self._cfg_path
             cfgmod._yaml_cache = None
 
+        self._output_dirs = dict(overrides['recording'])
         self.app = create_app(config_overrides=overrides, start_scheduler=start_scheduler)
         _assert_engines_are_sandboxed(self.app, overrides['database']['path'])
         self._started_scheduler = start_scheduler
@@ -597,6 +598,17 @@ class TestApp:
         data = {'config_version': cfgmod.CURRENT_CONFIG_VERSION}
         data.update(overrides)
         write_sandbox_config(self._cfg_path, data)
+
+    def sandbox_output_dirs(self):
+        """Point the runtime config's recording output dirs at this app's temp dirs.
+
+        The sandboxed config.yaml holds nothing by default, so a runtime load_config() sees
+        the default /dvr. A request that probes it (the disk readout behind /api/nav-status
+        and the dashboard) raises a real STORAGE_PATH_UNUSABLE alert on any machine without
+        a writable /dvr - CI among them - and a test counting alerts or queries then counts
+        that too (dev/docs/BUGS.md 2026-09-18). Opt-in rather than the default, because
+        the Settings tests rely on a config that sets nothing."""
+        self.sandbox_config({'recording': dict(self._output_dirs)})
 
     def cleanup(self):
         try:
