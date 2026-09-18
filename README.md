@@ -104,6 +104,10 @@ and hands them to whatever you already use to watch them.
 
 - Health checks that connect to a channel, measure resolution and bitrate against configurable
   thresholds, capture screenshots, and record the result.
+- A live preview: watch or listen to a channel's actual stream from its page, to confirm it is
+  the right channel and that it plays before a recording relies on it. The stream is copied
+  into a short HLS window, never re-encoded, and a preview gives its connection up to any
+  recording that needs it.
 - A rolling health score per channel, weighted toward recent observations, fed by both health
   checks and what real recordings actually produced.
 - Health check profiles and a nightly maintenance window, so checks run when nothing else needs
@@ -177,8 +181,9 @@ on these two volumes; nothing is kept in the container.
 The container writes to the mounts as `PUID:PGID` (default `1000:1000`) rather than as root, so
 your recordings are owned by a real account on the host. Set them to your own `id -u` / `id -g`.
 The `/config` volume is chowned to match at every start; `/dvr` deliberately is not (it is
-routinely a large share), so if it is not writable the container says so in its log at startup
-and the UI still comes up to be fixed.
+routinely a large share). ChannelBin checks every folder it is configured to write to - recordings,
+thumbnails, screenshots, backups - and one it cannot write shows up in the Readiness check on
+Maintenance and as an alert, with the uid it was checked as.
 
 `TZ` sets the container's clock. It does **not** set the app's display timezone - that is
 `display.timezone` in `config.yaml`, so scheduled times mean the same thing either way.
@@ -199,16 +204,16 @@ restart policy.
 - **Appdata (`/config`) holds the database, so keep it off the array.** Use an appdata share
   that lives on a pool only, or point it at the pool path directly
   (`/mnt/cache/appdata/channelbin`).
-- **Map `/dvr` itself, not subfolders of it.** Live thumbnails and health check screenshots
-  default to folders directly under `/dvr`. With only subfolders mapped, they land in an
+- **Map `/dvr` itself, not subfolders of it.** Thumbnails, health check screenshots and
+  cached logos default to `/dvr/images`. With only subfolders mapped, they land in an
   unmapped volume inside `docker.img` and are lost when the container is updated.
 - **Completed recordings** is an optional second path, mounted at `/dvr-complete`, for filing
   finished recordings somewhere outside the recordings share. Turn on **Move on complete** in
   Settings with that as the destination. A subfolder of `/dvr` works just as well and is
   faster, because the move is then a rename rather than a copy.
-- **Health check screenshots** is another optional path, mounted at `/screenshots`, for keeping
-  screenshots off the recordings share. Set **Screenshot directory** in Settings to
-  `/screenshots`; left unmapped, they go to `/dvr/channel_test_screenshots`.
+- **Images** is another optional path, mounted at `/images`, for keeping thumbnails, health
+  check screenshots and cached logos off the recordings share. Set **Images directory** in
+  Settings to `/images`; left unmapped, they go to `/dvr/images`.
 
 Unlike the compose example, the template tracks `latest`: Unraid keeps the tag a container was
 created with, so a pinned template would never show an update. Update between recordings.
@@ -539,6 +544,17 @@ shown once - copy it before leaving the page, since only its hash is stored afte
 
 ### Install
 
+**HACS (recommended):** in Home Assistant, open **HACS**, then the **⋯** menu > **Custom
+repositories**. Add `https://github.com/TheForgetfulDev/channelbin` with type **Integration**,
+then find ChannelBin in HACS, **Download** it, and restart Home Assistant. HACS installs from
+the latest GitHub release and offers updates when a new one is tagged. This repo is not in the
+default HACS store, which is why it is added as a custom repository. The integration's icon
+needs Home Assistant 2026.3 or later; older versions show a placeholder.
+
+If HACS gives you trouble, either of the two methods below always works.
+
+#### Without HACS
+
 **Manual install:** copy `custom_components/channelbin/` from this repo into your Home Assistant
 config directory, so you end up with `<ha-config>/custom_components/channelbin/`, then restart
 Home Assistant.
@@ -568,10 +584,6 @@ cd /config/channelbin-repo && git pull
 ```
 
 Restart Home Assistant after either install method.
-
-**HACS:** this repo ships a `hacs.json` and tags every release, so adding it to HACS as a custom
-repository should work. I have not tested that path myself - manual install is the one I use, and
-this is not in the default HACS store.
 
 ### Add the integration
 
@@ -673,3 +685,7 @@ broker, no other services to run.
 ## License
 
 MIT. See [LICENSE](LICENSE).
+
+One third-party library ships in the repo: [hls.js](https://github.com/video-dev/hls.js), under
+the Apache License 2.0, in `static/vendor/hls.js/` with its license text and a notice naming the
+version. It plays the live channel preview in browsers without native HLS support.

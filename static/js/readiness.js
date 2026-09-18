@@ -26,7 +26,9 @@
   /* The seven states, every one named. `checking` is the client-side transient while a run
      is in flight - the server never sends it - and it is listed here rather than left to a
      trailing else, so the next state added has to be given a label instead of silently
-     rendering as something it is not. */
+     rendering as something it is not.
+     The labels are duplicated in app/readiness.py::STATUS_LABELS, which writes the copied
+     report - tests/test_readiness.py::ReportTests fails when the two drift. */
   const STATUS = {
     ready:     { label: 'Ready', cls: 'b-done',
                  tip: 'Checked, and it is fine.' },
@@ -395,32 +397,6 @@ count beside Maintenance.">Ignore this</button>`;
       .catch((e) => showToast(`Could not change that: ${e.message}`, { type: 'error' }));
   }
 
-  function reportText() {
-    const d = state.data;
-    const verdict = { can: 'YES', cannot: 'NO', degraded: 'PARTLY', unknown: 'UNKNOWN',
-                      none: 'NOT SET UP' };
-    const lines = ['ChannelBin readiness check', `Generated ${d.generated_at}`, '',
-      d.verdict.head, d.verdict.sub, '', '## What this install can and cannot do'];
-    d.capabilities.forEach((cap) => {
-      lines.push(`  [${verdict[cap.state]}] ${cap.label}`);
-    });
-    lines.push('');
-    d.areas.forEach((area) => {
-      lines.push(`## ${area.label}`);
-      d.checks.filter((r) => r.area === area.id).forEach((r) => {
-        const tag = STATUS[r.status].label + (r.ignored ? ', ignored' : '');
-        lines.push(`  [${tag}] ${r.label}`);
-        lines.push(`      checked: ${r.tested}`);
-        lines.push(`      found:   ${r.found}`);
-        if (r.status !== 'ready' && r.status !== 'nothing') {
-          lines.push(`      cost:    ${r.without}`);
-        }
-      });
-      lines.push('');
-    });
-    return lines.join('\n');
-  }
-
   card.addEventListener('click', (ev) => {
     const run = ev.target.closest('[data-run]');
     if (run) { ev.stopPropagation(); runCheck(run.dataset.run); return; }
@@ -432,7 +408,9 @@ count beside Maintenance.">Ignore this</button>`;
     if (unignore) { ev.stopPropagation(); setIgnored(unignore.dataset.unignore, false); return; }
     if (ev.target.closest('#rd-runall')) { runAll(); return; }
     if (ev.target.closest('#rd-copy')) {
-      if (navigator.clipboard) navigator.clipboard.writeText(reportText());
+      // Written server-side (app/readiness.py::report_text), the same text the support
+      // bundle ships as readiness.txt.
+      if (navigator.clipboard && state.data) navigator.clipboard.writeText(state.data.report);
       showToast('Report copied.');
       return;
     }

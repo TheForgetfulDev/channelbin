@@ -12,13 +12,9 @@ config_version: 1
 
 recording:
   # The recordings volume. Everything the app writes for a recording - segments, the
-  # finished file, thumbnails, test screenshots - lands under here.
+  # finished file - lands under here, and images (thumbnails, health check screenshots,
+  # cached logos) go to its images folder by default (recording.images_dir).
   dvr_output_dir: /dvr
-  logo_cache:
-    # On the /config volume (like the backup dirs below), so cached logos survive an
-    # image upgrade. logo_cache.enabled still defaults to false - this only matters once
-    # it's turned on in Settings.
-    dir: /config/instance/logo-cache
 
 database:
   # On the /config volume, so an image upgrade never takes your recordings history with it.

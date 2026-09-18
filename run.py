@@ -7,6 +7,7 @@ from app.config import load_config
 from app.recorder import kill_all_active
 from app.postprocessor import kill_active_conversions
 from app.concatenator import kill_active_joins
+from app.preview import kill_all_previews
 from app.scheduler import release_pidfile
 
 app = create_app()
@@ -23,9 +24,13 @@ def _handle_shutdown(signum, frame):
     # unlike a conversion it keeps no checkpoint and always re-runs from the top - so
     # the partial is referenced by nothing and would only push the next attempt onto a
     # `_2` name (dev/changelog/986).
+    #
+    # A live preview is killed on the same terms: its ffmpeg holds a provider connection
+    # open for a viewer this process can no longer serve (dev/changelog/1018).
     kill_all_active()
     kill_active_conversions()
     kill_active_joins()
+    kill_all_previews()
     release_pidfile()
     sys.exit(0)
 

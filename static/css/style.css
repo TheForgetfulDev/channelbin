@@ -432,11 +432,6 @@ body.scroll-locked { position: fixed; left: 0; right: 0; width: 100%; overflow: 
 
 /* Responsive: channel health */
 @media (max-width: 768px) {
-  /* `.col-fps, .col-frames, .col-bitrate { display: none }` used to sit here with a
-     stray leading dot (`..col-fps`), which invalidates the whole selector list - so the
-     rule had never hidden any of the three. Deleted rather than repaired: all three
-     classes are used only by templates/channels/detail.html, which carries its own
-     working scoped copy, and page-specific rules belong in the page's block. */
   .hero-stat-val { font-size: var(--fs-2xl); }
   .hero-stats-row { gap: 1rem; }
 }
@@ -1737,6 +1732,65 @@ table.tbl { width: 100%; border-collapse: collapse; font-size: var(--fs-md); }
 /* Essentials columns on phones (DESIGN.md 9.5) - tablet/desktop keep every column. */
 @media (max-width: 768px) { .tbl .xtra { display: none; } }
 
+/* ── Table as cards on a phone (DESIGN.md 3.2, opt-in) ──────────────
+   `.tbl-cards` beside `.tbl`, never a change to `.tbl` itself: a table inside a modal is
+   already constrained by the sheet, and reflowing it there buys nothing. `.table-scroll`
+   stays wrapped around an opting-in table as the blowout safety net it was added to be -
+   above the breakpoint, and below it for any row a card cannot narrow far enough.
+
+   Every `<td>` of an opting-in table needs `data-label` carrying that cell's column
+   header. The `<thead>` is gone at this width, so a cell without one renders a value with
+   nothing saying what it measures.
+
+   The row is the card and each cell is one key/value line, the same shape `.statlist`
+   already gives a detail page (3.3), so a reflowed table reads as an idiom the app has
+   rather than a second one.
+
+   **The key is a float, and that is load-bearing.** The obvious spelling - make the cell a
+   flex row with the key as its first item - turns every CHILD of the cell into its own flex
+   item, so a cell holding more than one node lays them out side by side instead of stacked.
+   It shipped that way for an hour: /jobs' Next run cell (a date div over a relative-time
+   div) came out as two narrow columns with "every 5 minutes" broken mid-word down four
+   lines, and /tags' pattern chips were one non-wrapping row held together only by being
+   short. A float takes the key out of flow and leaves the cell an ordinary block, so its
+   contents lay out exactly as they did in the table - any mix of bare text, inline chips and
+   stacked divs. `overflow: hidden` makes the cell a block formatting context, which is what
+   contains the float so a short value cannot collapse the row to nothing.
+
+   A single-line value then sits on the key's line; a taller one flows past the key and uses
+   the full width below it, right-aligned throughout. Nothing here is a grid either: each
+   cell is its own container, so a content-sized track would resolve to a different width per
+   row and walk the keys out of line down the card - the defect class behind the list-grid
+   rule in CLAUDE.md. */
+@media (max-width: 768px) {
+  .tbl-cards, .tbl-cards tbody, .tbl-cards tr, .tbl-cards td { display: block; }
+  .tbl-cards thead { display: none; }
+  .tbl-cards tbody tr {
+    background: var(--bg2); border: 1px solid var(--border-soft);
+    border-radius: var(--radius); padding: 3px 12px; margin-bottom: 10px;
+  }
+  .tbl-cards tbody tr:last-child { margin-bottom: 0; }
+  /* The desktop row hover paints the cells; on a card it would light up one line of it. */
+  .tbl-cards tbody tr:hover td { background: none; }
+  .tbl-cards td {
+    padding: 7px 0; border-bottom: 1px solid var(--border-soft);
+    text-align: right; overflow: hidden;
+    /* A long unbroken value - a glob, a URL, a path - would otherwise set the card's
+       min-content width and push it past the phone. `anywhere` is what lowers that;
+       `break-word` leaves min-content at the longest word and does not. */
+    overflow-wrap: anywhere;
+  }
+  .tbl-cards td:last-child { border-bottom: none; }
+  .tbl-cards td::before {
+    content: attr(data-label);
+    float: left; max-width: 45%; margin: 1px 14px 0 0; text-align: left;
+    font-size: var(--fs-xs); font-weight: 600; letter-spacing: .07em;
+    text-transform: uppercase; color: var(--text-faint);
+  }
+  /* A trailing actions cell has no column header to sit opposite. */
+  .tbl-cards td:not([data-label])::before { content: none; }
+}
+
 /* ── Stat list (DESIGN.md 3.3 - two-column key/value list) ─────────── */
 .statlist { display: grid; grid-template-columns: 1fr 1fr; gap: 0 26px; }
 .statlist .srow { display: flex; justify-content: space-between; gap: 14px; padding: 5px 0; border-bottom: 1px solid var(--border-soft); font-size: var(--fs-md); }
@@ -2896,7 +2950,7 @@ a.shot-link { display: block; width: fit-content; cursor: zoom-in; }
 .test-row-screenshot { width: 96px; height: 54px; object-fit: cover; border-radius: var(--radius-sm); border: 1px solid var(--border); cursor: pointer; }
 /* Round 4: a failed test's error detail hangs off its status pill as a tooltip
    instead of riding on a second <tr>, so the table stays one row per test. */
-.table .badge[title] { cursor: help; }
+.tbl .badge[title] { cursor: help; }
 
 /* ── Responsive ────────────────────────────────────────────────────── */
 @media (max-width: 768px) {

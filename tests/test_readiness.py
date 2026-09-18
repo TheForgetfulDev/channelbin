@@ -104,8 +104,8 @@ class RegistryTests(unittest.TestCase):
         self.assertEqual(
             sorted(c.id for c in readiness.CHECKS if not c.ignorable),
             ['accounts_any', 'auth_gate', 'db_local', 'db_write', 'ffmpeg', 'ffprobe',
-             'guide_content', 'guide_groups', 'scheduler', 'secret_key', 'storage_dvr',
-             'timezone'])
+             'guide_content', 'guide_groups', 'scheduler', 'secret_key', 'storage_dirs',
+             'storage_dvr', 'timezone'])
 
 
 class _AppCase(unittest.TestCase):
@@ -353,6 +353,70 @@ class RunTests(_AppCase):
                 mock.patch.dict(readiness.CHECKS_BY_ID, {c.id: c for c in checks}):
             readiness.nav_summary()
         self.assertEqual(called, [])
+
+
+class ReportTests(_AppCase):
+    """The Copy report text is written once, server-side, and every copy of it - the card's
+    button and the support bundle's readiness.txt - is that one text (dev/changelog/1010).
+    It used to be built in readiness.js, so the bundle could only have had a second
+    rendering of the checks that drifted the first time either was edited."""
+
+    def test_every_payload_carries_the_report_it_was_built_from(self):
+        payload = readiness.evaluate(ignored=set())
+        self.assertEqual(payload['report'], readiness.report_text(payload))
+
+    def test_the_report_names_every_check_and_every_capability(self):
+        report = readiness.evaluate(ignored=set())['report']
+        for check in readiness.CHECKS:
+            self.assertIn(check.label, report)
+        for cap in readiness.CAPABILITIES:
+            self.assertIn(cap.label, report)
+
+    def test_a_new_check_reaches_the_report_with_no_other_edit(self):
+        extra = readiness.Check(
+            'added_later', 'machine', 'A check added after the report was written',
+            'the added check', readiness.CHEAP, 'Something stops working.',
+            None, True, lambda ctx: result(readiness.ATTENTION, 'found by the added check'))
+        checks = readiness.CHECKS + (extra,)
+        with mock.patch.object(readiness, 'CHECKS', checks), \
+                mock.patch.dict(readiness.CHECKS_BY_ID, {c.id: c for c in checks}):
+            report = readiness.evaluate(ignored=set())['report']
+        self.assertIn('[Attention] A check added after the report was written', report)
+        self.assertIn('found:   found by the added check', report)
+        self.assertIn('cost:    Something stops working.', report)
+
+    def test_an_ignored_check_says_so_and_a_passing_one_carries_no_cost(self):
+        answers = {'search_index': result(readiness.ATTENTION, 'stale'),
+                   'db_write': result(readiness.READY, 'fine')}
+        with patched(**answers):
+            report = readiness.evaluate(ignored={'search_index'})['report']
+        lines = report.splitlines()
+        i = lines.index('  [Attention, ignored] Channel and program search are indexed')
+        self.assertTrue(lines[i + 3].startswith('      cost:'))
+        j = lines.index('  [Ready] The database accepts writes')
+        self.assertFalse(lines[j + 3].startswith('      cost:'))
+
+    def test_the_card_labels_and_the_report_labels_agree(self):
+        """STATUS_LABELS is duplicated from readiness.js's STATUS table; the page and the
+        copied report must not name one state two ways."""
+        import os
+        import re
+        path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                            'static', 'js', 'readiness.js')
+        with open(path, encoding='utf-8') as fh:
+            js = fh.read()
+        js_labels = dict(re.findall(r"^\s*(\w+):\s*\{ label: '([^']+)'", js, re.M))
+        js_labels.pop('checking')
+        self.assertEqual(js_labels, readiness.STATUS_LABELS)
+
+    def test_the_card_copies_the_server_text_rather_than_building_its_own(self):
+        import os
+        path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                            'static', 'js', 'readiness.js')
+        with open(path, encoding='utf-8') as fh:
+            js = fh.read()
+        self.assertIn('writeText(state.data.report)', js)
+        self.assertNotIn('function reportText', js)
 
 
 class RouteTests(unittest.TestCase):

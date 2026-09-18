@@ -219,8 +219,7 @@ def create_app(config_overrides=None, start_scheduler=True):
         if tags_table_is_new:
             _seed_default_tags()
         _ensure_dvr_dir(cfg)
-        _ensure_screenshot_dir(cfg)
-        _ensure_live_thumbnail_dir(cfg)
+        _ensure_image_dirs(cfg)
         _configure_sqlite(app.config['SQLITE_CACHE_SIZE_MB'],
                           app.config['SQLITE_WAL_SIZE_LIMIT_MB'])
         _warn_when_pools_are_exhausted(db_cfg)
@@ -637,28 +636,17 @@ def _ensure_dvr_dir(cfg):
     logging.warning('DVR output directory %s', describe_dir_problem(dvr_dir, probe))
 
 
-def _ensure_screenshot_dir(cfg):
-    shot_dir = cfg.get('channel_testing', {}).get(
-        'screenshot_dir', '/dvr/channel_test_screenshots'
-    )
-    if not os.path.isdir(shot_dir):
+def _ensure_image_dirs(cfg):
+    from .storage_dirs import SCREENSHOTS, THUMBNAILS, image_dir
+    for kind in (THUMBNAILS, SCREENSHOTS):
+        path = image_dir(cfg, kind)
+        if os.path.isdir(path):
+            continue
         try:
-            os.makedirs(shot_dir, exist_ok=True)
-            logging.info('Created channel test screenshot directory: %s', shot_dir)
+            os.makedirs(path, exist_ok=True)
+            logging.info('Created %s directory: %s', kind, path)
         except OSError as exc:
-            logging.warning('Could not create screenshot directory %s: %s', shot_dir, exc)
-
-
-def _ensure_live_thumbnail_dir(cfg):
-    thumb_dir = cfg.get('recording', {}).get('live_thumbnail', {}).get(
-        'dir', '/dvr/live_thumbnails'
-    )
-    if not os.path.isdir(thumb_dir):
-        try:
-            os.makedirs(thumb_dir, exist_ok=True)
-            logging.info('Created live thumbnail directory: %s', thumb_dir)
-        except OSError as exc:
-            logging.warning('Could not create live thumbnail directory %s: %s', thumb_dir, exc)
+            logging.warning('Could not create %s directory %s: %s', kind, path, exc)
 
 
 def _check_config_file_missing(cfg: dict, fresh: bool):

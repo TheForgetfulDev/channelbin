@@ -43,14 +43,10 @@ fi
 # about files the user may share with other apps.
 chown -R "$PUID:$PGID" /config /app/capture-logs
 
-# A recordings mount the app cannot write to is the single most likely misconfiguration,
-# and a recording that fails at 8pm because of it is exactly the silent failure this app
-# exists to not have. Say it now, loudly, at startup - but do not refuse to boot: the UI
-# still needs to come up so the problem can be seen and fixed.
-if ! gosu channelbin test -w /dvr; then
-    log "WARNING: /dvr is not writable by uid $PUID (gid $PGID) - recordings will fail."
-    log "WARNING: fix the host directory's ownership, or set PUID/PGID to match it."
-fi
+# No writability check here. Whether a folder can be written is the app's question,
+# asked of the folders config.yaml actually names (which need not include /dvr at all),
+# and answered where the user looks: the Readiness check, the Alert Center and the Logs
+# page (app/storage_dirs.py, dev/changelog/1009). A line on stdout reaches none of them.
 
 # Tells the app it is tini's monitored child, not a detached background service -
 # app/routes/settings.py::api_restart_now reads this to know it must exit cleanly and

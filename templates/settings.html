@@ -319,6 +319,8 @@
         <div class="sec-sub"><strong>Output</strong></div>
         {{ field_text('recording.dvr_output_dir', 'Output directory',
            'Directory where recording files are written.', rec.get('dvr_output_dir', '/dvr'), tier='basic') }}
+        {{ field_text('recording.images_dir', 'Images directory',
+           'Directory where recording thumbnails, health check screenshots and cached channel logos are saved, each in its own subfolder: thumbnails, screenshots and logos.', rec.get('images_dir', '/dvr/images'), tier='basic') }}
         {% call field_shell('recording.filename_template', 'Filename template',
            'Template for auto-generated recording names from EPG guide data.', false, false,
            'naming name file rename variables tag cleanup preview designer', overridable_by='recording_profile', tier='basic') %}
@@ -407,8 +409,6 @@
            'How often the preview auto-refreshes while viewing an in-progress recording. Each refresh runs a short ffmpeg capture.', lt.get('auto_refresh_seconds', 60), gated_by=['recording.live_thumbnail.enabled'], tier='advanced') }}
         {{ field_bool('recording.logo_cache.enabled', 'Cache channel logos locally',
            'Download and cache channel logos locally instead of loading them from the provider/CDN on every page view. Only caches logos for channels that are in your TV Guide or belong to a group (a channel group or a health-check group) - not your whole channel catalog, which can be tens of thousands of channels on some accounts. A background job fetches a small batch every few minutes; a logo is only re-fetched if the provider gives it a different URL.', lc.get('enabled', False), tier='basic') }}
-        {{ field_text('recording.logo_cache.dir', 'Logo cache directory',
-           'Directory where cached logo images are stored.', lc.get('dir', 'instance/logo-cache'), tier='advanced') }}
       </div>
     {% endcall %}
 
@@ -596,8 +596,6 @@
            'Take a screenshot during each channel test.', ct.get('screenshots_enabled', True), overridable_by='health_check_profile', tier='basic') }}
         {{ field_number('channel_testing.screenshots_keep_count', 'Screenshots to keep (per test)',
            'Oldest screenshots are pruned per test when this count is exceeded - each guide run and each on-demand job keeps its own newest N for a channel, independently of other tests.', ct.get('screenshots_keep_count', 5), tier='advanced') }}
-        {{ field_text('channel_testing.screenshot_dir', 'Screenshot directory',
-           'Directory where channel test screenshots are saved.', ct.get('screenshot_dir', '/dvr/channel_test_screenshots'), tier='advanced') }}
         {{ field_text('channel_testing.capture_scratch_dir', 'Capture scratch directory',
            'Directory where a test\'s temporary video clip (100-200+ MB) is written while the test runs. Leave blank to use the system temp directory.', ct.get('capture_scratch_dir', ''), tier='advanced') }}
         {{ field_number('channel_testing.test_history_keep', 'Test history to keep (per test)',

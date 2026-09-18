@@ -947,6 +947,20 @@ def build_support_bundle(include_names: bool = False) -> bytes:
                 log.error('Support bundle: %s failed: %s', filename, exc)
                 errors[filename] = str(exc)
 
+        # The Readiness card's own Copy report text, not a second rendering of the checks:
+        # report_text() is the one writer, so a new or reworded check reaches the bundle
+        # with no edit here. Group names are not swept from free text (_group_to_dict), so
+        # the checks name groups and accounts by id themselves in this mode. On-demand
+        # checks read as whatever this process last ran - building a bundle never logs in
+        # to a provider or sends a message (dev/changelog/1010).
+        try:
+            from .readiness import evaluate
+            _write_text('readiness.txt',
+                        evaluate(pseudonymize=not include_names)['report'])
+        except Exception as exc:
+            log.error('Support bundle: readiness.txt failed: %s', exc)
+            errors['readiness.txt'] = str(exc)
+
         try:
             _write_json('apscheduler_jobs.json', _apscheduler_jobs())
         except Exception as exc:

@@ -38,6 +38,7 @@ from ..accounts import normalize_url_loose
 from ..config import load_config, resolve_ffmpeg_path
 from ..logo_cache import resolve_logo_url
 from ..screenshot import capture_screenshot
+from ..storage_dirs import THUMBNAILS, image_dir
 from ..url_utils import mask_creds as _mask_creds_str
 from .. import fmt_utils
 
@@ -928,10 +929,9 @@ def index():
                   .order_by(Recording.start_time.desc()).all())
 
     # persisted screenshots: one directory listing, never a per-row stat
-    thumb_cfg = load_config().get('recording', {}).get('live_thumbnail', {})
     thumb_ids = set()
     try:
-        for fn in os.listdir(thumb_cfg.get('dir', '/dvr/live_thumbnails')):
+        for fn in os.listdir(image_dir(load_config(), THUMBNAILS)):
             stem, ext = os.path.splitext(fn)
             if ext == '.jpg' and stem.isdigit():
                 thumb_ids.add(int(stem))
@@ -1071,7 +1071,9 @@ def recording_detail(recording_id):
             recover_act = 'retry-convert'
         elif segment_files_on_disk and rec.failure_reason != FAILURE_ALL_SEGMENTS_PLACEHOLDER:
             recover_act = 'retry-concat'
-    thumb_cfg = load_config().get('recording', {}).get('live_thumbnail', {})
+    cfg = load_config()
+    thumb_cfg = cfg.get('recording', {}).get('live_thumbnail', {})
+    thumb_dir = image_dir(cfg, THUMBNAILS)
 
     # "Find another airing" prefill: stored program title snapshot, else a live EPG
     # lookup by (channel, program air time) for pre-snapshot recordings whose entry
@@ -1106,7 +1108,7 @@ def recording_detail(recording_id):
 
     from ..tz_utils import get_display_tz
     now = datetime.utcnow()
-    thumb_path = os.path.join(thumb_cfg.get('dir', '/dvr/live_thumbnails'), f'{rec.id}.jpg')
+    thumb_path = os.path.join(thumb_dir, f'{rec.id}.jpg')
     # SCHEDULED excluded for the same reason as the list row's has_thumb: a file
     # at a not-yet-started recording's path belongs to a deleted, id-reused row.
     has_shot = rec.status == REC_STATUS_IN_PROGRESS or (
@@ -1182,7 +1184,7 @@ def live_thumbnail(recording_id):
     if not thumb_cfg.get('enabled', True):
         abort(404)
 
-    thumb_dir = thumb_cfg.get('dir', '/dvr/live_thumbnails')
+    thumb_dir = image_dir(cfg, THUMBNAILS)
     thumb_path = os.path.join(thumb_dir, f'{recording_id}.jpg')
 
     if rec.status != REC_STATUS_IN_PROGRESS:
@@ -1207,6 +1209,13 @@ def live_thumbnail(recording_id):
     if not fresh_enough:
         seg_path = get_live_segment_path(recording_id)
         if seg_path and os.path.exists(seg_path) and os.path.getsize(seg_path) > 0:
+            # images_dir can change in Settings without a restart, so the folder the
+            # startup pass created may not be this one.
+            try:
+                os.makedirs(thumb_dir, exist_ok=True)
+            except OSError as exc:
+                log.warning('Recording %d: cannot create thumbnail dir %s: %s',
+                            recording_id, thumb_dir, exc)
             ffmpeg_path = resolve_ffmpeg_path(cfg.get('ffmpeg', {}).get('path', 'ffmpeg'))
             ok = capture_screenshot(
                 seg_path, tmp_path, ffmpeg_path,

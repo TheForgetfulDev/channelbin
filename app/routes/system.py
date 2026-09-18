@@ -1,43 +1,16 @@
 import os
-from collections import namedtuple
 
 from flask import Blueprint, jsonify, render_template, request
 
-from ..alerts import update_storage_path_alert
 from ..config import load_config
 from ..config_backup import get_backup_dir
 from ..fs_utils import (DirProbe, PATH_MISSING, PATH_OK, PATH_UNREACHABLE,
-                        classify_oserror, log_dir_outcome_change, probe_dir)
+                        classify_oserror, probe_dir, probe_writable_dir)
+# Re-exported: the dashboard, the HA API and Readiness import the roles from here.
+from ..storage_dirs import (DVR_DIR_ROLE, MOVE_DEST_ROLE, images_root,  # noqa: F401
+                            report_storage_path)
 
 system_bp = Blueprint('system', __name__)
-
-# The directories the user configured for storage, and what stops working when one of
-# them stops answering. A path carrying a role gets the standing STORAGE_PATH_UNUSABLE
-# alert; a path without one is somebody asking about an arbitrary directory and is only
-# logged, which is what _disk_bytes() did for every caller before dev/changelog/868.
-StorageRole = namedtuple('StorageRole', 'what consequence')
-
-DVR_DIR_ROLE = StorageRole(
-    'DVR output directory',
-    'Recordings cannot be written while it is unusable, so any recording that starts '
-    'now will fail immediately.')
-
-MOVE_DEST_ROLE = StorageRole(
-    'Move-on-complete destination',
-    'Finished recordings cannot be filed there while it is unusable; they stay in the '
-    'DVR output directory instead.')
-
-
-def _report_storage_path(path, probe, role):
-    """Log the transition on `path` and move its standing alert along with it.
-
-    Gated on log_dir_outcome_change's own transition memory, which is what keeps this
-    free on the hot path: _disk_bytes() runs on a 15s poll per open browser tab, and the
-    alert must be one standing row per path rather than one row per poll.
-    """
-    what = role.what if role else 'Disk usage for'
-    if log_dir_outcome_change(path, probe, what) and role is not None:
-        update_storage_path_alert(path, probe, role.what, role.consequence)
 
 
 def _dir_size(path):
@@ -86,7 +59,7 @@ def _disk_bytes(path, role=None):
     rather than a wrong one. It never means zero, and it is never another
     filesystem's numbers wearing this path's label.
 
-    `role` is one of the StorageRole constants above when `path` is a directory the
+    `role` is one of the app/storage_dirs.py StorageRole constants when `path` is a directory the
     user configured for storage, which is what earns it a standing alert on top of the
     log line. Omitted, this answers about an arbitrary path and stays a log line only.
     """
@@ -104,7 +77,7 @@ def _disk_bytes(path, role=None):
     while True:
         probe = probe_dir(candidate)
         if probe.outcome == PATH_UNREACHABLE:
-            _report_storage_path(path, probe, role)
+            report_storage_path(path, probe, role)
             return None, None
         if probe.outcome != PATH_MISSING:
             # OK, or present-but-not-a-directory/not-readable: statvfs answers about the
@@ -117,9 +90,13 @@ def _disk_bytes(path, role=None):
     try:
         usage = os.statvfs(candidate)
     except OSError as exc:
-        _report_storage_path(path, classify_oserror(exc), role)
+        report_storage_path(path, classify_oserror(exc), role)
         return None, None
-    _report_storage_path(path, DirProbe(PATH_OK, None, None), role)
+    # A configured directory is judged on whether it can be written to, not only on whether
+    # it answers: that is the probe storage_dirs.sweep_write_dirs() reports for the same
+    # path, and two reporters with different answers would flap one alert every poll.
+    report_storage_path(path, probe_writable_dir(path) if role is not None
+                        else DirProbe(PATH_OK, None, None), role)
     return usage.f_blocks * usage.f_frsize, usage.f_bavail * usage.f_frsize
 
 
@@ -231,7 +208,7 @@ def storage_details():
     cfg = load_config()
     db_path = cfg['database']['path']
     dvr_dir = cfg['recording']['dvr_output_dir']
-    screenshot_dir = cfg.get('channel_testing', {}).get('screenshot_dir', '/dvr/channel_test_screenshots')
+    images_dir = images_root(cfg)
     backup_dir = get_backup_dir()
 
     db_bytes = None
@@ -260,7 +237,7 @@ def storage_details():
         dvr_bytes = total
         dvr_file_count = count
 
-    screenshot_bytes = _dir_size_recursive(screenshot_dir)
+    images_bytes = _dir_size_recursive(images_dir)
     backup_bytes = _dir_size(backup_dir)
 
     # What the directory totals above cannot say: how much room is left. Sent in
@@ -276,8 +253,8 @@ def storage_details():
         dvr_dir=dvr_dir,
         dvr_bytes=dvr_bytes,
         dvr_file_count=dvr_file_count,
-        screenshot_dir=screenshot_dir,
-        screenshot_bytes=screenshot_bytes,
+        images_dir=images_dir,
+        images_bytes=images_bytes,
         backup_dir=backup_dir,
         backup_bytes=backup_bytes,
         disk_total=disk_total,

@@ -20,9 +20,10 @@ import os
 import requests
 
 from . import db
-from .config import load_config, resolve_app_path, DEFAULT_LOGO_CACHE_DIR
+from .config import load_config
 from .database import Channel, ChannelGroupMember
 from .db_utils import retry_on_locked
+from .storage_dirs import LOGOS, image_dir
 from .url_utils import mask_creds
 
 log = logging.getLogger(__name__)
@@ -45,13 +46,12 @@ _ALLOWED_LOGO_CONTENT_TYPES = {
 
 
 def get_logo_cache_dir(cfg: dict | None = None) -> str:
-    """The configured logo-cache directory, absolutized. Pass `cfg` when the caller
+    """The logo subfolder of recording.images_dir, absolutized. Pass `cfg` when the caller
     already has a loaded config - a bare load_config() call would re-read the real
     config.yaml and escape a test's sandboxed override (CLAUDE.md config-read rule)."""
     if cfg is None:
         cfg = load_config()
-    lc_cfg = cfg.get('recording', {}).get('logo_cache', {})
-    return resolve_app_path(lc_cfg.get('dir', DEFAULT_LOGO_CACHE_DIR))
+    return image_dir(cfg, LOGOS)
 
 
 def resolve_logo_url(channel: Channel) -> str:

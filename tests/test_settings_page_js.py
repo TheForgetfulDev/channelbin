@@ -3,7 +3,7 @@
 The view, the query and the changed-from-default chip are three inputs to one filter
 function in static/js/settings.js (DESIGN.md 15.9, dev/changelog/1005 and 1006), which also
 dims a row whose gate is off from the gating controls' live values (1007). The server
-renders all 116 rows either way, so what Basic hides, what a filter in Basic brings back,
+renders all 115 rows either way, so what Basic hides, what a filter in Basic brings back,
 how it says so, and what gets saved are all browser behavior - none of it is visible from a
 response body.
 
@@ -104,7 +104,7 @@ class NeverChosenOpensInBasicTests(_Base):
 
     def test_only_the_basic_fields_show(self):
         self.assertEqual(self.obs['view'], 'basic')
-        self.assertEqual(len(self.obs['shownPaths']), 22)
+        self.assertEqual(len(self.obs['shownPaths']), 23)
         self.assertEqual(self.obs['checked'], ['basic'])
         self.assertEqual(self.obs['on'], ['basic'])
 
@@ -126,8 +126,8 @@ class NeverChosenOpensInBasicTests(_Base):
     def test_a_split_card_says_how_many_more_are_in_advanced(self):
         rec = self.obs['sections']['recording']
         self.assertFalse(rec['collapsed'])
-        self.assertEqual(rec['rail'], '11')
-        self.assertEqual(rec['more'], '17 more in Advanced Show Advanced')
+        self.assertEqual(rec['rail'], '12')
+        self.assertEqual(rec['more'], '16 more in Advanced Show Advanced')
         self.assertIsNone(self.obs['sections']['integrations']['more'])
 
     def test_a_group_with_nothing_basic_hides_its_heading(self):
@@ -139,7 +139,7 @@ class NeverChosenOpensInBasicTests(_Base):
         self.assertEqual(self.obs['sections']['integrations']['hiddenUnits'], 0)
 
     def test_the_search_box_counts_every_setting_because_search_reaches_all_of_them(self):
-        self.assertEqual(self.obs['placeholder'], 'Search 116 settings by name, description or key')
+        self.assertEqual(self.obs['placeholder'], 'Search 115 settings by name, description or key')
 
 
 class SearchInBasicTests(_Base):
@@ -161,13 +161,13 @@ class SearchInBasicTests(_Base):
 
     def test_counts_are_matches_and_spelled_right(self):
         during = self.obs['during']
-        self.assertEqual(during['chip'], '11 of 116 settings')
+        self.assertEqual(during['chip'], '11 of 115 settings')
         self.assertEqual(during['sections']['watchdog']['head'], '5 matches')
         self.assertIsNone(during['sections']['recording']['more'])
 
     def test_clearing_the_search_goes_back_to_basic_and_saves_nothing(self):
         cleared = self.obs['cleared']
-        self.assertEqual(len(cleared['shownPaths']), 22)
+        self.assertEqual(len(cleared['shownPaths']), 23)
         self.assertIsNone(cleared['notice'])
         self.assertEqual(self.obs['posts'], [])
 
@@ -180,7 +180,7 @@ class NoticeSwitchTests(_Base):
         self.assertIsNone(self.obs['after']['notice'])
         self.assertEqual(self.obs['posts'],
                          [{'path': f'/api/user-prefs/{SETTINGS_VIEW_PREF}', 'body': {'value': True}}])
-        self.assertEqual(len(self.obs['cleared']['shownPaths']), 116)
+        self.assertEqual(len(self.obs['cleared']['shownPaths']), 115)
 
 
 class FooterSwitchTests(_Base):
@@ -188,7 +188,7 @@ class FooterSwitchTests(_Base):
 
     def test_a_card_footer_switches_the_whole_page_and_saves_it(self):
         self.assertEqual(self.obs['view'], 'advanced')
-        self.assertEqual(len(self.obs['shownPaths']), 116)
+        self.assertEqual(len(self.obs['shownPaths']), 115)
         self.assertEqual(self.obs['posts'],
                          [{'path': f'/api/user-prefs/{SETTINGS_VIEW_PREF}', 'body': {'value': True}}])
 
@@ -200,12 +200,12 @@ class SavedAdvancedTests(_Base):
         opened = self.obs['opened']
         self.assertEqual(opened['view'], 'advanced')
         self.assertEqual(opened['checked'], ['advanced'])
-        self.assertEqual(len(opened['shownPaths']), 116)
+        self.assertEqual(len(opened['shownPaths']), 115)
         self.assertFalse(any(s['collapsed'] for s in opened['sections'].values()))
         self.assertFalse(any(s['more'] for s in opened['sections'].values()))
 
     def test_switching_back_saves_basic_once(self):
-        self.assertEqual(len(self.obs['switched']['shownPaths']), 22)
+        self.assertEqual(len(self.obs['switched']['shownPaths']), 23)
         self.assertEqual(self.obs['posts'],
                          [{'path': f'/api/user-prefs/{SETTINGS_VIEW_PREF}', 'body': {'value': False}}])
 
@@ -242,7 +242,7 @@ class ChangedChipTests(_Base):
 
     def test_the_counts_say_changed(self):
         on = self.obs['on']
-        self.assertEqual(on['chip'], '3 of 116 settings')
+        self.assertEqual(on['chip'], '3 of 115 settings')
         self.assertEqual(on['sections']['recording']['head'], '1 changed')
         self.assertEqual(on['sections']['watchdog']['head'], '1 changed')
         self.assertFalse(on['sections']['watchdog']['collapsed'])
@@ -271,7 +271,7 @@ class ChangedChipTests(_Base):
 
     def test_turning_it_off_goes_back_to_basic_and_saves_nothing(self):
         off = self.obs['off']
-        self.assertEqual(len(off['shownPaths']), 22)
+        self.assertEqual(len(off['shownPaths']), 23)
         self.assertIsNone(off['notice'])
         self.assertEqual(off['changedChip']['active'], False)
         self.assertEqual(self.obs['posts'], [])
@@ -305,7 +305,7 @@ class NothingChangedTests(_Base):
                          {'active': False, 'pressed': 'false', 'disabled': True, 'count': '0'})
 
     def test_a_disabled_chip_does_nothing(self):
-        self.assertEqual(len(self.obs['clicked']['shownPaths']), 22)
+        self.assertEqual(len(self.obs['clicked']['shownPaths']), 23)
         self.assertIsNone(self.obs['clicked']['verdict'] or None)
 
 
@@ -317,7 +317,7 @@ class NothingChangedReloadTests(_Base):
         self.assertEqual(opened['verdict'],
                          'No setting on this page is changed from its default. Show all settings')
         self.assertEqual(opened['changedChip']['disabled'], False)
-        self.assertEqual(len(self.obs['cleared']['shownPaths']), 22)
+        self.assertEqual(len(self.obs['cleared']['shownPaths']), 23)
         self.assertIsNone(self.obs['cleared']['verdict'] or None)
 
 

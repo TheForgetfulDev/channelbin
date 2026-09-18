@@ -16,7 +16,7 @@
 # logging.file, which appear below as commented-out examples because their defaults
 # are paths derived from wherever the app is installed.
 
-config_version: 5
+config_version: 7
 
 recording:
   # Where segments, the in-progress file and the finished recording are written.
@@ -24,6 +24,10 @@ recording:
   # directory and enable move_on_complete below, so only finished files land in the
   # directory you browse.
   dvr_output_dir: /dvr
+  # Every image the app saves: recording thumbnails, health check screenshots and cached
+  # channel logos, each in its own subfolder (thumbnails, screenshots, logos). Relative paths
+  # resolve against the app root.
+  images_dir: /dvr/images
   # Per-segment ffmpeg stderr spools, so a failed capture can say why. Tiny, deleted at each
   # segment close. Relative paths resolve against the app root. Keep this on LOCAL disk, not
   # under dvr_output_dir - if that mount is what failed, its error message must not live there.
@@ -77,7 +81,6 @@ recording:
     timeout_seconds: 300
   live_thumbnail:
     enabled: true
-    dir: /dvr/live_thumbnails
     min_regen_interval_seconds: 10
     capture_timeout_seconds: 12
     auto_refresh_seconds: 60
@@ -85,9 +88,8 @@ recording:
     # Cache channel logos locally instead of hotlinking the provider on every page view.
     # Off by default so an install that does not need it gets no background job and no
     # growing cache directory. Only logos for channels in the TV Guide or in a group are
-    # ever fetched, never the whole catalog. A relative path resolves against the app root.
+    # ever fetched, never the whole catalog. Cached logos go to images_dir's logos subfolder.
     enabled: false
-    dir: instance/logo-cache
   gather_health_data: true
   serialize_concat: false
 
@@ -352,6 +354,18 @@ http:
   # ffmpeg.extra_input_args; the later value wins.
   user_agent: VLC/3.0.18 LibVLC/3.0.18
 
+preview:
+  # The live channel preview on a channel's page: one ffmpeg stream-copies the channel
+  # into a rolling HLS window on local disk and the browser plays it. Video is never
+  # re-encoded; audio is converted to AAC only when the browser cannot decode it. A
+  # preview holds one of the account's connections and gives it up to any recording that
+  # needs it. One preview at a time.
+  segment_seconds: 2                     # HLS segment length; the stream's keyframe interval is the floor
+  idle_timeout_seconds: 15               # stop when nothing has fetched the playlist for this long (a closed tab)
+  max_seconds: 600                       # hard cap on one preview - it is a look, not a viewer
+  connect_timeout_seconds: 20            # stop if the stream has produced no playable segment by then
+  dir: ''                                # '' = system temp dir; where the rolling segment window is written
+
 channel_testing:
   skip_if_recording_active: true         # skip the automatic TV Guide Channels run while a recording is in progress
   skip_if_recording_within_minutes: 10   # skip ANY run if a recording starts this soon; 0 = off
@@ -359,7 +373,6 @@ channel_testing:
   wait_between_channels_seconds: 30
   screenshots_enabled: true
   screenshots_keep_count: 5
-  screenshot_dir: /dvr/channel_test_screenshots
   # '' = system temp dir; set to redirect the test's temporary capture clip elsewhere.
   capture_scratch_dir: ''
   test_history_keep: 0
@@ -373,7 +386,10 @@ channel_testing:
   # "channel offline" clip. One extra short ffprobe per connected test.
   placeholder_source_check: true
   health_score_half_life_samples: 5
-  reference_minutes: 2
+  # Observation length that counts as one full-weight data point, tracking
+  # test_duration_seconds above. Sets how fast the score reacts, not how tests weigh
+  # against recordings - it divides both, so their ratio is unchanged.
+  reference_minutes: 0.5
   instability_penalty_per_hr: 2.0
   health_score_test_fail_floor: 10
   health_score_warn_penalty: 10

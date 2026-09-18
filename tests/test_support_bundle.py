@@ -558,6 +558,73 @@ class BundleContentsTests(_BundleTestCase):
         self.assertEqual(cfg['notifications']['base_url'], 'http://[url redacted]')
 
 
+class ReadinessReportTests(_BundleTestCase):
+    """readiness.txt is the Readiness card's own Copy report text, so a bundle answers "is
+    this install set up correctly" without a second rendering to keep in step
+    (dev/changelog/1010)."""
+
+    def _report(self, **kw):
+        return _unzip(sb.build_support_bundle(**kw)).read('readiness.txt').decode()
+
+    def test_the_bundle_ships_the_copy_report_text(self):
+        from app import readiness
+        shipped = self._report()
+        expected = readiness.evaluate()['report']
+
+        def body(text):
+            return [line for line in text.splitlines() if not line.startswith('Generated ')]
+        self.assertEqual(body(shipped), body(expected))
+
+    def test_building_a_bundle_never_runs_an_ondemand_check(self):
+        """A bundle is not a reason to log in to a provider or send a real message."""
+        from app import readiness
+        called = []
+        checks = tuple(
+            c._replace(run=lambda ctx: called.append(1)) if c.cost == readiness.ON_DEMAND
+            else c for c in readiness.CHECKS)
+        with patch.object(readiness, 'CHECKS', checks), \
+                patch.dict(readiness.CHECKS_BY_ID, {c.id: c for c in checks}):
+            report = self._report()
+        self.assertEqual(called, [])
+        self.assertIn('[Not run yet] Every account still logs in', report)
+
+    def _seed_named_findings(self):
+        """An account too short for the bundle's free-text sweep, and a guide group with
+        nobody switched on - both of which a check names in its finding."""
+        acc = seed.make_account(name='Zq')
+        acc.status = 'ERROR'
+        group = seed.make_group(name='Zephyr Sports Group',
+                                members=[seed.make_channel(acc, name='A feed')])
+        group.in_guide = True
+        for m in group.memberships:
+            m.recording_enabled = False
+        db.session.commit()
+        return acc, group
+
+    def test_names_in_a_finding_are_pseudonymized_by_the_checks_themselves(self):
+        """Group names are not swept from free text and a two-letter account name is too
+        short to sweep, so a finding that named either would ship it verbatim."""
+        acc, group = self._seed_named_findings()
+        report = self._report()
+        self.assertIn(f'account {acc.id}', report)
+        self.assertIn(f'group {group.id}', report)
+        self.assertNotIn('Zephyr Sports Group', report)
+        self.assertNotIn(': Zq', report)
+
+    def test_opting_into_names_ships_the_real_ones(self):
+        _acc, _group = self._seed_named_findings()
+        report = self._report(include_names=True)
+        self.assertIn('Zephyr Sports Group', report)
+        self.assertIn(': Zq', report)
+
+    def test_a_readiness_failure_costs_only_its_own_file(self):
+        with patch('app.readiness.evaluate', side_effect=RuntimeError('boom')):
+            zf = _unzip(sb.build_support_bundle())
+        self.assertNotIn('readiness.txt', zf.namelist())
+        self.assertIn('readiness.txt', json.loads(zf.read('errors.json')))
+        self.assertIn('accounts.json', zf.namelist())
+
+
 class NoiseFilteringTests(_BundleTestCase):
     """dev/changelog/838: of the 2,000 raw lines the tail used to ship, roughly 93%
     was werkzeug HTTP access logging and routine APScheduler job start/finish chatter,

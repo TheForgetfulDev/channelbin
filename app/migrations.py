@@ -1356,7 +1356,7 @@ def _m036_epg_duration_column(conn, cur):
 def _m037_channel_logo_cache(conn, cur):
     """channels: logo_cache_path/logo_cache_source_url for local logo caching
     (app/logo_cache.py, dev/changelog/601). logo_cache_path is the cached file's name
-    under recording.logo_cache.dir,
+    in the logos subfolder of recording.images_dir,
     NULL until the background job fetches it (or if the fetch failed/wasn't an image).
     logo_cache_source_url is the exact provider logo_url the cache was built from (or
     last attempted against) - comparing it to the current logo_url on each sync is the

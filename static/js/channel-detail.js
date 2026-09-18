@@ -441,6 +441,214 @@
     });
   }
 
+  // ── Live preview ──────────────────────────────────────────────────────────
+  // The server runs one ffmpeg that stream-copies the channel into a rolling HLS window
+  // (app/preview.py); this plays it. The browser never sees the stream URL, only the
+  // session's playlist. Every way this modal can go away stops the session: the Stop
+  // button and the close/Esc/backdrop paths all run onClose, and leaving the page fires a
+  // pagehide beacon. The server's idle reaper is the backstop for a tab that dies
+  // without either, so a stop here is prompt rather than load-bearing.
+  //
+  // hls.js is loaded on the first click rather than with the page: it is the one third-
+  // party script in the app (static/vendor/hls.js/NOTICE.md) and 386 KB nobody should pay
+  // for on every channel page load.
+  let hlsLoading = null;
+  function loadHlsJs() {
+    if (window.Hls) return Promise.resolve(window.Hls);
+    if (!hlsLoading) {
+      hlsLoading = new Promise((resolve, reject) => {
+        const s = document.createElement('script');
+        s.src = C.urls.hlsJs;
+        s.onload = () => resolve(window.Hls);
+        s.onerror = () => { hlsLoading = null; reject(new Error('Could not load the video player script.')); };
+        document.head.appendChild(s);
+      });
+    }
+    return hlsLoading;
+  }
+
+  function openPreview() {
+    const stage = document.createElement('div');
+    stage.innerHTML = `
+      <div class="cd-preview-stage">
+        <video class="cd-preview-video" playsinline controls></video>
+        <button type="button" class="btn btn-primary cd-preview-play" hidden>Play</button>
+      </div>
+      <div class="cd-preview-status" role="status">Starting…</div>`;
+    const video = stage.querySelector('video');
+    const playBtn = stage.querySelector('.cd-preview-play');
+    const statusEl = stage.querySelector('.cd-preview-status');
+
+    let session = null;     // the start response: status_url / playlist_url / stop_url
+    let hls = null;
+    let pollTimer = null;
+    let closed = false;
+    let recoveredOnce = false;
+
+    const setStatus = (text, kind = '') => {
+      statusEl.textContent = text;
+      statusEl.dataset.kind = kind;
+    };
+
+    // pagehide cannot wait for a fetch and sendBeacon cannot set headers, so the token
+    // travels as a form field, which the CSRF check accepts just the same.
+    const stopSession = ({ beacon = false } = {}) => {
+      if (!session) return;
+      const url = session.stop_url;
+      session = null;
+      if (beacon && navigator.sendBeacon) {
+        const fd = new FormData();
+        fd.append('csrf_token', csrfToken());
+        navigator.sendBeacon(url, fd);
+        return;
+      }
+      jsonFetch(url, { method: 'POST' }).catch(() => {});
+    };
+    const onPageHide = () => stopSession({ beacon: true });
+
+    const detachPlayer = () => {
+      clearTimeout(pollTimer);
+      if (hls) { hls.destroy(); hls = null; }
+      video.pause();
+      video.removeAttribute('src');
+      video.load();
+    };
+
+    const modal = buildModal({
+      title: `Preview - ${C.channelName}`,
+      body: stage,
+      panelClass: 'modal-wide cd-preview-modal',
+      footer: [{ label: '■ Stop', class: 'btn', onClick: (close) => close() }],
+      onClose: () => {
+        closed = true;
+        window.removeEventListener('pagehide', onPageHide);
+        detachPlayer();
+        stopSession();
+      },
+    });
+    window.addEventListener('pagehide', onPageHide);
+
+    // The session ended on the server. Name why - a preview that stops without saying is
+    // a number nobody can explain - and leave the modal up so the reason can be read.
+    const ended = (s) => {
+      detachPlayer();
+      session = null;
+      const why = [s.reason_text, s.detail].filter(Boolean).join('\n');
+      setStatus(why || 'Stopped.', s.reason === 'user' ? '' : 'error');
+    };
+
+    const tryPlay = () => {
+      const p = video.play();
+      if (!p || !p.catch) return;
+      p.then(() => { playBtn.hidden = true; })
+       .catch((err) => {
+         if (err && err.name === 'NotAllowedError') {
+           playBtn.hidden = false;
+           setStatus('Ready - press Play. The browser would not start sound on its own.');
+         }
+       });
+    };
+    playBtn.addEventListener('click', tryPlay);
+    video.addEventListener('playing', () => {
+      if (closed || !session) return;
+      setStatus(session.transcode_audio
+        ? 'Playing. Audio is re-encoded to AAC so the browser can decode it; video is untouched.'
+        : 'Playing.', 'ok');
+    });
+
+    const onHlsError = (_evt, data) => {
+      if (!data || !data.fatal) return;
+      if (data.type === Hls.ErrorTypes.MEDIA_ERROR && !recoveredOnce) {
+        recoveredOnce = true;
+        hls.recoverMediaError();
+        return;
+      }
+      if (hls) { hls.destroy(); hls = null; }
+      if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
+        setStatus(`This browser cannot decode this stream (${data.details}). HEVC video, or an audio codec the browser lacks, is the usual reason.`, 'error');
+      } else if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
+        // The status poll will replace this with the server's reason if the session ended.
+        setStatus(`Lost the stream (${data.details}).`, 'error');
+      } else {
+        setStatus(`Playback failed (${data.details}).`, 'error');
+      }
+    };
+
+    // Prefer hls.js wherever Media Source Extensions exist (desktop Chrome/Firefox/Edge,
+    // Android Chrome), fall back to the browser's own HLS where it is the only option
+    // (iOS Safari), and say so where there is neither.
+    const attach = () => {
+      const url = session.playlist_url;
+      const nativeHls = video.canPlayType('application/vnd.apple.mpegurl');
+      const useNative = () => {
+        video.src = url;
+        video.addEventListener('loadedmetadata', tryPlay, { once: true });
+      };
+      loadHlsJs()
+        .then((Hls) => {
+          if (Hls && Hls.isSupported()) {
+            hls = new Hls({ liveSyncDurationCount: 3, liveMaxLatencyDurationCount: 8 });
+            hls.on(Hls.Events.MANIFEST_PARSED, tryPlay);
+            hls.on(Hls.Events.ERROR, onHlsError);
+            hls.loadSource(url);
+            hls.attachMedia(video);
+          } else if (nativeHls) {
+            useNative();
+          } else {
+            setStatus('This browser cannot play HLS video, so the preview cannot show here.', 'error');
+          }
+        })
+        .catch((e) => {
+          if (nativeHls) useNative();
+          else setStatus(e.message || 'Could not load the video player script.', 'error');
+        });
+    };
+
+    // hls.js gives a missing manifest very few retries, so the playlist is only handed to
+    // it once the server says the first segment exists; the poll keeps running afterwards
+    // so a stop decided on the server (preempted, idle, ended) reaches the modal by name.
+    let attached = false;
+    const poll = () => {
+      if (closed || !session) return;
+      jsonFetch(session.status_url)
+        .then((s) => {
+          if (closed || !session) return;
+          if (s.state === 'STOPPED') { ended(s); return; }
+          if (s.state === 'READY' && !attached) {
+            attached = true;
+            setStatus('Connected - starting playback…');
+            attach();
+          } else if (s.state === 'STARTING') {
+            setStatus(`Connecting to the stream… (${Math.round(s.elapsed_seconds)}s)`);
+          }
+          pollTimer = setTimeout(poll, attached ? 3000 : 1000);
+        })
+        .catch((e) => {
+          if (closed) return;
+          setStatus(e.message || 'Lost contact with the preview.', 'error');
+        });
+    };
+
+    jsonFetch(C.urls.preview, { method: 'POST' })
+      .then((data) => {
+        if (closed) {
+          // Closed before the start round-trip came back: stop what we just started.
+          session = data;
+          stopSession();
+          return;
+        }
+        session = data;
+        setStatus('Connecting to the stream…');
+        poll();
+      })
+      .catch((e) => {
+        if (closed) return;
+        setStatus(e.message || 'Could not start the preview.', 'error');
+      });
+
+    return modal;
+  }
+
   // The sticky bottom bar's kebab (DESIGN.md 9.6: a dropdown opening upward out of a fixed
   // bar clips). Its items are READ FROM #cd-kebab rather than re-listed here, so the two
   // surfaces cannot offer different actions - the server-rendered menu stays the one source.
@@ -564,6 +772,7 @@
       case 'copy-url': copyStreamUrl(el); return;
       case 'repoint': repointChannel(); return;
       case 'test-now': testNow(el); return;
+      case 'preview': openPreview(); return;
       case 'add-group': openAddToGroupModal(); return;
       case 'create-check': openCreateCheck(); return;
       case 'delete-channel': deleteChannel(); return;

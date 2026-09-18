@@ -165,7 +165,8 @@ class DockerPersistencePathTests(unittest.TestCase):
     def test_the_entrypoint_never_walks_the_recordings_volume(self):
         """/dvr is routinely a multi-terabyte share. A recursive chown of it at every
         container start costs minutes of startup and rewrites files the user may share with
-        other apps - the entrypoint warns about a bad ownership instead of "fixing" it."""
+        other apps - the entrypoint leaves ownership alone, and the app itself reports an
+        unwritable folder (dev/changelog/1009)."""
         for line in _read(ENTRYPOINT).splitlines():
             code = line.split('#')[0]
             if 'chown' in code and '-R' in code:

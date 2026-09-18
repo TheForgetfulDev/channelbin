@@ -95,8 +95,14 @@
 }
 .cd-grouprow:last-child { border-bottom: none; }
 
+/* Test History is 13 columns, the widest table in the app, and `.tbl th`'s nowrap is
+   sized for tables a third of that - held to one line, "Frames Received" alone costs
+   ~43px that the column does not need. Letting this page's headers wrap is what keeps
+   the table inside its card at desktop width; the thead is hidden below 768 anyway, so
+   this is a desktop-only concession and page-scoped rather than a fork of 3.2. */
+.cd-wide th { white-space: normal; }
+
 @media (max-width: 768px) {
-  .col-fps, .col-frames, .col-bitrate, .col-screenshot-h, .col-audio, .col-profile { display: none; }
   .cd-epg-btn .cd-epg-icon { display: inline; }
   .cd-epg-btn .cd-epg-label { display: none; }
 
@@ -172,6 +178,43 @@
   .cd-stickybar .cd-sb-form { display: contents; }
   body { padding-bottom: calc(74px + env(safe-area-inset-bottom)); }
 }
+/* The kebab's Preview row exists for the phone sheet only (see the markup); above the phone
+   breakpoint the header button is the one Preview control. Written at the shared rule's own
+   specificity plus one (`.menu button.menu-item` in style.css sets display) - a bare
+   `.cd-phone-only` loses that cascade and the row shows on desktop, which is what the
+   browser verification of dev/changelog/1018 caught. */
+@media (min-width: 769px) {
+  .menu button.menu-item.cd-phone-only { display: none; }
+}
+
+/* Live preview modal (static/js/channel-detail.js openPreview). The stage is the one
+   deliberately non-palette surface on the page: video letterboxes against the darkest
+   ground the palette has, never a mid-tone. A 16:9 box so the modal has its shape before
+   the first frame, and a phone's bottom sheet (style.css 9.6) does not jump when it lands. */
+.modal-panel.cd-preview-modal { max-width: 960px; }
+.cd-preview-stage {
+  position: relative;
+  aspect-ratio: 16 / 9;
+  background: var(--bg0);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+}
+.cd-preview-video { display: block; width: 100%; height: 100%; }
+.cd-preview-play {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+}
+.cd-preview-status {
+  margin-top: 10px;
+  font-size: var(--fs-sm);
+  color: var(--text-muted);
+  white-space: pre-line;
+  overflow-wrap: anywhere;
+}
+.cd-preview-status[data-kind="ok"] { color: var(--ok); }
+.cd-preview-status[data-kind="error"] { color: var(--bad); }
 </style>
 
 <div class="page-head">
@@ -324,12 +367,19 @@
                  the tooltip stops implying the guide has never heard of it. #}
               data-tip="{% if channel.in_guide %}Remove from Guide.&#10;Stops this channel showing as a guide row{{ ', but its listings stay in the guide through %s.' % guide_via_groups[0].name if guide_via_groups else '.' }} Scheduled recordings are unaffected.{% elif guide_via_groups %}Add to Guide.&#10;Its listings are already in the guide through {{ guide_via_groups[0].name }}. This gives it a TV Guide row of its own as well.{% else %}Add to Guide.&#10;Makes this channel a TV Guide row so programs can be scheduled from it.{% endif %}">{{ 'Remove from Guide' if channel.in_guide else '+ Add to Guide' }}</button>
     </form>
+    {# Preview is a look, Test is a measurement: a preview feeds nothing (no score, no row),
+       which is why it is its own verb rather than a mode of Test (DESIGN.md 4). #}
+    <button class="btn btn-sm tip-plain" data-act="preview"
+            data-tip="Preview.&#10;Plays this channel's live stream right here, so you can see it is the right channel and that it plays before a recording relies on it. Holds one of this account's connections while it runs, and gives it up to any recording that needs it.">Preview</button>
     <button class="btn btn-primary btn-sm tip-plain" data-act="test-now"
             data-tip="Test now.&#10;Runs a one-off &quot;does this play right now?&quot; check - a short capture and probe, distinct from a scheduled health check. Honors this account's connection limit.">&#9654; Test now</button>
     <span class="menu-wrap">
       <button class="btn btn-sm btn-icon" data-menu aria-label="More actions">&#8943;</button>
       {# Memberships are links in the title, so the kebab is actions only. #}
       <div class="menu" id="cd-kebab">
+        {# Phone only: the sticky bar's sheet is built from this menu, and the bar itself has
+           no room for a fourth button. On desktop Preview is the header button above. #}
+        <button class="menu-item cd-phone-only" data-act="preview">Preview</button>
         <button class="menu-item" data-act="add-group">&#9939; Add to channel group&hellip;</button>
         <button class="menu-item" data-act="create-check">&#10003; Create health check for this channel</button>
         <div class="sep"></div>
@@ -947,7 +997,7 @@
       <p class="card-note">No completed recording on this channel has produced a quality observation yet.</p>
       {% else %}
       <div class="table-scroll">
-        <table class="table">
+        <table class="tbl tbl-cards">
           <thead>
             <tr>
               <th>Completed</th>
@@ -1006,20 +1056,20 @@
         {% endif %}
       </div>
       <div class="table-scroll">
-        <table class="table">
+        <table class="tbl tbl-cards cd-wide">
           <thead>
             <tr>
               <th>Tested</th>
               <th>Status</th>
               <th>Resolution</th>
-              <th class="col-profile" title="Codec, bit depth and chroma, plus interlaced/VFR flags. Tests that predate stream-profile capture show --.">Profile</th>
-              <th class="col-audio">Audio</th>
-              <th class="col-fps">FPS</th>
-              <th class="col-frames">Frames Received</th>
-              <th class="col-bitrate">Bitrate</th>
+              <th title="Codec, bit depth and chroma, plus interlaced/VFR flags. Tests that predate stream-profile capture show --.">Profile</th>
+              <th>Audio</th>
+              <th>FPS</th>
+              <th>Frames Received</th>
+              <th>Bitrate</th>
               <th>Drops</th>
               <th>Duration</th>
-              <th class="col-screenshot-h">Screenshot</th>
+              <th>Screenshot</th>
               <th title="This test's own 0-100 quality score">Score</th>
               <th title="Channel's lifetime score immediately after this test">Lifetime</th>
             </tr>
@@ -1037,21 +1087,21 @@
                 {% endif %}
               </td>
               <td data-label="Resolution">{{ t.resolution or '--' }}</td>
-              <td data-label="Profile" class="col-profile">
+              <td data-label="Profile">
                 {% if test_profiles.get(t.id) %}{{ test_profiles[t.id] }}
                 {% else %}<span class="text-muted">--</span>{% endif %}
               </td>
-              <td data-label="Audio" class="col-audio">
+              <td data-label="Audio">
                 {% if t.audio_codec %}
                   {{ t.audio_codec|upper }}{% if t.audio_channels %} {{ t.audio_channels }}ch{% endif %}{% if t.audio_sample_rate %} {{ (t.audio_sample_rate // 1000) }}kHz{% endif %}{% if t.audio_bitrate_kbps %} {{ t.audio_bitrate_kbps|int }}kbps{% endif %}{% if t.audio_language %} <span class="text-muted">({{ t.audio_language }})</span>{% endif %}
                 {% else %}
                   <span class="text-muted">--</span>
                 {% endif %}
               </td>
-              <td data-label="FPS" class="col-fps">
+              <td data-label="FPS">
                 {% if t.fps %}{{ '%.1f' | format(t.fps) }}{% else %}--{% endif %}
               </td>
-              <td data-label="Frames Received" class="col-frames">
+              <td data-label="Frames Received">
                 {% if t.frame_pct is not none %}
                   {# Expected comes back out of the stored pair rather than fps x duration -
                      the server measures it over the clip's decode span, so recomputing it
@@ -1063,7 +1113,7 @@
                   {% endif %}
                 {% else %}--{% endif %}
               </td>
-              <td data-label="Bitrate" class="col-bitrate">
+              <td data-label="Bitrate">
                 {% if t.bitrate_kbps %}{{ '%.0f kbps' | format(t.bitrate_kbps) }}{% else %}--{% endif %}
               </td>
               <td data-label="Drops">
@@ -1075,7 +1125,7 @@
               <td data-label="Duration" class="text-muted small">
                 {% if t.test_ended_at %}{{ ((t.test_ended_at - t.test_started_at).total_seconds() | int) }}s{% else %}--{% endif %}
               </td>
-              <td data-label="Screenshot" class="col-screenshot-h">
+              <td data-label="Screenshot">
                 {% if t.screenshot_path %}
                   {% if t.screenshot_pruned %}
                   <div class="test-row-screenshot screenshot-placeholder pruned"
@@ -1193,6 +1243,10 @@ window.CHANNEL_DETAIL = {
     repoint: '/channels/{{ channel.id }}/repoint',
     sectionPref: '/api/user-prefs/channel_detail_sections',
     testNow: '/api/channels/{{ channel.id }}/test-now',
+    preview: '{{ url_for("preview.start_channel_preview", channel_id=channel.id) }}',
+    {# Loaded on the first Preview click, not with the page: 386 KB nobody pays for until
+       they ask to watch something (static/vendor/hls.js/NOTICE.md). #}
+    hlsJs: '{{ url_for("static", filename="vendor/hls.js/hls.light.min.js") }}',
     missingPreview: '{{ url_for("channels.missing_delete_preview") }}',
     missingDelete: '{{ url_for("channels.missing_delete") }}',
     channelsHub: '{{ url_for("channels.channel_browser") }}',

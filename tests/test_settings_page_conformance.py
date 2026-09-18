@@ -406,7 +406,6 @@ class SubGroupTests(unittest.TestCase):
         ('recording.move_on_complete.enabled', 'recording.move_on_complete.destination'),
         ('recording.post_script.enabled', 'recording.post_script.path'),
         ('recording.live_thumbnail.enabled', 'recording.live_thumbnail.auto_refresh_seconds'),
-        ('recording.logo_cache.enabled', 'recording.logo_cache.dir'),
         ('auth.enabled', 'auth.session_timeout_minutes'),
         ('config_backup.enabled', 'config_backup.backup_hour_et'),
         ('debug.xtream_debug_mode', 'debug.xtream_dump_dir'),
@@ -504,7 +503,7 @@ class TierTests(unittest.TestCase):
 
     BASIC = {
         'display.timezone', 'display.time_format', 'display.guide_collapse_gaps',
-        'recording.dvr_output_dir', 'recording.filename_template', 'recording.retention_days',
+        'recording.dvr_output_dir', 'recording.images_dir', 'recording.filename_template', 'recording.retention_days',
         'recording.retention_delete_file', 'recording.post_process.enabled',
         'recording.post_process.format', 'recording.post_process.reencode_mode',
         'recording.move_on_complete.enabled', 'recording.move_on_complete.destination',
@@ -537,14 +536,14 @@ class TierTests(unittest.TestCase):
 
     def test_the_basic_set_is_exactly_the_approved_one(self):
         tiers = self._tiers(self.basic_html)
-        self.assertEqual(len(tiers), 116)
+        self.assertEqual(len(tiers), 115)
         self.assertEqual({p for p, t in tiers.items() if t == 'basic'}, self.BASIC)
         self.assertEqual({t for t in tiers.values()}, {'basic', 'advanced'})
 
     def test_every_advanced_row_carries_its_badge_and_no_basic_row_does(self):
         rows = re.findall(r'data-path="([^"]+)" data-tier="[^"]*".*?<div class="fl-label">(.*?)</div>',
                           self.basic_html, re.S)
-        self.assertEqual(len(rows), 116)
+        self.assertEqual(len(rows), 115)
         for path, badge in rows:
             with self.subTest(path=path):
                 self.assertEqual('tier-badge' in badge, path not in self.BASIC)
@@ -623,7 +622,7 @@ class ChangedFromDefaultTests(unittest.TestCase):
 
     def test_every_setting_row_carries_the_mark_and_the_attribute_turns_it_on(self):
         html = self._page()
-        self.assertEqual(html.count('<div class="fr-changed">Changed from default</div>'), 116)
+        self.assertEqual(html.count('<div class="fr-changed">Changed from default</div>'), 115)
         self.assertIn('.frow[data-changed] .fr-changed { display: inline-flex; }', self._css())
 
     def test_a_value_saved_equal_to_its_default_is_not_a_change(self):
@@ -706,14 +705,12 @@ class GatingAndOverrideTests(unittest.TestCase):
     # Each is read with its apparent gate off, so dimming it would be a false claim.
     LOOKS_GATED_IS_NOT = (
         'recording.retention_delete_file', 'watchdog.stall_move_window_minutes',
-        'channel_testing.screenshots_keep_count', 'channel_testing.screenshot_dir',
+        'channel_testing.screenshots_keep_count',
         'channel_testing.pre_check.lead_minutes', 'channel_testing.pre_check.retry_minutes',
         'channel_testing.pre_check.min_margin_seconds', 'auth.cookie_secure',
         'config_backup.backup_retention_days', 'config_backup.backup_dir',
         'sync.skip_sync_if_recording_within_minutes',
         'channel_testing.skip_if_recording_within_minutes',
-        # The cache keeps serving, purging and tearing down files there with caching off.
-        'recording.logo_cache.dir',
         # An account's own debug switch uses the dump tools with the global one off.
         'debug.xtream_dump_dir',
     )

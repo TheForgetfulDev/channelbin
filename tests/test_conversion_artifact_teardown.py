@@ -48,12 +48,12 @@ class _ConversionArtifactCase(unittest.TestCase):
         db.session.commit()
 
         self.dvr_dir = os.path.join(self.t._tmpdir, 'dvr')
-        self.thumb_dir = os.path.join(self.t._tmpdir, 'live_thumbnails')
+        self.thumb_dir = os.path.join(self.t._tmpdir, 'images', 'thumbnails')
         os.makedirs(self.dvr_dir, exist_ok=True)
         os.makedirs(self.thumb_dir, exist_ok=True)
         self.cfg = load_config()
         self.cfg['recording']['dvr_output_dir'] = self.dvr_dir
-        self.cfg['recording']['live_thumbnail']['dir'] = self.thumb_dir
+        self.cfg['recording']['images_dir'] = os.path.dirname(self.thumb_dir)
         self.cfg['recording']['post_process']['enabled'] = True
         self.cfg['recording']['post_process']['format'] = self.fmt
 

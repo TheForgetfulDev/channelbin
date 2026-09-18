@@ -40,6 +40,66 @@ def build_capture_cmd(cfg: dict, url: str, output_path: str, duration_seconds: i
     not reasoned about pacing keeps today's behavior. Read the comment at the flag
     before changing what a call site passes."""
     cmd = [resolve_ffmpeg_path(cfg['ffmpeg']['path'])]
+    cmd += input_args(cfg, url, pace_realtime=pace_realtime)
+    if duration_seconds and duration_seconds > 0:
+        cmd += ['-t', str(duration_seconds)]
+    cmd += cfg['ffmpeg'].get('extra_output_args', [])
+    cmd += ['-c', 'copy', '-y', output_path]
+    return cmd
+
+
+def build_preview_cmd(cfg: dict, url: str, out_dir: str, *, segment_seconds: int = 2,
+                      list_size: int = 6, transcode_audio: bool = False,
+                      pace_realtime: bool = False) -> list:
+    """ffmpeg "connect + stream-copy to a rolling HLS window" command for the live channel
+    preview (app/preview.py). The input half is input_args(), the SAME connect behavior
+    every capture gets, so a provider sees a preview exactly as it sees a recording.
+
+    The output is deliberately a stream copy: re-encoding video measured 347% of this
+    box's 400% CPU at 1080p60 and fell behind real time, and a diagnostic must never be
+    able to starve the capture it sits beside (dev/changelog/1018). Only audio is ever
+    re-encoded, and only when the caller knows the browser cannot decode it (AC3/EAC3/MP2):
+    stereo AAC, ~5% of one core measured. One video and one audio stream, each optional
+    (`?`), so an audio-only channel - an Icecast radio mount - previews as sound alone
+    instead of failing on the missing video; subtitle and data tracks are dropped because
+    a teletext PID copied into a segment is something hls.js chokes on and nobody can see.
+
+    delete_segments keeps the window bounded on disk, omit_endlist keeps the playlist live,
+    independent_segments lets the player start at any segment. hls_delete_threshold keeps
+    three segments that have already dropped out of the playlist on disk a little longer:
+    a provider that bursts its backlog on connect advances the window several segments
+    between the player's playlist fetch and its first segment request, and the browser
+    verification saw exactly that 404 once (dev/changelog/1018). About 10 MB at 1080p all
+    told. Segment length is bounded below by the source's keyframe interval under a copy,
+    so a provider with a 5 s GOP produces 5 s segments whatever segment_seconds says."""
+    cmd = [resolve_ffmpeg_path(cfg['ffmpeg']['path'])]
+    cmd += input_args(cfg, url, pace_realtime=pace_realtime)
+    cmd += ['-map', '0:v:0?', '-map', '0:a:0?', '-sn', '-dn', '-c:v', 'copy']
+    if transcode_audio:
+        cmd += ['-c:a', 'aac', '-b:a', '128k', '-ac', '2']
+    else:
+        cmd += ['-c:a', 'copy']
+    cmd += ['-f', 'hls', '-hls_time', str(segment_seconds), '-hls_list_size', str(list_size),
+            '-hls_delete_threshold', '3',
+            '-hls_flags', 'delete_segments+independent_segments+omit_endlist',
+            '-hls_segment_filename', os.path.join(out_dir, PREVIEW_SEGMENT_PATTERN),
+            '-y', os.path.join(out_dir, PREVIEW_PLAYLIST)]
+    return cmd
+
+
+#: The preview's on-disk names. The route that serves segments matches PREVIEW_SEGMENT_RE
+#: and nothing else, so a request can only ever name a file ffmpeg wrote here.
+PREVIEW_PLAYLIST = 'index.m3u8'
+PREVIEW_SEGMENT_PATTERN = 'seg%05d.ts'
+PREVIEW_SEGMENT_RE = re.compile(r'^seg\d{5}\.ts$')
+
+
+def input_args(cfg: dict, url: str, *, pace_realtime: bool) -> list:
+    """The "how to connect to this URL" half of every ffmpeg command this app runs against
+    a stream: user agent, read timeout, the user's extra input args, reconnect flags for a
+    continuous http(s) stream, optional -re, then -i. Shared by build_capture_cmd() and
+    build_preview_cmd() so a flag learned once reaches every call site."""
+    cmd = []
     # Identify as http.user_agent, the same string account sync sends (accounts.py
     # _request_headers) - one setting, so a provider that filters on user agent sees this
     # app the same way whether it is fetching a playlist or capturing a stream. Without it
@@ -117,10 +177,6 @@ def build_capture_cmd(cfg: dict, url: str, output_path: str, duration_seconds: i
     if pace_realtime:
         cmd += ['-re']
     cmd += ['-i', url]
-    if duration_seconds and duration_seconds > 0:
-        cmd += ['-t', str(duration_seconds)]
-    cmd += cfg['ffmpeg'].get('extra_output_args', [])
-    cmd += ['-c', 'copy', '-y', output_path]
     return cmd
 
 

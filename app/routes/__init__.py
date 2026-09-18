@@ -17,9 +17,11 @@ from .channel_search import channel_search_bp
 from .channel_hide_rules import channel_hide_rules_bp
 from .auth import auth_bp
 from .ha import ha_bp
+from .preview import preview_bp
 
 
 def register_blueprints(app):
+    app.register_blueprint(preview_bp)
     app.register_blueprint(recordings_bp)
     app.register_blueprint(dashboard_bp)
     app.register_blueprint(settings_bp)

@@ -1365,8 +1365,8 @@ class Channel(db.Model):
     name             = db.Column(db.String(512), nullable=False)
     logo_url         = db.Column(db.String(2048))
     # Local logo cache (app/logo_cache.py). logo_cache_path is the cached file's name
-    # under recording.logo_cache.dir, NULL until fetched (or if the fetch failed/wasn't
-    # an image). logo_cache_source_url is the logo_url the cache was last built/attempted
+    # in the logos subfolder of recording.images_dir, NULL until fetched (or if the fetch
+    # failed/wasn't an image). logo_cache_source_url is the logo_url the cache was last built/attempted
     # from - comparing it to the current logo_url is the only change-detection check, so
     # a provider that never changes its logo URL never gets re-fetched.
     logo_cache_path        = db.Column(db.String(255))

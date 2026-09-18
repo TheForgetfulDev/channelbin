@@ -25,6 +25,7 @@ import json
 import logging
 from typing import Optional, Tuple
 
+from .config import config_default
 from .db_utils import retry_on_locked
 
 log = logging.getLogger(__name__)
@@ -119,10 +120,17 @@ def observation_weight(duration_seconds: float, cfg: dict) -> float:
 
     Replaces the old flat source_weight (recording=3, test=1): a 30-minute test observed
     twice as much real time as a 15-minute recording and should outweigh it, not
-    automatically lose 3-to-1. reference_minutes is the duration that gets weight 1.0 -
-    default 2.
+    automatically lose 3-to-1. reference_minutes is the duration that gets weight 1.0, and
+    tracks the default test duration so one health check is one full-weight data point.
+
+    It sets how fast the score moves, not how sources balance against each other: it divides
+    both durations in any comparison, so it cancels out of the ratio between two observations
+    (a 1-hour recording is worth ~11 default checks whatever the reference is) and only
+    scales the whole curve. Changing it is arithmetically a change to
+    health_score_half_life_samples - dev/changelog/1016.
     """
-    ref = cfg.get('channel_testing', {}).get('reference_minutes', 2)
+    ref = cfg.get('channel_testing', {}).get(
+        'reference_minutes', config_default('channel_testing.reference_minutes'))
     minutes = max((duration_seconds or 0) / 60.0, 0.1)
     return (minutes / max(ref, 0.01)) ** 0.5
 

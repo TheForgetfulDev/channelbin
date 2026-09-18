@@ -114,8 +114,10 @@ class PageChromeTests(_Base):
         self.assertIn('2 tags', re.findall(r'<h1[^>]*>(.*?)</h1>', html, re.S)[0])
 
     def test_the_table_is_the_shared_component_in_a_card(self):
-        """DESIGN.md 3.2 - .tbl in a .card, not .table in .table-responsive."""
-        self.assertRegex(self.html, r'<div class="card-body table-scroll">\s*<table class="tbl">')
+        """DESIGN.md 3.2 - .tbl in a .card, not .table in .table-responsive, and opted into
+        the phone card reflow (dev/changelog/1017)."""
+        self.assertRegex(
+            self.html, r'<div class="card-body table-scroll">\s*<table class="tbl tbl-cards">')
         self.assertNotIn('table-responsive', self.html)
         self.assertNotIn('<table class="table">', self.html)
 

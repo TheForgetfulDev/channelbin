@@ -1,4 +1,5 @@
 import copy
+import io
 import logging
 import os
 import re
@@ -7,6 +8,7 @@ import tempfile
 import threading
 from ruamel.yaml import YAML
 from ruamel.yaml.comments import CommentedMap
+from ruamel.yaml.error import YAMLError
 
 log = logging.getLogger(__name__)
 
@@ -47,12 +49,6 @@ DEFAULT_DB_BACKUP_DIR = 'instance/db-backups'
 # the same reason as the two backup dirs above - not dev/samples/, which is excluded from
 # the shipped tree and would also leave dumps world-readable (dev/changelog/550).
 DEFAULT_XTREAM_DUMP_DIR = 'instance/xtream-dumps'
-
-# Cached channel logo images (app/logo_cache.py) are not secret, but instance/ is the
-# established home for "app-managed local state that isn't a recording" (the two backup
-# dirs and the xtream dump dir above), and Docker already bind-mounts it to a persistent
-# volume - see docker/config.docker.yaml's override to /config/instance/logo-cache.
-DEFAULT_LOGO_CACHE_DIR = 'instance/logo-cache'
 
 # Claimed by app/scheduler.py::init_scheduler() to detect a second live process already
 # running the scheduler/startup-recovery pass against the same database (dev/docs/BUGS.md
@@ -144,6 +140,10 @@ _DEFAULTS = {
     'config_version': 1,
     'recording': {
         'dvr_output_dir': '/dvr',
+        # One folder for every image the app saves, each kind in its own subfolder
+        # (app/storage_dirs.py::image_dir): recording thumbnails, health check screenshots
+        # and cached channel logos (dev/changelog/1012).
+        'images_dir': '/dvr/images',
         # Where each capture ffmpeg's stderr is spooled while its segment runs, so the exit
         # code and the last thing ffmpeg said can be attributed to the segment that died
         # (dev/changelog/430). Files are tiny, per-segment, and unlinked at segment close.
@@ -239,7 +239,6 @@ _DEFAULTS = {
         },
         'live_thumbnail': {
             'enabled': True,
-            'dir': '/dvr/live_thumbnails',
             'min_regen_interval_seconds': 10,
             'capture_timeout_seconds': 12,
             'auto_refresh_seconds': 60,   # frontend polling cadence; user-configurable in Settings
@@ -253,7 +252,6 @@ _DEFAULTS = {
         # A deliberate scope choice, not an oversight.
         'logo_cache': {
             'enabled': False,
-            'dir': DEFAULT_LOGO_CACHE_DIR,
         },
         'gather_health_data': True,  # run ffprobe on completed .ts to capture resolution/fps/frames
         # If true, only one concat+conversion job runs at a time, and none run while
@@ -663,6 +661,16 @@ _DEFAULTS = {
     'http': {
         'user_agent': 'VLC/3.0.18 LibVLC/3.0.18',
     },
+    # Live channel preview (app/preview.py): ffmpeg stream-copies the channel into a rolling
+    # HLS window the browser plays. One preview at a time, app-wide. Not on the Settings
+    # page - none of these is a value a user forms an opinion about (dev/changelog/1018).
+    'preview': {
+        'segment_seconds': 2,           # HLS segment length; the source's keyframe interval is the floor
+        'idle_timeout_seconds': 15,     # stop when no player has fetched the playlist for this long
+        'max_seconds': 600,             # hard cap - a preview is a look, not a viewer
+        'connect_timeout_seconds': 20,  # stop if ffmpeg has produced no segment by then
+        'dir': '',                      # '' -> system temp dir; where the rolling segment window is written
+    },
     'channel_testing': {
         # Enable/schedule for the automatic guide run live on the 'TV Guide Channels'
         # system health-check row (OnDemandTestJob.is_system), not in config.
@@ -672,7 +680,6 @@ _DEFAULTS = {
         'wait_between_channels_seconds': 30,
         'screenshots_enabled': True,
         'screenshots_keep_count': 5,            # per channel, oldest pruned
-        'screenshot_dir': '/dvr/channel_test_screenshots',
         'capture_scratch_dir': '',              # '' -> system temp dir; set to redirect large capture clips elsewhere
         'test_history_keep': 0,                 # 0=keep forever, N=keep last N tests per channel
         'connect_retries': 2,                   # extra connection attempts after first failure
@@ -690,7 +697,15 @@ _DEFAULTS = {
         # Lifetime channel health score (app/health_score.py) - undertuned defaults,
         # expect to retune once more real test/recording data accumulates.
         'health_score_half_life_samples': 5,        # score decay half-life, in observations (not days)
-        'reference_minutes': 2,                     # duration that gets observation weight 1.0 (sqrt scaling)
+        # Duration that gets observation weight 1.0 (sqrt scaling) - tracks
+        # test_duration_seconds above, so one default-length health check is one full-weight
+        # data point. This is a SPEED knob, not a balance one: it divides every observation's
+        # duration alike, so it cancels out of any test-vs-recording comparison (a 1-hour
+        # recording is worth ~11 default checks at any reference) and only sets how far the
+        # whole score moves per observation. Halving it is arithmetically the same as halving
+        # health_score_half_life_samples. Retuned 2 -> 0.5 in config_version 7 after the test
+        # default went 120s -> 30s and left every check at half weight (dev/changelog/1016).
+        'reference_minutes': 0.5,
         'instability_penalty_per_hr': 2.0,           # per restart/drop-per-hour, on top of proportional time-lost
         'health_score_test_fail_floor': 10,         # quality score for a FAILED test
         'health_score_warn_penalty': 10,            # any WARN on an otherwise-COMPLETED test
@@ -988,10 +1003,22 @@ def record_config_changes(old: dict, new: dict) -> list:
 
 
 def _deep_merge(base, override):
+    """`override` onto `base`, recursing into nested dicts.
+
+    A section header with nothing under it (`logo_cache:` on its own line) parses as None,
+    and means "I have set nothing here" - never "this whole section is null". Storing the
+    None is what a reader cannot survive: every one of them does
+    `cfg.get(section, {}).get(key)`, which raises on a None that is present, and one such
+    section 500'd the Settings page (dev/docs/BUGS.md 2026-09-17). The defaults stand
+    instead. A leaf whose own default is not a dict keeps taking the null, because there
+    `key:` with no value is a real choice - an empty logging.file means log to stdout.
+    """
     result = dict(base)
     for key, val in override.items():
         if key in result and isinstance(result[key], dict) and isinstance(val, dict):
             result[key] = _deep_merge(result[key], val)
+        elif val is None and isinstance(result.get(key), dict):
+            continue
         else:
             result[key] = val
     return result
@@ -1150,6 +1177,114 @@ def _cfg_m005_container_log_file(cfg: dict) -> dict:
     return cfg
 
 
+def _pop_config_path(cfg: dict, path: tuple):
+    """Remove the leaf at `path` from a config structure. Returns (present, value).
+
+    Two things a plain `parent.pop(key)` does not do on the round-trip structure, both of
+    which a config migration needs. The removed key's own comment goes with it, and a
+    parent map left empty by the removal goes too - a comment with no key under it is
+    dumped at the wrong indentation and a map emptied this way is dumped as `{}` in the
+    middle of a block, and ruamel cannot read back either (dev/docs/BUGS.md 2026-09-17).
+    """
+    parents = []
+    node = cfg
+    for key in path[:-1]:
+        if not isinstance(node, dict) or key not in node:
+            return False, None
+        parents.append((node, key))
+        node = node[key]
+    if not isinstance(node, dict) or path[-1] not in node:
+        return False, None
+    value = node.pop(path[-1])
+    _forget_comment(node, path[-1])
+    for parent, key in reversed(parents):
+        if parent[key]:
+            break
+        del parent[key]
+        _forget_comment(parent, key)
+    return True, value
+
+
+def _forget_comment(parent, key):
+    """Drop the round-trip comment attached to `key`, which no longer exists. A no-op on a
+    plain dict, which carries no comments at all."""
+    items = getattr(parent, 'ca', None)
+    if items is not None:
+        items.items.pop(key, None)
+
+
+# The three per-kind image folder keys recording.images_dir replaced, with the defaults they
+# shipped with (the container's seed config wrote the logo one out as a value, so it counts).
+_LEGACY_IMAGE_DIR_KEYS = (
+    (('channel_testing', 'screenshot_dir'), ('/dvr/channel_test_screenshots',)),
+    (('recording', 'live_thumbnail', 'dir'), ('/dvr/live_thumbnails',)),
+    (('recording', 'logo_cache', 'dir'), ('instance/logo-cache', '/config/instance/logo-cache')),
+)
+
+
+def _cfg_m006_one_images_dir(cfg: dict) -> dict:
+    """Thumbnails, screenshots and cached logos share one `recording.images_dir`, each in
+    its own subfolder - dev/changelog/1012.
+
+    A folder the user actually chose carries over as images_dir: the screenshot folder
+    first, because it was the only one of the three Settings ever showed, then the thumbnail
+    folder, then the logo folder. A value equal to its old default was never a choice and
+    carries nothing. Files already saved are not moved, and the warning names the folders
+    they are still in.
+    """
+    found = []
+    for path, defaults in _LEGACY_IMAGE_DIR_KEYS:
+        present, value = _pop_config_path(cfg, path)
+        if not present:
+            continue
+        found.append(('.'.join(path), value, bool(value) and value not in defaults))
+    if not found:
+        return cfg
+    chosen = next(((key, value) for key, value, is_choice in found if is_choice), None)
+    rec = cfg.get('recording')
+    if not isinstance(rec, dict):
+        rec = {}
+        cfg['recording'] = rec
+    if chosen and not rec.get('images_dir'):
+        rec['images_dir'] = chosen[1]
+    images_dir = rec.get('images_dir') or _DEFAULTS['recording']['images_dir']  # pre-merge dict
+    log.warning('config migration: %s replaced by recording.images_dir (%s)%s. New images go '
+                'to its thumbnails, screenshots and logos subfolders; files already saved '
+                'were not moved and stay in %s',
+                ', '.join(key for key, _, _ in found), images_dir,
+                f', carried over from {chosen[0]}' if chosen else '',
+                ', '.join(str(value) for _, value, _ in found if value))
+    return cfg
+
+
+def _cfg_m007_reference_minutes_follows_test_duration(cfg: dict) -> dict:
+    """`channel_testing.reference_minutes` 2 -> 0.5, so the full-weight observation length
+    is one default-length health check again - dev/changelog/1016.
+
+    The reference was set when a health check ran 120s. The test default became 30s, which
+    left every default check carrying sqrt(0.5/2) = half weight and halved the rate at which
+    the score responds to anything. It is a speed knob rather than a balance one - it divides
+    every observation's duration alike, so recordings speed up by the same factor and their
+    weight *relative* to a check is unchanged.
+
+    A stored 2 is the old default and was never a choice, so it is dropped and the new default
+    applies; any other stored value was deliberate and is left alone. Scores are not recomputed
+    and cannot be: app/health_recompute.py replays the weight each blend actually ran with, so
+    past observations keep theirs and channels drift onto the new scale as new checks land.
+    """
+    ct = cfg.get('channel_testing')
+    if not isinstance(ct, dict) or ct.get('reference_minutes') != 2:
+        return cfg
+    ct.pop('reference_minutes')
+    log.warning('config migration: channel_testing.reference_minutes dropped (was the old '
+                'default, 2) and now takes its new default of %s - one %ss health check is a '
+                'full-weight observation again. Every channel health score will move about '
+                'twice as fast per observation from here on; stored scores are unchanged',
+                _DEFAULTS['channel_testing']['reference_minutes'],
+                _DEFAULTS['channel_testing']['test_duration_seconds'])
+    return cfg
+
+
 CONFIG_MIGRATIONS = [
     (1, "rename legacy 'xtream' section to 'sync'", _cfg_m001_xtream_to_sync),
     (2, "channel_testing.failing_score_threshold -> failing_band", _cfg_m002_failing_band),
@@ -1159,6 +1294,10 @@ CONFIG_MIGRATIONS = [
      _cfg_m004_concat_progress_supervision),
     (5, 'containers with no logging.file get one, so the Logs page has a source',
      _cfg_m005_container_log_file),
+    (6, 'thumbnail, screenshot and logo folders -> one recording.images_dir',
+     _cfg_m006_one_images_dir),
+    (7, 'channel_testing.reference_minutes follows the 30s test duration',
+     _cfg_m007_reference_minutes_follows_test_duration),
 ]
 
 CURRENT_CONFIG_VERSION = CONFIG_MIGRATIONS[-1][0]
@@ -1304,6 +1443,36 @@ def _finish_replace(tmp_path, dest):
     _fsync_dir(os.path.dirname(dest) or '.')
 
 
+def _serialize_config(data) -> str:
+    """The exact text that will become config.yaml, proven to parse back before it is
+    installed.
+
+    A round-trip structure that has had keys removed can carry a comment with no key left
+    to hold it, and ruamel then dumps YAML it cannot itself read - which is a config.yaml
+    that loads on nobody's machine and an app that cannot start at all (dev/docs/BUGS.md
+    2026-09-17, config migration 6 on a container's commented seed file). The values are
+    what must survive, so an unreadable round-trip dump falls back to a plain one, losing
+    the file's comments and saying so in the log, rather than installing a file no reader
+    can load. A plain dump that still does not parse is not recoverable here and raises,
+    which leaves the existing config.yaml untouched - _write_config_file() only replaces
+    the file once this has returned."""
+    buf = io.StringIO()
+    _yaml_rt.dump(data, buf)
+    text = buf.getvalue()
+    try:
+        _yaml_rt.load(text)
+        return text
+    except YAMLError as exc:
+        log.warning('config.yaml could not be written with its comments intact (%s) - '
+                    'writing it without them so the file stays readable. Every setting is '
+                    'preserved; hand-written comments in it are lost', exc)
+    buf = io.StringIO()
+    _yaml_rt.dump(_to_plain(data), buf)
+    text = buf.getvalue()
+    _yaml_rt.load(text)
+    return text
+
+
 def _write_config_file(data):
     """THE writer of config.yaml - every path that rewrites the file goes through here or
     _replace_config_file_from() below (enforced by
@@ -1320,11 +1489,12 @@ def _write_config_file(data):
     `data` may be a ruamel CommentedMap (the round-trip structure, comments preserved) or
     a plain dict. Callers must hold config_write_lock across their whole read-merge-write.
     """
+    text = _serialize_config(data)
     dest = _write_target(_CONFIG_PATH)
     fd, tmp_path = _config_tmp_file(dest)
     try:
         with os.fdopen(fd, 'w') as f:
-            _yaml_rt.dump(data, f)
+            f.write(text)
             f.flush()
             os.fsync(f.fileno())
         _finish_replace(tmp_path, dest)
@@ -1488,6 +1658,7 @@ def _merge_into_yaml_map(base, new):
     for key in list(base.keys()):
         if key not in new:
             del base[key]
+            _forget_comment(base, key)
     return base
 
 

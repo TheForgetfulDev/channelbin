@@ -189,12 +189,13 @@ class AbortAndDeleteFilesTests(unittest.TestCase):
         # config.yaml named and errored outright when that directory did not exist, which
         # is how the clean-room run found it (dev/changelog/520).
         dvr_dir = os.path.join(self.t._tmpdir, 'incomplete')
-        thumb_dir = os.path.join(self.t._tmpdir, 'live_thumbnails')
+        images_dir = os.path.join(self.t._tmpdir, 'images')
+        thumb_dir = os.path.join(images_dir, 'thumbnails')
         os.makedirs(dvr_dir, exist_ok=True)
         os.makedirs(thumb_dir, exist_ok=True)
         cfg = load_config()
         cfg['recording']['dvr_output_dir'] = dvr_dir
-        cfg['recording']['live_thumbnail']['dir'] = thumb_dir
+        cfg['recording']['images_dir'] = images_dir
 
         rec = seed.make_recording(status='PAUSED', channel_id=self.ch.id)
         db.session.flush()
