@@ -5,7 +5,8 @@
 {#  Scheduled jobs (dev/changelog/446).
 
     Converted against the generic components - DESIGN.md 3.2 (.tbl inside a
-    .card, wrapped in .table-scroll), 3.4 (badge + left edge, never a row tint),
+    .card, wrapped in .table-scroll, opted into the .tbl-cards phone reflow -
+    every <td> therefore needs a data-label), 3.4 (badge + left edge, never a row tint),
     3.6 (row actions behind a kebab), 3.10 (one h1), 3.14 (empty state). No
     page-specific DESIGN.md section governs it.
 
@@ -33,6 +34,17 @@
    the cell background, so the hover still works underneath it. */
 .tbl tbody tr[data-overlap="red"] td:first-child { box-shadow: inset 3px 0 0 var(--bad); }
 .tbl tbody tr[data-overlap="yellow"] td:first-child { box-shadow: inset 3px 0 0 var(--warn); }
+
+/* Below 768 the row IS the card (.tbl-cards), so an edge on its first cell marks one line
+   of the card instead of the card. Moved onto the row, where the same inset shadow follows
+   the card's own border-radius around the corner - which is what the group page's member
+   cards need a clipped ::before bar to achieve. */
+@media (max-width: 768px) {
+  .tbl-cards tbody tr[data-overlap="red"] td:first-child { box-shadow: none; }
+  .tbl-cards tbody tr[data-overlap="yellow"] td:first-child { box-shadow: none; }
+  .tbl-cards tbody tr[data-overlap="red"] { box-shadow: inset 3px 0 0 var(--bad); }
+  .tbl-cards tbody tr[data-overlap="yellow"] { box-shadow: inset 3px 0 0 var(--warn); }
+}
 
 .jb-dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; flex: none; }
 .jb-dot.red { background: var(--bad); }
@@ -64,7 +76,7 @@
 <div class="card">
   <div class="card-head"><h2>Jobs <span class="cnt">{{ jobs | length }}</span></h2></div>
   <div class="card-body table-scroll">
-    <table class="tbl">
+    <table class="tbl tbl-cards">
       <thead>
         <tr>
           <th>Job</th>
@@ -77,14 +89,14 @@
       <tbody>
         {% for job in jobs %}
         <tr data-overlap="{{ job.overlap }}">
-          <td>
+          <td data-label="Job">
             <div class="jb-name">
               <span class="jb-dot {{ job.overlap }} tip-plain"
                     data-tip="{% if job.overlap == 'red' %}Overlaps another job&#10;This job runs at the same time as at least one other.{% elif job.overlap == 'yellow' %}Runs close to another job&#10;Another job starts within 5 minutes of this one.{% else %}No conflict&#10;Nothing else is scheduled near this job.{% endif %}"></span>
               {{ job.display_name }}
             </div>
           </td>
-          <td>
+          <td data-label="Type">
             {# Every type gets its own branch - a new one added to _build_job_list
                must be named here rather than landing in a silent fallthrough. #}
             {% if job.type == 'recurring' %}{{ m.status_badge('b-sched', 'Recurring') }}
@@ -94,14 +106,14 @@
             {% else %}{{ m.status_badge('b-abort', job.type) }}
             {% endif %}
           </td>
-          <td>
+          <td data-label="Next run">
             <div class="mono">{{ job.next_run_et }}</div>
             <div class="jb-rel">{{ job.next_run_relative }}</div>
             {% if job.stop_run_et %}
             <div class="jb-stop">stops {{ job.stop_run_et }}</div>
             {% endif %}
           </td>
-          <td class="muted">
+          <td data-label="Schedule" class="muted">
             {{ job.schedule_description or '-' }}
             {% if job.get('duration_line') %}
             <div class="jb-rel">{{ job.duration_line }}</div>

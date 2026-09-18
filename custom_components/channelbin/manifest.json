@@ -4,8 +4,9 @@
   "codeowners": ["@TheForgetfulDev"],
   "config_flow": true,
   "documentation": "https://github.com/TheForgetfulDev/channelbin",
+  "issue_tracker": "https://github.com/TheForgetfulDev/channelbin/issues",
   "integration_type": "service",
   "iot_class": "local_polling",
   "requirements": [],
-  "version": "0.1.0"
+  "version": "0.11.0"
 }

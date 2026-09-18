@@ -190,6 +190,7 @@ def init_scheduler(app):
     schedule_check_window_jobs(app)
     schedule_logo_cache_job(app)
     schedule_index_janitor(app)
+    schedule_storage_dirs_check(app)
 
     # One-shot reconcile of every group's format state (auto-disable mismatched members /
     # re-enable conforming ones). Runs after migrations so schema-v6 columns exist.
@@ -2162,6 +2163,45 @@ def _index_janitor_job():
         succeeded = all(outcome['results'].values())
         record_job_run('search_index_janitor', started, datetime.utcnow(),
                        JOB_RUN_SUCCESS if succeeded else JOB_RUN_FAILED)
+
+
+_STORAGE_DIRS_INTERVAL_MINUTES = 5
+
+
+def schedule_storage_dirs_check(app):
+    """Register the storage-directory sweep, first tick shortly after startup.
+
+    Unlike the janitor it is deliberately re-armed at every start rather than left on its
+    old interval: a folder the process cannot write to is most often a fresh deploy's
+    ownership mistake, and the alert is worth most in the first minute, not five minutes
+    in. Off the startup thread because a stale network mount can hang a stat() for its
+    whole timeout (dev/changelog/1009)."""
+    _add_job(
+        func=_storage_dirs_job,
+        trigger='interval',
+        minutes=_STORAGE_DIRS_INTERVAL_MINUTES,
+        next_run_time=datetime.utcnow() + timedelta(seconds=10),
+        id='storage_dirs_check',
+        replace_existing=True,
+    )
+    log.info('Storage directory check scheduled every %d minutes',
+             _STORAGE_DIRS_INTERVAL_MINUTES)
+
+
+def _storage_dirs_job():
+    """Probe every configured write directory and raise or clear its standing alert
+    (app/storage_dirs.py). Without it, a folder only the DVR disk readout does not cover
+    stayed broken with nothing but one startup log line to say so.
+
+    Records no JobRun: every tick is a handful of stat() calls, and timing them would tell
+    the /jobs page nothing."""
+    with _app.app_context():
+        from .config import load_config
+        from .storage_dirs import sweep_write_dirs
+        try:
+            sweep_write_dirs(load_config(), _app.config.get('CAPTURE_LOG_DIR'))
+        except Exception:
+            log.exception('Storage directory check failed')
 
 
 def get_scheduler() -> BackgroundScheduler:

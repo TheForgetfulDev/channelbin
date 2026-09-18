@@ -35,7 +35,7 @@
 <div class="card">
   <div class="card-head"><h2>Tags <span class="cnt">{{ tags | length }}</span></h2></div>
   <div class="card-body table-scroll">
-    <table class="tbl">
+    <table class="tbl tbl-cards">
       <thead>
         <tr>
           <th>Name</th>
@@ -49,16 +49,16 @@
         <tr>
           {# The dot IS the Color column - a tag's color is how it appears everywhere else
              (the guide paints a dot of it), so a separate column would say it twice. #}
-          <td>
+          <td data-label="Name">
             <span class="color-dot" style="background: {{ tag.color }}"></span>
             <strong>{{ tag.name }}</strong>
           </td>
-          <td class="muted">
+          <td data-label="Match patterns" class="muted">
             {% for p in tag.patterns %}<code>{{ p.pattern }}</code>{% if not loop.last %} {% endif %}{% endfor %}
           </td>
           {# Named, not counted: "2 places" would make the user hunt for them. A tag is
              referenced by name, so deleting one silently changes what these render. #}
-          <td class="muted small">{{ usage.get(tag.name, []) | join(', ') or '-' }}</td>
+          <td data-label="Used in" class="muted small">{{ usage.get(tag.name, []) | join(', ') or '-' }}</td>
           <td style="text-align:right;">
             <span class="menu-wrap">
               <button class="btn btn-sm btn-icon" data-menu aria-label="More actions">&#8943;</button>

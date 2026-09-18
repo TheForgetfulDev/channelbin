@@ -106,6 +106,54 @@ def describe_dir_problem(path, probe: DirProbe) -> str:
     return f'{path} is unusable ({probe.outcome})'
 
 
+def _process_identity() -> str:
+    return f'uid {os.getuid()}, gid {os.getgid()}'
+
+
+def probe_writable_dir(path) -> DirProbe:
+    """Classify `path` as a directory this process can write into. Never raises.
+
+    probe_dir() answers "is it there"; a directory can be there and still refuse every
+    write, which is what a container running as a uid the host share does not know looks
+    like. PATH_OK here means files can be written: the directory exists and is writable,
+    or it is merely absent and its nearest existing ancestor would let it be created (every
+    writer creates its own directory on first use). PATH_DENIED carries the uid, because
+    "permission denied" without it leaves the reader guessing whose permission.
+    """
+    probe = probe_dir(path)
+    if probe.outcome == PATH_OK:
+        if os.access(path, os.W_OK | os.X_OK):
+            return probe
+        return DirProbe(PATH_DENIED, errno.EACCES,
+                        f'it exists, but is not writable by {_process_identity()}')
+    if probe.outcome != PATH_MISSING:
+        return probe
+    ancestor = os.path.dirname(os.path.abspath(path))
+    while True:
+        parent_probe = probe_dir(ancestor)
+        if parent_probe.outcome == PATH_OK:
+            if os.access(ancestor, os.W_OK | os.X_OK):
+                return DirProbe(PATH_OK, None, None)
+            return DirProbe(PATH_DENIED, errno.EACCES,
+                            f'it does not exist, and {ancestor} is not writable by '
+                            f'{_process_identity()} to create it')
+        if parent_probe.outcome == PATH_MISSING:
+            parent = os.path.dirname(ancestor)
+            if parent == ancestor:
+                return probe
+            ancestor = parent
+            continue
+        if parent_probe.outcome == PATH_UNREACHABLE:
+            return parent_probe
+        if parent_probe.outcome == PATH_DENIED:
+            return DirProbe(PATH_DENIED, parent_probe.errno,
+                            f'it does not exist, and {ancestor} is not accessible to create it')
+        if parent_probe.outcome == PATH_NOT_A_DIR:
+            return DirProbe(PATH_MISSING, None,
+                            f'it cannot be created: {ancestor} is a file')
+        return parent_probe
+
+
 def ensure_dir(path) -> DirProbe:
     """Return an OK probe for a usable directory, creating it if it is merely missing.
 

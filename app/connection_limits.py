@@ -22,8 +22,15 @@ log = logging.getLogger(__name__)
 
 _lock = threading.Lock()
 # account_id -> list of (holder_kind, holder_id) currently holding a slot.
-# holder_kind: 'recording' | 'test'
+# holder_kind: 'recording' | 'test' | 'preview'
 _holders: dict = defaultdict(list)
+
+#: What a holder of each kind is called when a refusal names it to the user.
+HOLDER_LABELS = {
+    'recording': 'a recording',
+    'test': 'a channel test',
+    'preview': 'a live preview',
+}
 
 
 def _limit_for_account(account, default_max_connections: int) -> int:
@@ -122,6 +129,20 @@ def accounts_without_free_recording_slot(account_ids, exclude_holder=None) -> se
     return full
 
 
+def describe_holders(account_id: int) -> str:
+    """Prose naming what holds this account's slots right now, for a refusal message -
+    'a recording', 'a recording and a live preview'. Empty string when nothing does.
+    Advisory, like at_limit(): read under the lock, but stale the moment it returns."""
+    with _lock:
+        kinds = [h[0] for h in _holders.get(account_id, ())]
+    labels = [HOLDER_LABELS.get(k, k) for k in dict.fromkeys(kinds)]
+    if not labels:
+        return ''
+    if len(labels) == 1:
+        return labels[0]
+    return ', '.join(labels[:-1]) + ' and ' + labels[-1]
+
+
 def release(account_id: int, holder_kind: str, holder_id):
     with _lock:
         holders = _holders.get(account_id)
@@ -135,6 +156,18 @@ def release(account_id: int, holder_kind: str, holder_id):
             _holders.pop(account_id, None)
 
 
+def _strip_kind(account_id: int, holder_kind: str) -> List:
+    """Release every holder of one kind on account_id and return their holder_ids."""
+    with _lock:
+        holders = _holders.get(account_id, [])
+        stripped = [h for h in holders if h[0] == holder_kind]
+        for h in stripped:
+            holders.remove(h)
+        if not holders:
+            _holders.pop(account_id, None)
+        return [h[1] for h in stripped]
+
+
 def preempt_tests_for_slot(account_id: int) -> List[int]:
     """Release every 'test'-kind holder for account_id and return their holder_ids
     (channel_ids), so the caller (recorder.py, when a recording needs the slot a
@@ -144,11 +177,13 @@ def preempt_tests_for_slot(account_id: int) -> List[int]:
     another recording. Recordings always win over tests per product decision;
     this is the mechanism that enforces it.
     """
-    with _lock:
-        holders = _holders.get(account_id, [])
-        test_holders = [h for h in holders if h[0] == 'test']
-        for h in test_holders:
-            holders.remove(h)
-        if not holders:
-            _holders.pop(account_id, None)
-        return [h[1] for h in test_holders]
+    return _strip_kind(account_id, 'test')
+
+
+def preempt_previews_for_slot(account_id: int) -> List[str]:
+    """Release every 'preview'-kind holder for account_id and return their holder_ids
+    (preview session ids), so recorder.py can stop the preview's ffmpeg through
+    app/preview.py. Same doctrine as preempt_tests_for_slot, and the recorder asks this
+    one FIRST: a preview is a person looking, a test is a measurement feeding the health
+    score, so the look yields before the measurement does (dev/changelog/1018)."""
+    return _strip_kind(account_id, 'preview')

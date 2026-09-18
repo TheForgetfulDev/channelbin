@@ -443,11 +443,8 @@ def channel_tests_window_plan():
 
 @channel_tests_bp.route('/channel-tests/screenshots/<path:filename>')
 def serve_screenshot(filename):
-    cfg = load_config()
-    screenshot_dir = cfg.get('channel_testing', {}).get(
-        'screenshot_dir', '/dvr/channel_test_screenshots'
-    )
-    return send_from_directory(screenshot_dir, filename)
+    from ..storage_dirs import SCREENSHOTS, image_dir
+    return send_from_directory(image_dir(load_config(), SCREENSHOTS), filename)
 
 
 def job_channel_lists(job):

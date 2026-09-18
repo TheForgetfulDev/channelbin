@@ -220,10 +220,15 @@ class ContainerLogFileMigrationEndToEndTests(ConfigSandbox):
 
     def test_an_existing_container_config_is_rewritten_on_startup(self):
         import yaml as _yaml
-        from app.config import CONTAINER_LOG_FILE, CURRENT_CONFIG_VERSION
+        from app.config import (CONFIG_MIGRATIONS, CONTAINER_LOG_FILE,
+                                CURRENT_CONFIG_VERSION, _cfg_m005_container_log_file)
         # A config.yaml exactly as 0.9.1's entrypoint seeded it: stamped at the version
-        # before this migration, and carrying no logging.file at all.
-        self._write_cfg({'config_version': CURRENT_CONFIG_VERSION - 1,
+        # before this migration, and carrying no logging.file at all. Pinned to this
+        # migration's own version rather than CURRENT-1, which stops exercising it the
+        # moment a later migration is added.
+        before = next(v for v, _d, fn in CONFIG_MIGRATIONS
+                      if fn is _cfg_m005_container_log_file) - 1
+        self._write_cfg({'config_version': before,
                          'logging': {'level': 'INFO'},
                          'database': {'path': '/config/dvr.db'}})
         self._migrate()

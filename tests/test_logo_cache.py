@@ -77,8 +77,9 @@ class EligibilityTests(unittest.TestCase):
 
     def setUp(self):
         self.t = make_test_app()
-        self.cache_dir = os.path.join(self.t._tmpdir, 'logo-cache')
-        self.cfg = {'recording': {'logo_cache': {'enabled': True, 'dir': self.cache_dir}}}
+        self.cache_dir = os.path.join(self.t._tmpdir, 'images', 'logos')
+        self.cfg = {'recording': {'images_dir': os.path.dirname(self.cache_dir),
+                                  'logo_cache': {'enabled': True}}}
 
     def tearDown(self):
         self.t.cleanup()
@@ -123,8 +124,9 @@ class ChangeDetectionTests(unittest.TestCase):
 
     def setUp(self):
         self.t = make_test_app()
-        self.cache_dir = os.path.join(self.t._tmpdir, 'logo-cache')
-        self.cfg = {'recording': {'logo_cache': {'enabled': True, 'dir': self.cache_dir}}}
+        self.cache_dir = os.path.join(self.t._tmpdir, 'images', 'logos')
+        self.cfg = {'recording': {'images_dir': os.path.dirname(self.cache_dir),
+                                  'logo_cache': {'enabled': True}}}
 
     def tearDown(self):
         self.t.cleanup()
@@ -222,7 +224,7 @@ class DisabledConfigTests(unittest.TestCase):
         acct = seed.make_account()
         seed.make_channel(acct, logo_url='http://provider.test/a.png', in_guide=True)
         db.session.commit()
-        cfg = {'recording': {'logo_cache': {'enabled': False, 'dir': '/nonexistent'}}}
+        cfg = {'recording': {'images_dir': '/nonexistent', 'logo_cache': {'enabled': False}}}
         with mock.patch.object(logo_cache_mod, 'load_config', return_value=cfg), \
              mock.patch.object(logo_cache_mod.requests, 'get') as get_mock:
             attempted = run_logo_cache_batch(limit=50)
@@ -237,7 +239,7 @@ class SvgPurgeTests(unittest.TestCase):
 
     def setUp(self):
         self.t = make_test_app()
-        self.cache_dir = os.path.join(self.t._tmpdir, 'logo-cache')
+        self.cache_dir = os.path.join(self.t._tmpdir, 'images', 'logos')
         os.makedirs(self.cache_dir, exist_ok=True)
 
     def tearDown(self):
@@ -259,7 +261,8 @@ class SvgPurgeTests(unittest.TestCase):
         a bare 'nothing cached' state. The disabled-caching sibling test below covers the
         purge in isolation."""
         ch = self._seed_stale_svg()
-        cfg = {'recording': {'logo_cache': {'enabled': True, 'dir': self.cache_dir}}}
+        cfg = {'recording': {'images_dir': os.path.dirname(self.cache_dir),
+                             'logo_cache': {'enabled': True}}}
         with mock.patch.object(logo_cache_mod, 'load_config', return_value=cfg), \
              mock.patch.object(logo_cache_mod.requests, 'get', return_value=_fake_response()):
             run_logo_cache_batch(limit=50)
@@ -270,7 +273,8 @@ class SvgPurgeTests(unittest.TestCase):
 
     def test_stale_svg_is_purged_even_when_caching_is_disabled(self):
         ch = self._seed_stale_svg()
-        cfg = {'recording': {'logo_cache': {'enabled': False, 'dir': self.cache_dir}}}
+        cfg = {'recording': {'images_dir': os.path.dirname(self.cache_dir),
+                             'logo_cache': {'enabled': False}}}
         with mock.patch.object(logo_cache_mod, 'load_config', return_value=cfg), \
              mock.patch.object(logo_cache_mod.requests, 'get') as get_mock:
             attempted = run_logo_cache_batch(limit=50)
@@ -284,9 +288,10 @@ class SvgPurgeTests(unittest.TestCase):
 class ServingRouteTests(unittest.TestCase):
     def setUp(self):
         self.t = make_test_app()
-        self.cache_dir = os.path.join(self.t._tmpdir, 'logo-cache')
+        self.cache_dir = os.path.join(self.t._tmpdir, 'images', 'logos')
         os.makedirs(self.cache_dir, exist_ok=True)
-        self.cfg = {'recording': {'logo_cache': {'enabled': True, 'dir': self.cache_dir}}}
+        self.cfg = {'recording': {'images_dir': os.path.dirname(self.cache_dir),
+                                  'logo_cache': {'enabled': True}}}
 
     def tearDown(self):
         self.t.cleanup()
@@ -323,7 +328,7 @@ class TeardownTests(unittest.TestCase):
 
     def setUp(self):
         self.t = make_test_app()
-        self.cache_dir = os.path.join(self.t._tmpdir, 'logo-cache')
+        self.cache_dir = os.path.join(self.t._tmpdir, 'images', 'logos')
         os.makedirs(self.cache_dir, exist_ok=True)
 
     def tearDown(self):
@@ -341,7 +346,8 @@ class TeardownTests(unittest.TestCase):
         ch.logo_cache_path = cache_path
         db.session.commit()
 
-        cfg = {'recording': {'logo_cache': {'enabled': True, 'dir': self.cache_dir}}}
+        cfg = {'recording': {'images_dir': os.path.dirname(self.cache_dir),
+                             'logo_cache': {'enabled': True}}}
         with mock.patch.object(logo_cache_mod, 'load_config', return_value=cfg):
             _delete_account_and_jobs(acct.id)
 
@@ -359,9 +365,10 @@ class TeardownTests(unittest.TestCase):
 class DeleteCachedLogosTests(unittest.TestCase):
     def setUp(self):
         self.t = make_test_app()
-        self.cache_dir = os.path.join(self.t._tmpdir, 'logo-cache')
+        self.cache_dir = os.path.join(self.t._tmpdir, 'images', 'logos')
         os.makedirs(self.cache_dir, exist_ok=True)
-        self.cfg = {'recording': {'logo_cache': {'enabled': True, 'dir': self.cache_dir}}}
+        self.cfg = {'recording': {'images_dir': os.path.dirname(self.cache_dir),
+                                  'logo_cache': {'enabled': True}}}
 
     def tearDown(self):
         self.t.cleanup()

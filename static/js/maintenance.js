@@ -404,7 +404,7 @@
           srow('Files', d.dvr_file_count === null || d.dvr_file_count === undefined
             ? DASH : d.dvr_file_count.toLocaleString()),
           srow('Database', bytesOrDash(d.db_bytes)),
-          srow('Screenshots', bytesOrDash(d.screenshot_bytes)),
+          srow('Images', bytesOrDash(d.images_bytes)),
           srow('Config backups', bytesOrDash(d.backup_bytes)),
         ];
         if (d.disk_free !== null && d.disk_free !== undefined) {
@@ -416,6 +416,8 @@
         const paths = [];
         if (d.dvr_dir) paths.push(`<div class="srow wide"><span class="sk">Recordings directory</span>
           <span class="sv">${escHtml(d.dvr_dir)}</span></div>`);
+        if (d.images_dir) paths.push(`<div class="srow wide"><span class="sk">Images directory</span>
+          <span class="sv">${escHtml(d.images_dir)}</span></div>`);
         if (d.db_path) paths.push(`<div class="srow wide"><span class="sk">Database path</span>
           <span class="sv">${escHtml(d.db_path)}</span></div>`);
         storageEl.innerHTML = diskMeterHtml(d) +

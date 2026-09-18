@@ -127,11 +127,11 @@ function ruleRowHtml(r) {
     ? `<button class="menu-item danger" data-act="delete-rule" data-id="${r.id}">Delete rule</button>`
     : `<button class="menu-item" data-act="edit-rule" data-id="${r.id}">Edit</button><div class="sep"></div><button class="menu-item danger" data-act="delete-rule" data-id="${r.id}">Delete rule</button>`;
   return `<tr class="${r.enabled ? '' : 'rule-disabled-row'}" data-rule-id="${r.id}">
-    <td><span class="rule-target-badge t-${r.target}">${escHtml(CFG.targetLabels[r.target] || r.target)}</span></td>
-    <td class="rule-pattern">${escHtml(r.pattern)}</td>
-    <td><span class="rule-scope-badge">${escHtml(accountLabel(r.account_id))}</span></td>
-    <td class="num"><span class="rule-match-n" data-tip="${nf(r.match_count)} of ${nf(scopeTotal)} channels in scope">${nf(r.match_count)}</span>${deferredHtml}</td>
-    <td><label class="switch" data-tip="${r.enabled ? 'On - this rule is being applied' : 'Off - kept for later, not applied right now'}"><input type="checkbox" ${r.enabled ? 'checked' : ''} data-act="toggle-rule" data-id="${r.id}"><span class="knob"></span></label></td>
+    <td data-label="Type"><span class="rule-target-badge t-${r.target}">${escHtml(CFG.targetLabels[r.target] || r.target)}</span></td>
+    <td data-label="Pattern" class="rule-pattern">${escHtml(r.pattern)}</td>
+    <td data-label="Account"><span class="rule-scope-badge">${escHtml(accountLabel(r.account_id))}</span></td>
+    <td data-label="Matches" class="num"><span class="rule-match-n" data-tip="${nf(r.match_count)} of ${nf(scopeTotal)} channels in scope">${nf(r.match_count)}</span>${deferredHtml}</td>
+    <td data-label="On"><label class="switch" data-tip="${r.enabled ? 'On - this rule is being applied' : 'Off - kept for later, not applied right now'}"><input type="checkbox" ${r.enabled ? 'checked' : ''} data-act="toggle-rule" data-id="${r.id}"><span class="knob"></span></label></td>
     <td style="text-align:right"><span class="menu-wrap"><button class="btn btn-sm btn-icon" data-menu aria-label="More actions for this rule">&#8943;</button><div class="menu pop-left">${menuItems}</div></span></td>
   </tr>`;
 }
@@ -139,7 +139,10 @@ function ruleRowHtml(r) {
 function ruleTableHtml(rows, emptyText) {
   if (!rows.length) return `<div class="rules-empty">${emptyText}</div>`;
   const sorted = sortBy(rows, RULE_SORT_KEYS[ruleSort.col] || RULE_SORT_KEYS.target, ruleSort.dir);
-  return `<div class="table-scroll"><table class="tbl">
+  // The rules table opts into the phone card reflow; the category picker and the preview
+  // table below do not - both live inside a modal, already constrained by the sheet.
+  // Every <td> in ruleRowHtml therefore carries a data-label (style.css, `.tbl-cards`).
+  return `<div class="table-scroll"><table class="tbl tbl-cards">
     <thead><tr>
       ${sortTh('target', 'Type', ruleSort)}
       ${sortTh('pattern', 'Pattern', ruleSort)}

@@ -349,6 +349,7 @@ def _build_job_list():
         'logo_cache_fetch': ('Logo Cache Fetch', '/settings?q=logo_cache'),
         'search_index_janitor': ('Search Index Janitor',
                                  '/settings?q=index_janitor_grace_minutes'),
+        'storage_dirs_check': ('Storage Folder Check', '/maintenance'),
         # Never a job id of its own - only ever seen as `channel_hide_materialize_retry`,
         # the one-shot queued when a hide-rule pass was refused. Named here so the retry
         # branch below renders it as "Hide Rules retry" rather than a raw job id
@@ -389,6 +390,11 @@ def _build_job_list():
             'Search Index Janitor rebuilds a search index that has been unusable for longer '
             'than its grace window with nothing else repairing it. To rebuild right now, use '
             'Maintenance -> Search index -> Rebuild now.'
+        ),
+        'storage_dirs_check': (
+            'Storage Folder Check makes sure every folder ChannelBin writes to is still '
+            'there and writable, and raises or clears an alert for each one. The same '
+            'answer is in the Readiness check on Maintenance.'
         ),
     }
 

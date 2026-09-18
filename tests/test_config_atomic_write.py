@@ -470,3 +470,80 @@ class SymlinkedConfigWriteTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class WrittenConfigMustParseBackTests(unittest.TestCase):
+    """The file installed must be one the app can read on its next start.
+
+    dev/docs/BUGS.md 2026-09-17: config migration 6 removed the only key from a commented
+    block in a container's config.yaml, and ruamel dumped the leftover comment followed by
+    `{}` at column 0 - YAML it cannot itself parse. Every start after that died in
+    load_config() before create_app() had built anything, so the container crash-looped
+    with no way in.
+    """
+
+    COMMENTED = (
+        'recording:\n'
+        '  dvr_output_dir: /dvr\n'
+        '  logo_cache:\n'
+        '    # why this folder is where it is\n'
+        '    dir: /config/instance/logo-cache\n'
+        'database:\n'
+        '  path: /config/dvr.db\n'
+    )
+
+    def _orphaned(self):
+        """The round-trip structure exactly as the defect produced it: the commented
+        block's only key popped with a plain pop, so the comment has nothing to attach to
+        and the map is empty."""
+        with cfgmod.config_write_lock:
+            raw = cfgmod._yaml_rt.load(self.COMMENTED)
+        raw['recording']['logo_cache'].pop('dir')
+        return raw
+
+    def test_the_shape_that_broke_it_really_does_dump_unparseable_yaml(self):
+        """Without this the test below proves nothing - it would be asserting that valid
+        YAML stays valid."""
+        import io
+        buf = io.StringIO()
+        with cfgmod.config_write_lock:
+            cfgmod._yaml_rt.dump(self._orphaned(), buf)
+            with self.assertRaises(Exception):
+                cfgmod._yaml_rt.load(buf.getvalue())
+
+    def test_an_unreadable_round_trip_dump_falls_back_to_a_plain_one(self):
+        with cfgmod.config_write_lock:
+            with self.assertLogs('app.config', level='WARNING') as logs:
+                text = cfgmod._serialize_config(self._orphaned())
+            back = cfgmod._yaml_rt.load(text)
+        self.assertEqual(back['recording']['dvr_output_dir'], '/dvr',
+                         'the fallback dropped a setting, not just the comments')
+        self.assertEqual(back['database']['path'], '/config/dvr.db')
+        self.assertIn('without them so the file stays readable', '\n'.join(logs.output))
+
+    def test_an_ordinary_file_keeps_its_comments(self):
+        with cfgmod.config_write_lock:
+            raw = cfgmod._yaml_rt.load(self.COMMENTED)
+            text = cfgmod._serialize_config(raw)
+        self.assertIn('# why this folder is where it is', text,
+                      'the guard re-serialized a file that was fine, losing its comments')
+
+    def test_popping_a_key_takes_its_comment_and_its_emptied_parent(self):
+        with cfgmod.config_write_lock:
+            raw = cfgmod._yaml_rt.load(self.COMMENTED)
+            present, value = cfgmod._pop_config_path(raw, ('recording', 'logo_cache', 'dir'))
+            text = cfgmod._serialize_config(raw)
+            back = cfgmod._yaml_rt.load(text)
+        self.assertTrue(present)
+        self.assertEqual(value, '/config/instance/logo-cache')
+        self.assertNotIn('logo_cache', back['recording'],
+                         'a map left empty by the removal must go with it')
+        self.assertNotIn('why this folder is where it is', text,
+                         'the comment outlived the key it described')
+        self.assertEqual(back['recording']['dvr_output_dir'], '/dvr')
+
+    def test_a_missing_path_is_reported_not_invented(self):
+        with cfgmod.config_write_lock:
+            raw = cfgmod._yaml_rt.load(self.COMMENTED)
+        self.assertEqual(cfgmod._pop_config_path(raw, ('recording', 'nope')), (False, None))
+        self.assertEqual(cfgmod._pop_config_path(raw, ('nope', 'deeper')), (False, None))

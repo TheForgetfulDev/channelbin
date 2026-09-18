@@ -24,6 +24,7 @@ from typing import List, Optional
 from . import admission
 from .config import config_default
 from .proc_utils import GrowthMonitor, terminate_or_kill, wait_for_file_data
+from .storage_dirs import SCREENSHOTS, image_dir
 from .toolchain import ffprobe_missing
 from .url_utils import mask_creds, mask_creds_in_text
 
@@ -1243,7 +1244,7 @@ def _run_channel_test_inner(app, channel_id: int, job_id: Optional[int] = None,
         settings = resolve_health_check_settings(ct_cfg, job.profile if job else None)
         duration = settings['test_duration_seconds']
         screenshots_enabled = settings['screenshots_enabled']
-        screenshot_dir = ct_cfg.get('screenshot_dir', '/dvr/channel_test_screenshots')
+        screenshot_dir = image_dir(cfg, SCREENSHOTS)
         keep_screenshots = ct_cfg.get('screenshots_keep_count', 5)
         keep_history = ct_cfg.get('test_history_keep', 0)
         connect_retries = settings['connect_retries']
@@ -1635,6 +1636,12 @@ def _run_channel_test_inner(app, channel_id: int, job_id: Optional[int] = None,
             if screenshots_enabled and connected and bytes_received > 0:
                 shot_name = f'ch_{channel_id}_{test_started.strftime("%Y%m%d_%H%M%S")}.jpg'
                 shot_path = os.path.join(screenshot_dir, shot_name)
+                # images_dir can change in Settings without a restart, so the folder the
+                # startup pass created may not be this one.
+                try:
+                    os.makedirs(screenshot_dir, exist_ok=True)
+                except OSError as exc:
+                    _append_log('WARN', f'Cannot create screenshot directory {screenshot_dir}: {exc}')
                 shot_ok, color_warn, recaptured = _capture_screenshot_with_recapture(
                     tmp_path, shot_path, ffmpeg_path, probe, actual_duration)
                 if shot_ok:

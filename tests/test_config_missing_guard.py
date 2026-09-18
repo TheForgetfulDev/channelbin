@@ -73,3 +73,44 @@ class ConfigFileMissingGuardTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)
+
+
+class EmptySectionKeepsItsDefaultsTests(unittest.TestCase):
+    """`logo_cache:` with nothing under it is "I set nothing here", not a null section.
+
+    dev/docs/BUGS.md 2026-09-17: such a section reached load_config() as None, and
+    /settings 500'd on `rec.get('logo_cache', {}).get('enabled')` - the `.get` default
+    never fires for a key that is present, so every reader of that shape breaks at once.
+    """
+
+    def setUp(self):
+        self.t = make_test_app()
+        self.t.app.config['WTF_CSRF_ENABLED'] = False
+        self.t.sandbox_config({'recording': {'dvr_output_dir': '/dvr', 'logo_cache': None,
+                                             'live_thumbnail': None},
+                               'channel_testing': None,
+                               'logging': {'file': None}})
+
+    def tearDown(self):
+        self.t.cleanup()
+
+    def test_the_section_reads_as_its_defaults(self):
+        from app.config import _DEFAULTS, load_config
+        cfg = load_config()
+        self.assertEqual(cfg['recording']['logo_cache'],
+                         _DEFAULTS['recording']['logo_cache'])
+        self.assertEqual(cfg['recording']['live_thumbnail'],
+                         _DEFAULTS['recording']['live_thumbnail'])
+        self.assertEqual(cfg['channel_testing'], _DEFAULTS['channel_testing'])
+        self.assertEqual(cfg['recording']['dvr_output_dir'], '/dvr',
+                         'a value set beside an empty section was dropped')
+
+    def test_an_empty_leaf_is_still_a_real_choice(self):
+        """Only a section gets the defaults back. `logging.file:` with no value means log
+        to stdout, and overriding that would re-impose a file nobody asked for."""
+        from app.config import load_config
+        self.assertIsNone(load_config()['logging']['file'])
+
+    def test_the_settings_page_still_renders(self):
+        resp = self.t.client.get('/settings')
+        self.assertEqual(resp.status_code, 200)

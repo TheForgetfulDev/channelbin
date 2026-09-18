@@ -219,9 +219,8 @@ def recording_disk_paths(recording_id: int) -> list:
     for seg in RecordingSegment.query.filter_by(recording_id=recording_id).all():
         if seg.file_path:
             paths.append(seg.file_path)
-    thumb_cfg = cfg.get('recording', {}).get('live_thumbnail', {})
-    paths.append(os.path.join(
-        thumb_cfg.get('dir', '/dvr/live_thumbnails'), f'{recording_id}.jpg'))
+    from .storage_dirs import THUMBNAILS, image_dir
+    paths.append(os.path.join(image_dir(cfg, THUMBNAILS), f'{recording_id}.jpg'))
     return paths
 
 
@@ -248,7 +247,8 @@ def persist_final_thumbnail(recording_id: int):
             break
     if seg is None:
         return
-    thumb_dir = thumb_cfg.get('dir', '/dvr/live_thumbnails')
+    from .storage_dirs import THUMBNAILS, image_dir
+    thumb_dir = image_dir(cfg, THUMBNAILS)
     try:
         os.makedirs(thumb_dir, exist_ok=True)
     except OSError as exc:
@@ -1913,6 +1913,15 @@ def _try_acquire_slot_with_preemption(app, recording_id: int, account_id: int) -
     from . import connection_limits as connlim
     if connlim.try_acquire(account_id, 'recording', recording_id):
         return True
+    # A live preview yields first: someone looking at a channel is worth less than a
+    # measurement feeding its health score, and far less than the recording itself.
+    if connlim.preempt_previews_for_slot(account_id):
+        from . import preview
+        preview.preempt_for_account(account_id)
+        log.warning('Recording %d: preempted a live preview on account %d',
+                    recording_id, account_id)
+        if connlim.try_acquire(account_id, 'recording', recording_id):
+            return True
     preempted = connlim.preempt_tests_for_slot(account_id)
     for _channel_id in preempted:
         from . import channel_tester

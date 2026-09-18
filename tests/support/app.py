@@ -12,7 +12,10 @@ single, safe app-building path. Guarantees:
   * the ERROR+ alert-log handler stripped so tests don't spawn Alert rows or stack handlers
     across repeated make_test_app() calls,
   * app/'s process-global mutable state reset (see reset_module_globals) so the previous
-    test module cannot decide this one's assertions.
+    test module cannot decide this one's assertions,
+  * background work stopped and drained before the test ends (see
+    _teardown_background_work) so a live recording, channel-test run or scheduler job
+    cannot spill its side effects into a later, unrelated test.
 
 The schema is copied from a per-process template DB rather than rebuilt (see
 `_template_db_path`), which is why this is ~130ms per app and not ~340ms. Pass
@@ -41,6 +44,7 @@ import shutil
 import sys
 import tempfile
 import threading
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
@@ -195,6 +199,119 @@ def write_sandbox_config(path, data):
         cfgmod._yaml_cache = None
 
 
+# Ceiling for "work that was in flight when its test ended is genuinely stuck", not an
+# expected wait. A tester loop checks stop_requested every second at worst
+# (channel_tester._interruptible_sleep) and an APScheduler job body is shorter than that,
+# so the normal cost of both drains below is microseconds.
+_TEARDOWN_DRAIN_SECONDS = 10.0
+
+
+def stop_channel_tester_run(timeout=None):
+    """Stop a channel-test run that is still going and wait for it to unwind.
+
+    Returns None when nothing was running, or a description of what was found - the
+    caller decides whether that is worth failing over.
+
+    A run that stops cleanly is still reported. Stopping it fixes the damage (nothing of
+    it reaches the next test) but says nothing about the test that leaked it, and the
+    leak was always cheap to fix once you knew which test it was: every recorded instance
+    cost a re-run and a blind hunt through a shard log instead. So teardown repairs the
+    state and names the culprit, rather than quietly repairing it forever.
+
+    A tester run does not own its thread: it is started on an APScheduler worker
+    (scheduler._on_demand_job_trigger, _precheck_job), on a named daemon thread from a
+    route or the window dispatcher, or on an unnamed one from startup reconciliation. So
+    this waits on the run's own state rather than trying to find a thread to join, which
+    covers every one of those callers and any later one for free.
+
+    Why teardown has to do this at all: _run_channel_loop tests a channel, sleeps
+    wait_sec, tests the next. A run that outlives its test therefore keeps spawning ffmpeg
+    at the seeded stream URL every few seconds, and netguard blames whichever test happens
+    to be draining when one fires - a real leak reported against an innocent module
+    (dev/docs/BUGS.md 2026-09-17 @ 05:17:19 PM ET, dev/changelog/1015).
+    """
+    import app.channel_tester as channel_tester
+    from app.proc_utils import terminate_or_kill
+
+    # Read at call time, not bound as a default, so a test about the stuck-work branch can
+    # shorten it without waiting out the real ceiling.
+    timeout = _TEARDOWN_DRAIN_SECONDS if timeout is None else timeout
+
+    with channel_tester._lock:
+        # is_running alone is the wrong signal: several tests set that flag by hand as a
+        # display fixture, with no thread behind it and nothing that will ever clear it
+        # (test_dashboard_nav_count, test_tester_preemption). Waiting on one of those would
+        # burn the whole timeout and then fail an innocent test - the exact mistake this
+        # helper exists to stop. run_started_at is stamped only by _reset_run_state(), which
+        # is the one way a real run begins, so it separates a run in flight from a flag.
+        state = channel_tester._state
+        if not (state.is_running and state.run_started_at is not None):
+            return None
+        proc = state.active_test_proc
+        # Snapshotted before the stop: RunState.clear() blanks the channel and phase, so
+        # reading them afterwards describes every leak as an idle run on no channel.
+        found = (f'a channel-test run (kind={state.run_kind!r}, '
+                 f'job_id={state.current_job_id}, phase={state.current_phase!r}, '
+                 f'channel={state.current_channel_name!r}, '
+                 f'{state.completed_channels}/{state.total_channels} done)')
+
+    channel_tester.request_stop()
+    # The loop only re-checks stop_requested between connection attempts, so a run parked
+    # in ffmpeg's own wait would sit out the whole timeout. Killing the child is what makes
+    # the stop prompt rather than eventual.
+    if proc is not None:
+        try:
+            terminate_or_kill(proc, hard=True)
+        except OSError:
+            pass  # already reaped; nothing to kill
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not channel_tester.is_running():
+            return f'{found} was still going when its test ended; teardown stopped it'
+        time.sleep(0.02)
+    return f'{found} did not stop within {timeout:g}s of request_stop()'
+
+
+def stop_preview_sessions():
+    """Stop a live channel preview and wait for its reaper thread to exit.
+
+    Same contract as stop_channel_tester_run(): None when nothing was live, otherwise a
+    description so the test that leaked it fails by name. A preview's ffmpeg holds a
+    connection slot and re-reads its source until stopped, so one left running spawns
+    into the next test exactly the way a leaked tester run does (dev/changelog/1018).
+    """
+    import app.preview as preview
+
+    session = preview.live_session()
+    if session is None:
+        preview.wait_for_reaper(_TEARDOWN_DRAIN_SECONDS)
+        return None
+    found = (f'a live channel preview (session={session.id}, channel={session.channel_name!r}, '
+             f'state={session.state})')
+    preview.stop_all(preview.REASON_SHUTDOWN)
+    if not preview.wait_for_reaper(_TEARDOWN_DRAIN_SECONDS):
+        return f'{found} was still going when its test ended and its reaper did not exit'
+    return f'{found} was still going when its test ended; teardown stopped it'
+
+
+def _assert_nothing_outlived_the_test(leftovers):
+    """Fail the test that leaked background work, rather than cleaning up quietly.
+
+    Same argument as netguard's drain, one layer up: teardown could stop this work and say
+    nothing, and the suite would stay green while a test kept handing its work to the next
+    one. The failure lands on the test that started it, which is the whole point - every
+    recorded instance of this leak was reported against an innocent module instead
+    (dev/docs/BUGS.md 2026-09-17 @ 05:17:19 PM ET, dev/changelog/1015).
+    """
+    if not leftovers:
+        return
+    raise AssertionError(
+        'background work outlived this test and had to be stopped in teardown '
+        '(see CLAUDE.md §Testing - tests must not leak live recordings or threads):\n\n'
+        + '\n\n'.join(leftovers))
+
+
 def reset_module_globals():
     """Return app/'s process-global mutable state to its pristine value.
 
@@ -221,6 +338,7 @@ def reset_module_globals():
     import app.config as config
     import app.fs_utils as fs_utils
     import app.postprocessor as postprocessor
+    import app.preview as preview
     import app.probe as probe
     import app.readiness as readiness
     import app.routes.channel_search as channel_search_routes
@@ -230,8 +348,17 @@ def reset_module_globals():
     # sync or maintenance job is then refused by a blocker that no longer exists.
     admission.reset_for_tests()
     # A health-check run left mid-flight reports is_running() True forever after, so the
-    # next module's job rows read RUNNING instead of SCHEDULED.
+    # next module's job rows read RUNNING instead of SCHEDULED. Stopped before the swap,
+    # never just swapped out from under: _run_channel_loop re-reads the module global on
+    # every iteration, so a fresh RunState hands a still-running loop stop_requested=False
+    # and makes it unstoppable for the rest of the process while hiding it from
+    # is_running() (dev/changelog/1015).
+    stop_channel_tester_run()
     channel_tester._state = channel_tester.RunState()
+    # A preview left live holds a connection slot on an account id the next module's
+    # seed will reuse, so its first recording or test is refused at the limit. Stopped
+    # (ffmpeg killed, slot released) and forgotten, never just cleared.
+    preview.reset_for_tests()
     # rebuild_in_progress() True makes the dashboard's background-activity indicator read
     # 'active' when the next module expects 'hidden'.
     search_index._rebuilding = False
@@ -350,13 +477,12 @@ class TestApp:
         self._tmpdir = tempfile.mkdtemp(prefix='dvr_test_')
         self.db_path = os.path.join(self._tmpdir, 'dvr.db')
         dvr_dir = os.path.join(self._tmpdir, 'dvr')
-        thumb_dir = os.path.join(self._tmpdir, 'thumbnails')
-        shot_dir = os.path.join(self._tmpdir, 'screenshots')
+        images_dir = os.path.join(self._tmpdir, 'images')
         # Capture stderr spools (dev/changelog/430). Sandboxed like every other output dir:
         # its default is app-root-relative, so without this override a test that reaches
         # _launch_segment would spool into the real repo.
         cap_log_dir = os.path.join(self._tmpdir, 'capture-logs')
-        for d in (dvr_dir, thumb_dir, shot_dir, cap_log_dir):
+        for d in (dvr_dir, images_dir, cap_log_dir):
             os.makedirs(d, exist_ok=True)
 
         overrides = {
@@ -370,9 +496,8 @@ class TestApp:
             'recording': {
                 'dvr_output_dir': dvr_dir,
                 'capture_log_dir': cap_log_dir,
-                'live_thumbnail': {'dir': thumb_dir},
+                'images_dir': images_dir,
             },
-            'channel_testing': {'screenshot_dir': shot_dir},
             'config_backup': {'backup_dir': os.path.join(self._tmpdir, 'config-backups')},
             'logging': {'file': os.path.join(self._tmpdir, 'test.log')},
             # No real webhooks ever fire from a test.
@@ -482,8 +607,12 @@ class TestApp:
                 from .notifyguard import cancel_pending
                 cancel_pending()
             finally:
+                # Bound before the try: the finally chain below reads it, so a raise inside
+                # _teardown_background_work() would otherwise surface as a NameError that
+                # hides whatever actually went wrong.
+                leftovers = []
                 try:
-                    self._shutdown_scheduler()
+                    leftovers = self._teardown_background_work()
                 finally:
                     try:
                         self.ctx.pop()
@@ -497,6 +626,28 @@ class TestApp:
                                 if os.path.exists(self._cfg_path):
                                     os.remove(self._cfg_path)
                             self._assert_no_network_attempts()
+                            _assert_nothing_outlived_the_test(leftovers)
+
+    def _teardown_background_work(self):
+        """Stop the scheduler, stop any channel-test run, then wait for both to unwind.
+
+        Returns the list of things still alive afterwards (normally empty).
+
+        The order is the whole point. Stopping dispatch first means no NEW job can start
+        while we are draining. Asking the tester to stop before waiting on the pool is what
+        keeps that wait short: a health check run is minutes long by design, so draining a
+        worker that is in the middle of one without asking it to stop first would hang the
+        suite rather than fix it.
+
+        Draining before _assert_no_network_attempts() is the fix for the leak this whole
+        path exists for: work that was in flight now finishes inside its OWN test, so a
+        blocked ffmpeg spawn is recorded against the test that started it instead of
+        against whoever happens to be tearing down when it fires.
+        """
+        scheduler = self._stop_scheduler_dispatch()
+        return [msg for msg in (stop_channel_tester_run(),
+                                stop_preview_sessions(),
+                                self._drain_scheduler_jobs(scheduler)) if msg]
 
     @staticmethod
     def _assert_no_network_attempts():
@@ -553,23 +704,69 @@ class TestApp:
             if getattr(state, 'launch_retry', None) is not None:
                 state.launch_retry.join(timeout=5)
 
-    def _shutdown_scheduler(self):
+    def _stop_scheduler_dispatch(self):
         """Stop the BackgroundScheduler this TestApp started and clear the module globals.
 
         Without this each start_scheduler=True setUp leaks a live scheduler thread that
         keeps polling a jobstore whose DB file is about to be deleted, and leaves
         app.scheduler._scheduler/_app pointing at a torn-down app for the next test.
+
+        Returns the scheduler so cleanup() can drain its worker pool afterwards, or None.
+        shutdown(wait=False) stops the dispatch loop and joins its thread but deliberately
+        does NOT wait on jobs already handed to a worker - draining those is a separate
+        step because a tester run has to be asked to stop first or the wait is unbounded.
         """
         if not self._started_scheduler:
-            return
+            return None
         import app.scheduler as sched
         from apscheduler.schedulers.base import SchedulerNotRunningError
+        scheduler = sched._scheduler
         try:
-            sched._scheduler.shutdown(wait=False)
+            scheduler.shutdown(wait=False)
         except (SchedulerNotRunningError, AttributeError):
             pass  # already stopped, or never got far enough to be assigned
         sched._scheduler = None
         sched._app = None
+        return scheduler
+
+    @staticmethod
+    def _drain_scheduler_jobs(scheduler, timeout=None):
+        """Wait for jobs already dispatched to the scheduler's worker pool to finish.
+
+        Returns None once the pool is idle, or a description of what is still running
+        after `timeout`.
+
+        Drains each executor rather than calling scheduler.shutdown(wait=True) a second
+        time: BaseScheduler.shutdown raises SchedulerNotRunningError once the state is
+        STOPPED, so a second call returns instantly and waits for nothing at all.
+        Executor.shutdown(True) is the real wait - it joins the underlying
+        concurrent.futures pool's threads, which are the ThreadPoolExecutor-N_M threads
+        netguard named in every recorded instance of this leak - and it is idempotent, so
+        running it after shutdown(wait=False) already shut the same pool down is safe.
+        scheduler._executors is private, which is why APScheduler is pinned <4.0
+        (CLAUDE.md §Environment); the alternative is joining threads by name, and a name
+        cannot say which pool a thread belongs to.
+
+        The join itself is bounded because Executor.shutdown(True) has no timeout of its
+        own - running it on a helper thread is what turns "wait forever" into "wait, then
+        say what is stuck".
+        """
+        if scheduler is None:
+            return None
+        timeout = _TEARDOWN_DRAIN_SECONDS if timeout is None else timeout
+
+        def _wait():
+            for executor in list(scheduler._executors.values()):
+                executor.shutdown(True)
+
+        drainer = threading.Thread(target=_wait, name='test-scheduler-drain', daemon=True)
+        drainer.start()
+        drainer.join(timeout)
+        if not drainer.is_alive():
+            return None
+        return (f'an APScheduler job was still running on a worker thread {timeout:.0f}s '
+                f'after the scheduler was shut down (live pool threads: '
+                f'{[t.name for t in threading.enumerate() if t.name.startswith("ThreadPoolExecutor-")]})')
 
 
 def make_test_app(extra_overrides=None, start_scheduler=False, fresh_schema=False):

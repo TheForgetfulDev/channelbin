@@ -70,6 +70,18 @@ NOT_RUN = 'not_run'
 #: client-side transient while a run is in flight and is never stored or returned.
 STATUSES = (READY, ATTENTION, PROBLEM, UNKNOWN, NOTHING, NOT_RUN)
 
+#: How each state is written in the report. duplicated from static/js/readiness.js::STATUS -
+#: the card needs its labels client-side for the `checking` transient the server never sends;
+#: tests/test_readiness.py::ReportTests fails when the two disagree.
+STATUS_LABELS = {
+    READY: 'Ready',
+    UNKNOWN: 'Could not check',
+    ATTENTION: 'Attention',
+    PROBLEM: 'Problem',
+    NOTHING: 'Nothing to check',
+    NOT_RUN: 'Not run yet',
+}
+
 #: How bad a state is, for picking a capability's own state and the verdict's color. -1
 #: means the state is not a verdict at all and never colors anything above it.
 STATUS_RANK = {
@@ -95,6 +107,10 @@ CAP_UNKNOWN = 'unknown'  # at least one could not be checked
 NOT_SET_UP = 'none'      # at least one has nothing to look at yet
 
 CAP_STATES = (CANNOT, DEGRADED, CAP_UNKNOWN, NOT_SET_UP, CAN)
+
+#: A capability's answer as the report writes it.
+CAP_REPORT_WORD = {CAN: 'YES', CANNOT: 'NO', DEGRADED: 'PARTLY', CAP_UNKNOWN: 'UNKNOWN',
+                   NOT_SET_UP: 'NOT SET UP'}
 
 #: The mark drawn on the capability row, and the left-edge color class `.grp-item` keys off.
 CAP_MARK = {CAN: '✓', CANNOT: '×', DEGRADED: '!', CAP_UNKNOWN: '?', NOT_SET_UP: '–'}
@@ -156,7 +172,7 @@ class Context:
     reaches neither the disk nor the database on its own.
     """
 
-    def __init__(self):
+    def __init__(self, pseudonymize=False):
         from flask import current_app
         from sqlalchemy import func
         from . import db
@@ -164,8 +180,10 @@ class Context:
         from .config import load_config
         from .database import (Account, Alert, Channel, ChannelGroup, ChannelTest,
                                ChannelGroupMember, EPGEntry)
-        from .fs_utils import filesystem_type, is_network_filesystem, probe_dir
+        from .fs_utils import (filesystem_type, is_network_filesystem, probe_dir,
+                               probe_writable_dir)
         from .search_index import readiness_map, SEARCH_INDEX_CHANNELS, SEARCH_INDEX_NAMES
+        from .storage_dirs import configured_write_dirs
         from .toolchain import describe_tools
         from .tz_utils import get_display_tz_name
         # _disk_bytes lives in the route module because the sidebar meter and the
@@ -175,6 +193,7 @@ class Context:
         # second spelling here would be a second answer to "is the DVR folder usable".
         from .routes.system import _disk_bytes, DVR_DIR_ROLE
 
+        self.pseudonymize = pseudonymize
         self.now = datetime.utcnow()
         self.cfg = load_config()
         rec_cfg = self.cfg['recording']
@@ -183,6 +202,14 @@ class Context:
         self.tools = describe_tools()
         self.dvr_dir = rec_cfg['dvr_output_dir']
         self.dvr_probe = probe_dir(self.dvr_dir)
+        self.dvr_write_probe = probe_writable_dir(self.dvr_dir)
+        # Probed here and never reported: the standing alerts belong to the disk readout and
+        # the storage_dirs_check job, and a page load moving an alert would be a third
+        # writer. A fixed handful of stat() calls, however many rows the install has.
+        self.write_dirs = [(path, role, probe_writable_dir(path))
+                           for path, role in configured_write_dirs(
+                               self.cfg, current_app.config.get('CAPTURE_LOG_DIR'))
+                           if path != self.dvr_dir]
         self.disk_total, self.disk_free = _disk_bytes(self.dvr_dir, DVR_DIR_ROLE)
 
         self.db_path = self.cfg['database']['path']
@@ -245,6 +272,17 @@ class Context:
                 .filter(Alert.dismissed_at.is_(None))
                 .group_by(Alert.severity).all())
         self.open_alerts = {sev: n for sev, n in rows}
+
+
+def _account_name(ctx, account):
+    """How a finding names an account. Every name a user chose goes through one of these
+    two, never `.name` directly: the support bundle evaluates with pseudonymize=True, and a
+    name written straight into a finding would ship verbatim (dev/changelog/1010)."""
+    return f'account {account.id}' if ctx.pseudonymize else account.name
+
+
+def _group_name(ctx, group):
+    return f'group {group.id}' if ctx.pseudonymize else group.name
 
 
 def _probe_db_write():
@@ -364,9 +402,26 @@ def _check_storage_dvr(ctx):
     tested = f'Probed the recording folder at {ctx.dvr_dir}'
     if ctx.dvr_probe.outcome != PATH_OK:
         return Result(PROBLEM, tested, describe_dir_problem(ctx.dvr_dir, ctx.dvr_probe))
-    if not os.access(ctx.dvr_dir, os.W_OK):
-        return Result(PROBLEM, tested, f'{ctx.dvr_dir} exists but this process may not write to it')
+    if ctx.dvr_write_probe.outcome != PATH_OK:
+        return Result(PROBLEM, tested, describe_dir_problem(ctx.dvr_dir, ctx.dvr_write_probe))
     return Result(READY, tested, f'{ctx.dvr_dir} is there and writable')
+
+
+def _check_storage_dirs(ctx):
+    from .fs_utils import PATH_OK, describe_dir_problem
+    tested = (f'Probed the {len(ctx.write_dirs)} other '
+              f'{_plural(len(ctx.write_dirs), "folder")} ChannelBin writes to for write access')
+    if not ctx.write_dirs:
+        return Result(NOTHING, tested, 'Nothing else is configured to be written')
+    bad = [(path, role, probe) for path, role, probe in ctx.write_dirs
+           if probe.outcome != PATH_OK]
+    if bad:
+        return Result(ATTENTION, tested,
+                      f'{len(bad)} of {len(ctx.write_dirs)} unusable: '
+                      + '; '.join(f'{role.what}: {describe_dir_problem(path, probe)}'
+                                  for path, role, probe in bad))
+    return Result(READY, tested,
+                  'All writable: ' + ', '.join(role.what for _p, role, _pr in ctx.write_dirs))
 
 
 def _check_storage_space(ctx):
@@ -470,7 +525,8 @@ def _check_account_login(ctx):
             XtreamClient(account.base_url, account.username, account.password,
                          timeout=timeout, cfg=ctx.cfg).check_auth()
         except Exception as exc:                          # noqa: BLE001 - reported, not swallowed
-            failures.append(f'{account.name}: {str(exc).strip().splitlines()[0]}')
+            failures.append(f'{_account_name(ctx, account)}: '
+                            f'{str(exc).strip().splitlines()[0]}')
     skipped = len(ctx.accounts) - len(xtream)
     tail = f' ({skipped} M3U {_plural(skipped, "account")} have no login step)' if skipped else ''
     if failures:
@@ -505,11 +561,12 @@ def _check_account_sync(ctx):
     if bad:
         return Result(PROBLEM, tested,
                       f'{len(bad)} of {len(ctx.accounts)} last failed to sync: '
-                      + ', '.join(a.name for a in bad), action)
+                      + ', '.join(_account_name(ctx, a) for a in bad), action)
     if never:
         return Result(PROBLEM, tested,
                       f'{len(never)} of {len(ctx.accounts)} {_plural(len(never), "has", "have")} '
-                      'never synced: ' + ', '.join(a.name for a in never), action)
+                      'never synced: ' + ', '.join(_account_name(ctx, a) for a in never),
+                      action)
     if worst_ratio > 2:
         return Result(PROBLEM, tested,
                       f'{len(overdue)} of {len(ctx.accounts)} {_plural(len(overdue), "is", "are")} '
@@ -517,7 +574,7 @@ def _check_account_sync(ctx):
     if overdue:
         account, age, interval = max(overdue, key=lambda row: row[1] / row[2])
         return Result(ATTENTION, tested,
-                      f'{account.name} last synced {int(round(age))} hours ago, '
+                      f'{_account_name(ctx, account)} last synced {int(round(age))} hours ago, '
                       f'on a {interval} hour interval', action)
     newest = max(a.last_sync_at for a in ctx.accounts)
     return Result(READY, tested, f'Every account is current, the oldest {_ago(newest, ctx.now)}')
@@ -554,7 +611,7 @@ def _check_guide_groups(ctx):
     if broken:
         return Result(PROBLEM, tested,
                       f'{len(broken)} of {ctx.guide_groups} {_plural(len(broken), "has", "have")} '
-                      'nobody switched on: ' + ', '.join(g.name for g in broken))
+                      'nobody switched on: ' + ', '.join(_group_name(ctx, g) for g in broken))
     return Result(READY, tested,
                   f'All {ctx.guide_groups} have at least one, '
                   f'{ctx.recording_members} recording members in total')
@@ -664,6 +721,12 @@ CHECKS = (
     Check('storage_dvr', 'machine', 'The recording folder works', 'the recording folder', CHEAP,
           'Any recording that starts now fails immediately, with nothing captured.',
           Link('Settings', 'settings.settings'), False, _check_storage_dvr),
+    Check('storage_dirs', 'machine', 'Every other folder ChannelBin writes to works',
+          'the other storage folders', CHEAP,
+          'Whatever that folder holds stops being saved - thumbnails, health check '
+          'screenshots, capture diagnostics, backups or moved recordings, depending on which '
+          'one. Recording itself carries on.',
+          Link('Settings', 'settings.settings'), False, _check_storage_dirs),
     Check('storage_space', 'machine', 'There is room to record', 'free disk space', CHEAP,
           'A recording that runs out of disk stops mid-capture, and what was written up to '
           'that point is all you get.',
@@ -787,6 +850,8 @@ CAPABILITIES = (
     Capability('search', 'Search your channels and programs instantly', _cap('search_index')),
     Capability('notify', 'Be told when something breaks',
                _cap('notify_any', 'notify_delivers')),
+    Capability('files', 'Save thumbnails, screenshots, backups and diagnostics',
+               _cap('storage_dirs')),
     Capability('safe', 'Keep your database and your schedule intact',
                _cap('db_local', 'db_write', 'secret_key', 'auth_gate')),
     Capability('clear', 'Be sure nothing is wrong right now', _cap('alerts_open')),
@@ -995,12 +1060,17 @@ def _verdict(caps, rows, counts):
                     'when something goes wrong.')}
 
 
-def evaluate(ctx=None, ignored=None) -> dict:
-    """The whole payload: every check, every capability, the verdict and the nav counts."""
+def evaluate(ctx=None, ignored=None, pseudonymize=False) -> dict:
+    """The whole payload: every check, every capability, the verdict and the nav counts.
+
+    `pseudonymize` names accounts and groups by id rather than by the name the user chose,
+    for the support bundle. It reaches cheap checks only: an on-demand answer was written
+    when it ran, and the bundle's own account-name sweep is what covers it.
+    """
     if ignored is None:
         ignored = ignored_check_ids()
     if ctx is None:
-        ctx = Context()
+        ctx = Context(pseudonymize=pseudonymize)
     with _lock:
         stored = dict(_ondemand)
 
@@ -1039,7 +1109,7 @@ def evaluate(ctx=None, ignored=None) -> dict:
     nav = nav_counts(caps)
     with _lock:
         _nav_cache.update({'at': datetime.utcnow(), 'value': nav})
-    return {
+    payload = {
         'checks': rows,
         'capabilities': caps,
         'verdict': _verdict(caps, rows, counts),
@@ -1048,6 +1118,37 @@ def evaluate(ctx=None, ignored=None) -> dict:
         'areas': [{'id': aid, 'label': label} for aid, label in AREAS],
         'generated_at': datetime.utcnow().isoformat(),
     }
+    payload['report'] = report_text(payload)
+    return payload
+
+
+def report_text(payload) -> str:
+    """The plain-text report: what the card's Copy report button copies and what the
+    support bundle ships as readiness.txt.
+
+    Built here, from the same payload the card draws, so it is the one rendering of it -
+    a check, capability or wording change reaches both copies with no edit to either
+    (dev/changelog/1010).
+    """
+    lines = ['ChannelBin readiness check', f"Generated {payload['generated_at']}", '',
+             payload['verdict']['head'], payload['verdict']['sub'], '',
+             '## What this install can and cannot do']
+    for cap in payload['capabilities']:
+        lines.append(f"  [{CAP_REPORT_WORD[cap['state']]}] {cap['label']}")
+    lines.append('')
+    for area in payload['areas']:
+        lines.append(f"## {area['label']}")
+        for row in payload['checks']:
+            if row['area'] != area['id']:
+                continue
+            tag = STATUS_LABELS[row['status']] + (', ignored' if row['ignored'] else '')
+            lines.append(f"  [{tag}] {row['label']}")
+            lines.append(f"      checked: {row['tested']}")
+            lines.append(f"      found:   {row['found']}")
+            if row['status'] not in (READY, NOTHING):
+                lines.append(f"      cost:    {row['without']}")
+        lines.append('')
+    return '\n'.join(lines)
 
 
 def nav_counts(caps) -> dict:

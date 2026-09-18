@@ -5,6 +5,34 @@ Notable changes to ChannelBin, newest first. This project follows
 release is tagged `v<version>` in git, and the version the app is running is shown in the
 page footer.
 
+## 0.11.0 - 2026-09-18
+
+**Added**
+
+- A preview button that allows you to play a live stream of any channel so you can verify it
+  works and that it is what your EPG says it is. Note that channel health checks are still the
+  ideal (and automated) way to verify a channel functions, but the preview option lets you
+  actually watch it. Also note this is NOT designed as an actual IPTV viewing application, it's
+  just to preview a channel.
+- The app regularly checks every folder it is set to write to and alerts you if any fail.
+- The support bundle includes the Readiness report.
+- The Home Assistant integration can be installed through HACS as a custom repository.
+
+**Changed**
+
+- All images (recording thumbnails, health check screenshots, and cached channel logos) now share
+  one images folder. Each one is stored in their own subfolder, but it makes managing that
+  directory much easier.
+
+**Fixed**
+
+- The thumbnail folder can be changed in Settings. Before, an install that could not write to the
+  default folder had no way to stop thumbnails failing.
+- Channel health scores give each health check its full weight again. A default check had been
+  counting as half an observation since checks were shortened to 30 seconds. Existing scores are
+  unchanged.
+- Rebuilt some tables that required horizontal scrolling when viewing from a phone.
+
 ## 0.10.0 - 2026-09-17
 
 **Added**

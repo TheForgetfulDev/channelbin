@@ -89,9 +89,11 @@ class JobsPageConformanceTests(unittest.TestCase):
         self.assertIn('Scheduled Jobs', h1s[0])
 
     def test_the_table_is_the_shared_component_in_a_card(self):
-        """DESIGN.md 3.2 - the bespoke .jobs-table and .jobs-table-wrap are gone."""
-        self.assertIn('<table class="tbl">', self.html)
-        self.assertRegex(self.html, r'<div class="card-body table-scroll">\s*<table class="tbl">')
+        """DESIGN.md 3.2 - the bespoke .jobs-table and .jobs-table-wrap are gone, and the
+        table opts into the phone card reflow (dev/changelog/1017)."""
+        self.assertIn('<table class="tbl tbl-cards">', self.html)
+        self.assertRegex(
+            self.html, r'<div class="card-body table-scroll">\s*<table class="tbl tbl-cards">')
         self.assertNotIn('jobs-table', self.html)
 
     def test_overlap_is_an_edge_and_a_dot_not_a_row_tint(self):
@@ -100,13 +102,37 @@ class JobsPageConformanceTests(unittest.TestCase):
         and which also fights `.tbl tbody tr:hover`."""
         style = re.search(r'<style>(.*?)</style>', self.html, re.S).group(1)
         rules = re.findall(r'tr\[data-overlap="(\w+)"\] td:first-child\s*{([^}]*)}', style)
-        self.assertEqual(sorted(k for k, _ in rules), ['red', 'yellow'])
+        # red and yellow each appear twice: the desktop edge, and the phone rule that
+        # clears it because the card carries the edge on the row instead.
+        self.assertEqual(sorted(k for k, _ in rules), ['red', 'red', 'yellow', 'yellow'])
         for key, decl in rules:
-            self.assertIn('inset', decl, key)
             self.assertNotIn('background', decl, key)
+        painted = [(k, d) for k, d in rules if 'none' not in d]
+        self.assertEqual(sorted(k for k, _ in painted), ['red', 'yellow'])
+        for key, decl in painted:
+            self.assertIn('inset', decl, key)
         for row in _tr_rows(self.html):
             self.assertRegex(row, r'data-overlap="(red|yellow|green)"')
             self.assertRegex(row, r'<span class="jb-dot (red|yellow|green) tip-plain"')
+
+    def test_the_phone_card_carries_the_overlap_edge_on_the_row(self):
+        """Below 768px the row IS the card, so an edge on its first cell marks one line of
+        the card rather than the card (dev/changelog/1017). The phone rule clears the cell
+        edge and repaints it on the `tr`, where the inset shadow follows the card's own
+        border-radius around the corner."""
+        style = re.search(r'<style>(.*?)</style>', self.html, re.S).group(1)
+        phone = re.search(r'@media \(max-width: 768px\) {(.*?)\n}', style, re.S)
+        self.assertIsNotNone(phone, 'the jobs page lost its phone block entirely')
+        body = phone.group(1)
+        for key, token in (('red', '--bad'), ('yellow', '--warn')):
+            self.assertRegex(
+                body, rf'\.tbl-cards tbody tr\[data-overlap="{key}"\] {{[^}}]*inset[^}}]*{token}',
+                f'the {key} overlap edge is not painted on the card itself')
+            self.assertRegex(
+                body,
+                rf'tr\[data-overlap="{key}"\] td:first-child[^{{]*{{[^}}]*box-shadow: none',
+                f'the {key} cell edge is not cleared, so the card shows a stripe beside '
+                'its first line as well as the band down its edge')
 
     def test_every_overlap_state_explains_itself(self):
         """CLAUDE.md principle 1 - a colored dot the user cannot decode is a

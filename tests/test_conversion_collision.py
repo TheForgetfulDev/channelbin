@@ -16,6 +16,7 @@ No real ffmpeg and no network throughout: subprocess.Popen is faked where a conv
 job store is mocked.
   python3 -m unittest tests.test_conversion_collision
 """
+import contextlib
 import os
 import signal
 import sys
@@ -26,6 +27,8 @@ from datetime import datetime, timedelta
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from sqlalchemy import event  # noqa: E402
 
 import app.config as cfgmod  # noqa: E402
 import app.postprocessor as ppmod  # noqa: E402
@@ -194,12 +197,68 @@ class ConflictPhraseTests(unittest.TestCase):
 
 
 # ── The blocking wait ──────────────────────────────────────────────────────────
+@contextlib.contextmanager
+def _joined_thread(target):
+    """Run target on a thread and join it before the caller moves on.
+
+    A helper that changes a row mid-wait is the only way to exercise a blocking poll loop,
+    but an unjoined one keeps touching the database while tearDown removes the session and
+    deletes the temp file underneath it - and being a daemon thread, nothing else ever reaps
+    it. An exception inside the helper is re-raised here rather than printed to stderr and
+    forgotten (dev/changelog/1014).
+    """
+    box = {}
+
+    def _run():
+        try:
+            target()
+        except Exception as exc:  # surfaced on the caller's thread below, never swallowed
+            box['exc'] = exc
+
+    th = threading.Thread(target=_run, daemon=True)
+    th.start()
+    try:
+        yield th
+    finally:
+        th.join(timeout=10)
+    if th.is_alive():
+        raise AssertionError('helper thread outlived the test that started it')
+    if 'exc' in box:
+        raise AssertionError(f'helper thread raised {box["exc"]!r}') from box['exc']
+
+
 class WaitForConversionClearTests(unittest.TestCase):
+    """Every statement this class's own session runs must come from the thread that owns it.
+
+    An ORM object stays attached to the session that loaded it, and a commit expires its
+    attributes - so reading `blocker.id` from inside a helper thread issues the refresh on
+    the MAIN thread's session and connection, concurrently with the poll loop already
+    querying there. Two threads on one sqlite3 connection is what produced
+    `sqlite3.InterfaceError: bad parameter or other API misuse` in the main thread and
+    `ObjectDeletedError` in the helper (BUGS.md 2026-09-17, dev/changelog/1014). Helpers
+    therefore close over plain ids, and this listener is what keeps that true.
+    """
+
     def setUp(self):
         self.t = make_test_app()
+        self._stmt_threads = set()
+        self._session = db.session()
+
+        @event.listens_for(self._session, 'do_orm_execute')
+        def _record_thread(orm_execute_state):
+            self._stmt_threads.add(threading.current_thread().name)
+
+        self._record_thread = _record_thread
 
     def tearDown(self):
-        self.t.cleanup()
+        try:
+            event.remove(self._session, 'do_orm_execute', self._record_thread)
+        finally:
+            self.t.cleanup()
+        foreign = self._stmt_threads - {threading.main_thread().name}
+        self.assertFalse(
+            foreign,
+            f'a helper thread ran a statement on the test session: {sorted(foreign)}')
 
     def test_returns_immediately_when_clear(self):
         """"Immediately" means it never polled, which is what the code actually promises.
@@ -219,19 +278,21 @@ class WaitForConversionClearTests(unittest.TestCase):
         conv = seed.make_recording(status='CONVERTING', name='conv')
         blocker = seed.make_recording(status=REC_STATUS_IN_PROGRESS, name='blocker')
         db.session.commit()
+        # Read both ids HERE, on the owning thread. See the class docstring.
+        conv_id, blocker_id = conv.id, blocker.id
         cleared = threading.Event()
 
         def _clear_soon():
             time.sleep(0.15)
             with self.t.app.app_context():
-                r = db.session.get(Recording, blocker.id)
+                r = db.session.get(Recording, blocker_id)
                 r.status = 'COMPLETED'
                 db.session.commit()
             cleared.set()
 
-        threading.Thread(target=_clear_soon, daemon=True).start()
-        started = time.monotonic()
-        _wait_for_conversion_clear(conv.id, 0, poll_seconds=0.02)
+        with _joined_thread(_clear_soon):
+            started = time.monotonic()
+            _wait_for_conversion_clear(conv_id, 0, poll_seconds=0.02)
         self.assertTrue(cleared.is_set())
         self.assertGreaterEqual(time.monotonic() - started, 0.1,
                                 'returned before the conflict actually cleared')
@@ -240,17 +301,18 @@ class WaitForConversionClearTests(unittest.TestCase):
         conv = seed.make_recording(status='CONVERTING', name='conv')
         seed.make_recording(status=REC_STATUS_IN_PROGRESS, name='never clears')
         db.session.commit()
+        conv_id = conv.id
 
         def _cancel_soon():
             time.sleep(0.1)
             with self.t.app.app_context():
-                r = db.session.get(Recording, conv.id)
+                r = db.session.get(Recording, conv_id)
                 r.status = 'ABORTED'
                 db.session.commit()
 
-        threading.Thread(target=_cancel_soon, daemon=True).start()
-        started = time.monotonic()
-        _wait_for_conversion_clear(conv.id, 0, poll_seconds=0.02)
+        with _joined_thread(_cancel_soon):
+            started = time.monotonic()
+            _wait_for_conversion_clear(conv_id, 0, poll_seconds=0.02)
         self.assertLess(time.monotonic() - started, 2.0,
                         'kept waiting on an unrelated recording after being cancelled')
 
