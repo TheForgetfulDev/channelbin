@@ -1522,20 +1522,20 @@
     }
     const c = COUNTS;
     const untested = Math.max(0, TOTAL - c.tested_count);
-    const seg = (kind, n) => (n ? `<div class="gd-sum-seg ${kind}" style="flex:${n}"></div>` : '');
+    const seg = (kind, n) => (n ? `<div class="stackbar-seg ${kind}" style="flex:${n}"></div>` : '');
     const segs = seg('pass', c.pass_count) + seg('warn', c.warn_count) + seg('fail', c.fail_count) + seg('untested', untested);
     const pct = (n) => (TOTAL ? Math.round(n / TOTAL * 100) : 0);
-    track.innerHTML = segs || '<div class="gd-sum-seg untested" style="flex:1"></div>';
-    track.className = 'gd-sum-track tip-plain';
+    track.innerHTML = segs || '<div class="stackbar-seg untested" style="flex:1"></div>';
+    track.className = 'stackbar tip-plain';
     track.setAttribute('data-tip',
       `Last run results.&#10;The most recent run of "${G.jobName || 'this check'}": ` +
       `${c.tested_count} of ${TOTAL} tested - ${c.pass_count} passed, ${c.warn_count} warned, ${c.fail_count} failed` +
       (untested ? `, ${untested} not tested` : '') + '.');
     byId('gd-sum-legend').innerHTML =
-      `<span class="gd-sl"><i class="gd-sl-dot pass"></i>Passed <strong>${c.pass_count}</strong> (${pct(c.pass_count)}%)</span>` +
-      `<span class="gd-sl"><i class="gd-sl-dot warn"></i>Warned <strong>${c.warn_count}</strong> (${pct(c.warn_count)}%)</span>` +
-      `<span class="gd-sl"><i class="gd-sl-dot fail"></i>Failed <strong>${c.fail_count}</strong> (${pct(c.fail_count)}%)</span>` +
-      `<span class="gd-sl text-muted">Tested <strong>${c.tested_count} / ${TOTAL}</strong></span>`;
+      `<span class="stackbar-key"><i class="stackbar-dot pass"></i>Passed <strong>${c.pass_count}</strong> (${pct(c.pass_count)}%)</span>` +
+      `<span class="stackbar-key"><i class="stackbar-dot warn"></i>Warned <strong>${c.warn_count}</strong> (${pct(c.warn_count)}%)</span>` +
+      `<span class="stackbar-key"><i class="stackbar-dot fail"></i>Failed <strong>${c.fail_count}</strong> (${pct(c.fail_count)}%)</span>` +
+      `<span class="stackbar-key text-muted">Tested <strong>${c.tested_count} / ${TOTAL}</strong></span>`;
   }
 
   function settingItems() {

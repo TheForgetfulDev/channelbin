@@ -144,13 +144,18 @@
 
   // A full-service restart makes the button label alone too easy to miss, so this
   // stays up (non-dismissable - nothing else on the page works mid-restart anyway)
-  // until the service is genuinely confirmed back, then reloads. `/api/settings/
-  // restart-status` is reused purely as a cheap heartbeat - its actual payload
-  // (config restart-needed) is irrelevant here, only that something answers.
+  // until the service is genuinely confirmed back, then reloads.
+  //
+  // "Back" is proven by `/api/settings/restart-status` reporting an instance id other
+  // than the one the restart POST answered with - the id is minted once per process.
+  // Waiting to catch a failed poll followed by a good one is only the fallback for
+  // when the POST's own connection dropped before it answered: a container restart
+  // finishes inside one poll interval, so no poll ever fails and a modal keyed on
+  // that alone waits forever on a healthy app (dev/changelog/1022).
   const RESTART_POLL_MS = 1500;
   const RESTART_SLOW_AFTER_MS = 45000;
 
-  const showRestartWaitModal = () => {
+  const showRestartWaitModal = (oldInstanceId) => {
     const body = document.createElement('div');
     body.className = 'restart-wait';
     body.innerHTML = '<div class="spinner mnt-spinner"></div>' +
@@ -160,8 +165,8 @@
 
     const startedAt = Date.now();
     // The old process is still alive for a moment after the request that triggered
-    // this, so an early poll succeeding does NOT mean it's back - only a poll that
-    // fails (the connection actually going away) and THEN succeeds again does.
+    // this, so an early poll succeeding does NOT mean it's back. With no id to compare
+    // against, only a poll that fails and THEN succeeds again does.
     let sawDrop = false;
     let slowWarned = false;
     let stopped = false;
@@ -184,33 +189,55 @@
       $('.modal-panel', modal).appendChild(foot);
     };
 
+    const isBack = (data) => {
+      const id = data && data.instance_id;
+      if (oldInstanceId && id) return id !== oldInstanceId;
+      return sawDrop;
+    };
+
     const tick = () => {
       if (stopped) return;
       jsonFetch('/api/settings/restart-status')
-        .then(() => {
+        .then((data) => {
           if (stopped) return;
-          if (!sawDrop) {
-            setTimeout(tick, RESTART_POLL_MS);
+          if (isBack(data)) {
+            stopped = true;
+            statusEl.textContent = 'Back online - reloading...';
+            setTimeout(() => window.location.reload(), 500);
             return;
           }
-          stopped = true;
-          statusEl.textContent = 'Back online - reloading...';
-          setTimeout(() => window.location.reload(), 500);
+          waiting();
         })
         .catch(() => {
           if (stopped) return;
           sawDrop = true;
-          statusEl.textContent = waitingText();
-          if (!slowWarned && Date.now() - startedAt >= RESTART_SLOW_AFTER_MS) {
-            slowWarned = true;
-            addReloadButton();
-          }
-          setTimeout(tick, RESTART_POLL_MS);
+          waiting();
         });
+    };
+
+    // Every tick that is not the reload, success or failure alike, so the timer and
+    // the slow-restart escape hatch never depend on catching the connection down.
+    const waiting = () => {
+      statusEl.textContent = waitingText();
+      if (!slowWarned && Date.now() - startedAt >= RESTART_SLOW_AFTER_MS) {
+        slowWarned = true;
+        addReloadButton();
+      }
+      setTimeout(tick, RESTART_POLL_MS);
     };
 
     tick();
   };
+
+  // A parked recording (waiting on another one to finish with the machine) never blocks a
+  // restart, but a parked conversion holds a suspended encode that a restart throws away,
+  // so every restart surface names it - in the same words tools/check_busy.py prints
+  // (dev/changelog/1026). Empty string when there is nothing parked.
+  const parkedSection = (parked) => (parked && parked.length
+    ? `<p class="text-muted">Parked, waiting on another recording - these do not stop a
+       restart:</p>
+       <ul class="blocking-list">${parked.map((r) => `<li>${escHtml(r.label)}</li>`).join('')}</ul>`
+    : '');
 
   const doRestart = (force) => {
     restartBtn.disabled = true;
@@ -219,7 +246,7 @@
       method: 'POST',
       body: JSON.stringify({ force }),
     })
-      .then(() => showRestartWaitModal())
+      .then((data) => showRestartWaitModal(data && data.instance_id))
       .catch((e) => {
         const blocking = e.data && e.data.blocking;
         if (e.status === 409 && blocking && blocking.length && !force) {
@@ -238,7 +265,8 @@
                    check or channel test loses the channels it has not reached; an account sync
                    fetches its playlist and guide data again from the start.</p>
                    <ul class="blocking-list">${blocking.map((r) =>
-                     `<li>${escHtml(r.label)}</li>`).join('')}</ul>`,
+                     `<li>${escHtml(r.label)}</li>`).join('')}</ul>
+                   ${parkedSection(e.data.parked)}`,
             footer: [
               { label: 'Cancel', class: 'btn' },
               {
@@ -266,13 +294,17 @@
       });
   };
 
-  restartBtn.addEventListener('click', () => {
+  const openRestartConfirm = (parkedHtml) => {
     buildModal({
       title: 'Restart the service?',
       body: `<p>Restart the ChannelBin service now? Active page connections will briefly drop.</p>
+             ${BOOT.is_docker ? `<p class="restart-wait-warn">The container comes back only if
+             it has a restart policy set (for example <code>restart: unless-stopped</code>).
+             Without one, it stops and stays down.</p>` : ''}
              <p class="text-muted">The server refuses while a capture, join, conversion,
              search index rebuild, health check, channel test or account sync is running, and
-             will say what is blocking it.</p>`,
+             will say what is blocking it.</p>
+             ${parkedHtml}`,
       footer: [
         { label: 'Cancel', class: 'btn' },
         {
@@ -282,6 +314,16 @@
         },
       ],
     });
+  };
+
+  // Parked rows are asked for before the confirm opens because the POST never refuses over
+  // them: this dialog is the only place a restart with just a parked conversion in flight
+  // can say what it will cost. A failed lookup says so rather than implying nothing is parked.
+  restartBtn.addEventListener('click', () => {
+    jsonFetch('/api/settings/restart-parked')
+      .then((data) => openRestartConfirm(parkedSection(data && data.parked)))
+      .catch(() => openRestartConfirm(`<p class="restart-wait-warn">Could not check for
+        parked conversions, so a restart may discard one that is part-way done.</p>`));
   });
 
   // ── Search index ────────────────────────────────────────────────────────

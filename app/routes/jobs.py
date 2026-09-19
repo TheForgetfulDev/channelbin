@@ -350,6 +350,7 @@ def _build_job_list():
         'search_index_janitor': ('Search Index Janitor',
                                  '/settings?q=index_janitor_grace_minutes'),
         'storage_dirs_check': ('Storage Folder Check', '/maintenance'),
+        'account_stats_fold': ('Account Stats Update', '/accounts'),
         # Never a job id of its own - only ever seen as `channel_hide_materialize_retry`,
         # the one-shot queued when a hide-rule pass was refused. Named here so the retry
         # branch below renders it as "Hide Rules retry" rather than a raw job id
@@ -395,6 +396,11 @@ def _build_job_list():
             'Storage Folder Check makes sure every folder ChannelBin writes to is still '
             'there and writable, and raises or clears an alert for each one. The same '
             'answer is in the Readiness check on Maintenance.'
+        ),
+        'account_stats_fold': (
+            'Account Stats Update adds newly finished recordings, health checks and '
+            'failovers to the per-account usage numbers. The Accounts pages do the same '
+            'every time they load, so opening one is the way to run it now.'
         ),
     }
 

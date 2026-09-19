@@ -474,13 +474,14 @@ def create_alert(alert_type: str, title: str, body: str = None,
     """Create an in-app Alert and enqueue push notifications per config routing.
 
     Safe to call from any thread (uses Flask app context internally).
-    Silently skips unknown alert_types, and silently skips alert_types the user has
-    ignored via a matching IgnoredAlertPattern (the underlying condition is still logged
-    normally by whatever code called this - only the Alert row and push are suppressed).
+    Skips an unknown alert_type with a WARNING (a misspelled type is an alert that would
+    otherwise never fire), and silently skips alert_types the user has ignored via a
+    matching IgnoredAlertPattern (the underlying condition is still logged normally by
+    whatever code called this - only the Alert row and push are suppressed).
     """
     type_meta = ALERT_TYPES.get(alert_type)
     if type_meta is None:
-        log.debug('create_alert: unknown alert_type %r, skipping', alert_type)
+        log.warning('create_alert: unknown alert_type %r, not raised: %s', alert_type, title)
         return
 
     if _record_if_ignored(alert_type, title):

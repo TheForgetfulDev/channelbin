@@ -330,6 +330,7 @@ def reset_module_globals():
     tests/test_global_state_isolation.py's allowlist with a reason. That test is what keeps
     this list from rotting the next time one is added.
     """
+    import app.account_stats as account_stats
     import app.admission as admission
     import app.auth as auth
     import app.channel_search as channel_search
@@ -347,6 +348,9 @@ def reset_module_globals():
     # A run abandoned mid-flight leaves its admission ticket held, and the next module's
     # sync or maintenance job is then refused by a blocker that no longer exists.
     admission.reset_for_tests()
+    # A catch-up left running is a live thread into a torn-down app, and a failed one's
+    # error would show as a notice on the next module's Accounts pages.
+    account_stats.reset_for_tests()
     # A health-check run left mid-flight reports is_running() True forever after, so the
     # next module's job rows read RUNNING instead of SCHEDULED. Stopped before the swap,
     # never just swapped out from under: _run_channel_loop re-reads the module global on

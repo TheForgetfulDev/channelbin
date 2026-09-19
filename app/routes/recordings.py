@@ -34,7 +34,7 @@ from ..recorder import (
     get_live_segment_path, recording_disk_paths, delete_files, end_slot_wait,
 )
 from ..tz_utils import parse_local_to_utc, local_input_value, format_local
-from ..accounts import normalize_url_loose
+from ..accounts import normalize_url, normalize_url_loose
 from ..config import load_config, resolve_ffmpeg_path
 from ..logo_cache import resolve_logo_url
 from ..screenshot import capture_screenshot
@@ -86,11 +86,17 @@ def _parse_recording_form(form):
 
 
 def _apply_edit_and_reschedule(recording_id, name, url, start_utc, stop_utc,
-                               profile_id=_UNSET):
+                               profile_id=_UNSET, channel_id=_UNSET, member_reason=None):
     """Persist an edit to a SCHEDULED recording, then re-register its jobs.
 
     Only the mutate+commit is retried; the scheduler side effects must run
     exactly once, after the write has durably succeeded.
+
+    `channel_id` (with `member_reason`, why the old member was passed over) restamps a
+    group recording onto a different member, pointing `url` at that member's feed the
+    way record start does. It is written only while the row is still SCHEDULED: once
+    record start has chosen a member, that choice is the one ffmpeg is capturing, and
+    an edit decided against the stale row must not overwrite it.
 
     The scheduled_* pair is re-baselined here, not preserved. It is an audit trail
     of *execution* drift (started late / stopped early / aborted), and the only
@@ -117,6 +123,20 @@ def _apply_edit_and_reschedule(recording_id, name, url, start_utc, stop_utc,
                 event_type=RECORDING_EDITED,
                 detail=f'Start/stop time edited: {old_start} → {start_utc}, {old_stop} → {stop_utc}',
             ))
+        if (channel_id is not _UNSET and channel_id != r.channel_id
+                and r.status == REC_STATUS_SCHEDULED):
+            new_ch = db.session.get(Channel, channel_id)
+            if new_ch is not None:
+                old_ch = r.channel
+                old_name = old_ch.name if old_ch else 'no member'
+                r.channel_id = new_ch.id
+                r.url = normalize_url(new_ch.stream_url, new_ch.account)
+                add_recording_event(
+                    r.id, RECORDING_EDITED,
+                    detail=(f'Group member changed for the edited window: "{old_name}" → '
+                            f'"{new_ch.name}" - {member_reason}.'),
+                    extra={'from_channel_id': old_ch.id if old_ch else None,
+                           'to_channel_id': new_ch.id})
         db.session.commit()
 
     _apply_edit_and_commit()
@@ -412,6 +432,57 @@ def _members_committed_in_window(members, start_utc, stop_utc, exclude_recording
         if len(others) >= limit:
             blocked.add(ch.id)
     return blocked
+
+
+def _resolve_group_member(group, channel_id, start_utc, stop_utc, streak_threshold,
+                          exclude_recording_id=None):
+    """The member a group-backed recording should be stamped with for [start_utc, stop_utc).
+
+    Returns (channel_id, reason). The supplied `channel_id` is kept (reason None) unless it
+    is genuinely unusable in this window - not a recording-enabled member, outside the
+    format lock, or on an account already committed then - so a schedule that would have
+    gone through is never quietly moved to a different feed. Otherwise the best member on
+    an uncommitted account wins, and `reason` says why the supplied one was passed over.
+    Every account committed is an override, never a skip: the supplied member is kept if
+    it is one, else the plain best member is taken. (None, None) only when the group has
+    no member to stamp and nothing usable was supplied.
+
+    Shared by create and edit so the two cannot disagree (dev/changelog/855, 1025).
+    """
+    from .channel_tests import _latest_tests_by_channel
+    enabled = recording_members(group.memberships)
+    latest_by_channel = _latest_tests_by_channel([ch.id for ch in enabled])
+    # Format lock filters, health score ranks (DESIGN-channel-groups-model.md 5).
+    active = format_eligible_members(group, enabled, latest_by_channel).members
+    committed = _members_committed_in_window(
+        active, start_utc, stop_utc, exclude_recording_id=exclude_recording_id)
+
+    supplied_is_member = (channel_id is not None
+                          and channel_id in {m.channel_id for m in group.memberships})
+    active_ids = {ch.id for ch in active}
+    if supplied_is_member and channel_id in active_ids and channel_id not in committed:
+        return channel_id, None
+
+    if not supplied_is_member:
+        reason = 'it is no longer a member of this group'
+    elif channel_id not in {ch.id for ch in enabled}:
+        reason = 'it is no longer enabled for recording in this group'
+    elif channel_id not in active_ids:
+        reason = "it does not match the group's format lock"
+    else:
+        reason = 'its account has no free connection in this window'
+
+    member = pick_best_member(active, latest_by_channel, exclude_ids=committed,
+                              streak_threshold=streak_threshold)
+    if member is None and supplied_is_member:
+        return channel_id, None
+    if member is None:
+        # Nothing on an uncommitted account and nothing supplied to fall back on: stamp
+        # the plain best member and let the limit check speak to it.
+        member = pick_best_member(active, latest_by_channel, streak_threshold=streak_threshold)
+    if member is None:
+        return None, None
+    return member.id, reason
 
 
 # ── Recordings list row model (design-system reference page 1) ──────────────
@@ -1584,43 +1655,19 @@ def new_recording_json():
             return jsonify({'error': 'The TV Guide Channels group cannot back a '
                                      'recording.'}), 400
         else:
-            from .channel_tests import _latest_tests_by_channel
-            streak_threshold = cfg.get('channel_testing', {}).get(
-                'failing_streak_threshold', DEFAULT_FAILING_STREAK_THRESHOLD)
-            active = recording_members(group.memberships)
-            latest_by_channel = _latest_tests_by_channel([ch.id for ch in active])
-            # Format lock filters, health score ranks - the member stamped on the
-            # recording now must be the one record start would resolve to, or the
-            # scheduled recording names a feed that will not be used
-            # (DESIGN-channel-groups-model.md 5).
-            active = format_eligible_members(group, active, latest_by_channel).members
-            # Then the account preference, the schedule-time half of dev/changelog/855.
             # The channel_id the modal supplies for a group row is the guide's serving
             # member - the app's own ranking, not a feed the user picked by hand - so a
             # multi-account group rolls over to an account with room in this window
-            # rather than stamping a member the limit check below would refuse. Only
-            # when the supplied member is genuinely unusable, so a schedule that would
-            # have gone through is never quietly moved to a different feed.
-            committed = _members_committed_in_window(
-                active, start_utc, stop_utc, exclude_recording_id=replace_recording_id)
-            supplied_is_member = (channel_id is not None
-                                  and channel_id in {m.channel_id for m in group.memberships})
-            keep_supplied = (supplied_is_member
-                             and channel_id in {ch.id for ch in active}
-                             and channel_id not in committed)
-            if not keep_supplied:
-                member = pick_best_member(active, latest_by_channel, exclude_ids=committed,
-                                          streak_threshold=streak_threshold)
-                if member is None and not supplied_is_member:
-                    # Nothing on an uncommitted account and nothing supplied to fall back
-                    # on: stamp the plain best member and let the limit check speak to it.
-                    # Rolling over cannot help when every account is committed.
-                    member = pick_best_member(active, latest_by_channel,
-                                              streak_threshold=streak_threshold)
-                    if member is None:
-                        group_id = None
-                if member is not None:
-                    channel_id = member.id
+            # rather than stamping a member the limit check below would refuse.
+            streak_threshold = cfg.get('channel_testing', {}).get(
+                'failing_streak_threshold', DEFAULT_FAILING_STREAK_THRESHOLD)
+            resolved, _reason = _resolve_group_member(
+                group, channel_id, start_utc, stop_utc, streak_threshold,
+                exclude_recording_id=replace_recording_id)
+            if resolved is None:
+                group_id = None
+            else:
+                channel_id = resolved
 
     profile_id_raw = request.form.get('profile_id', '').strip()
     profile_id = int(profile_id_raw) if profile_id_raw.isdigit() else None
@@ -1829,10 +1876,22 @@ def edit_recording_json(recording_id):
     if errors:
         return jsonify({'error': ' '.join(errors)}), 400
 
+    # A group recording's member was chosen for its old window; ask the same question
+    # of the new one, exactly as create does (dev/changelog/1025).
+    channel_id, member_reason = rec.channel_id, None
+    if rec.group is not None and not rec.group.is_system:
+        streak_threshold = load_config().get('channel_testing', {}).get(
+            'failing_streak_threshold', DEFAULT_FAILING_STREAK_THRESHOLD)
+        resolved, reason = _resolve_group_member(
+            rec.group, rec.channel_id, start_utc, stop_utc, streak_threshold,
+            exclude_recording_id=recording_id)
+        if resolved is not None and resolved != rec.channel_id:
+            channel_id, member_reason = resolved, reason
+
     force = request.form.get('force') == '1'
     if not force:
         warnings = _pending_recording_warnings(
-            rec.channel_id, rec.group_id, start_utc, stop_utc,
+            channel_id, rec.group_id, start_utc, stop_utc,
             exclude_recording_id=recording_id)
         if warnings:
             return jsonify({'success': False, **warnings})
@@ -1840,8 +1899,10 @@ def edit_recording_json(recording_id):
     profile_id_raw = request.form.get('profile_id', '').strip()
     profile_id = int(profile_id_raw) if profile_id_raw.isdigit() else None
 
-    _apply_edit_and_reschedule(recording_id, name, url, start_utc, stop_utc,
-                               profile_id=profile_id)
+    _apply_edit_and_reschedule(
+        recording_id, name, url, start_utc, stop_utc, profile_id=profile_id,
+        channel_id=channel_id if member_reason is not None else _UNSET,
+        member_reason=member_reason)
 
     return jsonify({'success': True})
 

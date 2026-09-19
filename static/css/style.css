@@ -1620,10 +1620,6 @@ body.scroll-locked { position: fixed; left: 0; right: 0; width: 100%; overflow: 
 .grp-mtable td { padding: 8px 12px; border-bottom: 1px solid var(--border-soft); vertical-align: middle; }
 .grp-mtable tr:hover td { background: var(--bg2); }
 .grp-mtable tr:last-child td { border-bottom: none; }
-.grp-mtable th.sortable { cursor: pointer; user-select: none; }
-.grp-mtable th.sortable:hover { color: var(--text-muted); }
-.grp-mtable th.sorted { color: var(--accent-text); }
-.grp-mtable th .arr { font-size: var(--fs-xs); }
 .grp-mnote { font-size: var(--fs-md); color: var(--text-muted); line-height: 1.5; padding: .45rem .25rem .6rem; }
 .grp-mnote a { cursor: pointer; }
 /* Nested opacity multiplies - a badge inside a .4-opacity parent could never clear
@@ -1693,6 +1689,12 @@ table.tbl { width: 100%; border-collapse: collapse; font-size: var(--fs-md); }
 .tbl tbody tr:hover td { background: var(--bg2); }
 .tbl .num { text-align: right; font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
 .tbl th.num { text-align: right; }
+/* A sortable column header, on every table that has one - `.tbl`, and the group page's two
+   tables that predate it. One rule set rather than a copy per table (dev/changelog/1029). */
+.tbl th.sortable, .gd-table th.sortable, .grp-mtable th.sortable { cursor: pointer; user-select: none; }
+.tbl th.sortable:hover, .gd-table th.sortable:hover, .grp-mtable th.sortable:hover { color: var(--text-muted); }
+.tbl th.sorted, .gd-table th.sorted, .grp-mtable th.sorted { color: var(--accent-text); }
+.tbl th .arr, .gd-table th .arr, .grp-mtable th .arr { font-size: var(--fs-xs); }
 /* format-plan.js::formatPlanTable - the winning bucket for the active auto-select strategy. */
 .fp-winner td { background: var(--accent-soft); }
 /* A bucket no strategy can pick, because the group records from none of its channels.
@@ -1818,6 +1820,26 @@ table.tbl { width: 100%; border-collapse: collapse; font-size: var(--fs-md); }
 .statlist .srow-act:hover { background: var(--bg2); }
 .statlist .srow-act .sv { display: flex; align-items: baseline; gap: 6px; justify-content: flex-end; }
 .srow-go { color: var(--text-faint); font-family: var(--font); font-weight: 400; }
+
+/* ── Stacked share bar (the group page's "Last run results", the account health bands) ──
+   One horizontal bar split into parts, with a legend beneath that names each part and its
+   number - the legend is the bar's direct label, so a color is never the only thing saying
+   what a segment is. Promoted from the group page's .gd-sum-* when the account stats became
+   its second caller (dev/changelog/1029). A part is colored either by a status modifier
+   (.pass/.warn/.fail/.untested) or by a health band class (.hb-*), which sets --hb. */
+.stackbar { display: flex; height: 14px; border-radius: 999px; overflow: hidden; background: var(--bg3); gap: 2px; }
+.stackbar-seg { height: 100%; min-width: 2px; background: var(--hb, var(--bg3)); }
+.stackbar-seg.pass { background: var(--ok); }
+.stackbar-seg.warn { background: var(--warn); }
+.stackbar-seg.fail { background: var(--bad); }
+.stackbar-seg.untested { background: var(--bg3); }
+.stackbar-legend { display: flex; gap: 8px 16px; flex-wrap: wrap; font-size: var(--fs-md); color: var(--text-muted); }
+.stackbar-key { display: inline-flex; align-items: center; gap: 6px; }
+.stackbar-key strong { color: var(--text); font-variant-numeric: tabular-nums; }
+.stackbar-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; flex-shrink: 0; background: var(--hb, var(--text-faint)); }
+.stackbar-dot.pass { background: var(--ok); }
+.stackbar-dot.warn { background: var(--warn); }
+.stackbar-dot.fail { background: var(--bad); }
 /* The origin line under a value ("pinned by you", "selected automatically by ..."). As a
    pill this was a third line inside a chip and came out double height beside its
    neighbors; as a list row it is simply the line beneath. */
@@ -2370,19 +2392,6 @@ body.actbar-on #app-toast { bottom: 78px; }
 }
 .gd-sum-note { font-size: var(--fs-sm); color: var(--text-muted); margin-top: 6px; }
 .gd-sum-bar-wrap { display: flex; flex-direction: column; gap: 9px; flex: 1; min-width: 260px; }
-.gd-sum-track { display: flex; height: 14px; border-radius: 999px; overflow: hidden; background: var(--bg3); gap: 2px; }
-.gd-sum-seg { height: 100%; min-width: 2px; }
-.gd-sum-seg.pass { background: var(--ok); }
-.gd-sum-seg.warn { background: var(--warn); }
-.gd-sum-seg.fail { background: var(--bad); }
-.gd-sum-seg.untested { background: var(--bg3); }
-.gd-sum-legend { display: flex; gap: 8px 16px; flex-wrap: wrap; font-size: var(--fs-md); color: var(--text-muted); }
-.gd-sl { display: inline-flex; align-items: center; gap: 6px; }
-.gd-sl strong { color: var(--text); font-variant-numeric: tabular-nums; }
-.gd-sl-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; flex-shrink: 0; }
-.gd-sl-dot.pass { background: var(--ok); }
-.gd-sl-dot.warn { background: var(--warn); }
-.gd-sl-dot.fail { background: var(--bad); }
 
 /* ── Settings chips (each opens the one Settings modal, focused) ───── */
 .gd-setbar { display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap; padding: 4px 0; }
@@ -2430,10 +2439,6 @@ body.actbar-on #app-toast { bottom: 78px; }
   text-align: left; font-size: var(--fs-xs); font-weight: 600; letter-spacing: .07em; text-transform: uppercase;
   color: var(--text-faint); padding: 9px 10px 7px; border-bottom: 1px solid var(--border-soft); white-space: nowrap;
 }
-.gd-table th.sortable { cursor: pointer; user-select: none; }
-.gd-table th.sortable:hover { color: var(--text-muted); }
-.gd-table th.sorted { color: var(--accent-text); }
-.gd-table th .arr { font-size: var(--fs-xs); }
 .gd-table td { padding: 8px 10px; border-bottom: 1px solid var(--border-soft); vertical-align: middle; white-space: nowrap; }
 .gd-table tr.gd-row { cursor: pointer; }
 .gd-table tr.gd-row.no-profile { cursor: default; }
@@ -3522,6 +3527,130 @@ a.shot-link { display: block; width: fit-content; cursor: zoom-in; }
   .acct-list .arow .a-num .a-k { text-align: left; font-size: var(--fs-2xs); }
   .acct-list .spark { height: 16px; gap: 3px; }
   .acct-list .spark i { width: 5px; }
+}
+
+/* ══ Account stats (DESIGN.md §17.7, templates/_account_stats.html) ═══════════
+   The list row's second line (what an account is right now), and the stats section under
+   the list / the account page's Usage card (what the accounts did over a window). Ported
+   from approved mockup 41 and audited against this file: the table is .tbl + .tbl-cards,
+   the bands are .stackbar, the tooltip is .dot-tooltip, the chips are .chip - only what
+   none of those already do lives here (dev/changelog/1029). */
+
+/* The row's second line. Fixed fr tracks only: every row is its own grid container, so a
+   content-sized track would walk these out of line from row to row (CLAUDE.md list-grid
+   rule). Both span the row's full width under its own cells. */
+.acct-rows .arow .a-more {
+  grid-column: 1 / -1; display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 6px var(--cell-gap);
+  margin-top: 10px; padding-top: 9px; border-top: 1px solid var(--border-soft);
+}
+.acct-rows .arow .a-bands {
+  grid-column: 1 / -1; display: grid; grid-template-columns: 7rem minmax(0, 1fr); gap: 12px;
+  align-items: start; margin-top: 8px;
+}
+.arow .a-x {
+  font-size: var(--fs-md); font-family: var(--font-mono); font-variant-numeric: tabular-nums;
+  min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.arow .a-more .a-k, .arow .a-bands .a-k {
+  display: block; font-family: var(--font); font-size: var(--fs-xs); text-transform: uppercase;
+  letter-spacing: .06em; color: var(--text-faint); margin-bottom: 1px; cursor: help;
+}
+
+/* The section. One filter row at the top scopes everything under it. */
+.acst { margin-top: 30px; }
+.acst-top { display: flex; align-items: center; gap: 10px 18px; flex-wrap: wrap; }
+.acst-top h2 { font-size: var(--fs-xl); font-weight: 700; margin: 0; }
+.acst-scope { font-size: var(--fs-md); color: var(--text-muted); line-height: 1.5; margin: 6px 0 0; max-width: 90ch; }
+.acst-body .acst-scope { margin: 0 0 8px; }
+.acst-notice { font-size: var(--fs-sm); margin: 4px 0 0; }
+.acst-cardscope { font-size: var(--fs-sm); color: var(--text-faint); }
+
+/* The window chips: links styled as the shared .chip, one active. At the section's top
+   they sit on a bar, so they take the bar height (DESIGN.md 3.5). */
+.acst-win { display: flex; gap: 6px; flex-wrap: wrap; }
+.acst-win .chip { text-decoration: none; }
+.acst-top .acst-win .chip { height: var(--ctl-h); padding-top: 0; padding-bottom: 0; display: inline-flex; align-items: center; }
+
+/* The table: every column sorts; the totals row is its footing and never moves. */
+.acst-table-card { margin-top: 16px; }
+.acst-acct { display: inline-flex; align-items: center; gap: 8px; font-weight: 600; min-width: 0; color: var(--text); }
+.acst-acct:hover { color: var(--accent-text); text-decoration: none; }
+.acst-acct .nm { overflow-wrap: anywhere; }
+.tbl tr.acst-total td { font-weight: 600; border-top: 1px solid var(--border); }
+
+/* Cards in a grid: each pie and each trend is its own card, so every chart has a border
+   that says where it ends. */
+.acst-grid { display: grid; gap: 18px; margin-top: 18px; }
+.acst-grid > .card { margin-top: 0; min-width: 0; }
+.acst-grid-shares { grid-template-columns: repeat(auto-fit, minmax(min(300px, 100%), 1fr)); }
+.acst-grid-trends { grid-template-columns: repeat(auto-fit, minmax(min(440px, 100%), 1fr)); }
+
+/* A pie per measure, its legend the direct label: name, number, share. Each legend line is
+   its own grid, so its tracks are fixed and the numbers line up down the legend. */
+.acst-pie { display: flex; align-items: center; gap: 18px; }
+.acst-pie svg { width: 104px; height: 104px; flex: none; }
+.acst-plegend { display: flex; flex-direction: column; gap: 5px; min-width: 0; flex: 1; font-size: var(--fs-sm); }
+.acst-pl { display: grid; grid-template-columns: 8px minmax(0, 1fr) 4.6rem 2.6rem; align-items: center; gap: 7px; color: var(--text-muted); }
+.acst-pl .nm { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.acst-pl strong { text-align: right; color: var(--text); font-family: var(--font-mono); font-variant-numeric: tabular-nums; font-weight: 600; }
+.acst-pl .pc { text-align: right; color: var(--text-faint); font-variant-numeric: tabular-nums; }
+.acst-share-tot { font-size: var(--fs-sm); color: var(--text-faint); margin-top: 10px; }
+.acst-share-empty { font-size: var(--fs-md); color: var(--text-muted); padding: 2px 0; }
+
+/* Health bands on an account: a slimmer .stackbar, under a small label on the Content card. */
+.acst-sub {
+  font-size: var(--fs-xs); font-weight: 600; letter-spacing: .07em; text-transform: uppercase;
+  color: var(--text-faint); margin: 16px 0 6px;
+}
+.acst-bandbar { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.acst-bandbar .stackbar { height: 8px; }
+.acst-bandbar .stackbar-legend { font-size: var(--fs-xs); gap: 3px 12px; }
+.acst-untested { color: var(--text-faint); font-size: var(--fs-sm); }
+
+/* Trend columns. HTML, not SVG, so the type never scales with the chart. One axis, labeled
+   under the columns; the peak value marks the top; a zero column is a stub. */
+.acst-plot { position: relative; padding-top: 16px; }
+.acst-peak { position: absolute; top: 0; left: 0; font-size: var(--fs-2xs); color: var(--text-faint); font-family: var(--font-mono); }
+.acst-plot::before { content: ""; position: absolute; left: 0; right: 0; top: 16px; border-top: 1px dashed var(--border-soft); }
+.acst-cols { display: flex; align-items: flex-end; gap: 4px; height: 120px; border-bottom: 1px solid var(--border); }
+.acst-col { flex: 1 1 0; min-width: 0; height: 100%; display: flex; flex-direction: column-reverse; gap: 1px; border-radius: 2px 2px 0 0; }
+.acst-col:hover, .acst-col:focus-visible { background: var(--bg2); outline: none; }
+.acst-col i { display: block; flex: none; min-height: 2px; }
+.acst-col i:last-child { border-radius: 2px 2px 0 0; }
+.acst-col i.ok { background: var(--ok); }
+.acst-col i.bad { background: var(--bad); }
+.acst-col i.zero { height: 2px; background: var(--border); }
+.acst-axis { display: flex; gap: 4px; margin-top: 5px; }
+.acst-axis span { flex: 1 1 0; min-width: 0; text-align: center; font-size: var(--fs-2xs); color: var(--text-muted); white-space: nowrap; }
+.acst-empty {
+  height: 136px; display: flex; align-items: center; justify-content: center; text-align: center;
+  color: var(--text-muted); font-size: var(--fs-md); border: 1px dashed var(--border-soft);
+  border-radius: var(--radius-sm); padding: 0 14px;
+}
+
+/* The column tooltip: the guide's .dot-tooltip, carrying each layer's color. */
+.acst-tt { min-width: 200px; pointer-events: none; position: fixed; }
+.acst-tt-row { display: grid; grid-template-columns: 8px minmax(0, 1fr) 4.6rem; align-items: center; gap: 8px; }
+.acst-tt-v { text-align: right; font-family: var(--font-mono); font-variant-numeric: tabular-nums; color: var(--text); }
+.acst-tt-d { padding-left: 16px; margin-top: -2px; }
+.acst-tt-tot { border-top: 1px solid var(--border-soft); margin-top: 3px; padding-top: 3px; }
+
+/* The Usage card: the windowed numbers, then each chart in its own bordered box. */
+.acst-boxes { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(380px, 100%), 1fr)); gap: 14px; margin-top: 16px; }
+.acst-box { border: 1px solid var(--border-soft); border-radius: var(--radius); padding: 12px 14px 14px; min-width: 0; }
+.acst-box-h { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; margin-bottom: 10px; }
+.acst-box-h h2 { font-size: var(--fs-sm); font-weight: 700; letter-spacing: .08em; text-transform: uppercase; color: var(--text-muted); margin: 0; }
+
+@media (max-width: 768px) {
+  .acct-rows .arow .a-more { grid-template-columns: repeat(2, minmax(0, 1fr)); margin-top: 2px; }
+  .acct-rows .arow .a-bands { grid-template-columns: minmax(0, 1fr); gap: 4px; margin-top: 4px; }
+  .acst-pie svg { width: 88px; height: 88px; }
+}
+/* The same reflow at the list's own container width, where the stylesheet's .acct-list
+   container query above restacks the row too. */
+@container acct-list (max-width: 715px) {
+  .acct-list .acct-rows .arow .a-more { grid-template-columns: repeat(2, minmax(0, 1fr)); margin-top: 2px; }
+  .acct-list .acct-rows .arow .a-bands { grid-template-columns: minmax(0, 1fr); gap: 4px; margin-top: 4px; }
 }
 
 /* ══ Profiles lists (DESIGN.md §3.1/§9.4) ════════════════════════════════════

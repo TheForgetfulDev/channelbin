@@ -31,8 +31,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from tests.support.app import make_test_app  # noqa: E402
 from tests.support import seed  # noqa: E402
-from app import db  # noqa: E402
-from app.database import Account, AccountSyncLog  # noqa: E402
+from app import account_stats, db  # noqa: E402
+from app.database import Account, AccountStatDay, AccountSyncLog  # noqa: E402
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 HARNESS = os.path.join(REPO, 'tests', 'support', 'accounts_page.mjs')
@@ -62,7 +62,15 @@ def _observe():
         snapshot('empty')
 
         alpha_id = seed.make_account(name='Alpha', channel_count=100).id
-        seed.make_account(name='Beta', channel_count=50)
+        beta_id = seed.make_account(name='Beta', channel_count=50).id
+        # Ledger rows for today, so the stats section has a table worth sorting and a trend
+        # column worth hovering: Beta recorded more, Alpha was checked and Beta never was.
+        today = account_stats.today_local().isoformat()
+        for aid, capture, passed, failed in ((alpha_id, 3600, 5, 5), (beta_id, 7200, 0, 0)):
+            db.session.add(AccountStatDay(account_id=aid, day=today, capture_seconds=capture,
+                                          segments=1, recordings=1, stalls=0,
+                                          checks_passed=passed, checks_failed=failed,
+                                          failovers_away=0))
         db.session.get(Account, alpha_id).status = 'SYNCING'
         log = AccountSyncLog(account_id=alpha_id, started_at=datetime.utcnow(),
                              status='IN_PROGRESS')
@@ -222,3 +230,59 @@ class FromEmptyTests(_Base):
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)
+
+
+class StatsSectionTests(_Base):
+    """The account stats under the list (dev/changelog/1029) are outside the live region:
+    the minute swap must not redraw them or throw away a sort the user picked."""
+    SCENARIO = 'stats_swap'
+
+    def test_the_list_swap_leaves_the_stats_section_alone(self):
+        self.assertTrue(self.obs['hadSection'])
+        self.assertEqual(self.obs['pageFetches'], 1, 'the list itself did refresh')
+        self.assertTrue(self.obs['sameSection'], 'the section was replaced by the swap')
+        self.assertTrue(self.obs['sortKept'])
+
+
+class WindowChipTests(_Base):
+    SCENARIO = 'window_chip'
+
+    def test_a_chip_saves_the_window_to_the_shared_pref_then_follows_its_link(self):
+        self.assertEqual(len(self.obs['posts']), 1)
+        post = self.obs['posts'][0]
+        self.assertEqual(post['path'], '/api/user-prefs/account_stats_window')
+        self.assertEqual(json.loads(post['body']), {'value': '7d'})
+        self.assertEqual(self.obs['navigations'], 1)
+
+
+class TableSortTests(_Base):
+    SCENARIO = 'sort'
+
+    def test_names_sort_both_ways_and_the_totals_row_stays_last(self):
+        self.assertEqual(self.obs['initial'], ['alpha', 'beta', 'total'])
+        self.assertEqual(self.obs['nameAsc'], ['alpha', 'beta', 'total'])
+        self.assertEqual(self.obs['nameDesc'], ['beta', 'alpha', 'total'])
+
+    def test_a_number_column_sorts_biggest_first(self):
+        self.assertEqual(self.obs['captureDesc'], ['beta', 'alpha', 'total'])
+        self.assertEqual(self.obs['ariaCapture'], 'descending')
+
+    def test_an_unmeasured_pass_rate_sorts_last_and_the_phone_chip_drives_the_same_sort(self):
+        """Beta was never checked. Its pass rate is no measurement, not 0%, so it goes
+        last rather than being read as the worst."""
+        self.assertEqual(self.obs['rateDesc'], ['alpha', 'beta', 'total'])
+        self.assertIn('Pass rate', self.obs['chipLabel'])
+
+
+class ColumnTooltipTests(_Base):
+    SCENARIO = 'column_tip'
+
+    def test_the_column_tooltip_names_each_account_in_its_color(self):
+        shown = self.obs['shown']
+        self.assertTrue(shown['visible'])
+        self.assertIn('Alpha', shown['text'])
+        self.assertIn('Beta', shown['text'])
+        self.assertEqual(len(shown['dots']), 2)
+
+    def test_a_tap_elsewhere_closes_it(self):
+        self.assertTrue(self.obs['hiddenAfterTapElsewhere'])

@@ -30,6 +30,9 @@ def create_app(config_overrides=None, start_scheduler=True):
         either arg, so create_app() stays byte-identical in production.
     """
     app = Flask(__name__, template_folder='../templates', static_folder='../static')
+    # '/accounts/' serves the same page as '/accounts' instead of 404ing. A Rule copies
+    # this setting when it is added, so it must be set before any blueprint registers.
+    app.url_map.strict_slashes = False
 
     from .config import load_config, migrate_config
     from .version import __version__

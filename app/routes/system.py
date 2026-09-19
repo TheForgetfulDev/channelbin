@@ -286,7 +286,8 @@ def readiness_run():
         for pending in pending_ondemand_ids():
             payload = run_check(pending)
         return jsonify(success=True, **(payload or evaluate()))
-    check = CHECKS_BY_ID.get(check_id)
+    # A list or dict body value is unhashable; it is an unknown check, not a 500.
+    check = CHECKS_BY_ID.get(check_id) if isinstance(check_id, str) else None
     if check is None:
         return jsonify({'error': f'Unknown check "{check_id}"'}), 404
     if check.cost != ON_DEMAND:
@@ -305,6 +306,8 @@ def readiness_ignore():
     data = request.get_json(silent=True) or {}
     check_id = data.get('check')
     ignored = bool(data.get('ignored'))
+    if not isinstance(check_id, str):
+        return jsonify({'error': f'Unknown check "{check_id}"'}), 404
     try:
         set_check_ignored(check_id, ignored)
     except KeyError:

@@ -21,11 +21,15 @@ Runs against a throwaway temp SQLite DB - never the live dvr.db.
 """
 import contextlib
 import json
+import os
 import unittest
+from datetime import datetime, timedelta
 from unittest import mock
 
+import requests
+
 from app import db, readiness
-from app.database import UserPref
+from app.database import UserPref, XtreamAccount
 from tests.support import seed
 from tests.support.app import make_test_app
 
@@ -353,6 +357,99 @@ class RunTests(_AppCase):
                 mock.patch.dict(readiness.CHECKS_BY_ID, {c.id: c for c in checks}):
             readiness.nav_summary()
         self.assertEqual(called, [])
+
+
+class AccountLoginMaskingTests(_AppCase):
+    """dev/docs/BUGS.md 2026-09-18: a refused or unreachable provider login rendered
+    `requests`' own exception text, which carries the credentialed player_api.php URL, into
+    the check's found string - and from there into /api/readiness, the on-demand cache and
+    the copied report, the one surface built to leave the box."""
+
+    USER = 'readinessuser7731'
+    PASSWORD = 'readinesspass9914'
+    BASE = 'https://provider.example.test:8443'
+
+    def setUp(self):
+        super().setUp()
+        db.session.add(XtreamAccount(name='Masked Provider', base_url=self.BASE,
+                                     username=self.USER, password=self.PASSWORD,
+                                     status='OK'))
+        db.session.commit()
+
+    def _run_with(self, exc):
+        with mock.patch('app.xtream_client.XtreamClient.check_auth', side_effect=exc):
+            return readiness.run_check('account_login')
+
+    def _assert_masked(self, payload):
+        row = next(r for r in payload['checks'] if r['id'] == 'account_login')
+        self.assertEqual(row['status'], readiness.PROBLEM)
+        self.assertIn('Masked Provider', row['found'], 'the failing account must be named')
+        dumped = json.dumps(payload)
+        for secret in (self.USER, self.PASSWORD):
+            self.assertNotIn(secret, dumped)
+            self.assertNotIn(secret, payload['report'])
+
+    def test_a_refused_login_does_not_leak_the_full_url(self):
+        url = (f'{self.BASE}/player_api.php?username={self.USER}'
+               f'&password={self.PASSWORD}')
+        self._assert_masked(self._run_with(requests.HTTPError(
+            f'401 Client Error: Unauthorized for url: {url}')))
+
+    def test_an_unreachable_host_does_not_leak_the_path_and_query(self):
+        self._assert_masked(self._run_with(requests.ConnectionError(
+            "HTTPSConnectionPool(host='provider.example.test', port=8443): Max retries "
+            f'exceeded with url: /player_api.php?username={self.USER}'
+            f'&password={self.PASSWORD} (Caused by NewConnectionError)')))
+
+
+class DbWriteProbeTests(_AppCase):
+    """dev/docs/BUGS.md 2026-09-18 @ 06:23:39 PM: the probe wrote a TEMP table, which lives in
+    SQLite's separate temp database, so a read-only dvr.db answered READY - and with it the
+    record, schedule and safe capabilities."""
+
+    def _make_read_only(self):
+        if hasattr(os, 'geteuid') and os.geteuid() == 0:
+            self.skipTest('root ignores file permissions')
+        # An already-open read-write connection keeps writing after the chmod; only a fresh
+        # one sees the file as read-only, which is what a remounted or chowned file does.
+        for engine in db.engines.values():
+            engine.dispose()
+        os.chmod(self.t.db_path, 0o444)
+
+    def tearDown(self):
+        os.chmod(self.t.db_path, 0o644)   # before cleanup() removes the temp dir
+        super().tearDown()
+
+    def test_a_read_only_database_is_a_problem(self):
+        """The app always runs WAL (db_utils.register_sqlite_pragmas), so this is the WAL
+        case. Asserted on status, not wording: the error text differs by journal mode."""
+        self._make_read_only()
+        writable, why = readiness._probe_db_write()
+        self.assertFalse(writable, 'a read-only database must not probe as writable')
+        self.assertTrue(why)
+        row = next(r for r in readiness.evaluate()['checks'] if r['id'] == 'db_write')
+        self.assertEqual(row['status'], readiness.PROBLEM)
+
+    def test_the_probe_leaves_nothing_behind(self):
+        self.assertEqual(readiness._probe_db_write(), (True, None))
+        db.session.expire_all()
+        self.assertIsNone(db.session.get(UserPref, readiness._DB_WRITE_PROBE_KEY))
+
+
+class AccountSyncSentenceTests(_AppCase):
+    """dev/docs/BUGS.md 2026-09-18 @ 06:23:40 PM: the READY sentence said "the oldest" and
+    showed the newest sync's age."""
+
+    def test_the_ready_sentence_names_the_stalest_sync(self):
+        now = datetime.utcnow()
+        for name, age in (('Fresh', timedelta(minutes=5)), ('Stale', timedelta(hours=11))):
+            db.session.add(XtreamAccount(name=name, base_url='http://p.example.test',
+                                         username='u', password='p', status='OK',
+                                         sync_interval_hours=12, last_sync_at=now - age))
+        db.session.commit()
+        row = next(r for r in readiness.evaluate()['checks'] if r['id'] == 'account_sync')
+        self.assertEqual(row['status'], readiness.READY)
+        self.assertIn('the oldest 11 hours ago', row['found'])
 
 
 class ReportTests(_AppCase):

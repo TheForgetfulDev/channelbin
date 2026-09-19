@@ -119,6 +119,19 @@ def make_recording(status='SCHEDULED', name=None, channel_id=None, group_id=None
     return rec
 
 
+def make_segment(recording, channel, started_at, ended_at, segment_number=0, **kw):
+    """A RecordingSegment captured on `channel` (None for a pre-column row). ended_at=None
+    is a segment still capturing."""
+    seg = RecordingSegment(
+        recording_id=recording.id, channel_id=channel.id if channel is not None else None,
+        segment_number=segment_number,
+        file_path=f'/tmp/seed_{recording.id}_seg_{segment_number:03d}.ts',
+        started_at=started_at, ended_at=ended_at, bytes_recorded=1024, **kw)
+    db.session.add(seg)
+    db.session.flush()
+    return seg
+
+
 def make_channel_test(channel, all_null=True, status='FAILED', **kw):
     """A ChannelTest row. all_null=True leaves every nullable column NULL - the
     pathological row that previously 500'd detail/health rendering.
@@ -130,10 +143,10 @@ def make_channel_test(channel, all_null=True, status='FAILED', **kw):
     is not a pathological value, it means the test is running right now, and every tally
     treats such a row as no result yet (app/routes/channel_tests.py::_tally). Pass
     test_ended_at=None explicitly to seed that row."""
+    kw.setdefault('test_started_at', _UTC_NOW())
     kw.setdefault('test_ended_at', _UTC_NOW())
     ct = ChannelTest(
         channel_id=channel.id,
-        test_started_at=_UTC_NOW(),
         status=status,
         **kw)
     db.session.add(ct)

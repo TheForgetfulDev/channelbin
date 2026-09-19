@@ -285,19 +285,30 @@ def _group_name(ctx, group):
     return f'group {group.id}' if ctx.pseudonymize else group.name
 
 
+#: A user_prefs key nothing else uses; the probe's INSERT is always rolled back.
+_DB_WRITE_PROBE_KEY = '_readiness_write_probe'
+
+
 def _probe_db_write():
     """(writable, why not) for the live database, without writing anything that lasts.
 
-    A SAVEPOINT that is rolled back: it takes the same write path a real commit does - the
-    journal, the lock, the read-only check - and leaves nothing behind. `PRAGMA
-    quick_check` would answer a different question (is the file corrupt) and a bare SELECT
-    answers none at all, since a read-only mount and a full disk both read perfectly.
+    An INSERT into a real table inside a SAVEPOINT that is rolled back: it takes the same
+    write path a real commit does - the journal, the lock, the read-only check - and leaves
+    nothing behind. It must write the MAIN schema: a TEMP table lives in SQLite's separate
+    temp database and succeeds against a read-only dvr.db (dev/docs/BUGS.md 2026-09-18 @
+    06:23:39 PM). `PRAGMA quick_check` would answer a different question (is the file
+    corrupt) and a bare SELECT answers none at all, since a read-only mount and a full disk
+    both read perfectly.
+
+    The rollback is the whole transaction, not just the savepoint - rolling back only the
+    savepoint would hold SQLite's write lock until the request ends. That is safe because
+    Context runs this before it loads any row.
     """
     from . import db
     try:
         db.session.begin_nested()
-        db.session.execute(db.text(
-            'CREATE TEMP TABLE IF NOT EXISTS readiness_write_probe (x INTEGER)'))
+        db.session.execute(db.text('INSERT INTO user_prefs (key, value) VALUES (:k, :v)'),
+                           {'k': _DB_WRITE_PROBE_KEY, 'v': ''})
         db.session.rollback()
         return True, None
     except Exception as exc:                              # noqa: BLE001 - reported, not swallowed
@@ -509,6 +520,7 @@ def _check_account_login(ctx):
     starve a recording of one. One call per account, only when asked, is also nowhere near
     enough traffic to put the account at risk.
     """
+    from .url_utils import mask_account_urls_in_text
     from .xtream_client import XtreamClient
     tested = 'Logged in to each account once, with the credentials stored for it'
     if not ctx.accounts:
@@ -525,8 +537,12 @@ def _check_account_login(ctx):
             XtreamClient(account.base_url, account.username, account.password,
                          timeout=timeout, cfg=ctx.cfg).check_auth()
         except Exception as exc:                          # noqa: BLE001 - reported, not swallowed
+            # requests errors stringify with the credentialed player_api.php URL, and this
+            # text reaches the copied report, which exists to leave the box.
+            said = mask_account_urls_in_text(str(exc), account.base_url, account.m3u_url,
+                                             account.epg_url)
             failures.append(f'{_account_name(ctx, account)}: '
-                            f'{str(exc).strip().splitlines()[0]}')
+                            f'{said.strip().splitlines()[0]}')
     skipped = len(ctx.accounts) - len(xtream)
     tail = f' ({skipped} M3U {_plural(skipped, "account")} have no login step)' if skipped else ''
     if failures:
@@ -576,8 +592,8 @@ def _check_account_sync(ctx):
         return Result(ATTENTION, tested,
                       f'{_account_name(ctx, account)} last synced {int(round(age))} hours ago, '
                       f'on a {interval} hour interval', action)
-    newest = max(a.last_sync_at for a in ctx.accounts)
-    return Result(READY, tested, f'Every account is current, the oldest {_ago(newest, ctx.now)}')
+    oldest = min(a.last_sync_at for a in ctx.accounts)
+    return Result(READY, tested, f'Every account is current, the oldest {_ago(oldest, ctx.now)}')
 
 
 def _check_epg_loaded(ctx):

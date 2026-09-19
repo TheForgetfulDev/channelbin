@@ -54,6 +54,7 @@ APP_DIR = os.path.join(REPO, 'app')
 # imported so the two lists have to be edited together and a silent drop on one side is a
 # red test rather than a no-op.
 RESET = {
+    'app/account_stats.py': {'_catch_up'},
     'app/admission.py': {'_active', '_next_seq'},
     'app/auth.py': {'_failures'},
     'app/channel_search.py': {'_tag_channel_ids_cache', '_standing_breakdown_cache',

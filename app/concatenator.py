@@ -713,11 +713,9 @@ def _run_concatenation(app, recording_id: int, *, reason: str):
                     if not stream_delivered:
                         from .health_score import apply_recording_health_observation
                         apply_recording_health_observation(app, recording_id, 'failed')
-                    # `status` is not optional on a frame in dashboard.js's terminal list:
-                    # it reads `d.status || evt`, so a frame without one relabels the badge
-                    # with the EVENT name and reaches for a badge class that does not exist.
-                    # Same defect dev/changelog/663 fixed on the retry frame; this site was
-                    # the one it missed (dev/docs/BUGS.md 2026-09-14).
+                    # `status` is not optional on a frame that moves a row: dashboard.js
+                    # relabels from it and ignores a frame without one, so this row would
+                    # sit on its old badge (dev/docs/BUGS.md 2026-09-14, dev/changelog/1023).
                     ev.publish(recording_id, CONCATENATION_DONE, {
                         'success': False, 'error': 'no valid segments',
                         'status': REC_STATUS_FAILED,

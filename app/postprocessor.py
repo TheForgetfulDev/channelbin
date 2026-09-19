@@ -478,6 +478,9 @@ def _persist_postprocess_waiting(recording_id, conflict=None):
     consumer that cannot see this process is the one that matters: tools/check_busy.py reads
     the row to decide whether a restart is interrupting real work, and a stamp left behind
     by a wait that ended would tell it a working recording is idle.
+
+    Returns the row's status (None if the row is gone), so a caller can publish the
+    parked/unparked frame without a second read.
     """
     from . import db
     from .database import Recording
@@ -486,11 +489,13 @@ def _persist_postprocess_waiting(recording_id, conflict=None):
     def _do():
         r = db.session.get(Recording, recording_id)
         if r is None:
-            return
+            return None
         set_postprocess_wait(r, conflict)
+        status = r.status
         db.session.commit()
+        return status
 
-    _do()
+    return _do()
 
 
 # ── Re-encode checkpointing ───────────────────────────────────────────────────────────
@@ -1044,7 +1049,9 @@ def run_conversion_supervised(app, recording_id, cmd, output_path, *,
             db.session.commit()
 
         _commit_yielded_event()
-        ev.publish(recording_id, CONVERSION_YIELDED, {'status': REC_STATUS_CONVERTING})
+        # `waiting` is what lets the Dashboard badge the row WAITING live, the same
+        # derivation fmt_utils.rec_status_display makes from the stored stamp.
+        ev.publish(recording_id, CONVERSION_YIELDED, {'status': REC_STATUS_CONVERTING, 'waiting': True})
 
     def _on_resume():
         nonlocal suspending_for
@@ -1059,7 +1066,7 @@ def run_conversion_supervised(app, recording_id, cmd, output_path, *,
             db.session.commit()
 
         _commit_resumed_event()
-        ev.publish(recording_id, CONVERSION_RESUMED, {'status': REC_STATUS_CONVERTING})
+        ev.publish(recording_id, CONVERSION_RESUMED, {'status': REC_STATUS_CONVERTING, 'waiting': False})
 
     def _tally_decode_errors(stderr_path, returncode):
         # Read while the spool still exists - supervise_ffmpeg unlinks it right after this.
@@ -1587,11 +1594,15 @@ def do_postprocess(app, recording_id: int, ts_path: str):
                     # what lets the restart guard tell that apart from a row that is working
                     # (dev/changelog/952); it is cleared on BOTH ways out of the wait, the
                     # cancelled-meanwhile one included.
-                    _persist_postprocess_waiting(recording_id, conflict)
+                    parked_status = _persist_postprocess_waiting(recording_id, conflict)
+                    ev.publish(recording_id, CONVERSION_YIELDED,
+                               {'status': parked_status, 'waiting': True})
                     try:
                         _wait_for_conversion_clear(recording_id, collision_window_seconds)
                     finally:
-                        _persist_postprocess_waiting(recording_id, None)
+                        unparked_status = _persist_postprocess_waiting(recording_id, None)
+                        ev.publish(recording_id, CONVERSION_RESUMED,
+                                   {'status': unparked_status, 'waiting': False})
                     if _stop_if_cancelled('Post-processing stopped while waiting for local '
                                           'resources to free up before converting.'):
                         return

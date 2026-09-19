@@ -245,7 +245,9 @@ def effective_health():
     return Channel.health_score + Channel.manual_health_adjustment
 
 
-def _health_band_expr(cfg):
+def health_band_expr(cfg):
+    """A channel's health band as SQL - the one spelling, shared with app/account_stats.py so
+    the Accounts pages' band counts equal what the `f.health` jump-off finds."""
     bands = health_bands.resolve_bands(cfg)
     band = db.case(
         (Channel.health_score.is_(None), HEALTH_UNTESTED),
@@ -3670,7 +3672,7 @@ def _combined_facet_scan(dim_keys: tuple, state: SearchState, ctx: SearchContext
     group_exprs, group_keys = [], []
     for key, expr in (('acct', Channel.account_id),
                       ('cat', Channel.category_name),
-                      ('health', _health_band_expr(ctx.cfg))):
+                      ('health', health_band_expr(ctx.cfg))):
         if key in dim_keys:
             group_exprs.append(expr.label(f'facet_{key}'))
             group_keys.append(key)
@@ -3826,7 +3828,7 @@ def _facet_counts(dim: Dimension, state: SearchState, ctx: SearchContext,
         return {str(account_id): n for account_id, n in rows}
 
     if dim.key == 'health':
-        band = _health_band_expr(ctx.cfg)
+        band = health_band_expr(ctx.cfg)
         rows = (over(band.label('band'), func.count(counted))
                 .filter(*preds).group_by('band').all())
         counts = dict.fromkeys(HEALTH_VALUES, 0)

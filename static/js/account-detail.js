@@ -162,8 +162,8 @@
   renderHistory();
 
   // ── Section layout (order + hidden), persisted server-side ───────────────
-  const SEC_NAMES = { details: 'Details', content: 'Content', history: 'Sync history',
-                      activity: 'Activity' };
+  const SEC_NAMES = { details: 'Details', content: 'Content', usage: 'Usage',
+                      history: 'Sync history', activity: 'Activity' };
   const sectionLayout = initSectionLayout({
     config: A,
     saveUrl: '/api/user-prefs/account_detail_sections',

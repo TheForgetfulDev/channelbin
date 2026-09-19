@@ -58,7 +58,7 @@ import sqlite3
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from app.database import RESTART_BLOCKING_STATUSES  # noqa: E402
+from app.database import RESTART_BLOCKING_STATUSES, parked_restart_phrase  # noqa: E402
 from app.search_index import STATUS_BUILDING  # noqa: E402
 
 
@@ -78,7 +78,7 @@ def busy_rows(db_path):
     while work is in flight (dev/changelog/362).
     """
     rows, note = _recording_rows(db_path)
-    return [(rid, status, name) for rid, status, name, waiting, _pct in rows
+    return [(rid, status, name) for rid, status, name, waiting, _on, _pct in rows
             if waiting is None], note
 
 
@@ -86,7 +86,8 @@ def parked_rows(db_path):
     """Return ``(rows, note)`` for recordings in a blocking status that are parked - doing
     no work, waiting on another recording to finish with the machine.
 
-    ``rows`` is a list of ``(id, status, name, progress_pct)`` tuples. **These do not block
+    ``rows`` is a list of ``(id, status, name, waiting_on_name, progress_pct)`` tuples,
+    ``waiting_on_name`` being the recording it parked for. **These do not block
     a restart**, which is the whole reason they are told apart from busy_rows(): a process
     that is paused is not, technically, running. On 2026-09-13 two recordings parked in
     ANALYZING, each polling once a minute and doing nothing at all, refused every restart
@@ -99,17 +100,20 @@ def parked_rows(db_path):
     allowed through (dev/changelog/952).
     """
     rows, note = _recording_rows(db_path)
-    return [(rid, status, name, pct) for rid, status, name, waiting, pct in rows
+    return [(rid, status, name, waiting_on, pct)
+            for rid, status, name, waiting, waiting_on, pct in rows
             if waiting is not None], note
 
 
 def _recording_rows(db_path):
-    """Every recording in a blocking status, with the two columns that say whether it is
-    actually working: ``(id, status, name, postprocess_waiting_since, progress_pct)``.
+    """Every recording in a blocking status, with the columns that say whether it is
+    actually working and, if parked, on what:
+    ``(id, status, name, postprocess_waiting_since, postprocess_waiting_on_name,
+    progress_pct)``.
 
     Same "missing or unreadable DB reads as idle" contract as the checks below. The waiting
-    column is read defensively - a database older than its migration does not have it, and
-    an upgrade in progress must not be told a fresh install is unreadable.
+    columns are read defensively - a database older than their migrations does not have
+    them, and an upgrade in progress must not be told a fresh install is unreadable.
     """
     if not os.path.exists(db_path):
         return [], f'no database at {db_path}, assuming idle'
@@ -118,11 +122,13 @@ def _recording_rows(db_path):
     conn = sqlite3.connect(f'file:{db_path}?mode=ro', uri=True)
     try:
         cols = {r[1] for r in conn.execute('PRAGMA table_info(recordings)').fetchall()}
-        waiting_col = ('postprocess_waiting_since' if 'postprocess_waiting_since' in cols
-                       else 'NULL')
+        waiting_col, waiting_on_col = (
+            c if c in cols else 'NULL'
+            for c in ('postprocess_waiting_since', 'postprocess_waiting_on_name'))
         placeholders = ','.join('?' * len(RESTART_BLOCKING_STATUSES))
         rows = conn.execute(
-            f'SELECT id, status, name, {waiting_col}, conversion_progress_pct '
+            f'SELECT id, status, name, {waiting_col}, {waiting_on_col}, '
+            f'conversion_progress_pct '
             f'FROM recordings WHERE status IN ({placeholders}) ORDER BY id',
             RESTART_BLOCKING_STATUSES,
         ).fetchall()
@@ -287,14 +293,12 @@ def main():
 
     for rid, status, name in rows:
         print(f'  #{rid}  {status}  {name}')
-    for rid, status, name, pct in parked:
+    for rid, status, name, waiting_on, pct in parked:
         # Named, never counted: these are printed whether or not anything else blocks, and
-        # they never reach the `kinds` list below. The cost line is the point - a parked
+        # they never reach the `kinds` list below. The cost is the point - a parked
         # conversion is holding a real encode that a restart throws away.
-        cost = (f'restarting discards the {pct:.0f}% encoded so far'
-                if status == 'CONVERTING' and pct else 'nothing is running for it yet')
-        print(f'  #{rid}  {status}  {name} - parked waiting on another recording, '
-              f'not blocking ({cost})')
+        print(f'  #{rid}  {status}  {name} - '
+              f'{parked_restart_phrase(status, waiting_on, pct)}')
     for jid, name in health_jobs:
         print(f'  health check #{jid} {name!r} is running')
     for tid, channel_name in tests:

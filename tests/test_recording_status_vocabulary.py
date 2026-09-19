@@ -6,16 +6,14 @@ dev/changelog/867 ruled the stored words are jargon. That rename reached the Rec
 and the recording detail page and stopped there, so two surfaces kept printing the stored
 enum and the same recording read as JOINING on one page and CONCATENATING on another.
 
-Three things are asserted here, and the Dashboard's own half is in
-tests/test_dashboard_page_conformance.py beside that page's other conformance cases:
+Two things are asserted here. The Dashboard's own half is in
+tests/test_dashboard_page_conformance.py beside that page's other conformance cases, and its
+live SSE relabel in tests/test_dashboard_live_js.py:
 
   * the label table has exactly one definition (app/fmt_utils.py) and every status the
     database can hold is in it - an unknown status renders visibly rather than landing in a
     real state's branch (CLAUDE.md, "states are enumerated");
-  * the channel detail page's recording-observations table renders the label, not the enum;
-  * every SSE frame dashboard.js treats as terminal carries a `status` key. That one is a
-    genuine defect, not wording: the handler reads `d.status || evt`, so a frame without one
-    relabels the badge with the EVENT name (dev/docs/BUGS.md 2026-09-14 @ 10:12:44 AM ET).
+  * the channel detail page's recording-observations table renders the label, not the enum.
 
 Runs against a throwaway temp SQLite DB - never the live dvr.db.
   python3 -m unittest tests.test_recording_status_vocabulary
@@ -119,53 +117,11 @@ class ChannelPageStatusTests(unittest.TestCase):
         self.assertEqual('CANCELLED', m.group(1).strip())
 
 
-class TerminalSseFrameTests(unittest.TestCase):
-    """dev/docs/BUGS.md 2026-09-14 @ 10:12:44 AM ET. static/js/dashboard.js relabels a row's
-    badge on any of eight events with `d.status || evt`, so a frame missing `status` puts an
-    event type in a status badge and asks for a CSS class that does not exist.
-    dev/changelog/663 fixed this once on the retry frame; the concat's no-valid-segments
-    frame was the site it missed.
-
-    Asserted statically over the source rather than by driving a concat, because the
-    invariant is about every publish site in that list, not about one of them: a new one
-    added without `status` is the next instance.
-    """
-
-    def setUp(self):
-        self.root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-
-    def _read(self, rel):
-        with open(os.path.join(self.root, rel)) as fh:
-            return fh.read()
-
-    def test_dashboard_js_still_falls_back_to_the_event_name(self):
-        """The premise of the test below. If this fallback is ever removed, the rule it
-        enforces can be relaxed - but until then a missing key is a visible defect."""
-        self.assertIn('d.status || evt', self._read('static/js/dashboard.js'))
-
-    def test_every_terminal_publish_site_carries_a_status(self):
-        js = self._read('static/js/dashboard.js')
-        m = re.search(r'if \(\[([^\]]*)\]\.includes\(evt\)\) \{\s*handleTerminal', js, re.S)
-        self.assertIsNotNone(m, 'could not find the terminal event list in dashboard.js')
-        terminal = {t.strip().strip("'\"") for t in m.group(1).split(',') if t.strip()}
-        # The three that are statuses rather than event types are published as statuses
-        # elsewhere; the event-type half is what this walks.
-        event_types = terminal - {'COMPLETED', 'FAILED', 'ABORTED'}
-        self.assertTrue(event_types)
-
-        offenders = []
-        for rel in ('app/concatenator.py', 'app/postprocessor.py', 'app/recorder.py',
-                    'app/watchdog.py'):
-            src = self._read(rel)
-            for call in re.finditer(r'ev\.publish\(\s*[^,]+,\s*([A-Za-z_\'"]+)\s*,\s*\{(.*?)\}\)',
-                                    src, re.S):
-                name = call.group(1).strip().strip("'\"")
-                if name not in event_types:
-                    continue
-                if "'status'" not in call.group(2):
-                    line = src[:call.start()].count('\n') + 1
-                    offenders.append(f'{rel}:{line} publishes {name} with no status')
-        self.assertEqual([], offenders, '; '.join(offenders))
+# The terminal-frame guard that lived here (dev/docs/BUGS.md 2026-09-14 @ 10:12:44 AM ET)
+# walked dashboard.js's event-name list. That list is gone - the page keys on `status` - so
+# the broader rule, every status-moving publish in app/ carries `status`, is now
+# tests/test_dashboard_live_js.py::EveryStatusMovingPublishCarriesStatusTests
+# (dev/changelog/1023).
 
 
 if __name__ == '__main__':

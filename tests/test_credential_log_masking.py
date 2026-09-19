@@ -42,6 +42,19 @@ class MaskCredsInTextTests(unittest.TestCase):
         out = mask_creds_in_text(f'failed ({BARE_URL})')
         self.assertNotIn('s3cret', out)
 
+    def test_masks_the_request_target_of_an_unreachable_host(self):
+        """BUGS.md 2026-09-18: requests' ConnectionError carries only the path and query,
+        with no scheme, so the URL-token pass never saw it."""
+        for target in ('/player_api.php?username=joe&password=s3cret',
+                       '/live/joe/s3cret/123.ts', '/joe/s3cret/123.ts'):
+            with self.subTest(target=target):
+                out = mask_creds_in_text(
+                    "HTTPConnectionPool(host='h', port=80): Max retries exceeded with "
+                    f"url: {target} (Caused by NewConnectionError('refused'))")
+                self.assertNotIn('joe', out)
+                self.assertNotIn('s3cret', out)
+                self.assertIn('Max retries exceeded with url: /', out)
+
     def test_text_without_url_passes_through_identically(self):
         text = 'Sync complete for account 3: 120 channels, 4000 EPG entries'
         self.assertEqual(mask_creds_in_text(text), text)

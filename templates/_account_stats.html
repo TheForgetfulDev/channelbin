@@ -1,0 +1,244 @@
+{#  The account stats (DESIGN.md §17.7, dev/changelog/1029). Every page that shows them
+    renders these macros from ONE `app/account_stats_view.py::section_context()` call, so
+    the Accounts list, a one-account install and the account page draw the same thing from
+    the same code - a change here changes every surface.
+
+    `s` is that context. `bands` is the request's `health_bands` global, passed in because
+    an imported macro does not see the page's context.
+
+    Two rules every macro here keeps:
+    - A zero is faint text, never a link (§17.3). A pass rate with no checks is a faint "-",
+      never 0%.
+    - Account colors are user data and go on the element as an inline style, the way
+      .color-dot does; every colored mark also carries the account's name. Health bands use
+      the band classes, never an account color. #}
+
+{% macro num(n) -%}
+{%- if n %}{{ '{:,}'.format(n | int) }}{% else %}<span class="text-faint">0</span>{% endif -%}
+{%- endmacro %}
+
+{% macro capture(seconds) -%}
+{%- if seconds %}{{ seconds | duration }}{% else %}<span class="text-faint">0</span>{% endif -%}
+{%- endmacro %}
+
+{% macro rate(r) -%}
+{%- if r is none %}<span class="text-faint">-</span>{% else %}{{ (r * 100) | round | int }}%{% endif -%}
+{%- endmacro %}
+
+{# The window control: one row, scoping everything under it. Real links, so they work with
+   no script and open in a new tab like any link; account-stats.js saves the pick first on
+   a plain click so every page that shows these stats opens on it next time. `anchor` is
+   the section the chips sit in, so the reload lands back on it rather than at the top of
+   a page where the stats are below the list or below two other cards. #}
+{% macro window_chips(s, anchor) -%}
+<div class="acst-win" role="group" aria-label="Time window">
+  {%- for key, label in s.windows %}
+  <a class="chip{% if key == s.window %} active{% endif %}" href="?w={{ key }}#{{ anchor }}" data-win="{{ key }}"
+     {% if key == s.window %}aria-current="true"{% endif %}>{{ label }}</a>
+  {%- endfor %}
+</div>
+{%- endmacro %}
+
+{% macro notice(s) -%}
+{% if s.notice %}<p class="acst-notice text-faint">{{ s.notice.text }}</p>{% endif %}
+{%- endmacro %}
+
+{# Health bands: status colors from the band classes, never account colors. #}
+{% macro band_bar(cur, bands) -%}
+{% if not cur.tested -%}
+<span class="acst-untested">Not tested yet</span>
+{%- else -%}
+<div class="acst-bandbar">
+  <div class="stackbar">
+    {%- for b in bands if cur.bands[b.key] %}<span class="stackbar-seg {{ b.css }}" style="flex:{{ cur.bands[b.key] }}"></span>{% endfor -%}
+  </div>
+  <div class="stackbar-legend">
+    {%- for b in bands %}<span class="stackbar-key {{ b.css }}"><i class="stackbar-dot"></i>{{ b.name }} <strong>{{ '{:,}'.format(cur.bands[b.key]) }}</strong></span>{% endfor -%}
+  </div>
+</div>
+{%- endif %}
+{%- endmacro %}
+
+{# The list row's second line: what the account is right now, then its health bands. The
+   labels carry the definitions; nothing here navigates (accounts.js NO_NAV skips
+   [data-tip]). #}
+{% macro row_more(cur, s, bands) -%}
+<span class="a-more">
+  <span class="a-x"><span class="a-k" data-tip="{{ s.tips.in_group }}">In a group</span>{{ num(cur.in_group) }}</span>
+  <span class="a-x"><span class="a-k" data-tip="{{ s.tips.rec_enabled }}">Recording on</span>{{ num(cur.recording_memberships) }}</span>
+  <span class="a-x"><span class="a-k" data-tip="{{ s.rows_tip }}">Guide rows</span>{{ num(cur.guide_rows_fed) }} <span class="text-faint">of {{ '{:,}'.format(cur.guide_rows_total) }}</span></span>
+  <span class="a-x"><span class="a-k" data-tip="{{ s.tips.epg }}">With EPG</span>{{ num(cur.epg.with_epg) }}</span>
+  <span class="a-x"><span class="a-k" data-tip="{{ s.tips.avg }}">Avg score</span>
+    {%- if cur.avg_score is none %}<span class="text-faint">-</span>
+    {%- else %}<span class="{{ cur.avg_score | health_css(bands) }} hb-text">{{ cur.avg_score | round | int }}</span>{% endif -%}
+  </span>
+  <span class="a-x"><span class="a-k" data-tip="{{ s.failing_tip }}">Failing now</span>
+    {%- if cur.failing %}<span class="hb-poor hb-text">{{ '{:,}'.format(cur.failing) }}</span>{% else %}<span class="text-faint">0</span>{% endif -%}
+  </span>
+</span>
+<span class="a-bands"><span class="a-k" data-tip="{{ s.tips.bands }}">Health bands</span>{{ band_bar(cur, bands) }}</span>
+{%- endmacro %}
+
+{# A trend chart: stacked columns, one axis labeled under them, the peak marked. The
+   breakdown is on each column's tooltip (account-stats.js), not in a legend. #}
+{% macro chart(c) -%}
+{% if c.empty -%}
+<div class="acst-empty">{{ c.empty }}</div>
+{%- else -%}
+<div class="acst-plot" data-tips="{{ c.tips }}">
+  <span class="acst-peak">{{ c.peak }}</span>
+  <div class="acst-cols">
+    {%- for col in c.cols %}<div class="acst-col" data-col="{{ loop.index0 }}" tabindex="0">
+      {%- if col.zero %}<i class="zero"></i>
+      {%- else %}{% for seg in col.segs %}<i{% if seg.cls %} class="{{ seg.cls }}"{% endif %} style="height:{{ seg.pct }}%{% if seg.color %};background:{{ seg.color }}{% endif %}"></i>{% endfor %}{% endif -%}
+    </div>{% endfor -%}
+  </div>
+  <div class="acst-axis">{% for label in c.axis %}<span>{{ label }}</span>{% endfor %}</div>
+</div>
+{%- endif %}
+{%- endmacro %}
+
+{% macro chart_head(title, c) -%}
+<h2>{{ title }}</h2>{% if c.unit %}<span class="acst-cardscope">per {{ c.unit }}</span>{% endif %}
+{%- endmacro %}
+
+{% macro pie_card(p) -%}
+<div class="card acst-share">
+  <div class="card-head"><h2>{{ p.title }}</h2><span class="acst-cardscope">{{ p.scope }}</span></div>
+  <div class="card-body">
+    {% if not p.total -%}
+    <div class="acst-share-empty">{{ p.empty }}</div>
+    {%- else -%}
+    <div class="acst-pie">
+      <svg viewBox="0 0 100 100" role="img" aria-label="{{ p.title }}">
+        {%- for arc in p.arcs %}<circle r="25" cx="50" cy="50" fill="none" stroke="{{ arc.color }}" stroke-width="50" stroke-dasharray="{{ arc.dash }}" stroke-dashoffset="{{ arc.offset }}" transform="rotate(-90 50 50)" data-tip="{{ arc.tip }}"></circle>{% endfor -%}
+      </svg>
+      <div class="acst-plegend">
+        {%- for part in p.parts %}
+        <span class="acst-pl"><span class="stackbar-dot" style="background:{{ part.color }}"></span><span class="nm">{{ part.name }}</span><strong>{% if part.value %}{{ part.text }}{% else %}<span class="text-faint">0</span>{% endif %}</strong><span class="pc">{{ part.share }}</span></span>
+        {%- endfor %}
+      </div>
+    </div>
+    <div class="acst-share-tot">{{ p.total_text }} in all</div>
+    {%- endif %}
+  </div>
+</div>
+{%- endmacro %}
+
+{# The Usage card: one account's windowed numbers and its two trends. The account page's
+   section and a one-account /accounts both render this, so they are one component. #}
+{% macro usage_card(s, a) -%}
+{% set w = s.windowed[a.id] %}
+<div class="card" data-section="usage" id="usage-card">
+  <div class="card-head"><h2>Usage</h2><div class="card-head-actions">{{ window_chips(s, 'usage-card') }}</div></div>
+  <div class="card-body acst-body">
+    <p class="acst-scope">Everything in this card covers {% if s.window == 'all' %}all time{% else %}the last {{ s.window_label }}{% endif %}.</p>
+    {{ notice(s) }}
+    <div class="statlist">
+      <div class="srow"><span class="sk">Recorded time</span><span class="sv tip-plain" data-tip="{{ s.tips.capture }}{{ s.window_note }}">{{ capture(w.capture_seconds) }}</span></div>
+      <div class="srow"><span class="sk">Recordings</span><span class="sv tip-plain" data-tip="{{ s.tips.recordings }}{{ s.window_note }}">{{ num(w.recordings) }}</span></div>
+      <div class="srow"><span class="sk">Stalls during capture</span><span class="sv tip-plain" data-tip="{{ s.tips.stalls }}{{ s.window_note }}">{{ num(w.stalls) }}</span></div>
+      <div class="srow"><span class="sk">Failed away from</span><span class="sv tip-plain" data-tip="{{ s.tips.failovers }}{{ s.window_note }}">{{ num(w.failovers_away) }}</span></div>
+      <div class="srow"><span class="sk">Health checks passed</span><span class="sv tip-plain" data-tip="{{ s.tips.passed }}{{ s.window_note }}">{{ num(w.checks_passed) }}</span></div>
+      <div class="srow"><span class="sk">Health checks failed</span><span class="sv{% if w.checks_failed %} bad{% endif %} tip-plain" data-tip="{{ s.tips.failed }}{{ s.window_note }}">{{ num(w.checks_failed) }}</span></div>
+      <div class="srow"><span class="sk">Pass rate</span><span class="sv tip-plain" data-tip="{{ s.tips.rate }}{{ s.window_note }}">{{ rate(w.pass_rate) }}</span></div>
+    </div>
+    <div class="acst-boxes">
+      <div class="acst-box"><div class="acst-box-h">{{ chart_head('Recorded time', s.charts.capture) }}</div>{{ chart(s.charts.capture) }}</div>
+      <div class="acst-box"><div class="acst-box-h">{{ chart_head('Health checks', s.charts.checks) }}</div>{{ chart(s.charts.checks) }}</div>
+    </div>
+  </div>
+</div>
+{%- endmacro %}
+
+{# The comparison (two or more accounts): the window row, one windowed table whose every
+   column sorts, the part-of-the-whole pies, then the two trends stacked by account. #}
+{% macro comparison(s) -%}
+{%- set SORTS = [
+  ('name', 'Account', 'capture'),
+  ('capture', 'Recorded time', 'capture'),
+  ('recordings', 'Recordings', 'recordings'),
+  ('stalls', 'Stalls', 'stalls'),
+  ('failovers', 'Failed away from', 'failovers'),
+  ('passed', 'Checks passed', 'passed'),
+  ('failed', 'Checks failed', 'failed'),
+  ('rate', 'Pass rate', 'rate'),
+] -%}
+<div class="acst-top"><h2>Usage</h2>{{ window_chips(s, 'acct-stats') }}</div>
+<p class="acst-scope">Recorded time, stalls, failovers and health checks {% if s.window == 'all' %}across all time{% else %}in the last {{ s.window_label }}{% endif %}. The guide and group shares, and the numbers on each account above, are always current.</p>
+{{ notice(s) }}
+<div class="card acst-table-card">
+  <div class="card-head"><h2>By account</h2>
+    <div class="card-head-actions">
+      {# Phones lose the header row to the card layout, so the sort moves to a chip
+         (DESIGN.md 9.4), the pattern the recordings list and the group page use. #}
+      <div class="menu-wrap sort-chip-wrap">
+        <button class="chip" type="button" id="acst-sort-chip" data-menu>Sort: <span class="acst-sort-label">Account order</span></button>
+        <div class="menu pop-left"><div class="pop-title">Sort by</div>
+          {%- for key, label, _ in SORTS %}<button class="menu-item" type="button" data-sort="{{ key }}">{{ label }}</button>{% endfor -%}
+        </div>
+      </div>
+    </div>
+  </div>
+  <div class="card-body">
+    <div class="table-scroll">
+      <table class="tbl tbl-cards acst-tbl" id="acst-table">
+        <thead><tr>
+          {%- for key, label, tip in SORTS %}
+          <th class="sortable{% if key != 'name' %} num{% endif %}" data-sort="{{ key }}" aria-sort="none"
+              data-tip="{% if key != 'name' %}{{ s.tips[tip] }}&#10;&#10;{% endif %}Click to sort; click again to reverse.">{{ label }}<span class="arr"></span></th>
+          {%- endfor %}
+        </tr></thead>
+        <tbody>
+          {%- for a in s.accounts %}{% set w = s.windowed[a.id] %}
+          <tr data-id="{{ a.id }}" data-order="{{ loop.index0 }}" data-name="{{ a.name | lower }}"
+              data-capture="{{ w.capture_seconds }}" data-recordings="{{ w.recordings }}"
+              data-stalls="{{ w.stalls }}" data-failovers="{{ w.failovers_away }}"
+              data-passed="{{ w.checks_passed }}" data-failed="{{ w.checks_failed }}"
+              data-rate="{{ '' if w.pass_rate is none else w.pass_rate }}">
+            <td data-label="Account"><a class="acst-acct" href="{{ url_for('accounts.account_detail', account_id=a.id) }}"><span class="color-dot" style="background:{{ a.color }}"></span><span class="nm">{{ a.name }}</span></a></td>
+            <td class="num" data-label="Recorded time"><span class="tip-plain" data-tip="{{ s.tips.capture }}">{{ capture(w.capture_seconds) }}</span></td>
+            <td class="num" data-label="Recordings"><span class="tip-plain" data-tip="{{ s.tips.recordings }}">{{ num(w.recordings) }}</span></td>
+            <td class="num" data-label="Stalls"><span class="tip-plain" data-tip="{{ s.tips.stalls }}">{{ num(w.stalls) }}</span></td>
+            <td class="num" data-label="Failed away from"><span class="tip-plain" data-tip="{{ s.tips.failovers }}">{{ num(w.failovers_away) }}</span></td>
+            <td class="num" data-label="Checks passed"><span class="tip-plain" data-tip="{{ s.tips.passed }}">{{ num(w.checks_passed) }}</span></td>
+            <td class="num" data-label="Checks failed"><span class="tip-plain" data-tip="{{ s.tips.failed }}">{{ num(w.checks_failed) }}</span></td>
+            <td class="num" data-label="Pass rate"><span class="tip-plain" data-tip="{{ s.tips.rate }}">{{ rate(w.pass_rate) }}</span></td>
+          </tr>
+          {%- endfor %}
+          {# The footing, not an account: it never sorts. #}
+          {% set t = s.totals %}
+          <tr class="acst-total">
+            <td data-label="Account">All accounts</td>
+            <td class="num" data-label="Recorded time">{{ capture(t.capture_seconds) }}</td>
+            <td class="num" data-label="Recordings">{{ num(t.recordings) }}</td>
+            <td class="num" data-label="Stalls">{{ num(t.stalls) }}</td>
+            <td class="num" data-label="Failed away from">{{ num(t.failovers_away) }}</td>
+            <td class="num" data-label="Checks passed">{{ num(t.checks_passed) }}</td>
+            <td class="num" data-label="Checks failed">{{ num(t.checks_failed) }}</td>
+            <td class="num" data-label="Pass rate">{{ rate(t.pass_rate) }}</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>
+<div class="acst-grid acst-grid-shares">
+  {%- for p in s.pies %}{{ pie_card(p) }}{% endfor -%}
+</div>
+<div class="acst-grid acst-grid-trends">
+  <div class="card acst-trend"><div class="card-head">{{ chart_head('Recorded time', s.charts.capture) }}</div><div class="card-body">{{ chart(s.charts.capture) }}</div></div>
+  <div class="card acst-trend"><div class="card-head">{{ chart_head('Health checks', s.charts.checks) }}</div><div class="card-body">{{ chart(s.charts.checks) }}</div></div>
+</div>
+{%- endmacro %}
+
+{# The section as /accounts shows it: the comparison for two or more accounts, the Usage
+   card for one (deliberate, dev/changelog/1027). Nothing at all for none - the list's
+   own empty state already says what to do. #}
+{% macro section(s) -%}
+{% if s.accounts %}
+<section class="acst" id="acct-stats">
+  {% if s.single %}{{ usage_card(s, s.accounts[0]) }}{% else %}{{ comparison(s) }}{% endif %}
+</section>
+{% endif %}
+{%- endmacro %}

@@ -68,10 +68,15 @@ class Band:
     def css(self):
         return f'hb-{self.key}'
 
+    @property
+    def name(self):
+        """The bare band name ("Fair"), where `label` carries its range ("Fair (50-79)")."""
+        return BAND_NAMES[self.key]
+
     def as_dict(self):
         """The wire shape handed to JS and to templates. `css` is included so no consumer
         rebuilds the class name by gluing a prefix to the key."""
-        return {'key': self.key, 'name': BAND_NAMES[self.key], 'label': self.label,
+        return {'key': self.key, 'name': self.name, 'label': self.label,
                 'floor': self.floor, 'ceiling': self.ceiling, 'css': self.css}
 
     def __repr__(self):

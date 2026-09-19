@@ -37,6 +37,11 @@ log = logging.getLogger(__name__)
 # that normally delimit a URL in log output and Python reprs.
 _URL_IN_TEXT_RE = re.compile(r'https?://[^\s\'"<>()\[\]]+')
 
+# The request target urllib3 prints in a MaxRetryError: a path, never a full URL. It is
+# masked by lending it a throwaway origin so every mask_creds() rule applies unchanged.
+_REQUEST_TARGET_RE = re.compile(r'(\burl: )(/[^\s\'"<>()\[\]]*)')
+_TARGET_ORIGIN = 'http://request-target.invalid'
+
 # Punctuation that commonly trails a URL in prose ("...from http://h/a/b/c.") and would
 # otherwise defeat the $-anchored bare-path rule.
 _TRAILING_PUNCT = '.,;:!?'
@@ -65,8 +70,18 @@ def mask_creds_in_text(text):
 
     Used for log messages, exception tracebacks (requests embeds the full credentialed
     URL in its exception text), and any error string persisted to the DB.
+
+    Also masks the scheme-less request target urllib3 names when a host cannot be
+    reached (`Max retries exceeded with url: /player_api.php?username=U&password=P`),
+    which carries the same credentials with no `://` in front of them.
     """
-    if not text or '://' not in text:
+    if not text:
+        return text
+    if 'url: /' in text:
+        text = _REQUEST_TARGET_RE.sub(
+            lambda m: m.group(1) + mask_creds(_TARGET_ORIGIN + m.group(2))[len(_TARGET_ORIGIN):],
+            text)
+    if '://' not in text:
         return text
 
     def _replace(match):
@@ -143,9 +158,20 @@ def mask_account_urls_in_text(text, *urls):
     """
     if not text:
         return text
-    for url in sorted({u for u in urls if u}, key=len, reverse=True):
+    urls = {u for u in urls if u}
+    for url in sorted(urls, key=len, reverse=True):
         text = text.replace(url, mask_url_path(url))
+    # The same URL's path on its own, as urllib3 names it when the host is unreachable -
+    # for a path-token provider that path is the whole credential.
+    paths = {_path_and_query(u) for u in urls} - {'', '/'}
+    for path in sorted(paths, key=len, reverse=True):
+        text = text.replace(path, '/***')
     return mask_creds_in_text(text)
+
+
+def _path_and_query(url):
+    match = re.match(r'(?i)^https?://[^/?#\s]+([/?#]\S*)?$', url)
+    return (match.group(1) or '') if match else ''
 
 
 class CredentialMaskingFilter(logging.Filter):

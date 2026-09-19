@@ -5,6 +5,7 @@ import re
 import signal
 import subprocess
 import threading
+import uuid
 import yaml
 from io import BytesIO
 
@@ -479,9 +480,16 @@ def api_settings_reveal():
     return jsonify({'success': True, 'value': value if isinstance(value, str) else ''})
 
 
+# Minted once per process, at import. The restart-wait modal holds the value the POST
+# below answered with and reloads when a heartbeat reports a different one - proof the
+# process was replaced, rather than an inference from catching a failed poll, which a
+# container restart faster than one poll interval never produced (dev/changelog/1022).
+_INSTANCE_ID = uuid.uuid4().hex
+
+
 @settings_bp.route('/api/settings/restart-status')
 def api_restart_status():
-    return jsonify({'restart_needed': is_restart_needed()})
+    return jsonify({'restart_needed': is_restart_needed(), 'instance_id': _INSTANCE_ID})
 
 
 # What each blocking status means to a human deciding whether to restart anyway.
@@ -497,26 +505,50 @@ _BLOCKING_PHRASE = {
 }
 
 
-def _restart_blocking_rows():
+def _restart_recordings():
+    """Recordings in a blocking status, split ``(working, parked)`` on
+    postprocess_waiting_since exactly as tools/check_busy.py splits them: a parked row is
+    doing no work and does not block a restart (dev/changelog/952, 1026)."""
+    from ..database import Recording, RESTART_BLOCKING_STATUSES
+    rows = (Recording.query
+            .filter(Recording.status.in_(RESTART_BLOCKING_STATUSES))
+            .order_by(Recording.id)
+            .all())
+    return ([r for r in rows if r.postprocess_waiting_since is None],
+            [r for r in rows if r.postprocess_waiting_since is not None])
+
+
+def _restart_parked_rows(parked=None):
+    """Parked recordings as the restart surfaces list them: not blocking, but named with
+    what they wait on and what a restart costs them, in the CLI's own words."""
+    from ..database import parked_restart_phrase
+    if parked is None:
+        parked = _restart_recordings()[1]
+    return [{
+        'id': r.id,
+        'name': r.name,
+        'status': r.status,
+        'label': f'#{r.id} "{r.name}" is ' + parked_restart_phrase(
+            r.status, r.postprocess_waiting_on_name, r.conversion_progress_pct),
+    } for r in parked]
+
+
+def _restart_blocking_rows(busy):
     """Everything a restart would interrupt, as the modal's row list.
 
     The same set tools/check_busy.py blocks on, so the two restart surfaces - this button
-    and the CLI - never disagree about what is in flight. Both read database rows rather
-    than app/admission.py's in-memory registry: the CLI runs in a separate process and
-    cannot see it, and a surface that saw more than the other would be the harder thing to
-    reason about. That registry's docstring is the authority on what it is for.
+    and the CLI - never disagree about what is in flight. A parked recording is not in it;
+    _restart_parked_rows() reports those. Both read database rows rather than
+    app/admission.py's in-memory registry: the CLI runs in a separate process and cannot
+    see it, and a surface that saw more than the other would be the harder thing to reason
+    about. That registry's docstring is the authority on what it is for.
 
     Every row here is synthetic except a recording's - 'id' means "recording id" to the
     modal, so anything else sends None rather than an id from another table.
     """
-    from ..database import (Recording, RESTART_BLOCKING_STATUSES, OnDemandTestJob,
-                            ChannelTest, Account)
+    from ..database import OnDemandTestJob, ChannelTest, Account
     from ..search_index import rebuilding_index_names
 
-    busy = (Recording.query
-            .filter(Recording.status.in_(RESTART_BLOCKING_STATUSES))
-            .order_by(Recording.id)
-            .all())
     rows = [{
         'id': r.id,
         'name': r.name,
@@ -571,17 +603,28 @@ def _restart_blocking_rows():
     return rows
 
 
+@settings_bp.route('/api/settings/restart-parked')
+def api_restart_parked():
+    """Parked recordings, for the Restart confirm to name before anyone clicks. They never
+    make the POST below refuse, so without this a restart with only a parked conversion in
+    flight would discard its partial encode with nothing said (dev/changelog/1026). Kept
+    off restart-status, which every page polls."""
+    return jsonify({'success': True, 'parked': _restart_parked_rows()})
+
+
 @settings_bp.route('/api/settings/restart', methods=['POST'])
 def api_restart_now():
     force = bool((request.get_json(silent=True) or {}).get('force'))
     # The blocking-list modal (static/js/maintenance.js::doRestart) renders whatever
     # 'blocking' sends it, so naming a new blocker here is the whole change on the JS side.
-    rows = _restart_blocking_rows()
+    working, parked = _restart_recordings()
+    rows = _restart_blocking_rows(working)
 
     if rows and not force:
         return jsonify({
             'error': 'Work is in flight: ' + '; '.join(r['label'] for r in rows),
             'blocking': rows,
+            'parked': _restart_parked_rows(parked),
         }), 409
 
     if os.environ.get('CHANNELBIN_DOCKER'):
@@ -593,7 +636,7 @@ def api_restart_now():
         # it back - the same SIGTERM path run.py's handler already uses when restart.sh
         # sends it outside a container.
         _schedule_self_restart()
-        return jsonify({'success': True, 'forced': bool(rows)})
+        return jsonify({'success': True, 'forced': bool(rows), 'instance_id': _INSTANCE_ID})
 
     # This route is the enforcement point, so the script is always invoked with --force:
     # its own busy guard would otherwise refuse a restart already approved here, and the
@@ -606,7 +649,7 @@ def api_restart_now():
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
         start_new_session=True,
     )
-    return jsonify({'success': True, 'forced': bool(rows)})
+    return jsonify({'success': True, 'forced': bool(rows), 'instance_id': _INSTANCE_ID})
 
 
 def _schedule_self_restart():

@@ -33,7 +33,7 @@ from app.channel_groups import guide_scope_channel_ids  # noqa: E402
 from app.channel_search import (  # noqa: E402
     DimensionFilter, SearchContext, SearchState, search)
 from app.database import Channel  # noqa: E402
-from app.routes.accounts import _guide_counts  # noqa: E402
+from app.account_stats import guide_counts  # noqa: E402
 from app.routes.guide import _guide_row_entries  # noqa: E402
 
 
@@ -165,21 +165,21 @@ class ConsumersAgreeTests(_GuideScopeTestCase):
     def test_the_account_count_matches_its_own_link(self):
         """The account page renders this number as a link into `f.other=guide`. Reading the
         raw flag here made the two disagree by more than 3x on the live database."""
-        self.assertEqual(_guide_counts()[self.acct.id], len(self.search_names()))
+        self.assertEqual(guide_counts()[self.acct.id], len(self.search_names()))
 
     def test_the_account_count_is_the_scope_count(self):
-        self.assertEqual(_guide_counts()[self.acct.id], len(self.scope_names()))
+        self.assertEqual(guide_counts()[self.acct.id], len(self.scope_names()))
 
     def test_the_search_filter_returns_the_scope(self):
         self.assertEqual(self.search_names(), self.scope_names())
 
     def test_a_second_account_does_not_borrow_the_first_ones_rows(self):
-        """`_guide_counts` groups by account, and the scope subquery is account-blind - so
+        """`guide_counts` groups by account, and the scope subquery is account-blind - so
         the two have to compose rather than one overwriting the other."""
         other = seed.make_account(name='Beta')
         seed.make_channel(other, name='Beta Guide Channel', in_guide=True)
         db.session.commit()
-        counts = _guide_counts()
+        counts = guide_counts()
         self.assertEqual(counts[self.acct.id], 4)
         self.assertEqual(counts[other.id], 1)
 

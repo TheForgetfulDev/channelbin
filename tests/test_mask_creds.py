@@ -134,6 +134,20 @@ class MaskAccountUrlsInTextTests(unittest.TestCase):
         text = 'plain failure, no url here'
         self.assertEqual(mask_account_urls_in_text(text), text)
 
+    def test_unreachable_host_names_the_path_token_without_a_scheme(self):
+        """BUGS.md 2026-09-18: urllib3 names only the request target when the host is
+        unreachable, so the full-URL substitution above never matches it."""
+        url = 'https://example-provider.test/TESTPATHTOKEN1/get.php?type=m3u'
+        out = mask_account_urls_in_text(
+            "HTTPSConnectionPool(host='example-provider.test', port=443): Max retries "
+            'exceeded with url: /TESTPATHTOKEN1/get.php?type=m3u (Caused by X)', url)
+        self.assertNotIn('TESTPATHTOKEN1', out)
+        self.assertIn('Max retries exceeded with url: /***', out)
+
+    def test_a_url_with_no_path_masks_no_bare_slash(self):
+        out = mask_account_urls_in_text('see /docs for help', 'https://example-provider.test/')
+        self.assertEqual(out, 'see /docs for help')
+
     def test_empty_and_none_are_safe(self):
         self.assertEqual(mask_account_urls_in_text('', 'https://example-provider.test/T'), '')
         self.assertIsNone(mask_account_urls_in_text(None, 'https://example-provider.test/T'))

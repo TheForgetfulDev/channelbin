@@ -5,6 +5,43 @@ Notable changes to ChannelBin, newest first. This project follows
 release is tagged `v<version>` in git, and the version the app is running is shown in the
 page footer.
 
+## 0.12.0 - 2026-09-18
+
+**Added**
+
+- The Accounts list compares your accounts side by side: a line of live numbers under each
+  account, and a comparison over 7, 30 or 90 days or all time with a sortable table, share
+  charts and trend charts.
+- Each account's page has a Usage section with recorded time, recordings, stalls, failovers and
+  health checks over a chosen window.
+
+**Changed**
+
+- Editing the times of a scheduled group recording picks the member that should serve the new
+  window, and switches to one on an account with a free connection instead of warning about a
+  clash it could avoid.
+- Restart no longer refuses over a recording whose conversion is waiting on another recording.
+  It names those recordings and what a restart costs them.
+- Inside a container, the Restart confirm warns that the container needs a restart policy to
+  come back up.
+
+**Fixed**
+
+- Account usernames and passwords no longer appear in the Readiness login check, or in sync
+  errors, alerts and the log when a provider host cannot be reached.
+- Recorded time under failover is credited to the account that captured each part, not all to
+  the account the recording ended on.
+- The Restart dialog notices the app is back after a fast container restart instead of waiting
+  forever.
+- Dashboard badges follow each recording's real status: a finished capture stops showing
+  Recording, a cancelled one stops showing live, and Waiting now appears.
+- A "waiting for a connection slot" alert clears when that recording fails to start.
+- URLs with a trailing slash open the page instead of a 404.
+- The Readiness check that the database accepts writes catches a read-only database, and the
+  sync line reports the oldest sync's age as its label says.
+- A few pages and API calls answer with a clear error instead of a server error when given
+  malformed input.
+
 ## 0.11.0 - 2026-09-18
 
 **Added**

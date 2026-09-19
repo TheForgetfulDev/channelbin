@@ -54,6 +54,7 @@ KIND_SYNC = 'sync'
 KIND_REBUILD = 'rebuild'
 KIND_MAINTENANCE = 'maintenance'
 KIND_HIDING = 'hiding'
+KIND_LEDGER = 'ledger'
 
 # Human prose for a refusal message, so a refused caller can hand the reason straight to a
 # user-facing surface without restating it. Keep these lowercase noun phrases - they are
@@ -64,6 +65,7 @@ KIND_LABELS = {
     KIND_REBUILD: 'a search index rebuild',
     KIND_MAINTENANCE: 'database maintenance',
     KIND_HIDING: 'a channel hide rule pass',
+    KIND_LEDGER: 'an account stats catch-up',
 }
 
 # The yield order, as a table rather than as branches scattered across four modules.
@@ -93,9 +95,13 @@ KIND_LABELS = {
 #   the caller here is a person who just saved a rule and is waiting on the answer). A
 #   refusal is never silent: the rule is saved either way and a retry is queued, so the only
 #   cost of yielding is that the new answer lands late.
-# - **Maintenance** yields to everything, itself included. It is the most deferrable work in
-#   the app (pruning, retention, WAL reporting) and the heaviest per run, because EPG cleanup
-#   drags a full `programs` rebuild behind it.
+# - **Ledger** - the account stats catch-up (app/account_stats.py), only ever the large
+#   first-run or timezone-change fold; routine folds are small and run inline without a
+#   ticket. It yields to sync, to maintenance and to itself, and refuses nothing: its only
+#   cost to anyone else is a late number on the Accounts pages, which say so while it runs.
+# - **Maintenance** yields to everything but the ledger, itself included. It is the most
+#   deferrable work in the app (pruning, retention, WAL reporting) and the heaviest per run,
+#   because EPG cleanup drags a full `programs` rebuild behind it.
 #
 # Recordings appear in no tuple by design - see the module docstring.
 BLOCKED_BY = {
@@ -103,6 +109,7 @@ BLOCKED_BY = {
     KIND_SYNC: (KIND_TESTER, KIND_SYNC),
     KIND_REBUILD: (KIND_SYNC, KIND_REBUILD),
     KIND_HIDING: (KIND_SYNC, KIND_HIDING),
+    KIND_LEDGER: (KIND_SYNC, KIND_MAINTENANCE, KIND_LEDGER),
     KIND_MAINTENANCE: (KIND_TESTER, KIND_SYNC, KIND_REBUILD, KIND_HIDING, KIND_MAINTENANCE),
 }
 
