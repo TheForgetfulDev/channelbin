@@ -439,6 +439,81 @@ class RestartApiBusyTests(unittest.TestCase):
         self.assertIn('--force', popen.call_args[0][0])
 
 
+class RestartApiParkedTests(unittest.TestCase):
+    """Guards dev/docs/BUGS.md 2026-09-18 "The restart modal blocked on a parked recording
+    that tools/check_busy.py lets through". A recording parked waiting on another one
+    (postprocess_waiting_since set) does not block the restart button, exactly as it does
+    not block the CLI; it is named instead, in the same words the CLI prints, with the
+    recording it waits on - in the 409 beside the real blockers, and on the
+    restart-parked lookup the confirm reads before it opens."""
+
+    def setUp(self):
+        self.t = make_test_app()
+        self.t.app.config['WTF_CSRF_ENABLED'] = False
+
+    def tearDown(self):
+        self.t.cleanup()
+
+    def post(self, body=None):
+        with patch('app.routes.settings.subprocess.Popen') as popen:
+            resp = self.t.client.post('/api/settings/restart',
+                                      json=body if body is not None else {})
+        return resp, popen
+
+    def _parked(self, status='CONVERTING', pct=66.4):
+        rec = seed.make_recording(status=status, name='Parked Game')
+        rec.postprocess_waiting_since = datetime.utcnow()
+        rec.postprocess_waiting_on_name = 'Live Match'
+        rec.postprocess_waiting_on_state = 'is in progress'
+        rec.conversion_progress_pct = pct
+        db.session.commit()
+        return rec
+
+    def test_a_parked_recording_alone_does_not_block(self):
+        self._parked()
+        resp, popen = self.post()
+        self.assertEqual(resp.status_code, 200, resp.get_json())
+        self.assertFalse(resp.get_json()['forced'])
+        popen.assert_called_once()
+
+    def test_a_parked_row_is_listed_apart_from_the_blockers(self):
+        parked = self._parked()
+        live = seed.make_recording(status='IN_PROGRESS', name='Live Match')
+        db.session.commit()
+        resp, popen = self.post()
+        self.assertEqual(resp.status_code, 409)
+        body = resp.get_json()
+        self.assertEqual([r['id'] for r in body['blocking']], [live.id])
+        self.assertEqual([r['id'] for r in body['parked']], [parked.id])
+        label = body['parked'][0]['label']
+        self.assertIn('waiting on "Live Match"', label)
+        self.assertIn('66% encoded so far', label)
+        self.assertNotIn('converting to its final file', label)
+        popen.assert_not_called()
+
+    def test_the_lookup_names_the_parked_row_and_its_cost(self):
+        rec = self._parked(status='ANALYZING', pct=None)
+        body = self.t.client.get('/api/settings/restart-parked').get_json()
+        self.assertTrue(body['success'])
+        self.assertEqual([r['id'] for r in body['parked']], [rec.id])
+        self.assertIn('waiting on "Live Match"', body['parked'][0]['label'])
+        self.assertIn('nothing is running for it yet', body['parked'][0]['label'])
+
+    def test_the_lookup_is_empty_when_only_working_rows_exist(self):
+        seed.make_recording(status='CONVERTING', name='Working')
+        db.session.commit()
+        body = self.t.client.get('/api/settings/restart-parked').get_json()
+        self.assertEqual(body['parked'], [])
+
+    def test_both_surfaces_print_the_same_sentence(self):
+        rec = self._parked()
+        label = self.t.client.get('/api/settings/restart-parked').get_json()['parked'][0]['label']
+        out = run_check_busy(self.t.db_path).stdout
+        cli_line = next(ln for ln in out.splitlines() if f'#{rec.id}' in ln)
+        phrase = label.split(' is ', 1)[1]
+        self.assertTrue(cli_line.endswith(phrase), f'{cli_line!r} vs {phrase!r}')
+
+
 class RestartApiDockerTests(unittest.TestCase):
     """Guards dev/docs/BUGS.md 2026-08-14 "The in-app Restart button was never adapted
     for the Docker container". Inside a container the app IS tini's monitored child
@@ -488,6 +563,56 @@ class RestartApiDockerTests(unittest.TestCase):
         self.assertEqual(resp.status_code, 200)
         popen.assert_not_called()
         schedule.assert_called_once()
+
+
+class RestartInstanceIdTests(unittest.TestCase):
+    """Guards dev/docs/BUGS.md 2026-09-18 "The restart-wait modal hung forever on a restart
+    faster than one poll". The modal proves the process was replaced by comparing
+    instance ids, so: the heartbeat reports one, it is stable for the life of a process,
+    and the restart POST answers with the SAME one on both restart paths - the client
+    must hold the old process's id for certain, never a value it guessed."""
+
+    def setUp(self):
+        self.t = make_test_app()
+        self.t.app.config['WTF_CSRF_ENABLED'] = False
+
+    def tearDown(self):
+        self.t.cleanup()
+
+    def status_id(self):
+        resp = self.t.client.get('/api/settings/restart-status')
+        self.assertEqual(resp.status_code, 200)
+        return resp.get_json().get('instance_id')
+
+    def test_the_heartbeat_reports_a_stable_instance_id(self):
+        first = self.status_id()
+        self.assertTrue(first)
+        self.assertEqual(self.status_id(), first)
+
+    def test_the_restart_answer_carries_the_heartbeat_id(self):
+        with patch('app.routes.settings.subprocess.Popen'):
+            resp = self.t.client.post('/api/settings/restart', json={})
+        self.assertEqual(resp.status_code, 200)
+        answered = resp.get_json().get('instance_id')
+        self.assertTrue(answered)
+        self.assertEqual(answered, self.status_id())
+
+    def test_the_container_restart_answer_carries_the_heartbeat_id(self):
+        with patch.dict(os.environ, {'CHANNELBIN_DOCKER': '1'}), \
+             patch('app.routes.settings._schedule_self_restart'):
+            resp = self.t.client.post('/api/settings/restart', json={})
+        self.assertEqual(resp.status_code, 200)
+        answered = resp.get_json().get('instance_id')
+        self.assertTrue(answered)
+        self.assertEqual(answered, self.status_id())
+
+    def test_the_id_is_minted_per_process_not_per_request(self):
+        """A fresh import - what a new process does - mints a different id."""
+        import app.routes.settings as settings_mod
+        spec = importlib.util.find_spec('app.routes.settings')
+        fresh = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(fresh)
+        self.assertNotEqual(fresh._INSTANCE_ID, settings_mod._INSTANCE_ID)
 
 
 class OrphanedChannelTestReconcileTests(unittest.TestCase):

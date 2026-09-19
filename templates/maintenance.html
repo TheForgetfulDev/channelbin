@@ -360,13 +360,15 @@
 </div>
 
 {# The only server-rendered data on the page: the backup schedule is config,
-   not measurement, so it does not need a fetch to say when the next one runs. #}
+   not measurement, so it does not need a fetch to say when the next one runs, and
+   whether this is a container, which the restart confirm has to warn about. #}
 <script type="application/json" id="maintenance-boot">
 {{ {
   'backup': {
     'hour': backup_hour,
     'enabled': backup_enabled,
   },
+  'is_docker': is_docker,
 } | tojson }}
 </script>
 {% endblock %}

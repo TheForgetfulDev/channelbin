@@ -177,6 +177,58 @@ class SlotWaitClearsTests(_SlotCase):
                                   recording_id=rid),
                          'and the failure that replaced it stands')
 
+    def test_an_unusable_dvr_dir_on_the_retry_clears_the_wait(self):
+        """dev/docs/BUGS.md 2026-09-18 @ 12:05:47 PM. The directory probe fails the row
+        ahead of the slot acquire, so a retry after a deferral left the wait standing."""
+        self._occupy_slot()
+        rid = self._scheduled()
+        self._wait_once(rid)
+
+        self.t.sandbox_config({'recording': {
+            'dvr_output_dir': os.path.join(self.t._tmpdir, 'not-there'),
+            'capture_log_dir': os.path.join(self.t._tmpdir, 'caplogs'),
+            'live_thumbnail': {'enabled': False},
+        }})
+        with mock.patch('app.scheduler.reschedule_recording_start'), \
+             mock.patch.object(recorder, '_launch_segment') as launch:
+            recorder.start_recording(self.t.app, rid)
+
+        db.session.expire_all()
+        self.assertFalse(launch.called)
+        self.assertEqual(REC_STATUS_FAILED, db.session.get(Recording, rid).status)
+        self.assertEqual(0, _open(SLOT_WAIT, recording_id=rid),
+                         'a FAILED recording is not waiting for anything')
+
+    def test_giving_up_on_a_conversion_collision_clears_the_wait(self):
+        """dev/docs/BUGS.md 2026-09-18 @ 12:05:47 PM. The collision_policy: wait give-up
+        fails the row before the slot acquire is ever reached again."""
+        self._occupy_slot()
+        rid = self._scheduled()
+        self._wait_once(rid)
+
+        self.t.sandbox_config({'recording': {
+            'dvr_output_dir': self.dvr,
+            'capture_log_dir': os.path.join(self.t._tmpdir, 'caplogs'),
+            'live_thumbnail': {'enabled': False},
+            'post_process': {'collision_policy': 'wait'},
+        }})
+        rec = db.session.get(Recording, rid)
+        rec.stop_time = datetime.utcnow() - timedelta(seconds=1)
+        db.session.commit()
+        with mock.patch('app.scheduler.reschedule_recording_start'), \
+             mock.patch('app.postprocessor.has_active_conversion', return_value=True), \
+             mock.patch.object(recorder, '_launch_segment') as launch:
+            recorder.start_recording(self.t.app, rid)
+
+        db.session.expire_all()
+        self.assertFalse(launch.called)
+        self.assertEqual(REC_STATUS_FAILED, db.session.get(Recording, rid).status)
+        self.assertEqual(0, _open(SLOT_WAIT, recording_id=rid),
+                         'a FAILED recording is not waiting for anything')
+        self.assertEqual(1, _open('RECORDING_FAILED_CONVERSION_COLLISION',
+                                  recording_id=rid),
+                         'and the failure that replaced it stands')
+
     def test_cancelling_a_queued_recording_clears_the_wait(self):
         self._occupy_slot()
         rid = self._scheduled()

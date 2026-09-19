@@ -1,7 +1,6 @@
 import json
 import threading
-from collections import defaultdict
-from datetime import datetime, timedelta
+from datetime import datetime
 
 from flask import (Blueprint, render_template, request, redirect, url_for, flash, current_app,
                    abort, jsonify)
@@ -12,13 +11,12 @@ from ..accounts import (NORM_DISABLED, NORM_MODES, coerce_normalization_mode,
                         resolve_normalization_mode, url_is_normalizable,
                         recompute_duplicate_stream_urls_and_commit, finalize_sync_state,
                         next_sync_map, sync_signature)
-from ..channel_groups import guide_scope_channel_ids, report_orphaned_guide_groups
-from ..channel_search import OTHER_NEW, OTHER_REMOVED
+from .. import account_stats_view
+from ..account_stats import WINDOWS, today_local, windowed_stats
+from ..channel_groups import report_orphaned_guide_groups
+from ..channel_search import GROUP_ANY, OTHER_NEW, OTHER_REMOVED
 from ..config import load_config, config_default
-from ..database import (
-    Account, Channel, AccountSyncLog, ChannelGroupMember, EPGEntry, Recording,
-    REC_STATUS_COMPLETED, REC_STATUS_FAILED, REC_STATUS_ABORTED,
-)
+from ..database import Account, AccountStatDay, Channel, AccountSyncLog, ChannelGroupMember
 from ..db_utils import retry_on_locked
 from ..logo_cache import delete_cached_logos
 from ..ui_constants import PRESET_COLORS
@@ -27,19 +25,16 @@ from .channels import _chunked, _DELETE_CHUNK_SIZE
 
 accounts_bp = Blueprint('accounts', __name__)
 
-# The four sections of the account page, in their default order (DESIGN.md §17.3). The
+# The five sections of the account page, in their default order (DESIGN.md §17.3). The
 # user's own order/hidden picks ride on the same server-side user-prefs store the group
-# detail page uses, so a saved layout follows them across browsers.
-ACCOUNT_SECTIONS = ['details', 'content', 'history', 'activity']
+# detail page uses, so a saved layout follows them across browsers - and a layout saved
+# before a section existed shows it at its default place (util.js initSectionLayout).
+ACCOUNT_SECTIONS = ['details', 'content', 'usage', 'history', 'activity']
 
 # How many sync runs the Sync history section shows before its "All N syncs" control.
 # Expanding loads the rest in place - there is no separate history page any more
 # (dev/changelog/455; DESIGN.md §17.1 retired account_logs.html).
 HISTORY_SHOWN = 10
-
-# Recording statuses that count as "this account produced a recording". Terminal states
-# only - an in-flight recording has no duration to total yet.
-_FINISHED_RECORDING_STATUSES = [REC_STATUS_COMPLETED, REC_STATUS_FAILED, REC_STATUS_ABORTED]
 
 # The per-account sync-interval choices. Blank means "follow sync.sync_interval_hours".
 _SYNC_HOURS_CHOICES = [1, 2, 4, 6, 12, 24]
@@ -113,69 +108,11 @@ def _sync_log_totals(account_ids):
     )
 
 
-def _guide_counts(account_ids=None):
-    """{account_id: channels of that account whose listings reach the guide}, in one query.
-
-    Guide SCOPE, not `Channel.in_guide` - the number is rendered as a link into the channel
-    search's `f.other=guide` filter, so reading the raw flag here made the count and the page
-    it opens disagree by more than 3x (`dev/changelog/734`). The definition, and why the flag
-    is not it, live on `channel_groups.guide_scope_channel_ids()`.
-    """
-    q = (db.session.query(Channel.account_id, db.func.count(Channel.id))
-         .filter(Channel.id.in_(guide_scope_channel_ids())))
-    if account_ids is not None:
-        q = q.filter(Channel.account_id.in_(account_ids))
-    return dict(q.group_by(Channel.account_id).all())
-
-
-def _epg_match_counts(account_id):
-    """This account's channels, split by whether they have confirmed EPG data: a
-    program showing in the next 24h ('with_epg'), an epg_channel_id set but currently
-    matching nothing ('no_match'), or no epg_channel_id at all ('no_id').
-
-    Same correlated-EXISTS shape the old /channels/epg page used before it was retired
-    in favor of this page's Content card (dev/changelog/631) -
-    ix_epg_entries_channel_stop (migration 17) still backs it, just from here now."""
-    now = datetime.utcnow()
-    window_end = now + timedelta(hours=24)
-    base = Channel.query.filter_by(account_id=account_id)
-    total = base.count()
-    no_id = base.filter(
-        db.or_(Channel.epg_channel_id.is_(None), Channel.epg_channel_id == '')).count()
-    has_epg = (
-        db.session.query(EPGEntry.id)
-        .filter(EPGEntry.channel_id == Channel.id,
-                EPGEntry.stop_time >= now, EPGEntry.start_time <= window_end)
-        .exists()
-    )
-    with_epg = base.filter(
-        Channel.epg_channel_id.isnot(None), Channel.epg_channel_id != '', has_epg).count()
-    return {'with_epg': with_epg, 'no_match': total - no_id - with_epg, 'no_id': no_id}
-
-
-def _recording_stats(account_ids=None):
-    """Finished recordings tallied per account: counts by status plus total seconds.
-
-    One query for every account on the page - never one per row. Shared by the list page
-    and the account page so the two can never disagree about what an account produced."""
-    q = (db.session.query(Channel.account_id, Recording.status,
-                          Recording.start_time, Recording.stop_time)
-         .join(Recording, Recording.channel_id == Channel.id)
-         .filter(Recording.status.in_(_FINISHED_RECORDING_STATUSES)))
-    if account_ids is not None:
-        q = q.filter(Channel.account_id.in_(account_ids))
-    stats = defaultdict(lambda: {'completed': 0, 'failed': 0, 'aborted': 0, 'total_seconds': 0.0})
-    for account_id, status, start, stop in q.all():
-        s = stats[account_id]
-        s[status.lower()] += 1
-        s['total_seconds'] += (stop - start).total_seconds()
-    return stats
-
-
 @accounts_bp.route('/accounts')
 def accounts_list():
-    """The Accounts list (DESIGN.md §17.1). A row says which account this is, whether it is
-    healthy and how big it is - nothing else, so this route fetches nothing else.
+    """The Accounts list (DESIGN.md §17.1) and, below it, the account stats (§17.7). A row
+    says which account this is, whether it is healthy, how big it is, and what it is right
+    now; the stats section compares what the accounts did over a window.
 
     Everything the old fat card needed and this one does not (recording totals, the preset
     color swatches, the debug flag) is gone rather than passed and ignored: an unused
@@ -183,11 +120,22 @@ def accounts_list():
     # Read BEFORE the rows. A sync that commits in between then shows up as a mismatch at the
     # next poll and costs one extra refresh; read after, the page would claim a signature
     # its rows do not reflect and never refresh for that change at all.
+    try:
+        window = account_stats_view.resolve_window(request.args.get('w'))
+    except ValueError:
+        # Validated here, not only by the chips: a hand-typed or stale link is a 400 that
+        # names the choices, never a silent fall back to some other window.
+        abort(400, description=f"w must be one of {', '.join(WINDOWS)}")
     sync_sig = sync_signature()
-    accounts = Account.query.order_by(Account.created_at).all()
+    # First, before anything else is loaded: it may commit a ledger catch-up, which expires
+    # every row already in the session. It also loads the accounts, so the rows' second
+    # line and the stats section below the list come from one call (dev/changelog/1029).
+    stats = account_stats_view.section_context(window, load_config(),
+                                               current_app._get_current_object())
+    accounts = stats['accounts']
     account_ids = [a.id for a in accounts]
     logs_by_account = _recent_logs_by_account(account_ids, limit=5)
-    guide_counts = _guide_counts(account_ids)
+    guide_counts_by_account = {aid: cur['guide_channels'] for aid, cur in stats['current'].items()}
     # The header's channel total is the sum of the column beneath it, deliberately - a
     # separately-queried total that disagreed with the visible rows would be worse than none.
     total_channels = sum(a.channel_count or 0 for a in accounts)
@@ -197,10 +145,11 @@ def accounts_list():
         accounts=accounts,
         next_sync=next_sync_map(accounts),
         logs_by_account=logs_by_account,
-        guide_counts=guide_counts,
+        guide_counts=guide_counts_by_account,
         total_channels=total_channels,
         total_hidden_channels=total_hidden_channels,
         sync_sig=sync_sig,
+        stats=stats,
     )
 
 
@@ -261,13 +210,22 @@ def _effective_settings(account, cfg):
     }
 
 
-def _account_detail_payload(account, cfg):
+def _account_detail_payload(account, cfg, stats):
     """Everything the account page renders, with every lookup batched before any loop.
 
     Nothing here may run per row - `cfg` is passed in rather than re-read, and the counts
-    are aggregate queries, not a walk over the account's channels."""
+    are aggregate queries, not a walk over the account's channels. `stats` is the page's
+    one `section_context()`: the Content card's current numbers and the Usage card both
+    come from it, so the catch-up fold and current_stats run once per page."""
     account_ids = [account.id]
-    stats = _recording_stats(account_ids)[account.id]
+    # All time by definition: the Content card says what this account has produced, ever.
+    # From the ledger, so each recording is credited only the segments this account
+    # captured (dev/changelog/1028) - and so this and the windowed Usage numbers are one
+    # source that cannot disagree.
+    if stats['window'] == 'all':
+        usage_all_time = stats['windowed'][account.id]
+    else:
+        usage_all_time = windowed_stats(account_ids, 'all', today_local())[account.id]
     rows = _recent_logs_by_account(account_ids, limit=HISTORY_SHOWN).get(account.id, [])
     # Serialized in the SAME shape the syncs API returns, so the history region's first
     # paint and its expand-in-place fetch cannot disagree about what a run looked like.
@@ -283,12 +241,11 @@ def _account_detail_payload(account, cfg):
                              AccountSyncLog.status.in_(('SUCCESS', 'PARTIAL')))
                      .order_by(AccountSyncLog.started_at.desc())
                      .first())
-    finished = stats['completed'] + stats['failed'] + stats['aborted']
     return {
-        'guide_count': _guide_counts(account_ids).get(account.id, 0),
-        'epg_match_counts': _epg_match_counts(account.id),
-        'rec_stats': stats,
-        'rec_total': finished,
+        'cur': stats['current'][account.id],
+        'group_any': GROUP_ANY,
+        'all_time_note': account_stats_view.ALL_TIME_NOTE,
+        'usage_all_time': usage_all_time,
         'logs': logs,
         'log_rows': rows,
         'total_syncs': total_syncs,
@@ -323,13 +280,20 @@ def account_detail(account_id):
     """The per-account page (DESIGN.md §17.3). Its anatomy is the group detail page's -
     an account is a sibling of a group - minus the screenshot frame and the separate
     status strip, both of which §17.3 rules out for an account."""
-    account = db.session.get(Account, account_id)
-    if account is None:
+    try:
+        window = account_stats_view.resolve_window(request.args.get('w'))
+    except ValueError:
+        abort(400, description=f"w must be one of {', '.join(WINDOWS)}")
+    cfg = load_config()
+    # First, before anything else is loaded: its catch-up fold may commit, which expires
+    # every row already in the session. It loads the account too (dev/changelog/1029).
+    stats = account_stats_view.section_context(window, cfg, current_app._get_current_object(),
+                                               account_ids=[account_id])
+    if not stats['accounts']:
         flash('Account not found.', 'error')
         return redirect(url_for('accounts.accounts_list'))
-
-    cfg = load_config()
-    payload = _account_detail_payload(account, cfg)
+    account = stats['accounts'][0]
+    payload = _account_detail_payload(account, cfg, stats)
     return render_template(
         'account_detail.html',
         account=account,
@@ -343,6 +307,7 @@ def account_detail(account_id):
         # Effective for THIS account - global flag OR its own override - so the kebab
         # menu and the mobile action sheet both light up correctly either way.
         xtream_debug=_xtream_debug_enabled(account),
+        stats=stats,
         **payload,
     )
 
@@ -573,6 +538,9 @@ def _delete_account_and_jobs(account_id):
         if account is None:
             return None
         name = account.name
+        # Not in the ORM cascade: the ledger has no relationship on Account, and a day row
+        # left behind would credit a future account that reused the id.
+        AccountStatDay.query.filter_by(account_id=account_id).delete(synchronize_session=False)
         db.session.delete(account)
         db.session.commit()
         return name
@@ -928,6 +896,9 @@ def _validate_account_form(form) -> list[str]:
     max_conn_raw = _field(form, 'max_connections')
     if max_conn_raw and not (max_conn_raw.isdigit() and int(max_conn_raw) >= 1):
         errors.append('Max connections must be a positive whole number.')
+    sync_hours_raw = _field(form, 'sync_interval_hours')
+    if sync_hours_raw and not (sync_hours_raw.isdigit() and int(sync_hours_raw) >= 1):
+        errors.append('Sync interval must be a positive whole number of hours.')
     return errors
 
 

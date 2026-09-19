@@ -2194,6 +2194,60 @@ def _m063_channel_pace_realtime(conn, cur):
         cur.execute('ALTER TABLE channels ADD COLUMN pace_realtime BOOLEAN')
     conn.commit()
 
+
+def _m064_account_stat_ledger(conn, cur):
+    """account_stat_days + account_stat_state: the per-account per-day ledger behind the
+    Accounts pages' usage numbers (app/account_stats.py, dev/changelog/1028).
+
+    No backfill here and no obligation to register: the ledger is filled by
+    `account_stats.refresh_ledger()` from its own watermarks, which start at 0, so the first
+    page load (or the hourly fold) after the upgrade reads the whole history. The watermark
+    row is the record of progress; an empty table with no state row simply means "nothing
+    folded yet", which is true.
+
+    CREATE TABLE/INDEX IF NOT EXISTS throughout, so this step is re-runnable from the top."""
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS account_stat_days (
+            id              INTEGER PRIMARY KEY,
+            account_id      INTEGER NOT NULL REFERENCES accounts(id),
+            day             VARCHAR(10) NOT NULL,
+            capture_seconds FLOAT NOT NULL,
+            segments        INTEGER NOT NULL,
+            recordings      INTEGER NOT NULL,
+            stalls          INTEGER NOT NULL,
+            checks_passed   INTEGER NOT NULL,
+            checks_failed   INTEGER NOT NULL,
+            failovers_away  INTEGER NOT NULL,
+            CONSTRAINT uq_account_stat_day UNIQUE (account_id, day)
+        )
+    ''')
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS account_stat_state (
+            id                 INTEGER PRIMARY KEY,
+            segment_watermark  INTEGER NOT NULL,
+            test_watermark     INTEGER NOT NULL,
+            event_watermark    INTEGER NOT NULL,
+            tz_name            VARCHAR(64),
+            refreshed_at       DATETIME,
+            rebuild_started_at DATETIME,
+            rebuilt_at         DATETIME
+        )
+    ''')
+    conn.commit()
+
+
+def _m065_channel_account_epg_index(conn, cur):
+    """channels: ix_channels_account_epg, so the Accounts list's per-account EPG coverage
+    count is answered from an index instead of every channel row. Measured on a copy of the
+    production database (139,101 channels): 162 ms -> 23 ms for the statement; the index
+    took 0.19 s to build there (dev/changelog/1029).
+
+    CREATE INDEX IF NOT EXISTS is idempotent, so this step is re-runnable from the top."""
+    cur.execute('CREATE INDEX IF NOT EXISTS ix_channels_account_epg '
+                'ON channels (account_id, epg_channel_id)')
+    conn.commit()
+
+
 SCHEMA_MIGRATIONS = [
     (1, 'baseline: pre-versioning additive migrations + backfills', _m001_baseline),
     (2, 'recordings: program_title/program_sub_title snapshot columns + backfill', _m002_program_title),
@@ -2317,6 +2371,10 @@ SCHEMA_MIGRATIONS = [
      _m062_fast_delivery_rollup),
     (63, 'channels: pace_realtime, the per-channel override of ffmpeg.pace_realtime',
      _m063_channel_pace_realtime),
+    (64, 'account_stat_days/account_stat_state: the per-account per-day usage ledger',
+     _m064_account_stat_ledger),
+    (65, 'channels: ix_channels_account_epg, the Accounts list\'s EPG coverage count',
+     _m065_channel_account_epg_index),
 ]
 
 CURRENT_SCHEMA_VERSION = SCHEMA_MIGRATIONS[-1][0]

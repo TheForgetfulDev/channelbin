@@ -611,6 +611,17 @@ class RestartGuardParkedTests(unittest.TestCase):
         self.assertEqual(1, out.returncode, 'a live conversion no longer blocks a restart')
         self.assertIn('blocking-kinds: recordings', out.stdout)
 
+    def test_the_parked_line_names_the_recording_it_waits_on(self):
+        """Guards dev/docs/BUGS.md 2026-09-18 "The restart modal blocked on a parked
+        recording" - the CLI half: the row carries the name since dev/changelog/954."""
+        rec = seed.make_recording(status=REC_STATUS_ANALYZING, name='parked pre-start')
+        rec.postprocess_waiting_since = datetime.utcnow()
+        rec.postprocess_waiting_on_name = 'Live Match'
+        db.session.commit()
+        out = self._check_busy()
+        self.assertIn('parked waiting on "Live Match"', out.stdout)
+        self.assertNotIn('another recording', out.stdout)
+
     def test_a_parked_row_does_not_mask_a_working_one(self):
         parked = seed.make_recording(status=REC_STATUS_CONVERTING, name='parked conv')
         parked.postprocess_waiting_since = datetime.utcnow()

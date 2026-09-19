@@ -38,6 +38,9 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 REFLOWING_PAGES = {
     '/tags': 1,
     '/jobs': 1,
+    # The account stats comparison (dev/changelog/1029); drawn only with two or more
+    # accounts, so the fixture below seeds a second one.
+    '/accounts': 1,
 }
 
 # Tables built in JavaScript, so no server render contains them. The source file is what
@@ -92,6 +95,7 @@ class LabelledCellTests(unittest.TestCase):
             db.session.flush()
             db.session.add(TagPattern(tag_id=tag.id, pattern='LIVE'))
             ch = make_channel(make_account(), name='Sports HD')
+            make_account(name='Second account')
             make_channel_test(ch, status=TEST_STATUS_COMPLETED, resolution='1920x1080')
             db.session.commit()
             cls.channel_id = ch.id
@@ -194,7 +198,7 @@ class OptInTests(unittest.TestCase):
                     if 'tbl-cards' in _read(os.path.relpath(path, REPO)):
                         found.add(os.path.relpath(path, REPO))
         registered = {'templates/tags.html', 'templates/jobs.html',
-                      'templates/channels/detail.html'} | {p for p, _b, _n in REFLOWING_JS}
+                      'templates/channels/detail.html', 'templates/_account_stats.html'} | {p for p, _b, _n in REFLOWING_JS}
         self.assertEqual(
             registered, found,
             'A file opts into .tbl-cards but is not covered above (or is covered and no '

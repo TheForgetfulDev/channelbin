@@ -71,6 +71,7 @@
     relabel uses the same words the server rendered rather than a second, hand-written
     copy that can drift from it (dev/changelog/961). -#}
 <script type="application/json" id="dash-status-labels">{{ rec_status_labels | tojson }}</script>
+<script type="application/json" id="dash-waiting-label">{{ rec_waiting_label | tojson }}</script>
 
 <div class="dash-pulse">
   {% for m in metrics %}
@@ -134,6 +135,7 @@
             update the visible cells. -#}
         <div class="drow{% if rec.status != 'SCHEDULED' %} has-bar{% endif %} {{ rec_status_class.get(rec.status, 'st-abort') }}"
              id="card-{{ rec.id }}" data-id="{{ rec.id }}" data-status="{{ rec.status }}"
+             data-waiting="{{ '1' if rec.id in rec_waiting_ids else '' }}"
              data-name="{{ rec.name | lower }}"
              data-href="{{ url_for('recordings.recording_detail', recording_id=rec.id) }}"
              {%- if rec.status == 'SCHEDULED' %}

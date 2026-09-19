@@ -35,11 +35,14 @@ def is_24h() -> bool:
     return get_time_format() == '24h'
 
 
-def to_local(dt: datetime) -> datetime:
-    """Naive-UTC (or aware) datetime → aware datetime in the display timezone."""
+def to_local(dt: datetime, tz: ZoneInfo = None) -> datetime:
+    """Naive-UTC (or aware) datetime → aware datetime in the display timezone.
+
+    Pass `tz` (from one `get_display_tz()` call) inside a per-row loop - without it every
+    call re-reads the config."""
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=UTC)
-    return dt.astimezone(get_display_tz())
+    return dt.astimezone(tz or get_display_tz())
 
 
 def to_naive_utc(dt: datetime) -> datetime:

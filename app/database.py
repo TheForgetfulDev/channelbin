@@ -423,6 +423,23 @@ RESTART_BLOCKING_STATUSES = (
     REC_STATUS_CONCATENATING, REC_STATUS_ANALYZING, REC_STATUS_CONVERTING,
 )
 
+
+def parked_restart_phrase(status, waiting_on_name, progress_pct):
+    """What a restart means for a recording in a blocking status that is parked
+    (``postprocess_waiting_since`` set): it does not block, and this says what it waits on
+    and what a restart costs it. A parked conversion holds a suspended encode that a restart
+    throws away; one parked before converting has no ffmpeg anywhere (dev/changelog/952).
+
+    The one wording for both restart surfaces - tools/check_busy.py and the Maintenance
+    restart button - so they print the same sentence (dev/changelog/1026). A pure function
+    of its inputs: the CLI calls it with raw sqlite3 columns and no app context.
+    """
+    waiting_on = f'"{waiting_on_name}"' if waiting_on_name else 'another recording'
+    cost = (f'restarting discards the {progress_pct:.0f}% encoded so far'
+            if status == REC_STATUS_CONVERTING and progress_pct
+            else 'nothing is running for it yet')
+    return f'parked waiting on {waiting_on}, not blocking ({cost})'
+
 # Statuses whose scheduled window is open: started, not finished, whether or not a capture
 # is running inside it right now. PAUSED and RETRYING are reachable only from IN_PROGRESS,
 # so no row in this set can carry a future start_time - a query that pairs these with
@@ -1545,6 +1562,13 @@ class Channel(db.Model):
         # health_score alone would not cover the aggregate and SQLite would fall back to the
         # table (migration 24's own comment).
         db.Index('ix_channels_health', 'health_score', 'manual_health_adjustment'),
+        # The Accounts list's "With EPG" count (account_stats.epg_match_counts) splits every
+        # channel of every account by whether it has an EPG id. Without this that is a read
+        # of every channel row; with it the count is answered from the index. Measured on a
+        # copy of the production database (139k channels): 162 ms -> 23 ms, and the list
+        # re-renders it every minute (dev/changelog/1029). A sync touches it only on the
+        # rows it already rewrites, whose SET list includes epg_channel_id anyway.
+        db.Index('ix_channels_account_epg', 'account_id', 'epg_channel_id'),
         # The channel grain's DEFAULT sort key, so the landing page can walk this index and
         # stop at LIMIT 100 instead of pouring every surviving row into a temp B-tree:
         # measured 105.5ms -> 9.0ms on 138k channels (dev/changelog/699). The expression must
@@ -2065,6 +2089,64 @@ class AccountSyncLog(db.Model):
     # before the columns with no alert to recover the count from - never a false zero.
     skipped_malformed_urls       = db.Column(db.Integer)
     skipped_duplicate_stream_ids = db.Column(db.Integer)
+
+
+class AccountStatDay(db.Model):
+    """One account's tallies for one local day - the ledger behind every windowed number on
+    the Accounts pages (app/account_stats.py, dev/changelog/1028).
+
+    Only ever ADDED to, by `account_stats.refresh_ledger()`, in the same commit that moves
+    the watermarks on `AccountStatState` past the rows it folded. It is deliberately not a
+    view over the source tables: channel tests are pruned and segments go with their
+    recording, so a count recomputed from them would shrink as history is deleted - a number
+    nobody could explain. A deleted source row's contribution stays here, the same way
+    health_recompute.py leaves it baked into a stored score.
+    """
+    __tablename__ = 'account_stat_days'
+
+    id              = db.Column(db.Integer, primary_key=True)
+    account_id      = db.Column(db.Integer, db.ForeignKey('accounts.id'), nullable=False)
+    # YYYY-MM-DD in the display timezone recorded on AccountStatState.tz_name, so a window
+    # is a string comparison with no timezone math at read time.
+    day             = db.Column(db.String(10), nullable=False)
+    # Wall clock of capture (segment ended_at - started_at), never content duration - the
+    # two differ on a feed that delivers faster than real time (dev/changelog/942).
+    # Excluded (placeholder) segments add nothing here.
+    capture_seconds = db.Column(db.Float, nullable=False, default=0.0)
+    segments        = db.Column(db.Integer, nullable=False, default=0)
+    # Recordings whose first joined segment on this account started on this day.
+    recordings      = db.Column(db.Integer, nullable=False, default=0)
+    stalls          = db.Column(db.Integer, nullable=False, default=0)
+    checks_passed   = db.Column(db.Integer, nullable=False, default=0)
+    checks_failed   = db.Column(db.Integer, nullable=False, default=0)
+    failovers_away  = db.Column(db.Integer, nullable=False, default=0)
+
+    __table_args__ = (
+        # Leads with account_id, so it also serves every "these accounts, since that day" read.
+        db.UniqueConstraint('account_id', 'day', name='uq_account_stat_day'),
+    )
+
+
+class AccountStatState(db.Model):
+    """The single row recording how far `account_stat_days` has read each source table.
+
+    A watermark is the highest source id folded in, and it is the only record of progress:
+    nothing ever infers it from the ledger's contents (CLAUDE.md, "already done is a fact
+    you recorded"). `rebuild_started_at` set with `rebuilt_at` older than it means a rebuild
+    was interrupted and is being resumed.
+    """
+    __tablename__ = 'account_stat_state'
+
+    id                 = db.Column(db.Integer, primary_key=True)
+    segment_watermark  = db.Column(db.Integer, nullable=False, default=0)
+    test_watermark     = db.Column(db.Integer, nullable=False, default=0)
+    event_watermark    = db.Column(db.Integer, nullable=False, default=0)
+    # The display timezone the days were bucketed in. A different one now means every day
+    # boundary moved, and the ledger is rebuilt.
+    tz_name            = db.Column(db.String(64))
+    refreshed_at       = db.Column(db.DateTime)
+    rebuild_started_at = db.Column(db.DateTime)
+    rebuilt_at         = db.Column(db.DateTime)
 
 
 # ── Scheduled-job run history (dev/changelog/592) ─────────────────────────────

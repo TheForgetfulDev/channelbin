@@ -85,17 +85,39 @@ function handleEvent(rid, eventType, d) {
 // once: nothing republishes it, and a miss falls back to the raw status so an unrecognized
 // value is shown rather than swallowed - same contract as rec_status_display's default.
 const STATUS_LABELS = readJson('dash-status-labels') || {};
+const WAITING_LABEL = readJson('dash-waiting-label');
 
-function handleTerminal(rid, status) {
+let _reloadTimer = null;
+
+// Keyed on the `status` a frame carries, never on its event name: every lifecycle publish
+// in app/ sends one, and a hand-kept list of names drifted until it matched three events
+// nothing sent and missed six that moved a row (dev/changelog/1023). A frame without a
+// known status - most of them - says nothing about the badge and leaves it alone.
+//
+// Acts only on a CHANGE from what the row shows: CONVERSION_PROGRESS and STATS_SNAPSHOT
+// repeat the current status every tick, and each change schedules a reload so the row's
+// server-rendered cells catch up with its new phase.
+function handleStatus(rid, d) {
+  if (!Object.prototype.hasOwnProperty.call(STATUS_LABELS, d.status)) return;
+  const row = document.getElementById(`card-${rid}`);
+  if (!row) return;
+  const wasWaiting = row.dataset.waiting === '1';
+  // Only the yield/resume frames carry `waiting`. Any other frame keeps the parked flag
+  // within one status and drops it across a status change, as the server's stamp does.
+  let waiting;
+  if (typeof d.waiting === 'boolean') waiting = d.waiting;
+  else waiting = d.status === row.dataset.status ? wasWaiting : false;
+  if (d.status === row.dataset.status && waiting === wasWaiting) return;
+
+  row.dataset.status = d.status;
+  row.dataset.waiting = waiting ? '1' : '';
   const badge = document.getElementById(`badge-${rid}`);
   if (badge) {
-    badge.className = `badge badge-${status.toLowerCase()}`;
-    badge.textContent = STATUS_LABELS[status] || status;
+    badge.className = `badge badge-${d.status.toLowerCase()}`;
+    badge.textContent = (waiting && WAITING_LABEL) ? WAITING_LABEL : STATUS_LABELS[d.status];
   }
-  const row = document.getElementById(`card-${rid}`);
-  if (row && status === 'COMPLETED') row.style.setProperty('--pct', '100%');
-  // Reload after a short delay to show final state.
-  setTimeout(() => location.reload(), 3000);
+  if (d.status === 'COMPLETED') row.style.setProperty('--pct', '100%');
+  if (_reloadTimer === null) _reloadTimer = setTimeout(() => location.reload(), 3000);
 }
 
 function connect() {
@@ -128,10 +150,7 @@ function connect() {
         handleEvent(rid, evt, d);
       }
 
-      if (['COMPLETED', 'FAILED', 'ABORTED', 'CONCATENATION_DONE', 'CONVERSION_DONE',
-           'RECORDING_FAILED', 'RECORDING_PAUSED', 'RECORDING_RETRY_SCHEDULED'].includes(evt)) {
-        handleTerminal(rid, d.status || evt);
-      }
+      handleStatus(rid, d);
     },
     onError() {
       setStatus('badge-warning', 'Reconnecting',

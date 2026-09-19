@@ -41,6 +41,13 @@ REC_STATUS_DISPLAY = {
 # the machine. Narrower than "any post-capture phase" on purpose: a join is never parked.
 _WAITABLE_STATUSES = (REC_STATUS_ANALYZING, REC_STATUS_CONVERTING)
 
+REC_WAITING_LABEL = 'WAITING'
+
+
+def rec_is_waiting(status, waiting):
+    """True when a parked stamp actually changes how this status is shown."""
+    return bool(waiting) and status in _WAITABLE_STATUSES
+
 
 def rec_status_display(status, waiting=False):
     """(section, edge class, badge class, badge label, pulse) for one Recording.status.
@@ -59,9 +66,9 @@ def rec_status_display(status, waiting=False):
     row = REC_STATUS_DISPLAY.get(status)
     if row is None:
         return ('done', 'st-abort', 'b-abort', status, False)
-    if waiting and status in _WAITABLE_STATUSES:
+    if rec_is_waiting(status, waiting):
         section, st_class, badge_class, _label, _pulse = row
-        return (section, st_class, badge_class, 'WAITING', False)
+        return (section, st_class, badge_class, REC_WAITING_LABEL, False)
     return row
 
 

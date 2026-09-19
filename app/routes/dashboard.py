@@ -19,7 +19,7 @@ from .. import events as ev
 from ..tz_utils import UTC, to_naive_utc, format_local, relative
 from ..accounts import get_sync_progress, next_sync_map, sync_signature
 from .channel_tests import get_active_run_summary
-from ..fmt_utils import REC_STATUS_DISPLAY, rec_status_display
+from ..fmt_utils import REC_STATUS_DISPLAY, REC_WAITING_LABEL, rec_is_waiting, rec_status_display
 
 dashboard_bp = Blueprint('dashboard', __name__)
 log = logging.getLogger(__name__)
@@ -416,6 +416,9 @@ def dashboard():
         rec_status_text={r.id: rec_status_display(
             r.status, waiting=bool(r.postprocess_waiting_since))[3] for r in active},
         rec_status_labels=REC_ROW_STATUS_LABEL,
+        rec_waiting_label=REC_WAITING_LABEL,
+        rec_waiting_ids={r.id for r in active
+                         if rec_is_waiting(r.status, r.postprocess_waiting_since)},
         section_defs=DASHBOARD_SECTIONS, section_order=order, section_on=enabled,
         section_pref_key=DASHBOARD_SECTIONS_PREF,
         metrics=_metric_tiles(active, accounts, now),
@@ -634,8 +637,7 @@ def _activity_status_dict():
             # Per-row, never rebinding the loop's own `label` - a second recording in the
             # same status would otherwise inherit the first one's parked wording.
             row_label = label
-            if r.postprocess_waiting_since and status_val in (REC_STATUS_ANALYZING,
-                                                              REC_STATUS_CONVERTING):
+            if rec_is_waiting(status_val, r.postprocess_waiting_since):
                 # Parked to let another recording have the machine, so the phase labels
                 # above describe work that has stopped. Same display-only derivation the
                 # recordings list makes; the row's status is untouched (dev/changelog/954).

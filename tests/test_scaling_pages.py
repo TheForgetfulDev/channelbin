@@ -39,7 +39,8 @@ from app.database import (Account, AccountSyncLog, Alert, Channel, ChannelEvent,
                           ChannelGroup, ChannelHideRule, HealthCheckProfile,
                           IgnoredAlertPattern, OnDemandTestJob, Recording, RecordingEvent,
                           RecordingProfile, RecordingSegment, Tag, TagPattern,
-                          CHANNEL_ADDED_TO_GUIDE, HIDE_TARGET_NAME_GLOB,
+                          CHANNEL_ADDED_TO_GUIDE, CHANNEL_FAILOVER_HEALTH_OBSERVATION,
+                          HIDE_TARGET_NAME_GLOB,
                           RECORDING_HANDOFF, REC_STATUS_SCHEDULED)
 
 
@@ -304,15 +305,39 @@ def _seed_hide_rules(n):
     db.session.commit()
 
 
+def _seed_ledger_sources(acc, i, in_guide=False):
+    """One channel of `acc` with a finished recording segment, a health check and a
+    failover event - one row of each source the account stats ledger folds."""
+    ch = seed.make_channel(acc, name=f'Scaling Channel {i}', in_guide=in_guide)
+    start = datetime.utcnow() - timedelta(days=i % 20, hours=2)
+    rec = seed.make_recording(status='COMPLETED', name=f'scaling_rec_{acc.id}_{i}',
+                              channel_id=ch.id, start_time=start,
+                              stop_time=start + timedelta(hours=1))
+    seed.make_segment(rec, ch, start, start + timedelta(minutes=50), stall_count=1)
+    seed.make_channel_test(ch, status='COMPLETED' if i % 3 else 'FAILED', test_started_at=start)
+    db.session.add(ChannelEvent(channel_id=ch.id, timestamp=start,
+                                event_type=CHANNEL_FAILOVER_HEALTH_OBSERVATION))
+    return ch
+
+
 def _seed_accounts(n):
     """n accounts, each with five sync-log rows - the /accounts list (dev/changelog/455).
 
     The list page fetched the last five sync runs with a query PER ACCOUNT, which is a real
     N+1 and the identical defect the Tags page had (dev/docs/BUGS.md 2026-08-04 @ 05:58:52
     AM ET). Five each rather than one because the fix is a windowed ranking query: a single
-    log per account would pass just as well against a `LIMIT 5` in a loop."""
+    log per account would pass just as well against a `LIMIT 5` in a loop.
+
+    Each account also gets a channel with a finished segment and a health check, so a
+    per-account usage number (app/account_stats.py, dev/changelog/1028) has rows to read -
+    and a health score and a group membership, so the row's second line and the stats
+    section's pies (dev/changelog/1029) have something per account to count."""
     for i in range(n):
         acc = seed.make_account(name=f'Scaling Account {i}')
+        ch = _seed_ledger_sources(acc, i)
+        ch.health_score = float(20 + (i * 7) % 80)
+        ch.consecutive_test_failures = i % 4
+        seed.make_group(name=f'Scaling Group {i}', members=[ch])
         for run in range(5):
             db.session.add(AccountSyncLog(
                 account_id=acc.id,
@@ -327,11 +352,21 @@ def _seed_account_history(n):
 
     The page shows only the last ten runs, so what this actually guards is everything
     AROUND that cap: the counts, the recordings tally and the effective-settings resolution
-    must each stay one query and one config read however much history the account has."""
+    must each stay one query and one config read however much history the account has.
+
+    Every channel also carries a finished segment, a health check and a failover event, so
+    the usage ledger's fold (app/account_stats.py, dev/changelog/1028) runs on the page load
+    and has to stay a fixed number of queries - and no per-row config read for the local
+    day - however many rows it folds. And a health score and a group membership per
+    channel, so the Content card's current numbers and the Usage card (dev/changelog/1031)
+    have something to count that grows with the account."""
     acc = (Account.query.filter_by(name='Scaling Account Detail').first()
            or seed.make_account(name='Scaling Account Detail'))
     for i in range(n):
-        seed.make_channel(acc, name=f'Scaling Channel {i}', in_guide=(i % 2 == 0))
+        ch = _seed_ledger_sources(acc, i, in_guide=(i % 2 == 0))
+        ch.health_score = float(20 + (i * 7) % 80)
+        ch.consecutive_test_failures = i % 4
+        seed.make_group(name=f'Scaling Detail Group {i}', members=[ch])
         db.session.add(AccountSyncLog(
             account_id=acc.id,
             started_at=datetime.utcnow() - timedelta(minutes=i + 1),

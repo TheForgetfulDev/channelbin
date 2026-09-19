@@ -11,7 +11,7 @@
    What is real here and what is not: every page and every nav-status payload is what the
    Flask app really answered at three database states (no accounts; one account mid-sync;
    that sync finished), base.html's own inline poll is what calls the hook, and util.js +
-   the three account scripts are the shipped files evaluated the way their <script src>
+   the four account scripts are the shipped files evaluated the way their <script src>
    would have been. Faked: the network, which answers from whichever state the scenario
    says the server is in. jsdom computes no layout and implements no navigation - a row
    click is observed as jsdom's "Not implemented: navigation" report, one per attempt.
@@ -27,7 +27,7 @@ const STATES = {};
 for (const s of ['empty', 'syncing', 'done']) {
   STATES[s] = { html: read(`${s}.html`), nav: JSON.parse(read(`${s}.json`)) };
 }
-const JS = ['util.js', 'account-modal.js', 'account-actions.js', 'accounts.js']
+const JS = ['util.js', 'account-modal.js', 'account-actions.js', 'accounts.js', 'account-stats.js']
   .map((f) => fs.readFileSync(`${REPO}/static/js/${f}`, 'utf8'));
 
 function boot(start, { serve = start, width = 1280 } = {}) {
@@ -45,9 +45,11 @@ function boot(start, { serve = start, width = 1280 } = {}) {
   // What the "server" currently answers. A scenario moves it between states.
   const server = { state: serve, pageStatus: 200 };
   const sent = [];
-  const fetchStub = (target) => {
+  const posts = [];
+  const fetchStub = (target, opts = {}) => {
     const url = new URL(String(target), 'http://localhost:5000/accounts');
     sent.push(url.pathname);
+    if ((opts.method || 'GET').toUpperCase() !== 'GET') posts.push({ path: url.pathname, body: opts.body });
     if (url.pathname === '/accounts') {
       const body = STATES[server.state].html;
       const status = server.pageStatus;
@@ -59,7 +61,8 @@ function boot(start, { serve = start, width = 1280 } = {}) {
         json: () => Promise.reject(new Error('not json')),
       });
     }
-    const payload = url.pathname === '/api/nav-status' ? STATES[server.state].nav : {};
+    const payload = url.pathname === '/api/nav-status' ? STATES[server.state].nav
+      : { success: true };
     return Promise.resolve({
       ok: true,
       status: 200,
@@ -95,7 +98,7 @@ function boot(start, { serve = start, width = 1280 } = {}) {
   const $ = (s) => document.querySelector(s);
   const row = (name) => $(`.acct-rows .arow[data-name="${name}"]`);
   const c = {
-    window, document, server, sent, errors, navigations, warnings, $, row,
+    window, document, server, sent, posts, errors, navigations, warnings, $, row,
     // base.html's poll is a fetch -> json -> hook chain, and the hook's swap is another
     // fetch -> text -> parse. Every stub resolves immediately, so one macrotask later
     // than all of that is enough.
@@ -252,6 +255,73 @@ await record('from_empty', async (start) => {
     before,
     after: { rows: c.rowCount(), empty: Boolean(c.$('.empty-state')), total: c.total() },
   };
+});
+
+/* ── The stats section (dev/changelog/1029) ─────────────────────────── */
+// The list's swap must leave the section below it alone: it is outside #acct-live, and
+// replacing it would redraw every chart once a minute and drop a sort the user picked.
+await record('stats_swap', async (start) => {
+  const c = start('syncing');
+  await c.settle();
+  const section = c.$('#acct-stats');
+  c.click(c.$('#acst-table th[data-sort="name"]'));
+  c.server.state = 'done';
+  await c.poll();
+  return {
+    errors: c.errors,
+    hadSection: Boolean(section),
+    pageFetches: c.pageFetches(),
+    sameSection: c.$('#acct-stats') === section,
+    sortKept: c.$('#acst-table th[data-sort="name"]').classList.contains('sorted'),
+  };
+});
+
+// A chip click saves the window to the shared pref, then follows its own link.
+await record('window_chip', async (start) => {
+  const c = start('done');
+  await c.settle();
+  c.click(c.$('#acct-stats .acst-win a[data-win="7d"]'));
+  await c.settle();
+  return { errors: c.errors, posts: c.posts, navigations: c.navigations.length };
+});
+
+// Every column sorts, both ways; the totals row stays last whatever the order.
+await record('sort', async (start) => {
+  const c = start('done');
+  await c.settle();
+  const order = () => Array.from(c.document.querySelectorAll('#acst-table tbody tr'))
+    .map((tr) => (tr.classList.contains('acst-total') ? 'total' : tr.dataset.name));
+  const th = (k) => c.$(`#acst-table th[data-sort="${k}"]`);
+  const initial = order();
+  c.click(th('name'));
+  const nameAsc = order();
+  c.click(th('name'));
+  const nameDesc = order();
+  c.click(th('capture'));
+  const captureDesc = order();
+  const ariaCapture = th('capture').getAttribute('aria-sort');
+  c.click(c.$('#acst-sort-chip + .menu [data-sort="rate"]'));
+  const rateDesc = order();
+  return {
+    errors: c.errors, initial, nameAsc, nameDesc, captureDesc, ariaCapture, rateDesc,
+    chipLabel: c.$('#acst-sort-chip').textContent.replace(/\s+/g, ' ').trim(),
+  };
+});
+
+// The trend column's tooltip names every account in the column, in its own color.
+await record('column_tip', async (start) => {
+  const c = start('done');
+  await c.settle();
+  const col = c.$('#acct-stats .acst-trend .acst-col:last-child');
+  col.dispatchEvent(new c.window.MouseEvent('mouseover', { bubbles: true }));
+  const tip = c.$('.acst-tt');
+  const shown = {
+    visible: Boolean(tip) && tip.style.display !== 'none',
+    text: tip ? tip.textContent.replace(/\s+/g, ' ').trim() : '',
+    dots: tip ? Array.from(tip.querySelectorAll('.stackbar-dot')).map((d) => d.style.background) : [],
+  };
+  c.click(c.document.body);
+  return { errors: c.errors, shown, hiddenAfterTapElsewhere: tip.style.display === 'none' };
 });
 
 process.stdout.write(JSON.stringify(out), () => process.exit(0));

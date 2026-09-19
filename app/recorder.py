@@ -23,7 +23,7 @@ from .database import (
     SEGMENT_STARTED, SEGMENT_ENDED, RECORDING_HANDOFF, DIAGNOSTICS, RESTART_ATTEMPTED,
     GROUP_MEMBER_SELECTED, GROUP_FAILOVER, RECORDING_FORMAT_OVERRIDE,
     RECORDING_URL_RERESOLVED, RECORDING_RESUME_REFUSED,
-    RECORDING_FAILED, RECORDING_START_DEFERRED,
+    RECORDING_FAILED, RECORDING_START_DEFERRED, RECORDING_ABORTED, RECORDING_PAUSED,
     REC_STATUS_SCHEDULED, REC_STATUS_IN_PROGRESS, REC_STATUS_PAUSED, REC_STATUS_RETRYING,
     REC_STATUS_FAILED, REC_STATUS_ABORTED,
     FAILURE_CONVERSION_COLLISION, FAILURE_CONNECTION_SLOT_TIMEOUT, FAILURE_DVR_DIR_UNUSABLE,
@@ -475,6 +475,7 @@ def start_recording(app, recording_id: int):
                     _fail_conversion_collision_and_commit()
                     from .health_score import dismiss_recording_failing_alerts
                     dismiss_recording_failing_alerts(recording_id)
+                    end_slot_wait(recording_id)
                     from .alerts import create_alert
                     create_alert(
                         'RECORDING_FAILED_CONVERSION_COLLISION',
@@ -645,6 +646,7 @@ def start_recording(app, recording_id: int):
             _mark_missing_dvr_dir_and_commit()
             from .health_score import dismiss_recording_failing_alerts
             dismiss_recording_failing_alerts(recording_id)
+            end_slot_wait(recording_id)
             return
 
         account_id = rec.channel.account_id if (rec.channel_id and rec.channel) else None
@@ -2218,8 +2220,6 @@ def abort_recording(app, recording_id: int):
     with app.app_context():
         rec = db.session.get(Recording, recording_id)
         if rec:
-            from .database import RECORDING_ABORTED
-
             @retry_on_locked()
             def _mark_aborted_and_commit():
                 r = db.session.get(Recording, recording_id)
@@ -2241,7 +2241,7 @@ def abort_recording(app, recording_id: int):
             dismiss_recording_failing_alerts(recording_id)
             end_slot_wait(recording_id)
 
-        ev.publish(recording_id, 'RECORDING_ABORTED', {'status': REC_STATUS_ABORTED})
+        ev.publish(recording_id, RECORDING_ABORTED, {'status': REC_STATUS_ABORTED})
 
 
 def pause_recording(app, recording_id: int):
@@ -2251,8 +2251,6 @@ def pause_recording(app, recording_id: int):
 
         rec = db.session.get(Recording, recording_id)
         if rec:
-            from .database import RECORDING_PAUSED
-
             @retry_on_locked()
             def _mark_paused_and_commit():
                 add_recording_event(recording_id, RECORDING_PAUSED, detail='Recording manually paused')
@@ -2261,7 +2259,7 @@ def pause_recording(app, recording_id: int):
 
             _mark_paused_and_commit()
 
-        ev.publish(recording_id, 'RECORDING_PAUSED', {'status': REC_STATUS_PAUSED})
+        ev.publish(recording_id, RECORDING_PAUSED, {'status': REC_STATUS_PAUSED})
 
 
 @retry_on_locked()

@@ -166,7 +166,7 @@ def alert_center():
 def api_alerts():
     unread_only     = request.args.get('unread_only') == '1'
     include_dismissed = request.args.get('include_dismissed') == '1'
-    limit           = min(int(request.args.get('limit', 100)), 500)
+    limit           = min(request.args.get('limit', 100, type=int), 500)
 
     q = Alert.query.order_by(Alert.created_at.desc())
     if not include_dismissed:

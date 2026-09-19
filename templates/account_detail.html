@@ -1,5 +1,6 @@
 {% extends "base.html" %}
 {% import '_macros.html' as m %}
+{% import '_account_stats.html' as acst %}
 {% block title %}{{ account.name }} - Account - ChannelBin{% endblock %}
 
 {#  The account page (dev/changelog/455; standard: DESIGN.md §17).
@@ -85,7 +86,7 @@
       Channels and guide data come from {{ "the provider's Xtream API" if is_xtream else 'an M3U playlist' }},
       {% if account.sync_enabled %}refreshed automatically every {{ settings.interval_hours }} hours{% else %}refreshed only when you ask for it, because automatic sync is off{% endif %}.
       It currently supplies <strong>{{ '{:,}'.format(account.channel_count or 0) }}</strong> channels{% if account.hidden_channel_count %} (<strong>{{ '{:,}'.format(account.hidden_channel_count) }}</strong> hidden){% endif %},
-      <strong>{{ '{:,}'.format(guide_count) }}</strong> of them in your TV Guide, and
+      <strong>{{ '{:,}'.format(cur.guide_channels) }}</strong> of them in your TV Guide, and
       <strong>{{ '{:,}'.format(account.epg_entry_count or 0) }}</strong> program entries.
       {% endif %}
     </p>
@@ -261,21 +262,34 @@
         <div class="srow"><span class="sk">Channels</span><span class="sv">
           {% if account.channel_count %}<a class="sv-link" href="{{ url_for('channels.channel_browser', **{'f.acct': account.id}) }}">{{ '{:,}'.format(account.channel_count) }}</a>{% else %}<span class="text-faint">0</span>{% endif %}{% if account.hidden_channel_count %} <span class="text-faint">({{ '{:,}'.format(account.hidden_channel_count) }} hidden)</span>{% endif %}</span></div>
         <div class="srow"><span class="sk">In the TV Guide</span><span class="sv">
-          {% if guide_count %}<a class="sv-link" href="{{ url_for('channels.channel_browser', **{'f.acct': account.id, 'f.other': 'guide'}) }}">{{ '{:,}'.format(guide_count) }}</a>{% else %}<span class="text-faint">0</span>{% endif %}</span></div>
+          {% if cur.guide_channels %}<a class="sv-link" href="{{ url_for('channels.channel_browser', **{'f.acct': account.id, 'f.other': 'guide'}) }}">{{ '{:,}'.format(cur.guide_channels) }}</a>{% else %}<span class="text-faint">0</span>{% endif %}</span></div>
         <div class="srow"><span class="sk">Program entries</span><span class="sv">
           {% if account.epg_entry_count %}{{ '{:,}'.format(account.epg_entry_count) }}{% else %}<span class="text-faint">0</span>{% endif %}</span></div>
         {{ m.stat_row('Channels with EPG match',
-                      '{:,}'.format(epg_match_counts.with_epg),
-                      'ok' if epg_match_counts.with_epg else 'faint',
+                      '{:,}'.format(cur.epg.with_epg),
+                      'ok' if cur.epg.with_epg else 'faint',
                       tip='Channels with EPG match.&#10;Channels with an EPG id set that currently has a program showing in the next 24h.') }}
         {{ m.stat_row('EPG id set, no match',
-                      '{:,}'.format(epg_match_counts.no_match),
-                      'warn' if epg_match_counts.no_match else 'faint',
+                      '{:,}'.format(cur.epg.no_match),
+                      'warn' if cur.epg.no_match else 'faint',
                       tip='EPG id set, no match.&#10;Channels with an EPG id set, but no program data currently matches it - likely a naming mismatch with the provider guide, or a guide the account does not carry.') }}
         {{ m.stat_row('No EPG id',
-                      '{:,}'.format(epg_match_counts.no_id),
+                      '{:,}'.format(cur.epg.no_id),
                       'faint',
                       tip='No EPG id.&#10;Channels with no EPG id at all, so no guide data can be matched to them.') }}
+        {# What the account is right now - the list row's second line, here in full (DESIGN.md
+           §17.7). Failing right now is not a link: it counts losing streaks as well as the
+           failing band, and no channel-search filter finds exactly that set. #}
+        <div class="srow"><span class="sk">In a channel group</span><span class="sv tip-plain" data-tip="{{ stats.tips.in_group }}">
+          {% if cur.in_group %}<a class="sv-link" href="{{ url_for('channels.channel_browser', **{'f.acct': account.id, 'f.group': group_any}) }}">{{ '{:,}'.format(cur.in_group) }}</a>{% else %}<span class="text-faint">0</span>{% endif %}</span></div>
+        <div class="srow"><span class="sk">Recording on</span><span class="sv tip-plain" data-tip="{{ stats.tips.rec_enabled }}">{{ acst.num(cur.recording_memberships) }}</span></div>
+        <div class="srow"><span class="sk">Guide rows it can feed</span><span class="sv tip-plain" data-tip="{{ stats.rows_tip }}">{{ acst.num(cur.guide_rows_fed) }} <span class="text-faint">of {{ '{:,}'.format(cur.guide_rows_total) }}</span></span></div>
+        <div class="srow"><span class="sk">Average health score</span><span class="sv tip-plain" data-tip="{{ stats.tips.avg }}">
+          {%- if cur.avg_score is none %}<span class="text-faint">-</span>{% else %}<span class="{{ cur.avg_score | health_css(health_bands) }} hb-text">{{ cur.avg_score | round | int }}</span>{% endif -%}
+        </span></div>
+        <div class="srow"><span class="sk">Failing right now</span><span class="sv tip-plain" data-tip="{{ stats.failing_tip }}">
+          {%- if cur.failing %}<span class="hb-poor hb-text">{{ '{:,}'.format(cur.failing) }}</span>{% else %}<span class="text-faint">0</span>{% endif -%}
+        </span></div>
         {{ m.stat_row('Constructed stream URLs',
                       '{:,}'.format(account.constructed_stream_url_count or 0),
                       'warn' if account.constructed_stream_url_count else 'faint',
@@ -288,14 +302,23 @@
                           last_finished_sync.skipped_duplicate_stream_ids if last_finished_sync else none,
                           last_finished_sync is not none,
                           'Duplicate stream IDs skipped (last sync).&#10;Entries that repeated a stream ID already seen in the same sync, so the second copy was not imported.') }}
-        <div class="srow"><span class="sk">Recordings</span><span class="sv">
-          {% if rec_total %}<a class="sv-link" href="{{ url_for('recordings.index') }}">{{ '{:,}'.format(rec_total) }}</a>{% else %}<span class="text-faint">0</span>{% endif %}</span></div>
+        {% set rec_count = usage_all_time.recordings %}
+        <div class="srow"><span class="sk">Recordings</span><span class="sv tip-plain" data-tip="Recordings, all time.&#10;Recordings that captured at least one segment on this account's channels. A recording that failed over between accounts counts for each of them.{{ all_time_note }}">
+          {% if rec_count %}<a class="sv-link" href="{{ url_for('recordings.index') }}">{{ '{:,}'.format(rec_count) }}</a>{% else %}<span class="text-faint">0</span>{% endif %}</span></div>
         {{ m.stat_row('Recorded time',
-                      rec_stats.total_seconds | duration if rec_total else '-',
-                      none if rec_total else 'faint') }}
+                      usage_all_time.capture_seconds | duration if usage_all_time.capture_seconds else '-',
+                      none if usage_all_time.capture_seconds else 'faint',
+                      tip='Recorded time, all time.&#10;Hours of capture from this account\'s channels: the wall clock of every segment recorded on one of them, added up. A recording that failed over between accounts credits each account only the part it captured.' ~ all_time_note) }}
+        {% if stats.notice %}<p class="text-faint small">{{ stats.notice.text }}</p>{% endif %}
       </div>
+      <div class="acst-sub"><span class="tip-plain" data-tip="{{ stats.tips.bands }}">Tested channels by health band</span></div>
+      {{ acst.band_bar(cur, health_bands) }}
     </div>
   </div>
+
+  {# Usage: what this account did over the chosen window. The same macro a one-account
+     /accounts renders in the comparison's place, so the two are one component (§17.7). #}
+  {{ acst.usage_card(stats, account) }}
 
   {# Sync history. The last {{ history_shown }} runs; "All N syncs" loads the rest into
      this same section - account_logs.html and its route are retired (§17.1), so there is
@@ -407,4 +430,5 @@ window.ACCOUNT_DETAIL = {
 <script src="{{ url_for('static', filename='js/account-modal.js') }}"></script>
 <script src="{{ url_for('static', filename='js/account-actions.js') }}"></script>
 <script src="{{ url_for('static', filename='js/account-detail.js') }}"></script>
+<script src="{{ url_for('static', filename='js/account-stats.js') }}"></script>
 {% endblock %}

@@ -191,6 +191,7 @@ def init_scheduler(app):
     schedule_logo_cache_job(app)
     schedule_index_janitor(app)
     schedule_storage_dirs_check(app)
+    schedule_account_stats_fold(app)
 
     # One-shot reconcile of every group's format state (auto-disable mismatched members /
     # re-enable conforming ones). Runs after migrations so schema-v6 columns exist.
@@ -2202,6 +2203,45 @@ def _storage_dirs_job():
             sweep_write_dirs(load_config(), _app.config.get('CAPTURE_LOG_DIR'))
         except Exception:
             log.exception('Storage directory check failed')
+
+
+_ACCOUNT_STATS_FOLD_INTERVAL_MINUTES = 60
+
+
+def schedule_account_stats_fold(app):
+    """Register the hourly account stats ledger fold (app/account_stats.py).
+
+    The Accounts pages fold on every load, so this exists for the source rows nobody looks
+    at before they are gone: a recording deleted, or a channel test pruned, before anyone
+    opened an Accounts page would otherwise never reach the ledger at all. A row can still
+    be lost inside the hour between finishing and this tick - the ledger's docstring and
+    dev/changelog/1028 say so rather than hooking every delete path."""
+    _add_job(
+        func=_account_stats_fold_job,
+        trigger='interval',
+        minutes=_ACCOUNT_STATS_FOLD_INTERVAL_MINUTES,
+        id='account_stats_fold',
+        replace_existing=True,
+    )
+    log.info('Account stats ledger fold scheduled every %d minutes',
+             _ACCOUNT_STATS_FOLD_INTERVAL_MINUTES)
+
+
+def _account_stats_fold_job():
+    """Fold new segments, tests and failover events into the account stats ledger.
+
+    Through ensure_fresh(), so a large backlog goes to the admitted background catch-up
+    rather than holding a scheduler thread, and a refusal is logged by name. Records no
+    JobRun: a tick is a few indexed counts and usually folds nothing."""
+    with _app.app_context():
+        from .account_stats import ensure_fresh
+        try:
+            notice = ensure_fresh(_app)
+        except Exception:
+            log.exception('Account stats ledger fold failed')
+            return
+        if notice:
+            log.info('Account stats ledger: %s', notice['text'])
 
 
 def get_scheduler() -> BackgroundScheduler:

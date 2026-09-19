@@ -90,7 +90,7 @@ def logs_history():
     path = _log_file_path()
     if not path or not os.path.isfile(path):
         return jsonify([])
-    tail = min(int(request.args.get('tail', 1000)), 5000)
+    tail = min(request.args.get('tail', 1000, type=int), 5000)
     lines = _tail_lines(path, tail)
     return jsonify(_parse_lines(lines))
 

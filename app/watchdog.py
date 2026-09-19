@@ -1240,7 +1240,9 @@ class WatchdogThread(threading.Thread):
         record_segment_diagnostics(self.recording_id, open_seg, exit_code, stderr_tail,
                                    reconnects, spool_missing)
         db.session.commit()
-        ev.publish(self.recording_id, event_type, sse_extra)
+        # `status` on every frame that moves a row: dashboard.js relabels from it and
+        # ignores a frame without one (dev/changelog/1023).
+        ev.publish(self.recording_id, event_type, {**sse_extra, 'status': REC_STATUS_FAILED})
         with _lock:
             _active.pop(self.recording_id, None)
         return True
@@ -1445,8 +1447,7 @@ class WatchdogThread(threading.Thread):
             _active.pop(self.recording_id, None)
         ev.publish(self.recording_id, RECORDING_RETRY_SCHEDULED, {
             # Every consumer of this event reads `status` to relabel the row (dashboard.js's
-            # handleTerminal); without it the badge rendered the event NAME and reached for a
-            # `badge-recording_retry_scheduled` rule that does not exist (dev/changelog/663).
+            # handleStatus ignores a frame without one; dev/changelog/663, 1023).
             'status': REC_STATUS_RETRYING,
             'attempt': r.dead_stream_retry_count,
             'max_attempts': max_attempts,
@@ -1519,6 +1520,7 @@ def finalize_dead_stream_retry_exhausted(app, recording_id: int, cause: str = No
               '(attempt %d) - aborting', rec.name, recording_id, rec.dead_stream_retry_count)
     from . import events as ev
     ev.publish(recording_id, RECORDING_FAILED_DEAD_STREAM, {
+        'status': REC_STATUS_FAILED,
         'retry_attempts': rec.dead_stream_retry_count,
     })
     from .health_score import apply_recording_health_observation

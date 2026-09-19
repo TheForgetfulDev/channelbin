@@ -1,5 +1,6 @@
 {% extends "base.html" %}
 {% import '_macros.html' as m %}
+{% import '_account_stats.html' as st %}
 {% block title %}Accounts - ChannelBin{% endblock %}
 
 {#  The Accounts list (standard: DESIGN.md §17.1/§17.2/§17.5).
@@ -8,7 +9,8 @@
     somewhere else to live: the seven loose buttons are a kebab, the red error line and the
     inline Recent-syncs table are sections on the account page (part 1, dev/changelog/455),
     and account_logs.html is gone. What is left is which account this is, whether it is
-    healthy, and how big it is.
+    healthy, how big it is, and - on its second line - what it is right now. How the
+    accounts were USED over a window is the stats section under the list (§17.7).
 
     Rows are server-rendered here and driven by static/js/accounts.js, the same split
     tags.html uses. Three things about the row are load-bearing:
@@ -167,16 +169,25 @@ Sync cancelled before it finished.
         </div>
       </span>
     </span>
+    {# What the account is right now, under the row's own numbers (§17.7). Inside
+       #acct-live, so the minute/sync-signature swap redraws it with the rest of the row. #}
+    {{ st.row_more(stats.current[account.id], stats, health_bands) }}
   </div>
   {% endfor %}
 </div>
 </div>
 {% endif %}
 </div>
+
+{# The account stats (§17.7): below the list and OUTSIDE #acct-live, so the list's minute
+   swap never recomputes or redraws them. Nothing on it moves with a sync anyway - syncs
+   are not in the ledger - and what a sync does move is on the rows above. #}
+{{ st.section(stats) }}
 {% endblock %}
 
 {% block scripts %}
 <script src="{{ url_for('static', filename='js/account-modal.js') }}"></script>
 <script src="{{ url_for('static', filename='js/account-actions.js') }}"></script>
 <script src="{{ url_for('static', filename='js/accounts.js') }}"></script>
+<script src="{{ url_for('static', filename='js/account-stats.js') }}"></script>
 {% endblock %}
