@@ -44,7 +44,7 @@ from ..channel_groups import (
     FORMAT_STRATEGY_LABELS,
     DEFAULT_FAILING_STREAK_THRESHOLD, plan_format_selection, FORMAT_STRATEGIES,
     MATCH_REASON_STRENGTH, FORMAT_STATUS_STRENGTH,
-    build_group_with_members, group_name_conflict, serving_member,
+    build_group_with_members, group_name_conflict, serving_member, touch_group,
 )
 from ..config import load_config
 from ..db_utils import retry_on_locked
@@ -1655,6 +1655,7 @@ def add_members(group_id):
         _grouping_events([by_id[cid] for cid in new_ids], g,
                          CHANNEL_GROUPED, 'Added to channel group "{group_name}"')
         channel_hiding.recompute(new_ids)
+        touch_group(g)
         db.session.commit()
     _add()
 
@@ -1750,6 +1751,13 @@ def remove_members(group_id):
         # Transferred channels are already covered - transfer_channel_state() recomputes
         # both ends itself, because it moves guide rows as well as memberships.
         channel_hiding.recompute([ch.id for ch in removed])
+        # A transfer changes this group's member set too - the source's membership is
+        # reassigned to the keeper or deleted - so the date moves for either outcome,
+        # not only for a plain removal. transfer_channel_state() also touches every
+        # group it moves a membership in, which covers the OTHER groups the source
+        # belonged to; this covers the one the request was aimed at.
+        if removed or transferred:
+            touch_group(g)
         db.session.commit()
         return ([ch.id for ch in removed], transferred, transfer_skipped, cancelled,
                 touched_group_ids - {group_id})
@@ -2438,6 +2446,10 @@ def apply_format_plan(group_id):
             apply_lock_and_log(g, strategy, entry, non_matching, len(removed))
             dropped = _apply_demotion(g, state) if demoting else []
             channel_hiding.recompute([ch.id for ch in removed])
+            # The lock write above already moves the date through `onupdate`; saying so
+            # here anyway keeps the membership change itself responsible for it, rather
+            # than leaving it to a side effect of the write beside it.
+            touch_group(g)
             db.session.commit()
             return [ch.id for ch in removed], dropped
         removed_ids, cancelled = _remove_and_lock()
@@ -2882,6 +2894,15 @@ def suggest():
     results.sort(key=lambda r: (FORMAT_STATUS_STRENGTH[r['format_status']],
                                 MATCH_REASON_STRENGTH[r['reason']], -r['effective_score']))
     results = results[:100]
+    # Provider-removed state for just the returned rows, batched - the same signal the
+    # Remove Duplicates modal and the member table badge (dev/changelog/652, 1042). Marked,
+    # never filtered or demoted: the user decides whether a dropped feed is still wanted.
+    lifecycle_by_channel = lifecycle_states_for_channels(
+        [best[r['channel_id']]['ch'] for r in results], load_config())
+    for r in results:
+        state, since = lifecycle_by_channel.get(r['channel_id'], (None, None))
+        r['lifecycle'] = state
+        r['lifecycle_date'] = since.strftime('%Y-%m-%d') if since else ''
     # Existing memberships (any kind) for just the returned rows, one batched query -
     # never a per-channel lazy load over the whole candidate set.
     result_ids = [r['channel_id'] for r in results]

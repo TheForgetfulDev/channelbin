@@ -29,6 +29,7 @@ to a local file. Run standalone:
   python3 -m unittest tests.test_concat_shutdown_teardown
 """
 import ast
+import contextlib
 import os
 import subprocess
 import sys
@@ -134,6 +135,10 @@ class _ConcatCase(unittest.TestCase):
         return (
             mock.patch('app.config.load_config', return_value=self.cfg),
             mock.patch('app.recorder.persist_final_thumbnail'),
+            # Both of the join's image grabs, not just the thumbnail: each one spawns a
+            # real ffmpeg against a fake segment file, and the second one left the join
+            # thread alive past the end of the test (dev/changelog/1060).
+            mock.patch('app.recorder.persist_poster_frame'),
             mock.patch('app.health_score.apply_capture_phase_health_observation'),
             mock.patch.object(catmod, '_measure_segment_content_durations'),
         )
@@ -163,7 +168,13 @@ class JoinChildIsTrackedTests(_ConcatCase):
 
         ctxs = self._patches() + (
             mock.patch.object(catmod, 'supervise_ffmpeg', side_effect=_fake_supervise),)
-        with ctxs[0], ctxs[1], ctxs[2], ctxs[3], ctxs[4]:
+        # Entered through an ExitStack rather than by index: a `with ctxs[0] .. ctxs[n]`
+        # line silently drops the tail when _patches() grows, and the patch it dropped was
+        # the supervisor stub, so the real one ran and the test failed somewhere else
+        # entirely (dev/changelog/1060).
+        with contextlib.ExitStack() as stack:
+            for ctx in ctxs:
+                stack.enter_context(ctx)
             catmod._run_concatenation(self.t.app, self.rid, reason='test')
         return seen
 
@@ -382,6 +393,7 @@ class SupervisedJoinShutdownTests(_ConcatCase):
         def _join():
             with mock.patch('app.config.load_config', return_value=self.cfg), \
                  mock.patch('app.recorder.persist_final_thumbnail'), \
+                 mock.patch('app.recorder.persist_poster_frame'), \
                  mock.patch('app.health_score.apply_capture_phase_health_observation'), \
                  mock.patch.object(catmod, '_measure_segment_content_durations'), \
                  mock.patch.object(pumod.subprocess, 'Popen', side_effect=_fake_popen):

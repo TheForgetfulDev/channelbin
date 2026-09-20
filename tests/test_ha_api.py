@@ -82,7 +82,14 @@ class StatusEndpointShapeTests(_ConfigSandbox):
     def test_bare_object_not_success_envelope(self):
         data = self._get()
         self.assertNotIn('success', data)
-        self.assertEqual(set(data.keys()), {'recording', 'disk', 'alerts', 'accounts'})
+        self.assertEqual(set(data.keys()),
+                         {'app_version', 'recording', 'disk', 'alerts', 'accounts'})
+
+    def test_reports_the_app_version(self):
+        """The integration refuses to run against a server older than its declared minimum,
+        and reads a missing version as too old (dev/changelog/1037)."""
+        from app.version import __version__
+        self.assertEqual(self._get()['app_version'], __version__)
 
     def test_recording_counts_and_next_recording(self):
         acc = make_account()

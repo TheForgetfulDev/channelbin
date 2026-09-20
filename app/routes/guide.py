@@ -90,8 +90,8 @@ GUIDE_SORT_KEYS = ('guide', 'name', 'health')
 GUIDE_CELL_FIELDS = ['rec_status', 'title', 'subtitle', 'time', 'tag_dots']
 
 # 13.9's "detailed" default preset, and its one hard rule: a description never renders in a
-# mobile grid cell (it lives in the program sheet), so mobile's default is off and guide.js
-# refuses to emit it at phone widths regardless of what the stored pref says.
+# mobile grid cell (it lives in the record modal the cell opens), so mobile's default is off
+# and guide.js refuses to emit it at phone widths regardless of what the stored pref says.
 GUIDE_LAYOUT_MOBILE_OVERRIDES = {
     'start_time': True,
     'description': False,

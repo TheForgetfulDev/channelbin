@@ -1,4 +1,6 @@
-from flask import Blueprint, render_template, request, jsonify
+import logging
+
+from flask import Blueprint, abort, render_template, request, jsonify, send_from_directory
 
 from .. import db
 from ..config import load_config
@@ -6,6 +8,12 @@ from ..database import RecordingProfile, Recording, Channel
 from ..db_utils import retry_on_locked
 from ..profile_forms import (BOOL, INT, TEXT, Override, ProfileField, default_summary,
                              nullable_overrides, parse_profile_body, profile_payload)
+from ..profile_posters import (
+    FILENAME_RE, MAX_BYTES, POSTER_HEIGHT, POSTER_WIDTH, discard_poster_file,
+    poster_payload, posters_dir, size_advice, sniff_image, store_poster,
+)
+
+log = logging.getLogger(__name__)
 
 profiles_bp = Blueprint('profiles', __name__)
 
@@ -28,11 +36,16 @@ _FIELDS = (
     ProfileField('stall_move_window_minutes', 'Stall window', INT),
     ProfileField('retention_days', 'Auto-delete after', INT),
     ProfileField('pre_check_enabled', 'Pre-recording health check', BOOL),
+    ProfileField('metadata_sidecar_enabled', 'Metadata file for media servers', BOOL),
 )
 
 
 def _profile_payload(p):
-    return profile_payload(p, _FIELDS)
+    payload = profile_payload(p, _FIELDS)
+    # Not a ProfileField: the poster travels as a file through its own routes below, never
+    # through the JSON body, so parse_profile_body() must not learn a key for it.
+    payload['poster'] = poster_payload(p)
+    return payload
 
 
 def _read_profile_body():
@@ -61,6 +74,7 @@ def _global_defaults(cfg):
         'stall_move_window_minutes': cfg['watchdog']['stall_move_window_minutes'],
         'retention_days': cfg['recording']['retention_days'],
         'pre_check_enabled': cfg['channel_testing']['pre_check']['enabled'],
+        'metadata_sidecar_enabled': cfg['recording']['metadata_sidecar']['enabled'],
     }
 
 
@@ -88,6 +102,7 @@ _OVERRIDE_ROWS = (
     ('stall_move_window_minutes', 'Stall window', lambda v: f'{v}m'),
     ('retention_days', 'Auto-delete', _retention),
     ('pre_check_enabled', 'Pre-recording check', lambda v: 'On' if v else 'Off'),
+    ('metadata_sidecar_enabled', 'Metadata file', lambda v: 'On' if v else 'Off'),
 )
 
 
@@ -102,6 +117,11 @@ def _overrides(p):
     if p.pre_padding_minutes or p.post_padding_minutes:
         rows.insert(0, Override('Padding',
                                 f'{p.pre_padding_minutes}m / {p.post_padding_minutes}m'))
+    # The pinned poster has no global to inherit, so it is not in _OVERRIDE_ROWS either.
+    # Its size is what the row shows: whether the image matches what a media server
+    # expects is the one thing about it a user would check here.
+    if p.poster_file:
+        rows.append(Override('Poster', f'{p.poster_width} x {p.poster_height}'))
     return rows
 
 
@@ -139,6 +159,10 @@ def profiles_list():
         # _OVERRIDE_ROWS, and is shown on its own line.
         default_summary=default_summary(defaults, _OVERRIDE_ROWS),
         profiles_json=[_profile_payload(p) for p in profiles],
+        # The modal's copy states these rather than re-spelling them in JS, so the size the
+        # form asks for and the size the upload response compares against are one number.
+        poster_spec={'width': POSTER_WIDTH, 'height': POSTER_HEIGHT,
+                     'maxMb': MAX_BYTES // (1024 * 1024)},
     )
 
 
@@ -193,6 +217,7 @@ def delete_profile(profile_id):
     if profile is None:
         return jsonify({'error': 'Profile not found'}), 404
     name = profile.name
+    poster_file = profile.poster_file
 
     # Two separate commits (unlink references, then delete the row) each need their
     # own retry_on_locked closure - see CLAUDE.md's db.session.commit() rule: a retry
@@ -213,5 +238,105 @@ def delete_profile(profile_id):
 
     _unlink_references()
     _delete_profile_row()
+    # The profile's poster is the one image its recordings share, so no recording's
+    # teardown removes it; the profile going is the only thing that does. After the row
+    # is gone, never before: a delete that fails to commit must leave the poster serving.
+    discard_poster_file(load_config(), poster_file)
 
     return jsonify({'success': True, 'name': name})
+
+
+@profiles_bp.route('/api/profiles/<int:profile_id>/poster', methods=['POST'])
+def upload_profile_poster(profile_id):
+    """Pin a poster image to a profile, replacing any it had (dev/changelog/1059).
+
+    Multipart, field `poster`. The app-wide MAX_CONTENT_LENGTH has already refused a
+    request larger than the framing allows before this runs (CSRFProtect parses the form
+    first); the bounded read below is the check on the image itself. The file is written
+    to disk BEFORE the row is pointed at it and outside the retry_on_locked closure,
+    because a file write is a non-idempotent side effect; the previous file is discarded
+    only after the commit that stopped referencing it.
+    """
+    if db.session.get(RecordingProfile, profile_id) is None:
+        return jsonify({'error': 'Profile not found'}), 404
+    upload = request.files.get('poster')
+    if upload is None or not upload.filename:
+        return jsonify({'error': 'Choose a JPG or PNG image to upload.'}), 400
+    data = upload.stream.read(MAX_BYTES + 1)
+    if len(data) > MAX_BYTES:
+        return jsonify({'error': f'The image is larger than {MAX_BYTES // (1024 * 1024)} MB. '
+                                 f'Use a smaller file - nothing here resizes it.'}), 413
+    info = sniff_image(data)
+    if info is None:
+        return jsonify({'error': 'That file is not a JPG or PNG image. The format is read '
+                                 'from the file itself, not its name.'}), 400
+
+    cfg = load_config()
+    try:
+        filename = store_poster(cfg, profile_id, data, info)
+    except OSError as exc:
+        log.warning('Profile %d: could not save its poster under %s: %s',
+                    profile_id, posters_dir(cfg), exc)
+        return jsonify({'error': f'Could not save the image to {posters_dir(cfg)}: '
+                                 f'{exc.strerror or exc}'}), 500
+
+    @retry_on_locked()
+    def _point_row_at_it_and_commit():
+        p = db.session.get(RecordingProfile, profile_id)
+        if p is None:
+            return None, None
+        previous = p.poster_file
+        p.poster_file = filename
+        p.poster_width = info.width
+        p.poster_height = info.height
+        db.session.commit()
+        return p, previous
+
+    profile, previous = _point_row_at_it_and_commit()
+    if profile is None:
+        discard_poster_file(cfg, filename)
+        return jsonify({'error': 'Profile not found'}), 404
+    if previous and previous != filename:
+        discard_poster_file(cfg, previous)
+    return jsonify({'success': True, 'profile': _profile_payload(profile),
+                    'advice': size_advice(info.width, info.height)})
+
+
+@profiles_bp.route('/api/profiles/<int:profile_id>/poster', methods=['DELETE'])
+def remove_profile_poster(profile_id):
+    """Unpin a profile's poster; its recordings go back to the captured frame. Posters
+    already copied beside finished recordings are left where they are."""
+    if db.session.get(RecordingProfile, profile_id) is None:
+        return jsonify({'error': 'Profile not found'}), 404
+
+    @retry_on_locked()
+    def _clear_and_commit():
+        p = db.session.get(RecordingProfile, profile_id)
+        if p is None:
+            return None, None
+        previous = p.poster_file
+        p.poster_file = None
+        p.poster_width = None
+        p.poster_height = None
+        db.session.commit()
+        return p, previous
+
+    profile, previous = _clear_and_commit()
+    if profile is None:
+        return jsonify({'error': 'Profile not found'}), 404
+    discard_poster_file(load_config(), previous)
+    return jsonify({'success': True, 'profile': _profile_payload(profile)})
+
+
+@profiles_bp.route('/api/profiles/<int:profile_id>/poster')
+def profile_poster(profile_id):
+    """Serve a profile's pinned poster. The name comes off the row, and only a name
+    store_poster() could have produced is ever handed to send_from_directory - which
+    refuses traversal on its own, but a row that fails the pattern did not come from this
+    code and is a 404 rather than a guess."""
+    profile = db.session.get(RecordingProfile, profile_id)
+    if profile is None or not profile.poster_file or not FILENAME_RE.match(profile.poster_file):
+        abort(404)
+    resp = send_from_directory(posters_dir(load_config()), profile.poster_file)
+    resp.headers['X-Content-Type-Options'] = 'nosniff'
+    return resp

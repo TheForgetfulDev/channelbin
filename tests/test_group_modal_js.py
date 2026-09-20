@@ -162,6 +162,23 @@ class SuggestSettleTests(_Base):
         self.assertIn('Service Unavailable', frame['error_text'])
 
 
+class SuggestProviderRemovedTests(_Base):
+    """A suggestion the provider has already dropped carries the same Missing badge the
+    group's member table and the Remove Duplicates modal show (dev/docs/BUGS.md 2026-09-19
+    @ 02:38:01 PM). Marked, not filtered: it is still a row and still checkable."""
+
+    def test_the_removed_candidate_is_badged_and_the_live_one_is_not(self):
+        rows = {r['name']: r for r in self.obs['fixed_missing']['settled']['suggest_badges']}
+        self.assertIsNone(rows['Fox Sports 1 HD']['badge'])
+        self.assertEqual(rows['FS1 backup']['badge'], 'Missing 2026-09-01')
+        self.assertIn("No longer seen in Acct B's synced feed since 2026-09-01",
+                      rows['FS1 backup']['tip'])
+
+    def test_the_removed_candidate_is_still_offered(self):
+        rows = {r['name']: r for r in self.obs['fixed_missing']['settled']['suggest_badges']}
+        self.assertTrue(rows['FS1 backup']['checkable'])
+
+
 class SingleSeedPathUnchangedTests(_Base):
     """The group detail page's per-row "Group with duplicates" seeds suggestions too, but
     it never opened on an empty body - it has its selection and its name field from the

@@ -25,6 +25,7 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from .config import load_config, config_default
 from . import admission, db
+from .channel_groups import touch_group
 from .database import (
     Account, Alert, Channel, ChannelEvent, ChannelGroupMember, EPGEntry, AccountSyncLog,
     Recording, add_recording_event,
@@ -2007,6 +2008,9 @@ def transfer_channel_state(source: Channel, dest: Channel, cfg: dict) -> str:
     for m in list(source.group_memberships):
         already_member = ChannelGroupMember.query.filter_by(
             group_id=m.group_id, channel_id=dest.id).first()
+        # Either branch changes which channels that group holds, and the group may not
+        # be the one the user is looking at - a source channel can belong to several.
+        touch_group(m.group)
         if already_member is not None:
             skipped_groups.append(m.group.name)
             db.session.delete(m)

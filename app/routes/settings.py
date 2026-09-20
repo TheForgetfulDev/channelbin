@@ -9,26 +9,30 @@ import uuid
 import yaml
 from io import BytesIO
 
+from ruamel.yaml.error import YAMLError as RoundTripYAMLError
 from flask import (Blueprint, render_template, request, redirect, url_for, flash,
                    jsonify, send_file, current_app, session)
 
 from .. import health_bands
 from ..config import (load_config, save_config, config_default, is_restart_needed,
                       RESTART_REQUIRED_KEYS, set_nested, mask_config, redact_sensitive_diff_lines, _is_sensitive_path,
-                      _load_config_file, config_write_lock, load_for_edit, changed_from_default)
+                      _load_config_file, config_write_lock, load_for_edit, changed_from_default,
+                      check_config_text)
 from ..database import (
     REC_STATUS_IN_PROGRESS, REC_STATUS_PAUSED, REC_STATUS_RETRYING,
     REC_STATUS_CONCATENATING, REC_STATUS_ANALYZING, REC_STATUS_CONVERTING,
 )
 from ..accounts import (TEMPLATE_VARIABLES, _TAG_TOKEN_RE, render_filename_template,
                         tag_template_variables)
-from ..recorder import _safe_name
+from ..recorder import _safe_name, FINISHED_IMAGE_CHOICES
+from ..channel_search import PAGE_SIZE_OPTIONS, configured_page_size
 from ..alerts import ALERT_TYPES, RETIRED_ALERT_TYPES
 from ..notifications import (SERVICE_LABELS, SERVICE_URL_HINTS, dismiss_placeholder_url_alert,
                              dismiss_send_failure_alert)
 from ..tz_utils import get_display_tz, format_local, to_local, to_naive_utc, parse_hhmm
 
 settings_bp = Blueprint('settings', __name__)
+log = logging.getLogger(__name__)
 
 # The /api/user-prefs key holding the Settings page's Basic/Advanced choice: true shows
 # Advanced, anything else (including never chosen) shows Basic. Named once here - the
@@ -37,87 +41,139 @@ settings_bp = Blueprint('settings', __name__)
 SETTINGS_VIEW_PREF = 'settings_show_advanced'
 
 
+def _page_size_choice(value):
+    """`search.page_size` as the int it is stored as, or None when it is not on the menu. The
+    select posts a string, and the raw YAML editor may hold either spelling."""
+    if isinstance(value, bool):
+        return None
+    try:
+        size = int(value)
+    except (TypeError, ValueError):
+        return None
+    return size if size in PAGE_SIZE_OPTIONS else None
+
+
+def _raw_yaml_problems(text):
+    """`check_config_text()` plus the rules the field routes enforce, which the raw editor
+    would otherwise walk around (enforcement lives server-side). The one answer both its
+    Validate button and its Save give (dev/changelog/1044)."""
+    data, problems = check_config_text(text)
+    if data is None:
+        return data, problems
+
+    def refuse(path, message):
+        problems.append({'severity': 'error', 'path': path, 'line': None, 'message': message})
+
+    # The Security card disables the enable toggle client-side until a password exists. A
+    # masked '********' still counts as "a password is set" - restore_masked_secrets()
+    # resolves it to the stored hash inside save_config().
+    auth_block = data.get('auth') if isinstance(data.get('auth'), dict) else {}
+    if auth_block.get('enabled') and not str(auth_block.get('password_hash') or '').strip():
+        refuse('auth.enabled', 'Cannot turn on the login gate with no password set - set one '
+                               'from the Security card first.')
+    testing = data.get('channel_testing') if isinstance(data.get('channel_testing'), dict) else {}
+    window_block = testing.get('window') if isinstance(testing.get('window'), dict) else {}
+    win_start, win_end = window_block.get('start'), window_block.get('end')
+    try:
+        for value in (win_start, win_end):
+            if value is not None:
+                parse_hhmm(value)
+    except (TypeError, ValueError, AttributeError):
+        refuse('channel_testing.window', 'start and end must be times like "01:30".')
+    else:
+        if win_start is not None and win_start == win_end:
+            refuse('channel_testing.window', 'start and end cannot be the same time - a '
+                                             'zero-length window would never run anything.')
+    # dev/changelog/771: the same band validation as api_settings_field.
+    bands_block = testing.get('health_bands')
+    if isinstance(bands_block, dict):
+        floors = dict(health_bands.DEFAULT_FLOORS)
+        floors.update({k: v for k, v in bands_block.items() if k in floors})
+        problem = health_bands.validate_floors(floors)
+        if problem:
+            refuse('channel_testing.health_bands', f'{problem}.')
+    failing = testing.get('failing_band')
+    if failing is not None and failing not in health_bands.FAILING_VALUES:
+        refuse('channel_testing.failing_band',
+               'Must be one of ' + ', '.join(health_bands.FAILING_VALUES) + '.')
+    search = data.get('search') if isinstance(data.get('search'), dict) else {}
+    page_size = search.get('page_size')
+    if page_size is not None and _page_size_choice(page_size) is None:
+        refuse('search.page_size',
+               'Must be one of ' + ', '.join(map(str, PAGE_SIZE_OPTIONS)) + '.')
+    return data, problems
+
+
+@settings_bp.route('/api/settings/validate', methods=['POST'])
+def api_settings_validate():
+    """Check the raw editor's text without saving it. Body: {text}."""
+    text = (request.get_json(silent=True) or {}).get('text')
+    if not isinstance(text, str):
+        return jsonify({'error': 'text is required'}), 400
+    _, problems = _raw_yaml_problems(text)
+    return jsonify({'success': True, 'problems': problems,
+                    'valid': not any(p['severity'] == 'error' for p in problems)})
+
+
+def _save_raw_yaml(data):
+    """save_config() and the side effects a changed key needs; returns the flash text."""
+    changed = save_config(data)
+    if any(path.startswith('auth.') for path, _, _ in changed):
+        from ..auth import refresh_auth
+        refresh_auth(current_app._get_current_object())
+    from ..toolchain import TOOLCHAIN_CONFIG_KEYS
+    if any(path in TOOLCHAIN_CONFIG_KEYS for path, _, _ in changed):
+        from ..toolchain import report_tool_state
+        report_tool_state(source='settings')
+    if any(path == 'search.tag_id_cache_enabled' for path, _, _ in changed):
+        from ..channel_search import clear_tag_channel_ids_cache
+        clear_tag_channel_ids_cache()
+    if any(path == 'search.standing_breakdown_cache_ttl_seconds' for path, _, _ in changed):
+        from ..channel_search import clear_standing_breakdown_cache
+        clear_standing_breakdown_cache()
+    if any(path == 'recording.logo_cache.enabled' for path, _, _ in changed):
+        from ..scheduler import apply_logo_cache_schedule
+        apply_logo_cache_schedule()
+    if not changed:
+        return 'No changes detected.'
+    if any(path in RESTART_REQUIRED_KEYS for path, _, _ in changed):
+        return 'Settings saved. Restart the service for all changes to take effect.'
+    return 'Settings saved.'
+
+
 @settings_bp.route('/settings', methods=['GET', 'POST'])
 def settings():
-    if request.method == 'POST':
-        raw = request.form.get('config_yaml', '')
-        try:
-            data = yaml.safe_load(raw)
-            if not isinstance(data, dict):
-                raise ValueError('Config must be a YAML mapping')
-            # Enforcement lives server-side (CLAUDE.md): the Security card disables the
-            # enable toggle client-side until a password exists, but the raw YAML editor
-            # bypasses that entirely, so the route must refuse it too. A masked
-            # '********' still counts as "a password is set" - restore_masked_secrets()
-            # resolves it to the stored hash inside save_config() below.
-            auth_block = data.get('auth') or {}
-            if auth_block.get('enabled') and not (auth_block.get('password_hash') or '').strip():
-                flash('Cannot enable the login gate with no password set - set one from '
-                     'the Security card first.', 'error')
-                return redirect(url_for('settings.settings'))
-            # Same enforcement as api_settings_field's window validation - the raw YAML
-            # editor bypasses that route entirely, so it needs its own guard.
-            window_block = (data.get('channel_testing') or {}).get('window') or {}
-            win_start, win_end = window_block.get('start'), window_block.get('end')
-            if win_start is not None or win_end is not None:
-                try:
-                    if win_start is not None:
-                        parse_hhmm(win_start)
-                    if win_end is not None:
-                        parse_hhmm(win_end)
-                except ValueError:
-                    flash('channel_testing.window.start/end must be in HH:MM format.', 'error')
-                    return redirect(url_for('settings.settings'))
-                if win_start is not None and win_start == win_end:
-                    flash('channel_testing.window start and end time cannot be the same - '
-                         'a zero-length window would never run anything.', 'error')
-                    return redirect(url_for('settings.settings'))
-            # Same enforcement as api_settings_field's band validation, for the same reason
-            # the window check above is duplicated here: the raw YAML editor never touches
-            # that route (dev/changelog/771).
-            bands_block = (data.get('channel_testing') or {}).get('health_bands')
-            if bands_block is not None:
-                floors = dict(health_bands.DEFAULT_FLOORS)
-                floors.update({k: v for k, v in (bands_block or {}).items() if k in floors})
-                problem = health_bands.validate_floors(floors)
-                if problem:
-                    flash(f'channel_testing.health_bands: {problem}.', 'error')
-                    return redirect(url_for('settings.settings'))
-            failing = (data.get('channel_testing') or {}).get('failing_band')
-            if failing is not None and failing not in health_bands.FAILING_VALUES:
-                flash('channel_testing.failing_band must be one of '
-                      + ', '.join(health_bands.FAILING_VALUES) + '.', 'error')
-                return redirect(url_for('settings.settings'))
-            changed = save_config(data)
-            if any(path.startswith('auth.') for path, _, _ in changed):
-                from ..auth import refresh_auth
-                refresh_auth(current_app._get_current_object())
-            from ..toolchain import TOOLCHAIN_CONFIG_KEYS
-            if any(path in TOOLCHAIN_CONFIG_KEYS for path, _, _ in changed):
-                from ..toolchain import report_tool_state
-                report_tool_state(source='settings')
-            if any(path == 'search.tag_id_cache_enabled' for path, _, _ in changed):
-                from ..channel_search import clear_tag_channel_ids_cache
-                clear_tag_channel_ids_cache()
-            if any(path == 'search.standing_breakdown_cache_ttl_seconds'
-                  for path, _, _ in changed):
-                from ..channel_search import clear_standing_breakdown_cache
-                clear_standing_breakdown_cache()
-            if not changed:
-                flash('No changes detected.', 'success')
-            elif any(path in RESTART_REQUIRED_KEYS for path, _, _ in changed):
-                flash('Settings saved. Restart the service for all changes to take effect.', 'success')
-            else:
-                flash('Settings saved.', 'success')
-        except Exception as exc:
-            flash(f'Invalid YAML: {exc}', 'error')
-        return redirect(url_for('settings.settings'))
+    if request.method == 'GET':
+        return _render_settings()
+    raw = request.form.get('config_yaml', '')
+    data, problems = _raw_yaml_problems(raw)
+    if any(p['severity'] == 'error' for p in problems):
+        # Rendered, not redirected: a redirect reloads the editor from disk and throws away
+        # everything the user typed.
+        flash('config.yaml was not saved - see the problems under the editor.', 'error')
+        return _render_settings(yaml_text=raw, yaml_problems=problems), 400
+    try:
+        message = _save_raw_yaml(data)
+    except (OSError, yaml.YAMLError, RoundTripYAMLError) as exc:
+        log.error('Settings: saving config.yaml from the raw editor failed: %s', exc)
+        flash(f'config.yaml could not be written: {exc}', 'error')
+        return _render_settings(yaml_text=raw), 500
+    warnings = sum(1 for p in problems if p['severity'] == 'warning')
+    if warnings:
+        message += f' {warnings} warning{"s" if warnings != 1 else ""} - press Validate to see them.'
+    flash(message, 'success')
+    return redirect(url_for('settings.settings'))
 
+
+def _render_settings(yaml_text=None, yaml_problems=None):
+    """The Settings page. `yaml_text` puts the raw editor back on text that was not saved,
+    with the config.yaml tab open and `yaml_problems` listed under it."""
     # Mask sensitive leaves on both render paths - the individual field widgets and the raw
     # YAML editor dump. The masked value round-trips back to the stored secret on save.
     unmasked_cfg = load_config()
     cfg = mask_config(unmasked_cfg)
-    cfg_yaml = yaml.dump(cfg, default_flow_style=False, sort_keys=False)
+    cfg_yaml = (yaml_text if yaml_text is not None
+                else yaml.dump(cfg, default_flow_style=False, sort_keys=False))
     # Coerced rather than read raw: a config written before _m014 still holds a boolean
     # here, and the select must land on the equivalent mode instead of no option at all.
     from ..accounts import NORM_DISABLED, NORM_MODES, coerce_normalization_mode
@@ -152,6 +208,7 @@ def settings():
 
     return render_template(
         'settings.html', cfg=cfg, cfg_yaml=cfg_yaml,
+        yaml_open=yaml_text is not None, yaml_problems=yaml_problems or [],
         show_advanced=show_advanced, view_pref_key=SETTINGS_VIEW_PREF,
         # Paths only - the unmasked config is compared, but no value leaves this line.
         changed_paths=set(changed_from_default(unmasked_cfg)),
@@ -160,6 +217,8 @@ def settings():
         norm_mode_value=(coerce_normalization_mode(cfg.get('sync', {}).get('url_normalization'))
                          or NORM_DISABLED),
         window_capacity_line=window_capacity_line,
+        page_size_options=[(n, str(n)) for n in PAGE_SIZE_OPTIONS],
+        page_size_value=configured_page_size(unmasked_cfg),
         timezone_options=timezone_options,
     )
 
@@ -202,6 +261,8 @@ def api_settings_field():
         # and rejects on others.
         'ffmpeg.read_timeout_seconds': (0, None),
         'recording.post_process.progress_interval_seconds': (1, 60),
+        # 0 is a real answer here - the program's own first moment - so no floor above it.
+        'recording.live_thumbnail.poster_frame_offset_seconds': (0, None),
         'recording.post_process.video_crf': (0, 51),
         'recording.post_process.audio_bitrate_kbps': (32, 320),
         'channel_testing.window.dispatch_interval_minutes': (1, None),
@@ -284,6 +345,20 @@ def api_settings_field():
             if value not in health_bands.FAILING_VALUES:
                 return jsonify({'error': 'Unknown band - pick one of '
                                          + ', '.join(health_bands.FAILING_VALUES)}), 400
+
+        # Enforcement lives server-side: the page offers a two-option select, and a third
+        # value stored here would reach a branch chain that names both real states and
+        # would silently render as one of them.
+        if path == 'recording.live_thumbnail.finished_image':
+            if value not in FINISHED_IMAGE_CHOICES:
+                return jsonify({'error': 'Pick one of '
+                                         + ', '.join(FINISHED_IMAGE_CHOICES)}), 400
+
+        if path == 'search.page_size':
+            value = _page_size_choice(value)
+            if value is None:
+                return jsonify({'error': 'Rows per page must be one of '
+                                         + ', '.join(map(str, PAGE_SIZE_OPTIONS))}), 400
 
         # Enforcement lives server-side (CLAUDE.md): the Integrations card disables this
         # toggle client-side until a key exists, but the route must refuse it too. Unlike
@@ -374,6 +449,13 @@ def api_settings_field():
     if path == 'search.standing_breakdown_cache_ttl_seconds':
         from ..channel_search import clear_standing_breakdown_cache
         clear_standing_breakdown_cache()
+
+    # The logo cache fetch job is registered only while the feature is on, so the toggle
+    # has to move the job with it or turning the feature on would do nothing until the
+    # next restart (dev/changelog/1056).
+    if path == 'recording.logo_cache.enabled':
+        from ..scheduler import apply_logo_cache_schedule
+        apply_logo_cache_schedule()
 
     return jsonify({'success': True, 'restart_required': needs_restart,
                     'changed_from_default': still_changed})
@@ -706,9 +788,16 @@ def api_rollback():
 
     try:
         apply_backup(backups[filename])
-        return jsonify({'success': True})
     except Exception as exc:
         return jsonify({'error': str(exc)}), 500
+    # A restored config can carry a different recording.logo_cache.enabled, and the job is
+    # registered only while the feature is on - so this path has to move the job too, or a
+    # rollback that turns logo caching on leaves it doing nothing with nothing saying why
+    # (dev/changelog/1056). The other live-config hooks this route does not fire (auth,
+    # toolchain, the search caches) are a pre-existing gap and are not widened here.
+    from ..scheduler import apply_logo_cache_schedule
+    apply_logo_cache_schedule()
+    return jsonify({'success': True})
 
 
 @settings_bp.route('/api/settings/support-bundle')

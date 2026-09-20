@@ -5,6 +5,7 @@ Module-level _active: dict[int, RecordingState] holds live state for each
 in-progress recording. All mutations are protected by _lock.
 """
 import glob
+import json
 import logging
 import os
 import subprocess
@@ -15,6 +16,8 @@ from collections import namedtuple
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Optional
+
+from sqlalchemy.exc import SQLAlchemyError
 
 from . import db
 from .config import load_config
@@ -28,6 +31,7 @@ from .database import (
     REC_STATUS_FAILED, REC_STATUS_ABORTED,
     FAILURE_CONVERSION_COLLISION, FAILURE_CONNECTION_SLOT_TIMEOUT, FAILURE_DVR_DIR_UNUSABLE,
     FAILURE_LAUNCH_FAILED,
+    CANCEL_DURING_CAPTURE,
 )
 from .channel_groups import (effective_score, pick_best_member, recording_members,
                              format_eligible_members, format_key, format_label,
@@ -156,10 +160,11 @@ def resolve_capture_pacing(cfg: dict, channel_pace, segment_duration, auto_paced
 _active: dict = {}
 
 
-def recording_disk_paths(recording_id: int) -> list:
+def recording_disk_paths(recording_id: int, cfg: dict = None) -> list:
     """Every on-disk file a recording owns, for teardown: every file its output stem can
-    occupy, all segment files, the conversion scratch files, the partly-encoded parts a
-    resumable conversion checkpoints into, and the live-thumbnail image.
+    occupy, its metadata sidecar and poster, all segment files, the conversion scratch
+    files, the partly-encoded parts a resumable conversion checkpoints into, and its images
+    (recording_image_paths()).
     Paths only - no deletion. Requires an active app context. Missing/None paths are
     omitted; the thumbnail and scratch paths are always included (delete_files() guards on
     existence).
@@ -175,22 +180,52 @@ def recording_disk_paths(recording_id: int) -> list:
     that reservation already proved belongs to this recording and not to a _2-suffixed
     neighbour.
 
+    A move on completion repoints `output_path` at the destination, so the stem the file
+    was moved FROM is expanded the same way: a .ts kept by post_process.delete_source off
+    (or one whose unlink failed) and any conversion scratch stay behind in that folder, and
+    the FILE_MOVED event's from_path is the only record of it (dev/changelog/1041). Moves
+    made before that event carried from_path are not covered.
+
     Its one blind spot is deliberate: the family is read from the CURRENT config, so a
     partial left by an attempt that ran under a different post_process.format is not
     listed. Nothing records the format an attempt actually used, and globbing the stem
     would delete on a guess."""
-    from .postprocessor import output_extension_family
+    from .database import FILE_MOVED
+    from .metadata_sidecar import sidecar_paths
+    from .postprocessor import all_part_paths_on_disk, output_extension_family
 
     paths = []
-    cfg = load_config()
+    if cfg is None:
+        cfg = load_config()
+    family = output_extension_family(cfg)
     rec = db.session.get(Recording, recording_id)
+    stems = []
     if rec is not None and rec.output_path:
         paths.append(rec.output_path)
-        stem = os.path.splitext(rec.output_path)[0]
-        for ext in output_extension_family(cfg):
+        stems.append(os.path.splitext(rec.output_path)[0])
+    for ev_row in (RecordingEvent.query
+                   .filter_by(recording_id=recording_id, event_type=FILE_MOVED).all()):
+        try:
+            from_path = json.loads(ev_row.extra_data).get('from_path') if ev_row.extra_data else None
+        except (ValueError, TypeError, AttributeError) as exc:
+            log.warning('Recording %d: unreadable FILE_MOVED extra_data: %s', recording_id, exc)
+            from_path = None
+        if from_path:
+            stems.append(os.path.splitext(from_path)[0])
+    for stem in dict.fromkeys(stems):
+        for ext in family:
             sibling = stem + ext
-            if sibling != rec.output_path:
+            if sibling not in paths:
                 paths.append(sibling)
+        # The .nfo and poster that describe this recording to a media server. Enumerated
+        # here and NOT in recording_image_paths(), which is what a keep-the-files delete
+        # removes: these describe the video the user is choosing to keep, and a library
+        # left holding the video without them would silently lose its title and synopsis
+        # (dev/changelog/1057). They are stem siblings but not members of the extension
+        # family, because that family also decides which stems a concat may claim.
+        for sidecar in sidecar_paths(stem + family[0]):
+            if sidecar not in paths:
+                paths.append(sidecar)
         # Supervised-run scratch (progress + stderr tail) is written alongside the output
         # file and unlinked in proc_utils.supervise_ffmpeg's finally, so these only survive
         # a shutdown that skipped it - after which a delete is the last thing that will ever
@@ -200,7 +235,7 @@ def recording_disk_paths(recording_id: int) -> list:
         # that function's own stale-reap list
         # and listed per id for the same reason: a bare f'{recording_id}*' glob would let
         # id 6 match id 64's files.
-        scratch_dir = os.path.dirname(rec.output_path) or '.'
+        scratch_dir = os.path.dirname(stem) or '.'
         for prefix in ('conv', 'concat', 'part', 'join'):
             paths.extend(glob.glob(os.path.join(scratch_dir, f'.{prefix}-progress-{recording_id}-*.txt')))
             paths.extend(glob.glob(os.path.join(scratch_dir, f'.{prefix}-stderr-{recording_id}-*.log')))
@@ -213,15 +248,251 @@ def recording_disk_paths(recording_id: int) -> list:
         # found on disk rather than read from conversion_parts_done, because the count is
         # what a crash between ffmpeg and the commit gets wrong - and a part no row knows
         # about is precisely the file nothing else will ever delete.
-        from .postprocessor import all_part_paths_on_disk
-        for ext in output_extension_family(cfg):
+        for ext in family:
             paths.extend(all_part_paths_on_disk(stem + ext))
     for seg in RecordingSegment.query.filter_by(recording_id=recording_id).all():
         if seg.file_path:
             paths.append(seg.file_path)
-    from .storage_dirs import THUMBNAILS, image_dir
-    paths.append(os.path.join(image_dir(cfg, THUMBNAILS), f'{recording_id}.jpg'))
+    paths.extend(recording_image_paths(recording_id, cfg))
+    return list(dict.fromkeys(paths))
+
+
+def recording_image_paths(recording_id: int, cfg: dict = None) -> list:
+    """The images ChannelBin itself made for a recording: the thumbnail and the poster
+    frame, plus any temp capture a failed or interrupted grab left beside either.
+
+    Removed on EVERY delete, including one that keeps the recording's files: both are named
+    by the row's id and only the row's pages ever show them, so once the row is gone nothing
+    will display or delete them again - and the keep-files dialog promises that only what
+    ChannelBin holds is removed (dev/changelog/1041). The COPY of the poster written beside
+    the video is a different file and deliberately not here: it describes the video the user
+    is choosing to keep, and recording_disk_paths() is what enumerates it.
+
+    The temp glob is anchored on f'{id}.' so recording 6 never matches recording 64's
+    files."""
+    from .storage_dirs import POSTER_FRAMES, THUMBNAILS, image_dir
+
+    cfg = cfg if cfg is not None else load_config()
+    paths = []
+    for kind in (THUMBNAILS, POSTER_FRAMES):
+        folder = image_dir(cfg, kind)
+        paths.append(os.path.join(folder, f'{recording_id}.jpg'))
+        paths.extend(glob.glob(os.path.join(folder, f'{recording_id}.*.tmp.jpg')))
     return paths
+
+
+#: Which segment the poster frame ended up coming from, in the words the log uses. The
+#: three are real states and each is named, rather than one of them being the trailing
+#: else: "the moment we asked for" and "the nearest content we had" are different answers
+#: and a cover that silently came from the wrong place is not explicable later.
+POSTER_FRAME_AT_TARGET = 'at_target'
+POSTER_FRAME_AFTER_TARGET = 'after_target'
+POSTER_FRAME_PAST_END = 'past_end'
+
+#: The two images a finished recording can show, and the only two values
+#: recording.live_thumbnail.finished_image accepts. Spelled here rather than in the route
+#: that validates it, so the reader and the gate cannot drift apart.
+FINISHED_IMAGE_POSTER = 'poster'
+FINISHED_IMAGE_LAST_FRAME = 'last_frame'
+FINISHED_IMAGE_CHOICES = (FINISHED_IMAGE_POSTER, FINISHED_IMAGE_LAST_FRAME)
+
+#: Where the offset was measured from. The program's own start time is the point of the
+#: feature; a manual URL-only recording carries none, exactly as it carries no
+#: program_title, and falls back to the start of its own first segment.
+POSTER_ANCHOR_PROGRAM = 'program start'
+POSTER_ANCHOR_CAPTURE = 'the start of the capture'
+
+
+def poster_frame_path(recording_id: int, cfg: dict = None) -> str:
+    """Where this recording's poster frame lives. The one spelling of that name, so the
+    writer, the teardown and the two readers cannot disagree about it."""
+    from .storage_dirs import POSTER_FRAMES, image_dir
+
+    return os.path.join(image_dir(cfg if cfg is not None else load_config(), POSTER_FRAMES),
+                        f'{recording_id}.jpg')
+
+
+def _segment_span_end(seg):
+    """The wall-clock moment this segment stopped covering, or None when it cannot be told.
+
+    content_duration_seconds is the fallback rather than the first choice because it
+    measures CONTENT, and a provider that replays its buffer on reconnect delivers more
+    content than wall clock (see the column's own comment). ended_at is the wall clock and
+    is what a target instant has to be compared against.
+    """
+    if seg.ended_at:
+        return seg.ended_at
+    if seg.content_duration_seconds:
+        return seg.started_at + timedelta(seconds=seg.content_duration_seconds)
+    return None
+
+
+def poster_frame_seek(candidates, target):
+    """Which captured segment holds `target`, and how far into it to seek.
+
+    Returns `(segment, seconds, how)`, or `(None, 0.0, None)` when there is nothing to
+    grab. `candidates` is concatenator.joinable_segments() output, in capture order - this
+    function is pure so the rule can be tested without a file or an ffmpeg, and it is the
+    part of this feature most likely to be wrong.
+
+    A recording is many segments with gaps between them, so the moment asked for may not be
+    inside any of them. One rule covers every shape: the first segment whose captured span
+    reaches past `target`, seeking to the distance from that segment's own start.
+
+    - The target sits inside a segment: seek to it. POSTER_FRAME_AT_TARGET.
+    - The target sits in a gap between two segments, or before the capture joined the feed
+      at all: the next segment starts after it, so the earliest content that exists after
+      the moment asked for is the top of that segment. POSTER_FRAME_AFTER_TARGET.
+    - The target is past everything captured, which is what a program that aired later than
+      its listing said looks like: the last segment, POSTER_FRAME_PAST_END. Reaching for
+      the newest content rather than giving up, because a frame from the wrong minute is
+      still a frame from this recording.
+
+    A segment whose end cannot be told is treated as covering nothing beyond its own start,
+    so an unknown falls through to the next segment rather than swallowing every target
+    after it.
+    """
+    for seg in candidates:
+        if target < seg.started_at:
+            return seg, 0.0, POSTER_FRAME_AFTER_TARGET
+        end = _segment_span_end(seg)
+        if end is not None and target < end:
+            return seg, max(0.0, (target - seg.started_at).total_seconds()), POSTER_FRAME_AT_TARGET
+    if candidates:
+        return candidates[-1], 0.0, POSTER_FRAME_PAST_END
+    return None, 0.0, None
+
+
+def persist_poster_frame(recording_id: int):
+    """Capture the recording's poster: a frame from inside the program itself.
+
+    Called from the concatenator in the same moment as persist_final_thumbnail(), and for
+    the same reason - a successful join deletes the segment files, so this is the last
+    point at which the frame can be taken from a file already on disk. It must never come
+    from a second pull on the stream URL: that spends a provider connection against a live
+    capture, which is what a diagnostic is forbidden from doing to the thing it describes.
+
+    Deliberately NOT the same image as the final-frame thumbnail. That one is grabbed from
+    the END of the last segment with data, which is an honest "what did this end on" and a
+    poor cover - a ball game ends on a postgame graphic, a commercial or the provider's
+    slate.
+
+    Best-effort: a failure only means the recording falls back to its thumbnail. Spawns
+    ffmpeg, so callers must keep it OUTSIDE any retry_on_locked closure. Requires an app
+    context.
+    """
+    from .concatenator import joinable_segments
+    from .config import resolve_ffmpeg_path
+    from .screenshot import capture_screenshot
+
+    cfg = load_config()
+    thumb_cfg = cfg.get('recording', {}).get('live_thumbnail', {})
+    if not thumb_cfg.get('enabled', True):
+        return
+    rec = db.session.get(Recording, recording_id)
+    if rec is None:
+        return
+
+    segments = (RecordingSegment.query.filter_by(recording_id=recording_id)
+                .order_by(RecordingSegment.segment_number).all())
+    candidates = joinable_segments(segments)
+    if not candidates:
+        log.info('Recording %d: no poster frame - nothing was captured to take one from',
+                 recording_id)
+        return
+
+    # Four different times are in play here and only one of them is the right anchor:
+    # the recording's scheduled start, its actual start, the program's start and the
+    # program's end. It is program_start_time, which is an immutable creation snapshot, so
+    # no new state is needed to compute the offset.
+    if rec.program_start_time:
+        anchor, anchor_kind = rec.program_start_time, POSTER_ANCHOR_PROGRAM
+    else:
+        anchor, anchor_kind = candidates[0].started_at, POSTER_ANCHOR_CAPTURE
+    offset = thumb_cfg.get('poster_frame_offset_seconds', 60)
+    try:
+        offset = max(0.0, float(offset))
+    except (TypeError, ValueError):
+        log.warning('Recording %d: poster_frame_offset_seconds is not a number (%r) - '
+                    'taking the frame at the program start instead', recording_id, offset)
+        offset = 0.0
+    target = anchor + timedelta(seconds=offset)
+
+    seg, seek, how = poster_frame_seek(candidates, target)
+    poster_path = poster_frame_path(recording_id, cfg)
+    poster_dir = os.path.dirname(poster_path)
+    try:
+        os.makedirs(poster_dir, exist_ok=True)
+    except OSError as exc:
+        log.warning('Recording %d: cannot create poster frame dir %s: %s',
+                    recording_id, poster_dir, exc)
+        return
+    tmp_path = os.path.join(poster_dir, f'{recording_id}.{uuid.uuid4().hex}.tmp.jpg')
+    ffmpeg_path = resolve_ffmpeg_path(cfg.get('ffmpeg', {}).get('path', 'ffmpeg'))
+    ok = capture_screenshot(
+        seg.file_path, tmp_path, ffmpeg_path,
+        seek_args=['-ss', f'{seek:.2f}'],
+        timeout=thumb_cfg.get('capture_timeout_seconds', 12),
+    )
+    if not ok:
+        log.info('Recording %d: poster frame capture failed (segment %d at %.2fs) - it '
+                 'falls back to the final-frame thumbnail',
+                 recording_id, seg.segment_number, seek)
+        return
+    try:
+        os.replace(tmp_path, poster_path)
+    except OSError as exc:
+        log.warning('Recording %d: poster frame replace failed: %s', recording_id, exc)
+        return
+    if how == POSTER_FRAME_AT_TARGET:
+        log.info('Recording %d: poster frame taken %.0fs after %s, %.2fs into segment %d',
+                 recording_id, offset, anchor_kind, seek, seg.segment_number)
+    elif how == POSTER_FRAME_AFTER_TARGET:
+        log.info('Recording %d: nothing was captured %.0fs after %s, so the poster frame '
+                 'is the first content after it, at the top of segment %d',
+                 recording_id, offset, anchor_kind, seg.segment_number)
+    else:
+        log.warning('Recording %d: %.0fs after %s is past everything this recording '
+                    'captured, so the poster frame is the top of its last segment (%d)',
+                    recording_id, offset, anchor_kind, seg.segment_number)
+
+
+def finished_image_path(recording_id: int, cfg: dict = None) -> str:
+    """The image a FINISHED recording shows, honoring recording.live_thumbnail
+    .finished_image, or None when it has neither.
+
+    The one place that preference is resolved, so the list page, the detail page and the
+    route that serves the bytes cannot disagree about which file a row is showing.
+
+    The unchosen image is the fallback rather than a hard miss, in both directions: every
+    recording made before the poster frame existed has only a thumbnail, and a recording
+    whose poster capture failed has one too. A row showing a placeholder because the
+    preferred image happens to be absent would be a regression dressed up as a setting.
+    """
+    cfg = cfg if cfg is not None else load_config()
+    for path in finished_image_candidates(recording_id, cfg):
+        if os.path.exists(path):
+            return path
+    return None
+
+
+def finished_image_candidates(recording_id: int, cfg: dict) -> list:
+    """Both images a finished recording could show, preferred one first."""
+    from .storage_dirs import THUMBNAILS, image_dir
+
+    thumb = os.path.join(image_dir(cfg, THUMBNAILS), f'{recording_id}.jpg')
+    poster = poster_frame_path(recording_id, cfg)
+    prefers_poster = (cfg.get('recording', {}).get('live_thumbnail', {})
+                      .get('finished_image', FINISHED_IMAGE_POSTER) != FINISHED_IMAGE_LAST_FRAME)
+    return [poster, thumb] if prefers_poster else [thumb, poster]
+
+
+def finished_image_dirs(cfg: dict) -> list:
+    """The folders finished_image_path() reads, for a page that needs the ids of every
+    recording that HAS an image - one directory listing each, never a stat per row."""
+    from .storage_dirs import POSTER_FRAMES, THUMBNAILS, image_dir
+
+    return [image_dir(cfg, THUMBNAILS), image_dir(cfg, POSTER_FRAMES)]
 
 
 def persist_final_thumbnail(recording_id: int):
@@ -728,6 +999,23 @@ def start_recording(app, recording_id: int):
         from .health_score import dismiss_recording_failing_alerts
         dismiss_recording_failing_alerts(recording_id)
         end_slot_wait(recording_id)
+
+        # Re-read the program's synopsis/genre/rating from the guide now that the channel
+        # is settled: a recording scheduled days ago may be describing a program the
+        # provider has since revised (dev/changelog/1055). Its own DB unit, deliberately
+        # kept out of everything around it - and it never raises into the start path,
+        # because a description is a convenience and Product Principle 2 does not let one
+        # cost a capture.
+        try:
+            from .recording_metadata import refresh_from_guide
+            refresh_from_guide(recording_id)
+        except SQLAlchemyError:
+            log.warning('Recording %d: could not refresh the program details at record '
+                        'start - keeping what was captured when it was scheduled',
+                        recording_id, exc_info=True)
+            # The launch below shares this session, so a half-failed unit has to be put
+            # back rather than carried into it.
+            db.session.rollback()
 
         # 1-based segment numbering for new recordings (DESIGN.md section 5 -
         # display matches filenames); pre-existing recordings keep 0-based files.
@@ -2226,6 +2514,7 @@ def abort_recording(app, recording_id: int):
                 add_recording_event(recording_id, RECORDING_ABORTED, detail='Recording manually cancelled')
                 now = datetime.utcnow()
                 r.status = REC_STATUS_ABORTED
+                r.cancel_reason = CANCEL_DURING_CAPTURE
                 r.stop_time = now
                 r.completed_at = now
                 db.session.commit()

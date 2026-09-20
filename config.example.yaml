@@ -24,9 +24,10 @@ recording:
   # directory and enable move_on_complete below, so only finished files land in the
   # directory you browse.
   dvr_output_dir: /dvr
-  # Every image the app saves: recording thumbnails, health check screenshots and cached
-  # channel logos, each in its own subfolder (thumbnails, screenshots, logos). Relative paths
-  # resolve against the app root.
+  # Every image the app saves: recording thumbnails, health check screenshots, cached
+  # channel logos and the poster images uploaded to recording profiles, each in its own
+  # subfolder (thumbnails, screenshots, logos, posters). Relative paths resolve against the
+  # app root.
   images_dir: /dvr/images
   # Per-segment ffmpeg stderr spools, so a failed capture can say why. Tiny, deleted at each
   # segment close. Relative paths resolve against the app root. Keep this on LOCAL disk, not
@@ -79,11 +80,25 @@ recording:
     enabled: false
     path: ''
     timeout_seconds: 300
+  metadata_sidecar:
+    # Write a Kodi-format .nfo file and a poster image beside every finished recording, so
+    # Plex, Jellyfin, Emby and Kodi read its real title, synopsis, air date and genre off
+    # local disk instead of guessing from the filename. No API, no token, no network call.
+    # Plex needs a Movie library with the "Plex NFO Movie" agent selected; an Other Videos
+    # library ignores these files. Off by default, and overridable per recording profile.
+    enabled: false
   live_thumbnail:
     enabled: true
     min_regen_interval_seconds: 10
     capture_timeout_seconds: 12
     auto_refresh_seconds: 60
+    # Seconds after the PROGRAM's own start time to grab the poster frame, so a recording
+    # with front padding does not put the previous show or a countdown clock on its cover.
+    poster_frame_offset_seconds: 60
+    # Which image a finished recording shows: poster (the frame from inside the program)
+    # or last_frame (the final-frame thumbnail). Whichever is missing falls back to the
+    # other, so older recordings still show their thumbnail.
+    finished_image: poster
   logo_cache:
     # Cache channel logos locally instead of hotlinking the provider on every page view.
     # Off by default so an install that does not need it gets no background job and no
@@ -217,8 +232,9 @@ database:
   pre_migration_backup: true
   # A snapshot is the whole database, including the accounts table's plaintext provider
   # credentials. Keep it on local disk (created 0700); a relative path resolves against
-  # the app directory. Pointing this at a shared/network mount exposes those credentials
-  # to everyone who can read that share.
+  # the directory holding `path` above, so the snapshots always belong to the database
+  # they were taken from. Pointing this at a shared/network mount exposes those
+  # credentials to everyone who can read that share.
   backup_dir: instance/db-backups
   migration_backups_keep: 3
   # SQLite page cache, in MB. SQLite's stock default is 2MB, which is far too small for a
@@ -280,6 +296,9 @@ search:
   # also recomputed whenever a sync lands, but a sync cannot see a health score changing, a
   # group edit, or simply time passing, so this bounds how stale those counts can get.
   standing_breakdown_cache_ttl_seconds: 300
+  # Rows a channel search page opens with: 100, 250 or 500. The page's own menu changes
+  # just the search in front of you, and a link that names a size always opens at it.
+  page_size: 100
   # Budget for the OPTIONAL parts of a search - the totals and the facet counts - in the two
   # states where they get expensive. Rows are never optional and never use these budgets; a
   # count that blows one is declined and labeled as declined rather than waited on.

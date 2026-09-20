@@ -21,6 +21,8 @@ database:
   path: /config/dvr.db
   # A DB snapshot carries provider credentials in plaintext, and a config backup is this
   # file verbatim - both stay on /config (created 0700), never on the recordings share.
+  # Absolute, so it is used exactly as written (a relative value would resolve beside
+  # `path` above, i.e. /config/instance/db-backups all the same).
   backup_dir: /config/instance/db-backups
 
 config_backup:

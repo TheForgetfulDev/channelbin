@@ -38,6 +38,12 @@ LIVE_THUMBNAIL_ROLE = StorageRole(
     'Recordings still capture, but no live or final-frame thumbnail can be saved, so '
     'their rows show a placeholder.')
 
+POSTER_FRAME_ROLE = StorageRole(
+    'Poster frame directory',
+    'Recordings still capture, but no poster frame can be taken from inside the program, '
+    'so their rows fall back to the final-frame thumbnail and a metadata file written for '
+    'a media server carries that instead.')
+
 SCREENSHOT_ROLE = StorageRole(
     'Health check screenshot directory',
     'Health checks still run, but none of their screenshots can be saved.')
@@ -68,6 +74,11 @@ CONFIG_BACKUP_ROLE = StorageRole(
     'Config backup directory',
     'The daily config.yaml backup cannot be written there.')
 
+PROFILE_POSTER_ROLE = StorageRole(
+    'Profile poster directory',
+    'A poster image cannot be uploaded to a recording profile, and recordings made under '
+    'a profile that has one get a captured frame as their poster instead.')
+
 
 #: The subfolders of recording.images_dir, one per kind of image (dev/changelog/1012). Each
 #: kind is its own folder so a directory listing of one never has to skip the others - the
@@ -75,6 +86,13 @@ CONFIG_BACKUP_ROLE = StorageRole(
 THUMBNAILS = 'thumbnails'
 SCREENSHOTS = 'screenshots'
 LOGOS = 'logos'
+#: The poster images uploaded to recording profiles (app/profile_posters.py).
+POSTERS = 'posters'
+#: The frame taken from inside the program itself, a fixed offset after the program's own
+#: start time (recorder.persist_poster_frame, dev/changelog/1060). Its own folder rather
+#: than a second name inside THUMBNAILS, because the recordings list reads that folder as a
+#: plain listing of "<recording id>.jpg" to decide which rows have an image.
+POSTER_FRAMES = 'poster-frames'
 
 
 def images_root(cfg: dict) -> str:
@@ -86,7 +104,8 @@ def images_root(cfg: dict) -> str:
 
 
 def image_dir(cfg: dict, kind: str) -> str:
-    """The folder one kind of image is saved in: `kind` is THUMBNAILS, SCREENSHOTS or LOGOS."""
+    """The folder one kind of image is saved in: `kind` is THUMBNAILS, SCREENSHOTS, LOGOS
+    or POSTERS."""
     return os.path.join(images_root(cfg), kind)
 
 
@@ -101,7 +120,7 @@ def configured_write_dirs(cfg: dict, capture_log_dir: str = None) -> list:
     `capture_log_dir` is the caller's resolved app.config['CAPTURE_LOG_DIR'] - the one
     value here create_app() resolves rather than a config read - and is skipped when None.
     """
-    from .config import DEFAULT_DB_BACKUP_DIR, resolve_app_path
+    from .config import db_backup_dir
     from .config_backup import get_backup_dir
 
     rec = cfg.get('recording', {})
@@ -113,6 +132,9 @@ def configured_write_dirs(cfg: dict, capture_log_dir: str = None) -> list:
     thumb = rec.get('live_thumbnail', {}) or {}
     if thumb.get('enabled', True):
         candidates.append((image_dir(cfg, THUMBNAILS), LIVE_THUMBNAIL_ROLE))
+        # Same switch, because the poster frame is the other half of "keep an image of a
+        # recording" and is captured in the same moment, from the same segment files.
+        candidates.append((image_dir(cfg, POSTER_FRAMES), POSTER_FRAME_ROLE))
     if ct.get('screenshots_enabled', True):
         candidates.append((image_dir(cfg, SCREENSHOTS), SCREENSHOT_ROLE))
     if ct.get('capture_scratch_dir'):
@@ -123,8 +145,12 @@ def configured_write_dirs(cfg: dict, capture_log_dir: str = None) -> list:
         candidates.append((capture_log_dir, CAPTURE_LOG_ROLE))
     if (rec.get('logo_cache', {}) or {}).get('enabled'):
         candidates.append((image_dir(cfg, LOGOS), LOGO_CACHE_ROLE))
-    candidates.append((resolve_app_path(cfg.get('database', {}).get(
-        'backup_dir', DEFAULT_DB_BACKUP_DIR)), DB_BACKUP_ROLE))
+    # Gated on the global sidecar switch: the poster only ever reaches a library through
+    # the sidecar, and a profile can turn that on by itself, but the standing alert is for
+    # an install that has opted in rather than one that never asked for the feature.
+    if (rec.get('metadata_sidecar', {}) or {}).get('enabled'):
+        candidates.append((image_dir(cfg, POSTERS), PROFILE_POSTER_ROLE))
+    candidates.append((db_backup_dir(cfg), DB_BACKUP_ROLE))
     candidates.append((get_backup_dir(cfg), CONFIG_BACKUP_ROLE))
 
     seen = set()

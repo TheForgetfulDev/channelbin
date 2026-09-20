@@ -602,6 +602,42 @@ def participating_member_ids(group, memberships):
     return test_member_ids(memberships)
 
 
+def touch_group(group):
+    """Move a group's `updated_at` to now, without committing.
+
+    ChannelGroup.updated_at carries SQLAlchemy's `onupdate`, which fires only when a
+    column on the group row itself is written. That covers the settings stored there -
+    the name, the guide flag, the format lock and strategy, the muted warnings - and
+    nothing else, so a change that lives on a *different* row left the group detail
+    page's "Updated" date sitting in the past while the page around it showed the new
+    state. Three kinds of change are in that gap and all three call this: membership
+    added or removed (channel_group_members), a member's participation switch moved
+    (set_participation, below), and the attached health check's own settings - its
+    profile and its schedule - which live on the OnDemandTestJob row
+    (dev/changelog/1047).
+
+    What is deliberately NOT here is the check running: a run writes the job's status
+    and completion time, which is activity rather than an edit, and it already has its
+    own "Last run" line on the page. Moving "Updated" for it would make the date mean
+    two things and leave the user unable to tell "I changed this" from "this ran".
+
+    Mutates without committing - the same convention as set_participation() and
+    database.py::add_recording_event() - so the call folds into whichever
+    retry_on_locked unit is already writing the change it describes, rather than
+    adding a second commit. Accepts None so a caller holding a job with no group need
+    not guard.
+
+    Forward only, per CLAUDE.md's timestamp-anchor rule: observations can arrive out of
+    order, and a date that can go backwards is worse than one that is merely coarse.
+    """
+    from datetime import datetime
+    if group is None:
+        return
+    now = datetime.utcnow()
+    if group.updated_at is None or group.updated_at < now:
+        group.updated_at = now
+
+
 # The two participation switches, by column name, with the label their event log entry
 # uses. A field outside this map is refused server-side - enforcement never lives in
 # whichever control happened to post it (DESIGN-channel-groups-model.md 4.2).
@@ -645,6 +681,9 @@ def set_participation(membership, field, enabled, surface='group_page') -> bool:
     if getattr(membership, field) == enabled:
         return False
     setattr(membership, field, enabled)  # participation-write-ok: the canonical writer
+    # After the no-op return above, so the group's date moves only for a switch that
+    # actually moved - the same reason this function logs nothing for a no-op.
+    touch_group(membership.group)
     where = PARTICIPATION_SURFACES[surface]
     detail = (f"{PARTICIPATION_FIELDS[field]} turned {'on' if enabled else 'off'} by hand"
               + (f' {where}' if where else ''))
@@ -732,16 +771,23 @@ def cancel_scheduled_recordings(scheduled, detail):
     WITHOUT touching the scheduler - same convention as set_participation() above.
     Returns the recording ids the caller must deregister after its commit lands.
 
+    `detail` names the specific group change in prose for the activity log; CANCEL_GROUP_CHANGE
+    is the enumerated half the CANCELLED strip branches on, and is what stops these rows
+    reading as "cancelled manually" on a page nobody cancelled anything from
+    (dev/changelog/1054).
+
     Two paths cancel a group's schedule and they must say it the same way: the guide
     demotion below, and dissolving the group outright (dev/changelog/763). A second
     hand-written copy of this loop is how one of them ends up leaving a SCHEDULED row
     that fires against a group that no longer exists."""
     from datetime import datetime
-    from .database import REC_STATUS_ABORTED, RECORDING_ABORTED, add_recording_event
+    from .database import (REC_STATUS_ABORTED, RECORDING_ABORTED, CANCEL_GROUP_CHANGE,
+                           add_recording_event)
     ids = []
     for rec in scheduled:
         add_recording_event(rec.id, RECORDING_ABORTED, detail=detail)
         rec.status = REC_STATUS_ABORTED
+        rec.cancel_reason = CANCEL_GROUP_CHANGE
         rec.completed_at = datetime.utcnow()
         ids.append(rec.id)
     return ids
@@ -973,11 +1019,13 @@ def warning_labels():
 
     A function rather than a module constant only because this module imports from
     .database lazily throughout, to keep the import graph acyclic."""
-    from .database import GROUP_WARNING_EPG, GROUP_WARNING_FORMAT, GROUP_WARNING_OVERRIDE
+    from .database import (GROUP_WARNING_EPG, GROUP_WARNING_FORMAT, GROUP_WARNING_OVERRIDE,
+                           GROUP_WARNING_UNMONITORED)
     return {
         GROUP_WARNING_FORMAT: 'mixed video formats',
         GROUP_WARNING_EPG: 'mismatched EPG data',
         GROUP_WARNING_OVERRIDE: 'no member matching the group format',
+        GROUP_WARNING_UNMONITORED: 'members no health check covers',
     }
 
 

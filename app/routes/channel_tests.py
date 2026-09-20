@@ -23,7 +23,7 @@ from ..channel_groups import (effective_score, check_target_channels, teardown_t
                               group_name_conflict, evaluate_and_reconcile_group,
                               group_live_recordings, group_scheduled_recordings,
                               cancel_scheduled_recordings, member_channels,
-                              deregister_cancelled_recordings)
+                              deregister_cancelled_recordings, touch_group)
 from .. import channel_hiding
 from ..config import load_config, config_default
 from ..db_utils import retry_on_locked
@@ -872,6 +872,10 @@ def reschedule_on_demand_job(job_id):
             job.scheduled_start_time = scheduled_start_time
         if prior_status != 'SCHEDULED':
             job.status_before_schedule = prior_status
+        # In this unit rather than the status one below: the recurrence fields are the
+        # schedule the user edited, while the second commit only records where the
+        # scheduler put it (dev/changelog/1047).
+        touch_group(job.group)
         db.session.commit()
 
     _set_recurrence_and_commit()
@@ -906,6 +910,9 @@ def update_on_demand_job_profile(job_id):
     if profile_id is not None and db.session.get(HealthCheckProfile, profile_id) is None:
         return jsonify({'error': 'Profile not found'}), 404
     job.profile_id = profile_id
+    # The profile is a health check setting that happens to be stored on the job row, so
+    # nothing would otherwise move the group's "Updated" date (dev/changelog/1047).
+    touch_group(job.group)
     db.session.commit()
     return jsonify({'success': True, 'profile_id': job.profile_id})
 
@@ -936,6 +943,7 @@ def unschedule_on_demand_job(job_id):
     job.recur_use_window = False
     job.window_skip_until = None
     job.scheduled_start_time = None
+    touch_group(job.group)  # a schedule setting, stored on the job row
     db.session.commit()
     return jsonify({'success': True, 'job_id': job_id, 'status': job.status})
 
@@ -957,6 +965,7 @@ def pause_on_demand_schedule(job_id):
 
     cancel_on_demand_job_schedule(job)
     job.recur_paused = True
+    touch_group(job.group)  # a schedule setting, stored on the job row
     db.session.commit()
     return jsonify({'success': True, 'job_id': job_id, 'recur_paused': True, 'recur_description': _recur_label(job)})
 
@@ -979,6 +988,7 @@ def resume_on_demand_schedule(job_id):
         job.recur_paused = False
         job.scheduler_job_id = aps_job_id
         job.scheduled_start_time = next_run
+        touch_group(job.group)  # a schedule setting, stored on the job row
         db.session.commit()
 
     _mark_resumed_and_commit()
@@ -1351,6 +1361,7 @@ def add_channels_to_job(job_id):
         return jsonify({'error': 'No new valid channels to add'}), 400
 
     channel_hiding.recompute(added)
+    touch_group(group)
     db.session.commit()
     channel_count = len(existing_set)
     return jsonify({'success': True, 'job_id': job_id, 'added_count': len(added), 'channel_count': channel_count})
@@ -1385,6 +1396,7 @@ def remove_channel_from_job(job_id, channel_id):
             ChannelTest.query.filter_by(job_id=job_id, channel_id=channel_id))
         # Losing its last group membership is what lets a deferred hide finally take effect.
         channel_hiding.recompute([channel_id])
+        touch_group(group)
         db.session.commit()
         return paths
 
@@ -1462,6 +1474,9 @@ def remove_duplicate_channels(job_id):
         screenshot_paths = delete_tests_collecting_screenshots(ChannelTest.query.filter(
             ChannelTest.job_id == job_id, ChannelTest.channel_id.in_(remove_ids)
         ))
+        # Both outcomes change the group's member set: a plain removal deletes the
+        # membership, and a transfer moves it onto the keeper.
+        touch_group(group)
         db.session.commit()
         return guide_removed, transferred, transfer_skipped, screenshot_paths
 

@@ -1899,11 +1899,12 @@ def _recording_retention_sweep():
             JOB_RUN_SUCCESS, JOB_RUN_FAILED,
             REC_STATUS_COMPLETED, REC_STATUS_FAILED, REC_STATUS_ABORTED,
         )
-        from .recorder import recording_disk_paths, delete_files
+        from .recorder import recording_disk_paths, recording_image_paths, delete_files
 
         started = datetime.utcnow()
         try:
-            rec_cfg = load_config().get('recording', {})
+            cfg = load_config()
+            rec_cfg = cfg.get('recording', {})
             global_days = rec_cfg.get('retention_days', 0) or 0
             delete_file = rec_cfg.get('retention_delete_file', False)
             now = datetime.utcnow()
@@ -1928,7 +1929,8 @@ def _recording_retention_sweep():
 
             deleted = 0
             for rid in doomed:
-                paths = recording_disk_paths(rid) if delete_file else []
+                paths = (recording_disk_paths(rid, cfg) if delete_file
+                         else recording_image_paths(rid, cfg))
                 unschedule_recording(rid)
 
                 @retry_on_locked()
@@ -1940,8 +1942,7 @@ def _recording_retention_sweep():
                     db.session.commit()
 
                 _delete_row()
-                if delete_file:
-                    delete_files(paths)
+                delete_files(paths)
                 deleted += 1
 
             if deleted:
@@ -2073,14 +2074,36 @@ _LOGO_CACHE_INTERVAL_MINUTES = 5
 
 
 def schedule_logo_cache_job(app):
-    """Register the channel-logo-cache fetch job. Registered unconditionally, like the
-    other daily maintenance jobs: the job itself reads recording.logo_cache.enabled at
-    run time (app/logo_cache.py::run_logo_cache_batch), so turning the feature on/off in
-    Settings takes effect on the next tick with no restart, and a disabled install just
-    gets a no-op poll every 5 minutes."""
-    existing = _scheduler.get_job('logo_cache_fetch')
+    """Register the channel-logo-cache fetch job at startup, if the feature is on."""
+    apply_logo_cache_schedule()
+
+
+def apply_logo_cache_schedule() -> bool:
+    """Register or remove logo_cache_fetch to match recording.logo_cache.enabled.
+    Returns True if the job is scheduled afterwards.
+
+    Called at startup and from every path that can move the setting, so turning the
+    feature on or off still takes effect with no restart - the property the previous
+    unconditional registration existed for. It is the registration that now follows the
+    setting rather than the tick: a disabled install used to get a poll every 5 minutes
+    that scanned the whole channels table and recorded a JobRun for doing nothing
+    (dev/changelog/1056).
+
+    Idempotent, and safe to call when the job is already in the state asked for - an
+    already-live job is left alone rather than re-added, so a call does not reset the
+    interval and push the next tick out by a fresh 5 minutes."""
+    from .config import load_config
+    enabled = (load_config().get('recording', {})
+               .get('logo_cache', {}).get('enabled', False))
+
+    existing = _scheduler.get_job('logo_cache_fetch') if _scheduler else None
+    if not enabled:
+        if remove_job_if_exists('logo_cache_fetch'):
+            log.info('Logo caching is off - unscheduled the logo cache fetch job')
+        return False
+
     if existing is not None and existing.next_run_time is not None:
-        return
+        return True
     _add_job(
         func=_logo_cache_job,
         trigger='interval',
@@ -2089,6 +2112,7 @@ def schedule_logo_cache_job(app):
         replace_existing=True,
     )
     log.info('Logo cache fetch scheduled every %d minutes', _LOGO_CACHE_INTERVAL_MINUTES)
+    return True
 
 
 def _logo_cache_job():
@@ -2116,8 +2140,8 @@ def schedule_index_janitor(app):
     recurring jobs: the job reads search.index_janitor_grace_minutes at run time, so
     changing (or zeroing) it in Settings takes effect on the next tick with no restart.
 
-    Same "leave an existing live job alone" shape as schedule_logo_cache_job, so a restart
-    does not reset the interval and delay the next tick by a fresh 10 minutes."""
+    Same "leave an existing live job alone" shape as apply_logo_cache_schedule, so a
+    restart does not reset the interval and delay the next tick by a fresh 10 minutes."""
     existing = _scheduler.get_job('search_index_janitor')
     if existing is not None and existing.next_run_time is not None:
         return

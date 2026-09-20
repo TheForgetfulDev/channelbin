@@ -5,6 +5,62 @@ Notable changes to ChannelBin, newest first. This project follows
 release is tagged `v<version>` in git, and the version the app is running is shown in the
 page footer.
 
+## 0.13.0 - 2026-09-20
+
+**Added**
+
+- A finished recording can write an .nfo file and a poster image next to the video, so Plex,
+  Jellyfin, Emby and Kodi show its real title, synopsis, air date, genre and rating instead of
+  guessing from the filename. Off by default, with a per-profile override.
+- Recordings keep their own copy of the program's synopsis, genre and rating, shown in a
+  Program card on the recording page, so the details survive the guide data being pruned.
+- An Edit details button on that card lets you correct the title, synopsis, genre and rating
+  before they reach the sidecar, lock them against being refreshed, and turn the sidecar off
+  for one recording.
+- A recording profile can carry its own poster image, uploaded in the profile's edit modal and
+  used as the artwork for every recording made under it.
+- The poster frame for a finished recording is taken from inside the program itself, 60 seconds
+  past its real start by default, so front padding cannot put a countdown clock or the previous
+  show on the cover.
+- The TV Guide's record modal opens with a full program header: title, subtitle, when it airs
+  and how long, the channel, the whole description and matched tags. Tapping a program on a
+  phone goes straight there.
+- Channel search has a rows-per-page menu of 100, 250 or 500, and a setting for the size it
+  opens with.
+- The raw config.yaml editor in Settings has a Validate button, and Save refuses text it can
+  see is broken instead of taking every page down.
+- The unmonitored-members warning on a channel group can be hidden per group, like the group's
+  other warnings.
+- The channel detail page links the account that owns the channel.
+
+**Changed**
+
+- The Home Assistant integration declares the oldest ChannelBin it runs against. Against an
+  older server its sensors go unavailable and Home Assistant shows a repair issue naming both
+  versions.
+- The Readiness alerts check counts unread errors only, matching the Alerts page, and is
+  advisory: it no longer turns the headline red or puts a badge on the Maintenance menu.
+
+**Fixed**
+
+- Deleting a recording removes everything it wrote, including a kept .ts source and
+  ChannelBin's own thumbnail.
+- The recording page shows the running segment's real size and rate while it captures, instead
+  of 0 B.
+- A cancelled recording's page says what the cancel actually left on disk, instead of reporting
+  the capture as discarded while offering to convert it.
+- The Dashboard stops counting down a conversion that is paused behind a live recording, and
+  says what it is waiting on.
+- The logo cache job is only scheduled when the feature is on, instead of ticking every five
+  minutes to do nothing.
+- Pre-migration database snapshots are written next to the database they back up.
+- A channel group's Updated date moves when you add or remove channels, change a member's
+  switches, or edit its health check.
+- The group page's Add Matching Channels list marks channels the provider has stopped sending,
+  the same way every other list does.
+- The Maintenance menu's readiness counts are red and amber instead of grey.
+- The desktop sidebar is wide enough for its own menu labels.
+
 ## 0.12.0 - 2026-09-18
 
 **Added**

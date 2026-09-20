@@ -239,7 +239,11 @@
       <div>
         <div class="cd-name">{{ channel.name }}</div>
         <div class="cd-meta">
-          <span>{{ channel.account.name }}</span>
+          {# The owning account is a link, not text - same macro and same cross-entity
+             pattern the recording detail header uses (dev/changelog/1046). Unguarded on
+             purpose: account_id is NOT NULL and deleting an account cascades its channels
+             away, so a channel always has one - the same assumption .acct-bar above makes. #}
+          {{ m.account_pill(channel.account.name, url_for('accounts.account_detail', account_id=channel.account.id), channel.account.color, tip='From account "' ~ channel.account.name ~ '" - click for the account page.') }}
           {% if channel.category_name %}
           <span class="text-faint">&middot;</span>
           <span>{{ channel.category_name }}</span>

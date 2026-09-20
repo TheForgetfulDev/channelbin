@@ -595,6 +595,42 @@ class SavedSearchTests(_PageJs, unittest.TestCase):
         self.assertEqual(self.obs['dirty_after_clear_all'], 'none')
 
 
+class PageSizeTests(_PageJs, unittest.TestCase):
+    """The rows-per-page menu and the `search.page_size` default (dev/changelog/1043)."""
+
+    SCENARIO = 'page_size'
+
+    def test_with_nothing_configured_the_page_asks_for_the_engine_default(self):
+        self.assertEqual(self.obs['stock_request_size'], '100')
+
+    def test_a_configured_default_is_what_a_url_with_no_size_opens_at(self):
+        self.assertEqual(self.obs['configured_request_size'], '250')
+
+    def test_a_size_in_the_url_beats_the_configured_default(self):
+        self.assertEqual(self.obs['url_request_size'], '1')
+
+    def test_the_menu_names_an_off_menu_size_rather_than_claiming_another(self):
+        self.assertEqual(self.obs['url_menu_value'], '1')
+        self.assertEqual(self.obs['url_menu_options'], ['1', '100', '250', '500'])
+
+    def test_changing_the_size_searches_again_from_page_one(self):
+        self.assertEqual(self.obs['page_before_change'], '2',
+                         'the scenario never reached page 2, so the reset proves nothing')
+        self.assertEqual(self.obs['changed_request_size'], '250')
+        self.assertEqual(self.obs['page_after_change'], '1')
+
+    def test_changing_the_size_stores_nothing(self):
+        """The stored default belongs to Settings alone; the menu is this search only."""
+        self.assertEqual(self.obs['posts_on_change'], 0)
+
+    def test_the_menu_stays_when_this_size_fits_but_a_smaller_one_would_page(self):
+        self.assertFalse(self.obs['fits_has_turns'])
+        self.assertTrue(self.obs['fits_has_menu'])
+
+    def test_nothing_renders_when_every_size_fits(self):
+        self.assertEqual(self.obs['small_pager_html'], '')
+
+
 class ActionContextTests(_PageJs, unittest.TestCase):
     """"You came here to add channels to group X" is an ERRAND, not a filter
     (DESIGN-channel-search.md 3). It is the one piece of pre-applied state that stays

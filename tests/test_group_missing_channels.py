@@ -122,5 +122,46 @@ class GroupDetailRowsMissingChannelsTests(unittest.TestCase):
                          payload['missing_channels'][0]['lifecycle_date'])
 
 
+class SuggestMarksProviderRemovedTests(unittest.TestCase):
+    """GET /api/channel-groups/suggest - "+ Add Matching Channels" - carries the same
+    lifecycle pair as the member rows, so a candidate the provider has dropped is marked
+    rather than offered as an ordinary one (dev/docs/BUGS.md 2026-09-19 @ 02:38:01 PM)."""
+
+    def setUp(self):
+        self.t = make_test_app()
+        self.account = seed.make_account(name='Acct A')
+        db.session.commit()
+
+    def tearDown(self):
+        self.t.cleanup()
+
+    def _suggest(self):
+        member = seed.make_channel(self.account, stream_id=1, name='FS1', epg_channel_id='fs1')
+        gone = _make_missing(self.account, 2, 'FS1', epg_channel_id='fs1')
+        live = seed.make_channel(self.account, stream_id=3, name='FS1', epg_channel_id='fs1')
+        grp = seed.make_group(name='FS1', members=[member], in_guide=False)
+        db.session.commit()
+        resp = self.t.client.get(f'/api/channel-groups/suggest?group_id={grp.id}')
+        self.assertEqual(resp.status_code, 200)
+        return gone, live, {r['channel_id']: r for r in resp.get_json()['results']}
+
+    def test_a_removed_candidate_is_marked_missing_with_its_date(self):
+        gone, _live, by_id = self._suggest()
+        self.assertEqual(by_id[gone.id]['lifecycle'], 'missing')
+        self.assertEqual(by_id[gone.id]['lifecycle_date'],
+                         gone.last_seen_at.strftime('%Y-%m-%d'))
+
+    def test_a_removed_candidate_is_still_listed_and_selectable(self):
+        """Marked, never filtered: whether a dropped feed is still wanted is the user's call."""
+        gone, _live, by_id = self._suggest()
+        self.assertIn(gone.id, by_id)
+        self.assertTrue(by_id[gone.id]['selectable'])
+
+    def test_a_live_candidate_carries_no_state(self):
+        _gone, live, by_id = self._suggest()
+        self.assertIsNone(by_id[live.id]['lifecycle'])
+        self.assertEqual(by_id[live.id]['lifecycle_date'], '')
+
+
 if __name__ == '__main__':
     unittest.main()

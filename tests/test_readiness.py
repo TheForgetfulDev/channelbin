@@ -264,10 +264,10 @@ class SilencingTests(_AppCase):
 
     def test_an_ignored_check_is_off_the_nav_count(self):
         fine = result(readiness.READY)
-        others = {c.id: fine for c in readiness.CHECKS if c.id != 'alerts_open'}
-        with patched(alerts_open=result(readiness.PROBLEM, '3 open'), **others):
+        others = {c.id: fine for c in readiness.CHECKS if c.id != 'storage_space'}
+        with patched(storage_space=result(readiness.PROBLEM, '99% used'), **others):
             before = readiness.evaluate()['nav']
-            readiness.set_check_ignored('alerts_open', True)
+            readiness.set_check_ignored('storage_space', True)
             after = readiness.evaluate()['nav']
         self.assertEqual(before['blocked'], 1)
         self.assertEqual(after['blocked'], 0)
@@ -576,6 +576,69 @@ class RouteTests(unittest.TestCase):
         self.assertIn('readiness', data)
         self.assertIn('blocked', data['readiness'])
         self.assertIn('degraded', data['readiness'])
+
+
+
+class UnreadErrorsCheckTests(_AppCase):
+    """The alerts check counts unread errors only, and is a nudge rather than a verdict.
+
+    Guards dev/docs/BUGS.md 2026-09-19 @ 12:43:36 AM: the check counted every undismissed alert
+    whatever its read state, so the card went red over errors already read while the Alerts
+    page said nothing was waiting, and it lit a second nav badge beside the Alerts one.
+    """
+
+    def _alert(self, severity, read=False, dismissed=False):
+        from app.database import Alert
+        now = datetime.utcnow()
+        db.session.add(Alert(alert_type='TEST', severity=severity, title=f'{severity} alert',
+                             read_at=now if read else None,
+                             dismissed_at=now if dismissed else None))
+        db.session.commit()
+
+    def _row(self, payload=None):
+        payload = payload or readiness.evaluate()
+        return next(r for r in payload['checks'] if r['id'] == 'alerts_unread')
+
+    def test_a_read_error_does_not_count(self):
+        self._alert('ERROR', read=True)
+        self._alert('CRIT', read=True)
+        self.assertEqual(self._row()['status'], readiness.READY)
+
+    def test_a_dismissed_unread_error_does_not_count(self):
+        self._alert('ERROR', dismissed=True)
+        self.assertEqual(self._row()['status'], readiness.READY)
+
+    def test_an_unread_warning_alone_does_not_fail_it(self):
+        self._alert('WARN')
+        row = self._row()
+        self.assertEqual(row['status'], readiness.READY)
+        self.assertIn('1 unread warning', row['found'])
+
+    def test_an_unread_error_fails_it_and_says_how_many(self):
+        self._alert('ERROR')
+        self._alert('CRIT')
+        self._alert('ERROR', read=True)
+        row = self._row()
+        self.assertEqual(row['status'], readiness.PROBLEM)
+        self.assertEqual(row['found'], '2 unread errors are waiting on the Alerts page')
+
+    def test_an_unread_error_never_reaches_the_nav_badge_or_the_headline(self):
+        fine = {c.id: result(readiness.READY, 'fine') for c in readiness.CHECKS
+                if c.id != 'alerts_unread'}
+        self._alert('ERROR')
+        with patched(**{c: r for c, r in fine.items()
+                        if readiness.CHECKS_BY_ID[c].cost == readiness.CHEAP}):
+            for cid in ('ffmpeg_build', 'account_login', 'notify_delivers'):
+                with patched(**{cid: fine[cid]}):
+                    readiness.run_check(cid)
+            payload = readiness.evaluate()
+        clear = next(c for c in payload['capabilities'] if c['id'] == 'clear')
+        self.assertEqual(clear['state'], readiness.CANNOT,
+                         'the card still shows the unread error on its own row')
+        self.assertEqual(payload['nav'], {'blocked': 0, 'degraded': 0})
+        self.assertEqual(payload['verdict']['level'], 'ok')
+        self.assertIn('1 unread error is waiting on the Alerts page', payload['verdict']['sub'])
+        self.assertEqual(readiness.nav_summary(), {'blocked': 0, 'degraded': 0})
 
 
 class GuideGroupReadTests(unittest.TestCase):

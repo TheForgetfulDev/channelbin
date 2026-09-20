@@ -65,6 +65,11 @@
      hand-written copies of one offset is the CSS defect class in CLAUDE.md.
      Settings' mobile section picker is the first such consumer. */
   --topnav-h: 52px;
+  /* Width of the expanded desktop sidebar (.sidebar). A token because the number is
+     cited in prose beside three list layouts that reflow off the room it leaves, and
+     because the rule itself needs it twice (width and flex-basis). Measured, not
+     picked: see the fit note above .sidebar. */
+  --sidebar-w: 232px;
   --shadow-row: 0 1px 2px rgba(0,0,0,.25);
   --shadow-pop: 0 8px 24px rgba(0,0,0,.45);
   /* density (comfortable) */
@@ -755,8 +760,15 @@ body.scroll-locked { position: fixed; left: 0; right: 0; width: 100%; overflow: 
    them as of dev/changelog/900. Changing any of these values, or adding a
    destination, means re-checking that fit. */
 .shell { display: flex; min-height: 100vh; }
+/* --sidebar-w is 232px because the labels have to fit without an ellipsis, measured in
+   a browser rather than eyeballed (dev/changelog/1045): "Health Check Profiles" is the
+   binding label and wants 222px, and "Maintenance" wants 231px in the synthetic case
+   where both its Readiness badges carry two digits - which app/readiness.py caps at 12
+   capabilities, so only one of the pair can ever reach two. 232 clears the real
+   constraint by 10px and the impossible one as well. A longer destination name, or a
+   badge on a row that has none today, means re-measuring. */
 .sidebar {
-  width: 212px; flex: 0 0 212px; background: var(--bg1); border-right: 1px solid var(--border-soft);
+  width: var(--sidebar-w); flex: 0 0 var(--sidebar-w); background: var(--bg1); border-right: 1px solid var(--border-soft);
   padding: 14px 12px; position: sticky; top: 0; height: 100vh; overflow-y: auto;
   display: flex; flex-direction: column;
   /* z-index required: sticky creates a stacking context, so a popover anchored
@@ -793,6 +805,14 @@ body.scroll-locked { position: fixed; left: 0; right: 0; width: 100%; overflow: 
 .nav-count.nav-count-warn,
 .nav-link.active .nav-count.nav-count-warn { background: var(--warn-soft); color: var(--warn); font-weight: 600; }
 .nav-count-bad + .nav-count-warn { margin-left: -5px; }
+/* Maintenance's Readiness pair: blocked in red, degraded in amber. Distinct names from the
+   Alerts pair so nav-alerts.js never writes alert numbers here (dev/changelog/950); the
+   rules themselves were missing until dev/changelog/1038. */
+.nav-count.nav-count-ready-bad,
+.nav-link.active .nav-count.nav-count-ready-bad { background: var(--bad-soft); color: var(--bad); font-weight: 600; }
+.nav-count.nav-count-ready-warn,
+.nav-link.active .nav-count.nav-count-ready-warn { background: var(--warn-soft); color: var(--warn); font-weight: 600; }
+.nav-count-ready-bad + .nav-count-ready-warn { margin-left: -5px; }
 /* Log out is a POST (state-changing), so it's a <button> in its own <form>, not an <a> -
    reset to match every .nav-link <a> around it. */
 .nav-logout-form { margin: 0; }
@@ -834,6 +854,10 @@ body.scroll-locked { position: fixed; left: 0; right: 0; width: 100%; overflow: 
    nav-alerts.js marks an error with pip-bad - the worst color present. */
 .nav-pip.pip-alert { background: var(--warn); }
 .nav-pip.pip-alert.pip-bad { background: var(--bad); }
+/* Same shape for Maintenance: amber while anything is degraded, red once base.html's
+   applyReadiness() marks a blocked capability with pip-bad. */
+.nav-pip.pip-ready { background: var(--warn); }
+.nav-pip.pip-ready.pip-bad { background: var(--bad); }
 
 /* The rail is a DESKTOP-only concept: at ≤900px the sidebar is display:none and
    the drawer is already the collapsed state. Gating the whole block means a
@@ -1225,7 +1249,7 @@ body.scroll-locked { position: fixed; left: 0; right: 0; width: 100%; overflow: 
 .list-scroll { overflow-x: auto; -webkit-overflow-scrolling: touch; }
 /* Named containers so the row grid can reflow off the space it actually has, not
    the raw viewport (dev/changelog/561) - a real narrow phone AND a wider window
-   with the sidebar eating 212px both starve the row the same way, and neither is
+   with the sidebar eating its --sidebar-w both starve the row the same way, and neither is
    "more correct" to key off. container-type:inline-size was verified empirically
    (not just per spec) to leave position:fixed popovers (positionMenu() in util.js)
    viewport-relative - it does NOT establish a containing block for them, unlike
@@ -1792,6 +1816,62 @@ table.tbl { width: 100%; border-collapse: collapse; font-size: var(--fs-md); }
   /* A trailing actions cell has no column header to sit opposite. */
   .tbl-cards td:not([data-label])::before { content: none; }
 }
+
+/* ── Info block (a thing's own details: subtitle, labelled lines, body text, tags) ──
+   The anatomy the guide's bottom sheets have always used to describe one program or one
+   channel, promoted out of guide.css when the record modal's program header became its
+   second caller (dev/changelog/1050). It had to move: the record modal is included on the
+   channel search page, which loads no guide.css, so leaving the rules there would have meant
+   a second copy of all seven.
+
+   A full-width label column rather than `.statlist`'s two-column grid - these lines sit
+   beside prose (a description that wraps to several lines) instead of a readout of numbers,
+   and the label is a quiet uppercase key, not a right-aligned mono value. */
+.info-sub { color: var(--text-muted); font-size: var(--fs-md); margin: 0 0 10px; }
+.info-desc { color: var(--text-muted); font-size: var(--fs-md); line-height: 1.5; margin: 10px 0 0; }
+
+.info-line {
+  display: flex;
+  gap: 0.6rem;
+  align-items: baseline;
+  font-size: var(--fs-md);
+  padding: 5px 0;
+  border-bottom: 1px solid var(--border-soft);
+}
+.info-lbl {
+  flex: 0 0 76px;
+  color: var(--text-faint);
+  font-size: var(--fs-xs);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.info-val { color: var(--text); min-width: 0; overflow-wrap: anywhere; }
+
+.info-tags { display: flex; flex-wrap: wrap; gap: 0.4rem; margin-top: 10px; }
+.info-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: var(--fs-sm);
+  color: var(--text-muted);
+  background: var(--bg2);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 2px 9px;
+}
+
+/* The record modal's program header - one `.info-*` block boxed off from the form below it,
+   so "what you are scheduling" reads as its own section rather than as more fields. The
+   last line inside it drops its divider: the box's own border already closes the list. */
+.prog-head {
+  background: var(--bg2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 12px 14px;
+  margin-bottom: 0.9rem;
+}
+.prog-head-title { margin: 0 0 4px; font-size: var(--fs-lg); font-weight: 600; color: var(--text); }
+.prog-head .info-line:last-child { border-bottom: none; }
 
 /* ── Stat list (DESIGN.md 3.3 - two-column key/value list) ─────────── */
 .statlist { display: grid; grid-template-columns: 1fr 1fr; gap: 0 26px; }
@@ -2529,6 +2609,14 @@ th.gd-c-part { text-align: center; }
 .gd-q-flags { grid-column: 1 / -1; display: flex; gap: 8px; flex-wrap: wrap; align-items: center; padding-top: 6px; border-top: 1px solid var(--border-soft); }
 .gd-q-empty { grid-column: 1 / -1; font-size: var(--fs-md); color: var(--text-muted); }
 
+/* The refusal a modal shows without closing: what the server said about the submission,
+   above the fields it applies to. The class exists because four modals had each written
+   this as the same inline style attribute (_record_modal.html, manual_record.js,
+   dup-modal.js, group-modal.js) and the fifth is where CLAUDE.md says to stop copying.
+   Those four are unconverted, not a second implementation - they keep their inline styles
+   until something else touches them. */
+.modal-err { color: var(--bad); font-size: var(--fs-sm); margin-bottom: 0.75rem; }
+
 /* ── Settings modal: the real Settings page anatomy ────────────────── */
 .modal-panel.modal-wide { max-width: 680px; }
 /* One width step above modal-wide: this one carries a channel table, not just fields. */
@@ -2557,7 +2645,8 @@ th.gd-c-part { text-align: center; }
    box, which is sized to the value it holds. */
 .gd-field.stack { display: block; }
 .gd-field.stack .gd-field-ctl { width: auto; display: block; margin-top: 8px; }
-.gd-field.stack .gd-field-ctl > input { width: 100%; }
+.gd-field.stack .gd-field-ctl > input,
+.gd-field.stack .gd-field-ctl > textarea { width: 100%; }
 .gd-field-left { flex: 1; min-width: 0; }
 .gd-field-lbl { font-size: var(--fs-md); font-weight: 600; color: var(--text); margin-bottom: 2px; }
 .gd-field-meta { font-size: var(--fs-sm); color: var(--text-muted); line-height: 1.45; }
@@ -2581,11 +2670,26 @@ th.gd-c-part { text-align: center; }
    body color, and the dim state then has something to dim against. */
 .cg-auto-details .tbl { font-size: var(--fs-sm); color: var(--text); }
 .gd-field-ctl.wide input { width: 100%; }
-.gd-field-ctl select, .gd-field-ctl input {
+.gd-field-ctl select, .gd-field-ctl input, .gd-field-ctl textarea {
   width: 100%; background: var(--bg3); border: 1px solid var(--border); border-radius: var(--radius-sm);
   color: var(--text); font: inherit; font-size: var(--fs-md); padding: 5px 8px; cursor: pointer;
 }
-.gd-field-ctl select:focus, .gd-field-ctl input:focus { outline: none; border-color: var(--accent); }
+/* A multi-line box is typed into rather than picked from, so it keeps the text caret and
+   the ability to be dragged taller. Height comes from its own rows attribute. */
+.gd-field-ctl textarea { cursor: text; resize: vertical; line-height: 1.45; }
+/* The poster a recording profile pins (profile-modal.js): the current image or the one
+   about to be uploaded, beside its size and the sentence saying how it differs from what
+   a media server expects. The image box is the poster's own 2:3 shape, and `contain`
+   rather than `cover` because showing a logo cropped would misstate what the server gets. */
+.pm-poster { display: flex; gap: 12px; align-items: flex-start; margin: 8px 0; }
+.pm-poster-img { width: 72px; aspect-ratio: 2 / 3; object-fit: contain; flex-shrink: 0; display: block; background: var(--bg3); border: 1px solid var(--border); border-radius: var(--radius-sm); }
+.pm-poster-meta { font-size: var(--fs-sm); color: var(--text-muted); line-height: 1.45; min-width: 0; }
+.pm-poster-meta .btn { margin-top: 8px; }
+.pm-poster-advice { color: var(--warn); }
+.pm-poster-none { font-size: var(--fs-sm); color: var(--text-muted); margin: 8px 0; }
+.gd-field-ctl input[type="file"] { padding: 4px 6px; }
+.gd-field-ctl select:focus, .gd-field-ctl input:focus,
+.gd-field-ctl textarea:focus { outline: none; border-color: var(--accent); }
 .gd-field-ctl input[type=datetime-local], .gd-field-ctl input[type=time] { font-family: var(--font-mono); color-scheme: dark; }
 /* The schedule picker is the shared recur_schedule_fields macro moved in, so it keeps
    its own form-group layout rather than the two-column field anatomy around it. */
@@ -3766,7 +3870,7 @@ a.shot-link { display: block; width: fit-content; cursor: zoom-in; }
   .prow .p-actions { position: absolute; top: 9px; right: 10px; }
 }
 /* Same reflow-off-available-space idea as .rec-list/.acct-list (dev/changelog/561): a
-   real narrow phone and a wider window with the sidebar eating 212px starve the row
+   real narrow phone and a wider window with the sidebar eating its --sidebar-w starve the row
    identically, and neither is "more correct" to key off. Deliberately duplicates the
    ≤768px block rather than replacing it, and every selector is .prof-list-prefixed -
    .p-* is short enough to be worth scoping even though nothing else claims it today. */

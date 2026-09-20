@@ -96,6 +96,14 @@ function boot() {
         abort_badges: document.querySelectorAll('#group-modal .badge.b-abort').length,
         picked_label: q('#group-modal .gd-field-lbl')
           ? q('#group-modal .gd-field-lbl').textContent.trim() : null,
+        suggest_badges: [].slice.call(document.querySelectorAll('#group-modal .suggest-table tbody tr'))
+          .map(function (tr) {
+            var b = tr.querySelector('.st-ch .badge');
+            return { name: tr.querySelector('.channel-name-link').textContent.trim(),
+                     badge: b ? b.textContent.trim() : null,
+                     tip: b ? b.getAttribute('data-tip') : null,
+                     checkable: !tr.querySelector('.group-suggest-cb').disabled };
+          }),
         asked: ASKED.slice(),
       };
     }
@@ -164,5 +172,14 @@ await scenario('selection_only',
 await scenario('single_seed',
   `openGroupModal({ channels: [{ channel_id: 5, channel_name: 'FS1' }], onDone: function () {} })`,
   [['settled', "PENDING['/api/channel-groups/suggest?channel_id=5'].res({ results: [] })"]]);
+
+// 7. A suggestion the provider has already dropped: marked Missing, still listed and
+//    still checkable (dev/changelog/1042).
+await scenario('fixed_missing',
+  `openGroupModal({ channels: [], fixedGroup: ${GROUP}, onDone: function () {} })`,
+  [['settled', RESOLVE({ seed_format_known: true, seed_format: '1080p60', results: [
+    Object.assign({}, SUGGEST[0], { lifecycle: null, lifecycle_date: '' }),
+    Object.assign({}, SUGGEST[1], { lifecycle: 'missing', lifecycle_date: '2026-09-01' }),
+  ] })]]);
 
 console.log(JSON.stringify(out));

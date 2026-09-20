@@ -1345,7 +1345,7 @@ def do_postprocess(app, recording_id: int, ts_path: str):
         CONVERSION_DONE, FILE_MOVED, CONCATENATION_DONE, SCRIPT_EXECUTED,
         REC_STATUS_ANALYZING, REC_STATUS_CONVERTING,
         REC_STATUS_ABORTED, REC_STATUS_FAILED, REC_STATUS_COMPLETED,
-        FAILURE_CONVERSION_FAILED,
+        FAILURE_CONVERSION_FAILED, CANCEL_DURING_CONVERSION,
     )
     from . import events as ev
     from . import alerts
@@ -2304,6 +2304,7 @@ def do_postprocess(app, recording_id: int, ts_path: str):
                 def _commit_conversion_cancelled():
                     r = db.session.get(Recording, recording_id)
                     r.status = REC_STATUS_ABORTED
+                    r.cancel_reason = CANCEL_DURING_CONVERSION
                     r.completed_at = datetime.utcnow()
                     set_conversion_parts(r)
                     db.session.add(RecordingEvent(
@@ -2519,15 +2520,18 @@ def do_postprocess(app, recording_id: int, ts_path: str):
                 else:
                     move_detail = f'Moved to {dest_path}'
 
+                # from_path is what teardown reads: once output_path names the destination,
+                # nothing else remembers the folder a kept .ts source and any conversion
+                # scratch were left in (recorder.recording_disk_paths, dev/changelog/1041).
+                moved_from = current_path if dest_path != current_path else None
+
                 @retry_on_locked()
                 def _commit_moved():
                     r = db.session.get(Recording, recording_id)
                     r.output_path = dest_path
-                    db.session.add(RecordingEvent(
-                        recording_id=recording_id,
-                        event_type=FILE_MOVED,
-                        detail=move_detail,
-                    ))
+                    add_recording_event(
+                        recording_id, FILE_MOVED, detail=move_detail,
+                        extra={'from_path': moved_from} if moved_from else None)
                     db.session.commit()
 
                 _commit_moved()
@@ -2537,6 +2541,18 @@ def do_postprocess(app, recording_id: int, ts_path: str):
                 alerts.dismiss_open_alerts_for_recording(recording_id, 'RECORDING_MOVE_FAILED')
                 log.info('Recording %d: %s', recording_id, move_detail)
                 current_path = dest_path
+
+        # ── Metadata sidecar ──────────────────────────────────────────────────
+        # After the move and before the post-script: collision_safe_dest() can rename the
+        # video, and the sidecar has to carry the name the file actually ended up with or a
+        # media server reads it onto the wrong item. Running before the script also means a
+        # user's own script finds the sidecar already there.
+        #
+        # Deliberately not inside a try that swallows - write_sidecar() handles its own
+        # failures, logs an event naming the reason, and never raises at a caller that is
+        # one step from marking this recording COMPLETED.
+        from .metadata_sidecar import write_sidecar
+        write_sidecar(recording_id, current_path, cfg)
 
         # ── Post-completion script ────────────────────────────────────────────
         ps = cfg['recording'].get('post_script', {})

@@ -14,8 +14,9 @@ import sys
 import threading
 import unittest
 import yaml
-from datetime import datetime, timedelta, time
+from datetime import datetime, timedelta, time, timezone
 from unittest import mock
+from zoneinfo import ZoneInfo
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -47,6 +48,47 @@ def _join_dispatch_threads():
     for t in threading.enumerate():
         if t.name.startswith('od-window-job-') or t.name == 'check-window-dispatch-kick':
             t.join(timeout=5)
+
+
+# A Thursday (recur_day 5), on standard time, so no DST transition falls inside either
+# pinned window. recur_day=0 jobs match any day regardless.
+_WINDOW_DAY = '2026-01-15'
+# The end of the default 02:00-06:00 window - the moment production's cron fires
+# window_close() - and a moment inside it, for the dispatcher.
+_WINDOW_CLOSE_LOCAL = f'{_WINDOW_DAY}T06:00:00'
+_INSIDE_WINDOW_LOCAL = f'{_WINDOW_DAY}T03:00:00'
+
+
+def _naive_utc(local_iso, tz='America/New_York'):
+    """A wall-clock moment in `tz` as the naive UTC datetime the app stores."""
+    return (datetime.fromisoformat(local_iso)
+            .replace(tzinfo=ZoneInfo(tz))
+            .astimezone(timezone.utc)
+            .replace(tzinfo=None))
+
+
+def _pin_clock(local_iso, tz='America/New_York'):
+    """Pin check_window's view of "now" to a wall-clock moment in `tz`.
+
+    window_close(), dispatch_tick() and due_jobs() each read datetime.utcnow() through the
+    module's own datetime, so one patch pins all three. Without it these tests answered a
+    different question depending on what time of night the suite ran: between 00:00 and the
+    02:00 window start, the occurrence window_close() closes begins later tonight, so the
+    alert raised by the first call predates occurrence_start_utc, the dedupe query misses it
+    and the second call raises a duplicate (dev/changelog/1051, dev/docs/BUGS.md
+    2026-09-19).
+
+    A datetime subclass rather than a Mock: the module also calls datetime.combine(), which
+    has to keep working.
+    """
+    pinned = _naive_utc(local_iso, tz)
+
+    class _PinnedDatetime(datetime):
+        @classmethod
+        def utcnow(cls):
+            return pinned
+
+    return mock.patch('app.check_window.datetime', _PinnedDatetime)
 
 
 class WindowBoundsTests(unittest.TestCase):
@@ -289,11 +331,19 @@ class DueJobsTests(unittest.TestCase):
 
 
 class DispatchTickTests(unittest.TestCase):
+    """Pinned inside the default 02:00-06:00 window. These tests used to reshape the
+    configured window instead - a 00:00-23:59 one to guarantee "now" was inside it, a
+    02:00-02:01 one to guarantee it was not - which left the second genuinely failing for
+    the 60 seconds a day it was wrong about."""
+
     def setUp(self):
         self.t = make_test_app()
         self.account = seed.make_account()
         self.channel = seed.make_channel(self.account)
         db.session.commit()
+        clock = _pin_clock(_INSIDE_WINDOW_LOCAL)
+        clock.start()
+        self.addCleanup(clock.stop)
 
     def tearDown(self):
         _join_dispatch_threads()
@@ -318,9 +368,8 @@ class DispatchTickTests(unittest.TestCase):
                            recurring=True, recur_use_window=True, recur_day=0)
         db.session.commit()
         spy = mock.Mock()
-        # A window of 02:00-02:01 is (almost) never "now" - deterministic no-op regardless
-        # of wall-clock time at test run.
-        with _patch_cfg(start='02:00', end='02:01'), \
+        # 04:00-05:00 does not contain the pinned 03:00.
+        with _patch_cfg(start='04:00', end='05:00'), \
              mock.patch('app.channel_tester.run_on_demand_test_job', spy):
             check_window.dispatch_tick(self.t.app)
         _join_dispatch_threads()
@@ -331,8 +380,7 @@ class DispatchTickTests(unittest.TestCase):
                                  recurring=True, recur_use_window=True, recur_day=0)
         db.session.commit()
         spy = mock.Mock()
-        # A window covering all 24 hours guarantees "now" is inside it, deterministically.
-        with _patch_cfg(start='00:00', end='23:59'), \
+        with _patch_cfg(), \
              mock.patch('app.channel_tester.run_on_demand_test_job', spy):
             check_window.dispatch_tick(self.t.app)
             _join_dispatch_threads()
@@ -341,11 +389,19 @@ class DispatchTickTests(unittest.TestCase):
 
 
 class WindowCloseTests(unittest.TestCase):
+    """Every test here is pinned to the window's end, which is when production's cron
+    actually calls window_close(). Run against the real clock they answer a different
+    question every hour of the night - see _pin_clock()."""
+
     def setUp(self):
         self.t = make_test_app()
         self.account = seed.make_account()
         self.channel = seed.make_channel(self.account)
         db.session.commit()
+        clock = _pin_clock(_WINDOW_CLOSE_LOCAL)
+        clock.start()
+        self.addCleanup(clock.stop)
+        self.now_utc = _naive_utc(_WINDOW_CLOSE_LOCAL)
 
     def tearDown(self):
         with channel_tester._lock:
@@ -362,10 +418,8 @@ class WindowCloseTests(unittest.TestCase):
         ct_cfg = _cfg()['channel_testing']
         with _patch_cfg():
             occurrence_start, _end = check_window._occurrence_bounds_for_closing(
-                ct_cfg, datetime.utcnow())
-        # completed_at set safely after the occurrence's own start (not "now", which may
-        # be anywhere relative to a real 02:00-06:00 window depending on when the suite
-        # happens to run) - due_jobs() must exclude it either way.
+                ct_cfg, self.now_utc)
+        # Ran inside tonight's own occurrence, so due_jobs() must exclude it.
         seed.make_test_job(name='Done', channels=[self.channel], status='SCHEDULED',
                           recurring=True, recur_use_window=True, recur_day=0,
                           completed_at=occurrence_start + timedelta(minutes=1),
@@ -447,13 +501,24 @@ class WindowCloseTests(unittest.TestCase):
             'standing leftover-work warning')
 
     def test_does_not_double_emit_for_one_occurrence(self):
+        """The dedupe query asks whether an alert exists that was created since the
+        occurrence started, so it only holds when the first alert lands inside the
+        occurrence being closed. Unpinned, this failed every night between 00:00 and the
+        02:00 start (dev/docs/BUGS.md 2026-09-19)."""
         seed.make_test_job(name='Locals HD', channels=[self.channel], status='SCHEDULED',
                            recurring=True, recur_use_window=True, recur_day=0)
         db.session.commit()
         with _patch_cfg():
             check_window.window_close(self.t.app)
-            existing = Alert.query.filter_by(alert_type='HEALTH_CHECK_WINDOW').count()
-            self.assertEqual(existing, 1)
+            raised = Alert.query.filter_by(alert_type='HEALTH_CHECK_WINDOW').all()
+            self.assertEqual(len(raised), 1)
+            # create_alert stamps created_at from the real clock, which the pin does not
+            # reach. Restamp it to a moment inside the pinned occurrence so the dedupe
+            # query is asked the question production asks it, rather than passing because
+            # a pinned date in the past precedes every real timestamp.
+            raised[0].created_at = self.now_utc - timedelta(minutes=5)
+            db.session.commit()
+
             with mock.patch('app.alerts.create_alert') as alert_spy:
                 check_window.window_close(self.t.app)
             alert_spy.assert_not_called()

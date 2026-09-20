@@ -78,6 +78,39 @@
     });
   });
 
+  // ── config.yaml tab: Validate ───────────────────────────────────────────
+  // renderYamlCheck is the only writer of #yaml-check after first paint; the server
+  // renders the same markup when it refuses a save (templates/settings.html).
+  const yamlCheck = $('#yaml-check');
+  const yamlText = $('#pane-yaml textarea');
+  const renderYamlCheck = (problems) => {
+    const errors = problems.filter((p) => p.severity === 'error').length;
+    const n = errors || problems.length;
+    const badge = problems.length
+      ? `<span class="badge ${errors ? 'b-fail' : 'b-warn'}">${n} ${errors ? 'problem' : 'warning'}${n === 1 ? '' : 's'}</span>`
+      : '<span class="badge b-done">Valid</span>';
+    const items = problems.map((p) => `<li class="yaml-${escHtml(p.severity)}">`
+      + (p.line ? `<span class="yaml-where">Line ${p.line}</span>` : '')
+      + (p.path ? `<code>${escHtml(p.path)}</code>` : '')
+      + ` ${escHtml(p.message)}</li>`).join('');
+    yamlCheck.innerHTML = badge + (items ? `<ul class="yaml-problems">${items}</ul>` : '');
+  };
+  $('#yaml-validate')?.addEventListener('click', () => {
+    jsonFetch('/api/settings/validate', {
+      method: 'POST',
+      body: JSON.stringify({ text: yamlText.value }),
+    })
+      .then((d) => renderYamlCheck(d.problems))
+      .catch((e) => toast(`Error: ${e.message || 'Validate failed'}`, true));
+  });
+  // A result describes the text it was run on, so an edit makes it stale.
+  yamlText?.addEventListener('input', () => {
+    if (yamlCheck.firstElementChild && !yamlCheck.querySelector('.b-abort')) {
+      yamlCheck.innerHTML = '<span class="badge b-abort">Not checked</span>'
+        + '<span class="note">Edited since the last check.</span>';
+    }
+  });
+
   // ── Saving one field ────────────────────────────────────────────────────
   const saveSetting = (path, value) =>
     jsonFetch('/api/settings/field', {

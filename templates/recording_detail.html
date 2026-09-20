@@ -436,7 +436,32 @@
 {% elif rec.status == 'ABORTED' %}
 <div class="live-strip abort-strip">
   <span class="fx">&#9632;</span>
-  <span>Cancelled manually{% if rec.completed_at %} at <b>{{ rec.completed_at | local_time_sec }}</b>{% endif %} - captured files were discarded</span>
+  {# Two halves, same shape as the FAILED strip above: why the row was cancelled, then what
+     is left on disk. One branch per app/database.py CANCEL_* value
+     (tests/test_cancel_reason_disclosure.py enforces it). This whole strip used to be the
+     single sentence "Cancelled manually - captured files were discarded", which was wrong
+     on three of the five: a cancel during analysis or conversion KEEPS the joined .ts on
+     purpose, and the kebab on this same page offers Retry conversion over the file the
+     sentence said was thrown away, while a group change cancels schedules nobody touched
+     manually and that had captured nothing to discard (dev/changelog/1054). #}
+  <span>Cancelled{% if rec.completed_at %} at <b>{{ rec.completed_at | local_time_sec }}</b>{% endif %} -
+    {% if rec.cancel_reason == 'BEFORE_START' %}you called it off <b>before it started</b>, so nothing was captured
+    {%- elif rec.cancel_reason == 'GROUP_CHANGE' %}a change to its <b>channel group</b> called it off before it started - the activity log below names the change
+    {%- elif rec.cancel_reason == 'DURING_CAPTURE' %}you stopped the capture and <b>discarded</b> what it had recorded
+    {%- elif rec.cancel_reason == 'DURING_ANALYSIS' %}you stopped post-capture analysis - the recorded <b>.ts file was kept</b>
+    {%- elif rec.cancel_reason == 'DURING_CONVERSION' %}you stopped the conversion - the source <b>.ts file was kept</b> and the partial output was deleted
+    {#- No reason: a row from before the vocabulary. Nothing is guessed about who cancelled
+        it or why, and the disk is deliberately NOT read here - the second half of this
+        strip already reports it, and saying it twice is what this branch did first. -#}
+    {%- else %}the reason was not recorded, and the activity log below is what says why{% endif %}</span>
+  <span class="sep-dot">·</span>
+  <span>
+    {#- recover_act is decided once in the route and is 'retry-convert' or nothing on a
+        cancelled row: retry_concat refuses ABORTED, so Retry join is never named here. -#}
+    {%- if recover_act == 'retry-convert' %}the joined <b>.ts</b> is still on disk - use <b>Retry conversion</b> to finish it
+    {%- elif segment_files_on_disk %}its segments are still on disk, but a cancelled recording cannot be joined - use <b>Record again</b> to reschedule
+    {%- elif rec.segments %}nothing recoverable is left on disk - use <b>Record again</b> to reschedule
+    {%- else %}use <b>Record again</b> to reschedule it{% endif %}</span>
 </div>
 {% else %}
 <div class="live-strip abort-strip">
@@ -806,6 +831,61 @@
   </div>
 </div>
 
+{# ── Program (dev/changelog/1055): what the guide says this recording is, read straight
+   off the recording's own columns. The synopsis/genre/rating are refreshed once at record
+   start and then frozen - the epg_entries row they came from is pruned a day after the
+   program airs, so this card is the only place they survive. Renders nothing for a manual
+   URL recording, which has no program behind it. No query of its own: every value is a
+   column on `rec`, per CLAUDE.md's no-hidden-I/O rule. #}
+{#- The card also renders with nothing in it when sidecars are switched on globally: a
+    manual URL recording has no program behind it, but it does get a .nfo, and Edit details
+    is the only way to give it one (dev/changelog/1058). -#}
+{% if rec.program_title or rec.metadata_description or rec.metadata_category or rec.metadata_rating or meta_panel.sidecar_global %}
+{#- data-meta rides ON the card rather than in the script block below, because this node is
+    swapped every 15s and a payload baked into the page would go stale behind it. tojson
+    inside a double-quoted attribute needs forceescape (CLAUDE.md, Jinja hazards). -#}
+<div class="card" id="panel-program" data-sec="program" data-meta="{{ meta_panel | tojson | forceescape }}">
+  <div class="card-head"><h2>Program</h2>
+    <div class="card-head-actions">
+      <button class="btn btn-sm" data-meta-edit>Edit details</button>
+    </div>
+  </div>
+  <div class="card-body">
+    <div class="statlist has-wide">
+      {% if rec.program_title %}{{ stat_row('Title', rec.program_title) }}{% endif %}
+      {% if rec.program_sub_title %}{{ stat_row('Episode', rec.program_sub_title) }}{% endif %}
+      {% if rec.metadata_title %}
+      {{ stat_row('Written as', rec.metadata_title,
+                  tip='What a media server will call this item. It was typed by hand, so it is what gets written instead of the guide\'s own title above.') }}
+      {% endif %}
+      {% if rec.program_start_time %}
+      {{ stat_row('Airs', rec.program_start_time | local_time,
+                  tip='The program\'s own air time as the guide gave it when this recording was set up. It does not move, even if the recording started late or was trimmed.') }}
+      {% endif %}
+      {% if rec.metadata_category %}{{ stat_row('Genre', rec.metadata_category) }}{% endif %}
+      {% if rec.metadata_rating %}{{ stat_row('Rating', rec.metadata_rating) }}{% endif %}
+      {% if rec.metadata_description %}
+      {{ stat_row('Synopsis', rec.metadata_description, wide=true) }}
+      {% endif %}
+      {% if meta_panel.sidecar_global %}
+      {{ stat_row('Metadata file',
+                  ('On' if meta_panel.sidecar_effective else 'Off')
+                  ~ ({'recording': ' for this recording', 'profile': ' via its profile', 'global': ''}[meta_panel.sidecar_level]),
+                  sv_cls=('ok' if meta_panel.sidecar_effective else 'na'),
+                  tip='Whether a .nfo file and poster are written beside this recording for Plex, Jellyfin, Emby and Kodi to read. Set per recording here, per profile on the Profiles page, or globally in Settings - the narrowest answer wins.') }}
+      {% endif %}
+      {% if rec.metadata_locked %}
+      {{ stat_row('Details', 'Locked', sv_cls='ok',
+                  tip='These details are locked, so the refresh that runs when a recording starts leaves them alone. Unlock them to let the guide update them again.') }}
+      {% endif %}
+      {% if not (rec.program_title or rec.metadata_description or rec.metadata_category or rec.metadata_rating) %}
+      <div class="empty-state">Nothing is known about what this recording contains. Edit details to write a title and a synopsis for your media server.</div>
+      {% endif %}
+    </div>
+  </div>
+</div>
+{% endif %}
+
 {# ── Segments (DESIGN.md 3.2/5): 1-based #, every row shown, exit pills with
    tooltips; legacy 0-based file names appear as-is in the File column. #}
 {% set exit_pill = {
@@ -858,13 +938,16 @@
              compares frames, so neither the delta nor its tooltip names a cause
              (dev/changelog/966). NULL on every segment captured before this was measured at
              concat time, and on any file ffprobe could not read. #}
-          <td class="num xtra">{% if seg.content_duration_seconds is none %}<span class="muted tip-plain" data-tip="Not measured. Segments captured before ChannelBin recorded a per-segment content length are not backfilled - the .ts files are deleted after conversion, so there is nothing left to probe.">-</span>{% else %}{{ (seg.content_duration_seconds | int) | duration(with_seconds=true) }}{% if seg_secs %}
+          <td class="num xtra">{% if seg.content_duration_seconds is none %}<span class="muted tip-plain" data-tip="{% if rec.status in ('IN_PROGRESS', 'PAUSED', 'RETRYING', 'CONCATENATING') %}Not measured yet. A segment's content length is measured when the segments are joined, after capture ends.{% else %}Not measured. Segments captured before ChannelBin recorded a per-segment content length are not backfilled - the .ts files are deleted after conversion, so there is nothing left to probe.{% endif %}">-</span>{% else %}{{ (seg.content_duration_seconds | int) | duration(with_seconds=true) }}{% if seg_secs %}
             {% set seg_delta = seg.content_duration_seconds - seg_secs %}
             {% set seg_ratio = seg.content_duration_seconds / seg_secs %}
             <span class="exit-code{{ ' bad' if seg_delta < -1 else '' }} tip-plain" data-tip="This segment holds {{ (seg.content_duration_seconds | int) | duration(with_seconds=true) }} of content but ran for {{ (seg_secs | int) | duration(with_seconds=true) }} of wall clock{% if (seg_ratio - 1) | abs >= 0.05 %} - {{ '%.2f' | format(seg_ratio) }}x real time{% endif %}.">{{ '%+d' | format(seg_delta | round | int) }}s</span>
             {% endif %}{% endif %}</td>
-          <td class="num">{{ seg.bytes_recorded | filesize if seg.bytes_recorded else '0 B' }}</td>
-          <td class="num xtra">{% if seg.bytes_recorded and seg_secs and seg_secs > 10 %}{{ '%.1f' | format(seg.bytes_recorded * 8 / seg_secs / 1000000) }} Mb/s{% else %}<span class="muted">-</span>{% endif %}
+          {# The open segment has no bytes_recorded until it ends; the route stat'ed its file
+             so this row grows with the banner rather than reading 0 B (dev/changelog/1040). #}
+          {% set seg_bytes = seg.bytes_recorded or (live_seg_bytes if seg.id == live_seg_id else 0) %}
+          <td class="num">{{ seg_bytes | filesize if seg_bytes else '0 B' }}</td>
+          <td class="num xtra">{% if seg_bytes and seg_secs and seg_secs > 10 %}{{ '%.1f' | format(seg_bytes * 8 / seg_secs / 1000000) }} Mb/s{% else %}<span class="muted">-</span>{% endif %}
             {% if seg.near_empty %}<span class="badge b-warn tip-plain" data-tip="This segment's bitrate is far below the recording's own average - likely a blank/slate screen or error card, even though the timeline itself is clean.">slate?</span>{% endif %}
             {# Shown rather than hidden: a discarded segment is a thing the app DID, and a row
                quietly missing from this table is how the whole defect stayed invisible in the
@@ -935,11 +1018,14 @@
   'CAPTURE_LOST_TO_OUTAGE': 'warn', 'SEGMENT_DISCARDED': 'warn',
   'FAST_DELIVERY_DETECTED': 'warn',
   'CONVERSION_RESTARTED': 'info', 'DIAGNOSTICS': 'info', 'CAPTURE_PACING_ENABLED': 'info',
+  'RECORDING_METADATA_REFRESHED': 'info', 'RECORDING_METADATA_REFRESH_SKIPPED': 'info',
+  'RECORDING_METADATA_EDITED': 'info',
   'POSTCAPTURE_ANALYSIS_STARTED': 'info', 'POSTCAPTURE_ANALYSIS_SKIPPED': 'info',
   'MIXED_FRAME_RATE_DETECTED': 'info',
   'RESTART_SUCCEEDED': 'ok', 'CONCATENATION_DONE': 'ok', 'CONVERSION_DONE': 'ok',
   'CONVERSION_RESUMED': 'ok',
-  'FILE_MOVED': 'ok', 'SCRIPT_EXECUTED': 'ok',
+  'FILE_MOVED': 'ok', 'SCRIPT_EXECUTED': 'ok', 'METADATA_SIDECAR_WRITTEN': 'ok',
+  'METADATA_SIDECAR_FAILED': 'warn',
   'RECORDING_FAILED': 'bad', 'RECORDING_FAILED_DEAD_STREAM': 'bad',
 } %}
 <div class="card" id="panel-eventlog" data-sec="log">
@@ -1238,18 +1324,23 @@ window.onScheduleSaved = () => window.location.reload();
   'use strict';
   // ── Section picker (DESIGN.md 9.5 mobile / 10.2 desktop): "Customize sections..."
   //    in the header kebab, hide/show + reorder, persisted server-side. Desktop picks
-  //    over #details-section/#panel-segments-slot/#panel-eventlog directly (3 real
-  //    #detail-sections children); mobile picks over #details-section's 3 sub-regions
-  //    (display:contents at ≤768px promotes them to real flex items) plus segs/log,
-  //    so 5 total. Decided once at load - this page doesn't re-layout across a live
-  //    desktop<->mobile resize, matching how the rest of the app treats breakpoints.
+  //    over #details-section/#panel-program/#panel-segments-slot/#panel-eventlog directly
+  //    (4 real #detail-sections children); mobile picks over #details-section's 3
+  //    sub-regions (display:contents at ≤768px promotes them to real flex items) plus
+  //    program/segs/log, so 6 total. Decided once at load - this page doesn't re-layout
+  //    across a live desktop<->mobile resize, matching how the rest of the app treats
+  //    breakpoints.
+  //    'program' renders only when the recording has a program behind it, so it is absent
+  //    for a manual URL capture. Both apply() and the picker's render() skip a key whose
+  //    node is missing, which is the same tolerance a section added after a user's prefs
+  //    were saved already relies on.
   const isMobile = window.matchMedia('(max-width: 768px)').matches;
   const SECTIONS = isMobile
     ? [{ key: 'shot', label: 'Screenshot' }, { key: 'tl', label: 'Run timeline' },
-       { key: 'stats', label: 'Stats' }, { key: 'segs', label: 'Segments' },
-       { key: 'log', label: 'Event log' }]
-    : [{ key: 'details', label: 'Details' }, { key: 'segs', label: 'Segments' },
-       { key: 'log', label: 'Event log' }];
+       { key: 'stats', label: 'Stats' }, { key: 'program', label: 'Program' },
+       { key: 'segs', label: 'Segments' }, { key: 'log', label: 'Event log' }]
+    : [{ key: 'details', label: 'Details' }, { key: 'program', label: 'Program' },
+       { key: 'segs', label: 'Segments' }, { key: 'log', label: 'Event log' }];
   const PREF_KEY = isMobile ? 'recording_detail_sections_mobile' : 'recording_detail_sections_desktop';
 
   // Re-queried per call, never cached: the 15s auto-refresh replaces whole
@@ -1406,6 +1497,176 @@ window.onScheduleSaved = () => window.location.reload();
 </script>
 {% endif %}
 <script>
+/* ── Edit details (dev/changelog/1058): the preview-and-correct surface for what this
+   recording tells a media server about itself.
+
+   A modal rather than an inline form, because #panel-program is in SWAP_IDS below and gets
+   replaced wholesale every 15 seconds - an inline form would be wiped out mid-sentence. The
+   modal lives on document.body, so the swap cannot reach it, and it reads its opening values
+   off the card's own data-meta at click time, so it never opens on a stale payload. */
+(() => {
+  const card = () => document.getElementById('panel-program');
+  const esc = (v) => escHtml(v == null ? '' : String(v));
+
+  /* What a save will actually do from here, said plainly. The three phases are the only
+     thing that changes between them, and getting this wrong is the failure mode the item
+     called out: a user who edits a SCHEDULED recording without locking it would otherwise
+     have no idea the refresh is about to undo the work. */
+  const PHASE_NOTE = {
+    before: 'This recording has not started yet. When it does, these details are read from '
+          + 'the guide again and anything the provider has revised is overwritten - unless '
+          + 'you lock them below.',
+    during: 'This recording is under way. What is here now is what gets written when it '
+          + 'finishes.',
+    after:  'This recording has finished. Saving rewrites the file beside it right away.',
+  };
+
+  function body(m) {
+    const rows = [];
+    const sidecarRows = [];
+    rows.push(fieldRow({
+      label: 'Title', stack: true,
+      meta: 'What your media server calls this item. Leave it blank to use the guide\'s own '
+          + 'title: <strong>' + esc(m.derived_title || 'the recording\'s name') + '</strong>.',
+      control: `<input type="text" id="md-title" maxlength="${m.limits.metadata_title}" `
+             + `placeholder="${esc(m.derived_title)}" value="${esc(m.title)}">`,
+    }));
+    rows.push(fieldRow({
+      label: 'Synopsis', stack: true,
+      meta: 'The summary shown on the item\'s page. Provider listings for sport are often '
+          + 'blank or a placeholder, so this is the one most worth typing.',
+      control: `<textarea id="md-description" rows="5" `
+             + `maxlength="${m.limits.metadata_description}">${esc(m.description)}</textarea>`,
+    }));
+    rows.push(fieldRow({
+      label: 'Genre', wide: true,
+      meta: 'One genre, as the provider words it - "Sports", "Documentary".',
+      control: `<input type="text" id="md-category" maxlength="${m.limits.metadata_category}" `
+             + `value="${esc(m.category)}">`,
+    }));
+    rows.push(fieldRow({
+      label: 'Rating', wide: true,
+      meta: 'The content rating, if the program carries one - "TV-PG", "PG-13".',
+      control: `<input type="text" id="md-rating" maxlength="${m.limits.metadata_rating}" `
+             + `value="${esc(m.rating)}">`,
+    }));
+    rows.push(fieldRow({
+      label: 'Lock these details',
+      meta: 'Keeps your wording when the recording starts and the guide is read again. '
+          + 'Turning it on is not the same as editing - you can fix a typo and still let '
+          + 'the provider update the rest.',
+      control: '<label class="switch"><input type="checkbox" id="md-locked"'
+             + (m.locked ? ' checked' : '') + '><span class="knob"></span></label>',
+    }));
+
+    /* The per-recording half of the three-level gate. Rendered only when the feature is on
+       globally - that switch is what decides whether any of this UI exists. It is NOT
+       gated on the resolved answer, which would hide the control from exactly the
+       recording that had been switched off and leave no way back. */
+    if (m.sidecar_global) {
+      const inherit = m.profile_name
+        ? `Follow its profile (${esc(m.profile_name)})` : 'Follow the global setting';
+      const sel = (v) => (m.sidecar_enabled === v ? ' selected' : '');
+      sidecarRows.push(fieldRow({
+        label: 'Metadata file', wide: true,
+        meta: 'Whether a .nfo file and a poster are written beside this recording. '
+            + 'Right now: <strong>' + (m.sidecar_effective ? 'On' : 'Off') + '</strong>'
+            + (m.sidecar_level === 'global' ? ', from the global setting'
+               : m.sidecar_level === 'profile' ? ', from its profile' : ', set here')
+            + '.' + (m.nfo_exists
+              ? ' Turning it off leaves <strong>' + esc(m.nfo_name) + '</strong> where it '
+                + 'is - delete it yourself if you want it gone.' : ''),
+        control: '<select id="md-sidecar">'
+               + `<option value=""${sel(null)}>${inherit}</option>`
+               + `<option value="on"${sel(true)}>Write one</option>`
+               + `<option value="off"${sel(false)}>Do not write one</option></select>`,
+      }));
+    }
+
+    let h = `<p class="card-note">${PHASE_NOTE[m.phase]}</p>`;
+    h += '<div class="modal-err" id="md-err" hidden></div>';
+    h += '<fieldset class="gd-fset"><div class="gd-fset-head">What the file will say</div>'
+       + rows.join('') + '</fieldset>';
+    if (sidecarRows.length) {
+      h += '<fieldset class="gd-fset"><div class="gd-fset-head">This recording only</div>'
+         + sidecarRows.join('') + '</fieldset>';
+    }
+    const el = document.createElement('div');
+    el.innerHTML = h;
+    return el;
+  }
+
+  function open(m) {
+    closeMenus();
+    let busy = false;
+    const modal = buildModal({
+      title: 'Edit details', body: body(m), panelClass: 'modal-wide',
+      footer: [
+        { label: 'Cancel', class: 'btn', onClick: (close) => close() },
+        { label: 'Save', class: 'btn btn-primary', onClick: () => { submit(); return false; } },
+      ],
+    });
+
+    const val = (id) => document.getElementById(id).value.trim();
+    const lock = document.getElementById('md-locked');
+
+    /* The lock turns itself on the moment a field is edited, and does it visibly so the
+       user can turn it straight back off. An implicit lock inferred from the row having
+       been touched would give one flag two meanings and remove the real case of fixing a
+       typo while still wanting the provider's updated synopsis. */
+    ['md-title', 'md-description', 'md-category', 'md-rating'].forEach((id) => {
+      document.getElementById(id).addEventListener('input', () => { lock.checked = true; });
+    });
+
+    async function submit() {
+      if (busy) return;
+      busy = true;
+      const err = document.getElementById('md-err');
+      err.hidden = true;
+      const payload = {
+        metadata_title: val('md-title'),
+        metadata_description: document.getElementById('md-description').value.trim(),
+        metadata_category: val('md-category'),
+        metadata_rating: val('md-rating'),
+        locked: lock.checked,
+      };
+      if (m.sidecar_global) {
+        const raw = val('md-sidecar');
+        payload.sidecar_enabled = raw === '' ? null : raw === 'on';
+      }
+      try {
+        const res = await jsonFetch(`/recordings/${m.recording_id}/metadata-json`,
+                                    { method: 'POST', body: JSON.stringify(payload) });
+        modal.closeModal();
+        if (!res.changed.length) {
+          showToast('Nothing changed.', { type: 'info' });
+        } else {
+          showToast(res.sidecar_rewritten
+            ? `Saved, and ${escHtml(m.nfo_name || 'the metadata file')} was rewritten.`
+            : 'Saved.');
+        }
+        await swapFromServer(['#panel-program', '#panel-eventlog']);
+        if (window.__applySectionLayout) window.__applySectionLayout();
+        if (window.__applyEvOrder) window.__applyEvOrder();
+        if (window.__applyEvDisclosures) window.__applyEvDisclosures();
+      } catch (e) {
+        err.textContent = e.message || 'Could not save.';
+        err.hidden = false;
+        busy = false;
+      }
+    }
+  }
+
+  // Delegated on document: the button rides on a card the 15s refresh replaces, so a
+  // handler bound to the element itself would stop working after the first swap.
+  document.addEventListener('click', (e) => {
+    if (!e.target.closest('[data-meta-edit]')) return;
+    const el = card();
+    if (el && el.dataset.meta) open(JSON.parse(el.dataset.meta));
+  });
+})();
+</script>
+<script>
 (function() {
   const REFRESH_INTERVAL_MS = 15000;
   const TERMINAL_STATUSES = ['COMPLETED', 'FAILED', 'ABORTED'];
@@ -1416,7 +1677,11 @@ window.onScheduleSaved = () => window.location.reload();
   // SWAP_IDS that contains a [data-sec] node needs the section-layout re-apply
   // below - a fresh node has no inline order/display.
   const initialStatus = '{{ rec.status }}';
-  const SWAP_IDS = ['detail-head-slot', 'hero-right', 'panel-segments-slot', 'panel-eventlog'];
+  // panel-program is in the list because the record-start refresh can rewrite the synopsis
+  // while this page is open on a SCHEDULED recording. swapFromServer needs the node on
+  // both sides, so a manual capture - which never has the card - simply skips it.
+  const SWAP_IDS = ['detail-head-slot', 'hero-right', 'panel-program',
+                    'panel-segments-slot', 'panel-eventlog'];
   if (initialStatus !== 'IN_PROGRESS' && initialStatus !== 'PAUSED') {
     SWAP_IDS.push('status-strip-slot');
   }

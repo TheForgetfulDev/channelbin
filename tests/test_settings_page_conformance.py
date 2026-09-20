@@ -507,6 +507,7 @@ class TierTests(unittest.TestCase):
         'recording.retention_delete_file', 'recording.post_process.enabled',
         'recording.post_process.format', 'recording.post_process.reencode_mode',
         'recording.move_on_complete.enabled', 'recording.move_on_complete.destination',
+        'recording.metadata_sidecar.enabled',
         'recording.live_thumbnail.enabled', 'recording.logo_cache.enabled', 'ffmpeg.path',
         'sync.sync_interval_hours', 'sync.epg_days_ahead', 'channel_testing.screenshots_enabled',
         'channel_testing.window.start', 'channel_testing.window.end', 'auth.enabled',
@@ -536,14 +537,14 @@ class TierTests(unittest.TestCase):
 
     def test_the_basic_set_is_exactly_the_approved_one(self):
         tiers = self._tiers(self.basic_html)
-        self.assertEqual(len(tiers), 115)
+        self.assertEqual(len(tiers), 119)
         self.assertEqual({p for p, t in tiers.items() if t == 'basic'}, self.BASIC)
         self.assertEqual({t for t in tiers.values()}, {'basic', 'advanced'})
 
     def test_every_advanced_row_carries_its_badge_and_no_basic_row_does(self):
         rows = re.findall(r'data-path="([^"]+)" data-tier="[^"]*".*?<div class="fl-label">(.*?)</div>',
                           self.basic_html, re.S)
-        self.assertEqual(len(rows), 115)
+        self.assertEqual(len(rows), 119)
         for path, badge in rows:
             with self.subTest(path=path):
                 self.assertEqual('tier-badge' in badge, path not in self.BASIC)
@@ -622,7 +623,7 @@ class ChangedFromDefaultTests(unittest.TestCase):
 
     def test_every_setting_row_carries_the_mark_and_the_attribute_turns_it_on(self):
         html = self._page()
-        self.assertEqual(html.count('<div class="fr-changed">Changed from default</div>'), 115)
+        self.assertEqual(html.count('<div class="fr-changed">Changed from default</div>'), 119)
         self.assertIn('.frow[data-changed] .fr-changed { display: inline-flex; }', self._css())
 
     def test_a_value_saved_equal_to_its_default_is_not_a_change(self):
@@ -698,6 +699,8 @@ class GatingAndOverrideTests(unittest.TestCase):
         'recording.move_on_complete.destination': ['recording.move_on_complete.enabled'],
         'recording.post_script.path': ['recording.post_script.enabled'],
         'recording.live_thumbnail.auto_refresh_seconds': ['recording.live_thumbnail.enabled'],
+        'recording.live_thumbnail.finished_image': ['recording.live_thumbnail.enabled'],
+        'recording.live_thumbnail.poster_frame_offset_seconds': ['recording.live_thumbnail.enabled'],
         'auth.session_timeout_minutes': ['auth.enabled'],
         'config_backup.backup_hour_et': ['config_backup.enabled'],
     }

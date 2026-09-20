@@ -381,8 +381,12 @@
     state.sortDesc = sort.startsWith('-');
     state.sort = sort.replace(/^-/, '');
     state.page = Math.max(1, parseInt(p.get('page'), 10) || 1);
+    // A URL that names a size always wins. One that names none opens at the Settings
+    // default, never by changing what the ENGINE reads into a missing `per_page`: the
+    // address bar carries `per_page` whenever it differs from the engine's, so a link copied
+    // from this page still opens at the size it was copied at (dev/changelog/1043).
     state.pageSize = Math.min(
-      parseInt(p.get('per_page'), 10) || (CAT ? CAT.page_size : 100),
+      parseInt(p.get('per_page'), 10) || (CAT ? CAT.opening_page_size : 100),
       CAT ? CAT.max_page_size : 500);
     const group = parseInt(p.get('add_to_group'), 10);
     state.addToGroup = Number.isFinite(group) ? group : null;
@@ -2119,12 +2123,29 @@
     // explicitly rather than left to fall out of the arithmetic below.
     if (last.total === null) { $('#pager').innerHTML = ''; return; }
     const pages = Math.max(1, last.pages || 1);
-    $('#pager').innerHTML = last.total > state.pageSize
+    const sizes = pageSizeOptions();
+    const turns = last.total > state.pageSize
       ? `<button class="btn btn-sm" data-pg="prev"${state.page <= 1 ? ' disabled' : ''}>&larr; Prev</button>
          <span class="pg-lbl">Page ${nf(state.page)} of ${nf(pages)}</span>
-         <button class="btn btn-sm" data-pg="next"${state.page >= pages ? ' disabled' : ''}>Next &rarr;</button>
-         <span class="pg-lbl" style="margin-left:auto">${nf(state.pageSize)} per page</span>`
+         <button class="btn btn-sm" data-pg="next"${state.page >= pages ? ' disabled' : ''}>Next &rarr;</button>`
       : '';
+    // Shown whenever a smaller size would page, not only when this one does: at 250 with
+    // 180 results there are no page turns, and hiding the size menu with them would leave
+    // no way back to 100.
+    const sizeMenu = last.total > Math.min(...sizes)
+      ? `<select id="pg-size" class="form-control pg-size" aria-label="Rows per page">${sizes.map((n) =>
+           `<option value="${n}"${n === state.pageSize ? ' selected' : ''}>${nf(n)} per page</option>`).join('')}
+         </select>`
+      : '';
+    $('#pager').innerHTML = turns + sizeMenu;
+  }
+
+  /* The menu, plus whatever size a URL named that is not on it (`per_page=50` is a valid
+     link), so the select never claims a size the page is not showing. */
+  function pageSizeOptions() {
+    const base = (CAT && CAT.page_size_options) || [100, 250, 500];
+    return base.includes(state.pageSize)
+      ? base : base.concat(state.pageSize).sort((a, b) => a - b);
   }
 
   /* ── Selection ───────────────────────────────────────────────────────
@@ -5326,6 +5347,16 @@
   // The empty state's "widen it" hint, which is a control only at phone width.
   $('#all-empty').addEventListener('click', (e) => {
     if (e.target.closest('#es-scope')) openScopeSheet();
+  });
+
+  // Changes this search only - the stored default is Settings' alone. The address bar
+  // picks the new size up from the response's query_string like every other change.
+  $('#pager').addEventListener('change', (e) => {
+    if (e.target.id !== 'pg-size') return;
+    const size = parseInt(e.target.value, 10);
+    if (!size || size === state.pageSize) return;
+    state.pageSize = size;
+    applyNow();
   });
 
   $('#pager').addEventListener('click', (e) => {

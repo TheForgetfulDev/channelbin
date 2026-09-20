@@ -44,6 +44,7 @@ from flask import Blueprint, jsonify, request
 
 from .. import db, health_bands
 from ..channel_search import (DEFAULT_FIELDS, DEFAULT_PAGE_SIZE, DEFAULT_SORT,
+                              PAGE_SIZE_OPTIONS, configured_page_size,
                               DEFAULT_SORT_BY_GRAIN, DEFAULT_STANDING, DIMENSIONS,
                               FIELD_GROUPS, FIELDS, GRAIN_CHANNELS,
                               GROUP_ANY, HEALTH_UNTESTED,
@@ -822,7 +823,13 @@ def channel_search_catalog_api():
         # builds them from its own controls, and the engine parses whatever arrives.
         'when_values': [{'value': v, 'label': WHEN_STATIC_LABELS[v]}
                         for v in WHEN_STATIC_VALUES],
+        # `page_size` is what the ENGINE means by a URL with no `per_page`; `opening_page_size`
+        # is what the page opens with instead, from Settings. Two keys because they are two
+        # facts: the page writes `per_page` into its own address bar whenever it differs from
+        # `page_size`, so a shared link always carries its size (dev/changelog/1043).
         'page_size': DEFAULT_PAGE_SIZE,
+        'opening_page_size': configured_page_size(cfg),
+        'page_size_options': list(PAGE_SIZE_OPTIONS),
         'max_page_size': MAX_PAGE_SIZE,
         # Labels carry the configured cut points ("Fair (50-79)"), so they are built from
         # the resolved bands rather than from a constant - move a cut point in Settings and

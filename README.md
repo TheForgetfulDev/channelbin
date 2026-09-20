@@ -204,8 +204,8 @@ restart policy.
 - **Appdata (`/config`) holds the database, so keep it off the array.** Use an appdata share
   that lives on a pool only, or point it at the pool path directly
   (`/mnt/cache/appdata/channelbin`).
-- **Map `/dvr` itself, not subfolders of it.** Thumbnails, health check screenshots and
-  cached logos default to `/dvr/images`. With only subfolders mapped, they land in an
+- **Map `/dvr` itself, not subfolders of it.** Thumbnails, health check screenshots,
+  cached logos and profile poster images default to `/dvr/images`. With only subfolders mapped, they land in an
   unmapped volume inside `docker.img` and are lost when the container is updated.
 - **Completed recordings** is an optional second path, mounted at `/dvr-complete`, for filing
   finished recordings somewhere outside the recordings share. Turn on **Move on complete** in
@@ -536,6 +536,12 @@ A read-only Home Assistant custom integration ships in `custom_components/channe
 
 There are no write-capable services (no start/abort/health-check from Home Assistant) - v1 is
 sensors only.
+
+The integration needs a ChannelBin server at least as new as the version it declares
+(`custom_components/channelbin/compat.py`). Against an older server it won't run: its sensors
+go unavailable and Home Assistant shows a repair notice naming both versions, which clears by
+itself once ChannelBin is upgraded. ChannelBin 0.12.0 and earlier don't report a version, so
+they are treated as too old.
 
 ### Generate an API key
 

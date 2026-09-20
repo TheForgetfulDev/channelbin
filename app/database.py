@@ -81,6 +81,33 @@ RECORDING_REPLACED_OTHER            = 'RECORDING_REPLACED_OTHER'
 # (DESIGN-sync-resilience.md §6) - the channel it targeted was missing from the provider
 # feed and the same stream survives on another channel row.
 RECORDING_REPOINTED                 = 'RECORDING_REPOINTED'
+# The record-start refresh of Recording.metadata_description/_category/_rating found the
+# program's listing again and at least one value had moved since the recording was
+# scheduled - the provider revised the synopsis, re-genred it, or re-rated it. Logged only
+# when something actually changed, and it names both values: a recording whose description
+# does not match what the guide showed when it was set up is otherwise unexplainable.
+RECORDING_METADATA_REFRESHED        = 'RECORDING_METADATA_REFRESHED'
+# The same refresh declined to run because Recording.metadata_locked is set. The user's
+# correction standing while a provider revision is ignored is a decision the app made on
+# their behalf, so it says so rather than leaving them to infer it from a description that
+# quietly stopped tracking the guide.
+RECORDING_METADATA_REFRESH_SKIPPED  = 'RECORDING_METADATA_REFRESH_SKIPPED'
+# A user corrected what this recording says about itself: any of the written title, the
+# synopsis, the genre or the rating, the lock that suppresses the record-start refresh, or
+# the per-recording switch for whether a sidecar is written at all. Names every value that
+# moved and both sides of each one, because a recording whose description no longer matches
+# the guide has to be explicable a month later - and because the lock and the switch each
+# store the user's answer to a judgment call, which CLAUDE.md's participation-switch rule
+# says may never move without a surface saying so.
+RECORDING_METADATA_EDITED           = 'RECORDING_METADATA_EDITED'
+# The .nfo file and poster that describe a finished recording to a media server were
+# written beside it (app/metadata_sidecar.py). Logged so a library showing the wrong
+# summary, or nothing at all, can be traced to what this app actually wrote and when.
+METADATA_SIDECAR_WRITTEN            = 'METADATA_SIDECAR_WRITTEN'
+# The same write failed - the folder went read-only, the mount dropped, the disk filled.
+# The recording is complete and untouched either way: a file that only describes the
+# artifact may never be allowed to damage it.
+METADATA_SIDECAR_FAILED             = 'METADATA_SIDECAR_FAILED'
 # Timeline damage found in the concatenated .ts (gaps/missing frames that break player
 # seeking) - logged when post_process.reencode_mode='damaged' decides to re-encode.
 SEEK_DAMAGE_DETECTED   = 'SEEK_DAMAGE_DETECTED'
@@ -319,6 +346,20 @@ class RecordingProfile(db.Model):
     retention_days            = db.Column(db.Integer)
     # None = use global channel_testing.pre_check.enabled; tri-state override
     pre_check_enabled         = db.Column(db.Boolean)
+    # None = use global recording.metadata_sidecar.enabled; tri-state override. Whether a
+    # finished recording gets the .nfo and poster that describe it to a media server
+    # (app/metadata_sidecar.py, dev/changelog/1057).
+    metadata_sidecar_enabled  = db.Column(db.Boolean)
+    # A poster image pinned to this profile, used as the sidecar's artwork for every
+    # recording made under it instead of a frame captured from the recording. The file's
+    # name inside images_dir's posters subfolder - chosen by the server as
+    # `profile-<id>-<token>.<ext>`, never the uploaded name - plus its pixel size, stored
+    # because the profiles page shows the size and reading it off the file per row would
+    # be per-row disk I/O. None = no pinned poster (app/profile_posters.py,
+    # dev/changelog/1059).
+    poster_file               = db.Column(db.String(255))
+    poster_width              = db.Column(db.Integer)
+    poster_height             = db.Column(db.Integer)
     created_at                = db.Column(db.DateTime, default=datetime.utcnow)
     updated_at                = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -404,6 +445,31 @@ FAILURE_REASONS = (
     FAILURE_SOURCE_MISSING, FAILURE_CONVERSION_FAILED,
 )
 
+# Recording.cancel_reason vocabulary - why a row is ABORTED. Same contract as
+# failure_reason above: every writer of REC_STATUS_ABORTED sets exactly one of these in the
+# same commit, a Retry that takes the row out of ABORTED clears it, and the detail page's
+# CANCELLED strip has one branch per value (tests/test_cancel_reason_disclosure.py checks
+# that). NULL on an ABORTED row means the row predates the vocabulary, and the strip's
+# NULL branch says only what it can still stat off the disk.
+#
+# The distinction the column exists to make is what a cancel left behind, which is not the
+# same at every phase: the strip claimed a discard on all five, while two of them keep the
+# joined .ts on purpose and offer Retry conversion over it (dev/changelog/1054).
+#
+# Never started, nothing captured.
+CANCEL_BEFORE_START     = 'BEFORE_START'
+CANCEL_GROUP_CHANGE     = 'GROUP_CHANGE'
+# The capture was running; its segments are deleted with it.
+CANCEL_DURING_CAPTURE   = 'DURING_CAPTURE'
+# After the join. Both keep the joined .ts so Retry conversion can finish the job.
+CANCEL_DURING_ANALYSIS  = 'DURING_ANALYSIS'
+CANCEL_DURING_CONVERSION = 'DURING_CONVERSION'
+
+CANCEL_REASONS = (
+    CANCEL_BEFORE_START, CANCEL_GROUP_CHANGE, CANCEL_DURING_CAPTURE,
+    CANCEL_DURING_ANALYSIS, CANCEL_DURING_CONVERSION,
+)
+
 # ChannelTest.status vocabulary. Shares string values with REC_STATUS_* above (and with
 # OnDemandTestJob.status, which has its own separate QUEUED/RUNNING/... vocabulary and no
 # constants of its own) - kept as distinct names because the two are different enumerations
@@ -484,6 +550,9 @@ class Recording(db.Model):
     # One of FAILURE_REASONS - set by every writer of REC_STATUS_FAILED, cleared when a Retry
     # takes the row out of FAILED (dev/changelog/990)
     failure_reason           = db.Column(db.String(64))
+    # One of CANCEL_REASONS - set by every writer of REC_STATUS_ABORTED, cleared when a Retry
+    # takes the row out of ABORTED (dev/changelog/1054)
+    cancel_reason            = db.Column(db.String(64))
     # Dead-stream fast-fail retry budget (watchdog.dead_stream_max_retry_attempts). Counts
     # attempts scheduled, not just fired - incremented when status -> RETRYING, never reset
     # (a mid-window recovery that later dies again keeps counting against the same budget, so
@@ -508,6 +577,44 @@ class Recording(db.Model):
     program_stop_time    = db.Column(db.DateTime)   # naive UTC; immutable EPG program air-time snapshot at creation (None for manual recordings)
     program_title        = db.Column(db.String(512))  # immutable EPG program title snapshot at creation (None for manual recordings)
     program_sub_title    = db.Column(db.String(512))  # immutable EPG program sub-title snapshot at creation (None for manual recordings)
+
+    # ── Describing the recording to something outside this app ────────────────
+    # The program's synopsis, genre and content rating, copied off its epg_entries row.
+    # They live here because epg_entries is not a durable store: epg.epg_keep_days deletes
+    # a program's row within a day of it airing and a sync replaces rows wholesale, so
+    # reading them back at post-process time is unreliable by construction. This is the
+    # irreversible half - a recording whose listing has been pruned can never be described
+    # again (dev/changelog/1055).
+    #
+    # DELIBERATELY NOT program_*, which is one meaning and keeps it: an immutable snapshot
+    # of what we planned to record. These are "as of record start, falling back to
+    # creation" - written when the recording is scheduled and refreshed again in
+    # recorder.start_recording(), because a recording set up days ahead may be describing a
+    # program the provider has since revised. The two questions stay separately answerable.
+    metadata_description = db.Column(db.Text)
+    metadata_category    = db.Column(db.String(255))
+    metadata_rating      = db.Column(db.String(64))
+    # What the sidecar calls this item, when the user has said. None means "derive it",
+    # which is what every recording carries until someone edits one: program_title joined
+    # with program_sub_title, falling back to the recording's own name
+    # (metadata_sidecar._display_title). A separate column rather than an edit to
+    # program_title for the reason the block above gives - that pair answers "what did we
+    # plan to record" and editing it would quietly give it a second meaning
+    # (dev/changelog/1058).
+    metadata_title       = db.Column(db.String(512))
+    # None = inherit RecordingProfile.metadata_sidecar_enabled, which in turn inherits the
+    # global recording.metadata_sidecar.enabled. The innermost of the feature's three-level
+    # gate, so one recording can be held out of (or pulled into) sidecar writing without
+    # touching its profile or the global setting. Tri-state, tested with `is not None`:
+    # False here is an answer, not an absence.
+    metadata_sidecar_enabled = db.Column(db.Boolean)
+    # The user's answer to "leave my wording alone": when set, the record-start refresh
+    # FILTERS on it and writes RECORDING_METADATA_REFRESH_SKIPPED. It never clears it, and
+    # no background job, sweep or reconcile pass may write it - CLAUDE.md's
+    # participation-switch rule governs this column directly, and
+    # tests/test_static_invariants.py::MetadataLockWriteBypassTests is the guard.
+    metadata_locked      = db.Column(db.Boolean, nullable=False, default=False,
+                                     server_default=db.text('0'))
 
     # ── Channel link & health ─────────────────────────────────────────────────
     channel_id               = db.Column(db.Integer, db.ForeignKey('channels.id'), nullable=True)
@@ -1234,16 +1341,19 @@ GROUP_FORMAT_STRATEGIES = (
 )
 
 # ChannelGroup.muted_warnings - which of the group's warning banners the user has hidden
-# (DESIGN-channel-groups-model.md 16.2). Only the three banners that describe a setup the
-# user may have chosen deliberately are mutable; the two that describe a state nobody
-# chose - nothing monitors these channels, and the strategy could not pick a format - are
-# not, because hiding those would hide the reason the group is not doing what it looks
-# like it does.
-GROUP_WARNING_FORMAT   = 'format'    # mixed formats, and its unmanaged sibling
-GROUP_WARNING_EPG      = 'epg'       # members carry different EPG ids (section 8)
-GROUP_WARNING_OVERRIDE = 'override'  # no member matches the lock, so it is bypassed (15.2)
+# (DESIGN-channel-groups-model.md 16.2). A banner is mutable when it describes a setup the
+# user may have chosen deliberately, which includes leaving members off every recurring
+# health check (dev/changelog/1048). The two that stay non-mutable describe a state nobody
+# chose and no setting asked for - the strategy could not pick a format, and a guide row has
+# nothing left to record from - so hiding either would hide the reason the group is not
+# doing what it looks like it does.
+GROUP_WARNING_FORMAT     = 'format'       # mixed formats, and its unmanaged sibling
+GROUP_WARNING_EPG        = 'epg'          # members carry different EPG ids (section 8)
+GROUP_WARNING_OVERRIDE   = 'override'     # no member matches the lock, so it is bypassed (15.2)
+GROUP_WARNING_UNMONITORED = 'unmonitored'  # no recurring health check covers these members
 
-GROUP_WARNING_KINDS = (GROUP_WARNING_FORMAT, GROUP_WARNING_EPG, GROUP_WARNING_OVERRIDE)
+GROUP_WARNING_KINDS = (GROUP_WARNING_FORMAT, GROUP_WARNING_EPG, GROUP_WARNING_OVERRIDE,
+                       GROUP_WARNING_UNMONITORED)
 
 
 class ChannelGroup(db.Model):

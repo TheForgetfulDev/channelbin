@@ -63,7 +63,9 @@ fails when a new step reaches for app code without being declared there.
 
 Rollback posture: there are no down-migrations. Before any pending step runs, the DB is
 snapshotted via VACUUM INTO (config: database.pre_migration_backup / backup_dir /
-migration_backups_keep); recovery = stop the app, restore that snapshot over dvr.db (removing
+migration_backups_keep, the last two read through config.db_backup_dir so the snapshots
+belong to the database being migrated); recovery = stop the app, restore that snapshot over
+dvr.db (removing
 any -wal/-shm files), and run the matching older code.
 
 Startup-only and single-threaded, so commits here deliberately skip retry_on_locked - no
@@ -2248,6 +2250,105 @@ def _m065_channel_account_epg_index(conn, cur):
     conn.commit()
 
 
+def _m066_recording_cancel_reason(conn, cur):
+    """recordings: cancel_reason, the enumerated answer to why a row is ABORTED.
+
+    No backfill. NULL means a row cancelled before the vocabulary existed, and the detail
+    page's CANCELLED strip reads those off the disk rather than guessing - the cancel
+    reason is not recoverable from a row's own columns, and inferring one from an event's
+    prose would invent history (dev/changelog/1054).
+
+    Column-presence guarded, so this step is re-runnable from the top."""
+    existing = [r[1] for r in cur.execute('PRAGMA table_info(recordings)').fetchall()]
+    if 'cancel_reason' not in existing:
+        cur.execute('ALTER TABLE recordings ADD COLUMN cancel_reason VARCHAR(64)')
+    conn.commit()
+
+
+def _m067_recording_metadata_snapshot(conn, cur):
+    """recordings: metadata_description/_category/_rating + metadata_locked.
+
+    No backfill, and that is the honest answer rather than a shortcut. The values come
+    off epg_entries, which epg.epg_keep_days deletes within a day of a program airing, so
+    a backfill would reach only the handful of recordings whose listing happens to survive
+    and would look like it had done the whole job. Recordings still SCHEDULED when this
+    lands need no backfill at all - the record-start refresh in recorder.start_recording()
+    fills them in on the way past (dev/changelog/1055).
+
+    Column-presence guarded, so this step is re-runnable from the top."""
+    existing = [r[1] for r in cur.execute('PRAGMA table_info(recordings)').fetchall()]
+    if 'metadata_description' not in existing:
+        cur.execute('ALTER TABLE recordings ADD COLUMN metadata_description TEXT')
+    if 'metadata_category' not in existing:
+        cur.execute('ALTER TABLE recordings ADD COLUMN metadata_category VARCHAR(255)')
+    if 'metadata_rating' not in existing:
+        cur.execute('ALTER TABLE recordings ADD COLUMN metadata_rating VARCHAR(64)')
+    if 'metadata_locked' not in existing:
+        cur.execute('ALTER TABLE recordings ADD COLUMN metadata_locked '
+                    'BOOLEAN NOT NULL DEFAULT 0')
+    conn.commit()
+
+
+def _m068_profile_metadata_sidecar(conn, cur):
+    """recording_profiles: metadata_sidecar_enabled, the tri-state per-profile override of
+    recording.metadata_sidecar.enabled.
+
+    Nullable with no default on purpose: NULL means "inherit the global setting", which is
+    what every existing profile should do when this lands. A DEFAULT 0 here would read as
+    "this profile has turned the feature off", so every profile would keep the feature off
+    for its recordings after the user switched it on globally (dev/changelog/1057).
+
+    Column-presence guarded, so this step is re-runnable from the top."""
+    existing = [r[1] for r in cur.execute('PRAGMA table_info(recording_profiles)').fetchall()]
+    if 'metadata_sidecar_enabled' not in existing:
+        cur.execute('ALTER TABLE recording_profiles ADD COLUMN metadata_sidecar_enabled BOOLEAN')
+    conn.commit()
+
+
+def _m069_recording_metadata_edit(conn, cur):
+    """recordings: metadata_title + metadata_sidecar_enabled, the two columns the
+    preview-and-correct surface writes (dev/changelog/1058).
+
+    Both nullable with no default, and for the same reason as migration 68's column above:
+    NULL is the meaningful resting state. metadata_title NULL means "derive the written
+    title from program_title and program_sub_title", which is what every recording made
+    before this did and should keep doing; metadata_sidecar_enabled NULL means "inherit the
+    profile, and through it the global setting". A DEFAULT on either would turn an absence
+    into an answer the user never gave, on every existing row at once.
+
+    No backfill, so no entry in the obligation ledger: there is nothing to compute here,
+    only two columns to add.
+
+    Column-presence guarded, so this step is re-runnable from the top."""
+    existing = [r[1] for r in cur.execute('PRAGMA table_info(recordings)').fetchall()]
+    if 'metadata_title' not in existing:
+        cur.execute('ALTER TABLE recordings ADD COLUMN metadata_title VARCHAR(512)')
+    if 'metadata_sidecar_enabled' not in existing:
+        cur.execute('ALTER TABLE recordings ADD COLUMN metadata_sidecar_enabled BOOLEAN')
+    conn.commit()
+
+
+def _m070_profile_poster(conn, cur):
+    """recording_profiles: poster_file + poster_width + poster_height, the poster image a
+    profile can pin for every recording made under it (dev/changelog/1059).
+
+    All three nullable with no default: NULL on poster_file is the resting state, "no
+    pinned poster, use the captured frame", which is what every existing profile does. The
+    size columns exist because the profiles page displays them and would otherwise have to
+    open each poster file per row.
+
+    No backfill, so no entry in the obligation ledger. Column-presence guarded, so this
+    step is re-runnable from the top."""
+    existing = [r[1] for r in cur.execute('PRAGMA table_info(recording_profiles)').fetchall()]
+    if 'poster_file' not in existing:
+        cur.execute('ALTER TABLE recording_profiles ADD COLUMN poster_file VARCHAR(255)')
+    if 'poster_width' not in existing:
+        cur.execute('ALTER TABLE recording_profiles ADD COLUMN poster_width INTEGER')
+    if 'poster_height' not in existing:
+        cur.execute('ALTER TABLE recording_profiles ADD COLUMN poster_height INTEGER')
+    conn.commit()
+
+
 SCHEMA_MIGRATIONS = [
     (1, 'baseline: pre-versioning additive migrations + backfills', _m001_baseline),
     (2, 'recordings: program_title/program_sub_title snapshot columns + backfill', _m002_program_title),
@@ -2375,6 +2476,19 @@ SCHEMA_MIGRATIONS = [
      _m064_account_stat_ledger),
     (65, 'channels: ix_channels_account_epg, the Accounts list\'s EPG coverage count',
      _m065_channel_account_epg_index),
+    (66, 'recordings: cancel_reason, why a row is ABORTED - what the cancel left on disk, '
+     'which the CANCELLED strip claimed was nothing', _m066_recording_cancel_reason),
+    (67, 'recordings: metadata_description/_category/_rating + metadata_locked - the '
+     'program\'s synopsis, genre and rating, which live only on the epg_entries row that '
+     'gets pruned a day after it airs', _m067_recording_metadata_snapshot),
+    (68, 'recording_profiles: metadata_sidecar_enabled, the per-profile override of '
+     'whether a finished recording gets the .nfo and poster that describe it to a media '
+     'server', _m068_profile_metadata_sidecar),
+    (69, 'recordings: metadata_title + metadata_sidecar_enabled - the written title when '
+     'the user overrides it, and the per-recording half of the sidecar on/off gate',
+     _m069_recording_metadata_edit),
+    (70, 'recording_profiles: poster_file + poster_width + poster_height - the poster '
+     'image a profile pins for every recording made under it', _m070_profile_poster),
 ]
 
 CURRENT_SCHEMA_VERSION = SCHEMA_MIGRATIONS[-1][0]
@@ -2468,21 +2582,30 @@ def _backup_before_migration(cur, db_version: int, first_pending: int, cfg: dict
     entire rollback story (no down-migrations exist), so a failed snapshot aborts startup
     rather than silently migrating an un-backed-up DB.
 
-    Both paths come from the caller's `cfg`, never a fresh load_config(). The two are the
-    same thing in production and are not the same thing anywhere else: database.backup_dir
-    defaults to an app-root-relative path, so a re-read resolved every snapshot to the real
-    install's instance/db-backups even when the cursor belonged to a temp database. The
-    suite ran that combination on every pass and the pruner then evicted the operator's real
-    snapshots to keep three copies of an empty test database (dev/changelog/936).
+    Both paths come from the caller's `cfg`, never a fresh load_config(), and the
+    destination is derived from the database being migrated rather than from the app root
+    (config.db_backup_dir). The two are the same directory in production and are not the
+    same directory anywhere else: a re-read - or, after that was fixed, a cfg that
+    overrode only database.path - resolved every snapshot to the running install's
+    instance/db-backups even when the cursor belonged to some other database, and the
+    pruner then evicted the operator's real snapshots to keep three copies of an empty one
+    (dev/changelog/936, dev/changelog/1052).
     """
-    from .config import (resolve_app_path, ensure_private_dir, DEFAULT_DB_BACKUP_DIR)
+    from .config import (resolve_app_path, ensure_private_dir, db_backup_dir,
+                         legacy_app_root_db_backup_dir)
     from .tz_utils import get_display_tz
     db_cfg = cfg.get('database', {})
     if not db_cfg.get('pre_migration_backup', True):
         log.warning('database.pre_migration_backup is false - migrating from schema version '
                     '%d without a snapshot', db_version)
         return
-    backup_dir = resolve_app_path(db_cfg.get('backup_dir', DEFAULT_DB_BACKUP_DIR))
+    backup_dir = db_backup_dir(cfg)
+    legacy_dir = legacy_app_root_db_backup_dir(cfg)
+    if legacy_dir and glob.glob(os.path.join(legacy_dir, 'dvr-pre-schema-v*.db')):
+        log.warning('Pre-migration snapshots now go to %s, beside the database being '
+                    'migrated. Older snapshots are still in %s - they are left intact and '
+                    'are no longer pruned; move or delete them yourself.',
+                    backup_dir, legacy_dir)
     ts = datetime.now(tz=get_display_tz()).strftime('%Y-%m-%d-%H-%M-%S')
     name = f'dvr-pre-schema-v{first_pending}-{ts}.db'
     dest = os.path.join(backup_dir, name)

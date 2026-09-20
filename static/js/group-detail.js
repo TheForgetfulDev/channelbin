@@ -785,9 +785,7 @@
     if (r.duplicate_title) {
       h += `<span class="badge b-warn tip-plain" data-tip="Duplicate feed.&#10;${escHtml(r.duplicate_title)}. Same stream URL, so it is literally the same feed listed twice - it adds nothing to failover and costs an extra test run.">&#10697; duplicate</span>`;
     }
-    if (r.lifecycle === 'missing') {
-      h += `<span class="badge b-warn tip-plain" data-tip="Missing.&#10;No longer seen in ${escHtml(r.account_name || 'this account')}'s synced feed since ${escHtml(r.lifecycle_date)}.">Missing ${escHtml(r.lifecycle_date)}</span>`;
-    }
+    h += missingBadge(r);
     // "No schedule reaches this feed" is a different fact from "this group's Health check
     // switch is off", but they read as the same words - so the note is suppressed when a
     // 16.1 pill is already saying it louder and with the reason attached.
@@ -1156,9 +1154,7 @@
     if (r.duplicate_title) {
       flags.push(`<span class="badge b-warn tip-plain" data-tip="Duplicate feed.&#10;${escHtml(r.duplicate_title)}. Same stream URL, so it is literally the same feed listed twice - it adds nothing to failover and costs an extra test run.">&#10697; duplicate</span>`);
     }
-    if (r.lifecycle === 'missing') {
-      flags.push(`<span class="badge b-warn tip-plain" data-tip="Missing.&#10;No longer seen in ${escHtml(r.account_name || 'this account')}'s synced feed since ${escHtml(r.lifecycle_date)}.">Missing ${escHtml(r.lifecycle_date)}</span>`);
-    }
+    if (r.lifecycle === 'missing') flags.push(missingBadge(r));
     const pillSaysUnmonitored = G.hasChannel && r.recording_enabled && !r.test_enabled;
     if (G.hasChannel && !r.monitored && !pillSaysUnmonitored) {
       flags.push(`<span class="gd-note tip-plain" data-tip="Not monitored.&#10;No recurring health check covers this feed, so format drift will not be caught automatically.">not monitored</span>`);
@@ -1666,7 +1662,7 @@
   // right one: a group being prepared for the guide should be warned BEFORE it gets
   // there, and a group made purely for health checking should not be warned at all.
 
-  // The three mutable banners, as the Settings > Warnings block lists them. Keyed on
+  // The four mutable banners, as the Settings > Warnings block lists them. Keyed on
   // app/database.py::GROUP_WARNING_KINDS, which the route validates against - this list
   // is the copy, never the authority.
   const WARN_SETTINGS = [
@@ -1682,9 +1678,14 @@
      'ChannelBin records rather than skips when every recording-enabled member is filtered ' +
      'out, so the file exists but is not the format you asked for. Hiding this does not ' +
      'affect the alerts or what the recording itself records.'],
+    ['unmonitored', 'Warn about members no health check covers',
+     'Members outside every active recurring health check are never re-checked, so a ' +
+     'provider changing their resolution or frame rate goes unnoticed until a recording ' +
+     'runs. Turn this off for a group you check by hand, or one whose extra members are ' +
+     'only there as spares.'],
   ];
 
-  // The hide control every mutable banner carries. One function so three banners cannot
+  // The hide control every mutable banner carries. One function so four banners cannot
   // drift apart in wording or behavior.
   function muteBtn(kind, why) {
     const tip = `Hide this warning for this group.&#10;${escHtml(why)} Turn it back on ` +
@@ -1792,7 +1793,10 @@
     }
     set('gd-epg-banner', epg);
     // Shown once above the whole stack whenever any of the three banners above needs it,
-    // rather than repeated inside each one - DESIGN-channel-groups-model.md:1108.
+    // rather than repeated inside each one - DESIGN-channel-groups-model.md:1108. The
+    // unmonitored banner is mutable too but stays off this gate on purpose: the note
+    // describes an invalid recording configuration, and missing health-check coverage is
+    // not one (dev/changelog/1048).
     set('gd-banner-explainer', (mixed || override || epg) ? bannerNote() : '');
 
     // The no-winner state, shown while it is TRUE rather than only in the one
@@ -1835,15 +1839,19 @@
     set('gd-broken-banner', broken);
 
     // Drift coverage. Rendered here rather than by the template so it follows the Health
-    // check switches, which move without a reload (dev/changelog/757).
+    // check switches, which move without a reload (dev/changelog/757). Mutable since
+    // dev/changelog/1048: leaving members off every check is a setup a user can choose on
+    // purpose, which is the test 16.2 applies.
     let unmon = '';
     const un = WARN.unmonitored_count || 0;
-    if (un) {
+    if (un && !muted.has('unmonitored')) {
       unmon = `<strong>&#9888; ${plural(un, 'channel')} not monitored</strong><br>` +
         `No active recurring health check covers ${un === 1 ? 'it' : 'them'}, so a ` +
         'provider-side resolution or frame-rate change will not be re-checked automatically.' +
         (WARN.has_check ? ''
-          : ' <a href="#" data-act="create-check">Schedule a health check for this group</a>.');
+          : ' <a href="#" data-act="create-check">Schedule a health check for this group</a>.') +
+        `<div class="gd-ban-acts">${muteBtn('unmonitored',
+          'For a group you check by hand, or whose extra members are only spares.')}</div>`;
     }
     set('gd-unmonitored-banner', unmon);
   }
@@ -2220,8 +2228,8 @@
     }
 
     // The re-entry point for every warning the user dismissed. Without one, "Hide this
-    // warning" is a one-way door - and there are three of them, so this block is built
-    // from a list rather than written out three times.
+    // warning" is a one-way door - and there are four of them, so this block is built
+    // from a list rather than written out four times.
     if (G.hasChannel && WARN) {
       const muted = new Set(WARN.muted || []);
       h += '<fieldset class="gd-fset"><div class="gd-fset-head">Warnings</div>';

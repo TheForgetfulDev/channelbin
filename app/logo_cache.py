@@ -162,42 +162,20 @@ def _record_logo_attempt(channel_id: int, source_url: str, cache_path: str | Non
     db.session.commit()
 
 
-def _purge_svg_logo_cache(cache_dir: str) -> None:
-    """Drop any logo cached before the raster-only allowlist existed. Keyed off the DB
-    (not a directory scan) since Channel.logo_cache_path is the only record of what's
-    safe to remove. Runs every batch tick regardless of the enabled flag - channel_logo
-    serves whatever is cached irrespective of it, so a since-disabled install would
-    otherwise keep serving a stored SVG forever."""
-    stale = Channel.query.filter(Channel.logo_cache_path.like('%.svg')).all()
-    for channel in stale:
-        old_path = channel.logo_cache_path
-        _clear_logo_cache_columns(channel.id)
-        try:
-            os.remove(os.path.join(cache_dir, old_path))
-        except OSError:
-            pass
-
-
-@retry_on_locked()
-def _clear_logo_cache_columns(channel_id: int) -> None:
-    channel = db.session.get(Channel, channel_id)
-    if channel is None:
-        return
-    channel.logo_cache_path = None
-    channel.logo_cache_source_url = None
-    db.session.commit()
-
-
 def run_logo_cache_batch(limit: int = 15) -> int:
     """Fetch up to `limit` pending/stale channel logos. Returns the number attempted.
-    Must run inside an app context; caller (the scheduler job) owns that."""
+    Must run inside an app context; caller (the scheduler job) owns that.
+
+    Re-checks the enabled flag rather than trusting its caller: the scheduled job is
+    registered and removed as the setting moves (app/scheduler.py::
+    apply_logo_cache_schedule), and this is the backstop for a tick already in flight
+    when it moved."""
     cfg = load_config()
     lc_cfg = cfg.get('recording', {}).get('logo_cache', {})
-    cache_dir = get_logo_cache_dir(cfg)
-    _purge_svg_logo_cache(cache_dir)
     if not lc_cfg.get('enabled', False):
         return 0
 
+    cache_dir = get_logo_cache_dir(cfg)
     channels = _channels_needing_fetch(limit)
     for channel in channels:
         _fetch_one_logo(channel, cache_dir, cfg)

@@ -14,6 +14,7 @@
   const openEditor = (profile) => openRecordingProfileModal({
     profile,
     defaults: CFG.defaults,
+    posterSpec: CFG.posterSpec,
   });
 
   const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;

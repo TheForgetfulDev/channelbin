@@ -186,8 +186,9 @@ class GuideLayoutDefaultsTests(unittest.TestCase):
         self.assertIn(GUIDE_LAYOUT_PREF_KEY, html)
 
     def test_mobile_never_renders_a_description_in_a_cell(self):
-        """13.9 is a hard rule, not a default: a description lives in the program sheet at
-        phone widths and there is no checkbox to turn it on. A pref that says otherwise -
+        """13.9 is a hard rule, not a default: a description lives in the record modal the
+        cell opens at phone widths and there is no checkbox to turn it on. A pref that says
+        otherwise -
         one written before the rule, or hand-edited - must still not produce one."""
         db.session.add(UserPref(key=GUIDE_LAYOUT_MOBILE_PREF_KEY,
                                 value=json.dumps({'description': True})))

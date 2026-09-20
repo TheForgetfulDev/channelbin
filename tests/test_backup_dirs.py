@@ -27,7 +27,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import app.config as config_mod  # noqa: E402
 from app.config import (DEFAULT_CONFIG_BACKUP_DIR, DEFAULT_DB_BACKUP_DIR, _DEFAULTS,
-                        ensure_private_dir, resolve_app_path)  # noqa: E402
+                        db_backup_dir, ensure_private_dir,
+                        resolve_app_path)  # noqa: E402
 from app.config_backup import do_backup  # noqa: E402
 from tests.support.app import make_test_app  # noqa: E402
 
@@ -47,11 +48,28 @@ class BackupDefaultLocationTests(unittest.TestCase):
                              f'{value!r} puts secrets back on the shared mount')
 
     def test_defaults_resolve_under_the_app_instance_dir(self):
-        for value in (_DEFAULTS['config_backup']['backup_dir'],
-                      _DEFAULTS['database']['backup_dir']):
-            resolved = resolve_app_path(value)
+        """The DB default goes through db_backup_dir(), which anchors a relative value at
+        the database's own directory rather than the app root (dev/changelog/1052). A
+        default install keeps dvr.db at the app root, so this pins that the two agree
+        there and nobody's existing snapshots moved."""
+        for resolved in (resolve_app_path(_DEFAULTS['config_backup']['backup_dir']),
+                         db_backup_dir(_DEFAULTS)):
             self.assertEqual(os.path.dirname(resolved),
                              os.path.join(config_mod._APP_ROOT, 'instance'))
+
+    def test_db_backup_dir_follows_the_database_it_is_backing_up(self):
+        """A relocated database takes its snapshots with it - the scratch app that
+        overrode only database.path used to deposit into, and prune, the running
+        install's folder (dev/docs/BUGS.md 2026-09-19)."""
+        cfg = {'database': {'path': '/srv/data/dvr.db'}}
+        self.assertEqual(db_backup_dir(cfg), '/srv/data/instance/db-backups')
+
+    def test_a_configured_absolute_backup_dir_is_never_rewritten(self):
+        """What the Docker image ships (/config/instance/db-backups) stays exactly that,
+        wherever database.path points."""
+        cfg = {'database': {'path': '/config/dvr.db',
+                            'backup_dir': '/some/where/else'}}
+        self.assertEqual(db_backup_dir(cfg), '/some/where/else')
 
 
 class ResolveAppPathTests(unittest.TestCase):

@@ -236,6 +236,41 @@ class BackupSnapshotTests(unittest.TestCase):
         strays = glob.glob(os.path.join(app_root, '.dvr-pre-schema-*.tmp'))
         self.assertEqual(strays, [], f'temp snapshot left beside the real dvr.db: {strays}')
 
+    def test_a_cfg_that_overrides_only_the_db_path_still_stays_out_of_the_real_install(self):
+        """dev/docs/BUGS.md 2026-09-19 - the scratch-app shape, with no backup_dir at all.
+
+        Taking both paths from the caller's cfg closed this for the test suite, which
+        names its own temp backup_dir. It did not close it for an app that points
+        database.path at a copy of dvr.db and leaves everything else alone: the default
+        backup_dir is relative, an app-root anchor resolved it to the RUNNING install's
+        instance/db-backups, and the pruner then evicted the genuine snapshots of a 1.78GB
+        database to keep three copies of the scratch one. The destination has to be
+        derived from the database being migrated.
+        """
+        app_root = os.path.dirname(os.path.dirname(os.path.abspath(M.__file__)))
+        real_backup_dir = os.path.join(app_root, 'instance', 'db-backups')
+        before = set(glob.glob(os.path.join(real_backup_dir, '*')))
+
+        # Deliberately no 'backup_dir' key - this is the whole point of the case.
+        # migration_backups_keep=0 (keep all) makes the FAILING direction harmless: with
+        # the anchor broken this run deposits into the real install's folder, and a
+        # regression test whose failure mode deletes an operator's 284MB snapshots is
+        # worse than the defect it guards. Proving the fix cost the real v63 snapshot
+        # once (dev/changelog/1052); it must not cost the next one.
+        cfg = {'database': {'path': self.t.db_path, 'pre_migration_backup': True,
+                            'migration_backups_keep': 0}}
+        _set_user_version(M.CURRENT_SCHEMA_VERSION - 1)
+        with _harmless_last_step():
+            M.run_migrations(fresh_db=False, cfg=cfg)
+
+        self.assertEqual(set(glob.glob(os.path.join(real_backup_dir, '*'))), before,
+                         'a scratch app that overrode only database.path deposited into - '
+                         'and pruned - the real install\'s backup dir')
+        landed = glob.glob(os.path.join(os.path.dirname(self.t.db_path),
+                                        'instance', 'db-backups', 'dvr-pre-schema-v*.db'))
+        self.assertEqual(len(landed), 1,
+                         f'the snapshot should sit beside the migrated database, got {landed}')
+
 
 class PruneMigrationBackupsTests(unittest.TestCase):
     """dev/docs/BUGS.md 2026-08-17 - _prune_migration_backups sorted purely by mtime, so an
@@ -1491,8 +1526,9 @@ _CURRENT_CODE_IMPORTS = {
     ('_backfill_consecutive_test_failures', '.database.TEST_STATUS_FAILED'): _MODELS,
     # Decides where the pre-migration snapshot lands. Runs before any step and stamps
     # nothing into the database it is backing up.
-    ('_backup_before_migration', '.config.DEFAULT_DB_BACKUP_DIR'): _PLUMBING,
+    ('_backup_before_migration', '.config.db_backup_dir'): _PLUMBING,
     ('_backup_before_migration', '.config.ensure_private_dir'): _PLUMBING,
+    ('_backup_before_migration', '.config.legacy_app_root_db_backup_dir'): _PLUMBING,
     ('_backup_before_migration', '.config.resolve_app_path'): _PLUMBING,
     ('_backup_before_migration', '.tz_utils.get_display_tz'): _PLUMBING,
 }
