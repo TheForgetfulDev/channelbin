@@ -25,6 +25,9 @@ The invariants, in the order the work happens:
       the relative line, without Recording.status moving. The status must not move: the
       startup sweep, the collision query and the cancel route all branch on it.
   (f) The Dashboard's background-task row says paused rather than naming the phase.
+  (g) The Dashboard's live ROW replaces its "Time left" cell with what it is waiting on,
+      rather than leaving a countdown that stopped moving under a WAITING badge
+      (dev/changelog/1053).
 
 Runs against a throwaway temp SQLite DB - never the live dvr.db.
   python3 -m unittest tests.test_postprocess_wait_surface
@@ -359,6 +362,77 @@ class DashboardBackgroundTaskTests(unittest.TestCase):
     def test_an_unparked_conversion_keeps_its_phase_label(self):
         tasks = self._tasks(REC_STATUS_CONVERTING, parked=False)
         self.assertEqual(['Converting'], [t['label'] for t in tasks])
+
+
+# ── (g) the Dashboard's live row cells ────────────────────────────────────────
+class DashboardRowCellTests(unittest.TestCase):
+    """The chip above said "Conversion paused" while the row's own cells two inches below
+    still counted down (dev/changelog/1053) - the one surface the WAITING rollout missed."""
+
+    def setUp(self):
+        self.t = make_test_app()
+        self.client = self.t.app.test_client()
+
+    def tearDown(self):
+        self.t.cleanup()
+
+    def _row_html(self, *, parked=True, pct=40.0, eta=720, out_size=1234567):
+        now = datetime.utcnow()
+        with self.t.app.app_context():
+            acc = make_account(name='Acct One')
+            ch = make_channel(acc, name='Channel One')
+            rec = make_recording(status=REC_STATUS_CONVERTING, name='parked show',
+                                 channel_id=ch.id, start_time=now - timedelta(minutes=70),
+                                 stop_time=now - timedelta(minutes=10),
+                                 started_at=now - timedelta(minutes=70))
+            rec.conversion_progress_pct = pct
+            rec.conversion_eta_seconds = eta
+            rec.conversion_out_size = out_size
+            if parked:
+                blocker = make_recording(status=REC_STATUS_IN_PROGRESS, name=BLOCKER)
+                db.session.commit()
+                ppmod.set_postprocess_wait(rec, blocker)
+            db.session.commit()
+            rec_id = rec.id
+        html = self.client.get('/').get_data(as_text=True)
+        start = html.index(f'id="card-{rec_id}"')
+        return html[start:html.index('</div>', start)], rec_id
+
+    def test_a_parked_row_drops_the_frozen_countdown(self):
+        row, rec_id = self._row_html()
+        self.assertNotIn('Time left', row)
+        self.assertNotIn(f'conv-eta-{rec_id}', row,
+                         'the parked cell must not carry the id dashboard.js writes an ETA '
+                         'into - the missing element is what keeps the handler out of it')
+        self.assertNotIn('12 min', row)
+
+    def test_a_parked_row_says_what_it_is_paused_at_and_waiting_on(self):
+        row, _ = self._row_html()
+        self.assertIn('Paused at', row)
+        self.assertIn('40%', row)
+        self.assertIn('Waiting on', row)
+        self.assertIn(BLOCKER, row)
+
+    def test_a_parked_row_still_reports_the_bytes_already_written(self):
+        """The encoded part is kept across the pause, so it is a fact, not a stale one."""
+        row, rec_id = self._row_html()
+        self.assertIn(f'conv-bytes-{rec_id}', row)
+        self.assertIn('1.2 MB', row)
+
+    def test_a_parked_row_sorts_on_no_remaining(self):
+        """The sort value mirrors the cell. Leaving the stored ETA in data-remaining would
+        order the Remaining column by a number that is nowhere on the row."""
+        row, _ = self._row_html()
+        self.assertIn('data-remaining=""', row)
+
+    def test_an_unparked_converting_row_still_counts_down(self):
+        row, rec_id = self._row_html(parked=False)
+        self.assertIn('Time left', row)
+        self.assertIn(f'conv-eta-{rec_id}', row)
+        self.assertIn('12 min', row)
+        self.assertIn('Complete', row)
+        self.assertNotIn('Waiting on', row)
+        self.assertIn('data-remaining="720"', row)
 
 
 if __name__ == '__main__':

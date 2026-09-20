@@ -22,16 +22,22 @@ from ..database import (
     REC_STATUS_CONCATENATING, REC_STATUS_ANALYZING, REC_STATUS_CONVERTING,
     REC_STATUS_COMPLETED, REC_STATUS_FAILED, REC_STATUS_ABORTED,
     FAILURE_ALL_SEGMENTS_PLACEHOLDER,
+    CANCEL_BEFORE_START, CANCEL_DURING_ANALYSIS, CANCEL_DURING_CONVERSION,
 )
 from ..channel_groups import (pick_best_member, recording_members,
                               format_eligible_members,
                               DEFAULT_FAILING_STREAK_THRESHOLD)
 from ..health_score import dismiss_recording_failing_alerts, evaluate_and_alert_recording
+from ..metadata_sidecar import globally_enabled
+from ..recording_metadata import (
+    EDITABLE_FIELDS, MAX_LENGTHS, UNSET, apply_user_edit, validate_edit,
+)
 from ..db_utils import retry_on_locked
 from ..scheduler import schedule_recording, unschedule_recording
 from ..recorder import (
     abort_recording, get_state, stop_recording, pause_recording, resume_recording,
-    get_live_segment_path, recording_disk_paths, delete_files, end_slot_wait,
+    get_live_segment_path, recording_disk_paths, recording_image_paths, delete_files, end_slot_wait,
+    finished_image_dirs, finished_image_path,
 )
 from ..tz_utils import parse_local_to_utc, local_input_value, format_local
 from ..accounts import normalize_url, normalize_url_loose
@@ -710,7 +716,7 @@ def _channel_initials(name):
     return (letters[:3] or '?').upper()
 
 
-def _index_row(rec, now, tz, thumb_ids):
+def _index_row(rec, now, tz, thumb_ids, live_seg_bytes=0):
     from ..tz_utils import UTC
     from ..concatenator import concat_progress
     from ..postprocessor import analysis_progress
@@ -839,8 +845,11 @@ def _index_row(rec, now, tz, thumb_ids):
             dur_tip = (f'Partial - {fmt_utils.fmt_duration(dur_secs)} captured of '
                        f'{fmt_utils.fmt_duration(sched_secs)} scheduled.')
 
-    # size: final file once it exists, else data written to segments so far
-    size_bytes = rec.final_file_size or sum(s.bytes_recorded or 0 for s in data_segs) or None
+    # size: final file once it exists, else data written to segments so far. The open
+    # segment has no bytes_recorded until it ends, so a caller that stat'ed it passes the
+    # live size in; the list page does not, since that would be disk I/O per row.
+    size_bytes = (rec.final_file_size
+                  or sum(s.bytes_recorded or 0 for s in data_segs) + live_seg_bytes or None)
     rate = None
     if size_bytes and dur_secs and dur_secs > 60:
         rate = f'{size_bytes * 8 / dur_secs / 1e6:.1f} Mb/s'
@@ -999,15 +1008,18 @@ def index():
                            joinedload(Recording.channel).joinedload(Channel.account))
                   .order_by(Recording.start_time.desc()).all())
 
-    # persisted screenshots: one directory listing, never a per-row stat
+    # persisted images: one directory listing PER FOLDER, never a per-row stat. Either
+    # folder alone answers the question a row asks - "is there an image to show" - because
+    # finished_image_path() falls back to whichever one exists (dev/changelog/1060).
     thumb_ids = set()
-    try:
-        for fn in os.listdir(image_dir(load_config(), THUMBNAILS)):
-            stem, ext = os.path.splitext(fn)
-            if ext == '.jpg' and stem.isdigit():
-                thumb_ids.add(int(stem))
-    except OSError:
-        pass  # thumbnail dir missing/unreadable -> rows just show placeholders
+    for folder in finished_image_dirs(load_config()):
+        try:
+            for fn in os.listdir(folder):
+                stem, ext = os.path.splitext(fn)
+                if ext == '.jpg' and stem.isdigit():
+                    thumb_ids.add(int(stem))
+        except OSError:
+            pass  # image dir missing/unreadable -> those rows just show placeholders
 
     now = datetime.utcnow()
     tz = get_display_tz()
@@ -1133,18 +1145,25 @@ def recording_detail(recording_id):
         s.file_path and os.path.exists(s.file_path) and os.path.getsize(s.file_path) > 0
         for s in rec.segments
     )
-    # The one answer to "what recovers this FAILED recording", read by the header, the mobile
-    # action bar and the status strip alike. Placeholder segments are on disk but a Retry join
-    # refuses them again for the same reason, so they recover nothing (dev/changelog/990).
+    # The one answer to "what recovers this finished-badly recording", read by the header, the
+    # mobile action bar and the status strip alike. Placeholder segments are on disk but a Retry
+    # join refuses them again for the same reason, so they recover nothing (dev/changelog/990).
+    #
+    # ABORTED gets only the conversion half, and that asymmetry is what the routes actually
+    # accept rather than a judgment call: retry_convert takes a cancelled row (the two cancels
+    # that keep the joined .ts exist so it can), while retry_concat refuses anything but FAILED
+    # or a stranded JOINING. Offering Retry join on a cancelled row would name a control that
+    # bounces the click straight back with an error (dev/changelog/1054).
     recover_act = None
     if rec.status == REC_STATUS_FAILED:
         if ts_source_available:
             recover_act = 'retry-convert'
         elif segment_files_on_disk and rec.failure_reason != FAILURE_ALL_SEGMENTS_PLACEHOLDER:
             recover_act = 'retry-concat'
+    elif rec.status == REC_STATUS_ABORTED and ts_source_available:
+        recover_act = 'retry-convert'
     cfg = load_config()
     thumb_cfg = cfg.get('recording', {}).get('live_thumbnail', {})
-    thumb_dir = image_dir(cfg, THUMBNAILS)
 
     # "Find another airing" prefill: stored program title snapshot, else a live EPG
     # lookup by (channel, program air time) for pre-snapshot recordings whose entry
@@ -1179,14 +1198,17 @@ def recording_detail(recording_id):
 
     from ..tz_utils import get_display_tz
     now = datetime.utcnow()
-    thumb_path = os.path.join(thumb_dir, f'{rec.id}.jpg')
+    # Whichever image this recording actually shows - the poster frame or the final-frame
+    # thumbnail, per the setting (dev/changelog/1060). Resolved through the one helper the
+    # serving route uses, so the page cannot claim an image the route then 404s.
     # SCHEDULED excluded for the same reason as the list row's has_thumb: a file
     # at a not-yet-started recording's path belongs to a deleted, id-reused row.
-    has_shot = rec.status == REC_STATUS_IN_PROGRESS or (
-        rec.status != REC_STATUS_SCHEDULED and os.path.exists(thumb_path))
+    shot_path = (finished_image_path(rec.id, cfg)
+                 if rec.status not in (REC_STATUS_SCHEDULED, REC_STATUS_IN_PROGRESS) else None)
+    has_shot = rec.status == REC_STATUS_IN_PROGRESS or shot_path is not None
     shot_mtime = None
-    if has_shot and rec.status != REC_STATUS_IN_PROGRESS and os.path.exists(thumb_path):
-        shot_mtime = datetime.utcfromtimestamp(os.path.getmtime(thumb_path))
+    if shot_path:
+        shot_mtime = datetime.utcfromtimestamp(os.path.getmtime(shot_path))
     # 1-based segment display: new recordings' rows are already 1-based; legacy
     # 0-based recordings get +1 applied to every displayed number (files keep
     # their names in the path column) - DESIGN.md section 5
@@ -1206,7 +1228,19 @@ def recording_detail(recording_id):
     distinct_accounts = _distinct_accounts(rec, seg_channels)
     event_channel_links = group_event_channel_links(rec.events)
     video, audio, tech_source = _tech_parts(rec)
-    row = _index_row(rec, now, get_display_tz(), {rec.id} if has_shot else set())
+    # The open segment's bytes_recorded is only written when it ends, so its row, the Size
+    # stat and the banner would disagree for the whole segment. The banner's number is this
+    # same file's size (watchdog._publish_snapshot); one stat for the one open segment.
+    live_seg = rec.active_segment if is_active else None
+    live_seg_id, live_seg_bytes = None, 0
+    if live_seg is not None and live_seg.file_path:
+        live_seg_id = live_seg.id
+        try:
+            live_seg_bytes = os.path.getsize(live_seg.file_path)
+        except OSError:  # ffmpeg has not created the file yet
+            live_seg_bytes = 0
+    row = _index_row(rec, now, get_display_tz(), {rec.id} if has_shot else set(),
+                     live_seg_bytes=live_seg_bytes)
     concat_prog, joinable_count = _join_strip_context(rec)
     # None for every status but ANALYZING, and also for an ANALYZING row whose passes are
     # done or have not started - the strip's generic wording covers that, per
@@ -1230,6 +1264,7 @@ def recording_detail(recording_id):
         row=row, video=video, audio=audio, tech_source=tech_source, fmt=_format_profile(rec),
         seg_offset=seg_offset, seg_stderr=seg_stderr, seg_channels=seg_channels,
         fast_delivery_segs=fast_delivery_segs,
+        live_seg_id=live_seg_id, live_seg_bytes=live_seg_bytes,
         distinct_accounts=distinct_accounts,
         event_channel_links=event_channel_links,
         shot_mtime=shot_mtime, has_shot=has_shot,
@@ -1237,15 +1272,153 @@ def recording_detail(recording_id):
         thumb_enabled=thumb_cfg.get('enabled', True),
         thumb_auto_refresh_seconds=thumb_cfg.get('auto_refresh_seconds', 60),
         find_airing_url=find_airing_url,
+        meta_panel=_metadata_panel(rec, cfg),
         profiles=profiles,  # _record_modal.html + GUIDE_CONFIG.profiles expect this name
     )
 
 
+#: Where a recording is in its life, for copy that has to be honest about what a save will
+#: actually do. 'before' is the only phase where the record-start refresh is still ahead of
+#: the user, and 'after' is the only one where a sidecar may already be on disk.
+def _metadata_phase(rec):
+    if rec.status == REC_STATUS_SCHEDULED:
+        return 'before'
+    if rec.status in (REC_STATUS_COMPLETED, REC_STATUS_FAILED, REC_STATUS_ABORTED):
+        return 'after'
+    return 'during'
+
+
+def _metadata_panel(rec, cfg):
+    """Everything the Program card shows and the edit modal opens with.
+
+    Rendered into the card as one `data-meta` payload rather than served by a GET endpoint,
+    for two reasons. The card is in the detail page's 15-second `swapFromServer` list, so a
+    payload carried ON the card stays fresh through every swap while one baked into the
+    page's script block would go stale. And a new non-`/api/` GET rule would owe a
+    `tests/test_scaling_pages.py` decision, for a route that is a single row by construction
+    (dev/changelog/1058).
+
+    One row, no loop, and one `stat()` for the whole page - nothing here scales with row
+    count.
+    """
+    from ..metadata_sidecar import (
+        derived_title, globally_enabled, sidecar_paths, sidecar_source,
+    )
+
+    level, effective = sidecar_source(cfg, rec.profile, rec)
+    nfo_path = sidecar_paths(rec.output_path)[0] if rec.output_path else None
+    return {
+        'recording_id': rec.id,
+        'title': rec.metadata_title,          # None means "derive it"
+        'derived_title': derived_title(rec),
+        'description': rec.metadata_description,
+        'category': rec.metadata_category,
+        'rating': rec.metadata_rating,
+        'locked': bool(rec.metadata_locked),
+        'sidecar_enabled': rec.metadata_sidecar_enabled,   # tri-state: None = inherit
+        'sidecar_effective': effective,
+        'sidecar_level': level,
+        # The global switch decides whether the feature's UI exists at all; the resolved
+        # answer above decides whether a file gets written. Two different questions, and
+        # hiding the per-recording control whenever the resolved answer is Off would leave
+        # a recording that had been switched off with no way to switch it back on.
+        'sidecar_global': globally_enabled(cfg),
+        'profile_name': rec.profile.name if rec.profile else None,
+        'nfo_name': os.path.basename(nfo_path) if nfo_path else None,
+        'nfo_exists': bool(nfo_path and os.path.exists(nfo_path)),
+        'phase': _metadata_phase(rec),
+        'limits': dict(MAX_LENGTHS),
+    }
+
+
+@recordings_bp.route('/recordings/<int:recording_id>/metadata-json', methods=['POST'])
+def save_recording_metadata(recording_id):
+    """Save what this recording says about itself, and rewrite its sidecar if it has one.
+
+    POST only. The read half is rendered into the page (see `_metadata_panel`), so there is
+    no GET rule here to keep in step with it.
+
+    Three things happen in a fixed order, and the order is the point. The columns move and
+    their event is written inside ONE `retry_on_locked` closure, because a rolled-back
+    session expires the row and a retry that re-ran only `commit()` would persist nothing.
+    The sidecar is rewritten AFTER that closure returns, because writing a file is exactly
+    the non-idempotent side effect the retry rule says may not sit inside one. And the
+    sidecar's own event commits separately, in `write_sidecar`, which is why it cannot share
+    the closure above - two commits under one decorator is how a retry duplicates a row.
+    """
+    rec = db.session.get(Recording, recording_id)
+    if rec is None:
+        return jsonify({'error': 'Recording not found'}), 404
+
+    data = request.get_json(silent=True) or {}
+    cfg = load_config()
+
+    values = {col: data[col] for col, _label in EDITABLE_FIELDS if col in data}
+    problem = validate_edit(values)
+    if problem:
+        return jsonify({'error': problem}), 400
+
+    lock = data.get('locked', UNSET)
+    if lock is not UNSET and not isinstance(lock, bool):
+        return jsonify({'error': 'The lock must be true or false.'}), 400
+
+    sidecar = data.get('sidecar_enabled', UNSET)
+    if sidecar is not UNSET and sidecar is not None and not isinstance(sidecar, bool):
+        return jsonify(
+            {'error': 'The metadata file switch must be true, false, or null to follow '
+                      'the profile.'}), 400
+    # The UI hides this control when the feature is off globally. That is presentation, and
+    # presentation is never the gate - a payload that skipped the form gets the same answer
+    # here (CLAUDE.md, "enforcement lives server-side").
+    if sidecar is not UNSET and not globally_enabled(cfg):
+        return jsonify(
+            {'error': 'Metadata files for media servers are turned off in Settings, so '
+                      'there is nothing to override for this recording.'}), 400
+
+    @retry_on_locked()
+    def _save_and_commit():
+        r = db.session.get(Recording, recording_id)
+        if r is None:
+            return None
+        changes = apply_user_edit(r, values, lock=lock, sidecar_enabled=sidecar)
+        if changes:
+            db.session.commit()
+        return changes
+
+    changed = _save_and_commit()
+    if changed is None:
+        return jsonify({'error': 'Recording not found'}), 404
+
+    # Rewrite the file on disk when there already is one, so a correction shows up in the
+    # library rather than only in this app. Skipped when nothing moved, when the recording
+    # has not finished, or when its video is gone - a sidecar describing a file that is no
+    # longer there is worse than none, since a media server would read it onto whatever
+    # else it matches.
+    rewrote = False
+    if (changed and _metadata_phase(rec) == 'after' and rec.output_path
+            and os.path.exists(rec.output_path)):
+        from ..metadata_sidecar import write_sidecar
+        rewrote = write_sidecar(recording_id, rec.output_path, cfg)
+
+    db.session.expire_all()
+    rec = db.session.get(Recording, recording_id)
+    return jsonify({
+        'success': True,
+        'changed': changed,
+        'sidecar_rewritten': rewrote,
+        'meta': _metadata_panel(rec, cfg),
+    })
+
+
 @recordings_bp.route('/recordings/<int:recording_id>/live-thumbnail.jpg')
 def live_thumbnail(recording_id):
-    """Recording screenshot: regenerated from the live segment while IN_PROGRESS;
-    for finished recordings, serves the final frame persisted at capture end
-    (recorder.persist_final_thumbnail) if one exists."""
+    """Recording screenshot: regenerated from the live segment while IN_PROGRESS; for a
+    finished recording, whichever of its two persisted images the
+    recording.live_thumbnail.finished_image setting names - the poster frame taken from
+    inside the program (recorder.persist_poster_frame) or the final frame captured at
+    capture end (recorder.persist_final_thumbnail). The path stays live-thumbnail.jpg
+    because every page already links it and the file it serves is the page's business,
+    not the URL's."""
     rec = db.session.get(Recording, recording_id)
     if rec is None:
         abort(404)
@@ -1259,10 +1432,11 @@ def live_thumbnail(recording_id):
     thumb_path = os.path.join(thumb_dir, f'{recording_id}.jpg')
 
     if rec.status != REC_STATUS_IN_PROGRESS:
-        if not os.path.exists(thumb_path):
+        finished_path = finished_image_path(recording_id, cfg)
+        if finished_path is None:
             abort(404)
-        resp = send_file(thumb_path, mimetype='image/jpeg')
-        resp.headers['X-Thumb-Captured-At'] = str(int(os.path.getmtime(thumb_path)))
+        resp = send_file(finished_path, mimetype='image/jpeg')
+        resp.headers['X-Thumb-Captured-At'] = str(int(os.path.getmtime(finished_path)))
         return resp
     # Must keep a .jpg extension - ffmpeg infers the output muxer from the
     # filename extension, so a plain ".tmp" suffix fails with "Unable to
@@ -1343,6 +1517,7 @@ def _cancel_analysis(recording_id, rec):
             recording_id, RECORDING_ABORTED,
             detail='Cancelled during post-capture analysis - the recorded .ts file is kept.')
         r.status = REC_STATUS_ABORTED
+        r.cancel_reason = CANCEL_DURING_ANALYSIS
         r.completed_at = datetime.utcnow()
         db.session.commit()
 
@@ -1375,6 +1550,7 @@ def cancel_recording(recording_id):
             r = db.session.get(Recording, recording_id)
             add_recording_event(recording_id, RECORDING_ABORTED, detail='Recording cancelled while scheduled')
             r.status = REC_STATUS_ABORTED
+            r.cancel_reason = CANCEL_BEFORE_START
             r.completed_at = datetime.utcnow()
             db.session.commit()
 
@@ -1594,7 +1770,8 @@ def delete_recording(recording_id):
     # Collect file paths before the row is gone; unlink only after the delete
     # durably commits (file removal is a non-idempotent side effect - keep it
     # out of the retry_on_locked closure per CLAUDE.md).
-    paths = recording_disk_paths(recording_id) if remove_files else []
+    paths = (recording_disk_paths(recording_id) if remove_files
+             else recording_image_paths(recording_id))
     from ..scheduler import unschedule_recording
     unschedule_recording(recording_id)
 
@@ -1699,9 +1876,16 @@ def new_recording_json():
     # into plain local variables (not an ORM object reference) before the
     # write closure below, so nothing here is affected by a rollback+retry
     # inside that closure.
+    #
+    # The same read also seeds the metadata_* family - the program's synopsis, genre and
+    # rating. Those are NOT an immutable snapshot: recorder.start_recording() refreshes
+    # them from the program's listing as it stands at air time. Seeding them here anyway
+    # is what makes the data survive at all, because epg_keep_days prunes the listing a
+    # day after it airs and nothing can recover it afterwards (dev/changelog/1055).
     source_epg_id_raw = request.form.get('source_epg_id', '').strip()
     program_start_time = program_stop_time = None
     program_title = program_sub_title = None
+    metadata_description = metadata_category = metadata_rating = None
     if source_epg_id_raw.isdigit():
         entry = db.session.get(EPGEntry, int(source_epg_id_raw))
         if entry is not None:
@@ -1709,6 +1893,9 @@ def new_recording_json():
             program_stop_time = entry.stop_time
             program_title = entry.title
             program_sub_title = entry.sub_title
+            metadata_description = entry.description
+            metadata_category = entry.category
+            metadata_rating = entry.rating
 
     # Each step below is its own retry unit rather than the whole route, so a
     # retried second commit can never re-run db.session.add(rec) and create a
@@ -1727,6 +1914,9 @@ def new_recording_json():
             program_stop_time=program_stop_time,
             program_title=program_title,
             program_sub_title=program_sub_title,
+            metadata_description=metadata_description,
+            metadata_category=metadata_category,
+            metadata_rating=metadata_rating,
             status=REC_STATUS_SCHEDULED,
             channel_id=channel_id,
             group_id=group_id,
@@ -1918,7 +2108,8 @@ def delete_recording_json(recording_id):
 
     name = rec.name
     remove_files = _wants_file_deletion(request.get_json(silent=True) or {})
-    paths = recording_disk_paths(recording_id) if remove_files else []
+    paths = (recording_disk_paths(recording_id) if remove_files
+             else recording_image_paths(recording_id))
     _unschedule_and_delete_row(recording_id)
     removed = delete_files(paths)
     _log_recording_deleted(recording_id, name, remove_files, removed)
@@ -2025,7 +2216,10 @@ def retry_convert(recording_id):
         r = db.session.get(Recording, recording_id)
         r.status = REC_STATUS_ANALYZING
         r.conversion_attempts = 0
+        # Both hold a value only while the row is terminal, and this one accepts an ABORTED
+        # row as well as a FAILED one; the next terminal writer names its own.
         r.failure_reason = None
+        r.cancel_reason = None
         db.session.commit()
 
     _mark_analyzing_and_commit()
@@ -2082,6 +2276,7 @@ def _cancel_conversion(recording_id, rec):
     def _mark_cancelled():
         r = db.session.get(Recording, recording_id)
         r.status = REC_STATUS_ABORTED
+        r.cancel_reason = CANCEL_DURING_CONVERSION
         r.completed_at = datetime.utcnow()
         # This branch is the one with no live chain behind it, so nothing else will ever
         # clear a wait the stranded row is carrying - and a finished recording that

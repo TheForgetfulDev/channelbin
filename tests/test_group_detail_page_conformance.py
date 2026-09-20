@@ -851,6 +851,24 @@ class WarningMuteTests(unittest.TestCase):
         with self.app.app_context():
             self.assertIsNone(db.session.get(ChannelGroup, self.gid))
 
+    def test_the_unmonitored_banner_is_mutable_too(self):
+        """§16.2 held this one back until dev/changelog/1048, on the reasoning that nobody
+        chooses to leave members unmonitored. Leaving them off every recurring check is a
+        setup a user can choose deliberately, so it takes the same Hide as the other
+        three."""
+        from app.database import GROUP_WARNING_MUTED
+        r = self._post({'unmonitored': False})
+        self.assertEqual(r.status_code, 200, r.get_data(as_text=True))
+        self.assertEqual(r.get_json()['muted'], ['unmonitored'])
+        self.assertEqual(self._muted(), ['unmonitored'])
+        with self.app.app_context():
+            ev = (ChannelGroupEvent.query
+                  .filter_by(group_id=self.gid, event_type=GROUP_WARNING_MUTED)
+                  .order_by(ChannelGroupEvent.id.desc()).first())
+        self.assertIn('health check', ev.detail,
+                      'the timeline names which warning went quiet, not just that one did')
+        self.assertEqual(self._post({'unmonitored': True}).get_json()['muted'], [])
+
     def test_the_system_group_has_nothing_to_hide(self):
         from app.database import ChannelGroup
         with self.app.app_context():
@@ -1113,6 +1131,36 @@ class GuideInvariantPageTests(unittest.TestCase):
         js = _read('static/js/group-detail.js')
         self.assertIn("set('gd-unmonitored-banner'", js)
         self.assertIn('WARN.unmonitored_count', js)
+
+    def test_the_unmonitored_banner_carries_the_same_hide_as_the_other_three(self):
+        """dev/changelog/1048: hidden per group like the mixed-format, EPG and override
+        banners, through the one muteBtn() rather than a control of its own."""
+        js = _read('static/js/group-detail.js')
+        banners = js[js.index('function renderBanners()'):js.index('function reviewMembers(')]
+        unmon = banners[banners.index('const un = WARN.unmonitored_count'):
+                        banners.index("set('gd-unmonitored-banner'")]
+        self.assertIn("!muted.has('unmonitored')", unmon,
+                      'hiding it has to actually suppress the banner')
+        self.assertIn("muteBtn('unmonitored'", unmon)
+
+    def test_the_no_winner_banner_did_not_move_with_it(self):
+        """The other banner §16.2 holds back. It names a reason the group cannot produce
+        the file its settings promise, which nobody chose and nobody may hide."""
+        js = _read('static/js/group-detail.js')
+        banners = js[js.index('function renderBanners()'):js.index('function reviewMembers(')]
+        nowinner = banners[banners.index('if (WARN.no_winner)'):
+                           banners.index("const nw = byId('gd-nowinner-banner')")]
+        self.assertNotIn('muteBtn(', nowinner)
+
+    def test_every_mutable_kind_has_a_settings_row(self):
+        """Settings > Warnings is the only way back from a Hide, so a kind the banners can
+        mute and this block does not list would be a one-way door. The tuple is the
+        authority; WARN_SETTINGS is the copy."""
+        from app.database import GROUP_WARNING_KINDS
+        js = _read('static/js/group-detail.js')
+        block = js[js.index('const WARN_SETTINGS = ['):js.index('function muteBtn(')]
+        for kind in GROUP_WARNING_KINDS:
+            self.assertIn(f"['{kind}',", block, f'{kind} cannot be turned back on')
 
     def test_the_clone_screen_never_offers_the_guide(self):
         """A copy's members take the model defaults, so Recording is off on every one of

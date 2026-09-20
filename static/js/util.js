@@ -1160,6 +1160,14 @@ function testStatusLabel(t) {
   return 'FAIL';
 }
 
+// The provider-removed badge for a row carrying the server's `lifecycle`/`lifecycle_date`
+// pair (app/accounts.py::lifecycle_states_for_channels). '' for any other state, so a caller
+// can concatenate it unconditionally.
+function missingBadge(r) {
+  if (r.lifecycle !== 'missing') return '';
+  return `<span class="badge b-warn tip-plain" data-tip="Missing.&#10;No longer seen in ${escHtml(r.account_name || 'this account')}'s synced feed since ${escHtml(r.lifecycle_date)}.">Missing ${escHtml(r.lifecycle_date)}</span>`;
+}
+
 // Scroll-lock backstop, registered LAST on purpose: every other listener in this file has
 // already run by the time these fire, so the DOM they read reflects the close that just
 // happened. A surface whose own open/close path forgets to call syncScrollLock therefore

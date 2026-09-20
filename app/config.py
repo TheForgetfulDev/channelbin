@@ -6,6 +6,7 @@ import re
 import shutil
 import tempfile
 import threading
+import yaml as pyyaml
 from ruamel.yaml import YAML
 from ruamel.yaml.comments import CommentedMap
 from ruamel.yaml.error import YAMLError
@@ -237,11 +238,36 @@ _DEFAULTS = {
             'path': '',
             'timeout_seconds': 300,
         },
+        # The .nfo file and poster written beside a finished recording so Plex, Jellyfin,
+        # Emby and Kodi can describe it from local disk instead of parsing the filename
+        # (app/metadata_sidecar.py, dev/changelog/1057). Off by default: it writes files
+        # into the user's library folder, which nobody who did not ask for it should find
+        # there. Overridable per recording profile via
+        # RecordingProfile.metadata_sidecar_enabled.
+        'metadata_sidecar': {
+            'enabled': False,
+        },
+        # Every image ChannelBin keeps OF a recording, not only the live one: the block
+        # also governs the final-frame thumbnail and the poster frame below. Named for the
+        # first of the three and left that way deliberately - renaming a config block costs
+        # every install a migration to answer a question nobody asked.
         'live_thumbnail': {
             'enabled': True,
             'min_regen_interval_seconds': 10,
             'capture_timeout_seconds': 12,
             'auto_refresh_seconds': 60,   # frontend polling cadence; user-configurable in Settings
+            # How far after the program's OWN start time the poster frame is taken
+            # (dev/changelog/1060). Anchored there rather than on the recording's start so
+            # front padding does not put a countdown clock or the previous show on the
+            # cover. 0 means the program's first moment.
+            'poster_frame_offset_seconds': 60,
+            # Which of the two images a FINISHED recording shows: 'poster' (the frame from
+            # inside the program) or 'last_frame' (the final-frame thumbnail). Either way
+            # the other one is served when the chosen one does not exist, so a recording
+            # made before this shipped still shows something. An IN_PROGRESS recording is
+            # not covered - it has no poster frame yet and its thumbnail is regenerated
+            # live, which is the whole point of that one.
+            'finished_image': 'poster',
         },
         # Local caching of Channel.logo_url images instead of hotlinking the provider/CDN
         # on every page view (dev/changelog/601).
@@ -559,6 +585,11 @@ _DEFAULTS = {
         # this bounds how stale the cached numbers can get from any of them
         # (dev/changelog/598). 300s (5 minutes), deliberately chosen. Exposed in Settings.
         'standing_breakdown_cache_ttl_seconds': 300,
+        # Rows per page the channel search PAGE opens with when its URL names none. One of
+        # channel_search.PAGE_SIZE_OPTIONS. Never read by the engine: a request with no
+        # `per_page` still means DEFAULT_PAGE_SIZE, so a stored link keeps meaning what it
+        # meant (dev/changelog/1043).
+        'page_size': 100,
         # Budget for an OPTIONAL aggregate - the totals and the facet rail - while search is
         # running unindexed. Rows are never optional and never use this; they keep
         # `degraded_timeout_seconds` above.
@@ -793,7 +824,9 @@ _DEFAULTS = {
 # Filesystem paths derived from config values. Config paths may be written relative
 # (the backup-dir defaults above are), and the app's CWD is not guaranteed - systemd,
 # a Docker ENTRYPOINT and a shell all start it differently - so a relative value must
-# be anchored to the app root rather than resolved by the process CWD.
+# be anchored to something fixed rather than resolved by the process CWD. That anchor is
+# the app root for everything except the pre-migration DB snapshots, which anchor to the
+# database they belong to instead - see db_backup_dir().
 # ---------------------------------------------------------------------------
 
 def resolve_app_path(path: str) -> str:
@@ -802,6 +835,40 @@ def resolve_app_path(path: str) -> str:
     if not path:
         return path
     return path if os.path.isabs(path) else os.path.join(_APP_ROOT, path)
+
+
+def db_backup_dir(cfg: dict) -> str:
+    """The one reader of database.backup_dir - where pre-migration DB snapshots live.
+
+    A relative value is anchored to the directory holding database.path, NOT to the app
+    root, so the snapshots belong to the database being migrated. The two are the same
+    directory in a default install and in the real one (dvr.db sits at the app root), and
+    a configured absolute path is never rewritten - so this moves nobody's existing
+    backups. What it closes is an app pointed at some other database: with an app-root
+    anchor, a scratch app or a test that overrode only database.path still deposited its
+    snapshot into the running install's folder and then pruned that folder to
+    migration_backups_keep, evicting the real ones. Snapshots are the whole rollback story
+    (no down-migrations), so the eviction, not the clutter, is the damage
+    (dev/changelog/1052).
+    """
+    db_cfg = cfg.get('database', {}) or {}
+    configured = db_cfg.get('backup_dir') or DEFAULT_DB_BACKUP_DIR
+    if os.path.isabs(configured):
+        return configured
+    db_path = resolve_app_path(db_cfg.get('path') or _DEFAULTS['database']['path'])
+    return os.path.join(os.path.dirname(db_path), configured)
+
+
+def legacy_app_root_db_backup_dir(cfg: dict) -> str:
+    """Where db_backup_dir() would have pointed before the anchor moved, or '' when the
+    two agree. Only a relocated database with a relative backup_dir can differ, and such
+    an install's older snapshots are still sitting in the returned directory - unpruned
+    and unreferenced - so the migration path names it once rather than leaving the move
+    to be discovered."""
+    current = db_backup_dir(cfg)
+    db_cfg = cfg.get('database', {}) or {}
+    legacy = resolve_app_path(db_cfg.get('backup_dir') or DEFAULT_DB_BACKUP_DIR)
+    return '' if os.path.abspath(legacy) == os.path.abspath(current) else legacy
 
 
 def ensure_private_dir(path: str) -> str:
@@ -892,6 +959,122 @@ def default_display(path: str) -> str:
     if isinstance(value, list):
         return ', '.join(str(v) for v in value)
     return str(value)
+
+
+# ---------------------------------------------------------------------------
+# The raw config.yaml editor's checks. One parse, shared by its Validate button and its
+# Save, so the two can never disagree about the same text (dev/changelog/1044).
+# ---------------------------------------------------------------------------
+
+# Sections keyed by names ChannelBin does not fix in advance (an alert type per routing
+# row), so a key missing from _DEFAULTS there is not a typo.
+_OPEN_CONFIG_MAPS = frozenset({'notifications.routing'})
+
+
+def _config_problem(severity, message, path=None, line=None):
+    return {'severity': severity, 'path': path, 'line': line, 'message': message}
+
+
+def _type_word(value):
+    if isinstance(value, bool):
+        return 'true/false'
+    if isinstance(value, (int, float)):
+        return 'a number'
+    if isinstance(value, str):
+        return 'text'
+    if isinstance(value, list):
+        return 'a list'
+    if isinstance(value, dict):
+        return 'a section'
+    return type(value).__name__
+
+
+def _types_agree(default, value):
+    if isinstance(default, bool) or isinstance(value, bool):
+        return isinstance(default, bool) and isinstance(value, bool)
+    if isinstance(default, (int, float)):
+        return isinstance(value, (int, float))
+    return isinstance(value, type(default))
+
+
+def _key_lines(node, prefix='', lines=None, dupes=None):
+    """{dot.path: 1-based line} for every mapping key in a composed PyYAML node tree, plus
+    the paths written more than once (PyYAML keeps the last and says nothing)."""
+    if lines is None:
+        lines, dupes = {}, []
+    if isinstance(node, pyyaml.MappingNode):
+        for key_node, value_node in node.value:
+            path = f'{prefix}.{key_node.value}' if prefix else str(key_node.value)
+            if path in lines:
+                dupes.append((path, key_node.start_mark.line + 1))
+            lines[path] = key_node.start_mark.line + 1
+            _key_lines(value_node, path, lines, dupes)
+    return lines, dupes
+
+
+def _check_against_defaults(data, defaults, prefix, lines, problems):
+    for key, value in data.items():
+        path = f'{prefix}.{key}' if prefix else str(key)
+        line = lines.get(path)
+        if key not in defaults:
+            if prefix not in _OPEN_CONFIG_MAPS:
+                problems.append(_config_problem(
+                    'warning', 'Not a setting ChannelBin reads - it is kept but ignored.',
+                    path, line))
+            continue
+        default = defaults[key]
+        if value is None:
+            continue  # "use the default" for a section, a real choice for a leaf (_deep_merge)
+        if isinstance(default, dict):
+            if not isinstance(value, dict):
+                problems.append(_config_problem(
+                    'error', f'This is a section of settings, so it cannot be '
+                    f'{_type_word(value)}. Saving it would stop every page from loading.',
+                    path, line))
+                continue
+            _check_against_defaults(value, default, path, lines, problems)
+        elif default is not None and not _types_agree(default, value):
+            hint = (' Put it in quotes - YAML reads an unquoted 1:30 as a number.'
+                    if isinstance(default, str) and isinstance(value, (int, float)) else '')
+            problems.append(_config_problem(
+                'error', f'Should be {_type_word(default)}, not {_type_word(value)}.{hint}',
+                path, line))
+
+
+def check_config_text(text):
+    """Parse the raw editor's text the way its Save does and say what is wrong with it.
+
+    Returns `(data, problems)`: `data` is the parsed mapping (None when it does not parse
+    into one), `problems` a list of {severity, path, line, message}. An `error` means Save
+    refuses the text; a `warning` is said and saved anyway.
+
+    A parse error reports PyYAML's line, column and problem, never its source snippet: the
+    snippet is the offending line verbatim, and that line may hold a secret the user typed.
+    Only shape and type are judged here - checks that need another module (the test window,
+    health bands) live beside the route that calls this."""
+    try:
+        data = pyyaml.safe_load(text)
+        root = pyyaml.compose(text)
+    except pyyaml.MarkedYAMLError as exc:
+        mark = exc.problem_mark or exc.context_mark
+        context = exc.context or ''
+        if context and exc.context_mark and mark and exc.context_mark.line != mark.line:
+            context += f' that starts on line {exc.context_mark.line + 1}'
+        message = '; '.join(part for part in (context, exc.problem) if part)
+        column = f', column {mark.column + 1}' if mark else ''
+        return None, [_config_problem(
+            'error', f'Not valid YAML{column}: {message or "could not be parsed"}.',
+            line=mark.line + 1 if mark else None)]
+    except pyyaml.YAMLError as exc:
+        return None, [_config_problem('error', f'Not valid YAML ({type(exc).__name__}).')]
+    if not isinstance(data, dict):
+        return None, [_config_problem(
+            'error', 'config.yaml must be a set of "name: value" settings at the top level.')]
+    lines, dupes = _key_lines(root)
+    problems = [_config_problem('warning', 'Written more than once - only the last one counts.',
+                                path, line) for path, line in dupes]
+    _check_against_defaults(data, _DEFAULTS, '', lines, problems)
+    return data, problems
 
 
 def set_nested(d: dict, path: str, value):

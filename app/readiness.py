@@ -138,8 +138,14 @@ IGNORED_PREF_KEY = 'readiness_ignored'
 #: capability's reason sentence - a `label` is the check's own claim ("The recording folder
 #: works"), which is right beside a state pill and wrong in the middle of a sentence.
 #: `without` is what stops working, and it is what the verdict's second line quotes.
-Check = namedtuple('Check', 'id area label short cost without link ignorable run note')
-Check.__new__.__defaults__ = (None, False, None, None)
+#:
+#: `advisory` means shown but never counted toward the headline or the Maintenance nav badge:
+#: its row and its capability row still carry the real state, and a green verdict names it in
+#: its second line. For a check that is a nudge rather than a claim about whether the install
+#: works - an unread error is on the Alerts page already, with its own nav badge, so a second
+#: badge for it is one alarm counted twice (dev/changelog/1039).
+Check = namedtuple('Check', 'id area label short cost without link ignorable run note advisory')
+Check.__new__.__defaults__ = (None, False, None, None, False)
 
 #: Where a check is fixed when it cannot be fixed in place. `endpoint` is resolved through
 #: url_for at evaluation time, so a renamed view function fails the test suite rather than
@@ -268,10 +274,14 @@ class Context:
         self.notify_enabled = sorted(name for name, svc in services.items()
                                      if isinstance(svc, dict) and svc.get('enabled'))
 
+        # The same filter as the Alerts page's unread count and the Alerts nav badge: an
+        # alert the user has already read is not one they can still miss, and counting it
+        # turned this card red while the Alerts page said nothing was waiting
+        # (dev/docs/BUGS.md 2026-09-19 @ 12:43:36 AM).
         rows = (db.session.query(Alert.severity, func.count(Alert.id))
-                .filter(Alert.dismissed_at.is_(None))
+                .filter(Alert.read_at.is_(None), Alert.dismissed_at.is_(None))
                 .group_by(Alert.severity).all())
-        self.open_alerts = {sev: n for sev, n in rows}
+        self.unread_alerts = {sev: n for sev, n in rows}
 
 
 def _account_name(ctx, account):
@@ -686,17 +696,20 @@ def _check_notify_delivers(ctx):
                   'Every service accepted the message: ' + ', '.join(ctx.notify_enabled), action)
 
 
-def _check_alerts_open(ctx):
-    tested = 'Counted the alerts that are open and undismissed'
-    total = sum(ctx.open_alerts.values())
-    if not total:
-        return Result(READY, tested, 'No open alerts')
-    parts = ', '.join(f'{n} {sev}' for sev, n in sorted(ctx.open_alerts.items()))
-    if ctx.open_alerts.get('CRIT') or ctx.open_alerts.get('ERROR'):
-        return Result(PROBLEM, tested, f'{total} open: {parts}')
-    if ctx.open_alerts.get('WARN'):
-        return Result(ATTENTION, tested, f'{total} open: {parts}')
-    return Result(READY, tested, f'{total} open, none above INFO: {parts}')
+def _check_alerts_unread(ctx):
+    from .routes.alerts import _RED_SEVERITIES
+    tested = 'Counted the unread errors on the Alerts page'
+    errors = sum(ctx.unread_alerts.get(sev, 0) for sev in _RED_SEVERITIES)
+    warnings = ctx.unread_alerts.get('WARN', 0)
+    if errors:
+        return Result(PROBLEM, tested,
+                      f'{errors} unread {_plural(errors, "error")} '
+                      f'{_plural(errors, "is", "are")} waiting on the Alerts page')
+    if warnings:
+        return Result(READY, tested,
+                      f'No unread errors ({warnings} unread '
+                      f'{_plural(warnings, "warning")}, which this does not count)')
+    return Result(READY, tested, 'No unread errors')
 
 
 def _url(endpoint, **values):
@@ -828,10 +841,11 @@ CHECKS = (
           'app believes it told you.',
           Link('Notifications', 'settings.notifications_settings'), True, _check_notify_delivers,
           'Sends a real message, so it never runs because you opened the page.'),
-    Check('alerts_open', 'told', 'Nothing is currently alerting', 'the open alerts', CHEAP,
-          'An alert stays open because the thing it names is still true. Readiness cannot '
-          'claim the install is fine while one is standing.',
-          Link('Alerts', 'alerts.alert_center'), True, _check_alerts_open),
+    Check('alerts_unread', 'told', 'No unread errors', 'unread errors', CHEAP,
+          'An error you have not read yet is something going wrong that you do not know '
+          'about. It is listed here so it is not missed; the Alerts badge already counts it, '
+          'so it does not add to the one beside Maintenance.',
+          Link('Alerts', 'alerts.alert_center'), True, _check_alerts_unread, None, True),
 )
 
 CHECKS_BY_ID = {c.id: c for c in CHECKS}
@@ -870,7 +884,7 @@ CAPABILITIES = (
                _cap('storage_dirs')),
     Capability('safe', 'Keep your database and your schedule intact',
                _cap('db_local', 'db_write', 'secret_key', 'auth_gate')),
-    Capability('clear', 'Be sure nothing is wrong right now', _cap('alerts_open')),
+    Capability('clear', 'Read every error the app has raised', _cap('alerts_unread')),
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -983,14 +997,16 @@ def _resolve(check, ctx, stored):
                       f'{type(exc).__name__}: {exc}'), None
 
 
-def _capability_state(cap, by_id):
+def _capability_state(cap, by_id, headline=False):
     """A capability's own state, over the checks that still count.
 
     Two calls the module docstring argues for, both applied here: an ignored check is not
     consulted at all, and NOT_RUN does not drag the capability down while UNKNOWN does.
+    `headline=True` also leaves out advisory checks, for the verdict and the nav counts; a
+    capability standing only on advisory checks then reads as CAN there.
     """
     rows = [by_id[cid] for cid in cap.needs if cid in by_id]
-    counted = [r for r in rows if not r['ignored']]
+    counted = [r for r in rows if not r['ignored'] and not (headline and r['advisory'])]
     blockers = [r for r in counted if r['status'] == PROBLEM]
     soft = [r for r in counted if r['status'] == ATTENTION]
     unsure = [r for r in counted if r['status'] == UNKNOWN]
@@ -1030,8 +1046,20 @@ def _verdict(caps, rows, counts):
     """The sentence, which is the whole point of the page.
 
     Written server-side rather than in the browser because it is the headline this feature
-    exists to produce, and a headline is worth asserting on in a test.
+    exists to produce, and a headline is worth asserting on in a test. `caps` and `counts`
+    are the headline ones, advisory checks left out; a green verdict names what an advisory
+    check found instead, so a nudge the headline does not count is still said.
     """
+    verdict = _headline(caps, rows, counts)
+    if verdict['level'] == 'ok':
+        nudges = [r['found'] for r in rows
+                  if r['advisory'] and not r['ignored'] and r['status'] in (PROBLEM, ATTENTION)]
+        if nudges:
+            verdict['sub'] += ' Also: ' + '; '.join(nudges) + '.'
+    return verdict
+
+
+def _headline(caps, rows, counts):
     blocked = [c for c in caps if c['state'] == CANNOT]
     degraded = [c for c in caps if c['state'] == DEGRADED]
     unsure = [c for c in caps if c['state'] == CAP_UNKNOWN]
@@ -1096,6 +1124,7 @@ def evaluate(ctx=None, ignored=None, pseudonymize=False) -> dict:
         action = result.action
         rows.append({
             'id': check.id,
+            'advisory': check.advisory,
             'area': check.area,
             'label': check.label,
             'short': check.short,
@@ -1118,17 +1147,18 @@ def evaluate(ctx=None, ignored=None, pseudonymize=False) -> dict:
 
     by_id = {r['id']: r for r in rows}
     caps = [_capability_state(cap, by_id) for cap in CAPABILITIES]
+    headline_caps = [_capability_state(cap, by_id, headline=True) for cap in CAPABILITIES]
     counted = [r for r in rows if not r['ignored']]
-    counts = {status: sum(1 for r in counted if r['status'] == status) for status in STATUSES}
-    counts['counted'] = len(counted)
+    counts = _status_counts(counted)
     counts['ignored'] = len(rows) - len(counted)
-    nav = nav_counts(caps)
+    nav = nav_counts(headline_caps)
     with _lock:
         _nav_cache.update({'at': datetime.utcnow(), 'value': nav})
     payload = {
         'checks': rows,
         'capabilities': caps,
-        'verdict': _verdict(caps, rows, counts),
+        'verdict': _verdict(headline_caps, rows,
+                            _status_counts([r for r in counted if not r['advisory']])),
         'counts': counts,
         'nav': nav,
         'areas': [{'id': aid, 'label': label} for aid, label in AREAS],
@@ -1136,6 +1166,12 @@ def evaluate(ctx=None, ignored=None, pseudonymize=False) -> dict:
     }
     payload['report'] = report_text(payload)
     return payload
+
+
+def _status_counts(rows):
+    counts = {status: sum(1 for r in rows if r['status'] == status) for status in STATUSES}
+    counts['counted'] = len(rows)
+    return counts
 
 
 def report_text(payload) -> str:

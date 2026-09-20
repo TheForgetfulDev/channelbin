@@ -20,6 +20,7 @@ from werkzeug.security import check_password_hash
 
 from .. import db
 from ..config import load_config
+from ..version import __version__
 from ..database import (
     Account, Recording,
     REC_STATUS_SCHEDULED, REC_STATUS_IN_PROGRESS, REC_STATUS_CONCATENATING,
@@ -129,7 +130,11 @@ def status():
         'latest': _latest_unread_alert(),
     }
 
+    # app_version is what the integration checks against its declared minimum
+    # (custom_components/channelbin/compat.py). A server that omits it predates the check
+    # and is read as too old there, so this key is never renamed or dropped.
     return jsonify({
+        'app_version': __version__,
         'recording': _recording_summary(),
         'disk': disk,
         'alerts': alerts,

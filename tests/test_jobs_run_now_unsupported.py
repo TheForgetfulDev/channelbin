@@ -20,6 +20,19 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from tests.support.app import make_test_app  # noqa: E402
 
 
+def _enable_logo_cache_job():
+    """logo_cache_fetch is registered only while recording.logo_cache.enabled is on
+    (dev/changelog/1056), and a test app's sandboxed config.yaml leaves it at its
+    shipped default of off - so the job has to be switched on deliberately for the
+    gating assertion below to still cover it rather than quietly skip it."""
+    import app.config as cfgmod
+    from app.scheduler import apply_logo_cache_schedule
+    stored = cfgmod._load_config_file() or {}
+    stored.setdefault('recording', {}).setdefault('logo_cache', {})['enabled'] = True
+    cfgmod.save_config(stored)
+    apply_logo_cache_schedule()
+
+
 class BuildJobListRunNowGatingTests(unittest.TestCase):
     """_build_job_list() must only attach run_url to jobs run_job_now() actually
     implements, and must explain itself for the rest rather than staying silent."""
@@ -31,6 +44,7 @@ class BuildJobListRunNowGatingTests(unittest.TestCase):
 
     def setUp(self):
         self.t = make_test_app(start_scheduler=True)
+        _enable_logo_cache_job()
 
     def tearDown(self):
         self.t.cleanup()

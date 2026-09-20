@@ -200,7 +200,7 @@ class SpecTests(_Base):
             'name', 'filename_template', 'pre_padding_minutes', 'post_padding_minutes',
             'stall_timeout_seconds', 'restart_delay_seconds', 'max_consecutive_failures',
             'stall_move_count', 'stall_move_window_minutes',
-            'retention_days', 'pre_check_enabled',
+            'retention_days', 'pre_check_enabled', 'metadata_sidecar_enabled',
         ]))
 
     def test_padding_fields_declare_blank_value_zero(self):

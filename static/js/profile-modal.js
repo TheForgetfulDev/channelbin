@@ -152,12 +152,107 @@ const RECORDING_PROFILE_SECTIONS = [
         inheritable: true, trueLabel: 'Enabled', falseLabel: 'Disabled',
         meta: 'Tests the channel shortly before the recording starts, so a dead feed is ' +
           'caught while there is still time to do something about it.' },
+      { key: 'metadata_sidecar_enabled', label: 'Metadata file for media servers',
+        type: 'tristate', inheritable: true, trueLabel: 'Enabled', falseLabel: 'Disabled',
+        meta: 'Saves a .nfo file and a poster beside each finished recording made with ' +
+          'this profile, so Plex, Jellyfin, Emby and Kodi show its real title, synopsis ' +
+          'and genre instead of guessing from the filename.' },
     ],
   },
 ];
 
 function pmFlatFields(sections) {
   return sections.reduce((acc, s) => acc.concat(s.fields), []);
+}
+
+/* The poster a recording profile pins (app/profile_posters.py). Deliberately NOT an entry
+   in RECORDING_PROFILE_SECTIONS: it travels as a file through /api/profiles/<id>/poster,
+   never inside the JSON body, and the row's poster columns are written by that route
+   alone. `spec` is RP_CONFIG.posterSpec - the size and the cap are stated by the server
+   so the form's copy and the upload's own check cannot name two different numbers.
+
+   pmSizeAdvice mirrors profile_posters.size_advice(): the modal says it BEFORE the upload,
+   from the picked file's own pixel size, which is the moment the user can still choose a
+   different file. Nothing is resized either way. */
+function pmSizeAdvice(width, height, spec) {
+  if (width === spec.width && height === spec.height) return null;
+  const expected = `${spec.width} x ${spec.height}`;
+  if (width * spec.height === height * spec.width) {
+    return `This image is ${width} x ${height}. It has the right 2:3 shape but is ` +
+      `${width < spec.width ? 'smaller' : 'larger'} than the ${expected} media servers ` +
+      'expect, so it will be scaled by the server.';
+  }
+  return `This image is ${width} x ${height}. Media servers expect a portrait poster of ` +
+    `${expected} (2:3), so this one will be cropped or letterboxed to fit.`;
+}
+
+function pmPosterCardHtml(src, line, advice, removable) {
+  return `<img class="pm-poster-img" src="${escHtml(src)}" alt="">` +
+    `<div class="pm-poster-meta"><div>${escHtml(line)}</div>` +
+    (advice ? `<div class="pm-poster-advice">${escHtml(advice)}</div>`
+      : '<div>Matches what media servers expect.</div>') +
+    (removable ? '<button type="button" class="btn btn-sm" data-poster-remove>Remove poster</button>' : '') +
+    '</div>';
+}
+
+function pmPosterSectionHtml(poster, spec) {
+  const current = poster
+    ? `<div class="pm-poster">${pmPosterCardHtml(poster.url,
+      `${poster.kind}, ${poster.width} x ${poster.height}`, poster.advice, true)}</div>`
+    : '<div class="pm-poster-none">No poster is pinned. Recordings made with this profile ' +
+      'get a frame captured from the recording.</div>';
+  const meta = 'Used as the cover of every recording made with this profile, in place of a ' +
+    'frame from the recording, whenever a metadata file is written for it. Needs to be ' +
+    `${spec.width} x ${spec.height} pixels (portrait, 2:3), JPG or PNG, up to ${spec.maxMb} MB. ` +
+    'It is used exactly as uploaded - nothing is resized, cropped or converted.';
+  return '<fieldset class="gd-fset"><div class="gd-fset-head">Poster image</div>' +
+    fieldRow({
+      label: 'Pinned poster', meta: escHtml(meta), stack: true,
+      control: `<div id="pm-poster-current">${current}</div>` +
+        '<input type="file" id="pm-poster-file" accept="image/jpeg,image/png">' +
+        '<div id="pm-poster-preview" class="pm-poster" hidden></div>',
+    }) +
+    '</fieldset>';
+}
+
+/* Wires the section: a picked file is previewed with its size and the advice line, an
+   oversize pick is refused here as a courtesy (the route refuses it again), and Remove
+   is deferred to Save so Cancel still cancels everything. `state` is {file, remove}. */
+function pmWirePosterSection(section, spec, state) {
+  const input = section.querySelector('#pm-poster-file');
+  const preview = section.querySelector('#pm-poster-preview');
+  const current = section.querySelector('#pm-poster-current');
+  section.addEventListener('click', (e) => {
+    if (!e.target.closest('[data-poster-remove]')) return;
+    state.remove = true;
+    current.innerHTML = '<div class="pm-poster-none">The poster will be removed when you save.</div>';
+  });
+  input.addEventListener('change', () => {
+    const file = input.files && input.files[0];
+    state.file = null;
+    preview.hidden = true;
+    preview.innerHTML = '';
+    if (!file) return;
+    if (file.size > spec.maxMb * 1024 * 1024) {
+      showToast(`That file is larger than ${spec.maxMb} MB. Nothing here resizes it.`, { type: 'error' });
+      input.value = '';
+      return;
+    }
+    const url = URL.createObjectURL(file);
+    const img = new Image();
+    img.onload = () => {
+      state.file = file;
+      preview.innerHTML = pmPosterCardHtml(url,
+        `Ready to upload: ${img.naturalWidth} x ${img.naturalHeight}`,
+        pmSizeAdvice(img.naturalWidth, img.naturalHeight, spec), false);
+      preview.hidden = false;
+    };
+    img.onerror = () => {
+      input.value = '';
+      showToast('That file could not be read as an image.', { type: 'error' });
+    };
+    img.src = url;
+  });
 }
 
 /* The "blank = inherit" sentence appended to an inheritable field's meta. Kept pure and
@@ -274,6 +369,11 @@ function pmSectionsHtml(sections, values, defaults) {
      defaults     - resolved global defaults, for the hints and placeholders
      notice       - optional HTML notice rendered above the fields
      submitUrl / method / submitLabel
+     extra        - optional element appended after the spec-driven sections
+     afterSave(res) - optional; a promise for follow-up requests that need the saved
+                    row's id (the poster upload). Its failure is reported but never leaves
+                    the modal open over a profile that IS saved - a second Save on the
+                    create path would make a duplicate.
      onDone()     - called after a successful save; call sites reload */
 function openProfileModal(opts) {
   const sections = opts.sections;
@@ -283,6 +383,7 @@ function openProfileModal(opts) {
 
   const body = document.createElement('div');
   body.innerHTML = (opts.notice || '') + pmSectionsHtml(sections, values, opts.defaults);
+  if (opts.extra) body.appendChild(opts.extra);
 
   const read = () => {
     const out = {};
@@ -297,11 +398,23 @@ function openProfileModal(opts) {
     const current = read();
     const error = pmValidate(fields, current);
     if (error) { showToast(error, { type: 'error' }); return; }
+    const name = pmPayload(fields, current).name;
     jsonFetch(opts.submitUrl, {
       method: opts.method,
       body: JSON.stringify(pmPayload(fields, current)),
-    }).then(() => {
-      showToast(`Profile "${pmPayload(fields, current).name}" saved.`);
+    }).then((res) => {
+      if (!opts.afterSave) return true;
+      return opts.afterSave(res).then(() => true, (err) => {
+        // The page reloads a moment later, so the message gets its time on screen first.
+        showToast(`Profile "${name}" saved, but its poster was not: ${err.message}`,
+          { type: 'error', durationMs: 10000 });
+        close();
+        setTimeout(onDone, 5000);
+        return false;
+      });
+    }).then((ok) => {
+      if (!ok) return;
+      showToast(`Profile "${name}" saved.`);
       close();
       onDone();
     }).catch((err) => showToast(err.message, { type: 'error' }));
@@ -345,10 +458,35 @@ function openHealthCheckProfileModal(opts) {
 }
 
 /* Recording Profiles list page (templates/profiles.html).
-   opts: { profile, defaults, onDone } - profile omitted for the create flow. */
+   opts: { profile, defaults, posterSpec, onDone } - profile omitted for the create flow.
+   The poster section rides along as `extra`, and its upload or removal runs after the
+   JSON save because a new profile has no id to attach a file to until then. */
 function openRecordingProfileModal(opts) {
   const p = opts.profile || null;
+  const spec = opts.posterSpec;
+  const posterState = { file: null, remove: false };
+  let extra = null;
+  let afterSave;
+  if (spec) {
+    extra = document.createElement('div');
+    extra.innerHTML = pmPosterSectionHtml(p ? p.poster : null, spec);
+    pmWirePosterSection(extra, spec, posterState);
+    afterSave = (res) => {
+      const id = res.profile.id;
+      if (posterState.file) {
+        const form = new FormData();
+        form.append('poster', posterState.file);
+        return jsonFetch(`/api/profiles/${id}/poster`, { method: 'POST', body: form });
+      }
+      if (posterState.remove) {
+        return jsonFetch(`/api/profiles/${id}/poster`, { method: 'DELETE' });
+      }
+      return Promise.resolve();
+    };
+  }
   return openProfileModal({
+    extra,
+    afterSave,
     title: p ? `Edit "${p.name}"` : 'Add a recording profile',
     sections: RECORDING_PROFILE_SECTIONS,
     values: p || {},

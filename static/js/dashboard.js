@@ -62,6 +62,11 @@ function handleSnapshot(rid, d) {
 function handleConversionProgress(rid, d) {
   if (d.out_size != null) setEl(`conv-bytes-${rid}`, fmtBytes(d.out_size));
   setEl(`conv-pct-${rid}`, d.pct != null ? `${Math.round(d.pct)}%` : DASH);
+  // A parked row renders no conv-eta element at all - the template puts "Waiting on" in
+  // that cell instead, because an ETA measured before the encoder was stopped is a clock
+  // that has stopped (dev/changelog/1053). setEl no-ops on the missing id, which is the
+  // point: the absence is the guard, so there is no flag here to get wrong. Park and
+  // unpark both arrive as status frames, and handleStatus reloads the page for them.
   setEl(`conv-eta-${rid}`, d.eta_seconds != null ? `~${fmtDur(d.eta_seconds)} left` : 'estimating...');
   const row = document.getElementById(`card-${rid}`);
   if (row && d.pct != null) row.style.setProperty('--pct', `${d.pct.toFixed(1)}%`);

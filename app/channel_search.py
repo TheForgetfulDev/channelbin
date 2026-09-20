@@ -744,6 +744,24 @@ SORTS_BY_GRAIN = {GRAIN_CHANNELS: SORTS, GRAIN_AIRINGS: SORTS_AIRINGS}
 DEFAULT_SORT_BY_GRAIN = {GRAIN_CHANNELS: DEFAULT_SORT, GRAIN_AIRINGS: 'when'}
 MAX_PAGE_SIZE = 500
 DEFAULT_PAGE_SIZE = 100
+# What the page's rows-per-page dropdown and the `search.page_size` setting offer. The engine
+# still accepts any `per_page` up to MAX_PAGE_SIZE from a URL; this is only the menu.
+PAGE_SIZE_OPTIONS = (100, 250, 500)
+
+
+def configured_page_size(cfg) -> int:
+    """The page's opening rows-per-page from `search.page_size`, or DEFAULT_PAGE_SIZE when the
+    stored value is not one of PAGE_SIZE_OPTIONS (a hand-edited config.yaml)."""
+    value = (cfg.get('search') or {}).get('page_size', DEFAULT_PAGE_SIZE)
+    try:
+        size = int(value)
+    except (TypeError, ValueError):
+        size = None
+    if size in PAGE_SIZE_OPTIONS:
+        return size
+    log.warning('search.page_size is %r, which is not one of %r - using %d',
+                value, PAGE_SIZE_OPTIONS, DEFAULT_PAGE_SIZE)
+    return DEFAULT_PAGE_SIZE
 
 
 # ---------------------------------------------------------------------------

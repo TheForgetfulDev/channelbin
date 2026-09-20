@@ -347,7 +347,13 @@ class CssClassDefinedTests(unittest.TestCase):
                           'rd-caps', 'rd-caprow', 'rd-capmark', 'rd-capname', 'rd-capwhy',
                           'rd-capact', 'rd-whylist', 'rd-row', 'rd-rname', 'rd-rcaret',
                           'rd-rfound', 'rd-ract', 'rd-muted', 'rd-detail', 'rd-dk', 'rd-dv',
-                          'rd-comp', 'rd-progress', 'rd-bar', 'rd-intro')
+                          'rd-comp', 'rd-progress', 'rd-bar', 'rd-intro',
+                          # Maintenance's Readiness nav badges and rail pip. The markup
+                          # is in base.html, but only applyReadiness() ever shows them, and
+                          # both badges shipped with no rule, drawn grey like any plain
+                          # count (dev/docs/BUGS.md 2026-09-18 @ 09:48:43 PM,
+                          # dev/changelog/1038).
+                          'nav-count-ready-bad', 'nav-count-ready-warn', 'pip-ready')
 
     def test_js_emitted_component_classes_are_defined(self):
         text = '\n'.join(t for _p, t in _css_sources())
@@ -507,6 +513,16 @@ class RetiredUiClassTests(unittest.TestCase):
                           "(dev/changelog/758)",
         'acct-sheet-sep': "use `.sheet-sep` - renamed with `.acct-sheet-act` above "
                           "(dev/changelog/758)",
+        # The record modal's program header became a second caller of the guide sheets'
+        # detail anatomy, and that modal renders on pages that load no guide.css - so the
+        # seven rules moved to style.css under a neutral prefix (dev/changelog/1050).
+        'guide-sheet-sub': "use `.info-sub` (style.css)",
+        'guide-sheet-desc': "use `.info-desc` (style.css)",
+        'guide-sheet-line': "use `.info-line` (style.css)",
+        'guide-sheet-lbl': "use `.info-lbl` (style.css)",
+        'guide-sheet-val': "use `.info-val` (style.css)",
+        'guide-sheet-tags': "use `.info-tags` (style.css)",
+        'guide-sheet-tag': "use `.info-tag` (style.css)",
     }
 
     def test_no_markup_references_a_retired_class(self):
@@ -881,6 +897,61 @@ class ParticipationWriteBypassTests(unittest.TestCase):
             'it happening. Call set_participation(), or add a '
             '`# participation-write-ok: <reason>` marker if this is Channel.test_enabled '
             'or another column that merely shares the name:\n' + '\n'.join(offenders))
+
+
+class MetadataLockWriteBypassTests(unittest.TestCase):
+    """`Recording.metadata_locked` is written by the user's own action and by nothing else.
+
+    The same rule as the participation switches above, on a column that stores the same
+    kind of fact: "leave my wording alone" is the user's answer to a judgment call, so an
+    engine has no standing to write it. `recording_metadata.refresh_from_guide()` FILTERS
+    on it - it never clears the lock, and never decides a program changed enough to be
+    worth overriding one (dev/changelog/1055).
+
+    `recording_metadata.apply_user_edit()` is the one writer, and it is the shape
+    `channel_groups.set_participation()` established: the column moves and the
+    `RECORDING_METADATA_EDITED` event explaining it is written in the same function, so a
+    lock cannot change with nothing on any surface saying so. The guard shipped with the
+    column and an empty `_CANONICAL` one changelog ahead of that surface (dev/changelog/1055,
+    then `1058`), precisely so the surface had to be built through one writer rather than
+    assigning the column from a route and meeting the rule afterwards - which is how the
+    participation guard came to exist in the first place.
+
+    app/ only - a test builds fixtures, and seeding a locked row is how the filter gets
+    exercised at all.
+
+    Escape hatch: a `# metadata-lock-write-ok: <reason>` marker on the line itself or
+    anywhere in the comment block directly above it.
+    """
+
+    _MARKER = 'metadata-lock-write-ok'
+    _CANONICAL = {('app/recording_metadata.py', 'apply_user_edit')}
+    _PATTERN = re.compile(r'\.metadata_locked\s*=(?!=)')
+
+    def test_the_metadata_lock_has_one_writer(self):
+        offenders = []
+        for path in _walk(APP_DIR, '.py'):
+            raw_lines = _read(path).splitlines()
+            code_lines = _mask_comments_and_strings(_read(path)).splitlines()
+            for i, line in enumerate(code_lines):
+                if not self._PATTERN.search(line):
+                    continue
+                if _marked_at(raw_lines, i, self._MARKER):
+                    continue
+                enclosing = ConfigReadBypassTests._enclosing_def(code_lines, i)
+                if (_rel(path), enclosing) in self._CANONICAL:
+                    continue
+                offenders.append(f'{_rel(path)}:{i + 1}: {raw_lines[i].strip()}')
+        self.assertEqual(
+            offenders, [],
+            'Recording.metadata_locked assigned outside its one writer (CLAUDE.md "any '
+            'column that stores a user\'s answer to a judgment call"). The lock suppresses '
+            'the record-start refresh of a recording\'s program details, so a write with '
+            'no event behind it leaves the user with a description that quietly stopped '
+            'tracking the guide and nothing on any surface saying why. Route it through a '
+            'single function that moves the column and logs it together, add that function '
+            'to _CANONICAL here, or mark the line '
+            '`# metadata-lock-write-ok: <reason>`:\n' + '\n'.join(offenders))
 
 
 def _marked_at(raw_lines, idx, marker):

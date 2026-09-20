@@ -565,9 +565,8 @@ class PasswordEndpointTests(_ConfigSandbox):
     def test_enabling_without_a_password_is_rejected_via_yaml_editor(self):
         tok = self._csrf()
         raw = yaml.dump({'auth': {'enabled': True, 'password_hash': ''}})
-        r = self.client.post('/settings', data={'config_yaml': raw, 'csrf_token': tok},
-                             follow_redirects=True)
-        self.assertEqual(r.status_code, 200)
+        r = self.client.post('/settings', data={'config_yaml': raw, 'csrf_token': tok})
+        self.assertEqual(r.status_code, 400)
         cfgmod._yaml_cache = None
         stored = cfgmod.load_config()
         self.assertFalse(stored['auth']['enabled'])

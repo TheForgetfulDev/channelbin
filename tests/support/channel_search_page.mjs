@@ -70,7 +70,7 @@ const JS = ['util.js', 'channel-search.js'].map(
    must render the server's sentence rather than one of its own. */
 function boot({ rows = ROWS, saved = null, url = 'http://localhost:5000/channels',
                 width = 1280, hold = null, holdCounts = false, declineWhy = null,
-                pinnedWidth = null } = {}) {
+                pinnedWidth = null, catalog = CATALOG } = {}) {
   const held = [];
   // Mutable, so a scenario can boot normally and start parking only once it is about
   // to do the thing it cares about - the grain flip needs channel rows on screen first.
@@ -140,7 +140,7 @@ function boot({ rows = ROWS, saved = null, url = 'http://localhost:5000/channels
             declined_reason: declineWhy }
         : { success: true, facets, facets_counted: Object.keys(facets).sort(),
             declined: [], declined_reason: '' };
-    } else if (href.includes('/catalog')) payload = CATALOG;
+    } else if (href.includes('/catalog')) payload = catalog;
     else if (href.includes('/api/channels/search')) {
       // Echo the request back as `query_string`, the way the engine does. Replaying one
       // frozen string instead would make every address-bar observation meaningless.
@@ -781,6 +781,61 @@ async function savedScenario() {
   obs.current_name_after_clear_all = c.$('#sf-current').textContent.trim();
   obs.dirty_after_clear_all = c.$('#sf-dirty').style.display;
   obs.errors = c.errors;
+  return obs;
+}
+
+/* ── Rows per page (dev/changelog/1043) ─────────────────────────────────
+   The Settings default reaches the page through the catalog's `opening_page_size`, never
+   through the engine's own meaning of a missing `per_page`; a URL that names a size wins;
+   the dropdown changes this search only and starts it again from page 1. */
+async function pageSizeScenario() {
+  const obs = {};
+  const at250 = Object.assign({}, CATALOG, { opening_page_size: 250 });
+  const sizeOf = (c) => (c.params().per_page || [])[0];
+  const menu = (c) => c.$('#pager #pg-size');
+
+  let c = boot();
+  await c.settle();
+  obs.stock_request_size = sizeOf(c);
+  obs.errors = c.errors.slice();
+
+  c = boot({ catalog: at250 });
+  await c.settle();
+  obs.configured_request_size = sizeOf(c);
+  obs.errors.push(...c.errors);
+
+  c = boot({ catalog: at250, url: 'http://localhost:5000/channels?per_page=1', rows: ROWS_PAGED });
+  await c.settle();
+  obs.url_request_size = sizeOf(c);
+  obs.url_menu_value = menu(c) ? menu(c).value : null;
+  obs.url_menu_options = menu(c) ? Array.from(menu(c).options).map((o) => o.value) : [];
+  const next = c.$$('#pager [data-pg]').find((b) => b.dataset.pg === 'next');
+  if (next) { c.click(next); await c.settle(); }
+  obs.page_before_change = (c.params().page || [])[0];
+  const n = c.posts().length;
+  if (menu(c)) {
+    menu(c).value = '250';
+    c.change(menu(c));
+    await c.settle();
+  }
+  obs.changed_request_size = sizeOf(c);
+  obs.page_after_change = (c.params().page || [])[0];
+  obs.posts_on_change = c.posts().length - n;
+  obs.errors.push(...c.errors);
+
+  // 180 matches at 250 a page: no page turns, but 100 would page, so the menu stays.
+  const fits = Object.assign({}, ROWS, { total: 180, pages: 1 });
+  c = boot({ rows: fits, url: 'http://localhost:5000/channels?per_page=250' });
+  await c.settle();
+  obs.fits_has_turns = c.$$('#pager [data-pg]').length > 0;
+  obs.fits_has_menu = !!menu(c);
+  obs.errors.push(...c.errors);
+
+  // Everything fits in the smallest size: nothing to page and nothing to choose.
+  c = boot();
+  await c.settle();
+  obs.small_pager_html = c.$('#pager').innerHTML.trim();
+  obs.errors.push(...c.errors);
   return obs;
 }
 
@@ -1738,6 +1793,7 @@ const run = async () => {
   out.table = await tableScenario();
   out.name_col = await nameColScenario();
   out.saved = await savedScenario();
+  out.page_size = await pageSizeScenario();
   out.context = await contextScenario();
   out.guide_action = await guideActionScenario();
   out.mobile = await mobileScenario();

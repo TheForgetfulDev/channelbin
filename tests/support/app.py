@@ -444,6 +444,26 @@ def _assert_jobstore_is_sandboxed(tmpdir):
         )
 
 
+def _assert_db_backup_dir_is_sandboxed(overrides, tmpdir):
+    """Fail loudly if this app's pre-migration snapshots would land outside the temp dir.
+
+    The third sibling of the two asserts around it, guarding the resource that is worst to
+    get wrong: a snapshot is the whole rollback story, the directory is pruned to
+    migration_backups_keep, and a test app depositing into the operator's folder evicts the
+    real snapshots to keep three copies of an empty database (dev/changelog/1052). The
+    destination is derived from database.path, so a test that redirects only the database
+    follows it automatically - what this catches is an extra_overrides that names a
+    backup_dir of its own somewhere outside the sandbox.
+    """
+    from app.config import db_backup_dir
+    resolved = db_backup_dir(overrides)
+    if not resolved.startswith(tmpdir):
+        raise AssertionError(
+            f'Pre-migration DB backup dir escaped the test sandbox: {resolved!r} is not '
+            f'under {tmpdir!r}. A migrating test app would deposit snapshots there and then '
+            'prune that directory to database.migration_backups_keep.')
+
+
 def _assert_engines_are_sandboxed(app, wanted_path):
     """Fail loudly if this app's ORM engines aren't pointed at the DB the overrides named.
 
@@ -571,6 +591,7 @@ class TestApp:
         self._output_dirs = dict(overrides['recording'])
         self.app = create_app(config_overrides=overrides, start_scheduler=start_scheduler)
         _assert_engines_are_sandboxed(self.app, overrides['database']['path'])
+        _assert_db_backup_dir_is_sandboxed(overrides, self._tmpdir)
         self._started_scheduler = start_scheduler
         if start_scheduler:
             _assert_jobstore_is_sandboxed(self._tmpdir)

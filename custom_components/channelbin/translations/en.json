@@ -12,7 +12,9 @@
     },
     "error": {
       "cannot_connect": "Failed to connect",
-      "invalid_auth": "Invalid API key"
+      "invalid_auth": "Invalid API key",
+      "server_too_old": "ChannelBin at {host} is version {reported}. This integration needs ChannelBin {minimum} or newer. Upgrade ChannelBin, then try again.",
+      "server_version_unknown": "ChannelBin at {host} didn't report its version, so it's older than this integration supports. This integration needs ChannelBin {minimum} or newer. Upgrade ChannelBin, then try again."
     },
     "abort": {
       "already_configured": "Device is already configured"
@@ -31,6 +33,16 @@
     "binary_sensor": {
       "recording": { "name": "Recording" },
       "has_alerts": { "name": "Has alerts" }
+    }
+  },
+  "issues": {
+    "server_too_old": {
+      "title": "ChannelBin is too old for this integration",
+      "description": "ChannelBin at {host} is version {reported}, and this integration needs ChannelBin {minimum} or newer. Its sensors stay unavailable until ChannelBin is upgraded. Once it is, this notice clears by itself."
+    },
+    "server_version_unknown": {
+      "title": "ChannelBin is too old for this integration",
+      "description": "ChannelBin at {host} didn't report its version, so it's older than this integration supports. This integration needs ChannelBin {minimum} or newer. Its sensors stay unavailable until ChannelBin is upgraded. Once it is, this notice clears by itself."
     }
   }
 }

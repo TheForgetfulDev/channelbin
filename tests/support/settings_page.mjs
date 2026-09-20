@@ -42,9 +42,19 @@ function boot(start, { query = '', changed = false } = {}) {
     }
     // A field save answers the way /api/settings/field does for a value set back to its
     // default, so a scenario can watch the mark clear.
+    // Validate answers from the text it was sent: "bad" in it earns one error whose
+    // message carries markup (it must reach the page as text) and one warning; anything
+    // else is clean.
+    const body = JSON.parse(opts.body || 'null') || {};
+    const problems = String(body.text || '').includes('bad')
+      ? [{ severity: 'error', path: 'recording', line: 2, message: 'Should be <b>a section</b>.' },
+         { severity: 'warning', path: 'bogus', line: 5, message: 'Not a setting.' }]
+      : [];
     const payload = url.pathname === '/api/settings/field'
       ? { success: true, restart_required: false, changed_from_default: false }
-      : { success: true };
+      : url.pathname === '/api/settings/validate'
+        ? { success: true, valid: !problems.length, problems }
+        : { success: true };
     return Promise.resolve({
       ok: true,
       status: 200,
@@ -299,6 +309,30 @@ await record('gates', async (start) => {
   const moveOn = c.snap();
   await c.settle();
   return { opened, ppOff, ppOn, mkv, mkvNever, never, searched, restartAndCollision, moveOn };
+});
+
+/* ── The config.yaml tab's Validate button ──────────────────────────── */
+await record('yaml_validate', async (start) => {
+  const c = start('plain');
+  const area = c.$('#pane-yaml textarea');
+  const region = () => ({
+    text: c.$('#yaml-check').textContent.replace(/\s+/g, ' ').trim(),
+    badge: c.$('#yaml-check .badge')?.className || null,
+    items: Array.from(c.document.querySelectorAll('#yaml-check li')).map((li) => li.className),
+    markup: c.$('#yaml-check').querySelector('b') !== null,
+  });
+  const opened = region();
+  area.value = 'recording: bad\n';
+  c.click(c.$('#yaml-validate'));
+  await c.settle();
+  const bad = region();
+  area.dispatchEvent(new c.window.Event('input', { bubbles: true }));
+  const edited = region();
+  area.value = 'recording: {}\n';
+  c.click(c.$('#yaml-validate'));
+  await c.settle();
+  const good = region();
+  return { opened, bad, edited, good, posts: c.posts };
 });
 
 // base.html's polls leave timers armed in every window, so node would never exit on its own.

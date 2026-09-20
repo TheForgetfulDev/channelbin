@@ -227,6 +227,7 @@ class FailedConcatPartialTests(unittest.TestCase):
         with mock.patch('app.config.load_config', return_value=self.cfg), \
              mock.patch.object(catmod, 'supervise_ffmpeg', side_effect=_fake_supervise), \
              mock.patch('app.recorder.persist_final_thumbnail'), \
+             mock.patch('app.recorder.persist_poster_frame'), \
              mock.patch('app.health_score.apply_capture_phase_health_observation'), \
              mock.patch.object(catmod, '_measure_segment_content_durations'):
             catmod._run_concatenation(self.t.app, self.rid, reason='test')

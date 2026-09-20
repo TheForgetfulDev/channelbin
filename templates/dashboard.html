@@ -143,7 +143,10 @@
              data-duration="{{ rec.duration_seconds or 0 }}"
              {%- elif rec.status == 'CONVERTING' %}
              data-elapsed="{{ rec.conversion_progress_pct if rec.conversion_progress_pct is not none else '' }}"
-             data-remaining="{{ rec.conversion_eta_seconds if rec.conversion_eta_seconds is not none else '' }}"
+             {# A parked row sorts on no remaining, because it renders none: the stored
+                ETA stopped being true the moment the encoder was stopped, and sorting a
+                column by a number that is not on the row is the same lie one level down. #}
+             data-remaining="{{ '' if rec.id in rec_waiting_ids else (rec.conversion_eta_seconds if rec.conversion_eta_seconds is not none else '') }}"
              data-recorded="{{ rec.conversion_out_size or 0 }}"
              {%- else %}
              data-elapsed="{{ st[0] if st else '' }}" data-remaining="{{ st[1] if st else '' }}" data-recorded="{{ st[2] if st else '' }}"
@@ -172,6 +175,18 @@
             <span class="d-cell"><span class="d-k">Starts</span>{{ rec.start_time | time_until }}</span>
             <span class="d-cell"><span class="d-k">Duration</span>{{ rec.duration_seconds | duration }}</span>
             <span class="d-cell"><span class="d-k">Start time</span>{{ rec.start_time | local_time }}</span>
+          {% elif rec.status == 'CONVERTING' and rec.id in rec_waiting_ids %}
+            {#- Parked: the encoder is stopped, so the middle cell names what it is stopped
+                FOR instead of counting down. A stored ETA stops being true the instant the
+                process is SIGSTOPped, and a stopped clock is the thing that misleads - the
+                detail page drops it for the same reason (dev/changelog/954) and the
+                Recordings list reads "paused at 40% - waiting on X". The other two cells
+                keep their running meaning: progress and bytes on disk are both still facts.
+                No conv-eta element on purpose - that is what keeps dashboard.js out of this
+                cell, rather than a flag it could get wrong (dev/changelog/1053). -#}
+            <span class="d-cell"><span class="d-k">Paused at</span><span id="conv-pct-{{ rec.id }}">{% if rec.conversion_progress_pct is not none %}{{ rec.conversion_progress_pct | round(0) | int }}%{% else %}-{% endif %}</span></span>
+            <span class="d-cell" data-tip="Waiting for &quot;{{ rec.postprocess_waiting_on_name }}&quot; to finish.&#10;Conversion resumes by itself once no recordings are active."><span class="d-k">Waiting on</span>{{ rec.postprocess_waiting_on_name or 'another recording' }}</span>
+            <span class="d-cell"><span class="d-k">Written</span><span id="conv-bytes-{{ rec.id }}">{{ (rec.conversion_out_size | filesize) if rec.conversion_out_size else '-' }}</span></span>
           {% elif rec.status == 'CONVERTING' %}
             <span class="d-cell"><span class="d-k">Complete</span><span id="conv-pct-{{ rec.id }}">{% if rec.conversion_progress_pct is not none %}{{ rec.conversion_progress_pct | round(0) | int }}%{% else %}-{% endif %}</span></span>
             <span class="d-cell"><span class="d-k">Time left</span><span id="conv-eta-{{ rec.id }}">{% if rec.conversion_eta_seconds is not none %}~{{ (rec.conversion_eta_seconds // 60) }} min{% else %}estimating...{% endif %}</span></span>

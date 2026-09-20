@@ -276,7 +276,8 @@ class ConcatExclusionTests(_PlaceholderDbCase):
         with mock.patch.object(cfgmod, 'load_config',
                                return_value=self._concat_cfg()), \
              mock.patch('app.postprocessor.do_postprocess'), \
-             mock.patch('app.recorder.persist_final_thumbnail'):
+             mock.patch('app.recorder.persist_final_thumbnail'), \
+             mock.patch('app.recorder.persist_poster_frame'):
             concatmod._run_concatenation(self.t.app, self.rec.id, reason='test')
 
         self.assertFalse(os.path.exists(dropped.file_path),

@@ -292,6 +292,7 @@ function openGroupModal(opts) {
           .concat(groupNote ? [groupNote] : [])
           .concat(r.in_guide ? ['in guide'] : [])
           .join(' · ');
+        const missing = r.lifecycle === 'missing' ? ` ${missingBadge(r)}` : '';
         return `
         <tr class="${disabled ? 'suggest-row-disabled' : ''}">
           <td class="st-cb"><input type="checkbox" class="group-suggest-cb" value="${r.channel_id}"
@@ -299,7 +300,7 @@ function openGroupModal(opts) {
           <td class="st-fmt">${fmtBadge(r)}</td>
           <td class="st-ch">
             <span class="account-dot" style="background:${escHtml(r.account_color || '#30363d')}" title="${escHtml(r.account_name)}"></span>
-            <a href="/channels/${r.channel_id}" target="_blank" rel="noopener" class="channel-name-link">${escHtml(r.channel_name)}</a>
+            <a href="/channels/${r.channel_id}" target="_blank" rel="noopener" class="channel-name-link">${escHtml(r.channel_name)}</a>${missing}
             <div class="st-meta">${meta}</div>
           </td>
           <td class="st-num">${numCell(r.resolution)}</td>

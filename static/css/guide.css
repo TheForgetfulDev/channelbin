@@ -1500,32 +1500,9 @@
 }
 .guide-sheet h4:first-child { margin-top: 0; }
 
-.guide-sheet-sub { color: var(--text-muted); font-size: 13px; margin: 0 0 10px; }
-.guide-sheet-desc { color: var(--text-muted); font-size: 13px; line-height: 1.5; margin: 10px 0 0; }
-
-.guide-sheet-line {
-  display: flex;
-  gap: 0.6rem;
-  align-items: baseline;
-  font-size: 13px;
-  padding: 5px 0;
-  border-bottom: 1px solid var(--border-soft);
-}
-.guide-sheet-lbl { flex: 0 0 76px; color: var(--text-faint); font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; }
-.guide-sheet-val { color: var(--text); min-width: 0; overflow-wrap: anywhere; }
-
-.guide-sheet-tags { display: flex; flex-wrap: wrap; gap: 0.4rem; margin-top: 10px; }
-.guide-sheet-tag {
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  font-size: 12px;
-  color: var(--text-muted);
-  background: var(--bg2);
-  border: 1px solid var(--border);
-  border-radius: 999px;
-  padding: 2px 9px;
-}
+/* The subtitle, labelled lines, description and tag chips a sheet is mostly made of are
+   style.css's shared `.info-*` block, not guide-local classes - the record modal's program
+   header draws the same anatomy on pages that never load this file (dev/changelog/1050). */
 
 /* The channel sheet's headline number - the score the mobile column has no room for. */
 .guide-sheet-health {

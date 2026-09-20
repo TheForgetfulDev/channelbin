@@ -623,11 +623,14 @@ def _run_concatenation(app, recording_id: int, *, reason: str):
 
         ev.publish(recording_id, CAPTURE_COMPLETE, {'status': REC_STATUS_CONCATENATING})
 
-        # Final-frame screenshot for the finished recording, taken now while the
-        # segment files still exist (a successful concat deletes them). Subprocess
-        # side effect - deliberately outside any retry_on_locked closure.
-        from .recorder import persist_final_thumbnail
+        # Both of the recording's own images, taken now while the segment files still
+        # exist (a successful concat deletes them). Subprocess side effects - deliberately
+        # outside any retry_on_locked closure. They answer different questions and neither
+        # replaces the other: the thumbnail is the final frame, the poster is a frame from
+        # inside the program itself (dev/changelog/1060).
+        from .recorder import persist_final_thumbnail, persist_poster_frame
         persist_final_thumbnail(recording_id)
+        persist_poster_frame(recording_id)
 
         # serialize_concat: only one concat+conversion job runs at a time, and none
         # run while any recording is IN_PROGRESS. Marking CONCATENATING above happens

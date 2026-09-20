@@ -18,9 +18,8 @@ const MOBILE_MQ = window.matchMedia('(max-width: 768px)');
 // The guide always does; channel detail's "What's On" card did not until its own revamp
 // approved a mobile design for it (dev/changelog/345 explains the opt-out, 349 flips it).
 // The test stays because the opt-in is what a page uses to say DESIGN.md 13's behaviours -
-// 3px/min, the program sheet in place of the record modal, the bottom sheets - are ones it
-// actually wants; a page embedding this grid without a mobile design must not get them
-// silently.
+// 3px/min, the logo-only channel column, the bottom sheets - are ones it actually wants; a
+// page embedding this grid without a mobile design must not get them silently.
 function isMobileGuide() {
   return MOBILE_MQ.matches && !!GUIDE_CONFIG.layoutMobile;
 }
@@ -404,7 +403,7 @@ function cellActiveFields(prog) {
   if (LAYOUT.rec_status && prog.has_recording) on.add('rec_status');
   if (LAYOUT.subtitle && real && prog.sub_title) on.add('subtitle');
   // 13.9 is a hard rule, not a default: a description never renders in a phone-width cell,
-  // it lives in the program sheet. There is no checkbox to turn it on there.
+  // it lives in the record modal the cell opens. There is no checkbox to turn it on there.
   if (!isMobileGuide() && LAYOUT.description && real && prog.description) on.add('description');
   if (LAYOUT.start_time || LAYOUT.end_time || LAYOUT.duration) on.add('time');
   // Tag dots always take their own line when shown (12.5).
@@ -756,8 +755,8 @@ function updateTagFilterSummary() {
 // bound against app/channel_search.py's `duration` dimension, but that one re-runs a DB
 // query per filter change - the grid never re-queries, it filters in memory over the window
 // it already fetched (same as the tag filter beside it), so the length is derived from
-// start_time/stop_time exactly the way the mobile program sheet already computes one
-// program's duration (openProgramSheet). The "Longer than X hours"/"Shorter than X minutes"
+// start_time/stop_time exactly the way the record modal's program header computes one
+// program's duration (progHeadHtml). The "Longer than X hours"/"Shorter than X minutes"
 // phrasing and the minutes/hours unit toggle are duplicated from channel-search.js's
 // duration facet on purpose, not shared code - that page's version is wired into a
 // URL-persisted facet system this filter has no need of; state here lives only in the
@@ -963,7 +962,7 @@ function renderProgramRows() {
 
       el.innerHTML = programCellHtml(prog, ch);
 
-      el.addEventListener('click', () => openProgramTarget(prog, ch));
+      el.addEventListener('click', () => openModal(prog, ch));
       row.appendChild(el);
     });
   });
@@ -1136,22 +1135,17 @@ function wireDayPicker() {
   });
 }
 
-// What a tap on a program cell opens. Desktop goes straight to the scheduling modal, as it
-// always has; mobile opens the program sheet, from which "Set Up Recording…" reaches the
-// same modal (13.10). One entry point so both render paths - normal and collapsed - can
-// never diverge on it.
-function openProgramTarget(prog, ch) {
-  if (isMobileGuide()) openProgramSheet(prog, ch);
-  else openModal(prog, ch);
-}
-
 // ── Mobile bottom sheets (DESIGN.md 13.10) ───────────────────────────────────
 //
 // Touch has no hover, so every 12.7 tooltip surface on the grid becomes a tap target
-// opening a sheet (13.1). All five sheets - program, channel, day picker, Layout, Tags -
-// go through util.js's buildModal(), which style.css already renders as a bottom sheet at
-// ≤768px (9.6). That is deliberately NOT a second overlay component: a guide-local sheet
-// would duplicate the backdrop, Esc handling and scroll behaviour the modal already has.
+// opening a sheet (13.1). The four sheets - channel, day picker, Layout, Tags - go through
+// util.js's buildModal(), which style.css already renders as a bottom sheet at ≤768px
+// (9.6). That is deliberately NOT a second overlay component: a guide-local sheet would
+// duplicate the backdrop, Esc handling and scroll behaviour the modal already has.
+//
+// A program cell is the exception, and always was the odd one out: its sheet only ever
+// described the program and then handed off to the record modal, which now carries that
+// description itself, so a tap goes straight there on every width (dev/changelog/1050).
 
 let openSheetEl = null;
 
@@ -1171,68 +1165,8 @@ function closeSheet() {
 
 function sheetLine(label, value) {
   if (!value) return '';
-  return `<div class="guide-sheet-line"><span class="guide-sheet-lbl">${escHtml(label)}</span>` +
-    `<span class="guide-sheet-val">${escHtml(value)}</span></div>`;
-}
-
-// 13.10's program sheet: the cell's own fields, plus the description that mobile cells are
-// forbidden from showing (13.9), plus the state-dependent actions.
-function openProgramSheet(prog, ch) {
-  const real = !prog.is_dummy && prog.title;
-  const fmtT = iso => fmtTimeTz(utcIsoToDate(iso));
-  const start = new Date(prog.start_time + 'Z');
-  const mins = Math.round((new Date(prog.stop_time + 'Z') - start) / 60000);
-
-  const tags = (prog.matched_tags || []).map(t =>
-    `<span class="guide-sheet-tag"><span class="tag-badge-dot" style="background:${escHtml(t.color)}"></span>` +
-    `${escHtml(t.name)}</span>`).join('');
-
-  const body =
-    (prog.sub_title && real ? `<p class="guide-sheet-sub">${escHtml(prog.sub_title)}</p>` : '') +
-    sheetLine('When', `${fmtT(prog.start_time)} - ${fmtT(prog.stop_time)}  ·  ${fmtDur(mins * 60, false)}`) +
-    sheetLine('Day', fmtDateTz(start)) +
-    sheetLine('Channel', ch.name) +
-    (real && prog.description ? `<p class="guide-sheet-desc">${escHtml(prog.description)}</p>` : '') +
-    (tags ? `<div class="guide-sheet-tags">${tags}</div>` : '');
-
-  openSheet({ title: prog.title || ch.name, body, footer: programSheetActions(prog, ch) });
-}
-
-// The recording states, each named explicitly - no trailing else rendering a real
-// state (CLAUDE.md: states are enumerated). "Set Up Recording…" is 13.10's mandated wording:
-// it opens the pre-filled scheduling flow and nothing is scheduled until the user confirms
-// there, so a bare "Record" implying instant scheduling is banned. RETRYING joins
-// IN_PROGRESS/PAUSED here (no active ffmpeg, same as PAUSED, but still an in-flight
-// recording - not terminal).
-function programSheetActions(prog, ch) {
-  const status = prog.recording_status;
-  const hasRec = prog.has_recording && prog.recording_id;
-
-  if (hasRec && (status === 'IN_PROGRESS' || status === 'PAUSED' || status === 'RETRYING')) {
-    return [
-      { label: 'Dashboard →', class: 'btn btn-primary',
-        onClick: () => { window.location.href = '/'; return false; } },  // nav-ok: modal button
-      { label: '■ Stop', class: 'btn btn-danger',
-        onClick: (close) => { close(); openActiveRecModal(prog); return false; } },
-    ];
-  }
-  if (hasRec && TERMINAL_STATUSES.has(status)) {
-    return [{ label: 'View recording', class: 'btn btn-primary',
-      onClick: () => { window.location.href = GUIDE_CONFIG.recDetailUrlBase + prog.recording_id; return false; } }];  // nav-ok: modal button
-  }
-  if (hasRec) {
-    return [{ label: 'Cancel recording', class: 'btn btn-danger',
-      onClick: (close) => { close(); cancelScheduledRecording(prog.recording_id); return false; } }];
-  }
-  return [{ label: 'Set Up Recording…', class: 'btn btn-primary',
-    onClick: (close) => { close(); openModal(prog, ch); return false; } }];
-}
-
-function cancelScheduledRecording(recId) {
-  if (!confirm('Cancel scheduled recording? This scheduled recording will be removed.')) return;
-  jsonFetch(GUIDE_CONFIG.editRecordingUrlBase + recId + '/cancel-json', { method: 'POST' })
-    .then(() => fetchAndRender())
-    .catch(e => showToast(e.message || 'Cancel failed.', { type: 'error' }));
+  return `<div class="info-line"><span class="info-lbl">${escHtml(label)}</span>` +
+    `<span class="info-val">${escHtml(value)}</span></div>`;
 }
 
 // 13.10's channel sheet: the health state in plain language with its number, the tech
@@ -1261,7 +1195,7 @@ function openChannelSheet(ch) {
   const body =
     `<div class="guide-sheet-health hb-${state === 'untested' ? 'none' : state}">` +
     `${state === 'untested' ? '--' : score}<span>/100</span></div>` +
-    `<p class="guide-sheet-sub">${escHtml(healthBandName(score))} - ${escHtml(why)}</p>` +
+    `<p class="info-sub">${escHtml(healthBandName(score))} - ${escHtml(why)}</p>` +
     sheetLine('Stream', channelTechText(ch)) +
     sheetLine('Account', ch.account_name || '') +
     (ch.lifecycle === 'missing'
@@ -1591,6 +1525,37 @@ function addSecondsToUtcIso(isoStr, seconds) {
   return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())}T${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())}`;
 }
 
+/* The modal's program header (#modal-prog-head): what the user is about to record, in full.
+   Everything the guide knows about the showing - subtitle, airtime, length, channel, the
+   WHOLE description, matched tags - rather than the 120-character slice of the description
+   that used to sit under the Recording Name field and cut off mid-sentence.
+
+   Returns '' for a target that is not a real EPG program: a dummy filler slot, or the
+   {recording_id, title, stream_url} shape the dashboard and the recording detail page pass
+   when editing an already-scheduled recording. Those have no program to describe, and an
+   empty box is worse than no box. The caller hides the container on ''. */
+function progHeadHtml(prog) {
+  if (!prog.id || prog.is_dummy || !prog.title) return '';
+  const fmtT = iso => fmtTimeTz(utcIsoToDate(iso));
+  const start = new Date(prog.start_time + 'Z');
+  const mins = Math.round((new Date(prog.stop_time + 'Z') - start) / 60000);
+
+  const tags = (prog.matched_tags || []).map(t =>
+    // .color-dot, not the grid's own .tag-badge-dot: that one lives in guide.css and this
+    // modal also renders on the channel search page, which loads no guide.css - an
+    // undefined class would leave the swatch invisible with nothing to say so.
+    `<span class="info-tag"><span class="color-dot" style="background:${escHtml(t.color)}"></span>` +
+    `${escHtml(t.name)}</span>`).join('');
+
+  return `<h3 class="prog-head-title">${escHtml(prog.title)}</h3>` +
+    (prog.sub_title ? `<p class="info-sub">${escHtml(prog.sub_title)}</p>` : '') +
+    sheetLine('When', `${fmtT(prog.start_time)} - ${fmtT(prog.stop_time)}  ·  ${fmtDur(mins * 60, false)}`) +
+    sheetLine('Day', fmtDateTz(start)) +
+    sheetLine('Channel', prog.channel_name) +
+    (prog.description ? `<p class="info-desc">${escHtml(prog.description)}</p>` : '') +
+    (tags ? `<div class="info-tags">${tags}</div>` : '');
+}
+
 /* Bumped on every openModal. A group note that arrives after the modal has been reopened
    on something else belongs to a target the user has already left, so it is dropped rather
    than painted - otherwise a slow fetch names the previous group over the current one. */
@@ -1616,8 +1581,9 @@ async function showGroupNote(groupId, token) {
     // The name is the nice-to-have; the warning is the point. Losing the lookup must not
     // cost the user the disclosure that a group records from a member that can change.
     if (token !== _modalOpenToken) return;
-    note.textContent = 'This is a channel group - the member it records from can change '
-      + 'before and during the recording. That member could not be looked up just now.';
+    note.textContent = 'This is a channel group - it will record from its best-ranked '
+      + 'available member, picked just before the recording starts. That member could not '
+      + 'be looked up just now.';
     note.style.display = '';
     return;
   }
@@ -1628,13 +1594,13 @@ async function showGroupNote(groupId, token) {
     parts.push(`Channel group "${gname}" has no recording-enabled member, so nothing `
       + "would record. Turn Recording on for a member on the group's page.");
   } else {
-    const acct = data.serving.account_name
-      ? ` (${escHtml(data.serving.account_name)})` : '';
-    // Deliberately three short clauses rather than the full ranking rule. This sits above
-    // every other field in the modal, and the long version ran to six lines at 375px.
-    parts.push(`Channel group "${gname}" would record from `
-      + `"${escHtml(data.serving.name)}"${acct} right now - its best-ranked available `
-      + 'member. That can change before and during the recording.');
+    // One sentence, not two, and no owning account: this sits above every other field in
+    // the modal and the longer version ran to six lines at 375px (dev/changelog/1050). The
+    // member is still NAMED - which feed you would actually get is the whole reason this
+    // notice exists (dev/changelog/904) - and "picked just before the recording starts" is
+    // what carries the fact that the answer can still move.
+    parts.push(`Channel group "${gname}" - it will record from its best-ranked available `
+      + `member ("${escHtml(data.serving.name)}"), picked just before the recording starts.`);
     if (data.format_override) {
       // The lock's zero-survivors override (DESIGN-channel-groups-model.md 15.2). Its
       // other three disclosures all land at or after record start; this is the only one
@@ -1764,8 +1730,12 @@ function openModal(prog, ch, opts = {}) {
     }
   }
 
-  const hint = document.getElementById('modal-name-hint');
-  if (hint) hint.textContent = prog.description ? prog.description.slice(0, 120) : '';
+  const head = document.getElementById('modal-prog-head');
+  if (head) {
+    const html = progHeadHtml(prog);
+    head.innerHTML = html;
+    head.style.display = html ? '' : 'none';
+  }
 
   const title          = document.getElementById('modal-title');
   const submit         = document.getElementById('modal-submit');
@@ -2240,7 +2210,7 @@ function renderProgramRowsCollapsed(terms) {
 
         el.innerHTML = programCellHtml(prog, ch);
 
-        el.addEventListener('click', () => openProgramTarget(prog, ch));
+        el.addEventListener('click', () => openModal(prog, ch));
         row.appendChild(el);
       });
     });

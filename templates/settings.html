@@ -148,7 +148,15 @@
   font-family: var(--font-mono); font-size: var(--fs-sm); line-height: 1.55; padding: 14px 16px; resize: vertical; }
 .yaml-pane textarea:focus { outline: none; border-color: var(--accent); }
 .yaml-foot { display: flex; align-items: center; gap: 12px; margin-top: 12px; flex-wrap: wrap; }
-.yaml-foot .note { font-size: var(--fs-sm); color: var(--text-muted); }
+.yaml-foot .note, .yaml-check .note { font-size: var(--fs-sm); color: var(--text-muted); }
+.yaml-check { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-top: 12px; }
+.yaml-check:empty { display: none; }
+.yaml-problems { flex-basis: 100%; margin: 0; padding: 0; list-style: none; font-size: var(--fs-sm); }
+.yaml-problems li { padding: 6px 10px; border-left: 3px solid var(--border); margin-top: 4px; overflow-wrap: anywhere; }
+.yaml-problems li.yaml-error { border-left-color: var(--bad); }
+.yaml-problems li.yaml-warning { border-left-color: var(--warn); }
+.yaml-problems .yaml-where { color: var(--text-muted); margin-right: 8px; }
+.yaml-problems code { margin-right: 6px; }
 
 /* ── The mobile section picker (DESIGN.md 15.5 item 1) ─────────────────
    Desktop's rail is a column beside the content; there is no such column on a
@@ -217,6 +225,7 @@
 {% set pp     = rec.get('post_process', {}) %}
 {% set mc     = rec.get('move_on_complete', {}) %}
 {% set ps     = rec.get('post_script', {}) %}
+{% set ms     = rec.get('metadata_sidecar', {}) %}
 {% set lt     = rec.get('live_thumbnail', {}) %}
 {% set lc     = rec.get('logo_cache', {}) %}
 {% set wd     = cfg.get('watchdog', {}) %}
@@ -255,12 +264,12 @@
 </div>
 
 <div class="tabs" role="tablist">
-  <button class="tab active" type="button" data-tab="gui" role="tab" aria-selected="true">Settings</button>
-  <button class="tab" type="button" data-tab="yaml" role="tab" aria-selected="false">config.yaml <span class="tier-badge tier-badge-on">Advanced</span></button>
+  <button class="tab{{ '' if yaml_open else ' active' }}" type="button" data-tab="gui" role="tab" aria-selected="{{ 'false' if yaml_open else 'true' }}">Settings</button>
+  <button class="tab{{ ' active' if yaml_open else '' }}" type="button" data-tab="yaml" role="tab" aria-selected="{{ 'true' if yaml_open else 'false' }}">config.yaml <span class="tier-badge tier-badge-on">Advanced</span></button>
 </div>
 
 {# ───────────────────────── SETTINGS TAB ─────────────────────────────── #}
-<div id="pane-gui">
+<div id="pane-gui"{% if yaml_open %} style="display:none"{% endif %}>
 
   <div class="toolbar">
     <div class="search-wrap" id="swrap">
@@ -320,7 +329,7 @@
         {{ field_text('recording.dvr_output_dir', 'Output directory',
            'Directory where recording files are written.', rec.get('dvr_output_dir', '/dvr'), tier='basic') }}
         {{ field_text('recording.images_dir', 'Images directory',
-           'Directory where recording thumbnails, health check screenshots and cached channel logos are saved, each in its own subfolder: thumbnails, screenshots and logos.', rec.get('images_dir', '/dvr/images'), tier='basic') }}
+           'Directory where recording thumbnails, health check screenshots, cached channel logos and the poster images uploaded to recording profiles are saved, each in its own subfolder: thumbnails, screenshots, logos and posters.', rec.get('images_dir', '/dvr/images'), tier='basic') }}
         {% call field_shell('recording.filename_template', 'Filename template',
            'Template for auto-generated recording names from EPG guide data.', false, false,
            'naming name file rename variables tag cleanup preview designer', overridable_by='recording_profile', tier='basic') %}
@@ -335,7 +344,7 @@
         {{ field_number('recording.retention_days', 'Auto-delete recordings after (days)',
            'Automatically delete completed, failed, and aborted recordings once they are this many days old. 0 = never delete. A daily sweep runs at 04:00.', rec.get('retention_days', 0), overridable_by='recording_profile', tier='basic') }}
         {{ field_bool('recording.retention_delete_file', 'Also delete the file on disk',
-           'When retention deletes a recording, also remove its file from disk. Off keeps the file and only deletes the database record.', rec.get('retention_delete_file', False), tier='basic') }}
+           'When retention deletes a recording, also remove its file from disk. Off keeps the file and removes only the recording and its thumbnail from ChannelBin.', rec.get('retention_delete_file', False), tier='basic') }}
       </div>
       <div data-sub="conversion">
         <div class="sec-sub"><strong>Conversion</strong></div>
@@ -389,6 +398,8 @@
            'Move the finished file to a different folder after all post-processing is done.', mc.get('enabled', False), tier='basic') }}
         {{ field_text('recording.move_on_complete.destination', 'Move destination',
            'Absolute path to move the final file to. Directory is created if it does not exist.', mc.get('destination', ''), gated_by=['recording.move_on_complete.enabled'], tier='basic') }}
+        {{ field_bool('recording.metadata_sidecar.enabled', 'Write a metadata file for media servers',
+           'Save a Kodi-format .nfo file and a poster image beside every finished recording, so Plex, Jellyfin, Emby and Kodi show its real title, synopsis, air date and genre instead of guessing from the filename. Nothing is sent anywhere - both files are written to local disk. In Plex this needs a Movie or TV Show library with the matching NFO agent selected; an Other Videos library ignores them. Turning this off later stops new files being written and leaves existing ones alone.', ms.get('enabled', False), tier='basic') }}
         {{ field_bool('recording.post_script.enabled', 'Run post-completion script',
            'Execute a shell script after the recording finishes all post-processing. Non-fatal: recording is marked COMPLETED regardless of script outcome.', ps.get('enabled', False), tier='advanced') }}
         {{ field_text('recording.post_script.path', 'Post-completion script path',
@@ -407,6 +418,11 @@
            'Show a periodically-refreshed frame from the current segment on the recording detail page while a recording is in progress.', lt.get('enabled', True), tier='basic') }}
         {{ field_number('recording.live_thumbnail.auto_refresh_seconds', 'Live thumbnail refresh interval (seconds)',
            'How often the preview auto-refreshes while viewing an in-progress recording. Each refresh runs a short ffmpeg capture.', lt.get('auto_refresh_seconds', 60), gated_by=['recording.live_thumbnail.enabled'], tier='advanced') }}
+        {{ field_select('recording.live_thumbnail.finished_image', 'Image shown for a finished recording',
+           'Which of the two images a completed recording shows in its row and on its detail page. The poster frame is taken from inside the program itself, so padding at the front does not put the previous show on it; the final frame is the last thing the recording captured, which for a game is usually a postgame graphic. Whichever one a recording does not have, it shows the other - recordings made before the poster frame existed keep showing their final frame.', lt.get('finished_image', 'poster'),
+           [('poster','Poster frame, taken from inside the program'), ('last_frame','Final frame of the recording')], gated_by=['recording.live_thumbnail.enabled'], tier='advanced') }}
+        {{ field_number('recording.live_thumbnail.poster_frame_offset_seconds', 'Poster frame offset (seconds)',
+           'How far after the program\'s own start time the poster frame is taken. Measured from the program start, not from when the recording started, so front padding is skipped. The frame comes from a segment already on disk and never costs a second connection to the provider. If nothing was captured at that moment, the nearest content after it is used instead.', lt.get('poster_frame_offset_seconds', 60), gated_by=['recording.live_thumbnail.enabled'], tier='advanced') }}
         {{ field_bool('recording.logo_cache.enabled', 'Cache channel logos locally',
            'Download and cache channel logos locally instead of loading them from the provider/CDN on every page view. Only caches logos for channels that are in your TV Guide or belong to a group (a channel group or a health-check group) - not your whole channel catalog, which can be tens of thousands of channels on some accounts. A background job fetches a small batch every few minutes; a logo is only re-fetched if the provider gives it a different URL.', lc.get('enabled', False), tier='basic') }}
       </div>
@@ -526,6 +542,8 @@
            'Remember which channels carry each tag instead of recalculating it on every search. Fixes real slowdowns from common-word tag patterns (e.g. "live"). Costs a small amount of RAM (typically kilobytes to a few tens of MB) - turn off if the box is RAM constrained.', search_cfg.get('tag_id_cache_enabled', True), tier='advanced') }}
         {{ field_number('search.standing_breakdown_cache_ttl_seconds', 'Airing count cache (seconds)',
            'How long the TV Guide airing search\'s unfiltered totals and "Hide X" counts may be served from cache before recomputing. A sync always invalidates it immediately; this bounds staleness from anything a sync would not catch (a health check, a channel-group edit, or time simply passing).', search_cfg.get('standing_breakdown_cache_ttl_seconds', 300), tier='advanced') }}
+        {{ field_select('search.page_size', 'Rows per page',
+           'How many channels or programs a search page shows when it opens. The page\'s own Rows per page menu changes just the search in front of you, and a link that names a size always opens at that size.', page_size_value, page_size_options, tier='advanced') }}
         {{ field_number('search.degraded_aggregate_timeout_seconds', 'Uncounted totals after (seconds)',
            'While search is running without its index, how long it may spend on the optional numbers - the match total, the "Hide X" counts and the facet rail - before returning the results without them and labeling them as not counted. Matching rows are always returned and are always complete; only the counts around them are skipped. 0 = never attempt them while unindexed.', search_cfg.get('degraded_aggregate_timeout_seconds', 2), tier='advanced') }}
         {{ field_number('search.full_scan_aggregate_timeout_seconds', 'Uncounted totals when unindexable (seconds)',
@@ -764,13 +782,28 @@
 </div>{# end pane-gui #}
 
 {# ───────────────────────── config.yaml TAB ──────────────────────────── #}
-<div id="pane-yaml" class="yaml-pane" style="display:none">
+<div id="pane-yaml" class="yaml-pane"{% if not yaml_open %} style="display:none"{% endif %}>
   <form method="post" action="{{ url_for('settings.settings') }}">
     {{ csrf_field() }}
     <textarea name="config_yaml" spellcheck="false" rows="40">{{ cfg_yaml }}</textarea>
     <div class="yaml-foot">
-      <button type="submit" class="btn btn-primary">Save config.yaml</button>
-      <span class="note">Saving here marks a restart as required.</span>
+      <button type="submit" class="btn btn-primary">Save</button>
+      <button type="button" class="btn" id="yaml-validate">Validate</button>
+      <span class="note">Save checks the file first and refuses anything that would not load.</span>
+    </div>
+    {# Server-rendered after a refused save; settings.js::renderYamlCheck is its only updater. #}
+    <div id="yaml-check" class="yaml-check">
+      {%- if yaml_problems %}
+      {%- set n_err = yaml_problems | selectattr('severity', 'equalto', 'error') | list | length %}
+      {%- set n = n_err or yaml_problems | length %}
+      <span class="badge {{ 'b-fail' if n_err else 'b-warn' }}">{{ n }} {{ 'problem' if n_err else 'warning' }}{{ '' if n == 1 else 's' }}</span>
+      {%- if n_err %}<span class="note">Not saved - your edits are still here.</span>{% endif %}
+      <ul class="yaml-problems">
+        {%- for p in yaml_problems %}
+        <li class="yaml-{{ p.severity }}">{% if p.line %}<span class="yaml-where">Line {{ p.line }}</span>{% endif %}{% if p.path %}<code>{{ p.path }}</code>{% endif %} {{ p.message }}</li>
+        {%- endfor %}
+      </ul>
+      {%- endif -%}
     </div>
   </form>
 </div>

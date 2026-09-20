@@ -580,6 +580,7 @@
    can only ever see 100 of 136,130 channels, so its counts would be a guess. */
 .pager { margin-top: 1rem; display: flex; gap: .5rem; align-items: center; flex-wrap: wrap; }
 .pager .pg-lbl { font-size: var(--fs-sm); color: var(--text-muted); }
+.pager .pg-size { margin-left: auto; width: auto; }
 .cs-empty .es-hint { font-size: var(--fs-sm); color: var(--text-faint); margin-top: .5rem; line-height: 1.5; }
 /* At phone width the way to widen the scope is a sheet, so this sentence carries the
    control rather than pointing at a search box that no longer holds one. */

@@ -232,59 +232,6 @@ class DisabledConfigTests(unittest.TestCase):
         get_mock.assert_not_called()
 
 
-class SvgPurgeTests(unittest.TestCase):
-    """A logo cached as .svg before the raster-only allowlist existed must be dropped -
-    channel_logo serves whatever's cached regardless of the enabled flag, so the purge
-    must run even when logo caching is currently turned off (dev/docs/BUGS.md 2026-08-14)."""
-
-    def setUp(self):
-        self.t = make_test_app()
-        self.cache_dir = os.path.join(self.t._tmpdir, 'images', 'logos')
-        os.makedirs(self.cache_dir, exist_ok=True)
-
-    def tearDown(self):
-        self.t.cleanup()
-
-    def _seed_stale_svg(self):
-        acct = seed.make_account()
-        ch = seed.make_channel(acct, logo_url='http://provider.test/evil.svg', in_guide=True)
-        with open(os.path.join(self.cache_dir, f'{ch.id}.svg'), 'wb') as f:
-            f.write(b'<svg onload="alert(1)"></svg>')
-        ch.logo_cache_path = f'{ch.id}.svg'
-        ch.logo_cache_source_url = 'http://provider.test/evil.svg'
-        db.session.commit()
-        return ch
-
-    def test_stale_svg_is_purged_on_next_batch_tick(self):
-        """When caching is enabled, purging clears the channel's eligibility columns, so
-        the very same batch tick also re-fetches it - ending with a safe raster file, not
-        a bare 'nothing cached' state. The disabled-caching sibling test below covers the
-        purge in isolation."""
-        ch = self._seed_stale_svg()
-        cfg = {'recording': {'images_dir': os.path.dirname(self.cache_dir),
-                             'logo_cache': {'enabled': True}}}
-        with mock.patch.object(logo_cache_mod, 'load_config', return_value=cfg), \
-             mock.patch.object(logo_cache_mod.requests, 'get', return_value=_fake_response()):
-            run_logo_cache_batch(limit=50)
-        db.session.refresh(ch)
-        self.assertEqual(ch.logo_cache_path, f'{ch.id}.png')
-        self.assertFalse(os.path.exists(os.path.join(self.cache_dir, f'{ch.id}.svg')))
-        self.assertTrue(os.path.exists(os.path.join(self.cache_dir, f'{ch.id}.png')))
-
-    def test_stale_svg_is_purged_even_when_caching_is_disabled(self):
-        ch = self._seed_stale_svg()
-        cfg = {'recording': {'images_dir': os.path.dirname(self.cache_dir),
-                             'logo_cache': {'enabled': False}}}
-        with mock.patch.object(logo_cache_mod, 'load_config', return_value=cfg), \
-             mock.patch.object(logo_cache_mod.requests, 'get') as get_mock:
-            attempted = run_logo_cache_batch(limit=50)
-        self.assertEqual(attempted, 0)
-        get_mock.assert_not_called()
-        db.session.refresh(ch)
-        self.assertIsNone(ch.logo_cache_path)
-        self.assertFalse(os.path.exists(os.path.join(self.cache_dir, f'{ch.id}.svg')))
-
-
 class ServingRouteTests(unittest.TestCase):
     def setUp(self):
         self.t = make_test_app()

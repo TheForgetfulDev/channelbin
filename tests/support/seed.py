@@ -155,13 +155,20 @@ def make_channel_test(channel, all_null=True, status='FAILED', **kw):
 
 
 def make_epg_entry(channel, title='Test Program', offset_minutes=0, duration_minutes=60,
-                   sub_title=None, description=None):
-    """One showing. `sub_title` and `description` default to NULL deliberately - that is
-    the shape most provider rows have, and it is what the airing search's `-word` handling
-    has to survive (tests/test_airing_search_negation.py)."""
-    start = _UTC_NOW() + timedelta(minutes=offset_minutes)
+                   sub_title=None, description=None, category=None, rating=None,
+                   start_time=None):
+    """One showing. `sub_title`, `description`, `category` and `rating` default to NULL
+    deliberately - that is the shape most provider rows have, and it is what the airing
+    search's `-word` handling has to survive (tests/test_airing_search_negation.py).
+
+    `start_time` pins the air time outright, for a caller that has to land a row on an
+    exact minute rather than an offset from now - the record-start metadata refresh finds
+    a program by channel plus exact start_time (dev/changelog/1055)."""
+    start = (start_time if start_time is not None
+             else _UTC_NOW() + timedelta(minutes=offset_minutes))
     entry = EPGEntry(
         channel_id=channel.id, title=title, sub_title=sub_title, description=description,
+        category=category, rating=rating,
         start_time=start, stop_time=start + timedelta(minutes=duration_minutes))
     db.session.add(entry)
     db.session.flush()

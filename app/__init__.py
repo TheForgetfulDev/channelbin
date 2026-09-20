@@ -8,6 +8,7 @@ from flask import Flask, current_app, flash, jsonify, redirect, request, url_for
 from flask_sqlalchemy import SQLAlchemy
 from flask_wtf import CSRFProtect
 from flask_wtf.csrf import CSRFError
+from werkzeug.exceptions import RequestEntityTooLarge
 
 from .db_utils import BACKGROUND_BIND, WorkloadRoutedSession
 from .fs_utils import PATH_MISSING, PATH_OK, describe_dir_problem, probe_dir
@@ -173,12 +174,28 @@ def create_app(config_overrides=None, start_scheduler=True):
     csrf.init_app(app)
 
     from .auth import wants_json as _wants_json
+    from .profile_posters import MAX_REQUEST_BYTES
+
+    # App-wide rather than per view, because CSRFProtect parses the form body in a
+    # before_request hook - a cap set inside a view would arrive after the bytes were
+    # already read. The only upload this app takes is a profile's poster image
+    # (app/profile_posters.py); every other request body is a small form or JSON document.
+    app.config['MAX_CONTENT_LENGTH'] = MAX_REQUEST_BYTES
 
     @app.errorhandler(CSRFError)
     def _handle_csrf_error(e):
         if _wants_json(request):
             return jsonify({'error': 'CSRF token missing or invalid - reload the page'}), 400
         flash('Security check failed (CSRF token missing or invalid) - please retry.', 'error')
+        return redirect(request.referrer or url_for('dashboard.dashboard'))
+
+    @app.errorhandler(RequestEntityTooLarge)
+    def _handle_too_large(e):
+        message = (f'That upload is larger than the {MAX_REQUEST_BYTES // (1024 * 1024)} MB '
+                   f'this app accepts.')
+        if _wants_json(request):
+            return jsonify({'error': message}), 413
+        flash(message, 'error')
         return redirect(request.referrer or url_for('dashboard.dashboard'))
 
     if cfg['flask'].get('behind_proxy'):
@@ -297,7 +314,7 @@ def create_app(config_overrides=None, start_scheduler=True):
                           .filter(Recording.status == REC_STATUS_IN_PROGRESS).scalar() or 0)
         # Collapsed-sidebar state, server-side so <body class="nav-min"> is in the
         # first paint - localStorage could only apply it after JS runs, which
-        # flashes the 212px sidebar on every navigation. One constant query.
+        # flashes the expanded sidebar on every navigation. One constant query.
         nav_pref = db.session.get(UserPref, 'nav_collapsed')
         try:
             nav_collapsed = bool(json.loads(nav_pref.value)) if nav_pref and nav_pref.value else False

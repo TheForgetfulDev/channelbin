@@ -6,7 +6,8 @@ break, if the port is edited carelessly:
 
   * `<body class="nav-min">` is server-rendered from the `nav_collapsed` pref. That
     is the whole reason persistence is server-side rather than localStorage: the
-    class has to be in the first paint or every navigation flashes a 212px sidebar.
+    class has to be in the first paint or every navigation flashes the expanded
+    sidebar.
     Absent when the pref is unset - server-rendered initial state equals the
     "nothing active" state (CLAUDE.md, Frontend rendering).
   * No `setup-flyout` / `setup-trigger` / `setup_flyout` token survives anywhere.
