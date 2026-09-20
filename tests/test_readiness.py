@@ -117,6 +117,12 @@ class _AppCase(unittest.TestCase):
         self.t = make_test_app()
         self.ctx = self.t.app.app_context()
         self.ctx.push()
+        # evaluate() probes the configured DVR directory, and an unwritable one raises a
+        # real ERROR-severity STORAGE_PATH_UNUSABLE alert into this test's database - which
+        # the alerts_unread check then counts as a genuine unread error. Without the
+        # sandbox these tests pass only on a machine that happens to have a writable /dvr
+        # (dev/docs/BUGS.md 2026-09-20).
+        self.t.sandbox_output_dirs()
 
     def tearDown(self):
         self.ctx.pop()
