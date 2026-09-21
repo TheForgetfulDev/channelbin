@@ -59,22 +59,47 @@
 {%- endif %}
 {%- endmacro %}
 
-{# The list row's second line: what the account is right now, then its health bands. The
-   labels carry the definitions; nothing here navigates (accounts.js NO_NAV skips
-   [data-tip]). #}
+{# The two cells that answer "is this account in trouble right now". Their own macros
+   because both row lines below show them and a second spelling of either would let one
+   surface call an account healthy while the other calls it failing. #}
+{% macro stat_avg(cur, s, bands) -%}
+<span class="a-x"><span class="a-k" data-tip="{{ s.tips.avg }}">Avg score</span>
+  {%- if cur.avg_score is none %}<span class="text-faint">-</span>
+  {%- else %}<span class="{{ cur.avg_score | health_css(bands) }} hb-text">{{ cur.avg_score | round | int }}</span>{% endif -%}
+</span>
+{%- endmacro %}
+
+{% macro stat_failing(cur, s) -%}
+<span class="a-x"><span class="a-k" data-tip="{{ s.failing_tip }}">Failing now</span>
+  {%- if cur.failing %}<span class="hb-poor hb-text">{{ '{:,}'.format(cur.failing) }}</span>{% else %}<span class="text-faint">0</span>{% endif -%}
+</span>
+{%- endmacro %}
+
+{# The Accounts list row's second line: what the account is right now, then its health
+   bands. The labels carry the definitions; nothing here navigates (accounts.js NO_NAV
+   skips [data-tip]). #}
 {% macro row_more(cur, s, bands) -%}
 <span class="a-more">
   <span class="a-x"><span class="a-k" data-tip="{{ s.tips.in_group }}">In a group</span>{{ num(cur.in_group) }}</span>
   <span class="a-x"><span class="a-k" data-tip="{{ s.tips.rec_enabled }}">Recording on</span>{{ num(cur.recording_memberships) }}</span>
   <span class="a-x"><span class="a-k" data-tip="{{ s.rows_tip }}">Guide rows</span>{{ num(cur.guide_rows_fed) }} <span class="text-faint">of {{ '{:,}'.format(cur.guide_rows_total) }}</span></span>
   <span class="a-x"><span class="a-k" data-tip="{{ s.tips.epg }}">With EPG</span>{{ num(cur.epg.with_epg) }}</span>
-  <span class="a-x"><span class="a-k" data-tip="{{ s.tips.avg }}">Avg score</span>
-    {%- if cur.avg_score is none %}<span class="text-faint">-</span>
-    {%- else %}<span class="{{ cur.avg_score | health_css(bands) }} hb-text">{{ cur.avg_score | round | int }}</span>{% endif -%}
-  </span>
-  <span class="a-x"><span class="a-k" data-tip="{{ s.failing_tip }}">Failing now</span>
-    {%- if cur.failing %}<span class="hb-poor hb-text">{{ '{:,}'.format(cur.failing) }}</span>{% else %}<span class="text-faint">0</span>{% endif -%}
-  </span>
+  {{ stat_avg(cur, s, bands) }}
+  {{ stat_failing(cur, s) }}
+</span>
+<span class="a-bands"><span class="a-k" data-tip="{{ s.tips.bands }}">Health bands</span>{{ band_bar(cur, bands) }}</span>
+{%- endmacro %}
+
+{# The Dashboard row's second line. Deliberately a SUBSET of row_more above, not a second
+   version of it: the dashboard answers "does anything need me right now", so it carries
+   the two numbers and the band bar that move on their own, and leaves the four
+   configuration counts (In a group, Recording on, Guide rows, With EPG) to /accounts,
+   where you go when you are asking what an account is set up to do. The Usage charts stay
+   off the dashboard entirely for the same reason (dev/changelog/1063). #}
+{% macro row_signal(cur, s, bands) -%}
+<span class="a-more a-more-2">
+  {{ stat_avg(cur, s, bands) }}
+  {{ stat_failing(cur, s) }}
 </span>
 <span class="a-bands"><span class="a-k" data-tip="{{ s.tips.bands }}">Health bands</span>{{ band_bar(cur, bands) }}</span>
 {%- endmacro %}

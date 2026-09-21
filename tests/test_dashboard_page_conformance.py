@@ -692,6 +692,71 @@ class RowHealthEdgeAndSortTests(unittest.TestCase):
         self.assertIn('sortChildren(', src)
         self.assertIn("querySelectorAll('.dash-head .sortable')", src)
 
+    def _account_row(self, html, acct_id):
+        m = re.search(rf'<div class="drow[^>]*data-acct="{acct_id}"[^>]*>(.*?)(?=<div class="drow|\Z)',
+                      html, re.S)
+        self.assertIsNotNone(m, f'no dashboard row for account {acct_id}')
+        return m.group(1)
+
+    def test_an_account_row_carries_the_health_signal_line(self):
+        """dev/changelog/1063: the dashboard answers "does anything need me right now", so
+        each account row carries the stats line's two moving numbers and the band bar."""
+        with self.t.app.app_context():
+            acc = make_account(name='Signal Acct')
+            db.session.commit()
+            acct_id = acc.id
+        row = self._account_row(self.client.get('/').get_data(as_text=True), acct_id)
+        self.assertIn('a-more', row)
+        self.assertIn('Avg score', row)
+        self.assertIn('Failing now', row)
+        self.assertIn('Health bands', row)
+
+    def test_the_dashboard_does_not_carry_the_windowed_usage_section(self):
+        """dev/changelog/1063 decided the charts stay on /accounts: the dashboard shows the
+        signal, not the report. The comparison table, the share pies, the trend charts and
+        the window chips are all /accounts furniture and must not appear here."""
+        html = self.client.get('/').get_data(as_text=True)
+        for marker in ('acst-table-card', 'acst-grid-shares', 'acst-grid-trends',
+                       'acst-win', 'id="acct-stats"'):
+            self.assertNotIn(marker, html, f'{marker} belongs to /accounts, not the dashboard')
+
+    def test_the_signal_line_omits_the_configuration_counts(self):
+        """The trim is the point (dev/changelog/1063). "In a group", "Recording on",
+        "Guide rows" and "With EPG" describe how an account is set up, not whether it needs
+        attention, and stay on /accounts - otherwise this is the whole section again."""
+        with self.t.app.app_context():
+            acc = make_account(name='Trimmed Acct')
+            db.session.commit()
+            acct_id = acc.id
+        row = self._account_row(self.client.get('/').get_data(as_text=True), acct_id)
+        for label in ('In a group', 'Recording on', 'Guide rows', 'With EPG'):
+            self.assertNotIn(label, row, f'{label} is /accounts detail, not a dashboard signal')
+
+    def test_an_account_with_auto_sync_off_says_so_under_next_sync(self):
+        """dev/docs/BUGS.md 2026-09-21: the row rendered a bare "-" for an account that never
+        syncs on a schedule, which reads as "nothing scheduled right now". Both Accounts
+        surfaces now go through m.account_next_sync, which names the state."""
+        with self.t.app.app_context():
+            acc = make_account(name='No Auto Sync', sync_enabled=False)
+            db.session.commit()
+            acct_id = acc.id
+        row = self._account_row(self.client.get('/').get_data(as_text=True), acct_id)
+        nxt = re.search(r'<span class="d-k">Next sync</span>(.*?)</span>\s*<span', row, re.S)
+        self.assertIsNotNone(nxt, 'no Next sync cell on the row')
+        self.assertIn('off', nxt.group(1))
+
+    def test_a_syncing_account_says_running_under_next_sync(self):
+        """The other state the dashboard used to collapse into "-" (dev/changelog/1063)."""
+        with self.t.app.app_context():
+            acc = make_account(name='Mid Sync')
+            acc.status = 'SYNCING'
+            db.session.commit()
+            acct_id = acc.id
+        row = self._account_row(self.client.get('/').get_data(as_text=True), acct_id)
+        nxt = re.search(r'<span class="d-k">Next sync</span>(.*?)</span>\s*<span', row, re.S)
+        self.assertIsNotNone(nxt, 'no Next sync cell on the row')
+        self.assertIn('running', nxt.group(1))
+
     def test_the_account_card_names_how_many_channels_are_hidden(self):
         """dev/docs/DESIGN-channel-hiding.md §11 "Counts": hidden_channel_count is rendered
         beside channel_count everywhere the latter already is, including this card."""

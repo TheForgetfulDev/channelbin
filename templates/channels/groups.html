@@ -117,8 +117,13 @@
 {% macro check_chip(g, c) %}
 {% if c.status == 'RUNNING' %}
 <span class="badge b-running tip-plain" data-menu-check="{{ g.id }}:{{ c.job_id }}" style="cursor:pointer;" data-tip="{{ c.name }}.&#10;Running now. Click for the live results page."><span class="pulse"></span>Running</span>
+{% elif c.inherited and not c.schedule_live %}
+{# The automatic check's coverage of this group is the one thing on this row nothing else
+   would report: the group has no check of its own, so with the TV Guide check's schedule
+   removed or paused, no member of it is being tested at all (changelog 1068). #}
+<span class="grp-check-chip grp-chip-none" data-menu-check="{{ g.id }}:{{ c.job_id }}" data-tip="{{ c.name }}.&#10;Not scheduled{% if c.recur_paused %} - its schedule is paused{% endif %}, so nothing is testing this group's members on its behalf. Give this group its own health check, or schedule the automatic one again.">No coverage</span>
 {% elif c.has_schedule %}
-<span class="grp-check-chip{% if c.inherited %} grp-chip-none{% endif %}" data-menu-check="{{ g.id }}:{{ c.job_id }}" data-tip="{{ c.name }}.&#10;{% if c.recurring %}{{ c.recur_description }}{% if c.recur_paused %} (paused){% endif %}{% else %}Next run {{ c.scheduled_et or 'unknown' }}{% endif %}{% if c.profile_name %}. Profile: {{ c.profile_name }}{% endif %}{% if c.inherited %}. Inherited: the automatic TV Guide check tests one channel per guide row, so it covers the member serving this group - not its other members.{% endif %}">{% if c.inherited %}Inherited coverage{% elif c.recurring %}&#8635; {{ c.recur_description }}{% else %}{{ c.scheduled_et }}{% endif %}</span>
+<span class="grp-check-chip{% if c.inherited %} grp-chip-none{% endif %}" data-menu-check="{{ g.id }}:{{ c.job_id }}" data-tip="{{ c.name }}.&#10;{% if c.recurring %}{{ c.recur_description }}{% else %}Next run {{ c.scheduled_et or 'unknown' }}{% endif %}{% if c.profile_name %}. Profile: {{ c.profile_name }}{% endif %}{% if c.inherited %}. Inherited: the automatic TV Guide check tests one channel per guide row, so it covers the member serving this group - not its other members.{% endif %}">{% if c.inherited %}Inherited coverage{% elif c.recurring %}&#8635; {{ c.recur_description }}{% else %}{{ c.scheduled_et }}{% endif %}</span>
 {% elif c.status == 'CANCELLED' %}
 <span class="grp-check-chip" data-menu-check="{{ g.id }}:{{ c.job_id }}" data-tip="{{ c.name }}.&#10;This health check was cancelled before it finished. It has no results.">Cancelled</span>
 {% else %}

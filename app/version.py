@@ -10,4 +10,4 @@ The DB schema version (PRAGMA user_version, see app/migrations.py) is an indepen
 monotonic integer and does NOT track this number.
 """
 
-__version__ = '0.13.0'
+__version__ = '0.14.0'

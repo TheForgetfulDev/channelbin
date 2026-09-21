@@ -1210,6 +1210,19 @@ def guide_row_targets(streak_threshold=DEFAULT_FAILING_STREAK_THRESHOLD,
     return [e[1] for e in entries]
 
 
+def schedule_is_live(job):
+    """True when a health check will still fire on its own - SCHEDULED, recurrence not
+    paused. Covers a one-off too, which `active_recurring_jobs()` below deliberately does
+    not: it runs once and that once is real coverage.
+
+    The ONE answer to "is anything still going to test these channels", and every surface
+    that CLAIMS coverage reads it, so none of them can promise a check that will never
+    fire. That matters most for the system TV Guide check, whose schedule the user may
+    remove like any other since dev/changelog/1068 - three surfaces advertise its
+    incidental coverage of a group, and an unscheduled check covers nothing."""
+    return job.status == 'SCHEDULED' and not job.recur_paused
+
+
 def active_recurring_jobs(include_system=True):
     """The health-check jobs that constitute ongoing monitoring, newest-id last.
 

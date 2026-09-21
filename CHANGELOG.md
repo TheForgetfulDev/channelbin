@@ -5,6 +5,32 @@ Notable changes to ChannelBin, newest first. This project follows
 release is tagged `v<version>` in git, and the version the app is running is shown in the
 page footer.
 
+## 0.14.0 - 2026-09-21
+
+**Added**
+
+- A running health check says how much longer it has left, on the group page and on the
+  Dashboard.
+- Channel search can filter on whether a health check watches a channel, so you can find the
+  holes in your monitoring.
+- Each account on the Dashboard shows its health signal: average score, how many of its
+  channels are failing now, and a band bar.
+- Account is a real column on a channel group's member table, carrying the provider's name and
+  not just a colored dot, sortable and reorderable like every other column.
+
+**Changed**
+
+- The automatic TV Guide Channels health check can be unscheduled, like every other check.
+  Where the app used to advertise that check's incidental coverage of a group, it now says No
+  coverage rather than naming a schedule that will never fire.
+- The Drops column on a group's member table is off by default.
+
+**Fixed**
+
+- The Dashboard's live timeline advances with the clock instead of freezing at the time the
+  page was loaded.
+- An account with auto-sync turned off says off under Next sync, instead of a bare dash.
+
 ## 0.13.0 - 2026-09-20
 
 **Added**

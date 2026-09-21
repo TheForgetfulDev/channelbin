@@ -69,7 +69,7 @@ class AudioColumnTests(unittest.TestCase):
     def test_the_column_is_labelled_and_sortable(self):
         js = _read('static/js/group-detail.js')
         self.assertIn("audio: 'Audio'", js)
-        sortable = js[js.index('const COL_SORTABLE ='):js.index('const FIELD_ONLY =')]
+        sortable = js[js.index('const COL_SORTABLE ='):js.index('const COL_TIP =')]
         self.assertIn('audio: true', sortable)
 
     def test_the_column_renders_its_own_td_and_not_a_subtitle_under_format(self):

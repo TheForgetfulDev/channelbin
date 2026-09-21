@@ -23,6 +23,7 @@ from typing import List, Optional
 
 from . import admission
 from .config import config_default
+from .postprocessor import EtaSmoother
 from .proc_utils import GrowthMonitor, terminate_or_kill, wait_for_file_data
 from .storage_dirs import SCREENSHOTS, image_dir
 from .toolchain import ffprobe_missing
@@ -80,6 +81,17 @@ class RunState:
     wait_started_at: Optional[datetime] = None
     wait_duration_seconds: Optional[float] = None
 
+    # How long one channel is expected to cost in wall time (its test duration plus the
+    # wait that follows it), resolved once per run from the job's health check settings.
+    # It is the denominator of the in-flight fraction below, so it is a plan, not a
+    # measurement - the estimate corrects itself against the measured rate as the run goes.
+    nominal_channel_seconds: float = 0.0
+
+    # Last smoothed estimate of wall seconds left in the run, or None for "not saying yet".
+    # Written only by _advance_eta(); get_status() reads it. See _eta_smoother for why a
+    # reader must never be the thing that advances it.
+    eta_seconds: Optional[float] = None
+
     # Between-channel context (populated during 'waiting' phase)
     last_channel_name: str = ''
     last_channel_id: Optional[int] = None
@@ -112,9 +124,16 @@ class RunState:
         self.current_job_id = None
         self.run_kind = 'job'
         self.pre_check_recording_id = None
+        self.eta_seconds = None
 
 
 _state = RunState()
+
+# The run's ETA smoother, and the monotonic reading at which it last took a sample.
+# Both are swapped out wholesale by _reset_run_state, so a finished run's smoothing
+# can never bleed into the next one.
+_eta_smoother: Optional[EtaSmoother] = None
+_eta_last_sample: float = 0.0
 
 # Monotonic across the process lifetime - see _append_log for why it must never reset.
 _log_seq = itertools.count(1)
@@ -141,6 +160,64 @@ def _append_log(level: str, message: str):
         'msg': message,
         'seq': next(_log_seq),
     })
+
+
+# Floor on how often the ETA takes a sample. The real interval is one channel's nominal
+# cost, so the smoother's +/-20% per-update clamp means "the estimate may move at most a
+# fifth per channel's worth of wall time" - a bound a person can hold in their head. A
+# faster cadence would keep that clamp from bounding anything over a channel, which is the
+# yo-yo this display had before (dev/changelog/276 fixed the same failure on conversions).
+_ETA_MIN_SAMPLE_SECONDS = 10.0
+
+# Below this many channels the run is over before an estimate could earn any trust, and
+# the elapsed/duration readouts already say everything there is to say.
+_ETA_MIN_CHANNELS = 2
+
+
+def _advance_eta():
+    """Take an ETA sample if enough wall time has passed since the last one.
+
+    Called only from the tester's own threads - the run loop at each channel boundary and
+    the in-test growth poll. A reader must NEVER call this: EtaSmoother carries state
+    across samples, so driving it from get_status() would make the estimate depend on how
+    many browser tabs happen to be open. get_status() reads _state.eta_seconds instead.
+
+    Progress is counted in fractional channels - completed, plus how far into the current
+    one we are - because whole channels alone step once every half-minute or so, and a
+    step function is what makes an estimate lurch. The in-flight fraction is capped just
+    under a whole channel so a channel that overruns flattens progress and pushes the
+    estimate UP, rather than letting it sit still and read as a stopped clock."""
+    global _eta_last_sample
+    with _lock:
+        s = _state
+        smoother = _eta_smoother
+        if (not s.is_running or smoother is None or s.run_started_at is None
+                or s.total_channels < _ETA_MIN_CHANNELS):
+            return
+        nominal = s.nominal_channel_seconds
+        now_mono = time.monotonic()
+        if now_mono - _eta_last_sample < max(_ETA_MIN_SAMPLE_SECONDS, nominal):
+            return
+        _eta_last_sample = now_mono
+
+        wall = (datetime.utcnow() - s.run_started_at).total_seconds()
+        fraction = 0.0
+        if s.current_phase == 'testing' and s.current_test_started_at and nominal > 0:
+            in_flight = (datetime.utcnow() - s.current_test_started_at).total_seconds()
+            fraction = min(0.99, max(0.0, in_flight / nominal))
+        progress = min(float(s.total_channels), s.completed_channels + fraction)
+
+        eta = smoother.update(wall, progress)
+        # Floored at a minute because every surface renders this with fmt_duration, whose
+        # smallest unit is the minute - an unfloored 45s estimate reads "~0m". Rounding an
+        # estimate up to the coarsest bucket it can be shown in is well inside what the
+        # tilde already claims.
+        if eta is not None:
+            eta = max(60.0, eta)
+        # Nothing has actually been measured until a channel has finished; before that the
+        # only input is the configured per-channel cost, and an estimate built from the
+        # settings alone would just be reading them back.
+        s.eta_seconds = eta if s.completed_channels >= 1 else None
 
 
 def get_status() -> dict:
@@ -171,6 +248,7 @@ def get_status() -> dict:
             'next_channel_id': s.next_channel_id,
             'total_channels': s.total_channels,
             'completed_channels': s.completed_channels,
+            'eta_seconds': s.eta_seconds,
             'run_started_at': s.run_started_at.isoformat() if s.run_started_at else None,
             'last_skip_reason': s.last_skip_reason,
             'current_job_id': s.current_job_id,
@@ -228,7 +306,7 @@ def _reset_run_state(job_id=None, run_kind='job', pre_check_recording_id=None, l
     the other - that gap is precisely the check-then-act race the registry closes
     (dev/changelog/679). The tester is refused by nothing, so this always grants; the
     ticket is given back by _end_run(), which every path that ends a run must call."""
-    global _state
+    global _state, _eta_smoother, _eta_last_sample
     _state = RunState(
         is_running=True,
         current_phase='testing',
@@ -237,6 +315,11 @@ def _reset_run_state(job_id=None, run_kind='job', pre_check_recording_id=None, l
         run_kind=run_kind,
         pre_check_recording_id=pre_check_recording_id,
     )
+    # Swapped rather than reset, for the same reason RunState itself is: a smoother
+    # carried over from the previous run would clamp this one's first estimates toward
+    # a number measured on a different set of channels.
+    _eta_smoother = None
+    _eta_last_sample = time.monotonic()
     _state.admission_ticket = admission.try_start(admission.KIND_TESTER, label)
 
 
@@ -254,14 +337,24 @@ def _end_run():
     admission.release(ticket)
 
 
-def _run_channel_loop(app, channels, wait_sec, job_id=None):
+def _run_channel_loop(app, channels, wait_sec, job_id=None, test_duration_sec=None):
     """Inner loop: iterate through channels, calling run_channel_test for each.
 
     Called by run_on_demand_test_job for custom and system jobs alike.
+
+    test_duration_sec is the job's resolved per-channel test length. Together with
+    wait_sec it is what one channel is expected to cost, which is the denominator the
+    ETA measures itself against; it falls back to the configured default so a caller
+    that does not resolve settings still gets a usable estimate.
     """
+    global _eta_smoother
     n = len(channels)
+    if test_duration_sec is None:
+        test_duration_sec = config_default('channel_testing.test_duration_seconds')
     with _lock:
         _state.total_channels = n
+        _state.nominal_channel_seconds = float(test_duration_sec or 0) + float(wait_sec or 0)
+        _eta_smoother = EtaSmoother(float(n))
 
     _append_log('INFO', f'Starting run - {n} channel{"s" if n != 1 else ""} to test')
     log.info('Starting channel test run: %d channels', n)
@@ -294,6 +387,13 @@ def _run_channel_loop(app, channels, wait_sec, job_id=None):
         with _lock:
             _state.completed_channels = i + 1
             stopped = _state.stop_requested
+
+        # The channel boundary is a sample point as well as the in-test poll, so the
+        # estimate keeps moving through a connect-retry loop or a between-channel wait,
+        # where no growth poll is running. It is deliberately NOT forced past the
+        # interval floor: a sample taken moments after the previous one has an almost
+        # zero denominator, and feeding that to the EWMA is the jitter this is avoiding.
+        _advance_eta()
 
         if stopped:
             _append_log('WARN', f'Run stopped by user after {i + 1}/{n} channels')
@@ -717,7 +817,9 @@ def run_on_demand_test_job(app, job_id: int, channel_id_subset: Optional[List[in
 
             job = _mark_job_running_and_commit()
 
-            wait_sec = resolve_health_check_settings(ct_cfg, job.profile)['wait_between_channels_seconds']
+            job_settings = resolve_health_check_settings(ct_cfg, job.profile)
+            wait_sec = job_settings['wait_between_channels_seconds']
+            test_duration_sec = job_settings['test_duration_seconds']
 
             if job.group is None:
                 log.error('run_on_demand_test_job: job %d has no attached group', job_id)
@@ -740,7 +842,8 @@ def run_on_demand_test_job(app, job_id: int, channel_id_subset: Optional[List[in
             # ── Phase 2: run tests - no outer app context ──────────────────────
             # run_channel_test() opens its own short-lived context per channel,
             # so there are no nested/concurrent sessions to cause lock conflicts.
-            completed = _run_channel_loop(app, channels, wait_sec, job_id=job_id)
+            completed = _run_channel_loop(app, channels, wait_sec, job_id=job_id,
+                                          test_duration_sec=test_duration_sec)
 
     finally:
         # ── Phase 3: save final status + clear module state ───────────────────
@@ -1990,6 +2093,7 @@ def _poll_for_stalls(filepath: str, duration: float, stall_threshold: float,
             log.debug('Channel test stall #%d detected at %d bytes', drop_count, monitor.last_size)
             monitor.reset()
 
+        _advance_eta()
         time.sleep(POLL_INTERVAL)
 
     return drop_count

@@ -45,6 +45,7 @@ from ..channel_groups import (
     DEFAULT_FAILING_STREAK_THRESHOLD, plan_format_selection, FORMAT_STRATEGIES,
     MATCH_REASON_STRENGTH, FORMAT_STATUS_STRENGTH,
     build_group_with_members, group_name_conflict, serving_member, touch_group,
+    schedule_is_live,
 )
 from ..config import load_config
 from ..db_utils import retry_on_locked
@@ -349,6 +350,9 @@ def _check_ctx(job, channel_ids, inherited, tests_by_job=None, ct_cfg=None):
         'completed_et': _fmt_et(job.completed_at),
         'completed_iso': job.completed_at.isoformat() if job.completed_at else '',
         'has_schedule': bool(job.recurring or job.status == 'SCHEDULED'),
+        # Narrower than has_schedule, which a paused recurring job still satisfies:
+        # this one is "will it actually fire", and is what a coverage claim reads.
+        'schedule_live': schedule_is_live(job),
         'inherited': inherited,
         'profile_name': job.profile.name if job.profile else None,
         'detail_url': url_for('channels.health_check_detail', job_id=job.id),
@@ -870,12 +874,11 @@ GROUP_DETAIL_SECTIONS = ('summary', 'linked', 'settings', 'channels', 'activity'
 # and filtered on its own (dev/changelog/755). The system group has no memberships, so it
 # has neither column.
 #
-# `account` is the one entry that is a FIELD rather than a column: it renders inside the
-# Channel cell as the account dot on a desktop, and as its own line on the phone card. It
-# is in this list anyway because "show the account at all" is a question a user with a
-# single account answers once and for all, and a hideable field needs somewhere to be
-# hidden from (dev/changelog/758). The client keeps it out of the <td> list and
-# out of the drag-to-reorder set - it has no column position to move.
+# `account` is a column of its own carrying the account's colour dot and its name
+# (dev/changelog/1064). It was a dot inside the Channel cell until then, which made it the
+# one entry the Columns popover could not reorder. A user with a single account still turns
+# it off here, which is why it was a hideable entry in the first place (dev/changelog/758);
+# the phone card draws it under the name rather than in a track.
 GROUP_DETAIL_COLUMNS = {
     'check': ('rec', 'test', 'status', 'score', 'res', 'fps', 'audio', 'framePct', 'bitrate', 'drops', 'shot', 'epg', 'account'),
     'channel': ('rec', 'test', 'score', 'res', 'fps', 'audio', 'bitrate', 'epg', 'account'),
@@ -887,8 +890,15 @@ GROUP_DETAIL_COLUMNS = {
 # (dev/changelog/769), but a column that is on for everybody would push the video stats right
 # on the many groups whose members all carry the same stereo AAC. EPG id joins them for the
 # same reason and is turned on for you by the mismatch banner's own Review members button,
-# which is the one moment it answers a question (dev/changelog/904).
-GROUP_DETAIL_COLUMNS_OFF = ('fps', 'framePct', 'audio', 'epg')
+# which is the one moment it answers a question (dev/changelog/904). Drops joins them
+# (dev/changelog/1064): a drop count is a detail you go looking for after the health score
+# and the frame percentage have already told you a feed is unwell, and on the overwhelming
+# majority of members it is a column of zeroes.
+#
+# A browser that already stored a layout keeps whatever it stored - a default only ever
+# decides what a key starts as, and overriding a visibility the user is already storing is
+# the app answering a question that belongs to them.
+GROUP_DETAIL_COLUMNS_OFF = ('fps', 'framePct', 'audio', 'epg', 'drops')
 
 
 def _group_detail_job(group):
@@ -1392,6 +1402,11 @@ def build_group_detail_context(group, job, pinned_check=False):
                     'job_id': system_job.id,
                     'name': system_job.name,
                     'recur_description': _recur_label(system_job, ct_cfg),
+                    # Its schedule is the user's to remove (dev/changelog/1068), and an
+                    # unscheduled check covers nothing - so the two surfaces that
+                    # advertise this coverage say which it is rather than assuming.
+                    'schedule_live': schedule_is_live(system_job),
+                    'recur_paused': system_job.recur_paused,
                     'channel_count': covered,
                     'detail_url': url_for('channels.health_check_detail', job_id=system_job.id),
                 }

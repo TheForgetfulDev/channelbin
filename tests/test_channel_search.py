@@ -29,6 +29,7 @@ import os
 import sys
 import unittest
 from datetime import datetime, timedelta
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -41,12 +42,13 @@ from tests.support.search import only_hiding  # noqa: E402
 from app import db  # noqa: E402
 from app.accounts import NORM_DISABLED, NORM_MPEGTS  # noqa: E402
 from app.channel_groups import set_participation  # noqa: E402
+from app import channel_tester  # noqa: E402
 from app.database import (AccountSyncLog, Channel, ChannelGroup,  # noqa: E402
-                          ChannelGroupMember, EPGEntry, Tag, TagPattern)
+                          ChannelGroupMember, EPGEntry, OnDemandTestJob, Tag, TagPattern)
 from app.channel_search import (  # noqa: E402
     DEFAULT_FIELDS, DEFAULT_SORT, DEFAULT_STANDING, GRAIN_AIRINGS, GROUP_ANY,
     HEALTH_VALUES, MAX_PAGE_SIZE, OTHER_DUP_URL, OTHER_GUIDE_OWN_ROW, OTHER_GUIDE_VIA_GROUP,
-    OTHER_IN_GUIDE, OTHER_NEW, OTHER_REMOVED, OTHER_VALUES,
+    OTHER_IN_GUIDE, OTHER_MONITORED, OTHER_NEW, OTHER_REMOVED, OTHER_VALUES,
     STANDING_OPTIONS, DimensionFilter, SearchContext, SearchState, SearchStateError,
     search, standing_applied)
 from app.search_index import rebuild_search_indexes  # noqa: E402
@@ -933,6 +935,164 @@ class GuideScopeHalvesTests(_EngineTestCase):
                          len(self.half(OTHER_GUIDE_VIA_GROUP)))
 
 
+class MonitoredFilterTests(_EngineTestCase):
+    """`f.other=monitored` - is anything re-checking this channel on a schedule RIGHT NOW.
+
+    Coverage, not history. The `showuntested` standing option already answers "was this ever
+    tested", which says nothing about whether anything will look at it again; excluding this
+    value is how a user finds the channels their monitoring misses (dev/changelog/1065).
+
+    Every assertion here is ultimately the same one: the filter must return exactly what
+    `channel_tester.monitored_channel_ids()` returns. That function is the definition - it
+    ranks members in Python to decide which one a scheduleless group's automatic check
+    probes - and a second answer spelled in SQL would show up as a channel this page calls
+    unmonitored while its group page says it is being checked.
+
+    The seeded corpus supplies the shape: the in-guide `Fox` group holds US| ESPN2 HD and
+    BBC World News, and nothing carries a schedule until a test adds one.
+    """
+
+    def _schedule(self, group, recurring=True, paused=False, status='SCHEDULED'):
+        """An active recurring check on `group`. All three conditions matter -
+        `channel_groups.active_recurring_jobs()` counts a job only when it is recurring,
+        SCHEDULED and not paused."""
+        job = OnDemandTestJob(name=f'{group.name} check', group_id=group.id, status=status,
+                              recurring=recurring, recur_paused=paused, recur_day=0,
+                              recur_hour=3, recur_minute=0)
+        db.session.add(job)
+        db.session.commit()
+        return job
+
+    def monitored(self):
+        return self.names(self.no_standing(
+            filters=(DimensionFilter('other', (OTHER_MONITORED,)),)))
+
+    def unmonitored(self):
+        return self.names(self.no_standing(
+            filters=(DimensionFilter('other', ex=(OTHER_MONITORED,)),)))
+
+    def expected(self):
+        """What the definition says, as names - the thing the filter has to reproduce."""
+        from app.channel_tester import monitored_channel_ids
+        ids = monitored_channel_ids()
+        return sorted(c.name for c in Channel.query.filter(Channel.id.in_(ids)).all())
+
+    def test_the_automatic_guide_check_is_coverage_on_its_own(self):
+        """With no group schedule anywhere, the pinned TV Guide check still probes ONE
+        member per guide row - so Fox's serving member is monitored and the other member is
+        a genuine hole. Counting the whole group here would be the false-reassuring answer
+        (dev/changelog/752)."""
+        self.assertEqual(self.monitored(), ['US| ESPN2 HD'])
+        self.assertEqual(self.monitored(), self.expected())
+        self.assertIn('BBC World News', self.unmonitored())
+
+    def test_empty_is_a_real_answer(self):
+        """Pausing the automatic check leaves nothing monitored at all, and the filter says
+        so both ways round rather than quietly matching everything."""
+        system = OnDemandTestJob.query.filter_by(is_system=True).one()
+        system.recur_paused = True
+        db.session.commit()
+        self.assertEqual(self.expected(), [])
+        self.assertEqual(self.monitored(), [])
+        self.assertEqual(self.unmonitored(), self.all_names())
+
+    def test_a_groups_own_schedule_monitors_every_participating_member(self):
+        """A group that carries its own schedule is checked member by member - that is the
+        division of labor the automatic check's one-probe fallback exists against."""
+        self._schedule(self.group)
+        self.assertEqual(self.monitored(), ['BBC World News', 'US| ESPN2 HD'])
+        self.assertEqual(self.monitored(), self.expected())
+
+    def test_a_paused_or_one_shot_job_is_not_a_schedule_of_its_own(self):
+        """"Active recurring" is read from active_recurring_jobs() rather than restated, so
+        a paused job and a one-shot job both leave the group on the automatic check's single
+        probe instead of promoting every member into coverage."""
+        job = self._schedule(self.group, paused=True)
+        self.assertEqual(self.monitored(), ['US| ESPN2 HD'])
+        job.recur_paused = False
+        job.recurring = False
+        db.session.commit()
+        self.assertEqual(self.monitored(), ['US| ESPN2 HD'])
+        self.assertEqual(self.monitored(), self.expected())
+        job.recurring = True
+        db.session.commit()
+        self.assertEqual(self.monitored(), ['BBC World News', 'US| ESPN2 HD'])
+
+    def test_a_members_health_check_switch_off_takes_it_out_of_coverage(self):
+        """The participation switch is what a run reads, so turning it off is a real hole -
+        the channel keeps its membership and stops being checked."""
+        self._schedule(self.group)
+        member = next(m for m in self.group.memberships if m.channel_id == self.bbc.id)
+        set_participation(member, 'test_enabled', False)
+        db.session.commit()
+        self.assertEqual(self.monitored(), ['US| ESPN2 HD'])
+        self.assertEqual(self.monitored(), self.expected())
+        self.assertIn('BBC World News', self.unmonitored())
+
+    def test_the_channel_wide_off_switch_wins_over_the_membership(self):
+        """Channel.test_enabled is an off switch and beats the membership's own (see
+        DESIGN-channel-groups-model.md 4.2). check_run_channels resolves both, which is
+        exactly why this filter reads it instead of joining the membership table itself."""
+        self._schedule(self.group)
+        self.espn2.test_enabled = False
+        db.session.commit()
+        self.assertEqual(self.monitored(), ['BBC World News'])
+        self.assertEqual(self.monitored(), self.expected())
+
+    def test_the_two_sides_partition_the_corpus(self):
+        """Include and exclude are complements over the same set. If they ever stop adding
+        back up to the whole, one of them has grown a second definition."""
+        self._schedule(self.group)
+        self.assertEqual(sorted(self.monitored() + self.unmonitored()), self.all_names())
+        self.assertEqual(set(self.monitored()) & set(self.unmonitored()), set())
+
+    def test_the_facet_count_matches_the_filter(self):
+        """The rail's number and the list it opens are one question asked twice."""
+        self._schedule(self.group)
+        facets = search(SearchState(standing=only_hiding(), facets=('other',)),
+                        self.context()).facets['other']
+        self.assertEqual(facets[OTHER_MONITORED], len(self.monitored()))
+        self.assertEqual(facets[OTHER_MONITORED], 2)
+
+    def test_a_group_row_answers_for_its_members(self):
+        """A group is a row on this grain, and it is monitored when any member is. Answering
+        `false` for groups the way the provider-shaped values do would drop exactly the
+        scheduleless groups whose one probed member is the fallback's whole point."""
+        self._schedule(self.group)
+        self.assertEqual(self.group_names(self.no_standing(
+            filters=(DimensionFilter('other', (OTHER_MONITORED,)),))), ['Fox'])
+        self.assertEqual(self.group_names(self.no_standing(
+            filters=(DimensionFilter('other', ex=(OTHER_MONITORED,)),))), [])
+
+    def test_the_id_set_is_resolved_once_per_request(self):
+        """The set costs ~60ms against the production database, and the filter, the standing
+        breakdown and every facet aggregate all ask for it - so the memo on SearchContext is
+        load-bearing rather than tidiness (CLAUDE.md: no hidden I/O in per-row loops)."""
+        self._schedule(self.group)
+        ctx = self.context()
+        calls = []
+        real = channel_tester.monitored_channel_ids
+
+        def counting():
+            calls.append(1)
+            return real()
+
+        with mock.patch.object(channel_tester, 'monitored_channel_ids', counting):
+            search(SearchState(standing=only_hiding(), facets=('other',),
+                               filters=(DimensionFilter('other', (OTHER_MONITORED,)),)), ctx)
+        self.assertEqual(sum(calls), 1)
+
+    def test_a_request_that_never_asks_never_pays(self):
+        """The memo is lazy on purpose: a search that neither filters on this value nor
+        draws the Other rail must not spend the query budget resolving it."""
+        self._schedule(self.group)
+        ctx = self.context()
+        with mock.patch.object(channel_tester, 'monitored_channel_ids',
+                               side_effect=AssertionError('resolved without being asked')):
+            search(SearchState(standing=only_hiding(), facets=()), ctx)
+        self.assertIsNone(ctx.monitored_ids)
+
+
 class StandingOptionTests(_EngineTestCase):
     """Preferences that survive every search - and are counted, never silently applied."""
 
@@ -1100,7 +1260,8 @@ class FacetCountTests(_EngineTestCase):
         self.assertEqual(set(empty['health'].values()), {0})
         self.assertEqual(empty['other'],
                          {OTHER_REMOVED: 0, OTHER_NEW: 0, OTHER_IN_GUIDE: 0,
-                          OTHER_GUIDE_OWN_ROW: 0, OTHER_GUIDE_VIA_GROUP: 0, OTHER_DUP_URL: 0})
+                          OTHER_GUIDE_OWN_ROW: 0, OTHER_GUIDE_VIA_GROUP: 0, OTHER_DUP_URL: 0,
+                          OTHER_MONITORED: 0})
         # Spelled out rather than built from OTHER_VALUES on purpose: this is the assertion
         # that a value added to the registry reaches the rail, so deriving it from the
         # registry would make it agree with itself and check nothing.

@@ -242,6 +242,32 @@ def _series(trend, account_id, column):
 # The one call a page makes
 # ---------------------------------------------------------------------------
 
+def rows_context(cfg, accounts):
+    """What a page needs to draw the account ROWS' second line, and nothing more.
+
+    The Dashboard shows `row_signal` on each of its account rows but none of the windowed
+    section, so it takes this instead of `section_context()` below: the ledger readers
+    (`windowed_stats`, `trend`) answer a question that page does not ask, and their queries
+    would be paid for on the app's landing page on every load (dev/changelog/1063).
+
+    Deliberately does NOT run the catch-up fold. `current_stats` reads the live tables, not
+    the ledger, so nothing here needs it - and folding would mean a COMMIT on the most-
+    visited page in the app. `/accounts`, the account page and the scheduled job all keep
+    the ledger current for the surfaces that actually read it.
+
+    Takes the accounts rather than loading them, because with no commit there is no session
+    expiry to sequence around - the caller may load them whenever it likes. `section_context`
+    cannot make that offer and says why in its own docstring."""
+    ids = [a.id for a in accounts]
+    current = account_stats.current_stats(ids, cfg)
+    return {
+        'current': current,
+        'tips': TIPS,
+        'rows_tip': rows_tip(next(iter(current.values()))['guide_rows_total'] if current else 0),
+        'failing_tip': failing_tip(cfg),
+    }
+
+
 def section_context(window, cfg, app, account_ids=None):
     """Everything the stats macros render, for every account, oldest first - the order the
     Accounts list shows them in, and `ctx['accounts']` is the list a page should render.

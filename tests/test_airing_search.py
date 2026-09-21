@@ -1037,6 +1037,14 @@ class QueryPlanTests(_AiringTestCase):
     def _statements(self, **kw):
         state = SearchState(grain=GRAIN_AIRINGS, **kw)
         ctx = self.context()          # built outside the window - it runs its own queries
+        # The `monitored` Other value resolves an id set in Python (channel_tester's
+        # monitored_channel_ids), and it is a per-CONTEXT fact like everything else build()
+        # reads - lazy only so a search that never asks for it does not pay. Warm it here
+        # for the same reason the context itself is built outside the window: these counts
+        # are about the shape of the facet pass, not about one-off context resolution.
+        # That it resolves exactly once per request is asserted separately, by
+        # test_channel_search.MonitoredFilterTests (dev/changelog/1065).
+        ctx.monitored_channel_ids()
         # The unfiltered airing breakdown is cached (dev/changelog/598) - clear it first so
         # every measurement is a cold statement count, not a cache hit skewed by an earlier
         # call in the same test.

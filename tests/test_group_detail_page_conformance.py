@@ -1412,9 +1412,9 @@ class PhoneLayoutTests(unittest.TestCase):
         self.assertIn('class="btn', fn)
         self.assertIn("'<div class=\"empty-state\">No channels match.</div>'", fn)
 
-    # ── The Account field, on both widths ────────────────────────────────────
+    # ── The Account column, on both widths ───────────────────────────────────
 
-    def test_the_account_field_is_hideable_on_every_facet(self):
+    def test_the_account_column_is_hideable_on_every_facet(self):
         """"Imagine a scenario where a user only has 1 account (will be true for many). Not
         being able to hide that field is a waste of space." So it is a real entry in the
         shared visibility set, not a phone-only extra."""
@@ -1428,19 +1428,36 @@ class PhoneLayoutTests(unittest.TestCase):
         two answers to one question. Both read `colState` through `fieldOn()`."""
         self.assertEqual(self.js.count("jsonFetch(`/api/user-prefs/group_detail_columns_"), 1)
         self.assertIn('const fieldOn = (k) => !colState.hidden.includes(k);', self.js)
-        name = self.js[self.js.index('function nameCell('):self.js.index('// One participation switch')]
-        self.assertIn("fieldOn('account')", name, 'the desktop account dot is gated too')
+        # The desktop gate is `columns()` itself - an off column never reaches `cell()` - so
+        # there is no second `fieldOn('account')` to look for on that side.
+        cols = self.js[self.js.index('function columns()'):self.js.index('function buildColMenu()')]
+        self.assertIn('colState.order.filter(k => fieldOn(k))', cols)
         card = self.js[self.js.index('function memberCard('):self.js.index('function renderCards()')]
         self.assertIn("fieldOn('account')", card)
 
-    def test_a_field_only_entry_is_not_a_column_and_is_not_draggable(self):
-        """It renders inside the Channel cell, so it has no column position - a grip that
-        moved nothing would be a control that lies."""
-        self.assertIn('const FIELD_ONLY = { account: true };', self.js)
-        cols = self.js[self.js.index('function columns()'):self.js.index('function buildColMenu()')]
-        self.assertIn('!FIELD_ONLY[k]', cols)
+    def test_the_account_column_draws_the_dot_and_the_name(self):
+        """A bare colour dot says two members are on different providers without saying which
+        one either is, and the name is the thing the user is actually reading for."""
+        cell = self.js[self.js.index("      case 'account': {"):self.js.index("      case 'acts':")]
+        self.assertIn('class="acct-dot"', cell)
+        self.assertIn('r.account_name', cell)
+        self.assertIn('class="gd-acct-name"', cell)
+        name = self.js[self.js.index('function nameCell('):self.js.index('// One participation switch')]
+        self.assertNotIn('acct-dot', name, 'the dot moved out of the Channel cell, not copied')
+
+    def test_every_column_entry_is_draggable(self):
+        """Account used to be the one entry with no grip, so it was the one entry the
+        Columns popover could not move - a control that lies about what it does."""
+        self.assertNotIn('FIELD_ONLY', self.js, 'the field-only carve-out is gone, not renamed')
         menu = self.js[self.js.index('function buildColMenu()'):self.js.index('const FILTER_DIMS = [')]
-        self.assertIn('item.draggable = !FIELD_ONLY[key];', menu)
+        self.assertIn('item.draggable = true;', menu)
+        self.assertEqual(menu.count('item.draggable'), 1, 'one answer for every entry')
+
+    def test_drops_is_off_until_it_is_asked_for(self):
+        """A drop count is what you look up after the score and the frame percentage have
+        already said a feed is unwell; on nearly every member it is a column of zeroes."""
+        from app.routes.channel_groups import GROUP_DETAIL_COLUMNS_OFF
+        self.assertIn('drops', GROUP_DETAIL_COLUMNS_OFF)
 
     def test_the_phone_field_picker_offers_the_same_set(self):
         """The Filters sheet's field list is DESIGN.md §9.4's amendment - visibility only,

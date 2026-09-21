@@ -187,6 +187,10 @@ function pollHealthCheck() {
         row.style.setProperty('--pct', `${pct.toFixed(1)}%`);
       }
       setEl('hc-results', `${data.pass_count}P ${data.warn_count}W ${data.fail_count}F`);
+      // A magnitude, not a countdown - the server re-estimates about once per channel, so
+      // this holds still between samples while the elapsed ticker above it keeps moving.
+      // Blank until a channel has finished, because until then nothing has been measured.
+      setEl('hc-eta', data.eta_seconds != null ? `~${fmtDur(data.eta_seconds, false)} left` : '');
       _hcRunStartedAt = data.run_started_at;
 
       setTimeout(pollHealthCheck, 3000);
@@ -242,6 +246,14 @@ const TL = {
   // on NOW rather than at the start of the window, because an axis that opens two
   // hours in the past is an axis whose first screen is already spent.
   scrollLeft: null,
+  // The clock the axis is drawn against, as two readings taken at the same instant:
+  // the server's `now` from the page blob, and what this browser's clock said when the
+  // blob was read. advanceNow() adds the ELAPSED browser time to the server's reading
+  // rather than taking Date.now() outright, because every other time on this axis - a
+  // bar's start and end, a job's next run - is the server's. A machine whose clock is
+  // ten minutes out would otherwise slide the whole drawing ten minutes sideways at the
+  // first tick and keep it there, and the row counters beside it are server-timed too.
+  serverNow: 0, readAt: 0,
 };
 
 const isPhone = () => window.matchMedia('(max-width: 768px)').matches;
@@ -477,6 +489,36 @@ function wireScroller() {
   sync();
 }
 
+/* ── The axis keeps time ──────────────────────────────────────────────────────
+   Everything the timeline draws is positioned against TL.data.now: the hour ticks,
+   every bar's left edge, and the captured share of a live recording's bar. Without
+   a tick that number stays at the server's render time forever, so the whole card
+   is a photograph taken at page load while the row beneath it counts up every
+   second from SSE - an hour on a dashboard left open is an hour of the axis being
+   wrong with nothing saying so.
+
+   The now-line itself does NOT move, and that is correct rather than a symptom:
+   TL.start is always now - TL_BACK_HOURS, so tlPx(now) is a constant. NOW is a
+   fixed post and the drawing slides leftward underneath it, which is also why the
+   restored scroll offset in wireScroller keeps it at the same place on screen.
+
+   renderTimeline stays the ONE writer of #tl (the one-updater-per-region rule) -
+   the timer, the visibility handler and the resize listener all call it and none
+   of them touches the region itself. */
+function advanceNow() {
+  if (!TL.data) return;
+  TL.data.now = TL.serverNow + (Date.now() - TL.readAt);
+}
+
+function startTimelineClock() {
+  const tick = () => { advanceNow(); renderTimeline(); };
+  setInterval(() => { if (!document.hidden) tick(); }, MIN);
+  // A hidden tab skips its ticks, so it owes a render the moment it is looked at
+  // again - otherwise coming back to a backgrounded dashboard shows an axis up to a
+  // minute stale, which is the same defect in miniature.
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) tick(); });
+}
+
 /* A phone has no hover, so the desktop tooltip is not a design (16.5 item 1).
    Tapping a bar or a job marker opens a bottom sheet carrying exactly what the
    tooltip carries. The sheet is free: .modal-panel already becomes one at ≤768px,
@@ -662,10 +704,14 @@ function initDashboard() {
   }
 
   TL.data = readJson('dash-timeline');
+  // Both readings together, before anything else can cost time between them.
+  TL.serverNow = TL.data ? TL.data.now : 0;
+  TL.readAt = Date.now();
   renderTimeline();
   // The scale is a property of the breakpoint, and the breakpoint can change under a
   // live page. Re-rendering restores the saved scroll position by way of TL.scrollLeft.
   window.addEventListener('resize', renderTimeline);
+  startTimelineClock();
 
   wireDashSort();
   connect();
