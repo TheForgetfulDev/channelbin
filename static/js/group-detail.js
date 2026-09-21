@@ -170,13 +170,11 @@
   // ── Column layout, persisted server-side (DESIGN.md 3.11) ─────────────────
 
   const COL_LABEL = { rec: 'Recording', test: 'Health check', status: 'Status', score: 'Score', res: 'Format', fps: 'FPS', audio: 'Audio', framePct: 'Frames', bitrate: 'Bitrate', drops: 'Drops', shot: 'Screenshot', epg: 'EPG id', account: 'Account' };
-  const COL_SORTABLE = { rec: true, test: true, status: true, score: true, res: true, fps: true, audio: true, framePct: true, bitrate: true, drops: true, shot: false, epg: true, account: false };
-  // Entries that are hideable FIELDS rather than columns: they render inside the Channel
-  // cell (the account dot) or on the phone card's own line, so they have no <td> of their
-  // own and no column position to drag. They are in `colState` regardless, because "show
-  // the account at all" is a real question for the many users with one account, and one
-  // toggle serving both widths beats a second field-visibility store (dev/changelog/758).
-  const FIELD_ONLY = { account: true };
+  const COL_SORTABLE = { rec: true, test: true, status: true, score: true, res: true, fps: true, audio: true, framePct: true, bitrate: true, drops: true, shot: false, epg: true, account: true };
+  // Account is a column like any other here (dev/changelog/1064). It used to be the one
+  // entry that drew inside the Channel cell as a bare dot, which made it the one entry with
+  // no column position to drag - a grip that would not move. The phone card still draws it
+  // on its own line rather than in a track, which is why PICKABLE_FIELDS below names it.
   // The two participation headers carry the tooltip that says what the switch under them
   // means - the labels are one word each and neither is self-explanatory.
   const COL_TIP = {
@@ -187,6 +185,8 @@
     epg: 'EPG id.&#10;The XMLTV channel id this member&#39;s listings are matched on. A group fills ' +
       'one guide row per program from whichever member wins, so members carrying different ids ' +
       'paint that row from unrelated schedules.',
+    account: 'Account.&#10;The provider account this feed comes from. Members on different ' +
+      'accounts fail over independently; members on one account share its connection limit.',
   };
   const PART_COLS = { rec: 'recording_enabled', test: 'test_enabled' };
 
@@ -230,7 +230,7 @@
     if (G.hasCheck || G.hasChannel) cols.push({ k: 'select', label: '', sort: false });
     cols.push({ k: 'caret', label: '', sort: false });
     cols.push({ k: 'name', label: 'Channel', sort: true });
-    colState.order.filter(k => !FIELD_ONLY[k] && fieldOn(k))
+    colState.order.filter(k => fieldOn(k))
       .forEach(k => cols.push({ k, label: COL_LABEL[k], sort: COL_SORTABLE[k], tip: COL_TIP[k] }));
     cols.push({ k: 'acts', label: '', sort: false });
     return cols;
@@ -243,32 +243,30 @@
     colState.order.forEach(key => {
       const item = document.createElement('label');
       item.className = 'col-item';
-      // A field-only entry gets no grip and is not draggable: it renders inside another
-      // cell, so there is no column position for a drag to move and a grip that did
-      // nothing would be a control that lies.
-      item.draggable = !FIELD_ONLY[key];
+      // Every entry is a column and every column carries a grip: a popover where one row
+      // will not move is a control that lies about what it does, which is what the Account
+      // entry was until dev/changelog/1064.
+      item.draggable = true;
       item.dataset.key = key;
-      item.innerHTML = (FIELD_ONLY[key] ? '<span class="grip"></span>' : `<span class="grip">&#8942;&#8942;</span>`) +
+      item.innerHTML = `<span class="grip">&#8942;&#8942;</span>` +
         `<input type="checkbox" ${fieldOn(key) ? 'checked' : ''}> ${escHtml(COL_LABEL[key])}`;
       item.querySelector('input').addEventListener('change', (e) => {
         toggleField(key, e.target.checked);
         renderList();
       });
-      if (!FIELD_ONLY[key]) {
-        item.addEventListener('dragstart', (e) => e.dataTransfer.setData('text/plain', key));
-        item.addEventListener('dragover', (e) => e.preventDefault());
-        item.addEventListener('drop', (e) => {
-          e.preventDefault();
-          const from = e.dataTransfer.getData('text/plain');
-          if (!from || from === key) return;
-          const order = colState.order.filter(k => k !== from);
-          order.splice(order.indexOf(key), 0, from);
-          colState.order = order;
-          saveColumns();
-          buildColMenu();
-          renderList();
-        });
-      }
+      item.addEventListener('dragstart', (e) => e.dataTransfer.setData('text/plain', key));
+      item.addEventListener('dragover', (e) => e.preventDefault());
+      item.addEventListener('drop', (e) => {
+        e.preventDefault();
+        const from = e.dataTransfer.getData('text/plain');
+        if (!from || from === key) return;
+        const order = colState.order.filter(k => k !== from);
+        order.splice(order.indexOf(key), 0, from);
+        colState.order = order;
+        saveColumns();
+        buildColMenu();
+        renderList();
+      });
       menu.insertBefore(item, note);
     });
   }
@@ -554,6 +552,9 @@
       // channel. The empty string is the no-id sentinel, matching the untested columns'
       // -1: a first click sorts descending and puts it at the bottom.
       case 'epg': return (r.epg_channel_id || '').toLowerCase();
+      // Sorted on the name rather than the id, because the name is what the cell shows and
+      // the id's order is an import artifact nobody can see.
+      case 'account': return (r.account_name || '').toLowerCase();
       default: return -1;
     }
   }
@@ -767,9 +768,6 @@
     // deliberate choice, not a problem, and its own switch already says so.
     const dim = rowDims(r);
     let h = `<div class="gd-namecell">${logoHtml(r)}` +
-      (fieldOn('account')
-        ? `<span class="acct-dot tip-plain" style="background:${escHtml(r.account_color || '')}" data-tip="${escHtml(r.account_name || 'Account')}.&#10;Provider account this feed comes from."></span>`
-        : '') +
       `<a href="/channels/${r.channel_id}" class="gd-name-link${dim ? ' dim' : ''}">${escHtml(r.channel_name)}</a>`;
     if (G.hasChannel && r.is_best && r.recording_enabled) {
       h += ` <span class="gd-best tip-plain" data-tip="Best eligible member.&#10;Highest health score among the members switched on for recording, so a recording starts here and fails over downward.">&#9733;</span>`;
@@ -880,6 +878,16 @@
         // cell alone is a coupled value with nothing holding the two ends together.
         return `<td><span class="gd-epg-id tip-plain" data-tip="EPG id.&#10;${escHtml(r.epg_channel_id)}">` +
           `${escHtml(r.epg_channel_id)}</span></td>`;
+      }
+      case 'account': {
+        const name = r.account_name || 'Account';
+        // Clamped on the inner span for the same reason the EPG id is: a sortable column's
+        // <th> carries `sortable` rather than a `gd-c-*` class, so a width put on the body
+        // cell alone is a coupled value with nothing holding the other end. The full name
+        // rides the tooltip, so clamping a long one loses nothing.
+        return `<td><span class="gd-acct tip-plain" data-tip="${escHtml(name)}.&#10;Provider account this feed comes from.">` +
+          `<span class="acct-dot" style="background:${escHtml(r.account_color || '')}"></span>` +
+          `<span class="gd-acct-name">${escHtml(name)}</span></span></td>`;
       }
       case 'acts':
         return `<td class="gd-c-acts"><span class="gd-rowacts">` +
@@ -1033,7 +1041,11 @@
 
   // The two participation switches are never in the field picker - they are what the page
   // exists to set - and neither is the name or anything explaining why a member is flagged.
-  const PICKABLE_FIELDS = () => colState.order.filter(k => CARD_FIELDS.includes(k) || FIELD_ONLY[k]);
+  // `account` is named separately because it is the one pickable field a card does not draw
+  // on the stat line: it has its own line under the name, so CARD_FIELDS cannot carry it.
+  const CARD_EXTRA_FIELDS = ['account'];
+  const PICKABLE_FIELDS = () => colState.order
+    .filter(k => CARD_FIELDS.includes(k) || CARD_EXTRA_FIELDS.includes(k));
 
   // The stats the desktop puts in columns, on one line. Never truncated and never a fixed
   // track: a card line is not a table track, so there is no header to slide off it.
@@ -2995,6 +3007,10 @@
     byId('gd-hs-drops').textContent = s.current_test_drop_count ?? 0;
     byId('gd-hs-data').textContent = fmtBytes(s.current_live_bytes || 0);
     byId('gd-hs-progress').textContent = `${s.completed_channels}/${s.total_channels}`;
+    // A magnitude, not a countdown: the server re-estimates about once per channel, so
+    // this holds steady between samples while Run elapsed keeps moving. The tilde is what
+    // says it is an estimate. Em dash while the run has not measured a channel yet.
+    byId('gd-hs-eta').textContent = s.eta_seconds != null ? `~${fmtDur(s.eta_seconds, false)}` : '—';
     byId('gd-hero-bar').style.width = (s.total_channels > 0 ? Math.round(s.completed_channels / s.total_channels * 100) : 0) + '%';
     byId('gd-hs-elapsed-stat').style.display = waiting ? 'none' : '';
     const wrap = byId('gd-hero-shot-wrap');

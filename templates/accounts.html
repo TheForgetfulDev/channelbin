@@ -138,12 +138,7 @@ Sync cancelled before it finished.
       <span class="a-num"><span class="a-k">Channels</span>{{ '{:,}'.format(account.channel_count or 0) }}{% if account.hidden_channel_count %}<span class="a-note">{{ '{:,}'.format(account.hidden_channel_count) }} hidden</span>{% endif %}</span>
       <span class="a-num"><span class="a-k">In guide</span>{{ '{:,}'.format(guide_counts.get(account.id, 0)) }}</span>
       <span class="a-num"><span class="a-k">EPG</span>{{ '{:,}'.format(account.epg_entry_count or 0) }}</span>
-      <span class="a-num"><span class="a-k">Next sync</span>
-        {%- if not account.sync_enabled %}<span class="text-faint">off</span>
-        {%- elif syncing %}<span class="text-muted">running</span>
-        {%- elif next_sync[account.id] %}{{ next_sync[account.id] | time_until }}
-        {%- else %}<span class="text-faint">-</span>{% endif -%}
-      </span>
+      <span class="a-num"><span class="a-k">Next sync</span>{{ m.account_next_sync(account, next_sync[account.id]) }}</span>
     </span>
     {# The trailing cell keeps its own class even though it holds one button, or it takes
        the default grid order and shifts every header label off its column (§17.6). #}

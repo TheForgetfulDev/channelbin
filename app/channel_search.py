@@ -349,7 +349,14 @@ DIMENSIONS = (
                    'Duplicated stream URL composes with the Show '
                    'duplicates standing option rather than overriding it, so with that one '
                    'off you get one survivor per cluster and the count line says how many '
-                   'copies are still hidden.'),
+                   'copies are still hidden.\n\n'
+                   'Monitored by a health check means something re-checks this channel on a '
+                   'schedule, so its resolution and frame rate will not go stale: every '
+                   'participating member of a group that carries its own schedule, plus the '
+                   'one channel the automatic TV Guide check probes for each guide row and '
+                   'for each group that has no schedule of its own. Exclude it to find the '
+                   'holes in your monitoring. It is not the same as never tested, which is '
+                   'about the past rather than about coverage now.'),
     Dimension('chan', 'Channel', hidden=True),
 )
 DIMENSION_BY_KEY = {d.key: d for d in DIMENSIONS}
@@ -397,8 +404,20 @@ OTHER_IN_GUIDE = 'guide'
 OTHER_GUIDE_OWN_ROW = 'guiderow'
 OTHER_GUIDE_VIA_GROUP = 'guidegroup'
 OTHER_DUP_URL = 'dupurl'
+#: Coverage RIGHT NOW: something re-checks this channel on a schedule. Deliberately a
+#: different question from the `showuntested` standing option, which is about whether the
+#: channel was ever tested at all - a fact about the past that says nothing about whether
+#: anything will look at it again. Excluding this value is how you find the holes in your
+#: monitoring, which is the reason it exists (dev/changelog/1065).
+#:
+#: Answered by `channel_tester.monitored_channel_ids()` and never restated here. That
+#: function ranks members in Python (health score, the format lock, failing streaks) to
+#: decide which one a scheduleless group's automatic check probes, so there IS no SQL
+#: spelling of it - and a second one would be a disagreement the user sees as a channel the
+#: filter calls unmonitored while the group page says it is being checked.
+OTHER_MONITORED = 'monitored'
 OTHER_VALUES = (OTHER_REMOVED, OTHER_NEW, OTHER_IN_GUIDE, OTHER_GUIDE_OWN_ROW,
-                OTHER_GUIDE_VIA_GROUP, OTHER_DUP_URL)
+                OTHER_GUIDE_VIA_GROUP, OTHER_DUP_URL, OTHER_MONITORED)
 #: The rail's wording for those four, from the approved mockup. Here rather than in the
 #: template because the values are a registry and their labels are part of it - a page that
 #: spelled them itself would be a second vocabulary to keep in step.
@@ -409,6 +428,7 @@ OTHER_LABELS = {
     OTHER_GUIDE_OWN_ROW: 'Has its own guide row',
     OTHER_GUIDE_VIA_GROUP: 'In the guide via a group',
     OTHER_DUP_URL: 'Duplicated stream URL',
+    OTHER_MONITORED: 'Monitored by a health check',
 }
 
 
@@ -1950,6 +1970,12 @@ def _value_predicate(dim_key: str, value: str, ctx: 'SearchContext', grain: str 
             return Channel.id.in_(guide_scope_group_member_ids())
         if value == OTHER_DUP_URL:
             return Channel.is_duplicate_stream_url.is_(True)
+        if value == OTHER_MONITORED:
+            # A bound id list, and not by preference: the set is decided in Python, so
+            # there is nothing to correlate. Read off `ctx` so the ~60ms behind it is paid
+            # once per request rather than once per facet aggregate - see
+            # SearchContext.monitored_channel_ids().
+            return Channel.id.in_(ctx.monitored_channel_ids())
         raise SearchStateError(f'unknown Other value {value!r}')
     if dim_key == 'chan':
         parsed = _optional_int(value)
@@ -2408,15 +2434,15 @@ def _group_row_filters(state: SearchState, ctx: 'SearchContext') -> list:
                              else not_(ChannelGroup.name.in_(list(f.ex))))
         elif f.key == 'other':
             if f.values:
-                preds.append(or_(*[_group_other_predicate(v) for v in f.values]))
+                preds.append(or_(*[_group_other_predicate(v, ctx) for v in f.values]))
             if f.ex:
-                preds.append(not_(or_(*[_group_other_predicate(v) for v in f.ex])))
+                preds.append(not_(or_(*[_group_other_predicate(v, ctx) for v in f.ex])))
         elif f.key == 'chan':
             preds.append(db.false())
     return preds
 
 
-def _group_other_predicate(value: str):
+def _group_other_predicate(value: str, ctx: 'SearchContext'):
     """One `Other` value, answered for a GROUP rather than for a channel.
 
     A group in the TV Guide answers both `guide` (it is in the guide) and `guidegroup` (a
@@ -2424,11 +2450,24 @@ def _group_other_predicate(value: str):
     `Channel.in_guide` and is about a CHANNEL holding a row of its own - keeping those two
     apart here is the same distinction dev/changelog/751 exists to protect. The three
     provider-shaped values describe a stream and a group has none.
+
+    `monitored` is answered as "any member of this group is being checked", which is a real
+    answer rather than the `false` the provider-shaped values get: a group with no schedule
+    of its own still has one member probed by the automatic check, and that fallback is the
+    whole reason a scheduleless group is covered at all (dev/changelog/752). Saying `false`
+    here would drop exactly those group rows out of a search for what IS monitored.
     """
     if value in (OTHER_IN_GUIDE, OTHER_GUIDE_VIA_GROUP):
         return ChannelGroup.in_guide.is_(True)
     if value in (OTHER_GUIDE_OWN_ROW, OTHER_REMOVED, OTHER_NEW, OTHER_DUP_URL):
         return db.false()
+    if value == OTHER_MONITORED:
+        monitored = ctx.monitored_channel_ids()
+        if not monitored:
+            return db.false()
+        return ChannelGroup.id.in_(
+            select(ChannelGroupMember.group_id)
+            .where(ChannelGroupMember.channel_id.in_(monitored)))
     raise SearchStateError(f'unknown Other value {value!r}')
 
 
@@ -2696,6 +2735,11 @@ class SearchContext:
     #: index of 50 instead of seeking `ix_channel_group_members_channel_id` per row.
     #: Empty is a real answer (no memberships exist), and the fold then removes nothing.
     group_member_channel_ids: tuple = ()
+    #: The `monitored` Other value's id set, memoized here once it has been asked for.
+    #: `None` means "not asked yet" and `()` is the real answer "nothing is monitored", so
+    #: the two cannot be confused into recomputing on every call. See
+    #: monitored_channel_ids() for why this one is lazy where the fields above are eager.
+    monitored_ids: tuple | None = None
 
     @classmethod
     def build(cls, cfg=None) -> 'SearchContext':
@@ -2766,6 +2810,28 @@ class SearchContext:
                    now=now, display_tz=tz,
                    day_bounds={WHEN_TODAY: (days[0], days[1]),
                                WHEN_TOMORROW: (days[1], days[2])})
+
+    def monitored_channel_ids(self) -> tuple:
+        """Channel ids a health check re-checks on a schedule, memoized for the request.
+
+        `channel_tester.monitored_channel_ids()` is the definition and this only caches it.
+        It has to be an id set rather than a predicate: deciding which member a scheduleless
+        group's automatic check probes ranks candidates in Python, so there is no SQL
+        spelling - see OTHER_MONITORED.
+
+        **Lazy, unlike every eager field above, and the reason is what it costs.** Measured
+        against the production database (139,152 channels, 82 monitored): 60-64ms warm,
+        144ms cold, nearly all of it the eager membership loads inside
+        `channel_groups.system_check_targets()`. That is worth paying once for a request
+        that draws the Other rail or filters on this value, and worth paying never for a
+        row-only request that does neither - which building it in `build()` would not allow.
+        Once per request either way: the filter, the standing breakdown and every facet
+        aggregate ask for it, so without the memo one rail request would pay it repeatedly.
+        """
+        if self.monitored_ids is None:
+            from .channel_tester import monitored_channel_ids
+            self.monitored_ids = tuple(sorted(monitored_channel_ids()))
+        return self.monitored_ids
 
     def probe(self, term_text: str, columns: tuple) -> int:
         """The airing planner's probe, memoized for the request. See airing_probe_count."""

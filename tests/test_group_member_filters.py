@@ -432,10 +432,10 @@ class EpgColumnTests(unittest.TestCase):
     """The column itself, and the stored-layout merge that decides whether it starts off."""
 
     def test_the_column_is_offered_on_every_facet_and_is_off_by_default(self):
-        src = _read('app/routes/channel_groups.py')
-        block = src[src.index('GROUP_DETAIL_COLUMNS = {'):src.index('def _group_detail_job(')]
-        self.assertEqual(block.count("'epg',"), 3, 'every facet lists the EPG id column')
-        self.assertIn("GROUP_DETAIL_COLUMNS_OFF = ('fps', 'framePct', 'audio', 'epg')", block)
+        from app.routes.channel_groups import GROUP_DETAIL_COLUMNS, GROUP_DETAIL_COLUMNS_OFF
+        for facet, cols in GROUP_DETAIL_COLUMNS.items():
+            self.assertIn('epg', cols, f'{facet} does not offer the EPG id column')
+        self.assertIn('epg', GROUP_DETAIL_COLUMNS_OFF, 'available, not shown until asked for')
 
     def test_a_column_new_to_a_stored_layout_takes_the_app_default(self):
         """dev/docs/BUGS.md 2026-09-09 @ 06:41 - a stored `hidden` list cannot say anything

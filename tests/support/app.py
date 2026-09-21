@@ -359,6 +359,11 @@ def reset_module_globals():
     # is_running() (dev/changelog/1015).
     stop_channel_tester_run()
     channel_tester._state = channel_tester.RunState()
+    # Paired with the RunState above: the smoother carries the previous run's rate and its
+    # +/-20% clamp, so leaving it would drag the next module's first estimate toward a
+    # number measured over different channels.
+    channel_tester._eta_smoother = None
+    channel_tester._eta_last_sample = 0.0
     # A preview left live holds a connection slot on an account id the next module's
     # seed will reuse, so its first recording or test is refused at the limit. Stopped
     # (ffmpeg killed, slot released) and forgotten, never just cleared.

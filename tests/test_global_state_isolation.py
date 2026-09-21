@@ -59,7 +59,7 @@ RESET = {
     'app/auth.py': {'_failures'},
     'app/channel_search.py': {'_tag_channel_ids_cache', '_standing_breakdown_cache',
                               '_now_tag_channel_ids_cache'},
-    'app/channel_tester.py': {'_state'},
+    'app/channel_tester.py': {'_state', '_eta_smoother', '_eta_last_sample'},
     'app/concatenator.py': {'_concat_progress'},
     'app/config.py': {'_restart_needed'},
     'app/fs_utils.py': {'_last_logged_outcome'},

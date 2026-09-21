@@ -16,6 +16,8 @@ from ..database import (
     WINDOW_OPEN_STATUSES,
 )
 from .. import events as ev
+from .. import account_stats_view
+from ..config import load_config
 from ..tz_utils import UTC, to_naive_utc, format_local, relative
 from ..accounts import get_sync_progress, next_sync_map, sync_signature
 from .channel_tests import get_active_run_summary
@@ -219,7 +221,6 @@ def _metric_tiles(recordings, accounts, now):
 
     `cls` is one of '', 'ok', 'warn', 'bad' and drives the tile's left rule and value color.
     """
-    from ..config import load_config
     from ..fmt_utils import fmt_bytes
     from .recordings import time_ago_filter
     from .system import DVR_DIR_ROLE, _disk_bytes
@@ -295,7 +296,6 @@ def _timeline_payload(recordings, accounts, now):
     identity-map hit. Moving this call ahead of those queries turns it into per-row I/O on a
     page that renders a row-scaling list.
     """
-    from ..config import load_config
     from .jobs import _build_job_list
 
     # Same section app/scheduler.py and app/accounts.py read the guards from - the
@@ -393,6 +393,12 @@ def dashboard():
                               REC_STATUS_SCHEDULED))
     ).order_by(Recording.start_time).all()
     accounts = Account.query.order_by(Account.created_at).all()
+    # The account rows' second line (DESIGN.md 16.1): the same macros /accounts draws, from
+    # the same numbers, so the two pages cannot disagree about an account's health. Rows
+    # only - the windowed Usage section stays on /accounts (dev/changelog/1063). Unlike
+    # section_context() this commits nothing, so it does not have to run before the queries
+    # above; see its docstring.
+    acct_stats = account_stats_view.rows_context(load_config(), accounts)
     health_check = get_active_run_summary()
     now = datetime.utcnow()
 
@@ -407,6 +413,7 @@ def dashboard():
     return render_template(
         'dashboard.html',
         recordings=active, accounts=accounts, health_check=health_check,
+        acct_stats=acct_stats,
         next_sync=next_sync_map(accounts),
         live=live, upcoming=upcoming, now=now, live_stats=_live_row_stats(live, now),
         rec_status_class=REC_ROW_STATUS_CLASS,

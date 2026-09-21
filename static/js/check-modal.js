@@ -351,10 +351,17 @@ function openCreateCheckModal(opts) {
   // groups that are not in the guide at all (dev/changelog/752). The server sets
   // inheritedCheck only when this group really is in its target set.
   if (opts.inheritedCheck && !opts.hasOwnCheck) {
-    notices.push('<div class="notice notice-info">The automatic TV Guide health check ' +
-      `(${escHtml(opts.inheritedCheck.recur_description || 'on a recurring schedule')}) tests one channel per ` +
-      'guide row, so it covers the member serving this group and none of its others. Give the group its own ' +
-      'schedule to have every member re-tested.</div>');
+    // Its schedule can be removed like any other check's (dev/changelog/1068), so the
+    // cadence is read off the check rather than assumed - naming a schedule that no
+    // longer exists would advertise coverage this group is not getting.
+    notices.push(opts.inheritedCheck.schedule_live
+      ? '<div class="notice notice-info">The automatic TV Guide health check ' +
+        `(${escHtml(opts.inheritedCheck.recur_description || 'at its next scheduled run')}) tests one channel per ` +
+        'guide row, so it covers the member serving this group and none of its others. Give the group its own ' +
+        'schedule to have every member re-tested.</div>'
+      : '<div class="notice notice-warn">The automatic TV Guide health check would normally test one channel ' +
+        'per guide row on this group\'s behalf, but it is not scheduled right now, so nothing is testing these ' +
+        'channels. A schedule here covers every member of the group.</div>');
   }
   if (empty) {
     notices.push('<div class="notice notice-warn">This group has no channels yet, so there is nothing to test. ' +

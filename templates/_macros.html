@@ -168,6 +168,19 @@
   {%- endif %}
 {%- endmacro %}
 
+{# "When does this sync next", in the one spelling both the Accounts list and the
+   Dashboard's Account sync status section use. Four states, each named: auto-sync turned
+   off, a sync running now, a scheduled time, and nothing scheduled. The dashboard drew a
+   bare "-" for the first of those, which reads as "nothing scheduled" when the truth is
+   "this account never syncs on its own" - a state the single-pane-of-glass page was the
+   one hiding (dev/docs/BUGS.md 2026-09-21, dev/changelog/1063). #}
+{% macro account_next_sync(account, next_sync_at) -%}
+{%- if not account.sync_enabled %}<span class="text-faint">off</span>
+{%- elif account.status == 'SYNCING' %}<span class="text-muted">running</span>
+{%- elif next_sync_at %}{{ next_sync_at | time_until }}
+{%- else %}<span class="text-faint">-</span>{% endif -%}
+{%- endmacro %}
+
 {# Card header (3.3). #}
 {% macro stat_row(key, value, sv_cls=none, wide=false, tip=none) -%}
 <div class="srow{% if wide %} wide{% endif %}"><span class="sk">{{ key }}</span><span class="sv{% if sv_cls %} {{ sv_cls }}{% endif %}{% if tip %} tip-plain" data-tip="{{ tip }}{% endif %}">{{ value }}</span></div>

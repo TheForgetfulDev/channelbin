@@ -1,5 +1,6 @@
 {% extends "base.html" %}
 {% import '_macros.html' as m %}
+{% import '_account_stats.html' as st %}
 {% block title %}Live Dashboard - ChannelBin{% endblock %}
 
 {#
@@ -243,10 +244,14 @@
           <span class="d-cell d-badge">{{ m.account_status_badge(acc.status, tip=false) }}</span>
           <span class="d-cell"><span class="d-k">Channels</span>{{ '{:,}'.format(acc.channel_count) if acc.channel_count else '-' }}{% if acc.hidden_channel_count %} <span class="text-faint">({{ '{:,}'.format(acc.hidden_channel_count) }} hidden)</span>{% endif %}</span>
           <span class="d-cell"><span class="d-k">Last sync</span>{{ acc.last_sync_at | time_ago if acc.last_sync_at else 'never' }}</span>
-          <span class="d-cell"><span class="d-k">Next sync</span>{{ next_sync[acc.id] | time_until if next_sync[acc.id] else '-' }}</span>
+          <span class="d-cell"><span class="d-k">Next sync</span>{{ m.account_next_sync(acc, next_sync[acc.id]) }}</span>
           <span class="c-actions">
             <a class="btn btn-sm" href="{{ url_for('accounts.account_detail', account_id=acc.id) }}">Manage</a>
           </span>
+          {# The same second line /accounts draws, trimmed to what moves on its own
+             (dev/changelog/1063). dashboard.js's ROW_NO_NAV already skips [data-tip], so
+             reading a definition here does not navigate the row. #}
+          {{ st.row_signal(acct_stats.current[acc.id], acct_stats, health_bands) }}
         </div>
         {% endfor %}
       </div>
@@ -272,7 +277,13 @@
             <span class="d-meta">{{ 'On demand' if health_check.kind == 'on_demand' else ('Pre-check' if health_check.kind == 'pre_check' else 'Guide channels') }}</span>
           </span>
           <span class="d-cell d-badge"><span class="badge badge-in_progress" id="hc-status-badge"><span class="pulse"></span>RUNNING</span></span>
-          <span class="d-cell"><span class="d-k">Elapsed</span><span id="hc-elapsed">-</span></span>
+          {#- The estimate rides in the Elapsed cell rather than taking a seventh column:
+              .dash-head and .drow share ONE grid rule across all three sections, so a new
+              track would have to be filled by recordings and accounts too, and at <=768px
+              the stat cells are hand-placed three to a row. It belongs beside Elapsed
+              anyway - they are the same clock. -#}
+          <span class="d-cell"><span class="d-k">Elapsed</span><span id="hc-elapsed">-</span>
+            <span class="d-sub" id="hc-eta">{{ ('~' ~ (health_check.eta_seconds | duration) ~ ' left') if health_check.eta_seconds else '' }}</span></span>
           <span class="d-cell"><span class="d-k">Channels</span><span id="hc-progress-text">{{ health_check.completed_channels }} / {{ health_check.total_channels }}</span></span>
           <span class="d-cell{% if health_check.fail_count %} warn{% endif %}"><span class="d-k">Results</span><span id="hc-results">{{ health_check.pass_count }}P {{ health_check.warn_count }}W {{ health_check.fail_count }}F</span></span>
           <span class="c-actions">

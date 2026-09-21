@@ -169,7 +169,9 @@
       <span class="badge b-warn">Stuck</span>
       {% elif job.status == 'SCHEDULED' %}<span class="badge b-auto">Scheduled</span>
       {% elif job.status == 'CANCELLED' %}<span class="badge b-abort">Cancelled</span>
-      {% elif job.status == 'QUEUED' %}<span class="badge b-abort">Queued</span>
+      {# "Queued" read as a position in a line nobody is working through; QUEUED is the
+         status a check with no schedule sits in, and the message beside it says so. #}
+      {% elif job.status == 'QUEUED' %}<span class="badge b-abort">No schedule</span>
       {% else %}<span class="badge b-done">Completed</span>{% endif %}
     {% else %}
     <span class="badge b-auto">&#9939; Channel group</span>
@@ -191,7 +193,10 @@
       {% elif job.status == 'SCHEDULED' %}
       {{ schedule.label }}{% if schedule.next_run_et %} - next run <strong>{{ schedule.next_run_et }}</strong>{% endif %}.
       {% elif job.status == 'QUEUED' %}
-      This check is waiting to run.
+      {# QUEUED is not a queue position - nothing dispatches it. It means the check exists
+         with no schedule, which is now reachable for the automatic check too (changelog
+         1068), so the line says what that actually means rather than implying a wait. #}
+      No schedule - this check runs only when you start it.
       {% elif job.status == 'CANCELLED' %}
       This check was cancelled before it finished.
       {% else %}
@@ -271,7 +276,9 @@
           {% elif job.recurring %}
           <button class="menu-item" data-act="resume-schedule">Enable schedule</button>
           {% endif %}
-          {% if job.status == 'SCHEDULED' and not is_system %}
+          {% if job.status == 'SCHEDULED' %}
+          {# The system check included: its schedule is the user's to set or remove like
+             any other, even though the check itself can never be deleted (changelog 1068). #}
           <button class="menu-item" data-act="unschedule">Unschedule</button>
           {% endif %}
           {% if job.status == 'CANCELLED' %}
@@ -334,6 +341,10 @@
     <div class="hero-stat">
       <div class="hero-stat-val" id="gd-hs-run-elapsed">&mdash;</div>
       <div class="hero-stat-lbl">Run elapsed</div>
+    </div>
+    <div class="hero-stat">
+      <div class="hero-stat-val" id="gd-hs-eta">&mdash;</div>
+      <div class="hero-stat-lbl">Est. remaining</div>
     </div>
     <div class="hero-stat">
       <div class="hero-stat-val" id="gd-hs-progress">{{ tester_status.completed_channels }}/{{ tester_status.total_channels }}</div>
@@ -427,6 +438,16 @@
         </span>
       </div>
       {% endfor %}
+      {% elif is_stored and inherited_check and not inherited_check.schedule_live %}
+      {# The automatic check's schedule can be removed like any other (changelog 1068), and
+         a group with no check of its own is then tested by nothing at all - which only this
+         card is in a position to say. #}
+      <p class="card-note">
+        This group carries no schedule of its own, and the automatic TV Guide check that would
+        otherwise test one member on its behalf is not scheduled{% if inherited_check.recur_paused %} - its schedule is paused{% endif %}.
+        Nothing is testing these channels. Add a health check here, or schedule the automatic one
+        again from <a href="{{ inherited_check.detail_url }}">{{ inherited_check.name }}</a>.
+      </p>
       {% elif is_stored %}
       <p class="card-note">
         This group carries no schedule of its own. The automatic TV Guide check tests one member on

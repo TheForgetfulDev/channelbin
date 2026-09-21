@@ -302,6 +302,7 @@ def get_active_run_summary():
             'completed_channels': status['completed_channels'],
             'total_channels': status['total_channels'] or 1,
             'run_started_at': status['run_started_at'],
+            'eta_seconds': status['eta_seconds'],
             'tested_count': 0, 'pass_count': 0, 'warn_count': 0, 'fail_count': 0,
         }
 
@@ -318,6 +319,7 @@ def get_active_run_summary():
         'completed_channels': status['completed_channels'],
         'total_channels': status['total_channels'],
         'run_started_at': status['run_started_at'],
+        'eta_seconds': status['eta_seconds'],
         **get_job_result_counts(job.id, [ch.id for ch in channels]),
     }
 
@@ -921,14 +923,19 @@ def update_on_demand_job_profile(job_id):
 @retry_on_locked()
 def unschedule_on_demand_job(job_id):
     """Remove a job's schedule (one-off or recurring) entirely, reverting it to whatever
-    status it was in before it was scheduled. Does not touch existing test results."""
+    status it was in before it was scheduled. Does not touch existing test results.
+
+    The system TV Guide check is unscheduled by exactly this route, like any other check
+    (dev/changelog/1068). Its row still cannot be deleted and its channel list is still
+    computed from the guide - only the schedule goes, and nothing re-arms it: the startup
+    sweep in scheduler.py only re-registers jobs already in SCHEDULED, and
+    check_window.due_jobs() only dispatches those. What that costs is disclosed where the
+    coverage is claimed, so a group is never told an unscheduled check is watching it."""
     from ..scheduler import cancel_on_demand_job_schedule
 
     job = db.session.get(OnDemandTestJob, job_id)
     if job is None:
         return jsonify({'error': 'Job not found'}), 404
-    if job.is_system:
-        return jsonify({'error': 'The TV Guide Channels check is always scheduled - pause its schedule instead'}), 400
     if job.status != 'SCHEDULED':
         return jsonify({'error': f'Job is {job.status}, not SCHEDULED'}), 409
 
