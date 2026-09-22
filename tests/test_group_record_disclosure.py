@@ -152,12 +152,11 @@ class GroupRecordContextApiTests(unittest.TestCase):
         self.assertIsNone(data['serving'])
         self.assertEqual(data['recording_member_count'], 0)
 
-    def test_health_check_only_group_serves_nobody(self):
+    def test_a_group_nobody_records_from_serves_nobody(self):
         """Not a recording source by construction - its members are never
         recording-enabled, so the same null answer covers it with no special case."""
         a = self._ch('Feed A', 80.0)
-        grp = seed.make_group(name='Checks', members=[a], recording=False,
-                              format_strategy='health_check_only')
+        grp = seed.make_group(name='Checks', members=[a], recording=False)
         db.session.commit()
 
         _, data = self._get(grp.id)

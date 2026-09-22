@@ -2349,6 +2349,84 @@ def _m070_profile_poster(conn, cur):
     conn.commit()
 
 
+def _m071_one_check_per_group(conn, cur):
+    """Every stored group carries exactly one health check, and the `health_check_only`
+    format strategy is gone (dev/changelog/1077, DESIGN-channel-groups-model.md 4.4, 6).
+
+    Three things, then the index that makes the first permanent:
+
+    1. `format_strategy='health_check_only'` becomes `highest_score`, the new default.
+       Whether a group records is a fact about its members (one has Recording on), never
+       a stored value the switches could contradict.
+    2. A non-system group with no job gets one - QUEUED, named `<group> - health check`,
+       no schedule - exactly what channel_groups.build_group_with_members() mints now.
+    3. A group with more than one job keeps ONE: the one with a live schedule, else the
+       most recently completed, else the newest. The losers' channel_tests rows are
+       re-pointed at the kept job so no history is lost, then the loser rows go, along
+       with any APScheduler entry a loser still held.
+    4. UNIQUE INDEX on on_demand_test_jobs.group_id.
+
+    Deliberately blunt: there are two databases in the world and both belong to the one
+    user. Every part is re-runnable from the top - a group already at one job is not
+    touched - and a WARNING names each group this changed, because a check that was
+    merged away is a thing its owner must not have to infer."""
+    rewritten = cur.execute(
+        "UPDATE channel_groups SET format_strategy='highest_score' "
+        "WHERE format_strategy='health_check_only'").rowcount
+    if rewritten:
+        log.warning('Migration 71: %d group(s) moved off the retired health_check_only '
+                    'strategy to highest_score; whether a group records is now read from '
+                    'its members alone', rewritten)
+
+    groups = cur.execute(
+        'SELECT id, name FROM channel_groups WHERE is_system=0 ORDER BY id').fetchall()
+    jobs_by_group = {}
+    for row in cur.execute(
+            'SELECT id, group_id, status, recurring, recur_paused, completed_at, '
+            'scheduler_job_id FROM on_demand_test_jobs WHERE is_system=0 '
+            'AND group_id IS NOT NULL ORDER BY id').fetchall():
+        jobs_by_group.setdefault(row[1], []).append(row)
+
+    has_jobstore = cur.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='apscheduler_jobs'"
+    ).fetchone() is not None
+
+    for gid, name in groups:
+        jobs = jobs_by_group.get(gid, [])
+        if not jobs:
+            cur.execute(
+                'INSERT INTO on_demand_test_jobs (name, is_system, status, created_at, '
+                'recurring, recur_paused, recur_use_window, group_id) '
+                "VALUES (?, 0, 'QUEUED', CURRENT_TIMESTAMP, 0, 0, 0, ?)",
+                (f'{name} - health check', gid))
+            log.warning('Migration 71: group "%s" (id %d) had no health check; one was '
+                        'created with no schedule', name, gid)
+            continue
+        if len(jobs) == 1:
+            continue
+
+        def _rank(j):
+            _id, _gid, status, recurring, paused, completed_at, _sid = j
+            live = status == 'SCHEDULED' and not paused
+            return (1 if live else 0, completed_at or '', _id)
+        kept = max(jobs, key=_rank)
+        losers = [j for j in jobs if j[0] != kept[0]]
+        for loser in losers:
+            cur.execute('UPDATE channel_tests SET job_id=? WHERE job_id=?',
+                        (kept[0], loser[0]))
+            if has_jobstore and loser[6]:
+                cur.execute('DELETE FROM apscheduler_jobs WHERE id=?', (loser[6],))
+            cur.execute('DELETE FROM on_demand_test_jobs WHERE id=?', (loser[0],))
+        log.warning('Migration 71: group "%s" (id %d) carried %d health checks; kept job '
+                    '%d and merged the test history of job(s) %s into it',
+                    name, gid, len(jobs), kept[0],
+                    ', '.join(str(j[0]) for j in losers))
+
+    cur.execute('CREATE UNIQUE INDEX IF NOT EXISTS uq_on_demand_test_jobs_group '
+                'ON on_demand_test_jobs (group_id)')
+    conn.commit()
+
+
 SCHEMA_MIGRATIONS = [
     (1, 'baseline: pre-versioning additive migrations + backfills', _m001_baseline),
     (2, 'recordings: program_title/program_sub_title snapshot columns + backfill', _m002_program_title),
@@ -2489,6 +2567,9 @@ SCHEMA_MIGRATIONS = [
      _m069_recording_metadata_edit),
     (70, 'recording_profiles: poster_file + poster_width + poster_height - the poster '
      'image a profile pins for every recording made under it', _m070_profile_poster),
+    (71, 'one health check per group: retire the health_check_only strategy, mint a check '
+     'for every group without one, merge extras, UNIQUE on on_demand_test_jobs.group_id',
+     _m071_one_check_per_group),
 ]
 
 CURRENT_SCHEMA_VERSION = SCHEMA_MIGRATIONS[-1][0]

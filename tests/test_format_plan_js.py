@@ -151,16 +151,16 @@ class TableTests(_Base):
 
 
 class GroupStrategyListTests(_Base):
-    def test_all_eight_values_in_dropdown_order(self):
+    def test_all_seven_values_in_dropdown_order(self):
         keys = [row[0] for row in self.evaluate('GROUP_FORMAT_STRATEGIES')]
         self.assertEqual(keys, [
-            'health_check_only', 'highest_score', 'highest_bitrate', 'highest_resolution',
+            'highest_score', 'highest_bitrate', 'highest_resolution',
             'most_channels', 'balanced', 'manual', 'unmanaged'])
 
     def test_the_default_is_first(self):
-        """A user looking for "I only want this for a health check" must find it at the top,
-        not as an empty spot in the dropdown."""
-        self.assertEqual(self.evaluate('GROUP_FORMAT_STRATEGIES')[0][0], 'health_check_only')
+        """The value a new group carries (dev/changelog/1077) sits at the top. There is no
+        "health check only" entry: whether a group records is a fact about its members."""
+        self.assertEqual(self.evaluate('GROUP_FORMAT_STRATEGIES')[0][0], 'highest_score')
 
     def test_every_value_ships_one_sentence_of_help(self):
         """§4.4: a setting whose owner cannot say what it does is a number the user cannot
@@ -174,19 +174,16 @@ class GroupStrategyListTests(_Base):
         """The one whose name does not say what it does. Its help says what the code does."""
         self.assertIn('60%', self.evaluate("groupStrategyHelp('balanced')"))
 
-    def test_only_two_values_manage_no_format(self):
+    def test_only_one_value_manages_no_format(self):
         managed = {k: self.evaluate(f"groupStrategyManagesFormat('{k}')")
                    for k, _, _ in self.evaluate('GROUP_FORMAT_STRATEGIES')}
-        self.assertEqual({k for k, v in managed.items() if not v},
-                         {'health_check_only', 'unmanaged'})
+        self.assertEqual({k for k, v in managed.items() if not v}, {'unmanaged'})
 
 
 class NonEngineEntryTests(_Base):
-    def test_the_three_formatless_values_say_what_they_do(self):
+    def test_the_two_formatless_values_say_what_they_do(self):
         """"No eligible format" would be a true sentence about the wrong question for a
         value that never had a bucket to win."""
-        self.assertEqual(self.evaluate(f"formatPlanOptionLabel({_PLAN}, 'health_check_only')"),
-                         'Health check only - not a recording source')
         self.assertEqual(self.evaluate(f"formatPlanOptionLabel({_PLAN}, 'unmanaged')"),
                          'No format management - any format, mixed')
         self.assertEqual(self.evaluate(f"formatPlanOptionLabel({_PLAN}, 'manual')"),
@@ -197,9 +194,8 @@ class NonEngineEntryTests(_Base):
             f"formatPlanOptionLabel({_PLAN}, 'highest_score', '1280x720 @ 60')")
         self.assertEqual(got, "Healthiest member's format - 1280x720 @ 60 (22 channels)")
 
-    def test_the_two_formatless_values_have_no_entry_at_all(self):
+    def test_the_formatless_value_has_no_entry_at_all(self):
         self.assertIsNone(self.evaluate(f"formatPlanEntry({_PLAN}, 'unmanaged')"))
-        self.assertIsNone(self.evaluate(f"formatPlanEntry({_PLAN}, 'health_check_only')"))
 
     def test_the_pending_pin_moves_the_winner_before_it_is_saved(self):
         """Without it the preview answers for the stored value and the marker does not move
@@ -221,10 +217,6 @@ class SummaryTests(_Base):
     def test_a_perfect_match_offers_no_consequence_clause(self):
         got = self.evaluate(f"formatPlanSummary({_PLAN}, 'highest_bitrate', null, null, 27)")
         self.assertEqual(got, 'Records from 27 of 27 members.')
-
-    def test_health_check_only_says_nothing_will_record(self):
-        got = self.evaluate(f"formatPlanSummary({_PLAN}, 'health_check_only', null, null, 30)")
-        self.assertIn('cannot be added to the TV Guide', got)
 
     def test_unmanaged_names_the_risk_it_accepts(self):
         got = self.evaluate(f"formatPlanSummary({_PLAN}, 'unmanaged', null, null, 30)")

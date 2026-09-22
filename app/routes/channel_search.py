@@ -351,6 +351,12 @@ def channel_search_api():
         # leaving the reader to notice the rail and the heading disagreeing.
         'channel_total': result.channel_total,
         'group_total': result.group_total,
+        # How many distinct channels the rows sit on - the airing grain's number, null on
+        # the channel grain where every row is a channel already. A NEW field rather than a
+        # second meaning for `channel_total`, which on the airing grain is the airing total
+        # again: these parameters and this envelope are an API once another surface links in,
+        # so a field changing what it counts per grain is a breaking change nobody can see.
+        'channels_matched': result.channels_matched,
         'page': result.page,
         'page_size': result.page_size,
         'pages': result.pages,
@@ -493,16 +499,19 @@ def channel_search_counts_api():
         return jsonify({'error': str(exc)}), 400
 
     def run(state, ctx):
-        hidden, total, pages, groups = search_counts(state, ctx)
+        hidden, total, pages, groups, matched = search_counts(state, ctx)
         return {'total': total, 'pages': pages, 'standing_hidden': hidden,
                 # The two numbers behind `total`, never one blended one - the results
                 # heading names both kinds, and the rail's facet counts stay channel-only.
-                'group_total': groups, 'channel_total': None if total is None else total - groups}
+                'group_total': groups, 'channel_total': None if total is None else total - groups,
+                # The airing grain's distinct-channel count, which the count line renders
+                # beside the airing total. Null off that grain.
+                'channels_matched': matched}
 
     return _optional_aggregate(
         'counts', state, run,
         {'total': None, 'pages': None, 'standing_hidden': None,
-         'group_total': None, 'channel_total': None},
+         'group_total': None, 'channel_total': None, 'channels_matched': None},
         LANE_ROWS)
 
 

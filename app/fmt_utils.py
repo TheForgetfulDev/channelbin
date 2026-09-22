@@ -37,6 +37,14 @@ REC_STATUS_DISPLAY = {
     REC_STATUS_ABORTED:       ('done',  'st-abort',  'b-abort',  'CANCELLED',     False),
 }
 
+# Just the words, for the surfaces that need the vocabulary without the classes - the
+# browser, chiefly. base.html serves this to every page and static/js/util.js reads it, the
+# same arrangement the health bands use, so a badge drawn by JS and one rendered by Jinja
+# cannot name one status two ways. Derived here rather than re-typed per consumer: the
+# Dashboard built its own copy of this comprehension and the TV Guide hand-wrote a rival
+# table that called two post-capture phases "Recorded" (dev/changelog/1083).
+REC_STATUS_LABELS = {status: row[3] for status, row in REC_STATUS_DISPLAY.items()}
+
 # The two statuses in which a recording can be parked waiting for another one to give up
 # the machine. Narrower than "any post-capture phase" on purpose: a join is never parked.
 _WAITABLE_STATUSES = (REC_STATUS_ANALYZING, REC_STATUS_CONVERTING)

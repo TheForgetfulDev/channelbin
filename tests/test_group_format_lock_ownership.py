@@ -2,12 +2,13 @@
 its format, and a stored format lock belongs to the `manual` strategy and to nothing else.
 
 Guards, in order:
-  * create_group asks the format question of the REQUESTED strategy, exactly as
-    add_members and clone_group ask it of the stored one. Until this shipped, grouping
-    mixed-format channels from the Browse tab was refused outright while creating the
-    group empty and adding the identical channels one request later succeeded - two
-    answers to one question, both visible to the user.
-  * A group on `health_check_only` - the default, and the shape of the sweep case
+  * create_group and add_members give the same answer to the same question. Until this
+    shipped, grouping mixed-format channels from the Browse tab was refused outright
+    while creating the group empty and adding the identical channels one request later
+    succeeded - two answers to one question, both visible to the user. Since
+    dev/changelog/1077 the question is gated on the group recording from somebody, so a
+    new group - which records from nobody - is never asked at all.
+  * A group nobody records from - every new group, and the shape of the sweep case
     (DESIGN-channel-groups-model.md 7) - is asked no format or duplicate question at all.
   * POST /format writes the `manual` strategy along with the pin, so pinning is one
     request that cannot strand half-done.
@@ -31,7 +32,7 @@ from tests.support.seed import make_account, make_channel, make_group  # noqa: E
 from app import db  # noqa: E402
 from app.database import (  # noqa: E402
     ChannelGroup, ChannelGroupEvent, ChannelTest,
-    GROUP_FORMAT_HEALTH_CHECK_ONLY, GROUP_FORMAT_HIGHEST_SCORE, GROUP_FORMAT_MANUAL,
+    GROUP_FORMAT_HIGHEST_SCORE, GROUP_FORMAT_MANUAL,
     GROUP_FORMAT_MOST_CHANNELS, GROUP_FORMAT_STRATEGY_APPLIED, GROUP_FORMAT_UNMANAGED,
 )
 
@@ -69,7 +70,8 @@ class CreateAndAddGiveTheSameAnswerTests(_Base):
         self.assertEqual(200, resp.status_code, resp.get_data(as_text=True))
         self.assertTrue(resp.get_json()['success'], resp.get_json())
         grp = ChannelGroup.query.filter_by(name='Sweep').one()
-        self.assertEqual(GROUP_FORMAT_HEALTH_CHECK_ONLY, grp.format_strategy)
+        self.assertEqual(GROUP_FORMAT_HIGHEST_SCORE, grp.format_strategy)
+        self.assertFalse(any(m.recording_enabled for m in grp.memberships))
         self.assertEqual({hd.id, sd.id},
                          {m.channel_id for m in grp.memberships})
 
@@ -101,29 +103,31 @@ class CreateAndAddGiveTheSameAnswerTests(_Base):
         self.assertEqual(200, resp.status_code, resp.get_data(as_text=True))
         self.assertTrue(resp.get_json()['success'], resp.get_json())
 
-    def test_creating_a_recording_group_from_mixed_channels_warns(self):
-        """The question is still asked where it means something - but as a warning with a
-        way through, never a refusal."""
+    def test_creating_a_group_from_mixed_channels_never_warns_whatever_the_strategy(self):
+        """A new group records from nobody whatever strategy it is given, so the format
+        question belongs to its promotion (dev/changelog/1077). The question is still
+        asked where it means something - adding to a group that records - as a warning
+        with a way through, never a refusal."""
         hd, sd = self._mixed_pair()
         resp = self.client.post('/api/channel-groups',
                                 json={'name': 'Records', 'channel_ids': [hd.id, sd.id],
-                                      'format_strategy': GROUP_FORMAT_HIGHEST_SCORE})
+                                      'format_strategy': GROUP_FORMAT_MOST_CHANNELS})
+        self.assertEqual(200, resp.status_code, resp.get_data(as_text=True))
+        self.assertTrue(resp.get_json()['success'], resp.get_json())
+        grp = ChannelGroup.query.filter_by(name='Records').one()
+        self.assertEqual({hd.id, sd.id}, {m.channel_id for m in grp.memberships})
+
+    def test_adding_to_a_group_that_records_still_warns(self):
+        hd, sd = self._mixed_pair()
+        anchor = self._measured('Anchor', '1920x1080', 60.0)
+        grp = make_group(name='Records', members=[anchor], recording=True)
+        db.session.commit()
+        resp = self.client.post(f'/api/channel-groups/{grp.id}/members',
+                                json={'channel_ids': [hd.id, sd.id]})
         self.assertEqual(200, resp.status_code, resp.get_data(as_text=True))
         body = resp.get_json()
         self.assertFalse(body['success'])
         self.assertIn('format_mismatch', body)
-        self.assertIsNone(ChannelGroup.query.filter_by(name='Records').first())
-
-    def test_the_create_warning_is_proceedable(self):
-        hd, sd = self._mixed_pair()
-        resp = self.client.post('/api/channel-groups',
-                                json={'name': 'Records', 'channel_ids': [hd.id, sd.id],
-                                      'format_strategy': GROUP_FORMAT_HIGHEST_SCORE,
-                                      'force': True})
-        self.assertEqual(200, resp.status_code, resp.get_data(as_text=True))
-        self.assertTrue(resp.get_json()['success'])
-        grp = ChannelGroup.query.filter_by(name='Records').one()
-        self.assertEqual({hd.id, sd.id}, {m.channel_id for m in grp.memberships})
 
 
 class PinningIsOneRequestTests(_Base):
@@ -131,7 +135,10 @@ class PinningIsOneRequestTests(_Base):
     two sequential requests, so a failed second one stranded it under the old strategy."""
 
     def _group_on(self, strategy):
-        grp = make_group(name='Grp', members=[])
+        # With a recording member: the Settings-side format writers refuse a group nobody
+        # records from (dev/changelog/1077), and pinning is a Settings-side write.
+        grp = make_group(name='Grp', members=[self._measured('Anchor', '1920x1080', 60.0)],
+                         recording=True)
         grp.format_strategy = strategy
         db.session.commit()
         return grp
@@ -151,9 +158,11 @@ class PinningIsOneRequestTests(_Base):
         """Enforcement lives server-side: a hand-crafted single POST is the case the
         two-request client proves the server has to own."""
         for strategy in (GROUP_FORMAT_HIGHEST_SCORE, GROUP_FORMAT_UNMANAGED,
-                         GROUP_FORMAT_MOST_CHANNELS, GROUP_FORMAT_HEALTH_CHECK_ONLY):
+                         GROUP_FORMAT_MOST_CHANNELS):
             with self.subTest(strategy=strategy):
-                grp = make_group(name=f'G-{strategy}', members=[])
+                grp = make_group(name=f'G-{strategy}',
+                                 members=[self._measured(f'A-{strategy}', '1920x1080', 60.0)],
+                                 recording=True)
                 grp.format_strategy = strategy
                 db.session.commit()
                 self.client.post(f'/api/channel-groups/{grp.id}/format',

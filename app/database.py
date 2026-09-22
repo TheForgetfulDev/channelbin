@@ -470,13 +470,38 @@ CANCEL_REASONS = (
     CANCEL_DURING_ANALYSIS, CANCEL_DURING_CONVERSION,
 )
 
-# ChannelTest.status vocabulary. Shares string values with REC_STATUS_* above (and with
-# OnDemandTestJob.status, which has its own separate QUEUED/RUNNING/... vocabulary and no
-# constants of its own) - kept as distinct names because the two are different enumerations
-# that happen to spell some members the same way.
+# ChannelTest.status vocabulary. Shares string values with REC_STATUS_* above and with
+# OD_JOB_STATUS_* below - kept as distinct names because all three are different
+# enumerations that happen to spell some members the same way.
 TEST_STATUS_COMPLETED = 'COMPLETED'
 TEST_STATUS_FAILED    = 'FAILED'
 TEST_STATUS_CANCELLED = 'CANCELLED'
+
+# OnDemandTestJob.status vocabulary - a health check's own run/schedule state, not the
+# per-channel result state TEST_STATUS_* above carries.
+#
+# The column answers two questions at once: whether a run is happening right now (RUNNING)
+# and, when one is not, what the check's schedule left behind. That overload is why the
+# terminal states below are read together as often as singly.
+OD_JOB_STATUS_QUEUED    = 'QUEUED'      # exists, no schedule; runs only when started by hand
+OD_JOB_STATUS_SCHEDULED = 'SCHEDULED'   # a trigger is armed (recurring cron, or a one-off)
+OD_JOB_STATUS_RUNNING   = 'RUNNING'
+OD_JOB_STATUS_COMPLETED = 'COMPLETED'
+OD_JOB_STATUS_CANCELLED = 'CANCELLED'
+
+# Every value the column may hold. A reader that branches per status checks its chain
+# against this, so a state nobody enumerated is a visible unknown rather than whatever the
+# trailing branch happened to render (dev/changelog/1076).
+OD_JOB_STATUSES = (
+    OD_JOB_STATUS_QUEUED, OD_JOB_STATUS_SCHEDULED, OD_JOB_STATUS_RUNNING,
+    OD_JOB_STATUS_COMPLETED, OD_JOB_STATUS_CANCELLED,
+)
+
+# Every status except RUNNING - i.e. no test loop is in flight, so the check is free to be
+# started or rescheduled. Written as the complement it is rather than as two hand-kept lists:
+# a run route and a schedule route that each enumerated their own subset is what let a
+# recurring SCHEDULED check belong to neither (dev/changelog/1076).
+OD_JOB_IDLE_STATUSES = tuple(s for s in OD_JOB_STATUSES if s != OD_JOB_STATUS_RUNNING)
 
 # Statuses that own a live ffmpeg child or an in-flight background thread, so restarting
 # the app (or deleting the row) would strand work. SCHEDULED is deliberately absent - a
@@ -1319,9 +1344,14 @@ class XtreamAccount(Account):
 # members at selection time and never mutates a stored participation choice.
 #
 # Only the four bucket-ranking strategies live in channel_groups.FORMAT_STRATEGIES - the
-# other four are handled outside that engine.
-GROUP_FORMAT_HEALTH_CHECK_ONLY = 'health_check_only'  # default: not a recording source
-GROUP_FORMAT_HIGHEST_SCORE     = 'highest_score'      # reference follows the healthiest member
+# other three are handled outside that engine.
+#
+# There is no "health check only" value. Whether a group is a recording source is a fact
+# about its members - at least one has Recording on - and never a stored strategy that the
+# switches could contradict (dev/changelog/1077, DESIGN-channel-groups-model.md 4.4). The
+# strategy answers only "which format, once it records"; a group nobody has switched on
+# for recording carries highest_score and records nothing.
+GROUP_FORMAT_HIGHEST_SCORE     = 'highest_score'      # default; reference follows the healthiest member
 GROUP_FORMAT_HIGHEST_BITRATE   = 'highest_bitrate'
 GROUP_FORMAT_HIGHEST_RESOLUTION = 'highest_resolution'
 GROUP_FORMAT_MOST_CHANNELS     = 'most_channels'
@@ -1330,7 +1360,6 @@ GROUP_FORMAT_MANUAL            = 'manual'             # the lock is whatever the
 GROUP_FORMAT_UNMANAGED         = 'unmanaged'          # no format management at all
 
 GROUP_FORMAT_STRATEGIES = (
-    GROUP_FORMAT_HEALTH_CHECK_ONLY,
     GROUP_FORMAT_HIGHEST_SCORE,
     GROUP_FORMAT_HIGHEST_BITRATE,
     GROUP_FORMAT_HIGHEST_RESOLUTION,
@@ -1363,8 +1392,10 @@ class ChannelGroup(db.Model):
     over to other members mid-recording (app/watchdog.py).
 
     There is one kind of group. A group used only for health checking is one whose
-    format_strategy is health_check_only and whose members are all recording-disabled -
-    a configuration, not a separate type (DESIGN-channel-groups-model.md DECIDED 2)."""
+    members are all recording-disabled - a configuration, not a separate type, and not
+    a stored value either (DESIGN-channel-groups-model.md DECIDED 2, 4.4). Every stored
+    group carries exactly one OnDemandTestJob (`check`), minted with it and deleted with
+    it (dev/changelog/1077)."""
     __tablename__ = 'channel_groups'
 
     id               = db.Column(db.Integer, primary_key=True)
@@ -1401,8 +1432,8 @@ class ChannelGroup(db.Model):
     # start, failover) - it never writes ChannelGroupMember.recording_enabled, which is
     # user intent and is written only by a human (DESIGN-channel-groups-model.md 4.1).
     format_strategy   = db.Column(db.String(32), nullable=False,
-                                  default=GROUP_FORMAT_HEALTH_CHECK_ONLY,
-                                  server_default=db.text("'%s'" % GROUP_FORMAT_HEALTH_CHECK_ONLY))
+                                  default=GROUP_FORMAT_HIGHEST_SCORE,
+                                  server_default=db.text("'%s'" % GROUP_FORMAT_HIGHEST_SCORE))
     # Which warning banners the user has hidden for this group: a JSON list of
     # GROUP_WARNING_KINDS values, read and written through muted_warning_set /
     # set_muted_warnings below rather than directly.
@@ -1954,8 +1985,9 @@ class OnDemandTestJob(db.Model):
     # can't be deleted or have channels managed directly.
     is_system            = db.Column(db.Boolean, nullable=False, default=False,
                                      server_default=db.text('0'))
-    # QUEUED | SCHEDULED | RUNNING | COMPLETED | CANCELLED
-    status               = db.Column(db.String(32), nullable=False, default='QUEUED')
+    # See OD_JOB_STATUS_* above - compare against those, never a retyped literal.
+    status               = db.Column(db.String(32), nullable=False,
+                                     default=OD_JOB_STATUS_QUEUED)
     created_at           = db.Column(db.DateTime, default=datetime.utcnow)
     scheduled_start_time = db.Column(db.DateTime)   # naive UTC; next run when SCHEDULED (recurring or not)
     completed_at         = db.Column(db.DateTime)   # last-run time when recurring; terminal-run time otherwise
@@ -1981,8 +2013,10 @@ class OnDemandTestJob(db.Model):
     window_skip_until   = db.Column(db.DateTime)
     # Groups unification 3/4: the job's channel list IS its group's membership
     # (channel_group_members, ordered by position). Nullable at the column level for
-    # SQLite ADD COLUMN; app-enforced NOT NULL after _m011's backfill. Several jobs may
-    # attach to one group (e.g. a nightly quick check + a weekly deep check).
+    # SQLite ADD COLUMN; app-enforced NOT NULL after _m011's backfill. Exactly ONE job per
+    # group, enforced by uq_on_demand_test_jobs_group below: a group's health check is a
+    # schedule the group carries, never an object of its own, so it is minted with the
+    # group (channel_groups.build_group_with_members) and dies with it (dev/changelog/1077).
     group_id             = db.Column(db.Integer, db.ForeignKey('channel_groups.id'))
     scheduler_job_id     = db.Column(db.String(255))            # APScheduler job ID if SCHEDULED
     profile_id           = db.Column(db.Integer, db.ForeignKey('health_check_profiles.id'))  # None = use global channel_testing.* config
@@ -1990,8 +2024,16 @@ class OnDemandTestJob(db.Model):
     tests = db.relationship('ChannelTest', backref='job', lazy='dynamic',
                             foreign_keys='ChannelTest.job_id')
     profile = db.relationship('HealthCheckProfile', lazy='joined')
+    # `group.check` is the one job; uselist=False is what the unique index above lets the
+    # ORM promise (CLAUDE.md "keyed lookups need a uniqueness argument").
     group = db.relationship('ChannelGroup', lazy='joined',
-                            backref=db.backref('test_jobs', lazy=True))
+                            backref=db.backref('check', uselist=False, lazy=True))
+
+    # Declared here as well as in migration 71, because a fresh database never runs
+    # migrations (see EPGEntry.__table_args__ for the same reasoning).
+    __table_args__ = (
+        db.Index('uq_on_demand_test_jobs_group', 'group_id', unique=True),
+    )
 
 
 class EPGEntry(db.Model):

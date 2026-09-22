@@ -66,7 +66,16 @@ def make_group(name='Test Group', members=(), in_guide=True, disabled=None,
 
     `disabled` is an iterable of channel ids whose Recording switch starts off;
     `test_disabled` the same for the Health check switch.
+
+    Every group carries exactly one OnDemandTestJob (`grp.check`), minted here the way
+    `channel_groups.build_group_with_members()` mints it - QUEUED, no schedule - because
+    the unique index on `on_demand_test_jobs.group_id` makes a second one impossible and
+    the pages assume the one is there (dev/changelog/1077). `job` is a dict of column
+    overrides for that check (`status`, `recurring`, `recur_paused`, ...); `job_name`
+    names it when the default `<name> - health check` is not what a test asserts on.
     """
+    job = kw.pop('job', None) or {}
+    job_name = kw.pop('job_name', None)
     grp = ChannelGroup(name=name, in_guide=in_guide, guide_sort_order=1, **kw)
     db.session.add(grp)
     db.session.flush()
@@ -77,20 +86,34 @@ def make_group(name='Test Group', members=(), in_guide=True, disabled=None,
             group_id=grp.id, channel_id=ch.id, position=pos,
             recording_enabled=recording and ch.id not in disabled,
             test_enabled=ch.id not in test_disabled))
+    job_kw = {'name': job_name or f'{name} - health check', 'status': 'QUEUED'}
+    job_kw.update(job)
+    db.session.add(OnDemandTestJob(group_id=grp.id, **job_kw))
     db.session.flush()
     return grp
 
 
-def make_test_job(name='Job', channels=(), disabled=(), status='QUEUED', **kw):
-    """An OnDemandTestJob attached to its own group holding `channels` (groups
-    unification 3/4 - a job's channel list IS its group's membership). `disabled` is an
-    iterable of channel ids whose Health check switch starts off."""
-    grp = make_group(name=name, members=channels, in_guide=False,
-                     recording=False, test_disabled=disabled)
-    job = OnDemandTestJob(name=name, status=status, group_id=grp.id, **kw)
-    db.session.add(job)
+def set_check(group, **fields):
+    """Reshape `group`'s one health check in place - status, schedule, profile, name -
+    and return it. The replacement for adding a second OnDemandTestJob to a group a test
+    already built, which the unique index refuses (dev/changelog/1077)."""
+    job = group.check
+    for k, v in fields.items():
+        setattr(job, k, v)
     db.session.flush()
     return job
+
+
+def make_test_job(name='Job', channels=(), disabled=(), status='QUEUED', **kw):
+    """The one OnDemandTestJob of a fresh group holding `channels`, Recording off on every
+    member (the group is a health check until someone records from it). `disabled` is an
+    iterable of channel ids whose Health check switch starts off; `kw` are column
+    overrides on the job. The job is named `name`, exactly as the group is - a test that
+    asserts on the name gets the string it passed."""
+    grp = make_group(name=name, members=channels, in_guide=False,
+                     recording=False, test_disabled=disabled,
+                     job_name=name, job=dict(status=status, **kw))
+    return grp.check
 
 
 def make_recording(status='SCHEDULED', name=None, channel_id=None, group_id=None,

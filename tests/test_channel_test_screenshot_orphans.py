@@ -107,23 +107,6 @@ class DeleteTestsCollectingScreenshotsHelperTests(_Base):
         self.assertEqual(ChannelTest.query.count(), 0)
 
 
-class JobDeleteUnlinksScreenshotsTests(_Base):
-    """teardown_test_job(), reached by DELETE /api/channel-tests/on-demand/<id>."""
-
-    def test_deleting_a_job_unlinks_its_channel_tests_screenshots(self):
-        acc = seed.make_account()
-        ch = seed.make_channel(acc)
-        job = seed.make_test_job(name='Job', channels=[ch])
-        shot = self._shot('job.jpg')
-        seed.make_channel_test(ch, job_id=job.id, screenshot_path=shot)
-        db.session.commit()
-
-        resp = self.client.delete(f'/api/channel-tests/on-demand/{job.id}')
-        self.assertEqual(resp.status_code, 200)
-        self.assertFalse(os.path.exists(shot))
-        self.assertEqual(ChannelTest.query.count(), 0)
-
-
 class GroupCascadeDeleteUnlinksScreenshotsTests(_Base):
     """teardown_test_job(), reached via the group-dissolve cascade
     (POST /api/channel-groups/<id>/delete)."""

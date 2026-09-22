@@ -25,7 +25,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from tests.support import make_test_app  # noqa: E402
 from tests.support.seed import make_account, make_channel, make_group  # noqa: E402
 from app import db  # noqa: E402
-from app.database import ChannelTest, OnDemandTestJob  # noqa: E402
+from app.database import ChannelTest  # noqa: E402
 from app.channel_groups import format_key, format_eligible_members  # noqa: E402
 from app.routes.channel_groups import group_detail_rows  # noqa: E402
 
@@ -118,11 +118,13 @@ class FormatSourceDisclosureTests(unittest.TestCase):
         self.grp = make_group(name='CW', members=[self.ch, self.keeper],
                               format_resolution=HD[0], format_fps=HD[1],
                               format_strategy='manual')
-        self.job = OnDemandTestJob(name='CW - health check', status='SCHEDULED',
-                                   group_id=self.grp.id)
-        self.other = OnDemandTestJob(name='TV Guide Channels', status='SCHEDULED',
-                                     group_id=self.grp.id)
-        db.session.add_all([self.job, self.other])
+        self.job = self.grp.check
+        self.job.status = 'SCHEDULED'
+        # A second check on another group - a group carries exactly one of its own
+        # (dev/changelog/1077), and the disclosure is about a test ANOTHER job produced.
+        other_grp = make_group(name='TV Guide Channels', members=[self.ch],
+                               job_name='TV Guide Channels', job={'status': 'SCHEDULED'})
+        self.other = other_grp.check
         db.session.commit()
 
     def tearDown(self):

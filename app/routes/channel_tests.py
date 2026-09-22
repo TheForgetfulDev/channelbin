@@ -13,17 +13,17 @@ from ..database import (
     Channel, ChannelTest, OnDemandTestJob, HealthCheckProfile,
     ChannelGroup, ChannelGroupMember, Recording,
     TEST_STATUS_COMPLETED, TEST_STATUS_CANCELLED, TEST_STATUS_FAILED,
+    OD_JOB_STATUS_QUEUED, OD_JOB_STATUS_SCHEDULED, OD_JOB_STATUS_RUNNING,
+    OD_JOB_STATUS_CANCELLED, OD_JOB_IDLE_STATUSES,
 )
 from ..accounts import (
     duplicates_within, duplicate_groups_within, lifecycle_states_for_channels,
     transfer_channel_state,
 )
-from ..channel_groups import (effective_score, check_target_channels, teardown_test_job,
+from ..channel_groups import (effective_score, check_target_channels,
                               set_participation, build_group_with_members,
                               group_name_conflict, evaluate_and_reconcile_group,
-                              group_live_recordings, group_scheduled_recordings,
-                              cancel_scheduled_recordings, member_channels,
-                              deregister_cancelled_recordings, touch_group)
+                              touch_group)
 from .. import channel_hiding
 from ..config import load_config, config_default
 from ..db_utils import retry_on_locked
@@ -473,19 +473,150 @@ def _editable_job_group_or_error(job):
 
 # ── On-demand job routes ──────────────────────────────────────────────────────
 
+def _run_preflight(data):
+    """(force, None) when a run may go ahead, else (None, (json, status)).
+
+    The "may this run start at all" half every run route shares, in one place: the tester
+    is already busy, and the run would land on top of an imminent recording. Each route
+    still owns its own status precondition, because those genuinely differ - resume needs
+    CANCELLED, test-selected needs a subset, start takes anything idle.
+
+    `force` is the caller's explicit override of the recording conflict only; a busy tester
+    is never overridable, since there is one tester and it is occupied. Same warn-then-let-
+    the-user-decide shape as manual sync (DESIGN-concurrency.md 5.4/5.5) - the user is
+    present, so they decide, but never silently.
+
+    Written once because the four hand-written copies this replaces had already begun to
+    drift in the order of their checks, which is how the next divergence slips in unseen
+    (dev/changelog/1076)."""
+    from ..channel_tester import get_status, imminent_recording_conflict
+
+    if get_status()['is_running']:
+        return None, (jsonify({'error': 'A health check is already in progress - please wait'}), 409)
+
+    force = bool(data.get('force'))
+    if not force:
+        conflict = imminent_recording_conflict()
+        if conflict:
+            return None, (jsonify({'error': f'Health check not started: {conflict}',
+                                   'conflicts': [conflict]}), 409)
+    return force, None
+
+
+def _parse_schedule(data):
+    """(fields, None) for a validated schedule request, else (None, (json, status)).
+
+    `fields` is a dict of exactly what the caller stores: recurring, use_window, recur_day,
+    recur_hour, recur_minute, scheduled_start_time. The non-applicable half of each shape is
+    None, so a caller may write all six without re-deciding which mode it is in.
+
+    One copy rather than two, because create and reschedule validate the same two shapes and
+    a rule enforced on only one of them is a rule the other path walks around."""
+    recurring = bool(data.get('recurring'))
+    use_window = bool(data.get('use_window'))
+    recur_day = recur_hour = recur_minute = None
+    scheduled_start_time = None
+
+    if recurring:
+        try:
+            recur_day = int(data.get('recur_day'))
+            if recur_day not in range(0, 8):
+                raise ValueError
+            if not use_window:
+                recur_hour, recur_minute = parse_hhmm(data.get('recur_time'))
+        except (ValueError, TypeError):
+            return None, (jsonify({'error': 'Invalid recurring schedule - pick a test day and time'}), 400)
+    else:
+        scheduled_time_str = data.get('scheduled_time')
+        if not scheduled_time_str:
+            return None, (jsonify({'error': 'scheduled_time is required'}), 400)
+        try:
+            scheduled_start_time = parse_local_to_utc(scheduled_time_str)
+        except ValueError:
+            return None, (jsonify({'error': 'Invalid scheduled_time format'}), 400)
+        if scheduled_start_time <= datetime.utcnow():
+            return None, (jsonify({'error': 'Scheduled time must be in the future'}), 400)
+
+    return {
+        'recurring': recurring,
+        'use_window': use_window,
+        'recur_day': recur_day,
+        'recur_hour': recur_hour,
+        'recur_minute': recur_minute,
+        'scheduled_start_time': scheduled_start_time,
+    }, None
+
+
+def apply_job_schedule(job, sched, prior_status):
+    """Put `sched` (a _parse_schedule() dict) on `job` and register it with the scheduler.
+    Returns (aps_job_id, next_run).
+
+    Three steps, two commits, in this order and no other: the recurrence fields are
+    committed BEFORE schedule_on_demand_job() so the jobstore never registers a job whose
+    recurrence the database does not durably have yet, and the status is committed AFTER
+    it, recording where the scheduler actually put the run. Each commit is its own
+    retry_on_locked unit and the scheduler call sits between them, per CLAUDE.md's
+    non-idempotent-side-effect rule. Create, reschedule and clone all schedule through
+    this one function (dev/changelog/1077).
+
+    `prior_status` is what Unschedule restores; it is left alone when the job was already
+    SCHEDULED (an edit of an existing schedule)."""
+    from ..scheduler import schedule_on_demand_job
+    recurring = sched['recurring']
+    use_window = sched['use_window']
+
+    @retry_on_locked()
+    def _set_recurrence_and_commit():
+        job.recurring = recurring
+        job.recur_day = sched['recur_day'] if recurring else None
+        job.recur_use_window = use_window if recurring else False
+        # A toggle into window mode leaves recur_hour/recur_minute exactly as they were -
+        # they are not meaningful while use_window is set, but restoring exact-time mode
+        # later should bring back the last time the user actually picked, not 00:00.
+        if recurring and not use_window:
+            job.recur_hour = sched['recur_hour']
+            job.recur_minute = sched['recur_minute']
+        elif not recurring:
+            job.recur_hour = None
+            job.recur_minute = None
+        job.recur_paused = False
+        if not recurring:
+            job.scheduled_start_time = sched['scheduled_start_time']
+        if prior_status != OD_JOB_STATUS_SCHEDULED:
+            job.status_before_schedule = prior_status
+        # In this unit rather than the status one below: the recurrence fields are the
+        # schedule the user edited, while the second commit only records where the
+        # scheduler put it (dev/changelog/1047).
+        touch_group(job.group)
+        db.session.commit()
+
+    _set_recurrence_and_commit()
+    aps_job_id, next_run = schedule_on_demand_job(job)
+
+    @retry_on_locked()
+    def _mark_scheduled_and_commit():
+        job.status = OD_JOB_STATUS_SCHEDULED
+        job.scheduled_start_time = next_run
+        job.scheduler_job_id = aps_job_id
+        db.session.commit()
+
+    _mark_scheduled_and_commit()
+    return aps_job_id, next_run
+
+
 def _start_job_run(job_id, subset=None, force=False):
     """Mark an on-demand job RUNNING and spawn its background test thread.
 
-    Shared tail of create/start/resume/test-selected/restart: each of those routes
-    checks its own already-running/status preconditions first, then calls this. subset
-    is the channel_id_subset passed through to run_on_demand_test_job (resume and
-    test-selected only)."""
+    Shared tail of create/start/resume/test-selected: each of those routes checks its own
+    status precondition and then _run_preflight() first, then calls this. subset is the
+    channel_id_subset passed through to run_on_demand_test_job (resume and test-selected
+    only)."""
     from ..channel_tester import run_on_demand_test_job
 
     @retry_on_locked()
     def _mark_running_and_commit():
         j = db.session.get(OnDemandTestJob, job_id)
-        j.status = 'RUNNING'
+        j.status = OD_JOB_STATUS_RUNNING
         j.completed_at = None
         db.session.commit()
 
@@ -503,179 +634,107 @@ def _start_job_run(job_id, subset=None, force=False):
 
 @channel_tests_bp.route('/api/channel-tests/on-demand', methods=['POST'])
 def create_on_demand_job():
-    """Create and optionally start an on-demand test job."""
+    """Create a group with its health check, and optionally start or schedule the check.
+
+    Two request shapes, and only two (dev/changelog/1077):
+      - `group_name` + `channel_ids`: the create flow's own screen, minting a real user
+        group named by the user. The check is the group's, named `<group> - health check`.
+      - `name` + `channel_ids` with no group name: the ad hoc "Test this channel" on a
+        channel's own page (dev/changelog/831), which mints a group named after the job.
+    A health check is a schedule its group carries, so there is no shape that creates a
+    check on its own or attaches a second one to an existing group - every group already
+    has its one, and a request that asks for another (`attach_group_id`) is told where to
+    find it rather than silently given a duplicate."""
     from ..channel_tester import get_status
-    from ..scheduler import schedule_on_demand_job
 
     data = request.get_json(force=True, silent=True) or {}
     name = (data.get('name') or '').strip()
-    # A health check is a schedule its group carries, so it has no name of its own to ask
-    # for (DESIGN-channel-groups-model.md DECIDED 2) - the client sends `group_name`
-    # instead and the job's name is derived below. `name` stays accepted for the one
-    # caller that has no group to derive from: the ad hoc "Test this channel" on a
-    # channel's own page (dev/changelog/831).
     group_name = (data.get('group_name') or '').strip()
     channel_ids = data.get('channel_ids') or []
     action = data.get('action', 'start')   # 'start' | 'schedule' | 'queue'
-    scheduled_time_str = data.get('scheduled_time')  # ISO datetime in display tz (one-off)
-    recurring = bool(data.get('recurring'))
-    recur_day = data.get('recur_day')            # 0=every day, 1=Sun...7=Sat
-    recur_time_str = data.get('recur_time')       # 'HH:MM' in display tz (recurring)
-    use_window = bool(data.get('use_window'))     # dispatcher-owned maintenance window instead
     profile_id_raw = data.get('profile_id')
     profile_id = int(profile_id_raw) if profile_id_raw not in (None, '') else None
     if profile_id is not None and db.session.get(HealthCheckProfile, profile_id) is None:
         profile_id = None
 
-    # Groups unification 4/4 (DESIGN.md §14.5 "Create a health check"): attaching a new
-    # check to an EXISTING group re-uses that group's own membership as the job's channel
-    # list, rather than spawning a duplicate group that would drift out of sync with it
-    # the moment a member is added or removed later.
-    attach_group_id = data.get('attach_group_id')
-    attach_group = None
-    if attach_group_id is not None:
-        attach_group = db.session.get(ChannelGroup, attach_group_id)
+    if data.get('attach_group_id') is not None:
+        attach_group = db.session.get(ChannelGroup, data.get('attach_group_id'))
         if attach_group is None:
             return jsonify({'error': 'Group not found'}), 404
-        unique_ids = [ch.id for ch in check_target_channels(attach_group)[0]]
-        duplicate_count = 0
-        if not unique_ids:
-            return jsonify({'error': 'This group has no channels to test'}), 400
-    else:
-        if not channel_ids:
-            return jsonify({'error': 'At least one channel is required'}), 400
+        return jsonify({
+            'error': (f'"{attach_group.name}" already carries its health check - every '
+                      'group has exactly one. Schedule or run it from the group\'s own '
+                      'page, and add channels to the group to have them tested.'),
+            'detail_url': url_for('channel_groups.group_detail', group_id=attach_group.id),
+        }), 409
 
-        # Deduplicate while preserving order
-        seen = set()
-        unique_ids = []
-        for cid in channel_ids:
-            if cid not in seen:
-                seen.add(cid)
-                unique_ids.append(cid)
-        duplicate_count = len(channel_ids) - len(unique_ids)
+    if not channel_ids:
+        return jsonify({'error': 'At least one channel is required'}), 400
 
-        # Validate all channel IDs exist
-        valid_channels = Channel.query.filter(Channel.id.in_(unique_ids)).all()
-        valid_ids = {ch.id for ch in valid_channels}
-        unique_ids = [cid for cid in unique_ids if cid in valid_ids]
-        if not unique_ids:
-            return jsonify({'error': 'None of the specified channels exist'}), 400
+    # Deduplicate while preserving order
+    seen = set()
+    unique_ids = []
+    for cid in channel_ids:
+        if cid not in seen:
+            seen.add(cid)
+            unique_ids.append(cid)
+    duplicate_count = len(channel_ids) - len(unique_ids)
 
-    # Derived, not demanded. The nameless client sends no `name` at all, and there are
-    # only two shapes a job can arrive in - attached to a group, or carrying a group_name
-    # to create one - so both have something to derive from. Only a request with neither
-    # is unanswerable, and that is the one that still 400s.
-    if not name:
-        if attach_group is not None:
-            name = f'{attach_group.name} - health check'
-        elif group_name:
-            name = f'{group_name} - health check'
-        else:
-            return jsonify({'error': 'Job name is required'}), 400
+    # Validate all channel IDs exist
+    valid_channels = Channel.query.filter(Channel.id.in_(unique_ids)).all()
+    valid_ids = {ch.id for ch in valid_channels}
+    unique_ids = [cid for cid in unique_ids if cid in valid_ids]
+    if not unique_ids:
+        return jsonify({'error': 'None of the specified channels exist'}), 400
+
+    if not group_name and not name:
+        return jsonify({'error': 'Job name is required'}), 400
 
     # The group this request is about to mint is a real user group, named by the user on
     # the create flow's own screen, so a collision is refused here the same way
     # POST /api/channel-groups refuses one - not silently allowed to make a second group
     # with a name that already means something else.
-    if attach_group is None and group_name and group_name_conflict(group_name):
-        return jsonify({'error': f'A group named "{group_name}" already exists'}), 409
+    if group_name_conflict(group_name or name):
+        return jsonify({'error': f'A group named "{group_name or name}" already exists'}), 409
 
+    # Deliberately not _run_preflight(): this request is creating the check as well as
+    # running it, so a recording conflict must not leave a half-made object behind. The
+    # busy-tester half is all that applies before anything is written.
     if action == 'start':
         status = get_status()
         if status['is_running']:
             return jsonify({'error': 'A health check is already in progress - please wait'}), 409
 
-    scheduled_start_time = None
-    recur_hour = recur_minute = None
+    sched = None
     if action == 'schedule':
-        if recurring:
-            try:
-                recur_day = int(recur_day)
-                if recur_day not in range(0, 8):
-                    raise ValueError
-                if not use_window:
-                    recur_hour, recur_minute = parse_hhmm(recur_time_str)
-            except (ValueError, TypeError):
-                return jsonify({'error': 'Invalid recurring schedule - pick a test day and time'}), 400
-        else:
-            if not scheduled_time_str:
-                return jsonify({'error': 'scheduled_time is required for schedule action'}), 400
-            try:
-                scheduled_start_time = parse_local_to_utc(scheduled_time_str)
-                if scheduled_start_time <= datetime.utcnow():
-                    return jsonify({'error': 'Scheduled time must be in the future'}), 400
-            except ValueError:
-                return jsonify({'error': 'Invalid scheduled_time format'}), 400
+        sched, err = _parse_schedule(data)
+        if err:
+            return err
 
     # Each step below is its own retry unit rather than the whole function, so a
-    # retried commit can never re-run db.session.add(job) and create a duplicate row.
+    # retried commit can never re-run the adds and create a duplicate row.
     @retry_on_locked()
-    def _create_job_and_commit():
-        # One commit for group + membership + job: a locked-retry rolls all three
-        # back together, so re-running the adds can't duplicate rows.
-        if attach_group_id is not None:
-            group_id_for_job = attach_group_id
-        else:
-            # The one builder every group-with-members goes through, so a group minted
-            # here is the same object POST /api/channel-groups mints - CHANNEL_GROUPED
-            # events on each member and the hiding recompute included, which this path
-            # used to skip (dev/changelog/831).
-            g = build_group_with_members(group_name or name, unique_ids)
-            group_id_for_job = g.id
-        j = OnDemandTestJob(
-            name=name,
-            status='QUEUED',
-            group_id=group_id_for_job,
-            profile_id=profile_id,
-        )
-        db.session.add(j)
+    def _create_group_and_commit():
+        # One commit for group + membership + check: a locked-retry rolls all three back
+        # together. The one builder every group-with-members goes through, so a group
+        # minted here is the same object POST /api/channel-groups mints - CHANNEL_GROUPED
+        # events on each member, the hiding recompute and the check included
+        # (dev/changelog/831, 1077).
+        g = build_group_with_members(group_name or name, unique_ids, profile_id=profile_id)
         db.session.commit()
-        return j
+        return g.id
 
-    job = _create_job_and_commit()
-    group = db.session.get(ChannelGroup, job.group_id) if job.group_id else None
+    group = db.session.get(ChannelGroup, _create_group_and_commit())
+    job = group.check
     # Same follow-up POST /api/channel-groups runs after its own create, as its own unit
     # rather than a second commit inside the closure above.
-    if group is not None and attach_group_id is None:
-        evaluate_and_reconcile_group(group)
+    evaluate_and_reconcile_group(group)
 
     if action == 'start':
         _start_job_run(job.id)
-
     elif action == 'schedule':
-        # Commit the recurrence fields *before* calling schedule_on_demand_job(),
-        # so the jobstore write never registers a job whose recurrence the DB
-        # doesn't durably have yet.
-        @retry_on_locked()
-        def _set_recurrence_and_commit():
-            job.recurring = recurring
-            job.recur_day = recur_day if recurring else None
-            job.recur_use_window = use_window if recurring else False
-            if recurring and not use_window:
-                job.recur_hour = recur_hour
-                job.recur_minute = recur_minute
-            elif not recurring:
-                job.recur_hour = None
-                job.recur_minute = None
-            job.recur_paused = False
-            job.status_before_schedule = 'QUEUED'
-            if not recurring:
-                job.scheduled_start_time = scheduled_start_time
-            db.session.commit()
-
-        _set_recurrence_and_commit()
-        aps_job_id, next_run = schedule_on_demand_job(job)
-
-        @retry_on_locked()
-        def _mark_scheduled_and_commit():
-            job.status = 'SCHEDULED'
-            job.scheduled_start_time = next_run
-            job.scheduler_job_id = aps_job_id
-            db.session.commit()
-
-        _mark_scheduled_and_commit()
-
-    # action == 'queue' → job stays QUEUED, nothing else to do
+        apply_job_schedule(job, sched, OD_JOB_STATUS_QUEUED)
+    # action == 'queue' -> job stays QUEUED, nothing else to do
 
     scheduled_et = None
     if job.scheduled_start_time:
@@ -684,12 +743,11 @@ def create_on_demand_job():
     return jsonify({
         'success': True,
         'job_id': job.id,
-        # The group this request minted (or attached to). The create flow's closing toast
-        # links at it, and the id is only knowable here - the same request made it.
-        'group_id': job.group_id,
-        'group_name': group.name if group is not None else None,
-        'detail_url': (url_for('channel_groups.group_detail', group_id=job.group_id)
-                       if job.group_id else None),
+        # The group this request minted. The create flow's closing toast links at it, and
+        # the id is only knowable here - the same request made it.
+        'group_id': group.id,
+        'group_name': group.name,
+        'detail_url': url_for('channel_groups.group_detail', group_id=group.id),
         'name': job.name,
         'status': job.status,
         'channel_count': len(unique_ids),
@@ -774,37 +832,40 @@ def on_demand_job_results(job_id):
 
 @channel_tests_bp.route('/api/channel-tests/on-demand/<int:job_id>/start', methods=['POST'])
 def start_on_demand_job(job_id):
-    """Manually start a QUEUED or SCHEDULED job immediately."""
-    from ..channel_tester import get_status, imminent_recording_conflict
+    """Run a health check now, from any status that is not already running.
+
+    The one run route: "Test now" means the same thing on a check that has never run, one
+    that is waiting on a schedule, and one that finished or was cancelled - re-test the whole
+    channel list. There used to be a second route (`/restart`) accepting only COMPLETED and
+    CANCELLED while this one accepted only QUEUED and SCHEDULED, which between them named
+    four of the five statuses and left a recurring SCHEDULED check able to reach neither
+    (dev/changelog/1076, dev/docs/BUGS.md 2026-09-21).
+
+    Prior ChannelTest rows are kept - a re-test adds a row rather than replacing one, and the
+    detail views resolve "current" through _latest_tests_by_channel(), so per-channel history
+    on Channel Detail survives every run.
+    """
     from ..scheduler import cancel_on_demand_job_schedule
 
     job = db.session.get(OnDemandTestJob, job_id)
     if job is None:
         return jsonify({'error': 'Job not found'}), 404
-    if job.status not in ('QUEUED', 'SCHEDULED'):
+    if job.status not in OD_JOB_IDLE_STATUSES:
         return jsonify({'error': f'Job is {job.status} and cannot be started'}), 409
 
-    status = get_status()
-    if status['is_running']:
-        return jsonify({'error': 'A health check is already in progress - please wait'}), 409
+    data = request.get_json(silent=True) or {}
+    force, err = _run_preflight(data)
+    if err:
+        return err
 
-    data = request.get_json(force=True, silent=True) or {}
     keep_schedule = bool(data.get('keep_schedule', False))
-
-    # Same warn + explicit override shape as manual sync (DESIGN-concurrency.md 5.4/5.5) -
-    # the user is present, so they decide, but never silently.
-    force = bool(data.get('force'))
-    if not force:
-        conflict = imminent_recording_conflict()
-        if conflict:
-            return jsonify({'error': f'Health check not started: {conflict}', 'conflicts': [conflict]}), 409
-
-    # Recurring jobs keep their CronTrigger - "Start Now" is just an extra ad hoc run, the
+    # Recurring jobs keep their CronTrigger - running now is just an extra ad hoc run, the
     # regular cadence is untouched. A one-off job's schedule is cancelled here too, unless
-    # the caller explicitly asked to keep it ("Run Now" with keep_schedule=True) - in that
-    # case job.scheduler_job_id is left pointing at the still-registered DateTrigger, and
+    # the caller explicitly asked to keep it ("Run and keep it" with keep_schedule=True) - in
+    # that case job.scheduler_job_id is left pointing at the still-registered DateTrigger, and
     # run_on_demand_test_job()'s finally block reverts back to SCHEDULED once this ad hoc
-    # run finishes instead of going terminal.
+    # run finishes instead of going terminal. A COMPLETED or CANCELLED job has no live
+    # trigger to cancel, so this is a no-op for them beyond clearing a stale deferred retry.
     if not job.recurring and not keep_schedule:
         cancel_on_demand_job_schedule(job)
     _start_job_run(job_id, force=force)
@@ -816,81 +877,22 @@ def reschedule_on_demand_job(job_id):
     """Set or update scheduled_start_time on a job - from QUEUED/COMPLETED/CANCELLED (first
     schedule, or re-scheduling a job that already ran) or SCHEDULED (editing an existing
     schedule, including flipping recurring on/off)."""
-    from ..scheduler import schedule_on_demand_job, cancel_on_demand_job_schedule
+    from ..scheduler import cancel_on_demand_job_schedule
 
     job = db.session.get(OnDemandTestJob, job_id)
     if job is None:
         return jsonify({'error': 'Job not found'}), 404
-    if job.status not in ('QUEUED', 'SCHEDULED', 'COMPLETED', 'CANCELLED'):
+    if job.status not in OD_JOB_IDLE_STATUSES:
         return jsonify({'error': f'Job is {job.status} and cannot be rescheduled'}), 409
     prior_status = job.status
 
-    data = request.get_json(force=True, silent=True) or {}
-    recurring = bool(data.get('recurring'))
-    use_window = bool(data.get('use_window'))
-    scheduled_start_time = None
-    recur_day = recur_hour = recur_minute = None
-
-    if recurring:
-        try:
-            recur_day = int(data.get('recur_day'))
-            if recur_day not in range(0, 8):
-                raise ValueError
-            if not use_window:
-                recur_hour, recur_minute = parse_hhmm(data.get('recur_time'))
-        except (ValueError, TypeError):
-            return jsonify({'error': 'Invalid recurring schedule - pick a test day and time'}), 400
-    else:
-        scheduled_time_str = data.get('scheduled_time')
-        if not scheduled_time_str:
-            return jsonify({'error': 'scheduled_time is required'}), 400
-        try:
-            scheduled_start_time = parse_local_to_utc(scheduled_time_str)
-            if scheduled_start_time <= datetime.utcnow():
-                return jsonify({'error': 'Scheduled time must be in the future'}), 400
-        except ValueError:
-            return jsonify({'error': 'Invalid scheduled_time format'}), 400
+    data = request.get_json(silent=True) or {}
+    sched, err = _parse_schedule(data)
+    if err:
+        return err
 
     cancel_on_demand_job_schedule(job)
-
-    # Commit the recurrence fields *before* calling schedule_on_demand_job(), so the
-    # jobstore write never registers a job whose recurrence the DB doesn't durably have yet.
-    @retry_on_locked()
-    def _set_recurrence_and_commit():
-        job.recurring = recurring
-        job.recur_day = recur_day
-        job.recur_use_window = use_window if recurring else False
-        # A toggle into window mode leaves recur_hour/recur_minute exactly as they were -
-        # they are not meaningful while use_window is set, but restoring exact-time mode
-        # later should bring back the last time the user actually picked, not 00:00.
-        if recurring and not use_window:
-            job.recur_hour = recur_hour
-            job.recur_minute = recur_minute
-        elif not recurring:
-            job.recur_hour = None
-            job.recur_minute = None
-        job.recur_paused = False
-        if not recurring:
-            job.scheduled_start_time = scheduled_start_time
-        if prior_status != 'SCHEDULED':
-            job.status_before_schedule = prior_status
-        # In this unit rather than the status one below: the recurrence fields are the
-        # schedule the user edited, while the second commit only records where the
-        # scheduler put it (dev/changelog/1047).
-        touch_group(job.group)
-        db.session.commit()
-
-    _set_recurrence_and_commit()
-    aps_job_id, next_run = schedule_on_demand_job(job)
-
-    @retry_on_locked()
-    def _mark_scheduled_and_commit():
-        job.status = 'SCHEDULED'
-        job.scheduled_start_time = next_run
-        job.scheduler_job_id = aps_job_id
-        db.session.commit()
-
-    _mark_scheduled_and_commit()
+    _aps_job_id, next_run = apply_job_schedule(job, sched, prior_status)
 
     return jsonify({
         'job_id': job_id,
@@ -936,11 +938,11 @@ def unschedule_on_demand_job(job_id):
     job = db.session.get(OnDemandTestJob, job_id)
     if job is None:
         return jsonify({'error': 'Job not found'}), 404
-    if job.status != 'SCHEDULED':
+    if job.status != OD_JOB_STATUS_SCHEDULED:
         return jsonify({'error': f'Job is {job.status}, not SCHEDULED'}), 409
 
     cancel_on_demand_job_schedule(job)
-    job.status = job.status_before_schedule or 'QUEUED'
+    job.status = job.status_before_schedule or OD_JOB_STATUS_QUEUED
     job.status_before_schedule = None
     job.recurring = False
     job.recur_day = None
@@ -965,7 +967,7 @@ def pause_on_demand_schedule(job_id):
     job = db.session.get(OnDemandTestJob, job_id)
     if job is None:
         return jsonify({'error': 'Job not found'}), 404
-    if job.status != 'SCHEDULED' or not job.recurring:
+    if job.status != OD_JOB_STATUS_SCHEDULED or not job.recurring:
         return jsonify({'error': 'Only a recurring, scheduled job can be paused'}), 409
     if job.recur_paused:
         return jsonify({'error': 'Job schedule is already paused'}), 409
@@ -985,7 +987,7 @@ def resume_on_demand_schedule(job_id):
     job = db.session.get(OnDemandTestJob, job_id)
     if job is None:
         return jsonify({'error': 'Job not found'}), 404
-    if job.status != 'SCHEDULED' or not job.recurring or not job.recur_paused:
+    if job.status != OD_JOB_STATUS_SCHEDULED or not job.recurring or not job.recur_paused:
         return jsonify({'error': 'Job schedule is not paused'}), 409
 
     aps_job_id, next_run = schedule_on_demand_job(job)
@@ -1019,7 +1021,7 @@ def skip_next_on_demand_job(job_id):
     job = db.session.get(OnDemandTestJob, job_id)
     if job is None:
         return jsonify({'error': 'Job not found'}), 404
-    if (job.status != 'SCHEDULED' or not job.recurring or job.recur_paused
+    if (job.status != OD_JOB_STATUS_SCHEDULED or not job.recurring or job.recur_paused
             or not (job.recur_use_window or job.scheduler_job_id)):
         return jsonify({'error': 'Only an active recurring schedule can skip its next run'}), 409
 
@@ -1073,7 +1075,7 @@ def force_cancel_on_demand_job(job_id):
     job = db.session.get(OnDemandTestJob, job_id)
     if job is None:
         return jsonify({'error': 'Job not found'}), 404
-    if job.status != 'RUNNING':
+    if job.status != OD_JOB_STATUS_RUNNING:
         return jsonify({'error': f'Job is {job.status}, not RUNNING'}), 400
 
     status = get_status()
@@ -1107,24 +1109,16 @@ def stop_on_demand_job(job_id):
 @channel_tests_bp.route('/api/channel-tests/on-demand/<int:job_id>/resume', methods=['POST'])
 def resume_on_demand_job(job_id):
     """Resume a CANCELLED job, re-testing only channels that didn't complete."""
-    from ..channel_tester import get_status, imminent_recording_conflict
-
     job = db.session.get(OnDemandTestJob, job_id)
     if job is None:
         return jsonify({'error': 'Job not found'}), 404
-    if job.status != 'CANCELLED':
+    if job.status != OD_JOB_STATUS_CANCELLED:
         return jsonify({'error': f'Job is {job.status} - only CANCELLED jobs can be resumed'}), 400
 
-    status = get_status()
-    if status['is_running']:
-        return jsonify({'error': 'A health check is already in progress - please wait'}), 409
-
     data = request.get_json(silent=True) or {}
-    force = bool(data.get('force'))
-    if not force:
-        conflict = imminent_recording_conflict()
-        if conflict:
-            return jsonify({'error': f'Health check not started: {conflict}', 'conflicts': [conflict]}), 409
+    force, err = _run_preflight(data)
+    if err:
+        return err
 
     channels, disabled_ids = job_channel_lists(job)
     all_ids = [ch.id for ch in channels]
@@ -1157,24 +1151,16 @@ def test_selected_on_demand_job(job_id):
     subset is intersected with the job's own enabled channels, so a stale/forged channel id
     can't test something outside this health check.
     """
-    from ..channel_tester import get_status, imminent_recording_conflict
-
     job = db.session.get(OnDemandTestJob, job_id)
     if job is None:
         return jsonify({'error': 'Job not found'}), 404
-    if job.status == 'RUNNING':
+    if job.status == OD_JOB_STATUS_RUNNING:
         return jsonify({'error': 'This job is already running'}), 409
 
-    status = get_status()
-    if status['is_running']:
-        return jsonify({'error': 'A health check is already in progress - please wait'}), 409
-
     data = request.get_json(silent=True) or {}
-    force = bool(data.get('force'))
-    if not force:
-        conflict = imminent_recording_conflict()
-        if conflict:
-            return jsonify({'error': f'Health check not started: {conflict}', 'conflicts': [conflict]}), 409
+    force, err = _run_preflight(data)
+    if err:
+        return err
 
     requested = data.get('channel_ids')
     if not isinstance(requested, list) or not requested:
@@ -1194,146 +1180,6 @@ def test_selected_on_demand_job(job_id):
     return jsonify({'success': True, 'job_id': job_id, 'channels_to_test': len(subset)})
 
 
-@channel_tests_bp.route('/api/channel-tests/on-demand/<int:job_id>/restart', methods=['POST'])
-def restart_on_demand_job(job_id):
-    """Restart a CANCELLED or COMPLETED job, re-testing all channels.
-
-    Does not delete prior ChannelTest rows - each re-test just adds a new row, and the
-    job-detail views resolve "current" results via _latest_tests_by_channel(). This keeps
-    per-test history intact (visible on Channel Detail) instead of destroying it on every
-    restart.
-    """
-    from ..channel_tester import get_status, imminent_recording_conflict
-
-    job = db.session.get(OnDemandTestJob, job_id)
-    if job is None:
-        return jsonify({'error': 'Job not found'}), 404
-    if job.status not in ('CANCELLED', 'COMPLETED'):
-        return jsonify({'error': f'Job is {job.status} - only CANCELLED or COMPLETED jobs can be restarted'}), 400
-
-    status = get_status()
-    if status['is_running']:
-        return jsonify({'error': 'A health check is already in progress - please wait'}), 409
-
-    data = request.get_json(silent=True) or {}
-    force = bool(data.get('force'))
-    if not force:
-        conflict = imminent_recording_conflict()
-        if conflict:
-            return jsonify({'error': f'Health check not started: {conflict}', 'conflicts': [conflict]}), 409
-
-    _start_job_run(job_id, force=force)
-    return jsonify({'success': True, 'job_id': job_id})
-
-
-def _group_dissolved_by(job):
-    """The ChannelGroup deleting `job` would destroy along with it, or None.
-
-    An auto-created 1:1 check bag has no other owner - deleting its last job would orphan
-    it with no UI to remove it. A group shared with another job stays, and so does the
-    system group.
-
-    The gate in delete_on_demand_job() and the delete itself both ask this one function
-    rather than each counting jobs its own way. Two answers to "does this destroy the
-    group" is how a gate ends up protecting a group the delete then takes anyway."""
-    group = job.group
-    if group is None or group.is_system:
-        return None
-    shared = (OnDemandTestJob.query
-              .filter(OnDemandTestJob.group_id == group.id,
-                      OnDemandTestJob.id != job.id).count())
-    return None if shared else group
-
-
-@channel_tests_bp.route('/api/channel-tests/on-demand/<int:job_id>', methods=['DELETE'])
-def delete_on_demand_job(job_id):
-    """Delete a QUEUED, SCHEDULED, COMPLETED, or CANCELLED job.
-
-    When this is its group's last job the group goes with it, which makes this a second
-    door onto the damage channel_groups.py::delete_group is gated against, so it takes
-    DESIGN-channel-groups-model.md 15.1's identical split (dev/changelog/869). There is
-    one kind of group since the groups unification: a bag created for a health check
-    appears on the Groups page like any other, and nothing stops the user turning
-    Recording on for a member, putting the group in the guide and scheduling against it.
-
-    - **A capture under way refuses the delete outright**, with no confirm that overrides
-      it. Foreign keys are off, so the delete would otherwise succeed and leave
-      Recording.group_id dangling - failover_group_member() reads that as "no group" and
-      stops failing over, silently, mid-recording.
-    - **Scheduled recordings are named, then cancelled** once the user confirms. They
-      cannot survive the group: a SCHEDULED row pointing at a deleted group fires later
-      and records with no member to resolve.
-
-    Neither gate applies when the group survives this delete - the recordings keep the
-    group they were counting on, and only the check schedule goes.
-
-    The gate runs before the closure below and the scheduler work after it, so the
-    retried unit is the database write alone."""
-    job = db.session.get(OnDemandTestJob, job_id)
-    if job is None:
-        return jsonify({'error': 'Job not found'}), 404
-    if job.is_system:
-        return jsonify({'error': 'The TV Guide Channels check cannot be deleted'}), 400
-    if job.status == 'RUNNING':
-        return jsonify({'error': 'Cannot delete a running job - stop it first'}), 409
-
-    doomed = _group_dissolved_by(job)
-    if doomed is not None:
-        live = group_live_recordings(doomed)
-        if live:
-            rec = live[0]
-            until = format_local(rec.stop_time, style='clock', none_value='an unknown time')
-            return jsonify({
-                'error': (f'Deleting this health check would also delete the group '
-                          f'"{doomed.name}", which is recording until {until}. That would '
-                          'leave the recording with nowhere to fail over to. Let it '
-                          'finish, or abort it deliberately, then come back to this.'),
-                'recording_in_progress': {'recording_id': rec.id, 'name': rec.name,
-                                          'until': until},
-            }), 409
-        scheduled = group_scheduled_recordings(doomed)
-        if scheduled and not (request.get_json(silent=True) or {}).get('confirm'):
-            return jsonify({
-                'error': ('Deleting this health check would also delete its channel group, '
-                          'which has scheduled recordings that would be cancelled.'),
-                'confirm_required': {
-                    'group_name': doomed.name,
-                    'scheduled_count': len(scheduled),
-                    'scheduled': [{'recording_id': r.id, 'name': r.name,
-                                   'start': format_local(r.start_time, style='clock',
-                                                         none_value='an unknown time')}
-                                  for r in scheduled[:5]],
-                },
-            }), 409
-
-    @retry_on_locked()
-    def _delete():
-        j = db.session.get(OnDemandTestJob, job_id)
-        group = _group_dissolved_by(j)  # before the job row goes, or it counts itself out
-        cancelled, members = [], []
-        if group is not None:
-            detail = (f'Channel group "{group.name}" was deleted with the health check '
-                      'that created it.')
-            cancelled = cancel_scheduled_recordings(group_scheduled_recordings(group), detail)
-            members = member_channels(group.memberships)
-        screenshot_paths = teardown_test_job(j)
-        db.session.delete(j)
-        if group is not None:
-            db.session.delete(group)  # membership rows go via the delete-orphan cascade
-            # After the group delete, not before it: the memberships that protect these
-            # channels only stop existing when that cascade flushes, and a recompute run
-            # one line earlier would still see them and leave every deferred hide deferred.
-            channel_hiding.recompute([ch.id for ch in members])
-        db.session.commit()
-        return cancelled, screenshot_paths
-
-    cancelled, screenshot_paths = _delete()
-    from ..recorder import delete_files
-    delete_files(screenshot_paths)
-    deregister_cancelled_recordings(cancelled)
-    return jsonify({'success': True, 'cancelled_recordings': len(cancelled)})
-
-
 @channel_tests_bp.route('/api/channel-tests/on-demand/<int:job_id>/channels', methods=['POST'])
 @retry_on_locked()
 def add_channels_to_job(job_id):
@@ -1341,7 +1187,7 @@ def add_channels_to_job(job_id):
     job = db.session.get(OnDemandTestJob, job_id)
     if job is None:
         return jsonify({'error': 'Job not found'}), 404
-    if job.status == 'RUNNING':
+    if job.status == OD_JOB_STATUS_RUNNING:
         return jsonify({'error': 'Cannot modify a running job'}), 409
     group, error = _editable_job_group_or_error(job)
     if group is None:
@@ -1381,7 +1227,7 @@ def remove_channel_from_job(job_id, channel_id):
     job = db.session.get(OnDemandTestJob, job_id)
     if job is None:
         return jsonify({'error': 'Job not found'}), 404
-    if job.status == 'RUNNING':
+    if job.status == OD_JOB_STATUS_RUNNING:
         return jsonify({'error': 'Cannot modify a running job'}), 409
     group, error = _editable_job_group_or_error(job)
     if group is None:
@@ -1421,7 +1267,7 @@ def remove_duplicate_channels(job_id):
     job = db.session.get(OnDemandTestJob, job_id)
     if job is None:
         return jsonify({'error': 'Job not found'}), 404
-    if job.status == 'RUNNING':
+    if job.status == OD_JOB_STATUS_RUNNING:
         return jsonify({'error': 'Cannot modify a running job'}), 409
     group, error = _editable_job_group_or_error(job)
     if group is None:
@@ -1514,7 +1360,7 @@ def toggle_job_channel_enabled(job_id, channel_id):
     job = db.session.get(OnDemandTestJob, job_id)
     if job is None:
         return jsonify({'error': 'Job not found'}), 404
-    if job.status == 'RUNNING':
+    if job.status == OD_JOB_STATUS_RUNNING:
         return jsonify({'error': 'Cannot modify a running job'}), 409
 
     if job.group is not None and job.group.is_system:

@@ -35,6 +35,15 @@ def _relative(dt_utc: datetime) -> str:
     return relative(dt_utc, style='long')
 
 
+def _check_group_url(od) -> str:
+    """Where a health-check row's Edit goes: its group's page, since a check is its
+    group's one schedule (dev/changelog/1077). `od` may be None for an APScheduler entry
+    whose job row is gone; the check URL then 404s honestly rather than guessing."""
+    if od is not None and od.group_id is not None:
+        return f'/channel-groups/{od.group_id}'
+    return f'/channels/health-checks/{od.id if od is not None else 0}'
+
+
 def _trigger_description(job) -> str:
     """Return a human-readable schedule description from an APScheduler trigger."""
     t = job.trigger
@@ -137,6 +146,7 @@ def _build_job_list():
     from ..database import (
         Recording, OnDemandTestJob, Account,
         REC_STATUS_SCHEDULED, REC_STATUS_IN_PROGRESS, REC_STATUS_PAUSED, REC_STATUS_RETRYING,
+        OD_JOB_STATUS_SCHEDULED,
     )
 
     scheduler = get_scheduler()
@@ -268,7 +278,7 @@ def _build_job_list():
         next_run_utc = to_naive_utc(next_run)
 
         od = od_jobs.get(job_id)
-        if od and od.status != 'SCHEDULED':
+        if od and od.status != OD_JOB_STATUS_SCHEDULED:
             continue  # orphaned APScheduler job for a job that already finished
         label = f'Health check #{job_id}'
         if od and od.name:
@@ -288,7 +298,7 @@ def _build_job_list():
             'stop_run_et': None,
             'schedule_description': ('deferred past a recording' if is_retry
                                      else _trigger_description(job) if is_recurring else None),
-            'edit_url': f'/channels/health-checks/{job_id}',
+            'edit_url': _check_group_url(od),
             'overlap': 'green',
         }
         if is_retry:
@@ -316,7 +326,8 @@ def _build_job_list():
     # off this page too - a paused window job (no row to begin with) gets the same result
     # by being excluded here instead.
     window_jobs = OnDemandTestJob.query.filter_by(
-        recurring=True, recur_use_window=True, status='SCHEDULED', recur_paused=False).all()
+        recurring=True, recur_use_window=True,
+        status=OD_JOB_STATUS_SCHEDULED, recur_paused=False).all()
     for od in window_jobs:
         next_run_utc = next_on_demand_run_for_job(od, ct_cfg)
         if next_run_utc is None:
@@ -334,7 +345,7 @@ def _build_job_list():
             'next_run_relative': _relative(next_run_utc),
             'stop_run_et': None,
             'schedule_description': _recur_label(od, ct_cfg),
-            'edit_url': f'/channels/health-checks/{od.id}',
+            'edit_url': _check_group_url(od),
             'skip_url': f'/api/channel-tests/on-demand/{od.id}/skip-next',
             'overlap': 'green',
         })

@@ -3,9 +3,11 @@
 
    A group is created as a health check and promoted deliberately (§14). This is the
    dialog that promotes it, opened the moment the user reaches for a recording action on a
-   group whose strategy is still `health_check_only`: the guide button, the first Recording
-   switch, or the bulk Recording-on action. It never refuses - it asks the questions the
-   action needs answered, then completes the action that opened it.
+   group no member of which has Recording on yet: the guide button, the first Recording
+   switch, the bulk Recording-on action, or the Settings modal's "Set up recording" button.
+   It never refuses - it asks the questions the action needs answered, then completes the
+   action that opened it. The server enforces the same gate (a format write on such a group
+   is refused with `needs_promotion`); this dialog is the way through it.
 
    Three things about it are load bearing and must not drift:
 
@@ -44,11 +46,11 @@ function openPromoteModal(opts) {
   const pending = (opts.pendingIds || []).slice();
   const onDone = opts.onDone || (() => location.reload());
 
-  // Deliberately not `health_check_only`: this dialog exists because the user reached for
-  // a recording action, and offering "not a recording source" as the answer would be
-  // offering to do nothing.
+  // Preselects the group's STORED strategy: a group that was promoted, had its last
+  // recording member switched off, and is being promoted again lands where it was
+  // (dev/changelog/1077). A never-promoted group stores the default, highest_score.
   const state = {
-    strategy: 'highest_score', pin: null, enable: 'matching',
+    strategy: opts.strategy || 'highest_score', pin: null, enable: 'matching',
     unmatched: 'keep', addGuide: !opts.inGuide,
     plan: null, planState: 'loading', busy: false,
   };
@@ -96,9 +98,9 @@ function openPromoteModal(opts) {
     const nUnmatched = unmatched().length;
     const fmtName = key || 'the chosen format';
 
-    let h = `<p class="card-note">${escHtml(opts.groupName)} is set up for health checks ` +
-      'only. To record from it, ChannelBin needs to know which video format the group ' +
-      `should be, and which of its ${total} member${total === 1 ? '' : 's'} it may record from.</p>`;
+    let h = `<p class="card-note">No member of ${escHtml(opts.groupName)} is switched on ` +
+      'for recording yet. To record from it, ChannelBin needs to know which video format the ' +
+      `group should be, and which of its ${total} member${total === 1 ? '' : 's'} it may record from.</p>`;
 
     h += '<fieldset class="gd-fset"><div class="gd-fset-head">' +
       '1. Which format should this group be?</div>';
@@ -110,7 +112,6 @@ function openPromoteModal(opts) {
       control: `<select id="pm-strategy"${loading ? ' disabled' : ''}>` +
         (loading ? '<option>Loading&hellip;</option>'
           : GROUP_FORMAT_STRATEGIES
-            .filter(([k]) => k !== 'health_check_only')
             .map(([k]) => `<option value="${k}"${k === state.strategy ? ' selected' : ''}>` +
               `${escHtml(formatPlanOptionLabel(state.plan, k, opts.derived || null))}</option>`)
             .join('')) + '</select>',

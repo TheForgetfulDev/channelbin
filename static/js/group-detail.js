@@ -1,8 +1,9 @@
 // Unified group / health-check detail page (templates/channels/group_detail.html).
 // Design: dev/changelog/272 (mockups 14 desktop + 15 mobile); rollout: dev/changelog/273.
 //
-// One page, two entry URLs, three states. `G.hasChannel` / `G.hasCheck` gate every
-// facet-specific column, action and section, exactly as the mockups' facets() did.
+// One page, two states: a stored group and the automatic system group. Every group
+// carries exactly one health check (dev/changelog/1077), so `G.hasChannel` alone gates
+// the facet-specific columns, actions and sections.
 //
 // This file is the SOLE renderer of the Channels table: the server ships the first
 // batch of rows in `G.rows` and the live-refresh endpoint returns the same shape, so
@@ -24,7 +25,7 @@
   // system group, which has no memberships and therefore nothing to warn about.
   let WARN = G.warnings;
 
-  const strategyValue = () => (WARN && WARN.strategy) || 'health_check_only';
+  const strategyValue = () => (WARN && WARN.strategy) || 'highest_score';
 
   // The status options a row can be filtered by. Order = display order. TESTING is
   // deliberately absent: it is transient, and a row under test is filtered by the status
@@ -153,12 +154,13 @@
   }
 
   // ── Section layout (order + hidden), persisted server-side ────────────────
-  // Stored separately per page state: a health-check-only page has no Group format
-  // section to order, so a shared layout would advertise sections that cannot appear.
+  // Stored separately per page state: the automatic group has no settings of its own to
+  // order, so a shared layout would advertise sections that cannot appear. A key saved
+  // before a section was removed is dropped by initSectionLayout, never rendered.
 
-  const SEC_NAMES = { summary: 'Summary', linked: G.linkedTitle || 'Linked',
-                      settings: 'Settings', channels: 'Channels', activity: 'Activity timeline' };
-  const secStateName = { both: 'channel group + health check', channel: 'channel group only', check: 'health check only' }[G.secKey];
+  const SEC_NAMES = { summary: 'Summary', settings: 'Settings', channels: 'Channels',
+                      activity: 'Activity timeline' };
+  const secStateName = { both: 'channel group', check: 'automatic health check' }[G.secKey];
   const sectionLayout = initSectionLayout({
     config: G,
     saveUrl: `/api/user-prefs/group_detail_sections_${G.secKey}`,
@@ -225,9 +227,9 @@
   // section picker never lists the page header.
   function columns() {
     const cols = [];
-    // Selection exists for the bulk verbs, and a stored group has two of them (the
-    // participation switches) whether or not it carries a health check to test with.
-    if (G.hasCheck || G.hasChannel) cols.push({ k: 'select', label: '', sort: false });
+    // Selection exists for the bulk verbs: every group's check gives it Test selected, and
+    // a stored group adds the two participation switches.
+    cols.push({ k: 'select', label: '', sort: false });
     cols.push({ k: 'caret', label: '', sort: false });
     cols.push({ k: 'name', label: 'Channel', sort: true });
     colState.order.filter(k => fieldOn(k))
@@ -433,7 +435,7 @@
       label: 'Status',
       values: STATUS_FILTER.map(([v, label]) => ({ v, label })),
       match: (r, v) => filterStatus(r) === v,
-      available: () => G.hasCheck },
+      available: () => true },
     // Format and FPS are two dimensions for the same reason Recording and Health check
     // are: one combined bucket cannot answer "every 60fps member, whatever its
     // resolution", which is a real question on a group that spans three formats.
@@ -509,7 +511,7 @@
         if (v === 'never') return !at;
         return !at || (Date.now() - new Date(at + 'Z').getTime()) > 86400000;
       },
-      available: () => G.hasCheck },
+      available: () => true },
   ];
 
   const filterBar = createFilterBar({
@@ -1410,10 +1412,8 @@
         `<div class="gm-sheet-sec">${escHtml(COL_LABEL.test)}</div>` +
         sheetRow('data-bulk="test:on"', forN('on')) + sheetRow('data-bulk="test:off"', forN('off'));
     }
-    if (G.hasCheck) {
-      h += '<div class="gm-sheet-sec">Health check run</div>' +
-        sheetRow('data-act="test-selected"', `Test the ${n} selected now`);
-    }
+    h += '<div class="gm-sheet-sec">Health check run</div>' +
+      sheetRow('data-act="test-selected"', `Test the ${n} selected now`);
     // Deleting a channel is unrelated to group/check membership - it is the same
     // permanent action the kebab's own "Delete missing channels..." runs group-wide,
     // scoped here to just the selection (dev/changelog/653, dev/changelog/772's
@@ -1522,12 +1522,6 @@
   function renderSummary() {
     const track = byId('gd-sum-track');
     if (!track) return;
-    // The bar shows ONE run, so once the group carries a second check the label has to say
-    // whose run it is - otherwise the number silently belongs to whichever sorted first.
-    const lbl = byId('gd-sum-lbl-run');
-    if (lbl && (G.checks || []).length > 1) {
-      lbl.innerHTML = `Last run results &#183; ${escHtml(G.jobName || '')}`;
-    }
     const c = COUNTS;
     const untested = Math.max(0, TOTAL - c.tested_count);
     const seg = (kind, n) => (n ? `<div class="stackbar-seg ${kind}" style="flex:${n}"></div>` : '');
@@ -1598,31 +1592,18 @@
         });
       }
     }
-    const checks = G.checks || [];
-    if (G.hasCheck) {
-      // Schedule and profile belong to a CHECK, not to the group, so a group carrying more
-      // than one gets a pair of chips per check with the check's name in the label. A chip
-      // for a check this page is not pinned to links to that check's own page rather than
-      // opening the Settings modal, which would edit the pinned job instead.
-      const multi = checks.length > 1;
-      const scoped = multi ? checks : [null];
-      scoped.forEach(c => {
-        const suffix = c ? ` · ${c.name}` : '';
-        const href = (c && !c.is_primary) ? c.detail_url : null;
-        // Never conditional on the schedule's value: a check with no schedule still gets
-        // a chip, it just reads "None" rather than disappearing.
-        items.push({
-          focus: 'check', label: `Schedule${suffix}`, href,
-          value: (c ? c.schedule_label : (G.schedule && G.schedule.label)) || 'None',
-          tip: 'When this health check re-tests every channel: nothing automatic, a single run at a set time, or a recurring day and time. Times use your configured timezone.',
-        });
-        items.push({
-          focus: 'check', label: `Test profile${suffix}`, href,
-          value: (c ? c.profile_name : G.profileName) || 'Default settings',
-          tip: 'How long each channel is watched and how strict the pass thresholds are. Profiles are edited under Health Check Profiles.',
-        });
-      });
-    }
+    // Never conditional on the schedule's value: a check with no schedule still gets a
+    // chip, it just reads "None" rather than disappearing.
+    items.push({
+      focus: 'check', label: 'Schedule',
+      value: (G.schedule && G.schedule.label) || 'None',
+      tip: 'When this health check re-tests every channel: nothing automatic, a single run at a set time, or a recurring day and time. Times use your configured timezone.',
+    });
+    items.push({
+      focus: 'check', label: 'Test profile',
+      value: G.profileName || 'Default settings',
+      tip: 'How long each channel is watched and how strict the pass thresholds are. Profiles are edited under Health Check Profiles.',
+    });
     return items;
   }
 
@@ -1860,8 +1841,7 @@
       unmon = `<strong>&#9888; ${plural(un, 'channel')} not monitored</strong><br>` +
         `No active recurring health check covers ${un === 1 ? 'it' : 'them'}, so a ` +
         'provider-side resolution or frame-rate change will not be re-checked automatically.' +
-        (WARN.has_check ? ''
-          : ' <a href="#" data-act="create-check">Schedule a health check for this group</a>.') +
+        ' <a href="#" data-act="schedule">Schedule this group\'s health check</a>.' +
         `<div class="gd-ban-acts">${muteBtn('unmonitored',
           'For a group you check by hand, or whose extra members are only spares.')}</div>`;
     }
@@ -1952,8 +1932,8 @@
     const where = G.hasChannel ? 'in this group' : 'in this health check';
 
     if (!activeSets) {
-      const why = G.hasChannel && G.hasCheck ? 'nothing is tested twice and failover never lands on them'
-        : G.hasChannel ? 'failover never lands on them' : 'nothing is tested twice';
+      const why = G.hasChannel ? 'nothing is tested twice and failover never lands on them'
+        : 'nothing is tested twice';
       el.className = 'notice-banner notice-banner-muted';
       el.innerHTML = `<div class="notice-banner-body"><span class="notice-banner-title">` +
         `${plural(sets, 'duplicate channel set')} ${where} - the extras are disabled, so ${why}.</span></div>`;
@@ -1961,11 +1941,9 @@
       return;
     }
 
-    const cost = G.hasChannel && G.hasCheck
+    const cost = G.hasChannel
       ? 'every run tests the same feed more than once, and failover can drop off a failing feed straight onto the very same stream.'
-      : G.hasChannel
-        ? 'failover can drop off a failing feed straight onto the very same stream instead of a genuinely different one, so one outage takes the whole group down with it.'
-        : 'each run tests it more than once and burns an extra connection on your account.';
+      : 'each run tests it more than once and burns an extra connection on your account.';
     // An automatic group computes its own membership, so there is nothing to remove
     // here - the fix is in Browse, where the channels themselves live.
     const action = G.isSystem
@@ -2018,8 +1996,8 @@
   function openDedup() {
     if (!DUP_GROUPS.length) { showToast('No duplicate channels here - nothing to review.', { type: 'error' }); return; }
     const intro = G.hasChannel
-      ? 'The channels you don\'t keep are removed from <strong>this group</strong>' +
-        (G.hasCheck ? ', which also takes them out of the health check and its test history here' : '') +
+      ? 'The channels you don\'t keep are removed from <strong>this group</strong>, which also ' +
+        'takes them out of its health check and their test history here' +
         '. They are not deleted &mdash; they stay in your channel list and return to the guide as ' +
         'individual channels if they were in it before.'
       : 'The channels you don\'t keep are removed from <strong>this health check</strong> only, along ' +
@@ -2125,6 +2103,30 @@
   }
 
   function drawFormatBlock(host, focus) {
+    // Settings edits a group that already records; the walkthrough is what promotes one
+    // (dev/changelog/1077). On a group no member of which has Recording on, a strategy
+    // dropdown would promise "Records from N of M members" for a group that records from
+    // nobody - which is exactly what it used to do - so the block says the state in one
+    // sentence and offers the one door. The server refuses a format write on such a
+    // group with `needs_promotion`, so this is the convenience and not the gate.
+    if (needsPromotion()) {
+      host.innerHTML = `<fieldset class="gd-fset${focus === 'format' ? ' hi' : ''}">` +
+        '<div class="gd-fset-head">Format</div>' +
+        // One row, in the slot the real strategy picker occupies: the sentence on the
+        // left, the one door on the right. Not `full` - that is the no-control shape, and
+        // it leaves a button stranded in a 220px column at the left edge (fieldRow's own
+        // note in util.js says so).
+        fieldRow({
+          label: 'Format strategy',
+          meta: 'No member of this group is switched on for recording, so it is a health ' +
+            'check and has no format to choose yet. Setting up recording asks which format ' +
+            'the group should be and which members it may record from, in one step.',
+          control: '<button type="button" class="btn btn-primary btn-sm" id="gd-setup-recording">' +
+            'Set up recording&hellip;</button>',
+        }) +
+        '</fieldset>';
+      return;
+    }
     const strategy = fmtEdit.strategy;
     const manages = groupStrategyManagesFormat(strategy);
     // The format the group's DATA points at, never its lock. `G.lockLabel ||
@@ -2144,10 +2146,9 @@
     h += fieldRow({
       wide: true,
       label: 'Format strategy',
-      meta: 'Which video format this group should be, and whether it is a recording source ' +
-        'at all. Unlike picking a format once, this is re-evaluated after every health check ' +
-        'run, so the format follows the data.' +
-        // `.none` colors the sentence as a warning for the two values that enforce
+      meta: 'Which video format this group should be. Unlike picking a format once, this is ' +
+        're-evaluated after every health check run, so the format follows the data.' +
+        // `.none` colors the sentence as a warning for the one value that enforces
         // nothing - it is the one thing about this control a user can get wrong quietly.
         `<div class="gd-strategy-help${manages ? '' : ' none'}">` +
         `${escHtml(groupStrategyHelp(strategy))}</div>`,
@@ -2212,12 +2213,12 @@
       h += '<div id="gd-fmt-block"></div>';
     }
 
-    if (G.hasCheck) {
+    {
       const s = G.schedule || { mode: 'manual' };
       h += `<fieldset class="gd-fset${focus === 'check' ? ' hi' : ''}"><div class="gd-fset-head">Health check</div>`;
       h += fieldRow({
         label: 'Schedule',
-        meta: '<p><strong>None</strong> means no automatic schedule - run it yourself from Test again. ' +
+        meta: '<p><strong>None</strong> means no automatic schedule - run it yourself from Test now. ' +
           '<strong>One time</strong> runs once at a date and time you pick. <strong>Recurring</strong> ' +
           'repeats on a day and time.</p><p>Runs are queued, so a check never competes with a recording ' +
           'for the same feed.</p>',
@@ -2258,7 +2259,14 @@
     body.innerHTML = h;
 
     const fmtHost = body.querySelector('#gd-fmt-block');
-    if (fmtHost) {
+    if (fmtHost && needsPromotion()) {
+      drawFormatBlock(fmtHost, focus);
+      // The one door: close this modal and open the walkthrough, which completes the
+      // promotion in one request and reloads the page.
+      fmtHost.addEventListener('click', (e) => {
+        if (e.target.closest('#gd-setup-recording')) { modal.closeModal(); openWalkthrough('manual'); }
+      });
+    } else if (fmtHost) {
       fmtEdit.strategy = strategyValue();
       fmtEdit.pin = G.lockLabel || G.referenceLabel || null;
       fmtEdit.plan = null;
@@ -2333,8 +2341,11 @@
       // because writing a pin by hand is what choosing manual means (dev/changelog/762).
       // This used to be /format chained to /format-strategy, and a failed second request
       // left the pin stranded under the old strategy - filtering members forever while
-      // this card named a strategy that follows the data instead.
-      if (fmtEdit.strategy === 'manual') {
+      // this card named a strategy that follows the data instead. A group nobody records
+      // from has no strategy control at all (drawFormatBlock), so nothing to write.
+      if (needsPromotion()) {
+        // nothing - the walkthrough is the only format writer for this group
+      } else if (fmtEdit.strategy === 'manual') {
         const pin = parseFormatLabel(fmtEdit.pin);
         if (!pin) {
           showToast('Pick a format to pin, or choose a strategy that follows the data.',
@@ -2360,7 +2371,7 @@
         }
       }
     }
-    if (G.hasCheck) {
+    {
       const profileId = body.querySelector('#gd-profile').value || null;
       if (String(profileId) !== String(G.profileId === null ? '' : G.profileId)) {
         reqs.push(jsonFetch(jobApi('profile'), { method: 'POST', body: JSON.stringify({ profile_id: profileId }) }));
@@ -2383,30 +2394,6 @@
       .catch(e => showToast(e.message || 'Could not save settings.', { type: 'error' }));
   }
 
-  // ── Create health check ───────────────────────────────────────────────────
-  // The modal itself lives in check-modal.js - the Groups list opens the same one.
-
-  function openCreateCheck() {
-    openCreateCheckModal({
-      groupId: G.groupId,
-      groupName: G.groupName,
-      memberCount: TOTAL,   // live count, not the server-rendered one - rows can change under the page
-      profiles: G.checkProfiles.profiles,
-      profilesUrl: G.profilesUrl,
-      inheritedCheck: G.inheritedCheck,
-      hasOwnCheck: G.hasCheck,
-      inGuide: G.inGuide,
-      testerBusy: G.testerBusy,
-      windowSettingsUrl: G.windowSettingsUrl,
-      scheduleTemplateId: 'cc-schedule-fields',
-      schedulePrefix: 'ccsched',
-      // A health check is a schedule its group carries, so it has nothing to name - the
-      // route derives the job name from the group (dev/changelog/831).
-      nameless: true,
-      onDone: () => { reloading = true; location.reload(); },
-    });
-  }
-
   // ── Row + page actions ────────────────────────────────────────────────────
 
   function rowById(cid) { return ROWS.find(r => r.channel_id === cid); }
@@ -2416,7 +2403,7 @@
     if (!r) return;
     const items = [];
     items.push({ act: 'details', label: 'Channel details' });
-    if (G.hasCheck) items.push({ act: 'retest', label: 'Test this feed now' });
+    items.push({ act: 'retest', label: 'Test this feed now' });
     if (!r.in_guide) items.push({ act: 'add-guide', label: 'Add to TV Guide' });
     items.push({ act: 'group', label: 'Group with duplicates…' });
     items.push({ sep: true });
@@ -2550,22 +2537,10 @@
       case 'sections': sectionLayout.open(); return;
       case 'dedup': openDedup(); return;
       case 'delete-missing': openDeleteMissing(); return;
-      case 'create-check': openCreateCheck(); return;
       // No 'create-group' case: promoting a health check into a channel group was the
       // two-object model's only reason to exist, and there is one object now
       // (DESIGN-channel-groups-model.md DECIDED 2, dev/changelog/752). Cloning a group
       // still opens that modal - from clone-modal.js, not here.
-      case 'pick-format':
-        openFormatPickerModal({
-          groupId: G.groupId,
-          groupName: G.groupName,
-          channels: ROWS.map(r => ({ id: r.channel_id, name: r.channel_name })),
-          onDone: () => { reloading = true; location.reload(); },
-        });
-        return;
-      case 'run-linked-check':
-        postAndReload(`/api/channel-tests/on-demand/${el.dataset.job}/start`);
-        return;
       case 'suggest':
         openGroupModal({ channels: [], fixedGroup: { id: G.groupId, name: G.groupName } });
         return;
@@ -2595,12 +2570,6 @@
           existingNames: G.groupNames,
           resolutionOptions: G.resolutionOptions,
           fpsOptions: G.fpsOptions,
-          profiles: G.checkProfiles.profiles,
-          profilesUrl: G.profilesUrl,
-          testerBusy: G.testerBusy,
-          windowSettingsUrl: G.windowSettingsUrl,
-          scheduleTemplateId: 'cc-schedule-fields',
-          schedulePrefix: 'ccsched',
           onDone: () => { reloading = true; location.reload(); },
         });
         return;
@@ -2611,7 +2580,7 @@
         openDeleteGroupModal({
           groupName: G.groupName,
           deleteUrl: api('delete'),
-          attachedChecks: G.checks || [],
+          attachedChecks: [{ name: G.jobName }],
           onDeleted: () => { reloading = true; location.href = G.groupsUrl; },  // nav-ok: redirect after deleting the group
           onError: (msg) => showActionError(msg),
         });
@@ -2642,17 +2611,9 @@
         });
         return;
       }
-      case 'restart':
-        if (!confirm('Test again and re-run all channels? Prior results are kept in each channel\'s history, not deleted.')) return;
-        postAndReload(jobApi('restart'));
-        return;
-      case 'start-over':
-        if (!confirm('Start over and re-test all channels? Prior results are kept in each channel\'s history, not deleted.')) return;
-        postAndReload(jobApi('restart'));
-        return;
       case 'resume': postAndReload(jobApi('resume')); return;
       case 'force-cancel':
-        if (!confirm('Force cancel this check? It will be marked Cancelled and you can then Resume or Start over.')) return;
+        if (!confirm('Force cancel this check? It will be marked Cancelled. You can test it again, or resume where it stopped.')) return;
         postAndReload(jobApi('force-cancel'));
         return;
       case 'unschedule':
@@ -2765,6 +2726,14 @@
     if (!d) return false;
     if (d.recording_in_progress) { liveRecordingModal(d.recording_in_progress, onCancel); return true; }
     if (d.confirm_required) { confirmLastMember(d.confirm_required, retry, onCancel); return true; }
+    // A format write on a group nobody records from: the server's answer is the
+    // walkthrough, which is the one path that turns Recording on and chooses the format
+    // together (dev/changelog/1077).
+    if (d.needs_promotion) {
+      if (onCancel) onCancel();
+      openWalkthrough('manual');
+      return true;
+    }
     if (d.needs_recording_member) {
       confirmModal({
         title: 'Turn on recording for at least one member',
@@ -2784,12 +2753,14 @@
   }
 
   // §14.1's dialog, with the page's own data handed to it. Opened by the guide button,
-  // by the first Recording switch on a health-check-only group, and by the bulk
-  // Recording-on action - all three complete the click that opened them.
+  // by the first Recording switch on a group nobody records from yet, by the bulk
+  // Recording-on action, and by the Settings modal's "Set up recording" button - all of
+  // them complete the click that opened them.
   function openWalkthrough(trigger, pendingIds) {
     openPromoteModal({
       groupId: G.groupId,
       groupName: G.groupName,
+      strategy: strategyValue(),
       rows: ROWS,
       derived: G.derivedReferenceLabel || null,
       inGuide: !!G.inGuide,
@@ -2799,10 +2770,12 @@
     });
   }
 
-  // Is this group still a health check rather than a recording source? The trigger for
-  // the walkthrough, read from the same server-decided field the banners are gated on.
+  // Is this group still a health check rather than a recording source - no member has
+  // Recording on? The trigger for the walkthrough, read from the same server-decided
+  // field the banners are gated on (routes/channel_groups.py::_banner_facts is_source).
+  // A convenience: the format routes refuse with `needs_promotion` on their own.
   function needsPromotion() {
-    return G.hasChannel && strategyValue() === 'health_check_only';
+    return G.hasChannel && !!WARN && !WARN.is_source;
   }
 
   // What the user is owed after a switch moves. Turning a switch OFF is the half that
@@ -2930,7 +2903,6 @@
     // Before the guard: the sticky bar carries the group's own actions even when there is
     // nothing selectable, so it is not conditional on there being bulk verbs.
     renderBottomBar();
-    if (!G.hasCheck && !G.hasChannel) return;
     const n = selected.size;
     byId('gd-sel-count').textContent = `${n} selected`;
     byId('gd-clear-selection').style.display = n ? '' : 'none';
@@ -3079,7 +3051,7 @@
       .then(r => r.json())
       .then(s => {
         testerStatus = s;
-        const isMine = G.hasCheck && s.is_running && s.current_job_id === G.jobId;
+        const isMine = s.is_running && s.current_job_id === G.jobId;
         updateHero(isMine);
         updateActionBarMsg(isMine);
         if (isMine) updateLog(s.logs || []);
@@ -3136,19 +3108,6 @@
       if (sortKey === k) sortDir *= -1;
       else { sortKey = k; sortDir = (k === 'name') ? 1 : -1; }
       renderList();
-      return;
-    }
-
-    // The paired-half badge scrolls rather than navigates: one page carries both halves,
-    // so there is nowhere else to go.
-    const jump = e.target.closest('[data-jump]');
-    if (jump) {
-      const target = byId(jump.dataset.jump);
-      if (target) {
-        target.scrollIntoView({ behavior: 'smooth', block: 'start' });
-        target.classList.add('gd-jump-flash');
-        setTimeout(() => target.classList.remove('gd-jump-flash'), 1200);
-      }
       return;
     }
 
@@ -3310,6 +3269,13 @@
 
   // ── Start ─────────────────────────────────────────────────────────────────
 
+  // `?settings=<key>` opens the Settings modal on that block, so a surface with no room
+  // for a settings control of its own - the groups list kebab's `Schedule health check`
+  // - can link at one instead of growing a second copy of this modal
+  // (dev/changelog/1078). An unknown key opens Settings with nothing highlighted, which
+  // is the same thing the in-page chips do when they pass no focus.
+  const settingsFocus = new URLSearchParams(window.location.search).get('settings');
+
   buildColMenu();
   renderSettingsBar();
   renderSummary();
@@ -3319,6 +3285,7 @@
   renderList();
   initBarReveal();
   pollStatus();
+  if (settingsFocus) openSettingsModal(settingsFocus);
 
   // Crossing the breakpoint redraws everything that branches on it. Without this a phone
   // rotated to landscape - or a desktop window dragged narrow - keeps whichever drawing it

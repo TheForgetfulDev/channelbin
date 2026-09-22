@@ -9,7 +9,7 @@
     toggle, format lock, format strategy and recording creation all reject it,
     because its membership is computed from the guide rather than stored. The old
     check_only restrictions are gone with `kind` (dev/changelog/741).
-  * A group still on `health_check_only` accepts any mix of channels silently; a group
+  * A group nobody records from accepts any mix of channels silently; a group
     that records gets a soft, proceedable format warning rather than a refusal
     (dev/changelog/762).
 
@@ -32,6 +32,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from tests.support import make_test_app  # noqa: E402
 from tests.support.seed import (  # noqa: E402
     make_account, make_channel, make_channel_test, make_group, make_recording, make_test_job,
+    set_check,
 )
 from app import db  # noqa: E402
 from app.database import (  # noqa: E402
@@ -221,9 +222,9 @@ class SystemGroupEnforcementTests(unittest.TestCase):
 
 
 class HealthCheckOnlyGroupTests(unittest.TestCase):
-    """A group still on `health_check_only` is not a recording source yet, so it accepts
-    any mix of channels - the format questions are asked when it is promoted, not while it
-    is being assembled (DESIGN-channel-groups-model.md §14.1)."""
+    """A group nobody records from yet is not a recording source, so it accepts any mix
+    of channels - the format questions are asked when it is promoted, not while it is
+    being assembled (DESIGN-channel-groups-model.md §14.1, dev/changelog/1077)."""
 
     def setUp(self):
         self.t = make_test_app()
@@ -261,8 +262,10 @@ class HealthCheckOnlyGroupTests(unittest.TestCase):
         saying out loud for a group that records, but adding a member is never blocked
         over its format - the lock skips it where members are chosen instead."""
         hd, sd = self._mixed_pair()
-        strict = make_group(name='Strict', members=[])
-        strict.format_strategy = GROUP_FORMAT_HIGHEST_SCORE
+        # "Records" means a member has Recording on - the strategy alone says nothing.
+        anchor = make_channel(self.acct, name='Anchor feed')
+        strict = make_group(name='Strict', members=[anchor], recording=True,
+                            format_strategy=GROUP_FORMAT_HIGHEST_SCORE)
         db.session.commit()
         resp = self.t.client.post(f'/api/channel-groups/{strict.id}/members',
                                   json={'channel_ids': [hd.id, sd.id]})
@@ -274,23 +277,25 @@ class HealthCheckOnlyGroupTests(unittest.TestCase):
                  for grp in body['format_mismatch']['groups'] for c in grp['channels']}
         self.assertEqual(named, {hd.id, sd.id},
                          'the warning names the channels whose formats disagree')
-        self.assertEqual(ChannelGroupMember.query.filter_by(group_id=strict.id).count(), 0,
+        self.assertEqual(ChannelGroupMember.query.filter_by(group_id=strict.id).count(), 1,
                          'an unconfirmed add writes no membership rows')
 
     def test_the_format_warning_is_proceedable(self):
         """The whole difference from the deleted rule: `force` gets through, and both
         mismatched members land (dev/changelog/762)."""
         hd, sd = self._mixed_pair()
-        strict = make_group(name='Strict', members=[])
-        strict.format_strategy = GROUP_FORMAT_HIGHEST_SCORE
+        # "Records" means a member has Recording on - the strategy alone says nothing.
+        anchor = make_channel(self.acct, name='Anchor feed')
+        strict = make_group(name='Strict', members=[anchor], recording=True,
+                            format_strategy=GROUP_FORMAT_HIGHEST_SCORE)
         db.session.commit()
         resp = self.t.client.post(f'/api/channel-groups/{strict.id}/members',
                                   json={'channel_ids': [hd.id, sd.id], 'force': True})
         self.assertEqual(resp.status_code, 200, resp.get_data(as_text=True))
         self.assertTrue(resp.get_json()['success'])
-        self.assertEqual(
-            {m.channel_id for m in ChannelGroupMember.query.filter_by(group_id=strict.id)},
-            {hd.id, sd.id})
+        self.assertTrue(
+            {m.channel_id for m in ChannelGroupMember.query.filter_by(group_id=strict.id)}
+            >= {hd.id, sd.id})
 
 
 class CheckRunChannelsKindTests(unittest.TestCase):
@@ -386,9 +391,9 @@ class GroupsTabScopeTests(unittest.TestCase):
 
 
 class GroupJobDeleteGuardTests(unittest.TestCase):
-    """Groups unification 3/4 teardown: a group backing a health check can't be
-    dissolved out from under it, and deleting a check cleans up the 1:1 bag it
-    owns without touching a bag another check still uses."""
+    """Groups unification 3/4 teardown: deleting a group takes its one health check
+    with it - scheduler entry and ChannelTest rows included - and a check cannot be
+    deleted on its own at all (dev/changelog/1077)."""
 
     def setUp(self):
         self.t = make_test_app()
@@ -417,13 +422,11 @@ class GroupJobDeleteGuardTests(unittest.TestCase):
         self.assertEqual(ChannelTest.query.filter_by(job_id=job_id).count(), 0)
 
     def test_deleting_group_cascades_a_directly_attached_job_on_a_paired_channel_group(self):
-        """The linked-pair case (a kind='channel' group with its own directly-attached
-        job, as opposed to make_test_job's auto-created check-only bag) cascades the
-        same way."""
+        """A group that records (Recording on, the make_group default) cascades the
+        same way as one nobody records from."""
         ch = make_channel(self.acct, name='Member')
         grp = make_group(name='Paired group', members=[ch])
-        job = OnDemandTestJob(name='Attached check', status='QUEUED', group_id=grp.id)
-        db.session.add(job)
+        job = set_check(grp, name='Attached check', status='QUEUED')
         db.session.commit()
         job_id = job.id
         resp = self.t.client.post(f'/api/channel-groups/{grp.id}/delete')
@@ -445,35 +448,32 @@ class GroupJobDeleteGuardTests(unittest.TestCase):
         self.assertIsNotNone(db.session.get(ChannelGroup, group_id))
         self.assertIsNotNone(db.session.get(OnDemandTestJob, job.id))
 
-    def test_deleting_job_deletes_its_sole_owned_group(self):
+    def test_a_check_cannot_be_deleted_on_its_own(self):
+        """dev/changelog/1077: a check is its group's one schedule and dies only with the
+        group, so there is no DELETE route for it any more."""
         ch = make_channel(self.acct, name='Member')
         job = make_test_job(name='Nightly', channels=[ch])
         db.session.commit()
         group_id = job.group_id
         resp = self.t.client.delete(f'/api/channel-tests/on-demand/{job.id}')
-        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.status_code, 404, 'no route answers a lone check delete')
         db.session.expire_all()
-        self.assertIsNone(db.session.get(ChannelGroup, group_id),
-                          'an auto-created 1:1 check bag has no other owner and no '
-                          'pre-#22 UI to remove it - it must go with its last job')
+        self.assertIsNotNone(db.session.get(ChannelGroup, group_id))
+        self.assertIsNotNone(db.session.get(OnDemandTestJob, job.id))
 
-    def test_deleting_job_keeps_group_a_second_job_still_uses(self):
+    def test_a_group_carries_exactly_one_check(self):
+        """The unique index on on_demand_test_jobs.group_id is what makes `group.check`
+        a safe one-to-one read (dev/changelog/1077)."""
+        from sqlalchemy.exc import IntegrityError
         ch = make_channel(self.acct, name='Member')
         first = make_test_job(name='Nightly quick', channels=[ch])
         db.session.commit()
-        second = OnDemandTestJob(name='Weekly deep', status='QUEUED',
-                                 group_id=first.group_id)
-        db.session.add(second)
-        db.session.commit()
-        group_id = first.group_id
-        resp = self.t.client.delete(f'/api/channel-tests/on-demand/{first.id}')
-        self.assertEqual(resp.status_code, 200)
-        db.session.expire_all()
-        self.assertIsNotNone(db.session.get(ChannelGroup, group_id),
-                             'several jobs may share one group - the survivor still '
-                             'needs its channel list')
-        self.assertEqual(db.session.get(OnDemandTestJob, second.id).group_id, group_id)
-
+        db.session.add(OnDemandTestJob(name='Weekly deep', status='QUEUED',
+                                       group_id=first.group_id))
+        with self.assertRaises(IntegrityError):
+            db.session.commit()
+        db.session.rollback()
+        self.assertEqual(db.session.get(ChannelGroup, first.group_id).check.id, first.id)
 
 class GroupNameUniquenessTests(unittest.TestCase):
     """No uniqueness check existed on group name before this - create/rename/clone

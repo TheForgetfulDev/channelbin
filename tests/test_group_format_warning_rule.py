@@ -54,7 +54,7 @@ class PinnedFormatOffendersTests(unittest.TestCase):
 
     def test_no_automatic_strategy_warns_even_with_a_lock_in_force(self):
         for strategy in ('highest_score', 'highest_resolution', 'highest_bitrate',
-                         'most_channels', 'balanced', 'unmanaged', 'health_check_only'):
+                         'most_channels', 'balanced', 'unmanaged'):
             with self.subTest(strategy=strategy):
                 self.assertEqual(
                     pinned_format_offenders(self._group(strategy), self.members, self.latest), [])

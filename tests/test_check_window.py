@@ -653,7 +653,7 @@ class OnDemandRouteWindowModeTests(unittest.TestCase):
                 'action': 'schedule', 'recurring': True, 'recur_day': 0, 'use_window': True,
             })
         self.assertEqual(resp.status_code, 200)
-        job = OnDemandTestJob.query.filter_by(name='Window check').one()
+        job = OnDemandTestJob.query.filter_by(name='Window check - health check').one()
         self.assertTrue(job.recur_use_window)
         self.assertIsNone(job.recur_hour)
         self.assertIsNone(job.recur_minute)
@@ -719,7 +719,48 @@ class OnDemandRouteWindowModeTests(unittest.TestCase):
                                  recur_hour=3, recur_minute=0)
         db.session.commit()
         ctx = _schedule_ctx(job, {'window': {'start': '02:00', 'end': '06:00'}})
-        self.assertFalse(ctx['use_window'])
+        self.assertIs(ctx['use_window'], False)
+
+    def test_schedule_ctx_states_no_opinion_for_an_unscheduled_check(self):
+        """dev/docs/BUGS.md 2026-09-21 @ 12:13:30 PM. A check with no schedule has no
+        answer to give, so the seam must send None - schedule-fields.js::prefill() reads
+        an explicit False as "exact time" and would override the picker's own window
+        default with a time nobody chose."""
+        from app.routes.channel_groups import _schedule_ctx
+        job = seed.make_test_job(name='No schedule', channels=[self.channel], status='QUEUED')
+        db.session.commit()
+        ctx = _schedule_ctx(job, {'window': {'start': '02:00', 'end': '06:00'}})
+        self.assertEqual(ctx['mode'], 'manual')
+        self.assertIsNone(ctx['use_window'])
+        self.assertEqual(ctx['recur_time'], '03:00')
+        self.assertEqual(ctx['recur_day'], 0)
+
+    def test_schedule_ctx_states_no_opinion_for_a_one_off_check(self):
+        """dev/docs/BUGS.md 2026-09-21 @ 12:44:32 PM. A one-off check has never answered
+        the window question either - its recur_use_window is an untouched column default -
+        so the seam must not ship it as False. prefill() ticks "a specific time" from an
+        explicit False and setMode() never moves the radio again, so switching a saved
+        one-off to Recurring revealed a choice the user had not made."""
+        from app.routes.channel_groups import _schedule_ctx
+        job = seed.make_test_job(name='One-off ctx', channels=[self.channel],
+                                 status='SCHEDULED', recurring=False,
+                                 scheduled_start_time=datetime.utcnow() + timedelta(days=1))
+        db.session.commit()
+        ctx = _schedule_ctx(job, {'window': {'start': '02:00', 'end': '06:00'}})
+        self.assertEqual(ctx['mode'], 'once')
+        self.assertIsNone(ctx['use_window'])
+
+    def test_group_page_sends_no_use_window_opinion_for_an_unscheduled_check(self):
+        """The same fact end to end: the group page's GROUP_DETAIL blob is what actually
+        reaches openSettingsModal, so the null has to survive the render."""
+        chan = seed.make_channel(self.account, name='Blob chan')
+        group = seed.make_group(name='Blob group', members=[chan])
+        db.session.commit()
+        resp = self.client.get(f'/channel-groups/{group.id}')
+        self.assertEqual(resp.status_code, 200)
+        blob = resp.get_data(as_text=True)
+        self.assertIn('"use_window": null', blob)
+        self.assertIn('"recur_time": "03:00"', blob)
 
 
 class SkipNextWindowJobTests(unittest.TestCase):
@@ -811,7 +852,7 @@ class JobsPageWindowVisibilityTests(unittest.TestCase):
         item = matches[0]
         self.assertEqual(item['type'], 'recurring')
         self.assertEqual(item['display_name'], 'Health check: Nightly window check')
-        self.assertEqual(item['edit_url'], f'/channels/health-checks/{job.id}')
+        self.assertEqual(item['edit_url'], f'/channel-groups/{job.group_id}')
         self.assertEqual(item['skip_url'], f'/api/channel-tests/on-demand/{job.id}/skip-next')
         self.assertNotIn('run_url', item)
         self.assertNotIn('cancel_url', item)

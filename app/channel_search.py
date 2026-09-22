@@ -2946,6 +2946,13 @@ class SearchResult:
     #: single number over two tables is the one number here the user could not explain.
     channel_total: int | None = 0
     group_total: int = 0
+    #: How many DISTINCT channels the rows this search shows sit on - the airing grain's
+    #: number, and None on the channel grain, where every row is a channel already. Counted
+    #: over the same row set as `total`, so "Collapse channel groups" and "One row per
+    #: channel" narrow it exactly as they narrow the total; a pair taken either side of the
+    #: collapse is a pair the reader cannot reconcile (dev/changelog/1080). None also means
+    #: "pending", the same way `total` does, when `want_counts=False`.
+    channels_matched: int | None = None
     page: int = 1
     page_size: int = DEFAULT_PAGE_SIZE
     pages: int | None = 0
@@ -3088,8 +3095,8 @@ def search(state: SearchState, ctx: SearchContext | None = None,
 
 
 def search_counts(state: SearchState, ctx: SearchContext) -> tuple:
-    """(standing_hidden, total, pages, group_total) alone - what a counts-only request needs,
-    without
+    """(standing_hidden, total, pages, group_total, channels_matched) alone - what a
+    counts-only request needs, without
     paying for the row query or the facet rail `search()` also builds. Same narrowing
     `_search_channels`/`_search_airings` build; this is the other half of the split
     `want_counts=False` created in `search()` (dev/changelog/598)."""
@@ -3097,7 +3104,7 @@ def search_counts(state: SearchState, ctx: SearchContext) -> tuple:
         raise SearchStateError(f'unknown result grain {state.grain!r}')
     text_preds = text_predicates(state, ctx)
     narrowing = text_preds + dimension_predicates(state, ctx)
-    hidden, total, pages = _breakdown_and_pages(state, ctx, narrowing)
+    hidden, total, pages, matched = _breakdown_and_pages(state, ctx, narrowing)
     # The group rows are part of what the pager pages, so a counts-only request has to
     # include them or the page's own count line disagrees with the pager beside it. Adding
     # the group query here rather than teaching the caller to add it is what keeps the two
@@ -3107,7 +3114,7 @@ def search_counts(state: SearchState, ctx: SearchContext) -> tuple:
     if groups:
         total += groups
         pages = (total + state.page_size - 1) // state.page_size
-    return hidden, total, pages, groups
+    return hidden, total, pages, groups, matched
 
 
 def _order_key(element):
@@ -3192,11 +3199,13 @@ def search_facets(state: SearchState, ctx: SearchContext) -> dict:
 
 
 def _breakdown_and_pages(state: SearchState, ctx: SearchContext, narrowing: list) -> tuple:
-    """(standing_hidden, total, pages) - the one place all three callers (both grains' full
-    search, and the counts-only endpoint) turn a breakdown into the page count the UI needs."""
-    hidden, total = _standing_breakdown(state, ctx, narrowing)
+    """(standing_hidden, total, pages, channels_matched) - the one place all three callers
+    (both grains' full search, and the counts-only endpoint) turn a breakdown into the page
+    count the UI needs. `channels_matched` is None off the airing grain - see
+    `_standing_breakdown_compute`."""
+    hidden, total, matched = _standing_breakdown(state, ctx, narrowing)
     pages = (total + state.page_size - 1) // state.page_size
-    return hidden, total, pages
+    return hidden, total, pages, matched
 
 
 def _merge_group_page(page, state: SearchState, groups: list) -> list:
@@ -3278,7 +3287,7 @@ def _search_channels(state: SearchState, ctx: SearchContext,
     groups = matching_groups(state, ctx, group_member_preds(state, ctx, narrowing))
 
     if want_counts:
-        hidden, channel_total, _pages = _breakdown_and_pages(state, ctx, narrowing)
+        hidden, channel_total, _pages, _matched = _breakdown_and_pages(state, ctx, narrowing)
         total = channel_total + len(groups)
         pages = (total + state.page_size - 1) // state.page_size
     else:
@@ -3334,9 +3343,9 @@ def _search_airings(state: SearchState, ctx: SearchContext,
     kept = standing_predicates(state, ctx, narrowing)
 
     if want_counts:
-        hidden, total, pages = _breakdown_and_pages(state, ctx, narrowing)
+        hidden, total, pages, matched = _breakdown_and_pages(state, ctx, narrowing)
     else:
-        hidden, total, pages = None, None, None
+        hidden, total, pages, matched = None, None, None, None
 
     query = _airing_query().filter(*narrowing, *kept)
     order = list(SORTS_AIRINGS[state.sort]())
@@ -3359,6 +3368,7 @@ def _search_airings(state: SearchState, ctx: SearchContext,
         rows=rows,
         total=total,
         channel_total=total,
+        channels_matched=matched,
         airing_group_ids=airing_group_ids,
         page=state.page,
         page_size=state.page_size,
@@ -3498,7 +3508,7 @@ def _cached_standing_breakdown(state: SearchState, ctx: SearchContext, narrowing
 
 
 def _standing_breakdown(state: SearchState, ctx: SearchContext, narrowing: list):
-    """({option key: rows it hid}, rows still visible) - one query for both, or a cache hit.
+    """`_standing_breakdown_compute`'s three numbers, or a cache hit.
 
     See `_cached_standing_breakdown` for when a cache is even attempted; every other case
     (any active text query or filter) always calls `_standing_breakdown_compute` directly.
@@ -3510,7 +3520,8 @@ def _standing_breakdown(state: SearchState, ctx: SearchContext, narrowing: list)
 
 
 def _standing_breakdown_compute(state: SearchState, ctx: SearchContext, narrowing: list):
-    """({option key: rows it hid}, rows still visible) - one query for both.
+    """({option key: rows it hid}, rows still visible, distinct channels among them) - one
+    query for all three.
 
     The CASE is ordered, so a row hidden by two options is attributed to the FIRST one in
     registry order. First, not all: the user is shown one number per option, and a row
@@ -3520,29 +3531,48 @@ def _standing_breakdown_compute(state: SearchState, ctx: SearchContext, narrowin
     Counted over rows that pass the text and the filters, so "412 duplicates hidden" means
     412 rows this search would give back by turning the option off - not 412 rows somewhere
     in the database. A number the user cannot act on is worse than no number.
+
+    THE DISTINCT-CHANNEL COUNT IS THE AIRING GRAIN'S ONLY, and it comes off THIS scan rather
+    than a second one. The count line names it beside the airing total in one sentence ("of
+    1,240 airings on 37 of 136,130 channels"), so the two have to describe one row set: a
+    total taken after "Collapse channel groups" folded members into their group, beside a
+    channel count taken before it, is a pair the reader cannot reconcile. Asking the same
+    GROUP BY for it gets that for free - the buckets already partition the rows, so the ''
+    bucket's distinct count is exactly the channels the visible rows sit on. Measured on the
+    live database (123k rows in scope, warm): 127ms -> 165ms for the extra aggregate, against
+    ~1.6s for a second query of this shape (dev/changelog/1080). The channel grain gets None,
+    not its own row count: there every row IS a channel and some rows are groups, so the
+    number would be either a restatement or a lie.
     """
     airings = state.grain == GRAIN_AIRINGS
     counted = EPGEntry.id if airings else Channel.id
+    channels = func.count(func.distinct(EPGEntry.channel_id))
     active = active_standing(state)
     scope = _cluster_scope(state, ctx, narrowing)
     if not active:
-        query = db.session.query(func.count(counted))
+        query = db.session.query(func.count(counted), *([channels] if airings else []))
         if airings:
             query = query.select_from(EPGEntry).join(
                 Channel, Channel.id == EPGEntry.channel_id)
-        return {}, (query.filter(*narrowing).scalar() or 0)
+        row = query.filter(*narrowing).one()
+        return {}, (row[0] or 0), (row[1] or 0) if airings else None
 
     bucket = db.case(*[(_standing_reject(s.key, ctx, scope, state), s.key) for s in active],
                      else_='')
-    query = db.session.query(bucket.label('bucket'), func.count(counted))
+    query = db.session.query(bucket.label('bucket'), func.count(counted),
+                             *([channels] if airings else []))
     if airings:
         query = query.select_from(EPGEntry).join(Channel, Channel.id == EPGEntry.channel_id)
     else:
         query = query.select_from(Channel)
     rows = query.filter(*narrowing).group_by('bucket').all()
-    counts = {key: n for key, n in rows}
+    counts = {row[0]: row[1] for row in rows}
+    # Zero rows visible means zero channels, and the bucket is absent rather than 0 - which
+    # is the same reason `total` reads through `.pop`'s default below.
+    visible = [row for row in rows if not row[0]]
     total = counts.pop('', 0)
-    return {k: n for k, n in counts.items() if n}, total
+    matched = ((visible[0][2] or 0) if visible else 0) if airings else None
+    return {k: n for k, n in counts.items() if n}, total, matched
 
 
 def _kept_ids(state: SearchState, rows: list) -> frozenset:

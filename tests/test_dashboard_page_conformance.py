@@ -35,6 +35,7 @@ import json
 import re
 import unittest
 from datetime import datetime, timedelta
+from html import unescape
 
 from app import db
 from app.routes.dashboard import (
@@ -285,6 +286,22 @@ class WindowOpenRowTests(unittest.TestCase):
         payload = json.loads(
             re.search(r'id="dash-timeline">(.*?)</script>', self.html, re.S).group(1))
         self.assertEqual({r['status'] for r in payload['recordings']}, {'PAUSED', 'RETRYING'})
+
+    def test_the_clash_legend_and_the_clash_tooltip_describe_one_outcome(self):
+        """16.4: the mark describes what scheduler.py will actually do. Since
+        dev/changelog/941 a clashing sync is deferred to the first gap long enough to
+        finish it, not dropped - so the legend under the axis may not threaten a skip
+        while the tooltip on the mark it labels promises a retry (dev/changelog/1084)."""
+        with open('static/js/dashboard.js') as fh:
+            src = fh.read()
+        legend = re.search(r'<i class="jobclash"></i>([^<]+)</span>', src)
+        self.assertIsNotNone(legend, 'the clash legend entry is gone from the timeline foot')
+        self.assertIn('deferred', legend.group(1).lower())
+        self.assertNotIn('skip', legend.group(1).lower())
+        clash = re.search(r'function jobClash\(.*?\n\}', src, re.S)
+        self.assertIsNotNone(clash, 'jobClash is gone - the legend now labels nothing')
+        for sentence in re.findall(r'`(Will be [^`]*)`', clash.group(0)):
+            self.assertIn('deferred', sentence.lower())
 
 
 class TimeAxisScaleTests(unittest.TestCase):
@@ -631,15 +648,17 @@ class RowHealthEdgeAndSortTests(unittest.TestCase):
 
     def test_the_page_hands_its_javascript_the_same_label_table_it_rendered(self):
         """dashboard.js relabels a badge from the status on an SSE frame. It reads the
-        server's own table out of #dash-status-labels rather than carrying a second,
-        hand-written copy that can drift from app/fmt_utils.py (dev/changelog/961)."""
-        from app.fmt_utils import REC_STATUS_DISPLAY
+        server's own table rather than carrying a second, hand-written copy that can drift
+        from app/fmt_utils.py (dev/changelog/961). The table moved out of this page's own
+        JSON blob and into base.html's `rec-status-labels` meta tag when the TV Guide turned
+        out to need the same words and was spelling its own (dev/changelog/1083)."""
+        from app.fmt_utils import REC_STATUS_DISPLAY, REC_WAITING_LABEL
         html = self.client.get('/').get_data(as_text=True)
-        m = re.search(r'<script type="application/json" id="dash-status-labels">(.*?)</script>',
-                      html, re.S)
+        m = re.search(r'<meta name="rec-status-labels" content="([^"]*)"', html)
         self.assertIsNotNone(m, 'the page renders no status-label table for its JS')
-        labels = json.loads(m.group(1))
-        self.assertEqual({s: row[3] for s, row in REC_STATUS_DISPLAY.items()}, labels)
+        vocab = json.loads(unescape(m.group(1)))
+        self.assertEqual({s: row[3] for s, row in REC_STATUS_DISPLAY.items()}, vocab['labels'])
+        self.assertEqual(REC_WAITING_LABEL, vocab['waiting'])
 
     def test_every_account_status_carries_its_own_edge_class(self):
         expect = {'OK': 'st-ok', 'SYNCING': 'st-sync', 'ERROR': 'st-bad', 'UNSYNCED': 'st-none'}

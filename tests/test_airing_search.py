@@ -531,6 +531,123 @@ class StandingOptionTests(_AiringTestCase):
         self.assertTrue(all(len(v) == 1 for v in by_channel.values()))
 
 
+class ChannelsMatchedTests(_AiringTestCase):
+    """"How many channels are these airings on" - `SearchResult.channels_matched`, the number
+    the count line renders beside the airing total (dev/changelog/1080).
+
+    Neither number on that line answered it before: `total` counts showings, and the figure
+    beside it was the whole library, which is the same whatever you searched for. So a person
+    could not tell 40 showings on 3 channels from 40 showings on 40, which is the difference
+    between a provider with real coverage and one feed repeating itself.
+
+    The two assertions that carry the DESIGN CALL are
+    `test_it_follows_the_group_collapse...` and `test_it_comes_off_the_breakdown_query...`:
+    the number is counted over the rows the user is shown, and it costs no second scan.
+    """
+
+    def matched(self, **kw):
+        return self.run_search(**kw).channels_matched
+
+    def test_it_counts_the_distinct_channels_the_visible_rows_sit_on(self):
+        """Everything fits on one page here, so the rows ARE the result set and the count is
+        checkable against them directly."""
+        result = self.run_search()
+        self.assertEqual(result.channels_matched,
+                         len({row.channel_id for row in result.rows}))
+        # A real number, or this asserts nothing: the default search keeps the collapsed
+        # group's one row plus BBC's two unfinished showings.
+        self.assertEqual(result.channels_matched, 2)
+
+    def test_it_follows_the_group_collapse_rather_than_every_channel_that_matched(self):
+        """THE DESIGN CALL. `total` is counted after "Collapse channel groups" folds a
+        group's members into one row, so this has to be too - the two sit in one sentence,
+        and a pair taken either side of the collapse is a pair the reader cannot reconcile.
+
+        Sky and ESPN2 carry the identical listing. Collapsed, the search shows one row on one
+        of them; uncollapsed it shows both. A count of "every channel that matched" would
+        answer 2 in both directions and so could not fail this.
+        """
+        collapsed = self.run_search(standing=only_hiding('grpdedup'), q='wembley cup')
+        both = self.run_search(standing=only_hiding(), q='wembley cup')
+        self.assertEqual((collapsed.total, collapsed.channels_matched), (1, 1))
+        self.assertEqual((both.total, both.channels_matched), (2, 2))
+
+    def test_firstonly_makes_it_equal_the_total(self):
+        """"One row per channel" is the case where the two numbers must converge - every row
+        is a different channel by construction, so a count that disagreed here would be
+        counting something other than the visible rows."""
+        result = self.run_search(standing=only_hiding('showpast', 'firstonly'))
+        self.assertEqual(result.channels_matched, result.total)
+        self.assertGreater(result.total, 1)
+
+    def test_a_search_that_matches_nothing_is_zero_channels_not_a_missing_number(self):
+        """Zero is a real answer here and null is not: null means "still counting", and a
+        search that came back with no rows has finished counting."""
+        result = self.run_search(q='nothingmatchesthis')
+        self.assertEqual((result.total, result.channels_matched), (0, 0))
+
+    def test_it_is_none_on_the_channel_grain(self):
+        """Not the channel count. There every row IS a channel and some rows are groups, so
+        the number would be either a restatement of `total` or a lie about it."""
+        state = SearchState(grain=GRAIN_CHANNELS, facets=())
+        self.assertIsNone(search(state, self.context()).channels_matched)
+
+    def test_it_is_none_when_the_counts_were_not_asked_for(self):
+        """Pending, the same way `total` is - the airing grain's row request skips the whole
+        breakdown and the page fills both in from `/counts` afterwards (dev/changelog/598).
+        A zero here would read as "these airings are on no channels", which the rows already
+        on screen disprove."""
+        result = search(self.state(), self.context(), want_counts=False)
+        self.assertIsNone(result.total)
+        self.assertIsNone(result.channels_matched)
+
+    def test_the_counts_endpoint_agrees_with_the_bundled_search(self):
+        """Two requests answering one question, exactly as `total` already is - a number that
+        differed between them is a count line that disagrees with itself between paints."""
+        state = self.state()
+        bundled = search(state, self.context())
+        _hidden, _total, _pages, _groups, matched = channel_search.search_counts(
+            state, self.context())
+        self.assertEqual(matched, bundled.channels_matched)
+
+    def test_it_comes_off_the_breakdown_query_rather_than_a_second_one(self):
+        """THE COST CALL. The breakdown already scans `epg_entries JOIN channels` under this
+        search's predicates and groups the rows by which option hid them, so the '' bucket's
+        distinct count is exactly what is wanted. Measured on the live database, the extra
+        aggregate is 127ms -> 165ms warm; a second query of this shape is ~1.6s.
+
+        One statement, whichever branch runs - with standing options active and without.
+        """
+        ctx = self.context()
+        for label, st in (('with standing options', self.state()), ('with none', self.bare())):
+            with self.subTest(label):
+                preds = channel_search.text_predicates(st, ctx) + \
+                    channel_search.dimension_predicates(st, ctx)
+                with IOCounter(all_engines()) as counter:
+                    channel_search._standing_breakdown_compute(st, ctx, preds)
+                self.assertEqual(counter.queries, 1, counter.statements)
+
+    def test_the_envelope_carries_it_on_both_the_row_and_the_counts_endpoint(self):
+        rows = self.t.client.get('/api/channels/search?grain=airings&standing=').get_json()
+        counts = self.t.client.get(
+            '/api/channels/search/counts?grain=airings&standing=').get_json()
+        self.assertEqual(rows['channels_matched'], counts['channels_matched'])
+        # Checked against the rows the same response returned rather than a re-typed number:
+        # `standing=` is the everything-hidden state (a `show*` option hides while it is
+        # ABSENT), so which rows survive it is not obvious from the URL.
+        self.assertEqual(rows['channels_matched'],
+                         len({r['channel']['id'] for r in rows['rows']}))
+        self.assertGreater(rows['channels_matched'], 1)
+        # A NEW field, not a second meaning for `channel_total` - which on this grain is the
+        # airing total again, and is an API other surfaces read.
+        self.assertEqual(rows['channel_total'], rows['total'])
+
+    def test_it_is_null_on_the_channel_grains_envelope(self):
+        payload = self.t.client.get('/api/channels/search').get_json()
+        self.assertIn('channels_matched', payload)
+        self.assertIsNone(payload['channels_matched'])
+
+
 class ClusterScopeTests(_AiringTestCase):
     """The two cluster options rank over the RESULT SET, not over the whole table.
 

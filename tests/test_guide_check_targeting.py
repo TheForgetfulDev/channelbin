@@ -33,12 +33,10 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from tests.support import make_test_app  # noqa: E402
 from tests.support.seed import (  # noqa: E402
-    make_account, make_channel, make_channel_test, make_group,
+    make_account, make_channel, make_channel_test, make_group, set_check,
 )
 from app import db  # noqa: E402
-from app.database import (  # noqa: E402
-    OnDemandTestJob, GROUP_FORMAT_HIGHEST_SCORE,
-)
+from app.database import GROUP_FORMAT_HIGHEST_SCORE, OnDemandTestJob  # noqa: E402
 
 
 def _system_group():
@@ -49,14 +47,12 @@ def _system_group():
 
 
 def _schedule(group, recurring=True, paused=False, status='SCHEDULED'):
-    """An OnDemandTestJob on `group`. Only `recurring AND SCHEDULED AND NOT paused`
-    counts as a schedule of the group's own (channel_groups.active_recurring_jobs)."""
-    job = OnDemandTestJob(name=f'{group.name} check', group_id=group.id, status=status,
-                          recurring=recurring, recur_paused=paused, recur_day=0,
-                          recur_hour=3, recur_minute=0)
-    db.session.add(job)
-    db.session.flush()
-    return job
+    """Put a schedule on `group`'s one check. Only `recurring AND (SCHEDULED or
+    RUNNING) AND NOT paused` counts as a schedule of the group's own
+    (channel_groups.active_recurring_jobs)."""
+    return set_check(group, name=f'{group.name} check', status=status,
+                     recurring=recurring, recur_paused=paused, recur_day=0,
+                     recur_hour=3, recur_minute=0)
 
 
 class SystemCheckTargetTests(unittest.TestCase):
@@ -147,9 +143,9 @@ class SystemCheckTargetTests(unittest.TestCase):
         self.assertEqual(ids, [members[-1].id], 'and it is the best-ranked participant')
 
     def test_the_fallback_reads_the_switch_the_group_is_actually_using(self):
-        # A group still on health_check_only has nothing recording-enabled by construction
-        # (DESIGN-channel-groups-model.md 14), so asking for its recording members would
-        # hand back nothing and the fallback would cover exactly the groups it exists for.
+        # A group nobody records from yet has nothing recording-enabled, so asking for its
+        # recording members would hand back nothing and the fallback would cover exactly
+        # the groups it exists for (DESIGN-channel-groups-model.md 14).
         a = make_channel(self.acct, name='A')
         b = make_channel(self.acct, name='B')
         a.health_score, b.health_score = 10, 90
@@ -275,10 +271,10 @@ class InheritedCoverageNoticeTests(unittest.TestCase):
         self.t.cleanup()
 
     def _inherited(self, group):
-        from app.routes.channel_groups import build_group_detail_context, _group_detail_job
+        from app.routes.channel_groups import build_group_detail_context
         # The builder calls url_for for the detail links, so it needs a request context.
         with self.t.app.test_request_context('/'):
-            ctx = build_group_detail_context(group, _group_detail_job(group))
+            ctx = build_group_detail_context(group)
         return ctx['inherited_check']
 
     def test_a_scheduleless_group_outside_the_guide_is_reported_as_covered(self):

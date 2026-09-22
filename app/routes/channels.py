@@ -462,27 +462,14 @@ def test_run_detail(job_id):
 
 @channels_bp.route('/channels/health-checks/<int:job_id>')
 def health_check_detail(job_id):
-    """A health check's detail page - the SAME unified page as `/channel-groups/<id>`,
-    entered by the check instead of by the group (dev/changelog/273). The URL is kept
-    (bookmarks, alert links, the Groups list's check chips) and pins which attached
-    check the table shows, which matters when a group carries more than one.
-
-    `pinned_check=True` is what makes entering by check mean something to the Activity
-    Timeline as well: its health tests are this check's runs, not every check's
-    (dev/changelog/790). The group's own recordings and changes are unaffected."""
-    from .channel_groups import build_group_detail_context
-
+    """A health check IS its group's page. The URL is kept for bookmarks, alert links
+    and the Jobs page, and redirects to `/channel-groups/<id>` - since every group
+    carries exactly one check there is nothing for a check-shaped URL to pin
+    (dev/changelog/1077; the shared page itself is dev/changelog/273)."""
     job = db.session.get(OnDemandTestJob, job_id)
-    if job is None:
+    if job is None or job.group is None:
         abort(404)
-    # Every job has carried a group since migration _m011 backfilled them, and
-    # create_on_demand_job always makes one. A job without one has no channel list to
-    # render at all, so there is nothing to show rather than a half-empty page.
-    if job.group is None:
-        abort(404)
-
-    return render_template('channels/group_detail.html',
-                           **build_group_detail_context(job.group, job, pinned_check=True))
+    return redirect(url_for('channel_groups.group_detail', group_id=job.group_id))
 
 
 # ── Channel detail (drill-down, not a tab) ──────────────────────────────────

@@ -58,7 +58,8 @@ import sqlite3
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from app.database import RESTART_BLOCKING_STATUSES, parked_restart_phrase  # noqa: E402
+from app.database import (RESTART_BLOCKING_STATUSES, parked_restart_phrase,  # noqa: E402
+                          OD_JOB_STATUS_RUNNING)
 from app.search_index import STATUS_BUILDING  # noqa: E402
 
 
@@ -177,10 +178,9 @@ def running_health_checks(db_path):
     job caught RUNNING at startup, so a row left by a hard kill is gone by the time the
     next process is up and cannot wedge restarts forever.
 
-    OnDemandTestJob's status vocabulary has no constants in app/database.py (unlike
-    RESTART_BLOCKING_STATUSES and STATUS_BUILDING, imported above rather than retyped), so
-    this literal matches the ~39 others across the tree. Same "missing or unreadable DB
-    reads as idle" contract as busy_rows().
+    The status comes from app/database.py's OD_JOB_STATUS_* block, imported rather than
+    retyped like RESTART_BLOCKING_STATUSES and STATUS_BUILDING above. Same "missing or
+    unreadable DB reads as idle" contract as busy_rows().
     """
     if not os.path.exists(db_path):
         return [], f'no database at {db_path}, assuming idle'
@@ -188,8 +188,8 @@ def running_health_checks(db_path):
     conn = sqlite3.connect(f'file:{db_path}?mode=ro', uri=True)
     try:
         rows = conn.execute(
-            "SELECT id, name FROM on_demand_test_jobs WHERE status = 'RUNNING' "
-            'ORDER BY id').fetchall()
+            'SELECT id, name FROM on_demand_test_jobs WHERE status = ? ORDER BY id',
+            (OD_JOB_STATUS_RUNNING,)).fetchall()
     except sqlite3.DatabaseError as e:
         return [], f'cannot read {db_path} ({e}), assuming idle'
     finally:

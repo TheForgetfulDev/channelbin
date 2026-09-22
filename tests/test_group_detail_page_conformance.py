@@ -133,7 +133,7 @@ class GroupDetailPayloadTests(unittest.TestCase):
                 m.recording_enabled = True  # participation-write-ok: fixture setup
             db.session.commit()
 
-        # No strategy set yet (health_check_only manages no format), so nothing is blocked
+        # Nobody records from it yet, so no lock is in force and nothing is blocked
         # even though the two members genuinely differ.
         rows, data = self._rows()
         self.assertIsNone(data['lock_label'])
@@ -384,7 +384,10 @@ class ParticipationFilterTests(unittest.TestCase):
         js = _read('static/js/group-detail.js')
         dims = js[js.index('const FILTER_DIMS = ['):js.index('const filterBar = createFilterBar(')]
         self.assertEqual(dims.count('available: () => G.hasChannel'), 2)
-        self.assertEqual(dims.count('available: () => G.hasCheck'), 2)
+        # Every group carries a check (dev/changelog/1077), so the status and test-age
+        # dimensions are never gated.
+        self.assertEqual(dims.count('available: () => true'), 2)
+        self.assertNotIn('G.hasCheck', js)
 
     def test_initial_state_is_nothing_active(self):
         """Server-rendered initial state must equal the "nothing active" state - JS may
@@ -410,7 +413,7 @@ class ParticipationFilterTests(unittest.TestCase):
 # ── dev/changelog/756 - the format strategy control and the banner stack ─────
 #
 # §4.4's eight-value setting had no dropdown, so every group was stuck on the
-# health_check_only default and nothing exercised the engine #7 built. §16's banners are
+# default and nothing exercised the engine #7 built. §16's banners are
 # the whole of what the app says about a questionable setup, since nothing is
 # auto-corrected (§4.1) and almost nothing is refused (§4.3, §15) - which makes their
 # gating a behavior, not decoration.
@@ -467,13 +470,20 @@ class BannerFactsTests(unittest.TestCase):
                     'no_winner', 'epg_ids', 'epg_missing_count'):
             self.assertIn(key, w)
 
-    def test_health_check_only_is_not_a_recording_source(self):
-        """§16 gates every warning on the STRATEGY, not on in_guide: a group made purely
-        for health checking should not be warned at all."""
+    def test_a_group_nobody_records_from_is_not_a_recording_source(self):
+        """§16 gates every warning on whether a member has Recording on, not on in_guide
+        and not on the strategy (dev/changelog/1077): a group made purely for health
+        checking should not be warned at all, whatever strategy it carries."""
+        for cid in (self.aid, self.bid):
+            # `confirm`: the last switch off is 15's gate, and this is that switch.
+            r = self.client.post(f'/api/channel-groups/{self.gid}/members/participation',
+                                 json={'channel_id': cid, 'field': 'recording_enabled',
+                                       'enabled': False, 'confirm': True})
+            self.assertEqual(r.status_code, 200, r.get_data(as_text=True))
         w = self._warn()
-        self.assertEqual(w['strategy'], 'health_check_only')
+        self.assertEqual(w['strategy'], 'highest_score')
         self.assertFalse(w['is_source'])
-        self.assertFalse(w['manages_format'])
+        self.assertEqual(w['recording_count'], 0)
 
     def test_unmanaged_is_a_source_that_manages_no_format(self):
         """The two flags are not the same question, and `unmanaged` is the value that
@@ -543,8 +553,10 @@ class BannerFactsTests(unittest.TestCase):
             bare.epg_channel_id = None
             db.session.commit()
             bare_id = bare.id
+        # `force`: the group records, so an untested newcomer draws the soft
+        # unverified-format warning first (dev/changelog/762); this test is about EPG ids.
         r = self.client.post(f'/api/channel-groups/{self.gid}/members',
-                             json={'channel_ids': [bare_id]})
+                             json={'channel_ids': [bare_id], 'force': True})
         self.assertEqual(r.status_code, 200, r.get_data(as_text=True))
         r = self.client.post(f'/api/channel-groups/{self.gid}/members/participation',
                              json={'channel_id': bare_id, 'field': 'recording_enabled',
@@ -932,11 +944,12 @@ class StrategyControlMarkupTests(unittest.TestCase):
         whose owner cannot say what it does is a number the user cannot explain."""
         js = _read('static/js/format-plan.js')
         block = js[js.index('const GROUP_FORMAT_STRATEGIES'):js.index('function groupStrategyLabel')]
-        for value in ('health_check_only', 'highest_score', 'highest_bitrate',
-                      'highest_resolution', 'most_channels', 'balanced', 'manual', 'unmanaged'):
+        for value in ('highest_score', 'highest_bitrate', 'highest_resolution',
+                      'most_channels', 'balanced', 'manual', 'unmanaged'):
             self.assertIn(f"'{value}'", block)
+        self.assertNotIn("'health_check_only'", block, 'retired in dev/changelog/1077')
         # Three columns per entry: key, dropdown label, one sentence of help.
-        self.assertEqual(block.count('],\n'), 8)
+        self.assertEqual(block.count('],\n'), 7)
 
     def test_the_strategy_list_matches_the_server(self):
         """A value the client offers that the server refuses is a dropdown entry that 400s."""
@@ -1091,11 +1104,15 @@ class GuideInvariantPageTests(unittest.TestCase):
                        'formatPlanSummary(', 'GROUP_FORMAT_STRATEGIES'):
             self.assertIn(helper, js, f'{helper} is format-plan.js\'s, not a local copy')
 
-    def test_the_walkthrough_never_offers_health_check_only(self):
-        """This dialog is open because the user reached for a recording action; offering
-        "not a recording source" would be offering to do nothing."""
+    def test_the_walkthrough_preselects_the_stored_strategy(self):
+        """A group that was promoted, had its last recording member switched off, and is
+        being promoted again lands where it was (dev/changelog/1077). The page hands the
+        stored value in; the dialog does not restart from the default."""
         js = _read('static/js/group-promote-modal.js')
-        self.assertIn("filter(([k]) => k !== 'health_check_only')", js)
+        self.assertIn("strategy: opts.strategy || 'highest_score'", js)
+        page = _read('static/js/group-detail.js')
+        fn = page[page.index('function openWalkthrough('):page.index('function needsPromotion(') if page.index('function needsPromotion(') > page.index('function openWalkthrough(') else page.index('function openWalkthrough(') + 800]
+        self.assertIn('strategy: strategyValue()', fn)
 
     def test_the_walkthrough_names_the_combination_not_each_half(self):
         """§14.1: "record from all" plus "stop checking the unmatched" is one bad outcome,
@@ -1308,7 +1325,7 @@ class PhoneLayoutTests(unittest.TestCase):
         fn = self.js[self.js.index('function renderBottomBar()'):self.js.index('function setBar(')]
         self.assertIn("el.classList.contains('gd-phone-hide')", fn)
         bar = self.tpl[self.tpl.index('class="gd-ab-actions"'):self.tpl.index('<div class="menu" id="gd-kebab">')]
-        for act in ('data-act="suggest"', 'data-act="create-check"', 'data-act="create-group"'):
+        for act in ('data-act="suggest"',):
             block = bar[bar.index(act) - 200:bar.index(act)]
             self.assertIn('gd-phone-hide', block, f'{act} is still on the phone bar')
         self.assertIn('gd-phone-hide', bar[bar.index("add_to_group=group.id") - 200:],

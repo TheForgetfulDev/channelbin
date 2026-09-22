@@ -238,166 +238,22 @@ class AccountDeleteReportsOrphanedGroupsTests(_Base):
             group_id=grp.id, event_type=GROUP_GUIDE_BROKEN).count())
 
 
-class DeleteHealthCheckThatDissolvesItsGroupTests(_Base):
-    """The third destroyer, and the second door onto the first one's damage
-    (`dev/changelog/869`).
+class NoCheckDeleteRouteTests(_Base):
+    """The check-delete route was a second door onto the damage delete_group is gated
+    against (dev/changelog/869), and it is gone: a check is its group's one schedule and
+    dies only with the group, through delete_group's gate (dev/changelog/1077)."""
 
-    `delete_on_demand_job` deletes the job's group too when it is the group's last job,
-    so that route destroys a ChannelGroup without ever passing §15.1's gate. There is one
-    kind of group since the groups unification, so a bag created for a health check shows
-    on the Groups page like any other and can be given a recording member, put in the
-    guide and scheduled against - at which point deleting the check silently did what
-    deleting the group is refused for.
-
-    The split is the same one and for the same reason: what is already on disk decides
-    whether the action is refused or merely confirmed. What is specific here is the
-    condition - the gate applies only when the group actually dies with the job, so a
-    group shared with a second check is untouched by either half.
-    """
-
-    def _job_on_a_recording_group(self, rec_status=None, count=1, extra_job=False):
-        """A health check whose group is promoted - in the guide with a recording member -
-        and optionally carrying `count` recordings in `rec_status`."""
-        from app import db
-        from app.database import ChannelGroup, ChannelGroupMember, OnDemandTestJob
-        ch = make_channel(self.acct, name='Feed')
-        job = make_test_job(name='Nightly', channels=[ch])
-        grp = db.session.get(ChannelGroup, job.group_id)
-        grp.in_guide = True  # hidden-recompute-ok: ChannelGroup.in_guide, not a channel's
-        ChannelGroupMember.query.filter_by(group_id=grp.id).update(
-            {'recording_enabled': True})
-        recs = []
-        if rec_status:
-            recs = [make_recording(status=rec_status, group_id=grp.id, channel_id=ch.id,
-                                   name=f'Show {i}') for i in range(count)]
-        if extra_job:
-            db.session.add(OnDemandTestJob(name='Second', status='QUEUED',
-                                           group_id=grp.id))
-        db.session.commit()
-        return job, grp, recs
-
-    def _delete_job(self, job, **body):
-        return self.client.delete(f'/api/channel-tests/on-demand/{job.id}',
-                                  json=body or None)
-
-    def test_a_capture_in_progress_refuses_the_check_delete(self):
+    def test_the_check_delete_route_no_longer_exists(self):
         from app import db
         from app.database import ChannelGroup, OnDemandTestJob
-        job, grp, _ = self._job_on_a_recording_group('IN_PROGRESS')
-        resp = self._delete_job(job)
-        self.assertEqual(409, resp.status_code, _json(resp))
-        self.assertIn('recording_in_progress', _json(resp))
-        self.assertNotIn('confirm_required', _json(resp),
-                         'a live capture is not a question here either')
-        db.session.expire_all()
-        self.assertIsNotNone(db.session.get(ChannelGroup, grp.id))
-        self.assertIsNotNone(db.session.get(OnDemandTestJob, job.id),
-                             'the job stays too - a refused delete deletes nothing')
-
-    def test_confirm_does_NOT_override_a_live_capture(self):
-        """Enforcement lives server-side. The client flag says a sentence was shown; no
-        sentence makes killing a live capture's failover acceptable."""
-        from app import db
-        from app.database import ChannelGroup
-        job, grp, _ = self._job_on_a_recording_group('IN_PROGRESS')
-        resp = self._delete_job(job, confirm=True)
-        self.assertEqual(409, resp.status_code, _json(resp))
-        db.session.expire_all()
-        self.assertIsNotNone(db.session.get(ChannelGroup, grp.id))
-
-    def test_scheduled_recordings_refuse_an_unconfirmed_check_delete(self):
-        from app import db
-        from app.database import ChannelGroup, Recording, REC_STATUS_SCHEDULED
-        job, grp, recs = self._job_on_a_recording_group('SCHEDULED', count=2)
-        resp = self._delete_job(job)
-        self.assertEqual(409, resp.status_code, _json(resp))
-        facts = _json(resp)['confirm_required']
-        self.assertEqual(2, facts['scheduled_count'])
-        self.assertEqual(grp.name, facts['group_name'],
-                         'the dialog names the GROUP that dies, not the check clicked - '
-                         'the group is what the recordings were counting on')
-        db.session.expire_all()
-        self.assertIsNotNone(db.session.get(ChannelGroup, grp.id))
-        self.assertEqual(REC_STATUS_SCHEDULED,
-                         db.session.get(Recording, recs[0].id).status)
-
-    def test_confirm_deletes_the_check_and_aborts_the_groups_schedule(self):
-        from app import db
-        from app.database import (ChannelGroup, OnDemandTestJob, Recording,
-                                  RecordingEvent, REC_STATUS_ABORTED, RECORDING_ABORTED)
-        job, grp, recs = self._job_on_a_recording_group('SCHEDULED', count=2)
-        resp = self._delete_job(job, confirm=True)
-        self.assertEqual(200, resp.status_code, _json(resp))
-        self.assertEqual(2, _json(resp)['cancelled_recordings'])
-        db.session.expire_all()
-        self.assertIsNone(db.session.get(OnDemandTestJob, job.id))
-        self.assertIsNone(db.session.get(ChannelGroup, grp.id))
-        for rec in recs:
-            row = db.session.get(Recording, rec.id)
-            self.assertEqual(REC_STATUS_ABORTED, row.status)
-            self.assertIsNotNone(row.completed_at)
-            ev = RecordingEvent.query.filter_by(
-                recording_id=rec.id, event_type=RECORDING_ABORTED).all()
-            self.assertEqual(1, len(ev),
-                             'the cancelled recording outlives the group, so the reason '
-                             'has to be on its own detail page')
-            self.assertIn(grp.name, ev[0].detail)
-
-    def test_the_scheduler_jobs_are_dropped_after_the_commit(self):
-        job, _, recs = self._job_on_a_recording_group('SCHEDULED', count=1)
-        with patch('app.scheduler.unschedule_recording') as un:
-            resp = self._delete_job(job, confirm=True)
-        self.assertEqual(200, resp.status_code, _json(resp))
-        self.assertEqual([rec.id for rec in recs], [c.args[0] for c in un.call_args_list])
-
-    def test_a_group_shared_with_another_check_is_gated_by_neither_half(self):
-        """The gate follows the group's death, not the click. A second job owns the group,
-        so it survives and its recordings keep the thing they were counting on."""
-        from app import db
-        from app.database import ChannelGroup, Recording, REC_STATUS_SCHEDULED
-        job, grp, recs = self._job_on_a_recording_group('SCHEDULED', count=1,
-                                                        extra_job=True)
-        resp = self._delete_job(job)
-        self.assertEqual(200, resp.status_code, _json(resp))
-        self.assertEqual(0, _json(resp)['cancelled_recordings'])
-        db.session.expire_all()
-        self.assertIsNotNone(db.session.get(ChannelGroup, grp.id))
-        self.assertEqual(REC_STATUS_SCHEDULED,
-                         db.session.get(Recording, recs[0].id).status)
-
-    def test_a_check_whose_group_has_no_recordings_needs_no_confirm(self):
-        from app import db
-        from app.database import ChannelGroup, OnDemandTestJob
-        job, grp, _ = self._job_on_a_recording_group()
-        resp = self._delete_job(job)
-        self.assertEqual(200, resp.status_code, _json(resp))
-        self.assertEqual(0, _json(resp)['cancelled_recordings'])
-        db.session.expire_all()
-        self.assertIsNone(db.session.get(OnDemandTestJob, job.id))
-        self.assertIsNone(db.session.get(ChannelGroup, grp.id))
-
-    def test_dissolving_the_group_recomputes_its_members_hidden_state(self):
-        """A membership DEFERS a hide, so the memberships this cascade destroys change
-        whether their channels are hidden. `delete_group` recomputed; this path never had
-        heard of hiding, and the static scanner cannot see it - its patterns are
-        `.in_guide =` and `ChannelGroupMember(`, and a cascade writes neither."""
-        from app import db
-        from app.database import Channel, ChannelGroup, ChannelGroupMember
         ch = make_channel(self.acct, name='Feed')
         job = make_test_job(name='Nightly', channels=[ch])
-        grp = db.session.get(ChannelGroup, job.group_id)
         db.session.commit()
-        with patch('app.channel_hiding.recompute') as recompute:
-            resp = self.client.delete(f'/api/channel-tests/on-demand/{job.id}')
-        self.assertEqual(200, resp.status_code, _json(resp))
-        self.assertTrue(recompute.called,
-                        'the channels lose their protection when the memberships go')
-        self.assertIn(ch.id, list(recompute.call_args[0][0]))
+        resp = self.client.delete(f'/api/channel-tests/on-demand/{job.id}')
+        self.assertEqual(404, resp.status_code, 'no route answers a lone check delete')
         db.session.expire_all()
-        self.assertIsNone(db.session.get(ChannelGroup, grp.id))
-        self.assertEqual(0, ChannelGroupMember.query.filter_by(group_id=grp.id).count())
-        self.assertIsNotNone(db.session.get(Channel, ch.id),
-                             'the channel itself is never destroyed by a check delete')
+        self.assertIsNotNone(db.session.get(OnDemandTestJob, job.id))
+        self.assertIsNotNone(db.session.get(ChannelGroup, job.group_id))
 
 
 if __name__ == '__main__':

@@ -160,7 +160,6 @@
           'Enrollment is edited from the check itself - the chips in the title bar link to each one.'
         : 'No health check tests this channel on a schedule, so a provider-side change would not be ' +
           'caught automatically. Create one from the &#8943; menu.',
-      control: '',
       full: true,
     });
     h += '</fieldset>';
@@ -169,8 +168,12 @@
     h += fieldRow({
       label: 'Notes',
       meta: 'Anything you want to remember about this channel. A note puts a &#128221; marker in the title bar.',
-      full: true,
-      control: `<textarea id="cd-notes" class="form-control" rows="4" style="resize:vertical; width:100%">${escHtml(state.notes || '')}</textarea>`,
+      // `stack`, not `full`: full is the no-control shape, and it left this textarea in
+      // the 220px right-hand column with the label above it rather than at the panel's
+      // width. The width and the resize handle both come from the .stack rules in
+      // style.css, so neither needs an inline style here.
+      stack: true,
+      control: `<textarea id="cd-notes" class="form-control" rows="4">${escHtml(state.notes || '')}</textarea>`,
     });
     h += '</fieldset>';
 
@@ -436,7 +439,6 @@
       schedulePrefix: 'ccsched',
       // Deliberately NOT nameless: an ad hoc test of one channel has no group to derive a
       // job name from, so this is the one caller that still asks for one.
-      allowAttachExisting: true,
       onDone: () => location.reload(),
     });
   }

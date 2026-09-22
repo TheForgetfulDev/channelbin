@@ -578,9 +578,10 @@ def imminent_recording_conflict() -> Optional[str]:
     """A recording starting soon that argues against starting a health-check run right now.
 
     None = no conflict. Mirrors sync's skip_sync_if_recording_within_minutes guard
-    (DESIGN-concurrency.md 5.5) - shared by run_on_demand_test_job's own skip-with-alert
-    path (scheduled fires, applies to system and custom jobs alike) and the manual Run Now
-    routes' warn+force pre-check (same shape as accounts.sync_conflicts, 5.4).
+    (DESIGN-concurrency.md 5.5) - shared by run_on_demand_test_job's own defer-with-retry
+    path (scheduled fires, applies to system and custom jobs alike; the occurrence is
+    queued for the first free gap rather than dropped, dev/changelog/941) and the manual
+    Run Now routes' warn+force pre-check (same shape as accounts.sync_conflicts, 5.4).
     """
     # Re-imported locally so tests can patch app.config.load_config (CLAUDE.md Testing).
     from .config import load_config
@@ -696,12 +697,13 @@ def _revert_job_status_after_busy_skip(app, job_id: int):
         from . import db
         from .database import OnDemandTestJob
         from .db_utils import retry_on_locked
+        from .database import OD_JOB_STATUS_RUNNING
         from .scheduler import finalize_on_demand_job_status
 
         @retry_on_locked()
         def _revert_status_and_commit():
             job = db.session.get(OnDemandTestJob, job_id)
-            if job is None or job.status != 'RUNNING':
+            if job is None or job.status != OD_JOB_STATUS_RUNNING:
                 return None
             kind = finalize_on_demand_job_status(job, False)
             new_status = job.status
@@ -768,7 +770,8 @@ def run_on_demand_test_job(app, job_id: int, channel_id_subset: Optional[List[in
         with app.app_context():
             from . import db
             from .config import load_config
-            from .database import OnDemandTestJob, Recording, REC_STATUS_IN_PROGRESS
+            from .database import (OnDemandTestJob, Recording, REC_STATUS_IN_PROGRESS,
+                                   OD_JOB_STATUS_RUNNING)
             from .channel_groups import check_run_channels
 
             from .db_utils import retry_on_locked
@@ -811,7 +814,7 @@ def run_on_demand_test_job(app, job_id: int, channel_id_subset: Optional[List[in
             def _mark_job_running_and_commit():
                 j = db.session.get(OnDemandTestJob, job_id)
                 if j is not None:
-                    j.status = 'RUNNING'
+                    j.status = OD_JOB_STATUS_RUNNING
                     db.session.commit()
                 return j
 

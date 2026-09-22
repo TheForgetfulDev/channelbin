@@ -35,10 +35,9 @@ function fetchFormatPlan(groupId, opts) {
    paths must be observable). */
 function formatPlanOptionLabel(plan, strategy, derived) {
   const label = groupStrategyLabel(strategy);
-  /* The three values that do not resolve to a measured bucket say what they DO instead
+  /* The two values that do not resolve to a measured bucket say what they DO instead
      of reporting "no eligible format", which for them would be a true sentence about the
      wrong question. */
-  if (strategy === 'health_check_only') return `${label} - not a recording source`;
   if (strategy === 'unmanaged') return `${label} - any format, mixed`;
   if (strategy === 'manual') return `${label} - you pick the format`;
   const entry = formatPlanEntry(plan, strategy, null, derived);
@@ -67,20 +66,19 @@ function formatPlanCounts(entry) {
 }
 
 /* ── The standing group setting (DESIGN-channel-groups-model.md §4.4) ─────────
-   ChannelGroup.format_strategy's eight values, in dropdown order, each with the one
+   ChannelGroup.format_strategy's seven values, in dropdown order, each with the one
    plain sentence of help text §4.4 requires. `balanced` is named there specifically -
    its own name does not say what it does, and a setting whose owner cannot say what it
    does is the number-the-user-cannot-explain principle 1 rates worse than no number -
    but every value ships with one, not just that one.
 
    Only the middle four are the bucket-ranking engine (app/channel_groups.py::
-   FORMAT_STRATEGIES). The other four are answered outside it and always have been:
-   health_check_only and unmanaged manage no format at all, highest_score follows the
-   healthiest member, and manual is whatever the user pinned. */
+   FORMAT_STRATEGIES). The other three are answered outside it and always have been:
+   unmanaged manages no format at all, highest_score follows the healthiest member, and
+   manual is whatever the user pinned. There is no "health check only" entry: whether a
+   group records is a fact about its members (one has Recording on), never a strategy
+   value (dev/changelog/1077). */
 const GROUP_FORMAT_STRATEGIES = [
-  ['health_check_only', 'Health check only',
-   'This group is not a recording source. Its members are tested and nothing else. ' +
-   'Choose any other strategy to record from it.'],
   ['highest_score', "Healthiest member's format",
    'No format is pinned. Whichever member is healthiest serves the group, and the group ' +
    'format follows it.'],
@@ -111,14 +109,14 @@ function groupStrategyHelp(strategy) {
   return found ? found[2] : '';
 }
 
-/* Does this strategy enforce a format on member selection? False for the two values
-   that manage none - mirrors app/channel_groups.py::group_manages_format(), which is
-   the authority; this is the client's read of the same two names. */
+/* Does this strategy enforce a format on member selection? False for the one value
+   that manages none - mirrors app/channel_groups.py::group_manages_format(), which is
+   the authority; this is the client's read of the same name. */
 function groupStrategyManagesFormat(strategy) {
-  return strategy !== 'health_check_only' && strategy !== 'unmanaged';
+  return strategy !== 'unmanaged';
 }
 
-/* The winning bucket for any of the eight values, not just the four the server's
+/* The winning bucket for any of the seven values, not just the four the server's
    `strategies` map answers for.
 
    `pin` is the format a dialog is CURRENTLY offering, which is not yet the group's
@@ -127,7 +125,7 @@ function groupStrategyManagesFormat(strategy) {
    marker does not move until after you commit. `derived` is the group's effective
    reference (payload.reference_key's label), which is what highest_score follows. */
 function formatPlanEntry(plan, strategy, pin, derived) {
-  if (strategy === 'health_check_only' || strategy === 'unmanaged') return null;
+  if (strategy === 'unmanaged') return null;
   const buckets = (plan && plan.buckets) || [];
   const bucketFor = (key) => buckets.find((b) => b.label === key);
   /* Both synthesized entries carry the same count fields the server's own entries do, so
@@ -181,10 +179,6 @@ function formatPlanSummary(plan, strategy, pin, derived, memberCount, measuredCo
   // appending an s to the whole phrase produces.
   const members = (n) => (narrowed ? `member${n === 1 ? '' : 's'} set to record`
                                    : `member${n === 1 ? '' : 's'}`);
-  if (strategy === 'health_check_only') {
-    return 'This group is tested and nothing else. It cannot be added to the TV Guide and no ' +
-      'recording will run from it until you choose one of the other strategies.';
-  }
   if (strategy === 'unmanaged') {
     return `No format is enforced, so all ${total} ${members(total)} stay eligible ` +
       'whatever they measure. A failover between two formats produces one file whose format ' +

@@ -125,20 +125,26 @@ class PagePayloadTests(_Base):
                  for i in range(n)]
         return seed.make_group(name=name, members=chans, in_guide=in_guide), chans
 
-    def test_groups_list_ships_profiles_and_tester_state(self):
+    def test_groups_list_ships_no_check_modal_at_all(self):
+        """dev/changelog/1078: the list page used to carry this modal's whole payload -
+        the profile list, the schedule-picker template and the script - for a pill and a
+        kebab item that created a second check on a group that already had one, which
+        the route answers with a 409. Nothing on this page opens it now, so shipping any
+        of that is dead weight and an invitation to wire it back up."""
         self._profile(name='Thorough', test_duration_seconds=300)
         self._group()
         html = self.client.get('/channel-groups').get_data(as_text=True)
-        self.assertIn('checkProfiles:', html)
-        self.assertIn('Thorough', html)
         self.assertIn('testerBusy:', html)
-        self.assertIn('cc-schedule-fields', html)
+        self.assertNotIn('checkProfiles:', html)
+        self.assertNotIn('cc-schedule-fields', html)
+        self.assertNotIn('check-modal.js', html)
+        self.assertNotIn('data-act="create-check"', html)
 
     def test_group_detail_ships_profiles(self):
         self._profile(name='Thorough', test_duration_seconds=300)
         grp, _ = self._group(name='Detail group')
         with self.t.app.test_request_context():
-            ctx = build_group_detail_context(grp, None)
+            ctx = build_group_detail_context(grp)
         names = [p['name'] for p in ctx['check_profiles']['profiles']]
         self.assertEqual(names[0], 'Global defaults (no profile)')
         self.assertIn('Thorough', names)
@@ -154,7 +160,7 @@ class PagePayloadTests(_Base):
         db.session.commit()
         grp, _ = self._group(name='Guide group', in_guide=True)
         with self.t.app.test_request_context():
-            ctx = build_group_detail_context(grp, None)
+            ctx = build_group_detail_context(grp)
         self.assertIsNotNone(ctx['inherited_check'])
         self.assertEqual(ctx['inherited_check']['channel_count'], 2)
         self.assertTrue(ctx['inherited_check']['recur_description'])
@@ -172,7 +178,7 @@ class PagePayloadTests(_Base):
         db.session.commit()
         grp, _ = self._group(name='Offguide group', in_guide=False)
         with self.t.app.test_request_context():
-            ctx = build_group_detail_context(grp, None)
+            ctx = build_group_detail_context(grp)
         self.assertIsNotNone(ctx['inherited_check'])
         self.assertEqual(ctx['inherited_check']['channel_count'], 1,
                          'one member on the group\'s behalf, never the whole membership')
@@ -185,12 +191,11 @@ class PagePayloadTests(_Base):
                                        status='SCHEDULED', recurring=True))
         db.session.commit()
         grp, _ = self._group(name='Self-scheduled group', in_guide=False)
-        db.session.add(OnDemandTestJob(name='Own check', group_id=grp.id,
-                                       status='SCHEDULED', recurring=True,
-                                       recur_day=1, recur_hour=3, recur_minute=0))
+        seed.set_check(grp, status='SCHEDULED', recurring=True,
+                       recur_day=1, recur_hour=3, recur_minute=0)
         db.session.commit()
         with self.t.app.test_request_context():
-            ctx = build_group_detail_context(grp, None)
+            ctx = build_group_detail_context(grp)
         self.assertIsNone(ctx['inherited_check'])
 
     def test_channels_browse_page_ships_profiles_and_tester_state(self):
@@ -212,33 +217,33 @@ class PagePayloadTests(_Base):
 
 class PostBodyTests(_Base):
     """The exact bodies static/js/check-modal.js::ccPayload builds, against the real
-    endpoint. `attach_group_id` + `profile_id` are always sent; the schedule keys are
-    added only for action='schedule'.
-
-    CHARACTERIZATION, not a regression guard: the endpoint is deliberately unchanged by
-    this feature, so every method here passes against the pre-redesign code too. They are
-    here to pin the contract the new modal now depends on - the schedule path in
-    particular had no test at all before, which is why the UI could go years without
-    offering it and nobody noticed the backend was ready."""
+    endpoint. `group_name` + `channel_ids` + `profile_id` are always sent; the schedule
+    keys are added only for action='schedule'. The request mints a group and the group's
+    one check together (dev/changelog/1077); there is no shape that attaches a check to
+    an existing group, and one that tries (`attach_group_id`) is refused with the
+    group's page in the answer."""
 
     def setUp(self):
         super().setUp()
-        chans = [seed.make_channel(self.acc, name=f'ch{i}') for i in range(2)]
-        self.grp = seed.make_group(name='Target', members=chans)
+        self.chans = [seed.make_channel(self.acc, name=f'ch{i}') for i in range(2)]
         self.profile = self._profile(name='Quick', test_duration_seconds=30)
 
     def _post(self, **body):
-        base = {'name': 'Target - health check', 'attach_group_id': self.grp.id,
+        base = {'group_name': 'Target', 'channel_ids': [c.id for c in self.chans],
                 'profile_id': self.profile.id}
         base.update(body)
         return self.client.post('/api/channel-tests/on-demand', json=base)
 
+    def _job(self):
+        grp = ChannelGroup.query.filter_by(name='Target').one()
+        return grp.check
+
     def test_save_for_later_queues_without_running(self):
         resp = self._post(action='queue')
         self.assertEqual(resp.status_code, 200)
-        job = OnDemandTestJob.query.filter_by(name='Target - health check').one()
+        job = self._job()
+        self.assertEqual(job.name, 'Target - health check')
         self.assertEqual(job.status, 'QUEUED')
-        self.assertEqual(job.group_id, self.grp.id)
         self.assertEqual(job.profile_id, self.profile.id)
         self.assertFalse(job.recurring)
 
@@ -254,14 +259,14 @@ class PostBodyTests(_Base):
         with patch('app.channel_tester.get_status', return_value={'is_running': True}):
             resp = self._post(action='start')
         self.assertEqual(resp.status_code, 409)
-        self.assertIsNone(OnDemandTestJob.query.filter_by(name='Target - health check').first())
+        self.assertIsNone(ChannelGroup.query.filter_by(name='Target').first())
 
     def test_schedule_recurring_stores_the_recurrence(self):
         run_at = datetime.utcnow() + timedelta(days=1)
         with patch('app.scheduler.schedule_on_demand_job', return_value=('aps-1', run_at)):
             resp = self._post(action='schedule', recurring=True, recur_day=1, recur_time='03:00')
         self.assertEqual(resp.status_code, 200)
-        job = OnDemandTestJob.query.filter_by(name='Target - health check').one()
+        job = self._job()
         self.assertEqual(job.status, 'SCHEDULED')
         self.assertTrue(job.recurring)
         self.assertEqual((job.recur_day, job.recur_hour, job.recur_minute), (1, 3, 0))
@@ -272,7 +277,7 @@ class PostBodyTests(_Base):
             resp = self._post(action='schedule', recurring=False,
                               scheduled_time=future.strftime('%Y-%m-%dT%H:%M'))
         self.assertEqual(resp.status_code, 200)
-        job = OnDemandTestJob.query.filter_by(name='Target - health check').one()
+        job = self._job()
         self.assertEqual(job.status, 'SCHEDULED')
         self.assertFalse(job.recurring)
         self.assertIsNotNone(job.scheduled_start_time)
@@ -280,18 +285,28 @@ class PostBodyTests(_Base):
     def test_empty_group_is_refused(self):
         """The modal disables its button and says why; the 400 is what actually enforces
         it (CLAUDE.md "Enforcement lives server-side")."""
-        empty = seed.make_group(name='Empty', members=[])
         resp = self.client.post('/api/channel-tests/on-demand',
-                                json={'name': 'Empty - health check',
-                                      'attach_group_id': empty.id, 'profile_id': None,
-                                      'action': 'queue'})
+                                json={'group_name': 'Empty', 'channel_ids': [],
+                                      'profile_id': None, 'action': 'queue'})
         self.assertEqual(resp.status_code, 400)
 
     def test_null_profile_id_means_global_defaults(self):
         resp = self._post(action='queue', profile_id=None)
         self.assertEqual(resp.status_code, 200)
-        job = OnDemandTestJob.query.filter_by(name='Target - health check').one()
-        self.assertIsNone(job.profile_id)
+        self.assertIsNone(self._job().profile_id)
+
+    def test_attaching_a_second_check_to_a_group_is_refused_with_its_page(self):
+        """dev/changelog/1077: every group already carries its one check, so the old
+        attach shape is answered with a 409 naming the group's page rather than a
+        duplicate row."""
+        grp = seed.make_group(name='Already', members=self.chans)
+        db.session.commit()
+        before = OnDemandTestJob.query.count()
+        resp = self.client.post('/api/channel-tests/on-demand',
+                                json={'attach_group_id': grp.id, 'action': 'queue'})
+        self.assertEqual(resp.status_code, 409)
+        self.assertIn(f'/channel-groups/{grp.id}', resp.get_json()['detail_url'])
+        self.assertEqual(before, OnDemandTestJob.query.count())
 
 
 if __name__ == '__main__':

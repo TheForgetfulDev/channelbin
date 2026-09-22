@@ -25,9 +25,10 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from tests.support.app import make_test_app  # noqa: E402
 from tests.support.seed import (make_account, make_channel, make_group,  # noqa: E402
-                                make_channel_test, make_recording)
+                                make_channel_test, make_recording, set_check,
+)
 from app import db  # noqa: E402
-from app.database import ChannelGroupMember, OnDemandTestJob  # noqa: E402
+from app.database import ChannelGroupMember  # noqa: E402
 
 
 class GroupTimelineScopeTests(unittest.TestCase):
@@ -46,8 +47,8 @@ class GroupTimelineScopeTests(unittest.TestCase):
 
         self.grp = make_group(name='G', in_guide=False,
                               members=[self.feed_a, self.feed_b, self.departed, self.oneoff])
+        # The group's one check (dev/changelog/1077) - every group carries exactly one.
         self.nightly = self._job('Nightly check', self.grp)
-        self.weekly = self._job('Weekly deep check', self.grp)
 
         # A second group sharing one feed, with a check of its own.
         self.other = make_group(name='Other', in_guide=False, members=[self.feed_a])
@@ -55,7 +56,7 @@ class GroupTimelineScopeTests(unittest.TestCase):
 
         self._at = datetime.utcnow() - timedelta(hours=6)
         self._test(self.feed_a, job_id=self.nightly.id)
-        self._test(self.feed_b, job_id=self.weekly.id)
+        self._test(self.feed_b, job_id=self.nightly.id)
         self._test(self.departed, job_id=self.nightly.id)
         self._test(self.feed_a, job_id=self.foreign.id)
         # A one-off "Test now": no job, no recording to protect.
@@ -86,10 +87,7 @@ class GroupTimelineScopeTests(unittest.TestCase):
         return ct
 
     def _job(self, name, group):
-        job = OnDemandTestJob(name=name, status='COMPLETED', group_id=group.id)
-        db.session.add(job)
-        db.session.flush()
-        return job
+        return set_check(group, name=name, status='COMPLETED')
 
     def _timeline(self, path):
         """Just the Activity Timeline block - a name that appears anywhere else on the
@@ -108,14 +106,10 @@ class GroupTimelineScopeTests(unittest.TestCase):
     def _group_page(self):
         return self._timeline(f'/channel-groups/{self.grp.id}')
 
-    def _check_page(self, job):
-        return self._timeline(f'/channels/health-checks/{job.id}')
-
     # ── Entered by group ────────────────────────────────────────────────────
-    def test_group_page_lists_every_check_the_group_itself_ran(self):
+    def test_group_page_lists_the_checks_own_runs(self):
         html = self._group_page()
         self.assertIn('Nightly check', html)
-        self.assertIn('Weekly deep check', html)
 
     def test_another_groups_check_on_a_shared_feed_is_not_this_groups_work(self):
         html = self._group_page()
@@ -136,49 +130,31 @@ class GroupTimelineScopeTests(unittest.TestCase):
 
     def test_every_test_entry_names_the_run_that_produced_it(self):
         html = self._group_page()
-        # One label per test entry, so a reader can tell a nightly result from a weekly
-        # one from a pre-check without inferring it from the numbers.
+        # One label per test entry, so a reader can tell a check's result from a
+        # pre-check's without inferring it from the numbers.
         self.assertEqual(html.count('Health Test'), 4, html.count('Health Test'))
-        for label in ('Nightly check', 'Weekly deep check', 'Pre-recording check'):
+        for label in ('Nightly check', 'Pre-recording check'):
             self.assertIn(f'· {label}', html)
 
     # ── Entered by check ────────────────────────────────────────────────────
-    def test_check_page_shows_only_that_checks_runs(self):
-        html = self._check_page(self.nightly)
-        self.assertIn('Nightly check', html)
-        self.assertNotIn('Weekly deep check', html)
-        self.assertNotIn('Other group check', html)
-        self.assertNotIn('Pre-recording check', html)
-
-    def test_check_page_keeps_a_departed_channels_run_from_that_check(self):
-        self.assertIn('Departed Feed', self._check_page(self.nightly))
-
-    def test_sibling_check_page_shows_its_own_runs(self):
-        html = self._check_page(self.weekly)
-        self.assertIn('Weekly deep check', html)
-        self.assertNotIn('Nightly check', html)
-
-    def test_the_groups_own_recording_stays_on_a_pinned_checks_page(self):
-        """A check has no recordings of its own; the ones below the tests are the
-        group's, and the page is the group's page in both entries. Characterization -
-        this half was already true and the point is that narrowing the tests left it
-        alone."""
-        self.assertIn('G rec', self._check_page(self.nightly))
+    def test_the_check_url_is_the_groups_page(self):
+        """dev/changelog/1077: a group carries exactly one check, so there is nothing
+        for a check-shaped URL to pin. It redirects to the group."""
+        resp = self.client.get(f'/channels/health-checks/{self.nightly.id}')
+        self.assertEqual(302, resp.status_code)
+        self.assertTrue(resp.headers['Location'].endswith(f'/channel-groups/{self.grp.id}'))
 
     # ── The scope is stated, not inferred ───────────────────────────────────
     def test_the_page_says_what_the_timeline_is_scoped_to(self):
         grp_html = self.client.get(
             f'/channel-groups/{self.grp.id}').get_data(as_text=True)
-        self.assertIn('own checks and pre-recording checks ran', grp_html)
-        chk_html = self.client.get(
-            f'/channels/health-checks/{self.nightly.id}').get_data(as_text=True)
-        self.assertIn('Health tests from &#34;Nightly check&#34; only', chk_html)
+        self.assertIn('check and pre-recording checks ran', grp_html)
 
 
 class GroupTimelineWithoutChecksTests(unittest.TestCase):
-    """A group with no check attached ran no health tests, so it lists none - the
-    members' own latest results are what the Channels table above is for. Before the
-    fix this page listed whatever any other check had run on its members."""
+    """A group whose own check has never run lists no health tests - the members' own
+    latest results are what the Channels table above is for. Before the fix this page
+    listed whatever any other check had run on its members."""
 
     def setUp(self):
         self.t = make_test_app()
@@ -189,10 +165,7 @@ class GroupTimelineWithoutChecksTests(unittest.TestCase):
         self.ch = make_channel(acct, name='Shared Feed', stream_id=201)
         self.grp = make_group(name='No check', in_guide=False, members=[self.ch])
         self.other = make_group(name='Tester', in_guide=False, members=[self.ch])
-        job = OnDemandTestJob(name='Somebody elses check', status='COMPLETED',
-                              group_id=self.other.id)
-        db.session.add(job)
-        db.session.flush()
+        job = set_check(self.other, name='Somebody elses check', status='COMPLETED')
         make_channel_test(self.ch, job_id=job.id, status='COMPLETED')
         # Something of its own, so the timeline block exists either way and an empty
         # assertion cannot pass by the page simply having no timeline.

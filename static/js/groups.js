@@ -15,8 +15,9 @@
   const filterCountEl = document.getElementById('filter-count');
   const chipsWrap = document.getElementById('filter-chips');
   const filterMenu = document.getElementById('filter-menu');
-  // One noun, one section. A group used only for health checking is a group whose format
-  // strategy is health_check_only, which the Purpose filter below reads.
+  // One noun, one section. A group used only for health checking is a group no member of
+  // which has Recording on - the row's data-records attribute, which the Purpose filter
+  // below reads (dev/changelog/1077).
   const SECTIONS = ['groups'];
 
   // A row carries its own health class plus its schedule's (data-healths), so one row
@@ -29,10 +30,10 @@
   const FILTER_DIMS = [
     { k: 'purpose', label: 'Purpose', values: [
       { v: 'recording', label: 'Records' },
-      { v: 'health_check_only', label: 'Health check only' },
-    ], match: (row, v) => (v === 'health_check_only'
-      ? row.dataset.strategy === 'health_check_only'
-      : row.dataset.strategy !== 'health_check_only') },
+      { v: 'check_only', label: 'Health check only' },
+    ], match: (row, v) => (v === 'check_only'
+      ? row.dataset.records === '0'
+      : row.dataset.records === '1') },
     { k: 'health', label: 'Health', values: [
       { v: 'st-bad', label: 'Failing' },
       { v: 'st-warn', label: 'Warning' },
@@ -45,9 +46,11 @@
       { v: 'in', label: 'In the guide' },
       { v: 'out', label: 'Not in the guide' },
     ], match: (row, v) => row.dataset.guide === v },
+    // The group's OWN check, which every group has (dev/changelog/1077) - so the buckets
+    // are what its schedule is, not whether one exists. `_check_dimension` computes it.
     { k: 'check', label: 'Health check', values: [
-      { v: 'sched', label: 'On a schedule' },
-      { v: 'oneoff', label: 'One-off only' },
+      { v: 'recur', label: 'Recurring' },
+      { v: 'once', label: 'One time' },
       { v: 'none', label: 'No schedule' },
     ], match: (row, v) => row.dataset.check === v },
     { k: 'issue', label: 'Needs attention', values: [
@@ -121,10 +124,12 @@
     health: { desc: false, get: (r) => ({ 'st-bad': 0, 'st-run': 1, 'st-warn': 2, 'st-ok': 3, 'st-none': 4 }[r.dataset.health]) },
     activity: { desc: true, get: (r) => r.dataset.activity || null },
     guide: { desc: false, get: (r) => (r.dataset.guide === 'in' ? 0 : 1) },
-    checks: { desc: true, get: (r) => parseInt(r.dataset.checksCount || '0', 10) },
   };
+  // No "Health checks attached" sort: every group carries exactly one, so it sorted
+  // nothing (dev/changelog/1077). The Health check FILTER above is what answers a
+  // question about schedules.
   const SORT_LABELS = { name: 'Group name', members: 'Number of channels', health: 'Health (worst first)',
-    activity: 'Last tested', guide: 'In the TV Guide', checks: 'Health checks attached' };
+    activity: 'Last tested', guide: 'In the TV Guide' };
   const sectionSort = { groups: { k: 'name', dir: 1 } };
 
   // ── URL-persisted state (search/filter/sort) ──────────────────────────
@@ -259,7 +264,10 @@
   });
   bindNavClicks(document.body, (e) => {
     if (e.target.closest('.grp-expand')) return null;
-    // Check chips navigate to the check's results page.
+    // Only the inherited-coverage chip carries this: it names the AUTOMATIC check, which
+    // belongs to a different group, so it goes somewhere the row click does not. A
+    // group's own chip is not a link - a check's URL redirects to its group's page
+    // (dev/changelog/1077), which is exactly where the row already goes.
     const chip = e.target.closest('[data-menu-check]');
     if (chip) return `/channels/health-checks/${chip.dataset.menuCheck.split(':')[1]}`;
     const row = e.target.closest('[data-expand]');
@@ -301,7 +309,6 @@
         .then(reload).catch(err => showToast(err.message, { type: 'error' }));
       return;
     }
-    if (act === 'create-check') { openCreateCheck(gid); return; }
     if (act === 'run-check') {
       const jobId = btn.dataset.job;
       jsonFetch(CFG.startJobUrlBase + jobId + '/start', { method: 'POST' })
@@ -314,12 +321,6 @@
         existingNames: CFG.groupNames || [],
         resolutionOptions: CFG.resolutionOptions || [],
         fpsOptions: CFG.fpsOptions || [],
-        profiles: CFG.checkProfiles.profiles,
-        profilesUrl: CFG.profilesUrl,
-        testerBusy: CFG.testerBusy,
-        windowSettingsUrl: CFG.windowSettingsUrl,
-        scheduleTemplateId: 'cc-schedule-fields',
-        schedulePrefix: 'ccsched',
         onDone: reload,
       });
       return;
@@ -361,10 +362,10 @@
     return modal;
   }
 
-  // No "create a channel group from this health check" entry point: a health check is a
-  // schedule a group already carries, so there is nothing to promote
-  // (DESIGN-channel-groups-model.md DECIDED 2, dev/changelog/752). clone-modal.js still
-  // opens create-group-modal.js, for cloning a group.
+  // No entry point here creates a health check, and none promotes one into a group: a
+  // group is minted with its one check and there is nothing to create or promote
+  // (DESIGN-channel-groups-model.md DECIDED 2, dev/changelog/752, `1077`). Scheduling a
+  // check is the kebab's `Schedule health check`, a link into the group's own Settings.
 
   // The dialog itself is group-delete.js, shared with the group detail page: the same
   // action, the same copy, and the same handling of a delete the server refuses because
@@ -380,26 +381,4 @@
     });
   }
 
-  // The modal itself lives in check-modal.js - the detail page opens the same one.
-  function openCreateCheck(groupId) {
-    const g = payloadFor(groupId);
-    openCreateCheckModal({
-      groupId: g.id,
-      groupName: g.name,
-      memberCount: g.member_count,
-      profiles: CFG.checkProfiles.profiles,
-      profilesUrl: CFG.profilesUrl,
-      inheritedCheck: (g.checks || []).find(c => c.inherited) || null,
-      hasOwnCheck: (g.checks || []).some(c => !c.inherited),
-      inGuide: g.in_guide,
-      testerBusy: CFG.testerBusy,
-      windowSettingsUrl: CFG.windowSettingsUrl,
-      scheduleTemplateId: 'cc-schedule-fields',
-      schedulePrefix: 'ccsched',
-      // A health check is a schedule its group carries, so it has nothing to name - the
-      // route derives the job name from the group (dev/changelog/831).
-      nameless: true,
-      onDone: reload,
-    });
-  }
 })();

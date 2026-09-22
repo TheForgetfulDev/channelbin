@@ -502,12 +502,12 @@
            'How often to refresh channel lists and EPG data from M3U/Xtream accounts. A low value means more frequent playlist and guide downloads from each provider, and some providers rate-limit or ban accounts for that.', sync_cfg.get('sync_interval_hours', 12), restart=True, overridable_by='account', tier='basic') }}
         {{ field_number('sync.request_timeout_seconds', 'Request timeout (seconds)',
            'HTTP timeout for all Xtream API, M3U, and XMLTV fetch requests.', sync_cfg.get('request_timeout_seconds', 30), tier='advanced') }}
-        {{ field_bool('sync.skip_sync_if_recording_active', 'Skip sync during recording',
-           'Skip the scheduled EPG sync when a recording is currently in progress.', sync_cfg.get('skip_sync_if_recording_active', True), tier='advanced') }}
-        {{ field_number('sync.skip_sync_if_recording_within_minutes', 'Skip sync window (minutes)',
-           'Also skip the sync if a recording is scheduled to start within this many minutes.', sync_cfg.get('skip_sync_if_recording_within_minutes', 5), tier='advanced') }}
-        {{ field_number('sync.tester_defer_retry_minutes', 'Defer sync past test runs (minutes)',
-           'Skip the scheduled sync while a channel test run is active, then retry after this many minutes. 0 = skip with no retry.', sync_cfg.get('tester_defer_retry_minutes', 20), tier='advanced') }}
+        {{ field_bool('sync.skip_sync_if_recording_active', 'Defer sync during recording',
+           'Hold the scheduled EPG sync while a recording is in progress. It retries at the first gap long enough to finish in.', sync_cfg.get('skip_sync_if_recording_active', True), tier='advanced') }}
+        {{ field_number('sync.skip_sync_if_recording_within_minutes', 'Defer sync window (minutes)',
+           'Also hold the sync if a recording is scheduled to start within this many minutes. It retries at the first gap long enough to finish in.', sync_cfg.get('skip_sync_if_recording_within_minutes', 5), tier='advanced') }}
+        {{ field_number('sync.tester_defer_retry_minutes', 'Defer sync past health check runs (minutes)',
+           'Hold the scheduled sync while a health check run is active, then retry after this many minutes. 0 = skip it with no retry.', sync_cfg.get('tester_defer_retry_minutes', 20), tier='advanced') }}
       </div>
       <div data-sub="guide-data">
         <div class="sec-sub"><strong>Guide data</strong></div>
@@ -566,10 +566,10 @@
           <a href="{{ url_for('channels.channels_health_checks') }}">TV Guide Channels</a>
           health check, like any other health check.
         </div>
-        {{ field_bool('channel_testing.skip_if_recording_active', 'Skip test during recording',
-           'Skip the scheduled TV Guide Channels health check when a recording is currently in progress.', ct.get('skip_if_recording_active', True), tier='advanced') }}
-        {{ field_number('channel_testing.skip_if_recording_within_minutes', 'Skip test window (minutes)',
-           'Skip or warn before starting any health check run (system or custom) if a recording is scheduled to start within this many minutes. 0 = off.', ct.get('skip_if_recording_within_minutes', 10), tier='advanced') }}
+        {{ field_bool('channel_testing.skip_if_recording_active', 'Defer health check during recording',
+           'Hold the scheduled TV Guide Channels health check while a recording is in progress. It retries at the first gap long enough to finish in.', ct.get('skip_if_recording_active', True), tier='advanced') }}
+        {{ field_number('channel_testing.skip_if_recording_within_minutes', 'Defer health check window (minutes)',
+           'If a recording is scheduled to start within this many minutes, hold a scheduled health check run (system or custom) and retry it later, and warn before starting a manual one. 0 = off.', ct.get('skip_if_recording_within_minutes', 10), tier='advanced') }}
       </div>
       <div data-sub="test-execution">
         <div class="sec-sub"><strong>Test execution</strong></div>

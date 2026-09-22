@@ -386,6 +386,35 @@
       });
   }
 
+  // A rebuild that starts AFTER this page loaded - which is how every account sync ends -
+  // would otherwise leave READY rows and an enabled Rebuild button on screen for its whole
+  // run, because the poll above only ever starts when a fetch has already found one in
+  // flight. /api/nav-status carries index readiness to every page in the app, so a change
+  // in what it reports is the signal that this card's own status is worth re-reading.
+  //
+  // This hook never writes #search-index-rows: it calls the one loader, which stays the
+  // region's single writer and keeps owning both ends of the poll. The name is per page -
+  // the channel search page defines its own - and it is registered inside this IIFE, which
+  // only runs on the Maintenance page.
+  //
+  // The comparison is on the WHOLE answer, not on `ready` alone. A sync moves the source
+  // watermark before it rebuilds, so an index goes stale (ready false) and only then
+  // BUILDING (ready still false): watching the boolean would fire on the staleness and
+  // then sleep through the rebuild this exists to catch. The reason string names which of
+  // the four states it is in, so it moves when the boolean does not.
+  let readinessSig = null;
+  window.__applySearchReadiness = (payload) => {
+    if (!payload) return;
+    const sig = JSON.stringify(payload);
+    if (sig === readinessSig) return;
+    const first = readinessSig === null;
+    readinessSig = sig;
+    // The first payload is the baseline - the page's own boot load already covers it. And
+    // while the 3s poll runs it is already re-reading this card, so the hook stands off.
+    if (first || indexPollTimer !== null) return;
+    loadIndexStatus();
+  };
+
   rebuildBtn.addEventListener('click', () => {
     rebuildBtn.disabled = true;
     jsonFetch('/api/settings/search-index/rebuild', { method: 'POST' })
