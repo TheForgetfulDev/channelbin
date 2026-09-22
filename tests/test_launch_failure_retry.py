@@ -19,6 +19,7 @@ _launch_segment calls load_config() itself, which make_test_app()'s overrides do
 """
 import os
 import sys
+import threading
 import unittest
 from unittest import mock
 
@@ -42,6 +43,33 @@ def _fake_proc(pid=4242):
     return proc
 
 
+class _InertWatchdog(threading.Thread):
+    """A watchdog real enough to be started, joined and seen on state.watchdog, which
+    then does nothing until teardown.
+
+    These tests hand the recorder a process whose poll() reports it has already exited,
+    so a real WatchdogThread correctly sees a dead capture and relaunches it - a second
+    writer to popen.call_count, to the segment rows and to the event log, racing every
+    assertion here. Quiescing it after the fact was not enough: it only has to win the
+    gap between the retry thread finishing and stop_event being set, which it did on a
+    loaded CI runner, writing its own RESTART_ATTEMPTED ("Waiting 0s before restart")
+    alongside the retry's (dev/docs/BUGS.md 2026-09-22 @ 06:27:21 PM).
+
+    What is under test is the retry, not what the watchdog does after it succeeds, so
+    the second writer is removed rather than raced against. A retry that starts no
+    watchdog at all still fails test_the_retry_leaves_the_recording_watched.
+    """
+
+    def __init__(self, recording_id, state, app):
+        super().__init__(daemon=True)
+        self.recording_id = recording_id
+        self.state = state
+        self.app = app
+
+    def run(self):
+        self.state.stop_event.wait()
+
+
 class _LaunchRetryTestCase(unittest.TestCase):
     """A temp dvr_output_dir every runtime load_config() call sees, plus a profile whose
     watchdog overrides drive the retry cadence without patching config at all."""
@@ -51,6 +79,11 @@ class _LaunchRetryTestCase(unittest.TestCase):
     max_failures = 10
 
     def setUp(self):
+        # _launch_segment imports WatchdogThread from the module at call time, so the
+        # module attribute is the one seam every launch site goes through.
+        watchdog_patch = mock.patch('app.watchdog.WatchdogThread', _InertWatchdog)
+        watchdog_patch.start()
+        self.addCleanup(watchdog_patch.stop)
         self.t = make_test_app()
         self.dvr = os.path.join(self.t._tmpdir, 'dvr')
         os.makedirs(self.dvr, exist_ok=True)
@@ -79,15 +112,12 @@ class _LaunchRetryTestCase(unittest.TestCase):
         return rec
 
     def _join_retry(self, recording_id, timeout=5):
-        """Wait for the pending relaunch, then quiesce whatever it started.
+        """Wait for the pending relaunch, then wind down whatever it started.
 
-        The quiesce half is load-bearing, not tidiness. A successful relaunch starts a
-        WatchdogThread, and these tests hand it a process whose poll() reports it has
-        already exited - so it correctly sees a dead capture and relaunches, which is a
-        second writer to popen.call_count and to the event log. Measured here: the count
-        is 2 the instant the retry thread joins and 4 a second later, so the assertions
-        below pass or fail on how fast the machine is (dev/changelog/903). What is under
-        test is the retry, not what the watchdog does after it succeeds.
+        The watchdog a successful relaunch starts is _InertWatchdog here, so this is
+        teardown rather than a race to quiesce a second writer before it acts - see that
+        class for why racing it was not good enough (dev/changelog/903 is the earlier,
+        timing-dependent attempt).
         """
         # getattr, so that with the fix reverted these tests fail on the behavior they
         # assert rather than on RecordingState not carrying the field yet.
