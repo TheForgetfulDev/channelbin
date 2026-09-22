@@ -9,10 +9,10 @@
 const SLOT_MINUTES = 30;        // label every 30 min
 const CUT_WIDTH_PX = 8;         // width of the "gap collapsed" cut divider
 
-// The one breakpoint declaration. It must stay equal to the `@media (max-width: 768px)`
+// The one breakpoint declaration. It must stay equal to the `@media (max-width: 960px)`
 // query in guide.css - CSS decides what the grid LOOKS like and this decides what it is
 // BUILT from, and the two disagreeing is a class of bug this file has shipped before.
-const MOBILE_MQ = window.matchMedia('(max-width: 768px)');
+const MOBILE_MQ = window.matchMedia('(max-width: 960px)');
 
 // True at phone widths on any page that has opted in by sending a `layoutMobile` dict.
 // The guide always does; channel detail's "What's On" card did not until its own revamp
@@ -490,10 +490,12 @@ function measureToolbarHeight() {
 }
 
 // The mobile shell's own sticky top bar is the FIRST thing in the sticky stack, so the
-// guide toolbar has to start below it, not at 0. Measured, not hardcoded, and unconditional:
-// .topnav appears at ≤900px while the guide's own mobile block starts at ≤768px, so a
-// value tied to either breakpoint is wrong across the 132px in between. A hidden top bar
-// measures 0 and the whole stack collapses back to the desktop arrangement on its own.
+// guide toolbar has to start below it, not at 0. Measured, not hardcoded, and unconditional.
+// The original reason was that .topnav appeared at ≤900px while the guide's own mobile block
+// started at ≤768px, so a value tied to either breakpoint was wrong across the 132px in
+// between; those became one number in dev/changelog/1094. The measurement stays anyway - a
+// hidden top bar measures 0 and the whole stack collapses back to the desktop arrangement on
+// its own, which no constant gives you.
 function measureTopBarHeight() {
   const bar = document.querySelector('.topnav');
   const h = (bar && getComputedStyle(bar).display !== 'none')
@@ -1167,7 +1169,7 @@ function wireDayPicker() {
 //
 // Touch has no hover, so every 12.7 tooltip surface on the grid becomes a tap target
 // opening a sheet (13.1). The four sheets - channel, day picker, Layout, Tags - go through
-// util.js's buildModal(), which style.css already renders as a bottom sheet at ≤768px
+// util.js's buildModal(), which style.css already renders as a bottom sheet at ≤960px
 // (9.6). That is deliberately NOT a second overlay component: a guide-local sheet would
 // duplicate the backdrop, Esc handling and scroll behaviour the modal already has.
 //

@@ -184,15 +184,15 @@
      are identical at 375 and at 1600, and only the DRAWING differs. A second
      template would be a second copy of all of that.
 
-     matchMedia and nothing else, so there is one spelling of 768 in the JS to
+     matchMedia and nothing else, so there is one spelling of 960 in the JS to
      match the one in channel-search.css. (jsdom implements matchMedia but always
      answers `matches: false`, so the test harness stubs it per width - that is
      what makes the breakpoint drivable in a test at all.) */
-  const MOBILE_MQ = window.matchMedia('(max-width: 768px)');
+  const MOBILE_MQ = window.matchMedia('(max-width: 960px)');
   const isMobile = () => MOBILE_MQ.matches;
 
   /* ── Sheets ──────────────────────────────────────────────────────────
-     A sheet IS a modal: style.css's own <=768px block turns .modal-panel into a
+     A sheet IS a modal: style.css's own <=960px block turns .modal-panel into a
      bottom sheet (DESIGN.md 9.6), which is how static/js/guide.js builds every
      one of its sheets. So there is deliberately no second overlay component on
      this page - no bespoke scrim, no second scroll lock, no second Escape
@@ -1067,7 +1067,7 @@
     // generated rule: this tag is late in the document and would otherwise beat
     // the mobile grid-template in the stylesheet.
     $('#col-css').textContent =
-      `@media (min-width: 769px) { .arow, .arow-head { grid-template-columns: ` +
+      `@media (min-width: 961px) { .arow, .arow-head { grid-template-columns: ` +
       `28px 30px ${nameColCss} ${widths}${actionTrack()}; } }`;
     renderHead();
   }

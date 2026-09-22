@@ -119,7 +119,7 @@ class NotificationsPageConformanceTests(unittest.TestCase):
         self.assertEqual(boot['routing']['CONVERSION_FAILED']['push_services'], ['pushover'])
 
     def test_the_routing_row_labels_its_controls_for_mobile(self):
-        """DESIGN.md 15.5 item 4: the routing table becomes cards at <=768px, and each
+        """DESIGN.md 15.5 item 4: the routing table becomes cards at <=960px, and each
         card labels its two controls in words - which is what a scrolled table loses
         the moment its header scrolls off. The labels are in one markup, hidden above
         the breakpoint, so there is no second rendering of the same rows.
@@ -131,8 +131,8 @@ class NotificationsPageConformanceTests(unittest.TestCase):
         self.assertIn('>Push to<', js)
         html = self._html()
         self.assertIn('.rt-cl { display: none;', html)
-        mobile = re.search(r'@media \(max-width: 768px\) \{(.*?)\n\}', html, re.S)
-        self.assertIsNotNone(mobile, 'the page has no 768px block')
+        mobile = re.search(r'@media \(max-width: 960px\) \{(.*?)\n\}', html, re.S)
+        self.assertIsNotNone(mobile, 'the page has no 960px block')
         self.assertIn('.rt-cl { display: block; }', mobile.group(1))
 
     def test_routing_table_has_search_and_severity_filters(self):

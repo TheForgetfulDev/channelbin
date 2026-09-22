@@ -134,7 +134,7 @@
   </div>
 </div>
 {# ── Mobile sticky bottom action bar (DESIGN.md 9.5) - supersedes the header action
-   group above at ≤768px; real buttons for the primary action(s), kebab holds
+   group above at ≤960px; real buttons for the primary action(s), kebab holds
    everything else. Same data-act/data-copy/onclick attributes as the header above,
    so the existing delegated (document-level) handlers cover these buttons too with
    no extra JS - every status gets an explicit branch, matching .dh-actions above. #}
@@ -1326,7 +1326,7 @@ window.onScheduleSaved = () => window.location.reload();
   //    in the header kebab, hide/show + reorder, persisted server-side. Desktop picks
   //    over #details-section/#panel-program/#panel-segments-slot/#panel-eventlog directly
   //    (4 real #detail-sections children); mobile picks over #details-section's 3
-  //    sub-regions (display:contents at ≤768px promotes them to real flex items) plus
+  //    sub-regions (display:contents at ≤960px promotes them to real flex items) plus
   //    program/segs/log, so 6 total. Decided once at load - this page doesn't re-layout
   //    across a live desktop<->mobile resize, matching how the rest of the app treats
   //    breakpoints.
@@ -1334,7 +1334,7 @@ window.onScheduleSaved = () => window.location.reload();
   //    for a manual URL capture. Both apply() and the picker's render() skip a key whose
   //    node is missing, which is the same tolerance a section added after a user's prefs
   //    were saved already relies on.
-  const isMobile = window.matchMedia('(max-width: 768px)').matches;
+  const isMobile = window.matchMedia('(max-width: 960px)').matches;
   const SECTIONS = isMobile
     ? [{ key: 'shot', label: 'Screenshot' }, { key: 'tl', label: 'Run timeline' },
        { key: 'stats', label: 'Stats' }, { key: 'program', label: 'Program' },

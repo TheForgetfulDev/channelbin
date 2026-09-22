@@ -371,8 +371,8 @@ body.scroll-locked { position: fixed; left: 0; right: 0; width: 100%; overflow: 
 }
 .notice-banner-muted .notice-banner-title { font-weight: 400; }
 
-/* ── Tablet breakpoint (≤768px) ────────────────────────────────────── */
-@media (max-width: 768px) {
+/* ── Mobile breakpoint (≤960px) ────────────────────────────────────── */
+@media (max-width: 960px) {
 /* Modals */
   .modal { align-items: flex-end; padding: 0; }
 }
@@ -436,7 +436,7 @@ body.scroll-locked { position: fixed; left: 0; right: 0; width: 100%; overflow: 
 .badge-automatic { background: var(--accent); color: #000; border: 1px solid var(--accent); font-weight: 600; }
 
 /* Responsive: channel health */
-@media (max-width: 768px) {
+@media (max-width: 960px) {
   .hero-stat-val { font-size: var(--fs-2xl); }
   .hero-stats-row { gap: 1rem; }
 }
@@ -859,11 +859,11 @@ body.scroll-locked { position: fixed; left: 0; right: 0; width: 100%; overflow: 
 .nav-pip.pip-ready { background: var(--warn); }
 .nav-pip.pip-ready.pip-bad { background: var(--bad); }
 
-/* The rail is a DESKTOP-only concept: at ≤900px the sidebar is display:none and
+/* The rail is a DESKTOP-only concept: at ≤960px the sidebar is display:none and
    the drawer is already the collapsed state. Gating the whole block means a
    persisted nav_collapsed can never reach the mobile shell and blank the
    drawer's labels, which share .nav-t with the sidebar. */
-@media (min-width: 901px) {
+@media (min-width: 961px) {
   body.nav-min .sidebar { width: 56px; flex: 0 0 56px; padding: 14px 8px; }
   body.nav-min .brand-row { flex-direction: column; align-items: stretch; gap: 8px; padding: 0 0 6px; }
   body.nav-min .navcollapse { order: 1; width: 100%; }
@@ -883,7 +883,7 @@ body.scroll-locked { position: fixed; left: 0; right: 0; width: 100%; overflow: 
   body.nav-min .sys-mini { display: none; }
 }
 
-/* mobile top bar (shell collapses at ≤900px; menu panel reuses nav-link/nav-section) */
+/* mobile top bar (shell collapses at ≤960px; menu panel reuses nav-link/nav-section) */
 .topnav {
   display: none; background: var(--bg1); border-bottom: 1px solid var(--border-soft);
   padding: 0 14px; height: var(--topnav-h); align-items: center; gap: 10px;
@@ -936,9 +936,9 @@ body.scroll-locked { position: fixed; left: 0; right: 0; width: 100%; overflow: 
 .menu-scrim { position: fixed; top: var(--topnav-h); left: 0; right: 0; bottom: 0; z-index: 138; background: rgba(0,0,0,.45); display: none; }
 /* ≥601px: the same single-column menu becomes a drawer + scrim on the LEFT, the
    same side as the button that opened it (DESIGN.md 9.7, amended 2026-07-29; a
-   multi-column menu was rejected). Upper-bounded at the 900px shell breakpoint so
+   multi-column menu was rejected). Upper-bounded at the 960px shell breakpoint so
    the drawer can't outlive the top bar that owns it. */
-@media (min-width: 601px) and (max-width: 900px) {
+@media (min-width: 601px) and (max-width: 960px) {
   .topnav-menu { left: 0; right: auto; width: 340px; border-right: 1px solid var(--border-soft); box-shadow: var(--shadow-pop); }
   .menu-scrim.open { display: block; }
 }
@@ -972,7 +972,7 @@ body.scroll-locked { position: fixed; left: 0; right: 0; width: 100%; overflow: 
    is where a line stops being comfortably readable at this size. */
 .page-sub { font-size: var(--fs-md); color: var(--text-muted); line-height: 1.5; max-width: 76ch; margin-bottom: 2px; }
 /* Mobile-only header action (DESIGN.md 9.3) - the desktop schedule button hides at
-   ≤768px in favor of a "TV Guide" link, since scheduling happens from the guide. */
+   ≤960px in favor of a "TV Guide" link, since scheduling happens from the guide. */
 .head-action-guide { display: none; }
 .back { display: inline-flex; align-items: center; gap: 6px; font-size: var(--fs-md); color: var(--text-muted); margin-bottom: 14px; }
 .back:hover { color: var(--accent-text); text-decoration: none; }
@@ -1221,7 +1221,7 @@ body.scroll-locked { position: fixed; left: 0; right: 0; width: 100%; overflow: 
   display: flex; align-items: center; justify-content: center; font-size: var(--fs-2xs); font-weight: 700; }
 .pk-cell { min-width: 0; display: flex; flex-direction: column; gap: 1px; }
 /* ONE markup for both shapes, never a second render: `display: contents` lets the channel
-   and the time be grid cells of the four-column desktop row, and the ≤768px block turns
+   and the time be grid cells of the four-column desktop row, and the ≤960px block turns
    the same wrapper into the row's second line. The routing table is the worked example of
    this rule (dev/changelog/440) - a matchMedia re-render is two writers for one region. */
 .pk-meta { display: contents; }
@@ -1294,7 +1294,7 @@ body.scroll-locked { position: fixed; left: 0; right: 0; width: 100%; overflow: 
    below the row's real minimum (measured empirically, dev/changelog/561: ~794px with
    the default visible columns) - covers a true narrow phone AND a wider window where
    the sidebar has eaten the room, the same condition either way. Deliberately
-   duplicates the ≤768px .c-title/.c-actions/.c-stats/.prog/[data-col="time"]
+   duplicates the ≤960px .c-title/.c-actions/.c-stats/.prog/[data-col="time"]
    declarations in the plain @media block further down rather than replacing them:
    those bare selectors are also load-bearing for dashboard.html's unrelated
    .c-actions usage, and this stays scoped to .rec-list so it can never reach there.
@@ -1363,7 +1363,7 @@ body.scroll-locked { position: fixed; left: 0; right: 0; width: 100%; overflow: 
 .c-time .day { color: var(--text); font-weight: 500; }
 .c-time .rel { color: var(--text-faint); font-size: var(--fs-sm); }
 /* desktop: invisible wrapper - duration/size/health stay independent grid columns,
-   each still ordered by data-col via applyColumns(); becomes one flex line at ≤768px */
+   each still ordered by data-col via applyColumns(); becomes one flex line at ≤960px */
 .c-stats { display: contents; }
 .c-num { font-size: var(--fs-md); font-family: var(--font-mono); font-variant-numeric: tabular-nums; color: var(--text); text-align: right; }
 .c-num .unit { color: var(--text-faint); font-size: var(--fs-sm); }
@@ -1743,7 +1743,7 @@ table.tbl { width: 100%; border-collapse: collapse; font-size: var(--fs-md); }
   white-space: pre-wrap; overflow-wrap: anywhere;
 }
 /* Essentials columns on phones (DESIGN.md 9.5) - tablet/desktop keep every column. */
-@media (max-width: 768px) { .tbl .xtra { display: none; } }
+@media (max-width: 960px) { .tbl .xtra { display: none; } }
 
 /* ── Table as cards on a phone (DESIGN.md 3.2, opt-in) ──────────────
    `.tbl-cards` beside `.tbl`, never a change to `.tbl` itself: a table inside a modal is
@@ -1775,7 +1775,7 @@ table.tbl { width: 100%; border-collapse: collapse; font-size: var(--fs-md); }
    cell is its own container, so a content-sized track would resolve to a different width per
    row and walk the keys out of line down the card - the defect class behind the list-grid
    rule in CLAUDE.md. */
-@media (max-width: 768px) {
+@media (max-width: 960px) {
   .tbl-cards, .tbl-cards tbody, .tbl-cards tr, .tbl-cards td { display: block; }
   .tbl-cards thead { display: none; }
   .tbl-cards tbody tr {
@@ -2253,16 +2253,34 @@ body.actbar-on #app-toast { bottom: 78px; }
 .switch input:checked + .knob { background: var(--accent-soft); border-color: var(--accent); }
 .switch input:checked + .knob::after { transform: translateX(16px); background: var(--accent); }
 
-/* ── Design-system responsive (shell ≤900px; components ≤768px) ────── */
-@media (max-width: 900px) {
+/* ── Design-system responsive: THE mobile breakpoint (≤960px) ────────
+   960 is the app's single mobile breakpoint. The shell (sidebar → top bar) and the
+   components (tables → cards, rows → stacks) move together at it, and no CSS or JS may
+   introduce a second one - `tests/test_static_invariants.py::SingleMobileBreakpointTests`
+   fails on a stray 768px/900px query.
+
+   It was two numbers until 2026-09-22 (shell 900, components 768) and the gap between them
+   was where landscape phones landed: a sideways phone is 667-956px wide, so it got the
+   mobile shell and the desktop component layout at once and a wide table got help from
+   neither. Worse at the top end - above 900 the sidebar came back, so an iPhone Pro Max at
+   932px rendered every page in 602px of content where a 13 at 844px got 778px. The bigger
+   phone drew the narrower page.
+
+   960 rather than a tighter fit because the largest shipping phone viewport in landscape is
+   the 16 Pro Max at 956px; the nearest device sits 4px below the line. The cost, accepted
+   deliberately: an iPad in portrait (768-834) and a desktop window under 960 now get the
+   phone arrangement. That is the same call dev/changelog/561 already made one width down -
+   a row starved by a narrow phone and a row starved by a sidebar eating a narrow window are
+   the same row, and neither viewport is more correct to key off. Full audit and the three
+   rejected alternatives: dev/changelog/1094. */
+@media (max-width: 960px) {
   .sidebar { display: none; }
   /* The desktop bar belongs to the sidebar shell; at this width the mobile top bar
      owns the chips, and rendering both would stack two bars. */
   .topbar { display: none; }
   .topnav { display: flex; }
   .main { padding: 18px 14px 60px; }
-}
-@media (max-width: 768px) {
+
   .list-head { display: none; }
   /* Field row (DESIGN.md 15.5 item 2): the row stacks and the control goes LAST -
      a control above its own description reads as belonging to the row above it.
@@ -2701,7 +2719,7 @@ th.gd-c-part { text-align: center; }
    approved round 2.1; ported per DESIGN-channel-groups-model.md §17,
    dev/changelog/758)
 
-   The desktop list is a nine-column table and cannot survive 375px; below 768 the
+   The desktop list is a nine-column table and cannot survive 375px; below 960 the
    same rows draw as one card each. ONE module renders both - group-detail.js keys
    off matchMedia and only the DRAWING differs, so the state, the filters, the
    sorting and the write paths have exactly one implementation.
@@ -2724,7 +2742,7 @@ th.gd-c-part { text-align: center; }
    a box at all until the media query below turns it into one. */
 .gd-statezone { display: contents; }
 
-@media (max-width: 768px) {
+@media (max-width: 960px) {
   .gd-statezone { display: flex; flex-direction: column; }
   /* Equal `order` keeps source order, so the bar still precedes its own error line. */
   .gd-statezone > .gd-actionbar, .gd-statezone > .gd-action-error { order: -1; }
@@ -2733,7 +2751,7 @@ th.gd-c-part { text-align: center; }
      sheet; the bulk bar's verbs move into the sticky bar's Actions sheet; the secondary
      "+ Add matching channels" moves into the overflow sheet. Hidden rather than removed
      because one template serves both widths - and the JS draws nothing into the table
-     below 768, so what is hidden here is chrome, not content.
+     below 960, so what is hidden here is chrome, not content.
      `.gd-phone-hide` is named on each control rather than matched structurally, so a
      control added to the card head later shows up by default and has to opt out
      deliberately. */
@@ -2848,7 +2866,7 @@ th.gd-c-part { text-align: center; }
 }
 
 /* ── Responsive ────────────────────────────────────────────────────── */
-@media (max-width: 768px) {
+@media (max-width: 960px) {
   .gd-head { flex-direction: column; }
   .gd-dates { text-align: left; }
   .gd-actionbar { align-items: flex-start; }
@@ -2885,7 +2903,7 @@ th.gd-c-part { text-align: center; }
   .card-head-actions { width: 100%; margin-left: 0; }
   .card-head-actions .search-wrap, .card-head-actions .search { width: 100%; }
   /* The drawer at this width is `.gm-drawer` inside a card, not a colspan row inside a
-     horizontally scrolling table - the table is not drawn below 768 at all
+     horizontally scrolling table - the table is not drawn below 960 at all
      (dev/changelog/758). So it needs the single-column stack and nothing else: the
      sticky/left:0 pin and the 100vw clamp that kept it reachable inside the scrolling
      table are gone with the thing they were compensating for. */
@@ -2976,7 +2994,7 @@ th.gd-c-part { text-align: center; }
    two different things and both are needed; without this the `text-overflow: ellipsis`
    on .url-display code can never engage. */
 .card[data-split] > .card-body > * { min-width: 0; }
-@media (max-width: 900px) { .card[data-split] > .card-body { grid-template-columns: minmax(0,1fr); } }
+@media (max-width: 960px) { .card[data-split] > .card-body { grid-template-columns: minmax(0,1fr); } }
 
 /* ── Health card ───────────────────────────────────────────────────────
    The score is a full-width header; under it two columns split by a vertical
@@ -3034,7 +3052,7 @@ a.shot-link { display: block; width: fit-content; cursor: zoom-in; }
 .tbl .badge[title] { cursor: help; }
 
 /* ── Responsive ────────────────────────────────────────────────────── */
-@media (max-width: 768px) {
+@media (max-width: 960px) {
   /* Same collapse .gd-sum makes: an align-self:stretch rule on a wrapped flex
      item shrinks to near-zero height, so the divider becomes a hairline. */
   .health-lower { flex-direction: column; align-items: stretch; }
@@ -3213,7 +3231,7 @@ a.shot-link { display: block; width: fit-content; cursor: zoom-in; }
 /* A second, quieter value under a cell's main one - the health check row's estimated
    time remaining under its elapsed. It lives inside the cell rather than in a column of
    its own because .dash-head and .dash-rows .drow share ONE grid rule above: a seventh
-   track added for one section would have to be filled by the other two, and at <=768px
+   track added for one section would have to be filled by the other two, and at <=960px
    the stat cells are placed three to a row by hand. */
 .drow .d-cell .d-sub {
   display: block; font-family: var(--font); font-size: var(--fs-xs);
@@ -3383,7 +3401,7 @@ a.shot-link { display: block; width: fit-content; cursor: zoom-in; }
    ONE markup, restyled - not a second set of elements. The desktop row's own
    cells become the card's stats grid, so a stat this page stops rendering cannot
    survive on the phone. */
-@media (max-width: 768px) {
+@media (max-width: 960px) {
   /* Two up. Only the first two tiles are above the fold, so the ORDER of
      _metric_tiles() is doing more work here than it does on desktop. */
   .dash-pulse { grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 16px; }
@@ -3432,13 +3450,13 @@ a.shot-link { display: block; width: fit-content; cursor: zoom-in; }
    templates/accounts.html + static/js/accounts.js.
 
    Built on the recordings list's anatomy but under its OWN class names: .list-head /
-   .rows .row above IS that page's six-track grid, and its ≤768px block assigns
+   .rows .row above IS that page's six-track grid, and its ≤960px block assigns
    grid-template-areas to .c-title / .c-actions globally - borrowing the names would
    silently import both. Same call the dashboard's section rows made (.dash-head /
    .dash-rows .drow, and the note above them).
 
    ONE markup, both breakpoints: the seven-track row reflows to §17.5 item 1's card at
-   ≤768px. Per CLAUDE.md's CSS rule the head and each row are SEPARATE grid containers,
+   ≤960px. Per CLAUDE.md's CSS rule the head and each row are SEPARATE grid containers,
    so the tracks are fixed lengths, fr, and minmax() of those only - a content-sized track
    (auto, max-content, fit-content) sizes itself per row and slides every header label off
    its column, and jsdom cannot see it happen.
@@ -3530,7 +3548,7 @@ a.shot-link { display: block; width: fit-content; cursor: zoom-in; }
 .spark i.part { background: var(--warn); height: 64%; }
 .spark i.none { background: var(--bg3); height: 36%; }
 
-@media (max-width: 768px) {
+@media (max-width: 960px) {
   /* §17.5 item 1: seven tracks in 347px is under 50px a column and the name alone needs
      more, so the row becomes a card (§9.4's approved arrangement). The name gets its own
      full-width line and WRAPS rather than truncating - a provider name is one long
@@ -3583,10 +3601,10 @@ a.shot-link { display: block; width: fit-content; cursor: zoom-in; }
 }
 /* Same reflow-off-available-space idea as .rec-list above (dev/changelog/561), on
    .acct-list's own measured minimum (~706px with the default columns). Deliberately
-   duplicates the ≤768px block above rather than replacing it, and every selector
+   duplicates the ≤960px block above rather than replacing it, and every selector
    here is .acct-list-prefixed: .arow/.a-name/etc. are ALSO Channels (Browse)'s class
    names (static/css/channel-search.css) - harmless there today only because that
-   page swaps to an entirely different .acard DOM below 768px, so a bare selector
+   page swaps to an entirely different .acard DOM below 960px, so a bare selector
    never actually matches a live .arow at that width. Scoping removes the need to
    reason about that coincidence holding forever. */
 @container acct-list (max-width: 715px) {
@@ -3740,7 +3758,7 @@ a.shot-link { display: block; width: fit-content; cursor: zoom-in; }
 .acst-box-h { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; margin-bottom: 10px; }
 .acst-box-h h2 { font-size: var(--fs-sm); font-weight: 700; letter-spacing: .08em; text-transform: uppercase; color: var(--text-muted); margin: 0; }
 
-@media (max-width: 768px) {
+@media (max-width: 960px) {
   .a-more { grid-template-columns: repeat(2, minmax(0, 1fr)); margin-top: 2px; }
   .a-bands { grid-template-columns: minmax(0, 1fr); gap: 4px; margin-top: 4px; }
   .acst-pie svg { width: 88px; height: 88px; }
@@ -3758,7 +3776,7 @@ a.shot-link { display: block; width: fit-content; cursor: zoom-in; }
 
    Built on the recordings/accounts list anatomy under its OWN class names, the same call
    .acct-head/.arow made: .list-head/.rows .row is the recordings grid and borrowing the
-   names would import its tracks and its ≤768px grid-template-areas along with them.
+   names would import its tracks and its ≤960px grid-template-areas along with them.
 
    What these rows replaced was a nine-column table of "Default (N)" cells - 731px wider
    than a portrait phone on /profiles, 677px on /health-check-profiles, the two worst
@@ -3841,7 +3859,7 @@ a.shot-link { display: block; width: fit-content; cursor: zoom-in; }
 }
 .p-dk { color: var(--text-muted); }
 
-@media (max-width: 768px) {
+@media (max-width: 960px) {
   /* Four tracks in 347px leaves the name under 90px, so the row becomes a card (§9.4's
      approved arrangement). The name gets its own full-width line and WRAPS rather than
      truncating, and the overrides - the only reason to look at this list - get theirs. */
@@ -3867,7 +3885,7 @@ a.shot-link { display: block; width: fit-content; cursor: zoom-in; }
 /* Same reflow-off-available-space idea as .rec-list/.acct-list (dev/changelog/561): a
    real narrow phone and a wider window with the sidebar eating its --sidebar-w starve the row
    identically, and neither is "more correct" to key off. Deliberately duplicates the
-   ≤768px block rather than replacing it, and every selector is .prof-list-prefixed -
+   ≤960px block rather than replacing it, and every selector is .prof-list-prefixed -
    .p-* is short enough to be worth scoping even though nothing else claims it today. */
 .prof-list { container-type: inline-size; container-name: prof-list; }
 @container prof-list (max-width: 620px) {
@@ -3973,7 +3991,7 @@ a.shot-link { display: block; width: fit-content; cursor: zoom-in; }
    all render rows with it. Was `.acct-sheet-act` until dev/changelog/758. */
 .sheet-act { display: none; }
 
-@media (max-width: 768px) {
+@media (max-width: 960px) {
   /* Two lines, no column dropped: timestamp and result on the first, the numbers and the
      duration on the second, the error spanning the full width and WRAPPING. §16.5 item 5
      beats §9.5's "essentials only" here, and the error text is the deciding case. */
@@ -4091,7 +4109,7 @@ a.shot-link { display: block; width: fit-content; cursor: zoom-in; }
 }
 .cg-dismiss input { accent-color: var(--accent); flex: none; }
 
-@media (max-width: 768px) {
+@media (max-width: 960px) {
   /* The sheet's foot becomes two full-width halves. .modal-foot right-aligns
      content-width buttons, which at 375 is two ~80px targets in the corner, under
      DESIGN.md §3.9's 44px floor. Not a column: a column costs a whole row in the tallest

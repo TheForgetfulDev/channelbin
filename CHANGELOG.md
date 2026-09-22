@@ -5,6 +5,23 @@ Notable changes to ChannelBin, newest first. This project follows
 release is tagged `v<version>` in git, and the version the app is running is shown in the
 page footer.
 
+## 0.16.0 - 2026-09-22
+
+**Changed**
+
+- The Home Assistant integration now lives in its own repository,
+  [channelbin-homeassistant](https://github.com/TheForgetfulDev/channelbin-homeassistant), and is
+  installed from there.
+- One width now decides the phone layout, 960px. A desktop window or a tablet narrower than that
+  gets the phone arrangement where it used to get a mix of the two.
+
+**Fixed**
+
+- A phone held in landscape mode gets the phone layout. The app switched its shell and its
+  components at two different widths, and a landscape phone landed between them, so wide tables
+  reflowed for neither.
+- README fixes for the Home Assistant integration.
+
 ## 0.15.0 - 2026-09-22
 
 **Added**

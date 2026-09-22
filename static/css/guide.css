@@ -10,9 +10,13 @@
    to that container in style.css (DESIGN.md 3.5). Do not drop it. */
 
 /* --guide-topbarh is the mobile shell's own sticky top bar, measured by guide.js and 0 when
-   that bar is not displayed. It is NOT tied to a breakpoint on purpose: .topnav appears at
-   ≤900px while the guide's mobile block starts at ≤768px, so any constant is wrong across
-   the 132px in between - which is where this bar used to slide underneath it. */
+   that bar is not displayed. It is NOT tied to a breakpoint on purpose. It was written that
+   way because .topnav appeared at ≤900px while the guide's mobile block started at ≤768px,
+   so any constant was wrong across the 132px in between - which is where this bar used to
+   slide underneath it. Those are one number as of dev/changelog/1094, so a constant would
+   now work; measuring stays because it is still the more robust shape - a hidden bar
+   measures 0 and the whole sticky stack collapses back to the desktop arrangement on its
+   own, with nothing to keep in sync if the bar's height ever changes. */
 .guide-toolbar {
   position: sticky;
   top: var(--guide-topbarh, 0px);
@@ -796,7 +800,7 @@
 }
 
 /* Desktop shows the numeric badge; the corner dot is mobile's carrier for the same state
-   (13.5), switched on in the ≤768px block below. */
+   (13.5), switched on in the ≤960px block below. */
 .guide-health-dot { display: none; }
 
 .guide-health-badge.hb-none {
@@ -1295,9 +1299,9 @@
   border-radius: 999px;
   animation: spin 0.7s linear infinite;
 }
-/* ── Mobile responsiveness (≤768px) ─────────────────────────────────────────── */
+/* ── Mobile responsiveness (≤960px) ─────────────────────────────────────────── */
 
-@media (max-width: 768px) {
+@media (max-width: 960px) {
   /* DESIGN.md 13 - the approved mobile guide. Same mini-grid paradigm as desktop (13.1),
      shrunk: 3px/min (set in guide.js, not here), a two-row toolbar, a mini channel column,
      and every hover tooltip replaced by a tap sheet. See dev/changelog/345. */
@@ -1469,7 +1473,7 @@
   overflow: hidden;
 }
 
-@media (max-width: 768px) {
+@media (max-width: 960px) {
   /* Interim mobile treatment: the tech readout does not fit a phone-width channel column,
      and 12.4's numeric badge is desktop-only (13.5 puts the score in the channel sheet).
      DESIGN.md 13's real mobile guide - mini-grid, bottom sheets, logo-only column - is a
@@ -1485,7 +1489,7 @@
 }
 
 /* ── Mobile bottom sheets (DESIGN.md 13.10) ─────────────────────────────────── */
-/* The sheets ARE modals: buildModal() builds them and style.css's ≤768px block already
+/* The sheets ARE modals: buildModal() builds them and style.css's ≤960px block already
    turns .modal-panel into a bottom sheet (9.6). Everything here is content styling inside
    that panel - no backdrop, no positioning, no second overlay component. */
 

@@ -523,80 +523,27 @@ old code against an upgraded database, rather than anything being corrupted.
 
 ## Home Assistant integration
 
-A read-only Home Assistant custom integration ships in `custom_components/channelbin/`. It polls
-`GET /api/ha/v1/status` every 45 seconds and exposes:
+ChannelBin has a read-only Home Assistant integration. It allows you to see details like
+what is recording right now, when your next upcoming recording is, unread alerts, account health
+status, and more.
 
-- `sensor.dvr_capturing` / `sensor.dvr_converting` - in-progress recording counts
-- `sensor.dvr_next_recording` - timestamp of the next scheduled recording, with name/channel/id attributes
-- `sensor.dvr_disk_free` / `sensor.dvr_disk_used_percent` - free space on the DVR output directory
-- `sensor.dvr_unread_alerts` - unread alert count, with latest severity/title/created_at attributes
-- `sensor.dvr_accounts_ok` - accounts in OK status, with an error-count attribute
-- `binary_sensor.dvr_recording` - on while any recording is in progress
-- `binary_sensor.dvr_has_alerts` - on while any alert is unread
+It lives in its own repository,
+[channelbin-homeassistant](https://github.com/TheForgetfulDev/channelbin-homeassistant), which is
+what HACS installs from. The full entity list, the requirements and every install method are
+documented there.
 
-There are no write-capable services (no start/abort/health-check from Home Assistant) - v1 is
-sensors only.
+### Turn the API on first
 
-The integration needs a ChannelBin server at least as new as the version it declares
-(`custom_components/channelbin/compat.py`). Against an older server it won't run: its sensors
-go unavailable and Home Assistant shows a repair notice naming both versions, which clears by
-itself once ChannelBin is upgraded. ChannelBin 0.12.0 and earlier don't report a version, so
-they are treated as too old.
+This half is done in ChannelBin, before you add anything in Home Assistant. Go to
+**Settings > Integrations**:
 
-### Generate an API key
+1. Generate a Home Assistant API key. It is shown once - copy it before leaving the page, since
+   only its hash is stored afterward.
+2. Turn the **Home Assistant integration** switch on. It stays disabled until a key exists, which
+   is why the key comes first.
 
-In ChannelBin, go to **Settings > Integrations** and generate a Home Assistant API key. It is
-shown once - copy it before leaving the page, since only its hash is stored afterward.
-
-### Install
-
-**HACS (recommended):** in Home Assistant, open **HACS**, then the **⋯** menu > **Custom
-repositories**. Add `https://github.com/TheForgetfulDev/channelbin` with type **Integration**,
-then find ChannelBin in HACS, **Download** it, and restart Home Assistant. HACS installs from
-the latest GitHub release and offers updates when a new one is tagged. This repo is not in the
-default HACS store, which is why it is added as a custom repository. The integration's icon
-needs Home Assistant 2026.3 or later; older versions show a placeholder.
-
-If HACS gives you trouble, either of the two methods below always works.
-
-#### Without HACS
-
-**Manual install:** copy `custom_components/channelbin/` from this repo into your Home Assistant
-config directory, so you end up with `<ha-config>/custom_components/channelbin/`, then restart
-Home Assistant.
-
-**Sparse git clone (updatable with `git pull`):** if your Home Assistant host has git, you can
-clone just the integration folder instead of copying it by hand:
-
-```bash
-cd /config
-git clone --no-checkout --filter=blob:none https://github.com/TheForgetfulDev/channelbin channelbin-repo
-cd channelbin-repo
-git sparse-checkout init --cone
-git sparse-checkout set custom_components/channelbin
-git checkout main
-
-ln -s /config/channelbin-repo/custom_components/channelbin /config/custom_components/channelbin
-```
-
-`--filter=blob:none` is a partial clone: it skips downloading file contents up front and fetches
-only the blobs sparse-checkout actually needs, instead of the whole repo's history.
-`sparse-checkout set custom_components/channelbin` then limits what is checked out on disk to just
-that folder. The symlink puts it where Home Assistant expects it while `channelbin-repo/` stays a
-real git checkout, so pulling updates later is just:
-
-```bash
-cd /config/channelbin-repo && git pull
-```
-
-Restart Home Assistant after either install method.
-
-### Add the integration
-
-After restarting Home Assistant: **Settings > Devices & Services > Add Integration**, search for
-"ChannelBin", and enter the host, port, scheme, and the API key generated above. The config flow
-validates the connection against `GET /api/ha/v1/status` before creating the entry, so a wrong host
-or key fails immediately with a clear error instead of silently at the first poll.
+Both are required. The status API rejects a request unless the switch is on and the key matches,
+and it answers the same way in either case, so a switch left off looks exactly like a wrong key.
 
 ---
 

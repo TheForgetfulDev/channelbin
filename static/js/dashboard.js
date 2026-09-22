@@ -298,7 +298,7 @@ const TL = {
   serverNow: 0, readAt: 0,
 };
 
-const isPhone = () => window.matchMedia('(max-width: 768px)').matches;
+const isPhone = () => window.matchMedia('(max-width: 960px)').matches;
 const tlPx = t => (t - TL.start) / MIN * TL.pxPerMin;
 // Through util.js, so the timeline reads the configured display timezone and clock format.
 // This used to be a bare toLocaleTimeString([], ...) with neither, which rendered the
@@ -563,7 +563,7 @@ function startTimelineClock() {
 
 /* A phone has no hover, so the desktop tooltip is not a design (16.5 item 1).
    Tapping a bar or a job marker opens a bottom sheet carrying exactly what the
-   tooltip carries. The sheet is free: .modal-panel already becomes one at ≤768px,
+   tooltip carries. The sheet is free: .modal-panel already becomes one at ≤960px,
    so this is buildModal(), not a second component. On desktop the hover tooltip
    already carries that same detail, so a click there goes straight to the item
    instead of showing a sheet only to make the reader tap Open a second time. */

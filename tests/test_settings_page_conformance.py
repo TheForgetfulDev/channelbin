@@ -205,7 +205,7 @@ class MobileStickyOffsetTests(unittest.TestCase):
 
         Measured in the browser pass: the rail named the previous section for the
         first 50-100px of every section, because the desktop rule was missing and
-        only the <=900px one existed.
+        only the <=960px one existed.
         """
         desktop = self.settings.split('@media')[0]
         self.assertRegex(desktop, r'\.sec-card\s*\{\s*scroll-margin-top:\s*\d+px')

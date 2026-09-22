@@ -172,12 +172,12 @@ body.on-logs .main {
 
 /* ══════════════════════════════════════════════════════════════════════════
    RESPONSIVE
-   The shell switch is at 900px, where base.html drops the sidebar for the
-   .topnav bar - the same boundary Settings' section picker uses, and the only
-   width at which --topnav-h is the right sticky offset. The ROW reflow is a
-   question about how narrow the text is, so it waits for 768px.
+   960 is the app's one mobile breakpoint (style.css, dev/changelog/1094). This page used to
+   split twice - the shell knock-ons at 900, where base.html drops the sidebar and --topnav-h
+   becomes the right sticky offset, and the row reflow at 768, which is a question about how
+   narrow the text is. Those are the same width now, so both live in one block.
    ══════════════════════════════════════════════════════════════════════════ */
-@media (max-width: 900px) {
+@media (max-width: 960px) {
   body.on-logs .shell { height: calc(100dvh - var(--topnav-h)); }
   body.on-logs .main { padding-bottom: 8px; }
   /* The toolbar itself is not hidden - only its desktop slot is. It lives in the
@@ -187,8 +187,7 @@ body.on-logs .main {
      here, because the box is the page's only scroller. A sticky bar in a column
      that never moves is a z-index waiting to fight something. */
   .logfilter { display: block; flex: none; margin: 10px 0; }
-}
-@media (max-width: 768px) {
+
   /* TWO LINES, not four columns, and the source SURVIVES (16.5 item 5): meta on
      the first line, message wrapping full width under it. Still fixed tracks so
      the timestamps line up down the page. */

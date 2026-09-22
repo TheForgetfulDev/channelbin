@@ -338,7 +338,7 @@
         toggle.setAttribute('aria-expanded', open ? 'true' : 'false');
         toggle.innerHTML = open ? '&#x2715;' : '&#9776;';
         // Single mutator for the drawer and its scrim, so one sync answers for every close
-        // path: scrim click, nav-link click, the toggle, and the >900px resize close.
+        // path: scrim click, nav-link click, the toggle, and the >960px resize close.
         syncScrollLock();
       }
       toggle.addEventListener('click', function() {
@@ -358,10 +358,10 @@
       menu.querySelectorAll('a').forEach(function(a) {
         a.addEventListener('click', function() { setOpen(false); });
       });
-      // The open menu is position:fixed, so widening past the ≤900px shell
+      // The open menu is position:fixed, so widening past the ≤960px shell
       // breakpoint would strand it on top of the now-visible desktop sidebar.
       window.addEventListener('resize', function() {
-        if (window.innerWidth > 900 && menu.classList.contains('open')) setOpen(false);
+        if (window.innerWidth > 960 && menu.classList.contains('open')) setOpen(false);
       });
     })();
   </script>

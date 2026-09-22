@@ -1,6 +1,6 @@
 """The `.tbl-cards` phone reflow, across every table that opts into it.
 
-A `.tbl` opting into `.tbl-cards` loses its `<thead>` below 768px and draws each row as a
+A `.tbl` opting into `.tbl-cards` loses its `<thead>` below 960px and draws each row as a
 card of key/value lines, where the key is the cell's own `data-label` (DESIGN.md 3.2,
 dev/changelog/1017). So a cell without one renders a bare value with nothing saying what it
 measures - invisible to every other test in the suite, because jsdom computes no layout and
@@ -120,7 +120,7 @@ class LabelledCellTests(unittest.TestCase):
                 self.assertEqual(
                     i, len(cells) - 1,
                     f'{where}: cell {i + 1} of {len(cells)} has no data-label, and is not '
-                    f'the trailing actions cell, so below 768px it renders a value with '
+                    f'the trailing actions cell, so below 960px it renders a value with '
                     f'nothing saying what it measures (DESIGN.md 3.2): {cell}')
 
     def test_server_rendered_pages_label_every_cell(self):

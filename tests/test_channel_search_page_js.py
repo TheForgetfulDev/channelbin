@@ -820,7 +820,7 @@ class MobilePageTests(_PageJs, unittest.TestCase):
 
 class MobileSheetTests(_PageJs, unittest.TestCase):
     """Every sheet, driven. A sheet here is a buildModal() panel, which style.css's own
-    <=768px block turns into a bottom sheet (DESIGN.md 9.6) - there is deliberately no
+    <=960px block turns into a bottom sheet (DESIGN.md 9.6) - there is deliberately no
     second overlay component on this page."""
 
     SCENARIO = 'mobile_sheets'

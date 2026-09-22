@@ -31,7 +31,7 @@ whenever you want:
 
 ```
 pip install -r requirements-dev.txt
-flake8 app/ run.py tools/ custom_components/ tests/ docker/
+flake8 app/ run.py tools/ tests/ docker/
 ```
 
 A clean run prints nothing and exits 0. Any output is a real finding worth fixing.

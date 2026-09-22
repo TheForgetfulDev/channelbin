@@ -116,12 +116,12 @@ class JobsPageConformanceTests(unittest.TestCase):
             self.assertRegex(row, r'<span class="jb-dot (red|yellow|green) tip-plain"')
 
     def test_the_phone_card_carries_the_overlap_edge_on_the_row(self):
-        """Below 768px the row IS the card, so an edge on its first cell marks one line of
+        """Below 960px the row IS the card, so an edge on its first cell marks one line of
         the card rather than the card (dev/changelog/1017). The phone rule clears the cell
         edge and repaints it on the `tr`, where the inset shadow follows the card's own
         border-radius around the corner."""
         style = re.search(r'<style>(.*?)</style>', self.html, re.S).group(1)
-        phone = re.search(r'@media \(max-width: 768px\) {(.*?)\n}', style, re.S)
+        phone = re.search(r'@media \(max-width: 960px\) {(.*?)\n}', style, re.S)
         self.assertIsNotNone(phone, 'the jobs page lost its phone block entirely')
         body = phone.group(1)
         for key, token in (('red', '--bad'), ('yellow', '--warn')):

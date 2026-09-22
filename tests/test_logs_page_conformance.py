@@ -18,7 +18,7 @@ carried in, that a careless edit would quietly undo:
     9.6). There is deliberately no second overlay component, and no second copy of
     the chips - the toolbar node is MOVED into the sheet and moved back.
   * 16.5 item 5: the SOURCE COLUMN SURVIVES at phone width. The page used to
-    `display: none` it at 768px, which deletes the one field saying which
+    `display: none` it at 960px, which deletes the one field saying which
     subsystem is talking - the opposite of what this app is for.
   * 16.6: one writer per region. appendRow() is the only thing that inserts a node
     into the box; the filter only toggles `hidden` on rows already there. That is
@@ -268,7 +268,7 @@ class LogsPageConformanceTests(unittest.TestCase):
     # ── Phone layout (16.5) ─────────────────────────────────────────────
 
     def test_the_source_column_survives_at_phone_width(self):
-        phone = _media_block(self.css, '@media (max-width: 768px)')
+        phone = _media_block(self.css, '@media (max-width: 960px)')
         self.assertNotRegex(phone, r'\.log-src[^{]*\{[^}]*display:\s*none',
                             'hiding the source column deletes information rather than '
                             'rearranging it (DESIGN.md 16.5 item 5)')
@@ -285,7 +285,7 @@ class LogsPageConformanceTests(unittest.TestCase):
 
     def test_the_desktop_toolbar_slot_is_hidden_rather_than_the_toolbar(self):
         """A rule on .log-toolbar would also hide it inside the sheet."""
-        shell = _media_block(self.css, '@media (max-width: 900px)')
+        shell = _media_block(self.css, '@media (max-width: 960px)')
         self.assertRegex(shell, r'#log-filter-slot\s*\{[^}]*display:\s*none')
         self.assertNotRegex(shell, r'\.log-toolbar\s*\{[^}]*display:\s*none')
 

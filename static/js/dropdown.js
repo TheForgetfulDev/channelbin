@@ -13,7 +13,7 @@
    dismisses it, the outside-click / Escape / scroll handlers reach it, and
    OVERLAY_SEL's `.menu.open` gives it the scroll lock. One node also means the
    21-row routing table carries no hidden menus at all, and that a menu in its
-   last row escapes `.table-scroll` (overflow-x: auto below 901px) instead of
+   last row escapes `.table-scroll` (overflow-x: auto below 961px) instead of
    being cut off by it.
 
    Rollout: dev/changelog/440.
