@@ -222,7 +222,7 @@ function boot({ rows = ROWS, saved = null, url = 'http://localhost:5000/channels
     beforeParse(w) {
       w.fetch = fetchStub;
       /* jsdom implements NO matchMedia at all, and the page's one spelling of the
-         768px breakpoint is matchMedia - so this stub is the only thing that makes
+         960px breakpoint is matchMedia - so this stub is the only thing that makes
          375 drivable here. It answers from `width` rather than always false, which
          is what a bare jsdom would do and would silently test the desktop
          arrangement twice. Layout is still not computed: this decides which

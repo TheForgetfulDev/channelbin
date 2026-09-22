@@ -52,8 +52,8 @@
 .svc-body input:focus { outline: none; border-color: var(--accent); }
 
 /* ── Alert routing ────────────────────────────────────────────────────
-   One markup for both widths. At >768px the column headers say which control is
-   which; at <=768px the row becomes a card (15.5 item 4) and each control takes
+   One markup for both widths. At >960px the column headers say which control is
+   which; at <=960px the row becomes a card (15.5 item 4) and each control takes
    the label the vanished header was carrying. */
 .rt-key { font-family: var(--font-mono); font-size: var(--fs-xs); color: var(--text-faint); word-break: break-all; }
 .rt-push { min-width: 190px; }
@@ -83,7 +83,7 @@
 .frow[data-path="notifications.base_url"] .fr-ctl { flex-direction: column; align-items: stretch; gap: 6px; }
 .url-preview { font-size: var(--fs-sm); color: var(--text-faint); word-break: break-all; text-align: right; }
 
-@media (max-width: 768px) {
+@media (max-width: 960px) {
   .svc-grid { grid-template-columns: 1fr; }
   .svc-actions .btn { flex: 1; justify-content: center; }
   .svc-bar .msel { width: 100%; }

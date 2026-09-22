@@ -130,9 +130,9 @@ def status():
         'latest': _latest_unread_alert(),
     }
 
-    # app_version is what the integration checks against its declared minimum
-    # (custom_components/channelbin/compat.py). A server that omits it predates the check
-    # and is read as too old there, so this key is never renamed or dropped.
+    # app_version is what the integration checks against its declared minimum. The integration
+    # is published as its own repository, channelbin-homeassistant. A server that omits this
+    # key predates the check and is read as too old there, so it is never renamed or dropped.
     return jsonify({
         'app_version': __version__,
         'recording': _recording_summary(),

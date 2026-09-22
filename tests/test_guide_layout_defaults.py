@@ -289,8 +289,8 @@ class GuideLayoutDefaultsTests(unittest.TestCase):
             js = fh.read()
         with open(os.path.join(REPO, 'static', 'css', 'guide.css'), encoding='utf-8') as fh:
             css = fh.read()
-        self.assertIn("matchMedia('(max-width: 768px)')", js)
-        self.assertIn('@media (max-width: 768px)', css)
+        self.assertIn("matchMedia('(max-width: 960px)')", js)
+        self.assertIn('@media (max-width: 960px)', css)
 
     # ── The channel detail page's "What's On" card (dev/changelog/349) ────────
     # It embeds the same grid, so it reads the same Layout machinery under its own keys.

@@ -108,7 +108,7 @@
 {# ── The state zone: the banners and the status/action bar ──────────────────
      One wrapper because the two swap order at phone width. On a desktop this element is
      `display: contents` and is not a box at all, so the order below is exactly what
-     renders; at ≤768 it becomes a flex column and the status bar is pulled above the
+     renders; at ≤960 it becomes a flex column and the status bar is pulled above the
      banners (DESIGN-channel-groups-model.md §17, mockup 34's R5). Measured at 375px: with
      two banners firing the bar started 1,022px down the document, so the page opened on
      advisories with every one of its own controls below the fold. #}
@@ -478,7 +478,7 @@
                   data-tip="Select.&#10;Turn on the checkboxes so an action can be applied to several members at once."></button>
         </div>
       </div>
-      {# One member per card below 768. Rendered by the same module and from the same rows
+      {# One member per card below 960. Rendered by the same module and from the same rows
          as the table beside it - group-detail.js draws into exactly one of the two, so
          neither is a hidden second copy of the list. #}
       <div class="gm-list" id="gd-list"></div>

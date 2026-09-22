@@ -35,11 +35,11 @@
 .tbl tbody tr[data-overlap="red"] td:first-child { box-shadow: inset 3px 0 0 var(--bad); }
 .tbl tbody tr[data-overlap="yellow"] td:first-child { box-shadow: inset 3px 0 0 var(--warn); }
 
-/* Below 768 the row IS the card (.tbl-cards), so an edge on its first cell marks one line
+/* Below 960 the row IS the card (.tbl-cards), so an edge on its first cell marks one line
    of the card instead of the card. Moved onto the row, where the same inset shadow follows
    the card's own border-radius around the corner - which is what the group page's member
    cards need a clipped ::before bar to achieve. */
-@media (max-width: 768px) {
+@media (max-width: 960px) {
   .tbl-cards tbody tr[data-overlap="red"] td:first-child { box-shadow: none; }
   .tbl-cards tbody tr[data-overlap="yellow"] td:first-child { box-shadow: none; }
   .tbl-cards tbody tr[data-overlap="red"] { box-shadow: inset 3px 0 0 var(--bad); }

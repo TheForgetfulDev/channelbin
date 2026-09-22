@@ -101,7 +101,7 @@
 .auth-password-form { padding: 6px 18px 16px; max-width: 340px; }
 
 /* ── The field row's own rules. The anatomy itself (.frow / .fl* / .fr-ctl /
-      .restart-badge, and the ≤768px stack) lives in style.css as of
+      .restart-badge, and the ≤960px stack) lives in style.css as of
       dev/changelog/440, because Notifications' Delivery card is the second page
       to use it. What stays here is what belongs to THIS page's search, not to
       the row. ─────────────────────────────────────────────────────────────── */
@@ -188,11 +188,11 @@
 .sp-note { font-size: var(--fs-sm); color: var(--text-faint); line-height: 1.45; padding: 10px 10px 2px; }
 
 /* ── Responsive ──────────────────────────────────────────────────────────
-   The switch is at 900px, not 768px: that is where base.html drops the sidebar
-   shell for the .topnav bar, and it is also where a 194px rail column stops
-   having room. Between 769 and 900 the old placeholder stacked the rail as a
-   flat eleven-item list, which is the spelling DESIGN.md 15.5 rejected. */
-@media (max-width: 900px) {
+   960 is the app's one mobile breakpoint (style.css, dev/changelog/1094). This page used to
+   split at 900 rather than 768 and argue the case in this comment - the rail and the section
+   picker both belong to the shell, so they had to move when base.html swapped the sidebar for
+   the .topnav bar, not one width later. The merge settled that argument by making it moot. */
+@media (max-width: 960px) {
   .set-wrap { display: block; }
   .set-rail { display: none; }
   .secpick { display: block; position: sticky; top: var(--topnav-h); z-index: 120;
@@ -201,8 +201,7 @@
      BOTH or the section head lands underneath them. Same one-value rule as the
      desktop offset above: the spy reads whatever this resolves to. */
   .sec-card { scroll-margin-top: calc(var(--topnav-h) + var(--pick-h) + 20px); }
-}
-@media (max-width: 768px) {
+
   /* The row itself stacks in style.css; these are the page's own knock-ons. */
   .sec-card .card-head { padding: 10px 14px; }
   .sec-note { padding: 10px 14px 2px; }

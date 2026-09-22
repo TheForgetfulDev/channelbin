@@ -1028,12 +1028,12 @@
   // second template would be a second copy of all of it, and the two would disagree
   // (static/js/channel-search.js made the same call for the same reason).
   //
-  // matchMedia and nothing else, so there is one spelling of 768 in this file to match the
+  // matchMedia and nothing else, so there is one spelling of 960 in this file to match the
   // one in style.css. jsdom answers `matches: false` always, which is why the desktop
   // drawing is what the suite sees and why the browser pass is not optional here.
   // ══════════════════════════════════════════════════════════════════════════
 
-  const MOBILE_MQ = window.matchMedia('(max-width: 768px)');
+  const MOBILE_MQ = window.matchMedia('(max-width: 960px)');
   const isPhone = () => MOBILE_MQ.matches;
 
   // Which of the shared fields a card can draw, in `colState.order`'s order so the phone
@@ -1613,7 +1613,7 @@
     // block, and the one pill carrying an origin line comes out double height beside its
     // neighbors. Same four facts, same click target, as the app's key/value list
     // (.statlist, DESIGN.md 3.3) - which is what an account page's Details card already is
-    // and which collapses to one column at 768 on its own. Each row stays a button opening
+    // and which collapses to one column at 960 on its own. Each row stays a button opening
     // Settings focused on its key, exactly as the pill did; the chevron is what says so.
     if (isPhone()) {
       host.className = '';

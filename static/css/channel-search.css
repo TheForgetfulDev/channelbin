@@ -440,7 +440,7 @@
    instead, and since the two selectors are identical the later one won at every
    width - the kebab was display:none on a phone too, which is the only place it
    exists, so Delete Missing Channels and Review Duplicates had no reachable
-   path at all below 768px (BUGS.md 2026-07-30 08:5x PM). Specificity cannot
+   path at all below 960px (BUGS.md 2026-07-30 08:5x PM). Specificity cannot
    settle a tie between two copies of one selector; source order does. */
 .page-head .page-kebab { display: none; background: none; border: 1px solid var(--border);
   border-radius: var(--radius-sm); color: var(--text-muted); font: inherit; font-size: var(--fs-base);
@@ -665,7 +665,7 @@
    and radius are .card's and the tint is the accent at two alphas (`-soft`'s single
    opacity cannot make a gradient, which is what the `-rgb` triplet is for).
 
-   A DESKTOP DEVICE, and it stops at the breakpoint - see the ≤768 block. */
+   A DESKTOP DEVICE, and it stops at the breakpoint - see the ≤960 block. */
 .cs-bar.nav-panel {
   border: 1px solid var(--border); border-radius: var(--radius);
   background-color: var(--bg1);
@@ -832,26 +832,22 @@
 /* A kebab-sheet row that names a state rather than offering an action. */
 .cs-sheet .prow.off { opacity: .55; cursor: default; }
 
-@media (max-width: 900px) {
-  /* 769-900 only, in practice: below 769 the rail is not built at all. The rail
-     stops being a rail and becomes a band above the results; collapsed it still
-     collapses, to a full-width strip. */
-  /* `align-items` has to be reset WITH the direction, never after it: flipping the
-     axis reassigns what that property controls. In a row it aligns heights, where
-     flex-start is what stops the rail stretching to the length of the results; in a
-     column it aligns WIDTHS, where flex-start makes .cs-main shrink-to-fit around the
-     widest thing inside it - the table's grid - so the results box grows past the
-     viewport and takes the search bar and the rail sideways with it. Everything below
-     .cs-main is already prepared to contain that width (min-width:0 down the chain,
-     #ch-list scrolling on its own); this is the one link that was handing it upward
-     instead. .rail carries align-self:flex-start of its own, so it does not inherit
-     this and its width:100% below stays load-bearing (dev/changelog/863). */
-  .cs-wrap { flex-direction: column; align-items: stretch; }
-  .rail, .rail.collapsed { width: 100%; }
-  .rail.collapsed .fac { display: none; }
-}
+/* The rail used to have a middle form - a full-width band above the results, for the
+   769-900px window where the shell was already mobile but the rail was still built. The one
+   mobile breakpoint (dev/changelog/1094) closed that window: the rail is hidden at the same
+   width the shell collapses at, so the band's range is empty and its rules are gone rather
+   than renumbered. Losing the band is a real consequence of the merge and not an oversight -
+   a facet rail stacked above the results costs vertical room a sideways phone does not have,
+   and the filters are reachable in the sheet at this width.
 
-@media (max-width: 768px) {
+   If a band is ever wanted back, the trap it hit is worth reading first: `align-items` has to
+   be reset WITH `flex-direction`, never after it, because flipping the axis reassigns what
+   that property controls. In a row it aligns heights, where flex-start is what stops the rail
+   stretching to the length of the results; in a column it aligns WIDTHS, where flex-start
+   makes .cs-main shrink-to-fit around the widest thing inside it - the table's grid - so the
+   results box grows past the viewport and takes the search bar sideways with it
+   (dev/changelog/863). */
+@media (max-width: 960px) {
   .rail { display: none; }
 
   /* ── THE PANEL IS A DESKTOP DEVICE AND STOPS HERE ─────────────────
@@ -1056,7 +1052,7 @@
   body.has-selbar .main { padding-bottom: 96px; }
 
   /* ── Sheets are buildModal() panels (9.6) ─────────────────────────
-     style.css's own <=768px block is what makes .modal-panel a bottom sheet;
+     style.css's own <=960px block is what makes .modal-panel a bottom sheet;
      everything here is content styling INSIDE one. There is deliberately no
      second overlay component on this page. */
   .cs-sheet .modal-body { padding: 8px 16px 14px; }

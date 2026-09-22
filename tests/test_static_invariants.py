@@ -216,6 +216,124 @@ class RootFontSizeTests(unittest.TestCase):
             f'static/css/style.css: {relative}')
 
 
+#: The app's one mobile breakpoint, and the only widths a width-based media query may name.
+#: 960 is the breakpoint, 961 its complement (`min-width`), 601 the nav drawer's lower bound,
+#: 480 the portrait-phone tightening pass. Moving the breakpoint is an edit here plus a sweep -
+#: that is the point of the number living in one place (dev/changelog/1094).
+MOBILE_BREAKPOINT_PX = 960
+ALLOWED_BREAKPOINT_PX = {480, 601, 960, 961}
+
+#: Widths that were breakpoints before 2026-09-22 and must not come back. Named explicitly so
+#: the failure message can say what went wrong rather than just "not in the allowlist".
+RETIRED_BREAKPOINT_PX = {768: 'the old component breakpoint', 769: 'its complement',
+                         900: 'the old shell breakpoint', 901: 'its complement'}
+
+
+class SingleMobileBreakpointTests(unittest.TestCase):
+    """The app has ONE mobile breakpoint and every width-based query names it.
+
+    It had two until 2026-09-22 - the shell moved at 900px and the components at 768px - and
+    the 132px between them is exactly where a phone held sideways lands (667-956px CSS px).
+    A landscape phone therefore got the mobile shell and the desktop component layout at the
+    same time, so a wide table was helped by neither: four pages needed a sideways drag at
+    844px, six at 932px, and at 932 the sidebar came back and left 602px of content where an
+    844px phone got 778px - the bigger phone drawing the narrower page.
+
+    The reason this needs a test rather than a note is that the two numbers were *already*
+    documented as needing to stay in sync, in five separate JS files each carrying a comment
+    saying "one spelling of 768 in this file, matching style.css". Prose did not stop the
+    split from existing; it only described it. This is the coupled-values CSS defect class
+    from CLAUDE.md applied to the breakpoint itself.
+
+    jsdom computes no layout, so nothing in the suite can see an overflow - this is a text
+    scan, and the browser pass that measured the widths above is recorded in
+    dev/changelog/1094.
+    """
+
+    #: `@media` preludes, and the width conditions inside them, wherever they are written -
+    #: a .css file, a template's own <style> block, or a JS template literal that builds one
+    #: (templates/index.html's column sizer does exactly that).
+    _MEDIA_RE = re.compile(r'@media[^{]*')
+    _WIDTH_RE = re.compile(r'\b(?:max|min)-width:\s*(\d+)px')
+    _MATCHMEDIA_RE = re.compile(r'matchMedia\(\s*[\'"`]\(\s*(?:max|min)-width:\s*(\d+)px')
+    _BLOCK_COMMENT_RE = re.compile(r'/\*.*?\*/', re.S)
+
+    @classmethod
+    def _scannable(cls, path):
+        """The file with block comments removed.
+
+        Required, not tidiness: `@media` is written in prose all over this tree, and a
+        prelude regex bounded by the next `{` runs straight out of a comment and into the
+        following rule. The comment above `@container rec-list` says "the plain @media block
+        further down" and made that container query read as a 800px media query.
+        """
+        return cls._BLOCK_COMMENT_RE.sub('', _read(path))
+
+    def _sources(self):
+        for path in sorted(_walk(CSS_DIR, '.css')):
+            yield path
+        for path in sorted(_walk(TPL_DIR, '.html')):
+            yield path
+        for path in sorted(_walk(JS_DIR, '.js')):
+            yield path
+
+    def test_every_media_query_width_is_an_approved_breakpoint(self):
+        """No `@media` may name a width outside the approved set."""
+        bad = []
+        for path in self._sources():
+            for prelude in self._MEDIA_RE.findall(self._scannable(path)):
+                for px in (int(m) for m in self._WIDTH_RE.findall(prelude)):
+                    if px in ALLOWED_BREAKPOINT_PX:
+                        continue
+                    why = RETIRED_BREAKPOINT_PX.get(px)
+                    bad.append(f'{_rel(path)}: {px}px'
+                               + (f' ({why}, retired 2026-09-22)' if why else ''))
+        self.assertEqual(
+            bad, [],
+            'These media queries name a width that is not one of the app\'s breakpoints '
+            f'{sorted(ALLOWED_BREAKPOINT_PX)}. The mobile breakpoint is '
+            f'{MOBILE_BREAKPOINT_PX}px and there is deliberately only one of it - a second '
+            'one is where landscape phones fell through before dev/changelog/1094. If a '
+            'surface genuinely needs to reflow on its own available width rather than the '
+            'viewport, use a named container (.rec-list/.acct-list/.prof-list), not a new '
+            f'breakpoint: {bad}')
+
+    def test_every_matchmedia_uses_the_mobile_breakpoint(self):
+        """The JS half of the breakpoint must equal the CSS half.
+
+        Six call sites across five JS files and one template pick a renderer or a sheet-vs-
+        modal from this query. CSS deciding what a surface LOOKS like while JS decides what
+        it is BUILT from, at two different widths, is a class of bug the guide has shipped
+        before (static/js/guide.js says so above its own declaration).
+        """
+        bad = []
+        for path in list(_walk(JS_DIR, '.js')) + list(_walk(TPL_DIR, '.html')):
+            for px in (int(m) for m in self._MATCHMEDIA_RE.findall(self._scannable(path))):
+                if px != MOBILE_BREAKPOINT_PX:
+                    bad.append(f'{_rel(path)}: matchMedia at {px}px')
+        self.assertEqual(
+            bad, [],
+            f'Every matchMedia breakpoint must be {MOBILE_BREAKPOINT_PX}px, matching the CSS: '
+            f'{sorted(bad)}')
+
+    def test_the_mobile_breakpoint_is_actually_used(self):
+        """A guard that allows a set of widths is worthless if the real one is absent.
+
+        Without this, deleting every `@media (max-width: 960px)` in the app passes both
+        checks above - they only constrain what a query may say, not that any exists.
+        """
+        found = sum(
+            len([m for m in self._WIDTH_RE.findall(prelude)
+                 if int(m) == MOBILE_BREAKPOINT_PX])
+            for path in self._sources()
+            for prelude in self._MEDIA_RE.findall(self._scannable(path)))
+        self.assertGreater(
+            found, 10,
+            f'Only {found} media queries name the {MOBILE_BREAKPOINT_PX}px mobile '
+            'breakpoint. The app\'s whole mobile layout hangs off it, so a number this low '
+            'means the breakpoint was renamed without this constant being updated.')
+
+
 class CssBreakpointOverrideTests(unittest.TestCase):
     """A responsive `display` set inside a `@media` block must not be undone by a later
     top-level rule carrying the *same selector* (BUGS.md 2026-07-30 - the `/channels` page
@@ -1574,7 +1692,7 @@ class RecordingDetailLayoutInvariants(unittest.TestCase):
     def test_status_strip_is_topmost(self):
         """The status strip (successor of the Job Summary panel, changelog/183) is the
         quickest read of current status and must come right after the header, before the
-        hero card - above the fold on desktop and first in the <=768px single column."""
+        hero card - above the fold on desktop and first in the <=960px single column."""
         text = _read(self._PATH)
         head = text.index('id="detail-head-slot"')
         strip = text.index('id="status-strip-slot"')

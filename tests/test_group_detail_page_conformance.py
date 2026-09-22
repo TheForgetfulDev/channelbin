@@ -334,7 +334,7 @@ class MemberListMarkupTests(unittest.TestCase):
         full-width card head. Measured at 375px in a browser; jsdom computes no layout, so
         this asserts the rule exists rather than the width it produces."""
         css = _read('static/css/style.css')
-        phone = css[css.index('@media (max-width: 768px)'):]
+        phone = css[css.index('@media (max-width: 960px)'):]
         idx = phone.index('.card-head-actions .search-wrap')
         before = phone[max(0, idx - 700):idx]
         # BOTH are needed: the head must wrap so the actions get their own line, and the
@@ -1243,7 +1243,7 @@ class PhoneLayoutTests(unittest.TestCase):
         """Two spellings of 768 is how the JS comes to draw cards while the CSS is still
         showing the table."""
         self.assertEqual(self.js.count("matchMedia("), 1)
-        self.assertIn("matchMedia('(max-width: 768px)')", self.js)
+        self.assertIn("matchMedia('(max-width: 960px)')", self.js)
         self.assertIn('.gm-list, .gd-phonebar, .gm-botpad { display: none; }', self.css)
 
     def test_render_list_is_the_only_entry_point(self):

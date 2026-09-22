@@ -30,9 +30,9 @@
 (() => {
   'use strict';
 
-  // One spelling of 768 in this file, matching the one in style.css (the pattern
+  // One spelling of 960 in this file, matching the one in style.css (the pattern
   // channel-search.js and dashboard.js already follow).
-  const isPhone = () => window.matchMedia('(max-width: 768px)').matches;
+  const isPhone = () => window.matchMedia('(max-width: 960px)').matches;
   const reload = () => window.location.reload();
 
   // ── Row navigation (§3.9) ────────────────────────────────────────────────

@@ -196,7 +196,7 @@ window.onScheduleSaved = () => window.location.reload();
   const applyColumns = () => {
     const visible = colState.order.filter(k => !colState.hidden.includes(k));
     const widths = visible.map(k => COLUMNS.find(c => c.key === k).width);
-    let css = `@media (min-width: 769px) { .list-head, .rows .row { grid-template-columns: minmax(240px,2.2fr) ${widths.join(' ')} 44px; } }\n`;
+    let css = `@media (min-width: 961px) { .list-head, .rows .row { grid-template-columns: minmax(240px,2.2fr) ${widths.join(' ')} 44px; } }\n`;
     colState.order.forEach((k, i) => {
       css += `[data-col="${k}"] { order: ${i + 1}; ${colState.hidden.includes(k) ? 'display: none;' : ''} }\n`;
     });

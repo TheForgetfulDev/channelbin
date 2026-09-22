@@ -98,11 +98,11 @@
 /* Test History is 13 columns, the widest table in the app, and `.tbl th`'s nowrap is
    sized for tables a third of that - held to one line, "Frames Received" alone costs
    ~43px that the column does not need. Letting this page's headers wrap is what keeps
-   the table inside its card at desktop width; the thead is hidden below 768 anyway, so
+   the table inside its card at desktop width; the thead is hidden below 960 anyway, so
    this is a desktop-only concession and page-scoped rather than a fork of 3.2. */
 .cd-wide th { white-space: normal; }
 
-@media (max-width: 768px) {
+@media (max-width: 960px) {
   .cd-epg-btn .cd-epg-icon { display: inline; }
   .cd-epg-btn .cd-epg-label { display: none; }
 
@@ -183,7 +183,7 @@
    specificity plus one (`.menu button.menu-item` in style.css sets display) - a bare
    `.cd-phone-only` loses that cascade and the row shows on desktop, which is what the
    browser verification of dev/changelog/1018 caught. */
-@media (min-width: 769px) {
+@media (min-width: 961px) {
   .menu button.menu-item.cd-phone-only { display: none; }
 }
 
@@ -476,7 +476,7 @@
      Phone widths only. It exists IN ADDITION to the bar above rather than instead of it,
      so the top bar keeps its buttons and its status message and this is purely a second
      reach: the actions land where a thumb is. Rendered at every width and
-     hidden by CSS above 768px, so there is one markup path and one set of handlers.
+     hidden by CSS above 960px, so there is one markup path and one set of handlers.
 
      The kebab here opens a SHEET, not the dropdown the top bar uses - a menu opening
      upward out of a fixed bottom bar is exactly the clipping case 9.6 warns about. It

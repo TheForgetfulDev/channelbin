@@ -251,7 +251,7 @@ class ShellSourceTests(unittest.TestCase):
         """body.nav-min hides .nav-t, which the mobile drawer also uses. Ungated,
         a persisted collapse would blank every label in the drawer."""
         css = _read('static/css/style.css')
-        block = _slice(css, '@media (min-width: 901px) {', '\n}')
+        block = _slice(css, '@media (min-width: 961px) {', '\n}')
         for sel in ('body.nav-min .nav-t', 'body.nav-min .sidebar',
                     'body.nav-min .sys-mini'):
             self.assertIn(sel, block)
@@ -314,7 +314,7 @@ class ShellSourceTests(unittest.TestCase):
 
     def test_mobile_drawer_opens_on_the_left(self):
         css = _read('static/css/style.css')
-        block = _slice(css, '@media (min-width: 601px) and (max-width: 900px) {', '\n}')
+        block = _slice(css, '@media (min-width: 601px) and (max-width: 960px) {', '\n}')
         self.assertIn('left: 0', block)
         self.assertIn('right: auto', block)
         self.assertIn('border-right', block)

@@ -30,6 +30,14 @@ epg.txt
 
 # --- Dev-only tree (docs, backlog, changelog, mockups, samples, screenshots) ---
 dev/
+# Source for the root of the Home Assistant integration's own public repo. It does not ship
+# to the app's public repo, so a build context holding it fails the release-time check that
+# refuses anything the public repo does not carry (dev/changelog/1089).
+ha-integration/
+# The integration itself stopped shipping to the app's public repo too (dev/changelog/1091),
+# so the same check refuses a build context carrying it. Nothing in the image reads it: the
+# integration runs inside Home Assistant, not inside this container.
+custom_components/
 CLAUDE.md
 AGENTS.md
 CONTRIBUTING.md
