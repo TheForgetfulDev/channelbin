@@ -3,12 +3,13 @@
 
 {% import '_macros.html' as m %}
 
-{#  Unified group / health-check detail page (dev/changelog/273, design 272 +
-    dev/mockups/14 desktop + dev/mockups/15 mobile).
+{#  Unified group detail page (dev/changelog/273, design 272 + dev/mockups/14 desktop +
+    dev/mockups/15 mobile).
 
-    ONE page serves `/channel-groups/<id>` and `/channels/health-checks/<job_id>`.
-    A ChannelGroup is the primary object; a health check is a facet it may or may not
-    have, so everything below is gated on three booleans from the route:
+    ONE page serves `/channel-groups/<id>`; `/channels/health-checks/<job_id>` redirects
+    here. A ChannelGroup is the object and `job` is its one health check - every group
+    carries exactly one, so nothing is gated on whether a check exists
+    (dev/changelog/1077). Everything below is gated on two booleans from the route:
       is_stored - an ordinary group, with stored membership: everything except the
                   pinned system group, whose membership is computed at display time.
                   Structural only - what may be renamed, dissolved, cloned, added to
@@ -18,8 +19,7 @@
                   itself is built on: a group with none records nothing, whatever its
                   format strategy is set to, and the Groups list page already calls that
                   state a health check (dev/changelog/750)
-      has_check - an OnDemandTestJob is attached
-    Structure and behavior are separate questions, and every combination of the three
+    Structure and behavior are separate questions, and every combination of the two
     must render cleanly on its own.
 
     The header, banners and status bar are NOT reorderable - they are how you know what
@@ -69,36 +69,21 @@
          to make and to undo. #}
       <span class="badge b-done tip-plain" data-tip="In Guide.&#10;This group renders as a single TV Guide row. A member that also has its own guide row keeps it.">In Guide</span>
       {% endif %}
-      {# The paired half, named. It scrolls to the `linked` section rather than
-         navigating, because one page already carries both halves (changelog 323). #}
-      {% if is_stored and checks %}
-      {% set other_name = checks[0].name if checks | length == 1 else (checks | length) ~ ' health checks' %}
-      <span class="gd-pair-badge tip-plain" data-jump="gd-linked"
-            data-tip="Linked health check.&#10;&quot;{{ other_name }}&quot; is paired with this channel group. They are separate things sharing one channel list - click to jump to it.">&#10003; {{ other_name }}</span>
-      {% endif %}
     </div>
     {# What this group IS, in the model's one noun. `records` leads because it is the
-       only one of the three flags that says whether anything comes out of this group;
-       a group with no member enabled for recording is a health check, which is the
-       sentence the Groups list page already uses for the same state. The system group
-       is the terminal branch because `is_stored` is exactly `not is_system` - there is
-       no fourth state to fall through to. #}
+       flag that says whether anything comes out of this group; a group with no member
+       enabled for recording is a health check, which is the sentence the Groups list
+       page already uses for the same state. The system group is the terminal branch
+       because `is_stored` is exactly `not is_system` - there is no third state to fall
+       through to. #}
     <p class="gd-sub-lead">
-      {% if is_stored and records and has_check %}
+      {% if is_stored and records %}
       A channel group of {{ payload.total }} feed{{ 's' if payload.total != 1 else '' }} that records with failover,
-      plus {{ 'one paired health check testing' if checks | length == 1 else (checks | length) ~ ' paired health checks testing' }}
-      those same feeds on a schedule.
-      {% elif is_stored and records %}
-      A channel group. Records the best-scoring enabled channel and fails over to the next-best feed
-      if the stream drops. No health check is attached yet.
-      {% elif is_stored and has_check %}
-      A channel group of {{ payload.total }} feed{{ 's' if payload.total != 1 else '' }} with no member enabled for
-      recording, so nothing records from it yet - it is a health check, testing those feeds on a
-      schedule. Turning Recording on for a member is what promotes it.
+      and tests those same feeds on its health check's schedule.
       {% elif is_stored %}
       A channel group of {{ payload.total }} feed{{ 's' if payload.total != 1 else '' }} with no member enabled for
-      recording, so nothing records from it yet, and no health check is attached to test the feeds
-      either. Turning Recording on for a member is what promotes it.
+      recording, so nothing records from it yet - it is a health check, testing those feeds on its
+      schedule. Turning Recording on for a member is what promotes it.
       {% else %}
       Tests every channel currently in your <a href="{{ url_for('guide.guide') }}">TV Guide</a>. Its channel list is
       computed from the guide and updates itself - add or remove channels from the
@@ -159,77 +144,66 @@
 
 {# ── Status / action bar ────────────────────────────────────────────────── #}
 <div class="gd-actionbar" id="gd-inline-actionbar">
+  {# Every branch below switches on `bar_state`, the one enumerated answer built in
+     routes/channel_groups.py::_action_bar_state(). No chain here may test job.status
+     directly: three chains each re-deriving it is how a real state ended up rendering
+     through a trailing else (dev/changelog/1076). #}
   <span id="gd-status-badge">
-    {% if has_check %}
-      {% if job.status == 'RUNNING' and tester_status.is_running and tester_status.current_job_id == job.id %}
-      {# b-running, not b-live: b-live is the recording red, and a health check that is
-         simply doing its job must not read as an alarm (§17.1 group C). #}
-      <span class="badge b-running"><span class="pulse"></span>Running</span>
-      {% elif job.status == 'RUNNING' %}
-      <span class="badge b-warn">Stuck</span>
-      {% elif job.status == 'SCHEDULED' %}<span class="badge b-auto">Scheduled</span>
-      {% elif job.status == 'CANCELLED' %}<span class="badge b-abort">Cancelled</span>
-      {# "Queued" read as a position in a line nobody is working through; QUEUED is the
-         status a check with no schedule sits in, and the message beside it says so. #}
-      {% elif job.status == 'QUEUED' %}<span class="badge b-abort">No schedule</span>
-      {% else %}<span class="badge b-done">Completed</span>{% endif %}
-    {% else %}
-    <span class="badge b-auto">&#9939; Channel group</span>
-    {% endif %}
+    {% if bar_state == 'running' %}
+    {# b-running, not b-live: b-live is the recording red, and a health check that is
+       simply doing its job must not read as an alarm (§17.1 group C). #}
+    <span class="badge b-running"><span class="pulse"></span>Running</span>
+    {% elif bar_state == 'stuck' %}<span class="badge b-warn">Stuck</span>
+    {% elif bar_state in ('scheduled_once', 'scheduled_recurring') %}<span class="badge b-auto">Scheduled</span>
+    {% elif bar_state == 'cancelled' %}<span class="badge b-abort">Cancelled</span>
+    {# "Queued" read as a position in a line nobody is working through; QUEUED is the
+       status a check with no schedule sits in, and the message beside it says so. #}
+    {% elif bar_state == 'queued' %}<span class="badge b-abort">No schedule</span>
+    {% elif bar_state == 'completed' %}<span class="badge b-done">Completed</span>
+    {% else %}<span class="badge b-warn">Unknown state: {{ job.status }}</span>{% endif %}
   </span>
   <span class="gd-ab-msg">
-    {% if has_check %}
-      {% if job.status == 'RUNNING' and tester_status.is_running and tester_status.current_job_id == job.id %}
-      {# Live region. group-detail.js::updateActionBarMsg is the sole updater once the page
-         is up - this is only the first frame of it, and both must render the same sentence
-         for each phase or the bar rewords itself on the first poll. #}
-      {% if tester_status.current_phase == 'waiting' %}
-      Between channels - {{ tester_status.completed_channels }} of {{ tester_status.total_channels }} done.
-      {% else %}
-      Testing channel {{ tester_status.completed_channels + 1 }} of {{ tester_status.total_channels }}.
-      {% endif %}
-      {% elif job.status == 'RUNNING' %}
-      The test process stopped unexpectedly.
-      {% elif job.status == 'SCHEDULED' %}
-      {{ schedule.label }}{% if schedule.next_run_et %} - next run <strong>{{ schedule.next_run_et }}</strong>{% endif %}.
-      {% elif job.status == 'QUEUED' %}
-      {# QUEUED is not a queue position - nothing dispatches it. It means the check exists
-         with no schedule, which is now reachable for the automatic check too (changelog
-         1068), so the line says what that actually means rather than implying a wait. #}
-      No schedule - this check runs only when you start it.
-      {% elif job.status == 'CANCELLED' %}
-      This check was cancelled before it finished.
-      {% else %}
-      Last run {{ last_run_et or 'never' }}.
-      {% endif %}
-    {# `in_guide` alone is not enough to claim a recording: _guide_row_entries() skips a
-       group whose recording_members() is empty, so the flag can be set and the guide
-       still draw no row. Saying so is the whole point of the state
-       (DESIGN-channel-groups-model.md 15). #}
-    {% elif group.in_guide and records %}
-    Recording from the best channel, failing over automatically.
-    {% elif group.in_guide %}
-    In the TV Guide, but no member is enabled for recording - the guide draws no row for this
-    group until one is.
+    {% if bar_state == 'running' %}
+    {# Live region. group-detail.js::updateActionBarMsg is the sole updater once the page
+       is up - this is only the first frame of it, and both must render the same sentence
+       for each phase or the bar rewords itself on the first poll. #}
+    {% if tester_status.current_phase == 'waiting' %}
+    Between channels - {{ tester_status.completed_channels }} of {{ tester_status.total_channels }} done.
     {% else %}
-    Not in the TV Guide.
+    Testing channel {{ tester_status.completed_channels + 1 }} of {{ tester_status.total_channels }}.
+    {% endif %}
+    {% elif bar_state == 'stuck' %}
+    The test process stopped unexpectedly.
+    {% elif bar_state in ('scheduled_once', 'scheduled_recurring') %}
+    {{ schedule.label }}{% if schedule.next_run_et %} - next run <strong>{{ schedule.next_run_et }}</strong>{% endif %}.
+    {% elif bar_state == 'queued' %}
+    {# QUEUED is not a queue position - nothing dispatches it. It means the check exists
+       with no schedule, which is now reachable for the automatic check too (changelog
+       1068), so the line says what that actually means rather than implying a wait. #}
+    No schedule - this check runs only when you start it.
+    {% elif bar_state == 'cancelled' %}
+    This check was cancelled before it finished.
+    {% elif bar_state == 'completed' %}
+    Last run {{ last_run_et or 'never' }}.
+    {% else %}
+    This check is in a state ChannelBin does not recognize ({{ job.status }}). Nothing is
+    running; report this if it persists.
     {% endif %}
   </span>
   <div class="gd-ab-actions" id="gd-inline-actions">
-    {% if has_check %}
-      {% if job.status == 'RUNNING' and tester_status.is_running and tester_status.current_job_id == job.id %}
-      <button class="btn btn-danger btn-sm" data-act="stop">Stop</button>
-      {% elif job.status == 'RUNNING' %}
-      <button class="btn btn-danger btn-sm" data-act="force-cancel">Force Cancel</button>
-      {% elif job.status == 'SCHEDULED' and not job.recurring %}
-      <button class="btn btn-primary btn-sm" data-act="run-now">&#9654; Run now</button>
-      {% elif job.status == 'CANCELLED' %}
-      <button class="btn btn-primary btn-sm" data-act="resume">Resume</button>
-      {% elif job.status == 'QUEUED' %}
-      <button class="btn btn-primary btn-sm" data-act="start">&#9654; Start now</button>
-      {% else %}
-      <button class="btn btn-primary btn-sm" data-act="restart">&#8635; Test again</button>
-      {% endif %}
+    {# One primary action, and it is always called "Test now" - a check that has never run
+       and one that ran yesterday are the same button doing the same thing, so the label
+       must not change under the user (dev/changelog/1076). The one-off scheduled case is
+       the single exception to "no prompt": running it early is genuinely a choice about
+       the schedule it would consume, so `run-now` asks keep-or-drop. #}
+    {% if bar_state == 'running' %}
+    <button class="btn btn-danger btn-sm" data-act="stop">Stop</button>
+    {% elif bar_state == 'stuck' %}
+    <button class="btn btn-danger btn-sm" data-act="force-cancel">Force Cancel</button>
+    {% elif bar_state == 'scheduled_once' %}
+    <button class="btn btn-primary btn-sm" data-act="run-now">&#9654; Test now</button>
+    {% elif bar_state in ('scheduled_recurring', 'queued', 'completed', 'cancelled') %}
+    <button class="btn btn-primary btn-sm" data-act="start">&#9654; Test now</button>
     {% endif %}
     {# The four secondary actions leave the bar at phone width: .mobile-actbar clones this
        element's children, and at 375px five buttons scroll sideways inside it with only two
@@ -243,16 +217,6 @@
     <a class="btn btn-primary btn-sm gd-phone-hide" href="{{ url_for('channels.channel_browser', add_to_group=group.id) }}"
        data-tip="Add channels.&#10;Opens the full channel browser so you can search and hand-pick any channel to add to this group, including ones unrelated to what's already here.">+ Add Channels</a>
     {% endif %}
-    {% if is_stored and not has_check %}
-    <button class="btn btn-sm gd-phone-hide" data-act="create-check"
-            data-tip="Create health check.&#10;Tests every feed in this group on a schedule and records how each one performed, so a dead or drifting channel is caught before a recording lands on it. Results appear in the Channels table below.">Create health check</button>
-    {% endif %}
-    {# Secondary on purpose: the primary action on a health check stays "Test again",
-       because creating a group off it is a deliberate one-off (changelog 323). #}
-    {% if not is_stored and not is_system %}
-    <button class="btn btn-sm gd-phone-hide" data-act="create-group"
-            data-tip="Create channel group.&#10;Bundles these channels into a TV Guide row that records with failover. This health check is not touched - the new group gets its own copy of the channel list.">&#9939; Create channel group</button>
-    {% endif %}
     {% if is_stored %}
     <button class="btn btn-sm" data-act="guide-toggle">{{ 'Remove from Guide' if group.in_guide else '+ Add to Guide' }}</button>
     {% endif %}
@@ -262,31 +226,23 @@
         {% if is_stored and not is_system %}
         <button class="menu-item" data-act="rename">Rename</button>
         {% endif %}
-        {% if is_stored and not has_check and not is_system %}
-        <button class="menu-item" data-act="create-check">Schedule health check</button>
-        {% endif %}
-        {% if not is_stored and not is_system %}
-        <button class="menu-item" data-act="create-group">Create a channel group&hellip;</button>
-        {% endif %}
-        {% if has_check %}
         <button class="menu-item" data-act="schedule">Schedule health check</button>
-          {% if job.recurring and not job.recur_paused %}
-          <button class="menu-item" data-act="pause-schedule">Pause schedule</button>
-          <button class="menu-item" data-act="skip-next">Skip next run</button>
-          {% elif job.recurring %}
-          <button class="menu-item" data-act="resume-schedule">Enable schedule</button>
-          {% endif %}
-          {% if job.status == 'SCHEDULED' %}
-          {# The system check included: its schedule is the user's to set or remove like
-             any other, even though the check itself can never be deleted (changelog 1068). #}
-          <button class="menu-item" data-act="unschedule">Unschedule</button>
-          {% endif %}
-          {% if job.status == 'CANCELLED' %}
-          <button class="menu-item" data-act="start-over">Start over</button>
-          {% endif %}
+        {% if job.recurring and not job.recur_paused %}
+        <button class="menu-item" data-act="pause-schedule">Pause schedule</button>
+        <button class="menu-item" data-act="skip-next">Skip next run</button>
+        {% elif job.recurring %}
+        <button class="menu-item" data-act="resume-schedule">Enable schedule</button>
         {% endif %}
-        {% if is_stored and not is_system %}
-        <button class="menu-item" data-act="pick-format">Pick best format&hellip;</button>
+        {% if bar_state in ('scheduled_once', 'scheduled_recurring') %}
+        {# The system check included: its schedule is the user's to set or remove like
+           any other, even though the check itself can never be deleted (changelog 1068). #}
+        <button class="menu-item" data-act="unschedule">Unschedule</button>
+        {% endif %}
+        {% if bar_state == 'cancelled' %}
+        {# Secondary to "Test now" on purpose, and named for what makes it different:
+           it tests only the channels that never finished. Worth keeping for a 50-channel
+           sweep that got stopped partway (dev/changelog/1076). #}
+        <button class="menu-item" data-act="resume">Resume where it stopped</button>
         {% endif %}
         <div class="sep"></div>
         <button class="menu-item" data-act="sections">Customize sections&hellip;</button>
@@ -311,7 +267,7 @@
 </div>{# /.gd-statezone #}
 
 {# ── Live progress hero + activity log (a running check only) ───────────── #}
-{% set _live = has_check and tester_status.is_running and tester_status.current_job_id == job.id %}
+{% set _live = tester_status.is_running and tester_status.current_job_id == job.id %}
 <div id="gd-hero" class="gd-hero" style="{{ '' if _live else 'display:none' }}">
   <div class="gd-hero-top">
     <div class="gd-hero-what">
@@ -392,75 +348,13 @@
           {% endif %}
         </div>
         {% endif %}
-        {% if is_stored and has_check %}<div class="gd-sum-rule"></div>{% endif %}
-        {% if has_check %}
+        {% if is_stored %}<div class="gd-sum-rule"></div>{% endif %}
         <div class="gd-sum-bar-wrap">
           <div class="gd-sum-lbl" id="gd-sum-lbl-run">Last run results</div>
           <div class="stackbar" id="gd-sum-track"></div>
           <div class="stackbar-legend" id="gd-sum-legend"></div>
         </div>
-        {% endif %}
       </div>
-    </div>
-  </div>
-
-  {# Linked: the schedules this group carries, as something you can see and act on rather
-     than a chip in the title bar (changelog 323). A health check is a schedule a group
-     holds, never a second object (DESIGN-channel-groups-model.md DECIDED 2), so there are
-     three states: a group with schedules, a group without, and the automatic check. #}
-  <div class="card" data-section="linked" id="gd-linked">
-    <div class="card-head">
-      <h2>{{ linked_title }}{% if is_stored %}<span class="cnt">{{ checks | length }}</span>{% endif %}</h2>
-      {% if is_stored %}
-      <div class="card-head-actions">
-        <button class="btn btn-sm" data-act="create-check">{{ '+ Add another' if checks else '+ Add health check' }}</button>
-      </div>
-      {% endif %}
-    </div>
-    <div class="card-body">
-      {% if is_stored and checks %}
-      <p class="card-note">
-        {{ 'This is a schedule' if checks | length == 1 else 'These are schedules' }} this group carries, so
-        {{ 'it tests' if checks | length == 1 else 'they test' }} whatever channels the group holds - there is one
-        channel list, not two. {{ 'It can' if checks | length == 1 else 'They can' }} be run, rescheduled or
-        removed without touching the group; removing {{ 'it' if checks | length == 1 else 'them all' }} leaves the
-        group relying on the automatic TV Guide check, which tests one member on its behalf and no others.
-      </p>
-      {% for c in checks %}
-      <div class="linked-item">
-        <span class="gd-kind">&#10003;</span>
-        <span class="li-name">{{ c.name }}</span>
-        <span class="badge {{ {'ok': 'b-done', 'bad': 'b-fail', 'warn': 'b-warn', 'run': 'b-running', 'none': 'b-abort'}[c.health_cls] }}">{{ c.health_label }}</span>
-        {% if c.profile_name %}<span class="grp-meta small">Profile: {{ c.profile_name }}</span>{% endif %}
-        <span class="li-actions">
-          <button class="btn btn-sm" data-act="run-linked-check" data-job="{{ c.job_id }}">Run now</button>
-          <a class="btn btn-sm" href="{{ c.detail_url }}">Open</a>
-        </span>
-      </div>
-      {% endfor %}
-      {% elif is_stored and inherited_check and not inherited_check.schedule_live %}
-      {# The automatic check's schedule can be removed like any other (changelog 1068), and
-         a group with no check of its own is then tested by nothing at all - which only this
-         card is in a position to say. #}
-      <p class="card-note">
-        This group carries no schedule of its own, and the automatic TV Guide check that would
-        otherwise test one member on its behalf is not scheduled{% if inherited_check.recur_paused %} - its schedule is paused{% endif %}.
-        Nothing is testing these channels. Add a health check here, or schedule the automatic one
-        again from <a href="{{ inherited_check.detail_url }}">{{ inherited_check.name }}</a>.
-      </p>
-      {% elif is_stored %}
-      <p class="card-note">
-        This group carries no schedule of its own. The automatic TV Guide check tests one member on
-        its behalf - the one currently serving the group - so a format drift on any other member
-        goes unnoticed until a recording lands on it.
-      </p>
-      {% else %}
-      <p class="card-note">
-        This is the automatic TV Guide health check. Its channel list is computed rather than stored:
-        one channel per guide row - a standalone channel, or the member currently serving a group's
-        row - plus one member of any group that carries no schedule of its own.
-      </p>
-      {% endif %}
     </div>
   </div>
 
@@ -530,16 +424,13 @@
       </div>
     </div>
     <div class="card-body">
-      {# Selection exists wherever there is a bulk verb to apply. A stored group always has
-         two of them (the participation switches); a check adds Test selected. #}
-      {% if has_check or is_stored %}
+      {# Selection exists wherever there is a bulk verb to apply. Every group's check gives
+         it Test selected; a stored group adds the two participation switches. #}
       <div class="gd-bulkbar">
         <label class="gd-bulk-lbl"><input type="checkbox" id="gd-select-all"> Select all visible</label>
         <span class="text-muted small" id="gd-sel-count">0 selected</span>
         <button class="btn btn-sm" id="gd-clear-selection" style="display:none;">Clear</button>
-        {% if has_check %}
         <button class="btn btn-primary btn-sm" id="gd-test-selected" disabled>&#9654; Test selected</button>
-        {% endif %}
         {% if is_stored %}
         {# Setting one switch 30 times is the work the columns exist to make cheap, so the
            selection gets the same two verbs a row does. Both go through the same route,
@@ -564,11 +455,6 @@
         <span class="gd-action-error" id="gd-bulk-error" style="display:none;"></span>
         <span class="text-muted small" id="gd-row-count" style="margin-left:auto;"></span>
       </div>
-      {% else %}
-      <div class="gd-bulkbar">
-        <span class="text-muted small" id="gd-row-count" style="margin-left:auto;"></span>
-      </div>
-      {% endif %}
       {# ── The phone's chrome (mockup 34, M2/M3/R6) ────────────────────────────
          The app's own .toolbar, so the chips take --ctl-h and the row gets the shared
          gap and margins - a bare .chip is 4px of padding and lands at ~28.5px, and it
@@ -588,10 +474,8 @@
                   data-tip="Sort.&#10;Choose the field the list is ordered by. Tapping the field it is already on flips the direction."></button>
           <button class="chip" id="gd-chip-filter" type="button"
                   data-tip="Filters.&#10;Participation, status, account and test age, plus which fields each card draws. The number is how many filters are on."></button>
-          {% if has_check or is_stored %}
           <button class="chip" id="gd-chip-select" type="button"
                   data-tip="Select.&#10;Turn on the checkboxes so an action can be applied to several members at once."></button>
-          {% endif %}
         </div>
       </div>
       {# One member per card below 768. Rendered by the same module and from the same rows
@@ -610,10 +494,9 @@
   <div class="card" data-section="activity">
     <div class="card-head"><h2>Activity timeline</h2></div>
     <div class="card-body">
-      {# What this list is scoped to. Entering by check URL narrows its health tests to
-         that check's runs; entering by group shows every check the group ran. Said
-         rather than inferred - a reader taking one check's page for a log of that
-         check's work is the defect this replaced (dev/changelog/790). #}
+      {# What this list is scoped to, said rather than inferred - a reader taking a page
+         for a log of one check's work alone is the defect this replaced
+         (dev/changelog/790). #}
       <p class="text-muted small">{{ timeline_scope }}</p>
       {% if not timeline_entries %}
       <p class="text-muted small">No activity recorded for this group yet.</p>
@@ -665,11 +548,6 @@
   {{ m.recur_schedule_fields('gdsched', 'Start Time', window_label) }}
 </template>
 
-{# Same macro again for the Create-health-check modal, with its own prefix: both modals
-   can be opened from this page, so the two sets of inputs must not share ids. #}
-<template id="cc-schedule-fields">
-  {{ m.recur_schedule_fields('ccsched', 'Start Time', window_label) }}
-</template>
 {% endblock %}
 
 {% block scripts %}
@@ -677,14 +555,11 @@
 window.GROUP_DETAIL = {
   groupId: {{ group.id }},
   groupName: {{ group.name | tojson }},
-  jobId: {{ job.id if has_check else 'null' }},
-  jobName: {{ (job.name if has_check else None) | tojson }},
-  jobStatus: {{ (job.status if has_check else None) | tojson }},
-  jobRecurring: {{ 'true' if has_check and job.recurring else 'false' }},
-  checks: {{ checks | tojson }},
-  linkedTitle: {{ linked_title | tojson }},
+  jobId: {{ job.id }},
+  jobName: {{ job.name | tojson }},
+  jobStatus: {{ job.status | tojson }},
+  jobRecurring: {{ 'true' if job.recurring else 'false' }},
   hasChannel: {{ 'true' if is_stored else 'false' }},
-  hasCheck: {{ 'true' if has_check else 'false' }},
   isSystem: {{ 'true' if is_system else 'false' }},
   inGuide: {{ 'true' if group.in_guide else 'false' }},
   secKey: {{ sec_key | tojson }},
@@ -710,8 +585,8 @@ window.GROUP_DETAIL = {
   fpsOptions: {{ fps_options | tojson }},
   schedule: {{ schedule | tojson }},
   profiles: [{% for p in health_check_profiles %}{ id: {{ p.id }}, name: {{ p.name | tojson }} }{{ ',' if not loop.last }}{% endfor %}],
-  profileId: {{ (job.profile_id if has_check else None) | tojson }},
-  profileName: {{ ((job.profile.name if job.profile else 'Default settings') if has_check else None) | tojson }},
+  profileId: {{ job.profile_id | tojson }},
+  profileName: {{ (job.profile.name if job.profile else 'Default settings') | tojson }},
   profilesUrl: {{ url_for('health_check_profiles.health_check_profiles_list') | tojson }},
   checkProfiles: {{ check_profiles | tojson }},
   inheritedCheck: {{ inherited_check | tojson }},
@@ -727,12 +602,9 @@ window.GROUP_DETAIL = {
 </script>
 <script src="{{ url_for('static', filename='js/format-plan.js') }}"></script>
 <script src="{{ url_for('static', filename='js/create-group-modal.js') }}"></script>
-<script src="{{ url_for('static', filename='js/format-picker-modal.js') }}"></script>
 {# §14.1's promotion walkthrough. After format-plan.js, whose helpers it renders with. #}
 <script src="{{ url_for('static', filename='js/group-promote-modal.js') }}"></script>
 <script src="{{ url_for('static', filename='js/schedule-fields.js') }}"></script>
-<script src="{{ url_for('static', filename='js/check-modal.js') }}"></script>
-<script src="{{ url_for('static', filename='js/clone-check-modal.js') }}"></script>
 <script src="{{ url_for('static', filename='js/clone-modal.js') }}"></script>
 <script src="{{ url_for('static', filename='js/dup-modal.js') }}"></script>
 <script src="{{ url_for('static', filename='js/missing-modal.js') }}"></script>

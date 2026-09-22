@@ -5,7 +5,8 @@ Guards the four things `dev/changelog/741` introduced that nothing else asserts:
   * **The three column defaults.** `recording_enabled` False and `test_enabled` True are
     what "a group is created as a health check and promoted deliberately" actually means
     (`dev/docs/DESIGN-channel-groups-model.md` §14), and `format_strategy` defaults to
-    `health_check_only` for the same reason. Getting any of them backwards silently makes
+    `highest_score` - whether the group records is read from the members, never from a
+    strategy value (`dev/changelog/1077`). Getting the switches backwards silently makes
     every new group a recording source nobody asked for.
   * **`format_strategy` is NOT NULL and validated server-side.** A NULL would put back the
     `is None` branch the NOT NULL removed, and an unvalidated value would store a strategy
@@ -19,10 +20,10 @@ Guards the four things `dev/changelog/741` introduced that nothing else asserts:
   * **`ChannelGroupEvent` cascade-deletes with its group**, per the
     teardown-releases-everything rule: the events are group-scoped and have nowhere else
     to belong.
-  * **Every surface reads "is this member sitting out" through one gate** - the group's
-    format_strategy, via `participation_is_recording()`. Reading a health_check_only
-    group through the Recording switch dims every row of every new group, since §14 says
-    a group is created with nothing recording-enabled (`dev/changelog/743`).
+  * **Every surface reads "is this member sitting out" through one gate** - whether any
+    member has Recording on, via `participation_is_recording()`. Reading a group nobody
+    records from through the Recording switch dims every row of every new group, since
+    §14 says a group is created with nothing recording-enabled (`dev/changelog/743`).
   * **No page tells a group it records when nothing does.** The detail page's description
     of itself is gated on the recording-enabled members - the set the recorder and the
     guide actually draw from - not on "this is not the system group"
@@ -41,7 +42,7 @@ from tests.support.seed import (make_account, make_channel, make_group,  # noqa:
 from app import db  # noqa: E402
 from app.channel_groups import FORMAT_STRATEGIES, FORMAT_STRATEGY_LABELS  # noqa: E402
 from app.database import (ChannelGroup, ChannelGroupMember, ChannelGroupEvent,  # noqa: E402
-                          GROUP_FORMAT_STRATEGIES, GROUP_FORMAT_HEALTH_CHECK_ONLY,
+                          GROUP_FORMAT_STRATEGIES,
                           GROUP_FORMAT_HIGHEST_SCORE, GROUP_MEMBER_PARTICIPATION,
                           GROUP_FORMAT_STRATEGY_APPLIED)
 
@@ -57,11 +58,11 @@ class SchemaDefaultsTests(unittest.TestCase):
         self.ctx.pop()
         self.t.cleanup()
 
-    def test_a_new_group_is_health_check_only(self):
+    def test_a_new_group_carries_the_default_strategy(self):
         grp = ChannelGroup(name='Fresh')
         db.session.add(grp)
         db.session.commit()
-        self.assertEqual(GROUP_FORMAT_HEALTH_CHECK_ONLY, grp.format_strategy)
+        self.assertEqual(GROUP_FORMAT_HIGHEST_SCORE, grp.format_strategy)
 
     def test_a_new_member_starts_recording_off_and_health_check_on(self):
         ch = make_channel(self.acct, name='Feed')
@@ -104,9 +105,9 @@ class SchemaDefaultsTests(unittest.TestCase):
                     db.session.commit()
                 db.session.rollback()
 
-    def test_the_value_list_is_the_eight_the_design_doc_names(self):
+    def test_the_value_list_is_the_seven_the_design_doc_names(self):
         self.assertEqual(
-            ('health_check_only', 'highest_score', 'highest_bitrate', 'highest_resolution',
+            ('highest_score', 'highest_bitrate', 'highest_resolution',
              'most_channels', 'balanced', 'manual', 'unmanaged'),
             GROUP_FORMAT_STRATEGIES)
 
@@ -206,8 +207,27 @@ class FormatStrategyRouteTests(unittest.TestCase):
                                 json={'strategy': 'whatever_sounds_best'})
         self.assertEqual(400, resp.status_code)
         db.session.expire_all()
-        self.assertEqual(GROUP_FORMAT_HEALTH_CHECK_ONLY,
+        self.assertEqual(GROUP_FORMAT_HIGHEST_SCORE,
                          db.session.get(ChannelGroup, self.grp.id).format_strategy)
+
+    def test_a_group_nobody_records_from_is_refused_and_pointed_at_the_walkthrough(self):
+        """dev/changelog/1077: Settings edits a group that records; the walkthrough
+        promotes one. Both Settings-side format writers refuse with `needs_promotion`
+        while no member has Recording on, so a strategy can never be stored for a group
+        that would then be told to "turn Recording on for at least one member"."""
+        for m in self.grp.memberships:
+            m.recording_enabled = False  # participation-write-ok: test fixture setup
+        db.session.commit()
+        for path, body in (('format-strategy', {'strategy': 'highest_bitrate'}),
+                           ('format', {'resolution': '1920x1080', 'fps': 60})):
+            with self.subTest(path=path):
+                resp = self.client.post(f'/api/channel-groups/{self.grp.id}/{path}', json=body)
+                self.assertEqual(409, resp.status_code, resp.get_json())
+                self.assertTrue(resp.get_json()['needs_promotion'])
+        db.session.expire_all()
+        grp = db.session.get(ChannelGroup, self.grp.id)
+        self.assertEqual(GROUP_FORMAT_HIGHEST_SCORE, grp.format_strategy)
+        self.assertIsNone(grp.locked_format_key)
 
 
 class LockFiltersRatherThanUnticksTests(unittest.TestCase):
@@ -304,8 +324,8 @@ class ParticipationDisplayGateTests(unittest.TestCase):
         self.t.cleanup()
 
     def _fresh_group(self):
-        """A group in its documented starting state: health_check_only, nothing
-        recording-enabled, every member health-checked."""
+        """A group in its documented starting state: nothing recording-enabled, every
+        member health-checked."""
         chans = [make_channel(self.acct, name='Feed A'), make_channel(self.acct, name='Feed B')]
         grp = make_group(name='Brand New', members=chans, in_guide=False, recording=False)
         db.session.commit()
@@ -428,11 +448,13 @@ class GroupEventTimelineTests(unittest.TestCase):
 
 class FormatStrategyEventTests(unittest.TestCase):
     """dev/docs/BUGS.md 2026-08-19 11:32 - `GROUP_FORMAT_STRATEGY_APPLIED` was declared and
-    never written by anything, so the one route that actually moves a group's format lock
-    in response to a strategy (`apply_format_plan`) left no trace of it. §4.5 says that
-    event carries the old format, the new format, the strategy that chose it and the
-    numbers behind it, and that the numbers are `_format_strategy_entry()`'s own
-    `rationale` rather than a second wording of the same decision."""
+    never written by anything, so moving a group's format lock in response to a strategy
+    left no trace of it. §4.5 says that event carries the old format, the new format, the
+    strategy that chose it and the numbers behind it, and that the numbers are
+    `_format_strategy_entry()`'s own `rationale` rather than a second wording of the same
+    decision. Since dev/changelog/1077 the Settings modal's strategy route is the one
+    hand-driven writer (the Pick best format modal is gone); the nightly re-evaluation is
+    the other."""
 
     def setUp(self):
         self.t = make_test_app()
@@ -458,9 +480,9 @@ class FormatStrategyEventTests(unittest.TestCase):
         self.ctx.pop()
         self.t.cleanup()
 
-    def _apply(self, strategy='most_channels', non_matching='keep'):
-        resp = self.client.post(f'/api/channel-groups/{self.grp.id}/apply-format-plan',
-                                json={'strategy': strategy, 'non_matching': non_matching})
+    def _apply(self, strategy='most_channels'):
+        resp = self.client.post(f'/api/channel-groups/{self.grp.id}/format-strategy',
+                                json={'strategy': strategy})
         self.assertEqual(200, resp.status_code, resp.get_json())
         return resp
 
@@ -474,7 +496,7 @@ class FormatStrategyEventTests(unittest.TestCase):
         return html[start:] if start != -1 else ''
 
     def _rationale(self, strategy='most_channels'):
-        """The picker's own sentence for this strategy, recomputed the way the route does -
+        """The engine's own sentence for this strategy, recomputed the way the route does -
         asserting against a hand-typed copy would pass even if the event wrote its own."""
         from app.channel_groups import plan_format_selection
         from app.routes.channel_tests import _latest_tests_by_channel
@@ -501,21 +523,21 @@ class FormatStrategyEventTests(unittest.TestCase):
         self.assertIn('Format Strategy Applied', timeline)
 
     def test_the_detail_names_the_format_the_lock_moved_from(self):
+        """The nightly re-evaluation's case: a standing strategy whose lock was written
+        by an earlier evaluation and no longer matches the data."""
+        from app.channel_groups import apply_format_strategy
         grp = db.session.get(ChannelGroup, self.grp.id)
+        grp.format_strategy = 'most_channels'
         grp.set_locked_format('1280x720', 30)
         db.session.commit()
-        self._apply()
+        apply_format_strategy(grp)
         self.assertIn('moved from 1280x720 @ 30 to 1920x1080 @ 60', self._event().detail)
+        self.assertEqual(['1280x720', 30], json.loads(self._event().extra_data)['from'])
 
-    def test_removing_the_non_matching_members_is_counted_in_the_same_event(self):
-        self._apply(non_matching='remove')
-        ev = self._event()
-        self.assertIn('1 non-matching member removed', ev.detail)
-        self.assertEqual(1, json.loads(ev.extra_data)['removed'])
-
-    def test_every_strategy_has_a_label_matching_the_pickers(self):
-        """The detail names the strategy in the same words the format picker offered it
-        under; a key with no label would put a bare `highest_bitrate` in front of the user."""
+    def test_every_strategy_has_a_label_matching_the_dropdowns(self):
+        """The detail names the strategy in the same words the Settings dropdown offered
+        it under; a key with no label would put a bare `highest_bitrate` in front of the
+        user."""
         self.assertEqual(set(FORMAT_STRATEGIES), set(FORMAT_STRATEGY_LABELS))
         js = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                           'static', 'js', 'format-plan.js')
@@ -640,9 +662,9 @@ class DetailPageSelfDescriptionTests(unittest.TestCase):
     the guide both draw from `recording_members()` and would find nobody.
 
     The gate is the recording-enabled members, not `format_strategy`: a promoted group
-    with nobody enabled records nothing either, so `participation_is_recording()` - which
-    answers a different question, which switch a member ROW is drawn by - would only have
-    narrowed the false claim."""
+    with nobody enabled records nothing either. Since dev/changelog/1077 that is the one
+    definition of "records" everywhere - `participation_is_recording()` reads the same
+    fact - so the two can no longer disagree."""
 
     def setUp(self):
         self.t = make_test_app()
@@ -681,7 +703,7 @@ class DetailPageSelfDescriptionTests(unittest.TestCase):
         return [make_channel(self.acct, name='Feed A'), make_channel(self.acct, name='Feed B')]
 
     def _fresh(self, in_guide=False, **kw):
-        """The documented starting state: health_check_only, nothing recording-enabled."""
+        """The documented starting state: nothing recording-enabled."""
         grp = make_group(name='Brand New', members=self._members(), in_guide=in_guide,
                          recording=False, **kw)
         db.session.commit()
@@ -712,14 +734,11 @@ class DetailPageSelfDescriptionTests(unittest.TestCase):
         self.assertNotIn('Records the best', lead)
         self.assertNotIn('records with failover', lead)
 
-    def test_a_fresh_group_with_a_check_says_the_check_is_what_it_does(self):
+    def test_a_fresh_group_says_the_check_is_what_it_does(self):
         grp = self._fresh()
-        job = make_test_job(name='Nightly', channels=[])
-        job.group_id = grp.id
-        db.session.commit()
         lead = self._lead(grp)
         self.assertNotIn('records with failover', lead)
-        self.assertIn('testing those feeds on a schedule', lead)
+        self.assertIn('testing those feeds on its schedule', lead)
 
     def test_a_promoted_group_with_nobody_enabled_still_does_not_claim_to_record(self):
         """The state that decided the gate: `format_strategy` is a real recording
@@ -730,13 +749,14 @@ class DetailPageSelfDescriptionTests(unittest.TestCase):
         self.assertIn('no member enabled for recording', lead)
 
     def test_a_group_in_the_guide_with_nobody_enabled_says_the_guide_has_no_row(self):
-        """_guide_row_entries() skips a group whose recording_members() is empty, so the
-        status bar's "Recording from the best channel" was a claim about a row the guide
-        does not draw."""
+        """_guide_row_entries() skips a group whose recording_members() is empty, so a
+        claim to be "Recording from the best channel" would be about a row the guide does
+        not draw. The status bar is the check's now (dev/changelog/1077); the breach is
+        said by the broken-row banner, which reads `guide_broken` off the page's facts."""
         grp = self._fresh(in_guide=True)
-        msg = self._status_msg(grp)
-        self.assertNotIn('Recording from the best channel', msg)
-        self.assertIn('draws no row', msg)
+        html = self._page(grp)
+        self.assertNotIn('Recording from the best channel', html)
+        self.assertIn('"guide_broken": true', html)
 
     def test_the_title_icon_tooltip_makes_the_same_claim_as_the_lead(self):
         tip = self._icon_tip(self._fresh())
@@ -748,13 +768,17 @@ class DetailPageSelfDescriptionTests(unittest.TestCase):
         is here so a later change cannot make the fresh-group copy honest by taking the
         recording group's own description away from it."""
         lead = self._lead(self._promoted())
-        self.assertIn('fails over to the next-best feed', lead)
+        self.assertIn('records with failover', lead)
         self.assertNotIn('no member enabled for recording', lead)
 
     def test_a_group_that_records_and_is_in_the_guide_still_says_so(self):
-        """Characterization, same reason: the status-bar branch that was correct."""
+        """Characterization, same reason: the page names the guide row and says the
+        group records, and the broken-row fact is false."""
         grp = self._promoted(in_guide=True)
-        self.assertIn('Recording from the best channel', self._status_msg(grp))
+        html = self._page(grp)
+        self.assertIn('>In Guide</span>', html)
+        self.assertIn('records with failover', self._lead(grp))
+        self.assertIn('"guide_broken": false', html)
 
 
 class FreshDatabaseOnlyMigrationTests(unittest.TestCase):

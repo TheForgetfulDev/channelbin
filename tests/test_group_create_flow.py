@@ -79,12 +79,15 @@ class NamelessCreateTests(_Base):
         self.assertIsNone(
             ChannelGroup.query.filter_by(name='Fox Sports 1 - health check').first())
 
-    def test_attaching_to_an_existing_group_derives_from_that_group(self):
+    def test_attaching_to_an_existing_group_is_refused_because_it_already_has_one(self):
+        """dev/changelog/1077: every group carries its one check, so the attach shape is
+        answered with the group's page rather than a second job."""
         group = seed.make_group(name='Already Here', members=self.chans)
+        before = len(self._jobs())
         resp = self.client.post('/api/channel-tests/on-demand',
                                 json={'attach_group_id': group.id, 'action': 'queue'})
-        self.assertEqual(resp.status_code, 200)
-        self.assertEqual(self._jobs()[0].name, 'Already Here - health check')
+        self.assertEqual(resp.status_code, 409)
+        self.assertEqual(len(self._jobs()), before)
 
     def test_a_request_with_neither_is_still_refused(self):
         """Nothing to derive from is the one unanswerable case, and it is the only one
@@ -94,12 +97,19 @@ class NamelessCreateTests(_Base):
         self.assertEqual(resp.status_code, 400)
         self.assertIn('name', resp.get_json()['error'].lower())
 
-    def test_an_explicit_name_still_wins(self):
+    def test_an_explicit_name_names_the_group_when_there_is_no_group_name(self):
         """The ad hoc "Test this channel" path has no group to derive from and still sends
-        its own name; nothing about it changed."""
+        its own name: that name becomes the minted group's, and the check is named after
+        the group like every check (dev/changelog/1077)."""
+        resp = self._create(name='2026-08-27 09:15 - fox', group_name=None)
+        self.assertEqual(resp.status_code, 200)
+        self.assertIsNotNone(ChannelGroup.query.filter_by(name='2026-08-27 09:15 - fox').first())
+        self.assertEqual(self._jobs()[0].name, '2026-08-27 09:15 - fox - health check')
+
+    def test_the_group_name_wins_over_an_explicit_name(self):
         resp = self._create(name='2026-08-27 09:15 - fox')
         self.assertEqual(resp.status_code, 200)
-        self.assertEqual(self._jobs()[0].name, '2026-08-27 09:15 - fox')
+        self.assertEqual(self._jobs()[0].name, 'Fox Sports 1 - health check')
 
 
 class MintedGroupTests(_Base):
@@ -133,11 +143,12 @@ class MintedGroupTests(_Base):
     def test_a_name_already_taken_is_refused_rather_than_duplicated(self):
         """POST /api/channel-groups refuses a collision; this path silently made a second
         group whose name already meant something else."""
-        seed.make_group(name='Fox Sports 1', members=self.chans[:1])
+        existing = seed.make_group(name='Fox Sports 1', members=self.chans[:1])
         resp = self._create()
         self.assertEqual(resp.status_code, 409)
         self.assertEqual(ChannelGroup.query.filter_by(name='Fox Sports 1').count(), 1)
-        self.assertEqual(self._jobs(), [])
+        self.assertEqual([j.id for j in self._jobs()], [existing.check.id],
+                         'only the existing group\'s own check; nothing was minted')
 
     def test_the_collision_check_is_case_insensitive_like_the_other_path(self):
         seed.make_group(name='fox sports 1', members=self.chans[:1])
@@ -156,11 +167,11 @@ class CreateResponseTests(_Base):
         self.assertEqual(data['group_name'], 'Fox Sports 1')
         self.assertEqual(data['detail_url'], f'/channel-groups/{group.id}')
 
-    def test_the_response_carries_the_group_it_attached_to(self):
+    def test_the_refusal_carries_the_page_of_the_group_that_already_has_a_check(self):
         group = seed.make_group(name='Already Here', members=self.chans)
         data = self.client.post('/api/channel-tests/on-demand',
                                 json={'attach_group_id': group.id, 'action': 'queue'}).get_json()
-        self.assertEqual(data['group_id'], group.id)
+        self.assertEqual(data['detail_url'], f'/channel-groups/{group.id}')
 
     def test_a_scheduled_create_still_carries_it(self):
         """The flow's recommended path is a recurring schedule, so this is the branch the

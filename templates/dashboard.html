@@ -68,11 +68,14 @@
    rows this render already read. GUIDE_CONFIG's pattern. #}
 <script type="application/json" id="dash-timeline">{{ timeline | tojson }}</script>
 <script type="application/json" id="dash-sections-pref">{{ {'key': section_pref_key, 'order': section_order, 'on': section_on, 'defs': section_defs} | tojson }}</script>
-{#- The one status -> label table (app/fmt_utils.py), handed to dashboard.js so an SSE
-    relabel uses the same words the server rendered rather than a second, hand-written
-    copy that can drift from it (dev/changelog/961). -#}
-<script type="application/json" id="dash-status-labels">{{ rec_status_labels | tojson }}</script>
-<script type="application/json" id="dash-waiting-label">{{ rec_waiting_label | tojson }}</script>
+{#- The status -> label table an SSE relabel needs is no longer emitted here: base.html
+    serves it to every page as the `rec-status-labels` meta tag, because the TV Guide needs
+    the same words and was spelling its own (dev/changelog/1083). -#}
+{#- Which background-task row means "a health check is running", from the server's own
+    vocabulary (app/routes/dashboard.py). dashboard.js swaps the health section when this
+    kind appears in or leaves /api/nav-status's task list, and keying that on the row's
+    display LABEL would break the moment somebody reworded it (dev/changelog/1082). -#}
+<script type="application/json" id="dash-bg-health-kind">{{ bg_health_kind | tojson }}</script>
 
 <div class="dash-pulse">
   {% for m in metrics %}
@@ -87,7 +90,11 @@
 
 <div id="dash-sections">
 {% for key in section_order %}
-  <div class="dash-sec" data-sec="{{ key }}"{% if not section_on[key] %} hidden{% endif %}>
+  {#- data-sync-sig is what dashboard.js compares /api/nav-status's account_sync against to
+      know these rows have gone stale, exactly as #acct-live does on /accounts. It rides on
+      the section node itself because that node is what gets swapped, so the swapped-in copy
+      carries the signature it was rendered at rather than inheriting the old one. -#}
+  <div class="dash-sec" data-sec="{{ key }}"{% if key == 'accounts' %} data-sync-sig="{{ sync_sig }}"{% endif %}{% if not section_on[key] %} hidden{% endif %}>
 
   {#- ── Timeline (16.3). Its body is drawn by dashboard.js from the blob above,
         because every bar is positioned in pixels off a scale only the client

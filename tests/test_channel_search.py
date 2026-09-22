@@ -956,10 +956,9 @@ class MonitoredFilterTests(_EngineTestCase):
         """An active recurring check on `group`. All three conditions matter -
         `channel_groups.active_recurring_jobs()` counts a job only when it is recurring,
         SCHEDULED and not paused."""
-        job = OnDemandTestJob(name=f'{group.name} check', group_id=group.id, status=status,
-                              recurring=recurring, recur_paused=paused, recur_day=0,
-                              recur_hour=3, recur_minute=0)
-        db.session.add(job)
+        job = seed.set_check(group, name=f'{group.name} check', status=status,
+                             recurring=recurring, recur_paused=paused, recur_day=0,
+                             recur_hour=3, recur_minute=0)
         db.session.commit()
         return job
 

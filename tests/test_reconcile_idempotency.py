@@ -25,7 +25,7 @@ from app.channel_groups import plan_reconcile, _log_and_alert_reconcile  # noqa:
 from app.database import (  # noqa: E402
     Channel, ChannelGroup, ChannelGroupMember, ChannelEvent, ChannelGroupEvent, Alert,
     CHANNEL_GROUP_FORMAT_MISMATCH, CHANNEL_GROUP_FORMAT_RESOLVED,
-    GROUP_FORMAT_HIGHEST_SCORE, GROUP_FORMAT_HEALTH_CHECK_ONLY,
+    GROUP_FORMAT_HIGHEST_SCORE,
 )
 from tests.support import make_test_app  # noqa: E402
 
@@ -47,10 +47,9 @@ class ReconcileIdempotencyTests(unittest.TestCase):
     def setUp(self):
         self.t = make_test_app()
 
-        # highest_score, not the health_check_only default: DESIGN-channel-groups-model.md
-        # 16 gates every format warning on the group being a recording source, so a
-        # default-strategy group deliberately logs nothing at all (see
-        # FormatWarningGateTests below).
+        # DESIGN-channel-groups-model.md 16 gates every format warning on the group being
+        # a recording source - a member with Recording on - so the memberships below are
+        # recording-enabled (see FormatWarningGateTests for the other case).
         self.group = ChannelGroup(name='Test Group',
                                   format_strategy=GROUP_FORMAT_HIGHEST_SCORE)
         db.session.add(self.group)
@@ -235,8 +234,9 @@ class CrossGroupStateTests(unittest.TestCase):
 
 class FormatWarningGateTests(unittest.TestCase):
     """DESIGN-channel-groups-model.md 16: every format warning is gated on the group
-    being a recording source (format_strategy != health_check_only). Part E was not,
-    which is how a health-check-only group came to have opinions about formats."""
+    being a recording source - at least one member with Recording on, never a strategy
+    value (dev/changelog/1077). Part E was not, which is how a group nobody records
+    from came to have opinions about formats."""
 
     def setUp(self):
         self.t = make_test_app()
@@ -247,14 +247,14 @@ class FormatWarningGateTests(unittest.TestCase):
         db.session.add_all([self.ref_ch, self.outlier])
         db.session.flush()
         self.group = ChannelGroup(name='Checks only',
-                                  format_strategy=GROUP_FORMAT_HEALTH_CHECK_ONLY)
+                                  format_strategy=GROUP_FORMAT_HIGHEST_SCORE)
         db.session.add(self.group)
         db.session.flush()
         db.session.add_all([
             ChannelGroupMember(group_id=self.group.id, channel_id=self.ref_ch.id,
-                               position=0, recording_enabled=True),
+                               position=0, recording_enabled=False),
             ChannelGroupMember(group_id=self.group.id, channel_id=self.outlier.id,
-                               position=1, recording_enabled=True),
+                               position=1, recording_enabled=False),
         ])
         db.session.commit()
         self.latest = {self.ref_ch.id: FakeTest(HD), self.outlier.id: FakeTest(SD)}
@@ -268,7 +268,7 @@ class FormatWarningGateTests(unittest.TestCase):
         diff = plan_reconcile(self.group, memberships, self.latest)
         _log_and_alert_reconcile(self.group, members, self.latest, diff)
 
-    def test_health_check_only_group_logs_no_format_events_or_alerts(self):
+    def test_a_group_nobody_records_from_logs_no_format_events_or_alerts(self):
         self._reconcile()
         self.assertEqual(
             ChannelGroupEvent.query.filter(ChannelGroupEvent.event_type.in_(
@@ -297,8 +297,7 @@ class FormatWarningGateTests(unittest.TestCase):
             Alert.query.filter(Alert.alert_type == 'GROUP_FORMAT_MISMATCH',
                                Alert.dismissed_at.is_(None)).count(), 1)
 
-        self.group.format_strategy = GROUP_FORMAT_HEALTH_CHECK_ONLY
-        db.session.commit()
+        # Already recording from nobody (setUp); the straggler is the pre-928 row above.
         self._reconcile()
         self.assertEqual(
             Alert.query.filter(Alert.alert_type == 'GROUP_FORMAT_MISMATCH',

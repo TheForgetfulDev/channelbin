@@ -31,6 +31,9 @@ from unittest import mock  # noqa: E402
 from tests.support.app import make_test_app  # noqa: E402
 from tests.support import seed  # noqa: E402
 from app import db, channel_tester  # noqa: E402
+from app.database import (  # noqa: E402
+    OD_JOB_STATUS_QUEUED, OD_JOB_STATUS_COMPLETED, OD_JOB_STATUS_CANCELLED,
+)
 
 
 def _cfg(within_minutes=10):
@@ -378,21 +381,23 @@ class ManualRunNowGuardTests(unittest.TestCase):
         run_spy.assert_called_once()
         self.assertTrue(run_spy.call_args.kwargs.get('force'))
 
-    # -- restart --
+    # -- start, from a terminal status (the old /restart route, dev/changelog/1076) --
 
-    def test_restart_refuses_when_conflicted(self):
-        job = seed.make_test_job(name='J', channels=[self.channel], status='COMPLETED')
+    def test_start_from_completed_refuses_when_conflicted(self):
+        job = seed.make_test_job(name='J', channels=[self.channel],
+                                 status=OD_JOB_STATUS_COMPLETED)
         db.session.commit()
         with self._conflicted('Reactor is melting.'):
-            resp, run_spy = self._post(f'/api/channel-tests/on-demand/{job.id}/restart')
+            resp, run_spy = self._post(f'/api/channel-tests/on-demand/{job.id}/start')
         self.assertEqual(resp.status_code, 409)
         run_spy.assert_not_called()
 
-    def test_restart_force_bypasses_the_refusal(self):
-        job = seed.make_test_job(name='J', channels=[self.channel], status='COMPLETED')
+    def test_start_from_completed_force_bypasses_the_refusal(self):
+        job = seed.make_test_job(name='J', channels=[self.channel],
+                                 status=OD_JOB_STATUS_COMPLETED)
         db.session.commit()
         with self._conflicted():
-            resp, run_spy = self._post(f'/api/channel-tests/on-demand/{job.id}/restart', force=True)
+            resp, run_spy = self._post(f'/api/channel-tests/on-demand/{job.id}/start', force=True)
         self.assertEqual(resp.status_code, 200)
         run_spy.assert_called_once()
         self.assertTrue(run_spy.call_args.kwargs.get('force'))
@@ -403,17 +408,20 @@ class ManualRunNowGuardTests(unittest.TestCase):
         """Patching the module-level helper must be enough to change every route's
         behavior - if a route had its own copy of the conflict logic, this would pass
         nothing for that route."""
-        jobs = {
-            'start': seed.make_test_job(name='S', channels=[self.channel], status='QUEUED'),
-            'resume': seed.make_test_job(name='R', channels=[self.channel], status='CANCELLED'),
-            'restart': seed.make_test_job(name='X', channels=[self.channel], status='COMPLETED'),
-        }
+        cases = [
+            ('start', seed.make_test_job(name='S', channels=[self.channel],
+                                         status=OD_JOB_STATUS_QUEUED)),
+            ('start', seed.make_test_job(name='X', channels=[self.channel],
+                                         status=OD_JOB_STATUS_COMPLETED)),
+            ('resume', seed.make_test_job(name='R', channels=[self.channel],
+                                          status=OD_JOB_STATUS_CANCELLED)),
+        ]
         db.session.commit()
         with self._conflicted('injected') as helper:
-            for action, job in jobs.items():
+            for action, job in cases:
                 resp, run_spy = self._post(f'/api/channel-tests/on-demand/{job.id}/{action}')
                 self.assertEqual(resp.status_code, 409, f'{action} did not honor the helper')
-        self.assertEqual(helper.call_count, len(jobs))
+        self.assertEqual(helper.call_count, len(cases))
 
 
 if __name__ == '__main__':

@@ -244,7 +244,10 @@
   }
 
   let CAT = null;                            // the catalog, once fetched
-  const emptyResult = () => ({ rows: [], total: 0, pages: 1, standingHidden: {}, degraded: '' });
+  // `channelsMatched: null` is stated rather than left undefined: null is this number's
+  // "not in yet", and the count line branches on exactly that.
+  const emptyResult = () => ({ rows: [], total: 0, pages: 1, standingHidden: {},
+                               channelsMatched: null, degraded: '' });
   let last = emptyResult();
   /* Is what is on screen an honest answer to the question currently being asked?
      True from boot (nothing has been fetched yet), true again whenever the rows in
@@ -711,6 +714,11 @@
           // single blended number over two tables is the one the reader could not
           // explain (DESIGN-group-search-rows.md 5.2).
           channelTotal: data.channel_total, groupTotal: data.group_total || 0,
+          /* How many distinct channels the airing rows sit on. `|| 0` would be wrong here:
+             null means the number is not in yet (the airing grain's row request skips the
+             whole breakdown), and a zero would read as "these airings are on no channels" -
+             which the rows on screen already disprove. */
+          channelsMatched: typeof data.channels_matched === 'number' ? data.channels_matched : null,
           standingHidden: data.standing_hidden, degraded: data.degraded || '',
         };
         /* The server declines the counts itself while the index is unusable, whatever this
@@ -780,6 +788,8 @@
         last.pages = data.pages;
         last.channelTotal = data.channel_total;
         last.groupTotal = data.group_total || 0;
+        last.channelsMatched = typeof data.channels_matched === 'number'
+          ? data.channels_matched : null;
         last.standingHidden = data.standing_hidden;
         // A 200 that declined is not a failure and not a pending state - the total is
         // simply not coming for this search, and renderCount() has to stop promising it.
@@ -2352,6 +2362,32 @@
     const from = (state.page - 1) * state.pageSize + 1;
     const to = countsMissing ? last.rows.length : Math.min(total, state.page * state.pageSize);
     const parts = [];
+    /* HOW MANY CHANNELS THESE AIRINGS ARE ON - the airing grain's number, and the one thing
+       neither number on this line used to answer: the total counts showings, and the library
+       size beside it is the same figure whatever you searched for. So the two are folded into
+       one phrase, "of 1,240 airings on 37 of 136,130 channels", rather than sitting side by
+       side as two channel numbers meaning different things. The library size is kept, not
+       dropped: it is deliberately the denominator on both grains (see headCount()), and
+       reading it as a denominator is what makes the pair legible.
+
+       Counted over the rows this search SHOWS, so "Collapse channel groups" and "One row per
+       channel" narrow it exactly as they narrow the total - a pair taken either side of the
+       collapse could not be reconciled by the person reading it (dev/changelog/1080).
+
+       Null whenever the total is: they come from the same query, so there is no state where
+       one is pending and the other is not. When it is missing the line falls back to the
+       plain "N channels total" below, which is what it said before this existed. */
+    const airings = isAirings();
+    const library = CAT ? CAT.total_channels : null;
+    const matched = last.channelsMatched;
+    const haveMatched = airings && !resultsPending && !countsMissing
+      && typeof matched === 'number' && typeof library === 'number';
+    const onChannels = !haveMatched ? '' : ` on <span class="onchans" data-tip="${tipAttr(
+      `These ${nf(total)} airing${total === 1 ? '' : 's'} sit on ${nf(matched)} of the `
+      + `${nf(library)} channel${library === 1 ? '' : 's'} in your library.\n\nCounted over the `
+      + 'rows this search shows, so the standing options that collapse rows together narrow '
+      + 'this the same way they narrow the total.')}"><strong>${nf(matched)}</strong> of `
+      + `${nf(library)}</span> channel${library === 1 ? '' : 's'}`;
     /* "No matches" is a claim about data nobody has yet, and the previous range is
        about a question no longer on screen. Only the three response-derived parts are
        gated here - the sort note, the scope line and the DUP back button below are
@@ -2376,10 +2412,21 @@
       : countsFailed ? `Showing these <strong>${nf(to)}</strong> <span class="uncounted" data-tip="${tipAttr(
         `The total could not be counted.\nReason: ${countsFailed}`
         + '\n\nThe rows shown are complete and correct.')}">&#9888; total not counted</span>`
+      /* "airings" rather than "matches" on this grain: the noun is what says WHAT was
+         counted, and it is the half of the confusion the channel count cannot fix on its
+         own. The channel grain keeps "matches", where a row may be a channel or a group and
+         no single noun covers both. */
       : (total
-        ? `Showing <strong>${nf(from)}-${nf(to)}</strong> of <strong>${nf(total)}</strong> match${total === 1 ? '' : 'es'}`
+        ? `Showing <strong>${nf(from)}-${nf(to)}</strong> of <strong>${nf(total)}</strong> `
+          + (airings ? `airing${total === 1 ? '' : 's'}` : `match${total === 1 ? '' : 'es'}`)
+          + onChannels
         : '<strong>No</strong> matches'));
-    if (CAT) parts.push(`<span class="sep">&middot;</span> ${nf(CAT.total_channels)} channels total`);
+    // Skipped when the phrase above already carries it as its denominator, so the line never
+    // shows two channel numbers at once. Still shown while the count is pending, declined or
+    // failed - the library size is known from first paint and is not what was too expensive.
+    if (CAT && !haveMatched) {
+      parts.push(`<span class="sep">&middot;</span> ${nf(CAT.total_channels)} channels total`);
+    }
 
     /* WHAT THIS SHAPE COSTS THE COUNTS, said here rather than left to be noticed. A group
        row is a different table with a different primary key, so it is counted in `total`
@@ -5083,12 +5130,10 @@
       testerBusy: CFG.testerBusy,
       scheduleTemplateId: 'cc-schedule-fields',
       schedulePrefix: 'browsesched',
-      allowAttachExisting: true,
-      // check-modal.js already toasts the accurate outcome itself - "created" for a new
-      // check, "N channel(s) added" for an existing one - before calling onDone(). This
+      // check-modal.js already toasts the outcome itself before calling onDone(). This
       // page doesn't reload (unlike most other openCreateCheckModal callers), so onDone
       // must stay a no-op rather than fall through to the default reload, and must not
-      // toast again itself or it stomps whichever message check-modal.js just showed.
+      // toast again itself or it stomps the message check-modal.js just showed.
       onDone: () => {},
     });
   }

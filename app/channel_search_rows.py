@@ -70,7 +70,7 @@ from .channel_search import (FIELDS, GRAIN_AIRINGS, GRAIN_CHANNELS,
                              matching_programs, tag_hit_predicate)
 from .logo_cache import resolve_logo_url
 from .database import (Channel, ChannelGroup, ChannelGroupMember, EPGEntry,
-                       GROUP_FORMAT_HEALTH_CHECK_ONLY, Recording,
+                       Recording,
                        REC_STATUS_IN_PROGRESS, REC_STATUS_PAUSED, REC_STATUS_RETRYING,
                        REC_STATUS_CONCATENATING, REC_STATUS_ANALYZING, REC_STATUS_CONVERTING,
                        REC_STATUS_COMPLETED,
@@ -278,8 +278,10 @@ def build_group_rows(groups, ctx) -> list:
             # setting the user made (dev/changelog/762).
             'format_label': format_label(locked) if locked else '',
             # Not a recording source at all, so the row offers no Record and says why rather
-            # than drawing a dead button (DESIGN-channel-groups-model.md DECIDED 2).
-            'check_only': group.format_strategy == GROUP_FORMAT_HEALTH_CHECK_ONLY,
+            # than drawing a dead button (DESIGN-channel-groups-model.md DECIDED 2). The one
+            # definition of "records": a member has Recording on - never the strategy
+            # (channel_groups.participation_is_recording, dev/changelog/1077).
+            'check_only': recording_count == 0,
             'serving': None if serving is None else {'id': serving.id, 'name': serving.name},
             # Read from the serving member, because that is the feed this row would open.
             'airing': None if serving is None else airing.get(serving.id),

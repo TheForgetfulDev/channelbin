@@ -192,7 +192,7 @@ class DupBannerRenderTests(unittest.TestCase):
     def _detail_body(self, channels, disabled=()):
         job = seed.make_test_job(channels=channels, disabled=disabled)
         db.session.commit()
-        resp = self.t.client.get(f'/channels/health-checks/{job.id}')
+        resp = self.t.client.get(f'/channel-groups/{job.group_id}')
         self.assertEqual(resp.status_code, 200)
         return resp.get_data(as_text=True)
 

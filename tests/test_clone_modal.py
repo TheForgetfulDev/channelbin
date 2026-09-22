@@ -20,7 +20,6 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from tests.support.app import make_test_app  # noqa: E402
 from tests.support import seed  # noqa: E402
 from app import db  # noqa: E402
-from app.database import OnDemandTestJob  # noqa: E402
 from app.routes.channel_groups import clone_info  # noqa: E402
 
 
@@ -36,7 +35,7 @@ class CloneKebabTests(unittest.TestCase):
         ch = seed.make_channel(self.acc, stream_id=1, name='Solo')
         job = seed.make_test_job(channels=[ch])
         db.session.commit()
-        body = self.t.client.get(f'/channels/health-checks/{job.id}').get_data(as_text=True)
+        body = self.t.client.get(f'/channel-groups/{job.group_id}').get_data(as_text=True)
         self.assertEqual(body.count('data-act="clone"'), 1)
         self.assertNotIn('data-act="clone-check"', body)
 
@@ -52,8 +51,7 @@ class CloneKebabTests(unittest.TestCase):
         # the kebab must offer exactly one Clone, not one per role.
         ch = seed.make_channel(self.acc, stream_id=1, name='Solo')
         grp = seed.make_group(name='Pair Group', members=[ch])
-        job = OnDemandTestJob(name='Pair Check', status='QUEUED', group_id=grp.id)
-        db.session.add(job)
+        seed.set_check(grp, name='Pair Check', status='QUEUED')
         db.session.commit()
         body = self.t.client.get(f'/channel-groups/{grp.id}').get_data(as_text=True)
         self.assertEqual(body.count('data-act="clone"'), 1)
@@ -63,12 +61,10 @@ class CloneKebabTests(unittest.TestCase):
         # test_format_plan_routes.py's equivalent case does.
         seed.make_channel(self.acc, stream_id=1, name='Solo', in_guide=True, test_enabled=True)
         sys_grp = seed.make_group(name='TV Guide Channels', is_system=True,
-                                  recording=False, in_guide=False)
-        job = OnDemandTestJob(name='TV Guide Channels', status='QUEUED',
-                              group_id=sys_grp.id, is_system=True)
-        db.session.add(job)
+                                  recording=False, in_guide=False,
+                                  job_name='TV Guide Channels', job={'is_system': True})
         db.session.commit()
-        body = self.t.client.get(f'/channels/health-checks/{job.id}').get_data(as_text=True)
+        body = self.t.client.get(f'/channel-groups/{sys_grp.id}').get_data(as_text=True)
         self.assertNotIn('data-act="clone"', body)
 
 
@@ -87,15 +83,19 @@ class CloneInfoRouteTests(unittest.TestCase):
         resp = self.t.client.get(f'/api/channel-groups/{grp.id}/clone-info')
         self.assertEqual(resp.status_code, 200)
         data = resp.get_json()
-        # `kind` and `linked_pair` are gone from this payload: there is one kind of group,
-        # and what the modal actually needs to know is whether a schedule comes with it
-        # (dev/changelog/741).
+        # `kind` and `linked_pair` are gone from this payload: there is one kind of group
+        # (dev/changelog/741), and every group carries its one check, so `check` is always
+        # there (dev/changelog/1077).
         self.assertNotIn('kind', data)
-        self.assertFalse(data['has_schedule'])
+        # And `has_schedule` is gone with them: it meant "a check is attached at all",
+        # which is now always true, while _check_ctx spells the same name "runs on a
+        # schedule rather than being a one-off" (dev/changelog/1078).
+        self.assertNotIn('has_schedule', data)
         self.assertIsNotNone(data['channel_settings'])
         self.assertTrue(data['channel_settings']['in_guide'])
-        self.assertEqual('health_check_only', data['channel_settings']['format_strategy'])
-        self.assertIsNone(data['check'])
+        self.assertEqual('highest_score', data['channel_settings']['format_strategy'])
+        self.assertTrue(data['channel_settings']['records'])
+        self.assertEqual(data['check']['job_id'], grp.check.id)
         self.assertEqual([c['id'] for c in data['channels']], [ch.id])
 
     def test_a_groups_settings_are_always_offered(self):
@@ -107,24 +107,28 @@ class CloneInfoRouteTests(unittest.TestCase):
         resp = self.t.client.get(f'/api/channel-groups/{job.group_id}/clone-info')
         self.assertEqual(resp.status_code, 200)
         data = resp.get_json()
-        self.assertTrue(data['has_schedule'])
         self.assertIsNotNone(data['channel_settings'])
         self.assertIsNotNone(data['check'])
         self.assertEqual(data['check']['job_id'], job.id)
 
-    def test_a_group_with_a_schedule_reports_both_halves(self):
+    def test_schedule_live_is_what_the_copy_schedule_option_reads(self):
+        """The modal offers "Copy the schedule and profile" only when there is a
+        schedule the clone route could actually carry over, and the route copies one
+        only when the source's is live. Both sides read this one field, so a QUEUED
+        check reports false and a live recurrence reports true (dev/changelog/1078)."""
         ch = seed.make_channel(self.acc, stream_id=1, name='Solo')
         grp = seed.make_group(name='Pair Group', members=[ch])
-        job = OnDemandTestJob(name='Pair Check', status='QUEUED', group_id=grp.id)
-        db.session.add(job)
+        job = seed.set_check(grp, name='Pair Check', status='QUEUED')
         db.session.commit()
-        resp = self.t.client.get(f'/api/channel-groups/{grp.id}/clone-info')
-        self.assertEqual(resp.status_code, 200)
-        data = resp.get_json()
-        self.assertTrue(data['has_schedule'])
-        self.assertIsNotNone(data['channel_settings'])
-        self.assertIsNotNone(data['check'])
+        data = self.t.client.get(f'/api/channel-groups/{grp.id}/clone-info').get_json()
         self.assertEqual(data['check']['job_id'], job.id)
+        self.assertFalse(data['check']['schedule_live'])
+
+        seed.set_check(grp, status='SCHEDULED', recurring=True, recur_day=0,
+                       recur_hour=3, recur_minute=0)
+        db.session.commit()
+        data = self.t.client.get(f'/api/channel-groups/{grp.id}/clone-info').get_json()
+        self.assertTrue(data['check']['schedule_live'])
 
     def test_the_docstring_documents_only_fields_the_route_returns(self):
         """A caller writes against this route's docstring, not against the diff, so a
@@ -136,7 +140,6 @@ class CloneInfoRouteTests(unittest.TestCase):
         """
         ch = seed.make_channel(self.acc, stream_id=1, name='Solo')
         grp = seed.make_group(name='Pair Group', members=[ch])
-        db.session.add(OnDemandTestJob(name='Pair Check', status='QUEUED', group_id=grp.id))
         db.session.commit()
         data = self.t.client.get(f'/api/channel-groups/{grp.id}/clone-info').get_json()
 

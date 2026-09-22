@@ -2,15 +2,18 @@
    A health check is a schedule a group carries, never a second object you create
    alongside it (DESIGN-channel-groups-model.md DECIDED 2) - the copy here says so, and
    there is no longer any flow that turns one into a channel group (dev/changelog/752).
-   Opened from the Groups list kebab/chip (groups.js), the unified group detail page's
-   four create-check triggers (group-detail.js), the last screen of the channel search's
-   group-create flow (group-create-flow.js), and the ad hoc "Test this channel" on a
-   channel's own page and the search's phone row sheet - the same modal serves an existing
-   channel GROUP (opts.groupId) as well as a selection with no group yet
-   (opts.channelIds), where the route creates one.
-   Replaces the two diverging local copies those files each carried - the list one had
-   the inherited-TV-Guide-coverage notice, the detail one had never heard of inherited
-   coverage, so every fix had to be made twice and had already failed to be.
+   It only ever CREATES, and only ever for a selection with no group yet
+   (opts.channelIds), where the route mints the group and its check together: the last
+   screen of the channel search's group-create flow (group-create-flow.js), and the ad
+   hoc "Test this channel" on a channel's own page and the search's phone row sheet.
+   The Groups pages no longer open it at all - an existing group already has its check,
+   so scheduling it is its own Settings (dev/changelog/1078), and `attach_group_id` is
+   answered with a 409 saying where to find it.
+
+   It also no longer offers "add these channels to an existing test". Under one check
+   per group that reads as adding channels to an existing GROUP, which both of its
+   callers already offer beside it by that name, against the group membership endpoint
+   rather than a check-shaped one (dev/changelog/1078).
 
    Three things about it are load-bearing and must not drift:
 
@@ -37,41 +40,24 @@
    dateToTzInputValue) and schedule-fields.js (mountScheduleFields).
 
    opts:
-     groupId       - the channel group the new check attaches to. Omit and pass
-                     channelIds instead for an ad hoc selection with no group yet
-                     (the Browse tab's "Test selected") - the server creates a fresh
-                     group for it, same as the old per-page flow did.
-     channelIds    - ad hoc mode: the selected channel ids. Mutually exclusive with
-                     groupId; exactly one of the two is supplied.
-     groupName     - used in the title and the default check name (group mode only)
-     modalTitle    - overrides the default `Add a health check schedule to "groupName"`
-                     title (ad hoc mode always sets this - there is no group name yet)
-     defaultName   - overrides the default `${groupName} - health check` Name value
-                     (ignored under `nameless`, which renders no Name field at all)
-     memberCount   - how many channels a run would test (0 = the empty-group state)
+     channelIds    - the selected channel ids. The server mints a group around them and
+                     that group's one check; there is no shape that attaches to a group
+                     that already exists.
+     modalTitle    - the dialog title. Required in practice - there is no group to name.
+     defaultName   - overrides the `Health check` Name value (ignored under `nameless`,
+                     which renders no Name field at all)
+     memberCount   - how many channels a run would test (0 = nothing selected)
      profiles      - [{id, name, settings, from_default}] from health_check_profile_payload;
                      entry 0 is the id:null "Global defaults (no profile)" pseudo-profile
      profilesUrl   - Health Check Profiles page, opened in a new tab from the meta copy
-     inheritedCheck- {recur_description} when the automatic TV Guide check already covers
-                     this group, else null (group mode only)
-     hasOwnCheck   - true when the group already has a check of its own (suppresses the
-                     inherited-coverage notice: it is only news when there is nothing else)
-     inGuide       - group.in_guide (group mode only)
      testerBusy    - a health check is running right now, so Run now would 409
      scheduleTemplateId / schedulePrefix - the <template> holding the rendered
                      recur_schedule_fields macro, and the id prefix it was rendered with
-     allowAttachExisting - offer a "What to do" toggle between creating a new test and
-                     adding these channels to an existing one (the Browse tab only - the
-                     Groups pages' create-check flow always makes a new check).
-     existingJobsUrl - GET endpoint returning {jobs: [...]} for the "existing test"
-                     picker; defaults to /api/channel-tests/on-demand.
-     initialTarget / initialJobId - pre-select "existing" mode and a job id, for the
-                     `?add_to_job=<id>` deep link from a job's own "+ Add Channels" button.
      nameless      - drop the Name field entirely. A health check is a schedule its group
                      carries, so it has no name of its own; the route derives the job name
-                     from the group it attaches to or creates (dev/changelog/831).
-     createGroupName - ad hoc mode only: the name for the group this create will mint,
-                     sent as `group_name` so it is not confused with the job's own name.
+                     from the group it creates (dev/changelog/831).
+     createGroupName - the name for the group this create will mint, sent as `group_name`
+                     so it is not confused with the job's own name.
      submitLabel   - fixed label for the primary button, instead of one that changes with
                      When to run.
      onBack()      - draw a back button instead of Cancel, for a caller that opens this as
@@ -82,17 +68,7 @@
                      new tab from the maintenance-window line.
      panelClass    - width class for the panel, for a caller opening this as one screen of
                      a wider flow. Defaults to modal-wide as before.
-     initialProfileId - pre-select this profile instead of "Global defaults" (clone-check-modal.js)
-     initialSchedule - seed the schedule fields from an existing job's schedule instead of
-                     the every-day/maintenance-window recurring default - same shape _schedule_ctx() /
-                     G.schedule already produce ({mode, recur_day, recur_time, use_window,
-                     oneoff_value}). Ignored when mode is 'manual' (nothing to seed).
-     onDone()      - called after a successful create or attach; call sites reload
-     onCancel()    - called if Cancel is clicked instead of submitting (clone-modal.js's
-                     "both" chain: the channel group half was already created by the time
-                     this screen opens, so the page still needs to refresh even if the
-                     user backs out of attaching a check). Omit for today's behavior
-                     (Cancel just closes, nothing else runs).
+     onDone()      - called after a successful create; call sites reload
 */
 
 const CC_WEEKDAYS = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
@@ -183,26 +159,12 @@ function ccWindowRecommendLine(plan, recurDay, addSeconds, settingsUrl) {
   return html;
 }
 
-/* The "add to an existing test" picker's eligible-jobs filter, pulled out as a pure
-   function so it is directly testable (see check-modal.js's file-top-level note above).
-   Two rules, both traced to real bugs in the two flows this modal replaces: the pinned
-   system "TV Guide Channels" check tests whatever is in the guide and its membership
-   can't be edited (app/routes/channel_tests.py::_editable_job_group_or_error already
-   enforces this server-side - is_system is filtered here only so the picker doesn't
-   offer a choice that then 400s), and a job with zero channels must still appear (it's
-   unreachable otherwise until it somehow gains a channel some other way). Only RUNNING
-   is excluded for a different reason - the job is mid-test and its membership route
-   itself 409s while running. */
-function ccEligibleJobs(jobs) {
-  return (jobs || []).filter(j => !j.is_system && j.status !== 'RUNNING');
-}
-
 /* The POST body for /api/channel-tests/on-demand. profile_id is null and never '' -
    the route reads `profile_id_raw not in (None, '')`, but a bare '' travelling as a
    string is the kind of thing that quietly becomes a 0 somewhere later. `schedule` is
    mountScheduleFields().payload() and is merged verbatim, so the recurring vs one-off
-   shape has exactly one author. Exactly one of groupId/channelIds is set (ad hoc mode
-   has no group yet - the route creates one, same as attach_group_id makes it reuse one). */
+   shape has exactly one author. `channel_ids` is always the shape: the route mints a
+   group around the selection and mints that group's one check with it. */
 function ccPayload(o) {
   const body = {
     action: o.action,
@@ -211,12 +173,11 @@ function ccPayload(o) {
   // Omitted entirely in nameless mode: the route derives the job's name from the group it
   // is attached to or about to create, and sending '' would be a name it has to reject.
   if (o.name) body.name = o.name;
-  if (o.groupId != null) body.attach_group_id = o.groupId;
-  else body.channel_ids = o.channelIds;
+  body.channel_ids = o.channelIds;
   // The group this request creates around the selection, named by the user. Distinct from
   // `name`, which is the JOB's - the ad hoc path used one string for both, so a nameless
   // caller would otherwise have created a group called "X - health check".
-  if (o.groupId == null && o.groupName) body.group_name = o.groupName;
+  if (o.groupName) body.group_name = o.groupName;
   if (o.action === 'schedule' && o.schedule) Object.assign(body, o.schedule);
   return body;
 }
@@ -237,19 +198,16 @@ function openCreateCheckModal(opts) {
     start: { label: opts.submitLabel || 'Create and run', option: 'Run now' },
     queue: { label: opts.submitLabel || 'Do not schedule', option: 'Do not schedule' },
   };
-  const seedSchedule = opts.initialSchedule && opts.initialSchedule.mode !== 'manual' ? opts.initialSchedule : null;
   const state = {
-    profileId: opts.initialProfileId == null ? '' : String(opts.initialProfileId),
+    profileId: '',
     action: 'schedule',
-    repeat: seedSchedule && seedSchedule.mode === 'once' ? 'once' : 'recur',
-    target: opts.initialTarget || 'new',
+    repeat: 'recur',
   };
-  const defaultCheckName = opts.defaultName || `${opts.groupName} - health check`;
+  const defaultCheckName = opts.defaultName || 'Health check';
 
   const body = document.createElement('div');
   let createBtn = null;
   let sched = null;
-  let jobsLoaded = false;
   // Fetched once per modal open and cached - the plan doesn't change while the modal is
   // open, so a live readout re-render (profile change, day change) must not re-fetch.
   let windowPlan = null;
@@ -337,35 +295,14 @@ function openCreateCheckModal(opts) {
   const optionMeta = () => `<div id="cc-when-meta">${optionMetaInner()}</div>`;
 
   const notices = [
-    opts.groupId != null
-      ? '<div class="notice notice-info">These settings allow you to create a scheduled health check on ' +
-        'your group. In addition to verifying if the channels work and gathering details such as bitrate and ' +
-        'resolution, this is the primary way that health scores for your channels are calculated. That is what ' +
-        'keeps the group healthy and functional - it catches a channel that stopped working, dropped ' +
-        'resolution, or has constant stalling issues, before a recording lands on it.</div>'
-      : '<div class="notice notice-info">A health check monitors the selected channels on a schedule. It ' +
-        'catches a feed that stopped playing, dropped resolution or changed frame rate, before a recording ' +
-        'lands on it.</div>',
+    '<div class="notice notice-info">A health check monitors the selected channels on a schedule. It ' +
+    'catches a feed that stopped playing, dropped resolution or changed frame rate, before a recording ' +
+    'lands on it. The selection becomes a group, and the check is that group\'s - every group carries ' +
+    'exactly one.</div>',
   ];
-  // Not gated on opts.inGuide: the automatic check's scheduleless-group fallback covers
-  // groups that are not in the guide at all (dev/changelog/752). The server sets
-  // inheritedCheck only when this group really is in its target set.
-  if (opts.inheritedCheck && !opts.hasOwnCheck) {
-    // Its schedule can be removed like any other check's (dev/changelog/1068), so the
-    // cadence is read off the check rather than assumed - naming a schedule that no
-    // longer exists would advertise coverage this group is not getting.
-    notices.push(opts.inheritedCheck.schedule_live
-      ? '<div class="notice notice-info">The automatic TV Guide health check ' +
-        `(${escHtml(opts.inheritedCheck.recur_description || 'at its next scheduled run')}) tests one channel per ` +
-        'guide row, so it covers the member serving this group and none of its others. Give the group its own ' +
-        'schedule to have every member re-tested.</div>'
-      : '<div class="notice notice-warn">The automatic TV Guide health check would normally test one channel ' +
-        'per guide row on this group\'s behalf, but it is not scheduled right now, so nothing is testing these ' +
-        'channels. A schedule here covers every member of the group.</div>');
-  }
   if (empty) {
-    notices.push('<div class="notice notice-warn">This group has no channels yet, so there is nothing to test. ' +
-      'Add channels to it first, then come back and create the check.</div>');
+    notices.push('<div class="notice notice-warn">Nothing is selected, so there is nothing to test. ' +
+      'Pick some channels first, then come back.</div>');
   }
 
   const profileOptions = profiles.map((p) => {
@@ -374,25 +311,9 @@ function openCreateCheckModal(opts) {
     return `<option value="${val}"${sel}>${escHtml(p.name)}</option>`;
   }).join('');
 
-  let targetBlock = '';
-  if (opts.allowAttachExisting) {
-    targetBlock = '<fieldset class="gd-fset"><div class="gd-fset-head">What to do</div>' +
-      fieldRow({ label: 'Add to', meta: 'Create a brand new test, or add these channels to a test that ' +
-        'already exists (its own schedule and profile are unchanged).',
-        control: '<select id="cc-target">' +
-          `<option value="new"${state.target === 'new' ? ' selected' : ''}>Create a new test</option>` +
-          `<option value="existing"${state.target === 'existing' ? ' selected' : ''}>Add to an existing test</option>` +
-          '</select>' }) +
-      '<div class="gd-field full" id="cc-attach-block" style="display:none">' +
-      fieldRow({ label: 'Existing test', meta: 'Only tests that are not currently running can be picked.',
-        control: '<select id="cc-existing-job"><option>Loading…</option></select>' }) +
-      '</div></fieldset>';
-  }
-
   // When to run leads: it is the decision this screen exists to take, and it governs
   // whether the rest of the screen is even shown.
-  body.innerHTML = notices.join('') + targetBlock +
-    '<div id="cc-create-block">' +
+  body.innerHTML = notices.join('') +
     '<fieldset class="gd-fset"><div class="gd-fset-head">When to run</div>' +
     fieldRow({ label: 'When to run', wide: true, meta: optionMeta(),
       control: '<select id="cc-when">' +
@@ -418,8 +339,7 @@ function openCreateCheckModal(opts) {
         'rel="noopener">Health Check Profiles</a>.',
       control: `<select id="cc-profile">${profileOptions}</select>` }) +
     fieldRow({ full: true, label: 'What this will do', meta: `<div id="cc-readout">${readoutHtml()}</div>` }) +
-    '</fieldset>' +
-    '</div>';
+    '</fieldset>';
 
   sched = mountScheduleFields({
     host: body.querySelector('#cc-sched'),
@@ -427,30 +347,17 @@ function openCreateCheckModal(opts) {
     prefix: opts.schedulePrefix,
   });
   // A recurring check needs a day and a time to be worth recommending, so the modal
-  // opens on a real one rather than an empty input the user must discover - or, when a
-  // source job's schedule was passed in (clone-check-modal.js), that one instead.
-  // The default is every day in the maintenance window (dev/changelog/830): recur_time
-  // is still seeded so switching to "a specific time" lands on a real hour rather than
-  // an empty input.
-  if (seedSchedule) {
-    sched.prefill({
-      oneoff_value: seedSchedule.oneoff_value,
-      recur_day: seedSchedule.recur_day,
-      recur_time: seedSchedule.recur_time,
-      use_window: seedSchedule.use_window,
-    });
-    sched.setMode(state.repeat);
-  } else {
-    sched.prefill({ recur_day: 0, recur_time: '03:00', use_window: true });
-    sched.setMode('recur');
-  }
+  // opens on a real one rather than an empty input the user must discover. The default
+  // is every day in the maintenance window (dev/changelog/830): recur_time is still
+  // seeded so switching to "a specific time" lands on a real hour rather than an empty
+  // input. This screen only ever creates, so there is no existing schedule to seed from.
+  sched.prefill({ recur_day: 0, recur_time: '03:00', use_window: true });
+  sched.setMode('recur');
 
   const readoutEl = body.querySelector('#cc-readout');
   const whenMetaEl = body.querySelector('#cc-when-meta');
   const firstRunEl = body.querySelector('#cc-firstrun');
   const scheduleRows = [body.querySelector('[data-frow="repeat"]'), body.querySelector('[data-frow="schedule"]')];
-  const createBlock = body.querySelector('#cc-create-block');
-  const attachBlock = body.querySelector('#cc-attach-block');
 
   // One updater per region: the readout follows the profile, the first-run line follows
   // the schedule inputs, and the When-to-run select owns the block visibility and the
@@ -462,43 +369,11 @@ function openCreateCheckModal(opts) {
     const scheduling = state.action === 'schedule';
     if (whenMetaEl) whenMetaEl.innerHTML = optionMetaInner();
     scheduleRows.forEach(el => { el.style.display = scheduling ? '' : 'none'; });
-    if (createBtn && state.target !== 'existing') createBtn.textContent = ACTIONS[state.action].label;
+    if (createBtn) createBtn.textContent = ACTIONS[state.action].label;
     if (scheduling) paintFirstRun();
   }
 
-  function loadExistingJobs() {
-    jobsLoaded = true;
-    const select = body.querySelector('#cc-existing-job');
-    select.innerHTML = '<option>Loading…</option>';
-    jsonFetch(opts.existingJobsUrl || '/api/channel-tests/on-demand').then(data => {
-      const jobs = ccEligibleJobs(data.jobs);
-      if (!jobs.length) {
-        select.innerHTML = '<option value="">No eligible tests - create one instead</option>';
-        return;
-      }
-      select.innerHTML = jobs.map(j => `<option value="${j.id}">${escHtml(j.name)} ` +
-        `(${j.status}, ${j.channel_count} channel${j.channel_count === 1 ? '' : 's'})</option>`).join('');
-      if (opts.initialJobId && jobs.some(j => String(j.id) === String(opts.initialJobId))) {
-        select.value = opts.initialJobId;
-      }
-    }).catch(() => { select.innerHTML = '<option value="">Failed to load tests</option>'; });
-  }
-
-  // The whole create fieldset (name/profile/when-to-run) is one region; the attach-
-  // existing picker is another. Only one is ever visible - there is nothing left in
-  // "create" mode to also apply when attaching to an existing test, since the existing
-  // job keeps its own profile and schedule untouched.
-  function paintTarget() {
-    if (!createBlock) return;
-    const existing = state.target === 'existing';
-    createBlock.style.display = existing ? 'none' : '';
-    attachBlock.style.display = existing ? '' : 'none';
-    if (createBtn) createBtn.textContent = existing ? 'Add to test' : ACTIONS[state.action].label;
-    if (existing && !jobsLoaded) loadExistingJobs();
-  }
-
   body.addEventListener('change', (e) => {
-    if (e.target.id === 'cc-target') { state.target = e.target.value; paintTarget(); return; }
     if (e.target.id === 'cc-profile') {
       state.profileId = e.target.value;
       readoutEl.innerHTML = readoutHtml();
@@ -515,21 +390,7 @@ function openCreateCheckModal(opts) {
     }
   });
 
-  function submitAttachExisting(close) {
-    const jobId = body.querySelector('#cc-existing-job').value;
-    if (!jobId) { showToast('Choose a test to add these channels to.', { type: 'error' }); return; }
-    jsonFetch(`/api/channel-tests/on-demand/${jobId}/channels`, {
-      method: 'POST',
-      body: JSON.stringify({ channel_ids: opts.channelIds }),
-    }).then((data) => {
-      showToast(`${data.added_count || opts.channelIds.length} channel(s) added to the test.`);
-      close();
-      onDone();
-    }).catch(err => showToast(err.message, { type: 'error' }));
-  }
-
   function submit(close) {
-    if (state.target === 'existing') { submitAttachExisting(close); return; }
     // In nameless mode there is no input to read and the server derives the job name from
     // the group, so `name` is left out of the payload entirely rather than guessed at here.
     const nameEl = body.querySelector('#cc-name');
@@ -544,7 +405,7 @@ function openCreateCheckModal(opts) {
     jsonFetch('/api/channel-tests/on-demand', {
       method: 'POST',
       body: JSON.stringify(ccPayload({
-        name, action: state.action, groupId: opts.groupId, channelIds: opts.channelIds,
+        name, action: state.action, channelIds: opts.channelIds,
         groupName: opts.createGroupName, profileId, schedule,
       })),
     }).then((data) => {
@@ -558,7 +419,7 @@ function openCreateCheckModal(opts) {
   }
 
   const modal = buildModal({
-    title: opts.modalTitle || `Add a health check schedule to "${opts.groupName}"`,
+    title: opts.modalTitle || 'Add a health check schedule',
     panelClass: opts.panelClass || 'modal-wide',
     body,
     footer: [
@@ -567,7 +428,7 @@ function openCreateCheckModal(opts) {
       // (CLAUDE.md UI naming). Everything else keeps today's Cancel.
       opts.onBack
         ? { label: '← Back', class: 'btn', onClick: (close) => { close(); opts.onBack(); return false; } }
-        : { label: 'Cancel', class: 'btn', onClick: (close) => { close(); if (opts.onCancel) opts.onCancel(); } },
+        : { label: 'Cancel', class: 'btn', onClick: (close) => close() },
       { label: ACTIONS.schedule.label, class: 'btn btn-primary', onClick: (close) => { submit(close); return false; } },
     ],
   });
@@ -577,6 +438,5 @@ function openCreateCheckModal(opts) {
     createBtn.title = 'Add channels to this group first';
   }
   paintWhen();
-  if (opts.allowAttachExisting) paintTarget();
   return modal;
 }

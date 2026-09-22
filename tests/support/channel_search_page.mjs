@@ -117,13 +117,17 @@ function boot({ rows = ROWS, saved = null, url = 'http://localhost:5000/channels
       const qs = new URLSearchParams(href.split('?')[1] || '');
       const empty = (qs.get('q') || '').startsWith('zzz-');
       const base = qs.get('grain') === 'airings' ? ROWS_AIRINGS : rows;
+      /* `channels_matched` rides with them, and it is null/0 wherever the total is: the two
+         come off one query on the server, so no scenario may show one arriving without the
+         other (dev/changelog/1080). */
       payload = declineWhy
         ? { success: true, total: null, pages: null, standing_hidden: null,
-            declined: ['counts'], declined_reason: declineWhy }
+            channels_matched: null, declined: ['counts'], declined_reason: declineWhy }
         : empty
-          ? { success: true, total: 0, pages: 1, standing_hidden: {} }
+          ? { success: true, total: 0, pages: 1, standing_hidden: {}, channels_matched: 0 }
           : { success: true, total: base.total, pages: base.pages,
-              standing_hidden: base.standing_hidden };
+              standing_hidden: base.standing_hidden,
+              channels_matched: base.channels_matched };
       park = holdCountsFlag;
     } else if (href.includes('/api/channels/search/facets')) {
       /* The rail's own endpoint (dev/changelog/676). It used to be the row endpoint with
@@ -166,12 +170,15 @@ function boot({ rows = ROWS, saved = null, url = 'http://localhost:5000/channels
       // was never actually given synchronously.
       const skippedCounts = href.includes('counts=0');
       payload = Object.assign({}, base,
-        empty ? { rows: [], total: 0, pages: 1 } : {},
-        skippedCounts ? { total: null, pages: null, standing_hidden: null } : {},
+        empty ? { rows: [], total: 0, pages: 1, channels_matched: 0 } : {},
+        skippedCounts
+          ? { total: null, pages: null, standing_hidden: null, channels_matched: null }
+          : {},
         // Rows first, always: the row endpoint drops the numbers itself when they would be
         // expensive and reports which ones (dev/changelog/676, 681). Rows are untouched.
         declineWhy
-          ? { total: null, pages: null, standing_hidden: null, facets: {},
+          ? { total: null, pages: null, standing_hidden: null, channels_matched: null,
+              facets: {},
               facets_counted: [], declined: ['counts', 'facets'],
               declined_reason: declineWhy }
           : {},
@@ -1197,6 +1204,10 @@ async function airingScenario() {
   // a note explaining a fallback from a sort nobody picked would fire on every flip
   // (dev/changelog/699).
   obs.count_line_after_flip = (c.$('#cs-count') || {}).textContent || '';
+  obs.count_html_after_flip = (c.$('#cs-count') || {}).innerHTML || '';
+  // The tooltip on the distinct-channel count, which is where what it counts is stated.
+  const onChans = c.$('#cs-count .onchans');
+  obs.on_channels_tip = onChans ? (onChans.getAttribute('data-tip') || '') : '';
 
   // The header is the airing registry's, and the pinned column is the PROGRAM.
   obs.head_labels = c.$$('#ahead > div').map((d) => d.textContent.replace(/[▲▼]/g, '').trim());

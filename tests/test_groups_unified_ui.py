@@ -1,14 +1,13 @@
 """Groups unification 4/4 - unified Groups UI (changelog/238, DESIGN.md §14):
 
   * Clone copies membership into a new group (optionally narrowed via
-    `channel_ids`), always starting out of the TV Guide, and is guarded by the
-    same format check that create-group applies when the clone is asked to record.
-  * "Create a health check" from an existing group (`attach_group_id`) attaches the
-    new job to the SAME group rather than spawning a duplicate bag with a copied,
-    driftable channel list.
+    `channel_ids`), always starting out of the TV Guide, and never warns about a
+    format mix - a clone records from nobody (dev/changelog/1077).
+  * Every group carries exactly one check, so the old attach shape
+    (`attach_group_id`) is refused rather than minting a second one.
   * The Groups list page renders one section holding every group, the pinned system
-    group included, and the create-check pill's label reflects whether the automatic
-    TV Guide check already covers the group.
+    group included, and a group covered only by the automatic TV Guide check says
+    so on its inherited chip.
   * The unified detail page's file-level comment describes the two flags the page is
     gated on in terms the model still has (`dev/changelog/747`).
 
@@ -66,11 +65,10 @@ class CloneGroupTests(unittest.TestCase):
         self.assertFalse(clone.in_guide)
         self.assertEqual({m.channel_id for m in clone.memberships}, {self.hd.id})
 
-    def test_clone_asking_to_record_warns_on_mismatch(self):
-        # The format question is asked of a group that RECORDS; a health-check-only group
-        # accepts any mix, so the clone has to ask for a recording strategy for there to
-        # be anything to say. It is a warning with a way through, never a refusal
-        # (dev/changelog/762) - so 200 with success False, and nothing created.
+    def test_clone_never_warns_on_a_format_mix(self):
+        # The format question is asked of a group that RECORDS, and a clone records from
+        # nobody - its members start with Recording off whatever strategy it is given -
+        # so the question belongs to its promotion (dev/changelog/1077).
         src = make_group(name='Bag', members=[self.hd, self.sd],
                          in_guide=False, recording=False)
         db.session.commit()
@@ -79,9 +77,8 @@ class CloneGroupTests(unittest.TestCase):
                                   json={'name': 'Bag (copy)',
                                         'format_strategy': 'highest_score'})
         self.assertEqual(resp.status_code, 200, resp.get_data(as_text=True))
-        self.assertFalse(resp.get_json()['success'])
-        self.assertIn('format_mismatch', resp.get_json())
-        self.assertIsNone(ChannelGroup.query.filter_by(name='Bag (copy)').first())
+        self.assertTrue(resp.get_json()['success'])
+        self.assertIsNotNone(ChannelGroup.query.filter_by(name='Bag (copy)').first())
 
     def test_clone_narrowed_by_channel_ids(self):
         src = make_group(name='Bag', members=[self.hd, self.sd],
@@ -113,19 +110,18 @@ class CreateCheckAttachedToGroupTests(unittest.TestCase):
     def tearDown(self):
         self.t.cleanup()
 
-    def test_attach_group_id_reuses_the_same_group(self):
+    def test_attach_group_id_is_refused_and_mints_nothing(self):
+        """dev/changelog/1077: the group already carries its one check."""
+        before = OnDemandTestJob.query.count()
         resp = self.t.client.post('/api/channel-tests/on-demand', json={
             'name': 'Group check', 'action': 'queue', 'attach_group_id': self.grp.id,
         })
-        self.assertEqual(resp.status_code, 200, resp.get_data(as_text=True))
-        job_id = resp.get_json()['job_id']
-        job = db.session.get(OnDemandTestJob, job_id)
-        self.assertEqual(job.group_id, self.grp.id)
-        # The group itself is unaffected - still exactly its own two members, with no
-        # duplicate group spawned to hold the job's channel list.
+        self.assertEqual(resp.status_code, 409, resp.get_data(as_text=True))
+        self.assertEqual(OnDemandTestJob.query.count(), before)
+        # The group itself is unaffected - still exactly its own two members, and no
+        # duplicate group spawned either.
         grp = db.session.get(ChannelGroup, self.grp.id)
         self.assertEqual(len(grp.memberships), 2)
-        # Only ONE group total exists (the original) - no orphan copy.
         self.assertEqual(ChannelGroup.query.count(), 2)  # the system group + this one
 
     def test_attach_group_id_rejects_missing_group(self):
@@ -164,67 +160,6 @@ class GroupsPageRenderTests(unittest.TestCase):
         self.assertEqual(resp.status_code, 200)
         self.assertIn('Empty', resp.get_data(as_text=True))
 
-    def test_create_check_pill_shows_despite_inherited_system_coverage(self):
-        """dev/docs/BUGS.md 2026-07-24: a channel-kind group with no check of its own
-        was covering itself with the system group's automatic check (its member is
-        in_guide + test_enabled, so it lands in the inherited `checks` list too), and
-        the template's `{% if g.checks %}` treated that inherited entry as if the
-        group already had one, hiding the create-check pill entirely. (Its exact label
-        is context-dependent as of the "+ additional health check" follow-up below -
-        this test only guards that *some* pill renders.)"""
-        acct = make_account()
-        ch = make_channel(acct, name='FS2', in_guide=True, test_enabled=True)
-        make_group(name='FS2 Group', members=[ch], in_guide=True)
-        db.session.commit()
-
-        resp = self.t.client.get('/channel-groups')
-        self.assertEqual(resp.status_code, 200)
-        body = resp.get_data(as_text=True)
-        self.assertIn('data-act="create-check" data-group="', body)
-
-    def test_create_check_pill_label_reflects_tv_guide_coverage(self):
-        """2026-07-24 follow-up (BUGS.md 2026-07-24, the add-health-check pill): a group
-        with no schedule of its own says "+ Add another health check" when the automatic
-        TV Guide check already covers a member on its behalf, and "+ Add health check"
-        when nothing does.
-
-        Rewritten for dev/changelog/752, which moved which groups those are. Coverage is
-        no longer "a member happens to carry Channel.in_guide" and is no longer gated on
-        the group being in the guide: the automatic check probes one member per guide row
-        plus one per group with no schedule of its own, so a group whose every member is
-        recording-disabled and which carries a schedule is the uncovered case now."""
-        acct = make_account()
-        covered_ch = make_channel(acct, name='Covered', in_guide=True, test_enabled=True)
-        make_group(name='Covered In-Guide Group', members=[covered_ch], in_guide=True)
-
-        # No guide row of its own and no member in the guide - covered by the fallback.
-        uncovered_ch = make_channel(acct, name='Uncovered', in_guide=False)
-        make_group(name='Plain Group', members=[uncovered_ch], in_guide=True)
-
-        out_of_guide_ch = make_channel(acct, name='OutOfGuideMember', in_guide=True, test_enabled=True)
-        make_group(name='Out Of Guide Group', members=[out_of_guide_ch], in_guide=False)
-
-        # Nobody participating, so the fallback has nobody to probe on its behalf.
-        empty_ch = make_channel(acct, name='NotParticipating', in_guide=False)
-        make_group(name='Nothing To Probe', members=[empty_ch], in_guide=False,
-                   recording=False, test_disabled=[empty_ch.id])
-        db.session.commit()
-
-        body = self.t.client.get('/channel-groups').get_data(as_text=True)
-
-        def pill_label(group_name):
-            idx = body.find(f'{group_name}</span>')
-            self.assertNotEqual(idx, -1, f'{group_name} row not found')
-            chunk = body[idx:idx + 2000]
-            pill_idx = chunk.find('data-act="create-check"')
-            self.assertNotEqual(pill_idx, -1, f'{group_name} has no create-check pill')
-            return chunk[pill_idx:pill_idx + 200]
-
-        self.assertIn('+ Add another health check', pill_label('Covered In-Guide Group'))
-        self.assertIn('+ Add another health check', pill_label('Plain Group'))
-        self.assertIn('+ Add another health check', pill_label('Out Of Guide Group'))
-        self.assertIn('+ Add health check', pill_label('Nothing To Probe'))
-
     def test_inherited_only_check_chip_reads_as_coverage_not_a_schedule(self):
         """dev/docs/BUGS.md 2026-08-21 @ 09:18:58 PM ET: a group covered only by the
         inherited automatic TV Guide check rendered that check's own time/recurrence
@@ -241,9 +176,13 @@ class GroupsPageRenderTests(unittest.TestCase):
         body = self.t.client.get('/channel-groups').get_data(as_text=True)
         row_idx = body.find('FS3 Group</span>')
         self.assertNotEqual(row_idx, -1, 'FS3 Group row not found')
-        chunk = body[row_idx:row_idx + 3000]
-        chip_attr = chunk.find('data-menu-check=')
-        self.assertNotEqual(chip_attr, -1, 'FS3 Group has no check chip')
+        chunk = body[row_idx:row_idx + 4000]
+        # The inherited chip names the SYSTEM job; the group's own check has a chip of its
+        # own beside it now that every group carries one (dev/changelog/1077).
+        sys_job = OnDemandTestJob.query.filter_by(is_system=True).one()
+        grp = ChannelGroup.query.filter_by(name='FS3 Group').one()
+        chip_attr = chunk.find(f'data-menu-check="{grp.id}:{sys_job.id}"')
+        self.assertNotEqual(chip_attr, -1, 'FS3 Group has no inherited-coverage chip')
         tag_start = chunk.rfind('<span', 0, chip_attr)
         tag_close = chunk.find('>', chip_attr)
         label_end = chunk.find('</span>', tag_close)

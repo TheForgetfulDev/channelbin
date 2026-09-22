@@ -640,55 +640,83 @@ function renderTimeHeader() {
 
 // ── Recording state helpers ───────────────────────────────────────────────────
 
+// How the guide draws one Recording.status, and ONLY the parts that are the guide's own:
+// the cell's edge colour, the chip's colour, the glyph, and the sentence explaining the
+// phase. The WORD is not here - it comes from the server's one status vocabulary
+// (app/fmt_utils.py, via util.js::recStatusLabel), because a status is stored under one
+// name and shown under another and a page that spells its own ends up disagreeing with the
+// Recordings list. This page did: CONCATENATING and ANALYZING both read "Recorded" while
+// CONVERTING, the phase after them, read "Converting" - so the guide called a program
+// recorded during the two phases that can still fail (dev/changelog/1083).
+//
+// Every status in that vocabulary appears below, including the two the guide draws nothing
+// for: app/routes/guide.py excludes FAILED and ABORTED from the recordings matched to
+// cells, so a chip for them would have no data behind it. `null` says that deliberately -
+// an absent entry is a status nobody decided about, and recChipFor says so out loud.
+const REC_CHIP = {
+  SCHEDULED:     { cls: 'rec-scheduled', badge: 'rec-badge-scheduled', glyph: '',
+                   detail: 'A recording is set up for this program but has not started yet.' },
+  IN_PROGRESS:   { cls: 'rec-active', badge: 'rec-badge-active', glyph: '⏺',
+                   detail: 'Capture is running for this program.' },
+  PAUSED:        { cls: 'rec-paused', badge: 'rec-badge-paused', glyph: '⏸',
+                   detail: 'The recording for this program is paused and is not capturing.' },
+  RETRYING:      { cls: 'rec-retry', badge: 'rec-badge-retry', glyph: '↻',
+                   detail: 'The stream reconnected but immediately died - waiting to try again.' },
+  CONCATENATING: { cls: 'rec-done', badge: 'rec-badge-done', glyph: '✓',
+                   detail: 'Capture finished; the segments are being joined into the final file.' },
+  ANALYZING:     { cls: 'rec-done', badge: 'rec-badge-done', glyph: '✓',
+                   detail: 'Capture finished and joined; the file is being checked before conversion.' },
+  CONVERTING:    { cls: 'rec-done', badge: 'rec-badge-done', glyph: '✓',
+                   detail: 'Capture finished; the file is being converted to its final format.' },
+  // The one place the guide deliberately says a different word than the Recordings list:
+  // a finished recording is "Recorded" here, not "Completed". Whether that is the right
+  // word is a naming call nobody has made; overriding it in one line keeps the question
+  // askable without reopening a second table (dev/changelog/1083).
+  COMPLETED:     { cls: 'rec-done', badge: 'rec-badge-done', glyph: '✓', word: 'Recorded',
+                   detail: 'This program was recorded and the file is in your library.' },
+  FAILED:  null,
+  ABORTED: null,
+};
+
+function recChipFor(status) {
+  if (Object.prototype.hasOwnProperty.call(REC_CHIP, status)) return REC_CHIP[status];
+  // No trailing fallback that renders a real state: a status added to app/fmt_utils.py and
+  // not to the table above would otherwise inherit whichever colour and word sat in the
+  // default branch, which is exactly how this page came to call a join "Recorded".
+  console.error(`guide: no chip defined for recording status ${status}`);
+  return null;
+}
+
 function recCssClass(status) {
-  switch (status) {
-    case 'IN_PROGRESS':  return 'rec-active';
-    case 'PAUSED':       return 'rec-paused';
-    case 'RETRYING':     return 'rec-retry';
-    case 'SCHEDULED':    return 'rec-scheduled';
-    case 'CONCATENATING':
-    case 'ANALYZING':
-    case 'CONVERTING':
-    case 'COMPLETED':    return 'rec-done';
-    default:             return 'rec-done';
-  }
+  const chip = recChipFor(status);
+  return chip ? chip.cls : '';
+}
+
+// The server's word, cased for a chip - CONCATENATING's becomes "Joining". The vocabulary
+// is written for the Recordings list's upper-case badges, and the guide's chips are sentence case
+// (DESIGN.md 4) - so this recases the one table rather than keeping a second one in the
+// guide's own casing, which is the thing that drifted.
+function recChipWord(status) {
+  const chip = recChipFor(status);
+  if (!chip) return null;
+  if (chip.word) return chip.word;
+  const label = recStatusLabel(status);
+  if (!label) return null;
+  return label.replace(/\S+/g, w => w.charAt(0) + w.slice(1).toLowerCase());
 }
 
 // The chip's meaning is carried by its colour, so it carries a tooltip with a distinct text
-// per state rather than relying on the colour alone (DESIGN.md 12.7). Every state is named
-// explicitly - a trailing `default` that renders a real state is how the next status added
-// lands somewhere wrong without erroring.
+// per state rather than relying on the colour alone (DESIGN.md 12.7). The tooltip's heading
+// is the chip's own word rather than a second copy of it - typing the two separately is how
+// "✓ Converting" ended up over a tooltip headed "Converting" while "✓ Recorded" sat over
+// one headed "Recorded" for a phase that had not finished.
 function recStatusBadge(status) {
-  const chip = (cls, text, tip) =>
-    `<div class="rec-badge rec-badge-${cls} tip-plain" data-tip="${escTipAttr(tip)}">${text}</div>`;
-  switch (status) {
-    case 'SCHEDULED':
-      return chip('scheduled', 'Scheduled',
-        'Scheduled\nA recording is set up for this program but has not started yet.');
-    case 'IN_PROGRESS':
-      return chip('active', '⏺ Recording',
-        'Recording now\nCapture is running for this program.');
-    case 'PAUSED':
-      return chip('paused', '⏸ Paused',
-        'Paused\nThe recording for this program is paused and is not capturing.');
-    case 'RETRYING':
-      return chip('retry', '↻ Retrying',
-        'Retrying\nThe stream reconnected but immediately died - waiting to try again.');
-    case 'CONCATENATING':
-      return chip('done', '✓ Recorded',
-        'Recorded\nCapture finished; the segments are being joined into the final file.');
-    case 'ANALYZING':
-      return chip('done', '✓ Recorded',
-        'Recorded\nCapture finished and joined; the file is being checked before conversion.');
-    case 'CONVERTING':
-      return chip('done', '✓ Converting',
-        'Converting\nCapture finished; the file is being converted to its final format.');
-    case 'COMPLETED':
-      return chip('done', '✓ Recorded',
-        'Recorded\nThis program was recorded and the file is in your library.');
-    default:
-      return '';
-  }
+  const chip = recChipFor(status);
+  const word = recChipWord(status);
+  if (!chip || !word) return '';
+  const text = chip.glyph ? `${chip.glyph} ${word}` : word;
+  const tip = `${word}\n${chip.detail}`;
+  return `<div class="rec-badge ${chip.badge} tip-plain" data-tip="${escTipAttr(tip)}">${text}</div>`;
 }
 
 // Tooltips travel through an HTML attribute, so newlines are encoded and the shared portal

@@ -1527,24 +1527,11 @@ body.scroll-locked { position: fixed; left: 0; right: 0; width: 100%; overflow: 
 .prune-row .pr-flag + .pr-flag { margin-left: 6px; }
 .gd-fset-head .fh-note { margin-left: auto; font-size: var(--fs-xs); font-weight: 400; color: var(--text-faint); text-transform: none; letter-spacing: 0; }
 
-/* ── Clone-check channel picker (checkbox list, no format columns - unlike
-   .prune-row above, there is nothing to compare against, so a 3-column row is
-   the right amount of grid, not a reuse of the 5-column one) ── */
-.clone-check-actions { display: flex; gap: 8px; margin-bottom: 6px; }
-.clone-check-list { border: 1px solid var(--border-soft); border-radius: var(--radius); overflow: hidden; max-height: 320px; overflow-y: auto; }
-.clone-check-row {
-  display: grid; grid-template-columns: 18px 10px minmax(0, 1fr) auto;
-  align-items: center; gap: 10px; padding: 8px 12px;
-  border-bottom: 1px solid var(--border-soft); font-size: var(--fs-md); cursor: pointer;
-}
-.clone-check-row:last-child { border-bottom: none; }
-.clone-check-row:hover { background: var(--bg3); }
-.clone-check-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.clone-check-acct { font-size: var(--fs-xs); color: var(--text-faint); white-space: nowrap; }
-
-/* Clone modal's step-1 type picker: bordered cards side by side (2 or 3 of them), not
-   the stacked .fp-radio list below - each option needs equal visual weight since none
-   is a "default that others qualify", unlike format-picker-modal's list. */
+/* Radio cards side by side, not the stacked .fp-radio list below - for a set of options
+   that need equal visual weight because none is a "default that others qualify", unlike
+   the walkthrough's list. Named for the Clone modal's own type picker, which is where it
+   started and which has since been retired (dev/changelog/1078); the hide-rules scope
+   picker is what uses it now. */
 .clone-type-choice { display: flex; gap: 10px; flex-wrap: wrap; }
 .clone-type-opt {
   flex: 1 1 160px; border: 1px solid var(--border); border-radius: var(--radius);
@@ -1557,10 +1544,10 @@ body.scroll-locked { position: fixed; left: 0; right: 0; width: 100%; overflow: 
 .notice-act { display: flex; align-items: flex-start; gap: 12px; }
 .notice-act > .btn { flex-shrink: 0; }
 
-/* Stacked radio choice with a description under each option (format-picker-modal.js's
-   "what happens to non-matching members" pair). Block-level labels, not the app's
-   default inline label+control row, because each option needs its own description
-   line - no width coupling to anything else, so no @media copy is needed. */
+/* Stacked radio choice with a description under each option (group-promote-modal.js's
+   "which members may record" choices). Block-level labels, not the app's default inline
+   label+control row, because each option needs its own description line - no width
+   coupling to anything else, so no @media copy is needed. */
 .fp-radio { display: block; padding: 8px 2px; cursor: pointer; }
 .fp-radio + .fp-radio { border-top: 1px solid var(--border-soft); }
 .fp-radio input[type=radio] { accent-color: var(--accent); margin-right: 6px; }
@@ -2486,25 +2473,7 @@ body.actbar-on #app-toast { bottom: 78px; }
 .gd-chip-val { font-weight: 600; }
 .gd-chip:hover, a.gd-chip:hover { text-decoration: none; }
 
-/* ── Linked section + the paired-half badge (dev/changelog/323) ─────── */
-/* The badge in the title names the OTHER half of the pair and scrolls to its card. It
-   replaced a static badge that named nothing and did nothing. */
-.gd-pair-badge {
-  display: inline-flex; align-items: center; gap: 5px; font-size: var(--fs-sm); font-weight: 600;
-  color: var(--accent-text); background: var(--accent-soft); border: 1px solid var(--accent);
-  border-radius: 999px; padding: 2px 10px; cursor: pointer;
-}
-.gd-pair-badge:hover { filter: brightness(1.15); }
-.linked-item {
-  display: flex; align-items: center; gap: .6rem; flex-wrap: wrap; padding: 10px 12px;
-  border: 1px solid var(--border-soft); border-radius: var(--radius-sm); background: var(--bg0);
-  margin-top: 8px;
-}
-.linked-item .li-name { font-weight: 600; font-size: var(--fs-lg); }
-.linked-item .li-actions { margin-left: auto; display: flex; gap: 6px; }
 .card-note { font-size: var(--fs-md); color: var(--text-muted); margin: 0 0 2px; max-width: 78ch; }
-/* Brief highlight so a jump from the title badge lands somewhere visibly. */
-.gd-jump-flash { box-shadow: 0 0 0 2px var(--accent); transition: box-shadow .2s ease; }
 
 /* ── Channels table ────────────────────────────────────────────────── */
 /* The four standing filter controls this page used to carry (.gd-filter and its two
@@ -2901,8 +2870,6 @@ th.gd-c-part { text-align: center; }
   .prune-row .pr-flagcell { grid-area: flag; }
   .prune-row > .btn { grid-area: act; align-self: center; }
   .gd-field-ctl.wide { width: 100%; }
-  .linked-item .li-actions { margin-left: 0; width: 100%; }
-  .linked-item .li-actions .btn { flex: 1 1 auto; justify-content: center; }
   .gd-sum { flex-direction: column; align-items: stretch; }
   .gd-sum-rule { width: 100%; height: 1px; align-self: auto; }
   .gd-sum-score-wrap { min-width: 0; }

@@ -110,10 +110,13 @@ class SystemCheckUnscheduleTests(_Base):
         self.assertTrue(job.recurring)
 
     def test_removing_the_schedule_is_not_removing_the_check(self):
+        """There is no route that deletes a check on its own any more - a check dies only
+        with its group (dev/changelog/1077) - so the old DELETE is a 404 and the system
+        check is still there after its schedule goes."""
         job_id = self._system_job().id
         self.client.post(f'/api/channel-tests/on-demand/{job_id}/unschedule')
         resp = self.client.delete(f'/api/channel-tests/on-demand/{job_id}')
-        self.assertEqual(400, resp.status_code)
+        self.assertEqual(404, resp.status_code)
         self.assertIsNotNone(self._system_job())
 
     def test_the_system_group_page_offers_unschedule_while_scheduled(self):
@@ -142,14 +145,19 @@ class ScheduleIsLiveTests(_Base):
 class InheritedCoverageHonestyTests(_Base):
 
     def _chip_label(self, html, group_name):
-        """The visible label of the check chip on `group_name`'s row."""
+        """The visible label of the INHERITED-coverage chip on `group_name`'s row - the
+        one naming the system job, since every group also carries a chip for its own
+        check (dev/changelog/1077)."""
         row = html.find(f'{group_name}</span>')
         self.assertNotEqual(row, -1, f'{group_name} row not found')
-        chunk = html[row:row + 3000]
-        attr = chunk.find('data-menu-check=')
-        self.assertNotEqual(attr, -1, f'{group_name} has no check chip')
+        chunk = html[row:row + 4000]
+        attr = chunk.find(f'data-menu-check="{self._group_id(group_name)}:{self._system_job().id}"')
+        self.assertNotEqual(attr, -1, f'{group_name} has no inherited-coverage chip')
         close = chunk.find('>', attr)
         return chunk[close + 1:chunk.find('</span>', close)]
+
+    def _group_id(self, group_name):
+        return ChannelGroup.query.filter_by(name=group_name).one().id
 
     def test_inherited_coverage_is_claimed_while_the_check_runs(self):
         grp = self._covered_group()
@@ -161,33 +169,37 @@ class InheritedCoverageHonestyTests(_Base):
         job_id = self._system_job().id
         self.client.post(f'/api/channel-tests/on-demand/{job_id}/unschedule')
         html = self.client.get('/channel-groups').data.decode()
-        self.assertEqual('No coverage', self._chip_label(html, grp.name))
+        self.assertEqual('No inherited coverage', self._chip_label(html, grp.name))
+
+    def _inherited_blob(self, grp):
+        """The `inheritedCheck` object the group page ships to group-detail.js, which is
+        what the page's own coverage copy is rendered from."""
+        html = self.client.get(f'/channel-groups/{grp.id}').data.decode()
+        start = html.find('inheritedCheck: ')
+        self.assertNotEqual(start, -1, 'the page ships no inheritedCheck')
+        return html[start:html.find('\n', start)]
 
     def test_the_group_page_says_nothing_is_testing_it(self):
         grp = self._covered_group()
         job_id = self._system_job().id
         self.client.post(f'/api/channel-tests/on-demand/{job_id}/unschedule')
-        html = self.client.get(f'/channel-groups/{grp.id}').data.decode()
-        self.assertIn('Nothing is testing these channels', html)
+        self.assertIn('"schedule_live": false', self._inherited_blob(grp))
 
     def test_the_group_page_claims_coverage_while_the_check_runs(self):
         grp = self._covered_group()
-        html = self.client.get(f'/channel-groups/{grp.id}').data.decode()
-        self.assertNotIn('Nothing is testing these channels', html)
-        self.assertIn('The automatic TV Guide check tests one member on', html)
+        self.assertIn('"schedule_live": true', self._inherited_blob(grp))
 
     def test_a_paused_recurrence_is_named_once_in_the_chip_tooltip(self):
         """_recur_label() already appends "(Paused)"; the chip appended a second one, so
         the tooltip read "... (Paused) (paused)"."""
         chans = [seed.make_channel(self.acc, name='Paused chip feed')]
         grp = seed.make_group(name='Paused chip group', members=chans)
-        db.session.add(OnDemandTestJob(name='Nightly', group_id=grp.id,
-                                       status='SCHEDULED', recurring=True, recur_day=0,
-                                       recur_hour=2, recur_minute=0, recur_paused=True))
+        seed.set_check(grp, name='Nightly', status='SCHEDULED', recurring=True, recur_day=0,
+                       recur_hour=2, recur_minute=0, recur_paused=True)
         db.session.commit()
         html = self.client.get('/channel-groups').data.decode()
-        start = html.find('data-tip="Nightly.')
-        self.assertNotEqual(start, -1, 'the Nightly chip has no tooltip')
+        start = html.find('data-tip="Health check paused.')
+        self.assertNotEqual(start, -1, 'the paused chip has no tooltip')
         tip = html[start:html.find('"', start + len('data-tip="'))]
         self.assertEqual(1, tip.lower().count('(paused)'), tip)
 

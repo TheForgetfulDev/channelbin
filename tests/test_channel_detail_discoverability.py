@@ -37,7 +37,7 @@ class AddToGuideVisibilityTests(unittest.TestCase):
         the pair this test has to hold together."""
         job = seed.make_test_job(channels=[channel])
         db.session.commit()
-        resp = self.t.client.get(f'/channels/health-checks/{job.id}')
+        resp = self.t.client.get(f'/channel-groups/{job.group_id}')
         self.assertEqual(resp.status_code, 200)
         body = resp.get_data(as_text=True)
         blob = body.split('rows: ', 1)[1].split(',\n  counts:', 1)[0]

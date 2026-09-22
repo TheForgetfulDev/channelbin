@@ -420,7 +420,6 @@ class CssDeadClassTests(unittest.TestCase):
         'd-':                'recording_detail.html `run-tl-dot d-{{ rep.kind }}` (the segment timeline)',
         'hb-':               'the health-band modifier (app/health_bands.py): guide.js '
                              '`hb-${state}`, util.js::healthBandCss, and Jinja `| health_css`',
-        'rec-badge-':        'guide.js `rec-badge rec-badge-${cls}` (recCssClass)',
     }
 
     # `.org` / `.w3` come from URLs inside the CSS (w3.org, fonts), not selectors.

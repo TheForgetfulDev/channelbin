@@ -73,9 +73,9 @@ def _memberships(channels):
 
 class FakeGroup:
     # format_strategy defaults to a lock-managing value rather than the model's own
-    # health_check_only default: a FakeGroup that carries a lock at all is by definition
+    # highest_score default: a FakeGroup that carries a lock at all is by definition
     # a group that manages its format, and the two values that manage none
-    # (health_check_only, unmanaged) get their own tests below.
+    # (unmanaged) gets its own tests below.
     def __init__(self, id=1, name='G', res=None, fps=None, strategy='manual'):
         self.id = id
         self.name = name

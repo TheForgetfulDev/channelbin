@@ -213,6 +213,48 @@ function _bandField(score, field) {
   return band ? band[field] : '';
 }
 
+// Recording-status vocabulary
+// ---------------------------------------------------------------------------
+// The browser's half of app/fmt_utils.py's REC_STATUS_DISPLAY, served in a meta tag by
+// base.html exactly as the health bands are. A recording's status is stored under one name
+// and shown under another - CONCATENATING is shown as JOINING, ABORTED as CANCELLED - so
+// any script that labels a status from a raw enum either reads this table or writes a
+// second one. Two scripts wrote one: the Dashboard's has been folded in here, and the TV
+// Guide's called both CONCATENATING and ANALYZING "Recorded" while naming the phase after
+// them correctly (dev/changelog/1083). Memoized like healthBands(): the tag is static for
+// the life of the page.
+let _recStatusVocab = null;
+function recStatusVocab() {
+  if (_recStatusVocab === null) {
+    const meta = document.querySelector('meta[name="rec-status-labels"]');
+    let parsed = null;
+    try {
+      parsed = meta && meta.content ? JSON.parse(meta.content) : null;
+    } catch (e) {
+      // A malformed tag must not take the page's JS down with it. Every caller below
+      // treats an absent word as "this status has no name here" and shows the raw status
+      // rather than a borrowed one, which is the honest reading.
+      console.error('rec-status-labels meta is not valid JSON', e);
+    }
+    _recStatusVocab = (parsed && parsed.labels) ? parsed : { labels: {}, waiting: '' };
+  }
+  return _recStatusVocab;
+}
+
+// What a human calls this Recording.status - CONCATENATING is shown as a join, and so on.
+// null for a status the server named no word for, so a caller can tell "not in the table"
+// from "named the empty string" and say something loud about it.
+function recStatusLabel(status) {
+  const labels = recStatusVocab().labels;
+  return Object.prototype.hasOwnProperty.call(labels, status) ? labels[status] : null;
+}
+
+// The label a post-processing chain badges as while it is parked waiting for another
+// recording to give up the machine (app/fmt_utils.py::REC_WAITING_LABEL).
+function recWaitingLabel() {
+  return recStatusVocab().waiting;
+}
+
 // Cached Intl.DateTimeFormat for `opts` in the display timezone.
 //
 // The cache is load-bearing, not an optimization: channel-search.js formats a time and a
@@ -987,8 +1029,12 @@ function confirmIgnoreAlert(alertId, title, onDone) {
 function fieldRow(o) {
   const cls = `gd-field${o.sub ? ' sub' : ''}${o.full ? ' full' : ''}${o.stack ? ' stack' : ''}`;
   return `<div class="${cls}"${o.id ? ` data-frow="${o.id}"` : ''}${o.hide ? ' style="display:none"' : ''}>` +
-    `<div class="gd-field-left"><div class="gd-field-lbl">${o.label}</div>` +
-    `<div class="gd-field-meta">${o.meta}</div></div>` +
+    // Both halves default to empty rather than being interpolated raw: a row that omits
+    // one is a legitimate shape (a control with no explanation, a note with no label),
+    // and template interpolation renders a missing key as the literal text `undefined`
+    // on the page - which shipped once (dev/docs/BUGS.md 2026-09-21).
+    `<div class="gd-field-left"><div class="gd-field-lbl">${o.label || ''}</div>` +
+    `<div class="gd-field-meta">${o.meta || ''}</div></div>` +
     (o.control ? `<div class="gd-field-ctl${o.wide ? ' wide' : ''}">${o.control}</div>` : '') + '</div>';
 }
 

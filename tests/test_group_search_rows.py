@@ -199,7 +199,7 @@ class TwoNumbersTests(_GroupSearchTestCase):
         a group counted by one and not the other is a pager that disagrees with its own
         count line."""
         state = SearchState(facets=())
-        hidden, total, pages, groups = search_counts(state, self.ctx())
+        hidden, total, pages, groups, _matched = search_counts(state, self.ctx())
         result = search(state, self.ctx())
         self.assertEqual((hidden, total, pages), (result.standing_hidden, result.total,
                                                   result.pages))

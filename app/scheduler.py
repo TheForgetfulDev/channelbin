@@ -768,7 +768,8 @@ def resume_in_progress_recordings(app):
 
         # On-demand jobs: handle any that were RUNNING (mark CANCELLED, or auto-heal back to
         # SCHEDULED for a recurring job) or SCHEDULED
-        from .database import OnDemandTestJob, ChannelTest, TEST_STATUS_CANCELLED
+        from .database import (OnDemandTestJob, ChannelTest, TEST_STATUS_CANCELLED,
+                               OD_JOB_STATUS_RUNNING, OD_JOB_STATUS_SCHEDULED)
         from .channel_tester import run_on_demand_test_job
         from .config import load_config
         ct_cfg = load_config().get('channel_testing', {})
@@ -801,7 +802,7 @@ def resume_in_progress_recordings(app):
 
         @retry_on_locked()
         def _cancel_running_ondemand():
-            for job in OnDemandTestJob.query.filter_by(status='RUNNING').all():
+            for job in OnDemandTestJob.query.filter_by(status=OD_JOB_STATUS_RUNNING).all():
                 # completed=False: a job caught RUNNING at startup was interrupted by the
                 # restart, never actually finished, so it can only land on SCHEDULED (recurring
                 # or a kept one-off) or CANCELLED - never COMPLETED.
@@ -828,7 +829,7 @@ def resume_in_progress_recordings(app):
             db.session.commit()
 
         to_start_immediately = []
-        for job in OnDemandTestJob.query.filter_by(status='SCHEDULED').all():
+        for job in OnDemandTestJob.query.filter_by(status=OD_JOB_STATUS_SCHEDULED).all():
             if job.recurring and job.recur_paused:
                 # Paused - no APScheduler job should exist; leave it that way across restarts.
                 continue
@@ -1031,11 +1032,14 @@ def finalize_on_demand_job_status(job, completed, ct_cfg=None):
     Returns 'recurring', 'kept', or 'finished' naming which branch was taken, so callers can
     layer their own side effects (an alert, a dispatch-thread kick, logging) on top.
     """
+    from .database import (OD_JOB_STATUS_SCHEDULED, OD_JOB_STATUS_COMPLETED,
+                           OD_JOB_STATUS_CANCELLED)
+
     job.completed_at = datetime.utcnow()
     if job.recurring:
         if completed:
             job.last_full_run_at = job.completed_at
-        job.status = 'SCHEDULED'
+        job.status = OD_JOB_STATUS_SCHEDULED
         next_run = next_on_demand_run_for_job(job, ct_cfg)
         if next_run:
             job.scheduled_start_time = next_run
@@ -1043,11 +1047,11 @@ def finalize_on_demand_job_status(job, completed, ct_cfg=None):
 
     kept_next_run = get_active_one_off_next_run(job)
     if kept_next_run:
-        job.status = 'SCHEDULED'
+        job.status = OD_JOB_STATUS_SCHEDULED
         job.scheduled_start_time = kept_next_run
         return 'kept'
 
-    job.status = 'COMPLETED' if completed else 'CANCELLED'
+    job.status = OD_JOB_STATUS_COMPLETED if completed else OD_JOB_STATUS_CANCELLED
     return 'finished'
 
 
@@ -1785,7 +1789,7 @@ def reschedule_window_jobs():
     prerequisite for the new bounds to take effect."""
     from . import db
     from .config import load_config
-    from .database import OnDemandTestJob
+    from .database import OnDemandTestJob, OD_JOB_STATUS_SCHEDULED
 
     ct_cfg = load_config().get('channel_testing', {})
     _register_window_close_job(ct_cfg)
@@ -1793,7 +1797,8 @@ def reschedule_window_jobs():
     @retry_on_locked()
     def _refresh_window_job_times():
         for job in OnDemandTestJob.query.filter_by(
-                recurring=True, recur_use_window=True, status='SCHEDULED').all():
+                recurring=True, recur_use_window=True,
+                status=OD_JOB_STATUS_SCHEDULED).all():
             job.scheduled_start_time = next_on_demand_run_for_job(job, ct_cfg)
         db.session.commit()
 

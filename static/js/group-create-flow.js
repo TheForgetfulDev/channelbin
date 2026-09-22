@@ -353,7 +353,6 @@ function openGroupCreateFlow(opts) {
       modalTitle: 'New channel group',
       hasOwnCheck: false,
       inGuide: false,
-      allowAttachExisting: false,
       nameless: true,
       submitLabel: 'Create',
       panelClass: CG_PANEL_CLASS,

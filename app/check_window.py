@@ -177,9 +177,11 @@ def due_jobs(occurrence_start_utc: datetime):
     status == SCHEDULED, not paused, recur_day matches the occurrence's local day (0 = every
     day), has not already run this occurrence (completed_at unset or before this occurrence
     started), and any "skip next run" window has passed."""
+    from .database import OD_JOB_STATUS_SCHEDULED
+
     now = datetime.utcnow()
     result = []
-    for job in _window_eligible_for_day(occurrence_start_utc, ('SCHEDULED',)):
+    for job in _window_eligible_for_day(occurrence_start_utc, (OD_JOB_STATUS_SCHEDULED,)):
         if job.completed_at is not None and job.completed_at >= occurrence_start_utc:
             continue
         if job.window_skip_until is not None and job.window_skip_until > now:
@@ -228,7 +230,8 @@ def window_close(app):
         from . import db
         from .config import load_config
         from . import channel_tester
-        from .database import OnDemandTestJob, Alert
+        from .database import (OnDemandTestJob, Alert,
+                               OD_JOB_STATUS_SCHEDULED, OD_JOB_STATUS_RUNNING)
         from .alerts import create_alert, dismiss_open_alerts
         from .fmt_utils import fmt_duration_hm, fmt_duration_phrase
 
@@ -271,7 +274,8 @@ def window_close(app):
         # The reporting cohort ("due tonight") includes the job just stopped (RUNNING at
         # query time) and anything already completed, which due_jobs()'s SCHEDULED-only /
         # completed_at filtering deliberately excludes for its own (start-able-now) purpose.
-        cohort = _window_eligible_for_day(occurrence_start_utc, ('SCHEDULED', 'RUNNING'))
+        cohort = _window_eligible_for_day(
+            occurrence_start_utc, (OD_JOB_STATUS_SCHEDULED, OD_JOB_STATUS_RUNNING))
         cohort_total = sum(estimate_job_seconds(j, ct_cfg) for j in cohort)
 
         window_label = format_window_label(ct_cfg)

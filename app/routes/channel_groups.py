@@ -4,6 +4,7 @@ import collections
 import json
 import logging
 import re
+from datetime import datetime
 
 from flask import Blueprint, render_template, request, jsonify, url_for, abort
 from sqlalchemy.orm import selectinload
@@ -17,10 +18,12 @@ from ..database import (
     CHANNEL_PLACEHOLDER_HEALTH_OBSERVATION, CHANNEL_FAST_DELIVERY_HEALTH_OBSERVATION,
     ChannelGroupEvent,
     GROUP_FORMAT_STRATEGIES,
-    GROUP_FORMAT_HEALTH_CHECK_ONLY, GROUP_FORMAT_MANUAL,
+    GROUP_FORMAT_HIGHEST_SCORE, GROUP_FORMAT_MANUAL,
     GROUP_WARNING_KINDS,
     group_event_channel_links,
     REC_STATUS_COMPLETED, REC_STATUS_FAILED, REC_STATUS_ABORTED,
+    OD_JOB_STATUS_QUEUED, OD_JOB_STATUS_SCHEDULED, OD_JOB_STATUS_RUNNING,
+    OD_JOB_STATUS_COMPLETED, OD_JOB_STATUS_CANCELLED,
 )
 from ..accounts import (
     duplicate_groups_within, duplicates_within, lifecycle_states_for_channels,
@@ -40,9 +43,9 @@ from ..channel_groups import (
     deregister_cancelled_recordings,
     report_orphaned_guide_groups, resolve_broken_guide_row,
     evaluate_and_reconcile_group, check_target_channels, teardown_test_job,
-    apply_lock_and_log, apply_format_strategy, strategy_lock_plan,
+    apply_format_strategy, strategy_lock_plan,
     FORMAT_STRATEGY_LABELS,
-    DEFAULT_FAILING_STREAK_THRESHOLD, plan_format_selection, FORMAT_STRATEGIES,
+    DEFAULT_FAILING_STREAK_THRESHOLD, plan_format_selection,
     MATCH_REASON_STRENGTH, FORMAT_STATUS_STRENGTH,
     build_group_with_members, group_name_conflict, serving_member, touch_group,
     schedule_is_live,
@@ -123,12 +126,13 @@ def _pending_warnings(existing_members, new_channels, force, ask_format):
 
     Empty (proceed) when `force` is set - that flag is the user's press of Proceed anyway.
 
-    `ask_format` is the caller's strategy gate: a group whose strategy is still
-    health_check_only is not a recording source, so it accepts any mix of channels and the
-    format questions are asked when it is promoted (DESIGN-channel-groups-model.md 14.1),
-    not while it is being assembled. The duplicate-stream warning rides the same gate
-    because it says the same thing - duplicate feeds "add no failover redundancy", which is
-    a sentence about a group that records.
+    `ask_format` is the caller's recording gate: a group nobody records from yet
+    (participation_is_recording() is False) accepts any mix of channels, and the format
+    questions are asked when it is promoted (DESIGN-channel-groups-model.md 14.1), not
+    while it is being assembled. A group being created or cloned has no recording member
+    by construction, so only add_members ever asks. The duplicate-stream warning rides the
+    same gate because it says the same thing - duplicate feeds "add no failover
+    redundancy", which is a sentence about a group that records.
 
     Warnings, all soft:
       - format_mismatch / unverified_format: _format_warnings() above
@@ -242,9 +246,11 @@ def _group_view(g, latest_by_channel=None, monitored_ids=None, memberships=None,
                  if t and t.test_started_at]
     last_tested = max(tested_at) if tested_at else None
 
-    # Part H drift-coverage: members not in any active recurring health check (their
-    # format could drift without the group's mismatch state being re-verified).
-    unmonitored_count = (sum(1 for ch in members if ch.id not in monitored_ids)
+    # Part H drift-coverage: participating members not in any active recurring health
+    # check (their format could drift without the group's mismatch state being
+    # re-verified). Same scope as the detail page's count (group_detail_rows).
+    unmonitored_count = (sum(1 for ch in members
+                             if ch.id in participating_ids and ch.id not in monitored_ids)
                          if monitored_ids is not None else None)
 
     return {
@@ -321,9 +327,10 @@ def _member_ctx(ch, latest_by_channel, disabled_tooltip, is_best):
 
 
 def _check_ctx(job, channel_ids, inherited, tests_by_job=None, ct_cfg=None):
-    """One health-check chip's worth of display fields for a group row - a job
-    attached to this group (inherited=False) or the system job covering this
-    channel-kind group's members incidentally (inherited=True, §14.5).
+    """One health-check chip's worth of display fields for a group row - the group's own
+    check (inherited=False) or the system job covering this group's members incidentally
+    (inherited=True, §14.5). Those are two different facts about a row and each has its
+    own chip; a group carries exactly one check of its own (dev/changelog/1077).
 
     `tests_by_job`: the batched {job_id: {channel_id: test}} map from
     `get_job_result_counts_batch()`. List views MUST pass it - without it this runs one
@@ -349,10 +356,14 @@ def _check_ctx(job, channel_ids, inherited, tests_by_job=None, ct_cfg=None):
         'scheduled_et': _fmt_et(job.scheduled_start_time),
         'completed_et': _fmt_et(job.completed_at),
         'completed_iso': job.completed_at.isoformat() if job.completed_at else '',
-        'has_schedule': bool(job.recurring or job.status == 'SCHEDULED'),
+        'has_schedule': bool(job.recurring or job.status == OD_JOB_STATUS_SCHEDULED),
         # Narrower than has_schedule, which a paused recurring job still satisfies:
         # this one is "will it actually fire", and is what a coverage claim reads.
         'schedule_live': schedule_is_live(job),
+        # What the chip renders, decided once here rather than in a template branch
+        # chain, so the filter dimension below and the chip can never disagree about
+        # which state a check is in.
+        'state': _check_state(job),
         'inherited': inherited,
         'profile_name': job.profile.name if job.profile else None,
         'detail_url': url_for('channels.health_check_detail', job_id=job.id),
@@ -361,13 +372,55 @@ def _check_ctx(job, channel_ids, inherited, tests_by_job=None, ct_cfg=None):
     }
 
 
-def _check_dimension(checks):
-    """Group-level 'Health check' filter dimension (§14.6): sched | oneoff | none."""
-    if not checks:
+def _check_state(job):
+    """The one enumeration of what a group's health check is doing right now:
+
+      running   - a run is in progress
+      cancelled - a run was stopped before it finished
+      recur     - a recurrence that will fire
+      paused    - a recurrence that is switched off
+      once      - a one-off run still ahead of us
+      none      - no schedule at all (never run, or run and finished)
+
+    Every OnDemandTestJob status maps onto one of them, so the chip that renders this
+    needs no trailing `else` standing in for a real state (CLAUDE.md "states are
+    enumerated"). Order matters: a CANCELLED recurring check will not fire again, so it
+    must not read as a live recurrence, and a run in progress outranks everything.
+
+    Returns None for a status outside the vocabulary, which the caller renders as an
+    unknown state naming the status rather than as any of the six above."""
+    if job.status == OD_JOB_STATUS_RUNNING:
+        return 'running'
+    if job.status == OD_JOB_STATUS_CANCELLED:
+        return 'cancelled'
+    if job.status == OD_JOB_STATUS_SCHEDULED:
+        if job.recurring:
+            return 'paused' if job.recur_paused else 'recur'
+        return 'once'
+    if job.status in (OD_JOB_STATUS_QUEUED, OD_JOB_STATUS_COMPLETED):
         return 'none'
-    if any(c['has_schedule'] for c in checks):
-        return 'sched'
-    return 'oneoff'
+    return None
+
+
+def _check_dimension(check):
+    """Group-level 'Health check' filter dimension (§14.6): recur | once | none.
+
+    A check either repeats, has a single run still ahead of it, or has no schedule.
+    There is no "no check at all" bucket - every group carries one
+    (dev/changelog/1077) - so this reads the schedule rather than the run state:
+    `recurring` survives a run (the status is RUNNING for its duration) and a paused
+    recurrence is still a recurrence the filter should find.
+
+    Reads the group's OWN check and nothing else. Folding the inherited automatic check
+    in here filed a group with no schedule of its own under "On a schedule", which is the
+    opposite of what somebody filtering for gaps in their monitoring is asking."""
+    if check is None:
+        return 'none'
+    if check['recurring']:
+        return 'recur'
+    if check['status'] == OD_JOB_STATUS_SCHEDULED:
+        return 'once'
+    return 'none'
 
 
 def _check_health(check):
@@ -376,9 +429,9 @@ def _check_health(check):
     attached at all."""
     if check is None:
         return 'none', 'No health check attached'
-    if check['status'] == 'RUNNING':
+    if check['status'] == OD_JOB_STATUS_RUNNING:
         return 'run', 'Running now'
-    if check['status'] == 'CANCELLED':
+    if check['status'] == OD_JOB_STATUS_CANCELLED:
         return 'none', 'Cancelled'
     if check['fail_count']:
         return 'bad', f"{check['fail_count']} failing"
@@ -409,10 +462,10 @@ def _last_activity(members, checks):
 
 
 def _channel_group_row(g, latest_by_channel, monitored_ids, system_job, system_channel_ids,
-                       memberships, jobs, blocking_recordings, tests_by_job,
+                       memberships, job, blocking_recordings, tests_by_job,
                        streak_threshold=DEFAULT_FAILING_STREAK_THRESHOLD, ct_cfg=None, cfg=None):
     view = _group_view(g, latest_by_channel, monitored_ids, memberships, streak_threshold, cfg)
-    off_tooltip = (_RECORDING_OFF_TOOLTIP if participation_is_recording(g)
+    off_tooltip = (_RECORDING_OFF_TOOLTIP if participation_is_recording(g, memberships)
                    else _TEST_DISABLED_TOOLTIP)
     members = [
         _member_ctx(ch, latest_by_channel,
@@ -422,13 +475,22 @@ def _channel_group_row(g, latest_by_channel, monitored_ids, system_job, system_c
     ]
     member_ids = [ch.id for ch in view['members']]
 
-    checks = [_check_ctx(job, member_ids, inherited=False, tests_by_job=tests_by_job, ct_cfg=ct_cfg)
-              for job in jobs]
+    # The group's own check, and separately whatever the automatic TV Guide check covers
+    # here. Two different facts about the row, so two chips, never one list the template
+    # has to tell apart (dev/changelog/1077). `job` is None only for a group the unique
+    # index should have made impossible; say so rather than render a silent gap.
+    check = (_check_ctx(job, member_ids, inherited=False, tests_by_job=tests_by_job,
+                        ct_cfg=ct_cfg) if job is not None else None)
+    if check is None:
+        log.warning('Group %s (%s) carries no health check - every group is minted with '
+                    'one, so this row is missing a check the schema requires', g.id, g.name)
+    inherited_check = None
     if system_job is not None:
         covered = [cid for cid in member_ids if cid in system_channel_ids]
         if covered:
-            checks.append(_check_ctx(system_job, covered, inherited=True,
-                                     tests_by_job=tests_by_job, ct_cfg=ct_cfg))
+            inherited_check = _check_ctx(system_job, covered, inherited=True,
+                                         tests_by_job=tests_by_job, ct_cfg=ct_cfg)
+    checks = [c for c in (check, inherited_check) if c is not None]
 
     recordings = [{'id': r.id, 'name': r.name, 'status': r.status,
                   'when': _fmt_et(r.start_time)} for r in blocking_recordings]
@@ -475,15 +537,13 @@ def _channel_group_row(g, latest_by_channel, monitored_ids, system_job, system_c
     if any(m['status'] == 'WAITING' for m in members):
         issues.append('untested')
 
-    # An attached (never inherited) schedule on this group. The inherited system check is
-    # the automatic TV Guide check, which has its own row.
-    attached = [c for c in checks if not c['inherited']]
-    # The group's own health class and its schedule's, both `st-` prefixed for the list's
+    # The group's own health class and its check's, both `st-` prefixed for the list's
     # health filter: one row has to match if EITHER matches. `health_cls` below is the
-    # worse of the two - that is what colours the row and drives the sort.
+    # worse of the two - that is what colours the row and drives the sort. The inherited
+    # automatic check is not this group's and never colours it.
     health_set = [f'st-{health_cls}']
-    if attached:
-        check_cls, check_label = _check_health(attached[-1])
+    if check is not None:
+        check_cls, check_label = _check_health(check)
         health_set.append(f'st-{check_cls}')
         health_cls, health_label = _worst_health([(health_cls, health_label),
                                                   (check_cls, check_label)])
@@ -493,7 +553,7 @@ def _channel_group_row(g, latest_by_channel, monitored_ids, system_job, system_c
         'in_guide': g.in_guide, 'format_strategy': g.format_strategy,
         'health_score': hscore, 'health_cls': health_cls, 'health_label': health_label,
         'health_set': health_set, 'health_n': g.health_score_sample_count,
-        'attached_checks': attached,
+        'attached_checks': [check] if check is not None else [],
         'members': members, 'member_count': len(members),
         'recording_count': view['active_count'], 'disabled_count': view['disabled_count'],
         # What the Mixed format badge's tooltip names: the pin, and each member off it.
@@ -508,7 +568,8 @@ def _channel_group_row(g, latest_by_channel, monitored_ids, system_job, system_c
         'reference_label': view['reference_label'] if view['reference_key'] else None,
         'locked': view['locked'],
         'best_active': next((m for m in members if m['is_best']), None),
-        'checks': checks, 'check_dim': _check_dimension(checks),
+        'check': check, 'inherited_check': inherited_check,
+        'check_dim': _check_dimension(check),
         'recordings': recordings,
         'accounts': sorted({m['account_name'] for m in members}),
         'issues': issues,
@@ -517,7 +578,7 @@ def _channel_group_row(g, latest_by_channel, monitored_ids, system_job, system_c
     }
 
 
-def _system_group_row(g, latest_by_channel, channels, disabled_ids, jobs, tests_by_job,
+def _system_group_row(g, latest_by_channel, channels, disabled_ids, job, tests_by_job,
                       ct_cfg=None):
     """The pinned "TV Guide Channels" row. Its membership is computed rather than stored
     (channel_groups.check_target_channels), so it cannot go through _channel_group_row's
@@ -534,10 +595,10 @@ def _system_group_row(g, latest_by_channel, channels, disabled_ids, jobs, tests_
         for ch in ranked
     ]
     channel_ids = [ch.id for ch in channels]
-    checks = [_check_ctx(job, channel_ids, inherited=False, tests_by_job=tests_by_job, ct_cfg=ct_cfg)
-              for job in jobs]
+    check = (_check_ctx(job, channel_ids, inherited=False, tests_by_job=tests_by_job,
+                        ct_cfg=ct_cfg) if job is not None else None)
 
-    health_cls, health_label = _check_health(checks[-1] if checks else None)
+    health_cls, health_label = _check_health(check)
 
     issues = []
     if not members:
@@ -550,20 +611,20 @@ def _system_group_row(g, latest_by_channel, channels, disabled_ids, jobs, tests_
         'in_guide': False, 'format_strategy': g.format_strategy,
         'health_score': None, 'health_cls': health_cls, 'health_label': health_label,
         'health_set': [f'st-{health_cls}'], 'health_n': 0,
-        'attached_checks': checks,
+        'attached_checks': [check] if check is not None else [],
         'members': members, 'member_count': len(members),
         'recording_count': 0, 'disabled_count': len(disabled_ids),
         'format_warning': None, 'unmonitored_count': 0,
         'reference_label': None, 'locked': False, 'best_active': None,
-        'checks': checks, 'check_dim': _check_dimension(checks),
+        'check': check, 'inherited_check': None,
+        'check_dim': _check_dimension(check),
         'recordings': [],
         'accounts': sorted({m['account_name'] for m in members}),
         'issues': issues,
-        'last_activity': _last_activity(members, checks),
-        # The system group has no detail page of its own - "Details" opens its schedule's
-        # results page. Ambiguous only for the rare 2-checks case (e.g. a nightly quick +
-        # weekly deep check on one group); first job wins.
-        'detail_url': checks[0]['detail_url'] if checks else None,
+        'last_activity': _last_activity(members, [check] if check is not None else []),
+        # The automatic group's page, like every other group's. It used to link at its
+        # check's own URL, which is now a redirect to exactly this (dev/changelog/1077).
+        'detail_url': url_for('channel_groups.group_detail', group_id=g.id),
     }
 
 
@@ -572,17 +633,16 @@ def groups_page():
     """The Groups tab (DESIGN.md §14): every ChannelGroup, one list.
 
     There is one kind of group. A group used only for health checking is one whose
-    format_strategy is health_check_only and whose members are all recording-disabled,
+    members are all recording-disabled,
     which is a configuration rather than a separate type - so this page no longer
     sections by kind and no longer merges a group with its schedule into a "pair"
     (DESIGN-channel-groups-model.md DECIDED 2).
 
     Every per-group lookup below is batched once across all groups rather than
     queried inside the per-group loop (CLAUDE.md's no-N+1 rule) - both
-    `ChannelGroup.memberships` and `OnDemandTestJob.group`'s `test_jobs` backref are
+    `ChannelGroup.memberships` and `OnDemandTestJob.group`'s `check` backref are
     `lazy=True`, so touching either per group in the loop is one query per group."""
-    from ..channel_tester import (monitored_channel_ids, get_status,
-                                  health_check_profile_payload)
+    from ..channel_tester import monitored_channel_ids, get_status
 
     cfg = load_config()
     ct_cfg = cfg.get('channel_testing', {})
@@ -600,10 +660,13 @@ def groups_page():
         for m in rows:
             memberships_by_group.setdefault(m.group_id, []).append(m)
 
-    jobs_by_group = {}
+    # One job per group, so a {group_id: job} map is provably unique - the unique index on
+    # on_demand_test_jobs.group_id is the argument (CLAUDE.md "keyed lookups need a
+    # uniqueness argument", dev/changelog/1077).
+    job_by_group = {}
     if groups:
         for job in OnDemandTestJob.query.filter(OnDemandTestJob.group_id.in_([g.id for g in groups])).all():
-            jobs_by_group.setdefault(job.group_id, []).append(job)
+            job_by_group[job.group_id] = job
 
     all_member_ids = set()
     for gid, memberships in memberships_by_group.items():
@@ -616,12 +679,11 @@ def groups_page():
     latest = _latest_tests_by_channel(list(all_member_ids))
     monitored_ids = monitored_channel_ids()
     # Every check's per-channel results in ONE query. Per-check is an N+1 across the page
-    # and each linked pair carries at least one check.
-    all_job_ids = [job.id for jobs in jobs_by_group.values() for job in jobs]
-    tests_by_job = get_job_result_counts_batch(all_job_ids, list(all_member_ids))
+    # and every group carries a check.
+    tests_by_job = get_job_result_counts_batch([j.id for j in job_by_group.values()],
+                                               list(all_member_ids))
 
-    system_jobs = jobs_by_group.get(system_group.id, []) if system_group else []
-    system_job = system_jobs[0] if system_jobs else None
+    system_job = job_by_group.get(system_group.id) if system_group else None
     system_channel_ids = {ch.id for ch in system_channels}
 
     blocking_by_group = {}
@@ -635,36 +697,29 @@ def groups_page():
 
     group_rows = []
     for g in groups:
-        jobs = jobs_by_group.get(g.id, [])
+        job = job_by_group.get(g.id)
         if g.is_system:
             group_rows.append(_system_group_row(g, latest, system_channels,
-                                                system_disabled_ids, jobs, tests_by_job, ct_cfg))
+                                                system_disabled_ids, job, tests_by_job, ct_cfg))
         else:
             group_rows.append(_channel_group_row(g, latest, monitored_ids,
                                                  system_job, system_channel_ids,
-                                                 memberships_by_group.get(g.id, []), jobs,
+                                                 memberships_by_group.get(g.id, []), job,
                                                  blocking_by_group.get(g.id, []),
                                                  tests_by_job, streak_threshold, ct_cfg, cfg))
     # The pinned system group stays first under every sort (DESIGN.md §14.1).
     group_rows.sort(key=lambda r: (not r['system'], r['name'].lower()))
 
-    # The Create-health-check modal's profile readout, folded once for the whole page.
-    # Building it per group row is the /guide-11s defect class - hand the resolver the
-    # config dict that is already in hand (dev/changelog/321).
-    check_profiles = health_check_profile_payload(
-        load_config().get('channel_testing', {}),
-        HealthCheckProfile.query.order_by(HealthCheckProfile.name).all())
     # For the Create-group modal's client-side name-conflict check and its Manual format
-    # mode. Both are per-request, never per row.
+    # mode. Both are per-request, never per row. No health-check profile payload and no
+    # schedule-picker template: this page no longer opens a check modal at all - a check
+    # is scheduled from its group's own Settings (dev/changelog/1078).
     resolution_options, fps_options = _format_option_sets({'resolution': '', 'fps': None})
-    from ..check_window import format_window_label
-    window_label = format_window_label(ct_cfg)
     return render_template('channels/groups.html',
         group_rows=group_rows,
         group_names=[g.name for g in groups],
         resolution_options=resolution_options, fps_options=fps_options,
-        check_profiles=check_profiles, tester_status=get_status(),
-        window_label=window_label)
+        tester_status=get_status())
 
 
 def _group_tests(job_names, recordings):
@@ -686,7 +741,7 @@ def _group_tests(job_names, recordings):
     return ChannelTest.query.filter(db.or_(*scopes)).all()
 
 
-def _build_group_timeline(group, pinned_job=None):
+def _build_group_timeline(group):
     """Merge this group's ChannelTests + group-backed Recordings + those recordings'
     GROUP_* RecordingEvents + members' grouping ChannelEvents + the group's own
     ChannelGroupEvents into one chronological (newest-first) list of dicts, for the group
@@ -695,14 +750,11 @@ def _build_group_timeline(group, pinned_job=None):
     _build_channel_timeline in routes/channels.py.
 
     A test entry is here because THIS GROUP'S OWN WORK produced it, never because of who
-    is a member today (dev/changelog/790): the tests any check attached to this group ran,
-    plus the pre-recording checks run for this group's own recordings. Scoping them by
-    current membership instead put another group's check on a shared feed, and a one-off
-    "Test now", on this page as if this check had run them - while a channel that WAS in a
-    run and has since been removed vanished from its own history. `pinned_job` narrows the
-    test half to one check, which is what /channels/health-checks/<id> is: the same page
-    entered by check rather than by group, so the timeline it shows is that check's runs.
-    Everything else below is a fact about the group and stays group-scoped either way.
+    is a member today (dev/changelog/790): the tests the group's one check ran, plus the
+    pre-recording checks run for this group's own recordings. Scoping them by current
+    membership instead put another group's check on a shared feed, and a one-off "Test
+    now", on this page as if this check had run them - while a channel that WAS in a run
+    and has since been removed vanished from its own history.
 
     Membership still comes from check_target_channels(), not `group.memberships`, for the
     ChannelEvent pull: the system group stores no membership rows (it is computed from the
@@ -724,9 +776,8 @@ def _build_group_timeline(group, pinned_job=None):
     names = {ch.id: ch.name for ch in members}
 
     recordings = Recording.query.filter_by(group_id=group.id).all()
-    job_names = ({pinned_job.id: pinned_job.name} if pinned_job is not None
-                 else {j.id: j.name for j in group.test_jobs})
-    tests = _group_tests(job_names, [] if pinned_job is not None else recordings)
+    job_names = {group.check.id: group.check.name} if group.check is not None else {}
+    tests = _group_tests(job_names, recordings)
 
     # A test may sit on a channel that has since left the group, so its name is resolved
     # with the same batched extra lookup the group's own events below use rather than
@@ -851,21 +902,16 @@ def _format_option_sets(group_format):
 
 # ── Unified group / health-check detail page ────────────────────────────────
 #
-# ONE page and ONE builder back both `/channel-groups/<id>` and
-# `/channels/health-checks/<job_id>` (dev/changelog/273). A ChannelGroup is the
-# primary object; an attached OnDemandTestJob is a schedule it may or may not have, so
-# the page's structure is driven by three booleans:
+# ONE page and ONE builder back `/channel-groups/<id>`, which
+# `/channels/health-checks/<job_id>` redirects to (dev/changelog/273). A ChannelGroup is the
+# object and its one OnDemandTestJob is the schedule it carries (dev/changelog/1077), so
+# the page's structure is driven by two booleans:
 #   is_stored = an ordinary group, with stored membership - everything but the pinned
 #               system group, whose membership is computed at display time
 #   records   = at least one member has Recording on, so a recording (and a guide row)
 #               can start from this group at all - what the page says about itself
-#   has_check = a health check schedule is attached (job is not None)
-# Every section keys off those. Both routes funnel through
-# build_group_detail_context() so a group opened from either URL renders identically.
-
-# `linked` sits between summary and settings (dev/changelog/323): an attached schedule
-# is a thing you can see and act on, not a chip in the title bar.
-GROUP_DETAIL_SECTIONS = ('summary', 'linked', 'settings', 'channels', 'activity')
+# Every section keys off those, through build_group_detail_context().
+GROUP_DETAIL_SECTIONS = ('summary', 'settings', 'channels', 'activity')
 
 # Optional Channels-table columns, per facet. Structural columns (select, caret,
 # Channel, actions) are never user-hideable and are not listed here.
@@ -899,17 +945,6 @@ GROUP_DETAIL_COLUMNS = {
 # decides what a key starts as, and overriding a visibility the user is already storing is
 # the app answering a question that belongs to them.
 GROUP_DETAIL_COLUMNS_OFF = ('fps', 'framePct', 'audio', 'epg', 'drops')
-
-
-def _group_detail_job(group):
-    """The health check this group's detail page shows, or None.
-
-    Several jobs may attach to one group (a nightly quick check plus a weekly deep
-    one), but the page renders exactly one - the newest, which is the one whose
-    results the table is showing. Opening a specific check by its own URL pins that
-    one instead."""
-    jobs = sorted(group.test_jobs, key=lambda j: j.id)
-    return jobs[-1] if jobs else None
 
 
 def _format_source_map(latest, latest_any):
@@ -1059,6 +1094,7 @@ def group_detail_rows(group, job):
         format_override = sel.override
     recording_ids = {m.channel_id for m in memberships if m.recording_enabled}
     test_ids = test_member_ids(memberships)
+    participating_ids = participating_member_ids(group, memberships) if stored else set()
 
     # The measurement the lock-derived facts above were decided on, whenever it is NOT the
     # one this table renders. Both maps are already loaded, so this costs one query for the
@@ -1142,18 +1178,23 @@ def group_detail_rows(group, job):
         # and so named the group's existing lock back at it (dev/changelog/890).
         'derived_reference_label': format_label(derived_ref_key) if derived_ref_key else None,
         'mismatch_count': len(outlier_ids),
-        'unmonitored_count': sum(1 for ch in channels if ch.id not in monitored_ids) if stored else 0,
+        # Participating members only - the same scope _banner_facts' copy of this count
+        # takes, so the header figure and the banner cannot disagree.
+        'unmonitored_count': (sum(1 for ch in channels
+                                  if ch.id in participating_ids and ch.id not in monitored_ids)
+                              if stored else 0),
         'warnings': _banner_facts(group, channels, latest_any, recording_ids,
                                   format_blocked_ids, format_override, best_active_id,
-                                  monitored_ids, job is not None, ref_key,
-                                  lock_ranking_ids(memberships) if stored else None)
+                                  monitored_ids, ref_key,
+                                  lock_ranking_ids(memberships) if stored else None,
+                                  participating_ids=participating_ids)
         if stored else None,
     }
 
 
 def _banner_facts(group, channels, latest, recording_ids, format_blocked_ids,
-                  format_override, best_active_id, monitored_ids, has_check, ref_key,
-                  rank_ids=None):
+                  format_override, best_active_id, monitored_ids, ref_key,
+                  rank_ids=None, participating_ids=None):
     """Everything section 16's warning banners need, decided server-side.
 
     The banners are gated and counted here rather than in group-detail.js because every
@@ -1161,10 +1202,14 @@ def _banner_facts(group, channels, latest, recording_ids, format_blocked_ids,
     format" is a disagreement the user reads as the page arguing with itself. The client
     renders and words them; it decides nothing.
 
-    Scoped to the RECORDING-ENABLED members throughout. Section 16.1: "If record is
-    disabled then no need to show the same warnings, because it isn't set to record
-    anyways" - a member sitting out is not part of what this group would record, so it is
-    not part of what a warning about that recording describes.
+    Scoped to the RECORDING-ENABLED members throughout, with one named exception.
+    Section 16.1: "If record is disabled then no need to show the same warnings, because
+    it isn't set to record anyways" - a member sitting out is not part of what this group
+    would record, so it is not part of what a warning about that recording describes.
+    The exception is `unmonitored_count`, which is scoped to the PARTICIPATING members
+    (either switch on): the drift warning has to fire for a group nobody records from,
+    whose recording set is empty by design, and a member with both switches off is
+    deliberately sitting out and is not a drift risk (dev/changelog/1077).
 
     `latest` is the ANY_JOB map, not the job-scoped one the rows render: every banner here
     describes what the lock and the recorder would do, and those read each member's own
@@ -1173,6 +1218,8 @@ def _banner_facts(group, channels, latest, recording_ids, format_blocked_ids,
 
     Every value is derived from data the caller already loaded; nothing here queries."""
     recording = [ch for ch in channels if ch.id in recording_ids]
+    if participating_ids is None:
+        participating_ids = recording_ids
 
     # The EPG tally behind the section 8 banner. Members with no id at all are counted
     # separately: unknown is not mismatched, and saying so is what keeps the banner from
@@ -1199,7 +1246,9 @@ def _banner_facts(group, channels, latest, recording_ids, format_blocked_ids,
         'no_winner': no_winner,
         'no_winner_rationale': entry.get('rationale') if no_winner else None,
         'manages_format': group_manages_format(group),
-        'is_source': group.format_strategy != GROUP_FORMAT_HEALTH_CHECK_ONLY,
+        # The one definition of "this group records": a member has Recording on. Not
+        # the strategy, which a group carries whether or not anyone records from it.
+        'is_source': bool(recording_ids),
         'muted': [k for k in GROUP_WARNING_KINDS if k in group.muted_warning_set()],
         'recording_count': len(recording),
         'in_guide': bool(group.in_guide),
@@ -1247,8 +1296,8 @@ def _banner_facts(group, channels, latest, recording_ids, format_blocked_ids,
         # The drift-coverage warning, moved off the template so it follows a Health check
         # switch instead of waiting for a reload (handed forward by dev/changelog/756).
         # Every other banner on this page is already decided here for the same reason.
-        'unmonitored_count': sum(1 for ch in channels if ch.id not in monitored_ids),
-        'has_check': bool(has_check),
+        'unmonitored_count': sum(1 for ch in channels
+                                 if ch.id in participating_ids and ch.id not in monitored_ids),
     }
 
 
@@ -1257,12 +1306,22 @@ def _schedule_ctx(job, ct_cfg=None):
     needs. `mode` is derived, never stored - the DB carries recurring/
     scheduled_start_time and this renders them (dev/changelog/272 round 4).
 
+    `use_window` is produced here and carries three values, which is the one place
+    they are all named: True = the maintenance window, False = an exact time, None =
+    this check has never answered the question, so the seam states no opinion and the
+    picker's own rendered default (the window) stands. Only a RECURRING check has ever
+    answered it - on a one-off or an unscheduled check, `recur_use_window` is an
+    untouched column default, not a choice. schedule-fields.js::prefill() is the reader
+    and treats an explicit False as a real answer, and `setMode()` never moves the radio
+    afterwards, so shipping that default lands the user on an exact time nobody picked
+    the moment the block is switched to Recurring (dev/changelog/1074, `1075`).
+
     `ct_cfg`: forwarded to `_recur_label()`, see `_check_ctx()`'s docstring."""
     if job is None:
         return None
     if job.recurring:
         mode = 'recur'
-    elif job.status == 'SCHEDULED' and job.scheduled_start_time:
+    elif job.status == OD_JOB_STATUS_SCHEDULED and job.scheduled_start_time:
         mode = 'once'
     else:
         mode = 'manual'
@@ -1272,12 +1331,18 @@ def _schedule_ctx(job, ct_cfg=None):
         label = f'One time, {_fmt_et(job.scheduled_start_time)}'
     else:
         label = _recur_label(job, ct_cfg)
+    # Two adjacent keys, two different questions, so two predicates. `recur_time` is a
+    # seed for a schedule being built from nothing, which is `manual` only; a stored
+    # hour, or its absence on a window check, belongs to whoever set the schedule.
+    never_scheduled = mode == 'manual'
+    no_window_opinion = mode != 'recur'
     return {
         'mode': mode,
         'label': label,
         'recur_day': job.recur_day if job.recur_day is not None else 0,
-        'recur_time': f'{job.recur_hour or 0:02d}:{job.recur_minute or 0:02d}',
-        'use_window': bool(job.recur_use_window),
+        'recur_time': ('03:00' if never_scheduled
+                       else f'{job.recur_hour or 0:02d}:{job.recur_minute or 0:02d}'),
+        'use_window': None if no_window_opinion else bool(job.recur_use_window),
         'oneoff_value': (local_input_value(job.scheduled_start_time)
                          if job.scheduled_start_time else ''),
         'paused': job.recur_paused,
@@ -1286,13 +1351,61 @@ def _schedule_ctx(job, ct_cfg=None):
     }
 
 
-def build_group_detail_context(group, job, pinned_check=False):
-    """Everything the unified detail template renders, for one (group, check) pair.
+# Every state the group page's status/action bar can be in, and the one place the list
+# exists. `unknown` is the safety net: a status outside OD_JOB_STATUSES renders as itself
+# rather than borrowing whatever the last branch happened to draw.
+#
+# Three separate branch chains used to derive this in Jinja - one for the badge, one for
+# the message, one for the buttons - and each ended in a trailing `{% else %}` that
+# rendered a real state. A recurring SCHEDULED check matched no branch in the actions
+# chain, fell into its else, and got the one button wired to a route that refuses it
+# (dev/changelog/1076, dev/docs/BUGS.md 2026-09-21). CLAUDE.md's "states are enumerated"
+# rule applied literally: the chain is written once, in Python, against the constants.
+BAR_RUNNING            = 'running'              # this job's test loop is live right now
+BAR_STUCK              = 'stuck'                # status RUNNING, but no tester behind it
+BAR_SCHEDULED_ONCE     = 'scheduled_once'       # a one-off trigger is armed
+BAR_SCHEDULED_RECUR    = 'scheduled_recurring'  # a cron or window trigger is armed
+BAR_QUEUED             = 'queued'               # exists, no schedule
+BAR_COMPLETED          = 'completed'
+BAR_CANCELLED          = 'cancelled'
+BAR_UNKNOWN            = 'unknown'
 
-    `pinned_check` says the page was entered by check URL rather than by group, which
-    both entry points otherwise look identical from here: /channel-groups/<id> pins the
-    newest attached check for the table too. It is what scopes the Activity Timeline's
-    test entries to that one check's runs (dev/changelog/790)."""
+BAR_STATES = (
+    BAR_RUNNING, BAR_STUCK, BAR_SCHEDULED_ONCE, BAR_SCHEDULED_RECUR,
+    BAR_QUEUED, BAR_COMPLETED, BAR_CANCELLED, BAR_UNKNOWN,
+)
+
+
+def _action_bar_state(job, tester_status):
+    """Which of BAR_STATES the group page's status bar is in, or None with no check.
+
+    RUNNING splits on whether the tester is actually working on THIS job: a row left
+    RUNNING by a killed process is a different thing to say and a different thing to
+    offer (Force Cancel, not Stop), and the two are only distinguishable by asking the
+    tester rather than the row."""
+    if job is None:
+        return None
+    if job.status == OD_JOB_STATUS_RUNNING:
+        live = (tester_status.get('is_running')
+                and tester_status.get('current_job_id') == job.id)
+        return BAR_RUNNING if live else BAR_STUCK
+    if job.status == OD_JOB_STATUS_SCHEDULED:
+        return BAR_SCHEDULED_RECUR if job.recurring else BAR_SCHEDULED_ONCE
+    if job.status == OD_JOB_STATUS_QUEUED:
+        return BAR_QUEUED
+    if job.status == OD_JOB_STATUS_COMPLETED:
+        return BAR_COMPLETED
+    if job.status == OD_JOB_STATUS_CANCELLED:
+        return BAR_CANCELLED
+    return BAR_UNKNOWN
+
+
+def build_group_detail_context(group):
+    """Everything the unified detail template renders for one group and its one check.
+
+    `job` is `group.check` - every group carries exactly one, so there is nothing to pin
+    and the Activity Timeline is always the group's (dev/changelog/1077). The system
+    group's check is the automatic TV Guide check."""
     from .channels import _ListPagination, CHANNEL_HEALTH_PAGE_SIZES
     from ..channel_tester import get_status, health_check_profile_payload
 
@@ -1300,17 +1413,16 @@ def build_group_detail_context(group, job, pinned_check=False):
     from ..check_window import format_window_label
     window_label = format_window_label(ct_cfg)
     is_stored = not group.is_system
+    job = group.check
     payload = group_detail_rows(group, job)
 
-    # What the page may SAY it is, as opposed to what it structurally is. A recording and
-    # a guide row both start from recording_members(), so a group with none records
-    # nothing whatever its format strategy says, and must not describe itself as a
-    # recording source - "a group with no member enabled for recording is simply a health
-    # check" is the Groups list page's own sentence for that state.
-    # Deliberately not participation_is_recording(): that gate answers which switch a
-    # member ROW is drawn by, and is keyed on format_strategy - a standing setting rather
-    # than a fact about what would happen if a recording started now (dev/changelog/750).
-    records = bool(recording_members(group.memberships))
+    # What the page may SAY it is. A recording and a guide row both start from
+    # recording_members(), so a group with none records nothing whatever its format
+    # strategy says, and must not describe itself as a recording source - "a group with no
+    # member enabled for recording is simply a health check" is the Groups list page's
+    # own sentence for that state. The same fact participation_is_recording() reads
+    # (dev/changelog/1077); spelled through it so the two cannot drift apart again.
+    records = participation_is_recording(group)
 
     # The Channels table's own status pills are corrected live by group-detail.js
     # (rowStatus() vs. testerStatus), but the Activity Timeline below is server-rendered
@@ -1346,16 +1458,12 @@ def build_group_detail_context(group, job, pinned_check=False):
     resolution_options, fps_options = _format_option_sets(
         group_format or {'resolution': '', 'fps': None})
 
-    timeline_job = job if (pinned_check and job is not None) else None
-    all_entries = _build_group_timeline(group, pinned_job=timeline_job)
+    all_entries = _build_group_timeline(group)
     # What the timeline is scoped to, said rather than left to be inferred - the whole
     # defect it replaces was a reader taking these entries for one check's own work
     # (dev/changelog/790).
-    timeline_scope = (
-        f'Health tests from "{timeline_job.name}" only. The recordings and group changes '
-        f'below are the group\'s.' if timeline_job is not None else
-        "Health tests this group's own checks and pre-recording checks ran, plus its "
-        'recordings and changes.')
+    timeline_scope = ("Health tests this group's check and pre-recording checks ran, plus "
+                      'its recordings and changes.')
     per_page = request.args.get('timeline_per_page', '25')
     if per_page not in CHANNEL_HEALTH_PAGE_SIZES:
         per_page = '25'
@@ -1368,32 +1476,21 @@ def build_group_detail_context(group, job, pinned_check=False):
         start = (page - 1) * per
         entries = all_entries[start:start + per]
 
-    # Every attached check, not just the one the table is pinned to: the `linked` section
-    # lists them all, and a group carrying more than one has to say which run the Summary
-    # bar and each Settings chip belong to.
     channel_ids = [r['channel_id'] for r in payload['rows']]
-    checks = []
-    for attached in sorted(group.test_jobs, key=lambda j: j.id):
-        ctx = _check_ctx(attached, channel_ids, inherited=False, ct_cfg=ct_cfg)
-        ctx['health_cls'], ctx['health_label'] = _check_health(ctx)
-        ctx['is_primary'] = job is not None and attached.id == job.id
-        ctx['schedule_label'] = _schedule_ctx(attached, ct_cfg)['label']
-        checks.append(ctx)
 
-    # Notice #2 of the Create-health-check modal (dev/changelog/321): this group is
-    # already covered incidentally by the automatic TV Guide check. Asked of the check's
-    # own target set, exactly as the groups list asks it of its batched copy
-    # (_channel_group_row) - never re-derived from Channel.in_guide, which since
-    # dev/changelog/752 answers a different question: the automatic check probes one
-    # member per guide row plus one per scheduleless group, and whether a member also
-    # holds its own guide row has nothing to do with whether it is one of them. The
-    # group's own in_guide is not a gate either, because the scheduleless fallback covers
-    # groups that are not in the guide at all. One resolve per page render, not per row.
+    # Whether this group is covered incidentally by the automatic TV Guide check, for
+    # the unmonitored banner's copy. Asked of the check's own target set, exactly as the
+    # groups list asks it of its batched copy (_channel_group_row) - never re-derived
+    # from Channel.in_guide, which since dev/changelog/752 answers a different question:
+    # the automatic check probes one member per guide row plus one per scheduleless
+    # group, and whether a member also holds its own guide row has nothing to do with
+    # whether it is one of them. The group's own in_guide is not a gate either, because
+    # the scheduleless fallback covers groups that are not in the guide at all. One
+    # resolve per page render, not per row.
     inherited_check = None
     if is_stored and channel_ids:
         system_group = ChannelGroup.query.filter_by(is_system=True).first()
-        system_job = (sorted(system_group.test_jobs, key=lambda j: j.id)[0]
-                      if system_group is not None and system_group.test_jobs else None)
+        system_job = system_group.check if system_group is not None else None
         if system_job is not None:
             system_ids = {ch.id for ch in check_target_channels(system_group)[0]}
             covered = sum(1 for cid in channel_ids if cid in system_ids)
@@ -1413,22 +1510,20 @@ def build_group_detail_context(group, job, pinned_check=False):
 
     from ..database import UserPref
     profiles = HealthCheckProfile.query.order_by(HealthCheckProfile.name).all()
-    sec_key = 'both' if (is_stored and job) else ('channel' if is_stored else 'check')
-    # The system group gets its own key rather than borrowing 'check': its membership is
-    # computed, so it has no participation switches to show and must not inherit a saved
-    # column order that names them.
-    col_key = 'system' if not is_stored else ('check' if job else 'channel')
+    # Two page states, stored and system, each with its own saved layout. The key names
+    # are the ones the pages have always saved under for these two states ('both' was a
+    # stored group with its check, which every stored group now is; 'check' the system
+    # group), so a layout saved before dev/changelog/1077 still applies. The system
+    # group's column key is its own: its membership is computed, so it has no
+    # participation switches to show and must not inherit a saved column order that
+    # names them.
+    sec_key = 'both' if is_stored else 'check'
+    col_key = 'check' if is_stored else 'system'
     sec_pref = db.session.get(UserPref, f'group_detail_sections_{sec_key}')
     col_pref = db.session.get(UserPref, f'group_detail_columns_{col_key}')
 
-    if not checks:
-        linked_title = 'Health checks'
-    else:
-        linked_title = f"Health check{'s' if len(checks) != 1 else ''}"
-
-    # Clone-provenance note (dev/changelog/501): a one-time "created
-    # from" pointer, not a live pairing - see `checks`/`inherited_check` above for
-    # that. The source may since have been deleted, converted or renamed, so the
+    # Clone-provenance note (dev/changelog/501): a one-time "created from" pointer, not a
+    # live pairing. The source may since have been deleted, converted or renamed, so the
     # link is offered only while it still resolves; the name always renders from the
     # snapshot taken at clone time either way.
     cloned_from = None
@@ -1443,11 +1538,9 @@ def build_group_detail_context(group, job, pinned_check=False):
     return {
         'group': group,
         'job': job,
-        'checks': checks,
-        'linked_title': linked_title,
         'is_stored': is_stored,
         'records': records,
-        'has_check': job is not None,
+        'bar_state': _action_bar_state(job, tester_status),
         'is_system': group.is_system,
         'payload': payload,
         'group_format': group_format,
@@ -1468,7 +1561,7 @@ def build_group_detail_context(group, job, pinned_check=False):
         'in_progress_test_id': in_progress_test_id,
         'created_et': _fmt_et(group.created_at),
         'updated_et': _fmt_et(group.updated_at),
-        'last_run_et': _fmt_et(job.completed_at) if job and job.completed_at else None,
+        'last_run_et': _fmt_et(job.completed_at) if job.completed_at else None,
         'sec_key': sec_key,
         'col_key': col_key,
         'section_pref': json.loads(sec_pref.value) if sec_pref and sec_pref.value else None,
@@ -1486,22 +1579,15 @@ def build_group_detail_context(group, job, pinned_check=False):
 
 @channel_groups_bp.route('/api/channel-groups/<int:group_id>/detail-rows')
 def group_detail_rows_api(group_id):
-    """Live refresh for the unified detail page's Channels table. `job_id` pins which
-    attached check's results the rows carry; omitted means the group's newest."""
+    """Live refresh for the unified detail page's Channels table, scoped to the group's
+    one check's results."""
     from ..channel_tester import get_status
 
     group = db.session.get(ChannelGroup, group_id)
     if group is None:
         return jsonify({'error': 'Group not found'}), 404
 
-    job_id = request.args.get('job_id', type=int)
-    if job_id is not None:
-        job = db.session.get(OnDemandTestJob, job_id)
-        if job is None or job.group_id != group.id:
-            return jsonify({'error': 'Health check not found on this group'}), 404
-    else:
-        job = _group_detail_job(group)
-
+    job = group.check
     payload = group_detail_rows(group, job)
     return jsonify({
         'success': True,
@@ -1554,7 +1640,7 @@ def group_detail(group_id):
     if group is None:
         abort(404)
     return render_template('channels/group_detail.html',
-                           **build_group_detail_context(group, _group_detail_job(group)))
+                           **build_group_detail_context(group))
 
 
 # ── Group CRUD ──────────────────────────────────────────────────────────────
@@ -1586,7 +1672,7 @@ def create_group():
     # (DESIGN-channel-groups-model.md 14): every member arrives with Health check on and
     # Recording off, and the five format questions are not asked here because at creation
     # time no member has been tested and every strategy would return "run a check first".
-    strategy = data.get('format_strategy') or GROUP_FORMAT_HEALTH_CHECK_ONLY
+    strategy = data.get('format_strategy') or GROUP_FORMAT_HIGHEST_SCORE
     if strategy not in GROUP_FORMAT_STRATEGIES:
         return jsonify({'error': f'Unknown format strategy "{strategy}"'}), 400
 
@@ -1602,14 +1688,12 @@ def create_group():
             return err
 
     if channels:
-        # Gated on the REQUESTED strategy exactly as add_members and clone_group gate it on
-        # the stored one. A group defaults to health_check_only, and a sweep - every member
+        # Never asked here: a new group records from nobody, and a sweep - every member
         # health checked, nothing recording-enabled - is the default shape of a new group
         # rather than a special case (DESIGN-channel-groups-model.md 7), so asking the
-        # format question here would put a warning in front of the most ordinary thing a
-        # user does with this app.
-        warnings = _pending_warnings([], channels, bool(data.get('force')),
-                                     strategy != GROUP_FORMAT_HEALTH_CHECK_ONLY)
+        # format question would put a warning in front of the most ordinary thing a user
+        # does with this app. The question is asked when the group is promoted (14.1).
+        warnings = _pending_warnings([], channels, bool(data.get('force')), ask_format=False)
         if warnings:
             return jsonify({'success': False, **warnings})
 
@@ -1652,7 +1736,7 @@ def add_members(group_id):
 
     warnings = _pending_warnings(
         existing_channels, new_channels, bool(data.get('force')),
-        group.format_strategy != GROUP_FORMAT_HEALTH_CHECK_ONLY)
+        ask_format=participation_is_recording(group))
     if warnings:
         return jsonify({'success': False, **warnings})
 
@@ -1795,10 +1879,11 @@ def _invariant_gate(group, losing_channel_ids, confirmed):
     `error_response` is non-None when the caller must stop.
 
     Every path that can empty a group's recording-enabled set goes through this one
-    function: the single switch, the bulk switch, member removal, and apply-format-plan's
-    remove option. That is the point. A bulk action that counted members its own way would
-    be a guard the user can walk around by selecting two rows instead of one, and 15 is the
-    only thing in this model that is enforced rather than warned about. All four paths are
+    function: the single switch, the bulk switch and member removal (the Pick best format
+    modal's remove option was the fourth until dev/changelog/1077 retired it). That is the
+    point. A bulk action that counted members its own way would be a guard the user can
+    walk around by selecting two rows instead of one, and 15 is the only thing in this
+    model that is enforced rather than warned about. All of the paths are
     held down by tests/test_group_guide_invariant.py.
 
     Two different answers, and the difference is 15.1's:
@@ -2080,6 +2165,25 @@ def toggle_group_guide(group_id):
 _RESOLUTION_RE = re.compile(r'^\d{2,5}x\d{2,5}$')
 
 
+def _needs_promotion_or_none(group):
+    """The gate on the two Settings-side format writers (dev/changelog/1077): a group no
+    member of which has Recording on has no format to be, so `POST .../format` and
+    `POST .../format-strategy` refuse with a 409 carrying `needs_promotion` - the same
+    shape toggle_group_guide's `needs_recording_member` takes, so the client opens the
+    walkthrough it already has. `POST .../promote` is the one door: it writes the
+    strategy, the pin, the switches and the guide flag together, so the group is never
+    left carrying a chosen format that nothing records under. Returns None when the
+    write may proceed."""
+    if participation_is_recording(group):
+        return None
+    return jsonify({
+        'error': (f'No member of "{group.name}" is switched on for recording, so it has '
+                  'no format to choose yet. Set up recording first - that asks which '
+                  'format the group should be and which members it may record from.'),
+        'needs_promotion': True,
+    }), 409
+
+
 @channel_groups_bp.route('/api/channel-groups/<int:group_id>/format', methods=['POST'])
 def set_group_format(group_id):
     """Lock the group format to a resolution+fps, or clear the lock (back to derived).
@@ -2102,6 +2206,9 @@ def set_group_format(group_id):
         return jsonify({'error': 'Group not found'}), 404
     if group.is_system:
         return jsonify({'error': 'The TV Guide Channels group has no group format.'}), 400
+    refused = _needs_promotion_or_none(group)
+    if refused is not None:
+        return refused
 
     data = request.get_json(silent=True) or {}
     clear = bool(data.get('clear')) or (data.get('resolution') in (None, '') and data.get('fps') in (None, ''))
@@ -2149,15 +2256,22 @@ def set_group_format_strategy(group_id):
     The choice is **applied as well as stored** (dev/changelog/753). A standing setting
     that visibly does nothing until the next health check run reads as broken, and the
     engine is the same one that runs nightly, so the two can never disagree about what
-    the setting means. It only ever moves the lock - removing the members that do not
-    match stays the explicit apply-format-plan press, because destroying membership rows
-    is not something a dropdown should do on change.
+    the setting means. It only ever moves the lock - a member that does not match is
+    filtered where members are chosen and never removed, because destroying membership
+    rows is not something a dropdown should do on change.
+
+    Refused with `needs_promotion` on a group no member of which records
+    (_needs_promotion_or_none): Settings edits a group that records, the walkthrough
+    promotes one (dev/changelog/1077).
     """
     group = db.session.get(ChannelGroup, group_id)
     if group is None:
         return jsonify({'error': 'Group not found'}), 404
     if group.is_system:
         return jsonify({'error': 'The TV Guide Channels group has no format strategy.'}), 400
+    refused = _needs_promotion_or_none(group)
+    if refused is not None:
+        return refused
 
     strategy = (request.get_json(silent=True) or {}).get('strategy')
     if strategy not in GROUP_FORMAT_STRATEGIES:
@@ -2227,9 +2341,6 @@ def promote_group(group_id):
     strategy = data.get('strategy')
     if strategy not in GROUP_FORMAT_STRATEGIES:
         return jsonify({'error': f'Unknown format strategy "{strategy}"'}), 400
-    if strategy == GROUP_FORMAT_HEALTH_CHECK_ONLY:
-        return jsonify({'error': 'Promoting a group means choosing a format strategy '
-                                 'other than health checks only.'}), 400
     enable = data.get('enable', 'none')
     if enable not in ('matching', 'all', 'none'):
         return jsonify({'error': "enable must be 'matching', 'all' or 'none'"}), 400
@@ -2276,12 +2387,18 @@ def promote_group(group_id):
     members = member_channels(group.memberships)
     latest = _latest_tests_by_channel([ch.id for ch in members])
     reference = group_reference_key(group, group.memberships, latest)
-    matching_ids = {ch.id for ch in members if format_key(latest.get(ch.id)) == reference}
-    # An unmeasured member is never counted as non-matching: unknown is not
-    # proven-different, and turning its health check off for failing a comparison nothing
-    # could make is how a member ends up recordable with no data behind it forever.
-    unmatched_ids = {ch.id for ch in members
-                     if format_key(latest.get(ch.id)) and ch.id not in matching_ids}
+    # Asked of the one helper that defines "which members clash with the reference", so
+    # the answer here is the one the mismatch banner gives. Its two rules do the work: an
+    # unmeasured member is never an outlier (unknown is not proven-different), and NO
+    # reference means no outliers - and equally nothing provably matching, so
+    # enable='matching' with no reference turns on nothing. Spelled inline, this counted
+    # every untested member as matching a None reference and switched Recording on for
+    # exactly the members nothing had measured (dev/docs/BUGS.md 2026-09-21).
+    _ref, outliers = group_format_outliers(members, latest, reference_key=reference)
+    unmatched_ids = {ch.id for ch in outliers}
+    matching_ids = ({ch.id for ch in members
+                     if format_key(latest.get(ch.id)) is not None and ch.id not in unmatched_ids}
+                    if reference is not None else set())
 
     if enable == 'all':
         turn_on = {ch.id for ch in members}
@@ -2381,115 +2498,6 @@ def set_group_warnings(group_id):
                     'muted': [k for k in GROUP_WARNING_KINDS if k in muted]})
 
 
-@channel_groups_bp.route('/api/channel-groups/<int:group_id>/apply-format-plan', methods=['POST'])
-def apply_format_plan(group_id):
-    """Apply an auto-select-format strategy (app/channel_groups.py::plan_format_selection)
-    to an EXISTING group's current members: lock the group format to the winner, then
-    either disable or remove the members that don't match it. Recomputes the plan from
-    the group's live members and their latest tests server-side - a client-supplied
-    channel list is never trusted (CLAUDE.md: enforcement lives server-side).
-
-    Body: {'strategy': one of FORMAT_STRATEGIES, 'non_matching': 'keep' | 'remove'}.
-    'keep' only sets the lock: the members that do not match it are filtered out wherever
-    members are chosen, and are left in the group untouched, so one that starts matching
-    again is eligible again on its own (DESIGN-channel-groups-model.md 4.1). 'remove'
-    deletes their ChannelGroupMember rows outright (mirrors remove_members, including its
-    ChannelEvent), then locks.
-
-    Uses each member's own latest test regardless of job (the same ANY_JOB default
-    evaluate_and_reconcile_group and apply_format_strategy use), never a specific job_id -
-    every surface that decides or describes a lock reads the same data or it is deciding
-    about a different app (dev/changelog/890)."""
-    group = db.session.get(ChannelGroup, group_id)
-    if group is None:
-        return jsonify({'error': 'Group not found'}), 404
-    if group.is_system:
-        return jsonify({'error': 'The TV Guide Channels group has no group format.'}), 400
-
-    data = request.get_json(silent=True) or {}
-    strategy = data.get('strategy')
-    if strategy not in FORMAT_STRATEGIES:
-        return jsonify({'error': f'strategy must be one of {", ".join(FORMAT_STRATEGIES)}'}), 400
-    non_matching = data.get('non_matching')
-    if non_matching not in ('keep', 'remove'):
-        return jsonify({'error': "non_matching must be 'keep' or 'remove'"}), 400
-
-    memberships = list(group.memberships)
-    members = member_channels(memberships)
-    latest = _latest_tests_by_channel([ch.id for ch in members])
-    # Ranked over the lock population, exactly as apply_format_strategy() ranks it, but
-    # the winning entry's `channel_ids` still covers every member measuring that format.
-    # That split is load-bearing here and nowhere else: `non_matching_ids` below can
-    # DELETE members, so narrowing the membership half would delete every health-check-only
-    # member as a side effect of a ranking change (dev/changelog/890).
-    plan = plan_format_selection(members, latest, rank_ids=lock_ranking_ids(memberships))
-    entry = plan['strategies'][strategy]
-    if entry['key'] is None:
-        return jsonify({'error': entry['rationale']}), 400
-
-    winning_ids = {cid for cid in entry['channel_ids']}
-    non_matching_ids = [ch.id for ch in members if ch.id not in winning_ids]
-    if len(non_matching_ids) >= len(members):
-        return jsonify({'error': 'This would remove every member of the group.'}), 400
-
-    resolution, fps = entry['resolution'], entry['fps']
-    removed_ids = []
-    cancelled = []
-    demoting = False
-
-    if non_matching == 'remove':
-        # The fourth path that can empty the recording-enabled set, and it takes the same
-        # gate as the other three. "This would remove every member" above is a different
-        # and weaker check: a group can keep members and still lose every one it was
-        # willing to record from.
-        err, state = _invariant_gate(group, non_matching_ids, bool(data.get('confirm')))
-        if err is not None:
-            return err
-        demoting = bool(state['breaches'] and state['in_guide'])
-
-        @retry_on_locked()
-        def _remove_and_lock():
-            g = db.session.get(ChannelGroup, group_id)
-            removed = []
-            for cid in non_matching_ids:
-                m = ChannelGroupMember.query.filter_by(group_id=group_id, channel_id=cid).first()
-                if m is not None:
-                    removed.append(m.channel)
-                    db.session.delete(m)
-            _grouping_events(removed, g, CHANNEL_UNGROUPED,
-                             'Removed from channel group "{group_name}"')
-            apply_lock_and_log(g, strategy, entry, non_matching, len(removed))
-            dropped = _apply_demotion(g, state) if demoting else []
-            channel_hiding.recompute([ch.id for ch in removed])
-            # The lock write above already moves the date through `onupdate`; saying so
-            # here anyway keeps the membership change itself responsible for it, rather
-            # than leaving it to a side effect of the write beside it.
-            touch_group(g)
-            db.session.commit()
-            return [ch.id for ch in removed], dropped
-        removed_ids, cancelled = _remove_and_lock()
-        deregister_cancelled_recordings(cancelled)
-    else:
-        @retry_on_locked()
-        def _lock():
-            g = db.session.get(ChannelGroup, group_id)
-            apply_lock_and_log(g, strategy, entry, non_matching, 0)
-            db.session.commit()
-        _lock()
-
-    group = db.session.get(ChannelGroup, group_id)
-    diff = evaluate_and_reconcile_group(group) or {}
-    return jsonify({
-        'success': True,
-        'format': {'resolution': resolution, 'fps': fps, 'label': entry['label']},
-        'kept': entry['count'],
-        'filtered': len(diff.get('outliers') or []),
-        'removed': len(removed_ids),
-        'left_guide': bool(demoting and removed_ids),
-        'cancelled_recordings': len(cancelled),
-    })
-
-
 @channel_groups_bp.route('/api/channel-groups/<int:group_id>/delete', methods=['POST'])
 def delete_group(group_id):
     """Dissolve the group. Its members are untouched: each keeps whatever guide row it
@@ -2498,11 +2506,10 @@ def delete_group(group_id):
     doubled as "put this back as a row if the group dissolves" - and that second meaning
     is what made the column unreadable.
 
-    A group is a health check's channel list (groups unification 3/4), so any
-    attached OnDemandTestJob(s) are cascade-deleted first - scheduler entry and
-    ChannelTest rows via teardown_test_job(), same teardown delete_on_demand_job()
-    does for a standalone job delete. Blocked only when a job is actively RUNNING,
-    since cascading through a live test run isn't safe.
+    A group is its health check's channel list (groups unification 3/4), and the check
+    dies with the group - this is the ONE path that deletes an OnDemandTestJob: scheduler
+    entry and ChannelTest rows via teardown_test_job(), then the row. Blocked only while
+    the check is actively RUNNING, since cascading through a live test run isn't safe.
 
     Recordings take DESIGN-channel-groups-model.md 15.1's split, the same one the
     participation switch takes, because dissolving the group is strictly the more
@@ -2523,12 +2530,9 @@ def delete_group(group_id):
         return jsonify({'error': 'Group not found'}), 404
     if group.is_system:
         return jsonify({'error': 'The TV Guide Channels group cannot be deleted'}), 400
-    jobs = list(group.test_jobs)
-    running = [j for j in jobs if j.status == 'RUNNING']
-    if running:
-        names = ', '.join(f'"{j.name}"' for j in running)
-        plural = 's' if len(running) != 1 else ''
-        return jsonify({'error': f'Health check{plural} {names} still running - stop before deleting this group'}), 409
+    job = group.check
+    if job is not None and job.status == OD_JOB_STATUS_RUNNING:
+        return jsonify({'error': f'Health check "{job.name}" still running - stop before deleting this group'}), 409
 
     live = group_live_recordings(group)
     if live:
@@ -2561,9 +2565,9 @@ def delete_group(group_id):
         detail = f'Channel group "{g.name}" was deleted.'
         cancelled = cancel_scheduled_recordings(group_scheduled_recordings(g), detail)
         screenshot_paths = []
-        for job in list(g.test_jobs):
-            screenshot_paths.extend(teardown_test_job(job))
-            db.session.delete(job)
+        if g.check is not None:
+            screenshot_paths = teardown_test_job(g.check)
+            db.session.delete(g.check)
         members = member_channels(g.memberships)
         _grouping_events(members, g, CHANNEL_UNGROUPED,
                          'Channel group "{group_name}" dissolved')
@@ -2616,8 +2620,10 @@ def clone_group(group_id):
         return jsonify({'error': 'A group needs at least one channel'}), 400
 
     # Group settings the Create-group modal sets at creation time (dev/changelog/322).
-    # All optional - a plain clone passes none of them.
-    allow_mismatch = bool(data.get('allow_format_mismatch'))
+    # All optional - a plain clone passes none of them. Deliberately no format warning
+    # here: a clone's members all start with Recording off (14), so the copy records from
+    # nobody and the format question belongs to its promotion, exactly as create_group
+    # reasons (dev/changelog/1077).
     in_guide = bool(data.get('in_guide'))
     fmt_res = (data.get('format_resolution') or '').strip() or None
     fmt_fps = data.get('format_fps')
@@ -2625,24 +2631,13 @@ def clone_group(group_id):
     if (fmt_res is None) != (fmt_fps is None):
         return jsonify({'error': 'A manual group format needs both a resolution and a frame rate'}), 400
 
-    # Warned, not refused (dev/changelog/762). `allow_format_mismatch` is the caller's
-    # explicit press of the confirm, and it is checked HERE rather than only in the modal
-    # because enforcement lives server-side - a client that pre-empts the warning with its
-    # own count is a convenience, never the thing that decides.
-    if strategy != GROUP_FORMAT_HEALTH_CHECK_ONLY and not allow_mismatch:
-        mismatch, _unverified = _format_warnings([], src_channels)
-        if mismatch:
-            return jsonify({'success': False, 'format_mismatch': mismatch})
-
     channel_ids = [ch.id for ch in src_channels]
     # A stored format lock belongs to `manual` and to nothing else
     # (DESIGN-channel-groups-model.md 16.2). Every other strategy either writes the lock
     # itself or does not read one, so a pin carried in under one of them would filter
     # members on a format nothing chose while the group's own settings card named a
     # different rule - and nothing would ever clear it. Refused rather than stored, and
-    # reported rather than silently dropped. health_check_only falls out of the same rule:
-    # it is not a recording source until it is promoted (15), so a lock on it is a setting
-    # nothing reads.
+    # reported rather than silently dropped.
     pin_refused = False
     if (fmt_res is not None or fmt_fps is not None) and strategy != GROUP_FORMAT_MANUAL:
         fmt_res, fmt_fps, pin_refused = None, None, True
@@ -2652,31 +2647,37 @@ def clone_group(group_id):
     # creation. The copy is made out of the guide and the caller is told to promote it,
     # which is the walkthrough's job and asks the format question properly.
     guide_refused = in_guide
-    in_guide = False
-    guide_order = None
+
+    # The clone's own check is minted with it, like every group's. `copy_schedule` carries
+    # the source check's profile and, when the source's schedule is live, its schedule
+    # over too (dev/changelog/1077). A paused or absent schedule is not copied - the copy
+    # then has a check with no schedule, and the response says so.
+    copy_schedule = bool(data.get('copy_schedule'))
+    src_check = src.check
+    profile_id = src_check.profile_id if (copy_schedule and src_check is not None) else None
+    sched = None
+    if copy_schedule and src_check is not None and schedule_is_live(src_check):
+        sched = {'recurring': src_check.recurring,
+                 'use_window': src_check.recur_use_window,
+                 'recur_day': src_check.recur_day,
+                 'recur_hour': src_check.recur_hour,
+                 'recur_minute': src_check.recur_minute,
+                 'scheduled_start_time': src_check.scheduled_start_time}
+        if not sched['recurring'] and (sched['scheduled_start_time'] is None
+                                       or sched['scheduled_start_time'] <= datetime.utcnow()):
+            sched = None
 
     @retry_on_locked()
     def _clone():
-        chans = Channel.query.filter(Channel.id.in_(channel_ids)).all()
-        by_id = {ch.id: ch for ch in chans}
-        # A clone starts out of the TV Guide unless the caller asked otherwise - only one
-        # group can be the guide row for a given set of channels, so this is opt-in.
-        group = ChannelGroup(name=name, format_strategy=strategy,
-                            cloned_from_group_id=src.id, cloned_from_name=src.name)
-        group.in_guide = in_guide
-        if guide_order is not None:
-            group.guide_sort_order = guide_order
-        group.format_resolution = fmt_res
-        group.format_fps = fmt_fps
-        db.session.add(group)
-        db.session.flush()
-        # Membership participation takes the model defaults, exactly as a fresh create
-        # does - a clone is not a promotion, so Recording starts off on every member.
-        for idx, cid in enumerate(channel_ids):
-            db.session.add(ChannelGroupMember(group_id=group.id, channel_id=cid, position=idx))
-        _grouping_events([by_id[cid] for cid in channel_ids], group,
-                         CHANNEL_GROUPED, 'Added to channel group "{group_name}"')
-        channel_hiding.recompute(channel_ids)
+        # The one builder every group goes through: memberships in position order with
+        # the model's participation defaults (a clone is not a promotion, so Recording
+        # starts off on every member), CHANNEL_GROUPED events, the hiding recompute and
+        # the group's check, in one commit. Out of the TV Guide - only one group can be
+        # the guide row for a set of channels, and a clone has nothing to record from.
+        group = build_group_with_members(
+            name, channel_ids, strategy, profile_id=profile_id,
+            cloned_from_group_id=src.id, cloned_from_name=src.name,
+            format_resolution=fmt_res, format_fps=fmt_fps)
         db.session.commit()
         return group.id
     new_id = _clone()
@@ -2685,14 +2686,20 @@ def clone_group(group_id):
     # Outside the commit closure on purpose: it is its own read-modify-write unit and
     # must not be re-run by a retry of the create above.
     evaluate_and_reconcile_group(group)
+    if sched is not None:
+        from .channel_tests import apply_job_schedule
+        apply_job_schedule(group.check, sched, OD_JOB_STATUS_QUEUED)
     return jsonify({'success': True, 'group_id': group.id, 'group_name': group.name,
                     'format_strategy': strategy,
                     # Reported, not silently dropped: the caller asked for a guide row and
                     # did not get one, and product principle 1 says the reason belongs on
                     # a surface rather than in a log line nobody reads. Same for a format
-                    # pin the clone's strategy has no standing to hold.
+                    # pin the clone's strategy has no standing to hold, and for a schedule
+                    # that was asked for and could not be copied.
                     'guide_refused': guide_refused,
                     'format_pin_refused': pin_refused,
+                    'schedule_copied': sched is not None,
+                    'profile_copied': profile_id is not None,
                     'detail_url': url_for('channel_groups.group_detail', group_id=group.id)})
 
 
@@ -2702,13 +2709,17 @@ def clone_info(group_id):
     the list page and every detail page's kebab feed the same modal identically instead
     of each hand-building its own ad hoc payload (dev/changelog/542).
 
-    `has_schedule` is true when a health check is attached to this group, and is what
-    decides whether the modal offers the group/check/both picker at all. An inherited
-    automatic TV Guide check does not count: it is attached to the system group rather
-    than to this one, so it is not this group's to clone. `channel_settings` is always
-    present - every group has guide and format settings (dev/changelog/741) - while
-    `check` is there only when a check really is attached, so the client can tell
-    "nothing to carry over" apart from "carry over these empty/default values".
+    `channel_settings` is always present - every group has guide and format settings
+    (dev/changelog/741) - and `check` carries the group's one check's profile and
+    schedule, which the clone route copies when its copy-schedule option is sent.
+    `schedule_live` says whether that schedule will actually fire, which is the only
+    thing the clone route can carry over and therefore what the modal's copy-schedule
+    option defaults to.
+
+    The old "has schedule" key is gone (dev/changelog/1078). It meant "a check is
+    attached to this group at all", which every group now satisfies, while _check_ctx
+    above spelled that same name "runs on a schedule rather than being a one-off" - one
+    name, two meanings, in two payloads of this one file.
 
     A backticked lowercase name in this docstring is a field of the response, and
     tests/test_clone_modal.py checks that it still is one."""
@@ -2738,9 +2749,12 @@ def clone_info(group_id):
         'format_resolution': group.format_resolution,
         'format_fps': group.format_fps,
         'format_strategy': group.format_strategy,
+        # Whether the source records from anybody, which is what decides whether its
+        # format settings mean anything to copy (dev/changelog/1077).
+        'records': participation_is_recording(group, memberships),
     }
 
-    job = _group_detail_job(group)
+    job = group.check
     check_payload = None
     if job is not None:
         ct_cfg = load_config().get('channel_testing', {})
@@ -2748,12 +2762,12 @@ def clone_info(group_id):
             'job_id': job.id,
             'profile_id': job.profile_id,
             'schedule': _schedule_ctx(job, ct_cfg),
+            'schedule_live': schedule_is_live(job),
         }
 
     return jsonify({
         'id': group.id, 'name': group.name,
         'channels': channel_payload,
-        'has_schedule': job is not None,
         'channel_settings': channel_settings,
         'check': check_payload,
     })
@@ -2777,10 +2791,9 @@ def group_record_context(group_id):
     an Edit opened days later would otherwise name a channel the recorder has already
     stopped preferring.
 
-    `serving` is null when nothing is eligible - a group with no recording-enabled member,
-    which is what a health_check_only group is by construction. The modal says so rather
-    than falling silent; a group that cannot produce a file is exactly the state the user
-    must not have to infer.
+    `serving` is null when nothing is eligible - a group with no recording-enabled member.
+    The modal says so rather than falling silent; a group that cannot produce a file is
+    exactly the state the user must not have to infer.
 
     `format_override` is the lock's zero-survivors case (DESIGN-channel-groups-model.md
     15.2): the recording will run anyway, off the group's locked format. It has always been

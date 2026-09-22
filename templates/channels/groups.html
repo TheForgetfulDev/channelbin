@@ -1,7 +1,7 @@
 {% extends "base.html" %}
 {% block title %}Groups - ChannelBin{% endblock %}
 
-{% from "_macros.html" import channel_pill, account_pill, status_badge, recur_schedule_fields %}
+{% from "_macros.html" import channel_pill, account_pill, status_badge %}
 
 {% block content %}
 <div class="page-head">
@@ -19,8 +19,8 @@
   <strong>Recording</strong> for the members you would record from and the group can be a single TV
   Guide row: recordings start on the healthiest enabled member and fail over to the next-best one if
   it dies. A <strong>health check</strong> is a schedule the group carries, testing its members to
-  confirm they still play &mdash; a group can carry more than one, and a group with no member
-  enabled for recording is simply a health check.
+  confirm they still play &mdash; every group has exactly one, created with it, and a group with no
+  member enabled for recording is simply a health check.
 </p>
 
 {% if not group_rows %}
@@ -114,20 +114,45 @@
 {% endif %}
 {% endmacro %}
 
-{% macro check_chip(g, c) %}
-{% if c.status == 'RUNNING' %}
-<span class="badge b-running tip-plain" data-menu-check="{{ g.id }}:{{ c.job_id }}" style="cursor:pointer;" data-tip="{{ c.name }}.&#10;Running now. Click for the live results page."><span class="pulse"></span>Running</span>
-{% elif c.inherited and not c.schedule_live %}
-{# The automatic check's coverage of this group is the one thing on this row nothing else
-   would report: the group has no check of its own, so with the TV Guide check's schedule
-   removed or paused, no member of it is being tested at all (changelog 1068). #}
-<span class="grp-check-chip grp-chip-none" data-menu-check="{{ g.id }}:{{ c.job_id }}" data-tip="{{ c.name }}.&#10;Not scheduled{% if c.recur_paused %} - its schedule is paused{% endif %}, so nothing is testing this group's members on its behalf. Give this group its own health check, or schedule the automatic one again.">No coverage</span>
-{% elif c.has_schedule %}
-<span class="grp-check-chip{% if c.inherited %} grp-chip-none{% endif %}" data-menu-check="{{ g.id }}:{{ c.job_id }}" data-tip="{{ c.name }}.&#10;{% if c.recurring %}{{ c.recur_description }}{% else %}Next run {{ c.scheduled_et or 'unknown' }}{% endif %}{% if c.profile_name %}. Profile: {{ c.profile_name }}{% endif %}{% if c.inherited %}. Inherited: the automatic TV Guide check tests one channel per guide row, so it covers the member serving this group - not its other members.{% endif %}">{% if c.inherited %}Inherited coverage{% elif c.recurring %}&#8635; {{ c.recur_description }}{% else %}{{ c.scheduled_et }}{% endif %}</span>
-{% elif c.status == 'CANCELLED' %}
-<span class="grp-check-chip" data-menu-check="{{ g.id }}:{{ c.job_id }}" data-tip="{{ c.name }}.&#10;This health check was cancelled before it finished. It has no results.">Cancelled</span>
+{# The group's own health check - every group carries exactly one (dev/changelog/1077), so
+   this chip is always drawn and always describes the same object. The state comes from the
+   route (`_check_state`), which is where the enumeration lives; the last branch is an
+   unknown status, never the rendering of a real state (CLAUDE.md "states are enumerated").
+   It is not a link: a check's own URL now redirects to its group's page, which is exactly
+   where clicking the row already goes. #}
+{% macro check_chip(c) %}
+{% set profile = '. Profile: ' ~ c.profile_name if c.profile_name else '' %}
+{% set ran = 'Last run ' ~ c.completed_et if c.completed_et else 'It has never run' %}
+{% if c.state == 'running' %}
+<span class="badge b-running tip-plain" data-tip="Health check running now.&#10;Testing {{ c.channel_count }} channel{{ 's' if c.channel_count != 1 else '' }}{{ profile }}. Open the group for live results."><span class="pulse"></span>Running</span>
+{% elif c.state == 'cancelled' %}
+<span class="grp-check-chip tip-plain" data-tip="Health check cancelled.&#10;The last run was stopped before it finished, and nothing is scheduled. {{ ran }}{{ profile }}.">Cancelled</span>
+{% elif c.state == 'recur' %}
+<span class="grp-check-chip tip-plain" data-tip="Health check schedule.&#10;{{ c.recur_description }}. Next run {{ c.scheduled_et or 'unknown' }}{{ profile }}.">&#8635; {{ c.recur_description }}</span>
+{% elif c.state == 'paused' %}
+{# The label carries "(Paused)" already - _recur_label() appends it - so nothing here
+   adds a second one (dev/docs/BUGS.md 2026-09-21 @ 08:04:00 AM ET). #}
+<span class="grp-check-chip grp-chip-none tip-plain" data-tip="Health check paused.&#10;{{ c.recur_description }}. The recurrence is switched off, so it will not fire until you resume it{{ profile }}.">&#8635; {{ c.recur_description }}</span>
+{% elif c.state == 'once' %}
+<span class="grp-check-chip tip-plain" data-tip="One-time health check.&#10;It runs once, at {{ c.scheduled_et or 'an unknown time' }}, and then has no schedule{{ profile }}.">One time, {{ c.scheduled_et or 'unknown' }}</span>
+{% elif c.state == 'none' %}
+<span class="grp-check-chip grp-chip-none tip-plain" data-tip="No health check schedule.&#10;This group carries a health check, but nothing is set to run it. {{ ran }}{{ profile }}. Schedule it from the group's Settings.">No schedule</span>
 {% else %}
-<span class="grp-check-chip" data-menu-check="{{ g.id }}:{{ c.job_id }}" data-tip="{{ c.name }}.&#10;One-off health check, ran {{ c.completed_et or 'never' }}. Click for its results page.">ran {{ c.completed_et or 'never' }}</span>
+{# Not the rendering of any real state - every one is named above. Reachable only if a
+   status is added to OD_JOB_STATUSES without a branch in _check_state(). #}
+<span class="grp-check-chip grp-chip-none tip-plain" data-tip="ChannelBin does not recognise this health check's state, so it cannot say what will happen next. Please report it.">Unknown state: {{ c.status }}</span>
+{% endif %}
+{% endmacro %}
+
+{# A second, separate fact about the row: what the automatic TV Guide check covers here.
+   It tests one channel per guide row, so it reaches the member serving this group and no
+   other - never a substitute for the group's own check, and it belongs to a different
+   group, which is why this one IS a link (changelog 1068, dev/changelog/1078). #}
+{% macro inherited_chip(g, c) %}
+{% if c.schedule_live %}
+<span class="grp-check-chip grp-chip-none" data-menu-check="{{ g.id }}:{{ c.job_id }}" data-tip="Inherited coverage.&#10;{% if c.recurring %}{{ c.recur_description }}{% else %}Next run {{ c.scheduled_et or 'unknown' }}{% endif %}. The automatic TV Guide check tests one channel per guide row, so it covers the member serving this group - not its other members. Click to open it.">Inherited coverage</span>
+{% else %}
+<span class="grp-check-chip grp-chip-none" data-menu-check="{{ g.id }}:{{ c.job_id }}" data-tip="No inherited coverage.&#10;The automatic TV Guide check is not scheduled{% if c.recur_paused %} - its recurrence is paused{% endif %}, so it adds nothing to this group. This group's own health check is what covers its members. Click to open the automatic check.">No inherited coverage</span>
 {% endif %}
 {% endmacro %}
 
@@ -145,13 +170,13 @@
 
 {% macro group_row(g) %}
 <div class="grp-item" data-group="{{ g.id }}" data-system="{{ '1' if g.system else '0' }}"
-     data-strategy="{{ g.format_strategy }}"
+     data-strategy="{{ g.format_strategy }}" data-records="{{ '1' if g.recording_count else '0' }}"
      data-health="st-{{ g.health_cls }}" data-healths="{{ g.health_set | join(' ') }}"
      data-guide="{{ 'in' if g.in_guide else 'out' }}"
      data-check="{{ g.check_dim }}" data-issues="{{ g.issues | join(' ') }}"
      data-accounts="{{ g.accounts | join('|') }}" data-name="{{ g.name | lower }}"
      data-search="{{ (g.name ~ ' ' ~ (g.members | map(attribute='name') | join(' '))) | lower }}"
-     data-members-count="{{ g.member_count }}" data-checks-count="{{ g.checks | length }}"
+     data-members-count="{{ g.member_count }}"
      data-activity="{{ g.last_activity }}"
      data-payload="{{ g | tojson | forceescape }}">
   <div class="grp-summary">
@@ -169,37 +194,31 @@
       {% if g.format_warning %}{% set fw = g.format_warning %}{% set one = fw.offenders | length == 1 %}<span class="badge b-fail tip-plain" data-tip="Mixed format.&#10;This group's format is pinned by hand to {{ fw.lock_label }}, and {{ fw.offenders | length }} member{{ '' if one else 's' }} with Recording on {{ 'measures' if one else 'measure' }} something else. {% if fw.override %}No member matches, so a recording runs from the highest-ranked one anyway{% else %}A recording skips {{ 'it' if one else 'them' }} until {{ 'it matches' if one else 'they match' }} again{% endif %}:{% for o in fw.offenders %}&#10;{{ o.name }} ({{ o.format }}){% endfor %}">Mixed format</span>{% endif %}
       {% if g.unmonitored_count %}<span class="badge b-warn tip-plain" data-tip="{{ g.unmonitored_count }} not monitored.&#10;No recurring health check covers these channels, so format drift will not be re-checked automatically.">&#9888; {{ g.unmonitored_count }} not monitored</span>{% endif %}
       {% if g.in_guide %}<span class="badge b-done tip-plain" data-tip="In Guide.&#10;This group renders as a single TV Guide row, filled by whichever member is serving it. A member that also has its own guide row keeps it.">In Guide</span>{% endif %}
-      {% if g.checks %}
-        {% for c in g.checks %}{{ check_chip(g, c) }}{% endfor %}
-        {% if g.system %}{{ results_span(g.checks[-1]) }}{% endif %}
-      {% endif %}
-      {# A health check is a schedule this group carries, so the pill adds one rather than
-         creating an object (DESIGN-channel-groups-model.md DECIDED 2). "another" when the
-         automatic check already covers a member on the group's behalf - which is no longer
-         gated on the group being in the guide, because the scheduleless-group fallback
-         covers groups that are not (dev/changelog/752). #}
-      {% if not g.system and not (g.checks | rejectattr('inherited') | list) %}
-        {% if g.checks | selectattr('inherited') | list %}
-        <span class="grp-check-chip grp-chip-none" data-act="create-check" data-group="{{ g.id }}">+ Add another health check</span>
-        {% else %}
-        <span class="grp-check-chip grp-chip-none" data-act="create-check" data-group="{{ g.id }}">+ Add health check</span>
-        {% endif %}
-      {% endif %}
+      {# No pill adds a health check: every group already carries one, minted with it
+         (dev/changelog/1077). Scheduling it is the kebab's `Schedule health check`,
+         which opens the group's own Settings. #}
+      {% if g.check %}{{ check_chip(g.check) }}{% endif %}
+      {% if g.inherited_check %}{{ inherited_chip(g, g.inherited_check) }}{% endif %}
+      {% if g.system and g.check %}{{ results_span(g.check) }}{% endif %}
       <div class="grp-actions">
         <button class="btn btn-sm btn-icon" data-menu aria-label="More actions">&#8943;</button>
         <div class="menu">
-          {% if g.detail_url %}<a href="{{ g.detail_url }}">Details</a>
-          {% else %}<button class="menu-item" disabled title="No health check attached yet - nothing to show">Details</button>{% endif %}
+          <a href="{{ g.detail_url }}">Details</a>
           {% if not g.system %}
           <button class="menu-item" data-act="guide-toggle" data-group="{{ g.id }}">{{ 'Remove from TV Guide' if g.in_guide else 'Add to TV Guide' }}</button>
           {% endif %}
           <div class="sep"></div>
-          {% if not g.system %}
-          <button class="menu-item" data-act="create-check" data-group="{{ g.id }}">Schedule health check</button>
+          {# One entry, unnamed: the group has one check, so naming it would name the
+             group again. It opens the group's Settings on its schedule rather than a
+             second schedule dialog, and no item here creates a check (DESIGN.md 14.5,
+             dev/changelog/1078). #}
+          <a href="{{ g.detail_url }}?settings=check">Schedule health check</a>
+          {% if g.check %}
+          {# "Test now" here and on the group page, same verb for the same action - this
+             one read "Run <name> now" while the detail page's read "Test again", for one
+             POST to one route (dev/changelog/1076). #}
+          <button class="menu-item" data-act="run-check" data-group="{{ g.id }}" data-job="{{ g.check.job_id }}">Test now</button>
           {% endif %}
-          {% for c in g.checks if not c.inherited %}
-          <button class="menu-item" data-act="run-check" data-group="{{ g.id }}" data-job="{{ c.job_id }}">Run {{ ('"' ~ c.name ~ '" ') if (g.checks | rejectattr('inherited') | list | length) > 1 else '' }}now</button>
-          {% endfor %}
           <div class="sep"></div>
           <button class="menu-item" data-act="clone" data-group="{{ g.id }}">Clone</button>
           <div class="sep"></div>
@@ -223,7 +242,6 @@
       <button class="menu-item" data-gsort="members">Number of channels</button>
       <button class="menu-item" data-gsort="health">Health (worst first)</button>
       <button class="menu-item" data-gsort="activity">Last tested</button>
-      <button class="menu-item" data-gsort="checks">Health checks attached</button>
       <button class="menu-item" data-gsort="guide">In the TV Guide</button>
     </div>
   </span>
@@ -238,13 +256,6 @@
 .grp-list-compact { display: flex; flex-direction: column; gap: 0.5rem; margin-bottom: 1.5rem; }
 </style>
 
-{# The one-off / recurring schedule picker for the Create-health-check modal. Its own
-   prefix, because the detail page renders the same macro with `gdsched` for its
-   Settings modal and two copies of one id on a page is a defect. #}
-<template id="cc-schedule-fields">
-  {{ recur_schedule_fields('ccsched', 'Start Time', window_label) }}
-</template>
-
 <script>
 window.GROUPS_CONFIG = {
   createGroupUrl: '{{ url_for("channel_groups.create_group") }}',
@@ -254,20 +265,11 @@ window.GROUPS_CONFIG = {
   resolutionOptions: {{ resolution_options | tojson }},
   fpsOptions: {{ fps_options | tojson }},
   startJobUrlBase: '/api/channel-tests/on-demand/',  // + id + /start
-  checkProfiles: {{ check_profiles | tojson }},
-  profilesUrl: {{ url_for('health_check_profiles.health_check_profiles_list') | tojson }},
   testerBusy: {{ 'true' if tester_status.is_running else 'false' }},
-  {# Where the maintenance window's hours live. The settings page reads ?q= off its own
-     URL and applies it as the page search (static/js/settings.js) - there is no anchor
-     to link at. #}
-  windowSettingsUrl: {{ (url_for('settings.settings') ~ '?q=Maintenance+window') | tojson }},
 };
 </script>
 <script src="{{ url_for('static', filename='js/format-plan.js') }}"></script>
 <script src="{{ url_for('static', filename='js/create-group-modal.js') }}"></script>
-<script src="{{ url_for('static', filename='js/schedule-fields.js') }}"></script>
-<script src="{{ url_for('static', filename='js/check-modal.js') }}"></script>
-<script src="{{ url_for('static', filename='js/clone-check-modal.js') }}"></script>
 <script src="{{ url_for('static', filename='js/clone-modal.js') }}"></script>
 <script src="{{ url_for('static', filename='js/group-delete.js') }}"></script>
 {# Ahead of groups.js, which builds its filter bar at load (DESIGN.md 3.11). #}

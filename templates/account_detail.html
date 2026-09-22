@@ -381,7 +381,9 @@
               {% elif log.status == 'PARTIAL' %}Sync finished with gaps: {{ '{:,}'.format(log.channels_synced or 0) }} channels{% if log.channels_added is not none and log.channels_removed is not none %} ({% if log.channels_added %}<a href="{{ new_channels_url }}">{{ '{:,}'.format(log.channels_added) }} added</a>{% else %}<span class="text-faint">0 added</span>{% endif %}, {% if log.channels_removed %}<a href="{{ removed_channels_url }}">{{ '{:,}'.format(log.channels_removed) }} removed</a>{% else %}<span class="text-faint">0 removed</span>{% endif %}){% endif %}{{ skipped_clause(log) }}, {{ '{:,}'.format(log.epg_entries_synced or 0) }} program entries. {{ log.error_message or 'Part of the import did not complete.' }}
               {% elif log.status == 'ERROR' %}Sync failed. {{ log.error_message or 'No reason was recorded.' }}
               {% elif log.status == 'CANCELLED' %}Sync cancelled before it finished.
-              {% elif log.status == 'SKIPPED' %}Sync skipped - it did not run. {{ log.error_message or 'No reason was recorded.' }}
+                            {% elif log.status == 'SKIPPED' %}{# Not "skipped": since dev/changelog/941 most SKIPPED
+                 rows are a deferral with a retry queued, and the stored message says which of the
+                 two this one is. #}Sync did not run. {{ log.error_message or 'No reason was recorded.' }}
               {% else %}{{ log.status }}
               {% endif %}
             </div>

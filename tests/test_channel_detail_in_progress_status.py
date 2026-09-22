@@ -111,7 +111,7 @@ class GroupDetailTimelineInProgressStatusTests(unittest.TestCase):
         db.session.commit()
 
         with patch('app.channel_tester.get_status', return_value=_running_status(self.ch.id)):
-            resp = self.t.client.get(f'/channels/health-checks/{self.job.id}')
+            resp = self.t.client.get(f'/channel-groups/{self.job.group_id}')
         self.assertEqual(resp.status_code, 200)
         body = resp.get_data(as_text=True)
         self.assertNotIn('>FAILED<', body)
@@ -123,7 +123,7 @@ class GroupDetailTimelineInProgressStatusTests(unittest.TestCase):
 
         with patch('app.channel_tester.get_status',
                     return_value={'is_running': False, 'current_channel_id': None}):
-            resp = self.t.client.get(f'/channels/health-checks/{self.job.id}')
+            resp = self.t.client.get(f'/channel-groups/{self.job.group_id}')
         self.assertEqual(resp.status_code, 200)
         body = resp.get_data(as_text=True)
         self.assertIn('>FAILED<', body)

@@ -1,6 +1,7 @@
-/* Shared "Create a channel group" modal (approved design: dev/changelog/322).
-   Opened from the Groups list kebab (groups.js) and from a health check's detail page
-   (group-detail.js). Replaces what used to be "Convert to channel group".
+/* The Clone screen (approved design: dev/changelog/322, one screen since
+   dev/changelog/1078). Opened by clone-modal.js, its only caller, from the Clone kebab
+   item on the groups list and on a group's own page. Replaces what used to be
+   "Convert to channel group".
 
    Three things about it are load-bearing and must not drift:
 
@@ -37,6 +38,13 @@
                     hardcoded defaults (clone-modal.js, only present when the source
                     itself is already a recording group). `in_guide` is deliberately not
                     among them - see rule 3 below.
+     copySchedule - initial state of the "Copy the schedule and profile" switch, AND
+                    whether that switch is offered at all. The caller sets it only when
+                    the source has a live schedule the clone route could carry over, so
+                    a false here renders a sentence saying there is nothing to copy
+                    rather than a control that cannot change the outcome.
+     jobId        - the source group's check, for the "run a health check first" action
+                    on the never-tested notice
      onDone(resp) - called on success; default navigates to the new group's detail page
 */
 function openCreateGroupModal(opts) {
@@ -80,8 +88,15 @@ function openCreateGroupModal(opts) {
                   mode: seed ? seed.format_mode : 'auto',
                   res: seedManual ? (seed.format_resolution || '') : '',
                   fps: seedManual ? String(seed.format_fps || '') : '',
-                  formatStrategy: seed ? seed.format_strategy : 'health_check_only',
+                  formatStrategy: seed ? seed.format_strategy : 'highest_score',
+                  // Whether the SOURCE records from anybody - the one fact "recording
+                  // source" means (dev/changelog/1077). A seedless source has no members.
+                  srcRecords: !!(seed && seed.records),
+                  copySchedule: !!opts.copySchedule,
                   autoSelect: '', autoTouched: false };
+  // Whether the question is worth asking at all, fixed at open: the caller only sets
+  // copySchedule when the source has a live schedule to carry over.
+  const copyScheduleOffered = !!opts.copySchedule;
 
   function nameError() {
     if (!state.name.trim()) return 'Give the group a name.';
@@ -227,10 +242,11 @@ function openCreateGroupModal(opts) {
       `<option value="${escHtml(r)}"${r === state.res ? ' selected' : ''}>${escHtml(r)}</option>`).join('');
     const fpsOpts = (opts.fpsOptions || []).map(f =>
       `<option value="${f.value}"${String(f.value) === String(state.fps) ? ' selected' : ''}>${escHtml(f.label)}</option>`).join('');
-    // Does the SOURCE manage a format? A health-check-only source has none to copy, and
-    // no member has been measured, so the format half of this screen has nothing to
-    // answer with (DESIGN-channel-groups-model.md §14).
-    const managesFormat = state.formatStrategy !== 'health_check_only';
+    // Does the SOURCE record from anybody? A source nobody records from has no format to
+    // copy, so the format half of this screen has nothing to answer with
+    // (DESIGN-channel-groups-model.md §14). Named for the predicate it reads, never for
+    // "manages format", which is a different question about the strategy value.
+    const srcRecords = state.srcRecords;
 
     body.innerHTML =
       '<div class="notice notice-info">' +
@@ -240,8 +256,8 @@ function openCreateGroupModal(opts) {
         '<p>Channels of different formats can all live in one group. The group format decides which of ' +
         'them a recording may be picked from - the rest stay in the group and are skipped until they ' +
         'match again.</p>' +
-        `<p>The health check "${escHtml(opts.srcName)}" is not touched - this creates a new group alongside ` +
-        'it, and takes you to that group when it is done.</p>' +
+        `<p>"${escHtml(opts.srcName)}" is not touched - this creates an independent copy alongside ` +
+        'it, and takes you to that copy when it is done.</p>' +
       '</div>' + note.html +
       '<fieldset class="gd-fset"><div class="gd-fset-head">Channel group</div>' +
       fieldRow({ label: 'Name', wide: true,
@@ -256,10 +272,25 @@ function openCreateGroupModal(opts) {
         meta: 'The copy is created out of the guide, with Recording off on every member - ' +
           'the same way any new group starts. Add it to the guide from its own page once ' +
           'you have chosen which members it may record from.' }) +
-      // The five format questions only mean something for a source that already manages a
-      // format. Cloning a health check has no measured members to reason about, and every
+      // The copy gets a health check either way - every group is minted with one
+      // (dev/changelog/1077). The only question is whether the source's schedule and
+      // profile come with it, and it is offered only when the source has a live schedule
+      // to copy (clone-modal.js decides that, so this row is absent rather than useless).
+      (copyScheduleOffered
+        ? fieldRow({ label: 'Copy the schedule and profile',
+            meta: 'The copy carries its own health check, like every group. Leave this on to ' +
+              'start it on the same schedule and test profile as the original; turn it off to ' +
+              'create the copy with no schedule and set one yourself.',
+            control: '<label class="switch"><input type="checkbox" id="cg-copy-sched"' +
+              `${state.copySchedule ? ' checked' : ''}><span class="knob"></span></label>` })
+        : fieldRow({ label: 'Health check',
+            meta: 'The copy carries its own health check, like every group. There is no ' +
+              'schedule on the original to copy over, so the copy starts without one - ' +
+              'set one from its own page.' })) +
+      // The five format questions only mean something for a source that already records.
+      // Cloning a health check has no measured members to reason about, and every
       // strategy would answer "run a check first" (§14).
-      (managesFormat
+      (srcRecords
         ? fieldRow({ label: 'Auto-select channels',
             meta: autoSelectMeta(),
             control: autoSelectControl() }) +
@@ -277,10 +308,10 @@ function openCreateGroupModal(opts) {
             meta: '29.97 and 30 (and 59.94 and 60) are treated as the same rate.',
             control: `<select id="cg-fps">${fpsOpts}</select>` })
         : fieldRow({ label: 'Format', full: true,
-            meta: 'The source is set up for health checks only, so there is no format to ' +
-              'copy and nothing has been measured yet to choose one from. The copy is ' +
-              'created the same way, and its format strategy is chosen on its own page ' +
-              'once a health check has run.' })) +
+            meta: 'No member of the source is switched on for recording, so there is no ' +
+              'format to copy and nothing has been measured yet to choose one from. The ' +
+              'copy is created the same way, and its format strategy is chosen on its own ' +
+              'page once a health check has run.' })) +
       '</fieldset>' +
       '<fieldset class="gd-fset"><div class="gd-fset-head">Channels' +
         `<span class="fh-note">${survivors.length} of ${channels.length} kept, ${measured} measured</span></div>` +
@@ -324,6 +355,9 @@ function openCreateGroupModal(opts) {
     }
   });
   body.addEventListener('change', (e) => {
+    // No re-render: nothing else on the screen reads it, and a render would rebuild the
+    // controls under the switch the user just flipped.
+    if (e.target.id === 'cg-copy-sched') { state.copySchedule = e.target.checked; return; }
     if (e.target.id === 'cg-res') {
       state.res = e.target.value;
       if (state.autoSelect) { state.autoTouched = true; render(); }
@@ -382,6 +416,11 @@ function openCreateGroupModal(opts) {
         format_resolution: state.mode === 'manual' ? state.res : null,
         format_fps: state.mode === 'manual' ? state.fps : null,
         allow_format_mismatch: !!allowMismatch,
+        // The copy's check is minted either way; this asks for the source check's
+        // schedule and profile to travel with it. The server carries a schedule over
+        // only when the source's is live and reports what it actually did
+        // (dev/changelog/1077).
+        copy_schedule: state.copySchedule,
       }),
     });
   }
@@ -405,21 +444,35 @@ function openCreateGroupModal(opts) {
     });
   }
 
+  /* What the server actually did, not what was asked for. The clone route deliberately
+     reports the parts of the request it refused or could not honor rather than dropping
+     them silently, and a toast reading a flat "Created" while a schedule the user ticked
+     did not travel is exactly the silence this app exists to refuse. */
+  function createdMessage(resp) {
+    const name = state.name.trim();
+    if (state.copySchedule && !resp.schedule_copied) {
+      return `Created "${name}", but its health check has no schedule - the original's ` +
+        'schedule was removed or paused before the copy was made.';
+    }
+    if (resp.schedule_copied) return `Created "${name}" on the same health check schedule.`;
+    return `Created "${name}".`;
+  }
+
   const modal = buildModal({
-    title: `Create a channel group from "${opts.srcName}"`,
+    title: `Clone "${opts.srcName}"`,
     panelClass: 'modal-xwide',
     body,
     footNote: ' ',
     footer: [
       { label: 'Cancel', class: 'btn', onClick: (c) => c() },
-      { label: 'Create channel group', class: 'btn btn-primary', onClick: (close) => {
+      { label: 'Create the copy', class: 'btn btn-primary', onClick: (close) => {
         const submit = (allow) => post(allow)
           .then((resp) => {
             // The server owns the mismatch warning; this modal's own count only pre-empts
             // it (dev/changelog/762). If the server saw a mismatch this screen did not -
             // a test that landed while the modal was open - it says so instead of creating.
             if (!resp.success) { confirmMismatch(() => submit(true)); return; }
-            showToast(`Created "${state.name.trim()}".`); close(); onDone(resp);
+            showToast(createdMessage(resp)); close(); onDone(resp);
           })
           .catch(err => showToast(err.message, { type: 'error' }));
         if (mismatchCount) { confirmMismatch(() => submit(true)); return false; }

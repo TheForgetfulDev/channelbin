@@ -5,6 +5,34 @@ Notable changes to ChannelBin, newest first. This project follows
 release is tagged `v<version>` in git, and the version the app is running is shown in the
 page footer.
 
+## 0.15.0 - 2026-09-22
+
+**Added**
+
+- Search Programs (EPG) says how many channels its matching airings are on, not just how many
+  airings there are.
+
+**Changed**
+
+- A channel group can no longer have duplicate health checks. Clone is one screen with a switch
+  for copying the schedule and profile, the Pick best format modal is gone, and "this group
+  records" now means at least one member has Recording turned on.
+- A group's health check shows one "Test now" button in every state except for running.
+
+**Fixed**
+
+- The schedule picker for a group's health check opens on the maintenance window instead of a
+  specific time.
+- The Dashboard's accounts and health sections keep themselves current on a page left open.
+- The Search index card on Maintenance notices a rebuild that starts after the page loads, which
+  is how every account sync ends.
+- The TV Guide's recording chip stops saying Recorded while a recording's segments are still
+  being joined and checked.
+- The Dashboard timeline legend, four Settings fields and an account's activity line say a
+  clashing job is deferred, which is what happens to it, rather than skipped.
+- The group Settings modal no longer prints "undefined" under its Format explanation or leaves
+  the recording setup button floating mid-panel.
+
 ## 0.14.0 - 2026-09-21
 
 **Added**

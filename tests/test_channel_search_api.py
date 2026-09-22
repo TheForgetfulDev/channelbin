@@ -688,7 +688,11 @@ class CountsSplitTests(_ApiTestCase):
             {'success', 'total', 'pages', 'standing_hidden', 'declined', 'declined_reason',
              # The two numbers behind `total` ride with it rather than being a third
              # request: the results heading names both kinds (dev/changelog/811).
-             'channel_total', 'group_total'})
+             'channel_total', 'group_total',
+             # And how many distinct channels the airing rows sit on, for the same reason -
+             # it comes off the breakdown query this endpoint already runs, so a third
+             # request for it would be a second scan (dev/changelog/1080).
+             'channels_matched'})
 
     def test_counts_endpoint_honours_filters_and_grain(self):
         """A TYPED search, so the bundled response declines its own total (this corpus has
@@ -814,7 +818,7 @@ class GroupRowTests(_ApiTestCase):
             self.assertIn(key, row['no_value'], key)
             self.assertTrue(row['no_value'][key].strip(), key)
 
-    def test_a_health_check_only_group_says_it_is_not_a_recording_source(self):
+    def test_a_group_nobody_records_from_says_it_is_not_a_recording_source(self):
         row = self.group_row('Nightly checks', query='q=nightly')
         self.assertTrue(row['check_only'])
 

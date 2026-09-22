@@ -21,7 +21,7 @@ from ..config import load_config
 from ..tz_utils import UTC, to_naive_utc, format_local, relative
 from ..accounts import get_sync_progress, next_sync_map, sync_signature
 from .channel_tests import get_active_run_summary
-from ..fmt_utils import REC_STATUS_DISPLAY, REC_WAITING_LABEL, rec_is_waiting, rec_status_display
+from ..fmt_utils import REC_STATUS_DISPLAY, rec_is_waiting, rec_status_display
 
 dashboard_bp = Blueprint('dashboard', __name__)
 log = logging.getLogger(__name__)
@@ -34,9 +34,18 @@ log = logging.getLogger(__name__)
 # (dev/changelog/961).
 REC_ROW_STATUS_CLASS = {status: row[1] for status, row in REC_STATUS_DISPLAY.items()}
 
-# For dashboard.js, which relabels a badge from the status on an SSE frame. Rendered into
-# the page as JSON rather than hand-written in the .js file, so there is one table, not two.
-REC_ROW_STATUS_LABEL = {status: row[3] for status, row in REC_STATUS_DISPLAY.items()}
+# ── The machine-readable half of a background-task row ───────────────────────
+# `label` and `detail` on a task are display text: they are reworded whenever the wording
+# is wrong, and the Dashboard's own history has two entries doing exactly that. `kind` is
+# what a client keys a DECISION off, so that a reword cannot silently switch a behavior
+# off. dashboard.js watches for BG_KIND_HEALTH_CHECK to know a health check has started or
+# ended; nothing else reads one yet, and every row carries one anyway so the next reader
+# does not have to add the field to four call sites first (dev/changelog/1082).
+BG_KIND_HEALTH_CHECK = 'health_check'
+BG_KIND_ACCOUNT_SYNC = 'account_sync'
+BG_KIND_POST_CAPTURE = 'post_capture'
+BG_KIND_SEARCH_INDEX = 'search_index'
+BG_KIND_MAINTENANCE = 'maintenance'
 
 
 # ── DESIGN.md 16.1/16.2: the sections, their order, and their one jump-off ───
@@ -422,12 +431,17 @@ def dashboard():
         # loaded - a dict build, no query (tests/test_scaling_pages.py::test_dashboard_page).
         rec_status_text={r.id: rec_status_display(
             r.status, waiting=bool(r.postprocess_waiting_since))[3] for r in active},
-        rec_status_labels=REC_ROW_STATUS_LABEL,
-        rec_waiting_label=REC_WAITING_LABEL,
         rec_waiting_ids={r.id for r in active
                          if rec_is_waiting(r.status, r.postprocess_waiting_since)},
         section_defs=DASHBOARD_SECTIONS, section_order=order, section_on=enabled,
         section_pref_key=DASHBOARD_SECTIONS_PREF,
+        # The two signals dashboard.js swaps its two self-refreshing sections on. The sync
+        # signature is the same one /accounts renders and /api/nav-status carries, so the
+        # comparison is between two readings of one function rather than between a page and
+        # a lookalike. The health kind is handed over for the same reason the status labels
+        # above are: a client decision keyed on a string the server owns.
+        sync_sig=sync_signature(),
+        bg_health_kind=BG_KIND_HEALTH_CHECK,
         metrics=_metric_tiles(active, accounts, now),
         timeline=_timeline_payload(active, accounts, now),
     )
@@ -612,7 +626,8 @@ def _activity_status_dict():
             detail = f'Testing {ch_name} ({done + 1} of {total})' if total else f'Testing {ch_name}'
         else:
             detail = f'{done} of {total} channels tested' if total else 'Starting…'
-        bg_tasks.append({'label': 'Channel health test', 'detail': detail,
+        bg_tasks.append({'kind': BG_KIND_HEALTH_CHECK,
+                         'label': 'Channel health test', 'detail': detail,
                          'href': url_for('jobs.jobs_page')})
         dashboard_bg_count += 1
 
@@ -626,7 +641,8 @@ def _activity_status_dict():
             detail = f"Syncing {acc.name} - {progress['done']:,} EPG entries"
         else:
             detail = f'Syncing {acc.name}'
-        bg_tasks.append({'label': 'Account sync', 'detail': detail,
+        bg_tasks.append({'kind': BG_KIND_ACCOUNT_SYNC,
+                         'label': 'Account sync', 'detail': detail,
                          'href': url_for('accounts.account_detail', account_id=acc.id)})
         dashboard_bg_count += 1
 
@@ -657,7 +673,8 @@ def _activity_status_dict():
                 detail = _joining_detail(r)
             elif status_val == REC_STATUS_ANALYZING:
                 detail = _analyzing_detail(r)
-            bg_tasks.append({'label': row_label, 'detail': detail,
+            bg_tasks.append({'kind': BG_KIND_POST_CAPTURE,
+                             'label': row_label, 'detail': detail,
                              'href': url_for('recordings.recording_detail', recording_id=r.id)})
             dashboard_bg_count += 1
 
@@ -666,7 +683,8 @@ def _activity_status_dict():
     # (dev/changelog/461). Not part of dashboard_bg_count: no Dashboard page section shows it.
     from ..search_index import rebuilding_index_names
     for name in rebuilding_index_names():
-        bg_tasks.append({'label': 'Search index rebuild', 'detail': f'Rebuilding {name} index',
+        bg_tasks.append({'kind': BG_KIND_SEARCH_INDEX,
+                         'label': 'Search index rebuild', 'detail': f'Rebuilding {name} index',
                          'href': url_for('system.maintenance') + '#m-index'})
 
     # The admission registry (app/admission.py) is the only record of a maintenance job -
@@ -681,7 +699,8 @@ def _activity_status_dict():
     admission_held = describe_active()
     for kind, label, _age in admission_held:
         if kind == KIND_MAINTENANCE:
-            bg_tasks.append({'label': 'Database maintenance', 'detail': label or 'Running',
+            bg_tasks.append({'kind': BG_KIND_MAINTENANCE,
+                             'label': 'Database maintenance', 'detail': label or 'Running',
                              'href': url_for('system.maintenance')})
 
     bg_active = bool(bg_tasks)

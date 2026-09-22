@@ -16,8 +16,8 @@ Guards what `dev/changelog/753` built, which is the two halves of
 
 The rules with teeth, each of which is a separate way to get this wrong:
 
-  * A strategy that manages no lock (`health_check_only`, `highest_score`, `manual`,
-    `unmanaged`) never writes one, and `unmanaged` never filters even when a stale lock is
+  * A strategy that manages no lock (`highest_score`, `manual`, `unmanaged`) never
+    writes one, and `unmanaged` never filters even when a stale lock is
     still on the row - §16.2 promises it "records from whichever member ranks best,
     whatever its format".
   * An **untested** member survives the filter. Unknown is not proven-different, and the
@@ -46,7 +46,7 @@ from app.channel_groups import (apply_format_strategy, format_eligible_members, 
                                 guide_row_targets, recording_members)
 from app.database import (ChannelGroupEvent, ChannelGroupMember, Alert,  # noqa: E402
                           GROUP_FORMAT_STRATEGY_APPLIED, GROUP_FORMAT_STRATEGY_BLOCKED,
-                          GROUP_FORMAT_HEALTH_CHECK_ONLY, GROUP_FORMAT_HIGHEST_SCORE,
+                          GROUP_FORMAT_HIGHEST_SCORE,
                           GROUP_FORMAT_MANUAL, GROUP_FORMAT_UNMANAGED)
 
 HD = ('1920x1080', 60)
@@ -146,14 +146,6 @@ class FormatFilterTests(_GroupCase):
         self.assertEqual(2, len(sel.members))
         self.assertFalse(group_manages_format(grp))
 
-    def test_health_check_only_never_filters(self):
-        grp, chans = self._group(GROUP_FORMAT_HEALTH_CHECK_ONLY, [SD, HD])
-        grp.set_locked_format(*HD)
-        db.session.commit()
-        sel = format_eligible_members(grp, recording_members(grp.memberships),
-                                      self._latest(chans))
-        self.assertEqual(2, len(sel.members))
-
     def test_zero_survivors_is_an_override_that_hands_back_everything(self):
         """§15.2: "that should force the recording to happen but be loud about it". An
         empty list here would be a silent skip, which is the one answer the model forbids."""
@@ -236,8 +228,8 @@ class NoEligibleMemberAlertTests(_GroupCase):
 # ── Layer 1: the standing strategy ───────────────────────────────────────────
 
 class StrategyLockPlanTests(_GroupCase):
-    def test_the_four_non_bucket_values_manage_no_lock(self):
-        for strategy in (GROUP_FORMAT_HEALTH_CHECK_ONLY, GROUP_FORMAT_HIGHEST_SCORE,
+    def test_the_three_non_bucket_values_manage_no_lock(self):
+        for strategy in (GROUP_FORMAT_HIGHEST_SCORE,
                          GROUP_FORMAT_MANUAL, GROUP_FORMAT_UNMANAGED):
             with self.subTest(strategy=strategy):
                 grp, chans = self._group(strategy, [HD, HD, SD])
@@ -317,7 +309,7 @@ class StrategyRouteTests(_GroupCase):
     def test_setting_the_strategy_applies_it_immediately(self):
         """A standing setting that visibly does nothing until the next run reads as
         broken."""
-        grp, _chans = self._group(GROUP_FORMAT_HEALTH_CHECK_ONLY, [HD, SD, SD])
+        grp, _chans = self._group(GROUP_FORMAT_HIGHEST_SCORE, [HD, SD, SD])
         resp = self.t.client.post(f'/api/channel-groups/{grp.id}/format-strategy',
                                   json={'strategy': 'most_channels'})
         self.assertEqual(200, resp.status_code)

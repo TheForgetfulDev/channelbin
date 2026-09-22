@@ -1053,6 +1053,47 @@ class AiringGrainTests(_PageJs, unittest.TestCase):
         self.assertEqual(self.obs['sort_after_flip'], 'when')
         self.assertNotIn('sorted by', self.obs['count_line_after_flip'])
 
+    def test_the_airing_count_line_names_airings_and_the_channels_they_are_on(self):
+        """Neither number on this line answered "how many channels is this on" before
+        (dev/changelog/1080): the total counts showings, and the figure beside it was the
+        whole library, which is the same whatever you searched for. Both halves of the fix
+        are asserted - the NOUN says what was counted, and the channel count says where.
+
+        The seeded corpus deliberately puts all three showings on one channel (its own
+        comment explains why another would move every channel-grain observation here), so
+        the number to look for is 1 of the library size.
+        """
+        line = self.obs['count_line_after_flip']
+        self.assertIn('airings', line)
+        self.assertNotIn('matches', line)
+        self.assertIn('on 1 of ', line)
+        self.assertIn('channels', line)
+        # The matched count is a number on this line like every other, so it is in <strong>.
+        self.assertIn('<strong>1</strong> of ', self.obs['count_html_after_flip'])
+
+    def test_the_airing_count_line_shows_one_channel_number_not_two(self):
+        """The library size is kept as the matched count's DENOMINATOR rather than sitting
+        beside it as a second "N channels total". Two channel numbers in one line, meaning
+        different things, is the confusion this change exists to remove."""
+        self.assertNotIn('channels total', self.obs['count_line_after_flip'])
+
+    def test_the_channel_grain_keeps_matches_and_its_own_channels_total(self):
+        """The other direction, so neither assertion above can pass by the line simply
+        having changed shape for everybody. A channel-grain row may be a channel or a
+        group, so no single noun covers both and "matches" stays."""
+        line = self.obs['count_line_after_back']
+        self.assertIn('matches', line)
+        self.assertIn('channels total', line)
+        self.assertNotIn('airings', line)
+
+    def test_the_channel_count_says_what_it_counted(self):
+        """Counted over the rows this search shows, so the collapse options narrow it the
+        same way they narrow the total. Said on the number itself: a reader who cannot find
+        out what a number counts cannot explain it."""
+        tip = self.obs['on_channels_tip']
+        self.assertIn('rows this search shows', tip)
+        self.assertIn('in your library', tip)
+
     def test_the_header_is_the_airing_registry_with_the_program_pinned_first(self):
         """The thing the row IS goes first and is not in the picker - Program here,
         exactly as Channel is on the other grain."""
@@ -1244,6 +1285,19 @@ class CountsSplitTests(_PageJs, unittest.TestCase):
         self.assertNotIn('+', self.obs['head_count_after'])
         self.assertIn('airing', self.obs['head_count_after'])
         self.assertNotIn('counting', self.obs['count_line_after'])
+
+    def test_the_channel_count_is_pending_with_the_total_and_arrives_with_it(self):
+        """They come off ONE query on the server, so there is no state where one has landed
+        and the other has not. While pending the line falls back to the plain library size it
+        showed before this number existed - that figure is known from first paint and is not
+        what was too expensive to have (dev/changelog/1080)."""
+        pending = self.obs['count_line_while_pending']
+        self.assertNotIn(' of </span>', pending)
+        self.assertNotIn('onchans', pending)
+        self.assertIn('channels total', pending)
+        after = self.obs['count_line_after']
+        self.assertIn('onchans', after)
+        self.assertNotIn('channels total', after)
 
 
 class RequestIdentityTests(_PageJs, unittest.TestCase):

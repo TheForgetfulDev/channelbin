@@ -658,6 +658,9 @@ _DEFAULTS = {
         # Legacy booleans from a pre-dropdown config are still accepted (True -> 'mpegts').
         'url_normalization': 'disabled',
         'epg_case_sensitive_matching': False,  # False = merge case-variant EPG IDs when matching XMLTV
+        # Both DEFER rather than skip since dev/changelog/941 - the occurrence retries at
+        # the first gap long enough to finish a sync in. The keys keep their historical
+        # names; renaming a live config leaf breaks every existing config.yaml.
         'skip_sync_if_recording_active': True,
         'skip_sync_if_recording_within_minutes': 5,
         'tester_defer_retry_minutes': 20,  # defer sync past an active test run, retry after this; 0 = skip with no retry
@@ -705,8 +708,11 @@ _DEFAULTS = {
     'channel_testing': {
         # Enable/schedule for the automatic guide run live on the 'TV Guide Channels'
         # system health-check row (OnDemandTestJob.is_system), not in config.
-        'skip_if_recording_active': True,       # skip the TV Guide Channels run if a recording is IN_PROGRESS
-        'skip_if_recording_within_minutes': 10, # skip ANY run (system or custom) if a recording starts this soon; 0 = off
+        # Both guards DEFER rather than skip since dev/changelog/941 - the occurrence is
+        # retried at the first gap long enough to finish the run in. The keys keep their
+        # historical names; renaming a live config leaf breaks every existing config.yaml.
+        'skip_if_recording_active': True,       # defer the TV Guide Channels run if a recording is IN_PROGRESS
+        'skip_if_recording_within_minutes': 10, # defer ANY scheduled run, warn before a manual one; 0 = off
         'test_duration_seconds': 30,
         'wait_between_channels_seconds': 30,
         'screenshots_enabled': True,

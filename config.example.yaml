@@ -386,8 +386,8 @@ preview:
   dir: ''                                # '' = system temp dir; where the rolling segment window is written
 
 channel_testing:
-  skip_if_recording_active: true         # skip the automatic TV Guide Channels run while a recording is in progress
-  skip_if_recording_within_minutes: 10   # skip ANY run if a recording starts this soon; 0 = off
+  skip_if_recording_active: true         # defer the automatic TV Guide Channels run while a recording is in progress
+  skip_if_recording_within_minutes: 10   # defer ANY scheduled run (and warn before a manual one) if a recording starts this soon; 0 = off
   test_duration_seconds: 30
   wait_between_channels_seconds: 30
   screenshots_enabled: true

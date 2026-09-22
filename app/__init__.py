@@ -301,6 +301,14 @@ def create_app(config_overrides=None, start_scheduler=True):
     # `with context`. Pure: reads the _DEFAULTS constant only (dev/changelog/1003).
     app.jinja_env.globals['default_display'] = default_display
 
+    # The recording-status vocabulary, for the browser's half of it (static/js/util.js's
+    # recStatusLabel()). A global rather than a context value because it is a module
+    # constant - no request state reaches it and no I/O builds it (dev/changelog/1083).
+    from .fmt_utils import REC_STATUS_LABELS, REC_WAITING_LABEL
+    app.jinja_env.globals['rec_status_vocab'] = {
+        'labels': REC_STATUS_LABELS, 'waiting': REC_WAITING_LABEL,
+    }
+
     @app.context_processor
     def inject_globals():
         cfg = load_config()

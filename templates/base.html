@@ -20,6 +20,11 @@
      rendered by Jinja can never disagree about where Fair ends. `| forceescape` because a
      tojson inside a double-quoted attribute is not otherwise attribute-safe. #}
   <meta name="health-bands" content="{{ health_bands_json | tojson | forceescape }}">
+  {# The recording-status vocabulary (app/fmt_utils.py), served the same way: a status is
+     stored under one name and shown under another, so any JS that labels a status from a
+     raw enum needs the server's own table or it invents a second one. The TV Guide had
+     invented one, and it called two post-capture phases "Recorded" (dev/changelog/1083). #}
+  <meta name="rec-status-labels" content="{{ rec_status_vocab | tojson | forceescape }}">
   <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
   <script src="{{ url_for('static', filename='js/util.js') }}"></script>
   <link rel="apple-touch-icon" sizes="180x180" href="{{ url_for('static', filename='img/logo/channelbin-favicon/apple-touch-icon.png') }}">
@@ -724,6 +729,11 @@
           if (window.__applyIndicators) window.__applyIndicators(d.activity);
           if (window.__applySearchReadiness) window.__applySearchReadiness(d.search);
           if (window.__applyAccountSync) window.__applyAccountSync(d.account_sync);
+          // Page-scoped, like the three above, and deliberately NOT a second assignment to
+          // __applyIndicators: that one is this file's own writer of the nav chips, and it
+          // is defined further down this page than the per-page scripts block, so a page
+          // script could neither wrap it nor replace it without dropping the chips.
+          if (window.__applyBackgroundTasks) window.__applyBackgroundTasks(d.activity.background);
           applyLiveCount(d.activity);
           applyReadiness(d.readiness);
           // Rail tooltips carry the counts, so they are re-derived after the

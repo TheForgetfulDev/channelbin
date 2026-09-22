@@ -268,8 +268,8 @@ def format_buckets(channels, latest_by_channel, rank_ids=None) -> list:
 
     **The bucket answers two different questions and keeps them apart.** `count`,
     `channel_ids` and `median_*` describe every channel handed in: that is the MEMBERSHIP
-    question ("who matches this format"), and apply_format_plan can delete the members a
-    winning bucket leaves out, so narrowing it would delete members nobody asked about.
+    question ("who matches this format"), which the create-group and clone previews
+    show per member, so narrowing it would describe members nobody asked about.
     `rank_count` and `rank_median_*` describe only `rank_ids` - the members the lock will
     actually filter, i.e. the recording-enabled ones - and are what the strategies rank
     on. `rank_ids=None` ranks over everyone, which is the right answer for a group with
@@ -488,15 +488,21 @@ def group_name_conflict(name, exclude_group_id=None) -> bool:
     return q.first() is not None
 
 
-def build_group_with_members(name, channel_ids, strategy=None):
+def build_group_with_members(name, channel_ids, strategy=None, profile_id=None, **group_kw):
     """Create a ChannelGroup holding `channel_ids`, WITHOUT committing. Returns the
-    flushed group.
+    flushed group, with its one health check reachable as `group.check`.
 
     The one way a group is brought into existence with members, so every path that makes
     one produces the same thing. The health-check create route used to assemble its own
     group out of bare ChannelGroup/ChannelGroupMember rows and got a second-class one -
     no CHANNEL_GROUPED events, so the members' own timelines never recorded that they had
     been grouped, and no hiding recompute either (dev/changelog/831).
+
+    **The check is minted here and nowhere else.** A group carries exactly one
+    OnDemandTestJob - QUEUED, named `<group> - health check`, no schedule until the user
+    gives it one, `profile_id` if the caller has one - and it dies with the group. Nothing
+    creates a second one (uq_on_demand_test_jobs_group refuses it) and nothing deletes it
+    on its own (dev/changelog/1077, DESIGN-channel-groups-model.md 6).
 
     Mutates and adds without committing - the same convention as set_participation() and
     database.py::add_recording_event() - so the caller owns the commit and can keep the
@@ -507,14 +513,21 @@ def build_group_with_members(name, channel_ids, strategy=None):
     `channel_ids` order becomes membership position order. The two participation columns
     take their model defaults - Recording off, Health check on - which is the whole of
     DESIGN-channel-groups-model.md 14's "created as a health check"; the group is never
-    put in the guide, however many of its members already are (dev/changelog/751)."""
+    put in the guide, however many of its members already are (dev/changelog/751).
+    `group_kw` is any other ChannelGroup column the caller sets at birth (a clone's
+    provenance note, a pinned format)."""
     from . import channel_hiding, db
     from .database import (Channel, ChannelEvent, ChannelGroup, ChannelGroupMember,
-                           CHANNEL_GROUPED, GROUP_FORMAT_HEALTH_CHECK_ONLY)
+                           CHANNEL_GROUPED, GROUP_FORMAT_HIGHEST_SCORE, OnDemandTestJob,
+                           OD_JOB_STATUS_QUEUED)
     group = ChannelGroup(name=name,
-                         format_strategy=strategy or GROUP_FORMAT_HEALTH_CHECK_ONLY)
+                         format_strategy=strategy or GROUP_FORMAT_HIGHEST_SCORE,
+                         **group_kw)
     db.session.add(group)
     db.session.flush()  # need group.id/name for the member FKs and the events
+    db.session.add(OnDemandTestJob(name=f'{group.name} - health check',
+                                   status=OD_JOB_STATUS_QUEUED,
+                                   group_id=group.id, profile_id=profile_id))
     ids = list(channel_ids)
     for idx, cid in enumerate(ids):
         db.session.add(ChannelGroupMember(group_id=group.id, channel_id=cid, position=idx))
@@ -564,8 +577,8 @@ def lock_ranking_ids(memberships):
     describes it. Read-only - deciding a lock never writes a participation switch (4.1).
 
     Handed to format_buckets/plan_format_selection as `rank_ids`; the membership figures
-    those return still cover every member, which is what apply_format_plan's remove
-    option must keep reading."""
+    those return still cover every member, which is what the per-member previews
+    read."""
     return {m.channel_id for m in memberships if m.recording_enabled} or {
         m.channel_id for m in memberships}
 
@@ -578,26 +591,34 @@ def test_member_ids(memberships):
     return {m.channel_id for m in memberships if m.test_enabled}
 
 
-def participation_is_recording(group) -> bool:
+def participation_is_recording(group, memberships=None) -> bool:
     """Which of the two participation switches answers "is this member taking part in
     what this group is FOR" - True for Recording, False for Testing.
 
-    The gate is the group's format_strategy, the same one
-    DESIGN-channel-groups-model.md 16 uses for its warnings: a group still on
-    health_check_only is not a recording source, so reading it through a Recording
-    switch nobody has turned on yet reports every member of every new group as sitting
-    out. Once it is promoted, Recording is the switch that matters.
+    True exactly when at least one member has Recording on: that is the ONE definition
+    of "this group is a recording source", and it is a fact about the members rather
+    than a stored setting the members could contradict (DESIGN-channel-groups-model.md
+    4.4, dev/changelog/1077). A group nobody has switched on for recording is a health
+    check, and reading it through a Recording switch nobody has turned on would report
+    every member of every new group as sitting out - so it reads through Testing until
+    someone records from it.
 
     Every display surface that dims, counts or labels a member as "disabled" asks this
-    - there is exactly one definition of it (dev/changelog/743)."""
-    from .database import GROUP_FORMAT_HEALTH_CHECK_ONLY
-    return group.format_strategy != GROUP_FORMAT_HEALTH_CHECK_ONLY
+    - there is exactly one definition of it (dev/changelog/743).
+
+    `memberships`: a list view passes its batched rows for this group, so the answer
+    costs no query per row (CLAUDE.md no-hidden-I/O-in-per-row-loops); a single-group
+    caller may leave it None and the relationship is read."""
+    if group is None:
+        return False
+    rows = group.memberships if memberships is None else memberships
+    return any(m.recording_enabled for m in rows)
 
 
 def participating_member_ids(group, memberships):
     """Channel ids of the members currently taking part in what `group` is for, read
     through whichever switch participation_is_recording() names."""
-    if participation_is_recording(group):
+    if participation_is_recording(group, memberships):
         return {m.channel_id for m in memberships if m.recording_enabled}
     return test_member_ids(memberships)
 
@@ -1211,31 +1232,45 @@ def guide_row_targets(streak_threshold=DEFAULT_FAILING_STREAK_THRESHOLD,
 
 
 def schedule_is_live(job):
-    """True when a health check will still fire on its own - SCHEDULED, recurrence not
-    paused. Covers a one-off too, which `active_recurring_jobs()` below deliberately does
-    not: it runs once and that once is real coverage.
+    """True when a health check will still fire on its own - SCHEDULED or RUNNING,
+    recurrence not paused. Covers a one-off too, which `active_recurring_jobs()` below
+    deliberately does not: it runs once and that once is real coverage.
+
+    OnDemandTestJob.status carries two meanings at once - the run state and the schedule
+    state - and a run flips a scheduled job to RUNNING for its whole duration
+    (channel_tester.run_on_demand_test_job restores SCHEDULED in its finally). Reading
+    SCHEDULED alone therefore reported every member of a recurring check as unmonitored
+    for exactly as long as it was being tested (dev/changelog/1077). A RUNNING one-off
+    counts the same way: its run is the coverage it promised.
 
     The ONE answer to "is anything still going to test these channels", and every surface
     that CLAIMS coverage reads it, so none of them can promise a check that will never
     fire. That matters most for the system TV Guide check, whose schedule the user may
     remove like any other since dev/changelog/1068 - three surfaces advertise its
     incidental coverage of a group, and an unscheduled check covers nothing."""
-    return job.status == 'SCHEDULED' and not job.recur_paused
+    from .database import OD_JOB_STATUS_SCHEDULED, OD_JOB_STATUS_RUNNING
+
+    return (job.status in (OD_JOB_STATUS_SCHEDULED, OD_JOB_STATUS_RUNNING)
+            and not job.recur_paused)
 
 
 def active_recurring_jobs(include_system=True):
     """The health-check jobs that constitute ongoing monitoring, newest-id last.
 
-    "Active recurring" is `recurring AND status=='SCHEDULED' AND NOT recur_paused`: a
-    one-shot job is not ongoing monitoring, and a paused recurring one has no live
-    APScheduler trigger behind it. The ONE definition - channel_tester's
-    monitored_channel_ids() and groups_with_own_schedule_ids() below both read it, and
-    two answers to "is this monitored on a schedule" is a disagreement the user sees.
+    "Active recurring" is `recurring AND status IN (SCHEDULED, RUNNING) AND NOT
+    recur_paused`: a one-shot job is not ongoing monitoring, and a paused recurring one
+    has no live APScheduler trigger behind it. RUNNING is in the set for the reason
+    schedule_is_live() gives - a scheduled check that is mid-run is still monitoring,
+    and this is the second of the two readers of the status column's schedule meaning;
+    do not add a third. The ONE definition - channel_tester's monitored_channel_ids() and
+    groups_with_own_schedule_ids() below both read it, and two answers to "is this
+    monitored on a schedule" is a disagreement the user sees.
 
     Must be called inside an app context."""
-    from .database import OnDemandTestJob
-    q = OnDemandTestJob.query.filter_by(status='SCHEDULED', recurring=True,
-                                        recur_paused=False)
+    from .database import OnDemandTestJob, OD_JOB_STATUS_SCHEDULED, OD_JOB_STATUS_RUNNING
+    q = (OnDemandTestJob.query
+         .filter(OnDemandTestJob.status.in_([OD_JOB_STATUS_SCHEDULED, OD_JOB_STATUS_RUNNING]))
+         .filter_by(recurring=True, recur_paused=False))
     if not include_system:
         q = q.filter(OnDemandTestJob.is_system.is_(False))
     return q.order_by(OnDemandTestJob.id).all()
@@ -1257,10 +1292,11 @@ def _fallback_serving_member(group, streak_threshold=DEFAULT_FAILING_STREAK_THRE
     """The one member the automatic check probes on behalf of a group that has no
     schedule of its own, or None when the group has nobody taking part.
 
-    Read through participation_is_recording() rather than recording_enabled directly: a
-    group still on health_check_only has nothing recording-enabled by construction
-    (DESIGN-channel-groups-model.md 14), so asking for its recording members would hand
-    back nothing and the fallback would cover exactly the groups it exists to cover."""
+    Read through participation_is_recording() rather than recording_enabled directly:
+    the recording members when the group has any - the feed a guide row would actually
+    record from is the one worth probing - else the tested members, so a group nobody
+    records from is still covered rather than skipped (DESIGN-channel-groups-model.md
+    14)."""
     if participation_is_recording(group):
         candidates = recording_members(group.memberships)
     else:
@@ -1401,14 +1437,15 @@ def check_run_channels(group):
 def group_manages_format(group) -> bool:
     """Whether `group`'s format lock is allowed to filter who serves and records.
 
-    False for health_check_only (not a recording source, and DESIGN-channel-groups-model.md
-    16 gates every format warning on the same condition) and for unmanaged, whose whole
-    meaning is that mixed formats are permitted - 16.2's own copy promises the group
-    "records from whichever member ranks best, whatever its format". highest_score writes
-    no lock, so it never filters by construction rather than by this gate."""
-    from .database import GROUP_FORMAT_HEALTH_CHECK_ONLY, GROUP_FORMAT_UNMANAGED
-    return group is not None and group.format_strategy not in (
-        GROUP_FORMAT_HEALTH_CHECK_ONLY, GROUP_FORMAT_UNMANAGED)
+    False for unmanaged only, whose whole meaning is that mixed formats are permitted -
+    16.2's own copy promises the group "records from whichever member ranks best,
+    whatever its format". highest_score writes no lock, so it never filters by
+    construction rather than by this gate. Whether the group records at all is a
+    separate question (participation_is_recording) and is not folded in here: a lock
+    on a group nobody records from filters nothing, because nothing is chosen from it
+    (dev/changelog/1077)."""
+    from .database import GROUP_FORMAT_UNMANAGED
+    return group is not None and group.format_strategy != GROUP_FORMAT_UNMANAGED
 
 
 # What the format lock did to a candidate list, as one value so every selection site
@@ -1673,10 +1710,11 @@ def _log_and_alert_reconcile(group, members, latest_by_channel, diff):
     dismissal below never matched because its source is correctly group-scoped while the
     state driving it was not (dev/changelog/789).
 
-    Gated on group_manages_format(): a group that is not a recording source has no format
-    to be wrong about, which is DESIGN-channel-groups-model.md 16's condition for every
-    other format warning. Its open mismatch alerts are dismissed on the way out, so a
-    group switched to health_check_only clears rather than stranding them.
+    Gated on group_manages_format() AND participation_is_recording(): a group nobody
+    records from has no format to be wrong about, which is DESIGN-channel-groups-model.md
+    16's condition for every other format warning. Its open mismatch alerts are dismissed
+    on the way out, so a group whose last recording member is switched off clears rather
+    than stranding them.
 
     Best-effort: never raises into the caller (a health-test run, the startup sweep) - a
     logging failure must not break reconciliation."""
@@ -1690,7 +1728,7 @@ def _log_and_alert_reconcile(group, members, latest_by_channel, diff):
     try:
         if group is None:
             return
-        if not group_manages_format(group):
+        if not (group_manages_format(group) and participation_is_recording(group)):
             _dismiss_format_mismatch_alerts(group)
             return
 
@@ -1765,22 +1803,23 @@ def _log_and_alert_reconcile(group, members, latest_by_channel, diff):
                       getattr(group, 'id', '?'))
 
 
-def apply_lock_and_log(group, strategy, entry, non_matching, removed_count):
+def apply_lock_and_log(group, strategy, entry):
     """Move `group`'s format lock to the winning bucket of `entry` and record it as a
     GROUP_FORMAT_STRATEGY_APPLIED ChannelGroupEvent (DESIGN-channel-groups-model.md 4.5):
     the old format, the new one, the strategy that chose it and the numbers behind it.
 
     The explanation is `_format_strategy_entry()`'s own `rationale` - the same sentence
-    the picker showed the user before they applied it, never a second wording of the same
+    the Settings modal shows under the strategy, never a second wording of the same
     decision. channel_id stays NULL: the lock is a fact about the whole group.
 
     Adds the event and mutates the group; **the caller commits**, so the lock and its
-    explanation land in one transaction and neither can exist without the other. An apply
-    that lands on the format already locked is still logged - a user pressed a button and
-    it may have removed members, and a press that leaves no trace is exactly what
-    principle 1 refuses. The standing strategy is the opposite case and checks for itself
-    that the lock actually moved before calling this, because a nightly re-evaluation that
-    reaffirms the same format forever is noise, not disclosure (dev/changelog/753)."""
+    explanation land in one transaction and neither can exist without the other. The
+    standing strategy (apply_format_strategy) is the only caller and checks for itself
+    that the lock actually moved before calling this, because a nightly re-evaluation
+    that reaffirms the same format forever is noise, not disclosure (dev/changelog/753).
+    The "Pick best format" modal that used to apply a strategy by hand - and could remove
+    the members that did not match - was retired in dev/changelog/1077; the Settings
+    modal and the promotion walkthrough are the two format writers."""
     from . import db
     from .database import ChannelGroupEvent, GROUP_FORMAT_STRATEGY_APPLIED
     old_key = group.locked_format_key
@@ -1794,21 +1833,15 @@ def apply_lock_and_log(group, strategy, entry, non_matching, removed_count):
         moved = f'Format lock moved from {format_label(old_key)} to {format_label(new_key)}'
     else:
         moved = f'Format locked to {format_label(new_key)}'
-    removed_txt = ''
-    if removed_count:
-        removed_txt = (f", {removed_count} non-matching member"
-                       f"{'s' if removed_count != 1 else ''} removed")
     db.session.add(ChannelGroupEvent(
         group_id=group.id, channel_id=None,
         event_type=GROUP_FORMAT_STRATEGY_APPLIED,
-        detail=f'{moved} by the {label} strategy - {entry["rationale"]}{removed_txt}',
+        detail=f'{moved} by the {label} strategy - {entry["rationale"]}',
         extra_data=json.dumps({
             'strategy': strategy,
             'from': list(old_key) if old_key else None,
             'to': list(new_key) if new_key else None,
             'matched': entry['count'],
-            'non_matching': non_matching,
-            'removed': removed_count,
         })))
 
 
@@ -1817,8 +1850,8 @@ def strategy_lock_plan(group, members, latest_by_channel, rank_ids=None) -> dict
     of the three-layer story (DESIGN-channel-groups-model.md 4.4, 5).
 
     Returns {'strategy', 'manages_lock', 'entry'}:
-      - `manages_lock` False for the four values that never write a lock
-        (health_check_only, highest_score, manual, unmanaged), and `entry` is then None.
+      - `manages_lock` False for the three values that never write a lock
+        (highest_score, manual, unmanaged), and `entry` is then None.
         Those are not special cases in the engine - only the four bucket-ranking
         strategies live in FORMAT_STRATEGIES, and the rest have always sat outside it.
       - otherwise `entry` is _format_strategy_entry()'s shape, whose 'key' is None when
@@ -1943,7 +1976,7 @@ def apply_format_strategy(group, streak_threshold=None):
         g = db.session.get(ChannelGroup, group_id)
         if g is None:
             return None
-        apply_lock_and_log(g, plan['strategy'], entry, 'keep', 0)
+        apply_lock_and_log(g, plan['strategy'], entry)
         db.session.commit()
         return g
     moved_group = _move_lock()

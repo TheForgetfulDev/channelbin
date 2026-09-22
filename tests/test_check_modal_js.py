@@ -30,7 +30,7 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MODAL_JS = os.path.join(REPO, 'static', 'js', 'check-modal.js')
 
 _EXPORTS = ('ccRunSeconds, ccDurationPhrase, ccNextRun, ccClock, ccWhenLabel, ccPayload, '
-            'ccEligibleJobs, ccWindowRecommendLine')
+            'ccWindowRecommendLine')
 
 _HARNESS = f"""
 const fs = require('fs');
@@ -142,7 +142,7 @@ class PayloadTests(_Base):
     """The POST body per action (dev/changelog/321 "POST body"). The endpoint is
     unchanged, so this is what has to match it."""
 
-    _BASE = '{name: "G - health check", groupId: 4, profileId: 2, action: "%s"%s}'
+    _BASE = '{name: "G - health check", channelIds: [7], profileId: 2, action: "%s"%s}'
 
     def _payload(self, action, extra=''):
         return self.evaluate(f'ccPayload({self._BASE % (action, extra)})')
@@ -150,7 +150,7 @@ class PayloadTests(_Base):
     def test_queue_sends_no_schedule_keys(self):
         body = self._payload('queue')
         self.assertEqual(body, {'name': 'G - health check', 'action': 'queue',
-                                'attach_group_id': 4, 'profile_id': 2})
+                                'channel_ids': [7], 'profile_id': 2})
 
     def test_start_sends_no_schedule_keys(self):
         self.assertNotIn('recurring', self._payload('start'))
@@ -174,35 +174,29 @@ class PayloadTests(_Base):
         self.assertNotIn('recurring', body)
 
     def test_empty_profile_id_becomes_null_never_an_empty_string(self):
-        body = self.evaluate('ccPayload({name: "n", groupId: 1, profileId: "", action: "queue"})')
+        body = self.evaluate('ccPayload({name: "n", channelIds: [1], profileId: "", action: "queue"})')
         self.assertIsNone(body['profile_id'])
 
     def test_missing_profile_id_becomes_null(self):
-        body = self.evaluate('ccPayload({name: "n", groupId: 1, action: "queue"})')
+        body = self.evaluate('ccPayload({name: "n", channelIds: [1], action: "queue"})')
         self.assertIsNone(body['profile_id'])
 
-    def test_ad_hoc_channel_ids_send_channel_ids_not_attach_group_id(self):
-        """The Browse tab's "Test selected" flow has no group yet - groupId is omitted and
-        channelIds carries the ad hoc selection instead (dev/changelog for fableUI #4
-        chunk 2). ccPayload must not send both, and must never send an attach_group_id
-        of null/undefined (the route would then read `attach_group_id is not None`
-        wrong side and take the group-required branch)."""
+    def test_the_selection_is_sent_as_channel_ids_and_never_as_a_group(self):
+        """This modal only ever creates, so the body always describes a selection the
+        route will mint a group around. `attach_group_id` must never appear: every group
+        already carries its one check and the route answers that shape with a 409
+        (dev/changelog/1077, `1078`)."""
         body = self.evaluate('ccPayload({name: "n", channelIds: [5, 6], action: "queue"})')
         self.assertEqual(body['channel_ids'], [5, 6])
         self.assertNotIn('attach_group_id', body)
-
-    def test_group_mode_still_sends_attach_group_id_not_channel_ids(self):
-        body = self.evaluate('ccPayload({name: "n", groupId: 4, action: "queue"})')
-        self.assertEqual(body['attach_group_id'], 4)
-        self.assertNotIn('channel_ids', body)
 
     def test_nameless_omits_name_entirely_rather_than_sending_an_empty_one(self):
         """A health check has no name of its own - the route derives one from the group
         (dev/changelog/831). The key must be ABSENT, not '': the route treats a present
         but empty name as a 400 the user cannot act on, since there is no field to fill."""
-        body = self.evaluate('ccPayload({groupId: 4, action: "queue"})')
+        body = self.evaluate('ccPayload({channelIds: [1], action: "queue"})')
         self.assertNotIn('name', body)
-        body = self.evaluate('ccPayload({name: "", groupId: 4, action: "queue"})')
+        body = self.evaluate('ccPayload({name: "", channelIds: [1], action: "queue"})')
         self.assertNotIn('name', body)
 
     def test_the_group_name_is_its_own_key_not_the_jobs_name(self):
@@ -212,12 +206,6 @@ class PayloadTests(_Base):
         body = self.evaluate('ccPayload({channelIds: [1, 2], groupName: "Fox Sports 1", action: "queue"})')
         self.assertEqual(body['group_name'], 'Fox Sports 1')
         self.assertNotIn('name', body)
-
-    def test_group_name_is_never_sent_alongside_attach_group_id(self):
-        """Attaching to a group that already exists cannot also be naming a new one - the
-        route would have two answers to which group this job is about."""
-        body = self.evaluate('ccPayload({groupId: 4, groupName: "Ignored", action: "queue"})')
-        self.assertNotIn('group_name', body)
 
 
 class WindowRecommendLineTests(_Base):
@@ -266,38 +254,6 @@ class WindowRecommendLineTests(_Base):
         line = self.evaluate(f'ccWindowRecommendLine({self._PLAN}, 5, 300, "/s")')
         self.assertIn('Recommended.', line)
         self.assertNotIn('may not all finish', line)
-
-
-class EligibleJobsTests(_Base):
-    """The "add to an existing test" picker's filter - the pinned system TV Guide check
-    must not be offered (its membership can't be edited -
-    app/routes/channel_tests.py::_editable_job_group_or_error 400s it server side), a
-    zero-channel job must still be offered, and a RUNNING job must not (its membership
-    route 409s while running)."""
-
-    _JOBS = ('[{id: 1, name: "TV Guide Channels", is_system: true, status: "SCHEDULED", channel_count: 400}, '
-             '{id: 2, name: "Empty check", is_system: false, status: "QUEUED", channel_count: 0}, '
-             '{id: 3, name: "Running now", is_system: false, status: "RUNNING", channel_count: 5}, '
-             '{id: 4, name: "Normal", is_system: false, status: "COMPLETED", channel_count: 10}]')
-
-    def test_system_job_excluded(self):
-        ids = [j['id'] for j in self.evaluate(f'ccEligibleJobs({self._JOBS})')]
-        self.assertNotIn(1, ids)
-
-    def test_zero_channel_job_included(self):
-        ids = [j['id'] for j in self.evaluate(f'ccEligibleJobs({self._JOBS})')]
-        self.assertIn(2, ids)
-
-    def test_running_job_excluded(self):
-        ids = [j['id'] for j in self.evaluate(f'ccEligibleJobs({self._JOBS})')]
-        self.assertNotIn(3, ids)
-
-    def test_normal_job_included(self):
-        ids = [j['id'] for j in self.evaluate(f'ccEligibleJobs({self._JOBS})')]
-        self.assertIn(4, ids)
-
-    def test_no_jobs_yields_empty_list_not_an_error(self):
-        self.assertEqual(self.evaluate('ccEligibleJobs(null)'), [])
 
 
 if __name__ == '__main__':

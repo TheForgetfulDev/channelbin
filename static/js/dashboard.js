@@ -86,12 +86,6 @@ function handleEvent(rid, eventType, d) {
   }
 }
 
-// The server's own status -> label table (app/fmt_utils.py), rendered into the page. Read
-// once: nothing republishes it, and a miss falls back to the raw status so an unrecognized
-// value is shown rather than swallowed - same contract as rec_status_display's default.
-const STATUS_LABELS = readJson('dash-status-labels') || {};
-const WAITING_LABEL = readJson('dash-waiting-label');
-
 let _reloadTimer = null;
 
 // Keyed on the `status` a frame carries, never on its event name: every lifecycle publish
@@ -102,8 +96,12 @@ let _reloadTimer = null;
 // Acts only on a CHANGE from what the row shows: CONVERSION_PROGRESS and STATS_SNAPSHOT
 // repeat the current status every tick, and each change schedules a reload so the row's
 // server-rendered cells catch up with its new phase.
+// The word comes from util.js's recStatusLabel - the server's own table (app/fmt_utils.py),
+// served to every page by base.html. A status the table does not name is not a status this
+// page can relabel, so the frame is left alone rather than badged from its raw enum.
 function handleStatus(rid, d) {
-  if (!Object.prototype.hasOwnProperty.call(STATUS_LABELS, d.status)) return;
+  const label = recStatusLabel(d.status);
+  if (label === null) return;
   const row = document.getElementById(`card-${rid}`);
   if (!row) return;
   const wasWaiting = row.dataset.waiting === '1';
@@ -119,7 +117,8 @@ function handleStatus(rid, d) {
   const badge = document.getElementById(`badge-${rid}`);
   if (badge) {
     badge.className = `badge badge-${d.status.toLowerCase()}`;
-    badge.textContent = (waiting && WAITING_LABEL) ? WAITING_LABEL : STATUS_LABELS[d.status];
+    const parked = recWaitingLabel();
+    badge.textContent = (waiting && parked) ? parked : label;
   }
   if (d.status === 'COMPLETED') row.style.setProperty('--pct', '100%');
   if (_reloadTimer === null) _reloadTimer = setTimeout(() => location.reload(), 3000);
@@ -164,20 +163,58 @@ function connect() {
   });
 }
 
-// ── Channel health check card (polling, not SSE - channel_tester has no pub/sub) ──
+/* ── Channel health check card (polling, not SSE - channel_tester has no pub/sub) ──
+
+   TWO WRITERS, ON TWO SCALES, AND THEY DO NOT OVERLAP. The 3s poll below writes CELLS
+   INSIDE the card by id and nothing else. The card itself - whether the section holds a
+   row at all - is written only by refreshSection('health'), the same way the template
+   owns a recording row while SSE patches its cells.
+
+   The widget is startable more than once because the section it lives in is swapped out
+   from under it: every start after the first has to find either its own live poll (and
+   leave it alone) or a fresh card (and adopt it). Both timers are stoppable for the same
+   reason - a poll left running against a card that has been replaced is the second writer
+   the rule above exists to prevent, and it would keep asking the server forever. */
 
 let _hcRunStartedAt = null;
+let _hcPolling = false;
+let _hcElapsedTimer = null;
+
+function stopHealthCheckWidget() {
+  _hcPolling = false;
+  if (_hcElapsedTimer !== null) { clearInterval(_hcElapsedTimer); _hcElapsedTimer = null; }
+  _hcRunStartedAt = null;
+}
 
 function pollHealthCheck() {
+  // Checked before the request and again after it: a swap can land during the round trip,
+  // and a chain that outlives its own card must not schedule another turn.
+  if (!_hcPolling || !document.getElementById('hc-card')) { stopHealthCheckWidget(); return; }
   fetch('/api/channel-tests/active-run')
     .then(r => r.json())
     .then(data => {
+      if (!_hcPolling || !document.getElementById('hc-card')) { stopHealthCheckWidget(); return; }
       if (!data || data.active === false) {
+        // The run is over. The badge says so immediately - the poll is what learns this
+        // first, ~15s before the nav-status hook could - and then the section is swapped
+        // for its server render, which is the empty state. This used to reload the whole
+        // page instead, which threw away the timeline's scroll position, every section's
+        // sort and the SSE connection to whatever was still recording, to refresh one
+        // row (dev/changelog/1082).
         const badge = document.getElementById('hc-status-badge');
         if (badge) { badge.textContent = 'FINISHED'; badge.className = 'badge badge-completed'; }
-        setTimeout(() => location.reload(), 3000);
+        stopHealthCheckWidget();
+        refreshSection('health');
         return;
       }
+
+      // A DIFFERENT run than the one this card was drawn for: the previous one finished
+      // and another started inside a single turn of this poll, so the nav hook saw a
+      // health check both times and had nothing to react to. Without this the cells below
+      // would keep counting under the finished run's name and link - the reload this
+      // replaced could not hit it, because it rebuilt the whole page (dev/changelog/1082).
+      // The live chain keeps running and adopts the swapped-in card by id.
+      if (_hcRunStartedAt && data.run_started_at !== _hcRunStartedAt) refreshSection('health');
 
       setEl('hc-progress-text', `${data.completed_channels} / ${data.total_channels}`);
       const row = document.getElementById('hc-card');
@@ -199,14 +236,19 @@ function pollHealthCheck() {
 }
 
 function startHealthCheckWidget() {
-  if (!document.getElementById('hc-card')) return;
+  if (!document.getElementById('hc-card')) { stopHealthCheckWidget(); return; }
+  // Already polling: the card was swapped for another card (a second run started, or the
+  // section simply re-rendered), and the live chain adopts it by id on its next turn.
+  // Starting a second one here is how the card ends up with two writers.
+  if (_hcPolling) return;
 
-  setInterval(() => {
+  _hcElapsedTimer = setInterval(() => {
     if (!_hcRunStartedAt) return;
     const elapsed = (Date.now() - new Date(_hcRunStartedAt + 'Z').getTime()) / 1000;
     setEl('hc-elapsed', fmtDur(elapsed));
   }, 1000);
 
+  _hcPolling = true;
   pollHealthCheck();
 }
 
@@ -455,7 +497,7 @@ function renderTimeline() {
       <span class="tl-key"><i class="converting"></i>Converting</span>
       <span class="tl-key"><i class="scheduled"></i>Scheduled</span>
       <span class="tl-key"><i class="job"></i>Job</span>
-      ${nClash ? '<span class="tl-key clash"><i class="jobclash"></i>Job that will be skipped</span>' : ''}
+      ${nClash ? '<span class="tl-key clash"><i class="jobclash"></i>Job that will be deferred</span>' : ''}
       <span class="tl-off">${escHtml(counts)} in this window${outside ? `, ${outside} outside it` : ''}</span>
     </div>`;
 
@@ -565,8 +607,15 @@ bindNavClicks(document, e => {
    pattern index.html's recordings list and group-detail.js's member table use.
    name/status compare as strings; every other column is a number staged on the row by
    the template (or kept live by the SSE handlers above), with a missing value sorting
-   to the end regardless of direction - the group-detail.js member table's convention. */
+   to the end regardless of direction - the group-detail.js member table's convention.
+
+   The chosen sort is held per SECTION KEY rather than in each section's own closure,
+   because two of these sections are swapped for a fresh server render while the page is
+   open. A closure goes with the nodes it was bound to, so the user's sort would silently
+   revert to server order on the first refresh - the frontend rule that a rebuild re-applies
+   every piece of active state (dev/changelog/1082). */
 const DASH_SORT_STRING = new Set(['name', 'status']);
+const DASH_SORT = new Map();
 
 function dashSortValue(row, key, dir) {
   const raw = row.dataset[key];
@@ -575,30 +624,38 @@ function dashSortValue(row, key, dir) {
   return parseFloat(raw);
 }
 
-function wireDashSort() {
-  document.querySelectorAll('.dash-sec').forEach(sec => {
-    const headers = Array.from(sec.querySelectorAll('.dash-head .sortable'));
-    const rows = sec.querySelector('.dash-rows');
-    if (!headers.length || !rows) return;
-    let state = null;  // { key, dir } - unsorted (server order) until the first click
-    const apply = () => {
-      sortChildren(rows, '.drow', row => dashSortValue(row, state.key, state.dir), state.dir);
-      headers.forEach(h => {
-        const active = h.dataset.sort === state.key;
-        h.classList.toggle('sorted', active);
-        h.querySelector('.sort-ind').textContent = active ? (state.dir === 'desc' ? ' ▾' : ' ▴') : '';
-      });
-    };
+function wireDashSec(sec) {
+  const secKey = sec.dataset.sec;
+  const headers = Array.from(sec.querySelectorAll('.dash-head .sortable'));
+  const rows = sec.querySelector('.dash-rows');
+  if (!headers.length || !rows) return;
+  const apply = () => {
+    const state = DASH_SORT.get(secKey);
+    if (!state) return;  // unsorted - the server's order, which is a real state
+    sortChildren(rows, '.drow', row => dashSortValue(row, state.key, state.dir), state.dir);
     headers.forEach(h => {
-      h.addEventListener('click', () => {
-        const key = h.dataset.sort;
-        state = (state && state.key === key)
-          ? { key, dir: state.dir === 'asc' ? 'desc' : 'asc' }
-          : { key, dir: DASH_SORT_STRING.has(key) ? 'asc' : 'desc' };
-        apply();
-      });
+      const active = h.dataset.sort === state.key;
+      h.classList.toggle('sorted', active);
+      h.querySelector('.sort-ind').textContent = active ? (state.dir === 'desc' ? ' ▾' : ' ▴') : '';
+    });
+  };
+  headers.forEach(h => {
+    h.addEventListener('click', () => {
+      const key = h.dataset.sort;
+      const state = DASH_SORT.get(secKey);
+      DASH_SORT.set(secKey, (state && state.key === key)
+        ? { key, dir: state.dir === 'asc' ? 'desc' : 'asc' }
+        : { key, dir: DASH_SORT_STRING.has(key) ? 'asc' : 'desc' });
+      apply();
     });
   });
+  // A no-op on the first wire and the whole point of the second: a section swapped in
+  // after the user sorted it arrives in server order and is re-sorted here.
+  apply();
+}
+
+function wireDashSort() {
+  document.querySelectorAll('.dash-sec').forEach(wireDashSec);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -682,6 +739,99 @@ document.addEventListener('change', e => {
   showToast(`${SEC.defs[k].label} ${SEC.on[k] ? 'shown' : 'hidden'}.`);
 });
 
+/* ═══════════════════════════════════════════════════════════════════════════
+   SECTIONS THAT KEEP THEMSELVES CURRENT  (the 2026-08-11 call: polling for
+   these two, SSE only for live recordings)
+
+   Two of the five sections go stale on a page left open. The accounts rows say
+   "Synced 4m ago" an hour later and never notice a sync starting, finishing or
+   failing; the health section is rendered empty unless the page happened to load
+   DURING a run, so a nightly check that starts while you are watching is invisible
+   until a reload. Both already have a trigger on /api/nav-status and neither was
+   reading it (dev/changelog/1001, 1082).
+
+   ONE WRITER PER REGION, several triggers into it - the shape accounts.js uses. The
+   writer is refreshSection(), which asks the server for a fresh copy of the section
+   and swaps it in whole, so the template stays the only thing that knows what a row
+   looks like. It never patches a cell from JSON, and nothing else replaces these
+   nodes: Customize MOVES and HIDES them, the SSE handlers write cells in the two
+   recording sections, and renderTimeline owns #tl.
+
+   The baseline every trigger compares against is READ BACK OUT OF THE DOM - the
+   signature the accounts section was rendered at, and whether a health card is on the
+   page - rather than remembered from the first payload. The server-rendered markup is
+   the ground truth about what the user is looking at, so there is no stored flag to
+   drift out of step with it, and a run that starts in the gap between the render and
+   the first poll is caught rather than missed.
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+// The two sections with a live trigger. Everything else is load-once on purpose: the
+// recording sections are SSE-driven, and the timeline redraws from its own clock.
+const SELF_REFRESHING = new Set(['accounts', 'health']);
+const ACCOUNTS_RERENDER_MS = 60 * 1000;
+
+const _swapping = new Set();
+const _sectionRenderedAt = new Map();
+
+const dashSec = key => document.querySelector(`.dash-sec[data-sec="${key}"]`);
+const healthCardPresent = () => Boolean(document.getElementById('hc-card'));
+
+function refreshSection(key) {
+  if (!SELF_REFRESHING.has(key) || _swapping.has(key) || !dashSec(key)) return;
+  _swapping.add(key);
+  swapFromServer([`.dash-sec[data-sec="${key}"]`])
+    .then(() => {
+      _sectionRenderedAt.set(key, Date.now());
+      // Everything the swap threw away and the user chose: this section's sort, and the
+      // order/visibility Customize holds outside the markup.
+      const sec = dashSec(key);
+      if (sec) wireDashSec(sec);
+      applySections();
+      // The fresh card (or the absence of one) decides whether the 3s poll runs; the
+      // widget adopts a card it is already polling rather than doubling up on it.
+      if (key === 'health') startHealthCheckWidget();
+    })
+    .catch(err => console.warn(`Dashboard ${key} section refresh failed; the next poll retries.`, err))
+    .finally(() => _swapping.delete(key));
+}
+
+/* Two triggers, each covering what the other cannot - accounts.js's pair, for the same
+   two reasons: the signature moves when a sync starts, ends or fails, and the minute tick
+   is what stops "Synced 4m ago" and "in 23h 44m" drifting while nothing changes.
+
+   The tick is also the answer for the row's health signal line (dev/changelog/1063), and
+   that is worth stating rather than assuming: Avg score, Failing now and the band bar move
+   with HEALTH CHECKS, not with syncs, so the sync signature is structurally the wrong
+   trigger for them and only the tick covers them at all.
+
+   Skipped while the tab is in the background or the section is hidden in Customize, since
+   the tick is the only unconditional recurring cost here. Neither needs its own recovery:
+   the next nav poll after the tab or the section comes back finds a render older than a
+   minute and refreshes then. */
+window.__applyAccountSync = (sig) => {
+  const sec = dashSec('accounts');
+  if (!sec || typeof sig !== 'string') return;
+  if (sig !== sec.dataset.syncSig) { refreshSection('accounts'); return; }
+  if (document.hidden || sec.hidden) return;
+  const at = _sectionRenderedAt.get('accounts') || 0;
+  if (Date.now() - at >= ACCOUNTS_RERENDER_MS) refreshSection('accounts');
+};
+
+// Which task row means "a health check is running", from the server's own vocabulary
+// (app/routes/dashboard.py). Keyed on `kind` and never on `label`, which is display text
+// and has been reworded twice on this payload already.
+const BG_HEALTH_KIND = readJson('dash-bg-health-kind');
+
+window.__applyBackgroundTasks = (bg) => {
+  if (!BG_HEALTH_KIND || !dashSec('health')) return;
+  const tasks = (bg && Array.isArray(bg.tasks)) ? bg.tasks : [];
+  const running = tasks.some(t => t && t.kind === BG_HEALTH_KIND);
+  // The section already shows the truth on both edges, which is also what keeps this
+  // quiet on every steady poll and stops it racing the swap the 3s poll just asked for.
+  if (running === healthCardPresent()) return;
+  refreshSection('health');
+};
+
 function initDashboard() {
   const prefs = readJson('dash-sections-pref');
   if (prefs) {
@@ -716,6 +866,9 @@ function initDashboard() {
   wireDashSort();
   connect();
   startHealthCheckWidget();
+  // The minute tick measures from the SERVER RENDER, not from the first swap, so a page
+  // left open from the moment it loaded is refreshed a minute later like any other.
+  SELF_REFRESHING.forEach(key => _sectionRenderedAt.set(key, Date.now()));
 }
 
 document.addEventListener('DOMContentLoaded', initDashboard);

@@ -76,8 +76,7 @@ def _seed_pairs(n):
         ch1 = seed.make_channel(acc, name=f'Pair {i} Member A')
         ch2 = seed.make_channel(acc, name=f'Pair {i} Member B')
         grp = seed.make_group(name=f'Pair {i}', members=[ch1, ch2])
-        db.session.add(OnDemandTestJob(name=f'Pair {i} check', group_id=grp.id,
-                                       status='COMPLETED'))
+        seed.set_check(grp, name=f'Pair {i} check', status='COMPLETED')
     db.session.commit()
 
 
@@ -92,19 +91,6 @@ def _seed_group_members(n):
         seed.make_channel_test(ch, all_null=False, status='COMPLETED',
                                resolution='1920x1080', fps=60.0, bitrate_kbps=4200.0)
     seed.make_group(name='Scaling Group', members=channels)
-    db.session.commit()
-
-
-def _seed_check_members(n):
-    """The same page entered by its health check instead of its group, with n channels
-    under test - the facet that also renders Status/Frames/Drops/Screenshot columns and
-    the per-run result tally."""
-    acc = seed.make_account()
-    channels = [seed.make_channel(acc, name=f'Checked {i}') for i in range(n)]
-    job = seed.make_test_job(name='Scaling Check', channels=channels, status='COMPLETED')
-    for ch in channels:
-        seed.make_channel_test(ch, all_null=False, status='COMPLETED', job_id=job.id,
-                               resolution='1280x720', fps=30.0, bitrate_kbps=2100.0)
     db.session.commit()
 
 
@@ -138,10 +124,6 @@ def _scaling_channel_id():
 
 def _scaling_group_id():
     return ChannelGroup.query.filter_by(name='Scaling Group').one().id
-
-
-def _scaling_job_id():
-    return OnDemandTestJob.query.filter_by(name='Scaling Check').one().id
 
 
 def _seed_converting(n):
@@ -622,9 +604,6 @@ class PageScalingTests(unittest.TestCase):
     def test_group_detail_page(self):
         self._assert_row_independent(_seed_group_members, lambda: f'/channel-groups/{_scaling_group_id()}')
 
-    def test_health_check_detail_page(self):
-        self._assert_row_independent(_seed_check_members, lambda: f'/channels/health-checks/{_scaling_job_id()}')
-
     def test_channel_detail_page(self):
         # Every list unpaginated, so the rows themselves scale - the default page sizes
         # would cap the rendered rows and hide a per-row lookup in the table loops.
@@ -750,7 +729,6 @@ COVERED = {
     'guide.guide': 'test_guide_page',
     'channels.channel_browser': 'test_channels_hub_page',
     'channels.channel_detail': 'test_channel_detail_page',
-    'channels.health_check_detail': 'test_health_check_detail_page',
     'channel_groups.groups_page': 'test_groups_page',
     'channel_groups.group_detail': 'test_group_detail_page',
     'alerts.alert_center': 'test_alerts_page',
@@ -778,6 +756,7 @@ NOT_ROW_SCALING = {
     'channels.channels_health_checks_guide': _REDIRECT + 'old URL, now the guide system check.',
     'channels.channels_test_runs': _REDIRECT + 'old URL, now the Groups tab.',
     'channels.test_run_detail': _REDIRECT + 'old URL, now the check detail page.',
+    'channels.health_check_detail': _REDIRECT + 'a check is its group, so this is the group page (changelog/1077).',
     'guide.channel_browser': _REDIRECT + 'old URL, now the Channels hub.',
     'guide.epg_status': _REDIRECT + 'old URL, the EPG Browser is retired (changelog/631).',
     'recordings.new_recording': _REDIRECT + 'manual scheduling is a modal on the TV Guide.',

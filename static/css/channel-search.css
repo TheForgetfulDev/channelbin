@@ -233,6 +233,11 @@
    total beside them is missing. Muted rather than a warning colour, so it reads as an
    absent extra and not as a problem with the results (dev/changelog/676). */
 .cs-count .uncounted { color: var(--text-muted); cursor: help; }
+/* "on 37 of 136,130 channels" - part of the sentence, not a note about it, so it takes the
+   line's own colour and leaves its number in `strong` like every other number here. NOT
+   .sortnote, whose warning colour would make the airing grain's ordinary count line look
+   like something went wrong; the dotted rule is only there to say a tooltip exists. */
+.cs-count .onchans { cursor: help; text-decoration: underline dotted var(--text-faint); }
 .cs-back {
   font: inherit; font-size: var(--fs-sm); font-weight: 700; cursor: pointer;
   background: var(--accent-soft); color: var(--accent-text);

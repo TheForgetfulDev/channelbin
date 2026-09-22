@@ -47,14 +47,13 @@ class _Base(unittest.TestCase):
     def _pair(self, name='Paired group', n=2, job_name='Nightly'):
         chans = [seed.make_channel(self.acc, name=f'{name} {i}') for i in range(n)]
         grp = seed.make_group(name=name, members=chans)
-        job = OnDemandTestJob(name=job_name, group_id=grp.id, status='COMPLETED')
-        db.session.add(job)
+        job = seed.set_check(grp, name=job_name, status='COMPLETED')
         db.session.commit()
         return grp, job, chans
 
     def _health_check_only_group(self, name='Standalone check', formats=None):
-        """A health-check-only group (nothing recording-enabled) with
-        `formats` = [(resolution, fps, health), ...]."""
+        """A group nobody records from (nothing recording-enabled, so it is a health
+        check and nothing else) with `formats` = [(resolution, fps, health), ...]."""
         formats = formats or [('1920x1080', 60.0, 90), ('1920x1080', 60.0, 80)]
         chans = []
         for i, (res, fps, health) in enumerate(formats):
@@ -73,44 +72,69 @@ class _Base(unittest.TestCase):
         return grp, chans
 
 
-class LinkedSectionTests(_Base):
+class OneCheckPerGroupTests(_Base):
+    """dev/changelog/1077: a group carries exactly one health check, minted with it. The
+    `linked` card that listed several, the pair badge and every create-a-check control
+    are gone with the second check."""
 
-    def test_linked_is_a_section_between_summary_and_settings(self):
-        self.assertEqual(('summary', 'linked', 'settings', 'channels', 'activity'),
+    def test_the_sections_no_longer_carry_a_linked_card(self):
+        self.assertEqual(('summary', 'settings', 'channels', 'activity'),
                          GROUP_DETAIL_SECTIONS)
 
-    def test_a_group_page_names_its_schedule_and_renders_the_linked_card(self):
+    def test_a_group_page_names_its_one_check(self):
         grp, job, _ = self._pair(job_name='Nightly quick')
         html = self.client.get(f'/channel-groups/{grp.id}').data.decode()
-        self.assertIn('id="gd-linked"', html)
-        self.assertIn('gd-pair-badge', html)
-        self.assertIn('Nightly quick', html)
-        self.assertIn('Health check', html)
+        self.assertNotIn('id="gd-linked"', html)
+        self.assertNotIn('gd-pair-badge', html)
+        self.assertIn('jobName: "Nightly quick"', html)
+        self.assertIn('data-act="schedule"', html)
 
-    def test_two_checks_are_both_listed_and_the_badge_counts_them(self):
+    def test_a_second_check_on_one_group_is_refused_by_the_database(self):
+        from sqlalchemy.exc import IntegrityError
         grp, _job, _ = self._pair(job_name='Nightly quick')
         db.session.add(OnDemandTestJob(name='Weekly deep', group_id=grp.id, status='COMPLETED'))
-        db.session.commit()
-        html = self.client.get(f'/channel-groups/{grp.id}').data.decode()
-        self.assertIn('Health checks', html)
-        self.assertIn('2 health checks', html)
-        self.assertIn('Nightly quick', html)
-        self.assertIn('Weekly deep', html)
+        with self.assertRaises(IntegrityError):
+            db.session.flush()
+        db.session.rollback()
 
-    def test_unpaired_group_page_offers_a_check_not_a_group(self):
+    def test_no_page_offers_to_create_a_check(self):
         chans = [seed.make_channel(self.acc, name='Solo A')]
         grp = seed.make_group(name='Solo group', members=chans)
         db.session.commit()
         html = self.client.get(f'/channel-groups/{grp.id}').data.decode()
-        self.assertIn('id="gd-linked"', html)
-        self.assertIn('Create health check', html)
+        self.assertNotIn('data-act="create-check"', html)
+        self.assertNotIn('Create health check', html)
         self.assertNotIn('data-act="create-group"', html)
 
     def test_system_check_page_cannot_create_a_group(self):
         sys_group = ChannelGroup.query.filter_by(is_system=True).first()
         html = self.client.get(f'/channel-groups/{sys_group.id}').data.decode()
-        self.assertIn('id="gd-linked"', html)
         self.assertNotIn('data-act="create-group"', html)
+        self.assertNotIn('data-act="create-check"', html)
+
+    def test_a_new_group_is_minted_with_its_check(self):
+        chans = [seed.make_channel(self.acc, name='Minted A')]
+        resp = self.client.post('/api/channel-groups',
+                                json={'name': 'Minted', 'channel_ids': [c.id for c in chans]})
+        self.assertEqual(200, resp.status_code, resp.get_json())
+        grp = ChannelGroup.query.filter_by(name='Minted').one()
+        self.assertIsNotNone(grp.check)
+        self.assertEqual('Minted - health check', grp.check.name)
+        self.assertEqual('QUEUED', grp.check.status)
+
+    def test_deleting_the_group_deletes_its_check(self):
+        grp, job, _ = self._pair(job_name='Dies with it')
+        job_id = job.id
+        resp = self.client.post(f'/api/channel-groups/{grp.id}/delete')
+        self.assertEqual(200, resp.status_code, resp.get_json())
+        db.session.expire_all()
+        self.assertIsNone(db.session.get(OnDemandTestJob, job_id))
+
+    def test_the_check_url_redirects_to_the_group(self):
+        grp, job, _ = self._pair(job_name='Redirected')
+        resp = self.client.get(f'/channels/health-checks/{job.id}')
+        self.assertEqual(302, resp.status_code)
+        self.assertTrue(resp.headers['Location'].endswith(f'/channel-groups/{grp.id}'))
 
 
 class CreateChannelGroupContractTests(_Base):
@@ -123,10 +147,10 @@ class CreateChannelGroupContractTests(_Base):
         self.assertEqual(200, resp.status_code, resp.get_json())
         db.session.expire_all()
         src = db.session.get(ChannelGroup, src_id)
-        self.assertEqual('health_check_only', src.format_strategy,
-                         'the source must still be a health check')
+        self.assertFalse(any(m.recording_enabled for m in src.memberships),
+                         'the source must still be a health check - nobody records from it')
         self.assertEqual(len(ids), len(list(src.memberships)))
-        self.assertEqual(1, len(list(src.test_jobs)), 'the job must still be attached')
+        self.assertIsNotNone(src.check, 'the job must still be attached')
         self.assertIsNotNone(ChannelGroup.query.filter_by(name='New group').first())
 
     def test_create_returns_the_new_groups_detail_url(self):
@@ -170,9 +194,10 @@ class CreateChannelGroupContractTests(_Base):
                                'channel_ids': [c.id for c in chans]})
         new = ChannelGroup.query.filter_by(name='Plain').first()
         self.assertFalse(new.in_guide)
-        # A clone inherits the source's strategy; the source here is health-check-only,
-        # and a health-check-only group is never put in the guide (15).
-        self.assertEqual('health_check_only', new.format_strategy)
+        # A clone inherits the source's strategy and starts with Recording off on every
+        # member, so it records from nobody and is never put in the guide (15).
+        self.assertEqual(src.format_strategy, new.format_strategy)
+        self.assertFalse(any(m.recording_enabled for m in new.memberships))
 
     def test_half_a_manual_format_is_rejected(self):
         src, chans = self._health_check_only_group()
@@ -183,9 +208,9 @@ class CreateChannelGroupContractTests(_Base):
         self.assertEqual(400, resp.status_code)
         self.assertIn('resolution and a frame rate', resp.get_json()['error'])
 
-    def test_guide_and_format_settings_are_ignored_on_a_health_check_only_clone(self):
-        """A health check has no guide row and no format rules, so accepting them would
-        store settings nothing ever reads."""
+    def test_guide_and_format_settings_are_ignored_on_a_clone_of_a_group_nobody_records_from(self):
+        """A group nobody records from has no guide row and no format to pin, so
+        accepting them would store settings nothing ever reads."""
         src, chans = self._health_check_only_group()
         resp = self.client.post(f'/api/channel-groups/{src.id}/clone',
                                 json={'name': 'Check copy',
@@ -250,21 +275,20 @@ class FormatMismatchOptInTests(_Base):
         return self._health_check_only_group('Mixed check', formats=[('1920x1080', 60.0, 90),
                                                         ('1280x720', 30.0, 10)])
 
-    def test_mismatch_warns_without_the_opt_in(self):
-        # The warning applies to a group that RECORDS. A health-check-only group accepts
-        # any mix of channels by design, so the clone has to ask for a recording strategy
-        # for there to be anything to warn about (DESIGN-channel-groups-model.md 14.1).
-        # 200 with success False, not a 409: the mix is disclosed and confirmable, never
-        # refused (dev/changelog/762).
+    def test_a_clone_never_warns_about_a_format_mix(self):
+        # The warning applies to a group that RECORDS, and a clone records from nobody:
+        # its members all start with Recording off, whatever strategy it is given, so the
+        # format question belongs to its promotion (DESIGN-channel-groups-model.md 14.1,
+        # dev/changelog/1077). The mix is still disclosed on the new group's own page.
         src, chans = self._mixed()
         resp = self.client.post(f'/api/channel-groups/{src.id}/clone',
-                                json={'name': 'Blocked', 'format_strategy': 'highest_score',
+                                json={'name': 'Mixed copy', 'format_strategy': 'highest_score',
                                       'channel_ids': [c.id for c in chans]})
         self.assertEqual(200, resp.status_code, resp.get_data(as_text=True))
-        self.assertFalse(resp.get_json()['success'])
-        self.assertIn('format_mismatch', resp.get_json())
-        self.assertIsNone(ChannelGroup.query.filter_by(name='Blocked').first(),
-                          'an unconfirmed clone creates nothing')
+        self.assertTrue(resp.get_json()['success'])
+        self.assertNotIn('format_mismatch', resp.get_json())
+        new = ChannelGroup.query.filter_by(name='Mixed copy').first()
+        self.assertEqual(len(chans), len(list(new.memberships)))
 
     def test_opt_in_is_honoured_server_side(self):
         """Enforcement lives server-side: gating this in the modal alone would leave the
