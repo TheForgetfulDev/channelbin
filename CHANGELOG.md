@@ -5,6 +5,14 @@ Notable changes to ChannelBin, newest first. This project follows
 release is tagged `v<version>` in git, and the version the app is running is shown in the
 page footer.
 
+## 0.16.2 - 2026-09-22
+
+Fixes a test that could fail at random: it searched a whole rendered page for a
+two-character string, which the page's own security token could contain by chance. That
+failure is what kept 0.16.1 from being published, and 0.16.1 in turn was what 0.16.0
+needed. Nothing in the app has changed across the three, so this is the release to
+install for everything listed under 0.16.0 below.
+
 ## 0.16.1 - 2026-09-22
 
 Fixes a test that could fail on a loaded machine for reasons unrelated to what it was

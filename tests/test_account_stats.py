@@ -10,6 +10,7 @@ deleted source row's contribution stays; days are local; a timezone change rebui
 """
 import logging
 import os
+import re
 import sys
 import unittest
 from datetime import date, datetime, timedelta
@@ -451,6 +452,22 @@ class CatchUpTests(_LedgerCase):
 
 class AccountPageTests(_LedgerCase):
 
+    # The rendered value of the "Recorded time" stat row, so an assertion reads that cell
+    # rather than the whole document. A duration is two or three characters ('2h', '30m'),
+    # and the page also carries a random CSRF token, base64 and SVG path data - searching
+    # the raw HTML for one matched 'SY7hME' inside a token and failed at random, roughly
+    # once every fifty runs (dev/docs/BUGS.md 2026-09-22 @ 07:35:26 PM).
+    _RECORDED_TIME = re.compile(
+        r'<span class="sk">Recorded time</span><span class="sv[^>]*>([^<]*)</span>')
+
+    def recorded_time(self, account):
+        page = self.t.client.get(f'/accounts/{account.id}').get_data(as_text=True)
+        shown = set(self._RECORDED_TIME.findall(page))
+        self.assertTrue(shown, 'the page rendered no "Recorded time" stat at all')
+        self.assertEqual(len(shown), 1,
+                         f'the page disagrees with itself about recorded time: {shown}')
+        return shown.pop()
+
     def test_content_card_shows_captured_time_not_the_recording_window(self):
         """BUGS.md 2026-09-18 03:41 PM: a 7h recording that ended on account B but captured
         2h on account A shows 2h on A's page - it used to show nothing there and 7h on B's."""
@@ -460,11 +477,8 @@ class AccountPageTests(_LedgerCase):
         seed.make_segment(rec, self.ch_b, T0 + timedelta(hours=2),
                           T0 + timedelta(hours=2, minutes=30), 1)
         db.session.commit()
-        page_a = self.t.client.get(f'/accounts/{self.a.id}').get_data(as_text=True)
-        page_b = self.t.client.get(f'/accounts/{self.b.id}').get_data(as_text=True)
-        self.assertIn(fmt_duration(7200), page_a)
-        self.assertIn(fmt_duration(1800), page_b)
-        self.assertNotIn(fmt_duration(7 * 3600), page_b)
+        self.assertEqual(self.recorded_time(self.a), fmt_duration(7200))
+        self.assertEqual(self.recorded_time(self.b), fmt_duration(1800))
 
     def test_account_delete_removes_its_ledger_rows(self):
         rec = seed.make_recording(status='COMPLETED', channel_id=self.ch_a.id)
