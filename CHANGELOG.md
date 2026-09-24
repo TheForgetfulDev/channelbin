@@ -5,6 +5,13 @@ Notable changes to ChannelBin, newest first. This project follows
 release is tagged `v<version>` in git, and the version the app is running is shown in the
 page footer.
 
+## 0.18.1 - 2026-09-24
+
+Fixes a test that could fail at random: its child process could miss a shutdown signal that
+arrived just before it went to sleep, and was then killed instead of exiting cleanly. That
+failure is what kept 0.18.0 from being published, and nothing in the app has changed between
+the two, so this is the release to install for everything listed under 0.18.0 below.
+
 ## 0.18.0 - 2026-09-24
 
 **Added**
