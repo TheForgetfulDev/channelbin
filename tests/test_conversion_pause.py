@@ -331,12 +331,19 @@ class TerminateContinuesFirstTests(unittest.TestCase):
         # once the handler is installed - SIGSTOP landing first leaves SIGTERM at its default
         # action, which the kernel applies to a stopped process without any SIGCONT, and the
         # test would then pass against a teardown that never continues anything.
+        #
+        # The child sleeps in short slices, never one long sleep. CPython runs a Python-level
+        # handler only at a bytecode boundary or when a blocking call returns EINTR, so a
+        # SIGTERM landing after the last check but before the child enters nanosleep() is
+        # noted and then ignored until the sleep ends: with time.sleep(60) that was about 1
+        # run in 100, stuck in state S with SIGTERM already consumed, and teardown SIGKILLed a
+        # child it had in fact continued (dev/docs/BUGS.md 2026-09-24).
         proc = subprocess.Popen(
             [sys.executable, '-c',
              'import signal, sys, time\n'
              'signal.signal(signal.SIGTERM, lambda *a: (_ for _ in ()).throw(SystemExit(0)))\n'
              'sys.stdout.write("ready\\n"); sys.stdout.flush()\n'
-             'time.sleep(60)\n'],
+             'while True: time.sleep(0.05)\n'],
             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
             text=True)
         try:
