@@ -4,7 +4,7 @@ from datetime import datetime, timedelta
 from flask import Blueprint, render_template, request, redirect, url_for, jsonify
 
 from .. import db
-from ..database import (Account, Channel, ChannelEvent, ChannelGroup, EPGEntry,
+from ..database import (Account, Channel, ChannelEvent, ChannelGroup, EPGEntry, EpgSource,
                         Recording, RecordingProfile, Tag, SavedSearch, UserPref,
                         CHANNEL_ADDED_TO_GUIDE, CHANNEL_REMOVED_FROM_GUIDE,
                         REC_STATUS_ABORTED, REC_STATUS_FAILED)
@@ -178,8 +178,13 @@ def _load_tags():
     return Tag.query.all()
 
 
+def epg_source_names() -> dict:
+    """{source_id: name} for every EPG source - one small query per request."""
+    return dict(db.session.query(EpgSource.id, EpgSource.name))
+
+
 def _program_dict(ch, entry, start, stop, *, stream_url, template, tag_cleanup, rec, all_tags,
-                  tags_by_name, tz, display_name=None, group_id=None):
+                  tags_by_name, tz, source_names, display_name=None, group_id=None):
     """Serialize one guide/search program cell (guide grid + extended search).
 
     entry=None → dummy filler slot for a channel with no EPG data.
@@ -187,6 +192,8 @@ def _program_dict(ch, entry, start, stop, *, stream_url, template, tag_cleanup, 
     call sites because the candidate set is built differently per route.
     display_name/group_id: set for channel-group rows - ch is then the group's
     active member (real recording target), display_name the group's name.
+    source_names is epg_source_names(), read once per request: the record dialog names the
+    EPG source a showing came from (DESIGN-epg-sources.md §9.4).
     """
     name = display_name or ch.name
     title = (entry.title or name) if entry else name
@@ -212,6 +219,7 @@ def _program_dict(ch, entry, start, stop, *, stream_url, template, tag_cleanup, 
         'stop_time': stop.strftime('%Y-%m-%dT%H:%M:%S'),
         'category': category,
         'rating': (entry.rating or '') if entry else '',
+        'source_name': source_names.get(entry.source_id) if entry else None,
         'stream_url': stream_url,
         'suggested_name': suggested,
         'channel_name': name,
@@ -559,6 +567,7 @@ def epg_api():
     # program cells and render_filename_template would otherwise issue its own Tag query
     # for each one whenever a tag-cleanup list is set (dev/changelog/441).
     tags_by_name = {t.name: t for t in all_tags}
+    source_names = epg_source_names()
 
     # One windowed query for every channel the page might need entries for (target_ids
     # plus every other group member the fallback loop below may probe), grouped in
@@ -610,7 +619,8 @@ def epg_api():
                     ch, None, slot, slot_end,
                     stream_url=stream_url, template=template,
                     tag_cleanup=tag_cleanup, rec=rec, all_tags=all_tags,
-                    tags_by_name=tags_by_name, tz=tz, display_name=display_name,
+                    tags_by_name=tags_by_name, tz=tz, source_names=source_names,
+                    display_name=display_name,
                     group_id=group.id if group is not None else None,
                 ))
                 slot = slot_end
@@ -621,7 +631,8 @@ def epg_api():
                     ch, entry, entry.start_time, entry.stop_time,
                     stream_url=stream_url, template=template,
                     tag_cleanup=tag_cleanup, rec=rec, all_tags=all_tags,
-                    tags_by_name=tags_by_name, tz=tz, display_name=display_name,
+                    tags_by_name=tags_by_name, tz=tz, source_names=source_names,
+                    display_name=display_name,
                     group_id=group.id if group is not None else None,
                 ))
 

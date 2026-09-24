@@ -32,6 +32,8 @@ cheaply see:
   * a CI workflow that stops installing the external tools the suite gates on, or that floats
     its runner image - either one silently shrinks the suite CI reports green over, with no
     failure anywhere to say so (dev/changelog/907).
+  * a test that searches a whole rendered page for a literal of four or fewer base64-alphabet
+    characters, which the page's random CSRF token can spell (dev/changelog/1097, `1111`).
 
 Plus one *advisory* scan (never fails): `db.session.commit()` sites not obviously wrapped by
 `retry_on_locked` - printed as suspects for a human to eyeball, per CLAUDE.md's note that this
@@ -1105,6 +1107,98 @@ def _toplevel_block(code_lines, idx):
     return start, end
 
 
+class EpgKeyWriteBypassTests(unittest.TestCase):
+    """The user's EPG key is written by `epg_sources.set_channel_key()` and nothing else.
+
+    `EpgChannelKey` stores the user's answer to "which id is this channel in that source's
+    file" - the participation-switch rule applied to EPG (DESIGN-epg-sources.md §6.1): no
+    sync, refresh or migration writes it, and the one writer logs CHANNEL_EPG_KEY_CHANGED
+    beside the write so a key cannot move with nothing on the channel's Activity Timeline
+    saying so (dev/changelog/1102). Deleting rows as part of tearing down their channel or
+    source is not writing an answer, and is not scanned for.
+
+    The scan: constructing an `EpgChannelKey`, a bulk `update()`/`insert()` on it, or
+    assigning `.key` in a module that names the model or the `epg_keys` relationship.
+    app/ only - a test builds fixtures.
+
+    Escape hatch: a `# epg-key-write-ok: <reason>` marker on the line itself or anywhere in
+    the comment block directly above it.
+    """
+
+    _MARKER = 'epg-key-write-ok'
+    _CANONICAL = {('app/epg_sources.py', 'set_channel_key'),
+                  # A refusal row: key stays NULL, the channel keeps matching by its provider
+                  # id, so nothing moves (dev/changelog/1105).
+                  ('app/epg_sources.py', 'reject_name_match')}
+    _ALWAYS = re.compile(r'\bEpgChannelKey\s*\(|\b(?:update|insert)\(\s*EpgChannelKey\b')
+    _KEY_ASSIGN = re.compile(r'\.key\s*=(?!=)')
+
+    def test_the_epg_key_has_one_writer(self):
+        offenders = []
+        for path in _walk(APP_DIR, '.py'):
+            text = _read(path)
+            raw_lines = text.splitlines()
+            code_lines = _mask_comments_and_strings(text).splitlines()
+            names_model = 'EpgChannelKey' in text or 'epg_keys' in text
+            for i, line in enumerate(code_lines):
+                if not (self._ALWAYS.search(line)
+                        or (names_model and self._KEY_ASSIGN.search(line))):
+                    continue
+                if line.lstrip().startswith('class '):
+                    continue
+                if _marked_at(raw_lines, i, self._MARKER):
+                    continue
+                enclosing = ConfigReadBypassTests._enclosing_def(code_lines, i)
+                if (_rel(path), enclosing) in self._CANONICAL:
+                    continue
+                offenders.append(f'{_rel(path)}:{i + 1}: {raw_lines[i].strip()}')
+        self.assertEqual(
+            offenders, [],
+            'an EpgChannelKey written outside app/epg_sources.py::set_channel_key(), the one '
+            'writer of the user\'s per-channel EPG key (DESIGN-epg-sources.md §6.1). A direct '
+            'write moves the key with no CHANNEL_EPG_KEY_CHANGED event. Call '
+            'set_channel_key(), or add a `# epg-key-write-ok: <reason>` marker if this is '
+            'not that column:\n' + '\n'.join(offenders))
+
+
+class EpgSourceOverrideWriteBypassTests(unittest.TestCase):
+    """`Channel.epg_source_override_id` is the user's answer to "which source should this
+    channel's guide come from" - the participation-switch rule applied to EPG
+    (DESIGN-epg-sources.md §6.2). One writer, `epg_sources.set_source_override()`, which
+    logs CHANNEL_EPG_SOURCE_OVERRIDE_CHANGED beside the write (dev/changelog/1107). Clearing
+    it because its source was deleted is teardown, not an answer, and is written through a
+    column variable the scan does not match.
+
+    The scan: an attribute assignment or a keyword argument naming the column. app/ only -
+    a test builds fixtures. Escape hatch: `# epg-override-write-ok: <reason>`.
+    """
+
+    _MARKER = 'epg-override-write-ok'
+    _CANONICAL = {('app/epg_sources.py', 'set_source_override')}
+    _PATTERN = re.compile(r'\bepg_source_override_id\s*=(?!=)')
+
+    def test_the_override_has_one_writer(self):
+        offenders = []
+        for path in _walk(APP_DIR, '.py'):
+            raw_lines = _read(path).splitlines()
+            code_lines = _mask_comments_and_strings(_read(path)).splitlines()
+            for i, line in enumerate(code_lines):
+                if not self._PATTERN.search(line):
+                    continue
+                if _marked_at(raw_lines, i, self._MARKER):
+                    continue
+                enclosing = ConfigReadBypassTests._enclosing_def(code_lines, i)
+                if (_rel(path), enclosing) in self._CANONICAL:
+                    continue
+                offenders.append(f'{_rel(path)}:{i + 1}: {raw_lines[i].strip()}')
+        self.assertEqual(
+            offenders, [],
+            'Channel.epg_source_override_id written outside app/epg_sources.py::'
+            'set_source_override(), its one writer. A direct write stores the user\'s answer '
+            'with no CHANNEL_EPG_SOURCE_OVERRIDE_CHANGED event behind it:\n'
+            + '\n'.join(offenders))
+
+
 class HideOverrideWriteBypassTests(unittest.TestCase):
     """`Channel.hidden_override` is a user's answer to a judgment call, so CLAUDE.md's
     participation-switch rule applies to it directly: a human writes it and nothing else
@@ -1353,6 +1447,78 @@ class BareExceptTests(unittest.TestCase):
             'Broad `except Exception: pass` / `except: pass` silent swallow (CLAUDE.md Error '
             'handling). Narrow to the expected exception and/or log.warning it:\n'
             + '\n'.join(offenders))
+
+
+_SHORT_NEEDLE_RE = re.compile(r'[A-Za-z0-9+/=_.-]{1,4}')
+_WHOLE_PAGE_NAMES = frozenset({'page', 'html', 'body', 'resp', 'response', 'rendered', 'markup'})
+
+
+def _short_needle_offenders(source, marker='short-needle-ok'):
+    """(lineno, needle, haystack) for each assertIn/assertNotIn in `source` that searches a
+    whole response for a short literal the CSRF token's alphabet can spell."""
+    lines = source.splitlines()
+    out = []
+    for node in ast.walk(ast.parse(source)):
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr in ('assertIn', 'assertNotIn') and len(node.args) >= 2):
+            continue
+        needle, hay = node.args[0], node.args[1]
+        if not (isinstance(needle, ast.Constant) and isinstance(needle.value, str)
+                and _SHORT_NEEDLE_RE.fullmatch(needle.value)):
+            continue
+        hay_src = ast.unparse(hay)
+        whole_page = ((isinstance(hay, ast.Name) and hay.id in _WHOLE_PAGE_NAMES)
+                      or '.get_data(' in hay_src or hay_src.endswith('.data'))
+        if not whole_page:
+            continue
+        if any(marker in lines[i - 1] for i in range(node.lineno, node.end_lineno + 1)):
+            continue
+        out.append((node.lineno, needle.value, hay_src))
+    return out
+
+
+class ShortNeedleOverWholePageTests(unittest.TestCase):
+    """No `assertIn`/`assertNotIn` of a literal of four or fewer characters, all drawn from
+    the base64 alphabet, against a whole rendered response.
+
+    Every page carries a per-response CSRF token (about 90 random base64 characters) and
+    inline SVG path data. A short needle searched across all of it can be matched by either:
+    a negative assertion then fails at random (a `7h` duration matched inside a token about
+    once every fifty runs and stopped a release, dev/changelog/1097), and a positive one
+    passes while the value it is about is missing. Read the one element or field the
+    assertion is about instead - `tests/support/markup.py` has the helpers.
+
+    Four characters, because `None` is the length of the needle that could actually fail
+    (dev/changelog/1111). Needles containing `%`, `<`, `>`, `#` or anything else outside the
+    alphabet cannot come from a token and are not flagged. Escape hatch for a call whose
+    haystack is not really a page (a payload dict named `body`, say):
+    `# short-needle-ok: <reason>` on any line of the call.
+    """
+
+    def test_no_short_needle_is_searched_for_across_a_whole_page(self):
+        offenders = []
+        for path in _walk(TESTS_DIR, '.py'):
+            if not os.path.basename(path).startswith('test_'):
+                continue
+            for lineno, needle, hay in _short_needle_offenders(_read(path)):
+                offenders.append(f'{_rel(path)}:{lineno}: {needle!r} in {hay[:60]}')
+        self.assertEqual(
+            sorted(offenders), [],
+            'A short needle searched for across a whole rendered response can be matched by '
+            'the CSRF token or SVG path data (dev/changelog/1097). Extract the one element or '
+            'field the assertion is about and compare it exactly, or add '
+            '`# short-needle-ok: <reason>` if the haystack is not a page:\n'
+            + '\n'.join(sorted(offenders)))
+
+    def test_the_detector_names_the_shape_and_honors_the_marker(self):
+        planted = ("self.assertIn('ab', page)\n"
+                   "self.assertNotIn('None', resp.get_data(as_text=True).split('</h1>')[0])\n"
+                   "self.assertIn('ab', page)  # short-needle-ok: fixture\n"
+                   "self.assertIn('43%', html)\n"
+                   "self.assertIn('ab', payload['error'])\n"
+                   "self.assertIn('stream URLs were built', html)\n")
+        self.assertEqual([(n, v) for n, v, _h in _short_needle_offenders(planted)],
+                         [(1, 'ab'), (2, 'None')])
 
 
 class JinjaBuiltinTests(unittest.TestCase):

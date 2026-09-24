@@ -42,6 +42,7 @@ import unittest
 from unittest.mock import patch
 
 from tests.support.app import make_test_app
+from tests.support.markup import text_of
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TPL = os.path.join(REPO, 'templates', 'logs.html')
@@ -136,7 +137,10 @@ class LogsPageConformanceTests(unittest.TestCase):
         with patch('app.routes.logs._log_file_path', return_value=None):
             resp = self.client.get('/logs')
         self.assertEqual(resp.status_code, 200)
-        self.assertNotIn('None', resp.get_data(as_text=True).split('</h1>')[0])
+        # The heading alone: everything above it includes the CSRF meta tag, whose random
+        # token can contain 'None' (dev/changelog/1097).
+        h1 = re.findall(r'<h1>(.*?)</h1>', resp.get_data(as_text=True), re.S)
+        self.assertEqual([text_of(h) for h in h1], ['Logs'])
 
     def test_no_log_file_configured_says_so_rather_than_showing_an_empty_page(self):
         """`logging.file` has no default, so an install that never set one renders a page

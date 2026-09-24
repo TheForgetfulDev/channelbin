@@ -5,6 +5,26 @@ Notable changes to ChannelBin, newest first. This project follows
 release is tagged `v<version>` in git, and the version the app is running is shown in the
 page footer.
 
+## 0.17.0 - 2026-09-24
+
+**Added**
+
+- An account can take its guide from more than one source: a separate XMLTV URL, or a guide
+  another account already downloads.
+- Guide sources have a priority order, and a channel can be pinned to one source.
+- A channel's guide id can be set manually.
+- EPG sources can match by name instead of just EPG ID.
+- Compare your EPG sources and see how they differ.
+
+**Fixed**
+
+- A sync deferred behind another account's sync moves its own schedule forward instead of
+  colliding again every interval.
+- A recurring health check saved with no time is refused with an alert instead of running every
+  second.
+- The scheduler keeps running through a locked database write, and raises an alert if it ever
+  stops.
+
 ## 0.16.2 - 2026-09-22
 
 Fixes a test that could fail at random: it searched a whole rendered page for a

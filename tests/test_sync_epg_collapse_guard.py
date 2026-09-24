@@ -1,6 +1,6 @@
 """EPG collapse guard - wipe prevention (DESIGN-sync-resilience.md §4, changelog/244).
 
-Before this fix, `_import_xmltv` deleted all future EPG for an account's channels BEFORE
+Before this fix, `import_source` deleted all future EPG for an account's channels BEFORE
 parsing the fetch, so a transient empty/garbage XMLTV response silently wiped the guide.
 This pins the two-phase parse: count what the real import would create first (sharing one
 match predicate with the real import loop, `_match_program`, so the two can't drift), and
@@ -8,22 +8,25 @@ refuse the import - keeping old EPG untouched - when the projected count is belo
 `sync.epg_collapse_threshold_percent` percent of the baseline (0 = guard disabled; baseline
 0, i.e. a first-ever sync, is exempt - nothing to compare against).
 
-The baseline is `_visible_epg_baseline()` - a LIVE count of the entries this account holds
+The baseline is `_visible_source_baseline()` - a LIVE count of the entries this account holds
 for channels that are not hidden - rather than the cached `account.epg_entry_count` it read
 until dev/changelog/781. Hiding a channel deletes its EPG and takes it out of the projected
 count, so a cached total from before a large hide would read a legitimate drop as a provider
 collapse and freeze that account's guide. The fixtures below therefore seed the number of
 rows they mean as the baseline; setting the cached column alone no longer arms anything. "Force EPG Resync" (a route flag threaded through
-sync_account -> _do_sync -> _sync_epg_from_url / _import_xmltv) bypasses the guard for one
+sync_account -> _do_sync -> refresh_source / import_source) bypasses the guard for one
 sync.
 
 Covers:
   - MatchPredicateTests: `_match_program` / `_count_projected_epg_entries` pure logic
     (channel match, case sensitivity, import window).
-  - ImportGuardTests: `_import_xmltv`'s guard math directly - refuse/pass/disabled/
+  - ImportGuardTests: `import_source`'s guard math directly - refuse/pass/disabled/
     first-sync exemption/force bypass, and that a refusal never touches existing rows.
+  - RefusalCauseTests: a refusal names its cause (empty feed / no match / shortfall), and
+    an empty feed is reported with no baseline (dev/changelog/1100).
+  - NonSuccessStatusTests: an HTTP status outside 2xx is a failed fetch.
   - DoSyncAlertRoutingTests: end-to-end `_do_sync` - PARTIAL status,
-    SYNC_EPG_COLLAPSE_REFUSED (never SYNC_EPG_FETCH_FAILED) raised/dismissed/refreshed
+    EPG_SOURCE_COLLAPSE_REFUSED (never EPG_SOURCE_FETCH_FAILED) raised/dismissed/refreshed
     correctly, force_epg_resync end-to-end.
   - RouteForceEpgResyncTests: the route threads the flag through to sync_account,
     independent of the pre-existing conflict-override `force` flag.
@@ -45,11 +48,12 @@ from sqlalchemy import event  # noqa: E402
 
 from app import db  # noqa: E402
 from app.accounts import (  # noqa: E402
-    _do_sync, _import_xmltv, _count_projected_epg_entries,
+    _do_sync, import_source, _count_projected_epg_entries, refresh_source,
 )
 from app.database import Account, Alert, AccountSyncLog, Channel, EPGEntry, M3uAccount  # noqa: E402
 from tests.support import make_test_app  # noqa: E402
 from tests.support import seed  # noqa: E402
+from tests.support.seed import make_epg_source  # noqa: E402
 
 M3U_URL = 'http://provider.test/playlist.m3u8?user=realuser&pass=realpass'
 EPG_URL = 'http://provider.test/xmltv.php?username=realuser&password=realpass'
@@ -93,28 +97,28 @@ class MatchPredicateTests(unittest.TestCase):
             ('unknown.test', 60, 30),            # unmatched channel
             ('ch1.test', 60 * 24 * 10, 30),      # way outside the window
         ])
-        count, parse_error = _count_projected_epg_entries(xml, self.channel_map, False,
+        count, parse_error, *_ = _count_projected_epg_entries(xml, self.channel_map, False,
                                                           self.window_start, self.window_end)
         self.assertEqual(count, 1 + 2)
         self.assertIsNone(parse_error)
 
     def test_case_insensitive_matching_when_not_case_sensitive(self):
         xml = _xmltv([('CH1.TEST', 60, 30)])
-        count, parse_error = _count_projected_epg_entries(xml, self.channel_map, False,
+        count, parse_error, *_ = _count_projected_epg_entries(xml, self.channel_map, False,
                                                           self.window_start, self.window_end)
         self.assertEqual(count, 1)
         self.assertIsNone(parse_error)
 
     def test_case_sensitive_matching_rejects_case_variant(self):
         xml = _xmltv([('CH1.TEST', 60, 30)])
-        count, parse_error = _count_projected_epg_entries(xml, self.channel_map, True,
+        count, parse_error, *_ = _count_projected_epg_entries(xml, self.channel_map, True,
                                                           self.window_start, self.window_end)
         self.assertEqual(count, 0)
         self.assertIsNone(parse_error)
 
 
-class ImportGuardTests(unittest.TestCase):
-    """`_import_xmltv`'s own guard math, directly - no fetch/HTTP involved."""
+class _GuardFixture(unittest.TestCase):
+    """One account, one EPG-mapped channel, and a way to seed a baseline."""
 
     def setUp(self):
         self.t = make_test_app()
@@ -136,6 +140,7 @@ class ImportGuardTests(unittest.TestCase):
         for i in range(count):
             db.session.add(EPGEntry(
                 channel_id=self.channel.id, title=f'Old {i}',
+                source_id=make_epg_source(self.account).id,
                 start_time=now + timedelta(hours=i), stop_time=now + timedelta(hours=i, minutes=30),
             ))
         db.session.commit()
@@ -143,11 +148,15 @@ class ImportGuardTests(unittest.TestCase):
     def _cfg(self, threshold_pct=20):
         return {'sync': {'epg_collapse_threshold_percent': threshold_pct}}
 
+
+class ImportGuardTests(_GuardFixture):
+    """`import_source`'s own guard math, directly - no fetch/HTTP involved."""
+
     def test_first_sync_baseline_zero_is_exempt(self):
         # epg_entry_count defaults to 0 - nothing to compare against, guard never fires
         # even though a single entry would fail any nonzero baseline comparison.
         xml = _xmltv([('ch1.test', 60, 30)])
-        synced, reason = _import_xmltv(self.account, xml, epg_days=3, cfg=self._cfg())
+        synced, reason = import_source(make_epg_source(self.account), xml, epg_days=3, cfg=self._cfg())
         self.assertIsNone(reason)
         self.assertEqual(synced, 1)
 
@@ -155,7 +164,7 @@ class ImportGuardTests(unittest.TestCase):
         self._seed_old_epg(100)
         xml = _xmltv([('ch1.test', 60, 30)])  # 1 entry, well below 20% of 100 (= 20 required)
 
-        synced, reason = _import_xmltv(self.account, xml, epg_days=3, cfg=self._cfg())
+        synced, reason = import_source(make_epg_source(self.account), xml, epg_days=3, cfg=self._cfg())
 
         self.assertEqual(synced, 0)
         self.assertIsNotNone(reason)
@@ -168,7 +177,7 @@ class ImportGuardTests(unittest.TestCase):
         # threshold 20% of 10 = 2 required; provide exactly 2.
         xml = _xmltv([('ch1.test', 60, 30), ('ch1.test', 180, 30)])
 
-        synced, reason = _import_xmltv(self.account, xml, epg_days=3, cfg=self._cfg())
+        synced, reason = import_source(make_epg_source(self.account), xml, epg_days=3, cfg=self._cfg())
 
         self.assertIsNone(reason)
         self.assertEqual(synced, 2)
@@ -179,7 +188,7 @@ class ImportGuardTests(unittest.TestCase):
         self._seed_old_epg(100)
         xml = _xmltv([('ch1.test', 60, 30)])  # would otherwise be refused
 
-        synced, reason = _import_xmltv(self.account, xml, epg_days=3,
+        synced, reason = import_source(make_epg_source(self.account), xml, epg_days=3,
                                        cfg=self._cfg(threshold_pct=0))
 
         self.assertIsNone(reason)
@@ -189,15 +198,143 @@ class ImportGuardTests(unittest.TestCase):
         self._seed_old_epg(100)
         xml = _xmltv([('ch1.test', 60, 30)])
 
-        synced, reason = _import_xmltv(self.account, xml, epg_days=3, cfg=self._cfg(),
+        synced, reason = import_source(make_epg_source(self.account), xml, epg_days=3, cfg=self._cfg(),
                                        force_epg_resync=True)
 
         self.assertIsNone(reason)
         self.assertEqual(synced, 1)
 
 
+def _channels_only_xmltv(channel_ids):
+    """A well-formed feed that lists channels and carries no <programme> at all - the
+    shape account 3's provider returned on 2026-09-23."""
+    chans = ''.join(f'<channel id="{c}"><display-name>{c}</display-name></channel>'
+                    for c in channel_ids)
+    return f'<?xml version="1.0" encoding="utf-8"?><tv>{chans}</tv>'.encode('utf-8')
+
+
+class RefusalCauseTests(_GuardFixture):
+    """A refusal names which of three things went wrong - the feed had no listings, it had
+    listings for other channels only, or it matched but too few - and an empty feed is
+    reported even when there is no baseline to arm the guard.
+
+    dev/docs/BUGS.md 2026-09-23: account 3's feed arrived with 8,350 channel entries and 0
+    programs, the refusal blamed "0 matching EPG entries", said "0 required" while refusing
+    0, and the next sync (baseline pruned to 0) would have imported it as a clean SUCCESS.
+    """
+
+    def test_empty_feed_is_named_as_empty_not_as_a_matching_shortfall(self):
+        self._seed_old_epg(100)
+        xml = _channels_only_xmltv(['ch1.test', 'other.test'])
+
+        synced, reason = import_source(make_epg_source(self.account), xml, epg_days=3, cfg=self._cfg())
+
+        self.assertEqual(synced, 0)
+        self.assertTrue(reason.startswith('import refused:'))
+        self.assertIn('no program listings', reason)
+        self.assertIn('2 channel entries', reason)
+        self.assertNotIn('matching EPG entries', reason)
+        self.assertEqual(EPGEntry.query.filter_by(channel_id=self.channel.id).count(), 100)
+
+    def test_listings_for_other_channels_only_is_named_as_no_match(self):
+        self._seed_old_epg(100)
+        xml = _xmltv([('other.test', 60, 30), ('other.test', 120, 30)])
+
+        synced, reason = import_source(make_epg_source(self.account), xml, epg_days=3, cfg=self._cfg())
+
+        self.assertEqual(synced, 0)
+        self.assertIn('the feed had 2 programs, but none matched', reason)
+        self.assertNotIn('no program listings', reason)
+
+    def test_a_shortfall_keeps_the_count_wording(self):
+        self._seed_old_epg(100)
+        xml = _xmltv([('ch1.test', 60, 30)])
+
+        _synced, reason = import_source(make_epg_source(self.account), xml, epg_days=3, cfg=self._cfg())
+
+        self.assertIn('provider returned 1 matching EPG entries', reason)
+        self.assertIn('at least 20 required', reason)
+
+    def test_required_count_is_rounded_up_not_truncated_to_zero(self):
+        self._seed_old_epg(1)   # 20% of 1 = 0.2, which the old text printed as "0 required"
+        xml = _xmltv([('other.test', 60, 30)])
+
+        _synced, reason = import_source(make_epg_source(self.account), xml, epg_days=3, cfg=self._cfg())
+
+        self.assertIn('at least 1 required', reason)
+        self.assertNotIn('(0 required)', reason)
+
+    def test_empty_feed_with_no_baseline_is_still_reported(self):
+        xml = _channels_only_xmltv(['ch1.test'])
+
+        synced, reason = import_source(make_epg_source(self.account), xml, epg_days=3, cfg=self._cfg())
+
+        self.assertEqual(synced, 0)
+        self.assertIsNotNone(reason, 'an empty feed must not pass as a healthy 0-entry import')
+        self.assertTrue(reason.startswith('import refused:'))
+        self.assertIn('no previous EPG to keep', reason)
+
+    def test_empty_feed_with_the_guard_disabled_is_not_refused(self):
+        xml = _channels_only_xmltv(['ch1.test'])
+
+        _synced, reason = import_source(make_epg_source(self.account), xml, epg_days=3,
+                                        cfg=self._cfg(threshold_pct=0))
+
+        self.assertIsNone(reason)
+
+    def test_force_epg_resync_imports_an_empty_feed(self):
+        self._seed_old_epg(5)
+        xml = _channels_only_xmltv(['ch1.test'])
+
+        synced, reason = import_source(make_epg_source(self.account), xml, epg_days=3, cfg=self._cfg(),
+                                       force_epg_resync=True)
+
+        self.assertIsNone(reason)
+        self.assertEqual(synced, 0)
+
+    def test_count_pass_reports_what_the_feed_held(self):
+        now = datetime.utcnow()
+        xml = _channels_only_xmltv(['a.test', 'b.test', 'c.test'])
+        count = _count_projected_epg_entries(xml, {'a.test': [1]}, False,
+                                             now - timedelta(hours=1), now + timedelta(days=3))
+        self.assertEqual((count.projected, count.programs_seen, count.channels_seen), (0, 0, 3))
+
+
+class NonSuccessStatusTests(unittest.TestCase):
+    """raise_for_status() lets any status outside 4xx/5xx through, and these providers
+    answer with a made-up HTTP 884. The EPG fetch treats anything outside 2xx as a failed
+    fetch rather than importing the body (dev/docs/BUGS.md 2026-09-23)."""
+
+    def setUp(self):
+        self.t = make_test_app()
+        self.account = M3uAccount(name='Status Test', m3u_url=M3U_URL, epg_url=EPG_URL,
+                                  status='OK')
+        db.session.add(self.account)
+        db.session.flush()
+        db.session.add(Channel(account_id=self.account.id, stream_id=1, name='Ch1',
+                               stream_url='http://example.test/live/1',
+                               epg_channel_id='ch1.test'))
+        db.session.commit()
+
+    def tearDown(self):
+        self.t.cleanup()
+
+    def test_http_884_is_a_fetch_failure_and_imports_nothing(self):
+        resp = mock.Mock()
+        resp.raise_for_status = mock.Mock()
+        resp.status_code = 884
+        resp.content = _xmltv([('ch1.test', 60, 30)])
+        with mock.patch('app.accounts.requests.get', return_value=resp):
+            synced, reason = refresh_source(make_epg_source(self.account, url=EPG_URL), timeout=5, epg_days=3)
+
+        self.assertEqual(synced, 0)
+        self.assertTrue(reason.startswith('fetch failed:'))
+        self.assertIn('HTTP 884', reason)
+        self.assertEqual(EPGEntry.query.count(), 0)
+
+
 class ChannelMapFanoutTests(unittest.TestCase):
-    """`_import_xmltv`'s channel_map build reads id/epg_channel_id as a column-tuple query
+    """`import_source`'s channel_map build reads id/epg_channel_id as a column-tuple query
     (dev/changelog/689) rather than hydrating full Channel ORM rows. That must still fan one
     epg_channel_id out to every channel that shares it (setdefault + append across query
     rows) and merge case variants into the same bucket - both are easy to lose in a
@@ -224,8 +361,8 @@ class ChannelMapFanoutTests(unittest.TestCase):
 
     def test_program_fans_out_to_every_channel_sharing_the_epg_id(self):
         xml = _xmltv([('shared.test', 60, 30)])
-        synced, reason = _import_xmltv(
-            self.account, xml, epg_days=3,
+        synced, reason = import_source(
+            make_epg_source(self.account), xml, epg_days=3,
             cfg={'sync': {'epg_collapse_threshold_percent': 0}})
 
         self.assertIsNone(reason)
@@ -270,15 +407,17 @@ class DeleteScopeSubqueryTests(unittest.TestCase):
     def test_delete_scoped_to_this_accounts_epg_mapped_channels_only(self):
         now = datetime.utcnow()
         db.session.add(EPGEntry(
-            channel_id=self.channel.id, title='Old', start_time=now, stop_time=now + timedelta(minutes=30)))
+            channel_id=self.channel.id, title='Old', start_time=now, stop_time=now + timedelta(minutes=30),
+            source_id=make_epg_source(self.account).id))
         db.session.add(EPGEntry(
             channel_id=self.other_channel.id, title='Other Old',
+            source_id=make_epg_source(self.other_account).id,
             start_time=now, stop_time=now + timedelta(minutes=30)))
         db.session.commit()
 
         xml = _xmltv([('ch1.test', 60, 30)])
-        synced, reason = _import_xmltv(
-            self.account, xml, epg_days=3,
+        synced, reason = import_source(
+            make_epg_source(self.account), xml, epg_days=3,
             cfg={'sync': {'epg_collapse_threshold_percent': 0}})
 
         self.assertIsNone(reason)
@@ -315,8 +454,8 @@ class DeleteScopeSubqueryTests(unittest.TestCase):
             event.listen(eng, 'before_cursor_execute', _on_execute)
         try:
             xml = _xmltv([('ch1.test', 60, 30)])
-            synced, reason = _import_xmltv(
-                self.account, xml, epg_days=3,
+            synced, reason = import_source(
+                make_epg_source(self.account), xml, epg_days=3,
                 cfg={'sync': {'epg_collapse_threshold_percent': 0}})
         finally:
             for eng in engines:
@@ -336,11 +475,13 @@ def _fake_get_factory(xml_bytes):
         if url == M3U_URL:
             resp = mock.Mock()
             resp.raise_for_status = mock.Mock()
+            resp.status_code = 200
             resp.content = M3U_PLAYLIST.encode('utf-8')
             return resp
         if url == EPG_URL:
             resp = mock.Mock()
             resp.raise_for_status = mock.Mock()
+            resp.status_code = 200
             resp.content = xml_bytes
             return resp
         raise AssertionError(f'unexpected requests.get call: {url}')
@@ -348,13 +489,14 @@ def _fake_get_factory(xml_bytes):
 
 
 class DoSyncAlertRoutingTests(unittest.TestCase):
-    """End-to-end `_do_sync`: PARTIAL status + the SYNC_EPG_COLLAPSE_REFUSED alert,
-    kept distinct from SYNC_EPG_FETCH_FAILED (item A's alert type)."""
+    """End-to-end `_do_sync`: PARTIAL status + the EPG_SOURCE_COLLAPSE_REFUSED alert,
+    kept distinct from EPG_SOURCE_FETCH_FAILED (item A's alert type)."""
 
     def setUp(self):
         self.t = make_test_app()
         self.account = M3uAccount(name='Routing Test', m3u_url=M3U_URL, epg_url=EPG_URL, status='OK')
         db.session.add(self.account)
+        self.source_id = make_epg_source(self.account).id
         db.session.commit()
 
     def tearDown(self):
@@ -374,13 +516,13 @@ class DoSyncAlertRoutingTests(unittest.TestCase):
 
     def _collapse_alert(self):
         return Alert.query.filter_by(
-            alert_type='SYNC_EPG_COLLAPSE_REFUSED',
-            source=f'account:{self.account.id}:epg-collapse').first()
+            alert_type='EPG_SOURCE_COLLAPSE_REFUSED',
+            source=f'epg-source:{self.source_id}:collapse').first()
 
     def _fetch_alert(self):
         return Alert.query.filter_by(
-            alert_type='SYNC_EPG_FETCH_FAILED',
-            source=f'account:{self.account.id}:epg-fetch').first()
+            alert_type='EPG_SOURCE_FETCH_FAILED',
+            source=f'epg-source:{self.source_id}:fetch').first()
 
     def test_collapse_refusal_finishes_partial_with_the_right_alert_not_fetch_failed(self):
         self._sync(self._healthy_xml())  # establish a healthy baseline (20 entries)
@@ -422,8 +564,8 @@ class DoSyncAlertRoutingTests(unittest.TestCase):
 
         self.assertEqual(second.id, first_id)
         self.assertEqual(
-            Alert.query.filter_by(alert_type='SYNC_EPG_COLLAPSE_REFUSED',
-                                  source=f'account:{self.account.id}:epg-collapse').count(),
+            Alert.query.filter_by(alert_type='EPG_SOURCE_COLLAPSE_REFUSED',
+                                  source=f'epg-source:{self.source_id}:collapse').count(),
             1)
 
     def test_force_epg_resync_bypasses_end_to_end(self):
@@ -435,6 +577,16 @@ class DoSyncAlertRoutingTests(unittest.TestCase):
         self.assertEqual(log_row.status, 'SUCCESS')
         self.assertIsNone(log_row.error_message)
         self.assertIsNone(self._collapse_alert())
+
+    def test_empty_feed_on_a_first_sync_finishes_partial_with_the_collapse_alert(self):
+        # dev/docs/BUGS.md 2026-09-23: with no baseline the guard never ran, so this was a
+        # SUCCESS with 0 entries and nothing on any surface.
+        self._sync(_channels_only_xmltv(['ch1.test']))
+
+        log_row = self._latest_log()
+        self.assertEqual(log_row.status, 'PARTIAL')
+        self.assertIn('no program listings', log_row.error_message)
+        self.assertIsNotNone(self._collapse_alert())
 
     def test_fully_healthy_sync_never_fires_the_collapse_alert(self):
         self._sync(self._healthy_xml())

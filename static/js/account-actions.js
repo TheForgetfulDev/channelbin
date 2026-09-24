@@ -114,15 +114,29 @@ function confirmForceEpgResync(id, opts = {}) {
    optional - the list row does not carry a sync count, and inventing one would be worse
    than leaving the clause out. */
 function confirmDeleteAccount(opts = {}) {
+  // Other accounts reading this one's EPG lose it too (DESIGN-epg-sources.md §9.5). The
+  // confirm still opens if that lookup fails - it only drops the sentence.
+  jsonFetch(`/api/accounts/${opts.id}/epg-readers`)
+    .then((res) => buildDeleteAccountModal(opts, res.readers || []))
+    .catch(() => buildDeleteAccountModal(opts, []));
+}
+
+function buildDeleteAccountModal(opts, readers) {
   const n = (v) => Number(v || 0).toLocaleString('en-US');
   const parts = [`${n(opts.channels)} channels`, `${n(opts.epg)} program entries`];
   if (opts.syncs !== undefined && opts.syncs !== null) parts.push(`${n(opts.syncs)} sync records`);
+  const epg = readers.length
+    ? '<p class="text-muted small" style="margin-top:8px">' +
+      readers.map((r) => `<strong>${escHtml(r.name)}</strong> takes its guide for ${n(r.guided)} ` +
+        `channel${r.guided === 1 ? '' : 's'} from this account's EPG`).join('; ') +
+      '. Those channels will switch to their next source or lose their guide.</p>'
+    : '';
   buildModal({
     title: 'Delete account',
     body: `<p>Delete <strong>${escHtml(opts.name || '')}</strong>?</p>` +
       '<p class="text-muted small" style="margin-top:8px">This removes its ' +
       `${parts.join(', ')}. Recordings already on disk are not deleted, but they lose the ` +
-      'channel they came from.</p>',
+      `channel they came from.</p>${epg}`,
     footer: [
       { label: 'Cancel', class: 'btn', onClick: (c) => c() },
       {

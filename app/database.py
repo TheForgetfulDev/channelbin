@@ -241,6 +241,22 @@ CHANNEL_HEALTH_ROLLBACK = 'CHANNEL_HEALTH_ROLLBACK'
 # The score moving with no observation behind it is the number a user cannot otherwise
 # explain, so this event carries the before/after value and the reason (dev/changelog/951).
 CHANNEL_HEALTH_RECOMPUTED = 'CHANNEL_HEALTH_RECOMPUTED'
+# The EPG source a channel's guide comes from moved from one source to another
+# (app/epg_sources.py, DESIGN-epg-sources.md §5.4). Written only for a move between two
+# sources: a channel gaining its first guide or losing its last is counted on the source
+# and, for a loss, named in EPG_SOURCE_COVERAGE_LOST - one event per channel per provider
+# hiccup would bury the timeline (dev/changelog/1101).
+CHANNEL_EPG_SOURCE_CHANGED = 'CHANNEL_EPG_SOURCE_CHANGED'
+# The user set or cleared this channel's EPG key for one source (EpgChannelKey, written only
+# by app/epg_sources.py::set_channel_key). extra_data carries source_id, the key and what
+# saving it did to the listings ('outcome', epg_sources.KEY_*): the channel page reads the
+# latest one per source to say a key is waiting for that source's next refresh
+# (dev/changelog/1102).
+CHANNEL_EPG_KEY_CHANGED = 'CHANNEL_EPG_KEY_CHANGED'
+# The user set or cleared this channel's EPG source override (Channel.epg_source_override_id,
+# written only by app/epg_sources.py::set_source_override). extra_data carries source_id and
+# previous; detail says where the guide comes from after it (dev/changelog/1107).
+CHANNEL_EPG_SOURCE_OVERRIDE_CHANGED = 'CHANNEL_EPG_SOURCE_OVERRIDE_CHANGED'
 
 # ── Channel group event type constants ────────────────────────────────────────
 #
@@ -1639,8 +1655,18 @@ class Channel(db.Model):
     # **Any new writer of those four columns must stamp this.** Today that is
     # accounts.py::_upsert_channels and routes/accounts.py::_renormalize_chunk.
     search_text_updated_at = db.Column(db.DateTime, index=True)
+    # DERIVED: the source whose listings are in epg_entries for this channel, written only
+    # by epg_sources.resolve_active_source() and rewritten by any import
+    # (DESIGN-epg-sources.md §5). NULL = no source covers it.
+    epg_source_id          = db.Column(db.Integer, db.ForeignKey('epg_sources.id'))
+    # USER-OWNED: the source the user chose for this channel (DESIGN-epg-sources.md §6.2).
+    # Participation-switch rule - no sync or refresh writes it; one writer,
+    # epg_sources.set_source_override(). It counts only while the account reads that
+    # source, and is never cleared for not counting (dev/changelog/1107).
+    # epg-override-write-ok: the column definition
+    epg_source_override_id = db.Column(db.Integer, db.ForeignKey('epg_sources.id'))
 
-    default_profile = db.relationship('RecordingProfile', foreign_keys=[default_profile_id], lazy='joined')
+    default_profile =db.relationship('RecordingProfile', foreign_keys=[default_profile_id], lazy='joined')
     # All group memberships. Membership has no bearing on this channel's own guide row:
     # in_guide means "this channel is a guide row" and nothing else, and a member may hold
     # one alongside its group's (dev/changelog/751). The membership row's .group
@@ -1661,6 +1687,9 @@ class Channel(db.Model):
     # ids are reused (CLAUDE.md teardown rule).
     health_exclusions = db.relationship('ChannelHealthExclusion', backref='channel',
                                         lazy=True, cascade='all, delete-orphan')
+    epg_alternate_entries = db.relationship('EpgAlternateEntry', lazy=True,
+                                            cascade='all, delete-orphan')
+    epg_keys = db.relationship('EpgChannelKey', lazy=True, cascade='all, delete-orphan')
 
     # Declared here as well as in migration 24, because a FRESH database never runs
     # migrations - run_migrations() stamps it at CURRENT_SCHEMA_VERSION and returns - so an
@@ -2090,6 +2119,153 @@ class EPGEntry(db.Model):
         # table scan (11.26s measured on 714,553 rows); indexed, SQLite plans it as a normal
         # b-tree range search (0.02s, 562x) - migration 36, dev/changelog/594.
         db.Index('ix_epg_entries_duration', 'duration_minutes'),
+        # A refresh's delete scope and the per-source counts (DESIGN-epg-sources.md §4, §8.2).
+        db.Index('ix_epg_entries_source', 'source_id', 'stop_time'),
+    )
+
+    # The source this row was imported from (app/epg_sources.py). Displayed and used as a
+    # refresh's delete scope; never a filter a guide or search reader applies - a row is in
+    # this table only because its source is the channel's active one (DESIGN-epg-sources.md
+    # §4). NULL only on rows imported before migration 72 on an account that had no source.
+    source_id   = db.Column(db.Integer, db.ForeignKey('epg_sources.id'))
+
+
+# ── EPG sources (app/epg_sources.py, DESIGN-epg-sources.md) ──────────────────────────────
+EPG_SOURCE_PROVIDER = 'provider'   # an Xtream account's xmltv.php, URL built at fetch time
+EPG_SOURCE_URL      = 'url'        # any XMLTV URL, stored on the row
+EPG_SOURCE_KINDS = (EPG_SOURCE_PROVIDER, EPG_SOURCE_URL)
+
+EPG_STATUS_OK        = 'OK'
+EPG_STATUS_FAILED    = 'FAILED'      # the fetch raised; old rows kept
+EPG_STATUS_REFUSED   = 'REFUSED'     # the collapse guard refused; old rows kept
+EPG_STATUS_TRUNCATED = 'TRUNCATED'   # the parse stopped after the delete
+
+EPG_KEY_ORIGIN_MANUAL     = 'manual'
+EPG_KEY_ORIGIN_NAME_MATCH = 'name_match'
+EPG_KEY_ACCEPTED = 'accepted'
+EPG_KEY_REJECTED = 'rejected'
+
+
+class EpgSource(db.Model):
+    """One XMLTV feed. Owned by the account that refreshes it and whose deletion takes it;
+    read by every account subscribed to it (DESIGN-epg-sources.md §3)."""
+    __tablename__ = 'epg_sources'
+
+    id               = db.Column(db.Integer, primary_key=True)
+    kind             = db.Column(db.String(16), nullable=False)          # EPG_SOURCE_KINDS
+    name             = db.Column(db.String(255), nullable=False)
+    owner_account_id = db.Column(db.Integer, db.ForeignKey('accounts.id'), nullable=False,
+                                 index=True)
+    # EPG_SOURCE_URL only. Account-owned and secret in full: render through mask_url_path().
+    url              = db.Column(db.String(2048))
+    # NULL = refreshes inside the owner account's sync (DESIGN-epg-sources.md §8.1).
+    refresh_interval_hours = db.Column(db.Integer)
+    enabled          = db.Column(db.Boolean, nullable=False, default=True,
+                                 server_default=db.text('1'))
+    last_refresh_at  = db.Column(db.DateTime)   # naive UTC, moved forward only
+    last_success_at  = db.Column(db.DateTime)
+    # Set while a refresh of this source runs, cleared when it ends and at startup. Read by
+    # a process that cannot see this one (tools/check_busy.py), like postprocess_waiting_since.
+    refresh_started_at = db.Column(db.DateTime)
+    last_status      = db.Column(db.String(16))  # EPG_STATUS_*, NULL = never refreshed
+    last_error       = db.Column(db.Text)        # masked
+    entry_count      = db.Column(db.Integer, nullable=False, default=0,
+                                 server_default=db.text('0'))   # rows held, both tables
+    channel_count    = db.Column(db.Integer, nullable=False, default=0,
+                                 server_default=db.text('0'))   # subscriber channels covered
+    active_channel_count = db.Column(db.Integer, nullable=False, default=0,
+                                     server_default=db.text('0'))
+    created_at       = db.Column(db.DateTime, default=datetime.utcnow)
+    updated_at       = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    owner = db.relationship('Account', foreign_keys=[owner_account_id], lazy='joined')
+
+
+class EpgSourceSubscription(db.Model):
+    """An account reading a source, at a priority (1 = first) that is total within the
+    account (DESIGN-epg-sources.md §3)."""
+    __tablename__ = 'epg_source_subscriptions'
+
+    id         = db.Column(db.Integer, primary_key=True)
+    source_id  = db.Column(db.Integer, db.ForeignKey('epg_sources.id'), nullable=False)
+    account_id = db.Column(db.Integer, db.ForeignKey('accounts.id'), nullable=False)
+    priority   = db.Column(db.Integer, nullable=False)
+
+    source = db.relationship('EpgSource', lazy='joined')
+
+    __table_args__ = (
+        db.UniqueConstraint('source_id', 'account_id', name='uq_epg_sub_source_account'),
+        db.UniqueConstraint('account_id', 'priority', name='uq_epg_sub_account_priority'),
+    )
+
+
+class EpgSourceChannel(db.Model):
+    """The source directory: one row per <channel> in the source's file, rewritten in full
+    on every import (DESIGN-epg-sources.md §7.4). Coverage questions are answered here,
+    never by counting epg_entries."""
+    __tablename__ = 'epg_source_channels'
+
+    id              = db.Column(db.Integer, primary_key=True)
+    source_id       = db.Column(db.Integer, db.ForeignKey('epg_sources.id'), nullable=False)
+    xml_id          = db.Column(db.String(255), nullable=False)
+    display_names   = db.Column(db.Text)       # JSON list, in file order
+    entry_count     = db.Column(db.Integer, nullable=False, default=0)   # in-window programs
+    distinct_titles = db.Column(db.Integer, nullable=False, default=0)   # capped, >= 3 = real
+    # The one title, when distinct_titles == 1: the channel page shows it rather than
+    # calling the channel filler (DESIGN-epg-sources.md §5.3).
+    sole_title      = db.Column(db.String(512))
+    horizon_until   = db.Column(db.DateTime)   # max stop_time in the window
+    # JSON [[start (naive UTC ISO), title], ...]: the first programs not yet over at the
+    # import, so the name-match review page can show which channel a proposal is (§7.5).
+    upcoming_titles = db.Column(db.Text)
+
+    __table_args__ = (
+        db.UniqueConstraint('source_id', 'xml_id', name='uq_epg_source_channel'),
+        db.Index('ix_epg_source_channels_count', 'source_id', 'entry_count'),
+    )
+
+
+class EpgAlternateEntry(db.Model):
+    """Listings from a source that is NOT the channel's active one (DESIGN-epg-sources.md
+    §4). Same columns as EPGEntry by design, so a change of winner is an INSERT ... SELECT;
+    no search index, no chan_prog, no guide reader. Read only by the source/channel pages
+    and the comparison view."""
+    __tablename__ = 'epg_alternate_entries'
+
+    id          = db.Column(db.Integer, primary_key=True)
+    source_id   = db.Column(db.Integer, db.ForeignKey('epg_sources.id'), nullable=False)
+    channel_id  = db.Column(db.Integer, db.ForeignKey('channels.id'), nullable=False)
+    title       = db.Column(db.String(512), nullable=False)
+    sub_title   = db.Column(db.String(512))
+    description = db.Column(db.Text)
+    start_time  = db.Column(db.DateTime, nullable=False)
+    stop_time   = db.Column(db.DateTime, nullable=False)
+    category    = db.Column(db.String(255))
+    rating      = db.Column(db.String(64))
+
+    __table_args__ = (
+        db.Index('ix_epg_alt_source_channel', 'source_id', 'channel_id'),
+    )
+
+
+class EpgChannelKey(db.Model):
+    """The user's per-channel, per-source XMLTV id (DESIGN-epg-sources.md §6.1). A user's
+    answer to a judgment call: no sync, refresh or migration writes it, and the one writer
+    is epg_sources.set_channel_key()."""
+    __tablename__ = 'epg_channel_keys'
+
+    id         = db.Column(db.Integer, primary_key=True)
+    channel_id = db.Column(db.Integer, db.ForeignKey('channels.id'), nullable=False)
+    source_id  = db.Column(db.Integer, db.ForeignKey('epg_sources.id'), nullable=False)
+    key        = db.Column(db.String(255))           # NULL with status rejected
+    origin     = db.Column(db.String(16), nullable=False)   # EPG_KEY_ORIGIN_*
+    status     = db.Column(db.String(16), nullable=False)   # EPG_KEY_ACCEPTED / _REJECTED
+    matched_on = db.Column(db.String(512))
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    __table_args__ = (
+        db.UniqueConstraint('channel_id', 'source_id', name='uq_epg_channel_key'),
     )
 
 

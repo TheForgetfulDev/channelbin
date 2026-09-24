@@ -349,8 +349,7 @@ class RecordDiagnosticsTests(unittest.TestCase):
         extra_data - two sources of truth for one fact is the defect, not the fix."""
         self._record(7, 'Server returned 500\n')
         extra = json.loads(self._events()[0].extra_data)
-        self.assertEqual(set(extra), {'kind', 'stderr_tail'})
-        self.assertNotIn('7', json.dumps(extra))
+        self.assertEqual(extra, {'kind': 'capture_stderr', 'stderr_tail': 'Server returned 500\n'})
 
     def test_exit_code_is_carried_in_the_detail_string(self):
         """Headline numbers belong in detail, which is where the event log shows them."""

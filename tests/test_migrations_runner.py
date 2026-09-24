@@ -1796,8 +1796,11 @@ class RetiredAlertDismissMigrationTests(unittest.TestCase):
 
             M._m052_dismiss_retired_alert_type_rows(conn, cur)
 
+            # Types retired after 52 shipped are covered by the later migration that
+            # retired them, never by an edit to 52.
+            later = set(M._M072_RETIRED_ALERT_TYPES)
             still_open = [t for t, (dismissed, _read) in self._rows(cur).items()
-                          if dismissed is None]
+                          if dismissed is None and t not in later]
             self.assertEqual(
                 [], still_open,
                 f'these types are retired but migration 52 does not dismiss them: '

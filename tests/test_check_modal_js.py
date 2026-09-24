@@ -195,9 +195,9 @@ class PayloadTests(_Base):
         (dev/changelog/831). The key must be ABSENT, not '': the route treats a present
         but empty name as a 400 the user cannot act on, since there is no field to fill."""
         body = self.evaluate('ccPayload({channelIds: [1], action: "queue"})')
-        self.assertNotIn('name', body)
+        self.assertNotIn('name', body)  # short-needle-ok: body is the payload dict, a key check
         body = self.evaluate('ccPayload({name: "", channelIds: [1], action: "queue"})')
-        self.assertNotIn('name', body)
+        self.assertNotIn('name', body)  # short-needle-ok: body is the payload dict, a key check
 
     def test_the_group_name_is_its_own_key_not_the_jobs_name(self):
         """The ad hoc create path names the GROUP it mints and the JOB from one string. A
@@ -205,7 +205,7 @@ class PayloadTests(_Base):
         group ends up called "<whatever> - health check"."""
         body = self.evaluate('ccPayload({channelIds: [1, 2], groupName: "Fox Sports 1", action: "queue"})')
         self.assertEqual(body['group_name'], 'Fox Sports 1')
-        self.assertNotIn('name', body)
+        self.assertNotIn('name', body)  # short-needle-ok: body is the payload dict, a key check
 
 
 class WindowRecommendLineTests(_Base):

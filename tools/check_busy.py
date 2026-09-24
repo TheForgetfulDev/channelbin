@@ -264,6 +264,32 @@ def syncing_accounts(db_path):
     return [r[0] for r in rows], None
 
 
+def refreshing_epg_sources(db_path):
+    """Return ``(names, note)`` for EPG sources whose refresh is running outside an account
+    sync - its own interval job, Refresh now, or the refresh a new source gets
+    (dev/changelog/1104). Blocking for the reason syncing_accounts() is: a restart after
+    the import's delete leaves the source holding only what it had imported so far. A
+    source refreshed inside its owner's sync is already named by that account.
+
+    Same "missing or unreadable DB reads as idle" contract as the functions above; a
+    database from before the column existed has no such refresh to report.
+    """
+    if not os.path.exists(db_path):
+        return [], f'no database at {db_path}, assuming idle'
+
+    conn = sqlite3.connect(f'file:{db_path}?mode=ro', uri=True)
+    try:
+        rows = conn.execute(
+            "SELECT s.name FROM epg_sources s JOIN accounts a ON a.id = s.owner_account_id "
+            "WHERE s.refresh_started_at IS NOT NULL AND a.status != 'SYNCING' "
+            "ORDER BY s.name").fetchall()
+    except sqlite3.DatabaseError as e:
+        return [], f'cannot read {db_path} ({e}), assuming idle'
+    finally:
+        conn.close()
+    return [r[0] for r in rows], None
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -290,6 +316,7 @@ def main():
     tests, test_note = in_flight_channel_tests(db_path)
     rebuilding, idx_note = rebuilding_indexes(db_path)
     syncing, sync_note = syncing_accounts(db_path)
+    refreshing, refresh_note = refreshing_epg_sources(db_path)
 
     for rid, status, name in rows:
         print(f'  #{rid}  {status}  {name}')
@@ -307,8 +334,11 @@ def main():
         print(f'  search index {name!r} is rebuilding')
     for name in syncing:
         print(f'  account {name!r} is syncing')
+    for name in refreshing:
+        print(f'  EPG source {name!r} is refreshing')
 
-    for seen in dict.fromkeys(n for n in (hc_note, test_note, idx_note, sync_note) if n):
+    for seen in dict.fromkeys(n for n in (hc_note, test_note, idx_note, sync_note,
+                                          refresh_note) if n):
         print(f'check_busy: {seen}')
 
     # The machine-readable half of the output. restart.sh keys its recordings-only stale-row
@@ -316,6 +346,7 @@ def main():
     kinds = [name for name, present in (
         ('recordings', rows), ('health-checks', health_jobs), ('channel-tests', tests),
         ('search-indexes', rebuilding), ('account-syncs', syncing),
+        ('epg-source-refreshes', refreshing),
     ) if present]
     if kinds:
         print('blocking-kinds: ' + ' '.join(kinds))

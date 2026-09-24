@@ -65,7 +65,7 @@ def _boot(html):
 class SectionTests(_StatsCase):
 
     def test_usage_is_the_fifth_section_after_content(self):
-        self.assertEqual(ACCOUNT_SECTIONS, ['details', 'content', 'usage', 'history', 'activity'])
+        self.assertEqual(ACCOUNT_SECTIONS, ['details', 'content', 'sources', 'usage', 'history', 'activity'])
         acc = seed.make_account(name='Alpha')
         db.session.commit()
         html = self.get(f'/accounts/{acc.id}')
@@ -108,9 +108,10 @@ class SectionTests(_StatsCase):
         css = json.loads(proc.stdout)
         order = {m.group(1): int(m.group(2))
                  for m in re.finditer(r'\[data-section="(\w+)"\] \{ order: (\d+);', css)}
-        # The saved order is kept; Usage goes in at its default index (third).
+        # The saved order is kept; Usage and EPG sources, both newer than the layout, go in
+        # at their default indexes (fourth and third).
         self.assertEqual(sorted(order, key=order.get),
-                         ['details', 'history', 'usage', 'content', 'activity'])
+                         ['details', 'history', 'sources', 'usage', 'content', 'activity'])
         self.assertNotIn('display: none', re.search(r'\[data-section="usage"\][^}]*}', css).group(0))
 
 

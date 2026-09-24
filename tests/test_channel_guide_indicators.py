@@ -16,6 +16,7 @@ trailing `else` rendering a real state is the defect class CLAUDE.md names, and 
 AND via a group" is a real state now, not an impossible one.
 """
 import os
+import re
 import sys
 import unittest
 
@@ -102,8 +103,8 @@ class GuideBadgeTests(_DetailPage):
         db.session.commit()
         body = self.page(ch)
         # Two of the three are in the guide, so the badge counts one extra, not two.
-        self.assertIn('+1', body)
-        self.assertIn('In guide via ', body)
+        self.assertEqual(re.findall(r'>(In guide via [^<]*)</span>', body),
+                         ['In guide via Alpha +1'])
 
 
 class GuideSentenceTests(_DetailPage):

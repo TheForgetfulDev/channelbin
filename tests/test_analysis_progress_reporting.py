@@ -28,6 +28,7 @@ Run standalone:
   python3 -m unittest tests.test_analysis_progress_reporting
 """
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -383,7 +384,7 @@ class AnalysisSurfaceTests(unittest.TestCase):
 
         self.assertIn(ppmod.ANALYSIS_PASS_TIMELINE, html)
         self.assertIn('pass 2 of 2', html)
-        self.assertIn('43%', html)
+        self.assertEqual(re.findall(r'<span><b>(\d+)%</b> read</span>', html), ['43'])
         self.assertIn('elapsed', html)
 
     def test_the_detail_strip_keeps_the_plain_sentence_when_no_pass_is_reading(self):
@@ -400,7 +401,10 @@ class AnalysisSurfaceTests(unittest.TestCase):
 
         html = self._html('/recordings')
 
-        self.assertIn('43%', html)
+        rel = [r for r in re.findall(r'<span class="rel">([^<]*)</span>', html)
+               if r.startswith('checking')]
+        self.assertEqual(len(rel), 1)
+        self.assertIn('43%', rel[0].split(' · '))
         self.assertIn('2 of 2', html)
 
     def test_the_recordings_list_row_falls_back_when_nothing_is_reading(self):

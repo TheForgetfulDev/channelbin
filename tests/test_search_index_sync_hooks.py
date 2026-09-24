@@ -29,6 +29,7 @@ from app.database import AccountSyncLog, Channel, M3uAccount  # noqa: E402
 from app.search_index import (SEARCH_INDEX_CHANNELS, apply_channel_search,  # noqa: E402
                               rebuild_search_indexes, search_index_readiness)
 from tests.support import make_test_app  # noqa: E402
+from tests.support.seed import make_epg_source  # noqa: E402
 
 M3U_URL = 'http://provider.test/playlist.m3u8'
 
@@ -45,6 +46,7 @@ def _fake_get(url, **kwargs):
     if url == M3U_URL:
         resp = mock.Mock()
         resp.raise_for_status = mock.Mock()
+        resp.status_code = 200
         resp.content = M3U_PLAYLIST.encode('utf-8')
         return resp
     raise AssertionError(f'unexpected requests.get call: {url}')
@@ -57,6 +59,8 @@ class SyncRebuildHookTests(unittest.TestCase):
         self.account = M3uAccount(name='Failing Provider', m3u_url=M3U_URL,
                                   epg_url=None, status='OK')
         db.session.add(self.account)
+        # The account's EPG as a source, as migration 72 makes it (DESIGN-epg-sources.md §10).
+        make_epg_source(self.account, url='http://provider.test/xmltv.php')
         db.session.commit()
         self.account_id = self.account.id
 
@@ -71,7 +75,7 @@ class SyncRebuildHookTests(unittest.TestCase):
     def test_sync_failing_at_the_epg_stage_still_rebuilds(self):
         """The realistic shape: channels land, the EPG stage blows up, sync ends ERROR."""
         with mock.patch('app.accounts.requests.get', side_effect=_fake_get), \
-             mock.patch('app.accounts._sync_epg_from_url',
+             mock.patch('app.accounts.refresh_source',
                         side_effect=RuntimeError('provider went away')):
             self.account.epg_url = 'http://provider.test/xmltv.php'
             db.session.commit()
@@ -100,11 +104,12 @@ class SyncRebuildHookTests(unittest.TestCase):
         def _renamed_get(url, **kwargs):
             resp = mock.Mock()
             resp.raise_for_status = mock.Mock()
+            resp.status_code = 200
             resp.content = renamed.encode('utf-8')
             return resp
 
         with mock.patch('app.accounts.requests.get', side_effect=_renamed_get), \
-             mock.patch('app.accounts._sync_epg_from_url',
+             mock.patch('app.accounts.refresh_source',
                         side_effect=RuntimeError('provider went away')):
             self.account.epg_url = 'http://provider.test/xmltv.php'
             db.session.commit()
@@ -134,6 +139,7 @@ class SyncRebuildHookTests(unittest.TestCase):
                 stop.set()                          # cancel lands after the channel commit
                 resp = mock.Mock()
                 resp.raise_for_status = mock.Mock()
+                resp.status_code = 200
                 resp.content = b'<?xml version="1.0" encoding="UTF-8"?><tv></tv>'
                 return resp
             return _fake_get(url, **kwargs)

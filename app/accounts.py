@@ -5,8 +5,11 @@ URL normalization, and filename templating. Code specific to the Xtream API
 (the HTTP client, dump/debug tooling) lives in app/xtream_client.py and is
 imported here lazily to avoid a circular import.
 """
+import bisect
+import functools
 import gzip
 import hashlib
+import math
 import os
 import re
 import logging
@@ -18,6 +21,7 @@ import defusedxml.ElementTree as ET
 from defusedxml.common import DefusedXmlException
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
+from typing import NamedTuple
 
 import requests
 from sqlalchemy import func, select, update
@@ -28,11 +32,20 @@ from . import admission, db
 from .channel_groups import touch_group
 from .database import (
     Account, Alert, Channel, ChannelEvent, ChannelGroupMember, EPGEntry, AccountSyncLog,
+    EpgAlternateEntry, EpgSource, EPG_SOURCE_PROVIDER, EPG_SOURCE_URL,
+    EPG_STATUS_FAILED, EPG_STATUS_OK, EPG_STATUS_REFUSED, EPG_STATUS_TRUNCATED,
     Recording, add_recording_event,
     CHANNEL_URL_CHANGED, CHANNEL_ADDED_TO_GUIDE, CHANNEL_REMOVED_FROM_GUIDE,
     RECORDING_REPOINTED, REC_STATUS_IN_PROGRESS, REC_STATUS_SCHEDULED,
 )
 from .db_utils import current_wal_size_bytes, retry_on_locked
+from .epg_sources import (
+    DISTINCT_TITLE_CAP, REASON_NONE, UPCOMING_TITLES, DirectoryRow, accepted_keys,
+    add_held_coverage, apply_winners, channel_key, demote, directory_coverage, drop_alternates,
+    ensure_provider_source, held_coverage, norm_key, promote, provider_xmltv_url,
+    refresh_source_counts, resolve_active_source, sources_refreshed_by_sync, subscriber_ids,
+    subscriptions_for, sources_without_directory, write_directory,
+)
 from .fmt_utils import fmt_bytes
 from .tz_utils import format_local, parse_epoch_utc, to_naive_utc
 from .url_utils import mask_account_urls_in_text, mask_creds, mask_creds_in_text, mask_url_path
@@ -53,6 +66,10 @@ _sync_cancel_reasons: dict[int, str] = {}
 # Principle 1 - a sync that's hung looks identical to one that's healthy without this).
 _sync_progress: dict[int, dict] = {}
 _sync_locks_mutex = threading.Lock()
+# One refresh of a source at a time, whichever path started it: its owner's sync, its own
+# job, or Refresh now. Admission keeps two syncs apart, but a manual Sync now is forced past
+# admission, so it can meet a source refresh that started first (dev/changelog/1104).
+_source_locks: dict[int, threading.Lock] = {}
 
 _DEFAULT_CANCEL_REASON = 'Cancelled by user'
 
@@ -96,6 +113,11 @@ def _raise_if_cancelled(stop_event: threading.Event | None, detail: str = '') ->
     """
     if stop_event is not None and stop_event.is_set():
         raise SyncCancelled(detail)
+
+
+def _get_source_lock(source_id: int) -> threading.Lock:
+    with _sync_locks_mutex:
+        return _source_locks.setdefault(source_id, threading.Lock())
 
 
 def _get_sync_lock(account_id: int) -> threading.Lock:
@@ -225,8 +247,15 @@ def _parse_m3u_as_streams(content: str) -> list:
 
 # ── XMLTV datetime parsing ────────────────────────────────────────────────────
 
+@functools.lru_cache(maxsize=65536)
 def _parse_xmltv_dt(s: str) -> datetime:
-    """Parse XMLTV datetime like '20250621143000 -0500' to naive UTC datetime."""
+    """Parse XMLTV datetime like '20250621143000 -0500' to naive UTC datetime.
+
+    Memoized: a feed repeats the same few thousand grid timestamps across every channel,
+    and strptime was over a third of an import's wall clock - 1.15M calls for 498,666
+    programs, since the scan pass and the import loop each parse every listing
+    (dev/changelog/1101). A pure function of an immutable string, returning an immutable
+    value, so the cache cannot change an answer."""
     m = re.match(r'(\d{14})\s*([+-]\d{4})', s)
     if not m:
         # Try without timezone offset - treat as UTC
@@ -1065,7 +1094,9 @@ def _do_sync(account_id: int, stop_event: threading.Event, use_dump: bool = Fals
     # a rollback, so touching `account` down there could raise instead of masking. These
     # are the account-owned URLs a requests exception will have stringified in full
     # (DESIGN-secrets.md §4.2).
-    account_urls = (account.m3u_url, account.epg_url, account.base_url)
+    account_urls = (account.m3u_url, account.epg_url, account.base_url,
+                    *(u for (u,) in db.session.query(EpgSource.url).filter(
+                        EpgSource.owner_account_id == account_id, EpgSource.url.isnot(None))))
     # Same reason: the failure-path alert below titles itself with the account name, and by
     # then the session has been rolled back and this instance expired.
     account_name = account.name
@@ -1158,11 +1189,6 @@ def _do_sync(account_id: int, stop_event: threading.Event, use_dump: bool = Fals
             rebuild_needed = True
             _apply_hide_rules_after_upsert(account_id, account.name)
             _raise_if_cancelled(stop_event, _CANCEL_KEPT_EPG)
-            epg_synced = 0
-            if account.epg_url:
-                epg_synced, epg_degradation_reason = _sync_epg_from_url(
-                    account, account.epg_url, timeout, epg_days, cfg,
-                    force_epg_resync=force_epg_resync, stop_event=stop_event)
         else:
             # Xtream path
             from .xtream_client import (XtreamClient, FileXtreamClient, _get_latest_dump_dir,
@@ -1206,24 +1232,42 @@ def _do_sync(account_id: int, stop_event: threading.Event, use_dump: bool = Fals
             rebuild_needed = True
             _apply_hide_rules_after_upsert(account_id, account.name)
             _raise_if_cancelled(stop_event, _CANCEL_KEPT_EPG)
-            if use_dump:
+
+            # Every Xtream account has exactly one provider source (DESIGN-epg-sources.md
+            # §3). Created here as well as at account creation so an account whose type was
+            # changed to Xtream, or that predates sources, is never left without one.
+            @retry_on_locked()
+            def _ensure_provider_source_and_commit():
+                ensure_provider_source(db.session.get(Account, account_id))
+                db.session.commit()
+
+            _ensure_provider_source_and_commit()
+
+        # One refresh per source this sync carries (DESIGN-epg-sources.md §8.1). Each writes
+        # its own status and alerts; the sync finishes PARTIAL naming every source that
+        # degraded (§9.1), so the sync log keeps the meaning DESIGN-sync-resilience.md §2
+        # gave it.
+        epg_synced = 0
+        degraded: list[str] = []
+        for source in sources_refreshed_by_sync(account_id):
+            if use_dump and source.kind == EPG_SOURCE_PROVIDER:
                 xmltv_path = os.path.join(dump_dir, 'xmltv.xml')
-                if os.path.exists(xmltv_path):
-                    case_sensitive = sync_cfg.get('epg_case_sensitive_matching', False)
-                    with open(xmltv_path, 'rb') as f:
-                        epg_synced, epg_degradation_reason = _import_xmltv(
-                            account, f.read(), epg_days, case_sensitive, cfg, force_epg_resync,
-                            stop_event=stop_event)
-                else:
-                    log.warning('No xmltv.xml in dump dir, skipping EPG sync')
-                    epg_synced = 0
+                if not os.path.exists(xmltv_path):
+                    log.warning('No xmltv.xml in dump dir, skipping EPG source %d', source.id)
+                    continue
+                case_sensitive = sync_cfg.get('epg_case_sensitive_matching', False)
+                with open(xmltv_path, 'rb') as f:
+                    synced, reason = import_source(
+                        source, f.read(), epg_days, case_sensitive, cfg, force_epg_resync,
+                        stop_event=stop_event)
             else:
-                epg_synced, epg_degradation_reason = _sync_epg_from_url(
-                    account,
-                    f'{client.base_url}/xmltv.php?username={client.username}&password={client.password}',
-                    timeout, epg_days, cfg, force_epg_resync=force_epg_resync,
-                    stop_event=stop_event,
-                )
+                synced, reason = refresh_source(
+                    source, timeout, epg_days, cfg, force_epg_resync=force_epg_resync,
+                    stop_event=stop_event)
+            epg_synced += synced
+            if reason:
+                degraded.append(f'EPG source "{source.name}": {reason}')
+        epg_degradation_reason = ' '.join(degraded) or None
 
         # "Removed this sync" = the immediate per-sync diff (channels the previous sync
         # touched that this one didn't) - not _raise_channel_lifecycle_alerts's delayed
@@ -1263,7 +1307,7 @@ def _do_sync(account_id: int, stop_event: threading.Event, use_dump: bool = Fals
         # count and the recompute would then hold for the rest of the read pass while the
         # recorder and watchdog writers can only wait on busy_timeout. They are also reads of
         # work that committed long before (the channel upserts above, the EPG batches inside
-        # _import_xmltv), so nothing here depends on the closure's own writes and hoisting
+        # import_source), so nothing here depends on the closure's own writes and hoisting
         # them changes no value. See dev/changelog/685.
         channel_count_total = Channel.query.filter_by(account_id=account_id).count()
         # Deliberately unfiltered by `hidden`, and it needs no filter: hidden channels are
@@ -1328,48 +1372,7 @@ def _do_sync(account_id: int, stop_event: threading.Event, use_dump: bool = Fals
         # one sync imported belongs (dev/changelog/926, 928).
         _alert_url_drift(account, drifted, sync_cfg)
         _write_channel_url_drift_events(drifted)
-        # The EPG degradation alert types are mutually exclusive per sync (a fetch
-        # exception never reaches the collapse guard, the guard only runs on a successful
-        # fetch, and a refused import never reaches the parse loop) - discriminated by the
-        # reason's own literal prefix, which this module controls at both write sites
-        # (_sync_epg_from_url / _import_xmltv). All are evaluated every sync so whichever
-        # one ISN'T this sync's reason still gets auto-resolved if it was standing from an
-        # earlier sync.
-        epg_alert_type = _epg_degradation_alert_type(epg_degradation_reason)
-        fetch_failed = epg_alert_type == 'SYNC_EPG_FETCH_FAILED'
-        collapse_refused = epg_alert_type == 'SYNC_EPG_COLLAPSE_REFUSED'
-        import_truncated = epg_alert_type == 'SYNC_EPG_IMPORT_TRUNCATED'
-        _raise_or_resolve_standing_alert(
-            'SYNC_EPG_FETCH_FAILED',
-            source=f'account:{account_id}:epg-fetch',
-            active=fetch_failed,
-            title=f'{account.name}: EPG fetch failed',
-            body=(
-                f'{epg_degradation_reason} - the previous EPG data was kept; this sync '
-                'finished PARTIAL.' if fetch_failed else ''
-            ),
-        )
-        _raise_or_resolve_standing_alert(
-            'SYNC_EPG_COLLAPSE_REFUSED',
-            source=f'account:{account_id}:epg-collapse',
-            active=collapse_refused,
-            title=f'{account.name}: EPG import refused',
-            body=(
-                f'{epg_degradation_reason} This sync finished PARTIAL.' if collapse_refused else ''
-            ),
-        )
-        # Deliberately not folded into the fetch-failure alert: its body promises the
-        # previous EPG data was kept, and on this path it was already deleted.
-        _raise_or_resolve_standing_alert(
-            'SYNC_EPG_IMPORT_TRUNCATED',
-            source=f'account:{account_id}:epg-truncated',
-            active=import_truncated,
-            title=f'{account.name}: EPG import was cut short',
-            body=(
-                f'{epg_degradation_reason} This sync finished PARTIAL.'
-                if import_truncated else ''
-            ),
-        )
+        # EPG alerts are raised per source, inside each refresh (DESIGN-epg-sources.md §9.1).
 
         # Live-vs-VOD classification degradations (DESIGN-live-vod.md §4). Both are
         # evaluated every sync so a standing one auto-resolves once the provider recovers.
@@ -1662,16 +1665,16 @@ def _write_channel_url_drift_events(drifted: list) -> None:
     _write_events_and_commit()
 
 
-# Every degradation reason _sync_epg_from_url / _import_xmltv can return starts with one
-# of these prefixes, and each maps to exactly one alert type. A map rather than a chain of
+# Every degradation reason refresh_source / import_source can return starts with one of
+# these prefixes, and each maps to exactly one alert type. A map rather than a chain of
 # startswith() branches because the chain's trailing else silently absorbed any prefix
 # added later - CLAUDE.md "a trailing else must never be the rendering of a real state".
 # The prefixes are literals this module owns at both write sites; nothing outside parses
 # them (they are also the user-facing text of AccountSyncLog.error_message).
 EPG_DEGRADATION_ALERT_TYPES = {
-    'fetch failed:': 'SYNC_EPG_FETCH_FAILED',
-    'import refused:': 'SYNC_EPG_COLLAPSE_REFUSED',
-    'import truncated:': 'SYNC_EPG_IMPORT_TRUNCATED',
+    'fetch failed:': 'EPG_SOURCE_FETCH_FAILED',
+    'import refused:': 'EPG_SOURCE_COLLAPSE_REFUSED',
+    'import truncated:': 'EPG_SOURCE_IMPORT_TRUNCATED',
 }
 
 
@@ -1689,7 +1692,7 @@ def _epg_degradation_alert_type(reason: str | None) -> str | None:
             return alert_type
     log.error('EPG degradation reason has no registered prefix, routing it to the generic '
               'fetch-failure alert: %r', reason)
-    return 'SYNC_EPG_FETCH_FAILED'
+    return 'EPG_SOURCE_FETCH_FAILED'
 
 
 def _raise_or_resolve_standing_alert(alert_type: str, source: str, active: bool,
@@ -1700,8 +1703,8 @@ def _raise_or_resolve_standing_alert(alert_type: str, source: str, active: bool,
     the GROUP_FORMAT_MISMATCH auto-resolve precedent (app/channel_groups.py:405-417) and
     generalizes `_alert_url_drift`'s refresh-only pattern above with a dismiss branch.
 
-    Canonical home for this pattern - SYNC_EPG_COLLAPSE_REFUSED and SYNC_FEED_SHRUNK
-    (Sync resilience B/C) need the identical shape; reuse this instead of a third copy.
+    Canonical home for this pattern - the EPG_SOURCE_* alerts and SYNC_FEED_SHRUNK need the
+    identical shape; reuse this instead of another copy.
     """
     @retry_on_locked()
     def _refresh_or_dismiss_existing():
@@ -2480,39 +2483,226 @@ def duplicates_within(channels) -> dict[int, str]:
     return titles
 
 
-def _sync_epg_from_url(account: Account, url: str, timeout: int, epg_days: int,
-                       cfg: dict | None = None, force_epg_resync: bool = False,
-                       stop_event: threading.Event | None = None) -> tuple[int, str | None]:
-    """Fetch XMLTV from a URL and import EPG entries for this account's channels.
+def _cancel_kept_source(source_name: str) -> str:
+    return (f'the channel list was updated; the import of EPG source "{source_name}" stopped '
+            'before it changed anything, so its previous listings were kept.')
+
+
+def _source_fetch_url(source: EpgSource) -> str:
+    if source.kind == EPG_SOURCE_PROVIDER:
+        return provider_xmltv_url(source.owner)
+    if source.kind == EPG_SOURCE_URL:
+        return source.url or ''
+    raise ValueError(f'EPG source {source.id} has unknown kind {source.kind!r}')
+
+
+def refresh_source(source: EpgSource, timeout: int, epg_days: int, cfg: dict | None = None,
+                   force_epg_resync: bool = False,
+                   stop_event: threading.Event | None = None,
+                   track_progress: bool = True) -> tuple[int, str | None]:
+    """Refresh one source, one at a time per source, with `refresh_started_at` set for as
+    long as it runs so the restart guard can see it. A source already being refreshed by
+    another path is skipped, not queued behind it: that refresh is fetching the same file.
+    See _refresh_source for the return value."""
+    source_id = source.id
+    lock = _get_source_lock(source_id)
+    if not lock.acquire(blocking=False):
+        log.info('EPG source %d (%s) is already being refreshed - skipped', source_id,
+                 source.name)
+        return 0, None
+    try:
+        _set_refreshing(source_id, True)
+        try:
+            return _refresh_source(source, timeout, epg_days, cfg, force_epg_resync,
+                                   stop_event, track_progress)
+        finally:
+            _set_refreshing(source_id, False)
+    finally:
+        lock.release()
+
+
+def _set_refreshing(source_id: int, on: bool) -> None:
+    @retry_on_locked()
+    def _stamp_and_commit():
+        src = db.session.get(EpgSource, source_id)
+        if src is not None:
+            src.refresh_started_at = datetime.utcnow() if on else None
+            db.session.commit()
+
+    _stamp_and_commit()
+
+
+#: Every standing alert a source can hold, by the key suffix it is raised under.
+_SOURCE_ALERTS = (('EPG_SOURCE_FETCH_FAILED', 'fetch'), ('EPG_SOURCE_COLLAPSE_REFUSED', 'collapse'),
+                  ('EPG_SOURCE_IMPORT_TRUNCATED', 'truncated'),
+                  ('EPG_SOURCE_COVERAGE_LOST', 'coverage'), ('EPG_SOURCE_STALE', 'stale'))
+
+
+def start_source_refresh(app, source_id: int) -> tuple[bool, str]:
+    """Refresh one source now, in the background, outside any account sync - Refresh now,
+    and the refresh a new or re-pointed source gets at once (its directory is empty until
+    then, so it covers nothing). Returns (started, message for the user).
+
+    Admission is asked here, in the request, so a refusal can be answered: it takes the
+    sync ticket (DESIGN-epg-sources.md §8.1), so it never overlaps an account sync or
+    another source's refresh. A refusal queues a retry rather than dropping the refresh,
+    and the message names what it is waiting behind.
+    """
+    source = db.session.get(EpgSource, source_id)
+    if source is None:
+        return False, 'That EPG source no longer exists.'
+    name = source.name
+    ticket = admission.try_start(admission.KIND_SYNC, f'EPG source {name}')
+    if not ticket.granted:
+        from .scheduler import defer_source_refresh
+        when = defer_source_refresh(source_id, ticket.reason)
+        later = (f'It will start at {format_local(when)}.' if when
+                 else 'Use Refresh now again once that has finished.')
+        return False, f'{ticket.reason[0].upper()}{ticket.reason[1:]}, so the refresh of "{name}" waits. {later}'
+    threading.Thread(target=refresh_source_standalone, args=(app, source_id),
+                     kwargs={'ticket': ticket}, daemon=True,
+                     name=f'epg-source-refresh-{source_id}').start()
+    return True, f'Refreshing "{name}" now.'
+
+
+def refresh_source_standalone(app, source_id: int, ticket=None):
+    """One source's refresh on its own - its interval job, Refresh now, or a deferred
+    retry. Returns the admission Refusal when it could not start (the caller decides where
+    that goes), else None. A `ticket` already granted is used and released here."""
+    if ticket is None:
+        with app.app_context():
+            source = db.session.get(EpgSource, source_id)
+            if source is None:
+                return None
+            label = f'EPG source {source.name}'
+        ticket = admission.try_start(admission.KIND_SYNC, label)
+        if not ticket.granted:
+            return ticket
+    try:
+        with app.app_context():
+            source = db.session.get(EpgSource, source_id)
+            if source is None:
+                return None
+            cfg = load_config()
+            sync_cfg = cfg.get('sync', {})
+            try:
+                refresh_source(source, sync_cfg.get('request_timeout_seconds', 30),
+                               sync_cfg.get('epg_days_ahead', 3), cfg, track_progress=False)
+            finally:
+                update_source_stale_alert(source_id)
+    finally:
+        admission.release(ticket)
+    return None
+
+
+def update_source_stale_alert(source_id: int) -> None:
+    """Raise or clear EPG_SOURCE_STALE: a source on its own interval with no good refresh in
+    OVERDUE_INTERVAL_MULTIPLE intervals. Called at each end of the condition - after every
+    refresh attempt, when a refresh is deferred, and when the source is edited - so nothing
+    has to poll, the same rule update_overdue_alert follows. A never-refreshed source is
+    measured from when it was added: one that has never worked is the stalest of all."""
+    source = db.session.get(EpgSource, source_id)
+    if source is None:
+        return
+    since = source.last_success_at or source.created_at
+    interval = source.refresh_interval_hours
+    active = bool(source.enabled and interval and since
+                  and datetime.utcnow() - since >= timedelta(hours=interval * OVERDUE_INTERVAL_MULTIPLE))
+    body = ''
+    if active:
+        last = (f'its last good refresh was {format_local(source.last_success_at)}'
+                if source.last_success_at else 'it has not had a good refresh since it was added')
+        body = (f'EPG source "{source.name}" refreshes every {interval}h, but {last} - more '
+                f'than {interval * OVERDUE_INTERVAL_MULTIPLE}h ago. Its listings are still the '
+                'ones from its last good refresh. The source\'s row on its account page says '
+                'why the refreshes since have not worked.')
+    _raise_or_resolve_standing_alert(
+        'EPG_SOURCE_STALE', source=f'epg-source:{source_id}:stale', active=active,
+        title=f'EPG source "{source.name}" is stale', body=body)
+
+
+def resolve_source_alerts(source_id: int) -> None:
+    """Clear every standing alert a deleted source held - nothing will ever refresh it to
+    clear them itself."""
+    for alert_type, suffix in _SOURCE_ALERTS:
+        _raise_or_resolve_standing_alert(alert_type, source=f'epg-source:{source_id}:{suffix}',
+                                         active=False)
+
+
+def report_source_removed(source_id: int, source_name: str, cause: str, readers,
+                          guided: dict[int, int], outcome: dict[int, int | None]) -> None:
+    """Raise EPG_SOURCE_REMOVED for a deleted source that other accounts read (§9.5):
+    which accounts, how many of their channels took their guide from it, and what became
+    of them. `guided` is {channel_id: source_id} collected before the delete
+    (foreign_guided_channels); `outcome` is reresolve_channels()' {channel_id: new winner}.
+    Nothing to say when no other account read it."""
+    readers = [r for r in readers if r.source_id == source_id]
+    if not readers:
+        return
+    mine = [cid for cid, sid in guided.items() if sid == source_id]
+    lost = [cid for cid in mine if not outcome.get(cid)]
+    who = ', '.join(f'"{r.account_name}" ({r.guided:,} channel(s) took their guide from it)'
+                    for r in readers)
+    body = f'EPG source "{source_name}" was deleted {cause}. Accounts reading it: {who}.'
+    if mine:
+        body += f' {len(mine) - len(lost):,} of those channel(s) now take their guide from another source'
+        if lost:
+            sample = [n for (n,) in db.session.query(Channel.name).filter(
+                Channel.id.in_(lost[:_LOST_CHANNELS_NAMED])).order_by(Channel.name)]
+            more = len(lost) - len(sample)
+            body += (f'; {len(lost):,} have no guide from any source now: {", ".join(sample)}'
+                     + (f', and {more:,} more' if more > 0 else ''))
+        body += '.'
+    from .alerts import create_alert
+    create_alert('EPG_SOURCE_REMOVED', f'EPG source "{source_name}" was removed', body,
+                 source=f'epg-source:{source_id}:removed')
+
+
+def _refresh_source(source: EpgSource, timeout: int, epg_days: int, cfg: dict | None,
+                    force_epg_resync: bool, stop_event: threading.Event | None,
+                    track_progress: bool) -> tuple[int, str | None]:
+    """Fetch one EPG source's XMLTV and import it (DESIGN-epg-sources.md §8).
 
     Returns (entries_imported, degradation_reason). `degradation_reason` is None on a
-    healthy fetch; a fetch exception no longer silently reports 0 entries as success -
-    it's a value the caller must handle, finishing the sync PARTIAL instead of plain
-    SUCCESS with a silently-stale EPG (DESIGN-sync-resilience.md §2). A degradation_reason
-    starting 'import refused:' instead means the collapse guard (§4) refused the import -
-    force_epg_resync bypasses that guard for this one call - and one starting
-    'import truncated:' means the payload stopped parsing after the delete had committed.
-    Every prefix this returns must have an entry in EPG_DEGRADATION_ALERT_TYPES.
+    healthy refresh; a fetch exception is a value the caller must handle, finishing the sync
+    PARTIAL instead of plain SUCCESS with a silently-stale guide (DESIGN-sync-resilience.md
+    §2). 'import refused:' means the collapse guard (§4) refused the import -
+    force_epg_resync bypasses that guard for this one call - and 'import truncated:' means
+    the payload stopped parsing after the delete had committed. Every prefix this returns
+    must have an entry in EPG_DEGRADATION_ALERT_TYPES. The source's own alerts and status
+    are written before this returns.
     """
-    log.info('Fetching XMLTV for account %d from %s', account.id, mask_url_path(url))
+    source_id, source_name = source.id, source.name
+    url = _source_fetch_url(source)
+    log.info('Fetching XMLTV for EPG source %d (%s) from %s', source_id, source_name,
+             mask_url_path(url))
+    reason = None
     try:
         resp = requests.get(url, timeout=timeout, stream=True, headers=_request_headers(cfg))
         resp.raise_for_status()
         xml_bytes = resp.content
     except Exception as exc:
-        log.warning('XMLTV fetch failed for account %d: %s - skipping EPG sync', account.id,
-                    mask_account_urls_in_text(str(exc), url))
         # Masked: this reason is persisted into AccountSyncLog.error_message and rendered
         # in the UI, and requests exceptions stringify with the full URL that was fetched.
         # Account-owned, so the whole path goes, not just the heuristic shapes.
-        return 0, f'fetch failed: {mask_account_urls_in_text(str(exc), url)}'
+        reason = f'fetch failed: {mask_account_urls_in_text(str(exc), url)}'
+    else:
+        # raise_for_status() only covers 4xx and 5xx. These providers answer their playlist
+        # endpoint with a made-up HTTP 884 and an empty body, which it lets through.
+        if not 200 <= resp.status_code < 300:
+            reason = (f'fetch failed: the provider answered HTTP {resp.status_code} '
+                      f'({fmt_bytes(len(xml_bytes))}), not a success status')
+    if reason:
+        log.warning('XMLTV fetch failed for EPG source %d (%s): %s - listings kept',
+                    source_id, source_name, reason)
+        _report_source_outcome(source_id, reason, None)
+        return 0, reason
     # The download is one blocking call, so this is the first moment a cancel issued during
-    # it can land - and it lands before _import_xmltv deletes anything, so the account keeps
-    # the EPG data it already had.
-    _raise_if_cancelled(stop_event, _CANCEL_KEPT_EPG)
+    # it can land - and it lands before the import deletes anything.
+    _raise_if_cancelled(stop_event, _cancel_kept_source(source_name))
     case_sensitive = (cfg or {}).get('sync', {}).get('epg_case_sensitive_matching', False)
-    return _import_xmltv(account, xml_bytes, epg_days, case_sensitive, cfg, force_epg_resync,
-                         stop_event=stop_event)
+    return import_source(source, xml_bytes, epg_days, case_sensitive, cfg, force_epg_resync,
+                         stop_event=stop_event, track_progress=track_progress)
 
 
 def _match_program(elem, channel_map: dict, case_sensitive: bool,
@@ -2538,45 +2728,127 @@ def _match_program(elem, channel_map: dict, case_sensitive: bool,
     return channel_ids, start_dt, stop_dt
 
 
+class ProjectedEpgCount(NamedTuple):
+    """What the scan pass saw. `programs_seen` and `channels_seen` count every <programme> /
+    <channel> element in the feed, matched or not, which is what lets a refusal tell "the
+    feed had no listings" from "it had listings for other channels" (dev/changelog/1100).
+    `directory` is the source directory the pass built (DESIGN-epg-sources.md §7.4)."""
+    projected: int
+    parse_error: str | None
+    programs_seen: int
+    channels_seen: int
+    directory: list | None = None
+
+
 def _count_projected_epg_entries(xml_bytes: bytes, channel_map: dict, case_sensitive: bool,
                                   window_start: datetime, window_end: datetime,
-                                  stop_event: threading.Event | None = None
-                                  ) -> tuple[int, str | None]:
-    """(projected_count, parse_error) - count the EPG entries the real import would
-    create, without building any ORM objects: the collapse guard's projected count
-    (DESIGN-sync-resilience.md §4). Cheap: one extra iterparse pass over xml_bytes
-    (already fully in memory from the fetch), CPU only, in a background sync thread.
+                                  stop_event: threading.Event | None = None,
+                                  cancel_detail: str = _CANCEL_KEPT_EPG
+                                  ) -> ProjectedEpgCount:
+    """One pass over the feed that counts the entries the real import would create - the
+    collapse guard's projected count (DESIGN-sync-resilience.md §4) - and builds the source
+    directory: every <channel>'s display names and, per channel id, its in-window program
+    count, distinct titles (capped) and horizon (DESIGN-epg-sources.md §7.4). CPU only, over
+    bytes already in memory, and no ORM objects.
+
+    Runs on every import, not only when the guard is armed: the directory is what decides
+    which source wins a channel, and that has to be known before any row is written.
 
     `stop_event` makes this pass cancellable: it is a full extra walk of the payload, which
     on a large feed is long enough that ignoring a cancel through it is exactly the wait
-    dev/changelog/720 removed. Stopping here is free - the pass only counts, and the delete
-    below it has not run.
+    dev/changelog/720 removed. Stopping here is free - nothing has been written.
 
-    A malformed or truncated payload is reported as a second return value rather than
-    raised. Letting it propagate failed the whole sync as ERROR - misattributing an
-    EPG-only fault to a channel sync that had already committed successfully - and did
-    so only when the guard happened to be armed, while the identical payload on an
-    unarmed guard was reported as a clean SUCCESS (dev/changelog/719). The count returned
-    alongside the error is what parsed before the break, and is not comparable against a
+    A malformed or truncated payload is reported as a value rather than raised. Letting it
+    propagate failed the whole sync as ERROR - misattributing an EPG-only fault to a channel
+    sync that had already committed successfully (dev/changelog/719). The counts returned
+    alongside the error are what parsed before the break, and are not comparable against a
     threshold: the caller refuses on the error itself.
     """
     total = 0
     seen = 0
+    channels = 0
+    names: dict[str, list] = {}
+    counts: dict[str, int] = {}
+    titles: dict[str, set] = {}
+    horizon: dict[str, datetime] = {}
+    # Per channel, the UPCOMING_TITLES programs starting soonest among those not over yet.
+    # Kept as a small sorted list rather than every program, so memory stays per channel.
+    upcoming: dict[str, list] = {}
+    now = datetime.utcnow()
+    error = None
     try:
+        # Only the two top-level elements are cleared. Clearing every element on its end
+        # event would empty <title> and <display-name> before their parent's end event
+        # reads them.
         for _event, elem in ET.iterparse(BytesIO(xml_bytes), events=('end',)):
             if elem.tag == 'programme':
                 seen += 1
                 if seen % _CANCEL_POLL_PROGRAMS == 0:
-                    _raise_if_cancelled(stop_event, _CANCEL_KEPT_EPG)
-                match = _match_program(elem, channel_map, case_sensitive, window_start, window_end)
-                if match is not None:
-                    total += len(match[0])
-            elem.clear()
+                    _raise_if_cancelled(stop_event, cancel_detail)
+                xml_id = elem.get('channel', '')
+                try:
+                    start_dt = _parse_xmltv_dt(elem.get('start', ''))
+                    stop_dt = _parse_xmltv_dt(elem.get('stop', ''))
+                except ValueError:
+                    elem.clear()
+                    continue
+                if stop_dt >= window_start and start_dt <= window_end:
+                    counts[xml_id] = counts.get(xml_id, 0) + 1
+                    title_el = elem.find('title')
+                    title = (title_el.text or '').strip() if title_el is not None else ''
+                    seen_titles = titles.setdefault(xml_id, set())
+                    if len(seen_titles) < DISTINCT_TITLE_CAP:
+                        seen_titles.add(title)
+                    if stop_dt > now:
+                        soon = upcoming.setdefault(xml_id, [])
+                        if len(soon) < UPCOMING_TITLES or start_dt < soon[-1][0]:
+                            bisect.insort(soon, (start_dt, title))
+                            del soon[UPCOMING_TITLES:]
+                    if xml_id not in horizon or stop_dt > horizon[xml_id]:
+                        horizon[xml_id] = stop_dt
+                    match = _match_program(elem, channel_map, case_sensitive,
+                                           window_start, window_end)
+                    if match is not None:
+                        total += len(match[0])
+                elem.clear()
+            elif elem.tag == 'channel':
+                channels += 1
+                xml_id = elem.get('id', '')
+                if xml_id:
+                    names[xml_id] = [d.text.strip() for d in elem.findall('display-name')
+                                     if d.text and d.text.strip()]
+                elem.clear()
     except (ET.ParseError, DefusedXmlException) as exc:
         # Unknown provenance - this text comes from the provider's payload, not from an
         # account-owned URL, so the generic masker is the right one (DESIGN-secrets.md §4.2).
-        return total, mask_creds_in_text(str(exc))
-    return total, None
+        error = mask_creds_in_text(str(exc))
+    directory = []
+    for xml_id in sorted(set(names) | set(counts)):
+        if not xml_id:
+            continue
+        t = titles.get(xml_id, set())
+        directory.append(DirectoryRow(
+            xml_id=xml_id, display_names=names.get(xml_id, []),
+            entry_count=counts.get(xml_id, 0), distinct_titles=len(t),
+            sole_title=next(iter(t)) if len(t) == 1 else None,
+            horizon_until=horizon.get(xml_id),
+            upcoming=tuple(upcoming.get(xml_id, ()))))
+    return ProjectedEpgCount(total, error, seen, channels, directory)
+
+
+def _empty_feed_reason(xml_bytes: bytes, channels_seen: int | None, baseline: int) -> str:
+    """The refusal for a well-formed feed with no <programme> elements at all. Worded apart
+    from a threshold refusal because the cause is the provider's, not a matching problem:
+    the channel list can arrive intact with every listing missing, which is what account 3
+    received on 2026-09-23 (dev/changelog/1100). `channels_seen` is None when no count pass
+    ran."""
+    shape = f'{fmt_bytes(len(xml_bytes))}'
+    if channels_seen is not None:
+        shape += f', {channels_seen} channel entries'
+    kept = (f'previous sync had {baseline}. Old EPG data was kept'
+            if baseline else 'there was no previous EPG to keep')
+    return (f'import refused: the provider\'s XMLTV feed contained no program listings at '
+            f'all ({shape}, 0 programs) - {kept}; use "Force EPG Resync" to import it anyway.')
 
 
 # gzip's magic number. A provider that serves its XMLTV as a .xml.gz FILE sends it with a
@@ -2610,177 +2882,278 @@ def _maybe_gunzip(xml_bytes: bytes) -> tuple[bytes, str | None]:
     return plain, None
 
 
-def _visible_epg_baseline(account: Account) -> int:
-    """The collapse guard's baseline: EPG entries this account currently holds for channels
-    that are NOT hidden.
+def _visible_source_baseline(source_id: int) -> int:
+    """The collapse guard's baseline for one source: the rows it holds, in both tables, on
+    channels that are NOT hidden (DESIGN-epg-sources.md §8.2).
 
-    Counted live rather than read from the cached `account.epg_entry_count`, and the reason is
-    that hiding moves the comparison's other side. `projected` counts only what the import
-    would create, and since dev/changelog/781 that excludes hidden channels - so a cached
-    total taken before a large hide reads a legitimate 32% drop as a provider returning
-    garbage, refuses the import, and leaves that account's guide silently frozen. Rebasing the
-    baseline the same way makes the two halves comparable again.
+    Per source, not per account: an account-wide count would read a second, smaller feed
+    imported after the first as a 90% collapse and refuse it forever.
 
-    A live count rather than a counter kept in step at hide time, because a counter needs a
-    hook on every path that can hide a channel and a missed one is invisible: this reads the
-    database, so it is right whatever route did the hiding, and it excludes rows sitting on a
-    hidden channel even if the purge in `channel_hiding.recompute()` had never run. Measured
-    on the production database: 181 ms on the largest account (56,781 channels, 566,258
-    entries), against a sync that runs for minutes.
+    Counted live rather than read from a cached total, because hiding moves the
+    comparison's other side. `projected` counts only what the import would create, and since
+    dev/changelog/781 that excludes hidden channels - so a total taken before a large hide
+    reads a legitimate drop as a provider returning garbage and freezes the guide. A live
+    count is right whatever route did the hiding, and excludes rows sitting on a hidden
+    channel even if the purge in `channel_hiding.recompute()` never ran.
 
-    Guard semantics are otherwise unchanged - `baseline == 0` still means "no prior successful
-    import to compare against" and leaves the guard unarmed (DESIGN-sync-resilience.md §4).
+    `baseline == 0` still means "no prior successful import to compare against" and leaves
+    the guard unarmed (DESIGN-sync-resilience.md §4).
     """
-    return db.session.query(func.count(EPGEntry.id)).join(
-        Channel, Channel.id == EPGEntry.channel_id).filter(
-            Channel.account_id == account.id, Channel.hidden.is_(False)).scalar() or 0
+    total = 0
+    for model in (EPGEntry, EpgAlternateEntry):
+        total += db.session.query(func.count(model.id)).join(
+            Channel, Channel.id == model.channel_id).filter(
+                model.source_id == source_id, Channel.hidden.is_(False)).scalar() or 0
+    return total
 
 
-def _import_xmltv(account: Account, xml_bytes: bytes, epg_days: int,
-                   case_sensitive: bool = False, cfg: dict | None = None,
-                   force_epg_resync: bool = False,
-                   stop_event: threading.Event | None = None) -> tuple[int, str | None]:
-    """Returns (entries_imported, degradation_reason) - same shape as
-    _sync_epg_from_url (None = healthy). A reason starting 'import refused:' means the
-    collapse guard (DESIGN-sync-resilience.md §4) skipped the delete and import entirely,
-    keeping the prior EPG data untouched; force_epg_resync bypasses the guard. One
-    starting 'import truncated:' means the opposite half of that story - the delete had
-    already committed when the payload stopped parsing, so the guide holds only what was
-    imported. The two are separate prefixes because they need opposite wording in front
-    of the user: one kept the old data, the other did not (dev/changelog/719).
+class _ImportResult(NamedTuple):
+    synced: int
+    reason: str | None
+    # None = the import never reached resolution (refused, undecodable), so coverage was
+    # not re-evaluated and a standing coverage alert must be left as it is.
+    lost_channel_ids: list | None
 
-    Accepts gzipped XMLTV. Decompression happens here rather than in _sync_epg_from_url so
-    the Xtream dump path (a saved xmltv.xml, which may equally be gzipped) gets it too, and
-    so the collapse guard's count pass below reads the same decompressed bytes the real
-    import loop does.
 
-    `stop_event` makes this - the longest phase of a sync - cancellable (dev/changelog/720).
-    The delete below is the line the cancel story turns on: stopping before it keeps the
-    account's previous EPG intact, and stopping after it cannot, so the two raise different
-    detail text rather than one generic "cancelled".
+def import_source(source: EpgSource, xml_bytes: bytes, epg_days: int,
+                  case_sensitive: bool = False, cfg: dict | None = None,
+                  force_epg_resync: bool = False,
+                  stop_event: threading.Event | None = None,
+                  track_progress: bool = True) -> tuple[int, str | None]:
+    """Import one EPG source's XMLTV payload for every account subscribed to it
+    (DESIGN-epg-sources.md §8.2), write the source's status and raise or clear its alerts.
+
+    Returns (entries_imported, degradation_reason), None = healthy. A reason starting
+    'import refused:' means the collapse guard (DESIGN-sync-resilience.md §4) skipped the
+    delete and import entirely, keeping the source's listings in both tables untouched;
+    force_epg_resync bypasses the guard. One starting 'import truncated:' means the delete
+    had already committed when the payload stopped parsing, so the source holds only what
+    was imported. The two need opposite wording in front of the user (dev/changelog/719).
+
+    Accepts gzipped XMLTV, decompressed here so the Xtream dump path gets it too and the
+    scan pass reads the same bytes the import loop does.
     """
+    began_at = datetime.utcnow()
+    result = _import_source(source, xml_bytes, epg_days, case_sensitive, cfg,
+                            force_epg_resync, stop_event, track_progress)
+    _report_source_outcome(source.id, result.reason, result.lost_channel_ids, began_at)
+    return result.synced, result.reason
+
+
+def _import_source(source: EpgSource, xml_bytes: bytes, epg_days: int, case_sensitive: bool,
+                   cfg: dict | None, force_epg_resync: bool,
+                   stop_event: threading.Event | None,
+                   track_progress: bool = True) -> _ImportResult:
+    source_id, source_name = source.id, source.name
+    # A standalone refresh has no sync progress entry to write, and one written here would
+    # outlive it: only sync_account's own teardown clears them.
+    progress_id = source.owner_account_id if track_progress else None
+    kept_detail = _cancel_kept_source(source_name)
+
     xml_bytes, gzip_reason = _maybe_gunzip(xml_bytes)
     if gzip_reason:
-        return 0, gzip_reason
+        return _ImportResult(0, gzip_reason, None)
 
     now = datetime.utcnow()
     window_start = now - timedelta(hours=1)
     window_end = now + timedelta(days=epg_days)
 
-    def _norm(s: str) -> str:
-        return s if case_sensitive else s.lower()
+    # Every channel this import can say anything about: the subscribers' channels, plus any
+    # channel elsewhere still pointing at this source (its account unsubscribed since).
+    subscribers = subscriber_ids(source_id)
+    scope = Channel.epg_source_id == source_id
+    if subscribers:
+        scope = db.or_(Channel.account_id.in_(subscribers), scope)
+    channels = db.session.query(
+        Channel.id, Channel.account_id, Channel.epg_channel_id, Channel.hidden,
+        Channel.epg_source_id, Channel.epg_source_override_id).filter(scope).all()
+    order = subscriptions_for({c.account_id for c in channels})
+    candidate_sources = {sid for sids in order.values() for sid in sids}
+    candidate_sources |= {c.epg_source_override_id for c in channels
+                          if c.epg_source_override_id}
+    candidate_sources.add(source_id)
+    user_keys = accepted_keys(candidate_sources)
 
-    # Build normalized epg_channel_id → [channel.id, ...]. Case-variant ids are merged
-    # into one bucket when case_sensitive is False, so every channel sharing a spelling
-    # case-insensitively gets matched (not just whichever exact-case string appears first).
-    #
-    # HIDDEN CHANNELS ARE EXCLUDED, and this one WHERE clause is the whole EPG saving
-    # (dev/changelog/781): the map is what decides which <programme> elements become rows, so
-    # leaving a channel out of it means no inserts and no index maintenance for it. The XML
-    # parse is the fixed cost and does not change. `_count_projected_epg_entries` is handed
-    # this same map, so the collapse guard's count pass follows automatically rather than
-    # having to be filtered a second time - the two share `_match_program` precisely so they
-    # cannot drift on what counts as a match.
+    # {normalized key: [channel ids]} over this source's key for each channel (§7.1).
+    # HIDDEN CHANNELS ARE EXCLUDED, and this is the whole EPG saving of dev/changelog/781:
+    # the map decides which <programme> elements become rows. The scan pass is handed this
+    # same map, so the guard's count follows without a second filter - the two share
+    # `_match_program` precisely so they cannot drift on what counts as a match.
+    subscribed = set(subscribers)
     channel_map: dict[str, list[int]] = {}
-    for ch_id, epg_channel_id in db.session.query(
-            Channel.id, Channel.epg_channel_id).filter(
-                Channel.account_id == account.id, Channel.hidden.is_(False)):
-        if epg_channel_id:
-            channel_map.setdefault(_norm(epg_channel_id), []).append(ch_id)
+    for c in channels:
+        if c.hidden or c.account_id not in subscribed:
+            continue
+        k = channel_key(c.epg_channel_id, user_keys.get((c.id, source_id)))
+        if k:
+            channel_map.setdefault(norm_key(k, case_sensitive), []).append(c.id)
 
     if not channel_map:
-        log.info('No visible channels with EPG IDs for account %d, skipping EPG import',
-                 account.id)
-        return 0, None
+        # The directory is still written: it is what the name-match review page proposes
+        # from, and an account whose channels carry no ids at all is exactly the one that
+        # needs it (DESIGN-epg-sources.md §7.5, dev/changelog/1105).
+        count = _count_projected_epg_entries(
+            xml_bytes, {}, case_sensitive, window_start, window_end,
+            stop_event=stop_event, cancel_detail=kept_detail)
+        if count.parse_error is None:
+            write_directory(source_id, count.directory or [])
+        log.info('No visible channels with an EPG key for EPG source %d (%s), skipping import',
+                 source_id, source_name)
+        return _ImportResult(0, None, None)
 
-    # Two-phase parse (DESIGN-sync-resilience.md §4): count what the real import would
-    # create before touching anything, so a garbage/empty fetch can be refused without
-    # ever running the delete below. baseline is still the PRIOR sync's cached value -
-    # _do_sync only overwrites account.epg_entry_count after this function returns.
     threshold_pct = (cfg or {}).get('sync', {}).get('epg_collapse_threshold_percent', 20)
-    baseline = _visible_epg_baseline(account)
-    if threshold_pct > 0 and baseline > 0:
-        projected, count_parse_error = _count_projected_epg_entries(
-            xml_bytes, channel_map, case_sensitive, window_start, window_end,
-            stop_event=stop_event)
+    baseline = _visible_source_baseline(source_id)
+    count = _count_projected_epg_entries(
+        xml_bytes, channel_map, case_sensitive, window_start, window_end,
+        stop_event=stop_event, cancel_detail=kept_detail)
+    projected = count.projected
+    reason = None
+    if threshold_pct > 0 and baseline == 0 and b'<programme' not in xml_bytes:
+        # Unarmed guard, empty feed. Nothing would be lost by importing it, but it would be
+        # a SUCCESS with 0 entries and no word on any surface - the state a source lands in
+        # one refresh after a real empty-feed refusal, once pruning has emptied its baseline.
+        # A byte search rather than the scan's count: a malformed payload's count stops at
+        # the break, and a feed lacking the literal tag cannot hold an element the import
+        # would read.
+        reason = _empty_feed_reason(xml_bytes, count.channels_seen, baseline)
+    elif threshold_pct > 0 and baseline > 0:
         min_required = baseline * threshold_pct / 100
-        reason = None
-        if count_parse_error:
+        if count.parse_error:
             # A payload that will not parse all the way through is refused on that fact
-            # alone, never on the threshold: `projected` here is only what parsed before
-            # the break, so comparing it would blame the provider's entry count for what
-            # is a broken download. Refusing keeps the old EPG - the strictly safer half
-            # of the truncation story, and the only one where nothing is lost.
+            # alone, never on the threshold: `projected` is only what parsed before the
+            # break. Refusing keeps the old listings - the only half where nothing is lost.
+            # Unarmed (no baseline), the import goes ahead and reports itself truncated.
             reason = (f'import refused: the XMLTV feed is truncated or malformed - parsing '
-                      f'stopped after {projected} projected entries ({count_parse_error}). '
+                      f'stopped after {projected} projected entries ({count.parse_error}). '
                       'Old EPG data was kept; use "Force EPG Resync" to import whatever '
                       'does parse.')
+        elif count.programs_seen == 0:
+            reason = _empty_feed_reason(xml_bytes, count.channels_seen, baseline)
         elif projected < min_required:
-            reason = (f'import refused: provider returned {projected} matching EPG entries, '
-                      f'previous sync had {baseline} - below the {threshold_pct}% collapse '
-                      f'threshold ({int(min_required)} required). Old EPG data was kept; '
-                      'use "Force EPG Resync" to override.')
-        if reason:
-            if force_epg_resync:
-                log.info('EPG collapse guard bypassed for account %d (Force EPG Resync): %s',
-                         account.id, reason)
+            # Rounded up: `projected` is a whole number, so "below 0.2" is "below 1".
+            required = math.ceil(min_required)
+            if projected == 0:
+                what = (f'the feed had {count.programs_seen} programs, but none matched the '
+                        'EPG id of a visible channel reading this source inside the import '
+                        'window')
             else:
-                log.warning('EPG collapse guard refused import for account %d: %s',
-                           account.id, reason)
-                return 0, reason
+                what = f'provider returned {projected} matching EPG entries'
+            reason = (f'import refused: {what}; previous sync had {baseline} - below the '
+                      f'{threshold_pct}% collapse threshold (at least {required} required). '
+                      'Old EPG data was kept; use "Force EPG Resync" to override.')
+    if reason:
+        if force_epg_resync:
+            log.info('EPG collapse guard bypassed for EPG source %d (Force EPG Resync): %s',
+                     source_id, reason)
+        else:
+            log.warning('EPG collapse guard refused import for EPG source %d (%s): %s',
+                        source_id, source_name, reason)
+            return _ImportResult(0, reason, None)
 
-    # Delete existing future EPG entries for this account's channels. Deliberately WIDER
-    # than the import that follows: it covers hidden channels too, which the import above
-    # excludes, so a channel hidden since the last sync has its stale entries cleared here
-    # rather than stranded forever behind a filter that stops re-creating them
-    # (dev/changelog/781). `channel_hiding.recompute()` already purges at the moment of
-    # hiding; this is the belt to that pair of braces, and narrowing it to match the map
-    # would turn a missed purge into permanently undeletable rows. It does NOT run when the
-    # map came back empty - an account with every channel hidden returns above, and the
-    # purge is what covers that account.
-    #
-    # A subquery rather than a materialized id list - SQLite's SQLITE_MAX_VARIABLE_NUMBER (32,766) is within
-    # ~4% of the largest real account's channel count, so binding one parameter per id
-    # would eventually die with "too many SQL variables" (dev/docs/BUGS.md 2026-08-15).
-    # Committed immediately (not just flushed) so the write lock is held only for the
-    # delete, not for the parse+insert loop that follows - see dev/docs/BUGS.md for the incident.
-    channel_ids_with_epg_id = db.session.query(Channel.id).filter(
-        Channel.account_id == account.id,
-        Channel.epg_channel_id.isnot(None),
-        Channel.epg_channel_id != '',
-    )
+    # The last point at which stopping costs the user nothing: the directory rewrite and
+    # the row moves below change what the guide shows.
+    _raise_if_cancelled(stop_event, kept_detail)
 
-    # The last point at which stopping costs the user nothing. Past the delete below, the
-    # previous EPG is gone whatever happens next, so this check is deliberately immediately
-    # before it rather than anywhere earlier in the function.
-    _raise_if_cancelled(stop_event, _CANCEL_KEPT_EPG)
+    write_directory(source_id, count.directory or [])
 
+    # Who wins each channel (DESIGN-epg-sources.md §5), decided before a row is written so
+    # every row lands in the table it belongs in.
+    coverage = directory_coverage(candidate_sources, case_sensitive)
+    # Another source with no directory yet covers what it holds rows for - read as "covers
+    # nothing", this import would take its channels from it (dev/changelog/1107).
+    unrefreshed = sources_without_directory(candidate_sources - {source_id})
+    held = (held_coverage(unrefreshed, [c.id for c in channels if not c.hidden])
+            if unrefreshed else {})
+    changes: dict[int, tuple] = {}
+    reasons: dict[int, str] = {}
+    winners: dict[int, int | None] = {}
+    lost: list[int] = []
+    covered_here = 0
+    for c in channels:
+        if c.hidden:
+            new, why = None, REASON_NONE
+        else:
+            ordered = order.get(c.account_id, [])
+            cov = {}
+            allowed = set(ordered) | ({c.epg_source_override_id}
+                                      if c.epg_source_override_id else set())
+            for sid in allowed:
+                k = channel_key(c.epg_channel_id, user_keys.get((c.id, sid)))
+                hit = coverage.get(sid, {}).get(norm_key(k, case_sensitive)) if k else None
+                if hit is not None:
+                    cov[sid] = hit
+            if held:
+                add_held_coverage(cov, c.id, held, allowed)
+            if source_id in cov and c.account_id in subscribed:
+                covered_here += 1
+            new, why = resolve_active_source(c.epg_source_override_id, ordered, cov)
+        winners[c.id] = new
+        if new != c.epg_source_id:
+            changes[c.id] = (c.epg_source_id, new)
+            reasons[c.id] = why
+            if c.epg_source_id is not None and new is None and not c.hidden:
+                lost.append(c.id)
+
+    # A change of winner is a move between the two tables, never a re-fetch (§5.4). Done
+    # before the delete and the inserts, so a cancel partway through the inserts leaves no
+    # channel with two sources' listings in epg_entries at once. A channel that lost its
+    # last source keeps what it has: this source's in-window rows go in the delete below.
+    touched_sources = {source_id}
+    by_old: dict[int, list[int]] = {}
+    by_new: dict[int, list[int]] = {}
+    for ch_id, (old, new) in changes.items():
+        if new is None:
+            continue
+        if old is not None:
+            by_old.setdefault(old, []).append(ch_id)
+        by_new.setdefault(new, []).append(ch_id)
+    for sid, ids in by_old.items():
+        demote(ids, sid)
+        touched_sources.add(sid)
+    for sid, ids in by_new.items():
+        promote(ids, sid)
+        touched_sources.add(sid)
+    if changes:
+        names = dict(db.session.query(EpgSource.id, EpgSource.name).filter(
+            EpgSource.id.in_({s for pair in changes.values() for s in pair if s})))
+        apply_winners(changes, names, reasons)
+
+    # Delete scope = this source's rows in the window, both tables (§8.2). No channel join:
+    # a channel hidden since the last refresh has its rows cleared by the same statement.
     @retry_on_locked()
     def _delete_old_epg_and_commit():
-        EPGEntry.query.filter(
-            EPGEntry.channel_id.in_(channel_ids_with_epg_id),
-            EPGEntry.stop_time >= window_start,
-        ).delete(synchronize_session=False)
+        for model in (EPGEntry, EpgAlternateEntry):
+            model.query.filter(model.source_id == source_id,
+                               model.stop_time >= window_start).delete(synchronize_session=False)
         db.session.commit()
 
     _delete_old_epg_and_commit()
 
     @retry_on_locked()
-    def _save_epg_batch_and_commit(batch_to_save):
-        db.session.bulk_insert_mappings(EPGEntry, batch_to_save)
+    def _save_epg_batch_and_commit(active_rows, alternate_rows):
+        if active_rows:
+            db.session.bulk_insert_mappings(EPGEntry, active_rows)
+        if alternate_rows:
+            db.session.bulk_insert_mappings(EpgAlternateEntry, alternate_rows)
         db.session.commit()
 
-    # Parse XMLTV with iterparse (streaming, memory-efficient for large files)
     synced = 0
+    handled = 0
     last_checkpoint = 0
-    batch: list = []
+    active_batch: list = []
+    alternate_batch: list = []
     batch_size = 2000
     truncated_reason: str | None = None
 
+    def _flush():
+        nonlocal active_batch, alternate_batch
+        if active_batch or alternate_batch:
+            _save_epg_batch_and_commit(active_batch, alternate_batch)
+            active_batch, alternate_batch = [], []
+
     try:
-        # Use start+end events so we can track when we're inside a <programme>
-        # and avoid clearing child elements (title, desc, etc.) before the
-        # parent <programme> end event fires and extracts them.
+        # start+end events so a <programme>'s children are not cleared before its own end
+        # event reads them.
         context = ET.iterparse(BytesIO(xml_bytes), events=('start', 'end'))
         in_program = False
         for event, elem in context:
@@ -2788,7 +3161,6 @@ def _import_xmltv(account: Account, xml_bytes: bytes, epg_days: int,
                 if elem.tag == 'programme':
                     in_program = True
                 continue
-            # event == 'end' from here
             if elem.tag != 'programme':
                 if not in_program:
                     elem.clear()  # safe to clear top-level non-program elements
@@ -2814,71 +3186,152 @@ def _import_xmltv(account: Account, xml_bytes: bytes, epg_days: int,
             rating = (rating_el.text or '').strip() if rating_el is not None else None
 
             for channel_id in channel_ids:
-                batch.append({
-                    'channel_id': channel_id,
-                    'title': title,
-                    'description': description,
-                    'sub_title': sub_title,
-                    'start_time': start_dt,
-                    'stop_time': stop_dt,
-                    'category': category,
-                    'rating': rating,
-                })
-                synced += 1
+                winner = winners.get(channel_id)
+                if winner is None:
+                    continue
+                row = {'channel_id': channel_id, 'source_id': source_id, 'title': title,
+                       'description': description, 'sub_title': sub_title,
+                       'start_time': start_dt, 'stop_time': stop_dt,
+                       'category': category, 'rating': rating}
+                if winner == source_id:
+                    active_batch.append(row)
+                    synced += 1
+                else:
+                    alternate_batch.append(row)
+                handled += 1
             elem.clear()
 
-            if synced - last_checkpoint >= 500:
+            if handled - last_checkpoint >= 500:
                 time.sleep(0)  # yield GIL so Flask request threads can run
-                # No upfront total - this is a streaming iterparse, so the phase reports a
-                # bare count rather than claiming an "of N" it can't back up.
-                _set_sync_progress(account.id, 'epg', synced, None)
-                last_checkpoint = synced
+                if progress_id is not None:
+                    _set_sync_progress(progress_id, 'epg', synced, None)
+                last_checkpoint = handled
                 if stop_event is not None and stop_event.is_set():
-                    # Salvage before stopping, exactly as the parse-error path below does:
-                    # `synced` counts rows appended to `batch`, so anything still buffered
-                    # would be reported as imported without ever having been inserted. This
-                    # is also why the cancel is answered here and not per element - a
-                    # checkpoint is a place where the buffer can be made whole.
-                    if batch:
-                        _save_epg_batch_and_commit(batch)
-                        batch = []
+                    # Salvage before stopping: `synced` counts rows appended to the batch,
+                    # so anything still buffered would be reported as imported without
+                    # ever having been inserted.
+                    _flush()
                     raise SyncCancelled(
-                        "the EPG import had already cleared this account's previous guide "
-                        f'data, so the guide holds only the {synced} entries imported '
-                        'before the cancel, until the next successful sync.')
+                        f'the import of EPG source "{source_name}" had already cleared its '
+                        f'previous listings, so it holds only the {synced} entries imported '
+                        'before the cancel, until its next successful refresh.')
 
-            if len(batch) >= batch_size:
-                _save_epg_batch_and_commit(batch)
-                batch = []
+            if len(active_batch) + len(alternate_batch) >= batch_size:
+                _flush()
 
-        if batch:
-            _save_epg_batch_and_commit(batch)
+        _flush()
 
     except (ET.ParseError, DefusedXmlException) as exc:
-        # Salvage first: `synced` counts rows appended to `batch`, so anything still
-        # buffered when the parse died was being counted as imported without ever having
-        # been inserted. Flushing makes the count honest as well as keeping the entries.
-        if batch:
-            _save_epg_batch_and_commit(batch)
-            batch = []
+        _flush()
         detail = mask_creds_in_text(str(exc))
-        log.warning('XMLTV parse error for account %d: %s - partial EPG imported', account.id,
-                    detail)
+        log.warning('XMLTV parse error for EPG source %d (%s): %s - partial EPG imported',
+                    source_id, source_name, detail)
         # Not None, and deliberately not silent: the delete above has already committed,
-        # so this account's guide now holds only what parsed. Reporting SUCCESS here left
-        # a 95%-empty guide looking healthy (dev/changelog/719).
+        # so the source now holds only what parsed (dev/changelog/719).
         truncated_reason = (f'import truncated: the XMLTV feed stopped parsing after {synced} '
-                            f'entries were imported ({detail}). The account\'s old EPG data '
+                            f'entries were imported ({detail}). The source\'s old EPG data '
                             'had already been cleared, so the guide holds only those entries '
                             'until the next successful sync.')
 
-    _set_sync_progress(account.id, 'epg', synced, None)
-    log.info('Imported %d EPG entries for account %d', synced, account.id)
-    return synced, truncated_reason
+    # Alternates are kept only for channels with an active source (§4).
+    orphaned = [ch for ch, (old, new) in changes.items() if new is None and old is not None]
+    for sid in {changes[ch][0] for ch in orphaned}:
+        drop_alternates([ch for ch in orphaned if changes[ch][0] == sid], sid)
+
+    @retry_on_locked()
+    def _refresh_counts_and_commit():
+        for sid in touched_sources:
+            refresh_source_counts(sid, covered_here if sid == source_id else None)
+        db.session.commit()
+
+    _refresh_counts_and_commit()
+
+    if progress_id is not None:
+        _set_sync_progress(progress_id, 'epg', synced, None)
+    log.info('Imported %d EPG entries from EPG source %d (%s)', synced, source_id, source_name)
+    return _ImportResult(synced, truncated_reason, lost)
+
+
+def _report_source_outcome(source_id: int, reason: str | None,
+                           lost_channel_ids: list | None,
+                           began_at: datetime | None = None) -> None:
+    """Write one refresh's outcome onto the source and raise or clear its alerts
+    (DESIGN-epg-sources.md §9.1). The three refresh types are evaluated on every refresh, so
+    whichever one is not this refresh's reason is auto-resolved if it was standing from an
+    earlier one. The coverage alert is evaluated only when the import got as far as
+    resolving winners (`lost_channel_ids` is not None): a refused or failed refresh changed
+    no channel's guide, so it can neither raise nor clear it."""
+    alert_type = _epg_degradation_alert_type(reason)
+    now = datetime.utcnow()
+
+    @retry_on_locked()
+    def _record_status_and_commit():
+        source = db.session.get(EpgSource, source_id)
+        if source is None:
+            return None
+        source.last_refresh_at = max(filter(None, (source.last_refresh_at, now)))
+        source.last_status = _EPG_STATUS_BY_ALERT.get(alert_type, EPG_STATUS_OK)
+        source.last_error = reason
+        if alert_type is None:
+            # When the import STARTED, i.e. read the users' keys: a key saved while it ran
+            # was not in its channel map, and the channel page's "waiting for the next
+            # refresh" compares against this (epg_sources._pending_keys).
+            source.last_success_at = began_at or now
+        db.session.commit()
+        return source.name
+
+    name = _record_status_and_commit()
+    if name is None:
+        return
+
+    fetch_failed = alert_type == 'EPG_SOURCE_FETCH_FAILED'
+    refused = alert_type == 'EPG_SOURCE_COLLAPSE_REFUSED'
+    truncated = alert_type == 'EPG_SOURCE_IMPORT_TRUNCATED'
+    _raise_or_resolve_standing_alert(
+        'EPG_SOURCE_FETCH_FAILED', source=f'epg-source:{source_id}:fetch',
+        active=fetch_failed, title=f'EPG source "{name}": fetch failed',
+        body=(f'{reason} - the source\'s previous listings were kept.' if fetch_failed else ''))
+    _raise_or_resolve_standing_alert(
+        'EPG_SOURCE_COLLAPSE_REFUSED', source=f'epg-source:{source_id}:collapse',
+        active=refused, title=f'EPG source "{name}": import refused',
+        body=reason if refused else '')
+    # Deliberately not folded into the fetch-failure alert: its body promises the previous
+    # listings were kept, and on this path they were already deleted.
+    _raise_or_resolve_standing_alert(
+        'EPG_SOURCE_IMPORT_TRUNCATED', source=f'epg-source:{source_id}:truncated',
+        active=truncated, title=f'EPG source "{name}": import was cut short',
+        body=reason if truncated else '')
+
+    if lost_channel_ids is None:
+        return
+    lost_body = ''
+    if lost_channel_ids:
+        sample = [n for (n,) in db.session.query(Channel.name).filter(
+            Channel.id.in_(list(lost_channel_ids)[:_LOST_CHANNELS_NAMED]))
+            .order_by(Channel.name)]
+        more = len(lost_channel_ids) - len(sample)
+        lost_body = (f'{len(lost_channel_ids):,} channel(s) that had a guide from EPG source '
+                     f'"{name}" have none from any source now: {", ".join(sample)}'
+                     + (f', and {more:,} more' if more > 0 else '') + '.')
+    _raise_or_resolve_standing_alert(
+        'EPG_SOURCE_COVERAGE_LOST', source=f'epg-source:{source_id}:coverage',
+        active=bool(lost_channel_ids),
+        title=f'EPG source "{name}": {len(lost_channel_ids):,} channel(s) lost their guide',
+        body=lost_body)
+
+
+#: How many channel names EPG_SOURCE_COVERAGE_LOST spells out before "and N more".
+_LOST_CHANNELS_NAMED = 10
+_EPG_STATUS_BY_ALERT = {
+    'EPG_SOURCE_FETCH_FAILED': EPG_STATUS_FAILED,
+    'EPG_SOURCE_COLLAPSE_REFUSED': EPG_STATUS_REFUSED,
+    'EPG_SOURCE_IMPORT_TRUNCATED': EPG_STATUS_TRUNCATED,
+}
 
 
 def cleanup_old_epg_entries(app):
-    """Delete EPG entries older than sync.epg_keep_days. 0 = keep forever."""
+    """Delete EPG entries, active and alternate, older than sync.epg_keep_days. 0 = keep
+    forever."""
     with app.app_context():
         cfg = load_config()
         keep_days = cfg.get('sync', {}).get('epg_keep_days', 1)
@@ -2889,15 +3342,21 @@ def cleanup_old_epg_entries(app):
         @retry_on_locked()
         def _delete_and_commit():
             n = EPGEntry.query.filter(EPGEntry.stop_time < cutoff).delete(synchronize_session=False)
-            if n:
-                # The delete is global, so any account's stored count may now be stale.
-                # Recompute in the same transaction (COUNT sees the pending delete) so the
-                # stored value doesn't drift until the account's next full sync. Only a
-                # handful of accounts, once daily - not a per-row hot loop.
+            # Same cutoff for the alternates (DESIGN-epg-sources.md §4), so the comparison
+            # view never shows a source's past that the guide itself has already dropped.
+            n_alt = EpgAlternateEntry.query.filter(
+                EpgAlternateEntry.stop_time < cutoff).delete(synchronize_session=False)
+            if n or n_alt:
+                # The delete is global, so any stored count may now be stale. Recompute in
+                # the same transaction (COUNT sees the pending delete) so the stored value
+                # doesn't drift until the next full sync. Only a handful of accounts and
+                # sources, once daily - not a per-row hot loop.
                 for account in Account.query.all():
                     account.epg_entry_count = EPGEntry.query.join(Channel).filter(
                         Channel.account_id == account.id
                     ).count()
+                for (source_id,) in db.session.query(EpgSource.id).all():
+                    refresh_source_counts(source_id)
             db.session.commit()
             return n
 

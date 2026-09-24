@@ -15,6 +15,7 @@ from app import db
 from app.database import (
     M3uAccount, Channel, ChannelGroup, ChannelGroupMember, ChannelTest,
     Recording, RecordingEvent, RecordingSegment, EPGEntry, OnDemandTestJob,
+    EpgSource, EpgSourceSubscription, EPG_SOURCE_PROVIDER, EPG_SOURCE_URL,
     RECORDING_ABORTED,
 )
 
@@ -33,6 +34,29 @@ def make_account(name='Test M3U', **kw):
     db.session.add(acc)
     db.session.flush()
     return acc
+
+
+def make_epg_source(account, kind=None, url=None, name=None, priority=None):
+    """The EPG source `account` owns of `kind`, created with the account subscribed if it
+    has none - what migration 72 or account creation gives a real account
+    (DESIGN-epg-sources.md §3). `kind` defaults by account type; a url source takes the
+    account's own epg_url unless `url` is given. Idempotent, flushes, does not commit."""
+    if kind is None:
+        kind = EPG_SOURCE_PROVIDER if account.account_type == 'xtream' else EPG_SOURCE_URL
+    src = EpgSource.query.filter_by(owner_account_id=account.id, kind=kind).first()
+    if src is not None:
+        return src
+    src = EpgSource(kind=kind, owner_account_id=account.id,
+                    name=name or f'{account.name} {kind}',
+                    url=(url or account.epg_url) if kind == EPG_SOURCE_URL else None)
+    db.session.add(src)
+    db.session.flush()
+    if priority is None:
+        priority = EpgSourceSubscription.query.filter_by(account_id=account.id).count() + 1
+    db.session.add(EpgSourceSubscription(source_id=src.id, account_id=account.id,
+                                         priority=priority))
+    db.session.flush()
+    return src
 
 
 def make_channel(account, stream_id=None, name='Test Channel', in_guide=False, **kw):
@@ -179,7 +203,7 @@ def make_channel_test(channel, all_null=True, status='FAILED', **kw):
 
 def make_epg_entry(channel, title='Test Program', offset_minutes=0, duration_minutes=60,
                    sub_title=None, description=None, category=None, rating=None,
-                   start_time=None):
+                   start_time=None, source_id=None):
     """One showing. `sub_title`, `description`, `category` and `rating` default to NULL
     deliberately - that is the shape most provider rows have, and it is what the airing
     search's `-word` handling has to survive (tests/test_airing_search_negation.py).
@@ -189,9 +213,14 @@ def make_epg_entry(channel, title='Test Program', offset_minutes=0, duration_min
     a program by channel plus exact start_time (dev/changelog/1055)."""
     start = (start_time if start_time is not None
              else _UTC_NOW() + timedelta(minutes=offset_minutes))
+    # The row carries the source its account owns, when it owns one - what a real import
+    # stamps (DESIGN-epg-sources.md §4). NULL otherwise, as on a pre-sources database.
+    if source_id is None:
+        owned = EpgSource.query.filter_by(owner_account_id=channel.account_id).first()
+        source_id = owned.id if owned is not None else None
     entry = EPGEntry(
         channel_id=channel.id, title=title, sub_title=sub_title, description=description,
-        category=category, rating=rating,
+        category=category, rating=rating, source_id=source_id,
         start_time=start, stop_time=start + timedelta(minutes=duration_minutes))
     db.session.add(entry)
     db.session.flush()

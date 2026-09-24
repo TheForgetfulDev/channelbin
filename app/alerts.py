@@ -34,6 +34,15 @@ STORAGE_PATH_UNUSABLE = 'STORAGE_PATH_UNUSABLE'
 #: four above: app/toolchain.py raises and dismisses it by type, one row per binary.
 EXTERNAL_TOOL_MISSING = 'EXTERNAL_TOOL_MISSING'
 
+#: The APScheduler loop thread exited, so nothing scheduled fires again until the app
+#: restarts. Named because app/scheduler.py raises it from the dying thread and dismisses
+#: it by type when the next start brings the loop back (dev/changelog/1114).
+SCHEDULER_STOPPED = 'SCHEDULER_STOPPED'
+#: One pass of that loop failed after handing jobs to workers and the loop carried on.
+#: Named because the raise site is a scheduler subclass whose reader should not have to
+#: find the literal (dev/changelog/1114).
+SCHEDULER_PASS_FAILED = 'SCHEDULER_PASS_FAILED'
+
 #: Types nothing raises any more, kept in ALERT_TYPES below purely so the rows already in
 #: the database still render with a label.
 #:
@@ -43,6 +52,9 @@ EXTERNAL_TOOL_MISSING = 'EXTERNAL_TOOL_MISSING'
 #: recording, account or page it concerns - which is both quieter and more useful, since it
 #: is where somebody asking the question already looks. In the week measured before this
 #: changed, these twelve were 189 of 198 alerts raised (dev/changelog/928).
+#:
+#: The three SYNC_EPG_* types are the exception: still real problems, retired because the
+#: per-source EPG_SOURCE_* types replaced them (dev/changelog/1101).
 #:
 #: Adding a type here means its raise sites go at the same time; ALERT_TYPES keeps the entry.
 #: Enforced by tests/test_retired_alert_types.py, which fails on a create_alert() of any of
@@ -60,6 +72,9 @@ RETIRED_ALERT_TYPES = frozenset({
     'HEALTH_CHECK_COMPLETE',
     'JOB_SKIPPED',
     'CHANNEL_HIDE_RULES_NOT_APPLIED',
+    'SYNC_EPG_FETCH_FAILED',
+    'SYNC_EPG_COLLAPSE_REFUSED',
+    'SYNC_EPG_IMPORT_TRUNCATED',
 })
 
 # Registry of all known alert types.
@@ -125,16 +140,42 @@ ALERT_TYPES = {
     # standing row but has no dismiss branch, because nothing observes the URLs going back
     # to what they were. A drift that has been dealt with is dismissed by hand.
     'PROVIDER_URLS_CHANGED': {'label': 'Provider Stream URLs Changed', 'severity': 'WARN'},
-    'SYNC_EPG_FETCH_FAILED': {
-        'label': 'EPG Fetch Failed', 'severity': 'WARN', 'self_clearing': True},
+    # Retired: the three per-account EPG types became the per-source EPG_SOURCE_* types
+    # below, so a provider feed and a URL feed fail the same way (DESIGN-epg-sources.md §9,
+    # dev/changelog/1101). Kept so their rows still render.
+    'SYNC_EPG_FETCH_FAILED': {'label': 'EPG Fetch Failed', 'severity': 'WARN'},
     'SYNC_EPG_COLLAPSE_REFUSED': {
-        'label': 'EPG Import Refused (Collapse Guard)', 'severity': 'WARN', 'self_clearing': True},
-    # Distinct from the two above because the old EPG is already gone by the time this
-    # fires: the delete commits before the parse loop, so their "previous EPG data was
-    # kept" wording would be false here (DESIGN-sync-resilience.md §3).
+        'label': 'EPG Import Refused (Collapse Guard)', 'severity': 'WARN'},
     'SYNC_EPG_IMPORT_TRUNCATED': {
-        'label': 'EPG Import Cut Short (Truncated Feed)', 'severity': 'WARN',
+        'label': 'EPG Import Cut Short (Truncated Feed)', 'severity': 'WARN'},
+    # One EPG source's refresh degraded (DESIGN-epg-sources.md §9.1). Keyed on the source,
+    # so a feed several accounts read raises once, and each clears on that source's next
+    # healthy refresh.
+    'EPG_SOURCE_FETCH_FAILED': {
+        'label': 'EPG Source Fetch Failed', 'severity': 'WARN', 'self_clearing': True},
+    'EPG_SOURCE_COLLAPSE_REFUSED': {
+        'label': 'EPG Source Import Refused (Collapse Guard)', 'severity': 'WARN',
         'self_clearing': True},
+    # Distinct from the two above because the source's old listings are already gone by
+    # the time this fires: the delete commits before the parse loop, so their "previous
+    # listings were kept" wording would be false here (DESIGN-sync-resilience.md §3).
+    'EPG_SOURCE_IMPORT_TRUNCATED': {
+        'label': 'EPG Source Import Cut Short (Truncated Feed)', 'severity': 'WARN',
+        'self_clearing': True},
+    # An import left channels that had a guide with none from any source. The one surface
+    # that sees a feed landing just above the collapse threshold: the guard counts rows,
+    # this names channels (DESIGN-epg-sources.md §9.1).
+    'EPG_SOURCE_COVERAGE_LOST': {
+        'label': 'Channels Lost Their Guide', 'severity': 'WARN', 'self_clearing': True},
+    # A source on its own refresh interval with no good refresh in twice that interval. A
+    # source riding its owner's sync is covered by SYNC_ACCOUNT_OVERDUE instead
+    # (DESIGN-epg-sources.md §12.1).
+    'EPG_SOURCE_STALE': {
+        'label': 'EPG Source Stale', 'severity': 'WARN', 'self_clearing': True},
+    # A source other accounts read was deleted, by hand or with its owner. Not
+    # self-clearing: nothing will ever refresh a source that is gone, so this is the one
+    # place its readers' lost channels are named (DESIGN-epg-sources.md §9.5).
+    'EPG_SOURCE_REMOVED': {'label': 'EPG Source Removed', 'severity': 'INFO'},
     'SYNC_FEED_SHRUNK': {
         'label': 'Provider Feed Shrunk', 'severity': 'WARN', 'self_clearing': True},
     'SYNC_LIVE_CLASSIFY_UNAVAILABLE': {
@@ -191,6 +232,12 @@ ALERT_TYPES = {
     'CONCATENATION_FAILED': {'label': 'Join Failed', 'severity': 'ERROR'},
     'CONFIG_FILE_MISSING': {'label': 'Config File Missing', 'severity': 'CRIT'},
     'HEALTH_CHECK_COMPLETE': {'label': 'Health Check Completed', 'severity': 'INFO'},
+    # A repeating health check whose row has no hour or minute, so it was not scheduled
+    # and will never run on its own (dev/changelog/1110). Registering it anyway would fire
+    # it every second. Not self_clearing: the delete path cancels a job's schedule inside
+    # its caller's commit unit, where an alert dismiss would commit that unit early.
+    'HEALTH_CHECK_SCHEDULE_INVALID': {
+        'label': 'Health Check Has No Time Set', 'severity': 'WARN'},
     'HEALTH_CHECK_WINDOW': {
         'label': 'Maintenance Window Closed With Work Left Over', 'severity': 'WARN',
         'self_clearing': True},
@@ -210,6 +257,17 @@ ALERT_TYPES = {
         'self_clearing': True},
     'SECOND_INSTANCE_DETECTED': {
         'label': 'Second Live Instance Detected', 'severity': 'CRIT'},
+    # The one thread every scheduled recording, sync and window check depends on has
+    # exited. Self-clearing because the only thing that ends the condition is the next
+    # start, and init_scheduler() dismisses the row there (dev/changelog/1114).
+    'SCHEDULER_STOPPED': {
+        'label': 'Scheduler Stopped', 'severity': 'ERROR', 'self_clearing': True},
+    # A scheduler pass failed between dispatching its jobs and writing their next run
+    # times, and the loop kept going. Not self-clearing: it is an event, not a state, and
+    # a job handed off just before the failure may have run twice - that is for a person
+    # to look at and dismiss.
+    'SCHEDULER_PASS_FAILED': {
+        'label': 'Scheduler Pass Failed', 'severity': 'ERROR'},
     'RECORDING_RESUME_REFUSED': {
         'label': 'Recording Resume Refused (Segment Still Growing)', 'severity': 'ERROR'},
     # WARN, not ERROR: nothing in the app malfunctioned - it was not running. The

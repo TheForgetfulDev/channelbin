@@ -628,7 +628,7 @@ def _restart_blocking_rows(busy):
     Every row here is synthetic except a recording's - 'id' means "recording id" to the
     modal, so anything else sends None rather than an id from another table.
     """
-    from ..database import OnDemandTestJob, ChannelTest, Account
+    from ..database import OnDemandTestJob, ChannelTest, Account, EpgSource
     from ..search_index import rebuilding_index_names
 
     rows = [{
@@ -681,6 +681,18 @@ def _restart_blocking_rows(busy):
         'status': 'SYNCING',
         'label': f'Account "{acc.name}" is syncing',
     } for acc in Account.query.filter_by(status='SYNCING').order_by(Account.id).all()]
+
+    # A source refreshing outside its owner's sync (tools/check_busy.py::
+    # refreshing_epg_sources for why it blocks). One inside a sync is named by the account.
+    rows += [{
+        'id': None,
+        'name': src.name,
+        'status': 'REFRESHING',
+        'label': f'EPG source "{src.name}" is refreshing',
+    } for src in EpgSource.query.join(Account, Account.id == EpgSource.owner_account_id)
+                              .filter(EpgSource.refresh_started_at.isnot(None),
+                                      Account.status != 'SYNCING')
+                              .order_by(EpgSource.id).all()]
 
     return rows
 

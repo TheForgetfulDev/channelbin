@@ -13,6 +13,7 @@ from datetime import datetime, timedelta
 
 from sqlalchemy import create_engine
 from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.schedulers.base import STATE_STOPPED
 from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
 from apscheduler.jobstores.base import JobLookupError
 
@@ -58,6 +59,119 @@ def remove_job_if_exists(job_id) -> bool:
         return True
     except JobLookupError:
         return False
+
+
+# APScheduler 3.11.2's _process_jobs() guards only its get_due_jobs() read. The jobstore
+# write it makes after handing a job to a worker (update_job for a recurring job,
+# remove_job for a one-shot) is unguarded, and _main_loop() has no try around
+# _process_jobs(), so any exception there ends the loop thread while scheduler.running
+# stays True - only shutdown() clears it. Measured on this box with the app's own pragmas:
+# a write lock held 14s across that bookkeeping raised "database is locked" on the DELETE,
+# left running=True with the thread dead, and a job registered afterwards never ran
+# (dev/changelog/1114). The two subclasses below answer that in layers: the store retries
+# the write the way every other jobstore write in this module already does, and the
+# scheduler keeps its loop alive through whatever still gets past that, and says so. Both
+# override private members, which is one of the reasons APScheduler is pinned <4.0
+# (CLAUDE.md §Environment); the test harness leans on _executors the same way.
+
+class _RetryingJobStore(SQLAlchemyJobStore):
+    """The jobstore, with the two writes APScheduler makes on its own retried on lock
+    contention past busy_timeout - the same rule _add_job/_remove_job apply to ours."""
+
+    @retry_on_locked(rollback_session=False)
+    def update_job(self, job):
+        super().update_job(job)
+
+    @retry_on_locked(rollback_session=False)
+    def remove_job(self, job_id):
+        super().remove_job(job_id)
+
+
+class _GuardedScheduler(BackgroundScheduler):
+    """BackgroundScheduler whose loop survives a failed pass and reports a dead one.
+
+    A pass that fails after dispatching is retried on the jobstore retry interval, the
+    way APScheduler already retries a failed get_due_jobs(). The write that failed was
+    never made, so the next pass sees the same due jobs: a job handed to a worker just
+    before the failure can run a second time. That is accepted and said in the alert -
+    a recording start is protected by its ownership claim (dev/changelog/987), a stop of
+    a recording already stopped is a no-op, and a sync still running is refused by
+    admission - because the alternative is the thread dying and nothing ever firing again.
+    """
+
+    def _process_jobs(self):
+        try:
+            return super()._process_jobs()
+        except Exception as exc:
+            if self.state == STATE_STOPPED:
+                # shutdown() flips the state before it takes the jobstore lock, so a pass
+                # already past its dispatch finds remove_job() looking only at pending jobs
+                # and raising JobLookupError. Nothing is lost: the loop is ending anyway.
+                log.info('Scheduler pass interrupted by shutdown after dispatching (%s: %s)',
+                         type(exc).__name__, exc)
+                return None
+            log.error('Scheduler pass failed after dispatching its jobs; the loop continues '
+                      'and retries in %ss', self.jobstore_retry_interval,
+                      exc_info=True, extra={'already_alerted': True})
+            _alert_from_scheduler_thread(
+                'SCHEDULER_PASS_FAILED',
+                title='A scheduler pass failed after starting its jobs',
+                body=(f'The scheduler could not record the next run times after starting '
+                      f'the jobs that were due ({type(exc).__name__}: {exc}). The loop is '
+                      f'still running and will try again in {self.jobstore_retry_interval}s. '
+                      'A job that started just before the failure may run a second time on '
+                      'that retry: a recording start or stop is safe to repeat, and a sync '
+                      'that is still running is refused, but check the jobs that were due '
+                      'at this time.'))
+            return self.jobstore_retry_interval
+
+    def _main_loop(self):
+        try:
+            super()._main_loop()
+        except BaseException:
+            log.critical('The scheduler thread has exited; nothing scheduled will fire until '
+                         'ChannelBin restarts', exc_info=True, extra={'already_alerted': True})
+            _alert_from_scheduler_thread(
+                'SCHEDULER_STOPPED',
+                title='The scheduler has stopped',
+                body=('The scheduler thread exited on an error. Scheduled recordings will '
+                      'not start or stop, and account syncs, EPG refreshes, health check '
+                      'windows and the nightly jobs will not run, until ChannelBin restarts. '
+                      'The error is in the log. This alert clears itself when the scheduler '
+                      'starts again.'),
+                source='scheduler')
+            raise
+
+
+def _alert_from_scheduler_thread(alert_type, title, body, source=None):
+    """Raise an alert from the loop thread, which has no app context of its own.
+
+    Best-effort by design: this runs on the one thread the app cannot afford to lose to
+    a second failure, so a failed alert write is logged and nothing more.
+    """
+    if _app is None:
+        return
+    try:
+        with _app.app_context():
+            from .alerts import create_alert
+            create_alert(alert_type, title=title, body=body, source=source)
+    except Exception:
+        log.warning('Could not raise %s from the scheduler thread', alert_type, exc_info=True)
+
+
+def scheduler_is_live() -> bool:
+    """True only if the scheduler exists, was started, and its loop thread is alive.
+
+    scheduler.running is a state flag that only shutdown() clears, so it stays True after
+    the loop thread has died. The thread is the fact; this is what readiness and the
+    dashboard ask (dev/changelog/1114). After a clean shutdown() the attribute is deleted
+    and falls back to the class-level None, which reads as not live, as it should.
+    """
+    scheduler = _scheduler
+    if scheduler is None or not scheduler.running:
+        return False
+    thread = getattr(scheduler, '_thread', None)
+    return thread is not None and thread.is_alive()
 
 
 def _pid_is_alive(pid: int) -> bool:
@@ -171,9 +285,9 @@ def init_scheduler(app):
         jobstore_engine,
         cache_size_mb=app.config['SQLITE_CACHE_SIZE_MB'],
         wal_size_limit_mb=app.config['SQLITE_WAL_SIZE_LIMIT_MB'])
-    job_store = SQLAlchemyJobStore(engine=jobstore_engine)
+    job_store = _RetryingJobStore(engine=jobstore_engine)
 
-    _scheduler = BackgroundScheduler(
+    _scheduler = _GuardedScheduler(
         jobstores={'default': job_store},
         timezone='UTC',
         # misfire_grace_time: None = always fire missed jobs, no ceiling
@@ -182,8 +296,15 @@ def init_scheduler(app):
     _scheduler.start()
     log.info('APScheduler started')
 
+    # The loop is back, which is the only thing that ends the condition a standing
+    # SCHEDULER_STOPPED row describes (the clearing path its self_clearing flag promises).
+    with app.app_context():
+        from .alerts import SCHEDULER_STOPPED, dismiss_open_alerts
+        dismiss_open_alerts(SCHEDULER_STOPPED, 'scheduler')
+
     resume_in_progress_recordings(app)
     schedule_all_account_syncs(app)
+    schedule_all_epg_source_refreshes(app)
     schedule_config_backup(app)
     schedule_recording_retention(app)
     schedule_db_maintenance(app)
@@ -486,6 +607,20 @@ def resume_in_progress_recordings(app):
                 db.session.commit()
 
         _reset_stuck_accounts()
+
+        @retry_on_locked()
+        def _clear_stale_source_refreshes():
+            # Same reasoning as the stuck accounts above: no refresh thread survives a
+            # restart, so every stamp present now is orphaned, and one left set would make
+            # the restart guard refuse forever (tools/check_busy.py).
+            from .database import EpgSource
+            n = EpgSource.query.filter(EpgSource.refresh_started_at.isnot(None)).update(
+                {'refresh_started_at': None}, synchronize_session=False)
+            if n:
+                log.info('Cleared %d EPG source refresh(es) interrupted by the restart', n)
+            db.session.commit()
+
+        _clear_stale_source_refreshes()
 
         @retry_on_locked()
         def _clear_stale_postprocess_waits():
@@ -922,6 +1057,10 @@ def schedule_on_demand_job(job):
 
     aps_job_id = f'od_job_{job.id}'
 
+    if job.recurring and (job.recur_hour is None or job.recur_minute is None):
+        _refuse_timeless_recurring_job(job, aps_job_id)
+        return None, None
+
     if job.recurring:
         from .tz_utils import get_display_tz_name
         tz_name = get_display_tz_name()
@@ -959,13 +1098,40 @@ def schedule_on_demand_job(job):
     return aps_job_id, next_run_utc
 
 
+def _refuse_timeless_recurring_job(job, aps_job_id):
+    """Say loudly that a recurring exact-time job has no hour or minute, instead of
+    registering it. APScheduler reads CronTrigger(hour=None, minute=None) as every field a
+    wildcard and fires it every second (dev/docs/BUGS.md 2026-09-23 @ 08:15:12 PM). The UI
+    always sets a time, so only a migrated or hand-edited row gets here."""
+    from .alerts import create_alert, has_open_alert
+    log.warning('OnDemandTestJob %d (%r) repeats but has no hour/minute set - not scheduled',
+                job.id, job.name)
+    try:
+        if has_open_alert('HEALTH_CHECK_SCHEDULE_INVALID', aps_job_id):
+            return
+        create_alert(
+            'HEALTH_CHECK_SCHEDULE_INVALID',
+            f'Health check "{job.name}" has no time set',
+            body=('It is set to repeat, but has no time of day to run at, so it was not '
+                  'scheduled and will not run on its own. Open the health check and set '
+                  'its time.'),
+            source=aps_job_id)
+    except Exception:
+        # The refusal above already stands; a failed alert write must not turn a startup
+        # sweep or a route into a crash (CLAUDE.md, product principles corollary).
+        log.exception('Could not raise the no-time alert for OnDemandTestJob %d', job.id)
+
+
 def get_next_on_demand_run(job):
     """Return the next naive-UTC fire time for a job's registered APScheduler job, or None.
 
     Returns None for a window job (recur_use_window=True) - it has no registered
     APScheduler job by design. Callers that need an accurate next-run for a window job too
-    must use next_on_demand_run_for_job() instead."""
-    if not job.scheduler_job_id:
+    must use next_on_demand_run_for_job() instead.
+
+    None when there is no scheduler either, as remove_job_if_exists() treats it: a run that
+    finishes after shutdown must still land its terminal status, not crash its thread."""
+    if not job.scheduler_job_id or _scheduler is None:
         return None
     aps_job = _scheduler.get_job(job.scheduler_job_id)
     if aps_job is None or aps_job.next_run_time is None:
@@ -1210,6 +1376,141 @@ def schedule_all_account_syncs(app, *, force_reschedule_defaults: bool = False):
         schedule_account_sync(app, acc.id, force_reschedule=force)
 
 
+# ── EPG source refresh jobs (DESIGN-epg-sources.md §8.1) ────────────────────────────
+#
+# A url source with its own refresh interval gets its own job; one with none rides its owner
+# account's sync and has no job here. Only url sources have an interval (dev/changelog/1104).
+
+def epg_source_job_id(source_id: int) -> str:
+    return f'epg_source_refresh_{source_id}'
+
+
+def epg_source_retry_job_id(source_id: int) -> str:
+    """The one-shot retry a refused refresh queues. Public so every teardown path removes
+    it with the interval job."""
+    return f'epg_source_refresh_retry_{source_id}'
+
+
+def remove_epg_source_jobs(source_id: int) -> None:
+    remove_job_if_exists(epg_source_job_id(source_id))
+    remove_job_if_exists(epg_source_retry_job_id(source_id))
+
+
+def schedule_epg_source_refresh(app, source_id: int, *, force_reschedule: bool = False,
+                                first_run: datetime | None = None):
+    """Register, move or remove a source's interval job to match the row.
+
+    The next run is one interval after the source's last refresh attempt, or `first_run`
+    when the caller has just started a refresh itself (a new or re-pointed source), so the
+    job does not fetch the file again a minute later. Spaced from the account syncs and the
+    other source jobs the same way the sync jobs are spaced from each other."""
+    if _scheduler is None:
+        log.warning('No scheduler running - refresh job for EPG source %d was not '
+                    '(re)scheduled.', source_id)
+        return
+    job_id = epg_source_job_id(source_id)
+    with app.app_context():
+        from . import db
+        from .database import EpgSource, EPG_SOURCE_URL
+        source = db.session.get(EpgSource, source_id)
+        if (source is None or source.kind != EPG_SOURCE_URL or not source.enabled
+                or not source.refresh_interval_hours):
+            remove_epg_source_jobs(source_id)
+            return
+        interval = source.refresh_interval_hours
+        existing = _scheduler.get_job(job_id)
+        if (existing is not None and existing.next_run_time is not None
+                and not force_reschedule and first_run is None):
+            td = getattr(existing.trigger, 'interval', None)
+            if td is not None and int(td.total_seconds() / 3600) == interval:
+                return
+        now = datetime.utcnow()
+        candidate = first_run
+        if candidate is None and source.last_refresh_at is not None:
+            candidate = source.last_refresh_at + timedelta(hours=interval)
+        if candidate is None or candidate <= now:
+            candidate = now + timedelta(minutes=1)
+        others = [to_naive_utc(j.next_run_time) for j in _scheduler.get_jobs()
+                  if j.id != job_id and j.next_run_time is not None
+                  and re.match(r'^(account_sync|epg_source_refresh)_\d+$', j.id)]
+        candidate = _find_safe_next_run(candidate, others)
+        _add_job(func=_epg_source_refresh_job, trigger='interval', hours=interval, id=job_id,
+                 replace_existing=True, next_run_time=candidate,
+                 kwargs={'source_id': source_id})
+        log.info('Refresh job scheduled for EPG source %d (%s) every %dh, next run at %s',
+                 source_id, source.name, interval, candidate)
+
+
+def schedule_all_epg_source_refreshes(app):
+    """Register every url source's job at startup, and drop jobs whose source is gone."""
+    with app.app_context():
+        from . import db
+        from .database import EpgSource
+        ids = [sid for (sid,) in db.session.query(EpgSource.id)]
+    for job in _scheduler.get_jobs():
+        m = re.match(r'^epg_source_refresh(?:_retry)?_(\d+)$', job.id)
+        if m and int(m.group(1)) not in ids:
+            remove_job_if_exists(job.id)
+    for sid in ids:
+        schedule_epg_source_refresh(app, sid)
+
+
+def _epg_source_refresh_job(source_id: int, retry: bool = False):
+    """A source's scheduled refresh, or the retry a refused one queued. A retry that runs
+    re-anchors the interval on itself, for the reason _reanchor_account_sync does
+    (dev/changelog/1103): otherwise it collides with the same account sync every time."""
+    from .accounts import refresh_source_standalone
+    with _app.app_context():
+        from . import db
+        from .database import EpgSource
+        source = db.session.get(EpgSource, source_id)
+        if source is None or not source.enabled:
+            return
+    try:
+        outcome = refresh_source_standalone(_app, source_id)
+    except Exception:
+        log.exception('Refresh of EPG source %d failed', source_id)
+        outcome = None
+    if isinstance(outcome, admission.Refusal):
+        defer_source_refresh(source_id, outcome.reason)
+    elif retry:
+        schedule_epg_source_refresh(_app, source_id, force_reschedule=True)
+
+
+def defer_source_refresh(source_id: int, reason: str) -> datetime | None:
+    """Queue one retry of a refused source refresh, `sync.tester_defer_retry_minutes` out -
+    the same knob and the same one-shot shape as a deferred account sync, and never a
+    nudge of the interval trigger. Returns when it will run, or None with no scheduler.
+    The pending retry is what the Sources card and /jobs show; the reason goes to the log."""
+    from .accounts import update_source_stale_alert
+    from .config import load_config
+    run_date = None
+    if _scheduler is not None:
+        minutes = load_config().get('sync', {}).get('tester_defer_retry_minutes', 20) or 20
+        run_date = datetime.utcnow() + timedelta(minutes=minutes)
+        _add_job(func=_epg_source_refresh_job, trigger='date', run_date=run_date,
+                 id=epg_source_retry_job_id(source_id), replace_existing=True,
+                 kwargs={'source_id': source_id, 'retry': True})
+    log.info('Deferred refresh of EPG source %d - %s; retry at %s', source_id, reason, run_date)
+    with _app.app_context():
+        update_source_stale_alert(source_id)
+    return run_date
+
+
+def epg_source_schedule() -> dict:
+    """{source_id: {'next': ..., 'retry': ...}} naive UTC, read off the jobs that will
+    really fire. Empty with no scheduler."""
+    out: dict = {}
+    if _scheduler is None:
+        return out
+    for job in _scheduler.get_jobs():
+        m = re.match(r'^epg_source_refresh(_retry)?_(\d+)$', job.id)
+        if m and job.next_run_time is not None:
+            out.setdefault(int(m.group(2)), {})['retry' if m.group(1) else 'next'] = \
+                to_naive_utc(job.next_run_time)
+    return out
+
+
 # ── Deferred occurrences ────────────────────────────────────────────────────────────
 #
 # A background job that yields to a recording used to simply return, dropping the occurrence
@@ -1398,7 +1699,9 @@ def _reserved_sync_windows(exclude_account_id: int) -> list:
     return reserved
 
 
-def _account_sync_job(account_id: int):
+def _account_sync_job(account_id: int, retry: bool = False):
+    """`retry` is True on the one-shot a deferral queued. When that run actually happens,
+    the account's regular schedule is re-anchored on it (_reanchor_account_sync)."""
     with _app.app_context():
         from . import db
         from .config import load_config
@@ -1444,13 +1747,49 @@ def _account_sync_job(account_id: int):
         # check here. That is what this used to be, and it lost the race it was written to
         # win: the check ran in the 4ms window before the tester registered itself
         # (app/admission.py, dev/changelog/679).
+        ran_at = datetime.utcnow()
         try:
             outcome = sync_account(_app, account_id)
         except Exception as exc:
             log.error('Account sync failed for account %d: %s', account_id, exc)
-            return
+            outcome = None
         if isinstance(outcome, admission.Refusal):
             _defer_sync_for_contention(account_id, account.name, sync_cfg, outcome.reason)
+        elif retry:
+            _reanchor_account_sync(account_id, ran_at)
+
+
+def _reanchor_account_sync(account_id: int, ran_at: datetime):
+    """Move an account's regular sync to one interval after a deferred sync actually ran.
+
+    Without this the interval trigger keeps its original phase, so an account deferred behind
+    another account's sync on the same schedule collides with it again on every occurrence -
+    a skip, a retry 20 minutes later, and a skip record in the history every other run,
+    forever (dev/docs/BUGS.md 2026-09-23 @ 09:15:49 AM). Done when the retry RUNS, never when
+    it is queued: a deferral must not move the schedule for a sync that has not happened.
+    schedule_account_sync() seeds the trigger from next_sync_at and spaces it from the other
+    accounts' jobs, so this only has to say where the next run belongs."""
+    from . import db
+    from .config import load_config
+    from .database import Account
+
+    interval = None
+
+    @retry_on_locked()
+    def _set_next_sync_and_commit():
+        nonlocal interval
+        account = db.session.get(Account, account_id)
+        if account is None or not account.sync_enabled:
+            return
+        interval = _get_account_interval(account, load_config())
+        account.next_sync_at = ran_at + timedelta(hours=interval)
+        db.session.commit()
+
+    _set_next_sync_and_commit()
+    if interval is not None:
+        schedule_account_sync(_app, account_id, force_reschedule=True)
+        log.info('Sync schedule for account %d re-anchored on its deferred run: every %dh from %s',
+                 account_id, interval, ran_at)
 
     # EPG cleanup is no longer piggybacked here - it runs from the visible daily
     # db_maintenance_daily job (schedule_db_maintenance) so it's controllable on /jobs.
@@ -1473,8 +1812,7 @@ def _defer_sync_past_recording(account_id: int, account_name: str, sync_cfg: dic
     scheduled in the meantime simply defers it again rather than forcing a sync through.
 
     Same one-shot DateTrigger and same job id as the contention deferral above, for the same
-    APScheduler 3.x reason (never modify_job() on the interval trigger, which would drift every
-    later fire). Sharing the id means `replace_existing` collapses a contention deferral and a
+    reason (the interval trigger is not touched until the retry runs). Sharing the id means `replace_existing` collapses a contention deferral and a
     recording deferral into one pending retry, /jobs already renders it, and the teardown paths
     in schedule_account_sync() already remove it.
     """
@@ -1517,7 +1855,7 @@ def _defer_sync_past_recording(account_id: int, account_name: str, sync_cfg: dic
             run_date=run_date,
             id=sync_retry_job_id(account_id),
             replace_existing=True,
-            kwargs={'account_id': account_id},
+            kwargs={'account_id': account_id, 'retry': True},
         )
         record_skipped_sync(
             account_id,
@@ -1551,8 +1889,9 @@ def _defer_sync_for_contention(account_id: int, account_name: str, sync_cfg: dic
         return
 
     # A one-shot DateTrigger, NOT modify_job() on the interval trigger: APScheduler 3.x
-    # recomputes every subsequent interval fire from the modified next_run_time, so
-    # nudging it here would permanently drift the account's sync schedule.
+    # recomputes every later fire from a modified next_run_time, and moving the schedule
+    # for a sync that has not happened yet is wrong - it moves when the retry actually
+    # runs (_reanchor_account_sync).
     # replace_existing collapses repeated deferrals into a single pending retry, and the
     # retry re-enters _account_sync_job, so all guards (recordings, and admission for the
     # tester and other syncs) re-run fresh.
@@ -1563,7 +1902,7 @@ def _defer_sync_for_contention(account_id: int, account_name: str, sync_cfg: dic
         run_date=run_date,
         id=sync_retry_job_id(account_id),
         replace_existing=True,
-        kwargs={'account_id': account_id},
+        kwargs={'account_id': account_id, 'retry': True},
     )
     _emit_job_skipped(
         job_id, f'Sync: {account_name}',

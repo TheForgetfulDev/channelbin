@@ -320,6 +320,7 @@ class DoSyncLifecycleWiringTests(unittest.TestCase):
             if url == M3U_URL:
                 resp = mock.Mock()
                 resp.raise_for_status = mock.Mock()
+                resp.status_code = 200
                 resp.content = _playlist(channel_ids).encode('utf-8')
                 return resp
             raise AssertionError(f'unexpected requests.get call: {url}')

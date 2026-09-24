@@ -10,7 +10,8 @@ from werkzeug.datastructures import MultiDict
 
 from .. import db
 from ..database import (
-    Account, Channel, ChannelGroup, ChannelGroupMember, EPGEntry, Recording,
+    Account, Channel, ChannelGroup, ChannelGroupMember, EPGEntry, EpgAlternateEntry,
+    EpgChannelKey, Recording,
     ChannelTest, ChannelEvent, OnDemandTestJob, Tag,
     RecordingProfile, HealthCheckProfile,
     CHANNEL_ADDED_TO_GUIDE, CHANNEL_REMOVED_FROM_GUIDE, CHANNEL_HEALTH_OVERRIDE_CHANGED,
@@ -589,7 +590,7 @@ def _health_checks_for_channel(channel):
 # (dev/changelog/341 - mockup 16's order). The header, status bar and the Recovery
 # card are deliberately NOT in this set: they are alert-style chrome that must always
 # render, the same rule the group page applies to its warning banners.
-CHANNEL_DETAIL_SECTIONS = ('health', 'settings', 'whatson', 'timeline', 'url',
+CHANNEL_DETAIL_SECTIONS = ('health', 'settings', 'whatson', 'guide', 'timeline', 'url',
                            'recordings', 'tests')
 
 # The "What's On" card is the TV Guide grid embedded as a single row, so it shares the
@@ -858,6 +859,12 @@ def channel_detail(channel_id):
     from ..health_recompute import rollback_preview
     health_rollback = rollback_preview(channel, cfg)
 
+    # Where this channel's guide comes from and why (DESIGN-epg-sources.md §9.3). A fixed
+    # handful of queries whatever the number of sources.
+    from ..epg_sources import channel_guide_view
+    guide_source = channel_guide_view(
+        channel, cfg.get('sync', {}).get('epg_case_sensitive_matching', False))
+
     return render_template('channels/detail.html',
         channel=channel,
         next_sync_at=(next_sync_map([channel.account])[channel.account_id]
@@ -874,6 +881,7 @@ def channel_detail(channel_id):
         repoint_candidate=repoint_candidate,
         duplicate_channels=duplicate_channels,
         total_epg_count=total_epg_count,
+        guide_source=guide_source,
         chan_epg_search_url=chan_epg_search_url,
         test_history=test_history,
         test_pagination=test_pagination,
@@ -1281,6 +1289,10 @@ def missing_delete():
                 ChannelEvent.channel_id.in_(chunk)).delete(synchronize_session=False)
             db.session.query(EPGEntry).filter(
                 EPGEntry.channel_id.in_(chunk)).delete(synchronize_session=False)
+            db.session.query(EpgAlternateEntry).filter(
+                EpgAlternateEntry.channel_id.in_(chunk)).delete(synchronize_session=False)
+            db.session.query(EpgChannelKey).filter(
+                EpgChannelKey.channel_id.in_(chunk)).delete(synchronize_session=False)
             db.session.query(Channel).filter(
                 Channel.id.in_(chunk)).delete(synchronize_session=False)
 
@@ -1379,6 +1391,118 @@ def update_channel_notes(channel_id):
     channel.notes = (request.get_json(silent=True) or {}).get('notes', '').strip() or None
     db.session.commit()
     return jsonify({'success': True, 'notes': channel.notes or ''})
+
+
+#: EpgChannelKey.key's column width.
+_EPG_KEY_MAX = 255
+
+
+def _subscribed_source(channel, raw_source_id):
+    """The EpgSource `raw_source_id` names, if the channel's account reads it - a key is
+    only meaningful in a file the channel is matched against. None otherwise."""
+    from ..database import EpgSource, EpgSourceSubscription
+    try:
+        source_id = int(raw_source_id)
+    except (TypeError, ValueError):
+        return None
+    if EpgSourceSubscription.query.filter_by(source_id=source_id,
+                                             account_id=channel.account_id).first() is None:
+        return None
+    return db.session.get(EpgSource, source_id)
+
+
+@channels_bp.route('/api/channels/<int:channel_id>/epg-key', methods=['POST'])
+def set_channel_epg_key(channel_id):
+    """Body {source_id, key}; a blank key clears it. The channel page's Set key / Clear key
+    (DESIGN-epg-sources.md §6.1, §9.3), through the one writer."""
+    from ..epg_sources import set_channel_key
+    data = request.get_json(silent=True) or {}
+    key = data.get('key')
+    if key is not None and not isinstance(key, str):
+        return jsonify({'error': 'key must be text'}), 400
+    key = (key or '').strip()
+    if len(key) > _EPG_KEY_MAX:
+        return jsonify({'error': f'An EPG key is at most {_EPG_KEY_MAX} characters.'}), 400
+    case_sensitive = load_config().get('sync', {}).get('epg_case_sensitive_matching', False)
+
+    @retry_on_locked()
+    def _set_and_commit():
+        channel = db.session.get(Channel, channel_id)
+        if channel is None:
+            return 404, 'Channel not found'
+        source = _subscribed_source(channel, data.get('source_id'))
+        if source is None:
+            return 400, "That EPG source isn't one this channel's account reads."
+        change = set_channel_key(channel, source, key, case_sensitive=case_sensitive)
+        db.session.commit()
+        return 200, change
+
+    status, result = _set_and_commit()
+    if status != 200:
+        return jsonify({'error': result}), status
+    if result is None:
+        return jsonify({'success': True, 'changed': False, 'message': 'Nothing changed.'})
+    return jsonify({'success': True, 'changed': True, 'outcome': result.outcome,
+                    'message': result.detail})
+
+
+@channels_bp.route('/api/channels/<int:channel_id>/epg-source-override', methods=['POST'])
+def set_channel_epg_source_override(channel_id):
+    """Body {source_id}; null clears it. The channel page's Use this source / Clear
+    override (DESIGN-epg-sources.md §6.2, §9.3), through the one writer. Only a source the
+    channel's account reads can be chosen; clearing is always allowed, including an
+    override on a source the account has since stopped reading."""
+    from ..database import EpgSource, EpgSourceSubscription
+    from ..epg_sources import set_source_override
+    raw = (request.get_json(silent=True) or {}).get('source_id')
+    if raw is not None and (isinstance(raw, bool) or not isinstance(raw, int)):
+        return jsonify({'error': 'source_id must be a source id or null'}), 400
+    case_sensitive = load_config().get('sync', {}).get('epg_case_sensitive_matching', False)
+
+    @retry_on_locked()
+    def _set_and_commit():
+        channel = db.session.get(Channel, channel_id)
+        if channel is None:
+            return 404, 'Channel not found'
+        source = None
+        if raw is not None:
+            source = _subscribed_source(channel, raw)
+            if source is None:
+                return 400, "That EPG source isn't one this channel's account reads."
+        # An import resolving this channel's winner at the same time would race the moves.
+        refreshing = [name for (name,) in db.session.query(EpgSource.name)
+                      .join(EpgSourceSubscription,
+                            EpgSourceSubscription.source_id == EpgSource.id)
+                      .filter(EpgSourceSubscription.account_id == channel.account_id,
+                              EpgSource.refresh_started_at.isnot(None))]
+        if refreshing:
+            return 409, (f'"{refreshing[0]}" is being refreshed right now. Try again once the '
+                         'refresh has finished.')
+        change = set_source_override(channel, source, case_sensitive=case_sensitive)
+        db.session.commit()
+        return 200, change
+
+    status, result = _set_and_commit()
+    if status != 200:
+        return jsonify({'error': result}), status
+    if result is None:
+        return jsonify({'success': True, 'changed': False, 'message': 'Nothing changed.'})
+    return jsonify({'success': True, 'changed': True, 'state': result.state,
+                    'message': result.detail})
+
+
+@channels_bp.route('/api/channels/<int:channel_id>/epg-key/lookup', methods=['GET'])
+def lookup_channel_epg_key(channel_id):
+    """?source_id=&q= - the Set key dialog's search over one source's channel list."""
+    from ..epg_sources import has_directory, search_directory
+    channel = db.session.get(Channel, channel_id)
+    if channel is None:
+        return jsonify({'error': 'Channel not found'}), 404
+    source = _subscribed_source(channel, request.args.get('source_id'))
+    if source is None:
+        return jsonify({'error': "That EPG source isn't one this channel's account reads."}), 400
+    return jsonify({'success': True, 'refreshed': has_directory(source.id),
+                    'results': search_directory(source.id, request.args.get('q', ''))})
 
 
 @channels_bp.route('/channels/<int:channel_id>/default-profile', methods=['POST'])
@@ -1608,3 +1732,135 @@ def hide_channels_bulk():
     return jsonify({'success': True, 'requested': len(ids), 'matched': len(found),
                     'hidden': hidden, 'deferred': deferred, 'epg_gap': epg_gap,
                     'missing': len(ids) - len(found)})
+
+
+def _plural(n: int, word: str) -> str:
+    return f'{n:,} {word}' if n == 1 else f'{n:,} {word}s'
+
+
+def _comparison_summary(c, active_name: str, other_name: str, until_text: str) -> list[str]:
+    """What a comparison found, in sentences - every count it judged on, so a verdict can
+    always be checked against the rows below it."""
+    from ..epg_sources import (CMP_DESCRIPTIONS, CMP_IDENTICAL, CMP_MOSTLY, CMP_NO_OVERLAP,
+                               CMP_SHIFTED, CMP_UNRELATED)
+    out = []
+    if c.verdict == CMP_NO_OVERLAP:
+        out.append('The two list no time in common from now on, so there is nothing to compare.')
+    elif c.verdict == CMP_IDENTICAL:
+        out.append(f'All {_plural(c.compared, "program")} match.')
+    elif c.verdict == CMP_DESCRIPTIONS:
+        out.append(f'All {_plural(c.compared, "program")} match, but only one side describes '
+                   f'{c.description_gaps:,} of them: {active_name} has a description on '
+                   f'{c.described_active:,}, {other_name} on {c.described_other:,}.')
+    elif c.verdict == CMP_UNRELATED:
+        out.append(f'Only {c.same + c.moved:,} of {_plural(c.compared, "program")} match - '
+                   'probably not the same channel.')
+    elif c.verdict in (CMP_MOSTLY, CMP_SHIFTED):
+        out.append(f'{c.same:,} of {_plural(c.compared, "program")} match.')
+    else:
+        raise ValueError(f'unknown comparison verdict {c.verdict!r}')
+    if c.moved:
+        move = c.largest_move.total_seconds()
+        out.append(f'{_plural(c.moved, "program")} {"starts" if c.moved == 1 else "start"} '
+                   f'at a different time in {other_name}, by up to '
+                   f'{fmt_utils.fmt_duration(abs(move))}.')
+    parts = []
+    if c.different:
+        parts.append(f'{c.different:,} with a different program in the same slot')
+    if c.only_active:
+        parts.append(f'{c.only_active:,} only in {active_name}')
+    if c.only_other:
+        parts.append(f'{c.only_other:,} only in {other_name}')
+    if parts and c.verdict != CMP_NO_OVERLAP:
+        out.append('Not matched: ' + ', '.join(parts) + '.')
+    if c.until is not None and c.verdict != CMP_NO_OVERLAP:
+        out.append(f'Compared until {until_text}, where the shorter of the two ends.')
+    for n, name in ((c.doubled_active, active_name), (c.doubled_other, other_name)):
+        if n:
+            out.append(f'{name} lists this channel twice at {_plural(n, "time")} - usually '
+                       'its file names the channel under two ids that differ only in case.')
+    return out
+
+
+def _difference_text(row, active_name: str, other_name: str) -> str:
+    from ..epg_sources import (ROW_DIFFERENT, ROW_DOUBLED_ACTIVE, ROW_DOUBLED_OTHER,
+                               ROW_MOVED, ROW_ONLY_ACTIVE, ROW_ONLY_OTHER, ROW_SAME)
+    if row.kind == ROW_SAME:
+        if row.active.described != row.other.described:
+            return f'Same - only {active_name if row.active.described else other_name} describes it'
+        return 'Same'
+    if row.kind == ROW_MOVED:
+        gap = (row.other.start - row.active.start).total_seconds()
+        return (f'Starts {fmt_utils.fmt_duration(abs(gap))} '
+                f'{"later" if gap > 0 else "earlier"} in {other_name}')
+    if row.kind == ROW_DIFFERENT:
+        return 'Different program'
+    if row.kind == ROW_ONLY_ACTIVE:
+        return f'Only in {active_name}'
+    if row.kind == ROW_ONLY_OTHER:
+        return f'Only in {other_name}'
+    if row.kind == ROW_DOUBLED_ACTIVE:
+        return f'Listed twice in {active_name}'
+    if row.kind == ROW_DOUBLED_OTHER:
+        return f'Listed twice in {other_name}'
+    raise ValueError(f'unknown comparison row kind {row.kind!r}')
+
+
+@channels_bp.route('/channels/<int:channel_id>/guide-compare')
+def channel_guide_compare(channel_id):
+    """One channel's guide beside what each other source its account reads says about it
+    (DESIGN-epg-sources.md §4, §12; dev/changelog/1108). Read-only. A fixed number of
+    queries whatever the listing count: the rows are compared in Python."""
+    from ..database import EpgSource
+    from ..epg_sources import (ROW_DOUBLED_ACTIVE, ROW_DOUBLED_OTHER, ROW_SAME,
+                               channel_source_comparisons)
+    from ..tz_utils import format_local, get_display_tz, is_24h, to_local
+    channel = db.session.get(Channel, channel_id)
+    if channel is None:
+        abort(404)
+    active, comps = channel_source_comparisons(channel)
+    active_source = (db.session.get(EpgSource, channel.epg_source_id)
+                     if channel.epg_source_id else None)
+    pick = request.args.get('source', type=int)
+    chosen = next((c for c in comps if c.source.id == pick), comps[0] if comps else None)
+    diff_only = request.args.get('diff') == '1'
+    tz, h24 = get_display_tz(), is_24h()
+    active_name = active_source.name if active_source else ''
+
+    def when(dt):
+        return format_local(dt, 'monthday_time', tz=tz, h24=h24)
+
+    def cell(x):
+        if x is None:
+            return None
+        return {'start': format_local(x.start, 'clock', tz=tz, h24=h24),
+                'stop': format_local(x.stop, 'clock', tz=tz, h24=h24),
+                'title': x.title, 'sub_title': x.sub_title,
+                'description': (x.description or '').strip()}
+
+    sources = [{'id': c.source.id, 'name': c.source.name, 'verdict': c.comparison.verdict,
+                'summary': _comparison_summary(c.comparison, active_name, c.source.name,
+                                               when(c.comparison.until)),
+                'until': when(c.last_stop)} for c in comps]
+    days = []
+    if chosen is not None:
+        for row in chosen.comparison.rows:
+            # A doubled row is the import listing a channel twice, which the summary names;
+            # it is not a difference between the two guides.
+            if diff_only and (row.kind in (ROW_DOUBLED_ACTIVE, ROW_DOUBLED_OTHER) or (
+                    row.kind == ROW_SAME and row.active.described == row.other.described)):
+                continue
+            label = to_local(row.start, tz).strftime('%A, %B %-d')
+            if not days or days[-1]['label'] != label:
+                days.append({'label': label, 'rows': []})
+            days[-1]['rows'].append({
+                'counted': row.counted,
+                'outside': (not row.counted
+                            and row.kind not in (ROW_DOUBLED_ACTIVE, ROW_DOUBLED_OTHER)),
+                'active': cell(row.active), 'other': cell(row.other),
+                'difference': _difference_text(row, active_name, chosen.source.name)})
+    return render_template(
+        'channels/guide_compare.html', channel=channel, active_source=active_source,
+        active_until=when(max(x.stop for x in active)) if active else None,
+        sources=sources, chosen=chosen.source if chosen else None, days=days,
+        diff_only=diff_only)

@@ -136,6 +136,7 @@ _BF_ANALYSIS_COMPLETED = 'm057.analysis_completed_at'
 #: same reason a column backfill uses it: the obligation is committed before the work, so
 #: an interrupted repair is retried rather than inferred complete (dev/changelog/951).
 _BF_DUPLICATE_CAPTURE_CORRECTIONS = 'm057.duplicate_capture_corrections'
+_BF_EPG_SOURCES = 'm072.epg_sources'
 
 
 def _register_backfill(conn, cur, name: str):
@@ -2427,6 +2428,213 @@ def _m071_one_check_per_group(conn, cur):
     conn.commit()
 
 
+
+#: The alert types migration 72 retired, dismissed by it. Spelled out for the reason _m052
+#: gives, and named so the retired-types tripwire test can read what 72 covers.
+_M072_RETIRED_ALERT_TYPES = ('SYNC_EPG_FETCH_FAILED', 'SYNC_EPG_COLLAPSE_REFUSED',
+                             'SYNC_EPG_IMPORT_TRUNCATED')
+
+
+def _m072_epg_sources(conn, cur):
+    """EPG sources (DESIGN-epg-sources.md §10, dev/changelog/1101): four new tables plus the
+    user-key table, `epg_entries.source_id`, `channels.epg_source_id` and
+    `channels.epg_source_override_id`, and every existing account's EPG turned into a source.
+
+    1. Tables and columns, all guarded, so the schema half is re-runnable from the top.
+    2. The backfill obligation is registered BEFORE the first data write (dev/changelog/686),
+       so an interrupted upgrade is retried rather than inferred complete.
+    3. Every Xtream account gets a `provider` source; every M3U account with an `epg_url`
+       gets a `url` source carrying it. INSERT ... WHERE NOT EXISTS on the owner, with a
+       priority-1 subscription the same way.
+    4. `epg_entries.source_id` is stamped per account, only where still NULL.
+    5. `channels.epg_source_id` is recomputed from scratch: the source for a channel holding
+       at least one row, NULL for the rest - never incremented.
+    6. Open SYNC_EPG_* alerts are dismissed: nothing raises those types any more, and the
+       per-source EPG_SOURCE_* types replace them. Spelled out rather than read from
+       alerts.RETIRED_ALERT_TYPES, for the reason _m052 gives.
+
+    Rows on an M3U account with no `epg_url` cannot exist (nothing imports for it) and are
+    left NULL and counted in the log if they somehow do. A fresh database never runs this:
+    create_all() builds the tables and there is nothing to backfill.
+    """
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS epg_sources (
+            id                     INTEGER PRIMARY KEY,
+            kind                   VARCHAR(16) NOT NULL,
+            name                   VARCHAR(255) NOT NULL,
+            owner_account_id       INTEGER NOT NULL REFERENCES accounts(id),
+            url                    VARCHAR(2048),
+            refresh_interval_hours INTEGER,
+            enabled                BOOLEAN DEFAULT 1 NOT NULL,
+            last_refresh_at        DATETIME,
+            last_success_at        DATETIME,
+            last_status            VARCHAR(16),
+            last_error             TEXT,
+            entry_count            INTEGER DEFAULT 0 NOT NULL,
+            channel_count          INTEGER DEFAULT 0 NOT NULL,
+            active_channel_count   INTEGER DEFAULT 0 NOT NULL,
+            created_at             DATETIME,
+            updated_at             DATETIME
+        )
+    ''')
+    cur.execute('CREATE INDEX IF NOT EXISTS ix_epg_sources_owner_account_id '
+                'ON epg_sources (owner_account_id)')
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS epg_source_subscriptions (
+            id         INTEGER PRIMARY KEY,
+            source_id  INTEGER NOT NULL REFERENCES epg_sources(id),
+            account_id INTEGER NOT NULL REFERENCES accounts(id),
+            priority   INTEGER NOT NULL,
+            CONSTRAINT uq_epg_sub_source_account UNIQUE (source_id, account_id),
+            CONSTRAINT uq_epg_sub_account_priority UNIQUE (account_id, priority)
+        )
+    ''')
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS epg_source_channels (
+            id              INTEGER PRIMARY KEY,
+            source_id       INTEGER NOT NULL REFERENCES epg_sources(id),
+            xml_id          VARCHAR(255) NOT NULL,
+            display_names   TEXT,
+            entry_count     INTEGER NOT NULL,
+            distinct_titles INTEGER NOT NULL,
+            sole_title      VARCHAR(512),
+            horizon_until   DATETIME,
+            CONSTRAINT uq_epg_source_channel UNIQUE (source_id, xml_id)
+        )
+    ''')
+    cur.execute('CREATE INDEX IF NOT EXISTS ix_epg_source_channels_count '
+                'ON epg_source_channels (source_id, entry_count)')
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS epg_alternate_entries (
+            id          INTEGER PRIMARY KEY,
+            source_id   INTEGER NOT NULL REFERENCES epg_sources(id),
+            channel_id  INTEGER NOT NULL REFERENCES channels(id),
+            title       VARCHAR(512) NOT NULL,
+            sub_title   VARCHAR(512),
+            description TEXT,
+            start_time  DATETIME NOT NULL,
+            stop_time   DATETIME NOT NULL,
+            category    VARCHAR(255),
+            rating      VARCHAR(64)
+        )
+    ''')
+    cur.execute('CREATE INDEX IF NOT EXISTS ix_epg_alt_source_channel '
+                'ON epg_alternate_entries (source_id, channel_id)')
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS epg_channel_keys (
+            id         INTEGER PRIMARY KEY,
+            channel_id INTEGER NOT NULL REFERENCES channels(id),
+            source_id  INTEGER NOT NULL REFERENCES epg_sources(id),
+            key        VARCHAR(255),
+            origin     VARCHAR(16) NOT NULL,
+            status     VARCHAR(16) NOT NULL,
+            matched_on VARCHAR(512),
+            created_at DATETIME,
+            updated_at DATETIME,
+            CONSTRAINT uq_epg_channel_key UNIQUE (channel_id, source_id)
+        )
+    ''')
+    conn.commit()
+
+    registered_now = not _backfill_pending(cur, _BF_EPG_SOURCES)
+    _register_backfill(conn, cur, _BF_EPG_SOURCES)
+
+    entry_cols = [r[1] for r in cur.execute('PRAGMA table_info(epg_entries)').fetchall()]
+    if 'source_id' not in entry_cols:
+        cur.execute('ALTER TABLE epg_entries ADD COLUMN source_id INTEGER '
+                    'REFERENCES epg_sources(id)')
+    channel_cols = [r[1] for r in cur.execute('PRAGMA table_info(channels)').fetchall()]
+    if 'epg_source_id' not in channel_cols:
+        cur.execute('ALTER TABLE channels ADD COLUMN epg_source_id INTEGER '
+                    'REFERENCES epg_sources(id)')
+    if 'epg_source_override_id' not in channel_cols:
+        cur.execute('ALTER TABLE channels ADD COLUMN epg_source_override_id INTEGER '
+                    'REFERENCES epg_sources(id)')
+    cur.execute('CREATE INDEX IF NOT EXISTS ix_epg_entries_source '
+                'ON epg_entries (source_id, stop_time)')
+    conn.commit()
+
+    if not _backfill_needed(cur, _BF_EPG_SOURCES, registered_now):
+        return
+
+    # The default names spelled out rather than read from epg_sources.default_source_name(),
+    # so this step's output stays what it was when it shipped (module docstring).
+    default_name = {'provider': '{} provider guide', 'url': '{} XMLTV'}
+    now = _utc_stamp()
+    accounts = cur.execute(
+        'SELECT id, name, account_type, epg_url FROM accounts ORDER BY id').fetchall()
+    for account_id, name, account_type, epg_url in accounts:
+        if account_type == 'xtream':
+            kind, url = 'provider', None
+        elif (epg_url or '').strip():
+            kind, url = 'url', epg_url
+        else:
+            continue
+        cur.execute(
+            'INSERT INTO epg_sources (kind, name, owner_account_id, url, enabled, '
+            'entry_count, channel_count, active_channel_count, created_at, updated_at) '
+            'SELECT ?, ?, ?, ?, 1, 0, 0, 0, ?, ? WHERE NOT EXISTS '
+            '(SELECT 1 FROM epg_sources WHERE owner_account_id = ? AND kind = ?)',
+            (kind, default_name[kind].format(name), account_id, url, now, now,
+             account_id, kind))
+        source_id = cur.execute(
+            'SELECT id FROM epg_sources WHERE owner_account_id = ? AND kind = ?',
+            (account_id, kind)).fetchone()[0]
+        cur.execute(
+            'INSERT INTO epg_source_subscriptions (source_id, account_id, priority) '
+            'SELECT ?, ?, 1 WHERE NOT EXISTS (SELECT 1 FROM epg_source_subscriptions '
+            'WHERE account_id = ?)', (source_id, account_id, account_id))
+        cur.execute(
+            'UPDATE epg_entries SET source_id = ? WHERE source_id IS NULL AND channel_id IN '
+            '(SELECT id FROM channels WHERE account_id = ?)', (source_id, account_id))
+        cur.execute(
+            'UPDATE channels SET epg_source_id = CASE WHEN EXISTS (SELECT 1 FROM epg_entries e '
+            'WHERE e.channel_id = channels.id) THEN ? ELSE NULL END WHERE account_id = ?',
+            (source_id, account_id))
+        cur.execute(
+            'UPDATE epg_sources SET '
+            'entry_count = (SELECT COUNT(*) FROM epg_entries WHERE source_id = ?), '
+            'active_channel_count = (SELECT COUNT(*) FROM channels WHERE epg_source_id = ?), '
+            'channel_count = (SELECT COUNT(*) FROM channels WHERE epg_source_id = ?) '
+            'WHERE id = ?', (source_id, source_id, source_id, source_id))
+        conn.commit()
+
+    orphaned = cur.execute(
+        'SELECT COUNT(*) FROM epg_entries WHERE source_id IS NULL').fetchone()[0]
+    if orphaned:
+        log.warning('Migration 72: %d EPG entries belong to an account with no EPG source '
+                    'and were left without one', orphaned)
+
+    cur.execute('UPDATE alerts SET dismissed_at = ? WHERE dismissed_at IS NULL '
+                'AND alert_type IN (?, ?, ?)', [now, *_M072_RETIRED_ALERT_TYPES])
+    if cur.rowcount:
+        log.info('Migration 72: dismissed %d open per-account EPG alert(s); EPG failures are '
+                 'now alerted per source', cur.rowcount)
+    conn.commit()
+    _finish_backfill(conn, cur, _BF_EPG_SOURCES)
+
+
+def _m073_epg_source_refreshing(conn, cur):
+    """epg_sources.refresh_started_at: set while a refresh of the source runs, so the
+    restart guard can refuse to kill one halfway through its import (dev/changelog/1104).
+    Nullable, no backfill, column-presence guarded - re-runnable from the top."""
+    existing = [r[1] for r in cur.execute('PRAGMA table_info(epg_sources)').fetchall()]
+    if 'refresh_started_at' not in existing:
+        cur.execute('ALTER TABLE epg_sources ADD COLUMN refresh_started_at DATETIME')
+    conn.commit()
+
+
+def _m074_epg_directory_upcoming(conn, cur):
+    """epg_source_channels.upcoming_titles: the next few programs a channel lists in its
+    source's file, so the name-match review page can show a person which channel a proposal
+    is (DESIGN-epg-sources.md §7.5, dev/changelog/1105). The directory is rewritten in full
+    at every import, so there is nothing to backfill; column-presence guarded."""
+    existing = [r[1] for r in cur.execute('PRAGMA table_info(epg_source_channels)').fetchall()]
+    if 'upcoming_titles' not in existing:
+        cur.execute('ALTER TABLE epg_source_channels ADD COLUMN upcoming_titles TEXT')
+    conn.commit()
+
+
 SCHEMA_MIGRATIONS = [
     (1, 'baseline: pre-versioning additive migrations + backfills', _m001_baseline),
     (2, 'recordings: program_title/program_sub_title snapshot columns + backfill', _m002_program_title),
@@ -2570,6 +2778,13 @@ SCHEMA_MIGRATIONS = [
     (71, 'one health check per group: retire the health_check_only strategy, mint a check '
      'for every group without one, merge extras, UNIQUE on on_demand_test_jobs.group_id',
      _m071_one_check_per_group),
+    (72, 'EPG sources: epg_sources + subscriptions + directory + alternates + user keys, '
+     'epg_entries.source_id, channels.epg_source_id/_override_id, and every account\'s EPG '
+     'turned into a source', _m072_epg_sources),
+    (73, 'epg_sources.refresh_started_at - a source refresh in flight, for the restart guard',
+     _m073_epg_source_refreshing),
+    (74, 'epg_source_channels: upcoming_titles for the name-match review page',
+     _m074_epg_directory_upcoming),
 ]
 
 CURRENT_SCHEMA_VERSION = SCHEMA_MIGRATIONS[-1][0]

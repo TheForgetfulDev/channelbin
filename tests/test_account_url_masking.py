@@ -18,7 +18,7 @@ from unittest.mock import patch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app import accounts as accounts_mod, db  # noqa: E402
-from app.database import Account, AccountSyncLog, M3uAccount  # noqa: E402
+from app.database import Account, AccountSyncLog, EpgSource, M3uAccount  # noqa: E402
 from tests.support import make_test_app  # noqa: E402
 
 # The shape that defeats every mask_creds heuristic: no /live/ prefix, no query params,
@@ -33,12 +33,17 @@ def _account():
                    m3u_url=M3U_URL, epg_url=EPG_URL)
 
 
+def _source():
+    return EpgSource(id=3, kind='url', name='provider XMLTV', url=EPG_URL, owner_account_id=7)
+
+
 class M3uFetchMaskingTests(unittest.TestCase):
     def test_non_playlist_error_message_hides_the_path_token(self):
         """The ValueError text is persisted verbatim into account.last_error."""
         resp = unittest.mock.Mock()
         resp.content = b'<html>login required</html>'
         resp.raise_for_status.return_value = None
+        resp.status_code = 200
         with patch.object(accounts_mod.requests, 'get', return_value=resp):
             with self.assertRaises(ValueError) as ctx:
                 accounts_mod._fetch_m3u_streams(_account(), 5, {})
@@ -49,6 +54,7 @@ class M3uFetchMaskingTests(unittest.TestCase):
         resp = unittest.mock.Mock()
         resp.content = b'<html>login required</html>'
         resp.raise_for_status.return_value = None
+        resp.status_code = 200
         with patch.object(accounts_mod.requests, 'get', return_value=resp):
             with self.assertLogs(accounts_mod.log, level='INFO') as logs:
                 with self.assertRaises(ValueError):
@@ -64,7 +70,11 @@ class EpgFetchMaskingTests(unittest.TestCase):
         exc = Exception(f'HTTPConnectionPool: Max retries exceeded with url: {EPG_URL}')
         with patch.object(accounts_mod.requests, 'get', side_effect=exc):
             with self.assertLogs(accounts_mod.log, level='INFO') as logs:
-                imported, reason = accounts_mod._sync_epg_from_url(_account(), EPG_URL, 5, 3, {})
+                # No database here: the source is transient, so the refresh-in-flight stamp
+                # (dev/changelog/1104) is patched out along with the outcome write.
+                with patch.object(accounts_mod, '_report_source_outcome'), \
+                     patch.object(accounts_mod, '_set_refreshing'):
+                    imported, reason = accounts_mod.refresh_source(_source(), 5, 3, {})
         self.assertEqual(imported, 0)
         self.assertTrue(reason.startswith('fetch failed:'))
         self.assertNotIn(TOKEN, reason)

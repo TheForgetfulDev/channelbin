@@ -10,7 +10,6 @@ deleted source row's contribution stays; days are local; a timezone change rebui
 """
 import logging
 import os
-import re
 import sys
 import unittest
 from datetime import date, datetime, timedelta
@@ -27,6 +26,7 @@ from app.database import (AccountStatDay, AccountStatState, ChannelEvent, Channe
 from app.fmt_utils import fmt_duration  # noqa: E402
 from tests.support import make_test_app  # noqa: E402
 from tests.support import seed  # noqa: E402
+from tests.support.markup import stat_values  # noqa: E402
 
 # A fixed moment well away from any DST change: 2026-09-10 15:00 UTC = 11:00 in New York.
 T0 = datetime(2026, 9, 10, 15, 0, 0)
@@ -452,17 +452,11 @@ class CatchUpTests(_LedgerCase):
 
 class AccountPageTests(_LedgerCase):
 
-    # The rendered value of the "Recorded time" stat row, so an assertion reads that cell
-    # rather than the whole document. A duration is two or three characters ('2h', '30m'),
-    # and the page also carries a random CSRF token, base64 and SVG path data - searching
-    # the raw HTML for one matched 'SY7hME' inside a token and failed at random, roughly
-    # once every fifty runs (dev/docs/BUGS.md 2026-09-22 @ 07:35:26 PM).
-    _RECORDED_TIME = re.compile(
-        r'<span class="sk">Recorded time</span><span class="sv[^>]*>([^<]*)</span>')
-
     def recorded_time(self, account):
+        # One cell rather than the whole document: a duration is two or three characters
+        # and the page carries a random CSRF token (dev/docs/BUGS.md 2026-09-22 @ 07:35:26 PM).
         page = self.t.client.get(f'/accounts/{account.id}').get_data(as_text=True)
-        shown = set(self._RECORDED_TIME.findall(page))
+        shown = set(stat_values(page, 'Recorded time'))
         self.assertTrue(shown, 'the page rendered no "Recorded time" stat at all')
         self.assertEqual(len(shown), 1,
                          f'the page disagrees with itself about recorded time: {shown}')

@@ -20,6 +20,7 @@ The alert body is built only from this module's own fixed phrasings. Apprise URL
 credentials in schemes (`pover://`, `discord://`) that app/url_utils.py's maskers do not
 match, and the body is rendered in the UI and can be pushed off-box.
 """
+import re
 import sys
 import threading
 import unittest
@@ -142,7 +143,9 @@ class FlushRaisesTheStandingAlertTests(unittest.TestCase):
 
     def test_the_alert_names_how_many_messages_were_dropped(self):
         self._flush_with((False, 'the service rejected the notification'), messages=3)
-        self.assertIn('3', self._open()[0].body)
+        body = self._open()[0].body
+        self.assertEqual(re.findall(r'and (\d+) queued notification\(s\) were dropped', body),
+                         ['3'])
 
     def test_repeated_failures_do_not_stack_alerts(self):
         for _ in range(4):

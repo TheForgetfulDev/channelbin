@@ -120,6 +120,7 @@ class M3uFetchIsOutsideTheRetryTests(unittest.TestCase):
             resp = mock.Mock()
             resp.content = body
             resp.raise_for_status.return_value = None
+            resp.status_code = 200
             return resp
 
         with mock.patch.object(accounts_mod.requests, 'get', fake_get):
