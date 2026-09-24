@@ -12,7 +12,7 @@ from sqlalchemy.orm import selectinload
 from .. import db, health_bands, channel_hiding
 from ..database import (
     Channel, ChannelGroup, ChannelGroupMember, ChannelEvent, ChannelTest, Tag,
-    Recording, RecordingEvent, HealthCheckProfile, OnDemandTestJob,
+    Recording, RecordingEvent, RecordingProfile, HealthCheckProfile, OnDemandTestJob,
     CHANNEL_GROUPED, CHANNEL_UNGROUPED, GROUP_MEMBER_SELECTED, GROUP_FAILOVER,
     CHANNEL_FAILOVER_HEALTH_OBSERVATION, CHANNEL_STALL_DEMOTION_HEALTH_OBSERVATION,
     CHANNEL_PLACEHOLDER_HEALTH_OBSERVATION, CHANNEL_FAST_DELIVERY_HEALTH_OBSERVATION,
@@ -37,6 +37,8 @@ from ..channel_groups import (
     participation_is_recording, participating_member_ids, group_manages_format,
     PARTICIPATION_FIELDS, set_participation, format_eligible_members,
     pinned_format_offenders, set_warning_muted,
+    set_guide_listings_member, guide_listings_member, guide_listings_pin_is_stale,
+    set_default_profile,
     guide_invariant_check, demote_group_from_guide, log_guide_change,
     group_scheduled_recordings,
     group_live_recordings, cancel_scheduled_recordings,
@@ -1554,6 +1556,10 @@ def build_group_detail_context(group):
             load_config().get('channel_testing', {}), profiles),
         'inherited_check': inherited_check,
         'cloned_from': cloned_from,
+        'guide_listings': _guide_listings_ctx(group) if is_stored else None,
+        'default_profile': _default_profile_ctx(group) if is_stored else None,
+        'recording_profiles': (RecordingProfile.query.order_by(RecordingProfile.name).all()
+                               if is_stored else []),
         # Client-side name-conflict check for the Create-channel-group modal. One query,
         # names only - never hydrated per row.
         'group_names': [n for (n,) in db.session.query(ChannelGroup.name).all()],
@@ -1575,6 +1581,26 @@ def build_group_detail_context(group):
         'timeline_pagination': pagination,
         'page_sizes': CHANNEL_HEALTH_PAGE_SIZES,
     }
+
+
+def _guide_listings_ctx(group):
+    """Where this group's guide row takes its listings from, for the settings bar and the
+    Settings modal. `stale` is a pin whose channel has left the group through a path that
+    could not clear it, which the page names rather than showing "Automatic" and leaving
+    the reader to wonder where their pin went (dev/changelog/1116)."""
+    pinned = guide_listings_member(group)
+    return {
+        'channel_id': pinned.id if pinned is not None else None,
+        'channel_name': pinned.name if pinned is not None else None,
+        'stale': guide_listings_pin_is_stale(group),
+    }
+
+
+def _default_profile_ctx(group):
+    """The group's default recording profile, for the settings bar and the Settings modal."""
+    p = group.default_profile
+    return {'profile_id': p.id if p is not None else None,
+            'profile_name': p.name if p is not None else None}
 
 
 @channel_groups_bp.route('/api/channel-groups/<int:group_id>/detail-rows')
@@ -1841,6 +1867,12 @@ def remove_members(group_id):
             if not did_transfer:
                 removed.append(ch)
                 db.session.delete(m)
+        # A pin on a channel that just left - removed, or transferred onto a keeper - is
+        # cleared here, where a person is doing it, rather than left to come back to life if
+        # the channel is ever re-added. Paths that drop a membership with nobody present
+        # leave it for guide_listings_member() to ignore and the group page to name.
+        if g.guide_listings_channel_id in {c.id for c in removed} | set(transferred):
+            set_guide_listings_member(g, None, reason='removed')
         # Transferred channels get their own event trail from transfer_channel_state()
         # (guide/scheduled-recording events) - a plain "Removed from channel group" event
         # here would misdescribe what happened to them, so only genuine removals count.
@@ -2496,6 +2528,70 @@ def set_group_warnings(group_id):
     muted = group.muted_warning_set()
     return jsonify({'success': True, 'moved': moved,
                     'muted': [k for k in GROUP_WARNING_KINDS if k in muted]})
+
+
+@channel_groups_bp.route('/api/channel-groups/<int:group_id>/guide-listings', methods=['POST'])
+def set_group_guide_listings(group_id):
+    """Pin the member whose listings fill this group's TV Guide row, or set it back to
+    automatic. Body: {'channel_id': <member id> | null}.
+
+    Display only - who records, fails over and gets health-checked is untouched. Written
+    through set_guide_listings_member(), the column's one writer, which logs
+    GROUP_GUIDE_LISTINGS_SET (dev/changelog/1116)."""
+    group = db.session.get(ChannelGroup, group_id)
+    if group is None:
+        return jsonify({'error': 'Group not found'}), 404
+    if group.is_system:
+        return jsonify({'error': 'The TV Guide Channels group has no guide row of its own.'}), 400
+    raw = (request.get_json(silent=True) or {}).get('channel_id')
+    if raw is not None and (isinstance(raw, bool) or not isinstance(raw, int)):
+        return jsonify({'error': 'channel_id must be a channel id or null'}), 400
+    if raw is not None and raw not in {m.channel_id for m in group.memberships}:
+        return jsonify({'error': 'That channel is not a member of this group'}), 400
+
+    @retry_on_locked()
+    def _save():
+        g = db.session.get(ChannelGroup, group_id)
+        channel = db.session.get(Channel, raw) if raw is not None else None
+        moved = set_guide_listings_member(g, channel)
+        if moved:
+            db.session.commit()
+        return moved
+    moved = _save()
+    return jsonify({'success': True, 'moved': moved,
+                    **_guide_listings_ctx(db.session.get(ChannelGroup, group_id))})
+
+
+@channel_groups_bp.route('/api/channel-groups/<int:group_id>/default-profile', methods=['POST'])
+def set_group_default_profile(group_id):
+    """Set the recording profile the record modal pre-selects for this group's guide row,
+    or clear it. Body: {'profile_id': <recording profile id> | null}.
+
+    A pre-selection only - the modal can still change it per recording. Written through
+    set_default_profile(), the column's one writer, which logs GROUP_DEFAULT_PROFILE_SET
+    (dev/changelog/1117)."""
+    group = db.session.get(ChannelGroup, group_id)
+    if group is None:
+        return jsonify({'error': 'Group not found'}), 404
+    if group.is_system:
+        return jsonify({'error': 'The TV Guide Channels group has no guide row of its own.'}), 400
+    raw = (request.get_json(silent=True) or {}).get('profile_id')
+    if raw is not None and (isinstance(raw, bool) or not isinstance(raw, int)):
+        return jsonify({'error': 'profile_id must be a recording profile id or null'}), 400
+    if raw is not None and db.session.get(RecordingProfile, raw) is None:
+        return jsonify({'error': 'That recording profile no longer exists'}), 400
+
+    @retry_on_locked()
+    def _save():
+        g = db.session.get(ChannelGroup, group_id)
+        profile = db.session.get(RecordingProfile, raw) if raw is not None else None
+        moved = set_default_profile(g, profile)
+        if moved:
+            db.session.commit()
+        return moved
+    moved = _save()
+    return jsonify({'success': True, 'moved': moved,
+                    **_default_profile_ctx(db.session.get(ChannelGroup, group_id))})
 
 
 @channel_groups_bp.route('/api/channel-groups/<int:group_id>/delete', methods=['POST'])

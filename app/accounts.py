@@ -635,12 +635,21 @@ def filename_tag_cleanup(cfg) -> list:
             + [(name, 'replace') for name in rec_cfg.get('filename_tags_replace', [])])
 
 
-def effective_filename_template(cfg, channel) -> str:
-    """The template a recording of this channel would be named with: the channel's default
-    profile's own template if it sets one, else the global recording.filename_template."""
+def default_profile_for(channel, group=None):
+    """The recording profile the record modal pre-selects for a showing on `channel`: the
+    group's default when the showing is on a group's row and the group sets one, else the
+    channel's own default, else None (dev/changelog/1117)."""
+    profile = getattr(group, 'default_profile', None) if group is not None else None
+    return profile if profile is not None else getattr(channel, 'default_profile', None)
+
+
+def effective_filename_template(cfg, channel, group=None) -> str:
+    """The template a recording of this channel would be named with: the pre-selected
+    profile's own template if it sets one (default_profile_for()), else the global
+    recording.filename_template."""
     global_template = cfg.get('recording', {}).get(
         'filename_template', config_default('recording.filename_template'))
-    profile = getattr(channel, 'default_profile', None)
+    profile = default_profile_for(channel, group)
     if profile is not None and profile.filename_template:
         return profile.filename_template
     return global_template

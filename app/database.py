@@ -319,6 +319,16 @@ GROUP_GUIDE_REMOVED             = 'GROUP_GUIDE_REMOVED'
 # silent behavior 15 refuses - so this records the broken state for the Activity Timeline
 # while the alert and the group page's banner carry it to the user. Group-wide.
 GROUP_GUIDE_BROKEN              = 'GROUP_GUIDE_BROKEN'
+# Which member's listings fill this group's guide row was pinned, moved or set back to
+# automatic (ChannelGroup.guide_listings_channel_id, written only by
+# app/channel_groups.py::set_guide_listings_member). Carries the pinned channel_id when there
+# is one; extra_data names the previous pin and why it moved (dev/changelog/1116).
+GROUP_GUIDE_LISTINGS_SET        = 'GROUP_GUIDE_LISTINGS_SET'
+# The group's default recording profile was set, changed or cleared
+# (ChannelGroup.default_profile_id, written only by
+# app/channel_groups.py::set_default_profile). extra_data names the new and previous
+# profile ids and why it moved - by hand, or because the profile was deleted.
+GROUP_DEFAULT_PROFILE_SET       = 'GROUP_DEFAULT_PROFILE_SET'
 
 # ── Models ────────────────────────────────────────────────────────────────────
 #
@@ -1460,6 +1470,23 @@ class ChannelGroup(db.Model):
     # can destroy a group, which is the teardown defect class CLAUDE.md already names.
     muted_warnings    = db.Column(db.Text)
 
+    # The member whose listings fill this group's guide row, whatever member it records
+    # from - a user's pin for a lead feed whose guide data is short or wrong. NULL means
+    # automatic (the serving member). Display only: it never moves who records, fails over
+    # or gets health-checked. Ignored while the channel is not a member, since a cascade can
+    # take the membership away without asking. One writer,
+    # app/channel_groups.py::set_guide_listings_member() (dev/changelog/1116).
+    # guide-listings-write-ok: the column definition
+    guide_listings_channel_id = db.Column(db.Integer, db.ForeignKey('channels.id'))
+
+    # The recording profile the record modal pre-selects for a showing on this group's row,
+    # over the serving member's own Channel.default_profile_id. NULL = no group default,
+    # so the serving member's default (if any) still applies. A pre-selection only: the
+    # modal can change it per recording. One writer,
+    # app/channel_groups.py::set_default_profile() (dev/changelog/1117).
+    # group-default-profile-write-ok: the column definition
+    default_profile_id = db.Column(db.Integer, db.ForeignKey('recording_profiles.id'))
+
     # Provenance note only (dev/changelog/501), stamped once by
     # clone_group() and never updated afterward - deliberately NOT a live pairing
     # (see `paired`/`attached_checks` above for that). cloned_from_name is a snapshot
@@ -1477,6 +1504,8 @@ class ChannelGroup(db.Model):
                                   backref=db.backref('group', lazy='joined'),
                                   lazy=True, order_by='ChannelGroupMember.position',
                                   cascade='all, delete-orphan')
+    default_profile = db.relationship('RecordingProfile', foreign_keys=[default_profile_id],
+                                      lazy='joined')
     # Deleting a group takes its events with it, per the teardown rule - they are
     # group-scoped and have nowhere else to belong.
     events      = db.relationship('ChannelGroupEvent', backref='group', lazy=True,

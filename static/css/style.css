@@ -2611,7 +2611,8 @@ th.gd-c-part { text-align: center; }
 
 /* ── Settings modal: the real Settings page anatomy ────────────────── */
 .modal-panel.modal-wide { max-width: 680px; }
-/* One width step above modal-wide: this one carries a channel table, not just fields. */
+/* One width step above modal-wide: for a panel carrying a channel table, or a settings form
+   dense enough that modal-wide cramps its field descriptions (the group Settings modal). */
 .modal-panel.modal-xwide { max-width: 820px; }
 /* min-width: 0 overrides the browser's UA default of min-width: min-content on <fieldset> -
    without it the fieldset refuses to shrink below its content's intrinsic width no matter

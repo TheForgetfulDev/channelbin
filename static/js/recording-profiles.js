@@ -22,11 +22,15 @@
   function openDelete(profile) {
     const recs = (CFG.recCounts || {})[profile.id] || 0;
     const chans = (CFG.channelCounts || {})[profile.id] || 0;
+    const groups = (CFG.groupCounts || {})[profile.id] || 0;
+    const defaults = [];
+    if (chans) defaults.push(plural(chans, 'channel'));
+    if (groups) defaults.push(plural(groups, 'channel group'));
     const attached = [];
     if (recs) attached.push(plural(recs, 'recording'));
-    if (chans) attached.push(`${plural(chans, 'channel')} using it as a default`);
+    if (defaults.length) attached.push(`${defaults.join(' and ')} using it as a default`);
     const fallout = attached.length
-      ? `<p style="font-size:.9rem" class="text-muted">${escHtml(attached.join(' and '))} ` +
+      ? `<p style="font-size:.9rem" class="text-muted">${escHtml(attached.join(', '))} ` +
         'will fall back to your global settings. Nothing is deleted except the profile ' +
         'itself.</p>'
       : '';

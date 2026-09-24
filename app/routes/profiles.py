@@ -4,7 +4,8 @@ from flask import Blueprint, abort, render_template, request, jsonify, send_from
 
 from .. import db
 from ..config import load_config
-from ..database import RecordingProfile, Recording, Channel
+from ..channel_groups import set_default_profile
+from ..database import RecordingProfile, Recording, Channel, ChannelGroup
 from ..db_utils import retry_on_locked
 from ..profile_forms import (BOOL, INT, TEXT, Override, ProfileField, default_summary,
                              nullable_overrides, parse_profile_body, profile_payload)
@@ -143,6 +144,12 @@ def profiles_list():
         .group_by(Channel.default_profile_id)
         .all()
     )
+    group_counts = dict(
+        db.session.query(ChannelGroup.default_profile_id, db.func.count(ChannelGroup.id))
+        .filter(ChannelGroup.default_profile_id.isnot(None))
+        .group_by(ChannelGroup.default_profile_id)
+        .all()
+    )
     cfg = load_config()
     defaults = _global_defaults(cfg)
     return render_template(
@@ -150,6 +157,7 @@ def profiles_list():
         profiles=profiles,
         rec_counts=rec_counts,
         channel_counts=channel_counts,
+        group_counts=group_counts,
         defaults=defaults,
         # Built here rather than in the template: the "did the user set this" test is
         # `is not None`, and a Jinja conditional written per field is where that quietly
@@ -227,6 +235,10 @@ def delete_profile(profile_id):
     def _unlink_references():
         Recording.query.filter_by(profile_id=profile_id).update({'profile_id': None})
         Channel.query.filter_by(default_profile_id=profile_id).update({'default_profile_id': None})
+        # A group's default goes through its one writer, so each group's timeline says the
+        # profile it pre-selected was deleted (dev/changelog/1117).
+        for group in ChannelGroup.query.filter_by(default_profile_id=profile_id).all():
+            set_default_profile(group, None, reason='profile_deleted')
         db.session.commit()
 
     @retry_on_locked()

@@ -1592,6 +1592,35 @@
         });
       }
     }
+    if (G.hasChannel && G.defaultProfile) {
+      const dp = G.defaultProfile;
+      items.push({
+        focus: 'recording', label: 'Recording profile',
+        value: dp.profile_name || 'None',
+        tip: dp.profile_name
+          ? `Recording a show from this group's TV Guide row starts with ${dp.profile_name} ` +
+            'selected. You can still pick another profile for each recording.'
+          : 'No group default. Recording a show from this group\'s TV Guide row starts with ' +
+            'the default profile of the member it would record from, if that channel has one.',
+      });
+    }
+    // Where the guide row's listings come from. A stale pin says so rather than reading
+    // "Automatic", which would hide that the setting the user made is no longer in force.
+    if (G.hasChannel && G.guideListings) {
+      const gl = G.guideListings;
+      items.push({
+        focus: 'guide', label: 'Guide listings',
+        value: gl.channel_name || 'Automatic',
+        sub: gl.stale ? 'pinned channel left the group' : '',
+        tip: gl.channel_name
+          ? `This group's TV Guide row shows ${gl.channel_name}'s listings first, whichever ` +
+            'member it records from. Other members fill any time those listings do not cover.'
+          : 'This group\'s TV Guide row shows the listings of the member it would record ' +
+            'from, and other members fill any time those listings do not cover.' +
+            (gl.stale ? ' The channel you pinned is no longer in this group, so the pin is ' +
+              'ignored.' : ''),
+      });
+    }
     // Never conditional on the schedule's value: a check with no schedule still gets a
     // chip, it just reads "None" rather than disappearing.
     items.push({
@@ -2240,6 +2269,47 @@
       h += '</fieldset>';
     }
 
+    if (G.hasChannel && G.defaultProfile) {
+      const dp = G.defaultProfile;
+      h += `<fieldset class="gd-fset${focus === 'recording' ? ' hi' : ''}"><div class="gd-fset-head">Recording</div>`;
+      h += fieldRow({
+        label: 'Default recording profile',
+        meta: '<p>Pre-selected when you record a show from this group\'s TV Guide row or from ' +
+          'Search. You can still change it for each recording.</p><p><strong>None</strong> falls ' +
+          'back to the default profile of the member the group would record from, if it has one. ' +
+          `Profiles themselves are edited under <a href="${escHtml(G.recordingProfilesUrl)}" ` +
+          'target="_blank" rel="noopener">Recording Profiles</a>.</p>',
+        control: '<select id="gd-rec-profile"><option value="">None</option>' +
+          G.recordingProfiles.map(p => `<option value="${p.id}"` +
+            `${p.id === dp.profile_id ? ' selected' : ''}>${escHtml(p.name)}</option>`).join('') +
+          '</select>',
+      });
+      h += '</fieldset>';
+    }
+
+    if (G.hasChannel && G.guideListings) {
+      const gl = G.guideListings;
+      const members = ROWS.slice().sort((a, b) => a.channel_name.localeCompare(b.channel_name));
+      h += `<fieldset class="gd-fset${focus === 'guide' ? ' hi' : ''}"><div class="gd-fset-head">TV Guide</div>`;
+      h += fieldRow({
+        wide: true,
+        label: 'Guide listings from',
+        meta: '<p><strong>Automatic</strong> shows the listings of the member this group would ' +
+          'record from. Pick a member when another one carries more days of guide data, or ' +
+          'better data.</p><p>This only changes what the TV Guide row shows. Which member ' +
+          'records is still chosen by format and health score, and any time the chosen ' +
+          'listings do not cover is filled from the other members.</p>' +
+          (gl.stale ? '<p class="text-muted">The channel you pinned is no longer in this ' +
+            'group, so the row is back on automatic until you pick again.</p>' : ''),
+        control: '<select id="gd-listings"><option value="">Automatic</option>' +
+          members.map(r => `<option value="${r.channel_id}"` +
+            `${r.channel_id === gl.channel_id ? ' selected' : ''}>` +
+            `${escHtml(r.channel_name)}${r.account_name ? ` (${escHtml(r.account_name)})` : ''}` +
+            '</option>').join('') + '</select>',
+      });
+      h += '</fieldset>';
+    }
+
     // The re-entry point for every warning the user dismissed. Without one, "Hide this
     // warning" is a one-way door - and there are four of them, so this block is built
     // from a list rather than written out four times.
@@ -2314,12 +2384,12 @@
     const modal = buildModal({
       title: 'Settings',
       body,
+      panelClass: 'modal-xwide',
       footer: [
         { label: 'Cancel', class: 'btn' },
         { label: 'Save', class: 'btn btn-primary', onClick: (close) => { saveSettings(body, close, gdSched); return false; } },
       ],
     });
-    modal.querySelector('.modal-panel').classList.add('modal-wide');
   }
 
   // "1920x1080 @ 60" back into the {resolution, fps} pair the /format endpoint takes.
@@ -2357,6 +2427,25 @@
         reqs.push(jsonFetch(api('format-strategy'), {
           method: 'POST', body: JSON.stringify({ strategy: fmtEdit.strategy }),
         }));
+      }
+
+      const recProfileEl = body.querySelector('#gd-rec-profile');
+      if (recProfileEl && G.defaultProfile) {
+        const picked = recProfileEl.value ? Number(recProfileEl.value) : null;
+        if (picked !== G.defaultProfile.profile_id) {
+          reqs.push(jsonFetch(api('default-profile'),
+                              { method: 'POST', body: JSON.stringify({ profile_id: picked }) }));
+        }
+      }
+
+      const listingsEl = body.querySelector('#gd-listings');
+      if (listingsEl && G.guideListings) {
+        const picked = listingsEl.value ? Number(listingsEl.value) : null;
+        // A stale pin is still stored, so choosing Automatic over it is a real change.
+        if (picked !== G.guideListings.channel_id || G.guideListings.stale) {
+          reqs.push(jsonFetch(api('guide-listings'),
+                              { method: 'POST', body: JSON.stringify({ channel_id: picked }) }));
+        }
       }
 
       const warnEls = Array.from(body.querySelectorAll('[data-warn]'));

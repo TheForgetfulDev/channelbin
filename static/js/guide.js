@@ -1231,7 +1231,8 @@ function openChannelSheet(ch) {
     (ch.lifecycle === 'missing'
       ? sheetLine('Status', `Missing since ${ch.lifecycle_date} - no longer seen in ${ch.account_name || 'this account'}'s synced feed.${repointHint(ch, true)}`)
       : '') +
-    (ch.is_group ? sheetLine('Group', `${ch.member_count} feeds, recording from ${ch.active_channel_name || '-'}`) : '');
+    (ch.is_group ? sheetLine('Group', `${ch.member_count} feeds, recording from ${ch.active_channel_name || '-'}`) : '') +
+    (ch.is_group ? sheetLine('Listings', groupListingsText(ch)) : '');
 
   openSheet({
     title: ch.name,
@@ -1584,6 +1585,9 @@ function progHeadHtml(prog) {
     sheetLine('Channel', prog.channel_name) +
     // Which EPG source this showing came from (DESIGN-epg-sources.md §9.4).
     sheetLine('Guide data', prog.source_name) +
+    // A group row fills time its recording member's listings miss from another member
+    // (dev/changelog/1116); this says whose listing the showing is when it is not that one.
+    sheetLine('Listings from', prog.listings_from) +
     (prog.description ?`<p class="info-desc">${escHtml(prog.description)}</p>` : '') +
     (tags ? `<div class="info-tags">${tags}</div>` : '');
 }
@@ -2481,6 +2485,18 @@ function repointHint(ch, sheet) {
     : '\nIt is also a duplicate stream URL - click the channel name to open its page and re-point it to the duplicate.';
 }
 
+// Where a group row's listings come from when that is anything other than the member it
+// records from - a pin, or members filling time the first one's listings do not cover. Empty
+// when the row shows only its recording member's own listings, which needs no saying.
+function groupListingsText(ch) {
+  const from = ch.listings_from || [];
+  const parts = [];
+  if (ch.listings_pinned_name) parts.push(`pinned to ${ch.listings_pinned_name}`);
+  const others = from.filter(n => n !== ch.listings_pinned_name);
+  if (others.length) parts.push(`${ch.listings_pinned_name ? 'gaps' : 'some times'} filled from ${others.join(', ')}`);
+  return parts.join('; ');
+}
+
 function renderGroupBadge(ch) {
   const badge = document.querySelector(`.guide-group-badge[data-channel-id="${ch.id}"]`);
   if (!badge) return;
@@ -2489,6 +2505,7 @@ function renderGroupBadge(ch) {
   badge.dataset.tip = escTipAttr(
     `Channel group - records from the best of ${ch.member_count || 0} feeds\n` +
     `Active: ${ch.active_channel_name || '-'}` +
+    (groupListingsText(ch) ? `\nListings: ${groupListingsText(ch)}` : '') +
     (memberLines.length ? `\n${memberLines.join('\n')}` : ''));
 }
 
