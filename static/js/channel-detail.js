@@ -24,7 +24,7 @@
   // over a flex column, so nothing in the page's DOM is moved or rebuilt.
 
   const SEC_NAMES = {
-    health: 'Channel Health', settings: 'Settings', whatson: "What's On",
+    health: 'Channel Health', settings: 'Settings', whatson: "What's On", guide: 'Guide source',
     timeline: 'Activity Timeline', url: 'Stream URL',
     recordings: 'Recording Observations', tests: 'Test History',
   };
@@ -425,6 +425,119 @@
     return modal;
   }
 
+  // ── EPG key (DESIGN-epg-sources.md §6.1) ───────────────────────────────────
+  // The key is this channel's id in one source's XMLTV file, kept through every sync. The
+  // server decides what saving it does to the listings and says so in `message`.
+
+  function saveEpgKey(sourceId, key) {
+    return jsonFetch(C.urls.epgKey, {
+      method: 'POST', body: JSON.stringify({ source_id: sourceId, key }),
+    }).then(data => {
+      showToast(data.message);
+      if (data.changed) setTimeout(() => location.reload(), 1500);
+    });
+  }
+
+  function clearEpgKey(el) {
+    if (!confirm(`Clear your EPG key for ${el.dataset.sourceName}?\n\n` +
+        "This channel goes back to the provider's id for that source.")) return;
+    saveEpgKey(Number(el.dataset.sourceId), '')
+      .catch(e => showToast(e.message || 'Could not clear the key.', { type: 'error' }));
+  }
+
+  // Use this source / Clear override (DESIGN-epg-sources.md §6.2). No confirm: nothing is
+  // deleted, and the other button undoes it.
+  function setEpgOverride(el) {
+    const sourceId = el.dataset.sourceId ? Number(el.dataset.sourceId) : null;
+    el.disabled = true;
+    jsonFetch(C.urls.epgOverride, {
+      method: 'POST', body: JSON.stringify({ source_id: sourceId }),
+    }).then(data => {
+      showToast(data.message);
+      if (data.changed) setTimeout(() => location.reload(), 1500);
+      else el.disabled = false;
+    }).catch(e => {
+      el.disabled = false;
+      showToast(e.message || 'Could not change the override.', { type: 'error' });
+    });
+  }
+
+  function openEpgKeyModal(el) {
+    const sourceId = Number(el.dataset.sourceId);
+    const body = document.createElement('div');
+    body.innerHTML =
+      `<p class="text-muted small">This channel's id in <strong>${escHtml(el.dataset.sourceName)}</strong>'s ` +
+      "guide file. It is kept through every sync; Clear key goes back to the provider's id.</p>" +
+      '<input type="text" id="cd-epg-key" class="form-control" maxlength="255" autocomplete="off">' +
+      '<div class="gd-field full"><div class="gd-field-lbl">Find it in this source</div>' +
+      '<input type="search" id="cd-epg-find" class="form-control" autocomplete="off" ' +
+      'placeholder="Search ids and channel names"></div>' +
+      '<div class="gs-lookup-results" id="cd-epg-results"></div>';
+    const keyInput = body.querySelector('#cd-epg-key');
+    const findInput = body.querySelector('#cd-epg-find');
+    const results = body.querySelector('#cd-epg-results');
+    keyInput.value = el.dataset.key || '';
+
+    const describe = (r) => {
+      const names = r.display_names.length ? escHtml(r.display_names.join(', ')) : '';
+      const listings = r.entry_count === 0 ? 'no listings'
+        : r.sole_title !== null
+          ? `${r.entry_count.toLocaleString()} listings, one program all day: <em>${escHtml(r.sole_title || '(untitled)')}</em>`
+          : `${r.entry_count.toLocaleString()} listings, ${r.distinct_titles}${r.distinct_titles >= C.epgTitleCap ? '+' : ''} titles`;
+      return `<code>${escHtml(r.xml_id)}</code> <span class="text-muted small">${names}` +
+        `${names ? ' &middot; ' : ''}${listings}</span>`;
+    };
+
+    let seq = 0;
+    let timer = null;
+    const search = () => {
+      const q = findInput.value.trim();
+      const mine = ++seq;
+      if (!q) { results.innerHTML = ''; return; }
+      jsonFetch(`${C.urls.epgKeyLookup}?source_id=${sourceId}&q=${encodeURIComponent(q)}`)
+        .then(data => {
+          if (mine !== seq) return;   // a newer search already answered
+          if (!data.refreshed) {
+            results.innerHTML = "<p class=\"text-muted small\">This source has no successful refresh yet, so its channel list is empty.</p>";
+          } else if (!data.results.length) {
+            results.innerHTML = '<p class="text-muted small">Nothing in this source matches.</p>';
+          } else {
+            results.innerHTML = data.results.map(r =>
+              `<button type="button" class="gs-lookup-item" data-xml-id="${escHtml(r.xml_id)}">${describe(r)}</button>`
+            ).join('');
+          }
+        })
+        .catch(e => { if (mine === seq) results.innerHTML = `<p class="text-muted small">${escHtml(e.message || 'Search failed.')}</p>`; });
+    };
+    findInput.addEventListener('input', () => { clearTimeout(timer); timer = setTimeout(search, 250); });
+    results.addEventListener('click', (e) => {
+      const item = e.target.closest('[data-xml-id]');
+      if (!item) return;
+      keyInput.value = item.dataset.xmlId;
+      keyInput.focus();
+    });
+
+    buildModal({
+      title: 'Set EPG key',
+      body,
+      footer: [
+        { label: 'Cancel', class: 'btn' },
+        { label: 'Save', class: 'btn btn-primary', onClick: (close) => {
+          const key = keyInput.value.trim();
+          if (!key) {
+            showToast("Type a key, or use Clear key to go back to the provider's id.", { type: 'error' });
+            return false;
+          }
+          saveEpgKey(sourceId, key)
+            .then(close)
+            .catch(e => showToast(e.message || 'Could not save the key.', { type: 'error' }));
+          return false;
+        } },
+      ],
+    });
+    keyInput.focus();
+  }
+
   function openCreateCheck() {
     openCreateCheckModal({
       channelIds: [C.channelId],
@@ -777,6 +890,9 @@
       case 'preview': openPreview(); return;
       case 'add-group': openAddToGroupModal(); return;
       case 'create-check': openCreateCheck(); return;
+      case 'epg-key-set': openEpgKeyModal(el); return;
+      case 'epg-key-clear': clearEpgKey(el); return;
+      case 'epg-override': setEpgOverride(el); return;
       case 'delete-channel': deleteChannel(); return;
       case 'hide-channel': setHideOverride(el); return;
       case 'health-reset': rollbackHealth('reset'); return;

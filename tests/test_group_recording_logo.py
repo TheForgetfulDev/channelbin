@@ -7,6 +7,7 @@ by new_recording_json and re-stamped at record start/failover) was already
 available and already used for the pill's acct_color on the very same line.
 """
 import os
+import re
 import sys
 import unittest
 
@@ -55,8 +56,17 @@ class GroupRecordingLogoTests(unittest.TestCase):
         resp = self.t.client.get('/recordings')
         self.assertEqual(resp.status_code, 200)
         html = resp.get_data(as_text=True)
-        self.assertIn('group_rec_no_channel', html)
-        self.assertIn(str(orphan.id), html)
+        # The orphan's own row, found by its exact link rather than its id, which as a short
+        # number is somewhere on any page (dev/changelog/1097).
+        rows = re.findall(r'<div class="row [^"]*" data-href="/recordings/%d"(.*?)<div class="c-time"'
+                          % orphan.id, html, re.S)
+        self.assertEqual(len(rows), 1)
+        self.assertIn('<div class="name">group_rec_no_channel</div>', rows[0])
+        pills = re.findall(r'<a class="ch-pill"[^>]*>(.*?)</a>', rows[0], re.S)
+        self.assertEqual(len(pills), 1)
+        self.assertRegex(pills[0], r'<span class="ch-logo"[^>]*>MYG</span>')
+        self.assertNotIn('<img', pills[0])
+        self.assertNotIn('logo-fallback', rows[0])
 
 
 if __name__ == '__main__':

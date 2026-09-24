@@ -242,9 +242,6 @@
         {% if account.username %}
         <div class="srow wide"><span class="sk">Username</span><span class="sv endpoint">{{ account.username }}</span></div>
         {% endif %}
-        {% if not is_xtream and epg_endpoint %}
-        <div class="srow wide"><span class="sk">XMLTV</span><span class="sv endpoint">{{ epg_endpoint }}</span></div>
-        {% endif %}
       </div>
     </div>
   </div>
@@ -313,6 +310,90 @@
       </div>
       <div class="acst-sub"><span class="tip-plain" data-tip="{{ stats.tips.bands }}">Tested channels by health band</span></div>
       {{ acst.band_bar(cur, health_bands) }}
+    </div>
+  </div>
+
+  {# EPG sources (DESIGN-epg-sources.md §9.2): every source this account reads, in the
+     priority order that decides which one a channel's guide comes from. A url source's
+     address is account-owned and masked in full, like every other account URL (§17.4). #}
+  <div class="card" data-section="sources">
+    <div class="card-head"><h2>EPG sources{% if epg_sources %} <span class="cnt">{{ epg_sources | length }}</span>{% endif %}</h2>
+      <div class="card-head-actions">
+        <button class="btn btn-sm" data-act="source-add"
+                data-tip="Add an XMLTV guide file, or another account's guide, as a source for this account's channels.">+ Add source</button>
+      </div>
+    </div>
+    <div class="card-body">
+      {% if not epg_sources %}
+      <p class="card-note">This account reads no EPG source, so no guide data is imported for its channels. Add source takes an XMLTV URL or another account's guide.</p>
+      {% else %}
+      {% if epg_sources | selectattr('subscribed') | list | length > 1 %}
+      <p class="card-note">When more than one source has listings for a channel, its guide comes from the first one in this order that has a full schedule for it - a source listing one program all day gives way to one with a schedule. A channel's own page can pick a different source for that channel.</p>
+      {% endif %}
+      <div class="table-scroll">
+        <table class="tbl tbl-cards">
+          <thead><tr><th>Source</th><th>Last refresh</th><th class="num">Entries</th>
+            <th class="num"><span class="tip-plain" data-tip="Channels covered.&#10;Channels reading this source that it has at least one listing for in the import window.">Covered</span></th>
+            <th class="num"><span class="tip-plain" data-tip="Guide from here.&#10;Channels on this account whose guide listings come from this source right now.">Guide from here</span></th>
+            <th></th></tr></thead>
+          <tbody>
+          {% set n_read = epg_sources | selectattr('subscribed') | list | length %}
+          {% for s in epg_sources %}
+          <tr>
+            <td data-label="Source">{% if s.subscribed and n_read > 1 %}<span class="text-faint">{{ loop.index }}.</span> {% endif %}{{ s.name }}
+              <div class="text-faint small">{{ s.kind }}{% if not s.owned %} - from <a href="{{ url_for('accounts.account_detail', account_id=s.owner_id) }}">{{ s.owner_name }}</a>{% endif %}{% if not s.subscribed %} - not used by this account{% elif not s.enabled %} - turned off{% endif %}</div>
+              {% if s.url %}<div class="small"><code>{{ s.url }}</code></div>{% endif %}
+              {% if s.readers %}<div class="text-faint small">Also read by {% for r in s.readers %}<a href="{{ url_for('accounts.account_detail', account_id=r.id) }}">{{ r.name }}</a> ({{ '{:,}'.format(r.guided) }} channel{{ '' if r.guided == 1 else 's' }} guided from here){{ ', ' if not loop.last }}{% endfor %}</div>{% endif %}
+              {% if s.is_url and s.subscribed and s.enabled %}
+              <div class="text-faint small">{% if s.refresh_interval_hours %}Refreshes every {{ s.refresh_interval_hours }}h{% if s.next_refresh_at %}, next {{ s.next_refresh_at | local_time }}{% endif %}{% else %}Refreshes with this account's sync{% endif %}</div>
+              {% endif %}</td>
+            <td data-label="Last refresh">
+              {% if s.refreshing %}<span class="badge b-running"><span class="pulse"></span>Refreshing</span>
+              {% else %}{{ m.status_badge(s.status_badge, s.status_label) }}{% endif %}
+              {% if s.last_refresh_at %}<div class="text-faint small">{{ s.last_refresh_at | local_time }}</div>{% endif %}
+              {% if s.retry_at and not s.refreshing %}<div class="small">Waiting behind other work - retries {{ s.retry_at | local_time }}</div>{% endif %}
+              {% if s.last_error %}<div class="small">{{ s.last_error }}</div>{% endif %}</td>
+            <td data-label="Entries" class="num">{% if s.entry_count %}{{ '{:,}'.format(s.entry_count) }}{% else %}<span class="text-faint">0</span>{% endif %}</td>
+            <td data-label="Covered" class="num">{% if s.channel_count %}{{ '{:,}'.format(s.channel_count) }}{% else %}<span class="text-faint">0</span>{% endif %}</td>
+            <td data-label="Guide from here" class="num">{% if s.active_here %}{{ '{:,}'.format(s.active_here) }}{% else %}<span class="text-faint">0</span>{% endif %}</td>
+            <td class="num">
+              <span class="menu-wrap">
+                <button class="btn btn-sm btn-icon" data-menu aria-label="Actions for {{ s.name }}">&#8943;</button>
+                <div class="menu">
+                  {% if s.subscribed %}
+                  <a class="menu-item" href="{{ url_for('accounts.epg_source_review', source_id=s.id) }}"
+                     data-tip="Channels whose name matches one in this source's file, for you to accept or reject. Nothing changes until you accept one.">Name matches &rarr;</a>
+                  {% if n_read > 1 %}
+                  <button class="menu-item" data-act="source-move" data-direction="up" data-source-id="{{ s.id }}"{% if loop.index == 1 %} disabled{% endif %}
+                          data-tip="Earlier sources win a channel when more than one has listings for it. Each channel's guide is re-decided from listings already here.">Move up</button>
+                  <button class="menu-item" data-act="source-move" data-direction="down" data-source-id="{{ s.id }}"{% if loop.index == n_read %} disabled{% endif %}>Move down</button>
+                  {% endif %}
+                  {% endif %}
+                  {% if not s.subscribed %}
+                  <button class="menu-item" data-act="source-use" data-source-id="{{ s.id }}">Use again</button>
+                  {% elif s.is_url and s.owned %}
+                  <button class="menu-item" data-act="source-refresh" data-source-id="{{ s.id }}"{% if s.refreshing or not s.enabled %} disabled{% endif %}>Refresh now</button>
+                  <button class="menu-item" data-act="source-edit" data-source-id="{{ s.id }}">Edit&hellip;</button>
+                  <div class="sep"></div>
+                  <button class="menu-item danger" data-act="source-delete" data-source-id="{{ s.id }}"
+                          data-source-name="{{ s.name }}" data-active-here="{{ s.active_here }}"
+                          data-readers="{% for r in s.readers %}{{ r.name }} ({{ '{:,}'.format(r.guided) }} channel{{ '' if r.guided == 1 else 's' }} guided from here){{ ', ' if not loop.last }}{% endfor %}">Delete</button>
+                  {% else %}
+                  <button class="menu-item" data-act="source-stop" data-source-id="{{ s.id }}"
+                          data-source-name="{{ s.name }}" data-active-here="{{ s.active_here }}"
+                          {% if not s.owned %}data-owner-name="{{ s.owner_name }}"{% endif %}
+                          data-readers="{% for r in s.readers %}{{ r.name }} ({{ '{:,}'.format(r.guided) }} channel{{ '' if r.guided == 1 else 's' }} guided from here){{ ', ' if not loop.last }}{% endfor %}"
+                          data-tip="Stop using this guide on this account. Its listings go, and each channel switches to its next source.">Stop using</button>
+                  {% endif %}
+                </div>
+              </span>
+            </td>
+          </tr>
+          {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      {% endif %}
     </div>
   </div>
 
@@ -427,6 +508,7 @@ window.ACCOUNT_DETAIL = {
   xtreamDebug: {{ 'true' if xtream_debug else 'false' }},
   browseUrl: {{ url_for('channels.channel_browser', **{'f.acct': account.id}) | tojson }},
   accountsUrl: {{ url_for('accounts.accounts_list') | tojson }},
+  sourceHours: {{ source_hours_choices | list | tojson }},
 };
 </script>
 <script src="{{ url_for('static', filename='js/account-modal.js') }}"></script>

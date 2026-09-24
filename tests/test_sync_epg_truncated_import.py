@@ -1,12 +1,12 @@
 """A truncated/malformed XMLTV must never finish as a healthy sync (dev/changelog/719).
 
-`_import_xmltv` deletes the account's future EPG in its own committed transaction BEFORE
+`import_source` deletes the account's future EPG in its own committed transaction BEFORE
 the parse loop (deliberately - the write lock must not be held across the parse). So when
 the payload stopped parsing partway, the guide was left holding only what had been
 imported while the sync log said plain SUCCESS: a 95%-empty guide reported as healthy,
 which is the founding product principle inverted. The parse-error branch now returns an
 `import truncated:` degradation reason, which finishes the sync PARTIAL and raises the
-standing SYNC_EPG_IMPORT_TRUNCATED alert.
+standing EPG_SOURCE_IMPORT_TRUNCATED alert.
 
 The collapse guard's count pass had the mirror-image defect: no exception handling at all,
 so the identical payload raised out of `_count_projected_epg_entries` and failed the WHOLE
@@ -17,7 +17,7 @@ fact rather than on the threshold math, keeping the old EPG.
 Covers:
   - CountPassTests: `_count_projected_epg_entries` reports rather than raises, and returns
     what parsed before the break.
-  - TruncatedImportTests: `_import_xmltv`'s reason, its count honesty (entries still
+  - TruncatedImportTests: `import_source`'s reason, its count honesty (entries still
     buffered when the parse died are flushed, not counted as imported and dropped), and
     that a truncation caught by the count pass refuses instead of deleting.
   - AlertRoutingTests: end-to-end `_do_sync` - PARTIAL, the truncated alert and not either
@@ -41,11 +41,12 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from app import db  # noqa: E402
 from app.accounts import (  # noqa: E402
     EPG_DEGRADATION_ALERT_TYPES, _count_projected_epg_entries, _do_sync,
-    _epg_degradation_alert_type, _import_xmltv,
+    _epg_degradation_alert_type, import_source,
 )
 from app.alerts import ALERT_TYPES  # noqa: E402
 from app.database import Account, AccountSyncLog, Alert, Channel, EPGEntry, M3uAccount  # noqa: E402
 from tests.support import make_test_app  # noqa: E402
+from tests.support.seed import make_epg_source  # noqa: E402
 
 M3U_URL = 'http://provider.test/playlist.m3u8?user=realuser&pass=realpass'
 EPG_URL = 'http://provider.test/xmltv.php?username=realuser&password=realpass'
@@ -89,6 +90,7 @@ def _fake_get_factory(xml_bytes):
     def _fake_get(url, **kwargs):
         resp = mock.Mock()
         resp.raise_for_status = mock.Mock()
+        resp.status_code = 200
         if url == M3U_URL:
             resp.content = M3U_PLAYLIST.encode('utf-8')
             return resp
@@ -112,20 +114,20 @@ class CountPassTests(unittest.TestCase):
                                             self.window_start, self.window_end)
 
     def test_truncated_payload_reports_the_error_rather_than_raising(self):
-        count, parse_error = self._count(_truncated_xmltv(4))
+        count, parse_error, *_ = self._count(_truncated_xmltv(4))
         self.assertIsNotNone(parse_error, 'a truncated payload must not raise out of the '
                                           'count pass and fail the whole sync')
         self.assertEqual(count, 4, 'the count returned alongside an error is what parsed '
                                    'before the break')
 
     def test_healthy_payload_still_reports_no_error(self):
-        count, parse_error = self._count(_xmltv(4))
+        count, parse_error, *_ = self._count(_xmltv(4))
         self.assertEqual(count, 4)
         self.assertIsNone(parse_error)
 
 
 class TruncatedImportTests(unittest.TestCase):
-    """`_import_xmltv` on a payload that stops parsing - both sides of the delete."""
+    """`import_source` on a payload that stops parsing - both sides of the delete."""
 
     def setUp(self):
         self.t = make_test_app()
@@ -150,6 +152,7 @@ class TruncatedImportTests(unittest.TestCase):
         for i in range(count):
             db.session.add(EPGEntry(
                 channel_id=self.channel.id, title=f'Old {i}',
+                source_id=make_epg_source(self.account).id,
                 start_time=now + timedelta(hours=i),
                 stop_time=now + timedelta(hours=i, minutes=30),
             ))
@@ -159,8 +162,8 @@ class TruncatedImportTests(unittest.TestCase):
 
     def test_truncation_after_the_delete_returns_a_named_degradation_reason(self):
         # Guard disabled, so nothing runs before the delete - the silent-success path.
-        synced, reason = _import_xmltv(
-            self.account, _truncated_xmltv(5), epg_days=3,
+        synced, reason = import_source(
+            make_epg_source(self.account), _truncated_xmltv(5), epg_days=3,
             cfg={'sync': {'epg_collapse_threshold_percent': 0}})
 
         self.assertIsNotNone(reason, 'a truncated import must not report a healthy sync')
@@ -169,8 +172,8 @@ class TruncatedImportTests(unittest.TestCase):
         self.assertIn('5 entries', reason, 'the reason names how much actually landed')
 
     def test_the_entries_that_did_parse_are_kept(self):
-        synced, _reason = _import_xmltv(
-            self.account, _truncated_xmltv(5), epg_days=3,
+        synced, _reason = import_source(
+            make_epg_source(self.account), _truncated_xmltv(5), epg_days=3,
             cfg={'sync': {'epg_collapse_threshold_percent': 0}})
         self.assertEqual(self._epg_count(), 5)
         self.assertEqual(synced, 5)
@@ -178,8 +181,8 @@ class TruncatedImportTests(unittest.TestCase):
     def test_reported_count_matches_what_was_actually_inserted(self):
         # `synced` counts rows appended to the pending batch, so anything still buffered
         # when the parse died was reported as imported and then dropped on the way out.
-        synced, reason = _import_xmltv(
-            self.account, _truncated_xmltv(7), epg_days=3,
+        synced, reason = import_source(
+            make_epg_source(self.account), _truncated_xmltv(7), epg_days=3,
             cfg={'sync': {'epg_collapse_threshold_percent': 0}})
         self.assertEqual(self._epg_count(), synced,
                          'the returned count must equal the rows actually in the database')
@@ -187,8 +190,8 @@ class TruncatedImportTests(unittest.TestCase):
 
     def test_truncation_caught_by_the_count_pass_refuses_and_keeps_the_old_epg(self):
         self._seed_old_epg(10)
-        synced, reason = _import_xmltv(
-            self.account, _truncated_xmltv(5), epg_days=3,
+        synced, reason = import_source(
+            make_epg_source(self.account), _truncated_xmltv(5), epg_days=3,
             cfg={'sync': {'epg_collapse_threshold_percent': 20}})
 
         self.assertEqual(synced, 0)
@@ -199,8 +202,8 @@ class TruncatedImportTests(unittest.TestCase):
 
     def test_force_epg_resync_imports_what_parses_from_a_truncated_payload(self):
         self._seed_old_epg(10)
-        synced, reason = _import_xmltv(
-            self.account, _truncated_xmltv(5), epg_days=3,
+        synced, reason = import_source(
+            make_epg_source(self.account), _truncated_xmltv(5), epg_days=3,
             cfg={'sync': {'epg_collapse_threshold_percent': 20}}, force_epg_resync=True)
 
         self.assertEqual(synced, 5)
@@ -208,21 +211,22 @@ class TruncatedImportTests(unittest.TestCase):
         self.assertEqual(self._epg_count(), 5, 'the bypass proceeds through the delete')
 
     def test_a_healthy_payload_is_still_reported_healthy(self):
-        synced, reason = _import_xmltv(
-            self.account, _xmltv(5), epg_days=3,
+        synced, reason = import_source(
+            make_epg_source(self.account), _xmltv(5), epg_days=3,
             cfg={'sync': {'epg_collapse_threshold_percent': 0}})
         self.assertEqual(synced, 5)
         self.assertIsNone(reason)
 
 
 class AlertRoutingTests(unittest.TestCase):
-    """End-to-end `_do_sync`: PARTIAL plus SYNC_EPG_IMPORT_TRUNCATED, never a sibling."""
+    """End-to-end `_do_sync`: PARTIAL plus EPG_SOURCE_IMPORT_TRUNCATED, never a sibling."""
 
     def setUp(self):
         self.t = make_test_app()
         self.account = M3uAccount(name='Routing Test', m3u_url=M3U_URL, epg_url=EPG_URL,
                                   status='OK')
         db.session.add(self.account)
+        self.source_id = make_epg_source(self.account).id
         db.session.commit()
 
     def tearDown(self):
@@ -240,10 +244,10 @@ class AlertRoutingTests(unittest.TestCase):
     def _alerts(self, alert_type, source_suffix):
         return Alert.query.filter_by(
             alert_type=alert_type,
-            source=f'account:{self.account.id}:{source_suffix}').all()
+            source=f'epg-source:{self.source_id}:{source_suffix}').all()
 
     def _truncated_alerts(self):
-        return self._alerts('SYNC_EPG_IMPORT_TRUNCATED', 'epg-truncated')
+        return self._alerts('EPG_SOURCE_IMPORT_TRUNCATED', 'truncated')
 
     def test_truncated_import_finishes_partial_with_its_own_alert(self):
         self._sync(_truncated_xmltv(5))
@@ -255,10 +259,10 @@ class AlertRoutingTests(unittest.TestCase):
         alerts = self._truncated_alerts()
         self.assertEqual(len(alerts), 1)
         self.assertIsNone(alerts[0].dismissed_at)
-        self.assertEqual(self._alerts('SYNC_EPG_FETCH_FAILED', 'epg-fetch'), [],
+        self.assertEqual(self._alerts('EPG_SOURCE_FETCH_FAILED', 'fetch'), [],
                          'the fetch succeeded - its alert promises the old EPG was kept, '
                          'which is false on this path')
-        self.assertEqual(self._alerts('SYNC_EPG_COLLAPSE_REFUSED', 'epg-collapse'), [])
+        self.assertEqual(self._alerts('EPG_SOURCE_COLLAPSE_REFUSED', 'collapse'), [])
 
     def test_account_status_stays_ok_and_the_channel_sync_is_not_blamed(self):
         self._sync(_truncated_xmltv(5))
@@ -308,7 +312,7 @@ class DegradationPrefixTests(unittest.TestCase):
         # degraded sync with no alert at all. Loud and misfiled beats silent.
         with self.assertLogs('app.accounts', level='ERROR'):
             self.assertEqual(_epg_degradation_alert_type('something new: happened'),
-                             'SYNC_EPG_FETCH_FAILED')
+                             'EPG_SOURCE_FETCH_FAILED')
 
 
 if __name__ == '__main__':

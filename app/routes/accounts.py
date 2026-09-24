@@ -1,6 +1,6 @@
 import json
 import threading
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from flask import (Blueprint, render_template, request, redirect, url_for, flash, current_app,
                    abort, jsonify)
@@ -10,15 +10,28 @@ from ..accounts import (NORM_DISABLED, NORM_MODES, coerce_normalization_mode,
                         norm_mode_example, norm_mode_label, normalize_url_with_mode,
                         resolve_normalization_mode, url_is_normalizable,
                         recompute_duplicate_stream_urls_and_commit, finalize_sync_state,
-                        next_sync_map, sync_signature)
+                        next_sync_map, report_source_removed, resolve_source_alerts,
+                        start_source_refresh, sync_signature, update_source_stale_alert)
 from .. import account_stats_view
 from ..account_stats import WINDOWS, today_local, windowed_stats
 from ..channel_groups import report_orphaned_guide_groups
 from ..channel_search import GROUP_ANY, OTHER_NEW, OTHER_REMOVED
 from ..config import load_config, config_default
-from ..database import Account, AccountStatDay, Channel, AccountSyncLog, ChannelGroupMember
+from ..database import (Account, AccountStatDay, Channel, AccountSyncLog, ChannelGroupMember,
+                        EpgSource, EpgSourceSubscription, EPG_SOURCE_PROVIDER,
+                        EPG_SOURCE_URL)
 from ..db_utils import retry_on_locked
+from ..epg_sources import (MATCH_DISAGREE, MATCH_NEW, REFRESH_HOURS_CHOICES,
+                           accept_name_matches, account_sources_view,
+                           add_url_source, borrowable_sources, clean_url_source_fields,
+                           delete_sources_for_account, delete_url_source,
+                           ensure_provider_source, foreign_guided_channels, foreign_readers, has_directory,
+                           forget_reader, move_source, name_match_review, propose_again,
+                           reject_name_matches, rejected_name_matches, reresolve_channels,
+                           stop_using_source, subscribe_to_source, update_url_source,
+                           use_source_again)
 from ..logo_cache import delete_cached_logos
+from ..tz_utils import format_local, get_display_tz, is_24h
 from ..ui_constants import PRESET_COLORS
 from ..url_utils import mask_url_path
 from .channels import _chunked, _DELETE_CHUNK_SIZE
@@ -29,7 +42,7 @@ accounts_bp = Blueprint('accounts', __name__)
 # user's own order/hidden picks ride on the same server-side user-prefs store the group
 # detail page uses, so a saved layout follows them across browsers - and a layout saved
 # before a section existed shows it at its default place (util.js initSectionLayout).
-ACCOUNT_SECTIONS = ['details', 'content', 'usage', 'history', 'activity']
+ACCOUNT_SECTIONS = ['details', 'content', 'sources', 'usage', 'history', 'activity']
 
 # How many sync runs the Sync history section shows before its "All N syncs" control.
 # Expanding loads the rest in place - there is no separate history page any more
@@ -262,7 +275,8 @@ def _account_detail_payload(account, cfg, stats):
         # the credential, and no heuristic can tell (DESIGN-secrets.md §4.2, DESIGN.md §17.4).
         'endpoint': mask_url_path(account.base_url if (account.account_type or 'm3u') == 'xtream'
                                   else account.m3u_url),
-        'epg_endpoint': mask_url_path(account.epg_url),
+        'epg_sources': account_sources_view(account.id, _epg_source_schedule()),
+        'source_hours_choices': REFRESH_HOURS_CHOICES,
         # The filtered channel-browser links the new/missing counts point at. These were also
         # the deep-link targets of the SYNC_CHANNELS_NEW/SYNC_CHANNELS_MISSING alerts until
         # dev/changelog/928 retired them - this page is now the only route to them, which is
@@ -273,6 +287,11 @@ def _account_detail_payload(account, cfg, stats):
         'removed_channels_url': url_for('channels.channel_browser',
                                          **{'f.other': OTHER_REMOVED, 'f.acct': account.id}),
     }
+
+
+def _epg_source_schedule() -> dict:
+    from ..scheduler import epg_source_schedule
+    return epg_source_schedule()
 
 
 @accounts_bp.route('/accounts/<int:account_id>')
@@ -320,6 +339,7 @@ def new_account():
 
     if request.method == 'POST':
         errors = _validate_account_form(request.form)
+        xmltv = _form_xmltv_fields(request.form, errors)
         if errors:
             for e in errors:
                 flash(e, 'error')
@@ -359,13 +379,23 @@ def new_account():
                 **_type_fields(form, account_type),
             )
             db.session.add(account)
+            db.session.flush()
+            if account_type == 'xtream':
+                ensure_provider_source(account)
+            source_id = add_url_source(account, xmltv).id if xmltv else None
             db.session.commit()
-            return account.id, account.name
+            return account.id, account.name, source_id
 
-        account_id, account_name = _create()
+        account_id, account_name, source_id = _create()
 
         from ..scheduler import schedule_account_sync
-        schedule_account_sync(current_app._get_current_object(), account_id)
+        app_obj = current_app._get_current_object()
+        schedule_account_sync(app_obj, account_id)
+        if source_id is not None:
+            # The source's directory is empty until its first import, so it covers nothing
+            # until then - fetch it now rather than at the account's first sync.
+            _, refresh_message = start_source_refresh(app_obj, source_id)
+            flash(refresh_message, 'info')
 
         if dup is not None:
             flash(_duplicate_warning(dup, account_type), 'warning')
@@ -504,9 +534,32 @@ def _delete_account_and_jobs(account_id):
                               _SYNC_STOP_TIMEOUT_SECONDS):
         return False, _sync_still_running_message(account_id)
 
+    # A source refresh has no stop signal to send, and one left running would go on writing
+    # rows for sources the delete below removes - refused, like a sync that will not stop.
+    owned_sources = EpgSource.query.filter_by(owner_account_id=account_id).all()
+    busy = [src.name for src in owned_sources if src.refresh_started_at is not None]
+    if busy:
+        return False, (f'EPG source "{busy[0]}" is being refreshed right now. Delete the '
+                       'account once that has finished.')
+    owned_source_ids = [src.id for src in owned_sources]
+    source_names = {src.id: src.name for src in owned_sources}
+    # Other accounts reading this account's sources, and their channels whose guide comes
+    # from one, read while the pointers still exist - the delete clears them
+    # (DESIGN-epg-sources.md §9.5, dev/changelog/763). And the sources this account reads
+    # from others, which are recounted once it has gone.
+    readers = foreign_readers(owned_source_ids, account_id)
+    guided_elsewhere = foreign_guided_channels(owned_source_ids, account_id)
+    read_elsewhere = [sid for (sid,) in db.session.query(EpgSourceSubscription.source_id)
+                      .join(EpgSource, EpgSource.id == EpgSourceSubscription.source_id)
+                      .filter(EpgSourceSubscription.account_id == account_id,
+                              EpgSource.owner_account_id != account_id)]
+
     if get_scheduler():
+        from ..scheduler import remove_epg_source_jobs
         remove_job_if_exists(f'account_sync_{account_id}')
         remove_job_if_exists(sync_retry_job_id(account_id))
+        for sid in owned_source_ids:
+            remove_epg_source_jobs(sid)
 
     # Cached logo files aren't part of the ORM graph (they're bytes on disk, not rows),
     # so the account's own delete-orphan cascade won't touch them - capture the paths
@@ -541,11 +594,25 @@ def _delete_account_and_jobs(account_id):
         # Not in the ORM cascade: the ledger has no relationship on Account, and a day row
         # left behind would credit a future account that reused the id.
         AccountStatDay.query.filter_by(account_id=account_id).delete(synchronize_session=False)
+        # Nor are its EPG sources, which may hold hundreds of thousands of rows across two
+        # tables and are bulk-deleted rather than cascaded (DESIGN-epg-sources.md §9.5).
+        delete_sources_for_account(account_id)
         db.session.delete(account)
         db.session.commit()
         return name
 
     name = _delete()
+    for sid in owned_source_ids:
+        resolve_source_alerts(sid)
+    outcome = (reresolve_channels(list(guided_elsewhere), _case_sensitive(),
+                                  previous=guided_elsewhere, source_names=source_names)
+               if guided_elsewhere else {})
+    for sid in owned_source_ids:
+        report_source_removed(sid, source_names[sid],
+                              f'with its account "{name}"' if name else 'with its account',
+                              readers, guided_elsewhere, outcome)
+    if read_elsewhere:
+        forget_reader(read_elsewhere)
     if cached_paths:
         delete_cached_logos(cached_paths)
     report_orphaned_guide_groups(
@@ -665,7 +732,6 @@ def account_settings_api(account_id):
             'name': account.name,
             'account_type': account.account_type or 'm3u',
             'm3u_url': account.m3u_url or '',
-            'epg_url': account.epg_url or '',
             'base_url': account.base_url or '',
             'username': account.username or '',
             'has_password': bool(account.password),
@@ -819,6 +885,497 @@ def cancel_sync_api(account_id):
     return jsonify({'success': True, 'message': _cancel_sync(account)})
 
 
+# ── EPG sources on the account page (DESIGN-epg-sources.md §9.2) ──────────────────
+
+def _json_owned_source(account_id, source_id, *, url_only=True):
+    """(account, source, error_response) for a source this account owns. Adding, editing,
+    deleting and refreshing are the owner's (§3); a provider source is edited only by
+    editing its account."""
+    account, err = _json_account(account_id)
+    if err:
+        return None, None, err
+    source = db.session.get(EpgSource, source_id)
+    if source is None or source.owner_account_id != account_id:
+        return None, None, (jsonify({'error': 'EPG source not found on this account.'}), 404)
+    if url_only and source.kind != EPG_SOURCE_URL:
+        return None, None, (jsonify({'error': "The provider's guide comes with the account - "
+                                              'edit the account instead.'}), 400)
+    return account, source, None
+
+
+def _case_sensitive() -> bool:
+    return load_config().get('sync', {}).get('epg_case_sensitive_matching', False)
+
+
+def _removal_message(name: str, done, verb: str) -> str:
+    if not done.affected:
+        return f'{verb} "{name}". No channel on this account was getting its guide from it.'
+    parts = []
+    if done.switched:
+        parts.append(f'{done.switched:,} now take their guide from another source')
+    if done.lost:
+        parts.append(f'{done.lost:,} have no guide from any source now')
+    return (f'{verb} "{name}". {done.affected:,} channel(s) were getting their guide from it: '
+            + ', and '.join(parts) + '.')
+
+
+@accounts_bp.route('/api/accounts/<int:account_id>/epg-sources', methods=['POST'])
+def add_epg_source_api(account_id):
+    """Add source (URL). Subscribed last, then fetched at once in the background: until
+    its first import its directory is empty and it covers nothing (§12.1)."""
+    account, err = _json_account(account_id)
+    if err:
+        return err
+    errors, fields = clean_url_source_fields(request.get_json(silent=True) or {}, account.name)
+    if errors:
+        return jsonify({'error': ' '.join(errors)}), 400
+
+    @retry_on_locked()
+    def _add_and_commit():
+        source = add_url_source(db.session.get(Account, account_id), fields)
+        db.session.commit()
+        return source.id
+
+    source_id = _add_and_commit()
+    app_obj = current_app._get_current_object()
+    from ..scheduler import schedule_epg_source_refresh
+    started, message = start_source_refresh(app_obj, source_id)
+    if fields['refresh_interval_hours']:
+        schedule_epg_source_refresh(
+            app_obj, source_id,
+            first_run=datetime.utcnow() + timedelta(hours=fields['refresh_interval_hours']))
+    return jsonify({'success': True, 'source_id': source_id, 'refresh_started': started,
+                    'message': f'Added "{fields["name"]}". {message}'})
+
+
+@accounts_bp.route('/api/accounts/<int:account_id>/epg-sources/<int:source_id>',
+                   methods=['GET'])
+def epg_source_settings_api(account_id, source_id):
+    """The Edit source dialog's values. The URL is served in full, as the account's own
+    URLs are to the edit-account modal: this is the owner's settings dialog, and a masked
+    value saved back would replace the real one."""
+    _account, source, err = _json_owned_source(account_id, source_id)
+    if err:
+        return err
+    return jsonify({'success': True, 'source': {
+        'id': source.id, 'name': source.name, 'url': source.url or '',
+        'refresh_interval_hours': source.refresh_interval_hours or '',
+        'enabled': bool(source.enabled)}})
+
+
+@accounts_bp.route('/api/accounts/<int:account_id>/epg-sources/<int:source_id>',
+                   methods=['POST'])
+def save_epg_source_api(account_id, source_id):
+    account, source, err = _json_owned_source(account_id, source_id)
+    if err:
+        return err
+    errors, fields = clean_url_source_fields(request.get_json(silent=True) or {}, account.name)
+    if errors:
+        return jsonify({'error': ' '.join(errors)}), 400
+
+    @retry_on_locked()
+    def _save_and_commit():
+        changed = update_url_source(db.session.get(EpgSource, source_id), fields)
+        db.session.commit()
+        return changed
+
+    url_changed = _save_and_commit()
+    update_source_stale_alert(source_id)
+    app_obj = current_app._get_current_object()
+    from ..scheduler import schedule_epg_source_refresh
+    message = f'Saved "{fields["name"]}".'
+    if url_changed and fields['enabled']:
+        # A new URL is a different file, and the directory describes the old one.
+        message += ' ' + start_source_refresh(app_obj, source_id)[1]
+        first = (datetime.utcnow() + timedelta(hours=fields['refresh_interval_hours'])
+                 if fields['refresh_interval_hours'] else None)
+        schedule_epg_source_refresh(app_obj, source_id, force_reschedule=True, first_run=first)
+    else:
+        schedule_epg_source_refresh(app_obj, source_id, force_reschedule=True)
+    return jsonify({'success': True, 'message': message})
+
+
+@accounts_bp.route('/api/accounts/<int:account_id>/epg-sources/<int:source_id>',
+                   methods=['DELETE'])
+def delete_epg_source_api(account_id, source_id):
+    """Delete a url source (§9.5): its listings, directory, keys and jobs, and every
+    channel it was the guide for moves to its next source. Refused while it is being
+    refreshed - the import would go on writing rows for a source that no longer exists."""
+    _account, source, err = _json_owned_source(account_id, source_id)
+    if err:
+        return err
+    if source.refresh_started_at is not None:
+        return jsonify({'error': f'"{source.name}" is being refreshed right now. Delete it '
+                                 'once the refresh has finished.'}), 409
+    name = source.name
+    readers = foreign_readers([source_id], account_id)
+    guided_elsewhere = foreign_guided_channels([source_id], account_id)
+    from ..scheduler import remove_epg_source_jobs
+    remove_epg_source_jobs(source_id)
+    done = delete_url_source(source_id, _case_sensitive())
+    resolve_source_alerts(source_id)
+    if readers:
+        outcome = dict(db.session.query(Channel.id, Channel.epg_source_id).filter(
+            Channel.id.in_(list(guided_elsewhere)))) if guided_elsewhere else {}
+        report_source_removed(source_id, name, f'by hand on "{_account.name}"', readers,
+                              guided_elsewhere, outcome)
+    if done is None:
+        return jsonify({'success': True, 'message': 'EPG source deleted.'})
+    return jsonify({'success': True, 'message': _removal_message(name, done, 'Deleted')})
+
+
+@accounts_bp.route('/api/accounts/<int:account_id>/epg-sources/<int:source_id>/refresh',
+                   methods=['POST'])
+def refresh_epg_source_api(account_id, source_id):
+    _account, source, err = _json_owned_source(account_id, source_id)
+    if err:
+        return err
+    if not source.enabled:
+        return jsonify({'error': f'"{source.name}" is turned off. Turn it on in Edit '
+                                 'first.'}), 400
+    if source.refresh_started_at is not None:
+        return jsonify({'error': f'"{source.name}" is already being refreshed.'}), 409
+    started, message = start_source_refresh(current_app._get_current_object(), source_id)
+    return jsonify({'success': True, 'refresh_started': started, 'message': message})
+
+
+@accounts_bp.route('/api/accounts/<int:account_id>/epg-sources/<int:source_id>/stop-using',
+                   methods=['POST'])
+def stop_using_epg_source_api(account_id, source_id):
+    """Stop reading a source (§3). Offered for the provider's guide; a url source is
+    deleted instead, since nothing else can read it yet."""
+    account, err = _json_account(account_id)
+    if err:
+        return err
+    source = db.session.get(EpgSource, source_id)
+    if source is None:
+        return jsonify({'error': 'EPG source not found.'}), 404
+    if source.refresh_started_at is not None:
+        return jsonify({'error': f'"{source.name}" is being refreshed right now. Try again '
+                                 'once the refresh has finished.'}), 409
+    done = stop_using_source(account_id, source_id, _case_sensitive())
+    if done is None:
+        return jsonify({'error': 'This account is not using that source.'}), 400
+    from ..scheduler import schedule_epg_source_refresh
+    schedule_epg_source_refresh(current_app._get_current_object(), source_id,
+                                force_reschedule=True)
+    return jsonify({'success': True,
+                    'message': _removal_message(source.name, done, 'Stopped using')})
+
+
+@accounts_bp.route('/api/accounts/<int:account_id>/epg-sources/<int:source_id>/use-again',
+                   methods=['POST'])
+def use_epg_source_again_api(account_id, source_id):
+    """Undo Stop using. The source's listings come back at its next refresh - for the
+    provider's guide that is the account's next sync; nothing is fetched here, since that
+    fetch is a provider connection and Sync now is the control that makes one."""
+    _account, source, err = _json_owned_source(account_id, source_id, url_only=False)
+    if err:
+        return err
+
+    @retry_on_locked()
+    def _subscribe_and_commit():
+        added = use_source_again(account_id, source_id)
+        db.session.commit()
+        return added
+
+    if not _subscribe_and_commit():
+        return jsonify({'error': 'This account already uses that source.'}), 400
+    from ..scheduler import schedule_epg_source_refresh
+    schedule_epg_source_refresh(current_app._get_current_object(), source_id,
+                                force_reschedule=True)
+    return jsonify({'success': True,
+                    'message': f'Using "{source.name}" again. Its listings come back at its '
+                               'next refresh - Sync now fetches it now.'})
+
+
+@accounts_bp.route('/api/accounts/<int:account_id>/epg-sources/<int:source_id>/move',
+                   methods=['POST'])
+def move_epg_source_api(account_id, source_id):
+    """Body {direction: 'up' | 'down'}: one place in the account's priority order
+    (DESIGN-epg-sources.md §5.2). Every channel's guide is re-decided from listings already
+    held; nothing is fetched."""
+    _account, err = _json_account(account_id)
+    if err:
+        return err
+    direction = (request.get_json(silent=True) or {}).get('direction')
+    if direction not in ('up', 'down'):
+        return jsonify({'error': 'direction must be "up" or "down"'}), 400
+    # An import resolving these channels at the same time would race the moves.
+    busy = [name for (name,) in db.session.query(EpgSource.name)
+            .join(EpgSourceSubscription, EpgSourceSubscription.source_id == EpgSource.id)
+            .filter(EpgSourceSubscription.account_id == account_id,
+                    EpgSource.refresh_started_at.isnot(None))]
+    if busy:
+        return jsonify({'error': f'"{busy[0]}" is being refreshed right now. Try again once '
+                                 'the refresh has finished.'}), 409
+    done = move_source(account_id, source_id, -1 if direction == 'up' else 1,
+                       _case_sensitive())
+    if done is None:
+        return jsonify({'error': 'This account is not using that source.'}), 400
+    name = db.session.get(EpgSource, source_id).name
+    if not done.moved:
+        return jsonify({'success': True, 'message': f'"{name}" is already '
+                        f'{"first" if direction == "up" else "last"}.'})
+    if done.switched == 1:
+        switched = '1 channel now takes its guide from a different source.'
+    elif done.switched:
+        switched = f'{done.switched:,} channels now take their guide from a different source.'
+    else:
+        switched = 'No channel changed where its guide comes from.'
+    return jsonify({'success': True, 'switched': done.switched,
+                    'message': f'Moved "{name}" {direction}. {switched}'})
+
+
+@accounts_bp.route('/api/accounts/<int:account_id>/epg-sources/borrowable', methods=['GET'])
+def borrowable_epg_sources_api(account_id):
+    """Add source's "another account's guide" list: every source another account owns that
+    this one does not read, with what reading it would do to this account's channels today
+    (epg_sources.borrowable_sources). Only the owner's refresh ever fetches it."""
+    _account, err = _json_account(account_id)
+    if err:
+        return err
+    tz, h24 = get_display_tz(), is_24h()
+    sources = []
+    for s in borrowable_sources(account_id, _case_sensitive()):
+        s['last_success_at'] = (format_local(s['last_success_at'], tz=tz, h24=h24)
+                                if s['last_success_at'] else None)
+        sources.append(s)
+    return jsonify({'success': True, 'sources': sources})
+
+
+def _borrowed_message(source, owner_name: str, done) -> str:
+    """What subscribing did, in the order the user asks it: what has a guide now, what is
+    still to come, and when."""
+    when = (f'at "{owner_name}"\'s next sync' if source.kind == EPG_SOURCE_PROVIDER
+            else 'at its next refresh')
+    parts = [f'Now using "{source.name}" from "{owner_name}".']
+    if done.turned_on:
+        parts.append('Nobody was reading it, so it had stopped being downloaded; it is '
+                     'downloaded again from now on.')
+    if not done.refreshed:
+        parts.append(f'It has no successful refresh yet, so which channels it covers is not '
+                     f'known - its listings arrive {when}.')
+    elif not done.covered:
+        parts.append('Its last refresh has no listings for any channel on this account.')
+    else:
+        if done.copied:
+            parts.append(f'{done.copied:,} channel(s) got its listings right away, and '
+                         f'{done.guided:,} of them now take their guide from it.')
+        if done.waiting:
+            parts.append(f'{done.waiting:,} more it covers get their listings {when}.')
+    if source.kind == EPG_SOURCE_URL and not source.enabled:
+        parts.append(f'It is turned off on "{owner_name}", so it is not being refreshed.')
+    return ' '.join(parts)
+
+
+@accounts_bp.route('/api/accounts/<int:account_id>/epg-sources/subscribe', methods=['POST'])
+def subscribe_epg_source_api(account_id):
+    """Read another account's source (DESIGN-epg-sources.md §3). Last in this account's
+    priority order, so it only gives a guide where nothing above it covers the channel;
+    what the database already holds is copied at once and nothing is fetched."""
+    _account, err = _json_account(account_id)
+    if err:
+        return err
+    source_id = (request.get_json(silent=True) or {}).get('source_id')
+    source = db.session.get(EpgSource, source_id) if isinstance(source_id, int) else None
+    if source is None:
+        return jsonify({'error': 'EPG source not found.'}), 404
+    if source.owner_account_id == account_id:
+        return jsonify({'error': 'That source belongs to this account - use Use again on '
+                                 'its row instead.'}), 400
+    if source.refresh_started_at is not None:
+        return jsonify({'error': f'"{source.name}" is being refreshed right now. Try again '
+                                 'once the refresh has finished.'}), 409
+    owner_name = source.owner.name if source.owner else 'its account'
+    done = subscribe_to_source(account_id, source.id, _case_sensitive())
+    if done is None:
+        return jsonify({'error': 'This account already uses that source.'}), 400
+    from ..scheduler import schedule_epg_source_refresh
+    schedule_epg_source_refresh(current_app._get_current_object(), source.id,
+                                force_reschedule=True)
+    source = db.session.get(EpgSource, source.id)
+    return jsonify({'success': True, 'message': _borrowed_message(source, owner_name, done)})
+
+
+@accounts_bp.route('/api/accounts/<int:account_id>/epg-readers', methods=['GET'])
+def epg_readers_api(account_id):
+    """Other accounts reading this account's EPG sources, for the delete confirm's second
+    sentence (DESIGN-epg-sources.md §9.5)."""
+    _account, err = _json_account(account_id)
+    if err:
+        return err
+    owned = [sid for (sid,) in db.session.query(EpgSource.id)
+             .filter(EpgSource.owner_account_id == account_id)]
+    totals: dict[tuple[str, int], int] = {}
+    for fr in foreign_readers(owned, account_id):
+        key = (fr.account_name, fr.account_id)
+        totals[key] = totals.get(key, 0) + fr.guided
+    return jsonify({'success': True, 'readers': [
+        {'id': aid, 'name': n, 'guided': g} for (n, aid), g in sorted(totals.items())]})
+
+
+# ── Name matching review (DESIGN-epg-sources.md §7.5, dev/changelog/1105) ─────────
+
+_REVIEW_PER_PAGE = 100
+_REVIEW_VIEWS = ('proposals', 'disagreements', 'rejected')
+
+
+def _upcoming_view(entry, tz, h24) -> list[dict]:
+    out = []
+    for start, title in entry.upcoming or ():
+        try:
+            when = datetime.fromisoformat(start)
+        except (TypeError, ValueError):
+            continue
+        out.append({'at': format_local(when, 'monthday_time', tz=tz, h24=h24), 'title': title})
+    return out
+
+
+def _file_row_view(entry, tz, h24) -> dict:
+    return {'xml_id': entry.xml_id, 'entry_count': entry.entry_count,
+            'distinct_titles': entry.distinct_titles, 'sole_title': entry.sole_title,
+            'horizon': format_local(entry.horizon_until, 'monthday_time', tz=tz, h24=h24)
+            if entry.horizon_until else None,
+            'upcoming': _upcoming_view(entry, tz, h24)}
+
+
+@accounts_bp.route('/epg-sources/<int:source_id>/review')
+def epg_source_review(source_id):
+    """Name matches a source's file proposes for the channels reading it (§7.5). Nothing
+    here is applied until a person accepts it; the provider's id stays the match for
+    every channel nobody reviews. A fixed number of queries whatever the channel count -
+    proposals are computed in Python over one directory read and one channel read."""
+    source = db.session.get(EpgSource, source_id)
+    if source is None:
+        abort(404)
+    view = request.args.get('view', 'proposals')
+    if view not in _REVIEW_VIEWS:
+        view = 'proposals'
+    include_single = request.args.get('single') == '1'
+    unguided_only = request.args.get('unguided') == '1'
+    page = max(request.args.get('page', 1, type=int) or 1, 1)
+
+    result = name_match_review(source, _case_sensitive(), include_single)
+    new = [p for p in result.proposals if p.kind == MATCH_NEW]
+    disagree = [p for p in result.proposals if p.kind == MATCH_DISAGREE]
+    if unguided_only:
+        new = [p for p in new if p.channel.epg_source_id is None]
+    rejected = rejected_name_matches(source_id)
+    listed = {'proposals': new, 'disagreements': disagree, 'rejected': rejected}[view]
+    pages = max((len(listed) + _REVIEW_PER_PAGE - 1) // _REVIEW_PER_PAGE, 1)
+    page = min(page, pages)
+    shown = listed[(page - 1) * _REVIEW_PER_PAGE:page * _REVIEW_PER_PAGE]
+
+    account_names = dict(db.session.query(Account.id, Account.name))
+    source_names = dict(db.session.query(EpgSource.id, EpgSource.name))
+    tz, h24 = get_display_tz(), is_24h()
+    rows = []
+    for item in shown:
+        if view == 'rejected':
+            rows.append({**item, 'account_name': account_names.get(item['account_id'], '?'),
+                         'rejected_at': format_local(item['rejected_at'], 'monthday_time',
+                                                     tz=tz, h24=h24)})
+            continue
+        ch = item.channel
+        row = {'channel_id': ch.id, 'channel_name': ch.name, 'account_id': ch.account_id,
+               'account_name': account_names.get(ch.account_id, '?'),
+               'provider_id': ch.epg_channel_id,
+               'guide_from': source_names.get(ch.epg_source_id) if ch.epg_source_id else None,
+               'matched_on': item.matched_on, 'file': _file_row_view(item.entry, tz, h24),
+               'current': _file_row_view(item.current, tz, h24) if item.current else None}
+        row['same_listings'] = bool(
+            row['current'] and row['file']['upcoming']
+            and [u['title'] for u in row['file']['upcoming']]
+            == [u['title'] for u in row['current']['upcoming']])
+        rows.append(row)
+
+    owner = db.session.get(Account, source.owner_account_id)
+    has_upcoming = any(r.get('file', {}).get('upcoming') for r in rows)
+    return render_template(
+        'epg_source_review.html', source=source, owner=owner, view=view, rows=rows,
+        page=page, pages=pages, total=len(listed), per_page=_REVIEW_PER_PAGE,
+        counts={'proposals': len(new), 'disagreements': len(disagree),
+                'rejected': len(rejected)},
+        ambiguous=result.ambiguous, single_hidden=result.single_hidden,
+        include_single=include_single, unguided_only=unguided_only,
+        refreshed=has_directory(source.id), has_upcoming=has_upcoming,
+        can_refresh=source.kind == EPG_SOURCE_URL and source.enabled)
+
+
+def _review_picks(data) -> list[tuple[int, str]]:
+    picks = []
+    for p in data.get('picks') or []:
+        try:
+            picks.append((int(p['channel_id']), str(p['xml_id'])))
+        except (KeyError, TypeError, ValueError):
+            continue
+    return picks
+
+
+def _review_source_or_error(source_id):
+    source = db.session.get(EpgSource, source_id)
+    if source is None:
+        return None, (jsonify({'error': 'EPG source not found.'}), 404)
+    return source, None
+
+
+@accounts_bp.route('/api/epg-sources/<int:source_id>/name-matches/accept', methods=['POST'])
+def accept_name_matches_api(source_id):
+    source, err = _review_source_or_error(source_id)
+    if err:
+        return err
+    picks = _review_picks(request.get_json(silent=True) or {})
+    if not picks:
+        return jsonify({'error': 'Nothing selected.'}), 400
+    done = accept_name_matches(source, picks, _case_sensitive())
+    parts = [f'Accepted {done.applied:,} name match{"es" if done.applied != 1 else ""}.']
+    if done.waiting:
+        when = ('at its next refresh - Refresh now fetches it now'
+                if source.kind == EPG_SOURCE_URL else "at the account's next sync")
+        parts.append(f'{done.waiting:,} get their listings from "{source.name}" {when}.')
+    if done.stale:
+        parts.append(f'{done.stale:,} were no longer proposed and were left alone.')
+    return jsonify({'success': True, 'accepted': done.applied, 'waiting': done.waiting,
+                    'stale': done.stale, 'message': ' '.join(parts)})
+
+
+@accounts_bp.route('/api/epg-sources/<int:source_id>/name-matches/reject', methods=['POST'])
+def reject_name_matches_api(source_id):
+    source, err = _review_source_or_error(source_id)
+    if err:
+        return err
+    picks = _review_picks(request.get_json(silent=True) or {})
+    if not picks:
+        return jsonify({'error': 'Nothing selected.'}), 400
+    done = reject_name_matches(source, picks, _case_sensitive())
+    msg = f'Rejected {done.applied:,}. They will not be proposed again.'
+    if done.stale:
+        msg += f' {done.stale:,} were no longer proposed and were left alone.'
+    return jsonify({'success': True, 'rejected': done.applied, 'stale': done.stale,
+                    'message': msg})
+
+
+@accounts_bp.route('/api/epg-sources/<int:source_id>/name-matches/propose-again',
+                   methods=['POST'])
+def propose_again_api(source_id):
+    _source, err = _review_source_or_error(source_id)
+    if err:
+        return err
+    ids = []
+    for cid in (request.get_json(silent=True) or {}).get('channel_ids') or []:
+        try:
+            ids.append(int(cid))
+        except (TypeError, ValueError):
+            continue
+    if not ids:
+        return jsonify({'error': 'Nothing selected.'}), 400
+    n = propose_again(source_id, ids)
+    return jsonify({'success': True, 'count': n,
+                    'message': f'{n:,} channel(s) will be proposed again if their names '
+                               'still match.'})
+
+
 @accounts_bp.route('/api/accounts/<int:account_id>/dump', methods=['POST'])
 def dump_account_api(account_id):
     account, err = _json_account(account_id)
@@ -929,12 +1486,26 @@ def _duplicate_warning(dup, account_type: str) -> str:
     return f'Heads up: account "{dup.name}" already uses this {field}. Added anyway - check both are intentional.'
 
 
+def _form_xmltv_fields(form, errors: list) -> dict | None:
+    """The add-account form's optional XMLTV URL, as the fields of the url source it
+    creates, or None when blank. Its validation errors are appended to `errors`."""
+    url = _field(form, 'epg_url')
+    if not url:
+        return None
+    problems, fields = clean_url_source_fields({'url': url}, _field(form, 'name'))
+    errors.extend(problems)
+    return fields
+
+
 def _type_fields(form, account_type: str, existing=None) -> dict:
-    """Return the account fields that differ by type, ready to set on the model."""
+    """Return the account fields that differ by type, ready to set on the model.
+
+    `Account.epg_url` is not among them and nothing writes it: an XMLTV URL is an EPG
+    source (_add_form_xmltv_source, the Sources card), and m072 turned every stored one
+    into a source (dev/changelog/1104)."""
     if account_type == 'm3u':
         return {
             'm3u_url': _field(form, 'm3u_url'),
-            'epg_url': _field(form, 'epg_url') or None,
             'base_url': '',
             'username': '',
             'password': '',
@@ -942,7 +1513,6 @@ def _type_fields(form, account_type: str, existing=None) -> dict:
     # xtream
     fields: dict = {
         'm3u_url': None,
-        'epg_url': None,
         'base_url': _field(form, 'base_url').rstrip('/'),
         'username': _field(form, 'username'),
     }

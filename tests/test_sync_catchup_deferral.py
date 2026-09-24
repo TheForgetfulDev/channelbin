@@ -264,6 +264,90 @@ class OverdueAccountsAreReleasedOneAtATimeTests(unittest.TestCase):
                 'two catch-up syncs were released into the same window')
 
 
+class ScheduleFollowsTheDeferredRunTests(unittest.TestCase):
+    """dev/docs/BUGS.md 2026-09-23 @ 09:15:49 AM. Two accounts on one schedule: the second
+    is refused while the first syncs, retries 20 minutes later, and its interval trigger kept
+    the original phase - so it collided again on every occurrence, forever, with a skip in
+    its history every other run. The regular schedule must move to one interval after the
+    retry actually ran, and must not move for anything else."""
+
+    def setUp(self):
+        self.t = make_test_app(start_scheduler=True)
+        self.account = seed.make_account(name='Second Account', sync_interval_hours=12,
+                                         sync_enabled=True)
+        db.session.commit()
+        sched.schedule_account_sync(self.t.app, self.account.id)
+
+    def tearDown(self):
+        self.t.cleanup()
+
+    def _interval_next(self):
+        job = sched.get_scheduler().get_job(f'account_sync_{self.account.id}')
+        return sched.to_naive_utc(job.next_run_time)
+
+    def _run(self, retry, outcome=None):
+        spy = mock.Mock(return_value=outcome)
+        with mock.patch('app.channel_tester.is_running', return_value=False), \
+             mock.patch('app.accounts.sync_account', spy), \
+             mock.patch('app.config.load_config', return_value=_full_cfg(_sync_cfg())):
+            sched._account_sync_job(self.account.id, retry=retry)
+        return spy
+
+    def test_a_retry_that_runs_moves_the_schedule_to_one_interval_after_it(self):
+        before = self._interval_next()
+        started = datetime.utcnow()
+        self._run(retry=True)
+        after = self._interval_next()
+        self.assertNotEqual(after, before)
+        self.assertGreaterEqual(after, started + timedelta(hours=12))
+        self.assertLess(after, started + timedelta(hours=12, minutes=30))
+        db.session.expire_all()
+        self.assertEqual(db.session.get(type(self.account), self.account.id).next_sync_at,
+                         after, 'the displayed next sync must be the job that will fire')
+
+    def test_a_retry_that_fails_still_moves_it(self):
+        """The attempt happened; the next one is an interval away whatever its result."""
+        before = self._interval_next()
+        spy = mock.Mock(side_effect=RuntimeError('provider down'))
+        with mock.patch('app.channel_tester.is_running', return_value=False), \
+             mock.patch('app.accounts.sync_account', spy), \
+             mock.patch('app.config.load_config', return_value=_full_cfg(_sync_cfg())):
+            sched._account_sync_job(self.account.id, retry=True)
+        self.assertNotEqual(self._interval_next(), before)
+
+    def test_an_on_time_run_does_not_move_it(self):
+        before = self._interval_next()
+        self._run(retry=False)
+        self.assertEqual(self._interval_next(), before)
+
+    def test_a_retry_refused_again_does_not_move_it(self):
+        from app import admission
+        before = self._interval_next()
+        refusal = admission.Refusal(kind=admission.KIND_SYNC, blocked_by=admission.KIND_SYNC,
+                                    reason='another account is syncing')
+        self._run(retry=True, outcome=refusal)
+        self.assertEqual(self._interval_next(), before)
+        self.assertIsNotNone(sched.get_scheduler().get_job(
+            sched.sync_retry_job_id(self.account.id)), 'the refusal still queues a retry')
+
+    def test_both_deferral_paths_queue_the_retry_as_a_retry(self):
+        """Captured rather than registered: a retry due now would fire on the live test
+        scheduler and run a real sync."""
+        add = mock.Mock()
+        with mock.patch.object(sched, '_add_job', add), \
+             mock.patch.object(sched, '_emit_job_skipped'), \
+             mock.patch('app.config.load_config', return_value=_full_cfg()):
+            sched._defer_sync_for_contention(self.account.id, 'Second Account', _sync_cfg(),
+                                             'another account is syncing')
+            sched._defer_sync_past_recording(self.account.id, 'Second Account', _sync_cfg(),
+                                             'a recording is in progress')
+        retries = [c.kwargs for c in add.call_args_list
+                   if c.kwargs.get('id') == sched.sync_retry_job_id(self.account.id)]
+        self.assertEqual(len(retries), 2)
+        for kw in retries:
+            self.assertTrue(kw['kwargs'].get('retry'))
+
+
 class NextSyncDisplayTests(unittest.TestCase):
     def setUp(self):
         self.t = make_test_app(start_scheduler=True)

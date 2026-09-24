@@ -57,13 +57,6 @@
                placeholder="http://provider.com/get.php?username=...&password=...&type=m3u_plus">
         <span class="form-hint">Full M3U playlist URL from your IPTV provider.</span>
       </div>
-      <div class="form-group">
-        <label>XMLTV EPG URL <span class="form-hint-inline">(optional)</span></label>
-        <input type="url" name="epg_url" class="form-control"
-               value="{{ form.get('epg_url', '') }}"
-               placeholder="http://provider.com/xmltv.php?username=...&password=...">
-        <span class="form-hint">TV guide data URL. Leave blank to skip EPG import.</span>
-      </div>
     </div>
 
     {# ── Xtream fields ── #}
@@ -98,6 +91,21 @@
     </div>
 
     {# ── Shared fields ── #}
+    {# Both types: it becomes an EPG source on the account (dev/changelog/1104). An Xtream
+       account also has its provider's own guide, which comes first in priority. #}
+    <div class="form-group">
+      <label>XMLTV EPG URL <span class="form-hint-inline">(optional)</span></label>
+      <input type="url" name="epg_url" class="form-control"
+             value="{{ form.get('epg_url', '') }}"
+             placeholder="http://example.com/guide.xml.gz">
+      <span class="form-hint">
+        A TV guide file, plain or <code>.gz</code>. It is added as an EPG source and fetched
+        right away. An Xtream account already gets its provider's guide, and this one fills
+        the channels that guide does not cover. Change or remove it later under EPG sources
+        on the account page.
+      </span>
+    </div>
+
     <div class="form-group">
       <label>URL Normalization</label>
       <select name="url_normalization" class="form-control" id="url-norm-select">

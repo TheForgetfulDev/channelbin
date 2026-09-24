@@ -1,0 +1,164 @@
+{% extends "base.html" %}
+{% block title %}Name matches - {{ source.name }} - ChannelBin{% endblock %}
+
+{#  Name-match review (DESIGN-epg-sources.md §7.5, dev/changelog/1105).
+
+    Proposals only: nothing on this page is applied until a person accepts it, and an
+    accepted row becomes the channel's key for this one source through
+    epg_sources.set_channel_key(). Every channel nobody reviews keeps matching on the id its
+    provider gives it. The "coming up" titles are what makes a row checkable - a name can
+    match the wrong channel (`US: NBC CHICAGO` listed under CNBC's id), and the programs show
+    it where the names cannot. #}
+
+{% macro file_cell(f) -%}
+  <code>{{ f.xml_id }}</code>
+  <div class="text-faint small">{{ '{:,}'.format(f.entry_count) }} program{{ 's' if f.entry_count != 1 else '' }},
+    {% if f.distinct_titles == 1 %}one title all day{% else %}{{ f.distinct_titles }}{{ '+' if f.distinct_titles >= 20 else '' }} titles{% endif %}{% if f.horizon %}, until {{ f.horizon }}{% endif %}</div>
+{%- endmacro %}
+
+{% macro coming_up(f) -%}
+  {% if f.upcoming %}
+  <ul class="nm-up">{% for u in f.upcoming %}<li><span class="text-faint">{{ u.at }}</span> {{ u.title }}</li>{% endfor %}</ul>
+  {% elif f.sole_title %}<span class="small">{{ f.sole_title }}</span>
+  {% else %}<span class="text-faint small">Shown after the next refresh</span>{% endif %}
+{%- endmacro %}
+
+{% macro channel_cell(r) -%}
+  <a href="{{ url_for('channels.channel_detail', channel_id=r.channel_id) }}">{{ r.channel_name }}</a>
+  <div class="text-faint small">{% if r.provider_id %}Provider id <code>{{ r.provider_id }}</code>{% else %}No EPG id from the provider{% endif %}</div>
+  {% if r.guide_from is defined %}<div class="text-faint small">{% if r.guide_from %}Guide today from {{ r.guide_from }}{% else %}No guide today{% endif %}</div>{% endif %}
+{%- endmacro %}
+
+{% macro qs(v=view, p=1) -%}
+{{ url_for('accounts.epg_source_review', source_id=source.id, view=v, page=p,
+           single='1' if include_single else none, unguided='1' if unguided_only else none) }}
+{%- endmacro %}
+
+{% block content %}
+<div class="page-head">
+  <h1>Name matches <span class="sub">{{ source.name }}</span></h1>
+  <a href="{{ url_for('accounts.account_detail', account_id=owner.id) }}" class="btn">&larr; {{ owner.name }}</a>
+</div>
+<p class="page-sub">
+  Channels whose name matches exactly one channel in this source's file. Nothing changes until
+  you accept a match, and every channel you don't accept keeps matching on the EPG id its
+  provider gives it. Check the programs coming up before accepting: a name can point at the
+  wrong channel.
+</p>
+
+<div id="nm-main" data-source-id="{{ source.id }}" data-owner-id="{{ owner.id }}">
+{% if not refreshed %}
+<div class="empty-state">
+  <p>{{ source.name }} has no successful refresh yet.</p>
+  <p class="text-muted">Proposals come from the channel list in its file, which is read at its first successful refresh.</p>
+</div>
+{% else %}
+<div class="tabs">
+  <a href="{{ qs('proposals') }}" class="tab{{ ' active' if view == 'proposals' else '' }}">Proposals <span class="cnt">{{ '{:,}'.format(counts.proposals) }}</span></a>
+  <a href="{{ qs('disagreements') }}" class="tab{{ ' active' if view == 'disagreements' else '' }}"
+     data-tip="Channels whose provider id matches one channel in the file while the name matches another. Sometimes the provider's id is the wrong one, sometimes the name is.">Disagreements <span class="cnt">{{ '{:,}'.format(counts.disagreements) }}</span></a>
+  <a href="{{ qs('rejected') }}" class="tab{{ ' active' if view == 'rejected' else '' }}">Rejected <span class="cnt">{{ '{:,}'.format(counts.rejected) }}</span></a>
+</div>
+
+{% if view != 'rejected' %}
+<div class="nm-filters">
+  <label><input type="checkbox" data-filter="single"{% if include_single %} checked{% endif %}> Include channels listing one program</label>
+  {% if view == 'proposals' %}
+  <label><input type="checkbox" data-filter="unguided"{% if unguided_only %} checked{% endif %}> Only channels with no guide today</label>
+  {% endif %}
+</div>
+<p class="text-faint small">
+  {% if ambiguous %}{{ '{:,}'.format(ambiguous) }} channel name{{ 's' if ambiguous != 1 else '' }} fit more than one channel in the file and {{ 'are' if ambiguous != 1 else 'is' }} not proposed.{% endif %}
+  {% if single_hidden and not include_single %}{{ '{:,}'.format(single_hidden) }} more match a channel listing one program all day.{% endif %}
+</p>
+{% endif %}
+
+<div class="toolbar nm-bar">
+  <label class="nm-all"><input type="checkbox" data-act="select-all"> Select all on this page</label>
+  {% if view == 'rejected' %}
+  <button class="btn btn-sm" data-act="again-selected" disabled>Propose again</button>
+  {% else %}
+  <button class="btn btn-sm btn-primary" data-act="accept-selected" disabled>Accept selected</button>
+  <button class="btn btn-sm" data-act="reject-selected" disabled>Reject selected</button>
+  {% endif %}
+  {% if can_refresh %}
+  <button class="btn btn-sm" data-act="refresh"
+          data-tip="Fetch this source's file now. Accepted matches get their listings from it at its next refresh.">&#8635; Refresh now</button>
+  {% endif %}
+</div>
+
+{% if not rows %}
+<div class="empty-state">
+  {% if view == 'rejected' %}<p>No rejected matches.</p>
+  {% elif view == 'disagreements' %}<p>No channel's name disagrees with its provider id.</p>
+  {% else %}<p>No name matches to review.</p>{% endif %}
+</div>
+{% else %}
+<div class="table-scroll">
+  <table class="tbl tbl-cards nm-tbl">
+    <thead><tr>
+      <th></th><th>Channel</th>
+      {% if view == 'proposals' %}<th>Match in the file</th><th>Coming up</th>
+      {% elif view == 'disagreements' %}<th>Provider id matches</th><th>Name matches</th>
+      {% else %}<th>Rejected match</th><th>Rejected</th>{% endif %}
+      <th></th>
+    </tr></thead>
+    <tbody>
+    {% for r in rows %}
+      {% if loop.first or r.account_id != rows[loop.index0 - 1].account_id %}
+      <tr class="nm-group"><td colspan="5">{{ r.account_name }}</td></tr>
+      {% endif %}
+      <tr data-channel-id="{{ r.channel_id }}"{% if r.file is defined %} data-xml-id="{{ r.file.xml_id }}"{% endif %}>
+        <td data-label="Select"><input type="checkbox" data-act="pick" aria-label="Select {{ r.channel_name }}"></td>
+        {% if view == 'rejected' %}
+        <td data-label="Channel"><a href="{{ url_for('channels.channel_detail', channel_id=r.channel_id) }}">{{ r.channel_name }}</a></td>
+        <td data-label="Rejected match">{{ r.matched_on or '-' }}</td>
+        <td data-label="Rejected">{{ r.rejected_at }}</td>
+        <td class="num"><button class="btn btn-sm" data-act="again">Propose again</button></td>
+        {% else %}
+        <td data-label="Channel">{{ channel_cell(r) }}</td>
+        {% if view == 'proposals' %}
+        <td data-label="Match in the file">{{ file_cell(r.file) }}
+          <div class="small">Matched on &ldquo;{{ r.matched_on }}&rdquo;</div></td>
+        <td data-label="Coming up">{{ coming_up(r.file) }}</td>
+        {% else %}
+        <td data-label="Provider id matches">{{ file_cell(r.current) }}{{ coming_up(r.current) }}</td>
+        <td data-label="Name matches">{{ file_cell(r.file) }}
+          <div class="small">Matched on &ldquo;{{ r.matched_on }}&rdquo;</div>{{ coming_up(r.file) }}
+          {% if r.same_listings %}<div class="small text-faint">Both list the same programs next.</div>{% endif %}</td>
+        {% endif %}
+        <td class="num nm-acts">
+          <button class="btn btn-sm btn-primary" data-act="accept">Accept</button>
+          <button class="btn btn-sm" data-act="reject">Reject</button>
+        </td>
+        {% endif %}
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% if pages > 1 %}
+<div class="test-history-pagination nm-pager">
+  {% if page > 1 %}<a href="{{ qs(view, page - 1) }}" class="btn btn-sm">&larr; Prev</a>{% endif %}
+  <span class="text-faint small">Page {{ page }} of {{ pages }} ({{ '{:,}'.format(total) }})</span>
+  {% if page < pages %}<a href="{{ qs(view, page + 1) }}" class="btn btn-sm">Next &rarr;</a>{% endif %}
+</div>
+{% endif %}
+{% endif %}
+{% endif %}
+</div>
+
+<style>
+  .nm-filters { display: flex; flex-wrap: wrap; gap: 0.5rem 1.25rem; margin-bottom: 0.25rem; }
+  .nm-bar { flex-wrap: wrap; gap: 0.5rem; margin: 0.5rem 0 0.75rem; }
+  .nm-all { margin-right: auto; }
+  .nm-up { list-style: none; margin: 0; padding: 0; font-size: var(--fs-sm); }
+  .nm-group td { font-weight: 600; background: var(--bg2); }
+  .nm-acts { white-space: nowrap; }
+  .nm-pager { margin-top: 0.75rem; }
+</style>
+{% endblock %}
+
+{% block scripts %}
+<script src="{{ url_for('static', filename='js/epg-source-review.js') }}"></script>
+{% endblock %}

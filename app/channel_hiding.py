@@ -62,7 +62,7 @@ from sqlalchemy import and_, case, delete, func, null, or_, not_, select, update
 
 from . import admission, db
 from .database import (Account, Channel, ChannelEvent, ChannelGroupMember, ChannelHideRule,
-                       EPGEntry, CHANNEL_HIDE_OVERRIDE_CHANGED, HIDE_TARGETS,
+                       EPGEntry, EpgAlternateEntry, CHANNEL_HIDE_OVERRIDE_CHANGED, HIDE_TARGETS,
                        HIDE_TARGET_CATEGORY_EXACT, HIDE_TARGET_CATEGORY_GLOB,
                        HIDE_TARGET_NAME_GLOB)
 from .db_utils import retry_on_locked
@@ -400,7 +400,7 @@ def purge_hidden_epg(scope_terms=()) -> int:
 
     A subquery rather than a materialized id list: SQLITE_MAX_VARIABLE_NUMBER is 32,766 and a
     realistic rule set hides ~62,000 channels, double the ceiling (dev/docs/BUGS.md
-    2026-08-15). Same reason `_import_xmltv`'s own delete is written this way.
+    2026-08-15).
 
     Un-hiding does NOT bring the entries back - nothing here restores them, and the next sync
     for that account is what refills the guide. That gap is disclosed rather than papered
@@ -412,6 +412,14 @@ def purge_hidden_epg(scope_terms=()) -> int:
     result = db.session.execute(
         delete(EPGEntry).where(EPGEntry.channel_id.in_(hidden_ids))
         .execution_options(synchronize_session=False))
+    # Both tables, and the derived pointer with them: a hidden channel has no guide from any
+    # source (DESIGN-epg-sources.md §11). The next import re-resolves it once un-hidden.
+    db.session.execute(
+        delete(EpgAlternateEntry).where(EpgAlternateEntry.channel_id.in_(hidden_ids))
+        .execution_options(synchronize_session=False))
+    db.session.execute(
+        update(Channel).where(Channel.id.in_(hidden_ids), Channel.epg_source_id.isnot(None))
+        .values(epg_source_id=None).execution_options(synchronize_session=False))
     return result.rowcount or 0
 
 

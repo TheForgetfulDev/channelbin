@@ -1,17 +1,17 @@
 """EPG-fetch failures must be observable, not swallowed to a silent SUCCESS.
 
 Pins DESIGN-sync-resilience.md §2-3 (Sync resilience A / changelog/242): before this fix,
-`_sync_epg_from_url` caught any fetch exception, logged a warning, and returned a bare `0` -
+`refresh_source` caught any fetch exception, logged a warning, and returned a bare `0` -
 `_do_sync` had no way to distinguish "feed fetch died" from "healthy feed with zero entries",
 so the sync always finished `AccountSyncLog.status = 'SUCCESS'` even when EPG silently didn't
 update (real occurrence: sync_log 122, `InvalidChunkLength`, no alert, account stayed OK).
 
 Two things are pinned:
-  1. `_sync_epg_from_url` itself returns `(0, reason)` on a fetch exception, `reason` starting
+  1. `refresh_source` itself returns `(0, reason)` on a fetch exception, `reason` starting
      `'fetch failed:'` and creds-masked (never the raw credentialed URL from the exception text).
   2. `_do_sync` end-to-end: a degraded EPG fetch finishes the sync `PARTIAL` (not `SUCCESS`),
      `error_message` carries the reason, `Account.status` stays `OK` (control value, unaffected -
-     DESIGN-sync-resilience.md §2), and a `SYNC_EPG_FETCH_FAILED` alert is raised. A subsequent
+     DESIGN-sync-resilience.md §2), and a `EPG_SOURCE_FETCH_FAILED` alert is raised. A subsequent
      healthy sync auto-dismisses that standing alert rather than leaving it live forever.
 
 No network: `requests.get` is patched at `app.accounts.requests.get` so the m3u playlist fetch
@@ -29,9 +29,11 @@ from unittest import mock
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app import db  # noqa: E402
-from app.accounts import _do_sync, _sync_epg_from_url  # noqa: E402
+from app.accounts import _do_sync, refresh_source  # noqa: E402
 from app.database import Account, Alert, AccountSyncLog, Channel, M3uAccount  # noqa: E402
 from tests.support import make_test_app  # noqa: E402
+from tests.test_sync_epg_collapse_guard import _xmltv  # noqa: E402
+from tests.support.seed import make_epg_source  # noqa: E402
 
 M3U_URL = 'http://provider.test/playlist.m3u8?user=realuser&pass=realpass'
 EPG_URL = 'http://provider.test/xmltv.php?username=realuser&password=realpass'
@@ -47,6 +49,7 @@ def _fake_get_epg_fetch_fails(url, **kwargs):
     if url == M3U_URL:
         resp = mock.Mock()
         resp.raise_for_status = mock.Mock()
+        resp.status_code = 200
         resp.content = M3U_PLAYLIST.encode('utf-8')
         return resp
     if url == EPG_URL:
@@ -60,24 +63,29 @@ def _fake_get_all_healthy(url, **kwargs):
     if url == M3U_URL:
         resp = mock.Mock()
         resp.raise_for_status = mock.Mock()
+        resp.status_code = 200
         resp.content = M3U_PLAYLIST.encode('utf-8')
         return resp
     if url == EPG_URL:
         resp = mock.Mock()
         resp.raise_for_status = mock.Mock()
-        resp.content = b'<?xml version="1.0"?><tv></tv>'
+        resp.status_code = 200
+        # One real listing: a feed with no <programme> at all is itself reported as a
+        # degradation (dev/changelog/1100), so it cannot stand in for a healthy one.
+        resp.content = _xmltv([('ch1.test', 60, 30)])
         return resp
     raise AssertionError(f'unexpected requests.get call: {url}')
 
 
 class SyncEpgFromUrlUnitTests(unittest.TestCase):
-    """Unit-level: _sync_epg_from_url's own return shape on a fetch exception."""
+    """Unit-level: refresh_source's own return shape on a fetch exception."""
 
     def setUp(self):
         self.t = make_test_app()
         self.account = M3uAccount(name='Unit Test Account', m3u_url=M3U_URL,
                                   epg_url=EPG_URL, status='OK')
         db.session.add(self.account)
+        self.source_id = make_epg_source(self.account).id
         db.session.commit()
 
     def tearDown(self):
@@ -86,7 +94,7 @@ class SyncEpgFromUrlUnitTests(unittest.TestCase):
     def test_fetch_exception_returns_zero_and_reason(self):
         with mock.patch('app.accounts.requests.get',
                         side_effect=ConnectionError(f'Connection refused to {EPG_URL}')):
-            count, reason = _sync_epg_from_url(self.account, EPG_URL, timeout=5, epg_days=3)
+            count, reason = refresh_source(make_epg_source(self.account, url=EPG_URL), timeout=5, epg_days=3)
         self.assertEqual(count, 0)
         self.assertIsNotNone(reason)
         self.assertTrue(reason.startswith('fetch failed:'))
@@ -98,21 +106,23 @@ class SyncEpgFromUrlUnitTests(unittest.TestCase):
     def test_healthy_fetch_returns_none_reason(self):
         resp = mock.Mock()
         resp.raise_for_status = mock.Mock()
+        resp.status_code = 200
         resp.content = b'<?xml version="1.0"?><tv></tv>'
         with mock.patch('app.accounts.requests.get', return_value=resp):
-            count, reason = _sync_epg_from_url(self.account, EPG_URL, timeout=5, epg_days=3)
+            count, reason = refresh_source(make_epg_source(self.account, url=EPG_URL), timeout=5, epg_days=3)
         self.assertIsNone(reason)
         self.assertEqual(count, 0)  # empty <tv/>, but a real (not swallowed) zero
 
 
 class DoSyncPartialStatusTests(unittest.TestCase):
-    """End-to-end: _do_sync wiring of PARTIAL status + the SYNC_EPG_FETCH_FAILED alert."""
+    """End-to-end: _do_sync wiring of PARTIAL status + the EPG_SOURCE_FETCH_FAILED alert."""
 
     def setUp(self):
         self.t = make_test_app()
         self.account = M3uAccount(name='Partial Test Account', m3u_url=M3U_URL,
                                   epg_url=EPG_URL, status='OK')
         db.session.add(self.account)
+        self.source_id = make_epg_source(self.account).id
         db.session.commit()
 
     def tearDown(self):
@@ -129,8 +139,8 @@ class DoSyncPartialStatusTests(unittest.TestCase):
 
     def _standing_alert(self):
         return Alert.query.filter_by(
-            alert_type='SYNC_EPG_FETCH_FAILED',
-            source=f'account:{self.account.id}:epg-fetch',
+            alert_type='EPG_SOURCE_FETCH_FAILED',
+            source=f'epg-source:{self.source_id}:fetch',
         ).first()
 
     def test_epg_fetch_failure_finishes_partial_with_alert(self):
@@ -169,8 +179,8 @@ class DoSyncPartialStatusTests(unittest.TestCase):
 
         # No second alert row was stacked for the same (type, source).
         self.assertEqual(
-            Alert.query.filter_by(alert_type='SYNC_EPG_FETCH_FAILED',
-                                  source=f'account:{self.account.id}:epg-fetch').count(),
+            Alert.query.filter_by(alert_type='EPG_SOURCE_FETCH_FAILED',
+                                  source=f'epg-source:{self.source_id}:fetch').count(),
             1)
 
     def test_repeated_failures_refresh_one_alert_not_stack(self):
@@ -182,8 +192,8 @@ class DoSyncPartialStatusTests(unittest.TestCase):
 
         self.assertEqual(second.id, first_id)  # same row, refreshed - not a new one
         self.assertEqual(
-            Alert.query.filter_by(alert_type='SYNC_EPG_FETCH_FAILED',
-                                  source=f'account:{self.account.id}:epg-fetch').count(),
+            Alert.query.filter_by(alert_type='EPG_SOURCE_FETCH_FAILED',
+                                  source=f'epg-source:{self.source_id}:fetch').count(),
             1)
 
     def test_fully_healthy_sync_stays_success_no_alert(self):

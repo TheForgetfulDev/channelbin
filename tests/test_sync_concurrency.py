@@ -112,7 +112,7 @@ class SyncDefersToTesterTests(unittest.TestCase):
         self._run_sync_job(tester_running=True)
         job = sched._scheduler.get_job(self.retry_id)
         self.assertIs(job.func, sched._account_sync_job)
-        self.assertEqual(job.kwargs, {'account_id': self.account.id})
+        self.assertEqual(job.kwargs, {'account_id': self.account.id, 'retry': True})
 
     def test_retry_is_a_one_shot_date_trigger_not_an_interval_nudge(self):
         """APScheduler 3.x recomputes subsequent interval fires from a modified

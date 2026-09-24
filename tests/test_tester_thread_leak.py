@@ -24,6 +24,7 @@ import sys
 import threading
 import time
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -204,16 +205,20 @@ class BareIsRunningFlagIsNotALeakTests(unittest.TestCase):
             self.t.cleanup()
 
     def test_cleanup_passes_and_does_not_wait(self):
+        """Decided on the exit path, not the clock: request_stop() is the one way into the
+        drain wait, so it must never be called for a bare flag. The old elapsed < 0.2s
+        check used the drain ceiling itself as its margin, so a slow runner failed a test
+        about a flag (dev/docs/BUGS.md 2026-09-11 @ 05:41:46 AM, 2026-09-23 @ 09:08:47 PM).
+        """
         import app.channel_tester as channel_tester
         channel_tester._state.is_running = True
 
         t, self.t = self.t, None
-        started = time.monotonic()
-        t.cleanup()
-        elapsed = time.monotonic() - started
+        with mock.patch.object(channel_tester, 'request_stop',
+                               wraps=channel_tester.request_stop) as stop:
+            t.cleanup()
 
-        self.assertLess(elapsed, 0.2,
-                        'teardown waited on a flag with no run behind it')
+        stop.assert_not_called()
 
 
 class ResetModuleGlobalsStopsBeforeSwappingTests(unittest.TestCase):
@@ -261,12 +266,28 @@ class SchedulerJobsAreDrainedBeforeTheNetguardCheckTests(unittest.TestCase):
 
     def test_cleanup_waits_for_a_job_already_running_on_a_worker(self):
         from datetime import datetime
-        from app.scheduler import _add_job
+        from apscheduler.events import EVENT_JOB_REMOVED
+        from app.scheduler import _add_job, get_scheduler
 
+        # The loop thread removes a one-shot job right after handing it to a worker, and
+        # shutdown() flips the state before taking the jobstore lock - so tearing down
+        # the moment the worker starts had the loop's remove_job() raise JobLookupError
+        # into a green run (dev/docs/BUGS.md 2026-09-23 09:51 PM). Waiting for the removal event
+        # lets the bookkeeping finish before the store goes away.
+        removed = threading.Event()
+
+        def _on_removed(event):
+            if event.job_id == 'drain_probe':
+                removed.set()
+
+        get_scheduler().add_listener(_on_removed, EVENT_JOB_REMOVED)
         _add_job(func=_slow_scheduler_job, trigger='date', run_date=datetime.utcnow(),
                  id='drain_probe', replace_existing=True)
         self.assertTrue(_job_started.wait(timeout=5),
                         'precondition: the job must have started on a worker')
+        self.assertTrue(removed.wait(timeout=5),
+                        'precondition: the loop must have finished its post-dispatch '
+                        'bookkeeping before the store is torn down')
 
         t, self.t = self.t, None
         t.cleanup()

@@ -185,11 +185,11 @@ class AccountPageTests(unittest.TestCase):
 
     # ── Sections ────────────────────────────────────────────────────────────
 
-    def test_all_five_sections_render_and_are_reorderable(self):
+    def test_every_section_renders_and_is_reorderable(self):
         acc = _account('Sections', 'OK')
         db.session.commit()
         html = self._get(acc)
-        for section in ('details', 'content', 'usage', 'history', 'activity'):
+        for section in ('details', 'content', 'sources', 'usage', 'history', 'activity'):
             self.assertIn(f'data-section="{section}"', html)
 
     def test_an_empty_section_still_renders_its_card_head(self):

@@ -144,7 +144,7 @@ def _build_job_list():
     """Return a list of job dicts for the jobs page/API."""
     from ..scheduler import get_scheduler
     from ..database import (
-        Recording, OnDemandTestJob, Account,
+        Recording, OnDemandTestJob, Account, EpgSource,
         REC_STATUS_SCHEDULED, REC_STATUS_IN_PROGRESS, REC_STATUS_PAUSED, REC_STATUS_RETRYING,
         OD_JOB_STATUS_SCHEDULED,
     )
@@ -185,6 +185,11 @@ def _build_job_list():
                    if m}
     accounts = ({a.id: a for a in Account.query.filter(Account.id.in_(account_ids)).all()}
                 if account_ids else {})
+    source_ids = {int(m.group(1)) for m in
+                  (re.match(r'^epg_source_refresh(?:_retry)?_(\d+)$', j.id) for j in other_jobs)
+                  if m}
+    sources = ({src.id: src for src in EpgSource.query.filter(EpgSource.id.in_(source_ids)).all()}
+               if source_ids else {})
     od_ids = {int(m.group(1)) for m in
               (re.match(r'^od_job_(?:retry_)?(\d+)$', j.id) for j in other_jobs) if m}
     od_jobs = ({o.id: o for o in
@@ -451,6 +456,41 @@ def _build_job_list():
             })
             continue
 
+        # A url source's own refresh job, and the retry a refused one queues
+        # (app/scheduler.py, dev/changelog/1104). Edit goes to the owner account's page,
+        # where the source's row is.
+        m = re.match(r'^epg_source_refresh(_retry)?_(\d+)$', job.id)
+        if m:
+            is_retry, source_id = bool(m.group(1)), int(m.group(2))
+            src = sources.get(source_id)
+            src_name = src.name if src else f'EPG source {source_id}'
+            td = getattr(job.trigger, 'interval', None)
+            hours = int(td.total_seconds() / 3600) if td else '?'
+            avg_seconds, runs, duration_line = _job_duration_info(job.id)
+            items.append({
+                '_start_utc': next_run_utc,
+                '_end_utc': next_run_utc + timedelta(seconds=avg_seconds) if avg_seconds else next_run_utc,
+                '_next_run_utc': next_run_utc,
+                'id': job.id,
+                'display_name': (f'EPG refresh retry: {src_name}' if is_retry
+                                 else f'EPG refresh: {src_name}'),
+                'type': 'one_off' if is_retry else 'recurring',
+                'next_run_utc': next_run_utc.isoformat(),
+                'next_run_et': _fmt_et(next_run_utc),
+                'next_run_relative': _relative(next_run_utc),
+                'stop_run_et': None,
+                'schedule_description': ('deferred behind an account sync or a channel test run'
+                                         if is_retry else
+                                         f'every {hours} hour{"s" if hours != 1 else ""}'),
+                'edit_url': f'/accounts/{src.owner_account_id}' if src else None,
+                'run_url': None if is_retry else f'/api/jobs/{job.id}/run-now',
+                'skip_url': None,
+                'overlap': 'green',
+                'runs': runs,
+                'duration_line': duration_line,
+            })
+            continue
+
         # One-shot deferred-sync retries: account_sync_retry_<id>. Own branch because
         # they don't match the account_sync_<id> regex above and would otherwise render
         # as a raw job id, with a Run Now button that run_job_now() answers 400 to.
@@ -691,6 +731,12 @@ def run_job_now(job_id):
             daemon=True, name=f'account-sync-{account_id}',
         ).start()
         return jsonify({'success': True, 'message': f'Sync started for "{account.name}"'})
+
+    m = re.match(r'^epg_source_refresh_(\d+)$', job_id)
+    if m:
+        from ..accounts import start_source_refresh
+        started, message = start_source_refresh(app_obj, int(m.group(1)))
+        return jsonify({'success': True, 'refresh_started': started, 'message': message})
 
     if job_id == 'config_backup_daily':
         from ..config_backup import do_backup

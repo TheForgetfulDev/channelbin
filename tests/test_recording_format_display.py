@@ -28,6 +28,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from tests.support.app import make_test_app  # noqa: E402
 from tests.support import seed  # noqa: E402
+from tests.support.markup import stat_values  # noqa: E402
 from app import db  # noqa: E402
 from app.database import RecordingSegment  # noqa: E402
 from app.routes.recordings import _format_profile  # noqa: E402
@@ -270,7 +271,7 @@ class DetailPageRenderTests(unittest.TestCase):
         html = self._get(rec.id)
         for label in ('Codec', 'Bit depth', 'Chroma', 'Scan', 'Frame rate'):
             self.assertIn(f'>{label}<', html)
-        self.assertIn('hevc', html)
+        self.assertEqual(stat_values(html, 'Codec'), ['hevc'])
         self.assertIn('10-bit', html)
         self.assertIn('4:2:2', html)
         self.assertIn('Interlaced', html)
@@ -329,7 +330,7 @@ class DetailPageRenderTests(unittest.TestCase):
         db.session.commit()
 
         html = self._get(rec.id)
-        self.assertIn('h264', html)
+        self.assertEqual(stat_values(html, 'Codec'), ['h264'])
         self.assertIn('Variable', html)
         self.assertIn('final output file', html)
         self.assertIn('0.0421', html)

@@ -29,6 +29,7 @@ See CLAUDE.md section Testing. Run standalone:
   python3 -m unittest tests.test_concat_progress_reporting
 """
 import os
+import re
 import sys
 import time
 import unittest
@@ -378,7 +379,7 @@ class JoinSurfaceTests(_ConcatCase):
             html = c.get(f'/recordings/{self.rid}').get_data(as_text=True)
 
         self.assertIn('1 of 3', html)
-        self.assertIn('25%', html)
+        self.assertEqual(re.findall(r'<span><b>(\d+)%</b></span>', html), ['25'])
         self.assertIn('elapsed', html)
 
     def test_the_detail_strip_never_counts_discarded_or_empty_segments(self):
@@ -426,7 +427,10 @@ class JoinSurfaceTests(_ConcatCase):
             html = c.get('/recordings').get_data(as_text=True)
 
         self.assertIn('1 of 3 segments', html)
-        self.assertIn('25%', html)
+        rel = [r for r in re.findall(r'<span class="rel">([^<]*)</span>', html)
+               if r.startswith('joining')]
+        self.assertEqual(len(rel), 1)
+        self.assertIn('25%', rel[0].split(' · '))
 
     def test_the_recordings_list_row_falls_back_when_no_join_is_running(self):
         self._set_status('CONCATENATING')

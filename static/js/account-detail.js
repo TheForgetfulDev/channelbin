@@ -162,7 +162,7 @@
   renderHistory();
 
   // ── Section layout (order + hidden), persisted server-side ───────────────
-  const SEC_NAMES = { details: 'Details', content: 'Content', usage: 'Usage',
+  const SEC_NAMES = { details: 'Details', content: 'Content', sources: 'EPG sources', usage: 'Usage',
                       history: 'Sync history', activity: 'Activity' };
   const sectionLayout = initSectionLayout({
     config: A,
@@ -183,7 +183,222 @@
     return { onDone: reload, onError: showActionError };
   };
 
+  // ── EPG sources (DESIGN-epg-sources.md §9.2) ────────────────────────────
+  // Add and Edit share one dialog. A new or re-pointed source is fetched straight away by
+  // the server, which says so in its message; the page reloads to show the new row.
+  const sourceUrl = (id) => `/api/accounts/${A.id}/epg-sources${id ? `/${id}` : ''}`;
+
+  function openSourceModal(src) {
+    const editing = !!src;
+    const s = src || { name: '', url: '', refresh_interval_hours: '', enabled: true };
+    const hours = (A.sourceHours || []).map((h) =>
+      `<option value="${h}"${String(s.refresh_interval_hours) === String(h) ? ' selected' : ''}>` +
+      `Every ${h} hour${h === 1 ? '' : 's'}</option>`).join('');
+    const body = document.createElement('div');
+    body.innerHTML =
+      fieldRow({
+        label: 'XMLTV URL', stack: true,
+        meta: 'A TV guide file, plain or <code>.gz</code>. Kept secret like the account\'s ' +
+          'own URLs.' + (editing ? ' Changing it fetches the new file straight away.' : ''),
+        control: `<input type="url" id="src-url" value="${escHtml(s.url)}" ` +
+          'placeholder="http://example.com/guide.xml.gz">',
+      }) +
+      fieldRow({
+        label: 'Name',
+        meta: 'Shown wherever this source is named. Blank uses the account name.',
+        control: `<input type="text" id="src-name" value="${escHtml(s.name)}">`,
+        wide: true,
+      }) +
+      fieldRow({
+        label: 'Refresh',
+        meta: 'How often the file is fetched again. With the account\'s sync, Sync now ' +
+          'fetches it too.',
+        control: '<select id="src-hours">' +
+          `<option value=""${s.refresh_interval_hours ? '' : ' selected'}>With this account's sync</option>` +
+          `${hours}</select>`,
+      }) +
+      (editing ? fieldRow({
+        label: 'On',
+        meta: 'Turned off, the source keeps its listings and is not fetched again.',
+        control: '<label class="switch"><input type="checkbox" id="src-on"' +
+          `${s.enabled ? ' checked' : ''}><span class="knob"></span></label>`,
+      }) : '');
+    const $m = (sel) => body.querySelector(sel);
+    buildModal({
+      title: editing ? 'Edit EPG source' : 'Add EPG source',
+      body,
+      footer: [
+        { label: 'Cancel', class: 'btn', onClick: (c) => c() },
+        {
+          label: editing ? 'Save' : 'Add source',
+          class: 'btn btn-primary',
+          onClick: (close) => {
+            const url = $m('#src-url').value.trim();
+            if (!url) { showToast('An XMLTV URL is required.', { type: 'error' }); return false; }
+            const payload = {
+              url,
+              name: $m('#src-name').value,
+              refresh_interval_hours: $m('#src-hours').value,
+              enabled: editing ? $m('#src-on').checked : true,
+            };
+            jsonFetch(sourceUrl(editing ? s.id : null), {
+              method: 'POST', body: JSON.stringify(payload),
+            }).then((res) => {
+              close();
+              showToast(res.message || 'Saved.', { durationMs: 7000 });
+              setTimeout(reload, 1500);
+            }).catch((e) => showToast(e.message || 'Could not save the source.', { type: 'error' }));
+            return false;
+          },
+        },
+      ],
+    });
+  }
+
+  function editSource(el) {
+    jsonFetch(sourceUrl(el.dataset.sourceId))
+      .then((res) => openSourceModal(res.source))
+      .catch((e) => showToast(e.message || 'Could not load the source.', { type: 'error' }));
+  }
+
+  // "Another account's guide" (DESIGN-epg-sources.md §3): a subscription to a source some
+  // other account owns and refreshes. Each option says what it would do here today, which
+  // is what makes the choice between two sources a decision rather than a guess.
+  const fmtN = (v) => Number(v).toLocaleString('en-US');
+
+  function borrowNote(s) {
+    if (s.covers === null) {
+      return 'No successful refresh yet, so which of this account\'s channels it covers is not known.';
+    }
+    if (!s.covers) return 'Its last refresh has no listings for any channel on this account.';
+    const out = [`Covers ${fmtN(s.covers)} of this account's channels.`];
+    if (s.fills) out.push(`${fmtN(s.fills)} with no guide now would get one.`);
+    if (s.switches) out.push(`${fmtN(s.switches)} would switch to it from a source listing one program all day.`);
+    if (!s.fills && !s.switches) out.push('Every one of them keeps the guide it has now.');
+    return out.join(' ');
+  }
+
+  function openAddSource() {
+    jsonFetch(sourceUrl('borrowable'))
+      .then((res) => {
+        if (!(res.sources || []).length) { openSourceModal(null); return; }
+        openBorrowModal(res.sources);
+      })
+      .catch(() => openSourceModal(null));
+  }
+
+  function openBorrowModal(sources) {
+    const body = document.createElement('div');
+    const opt = (value, title, sub) =>
+      `<label class="fp-radio"><input type="radio" name="src-pick" value="${value}">` +
+      `<strong>${title}</strong><span class="text-muted small">${sub}</span></label>`;
+    body.innerHTML =
+      '<p class="text-muted small">Another account\'s guide goes last in this account\'s ' +
+      'order, so it only gives a guide to channels nothing above it covers. Nothing is ' +
+      'downloaded twice: its account keeps refreshing it.</p>' +
+      '<div style="margin-top:8px">' +
+      opt('url', 'An XMLTV URL', 'A guide file of your own, fetched right away.') +
+      sources.map((s) => opt(String(s.id), escHtml(s.name),
+        `${escHtml(s.owner_name || '')} - ${escHtml(s.kind)}` +
+        `${s.last_success_at ? `, refreshed ${escHtml(s.last_success_at)}` : ''}` +
+        `${s.is_url && !s.enabled ? ', turned off on its account' : ''}<br>${borrowNote(s)}`)).join('') +
+      '</div>';
+    buildModal({
+      title: 'Add EPG source',
+      body,
+      footer: [
+        { label: 'Cancel', class: 'btn', onClick: (c) => c() },
+        {
+          label: 'Add source',
+          class: 'btn btn-primary',
+          onClick: (close) => {
+            const picked = body.querySelector('input[name="src-pick"]:checked');
+            if (!picked) { showToast('Choose a source.', { type: 'error' }); return false; }
+            if (picked.value === 'url') { close(); openSourceModal(null); return false; }
+            // Copying a large feed's listings takes a few seconds (dev/changelog/1106).
+            showToast('Adding the source and copying the listings it already has...',
+              { durationMs: 15000 });
+            jsonFetch(sourceUrl('subscribe'), {
+              method: 'POST', body: JSON.stringify({ source_id: Number(picked.value) }),
+            }).then((res) => {
+              close();
+              showToast(res.message || 'Added.', { durationMs: 10000 });
+              setTimeout(reload, 1500);
+            }).catch((e) => showToast(e.message || 'Could not add the source.', { type: 'error' }));
+            return false;
+          },
+        },
+      ],
+    });
+  }
+
+  // Sentence one says what happens; sentence two what it costs, counted from the row.
+  function confirmSourceRemoval(el, { title, verb, url, what }) {
+    const n = Number(el.dataset.activeHere || 0);
+    let cost = n
+      ? `${n.toLocaleString('en-US')} channel${n === 1 ? ' on this account gets its' : 's on this account get their'} ` +
+        'guide from it now. Each switches to the next source that covers it, or has no guide.'
+      : 'No channel on this account gets its guide from it right now.';
+    if (el.dataset.readers && verb === 'Delete source') {
+      cost += ` Other accounts read it too, and lose it: ${escHtml(el.dataset.readers)}. ` +
+        'Each of those channels switches to its next source, or has no guide.';
+    }
+    buildModal({
+      title,
+      body: `<p>${what(escHtml(el.dataset.sourceName || ''), el.dataset)}</p>` +
+        `<p class="text-muted small" style="margin-top:8px">${cost}</p>`,
+      footer: [
+        { label: 'Cancel', class: 'btn', onClick: (c) => c() },
+        {
+          label: verb,
+          class: 'btn btn-danger',
+          onClick: (close) => {
+            post(url, { method: url.endsWith('stop-using') ? 'POST' : 'DELETE' })
+              .then(() => { close(); setTimeout(reload, 1500); })
+              .catch(() => close());
+            return false;
+          },
+        },
+      ],
+    });
+  }
+
   const ACTIONS = {
+    'source-add': openAddSource,
+    'source-edit': editSource,
+    'source-refresh': (el) => post(`${sourceUrl(el.dataset.sourceId)}/refresh`, { method: 'POST' })
+      .then(() => setTimeout(reload, 1500)),
+    'source-delete': (el) => confirmSourceRemoval(el, {
+      title: 'Delete EPG source', verb: 'Delete source', url: sourceUrl(el.dataset.sourceId),
+      what: (name) => `Delete <strong>${name}</strong> and every listing it imported?`,
+    }),
+    'source-stop': (el) => confirmSourceRemoval(el, {
+      title: 'Stop using this guide', verb: 'Stop using',
+      url: `${sourceUrl(el.dataset.sourceId)}/stop-using`,
+      what: (name, d) => {
+        const head = `Stop using <strong>${name}</strong> on this account? Its listings are removed`;
+        if (d.ownerName) {
+          return `${head} from this account's channels. ${escHtml(d.ownerName)} keeps it, and ` +
+            'Add source brings it back.';
+        }
+        if (d.readers) {
+          return `${head}. It is still downloaded for the other accounts reading it: ` +
+            `${escHtml(d.readers)}. ` +
+            'Use again brings it back at the next sync.';
+        }
+        return `${head} and it is no longer downloaded. Use again brings it back at the next sync.`;
+      },
+    }),
+    'source-use': (el) => post(`${sourceUrl(el.dataset.sourceId)}/use-again`, { method: 'POST' })
+      .then(() => setTimeout(reload, 1500)),
+    // Re-deciding every channel's guide can take a few seconds on a large account, so the
+    // toast says the move is under way rather than leaving the menu looking dead.
+    'source-move': (el) => {
+      showToast('Moving the source and re-deciding each channel\'s guide...');
+      return post(`${sourceUrl(el.dataset.sourceId)}/move`,
+        { method: 'POST', body: JSON.stringify({ direction: el.dataset.direction }) })
+        .then(() => setTimeout(reload, 1500));
+    },
     sync: () => accountSync(A.id, hooks()),
     'cancel-sync': () => accountCancelSync(A.id, hooks()),
     'force-epg': () => confirmForceEpgResync(A.id, hooks()),
@@ -239,10 +454,10 @@
     });
   }
 
-  function run(act) {
+  function run(act, el) {
     const handler = act === 'page-actions' ? openPageActionSheet : ACTIONS[act];
     if (!handler) { console.warn('unhandled account action', act); return; }
-    handler();
+    handler(el);
   }
 
   document.addEventListener('click', (e) => {
@@ -253,7 +468,7 @@
     if (el.tagName === 'A') return;
     e.preventDefault();
     closeMenus();
-    run(el.dataset.act);
+    run(el.dataset.act, el);
   });
 
   // ── The sticky bottom bar ────────────────────────────────────────────────

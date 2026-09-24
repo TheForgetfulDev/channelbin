@@ -1582,7 +1582,9 @@ function progHeadHtml(prog) {
     sheetLine('When', `${fmtT(prog.start_time)} - ${fmtT(prog.stop_time)}  ·  ${fmtDur(mins * 60, false)}`) +
     sheetLine('Day', fmtDateTz(start)) +
     sheetLine('Channel', prog.channel_name) +
-    (prog.description ? `<p class="info-desc">${escHtml(prog.description)}</p>` : '') +
+    // Which EPG source this showing came from (DESIGN-epg-sources.md §9.4).
+    sheetLine('Guide data', prog.source_name) +
+    (prog.description ?`<p class="info-desc">${escHtml(prog.description)}</p>` : '') +
     (tags ? `<div class="info-tags">${tags}</div>` : '');
 }
 

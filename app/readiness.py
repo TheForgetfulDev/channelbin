@@ -229,9 +229,12 @@ class Context:
         self.docker = bool(os.environ.get('CHANNELBIN_DOCKER'))
 
         self.scheduler_jobs = None
-        from .scheduler import get_scheduler
+        from .scheduler import get_scheduler, scheduler_is_live
         scheduler = get_scheduler()
+        # Two facts, because they can disagree: `running` is a flag only a clean shutdown
+        # clears, so it stays True after the loop thread has died (dev/changelog/1114).
         self.scheduler_running = bool(scheduler and scheduler.running)
+        self.scheduler_thread_alive = scheduler_is_live()
         if self.scheduler_running:
             try:
                 self.scheduler_jobs = len(scheduler.get_jobs())
@@ -476,9 +479,14 @@ def _check_db_write(ctx):
 
 
 def _check_scheduler(ctx):
-    tested = 'Asked APScheduler whether it is running and what it has registered'
+    tested = ('Asked APScheduler whether it was started, checked that its loop thread is '
+              'still alive, and read what it has registered')
     if not ctx.scheduler_running:
         return Result(PROBLEM, tested, 'The scheduler is not running in this process')
+    if not ctx.scheduler_thread_alive:
+        return Result(PROBLEM, tested,
+                      'The scheduler was started but its thread has died. Nothing scheduled '
+                      'will fire until ChannelBin restarts; the error is in the log')
     if ctx.scheduler_jobs is None:
         return Result(UNKNOWN, tested, 'It is running, but its job list could not be read')
     return Result(READY, tested,

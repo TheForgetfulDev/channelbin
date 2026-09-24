@@ -23,14 +23,17 @@ import os
 import re
 import sys
 import unittest
+from datetime import datetime, timedelta
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from tests.support.app import make_test_app  # noqa: E402
-from tests.support.seed import make_account, make_channel, make_channel_test  # noqa: E402
+from tests.support.seed import (make_account, make_channel, make_channel_test,  # noqa: E402
+                                make_epg_source)
 from app import db  # noqa: E402
-from app.database import Tag, TagPattern, TEST_STATUS_COMPLETED  # noqa: E402
+from app.database import (EPGEntry, EpgAlternateEntry, EpgSourceChannel, Tag,  # noqa: E402
+                          TagPattern, TEST_STATUS_COMPLETED)
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -94,11 +97,29 @@ class LabelledCellTests(unittest.TestCase):
             db.session.add(tag)
             db.session.flush()
             db.session.add(TagPattern(tag_id=tag.id, pattern='LIVE'))
-            ch = make_channel(make_account(), name='Sports HD')
+            acc = make_account()
+            src = make_epg_source(acc)
+            src.last_status = 'OK'
+            ch = make_channel(acc, name='Sports HD')
+            # A file channel named like it, so the name-match review has a row to draw.
+            db.session.add(EpgSourceChannel(source_id=src.id, xml_id='sports.test',
+                                            display_names='["Sports HD"]', entry_count=10,
+                                            distinct_titles=5))
             make_account(name='Second account')
             make_channel_test(ch, status=TEST_STATUS_COMPLETED, resolution='1920x1080')
+            # A second guide listing the channel, so the comparison page has rows.
+            other = make_epg_source(acc, kind='provider', name='Other guide')
+            ch.epg_source_id = src.id
+            soon = datetime.utcnow() + timedelta(hours=1)
+            db.session.add(EPGEntry(channel_id=ch.id, source_id=src.id, title='News',
+                                    start_time=soon, stop_time=soon + timedelta(hours=1)))
+            db.session.add(EpgAlternateEntry(channel_id=ch.id, source_id=other.id,
+                                             title='News', start_time=soon,
+                                             stop_time=soon + timedelta(hours=1)))
             db.session.commit()
             cls.channel_id = ch.id
+            cls.account_id = acc.id
+            cls.source_id = src.id
         cls.patcher = mock.patch('app.routes.jobs._build_job_list', return_value=JOBS)
         cls.patcher.start()
 
@@ -136,16 +157,46 @@ class LabelledCellTests(unittest.TestCase):
                     self._assert_labelled(url, table)
 
     def test_channel_detail_labels_every_cell(self):
-        # Its own case rather than a REFLOWING_PAGES entry: the two tables render only
-        # when the channel actually has tests and observations, so the URL is seeded.
+        # Its own case rather than a REFLOWING_PAGES entry: the tables render only when
+        # the channel actually has tests, observations and an EPG source, so the URL is
+        # seeded.
         html = self.client.get(f'/channels/{self.channel_id}').get_data(as_text=True)
         tables = _card_tables(html)
         self.assertEqual(
-            1, len(tables),
-            'The seeded channel has one test and no recording observations, so exactly '
-            'one of channel detail\'s two tables should render as .tbl-cards')
+            2, len(tables),
+            'The seeded channel has one test, no recording observations and one EPG source, '
+            'so the Guide source table and one of the two history tables should render as '
+            '.tbl-cards')
         for table in tables:
             self._assert_labelled('/channels/<id>', table)
+
+    def test_account_detail_labels_every_cell(self):
+        # Seeded like the channel page: the EPG sources table renders only when the
+        # account reads a source (DESIGN-epg-sources.md §9.2).
+        html = self.client.get(f'/accounts/{self.account_id}').get_data(as_text=True)
+        tables = _card_tables(html)
+        self.assertEqual(1, len(tables), 'the EPG sources table should render as .tbl-cards')
+        for table in tables:
+            self._assert_labelled('/accounts/<id>', table)
+
+    def test_name_match_review_labels_every_cell(self):
+        # Seeded: the review draws rows only for a refreshed source whose file names one of
+        # the account's channels (dev/changelog/1105).
+        html = self.client.get(f'/epg-sources/{self.source_id}/review').get_data(as_text=True)
+        tables = _card_tables(html)
+        self.assertEqual(1, len(tables), 'the name-match proposals should render as .tbl-cards')
+        for table in tables:
+            self._assert_labelled('/epg-sources/<id>/review', table)
+
+    def test_guide_compare_labels_every_cell(self):
+        # Seeded: the comparison draws a table only for a channel two sources list
+        # (dev/changelog/1108).
+        html = self.client.get(f'/channels/{self.channel_id}/guide-compare').get_data(
+            as_text=True)
+        tables = _card_tables(html)
+        self.assertEqual(1, len(tables), 'one day of listings should render one .tbl-cards table')
+        for table in tables:
+            self._assert_labelled('/channels/<id>/guide-compare', table)
 
     def test_js_built_rows_label_every_cell(self):
         for path, builder, expected in REFLOWING_JS:
@@ -198,7 +249,10 @@ class OptInTests(unittest.TestCase):
                     if 'tbl-cards' in _read(os.path.relpath(path, REPO)):
                         found.add(os.path.relpath(path, REPO))
         registered = {'templates/tags.html', 'templates/jobs.html',
-                      'templates/channels/detail.html', 'templates/_account_stats.html'} | {p for p, _b, _n in REFLOWING_JS}
+                      'templates/channels/detail.html', 'templates/_account_stats.html',
+                      'templates/account_detail.html',
+                      'templates/epg_source_review.html',
+                      'templates/channels/guide_compare.html'} | {p for p, _b, _n in REFLOWING_JS}
         self.assertEqual(
             registered, found,
             'A file opts into .tbl-cards but is not covered above (or is covered and no '

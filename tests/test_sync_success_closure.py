@@ -109,6 +109,7 @@ class SuccessClosureRetryTests(unittest.TestCase):
             resp = mock.Mock()
             resp.content = body
             resp.raise_for_status.return_value = None
+            resp.status_code = 200
             return resp
 
         statements = []

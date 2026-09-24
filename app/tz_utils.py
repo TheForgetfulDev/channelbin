@@ -122,13 +122,17 @@ def parse_epoch_utc(value) -> datetime | None:
         return None
 
 
-def format_local(dt, style: str = 'datetime', none_value='-'):
+def format_local(dt, style: str = 'datetime', none_value='-', *, tz: ZoneInfo = None,
+                 h24: bool = None):
     """Format a naive-UTC (or aware) datetime in the display timezone.
-    None → none_value (pass none_value=None where JSON callers must keep nulls)."""
+    None → none_value (pass none_value=None where JSON callers must keep nulls).
+    A per-row loop passes `tz` and `h24`, read once, so no row reaches the config."""
     if dt is None:
         return none_value
     fmt_12h, fmt_24h = _STYLES[style]
-    return to_local(dt).strftime(fmt_24h if is_24h() else fmt_12h)
+    if h24 is None:
+        h24 = is_24h()
+    return to_local(dt, tz).strftime(fmt_24h if h24 else fmt_12h)
 
 
 def relative(dt_utc: datetime, *, style: str = 'compact', now: datetime = None) -> str:

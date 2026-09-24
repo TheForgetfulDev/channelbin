@@ -292,29 +292,39 @@ class WaitForConversionClearTests(unittest.TestCase):
 
         with _joined_thread(_clear_soon):
             started = time.monotonic()
-            _wait_for_conversion_clear(conv_id, 0, poll_seconds=0.02)
+            result = _wait_for_conversion_clear(conv_id, 0, poll_seconds=0.02)
+        self.assertEqual(result, 'clear')
         self.assertTrue(cleared.is_set())
         self.assertGreaterEqual(time.monotonic() - started, 0.1,
                                 'returned before the conflict actually cleared')
 
     def test_stops_waiting_once_this_recording_is_cancelled(self):
+        """The cancel exit is asserted by name, not by a 2s wall-clock margin: the wait has no
+        ceiling of its own, so a broken cancel branch hung this test rather than failing it,
+        and a margin on a shared machine is not a property of the code (dev/docs/BUGS.md
+        2026-09-11 @ 05:41:46 AM, 2026-09-23 @ 09:08:47 PM)."""
         conv = seed.make_recording(status='CONVERTING', name='conv')
         seed.make_recording(status=REC_STATUS_IN_PROGRESS, name='never clears')
         db.session.commit()
         conv_id = conv.id
+        polls = []
 
-        def _cancel_soon():
-            time.sleep(0.1)
-            with self.t.app.app_context():
-                r = db.session.get(Recording, conv_id)
-                r.status = 'ABORTED'
-                db.session.commit()
+        def _cancel_on_first_poll(_seconds):
+            polls.append(_seconds)
+            if len(polls) == 1:
+                # A pushed app context is a separate session, as the cancelling request is.
+                with self.t.app.app_context():
+                    r = db.session.get(Recording, conv_id)
+                    r.status = 'ABORTED'
+                    db.session.commit()
+            elif len(polls) > 50:
+                raise AssertionError('kept waiting on an unrelated recording after being '
+                                     'cancelled')
 
-        with _joined_thread(_cancel_soon):
-            started = time.monotonic()
-            _wait_for_conversion_clear(conv_id, 0, poll_seconds=0.02)
-        self.assertLess(time.monotonic() - started, 2.0,
-                        'kept waiting on an unrelated recording after being cancelled')
+        with mock.patch.object(ppmod.time, 'sleep', side_effect=_cancel_on_first_poll):
+            result = _wait_for_conversion_clear(conv_id, 0, poll_seconds=0.02)
+        self.assertEqual(result, 'cancelled')
+        self.assertEqual(len(polls), 1, 'the cancel was not noticed on the next poll')
 
 
 # ── run_conversion_supervised: in-loop preemption (fake Popen, no real ffmpeg) ────────────

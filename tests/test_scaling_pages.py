@@ -361,6 +361,73 @@ def _scaling_account_id():
     return Account.query.filter_by(name='Scaling Account Detail').one().id
 
 
+def _seed_name_match_review(n):
+    """One source whose directory names n channels, each proposed by name: a third of them
+    disagreeing with a provider id, and a third already rejected - the name-match review
+    page's three views (dev/changelog/1105). Every row shows programs from the directory
+    and the source its channel's guide comes from today, the two per-row lookups the page
+    must not make."""
+    import json as _json
+    from app.database import EpgChannelKey, EpgSourceChannel
+    acc = seed.make_account(name='Scaling Name Match')
+    src = seed.make_epg_source(acc, name='Scaling Name Source')
+    src.last_status = 'OK'
+    soon = datetime.utcnow() + timedelta(hours=1)
+    for i in range(n):
+        db.session.add(EpgSourceChannel(
+            source_id=src.id, xml_id=f'name{i}.test', display_names=_json.dumps([f'Named {i}']),
+            entry_count=10, distinct_titles=5, horizon_until=soon,
+            upcoming_titles=_json.dumps([[soon.isoformat(), f'Show {i}']])))
+        db.session.add(EpgSourceChannel(
+            source_id=src.id, xml_id=f'other{i}.test', display_names=_json.dumps([f'Other {i}']),
+            entry_count=10, distinct_titles=5, horizon_until=soon,
+            upcoming_titles=_json.dumps([[soon.isoformat(), f'Other show {i}']])))
+        ch = seed.make_channel(acc, name=f'Named {i}',
+                               epg_channel_id=f'other{i}.test' if i % 3 == 1 else None)
+        ch.epg_source_id = src.id if i % 2 else None
+        if i % 3 == 2:
+            db.session.flush()
+            db.session.add(EpgChannelKey(channel_id=ch.id, source_id=src.id, key=None,
+                                         origin='name_match', status='rejected',
+                                         matched_on=f'Named {i}'))
+    db.session.commit()
+
+
+def _seed_guide_compare(n):
+    """One channel whose guide lists n programs, beside another source listing n -
+    the comparison page (dev/changelog/1108) - with every kind of row: the same program,
+    a moved one, a different one, and one side only. The rows are compared in Python over
+    one read per table; a per-row lookup would show here."""
+    from app.database import EPGEntry, EpgAlternateEntry
+    acc = seed.make_account(name='Scaling Compare')
+    src = seed.make_epg_source(acc, name='Scaling Compare Active')
+    other = seed.make_epg_source(acc, kind='provider', name='Scaling Compare Other')
+    ch = seed.make_channel(acc, name='Scaling Compare Channel', epg_channel_id='cmp.test')
+    ch.epg_source_id = src.id
+    db.session.flush()
+    base = datetime.utcnow() + timedelta(hours=1)
+    for i in range(n):
+        start = base + timedelta(hours=i)
+        db.session.add(EPGEntry(channel_id=ch.id, source_id=src.id, title=f'Show {i}',
+                                description='About it.', start_time=start,
+                                stop_time=start + timedelta(hours=1)))
+        shift = {1: timedelta(minutes=90), 3: timedelta(minutes=30)}.get(i % 4, timedelta(0))
+        db.session.add(EpgAlternateEntry(
+            channel_id=ch.id, source_id=other.id,
+            title=f'Other {i}' if i % 4 == 2 else f'Show {i}',
+            start_time=start + shift, stop_time=start + shift + timedelta(hours=1)))
+    db.session.commit()
+
+
+def _scaling_compare_channel_id():
+    return Channel.query.filter_by(name='Scaling Compare Channel').one().id
+
+
+def _scaling_name_source_id():
+    from app.database import EpgSource
+    return EpgSource.query.filter_by(name='Scaling Name Source').one().id
+
+
 def _seed_ignored_patterns(n):
     """n alert suppression rules - the Ignored alerts page renders one row each, and every
     row runs the `local_time` filter over `created_at`, which is the template-filter shape
@@ -601,6 +668,20 @@ class PageScalingTests(unittest.TestCase):
         self._assert_row_independent(_seed_account_history,
                                      lambda: f'/accounts/{_scaling_account_id()}')
 
+    def test_epg_source_review_page(self):
+        for view in ('proposals', 'disagreements', 'rejected'):
+            with self.subTest(view=view):
+                self._assert_row_independent(
+                    _seed_name_match_review,
+                    lambda: f'/epg-sources/{_scaling_name_source_id()}/review?view={view}')
+
+    def test_channel_guide_compare_page(self):
+        for diff in ('0', '1'):
+            with self.subTest(diff=diff):
+                self._assert_row_independent(
+                    _seed_guide_compare,
+                    lambda: f'/channels/{_scaling_compare_channel_id()}/guide-compare?diff={diff}')
+
     def test_group_detail_page(self):
         self._assert_row_independent(_seed_group_members, lambda: f'/channel-groups/{_scaling_group_id()}')
 
@@ -729,6 +810,7 @@ COVERED = {
     'guide.guide': 'test_guide_page',
     'channels.channel_browser': 'test_channels_hub_page',
     'channels.channel_detail': 'test_channel_detail_page',
+    'channels.channel_guide_compare': 'test_channel_guide_compare_page',
     'channel_groups.groups_page': 'test_groups_page',
     'channel_groups.group_detail': 'test_group_detail_page',
     'alerts.alert_center': 'test_alerts_page',
@@ -737,6 +819,7 @@ COVERED = {
     'channel_hide_rules.hide_rules_page': 'test_hide_rules_page',
     'accounts.accounts_list': 'test_accounts_list_page',
     'accounts.account_detail': 'test_account_detail_page',
+    'accounts.epg_source_review': 'test_epg_source_review_page',
     'profiles.profiles_list': 'test_profiles_page',
     'health_check_profiles.health_check_profiles_list': 'test_health_check_profiles_page',
     'jobs.jobs_page': 'test_jobs_page',

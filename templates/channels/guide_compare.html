@@ -1,0 +1,115 @@
+{% extends "base.html" %}
+{% import '_macros.html' as m %}
+{% block title %}Compare guide sources - {{ channel.name }} - ChannelBin{% endblock %}
+
+{#  Guide source comparison (DESIGN-epg-sources.md §4, §12; dev/changelog/1108).
+
+    One channel's guide beside what each other source its account reads says about it,
+    from now on. Read-only: which source wins is decided on the channel page (Use this
+    source) and the account page (the priority order), never here. Every verdict carries the
+    counts it was judged on, and the rows below it are the evidence. #}
+
+
+{% macro listing(x) -%}
+  {% if x %}
+  <div class="gc-when text-faint small">{{ x.start }} - {{ x.stop }}</div>
+  <div>{{ x.title }}</div>
+  {% if x.sub_title %}<div class="text-muted small">{{ x.sub_title }}</div>{% endif %}
+  {% if x.description %}<div class="gc-desc text-faint small">{{ x.description }}</div>
+  {% else %}<div class="text-faint small">No description</div>{% endif %}
+  {% else %}<span class="text-faint">-</span>{% endif %}
+{%- endmacro %}
+
+{% macro qs(source_id, diff) -%}
+{{ url_for('channels.channel_guide_compare', channel_id=channel.id, source=source_id,
+           diff='1' if diff else none) }}
+{%- endmacro %}
+
+{% block content %}
+{% set verdicts = {
+  'identical': ('b-done', 'Identical'),
+  'descriptions': ('b-done', 'Identical, descriptions differ'),
+  'mostly': ('b-sched', 'Mostly the same'),
+  'shifted': ('b-warn', 'Shifted'),
+  'unrelated': ('b-fail', 'Unrelated'),
+  'no-overlap': ('b-abort', 'Nothing to compare'),
+} %}
+<style>
+.gc-sources { display: flex; flex-direction: column; gap: 12px; }
+.gc-source { display: flex; flex-direction: column; gap: 4px; }
+.gc-source-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.gc-desc { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.gc-when { font-variant-numeric: tabular-nums; }
+.gc-day { margin: 20px 0 8px; font-size: var(--fs-md); }
+.gc-outside td { opacity: .6; }
+</style>
+
+<div class="page-head">
+  <h1>Compare guide sources <span class="sub">{{ channel.name }}</span></h1>
+  <a href="{{ url_for('channels.channel_detail', channel_id=channel.id) }}" class="btn">&larr; {{ channel.name }}</a>
+</div>
+<p class="page-sub">
+  What each guide this channel's account reads lists for it, from now on, lined up by start
+  time. Two listings are the same program when their titles match and they start within five
+  minutes of each other. Nothing here changes which guide the channel uses.
+</p>
+
+{% if not active_source %}
+<div class="empty-state">
+  <p>This channel has no guide right now, so there is nothing to compare against.</p>
+  <p class="text-muted">Other guides' listings are kept only for a channel that takes its guide from somewhere.</p>
+</div>
+{% elif not sources %}
+<div class="empty-state">
+  <p>Only {{ active_source.name }} has listings for this channel.</p>
+  <p class="text-muted">A comparison needs a second guide the account reads that lists it too. Guides are added on the account page.</p>
+</div>
+{% else %}
+<div class="card">
+  <div class="card-head"><h2>Against {{ active_source.name }}</h2></div>
+  <div class="card-body">
+    <p class="card-note">The guide this channel shows today{% if active_until %}, listed until {{ active_until }}{% endif %}.</p>
+    <div class="gc-sources">
+      {% for s in sources %}
+      <div class="gc-source">
+        <div class="gc-source-head">
+          <strong>{{ s.name }}</strong> {{ m.status_badge(verdicts[s.verdict][0], verdicts[s.verdict][1]) }}
+          {% if chosen and s.id == chosen.id %}<span class="text-faint small">shown below</span>
+          {% else %}<a href="{{ qs(s.id, diff_only) }}" class="small">Show these listings</a>{% endif %}
+        </div>
+        <div class="text-muted small">{{ s.summary | join(' ') }} {{ s.name }} lists until {{ s.until }}.</div>
+      </div>
+      {% endfor %}
+    </div>
+  </div>
+</div>
+
+<div class="toolbar">
+  <div class="chips">
+    <a class="chip{% if not diff_only %} active{% endif %}" href="{{ qs(chosen.id, false) }}">All programs</a>
+    <a class="chip{% if diff_only %} active{% endif %}" href="{{ qs(chosen.id, true) }}">Differences only</a>
+  </div>
+</div>
+
+{% if not days %}
+<div class="empty-state"><p>{% if diff_only %}No differences: every program matches.{% else %}Neither guide lists anything from now on.{% endif %}</p></div>
+{% endif %}
+{% for day in days %}
+<h3 class="gc-day">{{ day.label }}</h3>
+<div class="table-scroll">
+  <table class="tbl tbl-cards">
+    <thead><tr><th>{{ active_source.name }}</th><th>{{ chosen.name }}</th><th>Difference</th></tr></thead>
+    <tbody>
+    {% for r in day.rows %}
+    <tr{% if not r.counted %} class="gc-outside"{% endif %}>
+      <td data-label="{{ active_source.name }}">{{ listing(r.active) }}</td>
+      <td data-label="{{ chosen.name }}">{{ listing(r.other) }}</td>
+      <td data-label="Difference">{{ r.difference }}{% if r.outside %}<div class="text-faint small">After the shorter guide ends - not counted</div>{% endif %}</td>
+    </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endfor %}
+{% endif %}
+{% endblock %}

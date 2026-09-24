@@ -22,6 +22,7 @@ Runs against a throwaway temp SQLite DB - never the live dvr.db.
 """
 import json
 import os
+import re
 import sys
 import threading
 import unittest
@@ -399,7 +400,7 @@ class BlockedSyncTests(unittest.TestCase):
 
         html = self.t.client.get(f'/accounts/{self.account.id}').get_data(as_text=True)
         self.assertIn('stream URLs were built by ChannelBin', html)
-        self.assertIn('HLS', html)
+        self.assertEqual(re.findall(r'in the\s*<strong>([^<]*)</strong> URL form', html), ['HLS'])
 
 
 if __name__ == '__main__':

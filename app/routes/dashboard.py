@@ -10,7 +10,7 @@ from sqlalchemy.orm import selectinload
 
 from .. import db
 from ..database import (
-    Recording, Account,
+    Recording, Account, EpgSource,
     REC_STATUS_SCHEDULED, REC_STATUS_IN_PROGRESS, REC_STATUS_PAUSED, REC_STATUS_RETRYING,
     REC_STATUS_CONCATENATING, REC_STATUS_ANALYZING, REC_STATUS_CONVERTING,
     WINDOW_OPEN_STATUSES,
@@ -43,6 +43,7 @@ REC_ROW_STATUS_CLASS = {status: row[1] for status, row in REC_STATUS_DISPLAY.ite
 # does not have to add the field to four call sites first (dev/changelog/1082).
 BG_KIND_HEALTH_CHECK = 'health_check'
 BG_KIND_ACCOUNT_SYNC = 'account_sync'
+BG_KIND_EPG_SOURCE_REFRESH = 'epg_source_refresh'
 BG_KIND_POST_CAPTURE = 'post_capture'
 BG_KIND_SEARCH_INDEX = 'search_index'
 BG_KIND_MAINTENANCE = 'maintenance'
@@ -646,6 +647,18 @@ def _activity_status_dict():
                          'href': url_for('accounts.account_detail', account_id=acc.id)})
         dashboard_bg_count += 1
 
+    # An EPG source refreshing on its own - its interval job or Refresh now. One inside an
+    # account's sync is that sync's work and already shown above.
+    syncing_ids = {acc.id for acc in syncing_accounts}
+    for src in EpgSource.query.filter(EpgSource.refresh_started_at.isnot(None)).all():
+        if src.owner_account_id in syncing_ids:
+            continue
+        bg_tasks.append({'kind': BG_KIND_EPG_SOURCE_REFRESH,
+                         'label': 'EPG source refresh', 'detail': f'Refreshing {src.name}',
+                         'href': url_for('accounts.account_detail',
+                                         account_id=src.owner_account_id)})
+        dashboard_bg_count += 1
+
     # The three post-capture phases - already counted via `live` on the Dashboard's own
     # recording sections (IN_PROGRESS + CONCATENATING + ANALYZING + CONVERTING all render as
     # one "Recordings in progress" list there). Each label names its own phase: the analysis
@@ -714,9 +727,11 @@ def _activity_status_dict():
     next_bg_job = None
     future_jobs = []
     try:
-        from ..scheduler import get_scheduler
+        from ..scheduler import get_scheduler, scheduler_is_live
         scheduler = get_scheduler()
-        if scheduler:
+        # A dead loop's registered jobs are not upcoming; readiness says why the chip is
+        # gone (dev/changelog/1114).
+        if scheduler and scheduler_is_live():
             # label, and the page that job's kind is managed from - the tooltip row is a
             # link like every other one, so each entry owns its own destination rather
             # than every scheduled job landing on the same generic list.

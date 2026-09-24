@@ -690,7 +690,7 @@ def airing_record_context_api(epg_id):
     # the whole point of this endpoint is to hand the modal exactly what the guide hands it.
     # Copying it here would be a second spelling of that shape, which is the drift this area
     # has already paid for four times.
-    from .guide import _program_dict
+    from .guide import _program_dict, epg_source_names
 
     entry = db.session.get(EPGEntry, epg_id)
     if entry is None:
@@ -742,6 +742,7 @@ def airing_record_context_api(epg_id):
         # One showing, so this is not the N+1 case the map exists for - but the parameter is
         # required precisely so a new caller cannot forget it in a loop (dev/changelog/441).
         tags_by_name={t.name: t for t in all_tags},
+        source_names=epg_source_names(),
         tz=get_display_tz(),
         # An existing recording's own group wins - it already settled the question, and
         # editing it must not repoint it. Otherwise the group the CLICKED ROW named, and

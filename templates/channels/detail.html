@@ -28,6 +28,16 @@
    computeRowHeight() and to .guide-program's height, and the approved design says the row
    sizes to its tallest cell like every other guide row does. */
 
+/* Guide source card: Set key / Clear key under a source's key, and the Set key dialog's
+   lookup results (static/js/channel-detail.js::openEpgKeyModal). */
+.gs-key-actions { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 6px; }
+.gs-lookup-results { display: flex; flex-direction: column; gap: 4px; margin-top: 0.6rem;
+  max-height: 18rem; overflow-y: auto; }
+.gs-lookup-item { display: block; width: 100%; text-align: left; padding: 6px 8px;
+  background: var(--bg2); border: 1px solid var(--border); border-radius: var(--radius-sm);
+  color: var(--text); cursor: pointer; }
+.gs-lookup-item:hover, .gs-lookup-item:focus-visible { border-color: var(--accent); }
+
 /* The guide's toolbar sticks to the viewport because it belongs to the page. This one
    belongs to a card, so it scrolls with it - a bar that detaches from its own card and
    floats over the rest of the page is the mobile divergence round 6 called out. The
@@ -910,6 +920,87 @@
     </div>
   </div>
 
+  {# Guide source (DESIGN-epg-sources.md §9.3): which source this channel's listings come
+     from and why, then what every source the account reads says about it. A channel
+     listing one title is shown WITH that title, never called filler: the same shape is how
+     an event or PPV channel describes itself (§5.3). #}
+  {% set gs = guide_source %}
+  {% set gs_reasons = {
+    'override': 'your override',
+    'priority': 'first in priority order',
+    'real-schedule': 'the source ahead of it lists only one program for this channel',
+    'only-listing': 'no source has a full schedule here; this is the first one listing anything',
+  } %}
+  {# Why a saved key has not changed the listings yet (epg_sources.KEY_PENDING_OUTCOMES). #}
+  {% set gs_pending = {
+    'waits': "Waiting for this source's next refresh - no channel holds this key's listings yet.",
+    'not-in-file': "Not in this source's last refresh, so it matches nothing until it appears there.",
+    'no-key': "No key left - this channel matches nothing here after the next refresh.",
+    'unrefreshed': 'This source has no successful refresh yet - the key applies at its first one.',
+  } %}
+  <div class="card" data-section="guide">
+    <div class="card-head"><h2>Guide source</h2>
+      {% if gs.comparable and not gs.hidden %}<div class="card-head-actions">
+        <a href="{{ url_for('channels.channel_guide_compare', channel_id=channel.id) }}" class="btn btn-sm"
+           data-tip="This channel's listings beside each other guide's, lined up by start time.">Compare sources &rarr;</a>
+      </div>{% endif %}
+    </div>
+    <div class="card-body">
+      <p class="card-note">
+        {% if gs.hidden %}Hidden channels have no guide data imported from any source.
+        {% elif gs.active %}Listings come from <strong>{{ gs.active.name }}</strong>{% if gs.reason in gs_reasons %}: {{ gs_reasons[gs.reason] }}{% endif %}.
+        {% elif gs.rows %}No source this account reads has listings for this channel right now.
+        {% else %}This account reads no EPG source, so no guide data is imported for it.
+        {% endif %}
+      </p>
+      {# An override that is not in force must never read as one that is (§5.1 step 1): it is
+         kept, and says why the guide comes from somewhere else. #}
+      {% if gs.override and not gs.hidden and gs.override.state != 'in-force' %}
+      <p class="card-note">
+        {% if gs.override.state == 'waiting' %}Your override is <strong>{{ gs.override.name }}</strong>; its listings for this channel arrive at its next refresh, and it takes over then.
+        {% elif gs.override.state == 'not-read' %}Your override is <strong>{{ gs.override.name }}</strong>, which this account no longer reads, so it is not used. It takes over again if the account uses that source again.
+        {% else %}Your override is <strong>{{ gs.override.name }}</strong>, which has no listings for this channel right now, so it is not used. It takes over again when it has some.
+        {% endif %}
+      </p>
+      {% endif %}
+      {% if gs.rows %}
+      <div class="table-scroll">
+        <table class="tbl tbl-cards">
+          <thead><tr><th>Source</th><th>Key for this channel</th><th>Listings</th><th>Until</th></tr></thead>
+          <tbody>
+          {% for r in gs.rows %}
+          <tr>
+            <td data-label="Source">{{ r.name }}{% if r.active %} {{ m.status_badge('b-done', 'Active') }}{% endif %}{% if r.override %} {{ m.status_badge('b-sched', 'Your override') }}{% endif %}
+              <div class="text-faint small">{{ r.kind }}{% if not r.subscribed %} - no longer read by this account{% endif %}</div>
+              {% if not gs.hidden and (r.override or (r.subscribed and r.covers)) %}<div class="gs-key-actions">
+                {% if r.override %}<button type="button" class="btn btn-sm" data-act="epg-override" data-source-id="">Clear override</button>
+                {% elif r.subscribed and r.covers %}<button type="button" class="btn btn-sm" data-act="epg-override" data-source-id="{{ r.id }}" data-source-name="{{ r.name }}"
+                  data-tip="Take this channel's guide from this source whatever the priority order says. Kept until you clear it.">Use this source</button>{% endif %}
+              </div>{% endif %}</td>
+            <td data-label="Key">{% if r.key %}<code>{{ r.key }}</code>
+              <div class="text-faint small">{{ 'provider id' if r.key_origin == 'provider' else ('your key' if r.key_origin == 'manual' else 'accepted name match') }}</div>
+              {% else %}<span class="text-faint">none - cannot be matched</span>{% endif %}
+              {% if r.key_pending %}<div class="small text-warning">{{ gs_pending[r.key_pending] }}
+                {% if r.key_pending != 'not-in-file' and r.key_pending != 'no-key' %}<a href="{{ url_for('accounts.account_detail', account_id=r.owner_id) }}">{{ r.owner_name }} &rarr;</a>{% endif %}</div>{% endif %}
+              {% if r.subscribed %}<div class="gs-key-actions">
+                <button type="button" class="btn btn-sm" data-act="epg-key-set" data-source-id="{{ r.id }}" data-source-name="{{ r.name }}" data-key="{{ r.user_key or '' }}">Set key</button>
+                {% if r.user_key %}<button type="button" class="btn btn-sm" data-act="epg-key-clear" data-source-id="{{ r.id }}" data-source-name="{{ r.name }}">Clear key</button>{% endif %}
+              </div>{% endif %}</td>
+            <td data-label="Listings">
+              {% if not r.covers %}<span class="text-faint">{{ 'none' if r.refreshed else 'no successful refresh yet' }}</span>
+              {% elif r.sole_title is not none %}{{ '{:,}'.format(r.entry_count) }}, listing one program all day: <em>{{ r.sole_title or '(untitled)' }}</em>
+              {% else %}{{ '{:,}'.format(r.entry_count) }} ({{ r.distinct_titles }}{% if r.distinct_titles >= gs.title_cap %}+{% endif %} titles)
+              {% endif %}{% if r.covers and not r.refreshed %}<div class="text-faint small">already held; this source has no successful refresh yet</div>{% endif %}</td>
+            <td data-label="Until">{% if r.covers and r.horizon_until %}{{ r.horizon_until | local_time }}{% else %}<span class="text-faint">-</span>{% endif %}</td>
+          </tr>
+          {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      {% endif %}
+    </div>
+  </div>
+
   {# Activity timeline: the same event-log component the recording detail page uses
      (channels/_timeline.html, styled in style.css). #}
   <div class="card" data-section="timeline">
@@ -1216,6 +1307,7 @@ window.CHANNEL_DETAIL = {
   {# What the two confirm dialogs promise, computed by the same replay the action will run
      (app/health_recompute.py::rollback_preview) rather than guessed at in JS. #}
   healthRollback: {{ health_rollback | tojson }},
+  epgTitleCap: {{ guide_source.title_cap }},
   defaultProfileId: {{ channel.default_profile_id | tojson }},
   defaultProfileName: {{ (channel.default_profile.name if channel.default_profile else None) | tojson }},
   testEnabled: {{ channel.test_enabled | tojson }},
@@ -1256,6 +1348,9 @@ window.CHANNEL_DETAIL = {
     channelsHub: '{{ url_for("channels.channel_browser") }}',
     hide: '{{ url_for("channels.hide_channel", channel_id=channel.id) }}',
     healthRollback: '{{ url_for("channels.rollback_health_score", channel_id=channel.id) }}',
+    epgKey: '{{ url_for("channels.set_channel_epg_key", channel_id=channel.id) }}',
+    epgOverride: '{{ url_for("channels.set_channel_epg_source_override", channel_id=channel.id) }}',
+    epgKeyLookup: '{{ url_for("channels.lookup_channel_epg_key", channel_id=channel.id) }}',
   },
 };
 </script>

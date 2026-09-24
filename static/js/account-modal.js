@@ -66,7 +66,6 @@ function accountPayload(values) {
     name: String(values.name || '').trim(),
     account_type: values.account_type,
     m3u_url: values.m3u_url,
-    epg_url: values.epg_url,
     base_url: values.base_url,
     username: values.username,
     password: values.password,
@@ -129,13 +128,8 @@ function renderAccountModal(data, onDone) {
       label: 'M3U URL', stack: true, id: 'm3u',
       meta: 'The full playlist URL from your provider. This is where the account DATA is ' +
         'fetched from - it is not where the streams come from, and the two are frequently ' +
-        'different hosts.',
+        'different hosts. Guide data (XMLTV) is set under EPG sources on the account page.',
       control: `<input type="url" id="acct-m3u" value="${escHtml(a.m3u_url)}">`,
-    }) +
-    fieldRow({
-      label: 'XMLTV EPG URL', stack: true, id: 'epg',
-      meta: 'Guide data URL. Leave blank to skip EPG import.',
-      control: `<input type="url" id="acct-epg" value="${escHtml(a.epg_url)}">`,
     }) +
     // ── Xtream fields ──
     fieldRow({
@@ -221,7 +215,7 @@ function renderAccountModal(data, onDone) {
 
   // One field set on screen at a time, the same rule the form page follows. Nothing is
   // cleared when the type changes - a mis-click must not cost a pasted URL.
-  const M3U_ROWS = ['m3u', 'epg'];
+  const M3U_ROWS = ['m3u'];
   const XTREAM_ROWS = ['base', 'user', 'pass', 'debug'];
   const applyType = () => {
     const type = $('#acct-type').value;
@@ -258,7 +252,6 @@ function renderAccountModal(data, onDone) {
     name: $('#acct-name').value,
     account_type: $('#acct-type').value,
     m3u_url: $('#acct-m3u').value,
-    epg_url: $('#acct-epg').value,
     base_url: $('#acct-base').value,
     username: $('#acct-user').value,
     password: $('#acct-pass').value,

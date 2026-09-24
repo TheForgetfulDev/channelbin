@@ -77,6 +77,7 @@ ALLOWED = {
     ('app/accounts.py', '_sync_threads'): 'a running sync thread deregisters itself in its own finally',
     ('app/accounts.py', '_sync_stop_events'): 'paired with _sync_threads; clearing loses the only handle that can stop a live sync',
     ('app/accounts.py', '_sync_locks'): 'clearing would let a second sync start against an account already syncing',
+    ('app/accounts.py', '_source_locks'): 'clearing would let a second refresh start against an EPG source already refreshing',
     ('app/accounts.py', '_sync_progress'): 'popped by the sync thread itself (accounts.py finally block), keyed to its lifetime',
     ('app/accounts.py', '_sync_cancel_reasons'): 'read by the sync thread after cancellation; clearing loses the reason the UI reports',
     ('app/concatenator.py', '_active_concats'): 'each concat chain releases its own claim in its finally; clearing would let a second concat start against a recording already being concatenated',

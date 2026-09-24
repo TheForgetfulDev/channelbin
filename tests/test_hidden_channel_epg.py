@@ -4,7 +4,7 @@ The largest single payoff of the hiding feature (dev/changelog/781): a channel n
 see costs nothing to store guide data for, so none is stored. Three pieces have to hold
 together, and each fails silently on its own:
 
-  - `_import_xmltv` builds `channel_map` from VISIBLE channels only, so a <programme> for a
+  - `import_source` builds `channel_map` from VISIBLE channels only, so a <programme> for a
     hidden channel becomes no rows. `_count_projected_epg_entries` is handed the same map,
     so the collapse guard's count pass follows for free - if it did not, the guard would
     compare a whole-account projection against a visible-only baseline and refuse every
@@ -34,10 +34,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app import db  # noqa: E402
 from app import channel_hiding  # noqa: E402
-from app.accounts import _import_xmltv, _visible_epg_baseline  # noqa: E402
+from app.accounts import import_source, _visible_source_baseline  # noqa: E402
 from app.database import Channel, EPGEntry  # noqa: E402
 from tests.support import make_test_app  # noqa: E402
 from tests.support import seed  # noqa: E402
+from tests.support.seed import make_epg_source  # noqa: E402
 
 
 def _xmltv(entries):
@@ -63,6 +64,7 @@ class _EpgHidingTestCase(unittest.TestCase):
         self.ctx_mgr = self.t.app.app_context()
         self.ctx_mgr.push()
         self.acct = seed.make_account(name='Alpha')
+        make_epg_source(self.acct)
 
     def tearDown(self):
         self.ctx_mgr.pop()
@@ -93,7 +95,7 @@ class ImportSkipsHiddenChannelsTests(_EpgHidingTestCase):
 
         xml = _xmltv([(visible.epg_channel_id, 60, 30),
                       (hidden.epg_channel_id, 60, 30)])
-        synced, reason = _import_xmltv(self.acct, xml, epg_days=3, cfg=self._cfg())
+        synced, reason = import_source(make_epg_source(self.acct), xml, epg_days=3, cfg=self._cfg())
 
         self.assertIsNone(reason)
         self.assertEqual(synced, 1, 'only the visible channel may produce a row')
@@ -114,8 +116,8 @@ class ImportSkipsHiddenChannelsTests(_EpgHidingTestCase):
         self.assertFalse(ch.hidden)
         self.assertTrue(ch.hidden_deferred)
 
-        synced, reason = _import_xmltv(
-            self.acct, _xmltv([(ch.epg_channel_id, 60, 30)]), epg_days=3, cfg=self._cfg())
+        synced, reason = import_source(
+            make_epg_source(self.acct), _xmltv([(ch.epg_channel_id, 60, 30)]), epg_days=3, cfg=self._cfg())
 
         self.assertIsNone(reason)
         self.assertEqual(synced, 1)
@@ -125,8 +127,8 @@ class ImportSkipsHiddenChannelsTests(_EpgHidingTestCase):
         ch = self._channel('Only One')
         self._hide(ch)
 
-        synced, reason = _import_xmltv(
-            self.acct, _xmltv([(ch.epg_channel_id, 60, 30)]), epg_days=3, cfg=self._cfg())
+        synced, reason = import_source(
+            make_epg_source(self.acct), _xmltv([(ch.epg_channel_id, 60, 30)]), epg_days=3, cfg=self._cfg())
 
         self.assertEqual(synced, 0)
         self.assertIsNone(reason, 'nothing to import is not a degradation')
@@ -147,7 +149,7 @@ class ImportSkipsHiddenChannelsTests(_EpgHidingTestCase):
         db.session.commit()
         self.assertEqual(self._entries(stranded), 1)
 
-        _import_xmltv(self.acct, _xmltv([(visible.epg_channel_id, 60, 30)]),
+        import_source(make_epg_source(self.acct), _xmltv([(visible.epg_channel_id, 60, 30)]),
                       epg_days=3, cfg=self._cfg(threshold_pct=0))
 
         self.assertEqual(self._entries(stranded), 0)
@@ -262,7 +264,7 @@ class CollapseGuardBaselineTests(_EpgHidingTestCase):
         hidden.hidden = True   # hidden-cache-write-ok: proving the COUNT filters, not the purge
         db.session.commit()
 
-        self.assertEqual(_visible_epg_baseline(self.acct), 4)
+        self.assertEqual(_visible_source_baseline(make_epg_source(self.acct).id), 4)
 
     def test_the_cached_column_no_longer_arms_the_guard(self):
         """The whole rebase in one assertion: a stale high count cannot refuse an import."""
@@ -270,8 +272,8 @@ class CollapseGuardBaselineTests(_EpgHidingTestCase):
         self.acct.epg_entry_count = 100_000
         db.session.commit()
 
-        synced, reason = _import_xmltv(
-            self.acct, _xmltv([(ch.epg_channel_id, 60, 30)]), epg_days=3, cfg=self._cfg())
+        synced, reason = import_source(
+            make_epg_source(self.acct), _xmltv([(ch.epg_channel_id, 60, 30)]), epg_days=3, cfg=self._cfg())
 
         self.assertIsNone(reason)
         self.assertEqual(synced, 1)
@@ -298,7 +300,7 @@ class CollapseGuardBaselineTests(_EpgHidingTestCase):
             self._hide(ch)
 
         xml = _xmltv([(keep.epg_channel_id, 60 + i * 30, 30) for i in range(5)])
-        synced, reason = _import_xmltv(self.acct, xml, epg_days=3, cfg=self._cfg())
+        synced, reason = import_source(make_epg_source(self.acct), xml, epg_days=3, cfg=self._cfg())
 
         self.assertIsNone(reason, f'the guard refused a legitimate import: {reason}')
         self.assertEqual(synced, 5)
@@ -310,8 +312,8 @@ class CollapseGuardBaselineTests(_EpgHidingTestCase):
             seed.make_epg_entry(ch)
         db.session.commit()
 
-        synced, reason = _import_xmltv(
-            self.acct, _xmltv([(ch.epg_channel_id, 60, 30)]), epg_days=3, cfg=self._cfg())
+        synced, reason = import_source(
+            make_epg_source(self.acct), _xmltv([(ch.epg_channel_id, 60, 30)]), epg_days=3, cfg=self._cfg())
 
         self.assertEqual(synced, 0)
         self.assertIsNotNone(reason)

@@ -15,7 +15,7 @@ carries the phase's own sentence and it is appended to the stored reason.
 
 Covers:
   - UpsertCancelTests: `_upsert_channels` stops mid-loop and commits nothing.
-  - ImportCancelTests: `_import_xmltv` stops before its delete (previous EPG kept) and
+  - ImportCancelTests: `import_source` stops before its delete (previous EPG kept) and
     inside its batch loop (buffered rows salvaged, count honest, reason names the loss).
   - CountPassCancelTests: the collapse guard's count pass is cancellable too.
   - CancelReasonTests: `_mark_sync_cancelled` appends the phase detail and keeps the
@@ -39,11 +39,12 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app import db  # noqa: E402
 from app.accounts import (  # noqa: E402
-    SyncCancelled, _count_projected_epg_entries, _do_sync, _import_xmltv,
+    SyncCancelled, _count_projected_epg_entries, _do_sync, import_source,
     _mark_sync_cancelled, _upsert_channels, _sync_cancel_reasons,
 )
 from app.database import Account, AccountSyncLog, Channel, EPGEntry, M3uAccount  # noqa: E402
 from tests.support import make_test_app  # noqa: E402
+from tests.support.seed import make_epg_source  # noqa: E402
 
 M3U_URL = 'http://provider.test/playlist.m3u8?user=realuser&pass=realpass'
 EPG_URL = 'http://provider.test/xmltv.php?username=realuser&password=realpass'
@@ -182,6 +183,7 @@ class _EpgFixture(unittest.TestCase):
         for i in range(n):
             db.session.add(EPGEntry(
                 channel_id=self.channel.id, title=f'Old {i}',
+                source_id=make_epg_source(self.account).id,
                 start_time=now + timedelta(hours=i),
                 stop_time=now + timedelta(hours=i, minutes=30)))
         db.session.commit()
@@ -191,7 +193,7 @@ class _EpgFixture(unittest.TestCase):
 
 
 class ImportCancelTests(_EpgFixture):
-    """The delete inside `_import_xmltv` is the line the cancel story turns on."""
+    """The delete inside `import_source` is the line the cancel story turns on."""
 
     def test_cancel_before_the_delete_keeps_the_previous_epg(self):
         self._seed_old_epg()
@@ -199,14 +201,14 @@ class ImportCancelTests(_EpgFixture):
         ev.set()
 
         with self.assertRaises(SyncCancelled) as caught:
-            _import_xmltv(self.account, _xmltv([('ch1.test', 60, 30)]), epg_days=3,
+            import_source(make_epg_source(self.account), _xmltv([('ch1.test', 60, 30)]), epg_days=3,
                           cfg={'sync': {'epg_collapse_threshold_percent': 0}},
                           stop_event=ev)
 
         db.session.rollback()
         self.assertEqual(len(self._epg_titles()), 3,
                           'stopping before the delete must leave the old guide intact')
-        self.assertIn('previous guide data was kept', str(caught.exception))
+        self.assertIn('its previous listings were kept', str(caught.exception))
 
     def test_cancel_inside_the_batch_loop_salvages_what_was_parsed(self):
         # Fired from the progress checkpoint, which the import loop reaches every 500
@@ -224,7 +226,7 @@ class ImportCancelTests(_EpgFixture):
         with mock.patch.object(accounts_mod, '_set_sync_progress',
                                side_effect=_cancel_at_first_epg_checkpoint):
             with self.assertRaises(SyncCancelled) as caught:
-                _import_xmltv(self.account, xml, epg_days=3,
+                import_source(make_epg_source(self.account), xml, epg_days=3,
                               cfg={'sync': {'epg_collapse_threshold_percent': 0}},
                               stop_event=ev)
 
@@ -240,8 +242,8 @@ class ImportCancelTests(_EpgFixture):
 
     def test_unset_stop_event_imports_normally(self):
         self._seed_old_epg()
-        synced, reason = _import_xmltv(
-            self.account, _xmltv([('ch1.test', 60, 30)]), epg_days=3,
+        synced, reason = import_source(
+            make_epg_source(self.account), _xmltv([('ch1.test', 60, 30)]), epg_days=3,
             cfg={'sync': {'epg_collapse_threshold_percent': 0}},
             stop_event=threading.Event())
         self.assertIsNone(reason)
@@ -263,7 +265,7 @@ class CountPassCancelTests(_EpgFixture):
                 stop_event=ev)
 
     def test_count_pass_without_an_event_is_unchanged(self):
-        total, err = _count_projected_epg_entries(
+        total, err, *_ = _count_projected_epg_entries(
             _xmltv([('ch1.test', 60, 30)]), {'ch1.test': [self.channel.id]}, False,
             datetime.utcnow() - timedelta(hours=1),
             datetime.utcnow() + timedelta(days=3))
@@ -279,7 +281,7 @@ class CountPassCancelTests(_EpgFixture):
         ev.set()
 
         with self.assertRaises(SyncCancelled):
-            _import_xmltv(self.account, _many_programs(1, 900), epg_days=3,
+            import_source(make_epg_source(self.account), _many_programs(1, 900), epg_days=3,
                           cfg={'sync': {'epg_collapse_threshold_percent': 20}},
                           stop_event=ev)
 
@@ -332,6 +334,7 @@ def _fake_get_factory(playlist_bytes, xml_bytes):
     def _fake_get(url, **kwargs):
         resp = mock.Mock()
         resp.raise_for_status = mock.Mock()
+        resp.status_code = 200
         if url == M3U_URL:
             resp.content = playlist_bytes
             return resp
@@ -352,6 +355,7 @@ class DoSyncCancelTests(unittest.TestCase):
         self.account = M3uAccount(name='E2E Cancel', m3u_url=M3U_URL, epg_url=EPG_URL,
                                   status='OK')
         db.session.add(self.account)
+        make_epg_source(self.account)
         db.session.commit()
         self.account_id = self.account.id
 

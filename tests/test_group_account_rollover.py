@@ -180,8 +180,9 @@ class RecordStartPrefersAFreeAccountTests(_GroupCase):
         self.assertIsNotNone(ev)
         self.assertIn('rolled over to a free account', ev.detail)
         self.assertIn('Strong Feed', ev.detail)
-        self.assertIn(str(self.strong_id), ev.extra_data)
-        self.assertIn('"took_busy_account": false', ev.extra_data)
+        extra = json.loads(ev.extra_data)
+        self.assertEqual(extra['skipped_busy_account_channel_ids'], [self.strong_id])
+        self.assertIs(extra['took_busy_account'], False)
 
     def test_the_better_member_still_wins_when_nothing_is_streaming(self):
         rid = self._scheduled()

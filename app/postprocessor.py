@@ -302,14 +302,18 @@ def _wait_for_conversion_clear(recording_id, within_seconds, poll_seconds=5, log
     """Block (polling) until _conversion_collision_conflict is clear, or this recording is
     cancelled meanwhile. Mirrors concatenator._wait_for_no_active_recording, with a
     lookahead window instead of a bare IN_PROGRESS check
-    (recording.post_process.collision_policy)."""
+    (recording.post_process.collision_policy).
+
+    Returns 'clear' or 'cancelled', naming which way out it took. The production caller
+    re-checks the cancel itself and ignores this; tests assert the exit by name rather than
+    by how fast it came (dev/docs/BUGS.md 2026-09-23 @ 09:08:47 PM)."""
     i = 0
     while True:
         conflict = _conversion_collision_conflict(within_seconds, recording_id)
         if conflict is None:
-            return
+            return 'clear'
         if cancelled_meanwhile(recording_id):
-            return
+            return 'cancelled'
         if i % log_every == 0:
             log.info('Recording %d conversion waiting on recording "%s" (status %s, '
                      'starts %s) - recording.post_process.collision_policy',

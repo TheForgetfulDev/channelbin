@@ -6,7 +6,7 @@ channels can jump straight past an exact multiple of 500 and stall visible progr
 stretches. The fix checks the *distance* since the last checkpoint
 (`synced - last_checkpoint >= 500`) instead of requiring an exact hit.
 
-No network: runs `_import_xmltv` directly against a throwaway temp SQLite DB - never dvr.db.
+No network: runs `import_source` directly against a throwaway temp SQLite DB - never dvr.db.
   python3 -m unittest tests.test_epg_progress_checkpoint
 """
 import os
@@ -18,9 +18,10 @@ from unittest import mock
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app import db  # noqa: E402
-from app.accounts import _import_xmltv  # noqa: E402
+from app.accounts import import_source  # noqa: E402
 from app.database import Channel, M3uAccount  # noqa: E402
 from tests.support import make_test_app  # noqa: E402
+from tests.support.seed import make_epg_source  # noqa: E402
 
 M3U_URL = 'http://provider.test/playlist.m3u8?user=realuser&pass=realpass'
 
@@ -73,8 +74,8 @@ class ProgressCheckpointTests(unittest.TestCase):
         calls = []
         with mock.patch('app.accounts._set_sync_progress',
                          side_effect=lambda *a: calls.append(a)):
-            synced, reason = _import_xmltv(
-                self.account, xml, epg_days=3,
+            synced, reason = import_source(
+                make_epg_source(self.account), xml, epg_days=3,
                 cfg={'sync': {'epg_collapse_threshold_percent': 0}})
 
         self.assertIsNone(reason)
