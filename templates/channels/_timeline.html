@@ -42,7 +42,8 @@
   'GROUP_CHECK_TARGETS_CHANGED': 'neutral', 'GROUP_FORMAT_STRATEGY_BLOCKED': 'failed',
   'GROUP_WARNING_MUTED': 'neutral',
   'GROUP_GUIDE_ADDED': 'start', 'GROUP_GUIDE_REMOVED': 'stopped',
-  'GROUP_GUIDE_BROKEN': 'failed',
+  'GROUP_GUIDE_BROKEN': 'failed', 'GROUP_GUIDE_LISTINGS_SET': 'neutral',
+  'GROUP_DEFAULT_PROFILE_SET': 'neutral',
 } %}
 {# ChannelGroupEvent types read badly through the generic underscores-to-Title-Case
    fallback ("Group Member Participation"), so each gets a written label. The fallback
@@ -58,6 +59,8 @@
   'GROUP_GUIDE_ADDED': 'Added To The TV Guide',
   'GROUP_GUIDE_REMOVED': 'Removed From The TV Guide',
   'GROUP_GUIDE_BROKEN': 'In The Guide With Nothing To Record',
+  'GROUP_GUIDE_LISTINGS_SET': 'Guide Listings Changed',
+  'GROUP_DEFAULT_PROFILE_SET': 'Default Profile Changed',
 } %}
 <div class="ch-timeline-log">
   {% for entry in entries %}

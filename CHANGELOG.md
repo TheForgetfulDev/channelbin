@@ -5,6 +5,18 @@ Notable changes to ChannelBin, newest first. This project follows
 release is tagged `v<version>` in git, and the version the app is running is shown in the
 page footer.
 
+## 0.18.0 - 2026-09-24
+
+**Added**
+
+- A channel group's TV Guide row fills any time its lead member's listings do not cover from
+  the group's other members, so one member with a single day of guide data no longer cuts the
+  whole row short.
+- A group can choose whose listings lead its TV Guide row, without changing which member it
+  records from.
+- A group can set a default recording profile, pre-selected when recording from the group's TV
+  Guide row or search result.
+
 ## 0.17.0 - 2026-09-24
 
 **Added**

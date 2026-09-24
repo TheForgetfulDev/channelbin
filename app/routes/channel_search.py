@@ -682,7 +682,8 @@ def airing_record_context_api(epg_id):
     Read-only, and it answers for exactly one EPG id - there is no way to enumerate stream
     URLs through it.
     """
-    from ..accounts import effective_filename_template, filename_tag_cleanup, normalize_url
+    from ..accounts import (default_profile_for, effective_filename_template,
+                            filename_tag_cleanup, normalize_url)
     from ..database import EPGEntry, Recording
     from ..recording_match import build_rec_indexes, candidate_recs, match_recording
     from ..tz_utils import get_display_tz
@@ -735,7 +736,7 @@ def airing_record_context_api(epg_id):
     prog = _program_dict(
         ch, entry, entry.start_time, entry.stop_time,
         stream_url=stream_url,
-        template=effective_filename_template(cfg, ch),
+        template=effective_filename_template(cfg, ch, chosen_group),
         tag_cleanup=filename_tag_cleanup(cfg),
         rec=rec,
         all_tags=all_tags,
@@ -750,11 +751,14 @@ def airing_record_context_api(epg_id):
         group_id=(rec.group_id if rec is not None
                   else (chosen_group.id if chosen_group is not None else None)),
     )
+    preselect = default_profile_for(ch, chosen_group)
     return jsonify({
         'success': True,
         'program': prog,
-        # openModal's second argument, which it reads for the channel's default profile.
-        'channel': {'id': ch.id, 'default_profile_id': ch.default_profile_id},
+        # openModal's second argument, which it reads for the profile to pre-select: the
+        # clicked group row's default over the channel's own (dev/changelog/1117).
+        'channel': {'id': ch.id,
+                    'default_profile_id': preselect.id if preselect is not None else None},
     })
 
 

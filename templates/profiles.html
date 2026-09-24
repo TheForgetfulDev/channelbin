@@ -64,7 +64,7 @@
     </span>
     {# Literal "·", not &middot; - tests/test_recording_stats.py asserts on this exact
        string as the marker for the per-profile usage count. #}
-    <span class="p-num"><span class="p-k">Used by</span>{{ rec_counts.get(p.id, 0) }} recording{{ 's' if rec_counts.get(p.id, 0) != 1 else '' }} · {{ channel_counts.get(p.id, 0) }} channel{{ 's' if channel_counts.get(p.id, 0) != 1 else '' }}</span>
+    <span class="p-num"><span class="p-k">Used by</span>{{ rec_counts.get(p.id, 0) }} recording{{ 's' if rec_counts.get(p.id, 0) != 1 else '' }} · {{ channel_counts.get(p.id, 0) }} channel{{ 's' if channel_counts.get(p.id, 0) != 1 else '' }}{% if group_counts.get(p.id) %} · {{ group_counts[p.id] }} group{{ 's' if group_counts[p.id] != 1 else '' }}{% endif %}</span>
     {# Keeps its own class even though it holds one button: an unclassed cell takes the
        default grid order and shifts every header label off its column. #}
     <span class="p-actions">
@@ -98,6 +98,7 @@ window.RP_CONFIG = {
   posterSpec: {{ poster_spec | tojson }},
   recCounts: {{ rec_counts | tojson }},
   channelCounts: {{ channel_counts | tojson }},
+  groupCounts: {{ group_counts | tojson }},
 };
 </script>
 <script src="{{ url_for('static', filename='js/profile-modal.js') }}"></script>

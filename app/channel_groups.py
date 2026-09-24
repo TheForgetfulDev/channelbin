@@ -1086,6 +1086,148 @@ def set_warning_muted(group, kind, muted) -> bool:
     return True
 
 
+# Why a group's guide-listings pin moved, as GROUP_GUIDE_LISTINGS_SET's extra_data carries
+# it. `removed` is the pinned channel leaving the group through the member-removal route.
+GUIDE_LISTINGS_REASONS = {
+    'user': 'by hand',
+    'removed': 'because {previous} was removed from the group',
+}
+
+
+def set_guide_listings_member(group, channel, reason='user'):
+    """Pin the member whose listings fill `group`'s guide row, or set it back to
+    automatic with `channel=None`.
+
+    THE only writer of ChannelGroup.guide_listings_channel_id. Which feed's guide data a
+    person trusts is their judgment call, so nothing derives or moves it on their behalf
+    (the participation-switch rule, CLAUDE.md); the one non-user reason is the pinned
+    channel being removed from the group by the member-removal route, which is a person's
+    action too and says so in the event. Enforced by
+    tests/test_static_invariants.py::GuideListingsWriteBypassTests.
+
+    `channel` must be a current member - the caller validates, and a non-member is a
+    ValueError rather than a stored pin that would silently do nothing. Same convention as
+    set_participation(): mutates and adds the ChannelGroupEvent without committing, and
+    returns True only when the pin actually moved."""
+    from . import db
+    from .database import Channel, ChannelGroupEvent, GROUP_GUIDE_LISTINGS_SET
+    if reason not in GUIDE_LISTINGS_REASONS:
+        raise ValueError(f'Unknown reason "{reason}"')
+    new_id = channel.id if channel is not None else None
+    if new_id is not None and new_id not in {m.channel_id for m in group.memberships}:
+        raise ValueError('That channel is not a member of this group')
+    previous_id = group.guide_listings_channel_id
+    if previous_id == new_id:
+        return False
+    group.guide_listings_channel_id = new_id
+    touch_group(group)
+    previous = db.session.get(Channel, previous_id) if previous_id is not None else None
+    why = GUIDE_LISTINGS_REASONS[reason].format(
+        previous=f'"{previous.name}"' if previous is not None else 'the pinned channel')
+    detail = (f'TV Guide listings pinned to "{channel.name}" {why}' if channel is not None
+              else f'TV Guide listings set back to automatic {why}')
+    db.session.add(ChannelGroupEvent(
+        group_id=group.id, channel_id=new_id, event_type=GROUP_GUIDE_LISTINGS_SET,
+        detail=detail,
+        extra_data=json.dumps({'channel_id': new_id, 'previous': previous_id,
+                               'reason': reason})))
+    return True
+
+
+# Why a group's default recording profile moved, as GROUP_DEFAULT_PROFILE_SET's extra_data
+# carries it. `profile_deleted` is the profile itself being deleted from the Recording
+# Profiles page, which unlinks it everywhere it is referenced.
+DEFAULT_PROFILE_REASONS = {
+    'user': 'by hand',
+    'profile_deleted': 'because the profile {previous} was deleted',
+}
+
+
+def set_default_profile(group, profile, reason='user'):
+    """Set `group`'s default recording profile, or clear it with `profile=None`.
+
+    THE only writer of ChannelGroup.default_profile_id. Which profile a group records with
+    by default is the user's call, so nothing derives or moves it on their behalf (the
+    participation-switch rule, CLAUDE.md); the one non-user reason is the profile being
+    deleted, which says so in the event. Enforced by
+    tests/test_static_invariants.py::GroupDefaultProfileWriteBypassTests.
+
+    Same convention as set_guide_listings_member(): mutates and adds the
+    ChannelGroupEvent without committing, and returns True only when the value moved."""
+    from . import db
+    from .database import ChannelGroupEvent, RecordingProfile, GROUP_DEFAULT_PROFILE_SET
+    if reason not in DEFAULT_PROFILE_REASONS:
+        raise ValueError(f'Unknown reason "{reason}"')
+    new_id = profile.id if profile is not None else None
+    previous_id = group.default_profile_id
+    if previous_id == new_id:
+        return False
+    group.default_profile_id = new_id
+    touch_group(group)
+    previous = db.session.get(RecordingProfile, previous_id) if previous_id is not None else None
+    why = DEFAULT_PROFILE_REASONS[reason].format(
+        previous=f'"{previous.name}"' if previous is not None else '')
+    detail = (f'Default recording profile set to "{profile.name}" {why}' if profile is not None
+              else f'Default recording profile cleared {why}')
+    db.session.add(ChannelGroupEvent(
+        group_id=group.id, event_type=GROUP_DEFAULT_PROFILE_SET, detail=detail,
+        extra_data=json.dumps({'profile_id': new_id, 'previous': previous_id,
+                               'reason': reason})))
+    return True
+
+
+def guide_listings_member(group):
+    """The member `group`'s guide row takes its listings from first, or None for
+    automatic. A pin whose channel is no longer a member reads as None: a bulk delete or a
+    dedup transfer can take the membership away without passing through
+    set_guide_listings_member(), and a pin on a feed outside the group is not something the
+    row may act on. `guide_listings_pin_is_stale()` is what lets a page say so."""
+    pinned = group.guide_listings_channel_id
+    if pinned is None:
+        return None
+    return next((m.channel for m in group.memberships if m.channel_id == pinned), None)
+
+
+def guide_listings_pin_is_stale(group):
+    """True when a pin is stored but its channel has left the group, so it is ignored."""
+    return (group.guide_listings_channel_id is not None
+            and guide_listings_member(group) is None)
+
+
+def fill_listings(chain, entries_by_channel):
+    """A group row's listings: the first channel in `chain` supplies everything it has,
+    and each channel after it fills only the time nothing earlier covers.
+
+    Feeds of one channel carry EPG from different providers and sources, and one that
+    stops at 24 hours used to hold a three-day row to 24 hours: the old fallback asked
+    whether the lead had ANY listing in the window, and one was enough (dev/docs/BUGS.md
+    2026-09-24). This fills every gap - a short tail, a missing hour, a late start.
+
+    A later channel's program is taken only when it overlaps nothing already placed.
+    Trimming one to fit would invent a start or stop time that no guide ever listed, and a
+    recording scheduled from the cell would capture those invented times; a short blank
+    beside a boundary is the honest cost. `entries_by_channel` maps channel id to entries
+    sorted by start_time; `chain` should not repeat a channel. Returns entries sorted by
+    start_time."""
+    import bisect
+    if not chain:
+        return []
+    # The first channel's listings go in whole, overlaps and all, exactly as a channel's
+    # own row would paint them - only what comes after it is fitted around them.
+    placed = list(entries_by_channel.get(chain[0], ()))
+    starts = [e.start_time for e in placed]
+    for channel_id in chain[1:]:
+        for entry in entries_by_channel.get(channel_id, ()):
+            i = bisect.bisect_left(starts, entry.start_time)
+            if i > 0 and placed[i - 1].stop_time > entry.start_time:
+                continue
+            if i < len(placed) and placed[i].start_time < entry.stop_time:
+                continue
+            placed.insert(i, entry)
+            starts.insert(i, entry.start_time)
+    return placed
+
+
 def guide_scope_channel_ids():
     """Subquery of the channel ids whose listings can reach the TV Guide: every in-guide
     channel, plus every member of an in-guide group.

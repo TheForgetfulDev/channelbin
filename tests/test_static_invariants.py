@@ -1199,6 +1199,77 @@ class EpgSourceOverrideWriteBypassTests(unittest.TestCase):
             + '\n'.join(offenders))
 
 
+class GuideListingsWriteBypassTests(unittest.TestCase):
+    """`ChannelGroup.guide_listings_channel_id` is the user's answer to "whose guide data
+    do I trust for this group" - the participation-switch rule applied to a group's
+    listings. One writer, `channel_groups.set_guide_listings_member()`, which logs
+    GROUP_GUIDE_LISTINGS_SET beside the write (dev/changelog/1116).
+
+    The scan: an attribute assignment or a keyword argument naming the column. app/ only -
+    a test builds fixtures. Escape hatch: `# guide-listings-write-ok: <reason>`.
+    """
+
+    _MARKER = 'guide-listings-write-ok'
+    _CANONICAL = {('app/channel_groups.py', 'set_guide_listings_member')}
+    _PATTERN = re.compile(r'\bguide_listings_channel_id\s*=(?!=)')
+
+    def test_the_pin_has_one_writer(self):
+        offenders = []
+        for path in _walk(APP_DIR, '.py'):
+            raw_lines = _read(path).splitlines()
+            code_lines = _mask_comments_and_strings(_read(path)).splitlines()
+            for i, line in enumerate(code_lines):
+                if not self._PATTERN.search(line):
+                    continue
+                if _marked_at(raw_lines, i, self._MARKER):
+                    continue
+                enclosing = ConfigReadBypassTests._enclosing_def(code_lines, i)
+                if (_rel(path), enclosing) in self._CANONICAL:
+                    continue
+                offenders.append(f'{_rel(path)}:{i + 1}: {raw_lines[i].strip()}')
+        self.assertEqual(
+            offenders, [],
+            'ChannelGroup.guide_listings_channel_id written outside app/channel_groups.py::'
+            'set_guide_listings_member(), its one writer. A direct write moves the pin with '
+            'no GROUP_GUIDE_LISTINGS_SET event behind it:\n' + '\n'.join(offenders))
+
+
+class GroupDefaultProfileWriteBypassTests(unittest.TestCase):
+    """`ChannelGroup.default_profile_id` is the user's answer to "which profile does this
+    group record with by default" - one writer, `channel_groups.set_default_profile()`,
+    which logs GROUP_DEFAULT_PROFILE_SET beside the write (dev/changelog/1117).
+
+    The scan is scoped to lines that name `ChannelGroup` or a `group`/`g` variable, because
+    `Channel.default_profile_id` shares the column name and is a different column. app/
+    only. Escape hatch: `# group-default-profile-write-ok: <reason>`.
+    """
+
+    _MARKER = 'group-default-profile-write-ok'
+    _CANONICAL = {('app/channel_groups.py', 'set_default_profile')}
+    _PATTERN = re.compile(r'\b(?:group|g|grp)\.default_profile_id\s*=(?!=)'
+                          r'|ChannelGroup\(.*\bdefault_profile_id\s*=(?!=)')
+
+    def test_the_default_has_one_writer(self):
+        offenders = []
+        for path in _walk(APP_DIR, '.py'):
+            raw_lines = _read(path).splitlines()
+            code_lines = _mask_comments_and_strings(_read(path)).splitlines()
+            for i, line in enumerate(code_lines):
+                if not self._PATTERN.search(line):
+                    continue
+                if _marked_at(raw_lines, i, self._MARKER):
+                    continue
+                enclosing = ConfigReadBypassTests._enclosing_def(code_lines, i)
+                if (_rel(path), enclosing) in self._CANONICAL:
+                    continue
+                offenders.append(f'{_rel(path)}:{i + 1}: {raw_lines[i].strip()}')
+        self.assertEqual(
+            offenders, [],
+            'ChannelGroup.default_profile_id written outside app/channel_groups.py::'
+            'set_default_profile(), its one writer. A direct write moves the default with '
+            'no GROUP_DEFAULT_PROFILE_SET event behind it:\n' + '\n'.join(offenders))
+
+
 class HideOverrideWriteBypassTests(unittest.TestCase):
     """`Channel.hidden_override` is a user's answer to a judgment call, so CLAUDE.md's
     participation-switch rule applies to it directly: a human writes it and nothing else

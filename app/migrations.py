@@ -2635,6 +2635,30 @@ def _m074_epg_directory_upcoming(conn, cur):
     conn.commit()
 
 
+def _m075_group_guide_listings(conn, cur):
+    """channel_groups.guide_listings_channel_id: the member whose listings fill a group's
+    guide row when the user pins one (dev/changelog/1116). Nullable with no backfill - NULL
+    is "automatic", which is what every existing group already does - so there is no
+    obligation to register; column-presence guarded, so re-runnable from the top."""
+    existing = [r[1] for r in cur.execute('PRAGMA table_info(channel_groups)').fetchall()]
+    if 'guide_listings_channel_id' not in existing:
+        cur.execute('ALTER TABLE channel_groups ADD COLUMN guide_listings_channel_id '
+                    'INTEGER REFERENCES channels(id)')
+    conn.commit()
+
+
+def _m076_group_default_profile(conn, cur):
+    """channel_groups.default_profile_id: the recording profile the record modal pre-selects
+    for a group's guide row (dev/changelog/1117). Nullable with no backfill - NULL is "no
+    group default", which is what every existing group already has - so there is no
+    obligation to register; column-presence guarded, so re-runnable from the top."""
+    existing = [r[1] for r in cur.execute('PRAGMA table_info(channel_groups)').fetchall()]
+    if 'default_profile_id' not in existing:
+        cur.execute('ALTER TABLE channel_groups ADD COLUMN default_profile_id '
+                    'INTEGER REFERENCES recording_profiles(id)')
+    conn.commit()
+
+
 SCHEMA_MIGRATIONS = [
     (1, 'baseline: pre-versioning additive migrations + backfills', _m001_baseline),
     (2, 'recordings: program_title/program_sub_title snapshot columns + backfill', _m002_program_title),
@@ -2785,6 +2809,10 @@ SCHEMA_MIGRATIONS = [
      _m073_epg_source_refreshing),
     (74, 'epg_source_channels: upcoming_titles for the name-match review page',
      _m074_epg_directory_upcoming),
+    (75, 'channel_groups: guide_listings_channel_id, the member a group\'s guide row takes '
+     'its listings from when the user pins one', _m075_group_guide_listings),
+    (76, 'channel_groups: default_profile_id, the recording profile a group\'s guide row '
+     'pre-selects in the record modal', _m076_group_default_profile),
 ]
 
 CURRENT_SCHEMA_VERSION = SCHEMA_MIGRATIONS[-1][0]

@@ -15,9 +15,10 @@ from ..accounts import (normalize_url, render_filename_template,
                         # airing grain can render a suggested name too (changelog 412).
                         filename_tag_cleanup as _tag_cleanup_from_config,
                         effective_filename_template as _effective_filename_template,
-                        tags_matching as _matched_tags)
+                        default_profile_for, tags_matching as _matched_tags)
 from ..channel_groups import (effective_score, rank_members, member_channels,
                               guide_row_targets, member_eager_options,
+                              guide_listings_member, fill_listings,
                               DEFAULT_FAILING_STREAK_THRESHOLD)
 from .. import channel_hiding
 from ..config import load_config
@@ -184,7 +185,8 @@ def epg_source_names() -> dict:
 
 
 def _program_dict(ch, entry, start, stop, *, stream_url, template, tag_cleanup, rec, all_tags,
-                  tags_by_name, tz, source_names, display_name=None, group_id=None):
+                  tags_by_name, tz, source_names, display_name=None, group_id=None,
+                  listings_from=None):
     """Serialize one guide/search program cell (guide grid + extended search).
 
     entry=None → dummy filler slot for a channel with no EPG data.
@@ -220,6 +222,10 @@ def _program_dict(ch, entry, start, stop, *, stream_url, template, tag_cleanup, 
         'category': category,
         'rating': (entry.rating or '') if entry else '',
         'source_name': source_names.get(entry.source_id) if entry else None,
+        # The group member whose listing this is, when it is not the member the row
+        # records from (dev/changelog/1116). None on a channel row and on the serving
+        # member's own listings.
+        'listings_from': listings_from,
         'stream_url': stream_url,
         'suggested_name': suggested,
         'channel_name': name,
@@ -591,18 +597,29 @@ def epg_api():
         ch = active if group is not None else obj
         display_name = group.name if group is not None else None
 
-        template = _effective_filename_template(cfg, ch)
-        entries = _entries_in_window(ch.id)
-        if group is not None and not entries:
-            # Feeds differ in EPG coverage - fall back to the best-scored member
-            # that has data in this window (display only; ch stays the record target).
-            for member in rank_members(member_channels(group.memberships), latest_test_by_channel,
-                                       streak_threshold=streak_threshold):
-                if member.id == ch.id:
-                    continue
-                entries = _entries_in_window(member.id)
-                if entries:
-                    break
+        template = _effective_filename_template(cfg, ch, group)
+        default_profile = default_profile_for(ch, group)
+        ranked = pinned = None
+        listings_names = {}
+        if group is None:
+            entries = _entries_in_window(ch.id)
+        else:
+            # Feeds differ in EPG coverage and quality, so a group row's listings come
+            # from a chain: the member the user pinned, then the serving member, then the
+            # rest by rank, each filling only the time nothing earlier covers (display
+            # only - ch stays the record target, dev/changelog/1116).
+            ranked = rank_members(member_channels(group.memberships), latest_test_by_channel,
+                                  streak_threshold=streak_threshold)
+            pinned = guide_listings_member(group)
+            chain = list(dict.fromkeys(
+                ([pinned.id] if pinned is not None else []) + [ch.id]
+                + [m.id for m in ranked]))
+            entries = fill_listings(chain, entries_by_channel)
+            listings_names = {m.id: m.name for m in ranked}
+        # Which members other than the one it records from supplied this row's listings,
+        # so the row can say so rather than leave a borrowed schedule looking like its own.
+        borrowed_ids = list(dict.fromkeys(e.channel_id for e in entries
+                                          if e.channel_id != ch.id)) if group is not None else []
 
         stream_url = normalize_url(ch.stream_url, ch.account, cfg)
         channel_recs = _candidate_recs(rec_indexes, ch, stream_url, group)
@@ -634,6 +651,8 @@ def epg_api():
                     tags_by_name=tags_by_name, tz=tz, source_names=source_names,
                     display_name=display_name,
                     group_id=group.id if group is not None else None,
+                    listings_from=listings_names.get(entry.channel_id)
+                    if entry.channel_id != ch.id else None,
                 ))
 
         lt = latest_test_by_channel.get(ch.id)
@@ -662,7 +681,9 @@ def epg_api():
             # colour alone is only readable against the status-bar legend, which a sheet
             # covers. Free: ch.account is already loaded for the colour on the line above.
             'account_name': ch.account.name,
-            'default_profile_id': ch.default_profile_id,
+            # A group row pre-selects the group's default profile over the serving member's
+            # own (dev/changelog/1117).
+            'default_profile_id': default_profile.id if default_profile is not None else None,
             'programs': programs,
             'recordings': channel_rec_dicts,
             'last_test_status': lt.status if lt else None,
@@ -694,9 +715,10 @@ def epg_api():
                     {'name': m.name, 'account_name': m.account.name,
                      'effective_score': effective_score(m),
                      'scored': m.health_score is not None}
-                    for m in rank_members(member_channels(group.memberships), latest_test_by_channel,
-                                          streak_threshold=streak_threshold)
+                    for m in ranked
                 ],
+                'listings_pinned_name': pinned.name if pinned is not None else None,
+                'listings_from': [listings_names[cid] for cid in borrowed_ids],
             })
         result_channels.append(row)
 
