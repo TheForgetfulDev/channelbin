@@ -54,6 +54,16 @@ recording:
     video_crf: 20                       # libx264 CRF (0-51, lower = better quality/larger file)
                                          # - only applies when a re-encode actually happens
     audio_bitrate_kbps: 192             # AAC bitrate for mp4 output (always re-encoded)
+    # What does the video re-encode. 'software' is libx264 on the CPU. 'vaapi' sends it to
+    # the GPU (Intel Quick Sync, AMD) through the render node below; in Docker that node
+    # has to be passed as a device (--device /dev/dri), and it is Linux-only. Decoding
+    # stays on the CPU, and a stream copy never uses the GPU at all. When the GPU is
+    # missing or fails, the conversion still finishes with libx264 and the recording's
+    # event log says so.
+    video_encoder: software             # 'software' | 'vaapi'
+    vaapi_device: /dev/dri/renderD128
+    vaapi_qp: 26                        # VAAPI constant quantizer (0-51, lower = better/larger).
+                                         # Not the same scale as video_crf: 26 matches crf 20
     # A conversion can die or stall mid-flight (an ffmpeg crash, a service restart).
     # These decide whether the app restarts it and how it notices a stall.
     auto_restart: true

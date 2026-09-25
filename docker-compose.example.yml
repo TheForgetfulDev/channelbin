@@ -13,7 +13,7 @@ services:
     container_name: channelbin
     # Pinned to a release on purpose. An image that changes under a `latest` tag can swap
     # the capture engine in the middle of a long recording; move this pin when you choose to.
-    image: ghcr.io/theforgetfuldev/channelbin:0.18.1
+    image: ghcr.io/theforgetfuldev/channelbin:0.19.0
     # To build from a checkout instead, replace the line above with:
     # build: .
     restart: unless-stopped
@@ -33,3 +33,9 @@ services:
       # Your recordings. Point this at wherever you keep them; it must be writable by
       # PUID/PGID above, or the container says so in its log at startup.
       - ./recordings:/dvr
+    # Optional: convert recordings on an Intel Quick Sync or AMD GPU (Linux hosts only, not
+    # Docker Desktop or WSL). It has to be a device, not a volume - mapped as a volume the
+    # container can see it but is not allowed to open it. Then set Video encoder to
+    # GPU (VAAPI) in Settings > Recording.
+    # devices:
+    #   - /dev/dri:/dev/dri

@@ -11,7 +11,9 @@
   <ReadMe>https://github.com/TheForgetfulDev/channelbin#readme</ReadMe>
   <Overview>ChannelBin is a self-hosted IPTV recorder (DVR) and channel tester for Xtream and M3U providers. It watches every recording and restarts the stream whenever it stalls, fails over to alternate channels and accounts, and labels a recording honestly when something could not be recovered. Health checks connect to each channel, measure what it actually delivers, take a screenshot and keep a quality score over time. It also includes a TV guide, and search across channels and EPG listings.
 
-The display timezone is set in Settings, not by the container's TZ. Some settings need a restart: the in-app Restart button relies on the --restart=unless-stopped extra parameter this template sets, so keep it.</Overview>
+The display timezone is set in Settings, not by the container's TZ. Some settings need a restart: the in-app Restart button relies on the --restart=unless-stopped extra parameter this template sets, so keep it.
+
+GPU conversion is optional. To convert recordings on an Intel Quick Sync or AMD GPU, add --device=/dev/dri to Extra Parameters (Advanced View) after the restart flag, then set Video encoder to GPU (VAAPI) in Settings, Recording. Pass it there and not as a Path: a path mapping shows the device to the container, which is then not allowed to open it. Without a GPU leave it out, and conversion stays on the CPU.</Overview>
   <Category>MediaServer:Video</Category>
   <WebUI>http://[IP]:[PORT:5000]/</WebUI>
   <TemplateURL>https://raw.githubusercontent.com/TheForgetfulDev/channelbin/main/docker/unraid-template.xml</TemplateURL>

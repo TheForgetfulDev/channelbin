@@ -349,6 +349,8 @@ def create_app(config_overrides=None, start_scheduler=True):
     if start_scheduler:
         from .scheduler import init_scheduler
         init_scheduler(app)
+        from .readiness import start_gpu_trial_at_startup
+        start_gpu_trial_at_startup(app, cfg)
 
     return app
 

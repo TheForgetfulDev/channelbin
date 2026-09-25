@@ -95,12 +95,12 @@ class RegistryTests(unittest.TestCase):
             self.assertIn(state, readiness.CAP_MARK)
             self.assertIn(state, readiness.CAP_HEALTH)
 
-    def test_the_checks_that_cost_something_are_the_three_that_were_designed_that_way(self):
+    def test_the_checks_that_cost_something_are_the_four_that_were_designed_that_way(self):
         """A cheap check that becomes expensive has to be declared ON_DEMAND in the same
         edit, or the card starts spawning processes because a page was opened."""
         self.assertEqual(
             sorted(c.id for c in readiness.CHECKS if c.cost == readiness.ON_DEMAND),
-            ['account_login', 'ffmpeg_build', 'notify_delivers'])
+            ['account_login', 'ffmpeg_build', 'gpu_encoder', 'notify_delivers'])
 
     def test_nothing_that_means_the_install_is_broken_can_be_silenced(self):
         """Which checks may be silenced is the one judgment call in the feature, so it is
@@ -322,7 +322,7 @@ class SilencingTests(_AppCase):
             # The on-demand checks read as not-run until they are asked for, which would
             # change the verdict, so they are answered the way a completed Run all leaves
             # them.
-            for cid in ('ffmpeg_build', 'account_login', 'notify_delivers'):
+            for cid in ('ffmpeg_build', 'gpu_encoder', 'account_login', 'notify_delivers'):
                 readiness.run_check(cid)
             return readiness.evaluate()
 
@@ -342,11 +342,11 @@ class RunTests(_AppCase):
 
     def test_pending_lists_only_what_has_not_been_asked_for(self):
         self.assertEqual(readiness.pending_ondemand_ids(),
-                         ['ffmpeg_build', 'account_login', 'notify_delivers'])
+                         ['ffmpeg_build', 'gpu_encoder', 'account_login', 'notify_delivers'])
         with patched(ffmpeg_build=result(readiness.READY, 'ok')):
             readiness.run_check('ffmpeg_build')
         self.assertEqual(readiness.pending_ondemand_ids(),
-                         ['account_login', 'notify_delivers'])
+                         ['gpu_encoder', 'account_login', 'notify_delivers'])
 
     def test_the_nav_summary_never_runs_an_ondemand_check(self):
         """A 15-second poll in three open tabs must not be able to spawn a process or open
@@ -634,7 +634,7 @@ class UnreadErrorsCheckTests(_AppCase):
         self._alert('ERROR')
         with patched(**{c: r for c, r in fine.items()
                         if readiness.CHECKS_BY_ID[c].cost == readiness.CHEAP}):
-            for cid in ('ffmpeg_build', 'account_login', 'notify_delivers'):
+            for cid in ('ffmpeg_build', 'gpu_encoder', 'account_login', 'notify_delivers'):
                 with patched(**{cid: fine[cid]}):
                     readiness.run_check(cid)
             payload = readiness.evaluate()

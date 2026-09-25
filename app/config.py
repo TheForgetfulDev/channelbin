@@ -197,6 +197,20 @@ _DEFAULTS = {
             # from ADTS to raw AAC for mp4 output regardless of the video path.
             'video_crf': 20,            # libx264 CRF, 0-51, lower = better quality/larger file
             'audio_bitrate_kbps': 192,  # AAC bitrate for mp4 output
+            # What does the video re-encode: 'software' is libx264 on the CPU; 'vaapi' is
+            # the GPU through the render node below (Intel Quick Sync, AMD), which the
+            # container reaches only when /dev/dri is passed as a device. A re-encode is
+            # the only thing that ever touches the GPU - a stream copy never decodes or
+            # encodes, and decoding stays on the CPU either way. If the GPU is missing or
+            # fails, the conversion completes with libx264 and the recording says so
+            # (dev/changelog/1125).
+            'video_encoder': 'software',
+            'vaapi_device': '/dev/dri/renderD128',
+            # Constant quantizer for the VAAPI encoder, 0-51. Its own key rather than a
+            # reading of video_crf: CRF is libx264's, and the scales do not line up (qp 20
+            # produced a file 2.3x the size of crf 20 at the same SSIM; 26 matched it,
+            # dev/changelog/1124).
+            'vaapi_qp': 26,
             # Conversion resilience (app/postprocessor.py supervised runner). A conversion
             # can be killed mid-flight (ffmpeg crash, a service restart, a stall); these
             # control whether the app restarts it and how it detects a stall.

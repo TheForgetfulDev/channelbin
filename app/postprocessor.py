@@ -530,6 +530,26 @@ def _persist_postprocess_waiting(recording_id, conflict=None):
 # is still readable up to its last complete fragment. Finding 1 above.
 PART_MOVFLAGS = '+frag_keyframe+empty_moov+default_base_moof'
 
+# The values of recording.post_process.video_encoder. Compared against these names and never
+# a re-typed literal; app/routes/settings.py whitelists a save against the same pair.
+VIDEO_ENCODER_SOFTWARE = 'software'
+VIDEO_ENCODER_VAAPI = 'vaapi'
+VIDEO_ENCODERS = (VIDEO_ENCODER_SOFTWARE, VIDEO_ENCODER_VAAPI)
+
+# What a died attempt's stderr tail contains when the HARDWARE path is what failed - the
+# device context, the upload filter or the encoder itself - as distinct from the decoder
+# choking on a damaged source, which is the death the restart loop already knows how to
+# treat. Measured on ffmpeg 7.1: a device that cannot be opened reports
+# '[AVHWDeviceContext @ ...] No VA display found for device ...', and every component of
+# the path logs under a tag that names it (dev/changelog/1125).
+GPU_ERROR_MARKERS = ('AVHWDeviceContext', 'AVHWFramesContext', 'hwupload', 'vaapi', 'VAAPI',
+                     'VA display')
+
+
+def names_gpu_failure(stderr_tail) -> bool:
+    """True when a conversion's last stderr lines blame the hardware encode path."""
+    return any(marker in (stderr_tail or '') for marker in GPU_ERROR_MARKERS)
+
 
 def part_path(output_path: str, index: int) -> str:
     """Where part `index` (1-based) of a resumable conversion lives.
@@ -1689,14 +1709,54 @@ def do_postprocess(app, recording_id: int, ts_path: str):
 
                 _commit_mixed_rate_detected()
 
+            ffmpeg_path = resolve_ffmpeg_path(cfg['ffmpeg']['path'])
+
+            # WHICH ENCODER, decided once here and before the started event so that event can
+            # say so. `use_gpu` is the working answer: it starts from the setting, is turned
+            # off by a failed trial before the first attempt, and is turned off again by a
+            # hardware death mid-run (the fallback in the loop below). A stream copy never
+            # reaches this - only a re-encode has an encoder to choose.
+            video_encoder = pp.get('video_encoder', 'software') or 'software'
+            vaapi_device = str(pp.get('vaapi_device') or '/dev/dri/renderD128')
+            vaapi_qp = int(pp.get('vaapi_qp', 26) or 26)
+            use_gpu = False
+            # (detail, extra) of the event that says why the GPU was asked for and is not
+            # being used, written right after the started event so the two read in order.
+            encoder_fallback_event = None
+            if fmt == 'mp4' and reencode and video_encoder == VIDEO_ENCODER_VAAPI:
+                from .toolchain import check_gpu_encoder
+                trial = check_gpu_encoder(ffmpeg_path, vaapi_device)
+                use_gpu = trial.ok
+                if not trial.ok:
+                    encoder_fallback_event = (
+                        f'The GPU encoder was asked for but a one-second test encode '
+                        f'through {vaapi_device} failed, so this conversion re-encodes with '
+                        f'libx264 on the CPU instead. ffmpeg reported: {trial.error}',
+                        {'kind': 'conversion_gpu_unavailable', 'device': vaapi_device,
+                         'error': trial.error})
+            elif (fmt == 'mp4' and reencode
+                  and video_encoder not in (VIDEO_ENCODER_SOFTWARE, VIDEO_ENCODER_VAAPI)):
+                # Only a hand-edited config.yaml gets here (the settings route whitelists
+                # the value). Software is the safe reading, and the surprise is written on
+                # the recording rather than left in the log alone.
+                log.warning('Recording %d: recording.post_process.video_encoder is %r, which '
+                            'is not a known encoder - re-encoding in software',
+                            recording_id, video_encoder)
+                encoder_fallback_event = (
+                    f'recording.post_process.video_encoder is set to "{video_encoder}", '
+                    f'which is not a known encoder (software or vaapi). Re-encoding with '
+                    f'libx264 on the CPU.',
+                    {'kind': 'conversion_encoder_unknown', 'value': str(video_encoder)})
+
             mode_note = ''
             if reencode:
                 if damage_summary:
-                    mode_note = ' (video re-encode: damage detected)'
+                    mode_note = ' (video re-encode: damage detected'
                 elif mixed_rate_summary:
-                    mode_note = ' (video re-encode: mixed capture frame rate)'
+                    mode_note = ' (video re-encode: mixed capture frame rate'
                 else:
-                    mode_note = ' (video re-encode: always)'
+                    mode_note = ' (video re-encode: always'
+                mode_note += ', on the GPU)' if use_gpu else ', libx264 on the CPU)'
 
             @retry_on_locked()
             def _commit_conversion_started():
@@ -1719,7 +1779,15 @@ def do_postprocess(app, recording_id: int, ts_path: str):
                 return
             ev.publish(recording_id, CONVERSION_STARTED, {'status': REC_STATUS_CONVERTING})
 
-            ffmpeg_path = resolve_ffmpeg_path(cfg['ffmpeg']['path'])
+            if encoder_fallback_event:
+                @retry_on_locked()
+                def _commit_encoder_fallback(detail=encoder_fallback_event[0],
+                                             extra=encoder_fallback_event[1]):
+                    add_recording_event(recording_id, DIAGNOSTICS, detail=detail, extra=extra)
+                    db.session.commit()
+
+                _commit_encoder_fallback()
+
             video_crf = int(pp.get('video_crf', 20) or 20)
             audio_kbps = int(pp.get('audio_bitrate_kbps', 192) or 192)
             rate = None
@@ -1759,6 +1827,13 @@ def do_postprocess(app, recording_id: int, ts_path: str):
                 target = dest or output_path
                 c = [ffmpeg_path, '-err_detect', 'ignore_err', '-fflags', '+genpts+discardcorrupt',
                      '-max_error_rate', '1.0']
+                if use_gpu:
+                    # A global option, so it sits before -i. Decoding stays on the CPU on
+                    # purpose: the default reencode_mode re-encodes exactly the recordings
+                    # whose streams are damaged, which is where a hardware decoder is least
+                    # proven, and the decode-error count below is read from the software
+                    # decoder's stderr (dev/changelog/1124).
+                    c += ['-vaapi_device', vaapi_device]
                 if start_at and start_at > 0:
                     c += ['-ss', f'{start_at:.6f}']
                 c += ['-i', ts_path]
@@ -1767,9 +1842,19 @@ def do_postprocess(app, recording_id: int, ts_path: str):
                     # dense, guaranteed-clean seek points. CFR at the stream's nominal rate
                     # (r_frame_rate - avg is skewed by the very gaps being repaired) fills
                     # timeline holes with duplicated frames instead of leaving PTS jumps.
-                    c += ['-c:v', 'libx264', '-preset', 'veryfast', '-crf', str(video_crf),
-                          '-pix_fmt', 'yuv420p',
-                          '-force_key_frames', 'expr:gte(t,n_forced*2)']
+                    if use_gpu:
+                        # format=nv12 does what -pix_fmt yuv420p does for libx264 (8-bit
+                        # 4:2:0, a 10-bit source included), then hwupload hands the frames to
+                        # the device. -qp is a constant quantizer on its own scale, hence a
+                        # setting of its own rather than video_crf. Forced keyframes and CFR
+                        # are honored by h264_vaapi exactly as by libx264 - measured, not
+                        # assumed (dev/changelog/1124).
+                        c += ['-vf', 'format=nv12,hwupload', '-c:v', 'h264_vaapi',
+                              '-qp', str(vaapi_qp)]
+                    else:
+                        c += ['-c:v', 'libx264', '-preset', 'veryfast', '-crf', str(video_crf),
+                              '-pix_fmt', 'yuv420p']
+                    c += ['-force_key_frames', 'expr:gte(t,n_forced*2)']
                     if rate:
                         c += ['-r', rate, '-fps_mode:v', 'cfr']
                 elif fmt == 'mp4':
@@ -1996,6 +2081,61 @@ def do_postprocess(app, recording_id: int, ts_path: str):
                     break
 
                 last_error = result.error_msg or result.reason
+
+                if use_gpu and result.reason == 'died' and names_gpu_failure(result.error_msg):
+                    # THE HARDWARE PATH FAILED, SO THE REST OF THE CONVERSION IS SOFTWARE.
+                    # Only a death that names the device, the upload or the encoder counts:
+                    # any other death is the decoder on a damaged source, which the restart
+                    # loop below already handles, and switching encoders on it would both
+                    # waste the GPU and break the two-deaths-at-one-offset reasoning that
+                    # triggers the audio-copy fallback. Every part the GPU encoded goes -
+                    # the same seam rule as the audio fallback (a file with two encoders'
+                    # output joined is exactly what the signature exists to prevent), so the
+                    # salvage of the killed part is skipped rather than done for nothing.
+                    use_gpu = False
+                    parts_discarded = discard_conversion_parts(output_path) if resumable else 0
+                    parts_done = 0
+                    source_covered = 0.0
+                    source_complete = False
+                    if resumable:
+                        signature = parts_signature(
+                            _build_cmd(audio_copy=audio_copy_fallback), output_path)
+                    attempt += 1
+                    log.warning('Recording %d: the GPU encoder failed %s into the source - '
+                                'retrying with libx264 on the CPU (%d GPU-encoded part(s) '
+                                'discarded): %s', recording_id,
+                                fmt_duration(result.out_time or 0, with_seconds=True),
+                                parts_discarded, last_error)
+
+                    @retry_on_locked()
+                    def _commit_gpu_fallback_event(where=result.out_time or 0, n=attempt,
+                                                   dropped=parts_discarded, sig=signature,
+                                                   err=last_error):
+                        r = db.session.get(Recording, recording_id)
+                        r.conversion_attempts = n
+                        # Registered before this attempt writes a part, for the reason the
+                        # audio fallback's commit gives.
+                        set_conversion_parts(r, signature=sig)
+                        add_recording_event(
+                            recording_id, CONVERSION_RESTARTED,
+                            detail=f'The GPU encoder failed '
+                                   f'{fmt_duration(where, with_seconds=True)} into the '
+                                   f'source. Retrying with libx264 on the CPU, which does '
+                                   f'not need the device.'
+                                   + (f' The {dropped} part(s) the GPU already encoded '
+                                      f'cannot be joined onto software-encoded video, so '
+                                      f'they were discarded and this attempt starts from '
+                                      f'the beginning.' if dropped else '')
+                                   + f' ffmpeg reported: {err}',
+                            extra={'kind': 'conversion_gpu_fallback', 'device': vaapi_device,
+                                   'error': err})
+                        db.session.commit()
+
+                    _commit_gpu_fallback_event()
+                    ev.publish(recording_id, CONVERSION_RESTARTED,
+                               {'status': REC_STATUS_CONVERTING, 'attempt': attempt,
+                                'max': max_attempts})
+                    continue
 
                 if resumable:
                     # THE KILLED PART IS SALVAGED BEFORE ANYTHING ELSE HAPPENS. Re-muxing it
@@ -2342,10 +2482,18 @@ def do_postprocess(app, recording_id: int, ts_path: str):
                     # beside a correctly-finished recording, which recording_disk_paths()
                     # already enumerates for teardown.
                     set_conversion_parts(r)
+                    # Which encoder made the file is stated here as well as at the start,
+                    # because a fallback mid-run means the two can differ.
+                    if fmt == 'mp4' and reencode:
+                        encoder_note = (' - video re-encoded on the GPU (h264_vaapi)' if use_gpu
+                                        else ' - video re-encoded with libx264 on the CPU')
+                    else:
+                        encoder_note = ''
                     db.session.add(RecordingEvent(
                         recording_id=recording_id,
                         event_type=CONVERSION_DONE,
-                        detail=f'Conversion complete: {os.path.basename(output_path)} ({_fmt_bytes(converted_size)})',
+                        detail=f'Conversion complete: {os.path.basename(output_path)} '
+                               f'({_fmt_bytes(converted_size)}){encoder_note}',
                     ))
                     db.session.commit()
 

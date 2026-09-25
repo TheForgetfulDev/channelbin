@@ -43,6 +43,13 @@ fi
 # about files the user may share with other apps.
 chown -R "$PUID:$PGID" /config /app/capture-logs
 
+# --- 4. The GPU, when one was passed in ---------------------------------------------
+# After the uid/gid remap, so the supplementary group lands on the final account. Silent
+# when there is no /dev/dri - most installs have none, and that is not a problem.
+# shellcheck source=render-groups.sh
+. /app/docker/render-groups.sh
+join_render_groups /dev/dri channelbin
+
 # No writability check here. Whether a folder can be written is the app's question,
 # asked of the folders config.yaml actually names (which need not include /dvr at all),
 # and answered where the user looks: the Readiness check, the Alert Center and the Logs

@@ -3,7 +3,7 @@
 The view, the query and the changed-from-default chip are three inputs to one filter
 function in static/js/settings.js (DESIGN.md 15.9, dev/changelog/1005 and 1006), which also
 dims a row whose gate is off from the gating controls' live values (1007). The server
-renders all 119 rows either way, so what Basic hides, what a filter in Basic brings back,
+renders all 122 rows either way, so what Basic hides, what a filter in Basic brings back,
 how it says so, and what gets saved are all browser behavior - none of it is visible from a
 response body.
 
@@ -127,7 +127,7 @@ class NeverChosenOpensInBasicTests(_Base):
         rec = self.obs['sections']['recording']
         self.assertFalse(rec['collapsed'])
         self.assertEqual(rec['rail'], '13')
-        self.assertEqual(rec['more'], '18 more in Advanced Show Advanced')
+        self.assertEqual(rec['more'], '21 more in Advanced Show Advanced')
         self.assertIsNone(self.obs['sections']['integrations']['more'])
 
     def test_a_group_with_nothing_basic_hides_its_heading(self):
@@ -139,7 +139,7 @@ class NeverChosenOpensInBasicTests(_Base):
         self.assertEqual(self.obs['sections']['integrations']['hiddenUnits'], 0)
 
     def test_the_search_box_counts_every_setting_because_search_reaches_all_of_them(self):
-        self.assertEqual(self.obs['placeholder'], 'Search 119 settings by name, description or key')
+        self.assertEqual(self.obs['placeholder'], 'Search 122 settings by name, description or key')
 
 
 class SearchInBasicTests(_Base):
@@ -161,7 +161,7 @@ class SearchInBasicTests(_Base):
 
     def test_counts_are_matches_and_spelled_right(self):
         during = self.obs['during']
-        self.assertEqual(during['chip'], '11 of 119 settings')
+        self.assertEqual(during['chip'], '11 of 122 settings')
         self.assertEqual(during['sections']['watchdog']['head'], '5 matches')
         self.assertIsNone(during['sections']['recording']['more'])
 
@@ -180,7 +180,7 @@ class NoticeSwitchTests(_Base):
         self.assertIsNone(self.obs['after']['notice'])
         self.assertEqual(self.obs['posts'],
                          [{'path': f'/api/user-prefs/{SETTINGS_VIEW_PREF}', 'body': {'value': True}}])
-        self.assertEqual(len(self.obs['cleared']['shownPaths']), 119)
+        self.assertEqual(len(self.obs['cleared']['shownPaths']), 122)
 
 
 class FooterSwitchTests(_Base):
@@ -188,7 +188,7 @@ class FooterSwitchTests(_Base):
 
     def test_a_card_footer_switches_the_whole_page_and_saves_it(self):
         self.assertEqual(self.obs['view'], 'advanced')
-        self.assertEqual(len(self.obs['shownPaths']), 119)
+        self.assertEqual(len(self.obs['shownPaths']), 122)
         self.assertEqual(self.obs['posts'],
                          [{'path': f'/api/user-prefs/{SETTINGS_VIEW_PREF}', 'body': {'value': True}}])
 
@@ -200,7 +200,7 @@ class SavedAdvancedTests(_Base):
         opened = self.obs['opened']
         self.assertEqual(opened['view'], 'advanced')
         self.assertEqual(opened['checked'], ['advanced'])
-        self.assertEqual(len(opened['shownPaths']), 119)
+        self.assertEqual(len(opened['shownPaths']), 122)
         self.assertFalse(any(s['collapsed'] for s in opened['sections'].values()))
         self.assertFalse(any(s['more'] for s in opened['sections'].values()))
 
@@ -242,7 +242,7 @@ class ChangedChipTests(_Base):
 
     def test_the_counts_say_changed(self):
         on = self.obs['on']
-        self.assertEqual(on['chip'], '3 of 119 settings')
+        self.assertEqual(on['chip'], '3 of 122 settings')
         self.assertEqual(on['sections']['recording']['head'], '1 changed')
         self.assertEqual(on['sections']['watchdog']['head'], '1 changed')
         self.assertFalse(on['sections']['watchdog']['collapsed'])
@@ -334,46 +334,62 @@ class GatedRowTests(_Base):
         # _DEFAULTS: move on complete, the post-script and the login gate are off; post-process
         # is on, mp4, re-encode when damaged, auto-restart on, collisions paused.
         self.assertEqual(self.obs['opened']['gated'], {
+            # The two GPU rows read nothing while the encoder is software
+            # (dev/changelog/1125).
+            f'{PP}.vaapi_device': 'Not used while Video encoder is Software',
+            f'{PP}.vaapi_qp': 'Not used while Video encoder is Software',
             'recording.move_on_complete.destination': 'Not used while Move on complete is off',
             'recording.post_script.path': 'Not used while Run post-completion script is off',
             'auth.session_timeout_minutes': 'Not used while Require a password is off',
         })
         self.assertTrue(self.obs['opened']['emptyLinesWhenUngated'])
 
-    def test_turning_post_process_off_dims_all_twelve_of_its_rows_before_the_save_answers(self):
+    def test_turning_post_process_off_dims_all_fifteen_of_its_rows_before_the_save_answers(self):
         gated = self.obs['ppOff']['gated']
         pp_rows = {k: v for k, v in gated.items() if k.startswith(PP)}
-        self.assertEqual(len(pp_rows), 12)
-        self.assertEqual(set(pp_rows.values()), {PP_OFF})
+        self.assertEqual(len(pp_rows), 15)
+        gpu_rows = {f'{PP}.vaapi_device', f'{PP}.vaapi_qp'}
+        self.assertEqual({v for k, v in pp_rows.items() if k not in gpu_rows}, {PP_OFF})
+        # The two GPU rows carry the post-process gate AND their own encoder gate.
+        self.assertEqual({v for k, v in pp_rows.items() if k in gpu_rows},
+                         {PP_OFF + ' and Video encoder is Software'})
 
     def test_turning_it_back_on_undims_them(self):
         self.assertEqual(self.obs['ppOn']['gated'], self.obs['opened']['gated'])
         self.assertTrue(self.obs['ppOn']['emptyLinesWhenUngated'])
 
-    def test_mkv_dims_the_three_encode_settings_and_nothing_else(self):
+    def test_mkv_dims_the_encode_settings_and_nothing_else(self):
         pp_rows = {k: v for k, v in self.obs['mkv']['gated'].items() if k.startswith(PP)}
         line = 'Not used while Output format is MKV'
+        both = line + ' and Video encoder is Software'
         self.assertEqual(pp_rows, {f'{PP}.reencode_mode': line, f'{PP}.video_crf': line,
-                                   f'{PP}.audio_bitrate_kbps': line})
+                                   f'{PP}.audio_bitrate_kbps': line,
+                                   f'{PP}.video_encoder': line,
+                                   f'{PP}.vaapi_device': both, f'{PP}.vaapi_qp': both})
 
     def test_every_unmet_gate_is_named(self):
         self.assertEqual(self.obs['mkvNever']['gated'][f'{PP}.video_crf'],
                          'Not used while Output format is MKV and '
                          'Video re-encode (MP4 seek repair) is Never')
 
-    def test_never_dims_only_the_crf(self):
+    def test_never_dims_only_the_encoder_rows(self):
         pp_rows = {k: v for k, v in self.obs['never']['gated'].items() if k.startswith(PP)}
-        self.assertEqual(pp_rows, {f'{PP}.video_crf':
-                                   'Not used while Video re-encode (MP4 seek repair) is Never'})
+        line = 'Not used while Video re-encode (MP4 seek repair) is Never'
+        both = line + ' and Video encoder is Software'
+        self.assertEqual(pp_rows, {f'{PP}.video_crf': line, f'{PP}.video_encoder': line,
+                                   f'{PP}.vaapi_device': both, f'{PP}.vaapi_qp': both})
 
     def test_a_gated_row_that_matches_a_search_is_still_a_hit(self):
-        self.assertEqual(self.obs['searched']['gatedHits'], [f'{PP}.video_crf'])
+        self.assertEqual(self.obs['searched']['gatedHits'],
+                         [f'{PP}.video_crf', f'{PP}.vaapi_qp'])
         self.assertIn(f'{PP}.video_crf', self.obs['searched']['shownPaths'])
 
     def test_the_restart_budget_and_the_speed_assumption_follow_their_own_switches(self):
         pp_rows = {k: v for k, v in self.obs['restartAndCollision']['gated'].items()
                    if k.startswith(PP)}
         self.assertEqual(pp_rows, {
+            f'{PP}.vaapi_device': 'Not used while Video encoder is Software',
+            f'{PP}.vaapi_qp': 'Not used while Video encoder is Software',
             f'{PP}.max_restart_attempts': 'Not used while Auto-restart stopped conversions is off',
             f'{PP}.collision_lookahead_multiplier':
                 'Not used while When a conversion collides with a recording is Off',

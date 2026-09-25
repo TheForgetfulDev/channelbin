@@ -149,6 +149,17 @@ class DockerPersistencePathTests(unittest.TestCase):
                           f'docker-compose.example.yml stops mounting {vol}, so a user who '
                           'copies it loses that data whenever the container is recreated.')
 
+    def test_the_compose_example_offers_the_gpu_commented_out(self):
+        """docker refuses to start a container whose device does not exist, so a live
+        `devices:` entry breaks every install without a GPU. It ships commented out, as a
+        device and never under volumes:, where the container cannot open it
+        (dev/changelog/1124, 1126)."""
+        text = _read(COMPOSE)
+        service = yaml.safe_load(text)['services']['channelbin']
+        self.assertNotIn('devices', service)
+        self.assertFalse(any('/dev/dri' in m for m in service['volumes']))
+        self.assertRegex(text, r'(?m)^\s*#\s*devices:\s*\n\s*#\s*- /dev/dri:/dev/dri\s*$')
+
     def test_the_compose_example_pins_the_published_image_at_this_version(self):
         """The example compose file is what a new install copies, so its image pin is what
         they run. A pin left behind at a release installs last release; a floating `latest`
@@ -380,6 +391,17 @@ class UnraidTemplateTests(unittest.TestCase):
         required = [t for t, c in self._paths().items()
                     if t not in VOLUMES and c.get('Required') != 'false']
         self.assertEqual(required, [], 'the Unraid template requires an extra mount')
+
+    def test_the_gpu_is_offered_through_extra_parameters_not_a_device_field(self):
+        """An empty Device field makes Unraid emit `--device=''`, which docker refuses with
+        "bad format for path", so the container never starts; a /dev/dri default is refused
+        on every host without a GPU. The template therefore carries no Device config and
+        tells the user to add the flag to Extra Parameters themselves (dev/changelog/1126)."""
+        devices = [c.get('Name') for c in self.root.findall('Config') if c.get('Type') == 'Device']
+        self.assertEqual(devices, [], 'a Device config breaks the container start on Unraid')
+        self.assertNotIn('--device', self.root.findtext('ExtraParams') or '',
+                         'a default --device stops the container starting on a host with no GPU')
+        self.assertIn('--device=/dev/dri', self.root.findtext('Overview') or '')
 
     def test_the_restart_policy_is_set(self):
         """The in-app Restart exits the process and relies on the restart policy; Unraid's

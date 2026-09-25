@@ -537,14 +537,14 @@ class TierTests(unittest.TestCase):
 
     def test_the_basic_set_is_exactly_the_approved_one(self):
         tiers = self._tiers(self.basic_html)
-        self.assertEqual(len(tiers), 119)
+        self.assertEqual(len(tiers), 122)
         self.assertEqual({p for p, t in tiers.items() if t == 'basic'}, self.BASIC)
         self.assertEqual({t for t in tiers.values()}, {'basic', 'advanced'})
 
     def test_every_advanced_row_carries_its_badge_and_no_basic_row_does(self):
         rows = re.findall(r'data-path="([^"]+)" data-tier="[^"]*".*?<div class="fl-label">(.*?)</div>',
                           self.basic_html, re.S)
-        self.assertEqual(len(rows), 119)
+        self.assertEqual(len(rows), 122)
         for path, badge in rows:
             with self.subTest(path=path):
                 self.assertEqual('tier-badge' in badge, path not in self.BASIC)
@@ -623,7 +623,7 @@ class ChangedFromDefaultTests(unittest.TestCase):
 
     def test_every_setting_row_carries_the_mark_and_the_attribute_turns_it_on(self):
         html = self._page()
-        self.assertEqual(html.count('<div class="fr-changed">Changed from default</div>'), 119)
+        self.assertEqual(html.count('<div class="fr-changed">Changed from default</div>'), 122)
         self.assertIn('.frow[data-changed] .fr-changed { display: inline-flex; }', self._css())
 
     def test_a_value_saved_equal_to_its_default_is_not_a_change(self):
@@ -694,6 +694,13 @@ class GatingAndOverrideTests(unittest.TestCase):
         f'{PP}.reencode_mode': [f'{PP}.enabled', f'{PP}.format!=mkv'],
         f'{PP}.audio_bitrate_kbps': [f'{PP}.enabled', f'{PP}.format!=mkv'],
         f'{PP}.video_crf': [f'{PP}.enabled', f'{PP}.format!=mkv', f'{PP}.reencode_mode!=never'],
+        # The GPU encoder is a re-encode choice, and its two knobs read nothing while the
+        # encoder is software (dev/changelog/1125).
+        f'{PP}.video_encoder': [f'{PP}.enabled', f'{PP}.format!=mkv', f'{PP}.reencode_mode!=never'],
+        f'{PP}.vaapi_device': [f'{PP}.enabled', f'{PP}.format!=mkv', f'{PP}.reencode_mode!=never',
+                               f'{PP}.video_encoder!=software'],
+        f'{PP}.vaapi_qp': [f'{PP}.enabled', f'{PP}.format!=mkv', f'{PP}.reencode_mode!=never',
+                           f'{PP}.video_encoder!=software'],
         f'{PP}.max_restart_attempts': [f'{PP}.enabled', f'{PP}.auto_restart'],
         f'{PP}.collision_lookahead_multiplier': [f'{PP}.enabled', f'{PP}.collision_policy!=off'],
         'recording.move_on_complete.destination': ['recording.move_on_complete.enabled'],
