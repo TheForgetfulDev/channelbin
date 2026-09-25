@@ -118,7 +118,11 @@
       body: JSON.stringify({ path, value }),
     })
       .then((d) => {
-        toast('Saved');
+        // Long enough to read ffmpeg's own reason when the GPU test fails.
+        if (d.gpu_trial) {
+          showToast(`Saved. ${d.gpu_trial.message}`,
+            { type: d.gpu_trial.ok ? 'success' : 'error', durationMs: d.gpu_trial.ok ? 5000 : 15000 });
+        } else toast('Saved');
         markChanged(path, d.changed_from_default);
         if (d.restart_required && typeof checkRestartStatus === 'function') checkRestartStatus();
       })

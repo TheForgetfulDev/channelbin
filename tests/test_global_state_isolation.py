@@ -68,6 +68,7 @@ RESET = {
     'app/probe.py': {'_missing_reported'},
     'app/readiness.py': {'_ondemand', '_nav_cache'},
     'app/search_index.py': {'_rebuilding', '_stale_since'},
+    'app/toolchain.py': {'_gpu_trial'},
 }
 
 # Process-global state that is deliberately NOT reset, with who owns it instead. Every

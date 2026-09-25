@@ -17,10 +17,13 @@ every place it actually matters rather than as a line item nobody can price.
 
 **Three rules this module exists to keep:**
 
-* **Nothing expensive happens because someone looked at the page.** The three ON_DEMAND
-  checks spawn a process, log in to a provider or send a real message, and they run only
-  when asked. An on-demand check nobody has run reports NOT_RUN and never borrows the
-  verdict it would have had.
+* **Nothing expensive happens because someone looked at the page.** The ON_DEMAND checks
+  spawn a process, log in to a provider or send a real message, and no page render, poll
+  or nav summary ever runs one. They run when asked - and the two GPU-related lines also
+  when something a person did makes the answer due: a settings save that turns the GPU
+  encoder on or moves its device, a startup with it on, and every conversion's own GPU
+  trial (`refresh_gpu_checks`, `record_gpu_trial`, dev/changelog/1127). An on-demand check
+  nobody has run reports NOT_RUN and never borrows the verdict it would have had.
 * **A check that could not answer is never rendered as a pass.** UNKNOWN outranks READY and
   drags its capability down with it; NOT_RUN deliberately does not, or the whole card would
   be grey on every load, which is the opposite of the rule above.
@@ -421,6 +424,46 @@ def _check_ffmpeg_build(ctx):
     return Result(READY, tested, f'All {len(described)} present', None, detail)
 
 
+def _check_gpu_encoder(ctx):
+    """On-demand: with the GPU encoder selected, does the configured device really encode?
+
+    READY, never NOTHING, while the setting is software: conversion is complete and working
+    on the CPU, and a NOTHING here would turn the whole "convert" capability to "not set
+    up" for every install that never asked for a GPU (see _capability_state). ATTENTION
+    rather than PROBLEM on a failure, because a re-encode still completes on the CPU. The
+    trial's own stderr tells a build without the encoder ("Unknown encoder 'h264_vaapi'")
+    from a device that will not open, so it is quoted rather than re-diagnosed here
+    (dev/changelog/1125).
+    """
+    from .postprocessor import VIDEO_ENCODER_VAAPI
+    from .toolchain import check_gpu_encoder
+    pp = ctx.cfg['recording'].get('post_process', {})
+    device = str(pp.get('vaapi_device') or '/dev/dri/renderD128')
+    if pp.get('video_encoder', 'software') != VIDEO_ENCODER_VAAPI:
+        return Result(READY, 'Read recording.post_process.video_encoder',
+                      'Not in use - video is re-encoded in software (libx264)')
+    if not ctx.tools['ffmpeg'].get('found'):
+        return Result(NOTHING, _gpu_tested(device), 'There is no ffmpeg to test with')
+    return _gpu_trial_result(device, check_gpu_encoder(ctx.tools['ffmpeg']['path'], device))
+
+
+def _gpu_tested(device):
+    return f'Encoded a one-second test clip through {device} with h264_vaapi'
+
+
+def _gpu_trial_result(device, trial):
+    """The gpu_encoder answer for one trial, whoever ran it."""
+    tested = _gpu_tested(device)
+    if trial.ok:
+        return Result(READY, tested, f'{device} encoded the test clip'
+                      + (' (remembered from an earlier pass)' if trial.cached else ''))
+    return Result(ATTENTION, tested,
+                  f'The test encode failed, so every re-encode runs on the CPU (libx264). '
+                  f'ffmpeg reported: {trial.error}. In Docker, pass /dev/dri as a device; '
+                  f'if the node is named differently here, set '
+                  f'recording.post_process.vaapi_device.')
+
+
 def _check_storage_dvr(ctx):
     from .fs_utils import PATH_OK, describe_dir_problem
     tested = f'Probed the recording folder at {ctx.dvr_dir}'
@@ -755,6 +798,15 @@ CHECKS = (
           Link('Maintenance', 'system.maintenance'), True, _check_ffmpeg_build,
           'Lists every filter and codec the build carries, which costs two processes, so it '
           'never runs because you opened the page.'),
+    Check('gpu_encoder', 'machine', 'The GPU encoder works', 'the GPU encoder', ON_DEMAND,
+          'Every video re-encode runs on the CPU instead, which finishes the same file but '
+          'occupies most of the machine for the length of the conversion.',
+          Link('Settings', 'settings.settings'), True, _check_gpu_encoder,
+          'Encodes a one-second test clip through the device, which costs a process, so it '
+          'never runs because you opened the page. It also runs when you turn the GPU '
+          'encoder on in Settings, when the app starts with it on, and before every '
+          'conversion that would use it, and each of those updates this line. Answers at '
+          'once while the encoder is set to Software.'),
     Check('storage_dvr', 'machine', 'The recording folder works', 'the recording folder', CHEAP,
           'Any recording that starts now fails immediately, with nothing captured.',
           Link('Settings', 'settings.settings'), False, _check_storage_dvr),
@@ -881,7 +933,7 @@ CAPABILITIES = (
     Capability('failover', 'Survive a feed dropping mid-recording',
                _cap('guide_groups', 'ffprobe', 'channels_tested')),
     Capability('convert', 'Convert a finished recording to MP4',
-               _cap('ffmpeg', 'ffmpeg_build')),
+               _cap('ffmpeg', 'ffmpeg_build', 'gpu_encoder')),
     Capability('measure', 'Know how good a recording actually was', _cap('ffprobe')),
     Capability('shots', 'Take screenshots and live thumbnails',
                _cap('ffmpeg', 'ffmpeg_build')),
@@ -1243,6 +1295,27 @@ def nav_summary() -> dict:
         return {'blocked': 0, 'degraded': 0}
 
 
+def _store_ondemand(check_id, result):
+    """The one write into _ondemand."""
+    with _lock:
+        _ondemand[check_id] = {
+            'status': result.status,
+            'tested': result.tested,
+            'found': result.found,
+            'detail': result.detail,
+            'action': result.action,
+            'at': datetime.utcnow().isoformat(),
+        }
+        _nav_cache.clear()
+
+
+def _run_and_store(check_id, ctx):
+    check = CHECKS_BY_ID[check_id]
+    result, _ = _resolve(check._replace(cost=CHEAP), ctx, {})
+    _store_ondemand(check_id, result)
+    return result
+
+
 def run_check(check_id: str) -> dict:
     """Run one ON_DEMAND check now and store its answer. Returns the fresh payload."""
     check = CHECKS_BY_ID.get(check_id)
@@ -1251,19 +1324,75 @@ def run_check(check_id: str) -> dict:
     if check.cost != ON_DEMAND:
         raise ValueError(f'{check_id} runs on every evaluation and is not asked for')
     ctx = Context()
-    result, _ = _resolve(check._replace(cost=CHEAP), ctx, {})
-    action = result.action
-    with _lock:
-        _ondemand[check_id] = {
-            'status': result.status,
-            'tested': result.tested,
-            'found': result.found,
-            'detail': result.detail,
-            'action': action,
-            'at': datetime.utcnow().isoformat(),
-        }
-        _nav_cache.clear()
+    _run_and_store(check_id, ctx)
     return evaluate(ctx=ctx)
+
+
+def record_gpu_trial(device, trial):
+    """Store a GPU trial's answer as the gpu_encoder line. Called by
+    toolchain.check_gpu_encoder() on every trial, so a conversion's pre-flight, a settings
+    save, the startup trial and the button all land in the same place (dev/changelog/1127)."""
+    _store_ondemand('gpu_encoder', _gpu_trial_result(device, trial))
+
+
+#: The config keys that move the gpu_encoder answer. A save touching one re-answers it at
+#: once rather than leaving the line describing a setting that is no longer in force.
+GPU_CONFIG_KEYS = ('recording.post_process.video_encoder',
+                   'recording.post_process.vaapi_device', 'ffmpeg.path')
+
+
+def refresh_gpu_checks(cfg=None):
+    """Re-answer the GPU lines now, from a settings save or from startup.
+
+    With the GPU encoder on, that is the build listing and the trial encode - both
+    processes, and both allowed here because saving a setting or starting the app is
+    something a person did, not a page someone looked at. With it off, the gpu_encoder
+    line re-answers "not in use" without spawning anything. Needs only the config and the
+    toolchain, so it builds that much rather than a whole Context (which probes every
+    folder and writes to the database).
+
+    Returns the gpu_encoder Result, or None when the encoder is software.
+    """
+    from types import SimpleNamespace
+    from .config import load_config
+    from .postprocessor import VIDEO_ENCODER_VAAPI
+    from .toolchain import describe_tools
+    if cfg is None:
+        cfg = load_config()
+    ctx = SimpleNamespace(cfg=cfg, tools=describe_tools(
+        cfg['ffmpeg'].get('path', 'ffmpeg'), cfg['ffmpeg'].get('ffprobe_path', '')))
+    on = (cfg['recording'].get('post_process', {}).get('video_encoder', 'software')
+          == VIDEO_ENCODER_VAAPI)
+    if on:
+        _run_and_store('ffmpeg_build', ctx)
+    result = _run_and_store('gpu_encoder', ctx)
+    return result if on else None
+
+
+def start_gpu_trial_at_startup(app, cfg):
+    """With the GPU encoder on, answer the GPU lines once per boot, on a background thread.
+
+    _ondemand is process memory, so without this every restart - every image update - put
+    "Not run yet" back on a GPU install until somebody pressed the button or a conversion
+    happened to run. A thread, so a slow or hanging device never delays startup. Returns
+    the thread, or None when the encoder is software. create_app() calls it only alongside
+    the live scheduler, so a test app never spawns it (dev/changelog/1127).
+    """
+    from .postprocessor import VIDEO_ENCODER_VAAPI
+    if (cfg['recording'].get('post_process', {}).get('video_encoder', 'software')
+            != VIDEO_ENCODER_VAAPI):
+        return None
+
+    def _run():
+        with app.app_context():
+            try:
+                refresh_gpu_checks(cfg)
+            except Exception:                         # noqa: BLE001 - a daemon thread's last word
+                log.exception('readiness: the startup GPU trial raised')
+
+    thread = threading.Thread(target=_run, name='gpu-trial-startup', daemon=True)
+    thread.start()
+    return thread
 
 
 def pending_ondemand_ids() -> list:

@@ -5,6 +5,22 @@ Notable changes to ChannelBin, newest first. This project follows
 release is tagged `v<version>` in git, and the version the app is running is shown in the
 page footer.
 
+## 0.19.0 - 2026-09-25
+
+**Added**
+
+- Conversion can re-encode video on an Intel Quick Sync or AMD GPU through VAAPI instead of
+  the CPU. It is off by default and has its own quality setting.
+- If the GPU is turned on but does not work, the conversion finishes on the CPU and says so on
+  the recording, in an alert and on Maintenance > Readiness.
+- Turning GPU encoding on tests the GPU right away and shows the result when you save. The test
+  also runs at startup while the setting is on, and every conversion's GPU check updates
+  Readiness.
+- The container image includes the Intel GPU driver and gives the app access to a passed-in
+  /dev/dri device on its own.
+- The README, the example compose file and the Unraid template show how to pass the GPU to the
+  container.
+
 ## 0.18.1 - 2026-09-24
 
 Fixes a test that could fail at random: its child process could miss a shutdown signal that

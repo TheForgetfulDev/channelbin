@@ -25,6 +25,7 @@ from ..database import (
 from ..accounts import (TEMPLATE_VARIABLES, _TAG_TOKEN_RE, render_filename_template,
                         tag_template_variables)
 from ..recorder import _safe_name, FINISHED_IMAGE_CHOICES
+from ..postprocessor import VIDEO_ENCODERS
 from ..channel_search import PAGE_SIZE_OPTIONS, configured_page_size
 from ..alerts import ALERT_TYPES, RETIRED_ALERT_TYPES
 from ..notifications import (SERVICE_LABELS, SERVICE_URL_HINTS, dismiss_placeholder_url_alert,
@@ -136,9 +137,31 @@ def _save_raw_yaml(data):
         apply_logo_cache_schedule()
     if not changed:
         return 'No changes detected.'
+    gpu = _refresh_gpu_after_save(changed)
+    gpu_note = f' {_gpu_trial_sentence(gpu)}' if gpu else ''
     if any(path in RESTART_REQUIRED_KEYS for path, _, _ in changed):
-        return 'Settings saved. Restart the service for all changes to take effect.'
-    return 'Settings saved.'
+        return ('Settings saved. Restart the service for all changes to take effect.'
+                + gpu_note)
+    return 'Settings saved.' + gpu_note
+
+
+def _refresh_gpu_after_save(changed):
+    """Re-answer the GPU Readiness lines when a save moved a key they read, and return the
+    gpu_encoder Result while the GPU encoder is on (None otherwise, or when nothing it reads
+    changed). Runs the trial inline, after save_config() has returned and outside the config
+    lock, so the page can say whether the GPU works in the same response - one second
+    normally, bounded by the trial's own deadline (dev/changelog/1127)."""
+    from ..readiness import GPU_CONFIG_KEYS, refresh_gpu_checks
+    if not any(p in GPU_CONFIG_KEYS for p, _, _ in changed):
+        return None
+    return refresh_gpu_checks(load_config())
+
+
+def _gpu_trial_sentence(result):
+    from ..readiness import READY
+    if result.status == READY:
+        return f'GPU encoder test passed: {result.found}.'
+    return f'GPU encoder test failed, so conversions will use the CPU: {result.found}'
 
 
 @settings_bp.route('/settings', methods=['GET', 'POST'])
@@ -264,6 +287,7 @@ def api_settings_field():
         # 0 is a real answer here - the program's own first moment - so no floor above it.
         'recording.live_thumbnail.poster_frame_offset_seconds': (0, None),
         'recording.post_process.video_crf': (0, 51),
+        'recording.post_process.vaapi_qp': (0, 51),
         'recording.post_process.audio_bitrate_kbps': (32, 320),
         'channel_testing.window.dispatch_interval_minutes': (1, None),
     }
@@ -353,6 +377,13 @@ def api_settings_field():
             if value not in FINISHED_IMAGE_CHOICES:
                 return jsonify({'error': 'Pick one of '
                                          + ', '.join(FINISHED_IMAGE_CHOICES)}), 400
+
+        # Same rule as the finished-image choice above: the postprocessor branches on this
+        # value by name, and an unknown one would be re-encoded in software with a warning
+        # rather than doing what the person thought they chose.
+        if path == 'recording.post_process.video_encoder':
+            if value not in VIDEO_ENCODERS:
+                return jsonify({'error': 'Pick one of ' + ', '.join(VIDEO_ENCODERS)}), 400
 
         if path == 'search.page_size':
             value = _page_size_choice(value)
@@ -457,8 +488,14 @@ def api_settings_field():
         from ..scheduler import apply_logo_cache_schedule
         apply_logo_cache_schedule()
 
-    return jsonify({'success': True, 'restart_required': needs_restart,
-                    'changed_from_default': still_changed})
+    payload = {'success': True, 'restart_required': needs_restart,
+               'changed_from_default': still_changed}
+    gpu = _refresh_gpu_after_save(changed)
+    if gpu is not None:
+        from ..readiness import READY
+        payload['gpu_trial'] = {'ok': gpu.status == READY,
+                                'message': _gpu_trial_sentence(gpu)}
+    return jsonify(payload)
 
 
 @settings_bp.route('/api/settings/password', methods=['POST'])

@@ -34,6 +34,11 @@ STORAGE_PATH_UNUSABLE = 'STORAGE_PATH_UNUSABLE'
 #: four above: app/toolchain.py raises and dismisses it by type, one row per binary.
 EXTERNAL_TOOL_MISSING = 'EXTERNAL_TOOL_MISSING'
 
+#: recording.post_process.video_encoder asks for the GPU and its trial encode failed, so
+#: conversions are being re-encoded in software instead. Named because app/toolchain.py
+#: raises and dismisses it by type, one row per configured device (dev/changelog/1125).
+GPU_ENCODER_UNAVAILABLE = 'GPU_ENCODER_UNAVAILABLE'
+
 #: The APScheduler loop thread exited, so nothing scheduled fires again until the app
 #: restarts. Named because app/scheduler.py raises it from the dying thread and dismisses
 #: it by type when the next start brings the loop back (dev/changelog/1114).
@@ -302,6 +307,13 @@ ALERT_TYPES = {
     EXTERNAL_TOOL_MISSING: {
         'label': 'External Tool Missing (ffmpeg/ffprobe)', 'severity': 'ERROR',
         'self_clearing': True},
+    # WARN, not ERROR: a conversion still completes, on the CPU. The alert exists so a GPU
+    # that was asked for and is not doing the work is never a quiet fallback
+    # (dev/changelog/1125). Raised by app/toolchain.py when the trial encode fails and
+    # dismissed by it on the next pass, so it clears itself the moment the device works.
+    GPU_ENCODER_UNAVAILABLE: {
+        'label': 'GPU Encoder Not Working (conversion falling back to software)',
+        'severity': 'WARN', 'self_clearing': True},
 }
 
 #: The self_clearing types above, as a set. Derived rather than written out a second time:

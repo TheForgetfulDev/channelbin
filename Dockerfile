@@ -39,11 +39,23 @@ ARG FFMPEG_SERIES=7.1
 # to it in a container (see docker/entrypoint.sh, app/routes/settings.py::api_restart_now).
 # tzdata: zoneinfo data for display.timezone.
 #
+# intel-media-va-driver-non-free: the VA-API driver (iHD) for Intel GPUs from Broadwell on,
+# so recording.post_process.video_encoder: vaapi can use Quick Sync when /dev/dri is passed
+# into the container. Debian's ffmpeg already carries the h264_vaapi encoder; without a
+# driver it has nothing to talk to. The non-free build rather than intel-media-va-driver:
+# the free one omits the closed shader kernels that H.264 encode on older generations
+# needs (dev/changelog/1124). It lives in Debian's non-free component, which is why that
+# component is enabled just for this install; the package is redistributable, which is
+# the condition for Debian carrying it at all. About 18 MB.
+#
 # The version check covers ffprobe as well as ffmpeg because the app needs both and a missing
 # ffprobe is silent at runtime - every probe returns an empty dict. An absent binary reports an
 # empty version here and fails the same case arm as a wrong one.
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN sed -i 's/^Components: main$/Components: main non-free/' \
+        /etc/apt/sources.list.d/debian.sources \
+    && apt-get update && apt-get install -y --no-install-recommends \
         ffmpeg \
+        intel-media-va-driver-non-free \
         gosu \
         procps \
         tini \

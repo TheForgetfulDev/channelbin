@@ -344,6 +344,7 @@ def reset_module_globals():
     import app.readiness as readiness
     import app.routes.channel_search as channel_search_routes
     import app.search_index as search_index
+    import app.toolchain as toolchain
 
     # A run abandoned mid-flight leaves its admission ticket held, and the next module's
     # sync or maintenance job is then refused by a blocker that no longer exists.
@@ -375,6 +376,11 @@ def reset_module_globals():
     # module makes this module's first tick read as already past its grace window - i.e. an
     # unexpected rebuild where the test set up a fresh observation.
     search_index._stale_since.clear()
+    # A GPU trial that passed is remembered for the process, keyed on binary and device;
+    # a module that patched the trial to pass would hand the next module a GPU it does
+    # not have. Only the trial is dropped - the tool and capability probes are machine
+    # facts and stay (tests/test_global_state_isolation.py).
+    toolchain._gpu_trial.clear()
     # Lockout counters are keyed by IP, and every test client is 127.0.0.1.
     auth._failures = {}
     # Latched after the first probe that cannot run ffprobe, so a module that exercised the

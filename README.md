@@ -35,6 +35,7 @@ It's actually been really fun using the search and surfacing channels that I did
 - [Install](#install)
   - [Docker](#docker-recommended)
   - [Unraid](#unraid)
+  - [GPU conversion (optional)](#gpu-conversion-optional)
   - [Running it directly](#running-it-directly)
 - [First run](#first-run)
 - [Configuration](#configuration)
@@ -164,6 +165,9 @@ file pins a release version rather than `latest`, so an update happens when you 
 and never in the middle of a recording. `:latest` exists for trying it out by hand. To build
 the image yourself, clone the repo and replace the `image:` line with `build: .`.
 
+Converting recordings on a GPU is optional and needs one extra line in the compose file - see
+[GPU conversion](#gpu-conversion-optional).
+
 #### Volumes
 
 | Mount | Holds |
@@ -217,6 +221,49 @@ restart policy.
 
 Unlike the compose example, the template tracks `latest`: Unraid keeps the tag a container was
 created with, so a pinned template would never show an update. Update between recordings.
+
+The template has no GPU field, because Unraid cannot leave a device field empty: it passes
+`--device=''` and the container refuses to start. To convert on the GPU, add
+`--device=/dev/dri` to Extra Parameters yourself - see [GPU conversion](#gpu-conversion-optional).
+
+### GPU conversion (optional)
+
+When a recording is re-encoded to MP4, ChannelBin can hand the video to an Intel Quick Sync or
+AMD GPU through VAAPI instead of libx264 on the CPU. On a 1080p60 recording that took about a
+fifth of the CPU time for the same file size and picture quality. It needs two things: the
+host's `/dev/dri` passed into the container, and the setting turned on.
+
+**Pass `/dev/dri` as a device, not a volume.** Mapped as a volume the container can see the
+device but is not allowed to open it, and every GPU encode fails with "Operation not
+permitted". The three ways to write it:
+
+| Where | What to add |
+|---|---|
+| Unraid | `--device=/dev/dri` in Extra Parameters (Advanced View), after `--restart=unless-stopped` |
+| Docker Compose | `devices:` with `- /dev/dri:/dev/dri` (commented out in the example compose file) |
+| `docker run` | `--device /dev/dri` |
+
+Leave it out on a machine with no GPU: docker will not start a container whose device does not
+exist. It works on Linux hosts only; Docker Desktop on Windows or macOS, and WSL, do not pass a
+VAAPI device through.
+
+You do not need to add the container to the host's `render` or `video` group. At every start
+the container gives its own user access to whatever group owns the device it was handed, and
+says so in its log.
+
+**Then turn it on:** Settings > Recording, **Video encoder** = GPU (VAAPI). It is shown once
+post-processing is on and re-encoding is allowed. **GPU device** defaults to
+`/dev/dri/renderD128`, which is right on almost every machine with one GPU. Maintenance >
+Readiness has a **The GPU encoder works** check that runs a one-second test encode on the
+device.
+
+If the GPU is missing or fails, the conversion still finishes in software with libx264. The
+recording's event log says which encoder did the work and why it fell back, and a device that
+fails its test encode also raises an alert naming the reason.
+
+Running without Docker, the same setting works if your ffmpeg has `h264_vaapi`, the VAAPI
+driver for your GPU is installed (`intel-media-va-driver` on Debian and Ubuntu), and the user
+running ChannelBin can open the render node (usually by being in the `render` group).
 
 ### Running it directly
 

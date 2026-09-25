@@ -64,6 +64,19 @@ _cache = None
 _cache_key = None
 _capabilities = None
 _capabilities_key = None
+# {(resolved ffmpeg path, device): True} - the GPU trial encodes that PASSED. A failure is never
+# stored: a device that is unplugged, busy or not yet passed into the container costs one
+# second to re-ask before the next conversion, where a remembered "no" would keep a GPU
+# that has since come back out of use until a restart (dev/changelog/1125).
+_gpu_trial = {}
+
+# The source key of the standing GPU alert, suffixed with the configured device.
+GPU_ALERT_SOURCE_PREFIX = 'toolchain:gpu:'
+
+# A one-second synthetic clip through the encoder proves the device end to end (the VA
+# driver loads, the node opens, the encoder accepts frames). A healthy trial takes well
+# under a second; a device that hangs is the only thing this deadline is for.
+_GPU_TRIAL_TIMEOUT_SECONDS = 30
 
 # The components of an ffmpeg build that ChannelBin actually invokes, and nothing else - a
 # dump of every filter a build carries answers no question an operator has. Each is named by
@@ -238,16 +251,142 @@ def describe_tools(configured_ffmpeg_path=None, configured_ffprobe_path=None):
 
 
 def reset_cache():
-    """Drop both cached probes so the next describe_tools() and describe_capabilities()
-    spawn again. Both, because app/probe.py calls this the moment a spawn proves a binary
-    has gone, and a capabilities answer outliving that would describe a build that is no
-    longer there."""
+    """Drop every cached probe so the next describe_tools(), describe_capabilities() and
+    check_gpu_encoder() spawn again. All of them, because app/probe.py calls this the
+    moment a spawn proves a binary has gone, and an answer outliving that would describe a
+    build that is no longer there."""
     global _cache, _cache_key, _capabilities, _capabilities_key
     with _lock:
         _cache = None
         _cache_key = None
         _capabilities = None
         _capabilities_key = None
+        _gpu_trial.clear()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# The GPU encoder: does the configured device really encode?
+# ─────────────────────────────────────────────────────────────────────────────
+# Two facts, kept apart on purpose (dev/changelog/1125): "this build lists h264_vaapi" is
+# what `ffmpeg -codecs` says and is answered by describe_capabilities(); "the device
+# encodes" is only ever answered by encoding something through it. A build with the
+# encoder compiled in fails all the same when no VA driver is installed, when /dev/dri was
+# bind-mounted rather than passed as a device, or when the app's user cannot open the node.
+
+def gpu_trial_cmd(ffmpeg_path, device):
+    """The one-second trial encode: a synthetic 320x240 clip uploaded to the device and
+    encoded with h264_vaapi to a null muxer. The same `-vaapi_device` / `format=nv12,
+    hwupload` / `h264_vaapi` shape the conversion uses, so a pass here means that command
+    will open the device too."""
+    return [ffmpeg_path, '-nostdin', '-hide_banner', '-loglevel', 'error',
+            '-vaapi_device', device, '-f', 'lavfi', '-i', 'testsrc2=s=320x240:d=1',
+            '-vf', 'format=nv12,hwupload', '-c:v', 'h264_vaapi', '-f', 'null', '-']
+
+
+def _run_gpu_trial(ffmpeg_path, device):
+    """(returncode, stderr tail) of one trial encode. The seam tests patch: nothing else in
+    this module spawns for the GPU. Same subprocess discipline as _probe_version."""
+    try:
+        proc = subprocess.run(gpu_trial_cmd(ffmpeg_path, device), capture_output=True,
+                              text=True, timeout=_GPU_TRIAL_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired:
+        return None, f'The trial encode produced nothing in {_GPU_TRIAL_TIMEOUT_SECONDS}s'
+    except OSError as exc:
+        return None, f'Could not run {ffmpeg_path}: {exc}'
+    lines = [ln.strip() for ln in (proc.stderr or '').splitlines() if ln.strip()]
+    return proc.returncode, '\n'.join(lines[-6:])
+
+
+class GpuTrial:
+    """What check_gpu_encoder() found. `error` is ffmpeg's own last lines when the encode
+    failed, already fit to quote in an event or an alert; '' on a pass."""
+    def __init__(self, ok, error='', cached=False):
+        self.ok = ok
+        self.error = error
+        self.cached = cached
+
+
+def check_gpu_encoder(ffmpeg_path, device):
+    """Prove the device encodes, and move its standing alert to match.
+
+    A pass is served from cache for the life of the process (keyed on both the binary and
+    the device, so a settings change re-asks); a failure is re-run on every call, per the
+    note on _gpu_trial. Called before every conversion that would use the GPU, on a
+    Readiness ask, on a settings save that turns the GPU on or moves its device, and once at
+    startup while the GPU is on (app/readiness.py::refresh_gpu_checks) - a second each,
+    against jobs measured in minutes to hours.
+
+    The alert half follows report_tool_state(): one row per device, raised on a failure
+    and dismissed on a pass, and never allowed to raise into the caller - the trial is a
+    diagnostic, and a failed alert write must not decide whether a conversion runs.
+
+    The cache is keyed on the binary as it resolves on disk, not on the caller's spelling
+    of it: the conversion passes the configured `ffmpeg` and Readiness passes the resolved
+    `/usr/bin/ffmpeg`, and one binary spelled two ways ran the trial twice per process
+    (dev/changelog/1127).
+
+    Every answer, a cached pass included, also becomes Readiness's "The GPU encoder works"
+    line, so a conversion's trial and a settings save's trial update the same surface the
+    button does rather than leaving it at "Not run yet" beside an alert that says otherwise.
+    """
+    key = (_absolute(ffmpeg_path), device)
+    with _lock:
+        cached = bool(_gpu_trial.get(key))
+    if cached:
+        trial = GpuTrial(True, cached=True)
+        _record_in_readiness(device, trial)
+        return trial
+    rc, tail = _run_gpu_trial(ffmpeg_path, device)
+    ok = rc == 0
+    if ok:
+        with _lock:
+            _gpu_trial[key] = True
+        log.info('GPU encoder trial passed on %s (%s)', device, key[0])
+    else:
+        # WARNING, not ERROR: the log->alert handler would raise a second, unlabeled row
+        # beside the standing one below.
+        log.warning('GPU encoder trial FAILED on %s (%s): %s', device, key[0],
+                    tail or f'ffmpeg exited {rc}')
+    _report_gpu_state(device, ok, tail or f'ffmpeg exited {rc}')
+    trial = GpuTrial(ok, '' if ok else (tail or f'ffmpeg exited {rc}'))
+    _record_in_readiness(device, trial)
+    return trial
+
+
+def _record_in_readiness(device, trial):
+    from .readiness import record_gpu_trial
+    record_gpu_trial(device, trial)
+
+
+def _report_gpu_state(device, ok, error):
+    from flask import has_app_context
+    if not has_app_context():
+        return
+    from .alerts import (GPU_ENCODER_UNAVAILABLE, create_alert, dismiss_open_alerts,
+                         has_open_alert)
+    source = f'{GPU_ALERT_SOURCE_PREFIX}{device}'
+    try:
+        if ok:
+            dismiss_open_alerts(GPU_ENCODER_UNAVAILABLE, source)
+        elif not has_open_alert(GPU_ENCODER_UNAVAILABLE, source):
+            create_alert(
+                GPU_ENCODER_UNAVAILABLE,
+                'The GPU encoder is not working, so conversions are using the CPU',
+                body=(f'Settings ask for video re-encodes to run on the GPU '
+                      f'(recording.post_process.video_encoder: vaapi), but a one-second '
+                      f'test encode through {device} failed. Every conversion that needs a '
+                      f're-encode still completes, using libx264 on the CPU, and says so in '
+                      f'its event log. ffmpeg reported: {error}\n\n'
+                      f'In Docker the device has to be passed as a device (--device '
+                      f'/dev/dri, or --device=/dev/dri in the Extra Parameters of the '
+                      f'Unraid template), not as a folder mapping, and it is only '
+                      f'available on a Linux host. If the node is named differently on '
+                      f'this machine, set recording.post_process.vaapi_device. '
+                      f'Maintenance > Readiness re-runs the test on demand, and this '
+                      f'alert clears itself once it passes.'),
+                source=source)
+    except Exception:
+        log.exception('Could not update the GPU encoder alert')
 
 
 def _run_listing(path, flag):
