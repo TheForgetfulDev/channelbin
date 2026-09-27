@@ -422,7 +422,7 @@ function showConflictError(elId, msg, conflicts, recDetailUrlBase) {
 
 // The soft, proceedable warnings POST /recordings/new-json and .../edit-json answer with
 // when a schedule overlaps another recording ({success: false, overlap_warning,
-// connection_limit_warning}) - dev/changelog/858, the recording-scheduling counterpart to
+// connection_limit_warning, account_block_warning}) - dev/changelog/858, the recording-scheduling counterpart to
 // group-modal.js's groupWarningsHtml(). Reuses the same
 // {recording_id, channel_name, title, start_time, stop_time} conflict shape showConflictError
 // already knows how to draw, so both blocks render as prose plus a clickable list.
@@ -444,7 +444,8 @@ function recordingWarningsHtml(data, recDetailUrlBase) {
     </div>`;
   };
   return block('Overlapping recording', data.overlap_warning)
-    + block('Connection limit', data.connection_limit_warning);
+    + block('Connection limit', data.connection_limit_warning)
+    + block('Blocked account', data.account_block_warning);
 }
 
 // EventSource with auto-reconnect. Returns { close() }; close() stops reconnection.

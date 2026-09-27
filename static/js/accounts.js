@@ -61,6 +61,10 @@
       case 'force-epg':
         confirmForceEpgResync(id, hooks);
         return;
+      case 'block':
+        confirmBlockAccount({ id, name: row.dataset.name, limit: row.dataset.limit,
+          onDone: reload });
+        return;
       case 'settings':
         // The SAME modal the account page opens - it takes an account id and nothing else.
         openAccountModal({ accountId: id, onDone: reload });

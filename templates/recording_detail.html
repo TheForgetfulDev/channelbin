@@ -411,6 +411,7 @@
     {%- elif rec.failure_reason == 'CONNECTION_SLOT_TIMEOUT' %}it <b>never started</b>: the account had no free connection slot, and its own window ended while it waited for one
     {%- elif rec.failure_reason == 'DVR_DIR_UNUSABLE' %}it <b>never started</b>: the DVR output directory could not be used, and the activity log below names the problem
     {%- elif rec.failure_reason == 'MISSED_AT_STARTUP' %}it <b>never started</b>: the service was not running during its window, and its stop time had already passed when the service came back
+    {%- elif rec.failure_reason == 'ACCOUNT_BLOCKED' %}it <b>never started</b>: every account it could record from was <b>blocked</b> for the rest of its window, as you asked
     {%- elif rec.failure_reason == 'ALL_SEGMENTS_PLACEHOLDER' %}every captured segment was the <b>provider's placeholder clip</b> rather than the channel, so there was nothing to join - the channel was down for the whole window
     {%- elif rec.failure_reason == 'SEGMENT_FILES_MISSING' %}the capture recorded data, but its segment files <b>went missing</b> before they could be joined, which is not a stream fault
     {%- elif rec.failure_reason == 'NO_VALID_SEGMENTS' %}the capture ran but the stream <b>never delivered any data</b>
@@ -430,7 +431,7 @@
     {%- if recover_act == 'retry-convert' %}the joined <b>.ts</b> is still on disk - use <b>Retry conversion</b> to finish it
     {%- elif recover_act == 'retry-concat' %}segments kept on disk - use <b>Retry join</b> to finish it
     {%- elif rec.failure_reason == 'ALL_SEGMENTS_PLACEHOLDER' %}a join would refuse the same placeholder clips again - use <b>Record again</b> to reschedule
-    {%- elif rec.failure_reason in ('CONVERSION_COLLISION', 'CONNECTION_SLOT_TIMEOUT', 'DVR_DIR_UNUSABLE', 'MISSED_AT_STARTUP', 'NO_VALID_SEGMENTS', 'PAUSED_NOTHING_CAPTURED') %}nothing was captured - use <b>Record again</b> to reschedule
+    {%- elif rec.failure_reason in ('CONVERSION_COLLISION', 'CONNECTION_SLOT_TIMEOUT', 'DVR_DIR_UNUSABLE', 'MISSED_AT_STARTUP', 'ACCOUNT_BLOCKED', 'NO_VALID_SEGMENTS', 'PAUSED_NOTHING_CAPTURED') %}nothing was captured - use <b>Record again</b> to reschedule
     {%- else %}nothing recoverable is left on disk - use <b>Record again</b> to reschedule{% endif %}</span>
 </div>
 {% elif rec.status == 'ABORTED' %}
@@ -734,6 +735,8 @@
         {{ stat_row('Starts', rec.start_time | local_time) }}
         {{ stat_row('Stops', rec.stop_time | local_time) }}
         {{ stat_row('Scheduled window', rec.scheduled_duration_seconds | int | duration) }}
+        {% if blocked_accounts %}{{ stat_row('Blocks account use', blocked_accounts | join(', '),
+             tip='Blocks account use.&#10;While this recording can still record, nothing in ChannelBin opens a stream on these accounts - so a TV can watch live on them. Change it from Edit (scheduled) or the in-progress controls.') }}{% endif %}
         {% if rec.program_duration_seconds is not none and rec.program_duration_seconds != rec.scheduled_duration_seconds %}
         {{ stat_row('Program length', rec.program_duration_seconds | int | duration) }}
         {% endif %}
@@ -746,7 +749,12 @@
            the resolution beside it already conveys the displayed size. `select` with no
            test drops the None halves, so a missing piece never leaves a stray newline. #}
         {% set coded_note = ('Encoder frame size: ' ~ fmt.coded ~ '.') if fmt.coded else none %}
-        {{ stat_row('Video', video or '-', tip=([tech_tip, coded_note] | select | join('\n')) or none) }}
+        {# A mixed-format file is disclosed here and in the event log, not by an alert
+           (dev/changelog/928). #}
+        {% set format_note = (row.format_change ~ '\nThe value shown is the latest segment\'s format.') if row.format_change else none %}
+        {{ stat_row('Video', ((video or '-') ~ (' · format changed' if row.format_change else '')),
+                    sv_cls=('warn' if row.format_change else none),
+                    tip=([format_note, tech_tip, coded_note] | select | join('\n')) or none) }}
         {{ stat_row('Audio', audio or '-', tip=([tech_tip, fmt.audio_note] | select | join('\n')) or none) }}
         {# Stream format profile (dev/changelog/336): same measurements, labels and amber
            treatment as the channel side's drawer. Rows predating format capture collapse
@@ -901,6 +909,7 @@
   'MANUAL_PAUSE':             ('na',   'The recording was paused.'),
   'SERVICE_RESTART':          ('na',   'The segment was closed because the service restarted.'),
   'TEARDOWN_RACE':            ('na',   'This segment was starting at the exact moment the recording was torn down, so it captured nothing. Its file was deleted and the row was closed rather than left open.'),
+  'ACCOUNT_BLOCKED':          ('na',   'You blocked the account this segment was on, so the recording moved to a member on another account and this segment was closed there. Nothing was wrong with the feed, and it was not scored for the move.'),
 } %}
 {# Why a row was kept out of the final file. Keyed on RecordingSegment.excluded_reason, which
    is a different question from the exit pill above (how the segment ended) and reads beside
@@ -1017,6 +1026,7 @@
   'RECORDING_START_DEFERRED': 'warn', 'CONVERSION_YIELDED': 'warn', 'CONVERSION_CANCELLED': 'warn',
   'CAPTURE_LOST_TO_OUTAGE': 'warn', 'SEGMENT_DISCARDED': 'warn',
   'FAST_DELIVERY_DETECTED': 'warn',
+  'RECORDING_FORMAT_OVERRIDE': 'warn', 'RECORDING_FORMAT_CHANGED': 'warn',
   'CONVERSION_RESTARTED': 'info', 'DIAGNOSTICS': 'info', 'CAPTURE_PACING_ENABLED': 'info',
   'RECORDING_METADATA_REFRESHED': 'info', 'RECORDING_METADATA_REFRESH_SKIPPED': 'info',
   'RECORDING_METADATA_EDITED': 'info',

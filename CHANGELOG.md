@@ -5,6 +5,35 @@ Notable changes to ChannelBin, newest first. This project follows
 release is tagged `v<version>` in git, and the version the app is running is shown in the
 page footer.
 
+## 0.21.0 - 2026-09-27
+
+**Added**
+
+- Block one or more accounts for a stretch of time, so a TV can watch live on an account
+  ChannelBin also records from. While a block holds, no recording, failover, health check or
+  preview opens a stream on it. Set it from the record modal for that recording's time, or from
+  the account pages for up to 24 hours. A recording already running on a newly blocked account
+  moves to another group member, and skipping a blocked account never counts against a
+  channel's health.
+- Delete a single health check from a channel's Test History. The channel's health score is
+  worked out again from what remains, the confirm shows the score it will land on, and the
+  Activity Timeline records the delete.
+- The Home Assistant status API lists each provider account and each recording being captured,
+  so the integration can show a device per account.
+
+**Changed**
+
+- Test History marks the tests that a reset or step back took out of the health score.
+
+**Fixed**
+
+- A recording whose video changes resolution or frame rate part-way through says so on its Stats
+  card, in its event log and on the Recordings list, instead of looking like a clean capture.
+- The account page follows a sync as it runs, counts down to the next one, and stops offering
+  Sync now once a sync has started, all without a reload.
+- A sync in progress shows as running in the account's sync history and Activity, instead of a
+  grey "IN_PROGRESS".
+
 ## 0.20.0 - 2026-09-26
 
 **Added**

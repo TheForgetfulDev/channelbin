@@ -30,7 +30,7 @@ from ..accounts import (
     tags_matching, transfer_channel_state,
 )
 from ..channel_groups import (
-    effective_score, rank_members, suggest_candidates, group_reference_key,
+    blocked_account_ids_now, effective_score, rank_members, suggest_candidates, group_reference_key,
     derived_reference_key, lock_ranking_ids,
     classify_group_formats, group_format_outliers, format_key, format_label,
     member_channels, recording_members, test_member_ids, pick_best_member,
@@ -2911,7 +2911,8 @@ def group_record_context(group_id):
     streak_threshold = cfg.get('channel_testing', {}).get(
         'failing_streak_threshold', DEFAULT_FAILING_STREAK_THRESHOLD)
     latest = _latest_tests_by_channel([m.channel_id for m in memberships], for_job_id=ANY_JOB)
-    choice = serving_member(group, latest, streak_threshold=streak_threshold)
+    choice = serving_member(group, latest, streak_threshold=streak_threshold,
+                            blocked_account_ids=blocked_account_ids_now())
     serving = choice.member
 
     return jsonify({

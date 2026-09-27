@@ -239,7 +239,7 @@ def build_group_rows(groups, ctx) -> list:
     named a different member than a recording would open is a row that lies about what
     clicking Record does.
     """
-    from .channel_groups import format_label, serving_member
+    from .channel_groups import blocked_account_ids_now, format_label, serving_member
     from .routes.channel_tests import _latest_tests_by_channel
     if not groups:
         return []
@@ -248,9 +248,11 @@ def build_group_rows(groups, ctx) -> list:
     latest = _latest_tests_by_channel(member_ids)
     bands = health_bands.resolve_bands(ctx.cfg)
 
+    blocked = blocked_account_ids_now()
     serving_by_group = {}
     for group in groups:
-        serving_by_group[group.id] = serving_member(group, latest).member
+        serving_by_group[group.id] = serving_member(group, latest,
+                                                    blocked_account_ids=blocked).member
 
     airing = _now_airing([s.id for s in serving_by_group.values() if s is not None])
 

@@ -191,6 +191,25 @@ def segment_format_key(seg):
                            getattr(seg, 'probe_fps', None))
 
 
+def recording_formats(segments):
+    """The distinct segment_format_keys a recording's file holds, in the order they first
+    appear, over segments already loaded in segment order. More than one means the finished
+    file changes format part-way through while its header describes only the first.
+
+    Pure - reads no DB, so a per-row caller pays nothing for it. The first key is the one
+    recorder.recording_format_pin() picks, for the same reasons: an unprobed segment is
+    unknown, not different, and an excluded segment was never joined into the file
+    (dev/changelog/957)."""
+    keys = []
+    for seg in segments:
+        if getattr(seg, 'excluded_reason', None) is not None:
+            continue
+        key = segment_format_key(seg)
+        if key is not None and key not in keys:
+            keys.append(key)
+    return keys
+
+
 def format_label(key) -> str:
     """Human-readable label for a format_key tuple, e.g. "1920x1080 @ 60"."""
     if not key:
@@ -1309,7 +1328,8 @@ ServingChoice = collections.namedtuple('ServingChoice', 'member selection')
 
 
 def serving_member(group, latest_by_channel=None,
-                   streak_threshold=DEFAULT_FAILING_STREAK_THRESHOLD) -> ServingChoice:
+                   streak_threshold=DEFAULT_FAILING_STREAK_THRESHOLD,
+                   blocked_account_ids=frozenset()) -> ServingChoice:
     """The member `group` would record from right now - format lock filters, health score
     ranks (DESIGN-channel-groups-model.md 5, dev/changelog/753).
 
@@ -1326,13 +1346,28 @@ def serving_member(group, latest_by_channel=None,
     `latest_by_channel` is load bearing rather than a tie-break: a member's format is read
     from its latest health check, so omitting the map leaves every format unknown and the
     lock filters nothing. Callers batch it over the whole page - asking per row is the
-    per-row-I/O defect class. Must be called inside an app context."""
+    per-row-I/O defect class. Must be called inside an app context.
+
+    `blocked_account_ids` - the accounts the user has blocked right now
+    (app/account_blocks.py) - is dropped before the format lock, as record start drops it,
+    and for the same reason it is passed in rather than read here. When every member is
+    blocked they all stay: the row still names the member a recording would wait on."""
     members = recording_members(group.memberships) if group is not None else []
+    if blocked_account_ids:
+        unblocked = [ch for ch in members if ch.account_id not in blocked_account_ids]
+        members = unblocked or members
     selection = format_eligible_members(group, members, latest_by_channel or {})
     return ServingChoice(
         pick_best_member(selection.members, latest_by_channel,
                          streak_threshold=streak_threshold),
         selection)
+
+
+def blocked_account_ids_now() -> set:
+    """Every account fully blocked right now - the one read a display surface makes before
+    its row loop and hands to serving_member(), which must not query per row."""
+    from .account_blocks import blocked_account_ids
+    return blocked_account_ids(None)
 
 
 def guide_row_targets(streak_threshold=DEFAULT_FAILING_STREAK_THRESHOLD,
@@ -1359,13 +1394,14 @@ def guide_row_targets(streak_threshold=DEFAULT_FAILING_STREAK_THRESHOLD,
     from .database import Channel, ChannelGroup
     entries = [((ch.guide_sort_order or 0, ch.name.lower()), ('channel', ch, None))
                for ch in Channel.query.filter(Channel.in_guide.is_(True)).all()]
+    blocked = blocked_account_ids_now()
     for g in ChannelGroup.query.filter_by(in_guide=True).options(*member_eager_options()).all():
         # The row must name the member a recording would actually start from, or clicking
         # Record on it records a feed the guide never showed (5, dev/changelog/753). The
         # override case still yields a member: the filter hands back the unfiltered list
         # rather than emptying it.
-        serving = serving_member(g, latest_by_channel,
-                                 streak_threshold=streak_threshold).member
+        serving = serving_member(g, latest_by_channel, streak_threshold=streak_threshold,
+                                 blocked_account_ids=blocked).member
         if serving is None:
             continue
         entries.append(((g.guide_sort_order or 0, g.name.lower()), ('group', g, serving)))

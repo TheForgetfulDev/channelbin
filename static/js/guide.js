@@ -1649,6 +1649,72 @@ async function showGroupNote(groupId, token) {
   note.style.display = '';
 }
 
+/* The "Block account use during this recording" picker, in both modals
+   (app/account_blocks.py, dev/changelog/1151). Fetched per open - which accounts exist and
+   what this recording already blocks both live on the server. `block_accounts_loaded` is
+   set only once the list has drawn, so a failed lookup leaves the recording's blocks alone
+   rather than saving "block nothing" over them; the picker stays hidden in that case. */
+let _blockPickerToken = 0;
+
+async function loadBlockPicker(prefix, recordingId) {
+  const wrap = document.getElementById(`${prefix}-blocks`);
+  if (!wrap) return;
+  const list = document.getElementById(`${prefix}-blocks-list`);
+  const loaded = document.getElementById(`${prefix}-blocks-loaded`);
+  const count = document.getElementById(`${prefix}-blocks-count`);
+  const token = ++_blockPickerToken;
+  loaded.value = '';
+  list.innerHTML = '';
+  count.textContent = '';
+  wrap.style.display = 'none';
+  wrap.open = false;
+  let data;
+  try {
+    data = await jsonFetch('/api/account-blocks/options'
+      + (recordingId ? `?recording_id=${encodeURIComponent(recordingId)}` : ''));
+  } catch (e) {
+    return;
+  }
+  if (token !== _blockPickerToken) return;
+  const accounts = data.accounts || [];
+  if (!accounts.length) return;
+  list.innerHTML = accounts.map((a) => {
+    let slots = '';
+    if (a.limit > 1) {
+      const opts = [`<option value="">All ${a.limit} connections</option>`];
+      for (let n = 1; n < a.limit; n++) {
+        opts.push(`<option value="${n}"${a.slots === n ? ' selected' : ''}>${n} of ${a.limit}</option>`);
+      }
+      slots = `<select name="block_slots_${a.id}" class="form-control" `
+        + `aria-label="Connections to block on ${escHtml(a.name)}">${opts.join('')}</select>`;
+    }
+    return `<label class="acct-block-row"><input type="checkbox" name="block_account_ids" `
+      + `value="${a.id}"${a.blocked ? ' checked' : ''}>`
+      + `<span class="color-dot" style="background:${escHtml(a.color || '')}"></span>`
+      + `${escHtml(a.name)}${slots}</label>`;
+  }).join('');
+  const update = () => {
+    const n = list.querySelectorAll('input[type=checkbox]:checked').length;
+    count.textContent = n ? ` (${n})` : '';
+  };
+  list.onchange = update;
+  update();
+  loaded.value = '1';
+  wrap.style.display = '';
+  wrap.open = accounts.some((a) => a.blocked);
+}
+
+// The picker's choice as the JSON the in-progress modal posts, or null when it never loaded.
+function blockPickerPayload(prefix) {
+  const loaded = document.getElementById(`${prefix}-blocks-loaded`);
+  if (!loaded || loaded.value !== '1') return null;
+  const list = document.getElementById(`${prefix}-blocks-list`);
+  return [...list.querySelectorAll('input[name=block_account_ids]:checked')].map((cb) => {
+    const sel = list.querySelector(`select[name="block_slots_${cb.value}"]`);
+    return { account_id: Number(cb.value), slots: sel && sel.value ? Number(sel.value) : null };
+  });
+}
+
 function applyProfilePadding() {
   const note = document.getElementById('modal-padding-note');
   if (!_modalPaddingApplicable || !_modalBaseStartIso || !_modalBaseStopIso) {
@@ -1748,6 +1814,7 @@ function openModal(prog, ch, opts = {}) {
   // the recording detail page all get it without knowing it exists (dev/changelog/904).
   _modalOpenToken += 1;
   showGroupNote(prog.group_id, _modalOpenToken);
+  loadBlockPicker('modal', isEdit && !replaceRecId ? prog.recording_id : null);
 
   const profileSel = document.getElementById('modal-profile');
   if (profileSel) {
@@ -1890,6 +1957,7 @@ function openActiveRecModal(prog) {
   pauseBtn.dataset.paused = isPaused ? '1' : '0';
 
   document.getElementById('active-rec-error').style.display = 'none';
+  loadBlockPicker('active-rec', prog.recording_id);
   document.getElementById('active-rec-modal').style.display = 'flex';
   syncScrollLock();
 }
@@ -2960,6 +3028,15 @@ document.addEventListener('DOMContentLoaded', function () {
         method: 'POST',
         body: JSON.stringify({ stop_time: stopVal }),
       });
+      // A running recording on an account this now blocks moves off it within its
+      // watchdog's next check (app/watchdog.py::_check_account_block).
+      const blocks = blockPickerPayload('active-rec');
+      if (blocks) {
+        await jsonFetch(`/api/recordings/${recId}/account-blocks`, {
+          method: 'POST',
+          body: JSON.stringify({ blocks }),
+        });
+      }
       closeActiveRecModal();
       fetchAndRender();
     } catch (e) {

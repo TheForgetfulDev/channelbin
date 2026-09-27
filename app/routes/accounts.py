@@ -18,8 +18,8 @@ from ..account_stats import WINDOWS, today_local, windowed_stats
 from ..channel_groups import report_orphaned_guide_groups
 from ..channel_search import GROUP_ANY, OTHER_NEW, OTHER_REMOVED
 from ..config import load_config, config_default
-from ..database import (Account, AccountStatDay, Channel, AccountSyncLog, ChannelGroupMember,
-                        EpgSource, EpgSourceSubscription, EPG_SOURCE_PROVIDER,
+from ..database import (Account, AccountBlock, AccountStatDay, Channel, AccountSyncLog,
+                        ChannelGroupMember, EpgSource, EpgSourceSubscription, EPG_SOURCE_PROVIDER,
                         EPG_SOURCE_URL)
 from ..db_utils import retry_on_locked
 from ..epg_sources import (MATCH_DISAGREE, MATCH_NEW, REFRESH_HOURS_CHOICES,
@@ -32,7 +32,11 @@ from ..epg_sources import (MATCH_DISAGREE, MATCH_NEW, REFRESH_HOURS_CHOICES,
                            stop_using_source, subscribe_to_source, update_url_source,
                            use_source_again)
 from ..logo_cache import delete_cached_logos
-from ..tz_utils import format_local, get_display_tz, is_24h
+from ..tz_utils import format_local, get_display_tz, is_24h, parse_local_to_utc
+from ..account_blocks import (MAX_ACCOUNT_BLOCK_HOURS, account_limits, add_account_block,
+                              block_views,
+                              describe, end_account_block, rearm_waiting_starts,
+                              recording_blocks, set_recording_blocks)
 from ..ui_constants import PRESET_COLORS
 from ..url_utils import mask_url_path
 from .channels import _chunked, _DELETE_CHUNK_SIZE
@@ -183,6 +187,8 @@ def accounts_list():
         total_hidden_channels=total_hidden_channels,
         sync_sig=sync_sig,
         stats=stats,
+        blocks=block_views(account_ids),
+        conn_limits=account_limits(account_ids, cfg),
     )
 
 
@@ -323,6 +329,10 @@ def account_detail(account_id):
         window = account_stats_view.resolve_window(request.args.get('w'))
     except ValueError:
         abort(400, description=f"w must be one of {', '.join(WINDOWS)}")
+    # Read before the rows it vouches for, as accounts_list does: a sync that moves in
+    # between costs one extra refresh, where a signature read after would vouch for a state
+    # the page never showed. Scalars only, so the fold below expires nothing of it.
+    sync_sig = sync_signature()
     cfg = load_config()
     # First, before anything else is loaded: its catch-up fold may commit, which expires
     # every row already in the session. It loads the account too (dev/changelog/1029).
@@ -349,6 +359,9 @@ def account_detail(account_id):
         # menu and the mobile action sheet both light up correctly either way.
         xtream_debug=_xtream_debug_enabled(account),
         stats=stats,
+        blocks=block_views([account.id]).get(account.id, []),
+        block_max_hours=MAX_ACCOUNT_BLOCK_HOURS,
+        sync_sig=sync_sig,
         **payload,
     )
 
@@ -619,6 +632,8 @@ def _delete_account_and_jobs(account_id):
         # Not in the ORM cascade: the ledger has no relationship on Account, and a day row
         # left behind would credit a future account that reused the id.
         AccountStatDay.query.filter_by(account_id=account_id).delete(synchronize_session=False)
+        # Nor its blocks, which would otherwise block a future account that reused the id.
+        AccountBlock.query.filter_by(account_id=account_id).delete(synchronize_session=False)
         # Nor are its EPG sources, which may hold hundreds of thousands of rows across two
         # tables and are bulk-deleted rather than cascaded (DESIGN-epg-sources.md §9.5).
         delete_sources_for_account(account_id)
@@ -879,6 +894,64 @@ def delete_account_api(account_id):
     if name is None:
         return jsonify({'success': True, 'message': 'Account deleted.'})
     return jsonify({'success': True, 'message': f'Account "{name}" deleted.'})
+
+
+@accounts_bp.route('/api/accounts/<int:account_id>/blocks', methods=['POST'])
+def block_account_api(account_id):
+    """Block the account from now for a while (app/account_blocks.py). Body: `minutes`, or
+    `until` as a datetime-local value in the display timezone; optional `slots` (omitted or
+    null = every slot). Bounded at MAX_ACCOUNT_BLOCK_HOURS - a block is for a stretch of
+    time, and one long enough to forget about is the switch it exists to avoid."""
+    account, err = _json_account(account_id)
+    if err:
+        return err
+    data = request.get_json(silent=True) or {}
+    now = datetime.utcnow()
+    try:
+        if data.get('until'):
+            stop = parse_local_to_utc(str(data['until']))
+        else:
+            stop = now + timedelta(minutes=int(data.get('minutes')))
+    except (TypeError, ValueError):
+        return jsonify({'error': 'Say how long to block the account for.'}), 400
+    if stop <= now:
+        return jsonify({'error': 'That time has already passed.'}), 400
+    if stop - now > timedelta(hours=MAX_ACCOUNT_BLOCK_HOURS):
+        return jsonify({'error': f'A block can run for at most {MAX_ACCOUNT_BLOCK_HOURS} '
+                                 f'hours.'}), 400
+    slots = data.get('slots')
+    if slots in ('', None):
+        slots = None
+    else:
+        try:
+            slots = int(slots)
+        except (TypeError, ValueError):
+            return jsonify({'error': 'Slots must be a whole number.'}), 400
+        if slots < 1:
+            return jsonify({'error': 'Slots must be at least 1.'}), 400
+    add_account_block(account_id, stop, start=now, slots=slots)
+    return jsonify({'success': True,
+                    'message': f'{describe(account.name, stop, capital=True)}.'})
+
+
+@accounts_bp.route('/api/accounts/<int:account_id>/blocks/<int:block_id>', methods=['DELETE'])
+def unblock_account_api(account_id, block_id):
+    """End one block. A block set on a recording is taken off that recording, which says so
+    on its own timeline; any start that was waiting on the block is re-armed at once."""
+    account, err = _json_account(account_id)
+    if err:
+        return err
+    block = db.session.get(AccountBlock, block_id)
+    if block is None or block.account_id != account_id:
+        return jsonify({'error': 'Block not found.'}), 404
+    if block.recording_id is not None:
+        wanted = recording_blocks(block.recording_id)
+        wanted.pop(account_id, None)
+        set_recording_blocks(block.recording_id, wanted)
+    else:
+        end_account_block(block_id)
+    rearm_waiting_starts()
+    return jsonify({'success': True, 'message': f'Account "{account.name}" unblocked.'})
 
 
 @accounts_bp.route('/api/accounts/<int:account_id>/sync', methods=['POST'])

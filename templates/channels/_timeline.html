@@ -34,6 +34,7 @@
   'CHANNEL_GROUP_FORMAT_MISMATCH': 'neutral', 'CHANNEL_GROUP_FORMAT_RESOLVED': 'neutral',
   'CHANNEL_URL_CHANGED': 'neutral', 'CHANNEL_HIDE_OVERRIDE_CHANGED': 'neutral',
   'CHANNEL_HEALTH_ROLLBACK': 'neutral', 'CHANNEL_HEALTH_RECOMPUTED': 'neutral',
+  'CHANNEL_TEST_DELETED': 'neutral',
   'CHANNEL_EPG_SOURCE_CHANGED': 'neutral', 'CHANNEL_EPG_KEY_CHANGED': 'neutral',
   'CHANNEL_EPG_SOURCE_OVERRIDE_CHANGED': 'neutral',
   'GROUP_MEMBER_SELECTED': 'start', 'GROUP_FAILOVER': 'aborted',
@@ -62,6 +63,7 @@
   'GROUP_GUIDE_LISTINGS_SET': 'Guide Listings Changed',
   'GROUP_DEFAULT_PROFILE_SET': 'Default Profile Changed',
 } %}
+{% import '_macros.html' as tm %}
 <div class="ch-timeline-log">
   {% for entry in entries %}
   {# A test row is created with status='FAILED' as a placeholder and only gets its real
@@ -119,13 +121,9 @@
          A row that silently disagrees with the score is exactly the number nobody can
          explain, so it says so (app/health_recompute.py, dev/changelog/895). The entry is
          never hidden: it happened. #}
-      {% if entry.excluded %}
-      <span class="badge badge-cancelled tip-plain"
-            data-tip="Rolled back by hand.&#10;This observation no longer counts toward the channel's health score. The lifetime figure beside it is what it produced when it ran.">NOT COUNTED</span>
-      {% endif %}
+      {% if entry.excluded %}{{ tm.not_counted_badge() }}{% endif %}
       {% if entry.correction_excluded and not entry.excluded %}
-      <span class="badge badge-cancelled tip-plain"
-            data-tip="Rolled back by hand.&#10;This recording's post-process quality correction no longer counts toward the channel's health score.">CORRECTION NOT COUNTED</span>
+      {{ tm.not_counted_badge('CORRECTION NOT COUNTED', "This recording's post-process quality correction", false) }}
       {% endif %}
 
       {% if show_source and entry.source %}

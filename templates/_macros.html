@@ -168,6 +168,18 @@
   {%- endif %}
 {%- endmacro %}
 
+{# The account is blocked right now (app/account_blocks.py, dev/changelog/1151). Always
+   carries its end time: a bare "Blocked" on an account reads as the provider having blocked
+   it. `blocks` is the account's entry from account_blocks.block_views(). #}
+{% macro account_block_badge(blocks, tip=true) -%}
+  {%- set active = blocks | selectattr('active') | list %}
+  {%- if active %}
+  {%- set last = active | sort(attribute='stop') | last %}
+  {%- set part = last.slots %}
+  <span class="badge b-warn{% if tip %} tip-plain" data-tip="Blocked.&#10;Nothing in ChannelBin opens a stream on this account until {{ last.stop_label }} - no recording, failover, health check or preview - so a TV can watch live on it.{% endif %}">{% if part %}{{ part }} connection{{ 's' if part != 1 }} blocked{% else %}Blocked{% endif %} until {{ last.stop_label }}</span>
+  {%- endif %}
+{%- endmacro %}
+
 {# "When does this sync next", in the one spelling both the Accounts list and the
    Dashboard's Account sync status section use. Four states, each named: auto-sync turned
    off, a sync running now, a scheduled time, and nothing scheduled. The dashboard drew a
@@ -184,6 +196,14 @@
 {# Card header (3.3). #}
 {% macro stat_row(key, value, sv_cls=none, wide=false, tip=none) -%}
 <div class="srow{% if wide %} wide{% endif %}"><span class="sk">{{ key }}</span><span class="sv{% if sv_cls %} {{ sv_cls }}{% endif %}{% if tip %} tip-plain" data-tip="{{ tip }}{% endif %}">{{ value }}</span></div>
+{%- endmacro %}
+
+{# A health observation the user rolled back by hand (app/health_recompute.py): the row stays,
+   and says it no longer counts. `lifetime_note` is for a row that prints the lifetime score
+   it produced when it ran, which the channel's score no longer matches. #}
+{% macro not_counted_badge(label='NOT COUNTED', what='This observation', lifetime_note=true) -%}
+<span class="badge badge-cancelled tip-plain"
+      data-tip="Rolled back by hand.&#10;{{ what }} no longer counts toward the channel's health score.{% if lifetime_note %} The lifetime figure beside it is what it produced when it ran.{% endif %}">{{ label }}</span>
 {%- endmacro %}
 
 {# ── Field row (DESIGN.md 3.13/15.1) ─────────────────────────────────────

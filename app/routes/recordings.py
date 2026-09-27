@@ -25,8 +25,8 @@ from ..database import (
     CANCEL_BEFORE_START, CANCEL_DURING_ANALYSIS, CANCEL_DURING_CONVERSION,
 )
 from ..channel_groups import (pick_best_member, recording_members,
-                              format_eligible_members,
-                              DEFAULT_FAILING_STREAK_THRESHOLD)
+                              format_eligible_members, recording_formats,
+                              format_label, DEFAULT_FAILING_STREAK_THRESHOLD)
 from ..health_score import dismiss_recording_failing_alerts, evaluate_and_alert_recording
 from ..metadata_sidecar import globally_enabled
 from ..recording_metadata import (
@@ -40,6 +40,7 @@ from ..recorder import (
     finished_image_dirs, finished_image_path,
 )
 from ..tz_utils import parse_local_to_utc, local_input_value, format_local
+from ..account_blocks import recording_blocks, set_recording_blocks
 from ..accounts import normalize_url, normalize_url_loose
 from ..config import load_config, resolve_ffmpeg_path
 from ..logo_cache import resolve_logo_url
@@ -360,7 +361,7 @@ def _serialize_overlap_conflicts(conflicts):
 
 
 def _pending_recording_warnings(channel_id, group_id, start_utc, stop_utc,
-                                exclude_recording_id=None):
+                                exclude_recording_id=None, pending_blocks=None):
     """Every soft, proceedable schedule-time warning new_recording_json and
     edit_recording_json raise before committing a create/edit, in one place - the
     recording-scheduling counterpart to routes/channel_groups.py::_pending_warnings().
@@ -396,8 +397,62 @@ def _pending_recording_warnings(channel_id, group_id, start_utc, stop_utc,
             exclude_recording_id=exclude_recording_id)
         if limit_conflict:
             warnings['connection_limit_warning'] = limit_conflict
+        block_warning = _account_block_warning(ch, group_id, start_utc, stop_utc,
+                                               exclude_recording_id, pending_blocks)
+        if block_warning:
+            warnings['account_block_warning'] = block_warning
 
     return warnings
+
+
+def _account_block_warning(ch, group_id, start_utc, stop_utc, exclude_recording_id,
+                           pending_blocks):
+    """The account this recording would record from is blocked for some of its window
+    (app/account_blocks.py). Asked only when there is nowhere else to go - a single channel,
+    or a group whose every recording member is blocked then - since a group with an unblocked
+    member simply records from that one. Counts the blocks this very request is setting, so
+    "block the account I am recording from" is caught before it is saved."""
+    from ..account_blocks import blocked_account_ids, blocks_overlapping
+    if group_id is not None:
+        group = db.session.get(ChannelGroup, group_id)
+        accounts = {m.account_id for m in recording_members(group.memberships)} if group else set()
+    else:
+        accounts = {ch.account_id}
+    accounts.discard(None)
+    if not accounts:
+        return None
+    blocked = blocked_account_ids(accounts, start=start_utc, stop=stop_utc,
+                                  pending=pending_blocks,
+                                  exclude_recording_id=exclude_recording_id)
+    if blocked != accounts:
+        return None
+    windows = blocks_overlapping(start_utc, stop_utc, accounts, exclude_recording_id)
+    names = sorted(a.name for a in Account.query.filter(Account.id.in_(accounts)).all())
+    whole = (bool(pending_blocks) and set(pending_blocks) >= accounts) or any(
+        b.start <= start_utc and b.stop >= stop_utc for b in windows)
+    subject = ('this channel\'s account' if group_id is None
+               else 'every account this group can record from')
+    return {'message': (
+        f'{subject[0].upper()}{subject[1:]} ({", ".join(names)}) is blocked for '
+        + ('all' if whole else 'part') + ' of this window. The recording waits for the '
+        'block to end and records what is left'
+        + (', so as things stand it will not record anything.' if whole else '.'))}
+
+
+def _parse_block_form(form):
+    """The record modal's account-block picker, as {account_id: slots} (None = every slot),
+    or None when the picker never loaded - a failed lookup must leave a recording's blocks
+    alone rather than read as "block nothing"."""
+    if form.get('block_accounts_loaded') != '1':
+        return None
+    wanted = {}
+    for raw in form.getlist('block_account_ids'):
+        raw = raw.strip()
+        if not raw.isdigit():
+            continue
+        slots_raw = (form.get(f'block_slots_{raw}') or '').strip()
+        wanted[int(raw)] = int(slots_raw) if slots_raw.isdigit() and int(slots_raw) > 0 else None
+    return wanted
 
 
 def _members_committed_in_window(members, start_utc, stop_utc, exclude_recording_id=None):
@@ -446,7 +501,7 @@ def _members_committed_in_window(members, start_utc, stop_utc, exclude_recording
 
 
 def _resolve_group_member(group, channel_id, start_utc, stop_utc, streak_threshold,
-                          exclude_recording_id=None):
+                          exclude_recording_id=None, pending_blocks=None):
     """The member a group-backed recording should be stamped with for [start_utc, stop_utc).
 
     Returns (channel_id, reason). The supplied `channel_id` is kept (reason None) unless it
@@ -461,12 +516,20 @@ def _resolve_group_member(group, channel_id, start_utc, stop_utc, streak_thresho
     Shared by create and edit so the two cannot disagree (dev/changelog/855, 1025).
     """
     from .channel_tests import _latest_tests_by_channel
+    from ..account_blocks import blocked_account_ids
     enabled = recording_members(group.memberships)
     latest_by_channel = _latest_tests_by_channel([ch.id for ch in enabled])
     # Format lock filters, health score ranks (DESIGN-channel-groups-model.md 5).
     active = format_eligible_members(group, enabled, latest_by_channel).members
     committed = _members_committed_in_window(
         active, start_utc, stop_utc, exclude_recording_id=exclude_recording_id)
+    # A member on an account blocked in this window is as unusable as one on a full
+    # account - including a block this same request is setting (dev/changelog/1151). Only
+    # the stamp: record start re-decides against the blocks as they stand then.
+    blocked = blocked_account_ids({ch.account_id for ch in active}, start=start_utc,
+                                  stop=stop_utc, pending=pending_blocks,
+                                  exclude_recording_id=exclude_recording_id)
+    committed |= {ch.id for ch in active if ch.account_id in blocked}
 
     supplied_is_member = (channel_id is not None
                           and channel_id in {m.channel_id for m in group.memberships})
@@ -480,6 +543,8 @@ def _resolve_group_member(group, channel_id, start_utc, stop_utc, streak_thresho
         reason = 'it is no longer enabled for recording in this group'
     elif channel_id not in active_ids:
         reason = "it does not match the group's format lock"
+    elif _account_of(active, channel_id) in blocked:
+        reason = 'its account is blocked in this window'
     else:
         reason = 'its account has no free connection in this window'
 
@@ -494,6 +559,10 @@ def _resolve_group_member(group, channel_id, start_utc, stop_utc, streak_thresho
     if member is None:
         return None, None
     return member.id, reason
+
+
+def _account_of(members, channel_id):
+    return next((ch.account_id for ch in members if ch.id == channel_id), None)
 
 
 # ── Recordings list row model (design-system reference page 1) ──────────────
@@ -532,7 +601,11 @@ def _tech_parts(rec):
     explicit fallback for pre-probe rows (those describe the final/converted
     file - the 'output' source label keeps that honest). (None, None, None)
     when nothing is known."""
+    # An excluded segment was never joined into the file, and a discarded placeholder has
+    # its own resolution and frame rate (dev/changelog/957).
     for s in reversed(rec.segments):
+        if s.excluded:
+            continue
         if s.probe_resolution or s.probe_audio_codec:
             return (_fmt_video(s.probe_resolution, s.probe_fps),
                     _fmt_audio(s.probe_audio_codec, s.probe_audio_channels),
@@ -581,7 +654,7 @@ def _format_profile(rec):
     interlaced = is_vfr = None
     fps = None
     for s in reversed(rec.segments):
-        if s.probe_video_codec:
+        if s.probe_video_codec and not s.excluded:
             src = 'capture'
             codec, pix_fmt, depth = s.probe_video_codec, s.probe_pix_fmt, s.probe_bit_depth
             chroma, coded = s.probe_chroma_subsampling, s.probe_coded_resolution
@@ -925,19 +998,28 @@ def _index_row(rec, now, tz, thumb_ids, live_seg_bytes=0):
     # had to change channels at least once (same-account restart never changes channel_id).
     distinct_channels = len({s.channel_id for s in rec.segments if s.channel_id is not None})
     spanned = f' Spanned {distinct_channels} channels.' if distinct_channels > 1 else ''
+    # A mixed-format file plays (dev/changelog/754), so this adds a sentence rather than moving
+    # the pill - what it corrects is a tooltip calling the file a clean, uniform capture.
+    formats = recording_formats(rec.segments)
+    format_change = None
+    if len(formats) > 1:
+        format_change = (f'Format changed mid-recording: '
+                         f'{", then ".join(format_label(k) for k in formats)}. The file plays, '
+                         f'but its header describes only {format_label(formats[0])}.')
+    format_tail = f' {format_change}' if format_change else ''
     if not rec.segments:
         health = {'cls': 'na', 'label': '-', 'tip': None}
     elif rec.status == REC_STATUS_FAILED:
         health = {'cls': 'bad', 'label': f'⚠ {stalls + (rec.consecutive_failures or 0)}',
                   'tip': (f'{len(rec.segments)} segments · {stalls} stalls · '
                           f'{rec.consecutive_failures or 0} consecutive failed restarts. '
-                          f'Partial file kept on disk.{missing}{spanned}')}
+                          f'Partial file kept on disk.{missing}{spanned}{format_tail}')}
     elif stalls > 0:
         downtime = (f' {fmt_utils.fmt_duration(rec.total_downtime_seconds, with_seconds=True)} '
                     f'with nothing being written.') if rec.total_downtime_seconds else ''
         health = {'cls': 'warn', 'label': f'⚠ {stalls}',
                   'tip': (f'{len(rec.segments)} segments · {stalls} stalls, recovered '
-                          f'automatically.{downtime}{missing}{spanned}')}
+                          f'automatically.{downtime}{missing}{spanned}{format_tail}')}
     elif rec.fast_delivery_segment_count:
         # A frozen or looping feed writes bytes at full rate and keeps ffmpeg's frame counter
         # moving, so it never stalls and never restarts - which meant this row read a green
@@ -947,11 +1029,12 @@ def _index_row(rec, now, tz, thumb_ids, live_seg_bytes=0):
         health = {'cls': 'warn', 'label': '⚠',
                   'tip': (f'{len(rec.segments)} segment'
                           f'{"s" if len(rec.segments) != 1 else ""} · 0 stalls, but the '
-                          f'capture was not clean.{missing}{spanned}')}
+                          f'capture was not clean.{missing}{spanned}{format_tail}')}
     else:
+        clean = '' if format_change else ' - clean capture'
         health = {'cls': 'ok', 'label': '✓',
                   'tip': (f'{len(rec.segments)} segment{"s" if len(rec.segments) != 1 else ""} '
-                          f'· 0 stalls - clean capture.{missing}{spanned}')}
+                          f'· 0 stalls{clean}.{missing}{spanned}{format_tail}')}
 
     video, audio, tech_source = _tech_parts(rec)
     tech_line = ' · '.join(p for p in (video, audio) if p) or None
@@ -1016,7 +1099,7 @@ def _index_row(rec, now, tz, thumb_ids, live_seg_bytes=0):
         'day': day, 'start': rec.start_time, 'stop': rec.stop_time, 'rel': rel,
         'dur_str': fmt_utils.fmt_duration(dur_secs), 'dur_flag': dur_flag, 'dur_tip': dur_tip,
         'size_num': size_num, 'size_unit': size_unit, 'rate': rate,
-        'health': health,
+        'health': health, 'format_change': format_change,
         'progress_pct': progress_pct,
         'output_file': os.path.basename(rec.output_path) if rec.output_path else None,
         'edit': edit,
@@ -1326,7 +1409,21 @@ def recording_detail(recording_id):
         find_airing_url=find_airing_url,
         meta_panel=_metadata_panel(rec, cfg),
         profiles=profiles,  # _record_modal.html + GUIDE_CONFIG.profiles expect this name
+        blocked_accounts=_recording_block_labels(rec.id),
     )
+
+
+def _recording_block_labels(recording_id):
+    """'"Provider A"', '"Provider B" (1 connection)' - the accounts this recording blocks,
+    for its detail page. Two statements whatever the count."""
+    wanted = recording_blocks(recording_id)
+    if not wanted:
+        return []
+    names = {a.id: a.name for a in Account.query.filter(Account.id.in_(wanted)).all()}
+    return [f'"{names[aid]}"' + ('' if slots is None else
+                                 f' ({slots} connection{"s" if slots != 1 else ""})')
+            for aid, slots in sorted(wanted.items(), key=lambda kv: names.get(kv[0], ''))
+            if aid in names]
 
 
 #: Where a recording is in its life, for copy that has to be honest about what a save will
@@ -1869,6 +1966,7 @@ def new_recording_json():
     # being replaced when it reads the window's existing commitments.
     replace_raw = request.form.get('replace_recording_id', '').strip()
     replace_recording_id = int(replace_raw) if replace_raw.isdigit() else None
+    wanted_blocks = _parse_block_form(request.form)
 
     # Group-backed recording (created from a channel-group guide row): channel_id must
     # be a member; the best member is re-resolved at record start (app/recorder.py).
@@ -1892,7 +1990,7 @@ def new_recording_json():
                 'failing_streak_threshold', DEFAULT_FAILING_STREAK_THRESHOLD)
             resolved, _reason = _resolve_group_member(
                 group, channel_id, start_utc, stop_utc, streak_threshold,
-                exclude_recording_id=replace_recording_id)
+                exclude_recording_id=replace_recording_id, pending_blocks=wanted_blocks)
             if resolved is None:
                 group_id = None
             else:
@@ -1912,7 +2010,7 @@ def new_recording_json():
     if not force:
         warnings = _pending_recording_warnings(
             channel_id, group_id, start_utc, stop_utc,
-            exclude_recording_id=replace_recording_id)
+            exclude_recording_id=replace_recording_id, pending_blocks=wanted_blocks)
         if warnings:
             return jsonify({'success': False, **warnings})
 
@@ -1979,6 +2077,11 @@ def new_recording_json():
         return r
 
     rec = _create_recording_and_commit()
+
+    # Saved before the start is armed, so a recording created after its own start time
+    # never opens a stream on an account it was asked to keep off.
+    if wanted_blocks:
+        set_recording_blocks(rec.id, wanted_blocks)
 
     if created_after_start:
         @retry_on_locked()
@@ -2118,6 +2221,12 @@ def edit_recording_json(recording_id):
     if errors:
         return jsonify({'error': ' '.join(errors)}), 400
 
+    wanted_blocks = _parse_block_form(request.form)
+    # The blocks this edit will leave in place, for the member stamp and the warning. The
+    # recording's current ones are excluded from both reads by its own id.
+    pending_blocks = (wanted_blocks if wanted_blocks is not None
+                      else recording_blocks(recording_id))
+
     # A group recording's member was chosen for its old window; ask the same question
     # of the new one, exactly as create does (dev/changelog/1025).
     channel_id, member_reason = rec.channel_id, None
@@ -2126,7 +2235,7 @@ def edit_recording_json(recording_id):
             'failing_streak_threshold', DEFAULT_FAILING_STREAK_THRESHOLD)
         resolved, reason = _resolve_group_member(
             rec.group, rec.channel_id, start_utc, stop_utc, streak_threshold,
-            exclude_recording_id=recording_id)
+            exclude_recording_id=recording_id, pending_blocks=pending_blocks)
         if resolved is not None and resolved != rec.channel_id:
             channel_id, member_reason = resolved, reason
 
@@ -2134,12 +2243,16 @@ def edit_recording_json(recording_id):
     if not force:
         warnings = _pending_recording_warnings(
             channel_id, rec.group_id, start_utc, stop_utc,
-            exclude_recording_id=recording_id)
+            exclude_recording_id=recording_id, pending_blocks=pending_blocks)
         if warnings:
             return jsonify({'success': False, **warnings})
 
     profile_id_raw = request.form.get('profile_id', '').strip()
     profile_id = int(profile_id_raw) if profile_id_raw.isdigit() else None
+
+    if wanted_blocks is not None and set_recording_blocks(recording_id, wanted_blocks):
+        from ..account_blocks import rearm_waiting_starts
+        rearm_waiting_starts()
 
     _apply_edit_and_reschedule(
         recording_id, name, url, start_utc, stop_utc, profile_id=profile_id,
@@ -2147,6 +2260,57 @@ def edit_recording_json(recording_id):
         member_reason=member_reason)
 
     return jsonify({'success': True})
+
+
+@recordings_bp.route('/api/account-blocks/options')
+def account_block_options():
+    """What the record modal's "Block account use during this recording" picker offers: every
+    account, its connection limit (a slot count is only asked for above one), and - with
+    `recording_id` - which of them that recording already blocks."""
+    from ..account_blocks import account_limits
+    rid = request.args.get('recording_id', '').strip()
+    current = recording_blocks(int(rid)) if rid.isdigit() else {}
+    accounts = Account.query.order_by(Account.name).all()
+    limits = account_limits([a.id for a in accounts])
+    return jsonify({'success': True, 'accounts': [{
+        'id': a.id,
+        'name': a.name,
+        'color': a.color,
+        'limit': limits.get(a.id, 1),
+        'blocked': a.id in current,
+        'slots': current.get(a.id),
+    } for a in accounts]})
+
+
+@recordings_bp.route('/api/recordings/<int:recording_id>/account-blocks', methods=['POST'])
+def set_recording_account_blocks(recording_id):
+    """Replace the accounts a recording blocks, for as long as it can still open a stream -
+    the in-progress modal's picker. Body: {"blocks": [{"account_id": 1, "slots": null}]}.
+    A live recording on an account this blocks moves off it within its watchdog's next
+    block check (app/watchdog.py::_check_account_block)."""
+    from ..account_blocks import rearm_waiting_starts
+    from ..database import WINDOW_OPEN_STATUSES
+    rec = db.session.get(Recording, recording_id)
+    if rec is None:
+        return jsonify({'error': 'Recording not found.'}), 404
+    if rec.status not in (REC_STATUS_SCHEDULED,) + tuple(WINDOW_OPEN_STATUSES):
+        return jsonify({'error': 'Only a scheduled or running recording can block accounts.'}), 400
+    data = request.get_json(silent=True) or {}
+    wanted = {}
+    for item in data.get('blocks') or []:
+        try:
+            aid = int(item.get('account_id'))
+            slots = item.get('slots')
+            slots = None if slots in (None, '') else int(slots)
+        except (AttributeError, TypeError, ValueError):
+            return jsonify({'error': 'Each block needs an account_id and optional slots.'}), 400
+        if slots is not None and slots < 1:
+            return jsonify({'error': 'Slots must be at least 1.'}), 400
+        wanted[aid] = slots
+    if set_recording_blocks(recording_id, wanted):
+        rearm_waiting_starts()
+        return jsonify({'success': True, 'message': 'Blocked accounts updated.'})
+    return jsonify({'success': True, 'message': 'Nothing to change.'})
 
 
 @recordings_bp.route('/recordings/<int:recording_id>/delete-json', methods=['POST'])

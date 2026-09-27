@@ -36,6 +36,7 @@ decision from section 17 that a careless edit would quietly undo:
 Runs against a throwaway temp SQLite DB - never the live dvr.db.
   python3 -m unittest tests.test_accounts_page_conformance
 """
+import json
 import os
 import re
 import sys
@@ -347,6 +348,17 @@ class AccountPageTests(unittest.TestCase):
         self.assertNotIn('added', activity)
         self.assertNotIn('removed', activity)
 
+    def test_activity_reads_a_running_sync_as_started(self):
+        """dev/docs/BUGS.md 2026-09-27 @ 04:50:19 PM: a running sync's log row says
+        IN_PROGRESS, and the Activity line printed that word under a green dot."""
+        acc = _account('Running', 'SYNCING')
+        _sync_log(acc, status='IN_PROGRESS', minutes_ago=2, seconds=None, channels=0, epg=0)
+        db.session.commit()
+        activity = self._activity(acc)
+        self.assertIn('Sync started.', activity)
+        self.assertIn('acct-act-dot live', activity)
+        self.assertNotIn('IN_PROGRESS', activity)
+
     def _content(self, account):
         return self._get(account).split('data-section="content"')[1].split('data-section=')[0]
 
@@ -413,9 +425,10 @@ class AccountPageTests(unittest.TestCase):
         self.assertIn('All 14 syncs', html)
         # The rows themselves are rendered by account-detail.js from this blob, which is
         # the ONE shape both the first paint and the expand-in-place fetch read.
-        blob = re.search(r'\n  logs: (\[.*?\]),\n', html, re.S)
+        blob = re.search(r'<script type="application/json" id="acct-state">(.*?)</script>',
+                         html, re.S)
         self.assertIsNotNone(blob, 'the history renderer needs its data blob')
-        self.assertEqual(blob.group(1).count('"started_at"'), 10)
+        self.assertEqual(len(json.loads(blob.group(1))['logs']), 10)
 
     def test_no_expand_control_when_everything_already_fits(self):
         acc = _account('Quiet', 'OK')
@@ -693,13 +706,14 @@ class AccountsListRowTests(unittest.TestCase):
 
     def test_the_kebab_offers_exactly_the_settled_action_list(self):
         """17.5 item 2. Re-normalize URLs is not offered here; everything else the
-        old card's seven loose buttons did has a home here or on the account page."""
+        old card's seven loose buttons did has a home here or on the account page. Block
+        account use joined the list in dev/changelog/1151."""
         _account('Kebab', 'OK')
         db.session.commit()
         _, rows = self._rows()
         row = rows[0]
         self.assertEqual(set(re.findall(r'data-act="([\w-]+)"', row)),
-                         {'sync', 'force-epg', 'settings', 'delete'})
+                         {'sync', 'force-epg', 'block', 'settings', 'delete'})
         self.assertIn('>Browse channels<', row)
         self.assertNotIn('Re-normalize', row)
 

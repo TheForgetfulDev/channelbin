@@ -25,6 +25,14 @@ log = logging.getLogger(__name__)
 _PROBE_MIN_BYTES = 2 * 1024 * 1024
 _PROBE_MAX_ATTEMPTS = 3
 
+# How often a live recording asks whether the user has blocked the account it is on
+# (app/account_blocks.py), and how long it waits to ask again after finding nowhere else to
+# go. The first is the whole latency of "block an account and the recording moves off it";
+# the second keeps a recording with no alternative from re-trying the move every poll
+# (dev/changelog/1151).
+_BLOCK_CHECK_SECONDS = 15
+_BLOCK_STAY_RECHECK_SECONDS = 300
+
 # Dead-stream retry backoff (Product Principle 2), deliberately hardcoded (2026-08-12) - only
 # the total attempt cap (watchdog.dead_stream_max_retry_attempts) is configurable, not this
 # cadence.
@@ -194,6 +202,11 @@ class WatchdogThread(threading.Thread):
         self.recording_id = recording_id
         self.state = state        # RecordingState from recorder.py
         self.app = app
+        # Account-block checks (_check_account_block): when to ask next, and the
+        # (member, account) this recording last said it is staying on, so the "nowhere to
+        # move" event is written once per block rather than once per check.
+        self._block_check_at = 0.0
+        self._block_stay_noted = None
 
     def run(self):
         from .config import load_config
@@ -291,6 +304,17 @@ class WatchdogThread(threading.Thread):
                 while not self.state.stop_event.is_set():
                     # Publish stats snapshot
                     self._publish_snapshot(cfg)
+
+                    # The user blocked the account this segment is on: move to another
+                    # member at a boundary we make ourselves, or stay and say so.
+                    if time.monotonic() >= self._block_check_at:
+                        if self._check_account_block(seg_num):
+                            member_stall_times = []
+                            member_stall_channel_id = None
+                            member_fast_delivery_strikes = 0
+                            member_fast_delivery_channel_id = None
+                            early_fail_times.clear()
+                            break
 
                     try:
                         current_size = os.path.getsize(seg_path)
@@ -1031,6 +1055,69 @@ class WatchdogThread(threading.Thread):
                 # ── End inner loop ───────────────────────────────────────────
 
             log.info('Watchdog exiting for recording %d (stop_event set)', self.recording_id)
+
+    def _check_account_block(self, seg_num: int) -> bool:
+        """Move this recording off an account the user has blocked since it started, or
+        stay on it and say why. Returns True when it moved and the next segment has been
+        launched - the caller then leaves this segment's poll loop.
+
+        A block set after a recording started is the case this exists for: the TV is about
+        to take the account's one connection, so a group recording moves to a member on
+        another account. With nowhere to go - a single channel, or every other member
+        blocked too - the capture carries on rather than a setting killing it
+        (dev/changelog/1151). Neither outcome is scored against anything."""
+        from . import db
+        from . import connection_limits as connlim
+        from .database import Channel, Recording, DIAGNOSTICS
+        from .account_blocks import describe, free_at
+
+        self._block_check_at = time.monotonic() + _BLOCK_CHECK_SECONDS
+        # Read fresh: a failover commits from its own app context, so this thread's session
+        # can still be holding the member the recording was on before it.
+        rec = db.session.get(Recording, self.recording_id, populate_existing=True)
+        channel = db.session.get(Channel, rec.channel_id) if rec and rec.channel_id else None
+        if channel is None:
+            return False
+        account_id = channel.account_id
+        if not connlim.must_yield_to_block(account_id, self.recording_id):
+            self._block_stay_noted = None
+            return False
+
+        why = describe(channel.account.name, free_at(account_id), capital=True)
+        if rec.group_id is not None:
+            from .recorder import failover_group_member, _launch_segment, _close_active_segment
+            if failover_group_member(self.app, self.recording_id, why, block_move=True):
+                terminate_or_kill(self.state.process)
+                _close_active_segment(self.app, self.recording_id, exit_reason='ACCOUNT_BLOCKED')
+                _launch_segment(self.app, self.recording_id, seg_num + 1)
+                self._block_stay_noted = None
+                return True
+
+        self._block_check_at = time.monotonic() + _BLOCK_STAY_RECHECK_SECONDS
+        key = (channel.id, account_id)
+        if self._block_stay_noted == key:
+            return False
+        self._block_stay_noted = key
+        where = ('it has no member on an account that is not blocked'
+                 if rec.group_id is not None else 'it records from a single channel')
+        channel_name = channel.name
+        log.warning('Recording %d: %s, but %s - staying on "%s"',
+                    self.recording_id, why, where, channel_name)
+
+        @retry_on_locked()
+        def _note_block_stay_and_commit():
+            add_recording_event(
+                self.recording_id, DIAGNOSTICS,
+                detail=(f'{why}, but {where}, so it keeps recording from "{channel_name}" '
+                        f'rather than stopping a live capture. The block still keeps '
+                        f'everything else off the account.'),
+                segment_number=seg_num,
+                extra={'kind': 'account_block_stayed', 'account_id': account_id,
+                       'channel_id': key[0]})
+            db.session.commit()
+
+        _note_block_stay_and_commit()
+        return False
 
     def _classify_placeholder(self, seg, wall_seconds, exit_code, proc_exited, last_size,
                               factor):

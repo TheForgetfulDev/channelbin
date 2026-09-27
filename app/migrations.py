@@ -2758,6 +2758,32 @@ def _m080_start_deferred(conn, cur):
     conn.commit()
 
 
+def _m081_account_blocks(conn, cur):
+    """account_blocks: the stretches of time the user has told ChannelBin to keep off an
+    account (app/account_blocks.py, dev/changelog/1151).
+
+    No backfill and no obligation to register (dev/changelog/686): an upgrading database has
+    no blocks, and "nothing is blocked" is exactly what it meant before this table existed.
+
+    CREATE TABLE/INDEX IF NOT EXISTS throughout, so this step is re-runnable from the top."""
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS account_blocks (
+            id           INTEGER PRIMARY KEY,
+            account_id   INTEGER NOT NULL REFERENCES accounts(id),
+            recording_id INTEGER REFERENCES recordings(id),
+            start_time   DATETIME,
+            stop_time    DATETIME,
+            slots        INTEGER,
+            created_at   DATETIME NOT NULL
+        )
+    ''')
+    cur.execute('CREATE INDEX IF NOT EXISTS ix_account_blocks_account_id '
+                'ON account_blocks (account_id)')
+    cur.execute('CREATE INDEX IF NOT EXISTS ix_account_blocks_recording_id '
+                'ON account_blocks (recording_id)')
+    conn.commit()
+
+
 SCHEMA_MIGRATIONS = [
     (1, 'baseline: pre-versioning additive migrations + backfills', _m001_baseline),
     (2, 'recordings: program_title/program_sub_title snapshot columns + backfill', _m002_program_title),
@@ -2921,6 +2947,8 @@ SCHEMA_MIGRATIONS = [
      _m079_postcapture_outcome_event_types),
     (80, 'recordings: start_deferred_since/_for, when a held start began waiting and what '
      'for', _m080_start_deferred),
+    (81, 'account_blocks: time windows the user keeps ChannelBin off an account',
+     _m081_account_blocks),
 ]
 
 CURRENT_SCHEMA_VERSION = SCHEMA_MIGRATIONS[-1][0]

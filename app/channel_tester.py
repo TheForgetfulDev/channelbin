@@ -1107,6 +1107,13 @@ def run_pre_check(app, recording_id: int):
                         from .recorder import _busy_channel_ids
                         from .routes.channel_tests import _latest_tests_by_channel
                         members = recording_members(rec.group.memberships)
+                        # Blocks are asked about at the recording's START, not now: a block
+                        # set on this recording begins when it does, and this runs minutes
+                        # ahead of it (dev/changelog/1151).
+                        from .account_blocks import blocked_account_ids, split_blocked
+                        unblocked, _ = split_blocked(members, blocked_account_ids(
+                            {ch.account_id for ch in members}, at=rec.start_time))
+                        members = unblocked or members
                         latest_by_channel = _latest_tests_by_channel([ch.id for ch in members])
                         # The format lock filters here too, or this pre-checks a member
                         # record start would have skipped - the shape this block promises
@@ -1128,6 +1135,17 @@ def run_pre_check(app, recording_id: int):
                                   recording_id)
                     channel_id = None
                     skip_reason = 'Could not resolve a channel to pre-check'
+                if channel_id is not None and skip_reason is None:
+                    # Nothing to learn from a channel the recording cannot start on, and the
+                    # test itself would open the connection the block exists to keep free.
+                    from .account_blocks import blocked_account_ids, describe, free_at
+                    target = db.session.get(Channel, channel_id)
+                    if target is not None and blocked_account_ids(
+                            [target.account_id], at=rec.start_time):
+                        until = free_at(target.account_id, rec.start_time)
+                        skip_reason = (describe(target.account.name, until, capital=True)
+                                       + ' when this recording starts')
+                        channel_id = None
                 if channel_id is None:
                     if skip_reason is None:
                         skip_reason = 'No selectable channel to pre-check (direct or via group)'
@@ -1296,6 +1314,14 @@ def run_channel_test(app, channel_id: int, job_id: Optional[int] = None,
         account_id = ch.account_id
 
         if not connlim.try_acquire(account_id, 'test', channel_id):
+            # A block is not a limit being hit and must not read as one: the user asked for
+            # the account to be left alone, and this skip is that request being honored.
+            from .account_blocks import blocked_reason
+            blocked = blocked_reason(account_id, ch.account.name if ch.account else f'#{account_id}')
+            if blocked:
+                log.info('Channel %d: skipping test - %s', channel_id, blocked)
+                _append_log('INFO', f'Skipped test - {blocked}')
+                return None
             log.info('Channel %d: skipping test - account %d at its connection limit', channel_id, account_id)
             _append_log('WARN', 'Skipped test - account at its connection limit (in use by a recording)')
             return None
