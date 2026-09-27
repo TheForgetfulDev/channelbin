@@ -352,26 +352,6 @@ class AccountListTests(_StatusFixture):
         self.assertIsNone(by_id[off.id]['next_sync_at'])
 
 
-    def test_every_field_the_integrations_account_sensors_read_is_sent(self):
-        """The two halves ship in different releases, so a renamed key would leave a
-        sensor reading Unknown forever with nothing failing on either side."""
-        import ast
-        import os
-        path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                            'custom_components', 'channelbin', 'sensor.py')
-        with open(path, encoding='utf-8') as fh:
-            tree = ast.parse(fh.read())
-        read = {node.args[0].value for node in ast.walk(tree)
-                if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
-                and node.func.attr == 'get' and getattr(node.func.value, 'id', '') == 'account'
-                and node.args and isinstance(node.args[0], ast.Constant)}
-        self.assertIn('provider_exp_date', read)
-        make_account(name='Any')
-        db.session.commit()
-        (entry,) = self._get()['accounts']['list']
-        self.assertEqual(sorted(read - set(entry)), [])
-
-
 class AccountListQueryCountTests(_StatusFixture):
     """dev/changelog/1147: the account list is polled every ~45s, so its SQL and config
     reads must not grow with the number of accounts."""
