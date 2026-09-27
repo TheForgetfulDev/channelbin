@@ -1167,6 +1167,7 @@
               <th>Screenshot</th>
               <th title="This test's own 0-100 quality score">Score</th>
               <th title="Channel's lifetime score immediately after this test">Lifetime</th>
+              <th></th>
             </tr>
           </thead>
           <tbody>
@@ -1180,6 +1181,7 @@
                 <span class="badge badge-{{ t.status | lower }}"
                       {% if t.error_detail %}title="{{ t.status }}: {{ t.error_detail }}"{% endif %}>{{ t.status }}</span>
                 {% endif %}
+                {% if t.id in excluded_test_ids %}{{ m.not_counted_badge(what='This health check') }}{% endif %}
               </td>
               <td data-label="Resolution">{{ t.resolution or '--' }}</td>
               <td data-label="Profile">
@@ -1244,6 +1246,18 @@
               </td>
               <td data-label="Score" class="text-muted small">{{ t.quality_score if t.quality_score is not none else '--' }}</td>
               <td data-label="Lifetime" class="text-muted small">{{ t.lifetime_score_after if t.lifetime_score_after is not none else '--' }}</td>
+              <td class="num">
+                {# No delete while the check is still running against this row - the route
+                   refuses it too (routes/channels.py::_deletable_test_or_error). #}
+                {% if t.id != in_progress_test_id %}
+                <span class="menu-wrap">
+                  <button class="btn btn-sm btn-icon" data-menu aria-label="Actions for this health check">&#8943;</button>
+                  <div class="menu pop-left">
+                    <button class="menu-item danger" data-act="delete-test" data-test-id="{{ t.id }}">Delete test&hellip;</button>
+                  </div>
+                </span>
+                {% endif %}
+              </td>
             </tr>
             {% endfor %}
           </tbody>
@@ -1348,6 +1362,7 @@ window.CHANNEL_DETAIL = {
     channelsHub: '{{ url_for("channels.channel_browser") }}',
     hide: '{{ url_for("channels.hide_channel", channel_id=channel.id) }}',
     healthRollback: '{{ url_for("channels.rollback_health_score", channel_id=channel.id) }}',
+    testBase: '/api/channels/{{ channel.id }}/tests/',  // + id + /delete-preview | /delete
     epgKey: '{{ url_for("channels.set_channel_epg_key", channel_id=channel.id) }}',
     epgOverride: '{{ url_for("channels.set_channel_epg_source_override", channel_id=channel.id) }}',
     epgKeyLookup: '{{ url_for("channels.lookup_channel_epg_key", channel_id=channel.id) }}',

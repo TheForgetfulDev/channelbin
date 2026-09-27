@@ -313,9 +313,10 @@ class PagesCarryThePromptTests(unittest.TestCase):
 
     def test_the_account_page_carries_it(self):
         page = self._get(f'/accounts/{self.account_id}')
-        m = re.search(r'syncPrompt: (\{.*?\}),\n', page)
+        # In the page's swapped state blob, so a refresh carries the new one (dev/changelog/1152).
+        m = re.search(r'<script type="application/json" id="acct-state">(.*?)</script>', page, re.S)
         self.assertIsNotNone(m)
-        self.assertEqual(json.loads(m.group(1)), self._expected())
+        self.assertEqual(json.loads(m.group(1))['syncPrompt'], self._expected())
 
 
 if __name__ == '__main__':

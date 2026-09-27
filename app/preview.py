@@ -226,6 +226,12 @@ def start_preview(channel_id: int) -> PreviewSession:
         _prune_ended_locked()
 
     if not connlim.try_acquire(channel.account_id, 'preview', session.id):
+        from .account_blocks import blocked_reason
+        blocked = blocked_reason(channel.account_id, account.name, capital=True)
+        if blocked:
+            _finish(session, REASON_LAUNCH_FAILED, detail='account blocked')
+            raise PreviewRefused(f'{blocked}. Unblock it on its '
+                                 f'account page to preview here.', 409)
         who = connlim.describe_holders(channel.account_id)
         _finish(session, REASON_LAUNCH_FAILED, detail='account at its connection limit')
         raise PreviewRefused(

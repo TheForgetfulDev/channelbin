@@ -30,7 +30,7 @@ from .database import (
     REC_STATUS_SCHEDULED, REC_STATUS_IN_PROGRESS, REC_STATUS_PAUSED, REC_STATUS_RETRYING,
     REC_STATUS_FAILED, REC_STATUS_ABORTED,
     FAILURE_CONVERSION_COLLISION, FAILURE_CONNECTION_SLOT_TIMEOUT, FAILURE_DVR_DIR_UNUSABLE,
-    FAILURE_LAUNCH_FAILED,
+    FAILURE_LAUNCH_FAILED, FAILURE_ACCOUNT_BLOCKED,
     CANCEL_DURING_CAPTURE,
 )
 from .channel_groups import (effective_score, pick_best_member, recording_members,
@@ -795,6 +795,18 @@ def start_recording(app, recording_id: int):
             # recording is not a failover candidate
             # (app/channel_groups.py::recording_members).
             members = recording_members(rec.group.memberships)
+            # Members on an account the user has blocked are dropped first, before the
+            # format lock, like a member that already failed - a blocked one must never be
+            # the lone survivor that suppresses the lock's zero-survivors override. When
+            # every member is blocked they all stay, and the slot acquire below refuses and
+            # defers: the recording waits for a block to end (dev/changelog/1151).
+            from .account_blocks import blocked_account_ids, split_blocked
+            blocked_ids = blocked_account_ids({ch.account_id for ch in members})
+            unblocked, skipped_blocked = split_blocked(members, blocked_ids)
+            if unblocked:
+                members = unblocked
+            else:
+                skipped_blocked = []
             from .routes.channel_tests import _latest_tests_by_channel
             latest_by_channel = _latest_tests_by_channel([ch.id for ch in members])
             # Format lock filters, health score ranks (DESIGN-channel-groups-model.md 5).
@@ -844,6 +856,13 @@ def start_recording(app, recording_id: int):
                 elif skipped_busy_account:
                     busy_note += (' - rolled over to a free account, past: '
                                   + ', '.join(f'"{ch.name}"' for ch in skipped_busy_account))
+                if skipped_blocked:
+                    busy_note += (' - skipped member(s) on a blocked account: '
+                                  + ', '.join(f'"{ch.name}" ({ch.account.name})'
+                                              for ch in skipped_blocked))
+                elif best.account_id in blocked_ids:
+                    busy_note += (f' - every member is on a blocked account, so the start '
+                                  f'waits for the block on "{best.account.name}" to end')
 
                 # The group's lock left nothing eligible and we are recording anyway
                 # (DESIGN-channel-groups-model.md 15.2). Principle 2 says complete the
@@ -856,22 +875,37 @@ def start_recording(app, recording_id: int):
                         f'Recorded from "{best.name}" at {got}. This group is locked to '
                         f'{format_label(selection.reference)} and no member matched.')
 
+                selected_detail = (f'Group "{rec.group.name}": recording from "{best.name}" '
+                                   f'({best.account.name}, score {effective_score(best)})'
+                                   f'{busy_note}')
+                # A start that is waiting re-enters here on every retry. The member it names
+                # is re-decided each time and written to the row, but the event is written
+                # only when what it says has changed - otherwise a two-hour wait on a
+                # blocked account buries the recording's history under identical rows.
+                last_selected = (RecordingEvent.query
+                                 .filter_by(recording_id=recording_id,
+                                            event_type=GROUP_MEMBER_SELECTED)
+                                 .order_by(RecordingEvent.id.desc()).first())
+                repeat_selection = (last_selected is not None
+                                    and last_selected.detail == selected_detail)
+
                 @retry_on_locked()
                 def _select_group_member_and_commit():
                     rec.channel_id = best.id
                     rec.url = normalize_url(best.stream_url, best.account)
-                    add_recording_event(recording_id, GROUP_MEMBER_SELECTED,
-                        detail=(f'Group "{rec.group.name}": recording from "{best.name}" '
-                                f'({best.account.name}, score {effective_score(best)})'
-                                f'{busy_note}'),
-                        extra={'group_id': rec.group_id, 'channel_id': best.id,
-                               'effective_score': effective_score(best),
-                               'took_busy': took_busy,
-                               'skipped_busy_channel_ids': [ch.id for ch in skipped_busy],
-                               'took_busy_account': took_busy_account,
-                               'skipped_busy_account_channel_ids': [
-                                   ch.id for ch in skipped_busy_account]})
-                    if override_detail:
+                    if not repeat_selection:
+                        add_recording_event(recording_id, GROUP_MEMBER_SELECTED,
+                            detail=selected_detail,
+                            extra={'group_id': rec.group_id, 'channel_id': best.id,
+                                   'effective_score': effective_score(best),
+                                   'took_busy': took_busy,
+                                   'skipped_busy_channel_ids': [ch.id for ch in skipped_busy],
+                                   'took_busy_account': took_busy_account,
+                                   'skipped_busy_account_channel_ids': [
+                                       ch.id for ch in skipped_busy_account],
+                                   'skipped_blocked_channel_ids': [
+                                       ch.id for ch in skipped_blocked]})
+                    if override_detail and not repeat_selection:
                         add_recording_event(recording_id, RECORDING_FORMAT_OVERRIDE,
                             detail=override_detail,
                             extra={'group_id': rec.group_id, 'channel_id': best.id,
@@ -1881,7 +1915,7 @@ def _pin_eligible_members(members, pin, latest_by_channel):
 
 
 def failover_group_member(app, recording_id: int, reason: str, demote: bool = False,
-                          score_departure: bool = True) -> bool:
+                          score_departure: bool = True, block_move: bool = False) -> bool:
     """Switch a group-backed recording to its next-best untried member after its
     active feed died (failed restart / dead-stream trip / max consecutive
     failures - the watchdog's three give-up points). Returns True if switched -
@@ -1915,6 +1949,16 @@ def failover_group_member(app, recording_id: int, reason: str, demote: bool = Fa
     that delivered five seconds of black. Two observations for one departure is the defect;
     which of the two is right is not in question.
 
+    `block_move=True` is the watchdog moving a recording off an account the user has just
+    blocked (dev/changelog/1151). Voluntary like a demotion - the current member is excluded
+    and a False means stay put - but the departing member is neither demoted nor burned and
+    is never scored: nothing about the feed was wrong, and a block must not count against
+    anything. Its account being blocked is what keeps it from being chosen again.
+
+    Members on a blocked account are dropped on every path, before either format filter, the
+    same way a member that already failed is. Unlike record start there is no fall back to
+    them: a live recording with nowhere unblocked to go keeps the member it has.
+
     Only rewrites channel_id/url and swaps connection slots; the caller owns
     killing/launching ffmpeg (this keeps every non-idempotent side effect out of
     the retry-wrapped DB closure below).
@@ -1928,7 +1972,7 @@ def failover_group_member(app, recording_id: int, reason: str, demote: bool = Fa
             return False
 
         old_channel = rec.channel
-        if rec.channel_id is not None:
+        if rec.channel_id is not None and not block_move:
             if demote:
                 state.demoted_member_ids.add(rec.channel_id)
             else:
@@ -1945,6 +1989,9 @@ def failover_group_member(app, recording_id: int, reason: str, demote: bool = Fa
         # (dev/docs/BUGS.md 2026-08-19, dev/changelog/754).
         members = [ch for ch in recording_members(rec.group.memberships)
                    if ch.id not in state.failed_member_ids]
+        from .account_blocks import blocked_account_ids, split_blocked
+        members, skipped_blocked = split_blocked(
+            members, blocked_account_ids({ch.account_id for ch in members}))
         from .routes.channel_tests import _latest_tests_by_channel
         latest_by_channel = _latest_tests_by_channel([ch.id for ch in members])
         # Same filter as record start, so a failover cannot land on a format the group
@@ -1989,7 +2036,14 @@ def failover_group_member(app, recording_id: int, reason: str, demote: bool = Fa
         # that a zero-survivors override would otherwise fire on. Staying put is the right
         # answer to "only the member you are on matches the locked format" - the override
         # exists to keep a dying recording alive, and this one is not dying.
-        stay_put = {rec.channel_id} if (demote and rec.channel_id is not None) else frozenset()
+        stay_put = ({rec.channel_id} if ((demote or block_move) and rec.channel_id is not None)
+                    else frozenset())
+        if block_move and old_channel is not None:
+            # A partial block leaves the account some slots, so its other members survive
+            # the blocked-account drop above - but moving to one of them keeps the very
+            # connection the block asked back.
+            stay_put = set(stay_put) | {ch.id for ch in members
+                                        if ch.account_id == old_channel.account_id}
         best = None
         for preferred in ([demoted, frozenset()] if demoted else [frozenset()]):
             base = stay_put | set(preferred)
@@ -2004,6 +2058,10 @@ def failover_group_member(app, recording_id: int, reason: str, demote: bool = Fa
         took_busy_account = best is not None and best.id in busy_account
         took_demoted = best is not None and best.id in demoted
         if best is None:
+            if block_move:
+                log.info('Recording %d: group "%s" has no member off a blocked account (%s) - '
+                         'staying on the current member', recording_id, rec.group.name, reason)
+                return False
             if demote:
                 # Not an abort and not a failure: a one-member group, or a group whose
                 # every other member is unavailable, simply stays where it is. The caller
@@ -2087,7 +2145,16 @@ def failover_group_member(app, recording_id: int, reason: str, demote: bool = Fa
         if took_demoted:
             override_note += (' - every other member has already been moved off during '
                               'this recording, so this is the best of them')
-        if demote:
+        if skipped_blocked and not block_move:
+            override_note += (' - skipped member(s) on a blocked account: '
+                              + ', '.join(f'"{ch.name}" ({ch.account.name})'
+                                          for ch in skipped_blocked))
+        if block_move:
+            detail = (f'Group "{rec.group.name}": {reason} - moving from "{old_name}" to '
+                      f'"{best.name}" ({best.account.name}, score {effective_score(best)}). '
+                      f'Nothing was wrong with "{old_name}"; it is not scored for the move'
+                      f'{busy_note}{override_note}')
+        elif demote:
             # "Died" would be false here and the distinction is the whole point of this
             # path: the feed is still delivering, it is just costing too much to keep.
             detail = (f'Group "{rec.group.name}": feed "{old_name}" kept stalling '
@@ -2123,6 +2190,8 @@ def failover_group_member(app, recording_id: int, reason: str, demote: bool = Fa
                        # demoted rather than burned and can be selected again this run.
                        'demoted': demote,
                        'took_demoted': took_demoted,
+                       'block_move': block_move,
+                       'skipped_blocked_channel_ids': [ch.id for ch in skipped_blocked],
                        # Cumulative counters through the just-abandoned member - lets the
                        # terminal observation score the final member from only its own share
                        # (health_score.py::apply_recording_health_observation). Snapshotted
@@ -2141,7 +2210,7 @@ def failover_group_member(app, recording_id: int, reason: str, demote: bool = Fa
         # for that member, independent of the recording's own terminal observation.
         # A demoted member did NOT die, so it is scored on what it actually measured
         # instead of the fail floor (see apply_stall_demotion_health_observation).
-        if old_channel is not None and score_departure:
+        if old_channel is not None and score_departure and not block_move:
             if demote:
                 from .health_score import apply_stall_demotion_health_observation
                 apply_stall_demotion_health_observation(
@@ -2405,6 +2474,12 @@ def _defer_start_for_slot(app, recording_id: int, account_id: int, waiting_on=No
     rec = db.session.get(Recording, recording_id)
     if rec is None:
         return
+    if waiting_on is None:
+        from .account_blocks import free_at
+        block_until = free_at(account_id, now)
+        if block_until is not None:
+            _defer_start_for_block(rec, account_id, block_until, now)
+            return
     why = _slot_wait_reason(account_id, waiting_on)
 
     if rec.stop_time <= now:
@@ -2451,6 +2526,78 @@ def _defer_start_for_slot(app, recording_id: int, account_id: int, waiting_on=No
         recording_id, now + timedelta(seconds=SLOT_WAIT_POLL_SECONDS))
 
 
+#: The longest a start waiting on a block sleeps before it re-asks. A block normally ends on
+#: its own clock and the retry is armed for that moment, but a block set on a recording ends
+#: early when that recording stops early, and nothing else re-arms the waiters then.
+BLOCK_WAIT_MAX_POLL_SECONDS = 300
+
+
+def _note_block_wait_once(recording_id: int, account_id: int, why: str):
+    """The deferral event for a wait on a block, written once per account. No alert: the
+    user set the block, so the recording waiting on it is a state they chose, shown on the
+    recording, not a problem to raise (dev/changelog/1151)."""
+    already = [e for e in RecordingEvent.query.filter_by(
+        recording_id=recording_id, event_type=RECORDING_START_DEFERRED).all()
+        if (e.extra_data or '') and json.loads(e.extra_data).get('kind') == 'account_block'
+        and json.loads(e.extra_data).get('account_id') == account_id]
+    if already:
+        return
+
+    @retry_on_locked()
+    def _mark_block_deferred_and_commit():
+        add_recording_event(
+            recording_id, RECORDING_START_DEFERRED,
+            detail=(f'Start deferred: {why}, and every account this recording could use is '
+                    f'blocked. It starts as soon as a block ends and records what is left of '
+                    f'its window.'),
+            extra={'kind': 'account_block', 'account_id': account_id})
+        db.session.commit()
+
+    _mark_block_deferred_and_commit()
+
+
+def _defer_start_for_block(rec, account_id: int, block_until: datetime, now: datetime):
+    """The block-shaped half of _defer_start_for_slot: every account this SCHEDULED recording
+    could start on is blocked by the user. It waits and records what is left once a block
+    ends - labeled partial by the late start, like any other late start - or, when the block
+    outlasts its window, it ends FAILED with its own reason naming the block."""
+    from .account_blocks import describe
+    recording_id = rec.id
+    account_name = _account_label(account_id)
+    why = describe(account_name, block_until)
+
+    if rec.stop_time <= now:
+        log.warning('Recording "%s" (#%d): never started - %s for the rest of its window',
+                    rec.name, recording_id, why, extra={'recording_id': recording_id})
+
+        @retry_on_locked()
+        def _fail_block_wait_and_commit():
+            r = db.session.get(Recording, recording_id)
+            r.status = REC_STATUS_FAILED
+            r.completed_at = now
+            r.failure_reason = FAILURE_ACCOUNT_BLOCKED
+            add_recording_event(
+                recording_id, RECORDING_FAILED,
+                detail=(f'Never started: {why}, and every account this recording could use '
+                        f'stayed blocked until its window ended. Nothing was captured.'))
+            db.session.commit()
+
+        _fail_block_wait_and_commit()
+        from .health_score import dismiss_recording_failing_alerts
+        dismiss_recording_failing_alerts(recording_id)
+        end_capture_wait(recording_id)
+        return
+
+    _note_block_wait_once(recording_id, account_id, why)
+    _note_start_deferred(recording_id, f'the block on "{account_name}" to end')
+    log.info('Recording %d: deferring start - %s', recording_id, why)
+    retry_at = min(block_until, rec.stop_time,
+                   now + timedelta(seconds=BLOCK_WAIT_MAX_POLL_SECONDS))
+    retry_at = max(retry_at, now + timedelta(seconds=SLOT_WAIT_POLL_SECONDS))
+    from .scheduler import reschedule_recording_start
+    reschedule_recording_start(recording_id, retry_at)
+
+
 def _defer_resume_for_slot(app, recording_id: int, account_id: int) -> None:
     """Hold a recording that is resuming (crash recovery, unpause, dead-stream retry) but
     cannot have a connection slot yet.
@@ -2464,6 +2611,26 @@ def _defer_resume_for_slot(app, recording_id: int, account_id: int) -> None:
     now = datetime.utcnow()
     rec = db.session.get(Recording, recording_id)
     if rec is None:
+        return
+    from .account_blocks import describe, free_at
+    block_until = free_at(account_id, now)
+    if block_until is not None:
+        # Blocked by the user: the same wait, noted without an alert (see
+        # _note_block_wait_once), and re-armed for when the block ends.
+        why = describe(_account_label(account_id), block_until)
+        _note_block_wait_once(recording_id, account_id, why)
+        if rec.stop_time <= now:
+            log.warning('Recording "%s" (#%d): %s and its window ended - not resuming; '
+                        'whatever was already captured is finalized by its stop job',
+                        rec.name, recording_id, why, extra={'recording_id': recording_id})
+            end_capture_wait(recording_id)
+            return
+        log.info('Recording %d: deferring resume - %s', recording_id, why)
+        from .scheduler import reschedule_recording_resume
+        retry_at = min(block_until, rec.stop_time,
+                       now + timedelta(seconds=BLOCK_WAIT_MAX_POLL_SECONDS))
+        reschedule_recording_resume(
+            recording_id, max(retry_at, now + timedelta(seconds=SLOT_WAIT_POLL_SECONDS)))
         return
     why = _slot_wait_reason(account_id)
 

@@ -55,7 +55,8 @@ FULL_REC = {'recorded_video_codec': 'h264', 'recorded_pix_fmt': 'yuv420p',
 
 
 def _seg(**kw):
-    return types.SimpleNamespace(**{f: kw.get(f) for f in _SEG_FIELDS})
+    return types.SimpleNamespace(excluded=kw.get('excluded', False),
+                                 **{f: kw.get(f) for f in _SEG_FIELDS})
 
 
 def _rec(segments=(), **kw):
@@ -87,6 +88,15 @@ class SourcePrecedenceTests(unittest.TestCase):
     def test_last_probed_segment_wins(self):
         early = dict(FULL_SEG, probe_video_codec='mpeg2video')
         view = _format_profile(_rec(segments=[_seg(**early), _seg(**FULL_SEG)]))
+
+        self.assertEqual(_row(view, 'Codec')['value'], 'hevc')
+
+    def test_an_excluded_segment_never_supplies_the_profile(self):
+        """A discarded placeholder was never joined into the file, so its codec does not
+        describe the recording (dev/docs/BUGS.md 2026-09-27 @ 02:04:32 PM)."""
+        placeholder = dict(FULL_SEG, probe_video_codec='mpeg2video')
+        view = _format_profile(_rec(segments=[_seg(**FULL_SEG),
+                                              _seg(excluded=True, **placeholder)]))
 
         self.assertEqual(_row(view, 'Codec')['value'], 'hevc')
 

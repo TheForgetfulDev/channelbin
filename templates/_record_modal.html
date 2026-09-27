@@ -4,6 +4,18 @@
    IDs. Requires `profiles` (RecordingProfile list) and `display_timezone` in the template
    context, plus a matching `profiles: {...}` map in the page's GUIDE_CONFIG. #}
 
+{% macro block_picker(prefix) -%}
+<details class="form-group acct-block-pick" id="{{ prefix }}-blocks" style="display:none">
+  <summary>Block account use during this recording<span id="{{ prefix }}-blocks-count"></span></summary>
+  <span class="form-hint">Nothing in ChannelBin opens a stream on a blocked account while this
+    recording can still record - so a TV can watch live on it. A channel group records from
+    members on other accounts; with nowhere else to go, the recording waits for the block to end
+    and records what is left.</span>
+  <input type="hidden" name="block_accounts_loaded" id="{{ prefix }}-blocks-loaded" value="">
+  <div id="{{ prefix }}-blocks-list"></div>
+</details>
+{%- endmacro %}
+
 {# Record / Edit modal #}
 <div id="record-modal" class="modal" style="display:none" role="dialog" aria-modal="true">
   <div class="modal-backdrop" id="modal-backdrop"></div>
@@ -70,6 +82,12 @@
             {% endfor %}
           </select>
         </div>
+        {# Which accounts to keep ChannelBin off while this recording can still open a stream
+           (app/account_blocks.py, dev/changelog/1151). Filled per open by
+           guide.js::loadBlockPicker; block_accounts_loaded is set only once the list has
+           loaded, so a failed lookup leaves the recording's blocks alone rather than
+           clearing them. #}
+        {{ block_picker('modal') }}
         <div id="modal-detail-link" style="display:none; margin-bottom: 0.75rem;">
           <a id="modal-detail-anchor" href="#" class="btn btn-sm" target="_blank">View recording details →</a>
         </div>
@@ -99,6 +117,7 @@
         <input type="datetime-local" id="active-rec-stop" class="form-control">
         <span class="form-hint">Must be in the future. Changes take effect immediately.</span>
       </div>
+      {{ block_picker('active-rec') }}
       <div style="margin-bottom: 0.75rem;">
         <a id="active-rec-detail-anchor" href="#" class="btn btn-sm" target="_blank">View recording details →</a>
       </div>

@@ -27,15 +27,36 @@
         - both fallbacks (no inline bar, no IntersectionObserver) resolve toward SHOWING
           it, so a primary action is never stranded off screen.
 
+   4. **The page keeps itself current through a sync** (dev/changelog/1152), the way the
+      Accounts list does (dev/changelog/921): driven by base.html's /api/nav-status poll, it
+      swaps LIVE_REGIONS for a fresh server render when the sync signature moves or the
+      render is a minute old. The template stays the only thing that knows how those regions
+      look, so every handler here is delegated on document. What a sync changes as DATA -
+      the status, the counts the confirms quote, the first page of history - comes from the
+      swapped #acct-state blob, never from the load-time ACCOUNT_DETAIL, which keeps only
+      what a sync cannot move.
+
    Depends on util.js (escHtml, fmtDur, jsonFetch, showToast, buildModal, closeMenus),
    account-actions.js (confirmAccountSync, accountCancelSync, confirmForceEpgResync,
-   confirmDeleteAccount - shared with the list page) and account-modal.js (openAccountModal).
+   confirmDeleteAccount, confirmBlockAccount, accountUnblock - shared with the list page) and account-modal.js (openAccountModal).
 */
 (function () {
   const A = window.ACCOUNT_DETAIL;
   if (!A) return;
 
   const $ = (sel, root = document) => root.querySelector(sel);
+
+  function readState() {
+    const el = $('#acct-state');
+    if (!el) return {};
+    try {
+      return JSON.parse(el.textContent);
+    } catch (err) {
+      console.warn('The account page state blob did not parse; keeping the last one.', err);
+      return {};
+    }
+  }
+  Object.assign(A, readState());
 
   // ── Formatting ───────────────────────────────────────────────────────────
   // Storage is naive UTC; display always goes through the configured timezone, never a
@@ -89,8 +110,10 @@
     SKIPPED: ['b-paused', 'Skipped'],
   };
   function logBadge(status) {
-    // b-running, not b-live: a sync in progress is not an alarm (dev/changelog/816).
-    if (!status) return '<span class="badge b-running"><span class="pulse"></span>Running</span>';
+    // b-running, not b-live: a sync in progress is not an alarm (dev/changelog/816). A
+    // running sync's row says IN_PROGRESS (app/accounts.py opens it that way); a NULL is
+    // read the same.
+    if (!status || status === 'IN_PROGRESS') return '<span class="badge b-running"><span class="pulse"></span>Running</span>';
     const hit = LOG_BADGE[status];
     // Every state is named; the fallthrough logs and renders the raw value rather than
     // quietly becoming the home for the next status anybody adds.
@@ -134,30 +157,35 @@
     box.innerHTML = head + logs.map((l) => historyRow(l, maxDuration)).join('');
   }
 
+  const loadAllSyncs = () => jsonFetch(`/api/accounts/${A.id}/syncs`).then((res) => {
+    logs = res.logs || [];
+    renderHistory();
+  });
+
   // "All N syncs" loads the rest into this same section and becomes "Show fewer" -
   // account_logs.html and its route are retired (§17.1), so there is no page to go to.
-  const moreBtn = $('#acct-hist-more');
-  if (moreBtn) {
-    moreBtn.addEventListener('click', () => {
-      if (expanded) {
-        logs = (A.logs || []).slice();
-        expanded = false;
-        moreBtn.textContent = `All ${fmtNum(Number(moreBtn.dataset.total))} syncs`;
-        renderHistory();
-        return;
-      }
-      moreBtn.disabled = true;
-      jsonFetch(`/api/accounts/${A.id}/syncs`)
-        .then((res) => {
-          logs = res.logs || [];
-          expanded = true;
-          moreBtn.textContent = 'Show fewer';
-          renderHistory();
-        })
-        .catch((e) => showToast(e.message || 'Could not load the sync history.', { type: 'error' }))
-        .finally(() => { moreBtn.disabled = false; });
-    });
-  }
+  // Delegated: the button lives in #acct-hist-head, which a refresh replaces.
+  document.addEventListener('click', (e) => {
+    const moreBtn = e.target.closest('#acct-hist-more');
+    if (!moreBtn || moreBtn.disabled) return;
+    if (expanded) {
+      logs = (A.logs || []).slice();
+      expanded = false;
+      moreBtn.textContent = `All ${fmtNum(Number(moreBtn.dataset.total))} syncs`;
+      renderHistory();
+      return;
+    }
+    moreBtn.disabled = true;
+    loadAllSyncs()
+      .then(() => {
+        expanded = true;
+        // Looked up again: a refresh may have replaced the button while the fetch ran.
+        const btn = $('#acct-hist-more');
+        if (btn) btn.textContent = 'Show fewer';
+      })
+      .catch((err) => showToast(err.message || 'Could not load the sync history.', { type: 'error' }))
+      .finally(() => { moreBtn.disabled = false; });
+  });
 
   renderHistory();
 
@@ -178,9 +206,12 @@
   // requires warn-and-override at every manual entry point, and this one only warned
   // (dev/docs/BUGS.md 2026-08-04). One implementation is the fix, not a tidier duplicate.
   // `onError` puts the reason in this page's own error line as well as the toast.
+  // An action that only moves what a sync moves refreshes the page in place rather than
+  // reloading it, so the history expansion and the scroll position survive it. `refresh`
+  // is hoisted from the live-refresh section below.
   const hooks = () => {
     showActionError('');
-    return { onDone: reload, onError: showActionError };
+    return { onDone: () => refresh(), onError: showActionError };
   };
 
   // ── EPG sources (DESIGN-epg-sources.md §9.2) ────────────────────────────
@@ -403,6 +434,10 @@
     'cancel-sync': () => accountCancelSync(A.id, hooks()),
     'force-epg': () => confirmForceEpgResync(A.id, hooks()),
     settings: () => openAccountModal({ accountId: A.id, onDone: reload }),
+    block: () => confirmBlockAccount(Object.assign(hooks(), {
+      id: A.id, name: A.name, limit: A.maxConnections, maxHours: A.blockMaxHours,
+    })),
+    unblock: (el) => accountUnblock(A.id, el.dataset.blockId, hooks()),
     sections: sectionLayout.open,
     dump: () => post(`/api/accounts/${A.id}/dump`, { method: 'POST' }),
     'sync-dump': () => post(`/api/accounts/${A.id}/sync-from-dump`, { method: 'POST' }).then(reload),
@@ -424,6 +459,7 @@
   // second, invisible copy of "Sync now" in the document (§17.6).
   function openPageActionSheet() {
     const items = [
+      { act: 'block', label: 'Block account use' },
       { act: 'settings', label: 'Edit settings' },
       { act: 'sections', label: 'Customize sections' },
       { sep: true },
@@ -484,13 +520,14 @@
     document.body.classList.toggle('actbar-on', on);
   }
 
+  let observer = null;
   if (bar) {
     if (!inlineBar || typeof IntersectionObserver === 'undefined') {
       // Both fallbacks resolve toward SHOWING it. A fallback that hid the bar could strand
       // the page's primary action off screen with no way to reach it.
       setBar(true);
     } else {
-      const observer = new IntersectionObserver((entries) => {
+      observer = new IntersectionObserver((entries) => {
         entries.forEach((entry) => setBar(!entry.isIntersecting));
       }, { threshold: 0 });
       observer.observe(inlineBar);
@@ -499,4 +536,73 @@
       window.addEventListener('pagehide', () => observer.disconnect());
     }
   }
+
+  // ── Live refresh (dev/changelog/1152) ────────────────────────────────────
+  // Two triggers, as on the Accounts list, and each covers what the other cannot:
+  //   1. the signature differs from the one this page was rendered at - some sync started,
+  //      finished, failed or was cancelled since. This is what stops "Syncing now" and a
+  //      Sync now button outliving the sync they describe;
+  //   2. the render is a minute old, so "Synced 4m ago" and "Next sync in 23h 44m" do not
+  //      quietly drift. Skipped in a background tab, where nobody reads them.
+  // The sticky bar swaps only its contents: the bar itself carries whether it is showing,
+  // and replacing it would drop that and animate it back in. The history body is swapped
+  // only while it holds the "No syncs yet" state - once #acct-hist exists, renderHistory()
+  // is its one writer. The Usage card is left out: a sync moves none of its numbers.
+  const LIVE_REGIONS = ['#acct-state', '#acct-head', '#acct-notices', '#acct-actionbar',
+    '#acct-stickybar-in', '#acct-details-body', '#acct-content-body', '#acct-sources-body',
+    '#acct-hist-head', '#acct-activity-body'];
+  const RERENDER_MS = 60 * 1000;
+  let renderedAt = Date.now();
+  let inFlight = false;
+  let again = false;
+
+  // Replacing a region under an open kebab or the phone's action sheet would close it
+  // mid-choice; the next poll simply asks again.
+  const busy = () => Boolean(document.querySelector('.menu.open, .acct-sheet'));
+
+  function reapply() {
+    // The inline bar is a new element now, and an observer watching the old, detached one
+    // would report it gone and pin the sticky bar on.
+    if (observer) {
+      observer.disconnect();
+      const fresh = $('#acct-actionbar');
+      if (fresh) observer.observe(fresh);
+    }
+    const btn = $('#acct-hist-more');
+    if (btn && expanded) btn.textContent = 'Show fewer';
+  }
+
+  function refresh() {
+    // One at a time. A request made while one is running (an action's own refresh landing
+    // on a poll's) runs once it finishes, so the page ends on the later state.
+    if (inFlight) { again = true; return Promise.resolve(); }
+    inFlight = true;
+    const regions = $('#acct-hist') ? LIVE_REGIONS : LIVE_REGIONS.concat('#acct-hist-body');
+    const shownLogs = JSON.stringify(A.logs || []);
+    return swapFromServer(regions)
+      .then(() => {
+        renderedAt = Date.now();
+        Object.assign(A, readState());
+        reapply();
+        const moved = JSON.stringify(A.logs || []) !== shownLogs;
+        // Redrawn only when the runs changed, so a minute tick leaves a hovered row alone.
+        if (!moved && $('#acct-hist') && $('#acct-hist').childElementCount) return null;
+        if (expanded) return loadAllSyncs();
+        logs = (A.logs || []).slice();
+        renderHistory();
+        return null;
+      })
+      .catch((err) => console.warn('Account page refresh failed; the next poll retries.', err))
+      .finally(() => {
+        inFlight = false;
+        if (again) { again = false; refresh(); }
+      });
+  }
+
+  window.__applyAccountSync = (sig) => {
+    if (typeof sig !== 'string' || inFlight || busy()) return;
+    const changed = sig !== A.syncSig;
+    if (!changed && (Date.now() - renderedAt < RERENDER_MS || document.hidden)) return;
+    refresh();
+  };
 }());

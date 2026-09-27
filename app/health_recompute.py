@@ -10,11 +10,18 @@ Two user actions are built on that, and they are the same mechanism twice:
   * **Reset** excludes every observation, leaving the channel with no score at all.
   * **Step back** excludes the single newest one that still counts, and can be clicked again.
 
-Excluding, not deleting, is the deliberate call (dev/changelog/895). An observation is not
-only a ChannelTest row - a terminal recording, a post-process damage correction, a group
-failover and a stall demotion each move the score too - and deleting a Recording to unwind
-its contribution would destroy the recording itself. So a `ChannelHealthExclusion` row marks
-an observation as not-counted and every surface keeps showing it, marked.
+Excluding, not deleting, is the deliberate call for those two (dev/changelog/895). An
+observation is not only a ChannelTest row - a terminal recording, a post-process damage
+correction, a group failover and a stall demotion each move the score too - and deleting a
+Recording to unwind its contribution would destroy the recording itself. So a
+`ChannelHealthExclusion` row marks an observation as not-counted and every surface keeps
+showing it, marked.
+
+A third action, **deleting one health check**, really does delete (apply_test_deletion,
+dev/changelog/1149). That reasoning does not reach a test: being an observation is all a
+ChannelTest is for, retention already deletes old ones routinely, and a test the user has
+judged wrong has nothing left worth keeping. The replay is the same one, and the channel's
+Activity Timeline names the test that went and the score it left behind.
 
 **The ledger reads back the weights that were actually used.** Every blending path persists
 its own `blend_breakdown` alongside the quality it produced, and that JSON carries the
@@ -148,6 +155,15 @@ def _stored_weight(breakdown, fallback):
     return fallback
 
 
+def _test_label(test):
+    """How a ChannelTest is named to a human - in the ledger, a confirm dialog and an event."""
+    from .tz_utils import format_local
+    label = f'Health check on {format_local(test.test_started_at)}'
+    if test.quality_score is not None:
+        label += f' (scored {test.quality_score}/100)'
+    return label
+
+
 def excluded_keys(channel_id):
     """{(kind, source_id)} the user has taken out of this channel's score."""
     from .database import ChannelHealthExclusion
@@ -182,8 +198,7 @@ def observation_ledger(channel_id, cfg) -> List[Observation]:
         weight = _stored_weight(breakdown, observation_weight(t.duration_seconds, cfg))
         obs.append(Observation(
             SOURCE_TEST, t.id, t.test_started_at, t.quality_score, weight,
-            f'Health check on {format_local(t.test_started_at)} (scored {t.quality_score}/100)',
-            (SOURCE_TEST, t.id) in excluded))
+            _test_label(t), (SOURCE_TEST, t.id) in excluded))
 
     # Either column alone is enough: the correction can exist on a row whose primary
     # observation was never written (its channel had already been re-observed by the time
@@ -313,6 +328,23 @@ def recompute_failure_streak(channel_id, excluded=None):
     return streak
 
 
+def _rewrite_from_ledger(channel, ledger, cfg):
+    """Replay `ledger` onto `channel`'s score columns and failure streak.
+
+    Returns (score_before, score_after, observations_counted). The one place a replay
+    result is written to the row, so the three writers below cannot drift on which columns
+    a recompute owns.
+    """
+    score, count, updated_at = replay(ledger, cfg)
+    before = channel.health_score
+    channel.health_score = score
+    channel.health_score_sample_count = count
+    channel.health_score_updated_at = updated_at
+    channel.consecutive_test_failures = recompute_failure_streak(
+        channel.id, excluded={o.key for o in ledger if o.excluded})
+    return before, score, count
+
+
 def rollback_preview(channel, cfg):
     """What the two rollback actions would do to `channel` right now, for the UI.
 
@@ -389,13 +421,7 @@ def apply_rollback(channel, action, cfg):
             excluded_at=now, action=action))
         o.excluded = True
 
-    score, count, updated_at = replay(ledger, cfg)
-    before = channel.health_score
-    channel.health_score = score
-    channel.health_score_sample_count = count
-    channel.health_score_updated_at = updated_at
-    channel.consecutive_test_failures = recompute_failure_streak(
-        channel.id, excluded={o.key for o in ledger if o.excluded})
+    before, score, count = _rewrite_from_ledger(channel, ledger, cfg)
 
     # A reset means "as if this channel had never been observed", and a manual offset left
     # standing on a channel with no observations produces exactly the unexplainable number
@@ -473,14 +499,8 @@ def recompute_in_place(channel, cfg, reason: str):
     if not counting:
         return None
 
-    score, count, updated_at = replay(ledger, cfg)
-    before = channel.health_score
     samples_before = channel.health_score_sample_count
-    channel.health_score = score
-    channel.health_score_sample_count = count
-    channel.health_score_updated_at = updated_at
-    channel.consecutive_test_failures = recompute_failure_streak(
-        channel.id, excluded={o.key for o in ledger if o.excluded})
+    before, score, count = _rewrite_from_ledger(channel, ledger, cfg)
 
     detail = (f'Health score recomputed from the {count} observation'
               f'{"s" if count != 1 else ""} on record - {reason}, '
@@ -496,6 +516,95 @@ def recompute_in_place(channel, cfg, reason: str):
         })))
     return {'detail': detail, 'score_before': before, 'score_after': score,
             'observations_counted': count, 'sample_count_before': samples_before}
+
+
+def _deleted_test_counted(ledger, test_id):
+    """Whether a test is currently one of the observations behind the stored score."""
+    return any(o.key == (SOURCE_TEST, test_id) and not o.excluded for o in ledger)
+
+
+def preview_test_deletion(channel, test, cfg):
+    """What deleting `test` would do to `channel`'s health score, for the confirm dialog.
+
+    Computed by the same replay apply_test_deletion() runs, so the number the user approves
+    is the number they get. A test that does not count (never scored, or already rolled back)
+    leaves the score exactly where it is - no replay runs, so no pruned residual is dropped
+    either.
+    """
+    ledger = observation_ledger(channel.id, cfg)
+    counted = _deleted_test_counted(ledger, test.id)
+    current = None if channel.health_score is None else int(round(channel.health_score))
+    preview = {
+        'test_id': test.id,
+        'label': _test_label(test),
+        'counted': counted,
+        'score_before': current,
+        'score_after': current,
+        'observations_after': channel.health_score_sample_count or 0,
+        'unledgered': 0,
+        'has_screenshot': bool(test.screenshot_path and not test.screenshot_pruned),
+    }
+    if counted:
+        remaining = [o for o in ledger if o.key != (SOURCE_TEST, test.id)]
+        score, count, _ = replay(remaining, cfg)
+        preview['score_after'] = None if score is None else int(round(score))
+        preview['observations_after'] = count
+        preview['unledgered'] = max(0, (channel.health_score_sample_count or 0) - len(ledger))
+    return preview
+
+
+def apply_test_deletion(channel, test, cfg):
+    """Delete one ChannelTest and, if it counted, rewrite the score from what remains.
+
+    Mutates, adds and deletes; does NOT commit - same contract as apply_rollback, so the
+    caller's `retry_on_locked` unit covers the whole read-modify-write. Returns
+    (result, screenshot_paths); the caller unlinks the paths with recorder.delete_files()
+    only after its commit has succeeded, never inside the retried unit.
+
+    The test's own exclusion row, if a rollback made one, goes with it
+    (delete_tests_collecting_screenshots). The ChannelEvent is written either way: a test
+    vanishing from the history is itself something the timeline should account for.
+    """
+    from . import db
+    from .channel_tester import delete_tests_collecting_screenshots
+    from .database import ChannelEvent, ChannelTest, CHANNEL_TEST_DELETED
+
+    ledger = observation_ledger(channel.id, cfg)
+    counted = _deleted_test_counted(ledger, test.id)
+    label = _test_label(test)
+    facts = {
+        'test_id': test.id,
+        'test_started_at': test.test_started_at.isoformat() if test.test_started_at else None,
+        'status': test.status,
+        'quality_score': test.quality_score,
+        'job_id': test.job_id,
+    }
+
+    paths = delete_tests_collecting_screenshots(ChannelTest.query.filter(ChannelTest.id == test.id))
+    db.session.expunge(test)
+
+    if counted:
+        remaining = [o for o in ledger if o.key != (SOURCE_TEST, facts['test_id'])]
+        unledgered = max(0, (channel.health_score_sample_count or 0) - len(ledger))
+        before, score, count = _rewrite_from_ledger(channel, remaining, cfg)
+        detail = f'Deleted {label} - {_score_words(before, score)}'
+    else:
+        unledgered = 0
+        before = score = channel.health_score
+        count = channel.health_score_sample_count or 0
+        detail = (f'Deleted {label} - it was not counting toward the health score, '
+                  f'so the score is unchanged')
+
+    db.session.add(ChannelEvent(
+        channel_id=channel.id, timestamp=datetime.utcnow(),
+        event_type=CHANNEL_TEST_DELETED, detail=detail,
+        extra_data=json.dumps(dict(
+            facts, counted=counted, score_before=before, score_after=score,
+            observations_remaining=count, unledgered_dropped=unledgered,
+            screenshot_deleted=bool(paths)))))
+
+    return ({'detail': detail, 'counted': counted, 'score_before': before,
+             'score_after': score, 'remaining': count}, paths)
 
 
 def repair_duplicated_capture_corrections(cfg):

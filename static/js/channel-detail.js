@@ -871,6 +871,63 @@
     });
   }
 
+  /* Delete one health check from Test History. The row and its screenshot go for good, and
+     the score is replayed without it (app/health_recompute.py::apply_test_deletion). The
+     dialog's numbers come from the server's own preview of that replay, asked on click
+     rather than rendered per row, since each one is a replay of the channel's whole ledger. */
+  function deleteTest(el) {
+    const base = `${C.urls.testBase}${encodeURIComponent(el.dataset.testId)}`;
+    jsonFetch(`${base}/delete-preview`).then((data) => {
+      const p = data.preview || {};
+      const scoreWord = (v) => (v === null || v === undefined ? 'no score' : String(v));
+      let body = `<p>${escHtml(p.label)} will be deleted from this channel's test history`
+               + `${p.has_screenshot ? ', along with its screenshot' : ''}.</p>`;
+      if (p.counted) {
+        const move = p.score_before === p.score_after
+          ? `stays at <strong>${scoreWord(p.score_after)}</strong>`
+          : `goes from <strong>${scoreWord(p.score_before)}</strong> to `
+            + `<strong>${scoreWord(p.score_after)}</strong>`;
+        body += `<p>The health score ${move}, recalculated from the `
+              + `${p.observations_after} observation${p.observations_after === 1 ? '' : 's'} `
+              + 'that remain. This cannot be undone.</p>';
+        /* Same shortfall the step-back dialog names: a replay cannot carry the residual of
+           tests retention has already deleted, so it leaves with this one. */
+        if (p.unledgered) {
+          body += `<p class="text-muted small">${p.unledgered} older observation`
+                + `${p.unledgered === 1 ? '' : 's'} behind the current score can no longer be `
+                + 'replayed - their test records have been deleted by retention - so their '
+                + 'small remaining influence is dropped too.</p>';
+        }
+      } else {
+        body += '<p>It does not count toward the health score, so the score stays at '
+              + `<strong>${scoreWord(p.score_before)}</strong>. This cannot be undone.</p>`;
+      }
+      const wrap = document.createElement('div');
+      wrap.innerHTML = body;
+      buildModal({
+        title: 'Delete test',
+        body: wrap,
+        footer: [
+          { label: 'Cancel', class: 'btn' },
+          {
+            label: 'Delete test',
+            class: 'btn btn-danger',
+            onClick: (close) => {
+              jsonFetch(`${base}/delete`, { method: 'POST' }).then((res) => {
+                close();
+                /* The reload re-renders the score, Test History, the latest-test card and
+                   the timeline together, as the rollback does. */
+                sessionStorage.setItem('cd-rollback-toast', (res.result || {}).detail || 'Test deleted.');
+                location.reload();
+              }).catch(e => showToast(e.message || 'Could not delete the test.', { type: 'error' }));
+              return false;
+            },
+          },
+        ],
+      });
+    }).catch(e => showToast(e.message || 'Could not load the test.', { type: 'error' }));
+  }
+
   /* The action's own sentence, carried across the reload it triggers. */
   (function showPendingRollbackToast() {
     const pending = sessionStorage.getItem('cd-rollback-toast');
@@ -897,6 +954,7 @@
       case 'hide-channel': setHideOverride(el); return;
       case 'health-reset': rollbackHealth('reset'); return;
       case 'health-step-back': rollbackHealth('step_back'); return;
+      case 'delete-test': deleteTest(el); return;
       case 'jump': {
         const target = document.querySelector(`[data-section="${el.dataset.jumpSection}"]`);
         if (target) target.scrollIntoView({ behavior: 'smooth', block: 'start' });

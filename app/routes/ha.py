@@ -15,11 +15,10 @@ own JS.
 import logging
 
 from flask import Blueprint, jsonify, request
-from sqlalchemy import func
 from werkzeug.security import check_password_hash
 
-from .. import db
 from ..config import load_config
+from ..url_utils import mask_account_urls_in_text
 from ..version import __version__
 from ..database import (
     Account, Recording,
@@ -63,9 +62,11 @@ def ping():
 
 
 def _recording_summary():
-    """capturing/converting counts + the next scheduled recording, from one query - the
-    same statuses dashboard.py::_metric_tiles reads, recomputed here rather than calling
-    it directly since that function returns HTML-formatted tile strings, not JSON."""
+    """capturing/converting counts, the capturing recordings and the next scheduled one,
+    from one query - the same statuses dashboard.py::_metric_tiles reads, recomputed here
+    rather than calling it directly since that function returns HTML-formatted tile strings,
+    not JSON. Recording.channel is lazy='joined', so reading its name per capturing row
+    costs no query of its own (tests/test_ha_api.py::CapturingListQueryCountTests)."""
     recs = Recording.query.filter(
         Recording.status.in_([REC_STATUS_IN_PROGRESS, REC_STATUS_CONVERTING,
                               REC_STATUS_CONCATENATING, REC_STATUS_ANALYZING,
@@ -76,8 +77,17 @@ def _recording_summary():
                                                   REC_STATUS_ANALYZING)]
     scheduled = [r for r in recs if r.status == REC_STATUS_SCHEDULED]
     nxt = scheduled[0] if scheduled else None
+    # capturing_count stays beside the list rather than being derived from it by the
+    # consumer: the shipped 1.0.x integration reads it by name (dev/changelog/1146).
     return {
         'capturing_count': len(capturing),
+        'capturing': [{
+            'id': r.id,
+            'name': r.name,
+            'channel': r.channel.name if r.channel else None,
+            'started_at': r.started_at.isoformat() if r.started_at else None,
+            'stop_time': r.stop_time.isoformat(),
+        } for r in capturing],
         'converting_count': len(converting),
         'next_recording': {
             'id': nxt.id,
@@ -88,15 +98,46 @@ def _recording_summary():
     }
 
 
-def _account_status_summary():
-    """total/ok/error account counts from one GROUP BY query - no existing helper returns
-    exactly this shape (dashboard.py's error-account list is a different consumer's need)."""
-    counts = dict(db.session.query(Account.status, func.count(Account.id))
-                  .group_by(Account.status).all())
+def _iso(value):
+    return value.isoformat() if value else None
+
+
+def _account_status_summary(cfg):
+    """total/ok/error account counts, plus one entry per account for the integration's
+    per-account devices, keyed on id so a rename never breaks an automation.
+
+    The counts keep their names and meanings - the shipped integration reads them - and are
+    counted from the same rows as the list rather than a separate GROUP BY. Next sync comes
+    from next_sync_map(), never the stored column, which goes stale when a sync is deferred
+    (dev/changelog/941). Connections in use are one registry read for every account.
+    last_error is masked on the way out even though the sync stores it masked: it leaves
+    the box here, and the account's own URLs are secret in full."""
+    from ..accounts import next_sync_map
+    from .. import connection_limits as connlim
+
+    accounts = Account.query.order_by(Account.id).all()
+    next_sync = next_sync_map(accounts)
+    in_use = connlim.holder_counts()
+    default_max = cfg.get('accounts', {}).get('default_max_connections', 1)
     return {
-        'total': sum(counts.values()),
-        'ok_count': counts.get('OK', 0),
-        'error_count': counts.get('ERROR', 0),
+        'total': len(accounts),
+        'ok_count': sum(1 for a in accounts if a.status == 'OK'),
+        'error_count': sum(1 for a in accounts if a.status == 'ERROR'),
+        'list': [{
+            'id': a.id,
+            'name': a.name,
+            'type': a.account_type,
+            'status': a.status,
+            'last_sync_at': _iso(a.last_sync_at),
+            'next_sync_at': _iso(next_sync.get(a.id)),
+            'last_error': mask_account_urls_in_text(a.last_error, a.m3u_url, a.epg_url,
+                                                    a.base_url),
+            'channel_count': a.channel_count or 0,
+            'hidden_channel_count': a.hidden_channel_count or 0,
+            'provider_exp_date': _iso(a.provider_exp_date),
+            'connections_in_use': in_use.get(a.id, 0),
+            'max_connections': connlim.limit_for_account(a, default_max),
+        } for a in accounts],
     }
 
 
@@ -104,13 +145,14 @@ def _account_status_summary():
 def status():
     """Combined recording/disk/alerts/accounts snapshot for HA to poll. Assembled from
     existing aggregation helpers (system.py::_disk_bytes, alerts.py::_unread_severity_counts
-    and _latest_unread_alert) plus the two single-query helpers above - never one query per
+    and _latest_unread_alert) plus the two summary helpers above - never one query per
     field, per CLAUDE.md's no-hidden-I/O-in-loops rule (this isn't a loop, but the same "one
     query, not N" spirit)."""
     from .alerts import _latest_unread_alert, _unread_severity_counts
     from .system import DVR_DIR_ROLE, _disk_bytes
 
-    dvr_dir = load_config()['recording']['dvr_output_dir']
+    cfg = load_config()
+    dvr_dir = cfg['recording']['dvr_output_dir']
     disk_total, disk_free = _disk_bytes(dvr_dir, DVR_DIR_ROLE)
     disk_used = (disk_total - disk_free) if disk_total is not None and disk_free is not None else None
     disk = {
@@ -138,5 +180,5 @@ def status():
         'recording': _recording_summary(),
         'disk': disk,
         'alerts': alerts,
-        'accounts': _account_status_summary(),
+        'accounts': _account_status_summary(cfg),
     })

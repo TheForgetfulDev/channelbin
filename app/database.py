@@ -251,6 +251,13 @@ CHANNEL_HEALTH_ROLLBACK = 'CHANNEL_HEALTH_ROLLBACK'
 # The score moving with no observation behind it is the number a user cannot otherwise
 # explain, so this event carries the before/after value and the reason (dev/changelog/951).
 CHANNEL_HEALTH_RECOMPUTED = 'CHANNEL_HEALTH_RECOMPUTED'
+# The user deleted one health check from this channel's Test History
+# (app/health_recompute.py::apply_test_deletion, dev/changelog/1149). Deliberately NOT
+# CHANNEL_HEALTH_ROLLBACK: that type means an observation stopped counting and is still on
+# record, and this one is gone. Written whether or not the test counted, since a row leaving
+# the history is itself worth accounting for; extra_data['counted'] says whether the score
+# moved, with the before/after value.
+CHANNEL_TEST_DELETED = 'CHANNEL_TEST_DELETED'
 # The EPG source a channel's guide comes from moved from one source to another
 # (app/epg_sources.py, DESIGN-epg-sources.md §5.4). Written only for a move between two
 # sources: a channel gaining its first guide or losing its last is counted on the source
@@ -459,6 +466,9 @@ FAILURE_CONVERSION_COLLISION     = 'CONVERSION_COLLISION'
 FAILURE_CONNECTION_SLOT_TIMEOUT  = 'CONNECTION_SLOT_TIMEOUT'
 FAILURE_DVR_DIR_UNUSABLE         = 'DVR_DIR_UNUSABLE'
 FAILURE_MISSED_AT_STARTUP        = 'MISSED_AT_STARTUP'
+# Every account it could record from was blocked by the user (app/account_blocks.py) for the
+# rest of its window. A state the user chose, so it raises no alert (dev/changelog/1151).
+FAILURE_ACCOUNT_BLOCKED          = 'ACCOUNT_BLOCKED'
 # The join. ALL_SEGMENTS_PLACEHOLDER leaves its files on disk, and a Retry join would refuse
 # them again for the same reason, so it offers no recovery.
 FAILURE_ALL_SEGMENTS_PLACEHOLDER = 'ALL_SEGMENTS_PLACEHOLDER'
@@ -475,7 +485,7 @@ FAILURE_REASONS = (
     FAILURE_MAX_CONSECUTIVE_FAILURES, FAILURE_DEAD_STREAM_DETECTED,
     FAILURE_FAST_DELIVERY_DETECTED, FAILURE_LAUNCH_FAILED,
     FAILURE_CONVERSION_COLLISION, FAILURE_CONNECTION_SLOT_TIMEOUT, FAILURE_DVR_DIR_UNUSABLE,
-    FAILURE_MISSED_AT_STARTUP,
+    FAILURE_MISSED_AT_STARTUP, FAILURE_ACCOUNT_BLOCKED,
     FAILURE_ALL_SEGMENTS_PLACEHOLDER, FAILURE_SEGMENT_FILES_MISSING, FAILURE_NO_VALID_SEGMENTS,
     FAILURE_PAUSED_NOTHING_CAPTURED, FAILURE_INSUFFICIENT_DISK_SPACE, FAILURE_CONCAT_ERROR,
     FAILURE_SOURCE_MISSING, FAILURE_CONVERSION_FAILED,
@@ -1140,6 +1150,8 @@ def detach_recording_references(recording_id: int):
         ChannelHealthExclusion.source_kind.in_(RECORDING_SOURCE_KINDS),
         ChannelHealthExclusion.source_id == recording_id,
     ).delete(synchronize_session=False)
+    # A block set on a recording takes its window from the row, so it means nothing without it.
+    AccountBlock.query.filter_by(recording_id=recording_id).delete(synchronize_session=False)
 
 
 def group_event_channel_links(events) -> dict:
@@ -1396,6 +1408,33 @@ class M3uAccount(Account):
 
 class XtreamAccount(Account):
     __mapper_args__ = {'polymorphic_identity': 'xtream'}
+
+
+class AccountBlock(db.Model):
+    """A stretch of time during which ChannelBin keeps off an account - so a TV can watch
+    live on it while ChannelBin records from the others (app/account_blocks.py,
+    dev/changelog/1151).
+
+    Two shapes, and exactly one of them per row. A block set on a recording carries
+    `recording_id` and NO times of its own: its window is that recording's, read live, so
+    moving, extending, stopping or cancelling the recording carries the block with it and
+    there is no copy to drift. A block set on the account carries `start_time`/`stop_time`
+    and no recording.
+
+    A user's answer to a judgment call, written only by the explicit user action
+    (CLAUDE.md, participation-switch rule): nothing derives it and nothing clears it early
+    on the user's behalf. It simply stops mattering once its window has passed.
+    """
+    __tablename__ = 'account_blocks'
+
+    id           = db.Column(db.Integer, primary_key=True)
+    account_id   = db.Column(db.Integer, db.ForeignKey('accounts.id'), nullable=False, index=True)
+    recording_id = db.Column(db.Integer, db.ForeignKey('recordings.id'), nullable=True, index=True)
+    start_time   = db.Column(db.DateTime)   # naive UTC; set only when recording_id is NULL
+    stop_time    = db.Column(db.DateTime)   # naive UTC; set only when recording_id is NULL
+    #: How many of the account's connection slots the block takes. NULL = every slot.
+    slots        = db.Column(db.Integer)
+    created_at   = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
 
 
 # ── Channel group format strategy ─────────────────────────────────────────────

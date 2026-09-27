@@ -20,7 +20,12 @@
     The status-dependent primary action is the `status_action` macro, rendered exactly
     twice: once in the inline bar you land on, once in the phone's sticky bottom bar
     (§17.5 item 3). Built once so the two can never offer different things; the
-    conformance test asserts the count is two, never one or three. #}
+    conformance test asserts the count is two, never one or three.
+
+    The page keeps itself current through a sync (dev/changelog/1152): account-detail.js
+    swaps the elements named in its LIVE_REGIONS list for a fresh render of this page, so
+    each of those ids is a contract with that file. The history rows are never among them -
+    that file draws them itself. #}
 
 {% set st = account.status %}
 {% set is_xtream = account_type == 'xtream' %}
@@ -67,7 +72,7 @@
 </div>
 
 {# ── Header ─────────────────────────────────────────────────────────────── #}
-<div class="gd-head">
+<div class="gd-head" id="acct-head">
   <div class="gd-head-main">
     <div class="gd-title">
       <span class="color-dot color-dot-lg" style="background: {{ account.color }}"
@@ -76,6 +81,7 @@
       {{ status_badge(st) }}
       {{ m.account_type_badge(account_type) }}
       {{ m.account_extra_badges(account) }}
+      {{ m.account_block_badge(blocks) }}
     </div>
     <p class="gd-sub-lead">
       {% if st == 'UNSYNCED' %}
@@ -100,6 +106,7 @@
 {# ── Banners. Above the action bar on purpose: a problem with the account should be read
      before the line telling you when it last ran. Each says what it MEANS, not just that
      it happened (DESIGN.md §17.3). ────────────────────────────────────────── #}
+<div id="acct-notices">
 {% if st == 'ERROR' and account.last_error %}
 <div class="notice notice-bad">
   <strong>&#9888; The last sync failed</strong><br>
@@ -120,6 +127,22 @@
   mode are the first two things to check.
 </div>
 {% endif %}
+{# Every block in force or still to come, each with its own way out. Info, not a warning:
+   the user set it (app/account_blocks.py, dev/changelog/1151). #}
+{% if blocks %}
+<div class="notice notice-info" id="acct-blocks">
+  <strong>Account use is blocked</strong><br>
+  While a block is in force nothing in ChannelBin opens a stream on this account - no recording,
+  failover, health check or preview. A channel group records from members on other accounts; a
+  recording with nowhere else to go waits for the block to end.
+  {% for b in blocks %}
+  <div class="acct-block-line">
+    <span>{% if b.active %}Until {{ b.stop_label }}{% else %}From {{ b.start_label }} until {{ b.stop_label }}{% endif %}{% if b.slots %}, {{ b.slots }} connection{{ 's' if b.slots != 1 }}{% endif %}{% if b.recording_id %}, during <a href="{{ url_for('recordings.recording_detail', recording_id=b.recording_id) }}">{{ b.recording_name }}</a>{% endif %}</span>
+    <button class="btn btn-sm" data-act="unblock" data-block-id="{{ b.id }}">Unblock</button>
+  </div>
+  {% endfor %}
+</div>
+{% endif %}
 {% if not account.sync_enabled and st != 'UNSYNCED' %}
 <div class="notice notice-info">
   <strong>Automatic sync is off for this account</strong><br>
@@ -127,6 +150,7 @@
   Last sync {{ account.last_sync_at | time_ago if account.last_sync_at else 'never' }}.
 </div>
 {% endif %}
+</div>
 
 {# ── Status / action bar ────────────────────────────────────────────────── #}
 <div class="gd-actionbar" id="acct-actionbar">
@@ -158,6 +182,7 @@
     <span class="menu-wrap">
       <button class="btn btn-sm btn-icon" data-menu aria-label="More actions">&#8943;</button>
       <div class="menu" id="acct-kebab">
+        <button class="menu-item" data-act="block">Block account use&hellip;</button>
         <button class="menu-item" data-act="settings">Edit settings&hellip;</button>
         <button class="menu-item" data-act="sections">Customize sections&hellip;</button>
         <div class="sep"></div>
@@ -189,7 +214,7 @@
         <button class="btn btn-sm" data-act="settings">Edit settings</button>
       </div>
     </div>
-    <div class="card-body">
+    <div class="card-body" id="acct-details-body">
       <div class="statlist has-wide">
         {{ m.stat_row('Type', 'Xtream API' if is_xtream else 'M3U playlist') }}
         {{ m.stat_row('Status', st, 'ok' if st == 'OK' else ('bad' if st == 'ERROR' else 'faint')) }}
@@ -254,7 +279,7 @@
         <a class="btn btn-sm" href="{{ url_for('channels.channel_browser', **{'f.acct': account.id}) }}">Browse channels <span class="arw">&#8594;</span></a>
       </div>
     </div>
-    <div class="card-body">
+    <div class="card-body" id="acct-content-body">
       <div class="statlist">
         <div class="srow"><span class="sk">Channels</span><span class="sv">
           {% if account.channel_count %}<a class="sv-link" href="{{ url_for('channels.channel_browser', **{'f.acct': account.id}) }}">{{ '{:,}'.format(account.channel_count) }}</a>{% else %}<span class="text-faint">0</span>{% endif %}{% if account.hidden_channel_count %} <span class="text-faint">({{ '{:,}'.format(account.hidden_channel_count) }} hidden)</span>{% endif %}</span></div>
@@ -323,7 +348,7 @@
                 data-tip="Add an XMLTV guide file, or another account's guide, as a source for this account's channels.">+ Add source</button>
       </div>
     </div>
-    <div class="card-body">
+    <div class="card-body" id="acct-sources-body">
       {% if not epg_sources %}
       <p class="card-note">This account reads no EPG source, so no guide data is imported for its channels. Add source takes an XMLTV URL or another account's guide.</p>
       {% else %}
@@ -409,14 +434,14 @@
      error spanning full width; no column is dropped, because the error text is the only
      place a failed sync says WHY (§16.5 item 5 beats §9.5, §17.5 item 5). #}
   <div class="card" data-section="history">
-    <div class="card-head"><h2>Sync history{% if total_syncs %} <span class="cnt">{{ total_syncs }}</span>{% endif %}</h2>
+    <div class="card-head" id="acct-hist-head"><h2>Sync history{% if total_syncs %} <span class="cnt">{{ total_syncs }}</span>{% endif %}</h2>
       {% if has_more_syncs %}
       <div class="card-head-actions">
         <button class="btn btn-sm" id="acct-hist-more" data-total="{{ total_syncs }}">All {{ '{:,}'.format(total_syncs) }} syncs</button>
       </div>
       {% endif %}
     </div>
-    <div class="card-body">
+    <div class="card-body" id="acct-hist-body">
       {% if not logs %}
       {# The empty state is server-rendered, and it renders INSIDE this card, head and all
          (§17.3): a bare empty box floating where a card should be leaves the section
@@ -442,7 +467,7 @@
         <a class="btn btn-sm" href="{{ url_for('logs.logs_page') }}">Logs <span class="arw">&#8594;</span></a>
       </div>
     </div>
-    <div class="card-body">
+    <div class="card-body" id="acct-activity-body">
       {% if not log_rows %}
       <div class="empty-state"><p><strong>Nothing has happened yet</strong></p>
         <p class="text-muted" style="font-size:13px;">Activity appears here once this account has been synced.</p></div>
@@ -453,11 +478,14 @@
          datetimes rather than the ISO strings the JSON shape carries. #}
       <div class="acct-activity">
         {% for log in log_rows[:6] %}
+        {# A running sync's row says IN_PROGRESS (app/accounts.py opens it that way); a NULL
+           is read the same, as a row from before that. #}
+        {% set running = not log.status or log.status == 'IN_PROGRESS' %}
         <div class="acct-act">
-          <span class="acct-act-dot {{ 'bad' if log.status == 'ERROR' else ('warn' if log.status == 'PARTIAL' else ('faint' if log.status in ('CANCELLED', 'SKIPPED') else ('live' if not log.status else 'ok'))) }}"></span>
+          <span class="acct-act-dot {{ 'live' if running else ('bad' if log.status == 'ERROR' else ('warn' if log.status == 'PARTIAL' else ('faint' if log.status in ('CANCELLED', 'SKIPPED') else 'ok'))) }}"></span>
           <div class="acct-act-body">
             <div class="acct-act-line">
-              {% if not log.status %}Sync started.
+              {% if running %}Sync started.
               {% elif log.status == 'SUCCESS' %}Sync finished: {{ '{:,}'.format(log.channels_synced or 0) }} channels{% if log.channels_added is not none and log.channels_removed is not none %} ({% if log.channels_added %}<a href="{{ new_channels_url }}">{{ '{:,}'.format(log.channels_added) }} added</a>{% else %}<span class="text-faint">0 added</span>{% endif %}, {% if log.channels_removed %}<a href="{{ removed_channels_url }}">{{ '{:,}'.format(log.channels_removed) }} removed</a>{% else %}<span class="text-faint">0 removed</span>{% endif %}){% endif %}{{ skipped_clause(log) }}, {{ '{:,}'.format(log.epg_entries_synced or 0) }} program entries{% if log.completed_at and log.started_at %} in {{ (log.completed_at - log.started_at).total_seconds() | duration }}{% endif %}.
               {% elif log.status == 'PARTIAL' %}Sync finished with gaps: {{ '{:,}'.format(log.channels_synced or 0) }} channels{% if log.channels_added is not none and log.channels_removed is not none %} ({% if log.channels_added %}<a href="{{ new_channels_url }}">{{ '{:,}'.format(log.channels_added) }} added</a>{% else %}<span class="text-faint">0 added</span>{% endif %}, {% if log.channels_removed %}<a href="{{ removed_channels_url }}">{{ '{:,}'.format(log.channels_removed) }} removed</a>{% else %}<span class="text-faint">0 removed</span>{% endif %}){% endif %}{{ skipped_clause(log) }}, {{ '{:,}'.format(log.epg_entries_synced or 0) }} program entries. {{ log.error_message or 'Part of the import did not complete.' }}
               {% elif log.status == 'ERROR' %}Sync failed. {{ log.error_message or 'No reason was recorded.' }}
@@ -484,7 +512,7 @@
    failure the browser pass found (dev/changelog/453). Its primary comes from the SAME
    macro as the inline one, so the two cannot offer different things. #}
 <div class="acct-stickybar actbar-reveal" id="acct-stickybar" aria-hidden="true">
-  <div class="acct-stickybar-in">
+  <div class="acct-stickybar-in" id="acct-stickybar-in">
     {{ status_action(st, account) }}
     <button class="btn btn-icon" data-act="page-actions" aria-label="More actions">&#8943;</button>
   </div>
@@ -492,24 +520,33 @@
 {% endblock %}
 
 {% block scripts %}
+{# What a sync can change, as data: account-detail.js reads it at load and again after each
+   refresh, which swaps this element with the regions above. The history rows are drawn
+   from `logs` by the page's one history renderer, so the status bar and the history come
+   from one render and cannot disagree. `syncSig` is the accounts.sync_signature() this page
+   was read at, compared against /api/nav-status's account_sync (dev/changelog/1152). #}
+<script type="application/json" id="acct-state">{{ {
+  'status': account.status,
+  'channels': account.channel_count or 0,
+  'epg': account.epg_entry_count or 0,
+  'totalSyncs': total_syncs,
+  'logs': logs,
+  'syncPrompt': sync_prompt,
+  'syncSig': sync_sig,
+} | tojson }}</script>
 <script>
 window.ACCOUNT_DETAIL = {
   id: {{ account.id }},
   name: {{ account.name | tojson }},
-  status: {{ account.status | tojson }},
   accountType: {{ account_type | tojson }},
-  channels: {{ account.channel_count or 0 }},
-  epg: {{ account.epg_entry_count or 0 }},
-  totalSyncs: {{ total_syncs }},
-  historyShown: {{ logs | length }},
-  logs: {{ logs | tojson }},
   sections: {{ sections | tojson }},
   sectionPref: {{ section_pref | tojson }},
   xtreamDebug: {{ 'true' if xtream_debug else 'false' }},
-  syncPrompt: {{ sync_prompt | tojson }},
   browseUrl: {{ url_for('channels.channel_browser', **{'f.acct': account.id}) | tojson }},
   accountsUrl: {{ url_for('accounts.accounts_list') | tojson }},
   sourceHours: {{ source_hours_choices | list | tojson }},
+  maxConnections: {{ settings.max_connections }},
+  blockMaxHours: {{ block_max_hours }},
 };
 </script>
 <script src="{{ url_for('static', filename='js/account-modal.js') }}"></script>

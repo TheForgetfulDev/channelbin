@@ -123,10 +123,11 @@ Sync cancelled before it finished.
        data-channels="{{ account.channel_count or 0 }}"
        data-epg="{{ account.epg_entry_count or 0 }}"
        data-sync-prompt="{{ sync_prompts[account.id] | tojson | forceescape }}"
+       data-limit="{{ conn_limits.get(account.id, 1) }}"
        data-href="{{ url_for('accounts.account_detail', account_id=account.id) }}">
     <span class="a-title">
       <a class="a-name" href="{{ url_for('accounts.account_detail', account_id=account.id) }}">{{ account.name }}</a>
-      <span class="a-badges">{{ m.account_type_badge(acct_type, tip=false) }}{{ m.account_extra_badges(account, tip=false) }}</span>
+      <span class="a-badges">{{ m.account_type_badge(acct_type, tip=false) }}{{ m.account_extra_badges(account, tip=false) }}{{ m.account_block_badge(blocks.get(account.id, []), tip=false) }}</span>
       <span class="a-meta">
         {% if account.last_sync_at %}Synced {{ account.last_sync_at | time_ago }}{% else %}Never synced{% endif %}
         {{ sparkline(logs_by_account.get(account.id, [])) }}
@@ -158,6 +159,7 @@ Sync cancelled before it finished.
           {% endif %}
           <button class="menu-item" data-act="force-epg"{% if syncing %} disabled{% endif %}>Force EPG resync</button>
           <div class="sep"></div>
+          <button class="menu-item" data-act="block">Block account use&hellip;</button>
           <button class="menu-item" data-act="settings">Edit settings</button>
           <a class="menu-item" href="{{ url_for('channels.channel_browser', **{'f.acct': account.id}) }}">Browse channels</a>
           <div class="sep"></div>

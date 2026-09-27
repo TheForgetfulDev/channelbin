@@ -33,8 +33,28 @@ HOLDER_LABELS = {
 }
 
 
-def _limit_for_account(account, default_max_connections: int) -> int:
+def limit_for_account(account, default_max_connections: int) -> int:
+    """The account's configured limit, before any block (app/account_blocks.py) is taken
+    out of it. What a slot decision compares against is _usable_limit()."""
     return account.max_connections or default_max_connections
+
+
+def _blocked_slots_now(account_ids) -> dict:
+    """{account_id: slots a block takes right now} - read BEFORE _lock is taken, since it is
+    a query and the lock guards only the in-memory holder list."""
+    from .account_blocks import blocked_slots, blocks_at
+    return blocked_slots(blocks_at(account_ids=account_ids))
+
+
+def _usable_limit(account, default_max_connections: int, blocked: dict) -> int:
+    """How many connections ChannelBin may hold on `account` right now: its limit less what
+    a block takes. 0 while a block takes every slot, which is what turns every acquire on a
+    blocked account into the refusal its caller already handles (dev/changelog/1151)."""
+    from .account_blocks import effective_limit
+    limit = limit_for_account(account, default_max_connections)
+    if account.id not in blocked:
+        return limit
+    return effective_limit(limit, blocked[account.id])
 
 
 def try_acquire(account_id: int, holder_kind: str, holder_id) -> bool:
@@ -52,6 +72,7 @@ def try_acquire(account_id: int, holder_kind: str, holder_id) -> bool:
     # override with its own max_connections) is still read under the lock, since
     # that must see the current value.
     default_max_connections = load_config().get('accounts', {}).get('default_max_connections', 1)
+    blocked = _blocked_slots_now([account_id])
     with _lock:
         account = db.session.get(Account, account_id)
         if account is None:
@@ -60,7 +81,7 @@ def try_acquire(account_id: int, holder_kind: str, holder_id) -> bool:
         key = (holder_kind, holder_id)
         if key in holders:
             return True
-        if len(holders) >= _limit_for_account(account, default_max_connections):
+        if len(holders) >= _usable_limit(account, default_max_connections, blocked):
             return False
         holders.append(key)
         return True
@@ -78,11 +99,13 @@ def at_limit(account_id: int) -> bool:
     from .config import load_config
     from .database import Account
     default_max_connections = load_config().get('accounts', {}).get('default_max_connections', 1)
+    blocked = _blocked_slots_now([account_id])
     with _lock:
         account = db.session.get(Account, account_id)
         if account is None:
             return True
-        return len(_holders[account_id]) >= _limit_for_account(account, default_max_connections)
+        return len(_holders[account_id]) >= _usable_limit(account, default_max_connections,
+                                                          blocked)
 
 
 def accounts_without_free_recording_slot(account_ids, exclude_holder=None) -> set:
@@ -111,7 +134,8 @@ def accounts_without_free_recording_slot(account_ids, exclude_holder=None) -> se
     if not ids:
         return set()
     default_max_connections = load_config().get('accounts', {}).get('default_max_connections', 1)
-    limits = {a.id: _limit_for_account(a, default_max_connections)
+    blocked = _blocked_slots_now(ids)
+    limits = {a.id: _usable_limit(a, default_max_connections, blocked)
               for a in Account.query.filter(Account.id.in_(ids)).all()}
     full = set()
     with _lock:
@@ -127,6 +151,35 @@ def accounts_without_free_recording_slot(account_ids, exclude_holder=None) -> se
             if held >= limit:
                 full.add(account_id)
     return full
+
+
+def must_yield_to_block(account_id: int, recording_id: int) -> bool:
+    """True when a block now leaves `account_id` fewer usable slots than the recordings
+    holding one, and `recording_id` is one of them - so it should move to another member if
+    it has one. Advisory, like at_limit(): two recordings on one partly blocked account may
+    both answer True and both try to move, and a move that finds nowhere to go stays put."""
+    from . import db
+    from .config import load_config
+    from .database import Account
+    blocked = _blocked_slots_now([account_id])
+    if account_id not in blocked:
+        return False
+    default_max_connections = load_config().get('accounts', {}).get('default_max_connections', 1)
+    account = db.session.get(Account, account_id)
+    if account is None:
+        return False
+    usable = _usable_limit(account, default_max_connections, blocked)
+    with _lock:
+        recordings = [h for h in _holders.get(account_id, ()) if h[0] == 'recording']
+    return ('recording', recording_id) in recordings and len(recordings) > usable
+
+
+def holder_counts() -> dict:
+    """{account_id: slots held right now, every holder kind} for every account holding
+    one. Advisory, like at_limit(), and taken in one pass under the lock so a caller
+    reporting on many accounts never asks once per account."""
+    with _lock:
+        return {account_id: len(holders) for account_id, holders in _holders.items() if holders}
 
 
 def describe_holders(account_id: int) -> str:

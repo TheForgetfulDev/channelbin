@@ -856,8 +856,11 @@ def channel_detail(channel_id):
     # How many step-backs are available and what the next one would leave the score at -
     # both promised in the confirm dialogs, so both come from the same replay that will run
     # (app/health_recompute.py). A fixed handful of queries, none of them per row.
-    from ..health_recompute import rollback_preview
+    from ..health_recompute import excluded_keys, rollback_preview, SOURCE_TEST
     health_rollback = rollback_preview(channel, cfg)
+    # Test History marks a rolled-back test the way the Activity Timeline does, or a test
+    # that no longer counts reads exactly like one that does. One query for the whole set.
+    excluded_test_ids = {sid for kind, sid in excluded_keys(channel.id) if kind == SOURCE_TEST}
 
     # Where this channel's guide comes from and why (DESIGN-epg-sources.md §9.3). A fixed
     # handful of queries whatever the number of sources.
@@ -893,6 +896,7 @@ def channel_detail(channel_id):
         coded_tip=fmt_utils.CODED_TIP,
         final_health_score=final_health_score,
         health_rollback=health_rollback,
+        excluded_test_ids=excluded_test_ids,
         pace_realtime_default=bool(cfg.get('ffmpeg', {}).get('pace_realtime', False)),
         recording_observations=recording_observations,
         timeline_entries=timeline_entries,
@@ -1375,6 +1379,11 @@ def test_channel_now(channel_id):
     if get_status()['is_running']:
         return jsonify({'error': 'A health check is already running - please wait for it to finish'}), 409
     if connlim.at_limit(channel.account_id):
+        from ..account_blocks import blocked_reason
+        blocked = blocked_reason(channel.account_id, channel.account.name, capital=True)
+        if blocked:
+            return jsonify({'error': f'{blocked}, so nothing is '
+                                     f'tested on it until then.'}), 409
         return jsonify({'error': f'{channel.account.name} is at its connection limit right now '
                                  f'(a recording or another test is using it)'}), 409
 
@@ -1619,6 +1628,77 @@ def rollback_health_score(channel_id):
 
     return jsonify({'success': True, 'result': result,
                     'preview': rollback_preview(channel, cfg)})
+
+
+def _deletable_test_or_error(channel_id, test_id):
+    """(channel, test, None) or (None, None, error response) for a per-test delete.
+
+    The test must belong to the channel named in the URL - the page never decides that
+    (CLAUDE.md, enforcement lives server-side). A test the tester is still running against
+    is refused: its results are written back to the row when it finishes, and its score
+    would then blend into the channel with no test left on record behind it.
+    """
+    channel = db.session.get(Channel, channel_id)
+    if channel is None:
+        return None, None, (jsonify({'error': 'Channel not found'}), 404)
+    test = db.session.get(ChannelTest, test_id)
+    if test is None or test.channel_id != channel_id:
+        return None, None, (jsonify({'error': 'Health check not found on this channel'}), 404)
+    status = get_status()
+    if (test.test_ended_at is None and status['is_running']
+            and status['current_channel_id'] == channel_id):
+        return None, None, (jsonify({'error': 'This health check is still running - '
+                                              'wait for it to finish'}), 409)
+    return channel, test, None
+
+
+@channels_bp.route('/api/channels/<int:channel_id>/tests/<int:test_id>/delete-preview')
+def preview_delete_channel_test(channel_id, test_id):
+    """What deleting one health check would do to the score, for the confirm dialog.
+
+    Asked per click rather than rendered per row: each answer is a full replay of the
+    channel's ledger, and a Test History page can list every test the channel has.
+    """
+    from ..health_recompute import preview_test_deletion
+
+    channel, test, error = _deletable_test_or_error(channel_id, test_id)
+    if error:
+        return error
+    return jsonify({'success': True,
+                    'preview': preview_test_deletion(channel, test, load_config())})
+
+
+@channels_bp.route('/api/channels/<int:channel_id>/tests/<int:test_id>/delete', methods=['POST'])
+def delete_channel_test(channel_id, test_id):
+    """Delete one health check - the row and its screenshot - and replay the score without it.
+
+    app/health_recompute.py::apply_test_deletion holds the reasoning for deleting rather
+    than excluding, and the replay itself.
+    """
+    from ..health_recompute import apply_test_deletion
+    from ..recorder import delete_files
+
+    _, _, error = _deletable_test_or_error(channel_id, test_id)
+    if error:
+        return error
+
+    cfg = load_config()
+
+    @retry_on_locked()
+    def _delete_and_commit():
+        ch = db.session.get(Channel, channel_id)
+        t = db.session.get(ChannelTest, test_id)
+        if t is None or t.channel_id != channel_id:
+            return None, []
+        result, paths = apply_test_deletion(ch, t, cfg)
+        db.session.commit()
+        return result, paths
+
+    result, paths = _delete_and_commit()
+    if result is None:
+        return jsonify({'error': 'Health check not found on this channel'}), 404
+    delete_files(paths)
+    return jsonify({'success': True, 'result': result})
 
 
 # ---------------------------------------------------------------------------

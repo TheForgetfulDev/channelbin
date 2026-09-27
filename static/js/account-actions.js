@@ -220,3 +220,79 @@ function buildDeleteAccountModal(opts, readers) {
     ],
   });
 }
+
+/* Block the account for a while (app/account_blocks.py, dev/changelog/1151): nothing in
+   ChannelBin opens a stream on it until the block ends, so a TV can watch live on it.
+   Timed only - a block exists so nobody has to remember to turn anything back on. The
+   server bounds it at `maxHours`. `limit` is the account's connection limit; the slot count
+   is only asked for above one. */
+const BLOCK_DURATIONS = [[30, '30 minutes'], [60, '1 hour'], [120, '2 hours'], [180, '3 hours'],
+  [240, '4 hours']];
+
+function confirmBlockAccount(opts = {}) {
+  const limit = Number(opts.limit || 1);
+  const maxHours = Number(opts.maxHours || 24);
+  const durations = BLOCK_DURATIONS.map(([m, label]) =>
+    `<option value="${m}"${m === 120 ? ' selected' : ''}>${label}</option>`).join('');
+  let slots = '';
+  if (limit > 1) {
+    const choices = [`<option value="">All ${limit} connections</option>`];
+    for (let n = 1; n < limit; n++) choices.push(`<option value="${n}">${n} of ${limit}</option>`);
+    slots = fieldRow({ label: 'Connections', control:
+      `<select id="block-slots" class="form-control">${choices.join('')}</select>` });
+  }
+  const body = document.createElement('div');
+  body.innerHTML =
+    `<p>Keep ChannelBin off <strong>${escHtml(opts.name || '')}</strong> for a while, so a ` +
+    'TV can watch live on it.</p>' +
+    fieldRow({ label: 'For', control:
+      `<select id="block-for" class="form-control">${durations}` +
+      '<option value="until">Until a time...</option></select>' }) +
+    '<div id="block-until-row" style="display:none">' +
+    fieldRow({ label: 'Until', control:
+      '<input type="datetime-local" id="block-until" class="form-control">' }) +
+    '</div>' + slots +
+    '<p class="text-muted small" style="margin-top:8px">No recording, failover, health check ' +
+    'or preview uses the account until then. A channel group records from members on other ' +
+    'accounts; a recording with nowhere else to go waits for the block to end. A recording ' +
+    'already running on it moves to another member if it has one. If another account reaches ' +
+    'the same provider account, block that one too. At most ' +
+    `${maxHours} hours.</p>`;
+  const forSel = body.querySelector('#block-for');
+  const untilRow = body.querySelector('#block-until-row');
+  forSel.addEventListener('change', () => {
+    untilRow.style.display = forSel.value === 'until' ? '' : 'none';
+  });
+
+  buildModal({
+    title: 'Block account use',
+    body,
+    footer: [
+      { label: 'Cancel', class: 'btn', onClick: (c) => c() },
+      {
+        label: 'Block account use',
+        class: 'btn btn-primary',
+        onClick: (close) => {
+          const payload = {};
+          if (forSel.value === 'until') payload.until = body.querySelector('#block-until').value;
+          else payload.minutes = Number(forSel.value);
+          const slotSel = body.querySelector('#block-slots');
+          if (slotSel && slotSel.value) payload.slots = Number(slotSel.value);
+          jsonFetch(`/api/accounts/${opts.id}/blocks`, {
+            method: 'POST',
+            body: JSON.stringify(payload),
+          })
+            .then((res) => { close(); accountActionDone(res, opts); })
+            .catch((e) => accountActionFailed(e.message || 'The account could not be blocked.', opts));
+          return false;
+        },
+      },
+    ],
+  });
+}
+
+function accountUnblock(id, blockId, opts = {}) {
+  return jsonFetch(`/api/accounts/${id}/blocks/${blockId}`, { method: 'DELETE' })
+    .then((res) => accountActionDone(res, opts))
+    .catch((e) => accountActionFailed(e.message || 'The block could not be ended.', opts));
+}
