@@ -1917,7 +1917,7 @@ def _m054_drop_guide_check_retarget_announcement(conn, cur):
         log.info('Removed the health check retarget announcement flag')
 
 
-#: The table-constraint primary key SQLAlchemy emits for `recordings` without
+#: The table-constraint primary key SQLAlchemy emits for a model without
 #: sqlite_autoincrement, and the inline form it emits with it. AUTOINCREMENT is only legal on
 #: the inline spelling, so the rebuild below has to move the clause, not just append a keyword.
 _PK_TABLE_CONSTRAINT = '\n\tPRIMARY KEY (id), '
@@ -1925,26 +1925,70 @@ _PK_COLUMN_OLD = 'id INTEGER NOT NULL,'
 _PK_COLUMN_NEW = 'id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,'
 
 
-def _recordings_autoincrement_ddl(old_sql: str, table_name: str) -> str:
-    """Rewrite `recordings`' CREATE TABLE so its primary key carries AUTOINCREMENT.
+def _autoincrement_ddl(old_sql: str, table: str, new_name: str) -> str:
+    """Rewrite `table`'s stored CREATE TABLE, renamed to `new_name`, so its primary key
+    carries AUTOINCREMENT.
 
     Derived from the DDL actually stored in sqlite_master rather than written out here, so
     the rebuilt table is the source table's own vintage down to the column list, types and
     defaults - nothing to drift out of step with the model, and nothing for a later step that
     adds a column to collide with. The only difference is where the primary key is declared.
 
-    Raises if either edit finds nothing. A rebuild that quietly produced a table without
+    Raises if any edit finds nothing. A rebuild that quietly produced a table without
     AUTOINCREMENT would leave the id still being re-issued while every check for the column's
     presence passed, which is the silent half-success this app refuses on principle.
     """
-    new_sql = old_sql.replace('CREATE TABLE recordings', f'CREATE TABLE {table_name}', 1)
-    if _PK_COLUMN_OLD not in new_sql or _PK_TABLE_CONSTRAINT not in new_sql:
+    header = f'CREATE TABLE {table} ('
+    if (not old_sql.startswith(header) or _PK_COLUMN_OLD not in old_sql
+            or _PK_TABLE_CONSTRAINT not in old_sql):
         raise RuntimeError(
-            'Cannot rebuild the recordings table with AUTOINCREMENT: its stored CREATE TABLE '
-            'does not carry the expected primary key clauses '
-            f'({_PK_COLUMN_OLD!r} and {_PK_TABLE_CONSTRAINT.strip()!r}). Stored DDL:\n{old_sql}')
+            f'Cannot rebuild the {table} table with AUTOINCREMENT: its stored CREATE TABLE '
+            f'does not carry the expected header and primary key clauses ({header!r}, '
+            f'{_PK_COLUMN_OLD!r} and {_PK_TABLE_CONSTRAINT.strip()!r}). Stored DDL:\n{old_sql}')
+    new_sql = f'CREATE TABLE {new_name} (' + old_sql[len(header):]
     new_sql = new_sql.replace(_PK_COLUMN_OLD, _PK_COLUMN_NEW, 1)
     return new_sql.replace(_PK_TABLE_CONSTRAINT, '', 1)
+
+
+def _rebuild_with_autoincrement(conn, cur, table: str):
+    """Rebuild `table` with AUTOINCREMENT by SQLite's documented copy/drop/rename procedure.
+    Shared by every step that retires a table's deleted ids (55, 77, 78); migration 55's
+    docstring carries the reasoning for each load-bearing detail.
+
+    The table's own indexes go with the DROP, so their stored CREATE INDEX statements are
+    read first and re-run after the rename - the rename keeps their names free. Autoindexes
+    (NULL sql) are rebuilt by the CREATE TABLE itself. Nothing in this app declares a trigger
+    or a view, which is why neither is carried.
+
+    Idempotent: a table already carrying AUTOINCREMENT, or one that does not exist (a fresh
+    create_all() build is already in the current shape), is left alone.
+    """
+    row = cur.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone()
+    if row is None:
+        return
+    old_sql = row[0]
+    if 'AUTOINCREMENT' in old_sql:
+        return
+
+    tmp_name = f'{table}_autoinc_new'
+    new_sql = _autoincrement_ddl(old_sql, table, tmp_name)
+    columns = ', '.join(f'"{r[1]}"' for r in cur.execute(f'PRAGMA table_info({table})'))
+    index_sql = [r[0] for r in cur.execute(
+        "SELECT sql FROM sqlite_master WHERE type='index' AND tbl_name=? AND sql IS NOT NULL "
+        "ORDER BY name", (table,))]
+
+    if not conn.in_transaction:
+        cur.execute('BEGIN')
+    cur.execute(new_sql)
+    cur.execute(f'INSERT INTO {tmp_name} ({columns}) SELECT {columns} FROM {table}')
+    copied = cur.rowcount
+    cur.execute(f'DROP TABLE {table}')
+    cur.execute(f'ALTER TABLE {tmp_name} RENAME TO {table}')
+    for sql in index_sql:
+        cur.execute(sql)
+    log.info('Rebuilt the %s table with AUTOINCREMENT (%d row(s), %d index(es) carried over); '
+             'a deleted id is no longer re-issued', table, copied, len(index_sql))
 
 
 def _m055_recordings_autoincrement(conn, cur):
@@ -1979,8 +2023,8 @@ def _m055_recordings_autoincrement(conn, cur):
       can be issued once more. That residual is what detach_recording_references() covers,
       which is why both halves stay. Seeding by hand would only help if the rows were being
       discarded rather than copied.
-    * **No indexes, triggers or views to recreate.** `recordings` carries none, which is why
-      the usual step 7 of the rebuild procedure is absent rather than forgotten.
+    * **No indexes, triggers or views to recreate.** `recordings` carries none. The shared
+      rebuild still carries any index a table has, for the steps that followed this one.
 
     The rename leaves the stored DDL reading `CREATE TABLE "recordings"` where a fresh
     create_all() build reads it unquoted - SQLite's own spelling of the identifier it just
@@ -1994,27 +2038,7 @@ def _m055_recordings_autoincrement(conn, cur):
 
     Idempotent: a table already carrying AUTOINCREMENT is left alone.
     """
-    row = cur.execute(
-        "SELECT sql FROM sqlite_master WHERE type='table' AND name='recordings'").fetchone()
-    if row is None:
-        return  # nothing to rebuild; create_all() will have built it in the current shape
-    old_sql = row[0]
-    if 'AUTOINCREMENT' in old_sql:
-        return
-
-    tmp_name = 'recordings_autoinc_new'
-    new_sql = _recordings_autoincrement_ddl(old_sql, tmp_name)
-    columns = ', '.join(f'"{r[1]}"' for r in cur.execute('PRAGMA table_info(recordings)'))
-
-    if not conn.in_transaction:
-        cur.execute('BEGIN')
-    cur.execute(new_sql)
-    cur.execute(f'INSERT INTO {tmp_name} ({columns}) SELECT {columns} FROM recordings')
-    copied = cur.rowcount
-    cur.execute('DROP TABLE recordings')
-    cur.execute(f'ALTER TABLE {tmp_name} RENAME TO recordings')
-    log.info('Rebuilt the recordings table with AUTOINCREMENT (%d row(s) carried over); '
-             'a deleted recording id is no longer re-issued', copied)
+    _rebuild_with_autoincrement(conn, cur, 'recordings')
 
 
 def _m056_segment_content_duration(conn, cur):
@@ -2659,6 +2683,81 @@ def _m076_group_default_profile(conn, cur):
     conn.commit()
 
 
+def _m077_channel_tests_autoincrement(conn, cur):
+    """Rebuild `channel_tests` with AUTOINCREMENT, the same fix migration 55 made for
+    `recordings` (dev/changelog/1129).
+
+    A health-score exclusion names a test by id, and SQLite handed a test deleted from the
+    top of the table's number to the next test created - so a new check on the same channel
+    inherited the old one's exclusion and was silently left out of the score. Deleting an
+    on-demand job's results and re-running it is the realistic path, since the freed ids come
+    back in the same order. delete_tests_collecting_screenshots() now removes those exclusions
+    with their test; this step is the other half, for every consumer of a test id nobody has
+    written yet. Both stay, for the reason migration 55's docstring gives.
+
+    The three indexes on the table are carried across by the shared rebuild. Idempotent."""
+    _rebuild_with_autoincrement(conn, cur, 'channel_tests')
+
+
+def _m078_channel_events_autoincrement(conn, cur):
+    """Rebuild `channel_events` with AUTOINCREMENT (dev/changelog/1129).
+
+    The failover, stall, placeholder and fast-delivery health-score exclusions name a
+    channel event by id. Today those events die only with their whole channel, and that
+    path now removes the exclusions too, so no event id can yet be inherited by the wrong
+    row. This closes it structurally rather than leaving it resting on where events happen
+    to be deleted today, and makes every id a stored reference can point at - recordings,
+    tests, events - behave the same way. Idempotent."""
+    _rebuild_with_autoincrement(conn, cur, 'channel_events')
+
+
+def _m079_postcapture_outcome_event_types(conn, cur):
+    """Retype the recording events whose outcome was only in their detail text
+    (dev/changelog/1140).
+
+    CONCATENATION_DONE was written for a finished join and for every join that gave up;
+    CONVERSION_DONE for a finished conversion, a give-up and a user cancel. Each now has its
+    own type, and the old rows move to the type they should have had so that every reader
+    can trust the type alone - a render shim reading the detail prefix would have kept the
+    double meaning in the table for good, and every future reader would need to know it.
+
+    The predicates are what every writer of those rows has put in the detail since the
+    first commit: every failure starts `FAILED` (`FAILED: ...`, `FAILED after N
+    attempt(s)`), every cancel starts `Conversion cancelled`, and no success starts with
+    either. GLOB rather than LIKE because LIKE is case-insensitive. The type names are
+    spelled out rather than imported, so this step keeps doing what it did when it shipped.
+
+    Re-runnable from the top: an UPDATE by predicate over rows still carrying the old type
+    matches nothing a second time, so it needs no entry in the backfill ledger."""
+    retypes = (
+        ('CONCATENATION_DONE', 'FAILED*', 'CONCATENATION_FAILED'),
+        ('CONVERSION_DONE', 'FAILED*', 'CONVERSION_FAILED'),
+        ('CONVERSION_DONE', 'Conversion cancelled*', 'CONVERSION_CANCELLED'),
+    )
+    for old_type, pattern, new_type in retypes:
+        cur.execute('UPDATE recording_events SET event_type = ? '
+                    'WHERE event_type = ? AND detail GLOB ?',
+                    (new_type, old_type, pattern))
+        if cur.rowcount:
+            log.info('Retyped %d %s event(s) to %s', cur.rowcount, old_type, new_type)
+
+
+def _m080_start_deferred(conn, cur):
+    """recordings: start_deferred_since / start_deferred_for - when a SCHEDULED recording's
+    start began being held, and what it is waiting for (dev/changelog/1141).
+
+    No backfill: NULL means "not being held", which is true of every row that is not
+    mid-wait at upgrade time. A row that is mid-wait fills both in at its next retry, at
+    most one poll interval after the restart this migration runs in.
+    """
+    rec_cols = [r[1] for r in cur.execute('PRAGMA table_info(recordings)').fetchall()]
+    if 'start_deferred_since' not in rec_cols:
+        cur.execute('ALTER TABLE recordings ADD COLUMN start_deferred_since DATETIME')
+    if 'start_deferred_for' not in rec_cols:
+        cur.execute('ALTER TABLE recordings ADD COLUMN start_deferred_for VARCHAR(500)')
+    conn.commit()
+
+
 SCHEMA_MIGRATIONS = [
     (1, 'baseline: pre-versioning additive migrations + backfills', _m001_baseline),
     (2, 'recordings: program_title/program_sub_title snapshot columns + backfill', _m002_program_title),
@@ -2813,6 +2912,15 @@ SCHEMA_MIGRATIONS = [
      'its listings from when the user pins one', _m075_group_guide_listings),
     (76, 'channel_groups: default_profile_id, the recording profile a group\'s guide row '
      'pre-selects in the record modal', _m076_group_default_profile),
+    (77, 'channel_tests: AUTOINCREMENT, so a deleted test id is never re-issued',
+     _m077_channel_tests_autoincrement),
+    (78, 'channel_events: AUTOINCREMENT, so a deleted event id is never re-issued',
+     _m078_channel_events_autoincrement),
+    (79, 'recording_events: CONCATENATION_DONE/CONVERSION_DONE rows that recorded a failure '
+     'or a cancel move to CONCATENATION_FAILED/CONVERSION_FAILED/CONVERSION_CANCELLED',
+     _m079_postcapture_outcome_event_types),
+    (80, 'recordings: start_deferred_since/_for, when a held start began waiting and what '
+     'for', _m080_start_deferred),
 ]
 
 CURRENT_SCHEMA_VERSION = SCHEMA_MIGRATIONS[-1][0]

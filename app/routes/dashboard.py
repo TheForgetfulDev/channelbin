@@ -1,3 +1,4 @@
+import hashlib
 import json
 import logging
 import os
@@ -6,6 +7,7 @@ from datetime import datetime, timedelta
 
 from flask import Blueprint, render_template, Response, stream_with_context, jsonify, url_for
 
+from sqlalchemy import func
 from sqlalchemy.orm import selectinload
 
 from .. import db
@@ -83,6 +85,43 @@ DASHBOARD_SECTIONS = {
 DASHBOARD_SECTION_ORDER = ['timeline', 'live', 'upcoming', 'accounts', 'health']
 DASHBOARD_SECTION_ON = {'timeline': True, 'live': True, 'upcoming': False,
                         'accounts': True, 'health': True}
+
+# Every status the Dashboard's two recording sections render - which is every status that is
+# not an outcome. recording_signature() reads the same set, so the page and the signature it
+# re-renders on cannot disagree about which rows exist.
+DASHBOARD_REC_STATUSES = (*WINDOW_OPEN_STATUSES, REC_STATUS_CONCATENATING,
+                          REC_STATUS_ANALYZING, REC_STATUS_CONVERTING, REC_STATUS_SCHEDULED)
+
+
+def recording_signature() -> str:
+    """A short string that changes whenever the set of recordings still under way changes.
+    /api/nav-status carries it and the Dashboard renders the one its rows were read at, so
+    the page knows a recording started, finished, was scheduled elsewhere or was edited
+    without reloading (dev/changelog/1143). Built for more readers than the Dashboard: the
+    Recordings list and the TV Guide's recording chips need the same trigger.
+
+    Hashes, per row in DASHBOARD_REC_STATUSES: id and status, which move on every
+    transition - a finished, failed or aborted row got there FROM one of these statuses, so
+    no outcome is reached without the set changing; the parked and held-start fields, which
+    change a row's cells with no status change and no SSE frame; and name, channel and the
+    two times, which an edit from another tab moves. count(*) over the whole table adds the
+    one change that touches no unfinished row: deleting a finished recording.
+
+    Deliberately NOT hashed: anything SSE already keeps current inside a row (bytes, progress,
+    ETA, stalls). Those move every second, and a signature that moved with them would re-render
+    the page on every poll. updated_at is left out for the same reason - capture and conversion
+    rewrite it constantly. A scan of a small table on every nav poll: ~0.04 ms on the live
+    database."""
+    rows = (db.session.query(
+                Recording.id, Recording.status, Recording.name, Recording.channel_id,
+                Recording.start_time, Recording.stop_time,
+                Recording.postprocess_waiting_since, Recording.postprocess_waiting_on_name,
+                Recording.start_deferred_since, Recording.start_deferred_for)
+            .filter(Recording.status.in_(DASHBOARD_REC_STATUSES))
+            .order_by(Recording.id).all())
+    total = db.session.query(func.count(Recording.id)).scalar() or 0
+    digest = hashlib.blake2s(repr([tuple(r) for r in rows]).encode(), digest_size=8).hexdigest()
+    return f'{total}|{len(rows)}|{digest}'
 
 
 def _section_state():
@@ -394,13 +433,14 @@ def _live_row_stats(rows, now):
 
 @dashboard_bp.route('/')
 def dashboard():
+    # Read before the rows: a change landing between the two then makes the next poll
+    # re-render once more, where the other order would leave that change unseen.
+    rec_sig = recording_signature()
     # selectinload segments: the active-card template counts `rec.segments | length` per
     # non-scheduled row, which is a lazy per-row load (N+1) without this - one batched query
     # instead. Guarded by test_scaling_pages::test_dashboard_page.
     active = Recording.query.options(selectinload(Recording.segments)).filter(
-        Recording.status.in_((*WINDOW_OPEN_STATUSES, REC_STATUS_CONCATENATING,
-                              REC_STATUS_ANALYZING, REC_STATUS_CONVERTING,
-                              REC_STATUS_SCHEDULED))
+        Recording.status.in_(DASHBOARD_REC_STATUSES)
     ).order_by(Recording.start_time).all()
     accounts = Account.query.order_by(Account.created_at).all()
     # The account rows' second line (DESIGN.md 16.1): the same macros /accounts draws, from
@@ -436,12 +476,13 @@ def dashboard():
                          if rec_is_waiting(r.status, r.postprocess_waiting_since)},
         section_defs=DASHBOARD_SECTIONS, section_order=order, section_on=enabled,
         section_pref_key=DASHBOARD_SECTIONS_PREF,
-        # The two signals dashboard.js swaps its two self-refreshing sections on. The sync
-        # signature is the same one /accounts renders and /api/nav-status carries, so the
-        # comparison is between two readings of one function rather than between a page and
-        # a lookalike. The health kind is handed over for the same reason the status labels
-        # above are: a client decision keyed on a string the server owns.
+        # The signals dashboard.js swaps its self-refreshing regions on. Each signature is the
+        # same one /api/nav-status carries, so the comparison is between two readings of one
+        # function rather than between a page and a lookalike. The health kind is handed over
+        # for the same reason the status labels above are: a client decision keyed on a
+        # string the server owns.
         sync_sig=sync_signature(),
+        rec_sig=rec_sig,
         bg_health_kind=BG_KIND_HEALTH_CHECK,
         metrics=_metric_tiles(active, accounts, now),
         timeline=_timeline_payload(active, accounts, now),
@@ -847,10 +888,12 @@ def nav_status():
     endpoint polled at `display.nav_poll_interval_seconds`.
 
     `account_sync` is `accounts.sync_signature()`, which /accounts compares against the one
-    its rows were rendered at to know when to re-render itself.
+    its rows were rendered at to know when to re-render itself. `alert_signature` does the
+    same job for /alerts (dev/changelog/1131), and `recording_signature` for the Dashboard's
+    recording regions (dev/changelog/1143).
     """
     from .system import _system_stats_dict
-    from .alerts import _unread_alert_summary
+    from .alerts import _unread_alert_summary, alert_signature
     from ..readiness import nav_summary
     return jsonify(
         stats=_system_stats_dict(),
@@ -858,6 +901,8 @@ def nav_status():
         activity=_activity_status_dict(),
         search=_search_readiness_dict(),
         account_sync=sync_signature(),
+        alert_signature=alert_signature(),
+        recording_signature=recording_signature(),
         # Cached for 30s inside nav_summary(), and never able to run an on-demand check -
         # a poll that spawned a process or opened a provider connection would be the exact
         # thing the Readiness card refuses to do on page load (dev/changelog/950).

@@ -537,14 +537,14 @@ class TierTests(unittest.TestCase):
 
     def test_the_basic_set_is_exactly_the_approved_one(self):
         tiers = self._tiers(self.basic_html)
-        self.assertEqual(len(tiers), 122)
+        self.assertEqual(len(tiers), 123)
         self.assertEqual({p for p, t in tiers.items() if t == 'basic'}, self.BASIC)
         self.assertEqual({t for t in tiers.values()}, {'basic', 'advanced'})
 
     def test_every_advanced_row_carries_its_badge_and_no_basic_row_does(self):
         rows = re.findall(r'data-path="([^"]+)" data-tier="[^"]*".*?<div class="fl-label">(.*?)</div>',
                           self.basic_html, re.S)
-        self.assertEqual(len(rows), 122)
+        self.assertEqual(len(rows), 123)
         for path, badge in rows:
             with self.subTest(path=path):
                 self.assertEqual('tier-badge' in badge, path not in self.BASIC)
@@ -573,13 +573,15 @@ class TierTests(unittest.TestCase):
 class ChangedFromDefaultTests(unittest.TestCase):
     """DESIGN.md 15.9: the changed-from-default mark and chip (dev/changelog/1006).
 
-    make_test_app() sandboxes config.yaml to a file holding nothing, so every row starts at
-    its default and each case writes the change it is about."""
+    Every row starts at its default and each case writes the change it is about. The test
+    app's own temp paths are dropped from its sandboxed config.yaml for that, since they are
+    real settings rows and would read as changed (dev/changelog/1130)."""
 
     def setUp(self):
         from app import config as cfgmod
         self.cfgmod = cfgmod
         self.t = make_test_app()
+        self.t.sandbox_config({}, keep_sandbox_paths=False)
         self.t.app.config['WTF_CSRF_ENABLED'] = False
         self.client = self.t.app.test_client()
 
@@ -623,7 +625,7 @@ class ChangedFromDefaultTests(unittest.TestCase):
 
     def test_every_setting_row_carries_the_mark_and_the_attribute_turns_it_on(self):
         html = self._page()
-        self.assertEqual(html.count('<div class="fr-changed">Changed from default</div>'), 122)
+        self.assertEqual(html.count('<div class="fr-changed">Changed from default</div>'), 123)
         self.assertIn('.frow[data-changed] .fr-changed { display: inline-flex; }', self._css())
 
     def test_a_value_saved_equal_to_its_default_is_not_a_change(self):

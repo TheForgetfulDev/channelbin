@@ -540,7 +540,9 @@ async function jsonFetch(url, opts = {}) {
 // one in JS that can drift from it. A region missing from either side is left alone.
 // Listeners bound to anything inside a swapped region go with it (bind by delegation), and
 // inline state held on those nodes has to be re-applied once this resolves. Rejects on a
-// network error or a non-2xx answer, leaving the page as it was.
+// network error or a non-2xx answer, leaving the page as it was. Resolves to the parsed
+// fresh document, so a caller can tell a region that is now GONE from the server's render
+// (left alone here) from one that was swapped.
 async function swapFromServer(selectors, url = location.href) {
   const res = await fetch(url, { cache: 'no-store' });
   if (!res.ok) throw new Error(`${url} answered ${res.status}`);
@@ -550,6 +552,7 @@ async function swapFromServer(selectors, url = location.href) {
     const fresh = doc.querySelector(sel);
     if (current && fresh) current.outerHTML = fresh.outerHTML;
   });
+  return doc;
 }
 
 /* ── App design-system behaviors (DESIGN.md sections 3.6/3.7/3.9/3.12) ──

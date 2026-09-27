@@ -245,7 +245,7 @@ def delete_profile(profile_id):
     def _delete_profile_row():
         p = db.session.get(RecordingProfile, profile_id)
         if p is not None:
-            db.session.delete(p)
+            db.session.delete(p)  # hidden-recompute-ok: a RecordingProfile, not a group
             db.session.commit()
 
     _unlink_references()

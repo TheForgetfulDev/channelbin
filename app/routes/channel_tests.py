@@ -1296,6 +1296,8 @@ def remove_duplicate_channels(job_id):
         guide_removed = []
         transferred = []
         transfer_skipped = []
+        # Transferred channels are not here: transfer_channel_state() recomputes both ends.
+        left_the_group = []
         for r in removals:
             cid = r.get('channel_id')
             if cid not in remove_ids:
@@ -1319,10 +1321,14 @@ def remove_duplicate_channels(job_id):
                     did_transfer = True
             if not did_transfer:
                 db.session.delete(by_channel[cid])
+                left_the_group.append(cid)
                 if r.get('remove_from_guide') and ch and ch.in_guide:
                     ch.in_guide = False
                     guide_removed.append(cid)
-                    channel_hiding.recompute([cid])
+        # Every channel that left the check's group, guide row or not: that membership can
+        # be the last protection it had. After the deletes, since a recompute that runs
+        # first still sees the membership (dev/changelog/1138).
+        channel_hiding.recompute(left_the_group)
 
         screenshot_paths = delete_tests_collecting_screenshots(ChannelTest.query.filter(
             ChannelTest.job_id == job_id, ChannelTest.channel_id.in_(remove_ids)

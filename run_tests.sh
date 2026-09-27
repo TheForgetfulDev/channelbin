@@ -41,6 +41,10 @@ cd "$(dirname "$0")"
 # So refuse, rather than run a smaller suite that looks identical to a whole one. Skipping
 # them is still allowed - it just has to be asked for, which is the difference between a
 # choice and an accident.
+#
+# Both checks run before either refuses, so a fresh checkout missing both hears about both
+# at once rather than one per attempt.
+refused=""
 if [ "${CHANNELBIN_ALLOW_MISSING_FFMPEG:-}" != "1" ]; then
     missing=""
     for bin in ffmpeg ffprobe; do
@@ -53,17 +57,41 @@ if [ "${CHANNELBIN_ALLOW_MISSING_FFMPEG:-}" != "1" ]; then
         echo "  PATH=$PATH" >&2
         echo "  Install ffmpeg (it ships ffprobe), or set CHANNELBIN_ALLOW_MISSING_FFMPEG=1 to" >&2
         echo "  run the rest of the suite deliberately." >&2
-        exit 1
+        refused=1
+    else
+        # Not fatal: 6.1 measured identical to 7.1 and a contributor's distro decides this.
+        # But ChannelBin targets 7.1 (README.md), so a run on anything else says which series
+        # it actually measured rather than leaving it to be inferred.
+        series="$(ffmpeg -version 2>/dev/null | head -1 | awk '{print $3}')"
+        case "$series" in
+            7.1.*|n7.1.*) ;;
+            *) echo "run_tests.sh: note - ffmpeg $series, not the 7.1 series this project" \
+                    "targets. Results still count; they were just measured elsewhere." >&2 ;;
+        esac
     fi
-    # Not fatal: 6.1 measured identical to 7.1 and a contributor's distro decides this. But
-    # ChannelBin targets 7.1 (README.md), so a run on anything else says which series it
-    # actually measured rather than leaving it to be inferred.
-    series="$(ffmpeg -version 2>/dev/null | head -1 | awk '{print $3}')"
-    case "$series" in
-        7.1.*|n7.1.*) ;;
-        *) echo "run_tests.sh: note - ffmpeg $series, not the 7.1 series this project" \
-                "targets. Results still count; they were just measured elsewhere." >&2 ;;
-    esac
 fi
+
+# The same trap for the client-side suite: every jsdom-backed test gates on `node` being on
+# PATH and node_modules/jsdom existing, and node_modules is gitignored - so a fresh clone, a
+# `git clean -fdx`, or a node upgrade that emptied it runs none of them and still reports OK
+# (dev/changelog/1135). CI is safe only because its workflow runs `npm ci` first.
+if [ "${CHANNELBIN_ALLOW_MISSING_NODE:-}" != "1" ]; then
+    missing=""
+    command -v node >/dev/null 2>&1 || missing="$missing node"
+    [ -d node_modules/jsdom ] || missing="$missing node_modules/jsdom"
+    if [ -n "$missing" ]; then
+        echo "run_tests.sh: missing:$missing" >&2
+        echo "  Every client-side (jsdom) test gates on these and would skip itself, so this" >&2
+        echo "  run would report green without driving any of the app's JavaScript. Refusing" >&2
+        echo "  instead." >&2
+        echo "  PATH=$PATH" >&2
+        echo "  node_modules looked for in: $(pwd)" >&2
+        echo "  Install node, run \`npm ci\` in the repo root, or set" >&2
+        echo "  CHANNELBIN_ALLOW_MISSING_NODE=1 to run the rest of the suite deliberately." >&2
+        refused=1
+    fi
+fi
+
+[ -z "$refused" ] || exit 1
 
 exec python3 -m tests.support.timing "$@"

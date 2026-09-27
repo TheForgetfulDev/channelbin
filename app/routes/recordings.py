@@ -36,7 +36,7 @@ from ..db_utils import retry_on_locked
 from ..scheduler import schedule_recording, unschedule_recording
 from ..recorder import (
     abort_recording, get_state, stop_recording, pause_recording, resume_recording,
-    get_live_segment_path, recording_disk_paths, recording_image_paths, delete_files, end_slot_wait,
+    get_live_segment_path, recording_disk_paths, recording_image_paths, delete_files, end_capture_wait,
     finished_image_dirs, finished_image_path,
 )
 from ..tz_utils import parse_local_to_utc, local_input_value, format_local
@@ -144,12 +144,17 @@ def _apply_edit_and_reschedule(recording_id, name, url, start_utc, stop_utc,
                     extra={'from_channel_id': old_ch.id if old_ch else None,
                            'to_channel_id': new_ch.id})
         db.session.commit()
+        return old_start != start_utc
 
-    _apply_edit_and_commit()
+    start_moved = _apply_edit_and_commit()
 
     unschedule_recording(recording_id)
     from flask import current_app
     schedule_recording(current_app._get_current_object(), recording_id, start_utc, stop_utc)
+    if start_moved:
+        # A new start time is a new plan: a hold on the old one is over, and one that
+        # carried over would date the next wait from before the edit (dev/changelog/1141).
+        end_capture_wait(recording_id)
 
 
 def _abort_and_delete_files(recording_id):
@@ -716,15 +721,16 @@ def _channel_initials(name):
     return (letters[:3] or '?').upper()
 
 
-def _index_row(rec, now, tz, thumb_ids, live_seg_bytes=0):
+def _row_times(rec, now, tz):
+    """(day label, relative line) for one row of the recordings list - the two cells of it
+    that change with the clock alone. _index_row renders them into the page, and
+    /api/recordings/times re-asks them once a minute so the open page's "in 5 min" and
+    "Today" stay true without re-rendering every row (dev/changelog/1144). One function, so
+    the page and the tick cannot word the same row two ways. Reads only the row's own
+    columns and the in-memory join/analysis registries: no query, no disk."""
     from ..tz_utils import UTC
     from ..concatenator import concat_progress
     from ..postprocessor import analysis_progress
-    # The WAITING derivation is inside rec_status_display, so this row and the Dashboard's
-    # row and chip cannot name the same parked recording three different ways.
-    section, st_class, badge_class, badge_label, pulse = fmt_utils.rec_status_display(
-        rec.status, waiting=bool(rec.postprocess_waiting_since))
-
     # A dict lookup under a lock, no I/O - safe in this per-row builder, which is what the
     # /recordings case in tests/test_scaling_pages.py exists to keep true. Only a row that
     # is actually joining can have an entry, so the lookup is skipped for every other status
@@ -808,10 +814,32 @@ def _index_row(rec, now, tz, thumb_ids, live_seg_bytes=0):
         rel = f'ended {_humanize_secs((now - rec.stop_time).total_seconds())} ago'
     elif rec.status == REC_STATUS_SCHEDULED:
         secs = (rec.start_time - now).total_seconds()
-        rel = f'in {_humanize_secs(secs)}' if secs > 0 else 'starting'
+        if secs > 0:
+            rel = f'in {_humanize_secs(secs)}'
+        elif rec.start_deferred_since:
+            # A held start names what it is waiting for, read off the row rather than the
+            # RECORDING_START_DEFERRED event, which would be a query per row
+            # (dev/changelog/1141). "starting" is left for the seconds a start really takes.
+            rel = (f'waiting for {rec.start_deferred_for}' if rec.start_deferred_for
+                   else 'waiting to start')
+            if -secs >= 60:
+                rel += f' · {_humanize_secs(secs)} late'
+        else:
+            rel = 'starting'
     else:
         anchor = rec.completed_at or rec.stop_time
         rel = f'{_humanize_secs((now - anchor).total_seconds())} ago'
+
+    return day, rel
+
+
+def _index_row(rec, now, tz, thumb_ids, live_seg_bytes=0):
+    # The WAITING derivation is inside rec_status_display, so this row and the Dashboard's
+    # row and chip cannot name the same parked recording three different ways.
+    section, st_class, badge_class, badge_label, pulse = fmt_utils.rec_status_display(
+        rec.status, waiting=bool(rec.postprocess_waiting_since))
+
+    day, rel = _row_times(rec, now, tz)
 
     sched_secs = rec.scheduled_duration_seconds
     # Discarded segments are out: this list stands in for the file, and both numbers it
@@ -1003,6 +1031,10 @@ def _index_row(rec, now, tz, thumb_ids, live_seg_bytes=0):
 def index():
     from sqlalchemy.orm import selectinload, joinedload
     from ..tz_utils import get_display_tz
+    from .dashboard import recording_signature
+    # Read before the rows: a change landing between the two then makes the next poll
+    # re-render once more, where the other order would leave that change unseen.
+    rec_sig = recording_signature()
     recordings = (Recording.query
                   .options(selectinload(Recording.segments),
                            joinedload(Recording.channel).joinedload(Channel.account))
@@ -1037,8 +1069,28 @@ def index():
     profiles = RecordingProfile.query.order_by(RecordingProfile.name).all()
 
     return render_template('index.html', sections=sections, total=len(rows),
-                           live_now=live_now, col_prefs=col_prefs,
+                           live_now=live_now, col_prefs=col_prefs, rec_sig=rec_sig,
                            profiles=profiles)  # _record_modal.html + GUIDE_CONFIG.profiles expect this name
+
+
+@recordings_bp.route('/api/recordings/times')
+def recording_times():
+    """Each recording's day label and relative line, for the open list page's minute tick.
+
+    Re-rendering the whole list to move "in 5 min" to "in 4 min" costs about 1.3 ms and
+    1.7 KB per recording - 2.7 s and 3.3 MB at 2,000 recordings, every minute, per open tab.
+    This answers the two cells that move with the clock alone, from the same _row_times()
+    the page itself renders them with, in one query and no per-row I/O. What a row IS
+    (status, section, menu) is the full re-render's job, driven by recording_signature()
+    (dev/changelog/1144)."""
+    from ..tz_utils import get_display_tz
+    now = datetime.utcnow()
+    tz = get_display_tz()
+    rows = {}
+    for rec in Recording.query.all():
+        day, rel = _row_times(rec, now, tz)
+        rows[rec.id] = {'day': day, 'rel': rel}
+    return jsonify({'success': True, 'rows': rows})
 
 
 @recordings_bp.route('/api/user-prefs/<key>', methods=['GET', 'POST'])
@@ -1556,7 +1608,7 @@ def cancel_recording(recording_id):
 
         _mark_aborted_and_commit()
         dismiss_recording_failing_alerts(recording_id)
-        end_slot_wait(recording_id)
+        end_capture_wait(recording_id)
         flash(f'Recording "{rec.name}" cancelled.', 'success')
     elif rec.status in (REC_STATUS_IN_PROGRESS, REC_STATUS_PAUSED, REC_STATUS_RETRYING):
         _abort_and_delete_files(recording_id)
@@ -1959,7 +2011,7 @@ def new_recording_json():
             if old is not None:
                 detail += (f', replacing scheduled recording #{old.id} "{old.name}" '
                            f'({old.start_time} – {old.stop_time} UTC), which was deleted')
-                db.session.delete(old)
+                db.session.delete(old)  # hidden-recompute-ok: a Recording, not a group or membership
             db.session.add(RecordingEvent(
                 recording_id=rec.id,
                 event_type=RECORDING_REPLACED_OTHER,
@@ -2246,7 +2298,7 @@ def _cancel_conversion(recording_id, rec):
     """
     from ..postprocessor import (request_cancel_conversion, set_postprocess_wait,
                                  set_conversion_parts, discard_conversion_parts)
-    from ..database import RecordingEvent, CONVERSION_DONE
+    from ..database import RecordingEvent, CONVERSION_CANCELLED
 
     # A live conversion: signal its loop to abort (it sets the terminal status + deletes the
     # partial output). A stranded CONVERTING row with no live ffmpeg: mark it here, since no
@@ -2289,7 +2341,7 @@ def _cancel_conversion(recording_id, rec):
         set_conversion_parts(r)
         db.session.add(RecordingEvent(
             recording_id=recording_id,
-            event_type=CONVERSION_DONE,
+            event_type=CONVERSION_CANCELLED,
             detail='Conversion cancelled by user - source .ts kept for retry.',
         ))
         db.session.commit()

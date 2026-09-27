@@ -3,7 +3,7 @@
 The view, the query and the changed-from-default chip are three inputs to one filter
 function in static/js/settings.js (DESIGN.md 15.9, dev/changelog/1005 and 1006), which also
 dims a row whose gate is off from the gating controls' live values (1007). The server
-renders all 122 rows either way, so what Basic hides, what a filter in Basic brings back,
+renders all 123 rows either way, so what Basic hides, what a filter in Basic brings back,
 how it says so, and what gets saved are all browser behavior - none of it is visible from a
 response body.
 
@@ -46,6 +46,9 @@ def _observe():
     if _RESULT is not None:
         return _RESULT
     t = make_test_app()
+    # A config that sets nothing, so the changed-from-default chip counts only the three
+    # saves below - the test app's temp paths are settings rows too (dev/changelog/1130).
+    t.sandbox_config({}, keep_sandbox_paths=False)
     tmp = tempfile.mkdtemp(prefix='settings_page_js_')
     try:
         t.app.config['WTF_CSRF_ENABLED'] = False
@@ -139,7 +142,7 @@ class NeverChosenOpensInBasicTests(_Base):
         self.assertEqual(self.obs['sections']['integrations']['hiddenUnits'], 0)
 
     def test_the_search_box_counts_every_setting_because_search_reaches_all_of_them(self):
-        self.assertEqual(self.obs['placeholder'], 'Search 122 settings by name, description or key')
+        self.assertEqual(self.obs['placeholder'], 'Search 123 settings by name, description or key')
 
 
 class SearchInBasicTests(_Base):
@@ -161,7 +164,7 @@ class SearchInBasicTests(_Base):
 
     def test_counts_are_matches_and_spelled_right(self):
         during = self.obs['during']
-        self.assertEqual(during['chip'], '11 of 122 settings')
+        self.assertEqual(during['chip'], '11 of 123 settings')
         self.assertEqual(during['sections']['watchdog']['head'], '5 matches')
         self.assertIsNone(during['sections']['recording']['more'])
 
@@ -180,7 +183,7 @@ class NoticeSwitchTests(_Base):
         self.assertIsNone(self.obs['after']['notice'])
         self.assertEqual(self.obs['posts'],
                          [{'path': f'/api/user-prefs/{SETTINGS_VIEW_PREF}', 'body': {'value': True}}])
-        self.assertEqual(len(self.obs['cleared']['shownPaths']), 122)
+        self.assertEqual(len(self.obs['cleared']['shownPaths']), 123)
 
 
 class FooterSwitchTests(_Base):
@@ -188,7 +191,7 @@ class FooterSwitchTests(_Base):
 
     def test_a_card_footer_switches_the_whole_page_and_saves_it(self):
         self.assertEqual(self.obs['view'], 'advanced')
-        self.assertEqual(len(self.obs['shownPaths']), 122)
+        self.assertEqual(len(self.obs['shownPaths']), 123)
         self.assertEqual(self.obs['posts'],
                          [{'path': f'/api/user-prefs/{SETTINGS_VIEW_PREF}', 'body': {'value': True}}])
 
@@ -200,7 +203,7 @@ class SavedAdvancedTests(_Base):
         opened = self.obs['opened']
         self.assertEqual(opened['view'], 'advanced')
         self.assertEqual(opened['checked'], ['advanced'])
-        self.assertEqual(len(opened['shownPaths']), 122)
+        self.assertEqual(len(opened['shownPaths']), 123)
         self.assertFalse(any(s['collapsed'] for s in opened['sections'].values()))
         self.assertFalse(any(s['more'] for s in opened['sections'].values()))
 
@@ -242,7 +245,7 @@ class ChangedChipTests(_Base):
 
     def test_the_counts_say_changed(self):
         on = self.obs['on']
-        self.assertEqual(on['chip'], '3 of 122 settings')
+        self.assertEqual(on['chip'], '3 of 123 settings')
         self.assertEqual(on['sections']['recording']['head'], '1 changed')
         self.assertEqual(on['sections']['watchdog']['head'], '1 changed')
         self.assertFalse(on['sections']['watchdog']['collapsed'])

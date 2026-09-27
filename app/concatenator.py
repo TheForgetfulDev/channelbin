@@ -554,7 +554,7 @@ def _run_concatenation(app, recording_id: int, *, reason: str):
     from .config import load_config
     from .database import (
         Recording, RecordingSegment, add_recording_event, preserve_cancelled_status,
-        CAPTURE_COMPLETE, CONCATENATION_STARTED, CONCATENATION_DONE,
+        CAPTURE_COMPLETE, CONCATENATION_STARTED, CONCATENATION_DONE, CONCATENATION_FAILED,
         REC_STATUS_ANALYZING, REC_STATUS_CONCATENATING, REC_STATUS_FAILED, REC_STATUS_PAUSED,
         FAILURE_ALL_SEGMENTS_PLACEHOLDER, FAILURE_SEGMENT_FILES_MISSING, FAILURE_NO_VALID_SEGMENTS,
         FAILURE_PAUSED_NOTHING_CAPTURED, FAILURE_INSUFFICIENT_DISK_SPACE, FAILURE_CONCAT_ERROR,
@@ -708,7 +708,7 @@ def _run_concatenation(app, recording_id: int, *, reason: str):
                     r.status = REC_STATUS_FAILED
                     r.completed_at = datetime.utcnow()
                     r.failure_reason = failure_reason
-                    add_recording_event(recording_id, CONCATENATION_DONE, detail=why)
+                    add_recording_event(recording_id, CONCATENATION_FAILED, detail=why)
                     db.session.commit()
                     return True
 
@@ -719,7 +719,7 @@ def _run_concatenation(app, recording_id: int, *, reason: str):
                     # `status` is not optional on a frame that moves a row: dashboard.js
                     # relabels from it and ignores a frame without one, so this row would
                     # sit on its old badge (dev/docs/BUGS.md 2026-09-14, dev/changelog/1023).
-                    ev.publish(recording_id, CONCATENATION_DONE, {
+                    ev.publish(recording_id, CONCATENATION_FAILED, {
                         'success': False, 'error': 'no valid segments',
                         'status': REC_STATUS_FAILED,
                     })
@@ -769,14 +769,14 @@ def _run_concatenation(app, recording_id: int, *, reason: str):
                     r.status = REC_STATUS_FAILED
                     r.completed_at = datetime.utcnow()
                     r.failure_reason = FAILURE_INSUFFICIENT_DISK_SPACE
-                    add_recording_event(recording_id, CONCATENATION_DONE,
+                    add_recording_event(recording_id, CONCATENATION_FAILED,
                                         detail=f'FAILED: not enough disk space - need {_fmt_bytes(total_seg_bytes)}, '
                                                f'only {_fmt_bytes(free_bytes)} free. Segments preserved. Free space and retry.')
                     db.session.commit()
                     return True
 
                 if _mark_disk_space_failed_and_commit():
-                    ev.publish(recording_id, CONCATENATION_DONE, {
+                    ev.publish(recording_id, CONCATENATION_FAILED, {
                         'success': False, 'error': 'insufficient disk space', 'status': REC_STATUS_FAILED,
                     })
                 return
@@ -961,13 +961,13 @@ def _run_concatenation(app, recording_id: int, *, reason: str):
                     r.status = REC_STATUS_FAILED
                     r.completed_at = datetime.utcnow()
                     r.failure_reason = FAILURE_CONCAT_ERROR
-                    add_recording_event(recording_id, CONCATENATION_DONE,
+                    add_recording_event(recording_id, CONCATENATION_FAILED,
                                         detail=f'FAILED: {error_msg}')
                     db.session.commit()
                     return True
 
                 if _mark_concat_failed_and_commit():
-                    ev.publish(recording_id, CONCATENATION_DONE, {
+                    ev.publish(recording_id, CONCATENATION_FAILED, {
                         'success': False,
                         'error': error_msg,
                         'status': REC_STATUS_FAILED,

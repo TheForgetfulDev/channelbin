@@ -51,6 +51,7 @@ import os
 import re
 import shutil
 import subprocess
+import textwrap
 import tokenize
 import unittest
 
@@ -1363,42 +1364,149 @@ class HiddenRecomputeHookTests(unittest.TestCase):
     enclosing block. Deliberately loose: what it is really looking for is a whole call site
     that has never heard of hiding at all.
 
+    Losing a membership writes neither pattern above - `db.session.delete(group)` takes every
+    membership with it through the delete-orphan cascade - so deletes are matched separately:
+    an ORM delete inside a function that deals in groups or memberships, a bulk delete whose
+    statement names `ChannelGroupMember`, and a drop from a `memberships` relationship. For
+    those the recompute must come AFTER the delete, because the protection only goes away
+    when the delete flushes and a recompute that runs first still sees it. Only a group or a
+    membership delete can matter: deleting a channel or an account also cascades through
+    memberships, but only those of channels that go with it, so no surviving channel changes.
+    The delete half exists because the loose match was blind to it for months while a
+    health-check delete dissolved groups without recomputing (dev/changelog/869, 1138).
+
     Escape hatch: `# hidden-recompute-ok: <reason>` - and it is genuinely needed, because
     `ChannelGroup.in_guide` shares its name with `Channel.in_guide` and no scanner can tell
-    an attribute assignment on one from the other. dev/changelog/775.
+    an attribute assignment on one from the other, nor what a `session.delete()` is handed.
+    dev/changelog/775.
     """
 
     _MARKER = 'hidden-recompute-ok'
     _PATTERNS = (re.compile(r'\.in_guide\s*=(?!=)'), re.compile(r'\bChannelGroupMember\('))
+    _ORM_DELETE = re.compile(r'\bsession\.delete\(')
+    _DEALS_IN_GROUPS = re.compile(r'\bChannelGroup|membership')
+    _BULK_DELETE = re.compile(r'\.delete\(')
+    _RELATIONSHIP_DROP = re.compile(r'memberships\.(?:remove|clear|pop)\(')
+
+    @staticmethod
+    def _statement_start(code_lines, idx, floor):
+        """First line of the (possibly wrapped) statement that ends on `idx`."""
+        depth = 0
+        for j in range(idx, floor - 1, -1):
+            depth += code_lines[j].count(')') - code_lines[j].count('(')
+            if depth <= 0:
+                return j
+        return floor
+
+    def _is_membership_delete(self, code_lines, i, start, end):
+        line = code_lines[i]
+        if self._RELATIONSHIP_DROP.search(line):
+            return True
+        if self._ORM_DELETE.search(line):
+            return any(self._DEALS_IN_GROUPS.search(ln) for ln in code_lines[start:end])
+        if self._BULK_DELETE.search(line):
+            first = self._statement_start(code_lines, i, start)
+            return any('ChannelGroupMember' in ln for ln in code_lines[first:i + 1])
+        return False
+
+    def _offenders_in(self, rel, text):
+        offenders = []
+        raw_lines = text.splitlines()
+        code_lines = _mask_comments_and_strings(text).splitlines()
+        for i, line in enumerate(code_lines):
+            writes = any(p.search(line) for p in self._PATTERNS)
+            # `class ChannelGroupMember(db.Model):` is the model's own declaration, not
+            # a membership being created.
+            if writes and line.lstrip().startswith('class '):
+                writes = False
+            start, end = _toplevel_block(code_lines, i)
+            deletes = not writes and self._is_membership_delete(code_lines, i, start, end)
+            if not (writes or deletes):
+                continue
+            if _marked_at(raw_lines, i, self._MARKER):
+                continue
+            looked_at = code_lines[i:end] if deletes else code_lines[start:end]
+            if any('channel_hiding' in ln for ln in looked_at):
+                continue
+            offenders.append(f'{rel}:{i + 1}: {raw_lines[i].strip()}')
+        return offenders
 
     def test_every_protection_change_recomputes(self):
         offenders = []
         for path in _walk(APP_DIR, '.py'):
             if _rel(path) == 'app/channel_hiding.py':
                 continue
-            raw_lines = _read(path).splitlines()
-            code_lines = _mask_comments_and_strings(_read(path)).splitlines()
-            for i, line in enumerate(code_lines):
-                if not any(p.search(line) for p in self._PATTERNS):
-                    continue
-                # `class ChannelGroupMember(db.Model):` is the model's own declaration, not
-                # a membership being created.
-                if line.lstrip().startswith('class '):
-                    continue
-                if _marked_at(raw_lines, i, self._MARKER):
-                    continue
-                start, end = _toplevel_block(code_lines, i)
-                if any('channel_hiding' in ln for ln in code_lines[start:end]):
-                    continue
-                offenders.append(f'{_rel(path)}:{i + 1}: {raw_lines[i].strip()}')
+            offenders += self._offenders_in(_rel(path), _read(path))
         self.assertEqual(
             offenders, [],
             'a site that changes whether a channel is protected from being hidden, with no '
-            'channel_hiding.recompute() anywhere in its enclosing function. Guide rows and '
-            'group memberships DEFER a hide, so gaining or losing one changes the answer - '
-            'add the recompute inside the same commit unit, or a '
-            '`# hidden-recompute-ok: <reason>` marker if this is ChannelGroup.in_guide or a '
-            'path where nothing can be protected:\n' + '\n'.join(offenders))
+            'channel_hiding.recompute() anywhere in its enclosing function (after the delete, '
+            'for a delete). Guide rows and group memberships DEFER a hide, so gaining or '
+            'losing one changes the answer - add the recompute inside the same commit unit, '
+            'or a `# hidden-recompute-ok: <reason>` marker if this is ChannelGroup.in_guide or '
+            'a path where nothing can be protected:\n' + '\n'.join(offenders))
+
+    # The delete half's own proof that it sees what it claims to (dev/changelog/1138).
+
+    def _scan(self, src):
+        return self._offenders_in('synthetic.py', textwrap.dedent(src))
+
+    def test_flags_a_group_delete_with_no_recompute(self):
+        self.assertEqual(len(self._scan('''
+            def dissolve(group_id):
+                g = db.session.get(ChannelGroup, group_id)
+                db.session.delete(g)
+                db.session.commit()
+            ''')), 1)
+
+    def test_flags_a_recompute_that_runs_before_the_delete(self):
+        self.assertEqual(len(self._scan('''
+            def dissolve(group_id):
+                g = db.session.get(ChannelGroup, group_id)
+                channel_hiding.recompute([m.channel_id for m in g.memberships])
+                db.session.delete(g)
+                db.session.commit()
+            ''')), 1)
+
+    def test_passes_a_recompute_after_the_delete(self):
+        self.assertEqual(self._scan('''
+            def dissolve(group_id):
+                g = db.session.get(ChannelGroup, group_id)
+                ids = [m.channel_id for m in g.memberships]
+                db.session.delete(g)
+                channel_hiding.recompute(ids)
+                db.session.commit()
+            '''), [])
+
+    def test_flags_a_wrapped_bulk_membership_delete(self):
+        offenders = self._scan('''
+            def purge(ids):
+                db.session.query(ChannelGroupMember).filter(
+                    ChannelGroupMember.channel_id.in_(ids)).delete(synchronize_session=False)
+                db.session.query(ChannelTest).filter(
+                    ChannelTest.channel_id.in_(ids)).delete(synchronize_session=False)
+            ''')
+        # The second statement deletes tests, not memberships.
+        self.assertEqual(len(offenders), 1)
+        self.assertIn('ChannelGroupMember.channel_id', offenders[0])
+
+    def test_flags_a_drop_from_the_memberships_relationship(self):
+        self.assertEqual(len(self._scan('''
+            def drop_first(group):
+                group.memberships.pop(0)
+            ''')), 1)
+
+    def test_flags_delete_group_with_its_recompute_removed(self):
+        rel = 'app/routes/channel_groups.py'
+        src = _read(os.path.join(ROOT, rel))
+        start = src.index('def delete_group(')
+        end = src.index('\n@', start)
+        body = src[start:end]
+        self.assertEqual(self._offenders_in(rel, body), [], 'precondition: passes as shipped')
+        stripped = '\n'.join(ln for ln in body.splitlines()
+                             if 'channel_hiding.recompute' not in ln)
+        offenders = self._offenders_in(rel, stripped)
+        self.assertTrue(any('db.session.delete(g)  #' in o for o in offenders), offenders)
 
 
 # Uppercase-only on purpose: ordinary lowercase prose about "a task" must not trip this.
@@ -1590,6 +1698,59 @@ class ShortNeedleOverWholePageTests(unittest.TestCase):
                    "self.assertIn('stream URLs were built', html)\n")
         self.assertEqual([(n, v) for n, v, _h in _short_needle_offenders(planted)],
                          [(1, 'ab'), (2, 'None')])
+
+
+def _patch_create_offenders(source, marker='patch-create-ok'):
+    """(lineno, call) for each mock.patch / patch.object / patch.multiple call in `source`
+    that passes create=True."""
+    lines = source.splitlines()
+    out = []
+    for node in ast.walk(ast.parse(source)):
+        if not (isinstance(node, ast.Call) and 'patch' in ast.unparse(node.func)):
+            continue
+        if not any(kw.arg == 'create' and isinstance(kw.value, ast.Constant)
+                   and kw.value.value is True for kw in node.keywords):
+            continue
+        if any(marker in lines[i - 1] for i in range(node.lineno, node.end_lineno + 1)):
+            continue
+        out.append((node.lineno, ast.unparse(node.func)))
+    return out
+
+
+class PatchCreateTests(unittest.TestCase):
+    """No `create=True` on a mock patch in tests/.
+
+    The flag makes mock invent the attribute when the target lacks it, which is the one
+    failure a patch exists to surface. Seven patches carried it: two stubbed
+    `app.postprocessor.nominal_video_rate`, a name that module only imports inside a function,
+    so the stub was never read and every case spawned a real ffprobe; five stubbed a scheduler
+    function that a rename would have turned into a green suite over a production ImportError
+    (dev/changelog/1136). Patch the name where it is read instead. Escape hatch for an
+    attribute that genuinely does not exist until runtime: `# patch-create-ok: <reason>` on
+    any line of the call.
+    """
+
+    def test_no_patch_invents_its_target(self):
+        offenders = []
+        for path in _walk(TESTS_DIR, '.py'):
+            for lineno, call in _patch_create_offenders(_read(path)):
+                offenders.append(f'{_rel(path)}:{lineno}: {call}(..., create=True)')
+        self.assertEqual(
+            sorted(offenders), [],
+            'create=True lets a patch stub a name the code never reads, and lets a rename '
+            'pass (dev/changelog/1136). Patch the attribute where the code under test looks '
+            'it up, or add `# patch-create-ok: <reason>` if it truly exists only at '
+            'runtime:\n' + '\n'.join(sorted(offenders)))
+
+    def test_the_detector_names_the_shape_and_honors_the_marker(self):
+        planted = ("mock.patch.object(ppmod, 'x', create=True)\n"
+                   "mock.patch('app.a.b',\n"
+                   "           create=True)\n"
+                   "patch.object(m, 'x', create=True)  # patch-create-ok: fixture\n"
+                   "mock.patch.object(ppmod, 'x', create=False)\n"
+                   "mock.patch.object(ppmod, 'x', return_value=None)\n")
+        self.assertEqual(_patch_create_offenders(planted),
+                         [(1, 'mock.patch.object'), (2, 'mock.patch')])
 
 
 class JinjaBuiltinTests(unittest.TestCase):

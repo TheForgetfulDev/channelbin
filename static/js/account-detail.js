@@ -28,7 +28,7 @@
           it, so a primary action is never stranded off screen.
 
    Depends on util.js (escHtml, fmtDur, jsonFetch, showToast, buildModal, closeMenus),
-   account-actions.js (accountSync, accountCancelSync, confirmForceEpgResync,
+   account-actions.js (confirmAccountSync, accountCancelSync, confirmForceEpgResync,
    confirmDeleteAccount - shared with the list page) and account-modal.js (openAccountModal).
 */
 (function () {
@@ -399,7 +399,7 @@
         { method: 'POST', body: JSON.stringify({ direction: el.dataset.direction }) })
         .then(() => setTimeout(reload, 1500));
     },
-    sync: () => accountSync(A.id, hooks()),
+    sync: () => confirmAccountSync(A.id, A.name, A.syncPrompt, hooks()),
     'cancel-sync': () => accountCancelSync(A.id, hooks()),
     'force-epg': () => confirmForceEpgResync(A.id, hooks()),
     settings: () => openAccountModal({ accountId: A.id, onDone: reload }),

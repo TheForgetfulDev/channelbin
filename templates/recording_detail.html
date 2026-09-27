@@ -1014,7 +1014,7 @@
 {% set ev_cls = {
   'STALL_DETECTED': 'warn', 'RESTART_FAILED': 'warn', 'RECORDING_STOPPED_EARLY': 'warn',
   'RECORDING_ABORTED': 'warn', 'SEEK_DAMAGE_DETECTED': 'warn', 'RECORDING_RETRY_SCHEDULED': 'warn',
-  'RECORDING_START_DEFERRED': 'warn', 'CONVERSION_YIELDED': 'warn',
+  'RECORDING_START_DEFERRED': 'warn', 'CONVERSION_YIELDED': 'warn', 'CONVERSION_CANCELLED': 'warn',
   'CAPTURE_LOST_TO_OUTAGE': 'warn', 'SEGMENT_DISCARDED': 'warn',
   'FAST_DELIVERY_DETECTED': 'warn',
   'CONVERSION_RESTARTED': 'info', 'DIAGNOSTICS': 'info', 'CAPTURE_PACING_ENABLED': 'info',
@@ -1027,6 +1027,7 @@
   'FILE_MOVED': 'ok', 'SCRIPT_EXECUTED': 'ok', 'METADATA_SIDECAR_WRITTEN': 'ok',
   'METADATA_SIDECAR_FAILED': 'warn',
   'RECORDING_FAILED': 'bad', 'RECORDING_FAILED_DEAD_STREAM': 'bad',
+  'CONCATENATION_FAILED': 'bad', 'CONVERSION_FAILED': 'bad',
 } %}
 <div class="card" id="panel-eventlog" data-sec="log">
   <div class="card-head">
@@ -1445,7 +1446,7 @@ window.onScheduleSaved = () => window.location.reload();
         document.getElementById('live-stalls').textContent    = d.stall_count;
         document.getElementById('live-failures').textContent  = d.consecutive_failures;
       }
-      if (['CAPTURE_COMPLETE','RECORDING_FAILED','RECORDING_ABORTED','CONCATENATION_DONE','RECORDING_PAUSED'].includes(msg.event)) {
+      if (['CAPTURE_COMPLETE','RECORDING_FAILED','RECORDING_ABORTED','CONCATENATION_DONE','CONCATENATION_FAILED','RECORDING_PAUSED'].includes(msg.event)) {
         sse.close();
         setTimeout(() => location.reload(), 2000);
       }

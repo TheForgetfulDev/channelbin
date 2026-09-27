@@ -24,6 +24,7 @@ viewport edge and the sticky-header clamp are browser work.
 """
 import json
 import os
+import shutil
 import subprocess
 import sys
 import unittest
@@ -52,6 +53,7 @@ def _observe():
     return _RESULT
 
 
+@unittest.skipIf(shutil.which('node') is None, 'node not installed')
 @unittest.skipUnless(os.path.isdir(JSDOM), 'jsdom not installed (npm install)')
 class TooltipLineBreakTests(unittest.TestCase):
     def setUp(self):

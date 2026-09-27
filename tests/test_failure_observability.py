@@ -342,7 +342,7 @@ class ConcatFailureIsObservableTests(unittest.TestCase):
         self.t.cleanup()
 
     def test_no_valid_segments_marks_failed_with_an_event_naming_why(self):
-        from app.database import CONCATENATION_DONE, REC_STATUS_FAILED
+        from app.database import CONCATENATION_DONE, CONCATENATION_FAILED, REC_STATUS_FAILED
         import app.concatenator as concatenator
 
         rec = seed.make_recording(status='IN_PROGRESS', name='dead concat')
@@ -356,9 +356,12 @@ class ConcatFailureIsObservableTests(unittest.TestCase):
         db.session.expire_all()
         self.assertEqual(db.session.get(Recording, rid).status, REC_STATUS_FAILED)
         events = RecordingEvent.query.filter_by(
-            recording_id=rid, event_type=CONCATENATION_DONE).all()
+            recording_id=rid, event_type=CONCATENATION_FAILED).all()
         self.assertEqual(len(events), 1,
-                         'a concat give-up must leave exactly one CONCATENATION_DONE event')
+                         'a concat give-up must leave exactly one CONCATENATION_FAILED event')
+        self.assertEqual(RecordingEvent.query.filter_by(
+            recording_id=rid, event_type=CONCATENATION_DONE).count(), 0,
+            'CONCATENATION_DONE means a joined file and nothing else (dev/changelog/1140)')
         self.assertIn('no valid segments', (events[0].detail or '').lower(),
                       f'the event must name the reason, got {events[0].detail!r}')
 
@@ -366,7 +369,7 @@ class ConcatFailureIsObservableTests(unittest.TestCase):
 class ConversionFailureIsObservableTests(unittest.TestCase):
     """The conversion give-up path taken at startup: a row left CONVERTING by a crash whose
     source .ts is gone can never be resumed, so it is failed on the spot. It surfaces twice -
-    a CONVERSION_DONE event on the recording and a standing CONVERSION_FAILED alert - and
+    a CONVERSION_FAILED event on the recording and a standing CONVERSION_FAILED alert - and
     both are asserted, because the alert is the half the detail page does not carry."""
 
     def setUp(self):
@@ -378,7 +381,7 @@ class ConversionFailureIsObservableTests(unittest.TestCase):
         self.t.cleanup()
 
     def test_converting_row_with_missing_source_fails_loudly(self):
-        from app.database import Alert, CONVERSION_DONE, REC_STATUS_FAILED
+        from app.database import Alert, CONVERSION_FAILED, REC_STATUS_FAILED
         from app.scheduler import resume_in_progress_recordings
 
         rec = seed.make_recording(status='CONVERTING', name='orphaned conversion')
@@ -391,7 +394,7 @@ class ConversionFailureIsObservableTests(unittest.TestCase):
         db.session.expire_all()
         self.assertEqual(db.session.get(Recording, rid).status, REC_STATUS_FAILED)
         events = RecordingEvent.query.filter_by(
-            recording_id=rid, event_type=CONVERSION_DONE).all()
+            recording_id=rid, event_type=CONVERSION_FAILED).all()
         self.assertEqual(len(events), 1)
         self.assertIn('missing', (events[0].detail or '').lower(),
                       f'the event must name the reason, got {events[0].detail!r}')

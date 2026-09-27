@@ -39,6 +39,7 @@ from unittest import mock
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import app.postprocessor as ppmod  # noqa: E402
+import app.probe as probemod  # noqa: E402
 from tests.support.app import make_test_app  # noqa: E402
 from tests.support import seed  # noqa: E402
 from app import db  # noqa: E402
@@ -190,7 +191,7 @@ class _ConversionPhaseHarness(unittest.TestCase):
             stack.enter_context(
                 mock.patch.object(cfgmod, 'load_config', return_value=self._config()))
             stack.enter_context(
-                mock.patch.object(ppmod, 'nominal_video_rate', create=True, return_value=None))
+                mock.patch.object(probemod, 'nominal_video_rate', return_value=None))
             stack.enter_context(
                 mock.patch.object(ppmod, 'parts_signature', return_value=_SIGNATURE))
             stack.enter_context(

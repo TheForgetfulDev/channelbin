@@ -113,7 +113,7 @@
   <div class="al-body">
     <div class="al-title">{{ a.title }}</div>
     <div class="al-meta">
-      {{ a.created_at | local_time if a.created_at else '' }}
+      {% if a.created_at %}{{ a.created_at | local_time }}&nbsp;&middot;&nbsp;{{ a.created_at | time_ago }}{% endif %}
       {% if a.source %}&nbsp;&middot;&nbsp;<code>{{ a.source }}</code>{% endif %}
       {% if a.alert_type %}&nbsp;&middot;&nbsp;{{ a.alert_type }}{% endif %}
       {% if a.dismissed_at %}&nbsp;&middot;&nbsp;<em>dismissed</em>{% endif %}
@@ -146,6 +146,12 @@
 </div>
 {% endmacro %}
 
+{# The one region the page re-renders: static/js/alerts.js swaps it (with #al-unread) for a
+   fresh server copy when /api/nav-status reports a signature other than the one it was
+   rendered at, and once a minute so the ages stay true. It always exists, whichever of the
+   cards and the empty state it holds, so a swap always has something to replace
+   (dev/changelog/1131). #}
+<div id="al-live" data-alert-sig="{{ alert_sig }}">
 {% if active_alerts %}
 <div class="card" id="al-card-active">
   <div class="card-head">
@@ -180,6 +186,7 @@
   {% endif %}
 </div>
 {% endif %}
+</div>
 {% endblock %}
 
 {% block scripts %}

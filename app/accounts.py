@@ -42,7 +42,7 @@ from .db_utils import current_wal_size_bytes, retry_on_locked
 from .epg_sources import (
     DISTINCT_TITLE_CAP, REASON_NONE, UPCOMING_TITLES, DirectoryRow, accepted_keys,
     add_held_coverage, apply_winners, channel_key, demote, directory_coverage, drop_alternates,
-    ensure_provider_source, held_coverage, norm_key, promote, provider_xmltv_url,
+    ensure_provider_source, file_id_for, held_coverage, norm_key, promote, provider_xmltv_url,
     refresh_source_counts, resolve_active_source, sources_refreshed_by_sync, subscriber_ids,
     subscriptions_for, sources_without_directory, write_directory,
 )
@@ -838,6 +838,31 @@ def sync_account(app, account_id: int, use_dump: bool = False, force_epg_resync:
     finally:
         admission.release(ticket)
         lock.release()
+
+
+def manual_sync_restarts_schedule(cfg: dict) -> bool:
+    """Whether a manual sync that did not say otherwise stands in for the next scheduled
+    one - the `sync.manual_sync_restarts_schedule` default (dev/changelog/1134)."""
+    return bool(cfg.get('sync', {}).get(
+        'manual_sync_restarts_schedule', config_default('sync.manual_sync_restarts_schedule')))
+
+
+def run_manual_sync(app, account_id: int, *, force_epg_resync: bool = False,
+                    restart_schedule: bool = False):
+    """The thread body of every manual sync. `restart_schedule` lets the run stand in for the
+    account's next scheduled sync; the schedule moves after the sync has run, and only if it
+    succeeded (scheduler.restart_schedule_after_manual_sync, dev/changelog/1134).
+
+    force_admission: a manual sync is a present user's call, already past the sync_conflicts
+    warn-and-override flow (DESIGN-concurrency.md §5.4). It still registers, so everything
+    that yields to a sync can see it."""
+    from .scheduler import restart_schedule_after_manual_sync
+
+    ran_at = datetime.utcnow()
+    sync_account(app, account_id, force_epg_resync=force_epg_resync, force_admission=True)
+    if restart_schedule:
+        with app.app_context():
+            restart_schedule_after_manual_sync(account_id, ran_at)
 
 
 def sync_conflicts(account_id: int) -> list[str]:
@@ -2714,19 +2739,11 @@ def _refresh_source(source: EpgSource, timeout: int, epg_days: int, cfg: dict | 
                          stop_event=stop_event, track_progress=track_progress)
 
 
-def _match_program(elem, channel_map: dict, case_sensitive: bool,
-                     window_start: datetime, window_end: datetime):
-    """(channel_ids, start_dt, stop_dt) this <programme> element would import into, or
-    None if out of scope (unmatched channel id, unparseable timestamps, or outside the
-    import window). Shared by the collapse guard's count pass
-    (_count_projected_epg_entries) and the real import loop below
-    (DESIGN-sync-resilience.md §4) so the two can never drift on what counts as a match.
-    """
-    epg_channel_id = elem.get('channel', '')
-    key = epg_channel_id if case_sensitive else epg_channel_id.lower()
-    channel_ids = channel_map.get(key)
-    if not channel_ids:
-        return None
+def _program_window(elem, window_start: datetime, window_end: datetime):
+    """(start_dt, stop_dt) of a <programme> element inside the import window, or None if
+    its timestamps do not parse or it falls outside. The one in-window test for the scan
+    pass (_count_projected_epg_entries) and the import loop (_match_program), so the
+    projected count and the rows written can never disagree about what is in scope."""
     try:
         start_dt = _parse_xmltv_dt(elem.get('start', ''))
         stop_dt = _parse_xmltv_dt(elem.get('stop', ''))
@@ -2734,19 +2751,53 @@ def _match_program(elem, channel_map: dict, case_sensitive: bool,
         return None
     if stop_dt < window_start or start_dt > window_end:
         return None
-    return channel_ids, start_dt, stop_dt
+    return start_dt, stop_dt
+
+
+def _match_program(elem, feed_map: dict, window_start: datetime, window_end: datetime):
+    """(channel_ids, start_dt, stop_dt) this <programme> element imports into, or None if
+    out of scope (an id no channel reads, unparseable timestamps, or outside the window).
+    `feed_map` is the scan pass's `ProjectedEpgCount.feed_map`, keyed on the file's exact
+    ids: case folding was already applied there, one id per channel (dev/changelog/1139)."""
+    channel_ids = feed_map.get(elem.get('channel', ''))
+    if not channel_ids:
+        return None
+    window = _program_window(elem, window_start, window_end)
+    if window is None:
+        return None
+    return channel_ids, *window
+
+
+def _feed_map(channel_map: dict, counts: dict, case_sensitive: bool) -> dict[str, list[int]]:
+    """{file id: [channel ids]} - for each channel key in `channel_map` ({key as the channel
+    spells it: [channel ids]}), the one id of the file it reads (file_id_for()) among the
+    ids folding to it that have in-window programs (`counts`). A file listing a channel
+    under ids differing only in case gives each its own schedule; reading all of them gave
+    the channel every program twice (dev/changelog/1139)."""
+    variants: dict[str, dict[str, int]] = {}
+    for xml_id, n in counts.items():
+        if xml_id:
+            variants.setdefault(norm_key(xml_id, case_sensitive), {})[xml_id] = n
+    out: dict[str, list[int]] = {}
+    for key, ids in channel_map.items():
+        fid = file_id_for(key, variants.get(norm_key(key, case_sensitive), {}))
+        if fid is not None:
+            out.setdefault(fid, []).extend(ids)
+    return out
 
 
 class ProjectedEpgCount(NamedTuple):
     """What the scan pass saw. `programs_seen` and `channels_seen` count every <programme> /
     <channel> element in the feed, matched or not, which is what lets a refusal tell "the
     feed had no listings" from "it had listings for other channels" (dev/changelog/1100).
-    `directory` is the source directory the pass built (DESIGN-epg-sources.md §7.4)."""
+    `directory` is the source directory the pass built (DESIGN-epg-sources.md §7.4), and
+    `feed_map` the {file id: [channel ids]} the import loop matches against (_feed_map())."""
     projected: int
     parse_error: str | None
     programs_seen: int
     channels_seen: int
     directory: list | None = None
+    feed_map: dict | None = None
 
 
 def _count_projected_epg_entries(xml_bytes: bytes, channel_map: dict, case_sensitive: bool,
@@ -2763,6 +2814,11 @@ def _count_projected_epg_entries(xml_bytes: bytes, channel_map: dict, case_sensi
     Runs on every import, not only when the guard is armed: the directory is what decides
     which source wins a channel, and that has to be known before any row is written.
 
+    `channel_map` is {key as the channel spells it: [channel ids]}. Which of the file's ids
+    each key reads is decided here, from the per-id counts, and handed back as `feed_map`;
+    the projected count is taken over that same map, so it is exactly what the import loop
+    will write (dev/changelog/1139).
+
     `stop_event` makes this pass cancellable: it is a full extra walk of the payload, which
     on a large feed is long enough that ignoring a cancel through it is exactly the wait
     dev/changelog/720 removed. Stopping here is free - nothing has been written.
@@ -2773,7 +2829,6 @@ def _count_projected_epg_entries(xml_bytes: bytes, channel_map: dict, case_sensi
     alongside the error are what parsed before the break, and are not comparable against a
     threshold: the caller refuses on the error itself.
     """
-    total = 0
     seen = 0
     channels = 0
     names: dict[str, list] = {}
@@ -2795,13 +2850,9 @@ def _count_projected_epg_entries(xml_bytes: bytes, channel_map: dict, case_sensi
                 if seen % _CANCEL_POLL_PROGRAMS == 0:
                     _raise_if_cancelled(stop_event, cancel_detail)
                 xml_id = elem.get('channel', '')
-                try:
-                    start_dt = _parse_xmltv_dt(elem.get('start', ''))
-                    stop_dt = _parse_xmltv_dt(elem.get('stop', ''))
-                except ValueError:
-                    elem.clear()
-                    continue
-                if stop_dt >= window_start and start_dt <= window_end:
+                window = _program_window(elem, window_start, window_end)
+                if window is not None:
+                    start_dt, stop_dt = window
                     counts[xml_id] = counts.get(xml_id, 0) + 1
                     title_el = elem.find('title')
                     title = (title_el.text or '').strip() if title_el is not None else ''
@@ -2815,10 +2866,6 @@ def _count_projected_epg_entries(xml_bytes: bytes, channel_map: dict, case_sensi
                             del soon[UPCOMING_TITLES:]
                     if xml_id not in horizon or stop_dt > horizon[xml_id]:
                         horizon[xml_id] = stop_dt
-                    match = _match_program(elem, channel_map, case_sensitive,
-                                           window_start, window_end)
-                    if match is not None:
-                        total += len(match[0])
                 elem.clear()
             elif elem.tag == 'channel':
                 channels += 1
@@ -2842,7 +2889,9 @@ def _count_projected_epg_entries(xml_bytes: bytes, channel_map: dict, case_sensi
             sole_title=next(iter(t)) if len(t) == 1 else None,
             horizon_until=horizon.get(xml_id),
             upcoming=tuple(upcoming.get(xml_id, ()))))
-    return ProjectedEpgCount(total, error, seen, channels, directory)
+    feed_map = _feed_map(channel_map, counts, case_sensitive)
+    total = sum(counts[fid] * len(ids) for fid, ids in feed_map.items())
+    return ProjectedEpgCount(total, error, seen, channels, directory, feed_map)
 
 
 def _empty_feed_reason(xml_bytes: bytes, channels_seen: int | None, baseline: int) -> str:
@@ -2983,11 +3032,13 @@ def _import_source(source: EpgSource, xml_bytes: bytes, epg_days: int, case_sens
     candidate_sources.add(source_id)
     user_keys = accepted_keys(candidate_sources)
 
-    # {normalized key: [channel ids]} over this source's key for each channel (§7.1).
+    # {key as the channel spells it: [channel ids]} over this source's key for each channel
+    # (§7.1). Not normalized here: the scan pass folds it and picks one of the file's ids per
+    # key (`feed_map`), and the spelling is what picks between ids differing only in case.
     # HIDDEN CHANNELS ARE EXCLUDED, and this is the whole EPG saving of dev/changelog/781:
-    # the map decides which <programme> elements become rows. The scan pass is handed this
-    # same map, so the guard's count follows without a second filter - the two share
-    # `_match_program` precisely so they cannot drift on what counts as a match.
+    # the map decides which <programme> elements become rows. The guard's count and the
+    # import loop both read the scan pass's `feed_map`, so they cannot drift on what counts
+    # as a match.
     subscribed = set(subscribers)
     channel_map: dict[str, list[int]] = {}
     for c in channels:
@@ -2995,7 +3046,7 @@ def _import_source(source: EpgSource, xml_bytes: bytes, epg_days: int, case_sens
             continue
         k = channel_key(c.epg_channel_id, user_keys.get((c.id, source_id)))
         if k:
-            channel_map.setdefault(norm_key(k, case_sensitive), []).append(c.id)
+            channel_map.setdefault(k, []).append(c.id)
 
     if not channel_map:
         # The directory is still written: it is what the name-match review page proposes
@@ -3064,6 +3115,7 @@ def _import_source(source: EpgSource, xml_bytes: bytes, epg_days: int, case_sens
     _raise_if_cancelled(stop_event, kept_detail)
 
     write_directory(source_id, count.directory or [])
+    feed_map = count.feed_map or {}
 
     # Who wins each channel (DESIGN-epg-sources.md §5), decided before a row is written so
     # every row lands in the table it belongs in.
@@ -3176,7 +3228,7 @@ def _import_source(source: EpgSource, xml_bytes: bytes, epg_days: int, case_sens
                 continue
             in_program = False
 
-            match = _match_program(elem, channel_map, case_sensitive, window_start, window_end)
+            match = _match_program(elem, feed_map, window_start, window_end)
             if match is None:
                 elem.clear()
                 continue

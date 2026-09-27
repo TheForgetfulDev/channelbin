@@ -705,7 +705,8 @@ def run_job_now(job_id):
     if m:
         from ..database import Account
         from .. import db
-        from ..accounts import sync_account, sync_conflicts
+        from ..accounts import manual_sync_restarts_schedule, run_manual_sync, sync_conflicts
+        from ..config import load_config
 
         account_id = int(m.group(1))
         account = db.session.get(Account, account_id)
@@ -723,14 +724,18 @@ def run_job_now(job_id):
                     'conflicts': conflicts,
                 }), 409
 
+        # A manual sync like Sync now, so it follows the same setting: with no dialog here
+        # to ask, the configured default decides whether it replaces the next scheduled run.
+        restart = account.sync_enabled and manual_sync_restarts_schedule(load_config())
         threading.Thread(
-            target=sync_account, args=(app_obj, account_id),
-            # See _start_sync in routes/accounts.py - manual sync is forced past admission
-            # but still registers.
-            kwargs={'force_admission': True},
+            target=run_manual_sync, args=(app_obj, account_id),
+            kwargs={'restart_schedule': restart},
             daemon=True, name=f'account-sync-{account_id}',
         ).start()
-        return jsonify({'success': True, 'message': f'Sync started for "{account.name}"'})
+        message = f'Sync started for "{account.name}"'
+        if restart:
+            message += '. If it succeeds, it replaces the next scheduled sync'
+        return jsonify({'success': True, 'message': message})
 
     m = re.match(r'^epg_source_refresh_(\d+)$', job_id)
     if m:

@@ -678,6 +678,10 @@ _DEFAULTS = {
         'skip_sync_if_recording_active': True,
         'skip_sync_if_recording_within_minutes': 5,
         'tester_defer_retry_minutes': 20,  # defer sync past an active test run, retry after this; 0 = skip with no retry
+        # Where the Sync now dialog's "skip the scheduled sync" switch starts. On, a manual
+        # sync that succeeds restarts the account's interval from itself; the request can
+        # say otherwise either way (dev/changelog/1134).
+        'manual_sync_restarts_schedule': True,
         'url_drift_alert_min_channels': 50,  # WARN when a sync rewrites this many channels' stream URLs; 0 = disabled
         # Refuse an EPG import when the projected entry count is below this percent of the
         # prior sync's cached epg_entry_count (DESIGN-sync-resilience.md §4) - guards against

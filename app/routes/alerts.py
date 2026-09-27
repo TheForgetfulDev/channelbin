@@ -138,9 +138,32 @@ def _alert_to_dict(a: Alert) -> dict:
     }
 
 
+def alert_signature() -> str:
+    """A short string that changes whenever anything the Alerts page shows could have.
+    /api/nav-status carries it and /alerts renders the one its cards were read at, so the
+    page knows when to re-render itself (dev/changelog/1131).
+
+    One part per way a row changes, because each is invisible to the others:
+      max(created_at)   a new alert, and a standing alert re-raised IN PLACE - accounts.py
+                        rewrites the open row's title, body and created_at and clears
+                        read_at, so neither its id nor the table's size moves
+      max(read_at)      Mark read / Mark all read, from any surface
+      max(dismissed_at) a dismiss, or a problem clearing itself
+      count(*)          the retention prune deleting dismissed rows (never the newest ones)
+    No max(id): every writer stamps created_at with the current time, so it adds nothing.
+    One aggregate over a table the prune keeps small, on every nav poll of every page."""
+    count, created, read, dismissed = db.session.query(
+        func.count(Alert.id), func.max(Alert.created_at),
+        func.max(Alert.read_at), func.max(Alert.dismissed_at)).one()
+    return '|'.join('' if v is None else str(v) for v in (count, created, read, dismissed))
+
+
 @alerts_bp.route('/alerts')
 def alert_center():
     include_dismissed = request.args.get('include_dismissed') == '1'
+    # Read before the rows: a change landing between the two then makes the next poll
+    # re-render once more, where the other order would leave that change unseen.
+    alert_sig = alert_signature()
     q = Alert.query.order_by(Alert.created_at.desc())
     if not include_dismissed:
         q = q.filter(Alert.dismissed_at.is_(None))
@@ -159,7 +182,8 @@ def alert_center():
                            past_alerts=past_alerts,
                            include_dismissed=include_dismissed,
                            unread_count=unread_count,
-                           alert_links=alert_links)
+                           alert_links=alert_links,
+                           alert_sig=alert_sig)
 
 
 @alerts_bp.route('/api/alerts')

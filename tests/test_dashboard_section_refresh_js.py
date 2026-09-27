@@ -1,4 +1,4 @@
-"""Tier 0 - the Live Dashboard's two self-refreshing sections, in a real DOM.
+"""Tier 0 - the Live Dashboard's self-refreshing regions, in a real DOM.
 
 Two of the Dashboard's five sections used to go stale on a page left open: the accounts
 rows said "Synced 4m ago" an hour later and never noticed a sync start, finish or fail,
@@ -20,6 +20,22 @@ because startHealthCheckWidget() returned at once when the server had rendered n
   (g) An unchanged signature still refreshes once the render is a minute old, in a
       visible tab and a visible section only.
 
+The recording regions - the header count, the tiles, the timeline blob and the live and
+upcoming sections - used to be load-once: a recording that started while the page was
+open stayed under Upcoming as Scheduled, and one that ended reloaded the whole page 3s
+later. They now follow the nav poll's recording_signature and the rows' own SSE status
+frames (dev/changelog/1143; dev/docs/BUGS.md 2026-09-26 @ 08:50:16 PM). Invariants:
+
+  (h) The page renders the signature the poll reports, and an agreeing payload fetches
+      nothing.
+  (i) A recording that starts moves from Upcoming to in progress, and the tiles, header
+      count and timeline follow - in one fetch, with no reload, leaving the accounts
+      section alone - then converges. Its own SSE frame does the same without a poll.
+  (j) A recording that finishes leaves the live section without a reload.
+  (k) A sort the user picked and a section hidden in Customize survive the swap.
+  (l) An unchanged signature refreshes them once a minute in a visible tab, in the same
+      fetch as the accounts section's tick.
+
 tests/support/dashboard_sections.mjs replays each scenario against the markup the
 dashboard route really rendered; every assertion lives here.
 
@@ -37,7 +53,10 @@ from datetime import datetime, timedelta
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app import db  # noqa: E402
-from app.database import Account, AccountSyncLog  # noqa: E402
+from app.database import (  # noqa: E402
+    Account, AccountSyncLog, Recording,
+    REC_STATUS_COMPLETED, REC_STATUS_IN_PROGRESS, REC_STATUS_SCHEDULED,
+)
 from app.routes.dashboard import BG_KIND_HEALTH_CHECK  # noqa: E402
 from tests.support import seed  # noqa: E402
 from tests.support.app import make_test_app  # noqa: E402
@@ -47,15 +66,15 @@ HARNESS = os.path.join(REPO, 'tests', 'support', 'dashboard_sections.mjs')
 JSDOM = os.path.join(REPO, 'node_modules', 'jsdom')
 
 _RESULT = None
-
-# Four database states the scenarios move the fake server between. idle and checking share
-# their ACCOUNT state on purpose, so the sync signature does not move underneath a health
-# scenario and add a page fetch nobody asked for.
-STATES = ('idle', 'checking', 'syncing', 'synced')
+_REC = {}
 
 
 def _observe():
-    """Render the four states once, drive every scenario once in node, return it all."""
+    """Render every state once, drive every scenario once in node, return it all.
+
+    idle and checking share their ACCOUNT state on purpose, so the sync signature does not
+    move underneath a health scenario and add a page fetch nobody asked for; scheduled,
+    started and finished share the synced accounts for the same reason."""
     global _RESULT
     if _RESULT is not None:
         return _RESULT
@@ -146,6 +165,39 @@ def _observe():
         db.session.commit()
         active_run['synced'] = snapshot('synced')
 
+        # The recording regions, with the accounts held at `synced` so the sync signature
+        # stays still underneath them. Start times put the server's order (by start) at
+        # Zeta, Alpha, Mid, so a name sort visibly reorders the live rows.
+        now = datetime.utcnow()
+        zeta = seed.make_recording(status=REC_STATUS_IN_PROGRESS, name='Zeta live',
+                                   start_time=now - timedelta(minutes=60),
+                                   stop_time=now + timedelta(minutes=60),
+                                   started_at=now - timedelta(minutes=60))
+        alpha_rec = seed.make_recording(status=REC_STATUS_IN_PROGRESS, name='Alpha live',
+                                        start_time=now - timedelta(minutes=10),
+                                        stop_time=now + timedelta(minutes=50),
+                                        started_at=now - timedelta(minutes=10))
+        soon = seed.make_recording(status=REC_STATUS_SCHEDULED, name='Mid show',
+                                   start_time=now + timedelta(minutes=2),
+                                   stop_time=now + timedelta(minutes=62))
+        db.session.commit()
+        rec_ids = {'zeta': zeta.id, 'alpha': alpha_rec.id, 'soon': soon.id}
+        _REC.update(rec_ids)
+        active_run['scheduled'] = snapshot('scheduled')
+
+        soon = db.session.get(Recording, rec_ids['soon'])
+        soon.status = REC_STATUS_IN_PROGRESS
+        soon.started_at = datetime.utcnow()
+        db.session.commit()
+        active_run['started'] = snapshot('started')
+
+        db.session.get(Recording, rec_ids['alpha']).status = REC_STATUS_COMPLETED
+        db.session.commit()
+        active_run['finished'] = snapshot('finished')
+
+        with open(os.path.join(tmp, 'recordings.json'), 'w', encoding='utf-8') as f:
+            json.dump(rec_ids, f)
+
         with open(os.path.join(tmp, 'active-run.json'), 'w', encoding='utf-8') as f:
             json.dump(active_run, f)
 
@@ -212,8 +264,9 @@ class SyncFinishedTests(_Base):
         self.assertIn('alpha:OK', self.obs['statuses'])
 
     def test_only_that_section_is_replaced(self):
-        """One writer per region: the recording sections are SSE's, and a swap that took
-        them with it would wipe every live value on the page."""
+        """A sync moves nothing in the recording sections, so re-rendering them with it would
+        be a fetch's worth of work for no change - they have their own trigger
+        (dev/changelog/1143)."""
         self.assertTrue(self.obs['otherSectionUntouched'])
 
     def test_the_section_keeps_its_place_in_the_customize_order(self):
@@ -283,7 +336,7 @@ class OnePollChainTests(_Base):
         self.assertTrue(self.obs['polled'])
 
     def test_starting_the_widget_again_never_adds_a_second_chain(self):
-        """refreshSection('health') re-enters startHealthCheckWidget on every swap, and a
+        """The health swap re-enters startHealthCheckWidget on every swap, and a
         run that outlives a swap would leave two chains writing one card and asking
         /api/channel-tests/active-run twice as often. Counted as polls in flight at once
         against an endpoint that never answers - one chain parks exactly one request."""
@@ -382,11 +435,14 @@ class HiddenSectionTests(_Base):
     SCENARIO = 'hidden_section'
 
     def test_a_section_hidden_in_customize_is_not_refetched_on_the_tick(self):
-        self.assertEqual(self.obs['whileHidden'], 0)
+        """The page IS fetched on that poll - the recording regions tick too
+        (dev/changelog/1143) - but the hidden section is not swapped in with them."""
+        self.assertEqual(self.obs['whileHidden']['pageFetches'], 1)
+        self.assertFalse(self.obs['whileHidden']['replaced'])
 
     def test_a_real_change_still_reaches_a_hidden_section(self):
         """Otherwise unhiding it would reveal a sync state from whenever the page loaded."""
-        self.assertEqual(self.obs['onChange']['pageFetches'], 1)
+        self.assertTrue(self.obs['onChange']['replaced'])
         self.assertIn('alpha:SYNCING', self.obs['onChange']['statuses'])
 
 
@@ -456,3 +512,123 @@ class PayloadContractTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+# ── The recording regions (dev/changelog/1143) ─────────────────────────────
+
+
+class RecordingBootTests(_Base):
+    SCENARIO = 'rec_boot'
+
+    def test_the_hook_is_registered_on_the_nav_status_poll(self):
+        self.assertEqual(self.obs['hook'], 'function')
+
+    def test_the_tiles_carry_the_signature_the_poll_reports(self):
+        """Two readings of routes/dashboard.py::recording_signature(), so the attribute has
+        to be that same string."""
+        self.assertTrue(self.obs['recSig'])
+        self.assertEqual(self.obs['recSig'], self.obs['navSig'])
+
+    def test_a_payload_that_agrees_with_the_page_fetches_nothing(self):
+        self.assertEqual(self.obs['pageFetches'], 0)
+
+
+class RecordingStartedByPollTests(_Base):
+    """The defect: a recording that started while / was open stayed under Upcoming as
+    Scheduled, the live section kept its empty state and the tiles kept their counts."""
+    SCENARIO = 'rec_started_by_poll'
+
+    def test_the_row_moves_from_upcoming_to_in_progress(self):
+        soon = _REC['soon']
+        self.assertEqual(self.obs['before']['upcoming'], [soon])
+        self.assertNotIn(soon, self.obs['before']['live'])
+        self.assertIn(soon, self.obs['after']['live'])
+        self.assertEqual(self.obs['after']['upcoming'], [])
+
+    def test_the_tiles_and_the_header_count_follow(self):
+        self.assertEqual(self.obs['before']['capturing'], '2')
+        self.assertEqual(self.obs['after']['capturing'], '3')
+        self.assertNotEqual(self.obs['before']['sub'], self.obs['after']['sub'])
+        self.assertIn('3 recordings in progress', self.obs['after']['sub'])
+
+    def test_the_timeline_redraws_from_the_fresh_blob(self):
+        self.assertIn('scheduled', self.obs['before']['bar'])
+        self.assertIn('live', self.obs['after']['bar'])
+
+    def test_one_fetch_no_reload_and_the_accounts_section_is_left_alone(self):
+        self.assertEqual(self.obs['after']['pageFetches'], 1)
+        self.assertEqual(self.obs['navigations'], [])
+        self.assertTrue(self.obs['after']['accountsUntouched'])
+
+    def test_the_timeline_section_is_never_moved(self):
+        """Only the swapped sections leave the container. Re-inserting the timeline to
+        re-apply the Customize order snapped its scroll back to the start after every swap
+        (dev/docs/BUGS.md 2026-09-26 @ 09:07:32 PM)."""
+        self.assertNotIn('timeline', self.obs['after']['removed'])
+        self.assertTrue(set(self.obs['after']['removed']) <= {'live', 'upcoming'},
+                        self.obs['after']['removed'])
+
+    def test_it_converges(self):
+        self.assertEqual(self.obs['after']['recSig'], self.obs['after']['navSig'])
+        self.assertEqual(self.obs['after']['pageFetchesAfterNextPoll'], 1)
+
+
+class RecordingStartedBySseTests(_Base):
+    """The row's own status frame moves it at once, rather than at the next nav poll - the
+    job the 3s page reload used to do."""
+    SCENARIO = 'rec_started_by_sse'
+
+    def test_the_row_moves_without_a_poll_or_a_reload(self):
+        self.assertIn(_REC['soon'], self.obs['live'])
+        self.assertEqual(self.obs['upcoming'], [])
+        self.assertEqual(self.obs['pageFetches'], 1)
+        self.assertEqual(self.obs['navigations'], [])
+
+
+class RecordingFinishedTests(_Base):
+    SCENARIO = 'rec_finished'
+
+    def test_a_finished_recording_leaves_the_live_section_without_a_reload(self):
+        self.assertIn(_REC['alpha'], self.obs['before'])
+        self.assertNotIn(_REC['alpha'], self.obs['after'])
+        self.assertEqual(len(self.obs['after']), 2)
+        self.assertEqual(self.obs['capturing'], '2')
+        self.assertEqual(self.obs['navigations'], [])
+
+
+class RecordingUserStateTests(_Base):
+    SCENARIO = 'rec_user_state'
+
+    def test_the_sort_survives_and_takes_in_the_new_row(self):
+        # The server's own order is Zeta, Alpha, Mid (by start time).
+        self.assertEqual(self.obs['sortedBefore'], [_REC['alpha'], _REC['zeta']])
+        self.assertEqual(self.obs['sortedAfter'], [_REC['alpha'], _REC['soon'], _REC['zeta']])
+        self.assertEqual(self.obs['sortedCol'], 'name:\u25b4')
+
+    def test_a_section_hidden_in_customize_stays_hidden(self):
+        self.assertTrue(self.obs['liveHiddenBefore'])
+        self.assertTrue(self.obs['liveHidden'])
+
+
+class ReorderTests(_Base):
+    SCENARIO = 'rec_reorder'
+
+    def test_a_customize_move_still_reorders(self):
+        """The move is skipped only when the order already matches."""
+        i = self.obs['before'].index('live')
+        self.assertEqual(self.obs['after'][i - 1], 'live')
+
+
+class RecordingMinuteTickTests(_Base):
+    """"Starts in 5m" and the Next recording tile drift while nothing changes, so the
+    signature alone cannot keep them true."""
+    SCENARIO = 'rec_minute_tick'
+
+    def test_a_background_tab_is_not_refetched(self):
+        self.assertEqual(self.obs['hiddenTab']['pageFetches'], 0)
+        self.assertFalse(self.obs['hiddenTab']['replaced'])
+
+    def test_a_visible_tab_refreshes_both_regions_in_one_fetch(self):
+        self.assertEqual(self.obs['visibleTab']['pageFetches'], 1)
+        self.assertTrue(self.obs['visibleTab']['replaced'])
+        self.assertTrue(self.obs['visibleTab']['accountsReplaced'])

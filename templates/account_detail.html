@@ -506,6 +506,7 @@ window.ACCOUNT_DETAIL = {
   sections: {{ sections | tojson }},
   sectionPref: {{ section_pref | tojson }},
   xtreamDebug: {{ 'true' if xtream_debug else 'false' }},
+  syncPrompt: {{ sync_prompt | tojson }},
   browseUrl: {{ url_for('channels.channel_browser', **{'f.acct': account.id}) | tojson }},
   accountsUrl: {{ url_for('accounts.accounts_list') | tojson }},
   sourceHours: {{ source_hours_choices | list | tojson }},

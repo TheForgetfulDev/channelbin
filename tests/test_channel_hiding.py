@@ -441,5 +441,43 @@ class DoorTests(_HidingTestCase):
         self.assertEqual(r.status_code, 400)
 
 
+class LeavingAHealthCheckTests(_HidingTestCase):
+    """A health check's channel list is a group, so its membership defers a hide, and
+    Remove Duplicate Channels taking a channel out of it must let that hide land
+    (dev/docs/BUGS.md 2026-09-26 @ 12:08:12 PM)."""
+
+    def setUp(self):
+        super().setUp()
+        self.client = self.t.app.test_client()
+        self.dupe = self._channel('Dupe')
+        self.keep = self._channel('Keep')
+        self.job = seed.make_test_job(name='Check', channels=[self.dupe, self.keep])
+        db.session.commit()
+
+    def _remove_duplicate(self, **removal):
+        r = self.client.post(
+            f'/api/channel-tests/on-demand/{self.job.id}/remove-duplicates',
+            json={'removals': [dict(channel_id=self.dupe.id, **removal)]})
+        self.assertEqual(r.status_code, 200, r.get_json())
+        db.session.expire_all()
+        return db.session.get(Channel, self.dupe.id)
+
+    def test_a_plain_removal_lets_a_deferred_hide_land(self):
+        self._hide(self.dupe)
+        self.assertTrue(self.dupe.hidden_deferred, 'precondition: the membership defers it')
+
+        ch = self._remove_duplicate()
+        self.assertTrue(ch.hidden)
+        self.assertFalse(ch.hidden_deferred)
+
+    def test_a_channel_still_in_the_guide_stays_deferred(self):
+        self.dupe.in_guide = True
+        self._hide(self.dupe)
+
+        ch = self._remove_duplicate()
+        self.assertFalse(ch.hidden)
+        self.assertTrue(ch.hidden_deferred)
+
+
 if __name__ == '__main__':
     unittest.main()

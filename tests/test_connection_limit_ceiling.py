@@ -327,7 +327,7 @@ class ResumeWaitsForASlotTests(_SlotCase):
     def test_resume_defers_without_flipping_status(self):
         self._occupy_slot()
         rid = self._paused()
-        with mock.patch('app.scheduler.reschedule_recording_resume', create=True) as resched, \
+        with mock.patch('app.scheduler.reschedule_recording_resume') as resched, \
              mock.patch.object(recorder, '_launch_segment') as launch:
             recorder.resume_recording(self.t.app, rid)
 
@@ -343,7 +343,7 @@ class ResumeWaitsForASlotTests(_SlotCase):
     def test_resume_proceeds_once_the_slot_frees(self):
         holder = self._occupy_slot()
         rid = self._paused()
-        with mock.patch('app.scheduler.reschedule_recording_resume', create=True), \
+        with mock.patch('app.scheduler.reschedule_recording_resume'), \
              mock.patch.object(recorder, '_launch_segment') as launch:
             recorder.resume_recording(self.t.app, rid)
             self.assertFalse(launch.called)
@@ -364,7 +364,7 @@ class ResumeWaitsForASlotTests(_SlotCase):
             start_time=now - timedelta(hours=3), stop_time=now - timedelta(minutes=1))
         db.session.commit()
         rid = rec.id
-        with mock.patch('app.scheduler.reschedule_recording_resume', create=True) as resched, \
+        with mock.patch('app.scheduler.reschedule_recording_resume') as resched, \
              mock.patch.object(recorder, '_launch_segment') as launch:
             recorder.resume_recording(self.t.app, rid)
 

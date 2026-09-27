@@ -49,7 +49,7 @@ from app.channel_search import (  # noqa: E402
     default_standing_for, dimensions_for, parse_duration, parse_terms, parse_when_custom,
     parse_when_next, search, standing_applied, standing_options_for, text_predicates,
     visible_dimensions_for,
-    WHEN_INDEX_DEFEAT_WIDTH, _facet_counts, clear_standing_breakdown_cache,
+    WHEN_INDEX_DEFEAT_WIDTH, WHEN_TODAY, _facet_counts, clear_standing_breakdown_cache,
     _group_collapse_losers, _group_ranked_entries)
 from app.channel_search_rows import build_rows  # noqa: E402
 from app.search_index import rebuild_search_indexes  # noqa: E402
@@ -371,14 +371,42 @@ class GuideScopeTests(_AiringTestCase):
 class WhenDimensionTests(_AiringTestCase):
     """`when` is the only dimension whose values carry their own state."""
 
+    def _today_titles(self):
+        return self.titles(standing=only_hiding(),
+                           filters=(DimensionFilter('when', (WHEN_TODAY,)),))
+
     def test_the_static_values_select_what_they_say(self):
+        """Guards dev/docs/BUGS.md 2026-09-26 08:10 PM. The `today` half used to lean on
+        `Nightly News`, which starts 30 minutes before the clock - so from local midnight to
+        12:30 AM it started yesterday and the test failed every night. The showing it checks
+        now sits in the middle of the search's own local day, 12 hours from either edge."""
         self.assertEqual(self.titles(standing=only_hiding(),
                                      filters=(DimensionFilter('when', ('now',)),)),
                          ['Nightly News'])
-        today = self.titles(standing=only_hiding(),
-                            filters=(DimensionFilter('when', ('today',)),))
-        self.assertIn('Nightly News', today)
+        start, stop = self.context().day_bounds[WHEN_TODAY]
+        midday = start + (stop - start) / 2
+        self._epg(self.bbc, 'Midday Bulletin', (midday - self.now).total_seconds() / 60)
+        db.session.commit()
+
+        today = self._today_titles()
+        self.assertIn('Midday Bulletin', today)
         self.assertNotIn('Wembley Highlights', today)
+
+    def test_today_is_what_starts_today_not_what_is_on_today(self):
+        """`today` is a window on start time, like `tomorrow` and every other `when` value,
+        and `now` is the answer for a showing already running. A film that began before
+        local midnight is on now and is not today - which is what keeps the `today` window
+        a plain start_time range the planner can index (see `_start_window()`)."""
+        start, _stop = self.context().day_bounds[WHEN_TODAY]
+        began = start - timedelta(minutes=30)
+        runs_for = (self.now - began).total_seconds() / 60 + 30
+        self._epg(self.bbc, 'Late Film', (began - self.now).total_seconds() / 60,
+                  duration=runs_for)
+        db.session.commit()
+
+        self.assertIn('Late Film', self.titles(standing=only_hiding(),
+                                               filters=(DimensionFilter('when', ('now',)),)))
+        self.assertNotIn('Late Film', self._today_titles())
 
     def test_a_relative_window_is_parsed_out_of_its_own_value(self):
         self.assertEqual(parse_when_next('next:3:hours'), timedelta(hours=3))

@@ -71,6 +71,11 @@ SOURCE_KINDS = (SOURCE_TEST, SOURCE_RECORDING, SOURCE_CAPTURE_CORRECTION,
                 SOURCE_FAILOVER, SOURCE_STALL_DEMOTION, SOURCE_PLACEHOLDER,
                 SOURCE_FAST_DELIVERY)
 
+#: The kinds whose source_id is a `recordings.id`. Every other event-sourced kind names a
+#: `channel_events.id`, and SOURCE_TEST a `channel_tests.id` - three id spaces, so a
+#: teardown matching exclusions by id must name the kinds of the one it is tearing down.
+RECORDING_SOURCE_KINDS = (SOURCE_RECORDING, SOURCE_CAPTURE_CORRECTION)
+
 
 class Observation:
     """One thing that moved (or would move) a channel's health score.

@@ -17,7 +17,8 @@
    Callers pass `onDone` (usually a reload) and `onError` (a surface's own error line, on
    top of the toast every failure already gets).
 
-   Depends on util.js (escHtml, jsonFetch, showToast, buildModal).
+   Depends on util.js (escHtml, jsonFetch, showToast, buildModal, fieldRow, fmtDur,
+   utcIsoToDate, tzDayLabel, fmtTimeTz).
 */
 
 /* One reporting path for every action here: a toast always, plus the caller's own error
@@ -39,12 +40,13 @@ function accountActionDone(res, opts) {
    (DESIGN-sync-resilience.md §4) - the two mean different things and neither implies the
    other. */
 function accountSync(id, opts = {}) {
+  const body = { force: !!opts.force, force_epg_resync: !!opts.forceEpgResync };
+  // Sent only when the user was asked. Left out, the server applies
+  // sync.manual_sync_restarts_schedule, so every manual sync follows the one setting.
+  if (typeof opts.restartSchedule === 'boolean') body.restart_schedule = opts.restartSchedule;
   return jsonFetch(`/api/accounts/${id}/sync`, {
     method: 'POST',
-    body: JSON.stringify({
-      force: !!opts.force,
-      force_epg_resync: !!opts.forceEpgResync,
-    }),
+    body: JSON.stringify(body),
   })
     .then((res) => accountActionDone(res, opts))
     .catch((e) => {
@@ -55,6 +57,69 @@ function accountSync(id, opts = {}) {
       }
       accountActionFailed(e.message || 'The sync could not be started.', opts);
     });
+}
+
+/* Sync now, first asking whether this run should stand in for the account's next scheduled
+   sync (dev/changelog/1134). `prompt` is the server's reading for this account
+   (routes/accounts.py::_sync_prompts): automatic sync on or off, the next scheduled attempt
+   in naive UTC, the interval, and where the switch starts. With automatic sync off, or
+   nothing scheduled, there is nothing to skip, so the sync starts straight away as it
+   always has. */
+const SYNC_SCHEDULE_SETTING_URL = '/settings?q=sync.manual_sync_restarts_schedule';
+
+function confirmAccountSync(id, name, prompt, opts = {}) {
+  const next = prompt && prompt.auto ? utcIsoToDate(prompt.next_at) : null;
+  if (!next) {
+    accountSync(id, opts);
+    return;
+  }
+  const clock = (d) => `${tzDayLabel(d)} ${fmtTimeTz(d)}`;
+  const secs = (next.getTime() - Date.now()) / 1000;
+  // Under a minute, or already overdue, a countdown would read wrong.
+  const label = secs >= 60
+    ? `And skip the scheduled sync in ${fmtDur(secs, false)}`
+    : 'And skip the next scheduled sync';
+  const hours = prompt.interval_hours;
+  const moved = new Date(Date.now() + hours * 3600000);
+  const onNote = `The next automatic sync then runs ${hours} hour${hours === 1 ? '' : 's'} ` +
+    `after this one, around ${clock(moved)}. If this sync fails, the scheduled one still runs.`;
+  const offNote = `The scheduled sync at ${clock(next)} still runs.`;
+  const start = !!prompt.restart_default;
+
+  const body = document.createElement('div');
+  body.innerHTML =
+    `<p>Fetch the channel list and guide for <strong>${escHtml(name || '')}</strong> from ` +
+    'the provider now.</p>' +
+    fieldRow({
+      label: escHtml(label),
+      meta: `<span id="sync-skip-note">${escHtml(start ? onNote : offNote)}</span>`,
+      control: '<label class="switch"><input type="checkbox" id="sync-skip"' +
+        `${start ? ' checked' : ''}><span class="knob"></span></label>`,
+    }) +
+    `<p class="text-muted small">This switch starts ${start ? 'on' : 'off'} because of the ` +
+    `<a href="${SYNC_SCHEDULE_SETTING_URL}">Sync now skips the scheduled sync</a> setting. ` +
+    'Change it there to change where the switch starts.</p>';
+  const skip = body.querySelector('#sync-skip');
+  skip.addEventListener('change', () => {
+    body.querySelector('#sync-skip-note').textContent = skip.checked ? onNote : offNote;
+  });
+
+  buildModal({
+    title: 'Sync now',
+    body,
+    footer: [
+      { label: 'Cancel', class: 'btn', onClick: (c) => c() },
+      {
+        label: 'Sync now',
+        class: 'btn btn-primary',
+        onClick: (close) => {
+          close();
+          accountSync(id, Object.assign({}, opts, { restartSchedule: skip.checked }));
+          return false;
+        },
+      },
+    ],
+  });
 }
 
 function confirmSyncAnyway(id, conflicts, opts) {

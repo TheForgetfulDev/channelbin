@@ -2,11 +2,14 @@
 
 `make_test_app()` now sandboxes config.yaml by default too (tests/support/app.py::TestApp,
 dev/changelog/605) - a plain `self.t = make_test_app()` with no `ConfigSandbox` already gets
-an empty, isolated config.yaml for the app's whole lifetime, so this class is no longer the
-only thing standing between a test and the real repo-root file. Reach for `ConfigSandbox`
-now specifically when a test needs to (a) control what the sandboxed file contains - the
-`_write_cfg()` below - since `TestApp`'s own default sandbox is always empty, or (b) sandbox
-`load_config()` outright, with no `make_test_app()`/Flask app involved at all.
+an isolated config.yaml for the app's whole lifetime, holding only its own temp output and
+backup dirs (dev/changelog/1130), so this class is no longer the only thing standing between
+a test and the real repo-root file. Reach for `ConfigSandbox` now specifically when a test
+needs to (a) control the whole of what the sandboxed file contains - the `_write_cfg()`
+below; `TestApp.sandbox_config()` covers the usual case of adding values - or (b) sandbox
+`load_config()` outright, with no `make_test_app()`/Flask app involved at all. Under this
+class the runtime output and backup dirs are NOT sandboxed: they resolve to the real `/dvr`
+and the real config-backups folder unless `_write_cfg()` names them.
 
 Before the default existed, this was the *only* fix: `make_test_app()` passed
 `extra_overrides` to `create_app()` once, and those overrides were never stored - so any

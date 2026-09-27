@@ -746,7 +746,7 @@ def start_recording(app, recording_id: int):
                     _fail_conversion_collision_and_commit()
                     from .health_score import dismiss_recording_failing_alerts
                     dismiss_recording_failing_alerts(recording_id)
-                    end_slot_wait(recording_id)
+                    end_capture_wait(recording_id)
                     from .alerts import create_alert
                     create_alert(
                         'RECORDING_FAILED_CONVERSION_COLLISION',
@@ -769,6 +769,14 @@ def start_recording(app, recording_id: int):
                         db.session.commit()
 
                     _mark_deferred_and_commit()
+
+                converting = [db.session.get(Recording, cid)
+                              for cid in postprocessor.active_conversion_ids()]
+                converting = [c for c in converting if c is not None]
+                _note_start_deferred(
+                    recording_id,
+                    f'the mp4 conversion of "{converting[0].name}" to finish' if converting
+                    else 'a live mp4 conversion to finish')
 
                 log.info('Recording %d: deferring start - a live mp4 conversion is running '
                          '(collision_policy: wait)', recording_id)
@@ -917,7 +925,7 @@ def start_recording(app, recording_id: int):
             _mark_missing_dvr_dir_and_commit()
             from .health_score import dismiss_recording_failing_alerts
             dismiss_recording_failing_alerts(recording_id)
-            end_slot_wait(recording_id)
+            end_capture_wait(recording_id)
             return
 
         account_id = rec.channel.account_id if (rec.channel_id and rec.channel) else None
@@ -998,7 +1006,7 @@ def start_recording(app, recording_id: int):
 
         from .health_score import dismiss_recording_failing_alerts
         dismiss_recording_failing_alerts(recording_id)
-        end_slot_wait(recording_id)
+        end_capture_wait(recording_id)
 
         # Re-read the program's synopsis/genre/rating from the guide now that the channel
         # is settled: a recording scheduled days ago may be describing a program the
@@ -1310,7 +1318,7 @@ def resume_recording(app, recording_id: int):
                 _abandon_unclaimed_start(recording_id, state, account_id)
                 return
 
-        end_slot_wait(recording_id)
+        end_capture_wait(recording_id)
 
         # Next segment number comes from this recording's OWN segment rows. Deriving it
         # from a directory listing of `{safe_name}_seg_*` instead - as this did until
@@ -2250,15 +2258,28 @@ def _earlier_waiter_for_slot(recording_id: int, account_id: int, start_time: dat
             .first())
 
 
+def _account_label(account_id: int) -> str:
+    from .database import Account
+    account = db.session.get(Account, account_id)
+    return account.name if account else f'#{account_id}'
+
+
+def _slot_wait_for(account_id: int, waiting_on=None) -> str:
+    """The short form of _slot_wait_reason below, completing "waiting for ..." on a list
+    row, where the full sentence has no room. The event and the alert keep the long one."""
+    phrase = f'a connection slot on "{_account_label(account_id)}"'
+    if waiting_on is not None:
+        phrase += f', behind "{waiting_on.name}"'
+    return phrase
+
+
 def _slot_wait_reason(account_id: int, waiting_on=None) -> str:
     """Plain-language why-this-recording-is-waiting, shared by every surface that says so.
 
     Written once here rather than at each site so the event, the alert and the log line
     cannot drift into describing the wait three different ways.
     """
-    from .database import Account
-    account = db.session.get(Account, account_id)
-    account_name = account.name if account else f'#{account_id}'
+    account_name = _account_label(account_id)
     if waiting_on is not None:
         return (f'recording "{waiting_on.name}" (#{waiting_on.id}) has been waiting longer '
                 f'for a connection slot on account "{account_name}"')
@@ -2306,21 +2327,64 @@ def _note_slot_wait_once(recording_id: int, account_id: int, why: str, waiting_o
     )
 
 
-def end_slot_wait(recording_id: int):
-    """Clear the standing slot-wait alert once this recording is no longer waiting.
+def _note_start_deferred(recording_id: int, waiting_for: str) -> None:
+    """Record on the row that this SCHEDULED recording's start is being held, and for what.
 
-    The other half of _note_slot_wait_once above. RECORDING_WAITING_FOR_CONNECTION_SLOT
-    describes a condition that is still true while the row stands, so the Alerts page
-    lists it under "Active alerts" and offers no Dismiss (dev/changelog/933) - a promise
-    that only holds if EVERY way out of the wait clears it, not just the one where the
-    recording starts.
+    The one writer that sets Recording.start_deferred_since/_for; end_capture_wait() below
+    is the one that clears them. `since` is stamped on the first deferral of a wait and
+    never moved, so the row can say how long it has really been waiting; `waiting_for` is
+    rewritten when the reason changes mid-wait (a slot waiter that then meets a live
+    conversion). Commits only when something changes - the wait re-enters every poll, and
+    a commit per poll would be a write per recording every 30 seconds for nothing.
 
-    Keyed on the recording id rather than the (type, source) pair: the source names the
-    account, and a second recording still queued on that same account has to keep its own
-    row. A no-op when nothing stands, so it is safe on the paths that never waited at all
-    - which is most of them, and is why it sits beside dismiss_recording_failing_alerts at
-    each site rather than behind a "did this one wait" test of its own.
+    Written only while the row is still SCHEDULED, checked inside the retried unit: a
+    cancel that committed first has already ended the wait, and stamping the row after it
+    would leave a cancelled recording claiming to wait (dev/changelog/1141).
     """
+    @retry_on_locked()
+    def _stamp_and_commit():
+        r = db.session.get(Recording, recording_id)
+        if r is None or r.status != REC_STATUS_SCHEDULED:
+            return
+        if r.start_deferred_since is not None and r.start_deferred_for == waiting_for:
+            return
+        if r.start_deferred_since is None:
+            r.start_deferred_since = datetime.utcnow()
+        r.start_deferred_for = waiting_for
+        db.session.commit()
+
+    _stamp_and_commit()
+
+
+def end_capture_wait(recording_id: int):
+    """Everything that says this recording is waiting to capture comes down with the wait.
+
+    Two facts, one exit. The standing RECORDING_WAITING_FOR_CONNECTION_SLOT alert (the
+    other half of _note_slot_wait_once above) describes a condition that is still true
+    while the row stands, so the Alerts page lists it under "Active alerts" and offers no
+    Dismiss (dev/changelog/933); and the row's start_deferred_since/_for pair is what the
+    Recordings list and the Dashboard read to say what a late start is waiting for
+    (dev/changelog/1141). Both are promises that only hold if EVERY way out of the wait
+    clears them, not just the one where the recording starts - which is why they share
+    this one function rather than each keeping its own list of call sites.
+
+    The alert is keyed on the recording id rather than the (type, source) pair: the source
+    names the account, and a second recording still queued on that same account has to
+    keep its own row. A no-op when nothing stands, so it is safe on the paths that never
+    waited at all - which is most of them, and is why it sits beside
+    dismiss_recording_failing_alerts at each site rather than behind a "did this one wait"
+    test of its own. Call it after the caller's own commit, never inside it.
+    """
+    @retry_on_locked()
+    def _clear_deferral_and_commit():
+        r = db.session.get(Recording, recording_id)
+        if r is None or (r.start_deferred_since is None and r.start_deferred_for is None):
+            return
+        r.start_deferred_since = None
+        r.start_deferred_for = None
+        db.session.commit()
+
+    _clear_deferral_and_commit()
     from .alerts import dismiss_open_alerts_for_recording
     dismiss_open_alerts_for_recording(
         recording_id, 'RECORDING_WAITING_FOR_CONNECTION_SLOT')
@@ -2367,7 +2431,7 @@ def _defer_start_for_slot(app, recording_id: int, account_id: int, waiting_on=No
         # The wait is over, badly: RECORDING_FAILED_CONNECTION_LIMIT below is what the
         # user is owed now, and leaving "waiting for a slot" standing beside it would
         # claim a recording is still queued when it has already given up.
-        end_slot_wait(recording_id)
+        end_capture_wait(recording_id)
         from .alerts import create_alert
         create_alert(
             'RECORDING_FAILED_CONNECTION_LIMIT',
@@ -2380,6 +2444,7 @@ def _defer_start_for_slot(app, recording_id: int, account_id: int, waiting_on=No
         return
 
     _note_slot_wait_once(recording_id, account_id, why, waiting_on)
+    _note_start_deferred(recording_id, _slot_wait_for(account_id, waiting_on))
     log.info('Recording %d: deferring start - %s', recording_id, why)
     from .scheduler import reschedule_recording_start
     reschedule_recording_start(
@@ -2410,7 +2475,7 @@ def _defer_resume_for_slot(app, recording_id: int, account_id: int) -> None:
         # Noted, then cleared: the deferral event is the durable record of why the resume
         # never happened, and it stays on the recording. The alert says the recording is
         # waiting, which stopped being true the moment its window closed.
-        end_slot_wait(recording_id)
+        end_capture_wait(recording_id)
         return
 
     _note_slot_wait_once(recording_id, account_id, why)
@@ -2528,7 +2593,7 @@ def abort_recording(app, recording_id: int):
             unschedule_recording(recording_id)
             from .health_score import dismiss_recording_failing_alerts
             dismiss_recording_failing_alerts(recording_id)
-            end_slot_wait(recording_id)
+            end_capture_wait(recording_id)
 
         ev.publish(recording_id, RECORDING_ABORTED, {'status': REC_STATUS_ABORTED})
 

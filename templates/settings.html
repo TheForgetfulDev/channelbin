@@ -514,6 +514,8 @@
            'Also hold the sync if a recording is scheduled to start within this many minutes. It retries at the first gap long enough to finish in.', sync_cfg.get('skip_sync_if_recording_within_minutes', 5), tier='advanced') }}
         {{ field_number('sync.tester_defer_retry_minutes', 'Defer sync past health check runs (minutes)',
            'Hold the scheduled sync while a health check run is active, then retry after this many minutes. 0 = skip it with no retry.', sync_cfg.get('tester_defer_retry_minutes', 20), tier='advanced') }}
+        {{ field_bool('sync.manual_sync_restarts_schedule', 'Sync now skips the scheduled sync',
+           'Where the switch in the Sync now dialog starts. With it on, a manual sync replaces the account\'s next scheduled sync: the next automatic one runs a full sync interval after the manual one. You can still change it each time in the dialog, and the schedule only moves if the manual sync succeeds.', sync_cfg.get('manual_sync_restarts_schedule', True), tier='advanced') }}
       </div>
       <div data-sub="guide-data">
         <div class="sec-sub"><strong>Guide data</strong></div>
@@ -522,7 +524,7 @@
         {{ field_number('sync.epg_keep_days', 'EPG keep days',
            'Delete EPG entries older than this many days. 0 = keep forever.', sync_cfg.get('epg_keep_days', 1), tier='advanced') }}
         {{ field_bool('sync.epg_case_sensitive_matching', 'Case-sensitive EPG ID matching',
-           'Require exact-case match between channel EPG IDs and XMLTV channel ids. When off, case-variant EPG IDs (e.g. FoxSports1.us vs foxsports1.us) are treated as the same channel.', sync_cfg.get('epg_case_sensitive_matching', False), tier='advanced') }}
+           'Require exact-case match between channel EPG IDs and XMLTV channel ids. When off, case-variant EPG IDs (e.g. FoxSports1.us vs foxsports1.us) are treated as the same channel; when a file lists both, a channel reads the one spelled like its own ID.', sync_cfg.get('epg_case_sensitive_matching', False), tier='advanced') }}
         {{ field_number('sync.epg_collapse_threshold_percent', 'EPG collapse guard threshold (%)',
            'Refuse an EPG import when the new data has fewer than this percent of the previous sync\'s entry count (protects against a transient empty/garbage feed wiping the guide). 0 = disabled.', sync_cfg.get('epg_collapse_threshold_percent', 20), tier='advanced') }}
       </div>

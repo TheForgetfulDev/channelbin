@@ -122,6 +122,7 @@ Sync cancelled before it finished.
        data-name="{{ account.name }}"
        data-channels="{{ account.channel_count or 0 }}"
        data-epg="{{ account.epg_entry_count or 0 }}"
+       data-sync-prompt="{{ sync_prompts[account.id] | tojson | forceescape }}"
        data-href="{{ url_for('accounts.account_detail', account_id=account.id) }}">
     <span class="a-title">
       <a class="a-name" href="{{ url_for('accounts.account_detail', account_id=account.id) }}">{{ account.name }}</a>

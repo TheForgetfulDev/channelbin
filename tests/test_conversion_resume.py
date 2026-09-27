@@ -45,6 +45,7 @@ from unittest import mock
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import app.postprocessor as ppmod  # noqa: E402
+import app.probe as probemod  # noqa: E402
 from tests.support.app import make_test_app  # noqa: E402
 from tests.support import seed  # noqa: E402
 from app import db  # noqa: E402
@@ -637,8 +638,7 @@ class RestartLoopResumeTests(unittest.TestCase):
                                         parts=len(parts))
 
         with mock.patch.object(cfgmod, 'load_config', return_value=cfg or self._config()), \
-                mock.patch.object(ppmod, 'nominal_video_rate', create=True,
-                                  return_value=None), \
+                mock.patch.object(probemod, 'nominal_video_rate', return_value=None), \
                 mock.patch.object(ppmod, 'run_conversion_supervised', _supervised), \
                 mock.patch.object(ppmod, 'join_conversion_parts', _join), \
                 mock.patch.object(ppmod, 'finalize_part', return_value=120.0):
@@ -694,16 +694,44 @@ class RestartLoopResumeTests(unittest.TestCase):
                         'a failed join must leave the encode recorded as finished')
         self.assertEqual(r.conversion_parts_done, 1)
 
-    def test_a_recorded_complete_encode_skips_straight_to_the_join(self):
+    def test_a_complete_checkpoint_with_no_signature_re_encodes_from_the_top(self):
+        # Nothing records what made those parts, so nothing may be joined onto them.
         set_conversion_parts(self.rec, parts_done=2, source_covered=1000.0,
-                             source_complete=True,
-                             signature=None)
+                             source_complete=True, signature=None)
         db.session.commit()
-        # The signature has to match for the checkpoint to be honoured, so take the one the
-        # run itself computes by letting a first run record it, then re-drive.
+        calls, _ = self._run([self._ok()])
+        self.assertEqual(len(calls), 1, 'an unsigned checkpoint must re-encode, not resume')
+        self.assertEqual(calls[0]['dest'], part_path(self.out, 1))
+        self.assertNotIn('-ss', calls[0]['cmd'])
+
+    def test_a_recorded_complete_encode_skips_straight_to_the_join(self):
+        # The checkpoint is honored only under the signature the run itself computes, so the
+        # first drive exists to capture the command that signature is taken from.
+        calls, _ = self._run([self._ok()])
+        signature = parts_signature(calls[0]['cmd'], calls[0]['dest'])
+
+        if os.path.exists(self.out):
+            os.unlink(self.out)
+        parts = [part_path(self.out, 1), part_path(self.out, 2)]
+        for p in parts:
+            with open(p, 'wb') as fh:
+                fh.write(b'p' * 64)
+        rec = db.session.get(Recording, self.rid)
+        rec.status = 'ANALYZING'
+        rec.output_path = self.ts
+        set_conversion_parts(rec, parts_done=2, source_covered=1000.0,
+                             source_complete=True, signature=signature)
+        db.session.commit()
+
+        # A result is on offer so a broken gate fails on the assertion, not on the stub.
         calls, joins = self._run([self._ok()])
-        self.assertEqual(len(calls), 1, 'a mismatched signature must re-encode, not resume')
-        del joins
+        self.assertEqual(calls, [],'a recorded complete encode must not encode again')
+        self.assertEqual(joins, [parts], 'the recorded parts must be joined as they stand')
+        r = db.session.get(Recording, self.rid)
+        self.assertEqual(r.status, 'COMPLETED')
+        self.assertEqual(r.output_path, self.out)
+        self.assertFalse(r.conversion_source_complete)
+        self.assertIsNone(r.conversion_parts_signature)
 
     def test_the_signature_is_registered_before_the_first_part_is_written(self):
         # The ordering is what makes the crash window safe: a recorded signature with no part
@@ -720,6 +748,7 @@ class RestartLoopResumeTests(unittest.TestCase):
             return self._ok()
 
         with mock.patch.object(cfgmod, 'load_config', return_value=self._config()), \
+                mock.patch.object(probemod, 'nominal_video_rate', return_value=None), \
                 mock.patch.object(ppmod, 'run_conversion_supervised', _supervised), \
                 mock.patch.object(ppmod, 'join_conversion_parts',
                                   return_value=ppmod.PartJoinResult(True, 'success', parts=1)), \
@@ -765,6 +794,7 @@ class RestartLoopResumeTests(unittest.TestCase):
             return self._ok()
 
         with mock.patch.object(cfgmod, 'load_config', return_value=self._config()), \
+                mock.patch.object(probemod, 'nominal_video_rate', return_value=None), \
                 mock.patch.object(ppmod, 'run_conversion_supervised', _supervised), \
                 mock.patch.object(ppmod, 'join_conversion_parts',
                                   return_value=ppmod.PartJoinResult(True, 'success', parts=1)), \

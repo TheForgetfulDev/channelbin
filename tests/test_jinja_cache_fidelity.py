@@ -51,6 +51,8 @@ _PAGES = ('/', '/guide', '/channels', '/accounts', '/settings', '/alerts')
 #     two renders. It caught this test out for real: under a sharded run the two renders sat
 #     far enough apart that the tile moved 122 -> 123 and the test failed claiming the
 #     bytecode cache had changed the markup (dev/changelog/583).
+#   * `/` names the DVR directory, which is each test app's own temp dir since the sandboxed
+#     config.yaml carries it (dev/changelog/1130), so the two apps print different paths.
 _CSRF = re.compile(r'(csrf[-_]token"[^>]*?(?:content|value)=")[^"]*"')
 _DASH_NOW = re.compile(r'("now":\s*)\d+')
 _LOG_LINES = re.compile(r'\d+ log lines')
@@ -89,7 +91,8 @@ class JinjaCacheFidelityTests(unittest.TestCase):
             t = make_test_app()
             try:
                 return {p: (t.client.get(p).status_code,
-                            _normalize(t.client.get(p).get_data(as_text=True)))
+                            _normalize(t.client.get(p).get_data(as_text=True)
+                                       .replace(t._tmpdir, 'TMPDIR')))
                         for p in _PAGES}
             finally:
                 t.cleanup()

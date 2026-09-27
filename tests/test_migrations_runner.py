@@ -2229,8 +2229,8 @@ class RecordingsAutoincrementMigrationTests(unittest.TestCase):
         """Loud, not silent. A rebuild that quietly produced a table without AUTOINCREMENT
         would leave the id still being re-issued while every presence check passed."""
         with self.assertRaises(RuntimeError) as ctx:
-            M._recordings_autoincrement_ddl(
-                'CREATE TABLE recordings (id INTEGER PRIMARY KEY, name TEXT)', 'tmp')
+            M._autoincrement_ddl(
+                'CREATE TABLE recordings (id INTEGER PRIMARY KEY, name TEXT)', 'recordings', 'tmp')
         self.assertIn('AUTOINCREMENT', str(ctx.exception))
 
     def test_m055_leaves_nothing_behind_if_it_dies_before_the_rename(self):
@@ -2296,6 +2296,200 @@ class RecordingsAutoincrementMigrationTests(unittest.TestCase):
                         'Recording lost __table_args__ sqlite_autoincrement - a fresh '
                         'install would re-issue deleted recording ids again')
 
+
+
+class ChildTablesAutoincrementMigrationTests(unittest.TestCase):
+    """Migrations 77 and 78 - rebuild `channel_tests` and `channel_events` with AUTOINCREMENT,
+    because a health-score exclusion names a row in either by id and a re-issued id hands a
+    new row an old one's exclusion (dev/changelog/1129).
+
+    Both go through the rebuild migration 55 uses, with one thing 55 never had to do: these
+    tables carry indexes, which the DROP takes with it. The pre-77 shape is derived from the
+    model, as in RecordingsAutoincrementMigrationTests, so the fixture follows the model.
+    """
+
+    STEPS = (
+        ('channel_tests', 77, '_m077_channel_tests_autoincrement', 'ChannelTest'),
+        ('channel_events', 78, '_m078_channel_events_autoincrement', 'ChannelEvent'),
+    )
+
+    @staticmethod
+    def _model(name):
+        import app.database as database
+        return getattr(database, name)
+
+    @classmethod
+    def _pre_rebuild_ddl(cls, model):
+        from sqlalchemy.schema import CreateTable
+        from sqlalchemy.dialects import sqlite as sqlite_dialect
+        ddl = str(CreateTable(model.__table__).compile(
+            dialect=sqlite_dialect.dialect())).strip()
+        assert M._PK_COLUMN_NEW in ddl, (
+            f'{model.__name__} no longer compiles to the AUTOINCREMENT primary key this '
+            f'fixture inverts - check __table_args__. Compiled:\n{ddl}')
+        ddl = ddl.replace(M._PK_COLUMN_NEW, M._PK_COLUMN_OLD, 1)
+        first_fk = ddl.index('\n\tFOREIGN KEY')
+        return ddl[:first_fk] + M._PK_TABLE_CONSTRAINT + ddl[first_fk:]
+
+    @staticmethod
+    def _index_ddl(model):
+        from sqlalchemy.schema import CreateIndex
+        from sqlalchemy.dialects import sqlite as sqlite_dialect
+        return [str(CreateIndex(ix).compile(dialect=sqlite_dialect.dialect())).strip()
+                for ix in model.__table__.indexes]
+
+    def _scratch(self, td, table, model_name, rows=3):
+        import sqlite3
+        model = self._model(model_name)
+        conn = sqlite3.connect(os.path.join(td, f'{table}.db'))
+        cur = conn.cursor()
+        cur.execute(self._pre_rebuild_ddl(model))
+        for sql in self._index_ddl(model):
+            cur.execute(sql)
+        for i in range(1, rows + 1):
+            self._insert(cur, table, i)
+        conn.commit()
+        return conn, cur
+
+    @staticmethod
+    def _insert(cur, table, row_id=None):
+        if table == 'channel_tests':
+            cur.execute("INSERT INTO channel_tests (id, channel_id, test_started_at, status) "
+                        "VALUES (?, 1, '2026-09-01 00:00:00', 'COMPLETED')", (row_id,))
+        else:
+            cur.execute("INSERT INTO channel_events (id, channel_id, timestamp, event_type) "
+                        "VALUES (?, 1, '2026-09-01 00:00:00', 'CHANNEL_FAILOVER')", (row_id,))
+        return cur.lastrowid
+
+    @staticmethod
+    def _ddl(cur, table):
+        return cur.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name=?",
+                           (table,)).fetchone()[0]
+
+    @staticmethod
+    def _indexes(cur, table):
+        return sorted(cur.execute(
+            "SELECT name, sql FROM sqlite_master WHERE type='index' AND tbl_name=? "
+            "AND sql IS NOT NULL", (table,)).fetchall())
+
+    def test_rebuilds_with_autoincrement_and_is_idempotent(self):
+        for table, _v, step, model_name in self.STEPS:
+            with self.subTest(table=table), tempfile.TemporaryDirectory() as td:
+                conn, cur = self._scratch(td, table, model_name)
+                self.assertNotIn('AUTOINCREMENT', self._ddl(cur, table))
+                getattr(M, step)(conn, cur)
+                conn.commit()
+                first = self._ddl(cur, table)
+                self.assertIn('AUTOINCREMENT', first)
+                self.assertNotIn(f'{table}_autoinc_new', {
+                    r[0] for r in cur.execute("SELECT name FROM sqlite_master WHERE type='table'")})
+                getattr(M, step)(conn, cur)
+                conn.commit()
+                self.assertEqual(first, self._ddl(cur, table),
+                                 'a second run rebuilt an AUTOINCREMENT table')
+                conn.close()
+
+    def test_carries_every_row_and_every_index_across(self):
+        """The DROP takes the table's indexes with it; losing one silently would turn every
+        per-channel timeline read into a full scan with nothing to say so."""
+        for table, _v, step, model_name in self.STEPS:
+            with self.subTest(table=table), tempfile.TemporaryDirectory() as td:
+                conn, cur = self._scratch(td, table, model_name)
+                rows_before = cur.execute(f'SELECT * FROM {table} ORDER BY id').fetchall()
+                indexes_before = self._indexes(cur, table)
+                self.assertTrue(indexes_before, 'fixture must carry the model\'s indexes')
+                getattr(M, step)(conn, cur)
+                conn.commit()
+                self.assertEqual(cur.execute(f'SELECT * FROM {table} ORDER BY id').fetchall(),
+                                 rows_before, 'the rebuild did not preserve every row verbatim')
+                self.assertEqual(self._indexes(cur, table), indexes_before,
+                                 'the rebuild lost or altered an index')
+                conn.close()
+
+    def test_stops_a_deleted_id_being_re_issued(self):
+        for table, _v, step, model_name in self.STEPS:
+            with self.subTest(table=table), tempfile.TemporaryDirectory() as td:
+                conn, cur = self._scratch(td, table, model_name)
+                cur.execute(f'DELETE FROM {table} WHERE id = 3')
+                self.assertEqual(self._insert(cur, table), 3,
+                                 'fixture must reproduce the reuse this migration closes')
+                getattr(M, step)(conn, cur)
+                conn.commit()
+                cur.execute(f'DELETE FROM {table} WHERE id = 3')
+                self.assertEqual(self._insert(cur, table), 4,
+                                 f'a deleted {table} id was handed to the next row')
+                conn.close()
+
+    def test_produces_the_same_schema_a_fresh_build_does(self):
+        """Table DDL compared with the name unquoted, for the reason migration 55's
+        equivalent test gives; the indexes must match the model's exactly."""
+        from sqlalchemy.schema import CreateTable
+        from sqlalchemy.dialects import sqlite as sqlite_dialect
+        for table, _v, step, model_name in self.STEPS:
+            model = self._model(model_name)
+            fresh = str(CreateTable(model.__table__).compile(
+                dialect=sqlite_dialect.dialect())).strip()
+            with self.subTest(table=table), tempfile.TemporaryDirectory() as td:
+                conn, cur = self._scratch(td, table, model_name)
+                getattr(M, step)(conn, cur)
+                conn.commit()
+                rebuilt = self._ddl(cur, table).replace(
+                    f'CREATE TABLE "{table}"', f'CREATE TABLE {table}', 1)
+                self.assertEqual(rebuilt, fresh,
+                                 'the rebuilt table differs from what create_all() builds')
+                self.assertEqual(sorted(sql for _n, sql in self._indexes(cur, table)),
+                                 sorted(self._index_ddl(model)))
+                conn.close()
+
+    def test_leaves_nothing_behind_if_it_dies_before_the_indexes_are_back(self):
+        """The index re-creation runs inside the step's transaction, so a crash between the
+        rename and the last CREATE INDEX rolls the whole rebuild back and the retry finishes
+        it - never a rebuilt table missing its indexes."""
+        class _DiesOnCreateIndex:
+            def __init__(self, inner):
+                self._inner = inner
+
+            def __getattr__(self, name):
+                return getattr(self._inner, name)
+
+            def execute(self, sql, *a):
+                if sql.startswith('CREATE INDEX'):
+                    raise RuntimeError('simulated crash before the indexes were recreated')
+                return self._inner.execute(sql, *a)
+
+        with tempfile.TemporaryDirectory() as td:
+            conn, cur = self._scratch(td, 'channel_tests', 'ChannelTest')
+            rows_before = cur.execute('SELECT * FROM channel_tests ORDER BY id').fetchall()
+            indexes_before = self._indexes(cur, 'channel_tests')
+            with self.assertRaises(RuntimeError):
+                M._m077_channel_tests_autoincrement(conn, _DiesOnCreateIndex(cur))
+            conn.rollback()
+            self.assertNotIn('AUTOINCREMENT', self._ddl(cur, 'channel_tests'))
+            self.assertEqual(self._indexes(cur, 'channel_tests'), indexes_before,
+                             'a rolled-back rebuild left the table without its indexes')
+
+            M._m077_channel_tests_autoincrement(conn, cur)
+            conn.commit()
+            self.assertIn('AUTOINCREMENT', self._ddl(cur, 'channel_tests'))
+            self.assertEqual(self._indexes(cur, 'channel_tests'), indexes_before)
+            self.assertEqual(cur.execute('SELECT * FROM channel_tests ORDER BY id').fetchall(),
+                             rows_before)
+            conn.close()
+
+    def test_registered_at_their_own_versions(self):
+        registered = {v: fn for v, _d, fn in M.SCHEMA_MIGRATIONS}
+        for table, version, step, _m in self.STEPS:
+            with self.subTest(table=table):
+                self.assertIs(registered.get(version), getattr(M, step))
+
+    def test_the_models_carry_sqlite_autoincrement(self):
+        """A fresh install never runs these steps, so the models are what get it there."""
+        for table, _v, _s, model_name in self.STEPS:
+            with self.subTest(table=table):
+                self.assertTrue(
+                    self._model(model_name).__table__.dialect_options['sqlite']['autoincrement'],
+                    f'{model_name} lost sqlite_autoincrement - a fresh install would re-issue '
+                    f'deleted {table} ids again')
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

@@ -568,7 +568,6 @@ class PageScalingTests(unittest.TestCase):
         """
         t = make_test_app()
         try:
-            t.sandbox_output_dirs()
             seed_fn(n_rows)
             url = path() if callable(path) else path
             ctx = prepare() if prepare is not None else None
@@ -602,6 +601,11 @@ class PageScalingTests(unittest.TestCase):
 
     def test_index_page(self):
         self._assert_row_independent(_seed_recordings, '/recordings')
+
+    def test_recording_times_api(self):
+        """The Recordings list's minute tick asks this for every row at once, so it is the
+        list page's own per-row cost in another shape (dev/changelog/1144)."""
+        self._assert_row_independent(_seed_recordings, '/api/recordings/times')
 
     def test_guide_page(self):
         self._assert_row_independent(_seed_guide_channels, '/guide')
