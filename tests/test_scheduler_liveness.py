@@ -223,10 +223,6 @@ class ShutdownRaceTests(unittest.TestCase):
 
 
 class DeadThreadIsReportedTests(_LiveSchedulerCase):
-    def setUp(self):
-        super().setUp()
-        self.t.sandbox_output_dirs()
-
     def _finished_thread(self):
         t = threading.Thread(target=lambda: None)
         t.start()

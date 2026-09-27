@@ -52,7 +52,8 @@
     const hooks = { onDone: reload };
     switch (act) {
       case 'sync':
-        accountSync(id, hooks);
+        confirmAccountSync(id, row.dataset.name, JSON.parse(row.dataset.syncPrompt || 'null'),
+          hooks);
         return;
       case 'cancel-sync':
         accountCancelSync(id, hooks);

@@ -45,7 +45,7 @@
 {% block content %}
 <div class="page-head">
   <h1>Live Dashboard
-    <span class="sub">
+    <span class="sub" id="dash-sub">
       {%- if live -%}
         {{ live | length }} recording{{ '' if live | length == 1 else 's' }} in progress,
         {{ upcoming | length }} scheduled
@@ -77,7 +77,12 @@
     display LABEL would break the moment somebody reworded it (dev/changelog/1082). -#}
 <script type="application/json" id="dash-bg-health-kind">{{ bg_health_kind | tojson }}</script>
 
-<div class="dash-pulse">
+{#- data-rec-sig is the recording signature this render was read at; dashboard.js compares
+    /api/nav-status's recording_signature against it and swaps the recording regions - the
+    header count, these tiles, the timeline blob and the two record sections - when they
+    differ. It rides on the tiles because they are always shown and always swapped
+    (dev/changelog/1143). -#}
+<div class="dash-pulse" data-rec-sig="{{ rec_sig }}">
   {% for m in metrics %}
   <div class="mtile{% if m.cls %} {{ m.cls }}{% endif %}"{% if m.tip %} data-tip="{{ m.tip }}"{% endif %}
        {% if m.href %}data-href="{{ m.href }}"{% endif %}>
@@ -179,7 +184,14 @@
               what changed is that a row has room for three of them, so the rest
               (stalls, failures, downtime, segments) moved into the tap/hover detail.
               dashboard.js's SSE handlers write these ids. -#}
-          {% if rec.status == 'SCHEDULED' %}
+          {% if rec.status == 'SCHEDULED' and rec.start_deferred_since %}
+            {#- A held start: the middle cell names what it is waiting for instead of the
+                duration, the way a parked conversion's does. "Overdue by N min" alone says
+                the start is late but not why (dev/changelog/1141). -#}
+            <span class="d-cell"><span class="d-k">Starts</span>{{ rec.start_time | time_until }}</span>
+            <span class="d-cell" data-tip="Start held since {{ rec.start_deferred_since | local_time_sec }}.&#10;Starts by itself once that clears, if its window is still open."><span class="d-k">Waiting for</span>{{ rec.start_deferred_for or '-' }}</span>
+            <span class="d-cell"><span class="d-k">Start time</span>{{ rec.start_time | local_time }}</span>
+          {% elif rec.status == 'SCHEDULED' %}
             <span class="d-cell"><span class="d-k">Starts</span>{{ rec.start_time | time_until }}</span>
             <span class="d-cell"><span class="d-k">Duration</span>{{ rec.duration_seconds | duration }}</span>
             <span class="d-cell"><span class="d-k">Start time</span>{{ rec.start_time | local_time }}</span>

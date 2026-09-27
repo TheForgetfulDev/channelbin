@@ -62,13 +62,7 @@ class _StartHarness(unittest.TestCase):
 
     def setUp(self):
         self.t = make_test_app()
-        self.dvr = os.path.join(self.t._tmpdir, 'dvr')
-        os.makedirs(self.dvr, exist_ok=True)
-        self.t.sandbox_config({'recording': {
-            'dvr_output_dir': self.dvr,
-            'capture_log_dir': os.path.join(self.t._tmpdir, 'caplogs'),
-            'live_thumbnail': {'enabled': False},
-        }})
+        self.t.sandbox_config({'recording': {'live_thumbnail': {'enabled': False}}})
         acct = seed.make_account()
         self.account_id = acct.id
         self.channel = seed.make_channel(acct, stream_id=77, name='Claim Channel')
@@ -98,14 +92,14 @@ class _StartHarness(unittest.TestCase):
 class AbortDuringStartTests(_StartHarness):
     """(a) A cancel that lands inside the start must stop the start, not run beside it.
 
-    end_slot_wait is the injection point because it is the last thing start_recording does
+    end_capture_wait is the injection point because it is the last thing start_recording does
     before _launch_segment - the exact window the defect lived in. Before the fix it sat on
     the other side of the _active registration, so the abort found nothing to tear down.
     """
 
     def _start_with_abort_at(self, target):
         real = getattr(recorder, target)
-        # One-shot: abort_recording calls end_slot_wait itself, so a wrapper that fired
+        # One-shot: abort_recording calls end_capture_wait itself, so a wrapper that fired
         # every time would recurse instead of testing anything.
         fired = []
 
@@ -122,30 +116,30 @@ class AbortDuringStartTests(_StartHarness):
         return popen
 
     def test_no_ffmpeg_is_spawned_for_a_cancelled_recording(self):
-        popen = self._start_with_abort_at('end_slot_wait')
+        popen = self._start_with_abort_at('end_capture_wait')
         self.assertFalse(
             popen.called,
             'start_recording spawned ffmpeg for a recording that was cancelled mid-start')
 
     def test_no_segment_row_is_created_for_a_cancelled_recording(self):
-        self._start_with_abort_at('end_slot_wait')
+        self._start_with_abort_at('end_capture_wait')
         self.assertEqual(
             self._segment_rows(), [],
             'a cancelled start left a segment row behind, so something was capturing')
 
     def test_the_cancelled_recording_keeps_its_aborted_status(self):
-        self._start_with_abort_at('end_slot_wait')
+        self._start_with_abort_at('end_capture_wait')
         self.assertEqual(self._status(), REC_STATUS_ABORTED)
 
     def test_nothing_is_left_in_active(self):
-        self._start_with_abort_at('end_slot_wait')
+        self._start_with_abort_at('end_capture_wait')
         self.assertIsNone(
             recorder.get_state(self.rid),
             '_active still holds live state for a cancelled recording - nothing would '
             'ever tear it down')
 
     def test_the_connection_slot_is_released(self):
-        self._start_with_abort_at('end_slot_wait')
+        self._start_with_abort_at('end_capture_wait')
         self.assertTrue(
             connlim.try_acquire(self.account_id, 'test', 'probe'),
             'a cancelled start held its connection slot for the life of the process')
@@ -261,17 +255,7 @@ class LiveSchedulerDoubleStartTests(unittest.TestCase):
 
     def setUp(self):
         self.t = make_test_app(start_scheduler=True)
-        # The DVR dir is read by a runtime load_config() inside start_recording, so without
-        # the sandbox it resolves to the real default. Where that path does not exist (a CI
-        # runner) the start fails the recording before either caller launches, and the test
-        # reports 0 starters instead of testing ownership at all.
-        dvr = os.path.join(self.t._tmpdir, 'dvr')
-        os.makedirs(dvr, exist_ok=True)
-        self.t.sandbox_config({'recording': {
-            'dvr_output_dir': dvr,
-            'capture_log_dir': os.path.join(self.t._tmpdir, 'caplogs'),
-            'live_thumbnail': {'enabled': False},
-        }})
+        self.t.sandbox_config({'recording': {'live_thumbnail': {'enabled': False}}})
 
     def tearDown(self):
         self.t.cleanup()
@@ -413,7 +397,7 @@ class ResumeClaimTests(_StartHarness):
 
     def test_a_cancel_during_resume_spawns_nothing(self):
         rid = self._paused_recording()
-        real = recorder.end_slot_wait
+        real = recorder.end_capture_wait
         fired = []
 
         def _abort_then_run(*args, **kwargs):
@@ -423,7 +407,7 @@ class ResumeClaimTests(_StartHarness):
             return real(*args, **kwargs)
 
         try:
-            with mock.patch.object(recorder, 'end_slot_wait', _abort_then_run), \
+            with mock.patch.object(recorder, 'end_capture_wait', _abort_then_run), \
                  mock.patch.object(recorder.subprocess, 'Popen',
                                    side_effect=lambda *a, **kw: _fake_proc()) as popen:
                 recorder.resume_recording(self.t.app, rid)

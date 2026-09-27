@@ -241,21 +241,71 @@ class SandboxFailuresAreNamedTests(unittest.TestCase):
         self.assertIn(stranded, str(caught.exception))
 
 
-if __name__ == '__main__':
-    unittest.main(verbosity=2)
-
-
-class SandboxOutputDirsTests(unittest.TestCase):
-    """dev/docs/BUGS.md 2026-09-18: a runtime load_config() in a test app saw the default
-    /dvr, so a request probing it raised a real storage alert on a machine without /dvr.
-    sandbox_output_dirs() is the opt-in that points those runtime reads at the temp dirs."""
+class SandboxedRuntimePathsTests(unittest.TestCase):
+    """dev/docs/BUGS.md 2026-09-25 @ 09:50:31 PM: make_test_app() handed its temp
+    output and backup dirs to create_app() only, so a runtime load_config() resolved them to
+    the real /dvr and the real instance/config-backups - a test wrote into production on
+    this box, failed on a runner without /dvr, and prune_backups() there would evict the
+    operator's backups. The sandboxed config.yaml now carries them, with no opt-in."""
 
     def setUp(self):
         self.t = make_test_app()
         self.addCleanup(self.t.cleanup)
 
+    def _assert_in_sandbox(self, label, path):
+        self.assertTrue(str(path).startswith(self.t._tmpdir), f'{label} = {path}')
+
     def test_runtime_load_config_points_every_output_dir_into_the_temp_dir(self):
-        self.t.sandbox_output_dirs()
         rec = cfgmod.load_config()['recording']
         for key in ('dvr_output_dir', 'capture_log_dir', 'images_dir'):
-            self.assertTrue(rec[key].startswith(self.t._tmpdir), f'{key} = {rec[key]}')
+            self._assert_in_sandbox(key, rec[key])
+
+    def test_the_config_backup_dir_resolves_into_the_temp_dir(self):
+        from app.config_backup import get_backup_dir
+        self._assert_in_sandbox('config_backup.backup_dir', get_backup_dir())
+
+    def test_a_bare_do_backup_writes_into_the_temp_dir(self):
+        """The call shape of the Back up now routes: no backup_dir, no cfg. The destination
+        is checked before the call, so a broken sandbox fails here rather than depositing a
+        file into the real folder."""
+        from app.config_backup import do_backup, get_backup_dir
+        self._assert_in_sandbox('config_backup.backup_dir', get_backup_dir())
+        self._assert_in_sandbox('do_backup()', do_backup())
+
+    def test_sandbox_config_merges_over_the_sandbox_paths(self):
+        from app.config_backup import get_backup_dir
+        self.t.sandbox_config({'recording': {'retention_days': 3}})
+        rec = cfgmod.load_config()['recording']
+        self.assertEqual(rec['retention_days'], 3)
+        for key in ('dvr_output_dir', 'capture_log_dir', 'images_dir'):
+            self._assert_in_sandbox(key, rec[key])
+        self._assert_in_sandbox('config_backup.backup_dir', get_backup_dir())
+
+    def test_the_opt_out_leaves_a_config_that_sets_nothing(self):
+        self.t.sandbox_config({}, keep_sandbox_paths=False)
+        self.assertEqual(cfgmod._load_config_file(),
+                         {'config_version': cfgmod.CURRENT_CONFIG_VERSION})
+
+
+class RuntimePathGuardTests(unittest.TestCase):
+    """The build-time guard beside the jobstore and DB-backup ones: a TestApp whose
+    sandboxed config.yaml does not carry its temp paths refuses to build."""
+
+    def test_an_app_whose_sandbox_lacks_the_paths_refuses_to_build(self):
+        real_write = testapp_mod.write_sandbox_config
+        orig_path = cfgmod._CONFIG_PATH
+
+        def stamp_only(path, data):
+            real_write(path, {'config_version': data['config_version']})
+
+        with mock.patch.object(testapp_mod, 'write_sandbox_config', stamp_only):
+            with self.assertRaises(AssertionError) as caught:
+                make_test_app()
+        self.assertIn('config_backup.backup_dir', str(caught.exception))
+        self.assertIn('recording.dvr_output_dir', str(caught.exception))
+        self.assertEqual(cfgmod._CONFIG_PATH, orig_path,
+                         'a refused build must hand _CONFIG_PATH back')
+
+
+if __name__ == '__main__':
+    unittest.main(verbosity=2)

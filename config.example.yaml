@@ -346,6 +346,10 @@ sync:
   # A sync defers past an active health-check run and retries after this many minutes.
   # 0 = skip the sync entirely instead of retrying.
   tester_defer_retry_minutes: 20
+  # Where the "skip the scheduled sync" switch in the Sync now dialog starts. When a manual
+  # sync with it on succeeds, the account's next automatic sync moves to one full interval
+  # after the manual one.
+  manual_sync_restarts_schedule: true
   # Warn when one sync rewrites this many channels' stream URLs. A provider changing every
   # URL at once is worth knowing about before recordings start failing. 0 = disabled.
   url_drift_alert_min_channels: 50

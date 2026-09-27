@@ -15,7 +15,12 @@ RESTART_FAILED         = 'RESTART_FAILED'
 # Renamed from RECORDING_COMPLETE 2026-07-16; existing rows migrated in _migrate_db().
 CAPTURE_COMPLETE       = 'CAPTURE_COMPLETE'
 CONCATENATION_STARTED  = 'CONCATENATION_STARTED'
+# The outcome is carried in the type, never in a prefix of the detail: DONE is a joined file
+# and nothing else, FAILED is a join that gave up (no valid segments, no disk space, an ffmpeg
+# error). DONE used to cover both, so a failure rendered in the success color
+# (dev/changelog/1140).
 CONCATENATION_DONE     = 'CONCATENATION_DONE'
+CONCATENATION_FAILED   = 'CONCATENATION_FAILED'
 RECORDING_FAILED                    = 'RECORDING_FAILED'
 RECORDING_FAILED_DEAD_STREAM        = 'RECORDING_FAILED_DEAD_STREAM'
 # Dead-stream fast-fail tripped but the retry budget (watchdog.dead_stream_max_retry_attempts)
@@ -177,8 +182,13 @@ CONVERSION_YIELDED     = 'CONVERSION_YIELDED'
 # resume after it means the app is still waiting, and that has to be readable off the
 # timeline rather than inferred from what follows (dev/changelog/952).
 CONVERSION_RESUMED     = 'CONVERSION_RESUMED'
+# Three outcomes, three types, for the same reason as CONCATENATION_DONE/_FAILED above:
+# DONE is a finished file, FAILED is a give-up, CANCELLED is the user calling it off (the
+# source .ts is kept either way). CONVERSION_DONE used to cover all three (dev/changelog/1140).
 CONVERSION_DONE        = 'CONVERSION_DONE'
-FILE_MOVED             = 'FILE_MOVED'
+CONVERSION_FAILED      = 'CONVERSION_FAILED'
+CONVERSION_CANCELLED   = 'CONVERSION_CANCELLED'
+FILE_MOVED            = 'FILE_MOVED'
 SCRIPT_EXECUTED        = 'SCRIPT_EXECUTED'
 # Pre-recording health check (DESIGN-prerecord-checks.md §3-4): a channel_tester run fired
 # a lead time before this recording's start_time, testing the channel (or would-be group
@@ -821,6 +831,21 @@ class Recording(db.Model):
     postprocess_waiting_on_name  = db.Column(db.String(500))
     postprocess_waiting_on_state = db.Column(db.String(200))
 
+    # A SCHEDULED recording whose start is being held: since when, and what for, as a phrase
+    # that completes "waiting for ..." ('a connection slot on "X"', 'a live mp4 conversion to
+    # finish'). ONE fact that moves as a pair: recorder._note_start_deferred() is the only
+    # writer that sets it and recorder.end_capture_wait() the one that clears it, on every
+    # way out of the wait. `since` is set once per wait and never moved, so a reason that
+    # changes mid-wait updates `for` alone.
+    #
+    # Deliberately NOT the postprocess_waiting_* columns above with a second meaning: the
+    # startup sweep, tools/check_busy.py and the settings split all branch on those, and a
+    # held start is not a parked conversion. Columns rather than the RECORDING_START_DEFERRED
+    # event because the recordings list and the Dashboard render them per row
+    # (dev/changelog/1141).
+    start_deferred_since = db.Column(db.DateTime)
+    start_deferred_for   = db.Column(db.String(500))
+
     # A re-encode's checkpoint: how much of the source is already encoded into part files on
     # disk, so a killed attempt costs one stretch of encoding instead of the whole job
     # (dev/changelog/955). The four columns are ONE fact and move together through
@@ -1099,11 +1124,22 @@ def detach_recording_references(recording_id: int):
 
     RecordingEvent and RecordingSegment need nothing here: both relationships declare
     cascade='all, delete-orphan', so the ORM deletes them along with the row.
+
+    Health-score exclusions of the recording's own observations are deleted, not unlinked:
+    they mean nothing without the row. Only the kinds keyed on a recording id - the failover,
+    stall, placeholder and fast-delivery kinds name a channel event, whose row outlives the
+    recording, and matching them by this id would delete an unrelated exclusion
+    (dev/changelog/1129).
     """
     from .alerts import detach_recording_alerts
+    from .health_recompute import RECORDING_SOURCE_KINDS
     detach_recording_alerts(recording_id)
     ChannelTest.query.filter_by(pre_check_recording_id=recording_id).update(
         {'pre_check_recording_id': None}, synchronize_session=False)
+    ChannelHealthExclusion.query.filter(
+        ChannelHealthExclusion.source_kind.in_(RECORDING_SOURCE_KINDS),
+        ChannelHealthExclusion.source_id == recording_id,
+    ).delete(synchronize_session=False)
 
 
 def group_event_channel_links(events) -> dict:
@@ -1712,8 +1748,12 @@ class Channel(db.Model):
                                   order_by='ChannelEvent.timestamp',
                                   cascade='all, delete-orphan')
     # Cascaded like the two above rather than left to the database: foreign keys are OFF in
-    # this app's SQLite, so a deleted channel leaves anything not cascaded here behind, and
-    # ids are reused (CLAUDE.md teardown rule).
+    # this app's SQLite, so a deleted channel leaves anything not cascaded here behind
+    # (CLAUDE.md teardown rule). The cascade reaches only an ORM delete of the Channel (the
+    # account delete). A query-level bulk delete skips it and deletes this table itself, as
+    # routes/channels.py::missing_delete does; a deleted source row takes its exclusions
+    # with it in detach_recording_references() and delete_tests_collecting_screenshots()
+    # (dev/changelog/1129).
     health_exclusions = db.relationship('ChannelHealthExclusion', backref='channel',
                                         lazy=True, cascade='all, delete-orphan')
     epg_alternate_entries = db.relationship('EpgAlternateEntry', lazy=True,
@@ -1912,8 +1952,11 @@ class ChannelTest(db.Model):
     audio_track_count    = db.Column(db.Integer)   # total audio streams ffprobe found
     extra_tracks         = db.Column(db.Text)      # JSON: [{type, codec, language, ...}] for every track beyond the first of its type
 
+    # AUTOINCREMENT: a health-score exclusion names a test by id, so a re-issued id would
+    # hand a new test an old one's exclusion (dev/changelog/1129, migration 77).
     __table_args__ = (
         db.Index('ix_channel_tests_channel_started', 'channel_id', 'test_started_at'),
+        {'sqlite_autoincrement': True},
     )
 
 
@@ -1929,8 +1972,11 @@ class ChannelEvent(db.Model):
     detail     = db.Column(db.Text)
     extra_data = db.Column(db.Text)   # JSON blob, e.g. {'old_adjustment': -10, 'new_adjustment': 20}
 
+    # AUTOINCREMENT for the same reason as ChannelTest: event-sourced health-score
+    # exclusions name an event by id (dev/changelog/1129, migration 78).
     __table_args__ = (
         db.Index('ix_channel_events_channel_ts', 'channel_id', 'timestamp'),
+        {'sqlite_autoincrement': True},
     )
 
 

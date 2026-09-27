@@ -829,7 +829,7 @@ def deregister_cancelled_recordings(recording_ids):
     a second chance to put the two in the wrong order (dev/changelog/869)."""
     if not recording_ids:
         return
-    from .recorder import end_slot_wait
+    from .recorder import end_capture_wait
     from .scheduler import unschedule_recording
     for rid in recording_ids:
         unschedule_recording(rid)
@@ -839,7 +839,7 @@ def deregister_cancelled_recordings(recording_ids):
         # aborted (dev/changelog/933). Clearing it here rather than at each caller for
         # the same reason the unschedule lives here: every path that cancels a group's
         # schedule owes both, and a second copy is a second chance to forget one.
-        end_slot_wait(rid)
+        end_capture_wait(rid)
 
 
 def log_guide_change(group, in_guide, detail, extra=None):

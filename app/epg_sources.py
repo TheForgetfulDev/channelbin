@@ -102,6 +102,45 @@ def norm_key(key: str, case_sensitive: bool) -> str:
     return key if case_sensitive else key.lower()
 
 
+def file_id_for(key: str, variants: dict[str, int]) -> str | None:
+    """The one id in a file that a channel keyed `key` reads its listings from, given
+    `variants` = {xml_id: in-window program count} for the file's ids that fold to the
+    key's normalized form (only ids with programs). None when there are none.
+
+    A file may list a channel under ids that differ only in case, each with its own
+    schedule, and on the provider guides they are usually different feeds told apart by
+    case alone (`4Seven.uk` is 4Seven, `4seven.uk` is London Live). Reading all of them
+    gave the channel every program twice (dev/changelog/1139). So: the id spelled exactly
+    as the key, else the one with the most programs, ties to the lowest id so every import
+    picks the same one. This is a choice among ids already gathered under one normalized
+    key, not an exact-then-fallback lookup - every variant is found either way."""
+    if not variants:
+        return None
+    if key in variants:
+        return key
+    return max(sorted(variants), key=variants.__getitem__)
+
+
+def folded_variants(source_id: int, case_sensitive: bool,
+                    norm_keys=None) -> dict[str, dict[str, int]]:
+    """{normalized key: {xml_id: entry_count}} over the source directory's ids with
+    listings, the input file_id_for() chooses from. `norm_keys` limits it to a handful of
+    keys (bound as one IN list); None reads the whole directory. One query."""
+    q = (db.session.query(EpgSourceChannel.xml_id, EpgSourceChannel.entry_count)
+         .filter(EpgSourceChannel.source_id == source_id, EpgSourceChannel.entry_count > 0))
+    if norm_keys is not None:
+        wanted = {k.lower() for k in norm_keys}
+        if not wanted:
+            return {}
+        q = q.filter(func.lower(EpgSourceChannel.xml_id).in_(wanted))
+    out: dict[str, dict[str, int]] = {}
+    for xml_id, n in q:
+        k = norm_key(xml_id, case_sensitive)
+        if norm_keys is None or k in norm_keys:
+            out.setdefault(k, {})[xml_id] = n
+    return out
+
+
 def default_source_name(account_name: str, kind: str) -> str:
     if kind == EPG_SOURCE_PROVIDER:
         return f'{account_name} provider guide'
@@ -195,8 +234,10 @@ def channel_key(epg_channel_id: str | None, user_key: str | None) -> str | None:
 
 def directory_coverage(source_ids, case_sensitive: bool) -> dict[int, dict[str, Coverage]]:
     """{source_id: {normalized xml_id: Coverage}} from the source directory - never a count
-    over epg_entries (DESIGN-epg-sources.md §7.4). Case-variant ids that fold together under
-    case-insensitive matching are merged, exactly as the importer's channel map merges them."""
+    over epg_entries (DESIGN-epg-sources.md §7.4). Where case-variant ids fold together
+    under case-insensitive matching, each number is the largest of the variants', never
+    their sum: the importer reads one variant per channel (file_id_for()), and which one
+    depends on the channel's own spelling, which a per-key answer cannot see."""
     out: dict[int, dict[str, Coverage]] = {sid: {} for sid in source_ids}
     if not out:
         return out
@@ -210,7 +251,7 @@ def directory_coverage(source_ids, case_sensitive: bool) -> dict[int, dict[str, 
         if prev is None:
             out[source_id][k] = Coverage(entries, titles)
         else:
-            out[source_id][k] = Coverage(prev.entry_count + entries,
+            out[source_id][k] = Coverage(max(prev.entry_count, entries),
                                          max(prev.distinct_titles, titles))
     return out
 
@@ -509,8 +550,9 @@ def _key_outcome_text(outcome: str, source_name: str, donor_name: str | None = N
 def _channel_directory(channel: Channel, source_ids, case_sensitive: bool):
     """For one channel over these sources: the user's accepted keys {source_id: (key,
     origin)}, the key each source is matched on {source_id: key} (§7.1), and the directory
-    row that key hits in each source {source_id: EpgSourceChannel} - the largest, when
-    case-variant ids fold together. Three queries whatever the source count."""
+    row that key hits in each source {source_id: EpgSourceChannel} - the one the import
+    reads (file_id_for()), when case-variant ids fold together. Three queries whatever the
+    source count."""
     source_ids = list(source_ids)
     keys = {k.source_id: (k.key, k.origin) for k in EpgChannelKey.query.filter(
         EpgChannelKey.channel_id == channel.id, EpgChannelKey.status == EPG_KEY_ACCEPTED,
@@ -524,12 +566,16 @@ def _channel_directory(channel: Channel, source_ids, case_sensitive: bool):
     if wanted:
         rows = EpgSourceChannel.query.filter(EpgSourceChannel.source_id.in_(list(wanted))).filter(
             func.lower(EpgSourceChannel.xml_id).in_({k.lower() for k in wanted.values()})).all()
+        hits: dict[int, dict[str, EpgSourceChannel]] = {}
         for r in rows:
             if norm_key(r.xml_id, case_sensitive) == norm_key(wanted[r.source_id],
                                                               case_sensitive):
-                prev = directory.get(r.source_id)
-                if prev is None or r.entry_count > prev.entry_count:
-                    directory[r.source_id] = r
+                hits.setdefault(r.source_id, {})[r.xml_id] = r
+        for sid, by_id in hits.items():
+            listed = {x: r.entry_count for x, r in by_id.items() if r.entry_count > 0}
+            pick = (file_id_for(wanted[sid], listed)
+                    or (wanted[sid] if wanted[sid] in by_id else min(by_id)))
+            directory[sid] = by_id[pick]
     return keys, wanted, directory
 
 
@@ -543,9 +589,16 @@ def _key_donor(channel: Channel, source: EpgSource, key: str, case_sensitive: bo
     holds that source's listings right now, as (channel id, name, table model), or None.
 
     Its rows are exactly what the next import would write for `channel`: the importer maps
-    every channel sharing a key onto the same programs (§7.1)."""
+    every channel whose key reads the same file id (file_id_for()) onto the same programs
+    (§7.1). A key differing only in case can read a different id, so matching the folded key
+    alone is not enough (dev/changelog/1139)."""
     subscribers = subscriber_ids(source.id)
     if not subscribers:
+        return None
+    wanted = norm_key(key, case_sensitive)
+    variants = folded_variants(source.id, case_sensitive, {wanted}).get(wanted, {})
+    target = file_id_for(key, variants)
+    if target is None:
         return None
     lowered = key.lower()
     by_provider = {cid for (cid,) in db.session.query(Channel.id).filter(
@@ -558,7 +611,6 @@ def _key_donor(channel: Channel, source: EpgSource, key: str, case_sensitive: bo
     if not ids:
         return None
     user_keys = {ch: k for (ch, _src), k in accepted_keys([source.id]).items() if ch in ids}
-    wanted = norm_key(key, case_sensitive)
     subscribed = set(subscribers)
     for cid, name, provider_id, hidden, account_id in (
             db.session.query(Channel.id, Channel.name, Channel.epg_channel_id, Channel.hidden,
@@ -567,13 +619,25 @@ def _key_donor(channel: Channel, source: EpgSource, key: str, case_sensitive: bo
         if hidden or account_id not in subscribed:
             continue
         k = channel_key(provider_id, user_keys.get(cid))
-        if not k or norm_key(k, case_sensitive) != wanted:
+        if (not k or norm_key(k, case_sensitive) != wanted
+                or file_id_for(k, variants) != target):
             continue
         for model in (EPGEntry, EpgAlternateEntry):
             if db.session.query(model.id).filter(_of_source(model, source.id),
                                                  model.channel_id == cid).first():
                 return cid, name, model
     return None
+
+
+def _reads_same_id(source_id: int, a: str, b: str, case_sensitive: bool) -> bool:
+    """Whether two keys that fold together read the same id of the source's file. Only a
+    difference of spelling can make them not: a file listing both spellings gives each its
+    own schedule (dev/changelog/1139)."""
+    if a == b:
+        return True
+    k = norm_key(a, case_sensitive)
+    variants = folded_variants(source_id, case_sensitive, {k}).get(k, {})
+    return file_id_for(a, variants) == file_id_for(b, variants)
 
 
 def _apply_key_now(channel: Channel, source: EpgSource, old_key: str | None,
@@ -588,7 +652,8 @@ def _apply_key_now(channel: Channel, source: EpgSource, old_key: str | None,
     if channel.hidden:
         return KEY_HIDDEN, None
     if (old_key and new_key
-            and norm_key(old_key, case_sensitive) == norm_key(new_key, case_sensitive)):
+            and norm_key(old_key, case_sensitive) == norm_key(new_key, case_sensitive)
+            and _reads_same_id(source.id, old_key, new_key, case_sensitive)):
         return KEY_SAME_LISTINGS, None
     if not new_key:
         return KEY_NO_KEY, None
@@ -1289,11 +1354,14 @@ def borrowable_sources(account_id: int, case_sensitive: bool) -> list[dict]:
     return out
 
 
-def _held_listings(source_id: int, case_sensitive: bool) -> dict[str, tuple[int, type]]:
-    """{normalized key: (channel id, table model)} - for each key into the source, one
-    visible channel on an account reading it that holds the source's listings for it now.
-    Any one will do: the importer maps every channel sharing a key onto the same programs
-    (§7.1), so their rows are identical."""
+def _held_listings(source_id: int, case_sensitive: bool,
+                   variants: dict[str, dict[str, int]]) -> dict[str, tuple[int, type]]:
+    """{file id: (channel id, table model)} - for each id of the source's file, one visible
+    channel on an account reading it that holds the source's listings for it now. Any one
+    will do: the importer maps every channel whose key reads that id onto the same programs
+    (§7.1), so their rows are identical. Keyed on the id read (file_id_for() over
+    `variants`, folded_variants()), not the folded key: two keys differing only in case can
+    read different ids (dev/changelog/1139)."""
     readers = subscriber_ids(source_id)
     if not readers:
         return {}
@@ -1312,8 +1380,9 @@ def _held_listings(source_id: int, case_sensitive: bool) -> dict[str, tuple[int,
         if cid not in holding:
             continue
         k = channel_key(provider_id, user.get(cid))
-        if k:
-            out.setdefault(norm_key(k, case_sensitive), (cid, holding[cid]))
+        fid = file_id_for(k, variants.get(norm_key(k, case_sensitive), {})) if k else None
+        if fid is not None:
+            out.setdefault(fid, (cid, holding[cid]))
     return out
 
 
@@ -1374,7 +1443,8 @@ def subscribe_to_source(account_id: int, source_id: int,
                                              source_id=source_id).first() is not None:
         return None
     name, refreshed = source.name, has_directory(source_id)
-    donors = _held_listings(source_id, case_sensitive)
+    variants = folded_variants(source_id, case_sensitive)
+    donors = _held_listings(source_id, case_sensitive, variants)
 
     @retry_on_locked()
     def _subscribe_and_commit():
@@ -1398,8 +1468,9 @@ def subscribe_to_source(account_id: int, source_id: int,
         if nk is None or nk not in coverage:
             continue
         covered += 1
-        if nk in donors:
-            pairs.append((cid, *donors[nk]))
+        fid = file_id_for(k, variants.get(nk, {}))
+        if fid in donors:
+            pairs.append((cid, *donors[fid]))
 
     for i in range(0, len(pairs), _COPY_CHUNK):
         @retry_on_locked()
@@ -1876,9 +1947,8 @@ ROW_DIFFERENT = 'different'         # neither has a partner, and they start toge
 ROW_ONLY_ACTIVE = 'only-active'
 ROW_ONLY_OTHER = 'only-other'
 #: A second listing at a moment one side already paired: that side lists the channel twice,
-#: which a file naming it under two ids that differ only in case produces when ids match
-#: case-insensitively. Shown, and left out of the verdict, which would otherwise call two
-#: agreeing guides unrelated.
+#: which a file giving two programs the same start time produces. Shown, and left out of the
+#: verdict, which would otherwise call two agreeing guides unrelated.
 ROW_DOUBLED_ACTIVE = 'doubled-active'
 ROW_DOUBLED_OTHER = 'doubled-other'
 

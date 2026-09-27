@@ -541,6 +541,13 @@ def _status_line(record, prior_passing):
     facts = ([f'{per_test:.1f}ms/test'] if per_test is not None else [])
     if share is not None:
         facts.append(f'{share * 100:.0f}% foreign CPU')
+    # A skip counts as a pass, so a suite that silently shrank reads OK with a normal-looking
+    # test count. Naming the skips on every line is what makes that visible even when a
+    # future gate lands without a run_tests.sh guard behind it (dev/changelog/1135). Records
+    # from before the key existed carry none, and a missing count is unknown, never zero.
+    skipped = record.get('skipped')
+    if skipped is not None:
+        facts.append(f'{skipped} skipped')
     per_test_txt = f" ({', '.join(facts)})" if facts else ''
 
     window = prior_passing[-BASELINE_WINDOW:]
@@ -722,6 +729,7 @@ def _run_worker(modules, emit_path):
     payload = {
         'wall': time.perf_counter() - t0,
         'test_count': result.testsRun,
+        'skipped': len(result.skipped),
         'failures': len(result.failures),
         'errors': len(result.errors),
         'per_module': _per_module(result.timings),
@@ -765,7 +773,7 @@ def _run_sharded(shards, log_dir=None):
         t.join(timeout=30)
     total_wall = time.perf_counter() - t0
 
-    merged = {'test_count': 0, 'failures': 0, 'errors': 0,
+    merged = {'test_count': 0, 'skipped': 0, 'failures': 0, 'errors': 0,
               'per_module': {}, 'fixtures': {}, 'failed_ids': [], 'successful': True,
               'total_wall': total_wall}
     for i, (proc, emit) in enumerate(zip(procs, emits)):
@@ -778,6 +786,7 @@ def _run_sharded(shards, log_dir=None):
         with open(emit, 'r', encoding='utf-8') as fh:
             payload = json.load(fh)
         merged['test_count'] += payload['test_count']
+        merged['skipped'] += payload['skipped']
         merged['failures'] += payload['failures']
         merged['errors'] += payload['errors']
         merged['successful'] = merged['successful'] and payload['successful']
@@ -787,8 +796,9 @@ def _run_sharded(shards, log_dir=None):
         for key in ('per_module', 'fixtures'):
             for k, v in payload[key].items():
                 merged[key][k] = merged[key].get(k, 0.0) + v
-        print(f'{STATUS_PREFIX} shard {i}: {payload["test_count"]} tests, '
-              f'{payload["wall"]:.1f}s, {"OK" if payload["successful"] else "FAILED"}',
+        print(f'{STATUS_PREFIX} shard {i}: {payload["test_count"]} tests '
+              f'({payload["skipped"]} skipped), {payload["wall"]:.1f}s, '
+              f'{"OK" if payload["successful"] else "FAILED"}',
               file=sys.stderr, flush=True)
 
     merged['failed_ids'] = sorted(set(merged['failed_ids']))
@@ -854,6 +864,7 @@ def main(argv=None):
         merged = {
             'total_wall': time.perf_counter() - t0,
             'test_count': result.testsRun,
+            'skipped': len(result.skipped),
             'failures': len(result.failures),
             'errors': len(result.errors),
             'per_module': _per_module(result.timings),
@@ -892,6 +903,7 @@ def main(argv=None):
         # figure. total_wall is what a person waits through.
         'total_charged': round(sum(per_module.values()) + sum(per_fixture.values()), 2),
         'test_count': merged['test_count'],
+        'skipped': merged['skipped'],
         'failures': merged['failures'],
         'errors': merged['errors'],
         'per_module': per_module,

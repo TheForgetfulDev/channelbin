@@ -66,7 +66,7 @@ function handleConversionProgress(rid, d) {
   // that cell instead, because an ETA measured before the encoder was stopped is a clock
   // that has stopped (dev/changelog/1053). setEl no-ops on the missing id, which is the
   // point: the absence is the guard, so there is no flag here to get wrong. Park and
-  // unpark both arrive as status frames, and handleStatus reloads the page for them.
+  // unpark both arrive as status frames, and handleStatus re-renders the row set for them.
   setEl(`conv-eta-${rid}`, d.eta_seconds != null ? `~${fmtDur(d.eta_seconds)} left` : 'estimating...');
   const row = document.getElementById(`card-${rid}`);
   if (row && d.pct != null) row.style.setProperty('--pct', `${d.pct.toFixed(1)}%`);
@@ -86,7 +86,12 @@ function handleEvent(rid, eventType, d) {
   }
 }
 
-let _reloadTimer = null;
+// The status (and parked flag) each row last asked the server to re-render for. A row whose
+// badge SSE has moved but whose swapped-in copy still shows the old status - the frame was
+// published before its commit landed - would otherwise ask again on every repeated frame,
+// once a second for as long as the two disagree. One ask per change; the nav poll's
+// recording signature is what catches the server up after that.
+const _askedFor = new Map();
 
 // Keyed on the `status` a frame carries, never on its event name: every lifecycle publish
 // in app/ sends one, and a hand-kept list of names drifted until it matched three events
@@ -94,8 +99,11 @@ let _reloadTimer = null;
 // known status - most of them - says nothing about the badge and leaves it alone.
 //
 // Acts only on a CHANGE from what the row shows: CONVERSION_PROGRESS and STATS_SNAPSHOT
-// repeat the current status every tick, and each change schedules a reload so the row's
-// server-rendered cells catch up with its new phase.
+// repeat the current status every tick. A change relabels the badge at once and asks for
+// the recording regions to be re-rendered, which is how a row moves between sections and
+// its server-rendered cells catch up with the new phase. This used to reload the whole
+// page 3s later, losing the timeline's scroll, every sort and this SSE connection
+// (dev/changelog/1143).
 // The word comes from util.js's recStatusLabel - the server's own table (app/fmt_utils.py),
 // served to every page by base.html. A status the table does not name is not a status this
 // page can relabel, so the frame is left alone rather than badged from its raw enum.
@@ -121,7 +129,10 @@ function handleStatus(rid, d) {
     badge.textContent = (waiting && parked) ? parked : label;
   }
   if (d.status === 'COMPLETED') row.style.setProperty('--pct', '100%');
-  if (_reloadTimer === null) _reloadTimer = setTimeout(() => location.reload(), 3000);
+  const ask = `${d.status}|${waiting ? 1 : 0}`;
+  if (_askedFor.get(rid) === ask) return;
+  _askedFor.set(rid, ask);
+  requestRefresh('recordings');
 }
 
 function connect() {
@@ -167,7 +178,7 @@ function connect() {
 
    TWO WRITERS, ON TWO SCALES, AND THEY DO NOT OVERLAP. The 3s poll below writes CELLS
    INSIDE the card by id and nothing else. The card itself - whether the section holds a
-   row at all - is written only by refreshSection('health'), the same way the template
+   row at all - is written only by the health region's swap (refreshRegions), the same way the template
    owns a recording row while SSE patches its cells.
 
    The widget is startable more than once because the section it lives in is swapped out
@@ -204,7 +215,7 @@ function pollHealthCheck() {
         const badge = document.getElementById('hc-status-badge');
         if (badge) { badge.textContent = 'FINISHED'; badge.className = 'badge badge-completed'; }
         stopHealthCheckWidget();
-        refreshSection('health');
+        requestRefresh('health');
         return;
       }
 
@@ -214,7 +225,7 @@ function pollHealthCheck() {
       // would keep counting under the finished run's name and link - the reload this
       // replaced could not hit it, because it rebuilt the whole page (dev/changelog/1082).
       // The live chain keeps running and adopts the swapped-in card by id.
-      if (_hcRunStartedAt && data.run_started_at !== _hcRunStartedAt) refreshSection('health');
+      if (_hcRunStartedAt && data.run_started_at !== _hcRunStartedAt) requestRefresh('health');
 
       setEl('hc-progress-text', `${data.completed_channels} / ${data.total_channels}`);
       const row = document.getElementById('hc-card');
@@ -672,14 +683,19 @@ function applySections() {
   const host = document.getElementById('dash-sections');
   const none = document.getElementById('dash-none');
   if (!host) return;
-  SEC.order.forEach(k => {
-    const el = host.querySelector(`.dash-sec[data-sec="${k}"]`);
-    if (!el) return;
-    el.hidden = !SEC.on[k];
-    // Re-appending in order is a move, not a re-render: the nodes and their live
-    // values are the same objects.
-    host.insertBefore(el, none);
-  });
+  const wanted = SEC.order.map(k => host.querySelector(`.dash-sec[data-sec="${k}"]`)).filter(Boolean);
+  wanted.forEach(el => { el.hidden = !SEC.on[el.dataset.sec]; });
+  // Moved only when out of order. Re-appending is a move, not a re-render - the nodes and
+  // their live values are the same objects - but a browser drops the scroll offset of
+  // everything inside a node it moves, and this runs after every section swap: moving the
+  // timeline in place snapped it back to the start once a minute (dev/docs/BUGS.md
+  // 2026-09-26 @ 09:07:32 PM). A real reorder still moves, and puts the scroll back.
+  const current = Array.from(host.children).filter(el => el.classList.contains('dash-sec'));
+  if (!wanted.every((el, i) => current[i] === el)) {
+    wanted.forEach(el => host.insertBefore(el, none));
+    const sc = document.getElementById('tl-scroll');
+    if (sc && TL.scrollLeft !== null) sc.scrollLeft = TL.scrollLeft;
+  }
   if (none) none.hidden = SEC.order.some(k => SEC.on[k]);
 }
 
@@ -740,60 +756,113 @@ document.addEventListener('change', e => {
 });
 
 /* ═══════════════════════════════════════════════════════════════════════════
-   SECTIONS THAT KEEP THEMSELVES CURRENT  (the 2026-08-11 call: polling for
-   these two, SSE only for live recordings)
+   REGIONS THAT KEEP THEMSELVES CURRENT  (the 2026-08-11 call: polling for the
+   row sets, SSE only for the cells inside live rows)
 
-   Two of the five sections go stale on a page left open. The accounts rows say
-   "Synced 4m ago" an hour later and never notice a sync starting, finishing or
-   failing; the health section is rendered empty unless the page happened to load
-   DURING a run, so a nightly check that starts while you are watching is invisible
-   until a reload. Both already have a trigger on /api/nav-status and neither was
-   reading it (dev/changelog/1001, 1082).
+   A page left open goes stale three ways. The accounts rows say "Synced 4m ago" an
+   hour later and never notice a sync starting, finishing or failing; the health
+   section is rendered empty unless the page happened to load DURING a run
+   (dev/changelog/1001, 1082); and a recording that starts stays under Upcoming as
+   Scheduled while the tiles keep their counts, because SSE can only write cells into
+   rows that are already on the page (dev/changelog/1143).
 
    ONE WRITER PER REGION, several triggers into it - the shape accounts.js uses. The
-   writer is refreshSection(), which asks the server for a fresh copy of the section
-   and swaps it in whole, so the template stays the only thing that knows what a row
-   looks like. It never patches a cell from JSON, and nothing else replaces these
-   nodes: Customize MOVES and HIDES them, the SSE handlers write cells in the two
-   recording sections, and renderTimeline owns #tl.
+   writer is refreshRegions(), which asks the server for a fresh copy of the page and
+   swaps the requested regions in whole, so the template stays the only thing that
+   knows what a row looks like. It never patches a cell from JSON, and nothing else
+   replaces these nodes: Customize MOVES and HIDES them, the SSE handlers write cells
+   inside the recording rows (ids are stable across a swap, so they keep landing), and
+   renderTimeline owns #tl - the swap replaces only the data blob it draws from.
 
    The baseline every trigger compares against is READ BACK OUT OF THE DOM - the
-   signature the accounts section was rendered at, and whether a health card is on the
-   page - rather than remembered from the first payload. The server-rendered markup is
-   the ground truth about what the user is looking at, so there is no stored flag to
-   drift out of step with it, and a run that starts in the gap between the render and
-   the first poll is caught rather than missed.
+   signatures the regions were rendered at, and whether a health card is on the page -
+   rather than remembered from the first payload. The server-rendered markup is the
+   ground truth about what the user is looking at, so there is no stored flag to drift
+   out of step with it, and a change in the gap between the render and the first poll
+   is caught rather than missed.
    ═══════════════════════════════════════════════════════════════════════════ */
 
-// The two sections with a live trigger. Everything else is load-once on purpose: the
-// recording sections are SSE-driven, and the timeline redraws from its own clock.
-const SELF_REFRESHING = new Set(['accounts', 'health']);
-const ACCOUNTS_RERENDER_MS = 60 * 1000;
+// What each refresh key swaps. `recordings` is five nodes because one change moves all
+// of them: a start takes a row out of Upcoming, puts one in progress, changes the
+// "Capturing now" tile and the header's count, and recolors a bar on the timeline.
+const REGIONS = {
+  accounts: ['.dash-sec[data-sec="accounts"]'],
+  health: ['.dash-sec[data-sec="health"]'],
+  recordings: ['#dash-sub', '.dash-pulse', '#dash-timeline',
+               '.dash-sec[data-sec="live"]', '.dash-sec[data-sec="upcoming"]'],
+};
+const RERENDER_MS = 60 * 1000;
 
 const _swapping = new Set();
+// Keys asked for while their own swap was in flight. The page that swap fetched may
+// predate the change that asked - an SSE status frame can arrive before its commit is
+// readable - so it runs once more when it lands rather than waiting a whole nav poll.
+const _rerun = new Set();
 const _sectionRenderedAt = new Map();
 
 const dashSec = key => document.querySelector(`.dash-sec[data-sec="${key}"]`);
 const healthCardPresent = () => Boolean(document.getElementById('hc-card'));
 
-function refreshSection(key) {
-  if (!SELF_REFRESHING.has(key) || _swapping.has(key) || !dashSec(key)) return;
-  _swapping.add(key);
-  swapFromServer([`.dash-sec[data-sec="${key}"]`])
+// Everything a swap threw away that the user chose or this file holds outside the markup:
+// each swapped section's sort, the timeline's data (its scroll lives in TL.scrollLeft and
+// survives), and - once, below - the order/visibility Customize holds.
+const AFTER_SWAP = {
+  accounts: () => { const sec = dashSec('accounts'); if (sec) wireDashSec(sec); },
+  health: () => {
+    const sec = dashSec('health');
+    if (sec) wireDashSec(sec);
+    // The fresh card (or the absence of one) decides whether the 3s poll runs; the
+    // widget adopts a card it is already polling rather than doubling up on it.
+    startHealthCheckWidget();
+  },
+  recordings: () => {
+    ['live', 'upcoming'].forEach(k => { const sec = dashSec(k); if (sec) wireDashSec(sec); });
+    readTimeline();
+    renderTimeline();
+  },
+};
+
+function refreshRegions(keys) {
+  const todo = keys.filter(k => {
+    if (!REGIONS[k] || !REGIONS[k].some(sel => document.querySelector(sel))) return false;
+    if (!_swapping.has(k)) return true;
+    if (k === 'recordings') _rerun.add(k);
+    return false;
+  });
+  if (!todo.length) return;
+  todo.forEach(k => _swapping.add(k));
+  // One fetch for every region due at once, so the minute tick costs one render, not two.
+  swapFromServer(todo.flatMap(k => REGIONS[k]))
     .then(() => {
-      _sectionRenderedAt.set(key, Date.now());
-      // Everything the swap threw away and the user chose: this section's sort, and the
-      // order/visibility Customize holds outside the markup.
-      const sec = dashSec(key);
-      if (sec) wireDashSec(sec);
+      todo.forEach(k => { _sectionRenderedAt.set(k, Date.now()); AFTER_SWAP[k](); });
       applySections();
-      // The fresh card (or the absence of one) decides whether the 3s poll runs; the
-      // widget adopts a card it is already polling rather than doubling up on it.
-      if (key === 'health') startHealthCheckWidget();
     })
-    .catch(err => console.warn(`Dashboard ${key} section refresh failed; the next poll retries.`, err))
-    .finally(() => _swapping.delete(key));
+    .catch((err) => {
+      todo.forEach(k => _rerun.delete(k));
+      console.warn(`Dashboard ${todo.join(', ')} refresh failed; the next poll retries.`, err);
+    })
+    .finally(() => {
+      todo.forEach(k => _swapping.delete(k));
+      const again = todo.filter(k => _rerun.delete(k));
+      if (again.length) refreshRegions(again);
+    });
 }
+
+// Every trigger asks through here. Asks made in one turn - the nav poll calls several hooks
+// back to back - are collected and answered by one refreshRegions() call.
+const _due = new Set();
+function requestRefresh(key) {
+  if (!_due.size) {
+    queueMicrotask(() => {
+      const keys = [..._due];
+      _due.clear();
+      refreshRegions(keys);
+    });
+  }
+  _due.add(key);
+}
+
+const minuteDue = key => Date.now() - (_sectionRenderedAt.get(key) || 0) >= RERENDER_MS;
 
 /* Two triggers, each covering what the other cannot - accounts.js's pair, for the same
    two reasons: the signature moves when a sync starts, ends or fails, and the minute tick
@@ -811,10 +880,25 @@ function refreshSection(key) {
 window.__applyAccountSync = (sig) => {
   const sec = dashSec('accounts');
   if (!sec || typeof sig !== 'string') return;
-  if (sig !== sec.dataset.syncSig) { refreshSection('accounts'); return; }
+  if (sig !== sec.dataset.syncSig) { requestRefresh('accounts'); return; }
   if (document.hidden || sec.hidden) return;
-  const at = _sectionRenderedAt.get('accounts') || 0;
-  if (Date.now() - at >= ACCOUNTS_RERENDER_MS) refreshSection('accounts');
+  if (minuteDue('accounts')) requestRefresh('accounts');
+};
+
+/* The recording regions' pair of triggers, for the accounts pair's two reasons.
+   /api/nav-status's recording_signature moves when a recording starts, ends, is scheduled
+   or edited from anywhere, or starts waiting on something (app/routes/dashboard.py
+   ::recording_signature) - the SSE trigger in handleStatus only hears about rows already
+   on the page, so a recording started from another tab reaches this page here. The minute
+   tick is what keeps "Starts in 5m", the Next recording tile and the header's counts
+   true while nothing changes. Skipped in a background tab for the accounts tick's reason;
+   there is no section check because the tiles are always shown. */
+window.__applyRecordingSignature = (sig) => {
+  const pulse = document.querySelector('.dash-pulse');
+  if (!pulse || typeof sig !== 'string') return;
+  if (sig !== pulse.dataset.recSig) { requestRefresh('recordings'); return; }
+  if (document.hidden) return;
+  if (minuteDue('recordings')) requestRefresh('recordings');
 };
 
 // Which task row means "a health check is running", from the server's own vocabulary
@@ -829,8 +913,16 @@ window.__applyBackgroundTasks = (bg) => {
   // The section already shows the truth on both edges, which is also what keeps this
   // quiet on every steady poll and stops it racing the swap the 3s poll just asked for.
   if (running === healthCardPresent()) return;
-  refreshSection('health');
+  requestRefresh('health');
 };
+
+// The blob and the moment it was read, together - see TL.serverNow. Called at load and again
+// after every swap of the recording regions, which replaces the blob with a fresh render.
+function readTimeline() {
+  TL.data = readJson('dash-timeline');
+  TL.serverNow = TL.data ? TL.data.now : 0;
+  TL.readAt = Date.now();
+}
 
 function initDashboard() {
   const prefs = readJson('dash-sections-pref');
@@ -853,10 +945,7 @@ function initDashboard() {
     }
   }
 
-  TL.data = readJson('dash-timeline');
-  // Both readings together, before anything else can cost time between them.
-  TL.serverNow = TL.data ? TL.data.now : 0;
-  TL.readAt = Date.now();
+  readTimeline();
   renderTimeline();
   // The scale is a property of the breakpoint, and the breakpoint can change under a
   // live page. Re-rendering restores the saved scroll position by way of TL.scrollLeft.
@@ -868,7 +957,7 @@ function initDashboard() {
   startHealthCheckWidget();
   // The minute tick measures from the SERVER RENDER, not from the first swap, so a page
   // left open from the moment it loaded is refreshed a minute later like any other.
-  SELF_REFRESHING.forEach(key => _sectionRenderedAt.set(key, Date.now()));
+  Object.keys(REGIONS).forEach(key => _sectionRenderedAt.set(key, Date.now()));
 }
 
 document.addEventListener('DOMContentLoaded', initDashboard);

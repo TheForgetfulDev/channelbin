@@ -27,7 +27,7 @@ import app.postprocessor as ppmod  # noqa: E402
 from tests.support.app import make_test_app  # noqa: E402
 from tests.support import seed  # noqa: E402
 from app import db  # noqa: E402
-from app.database import Recording, RecordingEvent, CONVERSION_RESTARTED, CONVERSION_DONE  # noqa: E402
+from app.database import Recording, RecordingEvent, CONVERSION_RESTARTED, CONVERSION_FAILED  # noqa: E402
 from app.postprocessor import (  # noqa: E402
     ConversionResult, do_postprocess, _count_decode_errors,
     _active_conversions, _active_lock,
@@ -132,7 +132,7 @@ class RepeatedDeathPositionTests(_ConversionCase):
         cfg = _config(max_restart_attempts=3)
         self._run(cfg, lambda *a, **k: ConversionResult(
             False, 'died', 'Conversion failed!', out_time=10382.06))
-        done = self._events(CONVERSION_DONE)
+        done = self._events(CONVERSION_FAILED)
         self.assertEqual(len(done), 1)
         self.assertIn('2h 53m 2s', done[0].detail,
                       'the operator must be told WHERE the source is damaged')
@@ -219,7 +219,7 @@ class AudioCopyFallbackTests(_ConversionCase):
         stub = self._run(cfg, lambda *a, **k: ConversionResult(
             False, 'died', 'boom', out_time=next(times)))
         self.assertEqual(stub.call_count, 4, 'initial + 3 restarts')
-        done = self._events(CONVERSION_DONE)
+        done = self._events(CONVERSION_FAILED)
         self.assertNotIn('same point', done[0].detail)
 
     def test_stall_at_the_same_point_is_not_treated_as_source_damage(self):

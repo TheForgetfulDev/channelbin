@@ -12,7 +12,7 @@ from .. import db
 from ..database import (
     Account, Channel, ChannelGroup, ChannelGroupMember, EPGEntry, EpgAlternateEntry,
     EpgChannelKey, Recording,
-    ChannelTest, ChannelEvent, OnDemandTestJob, Tag,
+    ChannelTest, ChannelEvent, ChannelHealthExclusion, OnDemandTestJob, Tag,
     RecordingProfile, HealthCheckProfile,
     CHANNEL_ADDED_TO_GUIDE, CHANNEL_REMOVED_FROM_GUIDE, CHANNEL_HEALTH_OVERRIDE_CHANGED,
     REC_STATUS_SCHEDULED, REC_STATUS_IN_PROGRESS, REC_STATUS_PAUSED, REC_STATUS_RETRYING,
@@ -1287,6 +1287,9 @@ def missing_delete():
                 ChannelTest.channel_id.in_(chunk)).delete(synchronize_session=False)
             db.session.query(ChannelEvent).filter(
                 ChannelEvent.channel_id.in_(chunk)).delete(synchronize_session=False)
+            # A query-level delete skips Channel.health_exclusions' ORM cascade.
+            db.session.query(ChannelHealthExclusion).filter(
+                ChannelHealthExclusion.channel_id.in_(chunk)).delete(synchronize_session=False)
             db.session.query(EPGEntry).filter(
                 EPGEntry.channel_id.in_(chunk)).delete(synchronize_session=False)
             db.session.query(EpgAlternateEntry).filter(
@@ -1777,8 +1780,8 @@ def _comparison_summary(c, active_name: str, other_name: str, until_text: str) -
         out.append(f'Compared until {until_text}, where the shorter of the two ends.')
     for n, name in ((c.doubled_active, active_name), (c.doubled_other, other_name)):
         if n:
-            out.append(f'{name} lists this channel twice at {_plural(n, "time")} - usually '
-                       'its file names the channel under two ids that differ only in case.')
+            out.append(f'{name} lists this channel twice at {_plural(n, "time")} - its file '
+                       'gives two programs the same start time.')
     return out
 
 

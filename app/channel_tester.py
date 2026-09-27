@@ -2211,9 +2211,18 @@ def delete_tests_collecting_screenshots(query):
     that closure's commit has durably succeeded - never from inside it. Unlinking is a
     non-idempotent side effect (CLAUDE.md, tests/test_static_invariants.py::
     RetryOnLockedSideEffectTests), so it cannot live in this function alongside the delete.
+
+    The deleted tests' health-score exclusions go in the same unit: an exclusion left
+    behind names an id the next test may be issued (dev/changelog/1129).
     """
-    from .database import ChannelTest
+    from .database import ChannelHealthExclusion, ChannelTest
+    from .health_recompute import SOURCE_TEST
     paths = [p for (p,) in query.with_entities(ChannelTest.screenshot_path).all() if p]
+    # Before the tests, while the subquery still matches them.
+    ChannelHealthExclusion.query.filter(
+        ChannelHealthExclusion.source_kind == SOURCE_TEST,
+        ChannelHealthExclusion.source_id.in_(query.with_entities(ChannelTest.id)),
+    ).delete(synchronize_session=False)
     query.delete(synchronize_session=False)
     return paths
 

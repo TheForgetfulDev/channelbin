@@ -4,9 +4,10 @@ Every Tier 2 test uses this instead of hand-rolling Flask()+db.init_app so there
 single, safe app-building path. Guarantees:
   * a fresh temp SQLite file per app (never the live dvr.db),
   * config overrides deep-merged on top of config.yaml via create_app(config_overrides=…),
-  * config.yaml itself is sandboxed to an empty temp file for the app's whole lifetime, so
-    a runtime load_config()/_load_config_file() call - direct, or via any route - reads
-    _DEFAULTS, never the developer's real repo-root file (see the _CONFIG_PATH patch below),
+  * config.yaml itself is sandboxed to a temp file for the app's whole lifetime, so a
+    runtime load_config()/_load_config_file() call - direct, or via any route - reads
+    _DEFAULTS plus this app's own temp paths, never the developer's real repo-root file
+    (see the _CONFIG_PATH patch below),
   * the real APScheduler/jobstore/resume machinery skipped (start_scheduler=False),
   * output dirs (dvr, thumbnails, screenshots) and the log file redirected into a temp dir,
   * the ERROR+ alert-log handler stripped so tests don't spawn Alert rows or stack handlers
@@ -57,6 +58,10 @@ import yaml  # noqa: E402
 # this is the one stable reference for "nobody has sandboxed config.yaml yet" that
 # TestApp.__init__ below compares against. See its own comment for why.
 _REAL_CONFIG_PATH = cfgmod._CONFIG_PATH
+
+# The recording.* keys TestApp points into its temp dir, both for create_app() and in the
+# sandboxed config.yaml a runtime load_config() reads.
+_SANDBOXED_RECORDING_DIRS = ('dvr_output_dir', 'capture_log_dir', 'images_dir')
 
 # Schema template: built once per process, copied per test. See _template_db_path().
 _template_lock = threading.Lock()
@@ -475,6 +480,36 @@ def _assert_db_backup_dir_is_sandboxed(overrides, tmpdir):
             'prune that directory to database.migration_backups_keep.')
 
 
+def _assert_runtime_paths_are_sandboxed(sandbox_paths):
+    """Fail loudly if a runtime load_config() would resolve an output or backup dir to
+    anything but the temp path this app hands create_app().
+
+    create_app() sees the overrides once; everything that reads config later (a scheduled
+    job, a route, a background thread) sees only the sandboxed config.yaml. With the paths
+    missing from that file, those reads resolved to the real /dvr and the real
+    instance/config-backups - a test wrote into production on this box and failed on a
+    runner without /dvr, and prune_backups() pointed there would evict the operator's
+    backups (dev/changelog/1130). Checked through the same readers production uses. The
+    bound is the system temp dir rather than this app's own, because a test may redirect a
+    dir into a temp dir of its own through extra_overrides (test_capture_stderr does).
+    """
+    from app.config_backup import get_backup_dir
+    rec = cfgmod.load_config()['recording']
+    wanted = {f'recording.{k}': v for k, v in sandbox_paths['recording'].items()}
+    wanted['config_backup.backup_dir'] = sandbox_paths['config_backup']['backup_dir']
+    found = {f'recording.{k}': rec[k] for k in _SANDBOXED_RECORDING_DIRS}
+    found['config_backup.backup_dir'] = get_backup_dir()
+    temp_root = os.path.realpath(tempfile.gettempdir())
+    escaped = {k: v for k, v in found.items()
+               if v != wanted[k] or not os.path.realpath(v).startswith(temp_root + os.sep)}
+    if escaped:
+        raise AssertionError(
+            f'Runtime config paths escaped the test sandbox: {escaped!r}, expected '
+            f'{wanted!r} under {temp_root!r}. TestApp must write them into its sandboxed '
+            'config.yaml, or a runtime load_config() writes into (and prunes) the real '
+            'directories.')
+
+
 def _assert_engines_are_sandboxed(app, wanted_path):
     """Fail loudly if this app's ORM engines aren't pointed at the DB the overrides named.
 
@@ -586,6 +621,14 @@ class TestApp:
                 'exist - an earlier test patched it and never put it back, so every config '
                 'read in this process is now serving defaults. Find that test rather than '
                 'working around it here.')
+        # The same paths create_app() is handed, so a runtime load_config() resolves them
+        # into the temp dir too rather than to the real /dvr and instance/config-backups
+        # (dev/changelog/1130). Taken from the merged overrides, so an extra_overrides that
+        # redirects one of them is honored at runtime as well.
+        self._sandbox_paths = {
+            'recording': {k: overrides['recording'][k] for k in _SANDBOXED_RECORDING_DIRS},
+            'config_backup': {'backup_dir': overrides['config_backup']['backup_dir']},
+        }
         self._cfg_path = None
         if cfgmod._CONFIG_PATH == _REAL_CONFIG_PATH:
             self._orig_cfg_path = cfgmod._CONFIG_PATH
@@ -595,11 +638,22 @@ class TestApp:
             # makes migrate_config() think it needs a pre-migration backup on every single
             # test-app build, which used to escape the sandbox entirely (dev/changelog/620).
             write_sandbox_config(self._cfg_path,
-                                 {'config_version': cfgmod.CURRENT_CONFIG_VERSION})
+                                 {'config_version': cfgmod.CURRENT_CONFIG_VERSION,
+                                  **self._sandbox_paths})
             cfgmod._CONFIG_PATH = self._cfg_path
             cfgmod._yaml_cache = None
+            # Before create_app(), so a failure leaves nothing built and hands _CONFIG_PATH
+            # back. Only for a sandbox this app owns: an outer one (ConfigSandbox, a
+            # hand-patched _CONFIG_PATH) holds a fixture its test wrote on purpose.
+            try:
+                _assert_runtime_paths_are_sandboxed(self._sandbox_paths)
+            except AssertionError:
+                cfgmod._CONFIG_PATH = self._orig_cfg_path
+                cfgmod._yaml_cache = None
+                os.remove(self._cfg_path)
+                shutil.rmtree(self._tmpdir, ignore_errors=True)
+                raise
 
-        self._output_dirs = dict(overrides['recording'])
         self.app = create_app(config_overrides=overrides, start_scheduler=start_scheduler)
         _assert_engines_are_sandboxed(self.app, overrides['database']['path'])
         _assert_db_backup_dir_is_sandboxed(overrides, self._tmpdir)
@@ -611,12 +665,19 @@ class TestApp:
         self.ctx.push()
         self.client = self.app.test_client()
 
-    def sandbox_config(self, overrides):
+    def sandbox_config(self, overrides, keep_sandbox_paths=True):
         """Write `overrides` into this app's sandboxed config.yaml so a runtime
         load_config() call - a background thread or scheduled job re-importing it
         locally, not just create_app()'s one-time config_overrides - sees them too
         (CLAUDE.md's Testing section: overrides passed to make_test_app() are otherwise
         invisible to any load_config() call made after startup).
+
+        `overrides` is merged over this app's temp output and backup dirs, so writing one
+        recording.* key does not send the others back to the real /dvr. Pass
+        keep_sandbox_paths=False only for a test about a config that sets nothing (the
+        Settings page's changed-from-default marks): runtime reads then resolve those dirs
+        to their real defaults, so such a test must not reach a capture, a probe or a
+        config backup.
 
         Raises if this app never got its own sandbox (see __init__'s 'cooperative, not
         unconditional' note) - the request cannot be honored, and returning quietly is
@@ -632,19 +693,10 @@ class TestApp:
                 'Either write the values into that sandbox instead (ConfigSandbox._write_cfg), '
                 'or find the test that patched _CONFIG_PATH and never restored it.')
         data = {'config_version': cfgmod.CURRENT_CONFIG_VERSION}
-        data.update(overrides)
+        if keep_sandbox_paths:
+            data = _deep_merge(data, self._sandbox_paths)
+        data = _deep_merge(data, overrides)
         write_sandbox_config(self._cfg_path, data)
-
-    def sandbox_output_dirs(self):
-        """Point the runtime config's recording output dirs at this app's temp dirs.
-
-        The sandboxed config.yaml holds nothing by default, so a runtime load_config() sees
-        the default /dvr. A request that probes it (the disk readout behind /api/nav-status
-        and the dashboard) raises a real STORAGE_PATH_UNUSABLE alert on any machine without
-        a writable /dvr - CI among them - and a test counting alerts or queries then counts
-        that too (dev/docs/BUGS.md 2026-09-18). Opt-in rather than the default, because
-        the Settings tests rely on a config that sets nothing."""
-        self.sandbox_config({'recording': dict(self._output_dirs)})
 
     def cleanup(self):
         try:

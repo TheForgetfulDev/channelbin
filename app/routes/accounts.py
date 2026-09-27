@@ -10,7 +10,8 @@ from ..accounts import (NORM_DISABLED, NORM_MODES, coerce_normalization_mode,
                         norm_mode_example, norm_mode_label, normalize_url_with_mode,
                         resolve_normalization_mode, url_is_normalizable,
                         recompute_duplicate_stream_urls_and_commit, finalize_sync_state,
-                        next_sync_map, report_source_removed, resolve_source_alerts,
+                        manual_sync_restarts_schedule, next_sync_map,
+                        report_source_removed, resolve_source_alerts,
                         start_source_refresh, sync_signature, update_source_stale_alert)
 from .. import account_stats_view
 from ..account_stats import WINDOWS, today_local, windowed_stats
@@ -121,6 +122,23 @@ def _sync_log_totals(account_ids):
     )
 
 
+def _sync_prompts(accounts, next_sync, cfg) -> dict:
+    """{account_id: what the Sync now dialog needs} (account-actions.js::confirmAccountSync,
+    dev/changelog/1134). One shape for both Accounts pages; `next_sync` is the batched
+    next_sync_map() answer, so building a page's worth asks nothing per row."""
+    from ..scheduler import account_sync_interval_hours
+    restart = manual_sync_restarts_schedule(cfg)
+    return {
+        a.id: {
+            'auto': bool(a.sync_enabled),
+            'next_at': next_sync[a.id].isoformat() if next_sync.get(a.id) else None,
+            'interval_hours': account_sync_interval_hours(a, cfg),
+            'restart_default': restart,
+        }
+        for a in accounts
+    }
+
+
 @accounts_bp.route('/accounts')
 def accounts_list():
     """The Accounts list (DESIGN.md §17.1) and, below it, the account stats (§17.7). A row
@@ -143,9 +161,10 @@ def accounts_list():
     # First, before anything else is loaded: it may commit a ledger catch-up, which expires
     # every row already in the session. It also loads the accounts, so the rows' second
     # line and the stats section below the list come from one call (dev/changelog/1029).
-    stats = account_stats_view.section_context(window, load_config(),
-                                               current_app._get_current_object())
+    cfg = load_config()
+    stats = account_stats_view.section_context(window, cfg, current_app._get_current_object())
     accounts = stats['accounts']
+    next_sync = next_sync_map(accounts)
     account_ids = [a.id for a in accounts]
     logs_by_account = _recent_logs_by_account(account_ids, limit=5)
     guide_counts_by_account = {aid: cur['guide_channels'] for aid, cur in stats['current'].items()}
@@ -156,7 +175,8 @@ def accounts_list():
     return render_template(
         'accounts.html',
         accounts=accounts,
-        next_sync=next_sync_map(accounts),
+        next_sync=next_sync,
+        sync_prompts=_sync_prompts(accounts, next_sync, cfg),
         logs_by_account=logs_by_account,
         guide_counts=guide_counts_by_account,
         total_channels=total_channels,
@@ -313,10 +333,12 @@ def account_detail(account_id):
         return redirect(url_for('accounts.accounts_list'))
     account = stats['accounts'][0]
     payload = _account_detail_payload(account, cfg, stats)
+    next_sync = next_sync_map([account])
     return render_template(
         'account_detail.html',
         account=account,
-        next_sync_at=next_sync_map([account])[account.id],
+        next_sync_at=next_sync[account.id],
+        sync_prompt=_sync_prompts([account], next_sync, cfg)[account.id],
         account_type=(account.account_type or 'm3u'),
         preset_colors=PRESET_COLORS,
         norm_options=_NORM_OPTIONS,
@@ -441,7 +463,7 @@ def _require_xtream_debug(account):
 # form-POST routes these helpers were also written for are gone as of DESIGN.md §17: the
 # list page no longer posts a form (dev/changelog/456).
 
-def _start_sync(account, *, force=False, force_epg_resync=False):
+def _start_sync(account, *, force=False, force_epg_resync=False, restart_schedule=False):
     """Start a manual sync. Returns (started, message, conflicts).
 
     `conflicts` is the list of reasons a concurrency clash blocked the start, which the
@@ -451,8 +473,10 @@ def _start_sync(account, *, force=False, force_epg_resync=False):
     running" is not enough to decide on. Empty list means no clash: either the sync started,
     or it failed for a reason force cannot fix. `force_epg_resync` is a separate,
     independently-meaning flag: it bypasses the EPG collapse guard for this one run
-    (DESIGN-sync-resilience.md §4), and is enforced here rather than in the UI."""
-    from ..accounts import sync_account, sync_conflicts
+    (DESIGN-sync-resilience.md §4), and is enforced here rather than in the UI.
+    `restart_schedule` lets a successful run stand in for the next scheduled sync; it means
+    nothing for an account with automatic sync off, which has no schedule to move."""
+    from ..accounts import run_manual_sync, sync_conflicts
 
     if account.status == 'SYNCING':
         return False, f'"{account.name}" is already syncing.', []
@@ -464,17 +488,18 @@ def _start_sync(account, *, force=False, force_epg_resync=False):
                     f'Sync not started for "{account.name}": ' + ' '.join(conflicts),
                     conflicts)
 
+    restart_schedule = restart_schedule and account.sync_enabled
     threading.Thread(
-        target=sync_account,
+        target=run_manual_sync,
         args=(current_app._get_current_object(), account.id),
-        # force_admission: a manual sync is a present user's call, already past the
-        # sync_conflicts warn-and-override flow above (DESIGN-concurrency.md §5.4). It
-        # still registers, so everything that yields to a sync can see it.
-        kwargs={'force_epg_resync': force_epg_resync, 'force_admission': True},
+        kwargs={'force_epg_resync': force_epg_resync, 'restart_schedule': restart_schedule},
         daemon=True,
         name=f'account-sync-{account.id}',
     ).start()
-    return True, f'Sync started for "{account.name}". Refresh in a moment to see results.', []
+    message = f'Sync started for "{account.name}".'
+    if restart_schedule:
+        message += ' If it succeeds, it replaces the next scheduled sync.'
+    return True, message + ' Refresh in a moment to see results.', []
 
 
 def _cancel_sync(account):
@@ -597,6 +622,8 @@ def _delete_account_and_jobs(account_id):
         # Nor are its EPG sources, which may hold hundreds of thousands of rows across two
         # tables and are bulk-deleted rather than cascaded (DESIGN-epg-sources.md §9.5).
         delete_sources_for_account(account_id)
+        # hidden-recompute-ok: the cascade takes memberships only of channels it deletes
+        # too, so no surviving channel loses a protection.
         db.session.delete(account)
         db.session.commit()
         return name
@@ -860,10 +887,16 @@ def sync_account_api(account_id):
     if err:
         return err
     data = request.get_json(silent=True) or {}
+    # The Sync now dialog always sends its switch. A caller that does not ask (the Force EPG
+    # resync confirm) gets the configured default, so the setting means the same thing on
+    # every path that starts a manual sync.
+    restart_schedule = (_checkbox(data['restart_schedule']) if 'restart_schedule' in data
+                        else manual_sync_restarts_schedule(load_config()))
     started, message, conflicts = _start_sync(
         account,
         force=_checkbox(data.get('force')),
         force_epg_resync=_checkbox(data.get('force_epg_resync')),
+        restart_schedule=restart_schedule,
     )
     if not started:
         # 409 for the concurrency conflict: it is a state clash the user can override by

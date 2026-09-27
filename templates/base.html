@@ -729,6 +729,8 @@
           if (window.__applyIndicators) window.__applyIndicators(d.activity);
           if (window.__applySearchReadiness) window.__applySearchReadiness(d.search);
           if (window.__applyAccountSync) window.__applyAccountSync(d.account_sync);
+          if (window.__applyAlertSignature) window.__applyAlertSignature(d.alert_signature);
+          if (window.__applyRecordingSignature) window.__applyRecordingSignature(d.recording_signature);
           // Page-scoped, like the three above, and deliberately NOT a second assignment to
           // __applyIndicators: that one is this file's own writer of the nav chips, and it
           // is defined further down this page than the per-page scripts block, so a page

@@ -39,6 +39,9 @@ from tests.support.timing import (  # noqa: E402
 FIXTURE_SLEEP = 0.30
 TEST_SLEEP = 0.05
 
+J3_HISTORY_FIXTURE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'fixtures',
+                                  'timing_history_j3.jsonl')
+
 
 class _Expensive(unittest.TestCase):
     """Everything in setUpClass, nothing in the tests - test_channel_search_page_js's
@@ -334,10 +337,16 @@ class PerTestCeilingTests(unittest.TestCase):
         self.assertNotIn('over ceiling', line)
 
     def test_the_recorded_history_would_not_have_warned_under_this_ceiling(self):
-        """Replay, not theory. The committed history is the fixture that proves the change
+        """Replay, not theory. The recorded history is the fixture that proves the change
         does what it claims: the 400s wall ceiling fired on many more green -j 3 runs than
-        the ms/test ceiling does, so the WARNING goes back to meaning something."""
-        with open(timing.HISTORY_PATH, 'r', encoding='utf-8') as fh:
+        the ms/test ceiling does, so the WARNING goes back to meaning something.
+
+        Replays a frozen copy of every green forward -j 3 run ever committed (2026-08-13 to
+        2026-09-16, when the default moved to -j 4), never the live history file: that one
+        keeps only the last MAX_HISTORY_LINES runs, so each -j 4 run pushed a -j 3 one out
+        until this test failed on every run (dev/docs/BUGS.md 2026-09-26 08:11 PM,
+        dev/changelog/1142)."""
+        with open(J3_HISTORY_FIXTURE, 'r', encoding='utf-8') as fh:
             records = [json.loads(line) for line in fh if line.strip()]
         green = [r for r in records
                  if r.get('jobs', 1) == 3 and r.get('shard_order', 'forward') == 'forward'
@@ -425,6 +434,28 @@ class ForeignCpuTests(unittest.TestCase):
         prior = [dict(record, failures=0, errors=0) for _ in range(10)]
 
         self.assertNotIn('foreign CPU', _status_line(record, prior))
+
+    def test_the_status_line_names_the_skip_count(self):
+        """A skip counts as a pass, so a suite that shrank reads OK unless the line says so.
+
+        Guards dev/docs/BUGS.md 2026-09-26 (dev/changelog/1135): with no node_modules, every
+        jsdom-backed test skipped itself and the status line was indistinguishable from a
+        whole run.
+        """
+        record = {'tier': '0-2', 'jobs': 3, 'total_wall': 400.0, 'test_count': 4600,
+                  'per_module': {'A': 1.0}, 'per_module_fixture': {}, 'skipped': 949}
+        prior = [dict(record, failures=0, errors=0) for _ in range(10)]
+
+        self.assertIn('949 skipped', _status_line(record, prior))
+        self.assertIn('0 skipped', _status_line(dict(record, skipped=0), prior))
+
+    def test_a_run_with_no_skip_count_says_nothing_about_it(self):
+        """Older records carry no such key, and a missing count is unknown, never zero."""
+        record = {'tier': '0-2', 'jobs': 3, 'total_wall': 400.0, 'test_count': 4600,
+                  'per_module': {'A': 1.0}, 'per_module_fixture': {}}
+        prior = [dict(record, failures=0, errors=0) for _ in range(10)]
+
+        self.assertNotIn('skipped', _status_line(record, prior))
 
 
 class ShardSplitTests(unittest.TestCase):

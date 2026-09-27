@@ -9,10 +9,14 @@
    What is real: the markup the Flask route rendered for seeded recordings, and util.js +
    dashboard.js evaluated as shipped. Faked: EventSource (each scenario pushes its frames
    through the page's own onmessage), fetch, timers (shortened), and page reload, which
-   jsdom reports as an unimplemented navigation - that report IS the observation.
+   jsdom reports as an unimplemented navigation. Two observations: how many times the page
+   asked the server for a fresh copy of itself (the re-render a status change triggers,
+   dev/changelog/1143), and how many reloads it attempted, which must be none.
 
    argv: <fixture dir> <repo root>. The fixture dir holds page.html and scenarios.json:
-   {name: {frames: [{recording_id, event, data}], watch: [recording ids]}}. */
+   {name: {frames: [{recording_id, event, data}], watch: [recording ids],
+           servePage?: answer the re-render with page.html itself instead of nothing,
+           gapMs?: settle this long after each frame}}. */
 import fs from 'fs';
 import { JSDOM, VirtualConsole } from 'jsdom';
 
@@ -21,9 +25,10 @@ const PAGE = fs.readFileSync(`${DIR}/page.html`, 'utf8');
 const SCENARIOS = JSON.parse(fs.readFileSync(`${DIR}/scenarios.json`, 'utf8'));
 const JS = ['util.js', 'dashboard.js'].map((f) => fs.readFileSync(`${REPO}/static/js/${f}`, 'utf8'));
 
-async function run({ frames, watch }) {
+async function run({ frames, watch, servePage = false, gapMs = 0 }) {
   const errors = [];
   let reloads = 0;
+  let refreshes = 0;
   const vc = new VirtualConsole();
   vc.on('jsdomError', (e) => {
     if (/navigation/i.test(e.message)) { reloads += 1; return; }
@@ -38,13 +43,16 @@ async function run({ frames, watch }) {
     url: 'http://localhost:5000/',
     virtualConsole: vc,
     beforeParse(w) {
-      w.fetch = () => Promise.resolve({
-        ok: true,
-        status: 200,
-        headers: { get: () => 'application/json' },
-        json: () => Promise.resolve({ active: false }),
-        text: () => Promise.resolve('{}'),
-      });
+      w.fetch = (target) => {
+        if (new URL(String(target), 'http://localhost:5000/').pathname === '/') refreshes += 1;
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          headers: { get: () => 'application/json' },
+          json: () => Promise.resolve({ active: false }),
+          text: () => Promise.resolve(servePage ? PAGE : '{}'),
+        });
+      };
       w.EventSource = class {
         constructor(url) { this.url = url; sources.push(this); }
         close() {}
@@ -68,7 +76,10 @@ async function run({ frames, watch }) {
 
   const stream = sources.find((s) => s.url === '/api/stream');
   if (!stream) throw new Error(`dashboard.js opened no /api/stream EventSource (${errors.join(' | ')})`);
-  for (const f of frames) stream.onmessage({ data: JSON.stringify(f) });
+  for (const f of frames) {
+    stream.onmessage({ data: JSON.stringify(f) });
+    if (gapMs) await new Promise((r) => setTimeout(r, gapMs));
+  }
   await new Promise((r) => setTimeout(r, 60));
 
   const rows = {};
@@ -81,9 +92,10 @@ async function run({ frames, watch }) {
       status: row ? row.dataset.status : null,
     };
   }
-  // A reload can only ever be one navigation per page; the harness counts attempts so a
-  // stack of timers from repeated frames shows up as more than one.
-  return { errors, reloads, rows };
+  // Counted rather than flagged, so a re-render asked for on every repeated frame shows up
+  // as more than one. Unless a scenario sets servePage, the stubbed page matches no region,
+  // so a swap changes nothing and every badge read below is what SSE wrote.
+  return { errors, reloads, refreshes, rows };
 }
 
 const out = {};

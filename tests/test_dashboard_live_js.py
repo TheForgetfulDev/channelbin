@@ -4,12 +4,14 @@ Guards dev/docs/BUGS.md 2026-09-18 "The Dashboard's live badge ignored most of t
 that change a recording's status". Invariants:
 
   (a) Any SSE frame whose `status` is a known Recording status, and differs from what the
-      row shows, relabels the badge with that status's shared label and schedules one reload
-      - whatever the event is called (capture end, cancel, dead-stream failure).
+      row shows, relabels the badge with that status's shared label and asks for exactly one
+      re-render of the recording regions, never a page reload - whatever the event is called
+      (capture end, cancel, dead-stream failure). dev/changelog/1143.
   (b) A conversion that parks badges WAITING from its yield frame, and drops back to its
       phase label on the resume frame.
   (c) A frame that repeats the row's current status (every CONVERSION_PROGRESS tick) neither
-      relabels nor reloads, and does not clear WAITING.
+      relabels nor re-renders, and does not clear WAITING. Nor does the same change arriving
+      again after a swap that still showed the old status.
   (d) A frame without a status never relabels the badge - in particular never with the
       event's own name.
   (e) Every publish in app/ carries `status`, except the named set of events that never move
@@ -77,6 +79,11 @@ def _scenarios(ids):
         'no_status': {'watch': [live], 'frames': [
             _frame(live, RESTART_ATTEMPTED, {'attempt': 1}),
             _frame(live, RECORDING_FAILED, {'consecutive_failures': 5, 'max_failures': 5})]},
+        # The server answers the re-render with the page as it was, i.e. the frame beat its
+        # own commit - so the swap puts the old status back under every repeat that follows.
+        'stale_swap': {'watch': [live], 'servePage': True, 'gapMs': 20, 'frames': [
+            _frame(live, CAPTURE_COMPLETE, {'status': REC_STATUS_CONCATENATING})
+            for _ in range(4)]},
         'stats_repeat': {'watch': [live], 'frames': [
             _frame(live, 'STATS_SNAPSHOT', {'status': REC_STATUS_IN_PROGRESS,
                                             'elapsed_seconds': 10, 'remaining_seconds': 50,
@@ -156,7 +163,8 @@ class CaptureCompleteTests(_Base):
     def test_the_row_relabels_to_joining(self):
         self.assertEqual(self.row('live')['text'], 'JOINING')
         self.assertEqual(self.row('live')['cls'], 'badge badge-concatenating')
-        self.assertEqual(self.obs['reloads'], 1)
+        self.assertEqual(self.obs['refreshes'], 1)
+        self.assertEqual(self.obs['reloads'], 0)
 
 
 class AbortedTests(_Base):
@@ -164,7 +172,8 @@ class AbortedTests(_Base):
 
     def test_the_row_relabels_to_cancelled(self):
         self.assertEqual(self.row('live')['text'], 'CANCELLED')
-        self.assertEqual(self.obs['reloads'], 1)
+        self.assertEqual(self.obs['refreshes'], 1)
+        self.assertEqual(self.obs['reloads'], 0)
 
 
 class DeadStreamTests(_Base):
@@ -173,7 +182,8 @@ class DeadStreamTests(_Base):
     def test_the_row_relabels_to_failed(self):
         self.assertEqual(self.row('live')['text'], 'FAILED')
         self.assertEqual(self.row('live')['cls'], 'badge badge-failed')
-        self.assertEqual(self.obs['reloads'], 1)
+        self.assertEqual(self.obs['refreshes'], 1)
+        self.assertEqual(self.obs['reloads'], 0)
 
 
 class YieldTests(_Base):
@@ -181,7 +191,8 @@ class YieldTests(_Base):
 
     def test_a_parked_conversion_badges_waiting(self):
         self.assertEqual(self.row('conv')['text'], 'WAITING')
-        self.assertEqual(self.obs['reloads'], 1)
+        self.assertEqual(self.obs['refreshes'], 1)
+        self.assertEqual(self.obs['reloads'], 0)
 
 
 class ResumeTests(_Base):
@@ -189,25 +200,41 @@ class ResumeTests(_Base):
 
     def test_a_resumed_conversion_badges_converting(self):
         self.assertEqual(self.row('parked')['text'], 'CONVERTING')
-        self.assertEqual(self.obs['reloads'], 1)
+        self.assertEqual(self.obs['refreshes'], 1)
+        self.assertEqual(self.obs['reloads'], 0)
 
 
 class ProgressRepeatTests(_Base):
     SCENARIO = 'progress_repeats'
 
-    def test_repeated_progress_neither_relabels_nor_reloads(self):
-        self.assertEqual(self.obs['reloads'], 0)
+    def test_repeated_progress_neither_relabels_nor_rerenders(self):
+        self.assertEqual(self.obs['refreshes'], 0)
         self.assertEqual(self.row('conv')['text'], 'CONVERTING')
 
     def test_progress_does_not_clear_waiting(self):
         self.assertEqual(self.row('parked')['text'], 'WAITING')
 
 
+class StaleSwapTests(_Base):
+    SCENARIO = 'stale_swap'
+
+    def test_one_change_asks_for_one_rerender_even_when_the_server_lags(self):
+        """A frame can arrive before its commit is readable, so the swapped-in row still
+        shows the old status and every repeated frame differs from it again. Asking once
+        per change keeps that from re-rendering the page once a second; the nav poll's
+        recording signature is what catches the server up (dev/changelog/1143)."""
+        self.assertEqual(self.obs['refreshes'], 1)
+        self.assertEqual(self.obs['reloads'], 0)
+
+    def test_the_badge_still_says_what_sse_said(self):
+        self.assertEqual(self.row('live')['text'], 'JOINING')
+
+
 class StatsRepeatTests(_Base):
     SCENARIO = 'stats_repeat'
 
     def test_a_snapshot_repeating_the_status_does_nothing(self):
-        self.assertEqual(self.obs['reloads'], 0)
+        self.assertEqual(self.obs['refreshes'], 0)
         self.assertEqual(self.row('live')['text'], 'RECORDING')
 
 
@@ -217,7 +244,7 @@ class NoStatusTests(_Base):
     def test_a_frame_without_a_status_never_relabels(self):
         self.assertEqual(self.row('live')['text'], 'RECORDING')
         self.assertEqual(self.row('live')['status'], REC_STATUS_IN_PROGRESS)
-        self.assertEqual(self.obs['reloads'], 0)
+        self.assertEqual(self.obs['refreshes'], 0)
 
 
 # Events that never move a Recording.status, so their frames carry no `status`: cell

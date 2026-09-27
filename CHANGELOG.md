@@ -5,6 +5,33 @@ Notable changes to ChannelBin, newest first. This project follows
 release is tagged `v<version>` in git, and the version the app is running is shown in the
 page footer.
 
+## 0.20.0 - 2026-09-26
+
+**Added**
+
+- Sync now asks before it runs, and can stand in for the account's next scheduled sync so the
+  two do not run back to back. A setting chooses whether that switch starts on.
+
+**Changed**
+
+- A scheduled recording that cannot start yet says what it is waiting for, a free connection on
+  its account or an mp4 conversion to finish, and how late it is.
+
+**Fixed**
+
+- The Dashboard shows a recording starting and ending without a reload.
+- The Recordings list follows recordings as they start and finish, and its "in 5 min" times
+  count down.
+- The Alerts page shows new alerts, and alerts that clear on their own, without a reload.
+- A channel listed in a guide file under two ids that differ only in case no longer shows every
+  program twice.
+- A recording's event log shows a failed or cancelled join or conversion as a failure instead of
+  a success.
+- Deleting a recording, health check or missing channel can no longer cause a later health check
+  to be left out of a channel's health score.
+- A channel hidden while it was in a health check is hidden once Remove Duplicate Channels takes
+  it out of that check.
+
 ## 0.19.0 - 2026-09-25
 
 **Added**

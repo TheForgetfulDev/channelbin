@@ -267,7 +267,7 @@ class SlotWaitClearsTests(_SlotCase):
     def test_resuming_clears_the_wait(self):
         holder = self._occupy_slot()
         rid = self._paused()
-        with mock.patch('app.scheduler.reschedule_recording_resume', create=True), \
+        with mock.patch('app.scheduler.reschedule_recording_resume'), \
              mock.patch.object(recorder, '_launch_segment'):
             recorder.resume_recording(self.t.app, rid)
             db.session.expire_all()
@@ -284,7 +284,7 @@ class SlotWaitClearsTests(_SlotCase):
         whatever was captured - but it does stop re-arming, so nothing is waiting."""
         self._occupy_slot()
         rid = self._paused()
-        with mock.patch('app.scheduler.reschedule_recording_resume', create=True), \
+        with mock.patch('app.scheduler.reschedule_recording_resume'), \
              mock.patch.object(recorder, '_launch_segment'):
             recorder.resume_recording(self.t.app, rid)
             db.session.expire_all()

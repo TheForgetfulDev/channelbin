@@ -43,6 +43,13 @@ def has_active_conversion() -> bool:
         return bool(_active_conversions)
 
 
+def active_conversion_ids() -> list:
+    """The recordings whose mp4 conversion is running right now, lowest id first - so a
+    held start can name what it is waiting on rather than only that something is."""
+    with _active_lock:
+        return sorted(_active_conversions)
+
+
 # ── Live post-capture analysis progress ───────────────────────────────────────
 # recording_id -> which whole-file read is running and how far through it is, for the
 # surfaces that report the ANALYZING phase while it runs. Same shape and the same reasoning
@@ -1366,7 +1373,8 @@ def do_postprocess(app, recording_id: int, ts_path: str):
         DIAGNOSTICS, SEEK_DAMAGE_DETECTED, MIXED_FRAME_RATE_DETECTED,
         POSTCAPTURE_ANALYSIS_STARTED, POSTCAPTURE_ANALYSIS_SKIPPED,
         CONVERSION_STARTED, CONVERSION_RESTARTED, CONVERSION_YIELDED, CONVERSION_RESUMED,
-        CONVERSION_DONE, FILE_MOVED, CONCATENATION_DONE, SCRIPT_EXECUTED,
+        CONVERSION_DONE, CONVERSION_FAILED, CONVERSION_CANCELLED,
+        FILE_MOVED, CONCATENATION_DONE, SCRIPT_EXECUTED,
         REC_STATUS_ANALYZING, REC_STATUS_CONVERTING,
         REC_STATUS_ABORTED, REC_STATUS_FAILED, REC_STATUS_COMPLETED,
         FAILURE_CONVERSION_FAILED, CANCEL_DURING_CONVERSION,
@@ -2453,13 +2461,13 @@ def do_postprocess(app, recording_id: int, ts_path: str):
                     set_conversion_parts(r)
                     db.session.add(RecordingEvent(
                         recording_id=recording_id,
-                        event_type=CONVERSION_DONE,
+                        event_type=CONVERSION_CANCELLED,
                         detail='Conversion cancelled by user - source .ts kept for retry.',
                     ))
                     db.session.commit()
 
                 _commit_conversion_cancelled()
-                ev.publish(recording_id, CONVERSION_DONE,
+                ev.publish(recording_id, CONVERSION_CANCELLED,
                            {'success': False, 'cancelled': True, 'status': REC_STATUS_ABORTED})
                 log.info('Recording %d conversion cancelled by user', recording_id)
                 return
@@ -2591,14 +2599,14 @@ def do_postprocess(app, recording_id: int, ts_path: str):
                     r.failure_reason = FAILURE_CONVERSION_FAILED
                     db.session.add(RecordingEvent(
                         recording_id=recording_id,
-                        event_type=CONVERSION_DONE,
+                        event_type=CONVERSION_FAILED,
                         detail=give_up_msg,
                     ))
                     db.session.commit()
                     return True
 
                 if _commit_conversion_failed():
-                    ev.publish(recording_id, CONVERSION_DONE,
+                    ev.publish(recording_id, CONVERSION_FAILED,
                                {'success': False, 'error': last_error, 'status': REC_STATUS_FAILED})
                     alerts.create_alert(
                         'CONVERSION_FAILED',
@@ -2612,7 +2620,7 @@ def do_postprocess(app, recording_id: int, ts_path: str):
                 else:
                     # Cancelled while this attempt was giving up: the row stays ABORTED, so
                     # neither the FAILED alert nor the FAILED SSE frame is honest here.
-                    ev.publish(recording_id, CONVERSION_DONE,
+                    ev.publish(recording_id, CONVERSION_CANCELLED,
                                {'success': False, 'cancelled': True, 'status': REC_STATUS_ABORTED})
                 return
 

@@ -730,7 +730,7 @@ def resume_in_progress_recordings(app):
         # give-up path as the supervised loop) rather than resurrecting it forever.
         from .config import load_config as _load_config
         from .postprocessor import is_conversion_active
-        from .database import CONVERSION_DONE
+        from .database import CONVERSION_FAILED
         from . import alerts as _alerts
         _pp = _load_config()['recording']['post_process']
         _auto = _pp.get('auto_restart', True)
@@ -759,7 +759,7 @@ def resume_in_progress_recordings(app):
                     r.status = REC_STATUS_FAILED
                     r.completed_at = datetime.utcnow()
                     r.failure_reason = FAILURE_SOURCE_MISSING
-                    add_recording_event(rid, CONVERSION_DONE,
+                    add_recording_event(rid, CONVERSION_FAILED,
                                         'FAILED: source .ts missing at restart - cannot resume conversion')
                     db.session.commit()
 
@@ -780,7 +780,7 @@ def resume_in_progress_recordings(app):
                     r.completed_at = datetime.utcnow()
                     r.conversion_attempts = n
                     r.failure_reason = FAILURE_CONVERSION_FAILED
-                    add_recording_event(rid, CONVERSION_DONE,
+                    add_recording_event(rid, CONVERSION_FAILED,
                                         f'FAILED: conversion budget exhausted after {n} attempt(s) '
                                         f'(interrupted by service restart)')
                     db.session.commit()
@@ -869,6 +869,11 @@ def resume_in_progress_recordings(app):
         for rec in expired:
             log.info('Recording %d is SCHEDULED but past stop_time → marking FAILED', rec.id)
         _mark_expired_failed(expired)
+        # A row that was held behind a slot or a conversion when the process went down is
+        # not waiting any more; every other way out of the wait clears the same two facts.
+        from .recorder import end_capture_wait
+        for rec in expired:
+            end_capture_wait(rec.id)
 
         # Case 2b: SCHEDULED, past start_time but stop_time still in future → start now
         missed = Recording.query.filter(
@@ -1242,7 +1247,7 @@ def _on_demand_job_trigger(job_id):
     run_on_demand_test_job(_app, job_id)
 
 
-def _get_account_interval(account, cfg) -> int:
+def account_sync_interval_hours(account, cfg) -> int:
     """Return the effective sync interval hours for an account."""
     if account.sync_interval_hours:
         return account.sync_interval_hours
@@ -1298,7 +1303,7 @@ def schedule_account_sync(app, account_id: int, *, force_reschedule: bool = Fals
             return
 
         cfg = load_config()
-        interval = _get_account_interval(account, cfg)
+        interval = account_sync_interval_hours(account, cfg)
 
         existing = _scheduler.get_job(job_id)
         if existing is not None and existing.next_run_time is not None and not force_reschedule:
@@ -1781,7 +1786,7 @@ def _reanchor_account_sync(account_id: int, ran_at: datetime):
         account = db.session.get(Account, account_id)
         if account is None or not account.sync_enabled:
             return
-        interval = _get_account_interval(account, load_config())
+        interval = account_sync_interval_hours(account, load_config())
         account.next_sync_at = ran_at + timedelta(hours=interval)
         db.session.commit()
 
@@ -1793,6 +1798,32 @@ def _reanchor_account_sync(account_id: int, ran_at: datetime):
 
     # EPG cleanup is no longer piggybacked here - it runs from the visible daily
     # db_maintenance_daily job (schedule_db_maintenance) so it's controllable on /jobs.
+
+
+def restart_schedule_after_manual_sync(account_id: int, ran_at: datetime) -> bool:
+    """Let a manual sync stand in for the account's next scheduled one: move the interval
+    to one period after `ran_at`, the manual sync's start (dev/changelog/1134). Returns
+    whether the schedule moved. Needs an app context.
+
+    Only a manual sync that SUCCEEDED moves it, judged by `last_sync_at`, which only the
+    success commit writes - never by the sync thread having returned, which it does after a
+    failure or a cancel too. A failed manual sync leaves the scheduled one standing, because
+    that sync is still wanted. A deferred retry queued before the manual sync is dropped with
+    the old slot: it was retrying work the manual sync has just done, and left in place it
+    would run a second full sync shortly after, which is what the user asked to avoid."""
+    from . import db
+    from .database import Account
+
+    account = db.session.get(Account, account_id)
+    if account is None or not account.sync_enabled:
+        return False
+    if account.last_sync_at is None or account.last_sync_at < ran_at:
+        log.info('Manual sync of account %d did not succeed - its next scheduled sync stays '
+                 'where it was', account_id)
+        return False
+    remove_job_if_exists(sync_retry_job_id(account_id))
+    _reanchor_account_sync(account_id, ran_at)
+    return True
 
 
 def sync_retry_job_id(account_id: int) -> str:

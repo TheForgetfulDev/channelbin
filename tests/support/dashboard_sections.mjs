@@ -3,29 +3,31 @@
    reports, so a failure reads as "the page did X" in Python rather than as a node exit
    code. Same shape as tests/support/accounts_page.mjs.
 
-   What it is for: two of the five sections keep themselves current by swapping in a fresh
-   server render when base.html's /api/nav-status poll hands them a trigger
-   (dev/changelog/1082). None of that is reachable from Python - a page whose hooks never
+   What it is for: the page keeps its sections current by swapping in a fresh server render
+   when base.html's /api/nav-status poll hands them a trigger - the accounts and health
+   sections (dev/changelog/1082), and the recording regions: the header count, the tiles,
+   the timeline blob and the two record sections (dev/changelog/1143). None of that is reachable from Python - a page whose hooks never
    registered renders exactly the same markup, and a page that starts two health-check
    polls against one card renders the same markup too.
 
    What is real here and what is not: every page and every nav-status payload is what the
-   Flask app really answered at four database states, base.html's own inline poll is what
+   Flask app really answered at each database state, base.html's own inline poll is what
    calls the hooks, and util.js + dashboard.js are the shipped files evaluated the way
    their <script src> would have been. Faked: the network, which answers from whichever
-   state the scenario says the server is in; EventSource, since no scenario here drives
-   SSE; and the health widget's own 3s/1s timers, shortened so a scenario can step them.
+   state the scenario says the server is in; EventSource, which a scenario pushes frames
+   through by hand; and the health widget's own 3s/1s timers, shortened so a scenario can step them.
    jsdom computes no layout and implements no navigation - a reload attempt is observed as
    jsdom's "Not implemented: navigation" report.
 
    argv: <fixture dir> <repo root>. The fixture dir holds <state>.html and <state>.json for
-   each of idle, syncing, synced and checking, plus active-run.json keyed by state. */
+   each state in STATE_NAMES, plus active-run.json keyed by state. */
 import fs from 'fs';
 import { JSDOM, VirtualConsole } from 'jsdom';
 
 const [, , DIR, REPO] = process.argv;
 const read = (f) => fs.readFileSync(`${DIR}/${f}`, 'utf8');
-const STATE_NAMES = ['idle', 'syncing', 'synced', 'checking', 'checking2'];
+const STATE_NAMES = ['idle', 'syncing', 'synced', 'checking', 'checking2',
+                     'scheduled', 'started', 'finished'];
 const STATES = {};
 for (const s of STATE_NAMES) {
   STATES[s] = { html: read(`${s}.html`), nav: JSON.parse(read(`${s}.json`)) };
@@ -63,6 +65,7 @@ function boot(start, { serve = start } = {}) {
 
   const server = { state: serve, pageStatus: 200 };
   const sent = [];
+  const sources = [];
   /* How many health-check polls are in flight AT ONCE, which is how a scenario counts
      poll chains without counting requests per millisecond. A rate is the obvious measure
      and it is a bad one: every chain here runs at the squashed timer's ceiling, so the
@@ -116,7 +119,7 @@ function boot(start, { serve = start } = {}) {
     virtualConsole: vc,
     beforeParse(w) {
       w.fetch = fetchStub;
-      w.EventSource = class { constructor(url) { this.url = url; } close() {} };
+      w.EventSource = class { constructor(url) { this.url = url; sources.push(this); } close() {} };
       w.matchMedia = () => ({
         media: '', matches: false, onchange: null,
         addEventListener() {}, removeEventListener() {},
@@ -148,6 +151,26 @@ function boot(start, { serve = start } = {}) {
     },
     settle: (ms = 60) => new Promise((r) => setTimeout(r, ms)),
     poll: async () => { window.fetchNavStatus(); await c.settle(); },
+    // One frame through the page's own /api/stream handler, as the server would send it.
+    sse: async (frame) => {
+      const stream = sources.find((x) => x.url === '/api/stream');
+      if (!stream) throw new Error('dashboard.js opened no /api/stream EventSource');
+      stream.onmessage({ data: JSON.stringify(frame) });
+      await c.settle();
+    },
+    recSig: () => ($('.dash-pulse') || { dataset: {} }).dataset.recSig,
+    rowIds: (key) => Array.from(document.querySelectorAll(`.dash-sec[data-sec="${key}"] .drow`))
+      .map((r) => Number(r.dataset.id)),
+    tile: (label) => {
+      const t = Array.from(document.querySelectorAll('.dash-pulse .mtile'))
+        .find((el) => el.querySelector('.m-k').textContent.trim() === label);
+      return t ? t.querySelector('.m-v').textContent.trim() : null;
+    },
+    headerSub: () => ($('#dash-sub') || { textContent: null }).textContent.trim(),
+    barClass: (rid) => {
+      const bar = $(`#tl .tl-bar[data-id="${rid}"]`);
+      return bar ? bar.className : null;
+    },
     click: (el) => el.dispatchEvent(new window.MouseEvent('click', { bubbles: true, cancelable: true })),
     pageFetches: () => sent.filter((p) => p === '/').length,
     runFetches: () => sent.filter((p) => p === '/api/channel-tests/active-run').length,
@@ -287,7 +310,7 @@ await record('check_starts', async (start) => {
 });
 
 /* ── Starting the widget again never adds a second poll chain ────────── */
-// The direct probe of the contract every health swap depends on: refreshSection('health')
+// The direct probe of the contract every health swap depends on: the health region's swap
 // re-enters startHealthCheckWidget on each swap, and a run that outlives one swap would
 // otherwise leave two chains writing one card and asking the server twice as often.
 await record('one_poll_chain', async (start) => {
@@ -390,12 +413,141 @@ await record('hidden_section', async (start) => {
   const realNow = c.window.Date.now.bind(c.window.Date);
   c.window.Date.now = () => realNow() + 61 * 1000;
   await c.poll();
-  const whileHidden = c.pageFetches();
+  // Asked of the NODE, not of the fetch count: the recording regions' own minute tick
+  // fetches the page on this same poll (dev/changelog/1143), and the question is whether
+  // the hidden section rode along in that swap.
+  const whileHidden = { replaced: c.sec('accounts') !== secEl, pageFetches: c.pageFetches() };
   // A real change still reaches it, so unhiding never reveals a stale sync state.
   c.server.state = 'syncing';
   await c.poll();
-  const onChange = { pageFetches: c.pageFetches(), statuses: c.acctStatuses() };
+  const onChange = { replaced: c.sec('accounts') !== secEl, statuses: c.acctStatuses() };
   return { errors: c.errors, whileHidden, onChange };
+});
+
+/* ═══ The recording regions (dev/changelog/1143) ═══════════════════════════
+   scheduled -> started -> finished, with the accounts and health state held still so no
+   other trigger fires underneath. REC holds the ids the Python side seeded. */
+const REC = JSON.parse(read('recordings.json'));
+
+/* ── The page as it opens ────────────────────────────────────────────── */
+await record('rec_boot', async (start) => {
+  const c = start('scheduled');
+  await c.settle();
+  return {
+    errors: c.errors,
+    hook: typeof c.window.__applyRecordingSignature,
+    recSig: c.recSig(),
+    navSig: STATES.scheduled.nav.recording_signature,
+    pageFetches: c.pageFetches(),
+  };
+});
+
+/* ── A recording starts; the nav poll is the first to hear ───────────── */
+await record('rec_started_by_poll', async (start) => {
+  const c = start('scheduled');
+  await c.settle();
+  const acctBefore = c.sec('accounts');
+  // Every node taken out of #dash-sections from here on. A browser drops the scroll offset
+  // of anything inside a node it moves, so the timeline section must never be among them
+  // (dev/docs/BUGS.md 2026-09-26 @ 09:07:32 PM) - jsdom has no layout to show the scroll
+  // itself snapping back, but it does see the move that causes it.
+  const removed = [];
+  new c.window.MutationObserver((muts) => muts.forEach((m) => m.removedNodes.forEach((n) => {
+    if (n.dataset && n.dataset.sec) removed.push(n.dataset.sec);
+  }))).observe(c.$('#dash-sections'), { childList: true });
+  const before = { live: c.rowIds('live'), upcoming: c.rowIds('upcoming'),
+                   capturing: c.tile('Capturing now'), sub: c.headerSub(),
+                   bar: c.barClass(REC.soon) };
+  c.server.state = 'started';
+  await c.poll();
+  const after = {
+    live: c.rowIds('live'), upcoming: c.rowIds('upcoming'),
+    capturing: c.tile('Capturing now'), sub: c.headerSub(), bar: c.barClass(REC.soon),
+    recSig: c.recSig(), navSig: STATES.started.nav.recording_signature,
+    pageFetches: c.pageFetches(), accountsUntouched: c.sec('accounts') === acctBefore,
+    removed: removed.slice(),
+  };
+  await c.poll();
+  after.pageFetchesAfterNextPoll = c.pageFetches();
+  return { errors: c.errors, navigations: c.navigations, before, after };
+});
+
+/* ── A recording starts; its own SSE frame is the first to hear ──────── */
+await record('rec_started_by_sse', async (start) => {
+  const c = start('scheduled');
+  await c.settle();
+  c.server.state = 'started';
+  await c.sse({ recording_id: REC.soon, event: 'SEGMENT_STARTED',
+                data: { status: 'IN_PROGRESS' } });
+  return { errors: c.errors, navigations: c.navigations, pageFetches: c.pageFetches(),
+           live: c.rowIds('live'), upcoming: c.rowIds('upcoming') };
+});
+
+/* ── A recording finishes ────────────────────────────────────────────── */
+await record('rec_finished', async (start) => {
+  const c = start('started');
+  await c.settle();
+  const before = c.rowIds('live');
+  c.server.state = 'finished';
+  await c.sse({ recording_id: REC.alpha, event: 'RECORDING_COMPLETE',
+                data: { status: 'COMPLETED' } });
+  return { errors: c.errors, navigations: c.navigations, before, after: c.rowIds('live'),
+           capturing: c.tile('Capturing now') };
+});
+
+/* ── What the user chose survives the swap ───────────────────────────── */
+await record('rec_user_state', async (start) => {
+  const c = start('scheduled');
+  await c.settle();
+  c.click(c.sortHeader('live', 'name'));
+  const sortedBefore = c.rowIds('live');
+  // Hide the live section the way the Customize switch does it. The stub saves nothing, so
+  // the server keeps rendering the section shown, and only the client's re-apply after the
+  // swap can keep it hidden.
+  const sw = c.document.createElement('input');
+  sw.dataset.czOn = 'live';
+  c.document.body.appendChild(sw);
+  sw.dispatchEvent(new c.window.Event('change', { bubbles: true }));
+  const liveHiddenBefore = c.sec('live').hidden;
+  c.server.state = 'started';
+  await c.poll();
+  return {
+    errors: c.errors, sortedBefore, sortedAfter: c.rowIds('live'),
+    sortedCol: c.sortedCol('live'), liveHidden: c.sec('live').hidden,
+    liveHiddenBefore,
+  };
+});
+
+/* ── A Customize reorder still moves the sections ────────────────────── */
+await record('rec_reorder', async (start) => {
+  const c = start('scheduled');
+  await c.settle();
+  const before = c.secOrder();
+  const up = c.document.createElement('button');
+  up.dataset.czUp = 'live';
+  c.document.body.appendChild(up);
+  c.click(up);
+  await c.settle();
+  return { errors: c.errors, before, after: c.secOrder() };
+});
+
+/* ── Nothing changed, but "Starts in 5m" has aged ────────────────────── */
+await record('rec_minute_tick', async (start) => {
+  const c = start('scheduled');
+  await c.settle();
+  const pulse = c.$('.dash-pulse');
+  const acct = c.sec('accounts');
+  const realNow = c.window.Date.now.bind(c.window.Date);
+  c.window.Date.now = () => realNow() + 61 * 1000;
+  Object.defineProperty(c.document, 'hidden', { configurable: true, get: () => true });
+  await c.poll();
+  const hiddenTab = { pageFetches: c.pageFetches(), replaced: c.$('.dash-pulse') !== pulse };
+  Object.defineProperty(c.document, 'hidden', { configurable: true, get: () => false });
+  await c.poll();
+  // One fetch carries both minute ticks - the accounts section's and this one.
+  const visibleTab = { pageFetches: c.pageFetches(), replaced: c.$('.dash-pulse') !== pulse,
+                       accountsReplaced: c.sec('accounts') !== acct };
+  return { errors: c.errors, hiddenTab, visibleTab };
 });
 
 process.stdout.write(JSON.stringify(out));
