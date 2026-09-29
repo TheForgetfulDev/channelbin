@@ -4,7 +4,7 @@ import os
 import threading
 import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from flask import (
     Blueprint, render_template, request, redirect, url_for, flash, jsonify,
@@ -243,7 +243,7 @@ def _match_channel_by_url(url: str):
 
 
 def _check_account_connection_limit(account_id, new_channel_id, start_utc, stop_utc,
-                                     exclude_recording_id=None):
+                                     exclude_recording_id=None, pending=None):
     """Return a dict {'message': str, 'conflicts': [...]} if scheduling new_channel_id
     from start_utc to stop_utc would push this account's concurrent distinct-channel
     commitments above its connection limit; None if OK.
@@ -257,6 +257,10 @@ def _check_account_connection_limit(account_id, new_channel_id, start_utc, stop_
     excluded here - that's a handoff (old recording gracefully stopped when the new
     one starts), not a conflict. Recordings with channel_id=None (ad-hoc URL) can't
     be attributed to an account and are invisible to this check - an accepted gap.
+
+    `pending` is recordings a bulk schedule is about to create alongside this one
+    (_pending_overlapping()); they count exactly as a stored one would, or eight showings
+    picked at once on a one-connection account would each pass alone (dev/changelog/1157).
 
     A non-None result used to be a hard 400 refusal; since dev/changelog/854 made the
     connection limit a hard ceiling enforced at record-start time, the schedule-time
@@ -286,7 +290,10 @@ def _check_account_connection_limit(account_id, new_channel_id, start_utc, stop_
 
     overlapping = q.all()
     other_channel_recs = [r for r in overlapping if r.channel_id != new_channel_id]
+    other_pending = [p for p in _pending_overlapping(pending, start_utc, stop_utc)
+                     if p['account_id'] == account_id and p['channel_id'] != new_channel_id]
     distinct_channels = {r.channel_id for r in other_channel_recs}
+    distinct_channels |= {p['channel_id'] for p in other_pending}
     distinct_channels.add(new_channel_id)
 
     if len(distinct_channels) > limit:
@@ -302,7 +309,7 @@ def _check_account_connection_limit(account_id, new_channel_id, start_utc, stop_
                 other_channel_recs,
                 key=lambda r: (r.channel.name if r.channel else '', r.start_time),
             )
-        ]
+        ] + [_serialize_pending(p) for p in other_pending]
         names = sorted({c['channel_name'] for c in conflicts})
         return {
             'message': (f'This would exceed "{account.name}"\'s connection limit ({limit}). '
@@ -340,6 +347,27 @@ def _overlap_conflicts(channel_id, group_id, start_utc, stop_utc, exclude_record
     return q.all()
 
 
+def _pending_overlapping(pending, start_utc, stop_utc):
+    """The not-yet-created recordings of a bulk schedule whose window overlaps this one.
+
+    Each is a dict of plain values ('channel_id', 'group_id', 'account_id', 'start',
+    'stop', 'name', 'channel_name') - never a Recording, since none exists yet."""
+    return [p for p in (pending or []) if p['start'] < stop_utc and p['stop'] > start_utc]
+
+
+def _serialize_pending(p):
+    """A pending bulk-schedule recording in the shape _serialize_overlap_conflicts() gives a
+    stored one, with no recording id to link to and `in_batch` saying why."""
+    return {
+        'recording_id': None,
+        'in_batch': True,
+        'channel_name': p['channel_name'],
+        'title': p['name'],
+        'start_time': local_time_filter(p['start']),
+        'stop_time': local_time_filter(p['stop']),
+    }
+
+
 def _serialize_overlap_conflicts(conflicts):
     def label(r):
         if r.channel:
@@ -361,7 +389,8 @@ def _serialize_overlap_conflicts(conflicts):
 
 
 def _pending_recording_warnings(channel_id, group_id, start_utc, stop_utc,
-                                exclude_recording_id=None, pending_blocks=None):
+                                exclude_recording_id=None, pending_blocks=None,
+                                pending=None):
     """Every soft, proceedable schedule-time warning new_recording_json and
     edit_recording_json raise before committing a create/edit, in one place - the
     recording-scheduling counterpart to routes/channel_groups.py::_pending_warnings().
@@ -377,24 +406,31 @@ def _pending_recording_warnings(channel_id, group_id, start_utc, stop_utc,
         (the provider connection ceiling) rather than just "something else is running
         then too" - a recording that trips it is very likely also present in
         'overlap_warning', and that is fine, the two answer different questions.
+
+    `pending` is the rest of a bulk schedule (_pending_overlapping()), counted in both
+    warnings under the same same-channel / same-group handoff rule as a stored recording.
     """
     if channel_id is None:
         return {}
     warnings = {}
 
     overlaps = _overlap_conflicts(channel_id, group_id, start_utc, stop_utc, exclude_recording_id)
-    if overlaps:
-        n = len(overlaps)
+    batch = [p for p in _pending_overlapping(pending, start_utc, stop_utc)
+             if p['channel_id'] != channel_id
+             and (group_id is None or p['group_id'] != group_id)]
+    if overlaps or batch:
+        n = len(overlaps) + len(batch)
         warnings['overlap_warning'] = {
             'message': f'Overlaps {n} other scheduled recording{"s" if n != 1 else ""}.',
-            'conflicts': _serialize_overlap_conflicts(overlaps),
+            'conflicts': (_serialize_overlap_conflicts(overlaps)
+                          + [_serialize_pending(p) for p in batch]),
         }
 
     ch = db.session.get(Channel, channel_id)
     if ch is not None:
         limit_conflict = _check_account_connection_limit(
             ch.account_id, channel_id, start_utc, stop_utc,
-            exclude_recording_id=exclude_recording_id)
+            exclude_recording_id=exclude_recording_id, pending=pending)
         if limit_conflict:
             warnings['connection_limit_warning'] = limit_conflict
         block_warning = _account_block_warning(ch, group_id, start_utc, stop_utc,
@@ -455,7 +491,8 @@ def _parse_block_form(form):
     return wanted
 
 
-def _members_committed_in_window(members, start_utc, stop_utc, exclude_recording_id=None):
+def _members_committed_in_window(members, start_utc, stop_utc, exclude_recording_id=None,
+                                 pending=None):
     """Of `members`, the channel ids _check_account_connection_limit() would refuse.
 
     The schedule-time counterpart to recorder._busy_account_channel_ids(). Live slot
@@ -488,6 +525,8 @@ def _members_committed_in_window(members, start_utc, stop_utc, exclude_recording
     committed_channels = {}
     for account_id, channel_id in q.all():
         committed_channels.setdefault(account_id, set()).add(channel_id)
+    for p in _pending_overlapping(pending, start_utc, stop_utc):
+        committed_channels.setdefault(p['account_id'], set()).add(p['channel_id'])
 
     blocked = set()
     for ch in members:
@@ -501,7 +540,7 @@ def _members_committed_in_window(members, start_utc, stop_utc, exclude_recording
 
 
 def _resolve_group_member(group, channel_id, start_utc, stop_utc, streak_threshold,
-                          exclude_recording_id=None, pending_blocks=None):
+                          exclude_recording_id=None, pending_blocks=None, pending=None):
     """The member a group-backed recording should be stamped with for [start_utc, stop_utc).
 
     Returns (channel_id, reason). The supplied `channel_id` is kept (reason None) unless it
@@ -522,7 +561,8 @@ def _resolve_group_member(group, channel_id, start_utc, stop_utc, streak_thresho
     # Format lock filters, health score ranks (DESIGN-channel-groups-model.md 5).
     active = format_eligible_members(group, enabled, latest_by_channel).members
     committed = _members_committed_in_window(
-        active, start_utc, stop_utc, exclude_recording_id=exclude_recording_id)
+        active, start_utc, stop_utc, exclude_recording_id=exclude_recording_id,
+        pending=pending)
     # A member on an account blocked in this window is as unusable as one on a full
     # account - including a block this same request is setting (dev/changelog/1151). Only
     # the stamp: record start re-decides against the blocks as they stand then.
@@ -1110,6 +1150,30 @@ def _index_row(rec, now, tz, thumb_ids, live_seg_bytes=0):
     }
 
 
+# The /api/user-prefs key holding the recordings list's saved filters. Written into the page
+# with the list so the script posts back to the key the route read - one spelling
+# (dev/changelog/1156).
+RECORDINGS_SAVED_FILTERS_PREF = 'recordings_saved_filters'
+
+
+def _saved_filters():
+    """The recordings list's saved filters as stored, or [] - never an exception.
+
+    One /api/user-prefs row holds the whole list. It is user-written JSON, so a value that
+    is not a list is treated as "nothing saved" rather than allowed to 500 the page it only
+    decorates; filter-bar.js skips any record inside it that is not shaped like one.
+    """
+    from ..database import UserPref
+
+    pref = db.session.get(UserPref, RECORDINGS_SAVED_FILTERS_PREF)
+    try:
+        rows = json.loads(pref.value) if pref and pref.value else []
+    except ValueError:
+        log.warning('Saved recordings-list filters are not valid JSON - ignoring them.')
+        return []
+    return rows if isinstance(rows, list) else []
+
+
 @recordings_bp.route('/recordings')
 def index():
     from sqlalchemy.orm import selectinload, joinedload
@@ -1149,10 +1213,12 @@ def index():
     from ..database import UserPref, RecordingProfile
     pref = db.session.get(UserPref, 'recordings_columns')
     col_prefs = json.loads(pref.value) if pref and pref.value else None
+    saved_filters = {'key': RECORDINGS_SAVED_FILTERS_PREF, 'list': _saved_filters()}
     profiles = RecordingProfile.query.order_by(RecordingProfile.name).all()
 
     return render_template('index.html', sections=sections, total=len(rows),
                            live_now=live_now, col_prefs=col_prefs, rec_sig=rec_sig,
+                           saved_filters=saved_filters,
                            profiles=profiles)  # _record_modal.html + GUIDE_CONFIG.profiles expect this name
 
 
@@ -1942,6 +2008,105 @@ def delete_recording(recording_id):
     return redirect(url_for('recordings.index'))
 
 
+def _create_scheduled_recording(cfg, *, name, url, start_utc, stop_utc, channel_id,
+                                 group_id, profile_id, entry=None, blocks=None):
+    """Create one SCHEDULED recording and arm its start - the one create path, shared by
+    the record modal (new_recording_json) and the bulk schedule (bulk_schedule_json), so
+    the two cannot drift in what a new recording carries (dev/changelog/1157).
+
+    `entry` is the EPGEntry being recorded, or None for a manual URL. `blocks` is the
+    account-block picker's {account_id: slots}, or None to set none. A start already in
+    the past is moved to now and logged as such. Returns the committed Recording.
+    """
+    now_utc = datetime.utcnow()
+    created_after_start = start_utc < now_utc
+    if created_after_start:
+        start_utc = now_utc
+
+    # Snapshot the EPG program's own air time (independent of what the user
+    # typed into the form) at creation, so it stays immutable even if the
+    # program later shifts in the guide or the recording is edited/adjusted.
+    # A plain read - not wrapped in retry_on_locked - whose result is captured
+    # into plain local variables (not an ORM object reference) before the
+    # write closure below, so nothing here is affected by a rollback+retry
+    # inside that closure.
+    #
+    # The same read also seeds the metadata_* family - the program's synopsis, genre and
+    # rating. Those are NOT an immutable snapshot: recorder.start_recording() refreshes
+    # them from the program's listing as it stands at air time. Seeding them here anyway
+    # is what makes the data survive at all, because epg_keep_days prunes the listing a
+    # day after it airs and nothing can recover it afterwards (dev/changelog/1055).
+    program_start_time = program_stop_time = None
+    program_title = program_sub_title = None
+    metadata_description = metadata_category = metadata_rating = None
+    if entry is not None:
+        program_start_time = entry.start_time
+        program_stop_time = entry.stop_time
+        program_title = entry.title
+        program_sub_title = entry.sub_title
+        metadata_description = entry.description
+        metadata_category = entry.category
+        metadata_rating = entry.rating
+
+    # Each step below is its own retry unit rather than the whole route, so a
+    # retried second commit can never re-run db.session.add(rec) and create a
+    # duplicate Recording row (see dev/docs/BUGS.md for the same class of bug fixed here
+    # after being caught in create_on_demand_job).
+    @retry_on_locked()
+    def _create_recording_and_commit():
+        r = Recording(
+            name=name,
+            url=url,
+            start_time=start_utc,
+            stop_time=stop_utc,
+            scheduled_start_time=start_utc,
+            scheduled_stop_time=stop_utc,
+            program_start_time=program_start_time,
+            program_stop_time=program_stop_time,
+            program_title=program_title,
+            program_sub_title=program_sub_title,
+            metadata_description=metadata_description,
+            metadata_category=metadata_category,
+            metadata_rating=metadata_rating,
+            status=REC_STATUS_SCHEDULED,
+            channel_id=channel_id,
+            group_id=group_id,
+            profile_id=profile_id,
+        )
+        db.session.add(r)
+        db.session.commit()
+        return r
+
+    rec = _create_recording_and_commit()
+
+    # Saved before the start is armed, so a recording created after its own start time
+    # never opens a stream on an account it was asked to keep off.
+    if blocks:
+        set_recording_blocks(rec.id, blocks)
+
+    if created_after_start:
+        @retry_on_locked()
+        def _log_created_after_start_and_commit():
+            db.session.add(RecordingEvent(
+                recording_id=rec.id,
+                event_type=RECORDING_CREATED_AFTER_EVENT_START,
+                detail='Recording created after the program\'s scheduled start time; start_time set to now',
+            ))
+            db.session.commit()
+
+        _log_created_after_start_and_commit()
+
+    from flask import current_app
+    schedule_recording(current_app._get_current_object(), rec.id, start_utc, stop_utc)
+
+    # Schedule-time half of DESIGN-prerecord-checks.md §2 (dev/changelog/478): warn now
+    # if the channel/group this recording just landed on is already failing, rather than
+    # waiting for the next scheduled test to happen to run assess_scheduled_recording_impact.
+    evaluate_and_alert_recording(rec, cfg)
+
+    return rec
+
+
 @recordings_bp.route('/recordings/new-json', methods=['POST'])
 def new_recording_json():
     name, url, start_utc, stop_utc, errors = _parse_recording_form(request.form)
@@ -2014,94 +2179,13 @@ def new_recording_json():
         if warnings:
             return jsonify({'success': False, **warnings})
 
-    now_utc = datetime.utcnow()
-    created_after_start = start_utc < now_utc
-    if created_after_start:
-        start_utc = now_utc
-
-    # Snapshot the EPG program's own air time (independent of what the user
-    # typed into the form) at creation, so it stays immutable even if the
-    # program later shifts in the guide or the recording is edited/adjusted.
-    # A plain read - not wrapped in retry_on_locked - whose result is captured
-    # into plain local variables (not an ORM object reference) before the
-    # write closure below, so nothing here is affected by a rollback+retry
-    # inside that closure.
-    #
-    # The same read also seeds the metadata_* family - the program's synopsis, genre and
-    # rating. Those are NOT an immutable snapshot: recorder.start_recording() refreshes
-    # them from the program's listing as it stands at air time. Seeding them here anyway
-    # is what makes the data survive at all, because epg_keep_days prunes the listing a
-    # day after it airs and nothing can recover it afterwards (dev/changelog/1055).
     source_epg_id_raw = request.form.get('source_epg_id', '').strip()
-    program_start_time = program_stop_time = None
-    program_title = program_sub_title = None
-    metadata_description = metadata_category = metadata_rating = None
-    if source_epg_id_raw.isdigit():
-        entry = db.session.get(EPGEntry, int(source_epg_id_raw))
-        if entry is not None:
-            program_start_time = entry.start_time
-            program_stop_time = entry.stop_time
-            program_title = entry.title
-            program_sub_title = entry.sub_title
-            metadata_description = entry.description
-            metadata_category = entry.category
-            metadata_rating = entry.rating
-
-    # Each step below is its own retry unit rather than the whole route, so a
-    # retried second commit can never re-run db.session.add(rec) and create a
-    # duplicate Recording row (see dev/docs/BUGS.md for the same class of bug fixed here
-    # after being caught in create_on_demand_job).
-    @retry_on_locked()
-    def _create_recording_and_commit():
-        r = Recording(
-            name=name,
-            url=url,
-            start_time=start_utc,
-            stop_time=stop_utc,
-            scheduled_start_time=start_utc,
-            scheduled_stop_time=stop_utc,
-            program_start_time=program_start_time,
-            program_stop_time=program_stop_time,
-            program_title=program_title,
-            program_sub_title=program_sub_title,
-            metadata_description=metadata_description,
-            metadata_category=metadata_category,
-            metadata_rating=metadata_rating,
-            status=REC_STATUS_SCHEDULED,
-            channel_id=channel_id,
-            group_id=group_id,
-            profile_id=profile_id,
-        )
-        db.session.add(r)
-        db.session.commit()
-        return r
-
-    rec = _create_recording_and_commit()
-
-    # Saved before the start is armed, so a recording created after its own start time
-    # never opens a stream on an account it was asked to keep off.
-    if wanted_blocks:
-        set_recording_blocks(rec.id, wanted_blocks)
-
-    if created_after_start:
-        @retry_on_locked()
-        def _log_created_after_start_and_commit():
-            db.session.add(RecordingEvent(
-                recording_id=rec.id,
-                event_type=RECORDING_CREATED_AFTER_EVENT_START,
-                detail='Recording created after the program\'s scheduled start time; start_time set to now',
-            ))
-            db.session.commit()
-
-        _log_created_after_start_and_commit()
-
-    from flask import current_app
-    schedule_recording(current_app._get_current_object(), rec.id, start_utc, stop_utc)
-
-    # Schedule-time half of DESIGN-prerecord-checks.md §2 (dev/changelog/478): warn now
-    # if the channel/group this recording just landed on is already failing, rather than
-    # waiting for the next scheduled test to happen to run assess_scheduled_recording_impact.
-    evaluate_and_alert_recording(rec, cfg)
+    entry = (db.session.get(EPGEntry, int(source_epg_id_raw))
+             if source_epg_id_raw.isdigit() else None)
+    rec = _create_scheduled_recording(
+        cfg, name=name, url=url, start_utc=start_utc, stop_utc=stop_utc,
+        channel_id=channel_id, group_id=group_id, profile_id=profile_id,
+        entry=entry, blocks=wanted_blocks)
 
     if replace_recording_id is not None:
         unschedule_recording(replace_recording_id)
@@ -2125,6 +2209,234 @@ def new_recording_json():
         _delete_replaced_and_commit()
 
     return jsonify({'success': True, 'id': rec.id})
+
+
+# ── Bulk schedule from the airing search (dev/changelog/1157) ───────────────
+#
+# Several showings ticked on the EPG search's airings list, one set of settings, each
+# showing its own ordinary scheduled recording. Preview and create run the SAME planner,
+# so what the preview promised is what the create does; create re-plans rather than
+# trusting a plan the client sends back, since the guide may have moved in between.
+
+#: A generous ceiling on one request - three pages of 100 showings. The planner's own
+#: queries are batched, but every created recording arms its own scheduler jobs.
+BULK_SCHEDULE_MAX = 300
+
+BULK_OK = 'ok'
+BULK_WARN = 'warn'      # overlaps something in time - proceedable
+BULK_HARD = 'hard'      # overlaps on one account with too few connections - proceedable, loud
+BULK_SKIP = 'skip'      # not created at all; `reason` says why
+
+
+def _parse_bulk_schedule(data):
+    """(items, profile_choice, error). `items` is [(epg_id, group_id or None)] in request
+    order; `profile_choice` is 'default' (each showing's own default, as its Record button
+    would pick), None (no profile - the global defaults) or a RecordingProfile."""
+    from ..database import RecordingProfile
+    raw_items = data.get('items')
+    if not isinstance(raw_items, list) or not raw_items:
+        return None, None, 'Select at least one showing to schedule.'
+    if len(raw_items) > BULK_SCHEDULE_MAX:
+        return None, None, (f'At most {BULK_SCHEDULE_MAX} showings can be scheduled at '
+                            f'once; {len(raw_items)} were selected.')
+
+    def _id(v):
+        return v if isinstance(v, int) and not isinstance(v, bool) and v > 0 else None
+
+    items = []
+    for raw in raw_items:
+        if not isinstance(raw, dict) or _id(raw.get('epg_id')) is None:
+            return None, None, 'Every showing needs a numeric epg_id.'
+        group_raw = raw.get('group_id')
+        if group_raw is not None and _id(group_raw) is None:
+            return None, None, 'group_id must be a numeric id when given.'
+        items.append((raw['epg_id'], group_raw))
+
+    choice = data.get('profile', 'default')
+    if choice == 'default':
+        return items, 'default', None
+    if choice in (None, 'none'):
+        return items, None, None
+    if _id(choice) is None:
+        return None, None, 'profile must be "default", "none" or a profile id.'
+    profile = db.session.get(RecordingProfile, choice)
+    if profile is None:
+        return None, None, 'That recording profile no longer exists.'
+    return items, profile, None
+
+
+def _plan_bulk_schedule(items, profile_choice, cfg):
+    """One plan per requested showing, in request order - what would be created and what
+    each one would be warned about.
+
+    Every showing is judged against the recordings already stored AND the showings before
+    it in this same request (`pending`), so eight overlapping picks on a one-connection
+    account are seven hard warnings rather than eight clean rows. Each plan carries its
+    private create arguments under '_create'; bulk_plan_payload() strips them."""
+    from types import SimpleNamespace
+    from ..accounts import default_profile_for, filename_naming_for
+    from ..channel_search_rows import (
+        REC_STATE_PAST, REC_STATE_RECORDING, REC_STATE_SCHEDULED,
+        _record_state, _recordings_for, _suggested_name)
+    from ..database import Tag
+    from ..tz_utils import get_display_tz
+
+    now = datetime.utcnow()
+    epg_ids = [epg_id for epg_id, _ in items]
+    entries = {e.id: e for e in EPGEntry.query.filter(EPGEntry.id.in_(epg_ids)).all()}
+    channels = {c.id: c for c in Channel.query.filter(
+        Channel.id.in_({e.channel_id for e in entries.values()})).all()}
+    recordings = _recordings_for(list(entries.values()), channels)
+    group_ids = {g for _, g in items if g is not None}
+    groups = ({g.id: g for g in ChannelGroup.query.filter(ChannelGroup.id.in_(group_ids)).all()}
+              if group_ids else {})
+    streak_threshold = cfg.get('channel_testing', {}).get(
+        'failing_streak_threshold', DEFAULT_FAILING_STREAK_THRESHOLD)
+    tags_by_name = {t.name: t for t in Tag.query.all()}
+    tz = get_display_tz()
+    ctx = SimpleNamespace(now=now)
+
+    plans, pending, seen = [], [], set()
+    for epg_id, group_id in items:
+        plan = {'epg_id': epg_id, 'group_id': group_id, 'verdict': BULK_SKIP,
+                'reason': None, 'warnings': {}}
+        plans.append(plan)
+        if epg_id in seen:
+            plan['reason'] = 'Listed twice - scheduled once.'
+            continue
+        seen.add(epg_id)
+        entry = entries.get(epg_id)
+        ch = channels.get(entry.channel_id) if entry is not None else None
+        if entry is None or ch is None:
+            plan['reason'] = 'This showing is no longer in the guide data.'
+            continue
+        plan.update(title=entry.title or ch.name, sub_title=entry.sub_title or '',
+                    channel_name=ch.name, program_start=_iso_utc(entry.start_time),
+                    program_stop=_iso_utc(entry.stop_time))
+
+        state = _record_state(entry, recordings.get(epg_id), ctx)
+        if state == REC_STATE_RECORDING:
+            plan['reason'] = 'Already being recorded.'
+            continue
+        if state == REC_STATE_SCHEDULED:
+            plan['reason'] = 'Already scheduled.'
+            continue
+        if state == REC_STATE_PAST:
+            plan['reason'] = 'Already over.'
+            continue
+
+        group = None
+        if group_id is not None:
+            group = groups.get(group_id)
+            if (group is None or group.is_system
+                    or ch.id not in {m.channel_id for m in group.memberships}):
+                plan['reason'] = 'This showing is not on a member of that channel group.'
+                continue
+            plan['group_name'] = group.name
+
+        profile = (default_profile_for(ch, group) if profile_choice == 'default'
+                   else profile_choice)
+        pre = (profile.pre_padding_minutes or 0) if profile is not None else 0
+        post = (profile.post_padding_minutes or 0) if profile is not None else 0
+        start = entry.start_time - timedelta(minutes=pre)
+        stop = entry.stop_time + timedelta(minutes=post)
+
+        target_id = ch.id
+        if group is not None:
+            # The same resolver the record modal's group path uses, counting this request's
+            # earlier picks, so a multi-account group rolls onto an account with room.
+            resolved, _reason = _resolve_group_member(
+                group, ch.id, start, stop, streak_threshold, pending=pending)
+            if resolved is None:
+                group = None
+                plan['group_id'] = None
+                plan.pop('group_name', None)
+            else:
+                target_id = resolved
+        target = channels.get(target_id) or db.session.get(Channel, target_id)
+
+        # Named by the profile the showing is actually scheduled with, which is the chosen
+        # one when a profile was picked - not the channel's default (dev/docs/BUGS.md
+        # 2026-09-29 @ 08:56).
+        name = _suggested_name(ch, entry, filename_naming_for(cfg, profile), tags_by_name, tz)
+        warnings = _pending_recording_warnings(
+            target.id, group.id if group else None, start, stop, pending=pending)
+        plan.update(
+            name=name,
+            member_name=target.name if group is not None else None,
+            start_time=_iso_utc(start), stop_time=_iso_utc(stop),
+            started=start < now,
+            profile_name=profile.name if profile is not None else None,
+            warnings=warnings,
+            verdict=(BULK_HARD if 'connection_limit_warning' in warnings
+                     else BULK_WARN if warnings else BULK_OK),
+        )
+        plan['_create'] = dict(
+            name=name, url=normalize_url(target.stream_url, target.account, cfg),
+            start_utc=start, stop_utc=stop, channel_id=target.id,
+            group_id=group.id if group else None,
+            profile_id=profile.id if profile is not None else None, entry=entry)
+        pending.append({'channel_id': target.id, 'group_id': group.id if group else None,
+                        'account_id': target.account_id, 'start': start, 'stop': stop,
+                        'name': name, 'channel_name': group.name if group else target.name})
+    return plans
+
+
+def _iso_utc(dt):
+    return dt.strftime('%Y-%m-%dT%H:%M:%S') if dt else None
+
+
+def bulk_plan_payload(plan):
+    return {k: v for k, v in plan.items() if not k.startswith('_')}
+
+
+@recordings_bp.route('/api/recordings/bulk-preview', methods=['POST'])
+def bulk_schedule_preview_json():
+    """What bulk_schedule_json would create for these showings, and every warning each one
+    would carry. Writes nothing."""
+    items, profile_choice, error = _parse_bulk_schedule(request.get_json(silent=True) or {})
+    if error:
+        return jsonify({'error': error}), 400
+    plans = _plan_bulk_schedule(items, profile_choice, load_config())
+    return jsonify({'success': True, 'plans': [bulk_plan_payload(p) for p in plans]})
+
+
+@recordings_bp.route('/api/recordings/bulk-schedule', methods=['POST'])
+def bulk_schedule_json():
+    """Schedule each showing as its own ordinary recording. Warnings do not stop a showing
+    - the preview already showed them and the user pressed Schedule - so only a skip does.
+
+    Each recording is created through _create_scheduled_recording(), one commit unit per
+    recording, so a failure part way leaves the ones before it intact and is reported by
+    name rather than failing the whole request (dev/changelog/1157)."""
+    items, profile_choice, error = _parse_bulk_schedule(request.get_json(silent=True) or {})
+    if error:
+        return jsonify({'error': error}), 400
+    cfg = load_config()
+    plans = _plan_bulk_schedule(items, profile_choice, cfg)
+
+    created, failed = [], []
+    for plan in plans:
+        args = plan.get('_create')
+        if plan['verdict'] == BULK_SKIP or args is None:
+            continue
+        # Broad on purpose, and logged with its traceback: whatever stops one showing, the
+        # ones already created stay created and this one is named in the response.
+        try:
+            rec = _create_scheduled_recording(cfg, **args)
+        except Exception as exc:
+            db.session.rollback()
+            log.exception('Bulk schedule: could not create "%s" (showing %s)',
+                          plan.get('name'), plan['epg_id'])
+            failed.append({**bulk_plan_payload(plan), 'error': str(exc) or type(exc).__name__})
+            continue
+        created.append({**bulk_plan_payload(plan), 'recording_id': rec.id})
+
+    skipped = [bulk_plan_payload(p) for p in plans if p['verdict'] == BULK_SKIP]
+    log.info('Bulk schedule: %d created, %d skipped, %d failed',
+             len(created), len(skipped), len(failed))
+    return jsonify({'success': True, 'created': created, 'skipped': skipped,
+                    'failed': failed})
 
 
 @recordings_bp.route('/api/recordings/test-url', methods=['POST'])

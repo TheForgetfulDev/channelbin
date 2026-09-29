@@ -246,7 +246,9 @@
     </div>
   </span>
 </div>
-<div class="grp-list-compact" id="grp-list-groups" data-section="groups">
+{# data-hc-sig: the health-check signature this list was read at. groups.js swaps the list
+   for a fresh render when nav-status carries a different one (dev/changelog/1158). #}
+<div class="grp-list-compact" id="grp-list-groups" data-section="groups" data-hc-sig="{{ hc_sig }}">
   {% for g in group_rows %}{{ group_row(g) }}{% endfor %}
 </div>
 
@@ -265,7 +267,6 @@ window.GROUPS_CONFIG = {
   resolutionOptions: {{ resolution_options | tojson }},
   fpsOptions: {{ fps_options | tojson }},
   startJobUrlBase: '/api/channel-tests/on-demand/',  // + id + /start
-  testerBusy: {{ 'true' if tester_status.is_running else 'false' }},
 };
 </script>
 <script src="{{ url_for('static', filename='js/format-plan.js') }}"></script>

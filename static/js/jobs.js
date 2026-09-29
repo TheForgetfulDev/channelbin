@@ -13,20 +13,85 @@
 (() => {
   'use strict';
 
-  // A schedule-changing action leaves every "next run" on the page stale, so the
-  // page is re-read from the scheduler afterwards. The delay is what makes the
-  // toast readable before the reload takes it away (dashboard.js does the same).
-  function reloadAfter(msg) {
+  // ── Live refresh (dev/changelog/1164) ───────────────────────────────────
+  // #jb-live and the header count are swapped for a fresh server render - the
+  // /accounts pattern (dev/changelog/921), never a JS copy of the template. Driven by
+  // base.html's /api/nav-status poll rather than a timer of its own. Three triggers:
+  //   1. the running background work or the next background job changed - a sync or
+  //      health check started or finished, so its rows moved;
+  //   2. the recording signature changed - a recording's start/stop jobs came or went;
+  //   3. the render is a minute old, so "in 23m" does not quietly drift. Skipped in a
+  //      background tab, where nobody reads it.
+  // A refresh waits while a row menu or a modal is open - swapping the row out from
+  // under an open menu would close it mid-choice. A change seen while it waits is kept
+  // in `stale`, so the first poll after the menu closes refreshes rather than finding
+  // the signature already recorded and nothing left to do.
+  const LIVE_REGIONS = ['#jb-live', '#jb-count'];
+  const RERENDER_MS = 60 * 1000;
+  let renderedAt = Date.now();
+  let inFlight = false;
+  let stale = false;
+  // What each trigger last saw. `undefined` until the first poll, which only records:
+  // the page was rendered moments before it, and the minute tick covers that gap.
+  let bgSig;
+  let recSig;
+
+  const busy = () => Boolean(document.querySelector('#jb-live .menu.open, .modal'));
+
+  function refresh() {
+    if (!document.getElementById('jb-live') || inFlight || busy()) return;
+    inFlight = true;
+    // Cleared when the fetch starts, not when it lands: a change reported while it is in
+    // flight may postdate the render it brings back, and sets `stale` again.
+    stale = false;
+    swapFromServer(LIVE_REGIONS)
+      .then(() => { renderedAt = Date.now(); })
+      .catch((err) => {
+        stale = true;
+        console.warn('Jobs table refresh failed; the next poll retries.', err);
+      })
+      .finally(() => { inFlight = false; });
+  }
+
+  // `relative` on next_scheduled is left out: it changes every minute by itself, which
+  // the tick already answers.
+  function backgroundSignature(bg) {
+    const tasks = (bg && Array.isArray(bg.tasks)) ? bg.tasks : [];
+    const next = bg && bg.next_scheduled;
+    return JSON.stringify([
+      tasks.map((t) => [t && t.kind, t && t.label]),
+      next ? [next.label, next.time_et] : null,
+    ]);
+  }
+
+  window.__applyBackgroundTasks = (bg) => {
+    const sig = backgroundSignature(bg);
+    if (bgSig !== undefined && sig !== bgSig) stale = true;
+    bgSig = sig;
+    if (stale || (!document.hidden && Date.now() - renderedAt >= RERENDER_MS)) refresh();
+  };
+
+  window.__applyRecordingSignature = (sig) => {
+    if (typeof sig !== 'string') return;
+    if (recSig !== undefined && sig !== recSig) stale = true;
+    recSig = sig;
+    if (stale) refresh();
+  };
+
+  // A schedule-changing action leaves every "next run" on the page stale, so the table
+  // is re-read from the scheduler straight away rather than at the next tick.
+  function refreshAfter(msg) {
     showToast(msg);
-    setTimeout(() => location.reload(), 1500);
+    stale = true;
+    refresh();
   }
 
   function run(url, body, skipUrl, name) {
     jsonFetch(url, { method: 'POST', body })
       .then(() => {
-        if (!skipUrl) { showToast(`${name} started.`); return null; }
+        if (!skipUrl) { refreshAfter(`${name} started.`); return null; }
         return jsonFetch(skipUrl, { method: 'POST' })
-          .then(() => reloadAfter(`${name} started, and its next scheduled run was skipped.`))
+          .then(() => refreshAfter(`${name} started, and its next scheduled run was skipped.`))
           .catch((e) => showToast(
             `${name} started, but its next scheduled run could not be skipped: ${e.message}`,
             { type: 'warning' }));
@@ -129,7 +194,7 @@
           onClick: (c) => {
             c();
             jsonFetch(btn.dataset.url, { method: 'POST' })
-              .then(() => reloadAfter('The next run was skipped.'))
+              .then(() => refreshAfter('The next run was skipped.'))
               .catch((e) => showToast(`Could not skip that run: ${e.message}`, { type: 'error' }));
           },
         },
@@ -150,7 +215,7 @@
           onClick: (c) => {
             c();
             jsonFetch(btn.dataset.url, { method: 'POST' })
-              .then(() => reloadAfter('The scheduled run was cancelled.'))
+              .then(() => refreshAfter('The scheduled run was cancelled.'))
               .catch((e) => showToast(`Could not cancel that run: ${e.message}`, { type: 'error' }));
           },
         },
@@ -159,7 +224,6 @@
   }
 
   document.addEventListener('click', (e) => {
-    if (e.target.closest('#jb-refresh')) { location.reload(); return; }
     const btn = e.target.closest('.menu-item[data-act]');
     if (!btn) return;
     if (btn.dataset.act === 'run') {

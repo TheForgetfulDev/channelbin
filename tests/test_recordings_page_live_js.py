@@ -36,8 +36,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app import db  # noqa: E402
 from app.database import (  # noqa: E402
-    Recording, REC_STATUS_COMPLETED, REC_STATUS_IN_PROGRESS, REC_STATUS_SCHEDULED,
+    Recording, UserPref, REC_STATUS_COMPLETED, REC_STATUS_IN_PROGRESS, REC_STATUS_SCHEDULED,
 )
+from app.routes.recordings import RECORDINGS_SAVED_FILTERS_PREF  # noqa: E402
 from tests.support import seed  # noqa: E402
 from tests.support.app import make_test_app  # noqa: E402
 
@@ -97,6 +98,15 @@ def _observe():
         rec.completed_at = datetime.utcnow()
         db.session.commit()
         snapshot('finished')
+
+        # One saved filter marked default: Completed, plus a channel no recording is on,
+        # which has to be dropped out loud rather than silently (dev/changelog/1156).
+        db.session.add(UserPref(key=RECORDINGS_SAVED_FILTERS_PREF, value=json.dumps([
+            {'name': 'Done only', 'is_default': True,
+             'filters': [['status', 'COMPLETED'], ['channel', 'No such channel']]},
+        ])))
+        db.session.commit()
+        snapshot('defaulted')
 
         with open(os.path.join(tmp, 'ids.json'), 'w', encoding='utf-8') as f:
             json.dump(_IDS, f)
@@ -294,6 +304,27 @@ class TimesEndpointTests(unittest.TestCase):
         self.assertIsNotNone(m)
         self.assertEqual((m.group(1), m.group(2)), (t['day'], t['rel']))
         self.assertTrue(t['rel'].startswith('in '))
+
+
+
+class SavedDefaultTests(_Base):
+    """A saved filter marked default is on before the list is first seen, and survives the
+    live swap (dev/changelog/1156)."""
+    SCENARIO = 'saved_default'
+
+    def test_the_default_filters_the_list_at_load(self):
+        self.assertEqual(self.obs['atBoot']['chips'], ['Status: COMPLETED \u2715'])
+        self.assertEqual(sorted(self.obs['atBoot']['visible']), sorted([_IDS['done'], _IDS['live']]))
+
+    def test_a_value_nothing_carries_is_named_not_dropped_quietly(self):
+        self.assertIn('Channel: No such channel', self.obs['atBoot']['toast'])
+        self.assertEqual(self.obs['atBoot']['chip'], 'Saved: Done only (edited) \u25be')
+
+    def test_it_survives_the_swap_and_writes_nothing(self):
+        self.assertEqual(self.obs['pageFetches'], 1)
+        self.assertEqual(self.obs['afterSwap']['chips'], ['Status: COMPLETED \u2715'])
+        self.assertEqual(self.obs['afterSwap']['visible'], [_IDS['done']])
+        self.assertEqual(self.obs['posts'], [])
 
 
 if __name__ == '__main__':

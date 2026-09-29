@@ -152,4 +152,160 @@ out.restored = run('snap()');
 
 out.changes = run('changes');
 out.errors = errors;
+
+/* ── Saved filters (opts.saved, dev/changelog/1156) ──────────────────────
+   A second page with the saved half switched on. The network is a stub whose answer the
+   scenario sets, and every POST body is kept so the stored list can be asserted on. */
+const SAVED_PAGE = PAGE.replace('</div>\n  </div>', `</div>
+      <div class="menu-wrap">
+        <button class="chip" id="saved-chip" type="button" data-menu>Saved</button>
+        <div class="menu pop-left" id="saved-menu"></div>
+      </div>
+    </div>
+  </div>`);
+
+function bootSaved(list) {
+  const errors = [];
+  const vc = new VirtualConsole();
+  vc.on('jsdomError', (e) => errors.push(`jsdomError: ${e.message}`));
+  vc.on('error', (...a) => errors.push(`console.error: ${a.join(' ')}`));
+  const dom = new JSDOM(SAVED_PAGE, {
+    runScripts: 'dangerously', pretendToBeVisual: true,
+    url: 'http://localhost:5000/', virtualConsole: vc,
+  });
+  const w = dom.window;
+  w.eval(`
+    var POSTS = [];
+    var FAIL = false;
+    var TOASTS = [];
+    window.fetch = (url, opts) => {
+      POSTS.push({ url: String(url), body: JSON.parse(opts.body) });
+      if (FAIL) return Promise.reject(new TypeError('network down'));
+      return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({ success: true }) });
+    };
+  `);
+  JS.forEach(src => w.eval(src));
+  w.eval(`
+    var realToast = showToast;
+    showToast = (msg, o) => { TOASTS.push([(o && o.type) || 'success', msg]); };
+    var ROWS = ${JSON.stringify(ROWS)};
+    var DIMS = [
+      { k: 'status', label: 'Status',
+        values: () => [...new Set(ROWS.map(r => r.status))].sort().map(v => ({v, label: v})),
+        match: (r, v) => r.status === v },
+      { k: 'account', label: 'Account',
+        values: () => [...new Set(ROWS.map(r => r.account))].sort().map(v => ({v, label: 'Account ' + v})),
+        match: (r, v) => r.account === v },
+    ];
+    var bar = createFilterBar({
+      chipsEl: document.getElementById('chips'),
+      menuEl: document.getElementById('menu'),
+      dims: DIMS, rows: () => ROWS, onChange: () => {},
+      saved: { chipEl: document.getElementById('saved-chip'),
+               menuEl: document.getElementById('saved-menu'),
+               list: ${JSON.stringify(list)}, prefUrl: '/api/user-prefs/test_saved' },
+    });
+    var click = (el) => el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+    function openSaved() { click(document.getElementById('saved-chip')); }
+    function named() {
+      return [...document.querySelectorAll('#saved-menu .fb-saved-load')].map(b => b.textContent.trim());
+    }
+    function typeName(n) {
+      const box = document.querySelector('#saved-menu [data-fsname]');
+      box.value = n;
+      box.dispatchEvent(new Event('input', { bubbles: true }));
+    }
+    function save() { click(document.querySelector('#saved-menu [data-fssave]')); }
+    function snapS() {
+      return {
+        chips: [...document.querySelectorAll('#chips .chip.active-filter')].map(c => c.textContent.trim()),
+        rows: ROWS.filter(r => bar.matches(r)).map(r => r.name),
+        chip: document.getElementById('saved-chip').textContent.replace(/\\s+/g, ' ').trim(),
+        saved: named(),
+        open: document.getElementById('saved-menu').classList.contains('open'),
+        err: (document.querySelector('#saved-menu .fb-saved-err') || {}).textContent || '',
+        posts: POSTS.length,
+        lastPost: POSTS.length ? POSTS[POSTS.length - 1] : null,
+        toasts: TOASTS.slice(),
+      };
+    }
+  `);
+  return { w, errors };
+}
+const tick = () => new Promise(r => setTimeout(r, 20));
+const saved = {};
+
+// 10. No saved list: the chip reads plain, the popover says nothing is saved. Each block
+//     records a throw rather than dying, so a broken bar fails its own assertions instead
+//     of taking every other class in the module down with the harness.
+try {
+  const { w, errors } = bootSaved([]);
+  w.eval('openSaved()');
+  saved.empty = w.eval('snapS()');
+  saved.empty.menu = w.eval('document.getElementById("saved-menu").textContent');
+
+  // 11. Save refuses an empty name and an empty selection, and writes nothing.
+  w.eval('typeName("Failures"); save()');
+  saved.save_nothing = w.eval('snapS()');
+  w.eval('bar.toggle("status", "FAIL"); bar.apply(); openSaved(); typeName(""); save()');
+  saved.save_unnamed = w.eval('snapS()');
+
+  // 12. Save names the chips on screen and writes the whole list back.
+  w.eval('typeName("Failures"); save()');
+  await tick();
+  saved.saved = w.eval('snapS()');
+
+  // 13. Changing the chips marks it edited; saving under the same name overwrites.
+  w.eval('bar.toggle("status", "WARN"); bar.apply()');
+  saved.edited = w.eval('snapS()');
+  w.eval('openSaved(); save()');
+  await tick();
+  saved.overwritten = w.eval('snapS()');
+
+  // 14. A second one, then loading the first puts its chips back and closes the popover.
+  w.eval('bar.clear(); bar.toggle("account", "1"); bar.apply(); openSaved(); typeName("Account one"); save()');
+  await tick();
+  w.eval('document.body.click(); openSaved()');
+  w.eval('click(document.querySelector("#saved-menu [data-fsload=\'0\']"))');
+  saved.loaded = w.eval('snapS()');
+
+  // 15. Set default marks exactly one; setting another moves it; clear leaves none.
+  w.eval('openSaved(); click(document.querySelector("#saved-menu [data-fsdef=\'1\']"))');
+  await tick();
+  saved.default_one = w.eval('snapS()');
+  saved.default_one.stillOpen = w.eval('document.getElementById("saved-menu").classList.contains("open")');
+  w.eval('click(document.querySelector("#saved-menu [data-fsdef=\'0\']"))');
+  await tick();
+  saved.default_moved = w.eval('snapS()');
+  w.eval('click(document.querySelector("#saved-menu [data-fsdef=\'0\']"))');
+  await tick();
+  saved.default_cleared = w.eval('snapS()');
+
+  // 16. A failed write is undone on screen, and the popover says so.
+  w.eval('FAIL = true; click(document.querySelector("#saved-menu [data-fsdel=\'1\']"))');
+  saved.delete_pending = w.eval('snapS()');
+  await tick();
+  saved.delete_failed = w.eval('snapS()');
+
+  // 17. A good delete removes it, and the chip stops naming a filter that is gone.
+  w.eval('FAIL = false; click(document.querySelector("#saved-menu [data-fsdel=\'0\']"))');
+  await tick();
+  saved.deleted = w.eval('snapS()');
+  saved.errors_a = errors;
+} catch (e) { saved.errors_a = [`threw: ${e.message}`]; }
+
+// 18. The default is applied as the bar is built; a value nothing carries is dropped and
+//     named, and malformed records and a second default are ignored.
+try {
+  const { w, errors } = bootSaved([
+    'junk', { name: '' , filters: [] }, { name: 'No filters key' },
+    { name: 'Pass on 2', filters: [['status', 'PASS'], ['account', '2'], ['status', 'GONE']], is_default: true },
+    { name: 'Second default', filters: [['status', 'FAIL']], is_default: true },
+  ]);
+  w.eval('openSaved()');
+  saved.boot_default = w.eval('snapS()');
+  saved.boot_default.badges = w.eval('[...document.querySelectorAll("#saved-menu .badge")].length');
+  saved.errors_b = errors;
+} catch (e) { saved.errors_b = [`threw: ${e.message}`]; }
+out.saved = saved;
 process.stdout.write(JSON.stringify(out));

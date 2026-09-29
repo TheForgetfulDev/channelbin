@@ -17,6 +17,7 @@ import logging
 from flask import Blueprint, jsonify, request
 from werkzeug.security import check_password_hash
 
+from .. import db
 from ..config import load_config
 from ..url_utils import mask_account_urls_in_text
 from ..version import __version__
@@ -77,6 +78,10 @@ def _recording_summary():
                                                   REC_STATUS_ANALYZING)]
     scheduled = [r for r in recs if r.status == REC_STATUS_SCHEDULED]
     nxt = scheduled[0] if scheduled else None
+    # The account is the capturing channel's: failover moves Recording.channel_id to the
+    # member now serving, so this names the account the stream is on right now. One
+    # lookup for every row, never a per-row load.
+    account_names = dict(db.session.query(Account.id, Account.name).all()) if capturing else {}
     # capturing_count stays beside the list rather than being derived from it by the
     # consumer: the shipped 1.0.x integration reads it by name (dev/changelog/1146).
     return {
@@ -85,6 +90,8 @@ def _recording_summary():
             'id': r.id,
             'name': r.name,
             'channel': r.channel.name if r.channel else None,
+            'account_id': r.channel.account_id if r.channel else None,
+            'account': account_names.get(r.channel.account_id) if r.channel else None,
             'started_at': r.started_at.isoformat() if r.started_at else None,
             'stop_time': r.stop_time.isoformat(),
         } for r in capturing],

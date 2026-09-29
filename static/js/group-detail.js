@@ -2565,11 +2565,22 @@
       return;
     }
     if (act === 'remove') {
-      const what = G.hasChannel
-        ? `Remove "${r.channel_name}" from this group? It is not deleted - it stays in your channel list and returns to the guide as an individual channel if it was in it before.`
-        : `Remove "${r.channel_name}" from this health check? Its results for this check are deleted.`;
-      if (!confirm(what)) return;
-      removeMember(r, false);
+      const spec = G.hasChannel
+        ? {
+            title: 'Remove from group',
+            message: `"${r.channel_name}" is removed from this group. It is not deleted - it stays ` +
+              'in your channel list and returns to the guide as an individual channel if it was ' +
+              'in it before.',
+            confirmLabel: 'Remove',
+          }
+        : {
+            title: 'Remove from health check',
+            message: `"${r.channel_name}" is removed from this health check.`,
+            consequence: 'Its results for this check are deleted.',
+            confirmLabel: 'Remove',
+            danger: true,
+          };
+      confirmModal(spec).then((ok) => { if (ok) removeMember(r, false); });
     }
   }
 
@@ -2702,18 +2713,27 @@
       }
       case 'resume': postAndReload(jobApi('resume')); return;
       case 'force-cancel':
-        if (!confirm('Force cancel this check? It will be marked Cancelled. You can test it again, or resume where it stopped.')) return;
-        postAndReload(jobApi('force-cancel'));
+        confirmModal({
+          title: 'Force cancel check',
+          message: 'This check is marked Cancelled. You can test it again, or resume where it stopped.',
+          confirmLabel: 'Force cancel',
+        }).then((ok) => { if (ok) postAndReload(jobApi('force-cancel')); });
         return;
       case 'unschedule':
-        if (!confirm('Remove this schedule? The health check itself is kept as-is.')) return;
-        postAndReload(jobApi('unschedule'));
+        confirmModal({
+          title: 'Remove schedule',
+          message: 'This check stops running on a schedule. The health check itself is kept as-is.',
+          confirmLabel: 'Remove schedule',
+        }).then((ok) => { if (ok) postAndReload(jobApi('unschedule')); });
         return;
       case 'pause-schedule': postAndReload(jobApi('pause-schedule')); return;
       case 'resume-schedule': postAndReload(jobApi('resume-schedule')); return;
       case 'skip-next':
-        if (!confirm('Skip the next scheduled run? It runs at the following occurrence instead.')) return;
-        postAndReload(jobApi('skip-next'));
+        confirmModal({
+          title: 'Skip next run',
+          message: 'The next scheduled run is skipped. The check runs at the following occurrence instead.',
+          confirmLabel: 'Skip next run',
+        }).then((ok) => { if (ok) postAndReload(jobApi('skip-next')); });
         return;
       case 'stop': {
         const btn = el;

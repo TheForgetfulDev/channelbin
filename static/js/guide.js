@@ -1520,6 +1520,14 @@ let _modalPaddingApplicable = false;
 let _modalStartEdited = false;
 let _modalStopEdited = false;
 
+// The showing a new-recording modal is open on, and whether its name has been typed over.
+// A profile carries its own filename template and tag cleanup, so picking one renames the
+// showing the way it re-pads the times - never over a name the user already typed, and
+// only the newest request may write (dev/changelog/1161).
+let _modalNameProg = null;
+let _modalNameEdited = false;
+let _modalNameSeq = 0;
+
 // Mirrors app/url_utils.py::mask_creds (the canonical masker, also behind the mask_creds
 // Jinja filter) so the same masking can be applied client-side to URLs populated purely
 // from JSON. Keep the rules below in sync with that function.
@@ -1764,6 +1772,27 @@ function applyProfilePadding() {
   }
 }
 
+function applyProfileName() {
+  const prog = _modalNameProg;
+  const sel = document.getElementById('modal-profile');
+  if (!prog || !sel || _modalNameEdited) return Promise.resolve();
+  const seq = ++_modalNameSeq;
+  return jsonFetch('/api/guide/suggested-name', {
+    method: 'POST',
+    body: JSON.stringify({
+      profile_id: sel.value || null,
+      title: prog.title, sub_title: prog.sub_title, description: prog.description,
+      category: prog.category, channel_name: prog.channel_name,
+      start_time: prog.start_time, stop_time: prog.stop_time,
+    }),
+  }).then((d) => {
+    if (seq !== _modalNameSeq || _modalNameEdited || _modalNameProg !== prog) return;
+    if (!d || typeof d.name !== 'string') return;
+    document.getElementById('modal-name').value = d.name;
+  }).catch((e) => showToast(`Could not rename the recording for that profile: ${e.message}`,
+    { type: 'error' }));
+}
+
 function openModal(prog, ch, opts = {}) {
   const isActive = prog.has_recording && prog.recording_id &&
     (prog.recording_status === 'IN_PROGRESS' || prog.recording_status === 'PAUSED' ||
@@ -1789,6 +1818,8 @@ function openModal(prog, ch, opts = {}) {
   // A fresh open means neither field has been hand-edited yet.
   _modalStartEdited = false;
   _modalStopEdited = false;
+  _modalNameEdited = false;
+  _modalNameProg = null;
 
   const startSrc = isEdit ? prog.recording_start_time : prog.start_time;
   const stopSrc  = isEdit ? prog.recording_stop_time  : prog.stop_time;
@@ -1830,6 +1861,9 @@ function openModal(prog, ch, opts = {}) {
       const defaultProfileId = (ch && ch.default_profile_id != null) ? String(ch.default_profile_id) : '';
       profileSel.value = GUIDE_CONFIG.profiles[defaultProfileId] ? defaultProfileId : '';
       applyProfilePadding();
+      // Set after the pre-selection, so only a profile the user picks renames the showing:
+      // the server already named it with the pre-selected one.
+      _modalNameProg = prog;
     }
   }
 
@@ -1974,8 +2008,9 @@ function showActiveRecError(msg) {
   el.style.display = 'block';
 }
 
-async function activeRecAction(path, confirmMsg) {
-  if (confirmMsg && !confirm(confirmMsg)) return;
+// `confirmSpec` is a util.js::confirmModal() spec, or null for an action that asks nothing.
+async function activeRecAction(path, confirmSpec) {
+  if (confirmSpec && !(await confirmModal(confirmSpec))) return;
   const recId = _activeRecId;
   if (!recId) return;
   try {
@@ -3010,7 +3045,11 @@ document.addEventListener('DOMContentLoaded', function () {
   if (modalStartInput) modalStartInput.addEventListener('input', () => { _modalStartEdited = true; });
   if (modalStopInput)  modalStopInput.addEventListener('input',  () => { _modalStopEdited = true; });
   const modalProfileSel = document.getElementById('modal-profile');
-  if (modalProfileSel) modalProfileSel.addEventListener('change', applyProfilePadding);
+  if (modalProfileSel) {
+    modalProfileSel.addEventListener('change', () => { applyProfilePadding(); applyProfileName(); });
+  }
+  const modalNameInput = document.getElementById('modal-name');
+  if (modalNameInput) modalNameInput.addEventListener('input', () => { _modalNameEdited = true; });
 
   // Active recording modal
   document.getElementById('active-rec-close').addEventListener('click', closeActiveRecModal);
@@ -3045,7 +3084,11 @@ document.addEventListener('DOMContentLoaded', function () {
   });
 
   document.getElementById('active-rec-stop-btn').addEventListener('click', function () {
-    activeRecAction('/stop-json', 'Stop the recording now and join what was captured?');
+    activeRecAction('/stop-json', {
+      title: 'Stop recording',
+      message: 'The recording stops now and what was captured is joined into one file.',
+      confirmLabel: 'Stop',
+    });
   });
 
   document.getElementById('active-rec-pause-btn').addEventListener('click', function () {
@@ -3058,7 +3101,13 @@ document.addEventListener('DOMContentLoaded', function () {
   });
 
   document.getElementById('active-rec-cancel-btn').addEventListener('click', function () {
-    activeRecAction('/cancel-json', 'Abort this recording? Capture will stop and every recorded segment will be permanently deleted from disk. This cannot be undone.');
+    activeRecAction('/cancel-json', {
+      title: 'Abort recording',
+      message: 'Capture stops now.',
+      consequence: 'Every recorded segment will be permanently deleted from disk. This cannot be undone.',
+      confirmLabel: 'Abort',
+      danger: true,
+    });
   });
 
   // Stream URL mask/reveal + copy
@@ -3095,7 +3144,11 @@ document.addEventListener('DOMContentLoaded', function () {
   document.getElementById('modal-delete').addEventListener('click', async function () {
     const recId = this.dataset.recId;
     if (!recId) return;
-    if (!confirm('Cancel scheduled recording? This scheduled recording will be removed.')) return;
+    if (!(await confirmModal({
+      title: 'Cancel recording',
+      message: 'This scheduled recording is removed before it starts.',
+      confirmLabel: 'Cancel recording',
+    }))) return;
     document.getElementById('modal-error').style.display = 'none';
     try {
       await jsonFetch(GUIDE_CONFIG.editRecordingUrlBase + recId + '/cancel-json', { method: 'POST' });

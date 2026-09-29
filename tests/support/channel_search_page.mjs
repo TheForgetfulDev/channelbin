@@ -1229,15 +1229,49 @@ async function airingScenario() {
     label: b.textContent.trim(), act: b.dataset.act || '', disabled: b.disabled,
   }));
 
-  // Selecting a showing selects its CHANNEL, and two showings on one channel are one
-  // selection - which is what makes the count honest.
-  c.$$('#ch-list .arow-air input[type=checkbox]').forEach((box) => {
-    box.checked = true;
+  // Nothing ticked: no showing to schedule, so the action is not offered.
+  obs.sched_shown_before = (c.$('#sel-sched') || { style: {} }).style.display !== 'none';
+  // A tick selects the SHOWING; its channel comes along for the channel actions, and two
+  // showings on one channel are still one CHANNEL - which is what keeps that count honest.
+  const tick = (box, on) => {
+    box.checked = on;
     box.dispatchEvent(new c.window.Event('change', { bubbles: true }));
-  });
+  };
+  c.$$('#ch-list .arow-air input[type=checkbox]').forEach((box) => tick(box, true));
   obs.selected_count_text = (c.$('#sel-group') || {}).textContent;
   obs.distinct_channels_in_rows =
     new Set((ROWS_AIRINGS.rows || []).map((r) => (r.channel || {}).id)).size;
+  obs.airing_rows = (ROWS_AIRINGS.rows || []).length;
+  obs.sched_shown_after = c.$('#sel-sched').style.display !== 'none';
+  obs.sched_text = c.$('#sel-sched').textContent;
+  obs.every_airing_box_checked = c.$$('#ch-list .arow-air input[type=checkbox]')
+    .every((b) => b.checked);
+
+  // Untick the showings of one channel that has two: the first untick keeps the channel
+  // (another showing on it is still ticked), the last one lets it go.
+  const byChannel = {};
+  c.$$('#ch-list .arow-air input[type=checkbox]').forEach((b) => {
+    (byChannel[b.dataset.id] = byChannel[b.dataset.id] || []).push(b);
+  });
+  const twin = Object.values(byChannel).find((boxes) => boxes.length >= 2);
+  obs.fixture_has_two_showings_on_one_channel = !!twin;
+  if (twin) {
+    tick(twin[0], false);
+    obs.group_text_after_one_untick = c.$('#sel-group').textContent;
+    obs.sched_text_after_one_untick = c.$('#sel-sched').textContent;
+    obs.twin_sibling_still_checked = twin[1].checked;
+    twin.slice(1).forEach((b) => tick(b, false));
+    obs.group_text_after_all_unticked = c.$('#sel-group').textContent;
+    twin.forEach((b) => tick(b, true));
+  }
+
+  // Schedule selected hands the modal one item per ticked SHOWING, never per channel.
+  const bulkOpened = [];
+  c.window.openBulkScheduleModal = (opts) => bulkOpened.push(opts);
+  c.click(c.$('#sel-sched'));
+  obs.bulk_items = bulkOpened.length ? bulkOpened[0].items : null;
+  obs.bulk_urls = bulkOpened.length
+    ? [bulkOpened[0].previewUrl, bulkOpened[0].scheduleUrl] : null;
 
   // The Record click fetches its context rather than trusting the masked row payload.
   const openedWith = [];

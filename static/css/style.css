@@ -1064,6 +1064,17 @@ body.scroll-locked { position: fixed; left: 0; right: 0; width: 100%; overflow: 
 .fb-tick { flex: 0 0 auto; width: 11px; color: var(--accent-text); }
 .fb-lbl { flex: 1 1 auto; }
 .fb-n { color: var(--text-faint); font-size: var(--fs-xs); }
+/* Saved filters (filter-bar.js opts.saved, dev/changelog/1156). The chip names the saved
+   filter on screen, capped so a long name cannot push the chip row off a phone. */
+.fb-saved-cur { display: inline-block; max-width: 14em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; vertical-align: bottom; }
+.fb-saved-dirty { color: var(--warn); font-weight: 600; }
+.fb-saved-row { display: flex; align-items: center; gap: 6px; min-width: 260px; }
+.menu .fb-saved-row button.menu-item.fb-saved-load { flex: 1 1 auto; min-width: 0; display: flex; align-items: center; gap: 6px; }
+.fb-saved-nm { overflow: hidden; text-overflow: ellipsis; }
+.fb-saved-empty { font-size: var(--fs-sm); color: var(--text-muted); padding: 4px 11px 6px; }
+.fb-saved-foot { display: flex; gap: 6px; padding: 8px 5px 2px; border-top: 1px solid var(--border-soft); margin-top: 5px; }
+.fb-saved-input { flex: 1 1 auto; min-width: 0; font: inherit; font-size: var(--fs-sm); padding: 4px 8px; color: var(--text); background: var(--bg1); border: 1px solid var(--border); border-radius: var(--radius-sm); }
+.fb-saved-err { font-size: var(--fs-xs); color: var(--bad); padding: 6px 11px 0; line-height: 1.4; }
 
 /* ── Dropdown / multi-select (DESIGN.md 15.3), driven by static/js/dropdown.js
       "Open a list, pick from it" is ONE component, so the trigger label, the
@@ -1096,8 +1107,8 @@ body.scroll-locked { position: fixed; left: 0; right: 0; width: 100%; overflow: 
 
 /* ═══ The filename template designer (DESIGN.md 15.1/15.4) ═══════════
    Driven by static/js/filename-designer.js. In style.css rather than in the Settings
-   page's own block because the component is meant to open from more than one host - a
-   Recording Profile's template field is the next one - and a class styled inside one
+   page's own block because the component opens from two hosts - Settings and a Recording
+   Profile's template field (dev/changelog/1161) - and a class styled inside one
    page's <style> may not be reused from another (CLAUDE.md CSS rules).
    Rollout: dev/changelog/441. ─────────────────────────────────────── */
 .fd { display: flex; flex-direction: column; gap: 14px; }
@@ -2128,6 +2139,9 @@ body.actbar-on #app-toast { bottom: 78px; }
    actually overflows a row. */
 .modal-foot { display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 10px; padding: 12px 18px; border-top: 1px solid var(--border-soft); }
 .modal-foot-note { margin-right: auto; font-size: var(--fs-sm); color: var(--text-muted); max-width: 46ch; }
+/* util.js::confirmModal - the names a confirm is about (clashing channels). */
+.confirm-list { margin: 8px 0 12px 1.2rem; padding: 0; font-size: var(--fs-sm); }
+.confirm-list li { margin: 2px 0; overflow-wrap: anywhere; }
 
 /* A modal body waiting on the fetch that will fill it. Deliberately NOT channel-search's
    `.cs-loading`, which is a different thing in two ways: it is scoped to
@@ -2680,6 +2694,15 @@ th.gd-c-part { text-align: center; }
 .pm-poster-meta .btn { margin-top: 8px; }
 .pm-poster-advice { color: var(--warn); }
 .pm-poster-none { font-size: var(--fs-sm); color: var(--text-muted); margin: 8px 0; }
+/* A recording profile's filename template read-out (profile-modal.js): the template and
+   the tag cleanup that travels with it, edited only through the designer step. The
+   template is one long token as often as not, so it wraps anywhere rather than widening
+   the row. */
+.pm-tpl { font-size: var(--fs-sm); color: var(--text-muted); line-height: 1.45; min-width: 0; overflow-wrap: anywhere; }
+.pm-tpl-now code { font-family: var(--font-mono); color: var(--text); }
+.pm-tpl-inherit code { color: var(--text-muted); }
+.pm-tpl-cleanup { margin-top: 2px; }
+.pm-tpl-acts { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
 .gd-field-ctl input[type="file"] { padding: 4px 6px; }
 .gd-field-ctl select:focus, .gd-field-ctl input:focus,
 .gd-field-ctl textarea:focus { outline: none; border-color: var(--accent); }

@@ -235,6 +235,10 @@ def create_app(config_overrides=None, start_scheduler=True):
         # nothing at all on every startup after that (dev/changelog/951).
         from .health_recompute import repair_duplicated_capture_corrections
         repair_duplicated_capture_corrections(cfg)
+        # Migration 83's obligation, for the same reason: it needs the global cleanup lists
+        # from the cfg held here (dev/changelog/1161).
+        from .accounts import backfill_profile_filename_cleanup
+        backfill_profile_filename_cleanup(cfg)
         _ensure_system_health_job()
         if tags_table_is_new:
             _seed_default_tags()

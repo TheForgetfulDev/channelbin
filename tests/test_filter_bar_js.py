@@ -194,5 +194,119 @@ class OnChangeTests(_Base):
         self.assertEqual(self.obs['changes'], 4)
 
 
+
+class _Saved(_Base):
+    """Saved filters (opts.saved) - a named chip combination, loadable, one of which may be
+    the default applied as the page opens (dev/changelog/1156)."""
+
+    def setUp(self):
+        self.s = self.obs['saved']
+        for k in ('errors_a', 'errors_b'):
+            if any(str(e).startswith('threw:') for e in self.s.get(k, [])):
+                self.fail(f'the saved-filter scenario threw: {self.s[k]}')
+
+    def test_neither_saved_page_threw(self):
+        self.assertEqual(self.s['errors_a'], [])
+        self.assertEqual(self.s['errors_b'], [])
+
+
+class SavedFilterSaveTests(_Saved):
+
+    def test_nothing_saved_reads_plain(self):
+        self.assertEqual(self.s['empty']['chip'], 'Saved \u25be')
+        self.assertIn('Nothing saved yet', self.s['empty']['menu'])
+
+    def test_an_empty_selection_or_an_empty_name_writes_nothing(self):
+        """A saved filter with no chips is the unfiltered page under a name that promises
+        otherwise; a nameless one cannot be picked out of the list."""
+        self.assertEqual(self.s['save_nothing']['posts'], 0)
+        self.assertEqual(self.s['save_nothing']['toasts'][-1][0], 'error')
+        self.assertEqual(self.s['save_unnamed']['posts'], 0)
+        self.assertEqual(self.s['save_unnamed']['toasts'][-1],
+                         ['error', 'Give the filter a name first.'])
+
+    def test_save_stores_the_chips_on_screen_and_names_them_on_the_chip(self):
+        self.assertEqual(self.s['saved']['lastPost']['url'], '/api/user-prefs/test_saved')
+        self.assertEqual(self.s['saved']['lastPost']['body']['value'],
+                         [{'name': 'Failures', 'filters': [['status', 'FAIL']], 'is_default': False}])
+        self.assertEqual(self.s['saved']['chip'], 'Saved: Failures \u25be')
+
+    def test_changing_the_chips_marks_it_edited(self):
+        """Derived from the chips, not a flag - so adding a value is enough to show it."""
+        self.assertEqual(self.s['edited']['chip'], 'Saved: Failures (edited) \u25be')
+
+    def test_saving_under_the_same_name_overwrites_and_says_so(self):
+        self.assertEqual(self.s['overwritten']['saved'], ['Failures'])
+        self.assertEqual(self.s['overwritten']['lastPost']['body']['value'][0]['filters'],
+                         [['status', 'FAIL'], ['status', 'WARN']])
+        self.assertEqual(self.s['overwritten']['toasts'][-1], ['success', 'Updated "Failures".'])
+        self.assertEqual(self.s['overwritten']['chip'], 'Saved: Failures \u25be')
+
+
+class SavedFilterLoadTests(_Saved):
+
+    def test_loading_replaces_the_chips_with_the_saved_ones(self):
+        """Account: 1 was on the bar before the load; it must not survive into it."""
+        self.assertEqual(self.s['loaded']['chips'], ['Status: FAIL \u2715', 'Status: WARN \u2715'])
+        self.assertEqual(self.s['loaded']['rows'], ['c', 'd'])
+        self.assertEqual(self.s['loaded']['chip'], 'Saved: Failures \u25be')
+
+    def test_loading_is_an_action_and_closes_the_popover(self):
+        self.assertFalse(self.s['loaded']['open'])
+
+
+class SavedFilterDefaultTests(_Saved):
+
+    def test_set_default_marks_exactly_one_and_keeps_the_popover_open(self):
+        self.assertEqual([r['is_default'] for r in self.s['default_one']['lastPost']['body']['value']],
+                         [False, True])
+        self.assertTrue(self.s['default_one']['stillOpen'])
+
+    def test_setting_another_moves_the_default(self):
+        self.assertEqual([r['is_default'] for r in self.s['default_moved']['lastPost']['body']['value']],
+                         [True, False])
+
+    def test_clear_default_leaves_none(self):
+        self.assertEqual([r['is_default'] for r in self.s['default_cleared']['lastPost']['body']['value']],
+                         [False, False])
+
+    def test_the_default_is_on_the_bar_when_it_is_built(self):
+        self.assertEqual(self.s['boot_default']['chips'],
+                         ['Status: PASS \u2715', 'Account: Account 2 \u2715'])
+        self.assertEqual(self.s['boot_default']['rows'], ['b'])
+
+    def test_a_saved_value_nothing_carries_is_dropped_and_named(self):
+        """Dropping it is DESIGN.md 3.11; saying so is what stops a saved filter quietly
+        showing more than its name promises."""
+        kind, msg = self.s['boot_default']['toasts'][-1]
+        self.assertEqual(kind, 'warning')
+        self.assertIn('Status: GONE', msg)
+        self.assertIn('"Pass on 2"', msg)
+        self.assertEqual(self.s['boot_default']['chip'], 'Saved: Pass on 2 (edited) \u25be')
+
+    def test_malformed_records_are_skipped_and_only_one_default_survives(self):
+        self.assertEqual(self.s['boot_default']['saved'], ['Pass on 2 default', 'Second default'])
+        self.assertEqual(self.s['boot_default']['badges'], 1)
+
+    def test_building_the_bar_writes_nothing(self):
+        self.assertEqual(self.s['boot_default']['posts'], 0)
+
+
+class SavedFilterFailureTests(_Saved):
+
+    def test_a_failed_write_is_undone_on_screen_and_the_popover_says_so(self):
+        self.assertEqual(self.s['delete_pending']['saved'], ['Failures'])
+        self.assertEqual(self.s['delete_failed']['saved'], ['Failures', 'Account one'])
+        self.assertIn('not saved', self.s['delete_failed']['err'])
+        self.assertEqual(self.s['delete_failed']['toasts'][-1][0], 'error')
+
+    def test_the_next_good_write_clears_the_error(self):
+        self.assertEqual(self.s['deleted']['err'], '')
+
+    def test_deleting_the_one_on_screen_stops_the_chip_naming_it(self):
+        self.assertEqual(self.s['deleted']['saved'], ['Account one'])
+        self.assertEqual(self.s['deleted']['chip'], 'Saved \u25be')
+
+
 if __name__ == '__main__':
     unittest.main()

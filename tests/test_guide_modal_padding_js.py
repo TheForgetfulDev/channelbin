@@ -160,3 +160,45 @@ class ReopenClearsEditFlagTests(_Base):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class ProfileChangeRenamesTests(_Base):
+    """A profile carries its own filename template and tag cleanup, so picking one in a
+    new-recording modal re-asks the server for the name, as it re-pads the times
+    (dev/changelog/1161)."""
+    SCENARIO = 'profile_change_renames'
+
+    def test_opens_with_the_server_rendered_name_and_asks_nothing(self):
+        self.assertEqual(self.obs['opened'], 'Test Program')
+
+    def test_picking_a_profile_renames_with_it(self):
+        self.assertEqual(self.obs['afterPick'], 'Renamed for 1')
+
+    def test_no_profile_asks_for_the_global_naming(self):
+        self.assertEqual(self.obs['afterNone'], 'Renamed for null')
+
+    def test_the_request_carries_the_showing(self):
+        first = self.obs['requests'][0]
+        self.assertEqual(first['profile_id'], '1')
+        self.assertEqual(first['title'], 'Test Program')
+        self.assertEqual(first['sub_title'], 'Pilot')
+        self.assertEqual(first['category'], 'Drama')
+        self.assertEqual(first['channel_name'], 'Chan')
+        self.assertEqual(first['start_time'], '2026-08-10T20:00:00')
+        self.assertIsNone(self.obs['requests'][1]['profile_id'])
+
+
+class TypedNameSurvivesTests(_Base):
+    SCENARIO = 'typed_name_survives_profile_change'
+
+    def test_a_typed_name_is_kept_and_not_even_asked_about(self):
+        self.assertEqual(self.obs['name'], 'My own name')
+        self.assertEqual(self.obs['requests'], [])
+
+
+class EditDoesNotRenameTests(_Base):
+    SCENARIO = 'edit_does_not_rename'
+
+    def test_a_scheduled_recordings_name_is_left_alone(self):
+        self.assertEqual(self.obs['name'], 'Stored name')
+        self.assertEqual(self.obs['requests'], [])

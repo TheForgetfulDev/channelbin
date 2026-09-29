@@ -37,9 +37,10 @@ class BuildJobListRunNowGatingTests(unittest.TestCase):
     """_build_job_list() must only attach run_url to jobs run_job_now() actually
     implements, and must explain itself for the rest rather than staying silent."""
 
+    # recording_retention_daily, db_maintenance_daily and logo_cache_fetch gained a real
+    # Run Now in dev/changelog/1159 (tests/test_jobs_system_run_now_and_side_jobs.py).
     UNSUPPORTED = (
-        'hc_window_dispatch', 'hc_window_close', 'recording_retention_daily',
-        'db_maintenance_daily', 'logo_cache_fetch',
+        'hc_window_dispatch', 'hc_window_close', 'search_index_janitor',
     )
 
     def setUp(self):
@@ -52,6 +53,10 @@ class BuildJobListRunNowGatingTests(unittest.TestCase):
     def _items_by_id(self):
         from app.routes.jobs import _build_job_list
         return {i['id']: i for i in _build_job_list()}
+
+    def test_logo_cache_fetch_has_a_working_run_url(self):
+        item = self._items_by_id()['logo_cache_fetch']
+        self.assertEqual(item['run_url'], '/api/jobs/logo_cache_fetch/run-now')
 
     def test_config_backup_daily_keeps_a_working_run_url(self):
         item = self._items_by_id()['config_backup_daily']
@@ -70,7 +75,8 @@ class BuildJobListRunNowGatingTests(unittest.TestCase):
         for job_id in self.UNSUPPORTED:
             reason = items[job_id].get('run_disabled_reason')
             self.assertTrue(reason, f'{job_id} must explain why Run Now is unavailable')
-            self.assertIn('not supported yet', reason)
+            # Its own explanation, not the generic fallback for a job nobody wrote one for.
+            self.assertNotIn('not supported yet', reason)
 
     def test_dispatch_reason_names_the_configured_interval(self):
         """The interval in the toast must reflect the real config value, not a hardcoded

@@ -288,7 +288,7 @@ def stop_preview_sessions():
     """
     import app.preview as preview
 
-    session = preview.live_session()
+    session = preview.live_session(None)
     if session is None:
         preview.wait_for_reaper(_TEARDOWN_DRAIN_SECONDS)
         return None

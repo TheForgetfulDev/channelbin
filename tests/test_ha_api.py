@@ -126,10 +126,12 @@ class StatusEndpointShapeTests(_StatusFixture):
     def test_capturing_lists_each_in_progress_recording(self):
         """dev/changelog/1146: Home Assistant could see that something was capturing but
         never which recording. The list mirrors next_recording's fields, naive UTC on the
-        wire, and carries only IN_PROGRESS rows - never a converting or scheduled one."""
-        acc = make_account()
+        wire, and carries only IN_PROGRESS rows - never a converting or scheduled one. Each
+        entry names the account its channel is on (dev/changelog/1154)."""
+        acc = make_account(name='Main')
+        other = make_account(name='Backup')
         news = make_channel(acc, name='News HD')
-        sports = make_channel(acc, name='Sports 1')
+        sports = make_channel(other, name='Sports 1')
         now = datetime.utcnow().replace(microsecond=0)
         first = make_recording(status='IN_PROGRESS', name='Morning News', channel_id=news.id,
                                start_time=now - timedelta(minutes=30),
@@ -147,9 +149,11 @@ class StatusEndpointShapeTests(_StatusFixture):
         rec = self._get()['recording']
         self.assertEqual(rec['capturing'], [
             {'id': first.id, 'name': 'Morning News', 'channel': 'News HD',
+             'account_id': acc.id, 'account': 'Main',
              'started_at': first.started_at.isoformat(),
              'stop_time': first.stop_time.isoformat()},
             {'id': second.id, 'name': 'The Match', 'channel': 'Sports 1',
+             'account_id': other.id, 'account': 'Backup',
              'started_at': second.started_at.isoformat(),
              'stop_time': second.stop_time.isoformat()},
         ])
@@ -161,7 +165,24 @@ class StatusEndpointShapeTests(_StatusFixture):
 
         (entry,) = self._get()['recording']['capturing']
         self.assertIsNone(entry['channel'])
+        self.assertIsNone(entry['account_id'])
+        self.assertIsNone(entry['account'])
         self.assertIsNone(entry['started_at'])
+
+    def test_capturing_account_follows_a_failover(self):
+        """Failover moves Recording.channel_id to the member now serving, so the account
+        reported is the one the stream is on now, not the one the recording started on
+        (dev/changelog/1154)."""
+        first_acc, second_acc = make_account(name='First'), make_account(name='Second')
+        start_ch = make_channel(first_acc, name='Feed A')
+        moved_ch = make_channel(second_acc, name='Feed B')
+        rec = make_recording(status='IN_PROGRESS', name='Game', channel_id=start_ch.id)
+        db.session.commit()
+        rec.channel_id = moved_ch.id
+        db.session.commit()
+
+        (entry,) = self._get()['recording']['capturing']
+        self.assertEqual((entry['account_id'], entry['account']), (second_acc.id, 'Second'))
 
     def test_nothing_capturing_is_an_empty_list(self):
         rec = self._get()['recording']

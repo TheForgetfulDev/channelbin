@@ -448,7 +448,11 @@ def _seed_recording_profiles(n):
     acc = seed.make_account(name='Profile Scaling Account')
     base = datetime.utcnow() - timedelta(days=1)
     for i in range(n):
-        p = RecordingProfile(name=f'Scaling Profile {i}', pre_padding_minutes=i % 5)
+        # Half carry their own template and tag cleanup, which the row reads back through
+        # accounts.profile_tag_cleanup() - a pure parse of the row, never a query.
+        p = RecordingProfile(name=f'Scaling Profile {i}', pre_padding_minutes=i % 5,
+                             filename_template='{title}' if i % 2 else None,
+                             filename_tags_remove='["live"]' if i % 2 else None)
         db.session.add(p)
         db.session.flush()
         seed.make_channel(acc, name=f'Profile Channel {i}', default_profile_id=p.id)
@@ -780,8 +784,13 @@ class PageScalingTests(unittest.TestCase):
         a test that edited the real file to exercise this would be writing into
         production - which is exactly how this was found.
         """
-        with mock.patch.object(rows_mod, '_tag_cleanup',
-                               return_value=[('live', 'remove'), ('new', 'replace')]):
+        cleanup = [('live', 'remove'), ('new', 'replace')]
+        # The naming is resolved per channel as a (template, cleanup) pair
+        # (dev/changelog/1161); every channel gets a non-empty cleanup list here.
+        with mock.patch.object(
+                rows_mod, '_filename_namings',
+                side_effect=lambda channels, ctx: {c.id: ('{title} {tag:live}', cleanup)
+                                                   for c in channels}):
             self._assert_row_independent(_seed_search_channels,
                                          '/api/channels/search?grain=airings&facets=')
 

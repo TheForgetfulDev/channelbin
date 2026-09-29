@@ -9,6 +9,7 @@ APScheduler integration.
 import logging
 import os
 import re
+import threading
 from datetime import datetime, timedelta
 
 from sqlalchemy import create_engine
@@ -2641,6 +2642,59 @@ def _account_stats_fold_job():
             return
         if notice:
             log.info('Account stats ledger: %s', notice['text'])
+
+
+# Run Now on /jobs for the system jobs (dev/changelog/1159). The two that do bulk database
+# work ask admission in the request, so a refusal reaches the person who clicked instead of
+# becoming the scheduled path's quiet defer-and-retry; the rest are cheap and already
+# admission-routed (or need no ticket) inside their own job body.
+_RUN_NOW_ADMITTED = {
+    'recording_retention_daily': ('recording retention', _recording_retention_sweep),
+    'db_maintenance_daily': ('database maintenance', _db_maintenance_sweep),
+}
+_RUN_NOW_PLAIN = {
+    'logo_cache_fetch': _logo_cache_job,
+    'storage_dirs_check': _storage_dirs_job,
+    'account_stats_fold': _account_stats_fold_job,
+}
+RUN_NOW_SYSTEM_JOBS = frozenset(_RUN_NOW_ADMITTED) | frozenset(_RUN_NOW_PLAIN)
+
+
+def run_system_job_now(job_id: str):
+    """Start one of RUN_NOW_SYSTEM_JOBS on a background thread, outside its schedule.
+
+    Returns None when it started, or the `admission.Refusal` naming what holds the axis.
+    Leaves the job's own next run alone - skipping that is the page's separate request."""
+    if job_id in _RUN_NOW_ADMITTED:
+        label, sweep = _RUN_NOW_ADMITTED[job_id]
+        ticket = admission.try_start(admission.KIND_MAINTENANCE, f'{label} (run now)')
+        if not ticket.granted:
+            return ticket
+
+        def _run():
+            try:
+                sweep()
+            except Exception:
+                log.exception('Run now of %s failed', job_id)
+            finally:
+                admission.release(ticket)
+    else:
+        job_func = _RUN_NOW_PLAIN[job_id]
+        ticket = None
+
+        def _run():
+            try:
+                job_func()
+            except Exception:
+                log.exception('Run now of %s failed', job_id)
+
+    log.info('Run now: %s', job_id)
+    try:
+        threading.Thread(target=_run, name=f'run-now-{job_id}', daemon=True).start()
+    except Exception:
+        admission.release(ticket)
+        raise
+    return None
 
 
 def get_scheduler() -> BackgroundScheduler:

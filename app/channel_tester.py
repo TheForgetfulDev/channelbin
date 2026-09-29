@@ -266,6 +266,41 @@ def is_running() -> bool:
         return _state.is_running
 
 
+def health_check_signature() -> dict:
+    """{'sig', 'busy'}: a short string that changes whenever a page showing test results
+    could have gone stale, plus whether the tester is running. /api/nav-status carries it,
+    and the Groups list and the Channel page render the one they were read at, so each
+    knows when to swap in a fresh render (dev/changelog/1158).
+
+    One part per way a result lands, because each is invisible to the others:
+      run_started_at, is_running  a run starting or ending - a health check, a one-off
+                                  Test now or a pre-recording check alike
+      completed_channels          a channel finishing mid-run; it moves after that
+                                  channel's test row is written, so a render made after it
+                                  holds the result
+      current_channel_id          the next channel starting, before its row exists
+      max(ChannelTest.id)         a test row being created
+      RUNNING job ids             a check's own status, written just after the tester
+                                  starts and just before it stops - without it a render in
+                                  either gap shows the wrong chip and nothing moves after
+    Two in-memory reads and two small queries (a primary-key max and a scan of the
+    one-per-group jobs table), on every nav poll of every page."""
+    from . import db
+    from sqlalchemy import func
+    from .database import ChannelTest, OnDemandTestJob, OD_JOB_STATUS_RUNNING
+    with _lock:
+        s = _state
+        busy = s.is_running
+        run = (s.run_started_at.isoformat() if s.run_started_at else '',
+               int(s.is_running), s.completed_channels, s.current_channel_id or '')
+    latest_test = db.session.query(func.max(ChannelTest.id)).scalar() or 0
+    running_jobs = [job_id for (job_id,) in db.session.query(OnDemandTestJob.id)
+                    .filter(OnDemandTestJob.status == OD_JOB_STATUS_RUNNING)
+                    .order_by(OnDemandTestJob.id)]
+    sig = '|'.join(str(p) for p in (*run, latest_test, ','.join(map(str, running_jobs))))
+    return {'sig': sig, 'busy': busy}
+
+
 def request_stop():
     with _lock:
         _state.stop_requested = True

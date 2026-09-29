@@ -20,11 +20,26 @@ from ..tz_utils import to_naive_utc, is_24h, format_local, relative
 jobs_bp = Blueprint('jobs', __name__)
 
 # Recurring jobs (other than the account_sync_<id> and od_job_<id> families, which are
-# matched and handled separately) that run_job_now() actually implements. Anything not in
-# this set gets a greyed-out, still-clickable Run Now item explaining why - see
+# matched and handled separately) that run_job_now() actually implements: config backup,
+# which it runs inline, plus scheduler.RUN_NOW_SYSTEM_JOBS (dev/changelog/1159). Anything
+# else gets a greyed-out, still-clickable Run Now item explaining why - see
 # _RUN_NOW_REASONS in _build_job_list() - instead of a button that promises an action the
 # backend will 400 on (dev/changelog/613).
-_RUN_NOW_SUPPORTED_JOBS = frozenset({'config_backup_daily'})
+def _run_now_supported_jobs() -> frozenset:
+    from ..scheduler import RUN_NOW_SYSTEM_JOBS
+    return RUN_NOW_SYSTEM_JOBS | {'config_backup_daily'}
+
+
+# The one-shot jobs a single recording arms besides its start/stop pair
+# (app/scheduler.py). Each is a detail of that recording's row, not a row of its own:
+# every scheduled recording has a pre-check, so a row apiece would double the page and
+# mark each recording as overlapping its own start. The value is the line shown on the
+# recording's row, and the statuses its row is rendered for.
+_RECORDING_SIDE_JOBS = {
+    'precheck': ('pre-recording check', 'Pre-recording check'),
+    'retry': ('dead-stream retry', 'Dead-stream retry'),
+    'resume': ('resumes', 'Resume'),
+}
 
 
 def _fmt_et(dt_utc: datetime) -> str:
@@ -159,9 +174,14 @@ def _build_job_list():
     # Separate recording start/stop jobs from others
     start_ids: dict[int, object] = {}  # recording_id → job
     stop_ids: dict[int, object] = {}
+    side_jobs: list = []  # (kind, recording_id, job) - see _RECORDING_SIDE_JOBS
     other_jobs: list = []
 
     for job in raw_jobs:
+        m = re.match(r'^(precheck|retry|resume)_(\d+)$', job.id)
+        if m:
+            side_jobs.append((m.group(1), int(m.group(2)), job))
+            continue
         m = re.match(r'^start_(\d+)$', job.id)
         if m:
             start_ids[int(m.group(1))] = job
@@ -177,7 +197,7 @@ def _build_job_list():
     # and one per account sync job (dev/docs/BUGS.md 2026-08-18). A missing id is a normal
     # state here, not an error: an APScheduler job can outlive the row it names, which is
     # exactly what the `Recording #<id>` / `Account <id>` fallback labels below are for.
-    rec_ids = set(start_ids) | set(stop_ids)
+    rec_ids = set(start_ids) | set(stop_ids) | {rid for _k, rid, _j in side_jobs}
     recordings = ({r.id: r for r in Recording.query.filter(Recording.id.in_(rec_ids)).all()}
                   if rec_ids else {})
     account_ids = {int(m.group(1)) for m in
@@ -262,6 +282,46 @@ def _build_job_list():
             'stop_run_et': _fmt_et(stop_run_utc),
             'schedule_description': None,
             'edit_url': f'/recordings/{rec_id}',
+            'overlap': 'green',
+        })
+
+    # A recording's side jobs: a line on its row, or - when that row is not on the page, e.g.
+    # a retry armed for a recording whose stop job is gone - a one-off row of their own,
+    # named, since the catch-all below would render a raw id as a skippable recurring job.
+    rows_by_rec = {}
+    for item in items:
+        m = re.match(r'^(?:start|active)_(\d+)$', item['id'])
+        if m:
+            rows_by_rec[int(m.group(1))] = item
+    for kind, rec_id, job in sorted(side_jobs, key=lambda t: t[0]):
+        if job.next_run_time is None:
+            continue
+        run_utc = to_naive_utc(job.next_run_time)
+        line_label, row_label = _RECORDING_SIDE_JOBS[kind]
+        parent = rows_by_rec.get(rec_id)
+        if parent is not None:
+            parent.setdefault('pending_lines', []).append(f'{line_label} {_fmt_et(run_utc)}')
+            continue
+        rec = recordings.get(rec_id)
+        if rec is not None and rec.status not in (
+                REC_STATUS_SCHEDULED, REC_STATUS_IN_PROGRESS, REC_STATUS_PAUSED,
+                REC_STATUS_RETRYING):
+            continue  # orphaned, same as the start/stop rows above
+        name = rec.name if rec else f'Recording #{rec_id}'
+        items.append({
+            '_start_utc': run_utc,
+            '_end_utc': run_utc,
+            '_next_run_utc': run_utc,
+            'id': job.id,
+            'display_name': f'{row_label}: {name}',
+            'type': 'one_off',
+            'next_run_utc': run_utc.isoformat(),
+            'next_run_et': _fmt_et(run_utc),
+            'next_run_relative': _relative(run_utc),
+            'stop_run_et': None,
+            'schedule_description': None,
+            'edit_url': f'/recordings/{rec_id}',
+            'edit_label': 'Edit',
             'overlap': 'green',
         })
 
@@ -375,7 +435,7 @@ def _build_job_list():
     }
 
     # Explains, per job, what it does and why Run Now isn't offered - shown in the greyed
-    # Run Now item's toast for anything not in _RUN_NOW_SUPPORTED_JOBS. dispatch_minutes is
+    # Run Now item's toast for anything not in _run_now_supported_jobs(). dispatch_minutes is
     # read from the same ct_cfg already loaded above rather than a second load_config() call.
     dispatch_minutes = ct_cfg.get('window', {}).get('dispatch_interval_minutes', 5)
     _RUN_NOW_REASONS = {
@@ -383,43 +443,23 @@ def _build_job_list():
             'Maintenance Window Dispatch starts the next due health check inside your '
             f'configured maintenance window, checking every {dispatch_minutes} minute'
             f'{"s" if dispatch_minutes != 1 else ""} '
-            '(channel_testing.window.dispatch_interval_minutes). Running it on demand is '
-            'not supported yet.'
+            '(channel_testing.window.dispatch_interval_minutes). Run now is not offered: '
+            'outside the window it does nothing, and inside it the next check is at most '
+            'one interval away.'
         ),
         'hc_window_close': (
             'Maintenance Window Close hard-stops any health checks still running when the '
-            'maintenance window ends, and reports what was left over. Running it on demand '
-            'is not supported yet.'
-        ),
-        'recording_retention_daily': (
-            'Recording Retention deletes recordings (and, if enabled, their files) past '
-            'their configured retention window. Running it on demand is not supported yet.'
-        ),
-        'db_maintenance_daily': (
-            'Database Maintenance prunes dismissed alerts and old EPG entries, and checks '
-            'the write-ahead log. Running it on demand is not supported yet.'
-        ),
-        'logo_cache_fetch': (
-            'Logo Cache Fetch refreshes cached channel logos in small batches. Running it '
-            'on demand is not supported yet.'
+            'maintenance window ends, and reports what was left over. Run now is not '
+            'offered, because running it by hand would stop checks that are mid-run.'
         ),
         'search_index_janitor': (
             'Search Index Janitor rebuilds a search index that has been unusable for longer '
             'than its grace window with nothing else repairing it. To rebuild right now, use '
             'Maintenance -> Search index -> Rebuild now.'
         ),
-        'storage_dirs_check': (
-            'Storage Folder Check makes sure every folder ChannelBin writes to is still '
-            'there and writable, and raises or clears an alert for each one. The same '
-            'answer is in the Readiness check on Maintenance.'
-        ),
-        'account_stats_fold': (
-            'Account Stats Update adds newly finished recordings, health checks and '
-            'failovers to the per-account usage numbers. The Accounts pages do the same '
-            'every time they load, so opening one is the way to run it now.'
-        ),
     }
 
+    run_now_supported = _run_now_supported_jobs()
     for job in other_jobs:
         next_run = job.next_run_time
         if next_run is None:
@@ -570,7 +610,7 @@ def _build_job_list():
             'runs': runs,
             'duration_line': duration_line,
         }
-        if job.id in _RUN_NOW_SUPPORTED_JOBS:
+        if job.id in run_now_supported:
             item['run_url'] = f'/api/jobs/{job.id}/run-now'
         else:
             item['run_disabled_reason'] = _RUN_NOW_REASONS.get(
@@ -742,6 +782,13 @@ def run_job_now(job_id):
         from ..accounts import start_source_refresh
         started, message = start_source_refresh(app_obj, int(m.group(1)))
         return jsonify({'success': True, 'refresh_started': started, 'message': message})
+
+    from ..scheduler import RUN_NOW_SYSTEM_JOBS, run_system_job_now
+    if job_id in RUN_NOW_SYSTEM_JOBS:
+        refusal = run_system_job_now(job_id)
+        if refusal is not None:
+            return jsonify({'error': f'Not started: {refusal.reason}'}), 409
+        return jsonify({'success': True, 'message': 'Started'})
 
     if job_id == 'config_backup_daily':
         from ..config_backup import do_backup

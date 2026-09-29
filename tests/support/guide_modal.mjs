@@ -32,9 +32,17 @@ function boot() {
   vc.on('jsdomError', (e) => errors.push(`jsdomError: ${e.message}`));
   vc.on('error', (...a) => errors.push(`console.error: ${a.join(' ')}`));
 
-  const fetchStub = (target) => {
+  const nameRequests = [];
+  const fetchStub = (target, init) => {
     const href = String(target);
-    const payload = href.includes('/api/guide/epg') ? { channels: [] } : [];
+    let payload = href.includes('/api/guide/epg') ? { channels: [] } : [];
+    // The record modal's rename for a picked profile (dev/changelog/1161): answered with a
+    // name that says which profile asked, so a stale or wrong answer is visible.
+    if (href.includes('/api/guide/suggested-name')) {
+      const body = JSON.parse(init.body);
+      nameRequests.push(body);
+      payload = { success: true, name: `Renamed for ${body.profile_id}` };
+    }
     return Promise.resolve({
       ok: true,
       status: 200,
@@ -86,7 +94,9 @@ function boot() {
   const change = (el, v) => { el.value = v; el.dispatchEvent(new window.Event('change', { bubbles: true })); };
 
   return {
-    window, document, errors, $,
+    window, document, errors, $, nameRequests,
+    typeName: (v) => type($('#modal-name'), v),
+    nameValue: () => $('#modal-name').value,
     openModal: (prog, ch) => window.openModal(prog, ch),
     typeStart: (v) => type($('#modal-start'), v),
     typeStop: (v) => type($('#modal-stop'), v),
@@ -176,6 +186,47 @@ await record('reopen_clears_edit_flag', async () => {
     afterFirstEdit,
     reopenedStart: c.startValue(),
   };
+});
+
+const settle = (w) => new Promise((r) => w.setTimeout(r, 0));
+
+/* ── Picking a profile renames the showing with that profile's naming ───────────────── */
+await record('profile_change_renames', async () => {
+  const c = boot();
+  c.openModal({ ...PROG, sub_title: 'Pilot', category: 'Drama', channel_name: 'Chan' }, CH);
+  const opened = c.nameValue();
+  c.selectProfile('1');
+  await settle(c.window);
+  await settle(c.window);
+  const afterPick = c.nameValue();
+  c.selectProfile('');
+  await settle(c.window);
+  await settle(c.window);
+  return { errors: c.errors, opened, afterPick, afterNone: c.nameValue(),
+           requests: c.nameRequests };
+});
+
+/* ── A typed name is the user's: a later profile pick leaves it alone ─────────────────── */
+await record('typed_name_survives_profile_change', async () => {
+  const c = boot();
+  c.openModal(PROG, CH);
+  c.typeName('My own name');
+  c.selectProfile('1');
+  await settle(c.window);
+  await settle(c.window);
+  return { errors: c.errors, name: c.nameValue(), requests: c.nameRequests };
+});
+
+/* ── Editing a scheduled recording never renames it ──────────────────────────────────── */
+await record('edit_does_not_rename', async () => {
+  const c = boot();
+  c.openModal({ ...PROG, has_recording: true, recording_id: 77, recording_status: 'SCHEDULED',
+                recording_start_time: PROG.start_time, recording_stop_time: PROG.stop_time,
+                recording_profile_id: null, suggested_name: 'Stored name' }, CH);
+  c.selectProfile('1');
+  await settle(c.window);
+  await settle(c.window);
+  return { errors: c.errors, name: c.nameValue(), requests: c.nameRequests };
 });
 
 console.log(JSON.stringify(out));

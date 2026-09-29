@@ -137,6 +137,12 @@ _BF_ANALYSIS_COMPLETED = 'm057.analysis_completed_at'
 #: an interrupted repair is retried rather than inferred complete (dev/changelog/951).
 _BF_DUPLICATE_CAPTURE_CORRECTIONS = 'm057.duplicate_capture_corrections'
 _BF_EPG_SOURCES = 'm072.epg_sources'
+#: The global tag-cleanup lists copied onto every profile that already set its own template,
+#: so no existing profile's filenames change the moment its cleanup stops being the global
+#: one. The lists live in config.yaml, which a migration step has no business reading, so
+#: accounts.backfill_profile_filename_cleanup() discharges it from create_app() with the cfg
+#: create_app() already holds (dev/changelog/1161).
+_BF_PROFILE_FILENAME_CLEANUP = 'm083.profile_filename_cleanup'
 
 
 def _register_backfill(conn, cur, name: str):
@@ -2758,6 +2764,35 @@ def _m080_start_deferred(conn, cur):
     conn.commit()
 
 
+def _m082_channel_screenshot_captured_at(conn, cur):
+    """channels: screenshot_captured_at - when "Capture screenshot" last saved a frame of
+    the channel (dev/changelog/1160).
+
+    No backfill: NULL means "none taken", which is true of every channel before the action
+    existed."""
+    cols = [r[1] for r in cur.execute('PRAGMA table_info(channels)').fetchall()]
+    if 'screenshot_captured_at' not in cols:
+        cur.execute('ALTER TABLE channels ADD COLUMN screenshot_captured_at DATETIME')
+    conn.commit()
+
+
+def _m083_profile_filename_cleanup(conn, cur):
+    """recording_profiles: filename_tags_remove / filename_tags_replace - a profile's own
+    tag-cleanup lists, saved with its template (dev/changelog/1161).
+
+    The obligation is registered BEFORE the ALTER, so the only crash state is "owed, no
+    column yet" (dev/changelog/686). Its discharge needs the global lists from config.yaml
+    and runs from create_app(); see _BF_PROFILE_FILENAME_CLEANUP."""
+    cols = [r[1] for r in cur.execute('PRAGMA table_info(recording_profiles)').fetchall()]
+    if 'filename_tags_remove' not in cols or 'filename_tags_replace' not in cols:
+        _register_backfill(conn, cur, _BF_PROFILE_FILENAME_CLEANUP)
+    if 'filename_tags_remove' not in cols:
+        cur.execute('ALTER TABLE recording_profiles ADD COLUMN filename_tags_remove TEXT')
+    if 'filename_tags_replace' not in cols:
+        cur.execute('ALTER TABLE recording_profiles ADD COLUMN filename_tags_replace TEXT')
+    conn.commit()
+
+
 def _m081_account_blocks(conn, cur):
     """account_blocks: the stretches of time the user has told ChannelBin to keep off an
     account (app/account_blocks.py, dev/changelog/1151).
@@ -2949,6 +2984,10 @@ SCHEMA_MIGRATIONS = [
      'for', _m080_start_deferred),
     (81, 'account_blocks: time windows the user keeps ChannelBin off an account',
      _m081_account_blocks),
+    (82, 'channels: screenshot_captured_at, when "Capture screenshot" last saved a frame',
+     _m082_channel_screenshot_captured_at),
+    (83, 'recording_profiles: filename_tags_remove/_replace, a profile\'s own tag cleanup '
+     'saved with its template', _m083_profile_filename_cleanup),
 ]
 
 CURRENT_SCHEMA_VERSION = SCHEMA_MIGRATIONS[-1][0]

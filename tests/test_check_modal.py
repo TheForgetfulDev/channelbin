@@ -130,11 +130,14 @@ class PagePayloadTests(_Base):
         the profile list, the schedule-picker template and the script - for a pill and a
         kebab item that created a second check on a group that already had one, which
         the route answers with a 409. Nothing on this page opens it now, so shipping any
-        of that is dead weight and an invitation to wire it back up."""
+        of that is dead weight and an invitation to wire it back up. The busy flag the
+        modal read went too; the list follows the tester through nav-status instead
+        (dev/changelog/1158)."""
         self._profile(name='Thorough', test_duration_seconds=300)
         self._group()
         html = self.client.get('/channel-groups').get_data(as_text=True)
-        self.assertIn('testerBusy:', html)
+        self.assertIn('GROUPS_CONFIG', html)
+        self.assertNotIn('testerBusy:', html)
         self.assertNotIn('checkProfiles:', html)
         self.assertNotIn('cc-schedule-fields', html)
         self.assertNotIn('check-modal.js', html)

@@ -281,11 +281,19 @@
      means the server sent no reason, and the fallback wording below stands in. */
   let declinedWhy = '';
   const selected = new Map();                // channel id -> { name, logo_url }
+  /* The SHOWINGS ticked on the airing grain - airing id -> what scheduling it needs.
+     Kept beside `selected`, never instead of it: ticking a showing also selects its
+     channel, so every channel action on the bar still reads `selected`, and unticking
+     the last showing on a channel lets the channel go (setAiringSelected). Scheduling is
+     the one action that reads this map (dev/changelog/1157). Cleared when the grain is
+     left, since no channel-grain row can show which of a channel's showings were ticked. */
+  const selectedAirings = new Map();
 
   /* ── One row, two shapes ─────────────────────────────────────────────
-     THE SELECTION IS ALWAYS A SET OF CHANNELS, on both grains: all three things you
-     can do with a selection (test, add to guide, group) are things you do to a
-     channel, and several showings of one program on one channel are ONE selection.
+     THE CHANNEL ACTIONS ALWAYS ACT ON A SET OF CHANNELS, on both grains: test, add to
+     guide, group and hide are things you do to a channel, and several showings of one
+     program on one channel are ONE channel. On the airing grain the tick itself selects
+     the SHOWING (selectedAirings) and carries its channel into `selected`.
 
      So everything that asks "which channel is this row about" goes through
      rowChannel(), and everything that asks "which channels are on this page" goes
@@ -547,6 +555,9 @@
        grain's vocabulary, so the remap below could never fire. */
     const hadSort = state.sort;
     state.grain = g;
+    // The ticked SHOWINGS stay behind; the channels they carried into `selected` go along,
+    // exactly as a channel selection always has.
+    if (from === GRAIN_AIRINGS) selectedAirings.clear();
 
     // Park what the grain being LEFT owns and this one cannot express.
     const leaving = state.filters.filter((f) => !dimInGrain(f.key, g));
@@ -1856,11 +1867,14 @@
         `Matched on the CHANNEL's ${row.why.label}, not on anything in this program.`)}">${esc(row.why.label)}</span>`
     : '');
 
+  const AIRING_TICK_TIP = 'Selects this showing, for Schedule selected. The channel actions on '
+    + 'the bar act on its channel - several showings on one channel are one channel there.';
+
   function airingRowHtml(row) {
     const ch = row.channel;
     const cells = [
-      `<div><input type="checkbox" data-air="${row.id}" data-id="${ch.id}"${selected.has(ch.id) ? ' checked' : ''}
-         data-tip="Selecting a showing selects its CHANNEL - several showings on one channel are one selection."></div>`,
+      `<div><input type="checkbox" data-air="${row.id}" data-id="${ch.id}"${selectedAirings.has(row.id) ? ' checked' : ''}
+         data-tip="${AIRING_TICK_TIP}"></div>`,
       // The 30px track is the channel LOGO on this grain too, not a state glyph
       // (mockup 25 round 8). One writer for both grains would be nice, but the channel
       // row's copy carries a tooltip about the channel and this one has to say which
@@ -1923,9 +1937,9 @@
        switching it off separately would leave a list of identical rows. */
     return `<div class="ccard acard${row.on_now ? ' is-onnow' : ''}${row.ended ? ' is-past' : ''}${
         ch.lifecycle === 'missing' ? ' is-removed' : ''}${row.group ? ' is-group' : ''}" data-air="${row.id}" data-id="${ch.id}">
-      <div><input type="checkbox" data-air="${row.id}" data-id="${ch.id}"${selected.has(ch.id) ? ' checked' : ''}
-        data-tip="Selecting a showing selects its CHANNEL - several showings on one channel are one selection."
-        aria-label="Select ${esc(ch.name)}"></div>
+      <div><input type="checkbox" data-air="${row.id}" data-id="${ch.id}"${selectedAirings.has(row.id) ? ' checked' : ''}
+        data-tip="${AIRING_TICK_TIP}"
+        aria-label="Select ${esc(row.title || ch.name)}"></div>
       <div class="cc-logo${row.group ? ' is-grouplogo' : ''}"
         data-act="${row.group ? 'open-group' : 'open-channel'}"
         data-id="${row.group ? row.group.id : ch.id}"
@@ -2209,6 +2223,12 @@
        what did not fit, not the actions. */
     const short = isMobile();
     $('#sel-group').textContent = short ? `+ Group (${nf(n)})` : `+ Group selected (${nf(n)})`;
+    // Only on the grain whose rows ARE showings, and only once one is ticked: a channel
+    // carried over from the other grain names no showing to schedule.
+    const nAir = isAirings() ? selectedAirings.size : 0;
+    const schedBtn = $('#sel-sched');
+    schedBtn.style.display = nAir ? '' : 'none';
+    schedBtn.textContent = short ? `Schedule (${nf(nAir)})` : `Schedule selected (${nf(nAir)})`;
     renderGuideAction(n, short);
 
     /* The delete action is offered only when the selection holds channels the provider has
@@ -2258,11 +2278,18 @@
     }
 
     $$('#ch-list input[type=checkbox]').forEach((cb) => {
-      cb.checked = selected.has(Number(cb.dataset.id));
+      cb.checked = cb.dataset.air
+        ? selectedAirings.has(Number(cb.dataset.air)) : selected.has(Number(cb.dataset.id));
     });
     const all = $('#all-select-all');
-    const page = pageChannels();
-    if (all) all.checked = page.length > 0 && page.every((c) => selected.has(c.id));
+    if (all) {
+      if (isAirings()) {
+        all.checked = last.rows.length > 0 && last.rows.every((r) => selectedAirings.has(r.id));
+      } else {
+        const page = pageChannels();
+        all.checked = page.length > 0 && page.every((c) => selected.has(c.id));
+      }
+    }
   }
 
   function addToGroupName() {
@@ -2307,6 +2334,28 @@
       });
     } else {
       selected.delete(id);
+    }
+  }
+
+  /* Tick or untick one SHOWING. Its channel comes along, so the channel actions keep
+     meaning what they meant, and goes again only once no ticked showing is left on it. */
+  function setAiringSelected(airId, on) {
+    const air = findAiring(airId);
+    const chId = air ? air.channel.id : (selectedAirings.get(airId) || {}).channel_id;
+    if (on && air) {
+      selectedAirings.set(airId, {
+        channel_id: air.channel.id,
+        // The row names the group, as it does for Record (openRecordModal) - never inferred.
+        group_id: air.group && !air.group.check_only ? air.group.id : null,
+        title: air.title,
+      });
+      setRowSelected(air.channel.id, true);
+    } else if (!on) {
+      selectedAirings.delete(airId);
+      if (chId != null
+          && !Array.from(selectedAirings.values()).some((v) => v.channel_id === chId)) {
+        setRowSelected(chId, false);
+      }
     }
   }
 
@@ -2623,11 +2672,16 @@
         }
         // The warning names what it clashes with, because "add anyway?" without
         // the other channel's name is a question nobody can answer.
-        const names = (data.conflicting_channels || []).map((c) => c.name).join(', ');
-        if (!window.confirm(`"${data.channel_name}" shares a stream URL with a channel already `
-                            + `in your guide:\n\n${names}\n\nAdd it anyway?`)) return;
-        return jsonFetch(`${CFG.addGuideUrlBase}${id}/add?force=1`, { method: 'POST' })
-          .then(() => { showToast(`"${data.channel_name}" added to your guide.`); applyNow(false); });
+        return confirmModal({
+          title: 'Add a duplicate stream',
+          message: `"${data.channel_name}" shares a stream URL with a channel already in your guide:`,
+          list: (data.conflicting_channels || []).map((c) => c.name),
+          confirmLabel: 'Add anyway',
+        }).then((ok) => {
+          if (!ok) return null;
+          return jsonFetch(`${CFG.addGuideUrlBase}${id}/add?force=1`, { method: 'POST' })
+            .then(() => { showToast(`"${data.channel_name}" added to your guide.`); applyNow(false); });
+        });
       })
       .catch((e) => showToast(e.message || 'Could not add that channel.', { type: 'error' }));
   }
@@ -2758,14 +2812,15 @@
     const air = rowSheetAir === null ? null : findAiring(rowSheetAir);
     const ch = air ? air.channel : channelOnPage(rowSheetId);
     if (!ch) return '';
-    const sel = selected.has(ch.id);
+    const sel = air ? selectedAirings.has(air.id) : selected.has(ch.id);
     return `${rowRecordSheetHtml(air)}
       ${air ? `<div class="sh-note" style="padding:2px 0 8px">On <b>${esc(ch.name)}</b>, ${
         esc(dayLabel(utcDate(air.start_time)))} ${esc(timeRange(air))}.</div>` : ''}
-      ${rowSheetChannelRows(ch, sel)}`;
+      ${rowSheetChannelRows(ch, sel, air)}`;
   }
 
-  function rowSheetChannelRows(row, sel) {
+  function rowSheetChannelRows(row, sel, air = null) {
+    const thing = air ? 'showing' : 'channel';
     return `<div class="prow drill" data-act="open-channel" data-id="${row.id}">
         <span class="pico">&#8599;</span><span class="pv">Open channel detail</span></div>
       ${row.in_guide
@@ -2777,16 +2832,16 @@
               ? `<span class="hint">already in it via ${esc(row.guide_via[0].name)}</span>` : ''}</div>`}
       <div class="prow drill" data-rowtest="${row.id}">
         <span class="pico">&#9889;</span><span class="pv">Test this channel</span></div>
-      <div class="prow drill" data-rowsel="${row.id}">
+      <div class="prow drill" data-rowsel="${row.id}"${air ? ` data-rowair="${air.id}"` : ''}>
         <span class="pico">${sel ? '&#10005;' : '&#10003;'}</span>
-        <span class="pv">${sel ? 'Deselect this channel' : 'Select this channel'}</span></div>
+        <span class="pv">${sel ? `Deselect this ${thing}` : `Select this ${thing}`}</span></div>
       ${row.dup ? `<div class="prow drill" data-act="dup-badge" data-id="${row.id}">
         <span class="pico">&#9282;</span>
         <span class="pv">${nf(row.dup.count)} channels share this stream URL</span></div>` : ''}
       <div class="sh-note">Selecting from in here and ticking the card's checkbox write the same
         selection, so a one-channel action and a fifty-channel action are one path rather than
-        two.${isAirings() ? ' <b>Selecting a showing selects its channel</b> - several showings '
-        + 'on one channel are one selection, on both tabs.' : ''}</div>`;
+        two.${isAirings() ? ' <b>Selecting a showing also selects its channel</b> for the channel '
+        + 'actions - several showings on one channel are one channel there.' : ''}</div>`;
   }
 
   function openRowSheet(id, airId = null) {
@@ -2811,7 +2866,9 @@
         // Through the same Map the checkbox writes, so the card's tick, this row
         // and the bottom bar cannot disagree about what is selected.
         const rid = Number(sel.dataset.rowsel);
-        setRowSelected(rid, !selected.has(rid));
+        const airId = Number(sel.dataset.rowair) || null;
+        if (airId !== null) setAiringSelected(airId, !selectedAirings.has(airId));
+        else setRowSelected(rid, !selected.has(rid));
         renderResults();
         renderOpenSheet();
         return;
@@ -4995,13 +5052,15 @@
   $('#atable').addEventListener('change', (e) => {
     if (e.target.closest('#all-select-all')) {
       const on = e.target.checked;
-      pageChannels().forEach((c) => setRowSelected(c.id, on));
+      if (isAirings()) last.rows.forEach((r) => setAiringSelected(r.id, on));
+      else pageChannels().forEach((c) => setRowSelected(c.id, on));
       updateSelectionUI();
       return;
     }
     const cb = e.target.closest('#ch-list input[type=checkbox]');
     if (!cb || !cb.dataset.id) return;
-    setRowSelected(Number(cb.dataset.id), cb.checked);
+    if (cb.dataset.air) setAiringSelected(Number(cb.dataset.air), cb.checked);
+    else setRowSelected(Number(cb.dataset.id), cb.checked);
     updateSelectionUI();
   });
 
@@ -5009,17 +5068,28 @@
      that were fetched, and saying "Select All" while ticking 100 of 134,399
      would be the lie the count line exists to prevent. */
   $('#sel-all-btn').addEventListener('click', () => {
-    const page = pageChannels();
-    page.forEach((c) => setRowSelected(c.id, true));
+    let n;
+    let noun;
+    if (isAirings()) {
+      last.rows.forEach((r) => setAiringSelected(r.id, true));
+      n = last.rows.length;
+      noun = 'showing';
+    } else {
+      const page = pageChannels();
+      page.forEach((c) => setRowSelected(c.id, true));
+      n = page.length;
+      noun = 'channel';
+    }
     updateSelectionUI();
     if (last.total > last.rows.length) {
-      showToast(`Selected the ${nf(page.length)} channel${page.length === 1 ? '' : 's'} on this `
+      showToast(`Selected the ${nf(n)} ${noun}${n === 1 ? '' : 's'} on this `
                 + `page. ${nf(last.total)} ${grainUi().noun}${last.total === 1 ? '' : 's'} match `
                 + 'this search - page through to add more.');
     }
   });
   $('#desel-all-btn').addEventListener('click', () => {
     selected.clear();
+    selectedAirings.clear();
     updateSelectionUI();
   });
 
@@ -5154,9 +5224,13 @@
       if (warned.length) {
         const lines = warned.map((w) => `${w.channel_name} shares a stream URL with: `
           + (w.conflicting_channels || []).map((c) => c.name).join(', '));
-        const proceed = window.confirm(
-          `${warned.length} channel${warned.length === 1 ? '' : 's'} share a stream URL with a `
-          + `channel already in your guide:\n\n${lines.join('\n')}\n\nAdd them anyway?`);
+        const proceed = await confirmModal({
+          title: 'Add duplicate streams',
+          message: `${warned.length === 1 ? '1 channel shares' : `${warned.length} channels share`} a stream URL `
+            + 'with a channel already in your guide:',
+          list: lines,
+          confirmLabel: 'Add anyway',
+        });
         if (proceed) {
           const forced = await Promise.all(warned.map((w) =>
             jsonFetch(`${CFG.addGuideUrlBase}${w.channel_id}/add?force=1`, { method: 'POST' })));
@@ -5247,6 +5321,7 @@
         showToast(msg);
       }
       selected.clear();
+      selectedAirings.clear();
       applyNow(false);
     } catch (err) {
       showToast(err.message || 'Could not change every channel. Try again.', { type: 'error' });
@@ -5278,6 +5353,35 @@
         windowSettingsUrl: CFG.windowSettingsUrl,
         scheduleTemplateId: 'cc-schedule-fields',
         schedulePrefix: 'browsesched',
+      },
+    });
+  });
+
+  /* Schedule every ticked SHOWING, one recording each, with one profile (dev/changelog/1157).
+     The profiles are read off the record modal's own picker, which this page already
+     renders, so the two dialogs cannot offer different lists. Created and skipped showings
+     leave the selection; a failed one stays ticked, so trying again is one click. */
+  $('#sel-sched').addEventListener('click', () => {
+    if (!selectedAirings.size) { showToast('Select some showings first.', { type: 'error' }); return; }
+    if (typeof openBulkScheduleModal !== 'function') {
+      showToast('The scheduling dialog did not load on this page.', { type: 'error' });
+      return;
+    }
+    const profiles = Array.from(document.querySelectorAll('#modal-profile option'))
+      .filter((o) => o.value)
+      .map((o) => ({ id: Number(o.value), name: o.textContent }));
+    openBulkScheduleModal({
+      items: Array.from(selectedAirings.entries())
+        .map(([id, v]) => ({ epg_id: id, group_id: v.group_id })),
+      profiles,
+      previewUrl: CFG.bulkPreviewUrl,
+      scheduleUrl: CFG.bulkScheduleUrl,
+      when: (plan) => `${dayLabel(utcDate(plan.start_time))} ${timeRange(plan)}`,
+      onDone: (res) => {
+        [...(res.created || []), ...(res.skipped || [])]
+          .forEach((p) => setAiringSelected(p.epg_id, false));
+        updateSelectionUI();
+        applyNow(false);
       },
     });
   });

@@ -337,8 +337,7 @@ def _airing_rows(result, state, ctx) -> list:
     clusters = _duplicate_clusters(channels)
     recordings = _recordings_for(entries, channels_by_id)
     stands_for = _airing_group_labels(result, ctx)
-    templates = _filename_templates(channels, ctx)
-    tag_cleanup = _tag_cleanup(ctx)
+    namings = _filename_namings(channels, ctx)
     all_tags = list(ctx.tags)
     # Hoisted out of the row loop, not looked up inside it: the context already holds every
     # Tag, so the renderer below never needs to ask the database for one.
@@ -385,7 +384,7 @@ def _airing_rows(result, state, ctx) -> list:
             # default profile and the {tag:...} tokens resolve against Tag rows, neither of
             # which the browser has. It is what the Schedule Recording modal opens prefilled
             # with, so leaving it out would cost a round trip per Record click.
-            'suggested_name': _suggested_name(ch, entry, templates, tag_cleanup,
+            'suggested_name': _suggested_name(ch, entry, namings[ch.id],
                                               tags_by_name, ctx.display_tz),
             'matched_tags': _matched_tags(all_tags, entry),
             # The group this showing STANDS FOR, or None. Present only while "Collapse
@@ -578,31 +577,29 @@ def _recordings_for(entries, channels_by_id) -> dict:
     return out
 
 
-def _filename_templates(channels, ctx) -> dict:
-    """{channel id: template} - resolved once per channel, never inside the row loop.
+def _filename_namings(channels, ctx) -> dict:
+    """{channel id: (template, tag_cleanup)} - resolved once per channel, never inside the
+    row loop.
 
     No batching query is needed: `Channel.default_profile` is declared `lazy='joined'`
     (app/database.py), so the profile arrives with the channel. Resolved here anyway rather
-    than in the loop, because "which template" is a per-channel fact and a page has far more
+    than in the loop, because "which naming" is a per-channel fact and a page has far more
     rows than channels.
     """
-    from .accounts import effective_filename_template
-    return {c.id: effective_filename_template(ctx.cfg, c) for c in channels}
+    from .accounts import effective_filename_naming
+    return {c.id: effective_filename_naming(ctx.cfg, c) for c in channels}
 
 
-def _tag_cleanup(ctx) -> list:
-    from .accounts import filename_tag_cleanup
-    return filename_tag_cleanup(ctx.cfg)
-
-
-def _suggested_name(ch, entry, templates, tag_cleanup, tags_by_name, tz) -> str:
+def _suggested_name(ch, entry, naming, tags_by_name, tz) -> str:
+    """`naming` is the (template, tag_cleanup) pair from accounts.filename_naming_for()."""
     from .accounts import render_filename_template
     # tags_by_name is what keeps this out of the N+1 class: this runs once per showing, and
     # without a prefetched map the renderer would issue up to two Tag queries per row.
     # tests/test_scaling_pages.py is the guard (dev/changelog/441). tz is the same fix,
     # one call site over: without it the renderer calls get_display_tz() -> load_config()
     # per showing.
-    return render_filename_template(templates.get(ch.id, ''), {
+    template, tag_cleanup = naming
+    return render_filename_template(template, {
         'start_time': entry.start_time,
         'stop_time': entry.stop_time,
         'title': entry.title or ch.name,

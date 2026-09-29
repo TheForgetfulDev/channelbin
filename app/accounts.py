@@ -9,6 +9,7 @@ import bisect
 import functools
 import gzip
 import hashlib
+import json
 import math
 import os
 import re
@@ -643,16 +644,91 @@ def default_profile_for(channel, group=None):
     return profile if profile is not None else getattr(channel, 'default_profile', None)
 
 
-def effective_filename_template(cfg, channel, group=None) -> str:
-    """The template a recording of this channel would be named with: the pre-selected
-    profile's own template if it sets one (default_profile_for()), else the global
-    recording.filename_template."""
+def _tag_name_list(raw) -> list:
+    """A profile's stored cleanup column as a list of names. NULL is empty, and so is a
+    value that is not a JSON list of strings - the column is only ever written by the
+    profile API, so anything else is damage, and naming the file with no cleanup is the
+    recoverable reading of it."""
+    if not raw:
+        return []
+    try:
+        names = json.loads(raw)
+    except ValueError:
+        log.warning('Unreadable filename tag list on a recording profile: %r', raw)
+        return []
+    if not isinstance(names, list):
+        return []
+    return [n for n in names if isinstance(n, str) and n]
+
+
+def profile_tag_cleanup(profile) -> list:
+    """The (tag_name, mode) cleanup list stored on a profile, in filename_tag_cleanup()'s
+    shape. A name in both lists counts as remove, as the save path already guarantees."""
+    remove = _tag_name_list(profile.filename_tags_remove)
+    replace = [n for n in _tag_name_list(profile.filename_tags_replace) if n not in remove]
+    return [(n, 'remove') for n in remove] + [(n, 'replace') for n in replace]
+
+
+def filename_naming_for(cfg, profile) -> tuple:
+    """(template, tag_cleanup) a recording made with `profile` is named with.
+
+    The template and its cleanup lists are one unit and always come from the same place: a
+    profile that sets a template brings its own lists, and one that does not (or no profile
+    at all) takes the global template and the global lists together. Returning them as a
+    pair is what keeps a caller from ever pairing one profile's template with another
+    source's cleanup (dev/changelog/1161)."""
+    if profile is not None and profile.filename_template:
+        return profile.filename_template, profile_tag_cleanup(profile)
     global_template = cfg.get('recording', {}).get(
         'filename_template', config_default('recording.filename_template'))
-    profile = default_profile_for(channel, group)
-    if profile is not None and profile.filename_template:
-        return profile.filename_template
-    return global_template
+    return global_template, filename_tag_cleanup(cfg)
+
+
+def effective_filename_naming(cfg, channel, group=None) -> tuple:
+    """(template, tag_cleanup) for a recording of this channel under the profile the
+    record modal pre-selects (default_profile_for())."""
+    return filename_naming_for(cfg, default_profile_for(channel, group))
+
+
+def backfill_profile_filename_cleanup(cfg):
+    """Copy the global tag-cleanup lists onto every profile that set its own template before
+    profiles had lists of their own, so none of their filenames change on upgrade.
+
+    Gated on migration 83's ledger obligation, never on whether the columns look empty
+    (dev/changelog/686). Only rows whose lists are both still NULL are written, so a replay
+    after a crash between the work and the stamp repeats the same answer. The work and the
+    stamp land in one commit."""
+    from .database import RecordingProfile
+    from .migrations import (_BF_PROFILE_FILENAME_CLEANUP, finish_obligation,
+                             obligation_pending)
+
+    if not obligation_pending(_BF_PROFILE_FILENAME_CLEANUP):
+        return
+    rec = cfg.get('recording', {})
+    remove = json.dumps(sorted({str(n) for n in rec.get('filename_tags_remove', []) or [] if n}))
+    replace = json.dumps(sorted({str(n) for n in rec.get('filename_tags_replace', []) or []
+                                 if n} - set(json.loads(remove))))
+
+    @retry_on_locked()
+    def _copy_and_commit():
+        rows = (RecordingProfile.query
+                .filter(RecordingProfile.filename_template.isnot(None),
+                        RecordingProfile.filename_template != '',
+                        RecordingProfile.filename_tags_remove.is_(None),
+                        RecordingProfile.filename_tags_replace.is_(None))
+                .all())
+        for p in rows:
+            p.filename_tags_remove = remove
+            p.filename_tags_replace = replace
+        finish_obligation(_BF_PROFILE_FILENAME_CLEANUP)
+        db.session.commit()
+        return [p.name for p in rows]
+
+    names = _copy_and_commit()
+    if names:
+        log.info('Recording profiles %s keep the global filename tag cleanup they were named '
+                 'with, now stored on each profile (dev/changelog/1161)',
+                 ', '.join(f'"{n}"' for n in names))
 
 
 def render_filename_template(template: str, program: dict, tag_cleanup: list = None,

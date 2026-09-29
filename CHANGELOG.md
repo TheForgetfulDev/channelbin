@@ -5,6 +5,37 @@ Notable changes to ChannelBin, newest first. This project follows
 release is tagged `v<version>` in git, and the version the app is running is shown in the
 page footer.
 
+## 0.22.0 - 2026-09-29
+
+**Added**
+
+- Save the Recordings list's filters under a name, load one again with a click, and make one
+  the default so the list opens already filtered.
+- Schedule several showings at once from Search Programs: tick them, pick one recording
+  profile, and review what will be created before it is.
+- Capture screenshot on the channel page saves one live frame without running a health check.
+- Recording profiles get the same filename designer as Settings, with their own tag cleanup
+  lists, and the record modal renames a showing when a different profile is picked.
+- Run now on five housekeeping jobs on the Jobs page.
+- The Home Assistant status API names the account each recording in progress is on.
+
+**Changed**
+
+- The Jobs page keeps itself current: countdowns move and jobs that fire update their rows
+  without a reload.
+- The Groups list and the channel page follow a health check as it runs, instead of showing
+  results as they stood when the page was opened.
+- Every confirmation is the app's own dialog, with the button named for what it does, instead
+  of the browser's.
+
+**Fixed**
+
+- Recordings with AC-3 or E-AC-3 audio, 5.1 included, convert through the audio-copy fallback
+  instead of failing it, and copied 5.1 AAC is no longer damaged.
+- A recording's pre-check, retry and resume jobs show on that recording's row on the Jobs page,
+  instead of as raw ids with a Skip that did not work.
+- Deleting an account removes its channels' health check screenshots.
+
 ## 0.21.0 - 2026-09-27
 
 **Added**

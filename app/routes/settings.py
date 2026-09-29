@@ -1108,8 +1108,8 @@ def _unknown_tokens(template, tag_names):
 def filename_designer_boot_api():
     """Everything the designer needs to open, in one request.
 
-    One payload rather than template context, because the component is meant to open from
-    any page (a Recording Profile's template field is the next host) and a page-supplied
+    One payload rather than template context, because the component opens from more than
+    one page (Settings and the Recording Profiles modal, dev/changelog/1161) and a page-supplied
     boot block would have to be duplicated on each of them.
     """
     from ..database import Tag

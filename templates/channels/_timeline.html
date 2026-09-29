@@ -133,7 +133,9 @@
       {% endif %}
 
       {% if entry.quality_breakdown or entry.correction_breakdown or entry.blend_breakdown %}
-      <details class="ch-breakdown">
+      {# data-bd names the entry, so a page that swaps this log for a fresh render can
+         re-open the breakdowns that were open (channel-detail.js, dev/changelog/1158). #}
+      <details class="ch-breakdown" data-bd="{{ entry.kind }}:{{ entry.obj.id if entry.obj else '' }}">
         <summary class="text-muted small" style="cursor:pointer;">Score breakdown</summary>
         {% if entry.quality_breakdown %}
         {% set qb = entry.quality_breakdown %}

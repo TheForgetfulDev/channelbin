@@ -155,7 +155,8 @@ class AudioCopyFallbackTests(_ConversionCase):
         self.assertEqual(last[last.index('-c:a') + 1], 'copy')
         self.assertIn('-bsf:a', last)
         self.assertEqual(last[last.index('-bsf:a') + 1], 'aac_adtstoasc',
-                         'mp4 needs ADTS AAC converted to raw AAC when copying')
+                         'mp4 needs ADTS AAC converted to raw AAC when copying, and an '
+                         'unprobeable source is treated as AAC')
 
     def test_fallback_keeps_the_video_treatment(self):
         cfg = _config(max_restart_attempts=3, reencode_mode='always')

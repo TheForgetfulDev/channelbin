@@ -644,8 +644,12 @@ def groups_page():
     queried inside the per-group loop (CLAUDE.md's no-N+1 rule) - both
     `ChannelGroup.memberships` and `OnDemandTestJob.group`'s `check` backref are
     `lazy=True`, so touching either per group in the loop is one query per group."""
-    from ..channel_tester import monitored_channel_ids, get_status
+    from ..channel_tester import monitored_channel_ids, health_check_signature
 
+    # Read before any row, as the Accounts list does: a result that lands in between costs
+    # one extra refresh, where a signature read after the rows would vouch for a state the
+    # page never showed (dev/changelog/1158).
+    hc_sig = health_check_signature()['sig']
     cfg = load_config()
     ct_cfg = cfg.get('channel_testing', {})
     streak_threshold = ct_cfg.get('failing_streak_threshold', DEFAULT_FAILING_STREAK_THRESHOLD)
@@ -721,7 +725,7 @@ def groups_page():
         group_rows=group_rows,
         group_names=[g.name for g in groups],
         resolution_options=resolution_options, fps_options=fps_options,
-        tester_status=get_status())
+        hc_sig=hc_sig)
 
 
 def _group_tests(job_names, recordings):

@@ -109,6 +109,27 @@ def image_dir(cfg: dict, kind: str) -> str:
     return os.path.join(images_root(cfg), kind)
 
 
+def manual_screenshot_path(cfg: dict, channel_id: int) -> str:
+    """Where the channel page's "Capture screenshot" keeps its frame: one file per channel in
+    the SCREENSHOTS folder, replaced by each new capture. Health check retention never
+    touches it - that prunes the files ChannelTest rows name, and no row names this one - so
+    it goes only when its channel is deleted (dev/changelog/1160)."""
+    return os.path.join(image_dir(cfg, SCREENSHOTS), f'manual-ch{int(channel_id)}.jpg')
+
+
+def manual_screenshot_paths(cfg: dict, channel_ids) -> list:
+    """manual_screenshot_path() of each of `channel_ids` that has one, for a delete to unlink
+    once it has committed. Read before the channel rows go - the column is what says a file
+    exists. One query for the whole list."""
+    from .database import Channel
+    ids = list(channel_ids)
+    if not ids:
+        return []
+    rows = (Channel.query.with_entities(Channel.id)
+            .filter(Channel.id.in_(ids), Channel.screenshot_captured_at.isnot(None)).all())
+    return [manual_screenshot_path(cfg, cid) for (cid,) in rows]
+
+
 def configured_write_dirs(cfg: dict, capture_log_dir: str = None) -> list:
     """[(path, role)] for every directory this install will write into, in a fixed order.
 
