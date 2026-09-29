@@ -51,6 +51,9 @@
          only when the profile actually sets one. #}
       {% if p.filename_template %}
       <span class="p-meta"><span class="p-mk">Filename</span>{{ p.filename_template }}</span>
+      {% if cleanup_text.get(p.id) %}
+      <span class="p-meta"><span class="p-mk">Cleanup</span>{{ cleanup_text[p.id] }}</span>
+      {% endif %}
       {% endif %}
     </span>
     <span class="p-over">
@@ -86,6 +89,7 @@
   <span class="p-dk">Anything a profile does not set follows your global settings:</span>
   {% for d in default_summary %}<span class="p-ov"><span class="p-ok">{{ d.label }}</span>{{ d.value }}</span>{% endfor %}
   <span class="p-ov"><span class="p-ok">Filename</span>{{ defaults.filename_template }}</span>
+  {% if default_cleanup_text %}<span class="p-ov"><span class="p-ok">Cleanup</span>{{ default_cleanup_text }}</span>{% endif %}
 </p>
 {% endif %}
 {% endblock %}
@@ -101,6 +105,8 @@ window.RP_CONFIG = {
   groupCounts: {{ group_counts | tojson }},
 };
 </script>
+<script src="{{ url_for('static', filename='js/dropdown.js') }}"></script>
+<script src="{{ url_for('static', filename='js/filename-designer.js') }}"></script>
 <script src="{{ url_for('static', filename='js/profile-modal.js') }}"></script>
 <script src="{{ url_for('static', filename='js/recording-profiles.js') }}"></script>
 {% endblock %}

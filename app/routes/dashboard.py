@@ -890,9 +890,12 @@ def nav_status():
     `account_sync` is `accounts.sync_signature()`, which /accounts compares against the one
     its rows were rendered at to know when to re-render itself. `alert_signature` does the
     same job for /alerts (dev/changelog/1131), and `recording_signature` for the Dashboard's
-    recording regions (dev/changelog/1143).
+    recording regions (dev/changelog/1143). `health_check` is
+    `channel_tester.health_check_signature()`, which the Groups list and the Channel page
+    follow a test run on (dev/changelog/1158).
     """
     from .system import _system_stats_dict
+    from ..channel_tester import health_check_signature
     from .alerts import _unread_alert_summary, alert_signature
     from ..readiness import nav_summary
     return jsonify(
@@ -903,6 +906,7 @@ def nav_status():
         account_sync=sync_signature(),
         alert_signature=alert_signature(),
         recording_signature=recording_signature(),
+        health_check=health_check_signature(),
         # Cached for 30s inside nav_summary(), and never able to run an on-demand check -
         # a poll that spawned a process or opened a provider connection would be the exact
         # thing the Readiness card refuses to do on page load (dev/changelog/950).

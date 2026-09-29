@@ -63,15 +63,15 @@
 
 <div class="page-head">
   <h1>Scheduled Jobs
-    <span class="sub">{{ jobs | length }} job{{ '' if jobs | length == 1 else 's' }}</span>
+    <span class="sub" id="jb-count">{{ jobs | length }} job{{ '' if jobs | length == 1 else 's' }}</span>
   </h1>
-  <div class="card-head-actions">
-    <button class="btn btn-sm" id="jb-refresh">&#8635; Refresh</button>
-  </div>
 </div>
 <p class="page-sub">Everything the scheduler will do on its own, read from its live state rather
   than from a stored list - so what is here is what will run.</p>
 
+{# The one region static/js/jobs.js swaps for a fresh render (dev/changelog/1164). It holds
+   the empty state too, so a page that opened with no jobs picks up the first one. #}
+<div id="jb-live">
 {% if jobs %}
 <div class="card">
   <div class="card-head"><h2>Jobs <span class="cnt">{{ jobs | length }}</span></h2></div>
@@ -112,6 +112,9 @@
             {% if job.stop_run_et %}
             <div class="jb-stop">stops {{ job.stop_run_et }}</div>
             {% endif %}
+            {% for line in job.get('pending_lines', []) %}
+            <div class="jb-stop">{{ line }}</div>
+            {% endfor %}
           </td>
           <td data-label="Schedule" class="muted">
             {{ job.schedule_description or '-' }}
@@ -126,7 +129,7 @@
               <button class="btn btn-sm btn-icon" data-menu aria-label="More actions">&#8943;</button>
               <div class="menu pop-left">
                 {% if job.edit_url %}
-                <a href="{{ job.edit_url }}">{% if job.type in ('one_off', 'active') and (job.id.startswith('start_') or job.id.startswith('active_')) %}Edit{% else %}Settings{% endif %}</a>
+                <a href="{{ job.edit_url }}">{% if job.get('edit_label') %}{{ job.edit_label }}{% elif job.type in ('one_off', 'active') and (job.id.startswith('start_') or job.id.startswith('active_')) %}Edit{% else %}Settings{% endif %}</a>
                 {% endif %}
                 {% if job.get('run_url') %}
                 <button class="menu-item" data-act="run" data-url="{{ job.run_url }}"
@@ -173,6 +176,7 @@
   <a class="btn btn-primary" href="{{ url_for('guide.guide') }}">Go to the TV Guide</a>
 </div>
 {% endif %}
+</div>
 {% endblock %}
 
 {% block scripts %}

@@ -217,7 +217,16 @@
     rows: allRows,
     note: 'Choices inside one filter are an "or"; different filters are an "and".',
     onChange: applyFilter,
+    saved: {
+      chipEl: document.getElementById('saved-filters-chip'),
+      menuEl: document.getElementById('saved-filters-menu'),
+      list: (readJson('rec-saved-filters') || {}).list,
+      prefUrl: `/api/user-prefs/${(readJson('rec-saved-filters') || {}).key}`,
+    },
   });
+  // A default saved filter is already on the bar by now, and the bar does not notify
+  // while it is still being built.
+  applyFilter();
 
   // ── Click targets (DESIGN.md 3.9): row -> details; thumb -> lightbox;
   //    pills are real links; the actions cell swallows its clicks ──

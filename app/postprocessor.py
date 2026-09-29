@@ -534,8 +534,11 @@ def _persist_postprocess_waiting(recording_id, conflict=None):
 # real recordings), so resuming one saves nothing and it keeps writing the final file directly.
 
 # Fragmented-MP4 flags: moov up front and self-contained fragments, so a part killed mid-write
-# is still readable up to its last complete fragment. Finding 1 above.
-PART_MOVFLAGS = '+frag_keyframe+empty_moov+default_base_moof'
+# is still readable up to its last complete fragment. Finding 1 above. delay_moov holds the
+# moov until the first packets arrive: without it a copied AC-3/E-AC-3 track is refused
+# ("Cannot write moov atom before AC3 packets"), and copied 5.1 AAC is written with a header
+# that decodes as errors all the way through - measured on ffmpeg 7.1, dev/changelog/1163.
+PART_MOVFLAGS = '+frag_keyframe+empty_moov+default_base_moof+delay_moov'
 
 # The values of recording.post_process.video_encoder. Compared against these names and never
 # a re-typed literal; app/routes/settings.py whitelists a save against the same pair.
@@ -1809,6 +1812,19 @@ def do_postprocess(app, recording_id: int, ts_path: str):
             # all (dev/changelog/955).
             resumable = (fmt == 'mp4' and reencode)
 
+            # The source's audio codec, probed only when the audio-copy fallback first builds
+            # a command - the fallback is rare and nothing else here needs it.
+            source_audio_codec = []
+
+            def _copied_audio_needs_adts_filter():
+                if not source_audio_codec:
+                    from .probe import parse_ffprobe
+                    source_audio_codec.append(
+                        (parse_ffprobe(ts_path, count_packets=False) or {}).get('audio_codec'))
+                # Unknown is treated as AAC, the common IPTV codec and this path's behavior
+                # before the codec was consulted.
+                return source_audio_codec[0] in (None, 'aac')
+
             def _build_cmd(audio_copy=False, dest=None, start_at=0.0):
                 """The conversion command, optionally with audio stream-copied instead of
                 re-encoded (the fallback below).
@@ -1870,13 +1886,20 @@ def do_postprocess(app, recording_id: int, ts_path: str):
                 else:
                     return c + ['-c', 'copy', '-y', target]
                 if audio_copy:
-                    # MP4/MOV needs ADTS AAC converted to raw AAC by this bitstream filter.
-                    # Copying never decodes, so no bad frame can reach a decoder or a filter
-                    # graph - which is why it survives a source the re-encode cannot. The
-                    # cost is that one codec config covers the whole track, so a source that
-                    # really does change layout mid-stream leaves that stretch undecodable
-                    # in players. Fallback only, never the default.
-                    c += ['-c:a', 'copy', '-bsf:a', 'aac_adtstoasc']
+                    # MP4 needs ADTS AAC converted to raw AAC by aac_adtstoasc, and it is named
+                    # explicitly because a fragmented part writes its header before the first
+                    # packet, where the muxer cannot insert it itself. Named for AAC ONLY:
+                    # ffmpeg refuses the filter on any other codec at startup, so an AC-3 or
+                    # E-AC-3 5.1 feed, or an MP2 one, could never convert through this fallback
+                    # (dev/changelog/1163). Copying never decodes, so no bad frame can reach a
+                    # decoder or a filter graph - which is why it survives a source the
+                    # re-encode cannot. The cost for AAC is that one codec config covers the
+                    # whole track, so a source that really does change layout mid-stream
+                    # leaves that stretch undecodable in players. Fallback only, never the
+                    # default.
+                    c += ['-c:a', 'copy']
+                    if _copied_audio_needs_adts_filter():
+                        c += ['-bsf:a', 'aac_adtstoasc']
                 else:
                     c += ['-c:a', 'aac', '-b:a', f'{audio_kbps}k']
                 # A resumable run's parts are fragmented so a kill leaves a readable

@@ -22,6 +22,12 @@ Rules this module enforces, each of which a test in tests/test_preview.py guards
   exiting on its own, connect timeout, preemption, replacement, app shutdown.
 * Nothing here feeds the health score or writes a database row. A preview is not an
   observation.
+* "Capture screenshot" on the channel page is a preview too (capture_frame): it reads a
+  frame out of the live preview of that channel when one is playing, and otherwise opens a
+  short capture session through the same start path - same slot, same refusals, same
+  preemption, same teardown - and ends it as soon as one segment exists. A capture session
+  never replaces the preview someone is watching; the one-at-a-time rule is about watched
+  sessions (dev/changelog/1160).
 
 Session state is process-local (like recorder._active): a restart kills the ffmpeg this
 process owned, so there is nothing to recover. Full reasoning: dev/changelog/1018.
@@ -61,6 +67,7 @@ REASON_FFMPEG_EXITED = 'ffmpeg_exited'
 REASON_REPLACED = 'replaced'
 REASON_SHUTDOWN = 'shutdown'
 REASON_LAUNCH_FAILED = 'launch_failed'
+REASON_CAPTURED = 'captured'
 
 REASON_TEXT = {
     REASON_USER: 'Stopped.',
@@ -72,7 +79,18 @@ REASON_TEXT = {
     REASON_REPLACED: 'Stopped - another preview was started.',
     REASON_SHUTDOWN: 'Stopped - the app is restarting.',
     REASON_LAUNCH_FAILED: 'Could not start ffmpeg.',
+    REASON_CAPTURED: 'Stopped - the screenshot was taken.',
 }
+
+# What a session is for. A WATCH session is the modal's player; a CAPTURE session exists
+# only until capture_frame() has one segment to take a frame from.
+PURPOSE_WATCH = 'watch'
+PURPOSE_CAPTURE = 'capture'
+
+# How long capture_frame() waits beyond the connect timeout for the reaper to settle a
+# capture session one way or the other. The reaper enforces the connect timeout itself;
+# this is only the backstop against waiting forever if it never gets to.
+_CAPTURE_WAIT_MARGIN = 5.0
 
 # Audio a browser decodes as delivered. Anything else known (ac3, eac3, mp2, dts...) is
 # re-encoded to AAC by build_preview_cmd; an UNKNOWN codec (never tested) is copied, because
@@ -120,6 +138,7 @@ class PreviewSession:
     # on a slot a recording already took (the tester's G1 fix, DESIGN-concurrency.md 5.1).
     preempted: bool = False
     playlist_fetches: int = 0
+    purpose: str = PURPOSE_WATCH
     # _finish() claims a session under _lock and tears it down under _teardown_lock, so a
     # second finisher blocks until the first is done rather than returning early.
     _finishing: bool = False
@@ -158,16 +177,18 @@ _KEEP_ENDED = 5
 _REAP_INTERVAL = 0.5
 
 
-def _live_locked() -> Optional[PreviewSession]:
+def _live_locked(purpose: Optional[str] = PURPOSE_WATCH) -> Optional[PreviewSession]:
+    """The live session of `purpose` (None: of any purpose). There is at most one WATCH
+    session; capture sessions sit beside it for the few seconds they run."""
     for s in _sessions.values():
-        if s.live:
+        if s.live and (purpose is None or s.purpose == purpose):
             return s
     return None
 
 
-def live_session() -> Optional[PreviewSession]:
+def live_session(purpose: Optional[str] = PURPOSE_WATCH) -> Optional[PreviewSession]:
     with _lock:
-        return _live_locked()
+        return _live_locked(purpose)
 
 
 def get_session(session_id: str) -> Optional[PreviewSession]:
@@ -182,10 +203,16 @@ def _prune_ended_locked():
 
 
 def start_preview(channel_id: int) -> PreviewSession:
-    """Start previewing `channel_id`, stopping any preview already running. Raises
+    """Start previewing `channel_id`, stopping any preview already being watched. Raises
     PreviewRefused with a user-facing message (404 unknown channel, 409 account at its
     connection limit, 500 the directory or ffmpeg could not be created). Requires an app
     context; the returned session is already registered and reaped."""
+    return _launch(channel_id, PURPOSE_WATCH)
+
+
+def _launch(channel_id: int, purpose: str) -> PreviewSession:
+    """The one start path for both purposes: slot, refusal prose, ffmpeg, the
+    acquire-to-Popen preemption window and the reaper are identical for a capture."""
     from . import db
     from .config import load_config
     from .database import Channel, ChannelTest
@@ -197,14 +224,21 @@ def start_preview(channel_id: int) -> PreviewSession:
     if channel is None:
         raise PreviewRefused('Channel not found', 404)
     account = channel.account
-    latest = (ChannelTest.query.filter_by(channel_id=channel_id)
-              .order_by(ChannelTest.id.desc()).first())
-    transcode_audio = audio_needs_transcode(latest.audio_codec if latest else None)
+    if purpose == PURPOSE_WATCH:
+        latest = (ChannelTest.query.filter_by(channel_id=channel_id)
+                  .order_by(ChannelTest.id.desc()).first())
+        transcode_audio = audio_needs_transcode(latest.audio_codec if latest else None)
+    else:
+        # Nobody hears a capture, so its audio is copied whatever the codec.
+        transcode_audio = False
     # The channel's own pacing answer, then the Settings default - the same resolution a
     # recording's unbounded segment gets, so a channel that needs -re to play gets it here too.
     pace, _source = resolve_capture_pacing(cfg, channel.pace_realtime, 0, False)
 
-    stop_all(REASON_REPLACED)
+    if purpose == PURPOSE_WATCH:
+        watched = live_session(PURPOSE_WATCH)
+        if watched is not None:
+            _finish(watched, REASON_REPLACED)
 
     session = PreviewSession(
         id=secrets.token_urlsafe(12),
@@ -218,6 +252,7 @@ def start_preview(channel_id: int) -> PreviewSession:
         max_seconds=float(pcfg.get('max_seconds', 600)),
         connect_timeout=float(pcfg.get('connect_timeout_seconds', 20)),
         started_mono=time.monotonic(),
+        purpose=purpose,
     )
     # Registered BEFORE the slot is taken, so a recording preempting in the window between
     # acquire and Popen finds something to flag rather than nothing (see `preempted`).
@@ -225,13 +260,14 @@ def start_preview(channel_id: int) -> PreviewSession:
         _sessions[session.id] = session
         _prune_ended_locked()
 
+    verb = 'preview' if purpose == PURPOSE_WATCH else 'capture a screenshot'
     if not connlim.try_acquire(channel.account_id, 'preview', session.id):
         from .account_blocks import blocked_reason
         blocked = blocked_reason(channel.account_id, account.name, capital=True)
         if blocked:
             _finish(session, REASON_LAUNCH_FAILED, detail='account blocked')
             raise PreviewRefused(f'{blocked}. Unblock it on its '
-                                 f'account page to preview here.', 409)
+                                 f'account page to {verb} here.', 409)
         who = connlim.describe_holders(channel.account_id)
         _finish(session, REASON_LAUNCH_FAILED, detail='account at its connection limit')
         raise PreviewRefused(
@@ -248,8 +284,8 @@ def start_preview(channel_id: int) -> PreviewSession:
     cmd = build_preview_cmd(cfg, channel.stream_url, session.dir,
                             segment_seconds=int(pcfg.get('segment_seconds', 2)),
                             transcode_audio=transcode_audio, pace_realtime=pace)
-    log.info('Preview %s: channel %d (%s)%s - %s', session.id, channel.id, channel.name,
-             ' with audio re-encoded to AAC' if transcode_audio else '',
+    log.info('Preview %s (%s): channel %d (%s)%s - %s', session.id, purpose, channel.id,
+             channel.name, ' with audio re-encoded to AAC' if transcode_audio else '',
              mask_creds_in_text(' '.join(cmd)))
     try:
         # stderr to a file, never a pipe: an undrained pipe once deadlocked every recording
@@ -308,7 +344,8 @@ def _finish(session: PreviewSession, reason: str, detail: str = '') -> bool:
             session.detail = detail
     finally:
         session._teardown_lock.release()
-    level = logging.INFO if reason in (REASON_USER, REASON_REPLACED) else logging.WARNING
+    level = (logging.INFO if reason in (REASON_USER, REASON_REPLACED, REASON_CAPTURED)
+             else logging.WARNING)
     log.log(level, 'Preview %s: channel %d (%s) stopped - %s%s', session.id,
             session.channel_id, session.channel_name, reason, f' ({detail})' if detail else '')
     return True
@@ -323,7 +360,7 @@ def stop_preview(session_id: str, reason: str = REASON_USER) -> bool:
 
 
 def stop_all(reason: str = REASON_SHUTDOWN) -> int:
-    """Stop every live session (there is at most one). Returns how many were live."""
+    """Stop every live session, watched and capture alike. Returns how many were live."""
     with _lock:
         live = [s for s in _sessions.values() if s.live]
     for s in live:
@@ -338,21 +375,20 @@ def kill_all_previews():
 
 
 def preempt_for_account(account_id: int) -> bool:
-    """A recording on `account_id` needs the slot: stop the live preview if it is on that
-    account. Called by recorder._try_acquire_slot_with_preemption after
-    connection_limits.preempt_previews_for_slot() stripped the slot. Flags the session even
+    """A recording on `account_id` needs the slot: stop every live session on that account,
+    watched or capturing. Called by recorder._try_acquire_slot_with_preemption after
+    connection_limits.preempt_previews_for_slot() stripped the slots. Flags a session even
     when its ffmpeg is not registered yet, for the same reason
     channel_tester.kill_active_test_for_account does: a match with proc=None means the
-    preview is inside its acquire-to-Popen window and must not launch on a stripped slot."""
+    session is inside its acquire-to-Popen window and must not launch on a stripped slot."""
     with _lock:
-        session = _live_locked()
-        if session is None or session.account_id != account_id:
-            return False
-        session.preempted = True
-        launched = session.proc is not None
-    if launched:
-        _finish(session, REASON_PREEMPTED)
-    return True
+        matched = [s for s in _sessions.values() if s.live and s.account_id == account_id]
+        for s in matched:
+            s.preempted = True
+        launched = [s for s in matched if s.proc is not None]
+    for s in launched:
+        _finish(s, REASON_PREEMPTED)
+    return bool(matched)
 
 
 def touch_playlist(session_id: str) -> Optional[str]:
@@ -385,6 +421,111 @@ def segment_path(session_id: str, name: str) -> Optional[str]:
     with _lock:
         session.last_seen_mono = time.monotonic()
     return path
+
+
+def _listed_segments(playlist_path: str) -> list:
+    """The segment names the playlist lists, oldest first. A listed segment is complete:
+    ffmpeg adds it only once it has closed the file."""
+    try:
+        with open(playlist_path, 'r', encoding='utf-8', errors='replace') as fh:
+            return [ln.strip() for ln in fh if PREVIEW_SEGMENT_RE.match(ln.strip())]
+    except OSError:
+        return []
+
+
+def _copy_listed_segment(session: PreviewSession, newest: bool, dest_dir: str) -> Optional[str]:
+    """Copy one listed segment out of the session's window into `dest_dir` and return the
+    copy's path, or None. Copied rather than read in place: the window deletes old segments
+    as it rolls, and a preemption removes the whole directory."""
+    names = _listed_segments(session.playlist_path)
+    if not names:
+        return None
+    name = names[-1] if newest else names[0]
+    dest = os.path.join(dest_dir, name)
+    try:
+        shutil.copyfile(os.path.join(session.dir, name), dest)
+    except OSError as exc:
+        log.warning('Preview %s: could not copy segment %s for a screenshot: %s',
+                    session.id, name, exc)
+        return None
+    return dest
+
+
+def capture_frame(channel_id: int, output_path: str, ffmpeg_path: str) -> str:
+    """Save one frame of `channel_id`'s live stream to `output_path` as a JPEG, and return
+    where it came from: 'preview' when a preview of this channel was already playing (no
+    new connection), 'capture' when a capture session was opened for it.
+
+    Raises PreviewRefused with a user-facing message on every way it can fail - the same
+    refusals start_preview() gives, plus a session that ends before it has a segment, and
+    a segment no frame can be read from. `output_path` is only replaced on success, so a
+    failed capture never loses the previous one. Requires an app context. Writes nothing to
+    the database and feeds nothing into the health score: the caller records the capture.
+    """
+    from .probe import parse_ffprobe
+    from .screenshot import capture_screenshot, seek_args_for_clip
+
+    scratch = tempfile.mkdtemp(prefix='channelbin-shot-')
+    try:
+        source = 'preview'
+        watched = live_session(PURPOSE_WATCH)
+        seg = None
+        if (watched is not None and watched.channel_id == channel_id
+                and watched.state == STATE_READY):
+            seg = _copy_listed_segment(watched, newest=True, dest_dir=scratch)
+        if seg is None:
+            source = 'capture'
+            with _lock:
+                busy = any(s.live and s.purpose == PURPOSE_CAPTURE and s.channel_id == channel_id
+                           for s in _sessions.values())
+            if busy:
+                raise PreviewRefused('A screenshot of this channel is already being taken.', 409)
+            session = _launch(channel_id, PURPOSE_CAPTURE)
+            try:
+                deadline = time.monotonic() + session.connect_timeout + _CAPTURE_WAIT_MARGIN
+                while (session.live and session.state != STATE_READY
+                       and time.monotonic() < deadline):
+                    time.sleep(_REAP_INTERVAL / 2)
+                if session.state == STATE_READY and session.live:
+                    # The first segment, not the newest: it opens on the keyframe the
+                    # window was cut at, and it is the one furthest from being rolled off.
+                    seg = _copy_listed_segment(session, newest=False, dest_dir=scratch)
+            finally:
+                # Released before the frame is decoded: the connection is done with once a
+                # segment is on local disk.
+                _finish(session, REASON_CAPTURED)
+            if seg is None:
+                if session.reason and session.reason != REASON_CAPTURED:
+                    detail = f' {session.detail}' if session.detail else ''
+                    raise PreviewRefused(f'{REASON_TEXT[session.reason]}{detail}', 502)
+                raise PreviewRefused('The stream started, but its first segment could not be '
+                                     'read.', 502)
+
+        probe = parse_ffprobe(seg, count_packets=False, timeout=30)
+        if probe and not probe.get('resolution'):
+            raise PreviewRefused('This channel has no video to take a screenshot of.', 422)
+        staged = os.path.join(scratch, 'frame.jpg')
+        if not capture_screenshot(seg, staged, ffmpeg_path, probe=probe,
+                                  seek_args=seek_args_for_clip(probe.get('duration'))):
+            raise PreviewRefused('The stream played, but no frame could be read from it.', 502)
+        tmp_out = f'{output_path}.part'
+        try:
+            os.makedirs(os.path.dirname(output_path), exist_ok=True)
+            # Staged in scratch and copied beside the target first, so the final step is an
+            # os.replace within one filesystem - a reader never sees half a JPEG.
+            shutil.copyfile(staged, tmp_out)
+            os.replace(tmp_out, output_path)
+        except OSError as exc:
+            try:
+                os.unlink(tmp_out)
+            except OSError:
+                pass   # never written, or already gone - nothing to clean up
+            raise PreviewRefused(f'Could not save the screenshot: {exc}', 500)
+        log.info('Screenshot of channel %d saved to %s (from %s)', channel_id, output_path,
+                 'the playing preview' if source == 'preview' else 'a capture session')
+        return source
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
 
 
 def _playlist_is_playable(path: str) -> bool:

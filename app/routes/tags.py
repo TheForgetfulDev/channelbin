@@ -4,7 +4,7 @@ from flask import Blueprint, render_template, request, jsonify
 from sqlalchemy.orm import selectinload
 
 from .. import db
-from ..accounts import _TAG_TOKEN_RE
+from ..accounts import _TAG_TOKEN_RE, profile_tag_cleanup
 from ..config import load_config
 from ..database import Tag, TagPattern, RecordingProfile
 from ..db_utils import retry_on_locked
@@ -160,10 +160,14 @@ def _tag_usage() -> dict[str, list[str]]:
     for name in rec_cfg.get('filename_tags_replace', []) or []:
         note(name, 'filename cleanup (replace)')
 
-    for profile_name, template in db.session.query(
-            RecordingProfile.name, RecordingProfile.filename_template).all():
-        for name in _TAG_TOKEN_RE.findall(template or ''):
-            note(name, f'the "{profile_name}" recording profile')
+    for profile in RecordingProfile.query.all():
+        for name in _TAG_TOKEN_RE.findall(profile.filename_template or ''):
+            note(name, f'the "{profile.name}" recording profile')
+        # A profile's own cleanup counts only while it sets a template - without one it is
+        # named by the global lists above (accounts.filename_naming_for).
+        if profile.filename_template:
+            for name, mode in profile_tag_cleanup(profile):
+                note(name, f'the "{profile.name}" recording profile\'s filename cleanup ({mode})')
 
     return usage
 

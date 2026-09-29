@@ -13,8 +13,7 @@ from ..accounts import (normalize_url, render_filename_template,
                         repoint_candidates_for_channels, transfer_channel_state,
                         # Moved beside render_filename_template so the channel search's
                         # airing grain can render a suggested name too (changelog 412).
-                        filename_tag_cleanup as _tag_cleanup_from_config,
-                        effective_filename_template as _effective_filename_template,
+                        effective_filename_naming as _effective_filename_naming,
                         default_profile_for, tags_matching as _matched_tags)
 from ..channel_groups import (effective_score, rank_members, member_channels,
                               guide_row_targets, member_eager_options,
@@ -240,6 +239,44 @@ def _program_dict(ch, entry, start, stop, *, stream_url, template, tag_cleanup, 
         'is_dummy': entry is None,
         'matched_tags': _matched_tags(all_tags, entry.title, entry.sub_title, entry.description) if entry else [],
     }
+
+
+@guide_bp.route('/api/guide/suggested-name', methods=['POST'])
+def suggested_name_api():
+    """The record modal's name for a showing under the profile now picked in it.
+
+    The server-rendered `suggested_name` is named with the channel's default profile, and a
+    profile carries its own template and tag cleanup, so picking another profile has to
+    rename the showing the way picking one re-pads its times (dev/changelog/1161). The
+    body is the program fields the modal already holds; `profile_id` null means no
+    profile, i.e. the global naming."""
+    from ..accounts import filename_naming_for
+    data = request.get_json(silent=True) or {}
+    profile = None
+    profile_id = data.get('profile_id')
+    if profile_id not in (None, ''):
+        try:
+            profile = db.session.get(RecordingProfile, int(profile_id))
+        except (TypeError, ValueError):
+            return jsonify({'error': 'profile_id must be a profile id.'}), 400
+        if profile is None:
+            return jsonify({'error': 'That recording profile no longer exists.'}), 404
+    try:
+        start = datetime.fromisoformat(str(data.get('start_time', '')).replace('Z', ''))
+        stop = datetime.fromisoformat(str(data.get('stop_time', '')).replace('Z', ''))
+    except ValueError:
+        return jsonify({'error': 'start_time and stop_time must be ISO times.'}), 400
+    template, tag_cleanup = filename_naming_for(load_config(), profile)
+    name = render_filename_template(template, {
+        'start_time': start,
+        'stop_time': stop,
+        'title': str(data.get('title') or ''),
+        'sub_title': str(data.get('sub_title') or ''),
+        'description': str(data.get('description') or ''),
+        'channel_name': str(data.get('channel_name') or ''),
+        'category': str(data.get('category') or ''),
+    }, tag_cleanup=tag_cleanup)
+    return jsonify({'success': True, 'name': name})
 
 
 def _guide_row_entries(streak_threshold=DEFAULT_FAILING_STREAK_THRESHOLD):
@@ -518,7 +555,6 @@ def epg_api():
         return jsonify({'error': 'Invalid start/end parameters'}), 400
 
     cfg = load_config()
-    tag_cleanup = _tag_cleanup_from_config(cfg)
     streak_threshold = cfg.get('channel_testing', {}).get(
         'failing_streak_threshold', DEFAULT_FAILING_STREAK_THRESHOLD)
     # Hoisted beside cfg, not read inside the per-program loop below - _program_dict runs
@@ -597,7 +633,7 @@ def epg_api():
         ch = active if group is not None else obj
         display_name = group.name if group is not None else None
 
-        template = _effective_filename_template(cfg, ch, group)
+        template, tag_cleanup = _effective_filename_naming(cfg, ch, group)
         default_profile = default_profile_for(ch, group)
         ranked = pinned = None
         listings_names = {}

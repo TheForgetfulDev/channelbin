@@ -236,6 +236,9 @@
            The single-channel ad hoc test survives on the phone row sheet and on a
            channel's own page, which have no group to work from. #}
         <button class="btn btn-sm btn-primary" id="sel-group" type="button">+ Group selected (0)</button>
+        {# Airings only, and only once a showing is ticked: the one selection-bar action
+           that acts on SHOWINGS rather than channels (dev/changelog/1157). #}
+        <button class="btn btn-sm" id="sel-sched" type="button" style="display:none">Schedule selected (0)</button>
         <button class="btn btn-sm" id="sel-add" type="button">+ Add selected to guide (0)</button>
         {# Hide is not Delete and not Remove: nothing is destroyed and nothing leaves a
            list it was put in by hand. A channel in the TV Guide or a group is not refused
@@ -323,6 +326,8 @@ window.CHANNEL_SEARCH_CONFIG = {
      the raw stream URL (the row payload masks it), the recording's profile and the
      group behind a group-backed recording. Fetched per Record CLICK, not per row. #}
   recordContextUrlBase: '/api/channels/airings/',    {# + <epg id>/record-context #}
+  bulkPreviewUrl: {{ url_for('recordings.bulk_schedule_preview_json') | tojson }},
+  bulkScheduleUrl: {{ url_for('recordings.bulk_schedule_json') | tojson }},
   {# The replace action context, RESOLVED - null when `replace_rec` named a recording that
      is no longer scheduled. That resolution is the authority: the JS drops the parameter
      from its state when this is null, so a stale link cannot leave the URL claiming a
@@ -371,6 +376,7 @@ window.onScheduleSaved = () => {
 </script>
 <script src="{{ url_for('static', filename='js/guide.js') }}"></script>
 <script src="{{ url_for('static', filename='js/channel-search.js') }}"></script>
+<script src="{{ url_for('static', filename='js/bulk-schedule-modal.js') }}"></script>
 <script src="{{ url_for('static', filename='js/schedule-fields.js') }}"></script>
 <script src="{{ url_for('static', filename='js/check-modal.js') }}"></script>
 <script src="{{ url_for('static', filename='js/dup-modal.js') }}"></script>

@@ -19,8 +19,8 @@ from ..channel_groups import report_orphaned_guide_groups
 from ..channel_search import GROUP_ANY, OTHER_NEW, OTHER_REMOVED
 from ..config import load_config, config_default
 from ..database import (Account, AccountBlock, AccountStatDay, Channel, AccountSyncLog,
-                        ChannelGroupMember, EpgSource, EpgSourceSubscription, EPG_SOURCE_PROVIDER,
-                        EPG_SOURCE_URL)
+                        ChannelGroupMember, ChannelTest, EpgSource, EpgSourceSubscription,
+                        EPG_SOURCE_PROVIDER, EPG_SOURCE_URL)
 from ..db_utils import retry_on_locked
 from ..epg_sources import (MATCH_DISAGREE, MATCH_NEW, REFRESH_HOURS_CHOICES,
                            accept_name_matches, account_sources_view,
@@ -32,6 +32,7 @@ from ..epg_sources import (MATCH_DISAGREE, MATCH_NEW, REFRESH_HOURS_CHOICES,
                            stop_using_source, subscribe_to_source, update_url_source,
                            use_source_again)
 from ..logo_cache import delete_cached_logos
+from ..storage_dirs import manual_screenshot_paths
 from ..tz_utils import format_local, get_display_tz, is_24h, parse_local_to_utc
 from ..account_blocks import (MAX_ACCOUNT_BLOCK_HOURS, account_limits, add_account_block,
                               block_views,
@@ -609,6 +610,20 @@ def _delete_account_and_jobs(account_id):
             Channel.logo_cache_path.isnot(None)).all()
     ]
 
+    # Screenshots are files, not rows, for the same reason: the cascade takes every
+    # ChannelTest and the channel rows that say a hand capture exists, and leaves the images
+    # on disk. Read before the delete, unlinked after it has committed (dev/changelog/1160).
+    cfg = load_config()
+    channel_ids = [cid for (cid,) in db.session.query(Channel.id).filter(
+        Channel.account_id == account_id).all()]
+    screenshot_paths = []
+    for chunk in _chunked(channel_ids, _DELETE_CHUNK_SIZE):
+        screenshot_paths.extend(
+            p for (p,) in db.session.query(ChannelTest.screenshot_path)
+            .filter(ChannelTest.channel_id.in_(chunk))
+            .filter(ChannelTest.screenshot_path.isnot(None)).all())
+        screenshot_paths.extend(manual_screenshot_paths(cfg, chunk))
+
     # Which groups are about to lose a member, read while the membership rows still
     # exist - the account's cascade takes its channels, and Channel.group_memberships'
     # delete-orphan cascade takes their memberships with them, so this query finds
@@ -657,6 +672,9 @@ def _delete_account_and_jobs(account_id):
         forget_reader(read_elsewhere)
     if cached_paths:
         delete_cached_logos(cached_paths)
+    if name is not None and screenshot_paths:
+        from ..recorder import delete_files
+        delete_files(screenshot_paths)
     report_orphaned_guide_groups(
         touched_group_ids,
         cause=f'The channels it could record from belonged to the deleted account "{name}".'

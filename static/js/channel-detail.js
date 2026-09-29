@@ -277,13 +277,16 @@
     }
   }
 
-  function repointChannel() {
+  async function repointChannel() {
     const r = C.repoint;
     if (!r) return;
-    if (!confirm(`Re-point "${C.channelName}" to "${r.name}" on ${r.account}?\n\n` +
-        'This transfers guide listing, channel-group assignment, SCHEDULED recordings, and ' +
-        `channel-test enrollment to the surviving channel. "${C.channelName}" will no longer ` +
-        'appear in the guide or be tested.')) return;
+    if (!(await confirmModal({
+      title: 'Re-point channel',
+      message: `The guide listing, channel-group assignment, scheduled recordings and health ` +
+        `check enrollment move from "${C.channelName}" to "${r.name}" on ${r.account}.`,
+      consequence: `"${C.channelName}" will no longer appear in the guide or be tested.`,
+      confirmLabel: 'Re-point',
+    }))) return;
     jsonFetch(C.urls.repoint, {
       method: 'POST', body: JSON.stringify({ survivor_channel_id: r.id }),
     })
@@ -337,12 +340,14 @@
       .catch((e) => showActionError(e.message || 'Could not change this channel.'));
   }
 
+  // The test runs in a background thread. Nothing here waits for it: the live refresh
+  // below is the page's one updater for a result, however the test was started. The
+  // button stays disabled until a refresh replaces it.
   function testNow(btn) {
     btn.disabled = true;
     jsonFetch(C.urls.testNow, { method: 'POST' })
       .then(data => {
-        showToast(data.message || 'Testing this channel now - the page will refresh when it finishes.');
-        pollForTest(btn);
+        showToast(data.message || 'Testing this channel now - this page updates itself when it finishes.');
       })
       .catch(e => {
         btn.disabled = false;
@@ -350,22 +355,79 @@
       });
   }
 
-  // The test runs in a background thread, so the page watches the shared tester status
-  // rather than holding the request open. Reloading when it goes idle is what puts the
-  // new result on the page.
-  function pollForTest(btn) {
-    let sawRunning = false;
-    const tick = () => {
-      jsonFetch('/api/channel-tests/status')
-        .then(s => {
-          if (s.is_running) { sawRunning = true; setTimeout(tick, 2000); return; }
-          if (!sawRunning) { setTimeout(tick, 2000); return; }
-          location.reload();
-        })
-        .catch(() => { if (btn) btn.disabled = false; });
-    };
-    setTimeout(tick, 1500);
+  // One live frame, no test (dev/changelog/1160). The request blocks for the few seconds
+  // the capture takes; the Health card then gets it through the same swap a test result
+  // does, so the tile has one updater, and the frame opens in the lightbox as well.
+  function captureScreenshot() {
+    const btns = document.querySelectorAll('[data-act="screenshot"]');
+    btns.forEach(b => { b.disabled = true; });
+    showToast('Capturing a frame from the live stream…');
+    jsonFetch(C.urls.screenshot, { method: 'POST' })
+      .then(data => refreshLive()
+        .catch(err => console.warn('Health card refresh after a screenshot failed.', err))
+        .then(() => {
+          showToast(data.source === 'preview'
+            ? 'Screenshot saved, taken from the preview that is playing.'
+            : 'Screenshot saved.');
+          openLightbox(data.url, 'Screenshot');
+        }))
+      .catch(e => showActionError(e.message || 'Could not capture a screenshot.'))
+      .finally(() => {
+        document.querySelectorAll('[data-act="screenshot"]').forEach(b => { b.disabled = false; });
+      });
   }
+
+  // ── Live refresh (dev/changelog/1158) ─────────────────────────────────────
+  // Driven by base.html's /api/nav-status poll, which hands over
+  // channel_tester.health_check_signature(). When it differs from the one #cd-statusbar
+  // was rendered at - a test of this channel started or finished, from Test now, a group's
+  // check or the nightly one alike - the status bar and the three cards a result lands in
+  // are swapped for a fresh render of this same URL, so the test history keeps its page.
+  // The What's on card is never swapped: guide.js owns it. The section order and hidden
+  // sections are a stylesheet keyed on [data-section], so swapping whole cards cannot
+  // disturb them. The rollback confirms read the swapped #cd-health-state, never a
+  // load-time copy, and open score breakdowns are re-opened by the entry they belong to.
+  // The swap waits while a menu, a dialog or the actions sheet is open (the preview is a
+  // dialog too), and the next poll asks again.
+  const LIVE_REGIONS = ['#cd-statusbar', '#cd-health', '#cd-timeline', '#cd-tests'];
+  let hcInFlight = false;
+  const refreshBusy = () => Boolean(document.querySelector('.menu.open, .modal'));
+
+  function healthState() {
+    const el = byId('cd-health-state');
+    try {
+      return el ? JSON.parse(el.textContent) : {};
+    } catch (e) {
+      console.warn('Unreadable #cd-health-state', e);
+      return {};
+    }
+  }
+
+  function refreshLive() {
+    const openBd = Array.from(document.querySelectorAll('#cd-timeline details[data-bd][open]'))
+      .map(d => d.dataset.bd);
+    return swapFromServer(LIVE_REGIONS).then(() => {
+      document.querySelectorAll('#cd-timeline details[data-bd]').forEach(d => {
+        if (openBd.includes(d.dataset.bd)) d.open = true;
+      });
+      // The phone's sticky bar is not a swapped region, so the Test button a click
+      // disabled there is given back here, as the status bar's is by being replaced.
+      document.querySelectorAll('.cd-stickybar [data-act="test-now"]').forEach(b => { b.disabled = false; });
+    });
+  }
+
+  window.__applyHealthCheck = (hc) => {
+    if (!hc || typeof hc.sig !== 'string') return;
+    // Read on every poll, not only on a swap: the create-check dialog words its Run now
+    // option from it, and the tester can go busy without this channel's regions moving.
+    C.testerBusy = Boolean(hc.busy);
+    const bar = byId('cd-statusbar');
+    if (!bar || hcInFlight || refreshBusy() || hc.sig === bar.dataset.hcSig) return;
+    hcInFlight = true;
+    refreshLive()
+      .catch((err) => console.warn('Channel page refresh failed; the next poll retries.', err))
+      .finally(() => { hcInFlight = false; });
+  };
 
   function openAddToGroupModal() {
     const body = document.createElement('div');
@@ -438,9 +500,13 @@
     });
   }
 
-  function clearEpgKey(el) {
-    if (!confirm(`Clear your EPG key for ${el.dataset.sourceName}?\n\n` +
-        "This channel goes back to the provider's id for that source.")) return;
+  async function clearEpgKey(el) {
+    if (!(await confirmModal({
+      title: 'Clear EPG key',
+      message: `Your EPG key for ${el.dataset.sourceName} is cleared.`,
+      consequence: "This channel goes back to the provider's id for that source.",
+      confirmLabel: 'Clear key',
+    }))) return;
     saveEpgKey(Number(el.dataset.sourceId), '')
       .catch(e => showToast(e.message || 'Could not clear the key.', { type: 'error' }));
   }
@@ -790,11 +856,11 @@
 
   /* Roll the health score back by hand - a full reset, or one observation at a time.
      Both open a confirm naming exactly what will happen and what the score will become,
-     because the server has already computed both (C.healthRollback, from the same replay
+     because the server has already computed both (#cd-health-state, from the same replay
      that will run). Never a bare confirm(): the reset also clears the manual offset, and a
      dialog that does not say so is the "UI text describing backend behavior" defect. */
   function rollbackHealth(action) {
-    const rb = C.healthRollback || {};
+    const rb = healthState().healthRollback || {};
     if (!rb.available) {
       showToast('This channel has no observations left to unwind.', { type: 'error' });
       return;
@@ -945,6 +1011,7 @@
       case 'repoint': repointChannel(); return;
       case 'test-now': testNow(el); return;
       case 'preview': openPreview(); return;
+      case 'screenshot': captureScreenshot(); return;
       case 'add-group': openAddToGroupModal(); return;
       case 'create-check': openCreateCheck(); return;
       case 'epg-key-set': openEpgKeyModal(el); return;

@@ -321,14 +321,18 @@ class LifecycleTests(_Live):
         self.assertEqual(self._holders(), [])
 
     def test_playlist_fetches_keep_an_idle_preview_alive(self):
-        with self._config_with(idle_timeout_seconds=1):
+        """Fetches span 2.5x the idle timeout, with 1.5 s of slack per gap: a 0.5 s margin
+        against a 1 s timeout lost to one slow request on a loaded box (dev/docs/BUGS.md
+        2026-09-29)."""
+        with self._config_with(idle_timeout_seconds=2):
             data = self._start().get_json()
         sid = data['session_id']
         self._wait_state(sid, preview.STATE_READY)
-        for _ in range(6):
+        for _ in range(10):
             self.assertEqual(self.client.get(data['playlist_url']).status_code, 200)
             time.sleep(0.5)
-        self.assertTrue(preview.get_session(sid).live)
+        session = preview.get_session(sid)
+        self.assertTrue(session.live, f'preview stopped: {session.reason} {session.detail}')
 
     def test_hard_cap_stops_a_long_preview(self):
         with self._config_with(max_seconds=2):

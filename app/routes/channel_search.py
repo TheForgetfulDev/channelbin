@@ -682,8 +682,7 @@ def airing_record_context_api(epg_id):
     Read-only, and it answers for exactly one EPG id - there is no way to enumerate stream
     URLs through it.
     """
-    from ..accounts import (default_profile_for, effective_filename_template,
-                            filename_tag_cleanup, normalize_url)
+    from ..accounts import default_profile_for, effective_filename_naming, normalize_url
     from ..database import EPGEntry, Recording
     from ..recording_match import build_rec_indexes, candidate_recs, match_recording
     from ..tz_utils import get_display_tz
@@ -733,11 +732,12 @@ def airing_record_context_api(epg_id):
                                      'group.'}), 400
 
     all_tags = Tag.query.all()
+    template, tag_cleanup = effective_filename_naming(cfg, ch, chosen_group)
     prog = _program_dict(
         ch, entry, entry.start_time, entry.stop_time,
         stream_url=stream_url,
-        template=effective_filename_template(cfg, ch, chosen_group),
-        tag_cleanup=filename_tag_cleanup(cfg),
+        template=template,
+        tag_cleanup=tag_cleanup,
         rec=rec,
         all_tags=all_tags,
         # One showing, so this is not the N+1 case the map exists for - but the parameter is

@@ -319,8 +319,11 @@
 
 {# ── Status / action bar ────────────────────────────────────────────────
      Every state is named explicitly - no trailing else renders a real state, or the
-     next one added lands in it silently (CLAUDE.md, defect-class rules). #}
-<div class="gd-actionbar">
+     next one added lands in it silently (CLAUDE.md, defect-class rules).
+     #cd-statusbar, and the Health, Activity Timeline and Test History cards, are swapped for
+     a fresh render whenever the health-check signature it carries moves
+     (channel-detail.js, dev/changelog/1158). #}
+<div class="gd-actionbar" id="cd-statusbar" data-hc-sig="{{ hc_sig }}">
   {% if lifecycle_state == 'missing' %}
   <span class="badge b-warn">Missing from feed</span>
   <span class="gd-ab-msg">
@@ -385,6 +388,8 @@
        which is why it is its own verb rather than a mode of Test (DESIGN.md 4). #}
     <button class="btn btn-sm tip-plain" data-act="preview"
             data-tip="Preview.&#10;Plays this channel's live stream right here, so you can see it is the right channel and that it plays before a recording relies on it. Holds one of this account's connections while it runs, and gives it up to any recording that needs it.">Preview</button>
+    <button class="btn btn-sm tip-plain" data-act="screenshot"
+            data-tip="Capture screenshot.&#10;Grabs a single frame from the live stream right now, without a full test. Honors this account's connection limit.">Capture screenshot</button>
     <button class="btn btn-primary btn-sm tip-plain" data-act="test-now"
             data-tip="Test now.&#10;Runs a one-off &quot;does this play right now?&quot; check - a short capture and probe, distinct from a scheduled health check. Honors this account's connection limit.">&#9654; Test now</button>
     <span class="menu-wrap">
@@ -394,6 +399,7 @@
         {# Phone only: the sticky bar's sheet is built from this menu, and the bar itself has
            no room for a fourth button. On desktop Preview is the header button above. #}
         <button class="menu-item cd-phone-only" data-act="preview">Preview</button>
+        <button class="menu-item" data-act="screenshot">Capture screenshot</button>
         <button class="menu-item" data-act="add-group">&#9939; Add to channel group&hellip;</button>
         <button class="menu-item" data-act="create-check">&#10003; Create health check for this channel</button>
         <div class="sep"></div>
@@ -532,7 +538,11 @@
 
   {# Health: the score is a full-width header; under it the screenshot and the latest test
      are two columns split by the rule, so their labels start on the same line (round 4). #}
-  <div class="card" data-section="health">
+  <div class="card" data-section="health" id="cd-health">
+    {# What the two rollback confirms promise, computed by the same replay the action will
+       run (app/health_recompute.py::rollback_preview). Here rather than in CHANNEL_DETAIL
+       because a test landing moves it, and this card is swapped when one does. #}
+    <script type="application/json" id="cd-health-state">{{ {'healthRollback': health_rollback} | tojson }}</script>
     <div class="card-head">
       <h2>Channel Health</h2>
       <div class="card-head-actions">
@@ -609,11 +619,25 @@
       </div>
       {% endif %}
 
-      {% if latest_test %}
+      {% endif %}
+
+      {# Outside the tested/untested branch above, so a channel with no test yet still shows a
+         frame taken by hand. The tile shows whichever is newer - the hand capture or the
+         latest test's - and its caption says which (dev/changelog/1160). #}
+      {% if latest_test or manual_shot %}
       <div class="health-lower">
         <div class="hl-shot">
           <div class="shot-lbl">Latest screenshot</div>
-          {% if latest_test.screenshot_path and latest_test.screenshot_pruned %}
+          {% if manual_shot %}
+          <a class="shot-link" href="{{ manual_shot.url }}" target="_blank">
+            <img src="{{ manual_shot.url }}" class="shot-frame" alt="Latest screenshot" loading="lazy"
+                 onerror="this.parentElement.style.display='none';this.parentElement.nextElementSibling.style.display='flex'">
+          </a>
+          <div class="shot-frame screenshot-placeholder missing" style="display:none"
+               title="The screenshot taken by hand is no longer on disk.">
+            Screenshot unavailable
+          </div>
+          {% elif latest_test.screenshot_path and latest_test.screenshot_pruned %}
           <div class="shot-frame screenshot-placeholder pruned"
                title="Screenshot was pruned by the retention policy. Change how many screenshots are kept per test in Settings &rarr; Channel Health Checks.">
             Screenshot pruned
@@ -634,8 +658,13 @@
             No screenshot
           </div>
           {% endif %}
+          {% if manual_shot %}
+          <div class="shot-cap">{{ manual_shot.at | local_time }}, captured by hand</div>
+          {% else %}
           <div class="shot-cap">{{ latest_test.test_started_at | local_time }}, during the last test</div>
+          {% endif %}
         </div>
+        {% if latest_test %}
         <div class="hs-rule"></div>
         <div class="hl-tests">
           <div class="latest-line">
@@ -709,8 +738,8 @@
           </p>
           {% endif %}
         </div>
+        {% endif %}
       </div>
-      {% endif %}
       {% endif %}
     </div>
   </div>
@@ -1003,7 +1032,7 @@
 
   {# Activity timeline: the same event-log component the recording detail page uses
      (channels/_timeline.html, styled in style.css). #}
-  <div class="card" data-section="timeline">
+  <div class="card" data-section="timeline" id="cd-timeline">
     <div class="card-head"><h2>Activity Timeline</h2></div>
     <div class="card-body">
       {% if not timeline_entries %}
@@ -1125,7 +1154,7 @@
 
   {# Test history: one row per test. A failure's detail hangs off the status pill as a
      tooltip rather than riding on a second <tr> (round 4), so the table stays scannable. #}
-  <div class="card" data-section="tests">
+  <div class="card" data-section="tests" id="cd-tests">
     <div class="card-head"><h2>Test History</h2></div>
     <div class="card-body">
       {% if not test_history %}
@@ -1318,9 +1347,6 @@ window.CHANNEL_DETAIL = {
   notes: {{ (channel.notes or '') | tojson }},
   healthAdjustment: {{ channel.manual_health_adjustment }},
   healthNote: {{ (channel.manual_health_note or '') | tojson }},
-  {# What the two confirm dialogs promise, computed by the same replay the action will run
-     (app/health_recompute.py::rollback_preview) rather than guessed at in JS. #}
-  healthRollback: {{ health_rollback | tojson }},
   epgTitleCap: {{ guide_source.title_cap }},
   defaultProfileId: {{ channel.default_profile_id | tojson }},
   defaultProfileName: {{ (channel.default_profile.name if channel.default_profile else None) | tojson }},
@@ -1354,6 +1380,7 @@ window.CHANNEL_DETAIL = {
     sectionPref: '/api/user-prefs/channel_detail_sections',
     testNow: '/api/channels/{{ channel.id }}/test-now',
     preview: '{{ url_for("preview.start_channel_preview", channel_id=channel.id) }}',
+    screenshot: '{{ url_for("preview.capture_channel_screenshot", channel_id=channel.id) }}',
     {# Loaded on the first Preview click, not with the page: 386 KB nobody pays for until
        they ask to watch something (static/vendor/hls.js/NOTICE.md). #}
     hlsJs: '{{ url_for("static", filename="vendor/hls.js/hls.light.min.js") }}',

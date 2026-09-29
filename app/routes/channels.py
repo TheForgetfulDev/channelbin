@@ -1,5 +1,6 @@
 import json
 import logging
+import os
 import threading
 from datetime import datetime
 from urllib.parse import parse_qsl, urlencode
@@ -30,6 +31,7 @@ from .. import channel_hiding
 from ..config import load_config
 from ..db_utils import retry_on_locked
 from ..logo_cache import get_logo_cache_dir, resolve_logo_url
+from ..storage_dirs import manual_screenshot_paths
 from .. import fmt_utils
 
 log = logging.getLogger(__name__)
@@ -94,7 +96,7 @@ def _chunked(items, size):
         yield items[i:i + size]
 from .channel_tests import _serialize_dup_groups
 from .channel_groups import _next_guide_sort_order
-from ..channel_tester import get_status, health_check_profile_payload
+from ..channel_tester import get_status, health_check_profile_payload, health_check_signature
 
 channels_bp = Blueprint('channels', __name__)
 
@@ -709,6 +711,10 @@ def channel_detail(channel_id):
     channel = db.session.get(Channel, channel_id)
     if channel is None:
         abort(404)
+    # Read before the test rows: a result landing in between costs one extra refresh of
+    # the live regions, where a signature read after them would vouch for a state the page
+    # never showed (dev/changelog/1158).
+    hc_sig = health_check_signature()['sig']
 
     duplicate_channels = []
     if channel.is_duplicate_stream_url:
@@ -828,6 +834,21 @@ def channel_detail(channel_id):
 
     cfg = load_config()
     lifecycle_by_channel = _lifecycle_states_for_channels([channel], cfg)
+
+    # The Health card's "Latest screenshot" tile shows a hand capture while it is newer than
+    # the latest test (dev/changelog/1160). No stat of the file: the column is the record.
+    manual_shot = None
+    if channel.screenshot_captured_at and (
+            latest_test is None
+            or channel.screenshot_captured_at >= latest_test.test_started_at):
+        from ..storage_dirs import manual_screenshot_path
+        manual_shot = {
+            'at': channel.screenshot_captured_at,
+            'url': url_for('channel_tests.serve_screenshot',
+                           filename=os.path.basename(manual_screenshot_path(cfg, channel.id)),
+                           v=int(channel.screenshot_captured_at.timestamp())),
+        }
+
     lifecycle_state, lifecycle_since = lifecycle_by_channel.get(channel.id, (None, None))
     repoint_candidate = _repoint_candidates_for_channels(
         [channel], cfg, lifecycle_by_channel).get(channel.id)
@@ -890,7 +911,9 @@ def channel_detail(channel_id):
         test_pagination=test_pagination,
         per_page=per_page,
         latest_test=latest_test,
+        manual_shot=manual_shot,
         in_progress_test_id=in_progress_test_id,
+        hc_sig=hc_sig,
         quality_stats=quality_stats,
         test_profiles=test_profiles,
         coded_tip=fmt_utils.CODED_TIP,
@@ -1266,6 +1289,7 @@ def missing_delete():
                 .filter(ChannelTest.channel_id.in_(chunk))
                 .filter(ChannelTest.screenshot_path.isnot(None)).all()
             )
+            screenshot_paths.extend(manual_screenshot_paths(cfg, chunk))
 
         # Which groups are about to lose a member, read while the membership rows still
         # exist. Any of them left in the TV Guide with nothing switched on for recording
@@ -1391,7 +1415,7 @@ def test_channel_now(channel_id):
     threading.Thread(target=run_single_channel_test, args=(app, channel_id),
                      daemon=True, name=f'test-now-{channel_id}').start()
     return jsonify({'success': True,
-                    'message': f'Testing "{channel.name}" now - this page will refresh when it finishes.'})
+                    'message': f'Testing "{channel.name}" now - this page updates itself when it finishes.'})
 
 
 @channels_bp.route('/channels/<int:channel_id>/notes', methods=['POST'])

@@ -371,6 +371,14 @@ class RecordingProfile(db.Model):
     name                      = db.Column(db.String(255), nullable=False)
     # None = use global recording.filename_template
     filename_template         = db.Column(db.String(512))
+    # The profile's own tag-cleanup lists, JSON arrays of tag names. They travel WITH the
+    # template rather than inheriting on their own: a profile that sets a template is
+    # named by its template and these lists (NULL reads as empty), and one that does not
+    # inherits the global template and the global lists together, exactly as the Settings
+    # designer saves all three as one unit (accounts.filename_naming_for,
+    # dev/changelog/1161).
+    filename_tags_remove      = db.Column(db.Text)
+    filename_tags_replace     = db.Column(db.Text)
     pre_padding_minutes       = db.Column(db.Integer, nullable=False, default=0,
                                           server_default=db.text('0'))
     post_padding_minutes      = db.Column(db.Integer, nullable=False, default=0,
@@ -1712,6 +1720,10 @@ class Channel(db.Model):
     # watchdog's automatic pacing (CAPTURE_PACING_ENABLED) lives on the running recording's
     # state and never writes here, and an explicit False is what stops it (dev/changelog/997).
     pace_realtime    = db.Column(db.Boolean)
+    # When the channel page's "Capture screenshot" last saved a frame (naive UTC). The file
+    # is storage_dirs.manual_screenshot_path(); NULL means none has been taken. Not a health
+    # observation and never read by the score (dev/changelog/1160).
+    screenshot_captured_at = db.Column(db.DateTime)
     # Channel lifecycle tracking (DESIGN-sync-resilience.md §5): first_seen_at is set once
     # at row creation; last_seen_at is updated on every sync whose feed includes the
     # channel (both stamped in app/accounts.py::_upsert_channels, the one shared M3U/

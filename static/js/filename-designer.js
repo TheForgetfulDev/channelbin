@@ -3,11 +3,13 @@
    Replaces /settings/template and templates/template_editor.html, both deleted outright in
    the same change (DESIGN.md 11.4: a losing spelling gets deleted, not switched off).
 
-   It is written as a COMPONENT rather than a page script. `openFilenameDesigner()` is the
-   modal host Settings uses; `designerBodyHtml()` and the delegated wiring below are the
-   seam a second host swaps into its own panel - a Recording Profile's template field is
-   the next one, and the fixed ordering (2026-07-27) is that the Settings designer is
-   revamped first so that field adopts this rather than the old editor.
+   It is written as a COMPONENT rather than a page script, with two hosts. Settings opens
+   it as its own modal (`openFilenameDesigner()`), which saves to config.yaml. A Recording
+   Profile opens it as a STEP inside the profile modal (`FilenameDesigner.embed()`): the
+   profile's body and foot are set aside, the designer is drawn into the same panel, and
+   they come back on Use template or Cancel. That host never writes anything - it hands the
+   template and its two cleanup lists back to the profile form, which saves them with the
+   profile (dev/changelog/1161).
 
    THREE THINGS THIS FILE DELIBERATELY DOES NOT DO:
 
@@ -45,7 +47,10 @@ const FD_PICKER_PAGE = 200;
 
 let FD_BOOT = null;          // one /api/filename-designer fetch per page load
 let fdModal = null;
-let fdOnSave = null;
+/* What Save and Cancel mean, which is the one thing the two hosts disagree about:
+   { embedded, save(values), cancel() }. Nothing else in the component asks which host
+   it is in. */
+let fdHost = null;
 let fdPreviewTimer = null;
 let fdPickerTimer = null;
 /* Debounced requests can land out of order, and a stale response overwriting a newer one
@@ -471,10 +476,18 @@ function refreshPicker() {
 }
 
 /* ── Step rendering. One overlay, two bodies and two feet. ──────────────────────────── */
-const FD_DESIGNER_FOOT = `<span class="modal-foot-note">Saved as recording.filename_template. The same
-    designer is what a Recording Profile's own template field will open.</span>
+/* The embedded host's primary button is not Save: nothing is stored until the profile
+   itself is saved, and a Save here followed by a Cancel on the profile would have promised
+   a write that never happened. */
+function designerFootHtml() {
+  const embedded = fdHost && fdHost.embedded;
+  const note = embedded
+    ? 'Goes into this profile, and is stored when you save the profile.'
+    : 'Saved as recording.filename_template. A Recording Profile can set its own.';
+  return `<span class="modal-foot-note">${note}</span>
   <button class="btn" type="button" data-fd-cancel>Cancel</button>
-  <button class="btn btn-primary" type="button" data-fd-save>Save</button>`;
+  <button class="btn btn-primary" type="button" data-fd-save>${embedded ? 'Use template' : 'Save'}</button>`;
+}
 
 const FD_PICKER_FOOT = `<span class="modal-foot-note">The full search - facets, saved searches, the
     columns picker - lives on the Channels page. This is the same rows, cut down to picking one.</span>
@@ -485,7 +498,7 @@ function renderStep() {
   const designer = S.step === 'designer';
   fdModal.querySelector('.modal-head h2').textContent = designer ? 'Filename template' : 'Pick a program';
   fdModal.querySelector('.modal-body').innerHTML = designer ? designerBodyHtml() : pickerBodyHtml();
-  fdModal.querySelector('.modal-foot').innerHTML = designer ? FD_DESIGNER_FOOT : FD_PICKER_FOOT;
+  fdModal.querySelector('.modal-foot').innerHTML = designer ? designerFootHtml() : FD_PICKER_FOOT;
   if (designer) {
     syncDropdownTriggers();
     const save = fdModal.querySelector('[data-fd-save]');
@@ -575,10 +588,25 @@ function registerDesignerDropdowns() {
 /* ── Wiring. Delegated on the overlay, so a region that gets rebuilt (the designer, the
       picker list, the day chips) keeps working without re-binding. ──────────────────── */
 function wireDesigner(overlay) {
+  // Once per overlay. The profile modal can open the step many times, and a second set of
+  // delegated listeners would insert every chip twice.
+  if (overlay.fdWired) return;
+  overlay.fdWired = true;
+  // Escape steps back one level: the picker to the designer, the designer to its host's
+  // Cancel (which closes the Settings modal, and returns to the profile form).
+  overlay.escapeHandler = () => {
+    if (fdModal !== overlay) { overlay.closeModal(); return; }
+    closeDropdown();
+    if (S.step === 'picker') backToDesigner();
+    else fdHost.cancel();
+  };
   overlay.addEventListener('click', (e) => {
+    // The profile host keeps these listeners after the step closes; they must not act on
+    // its own form.
+    if (fdModal !== overlay) return;
     const t = e.target;
 
-    if (t.closest('[data-fd-cancel]')) { overlay.closeModal(); return; }
+    if (t.closest('[data-fd-cancel]')) { fdHost.cancel(); return; }
     if (t.closest('[data-fd-save]')) { saveTemplate(); return; }
     if (t.closest('[data-fdpick-open]')) { openPickerStep(); return; }
     if (t.closest('[data-fd-back]')) { backToDesigner(); return; }
@@ -623,6 +651,7 @@ function wireDesigner(overlay) {
   });
 
   overlay.addEventListener('input', (e) => {
+    if (fdModal !== overlay) return;
     const t = e.target;
     if (t.id === 'fd-tpl') { S.tpl = t.value; schedulePreview(); return; }
     if (t.id === 'fd-pksearch') {
@@ -641,6 +670,10 @@ function wireDesigner(overlay) {
 
 function saveTemplate() {
   if (!S.tpl.trim()) return;
+  if (fdHost.embedded) {
+    fdHost.save({ template: S.tpl.trim(), remove: S.remove.slice(), replace: S.replace.slice() });
+    return;
+  }
   jsonFetch('/api/filename-template', {
     method: 'POST',
     body: JSON.stringify({ template: S.tpl, remove: S.remove, replace: S.replace }),
@@ -651,7 +684,7 @@ function saveTemplate() {
     // designer without a page reload has to see what was just saved rather than what was
     // there when the page loaded.
     if (FD_BOOT) { FD_BOOT.template = d.template; FD_BOOT.remove = d.remove; FD_BOOT.replace = d.replace; }
-    if (fdOnSave) fdOnSave(d);
+    if (fdHost && fdHost.onSave) fdHost.onSave(d);
     if (fdModal) fdModal.closeModal();
   }).catch((e) => showToast(e.message || 'Could not save the template.', { type: 'error' }));
 }
@@ -669,14 +702,23 @@ function fdLoadBoot() {
 
 /* `onSave` is how a host learns the template changed - Settings uses it to update the
    value it shows on the field row. The component never reaches into its host's DOM. */
+function resetState(start) {
+  S.step = 'designer';
+  S.tpl = start.template || '';
+  S.remove = (start.remove || []).slice();
+  S.replace = (start.replace || []).slice();
+  S.preview = null;
+}
+
+function stopTimers() {
+  clearTimeout(fdPreviewTimer);
+  clearTimeout(fdPickerTimer);
+}
+
 function openFilenameDesigner({ onSave = null } = {}) {
-  fdOnSave = onSave;
   fdLoadBoot().then(() => {
-    S.step = 'designer';
-    S.tpl = FD_BOOT.template || '';
-    S.remove = (FD_BOOT.remove || []).slice();
-    S.replace = (FD_BOOT.replace || []).slice();
-    S.preview = null;
+    fdHost = { embedded: false, onSave, cancel: () => { if (fdModal) fdModal.closeModal(); } };
+    resetState(FD_BOOT);
     // The first preview is fetched BEFORE the panel is built, so the modal never opens
     // showing an empty filename that fills in a moment later - the filename is the whole
     // point of the screen and a blank first frame reads as a broken one.
@@ -690,8 +732,7 @@ function openFilenameDesigner({ onSave = null } = {}) {
         onClose: () => {
           closeDropdown();
           fdModal = null;
-          clearTimeout(fdPreviewTimer);
-          clearTimeout(fdPickerTimer);
+          stopTimers();
         },
       });
       // buildModal only builds a foot when it is given footer entries, and this component
@@ -699,7 +740,7 @@ function openFilenameDesigner({ onSave = null } = {}) {
       // it covers everything else.
       const foot = document.createElement('div');
       foot.className = 'modal-foot';
-      foot.innerHTML = FD_DESIGNER_FOOT;
+      foot.innerHTML = designerFootHtml();
       fdModal.querySelector('.modal-panel').appendChild(foot);
       wireDesigner(fdModal);
       syncDropdownTriggers();
@@ -711,13 +752,75 @@ function openFilenameDesigner({ onSave = null } = {}) {
   }).catch(() => showToast('Could not open the filename designer.', { type: 'error' }));
 }
 
-  // The modal host is what Settings calls today. `FilenameDesigner` is the seam a second
-  // host uses to put the same body into its own panel - a Recording Profile's template
-  // field is the next one, and exposing the pieces rather than only the modal is what
-  // keeps that from becoming a second implementation (DESIGN.md 15.1).
+/* ── The embedded host: a step inside another modal ─────────────────────────────────
+   `overlay` is an overlay built by buildModal, with a foot. `start` is {template, remove, replace},
+   or null to start from what Settings stores. `onSave(values)` receives the same three
+   and owns the write. The host's title, body and foot NODES are moved aside rather than
+   re-rendered, so its typed values and its buttons' listeners come back untouched. */
+function embedFilenameDesigner(overlay, { start = null, onSave } = {}) {
+  if (fdModal === overlay) return Promise.resolve();
+  return fdLoadBoot().then(() => {
+    const panel = overlay.querySelector('.modal-panel');
+    const h2 = overlay.querySelector('.modal-head h2');
+    const body = overlay.querySelector('.modal-body');
+    const foot = overlay.querySelector('.modal-foot');
+    const saved = {
+      title: h2.textContent,
+      body: document.createDocumentFragment(),
+      foot: document.createDocumentFragment(),
+      scroll: body.scrollTop,
+      hadClasses: ['modal-xwide', 'fd-modal'].filter((c) => panel.classList.contains(c)),
+    };
+    const restore = () => {
+      closeDropdown();
+      stopTimers();
+      fdModal = null;
+      fdHost = null;
+      h2.textContent = saved.title;
+      body.replaceChildren(saved.body);
+      foot.replaceChildren(saved.foot);
+      ['modal-xwide', 'fd-modal'].forEach((c) => {
+        if (!saved.hadClasses.includes(c)) panel.classList.remove(c);
+      });
+      body.scrollTop = saved.scroll;
+    };
+    resetState(start || FD_BOOT);
+    fdHost = {
+      embedded: true,
+      save: (values) => { restore(); onSave(values); },
+      cancel: restore,
+    };
+    return fdFetchPreview().then(() => {
+      saved.body.append(...body.childNodes);
+      saved.foot.append(...foot.childNodes);
+      panel.classList.add('modal-xwide', 'fd-modal');
+      fdModal = overlay;
+      wireDesigner(overlay);
+      renderStep();
+      body.scrollTop = 0;
+      const box = overlay.querySelector('#fd-tpl');
+      if (box) box.focus();
+    });
+  }).catch(() => showToast('Could not open the filename designer.', { type: 'error' }));
+}
+
+/* The profile modal closing while the step is showing (its x, its backdrop) takes the
+   designer with it; this drops the component's hold on the removed panel. */
+function releaseFilenameDesigner(overlay) {
+  if (fdModal !== overlay) return;
+  closeDropdown();
+  stopTimers();
+  fdModal = null;
+  fdHost = null;
+}
+
+  // Two hosts, one component: Settings opens it as a modal, a Recording Profile embeds it
+  // as a step in its own (DESIGN.md 15.1, dev/changelog/1161).
   window.openFilenameDesigner = openFilenameDesigner;
   window.FilenameDesigner = {
     open: openFilenameDesigner,
+    embed: embedFilenameDesigner,
+    release: releaseFilenameDesigner,
     bodyHtml: designerBodyHtml,
     wire: wireDesigner,
     loadBoot: fdLoadBoot,

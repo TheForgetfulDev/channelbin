@@ -21,7 +21,7 @@ import { JSDOM, VirtualConsole } from 'jsdom';
 
 const [, , DIR, REPO] = process.argv;
 const read = (f) => fs.readFileSync(`${DIR}/${f}`, 'utf8');
-const STATE_NAMES = ['scheduled', 'started', 'finished', 'empty'];
+const STATE_NAMES = ['scheduled', 'started', 'finished', 'empty', 'defaulted'];
 const STATES = {};
 for (const s of STATE_NAMES) {
   STATES[s] = { html: read(`${s}.html`), nav: JSON.parse(read(`${s}.json`)),
@@ -216,6 +216,20 @@ await record('filter', async (start) => {
   await c.poll();
   return { errors: c.errors, visibleBefore, chipsBefore,
            visibleAfter: c.visible(), chipsAfter: c.chips() };
+});
+
+/* ── A default saved filter is on as the page opens (dev/changelog/1156) ── */
+await record('saved_default', async (start) => {
+  const c = start('defaulted');
+  const atBoot = { visible: c.visible(), chips: c.chips(),
+                   chip: c.$('#saved-filters-chip').textContent.replace(/\s+/g, ' ').trim(),
+                   toast: (c.$('#app-toast') || { textContent: '' }).textContent };
+  await c.settle();
+  // A different signature, so the row set really is swapped under the filter.
+  c.server.state = 'started';
+  await c.poll();
+  return { errors: c.errors, atBoot, pageFetches: c.pageFetches(),
+           afterSwap: { visible: c.visible(), chips: c.chips() }, posts: c.posts() };
 });
 
 /* ── An open row menu holds the swap ─────────────────────────────────── */

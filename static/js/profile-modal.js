@@ -32,7 +32,8 @@
      key         - the API field name, and the input's id suffix
      label       - on-screen label; also what a validation error names
      meta        - the explanatory line under the label
-     type        - 'text' | 'int' | 'tristate'
+     type        - 'text' | 'int' | 'tristate' | 'template' (a filename template, edited in
+                   the filename designer - see pmTemplateHtml)
      required    - text only; blocks submit when empty
      inheritable - blank/unset falls back to the global default (adds the hint sentence)
      unit        - appended to the default value in the hint ('s', 'm', …)
@@ -85,10 +86,9 @@ const HEALTH_CHECK_PROFILE_SECTIONS = [
      global retention window, 0 means never auto-delete even when a global window is set.
      Those are opposite outcomes, which is why the copy spells both out.
 
-   `filename_template` stays a plain text input on purpose. The template designer in
-   Settings is itself being revamped, and this field is meant to get that revamped
-   version rather than the current one - doing it now would mean building it twice
-   (2026-07-27; tracked in the backlog against the filename-template item). */
+   `filename_template` is edited in the filename designer, opened as a step inside this
+   modal, exactly as Settings edits the global one: the template and its two tag-cleanup
+   lists are one unit, saved with the profile (dev/changelog/1161). */
 const RECORDING_PROFILE_SECTIONS = [
   {
     title: 'Profile',
@@ -96,11 +96,10 @@ const RECORDING_PROFILE_SECTIONS = [
       { key: 'name', label: 'Name', type: 'text', required: true, wide: true,
         placeholder: 'e.g. Sports, Movies, Flaky Stream',
         meta: 'A friendly label shown when picking a profile for a recording.' },
-      { key: 'filename_template', label: 'Filename template', type: 'text',
+      { key: 'filename_template', label: 'Filename template', type: 'template',
         inheritable: true, wide: true,
-        meta: 'Names the finished file for recordings using this profile. Supports ' +
-          '{date}, {title}, {sub_title}, {description}, {channel}, {category}, ' +
-          '{start_time} and {end_time}.' },
+        meta: 'Names the finished file for recordings using this profile, together with ' +
+          'its own tag cleanup.' },
     ],
   },
   {
@@ -270,6 +269,9 @@ function pmHintText(f, defaults) {
   // A text default (a filename template) can be long and the placeholder already shows
   // it verbatim - quoting it here too just prints the same string twice in one row.
   if (f.type === 'text') return 'Leave blank to use the global default.';
+  if (f.type === 'template') {
+    return 'Without one, the global template and its tag cleanup are used.';
+  }
   return `Leave blank to use the global default (${d}${f.unit || ''}).`;
 }
 
@@ -279,7 +281,7 @@ function pmHintText(f, defaults) {
 function pmValidate(fields, values) {
   for (const f of fields) {
     const v = values[f.key];
-    if (f.type === 'text') {
+    if (f.type === 'text' || f.type === 'template') {
       if (f.required && !String(v == null ? '' : v).trim()) return `${f.label} is required.`;
     } else if (f.type === 'int') {
       const raw = v == null ? '' : String(v).trim();
@@ -302,7 +304,7 @@ function pmPayload(fields, values) {
     // clearing a padding box stores 0 rather than trying to write NULL. Mirrors
     // ProfileField.blank_value in app/profile_forms.py.
     const blank = f.blankValue === undefined ? null : f.blankValue;
-    if (f.type === 'text') {
+    if (f.type === 'text' || f.type === 'template') {
       const raw = String(v == null ? '' : v).trim();
       body[f.key] = (f.inheritable && raw === '') ? blank : raw;
     } else if (f.type === 'int') {
@@ -316,8 +318,37 @@ function pmPayload(fields, values) {
   return body;
 }
 
-function pmControlHtml(f, value, defaults) {
+/* The template field's read-out: what this profile names files with, and the cleanup that
+   travels with it. `cleanup` is {remove, replace}. Pure, so the three states - its own
+   template, its own with no cleanup, inheriting - are asserted in node. */
+function pmTemplateSummaryHtml(template, cleanup, defaults) {
+  if (!template) {
+    const d = (defaults || {}).filename_template;
+    return '<div class="pm-tpl-now pm-tpl-inherit">Uses the global template' +
+      (d ? `: <code>${escHtml(d)}</code>` : '') + ', with its tag cleanup.</div>';
+  }
+  const remove = (cleanup && cleanup.remove) || [];
+  const replace = (cleanup && cleanup.replace) || [];
+  const parts = [];
+  if (remove.length) parts.push(`remove ${remove.map(escHtml).join(', ')}`);
+  if (replace.length) parts.push(`replace ${replace.map(escHtml).join(', ')}`);
+  return `<div class="pm-tpl-now"><code>${escHtml(template)}</code></div>` +
+    `<div class="pm-tpl-cleanup">Tag cleanup: ${parts.length ? parts.join('; ') : 'none'}</div>`;
+}
+
+function pmTemplateHtml(f, value, defaults, cleanup) {
+  const v = value == null ? '' : String(value);
+  return `<input type="hidden" id="pm-${f.key}" value="${escHtml(v)}">` +
+    `<div class="pm-tpl" data-pm-tpl>${pmTemplateSummaryHtml(v, cleanup, defaults)}</div>` +
+    '<div class="pm-tpl-acts">' +
+    '<button type="button" class="btn btn-sm" data-pm-design>Open the designer</button>' +
+    `<button type="button" class="btn btn-sm" data-pm-tpl-clear${v ? '' : ' hidden'}>Use the global template</button>` +
+    '</div>';
+}
+
+function pmControlHtml(f, value, defaults, cleanup) {
   const id = `pm-${f.key}`;
+  if (f.type === 'template') return pmTemplateHtml(f, value, defaults, cleanup);
   if (f.type === 'tristate') {
     const d = (defaults || {})[f.key];
     const dLabel = d === undefined || d === null
@@ -347,7 +378,7 @@ function pmControlHtml(f, value, defaults) {
     `placeholder="${escHtml(ph)}">`;
 }
 
-function pmSectionsHtml(sections, values, defaults) {
+function pmSectionsHtml(sections, values, defaults, cleanup) {
   return sections.map((s) => {
     const rows = s.fields.map((f) => {
       const hint = pmHintText(f, defaults);
@@ -355,7 +386,7 @@ function pmSectionsHtml(sections, values, defaults) {
         label: escHtml(f.label),
         wide: f.wide,
         meta: escHtml(f.meta) + (hint ? ` ${escHtml(hint)}` : ''),
-        control: pmControlHtml(f, values[f.key], defaults),
+        control: pmControlHtml(f, values[f.key], defaults, cleanup),
       });
     }).join('');
     return `<fieldset class="gd-fset"><div class="gd-fset-head">${escHtml(s.title)}</div>${rows}</fieldset>`;
@@ -370,6 +401,9 @@ function pmSectionsHtml(sections, values, defaults) {
      notice       - optional HTML notice rendered above the fields
      submitUrl / method / submitLabel
      extra        - optional element appended after the spec-driven sections
+     cleanup      - {remove, replace}: the tag cleanup that travels with a 'template' field.
+                    Sent as filename_tags_remove / filename_tags_replace; omit for a type
+                    with no template field
      afterSave(res) - optional; a promise for follow-up requests that need the saved
                     row's id (the poster upload). Its failure is reported but never leaves
                     the modal open over a profile that IS saved - a second Save on the
@@ -381,8 +415,12 @@ function openProfileModal(opts) {
   const values = Object.assign({}, opts.values || {});
   const onDone = opts.onDone || (() => window.location.reload());
 
+  const cleanup = opts.cleanup
+    ? { remove: (opts.cleanup.remove || []).slice(), replace: (opts.cleanup.replace || []).slice() }
+    : null;
+
   const body = document.createElement('div');
-  body.innerHTML = (opts.notice || '') + pmSectionsHtml(sections, values, opts.defaults);
+  body.innerHTML = (opts.notice || '') + pmSectionsHtml(sections, values, opts.defaults, cleanup);
   if (opts.extra) body.appendChild(opts.extra);
 
   const read = () => {
@@ -394,6 +432,15 @@ function openProfileModal(opts) {
     return out;
   };
 
+  const payload = (current) => {
+    const out = pmPayload(fields, current);
+    if (cleanup) {
+      out.filename_tags_remove = cleanup.remove;
+      out.filename_tags_replace = cleanup.replace;
+    }
+    return out;
+  };
+
   function submit(close) {
     const current = read();
     const error = pmValidate(fields, current);
@@ -401,7 +448,7 @@ function openProfileModal(opts) {
     const name = pmPayload(fields, current).name;
     jsonFetch(opts.submitUrl, {
       method: opts.method,
-      body: JSON.stringify(pmPayload(fields, current)),
+      body: JSON.stringify(payload(current)),
     }).then((res) => {
       if (!opts.afterSave) return true;
       return opts.afterSave(res).then(() => true, (err) => {
@@ -424,15 +471,60 @@ function openProfileModal(opts) {
     title: opts.title,
     panelClass: 'modal-wide',
     body,
+    // Closing from inside the designer step (the x, the backdrop) takes the step with it.
+    onClose: () => { if (window.FilenameDesigner) window.FilenameDesigner.release(modal); },
     footer: [
       { label: 'Cancel', class: 'btn', onClick: (c) => c() },
       { label: opts.submitLabel, class: 'btn btn-primary',
         onClick: (close) => { submit(close); return false; } },
     ],
   });
-  const first = body.querySelector('input, select');
+  if (cleanup) pmWireTemplateField(body, modal, cleanup, opts.defaults);
+  const first = body.querySelector('input:not([type="hidden"]), select');
   if (first) first.focus();
   return modal;
+}
+
+/* The template field's two buttons. The designer is a STEP in this modal, never a second
+   overlay: FilenameDesigner.embed() swaps this modal's body for the designer and back, so
+   there is one Escape handler and one scroll lock (DESIGN.md 15.1). It hands back the
+   template and both lists and writes nothing; they are saved with the profile. */
+function pmWireTemplateField(body, modal, cleanup, defaults) {
+  const input = body.querySelector('#pm-filename_template');
+  if (!input) return;
+  const redraw = () => {
+    body.querySelector('[data-pm-tpl]').innerHTML =
+      pmTemplateSummaryHtml(input.value, cleanup, defaults);
+    body.querySelector('[data-pm-tpl-clear]').hidden = !input.value;
+  };
+  body.addEventListener('click', (e) => {
+    if (e.target.closest('[data-pm-tpl-clear]')) {
+      input.value = '';
+      cleanup.remove = [];
+      cleanup.replace = [];
+      redraw();
+      return;
+    }
+    if (!e.target.closest('[data-pm-design]')) return;
+    if (!window.FilenameDesigner) {
+      showToast('The filename designer did not load on this page.', { type: 'error' });
+      return;
+    }
+    // A profile without a template starts from the global one, which is what its files
+    // are named with today.
+    const start = input.value
+      ? { template: input.value, remove: cleanup.remove, replace: cleanup.replace }
+      : null;
+    window.FilenameDesigner.embed(modal, {
+      start,
+      onSave: (v) => {
+        input.value = v.template;
+        cleanup.remove = v.remove.slice();
+        cleanup.replace = v.replace.filter((n) => !v.remove.includes(n));
+        redraw();
+      },
+    });
+  });
 }
 
 /* Health Check Profiles list page (templates/health_check_profiles.html).
@@ -487,6 +579,10 @@ function openRecordingProfileModal(opts) {
   return openProfileModal({
     extra,
     afterSave,
+    cleanup: {
+      remove: (p && p.filename_tags_remove) || [],
+      replace: (p && p.filename_tags_replace) || [],
+    },
     title: p ? `Edit "${p.name}"` : 'Add a recording profile',
     sections: RECORDING_PROFILE_SECTIONS,
     values: p || {},

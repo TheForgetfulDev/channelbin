@@ -1,8 +1,10 @@
+import json
 import logging
 
 from flask import Blueprint, abort, render_template, request, jsonify, send_from_directory
 
 from .. import db
+from ..accounts import profile_tag_cleanup
 from ..config import load_config
 from ..channel_groups import set_default_profile
 from ..database import RecordingProfile, Recording, Channel, ChannelGroup
@@ -46,14 +48,50 @@ def _profile_payload(p):
     # Not a ProfileField: the poster travels as a file through its own routes below, never
     # through the JSON body, so parse_profile_body() must not learn a key for it.
     payload['poster'] = poster_payload(p)
+    # Lists, not the stored JSON text - and read through the same helper the renderer
+    # uses, so the modal is shown exactly the cleanup that names this profile's files.
+    cleanup = profile_tag_cleanup(p)
+    payload['filename_tags_remove'] = [n for n, mode in cleanup if mode == 'remove']
+    payload['filename_tags_replace'] = [n for n, mode in cleanup if mode == 'replace']
     return payload
+
+
+def _read_tag_list(data, key):
+    """(names, error) for one cleanup list. Omitted means empty: the modal always sends
+    both, like every other field, so an edit that clears a list works."""
+    raw = data.get(key)
+    if raw is None:
+        return [], None
+    if not isinstance(raw, list) or not all(isinstance(n, str) for n in raw):
+        return None, 'Tag cleanup lists must be lists of tag names.'
+    return sorted({n.strip() for n in raw if n.strip()}), None
 
 
 def _read_profile_body():
     """(values, error) parsed from the JSON body. The modal runs the same checks before
     it submits, but this is the one that counts: presentation-layer validation is never
-    the enforcement point (CLAUDE.md - enforcement lives server-side)."""
-    return parse_profile_body(_FIELDS, request.get_json(silent=True) or {})
+    the enforcement point (CLAUDE.md - enforcement lives server-side).
+
+    The two tag-cleanup lists belong to the template (accounts.filename_naming_for), so
+    they are stored only alongside one: a profile without a template stores NULL for both
+    and inherits the global lists with the global template. A name in both lists is kept
+    in remove only, as the Settings save does (dev/changelog/1161)."""
+    data = request.get_json(silent=True) or {}
+    values, error = parse_profile_body(_FIELDS, data)
+    if error:
+        return None, error
+    remove, error = _read_tag_list(data, 'filename_tags_remove')
+    if error:
+        return None, error
+    replace, error = _read_tag_list(data, 'filename_tags_replace')
+    if error:
+        return None, error
+    if values['filename_template'] is None:
+        values['filename_tags_remove'] = values['filename_tags_replace'] = None
+    else:
+        values['filename_tags_remove'] = json.dumps(remove)
+        values['filename_tags_replace'] = json.dumps([n for n in replace if n not in remove])
+    return values, None
 
 
 def _global_defaults(cfg):
@@ -107,6 +145,16 @@ _OVERRIDE_ROWS = (
 )
 
 
+def _cleanup_text(cleanup):
+    """The tag cleanup a filename is named with, in one line, or None when there is none.
+    Shared by a profile's row and the global defaults line so the two read alike."""
+    remove = [n for n, mode in cleanup if mode == 'remove']
+    replace = [n for n, mode in cleanup if mode == 'replace']
+    parts = ([f'remove {", ".join(remove)}'] if remove else []) + \
+        ([f'replace {", ".join(replace)}'] if replace else [])
+    return '; '.join(parts).capitalize() if parts else None
+
+
 def _overrides(p):
     """What this profile changes, as label/value pairs. Empty means it changes nothing."""
     rows = nullable_overrides(p, _OVERRIDE_ROWS)
@@ -152,6 +200,7 @@ def profiles_list():
     )
     cfg = load_config()
     defaults = _global_defaults(cfg)
+    from ..accounts import filename_tag_cleanup
     return render_template(
         'profiles.html',
         profiles=profiles,
@@ -163,6 +212,11 @@ def profiles_list():
         # `is not None`, and a Jinja conditional written per field is where that quietly
         # becomes truthiness and starts hiding a profile's 0 (app/profile_forms.py).
         overrides={p.id: _overrides(p) for p in profiles},
+        # Only a profile with its own template has cleanup of its own; the rest inherit
+        # the global lists with the global template (accounts.filename_naming_for).
+        cleanup_text={p.id: _cleanup_text(profile_tag_cleanup(p))
+                      for p in profiles if p.filename_template},
+        default_cleanup_text=_cleanup_text(filename_tag_cleanup(cfg)),
         # The filename template is excluded here for the same reason it is excluded from
         # _OVERRIDE_ROWS, and is shown on its own line.
         default_summary=default_summary(defaults, _OVERRIDE_ROWS),

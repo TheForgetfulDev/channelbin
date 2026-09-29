@@ -1121,8 +1121,8 @@ class AiringGrainTests(_PageJs, unittest.TestCase):
         self.assertTrue(self.obs['first_row_title'])
 
     def test_the_checkbox_carries_both_ids(self):
-        """A selection is always a set of CHANNELS, on both grains - but the row is a
-        showing, so both ids have to be on the element."""
+        """The tick selects the SHOWING and carries its CHANNEL into the channel actions,
+        so both ids have to be on the element (dev/changelog/1157)."""
         self.assertTrue(self.obs['checkbox_has_channel_id'])
         self.assertTrue(self.obs['checkbox_has_airing_id'])
 
@@ -1131,6 +1131,38 @@ class AiringGrainTests(_PageJs, unittest.TestCase):
         number of ROWS ticked would be the lie the count line exists to prevent."""
         n = self.obs['distinct_channels_in_rows']
         self.assertIn(f'({n})', self.obs['selected_count_text'])
+
+    def test_schedule_selected_counts_showings_not_channels(self):
+        """dev/changelog/1157: on this grain a tick selects the SHOWING. Schedule selected
+        is offered only once one is ticked and counts every ticked showing, while the
+        channel actions beside it keep counting distinct channels."""
+        self.assertFalse(self.obs['sched_shown_before'])
+        self.assertTrue(self.obs['sched_shown_after'])
+        self.assertTrue(self.obs['every_airing_box_checked'])
+        self.assertIn(f"({self.obs['airing_rows']})", self.obs['sched_text'])
+        self.assertLess(self.obs['distinct_channels_in_rows'], self.obs['airing_rows'],
+                        'the fixture must put two showings on one channel, or the two '
+                        'counts cannot be told apart')
+
+    def test_unticking_one_of_two_showings_keeps_the_channel(self):
+        """The channel leaves the selection only with its last ticked showing - otherwise
+        unticking one showing would silently drop the channel another tick still names."""
+        self.assertTrue(self.obs['fixture_has_two_showings_on_one_channel'])
+        n = self.obs['distinct_channels_in_rows']
+        self.assertIn(f'({n})', self.obs['group_text_after_one_untick'])
+        self.assertTrue(self.obs['twin_sibling_still_checked'],
+                        'unticking one showing must not untick its sibling on the same channel')
+        self.assertIn(f"({self.obs['airing_rows'] - 1})", self.obs['sched_text_after_one_untick'])
+        self.assertIn(f'({n - 1})', self.obs['group_text_after_all_unticked'])
+
+    def test_schedule_selected_hands_the_modal_one_item_per_showing(self):
+        items = self.obs['bulk_items']
+        self.assertIsNotNone(items, 'Schedule selected did not open the bulk modal')
+        self.assertEqual(len(items), self.obs['airing_rows'])
+        self.assertEqual(len({i['epg_id'] for i in items}), len(items))
+        self.assertTrue(all('group_id' in i for i in items))
+        self.assertEqual(self.obs['bulk_urls'],
+                         ['/api/recordings/bulk-preview', '/api/recordings/bulk-schedule'])
 
     def test_the_record_button_is_per_showing_and_draws_every_state(self):
         """The same channel can have one showing scheduled and one neither, so a button

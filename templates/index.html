@@ -32,6 +32,13 @@
          list of filters and the predicate they drive cannot drift apart. #}
       <div class="menu pop-left" id="filter-menu"></div>
     </div>
+    {# Saved filters (dev/changelog/1156). In the chip row rather than beside Columns so it
+       is still there at phone widths, where .toolbar .right is hidden. filter-bar.js
+       writes the label: which saved filter is on, and whether it has been changed. #}
+    <div class="menu-wrap">
+      <button class="chip" id="saved-filters-chip" type="button" data-menu>Saved &#9662;</button>
+      <div class="menu pop-left" id="saved-filters-menu"></div>
+    </div>
     {# Mobile only (DESIGN.md 9.4): desktop sorts via the column headers, which
        don't exist at mobile widths - this chip is the mobile sort control. #}
     <div class="menu-wrap sort-chip-wrap">
@@ -174,6 +181,7 @@ const GUIDE_CONFIG = {
 {# The shared filter bar (DESIGN.md 3.11); recordings.js registers its dimensions. #}
 <script src="{{ url_for('static', filename='js/filter-bar.js') }}"></script>
 <script type="application/json" id="rec-col-prefs">{{ col_prefs | tojson }}</script>
+<script type="application/json" id="rec-saved-filters">{{ saved_filters | tojson }}</script>
 {% endif %}
 {#- Loaded on the empty page too: its live-refresh hook is what notices the first recording
     arriving (dev/changelog/1144). -#}

@@ -4277,5 +4277,34 @@ class DirectNavigationBypassTests(unittest.TestCase):
             'no modifier applies in a `nav-ok: <reason>` comment')
 
 
+
+class NativeConfirmDialogTests(unittest.TestCase):
+    """A confirm is util.js::confirmModal(), never the browser's native confirm().
+
+    dev/changelog/1162. The native dialog was the app's de facto confirm pattern on five
+    pages, so every planning agent that looked for "how does this app confirm" found it and
+    copied it. `confirmModal()` is the one confirm (DESIGN.md 3.12): the app's own modal,
+    the verb-named button DESIGN.md 4 asks for, and an Escape that closes only itself when it
+    sits over another overlay. Comments are stripped first - prose may name the old call.
+    """
+
+    _PATTERN = re.compile(r'(?<![\w$.])confirm\s*\(|\bwindow\.confirm\b')
+    _COMMENTS = re.compile(r'/\*.*?\*/|\{#.*?#\}|<!--.*?-->|(?<![:\'"])//[^\n]*', re.S)
+
+    def test_no_native_confirm(self):
+        offenders = []
+        paths = list(_walk(JS_DIR, '.js')) + list(_walk(TPL_DIR, '.html'))
+        for path in sorted(paths):
+            # Blank each comment but keep its newlines, so a hit reports its real line.
+            code = self._COMMENTS.sub(lambda m: re.sub(r'[^\n]', ' ', m.group(0)), _read(path))
+            for i, line in enumerate(code.splitlines()):
+                if self._PATTERN.search(line):
+                    offenders.append(f'{_rel(path)}:{i + 1}: {line.strip()}')
+        self.assertEqual(
+            offenders, [],
+            'a native confirm() dialog. Use util.js::confirmModal() - the app\'s own modal, '
+            'with the action verb on its button (DESIGN.md 3.12 and 4, dev/changelog/1162)')
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

@@ -822,7 +822,15 @@ function buildModal({ title = '', body = '', footer = [], dismissable = true, on
     syncScrollLock();
     if (onClose) onClose();
   };
-  const onKey = (e) => { if (e.key === 'Escape' && dismissable) close(); };
+  // `overlay.escapeHandler`, when a host sets one, takes Escape instead of closing: a panel
+  // showing a STEP (the filename designer inside a profile, its guide picker) steps back
+  // one level. Still one listener per overlay, so there is never a second Escape handler
+  // to argue with this one (dev/changelog/1161).
+  const onKey = (e) => {
+    if (e.key !== 'Escape' || !dismissable) return;
+    if (overlay.escapeHandler) { overlay.escapeHandler(); return; }
+    close();
+  };
 
   if (dismissable) {
     const x = document.createElement('button');
@@ -865,6 +873,50 @@ function buildModal({ title = '', body = '', footer = [], dismissable = true, on
   syncScrollLock();
   overlay.closeModal = close;
   return overlay;
+}
+
+// The app's one confirm dialog - never the browser's native confirm() (DESIGN.md 3.12,
+// dev/changelog/1162). Resolves true on the action button, false on Cancel, ×, the backdrop
+// and Escape. Copy follows DESIGN.md 4: `message` says what will happen, `consequence` is
+// the destructive consequence (only when there is one), `confirmLabel` is the action verb.
+// Every text field is plain text; `list` renders names as a list rather than a joined line.
+//   if (!(await confirmModal({ title, message, confirmLabel }))) return;
+// Escape is taken in the capture phase and stopped there, because a confirm usually sits
+// over another overlay (the guide's record modal) whose own Escape handler would otherwise
+// close that one too. A danger confirm starts focused on Cancel so Enter cannot destroy.
+function confirmModal({ title, message, consequence = '', list = null, confirmLabel,
+                        danger = false } = {}) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const settle = (v) => { if (!settled) { settled = true; resolve(v); } };
+    const body = `<p>${escHtml(message)}</p>` +
+      (list && list.length
+        ? `<ul class="confirm-list">${list.map((s) => `<li>${escHtml(s)}</li>`).join('')}</ul>` : '') +
+      (consequence ? `<p>${escHtml(consequence)}</p>` : '');
+    const onKey = (e) => {
+      if (e.key !== 'Escape') return;
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      overlay.closeModal();
+    };
+    const overlay = buildModal({
+      title,
+      body,
+      footer: [
+        { label: 'Cancel', class: 'btn' },
+        {
+          label: confirmLabel,
+          class: danger ? 'btn btn-danger' : 'btn btn-primary',
+          onClick: (close) => { settle(true); close(); },
+        },
+      ],
+      onClose: () => { window.removeEventListener('keydown', onKey, true); settle(false); },
+    });
+    window.addEventListener('keydown', onKey, true);
+    const buttons = overlay.querySelectorAll('.modal-foot .btn');
+    const focusBtn = danger ? buttons[0] : buttons[buttons.length - 1];
+    if (focusBtn) focusBtn.focus();
+  });
 }
 
 // ── Section layout ("Customize sections") control ───────────────────────────────────

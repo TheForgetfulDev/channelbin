@@ -7,6 +7,7 @@ is not one ffmpeg wrote is a 404 rather than a path. The stream URL never appear
 response - the browser only ever learns this app's own URLs (dev/changelog/1018).
 """
 import logging
+import os
 
 from flask import Blueprint, jsonify, send_file, url_for
 
@@ -35,6 +36,55 @@ def start_channel_preview(channel_id):
     except preview.PreviewRefused as exc:
         return jsonify({'error': exc.message}), exc.status
     return jsonify({'success': True, **session.to_dict(), **_urls(session.id)})
+
+
+@preview_bp.route('/api/channels/<int:channel_id>/screenshot', methods=['POST'])
+def capture_channel_screenshot(channel_id):
+    """The channel page's "Capture screenshot": one live frame, without a test. Blocks for
+    the few seconds a capture takes. Records only when it was taken - never a ChannelTest,
+    never a score observation (dev/changelog/1160)."""
+    from datetime import datetime
+
+    from .. import db
+    from ..config import load_config, resolve_ffmpeg_path
+    from ..database import Channel
+    from ..db_utils import retry_on_locked
+    from ..storage_dirs import manual_screenshot_path
+
+    if db.session.get(Channel, channel_id) is None:
+        return jsonify({'error': 'Channel not found'}), 404
+    cfg = load_config()
+    path = manual_screenshot_path(cfg, channel_id)
+    try:
+        source = preview.capture_frame(channel_id, path,
+                                       resolve_ffmpeg_path(cfg['ffmpeg']['path']))
+    except preview.PreviewRefused as exc:
+        log.warning('Screenshot of channel %d not taken: %s', channel_id, exc.message)
+        return jsonify({'error': exc.message}), exc.status
+
+    @retry_on_locked()
+    def _stamp_and_commit():
+        channel = db.session.get(Channel, channel_id)
+        if channel is None:
+            return None
+        channel.screenshot_captured_at = datetime.utcnow()
+        db.session.commit()
+        return channel.screenshot_captured_at
+
+    captured_at = _stamp_and_commit()
+    if captured_at is None:
+        # Deleted while the frame was being taken: the file has no channel to belong to.
+        try:
+            os.unlink(path)
+        except OSError:
+            pass   # already gone
+        return jsonify({'error': 'Channel not found'}), 404
+    return jsonify({
+        'success': True,
+        'source': source,
+        'url': url_for('channel_tests.serve_screenshot', filename=os.path.basename(path),
+                       v=int(captured_at.timestamp())),
+    })
 
 
 @preview_bp.route('/api/preview/<session_id>/status')

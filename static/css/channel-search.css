@@ -1121,6 +1121,23 @@
   .sugg-scopeline .ssl-go { color: var(--accent-text); font-weight: 600; flex: none; }
 }
 
+/* ── Schedule selected (static/js/bulk-schedule-modal.js, dev/changelog/1157) ──
+   One line per showing: what it will be called, then where and when, then any warning
+   under it. A list rather than a table, so the phone form is the same markup. */
+.bs-panel { max-width: 640px; }
+.bs-sum { margin: 0 0 .5rem; font-weight: 600; }
+.bs-list { list-style: none; margin: 0; padding: 0; max-height: 50vh; overflow-y: auto;
+  border: 1px solid var(--border); border-radius: var(--radius-sm); }
+.bs-row { padding: .5rem .75rem; border-bottom: 1px solid var(--border-soft); }
+.bs-row:last-child { border-bottom: none; }
+.bs-row.is-skip { color: var(--text-muted); }
+.bs-main { display: flex; align-items: baseline; gap: .5rem; flex-wrap: wrap; }
+.bs-title { font-weight: 600; overflow-wrap: anywhere; }
+.bs-meta { font-size: var(--fs-sm); color: var(--text-muted); overflow-wrap: anywhere; }
+.bs-warn { font-size: var(--fs-sm); color: var(--warn); margin-top: .2rem; }
+.bs-warn.is-hard { color: var(--bad); }
+.bs-warn.is-skip { color: var(--text-muted); }
+
 @media (max-width: 480px) {
   .cb-all { padding: .6rem; }
   /* The label track is measured against the longest short label ("Health"), so it

@@ -193,8 +193,10 @@ _DEFAULTS = {
             # Compression tuning for mp4 output. video_crf only applies when a video
             # re-encode actually happens (reencode_mode 'always', or 'damaged' finding
             # damage) - the plain stream-copy path ignores it. audio_bitrate_kbps applies to
-            # every mp4 conversion, re-encoded or not, since AAC audio is always re-encoded
-            # from ADTS to raw AAC for mp4 output regardless of the video path.
+            # every mp4 conversion, re-encoded or not, since audio is always re-encoded to
+            # AAC for mp4 output regardless of the video path. It is a total across every
+            # channel: a 5.1 source keeps its six channels at a sixth of it each
+            # (dev/changelog/1163).
             'video_crf': 20,            # libx264 CRF, 0-51, lower = better quality/larger file
             'audio_bitrate_kbps': 192,  # AAC bitrate for mp4 output
             # What does the video re-encode: 'software' is libx264 on the CPU; 'vaapi' is

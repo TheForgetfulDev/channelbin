@@ -7,7 +7,8 @@
   const CFG = window.GROUPS_CONFIG;
 
   // ── Search + filter (§14.6) ──────────────────────────────────────────
-  const allItems = Array.from(document.querySelectorAll('.grp-item'));
+  // Re-collected after a live refresh swaps the list (refreshList below).
+  let allItems = Array.from(document.querySelectorAll('.grp-item'));
   const searchInput = document.getElementById('grp-search');
   const searchWrap = document.getElementById('search-wrap');
   const searchClear = document.getElementById('search-clear');
@@ -41,7 +42,10 @@
       { v: 'st-run', label: 'Running now' },
       { v: 'st-none', label: 'Unknown' },
     ], match: (row, v) => hasToken(row, 'healths', v) },
-    { k: 'account', label: 'Account', values: null, match: (row, v) => (row.dataset.accounts || '').split('|').includes(v) },
+    // Values are the accounts actually present across every row, not a fixed list - read
+    // from the rows each time, so a refresh that changes them changes the menu too.
+    { k: 'account', label: 'Account', values: () => [...new Set(allItems.flatMap(r => (r.dataset.accounts || '').split('|').filter(Boolean)))]
+      .sort().map(a => ({ v: a, label: a })), match: (row, v) => (row.dataset.accounts || '').split('|').includes(v) },
     { k: 'guide', label: 'TV Guide', values: [
       { v: 'in', label: 'In the guide' },
       { v: 'out', label: 'Not in the guide' },
@@ -60,9 +64,6 @@
       { v: 'untested', label: 'Has untested channels' },
     ], match: (row, v) => (row.dataset.issues || '').split(' ').includes(v) },
   ];
-  // Account values are the accounts actually present across every row, not a fixed list.
-  const accountValues = [...new Set(allItems.flatMap(r => (r.dataset.accounts || '').split('|').filter(Boolean)))].sort();
-  FILTER_DIMS.find(d => d.k === 'account').values = accountValues.map(a => ({ v: a, label: a }));
 
   const filterBar = createFilterBar({
     chipsEl: chipsWrap,
@@ -225,6 +226,13 @@
     const cur = memberSort[gid];
     const dir = (cur && cur.k === key) ? -cur.dir : 1;
     memberSort[gid] = { k: key, dir };
+    sortMembers(table);
+  });
+  function sortMembers(table) {
+    const st = memberSort[table.dataset.mtable];
+    if (!st) return;
+    const { k: key, dir } = st;
+    const th = table.querySelector(`th[data-msort="${key}"]`);
     table.querySelectorAll('th.sortable').forEach(h => {
       h.classList.toggle('sorted', h === th);
       h.querySelector('.arr').textContent = h === th ? (dir === 1 ? ' ▴' : ' ▾') : '';
@@ -245,7 +253,7 @@
       const raw = row.dataset[key];
       return raw === '' || raw === undefined ? (dir === 1 ? Infinity : -Infinity) : parseFloat(raw);
     }, dir === 1 ? 'asc' : 'desc');
-  });
+  }
 
   // ── Row navigates to detail; disclosure triangle expands the members ──
   // The triangle (.grp-expand) and the row body ([data-expand]) do different things.
@@ -370,6 +378,54 @@
   // The dialog itself is group-delete.js, shared with the group detail page: the same
   // action, the same copy, and the same handling of a delete the server refuses because
   // the group is recording or has recordings scheduled.
+  // ── Live refresh (dev/changelog/1158) ────────────────────────────────
+  // Driven by base.html's /api/nav-status poll, which hands over
+  // channel_tester.health_check_signature(). When it differs from the one the list was
+  // rendered at - a check started or finished, a channel's result landed, a one-off test
+  // ran - the list is swapped for a fresh server render, so the Running chip, the member
+  // verdicts and the best-member star never outlive the run that set them. Nothing here is
+  // a relative time, so there is no minute tick.
+  //
+  // The swap throws away every piece of state held on the old nodes, so each is put back:
+  // search and filter (applyFilter, through the filter bar so a value that no longer
+  // occurs drops its chip), the section sort, each group's member sort, and which groups
+  // were open. It waits while a menu or a dialog is open - swapping a row out from under
+  // an open kebab closes it mid-choice, and a dialog was opened against the old row - and
+  // the next poll asks again.
+  let hcInFlight = false;
+  const refreshBusy = () => Boolean(document.querySelector('.menu.open, .modal'));
+
+  function refreshList() {
+    const open = allItems.filter(r => {
+      const d = r.querySelector('.grp-detail');
+      return d && !d.hidden;
+    }).map(r => r.dataset.group);
+    return swapFromServer(['#grp-list-groups']).then(() => {
+      allItems = Array.from(document.querySelectorAll('.grp-item'));
+      open.forEach(gid => {
+        const item = document.querySelector(`.grp-item[data-group="${gid}"]`);
+        const detail = item && item.querySelector('.grp-detail');
+        const caret = item && item.querySelector('.grp-expand');
+        if (!detail || !caret || caret.disabled) return;
+        detail.hidden = false;
+        caret.setAttribute('aria-expanded', 'true');
+      });
+      document.querySelectorAll('table.grp-mtable').forEach(sortMembers);
+      SECTIONS.forEach(applySort);
+      filterBar.apply();
+    });
+  }
+
+  window.__applyHealthCheck = (hc) => {
+    const list = document.getElementById('grp-list-groups');
+    if (!list || !hc || typeof hc.sig !== 'string' || hcInFlight || refreshBusy()) return;
+    if (hc.sig === list.dataset.hcSig) return;
+    hcInFlight = true;
+    refreshList()
+      .catch((err) => console.warn('Groups list refresh failed; the next poll retries.', err))
+      .finally(() => { hcInFlight = false; });
+  };
+
   function openDeleteModal(groupId) {
     const g = payloadFor(groupId);
     openDeleteGroupModal({
