@@ -1162,6 +1162,311 @@ class EpgKeyWriteBypassTests(unittest.TestCase):
             'not that column:\n' + '\n'.join(offenders))
 
 
+class AccountHostWriteBypassTests(unittest.TestCase):
+    """An account's host list is written by `app/account_links.py` and by nothing else.
+
+    The rows of `account_hosts` are the user's judgment about which names reach the same
+    server (DESIGN-account-providers.md §3.2, dev/changelog/1168) - the participation-switch
+    rule applied to a list. Adding a row, deleting one, or moving `host`/`position` is a
+    change to that list, and the writer module is where the invariants live (the first add
+    seeds the current host as active; the active host cannot be removed while another is
+    listed; a delete takes the whole list with the account). A second writer is how a list
+    ends up non-empty with nothing active.
+
+    `is_active` / `activated_at` / `last_resolved_at` / `last_resolve_error` are deliberately
+    NOT in the pattern: they are state the app writes - which of the user's own declared
+    equivalents is dialed, and whether each one resolved - a selection among what the user
+    listed, never a change to the list. They are written inside the same module anyway.
+
+    app/ only - a test builds fixtures. The scan: a constructor call, a query-level delete,
+    or an assignment to the two list columns, in any file that names the model. Escape
+    hatch: `# account-host-write-ok: <reason>`.
+    """
+
+    _MARKER = 'account-host-write-ok'
+    _CANONICAL_FILE = 'app/account_links.py'
+    _PATTERN = re.compile(r'(?<!class )\bAccountHost\(|\bAccountHost\.query\b.*\.delete\(|'
+                          r'\.(?:host|position)\s*=(?!=)')
+
+    def test_the_host_list_has_one_writer(self):
+        offenders = []
+        for path in _walk(APP_DIR, '.py'):
+            source = _read(path)
+            if 'AccountHost' not in source or _rel(path) == self._CANONICAL_FILE:
+                continue
+            raw_lines = source.splitlines()
+            code_lines = _mask_comments_and_strings(source).splitlines()
+            for i, line in enumerate(code_lines):
+                if not self._PATTERN.search(line):
+                    continue
+                if _marked_at(raw_lines, i, self._MARKER):
+                    continue
+                offenders.append(f'{_rel(path)}:{i + 1}: {raw_lines[i].strip()}')
+        self.assertEqual(
+            offenders, [],
+            'account_hosts written outside app/account_links.py, its one writer (CLAUDE.md '
+            '"A participation switch is written by a human and by nothing else", applied to '
+            'the host list). Go through add_host()/remove_host()/delete_hosts_for_account(), '
+            'or mark the line `# account-host-write-ok: <reason>` if it is not a write to '
+            'the list:\n' + '\n'.join(offenders))
+
+    def test_the_scan_would_catch_a_second_writer(self):
+        for line in ('row = AccountHost(account_id=1, host=h)',
+                     'AccountHost.query.filter_by(account_id=aid).delete()',
+                     'row.host = new_name',
+                     'row.position = 3'):
+            self.assertIsNotNone(self._PATTERN.search(line), line)
+        for line in ('class AccountHost(db.Model):',
+                     'row.is_active = True',
+                     'row.last_resolve_error = None',
+                     'AccountHost.query.filter_by(account_id=aid).all()'):
+            self.assertIsNone(self._PATTERN.search(line), line)
+
+
+class AccountLoginWriteBypassTests(unittest.TestCase):
+    """An account's login list is written by `app/account_links.py` and by nothing else.
+
+    The rows of `logins` and `account_logins` are the user's judgment about which
+    credentials the backend accepts for an account and how many seats each has
+    (DESIGN-account-providers.md §3.2, dev/changelog/1169) - the participation-switch rule
+    applied to a list, as for the host list above. Adding a row, deleting one, or moving
+    `name`/`username`/`password`/`max_connections`/`position`/`login_id` is a change to that
+    list, and the writer module is where the invariants live (a username listed once per
+    account; a password blank on edit means "keep"; a changed credential clears the refusal
+    stamp; a login goes with the last account holding it).
+
+    `last_refused_at` / `last_refused_detail` are deliberately NOT in the pattern: they are
+    state the app writes - the capture path's last credential refusal, read to skip the
+    login for a while - a fact about what the user listed, never a change to the list. They
+    are written inside the same module anyway.
+
+    app/ only - a test builds fixtures. The scan: a constructor call, a query-level delete,
+    or an assignment to a list column through a variable named for a login, in any file
+    that names either model. The column names collide with `Account`'s own
+    (`account.username = ...` on the account form is a different list), so the assignment
+    half keys on the variable name. Escape hatch: `# account-login-write-ok: <reason>`.
+    """
+
+    _MARKER = 'account-login-write-ok'
+    _CANONICAL_FILE = 'app/account_links.py'
+    _PATTERN = re.compile(r'(?<!class )\b(?:Account)?Login\(|\b(?:Account)?Login\.query\b.*\.delete\(|'
+                          r'\b(?:login|lg|row)\.(?:name|username|password|max_connections|position|login_id)\s*=(?!=)')
+
+    def test_the_login_list_has_one_writer(self):
+        offenders = []
+        for path in _walk(APP_DIR, '.py'):
+            source = _read(path)
+            if (('Login' not in source and 'AccountLogin' not in source)
+                    or _rel(path) == self._CANONICAL_FILE):
+                continue
+            raw_lines = source.splitlines()
+            code_lines = _mask_comments_and_strings(source).splitlines()
+            for i, line in enumerate(code_lines):
+                if not self._PATTERN.search(line):
+                    continue
+                if _marked_at(raw_lines, i, self._MARKER):
+                    continue
+                offenders.append(f'{_rel(path)}:{i + 1}: {raw_lines[i].strip()}')
+        self.assertEqual(
+            offenders, [],
+            'logins / account_logins written outside app/account_links.py, its one writer '
+            '(CLAUDE.md "A participation switch is written by a human and by nothing else", '
+            'applied to the login list). Go through add_login()/update_login()/'
+            'remove_login()/move_login()/delete_logins_for_account(), or mark the line '
+            '`# account-login-write-ok: <reason>` if it is not a write to the list:\n'
+            + '\n'.join(offenders))
+
+    def test_the_scan_would_catch_a_second_writer(self):
+        for line in ('row = Login(name=n, username=u, password=p, max_connections=1)',
+                     'db.session.add(AccountLogin(account_id=aid, login_id=row.id))',
+                     'Login.query.filter(Login.id.in_(ids)).delete()',
+                     'AccountLogin.query.filter_by(account_id=aid).delete()',
+                     'login.password = new',
+                     'lg.max_connections = 2',
+                     'row.position = 3'):
+            self.assertIsNotNone(self._PATTERN.search(line), line)
+        for line in ('class Login(db.Model):',
+                     'class AccountLogin(db.Model):',
+                     'row.last_refused_at = now',
+                     'login.last_refused_detail = None',
+                     'account.username = form.username',
+                     'account.max_connections = int(raw)',
+                     'Login.query.filter_by(id=lid).all()'):
+            self.assertIsNone(self._PATTERN.search(line), line)
+
+
+class ProviderWriteBypassTests(unittest.TestCase):
+    """Which provider an account is on, and the provider rows themselves, are written by
+    `app/account_links.py` and by nothing else.
+
+    `Account.provider_id` is the user's answer to "do these accounts reach the same backend"
+    (DESIGN-account-providers.md §6.1, dev/changelog/1170) - a judgment no field on the
+    account can settle, since unrelated backends share stream ids by chance and a curation
+    service can hand two accounts the same credentials. The participation-switch rule
+    applies: nothing infers it, and the writer is where its invariants live (leaving a
+    provider drops the shares it held there; deleting one leaves hosts and logins alone).
+    Sharing a login is a write to `account_logins`, which `AccountLoginWriteBypassTests`
+    already guards.
+
+    app/ only - a test builds fixtures. Escape hatch: `# provider-write-ok: <reason>`.
+    """
+
+    _MARKER = 'provider-write-ok'
+    _CANONICAL_FILE = 'app/account_links.py'
+    _PATTERN = re.compile(r'(?<!class )\bProvider\(|\bProvider\.query\b.*\.delete\(|'
+                          r'\.provider_id\s*=(?!=)|\bprovider\.name\s*=(?!=)')
+
+    def test_providers_have_one_writer(self):
+        offenders = []
+        for path in _walk(APP_DIR, '.py'):
+            source = _read(path)
+            if 'provider' not in source or _rel(path) == self._CANONICAL_FILE:
+                continue
+            raw_lines = source.splitlines()
+            code_lines = _mask_comments_and_strings(source).splitlines()
+            for i, line in enumerate(code_lines):
+                if not self._PATTERN.search(line):
+                    continue
+                if _marked_at(raw_lines, i, self._MARKER):
+                    continue
+                offenders.append(f'{_rel(path)}:{i + 1}: {raw_lines[i].strip()}')
+        self.assertEqual(
+            offenders, [],
+            'providers / Account.provider_id written outside app/account_links.py, its one '
+            'writer (CLAUDE.md "A participation switch is written by a human and by nothing '
+            'else", applied to the provider link). Go through create_provider()/'
+            'rename_provider()/delete_provider()/set_account_provider(), or mark the line '
+            '`# provider-write-ok: <reason>` if it is not such a write:\n'
+            + '\n'.join(offenders))
+
+    def test_the_scan_would_catch_a_second_writer(self):
+        for line in ('db.session.add(Provider(name=n, created_at=now, updated_at=now))',
+                     'Provider.query.filter_by(id=pid).delete()',
+                     'account.provider_id = pid',
+                     'a.provider_id = None',
+                     'provider.name = new_name'):
+            self.assertIsNotNone(self._PATTERN.search(line), line)
+        for line in ('class Provider(db.Model):',
+                     'if account.provider_id == pid:',
+                     'Provider.query.order_by(Provider.name).all()',
+                     'provider_id = db.Column(db.Integer)'):
+            self.assertIsNone(self._PATTERN.search(line), line)
+
+
+class DuplicateFoldWriteTests(unittest.TestCase):
+    """The duplicate fold's two columns have one writer, and a bulk write of anything the
+    keep rule reads must re-rank the stored answer.
+
+    `Channel.duplicate_cluster_id` and `.is_duplicate_loser` are a derived cache
+    (app/duplicate_streams.py, dev/changelog/1172): which channels are one stream, and which
+    copy of each is folded away. "Show duplicates" off is the loser column read straight off
+    an index, so a second writer is a second definition of the fold.
+
+    The other half is what keeps the cache current. The keep rule reads a channel's hidden
+    flag, guide flag, group membership and health score. Hidden, guide and group changes all
+    pass through `channel_hiding.recompute()` (HiddenRecomputeHookTests holds them to it),
+    and that re-ranks. A health score or guide flag written through the ORM re-ranks from
+    the session's after-flush listener. **A bulk UPDATE reaches neither** - the listener
+    only sees objects - so one that sets a rank input must call `duplicate_streams.rerank()`
+    or `recompute()` in its own function, or the wrong copy stays kept until the next sync
+    with nothing anywhere saying so.
+
+    app/ only. Escape hatches: `# duplicate-fold-write-ok: <reason>` for the columns,
+    `# duplicate-rank-ok: <reason>` for a rank input.
+    """
+
+    _COLUMN_MARKER = 'duplicate-fold-write-ok'
+    _RANK_MARKER = 'duplicate-rank-ok'
+    _CANONICAL_FILE = 'app/duplicate_streams.py'
+    _COLUMN_WRITE = re.compile(
+        r'\b(?:duplicate_cluster_id|is_duplicate_loser)\s*=(?!=)')
+    # A keyword argument or a dict key naming a rank input: what a bulk write looks like,
+    # whether it is spelled .values(health_score=...) or .update({Channel.health_score: ...}).
+    _RANK_BULK = re.compile(
+        r'(?<![\w.])(?:health_score|manual_health_adjustment)\s*=(?!=)'
+        r'|\bChannel\.(?:health_score|manual_health_adjustment|in_guide)\s*:')
+    # The model's own column declarations, and the migration runner, which works on a
+    # table of another vintage and is followed by migration 88's full recompute.
+    _RANK_EXEMPT_FILES = ('app/database.py', 'app/migrations.py')
+
+    def test_the_fold_columns_have_one_writer(self):
+        offenders = []
+        for path in _walk(APP_DIR, '.py'):
+            rel = _rel(path)
+            if rel in (self._CANONICAL_FILE, 'app/database.py'):
+                continue
+            source = _read(path)
+            raw_lines = source.splitlines()
+            for i, line in enumerate(_mask_comments_and_strings(source).splitlines()):
+                if self._COLUMN_WRITE.search(line) \
+                        and not _marked_at(raw_lines, i, self._COLUMN_MARKER):
+                    offenders.append(f'{rel}:{i + 1}: {raw_lines[i].strip()}')
+        self.assertEqual(
+            offenders, [],
+            'Channel.duplicate_cluster_id / is_duplicate_loser written outside '
+            'app/duplicate_streams.py, their one writer. Call recompute() or rerank() '
+            'there instead:\n' + '\n'.join(offenders))
+
+    def _rank_offenders(self, rel, source):
+        offenders = []
+        raw_lines = source.splitlines()
+        code_lines = _mask_comments_and_strings(source).splitlines()
+        for i, line in enumerate(code_lines):
+            if not self._RANK_BULK.search(line) or _marked_at(raw_lines, i, self._RANK_MARKER):
+                continue
+            start, end = _toplevel_block(code_lines, i)
+            if any('duplicate_streams' in ln for ln in code_lines[start:end]):
+                continue
+            offenders.append(f'{rel}:{i + 1}: {raw_lines[i].strip()}')
+        return offenders
+
+    def test_a_bulk_write_of_a_rank_input_re_ranks(self):
+        offenders = []
+        for path in _walk(APP_DIR, '.py'):
+            rel = _rel(path)
+            if rel in self._RANK_EXEMPT_FILES or rel == self._CANONICAL_FILE:
+                continue
+            offenders += self._rank_offenders(rel, _read(path))
+        self.assertEqual(
+            offenders, [],
+            'a keyword or dict-key write of health_score / manual_health_adjustment / '
+            'Channel.in_guide with no duplicate_streams call in its function. If it is a '
+            'bulk UPDATE of channels, call duplicate_streams.rerank(ids) after it; if it is '
+            'something else (a constructor, another table), mark it '
+            '`# duplicate-rank-ok: <reason>`:\n' + '\n'.join(offenders))
+
+    def test_the_scans_see_what_they_claim_to(self):
+        for line in ('ch.is_duplicate_loser = True',
+                     '.values(duplicate_cluster_id=None)'):
+            self.assertIsNotNone(self._COLUMN_WRITE.search(line), line)
+        for line in ('if ch.is_duplicate_loser == other:',
+                     'Channel.duplicate_cluster_id.in_(ids)'):
+            self.assertIsNone(self._COLUMN_WRITE.search(line), line)
+        for line in ('update(Channel).values(health_score=None)',
+                     '.update({Channel.health_score: 0})',
+                     '.update({Channel.in_guide: False})',
+                     'values(manual_health_adjustment=0)'):
+            self.assertIsNotNone(self._RANK_BULK.search(line), line)
+        for line in ('channel.health_score = new_score',
+                     'final_health_score=final_health_score,',
+                     'if ch.health_score == 5:',
+                     'group.health_score = new_score'):
+            self.assertIsNone(self._RANK_BULK.search(line), line)
+        flagged = self._rank_offenders('synthetic.py', textwrap.dedent("""
+            def reset_scores(ids):
+                db.session.execute(update(Channel).where(Channel.id.in_(ids))
+                                   .values(health_score=None))
+        """))
+        self.assertEqual(len(flagged), 1, flagged)
+        cleared = self._rank_offenders('synthetic.py', textwrap.dedent("""
+            def reset_scores(ids):
+                db.session.execute(update(Channel).where(Channel.id.in_(ids))
+                                   .values(health_score=None))
+                duplicate_streams.rerank(ids)
+        """))
+        self.assertEqual(cleared, [])
+
+
 class EpgSourceOverrideWriteBypassTests(unittest.TestCase):
     """`Channel.epg_source_override_id` is the user's answer to "which source should this
     channel's guide come from" - the participation-switch rule applied to EPG
@@ -3651,15 +3956,12 @@ def _boolean_leading_indexes(by_table=None):
 #: Same contract as _MEASURED_PREFIX_EXEMPTIONS: an entry promises the experiment was run on
 #: a realistic database and the number written down, never that the shape was argued about.
 #:
-#: Both entries here earn it the same way, and it is the way that distinguishes a useful
+#: The first entry earns it the way that distinguishes a useful
 #: boolean index from a decoy: their queries seek the RARE value. Measured on the production
 #: database (137,144 channels), each against the same query with the index suppressed:
 _MEASURED_BOOLEAN_INDEX_EXEMPTIONS = {
     # 6 rows of 137,144. The guide reads in_guide=1; 0.0 ms with, 171.4 ms without.
     ('channels', 'ix_channels_in_guide'),
-    # 1,572 rows of 137,144. channel_search's duplicate handling asks .is_(True) in its hot
-    # paths; 1.0 ms with, 40.5 ms without.
-    ('channels', 'ix_channels_is_duplicate_stream_url'),
     # The third case, and it earns its place a different way: this one is never SOUGHT, it is
     # SCANNED. The standing breakdown buckets every channel through one ordered CASE, so it
     # visits all 137,283 rows of a 63 MB table whatever the leading column is; holding the
@@ -4126,10 +4428,9 @@ class StandingIndexCoverageTests(unittest.TestCase):
         self.assertIn('hidden', found['showhidden'])
         self.assertIn('in_guide', found['showmembers'])
         self.assertEqual(found['shownotnorm'], {'url_normalizable', 'account_id'})
-        # The duplicate-loser window reads stream_url and health_score, but inside its own
-        # SELECT - the outer CASE only tests the id. If the walk ever starts descending,
-        # this is the assertion that says so.
-        self.assertEqual(found['showdup'], {'id'})
+        # The fold's answer is stored (app/duplicate_streams.py), so hiding duplicates is
+        # one column - and the index has to carry it.
+        self.assertEqual(found['showdup'], {'is_duplicate_loser'})
 
 
 class CiWorkflowToolingTests(unittest.TestCase):

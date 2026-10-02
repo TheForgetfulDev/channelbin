@@ -314,6 +314,7 @@ def init_scheduler(app):
     schedule_index_janitor(app)
     schedule_storage_dirs_check(app)
     schedule_account_stats_fold(app)
+    schedule_host_resolve_check(app)
 
     # One-shot reconcile of every group's format state (auto-disable mismatched members /
     # re-enable conforming ones). Runs after migrations so schema-v6 columns exist.
@@ -2605,6 +2606,42 @@ def _storage_dirs_job():
             log.exception('Storage directory check failed')
 
 
+def schedule_host_resolve_check(app):
+    """Register the account host list's DNS probe (app/account_links.py, design §4.5):
+    every `hosts.check_interval_hours`, first tick a minute after startup. It resolves
+    every listed host and stamps the verdict on the account page; it never rolls, because
+    a probe that moved an account off a host still serving a running recording over a
+    resolver hiccup would disturb a working capture. Re-armed at every start so a changed
+    interval takes effect without waiting out the old one."""
+    from .config import load_config
+    if _scheduler is None:
+        # A scheduler-less app (a test app, an early-startup settings save): nothing to arm.
+        return
+    hours = float((load_config().get('hosts') or {}).get('check_interval_hours', 6))
+    _add_job(
+        func=_host_resolve_job,
+        trigger='interval',
+        hours=hours,
+        next_run_time=datetime.utcnow() + timedelta(seconds=60),
+        id='host_resolve_check',
+        replace_existing=True,
+    )
+    log.info('Stream host check scheduled every %g hours', hours)
+
+
+def _host_resolve_job():
+    """Resolve every listed host and stamp the result (app/account_links.py::check_hosts).
+    DNS only - no stream is opened and no panel is called, so it takes no seat and no
+    admission ticket: a handful of lookups and a few row stamps, the same answer the
+    storage-directory sweep gives. Records no JobRun for the same reason."""
+    with _app.app_context():
+        from .account_links import check_hosts
+        try:
+            check_hosts()
+        except Exception:
+            log.exception('Stream host check failed')
+
+
 _ACCOUNT_STATS_FOLD_INTERVAL_MINUTES = 60
 
 
@@ -2656,6 +2693,7 @@ _RUN_NOW_PLAIN = {
     'logo_cache_fetch': _logo_cache_job,
     'storage_dirs_check': _storage_dirs_job,
     'account_stats_fold': _account_stats_fold_job,
+    'host_resolve_check': _host_resolve_job,
 }
 RUN_NOW_SYSTEM_JOBS = frozenset(_RUN_NOW_ADMITTED) | frozenset(_RUN_NOW_PLAIN)
 

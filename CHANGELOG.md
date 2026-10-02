@@ -5,6 +5,36 @@ Notable changes to ChannelBin, newest first. This project follows
 release is tagged `v<version>` in git, and the version the app is running is shown in the
 page footer.
 
+## 0.23.0 - 2026-10-02
+
+**Added (experimental)**
+
+These account features are complete and shipped, but new and lightly tested outside one
+install, so expect rough edges and please report what you hit. An account that uses none of
+them behaves exactly as before.
+
+- An account can list the other host names its reseller hands out. When a recording, health
+  check or preview fails because the active host stopped resolving, the account moves to the
+  next one that does, with an alert and an event on the recording.
+- An account can list its other logins, each with its own seat count. A capture takes a seat
+  on the first login with one free, and a login the server refuses is skipped while another
+  has room.
+- Put accounts that reach the same backend on a provider, and let two of them share a login,
+  so its seats count once and a block on either account covers both.
+- Channels on one provider with the same stream id are recognized as one channel: channel
+  search folds them into one row, and a channel group says what a second copy covers as a
+  backup.
+
+**Changed**
+
+- When duplicate channels are folded, a copy still in the provider's feed is kept ahead of one
+  that has gone missing.
+
+**Fixed**
+
+- Add to channel group on the channel page shows the server's warnings and lets you go ahead,
+  instead of closing as if the channel had been added.
+
 ## 0.22.0 - 2026-09-29
 
 **Added**

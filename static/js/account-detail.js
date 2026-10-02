@@ -190,8 +190,8 @@
   renderHistory();
 
   // ── Section layout (order + hidden), persisted server-side ───────────────
-  const SEC_NAMES = { details: 'Details', content: 'Content', sources: 'EPG sources', usage: 'Usage',
-                      history: 'Sync history', activity: 'Activity' };
+  const SEC_NAMES = { details: 'Details', hosts: 'Hosts', logins: 'Logins', content: 'Content', sources: 'EPG sources',
+                      usage: 'Usage', history: 'Sync history', activity: 'Activity' };
   const sectionLayout = initSectionLayout({
     config: A,
     saveUrl: '/api/user-prefs/account_detail_sections',
@@ -213,6 +213,211 @@
     showActionError('');
     return { onDone: () => refresh(), onError: showActionError };
   };
+
+  // ── Hosts (DESIGN-account-providers.md §4) ───────────────────────────────
+  // The list is the user's and only the three explicit actions here move it. Each one
+  // refreshes the page in place afterward, like a sync action, so the card shows the
+  // server's view of the list rather than a copy this file would have to keep right.
+  const hostUrl = (id) => `/api/accounts/${A.id}/hosts${id ? `/${id}` : ''}`;
+
+  function openAddHost() {
+    const body = document.createElement('div');
+    body.innerHTML =
+      fieldRow({
+        label: 'Host', stack: true,
+        meta: 'A host name, with its port if the stream URLs carry one - like ' +
+          '<code>a2.skyline.example</code> or <code>a2.skyline.example:8080</code>. A pasted ' +
+          'URL is reduced to its host.',
+        control: '<input type="text" id="host-name" autocomplete="off" spellcheck="false">',
+      }) +
+      '<p class="text-muted small" style="margin-top:8px">Only list names your reseller gave ' +
+      'you for this same account. The first one you add also lists the host this account\'s ' +
+      'stream URLs use today, as the active one, so the list starts from what is true now.</p>';
+    const input = body.querySelector('#host-name');
+    const modal = buildModal({
+      title: 'Add host',
+      body,
+      footer: [
+        { label: 'Cancel', class: 'btn', onClick: (c) => c() },
+        {
+          label: 'Add host',
+          class: 'btn btn-primary',
+          onClick: (close) => {
+            const host = input.value.trim();
+            if (!host) { showToast('Enter a host name.', { type: 'error' }); return false; }
+            post(hostUrl(), { method: 'POST', body: JSON.stringify({ host }) })
+              .then(() => { close(); refresh(); })
+              .catch(() => {});
+            return false;
+          },
+        },
+      ],
+    });
+    setTimeout(() => input.focus(), 50);
+    return modal;
+  }
+
+  function confirmActivateHost(el) {
+    const host = el.dataset.host || '';
+    confirmModal({
+      title: 'Make this host active',
+      message: `Move every stream URL on this account to ${host}?`,
+      consequence: 'A running recording picks the new host up at its next segment.',
+      confirmLabel: 'Make active',
+    }).then((ok) => {
+      if (!ok) return;
+      post(`${hostUrl(el.dataset.hostId)}/activate`, { method: 'POST' })
+        .then(() => refresh()).catch(() => {});
+    });
+  }
+
+  function confirmRemoveHost(el) {
+    const host = el.dataset.host || '';
+    const isActive = el.dataset.active === '1';
+    const others = Number(el.dataset.others || 0);
+    if (isActive && others > 0) {
+      showToast(`${host} is the active host. Make another host active first.`, { type: 'error' });
+      return;
+    }
+    confirmModal({
+      title: 'Remove host',
+      message: `Remove ${host} from this account's host list?`,
+      consequence: isActive
+        ? 'It is the only host listed, so the list empties and the stream URLs stay as they are.'
+        : 'Stream URLs are not changed.',
+      confirmLabel: 'Remove',
+      danger: true,
+    }).then((ok) => {
+      if (!ok) return;
+      post(hostUrl(el.dataset.hostId), { method: 'DELETE' })
+        .then(() => refresh()).catch(() => {});
+    });
+  }
+
+  // ── Logins (DESIGN-account-providers.md §5, §6.3) ────────────────────────
+  // Add and Edit share one dialog. The password is never served back: the edit form shows
+  // a blank field that means "keep", and the eye reveals only what is being typed, exactly
+  // as the account's own password works (DESIGN.md §17.4).
+  const loginUrl = (id) => `/api/accounts/${A.id}/logins${id ? `/${id}` : ''}`;
+
+  function openLoginDialog(existing, seatPrefill, sharedWith) {
+    const edit = !!existing;
+    const body = document.createElement('div');
+    body.innerHTML =
+      (sharedWith
+        ? `<p class="card-note">This login is shared with ${escHtml(sharedWith)}. A change ` +
+          'here applies to every account holding it.</p>'
+        : '') +
+      fieldRow({
+        label: 'Name', stack: true,
+        meta: 'What this login is called here, like <code>main</code> or <code>spare</code>.',
+        control: '<input type="text" id="login-name" autocomplete="off">',
+      }) +
+      fieldRow({
+        label: 'Username', stack: true,
+        control: '<input type="text" id="login-user" autocomplete="off" spellcheck="false">',
+      }) +
+      fieldRow({
+        label: 'Password', stack: true,
+        meta: edit
+          ? 'Leave blank to keep the existing password. ChannelBin never shows a stored ' +
+            'password back to you - the eye only reveals what you type here.'
+          : 'The eye only reveals what you type here - ChannelBin never shows a stored ' +
+            'password back to you.',
+        control: '<span class="secret-field">' +
+          '<input type="password" id="login-pass" autocomplete="new-password" ' +
+          `placeholder="${edit ? 'Leave blank to keep existing' : 'Password'}">` +
+          '<button type="button" class="secret-reveal-btn" ' +
+          'aria-label="Show what I am typing" title="Show what I am typing">' +
+          ACCOUNT_EYE_SVG + '</button></span>',
+      }) +
+      fieldRow({
+        label: 'Seats', stack: true,
+        meta: 'How many streams this login may have open at once. Pre-filled from what the ' +
+          'provider reports for the account, or the account\'s own limit.',
+        control: '<input type="number" id="login-seats" min="1" step="1">',
+      });
+    const $f = (id) => body.querySelector(`#${id}`);
+    if (edit) {
+      $f('login-name').value = existing.name || '';
+      $f('login-user').value = existing.username || '';
+      $f('login-seats').value = existing.max_connections || 1;
+    } else {
+      $f('login-seats').value = seatPrefill || 1;
+    }
+    initLocalReveal(body);
+    const modal = buildModal({
+      title: edit ? 'Edit login' : 'Add login',
+      body,
+      footer: [
+        { label: 'Cancel', class: 'btn', onClick: (c) => c() },
+        {
+          label: edit ? 'Save' : 'Add login',
+          class: 'btn btn-primary',
+          onClick: (close) => {
+            const payload = {
+              name: $f('login-name').value.trim(),
+              username: $f('login-user').value.trim(),
+              password: $f('login-pass').value,
+              max_connections: $f('login-seats').value,
+            };
+            if (!payload.name) { showToast('Give the login a name.', { type: 'error' }); return false; }
+            if (!payload.username) { showToast('Enter the username.', { type: 'error' }); return false; }
+            if (!edit && !payload.password) { showToast('Enter the password.', { type: 'error' }); return false; }
+            post(loginUrl(edit ? existing.id : null), { method: 'POST', body: JSON.stringify(payload) })
+              .then(() => { close(); refresh(); })
+              .catch(() => {});
+            return false;
+          },
+        },
+      ],
+    });
+    setTimeout(() => $f('login-name').focus(), 50);
+    return modal;
+  }
+
+  function openAddLogin() {
+    jsonFetch(loginUrl())
+      .then((res) => openLoginDialog(null, res.seat_prefill))
+      .catch((e) => showToast(e.message || 'Request failed.', { type: 'error' }));
+  }
+
+  function openEditLogin(el) {
+    jsonFetch(loginUrl())
+      .then((res) => {
+        const login = (res.logins || []).find((l) => String(l.id) === el.dataset.loginId);
+        if (!login) { showToast('Login not found.', { type: 'error' }); return; }
+        openLoginDialog(login, null, el.dataset.sharedWith || '');
+      })
+      .catch((e) => showToast(e.message || 'Request failed.', { type: 'error' }));
+  }
+
+  function moveLogin(el) {
+    post(`${loginUrl(el.dataset.loginId)}/move`,
+      { method: 'POST', body: JSON.stringify({ direction: el.dataset.direction }) })
+      .then(() => refresh()).catch(() => {});
+  }
+
+  function confirmRemoveLogin(el) {
+    const name = el.dataset.login || '';
+    const held = Number(el.dataset.held || 0);
+    const sharedWith = el.dataset.sharedWith || '';
+    confirmModal({
+      title: 'Remove login',
+      message: `Remove login "${name}" from this account's list?`,
+      consequence: sharedWith
+        ? `${sharedWith} keeps it, with its seats. This account's connection limit drops by its seats.`
+        : held > 0
+        ? 'A recording, health check or preview seated on it keeps its seat until it ends; nothing is cancelled. The account\'s connection limit drops by its seats.'
+        : 'The account\'s connection limit drops by its seats.',
+      confirmLabel: 'Remove',
+      danger: true,
+    }).then((ok) => {
+      if (!ok) return;
+      post(loginUrl(el.dataset.loginId), { method: 'DELETE' })
+        .then(() => refresh()).catch(() => {});
+    });
+  }
 
   // ── EPG sources (DESIGN-epg-sources.md §9.2) ────────────────────────────
   // Add and Edit share one dialog. A new or re-pointed source is fetched straight away by
@@ -430,6 +635,13 @@
         { method: 'POST', body: JSON.stringify({ direction: el.dataset.direction }) })
         .then(() => setTimeout(reload, 1500));
     },
+    'host-add': openAddHost,
+    'host-activate': confirmActivateHost,
+    'host-remove': confirmRemoveHost,
+    'login-add': openAddLogin,
+    'login-edit': openEditLogin,
+    'login-move': moveLogin,
+    'login-remove': confirmRemoveLogin,
     sync: () => confirmAccountSync(A.id, A.name, A.syncPrompt, hooks()),
     'cancel-sync': () => accountCancelSync(A.id, hooks()),
     'force-epg': () => confirmForceEpgResync(A.id, hooks()),
@@ -549,8 +761,9 @@
   // only while it holds the "No syncs yet" state - once #acct-hist exists, renderHistory()
   // is its one writer. The Usage card is left out: a sync moves none of its numbers.
   const LIVE_REGIONS = ['#acct-state', '#acct-head', '#acct-notices', '#acct-actionbar',
-    '#acct-stickybar-in', '#acct-details-body', '#acct-content-body', '#acct-sources-body',
-    '#acct-hist-head', '#acct-activity-body'];
+    '#acct-stickybar-in', '#acct-details-body', '#acct-hosts-head', '#acct-hosts-body',
+    '#acct-logins-head', '#acct-logins-body', '#acct-content-body',
+    '#acct-sources-body', '#acct-hist-head', '#acct-activity-body'];
   const RERENDER_MS = 60 * 1000;
   let renderedAt = Date.now();
   let inFlight = false;

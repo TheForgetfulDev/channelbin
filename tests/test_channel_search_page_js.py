@@ -41,7 +41,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from tests.support.app import make_test_app  # noqa: E402
 from tests.support import seed  # noqa: E402
 from tests.support.search import show_all_query  # noqa: E402
-from app import db  # noqa: E402
+from app import db, duplicate_streams  # noqa: E402
 from app.accounts import NORM_DISABLED, NORM_MPEGTS  # noqa: E402
 from app.database import EPGEntry, Tag, TagPattern  # noqa: E402
 
@@ -105,7 +105,7 @@ def _seed_corpus():
     dup_low = channel('Sky Sports Action HD', category_name='Sports', health_score=10.0)
     for ch in (espn2, dup_high, dup_low):
         ch.stream_url = 'http://example.test/live/user1/pass1/77'
-        ch.is_duplicate_stream_url = True
+    duplicate_streams.recompute()
     channel('Gone Fishing TV', category_name='Docs', health_score=55.0,
             last_seen_at=now - timedelta(days=30))
 
@@ -440,6 +440,12 @@ class TableTests(_PageJs, unittest.TestCase):
         self.assertEqual(len(self.obs['dup_payload_ids']), self.obs['dup_payload_count'])
         self.assertEqual(sorted(self.obs['drill_in_filters']),
                          sorted(str(i) for i in self.obs['dup_payload_ids']))
+
+    def test_the_dup_badge_names_what_made_the_cluster_one_stream(self):
+        """dev/changelog/1172: the fold has two keys, and the tooltip says which one from
+        the row's `dup.key` rather than assuming a shared URL. This corpus's cluster is a
+        URL one; the provider wording is the same function's other branch."""
+        self.assertIn('3 channels share this stream URL', self.obs['dup_badge_tip'])
 
     def test_the_drill_in_turns_show_duplicates_on(self):
         """Otherwise the copies it just went to look at are the very rows that are hidden
@@ -954,7 +960,7 @@ class MobileSheetTests(_PageJs, unittest.TestCase):
         self.assertTrue(self.obs['card_badge_opened_a_sheet'])
         self.assertTrue(self.obs['card_badge_did_not_drill_in'],
                         'the card badge drilled straight in, so the cluster was never explained')
-        self.assertEqual(self.obs['dup_sheet_title'], 'Duplicated stream URL')
+        self.assertEqual(self.obs['dup_sheet_title'], 'Duplicated stream')
         self.assertTrue(self.obs['dup_sheet_lists_others'])
         self.assertTrue(self.obs['dup_sheet_says_kept_reason'])
         self.assertTrue(self.obs['dup_sheet_has_drill_button'])

@@ -607,6 +607,7 @@ async function tableScenario() {
   const before = c.window.location.search;
   const badge = c.$('#ch-list [data-act="dup-badge"]');
   obs.dup_badge_rendered = !!badge;
+  obs.dup_badge_tip = badge ? badge.getAttribute('data-tip') : '';
   if (badge) {
     const row = ROWS_DUP.rows.find((r) => r.id === Number(badge.dataset.id));
     obs.dup_payload_ids = (row.dup || {}).ids || [];

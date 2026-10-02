@@ -34,10 +34,10 @@ from tests.support.app import make_test_app  # noqa: E402
 from tests.support.iocount import IOCounter, all_engines  # noqa: E402
 from tests.support import seed  # noqa: E402
 from tests.support.search import unfolded_query  # noqa: E402
-from app import db  # noqa: E402
-from app.database import (Account, AccountSyncLog, Alert, Channel, ChannelEvent,  # noqa: E402
+from app import account_links, db  # noqa: E402
+from app.database import (Account, AccountHost, AccountLogin, AccountSyncLog, Alert, Channel, ChannelEvent,  # noqa: E402
                           ChannelGroup, ChannelHideRule, HealthCheckProfile,
-                          IgnoredAlertPattern, OnDemandTestJob, Recording, RecordingEvent,
+                          IgnoredAlertPattern, Login, OnDemandTestJob, Recording, RecordingEvent,
                           RecordingProfile, RecordingSegment, Tag, TagPattern,
                           CHANNEL_ADDED_TO_GUIDE, CHANNEL_FAILOVER_HEALTH_OBSERVATION,
                           HIDE_TARGET_NAME_GLOB,
@@ -120,6 +120,29 @@ def _seed_channel_history(n):
 
 def _scaling_channel_id():
     return Channel.query.filter_by(name='Scaling Channel').one().id
+
+
+def _seed_group_provider_copies(n):
+    """ONE group of n members, half on each of two accounts on one provider, each member
+    the same stream id as one on the other account - every member a provider copy, so the
+    group page's "same channel through a provider" line (dev/changelog/1173) has n/2 pairs
+    to name. Its account, provider and login lookups must be batched, never per pair."""
+    from app import duplicate_streams
+    now = datetime.utcnow()
+    a = seed.make_account(name='copies-a', last_sync_at=now)
+    b = seed.make_account(name='copies-b', last_sync_at=now)
+    db.session.commit()
+    account_links.create_provider('copies', [a.id, b.id])
+    channels = []
+    for i in range(max(n // 2, 1)):
+        for acc in (a, b):
+            ch = seed.make_channel(acc, name=f'Copy {i} {acc.name}', last_seen_at=now)
+            ch.stream_url = ch.raw_stream_url = f'http://{acc.name}.example/live/u/p/{i}.ts'
+            ch.provider_stream_id = str(i)
+            channels.append(ch)
+    seed.make_group(name='Scaling Group', members=channels)
+    duplicate_streams.recompute()
+    db.session.commit()
 
 
 def _scaling_group_id():
@@ -215,7 +238,13 @@ def _seed_search_channels(n):
         channels.append(ch)
     for ch in channels[:3]:
         ch.stream_url = 'http://example.test/live/shared/cluster/1'
-        ch.is_duplicate_stream_url = True
+    # And a cluster keyed on the provider's stream id, the fold's other key
+    # (dev/changelog/1172): its row payload names the provider, which is one more lookup
+    # that has to be per page. Putting the account on a provider recomputes the fold.
+    for ch in channels[3:5]:
+        ch.provider_stream_id = '777'
+    db.session.flush()
+    account_links.create_provider('Scaling Provider', [acc.id])
     seed.make_group(name='Scaling Search Group', members=channels[:2])
     tag = Tag(name='scaling-tag')
     db.session.add(tag)
@@ -313,9 +342,16 @@ def _seed_accounts(n):
     Each account also gets a channel with a finished segment and a health check, so a
     per-account usage number (app/account_stats.py, dev/changelog/1028) has rows to read -
     and a health score and a group membership, so the row's second line and the stats
-    section's pies (dev/changelog/1029) have something per account to count."""
+    section's pies (dev/changelog/1029) have something per account to count.
+
+    Every pair of accounts is on a provider of its own and shares a login, with a host
+    list on the second, so the Providers section (dev/changelog/1170) has a card, a chip
+    menu, a shared pool and a host summary per pair to draw."""
+    from app import account_links
+    accounts = []
     for i in range(n):
         acc = seed.make_account(name=f'Scaling Account {i}')
+        accounts.append(acc)
         ch = _seed_ledger_sources(acc, i)
         ch.health_score = float(20 + (i * 7) % 80)
         ch.consecutive_test_failures = i % 4
@@ -327,6 +363,12 @@ def _seed_accounts(n):
                 completed_at=datetime.utcnow() - timedelta(hours=run + 1) + timedelta(seconds=20),
                 status='SUCCESS', channels_synced=10, epg_entries_synced=100))
     db.session.commit()
+    ids = [a.id for a in accounts]
+    for i in range(0, len(ids) - 1, 2):
+        account_links.create_provider(f'Scaling Provider {i}', ids[i:i + 2])
+        login = account_links.add_login(ids[i], f'main{i}', f'user{i}', 'pw', 1)
+        account_links.share_login(login.id, ids[i + 1])
+        account_links.add_host(ids[i + 1], f'h{i}.scaling.example')
 
 
 def _seed_account_history(n):
@@ -349,6 +391,23 @@ def _seed_account_history(n):
         ch.health_score = float(20 + (i * 7) % 80)
         ch.consecutive_test_failures = i % 4
         seed.make_group(name=f'Scaling Detail Group {i}', members=[ch])
+        # A listed host per row, so the Hosts card (dev/changelog/1168) grows with the seed
+        # and a per-host lookup would show up as a query that scales.
+        db.session.add(AccountHost(account_id=acc.id, host=f'h{i}.scaling.example',
+                                   position=i, is_active=(i == 0),
+                                   last_resolve_error=('did not resolve' if i % 3 == 1 else None),
+                                   last_resolved_at=(datetime.utcnow() if i % 3 == 2 else None),
+                                   created_at=datetime.utcnow()))
+        # And a listed login per row, so the Logins card (dev/changelog/1169) grows with the
+        # seed too; one of every three is inside its refusal cooldown.
+        login = Login(name=f'login {i}', username=f'user{i}', password=f'pw{i}',
+                      max_connections=1 + i % 3,
+                      last_refused_at=(datetime.utcnow() if i % 3 == 1 else None),
+                      last_refused_detail=('HTTP error 403 Forbidden' if i % 3 == 1 else None),
+                      created_at=datetime.utcnow(), updated_at=datetime.utcnow())
+        db.session.add(login)
+        db.session.flush()
+        db.session.add(AccountLogin(account_id=acc.id, login_id=login.id, position=i))
         db.session.add(AccountSyncLog(
             account_id=acc.id,
             started_at=datetime.utcnow() - timedelta(minutes=i + 1),
@@ -811,6 +870,12 @@ class PageScalingTests(unittest.TestCase):
     def test_group_detail_rows_api(self):
         self._assert_row_independent(
             _seed_group_members, lambda: f'/api/channel-groups/{_scaling_group_id()}/detail-rows')
+
+    def test_group_detail_with_provider_copies(self):
+        for path in ('/channel-groups/{}', '/api/channel-groups/{}/detail-rows'):
+            with self.subTest(path=path):
+                self._assert_row_independent(
+                    _seed_group_provider_copies, lambda: path.format(_scaling_group_id()))
 
 
 #: Page endpoints that have a case above, mapped to the test method that measures them.

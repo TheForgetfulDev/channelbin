@@ -2,6 +2,7 @@ from .recordings import recordings_bp
 from .dashboard import dashboard_bp
 from .settings import settings_bp
 from .accounts import accounts_bp
+from .providers import providers_bp
 from .guide import guide_bp
 from .channel_tests import channel_tests_bp
 from .channels import channels_bp
@@ -26,6 +27,7 @@ def register_blueprints(app):
     app.register_blueprint(dashboard_bp)
     app.register_blueprint(settings_bp)
     app.register_blueprint(accounts_bp)
+    app.register_blueprint(providers_bp)
     app.register_blueprint(guide_bp)
     app.register_blueprint(channel_tests_bp)
     app.register_blueprint(channels_bp)

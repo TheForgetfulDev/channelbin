@@ -388,7 +388,7 @@ class SubGroupTests(unittest.TestCase):
                       'Measurement and local contention', 'Thumbnails and logos'],
         'watchdog': ['Stall detection', 'Moving off a member', 'Dead-stream detection'],
         'ffmpeg': ['Binaries', 'Capture', 'Join'],
-        'sync': ['Connections', 'Sync schedule', 'Guide data', 'Stream URLs',
+        'sync': ['Connections', 'Stream hosts and logins', 'Sync schedule', 'Guide data', 'Stream URLs',
                  'Channel lifecycle', 'Search'],
         'channel-testing': ['Scheduling around recordings', 'Test execution', 'Scoring',
                             'Screenshots and history', 'Pre-recording checks',
@@ -537,14 +537,14 @@ class TierTests(unittest.TestCase):
 
     def test_the_basic_set_is_exactly_the_approved_one(self):
         tiers = self._tiers(self.basic_html)
-        self.assertEqual(len(tiers), 123)
+        self.assertEqual(len(tiers), 126)
         self.assertEqual({p for p, t in tiers.items() if t == 'basic'}, self.BASIC)
         self.assertEqual({t for t in tiers.values()}, {'basic', 'advanced'})
 
     def test_every_advanced_row_carries_its_badge_and_no_basic_row_does(self):
         rows = re.findall(r'data-path="([^"]+)" data-tier="[^"]*".*?<div class="fl-label">(.*?)</div>',
                           self.basic_html, re.S)
-        self.assertEqual(len(rows), 123)
+        self.assertEqual(len(rows), 126)
         for path, badge in rows:
             with self.subTest(path=path):
                 self.assertEqual('tier-badge' in badge, path not in self.BASIC)
@@ -625,7 +625,7 @@ class ChangedFromDefaultTests(unittest.TestCase):
 
     def test_every_setting_row_carries_the_mark_and_the_attribute_turns_it_on(self):
         html = self._page()
-        self.assertEqual(html.count('<div class="fr-changed">Changed from default</div>'), 123)
+        self.assertEqual(html.count('<div class="fr-changed">Changed from default</div>'), 126)
         self.assertIn('.frow[data-changed] .fr-changed { display: inline-flex; }', self._css())
 
     def test_a_value_saved_equal_to_its_default_is_not_a_change(self):

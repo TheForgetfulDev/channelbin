@@ -9,7 +9,7 @@ from datetime import datetime
 from flask import Blueprint, render_template, request, jsonify, url_for, abort
 from sqlalchemy.orm import selectinload
 
-from .. import db, health_bands, channel_hiding
+from .. import db, health_bands, channel_hiding, duplicate_streams
 from ..database import (
     Channel, ChannelGroup, ChannelGroupMember, ChannelEvent, ChannelTest, Tag,
     Recording, RecordingEvent, RecordingProfile, HealthCheckProfile, OnDemandTestJob,
@@ -141,6 +141,10 @@ def _pending_warnings(existing_members, new_channels, force, ask_format):
       - duplicate_warning + dup_groups: exact-stream_url duplicate sets within the would-be
         member list that involve at least one NEW channel (sets purely among existing
         members were already accepted when they were added)
+      - provider_copies: one note per NEW channel that is the same channel as another
+        would-be member through a provider, naming what that second copy covers
+        (duplicate_streams.provider_copies(), DESIGN-account-providers.md §9). Same gate
+        as the URL warning, for the same reason: both are sentences about failover.
     """
     if force or not ask_format:
         return {}
@@ -154,6 +158,11 @@ def _pending_warnings(existing_members, new_channels, force, ask_format):
     if dup_sets:
         warnings['duplicate_warning'] = True
         warnings['dup_groups'] = _serialize_dup_groups(dup_sets, load_config())
+
+    copies = duplicate_streams.provider_copies(list(existing_members) + list(new_channels),
+                                               new_ids=new_ids)
+    if copies:
+        warnings['provider_copies'] = copies
 
     mismatch, unverified_new = _format_warnings(existing_members, new_channels)
     if mismatch:
@@ -1168,6 +1177,7 @@ def group_detail_rows(group, job):
     return {
         'rows': rows,
         'dup_groups': dup_groups,
+        'provider_copies': duplicate_streams.provider_copies(channels),
         'missing_channels': missing_channels,
         'counts': counts,
         'total': len(channel_ids),

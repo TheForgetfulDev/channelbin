@@ -326,6 +326,20 @@ search:
 accounts:
   default_max_connections: 1            # per-account cap on simultaneous connections (recordings + tests)
 
+# An account's stream host list: the other host names a reseller hands out for one account,
+# listed on the account page, one active at a time. When a capture fails because the active
+# host stopped resolving, the account swaps to the next listed host that does.
+hosts:
+  roll_cooldown_minutes: 10             # at most one swap per account per this many minutes
+  check_interval_hours: 6               # how often every listed host is looked up in DNS (lookup
+                                        # only - never swaps by itself)
+
+# An account's login list (the account page's Logins card): the other username/passwords
+# the account accepts, each with its own seats.
+logins:
+  refusal_cooldown_minutes: 30          # a login the server refused (401/403) is skipped this long
+                                        # when another login on the account has a free seat
+
 sync:
   sync_interval_hours: 12
   epg_days_ahead: 3                      # days of future EPG to import; also the TV Guide grid's width

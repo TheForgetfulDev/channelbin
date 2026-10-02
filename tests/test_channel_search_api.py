@@ -34,7 +34,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from tests.support.app import make_test_app  # noqa: E402
 from tests.support import seed  # noqa: E402
 from tests.support.search import show_all_query, unfolded_query  # noqa: E402
-from app import db  # noqa: E402
+from app import db, duplicate_streams  # noqa: E402
 from app.accounts import NORM_DISABLED, NORM_MPEGTS  # noqa: E402
 from app.channel_search import (DEFAULT_FIELDS, DIMENSIONS, FIELDS, GRAIN_CHANNELS,  # noqa: E402
                                 SORTS, STANDING_OPTIONS, VISIBLE_DIMENSIONS,
@@ -106,7 +106,7 @@ class _ApiTestCase(unittest.TestCase):
                                      health_score=10.0)
         for ch in (self.espn2, self.dup_high, self.dup_low):
             ch.stream_url = 'http://example.test/live/user1/pass1/77'
-            ch.is_duplicate_stream_url = True
+        duplicate_streams.recompute()
 
         self.removed = self._channel('Gone Fishing TV', category_name='Docs',
                                      health_score=55.0,
@@ -464,7 +464,10 @@ class DuplicateBadgeTests(_ApiTestCase):
         """ANY group, deliberately. A health-check-only group is still a channel the user
         curated and is monitoring, so it must not lose to an untouched copy."""
         self.espn2.in_guide = False
-        ChannelGroupMember.query.filter_by(channel_id=self.espn2.id).delete()
+        # Through the ORM, as the app's own removals go: the stored fold re-ranks a cluster
+        # when a membership it reads is flushed (app/duplicate_streams.py).
+        for member in ChannelGroupMember.query.filter_by(channel_id=self.espn2.id).all():
+            db.session.delete(member)
         # dup_low is the WORST-scoring copy (10 vs 99), so only the group rung can explain
         # it winning - health and id both point elsewhere.
         seed.make_group(name='Watchlist', members=[self.dup_low], in_guide=False,
@@ -478,7 +481,10 @@ class DuplicateBadgeTests(_ApiTestCase):
         self.espn2.in_guide = False
         # Every membership goes, or the group rung decides this cluster before health is
         # ever consulted and the fall-through below is never reached.
-        ChannelGroupMember.query.filter_by(channel_id=self.espn2.id).delete()
+        # Through the ORM, as the app's own removals go: the stored fold re-ranks a cluster
+        # when a membership it reads is flushed (app/duplicate_streams.py).
+        for member in ChannelGroupMember.query.filter_by(channel_id=self.espn2.id).all():
+            db.session.delete(member)
         db.session.commit()
         row = self.row_named('Sky Sports Action', SHOW_ALL)
         self.assertEqual(row['dup']['kept_id'], self.dup_high.id)
@@ -493,9 +499,9 @@ class DuplicateBadgeTests(_ApiTestCase):
         self.assertEqual(row['dup']['kept_reason'], KEEP_REASON_ID)
 
     def test_the_hidden_rows_follow_the_group_rung_too(self):
-        """The badge explains, the SQL hides - two spellings of one cascade
-        (`_keep_rank` and `_duplicate_losers`). A rung added to one and not the other is a
-        badge naming a channel the list did not actually keep."""
+        """The badge explains what the stored fold decided (`_keep_reason` over
+        `duplicate_streams.keep_order`). A rung added to one and not the other is a badge
+        naming a channel the list did not actually keep."""
         self.espn2.in_guide = False
         db.session.commit()
         names = [r['name'] for r in self.rows()]

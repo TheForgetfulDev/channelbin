@@ -143,6 +143,10 @@ _BF_EPG_SOURCES = 'm072.epg_sources'
 #: accounts.backfill_profile_filename_cleanup() discharges it from create_app() with the cfg
 #: create_app() already holds (dev/changelog/1161).
 _BF_PROFILE_FILENAME_CLEANUP = 'm083.profile_filename_cleanup'
+_BF_PROVIDER_STREAM_ID = 'm087.provider_stream_id'
+#: Discharged by duplicate_streams.backfill_fold() from create_app(): the fold's ranking
+#: reads config, and a step does not.
+_BF_DUPLICATE_FOLD = 'm088.duplicate_fold'
 
 
 def _register_backfill(conn, cur, name: str):
@@ -2793,6 +2797,171 @@ def _m083_profile_filename_cleanup(conn, cur):
     conn.commit()
 
 
+def _m084_account_hosts(conn, cur):
+    """account_hosts: the host names a reseller handed out for one account, one of them
+    active, listed by the user (app/account_links.py).
+
+    No backfill and no obligation to register (dev/changelog/686): nothing seeds the list
+    from existing rows, because an empty list means "leave the URLs as the provider sent
+    them", which is exactly what every account did before this table existed. A seeded
+    list would be the app writing the user's judgment for them.
+
+    CREATE TABLE/INDEX IF NOT EXISTS throughout, so this step is re-runnable from the top."""
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS account_hosts (
+            id                 INTEGER PRIMARY KEY,
+            account_id         INTEGER NOT NULL REFERENCES accounts(id),
+            host               VARCHAR(255) NOT NULL,
+            position           INTEGER NOT NULL DEFAULT 0,
+            is_active          BOOLEAN NOT NULL DEFAULT 0,
+            activated_at       DATETIME,
+            last_resolved_at   DATETIME,
+            last_resolve_error VARCHAR(255),
+            created_at         DATETIME NOT NULL,
+            CONSTRAINT uq_account_hosts_account_host UNIQUE (account_id, host)
+        )
+    ''')
+    conn.commit()
+
+
+def _m085_logins(conn, cur):
+    """logins + account_logins: the username/passwords an account holds beyond its own,
+    each with its own seat count (app/account_links.py, app/connection_limits.py).
+
+    No backfill and no obligation to register (dev/changelog/686): nothing seeds a login
+    from `Account.username`/`password`, because an account with no login rows means "one
+    seat pool, URLs untouched", which is exactly what every account did before these tables
+    existed. A seeded row would be the app writing the user's judgment for them.
+
+    CREATE TABLE IF NOT EXISTS throughout, so this step is re-runnable from the top."""
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS logins (
+            id                  INTEGER PRIMARY KEY,
+            name                VARCHAR(100) NOT NULL,
+            username            VARCHAR(255) NOT NULL,
+            password            VARCHAR(255) NOT NULL,
+            max_connections     INTEGER NOT NULL,
+            last_refused_at     DATETIME,
+            last_refused_detail VARCHAR(255),
+            created_at          DATETIME NOT NULL,
+            updated_at          DATETIME NOT NULL
+        )
+    ''')
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS account_logins (
+            account_id INTEGER NOT NULL REFERENCES accounts(id),
+            login_id   INTEGER NOT NULL REFERENCES logins(id),
+            position   INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (account_id, login_id)
+        )
+    ''')
+    conn.commit()
+
+
+def _m086_providers(conn, cur):
+    """providers + accounts.provider_id: the user's label for accounts that reach one
+    backend (app/account_links.py, dev/changelog/1170).
+
+    No backfill and no obligation to register (dev/changelog/686): nothing puts an account
+    on a provider, because the link is the user's call and measured id overlap between
+    unrelated backends makes any inference wrong (DESIGN-account-providers.md §2). NULL is
+    "on none", which is what every account was before this step.
+
+    CREATE TABLE IF NOT EXISTS and a column check, so this step is re-runnable from the top."""
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS providers (
+            id         INTEGER PRIMARY KEY,
+            name       VARCHAR(100) NOT NULL UNIQUE,
+            created_at DATETIME NOT NULL,
+            updated_at DATETIME NOT NULL
+        )
+    ''')
+    cols = [r[1] for r in cur.execute('PRAGMA table_info(accounts)').fetchall()]
+    if 'provider_id' not in cols:
+        cur.execute('ALTER TABLE accounts ADD COLUMN provider_id INTEGER REFERENCES providers(id)')
+    conn.commit()
+
+
+_M087_CHUNK = 5000
+
+
+def _m087_channel_provider_stream_id(conn, cur):
+    """channels: provider_stream_id - the provider's stream id out of the stream URL, the key
+    the duplicate fold uses for accounts on a provider (dev/changelog/1171,
+    DESIGN-account-providers.md §7).
+
+    Defined as accounts.url_provider_stream_id(raw_stream_url), the same parse that defines
+    url_normalizable, so it calls current code under the rule in this module's docstring.
+    Ledger-gated like _m024: the backfill commits in chunks, so an interrupted run leaves the
+    column present and partly filled, and the retry has to finish it rather than read the
+    column's existence as done. Every value is recomputed from the URL, so a re-run from the
+    top is safe. No index: the fold's query decides that."""
+    from .accounts import url_provider_stream_id
+
+    cols = {r[1] for r in cur.execute('PRAGMA table_info(channels)').fetchall()}
+    added = 'provider_stream_id' not in cols
+    if added:
+        _register_backfill(conn, cur, _BF_PROVIDER_STREAM_ID)
+        cur.execute('ALTER TABLE channels ADD COLUMN provider_stream_id TEXT')
+        conn.commit()
+    if _backfill_needed(cur, _BF_PROVIDER_STREAM_ID, added):
+        # raw_stream_url first and stream_url as the fallback, matching _m024.
+        rows = cur.execute('SELECT id, raw_stream_url, stream_url FROM channels').fetchall()
+        values = [(url_provider_stream_id(r[1] or r[2] or ''), r[0]) for r in rows]
+        for lo in range(0, len(values), _M087_CHUNK):
+            cur.executemany('UPDATE channels SET provider_stream_id = ? WHERE id = ?',
+                            values[lo:lo + _M087_CHUNK])
+            conn.commit()
+        log.info('Backfill: %d of %d channels carry a provider stream id',
+                 sum(1 for v in values if v[0] is not None), len(rows))
+        _finish_backfill(conn, cur, _BF_PROVIDER_STREAM_ID)
+
+
+
+def _m088_duplicate_fold(conn, cur):
+    """channels: duplicate_cluster_id + is_duplicate_loser replace is_duplicate_stream_url
+    (app/duplicate_streams.py, dev/changelog/1172).
+
+    The old flag said "shares a stream URL with another channel"; the fold now keys on the
+    provider's stream id for accounts on a provider, and stores which cluster a channel is
+    in and whether it is the copy folded away, so a search reads the answer instead of
+    ranking every duplicate per query.
+
+    The obligation to compute both columns is registered before the first ALTER and
+    discharged by duplicate_streams.backfill_fold() from create_app(): its ranking reads
+    config. Until then every channel reads as not a duplicate, which hides nothing.
+
+    Guarded throughout, so the step is re-runnable from the top."""
+    cols = {r[1] for r in cur.execute('PRAGMA table_info(channels)').fetchall()}
+    if not cols:
+        return
+    if not {'duplicate_cluster_id', 'is_duplicate_loser'} <= cols \
+            or 'is_duplicate_stream_url' in cols:
+        _register_backfill(conn, cur, _BF_DUPLICATE_FOLD)
+    if 'duplicate_cluster_id' not in cols:
+        cur.execute('ALTER TABLE channels ADD COLUMN duplicate_cluster_id INTEGER')
+    if 'is_duplicate_loser' not in cols:
+        cur.execute('ALTER TABLE channels ADD COLUMN is_duplicate_loser '
+                    'BOOLEAN NOT NULL DEFAULT 0')
+    cur.execute('DROP INDEX IF EXISTS ix_channels_is_duplicate_stream_url')
+    if 'is_duplicate_stream_url' in cols:
+        cur.execute('ALTER TABLE channels DROP COLUMN is_duplicate_stream_url')
+    cur.execute('CREATE INDEX IF NOT EXISTS ix_channels_duplicate_cluster_id '
+                'ON channels (duplicate_cluster_id)')
+    # "Show duplicates" off now reads is_duplicate_loser, and ix_channels_standing only
+    # pays while it covers every column the standing breakdown reads (migration 48,
+    # StandingIndexCoverageTests) - so it is rebuilt with the column added. Asked of the
+    # index's own SQL rather than assumed, so a re-run does not rebuild it twice.
+    standing = cur.execute("SELECT sql FROM sqlite_master WHERE type = 'index' "
+                           "AND name = 'ix_channels_standing'").fetchone()
+    if standing is None or 'is_duplicate_loser' not in (standing[0] or ''):
+        cur.execute('DROP INDEX IF EXISTS ix_channels_standing')
+        cur.execute('CREATE INDEX ix_channels_standing ON channels '
+                    '(hidden, in_guide, url_normalizable, account_id, health_score, '
+                    'is_duplicate_loser)')
+    conn.commit()
+
+
 def _m081_account_blocks(conn, cur):
     """account_blocks: the stretches of time the user has told ChannelBin to keep off an
     account (app/account_blocks.py, dev/changelog/1151).
@@ -2988,6 +3157,16 @@ SCHEMA_MIGRATIONS = [
      _m082_channel_screenshot_captured_at),
     (83, 'recording_profiles: filename_tags_remove/_replace, a profile\'s own tag cleanup '
      'saved with its template', _m083_profile_filename_cleanup),
+    (84, 'account_hosts: the host names a reseller handed out for one account, one active, '
+     'rolled when the active one stops resolving', _m084_account_hosts),
+    (85, 'logins + account_logins: the username/passwords an account holds, each with its '
+     'own seats, a capture launched with the one it took a seat on', _m085_logins),
+    (86, 'providers + accounts.provider_id: the user\'s label for accounts that reach one '
+     'backend, which may share a login', _m086_providers),
+    (87, 'channels: provider_stream_id, the provider\'s stream id out of the stream URL, '
+     'stamped at sync and backfilled', _m087_channel_provider_stream_id),
+    (88, 'channels: duplicate_cluster_id + is_duplicate_loser, the stored duplicate fold, '
+     'replacing is_duplicate_stream_url', _m088_duplicate_fold),
 ]
 
 CURRENT_SCHEMA_VERSION = SCHEMA_MIGRATIONS[-1][0]
@@ -3178,12 +3357,11 @@ def _backfill_url_normalization():
 
 
 def _backfill_duplicate_flags():
-    """One-time pass to compute is_duplicate_stream_url for channels synced before this
-    column existed."""
-    from .accounts import _recompute_duplicate_stream_urls
-    _recompute_duplicate_stream_urls()
-    db.session.commit()
-    log.info('Backfill: computed is_duplicate_stream_url for existing channels')
+    """Nothing to compute here any more. The flag this filled was replaced by the duplicate
+    fold's columns in migration 88, which registers its own obligation to compute them from
+    the current rows (app/duplicate_streams.py) - and a database old enough to reach this
+    line has not crossed 88 yet, so that pass still lies ahead of it."""
+    log.info('Backfill: duplicate flags are computed by migration 88')
 
 
 def _backfill_health_scores():

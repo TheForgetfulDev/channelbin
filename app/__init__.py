@@ -217,7 +217,11 @@ def create_app(config_overrides=None, start_scheduler=True):
         fresh = is_fresh_db()  # must be checked before create_all builds the schema
         tags_table_is_new = not _table_exists('tags')
         db.create_all()
-        run_migrations(fresh_db=fresh, cfg=cfg)
+        # Steps run ORM code against a channels table that may not have the duplicate
+        # fold's columns yet; migration 88 owes the full recompute, discharged below.
+        from . import duplicate_streams
+        with duplicate_streams.suspended():
+            run_migrations(fresh_db=fresh, cfg=cfg)
         # Unconditional, and it has to be: the FTS5 search indexes are raw virtual tables
         # with no ORM model, so create_all() can't build them, and run_migrations() skips
         # every step on a fresh DB. Without this a brand-new database - and the test
@@ -239,6 +243,10 @@ def create_app(config_overrides=None, start_scheduler=True):
         # from the cfg held here (dev/changelog/1161).
         from .accounts import backfill_profile_filename_cleanup
         backfill_profile_filename_cleanup(cfg)
+        # Migration 88's: the fold's ranking reads sync.channel_missing_after_days from the
+        # cfg held here (dev/changelog/1172).
+        duplicate_streams.backfill_fold(cfg)
+        duplicate_streams.install_listener()
         _ensure_system_health_job()
         if tags_table_is_new:
             _seed_default_tags()
@@ -574,6 +582,7 @@ def _ensure_system_health_job():
     Startup-only commit, deliberately outside retry_on_locked (single-threaded, no
     concurrent writer exists yet - same exemption as _seed_default_tags).
     """
+    from sqlalchemy import text
     from .config import config_write_lock, _load_config_file, _write_config_file
     from .database import ChannelGroup, OnDemandTestJob
     log = logging.getLogger(__name__)
@@ -582,15 +591,26 @@ def _ensure_system_health_job():
     # is computed at run/display time (channel_groups.check_target_channels), so the
     # group row exists but never gets membership rows. Self-heals a system job left
     # unlinked (group_id None) as well as a fresh DB with neither row.
-    system_group = ChannelGroup.query.filter_by(is_system=True).first()
-    if system_group is None:
+    #
+    # The two existence checks are plain SQL rather than ORM queries on purpose: an ORM
+    # query compiles cold on every fresh engine (~8ms each), and the test suite builds a
+    # few thousand apps per run, so this pair was the single largest fixed cost in
+    # make_test_app() - measured 52ms -> ~44ms per app without it (dev/changelog/1167).
+    # The rows are only ever CREATED through the ORM below, so the models stay the schema.
+    group_row = db.session.execute(text(
+        'SELECT id FROM channel_groups WHERE is_system = 1 LIMIT 1')).first()
+    if group_row is None:
         system_group = ChannelGroup(name='TV Guide Channels', is_system=True)
         db.session.add(system_group)
         db.session.commit()
+        group_id = system_group.id
         log.info('Created system group: TV Guide Channels')
+    else:
+        group_id = group_row[0]
 
-    job = OnDemandTestJob.query.filter_by(is_system=True).first()
-    if job is None:
+    job_row = db.session.execute(text(
+        'SELECT id, group_id FROM on_demand_test_jobs WHERE is_system = 1 LIMIT 1')).first()
+    if job_row is None:
         db.session.add(OnDemandTestJob(
             name='TV Guide Channels',
             is_system=True,
@@ -600,12 +620,13 @@ def _ensure_system_health_job():
             recur_hour=2,
             recur_minute=0,
             recur_paused=False,
-            group_id=system_group.id,
+            group_id=group_id,
         ))
         db.session.commit()
         log.info('Created system health-check job: TV Guide Channels')
-    elif job.group_id is None:
-        job.group_id = system_group.id
+    elif job_row[1] is None:
+        db.session.execute(text('UPDATE on_demand_test_jobs SET group_id = :gid WHERE id = :jid'),
+                           {'gid': group_id, 'jid': job_row[0]})
         db.session.commit()
 
     # Read through the mtime cache, never a direct yaml.safe_load: an uncached parse here

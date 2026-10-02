@@ -1506,6 +1506,8 @@ _CURRENT_CODE_IMPORTS = {
     # channels.url_normalizable is defined as this function's answer - the column exists
     # only because deriving it per request was measured too expensive.
     ('_m024_channel_search_support', '.accounts.url_is_normalizable'): _DEFINED_BY,
+    # channels.provider_stream_id is defined the same way, by the same parse.
+    ('_m087_channel_provider_stream_id', '.accounts.url_provider_stream_id'): _DEFINED_BY,
     # _m004 is the one dependency of a different kind: legacy channel_testing keys are the
     # user's own config, which is state like the database, not code.
     ('_m004_unify_guide_health_checks', '.config.load_config'): _INPUT_STATE,
@@ -1515,7 +1517,6 @@ _CURRENT_CODE_IMPORTS = {
     ('_backfill_url_normalization', '.accounts.normalize_url'): _DEFINED_BY,
     ('_backfill_url_normalization', '.database.Account'): _MODELS,
     ('_backfill_url_normalization', '.database.Channel'): _MODELS,
-    ('_backfill_duplicate_flags', '.accounts._recompute_duplicate_stream_urls'): _DEFINED_BY,
     ('_backfill_health_scores', '.health_score.blend_health_score'): _DEFINED_BY,
     ('_backfill_health_scores', '.health_score.score_test_quality'): _DEFINED_BY,
     ('_backfill_health_scores', '.config.load_config'): _INPUT_STATE,

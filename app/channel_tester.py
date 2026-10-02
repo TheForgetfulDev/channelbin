@@ -22,6 +22,9 @@ from datetime import datetime, timedelta
 from typing import List, Optional
 
 from . import admission
+from .account_links import (is_credential_refusal, is_resolution_failure,
+                            note_refusal_for_holder, render_held_login,
+                            roll_host_for_channel)
 from .config import config_default
 from .postprocessor import EtaSmoother
 from .proc_utils import GrowthMonitor, terminate_or_kill, wait_for_file_data
@@ -1173,13 +1176,14 @@ def run_pre_check(app, recording_id: int):
                 if channel_id is not None and skip_reason is None:
                     # Nothing to learn from a channel the recording cannot start on, and the
                     # test itself would open the connection the block exists to keep free.
-                    from .account_blocks import blocked_account_ids, describe, free_at
+                    from .account_blocks import blocked_account_ids, blocked_reason, describe
                     target = db.session.get(Channel, channel_id)
                     if target is not None and blocked_account_ids(
                             [target.account_id], at=rec.start_time):
-                        until = free_at(target.account_id, rec.start_time)
-                        skip_reason = (describe(target.account.name, until, capital=True)
-                                       + ' when this recording starts')
+                        why = (blocked_reason(target.account_id, target.account.name,
+                                              capital=True, at=rec.start_time)
+                               or describe(target.account.name, None, capital=True))
+                        skip_reason = why + ' when this recording starts'
                         channel_id = None
                 if channel_id is None:
                     if skip_reason is None:
@@ -1401,6 +1405,9 @@ def _run_channel_test_inner(app, channel_id: int, job_id: Optional[int] = None,
         cfg = load_config()
         from .accounts import normalize_url
         stream_url = normalize_url(ch.stream_url, ch.account, cfg)
+        # The seat run_channel_test() took may be on one of the account's listed logins;
+        # the test is launched with that login's credentials (app/account_links.py).
+        stream_url, _login_id = render_held_login(stream_url, ch.account_id, 'test', channel_id)
         with _lock:
             # Overrides the raw value _run_channel_loop set before this test started -
             # this is the URL actually handed to ffmpeg below, so the live status/log
@@ -1584,6 +1591,19 @@ def _run_channel_test_inner(app, channel_id: int, job_id: Optional[int] = None,
 
                 stderr_thread.join(timeout=2.0)
                 stderr_snippet = _extract_stderr_error(list(stderr_buf))
+
+                # ffmpeg exited because the stream host did not resolve: the one failure
+                # that rolls the account's host list (app/account_links.py). Rate-limited
+                # there, so asking on every attempt costs nothing; this test still fails on
+                # the host it opened, and the next one opens on the rolled URL.
+                if exit_code_before_kill is not None and is_resolution_failure('\n'.join(stderr_buf)):
+                    roll_host_for_channel(channel_id, trigger=f'Health check of channel {channel_id}')
+                # Likewise a refusal of the login this test's seat is on: stamped so the
+                # next capture on the account takes a seat on another login.
+                if exit_code_before_kill is not None and is_credential_refusal('\n'.join(stderr_buf)):
+                    note_refusal_for_holder('test', channel_id,
+                                            trigger=f'Health check of channel {channel_id}',
+                                            stderr_tail='\n'.join(stderr_buf))
 
                 if exit_code_before_kill is not None:
                     code_str = f' (exit code {exit_code_before_kill})'

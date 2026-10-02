@@ -110,7 +110,7 @@ _APSCHEDULER_ROUTINE_SUFFIX = 'executed successfully'
 # wrong on any channel the user has nudged by hand.
 _CHANNEL_FIELDS = (
     'id', 'account_id', 'name', 'category_name', 'category_id', 'epg_channel_id',
-    'in_guide', 'test_enabled', 'is_duplicate_stream_url', 'stream_url',
+    'in_guide', 'test_enabled', 'is_duplicate_stream', 'stream_url',
     'health_score', 'health_score_sample_count', 'health_score_updated_at',
     'manual_health_adjustment', 'consecutive_test_failures',
 )
@@ -638,7 +638,7 @@ def _channel_aggregate():
     """
     query = db.session.query(
         Channel.account_id, Channel.stream_url, Channel.in_guide,
-        Channel.test_enabled, Channel.is_duplicate_stream_url,
+        Channel.test_enabled, Channel.is_duplicate_stream,
     ).yield_per(1000)
 
     counts = Counter()
@@ -655,14 +655,14 @@ def _channel_aggregate():
         'url_extension': key[2],
         'in_guide': key[3],
         'test_enabled': key[4],
-        'is_duplicate_stream_url': key[5],
+        'is_duplicate_stream': key[5],
         'count': count,
     } for key, count in counts.items()]
     # Deterministic order so two bundles from one install diff cleanly. None sorts
     # against a string in Python 3, hence the '' stand-ins in the key only.
     rows.sort(key=lambda r: (r['account_id'], r['url_scheme'] or '',
                              r['url_extension'] or '', r['in_guide'],
-                             r['test_enabled'], r['is_duplicate_stream_url']))
+                             r['test_enabled'], r['is_duplicate_stream']))
     return total, rows
 
 

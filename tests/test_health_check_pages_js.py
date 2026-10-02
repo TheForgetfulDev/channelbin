@@ -312,5 +312,27 @@ class ChannelPageMenuOpenTests(_Base):
         self.assertEqual(self.obs['afterClose'], {'pageFetches': 1, 'bar': 'Healthy'})
 
 
+class ChannelPageAddToGroupWarnedTests(_Base):
+    """dev/docs/BUGS.md 2026-10-02 @ 08:42:25 AM - Add to channel group read the server's
+    `{success: false, ...warnings}` answer as success: it closed and reloaded, and the channel
+    had not been added."""
+    SCENARIO = 'channel_add_to_group_warned'
+
+    def test_a_warned_add_keeps_the_dialog_up_and_shows_the_warning(self):
+        w = self.obs['warned']
+        self.assertTrue(w['modalOpen'])
+        self.assertIn('is the same channel as curated: One', w['warning'])
+        self.assertTrue(w['proceed'])
+        self.assertEqual(w['navigations'], 0)
+
+    def test_the_warning_text_is_escaped(self):
+        self.assertEqual(self.obs['warned']['bold'], 0)
+        self.assertIn('<b>One</b>', self.obs['warned']['warning'])
+
+    def test_proceed_anyway_resends_forced_and_then_reloads(self):
+        self.assertEqual([b['force'] for b in self.obs['memberPosts']], [False, True])
+        self.assertEqual(self.obs['navigationsAfterProceed'], 1)
+
+
 if __name__ == '__main__':
     unittest.main()

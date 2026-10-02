@@ -30,7 +30,7 @@ const PAGES = {
   channel: {
     path: META.channelPath,
     js: ['util.js', 'schedule-fields.js', 'check-modal.js', 'missing-modal.js',
-      'channel-detail.js'],
+      'group-modal.js', 'channel-detail.js'],
   },
 };
 const STATES = {};
@@ -41,7 +41,9 @@ for (const s of ['idle', 'running', 'done']) {
   };
 }
 
-function boot(page, start, { query = '' } = {}) {
+/* `answers`: {pathname: (opts) => payload} for a scenario that needs an endpoint to say
+   something other than the generic success - checked before every default below. */
+function boot(page, start, { query = '', answers = {} } = {}) {
   const spec = PAGES[page];
   const errors = [];
   const navigations = [];
@@ -55,10 +57,21 @@ function boot(page, start, { query = '' } = {}) {
   const server = { state: start };
   const sent = [];
   const posts = [];
+  const bodies = [];
   const fetchStub = (target, opts = {}) => {
     const url = new URL(String(target), `http://localhost:5000${spec.path}`);
     sent.push(url.pathname);
-    if ((opts.method || 'GET').toUpperCase() !== 'GET') posts.push(url.pathname);
+    if ((opts.method || 'GET').toUpperCase() !== 'GET') {
+      posts.push(url.pathname);
+      bodies.push({ path: url.pathname, body: opts.body ? JSON.parse(opts.body) : null });
+    }
+    if (answers[url.pathname]) {
+      const payload = answers[url.pathname](opts);
+      return Promise.resolve({
+        ok: true, status: 200, headers: { get: () => 'application/json' },
+        json: () => Promise.resolve(payload), text: () => Promise.resolve(JSON.stringify(payload)),
+      });
+    }
     if (url.pathname === spec.path) {
       const body = STATES[server.state][page];
       return Promise.resolve({
@@ -96,7 +109,7 @@ function boot(page, start, { query = '' } = {}) {
   spec.js.forEach((f) => window.eval(fs.readFileSync(`${REPO}/static/js/${f}`, 'utf8')));
 
   const c = {
-    window, document, server, sent, posts, errors, navigations,
+    window, document, server, sent, posts, bodies, errors, navigations,
     $: (s) => document.querySelector(s),
     $$: (s) => Array.from(document.querySelectorAll(s)),
     settle: (ms = 60) => new Promise((r) => setTimeout(r, ms)),
@@ -309,6 +322,46 @@ await record('channel_menu_open', async (start) => {
   return {
     errors: c.errors, menuOpen, whileOpen,
     afterClose: { pageFetches: c.pageFetches(), bar: c.text('#cd-statusbar .badge') },
+  };
+});
+
+/* Add to channel group, answered with the server's soft warnings: nothing was added, so
+   the dialog has to stay up and say why rather than close and reload as if it had worked
+   (dev/docs/BUGS.md 2026-10-02 @ 08:42:25 AM). */
+await record('channel_add_to_group_warned', async (start) => {
+  const c = start('channel', 'idle', {
+    answers: {
+      '/api/channel-groups': () => ({ groups: [{ id: 9, name: 'Pair', member_count: 1, in_guide: true }] }),
+      '/api/channel-groups/9/members': (opts) => (JSON.parse(opts.body).force
+        ? { success: true, group_id: 9, group_name: 'Pair', added: [1] }
+        : { success: false, provider_copies: [{ text: 'direct: <b>One</b> is the same channel as curated: One.' }] }),
+    },
+  });
+  await c.settle();
+  c.click(c.$('#cd-kebab [data-act="add-group"]'));
+  await c.settle();
+  const radio = c.$('input[name="cd-grp"]');
+  radio.checked = true;
+  radio.dispatchEvent(new c.window.Event('change', { bubbles: true }));
+  c.click(c.$('.modal-foot .btn-primary'));
+  await c.settle();
+  const warned = {
+    modalOpen: Boolean(c.$('#cd-grp-warnings')),
+    warning: c.text('#cd-grp-warnings'),
+    bold: c.$$('#cd-grp-warnings b').length,
+    proceed: Boolean(c.$('#cd-grp-force')),
+    navigations: c.navigations.length,
+  };
+  const force = c.$('#cd-grp-force');
+  if (force) {
+    c.click(force);
+    await c.settle();
+  }
+  return {
+    errors: c.errors,
+    warned,
+    memberPosts: c.bodies.filter((b) => b.path === '/api/channel-groups/9/members').map((b) => b.body),
+    navigationsAfterProceed: c.navigations.length,
   };
 });
 

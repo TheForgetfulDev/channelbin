@@ -30,7 +30,7 @@ from tests.support.config_sandbox import ConfigSandbox  # noqa: E402
 from tests.support.iocount import IOCounter, all_engines  # noqa: E402
 from tests.support import seed  # noqa: E402
 from tests.support.search import only_hiding  # noqa: E402
-from app import db  # noqa: E402
+from app import db, duplicate_streams  # noqa: E402
 from app.accounts import NORM_DISABLED, NORM_MPEGTS  # noqa: E402
 from app.channel_search import (  # noqa: E402
     DimensionFilter, GRAIN_AIRINGS, GRAIN_CHANNELS, SearchContext, SearchState,
@@ -61,8 +61,7 @@ class _CacheTestCase(unittest.TestCase):
         self.dup_b = seed.make_channel(self.acct, name='Dup B', health_score=10.0,
                                        last_seen_at=now)
         self.dup_a.stream_url = self.dup_b.stream_url = 'http://example.test/live/shared'
-        self.dup_a.is_duplicate_stream_url = True
-        self.dup_b.is_duplicate_stream_url = True
+        duplicate_streams.recompute()
 
         self.unnorm = seed.make_channel(self.acct, name='Radio Mount', health_score=70.0,
                                         last_seen_at=now, url_normalizable=False)

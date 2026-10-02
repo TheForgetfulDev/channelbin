@@ -29,7 +29,8 @@ from sqlalchemy import func, select, update
 from sqlalchemy.exc import SQLAlchemyError
 
 from .config import load_config, config_default
-from . import admission, db
+from . import admission, db, duplicate_streams
+from .account_links import clear_rolled_alert_after_sync, host_list, render_host
 from .channel_groups import touch_group
 from .database import (
     Account, Alert, Channel, ChannelEvent, ChannelGroupMember, EPGEntry, AccountSyncLog,
@@ -576,6 +577,21 @@ def url_is_normalizable(url: str) -> bool:
     defined as this function's answer, but see migrations.py's module docstring before
     assuming an edit here stays inside this module (dev/changelog/688)."""
     return parse_stream_url_parts(url) is not None
+
+
+def url_provider_stream_id(url: str) -> str | None:
+    """The provider's stream id in this URL - the <numeric id> of its user/pass/id triplet,
+    as text - or None when it carries no triplet. Pure, safe in a row loop.
+
+    The strict triplet, not "any trailing number": measured on the live database, the looser
+    pattern also keyed provider .mp3 radio streams and a third-party /static/1.ts that two
+    unrelated accounts both carry, and those are exactly the rows the provider fold must
+    leave on their URL (dev/changelog/1171).
+
+    A shipped migration step backfills channels.provider_stream_id through this, under the
+    same rule as url_is_normalizable() above."""
+    parts = parse_stream_url_parts(url)
+    return parts[3] if parts else None
 
 
 # ── Filename template ─────────────────────────────────────────────────────────
@@ -1429,7 +1445,7 @@ def _do_sync(account_id: int, stop_event: threading.Event, use_dump: bool = Fals
             Channel.account_id == account_id
         ).count()
 
-        recompute_duplicate_stream_urls_and_commit()
+        duplicate_streams.recompute_and_commit()
 
         @retry_on_locked()
         def _mark_success_and_commit():
@@ -1545,6 +1561,10 @@ def _do_sync(account_id: int, stop_event: threading.Event, use_dump: bool = Fals
         # belongs on the success path rather than on a sweep: nothing else knows the account
         # caught up.
         update_overdue_alert(account_id, sync_cfg)
+
+        # A sync that reached the end on the rolled host is the proof the roll worked - the
+        # self-clearing half of ACCOUNT_HOST_ROLLED (app/account_links.py).
+        clear_rolled_alert_after_sync(account_id)
 
         _raise_channel_lifecycle_alerts(account, cfg, sync_time, previous_last_sync_at,
                                         channel_count_baseline, new_channel_ids)
@@ -2039,7 +2059,7 @@ def lifecycle_states_for_channels(channels, cfg, accounts_by_id=None) -> dict:
 def repoint_candidates_for_channels(channels, cfg, lifecycle_by_channel):
     """{missing_channel.id: survivor_channel} - the duplicate-repoint recovery target
     (DESIGN-sync-resilience.md §6) for every channel in `channels` that is 'missing' and
-    duplicate-flagged. `is_duplicate_stream_url` is the cheap prefilter (skip the lookup
+    duplicate-flagged. `is_duplicate_stream` is the cheap prefilter (skip the lookup
     entirely when nothing in the batch is flagged); the survivor query itself is one batched
     exact-URL lookup across ALL accounts, never per-row. Picks the oldest (lowest id)
     non-missing channel sharing the URL, matching duplicate_groups_within's "oldest first"
@@ -2052,7 +2072,7 @@ def repoint_candidates_for_channels(channels, cfg, lifecycle_by_channel):
     """
     missing_channels = [
         ch for ch in channels
-        if ch.is_duplicate_stream_url
+        if ch.is_duplicate_stream
         and lifecycle_by_channel.get(ch.id, (None, None))[0] == 'missing'
     ]
     if not missing_channels:
@@ -2177,6 +2197,32 @@ def transfer_channel_state(source: Channel, dest: Channel, cfg: dict) -> str:
     return f'"{source.name}" -> "{dest.name}": moved {", ".join(moved)}.'
 
 
+def missing_channel_expr(cfg, joined: bool = False):
+    """The 'missing' branch of channel_lifecycle_state() as one SQL predicate on Channel -
+    the spelling every query that needs "has the provider stopped listing this" composes
+    in (the channel search's `Deleted by provider` value, the bulk-delete query, the
+    duplicate fold's feed rung). Kept deliberately parallel to channel_lifecycle_state's
+    missing condition - if that condition changes, this must change with it.
+
+    By default an EXISTS, so it drops into a WHERE or an ORDER BY without changing the
+    shape of the query around it. De-correlating it into one OR branch per account was
+    measured twice as slow (62.9ms vs 32.2ms, 2026-07-30), because the OR chain costs the
+    account index; do not "optimize" it back. `joined=True` is for a query that already
+    joins Account on Channel.account_id and reads its columns directly.
+    """
+    missing_days = (cfg or {}).get('sync', {}).get('channel_missing_after_days', 7)
+    if missing_days <= 0:
+        return db.false()
+    cutoff = datetime.utcnow() - timedelta(days=missing_days)
+    unseen = db.and_(Channel.last_seen_at.isnot(None), Channel.last_seen_at < cutoff)
+    synced_since = db.and_(Account.last_sync_at.isnot(None),
+                           Account.last_sync_at > Channel.last_seen_at)
+    if joined:
+        return db.and_(unseen, synced_since)
+    return db.and_(unseen, select(Account.id).where(
+        Account.id == Channel.account_id, synced_since).correlate(Channel).exists())
+
+
 def missing_channels_query(account_id, cfg, channel_ids=None):
     """Channel.query filtered to exactly the 'missing' branch of channel_lifecycle_state()
     above - re-expressed as SQL (joined against Account) so a bulk operation over
@@ -2185,22 +2231,11 @@ def missing_channels_query(account_id, cfg, channel_ids=None):
     it depends on per-account aggregates that don't apply to "missing" at all.
 
     `channel_ids` scopes to an explicit set of channels (a group/health check's own
-    members) instead of - or in addition to - an account. Kept deliberately parallel to
-    channel_lifecycle_state's missing condition - if that condition changes, this must
-    change with it.
+    members) instead of - or in addition to - an account. The condition itself is
+    missing_channel_expr()'s.
     """
-    missing_days = cfg.get('sync', {}).get('channel_missing_after_days', 7)
-    if missing_days <= 0:
-        return Channel.query.filter(db.false())
-
-    cutoff = datetime.utcnow() - timedelta(days=missing_days)
-    q = (
-        Channel.query.join(Account, Channel.account_id == Account.id)
-        .filter(Channel.last_seen_at.isnot(None))
-        .filter(Account.last_sync_at.isnot(None))
-        .filter(Channel.last_seen_at < cutoff)
-        .filter(Account.last_sync_at > Channel.last_seen_at)
-    )
+    q = (Channel.query.join(Account, Channel.account_id == Account.id)
+         .filter(missing_channel_expr(cfg, joined=True)))
     if account_id:
         q = q.filter(Channel.account_id == account_id)
     if channel_ids is not None:
@@ -2316,7 +2351,8 @@ def _upsert_channels(account: Account, streams: list, cfg: dict | None = None,
         for row in db.session.query(
             Channel.id, Channel.stream_id, Channel.name, Channel.logo_url,
             Channel.category_name, Channel.category_id, Channel.stream_url,
-            Channel.raw_stream_url, Channel.url_normalizable, Channel.epg_channel_id,
+            Channel.raw_stream_url, Channel.url_normalizable, Channel.provider_stream_id,
+            Channel.epg_channel_id,
         ).filter(Channel.account_id == account.id).all()
     }
 
@@ -2325,6 +2361,12 @@ def _upsert_channels(account: Account, streams: list, cfg: dict | None = None,
     # default state of every account, and this loop runs once per channel - tens of
     # thousands of times on a real provider (CLAUDE.md "no hidden I/O in per-row loops").
     norm_mode = resolve_normalization_mode(account, cfg)
+    # The account's host list, once per sync. The provider keeps sending URLs on whatever
+    # host its playlist names - often the one that just died - so the active host has to be
+    # re-applied on every sync or the next sync undoes a roll (app/account_links.py). An
+    # account with no list gets (frozenset(), None) and render_host() hands every URL back
+    # unchanged.
+    listed_hosts, active_host = host_list(account.id)
 
     sync_time = datetime.utcnow()
     synced = 0
@@ -2379,12 +2421,16 @@ def _upsert_channels(account: Account, streams: list, cfg: dict | None = None,
             # usable channels, so skip them entirely rather than importing dead rows.
             skipped_malformed += 1
             continue
-        stream_url = normalize_url_with_mode(raw_url, norm_mode)
+        stream_url = render_host(normalize_url_with_mode(raw_url, norm_mode),
+                                 listed_hosts, active_host)
         # Stamped here, next to the URL it describes, so the stored flag can never disagree
         # with the raw_stream_url in the same row. Deliberately a property of the URL alone
         # and not of the account's mode: a channel whose account defers normalization is
         # still "has a triplet" or "has none", and the mode is applied by whoever reads it.
-        normalizable = url_is_normalizable(raw_url)
+        # The provider's stream id comes out of the same parse, so the two can never
+        # disagree (url_is_normalizable() is exactly "the parse found a triplet").
+        provider_sid = url_provider_stream_id(raw_url)
+        normalizable = provider_sid is not None
         epg_id = stream.get('epg_channel_id') or ''
         cat_id = str(stream.get('category_id', ''))
         cat_name = stream.get('category_name') or ''
@@ -2399,9 +2445,9 @@ def _upsert_channels(account: Account, streams: list, cfg: dict | None = None,
             # below are load-bearing and carried over unchanged from when these were
             # direct assignments. name/logo_url/category_name/category_id keep the stored
             # value when the provider omits or empties them, so "the provider said
-            # nothing" must not read as a change. The other four have no fallback and
+            # nothing" must not read as a change. The other five have no fallback and
             # never did: an omitted epg_channel_id genuinely clears the stored one, and
-            # the URL trio is recomputed from this sync's own feed every time.
+            # the four URL columns are recomputed from this sync's own feed every time.
             fields = {
                 'name': stream.get('name', ch.name),
                 'logo_url': stream.get('stream_icon') or ch.logo_url,
@@ -2410,6 +2456,7 @@ def _upsert_channels(account: Account, streams: list, cfg: dict | None = None,
                 'stream_url': stream_url,
                 'raw_stream_url': raw_url,
                 'url_normalizable': normalizable,
+                'provider_stream_id': provider_sid,
                 'epg_channel_id': epg_id,
             }
             moved = [col for col, val in fields.items() if getattr(ch, col) != val]
@@ -2439,6 +2486,7 @@ def _upsert_channels(account: Account, streams: list, cfg: dict | None = None,
                 stream_url=stream_url,
                 raw_stream_url=raw_url,
                 url_normalizable=normalizable,
+                provider_stream_id=provider_sid,
                 epg_channel_id=epg_id,
                 in_guide=False,
                 guide_sort_order=0,
@@ -2504,71 +2552,6 @@ def _stamp_last_seen(channel_ids: list[int], sync_time: datetime) -> None:
             .values(last_seen_at=sync_time, updated_at=Channel.updated_at),
             execution_options={'synchronize_session': False},
         )
-
-
-def _recompute_duplicate_stream_urls() -> None:
-    """Flag every Channel whose stream_url is shared by >1 channel, across all accounts.
-
-    Runs after every sync (not on-demand) since a newly-synced account's channels can
-    create or resolve duplicates involving channels from other accounts too.
-
-    Two Core UPDATEs, one per direction, rather than a Python scan-and-flip over
-    `Channel.query.all()`: this is a whole-database pass on every sync of any account, and
-    hydrating every channel to compare one string cost 5.80s warm / 7.56s cold against the
-    real 138,415-row database while changing zero rows, versus 0.59s for the two statements
-    (dev/changelog/684). It also allocated 138k ORM objects on a box with no swap.
-
-    It writes, so it holds the single write lock for as long as its enclosing closure runs,
-    and a lock retry re-runs everything else in that closure with it: prefer
-    `recompute_duplicate_stream_urls_and_commit()` below, which is that closure and holds
-    nothing else (dev/changelog/685). Re-running the recompute itself is always safe - it
-    derives every flag from the current table rather than from a diff.
-
-    The duplicate set stays a subquery instead of a Python set so no URL ever crosses back
-    into the process: both statements plan as a `SEARCH channels USING INDEX
-    ix_channels_is_duplicate_stream_url` with the group-by materialized once as a list
-    subquery. `stream_url` is NOT NULL, and the `://` filter cannot admit a NULL either, so
-    the NOT IN below has no three-valued-logic hole to fall through.
-
-    `updated_at` is deliberately NOT self-assigned here (contrast `_stamp_last_seen` above,
-    which must suppress it): a row whose flag actually flips did change, and letting the
-    column's `onupdate` fire keeps this identical to the ORM flush it replaces.
-
-    synchronize_session=False is safe for the same reason it is in `_stamp_last_seen` -
-    all four callers commit immediately, which expires the identity map anyway.
-    """
-    dup_urls = (
-        select(Channel.stream_url)
-        .where(Channel.stream_url.contains('://'))  # skip malformed/truncated URLs - not a real duplicate signal
-        .group_by(Channel.stream_url)
-        .having(func.count(Channel.id) > 1)
-    )
-    db.session.execute(
-        update(Channel)
-        .where(Channel.is_duplicate_stream_url.is_(False),
-               Channel.stream_url.in_(dup_urls))
-        .values(is_duplicate_stream_url=True),
-        execution_options={'synchronize_session': False},
-    )
-    db.session.execute(
-        update(Channel)
-        .where(Channel.is_duplicate_stream_url.is_(True),
-               Channel.stream_url.not_in(dup_urls))
-        .values(is_duplicate_stream_url=False),
-        execution_options={'synchronize_session': False},
-    )
-
-
-@retry_on_locked()
-def recompute_duplicate_stream_urls_and_commit() -> None:
-    """The recompute above as its own retried commit unit - the way callers should run it.
-
-    Kept deliberately bare: whatever else shares a `retry_on_locked` closure with these two
-    write statements is redone on every lock retry, and is holding the write lock while they
-    run (dev/changelog/685).
-    """
-    _recompute_duplicate_stream_urls()
-    db.session.commit()
 
 
 def duplicate_groups_within(channels) -> list[list]:

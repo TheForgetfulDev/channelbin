@@ -48,6 +48,17 @@ SCHEDULER_STOPPED = 'SCHEDULER_STOPPED'
 #: find the literal (dev/changelog/1114).
 SCHEDULER_PASS_FAILED = 'SCHEDULER_PASS_FAILED'
 
+#: A capture failed because the account's active stream host stopped resolving, and the
+#: account rolled onto the next host on its list - or could not, because none resolves.
+#: Named because app/account_links.py raises and dismisses it by type: cleared when the
+#: account next syncs on the new host or the user edits the list (dev/changelog/1168).
+ACCOUNT_HOST_ROLLED = 'ACCOUNT_HOST_ROLLED'
+
+#: A capture failed because the server refused the credentials of one of the account's
+#: listed logins (ffmpeg's 401/403). Named because app/account_links.py raises it by type,
+#: at most once per refusal cooldown window per login (dev/changelog/1169).
+ACCOUNT_LOGIN_REFUSED = 'ACCOUNT_LOGIN_REFUSED'
+
 #: Types nothing raises any more, kept in ALERT_TYPES below purely so the rows already in
 #: the database still render with a label.
 #:
@@ -227,6 +238,23 @@ ALERT_TYPES = {
     # the corrected "next sync" time (dev/changelog/923 decision 8).
     'SYNC_ACCOUNT_OVERDUE': {
         'label': 'Account Sync Overdue', 'severity': 'WARN', 'self_clearing': True},
+    # The account's active stream host stopped resolving and a capture failure rolled it
+    # onto the next listed host, rewriting the account's stream URLs (app/account_links.py,
+    # dev/changelog/1168). WARN: the recording that tripped it relaunches on the new host
+    # at its next segment, so nothing is lost unless every listed host is dead - and then
+    # the same type says so. Self-clearing: the next successful sync on the new host, or
+    # the user editing the host list, dismisses it.
+    ACCOUNT_HOST_ROLLED: {
+        'label': 'Account Stream Host Rolled', 'severity': 'WARN', 'self_clearing': True},
+    # A listed login was refused by the server (401/403) and is skipped for the refusal
+    # cooldown while another login on the account has a free seat (dev/changelog/1169).
+    # WARN: the capture relaunches on another login at its next segment. NOT self-clearing,
+    # on purpose: there is no cheap "a capture on this login succeeded since" signal, and a
+    # self-clearing alert cannot be dismissed by hand, so a one-off panel hiccup would sit
+    # in Active alerts until the login was removed. Raised at most once per cooldown window
+    # per login instead, and the user dismisses it.
+    ACCOUNT_LOGIN_REFUSED: {
+        'label': 'Account Login Refused', 'severity': 'WARN'},
     'RECORDING_MOVE_FAILED': {
         'label': 'Recording Move Failed', 'severity': 'ERROR', 'self_clearing': True},
     # Unlike the two above, this one has no self-clearing path and is not expected to grow

@@ -182,6 +182,209 @@ class M024ResumeTests(unittest.TestCase):
             conn.close()
 
 
+class _CrashOnSecondChunk:
+    """Cursor proxy whose second executemany() raises, so a chunked backfill dies with its
+    first chunk already committed - the half-written state that reads as "done"."""
+
+    def __init__(self, cur):
+        self._cur = cur
+        self._calls = 0
+
+    def executemany(self, sql, *args):
+        self._calls += 1
+        if self._calls == 2:
+            raise _SimulatedCrash(sql)
+        return self._cur.executemany(sql, *args)
+
+    def __getattr__(self, name):
+        return getattr(self._cur, name)
+
+
+class M087ResumeTests(unittest.TestCase):
+    """Migration 87 - channels.provider_stream_id (dev/changelog/1171). Same shape as m024:
+    the column is committed before a chunked backfill, so a half-filled column is the state
+    a retry must not mistake for done - a NULL id silently drops a channel out of the
+    provider duplicate fold."""
+
+    _DDL = ('CREATE TABLE channels (id INTEGER PRIMARY KEY, raw_stream_url TEXT, '
+            'stream_url TEXT)',)
+
+    def _seed(self, conn, cur):
+        cur.execute("INSERT INTO channels (id, raw_stream_url, stream_url) VALUES "
+                    "(1, 'http://host/user/pass/123', 'http://host/user/pass/123'), "
+                    "(2, 'http://host/radio-mount', 'http://host/radio-mount'), "
+                    "(3, NULL, 'http://host/live/user/pass/0456.ts')")
+        conn.commit()
+
+    def _ids(self, cur):
+        return dict(cur.execute('SELECT id, provider_stream_id FROM channels ORDER BY id'))
+
+    def test_a_fresh_run_stamps_every_row(self):
+        with tempfile.TemporaryDirectory() as td:
+            conn, cur = _scratch(td, *self._DDL)
+            self._seed(conn, cur)
+            M._m087_channel_provider_stream_id(conn, cur)
+            self.assertEqual(self._ids(cur), {1: '123', 2: None, 3: '0456'},
+                             'stream_url is the fallback, and the id stays text')
+            conn.close()
+
+    def test_interrupted_backfill_is_finished_by_the_next_run(self):
+        with tempfile.TemporaryDirectory() as td:
+            conn, cur = _scratch(td, *self._DDL)
+            self._seed(conn, cur)
+
+            crashing = _CrashingCursor(cur, 'SELECT id, raw_stream_url')
+            with self.assertRaises(_SimulatedCrash):
+                M._m087_channel_provider_stream_id(conn, crashing)
+            self.assertIn('provider_stream_id',
+                          {r[1] for r in cur.execute('PRAGMA table_info(channels)')},
+                          'the column was committed before the crash - that is the trap')
+
+            M._m087_channel_provider_stream_id(conn, cur)
+
+            self.assertEqual(self._ids(cur), {1: '123', 2: None, 3: '0456'})
+            conn.close()
+
+    def test_a_crash_between_chunks_still_finishes(self):
+        with tempfile.TemporaryDirectory() as td:
+            conn, cur = _scratch(td, *self._DDL)
+            self._seed(conn, cur)
+
+            crashing = _CrashOnSecondChunk(cur)
+            with patch.object(M, '_M087_CHUNK', 1):
+                with self.assertRaises(_SimulatedCrash):
+                    M._m087_channel_provider_stream_id(conn, crashing)
+            self.assertEqual(self._ids(cur), {1: '123', 2: None, 3: None},
+                             'the first chunk was committed, the rest was not')
+
+            M._m087_channel_provider_stream_id(conn, cur)
+
+            self.assertEqual(self._ids(cur), {1: '123', 2: None, 3: '0456'})
+            conn.close()
+
+    def test_a_finished_backfill_is_not_run_again(self):
+        with tempfile.TemporaryDirectory() as td:
+            conn, cur = _scratch(td, *self._DDL)
+            self._seed(conn, cur)
+            M._m087_channel_provider_stream_id(conn, cur)
+
+            cur.execute("UPDATE channels SET provider_stream_id = '999' WHERE id = 1")
+            conn.commit()
+            M._m087_channel_provider_stream_id(conn, cur)
+
+            self.assertEqual(self._ids(cur)[1], '999')
+            conn.close()
+
+
+class M088FoldTests(unittest.TestCase):
+    """Migration 88 - the stored duplicate fold (dev/changelog/1172). The step swaps the
+    columns and registers the obligation to compute them; create_app() discharges it, because
+    the ranking reads config. A step that crashed after its ALTERs leaves the columns present
+    and empty, which reads as "nothing is a duplicate" - so only the ledger may say the
+    compute is done."""
+
+    _DDL = ('CREATE TABLE channels (id INTEGER PRIMARY KEY, stream_url TEXT, hidden BOOLEAN, '
+            'in_guide BOOLEAN, url_normalizable BOOLEAN, account_id INTEGER, '
+            'health_score FLOAT, is_duplicate_stream_url BOOLEAN NOT NULL DEFAULT 0)',
+            'CREATE INDEX ix_channels_is_duplicate_stream_url '
+            'ON channels (is_duplicate_stream_url)',
+            'CREATE INDEX ix_channels_standing ON channels '
+            '(hidden, in_guide, url_normalizable, account_id, health_score)')
+
+    def _columns(self, cur):
+        return {r[1] for r in cur.execute('PRAGMA table_info(channels)')}
+
+    def _indexes(self, cur):
+        return dict(cur.execute(
+            "SELECT name, sql FROM sqlite_master WHERE type = 'index' "
+            "AND tbl_name = 'channels' AND sql IS NOT NULL"))
+
+    def test_the_step_swaps_the_columns_and_registers_the_compute(self):
+        with tempfile.TemporaryDirectory() as td:
+            conn, cur = _scratch(td, *self._DDL)
+            M._m088_duplicate_fold(conn, cur)
+
+            cols = self._columns(cur)
+            self.assertLessEqual({'duplicate_cluster_id', 'is_duplicate_loser'}, cols)
+            self.assertNotIn('is_duplicate_stream_url', cols)
+            indexes = self._indexes(cur)
+            self.assertNotIn('ix_channels_is_duplicate_stream_url', indexes)
+            self.assertIn('ix_channels_duplicate_cluster_id', indexes)
+            self.assertIn('is_duplicate_loser', indexes['ix_channels_standing'],
+                          'the covering index has to carry the column the fold now reads')
+            self.assertTrue(M._backfill_pending(cur, M._BF_DUPLICATE_FOLD))
+            conn.close()
+
+    def test_a_crash_after_the_first_alter_still_owes_the_compute(self):
+        with tempfile.TemporaryDirectory() as td:
+            conn, cur = _scratch(td, *self._DDL)
+            crashing = _CrashingCursor(cur, 'DROP INDEX IF EXISTS ix_channels_is_dup')
+            with self.assertRaises(_SimulatedCrash):
+                M._m088_duplicate_fold(conn, crashing)
+            self.assertTrue(M._backfill_pending(cur, M._BF_DUPLICATE_FOLD),
+                            'registered before the first ALTER, so the crash cannot lose it')
+
+            M._m088_duplicate_fold(conn, cur)
+
+            self.assertNotIn('is_duplicate_stream_url', self._columns(cur))
+            self.assertTrue(M._backfill_pending(cur, M._BF_DUPLICATE_FOLD))
+            conn.close()
+
+    def test_a_re_run_over_a_finished_database_owes_nothing_new(self):
+        with tempfile.TemporaryDirectory() as td:
+            conn, cur = _scratch(td, *self._DDL)
+            M._m088_duplicate_fold(conn, cur)
+            M._finish_backfill(conn, cur, M._BF_DUPLICATE_FOLD)
+            before = self._indexes(cur)
+
+            M._m088_duplicate_fold(conn, cur)
+
+            self.assertFalse(M._backfill_pending(cur, M._BF_DUPLICATE_FOLD))
+            self.assertEqual(self._indexes(cur), before)
+            conn.close()
+
+
+class M088DischargeTests(unittest.TestCase):
+    """duplicate_streams.backfill_fold() - the half of migration 88 that needs the ORM."""
+
+    def setUp(self):
+        self.t = make_test_app()
+        acc = seed.make_account(name='A')
+        self.a = seed.make_channel(acc, name='one')
+        self.b = seed.make_channel(acc, name='two')
+        self.a.stream_url = self.b.stream_url = 'http://example.test/live/shared'
+        db.session.commit()
+
+    def tearDown(self):
+        self.t.cleanup()
+
+    def _register(self):
+        db.session.execute(db.text(M._BACKFILL_LEDGER_DDL))
+        db.session.execute(db.text(
+            "INSERT OR REPLACE INTO migration_backfills (name, registered_at) VALUES (:n, 'x')"),
+            {'n': M._BF_DUPLICATE_FOLD})
+        db.session.commit()
+
+    def _fold(self):
+        from app.database import Channel
+        db.session.expire_all()
+        return {c.name: (c.duplicate_cluster_id, c.is_duplicate_loser)
+                for c in Channel.query.all()}
+
+    def test_a_pending_obligation_computes_the_fold_and_is_finished(self):
+        from app import duplicate_streams
+        self._register()
+        duplicate_streams.backfill_fold({})
+        self.assertEqual(self._fold(), {'one': (self.a.id, False), 'two': (self.a.id, True)})
+        self.assertFalse(M.obligation_pending(M._BF_DUPLICATE_FOLD))
+
+    def test_with_no_obligation_it_does_nothing(self):
+        """A fresh install, and every startup after the upgrade: the sync owns the fold."""
+        from app import duplicate_streams
+        duplicate_streams.backfill_fold({})
+        self.assertEqual(self._fold(), {'one': (None, False), 'two': (None, False)})
+
+
 class M032ResumeTests(unittest.TestCase):
     """Migration 32 - recording_segments.channel_id, whose correlation pass commits in
     stages and used to return outright on "the column exists"."""

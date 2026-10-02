@@ -42,6 +42,14 @@ def _set_next_run(job_id, when_utc_aware):
 class BackgroundDimWindowTests(unittest.TestCase):
     def setUp(self):
         self.t = make_test_app(start_scheduler=True)
+        # Every job the app registers starts outside the window, so each test decides what
+        # is in it. Without this a fixed-time job (the 2:00 AM guide health check) lands
+        # inside the hour whenever the suite runs between 1 and 2 AM, and the two "stays
+        # hidden" tests fail by the clock (dev/docs/BUGS.md 2026-10-02 01:10).
+        later = datetime.now(UTC) + timedelta(hours=5)
+        for job in sched._scheduler.get_jobs():
+            if job.next_run_time is not None:
+                _set_next_run(job.id, later)
 
     def tearDown(self):
         self.t.cleanup()

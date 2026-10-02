@@ -65,6 +65,11 @@ class _Cheap(unittest.TestCase):
         time.sleep(TEST_SLEEP)
 
 
+def _key(cls):
+    """The bucket a class's time lands in: module-qualified since dev/changelog/1167."""
+    return f"{cls.__module__.rsplit('.', 1)[-1]}.{cls.__name__}"
+
+
 def _run(*classes):
     """Drive _TimingResult over the given TestCase classes and return (result, wall)."""
     suite = unittest.TestSuite(
@@ -82,7 +87,7 @@ class FixtureTimeIsAttributedTests(unittest.TestCase):
         """The headline defect: a class whose whole cost is setUpClass reported zero."""
         result, _ = _run(_Cheap, _Expensive)
 
-        self.assertGreaterEqual(result.fixtures.get('_Expensive', 0.0),
+        self.assertGreaterEqual(result.fixtures.get(_key(_Expensive), 0.0),
                                 FIXTURE_SLEEP * 0.8,
                                 'setUpClass time was not charged to the class that paid it')
 
@@ -93,7 +98,7 @@ class FixtureTimeIsAttributedTests(unittest.TestCase):
         written for. Its 26s fixture would have stayed invisible."""
         result, _ = _run(_Expensive, _Cheap)
 
-        self.assertGreaterEqual(result.fixtures.get('_Expensive', 0.0),
+        self.assertGreaterEqual(result.fixtures.get(_key(_Expensive), 0.0),
                                 FIXTURE_SLEEP * 0.8,
                                 'the run-leading class paid no fixture time')
 
@@ -110,7 +115,7 @@ class FixtureTimeIsAttributedTests(unittest.TestCase):
         """The counterpart: the gap is real elapsed time, not a flat allowance."""
         result, _ = _run(_Cheap, _Expensive)
 
-        self.assertLess(result.fixtures.get('_Cheap', 0.0), FIXTURE_SLEEP / 2)
+        self.assertLess(result.fixtures.get(_key(_Cheap), 0.0), FIXTURE_SLEEP / 2)
 
 
 class ChargedAndStatusLineTests(unittest.TestCase):
@@ -517,6 +522,34 @@ class ShardSplitTests(unittest.TestCase):
         weights = _module_weights(['tests.test_suite_timing_harness'], history)
 
         self.assertGreater(weights['tests.test_suite_timing_harness'], 0.0)
+
+    def test_a_class_name_shared_by_two_modules_is_not_summed_into_one_bucket(self):
+        """dev/changelog/1167: `AgedRenderTests` lives in four page-JS modules and
+        `RouteTests` in six, and a bare-name bucket added them together - so the movers
+        list named a class no single file held. The key carries the module."""
+        self.assertEqual(timing._class_key('tests.test_alpha.RouteTests.test_x'),
+                         'test_alpha.RouteTests')
+        self.assertNotEqual(timing._class_key('tests.test_alpha.RouteTests.test_x'),
+                            timing._class_key('tests.test_beta.RouteTests.test_x'))
+
+    def test_module_weights_read_the_qualified_key_before_a_bare_one(self):
+        """A record that holds both spellings (the run that introduced the qualified key
+        packs against a bare-name record; later records never carry bare names) counts
+        this module's class once, from the qualified bucket, never both."""
+        history = [{'failures': 0, 'errors': 0, 'per_module_fixture': {},
+                    'per_module': {'test_suite_timing_harness._Cheap': 7.0, '_Cheap': 100.0}}]
+        weights = _module_weights(['tests.test_suite_timing_harness'], history)
+
+        self.assertEqual(weights['tests.test_suite_timing_harness'], 7.0)
+
+    def test_module_weights_still_read_a_bare_name_record(self):
+        """The committed history holds ~300 bare-name records; the first run after the key
+        change packs its shards from one of them and must not read every module as new."""
+        history = [{'failures': 0, 'errors': 0, 'per_module_fixture': {},
+                    'per_module': {'_Cheap': 7.0}}]
+        weights = _module_weights(['tests.test_suite_timing_harness'], history)
+
+        self.assertEqual(weights['tests.test_suite_timing_harness'], 7.0)
 
     def test_a_failed_run_never_supplies_the_weights(self):
         """Same rule the baseline already follows: a run that failed may have died early,

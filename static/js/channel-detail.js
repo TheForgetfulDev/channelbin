@@ -448,7 +448,7 @@
         (rows || '<p class="text-muted small">You have no channel groups yet.</p>') +
         '<div class="gd-field full"><div class="gd-field-lbl">Or create a new group</div>' +
         '<input type="text" id="cd-new-group" class="form-control" placeholder="New group name" style="width:100%">' +
-        '</div>';
+        '</div><div id="cd-grp-warnings" style="margin-top:0.75rem;"></div>';
     };
 
     body.addEventListener('change', (e) => {
@@ -464,21 +464,36 @@
       ],
     });
 
-    function submit(close) {
+    /* The server answers an unforced add with `{success: false, ...warnings}` when it has
+       something to say first, and nothing was added. Those render through the one shared
+       builder with its Proceed anyway, never read as success (dev/docs/BUGS.md
+       2026-10-02 @ 08:42:25 AM). */
+    function submit(close, force) {
       const newName = (body.querySelector('#cd-new-group') || {}).value || '';
       const req = newName.trim()
         ? jsonFetch('/api/channel-groups', {
             method: 'POST',
-            body: JSON.stringify({ name: newName.trim(), channel_ids: [C.channelId] }),
+            body: JSON.stringify({ name: newName.trim(), channel_ids: [C.channelId], force: !!force }),
           })
         : (picked
             ? jsonFetch(`/api/channel-groups/${picked}/members`, {
-                method: 'POST', body: JSON.stringify({ channel_ids: [C.channelId] }),
+                method: 'POST', body: JSON.stringify({ channel_ids: [C.channelId], force: !!force }),
               })
             : null);
       if (!req) { showToast('Pick a group or name a new one.', { type: 'error' }); return; }
-      req.then(() => { close(); location.reload(); })
-        .catch(e => showToast(e.message || 'Could not add the channel.', { type: 'error' }));
+      req.then((data) => {
+        if (data && data.success === false) {
+          const wrap = body.querySelector('#cd-grp-warnings');
+          wrap.innerHTML = groupWarningsHtml(data, 'cd-grp-force');
+          wrap.querySelector('#cd-grp-force').addEventListener('click', () => {
+            wrap.innerHTML = '';
+            submit(close, true);
+          });
+          return;
+        }
+        close();
+        location.reload();
+      }).catch(e => showToast(e.message || 'Could not add the channel.', { type: 'error' }));
     }
 
     jsonFetch('/api/channel-groups')

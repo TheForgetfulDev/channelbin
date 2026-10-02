@@ -106,13 +106,16 @@ BASELINE_WINDOW = 10
 #     That measurement itself carried 10% foreign CPU, so it reads a little high and the
 #     ceiling derived from it is correspondingly loose - the right direction for the
 #     diagnostic path, where a WARNING nobody is acting on costs more than it earns.
-#   -j 4: 49.5ms/test x 1.30 = 65, from the first 4-shard run on the 4-core box (297.3s /
-#     6,002 tests, green, 5% foreign CPU; dev/changelog/989). ONE run, so this is the least
-#     measured of the three and the first to re-derive once the history holds 30 green -j 4
-#     records.
+#   -j 4: 65.6ms/test, the median of the last 30 green records, x 1.30 = 85 (2026-09-30,
+#     dev/changelog/1167). The first value, 65, came from ONE run (49.5ms/test on the day
+#     the box went to 4 cores, dev/changelog/989) and fired on 23 of the next 30 green runs
+#     - not noise and not a busy box, but the suite's mix getting heavier: jsdom page
+#     fixtures went from 8% to 15% of charged time, make_test_app() from 40ms to 52ms, and
+#     four CPU-bound shards on four cores stretch every test once nothing is left idle.
+#     Replayed over all 162 green -j 4 records, 85 fires on 0 (70 on 1, 65 on 25).
 # Full reasoning, the replay table, and the history of the wall-clock era:
 # `dev/docs/PERF-test-suite.md` §6 - that file is the record, not this comment.
-CEILINGS_MS_PER_TEST = {('0-2', 1): 210.0, ('0-2', 3): 110.0, ('0-2', 4): 65.0}
+CEILINGS_MS_PER_TEST = {('0-2', 1): 210.0, ('0-2', 3): 110.0, ('0-2', 4): 85.0}
 
 # ── Per-test drift (added 2026-08-21, dev/changelog/777) ─────────────────────
 # Neither check above can see a permanent step that lands under TOL: the slower run joins the
@@ -365,17 +368,23 @@ def _git_info():
 
 
 def _class_key(test_id):
-    """The per-class bucket a test id belongs to.
+    """The per-class bucket a test id belongs to: 'test_mod.ClassName'.
 
-    test.id() looks like 'test_pkg.test_mod.ClassName.test_method'; the class name is a
-    stable, human-meaningful bucket for "which area got slower".
+    test.id() looks like 'tests.test_mod.ClassName.test_method'. The module is part of the
+    key because class names repeat across modules - `AgedRenderTests` is declared in four
+    page-JS modules and `RouteTests` in six - and a bare-name bucket summed them, so the
+    movers list named a class that no single file held and a new module's classes read as
+    growth in an old one (dev/changelog/1167). Records written before then carry bare
+    names; `_module_weights` reads either.
     """
     parts = test_id.split('.')
+    if len(parts) >= 3:
+        return f'{parts[-3]}.{parts[-2]}'
     return parts[-2] if len(parts) >= 2 else test_id
 
 
 def _per_module(timings):
-    """Aggregate per-test timings into {ClassName: seconds}."""
+    """Aggregate per-test timings into {'test_mod.ClassName': seconds}."""
     agg = {}
     for dur, tid in timings:
         key = _class_key(tid)
@@ -646,7 +655,11 @@ def _module_weights(modules, history):
                 classes = re.findall(r'^class (\w+)', fh.read(), re.M)
         except OSError:
             classes = []
-        weights[mod] = sum(charged.get(c, 0.0) for c in classes)
+        # Module-qualified keys first (every record since dev/changelog/1167); a bare
+        # class name is what an older record holds, and is only read when no qualified
+        # bucket exists so a name shared across modules is never counted twice.
+        base = mod.rsplit('.', 1)[-1]
+        weights[mod] = sum(charged.get(f'{base}.{c}', charged.get(c, 0.0)) for c in classes)
 
     known = [w for w in weights.values() if w > 0]
     fallback = (sum(known) / len(known)) if known else 1.0

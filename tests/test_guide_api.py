@@ -141,9 +141,9 @@ class GuideEpgApiTests(unittest.TestCase):
         already proves the False side."""
         since = self.anchor - timedelta(days=30)
         missing_ch = seed.make_channel(self.acc, stream_id=2, name='Gone Ch', in_guide=True,
-                                       last_seen_at=since, is_duplicate_stream_url=True)
+                                       last_seen_at=since, duplicate_cluster_id=1)
         survivor = seed.make_channel(self.acc, stream_id=3, name='Survivor Ch', in_guide=False,
-                                     is_duplicate_stream_url=True)
+                                     duplicate_cluster_id=1)
         missing_ch.stream_url = 'http://example.test/live/shared-repoint'
         survivor.stream_url = 'http://example.test/live/shared-repoint'
         self.acc.last_sync_at = self.anchor

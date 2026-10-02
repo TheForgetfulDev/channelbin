@@ -56,7 +56,7 @@ function cgPickedHtml(rows, formatFor, known) {
 
 /* The soft warnings POST /api/channel-groups and .../members answer with when they refuse
    to proceed unforced (`{success: false, format_mismatch, unverified_format,
-   duplicate_warning}`), rendered as prose plus a Proceed anyway. Declared at file top
+   duplicate_warning, provider_copies}`), rendered as prose plus a Proceed anyway. Declared at file top
    level so the group-create flow draws the identical warnings from the identical response
    rather than paraphrasing them a second time (dev/changelog/831).
 
@@ -97,6 +97,13 @@ function groupWarningsHtml(data, forceId, dedupId) {
     html += `<div style="margin-bottom:0.5rem;"><strong style="color:var(--warn);">⚠ Duplicate stream URLs</strong><br>
       <span style="font-size:12px; color:var(--text-muted);">Some of these channels point at the <em>same</em> stream URL -
       they add no failover redundancy (if one feed dies, so do the others).</span></div>`;
+  }
+  if (data.provider_copies) {
+    // Not a ⚠: a copy through a different login is a real backup, and the sentence (built
+    // once, server-side, in duplicate_streams.provider_copies) says which kind this is.
+    const lines = data.provider_copies.map((c) => `<li>${escHtml(c.text)}</li>`).join('');
+    html += '<div style="margin-bottom:0.5rem;"><strong>Same channel through a provider</strong>' +
+      `<ul class="small text-muted" style="margin:0.35rem 0 0; padding-left:1.25rem;">${lines}</ul></div>`;
   }
   html += '<div style="display:flex; gap:0.5rem; flex-wrap:wrap;">';
   if (data.duplicate_warning && dedupId) {

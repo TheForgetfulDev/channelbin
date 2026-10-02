@@ -133,7 +133,7 @@ def effective_limit(limit: int, taken) -> int:
 
 def account_limits(account_ids: Iterable[int], cfg: Optional[dict] = None) -> Dict[int, int]:
     """{account_id: configured connection limit}, batched - one config read, one query."""
-    from .connection_limits import limit_for_account
+    from .connection_limits import limits_for_accounts
     from .database import Account
     ids = {a for a in account_ids if a is not None}
     if not ids:
@@ -142,14 +142,85 @@ def account_limits(account_ids: Iterable[int], cfg: Optional[dict] = None) -> Di
         from .config import load_config
         cfg = load_config()
     default_max = cfg.get('accounts', {}).get('default_max_connections', 1)
-    return {a.id: limit_for_account(a, default_max)
-            for a in Account.query.filter(Account.id.in_(ids)).all()}
+    return limits_for_accounts(Account.query.filter(Account.id.in_(ids)).all(), default_max)
 
 
-def fully_blocked(slots_by_account: Dict[int, Optional[int]], limits: Dict[int, int]) -> set:
-    """Accounts whose block leaves them no connection at all."""
-    return {aid for aid, taken in slots_by_account.items()
-            if taken is None or effective_limit(limits.get(aid, 0), taken) == 0}
+def account_pools(account_id: int, seats: Optional[list], limit: Optional[int]) -> list:
+    """[(pool, size), ...] for an account, in the order seats are taken: one pool per listed
+    login (`seats` from account_links.login_seats_for_accounts), or the account's own pool
+    sized by `limit` when it lists none. The same keys app/connection_limits.py counts on."""
+    if seats:
+        return [(('login', login_id), size) for login_id, size, _ in seats]
+    return [(account_id, limit)]
+
+
+def pool_taken(slots_by_account: Dict[int, Optional[int]], seats_by_account: Dict[int, list]
+               ) -> dict:
+    """{pool: slots taken} - each blocked account's slots spread over its pools in list
+    order, summed per pool (None = every slot).
+
+    A block is written against an account, because that is what the user is keeping a TV
+    on; the seats it takes are the account's logins'. When one of them is a login another
+    account on the same provider shares, that account loses those seats too - the provider
+    sees one login (DESIGN-account-providers.md §5.3, dev/changelog/1170). An account with
+    no logins has one pool and takes its block whole, which is the rule before logins."""
+    out: dict = {}
+    for account_id, taken in slots_by_account.items():
+        left = taken
+        for pool, size in account_pools(account_id, seats_by_account.get(account_id), None):
+            if left is None:
+                share = None
+            elif size is None:
+                share = left
+            else:
+                share = min(left, size)
+                left -= share
+            if pool in out and out[pool] is None:
+                continue
+            out[pool] = None if share is None else out.get(pool, 0) + share
+    return out
+
+
+def _fully_blocked_pools(candidates, taken: dict, seats_by_account: Dict[int, list],
+                         limits: Dict[int, int]) -> set:
+    """Of `candidates`, the accounts left with no usable seat on any pool."""
+    out = set()
+    for account_id in candidates:
+        pools = account_pools(account_id, seats_by_account.get(account_id),
+                              limits.get(account_id, 0))
+        if all(effective_limit(size, taken.get(pool, 0)) == 0 for pool, size in pools):
+            out.add(account_id)
+    return out
+
+
+def _with_siblings(ids) -> tuple[set, dict]:
+    """(`ids` plus every account sharing a login with one of them, {account_id: {sibling:
+    [login_id, ...]}}) - the accounts whose blocks can reach `ids`."""
+    from .account_links import login_siblings
+    siblings = login_siblings(ids)
+    wider = set(ids) | {other for found in siblings.values() for other in found}
+    return wider, siblings
+
+
+def _pool_blocked(merged: Dict[int, Optional[int]], candidates: Optional[set]) -> set:
+    """The accounts among `candidates` (None = every account a block can reach) that
+    `merged` (blocked_slots() over the right block set) leaves with no seat at all.
+
+    The question is per pool: a block on one account reaches every account sharing one of
+    its logins. Seats and limits are read only for the accounts involved."""
+    from .account_links import login_seats_for_accounts, login_siblings
+    if not merged:
+        return set()
+    reached = set(merged) | {other for found in login_siblings(merged).values()
+                             for other in found}
+    if candidates is not None:
+        reached &= candidates
+    if not reached:
+        return set()
+    seats = login_seats_for_accounts(reached | set(merged))
+    plain = {aid for aid in reached if not seats.get(aid)}
+    limits = account_limits(plain) if plain else {}
+    return _fully_blocked_pools(reached, pool_taken(merged, seats), seats, limits)
 
 
 def blocked_account_ids(account_ids: Optional[Iterable[int]], at: Optional[datetime] = None,
@@ -162,17 +233,15 @@ def blocked_account_ids(account_ids: Optional[Iterable[int]], at: Optional[datet
     ids = None if account_ids is None else {a for a in account_ids if a is not None}
     if ids is not None and not ids:
         return set()
+    # A block on an account sharing a login with one of `ids` takes that login's seats from
+    # it too (dev/changelog/1170), so those accounts' blocks are read as well.
+    wider = None if ids is None else _with_siblings(ids)[0]
     if start is not None and stop is not None:
-        blocks = blocks_overlapping(start, stop, ids, exclude_recording_id)
+        blocks = blocks_overlapping(start, stop, wider, exclude_recording_id)
     else:
-        blocks = blocks_at(at, ids)
-    pending = {a: s for a, s in (pending or {}).items() if ids is None or a in ids}
-    merged = blocked_slots(blocks, pending)
-    if not merged:
-        return set()
-    partial = {aid for aid, taken in merged.items() if taken is not None}
-    limits = account_limits(partial) if partial else {}
-    return fully_blocked(merged, limits)
+        blocks = blocks_at(at, wider)
+    pending = {a: s for a, s in (pending or {}).items() if wider is None or a in wider}
+    return _pool_blocked(blocked_slots(blocks, pending), ids)
 
 
 def split_blocked(members, blocked_ids):
@@ -193,15 +262,17 @@ def free_at(account_id: int, at: Optional[datetime] = None) -> Optional[datetime
     None when it is not fully blocked. The earliest block end after which the blocks still
     in force leave a slot. A block that starts at that same moment is not looked ahead to -
     the next retry re-asks."""
+    from .account_links import login_seats_for_accounts
     at = at or datetime.utcnow()
-    blocks = sorted(blocks_at(at, [account_id]), key=lambda b: b.stop)
+    wider, _ = _with_siblings([account_id])
+    blocks = sorted(blocks_at(at, wider), key=lambda b: b.stop)
     if not blocks:
         return None
-    limit = (account_limits([account_id]).get(account_id, 0)
-             if any(b.slots is not None for b in blocks) else 0)
+    seats = login_seats_for_accounts(wider)
+    limits = account_limits([account_id]) if not seats.get(account_id) else {}
     for i in range(len(blocks)):
-        taken = blocked_slots(blocks[i:]).get(account_id, 0)
-        if taken is not None and effective_limit(limit, taken) > 0:
+        taken = pool_taken(blocked_slots(blocks[i:]), seats)
+        if not _fully_blocked_pools([account_id], taken, seats, limits):
             return None if i == 0 else blocks[i - 1].stop
     return blocks[-1].stop
 
@@ -223,11 +294,51 @@ def describe(account_name: str, until: Optional[datetime], capital: bool = False
     return f'{head} "{account_name}" is blocked until {until_label(until)}'
 
 
-def blocked_reason(account_id: int, account_name: str, capital: bool = False) -> Optional[str]:
-    """describe() for an account fully blocked right now, else None - for a refusal that
-    has to say why, rather than blaming the connection limit."""
-    until = free_at(account_id)
-    return describe(account_name, until, capital) if until is not None else None
+def blocked_reason(account_id: int, account_name: str, capital: bool = False,
+                   at: Optional[datetime] = None, partial: bool = False) -> Optional[str]:
+    """describe() for an account fully blocked at `at` (default now), else None - for a
+    refusal that has to say why, rather than blaming the connection limit. `partial` also
+    answers for a block that leaves some seats (the watchdog's move off a partly blocked
+    pool), without an end time.
+
+    When the seats are gone because a block on ANOTHER account takes a login the two share,
+    it says that instead: an account the user never blocked must not read as blocked with
+    no way to see why (dev/changelog/1170)."""
+    at = at or datetime.utcnow()
+    until = free_at(account_id, at)
+    if until is None and not partial:
+        return None
+    own = blocks_at(at, [account_id])
+    if own:
+        return describe(account_name, until, capital)
+    sibling = _sibling_block_phrase(account_id, at, until)
+    if sibling is None:
+        return describe(account_name, until, capital) if until is not None else None
+    head = 'Account' if capital else 'account'
+    return f'{head} "{account_name}" {sibling}'
+
+
+def _sibling_block_phrase(account_id: int, at: datetime, until: Optional[datetime]) -> Optional[str]:
+    """'shares login "main" with "skyline-curated", which is blocked until 10:00 PM' for the
+    first sibling whose block reaches this account at `at`, else None."""
+    from .database import Account, Login
+    _, siblings = _with_siblings([account_id])
+    found = siblings.get(account_id) or {}
+    if not found:
+        return None
+    blocking = {b.account_id for b in blocks_at(at, found)}
+    if not blocking:
+        return None
+    other = min(blocking)
+    login_ids = found[other]
+    names = dict(db.session.query(Account.id, Account.name).filter(Account.id == other).all())
+    logins = [n for (n,) in db.session.query(Login.name).filter(Login.id.in_(login_ids))
+              .order_by(Login.id).all()]
+    login_text = (f'login "{logins[0]}"' if len(logins) == 1
+                  else 'logins ' + ', '.join(f'"{n}"' for n in logins))
+    tail = f' until {until_label(until)}' if until is not None else ''
+    return (f'shares {login_text} with "{names.get(other, f"account {other}")}", which is '
+            f'blocked{tail}')
 
 
 def upcoming_by_account(account_ids: Optional[Iterable[int]] = None

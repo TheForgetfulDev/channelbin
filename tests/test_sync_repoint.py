@@ -75,8 +75,8 @@ class RepointCandidateDetectionTests(unittest.TestCase):
         return _lifecycle_states_for_channels(channels, CFG)
 
     def test_missing_duplicate_flagged_channel_finds_survivor(self):
-        missing = _make_channel(self.account, 1, 'Missing Ch', is_duplicate_stream_url=True)
-        survivor = _make_channel(self.account, 2, 'Survivor Ch', is_duplicate_stream_url=True)
+        missing = _make_channel(self.account, 1, 'Missing Ch', duplicate_cluster_id=1)
+        survivor = _make_channel(self.account, 2, 'Survivor Ch', duplicate_cluster_id=1)
         _mark_missing(missing, self.account)
         db.session.commit()
 
@@ -88,8 +88,8 @@ class RepointCandidateDetectionTests(unittest.TestCase):
     def test_prefilter_skips_channel_not_flagged_duplicate(self):
         """is_duplicate_stream_url is the cheap prefilter - a missing channel that isn't
         flagged is skipped even though a URL-sharing survivor exists."""
-        missing = _make_channel(self.account, 1, 'Missing Ch', is_duplicate_stream_url=False)
-        _make_channel(self.account, 2, 'Survivor Ch', is_duplicate_stream_url=False)
+        missing = _make_channel(self.account, 1, 'Missing Ch', duplicate_cluster_id=None)
+        _make_channel(self.account, 2, 'Survivor Ch', duplicate_cluster_id=None)
         _mark_missing(missing, self.account)
         db.session.commit()
 
@@ -98,8 +98,8 @@ class RepointCandidateDetectionTests(unittest.TestCase):
         self.assertEqual(candidates, {})
 
     def test_survivor_also_missing_is_excluded(self):
-        missing = _make_channel(self.account, 1, 'Missing Ch', is_duplicate_stream_url=True)
-        also_missing = _make_channel(self.account, 2, 'Also Missing', is_duplicate_stream_url=True)
+        missing = _make_channel(self.account, 1, 'Missing Ch', duplicate_cluster_id=1)
+        also_missing = _make_channel(self.account, 2, 'Also Missing', duplicate_cluster_id=1)
         _mark_missing(missing, self.account)
         _mark_missing(also_missing, self.account)
         db.session.commit()
@@ -109,9 +109,9 @@ class RepointCandidateDetectionTests(unittest.TestCase):
         self.assertEqual(candidates, {})
 
     def test_multiple_survivors_picks_oldest_by_id(self):
-        missing = _make_channel(self.account, 1, 'Missing Ch', is_duplicate_stream_url=True)
-        older = _make_channel(self.account, 2, 'Older Survivor', is_duplicate_stream_url=True)
-        newer = _make_channel(self.account, 3, 'Newer Survivor', is_duplicate_stream_url=True)
+        missing = _make_channel(self.account, 1, 'Missing Ch', duplicate_cluster_id=1)
+        older = _make_channel(self.account, 2, 'Older Survivor', duplicate_cluster_id=1)
+        newer = _make_channel(self.account, 3, 'Newer Survivor', duplicate_cluster_id=1)
         self.assertLess(older.id, newer.id)
         _mark_missing(missing, self.account)
         db.session.commit()
@@ -121,8 +121,8 @@ class RepointCandidateDetectionTests(unittest.TestCase):
         self.assertEqual(candidates.get(missing.id), older)
 
     def test_non_missing_channel_has_no_candidate(self):
-        ch = _make_channel(self.account, 1, 'Healthy Ch', is_duplicate_stream_url=True)
-        _make_channel(self.account, 2, 'Other', is_duplicate_stream_url=True)
+        ch = _make_channel(self.account, 1, 'Healthy Ch', duplicate_cluster_id=1)
+        _make_channel(self.account, 2, 'Other', duplicate_cluster_id=1)
         db.session.commit()
 
         lifecycle = self._lifecycle([ch])
@@ -308,9 +308,9 @@ class RepointRouteTests(unittest.TestCase):
 
     def _missing_and_survivor(self):
         missing = _make_channel(self.account, 1, 'Missing Ch',
-                                is_duplicate_stream_url=True, in_guide=True)
+                                duplicate_cluster_id=1, in_guide=True)
         survivor = _make_channel(self.account, 2, 'Survivor Ch',
-                                 is_duplicate_stream_url=True, in_guide=False)
+                                 duplicate_cluster_id=1, in_guide=False)
         _mark_missing(missing, self.account)
         db.session.commit()
         return missing, survivor

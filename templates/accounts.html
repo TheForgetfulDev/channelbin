@@ -1,6 +1,7 @@
 {% extends "base.html" %}
 {% import '_macros.html' as m %}
 {% import '_account_stats.html' as st %}
+{% import '_account_providers.html' as pv %}
 {% block title %}Accounts - ChannelBin{% endblock %}
 
 {#  The Accounts list (standard: DESIGN.md §17.1/§17.2/§17.5).
@@ -180,6 +181,10 @@ Sync cancelled before it finished.
 {# The account stats (§17.7): below the list and OUTSIDE #acct-live, so the list's minute
    swap never recomputes or redraws them. Nothing on it moves with a sync anyway - syncs
    are not in the ledger - and what a sync does move is on the rows above. #}
+{# Providers (DESIGN-account-providers.md §6.2): under the list, outside #acct-live - a
+   provider changes only when the user acts here, and that action reloads the page. #}
+{{ pv.section(providers) }}
+
 {{ st.section(stats) }}
 {% endblock %}
 
@@ -187,5 +192,6 @@ Sync cancelled before it finished.
 <script src="{{ url_for('static', filename='js/account-modal.js') }}"></script>
 <script src="{{ url_for('static', filename='js/account-actions.js') }}"></script>
 <script src="{{ url_for('static', filename='js/accounts.js') }}"></script>
+<script src="{{ url_for('static', filename='js/account-providers.js') }}"></script>
 <script src="{{ url_for('static', filename='js/account-stats.js') }}"></script>
 {% endblock %}

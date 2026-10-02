@@ -126,6 +126,7 @@ def _account_status_summary(cfg):
     next_sync = next_sync_map(accounts)
     in_use = connlim.holder_counts()
     default_max = cfg.get('accounts', {}).get('default_max_connections', 1)
+    limits = connlim.limits_for_accounts(accounts, default_max)
     return {
         'total': len(accounts),
         'ok_count': sum(1 for a in accounts if a.status == 'OK'),
@@ -143,7 +144,7 @@ def _account_status_summary(cfg):
             'hidden_channel_count': a.hidden_channel_count or 0,
             'provider_exp_date': _iso(a.provider_exp_date),
             'connections_in_use': in_use.get(a.id, 0),
-            'max_connections': connlim.limit_for_account(a, default_max),
+            'max_connections': limits[a.id],
         } for a in accounts],
     }
 
