@@ -659,6 +659,25 @@ _DEFAULTS = {
         # (see app/connection_limits.py); does not apply to account sync.
         'default_max_connections': 1,
     },
+    # An account's host list (app/account_links.py, dev/changelog/1168): the other host
+    # names a reseller hands out for one account, one active at a time.
+    'hosts': {
+        # At most one roll per account per this many minutes, so a flapping resolver cannot
+        # walk the list every few seconds. A second resolution failure inside the window is
+        # logged and does not roll.
+        'roll_cooldown_minutes': 10,
+        # How often the host_resolve_check job resolves every listed host (DNS only; it
+        # marks hosts good or bad on the account page and never rolls).
+        'check_interval_hours': 6,
+    },
+    # An account's login list (app/account_links.py, dev/changelog/1169): the other
+    # username/passwords the account accepts, each with its own seats.
+    'logins': {
+        # A login the server refused (401/403) is skipped for this many minutes when another
+        # login on the account has a free seat. With no other login it is tried again at
+        # once: a refusal is sometimes a panel hiccup, and giving up is worse.
+        'refusal_cooldown_minutes': 30,
+    },
     'sync': {
         'sync_interval_hours': 12,
         # Days of future EPG to import AND the width of the TV Guide grid, so the guide can

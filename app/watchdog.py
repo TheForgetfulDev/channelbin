@@ -14,6 +14,8 @@ from .database import (
     FAILURE_MAX_CONSECUTIVE_FAILURES, FAILURE_DEAD_STREAM_DETECTED, FAILURE_FAST_DELIVERY_DETECTED,
 )
 from .db_utils import retry_on_locked
+from .account_links import (is_credential_refusal, is_resolution_failure,
+                            note_refusal_for_holder, roll_host_for_channel)
 from .probe import parse_ffprobe
 from .proc_utils import (DeliveryRateMonitor, GrowthMonitor, read_capture_content_position,
                          terminate_or_kill, wait_for_file_data)
@@ -658,6 +660,28 @@ class WatchdogThread(threading.Thread):
 
                         rec = _record_segment_end_and_commit()
 
+                        # The one failure that moves the account's host list: ffmpeg could
+                        # not resolve the stream host. A stall, a timeout or a refused
+                        # connection is the channel's or the provider's problem and rolls
+                        # nothing (app/account_links.py). Outside the retry closure above
+                        # because it does DNS lookups and commits on its own; the next
+                        # segment picks the new URL up through _reresolve_channel_url().
+                        if is_resolution_failure(stderr_tail):
+                            roll_host_for_channel(
+                                seg_channel_id,
+                                trigger=f'Recording {self.recording_id} (segment {seg_num})',
+                                recording_id=self.recording_id)
+                        # The one failure that moves a recording between the account's
+                        # listed logins: the server refused the credentials. Stamped on
+                        # the login this recording's seat is on; the relaunch below
+                        # re-seats onto another login with a free seat (app/recorder.py
+                        # _launch_segment). Nothing happens for an account with no list.
+                        if is_credential_refusal(stderr_tail):
+                            note_refusal_for_holder(
+                                'recording', self.recording_id,
+                                trigger=f'Recording {self.recording_id} (segment {seg_num})',
+                                stderr_tail=stderr_tail, recording_id=self.recording_id)
+
                         if fast_delivery is not None:
                             ev.publish(self.recording_id, FAST_DELIVERY_DETECTED, {
                                 'segment_number': seg_num,
@@ -1069,7 +1093,7 @@ class WatchdogThread(threading.Thread):
         from . import db
         from . import connection_limits as connlim
         from .database import Channel, Recording, DIAGNOSTICS
-        from .account_blocks import describe, free_at
+        from .account_blocks import blocked_reason, describe
 
         self._block_check_at = time.monotonic() + _BLOCK_CHECK_SECONDS
         # Read fresh: a failover commits from its own app context, so this thread's session
@@ -1083,7 +1107,8 @@ class WatchdogThread(threading.Thread):
             self._block_stay_noted = None
             return False
 
-        why = describe(channel.account.name, free_at(account_id), capital=True)
+        why = (blocked_reason(account_id, channel.account.name, capital=True, partial=True)
+               or describe(channel.account.name, None, capital=True))
         if rec.group_id is not None:
             from .recorder import failover_group_member, _launch_segment, _close_active_segment
             if failover_group_member(self.app, self.recording_id, why, block_move=True):

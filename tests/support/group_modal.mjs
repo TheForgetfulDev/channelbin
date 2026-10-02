@@ -182,4 +182,22 @@ await scenario('fixed_missing',
     Object.assign({}, SUGGEST[1], { lifecycle: 'missing', lifecycle_date: '2026-09-01' }),
   ] })]]);
 
+// 8. The soft warnings with a provider copy among them (DESIGN-account-providers.md §9):
+//    the server's sentence, escaped, under its own heading, with Proceed anyway.
+{
+  const { w, errors } = boot();
+  const host = w.document.createElement('div');
+  host.innerHTML = w.groupWarningsHtml({ success: false, provider_copies: [
+    { text: 'direct: <b>One</b> is the same channel as curated: One, which is already a member.' },
+  ] }, 'warn-force');
+  out.provider_copies_warning = {
+    text: host.textContent.replace(/\s+/g, ' ').trim(),
+    items: host.querySelectorAll('li').length,
+    bold: host.querySelectorAll('b').length,
+    proceed: Boolean(host.querySelector('#warn-force')),
+    warn_glyph: host.textContent.includes('\u26a0'),
+  };
+  out.errors.push(...errors);
+}
+
 console.log(JSON.stringify(out));

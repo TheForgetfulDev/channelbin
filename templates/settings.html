@@ -230,6 +230,8 @@
 {% set wd     = cfg.get('watchdog', {}) %}
 {% set ff     = cfg.get('ffmpeg', {}) %}
 {% set sync_cfg = cfg.get('sync', {}) %}
+{% set hosts_cfg = cfg.get('hosts', {}) %}
+{% set logins_cfg = cfg.get('logins', {}) %}
 {% set acct_cfg = cfg.get('accounts', {}) %}
 {% set search_cfg = cfg.get('search', {}) %}
 {% set http   = cfg.get('http', {}) %}
@@ -501,6 +503,15 @@
         <div class="sec-sub"><strong>Connections</strong></div>
         {{ field_number('accounts.default_max_connections', 'Default max connections per account',
            'Fallback cap on concurrent connections (recordings + channel tests) to a single provider. Does not apply to account sync.', acct_cfg.get('default_max_connections', 1), overridable_by='account', tier='advanced') }}
+      </div>
+      <div data-sub="hosts">
+        <div class="sec-sub"><strong>Stream hosts and logins</strong></div>
+        {{ field_number('hosts.roll_cooldown_minutes', 'Host roll cooldown (minutes)',
+           'When a capture fails because an account\'s active stream host stopped resolving, ChannelBin swaps the account to the next host on its list. This is the least time between two such swaps on one account, so a flaky resolver cannot walk the whole list in a minute. The list itself is on each account\'s page.', hosts_cfg.get('roll_cooldown_minutes', 10), tier='advanced') }}
+        {{ field_number('hosts.check_interval_hours', 'Host check interval (hours)',
+           'How often every listed host is looked up in DNS so the account page can show which ones still resolve. A lookup only - nothing is opened on the provider, and a failed check never swaps hosts by itself.', hosts_cfg.get('check_interval_hours', 6), tier='advanced') }}
+        {{ field_number('logins.refusal_cooldown_minutes', 'Login refusal cooldown (minutes)',
+           'When a capture fails because the server refused one of an account\'s listed logins (401 or 403), that login is skipped for this long while another login on the account has a free seat. With no other login it is tried again at once. The list itself is on each account\'s page.', logins_cfg.get('refusal_cooldown_minutes', 30), tier='advanced') }}
       </div>
       <div data-sub="sync-schedule">
         <div class="sec-sub"><strong>Sync schedule</strong></div>

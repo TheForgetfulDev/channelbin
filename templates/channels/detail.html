@@ -274,9 +274,10 @@
           <span class="badge b-auto tip-plain"
                 data-tip="In the guide through a group.&#10;{{ 'This channel has no guide row of its own, but its' if not channel.in_guide else 'As well as its own row, this channel&#39;s' }} listings reach the TV Guide through {{ 'this group, which has a row of its own' if guide_via_groups | length == 1 else 'these groups, each of which has a row' }}:&#10;{% for g in guide_via_groups %}{{ g.name }}&#10;{% endfor %}">In guide via {{ guide_via_groups[0].name }}{% if guide_via_groups | length > 1 %} +{{ guide_via_groups | length - 1 }}{% endif %}</span>
           {% endif %}
-          {% if channel.is_duplicate_stream_url %}
+          {% if duplicate_key %}
+          {% set dup_others = duplicate_channels | length %}
           <span class="badge b-warn tip-plain"
-                data-tip="Duplicate stream URL.&#10;Shares its stream URL with {{ duplicate_channels | length }} other channel{{ 's' if duplicate_channels | length != 1 else '' }} - see the Stream URL section.">Duplicate URL</span>
+                data-tip="Duplicate stream.&#10;{% if duplicate_key.kind == 'provider' %}The same stream as {{ dup_others }} other channel{{ 's' if dup_others != 1 else '' }} (id {{ duplicate_key.stream_id }} on {{ duplicate_key.provider }}){% else %}Shares its stream URL with {{ dup_others }} other channel{{ 's' if dup_others != 1 else '' }}{% endif %} - see the Stream URL section.">Duplicate stream</span>
           {% endif %}
           {% if lifecycle_state == 'missing' %}
           <span class="badge b-warn tip-plain"
@@ -1095,9 +1096,14 @@
       {% if duplicate_channels %}
       <div class="dup-block">
         <div class="dup-head">
-          <strong>&#9888; Duplicate stream URL</strong><br>
-          Shared with {{ duplicate_channels | length }} other channel{{ 's' if duplicate_channels | length != 1 else '' }}.
+          <strong>&#9888; Duplicate stream</strong><br>
+          {% if duplicate_key.kind == 'provider' %}
+          The same stream as {{ duplicate_channels | length }} other channel{{ 's' if duplicate_channels | length != 1 else '' }}: id {{ duplicate_key.stream_id }} on {{ duplicate_key.provider }}.
+          Accounts on one provider reach the same stream under the same id, whatever the URL says.
+          {% else %}
+          Shares its stream URL with {{ duplicate_channels | length }} other channel{{ 's' if duplicate_channels | length != 1 else '' }}.
           They are the same provider stream under different names.
+          {% endif %}
         </div>
         <ul class="dup-list">
           {% for dup in duplicate_channels %}
@@ -1399,5 +1405,8 @@ window.CHANNEL_DETAIL = {
 <script src="{{ url_for('static', filename='js/schedule-fields.js') }}"></script>
 <script src="{{ url_for('static', filename='js/check-modal.js') }}"></script>
 <script src="{{ url_for('static', filename='js/missing-modal.js') }}"></script>
+{# For groupWarningsHtml(): Add to channel group draws the server's soft warnings with the
+   same builder every other add path uses. #}
+<script src="{{ url_for('static', filename='js/group-modal.js') }}"></script>
 <script src="{{ url_for('static', filename='js/channel-detail.js') }}"></script>
 {% endblock %}

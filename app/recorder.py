@@ -1695,7 +1695,21 @@ def _launch_segment(app, recording_id: int, seg_num: int) -> str:
         pace, pace_source = resolve_capture_pacing(
             cfg, channel.pace_realtime if channel is not None else None, segment_duration,
             pace_state is not None and rec.channel_id in pace_state.auto_paced_channel_ids)
-        cmd = build_capture_cmd(cfg, rec.url, seg_path, segment_duration,
+        # The recording's seat may be on one of the account's listed logins: if the server
+        # refused that login since the last segment, the seat moves to another login with
+        # a free one, and either way this segment is launched with the seated login's
+        # credentials rendered into the URL (app/account_links.py). Recording.url keeps
+        # the channel's URL; the substitution lives on the command only. An account with
+        # no login list pays nothing here: the holder is in its own pool and the URL
+        # passes through untouched.
+        launch_url = rec.url
+        if channel is not None:
+            from . import connection_limits as connlim
+            from .account_links import render_held_login
+            connlim.reseat_if_refused(channel.account_id, 'recording', recording_id)
+            launch_url, _login_id = render_held_login(rec.url, channel.account_id,
+                                                      'recording', recording_id)
+        cmd = build_capture_cmd(cfg, launch_url, seg_path, segment_duration,
                                 pace_realtime=pace)
         log.info('Recording %d seg %d: %s', recording_id, seg_num,
                  mask_creds_in_text(' '.join(cmd)))

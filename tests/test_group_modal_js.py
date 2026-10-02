@@ -197,5 +197,24 @@ class SingleSeedPathUnchangedTests(_Base):
         self.assertFalse(self.obs['single_seed']['settled']['empty_shown'])
 
 
+class ProviderCopiesWarningTests(_Base):
+    """The add-time note for a member that is one channel reached twice through a provider
+    (dev/changelog/1173, DESIGN-account-providers.md §9)."""
+
+    def test_the_servers_sentence_is_shown_escaped(self):
+        w = self.obs['provider_copies_warning']
+        self.assertIn('Same channel through a provider', w['text'])
+        self.assertIn('<b>One</b> is the same channel as curated: One', w['text'])
+        self.assertEqual(w['items'], 1)
+        self.assertEqual(w['bold'], 0)
+
+    def test_it_can_be_proceeded_past(self):
+        self.assertTrue(self.obs['provider_copies_warning']['proceed'])
+
+    def test_it_is_not_drawn_as_a_warning(self):
+        """A copy through a different login is a real backup; no ⚠ on it."""
+        self.assertFalse(self.obs['provider_copies_warning']['warn_glyph'])
+
+
 if __name__ == '__main__':
     unittest.main()

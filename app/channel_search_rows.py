@@ -63,13 +63,13 @@ from datetime import datetime
 
 from sqlalchemy import case, select
 
-from . import db, health_bands
+from . import db, duplicate_streams, health_bands
 from .channel_search import (FIELDS, GRAIN_AIRINGS, GRAIN_CHANNELS,
                              HEALTH_UNTESTED, SearchStateError, effective_health,
                              field_hit_predicate, in_any_group_expr, include_terms,
                              matching_programs, tag_hit_predicate)
 from .logo_cache import resolve_logo_url
-from .database import (Channel, ChannelGroup, ChannelGroupMember, EPGEntry,
+from .database import (Channel, ChannelGroup, ChannelGroupMember, EPGEntry, Provider,
                        Recording,
                        REC_STATUS_IN_PROGRESS, REC_STATUS_PAUSED, REC_STATUS_RETRYING,
                        REC_STATUS_CONCATENATING, REC_STATUS_ANALYZING, REC_STATUS_CONVERTING,
@@ -95,6 +95,7 @@ GROUP_ROW = 'group'
 #: it, not all five - "kept because it is in your guide" is actionable, a recital of the
 #: rule is not.
 KEEP_REASON_NOT_HIDDEN = 'the others are hidden'
+KEEP_REASON_IN_FEED = 'still in the provider\'s feed'
 KEEP_REASON_IN_GUIDE = 'already in your TV Guide'
 KEEP_REASON_IN_GROUP = 'in a channel group'
 KEEP_REASON_HEALTH = 'the best health score'
@@ -141,7 +142,7 @@ def _plain_channel_rows(rows, result, state, ctx) -> list:
     groups, guide_via = _groups_by_channel(ids)
     tags = _tags_by_channel(ids, ctx)
     lifecycle = _lifecycle(rows, ctx)
-    clusters = _duplicate_clusters(rows)
+    clusters = _duplicate_clusters(rows, ctx)
     # Hoisted: banding a score is per-row work, resolving the bands is per-request.
     bands = health_bands.resolve_bands(ctx.cfg)
 
@@ -334,7 +335,7 @@ def _airing_rows(result, state, ctx) -> list:
     # the row itself is a showing that is usually not the one on now - see tag_hit_predicate.
     tags = _tags_by_channel(channel_ids, ctx, now_scoped=False)
     lifecycle = _lifecycle(channels, ctx)
-    clusters = _duplicate_clusters(channels)
+    clusters = _duplicate_clusters(channels, ctx)
     recordings = _recordings_for(entries, channels_by_id)
     stands_for = _airing_group_labels(result, ctx)
     namings = _filename_namings(channels, ctx)
@@ -777,32 +778,53 @@ def _lifecycle(rows, ctx) -> dict:
     return lifecycle_states_for_channels(rows, ctx.cfg, accounts_by_id=ctx.accounts_by_id)
 
 
-def _duplicate_clusters(rows) -> dict:
-    """{channel id: {count, others, kept_id, kept_reason}} for every duplicate row on the page.
+def _duplicate_clusters(rows, ctx) -> dict:
+    """{channel id: {count, others, kept_id, kept_reason, key}} for every duplicate row on
+    the page.
 
-    The cluster is read over the whole channels table, not over the result set, for the same
-    reason the engine computes the keep-rule that way: which copy is KEPT must not change
-    because of what the user typed. One query for every cluster the page touches.
+    The cluster is the one the fold stored (app/duplicate_streams.py), read over the whole
+    channels table rather than over the result set: which copy is KEPT must not change
+    because of what the user typed. One query for every cluster the page touches, plus one
+    for the provider names when any of them is keyed on a provider.
     """
-    urls = {r.stream_url for r in rows if r.is_duplicate_stream_url and r.stream_url}
-    if not urls:
+    cluster_ids = {r.duplicate_cluster_id for r in rows
+                   if r.duplicate_cluster_id is not None}
+    if not cluster_ids:
         return {}
 
     members = (db.session.query(Channel.id, Channel.name, Channel.category_name,
-                                Channel.stream_url, Channel.in_guide, Channel.hidden,
+                                Channel.duplicate_cluster_id, Channel.account_id,
+                                Channel.provider_stream_id, Channel.is_duplicate_loser,
+                                Channel.in_guide, Channel.hidden,
+                                duplicate_streams.missing_expr(ctx.cfg).label('missing'),
                                 in_any_group_expr().label('in_group'),
                                 effective_health().label('health'))
-               .filter(Channel.stream_url.in_(urls),
-                       Channel.is_duplicate_stream_url.is_(True)).all())
-    by_url = {}
+               .filter(Channel.duplicate_cluster_id.in_(cluster_ids)).all())
+    by_cluster = {}
     for member in members:
-        by_url.setdefault(member.stream_url, []).append(member)
+        by_cluster.setdefault(member.duplicate_cluster_id, []).append(member)
+
+    def provider_id(member):
+        account = ctx.accounts_by_id.get(member.account_id)
+        if account is None or member.provider_stream_id is None:
+            return None
+        return account.provider_id
+
+    provider_ids = {provider_id(m) for m in members} - {None}
+    provider_names = (dict(db.session.query(Provider.id, Provider.name)
+                           .filter(Provider.id.in_(provider_ids)).all())
+                      if provider_ids else {})
 
     out = {}
-    for url, cluster in by_url.items():
-        ranked = sorted(cluster, key=_keep_rank)
+    for cluster in by_cluster.values():
+        # The kept copy is the one the fold did not flag. Sorted so it leads and the rest
+        # read in a stable order; a cluster caught between a write and its re-rank can
+        # briefly carry none, and then the lowest id stands in.
+        ranked = sorted(cluster, key=lambda m: (bool(m.is_duplicate_loser), m.id))
         keep = ranked[0]
         reason = _keep_reason(keep, cluster)
+        key = duplicate_streams.key_payload(
+            keep.provider_stream_id, provider_names.get(provider_id(keep)))
         for member in cluster:
             others = [m for m in ranked if m.id != member.id]
             out[member.id] = {
@@ -817,31 +839,24 @@ def _duplicate_clusters(rows) -> dict:
                 'others_hidden': max(0, len(others) - DUP_TOOLTIP_MEMBERS),
                 'kept_id': keep.id,
                 'kept_reason': reason,
+                # What made these one stream: {'kind': 'url'} or {'kind': 'provider',
+                # 'stream_id', 'provider'} - the badge names it.
+                'key': key,
             }
     return out
 
 
-def _keep_rank(member):
-    """The keep-rule cascade as a sort key, spelled to match `_duplicate_losers()`'s SQL
-    exactly: not hidden first, then in your guide, then in a channel group, then the best
-    health, then the lowest id. SQLite sorts NULL lowest, so a DESC on health puts a
-    never-scored channel behind a scored one - hence the explicit "health is None" term
-    rather than treating None as any particular number.
-
-    Changing a rung here means changing it in `_duplicate_losers()` in the same edit: that
-    query decides which rows are excluded and this one only explains it, so a disagreement
-    shows up as a badge describing a rule the list did not follow."""
-    health = member.health
-    return (1 if member.hidden else 0, 0 if member.in_guide else 1,
-            0 if member.in_group else 1,
-            0 if health is not None else 1, -(health or 0), member.id)
-
-
 def _keep_reason(keep, cluster) -> str:
     """The one rung that actually decided it - the first on which the winner differs from
-    anything else in the cluster. A rung the whole cluster ties on explains nothing."""
+    anything else in the cluster. A rung the whole cluster ties on explains nothing.
+
+    Walks `duplicate_streams.keep_order()`'s rungs in its order. That function decides which
+    copy is kept and this one only explains it, so a rung added there is added here in the
+    same edit, or the badge describes a rule the list did not follow."""
     if any(m.id != keep.id and bool(m.hidden) != bool(keep.hidden) for m in cluster):
         return KEEP_REASON_NOT_HIDDEN
+    if any(m.id != keep.id and bool(m.missing) != bool(keep.missing) for m in cluster):
+        return KEEP_REASON_IN_FEED
     if any(m.id != keep.id and bool(m.in_guide) != bool(keep.in_guide) for m in cluster):
         return KEEP_REASON_IN_GUIDE
     if any(m.id != keep.id and bool(m.in_group) != bool(keep.in_group) for m in cluster):

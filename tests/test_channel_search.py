@@ -39,7 +39,7 @@ from tests.support.app import make_test_app  # noqa: E402
 from tests.support.iocount import IOCounter, all_engines  # noqa: E402
 from tests.support import seed  # noqa: E402
 from tests.support.search import only_hiding  # noqa: E402
-from app import db  # noqa: E402
+from app import db, duplicate_streams  # noqa: E402
 from app.accounts import NORM_DISABLED, NORM_MPEGTS  # noqa: E402
 from app.channel_groups import set_participation  # noqa: E402
 from app import channel_tester  # noqa: E402
@@ -48,7 +48,7 @@ from app.database import (AccountSyncLog, Channel, ChannelGroup,  # noqa: E402
 from app.channel_search import (  # noqa: E402
     DEFAULT_FIELDS, DEFAULT_SORT, DEFAULT_STANDING, GRAIN_AIRINGS, GROUP_ANY,
     HEALTH_VALUES, MAX_PAGE_SIZE, OTHER_DUP_URL, OTHER_GUIDE_OWN_ROW, OTHER_GUIDE_VIA_GROUP,
-    OTHER_IN_GUIDE, OTHER_MONITORED, OTHER_NEW, OTHER_REMOVED, OTHER_VALUES,
+    OTHER_IN_GUIDE, OTHER_MONITORED, OTHER_NEW, OTHER_PROVIDER, OTHER_REMOVED, OTHER_VALUES,
     STANDING_OPTIONS, DimensionFilter, SearchContext, SearchState, SearchStateError,
     search, standing_applied)
 from app.search_index import rebuild_search_indexes  # noqa: E402
@@ -111,7 +111,7 @@ class _EngineTestCase(unittest.TestCase):
                                      health_score=10.0)
         for ch in (self.espn2, self.dup_high, self.dup_low):
             ch.stream_url = 'http://example.test/live/shared'
-            ch.is_duplicate_stream_url = True
+        duplicate_streams.recompute()
 
         # Provider-removed: last seen before the cutoff, on an account that has synced since.
         self.removed = self._channel('Gone Fishing TV', category_name='Docs',
@@ -1118,7 +1118,10 @@ class StandingOptionTests(_EngineTestCase):
         self.assertIn('US| ESPN2 HD', self.names(state))          # group rung decides
 
         # Every membership goes, or health is never consulted for this cluster.
-        ChannelGroupMember.query.filter_by(channel_id=self.espn2.id).delete()
+        # Through the ORM, as the app's own removals go: the stored fold re-ranks a cluster
+        # when a membership it reads is flushed (app/duplicate_streams.py).
+        for member in ChannelGroupMember.query.filter_by(channel_id=self.espn2.id).all():
+            db.session.delete(member)
         db.session.commit()
         self.assertIn('Sky Sports Action', self.names(state))     # health rung decides
 
@@ -1260,7 +1263,7 @@ class FacetCountTests(_EngineTestCase):
         self.assertEqual(empty['other'],
                          {OTHER_REMOVED: 0, OTHER_NEW: 0, OTHER_IN_GUIDE: 0,
                           OTHER_GUIDE_OWN_ROW: 0, OTHER_GUIDE_VIA_GROUP: 0, OTHER_DUP_URL: 0,
-                          OTHER_MONITORED: 0})
+                          OTHER_PROVIDER: 0, OTHER_MONITORED: 0})
         # Spelled out rather than built from OTHER_VALUES on purpose: this is the assertion
         # that a value added to the registry reaches the rail, so deriving it from the
         # registry would make it agree with itself and check nothing.

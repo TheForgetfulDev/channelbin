@@ -8,7 +8,7 @@ bearing test here is `IncrementalMatchesFromScratchTests`, in the shape of
 `test_guide_scope_consistency.py` - it drives the real routes and asserts after every
 mutation that the maintained answer equals a from-scratch recompute.
 
-The other test that cannot be skipped is `DuplicateKeepCascadeTests`. `_duplicate_losers()`
+The other test that cannot be skipped is `DuplicateKeepCascadeTests`. The duplicate fold
 ranks the KEPT copy of a shared-URL cluster over the whole channels table, so without a
 hidden rung at the top of that cascade, hiding the copy that happened to win makes every
 remaining copy a loser - and with `hidden` and `dup` both defaulting on, the stream vanishes
@@ -26,7 +26,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from tests.support.app import make_test_app  # noqa: E402
 from tests.support import seed  # noqa: E402
 from app import db  # noqa: E402
-from app import channel_hiding  # noqa: E402
+from app import channel_hiding, duplicate_streams  # noqa: E402
 from app.channel_search import (  # noqa: E402
     SearchContext, SearchState, default_standing_for, standing_applied, GRAIN_CHANNELS)
 from app.database import Channel, ChannelEvent, CHANNEL_HIDE_OVERRIDE_CHANGED  # noqa: E402
@@ -245,18 +245,19 @@ class DuplicateKeepCascadeTests(_HidingTestCase):
     """Hiding the KEPT copy of a duplicate cluster must promote a visible one, not make the
     whole stream disappear.
 
-    `_duplicate_losers()` ranks over the whole channels table on purpose, so it does not know
-    or care what the current search asks for. Before the hidden rung existed, hiding the
-    winner left every other copy ranked below a row that `hidden` then also removed, and with
-    both options defaulting on the result was zero rows for that stream.
+    The fold ranks over the whole channels table on purpose, so it does not know or care
+    what the current search asks for. Before the hidden rung existed, hiding the winner left
+    every other copy ranked below a row that `hidden` then also removed, and with both
+    options defaulting on the result was zero rows for that stream.
     """
 
     def setUp(self):
         super().setUp()
         url = 'http://dupe.test/live/9'
-        self.first = self._channel('Copy One', is_duplicate_stream_url=True)
-        self.second = self._channel('Copy Two', is_duplicate_stream_url=True)
+        self.first = self._channel('Copy One')
+        self.second = self._channel('Copy Two')
         self.first.stream_url = self.second.stream_url = url
+        duplicate_streams.recompute()
         db.session.commit()
 
     def test_the_lowest_id_wins_when_nothing_is_hidden(self):
@@ -266,27 +267,16 @@ class DuplicateKeepCascadeTests(_HidingTestCase):
         self._hide(self.first)
         self.assertEqual(self.search_names(), ['Copy Two'])
 
-    def test_the_python_keep_rank_agrees_with_the_sql(self):
-        """`channel_search_rows._keep_rank()` explains what `_duplicate_losers()` decides.
+    def test_the_kept_badge_names_the_copy_the_list_kept(self):
+        """`channel_search_rows._duplicate_clusters()` explains what the stored fold decided.
         A disagreement is a KEPT badge naming a rule the list did not follow."""
-        from app.channel_search_rows import _keep_rank
+        from app.channel_search_rows import KEEP_REASON_NOT_HIDDEN, _duplicate_clusters
         self._hide(self.first)
         db.session.expire_all()
         rows = Channel.query.order_by(Channel.id).all()
-        best = sorted(rows, key=lambda ch: _keep_rank(_KeepRow(ch)))[0]
-        self.assertEqual(best.name, 'Copy Two')
-
-
-class _KeepRow:
-    """The shape `_keep_rank()` reads - the query it normally consumes selects these five
-    values as labelled columns rather than whole Channel rows."""
-
-    def __init__(self, ch):
-        self.id = ch.id
-        self.hidden = ch.hidden
-        self.in_guide = ch.in_guide
-        self.in_group = bool(ch.group_memberships)
-        self.health = ch.health_score
+        cluster = _duplicate_clusters(rows, SearchContext.build({}))[self.second.id]
+        self.assertEqual(cluster['kept_id'], self.second.id)
+        self.assertEqual(cluster['kept_reason'], KEEP_REASON_NOT_HIDDEN)
 
 
 class IncrementalMatchesFromScratchTests(_HidingTestCase):

@@ -107,9 +107,11 @@ class ConfigCommentPreservationTests(unittest.TestCase):
         del data['sync']
         config_mod.save_config(data)
         raw = self._read_raw()
-        self.assertNotIn('interval_hours', raw,
-                         'a key absent from the saved data must still be removed from the '
-                         'file, not left behind by the comment-preserving merge')
+        # The whole key, not the substring: a defaults leaf named `check_interval_hours`
+        # (hosts.check_interval_hours) legitimately lands in the saved file.
+        self.assertNotRegex(raw, r'(?m)^\s*interval_hours:',
+                            'a key absent from the saved data must still be removed from the '
+                            'file, not left behind by the comment-preserving merge')
 
     def test_migrate_config_rewrite_preserves_comments(self):
         # config_version 0 (absent) + the legacy 'xtream' section forces migrate_config()'s

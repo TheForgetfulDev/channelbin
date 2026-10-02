@@ -531,10 +531,10 @@ class MissingDeleteRouteTests(unittest.TestCase):
         half of a duplicate pair is bulk-deleted, the survivor's flag must be cleared too,
         not just left stale until the next full sync."""
         shared_url = 'http://example.test/live/shared-dup'
-        ch = _missing_channel(self.account, 1, name='Missing Dup', is_duplicate_stream_url=True)
+        ch = _missing_channel(self.account, 1, name='Missing Dup', duplicate_cluster_id=1)
         ch.stream_url = shared_url
         survivor = seed.make_channel(self.account, stream_id=2, name='Survivor Dup',
-                                     is_duplicate_stream_url=True)
+                                     duplicate_cluster_id=1)
         survivor.stream_url = shared_url
         db.session.commit()
         survivor_id = survivor.id
@@ -543,7 +543,7 @@ class MissingDeleteRouteTests(unittest.TestCase):
         self.assertEqual(resp.get_json()['deleted_count'], 1)
 
         db.session.expire_all()
-        self.assertFalse(db.session.get(Channel, survivor_id).is_duplicate_stream_url)
+        self.assertFalse(db.session.get(Channel, survivor_id).is_duplicate_stream)
 
     def test_group_scoped_delete_only_deletes_that_group_s_eligible_channels(self):
         """The group/health-check detail page's "Delete Missing Channels" (dev/changelog/653)

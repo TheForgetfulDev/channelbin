@@ -1,5 +1,8 @@
 import json
 from datetime import datetime
+
+from sqlalchemy.ext.hybrid import hybrid_property
+
 from . import db
 
 # ── Event type constants ──────────────────────────────────────────────────────
@@ -79,6 +82,13 @@ RECORDING_FORMAT_CHANGED            = 'RECORDING_FORMAT_CHANGED'
 # channel's current stream_url - the provider rewrote its stream domain and/or embedded
 # creds and sync repointed the Channel row. Logged only when the URL actually changed.
 RECORDING_URL_RERESOLVED            = 'RECORDING_URL_RERESOLVED'
+# This recording's capture failed because the account's active host stopped resolving, and
+# that failure rolled the account onto its next listed host (app/account_links.py). Logged
+# on the recording that triggered the roll, naming both hosts; its next segment launches
+# on the new URL through the re-resolve above. A stall, a timeout or a refused connection
+# never rolls, so this event is always paired with a resolver error in the stderr tail.
+RECORDING_HOST_ROLLED               = 'RECORDING_HOST_ROLLED'
+RECORDING_LOGIN_REFUSED             = 'RECORDING_LOGIN_REFUSED'
 # Logged on the NEW recording when it was created via "Find Another Airing" replace mode
 # (the SCHEDULED recording it replaced is deleted in the same request).
 RECORDING_REPLACED_OTHER            = 'RECORDING_REPLACED_OTHER'
@@ -1394,6 +1404,10 @@ class Account(db.Model):
     # exists for them) but not type-restricted at the column level.
     xtream_debug_override = db.Column(db.Boolean, nullable=False, default=False,
                                       server_default=db.text('0'))
+    #: The provider the user put this account on (DESIGN-account-providers.md §6,
+    #: dev/changelog/1170): "these accounts reach the same backend". NULL = on none, which is
+    #: every account until the user says otherwise. Written only by app/account_links.py.
+    provider_id       = db.Column(db.Integer, db.ForeignKey('providers.id'))
     created_at        = db.Column(db.DateTime, default=datetime.utcnow)
     updated_at        = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -1443,6 +1457,98 @@ class AccountBlock(db.Model):
     #: How many of the account's connection slots the block takes. NULL = every slot.
     slots        = db.Column(db.Integer)
     created_at   = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+
+
+class Provider(db.Model):
+    """The user's label for a backend that several accounts reach (DESIGN-account-providers.md
+    §6, dev/changelog/1170): the same stream id is the same channel on every account on it,
+    and two accounts on it may share a login row. The app never creates one, never puts an
+    account on one and never removes an account from one - only app/account_links.py, from
+    the explicit user action (CLAUDE.md, participation-switch rule)."""
+    __tablename__ = 'providers'
+
+    id         = db.Column(db.Integer, primary_key=True)
+    name       = db.Column(db.String(100), nullable=False, unique=True)
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow,
+                           onupdate=datetime.utcnow)
+
+
+class AccountHost(db.Model):
+    """One of the host names an account's reseller handed out for the same server, listed
+    by the user on the account page (app/account_links.py). Exactly one is active while the
+    list is non-empty, and every stream URL on the account whose host is in the list carries
+    the active one. An account with no rows behaves exactly as it did before this table
+    existed: its URLs are left as the provider sent them.
+
+    The list is the user's judgment and only `app/account_links.py` adds to or removes from
+    it (CLAUDE.md, participation-switch rule). `is_active` and `activated_at` are state the
+    app writes: which of the user's own declared equivalents is dialed right now, moved by a
+    roll when the active host stops resolving, and never a choice the app makes about which
+    hosts belong on the list. `last_resolved_at` / `last_resolve_error` are the DNS probe's
+    stamps, display only.
+    """
+    __tablename__ = 'account_hosts'
+    __table_args__ = (db.UniqueConstraint('account_id', 'host', name='uq_account_hosts_account_host'),)
+
+    id                 = db.Column(db.Integer, primary_key=True)
+    # No index of its own: the UNIQUE (account_id, host) index leads on account_id and
+    # serves every lookup here.
+    account_id         = db.Column(db.Integer, db.ForeignKey('accounts.id'), nullable=False)
+    #: `name[:port]` - the netloc of a stream URL, scheme-less, port kept when the URLs carry one.
+    host               = db.Column(db.String(255), nullable=False)
+    position           = db.Column(db.Integer, nullable=False, default=0)
+    is_active          = db.Column(db.Boolean, nullable=False, default=False,
+                                   server_default=db.text('0'))
+    #: When this host last became the active one through a roll or Make active; NULL on the
+    #: host the list was seeded from, which has been active all along. Display only.
+    activated_at       = db.Column(db.DateTime)   # naive UTC
+    #: The DNS probe's last verdict: when it last resolved, and the resolver's error if the
+    #: last attempt failed (NULL = resolved, or never checked).
+    last_resolved_at   = db.Column(db.DateTime)   # naive UTC
+    last_resolve_error = db.Column(db.String(255))
+    created_at         = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+
+
+class Login(db.Model):
+    """A username/password the backend accepts for an account, with its own seat count,
+    listed by the user on the account page (app/account_links.py, dev/changelog/1169). A
+    capture takes a seat on one login and is launched with that login's credentials in the
+    stream URL; the account's own `username`/`password` stay what the sync talks to. An
+    account with no login rows behaves exactly as it did before this table existed: one
+    seat pool sized by `Account.max_connections`, URLs untouched.
+
+    A row rather than a column because one account may hold two (a second credential from
+    the reseller) and, later, two accounts on one provider may hold the same one. The list
+    is the user's judgment and only `app/account_links.py` adds, edits or removes a row
+    (CLAUDE.md, participation-switch rule). `last_refused_at` / `last_refused_detail` are
+    state the app writes: the capture path's last credential refusal, read to skip the login
+    for a while when another has a free seat.
+    """
+    __tablename__ = 'logins'
+
+    id                  = db.Column(db.Integer, primary_key=True)
+    #: The user's label for the login ("main", "spare"); what alerts and the card call it.
+    name                = db.Column(db.String(100), nullable=False)
+    username            = db.Column(db.String(255), nullable=False)
+    password            = db.Column(db.String(255), nullable=False)
+    #: Seats on this login. Required: a login with no number cannot size its pool.
+    max_connections     = db.Column(db.Integer, nullable=False)
+    last_refused_at     = db.Column(db.DateTime)   # naive UTC
+    last_refused_detail = db.Column(db.String(255))
+    created_at          = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+    updated_at          = db.Column(db.DateTime, nullable=False, default=datetime.utcnow,
+                                    onupdate=datetime.utcnow)
+
+
+class AccountLogin(db.Model):
+    """Which logins an account holds, in order. The order is the order seats are taken in
+    (app/connection_limits.py walks it) and the order the Logins card shows."""
+    __tablename__ = 'account_logins'
+
+    account_id = db.Column(db.Integer, db.ForeignKey('accounts.id'), primary_key=True)
+    login_id   = db.Column(db.Integer, db.ForeignKey('logins.id'), primary_key=True)
+    position   = db.Column(db.Integer, nullable=False, default=0)
 
 
 # ── Channel group format strategy ─────────────────────────────────────────────
@@ -1666,8 +1772,28 @@ class Channel(db.Model):
     guide_sort_order = db.Column(db.Integer, default=0)
     test_enabled     = db.Column(db.Boolean, nullable=False, default=True,
                                  server_default=db.text('1'))
-    is_duplicate_stream_url = db.Column(db.Boolean, nullable=False, default=False,
-                                        server_default=db.text('0'))
+    # ── The duplicate fold (app/duplicate_streams.py, dev/changelog/1172) ────
+    #
+    # Both are a derived cache written only by duplicate_streams, never by a route or a
+    # human. duplicate_cluster_id is the lowest channel id among the channels that are the
+    # same stream as this one (same provider + stream id for an account on a provider, same
+    # stream_url otherwise), NULL when there is no other. is_duplicate_loser is True on
+    # every member of a cluster except the copy the keep rule kept; "Show duplicates" off
+    # is this column.
+    duplicate_cluster_id = db.Column(db.Integer)
+    is_duplicate_loser   = db.Column(db.Boolean, nullable=False, default=False,
+                                     server_default=db.text('0'))
+
+    @hybrid_property
+    def is_duplicate_stream(self):
+        """Is this channel the same stream as another one. The cluster column read as a
+        yes/no - deliberately not a stored column of its own, so the two cannot disagree."""
+        return self.duplicate_cluster_id is not None
+
+    @is_duplicate_stream.expression
+    def is_duplicate_stream(cls):
+        return cls.duplicate_cluster_id.isnot(None)
+
     # Whether this channel's provider URL carries a <user>/<pass>/<numeric id> triplet for
     # URL normalization to rebuild from - app/accounts.py::url_is_normalizable() of
     # raw_stream_url, stamped in _upsert_channels alongside the URL it describes. Stored
@@ -1678,6 +1804,12 @@ class Channel(db.Model):
     # Icecast radio mount or a placeholder, ~850 of 136k channels here).
     url_normalizable = db.Column(db.Boolean, nullable=False, default=True,
                                  server_default=db.text('1'))
+    # The provider's stream id: the <numeric id> of that same triplet, from the same parse
+    # in the same row write, so it is NULL exactly when url_normalizable is False. Text,
+    # never cast, and never compared to stream_id, which is something else on M3U accounts
+    # (DESIGN-account-providers.md §2, §7). The duplicate fold keys on it for accounts on a
+    # provider (dev/changelog/1171).
+    provider_stream_id = db.Column(db.Text)
     # ── Hiding (app/channel_hiding.py, dev/changelog/775) ─────────────────────
     #
     # hidden is the MATERIALIZED EFFECTIVE ANSWER and means exactly "do not offer this
@@ -1823,12 +1955,13 @@ class Channel(db.Model):
         # Two boolean-led indexes, kept because their queries seek the RARE value - which is
         # the whole distinction BooleanLeadingIndexTests exists to make. Measured on the
         # production database: in_guide=1 is 0.0 ms here against 171.4 ms without,
-        # is_duplicate_stream_url=1 is 1.0 ms against 40.5 ms. Seeking the COMMON value of
+        # a duplicate flag=1 was 1.0 ms against 40.5 ms (that flag is now
+        # ix_channels_duplicate_cluster_id below, sought on IS NOT NULL). Seeking the COMMON value of
         # either would cost ~139 ms against 0.2 ms, and no query does. That is what
         # ix_channels_hidden and ix_channels_test_enabled could not say for themselves, which
         # is why migration 45 dropped them (dev/changelog/781).
         db.Index('ix_channels_in_guide', 'in_guide'),
-        db.Index('ix_channels_is_duplicate_stream_url', 'is_duplicate_stream_url'),
+        db.Index('ix_channels_duplicate_cluster_id', 'duplicate_cluster_id'),
         # The standing breakdown's covering index, and the one boolean-led index here that is
         # never SOUGHT - it is SCANNED end to end, which is a third case the rare-vs-common
         # rule above does not cover. `_standing_breakdown_compute()` buckets every channel
@@ -1846,7 +1979,7 @@ class Channel(db.Model):
         # index silently stops covering and the scan returns. StandingIndexCoverageTests
         # checks that rather than trusting this comment.
         db.Index('ix_channels_standing', 'hidden', 'in_guide', 'url_normalizable',
-                 'account_id', 'health_score'),
+                 'account_id', 'health_score', 'is_duplicate_loser'),
         # health_score, manual_health_adjustment together: the health band shown in the UI
         # is the *effective* score (health_score + manual_health_adjustment), so an index on
         # health_score alone would not cover the aggregate and SQLite would fall back to the

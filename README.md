@@ -135,6 +135,9 @@ and hands them to whatever you already use to watch them.
 
 - Xtream and M3U/XMLTV accounts, synced on a schedule, with sync logs and a sync that stands
   aside when a recording is running or about to start.
+- Experimental: alternate hosts and logins per account, and providers that link accounts
+  reaching the same backend, so a shared login counts its seats once and a channel carried by
+  two of them is recognized as one. Complete, but new; expect rough edges.
 - A jobs page listing every scheduled job with its next run time, and a maintenance page.
 - Log viewer, in-app settings editor, automatic config and database backups, and a sanitized
   support bundle for sharing diagnostics without sharing credentials.

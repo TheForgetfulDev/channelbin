@@ -24,10 +24,10 @@ from ..accounts import (
     duplicate_groups_within, lifecycle_states_for_channels,
     NORM_DISABLED, resolve_normalization_mode, url_is_normalizable,
     missing_channels_query, next_sync_map, repoint_candidates_for_channels,
-    _recompute_duplicate_stream_urls, transfer_channel_state,
+    transfer_channel_state,
 )
 from ..channel_groups import group_channel_ids, report_orphaned_guide_groups
-from .. import channel_hiding
+from .. import channel_hiding, duplicate_streams
 from ..config import load_config
 from ..db_utils import retry_on_locked
 from ..logo_cache import get_logo_cache_dir, resolve_logo_url
@@ -716,14 +716,20 @@ def channel_detail(channel_id):
     # never showed (dev/changelog/1158).
     hc_sig = health_check_signature()['sig']
 
+    # The cluster the fold stored, so this page and the search's DUP badge name the same
+    # channels (app/duplicate_streams.py).
     duplicate_channels = []
-    if channel.is_duplicate_stream_url:
+    duplicate_key = None
+    if channel.duplicate_cluster_id is not None:
         duplicate_channels = (
             Channel.query
-            .filter(Channel.stream_url == channel.stream_url, Channel.id != channel.id)
+            .filter(Channel.duplicate_cluster_id == channel.duplicate_cluster_id,
+                    Channel.id != channel.id)
             .order_by(Channel.name)
             .all()
         )
+        if duplicate_channels:
+            duplicate_key = duplicate_streams.describe_key(channel)
 
     total_epg_count = EPGEntry.query.filter_by(channel_id=channel_id).count()
 
@@ -904,6 +910,7 @@ def channel_detail(channel_id):
         lifecycle_since=lifecycle_since,
         repoint_candidate=repoint_candidate,
         duplicate_channels=duplicate_channels,
+        duplicate_key=duplicate_key,
         total_epg_count=total_epg_count,
         guide_source=guide_source,
         chan_epg_search_url=chan_epg_search_url,
@@ -1327,9 +1334,9 @@ def missing_delete():
             db.session.query(Channel).filter(
                 Channel.id.in_(chunk)).delete(synchronize_session=False)
 
-        # account.channel_count/epg_entry_count and Channel.is_duplicate_stream_url are all
-        # stored counters that only self-heal on the next full sync
-        # (_mark_success_and_commit / _recompute_duplicate_stream_urls in app/accounts.py) -
+        # account.channel_count/epg_entry_count and the duplicate fold's columns are all
+        # stored values that only self-heal on the next full sync
+        # (_mark_success_and_commit in app/accounts.py, duplicate_streams.recompute()) -
         # a bulk delete is exactly the kind of out-of-band change that leaves them stale
         # (dashboard/accounts-page counts wrong; surviving channels still flagged DUP)
         # without an explicit recompute here, and repeated real syncs aren't always an
@@ -1345,7 +1352,7 @@ def missing_delete():
         # recompute, so it is the one other caller of the counter that recompute() would
         # otherwise keep in sync on its own - a deleted hidden channel must leave the count.
         channel_hiding.refresh_hidden_channel_counts(touched_account_ids)
-        _recompute_duplicate_stream_urls()
+        duplicate_streams.recompute()
 
         db.session.commit()
         return len(ids), unlinked_recordings, screenshot_paths, touched_group_ids, None, skipped

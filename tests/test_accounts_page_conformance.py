@@ -190,7 +190,7 @@ class AccountPageTests(unittest.TestCase):
         acc = _account('Sections', 'OK')
         db.session.commit()
         html = self._get(acc)
-        for section in ('details', 'content', 'sources', 'usage', 'history', 'activity'):
+        for section in ('details', 'hosts', 'logins', 'content', 'sources', 'usage', 'history', 'activity'):
             self.assertIn(f'data-section="{section}"', html)
 
     def test_an_empty_section_still_renders_its_card_head(self):

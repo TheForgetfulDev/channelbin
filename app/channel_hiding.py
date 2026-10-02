@@ -60,7 +60,7 @@ from datetime import datetime
 
 from sqlalchemy import and_, case, delete, func, null, or_, not_, select, update
 
-from . import admission, db
+from . import admission, db, duplicate_streams
 from .database import (Account, Channel, ChannelEvent, ChannelGroupMember, ChannelHideRule,
                        EPGEntry, EpgAlternateEntry, CHANNEL_HIDE_OVERRIDE_CHANGED, HIDE_TARGETS,
                        HIDE_TARGET_CATEGORY_EXACT, HIDE_TARGET_CATEGORY_GLOB,
@@ -98,29 +98,13 @@ OVERRIDE_VALUES = {
 # The one recompute
 # ---------------------------------------------------------------------------
 
-def _in_any_group_expr():
-    """"Is this channel in any channel group at all", as a correlated EXISTS.
-
-    Deliberately ANY group, not only one that is in the guide: a channel sitting in a
-    health-check-only group is one the user curated and is monitoring, so hiding it out from
-    under them would be the same mistake the duplicate keep-rule already refuses to make
-    (dev/changelog/759).
-
-    Spelled here rather than imported from `channel_search.in_any_group_expr()` because that
-    module is the search engine and this one is read by the sync: the two must not import
-    each other to share four lines of correlated SELECT.
-    """
-    return select(ChannelGroupMember.id).where(
-        ChannelGroupMember.channel_id == Channel.id).correlate(Channel).exists()
-
-
 def protection_expr():
     """"Is this channel protected from being hidden" - in the TV Guide, or in any group.
 
     A guide row belonging to a GROUP this channel is a member of does not appear here and
     does not need to: the membership itself already protects the channel.
     """
-    return or_(Channel.in_guide.is_(True), _in_any_group_expr())
+    return or_(Channel.in_guide.is_(True), duplicate_streams.in_any_group_expr())
 
 
 @dataclass(frozen=True)
@@ -344,6 +328,14 @@ def recompute(channel_ids=None, account_id=None, resolved=None) -> int:
         stmt = stmt.where(*scope_terms)
     result = db.session.execute(stmt.execution_options(synchronize_session=False))
     purge_hidden_epg(scope_terms)
+    # `hidden` is the top rung of the duplicate keep rule, and this bulk write is one the
+    # session's after-flush re-rank never sees. A scoped pass re-ranks its own channels'
+    # clusters; a wider one is always followed by the whole-table recompute (a sync runs
+    # it after its upserts) or runs it here.
+    if channel_ids is not None:
+        duplicate_streams.rerank(channel_ids)
+    elif account_id is None:
+        duplicate_streams.recompute()
 
     # Which accounts this pass could have moved the hidden count for, account_id's own
     # column never changes so this is exactly as safe to read after the UPDATE as before it.

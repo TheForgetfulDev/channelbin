@@ -17,6 +17,7 @@
 
   let ROWS = G.rows.slice();
   let DUP_GROUPS = G.dupGroups.slice();
+  let PROVIDER_COPIES = G.providerCopies.slice();
   let MISSING_CHANNELS = G.missingChannels.slice();
   let COUNTS = G.counts;
   let TOTAL = G.total;
@@ -1988,6 +1989,20 @@
     el.style.display = '';
   }
 
+  // Sole updater for #gd-copies-banner. A statement, not a warning: a copy through a
+  // different login is a real backup, so the banner carries no ⚠ and no action - nothing
+  // is removed and no switch moves (DESIGN-account-providers.md §9). The sentences are
+  // built server-side by duplicate_streams.provider_copies(), the same ones the add-time
+  // note shows.
+  function renderCopiesBanner() {
+    const el = byId('gd-copies-banner');
+    if (!PROVIDER_COPIES.length) { el.style.display = 'none'; return; }
+    const lines = PROVIDER_COPIES.map(c => `<div class="notice-banner-sub">${escHtml(c.text)}</div>`).join('');
+    el.innerHTML = `<div class="notice-banner-body"><div class="notice-banner-title">` +
+      `Same channel through a provider</div>${lines}</div>`;
+    el.style.display = '';
+  }
+
   // What "remove" means differs per page state, and dup-modal.js makes every caller
   // spell it out for exactly that reason.
   // The dedup submit, named rather than inline so §15's confirm can re-run the identical
@@ -3042,6 +3057,7 @@
       .then(data => {
         ROWS = data.rows;
         DUP_GROUPS = data.dup_groups;
+        PROVIDER_COPIES = data.provider_copies;
         MISSING_CHANNELS = data.missing_channels;
         COUNTS = data.counts;
         TOTAL = data.total;
@@ -3066,6 +3082,7 @@
         renderBanners();
         renderSettingsBar();
         renderDupBanner();
+        renderCopiesBanner();
         renderMissingBanner();
         // The rows just changed underneath the bar, so its account values are re-derived
         // and any filter that no longer matches anything present is dropped with its chip.
@@ -3390,6 +3407,7 @@
   renderSummary();
   renderBanners();
   renderDupBanner();
+  renderCopiesBanner();
   renderMissingBanner();
   renderList();
   initBarReveal();

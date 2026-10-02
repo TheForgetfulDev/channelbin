@@ -1,9 +1,10 @@
-"""app/accounts.py::_recompute_duplicate_stream_urls - the cross-account duplicate-URL flag.
+"""app/duplicate_streams.py::recompute - which channels are flagged as a duplicate stream, on
+the URL key (the provider key and the kept copy are tests/test_duplicate_fold.py).
 
 The flag drives what channel search hides by default and is the cheap prefilter the
 missing-channel re-point helper keys off, so which rows end up flagged is a product-visible
-answer. dev/changelog/684 replaced the function's full-table ORM scan with two Core UPDATEs;
-these tests pin both halves of that:
+answer. dev/changelog/684 replaced a full-table ORM scan with Core UPDATEs, and
+dev/changelog/1172 made it one; these tests pin both halves of that:
 
   - RecomputeResultTests: the answer itself, one rule at a time. These are characterization
     tests - they pass against the pre-684 implementation too, deliberately, because the whole
@@ -24,7 +25,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app import db  # noqa: E402
 from app.database import Channel  # noqa: E402
-from app.accounts import _recompute_duplicate_stream_urls  # noqa: E402
+from app.duplicate_streams import recompute as _recompute_duplicate_stream_urls  # noqa: E402
 from tests.support import make_test_app  # noqa: E402
 from tests.support import seed  # noqa: E402
 from tests.support.iocount import IOCounter, all_engines  # noqa: E402
@@ -50,7 +51,7 @@ class _Base(unittest.TestCase):
         UPDATE writes past the identity map on purpose (synchronize_session=False)."""
         db.session.expire_all()
         return {ch.id for ch in Channel.query.filter(
-            Channel.is_duplicate_stream_url.is_(True)).all()}
+            Channel.is_duplicate_stream).all()}
 
 
 class RecomputeResultTests(_Base):
@@ -73,7 +74,7 @@ class RecomputeResultTests(_Base):
         _recompute_duplicate_stream_urls()
         db.session.commit()
         self.assertEqual(self._flagged(), set())
-        self.assertFalse(db.session.get(Channel, a.id).is_duplicate_stream_url)
+        self.assertFalse(db.session.get(Channel, a.id).is_duplicate_stream)
 
     def test_every_member_of_a_three_way_group_is_flagged(self):
         ids = [self._channel(self.account_a, i, 'http://example.test/live/shared').id
@@ -99,9 +100,9 @@ class RecomputeResultTests(_Base):
     def test_stale_true_flag_is_cleared_when_the_duplicate_goes_away(self):
         """The other direction: the flag is recomputed, not accumulated."""
         survivor = self._channel(self.account_a, 1, 'http://example.test/live/shared',
-                                 is_duplicate_stream_url=True)
+                                 duplicate_cluster_id=1)
         gone = self._channel(self.account_b, 1, 'http://example.test/live/shared',
-                             is_duplicate_stream_url=True)
+                             duplicate_cluster_id=1)
         db.session.commit()
         db.session.delete(gone)
         db.session.commit()
@@ -109,31 +110,31 @@ class RecomputeResultTests(_Base):
         _recompute_duplicate_stream_urls()
         db.session.commit()
         self.assertEqual(self._flagged(), set())
-        self.assertFalse(db.session.get(Channel, survivor.id).is_duplicate_stream_url)
+        self.assertFalse(db.session.get(Channel, survivor.id).is_duplicate_stream)
 
     def test_stale_true_flag_on_a_malformed_url_is_cleared(self):
         """The skip rule has to reach the clearing direction too, or a row flagged before
         it existed stays flagged forever."""
-        ch = self._channel(self.account_a, 1, 'http', is_duplicate_stream_url=True)
+        ch = self._channel(self.account_a, 1, 'http', duplicate_cluster_id=1)
         db.session.commit()
 
         _recompute_duplicate_stream_urls()
         db.session.commit()
-        self.assertFalse(db.session.get(Channel, ch.id).is_duplicate_stream_url)
+        self.assertFalse(db.session.get(Channel, ch.id).is_duplicate_stream)
 
     def test_already_correct_flags_are_left_alone(self):
         dup_a = self._channel(self.account_a, 1, 'http://example.test/live/shared',
-                              is_duplicate_stream_url=True)
+                              duplicate_cluster_id=1)
         dup_b = self._channel(self.account_b, 1, 'http://example.test/live/shared',
-                              is_duplicate_stream_url=True)
+                              duplicate_cluster_id=1)
         unique = self._channel(self.account_a, 2, 'http://example.test/live/2',
-                               is_duplicate_stream_url=False)
+                               duplicate_cluster_id=None)
         db.session.commit()
 
         _recompute_duplicate_stream_urls()
         db.session.commit()
         self.assertEqual(self._flagged(), {dup_a.id, dup_b.id})
-        self.assertFalse(db.session.get(Channel, unique.id).is_duplicate_stream_url)
+        self.assertFalse(db.session.get(Channel, unique.id).is_duplicate_stream)
 
     def test_no_channels_at_all_is_not_an_error(self):
         _recompute_duplicate_stream_urls()
@@ -172,7 +173,7 @@ class RecomputeStatementShapeTests(_Base):
         for i in range(n_stale_flags):
             stream_id += 1
             self._channel(self.account_a, stream_id, f'http://example.test/live/stale{i}',
-                          is_duplicate_stream_url=True)
+                          duplicate_cluster_id=1)
         db.session.commit()
 
     def test_recompute_hydrates_no_channel_rows(self):
@@ -186,13 +187,13 @@ class RecomputeStatementShapeTests(_Base):
         self.assertNotIn('channels.name', joined)
         self.assertNotIn('recording_profiles', joined)
 
-    def test_recompute_is_two_statements_regardless_of_how_many_rows_flip(self):
-        """Both directions of the flip in one pass each - not one UPDATE per changed row,
-        and not a count that grows with the table."""
+    def test_recompute_is_one_statement_regardless_of_how_many_rows_flip(self):
+        """Both directions of the flip in one pass - not one UPDATE per changed row, and
+        not a count that grows with the table."""
         self._seed(n_dup_pairs=6, n_unique=8, n_stale_flags=4)
         with IOCounter(all_engines()) as c:
             _recompute_duplicate_stream_urls()
-        self.assertEqual(c.queries, 2, c.statements)
+        self.assertEqual(c.queries, 1, c.statements)
         self.assertTrue(all(s.strip().upper().startswith('UPDATE') for s in c.statements),
                         c.statements)
 

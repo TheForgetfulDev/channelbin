@@ -29,7 +29,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from sqlalchemy import event  # noqa: E402
 from sqlalchemy.exc import OperationalError  # noqa: E402
 
-from app import db  # noqa: E402
+from app import db, duplicate_streams  # noqa: E402
 from app import accounts as accounts_mod  # noqa: E402
 from app.accounts import _do_sync  # noqa: E402
 from app.database import Account, Channel  # noqa: E402
@@ -118,18 +118,18 @@ class SuccessClosureRetryTests(unittest.TestCase):
             statements.append(statement)
 
         recomputes = []
-        real_recompute = accounts_mod._recompute_duplicate_stream_urls
+        real_recompute = duplicate_streams.recompute
 
-        def counting_recompute():
+        def counting_recompute(*args, **kwargs):
             recomputes.append(True)
-            return real_recompute()
+            return real_recompute(*args, **kwargs)
 
         engine = db.session.get_bind()
         event.listen(engine, 'before_cursor_execute', record)
         try:
             with mock.patch.object(accounts_mod, 'requests') as req:
                 req.get = fake_get
-                with mock.patch.object(accounts_mod, '_recompute_duplicate_stream_urls',
+                with mock.patch.object(duplicate_streams, 'recompute',
                                        counting_recompute):
                     with one_lock_retry_on_the_success_closure():
                         _do_sync(self.account_id, threading.Event())
@@ -180,9 +180,9 @@ class SuccessClosureRetryTests(unittest.TestCase):
         self._sync_with_one_lock_retry()
 
         db.session.expire_all()
-        flagged = Channel.query.filter_by(
-            stream_url='http://provider.test/live/u/p/1.ts',
-            is_duplicate_stream_url=True).count()
+        flagged = Channel.query.filter(
+            Channel.stream_url == 'http://provider.test/live/u/p/1.ts',
+            Channel.is_duplicate_stream).count()
         self.assertEqual(flagged, 2, 'both copies of the shared URL must end the sync flagged')
 
 

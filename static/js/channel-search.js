@@ -1289,6 +1289,16 @@
     return esc(out).split(MARK_OPEN).join('<mark>').split(MARK_CLOSE).join('</mark>');
   }
 
+  /* What made a cluster one stream, in words. The server sends the key
+     (`dup.key`): the provider's stream id for accounts on a provider, the exact
+     URL otherwise - so every sentence about a cluster names the same reason. */
+  const dupOnProvider = (d) => !!(d.key && d.key.kind === 'provider');
+  const dupKeyClause = (d) => (dupOnProvider(d)
+    ? `are the same stream (id ${d.key.stream_id} on ${d.key.provider})`
+    : 'share this stream URL');
+  const KEEP_RULE = 'The rule is: still in the provider\'s feed first, then in your guide, '
+    + 'then in a channel group, then best health, then lowest channel id.';
+
   // The badge always carries the cluster size: that is what tells a stray pair
   // apart from the six-copy cluster, which is what the user is looking for.
   function dupBadge(row) {
@@ -1299,8 +1309,8 @@
       ? `\n  + ${d.others.length - shown.length} more` : '';
     const hidden = d.others_hidden
       ? '\n\nSome of them are hidden right now because "Show duplicates" is off.' : '';
-    const tip = `Duplicate stream URL.\n${d.count - 1} other channel` +
-      `${d.count === 2 ? '' : 's'} point at the identical URL:\n` +
+    const tip = `Duplicate stream.\n${d.count} channels ${dupKeyClause(d)}. The other` +
+      `${d.count === 2 ? '' : 's'}:\n` +
       shown.map((c) => `  ${c.name}   (${c.category || 'no category'})`).join('\n') + more + hidden +
       '\n\nClick to see just that cluster. A "← Your search" button appears so you can return.';
     return `<span class="badge b-warn" data-act="dup-badge" data-id="${row.id}" data-tip="${tipAttr(tip)}">DUP &times;${d.count}</span>`;
@@ -1452,7 +1462,7 @@
     : '');
   // Says which RUNG of the cascade decided it, not all three.
   const keptBadge = (row) => (row.kept && row.dup
-    ? `<span class="kept" data-tip="${tipAttr(`Kept out of the ${row.dup.count} channels sharing this stream URL, because it is ${row.dup.kept_reason}.\nThe rule is: in your guide first, then in a channel group, then best health, then lowest channel id.`)}">KEPT</span>`
+    ? `<span class="kept" data-tip="${tipAttr(`Kept out of the ${row.dup.count} channels that ${dupKeyClause(row.dup)}, because it is ${row.dup.kept_reason}.\n${KEEP_RULE}`)}">KEPT</span>`
     : '');
   const noteBadge = (row) => (row.notes
     ? `<span data-tip="${tipAttr(row.notes)}" style="cursor:help">&#128221;</span>` : '');
@@ -2759,7 +2769,7 @@
     // cluster (dev/changelog/778).
     state.standing.add('showdup');
     applyNow();
-    showToast(`Showing the ${row.dup.count} channels that share that stream URL. `
+    showToast(`Showing the ${row.dup.count} channels that ${dupKeyClause(row.dup)}. `
               + 'Use "← Your search" to return.');
   }
 
@@ -2837,7 +2847,7 @@
         <span class="pv">${sel ? `Deselect this ${thing}` : `Select this ${thing}`}</span></div>
       ${row.dup ? `<div class="prow drill" data-act="dup-badge" data-id="${row.id}">
         <span class="pico">&#9282;</span>
-        <span class="pv">${nf(row.dup.count)} channels share this stream URL</span></div>` : ''}
+        <span class="pv">${nf(row.dup.count)} channels ${esc(dupKeyClause(row.dup))}</span></div>` : ''}
       <div class="sh-note">Selecting from in here and ticking the card's checkbox write the same
         selection, so a one-channel action and a fifty-channel action are one path rather than
         two.${isAirings() ? ' <b>Selecting a showing also selects its channel</b> for the channel '
@@ -3019,16 +3029,18 @@
       ? `<div class="prow"><span class="pv text-faint">+ ${nf(d.others_hidden)} more</span></div>` : '';
     const sheet = openSheet({
       kind: 'dup',
-      title: 'Duplicated stream URL',
-      body: `<div class="sh-note" style="padding-top:2px">${nf(d.count - 1)} other channel${
-          d.count === 2 ? '' : 's'} point at the identical stream URL. They are duplicates because
-          they share a URL, not because they share a name.</div>
+      title: 'Duplicated stream',
+      body: `<div class="sh-note" style="padding-top:2px">${dupOnProvider(d)
+          ? `${nf(d.count)} channels ${esc(dupKeyClause(d))}. Accounts on one provider reach
+          the same stream under the same id, whatever the URL says.`
+          : `${nf(d.count - 1)} other channel${d.count === 2 ? '' : 's'} point at the identical
+          stream URL. They are duplicates because they share a URL, not because they share a
+          name.`}</div>
         ${others.map((o) => `<div class="prow"><span class="pv">${esc(o.name)}</span>
           <span class="hint">${esc(o.category || 'no category')}</span></div>`).join('')}${more}
         <div class="psep"></div>
         <div class="sh-note" style="padding-top:0">The one kept is ${esc(d.kept_reason)}.
-          The rule is: in your guide first, then in a channel group, then best health, then
-          lowest channel id.</div>
+          ${esc(KEEP_RULE)}</div>
         <div style="padding:4px 0 6px"><button class="btn btn-primary" data-dupdrill="${row.id}"
           style="width:100%;justify-content:center">Show just these ${nf(d.count)} channels</button></div>`,
     });

@@ -141,8 +141,27 @@
     <button class="btn btn-sm" data-act="unblock" data-block-id="{{ b.id }}">Unblock</button>
   </div>
   {% endfor %}
+  {% for sib in sibling_blocks.covers %}
+  <div>This block also covers {{ sib.account }}, which shares login{{ 's' if sib.logins | length != 1 }} {% for n in sib.logins %}"{{ n }}"{{ ', ' if not loop.last }}{% endfor %}.</div>
+  {% endfor %}
 </div>
 {% endif %}
+{# A block the user set on ANOTHER account that reaches this one through a login the two
+   share (DESIGN-account-providers.md §5.3, dev/changelog/1170). Said here, because this
+   account was never blocked itself and would otherwise refuse with no visible reason. #}
+{% for sib in sibling_blocks.covered_by %}
+<div class="notice notice-info">
+  <strong>A block on {{ sib.account }} also covers this account</strong><br>
+  This account shares login{{ 's' if sib.logins | length != 1 }} {% for n in sib.logins %}"{{ n }}"{{ ', ' if not loop.last }}{% endfor %} with
+  <a href="{{ url_for('accounts.account_detail', account_id=sib.account_id) }}">{{ sib.account }}</a>,
+  so while that block is in force its seats are taken here too. Unblock it on {{ sib.account }}'s page.
+  {% for b in sib.blocks %}
+  <div class="acct-block-line">
+    <span>{% if b.active %}Until {{ b.stop_label }}{% else %}From {{ b.start_label }} until {{ b.stop_label }}{% endif %}{% if b.slots %}, {{ b.slots }} connection{{ 's' if b.slots != 1 }}{% endif %}</span>
+  </div>
+  {% endfor %}
+</div>
+{% endfor %}
 {% if not account.sync_enabled and st != 'UNSYNCED' %}
 <div class="notice notice-info">
   <strong>Automatic sync is off for this account</strong><br>
@@ -217,6 +236,10 @@
     <div class="card-body" id="acct-details-body">
       <div class="statlist has-wide">
         {{ m.stat_row('Type', 'Xtream API' if is_xtream else 'M3U playlist') }}
+        {% if provider %}
+        <div class="srow"><span class="sk">Provider</span>
+          <span class="sv tip-plain" data-tip="Provider.&#10;The accounts on this provider reach the same backend, so they may share a login and count its seats once. Managed on the Accounts page."><a href="{{ url_for('accounts.accounts_list') }}#provider-{{ provider.id }}">{{ provider.name }}</a></span></div>
+        {% endif %}
         {{ m.stat_row('Status', st, 'ok' if st == 'OK' else ('bad' if st == 'ERROR' else 'faint')) }}
         <div class="srow"><span class="sk">URL normalization</span>
           <span class="sv tip-plain" data-tip="URL normalization.&#10;Rewrites every stream URL into one consistent shape. Only the shape changes - the address and credentials the provider supplied are kept as they are, and a URL with no user/password/id in it is left alone.{% if settings.norm_example %}&#10;Example: {{ settings.norm_example }}{% endif %}">{{ settings.norm_label }}{% if settings.norm_inherited %} <span class="text-faint sv-inherit">(global)</span>{% endif %}</span></div>
@@ -224,7 +247,7 @@
         <div class="srow"><span class="sk">Sync interval</span>
           <span class="sv tip-plain" data-tip="Sync interval.&#10;How often this account is refreshed. (global) means it follows sync.sync_interval_hours in Settings rather than carrying its own value.">every {{ settings.interval_hours }}h{% if settings.interval_inherited %} <span class="text-faint sv-inherit">(global)</span>{% endif %}</span></div>
         <div class="srow"><span class="sk">Max connections</span>
-          <span class="sv tip-plain" data-tip="Max simultaneous connections.&#10;The cap on concurrent connections ChannelBin opens to this provider - recordings and channel tests combined. Account sync does not count against it.">{{ settings.max_connections }}{% if settings.max_connections_inherited %} <span class="text-faint sv-inherit">(global)</span>{% endif %}</span></div>
+          <span class="sv tip-plain" data-tip="Max simultaneous connections.&#10;The cap on concurrent connections ChannelBin opens to this provider - recordings, channel tests and previews combined. Account sync does not count against it.{% if settings.max_connections_logins %}&#10;The sum of the seats on this account's listed logins; the Max connections setting is not read while any login is listed.{% endif %}">{{ settings.max_connections }}{% if settings.max_connections_logins %} <span class="text-faint sv-inherit">(logins: {{ settings.max_connections_logins }})</span>{% elif settings.max_connections_inherited %} <span class="text-faint sv-inherit">(global)</span>{% endif %}</span></div>
         {% if is_xtream %}
         {# What the provider itself reports in its auth response (dev/changelog/534) -
            separate from the sync-health Status row above and the configured Max
@@ -268,6 +291,108 @@
         <div class="srow wide"><span class="sk">Username</span><span class="sv endpoint">{{ account.username }}</span></div>
         {% endif %}
       </div>
+    </div>
+  </div>
+
+  {# Hosts (DESIGN-account-providers.md §4, §6.3): the other names the reseller handed out
+     for this account's server, one active. Every state a host can be in is named - a
+     trailing else would become the home for the next one somebody adds. The list is the
+     user's; app/account_links.py is its one writer, and the page only shows it. #}
+  <div class="card" data-section="hosts">
+    <div class="card-head" id="acct-hosts-head"><h2>Hosts{% if hosts %} <span class="cnt">{{ hosts | length }}</span>{% endif %}</h2>
+      <div class="card-head-actions">
+        <button class="btn btn-sm" data-act="host-add"
+                data-tip="Add another host name this account's streams can be reached on. When the active one stops resolving, ChannelBin swaps every stream URL on this account to the next one that does.">+ Add host</button>
+      </div>
+    </div>
+    <div class="card-body" id="acct-hosts-body">
+      {% if not hosts %}
+      <p class="card-note">One host, the one in this account's stream URLs. Add the others your reseller gave you and ChannelBin will swap to a working one when this one stops resolving.</p>
+      {% else %}
+      <p class="card-note">Every stream URL on this account uses the active host. When a recording, health check or preview fails because that host stopped resolving, the next host on this list that does resolve takes over, every URL moves to it, and an alert says so. A channel that fails for any other reason changes nothing here. The list is checked in DNS on a schedule, so a host going bad shows up before a recording finds out.</p>
+      <div class="table-scroll">
+        <table class="tbl tbl-cards">
+          <thead><tr><th>Host</th><th>Role</th><th>Resolves</th><th></th></tr></thead>
+          <tbody>
+          {% for h in hosts %}
+          <tr>
+            <td data-label="Host"><code>{{ h.host }}</code></td>
+            <td data-label="Role">
+              {% if h.is_active %}{{ m.status_badge('b-done', 'Active') }}{% if h.activated_at %}<div class="text-faint small">since {{ h.activated_at | local_time }}</div>{% endif %}
+              {% else %}<span class="text-faint">Standby</span>{% endif %}</td>
+            <td data-label="Resolves">
+              {% if h.state == 'resolving' %}{{ m.status_badge('b-done', 'Yes') }}<div class="text-faint small">checked {{ h.last_resolved_at | local_time }}</div>
+              {% elif h.state == 'failing' %}{{ m.status_badge('b-fail', 'No') }}<div class="small">{{ h.error }}</div>{% if h.last_resolved_at %}<div class="text-faint small">last resolved {{ h.last_resolved_at | local_time }}</div>{% endif %}
+              {% elif h.state == 'unchecked' %}<span class="text-faint">Not checked yet</span>
+              {% endif %}</td>
+            <td class="num">
+              <span class="menu-wrap">
+                <button class="btn btn-sm btn-icon" data-menu aria-label="Actions for {{ h.host }}">&#8943;</button>
+                <div class="menu">
+                  <button class="menu-item" data-act="host-activate" data-host-id="{{ h.id }}" data-host="{{ h.host }}"{% if h.is_active %} disabled{% endif %}
+                          data-tip="Move every stream URL on this account to this host now.">Make active</button>
+                  <div class="sep"></div>
+                  <button class="menu-item danger" data-act="host-remove" data-host-id="{{ h.id }}" data-host="{{ h.host }}" data-active="{{ '1' if h.is_active else '' }}" data-others="{{ hosts | length - 1 }}">Remove</button>
+                </div>
+              </span>
+            </td>
+          </tr>
+          {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      {% endif %}
+    </div>
+  </div>
+
+  {# Logins (DESIGN-account-providers.md §5, §6.3): the username/passwords this account
+     accepts beyond its own, each with its seats. A capture takes a seat on one and is
+     launched with its credentials. Every row is one of two refusal states and both are
+     named; the password is never in the view. The list is the user's; app/account_links.py
+     is its one writer, and the page only shows it. #}
+  <div class="card" data-section="logins">
+    <div class="card-head" id="acct-logins-head"><h2>Logins{% if logins %} <span class="cnt">{{ logins | length }}</span>{% endif %}</h2>
+      <div class="card-head-actions">
+        <button class="btn btn-sm" data-act="login-add"
+                data-tip="Add another username and password this account accepts, with its own seats. Recordings, health checks and previews take a seat on one login at a time and are launched with its credentials.">+ Add login</button>
+      </div>
+    </div>
+    <div class="card-body" id="acct-logins-body">
+      {% if not logins %}
+      <p class="card-note">One login, the account's own. Add another to run more streams at once and have a spare.</p>
+      {% else %}
+      <p class="card-note">A recording, health check or preview takes a seat on the first login here with one free and is launched with that login's username and password in the stream URL. The seats add up to this account's connection limit. When the server refuses a login, it is skipped for a while if another login has a free seat, and an alert says so. Syncs keep using the account's own login.</p>
+      <div class="table-scroll">
+        <table class="tbl tbl-cards">
+          <thead><tr><th>Login</th><th>Seats</th><th>Refused</th><th></th></tr></thead>
+          <tbody>
+          {% for lg in logins %}
+          <tr>
+            <td data-label="Login"><strong>{{ lg.name }}</strong><div class="text-faint small"><code>{{ lg.username }}</code></div>{% if lg.shared_with %}<div class="small">Shared with {{ lg.shared_with | join(', ') }}</div>{% endif %}</td>
+            <td data-label="Seats">{{ lg.held }} of {{ lg.max_connections }} in use{% if lg.holders %}<div class="text-faint small">{{ lg.holders }}</div>{% endif %}</td>
+            <td data-label="Refused">
+              {% if lg.refused %}{{ m.status_badge('b-fail', 'Yes') }}<div class="small">{{ lg.last_refused_at | local_time }}: {{ lg.last_refused_detail }}</div><div class="text-faint small">Skipped while another login has a free seat.</div>
+              {% elif lg.last_refused_at %}<span class="text-faint">Not lately</span><div class="text-faint small">last refused {{ lg.last_refused_at | local_time }}</div>
+              {% else %}<span class="text-faint">Never</span>
+              {% endif %}</td>
+            <td class="num">
+              <span class="menu-wrap">
+                <button class="btn btn-sm btn-icon" data-menu aria-label="Actions for login {{ lg.name }}">&#8943;</button>
+                <div class="menu">
+                  <button class="menu-item" data-act="login-edit" data-login-id="{{ lg.id }}" data-shared-with="{{ lg.shared_with | join(', ') }}">Edit</button>
+                  <button class="menu-item" data-act="login-move" data-login-id="{{ lg.id }}" data-direction="up"{% if lg.first %} disabled{% endif %}>Move up</button>
+                  <button class="menu-item" data-act="login-move" data-login-id="{{ lg.id }}" data-direction="down"{% if lg.last %} disabled{% endif %}>Move down</button>
+                  <div class="sep"></div>
+                  <button class="menu-item danger" data-act="login-remove" data-login-id="{{ lg.id }}" data-login="{{ lg.name }}" data-held="{{ lg.held }}" data-shared-with="{{ lg.shared_with | join(', ') }}">Remove</button>
+                </div>
+              </span>
+            </td>
+          </tr>
+          {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      {% endif %}
     </div>
   </div>
 

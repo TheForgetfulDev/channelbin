@@ -1,0 +1,79 @@
+{# The Accounts page's Providers section (DESIGN-account-providers.md §6.2,
+   dev/changelog/1170). `providers` is routes/providers.py::providers_section(): None with
+   fewer than two accounts, so a one-account user sees nothing at all. The writes are
+   account-providers.js -> /api/providers*, through app/account_links.py. #}
+{% macro section(providers) -%}
+{% if providers %}
+<section class="prov" id="acct-providers" data-choices="{{ providers.choices | tojson | forceescape }}">
+  <div class="prov-top">
+    <h2>Providers</h2>
+    <button class="btn btn-sm" data-act="prov-add"
+            data-tip="Put accounts that reach the same backend on one provider, so ChannelBin knows they are one service and they may share a login.">+ Add provider</button>
+  </div>
+  {% if not providers.providers %}
+  <p class="card-note">Have more than one account for the same provider? Put them on a provider so ChannelBin knows they are one backend.</p>
+  {% else %}
+  <div class="prov-cards">
+    {% for p in providers.providers %}
+    <div class="card" id="provider-{{ p.id }}" data-provider-id="{{ p.id }}" data-name="{{ p.name }}"
+         data-addable="{{ p.addable | tojson | forceescape }}">
+      <div class="card-head"><h2>{{ p.name }}</h2>
+        <div class="card-head-actions">
+          <span class="menu-wrap">
+            <button class="btn btn-sm btn-icon" data-menu data-sheet aria-label="Actions for provider {{ p.name }}">&#8943;</button>
+            <div class="menu">
+              <button class="menu-item" data-act="prov-rename">Rename</button>
+              {% for a in p.accounts %}
+              <button class="menu-item" data-act="prov-remove-account" data-account-id="{{ a.id }}" data-account="{{ a.name }}">Remove {{ a.name }}</button>
+              {% endfor %}
+              <div class="sep"></div>
+              <button class="menu-item danger" data-act="prov-delete">Delete provider</button>
+            </div>
+          </span>
+        </div>
+      </div>
+      <div class="card-body">
+        <p class="card-note">Accounts on {{ p.name }} reach the same backend, so a channel with the same stream id on two of them is one channel, and two of them may share a login and count its seats once.</p>
+        {% if not p.accounts %}
+        <p class="text-faint">No accounts on this provider yet.</p>
+        {% endif %}
+        {% for a in p.accounts %}
+        <div class="prov-acct">
+          <a class="prov-name" href="{{ url_for('accounts.account_detail', account_id=a.id) }}">{{ a.name }}</a>
+          <span class="prov-meta">{{ 'Xtream' if a.type == 'xtream' else 'M3U' }} &middot; {{ '{:,}'.format(a.channels) }} channels{% if a.hosts %} &middot; hosts: {{ a.hosts }}{% if a.active_host %}, {{ a.active_host }} active{% endif %}{% endif %}</span>
+          <span class="prov-logins">
+            {% if not a.logins %}<span class="prov-meta">no logins listed</span>{% endif %}
+            {% for lg in a.logins %}
+            <span class="menu-wrap">
+              <button class="chip{% if lg.shared %} active{% endif %}" data-menu data-sheet
+                      aria-label="Login {{ lg.name }} on {{ a.name }}">login: {{ lg.name }}{% if lg.shared %} (shared){% endif %} &#9662;</button>
+              <div class="menu">
+                {% for t in lg.share_targets %}
+                <button class="menu-item" data-act="prov-share" data-login-id="{{ lg.id }}" data-login="{{ lg.name }}" data-account-id="{{ t.id }}">Share with {{ t.name }}</button>
+                {% endfor %}
+                {% if lg.shared %}
+                <button class="menu-item" data-act="prov-unshare" data-login-id="{{ lg.id }}" data-login="{{ lg.name }}" data-account-id="{{ a.id }}" data-account="{{ a.name }}">Stop sharing on {{ a.name }}</button>
+                {% endif %}
+                {% if not lg.share_targets and not lg.shared %}
+                <button class="menu-item" disabled>No other account here to share with</button>
+                {% endif %}
+              </div>
+            </span>
+            {% endfor %}
+          </span>
+        </div>
+        {% endfor %}
+        {% for pool in p.pools %}
+        <div class="prov-pool">Login "{{ pool.name }}" &middot; {{ pool.seats }} seat{{ 's' if pool.seats != 1 }}, {{ pool.held }} in use{% if pool.holders %} by {{ pool.holders }}{% endif %} &middot; held by {{ pool.accounts | join(', ') }}{% if pool.outside %}<span class="text-warning"> - {{ pool.outside | join(', ') }} {{ 'is' if pool.outside | length == 1 else 'are' }} not on this provider</span>{% endif %}</div>
+        {% endfor %}
+        {% if p.addable %}
+        <button class="btn btn-sm prov-add-acct" data-act="prov-add-account">+ Add account to this provider</button>
+        {% endif %}
+      </div>
+    </div>
+    {% endfor %}
+  </div>
+  {% endif %}
+</section>
+{% endif %}
+{%- endmacro %}

@@ -43,7 +43,12 @@ import time
 from dataclasses import dataclass, field
 from typing import Optional
 
+from flask import current_app
+
 from . import connection_limits as connlim
+from .account_links import (is_credential_refusal, is_resolution_failure,
+                            note_refusal_for_holder, render_held_login,
+                            roll_host_for_channel)
 from .proc_utils import (PREVIEW_PLAYLIST, PREVIEW_SEGMENT_RE, build_preview_cmd,
                          read_stderr_tail, terminate_or_kill)
 from .url_utils import mask_creds_in_text
@@ -139,6 +144,14 @@ class PreviewSession:
     preempted: bool = False
     playlist_fetches: int = 0
     purpose: str = PURPOSE_WATCH
+    # The Flask app this session was started under. _check() runs on the reaper thread
+    # with no context of its own; the one thing it needs one for is the host roll after a
+    # start failure, which reads and writes the database.
+    app: Optional[object] = field(default=None, repr=False)
+    # The login the session's seat was on at launch (None: the account's own pool). Kept
+    # here because the seat is released before the start failure's stderr is read, and a
+    # credential refusal has to be stamped on the login that was actually sent.
+    login_id: Optional[int] = None
     # _finish() claims a session under _lock and tears it down under _teardown_lock, so a
     # second finisher blocks until the first is done rather than returning early.
     _finishing: bool = False
@@ -253,6 +266,7 @@ def _launch(channel_id: int, purpose: str) -> PreviewSession:
         connect_timeout=float(pcfg.get('connect_timeout_seconds', 20)),
         started_mono=time.monotonic(),
         purpose=purpose,
+        app=current_app._get_current_object(),
     )
     # Registered BEFORE the slot is taken, so a recording preempting in the window between
     # acquire and Popen finds something to flag rather than nothing (see `preempted`).
@@ -281,7 +295,12 @@ def _launch(channel_id: int, purpose: str) -> PreviewSession:
         raise PreviewRefused(f'Could not create the preview directory: {exc}', 500)
     session.stderr_path = os.path.join(session.dir, 'ffmpeg.stderr')
 
-    cmd = build_preview_cmd(cfg, channel.stream_url, session.dir,
+    # The seat just taken may be on one of the account's listed logins: the capture is
+    # launched with that login's credentials, never the URL's own, so the seat and the
+    # credentials the provider sees are the same login (app/account_links.py).
+    launch_url, session.login_id = render_held_login(channel.stream_url, channel.account_id,
+                                                     'preview', session.id)
+    cmd = build_preview_cmd(cfg, launch_url, session.dir,
                             segment_seconds=int(pcfg.get('segment_seconds', 2)),
                             transcode_audio=transcode_audio, pace_realtime=pace)
     log.info('Preview %s (%s): channel %d (%s)%s - %s', session.id, purpose, channel.id,
@@ -544,6 +563,7 @@ def _check(session: PreviewSession):
         tail = mask_creds_in_text(read_stderr_tail(session.stderr_path))
         _finish(session, REASON_FFMPEG_EXITED,
                 detail=f'ffmpeg exited with code {rc}' + (f': {tail}' if tail else ''))
+        _roll_if_unresolved(session, tail)
         return
     if session.state == STATE_STARTING:
         if _playlist_is_playable(session.playlist_path):
@@ -556,6 +576,7 @@ def _check(session: PreviewSession):
         elif now - session.started_mono > session.connect_timeout:
             tail = mask_creds_in_text(read_stderr_tail(session.stderr_path))
             _finish(session, REASON_CONNECT_TIMEOUT, detail=tail)
+            _roll_if_unresolved(session, tail)
             return
     if session.state == STATE_READY and session.last_seen_mono is not None:
         if now - session.last_seen_mono > session.idle_timeout:
@@ -563,6 +584,28 @@ def _check(session: PreviewSession):
             return
     if now - session.started_mono > session.max_seconds:
         _finish(session, REASON_MAX_DURATION)
+
+
+def _roll_if_unresolved(session: PreviewSession, tail: str) -> None:
+    """After a start failure: if ffmpeg said the stream host did not resolve, roll the
+    account's host list; if it said the server refused the credentials, stamp the login
+    the preview was launched with (app/account_links.py). The session is already torn
+    down, so the slot is free and this touches nothing the preview holds; under the
+    session's own app because the reaper thread carries no context."""
+    if session.app is None:
+        return
+    unresolved = is_resolution_failure(tail)
+    refused = session.login_id is not None and is_credential_refusal(tail)
+    if not unresolved and not refused:
+        return
+    with session.app.app_context():
+        if unresolved:
+            roll_host_for_channel(session.channel_id,
+                                  trigger=f'Preview of {session.channel_name}')
+        if refused:
+            note_refusal_for_holder('preview', session.id,
+                                    trigger=f'Preview of {session.channel_name}',
+                                    stderr_tail=tail, login_id=session.login_id)
 
 
 def _reap_loop():

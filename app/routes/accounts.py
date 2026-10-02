@@ -5,15 +5,19 @@ from datetime import datetime, timedelta
 from flask import (Blueprint, render_template, request, redirect, url_for, flash, current_app,
                    abort, jsonify)
 
-from .. import db
+from .. import db, duplicate_streams
 from ..accounts import (NORM_DISABLED, NORM_MODES, coerce_normalization_mode,
                         norm_mode_example, norm_mode_label, normalize_url_with_mode,
-                        resolve_normalization_mode, url_is_normalizable,
-                        recompute_duplicate_stream_urls_and_commit, finalize_sync_state,
+                        resolve_normalization_mode, url_provider_stream_id,
+                        finalize_sync_state,
                         manual_sync_restarts_schedule, next_sync_map,
                         report_source_removed, resolve_source_alerts,
                         start_source_refresh, sync_signature, update_source_stale_alert)
 from .. import account_stats_view
+from ..account_links import (add_host, add_login, delete_hosts_for_account,
+                             delete_logins_for_account, hosts_for_accounts,
+                             logins_for_accounts, move_login, refusal_cooldown, remove_host,
+                             remove_login, set_active_host, update_login)
 from ..account_stats import WINDOWS, today_local, windowed_stats
 from ..channel_groups import report_orphaned_guide_groups
 from ..channel_search import GROUP_ANY, OTHER_NEW, OTHER_REMOVED
@@ -41,6 +45,7 @@ from ..account_blocks import (MAX_ACCOUNT_BLOCK_HOURS, account_limits, add_accou
 from ..ui_constants import PRESET_COLORS
 from ..url_utils import mask_url_path
 from .channels import _chunked, _DELETE_CHUNK_SIZE
+from .providers import account_provider, providers_section, sibling_blocks
 
 accounts_bp = Blueprint('accounts', __name__)
 
@@ -48,7 +53,8 @@ accounts_bp = Blueprint('accounts', __name__)
 # user's own order/hidden picks ride on the same server-side user-prefs store the group
 # detail page uses, so a saved layout follows them across browsers - and a layout saved
 # before a section existed shows it at its default place (util.js initSectionLayout).
-ACCOUNT_SECTIONS = ['details', 'content', 'sources', 'usage', 'history', 'activity']
+ACCOUNT_SECTIONS = ['details', 'hosts', 'logins', 'content', 'sources', 'usage', 'history',
+                    'activity']
 
 # How many sync runs the Sync history section shows before its "All N syncs" control.
 # Expanding loads the rest in place - there is no separate history page any more
@@ -190,6 +196,7 @@ def accounts_list():
         stats=stats,
         blocks=block_views(account_ids),
         conn_limits=account_limits(account_ids, cfg),
+        providers=providers_section(accounts),
     )
 
 
@@ -229,20 +236,89 @@ def _section_pref():
     return stored if isinstance(stored, dict) and isinstance(stored.get('order'), list) else None
 
 
-def _effective_settings(account, cfg):
+def host_views(account_id):
+    """The Hosts card's rows (DESIGN-account-providers.md §4.5, §6.3), one query. Each host
+    is one of three states and the template names every one: resolving (the probe or a
+    roll last found it), failing (with the resolver's words and, when known, the last time
+    it did resolve), or not checked yet."""
+    out = []
+    for row in hosts_for_accounts([account_id]).get(account_id, []):
+        if row.last_resolve_error:
+            state = 'failing'
+        elif row.last_resolved_at:
+            state = 'resolving'
+        else:
+            state = 'unchecked'
+        out.append({
+            'id': row.id,
+            'host': row.host,
+            'is_active': row.is_active,
+            'activated_at': row.activated_at,
+            'state': state,
+            'last_resolved_at': row.last_resolved_at,
+            'error': row.last_resolve_error,
+        })
+    return out
+
+
+def login_views(account_id, cfg):
+    """The Logins card's rows (DESIGN-account-providers.md §5, §6.3): each login with its
+    seats, what holds them right now, and whether the server refused it inside the cooldown
+    (`refused`) or ever (`last_refused_at`). The password is never in the view. One query
+    for the rows, one registry read for the holders."""
+    from .. import connection_limits as connlim
+    from .providers import login_shares
+    rows = logins_for_accounts([account_id]).get(account_id, [])
+    if not rows:
+        return []
+    # A shared login is one pool: its count and its holder line cover every account that
+    # holds it, and name the other account's holders (dev/changelog/1170).
+    held = connlim.login_pool_counts([row.id for row in rows])
+    shares = login_shares(account_id, [row.id for row in rows])
+    names = None
+    if shares:
+        names = dict(db.session.query(Account.id, Account.name).all())
+    cooldown = refusal_cooldown(cfg)
+    now = datetime.utcnow()
+    out = []
+    for i, row in enumerate(rows):
+        out.append({
+            'id': row.id,
+            'name': row.name,
+            'username': row.username,
+            'max_connections': row.max_connections,
+            'held': held.get(row.id, 0),
+            'holders': (connlim.describe_pool_holders(row.id, account_id=account_id, names=names)
+                        if held.get(row.id) else ''),
+            'shared_with': shares.get(row.id, []),
+            'refused': (row.last_refused_at is not None
+                        and now - row.last_refused_at < cooldown),
+            'last_refused_at': row.last_refused_at,
+            'last_refused_detail': row.last_refused_detail,
+            'first': i == 0,
+            'last': i == len(rows) - 1,
+        })
+    return out
+
+
+def _effective_settings(account, cfg, logins=()):
     """Each per-account setting, its effective value, and whether it was inherited.
 
     An inherited value is labelled `(global)` on the page (DESIGN.md §17.3), so "6h because
     this account says 6h" and "6h because Settings says 6h" are distinguishable at a glance -
-    they behave differently the moment the global changes."""
+    they behave differently the moment the global changes. While the account holds logins
+    (`logins`, the card's rows) its connection limit is the sum of their seats and the page
+    says `(logins: main, spare)` instead - Account.max_connections is not read for it."""
     global_hours = cfg.get('sync', {}).get('sync_interval_hours', config_default('sync.sync_interval_hours'))
     global_conn = cfg.get('accounts', {}).get('default_max_connections', 1)
     mode = resolve_normalization_mode(account, cfg)
     return {
         'interval_hours': account.sync_interval_hours or global_hours,
         'interval_inherited': account.sync_interval_hours is None,
-        'max_connections': account.max_connections or global_conn,
-        'max_connections_inherited': account.max_connections is None,
+        'max_connections': (sum(lg['max_connections'] for lg in logins) if logins
+                            else account.max_connections or global_conn),
+        'max_connections_inherited': account.max_connections is None and not logins,
+        'max_connections_logins': ', '.join(lg['name'] for lg in logins),
         'norm_mode': mode,
         'norm_label': norm_mode_label(mode) or 'Disabled',
         'norm_example': norm_mode_example(mode),
@@ -272,6 +348,7 @@ def _account_detail_payload(account, cfg, stats):
     # The Activity section renders the ORM rows directly - a different region, server-side,
     # and Jinja's time filters want the datetimes rather than ISO strings.
     logs = [_sync_log_json(log) for log in rows]
+    logins = login_views(account.id, cfg)
     total_syncs = _sync_log_totals(account_ids).get(account.id, 0)
     last_good = next((log for log in rows if log.status == 'SUCCESS'), None)
     # Queried rather than picked out of `rows`: the last ten runs can all be failures, and
@@ -292,7 +369,8 @@ def _account_detail_payload(account, cfg, stats):
         'has_more_syncs': total_syncs > len(logs),
         'last_good_sync': last_good,
         'last_finished_sync': last_finished,
-        'settings': _effective_settings(account, cfg),
+        'logins': logins,
+        'settings': _effective_settings(account, cfg, logins),
         # Which URL form the constructed stream URLs were built in. On the banner because a
         # constructed URL that does not play is nearly always the wrong form, so the form is
         # the first thing to check - it used to be named in the SYNC_STREAM_URLS_CONSTRUCTED
@@ -360,7 +438,10 @@ def account_detail(account_id):
         # menu and the mobile action sheet both light up correctly either way.
         xtream_debug=_xtream_debug_enabled(account),
         stats=stats,
+        hosts=host_views(account.id),
         blocks=block_views([account.id]).get(account.id, []),
+        sibling_blocks=sibling_blocks(account.id),
+        provider=account_provider(account),
         block_max_hours=MAX_ACCOUNT_BLOCK_HOURS,
         sync_sig=sync_sig,
         **payload,
@@ -649,12 +730,20 @@ def _delete_account_and_jobs(account_id):
         AccountStatDay.query.filter_by(account_id=account_id).delete(synchronize_session=False)
         # Nor its blocks, which would otherwise block a future account that reused the id.
         AccountBlock.query.filter_by(account_id=account_id).delete(synchronize_session=False)
+        # Nor its host list, for the same reason (app/account_links.py is its one writer),
+        # nor its login list and the logins no other account holds.
+        delete_hosts_for_account(account_id)
+        delete_logins_for_account(account_id)
         # Nor are its EPG sources, which may hold hundreds of thousands of rows across two
         # tables and are bulk-deleted rather than cascaded (DESIGN-epg-sources.md §9.5).
         delete_sources_for_account(account_id)
         # hidden-recompute-ok: the cascade takes memberships only of channels it deletes
         # too, so no surviving channel loses a protection.
         db.session.delete(account)
+        # A deleted channel may have been the copy its cluster kept; without this the
+        # copies on other accounts stay folded behind a row that no longer exists.
+        db.session.flush()
+        duplicate_streams.recompute(cfg)
         db.session.commit()
         return name
 
@@ -832,8 +921,8 @@ def save_account_api(account_id):
 
 @retry_on_locked()
 def _renormalize_chunk(chunk_ids, mode):
-    """Recompute stream_url/url_normalizable for one chunk of channels from their stored
-    raw_stream_url, under `mode`. Deterministic and idempotent (never inserts a row), so a
+    """Recompute stream_url/url_normalizable/provider_stream_id for one chunk of channels
+    from their stored raw_stream_url, under `mode`. Deterministic and idempotent (never inserts a row), so a
     lock-retry re-running the whole chunk is always safe - unlike an INSERT, there is no
     duplicate-row risk from CLAUDE.md's "one commit per decorated closure" rule."""
     rows = Channel.query.filter(Channel.id.in_(chunk_ids)).all()
@@ -843,15 +932,19 @@ def _renormalize_chunk(chunk_ids, mode):
         if not ch.raw_stream_url:
             continue
         new_url = normalize_url_with_mode(ch.raw_stream_url, mode)
-        normalizable = url_is_normalizable(ch.raw_stream_url)
-        if new_url != ch.stream_url or normalizable != ch.url_normalizable:
-            row = {'id': ch.id, 'stream_url': new_url, 'url_normalizable': normalizable}
+        # One parse for both, as in _upsert_channels, so the pair can never disagree.
+        provider_sid = url_provider_stream_id(ch.raw_stream_url)
+        normalizable = provider_sid is not None
+        if (new_url != ch.stream_url or normalizable != ch.url_normalizable
+                or provider_sid != ch.provider_stream_id):
+            row = {'id': ch.id, 'stream_url': new_url, 'url_normalizable': normalizable,
+                   'provider_stream_id': provider_sid}
             if new_url != ch.stream_url:
                 # stream_url is one of the four columns ch_fts indexes, so rewriting it
                 # genuinely moves the channels search index's source and has to stamp the
                 # watermark (app/database.py::Channel.search_text_updated_at). This is the
                 # only writer of an indexed column outside _upsert_channels; url_normalizable
-                # is not indexed and must not stamp on its own.
+                # and provider_stream_id are not indexed and must not stamp on their own.
                 row['search_text_updated_at'] = stamped_at
             mappings.append(row)
     if mappings:
@@ -883,7 +976,7 @@ def renormalize_urls_api(account_id):
     for chunk in _chunked(ids, _DELETE_CHUNK_SIZE):
         changed += _renormalize_chunk(chunk, mode)
     if changed:
-        recompute_duplicate_stream_urls_and_commit()
+        duplicate_streams.recompute_and_commit()
 
     label = norm_mode_label(mode) or 'the global default'
     message = (f'Re-normalized {changed} of {len(ids)} channel URL(s) to {label}.' if changed
@@ -970,6 +1063,159 @@ def unblock_account_api(account_id, block_id):
         end_account_block(block_id)
     rearm_waiting_starts()
     return jsonify({'success': True, 'message': f'Account "{account.name}" unblocked.'})
+
+
+@accounts_bp.route('/api/accounts/<int:account_id>/hosts', methods=['POST'])
+def add_host_api(account_id):
+    """Add a host to the account's list (app/account_links.py). Body: `host`, a bare
+    `name[:port]` or a pasted URL, which is reduced to its host. The first add also seeds
+    the host the account's URLs carry today as the active one, and the response says so."""
+    account, err = _json_account(account_id)
+    if err:
+        return err
+    data = request.get_json(silent=True) or {}
+    before = hosts_for_accounts([account_id]).get(account_id, [])
+    try:
+        row = add_host(account_id, str(data.get('host') or ''))
+    except ValueError as exc:
+        return jsonify({'error': str(exc)}), 400
+    after = hosts_for_accounts([account_id]).get(account_id, [])
+    seeded = [r.host for r in after if r.id != row.id and r.id not in {b.id for b in before}]
+    message = f'{row.host} added to {account.name}\'s host list.'
+    if seeded:
+        message += (f' {seeded[0]} is the host this account\'s stream URLs use now, so it was '
+                    f'listed first and is the active one.')
+    elif row.is_active:
+        message += ' It is the active host.'
+    return jsonify({'success': True, 'message': message, 'host_id': row.id})
+
+
+@accounts_bp.route('/api/accounts/<int:account_id>/hosts/<int:host_id>', methods=['DELETE'])
+def remove_host_api(account_id, host_id):
+    """Take a host off the list. The active host is refused while another is listed."""
+    account, err = _json_account(account_id)
+    if err:
+        return err
+    try:
+        name = remove_host(account_id, host_id)
+    except LookupError as exc:
+        return jsonify({'error': str(exc)}), 404
+    except ValueError as exc:
+        return jsonify({'error': str(exc)}), 409
+    return jsonify({'success': True, 'message': f'{name} removed from {account.name}\'s host list.'})
+
+
+@accounts_bp.route('/api/accounts/<int:account_id>/hosts/<int:host_id>/activate', methods=['POST'])
+def activate_host_api(account_id, host_id):
+    """The user's own switch: every stream URL on the account moves to this host now."""
+    account, err = _json_account(account_id)
+    if err:
+        return err
+    try:
+        summary = set_active_host(account_id, host_id)
+    except LookupError as exc:
+        return jsonify({'error': str(exc)}), 404
+    n = summary['channels']
+    message = (f'{account.name} now uses {summary["host"]}: {n:,} stream URL{"" if n == 1 else "s"} '
+               f'rewritten')
+    if summary['account_urls']:
+        message += ', and the account\'s own URL'
+    message += '.'
+    return jsonify({'success': True, 'message': message, **summary})
+
+
+def _login_seat_prefill(account):
+    """What the add-login dialog pre-fills seats with: the Xtream-reported cap when one is
+    known, else the account's effective limit (DESIGN-account-providers.md §3.2)."""
+    if account.provider_max_connections:
+        return int(account.provider_max_connections)
+    return int(account.max_connections
+               or load_config().get('accounts', {}).get('default_max_connections', 1))
+
+
+@accounts_bp.route('/api/accounts/<int:account_id>/logins', methods=['GET'])
+def logins_api(account_id):
+    """The add/edit dialogs' values: every login without its password (never served back,
+    as the account's own password is not), and the seat count a new one pre-fills with."""
+    account, err = _json_account(account_id)
+    if err:
+        return err
+    return jsonify({
+        'success': True,
+        'logins': [{'id': lg['id'], 'name': lg['name'], 'username': lg['username'],
+                    'max_connections': lg['max_connections']}
+                   for lg in login_views(account_id, load_config())],
+        'seat_prefill': _login_seat_prefill(account),
+    })
+
+
+def _login_fields(data):
+    return (str(data.get('name') or ''), str(data.get('username') or ''),
+            str(data.get('password') or ''), data.get('max_connections'))
+
+
+@accounts_bp.route('/api/accounts/<int:account_id>/logins', methods=['POST'])
+def add_login_api(account_id):
+    """Add a login to the account's list (app/account_links.py). Body: `name`, `username`,
+    `password`, `max_connections`."""
+    account, err = _json_account(account_id)
+    if err:
+        return err
+    data = request.get_json(silent=True) or {}
+    try:
+        row = add_login(account_id, *_login_fields(data))
+    except ValueError as exc:
+        return jsonify({'error': str(exc)}), 400
+    return jsonify({'success': True, 'login_id': row.id,
+                    'message': (f'Login "{row.name}" added to {account.name} with '
+                                f'{row.max_connections} seat{"" if row.max_connections == 1 else "s"}.')})
+
+
+@accounts_bp.route('/api/accounts/<int:account_id>/logins/<int:login_id>', methods=['POST'])
+def update_login_api(account_id, login_id):
+    """Edit a login. A blank `password` keeps the stored one."""
+    account, err = _json_account(account_id)
+    if err:
+        return err
+    data = request.get_json(silent=True) or {}
+    try:
+        row = update_login(account_id, login_id, *_login_fields(data))
+    except LookupError as exc:
+        return jsonify({'error': str(exc)}), 404
+    except ValueError as exc:
+        return jsonify({'error': str(exc)}), 400
+    return jsonify({'success': True, 'message': f'Login "{row.name}" saved.'})
+
+
+@accounts_bp.route('/api/accounts/<int:account_id>/logins/<int:login_id>', methods=['DELETE'])
+def remove_login_api(account_id, login_id):
+    """Take a login off the list. A capture seated on it keeps its seat until it ends."""
+    account, err = _json_account(account_id)
+    if err:
+        return err
+    try:
+        name = remove_login(account_id, login_id)
+    except LookupError as exc:
+        return jsonify({'error': str(exc)}), 404
+    return jsonify({'success': True,
+                    'message': f'Login "{name}" removed from {account.name}\'s list.'})
+
+
+@accounts_bp.route('/api/accounts/<int:account_id>/logins/<int:login_id>/move', methods=['POST'])
+def move_login_api(account_id, login_id):
+    """Move a login one step up or down the list - the order seats are taken in. Body:
+    `direction`, `up` or `down`."""
+    account, err = _json_account(account_id)
+    if err:
+        return err
+    data = request.get_json(silent=True) or {}
+    try:
+        order = move_login(account_id, login_id, str(data.get('direction') or ''))
+    except LookupError as exc:
+        return jsonify({'error': str(exc)}), 404
+    except ValueError as exc:
+        return jsonify({'error': str(exc)}), 400
+    return jsonify({'success': True, 'order': order})
 
 
 @accounts_bp.route('/api/accounts/<int:account_id>/sync', methods=['POST'])

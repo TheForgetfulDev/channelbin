@@ -72,6 +72,7 @@ from sqlalchemy import (String, and_, case, cast, func, literal_column, not_, or
 
 from . import db, health_bands
 from .channel_groups import guide_scope_channel_ids, guide_scope_group_member_ids
+from .duplicate_streams import effective_health, in_any_group_expr  # noqa: F401 - re-exported: the search's callers read them here
 from .database import (Account, AccountSyncLog, Channel, ChannelGroup,
                        ChannelGroupMember, EPGEntry, Tag)
 from .search_index import (AIRING_PROBE_MAX_ROWS, SEARCH_INDEX_CHANNELS, SEARCH_INDEX_NAMES,
@@ -235,16 +236,6 @@ HEALTH_UNTESTED_LABEL = health_bands.UNTESTED_LABEL
 HEALTH_VALUES = health_bands.BAND_KEYS + (HEALTH_UNTESTED,)
 
 
-def effective_health():
-    """The score the badges show: the observed score plus the manual adjustment.
-
-    Deliberately unclamped. `health_score_badge` clamps to 0-100 for display, but clamping
-    cannot move a value across the 80 or 50 cut points, so banding on the raw sum is the same
-    answer with one less expression in every query.
-    """
-    return Channel.health_score + Channel.manual_health_adjustment
-
-
 def health_band_expr(cfg):
     """A channel's health band as SQL - the one spelling, shared with app/account_stats.py so
     the Accounts pages' band counts equal what the `f.health` jump-off finds."""
@@ -403,7 +394,14 @@ OTHER_IN_GUIDE = 'guide'
 #: it. Everything asking the wider question still goes through guide_scope_channel_ids().
 OTHER_GUIDE_OWN_ROW = 'guiderow'
 OTHER_GUIDE_VIA_GROUP = 'guidegroup'
+#: "Is the same stream as another channel" - the duplicate fold's cluster, whichever key put
+#: it there. The value is still spelled `dupurl` because it is part of the URL contract: it
+#: predates the provider key, and a rename would 400 every saved link to it.
 OTHER_DUP_URL = 'dupurl'
+#: The channel's account is on a provider. Excluding it is how you find the channels the
+#: provider-keyed fold cannot reach - an account that shares streams with a provider's
+#: accounts but was never put on it (DESIGN-account-providers.md §8.3).
+OTHER_PROVIDER = 'provider'
 #: Coverage RIGHT NOW: something re-checks this channel on a schedule. Deliberately a
 #: different question from the `showuntested` standing option, which is about whether the
 #: channel was ever tested at all - a fact about the past that says nothing about whether
@@ -417,7 +415,7 @@ OTHER_DUP_URL = 'dupurl'
 #: filter calls unmonitored while the group page says it is being checked.
 OTHER_MONITORED = 'monitored'
 OTHER_VALUES = (OTHER_REMOVED, OTHER_NEW, OTHER_IN_GUIDE, OTHER_GUIDE_OWN_ROW,
-                OTHER_GUIDE_VIA_GROUP, OTHER_DUP_URL, OTHER_MONITORED)
+                OTHER_GUIDE_VIA_GROUP, OTHER_DUP_URL, OTHER_PROVIDER, OTHER_MONITORED)
 #: The rail's wording for those four, from the approved mockup. Here rather than in the
 #: template because the values are a registry and their labels are part of it - a page that
 #: spelled them itself would be a second vocabulary to keep in step.
@@ -427,7 +425,8 @@ OTHER_LABELS = {
     OTHER_IN_GUIDE: 'In your guide',
     OTHER_GUIDE_OWN_ROW: 'Has its own guide row',
     OTHER_GUIDE_VIA_GROUP: 'In the guide via a group',
-    OTHER_DUP_URL: 'Duplicated stream URL',
+    OTHER_DUP_URL: 'Duplicated stream',
+    OTHER_PROVIDER: 'On a provider',
     OTHER_MONITORED: 'Monitored by a health check',
 }
 
@@ -1732,30 +1731,10 @@ def _tag_predicate(tag: Tag, indexed: bool, grain: str = GRAIN_CHANNELS, narrow:
 
 
 def _missing_predicate(ctx: 'SearchContext'):
-    """The 'deleted by provider' half of accounts.channel_lifecycle_state(), as SQL.
-
-    Kept deliberately parallel to accounts.missing_channels_query() - if that condition
-    changes, this changes with it.
-
-    Spelled as an EXISTS rather than a join so it composes into a WHERE clause without
-    changing the shape of the query it lands in. De-correlating it into one OR branch per
-    account looks like it should be faster - there are only four accounts - and was measured
-    twice as slow (62.9ms vs 32.2ms), because the OR chain costs the account index. Measured
-    2026-07-30; do not "optimize" it back.
-    """
-    missing_days = (ctx.cfg or {}).get('sync', {}).get('channel_missing_after_days', 7)
-    if missing_days <= 0:
-        return db.false()
-    cutoff = datetime.utcnow() - timedelta(days=missing_days)
-    return and_(
-        Channel.last_seen_at.isnot(None),
-        Channel.last_seen_at < cutoff,
-        select(Account.id).where(
-            Account.id == Channel.account_id,
-            Account.last_sync_at.isnot(None),
-            Account.last_sync_at > Channel.last_seen_at,
-        ).exists(),
-    )
+    """The 'deleted by provider' half of accounts.channel_lifecycle_state(), as SQL - one
+    spelling, shared with the duplicate fold's feed rung."""
+    from .accounts import missing_channel_expr
+    return missing_channel_expr(ctx.cfg)
 
 
 def _new_predicate(ctx: 'SearchContext'):
@@ -1969,7 +1948,11 @@ def _value_predicate(dim_key: str, value: str, ctx: 'SearchContext', grain: str 
             # subtracting one from the other would stop the two values ORing back to `guide`.
             return Channel.id.in_(guide_scope_group_member_ids())
         if value == OTHER_DUP_URL:
-            return Channel.is_duplicate_stream_url.is_(True)
+            return Channel.is_duplicate_stream
+        if value == OTHER_PROVIDER:
+            if not ctx.provider_account_ids:
+                return db.false()
+            return Channel.account_id.in_(sorted(ctx.provider_account_ids))
         if value == OTHER_MONITORED:
             # A bound id list, and not by preference: the set is decided in Python, so
             # there is nothing to correlate. Read off `ctx` so the ~60ms behind it is paid
@@ -2039,65 +2022,26 @@ def dimension_predicates(state: SearchState, ctx: 'SearchContext', skip: str = '
 # Standing options -> SQL
 # ---------------------------------------------------------------------------
 
-def in_any_group_expr():
-    """"Is this channel in any channel group at all" as a correlated EXISTS, for use as a
-    keep-rule rung. ANY group, deliberately - not only one that is in the guide.
+def _folds_url_duplicates_only(state) -> bool:
+    """Does this search keep provider-keyed duplicates on screen while "Show duplicates" is
+    off. Two places do, and both because the copies are not interchangeable there
+    (DESIGN-account-providers.md §8.4, §8.5):
 
-    A channel sitting in a health-check-only group is one the user deliberately curated and
-    is monitoring, so a rule that only protected in-guide members would hide it in favour of
-    an untouched copy of the same stream - deliberate, see dev/changelog/759. It is also the
-    cheaper of the two spellings and the one that reads as a single sentence in the KEPT
-    tooltip, which the guide-scope variant did not.
+    * a group's `+ Add channels`, where the person is choosing a backup and a copy the list
+      folded away is a backup nobody adds;
+    * the airing grain, where the copies come from different accounts with different guides
+      and the point is to search every guide.
 
-    Correlated rather than an id set: it runs inside a window ORDER BY over only the ~1,600
-    rows flagged is_duplicate_stream_url, and channel_group_members is indexed on channel_id,
-    so each row costs one index seek. Measured at +1.2ms over the whole cascade on the live
-    database - the guide-scope variant measured +1.3ms, i.e. neither cost decided this.
-    """
-    return select(ChannelGroupMember.id).where(
-        ChannelGroupMember.channel_id == Channel.id).correlate(Channel).exists()
+    Two rows with the same URL are the same row everywhere, so those still fold."""
+    return state is not None and (
+        state.grain == GRAIN_AIRINGS or state.add_to_group is not None)
 
 
-def _duplicate_losers():
-    """Channels hidden while "Show duplicates" is off: every member of a shared-stream_url
-    cluster except the one kept.
-
-    The keep rule is a CASCADE, not five exclusive rules - each rung only gets a say when
-    the one above it ties: not hidden, then already in your guide, then in a channel group,
-    then the best health score, then the lowest channel id (mockup 21 round 6; the group rung
-    added by dev/changelog/759, the hidden rung by dev/changelog/775). SQLite sorts NULL
-    lowest, so DESC puts a never-scored channel behind a scored one, which is what the rule
-    intends.
-
-    **The hidden rung is at the top and is not optional.** This ranks over the whole channels
-    table, so without it a cluster whose KEPT copy the user hid makes every remaining copy a
-    loser - and with `hidden` and `dup` both defaulting on, the stream then disappears from
-    the search entirely rather than falling back to a visible copy. A hidden channel must
-    never win a cluster, whatever the search says.
-
-    **`channel_search_rows._keep_rank()` spells this same cascade in Python** so the KEPT
-    badge can name the rung that decided a row. The two are one rule and must move together:
-    a badge explaining a rung this query does not apply is a badge that lies.
-
-    Computed over the whole channels table rather than the filtered set, on purpose: which
-    copy is KEPT must not change because the user typed something. Only the ~1,600 rows
-    already flagged is_duplicate_stream_url take part.
-    """
-    ranked = (
-        select(Channel.id.label('id'),
-               func.row_number().over(
-                   partition_by=Channel.stream_url,
-                   order_by=[Channel.hidden.asc(),
-                             Channel.in_guide.desc(),
-                             in_any_group_expr().desc(),
-                             effective_health().desc(),
-                             Channel.id.asc()]).label('rn'))
-        .where(Channel.is_duplicate_stream_url.is_(True))
-        .subquery()
-    )
-    return (select(ranked.c.id)
-            .group_by(ranked.c.id)
-            .having(func.min(ranked.c.rn) > 1))
+def _provider_keyed(ctx: 'SearchContext'):
+    """duplicate_streams.provider_keyed_expr() with the account lookup already resolved -
+    the context holds every account, so this is a constant list rather than a subquery."""
+    return and_(Channel.provider_stream_id.isnot(None),
+                Channel.account_id.in_(sorted(ctx.provider_account_ids)))
 
 
 def _standing_reject(key: str, ctx: 'SearchContext', row_preds=(), state=None):
@@ -2131,7 +2075,13 @@ def _standing_reject(key: str, ctx: 'SearchContext', row_preds=(), state=None):
         # re-derive any of them. Measured at +2ms on a 100ms channel-grain scan.
         return Channel.hidden.is_(True)
     if key == 'showdup':
-        return Channel.id.in_(_duplicate_losers())
+        # The stored answer, off the column (app/duplicate_streams.py): every member of a
+        # cluster except the copy kept. Ranking it here instead cost 6.6s a search once
+        # accounts were on a provider (dev/changelog/1172).
+        loser = Channel.is_duplicate_loser.is_(True)
+        if _folds_url_duplicates_only(state) and ctx.provider_account_ids:
+            return and_(loser, not_(_provider_keyed(ctx)))
+        return loser
     if key == 'shownotnorm':
         # Only meaningful for an account that actually normalizes: with the mode disabled
         # the provider's URL is what it is, and "normalization left it alone" describes
@@ -2459,7 +2409,8 @@ def _group_other_predicate(value: str, ctx: 'SearchContext'):
     """
     if value in (OTHER_IN_GUIDE, OTHER_GUIDE_VIA_GROUP):
         return ChannelGroup.in_guide.is_(True)
-    if value in (OTHER_GUIDE_OWN_ROW, OTHER_REMOVED, OTHER_NEW, OTHER_DUP_URL):
+    if value in (OTHER_GUIDE_OWN_ROW, OTHER_REMOVED, OTHER_NEW, OTHER_DUP_URL,
+                 OTHER_PROVIDER):
         return db.false()
     if value == OTHER_MONITORED:
         monitored = ctx.monitored_channel_ids()
@@ -2557,11 +2508,7 @@ def group_member_preds(state: SearchState, ctx: 'SearchContext', narrowing: list
     **A cluster option decides which COPY of a duplicated feed to show. It says nothing
     about whether a group matches what you typed**, which is the only question this asks -
     the row it puts on screen is the GROUP's, not the member's, so "show me one of these
-    three identical channels" has no bearing on it. It is also by far the most expensive
-    predicate the engine has: `showdup` ranks a window over every duplicate row in the
-    table, and including it here paid that a second time per keystroke. Measured on the live
-    database (112,968 channels): a `q=news` row request went 345ms -> 240ms with it dropped,
-    and `q=football` 144ms -> 116ms.
+    three identical channels" has no bearing on it.
     """
     return list(narrowing) + [
         pred for key, pred in standing_predicates(state, ctx, narrowing, by_key=True)
@@ -2705,6 +2652,10 @@ class SearchContext:
     #: account is loaded here anyway for normalizing_account_ids, so keeping them costs
     #: nothing and gives the row builder its own batched source.
     accounts_by_id: dict = field(default_factory=dict)
+    #: Accounts on a provider. Their channels with a stream id are keyed by (provider, id) in
+    #: the duplicate fold rather than by URL - read here so the two places that treat those
+    #: copies differently need no subquery.
+    provider_account_ids: frozenset = frozenset()
     #: ONE clock for the whole request. Every `when` value, the `past` option and the Record
     #: button's five states are answered against this, so a search cannot report a showing as
     #: "on now" in one predicate and "ended" in the next because the second ran a second later.
@@ -2807,6 +2758,8 @@ class SearchContext:
                    readiness=readiness_map(),
                    tags_by_name={t.name: t for t in tags},
                    accounts_by_id={a.id: a for a in accounts},
+                   provider_account_ids=frozenset(
+                       a.id for a in accounts if a.provider_id is not None),
                    now=now, display_tz=tz,
                    day_bounds={WHEN_TODAY: (days[0], days[1]),
                                WHEN_TOMORROW: (days[1], days[2])})
@@ -3318,7 +3271,7 @@ def _search_channels(state: SearchState, ctx: SearchContext,
         pages=pages,
         standing_hidden=hidden,
         facets=compute_facets(state, ctx, text_preds=text_preds) if want_facets else {},
-        kept_ids=_kept_ids(state, rows),
+        kept_ids=_kept_ids(state, rows, ctx),
         degraded=degraded_reason(state, ctx),
     )
 
@@ -3451,7 +3404,8 @@ def full_scan_reason(state: SearchState) -> str:
 #: (which toggles are on, the data) whenever nothing else is narrowing the result, so it is
 #: memoized the same shape as #15's per-tag cache (`_tag_channel_ids_cache`,
 #: dev/changelog/597) - watermark-invalidated, keyed by the toggle combination plus the one
-#: config-driven fact (`normalizing_account_ids`) the channels/programs watermark cannot see.
+#: facts (`normalizing_account_ids` from config, `provider_account_ids` from the accounts
+#: table) the channels/programs watermark cannot see.
 #:
 #: A TTL backstops the watermark rather than replacing it: the watermark
 #: (MAX(id)/MAX(last_seen_at) on channels, MAX(id) on epg_entries) does NOT move when a health
@@ -3488,7 +3442,8 @@ def _cached_standing_breakdown(state: SearchState, ctx: SearchContext, narrowing
         return None
 
     key = (tuple(s.key for s in active_standing(state)),
-          tuple(sorted(ctx.normalizing_account_ids)))
+          tuple(sorted(ctx.normalizing_account_ids)),
+          tuple(sorted(ctx.provider_account_ids)))
     watermark = (source_watermark(SEARCH_INDEX_CHANNELS),
                 source_watermark(SEARCH_INDEX_PROGRAMS))
     ttl = ctx.cfg.get('search', {}).get('standing_breakdown_cache_ttl_seconds', 300)
@@ -3575,17 +3530,25 @@ def _standing_breakdown_compute(state: SearchState, ctx: SearchContext, narrowin
     return {k: n for k, n in counts.items() if n}, total, matched
 
 
-def _kept_ids(state: SearchState, rows: list) -> frozenset:
+def _kept_ids(state: SearchState, rows: list, ctx: 'SearchContext') -> frozenset:
     """Which of the rows on this page are the surviving copy of a duplicate cluster - what
     the KEPT badge is drawn from. Only meaningful while duplicates are being hidden: with
-    "Show duplicates" ticked every copy is shown and none of them is "the one kept"."""
+    "Show duplicates" ticked every copy is shown and none of them is "the one kept". The
+    same goes for a provider-keyed cluster on a search that leaves those unfolded."""
     if not standing_applied(state.standing, 'showdup'):
         return frozenset()
-    # A page can now hold group rows too, and a group has no stream URL to duplicate. Asked
-    # by attribute rather than by isinstance so this keeps working for any row kind added
-    # later that is equally not a channel.
-    return frozenset(r.id for r in rows
-                     if getattr(r, 'is_duplicate_stream_url', False))
+    unfolded = _folds_url_duplicates_only(state)
+
+    def kept(row) -> bool:
+        # A page can hold group rows too, and a group has no stream to duplicate. Asked by
+        # attribute rather than by isinstance so this keeps working for any row kind added
+        # later that is equally not a channel.
+        if getattr(row, 'duplicate_cluster_id', None) is None or row.is_duplicate_loser:
+            return False
+        return not (unfolded and row.provider_stream_id is not None
+                    and row.account_id in ctx.provider_account_ids)
+
+    return frozenset(r.id for r in rows if kept(r))
 
 
 # ---------------------------------------------------------------------------

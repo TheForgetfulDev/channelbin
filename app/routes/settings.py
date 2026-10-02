@@ -460,6 +460,12 @@ def api_settings_field():
         schedule_all_account_syncs(current_app._get_current_object(),
                                    force_reschedule_defaults=True)
 
+    # The host check job is registered with its interval baked in, so a changed interval
+    # re-arms it rather than waiting out the old one (app/account_links.py).
+    if path == 'hosts.check_interval_hours':
+        from ..scheduler import schedule_host_resolve_check
+        schedule_host_resolve_check(current_app._get_current_object())
+
     # start/end are re-read live by the dispatcher and window_close, so this is purely
     # about keeping hc_window_close's CronTrigger and every window check's displayed
     # next-run in sync with a changed end time - not a prerequisite for the new bounds

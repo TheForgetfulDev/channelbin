@@ -181,20 +181,23 @@ def write_sandbox_config(path, data):
     run (dev/changelog/724). Production forbids the same shape for the same reason
     (CLAUDE.md "config.yaml is written atomically, under one lock", dev/changelog/671).
 
-    Reuses app/config.py's own primitives rather than restating them - temp file in the
-    target's OWN directory (os.replace() is atomic only within one filesystem), fsync,
-    permissions carried forward, atomic replace - so a reader sees the old file or the new
-    one and never a torn one. The parsed-config cache is dropped inside the lock, so no
-    reader can cache pre-write content under a post-write stat key.
+    Reuses app/config.py's own temp-file primitive rather than restating it - temp file in
+    the target's OWN directory (os.replace() is atomic only within one filesystem), then an
+    atomic replace - so a reader sees the old file or the new one and never a torn one. The
+    parsed-config cache is dropped inside the lock, so no reader can cache pre-write content
+    under a post-write stat key.
+
+    What production's writer does and this deliberately does not: fsync the file and its
+    directory. That guards a power loss, which a temp file deleted seconds later cannot
+    care about, and the two syncs were ~3ms of every make_test_app() (dev/changelog/1167).
+    The rename is what defends against the torn read; the fsync never was.
     """
     with cfgmod.config_write_lock:
         fd, tmp_path = cfgmod._config_tmp_file(path)
         try:
             with os.fdopen(fd, 'w') as f:
                 yaml.dump(data, f)
-                f.flush()
-                os.fsync(f.fileno())
-            cfgmod._finish_replace(tmp_path, path)
+            os.replace(tmp_path, path)
         except BaseException:
             try:
                 os.unlink(tmp_path)
@@ -335,7 +338,9 @@ def reset_module_globals():
     tests/test_global_state_isolation.py's allowlist with a reason. That test is what keeps
     this list from rotting the next time one is added.
     """
+    import app.account_links as account_links
     import app.account_stats as account_stats
+    import app.connection_limits as connection_limits
     import app.admission as admission
     import app.auth as auth
     import app.channel_search as channel_search
@@ -374,6 +379,13 @@ def reset_module_globals():
     # seed will reuse, so its first recording or test is refused at the limit. Stopped
     # (ffmpeg killed, slot released) and forgotten, never just cleared.
     preview.reset_for_tests()
+    # A roll attempt recorded by one module's stall test puts the next module's roll inside
+    # the cooldown, so its resolution failure rolls nothing.
+    account_links._last_roll_attempt.clear()
+    # Where each held seat was counted. A seat a module's test took and never released
+    # would otherwise be released into the wrong pool by the next module's teardown; the
+    # holder lists themselves are cleared by the tests that take seats.
+    connection_limits._seat_of.clear()
     # rebuild_in_progress() True makes the dashboard's background-activity indicator read
     # 'active' when the next module expects 'hidden'.
     search_index._rebuilding = False

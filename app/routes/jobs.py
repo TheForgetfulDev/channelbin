@@ -427,6 +427,7 @@ def _build_job_list():
                                  '/settings?q=index_janitor_grace_minutes'),
         'storage_dirs_check': ('Storage Folder Check', '/maintenance'),
         'account_stats_fold': ('Account Stats Update', '/accounts'),
+        'host_resolve_check': ('Stream Host Check', '/settings?q=hosts'),
         # Never a job id of its own - only ever seen as `channel_hide_materialize_retry`,
         # the one-shot queued when a hide-rule pass was refused. Named here so the retry
         # branch below renders it as "Hide Rules retry" rather than a raw job id
