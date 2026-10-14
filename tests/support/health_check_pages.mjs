@@ -334,7 +334,9 @@ await record('channel_add_to_group_warned', async (start) => {
       '/api/channel-groups': () => ({ groups: [{ id: 9, name: 'Pair', member_count: 1, in_guide: true }] }),
       '/api/channel-groups/9/members': (opts) => (JSON.parse(opts.body).force
         ? { success: true, group_id: 9, group_name: 'Pair', added: [1] }
-        : { success: false, provider_copies: [{ text: 'direct: <b>One</b> is the same channel as curated: One.' }] }),
+        : { success: false, duplicate_warning: true, dup_groups: [{ suggested_keep_id: 2, provider: '<b>Strong</b>',
+          channels: [{ channel_id: 2, channel_name: 'One', account_name: 'curated' },
+                     { channel_id: 1, channel_name: 'One', account_name: 'direct' }] }] }),
     },
   });
   await c.settle();

@@ -1,0 +1,225 @@
+{% extends "base.html" %}
+{% import "_macros.html" as m %}
+{% block title %}{{ rule.name }} - Auto-record rules - ChannelBin{% endblock %}
+
+{#  One auto-record rule (DESIGN-autoschedule.md §8, mockup 42, dev/changelog/1189). The group
+    page's shell: the header, the banners and the status bar say what the rule is doing and
+    what is wrong with it right now and never move; everything in #rule-sections is a card
+    Customize sections can reorder or hide, one layout for every rule.
+
+    Everything here comes from auto_rules_view.page_context(), a fixed number of queries
+    however long the rule's history is. static/js/rule-detail.js swaps .gd-head,
+    .gd-statezone and #rule-sections for a fresh render after an action, and #rule-history
+    alone when a History filter or "Show more" is clicked - the template is the one
+    renderer. The Settings chips are drawn by util.js renderSettingChips() from the
+    data-items on #rule-setbar, which travels with the swap. #}
+
+{% macro ledger(rows, past) -%}
+<div class="table-scroll">
+  <table class="tbl tbl-cards rl-tbl">
+    <thead><tr>
+      <th>{{ 'Aired' if past else 'When' }}</th><th>Program</th><th>Channel</th>
+      <th>{{ 'Outcome' if past else 'Decision' }}</th><th>Why</th>
+    </tr></thead>
+    <tbody>
+      {% for e in rows %}
+      <tr>
+        <td data-label="{{ 'Aired' if past else 'When' }}" class="rl-when"><span class="day">{{ e.day }}</span>{{ e.time }}</td>
+        <td data-label="Program" class="rl-prog"><span class="t">{{ e.title }}</span>{% if e.sub %}<span class="s">{{ e.sub }}</span>{% endif %}</td>
+        <td data-label="Channel" class="rl-where">{{ e.where }}{% if e.via %}<span class="via">via {{ e.via }}</span>{% endif %}</td>
+        <td data-label="{{ 'Outcome' if past else 'Decision' }}">{{ m.status_badge(e.badge[0], e.badge[1], pulse=e.pulse) }}</td>
+        <td data-label="Why" class="rl-why">
+          {%- for text, cls in e.detail %}{% if cls %}<span class="{{ cls }}">{{ text }}</span>{% else %}{{ text }}{% endif %}{% endfor %}
+          {%- if e.fate or e.rec %}<span class="fate">{{ e.fate }}{% if e.rec %} <a href="{{ url_for('recordings.recording_detail', recording_id=e.rec.id) }}">{{ e.rec.name }} &rarr;</a>{% endif %}</span>{% endif -%}
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{%- endmacro %}
+
+{% block content %}
+<div class="page-head">
+  <h1>Auto-record rules</h1>
+  <a href="{{ url_for('auto_rules.rules_page') }}" class="btn">&larr; All Rules</a>
+</div>
+
+<div class="gd-head">
+  <div class="gd-head-main">
+    <div class="gd-title">
+      <h2>{{ rule.name }}</h2>
+      <span class="badge {{ badge[0] }} tip-plain" data-tip="{{ badge_tip }}">{{ badge[1] }}</span>
+    </div>
+    <p class="gd-sub-lead">{{ lead }}</p>
+  </div>
+  <div class="gd-dates">
+    Added {{ added }}{% if changed %}<br>Changed {{ changed }}{% endif %}
+  </div>
+</div>
+
+{# The banners and the status bar. On a phone the bar comes first (.gd-statezone, the group
+   page's R5): the rule's own controls must not sit below its advisories. #}
+<div class="gd-statezone">
+  {% for tone, strong, text, action in notices %}
+  <div class="notice notice-{{ tone }}{{ ' notice-act' if action else '' }}">
+    <div><strong>{{ strong }}</strong> {{ text }}</div>
+    {% if action == 'edit-search' %}
+    <a class="btn btn-sm" href="{{ rule.edit_search_url }}">Edit search</a>
+    {% elif action == 'resume' %}
+    <button class="btn btn-sm" data-act="resume">Resume</button>
+    {% endif %}
+  </div>
+  {% endfor %}
+
+  {# What the dialogs act on rides here, inside the region a swap replaces, so it is never
+     older than the page around it. #}
+  <div class="gd-actionbar" id="rule-actionbar" data-dialog="{{ dialog | tojson | forceescape }}"
+       data-scheduled="{{ rule.scheduled }}">
+    <span class="badge {{ badge[0] }} tip-plain" data-tip="{{ badge_tip }}">{{ badge[1] }}</span>
+    <span class="gd-ab-msg">{{ action_message }}</span>
+    <div class="gd-ab-actions">
+      {# A link, like the group page's + Add Channels: it opens the Programs search on an
+         errand (the `rule` action context) rather than doing the work here. #}
+      <a class="btn btn-primary btn-sm" href="{{ rule.edit_search_url }}"
+         data-tip="Edit search.&#10;Opens the Programs search with this rule's search loaded. What it finds is what the rule records once you save it.">Edit search</a>
+      {% if rule.enabled %}
+      <button class="btn btn-sm" data-act="pause">Pause</button>
+      {% else %}
+      <button class="btn btn-sm" data-act="resume">Resume</button>
+      {% endif %}
+      <span class="menu-wrap">
+        <button class="btn btn-sm btn-icon" data-menu aria-label="More actions">&#8943;</button>
+        <div class="menu pop-left">
+          <button class="menu-item" data-act="edit">Edit settings&hellip;</button>
+          <a class="menu-item" href="{{ rule.search_url }}">Open search</a>
+          <button class="menu-item" data-act="sections">Customize sections&hellip;</button>
+          <div class="sep"></div>
+          <button class="menu-item danger" data-act="delete">Delete rule</button>
+        </div>
+      </span>
+    </div>
+  </div>
+</div>
+
+<div class="gd-sections" id="rule-sections">
+
+  <div class="card" data-section="coming">
+    <div class="card-head"><h2>Coming up{% if coming %} <span class="cnt">{{ coming | length }}</span>{% endif %}</h2></div>
+    <div class="card-body">
+      {% if coming %}
+      <p class="card-note">Every showing ahead that this rule has judged, and what it decided. A
+        recording it scheduled can be opened, edited or cancelled like any other; a cancelled one
+        stays cancelled.</p>
+      {{ ledger(coming, false) }}
+      {% elif state == 'new' %}
+      <p class="card-note">Nothing yet - the first check has not run.</p>
+      {% elif state == 'broken' %}
+      <p class="card-note">Nothing new is judged while the rule is not running.</p>
+      {% elif state == 'paused' %}
+      <p class="card-note">Nothing - a paused rule judges nothing new.</p>
+      {% else %}
+      <p class="card-note">Nothing it matches is in the guide yet{% if checks.reach not in ('Nothing listed', '-') %}, which reaches {{ checks.reach }}{% endif %}. The guide is checked every hour.</p>
+      {% endif %}
+    </div>
+  </div>
+
+  <div class="card" data-section="search">
+    <div class="card-head">
+      <h2>What it searches for</h2>
+      <div class="card-head-actions">
+        <a class="btn btn-sm" href="{{ rule.search_url }}">Open search <span class="arw">&rarr;</span></a>
+        <a class="btn btn-sm" href="{{ rule.edit_search_url }}">Edit search</a>
+      </div>
+    </div>
+    <div class="card-body">
+      <div class="statlist rl-search-lines">
+        {% if search %}
+        {% for ln in search.lines %}
+        <div class="srow"><span class="sk">{{ ln.label }}</span><span class="sv">
+          {%- if ln.neg %}not {% endif -%}
+          {%- for v in ln['values'] %}{% if not loop.first %} or {% endif %}{{ v.text }}{% if v.gone %} <span class="gone">(no longer exists)</span>{% endif %}{% endfor -%}
+        </span></div>
+        {% endfor %}
+        {% else %}
+        <div class="srow"><span class="sk">Search</span><span class="sv"><span class="gone">Its search can no longer be read</span></span></div>
+        {% endif %}
+      </div>
+      <p class="card-note">The search is the rule: whatever it finds is what the rule records.</p>
+    </div>
+  </div>
+
+  <div class="card" data-section="checks">
+    <div class="card-head">
+      <h2>Checks</h2>
+      <div class="card-head-actions">
+        <button class="btn btn-sm" data-act="check"{{ '' if rule.enabled else ' disabled' }}>Check now</button>
+      </div>
+    </div>
+    <div class="card-body">
+      <div class="statlist">
+        <div class="srow"><span class="sk">Last checked</span><span class="sv tip-plain" data-tip="Last checked.&#10;{{ ('%s.' % checks.last_at) if checks.last_at else 'This rule has not been checked yet.' }}">{{ checks.last }}</span></div>
+        <div class="srow"><span class="sk">Next check</span><span class="sv tip-plain" data-tip="Next check.&#10;Every rule is checked every hour, after every guide refresh, and whenever it is saved or resumed.">{{ checks.next }}</span></div>
+        <div class="srow"><span class="sk">Guide reaches</span><span class="sv tip-plain" data-tip="Guide reaches.&#10;How far ahead the guide this rule searches is listed, at its last check. A rule cannot schedule past it.">{{ checks.reach }}</span></div>
+        <div class="srow"><span class="sk">History kept</span><span class="sv tip-plain" data-tip="History kept.&#10;How long a decision stays in History after its program airs (auto_scheduling.history_keep_days in Settings).">{{ checks.kept }}</span></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="card" data-section="settings">
+    <div class="card-head">
+      <h2>Settings</h2>
+      <div class="card-head-actions">
+        <button class="btn btn-sm" data-act="edit">Edit settings</button>
+      </div>
+    </div>
+    <div class="card-body">
+      <div class="gd-setbar" id="rule-setbar" data-items="{{ settings | tojson | forceescape }}"></div>
+    </div>
+  </div>
+
+  <div class="card" data-section="history" id="rule-history">
+    <div class="card-head"><h2>History{% if history_total %} <span class="cnt">{{ history_total }}</span>{% endif %}</h2></div>
+    <div class="card-body">
+      {% if history_total %}
+      <p class="card-note">What this rule did with showings that have aired, newest first.{% if keep_days %} Kept for {{ keep_days }} days.{% endif %}</p>
+      <div class="rl-filter">
+        {% for f in history_filters %}
+        <a class="chip{{ ' active' if f.key == history_filter else '' }}" data-hist="{{ f.key }}"
+           href="{{ url_for('auto_rules.rule_page', rule_id=rule.id, hist=f.key) }}">{{ f.label }}<span class="n">{{ f.count }}</span></a>
+        {% endfor %}
+      </div>
+      {% if history %}
+      {{ ledger(history, true) }}
+      {% else %}
+      <p class="card-note">Nothing here for that filter.</p>
+      {% endif %}
+      {% if history_more %}
+      <div class="rl-more">
+        <a class="btn btn-sm" data-hist-more="1"
+           href="{{ url_for('auto_rules.rule_page', rule_id=rule.id, hist=history_filter, shown=history_shown + history_page) }}">
+          {%- if history_more > history_page %}Show {{ history_page }} more of {{ history_more }}{% else %}Show {{ history_more }} more{% endif -%}
+        </a>
+      </div>
+      {% endif %}
+      {% else %}
+      <p class="card-note">Nothing has aired since this rule was made.</p>
+      {% endif %}
+    </div>
+  </div>
+
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+window.RULE_CONFIG = Object.assign({{ page_config | tojson }}, {
+  sections: {{ sections | tojson }},
+  sectionNames: {{ section_names | tojson }},
+  sectionPref: {{ section_pref | tojson }},
+  sectionsPrefKey: {{ sections_pref_key | tojson }},
+});
+</script>
+<script src="{{ url_for('static', filename='js/auto-rule-modal.js') }}"></script>
+<script src="{{ url_for('static', filename='js/rule-detail.js') }}"></script>
+{% endblock %}

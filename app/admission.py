@@ -55,6 +55,7 @@ KIND_REBUILD = 'rebuild'
 KIND_MAINTENANCE = 'maintenance'
 KIND_HIDING = 'hiding'
 KIND_LEDGER = 'ledger'
+KIND_RULES = 'rules'
 
 # Human prose for a refusal message, so a refused caller can hand the reason straight to a
 # user-facing surface without restating it. Keep these lowercase noun phrases - they are
@@ -66,6 +67,7 @@ KIND_LABELS = {
     KIND_MAINTENANCE: 'database maintenance',
     KIND_HIDING: 'a channel hide rule pass',
     KIND_LEDGER: 'an account stats catch-up',
+    KIND_RULES: 'an auto-record rule check',
 }
 
 # The yield order, as a table rather than as branches scattered across four modules.
@@ -99,6 +101,13 @@ KIND_LABELS = {
 #   first-run or timezone-change fold; routine folds are small and run inline without a
 #   ticket. It yields to sync, to maintenance and to itself, and refuses nothing: its only
 #   cost to anyone else is a late number on the Accounts pages, which say so while it runs.
+# - **Rules** - an auto-record rule evaluation (app/auto_rules.py) - yields to sync (it reads
+#   the listings a sync is rewriting), to a rebuild (the index is half-filled while it runs),
+#   to maintenance and to itself (two evaluations at once could both create one recording).
+#   The refusable rebuild and maintenance yield to it in turn: both are deferrable and an
+#   evaluation takes seconds. Sync deliberately does not - a refused sync writes a skipped
+#   row into the account's own history for a few seconds' wait, and the sync's import
+#   queues the next evaluation anyway (DESIGN-autoschedule.md §4.2).
 # - **Maintenance** yields to everything but the ledger, itself included. It is the most
 #   deferrable work in the app (pruning, retention, WAL reporting) and the heaviest per run,
 #   because EPG cleanup drags a full `programs` rebuild behind it.
@@ -107,10 +116,12 @@ KIND_LABELS = {
 BLOCKED_BY = {
     KIND_TESTER: (),
     KIND_SYNC: (KIND_TESTER, KIND_SYNC),
-    KIND_REBUILD: (KIND_SYNC, KIND_REBUILD),
+    KIND_REBUILD: (KIND_SYNC, KIND_REBUILD, KIND_RULES),
     KIND_HIDING: (KIND_SYNC, KIND_HIDING),
     KIND_LEDGER: (KIND_SYNC, KIND_MAINTENANCE, KIND_LEDGER),
-    KIND_MAINTENANCE: (KIND_TESTER, KIND_SYNC, KIND_REBUILD, KIND_HIDING, KIND_MAINTENANCE),
+    KIND_RULES: (KIND_SYNC, KIND_REBUILD, KIND_MAINTENANCE, KIND_RULES),
+    KIND_MAINTENANCE: (KIND_TESTER, KIND_SYNC, KIND_REBUILD, KIND_HIDING, KIND_RULES,
+                       KIND_MAINTENANCE),
 }
 
 

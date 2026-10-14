@@ -403,8 +403,9 @@ def persist_poster_frame(recording_id: int):
 
     # Four different times are in play here and only one of them is the right anchor:
     # the recording's scheduled start, its actual start, the program's start and the
-    # program's end. It is program_start_time, which is an immutable creation snapshot, so
-    # no new state is needed to compute the offset.
+    # program's end. It is program_start_time, the creation snapshot of the air time (moved
+    # only by auto-record retrack, along with the program and the window - dev/changelog/1188),
+    # so no new state is needed to compute the offset.
     if rec.program_start_time:
         anchor, anchor_kind = rec.program_start_time, POSTER_ANCHOR_PROGRAM
     else:

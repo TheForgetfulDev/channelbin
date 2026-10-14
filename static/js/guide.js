@@ -1696,7 +1696,7 @@ async function loadBlockPicker(prefix, recordingId) {
       slots = `<select name="block_slots_${a.id}" class="form-control" `
         + `aria-label="Connections to block on ${escHtml(a.name)}">${opts.join('')}</select>`;
     }
-    return `<label class="acct-block-row"><input type="checkbox" name="block_account_ids" `
+    return `<label class="check-row"><input type="checkbox" name="block_account_ids" `
       + `value="${a.id}"${a.blocked ? ' checked' : ''}>`
       + `<span class="color-dot" style="background:${escHtml(a.color || '')}"></span>`
       + `${escHtml(a.name)}${slots}</label>`;

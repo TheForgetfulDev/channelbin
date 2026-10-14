@@ -151,6 +151,8 @@ class DoSyncPersistsProviderInfoTests(unittest.TestCase):
         # stream_origin_from_server_info reproduces the port verbatim, including a
         # default one - see its own docstring for why.
         self.assertEqual(acc.provider_stream_origin, 'http://stream.provider.test:80')
+        # The Hosts card's stamp: where the streams are, not the API host (dev/changelog/1176).
+        self.assertEqual(acc.stream_host, 'stream.provider.test:80')
 
     def test_degenerate_auth_response_leaves_fields_none_not_raising(self):
         self._write_dump({'user_info': {'auth': 1, 'status': 'Active'}})

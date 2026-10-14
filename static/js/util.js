@@ -293,6 +293,20 @@ function fmtTimeTz(date, { seconds = false } = {}) {
   return tzFormatter(opts).format(date);
 }
 
+// A bare 'HH:MM' time of day - a clock reading, not an instant, so there is no timezone to
+// convert through - in the display clock format: '6:00 PM', or '18:00' under a 24h setting.
+// The browser half of app/tz_utils.py::format_clock, accepting exactly what its parse_hhmm
+// accepts. Anything else comes back as it arrived: '24:00' printed as '12:00 PM' would name a
+// time the search is not running. `hour12` is for a caller that already holds the setting.
+function fmtHhmm(hhmm, hour12 = displayHour12()) {
+  const s = String(hhmm == null ? '' : hhmm);
+  const m = /^([01]?\d|2[0-3]):([0-5]\d)$/.exec(s);
+  if (!m) return s;
+  const h = Number(m[1]);
+  if (!hour12) return `${String(h).padStart(2, '0')}:${m[2]}`;
+  return `${h % 12 || 12}:${m[2]} ${h < 12 ? 'AM' : 'PM'}`;
+}
+
 // Date parts in the display timezone. Defaults to the long day form the guide's readout
 // and day picker use; pass Intl options for any other shape.
 function fmtDateTz(date, opts) {
@@ -380,6 +394,27 @@ function bindNavClicks(root, resolve) {
     followHref(e, url);
   });
 }
+
+// A toast for an action that ends in a navigation or a reload: the action's own sentence is
+// carried to the page that loads next and shown there. Per-tab sessionStorage, read once;
+// storage that is blocked loses the sentence, never the action.
+const _PENDING_TOAST_KEY = 'app-pending-toast';
+function showToastAfterLoad(message, opts = {}) {
+  try {
+    sessionStorage.setItem(_PENDING_TOAST_KEY, JSON.stringify({ message, opts }));
+  } catch (e) { /* storage blocked: the page still loads, just without the sentence */ }
+}
+(() => {
+  let pending = null;
+  try {
+    pending = JSON.parse(sessionStorage.getItem(_PENDING_TOAST_KEY) || 'null');
+    sessionStorage.removeItem(_PENDING_TOAST_KEY);
+  } catch (e) { /* storage blocked or the value unreadable: nothing to show */ }
+  if (!pending || !pending.message) return;
+  const show = () => showToast(pending.message, pending.opts || {});
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', show);
+  else show();
+})();
 
 let _toastTimer = null;
 function showToast(message, { type = 'success', html = false, durationMs = 5000 } = {}) {
@@ -917,6 +952,41 @@ function confirmModal({ title, message, consequence = '', list = null, confirmLa
     const focusBtn = danger ? buttons[0] : buttons[buttons.length - 1];
     if (focusBtn) focusBtn.focus();
   });
+}
+
+// ── Settings chips (a detail page's Settings card) ───────────────────────────────────
+// A bar of chips, each opening the page's settings dialog focused on its own field: the
+// chip carries the value, the tooltip the explanation. Shared by the group page and an
+// auto-record rule's page (dev/changelog/1189). The desktop's wrapping row of pills does not
+// survive 375px - it wraps into an uneven block, and a pill carrying a second line comes out
+// double height beside its neighbors - so at phone width the same items, with the same click
+// target, are the app's key/value list (.statlist, DESIGN.md 3.3), each row a button whose
+// chevron says it opens something.
+//   renderSettingChips(host, items, { phone, act })
+// items: [{ focus, label, value, sub?, tip }]. act: the data-act the page's delegated click
+// handler listens for; each button carries data-focus naming its field. host is rewritten
+// whole, so a page calls this again whenever the breakpoint is crossed.
+function renderSettingChips(host, items, { phone = false, act = 'settings' } = {}) {
+  if (!host) return;
+  const attrs = (it, verb) => `data-act="${act}" data-focus="${escHtml(it.focus)}"`
+    + ` data-tip="${escHtml(it.label)}.&#10;${escHtml(it.tip)} ${verb} to change it."`;
+  if (phone) {
+    host.className = '';
+    host.innerHTML = '<div class="statlist">' + items.map((it) => {
+      const value = `<span>${escHtml(it.value)}`
+        + (it.sub ? `<span class="srow-sub">${escHtml(it.sub)}</span>` : '') + '</span>';
+      return `<button type="button" class="srow srow-act tip-plain" ${attrs(it, 'Tap')}>`
+        + `<span class="sk">${escHtml(it.label)}</span><span class="sv">${value}`
+        + '<span class="srow-go" aria-hidden="true">&rsaquo;</span></span></button>';
+    }).join('') + '</div>';
+    return;
+  }
+  host.className = 'gd-setbar';
+  host.innerHTML = items.map((it) => `<button type="button" class="gd-chip tip-plain" ${attrs(it, 'Click')}>`
+    + `<span class="gd-chip-lbl">${escHtml(it.label)}</span>`
+    + `<span class="gd-chip-val">${escHtml(it.value)}</span>`
+    + (it.sub ? `<span class="gd-sub">${escHtml(it.sub)}</span>` : '')
+    + '</button>').join('');
 }
 
 // ── Section layout ("Customize sections") control ───────────────────────────────────

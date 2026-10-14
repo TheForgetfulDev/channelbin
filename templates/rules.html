@@ -1,0 +1,113 @@
+{% extends "base.html" %}
+{% import "_macros.html" as m %}
+{% block title %}Auto-record rules - ChannelBin{% endblock %}
+
+{#  Auto-record rules (DESIGN-autoschedule.md §8, mockup 42, dev/changelog/1189). The list is
+    the recordings list's card-table hybrid; a row opens the rule's own page, and its kebab
+    holds the same actions as that page. Every value comes from
+    auto_rules_view.list_context(), a fixed number of queries however many rules there are.
+
+    `.page-head` and #rules-body are the two regions static/js/rules.js swaps for a fresh
+    render after an action, so the count, the row and the empty state follow it. #}
+
+{% block content %}
+<div class="page-head">
+  <h1>Auto-record rules
+    <span class="sub">{{ rules | length }} rule{{ '' if rules | length == 1 else 's' }}{% if rules %} &middot; {{ scheduled_total }} recording{{ '' if scheduled_total == 1 else 's' }} scheduled{% endif %}</span>
+  </h1>
+  <a class="btn btn-primary" href="{{ page_config.newRuleUrl }}">+ New rule</a>
+</div>
+<p class="page-sub">
+  A rule is a saved Programs search that records whatever it finds. Each upcoming program it
+  matches is scheduled once as an ordinary recording, now and again whenever the guide
+  refreshes, so a weekly event gets recorded without coming back to schedule it.
+</p>
+
+<div id="rules-body">
+{# How far the guide reaches and what refreshes it: a rule can only schedule what is listed. #}
+<div class="notice-banner notice-banner-{{ guide.tone }}" id="rules-guide">
+  <div class="notice-banner-body">
+    <div class="notice-banner-title">{{ guide.title }}</div>
+    {% if guide.sub %}<div class="notice-banner-sub">{{ guide.sub }}</div>{% endif %}
+  </div>
+  {% if guide.tone == 'warn' %}
+  <a class="btn btn-sm" href="{{ url_for('accounts.accounts_list') }}"
+     data-tip="Sync now and the automatic sync switch live on each account.">Accounts &rarr;</a>
+  {% endif %}
+</div>
+
+{% if not rules %}
+<div class="empty-state">
+  <p><strong>No rules yet</strong></p>
+  <p class="text-muted small">
+    A rule starts as a Programs search for what you want recorded - a series, a sport, a
+    team. The search becomes the rule, so what the search shows is exactly what the rule
+    will record.
+  </p>
+  <a class="btn btn-primary" href="{{ page_config.newRuleUrl }}">+ New rule</a>
+</div>
+{% else %}
+<div class="rl-list">
+  <div class="list-head">
+    <span>Rule</span><span>Status</span><span>Next recording</span>
+    <span class="num tip-plain" data-tip="Scheduled.&#10;Recordings this rule has scheduled that have not started yet.">Scheduled</span>
+    <span>Last checked</span><span></span>
+  </div>
+  <div class="rows">
+    {% for r in rules %}
+    <div class="row {{ r.edge }}" data-rule="{{ r.id }}" data-name="{{ r.name }}"
+         data-enabled="{{ 1 if r.enabled else 0 }}" data-scheduled="{{ r.scheduled }}"
+         data-href="{{ url_for('auto_rules.rule_page', rule_id=r.id) }}"
+         data-dialog="{{ r.dialog | tojson | forceescape }}">
+      <span class="rl-title">
+        <a class="rl-name" href="{{ url_for('auto_rules.rule_page', rule_id=r.id) }}">{{ r.name }}</a>
+        <span class="rl-sum tip-plain" data-tip="{{ r.search_tip }}">{{ r.summary }}</span>
+      </span>
+      <span class="rl-status"><span class="badge {{ r.badge[0] }} tip-plain" data-tip="{{ r.badge_tip }}">{{ r.badge[1] }}</span></span>
+      <span class="rl-cell rl-next">
+        {% if r.next.day %}
+        <span class="day">{{ r.next.day }}</span> {{ r.next.time }}
+        <span class="sub">{{ r.next.sub }}</span>
+        {% if r.next.warned %}<span class="warnline">Scheduled with a warning</span>{% endif %}
+        {% else %}
+        {{ r.next.head }}<span class="sub">{{ r.next.sub }}</span>
+        {% endif %}
+        {% if r.problems %}<span class="warnline">Its last check could not schedule everything</span>{% endif %}
+      </span>
+      <span class="rl-meta">
+        <span class="rl-num"><span class="rl-k">Scheduled</span>{% if r.scheduled %}{{ r.scheduled }}{% else %}<span class="zero">0</span>{% endif %}</span>
+        <span class="rl-cell"{% if r.checked_at %} data-tip="Last checked {{ r.checked_at }}."{% endif %}><span class="rl-k">Checked</span>{{ r.checked }}</span>
+      </span>
+      <span class="c-actions">
+        <span class="menu-wrap">
+          <button class="btn btn-sm btn-icon" data-menu aria-label="Actions for {{ r.name }}">&#8943;</button>
+          <div class="menu pop-left">
+            {% if r.enabled %}
+            <button class="menu-item" data-act="pause">Pause</button>
+            {% else %}
+            <button class="menu-item" data-act="resume">Resume</button>
+            {% endif %}
+            <a class="menu-item" href="{{ r.edit_search_url }}">Edit search</a>
+            <button class="menu-item" data-act="edit">Edit settings&hellip;</button>
+            <a class="menu-item" href="{{ r.search_url }}">Open search</a>
+            <button class="menu-item" data-act="check"{{ '' if r.enabled else ' disabled' }}>Check now</button>
+            <div class="sep"></div>
+            <button class="menu-item danger" data-act="delete">Delete rule</button>
+          </div>
+        </span>
+      </span>
+    </div>
+    {% endfor %}
+  </div>
+</div>
+{% endif %}
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+window.RULES_CONFIG = {{ page_config | tojson }};
+</script>
+<script src="{{ url_for('static', filename='js/auto-rule-modal.js') }}"></script>
+<script src="{{ url_for('static', filename='js/rules.js') }}"></script>
+{% endblock %}

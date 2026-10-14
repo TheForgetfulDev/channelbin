@@ -276,6 +276,60 @@ class M087ResumeTests(unittest.TestCase):
             conn.close()
 
 
+class M089ResumeTests(unittest.TestCase):
+    """Migration 89 - accounts.stream_host (dev/changelog/1176). The column is committed
+    before a per-account backfill, so a column with some accounts still NULL is the state a
+    retry must not mistake for done - a NULL host hides the Hosts card's only row."""
+
+    _DDL = ('CREATE TABLE accounts (id INTEGER PRIMARY KEY, name TEXT)',
+            'CREATE TABLE channels (id INTEGER PRIMARY KEY, account_id INTEGER, stream_url TEXT)')
+
+    def _seed(self, conn, cur):
+        cur.execute("INSERT INTO accounts (id, name) VALUES (1, 'a'), (2, 'b'), (3, 'empty')")
+        cur.execute("INSERT INTO channels (account_id, stream_url) VALUES "
+                    "(1, 'http://a1.example/live/u/p/1.ts'), (1, 'http://a1.example/live/u/p/2.ts'), "
+                    "(1, 'http://radio.example:8000/mount'), "
+                    "(2, 'http://B2.example:80/u/p/3')")
+        conn.commit()
+
+    def _hosts(self, cur):
+        return dict(cur.execute('SELECT id, stream_host FROM accounts ORDER BY id'))
+
+    def test_a_fresh_run_stamps_each_account_with_its_majority_host(self):
+        with tempfile.TemporaryDirectory() as td:
+            conn, cur = _scratch(td, *self._DDL)
+            self._seed(conn, cur)
+            M._m089_account_stream_host(conn, cur)
+            self.assertEqual(self._hosts(cur),
+                             {1: 'a1.example', 2: 'b2.example:80', 3: None},
+                             'the majority wins, the host is lower-cased, no channels is None')
+            conn.close()
+
+    def test_interrupted_backfill_is_finished_by_the_next_run(self):
+        with tempfile.TemporaryDirectory() as td:
+            conn, cur = _scratch(td, *self._DDL)
+            self._seed(conn, cur)
+            crashing = _CrashingCursor(cur, 'UPDATE accounts SET stream_host')
+            with self.assertRaises(_SimulatedCrash):
+                M._m089_account_stream_host(conn, crashing)
+            self.assertIn('stream_host', {r[1] for r in cur.execute('PRAGMA table_info(accounts)')},
+                          'the column was committed before the crash - that is the trap')
+            M._m089_account_stream_host(conn, cur)
+            self.assertEqual(self._hosts(cur), {1: 'a1.example', 2: 'b2.example:80', 3: None})
+            conn.close()
+
+    def test_a_finished_backfill_is_not_run_again(self):
+        with tempfile.TemporaryDirectory() as td:
+            conn, cur = _scratch(td, *self._DDL)
+            self._seed(conn, cur)
+            M._m089_account_stream_host(conn, cur)
+            cur.execute("UPDATE accounts SET stream_host = 'kept.example' WHERE id = 1")
+            conn.commit()
+            M._m089_account_stream_host(conn, cur)
+            self.assertEqual(self._hosts(cur)[1], 'kept.example')
+            conn.close()
+
+
 class M088FoldTests(unittest.TestCase):
     """Migration 88 - the stored duplicate fold (dev/changelog/1172). The step swaps the
     columns and registers the obligation to compute them; create_app() discharges it, because

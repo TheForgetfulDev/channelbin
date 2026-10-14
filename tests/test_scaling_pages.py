@@ -125,8 +125,8 @@ def _scaling_channel_id():
 def _seed_group_provider_copies(n):
     """ONE group of n members, half on each of two accounts on one provider, each member
     the same stream id as one on the other account - every member a provider copy, so the
-    group page's "same channel through a provider" line (dev/changelog/1173) has n/2 pairs
-    to name. Its account, provider and login lookups must be batched, never per pair."""
+    group page has n/2 duplicate sets to count and badge (dev/changelog/1173, 1175). Their
+    account, provider and login lookups must be batched, never per set."""
     from app import duplicate_streams
     now = datetime.utcnow()
     a = seed.make_account(name='copies-a', last_sync_at=now)
@@ -314,6 +314,103 @@ def _seed_hide_rules(n):
         db.session.add(ChannelHideRule(target=HIDE_TARGET_NAME_GLOB, pattern=f'SCALE{i}*',
                                        account_id=None, enabled=True))
     db.session.commit()
+
+
+def _seed_auto_rules(n):
+    """n auto-record rules (DESIGN-autoschedule.md §8), each with a ledger row of every verdict
+    and a scheduled plus a finished recording, alternating paused, profiled, broken and with a
+    problem - the Rules list (dev/changelog/1189). Each rule's search names an account and a
+    channel and its pick names a channel or a group, so every name the list reads for a row
+    is there to be looked up: auto_rules_view.list_context() reads the next recordings, the
+    cap counts and those names in a fixed number of grouped queries however many rules
+    there are."""
+    from app.database import RULE_MATCH_ACTIONS, RULE_MATCH_SCHEDULED, AutoRule, RuleMatch
+    profile = RecordingProfile(name='Scaling profile', pre_padding_minutes=2,
+                               post_padding_minutes=30)
+    db.session.add(profile)
+    acc = seed.make_account(name='Scaling rules account')
+    db.session.flush()
+    now = datetime.utcnow()
+    for i in range(n):
+        ch = seed.make_channel(acc, name=f'Rule channel {i}')
+        group = seed.make_group(name=f'Rule group {i}', members=[ch]) if i % 2 else None
+        rule = AutoRule(name=f'Rule {i}',
+                        search_params=f'q=show{i}&f.acct={acc.id}&f.chan={ch.id}&grain=airings',
+                        enabled=i % 2 == 0, profile_id=profile.id if i % 3 == 0 else None,
+                        skip_repeats=True, limit_count=1 if i % 4 == 0 else None,
+                        limit_window_hours=120 if i % 4 == 0 else None,
+                        max_upcoming=None if i % 5 else 3, revision=1,
+                        last_evaluated_at=now - timedelta(minutes=i),
+                        last_guide_reach=now + timedelta(days=2) if i % 2 else None,
+                        last_error='The search names a tag that is gone.' if i % 7 == 0 else None,
+                        last_problems='"Show" could not be placed.' if i % 7 == 3 else None)
+        db.session.add(rule)
+        db.session.flush()
+        base = now + timedelta(days=2, hours=i)
+        nxt = seed.make_recording(status=REC_STATUS_SCHEDULED, name=f'rule_{i}_next',
+                                  rule_id=rule.id, start_time=base,
+                                  stop_time=base + timedelta(minutes=30))
+        seed.make_recording(status='COMPLETED', name=f'rule_{i}_done', rule_id=rule.id,
+                            start_time=base - timedelta(days=7),
+                            stop_time=base - timedelta(days=7) + timedelta(minutes=30))
+        for j, action in enumerate(RULE_MATCH_ACTIONS):
+            start = now + timedelta(days=1, hours=j)
+            db.session.add(RuleMatch(
+                rule_id=rule.id, title_key=f'show {i}', episode_key=str(j),
+                program_title=f'Show {i}', program_start_time=start,
+                program_stop_time=start + timedelta(minutes=30), action_taken=action,
+                channel_id=ch.id, group_id=group.id if group else None,
+                recording_id=nxt.id if action == RULE_MATCH_SCHEDULED else None,
+                detail='Scheduled with a warning: the account is full.'))
+    db.session.commit()
+
+
+def _seed_auto_rule_history(n):
+    """One auto-record rule with n ledger rows on each side of now - every verdict, picks
+    whose recordings are scheduled, finished, failed, cancelled and deleted, each on its own
+    channel or group - the rule's own page (dev/changelog/1189). page_context() reads the
+    ledger, the recordings it names and those names in four queries, and History renders a
+    page of rows however long it is."""
+    from app.database import (
+        RULE_MATCH_ACTIONS, RULE_MATCH_SCHEDULED, AutoRule, RuleMatch)
+    acc = seed.make_account(name='Scaling history account')
+    db.session.flush()
+    now = datetime.utcnow()
+    rule = AutoRule(name='Scaling history rule', search_params='q=race&grain=airings',
+                    enabled=True, skip_repeats=True, revision=1,
+                    last_evaluated_at=now - timedelta(minutes=5),
+                    last_guide_reach=now + timedelta(days=2))
+    db.session.add(rule)
+    db.session.flush()
+    statuses = (REC_STATUS_SCHEDULED, 'COMPLETED', 'FAILED', 'ABORTED')
+    for i in range(n):
+        ch = seed.make_channel(acc, name=f'History channel {i}')
+        group = seed.make_group(name=f'History group {i}', members=[ch]) if i % 2 else None
+        for side in (-1, 1):
+            start = now + side * timedelta(days=1 + i % 20, hours=i)
+            action = RULE_MATCH_ACTIONS[i % len(RULE_MATCH_ACTIONS)]
+            rec_id, removed = None, None
+            if action == RULE_MATCH_SCHEDULED:
+                if i % 3 == 2:
+                    removed = REC_STATUS_SCHEDULED
+                else:
+                    rec_id = seed.make_recording(
+                        status=statuses[i % len(statuses)] if side < 0 else REC_STATUS_SCHEDULED,
+                        name=f'history_{i}_{side}', rule_id=rule.id, start_time=start,
+                        stop_time=start + timedelta(hours=1)).id
+            db.session.add(RuleMatch(
+                rule_id=rule.id, title_key=f'race {i} {side}', episode_key='',
+                program_title=f'Race {i}', program_sub_title='Final',
+                program_start_time=start, program_stop_time=start + timedelta(hours=1),
+                action_taken=action, channel_id=ch.id, group_id=group.id if group else None,
+                recording_id=rec_id, removed_status=removed,
+                detail='Scheduled on a channel. Moved with the program from A to B.'))
+    db.session.commit()
+
+
+def _scaling_rule_id():
+    from app.database import AutoRule
+    return AutoRule.query.filter_by(name='Scaling history rule').one().id
 
 
 def _seed_ledger_sources(acc, i, in_guide=False):
@@ -707,6 +804,13 @@ class PageScalingTests(unittest.TestCase):
     def test_hide_rules_page(self):
         self._assert_row_independent(_seed_hide_rules, '/channels/hide-rules')
 
+    def test_rules_page(self):
+        self._assert_row_independent(_seed_auto_rules, '/rules')
+
+    def test_rule_page(self):
+        self._assert_row_independent(_seed_auto_rule_history,
+                                     lambda: f'/rules/{_scaling_rule_id()}')
+
     def test_profiles_page(self):
         self._assert_row_independent(_seed_recording_profiles, '/profiles')
 
@@ -895,6 +999,8 @@ COVERED = {
     'alerts.ignored_alerts': 'test_ignored_alerts_page',
     'tags.tags_list': 'test_tags_page',
     'channel_hide_rules.hide_rules_page': 'test_hide_rules_page',
+    'auto_rules.rules_page': 'test_rules_page',
+    'auto_rules.rule_page': 'test_rule_page',
     'accounts.accounts_list': 'test_accounts_list_page',
     'accounts.account_detail': 'test_account_detail_page',
     'accounts.epg_source_review': 'test_epg_source_review_page',

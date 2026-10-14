@@ -315,6 +315,7 @@ def init_scheduler(app):
     schedule_storage_dirs_check(app)
     schedule_account_stats_fold(app)
     schedule_host_resolve_check(app)
+    schedule_auto_rule_sweep(app)
 
     # One-shot reconcile of every group's format state (auto-disable mismatched members /
     # re-enable conforming ones). Runs after migrations so schema-v6 columns exist.
@@ -2096,6 +2097,115 @@ def pending_hide_materialize() -> dict | None:
 _DAY_MAP = {1: 'sun', 2: 'mon', 3: 'tue', 4: 'wed', 5: 'thu', 6: 'fri', 7: 'sat'}
 
 
+AUTO_RULES_EVALUATE_JOB_ID = 'auto_rules_evaluate'
+AUTO_RULE_SWEEP_JOB_ID = 'auto_rule_sweep'
+#: How long a refused evaluation waits before asking admission again. Short, because what it
+#: yields to is usually a sync finishing, and the sync's own import queued it.
+_AUTO_RULES_RETRY_MINUTES = 5
+
+
+def queue_auto_rule_evaluation(delay_seconds: int = 30, reason: str = '') -> bool:
+    """Arm the one-shot that evaluates every enabled auto-record rule (DESIGN-autoschedule.md
+    §4.1). A fixed id and replace_existing, so several guide imports finishing together - or a
+    refused run and a fresh import - become one evaluation. False, and nothing queued, when no
+    scheduler is running: a test app or a stopped one has nowhere to put it."""
+    if not scheduler_is_live():
+        return False
+    run_date = datetime.utcnow() + timedelta(seconds=delay_seconds)
+    # max_instances=2: a check asked for while the previous queued one is still running would
+    # otherwise reach its run date, be skipped as "max instances reached" and - being a date
+    # job - removed, so a rule saved during a long check would wait for the hourly sweep. The
+    # second instance is refused by admission instead and queues itself again.
+    _add_job(func=_auto_rules_evaluate_job, trigger='date', run_date=run_date,
+             id=AUTO_RULES_EVALUATE_JOB_ID, replace_existing=True, max_instances=2,
+             kwargs={'reason': reason or None})
+    log.info('Auto-record rule check queued for %s%s', run_date,
+             f' ({reason})' if reason else '')
+    return True
+
+
+def auto_rule_next_check():
+    """When every enabled rule is next checked - the queued evaluation or the sweep,
+    whichever comes first - as naive UTC, or None when no scheduler is running. Read from
+    the jobs themselves, so the Rules page never states a time nothing is armed for."""
+    if not scheduler_is_live():
+        return None
+    times = [job.next_run_time for job in (_scheduler.get_job(AUTO_RULES_EVALUATE_JOB_ID),
+                                           _scheduler.get_job(AUTO_RULE_SWEEP_JOB_ID))
+             if job is not None and job.next_run_time is not None]
+    return to_naive_utc(min(times)) if times else None
+
+
+def _auto_rules_evaluate_job(reason: str = None):
+    """The queued evaluation. `reason` only names why it was queued, for /jobs."""
+    with _app.app_context():
+        _run_auto_rules('queued')
+
+
+def schedule_auto_rule_sweep(app):
+    """Register the periodic auto-record rule sweep, every auto_scheduling.sweep_interval_hours
+    with a floor of 1 (§4.1: it is the only evaluation that notices a failed original's replay
+    or the guide draining, so it cannot be turned off). Re-registered only when the interval
+    changed, so a restart does not push the next tick back by a whole interval."""
+    from .config import load_config
+    raw = (load_config().get('auto_scheduling') or {}).get('sweep_interval_hours', 1)
+    try:
+        hours = max(1, int(raw))
+    except (TypeError, ValueError):
+        log.warning('auto_scheduling.sweep_interval_hours is %r, not a whole number of hours - '
+                    'sweeping every hour', raw)
+        hours = 1
+    existing = _scheduler.get_job(AUTO_RULE_SWEEP_JOB_ID)
+    interval = getattr(getattr(existing, 'trigger', None), 'interval', None)
+    if (existing is not None and existing.next_run_time is not None
+            and interval == timedelta(hours=hours)):
+        return
+    _add_job(func=_auto_rule_sweep_job, trigger='interval', hours=hours,
+             id=AUTO_RULE_SWEEP_JOB_ID, replace_existing=True)
+    log.info('Auto-record rule sweep scheduled every %d hour%s', hours, '' if hours == 1 else 's')
+
+
+def _auto_rule_sweep_admitted():
+    """Run now's half of the sweep: the KIND_RULES ticket is already held by the request
+    (run_system_job_now), so this runs the evaluation without asking again."""
+    with _app.app_context():
+        from .auto_rules import TRIGGER_SWEEP, run_admitted
+        from .database import record_job_run, JOB_RUN_SUCCESS, JOB_RUN_FAILED
+        started = datetime.utcnow()
+        try:
+            run_admitted(TRIGGER_SWEEP)
+        except Exception:
+            record_job_run(AUTO_RULE_SWEEP_JOB_ID, started, datetime.utcnow(), JOB_RUN_FAILED)
+            raise
+        record_job_run(AUTO_RULE_SWEEP_JOB_ID, started, datetime.utcnow(), JOB_RUN_SUCCESS)
+
+
+def _auto_rule_sweep_job():
+    with _app.app_context():
+        from .database import record_job_run, JOB_RUN_SUCCESS, JOB_RUN_FAILED
+        started = datetime.utcnow()
+        try:
+            ran = _run_auto_rules('sweep')
+        except Exception:
+            log.exception('Auto-record rule sweep failed')
+            record_job_run(AUTO_RULE_SWEEP_JOB_ID, started, datetime.utcnow(), JOB_RUN_FAILED)
+            return
+        if ran:
+            record_job_run(AUTO_RULE_SWEEP_JOB_ID, started, datetime.utcnow(), JOB_RUN_SUCCESS)
+
+
+def _run_auto_rules(kind: str) -> bool:
+    """One evaluation of every enabled rule; a refusal re-queues it rather than dropping it.
+    True when it ran."""
+    from .auto_rules import TRIGGER_QUEUED, TRIGGER_SWEEP, run_evaluation, waiting_phrase
+    outcome = run_evaluation(TRIGGER_SWEEP if kind == 'sweep' else TRIGGER_QUEUED)
+    if isinstance(outcome, admission.Refusal):
+        queue_auto_rule_evaluation(delay_seconds=_AUTO_RULES_RETRY_MINUTES * 60,
+                                   reason=waiting_phrase(outcome))
+        return False
+    return True
+
+
 def _hc_window_dispatch_job():
     from .check_window import dispatch_tick
     dispatch_tick(_app)
@@ -2688,7 +2798,10 @@ def _account_stats_fold_job():
 _RUN_NOW_ADMITTED = {
     'recording_retention_daily': ('recording retention', _recording_retention_sweep),
     'db_maintenance_daily': ('database maintenance', _db_maintenance_sweep),
+    AUTO_RULE_SWEEP_JOB_ID: ('auto-record rule check', _auto_rule_sweep_admitted),
 }
+#: The admission kind each of those asks for; maintenance unless named here.
+_RUN_NOW_KINDS = {AUTO_RULE_SWEEP_JOB_ID: admission.KIND_RULES}
 _RUN_NOW_PLAIN = {
     'logo_cache_fetch': _logo_cache_job,
     'storage_dirs_check': _storage_dirs_job,
@@ -2705,7 +2818,8 @@ def run_system_job_now(job_id: str):
     Leaves the job's own next run alone - skipping that is the page's separate request."""
     if job_id in _RUN_NOW_ADMITTED:
         label, sweep = _RUN_NOW_ADMITTED[job_id]
-        ticket = admission.try_start(admission.KIND_MAINTENANCE, f'{label} (run now)')
+        ticket = admission.try_start(_RUN_NOW_KINDS.get(job_id, admission.KIND_MAINTENANCE),
+                                     f'{label} (run now)')
         if not ticket.granted:
             return ticket
 

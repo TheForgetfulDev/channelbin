@@ -54,11 +54,9 @@
     const { hour, enabled } = BOOT.backup;
     const label = $('#backup-schedule-label');
     if (!enabled) { label.textContent = 'Automatic backups are disabled.'; return; }
-    // A whole-hour local wall clock, not an instant, so it is rendered by hand rather than
-    // through fmtTimeTz - only the 12h/24h choice is shared.
-    const timeStr = displayHour12()
-      ? `${hour % 12 || 12}:00 ${hour < 12 ? 'AM' : 'PM'}`
-      : `${String(hour).padStart(2, '0')}:00`;
+    // A whole-hour local wall clock, not an instant, so it goes through fmtHhmm rather than
+    // fmtTimeTz - there is no timezone to convert it through.
+    const timeStr = fmtHhmm(`${hour}:00`);
     label.textContent = `Scheduled: daily at ${timeStr}`;
   })();
 

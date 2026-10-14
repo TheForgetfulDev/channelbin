@@ -307,11 +307,14 @@ REC_STATE_SCHEDULED = 'scheduled'
 REC_STATE_RECORDED = 'recorded'
 REC_STATE_PAST = 'past'
 
-#: Recording statuses that mean "this showing is spoken for".
-_REC_LIVE = (REC_STATUS_IN_PROGRESS, REC_STATUS_PAUSED, REC_STATUS_RETRYING,
-             REC_STATUS_CONCATENATING, REC_STATUS_ANALYZING, REC_STATUS_CONVERTING)
-_REC_DONE = (REC_STATUS_COMPLETED,)
-_REC_DEAD = (REC_STATUS_ABORTED, REC_STATUS_FAILED)
+#: Recording statuses that mean "this showing is spoken for": being captured or processed
+#: (REC_LIVE) or finished (REC_DONE). SCHEDULED is the third spoken-for state, named on its
+#: own. Public because auto-record rules ask the same question and must get the same answer
+#: (app/auto_rules.py, DESIGN-autoschedule.md §3.4) - import these, never re-type them.
+REC_LIVE = (REC_STATUS_IN_PROGRESS, REC_STATUS_PAUSED, REC_STATUS_RETRYING,
+            REC_STATUS_CONCATENATING, REC_STATUS_ANALYZING, REC_STATUS_CONVERTING)
+REC_DONE = (REC_STATUS_COMPLETED,)
+REC_DEAD = (REC_STATUS_ABORTED, REC_STATUS_FAILED)
 
 
 def _airing_rows(result, state, ctx) -> list:
@@ -450,18 +453,27 @@ def _airing_group_labels(result, ctx) -> dict:
     payloads = {p['id']: p for p in build_group_rows(groups, ctx)}
     by_id = {g.id: g for g in groups}
 
-    def rank(group_id):
-        group = by_id.get(group_id)
-        if group is None:
-            return (1, 0, group_id)
-        return (0 if group.in_guide else 1, -len(group.memberships), group.id)
-
     out = {}
     for entry_id, group_ids in wins.items():
         known = [gid for gid in group_ids if gid in payloads]
         if known:
-            out[entry_id] = payloads[min(known, key=rank)]
+            out[entry_id] = payloads[label_group_id(known, by_id)]
     return out
+
+
+def label_group_id(group_ids, groups_by_id):
+    """Which of the groups a showing won it is labeled - and, for an auto-record rule,
+    scheduled - as: the group in the TV Guide, then the larger, then the lower id.
+
+    The one spelling of that rank. A rule schedules a row on the group the search page
+    names it with (DESIGN-autoschedule.md §4.3), so the two must never be ranked apart.
+    `groups_by_id` must carry each group's memberships loaded."""
+    def rank(group_id):
+        group = groups_by_id.get(group_id)
+        if group is None:
+            return (1, 0, group_id)
+        return (0 if group.in_guide else 1, -len(group.memberships), group.id)
+    return min(group_ids, key=rank)
 
 
 def _iso(value):
@@ -475,11 +487,11 @@ def _record_state(entry, rec, ctx) -> str:
     now has necessarily started, and the useful action there is Manage, not a dead button.
     """
     if rec is not None:
-        if rec.status in _REC_LIVE:
+        if rec.status in REC_LIVE:
             return REC_STATE_RECORDING
-        if rec.status in _REC_DONE:
+        if rec.status in REC_DONE:
             return REC_STATE_RECORDED
-        if rec.status not in _REC_DEAD:
+        if rec.status not in REC_DEAD:
             return REC_STATE_SCHEDULED
     if entry.stop_time and entry.stop_time <= ctx.now:
         return REC_STATE_PAST
@@ -548,7 +560,7 @@ def _recordings_for(entries, channels_by_id) -> dict:
     candidates = Recording.query.filter(
         Recording.stop_time >= window_start,
         Recording.start_time <= window_stop,
-        Recording.status.notin_(_REC_DEAD),
+        Recording.status.notin_(REC_DEAD),
     ).all()
     if not candidates:
         return {}

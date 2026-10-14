@@ -64,11 +64,13 @@ def _candidate_channel_ids(rec):
 def find_program_entry(rec):
     """This recording's program listing as it stands now, or None.
 
-    Keyed on the channel plus the IMMUTABLE `program_start_time` snapshot, which is why
-    no `source_epg_id` column is needed: the id does not survive a sync, the air time
-    does. An exact start-time match is deliberate. A provider that moved the program has
+    Keyed on the channel plus the `program_start_time` snapshot, which is why no
+    `source_epg_id` column is needed: the id does not survive a sync, the air time does.
+    An exact start-time match is deliberate. A provider that moved the program has
     published a different airing, and describing a recording with the synopsis of whatever
-    else now starts near that minute would be worse than leaving the snapshot alone.
+    else now starts near that minute would be worse than leaving the snapshot alone. The
+    one thing that moves the snapshot is auto-record retrack, which moves it WITH the
+    program it followed, so the lookup still lands on that program (dev/changelog/1188).
     """
     channel_ids = _candidate_channel_ids(rec)
     if not channel_ids or rec.program_start_time is None:

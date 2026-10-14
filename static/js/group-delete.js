@@ -15,6 +15,7 @@
  *   groupName      - for the dialog copy
  *   deleteUrl      - POST target for the group's delete route
  *   attachedChecks - [{name}, ...] health checks that go with the group (may be empty)
+ *   attachedRules  - [name, ...] auto-record rules whose search names the group (may be empty)
  *   recordingUrl(id) - optional; builds the link to a recording's detail page
  *   onDeleted(result) - called after the delete succeeds
  *   onError(message)  - called for a refusal this flow does not own
@@ -97,10 +98,20 @@ function openDeleteGroupModal(opts) {
     ? `Group "${escHtml(name)}" will be deleted, along with the health check ` +
       `schedule${checks.length === 1 ? '' : 's'} it carries (${names}).`
     : `Group "${escHtml(name)}" will be deleted.`;
+  // A rule naming a deleted group stops running rather than quietly matching something
+  // else (DESIGN-autoschedule.md §3.2), so it is named before the click.
+  const rules = opts.attachedRules || [];
+  const ruleLine = rules.length
+    ? `${rules.length === 1 ? 'The auto-record rule' : 'The auto-record rules'} ` +
+      `${rules.map((r) => `&ldquo;${escHtml(r)}&rdquo;`).join(', ')} ` +
+      `${rules.length === 1 ? 'names' : 'name'} this group and will stop scheduling until ` +
+      `${rules.length === 1 ? 'its search is' : 'their searches are'} changed.`
+    : null;
   return confirmDialog({
     title: 'Delete group',
     lines: [first,
-            'Its channels are not deleted, and each keeps its own guide row if it has one.'],
+            'Its channels are not deleted, and each keeps its own guide row if it has one.',
+            ...(ruleLine ? [ruleLine] : [])],
     confirm: cascade
       ? `Delete group and health check${checks.length === 1 ? '' : 's'}`
       : 'Delete group',

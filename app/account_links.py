@@ -55,7 +55,7 @@ from typing import Iterable, Optional
 from sqlalchemy import update
 
 from . import db
-from .db_utils import retry_on_locked
+from .db_utils import chunked, retry_on_locked
 
 log = logging.getLogger(__name__)
 
@@ -243,21 +243,29 @@ def hosts_for_accounts(account_ids: Iterable[int]) -> dict:
     return out
 
 
-def current_host(account_id: int) -> Optional[str]:
-    """The host most of the account's stream URLs carry right now - what the first entry
-    in a new list is seeded from, so the list always starts from what is already true.
-    None for an account with no channels. One columns-only query; the count is in Python
-    because SQLite cannot pull a netloc out of a URL."""
-    from .database import Channel
+def dominant_host(urls: Iterable[Optional[str]]) -> Optional[str]:
+    """The host most of `urls` are on; None when none of them has one. Pure, so the
+    migration that backfills Account.stream_host counts exactly as current_host() does."""
     counts: Counter = Counter()
-    for (url,) in db.session.query(Channel.stream_url).filter(
-            Channel.account_id == account_id).yield_per(2000):
+    for url in urls:
         host = host_of(url)
         if host:
             counts[host] += 1
     if not counts:
         return None
     return counts.most_common(1)[0][0]
+
+
+def current_host(account_id: int) -> Optional[str]:
+    """The host most of the account's stream URLs carry right now - what the first entry
+    in a new list is seeded from, so the list always starts from what is already true, and
+    what a sync stamps on Account.stream_host for the Hosts card. None for an account with
+    no channels. One columns-only query; the count is in Python because SQLite cannot pull
+    a netloc out of a URL. It reads every channel on the account (about 250ms at 58,000),
+    so a page reads the stamp instead (dev/changelog/1176)."""
+    from .database import Channel
+    return dominant_host(url for (url,) in db.session.query(Channel.stream_url).filter(
+        Channel.account_id == account_id).yield_per(2000))
 
 
 # ── The writer: the list is the user's ──────────────────────────────────────────────────
@@ -514,8 +522,8 @@ def _activate(account_id: int, host: str) -> dict:
                 .values(stream_url=db.bindparam('b_url'),
                         search_text_updated_at=now, updated_at=table.c.updated_at))
         conn = db.session.connection()
-        for i in range(0, len(changed), _ROLL_CHUNK):
-            conn.execute(stmt, changed[i:i + _ROLL_CHUNK])
+        for batch in chunked(changed, _ROLL_CHUNK):
+            conn.execute(stmt, batch)
         account_urls = 0
         account = db.session.get(Account, account_id)
         if account is not None:
@@ -525,6 +533,10 @@ def _activate(account_id: int, host: str) -> dict:
                 if rendered != value:
                     setattr(account, col, rendered)
                     account_urls += 1
+            # The URLs on a listed host all moved, so the stamped stream host moves with
+            # them; one on a host outside the list did not move and keeps it.
+            if account.stream_host in hosts:
+                account.stream_host = host
         db.session.commit()
         return {'host': host, 'channels': len(changed), 'account_urls': account_urls}
 

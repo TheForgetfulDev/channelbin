@@ -66,24 +66,33 @@ _analysis_progress_lock = threading.Lock()
 # the text a user reads while waiting on one.
 ANALYSIS_PASS_HEALTH = 'capture health'
 ANALYSIS_PASS_TIMELINE = 'damage scan'
+ANALYSIS_PASS_FORMATS = 'format survey'
+ANALYSIS_PASS_LOUDNESS = 'loudness'
 
 
 def analysis_pass_plan(cfg, pp) -> list:
     """The whole-file reads this recording's ANALYZING phase will actually run, in order.
 
-    "Pass 1 of 2" is a promise, so the denominator is derived from the same two settings the
+    "Pass 1 of 2" is a promise, so the denominator is derived from the same settings the
     phase branches on rather than hardcoded: with gather_health_data off there is no health
     pass, and the damage scan then runs only because the re-encode decision needs it - which
     requires mp4 output and reencode_mode 'damaged' (do_postprocess's own conditions, kept
-    in step with them). A plan of zero passes is the honest answer for a configuration whose
+    in step with them). Every mp4 conversion gets the format survey, because every one
+    re-encodes its audio and needs the widest layout in the file; the loudness pass runs only
+    when leveling is on. A plan of zero passes is the honest answer for a configuration whose
     analysis reads nothing, and the surfaces show no progress rather than an empty bar.
     """
+    plan = []
+    mp4 = pp.get('enabled') and pp.get('format', 'mp4').lower().lstrip('.') == 'mp4'
     if cfg['recording'].get('gather_health_data', True):
-        return [ANALYSIS_PASS_HEALTH, ANALYSIS_PASS_TIMELINE]
-    if (pp.get('enabled') and pp.get('format', 'mp4').lower().lstrip('.') == 'mp4'
-            and pp.get('reencode_mode', 'damaged') == 'damaged'):
-        return [ANALYSIS_PASS_TIMELINE]
-    return []
+        plan += [ANALYSIS_PASS_HEALTH, ANALYSIS_PASS_TIMELINE]
+    elif mp4 and pp.get('reencode_mode', 'damaged') == 'damaged':
+        plan.append(ANALYSIS_PASS_TIMELINE)
+    if mp4:
+        plan.append(ANALYSIS_PASS_FORMATS)
+        if pp.get('loudness_normalize'):
+            plan.append(ANALYSIS_PASS_LOUDNESS)
+    return plan
 
 
 def _start_analysis_pass(recording_id: int, label: str, plan: list, total_bytes: int):
@@ -552,8 +561,14 @@ VIDEO_ENCODERS = (VIDEO_ENCODER_SOFTWARE, VIDEO_ENCODER_VAAPI)
 # treat. Measured on ffmpeg 7.1: a device that cannot be opened reports
 # '[AVHWDeviceContext @ ...] No VA display found for device ...', and every component of
 # the path logs under a tag that names it (dev/changelog/1125).
+#
+# 'hwaccel' and 'Error reinitializing filters' cover the paths dev/changelog/1184 added:
+# hardware decoding, and the mid-file format change every hardware shape but one died on
+# with that exact message (dev/changelog/1183) - one of which named only `Parsed_null_0`,
+# which no device-specific marker matches. The second is only ever consulted while the GPU
+# is in use, where the software path's auto-reinit is not in play.
 GPU_ERROR_MARKERS = ('AVHWDeviceContext', 'AVHWFramesContext', 'hwupload', 'vaapi', 'VAAPI',
-                     'VA display')
+                     'VA display', 'hwaccel', 'Error reinitializing filters')
 
 
 def names_gpu_failure(stderr_tail) -> bool:
@@ -1373,7 +1388,7 @@ def do_postprocess(app, recording_id: int, ts_path: str):
     from .config import load_config, resolve_ffmpeg_path
     from .database import (
         Recording, RecordingEvent, add_recording_event, preserve_cancelled_status,
-        DIAGNOSTICS, SEEK_DAMAGE_DETECTED, MIXED_FRAME_RATE_DETECTED,
+        DIAGNOSTICS, SEEK_DAMAGE_DETECTED, MIXED_FRAME_RATE_DETECTED, FORMAT_NORMALIZE_NEEDED,
         POSTCAPTURE_ANALYSIS_STARTED, POSTCAPTURE_ANALYSIS_SKIPPED,
         CONVERSION_STARTED, CONVERSION_RESTARTED, CONVERSION_YIELDED, CONVERSION_RESUMED,
         CONVERSION_DONE, CONVERSION_FAILED, CONVERSION_CANCELLED,
@@ -1409,6 +1424,24 @@ def do_postprocess(app, recording_id: int, ts_path: str):
 
         rec_name = rec.name
         current_path = ts_path
+
+        # The format survey and the loudness pass serve the mp4 conversion alone (its audio
+        # is always re-encoded, so it needs the widest layout in the file). Read here, ahead
+        # of the analysis phase, so both halves of the phase agree on whether they run.
+        mp4_conversion = (bool(pp.get('enabled'))
+                          and pp.get('format', 'mp4').lower().lstrip('.') == 'mp4')
+        survey = None
+        loudness_lufs = None
+
+        def _run_format_analysis():
+            nonlocal survey, loudness_lufs
+            if not mp4_conversion:
+                return
+            survey = _survey_recording(recording_id, ts_path, analysis_plan=analysis_plan)
+            if pp.get('loudness_normalize'):
+                loudness_lufs = _measure_recording_loudness(
+                    recording_id, ts_path, resolve_ffmpeg_path(cfg['ffmpeg']['path']),
+                    analysis_plan=analysis_plan)
 
         # Post-capture cancel: the user can abort while this chain is still working, so
         # the chain stops at the next phase boundary instead of running to completion and
@@ -1477,6 +1510,9 @@ def do_postprocess(app, recording_id: int, ts_path: str):
             ev.publish(recording_id, POSTCAPTURE_ANALYSIS_SKIPPED,
                        {'status': REC_STATUS_ANALYZING})
             timeline_scan = _recorded_timeline_scan(recording_id)
+            survey = _recorded_survey(recording_id)
+            _loud = _recorded_diagnostic(recording_id, 'loudness_measured')
+            loudness_lufs = _loud.get('lufs') if _loud else None
         else:
             # An earlier attempt that started this phase and never recorded finishing it is
             # being redone, which an operator must not have to infer - same warning the
@@ -1539,6 +1575,7 @@ def do_postprocess(app, recording_id: int, ts_path: str):
             if cfg['recording'].get('gather_health_data', True):
                 timeline_scan = _scan_recording_timeline(recording_id, ts_path,
                                                          analysis_plan=analysis_plan)
+                _run_format_analysis()
                 # Near-empty/slate detection (compute-only, no extra ffprobe) and the
                 # capture-quality score correction both depend on what the timeline scan just
                 # committed (timeline_deficit_seconds), so they run right after it, in order.
@@ -1553,6 +1590,8 @@ def do_postprocess(app, recording_id: int, ts_path: str):
                 apply_capture_quality_correction(
                     app, recording_id, analysis_completed_at=analysis_finished_at)
             else:
+                _run_format_analysis()
+
                 # No blend ran, so nothing here is an increment and the stamp is free to be
                 # its own commit.
                 @retry_on_locked()
@@ -1664,12 +1703,63 @@ def do_postprocess(app, recording_id: int, ts_path: str):
             # into a re-encode, and it still requires mp4 + reencode_mode == 'damaged'.
             # Collapsing them back together would silently start re-encoding files for
             # users who explicitly set reencode_mode: never (dev/changelog/331).
+            from . import normalize as nz
+            from .probe import HDR_TRANSFERS
+
+            video_encoder = pp.get('video_encoder', 'software') or 'software'
+            video_codec = pp.get('video_codec', nz.VIDEO_CODEC_H264) or nz.VIDEO_CODEC_H264
+            try:
+                max_height = int(pp.get('max_height', 0) or 0)
+            except (TypeError, ValueError):
+                max_height = 0
+            audio_channels_setting = (pp.get('audio_channels', nz.AUDIO_CHANNELS_SOURCE)
+                                      or nz.AUDIO_CHANNELS_SOURCE)
+
+            # WHAT THE RECORDING CONTAINS, measured once: the segment rows, the whole-file
+            # survey (recorded by the analysis phase, or run now when that phase was skipped
+            # or predates it), and the joined file's header.
+            src = None
+            if fmt == 'mp4':
+                if survey is None:
+                    survey = _survey_recording(recording_id, ts_path)
+                from .probe import nominal_video_rate, parse_ffprobe
+                header = dict(parse_ffprobe(ts_path, count_packets=False) or {})
+                header['r_frame_rate'] = nominal_video_rate(ts_path)
+                src = nz.gather_source_formats(_segment_formats(recording_id), survey, header,
+                                               HDR_TRANSFERS)
+                if pp.get('loudness_normalize') and loudness_lufs is None:
+                    _loud = _recorded_diagnostic(recording_id, 'loudness_measured')
+                    if _loud is None:
+                        loudness_lufs = _measure_recording_loudness(
+                            recording_id, ts_path, resolve_ffmpeg_path(cfg['ffmpeg']['path']))
+                    else:
+                        loudness_lufs = _loud.get('lufs')
+
+            def _plan(software):
+                """The normalize plan for one encoder. Software never normalizes an HDR
+                source - tone-mapping there costs ~46 CPU-s per second of 4K."""
+                if src is None:
+                    return nz.NormalizePlan()
+                return nz.plan_normalize(src, max_height=max_height,
+                                         audio_channels=audio_channels_setting,
+                                         hdr_ok=not software)
+
+            # The plan the TRIGGER is judged against assumes the configured encoder; a GPU
+            # that later turns out not to work changes the command, not whether the
+            # recording needed normalizing.
+            wants_gpu = video_encoder == VIDEO_ENCODER_VAAPI
+            trigger_plan = _plan(software=not wants_gpu)
+
             reencode = False
             damage_summary = None
             mixed_rate_summary = None
+            normalize_reasons = ()
+            timeline_damaged = None
             reencode_mode = pp.get('reencode_mode', 'damaged')
             if fmt == 'mp4' and reencode_mode == 'always':
                 reencode = True
+                if timeline_scan is not None:
+                    timeline_damaged = bool(timeline_scan[0])
             elif fmt == 'mp4' and reencode_mode == 'damaged':
                 # Scan only if the health phase did not already do it - this branch has
                 # always run the scan regardless of gather_health_data, and it still must,
@@ -1678,6 +1768,7 @@ def do_postprocess(app, recording_id: int, ts_path: str):
                     timeline_scan = _scan_recording_timeline(
                         recording_id, ts_path, analysis_plan=analysis_plan)
                 damaged, _metrics, summary = timeline_scan
+                timeline_damaged = bool(damaged)
                 if damaged:
                     reencode = True
                     damage_summary = summary
@@ -1692,6 +1783,20 @@ def do_postprocess(app, recording_id: int, ts_path: str):
                     # meaning" is the rule this whole defect was an instance of.
                     reencode = True
                     mixed_rate_summary = summary
+                elif src is not None and src.mixed_rate:
+                    # The same finding, seen by the whole-file survey rather than the segment
+                    # rows: a rate change inside one segment, which no row probe can see.
+                    reencode = True
+                    mixed_rate_summary = (
+                        'the file holds '
+                        + ' and '.join(f'{r:.3f}'.rstrip('0').rstrip('.') for r in src.rates)
+                        + ' fps, seen by the whole-file format survey')
+                if trigger_plan.reasons:
+                    # Not normalized: the picture size changed partway through, or it is
+                    # bigger than max_height. Like a rate change, never damage - each reason
+                    # is named on its own (dev/changelog/1184).
+                    reencode = True
+                    normalize_reasons = trigger_plan.reasons
 
             if damage_summary:
                 @retry_on_locked()
@@ -1720,31 +1825,103 @@ def do_postprocess(app, recording_id: int, ts_path: str):
 
                 _commit_mixed_rate_detected()
 
+            if normalize_reasons:
+                sizes = ' and '.join(f'{w}x{h}' for w, h in src.sizes)
+                target = f'{trigger_plan.width}x{trigger_plan.height}'
+                reason_detail = {
+                    nz.REASON_MIXED_RESOLUTION:
+                        f'The picture size changed mid-recording ({sizes}). Converting with '
+                        f'full video re-encode to bring all of it to {target}, its biggest '
+                        f'size, rather than leaving a file whose header describes only the '
+                        f'first stretch.',
+                    nz.REASON_ABOVE_MAX_RESOLUTION:
+                        f'The recording is bigger than the maximum resolution setting '
+                        f'({max_height} lines). Converting with full video re-encode to '
+                        f'bring it down to {target}.',
+                }
+
+                @retry_on_locked()
+                def _commit_normalize_needed(reasons=normalize_reasons):
+                    for reason in reasons:
+                        add_recording_event(
+                            recording_id, FORMAT_NORMALIZE_NEEDED,
+                            detail=reason_detail[reason],
+                            extra={'kind': reason,
+                                   'sizes': [list(sz) for sz in src.sizes],
+                                   'target': [trigger_plan.width, trigger_plan.height]})
+                    db.session.commit()
+
+                _commit_normalize_needed()
+
+            if src is not None and src.mixed_audio_layout:
+                # Not a re-encode trigger: mp4 audio is re-encoded on every conversion, so
+                # -ac fixes this without touching the video. Said anyway, because the layout
+                # the file ends up with is a choice the app made on the recording's behalf.
+                out_ch = trigger_plan.channels
+                layouts = ' and '.join(nz.channels_label(n) for n in src.channels)
+
+                @retry_on_locked()
+                def _commit_mixed_audio(layouts_=layouts, out_ch_=out_ch):
+                    add_recording_event(
+                        recording_id, DIAGNOSTICS,
+                        detail=f'The audio layout changed mid-recording ({layouts_}). The '
+                               f'whole file is encoded as {nz.channels_label(out_ch_)}'
+                               + (', its widest layout.'
+                                  if audio_channels_setting == nz.AUDIO_CHANNELS_SOURCE
+                                  else ', per the audio channels setting.'),
+                        extra={'kind': 'mixed_audio_layout', 'channels': list(src.channels),
+                               'output_channels': out_ch_})
+                    db.session.commit()
+
+                _commit_mixed_audio()
+
             ffmpeg_path = resolve_ffmpeg_path(cfg['ffmpeg']['path'])
 
             # WHICH ENCODER, decided once here and before the started event so that event can
             # say so. `use_gpu` is the working answer: it starts from the setting, is turned
             # off by a failed trial before the first attempt, and is turned off again by a
             # hardware death mid-run (the fallback in the loop below). A stream copy never
-            # reaches this - only a re-encode has an encoder to choose.
-            video_encoder = pp.get('video_encoder', 'software') or 'software'
+            # reaches this - only a re-encode has an encoder to choose. `gpu_codec` is the
+            # codec the GPU is encoding: the configured one, or H.264 when the device cannot
+            # do HEVC.
             vaapi_device = str(pp.get('vaapi_device') or '/dev/dri/renderD128')
             vaapi_qp = int(pp.get('vaapi_qp', 26) or 26)
+            vaapi_hevc_qp = int(pp.get('vaapi_hevc_qp', 27) or 27)
             use_gpu = False
-            # (detail, extra) of the event that says why the GPU was asked for and is not
-            # being used, written right after the started event so the two read in order.
-            encoder_fallback_event = None
-            if fmt == 'mp4' and reencode and video_encoder == VIDEO_ENCODER_VAAPI:
+            gpu_codec = nz.VIDEO_CODEC_H264
+            # (detail, extra) of the events that say why the encoder is not the one asked
+            # for, written right after the started event so they read in order.
+            encoder_events = []
+            if fmt == 'mp4' and reencode and wants_gpu:
                 from .toolchain import check_gpu_encoder
-                trial = check_gpu_encoder(ffmpeg_path, vaapi_device)
-                use_gpu = trial.ok
-                if not trial.ok:
-                    encoder_fallback_event = (
+                want_codec = (nz.VIDEO_CODEC_HEVC if video_codec == nz.VIDEO_CODEC_HEVC
+                              else nz.VIDEO_CODEC_H264)
+                trial = check_gpu_encoder(ffmpeg_path, vaapi_device, want_codec)
+                if trial.ok:
+                    use_gpu, gpu_codec = True, want_codec
+                elif want_codec == nz.VIDEO_CODEC_HEVC:
+                    # The device may still do H.264 - a GPU that encodes H.264 but not HEVC is
+                    # common on older hardware. Not reported: its pass must not turn the
+                    # HEVC alert and Readiness green (toolchain.check_gpu_encoder).
+                    h264 = check_gpu_encoder(ffmpeg_path, vaapi_device, nz.VIDEO_CODEC_H264,
+                                             report=False)
+                    use_gpu = h264.ok
+                    encoder_events.append((
+                        f'HEVC on the GPU was asked for but a one-second HEVC test encode '
+                        f'through {vaapi_device} failed, so this conversion '
+                        + ('encodes H.264 on the GPU instead.' if h264.ok else
+                           f'encodes H.264 with libx264 on the CPU instead - an H.264 test '
+                           f'encode on the GPU failed too ({h264.error}).')
+                        + f' ffmpeg reported: {trial.error}',
+                        {'kind': 'conversion_hevc_unavailable', 'device': vaapi_device,
+                         'error': trial.error, 'gpu_h264': h264.ok}))
+                else:
+                    encoder_events.append((
                         f'The GPU encoder was asked for but a one-second test encode '
                         f'through {vaapi_device} failed, so this conversion re-encodes with '
                         f'libx264 on the CPU instead. ffmpeg reported: {trial.error}',
                         {'kind': 'conversion_gpu_unavailable', 'device': vaapi_device,
-                         'error': trial.error})
+                         'error': trial.error}))
             elif (fmt == 'mp4' and reencode
                   and video_encoder not in (VIDEO_ENCODER_SOFTWARE, VIDEO_ENCODER_VAAPI)):
                 # Only a hand-edited config.yaml gets here (the settings route whitelists
@@ -1753,11 +1930,53 @@ def do_postprocess(app, recording_id: int, ts_path: str):
                 log.warning('Recording %d: recording.post_process.video_encoder is %r, which '
                             'is not a known encoder - re-encoding in software',
                             recording_id, video_encoder)
-                encoder_fallback_event = (
+                encoder_events.append((
                     f'recording.post_process.video_encoder is set to "{video_encoder}", '
                     f'which is not a known encoder (software or vaapi). Re-encoding with '
                     f'libx264 on the CPU.',
-                    {'kind': 'conversion_encoder_unknown', 'value': str(video_encoder)})
+                    {'kind': 'conversion_encoder_unknown', 'value': str(video_encoder)}))
+            if (fmt == 'mp4' and reencode and not wants_gpu
+                    and video_codec == nz.VIDEO_CODEC_HEVC):
+                # The settings page offers HEVC only with the GPU encoder: software HEVC ran
+                # at about half real time on a 14th-gen i5, so a 4 h race would take ~8 h
+                # (dev/changelog/1183). A hand-edited config gets H.264, said out loud.
+                encoder_events.append((
+                    'HEVC was asked for, but HEVC is only encoded on the GPU and the video '
+                    'encoder is set to software. Re-encoding as H.264 with libx264.',
+                    {'kind': 'conversion_hevc_needs_gpu'}))
+
+            # GPU DECODE, on top of a GPU encode: only where the damage scan ran and found the
+            # file clean, and only on one single format. The hardware decoder logs no decode
+            # errors, so on a damaged file the concealed-damage count below would read zero;
+            # and it dies on a mid-file size change in every shape measured
+            # (dev/changelog/1183).
+            hw_decode = bool(use_gpu and pp.get('vaapi_decode') and timeline_damaged is False
+                             and src is not None and src.single_format)
+
+            gpu_plan = _plan(software=False)
+            sw_plan = _plan(software=True)
+
+            def _current_plan():
+                return gpu_plan if use_gpu else sw_plan
+
+            if (fmt == 'mp4' and reencode and src is not None and src.hdr_transfer
+                    and not use_gpu):
+                # Recorded whichever way it came about - software by setting, or a GPU that
+                # was asked for and is not working.
+                encoder_events.append((
+                    f'This recording is HDR ({src.hdr_transfer}). It is not normalized in '
+                    f'software: tone-mapping HDR on the CPU costs about 46 CPU-seconds per '
+                    f'second of 4K, so its picture is re-encoded at its own size and rate, '
+                    f'as it always was. The GPU encoder normalizes HDR - keeping it as HDR10 '
+                    f'with HEVC, or tone-mapping it to SDR with H.264.',
+                    {'kind': 'normalize_skipped_hdr', 'transfer': src.hdr_transfer}))
+
+            def _encoder_name():
+                if not use_gpu:
+                    return 'libx264 on the CPU'
+                from .toolchain import VAAPI_ENCODERS
+                return (f'on the GPU ({VAAPI_ENCODERS[gpu_codec]}'
+                        + (', decoded on the GPU)' if hw_decode else ')'))
 
             mode_note = ''
             if reencode:
@@ -1765,9 +1984,11 @@ def do_postprocess(app, recording_id: int, ts_path: str):
                     mode_note = ' (video re-encode: damage detected'
                 elif mixed_rate_summary:
                     mode_note = ' (video re-encode: mixed capture frame rate'
+                elif normalize_reasons:
+                    mode_note = ' (video re-encode: not one consistent format'
                 else:
                     mode_note = ' (video re-encode: always'
-                mode_note += ', on the GPU)' if use_gpu else ', libx264 on the CPU)'
+                mode_note += f', {_encoder_name()})'
 
             @retry_on_locked()
             def _commit_conversion_started():
@@ -1790,21 +2011,33 @@ def do_postprocess(app, recording_id: int, ts_path: str):
                 return
             ev.publish(recording_id, CONVERSION_STARTED, {'status': REC_STATUS_CONVERTING})
 
-            if encoder_fallback_event:
+            if encoder_events:
                 @retry_on_locked()
-                def _commit_encoder_fallback(detail=encoder_fallback_event[0],
-                                             extra=encoder_fallback_event[1]):
-                    add_recording_event(recording_id, DIAGNOSTICS, detail=detail, extra=extra)
+                def _commit_encoder_events(events_=tuple(encoder_events)):
+                    for detail, extra in events_:
+                        add_recording_event(recording_id, DIAGNOSTICS, detail=detail,
+                                            extra=extra)
                     db.session.commit()
 
-                _commit_encoder_fallback()
+                _commit_encoder_events()
 
             video_crf = int(pp.get('video_crf', 20) or 20)
             audio_kbps = int(pp.get('audio_bitrate_kbps', 192) or 192)
-            rate = None
-            if fmt == 'mp4' and reencode:
-                from .probe import nominal_video_rate
-                rate = nominal_video_rate(ts_path)
+            loudness_gain = (nz.loudness_gain_db(loudness_lufs)
+                             if pp.get('loudness_normalize') and fmt == 'mp4' else None)
+            if pp.get('loudness_normalize') and fmt == 'mp4' and loudness_gain is None:
+                @retry_on_locked()
+                def _commit_loudness_skipped(lufs=loudness_lufs):
+                    add_recording_event(
+                        recording_id, DIAGNOSTICS,
+                        detail=('Loudness leveling is on, but this recording is silent, so '
+                                'there is nothing to level.' if lufs is not None else
+                                'Loudness leveling is on, but the measurement failed, so the '
+                                'audio is converted at its own level.'),
+                        extra={'kind': 'loudness_not_applied', 'lufs': lufs})
+                    db.session.commit()
+
+                _commit_loudness_skipped()
 
             # Only a re-encode checkpoints. A stream copy finishes in minutes on files this
             # size (3m to 15m47s measured on real recordings), so parts would buy nothing and
@@ -1834,6 +2067,8 @@ def do_postprocess(app, recording_id: int, ts_path: str):
                 first, and swaps +faststart for fragmented flags so a part killed mid-write is
                 still readable. The seek is an INPUT seek, before -i, which decodes from the
                 preceding keyframe and discards - accurate, and the shape finding 2 measured.
+                It sits correctly beside -reinit_filter:v 0, in either order, across a
+                mid-file size change (measured, dev/changelog/1184).
 
                 -max_error_rate 1.0 raises ffmpeg's default abort, which fires once 2/3 of
                 the frames in its window fail to decode: a burst of garbage audio trips it
@@ -1846,41 +2081,66 @@ def do_postprocess(app, recording_id: int, ts_path: str):
                 boundary, routine on IPTV) from reconfiguring it - measured, that truncates
                 the audio at the change and fails the conversion outright
                 (dev/changelog/800). Trading a common working case for a rare broken one is
-                the wrong direction; the fallback handles the rare one instead.
+                the wrong direction; the fallback handles the rare one instead. The VIDEO
+                one is here on the GPU path, which is a different stream and a measured need.
                 """
+                from .toolchain import vaapi_device_args, vaapi_encode_args, VAAPI_UPLOAD
                 target = dest or output_path
+                plan = _current_plan()
                 c = [ffmpeg_path, '-err_detect', 'ignore_err', '-fflags', '+genpts+discardcorrupt',
                      '-max_error_rate', '1.0']
-                if use_gpu:
-                    # A global option, so it sits before -i. Decoding stays on the CPU on
-                    # purpose: the default reencode_mode re-encodes exactly the recordings
-                    # whose streams are damaged, which is where a hardware decoder is least
-                    # proven, and the decode-error count below is read from the software
-                    # decoder's stderr (dev/changelog/1124).
-                    c += ['-vaapi_device', vaapi_device]
+                gpu_reencode = use_gpu and fmt == 'mp4' and reencode
+                if gpu_reencode and hw_decode:
+                    # The decoded frames stay on the device; -hwaccel_device opens it for the
+                    # filters and the encoder as well.
+                    c += ['-hwaccel', 'vaapi', '-hwaccel_device', vaapi_device,
+                          '-hwaccel_output_format', 'vaapi']
+                elif gpu_reencode:
+                    # A global option, so it sits before -i. Decoding stays on the CPU: the
+                    # decode-error count below is read from the software decoder's stderr
+                    # (dev/changelog/1124).
+                    c += vaapi_device_args(vaapi_device)
+                    if plan.width:
+                        # The hardware frames context is sized once, at the first frame; the
+                        # fixed-size software scale before the upload (gpu_upload_filter) is
+                        # what keeps a mid-file size change from tearing it down. Input
+                        # option, video only (dev/changelog/1183).
+                        c += ['-reinit_filter:v', '0']
                 if start_at and start_at > 0:
                     c += ['-ss', f'{start_at:.6f}']
                 c += ['-i', ts_path]
                 if fmt == 'mp4' and reencode:
                     # yuv420p keeps hardware players (Roku/TV apps) happy; 2s forced IDRs give
-                    # dense, guaranteed-clean seek points. CFR at the stream's nominal rate
-                    # (r_frame_rate - avg is skewed by the very gaps being repaired) fills
-                    # timeline holes with duplicated frames instead of leaving PTS jumps.
+                    # dense, guaranteed-clean seek points. CFR at the target rate (nominal
+                    # r_frame_rate rationals - avg is skewed by the very gaps being repaired)
+                    # fills timeline holes with duplicated frames instead of leaving PTS jumps.
                     if use_gpu:
-                        # format=nv12 does what -pix_fmt yuv420p does for libx264 (8-bit
-                        # 4:2:0, a 10-bit source included), then hwupload hands the frames to
-                        # the device. -qp is a constant quantizer on its own scale, hence a
-                        # setting of its own rather than video_crf. Forced keyframes and CFR
-                        # are honored by h264_vaapi exactly as by libx264 - measured, not
-                        # assumed (dev/changelog/1124).
-                        c += ['-vf', 'format=nv12,hwupload', '-c:v', 'h264_vaapi',
-                              '-qp', str(vaapi_qp)]
+                        hevc = gpu_codec == nz.VIDEO_CODEC_HEVC
+                        if hw_decode:
+                            vf = nz.gpu_decode_filter(plan, hevc=hevc)
+                        elif plan.width:
+                            vf = nz.gpu_upload_filter(plan, hevc=hevc)
+                        else:
+                            # Nothing measured a size: the shape that predates normalizing.
+                            vf = VAAPI_UPLOAD
+                        # format=nv12 does what -pix_fmt yuv420p does for libx264 (8-bit 4:2:0,
+                        # a 10-bit SDR source included); an HDR source keeps 10 bits for
+                        # Main10 HEVC or is tone-mapped for H.264. -qp is a constant quantizer
+                        # on each codec's own scale, hence a setting per codec. Forced
+                        # keyframes and CFR are honored by the VAAPI encoders exactly as by
+                        # libx264 - measured, not assumed (dev/changelog/1124).
+                        c += ['-vf', vf] + vaapi_encode_args(
+                            gpu_codec, vaapi_hevc_qp if hevc else vaapi_qp,
+                            main10=hevc and plan.hdr)
                     else:
+                        vf = nz.software_video_filter(plan)
+                        if vf:
+                            c += ['-vf', vf]
                         c += ['-c:v', 'libx264', '-preset', 'veryfast', '-crf', str(video_crf),
                               '-pix_fmt', 'yuv420p']
                     c += ['-force_key_frames', 'expr:gte(t,n_forced*2)']
-                    if rate:
-                        c += ['-r', rate, '-fps_mode:v', 'cfr']
+                    if plan.rate:
+                        c += ['-r', plan.rate, '-fps_mode:v', 'cfr']
                 elif fmt == 'mp4':
                     c += ['-c:v', 'copy']
                 else:
@@ -1901,12 +2161,54 @@ def do_postprocess(app, recording_id: int, ts_path: str):
                     if _copied_audio_needs_adts_filter():
                         c += ['-bsf:a', 'aac_adtstoasc']
                 else:
-                    c += ['-c:a', 'aac', '-b:a', f'{audio_kbps}k']
+                    # -ac is explicit because without it the encoder takes the FIRST audio's
+                    # layout: a stereo start downmixed a later 5.1 stretch for the whole file
+                    # (dev/changelog/1163). The widest layout in the recording, or stereo by
+                    # setting; the bitrate is per stereo pair.
+                    c += ['-c:a', 'aac']
+                    af = nz.audio_filter(loudness_gain)
+                    if af:
+                        c += ['-af', af]
+                    if plan.channels:
+                        c += ['-ac', str(plan.channels)]
+                    c += ['-b:a', f'{nz.audio_bitrate_kbps(audio_kbps, plan.channels)}k']
                 # A resumable run's parts are fragmented so a kill leaves a readable
                 # checkpoint; +faststart moves to the join that assembles them, so the final
                 # file is byte-for-byte the shape it has always been (dev/changelog/955).
                 movflags = PART_MOVFLAGS if resumable else '+faststart'
                 return c + ['-movflags', movflags, '-y', target]
+
+            def _done_note():
+                """What the finished file IS, for the done event: which encoder made it
+                (a fallback mid-run means that can differ from the started event), and what
+                the recording was normalized from and to - the source change is already on
+                the recording as RECORDING_FORMAT_CHANGED, and this is the other half."""
+                if fmt != 'mp4':
+                    return ''
+                plan = _current_plan()
+                notes = []
+                if reencode:
+                    notes.append('video re-encoded '
+                                 + ('with ' if not use_gpu else '') + _encoder_name())
+                    if src is not None and plan.normalize_video and plan.width:
+                        codec = ('HEVC' if use_gpu and gpu_codec == nz.VIDEO_CODEC_HEVC
+                                 else 'H.264')
+                        target = f'{plan.target_label()} {codec}'
+                        if plan.hdr:
+                            target += (' HDR10' if codec == 'HEVC' and use_gpu
+                                       else ', tone-mapped to SDR')
+                        if src.mixed_resolution or src.mixed_rate:
+                            heights = ' and '.join(f'{h}p' for _w, h in src.sizes)
+                            rates = ' and '.join(f'{r:.2f}'.rstrip('0').rstrip('.')
+                                                 for r in src.rates)
+                            notes.append(f'the recording held {heights}'
+                                         + (f' at {rates} fps' if rates else '')
+                                         + f'; normalized to {target}')
+                        else:
+                            notes.append(target)
+                if plan.channels and not audio_copy_fallback:
+                    notes.append(f'audio {nz.channels_label(plan.channels)}')
+                return (' - ' + '; '.join(notes)) if notes else ''
 
             # Supervised restart loop. `attempt` is the number of restarts already performed
             # (persisted across a service restart via conversion_attempts). max_restart_attempts
@@ -2123,7 +2425,20 @@ def do_postprocess(app, recording_id: int, ts_path: str):
                     # the same seam rule as the audio fallback (a file with two encoders'
                     # output joined is exactly what the signature exists to prevent), so the
                     # salvage of the killed part is skipped rather than done for nothing.
-                    use_gpu = False
+                    #
+                    # With GPU DECODE in play the decoder is the likelier culprit, so the
+                    # first step back keeps the GPU encode and decodes on the CPU; only a
+                    # death without it gives up the device - and then the cached trial pass
+                    # is dropped and the alert and Readiness are moved, so the next
+                    # conversion asks the device again instead of trusting a one-second
+                    # synthetic pass over a real failure (dev/changelog/1184).
+                    dropped_decode = hw_decode
+                    if hw_decode:
+                        hw_decode = False
+                    else:
+                        from .toolchain import record_gpu_failure
+                        record_gpu_failure(ffmpeg_path, vaapi_device, gpu_codec, last_error)
+                        use_gpu = False
                     parts_discarded = discard_conversion_parts(output_path) if resumable else 0
                     parts_done = 0
                     source_covered = 0.0
@@ -2132,34 +2447,45 @@ def do_postprocess(app, recording_id: int, ts_path: str):
                         signature = parts_signature(
                             _build_cmd(audio_copy=audio_copy_fallback), output_path)
                     attempt += 1
-                    log.warning('Recording %d: the GPU encoder failed %s into the source - '
-                                'retrying with libx264 on the CPU (%d GPU-encoded part(s) '
-                                'discarded): %s', recording_id,
+                    log.warning('Recording %d: the GPU %s failed %s into the source - '
+                                'retrying %s (%d GPU-encoded part(s) discarded): %s',
+                                recording_id, 'decoder' if dropped_decode else 'encoder',
                                 fmt_duration(result.out_time or 0, with_seconds=True),
+                                'with CPU decoding' if dropped_decode else 'with libx264 on the CPU',
                                 parts_discarded, last_error)
 
                     @retry_on_locked()
                     def _commit_gpu_fallback_event(where=result.out_time or 0, n=attempt,
                                                    dropped=parts_discarded, sig=signature,
-                                                   err=last_error):
+                                                   err=last_error, decode=dropped_decode):
                         r = db.session.get(Recording, recording_id)
                         r.conversion_attempts = n
                         # Registered before this attempt writes a part, for the reason the
                         # audio fallback's commit gives.
                         set_conversion_parts(r, signature=sig)
+                        if decode:
+                            what = (f'The GPU conversion, decoding on the GPU, failed '
+                                    f'{fmt_duration(where, with_seconds=True)} into the '
+                                    f'source. Retrying with the decoding on the CPU and the '
+                                    f'encoding still on the GPU.')
+                        else:
+                            what = (f'The GPU encoder failed '
+                                    f'{fmt_duration(where, with_seconds=True)} into the '
+                                    f'source. Retrying with libx264 on the CPU, which does '
+                                    f'not need the device.')
                         add_recording_event(
                             recording_id, CONVERSION_RESTARTED,
-                            detail=f'The GPU encoder failed '
-                                   f'{fmt_duration(where, with_seconds=True)} into the '
-                                   f'source. Retrying with libx264 on the CPU, which does '
-                                   f'not need the device.'
+                            detail=what
                                    + (f' The {dropped} part(s) the GPU already encoded '
-                                      f'cannot be joined onto software-encoded video, so '
-                                      f'they were discarded and this attempt starts from '
-                                      f'the beginning.' if dropped else '')
+                                      f'cannot be joined onto '
+                                      + ('video decoded another way' if decode
+                                         else 'software-encoded video')
+                                      + ', so they were discarded and this attempt starts '
+                                        'from the beginning.' if dropped else '')
                                    + f' ffmpeg reported: {err}',
-                            extra={'kind': 'conversion_gpu_fallback', 'device': vaapi_device,
-                                   'error': err})
+                            extra={'kind': ('conversion_gpu_decode_fallback' if decode
+                                            else 'conversion_gpu_fallback'),
+                                   'device': vaapi_device, 'error': err})
                         db.session.commit()
 
                     _commit_gpu_fallback_event()
@@ -2515,11 +2841,7 @@ def do_postprocess(app, recording_id: int, ts_path: str):
                     set_conversion_parts(r)
                     # Which encoder made the file is stated here as well as at the start,
                     # because a fallback mid-run means the two can differ.
-                    if fmt == 'mp4' and reencode:
-                        encoder_note = (' - video re-encoded on the GPU (h264_vaapi)' if use_gpu
-                                        else ' - video re-encoded with libx264 on the CPU')
-                    else:
-                        encoder_note = ''
+                    encoder_note = _done_note()
                     db.session.add(RecordingEvent(
                         recording_id=recording_id,
                         event_type=CONVERSION_DONE,
@@ -3043,6 +3365,112 @@ def _scan_recording_timeline(recording_id, ts_path, analysis_plan=None):
 
     _commit_timeline_diagnostics()
     return damaged, metrics, summary
+
+
+def _segment_formats(recording_id):
+    """[(probe_resolution, probe_fps, probe_audio_channels, probe_interlaced), ...] for the
+    segments the concat joined - same row test as _joined_segment_count. The capture-time
+    probes recorder.recording_format_pin() reads; each one sees its segment's first frames."""
+    from . import db
+    from .database import RecordingSegment
+    return db.session.query(
+        RecordingSegment.probe_resolution, RecordingSegment.probe_fps,
+        RecordingSegment.probe_audio_channels, RecordingSegment.probe_interlaced,
+    ).filter(
+        RecordingSegment.recording_id == recording_id,
+        RecordingSegment.bytes_recorded > 0,
+        RecordingSegment.excluded_reason.is_(None),
+    ).order_by(RecordingSegment.segment_number.asc()).all()
+
+
+def _recorded_diagnostic(recording_id, kind):
+    """The extra_data of the newest DIAGNOSTICS event of this kind, or None. How a resumed
+    post-process reads back a whole-file measurement instead of paying for it twice - the
+    same memo _recorded_timeline_scan is for the damage scan (dev/changelog/951)."""
+    import json
+    from .database import RecordingEvent, DIAGNOSTICS
+    events = (RecordingEvent.query
+              .filter_by(recording_id=recording_id, event_type=DIAGNOSTICS)
+              .order_by(RecordingEvent.id.desc()).all())
+    for evt in events:
+        try:
+            extra = json.loads(evt.extra_data) if evt.extra_data else {}
+        except (ValueError, TypeError):
+            continue
+        if isinstance(extra, dict) and extra.get('kind') == kind:
+            return extra
+    return None
+
+
+def _survey_recording(recording_id, ts_path, analysis_plan=None):
+    """Run the whole-file format survey, record it, and return its dict ({} on failure).
+
+    Recorded on BOTH outcomes, like the damage scan: "checked, one format" is a finding, and
+    a survey that failed has to say so or the conversion's choices look unexplained."""
+    from . import db
+    from .database import DIAGNOSTICS, add_recording_event
+    from .normalize import channels_label
+    from .probe import survey_formats
+
+    with _analysis_pass(recording_id, ANALYSIS_PASS_FORMATS, ts_path, analysis_plan) as hook:
+        survey = survey_formats(ts_path, on_progress=hook)
+    if survey:
+        sizes = ', '.join(f'{w}x{h}' + ('' if abs(sar - 1.0) < 0.001 else f' (SAR {sar:g})')
+                          for w, h, sar in survey['video_sizes'])
+        layouts = ', '.join(channels_label(n) for n in survey['audio_channels']) or 'no audio'
+        detail = (f'Format survey: picture {sizes}; audio {layouts}'
+                  + ('; interlaced' if survey['interlaced'] else '')
+                  + (f'; transfer {", ".join(survey["transfers"])}' if survey['transfers'] else '')
+                  + f' ({survey["keyframes"]} keyframes, {survey["audio_frames"]} audio frames read)')
+        extra = dict(survey, kind='format_survey')
+    else:
+        detail = ('Format survey failed - the conversion falls back on the capture-time probe '
+                  'of each segment, which sees only its first frames')
+        extra = {'kind': 'format_survey', 'survey_failed': True}
+
+    @retry_on_locked()
+    def _commit_survey():
+        add_recording_event(recording_id, DIAGNOSTICS, detail=detail, extra=extra)
+        db.session.commit()
+
+    _commit_survey()
+    log.info('Recording %d: %s', recording_id, detail)
+    return survey
+
+
+def _recorded_survey(recording_id):
+    """The survey a previous run recorded: its dict, {} if it recorded a failure, None if no
+    survey was ever recorded."""
+    extra = _recorded_diagnostic(recording_id, 'format_survey')
+    if extra is None:
+        return None
+    if extra.get('survey_failed'):
+        return {}
+    return {k: v for k, v in extra.items() if k != 'kind'}
+
+
+def _measure_recording_loudness(recording_id, ts_path, ffmpeg_path, analysis_plan=None):
+    """Measure integrated loudness, record it, and return LUFS (None on failure)."""
+    from . import db
+    from .database import DIAGNOSTICS, add_recording_event
+    from .probe import measure_loudness
+
+    with _analysis_pass(recording_id, ANALYSIS_PASS_LOUDNESS, ts_path, analysis_plan) as hook:
+        lufs = measure_loudness(ts_path, ffmpeg_path, on_progress=hook)
+    if lufs is None:
+        detail = 'Loudness measurement failed - the audio is converted without leveling'
+        extra = {'kind': 'loudness_measured', 'measure_failed': True}
+    else:
+        detail = f'Loudness measured: {lufs:.1f} LUFS integrated'
+        extra = {'kind': 'loudness_measured', 'lufs': lufs}
+
+    @retry_on_locked()
+    def _commit_loudness():
+        add_recording_event(recording_id, DIAGNOSTICS, detail=detail, extra=extra)
+        db.session.commit()
+
+    _commit_loudness()
+    return lufs
 
 
 def _near_empty_flags(spans, ratio_threshold, min_span_seconds):

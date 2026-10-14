@@ -1099,10 +1099,8 @@
           <strong>&#9888; Duplicate stream</strong><br>
           {% if duplicate_key.kind == 'provider' %}
           The same stream as {{ duplicate_channels | length }} other channel{{ 's' if duplicate_channels | length != 1 else '' }}: id {{ duplicate_key.stream_id }} on {{ duplicate_key.provider }}.
-          Accounts on one provider reach the same stream under the same id, whatever the URL says.
           {% else %}
           Shares its stream URL with {{ duplicate_channels | length }} other channel{{ 's' if duplicate_channels | length != 1 else '' }}.
-          They are the same provider stream under different names.
           {% endif %}
         </div>
         <ul class="dup-list">

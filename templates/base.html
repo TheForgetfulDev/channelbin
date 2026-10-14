@@ -52,6 +52,7 @@
   {% macro nav_icon(key) -%}
     {%- set icons = {
       'recordings': '<circle cx="9" cy="9" r="6.6"/><circle cx="9" cy="9" r="2.6" fill="currentColor" stroke="none"/>',
+      'rules': '<path d="M3.4 7.4A5.8 5.8 0 0 1 13.6 5.4"/><path d="M15.4 3.2v3.4H12"/><path d="M14.6 10.6A5.8 5.8 0 0 1 4.4 12.6"/><path d="M2.6 14.8v-3.4H6"/><circle cx="9" cy="9" r="2.2" fill="currentColor" stroke="none"/>',
       'guide': '<rect x="2" y="3.5" width="14" height="11" rx="1.5"/><path d="M2 7.5h14M7 7.5v7M11.5 7.5v7"/>',
       'live': '<circle cx="9" cy="9" r="1.9" fill="currentColor" stroke="none"/><path d="M5.8 5.8a4.6 4.6 0 0 0 0 6.4M12.2 12.2a4.6 4.6 0 0 0 0-6.4"/><path d="M3.4 3.4a8 8 0 0 0 0 11.2M14.6 14.6a8 8 0 0 0 0-11.2"/>',
       'browse': '<rect x="2" y="5.5" width="14" height="10" rx="1.5"/><path d="M6 2.5 9 5.5l3-3"/>',
@@ -81,6 +82,8 @@
     <a class="nav-link{% if request.endpoint == 'dashboard.dashboard' %} active{% endif %}" href="{{ url_for('dashboard.dashboard') }}">{{ nav_icon('live') }}<span class="nav-t">Dashboard</span> <span class="nav-count nav-count-live"{% if not nav_live_count %} style="display:none"{% endif %}>{{ nav_live_count }}</span><span class="nav-pip pip-live"{% if not nav_live_count %} style="display:none"{% endif %}></span></a>
     <div class="nav-section"><span class="nav-t">Library</span></div>
     <a class="nav-link{% if request.endpoint == 'recordings.index' %} active{% endif %}" href="{{ url_for('recordings.index') }}">{{ nav_icon('recordings') }}<span class="nav-t">Recordings</span> <span class="nav-count">{{ nav_recordings_total }}</span><span class="nav-pip"></span></a>
+    {# Auto-record rules (DESIGN-autoschedule.md §8), beside the recordings they make. #}
+    <a class="nav-link{% if request.endpoint and request.endpoint.startswith('auto_rules.') %} active{% endif %}" href="{{ url_for('auto_rules.rules_page') }}">{{ nav_icon('rules') }}<span class="nav-t">Auto-record</span></a>
     <a class="nav-link{% if request.endpoint == 'guide.guide' %} active{% endif %}" href="{{ url_for('guide.guide') }}">{{ nav_icon('guide') }}<span class="nav-t">TV Guide</span></a>
     <a class="nav-link{% if request.endpoint in ('channels.channel_browser', 'channels.channel_detail') %} active{% endif %}" href="{{ url_for('channels.channel_browser') }}">{{ nav_icon('browse') }}<span class="nav-t">Channel Search</span></a>
     {# No separate Health Checks link (DESIGN.md §14.1) - health checks live on the

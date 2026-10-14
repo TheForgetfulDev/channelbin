@@ -45,7 +45,7 @@ from app.database import UserPref  # noqa: E402
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-# The 15 destinations the production sidebar renders, in order. Health Checks is
+# The 16 destinations the production sidebar renders, in order. Health Checks is
 # deliberately absent (DESIGN.md §14.1); EPG Browser was retired (dev/changelog/631).
 # Maintenance sits second to last, between Logs and Settings (DESIGN.md §16.1,
 # dev/changelog/444) - the slot is part of the approved design, so the order here is
@@ -53,10 +53,11 @@ _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # Channels hub, whose tabs are on their way out (dev/changelog/782). Dashboard leads
 # with no section heading above it and the former Channels section is gone, its two
 # destinations folded into Library under their full names (DESIGN.md §2,
-# dev/changelog/900).
+# dev/changelog/900). Auto-record, the auto-record rules pages, follows Recordings
+# (dev/changelog/1186; named Auto-record in dev/changelog/1189).
 NAV_LABELS = [
     'Dashboard',
-    'Recordings', 'TV Guide', 'Channel Search', 'Channel Groups',
+    'Recordings', 'Auto-record', 'TV Guide', 'Channel Search', 'Channel Groups',
     'Accounts', 'Recording Profiles', 'Health Check Profiles', 'Tags', 'Hide Rules',
     'Jobs', 'Alerts', 'Logs', 'Maintenance', 'Settings',
 ]
@@ -154,7 +155,7 @@ class RenderedShellTests(unittest.TestCase):
     def _drawer(self):
         return _slice(self.html, 'id="topnav-menu"', '</div>\n\n  <div class="shell">')
 
-    def test_sidebar_renders_exactly_the_15_production_destinations(self):
+    def test_sidebar_renders_exactly_the_16_production_destinations(self):
         labels = re.findall(r'<span class="nav-t">([^<]+)</span>', self._sidebar())
         # brand + 3 section headings + the destinations
         self.assertEqual([l for l in labels if l in NAV_LABELS], NAV_LABELS)

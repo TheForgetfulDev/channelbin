@@ -7,7 +7,8 @@ from .. import db
 from ..accounts import profile_tag_cleanup
 from ..config import load_config
 from ..channel_groups import set_default_profile
-from ..database import RecordingProfile, Recording, Channel, ChannelGroup
+from ..auto_rules import unlink_profile
+from ..database import AutoRule, RecordingProfile, Recording, Channel, ChannelGroup
 from ..db_utils import retry_on_locked
 from ..profile_forms import (BOOL, INT, TEXT, Override, ProfileField, default_summary,
                              nullable_overrides, parse_profile_body, profile_payload)
@@ -198,6 +199,12 @@ def profiles_list():
         .group_by(ChannelGroup.default_profile_id)
         .all()
     )
+    rule_counts = dict(
+        db.session.query(AutoRule.profile_id, db.func.count(AutoRule.id))
+        .filter(AutoRule.profile_id.isnot(None))
+        .group_by(AutoRule.profile_id)
+        .all()
+    )
     cfg = load_config()
     defaults = _global_defaults(cfg)
     from ..accounts import filename_tag_cleanup
@@ -207,6 +214,7 @@ def profiles_list():
         rec_counts=rec_counts,
         channel_counts=channel_counts,
         group_counts=group_counts,
+        rule_counts=rule_counts,
         defaults=defaults,
         # Built here rather than in the template: the "did the user set this" test is
         # `is not None`, and a Jinja conditional written per field is where that quietly
@@ -289,6 +297,9 @@ def delete_profile(profile_id):
     def _unlink_references():
         Recording.query.filter_by(profile_id=profile_id).update({'profile_id': None})
         Channel.query.filter_by(default_profile_id=profile_id).update({'default_profile_id': None})
+        # A rule on this profile falls back to each showing's own default (§8 of
+        # DESIGN-autoschedule.md); the delete confirm says how many there are.
+        unlink_profile(profile_id)
         # A group's default goes through its one writer, so each group's timeline says the
         # profile it pre-selected was deleted (dev/changelog/1117).
         for group in ChannelGroup.query.filter_by(default_profile_id=profile_id).all():

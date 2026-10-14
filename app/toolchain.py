@@ -64,7 +64,8 @@ _cache = None
 _cache_key = None
 _capabilities = None
 _capabilities_key = None
-# {(resolved ffmpeg path, device): True} - the GPU trial encodes that PASSED. A failure is never
+# {(resolved ffmpeg path, device, codec): True} - the GPU trial encodes that PASSED. Keyed on the
+# codec too, because a device can encode H.264 and not HEVC. A failure is never
 # stored: a device that is unplugged, busy or not yet passed into the container costs one
 # second to re-ask before the next conversion, where a remembered "no" would keep a GPU
 # that has since come back out of use until a restart (dev/changelog/1125).
@@ -273,21 +274,55 @@ def reset_cache():
 # encoder compiled in fails all the same when no VA driver is installed, when /dev/dri was
 # bind-mounted rather than passed as a device, or when the app's user cannot open the node.
 
-def gpu_trial_cmd(ffmpeg_path, device):
+#: recording.post_process.video_codec -> the VAAPI encoder that writes it.
+VAAPI_ENCODERS = {'h264': 'h264_vaapi', 'hevc': 'hevc_vaapi'}
+
+
+def vaapi_device_args(device):
+    """The global option that opens the device for the upload filter and the encoder. Before
+    -i, like every global option."""
+    return ['-vaapi_device', device]
+
+
+def vaapi_encode_args(codec='h264', qp=None, main10=False):
+    """The encoder half of every VAAPI encode - the trial's and the conversion's, so a trial
+    pass proves the exact encoder the conversion will open rather than a look-alike.
+
+    hevc gets -tag:v hvc1, what Apple-family players need to accept HEVC in mp4 (the Android
+    TV test played it too, dev/changelog/1183), and -profile:v main10 for an HDR10 source
+    uploaded as p010. qp is optional because the trial measures whether the device encodes,
+    not at what quality."""
+    args = ['-c:v', VAAPI_ENCODERS.get(codec, 'h264_vaapi')]
+    if qp is not None:
+        args += ['-qp', str(qp)]
+    if codec == 'hevc':
+        if main10:
+            args += ['-profile:v', 'main10']
+        args += ['-tag:v', 'hvc1']
+    return args
+
+
+#: The upload filter both the trial and a plain conversion use: 8-bit 4:2:0 in system
+#: memory, then onto the device.
+VAAPI_UPLOAD = 'format=nv12,hwupload'
+
+
+def gpu_trial_cmd(ffmpeg_path, device, codec='h264'):
     """The one-second trial encode: a synthetic 320x240 clip uploaded to the device and
-    encoded with h264_vaapi to a null muxer. The same `-vaapi_device` / `format=nv12,
-    hwupload` / `h264_vaapi` shape the conversion uses, so a pass here means that command
-    will open the device too."""
-    return [ffmpeg_path, '-nostdin', '-hide_banner', '-loglevel', 'error',
-            '-vaapi_device', device, '-f', 'lavfi', '-i', 'testsrc2=s=320x240:d=1',
-            '-vf', 'format=nv12,hwupload', '-c:v', 'h264_vaapi', '-f', 'null', '-']
+    encoded to a null muxer, through vaapi_device_args / VAAPI_UPLOAD / vaapi_encode_args -
+    the same three pieces the conversion builds its command from, so a pass here means that
+    command will open the device and the encoder too."""
+    return ([ffmpeg_path, '-nostdin', '-hide_banner', '-loglevel', 'error']
+            + vaapi_device_args(device)
+            + ['-f', 'lavfi', '-i', 'testsrc2=s=320x240:d=1', '-vf', VAAPI_UPLOAD]
+            + vaapi_encode_args(codec) + ['-f', 'null', '-'])
 
 
-def _run_gpu_trial(ffmpeg_path, device):
+def _run_gpu_trial(ffmpeg_path, device, codec='h264'):
     """(returncode, stderr tail) of one trial encode. The seam tests patch: nothing else in
     this module spawns for the GPU. Same subprocess discipline as _probe_version."""
     try:
-        proc = subprocess.run(gpu_trial_cmd(ffmpeg_path, device), capture_output=True,
+        proc = subprocess.run(gpu_trial_cmd(ffmpeg_path, device, codec), capture_output=True,
                               text=True, timeout=_GPU_TRIAL_TIMEOUT_SECONDS)
     except subprocess.TimeoutExpired:
         return None, f'The trial encode produced nothing in {_GPU_TRIAL_TIMEOUT_SECONDS}s'
@@ -300,18 +335,19 @@ def _run_gpu_trial(ffmpeg_path, device):
 class GpuTrial:
     """What check_gpu_encoder() found. `error` is ffmpeg's own last lines when the encode
     failed, already fit to quote in an event or an alert; '' on a pass."""
-    def __init__(self, ok, error='', cached=False):
+    def __init__(self, ok, error='', cached=False, codec='h264'):
         self.ok = ok
         self.error = error
         self.cached = cached
+        self.codec = codec
 
 
-def check_gpu_encoder(ffmpeg_path, device):
-    """Prove the device encodes, and move its standing alert to match.
+def check_gpu_encoder(ffmpeg_path, device, codec='h264', report=True):
+    """Prove the device encodes `codec`, and move its standing alert to match.
 
-    A pass is served from cache for the life of the process (keyed on both the binary and
-    the device, so a settings change re-asks); a failure is re-run on every call, per the
-    note on _gpu_trial. Called before every conversion that would use the GPU, on a
+    A pass is served from cache for the life of the process (keyed on the binary, the
+    device and the codec, so a settings change re-asks); a failure is re-run on every call,
+    per the note on _gpu_trial. Called before every conversion that would use the GPU, on a
     Readiness ask, on a settings save that turns the GPU on or moves its device, and once at
     startup while the GPU is on (app/readiness.py::refresh_gpu_checks) - a second each,
     against jobs measured in minutes to hours.
@@ -328,29 +364,52 @@ def check_gpu_encoder(ffmpeg_path, device):
     Every answer, a cached pass included, also becomes Readiness's "The GPU encoder works"
     line, so a conversion's trial and a settings save's trial update the same surface the
     button does rather than leaving it at "Not run yet" beside an alert that says otherwise.
+    report=False is for the one trial that must not: the H.264 trial a conversion falls back
+    to after the configured HEVC failed. Its pass would dismiss the alert and turn Readiness
+    green while the codec the person chose still does not work (dev/changelog/1184).
     """
-    key = (_absolute(ffmpeg_path), device)
+    key = (_absolute(ffmpeg_path), device, codec)
     with _lock:
         cached = bool(_gpu_trial.get(key))
     if cached:
-        trial = GpuTrial(True, cached=True)
-        _record_in_readiness(device, trial)
+        trial = GpuTrial(True, cached=True, codec=codec)
+        if report:
+            _record_in_readiness(device, trial)
         return trial
-    rc, tail = _run_gpu_trial(ffmpeg_path, device)
+    rc, tail = _run_gpu_trial(ffmpeg_path, device, codec)
     ok = rc == 0
     if ok:
         with _lock:
             _gpu_trial[key] = True
-        log.info('GPU encoder trial passed on %s (%s)', device, key[0])
+        log.info('GPU encoder trial passed on %s for %s (%s)', device, codec, key[0])
     else:
         # WARNING, not ERROR: the log->alert handler would raise a second, unlabeled row
         # beside the standing one below.
-        log.warning('GPU encoder trial FAILED on %s (%s): %s', device, key[0],
+        log.warning('GPU encoder trial FAILED on %s for %s (%s): %s', device, codec, key[0],
                     tail or f'ffmpeg exited {rc}')
-    _report_gpu_state(device, ok, tail or f'ffmpeg exited {rc}')
-    trial = GpuTrial(ok, '' if ok else (tail or f'ffmpeg exited {rc}'))
-    _record_in_readiness(device, trial)
+    trial = GpuTrial(ok, '' if ok else (tail or f'ffmpeg exited {rc}'), codec=codec)
+    if report:
+        _report_gpu_state(device, ok, tail or f'ffmpeg exited {rc}', codec)
+        _record_in_readiness(device, trial)
     return trial
+
+
+def record_gpu_failure(ffmpeg_path, device, codec, error):
+    """A conversion's GPU encode died part-way on real content: forget the cached pass and
+    say so where the trial would have.
+
+    A one-second 320x240 synthetic trial can pass on a device that fails on a real
+    recording, and before this the cached pass outlived the failure - the alert and
+    Readiness kept saying the GPU worked, and every later conversion started on it, died,
+    discarded its GPU parts and fell back again (dev/changelog/1184). Dropping the entry
+    makes the next conversion re-run the trial (a failure is never cached), which either
+    passes again or sends it straight to the CPU without spending an attempt.
+    """
+    with _lock:
+        _gpu_trial.pop((_absolute(ffmpeg_path), device, codec), None)
+    detail = f'A conversion\'s {VAAPI_ENCODERS.get(codec, codec)} encode failed part-way: {error}'
+    _report_gpu_state(device, False, detail, codec)
+    _record_in_readiness(device, GpuTrial(False, detail, codec=codec))
 
 
 def _record_in_readiness(device, trial):
@@ -358,7 +417,7 @@ def _record_in_readiness(device, trial):
     record_gpu_trial(device, trial)
 
 
-def _report_gpu_state(device, ok, error):
+def _report_gpu_state(device, ok, error, codec='h264'):
     from flask import has_app_context
     if not has_app_context():
         return
@@ -369,14 +428,24 @@ def _report_gpu_state(device, ok, error):
         if ok:
             dismiss_open_alerts(GPU_ENCODER_UNAVAILABLE, source)
         elif not has_open_alert(GPU_ENCODER_UNAVAILABLE, source):
+            if codec == 'hevc':
+                title = 'The GPU cannot encode HEVC, so conversions are using H.264'
+                what = (f'Settings ask for video re-encodes to be HEVC on the GPU '
+                        f'(recording.post_process.video_codec: hevc), but an HEVC encode '
+                        f'through {device} failed. Every conversion that needs a re-encode '
+                        f'still completes as H.264 - on the GPU if the device can encode '
+                        f'that, otherwise with libx264 on the CPU - and says which in its '
+                        f'event log. ffmpeg reported: {error}')
+            else:
+                title = 'The GPU encoder is not working, so conversions are using the CPU'
+                what = (f'Settings ask for video re-encodes to run on the GPU '
+                        f'(recording.post_process.video_encoder: vaapi), but a test encode '
+                        f'through {device} failed. Every conversion that needs a re-encode '
+                        f'still completes, using libx264 on the CPU, and says so in its '
+                        f'event log. ffmpeg reported: {error}')
             create_alert(
-                GPU_ENCODER_UNAVAILABLE,
-                'The GPU encoder is not working, so conversions are using the CPU',
-                body=(f'Settings ask for video re-encodes to run on the GPU '
-                      f'(recording.post_process.video_encoder: vaapi), but a one-second '
-                      f'test encode through {device} failed. Every conversion that needs a '
-                      f're-encode still completes, using libx264 on the CPU, and says so in '
-                      f'its event log. ffmpeg reported: {error}\n\n'
+                GPU_ENCODER_UNAVAILABLE, title,
+                body=(f'{what}\n\n'
                       f'In Docker the device has to be passed as a device (--device '
                       f'/dev/dri, or --device=/dev/dri in the Extra Parameters of the '
                       f'Unraid template), not as a folder mapping, and it is only '

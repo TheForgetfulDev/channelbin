@@ -182,20 +182,28 @@ await scenario('fixed_missing',
     Object.assign({}, SUGGEST[1], { lifecycle: 'missing', lifecycle_date: '2026-09-01' }),
   ] })]]);
 
-// 8. The soft warnings with a provider copy among them (DESIGN-account-providers.md §9):
-//    the server's sentence, escaped, under its own heading, with Proceed anyway.
+// 8. The soft warnings with duplicate sets: one line for every set, by URL or through a
+//    provider (dev/changelog/1175), counted on the extras, the provider name escaped.
 {
   const { w, errors } = boot();
-  const host = w.document.createElement('div');
-  host.innerHTML = w.groupWarningsHtml({ success: false, provider_copies: [
-    { text: 'direct: <b>One</b> is the same channel as curated: One, which is already a member.' },
-  ] }, 'warn-force');
-  out.provider_copies_warning = {
-    text: host.textContent.replace(/\s+/g, ' ').trim(),
-    items: host.querySelectorAll('li').length,
-    bold: host.querySelectorAll('b').length,
-    proceed: Boolean(host.querySelector('#warn-force')),
-    warn_glyph: host.textContent.includes('\u26a0'),
+  const draw = (sets) => {
+    const host = w.document.createElement('div');
+    host.innerHTML = w.groupWarningsHtml({ success: false, duplicate_warning: true, dup_groups: sets },
+      'warn-force', 'warn-dedup');
+    return {
+      text: host.textContent.replace(/\s+/g, ' ').trim(),
+      items: host.querySelectorAll('li').length,
+      bold: host.querySelectorAll('b').length,
+      proceed: Boolean(host.querySelector('#warn-force')),
+      dedup: (host.querySelector('#warn-dedup') || { textContent: '' }).textContent,
+    };
+  };
+  const ch = (id) => ({ channel_id: id, channel_name: `C${id}`, account_name: 'a' });
+  out.duplicate_sets_warning = {
+    provider: draw([{ suggested_keep_id: 1, provider: '<b>Strong</b>', channels: [ch(1), ch(2), ch(3)] }]),
+    url: draw([{ suggested_keep_id: 4, provider: null, channels: [ch(4), ch(5)] }]),
+    both: draw([{ suggested_keep_id: 1, provider: 'Strong', channels: [ch(1), ch(2)] },
+                { suggested_keep_id: 4, provider: null, channels: [ch(4), ch(5)] }]),
   };
   out.errors.push(...errors);
 }

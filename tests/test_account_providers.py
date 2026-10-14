@@ -239,7 +239,7 @@ class PageTests(_Case):
         self.assertIn('Shared with skyline-curated', html)
         self.assertIn('A block on skyline-curated also covers this account', html)
         own = self.client.get(f'/accounts/{self.cur_id}').get_data(as_text=True)
-        self.assertIn('This block also covers skyline-direct, which shares login "main".', own)
+        self.assertIn('Also covers skyline-direct (shared login "main").', own)
 
     def test_the_routes_create_share_unshare_remove_and_delete(self):
         resp = self.client.post('/api/providers', json={'name': 'skyline',

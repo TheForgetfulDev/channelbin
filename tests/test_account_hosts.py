@@ -217,6 +217,27 @@ class ListWriterTests(_Case):
                 .filter(Channel.account_id == self.acc_id).all()}
         self.assertTrue(all('a1.skyline.example' in u or 'radio' in u for u in raws))
 
+    def test_make_active_moves_the_stamped_stream_host_only_when_it_was_listed(self):
+        acc = db.session.get(Account, self.acc_id)
+        acc.stream_host = 'a1.skyline.example'
+        db.session.commit()
+        self._list('a2.skyline.example')
+        target = AccountHost.query.filter_by(account_id=self.acc_id, host='a2.skyline.example').one()
+        links.set_active_host(self.acc_id, target.id)
+        db.session.expire_all()
+        self.assertEqual(db.session.get(Account, self.acc_id).stream_host, 'a2.skyline.example')
+        acc = db.session.get(Account, self.acc_id)
+        acc.stream_host = 'cdn.elsewhere.example'
+        db.session.commit()
+        back = AccountHost.query.filter_by(account_id=self.acc_id, host='a1.skyline.example').one()
+        links.set_active_host(self.acc_id, back.id)
+        db.session.expire_all()
+        self.assertEqual(db.session.get(Account, self.acc_id).stream_host, 'cdn.elsewhere.example',
+                         'URLs on a host outside the list did not move, so neither does the stamp')
+
+    def test_current_host_is_the_majority_host(self):
+        self.assertEqual(links.current_host(self.acc_id), 'a1.skyline.example')
+
     def test_deleting_the_account_takes_its_host_rows(self):
         self._list('a2.skyline.example')
         resp = self.client.delete(f'/api/accounts/{self.acc_id}')
@@ -397,17 +418,65 @@ class ProbeTests(_Case):
 
 class RouteAndPageTests(_Case):
 
+    def _page(self):
+        return self.client.get(f'/accounts/{self.acc_id}').get_data(as_text=True)
+
+    def _card(self, html):
+        return html.split('data-section="hosts"')[1].split('data-section="logins"')[0]
+
+    def _stamp_stream_host(self, host):
+        acc = db.session.get(Account, self.acc_id)
+        acc.stream_host = host
+        db.session.commit()
+
     def test_the_page_shows_the_hint_with_no_list_and_the_rows_with_one(self):
-        html = self.client.get(f'/accounts/{self.acc_id}').get_data(as_text=True)
+        self._stamp_stream_host('a1.skyline.example')
+        html = self._page()
         self.assertIn('data-section="hosts"', html)
-        self.assertIn('Add the others your reseller gave you', html)
+        self.assertIn('Add the other hosts your reseller gave you', html)
         self.assertEqual(html.count('data-act="host-add"'), 1)
         self._list('a2.skyline.example')
-        html = self.client.get(f'/accounts/{self.acc_id}').get_data(as_text=True)
+        html = self._page()
         self.assertIn('<code>a1.skyline.example</code>', html)
         self.assertIn('<code>a2.skyline.example</code>', html)
         self.assertIn('Not checked yet', html)
         self.assertEqual(html.count('data-act="host-activate"'), 2)
+
+    def test_with_nothing_listed_the_streams_host_is_a_row_with_no_actions(self):
+        """dev/changelog/1176: the card used to show only a sentence with no host in it."""
+        self._stamp_stream_host('a1.skyline.example')
+        card = self._card(self._page())
+        self.assertIn('data-host-row="streams"', card)
+        self.assertIn('<code>a1.skyline.example</code>', card)
+        self.assertIn('Active', card)
+        self.assertIn('<span class="cnt">1</span>', card)
+        row = card.split('data-host-row="streams"')[1].split('</tr>')[0]
+        self.assertNotIn('data-host-id', row, 'the row has no host id an action could post')
+        self.assertNotIn('data-menu', row)
+
+    def test_with_no_channels_yet_the_card_says_so_instead_of_an_empty_table(self):
+        card = self._card(self._page())
+        self.assertNotIn('data-host-row="streams"', card)
+        self.assertIn('No stream URLs yet', card)
+        self.assertNotIn('<table', card)
+
+    def test_a_listed_streams_host_is_not_shown_twice(self):
+        self._stamp_stream_host('a1.skyline.example')
+        self._list('a2.skyline.example')
+        card = self._card(self._page())
+        self.assertNotIn('data-host-row="streams"', card)
+        self.assertEqual(card.count('<code>a1.skyline.example</code>'), 1)
+        self.assertIn('<span class="cnt">2</span>', card)
+
+    def test_streams_on_a_host_outside_the_list_are_shown_as_not_listed(self):
+        self._list('a2.skyline.example')
+        self._stamp_stream_host('cdn.elsewhere.example')
+        card = self._card(self._page())
+        self.assertIn('data-host-row="streams"', card)
+        self.assertIn('<code>cdn.elsewhere.example</code>', card)
+        self.assertIn('Not listed', card)
+        self.assertIn('<span class="cnt">3</span>', card)
+        self.assertIn('data-others="1"', card, 'the extra row does not count as a listed host')
 
     def test_the_routes_add_activate_and_remove_through_the_one_writer(self):
         resp = self.client.post(f'/api/accounts/{self.acc_id}/hosts', json={'host': 'a2.skyline.example'})

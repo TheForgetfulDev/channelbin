@@ -1508,6 +1508,8 @@ _CURRENT_CODE_IMPORTS = {
     ('_m024_channel_search_support', '.accounts.url_is_normalizable'): _DEFINED_BY,
     # channels.provider_stream_id is defined the same way, by the same parse.
     ('_m087_channel_provider_stream_id', '.accounts.url_provider_stream_id'): _DEFINED_BY,
+    # accounts.stream_host is defined as the count current_host() makes at sync.
+    ('_m089_account_stream_host', '.account_links.dominant_host'): _DEFINED_BY,
     # _m004 is the one dependency of a different kind: legacy channel_testing keys are the
     # user's own config, which is state like the database, not code.
     ('_m004_unify_guide_health_checks', '.config.load_config'): _INPUT_STATE,

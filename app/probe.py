@@ -1,6 +1,7 @@
 """Shared ffprobe utility used by channel tester and post-processor."""
 import json
 import logging
+import math
 import os
 import queue
 import re
@@ -588,6 +589,242 @@ def effective_capture_fps(segment_rates) -> tuple:
     return effective, distinct
 
 
+def _stream_probe_lines(cmd, on_line, *, timeout, on_progress=None, merge_stderr=False) -> int:
+    """Run a whole-file ffprobe whose stdout is one record per line, hand each line to
+    on_line as it arrives, and return the exit code. OSError from the spawn propagates for
+    the caller to report; subprocess.TimeoutExpired is raised on inactivity.
+
+    timeout bounds inactivity, not total wall time: a probe reading a large file
+    legitimately runs for minutes, so the deadline must reset on every line rather than cap
+    the read loop outright (dev/changelog/797's run_probe_until_stalled is the same shape,
+    over bytes read; a line here is the cheaper, more direct progress signal). A reader
+    thread is required to make that inactivity actually observable - reading proc.stdout
+    directly in the loop blocks the whole thread on a stalled ffprobe with no way to notice
+    no line has arrived.
+
+    on_progress(read_bytes) is sampled on a clock rather than per line: a 6-hour capture is
+    millions of lines, and an unthrottled read would turn one /proc open per second into one
+    per line.
+    """
+    # merge_stderr: ffmpeg's filters log to stderr, and that log IS the record a measurement
+    # reads. It is drained by the same reader as stdout, so it can never fill a pipe buffer.
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT if merge_stderr else subprocess.DEVNULL,
+                            text=True, errors='replace')
+    lines: queue.Queue = queue.Queue()
+
+    def _reader():
+        try:
+            for line in proc.stdout:
+                lines.put(line)
+        finally:
+            lines.put(None)
+
+    reader = threading.Thread(target=_reader, daemon=True)
+    reader.start()
+
+    try:
+        last_progress = time.monotonic()
+        last_report = last_progress
+        _report_progress(on_progress, _bytes_read(proc.pid))
+        while True:
+            try:
+                line = lines.get(timeout=1.0)
+            except queue.Empty:
+                if time.monotonic() - last_progress > timeout:
+                    raise subprocess.TimeoutExpired(cmd, timeout)
+                continue
+            if line is None:
+                break
+            last_progress = time.monotonic()
+            if on_progress is not None and last_progress - last_report >= _SCAN_PROGRESS_INTERVAL:
+                last_report = last_progress
+                _report_progress(on_progress, _bytes_read(proc.pid))
+            on_line(line)
+        proc.wait(timeout=timeout)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+        reader.join(timeout=5)
+        proc.stdout.close()  # runs per recording and per channel test; don't leak fds
+    return proc.returncode
+
+
+#: A PQ or HLG transfer function is the only thing that proves a source is HDR. Frame width
+#: is not, and the 3840-wide trigger this replaced is what made the screenshot HDR path
+#: wrong: it pulled 4K *SDR* into the tonemap chain, where a bar pattern whose mean luma is
+#: 102 came back at 66. A source that declares no transfer at all is left alone for the same
+#: reason, in the other direction: unknown is not a proven HDR (dev/changelog/915).
+HDR_TRANSFERS = ('smpte2084', 'arib-std-b67')
+
+
+def _parse_sar(raw):
+    """'4:3' -> 4/3; None for absent, '0:1' or 'N/A' - an unstated aspect is square."""
+    try:
+        num, den = (int(x) for x in (raw or '').split(':'))
+    except ValueError:
+        return None
+    return num / den if num > 0 and den > 0 else None
+
+
+def survey_formats(filepath: str, timeout: int = 600, on_progress=None) -> dict:
+    """Every picture size, audio layout, interlacing and transfer function the file carries,
+    from ONE whole-file read: video keyframes only (`-skip_frame nokey`) and every audio
+    frame.
+
+    The segment rows' capture-time probes see only each segment's first frames, so a format
+    change inside one segment - a stereo pre-roll before a 5.1 program with no restart, a
+    provider switching feeds under one connection - is invisible to them. This is what sees
+    it. Measured on this box (dev/changelog/1184): 12.8 s wall / 12.7 CPU-s for a 25 min
+    1080p recording, about 2 minutes for 4 hours; 4K HEVC Main10 keyframes decode at about
+    3 CPU-s per minute. Keyframes are enough for video because a picture size, an
+    interlacing mode or a transfer function can only change at one.
+
+    Returns {} on any failure (unknown must never read as "one format"), else:
+        video_sizes     [[width, height, sar], ...] distinct, sar a float (1.0 when unstated)
+        interlaced      True when any keyframe was coded interlaced
+        video_rates     distinct frame rates, from each keyframe's own duration
+        transfers       distinct color_transfer values a keyframe stated
+        audio_channels  distinct channel counts across every audio stream
+        keyframes, audio_frames  how much was seen, so an empty answer is explainable
+    """
+    if not filepath or not os.path.exists(filepath):
+        return {}
+    ffprobe_path = resolve_ffprobe_path()
+    cmd = [ffprobe_path, '-v', 'error', '-skip_frame', 'nokey', '-show_entries',
+           'frame=media_type,stream_index,width,height,sample_aspect_ratio,interlaced_frame,'
+           'color_transfer,duration_time,channels', '-of', 'compact=p=0', filepath]
+    st = {'sizes': set(), 'interlaced': False, 'transfers': set(), 'channels': set(),
+          'rates': [], 'video_stream': None, 'keyframes': 0, 'audio_frames': 0}
+
+    def _on_line(line):
+        fields = dict(part.split('=', 1) for part in line.strip().split('|') if '=' in part)
+        kind = fields.get('media_type')
+        if kind == 'video':
+            # The first video stream only: it is the one the conversion encodes.
+            if st['video_stream'] is None:
+                st['video_stream'] = fields.get('stream_index')
+            if fields.get('stream_index') != st['video_stream']:
+                return
+            try:
+                w, h = int(fields.get('width', 0)), int(fields.get('height', 0))
+            except ValueError:
+                return
+            if w <= 0 or h <= 0:
+                return
+            st['keyframes'] += 1
+            st['sizes'].add((w, h, round(_parse_sar(fields.get('sample_aspect_ratio')) or 1.0, 4)))
+            if fields.get('interlaced_frame') == '1':
+                st['interlaced'] = True
+            # A keyframe's duration is one frame at the rate in force there, so a rate change
+            # inside one segment shows up here as it does nowhere else.
+            duration = _packet_time(fields.get('duration_time', ''))
+            if duration and 0.001 < duration < 1.0:
+                rate = round(1.0 / duration, 3)
+                if not any(abs(rate - r) / r <= RATE_SAME_TOLERANCE for r in st['rates']):
+                    st['rates'].append(rate)
+            transfer = fields.get('color_transfer') or ''
+            if transfer and transfer not in ('unknown', 'unspecified', 'reserved'):
+                st['transfers'].add(transfer)
+        elif kind == 'audio':
+            try:
+                n = int(fields.get('channels', 0))
+            except ValueError:
+                return
+            if n > 0:
+                st['audio_frames'] += 1
+                st['channels'].add(n)
+
+    try:
+        returncode = _stream_probe_lines(cmd, _on_line, timeout=timeout, on_progress=on_progress)
+    except OSError as exc:
+        _report_ffprobe_unusable(ffprobe_path, exc, os.path.basename(filepath))
+        return {}
+    except subprocess.SubprocessError as exc:
+        log.warning('Format survey failed for %s: %s', filepath, exc)
+        return {}
+    if returncode != 0 or not st['keyframes']:
+        return {}
+    return {
+        'video_sizes': [list(s) for s in sorted(st['sizes'])],
+        'interlaced': st['interlaced'],
+        'video_rates': sorted(st['rates']),
+        'transfers': sorted(st['transfers']),
+        'audio_channels': sorted(st['channels']),
+        'keyframes': st['keyframes'],
+        'audio_frames': st['audio_frames'],
+    }
+
+
+#: What ebur128 reports for audio with nothing above its absolute gate - silence, or close
+#: enough that there is no program loudness to measure.
+LOUDNESS_SILENT_LUFS = -70.0
+
+_EBUR128_LINE_RE = re.compile(r'^\[Parsed_ebur128_\d+ @ (0x[0-9a-f]+)\] t: *([0-9.]+).*?'
+                              r'\bI: *(-?[0-9.]+) LUFS')
+
+
+def combine_loudness(instances) -> float | None:
+    """One integrated loudness from [(seconds, lufs), ...], one pair per ebur128 instance.
+
+    ffmpeg rebuilds the audio filter graph when the decoded layout changes (stereo -> 5.1 at
+    a program boundary), and each rebuild is a fresh ebur128 with its own integrated
+    figure - measured on a stereo-then-5.1 file, two summaries (dev/changelog/1184). They
+    are combined by duration-weighted ENERGY, which is how integrated loudness itself
+    averages; a mean of the LUFS figures would weight a quiet stretch far above its share.
+    The gate is per instance, so the result is an approximation across a layout change and
+    exact for a file that never changed. None when nothing was measured.
+    """
+    usable = [(float(d), float(lufs)) for d, lufs in instances if d and d > 0]
+    if not usable:
+        return None
+    total = sum(d for d, _ in usable)
+    energy = sum(d * 10 ** (lufs / 10.0) for d, lufs in usable) / total
+    if energy <= 10 ** (LOUDNESS_SILENT_LUFS / 10.0):
+        return LOUDNESS_SILENT_LUFS
+    return round(10.0 * math.log10(energy), 2)
+
+
+def measure_loudness(filepath: str, ffmpeg_path: str, timeout: int = 600,
+                     on_progress=None) -> float | None:
+    """Integrated loudness (LUFS) of the audio the conversion would encode, or None.
+
+    One ebur128 pass over the audio alone (-vn, ffmpeg's own default audio pick, the same
+    stream the conversion takes). Measured at 116 CPU-s for 4 hours of audio, against ~11x
+    that for a two-pass loudnorm (dev/changelog/1183). The per-100 ms log lines are read
+    live rather than the closing summary, because they carry which ebur128 instance spoke
+    and when, and a layout change splits the file across several (combine_loudness).
+    """
+    if not filepath or not os.path.exists(filepath):
+        return None
+    cmd = [ffmpeg_path, '-hide_banner', '-nostats', '-nostdin', '-loglevel', 'info',
+           '-i', filepath, '-vn', '-sn', '-dn', '-af', 'ebur128', '-f', 'null', '-']
+    instances = {}
+
+    def _on_line(line):
+        m = _EBUR128_LINE_RE.match(line)
+        if not m:
+            return
+        key, t, lufs = m.group(1), float(m.group(2)), float(m.group(3))
+        entry = instances.setdefault(key, [t, t, lufs])
+        entry[1] = t
+        entry[2] = lufs
+
+    try:
+        returncode = _stream_probe_lines(cmd, _on_line, timeout=timeout,
+                                         on_progress=on_progress, merge_stderr=True)
+    except (OSError, subprocess.SubprocessError) as exc:
+        log.warning('Loudness measurement failed for %s: %s', filepath, exc)
+        return None
+    if returncode != 0:
+        log.warning('Loudness measurement for %s exited %s', filepath, returncode)
+        return None
+    # Each log line is 100 ms of audio, so an instance's span is last - first plus one line.
+    return combine_loudness([(last - first + 0.1, lufs)
+                             for first, last, lufs in instances.values()])
+
+
 def scan_video_timeline(filepath: str, gap_threshold: float = 0.25, timeout: int = 600,
                         expected_fps: float | None = None, on_progress=None) -> dict:
     """Scan every video packet's timestamps and measure timeline damage.
@@ -654,108 +891,62 @@ def scan_video_timeline(filepath: str, gap_threshold: float = 0.25, timeout: int
 
         cmd = [ffprobe_path, '-v', 'error', '-select_streams', 'v:0',
                '-show_entries', 'packet=pts_time,dts_time', '-of', 'csv=p=0', filepath]
+        st = {'low': None, 'highwater': None, 'count': 0, 'prev_dts': None,
+              'dts_low': None, 'dts_high': None, 'saw_dts': False, 'gap_count': 0,
+              'gap_seconds': 0.0, 'max_gap': 0.0, 'backward_count': 0}
+
+        def _on_line(line):
+            fields = line.strip().rstrip(',').split(',')
+            pts = _packet_time(fields[0] if fields else '')
+            dts = _packet_time(fields[1] if len(fields) > 1 else '')
+            # A packet with neither timestamp tells us nothing about the timeline.
+            if pts is None and dts is None:
+                return
+
+            # Presentation timeline: span and packet count only, no gap accounting.
+            # min/max rather than first/last because with B-frames the first packet in
+            # storage order is not the earliest-presented one.
+            stamp = pts if pts is not None else dts
+            st['count'] += 1
+            if st['low'] is None or stamp < st['low']:
+                st['low'] = stamp
+            if st['highwater'] is None or stamp > st['highwater']:
+                st['highwater'] = stamp
+
+            # Decode timeline: the only basis gap accounting runs on. Packets missing a
+            # DTS are skipped rather than substituted with PTS - mixing the two timelines
+            # would manufacture a gap at every switch between them.
+            if dts is not None:
+                st['saw_dts'] = True
+                if st['dts_low'] is None or dts < st['dts_low']:
+                    st['dts_low'] = dts
+                if st['dts_high'] is None or dts > st['dts_high']:
+                    st['dts_high'] = dts
+                if st['prev_dts'] is not None:
+                    step = dts - st['prev_dts']
+                    if step < 0:
+                        st['backward_count'] += 1
+                    elif step > gap_threshold:
+                        st['gap_count'] += 1
+                        st['gap_seconds'] += step
+                        if step > st['max_gap']:
+                            st['max_gap'] = step
+                st['prev_dts'] = dts
+
         try:
-            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
-                                    stderr=subprocess.DEVNULL, text=True)
+            returncode = _stream_probe_lines(cmd, _on_line, timeout=timeout,
+                                             on_progress=on_progress)
         except OSError as exc:
             # See parse_ffprobe: this is the binary failing to execute, not a file with no
             # measurable timeline, and the two must not share one empty answer.
             _report_ffprobe_unusable(ffprobe_path, exc, os.path.basename(filepath))
             return {}
-        low = None
-        highwater = None
-        count = 0
-        prev_dts = None
-        dts_low = None
-        dts_high = None
-        saw_dts = False
-        gap_count = 0
-        gap_seconds = 0.0
-        max_gap = 0.0
-        backward_count = 0
 
-        # timeout bounds inactivity, not total wall time: a probe reading a large file
-        # legitimately runs for minutes, so the deadline must reset on every line rather
-        # than cap the read loop outright (dev/changelog/797's run_probe_until_stalled is
-        # the same shape, over bytes read; a CSV line here is the cheaper, more direct
-        # progress signal). A reader thread is required to make that inactivity actually
-        # observable - reading proc.stdout directly in this loop, as before, blocks the
-        # whole thread on a stalled ffprobe with no way to notice no line has arrived.
-        lines: queue.Queue = queue.Queue()
-
-        def _reader():
-            try:
-                for line in proc.stdout:
-                    lines.put(line)
-            finally:
-                lines.put(None)
-
-        reader = threading.Thread(target=_reader, daemon=True)
-        reader.start()
-
-        try:
-            last_progress = time.monotonic()
-            last_report = last_progress
-            _report_progress(on_progress, _bytes_read(proc.pid))
-            while True:
-                try:
-                    line = lines.get(timeout=1.0)
-                except queue.Empty:
-                    if time.monotonic() - last_progress > timeout:
-                        raise subprocess.TimeoutExpired(cmd, timeout)
-                    continue
-                if line is None:
-                    break
-                last_progress = time.monotonic()
-                if on_progress is not None and last_progress - last_report >= _SCAN_PROGRESS_INTERVAL:
-                    last_report = last_progress
-                    _report_progress(on_progress, _bytes_read(proc.pid))
-
-                fields = line.strip().rstrip(',').split(',')
-                pts = _packet_time(fields[0] if fields else '')
-                dts = _packet_time(fields[1] if len(fields) > 1 else '')
-                # A packet with neither timestamp tells us nothing about the timeline.
-                if pts is None and dts is None:
-                    continue
-
-                # Presentation timeline: span and packet count only, no gap accounting.
-                # min/max rather than first/last because with B-frames the first packet in
-                # storage order is not the earliest-presented one.
-                stamp = pts if pts is not None else dts
-                count += 1
-                if low is None or stamp < low:
-                    low = stamp
-                if highwater is None or stamp > highwater:
-                    highwater = stamp
-
-                # Decode timeline: the only basis gap accounting runs on. Packets missing a
-                # DTS are skipped rather than substituted with PTS - mixing the two timelines
-                # would manufacture a gap at every switch between them.
-                if dts is not None:
-                    saw_dts = True
-                    if dts_low is None or dts < dts_low:
-                        dts_low = dts
-                    if dts_high is None or dts > dts_high:
-                        dts_high = dts
-                    if prev_dts is not None:
-                        step = dts - prev_dts
-                        if step < 0:
-                            backward_count += 1
-                        elif step > gap_threshold:
-                            gap_count += 1
-                            gap_seconds += step
-                            if step > max_gap:
-                                max_gap = step
-                    prev_dts = dts
-            proc.wait(timeout=timeout)
-        finally:
-            if proc.poll() is None:
-                proc.kill()
-                proc.wait()
-            reader.join(timeout=5)
-            proc.stdout.close()  # scanner runs per recording and per channel test; don't leak fds
-
-        if proc.returncode != 0 or count < 2 or low is None:
+        low, highwater, count = st['low'], st['highwater'], st['count']
+        saw_dts, backward_count = st['saw_dts'], st['backward_count']
+        dts_low, dts_high = st['dts_low'], st['dts_high']
+        gap_count, gap_seconds, max_gap = st['gap_count'], st['gap_seconds'], st['max_gap']
+        if returncode != 0 or count < 2 or low is None:
             return {}
 
         span = highwater - low

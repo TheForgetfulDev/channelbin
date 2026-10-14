@@ -282,7 +282,9 @@ class TheFacetRailHasItsOwnEndpointTests(_Base):
     def test_the_facets_endpoint_carries_the_rail_and_nothing_else(self):
         self.make_healthy()
         payload = self.get(FACETS_URL, 'q=espn&facets=acct')
-        self.assertEqual(set(payload), {'success', 'facets', 'facets_counted',
+        # `uncounted` is part of the rail: the facets left out on purpose, and why
+        # (dev/changelog/1187).
+        self.assertEqual(set(payload), {'success', 'facets', 'facets_counted', 'uncounted',
                                         'declined', 'declined_reason'})
         self.assertNotIn('rows', payload)
 

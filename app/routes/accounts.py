@@ -1,4 +1,3 @@
-import json
 import threading
 from datetime import datetime, timedelta
 
@@ -15,7 +14,7 @@ from ..accounts import (NORM_DISABLED, NORM_MODES, coerce_normalization_mode,
                         start_source_refresh, sync_signature, update_source_stale_alert)
 from .. import account_stats_view
 from ..account_links import (add_host, add_login, delete_hosts_for_account,
-                             delete_logins_for_account, hosts_for_accounts,
+                             delete_logins_for_account, hosts_for_accounts, is_refused_now,
                              logins_for_accounts, move_login, refusal_cooldown, remove_host,
                              remove_login, set_active_host, update_login)
 from ..account_stats import WINDOWS, today_local, windowed_stats
@@ -25,8 +24,9 @@ from ..config import load_config, config_default
 from ..database import (Account, AccountBlock, AccountStatDay, Channel, AccountSyncLog,
                         ChannelGroupMember, ChannelTest, EpgSource, EpgSourceSubscription,
                         EPG_SOURCE_PROVIDER, EPG_SOURCE_URL)
-from ..db_utils import retry_on_locked
+from ..db_utils import chunked, retry_on_locked
 from ..epg_sources import (MATCH_DISAGREE, MATCH_NEW, REFRESH_HOURS_CHOICES,
+                           case_sensitive_matching,
                            accept_name_matches, account_sources_view,
                            add_url_source, borrowable_sources, clean_url_source_fields,
                            delete_sources_for_account, delete_url_source,
@@ -44,7 +44,7 @@ from ..account_blocks import (MAX_ACCOUNT_BLOCK_HOURS, account_limits, add_accou
                               recording_blocks, set_recording_blocks)
 from ..ui_constants import PRESET_COLORS
 from ..url_utils import mask_url_path
-from .channels import _chunked, _DELETE_CHUNK_SIZE
+from .channels import _DELETE_CHUNK_SIZE
 from .providers import account_provider, providers_section, sibling_blocks
 
 accounts_bp = Blueprint('accounts', __name__)
@@ -220,20 +220,9 @@ def _sync_log_json(log):
 
 
 def _section_pref():
-    """The stored {order, hidden} for the account page's sections, or None.
-
-    It is user-written JSON, so anything that is not the expected shape falls back to the
-    defaults rather than being allowed to 500 a page it only arranges."""
-    from ..database import UserPref
-
-    pref = db.session.get(UserPref, _SECTIONS_PREF_KEY)
-    try:
-        stored = json.loads(pref.value) if pref and pref.value else None
-    except ValueError:
-        current_app.logger.warning(
-            'Stored account-page section prefs are not valid JSON - using defaults.')
-        return None
-    return stored if isinstance(stored, dict) and isinstance(stored.get('order'), list) else None
+    """The stored {order, hidden} for the account page's sections, or None."""
+    from .recordings import read_section_pref
+    return read_section_pref(_SECTIONS_PREF_KEY)
 
 
 def host_views(account_id):
@@ -259,6 +248,42 @@ def host_views(account_id):
             'error': row.last_resolve_error,
         })
     return out
+
+
+def unlisted_stream_host(account, hosts):
+    """The host the account's streams are on when it is not one of the listed `hosts` (the
+    card's rows), else None. With nothing listed it is the card's only row; with a list it
+    shows only when the streams sit outside it, where a host swap cannot move them. Read
+    from the sync's stamp, never by counting URLs here (dev/changelog/1176)."""
+    host = account.stream_host
+    if not host or any(h['host'] == host for h in hosts):
+        return None
+    return host
+
+
+def own_login_view(account, logins):
+    """The Logins card's row for the account's own login - its username and password on the
+    account itself, which every sync uses (dev/changelog/1176). With nothing listed it is
+    the login every capture uses, so it carries the account pool's seat count and holder
+    line; once logins are listed, captures take seats on those and this row says syncs
+    only. When a listed login has the same username it IS this login, so there is no
+    second row: `same_as` names the listed row to mark instead. Carries no login id - the
+    row has nothing the login endpoints could act on."""
+    from .. import connection_limits as connlim
+    if account.username:
+        same = next((lg for lg in logins if lg['username'] == account.username), None)
+        if same is not None:
+            return {'same_as': same['id']}
+    if logins:
+        return {'same_as': None, 'username': account.username, 'syncs_only': True}
+    held = connlim.holder_counts().get(account.id, 0)
+    return {
+        'same_as': None,
+        'username': account.username,
+        'syncs_only': False,
+        'held': held,
+        'holders': connlim.describe_holders(account.id) if held else '',
+    }
 
 
 def login_views(account_id, cfg):
@@ -291,8 +316,7 @@ def login_views(account_id, cfg):
             'holders': (connlim.describe_pool_holders(row.id, account_id=account_id, names=names)
                         if held.get(row.id) else ''),
             'shared_with': shares.get(row.id, []),
-            'refused': (row.last_refused_at is not None
-                        and now - row.last_refused_at < cooldown),
+            'refused': is_refused_now(row.last_refused_at, now, cooldown),
             'last_refused_at': row.last_refused_at,
             'last_refused_detail': row.last_refused_detail,
             'first': i == 0,
@@ -370,6 +394,7 @@ def _account_detail_payload(account, cfg, stats):
         'last_good_sync': last_good,
         'last_finished_sync': last_finished,
         'logins': logins,
+        'own_login': own_login_view(account, logins),
         'settings': _effective_settings(account, cfg, logins),
         # Which URL form the constructed stream URLs were built in. On the banner because a
         # constructed URL that does not play is nearly always the wrong form, so the form is
@@ -422,6 +447,7 @@ def account_detail(account_id):
         return redirect(url_for('accounts.accounts_list'))
     account = stats['accounts'][0]
     payload = _account_detail_payload(account, cfg, stats)
+    hosts = host_views(account.id)
     next_sync = next_sync_map([account])
     return render_template(
         'account_detail.html',
@@ -438,7 +464,8 @@ def account_detail(account_id):
         # menu and the mobile action sheet both light up correctly either way.
         xtream_debug=_xtream_debug_enabled(account),
         stats=stats,
-        hosts=host_views(account.id),
+        hosts=hosts,
+        unlisted_host=unlisted_stream_host(account, hosts),
         blocks=block_views([account.id]).get(account.id, []),
         sibling_blocks=sibling_blocks(account.id),
         provider=account_provider(account),
@@ -698,7 +725,7 @@ def _delete_account_and_jobs(account_id):
     channel_ids = [cid for (cid,) in db.session.query(Channel.id).filter(
         Channel.account_id == account_id).all()]
     screenshot_paths = []
-    for chunk in _chunked(channel_ids, _DELETE_CHUNK_SIZE):
+    for chunk in chunked(channel_ids, _DELETE_CHUNK_SIZE):
         screenshot_paths.extend(
             p for (p,) in db.session.query(ChannelTest.screenshot_path)
             .filter(ChannelTest.channel_id.in_(chunk))
@@ -973,7 +1000,7 @@ def renormalize_urls_api(account_id):
     ids = [cid for (cid,) in db.session.query(Channel.id)
            .filter_by(account_id=account_id).all()]
     changed = 0
-    for chunk in _chunked(ids, _DELETE_CHUNK_SIZE):
+    for chunk in chunked(ids, _DELETE_CHUNK_SIZE):
         changed += _renormalize_chunk(chunk, mode)
     if changed:
         duplicate_streams.recompute_and_commit()
@@ -1274,7 +1301,7 @@ def _json_owned_source(account_id, source_id, *, url_only=True):
 
 
 def _case_sensitive() -> bool:
-    return load_config().get('sync', {}).get('epg_case_sensitive_matching', False)
+    return case_sensitive_matching(load_config())
 
 
 def _removal_message(name: str, done, verb: str) -> str:

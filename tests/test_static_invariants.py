@@ -426,6 +426,79 @@ class CssBreakpointOverrideTests(unittest.TestCase):
             'rule above the media block:\n' + '\n'.join(sorted(offenders)))
 
 
+class FieldControlInputRuleTests(unittest.TestCase):
+    """A rule that styles the inputs in a `fieldRow()` control slot (`.gd-field-ctl`) as
+    text boxes must leave checkboxes and radios out (BUGS.md 2026-10-03 11:01 AM - the Add
+    provider dialog's account list).
+
+    The slot was written for text boxes and selects, so its input rule gives every `input`
+    `width: 100%`, padding, a background and a border. A checkbox list put in the slot then
+    stretches each checkbox across the row and pushes its label to the far side. Nothing
+    errors and jsdom computes no layout, so this is a text scan: every `.gd-field-ctl` input
+    selector that sets box geometry or paint either names a type that is not a checkbox or
+    radio, or excludes both inside `:where()`. The `:where()` is part of the rule: a bare
+    `:not([type=checkbox])` adds specificity and outranks the slot's own typed rules
+    (`input[type=file]` padding, the datetime/time mono font).
+    """
+
+    _BOX_PROPS_RE = re.compile(
+        r'(^|;)\s*(width|min-width|padding[a-z-]*|background[a-z-]*|border[a-z-]*)\s*:')
+    _TYPED_RE = re.compile(r'^input\[type=["\']?([a-z-]+)["\']?\]')
+    _TOGGLE_TYPES = ('checkbox', 'radio')
+
+    def _offends(self, selector):
+        parts = selector.split()
+        if not parts or not any('.gd-field-ctl' in p for p in parts[:-1]):
+            return False
+        last = parts[-1]
+        if not re.match(r'^input(?![\w-])', last):
+            return False
+        typed = self._TYPED_RE.match(last)
+        if typed:
+            return typed.group(1) in self._TOGGLE_TYPES
+        compact = last.replace('"', '').replace("'", '')
+        return not any(f':where(:not([type={a}]):not([type={b}]))' in compact
+                       for a, b in (('checkbox', 'radio'), ('radio', 'checkbox')))
+
+    def test_field_control_input_rules_skip_checkboxes_and_radios(self):
+        offenders = []
+        for path in _walk(CSS_DIR, '.css'):
+            rules = CssBreakpointOverrideTests._rules(
+                CssBreakpointOverrideTests._COMMENTS_RE.sub('', _read(path)))
+            for prelude, body, _in_media, _order in rules:
+                if not self._BOX_PROPS_RE.search(body):
+                    continue
+                for selector in prelude.split(','):
+                    selector = ' '.join(selector.split())
+                    if self._offends(selector):
+                        offenders.append(f'{_rel(path)}: `{selector}`')
+        self.assertEqual(
+            sorted(offenders), [],
+            'A `.gd-field-ctl` input rule sets width/padding/background/border on every input, '
+            'checkboxes and radios included, which stretches a checkbox list across the row. '
+            'Add `:where(:not([type=checkbox]):not([type=radio]))` to the input:\n'
+            + '\n'.join(sorted(offenders)))
+
+    def test_the_scan_sees_the_shapes_it_guards(self):
+        offends = self._offends
+        self.assertTrue(offends('.gd-field-ctl input'))
+        self.assertTrue(offends('.gd-field-ctl.wide input'))
+        self.assertTrue(offends('.gd-field.stack .gd-field-ctl > input'))
+        self.assertTrue(offends('.gd-field-ctl input:focus'))
+        self.assertTrue(offends('.gd-field-ctl input:not([type=checkbox])'))
+        self.assertTrue(offends('.gd-field-ctl input[type=checkbox]'))
+        self.assertTrue(offends('.gd-field-ctl input:not([type=checkbox]):not([type=radio])'))
+        self.assertFalse(offends(
+            '.gd-field-ctl input:where(:not([type=checkbox]):not([type=radio]))'))
+        self.assertFalse(offends(
+            '.gd-field-ctl input:where(:not([type="radio"]):not([type="checkbox"])):focus'))
+        self.assertFalse(offends('.gd-field-ctl input[type="file"]'))
+        self.assertFalse(offends('.gd-field-ctl input[type=datetime-local]'))
+        self.assertFalse(offends('.gd-field-ctl select'))
+        self.assertFalse(offends('.gd-field-ctl textarea'))
+        self.assertFalse(offends('.switch input'))
+
+
 class CssClassDefinedTests(unittest.TestCase):
     """Two sibling defects to the undefined-var one above, both shipped and both silent:
     a class emitted by JS but styled nowhere, and a class defined twice where the wrong

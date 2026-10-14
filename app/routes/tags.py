@@ -5,6 +5,7 @@ from sqlalchemy.orm import selectinload
 
 from .. import db
 from ..accounts import _TAG_TOKEN_RE, profile_tag_cleanup
+from ..auto_rules import rename_in_rules, rules_naming
 from ..config import load_config
 from ..database import Tag, TagPattern, RecordingProfile
 from ..db_utils import retry_on_locked
@@ -78,6 +79,9 @@ def update_tag(tag_id):
         tag = db.session.get(Tag, tag_id)
         if tag is None:
             return None
+        # An auto-record rule naming the tag follows the rename in this same commit, or it
+        # would stop running the moment its tag "disappeared" (DESIGN-autoschedule.md §3.2).
+        rename_in_rules('tag', tag.name, values['name'])
         tag.name = values['name']
         tag.color = values['color']
         # Replacing the collection relies on delete-orphan to reap the old rows; assigning
@@ -168,6 +172,13 @@ def _tag_usage() -> dict[str, list[str]]:
         if profile.filename_template:
             for name, mode in profile_tag_cleanup(profile):
                 note(name, f'the "{profile.name}" recording profile\'s filename cleanup ({mode})')
+
+    # An auto-record rule's search names tags too, and deleting one stops the rule running
+    # (DESIGN-autoschedule.md §3.2) - which is worth knowing before the click, not from the
+    # broken-rule alert an hour later.
+    for rule_name, tags in rules_naming('tag'):
+        for name in tags:
+            note(name, f'the "{rule_name}" auto-record rule')
 
     return usage
 

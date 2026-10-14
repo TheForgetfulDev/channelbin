@@ -132,10 +132,6 @@ def fmt_count(n):
     return f'{int(n or 0):,}'
 
 
-def fmt_rate(rate):
-    return None if rate is None else f'{round(rate * 100)}%'
-
-
 def _share(value, total):
     if not value:
         return ''

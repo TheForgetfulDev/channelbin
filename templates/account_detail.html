@@ -142,7 +142,7 @@
   </div>
   {% endfor %}
   {% for sib in sibling_blocks.covers %}
-  <div>This block also covers {{ sib.account }}, which shares login{{ 's' if sib.logins | length != 1 }} {% for n in sib.logins %}"{{ n }}"{{ ', ' if not loop.last }}{% endfor %}.</div>
+  <div>Also covers {{ sib.account }} (shared login{{ 's' if sib.logins | length != 1 }} {% for n in sib.logins %}"{{ n }}"{{ ', ' if not loop.last }}{% endfor %}).</div>
   {% endfor %}
 </div>
 {% endif %}
@@ -152,9 +152,8 @@
 {% for sib in sibling_blocks.covered_by %}
 <div class="notice notice-info">
   <strong>A block on {{ sib.account }} also covers this account</strong><br>
-  This account shares login{{ 's' if sib.logins | length != 1 }} {% for n in sib.logins %}"{{ n }}"{{ ', ' if not loop.last }}{% endfor %} with
-  <a href="{{ url_for('accounts.account_detail', account_id=sib.account_id) }}">{{ sib.account }}</a>,
-  so while that block is in force its seats are taken here too. Unblock it on {{ sib.account }}'s page.
+  Shared login{{ 's' if sib.logins | length != 1 }} {% for n in sib.logins %}"{{ n }}"{{ ', ' if not loop.last }}{% endfor %} - its seats are blocked here too.
+  Unblock it on <a href="{{ url_for('accounts.account_detail', account_id=sib.account_id) }}">{{ sib.account }}</a>.
   {% for b in sib.blocks %}
   <div class="acct-block-line">
     <span>{% if b.active %}Until {{ b.stop_label }}{% else %}From {{ b.start_label }} until {{ b.stop_label }}{% endif %}{% if b.slots %}, {{ b.slots }} connection{{ 's' if b.slots != 1 }}{% endif %}</span>
@@ -297,23 +296,37 @@
   {# Hosts (DESIGN-account-providers.md §4, §6.3): the other names the reseller handed out
      for this account's server, one active. Every state a host can be in is named - a
      trailing else would become the home for the next one somebody adds. The list is the
-     user's; app/account_links.py is its one writer, and the page only shows it. #}
+     user's; app/account_links.py is its one writer, and the page only shows it. The host
+     the streams are on is always a row: the stamped Account.stream_host, shown when it is
+     not one of the listed hosts, with no menu because it has no host id to act on
+     (dev/changelog/1176). #}
+  {% set host_rows = (hosts | length) + (1 if unlisted_host else 0) %}
   <div class="card" data-section="hosts">
-    <div class="card-head" id="acct-hosts-head"><h2>Hosts{% if hosts %} <span class="cnt">{{ hosts | length }}</span>{% endif %}</h2>
+    <div class="card-head" id="acct-hosts-head"><h2>Hosts{% if host_rows %} <span class="cnt">{{ host_rows }}</span>{% endif %}</h2>
       <div class="card-head-actions">
         <button class="btn btn-sm" data-act="host-add"
                 data-tip="Add another host name this account's streams can be reached on. When the active one stops resolving, ChannelBin swaps every stream URL on this account to the next one that does.">+ Add host</button>
       </div>
     </div>
     <div class="card-body" id="acct-hosts-body">
-      {% if not hosts %}
-      <p class="card-note">One host, the one in this account's stream URLs. Add the others your reseller gave you and ChannelBin will swap to a working one when this one stops resolving.</p>
+      {% if not host_rows %}
+      <p class="card-note">No stream URLs yet. The host shows here after the first sync.</p>
       {% else %}
-      <p class="card-note">Every stream URL on this account uses the active host. When a recording, health check or preview fails because that host stopped resolving, the next host on this list that does resolve takes over, every URL moves to it, and an alert says so. A channel that fails for any other reason changes nothing here. The list is checked in DNS on a schedule, so a host going bad shows up before a recording finds out.</p>
+      <p class="card-note">{% if hosts %}When the active host stops resolving, every stream URL moves to the next one that does, and an alert says so.{% else %}Add the other hosts your reseller gave you, and ChannelBin swaps to one that works when this one stops resolving.{% endif %}</p>
       <div class="table-scroll">
         <table class="tbl tbl-cards">
           <thead><tr><th>Host</th><th>Role</th><th>Resolves</th><th></th></tr></thead>
           <tbody>
+          {% if unlisted_host %}
+          <tr data-host-row="streams">
+            <td data-label="Host"><code>{{ unlisted_host }}</code><div class="text-faint small">Where the streams are</div></td>
+            <td data-label="Role">
+              {% if hosts %}<span class="tip-plain" data-tip="Most of this account's stream URLs are on this host, and it is not on the list, so a host swap does not move them.">{{ m.status_badge('b-warn', 'Not listed') }}</span>
+              {% else %}{{ m.status_badge('b-done', 'Active') }}{% endif %}</td>
+            <td data-label="Resolves"><span class="text-faint tip-plain" data-tip="Only listed hosts are checked. Add a host and this one goes on the list too.">Not checked</span></td>
+            <td class="num"></td>
+          </tr>
+          {% endif %}
           {% for h in hosts %}
           <tr>
             <td data-label="Host"><code>{{ h.host }}</code></td>
@@ -349,26 +362,27 @@
      accepts beyond its own, each with its seats. A capture takes a seat on one and is
      launched with its credentials. Every row is one of two refusal states and both are
      named; the password is never in the view. The list is the user's; app/account_links.py
-     is its one writer, and the page only shows it. #}
+     is its one writer, and the page only shows it. The account's own login is always a
+     row too (own_login_view(), dev/changelog/1176) unless a listed login is the same one;
+     its menu edits the account, the only place its username and password live. #}
+  {% set own_row = own_login and not own_login.same_as %}
+  {% set login_rows = (logins | length) + (1 if own_row else 0) %}
   <div class="card" data-section="logins">
-    <div class="card-head" id="acct-logins-head"><h2>Logins{% if logins %} <span class="cnt">{{ logins | length }}</span>{% endif %}</h2>
+    <div class="card-head" id="acct-logins-head"><h2>Logins <span class="cnt">{{ login_rows }}</span></h2>
       <div class="card-head-actions">
         <button class="btn btn-sm" data-act="login-add"
                 data-tip="Add another username and password this account accepts, with its own seats. Recordings, health checks and previews take a seat on one login at a time and are launched with its credentials.">+ Add login</button>
       </div>
     </div>
     <div class="card-body" id="acct-logins-body">
-      {% if not logins %}
-      <p class="card-note">One login, the account's own. Add another to run more streams at once and have a spare.</p>
-      {% else %}
-      <p class="card-note">A recording, health check or preview takes a seat on the first login here with one free and is launched with that login's username and password in the stream URL. The seats add up to this account's connection limit. When the server refuses a login, it is skipped for a while if another login has a free seat, and an alert says so. Syncs keep using the account's own login.</p>
+      <p class="card-note">{% if logins %}Recordings, health checks and previews take a seat on the first login with one free. A login the server refuses is skipped for a while, and an alert says so.{% else %}Add another login to run more streams at once or keep a spare.{% endif %}</p>
       <div class="table-scroll">
         <table class="tbl tbl-cards">
           <thead><tr><th>Login</th><th>Seats</th><th>Refused</th><th></th></tr></thead>
           <tbody>
           {% for lg in logins %}
           <tr>
-            <td data-label="Login"><strong>{{ lg.name }}</strong><div class="text-faint small"><code>{{ lg.username }}</code></div>{% if lg.shared_with %}<div class="small">Shared with {{ lg.shared_with | join(', ') }}</div>{% endif %}</td>
+            <td data-label="Login"><strong>{{ lg.name }}</strong><div class="text-faint small"><code>{{ lg.username }}</code></div>{% if lg.shared_with %}<div class="small">Shared with {{ lg.shared_with | join(', ') }}</div>{% endif %}{% if own_login and own_login.same_as == lg.id %}<div class="text-faint small">The account's own login, also used by syncs</div>{% endif %}</td>
             <td data-label="Seats">{{ lg.held }} of {{ lg.max_connections }} in use{% if lg.holders %}<div class="text-faint small">{{ lg.holders }}</div>{% endif %}</td>
             <td data-label="Refused">
               {% if lg.refused %}{{ m.status_badge('b-fail', 'Yes') }}<div class="small">{{ lg.last_refused_at | local_time }}: {{ lg.last_refused_detail }}</div><div class="text-faint small">Skipped while another login has a free seat.</div>
@@ -389,10 +403,27 @@
             </td>
           </tr>
           {% endfor %}
+          {% if own_row %}
+          <tr data-login-row="own">
+            <td data-label="Login"><strong>Account's own</strong><div class="text-faint small">{% if own_login.username %}<code>{{ own_login.username }}</code>{% else %}from the playlist{% endif %}</div></td>
+            <td data-label="Seats">
+              {% if own_login.syncs_only %}<span class="text-faint tip-plain" data-tip="Recordings, health checks and previews use the logins above. Syncs use this one, and a sync takes no seat.">Syncs only</span>
+              {% else %}{{ own_login.held }} of {{ settings.max_connections }} in use{% if settings.max_connections_inherited %} <span class="text-faint">(global)</span>{% endif %}{% if own_login.holders %}<div class="text-faint small">{{ own_login.holders }}</div>{% endif %}
+              {% endif %}</td>
+            <td data-label="Refused"><span class="text-faint tip-plain" data-tip="Refusals are tracked on listed logins, where another login can take over.">Not tracked</span></td>
+            <td class="num">
+              <span class="menu-wrap">
+                <button class="btn btn-sm btn-icon" data-menu aria-label="Actions for the account's own login">&#8943;</button>
+                <div class="menu">
+                  <button class="menu-item" data-act="settings">Edit account</button>
+                </div>
+              </span>
+            </td>
+          </tr>
+          {% endif %}
           </tbody>
         </table>
       </div>
-      {% endif %}
     </div>
   </div>
 

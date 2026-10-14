@@ -25,6 +25,7 @@ from ..database import (
 from ..accounts import (TEMPLATE_VARIABLES, _TAG_TOKEN_RE, render_filename_template,
                         tag_template_variables)
 from ..recorder import _safe_name, FINISHED_IMAGE_CHOICES
+from ..normalize import AUDIO_CHANNELS_CHOICES, MAX_HEIGHT_CHOICES, VIDEO_CODECS
 from ..postprocessor import VIDEO_ENCODERS
 from ..channel_search import PAGE_SIZE_OPTIONS, configured_page_size
 from ..alerts import ALERT_TYPES, RETIRED_ALERT_TYPES
@@ -288,6 +289,8 @@ def api_settings_field():
         'recording.live_thumbnail.poster_frame_offset_seconds': (0, None),
         'recording.post_process.video_crf': (0, 51),
         'recording.post_process.vaapi_qp': (0, 51),
+        'recording.post_process.vaapi_hevc_qp': (0, 51),
+        # Per stereo pair since dev/changelog/1184: a 5.1 source gets three times this.
         'recording.post_process.audio_bitrate_kbps': (32, 320),
         'channel_testing.window.dispatch_interval_minutes': (1, None),
     }
@@ -384,6 +387,22 @@ def api_settings_field():
         if path == 'recording.post_process.video_encoder':
             if value not in VIDEO_ENCODERS:
                 return jsonify({'error': 'Pick one of ' + ', '.join(VIDEO_ENCODERS)}), 400
+        if path == 'recording.post_process.video_codec':
+            if value not in VIDEO_CODECS:
+                return jsonify({'error': 'Pick one of ' + ', '.join(VIDEO_CODECS)}), 400
+        if path == 'recording.post_process.audio_channels':
+            if value not in AUDIO_CHANNELS_CHOICES:
+                return jsonify({'error': 'Pick one of '
+                                         + ', '.join(AUDIO_CHANNELS_CHOICES)}), 400
+        # A select posts a string; the postprocessor compares a number.
+        if path == 'recording.post_process.max_height':
+            try:
+                value = int(value)
+            except (TypeError, ValueError):
+                value = None
+            if value not in MAX_HEIGHT_CHOICES:
+                return jsonify({'error': 'Pick one of '
+                                         + ', '.join(map(str, MAX_HEIGHT_CHOICES))}), 400
 
         if path == 'search.page_size':
             value = _page_size_choice(value)

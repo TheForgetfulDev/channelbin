@@ -40,7 +40,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from tests.support.app import make_test_app  # noqa: E402
 from tests.support import seed  # noqa: E402
-from tests.support.search import show_all_query  # noqa: E402
+from tests.support.search import only_hiding, show_all_query  # noqa: E402
 from app import db, duplicate_streams  # noqa: E402
 from app.accounts import NORM_DISABLED, NORM_MPEGTS  # noqa: E402
 from app.database import EPGEntry, Tag, TagPattern  # noqa: E402
@@ -74,6 +74,10 @@ _FIXTURES = {
     'rows_airings.json': '/api/channels/search?grain=airings&facets=&' + SHOW_ALL,
     'airings_counts.json': '/api/channels/search/counts?grain=airings&' + SHOW_ALL,
     'airings_facets.json': '/api/channels/search/facets?grain=airings&' + SHOW_ALL,
+    # The same with One row per channel on, for the facets the rail leaves out on purpose
+    # and the sentence the server gives for it (dev/changelog/1187).
+    'airings_facets_firstonly.json': '/api/channels/search/facets?grain=airings&' + '&'.join(
+        f'standing={k}' for k in sorted(only_hiding('firstonly'))),
     # Beta has zero channels, so its id is genuinely absent from `facets.acct` (not
     # merely uncounted) - the real, counted 0 that a "Filter by" suggestion must not
     # offer (dev/docs/BUGS.md 2026-08-12, the 0-result suggestion bug).
@@ -668,6 +672,85 @@ class ActionContextTests(_PageJs, unittest.TestCase):
         self.assertNotIn('add_to_group', self.obs['address_bar_after_dismiss'])
 
 
+class RuleErrandTests(_PageJs, unittest.TestCase):
+    """The third action context, `rule` (DESIGN-channel-search.md §3, dev/changelog/1189):
+    + New rule's `rule=new` and a rule's Edit search's `rule=<id>`, each as the server
+    resolved it. Like the other two it narrows nothing, rides the URL until dismissed, and is
+    dropped when the server did not resolve it."""
+
+    SCENARIO = 'rule_errand'
+
+    def test_the_page_booted_without_throwing(self):
+        # The two errands end in a navigation jsdom cannot perform; everything before it
+        # and every other state must be clean.
+        for name in ('plain', 'channel_grain', 'new_mode', 'edit_mode', 'dismissed', 'stale'):
+            self.assertEqual(self.obs[name]['errors'], [], name)
+
+    def test_with_no_errand_create_rule_is_offered_in_both_places_on_programs_only(self):
+        plain = self.obs['plain']
+        self.assertFalse(plain['bar_shown'])
+        self.assertTrue(plain['mkrule_shown'])
+        self.assertFalse(plain['mkrule_primary'])
+        self.assertTrue(plain['saved_menu_offers_create'])
+        self.assertEqual(plain['rule_in_request'], [])
+        self.assertFalse(self.obs['channel_grain']['mkrule_shown'],
+                         'a rule records showings, and a channel has no start time')
+
+    def test_new_rule_says_what_to_do_and_makes_create_rule_the_primary(self):
+        new = self.obs['new_mode']
+        self.assertTrue(new['bar_shown'])
+        self.assertIn('New auto-record rule.', new['label'])
+        self.assertIn('Create rule from this search', new['label'])
+        self.assertFalse(new['save_shown'])
+        self.assertTrue(new['mkrule_shown'])
+        self.assertTrue(new['mkrule_primary'])
+        self.assertEqual(new['rule_in_request'], ['new'])
+        self.assertIn('rule=new', new['address_bar'])
+        self.assertIn('Stop making a rule', new['dismiss_tip'])
+
+    def test_a_rule_made_from_new_rule_opens_its_page_with_the_outcome(self):
+        new = self.obs['new_mode']
+        self.assertEqual(new['dialog_title'], 'Create rule from this search')
+        self.assertIn('grain=airings', new['created_search'])
+        self.assertTrue(new['navigated'])
+        self.assertEqual(new['pending_toast']['message'], 'Rule saved. 1 scheduled.')
+
+    def test_edit_search_names_the_rule_and_offers_only_save_to_rule(self):
+        edit = self.obs['edit_mode']
+        self.assertTrue(edit['bar_shown'])
+        self.assertIn('Editing the search for rule Cup Series.', edit['label'])
+        self.assertTrue(edit['save_shown'])
+        self.assertFalse(edit['mkrule_shown'], 'a second rule is not what this errand is for')
+        self.assertFalse(edit['saved_menu_offers_create'])
+        self.assertEqual(edit['rule_in_request'], ['7'])
+        self.assertIn('keeps the search it has', edit['dismiss_tip'])
+
+    def test_save_to_rule_sends_only_the_search_and_ends_on_the_rule_page(self):
+        """The settings stay as they are - the PUT carries `search` alone, and the server's
+        clean_search() drops the page-only parts, the errand included."""
+        put = self.obs['edit_mode']['put']
+        self.assertEqual(put['url'], '/api/auto-rules/7')
+        self.assertEqual(list(put['body']), ['search'])
+        self.assertIn('q=Cup', put['body']['search'])
+        self.assertIn('grain=airings', put['body']['search'])
+        self.assertTrue(self.obs['edit_mode']['navigated'])
+        self.assertEqual(self.obs['edit_mode']['pending_toast']['message'],
+                         'Saved the new search to "Cup Series". 1 scheduled.')
+
+    def test_dismissing_takes_the_errand_out_of_the_url(self):
+        gone = self.obs['dismissed']
+        self.assertFalse(gone['bar_shown'])
+        self.assertNotIn('rule=', gone['address_bar'])
+        self.assertTrue(gone['mkrule_shown'])
+        self.assertIn('The rule keeps the search it has', gone['toasts'][-1])
+
+    def test_a_rule_the_server_did_not_resolve_is_dropped(self):
+        stale = self.obs['stale']
+        self.assertFalse(stale['bar_shown'])
+        self.assertEqual(stale['rule_in_request'], [])
+        self.assertNotIn('rule=', stale['address_bar'])
+
+
 class BulkGuideActionTests(_PageJs, unittest.TestCase):
     """The bulk guide action reflects what is actually selected (dev/changelog/792).
 
@@ -1239,18 +1322,18 @@ class WhenDimensionTests(_PageJs, unittest.TestCase):
         new number silently widened the filter instead of changing it."""
         self.assertEqual(self.obs['when_after_retype'], ['next:5:hours'])
 
-    def test_an_unreadable_caret_is_restored_to_the_END_not_the_front(self):
-        """Chrome raises InvalidStateError on `selectionStart` for `type=number`, so the
-        caret cannot be read across the rail rebuild. Defaulting it to 0 puts the cursor
-        at the FRONT, and the next digit lands before the previous one - typing "36" gives
-        "63" and applies a 63-hour window. Measured in a real browser (dev/changelog/414);
-        this scenario makes the getter throw, because jsdom implements selectionStart on a
-        number input where Chrome does not and would otherwise never reach that branch."""
+    def test_digits_typed_with_a_pause_between_them_land_in_order(self):
+        """A rebuilt number box takes the caret at its FRONT and Chrome will not let it be
+        moved, so digits typed across an apply landed backwards: "36" became "63"
+        (dev/changelog/414, dev/docs/BUGS.md 2026-07-31 09:52 PM) and later "24" became "42"
+        on Program length. jsdom cannot see a caret, so what is asserted is the guarantee: the
+        rail is not redrawn under the focused box, which stays the same node holding both
+        digits, and it catches up once focus leaves (dev/docs/BUGS.md 2026-10-13 06:48 PM)."""
+        self.assertTrue(self.obs['caret_box_same_node'])
         self.assertTrue(self.obs['caret_box_still_focused'])
-        self.assertIsNotNone(self.obs['caret_set_at'], 'the caret was never restored at all')
-        self.assertEqual(self.obs['caret_set_at'], self.obs['caret_set_on_value_len'],
-                         'the caret was put somewhere other than the end, so the next digit '
-                         'typed lands before the ones already there')
+        self.assertEqual(self.obs['caret_box_value'], '12')
+        self.assertEqual(self.obs['when_after_two_digits'], ['next:12:hours'])
+        self.assertTrue(self.obs['caret_box_redrawn_after_blur'])
 
     def test_a_filter_the_other_grain_cannot_express_is_parked_not_dropped(self):
         """It leaves the REQUEST but stays on SCREEN, struck through. Hiding it while the
@@ -1270,6 +1353,136 @@ class WhenDimensionTests(_PageJs, unittest.TestCase):
         self.assertEqual(self.obs['when_after_flip_back'], ['next:5:hours'])
         self.assertTrue(self.obs['parked_chip_gone'])
         self.assertEqual(self.obs['rel_control_value'], '5')
+
+
+class DayTimeDimensionTests(_PageJs, unittest.TestCase):
+    """`dow` and `tod` (dev/changelog/1187): a week from the catalog, a clock range the page
+    spells itself, and the caret kept in every fill-in box across the rail's rebuild."""
+
+    SCENARIO = 'day_time'
+
+    def test_both_cards_follow_when_on_the_airing_rail(self):
+        self.assertEqual(self.obs['rail_facets'][:4], ['when', 'dow', 'tod', 'duration'])
+
+    def test_the_whole_week_shows_monday_first_with_no_find_box(self):
+        """Seven values is one past the rail's cutoff of six, which would put Sunday behind
+        "Show all 7" and add a find box for seven words."""
+        served = [d['value'] for d in _observations()['catalog_dow_values']]
+        self.assertEqual(self.obs['dow_values'], served)
+        self.assertEqual(self.obs['dow_labels'][-2:], ['Saturday', 'Sunday'])
+        self.assertFalse(self.obs['dow_has_find_box'])
+        self.assertFalse(self.obs['dow_has_show_all'])
+
+    def test_picking_days_sends_each_and_excluding_one_sends_it_apart(self):
+        self.assertEqual(self.obs['dow_after_picking'], ['sat', 'sun'])
+        self.assertEqual(self.obs['dow_excluded'], ['mon'])
+        self.assertTrue(any('Saturday' in t for t in self.obs['chip_texts']),
+                        self.obs['chip_texts'])
+
+    def test_a_range_in_the_url_comes_back_into_its_boxes(self):
+        """Restoring only the chip would leave a filter you can see and cannot edit."""
+        self.assertEqual(self.obs['tod_hydrated'], {'from': '18:00', 'to': '23:59'})
+        self.assertEqual(self.obs['tod_sent_at_boot'], ['tod:18:00..23:59'])
+        self.assertTrue(self.obs['tod_fill_on'])
+        self.assertEqual(self.obs['tod_value_rows'], ['tod:18:00..23:59'])
+
+    def test_the_range_reads_in_the_display_clock_format(self):
+        self.assertEqual(self.obs['tod_fill_label'], '6:00 PM to 11:59 PM')
+        self.assertEqual(self.obs['tod_label_after_retype'], '6:00 PM to 2:00 AM')
+        self.assertIn('Time of day is 6:00 PM to 11:59 PM', self.obs['chip_texts'][0])
+
+    def test_retyping_an_end_replaces_the_one_range(self):
+        self.assertEqual(self.obs['tod_after_retype'], ['tod:18:00..02:00'])
+
+    def test_an_excluded_range_stays_excluded_when_retyped(self):
+        self.assertEqual(self.obs['tod_excluded_after_retype'],
+                         {'inc': [], 'exc': ['tod:19:30..02:00']})
+
+    def test_one_end_alone_is_a_range_and_neither_is_none(self):
+        self.assertEqual(self.obs['tod_one_end'], ['tod:..02:00'])
+        self.assertEqual(self.obs['tod_none'], [])
+
+    def test_the_rail_is_not_redrawn_under_a_focused_time_box(self):
+        """Nothing can put a multi-field box back: focus() on a new one lands on its first
+        field, so the minutes being typed went into the hour, and a box still being filled
+        holds '' and was redrawn empty. jsdom has no fields to see that with, so what is
+        asserted is the cause - the box is the SAME node after an apply lands - and that
+        the rail catches up once focus leaves it (dev/docs/BUGS.md 2026-10-13 03:38 PM)."""
+        self.assertTrue(self.obs['tod_box_kept_focus'])
+        self.assertTrue(self.obs['tod_box_same_node_while_focused'])
+        self.assertTrue(self.obs['tod_box_redrawn_after_blur'])
+
+    def test_the_program_length_box_keeps_the_caret_too(self):
+        """dev/docs/BUGS.md 2026-10-13 03:38 PM: the rail restored the caret for `when`'s two boxes
+        only, so Program length's dropped focus after one digit and "180" was unreachable
+        by typing."""
+        self.assertEqual(self.obs['dur_sent'], ['dur:120..'])
+        self.assertTrue(self.obs['dur_box_kept_focus'])
+
+    def test_a_press_that_leaves_the_time_box_still_lands(self):
+        """Leaving the box is usually a press on the next thing, and mousedown moves focus
+        before mouseup: a redraw at the focusout detached the pressed button and swallowed
+        its click, so picking Friday right after typing a time did nothing
+        (dev/docs/BUGS.md 2026-10-13 03:38 PM)."""
+        self.assertTrue(self.obs['press_deferred'])
+        self.assertTrue(self.obs['pressed_button_still_attached'])
+        self.assertEqual(self.obs['dow_after_press'], ['sat', 'sun', 'fri'])
+
+    def test_a_range_taken_off_the_search_reads_not_counted_rather_than_zero(self):
+        """Its row and boxes stay, ready to put back, but the engine counts a typed value only
+        while it is filtering - so a "0" there was a number nobody could explain
+        (dev/docs/BUGS.md 2026-10-13 03:38 PM)."""
+        self.assertEqual(self.obs['tod_before_chip_removed'], ['tod:18:00..'])
+        self.assertEqual(self.obs['tod_sent_after_chip_removed'], [])
+        self.assertIsNotNone(self.obs['tod_count_after_removed'])
+        self.assertTrue(self.obs['tod_count_after_removed']['uncounted'])
+        self.assertFalse(self.obs['tod_count_after_removed']['zero'])
+
+    def test_the_pill_popover_keeps_its_box_when_the_first_chip_appears(self):
+        """Opened from the well's pill with nothing set, the first digit made the first chip,
+        the pill moved after it with the popover inside, and the move blurred the box - the
+        second digit went nowhere. Found by the browser pass on the popover's new typed boxes
+        (dev/changelog/1187)."""
+        self.assertEqual(self.obs['pill_pop_first_chip'], ['dur:120..'])
+        self.assertTrue(self.obs['pill_pop_kept_focus'])
+        self.assertEqual(self.obs['pill_pop_two_digits'], ['dur:1440..'])
+        self.assertTrue(self.obs['pill_after_chips'])
+        self.assertEqual(self.obs['pill_pop_errors'], [])
+
+    def test_the_filter_popover_can_set_a_typed_value(self):
+        """It offered Program length with no box to type into and said "no value matches
+        that" (dev/docs/BUGS.md 2026-10-13 03:38 PM); Time of day would have inherited the
+        same."""
+        self.assertEqual(self.obs['pop_duration_boxes'], ['min', 'max', 'unit'])
+        self.assertFalse(self.obs['pop_duration_says_none'])
+        self.assertEqual(self.obs['pop_duration_sent'], ['dur:240..'])
+        self.assertTrue(self.obs['pop_still_open'])
+
+    def test_the_filters_sheet_carries_both_at_phone_width(self):
+        self.assertIn('dow', self.obs['sheet_dims'])
+        self.assertIn('tod', self.obs['sheet_dims'])
+        self.assertEqual(self.obs['sheet_dow_rows'], 7)
+        self.assertFalse(self.obs['sheet_dow_find_box'])
+        self.assertEqual(self.obs['sheet_tod_boxes'], ['from', 'to'])
+        self.assertEqual(self.obs['sheet_tod_sent'], ['tod:..09:00'])
+
+    def test_facets_left_out_on_purpose_say_why_once_and_on_each_dash(self):
+        """Under One row per channel the showing's own day, time, length, When and tags are
+        not counted, because each count would disagree with its own list. A column of bare
+        `--` would be a number withheld for no stated reason (dev/docs/BUGS.md 2026-10-13
+        03:38 PM)."""
+        self.assertEqual(self.obs['served_uncounted'], ['dow', 'duration', 'tag', 'tod', 'when'])
+        self.assertEqual(len(self.obs['uncounted_notes']), 1, self.obs['uncounted_notes'])
+        note = self.obs['uncounted_notes'][0]
+        self.assertIn('Day of week', note)
+        self.assertIn('One row per channel', note)
+        self.assertIn('One row per channel', self.obs['uncounted_dow_tip'] or '')
+        self.assertTrue(self.obs['uncounted_acct_still_counted'])
+
+    def test_nothing_threw(self):
+        self.assertEqual(self.obs['errors'], [])
+        self.assertEqual(self.obs['mobile_errors'], [])
+        self.assertEqual(self.obs['uncounted_errors'], [])
 
 
 class CountsSplitTests(_PageJs, unittest.TestCase):

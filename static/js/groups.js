@@ -432,6 +432,7 @@
       groupName: g.name,
       deleteUrl: CFG.deleteUrlBase + groupId + '/delete',
       attachedChecks: g.attached_checks || [],
+      attachedRules: g.auto_rules || [],
       onDeleted: () => { showToast(`"${g.name}" deleted.`); removeGroupRow(groupId); },
       onError: (msg) => showToast(msg, { type: 'error' }),
     });

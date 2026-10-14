@@ -46,6 +46,7 @@ from .. import db, health_bands
 from ..channel_search import (DEFAULT_FIELDS, DEFAULT_PAGE_SIZE, DEFAULT_SORT,
                               PAGE_SIZE_OPTIONS, configured_page_size,
                               DEFAULT_SORT_BY_GRAIN, DEFAULT_STANDING, DIMENSIONS,
+                              DOW_LABELS, DOW_VALUES,
                               FIELD_GROUPS, FIELDS, GRAIN_CHANNELS,
                               GROUP_ANY, HEALTH_UNTESTED,
                               HEALTH_UNTESTED_LABEL, IMPLEMENTED_GRAINS, MAX_PAGE_SIZE,
@@ -55,7 +56,7 @@ from ..channel_search import (DEFAULT_FIELDS, DEFAULT_PAGE_SIZE, DEFAULT_SORT,
                               default_fields_for, default_standing_for,
                               dimensions_for, full_scan_reason,
                               probe_degraded_reason, search, search_counts,
-                              search_facets, standing_options_for)
+                              search_facets, standing_options_for, uncounted_facets)
 from ..channel_search_rows import build_rows
 from ..config import load_config
 from ..database import Account, Channel, ChannelGroup, ChannelGroupMember, Tag
@@ -368,6 +369,9 @@ def channel_search_api():
         # Which dimensions were actually counted. Absent from `facets` means "not asked
         # for", and the rail has to be able to tell that from a genuine zero.
         'facets_counted': sorted(result.facets),
+        # Facets left out ON PURPOSE for this state, each with the sentence saying why - a
+        # different fact from `declined` below, which is about what the box could afford.
+        'uncounted': uncounted_facets(state) if want_facets else {},
         # What this response deliberately did NOT answer, so the page can say so instead of
         # rendering a pending spinner forever or a `--` the reader has to guess at. Always
         # present, empty when nothing was declined: absent-vs-empty is a distinction this
@@ -535,10 +539,12 @@ def channel_search_facets_api():
 
     def run(state, ctx):
         facets = search_facets(state, ctx)
-        return {'facets': facets, 'facets_counted': sorted(facets)}
+        return {'facets': facets, 'facets_counted': sorted(facets),
+                'uncounted': uncounted_facets(state)}
 
     return _optional_aggregate(
-        'facets', state, run, {'facets': {}, 'facets_counted': []}, LANE_FACETS)
+        'facets', state, run, {'facets': {}, 'facets_counted': [], 'uncounted': {}},
+        LANE_FACETS)
 
 
 def _superseded(state, reason, lane):
@@ -837,6 +843,10 @@ def channel_search_catalog_api():
         # builds them from its own controls, and the engine parses whatever arrives.
         'when_values': [{'value': v, 'label': WHEN_STATIC_LABELS[v]}
                         for v in WHEN_STATIC_VALUES],
+        # In week order, Monday first, which is the rail's order - not sorted. Time of day has
+        # no fixed values at all: like Program length, the page builds its one value from its
+        # own controls.
+        'dow_values': [{'value': v, 'label': DOW_LABELS[v]} for v in DOW_VALUES],
         # `page_size` is what the ENGINE means by a URL with no `per_page`; `opening_page_size`
         # is what the page opens with instead, from Settings. Two keys because they are two
         # facts: the page writes `per_page` into its own address bar whenever it differs from

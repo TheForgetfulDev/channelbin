@@ -32,7 +32,8 @@ from tests.support.app import make_test_app  # noqa: E402
 from tests.support.seed import (make_account, make_channel, make_channel_test,  # noqa: E402
                                 make_epg_source)
 from app import db  # noqa: E402
-from app.database import (EPGEntry, EpgAlternateEntry, EpgSourceChannel, Tag,  # noqa: E402
+from app.database import (AutoRule, EPGEntry, EpgAlternateEntry, EpgSourceChannel,  # noqa: E402
+                          RULE_MATCH_SKIPPED_CAP, RULE_MATCH_SKIPPED_REPEAT, RuleMatch, Tag,
                           TagPattern, TEST_STATUS_COMPLETED)
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -98,6 +99,8 @@ class LabelledCellTests(unittest.TestCase):
             db.session.flush()
             db.session.add(TagPattern(tag_id=tag.id, pattern='LIVE'))
             acc = make_account()
+            # A synced account's stamp, so the Hosts card draws its row (dev/changelog/1176).
+            acc.stream_host = 'example.test'
             src = make_epg_source(acc)
             src.last_status = 'OK'
             ch = make_channel(acc, name='Sports HD')
@@ -116,7 +119,18 @@ class LabelledCellTests(unittest.TestCase):
             db.session.add(EpgAlternateEntry(channel_id=ch.id, source_id=other.id,
                                              title='News', start_time=soon,
                                              stop_time=soon + timedelta(hours=1)))
+            rule = AutoRule(name='Reflow rule', search_params='grain=airings&q=News')
+            db.session.add(rule)
+            db.session.flush()
+            # One showing on each side of now, so both of the rule page's ledger tables draw.
+            for days, action in ((1, RULE_MATCH_SKIPPED_CAP), (-1, RULE_MATCH_SKIPPED_REPEAT)):
+                at = datetime.utcnow() + timedelta(days=days)
+                db.session.add(RuleMatch(rule_id=rule.id, title_key=f'news {days}',
+                                         program_title='News', program_start_time=at,
+                                         program_stop_time=at + timedelta(hours=1),
+                                         action_taken=action, detail='A sentence.'))
             db.session.commit()
+            cls.rule_id = rule.id
             cls.channel_id = ch.id
             cls.account_id = acc.id
             cls.source_id = src.id
@@ -156,6 +170,15 @@ class LabelledCellTests(unittest.TestCase):
                 for table in tables:
                     self._assert_labelled(url, table)
 
+    def test_rule_page_labels_every_cell(self):
+        # Seeded: Coming up and History each draw a table only once the rule has judged a
+        # showing on that side of now (dev/changelog/1189).
+        html = self.client.get(f'/rules/{self.rule_id}').get_data(as_text=True)
+        tables = _card_tables(html)
+        self.assertEqual(2, len(tables), 'Coming up and History should render as .tbl-cards')
+        for table in tables:
+            self._assert_labelled('/rules/<id>', table)
+
     def test_channel_detail_labels_every_cell(self):
         # Its own case rather than a REFLOWING_PAGES entry: the tables render only when
         # the channel actually has tests, observations and an EPG source, so the URL is
@@ -172,10 +195,13 @@ class LabelledCellTests(unittest.TestCase):
 
     def test_account_detail_labels_every_cell(self):
         # Seeded like the channel page: the EPG sources table renders only when the
-        # account reads a source (DESIGN-epg-sources.md §9.2).
+        # account reads a source (DESIGN-epg-sources.md §9.2), and the Hosts table only
+        # once a sync has stamped where the streams are. The Logins table always renders:
+        # the account's own login is a row (dev/changelog/1176).
         html = self.client.get(f'/accounts/{self.account_id}').get_data(as_text=True)
         tables = _card_tables(html)
-        self.assertEqual(1, len(tables), 'the EPG sources table should render as .tbl-cards')
+        self.assertEqual(3, len(tables),
+                         'the Hosts, Logins and EPG sources tables should render as .tbl-cards')
         for table in tables:
             self._assert_labelled('/accounts/<id>', table)
 
@@ -248,7 +274,7 @@ class OptInTests(unittest.TestCase):
                     path = os.path.join(root, name)
                     if 'tbl-cards' in _read(os.path.relpath(path, REPO)):
                         found.add(os.path.relpath(path, REPO))
-        registered = {'templates/tags.html', 'templates/jobs.html',
+        registered = {'templates/tags.html', 'templates/jobs.html', 'templates/rule_detail.html',
                       'templates/channels/detail.html', 'templates/_account_stats.html',
                       'templates/account_detail.html',
                       'templates/epg_source_review.html',

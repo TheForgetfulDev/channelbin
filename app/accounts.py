@@ -30,7 +30,7 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from .config import load_config, config_default
 from . import admission, db, duplicate_streams
-from .account_links import clear_rolled_alert_after_sync, host_list, render_host
+from .account_links import clear_rolled_alert_after_sync, current_host, host_list, render_host
 from .channel_groups import touch_group
 from .database import (
     Account, Alert, Channel, ChannelEvent, ChannelGroupMember, EPGEntry, AccountSyncLog,
@@ -40,10 +40,11 @@ from .database import (
     CHANNEL_URL_CHANGED, CHANNEL_ADDED_TO_GUIDE, CHANNEL_REMOVED_FROM_GUIDE,
     RECORDING_REPOINTED, REC_STATUS_IN_PROGRESS, REC_STATUS_SCHEDULED,
 )
-from .db_utils import current_wal_size_bytes, retry_on_locked
+from .db_utils import chunked, current_wal_size_bytes, retry_on_locked
 from .epg_sources import (
     DISTINCT_TITLE_CAP, REASON_NONE, UPCOMING_TITLES, DirectoryRow, accepted_keys,
-    add_held_coverage, apply_winners, channel_key, demote, directory_coverage, drop_alternates,
+    add_held_coverage, apply_winners, case_sensitive_matching, channel_key, demote,
+    directory_coverage, drop_alternates,
     ensure_provider_source, file_id_for, held_coverage, norm_key, promote, provider_xmltv_url,
     refresh_source_counts, resolve_active_source, sources_refreshed_by_sync, subscriber_ids,
     subscriptions_for, sources_without_directory, write_directory,
@@ -1381,7 +1382,7 @@ def _do_sync(account_id: int, stop_event: threading.Event, use_dump: bool = Fals
                 if not os.path.exists(xmltv_path):
                     log.warning('No xmltv.xml in dump dir, skipping EPG source %d', source.id)
                     continue
-                case_sensitive = sync_cfg.get('epg_case_sensitive_matching', False)
+                case_sensitive = case_sensitive_matching(cfg)
                 with open(xmltv_path, 'rb') as f:
                     synced, reason = import_source(
                         source, f.read(), epg_days, case_sensitive, cfg, force_epg_resync,
@@ -1444,6 +1445,7 @@ def _do_sync(account_id: int, stop_event: threading.Event, use_dump: bool = Fals
         epg_entry_count_total = EPGEntry.query.join(Channel).filter(
             Channel.account_id == account_id
         ).count()
+        stream_host = current_host(account_id)
 
         duplicate_streams.recompute_and_commit()
 
@@ -1456,6 +1458,7 @@ def _do_sync(account_id: int, stop_event: threading.Event, use_dump: bool = Fals
             account.next_sync_at = now + timedelta(hours=interval_hours)
             account.channel_count = channel_count_total
             account.epg_entry_count = epg_entry_count_total
+            account.stream_host = stream_host
             account.constructed_stream_url_count = constructed_urls
             account.provider_status = provider_info.get('status')
             account.provider_exp_date = provider_info.get('exp_date')
@@ -2109,7 +2112,8 @@ def transfer_channel_state(source: Channel, dest: Channel, cfg: dict) -> str:
     lifecycle-'missing' and `dest` not to be) and "Remove Duplicate Channels" removal with
     transfer (`app/routes/channel_tests.py`, `channel_groups.py`, `guide.py`, no lifecycle
     requirement). This function itself only assumes `source` and `dest` are two distinct
-    Channel rows sharing the same stream_url - callers own their own validation and are
+    Channel rows that are the same stream - one stream_url, or for the group page one stored
+    duplicate cluster (dev/changelog/1175) - callers own their own validation and are
     expected to call this only from inside their own retry_on_locked commit closure, after
     re-fetching fresh rows.
     """
@@ -2545,10 +2549,10 @@ def _stamp_last_seen(channel_ids: list[int], sync_time: datetime) -> None:
     ORM instances, and both callers commit immediately (which expires the identity map
     anyway).
     """
-    for i in range(0, len(channel_ids), _LAST_SEEN_CHUNK):
+    for batch in chunked(channel_ids, _LAST_SEEN_CHUNK):
         db.session.execute(
             update(Channel)
-            .where(Channel.id.in_(channel_ids[i:i + _LAST_SEEN_CHUNK]))
+            .where(Channel.id.in_(batch))
             .values(last_seen_at=sync_time, updated_at=Channel.updated_at),
             execution_options={'synchronize_session': False},
         )
@@ -2793,7 +2797,7 @@ def _refresh_source(source: EpgSource, timeout: int, epg_days: int, cfg: dict | 
     # The download is one blocking call, so this is the first moment a cancel issued during
     # it can land - and it lands before the import deletes anything.
     _raise_if_cancelled(stop_event, _cancel_kept_source(source_name))
-    case_sensitive = (cfg or {}).get('sync', {}).get('epg_case_sensitive_matching', False)
+    case_sensitive = case_sensitive_matching(cfg)
     return import_source(source, xml_bytes, epg_days, case_sensitive, cfg, force_epg_resync,
                          stop_event=stop_event, track_progress=track_progress)
 
@@ -3051,9 +3055,16 @@ def import_source(source: EpgSource, xml_bytes: bytes, epg_days: int,
     scan pass reads the same bytes the import loop does.
     """
     began_at = datetime.utcnow()
+    source_id = source.id
     result = _import_source(source, xml_bytes, epg_days, case_sensitive, cfg,
                             force_epg_resync, stop_event, track_progress)
-    _report_source_outcome(source.id, result.reason, result.lost_channel_ids, began_at)
+    _report_source_outcome(source_id, result.reason, result.lost_channel_ids, began_at)
+    # Every import that wrote to the guide asks the auto-record rules to look again
+    # (DESIGN-autoschedule.md §4.1). `lost_channel_ids` is set exactly when the import
+    # reached resolution - a refused, undecodable or channel-less import wrote nothing.
+    if result.lost_channel_ids is not None:
+        from .auto_rules import queue_evaluation
+        queue_evaluation(f'EPG source #{source_id} imported')
     return result.synced, result.reason
 
 
