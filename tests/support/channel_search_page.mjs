@@ -44,8 +44,10 @@ const ROWS_AIRINGS = Object.assign(
   JSON.parse(read('airings_facets.json')),
   { declined: [], declined_reason: '' });
 const ROWS_ACCTFACETS = JSON.parse(read('rows_acctfacets.json'));
+// The rail's real answer with One row per channel on: which facets it left out, and why.
+const FACETS_FIRSTONLY = JSON.parse(read('airings_facets_firstonly.json'));
 
-const JS = ['util.js', 'channel-search.js'].map(
+const JS = ['util.js', 'auto-rule-modal.js', 'channel-search.js'].map(
   (f) => fs.readFileSync(`${REPO}/static/js/${f}`, 'utf8'));
 
 /* One booted page. `rows` picks which search response every /api/channels/search
@@ -70,7 +72,8 @@ const JS = ['util.js', 'channel-search.js'].map(
    must render the server's sentence rather than one of its own. */
 function boot({ rows = ROWS, saved = null, url = 'http://localhost:5000/channels',
                 width = 1280, hold = null, holdCounts = false, declineWhy = null,
-                pinnedWidth = null, catalog = CATALOG } = {}) {
+                pinnedWidth = null, catalog = CATALOG, uncounted = null,
+                ruleCtx = undefined } = {}) {
   const held = [];
   // Mutable, so a scenario can boot normally and start parking only once it is about
   // to do the thing it cares about - the grain flip needs channel rows on screen first.
@@ -94,7 +97,15 @@ function boot({ rows = ROWS, saved = null, url = 'http://localhost:5000/channels
     sent.push(entry);
     let payload = { success: true };
     let park = false;
-    if (href.includes('/record-context')) {
+    if (href.includes('/api/auto-rules')) {
+      // The rule errand's two writes: Create rule (POST) and Save to rule (PUT). Answered
+      // the way the routes answer a save, with the check's outcome and the rule's page.
+      payload = { success: true, url: '/rules/7',
+                  evaluation: { queued: false, rule_id: 7, scheduled: 1, skipped: {},
+                                already_scheduled: 0, retracked: 0, error: null,
+                                problems: null, abandoned: false,
+                                guide_reach: '2026-10-16T23:00:00' } };
+    } else if (href.includes('/record-context')) {
       const air = (ROWS_AIRINGS.rows || [])[0] || {};
       payload = {
         success: true,
@@ -138,12 +149,14 @@ function boot({ rows = ROWS, saved = null, url = 'http://localhost:5000/channels
       const base = qs.get('grain') === 'airings' ? ROWS_AIRINGS : rows;
       const asked = qs.getAll('facets').filter(Boolean);
       const facets = {};
-      asked.forEach((k) => { if ((base.facets || {})[k]) facets[k] = base.facets[k]; });
+      asked.forEach((k) => {
+        if ((base.facets || {})[k] && !(uncounted || {})[k]) facets[k] = base.facets[k];
+      });
       payload = declineWhy
-        ? { success: true, facets: {}, facets_counted: [], declined: ['facets'],
+        ? { success: true, facets: {}, facets_counted: [], uncounted: {}, declined: ['facets'],
             declined_reason: declineWhy }
         : { success: true, facets, facets_counted: Object.keys(facets).sort(),
-            declined: [], declined_reason: '' };
+            uncounted: uncounted || {}, declined: [], declined_reason: '' };
     } else if (href.includes('/catalog')) payload = catalog;
     else if (href.includes('/api/channels/search')) {
       // Echo the request back as `query_string`, the way the engine does. Replaying one
@@ -260,6 +273,9 @@ function boot({ rows = ROWS, saved = null, url = 'http://localhost:5000/channels
   window.scrollTo = () => {};
   const toasts = [];
   if (saved) window.CHANNEL_SEARCH_CONFIG.savedSearches = saved;
+  // The route's resolution of the `rule` action context (routes/channels.py::_rule_context),
+  // which page.html - rendered with no context - carries as null.
+  if (ruleCtx !== undefined) window.CHANNEL_SEARCH_CONFIG.ruleCtx = ruleCtx;
   JS.forEach((src) => window.eval(src));
   // showToast is util.js's, and it is what the page uses to say out loud that it did
   // something the user did not ask for. Wrapped after load so the real one still runs.
@@ -871,6 +887,82 @@ async function contextScenario() {
   return obs;
 }
 
+/* ── 5a. The rule errand (dev/changelog/1189) ───────────────────────────────────
+   The third action context. `rule=new` is the Rules page's + New rule: a bar saying what to
+   do, and the results bar's Create rule as the primary button. `rule=<id>` is a rule's Edit
+   search: the bar names the rule, offers Save to rule, and nothing on the page offers to
+   create a second rule. Both are the SERVER's resolution - a URL naming a rule the server
+   did not resolve is dropped. Navigation at the end of an errand is not implemented in
+   jsdom, so it is observed as the error jsdom raises plus the toast left for the next page. */
+async function ruleErrandScenario() {
+  const AIR = 'http://localhost:5000/channels?grain=airings';
+  const view = (c) => ({
+    bar_shown: c.$('#rule-bar').style.display !== 'none',
+    label: c.$('#rule-lbl').textContent.replace(/\s+/g, ' ').trim(),
+    save_shown: c.$('#rule-save').style.display !== 'none',
+    mkrule_shown: c.$('#sel-mkrule').style.display !== 'none',
+    mkrule_primary: c.$('#sel-mkrule').classList.contains('btn-primary'),
+    rule_in_request: (c.params().rule || []),
+    address_bar: c.window.location.search,
+    dismiss_tip: c.$('#rule-x').dataset.tip || '',
+  });
+  // The Saved searches panel, opened the way a person opens it.
+  const savedMenuOffersCreate = (c) => {
+    c.click(c.$('#sf-btn'));
+    return /data-mkrule/.test(c.$('#sf-pop-body').innerHTML);
+  };
+  const obs = {};
+
+  let c = boot({ url: AIR });
+  await c.settle();
+  obs.plain = Object.assign(view(c), { errors: c.errors });
+  obs.plain.saved_menu_offers_create = savedMenuOffersCreate(c);
+
+  c = boot({ url: 'http://localhost:5000/channels' });
+  await c.settle();
+  obs.channel_grain = Object.assign(view(c), { errors: c.errors });
+
+  c = boot({ url: `${AIR}&rule=new`, ruleCtx: { mode: 'new', value: 'new' } });
+  await c.settle();
+  obs.new_mode = Object.assign(view(c), { errors: c.errors.slice() });
+  c.click(c.$('#sel-mkrule'));
+  // The rule dialog, not the record modal the page already carries hidden.
+  const modal = c.$$('.modal').find((m) => m.querySelector('#ar-name')) || null;
+  obs.new_mode.dialog_title = modal ? modal.querySelector('.modal-head h2').textContent : null;
+  if (modal) {
+    modal.querySelector('#ar-name').value = 'Cup';
+    c.click(modal.querySelector('.modal-foot .btn-primary'));
+    await c.wait(20);
+  }
+  const created = c.sent.filter((x) => x.method === 'POST' && x.url.includes('/api/auto-rules')).pop();
+  obs.new_mode.created_search = created ? created.body.search : null;
+  obs.new_mode.navigated = c.errors.some((e) => /navigation/i.test(e));
+  obs.new_mode.pending_toast = JSON.parse(c.window.sessionStorage.getItem('app-pending-toast') || 'null');
+
+  const EDIT = { mode: 'edit', value: '7', id: 7, name: 'Cup Series', url: '/rules/7' };
+  c = boot({ url: `${AIR}&q=Cup&rule=7`, ruleCtx: EDIT });
+  await c.settle();
+  obs.edit_mode = Object.assign(view(c), { errors: c.errors.slice() });
+  obs.edit_mode.saved_menu_offers_create = savedMenuOffersCreate(c);
+  c.click(c.$('#rule-save'));
+  await c.wait(20);
+  const put = c.sent.filter((x) => x.method === 'PUT').pop();
+  obs.edit_mode.put = put ? { url: put.url, body: put.body } : null;
+  obs.edit_mode.navigated = c.errors.some((e) => /navigation/i.test(e));
+  obs.edit_mode.pending_toast = JSON.parse(c.window.sessionStorage.getItem('app-pending-toast') || 'null');
+
+  c = boot({ url: `${AIR}&rule=7`, ruleCtx: EDIT });
+  await c.settle();
+  c.click(c.$('#rule-x'));
+  await c.settle();
+  obs.dismissed = Object.assign(view(c), { toasts: c.toasts, errors: c.errors });
+
+  c = boot({ url: `${AIR}&rule=7`, ruleCtx: null });
+  await c.settle();
+  obs.stale = Object.assign(view(c), { errors: c.errors });
+  return obs;
+}
+
 /* ── 5b. The one bulk guide action, and the three answers a selection can give ──
    `in_guide` is per-channel, so a selection can hold both answers at once. The action is
    one button that becomes Add or Remove, and DISABLES on a mixed selection while saying
@@ -1405,31 +1497,201 @@ async function whenScenario() {
   obs.parked_chip_gone = !c.$('#wellbody .cs-chip.parked');
   obs.rel_control_value = (c.$('#rail [data-whenrel="n"]') || {}).value;
 
-  /* THE CARET, simulated and observed through a SPY, because neither engine lets it be
-     read off the element: Chrome raises InvalidStateError on `selectionStart` for
-     `type=number`, and jsdom returns null. Both land on the same branch in the page, and
-     the bug a real browser showed was that this branch defaulted the caret to 0 - so the
-     next digit typed landed BEFORE the previous one and "36" became "63"
-     (dev/changelog/414). What is assertable is where the restore asks for the caret. */
-  const setCalls = [];
-  const proto = c.window.HTMLInputElement.prototype;
-  const realSet = proto.setSelectionRange;
-  proto.setSelectionRange = function (a, b) {
-    setCalls.push({ value: String(this.value), at: a });
-    try { return realSet.call(this, a, b); } catch (e) { return undefined; }
-  };
+  /* THE CARET. Neither engine lets it be read off a number box (Chrome refuses selection on
+     `type=number`, jsdom returns null), and the bug a real browser showed was digits landing
+     backwards: "36" became "63" (dev/changelog/414), and later "24" became "42" on Program
+     length, because a rebuilt number box takes the caret at its FRONT and Chrome will not let
+     it be moved (dev/changelog/1187). The guarantee is now structural - the rail is not
+     redrawn under a focused number box at all - so what is asserted is that the box typed
+     into is the SAME node after the apply, still focused, holding both digits. */
   if (relBox()) {
-    relBox().focus();
-    c.type(relBox(), '12');
+    const before = relBox();
+    before.focus();
+    c.type(before, '1');
     await c.settle();
-    const last = setCalls[setCalls.length - 1] || null;
-    obs.caret_set_at = last ? last.at : null;
-    obs.caret_set_on_value_len = last ? last.value.length : null;
-    obs.caret_box_still_focused = c.document.activeElement === relBox();
+    obs.caret_box_same_node = relBox() === before;
+    c.type(before, '12');
+    await c.settle();
+    obs.caret_box_still_focused = c.document.activeElement === before;
+    obs.caret_box_value = before.value;
+    obs.when_after_two_digits = c.params()['f.when'] || [];
+    before.blur();
+    await c.wait(20);
+    obs.caret_box_redrawn_after_blur = relBox() !== before && !!relBox();
   }
-  proto.setSelectionRange = realSet;
 
   obs.errors = c.errors;
+  return obs;
+}
+
+/* ── 9b. Day of week and Time of day (dev/changelog/1187) ──────────────── */
+async function dayTimeScenario() {
+  const obs = {};
+  // Arriving with a time range in the URL: the boxes have to come back with it, or the
+  // chip sits over two empty controls - a filter you can see and cannot edit.
+  const c = boot({ url: 'http://localhost:5000/channels?grain=airings&f.tod=tod%3A18%3A00..23%3A59' });
+  await c.settle();
+  const fac = (key) => c.$(`#rail [data-fac="${key}"]`);
+  obs.rail_facets = c.$$('#rail .fac').map((f) => f.dataset.fac);
+
+  // The week, all of it, Monday first, with no find box and no "Show all 7".
+  obs.dow_values = c.$$('#rail [data-fac="dow"] .prow[data-value]').map((r) => r.dataset.value);
+  obs.dow_labels = c.$$('#rail [data-fac="dow"] .prow[data-value] .pv').map((r) => r.textContent.trim());
+  obs.dow_has_find_box = !!(fac('dow') && fac('dow').querySelector('.rsearch'));
+  obs.dow_has_show_all = !!(fac('dow') && fac('dow').querySelector('.fac-more'));
+  const dayBtn = (day, dir) => c.$(`#rail [data-fac="dow"] .tri button[data-value="${day}"][data-dir="${dir}"]`);
+  if (dayBtn('sat', 'inc')) { c.click(dayBtn('sat', 'inc')); await c.settle(); }
+  if (dayBtn('sun', 'inc')) { c.click(dayBtn('sun', 'inc')); await c.settle(); }
+  obs.dow_after_picking = c.params()['f.dow'] || [];
+  if (dayBtn('mon', 'exc')) { c.click(dayBtn('mon', 'exc')); await c.settle(); }
+  obs.dow_excluded = c.params()['x.dow'] || [];
+  obs.chip_texts = c.$$('#wellbody .cs-chip').map((el) => el.textContent.replace(/\s+/g, ' ').trim());
+
+  // The time range: hydrated, chipped in the display clock format, one value.
+  const box = (end) => c.$(`#rail [data-todrange="${end}"]`);
+  obs.tod_hydrated = { from: (box('from') || {}).value, to: (box('to') || {}).value };
+  obs.tod_sent_at_boot = c.params()['f.tod'] || [];
+  obs.tod_fill_on = !!(fac('tod') && fac('tod').querySelector('.when-fill.on'));
+  obs.tod_value_rows = c.$$('#rail [data-fac="tod"] .prow[data-value]').map((r) => r.dataset.value);
+  obs.tod_fill_label = ((fac('tod') && fac('tod').querySelector('.wf-l')) || {}).textContent || '';
+
+  // Retyping the end REPLACES the one range rather than adding a second. While the box has
+  // focus the rail is not redrawn under it at all - the SAME node, not a new one given the
+  // focus - and once focus leaves, the rail catches up.
+  const toBefore = box('to');
+  if (toBefore) { toBefore.focus(); c.type(toBefore, '02:00'); await c.settle(); }
+  obs.tod_after_retype = c.params()['f.tod'] || [];
+  obs.tod_box_kept_focus = c.document.activeElement === box('to');
+  obs.tod_box_same_node_while_focused = !!toBefore && box('to') === toBefore;
+  obs.tod_label_while_focused = ((fac('tod') && fac('tod').querySelector('.wf-l')) || {}).textContent || '';
+  if (toBefore) { toBefore.blur(); await c.wait(20); }
+  obs.tod_box_redrawn_after_blur = !!toBefore && box('to') !== toBefore && !!box('to');
+  obs.tod_label_after_retype = ((fac('tod') && fac('tod').querySelector('.wf-l')) || {}).textContent || '';
+
+  // The usual way out of the box is a press on something else in the rail. Mousedown moves
+  // focus before mouseup, so a redraw at the focusout would detach the pressed button and
+  // its click would never arrive. The held-back redraw has to wait for the release.
+  const toAgain = box('to');
+  if (toAgain) { toAgain.focus(); c.type(toAgain, '02:00'); await c.settle(); }
+  obs.press_deferred = !!toAgain && box('to') === toAgain;
+  const fri = dayBtn('fri', 'inc');
+  const fire = (el, type) => el.dispatchEvent(new c.window.MouseEvent(type, { bubbles: true, cancelable: true }));
+  if (fri) {
+    fire(fri, 'pointerdown');
+    fire(fri, 'mousedown');
+    fri.focus();                         // a press's default action, which is the focusout
+    await c.wait(40);
+    obs.pressed_button_still_attached = fri.isConnected;
+    fire(fri, 'pointerup');
+    fire(fri, 'mouseup');
+    c.click(fri);
+    await c.settle();
+  }
+  obs.dow_after_press = c.params()['f.dow'] || [];
+
+  // Excluded, then retyped: retyping a time is not a decision to flip it.
+  const todExc = c.$('#rail [data-fac="tod"] .tri button[data-dir="exc"]');
+  if (todExc) { c.click(todExc); await c.settle(); }
+  if (box('from')) { box('from').focus(); c.type(box('from'), '19:30'); await c.settle(); }
+  obs.tod_excluded_after_retype = { inc: c.params()['f.tod'] || [], exc: c.params()['x.tod'] || [] };
+
+  // One end emptied: the other stands alone. Both emptied: no value at all.
+  if (box('from')) { box('from').focus(); c.type(box('from'), ''); await c.settle(); }
+  obs.tod_one_end = (c.params()['x.tod'] || []).concat(c.params()['f.tod'] || []);
+  if (box('to')) { box('to').focus(); c.type(box('to'), ''); await c.settle(); }
+  obs.tod_none = (c.params()['x.tod'] || []).concat(c.params()['f.tod'] || []);
+
+  // Program length's boxes keep the caret too - the same rebuild, the same restore.
+  const durMin = () => c.$('#rail [data-durrange="min"]');
+  if (durMin()) { durMin().focus(); c.type(durMin(), '2'); await c.settle(); }
+  obs.dur_sent = c.params()['f.duration'] || [];
+  obs.dur_box_kept_focus = c.document.activeElement === durMin();
+  if (durMin()) durMin().blur();
+  await c.wait(20);
+
+  // A range taken off the search keeps its row and boxes, ready to put back - and its count
+  // reads "not counted", never a zero the engine did not say.
+  if (box('from')) { box('from').focus(); c.type(box('from'), '18:00'); await c.settle(); }
+  if (box('from')) { box('from').blur(); await c.wait(20); }
+  obs.tod_before_chip_removed = (c.params()['x.tod'] || []).concat(c.params()['f.tod'] || []);
+  const todChipX = c.$$('#wellbody .cs-chip').find((el) => /Time of day/.test(el.textContent));
+  const rm = todChipX && todChipX.querySelector('[data-rm]');
+  if (rm) { c.click(rm); await c.settle(); }
+  obs.tod_sent_after_chip_removed = (c.params()['x.tod'] || []).concat(c.params()['f.tod'] || []);
+  const todCount = c.$('#rail [data-fac="tod"] .prow[data-value] .pcount');
+  obs.tod_count_after_removed = todCount ? { text: todCount.textContent.trim(),
+    uncounted: todCount.classList.contains('uncounted'), zero: todCount.classList.contains('zero') } : null;
+
+  // The + Filter popover can set the fill-ins too, and does not call them empty.
+  c.click(c.$('#fb-add'));
+  await c.wait(20);
+  const popRow = c.$('#fb-pop [data-dim="duration"]');
+  if (popRow) { c.click(popRow); await c.wait(20); }
+  obs.pop_duration_boxes = c.$$('#fb-pop [data-durrange]').map((el) => el.dataset.durrange);
+  obs.pop_duration_says_none = !!c.$('#fb-pop .fac-none');
+  const popMin = c.$('#fb-pop [data-durrange="min"]');
+  if (popMin) { popMin.focus(); c.type(popMin, '4'); await c.settle(); }
+  obs.pop_duration_sent = c.params()['f.duration'] || [];
+  obs.pop_still_open = c.$('#fb-pop').classList.contains('open');
+  obs.errors = c.errors;
+
+  // The popover opened from the WELL's pill, with nothing set yet: the first digit typed
+  // into Program length makes the first chip, and the pill (with the popover inside it)
+  // moves to sit after the chips. That move used to blur the box mid-number.
+  const p = boot({ url: 'http://localhost:5000/channels?grain=airings' });
+  await p.settle();
+  p.click(p.$('#addf2'));
+  await p.wait(20);
+  const pd = p.$('#fb-pop [data-dim="duration"]');
+  if (pd) { p.click(pd); await p.wait(20); }
+  const pmin = p.$('#fb-pop [data-durrange="min"]');
+  if (pmin) {
+    pmin.focus();
+    p.type(pmin, '2');
+    await p.settle();
+    obs.pill_pop_first_chip = (p.params()['f.duration'] || []).slice();
+    obs.pill_pop_kept_focus = p.document.activeElement === pmin;
+    p.type(pmin, '24');
+    await p.settle();
+    obs.pill_pop_two_digits = p.params()['f.duration'] || [];
+    pmin.blur();
+    await p.wait(20);
+  }
+  obs.pill_after_chips = !!p.$('#addf-slot-tail #addfpw2');
+  obs.pill_pop_errors = p.errors;
+
+  // At phone width the Filters sheet carries both, the time boxes inside the drill-in.
+  const m = boot({ width: 375, url: 'http://localhost:5000/channels?grain=airings' });
+  await m.settle();
+  m.click(m.$('#addf2'));
+  await m.wait(20);
+  obs.sheet_dims = m.$$('.cs-sheet [data-fdim]').map((el) => el.dataset.fdim);
+  m.click(m.$('.cs-sheet [data-fdim="dow"]'));
+  await m.wait(20);
+  obs.sheet_dow_rows = m.$$('.cs-sheet .prow[data-key="dow"]').length;
+  obs.sheet_dow_find_box = !!m.$('.cs-sheet .rsearch');
+  m.click(m.$('.cs-sheet [data-fback]'));
+  await m.wait(20);
+  m.click(m.$('.cs-sheet [data-fdim="tod"]'));
+  await m.wait(20);
+  obs.sheet_tod_boxes = m.$$('.cs-sheet [data-todrange]').map((el) => el.dataset.todrange);
+  const sheetTo = m.$('.cs-sheet [data-todrange="to"]');
+  if (sheetTo) { m.type(sheetTo, '09:00'); await m.settle(); }
+  obs.sheet_tod_sent = m.params()['f.tod'] || [];
+  obs.mobile_errors = m.errors;
+
+  // Facets the server left out on purpose: said once at the top of the rail, in its words,
+  // and on each `--` they cover - not a column of bare dashes nobody can explain.
+  const u = boot({ url: 'http://localhost:5000/channels?grain=airings',
+                   uncounted: FACETS_FIRSTONLY.uncounted });
+  await u.settle();
+  obs.served_uncounted = Object.keys(FACETS_FIRSTONLY.uncounted || {}).sort();
+  obs.uncounted_notes = u.$$('#rail .rnote').map((el) => el.textContent.replace(/\s+/g, ' ').trim());
+  const dash = u.$('#rail [data-fac="dow"] .pcount.uncounted');
+  obs.uncounted_dow_tip = dash ? dash.getAttribute('data-tip') : null;
+  const acct = u.$('#rail [data-fac="acct"] .pcount');
+  obs.uncounted_acct_still_counted = !!acct && !acct.classList.contains('uncounted');
+  obs.uncounted_errors = u.errors;
   return obs;
 }
 
@@ -1841,12 +2103,14 @@ const run = async () => {
   out.saved = await savedScenario();
   out.page_size = await pageSizeScenario();
   out.context = await contextScenario();
+  out.rule_errand = await ruleErrandScenario();
   out.guide_action = await guideActionScenario();
   out.mobile = await mobileScenario();
   out.mobile_sheets = await mobileSheetsScenario();
   out.airing = await airingScenario();
   out.nav_click = await navClickScenario();
   out.when = await whenScenario();
+  out.day_time = await dayTimeScenario();
   out.airing_mobile = await airingMobileScenario();
   out.loading = await loadingScenario();
   out.loading_flip = await loadingFlipScenario();
@@ -1861,6 +2125,7 @@ const run = async () => {
   out.decline_why = DECLINE_WHY;
   out.catalog_by_grain = CATALOG.by_grain;
   out.catalog_when_values = CATALOG.when_values;
+  out.catalog_dow_values = CATALOG.dow_values;
   out.airing_rows = ROWS_AIRINGS.rows;
   process.stdout.write(JSON.stringify(out));
   process.exit(0);

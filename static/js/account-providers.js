@@ -35,7 +35,7 @@
     return choices.map((c) => {
       const note = c.provider && c.provider !== providerName
         ? ` <span class="text-faint">(on ${escHtml(c.provider)} now, would move)</span>` : '';
-      return `<label class="prov-check"><input type="checkbox" value="${c.id}"> ` +
+      return `<label class="check-row"><input type="checkbox" value="${c.id}"> ` +
         `${escHtml(c.name)}${note}</label>`;
     }).join('');
   }

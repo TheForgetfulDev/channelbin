@@ -14,7 +14,6 @@ from __future__ import annotations
 import json
 import logging
 import re
-import unicodedata
 from datetime import datetime, timedelta
 from typing import NamedTuple
 from urllib.parse import urlsplit
@@ -28,7 +27,8 @@ from .database import (Account, Channel, ChannelEvent, CHANNEL_EPG_KEY_CHANGED,
                        EPG_KEY_ORIGIN_MANUAL, EPG_KEY_ORIGIN_NAME_MATCH, EPG_KEY_REJECTED,
                        EPG_SOURCE_PROVIDER, EPG_SOURCE_URL, EPG_STATUS_FAILED, EPG_STATUS_OK,
                        EPG_STATUS_REFUSED, EPG_STATUS_TRUNCATED)
-from .db_utils import retry_on_locked
+from .db_utils import chunked, retry_on_locked
+from .program_titles import strip_marks
 
 log = logging.getLogger(__name__)
 
@@ -93,6 +93,12 @@ def normalize_name(name: str | None) -> str:
         return ''
     text = _NAME_SEPARATORS.sub(' ', name.casefold())
     return _WHITESPACE.sub(' ', text).strip()
+
+
+def case_sensitive_matching(cfg) -> bool:
+    """`sync.epg_case_sensitive_matching` off a loaded config - the one reader, handed the
+    config the caller already holds (never a load_config() of its own)."""
+    return (cfg or {}).get('sync', {}).get('epg_case_sensitive_matching', False)
 
 
 def norm_key(key: str, case_sensitive: bool) -> str:
@@ -330,9 +336,7 @@ _ENTRY_COLUMNS = ('channel_id', 'title', 'sub_title', 'description', 'start_time
 
 
 def _chunks(ids):
-    ids = list(ids)
-    for i in range(0, len(ids), _CHUNK):
-        yield ids[i:i + _CHUNK]
+    return chunked(list(ids), _CHUNK)
 
 
 def _of_source(model, source_id: int):
@@ -505,8 +509,7 @@ def apply_winners(changes: dict[int, tuple[int | None, int | None]],
     events = [_source_change_event(ch_id, old, new, source_names,
                                    reasons.get(ch_id, REASON_PRIORITY))
               for ch_id, (old, new) in changes.items() if old is not None and new is not None]
-    for i in range(0, len(events), _CHUNK):
-        batch = events[i:i + _CHUNK]
+    for batch in chunked(events, _CHUNK):
 
         @retry_on_locked()
         def _log_and_commit(batch=batch):
@@ -1472,9 +1475,9 @@ def subscribe_to_source(account_id: int, source_id: int,
         if fid in donors:
             pairs.append((cid, *donors[fid]))
 
-    for i in range(0, len(pairs), _COPY_CHUNK):
+    for pairs_batch in chunked(pairs, _COPY_CHUNK):
         @retry_on_locked()
-        def _copy_and_commit(batch=pairs[i:i + _COPY_CHUNK]):
+        def _copy_and_commit(batch=pairs_batch):
             targets = [t for t, _d, _m in batch]
             for model in (EPGEntry, EpgAlternateEntry):
                 db.session.execute(delete(model).where(_of_source(model, source_id),
@@ -1845,8 +1848,7 @@ def accept_name_matches(source: EpgSource, picks, case_sensitive: bool) -> NameM
     valid = [(cid, xml) for cid, xml in picks
              if cid in proposals and proposals[cid].entry.xml_id == xml]
     applied = waiting = 0
-    for i in range(0, len(valid), 100):
-        chunk = valid[i:i + 100]
+    for chunk in chunked(valid, 100):
 
         @retry_on_locked()
         def _accept_and_commit():
@@ -1996,13 +1998,14 @@ class Comparison(NamedTuple):
 
 def comparison_title(title: str | None) -> str:
     """A listing's title as the comparison matches it: §7.3's normalize_name() after
-    dropping modifier letters - the superscript tags providers append (`ᴺᵉʷ`, `ᴸᶦᵛᵉ`,
-    `ᴿᴬᵂ`, 131,000 of them in the live guide) that one feed carries and another does not -
+    dropping the marks providers write into titles - the superscript tags (`ᴺᵉʷ`, `ᴸᶦᵛᵉ`,
+    `ᴿᴬᵂ`, 131,000 of them in the live guide) that one feed carries and another does not,
     and a leading `Live:`, the other feeds' spelling of the same tag
-    (`U.S. Senate ᴸᶦᵛᵉ` / `Live: U.S. Senate`)."""
-    key = normalize_name(''.join(ch for ch in (title or '')
-                                 if unicodedata.category(ch) != 'Lm'))
-    return key[5:] if key.startswith('live ') else key
+    (`U.S. Senate ᴸᶦᵛᵉ` / `Live: U.S. Senate`).
+
+    The marks are program_titles.strip_marks(), the one definition auto-record rules use
+    too (DESIGN-autoschedule.md §3.3). The separator folding is this comparison's own."""
+    return normalize_name(strip_marks(title))
 
 
 def _word_prefix(x: str, y: str) -> bool:

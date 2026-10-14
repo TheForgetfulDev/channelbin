@@ -118,6 +118,8 @@ function ccNextRun(recurDay, timeHHMM, nowWall) {
   };
 }
 
+// duplicated from static/js/util.js::fmtHhmm - this file's pure helpers are evaluated in node
+// without util.js (tests/test_check_modal_js.py), so it cannot call the shared one there.
 function ccClock(timeHHMM, hour12) {
   const [h, m] = timeHHMM.split(':').map(Number);
   if (!hour12) return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`;

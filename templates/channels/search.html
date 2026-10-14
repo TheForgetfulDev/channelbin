@@ -176,6 +176,15 @@
               data-tip="Stop replacing that recording. The search itself is left alone, and the scheduled recording stays as it is.">&times;</button>
     </div>
 
+    {# The THIRD action context (DESIGN-channel-search.md §3, dev/changelog/1189): making an
+       auto-record rule, or changing one rule's search. Served hidden, like the replace bar;
+       renderRuleBar() draws it from the server's own resolution of the rule. #}
+    <div class="cs-replace-bar" id="rule-bar" style="display:none">
+      <span class="cs-replace-lbl" id="rule-lbl"></span>
+      <button class="btn btn-sm btn-primary" id="rule-save" type="button" style="display:none">Save to rule</button>
+      <button class="btn btn-sm btn-ghost" id="rule-x" type="button">&times;</button>
+    </div>
+
     <div class="cb-all">
       {# The heading is the COUNT and nothing else. The grain selector moved OUT of this
          card and above the search box (dev/changelog/811): it says what a row is, which
@@ -189,6 +198,10 @@
       <div class="select-btns">
         <button class="btn btn-sm" id="sel-all-btn" type="button">Select All</button>
         <button class="btn btn-sm" id="desel-all-btn" type="button">Deselect All</button>
+        {# Programs only, and never while changing an existing rule's search (that errand's
+           bar offers Save to rule instead). The same action as the Saved searches menu's. #}
+        <button class="btn btn-sm" id="sel-mkrule" type="button" style="display:none"
+                data-tip="Create rule from this search.&#10;Records each upcoming program this search finds, once, now and whenever the guide refreshes.">Create rule from this search&#8230;</button>
         <div class="menu-wrap">
           <button class="btn btn-sm" id="cols-btn" type="button" data-menu>&#9881; Columns</button>
           <div class="menu menu-panel" id="cols-pop">
@@ -333,6 +346,9 @@ window.CHANNEL_SEARCH_CONFIG = {
      from its state when this is null, so a stale link cannot leave the URL claiming a
      replace the page is not offering. #}
   replaceRec: {{ replace_rec | tojson }},
+  {# The rule action context, RESOLVED - null when `rule` named a rule that no longer exists,
+     which drops the context exactly as a stale replace_rec is dropped. #}
+  ruleCtx: {{ rule_ctx | tojson }},
   savedSearches: {{ saved_searches | tojson }},
   dupGroups: {{ dup_groups | tojson }},
   newTagUrl: {{ (url_for('tags.tags_list') ~ '?new=1') | tojson }},
@@ -349,6 +365,14 @@ window.CHANNEL_SEARCH_CONFIG = {
      the first screen is decided by the first paint rather than by a fetch made after the
      modal is already on screen. 0 = never dismissed. #}
   groupIntroSeenVersion: {{ group_intro_seen_version | tojson }},
+  {# "Create rule from this search..." (Programs only) and the rule errand's Save to rule. #}
+  autoRule: {
+    createUrl: {{ url_for('auto_rules.create_rule_json') | tojson }},
+    apiBase: '/api/auto-rules/',
+    rulesUrl: {{ url_for('auto_rules.rules_page') | tojson }},
+    defaultCap: {{ auto_rule_default_cap | tojson }},
+    phrases: {{ auto_rule_phrases | tojson }},
+  },
 };
 
 {# What guide.js needs to drive the shared record modal. Same shape as index.html's -
@@ -377,6 +401,7 @@ window.onScheduleSaved = () => {
 <script src="{{ url_for('static', filename='js/guide.js') }}"></script>
 <script src="{{ url_for('static', filename='js/channel-search.js') }}"></script>
 <script src="{{ url_for('static', filename='js/bulk-schedule-modal.js') }}"></script>
+<script src="{{ url_for('static', filename='js/auto-rule-modal.js') }}"></script>
 <script src="{{ url_for('static', filename='js/schedule-fields.js') }}"></script>
 <script src="{{ url_for('static', filename='js/check-modal.js') }}"></script>
 <script src="{{ url_for('static', filename='js/dup-modal.js') }}"></script>

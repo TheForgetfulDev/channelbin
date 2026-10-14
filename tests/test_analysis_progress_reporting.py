@@ -53,28 +53,42 @@ def _cfg(gather=True):
     return {'recording': {'gather_health_data': gather}}
 
 
-def _pp(enabled=True, fmt='mp4', mode='damaged'):
-    return {'enabled': enabled, 'format': fmt, 'reencode_mode': mode}
+def _pp(enabled=True, fmt='mp4', mode='damaged', loudness=False):
+    return {'enabled': enabled, 'format': fmt, 'reencode_mode': mode,
+            'loudness_normalize': loudness}
 
 
 class AnalysisPassPlanTests(unittest.TestCase):
     """Pure, no app: the denominator "pass N of M" is measured against."""
 
-    def test_the_ordinary_recording_runs_both_reads(self):
+    def test_the_ordinary_recording_runs_three_reads(self):
         self.assertEqual(ppmod.analysis_pass_plan(_cfg(), _pp()),
+                         [ppmod.ANALYSIS_PASS_HEALTH, ppmod.ANALYSIS_PASS_TIMELINE,
+                          ppmod.ANALYSIS_PASS_FORMATS])
+
+    def test_loudness_leveling_adds_its_own_read(self):
+        """dev/changelog/1184: the ebur128 pass runs only when leveling is on."""
+        self.assertEqual(ppmod.analysis_pass_plan(_cfg(), _pp(loudness=True)),
+                         [ppmod.ANALYSIS_PASS_HEALTH, ppmod.ANALYSIS_PASS_TIMELINE,
+                          ppmod.ANALYSIS_PASS_FORMATS, ppmod.ANALYSIS_PASS_LOUDNESS])
+
+    def test_an_mkv_conversion_runs_no_format_survey(self):
+        """The survey serves the mp4 audio re-encode; an mkv conversion copies everything."""
+        self.assertEqual(ppmod.analysis_pass_plan(_cfg(), _pp(fmt='mkv', loudness=True)),
                          [ppmod.ANALYSIS_PASS_HEALTH, ppmod.ANALYSIS_PASS_TIMELINE])
 
     def test_health_data_off_leaves_only_the_scan_the_reencode_decision_needs(self):
         """do_postprocess still scans in that case, or turning health data off would
         silently disable damage repair - so the phase has one pass, not zero."""
         self.assertEqual(ppmod.analysis_pass_plan(_cfg(gather=False), _pp()),
-                         [ppmod.ANALYSIS_PASS_TIMELINE])
+                         [ppmod.ANALYSIS_PASS_TIMELINE, ppmod.ANALYSIS_PASS_FORMATS])
 
-    def test_health_data_off_and_reencode_always_reads_nothing(self):
-        """reencode_mode 'always' does not ask whether the file is damaged, so no pass runs
-        and an empty plan is the honest answer rather than a bar with no work behind it."""
+    def test_health_data_off_and_reencode_always_reads_only_the_formats(self):
+        """reencode_mode 'always' does not ask whether the file is damaged, so there is no
+        damage scan - but the audio re-encode still needs the widest layout in the file."""
         self.assertEqual(ppmod.analysis_pass_plan(_cfg(gather=False),
-                                                  _pp(mode='always')), [])
+                                                  _pp(mode='always')),
+                         [ppmod.ANALYSIS_PASS_FORMATS])
 
     def test_health_data_off_and_a_ts_output_reads_nothing(self):
         self.assertEqual(ppmod.analysis_pass_plan(_cfg(gather=False), _pp(fmt='ts')), [])

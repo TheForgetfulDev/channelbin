@@ -295,13 +295,6 @@ class XtreamClient:
         except Exception:
             return {}
 
-    def get_xmltv(self) -> bytes:
-        url = f'{self.base_url}/xmltv.php'
-        resp = requests.get(url, params=self._base_params, timeout=self.timeout,
-                            stream=True, headers=self._headers)
-        resp.raise_for_status()
-        return resp.content
-
 
 # ── Dump helpers ─────────────────────────────────────────────────────────────
 

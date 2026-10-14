@@ -5,6 +5,39 @@ Notable changes to ChannelBin, newest first. This project follows
 release is tagged `v<version>` in git, and the version the app is running is shown in the
 page footer.
 
+## 0.24.0 - 2026-10-14
+
+**Added**
+
+- Auto-record rules: save a Programs search as a rule, and every new matching showing is
+  scheduled as an ordinary recording, checked whenever the guide changes and once an hour. Each
+  rule has its own page showing what is coming up, what it decided and why, with edit, pause,
+  check now and delete.
+- When the guide moves a program that an auto-record rule scheduled, that rule's recording moves
+  with it instead of the program being scheduled a second time. Recordings you scheduled
+  yourself are never moved.
+- Search Programs filters by day of week and by time of day, and a rule can use both.
+- Re-encodes can use HEVC on the GPU, with GPU decoding, a maximum resolution, an audio channel
+  layout and optional loudness leveling.
+
+**Changed**
+
+- A re-encode produces one consistent format for the whole recording, at the largest picture and
+  frame rate it captured, and stays on the GPU when a recording changed format partway through.
+  The default damaged mode also re-encodes a recording that is not one consistent format.
+- A channel group shows its duplicates as one line with Show and Remove duplicates, and each
+  extra copy carries a badge naming the copy it duplicates.
+- An account's Hosts and Logins cards always show the host its streams are on and its own login.
+
+**Fixed**
+
+- Removing a duplicate from a group carries its guide listing and schedules over to the copy
+  that stays, instead of skipping copies from another account.
+- Checkboxes in dialog lists stay their normal size instead of stretching across the row.
+- On Search Programs, typing into Program length, date and time boxes no longer loses the caret
+  or scrambles digits, facet counts match the list under One row per channel, and the + Filter
+  popover can set a typed value.
+
 ## 0.23.0 - 2026-10-02
 
 **Added (experimental)**

@@ -1,5 +1,6 @@
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
+from functools import lru_cache
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 log = logging.getLogger(__name__)
@@ -52,6 +53,54 @@ def to_naive_utc(dt: datetime) -> datetime:
     return dt.astimezone(UTC).replace(tzinfo=None)
 
 
+def utc_offset_segments(tz: ZoneInfo, lo: datetime, hi: datetime) -> tuple:
+    """`tz`'s UTC offset over naive-UTC [lo, hi], as `((until, seconds), ..., (None, seconds))`.
+
+    Each `seconds` is the offset in force for instants before its `until` (naive UTC) and at
+    or after the previous one; the last entry has no `until` and holds from its start on, so
+    an instant outside [lo, hi] still gets the offset of the segment nearest it. A zone with
+    no change inside the span is one entry.
+
+    This is what lets SQL read a stored naive-UTC time as a LOCAL wall-clock time without a
+    timezone database: the channel search's day-of-week and time-of-day filters add the
+    offset in force at each showing's start, so 7 PM means 7 PM on both sides of a DST change
+    (dev/changelog/1187). Sampled a day apart and bisected to the second - no zone changes its
+    offset twice inside one day at any date a guide can hold. Cached on the span's dates,
+    which is how often its answer can change.
+    """
+    return _offset_segments(tz, lo.date(), hi.date())
+
+
+@lru_cache(maxsize=64)
+def _offset_segments(tz: ZoneInfo, lo_day, hi_day) -> tuple:
+    def offset(at: datetime) -> int:
+        return int(at.replace(tzinfo=UTC).astimezone(tz).utcoffset().total_seconds())
+
+    step = timedelta(days=1)
+    at = datetime.combine(lo_day, datetime.min.time()) - step
+    end = datetime.combine(hi_day, datetime.min.time()) + 2 * step
+    current = offset(at)
+    segments = []
+    while at < end:
+        nxt = at + step
+        changed = offset(nxt)
+        if changed != current:
+            # The first second at which the new offset holds, somewhere in (at, nxt].
+            before, after = at, nxt
+            while after - before > timedelta(seconds=1):
+                mid = before + (after - before) / 2
+                mid = mid.replace(microsecond=0)
+                if offset(mid) == current:
+                    before = mid
+                else:
+                    after = mid
+            segments.append((after, current))
+            current = changed
+        at = nxt
+    segments.append((None, current))
+    return tuple(segments)
+
+
 def parse_local_to_utc(value: str) -> datetime:
     """Parse a datetime-local form value ('YYYY-MM-DDTHH:MM[:SS]'), interpreted in the
     display timezone, into naive UTC. Raises ValueError on any bad input - None and
@@ -65,11 +114,14 @@ def parse_local_to_utc(value: str) -> datetime:
     return dt.astimezone(UTC).replace(tzinfo=None)
 
 
-def format_clock(hour: int, minute: int) -> str:
+def format_clock(hour: int, minute: int, h24: bool = None) -> str:
     """A bare time-of-day (no date) as 'H:MM' (24h) or 'H:MM AM/PM' (12h), per the display
     time format setting - the formatting _recur_label already did inline for recur_hour/
-    recur_minute, now shared with the maintenance window's start/end times."""
-    if is_24h():
+    recur_minute, now shared with the maintenance window's start/end times. A per-row caller
+    passes `h24`, read once."""
+    if h24 is None:
+        h24 = is_24h()
+    if h24:
         return f'{hour:02d}:{minute:02d}'
     suffix = 'AM' if hour < 12 else 'PM'
     disp_h = hour % 12 or 12
@@ -135,6 +187,44 @@ def format_local(dt, style: str = 'datetime', none_value='-', *, tz: ZoneInfo = 
     return to_local(dt, tz).strftime(fmt_24h if h24 else fmt_12h)
 
 
+def day_label(dt_utc: datetime, now: datetime, tz: ZoneInfo) -> str:
+    """'Today' / 'Tomorrow' / 'Yesterday', else 'Sun Oct 18' (with the year when it is not
+    this year), for a naive-UTC instant in the display timezone. The one spelling of a day
+    heading beside a clock time - the recordings list and the Rules pages both use it."""
+    local = to_local(dt_utc, tz)
+    today = to_local(now, tz).date()
+    delta = (local.date() - today).days
+    if delta == 0:
+        return 'Today'
+    if delta == 1:
+        return 'Tomorrow'
+    if delta == -1:
+        return 'Yesterday'
+    if local.year == today.year:
+        return local.strftime('%a %b ') + str(local.day)
+    return local.strftime('%b ') + f'{local.day}, {local.year}'
+
+
+def ago(when: datetime, now: datetime, none_value: str = 'never') -> str:
+    """'just now' / '5 minutes ago' / '3 hours ago' / '2 days ago' for a past naive-UTC
+    instant: rounded, one unit, the register a person uses for "when did this last happen".
+    Hours run to 48 so "yesterday evening" does not read as "1 day ago"."""
+    if when is None:
+        return none_value
+    minutes = (now - when).total_seconds() / 60
+    if minutes < 1:
+        return 'just now'
+    if minutes < 60:
+        m = int(round(minutes))
+        return f'{m} minute{"" if m == 1 else "s"} ago'
+    hours = minutes / 60
+    if hours < 48:
+        h = int(round(hours))
+        return f'{h} hour{"" if h == 1 else "s"} ago'
+    d = int(round(hours / 24))
+    return f'{d} day{"" if d == 1 else "s"} ago'
+
+
 def relative(dt_utc: datetime, *, style: str = 'compact', now: datetime = None) -> str:
     """Relative phrase for a future naive-UTC datetime; past → 'overdue'.
     style='compact' ('in 5m', dashboard wording); style='long' ('in 5 minutes', jobs wording).
@@ -144,9 +234,9 @@ def relative(dt_utc: datetime, *, style: str = 'compact', now: datetime = None) 
     `app/routes/recordings.py` is loose/approximate wording ('3.5 hours') for the recordings
     list, where many rows are shown at once and exact seconds don't matter; the `time_ago`/
     `time_until` Jinja filters (same file) are exact combined-unit wording ('1d 4h ago') for
-    account sync timestamps, where precision is the point. A fourth, `_ago`/`_ahead` in
-    `app/readiness.py`, is past-tense rounded single-unit prose ('3 hours ago') for the
-    readiness sentences (dev/changelog/971)."""
+    account sync timestamps, where precision is the point. A fourth, `ago()` above, is
+    past-tense rounded single-unit prose ('3 hours ago') for a sentence read once - the
+    readiness sentences (dev/changelog/971) and the Rules pages (dev/changelog/1189)."""
     if now is None:
         now = datetime.utcnow()
     diff = (dt_utc - now).total_seconds()

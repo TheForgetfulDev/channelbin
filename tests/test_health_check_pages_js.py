@@ -321,13 +321,13 @@ class ChannelPageAddToGroupWarnedTests(_Base):
     def test_a_warned_add_keeps_the_dialog_up_and_shows_the_warning(self):
         w = self.obs['warned']
         self.assertTrue(w['modalOpen'])
-        self.assertIn('is the same channel as curated: One', w['warning'])
+        self.assertIn('1 duplicate channel across accounts on <b>Strong</b>.', w['warning'])
         self.assertTrue(w['proceed'])
         self.assertEqual(w['navigations'], 0)
 
     def test_the_warning_text_is_escaped(self):
         self.assertEqual(self.obs['warned']['bold'], 0)
-        self.assertIn('<b>One</b>', self.obs['warned']['warning'])
+        self.assertIn('<b>Strong</b>', self.obs['warned']['warning'])
 
     def test_proceed_anyway_resends_forced_and_then_reloads(self):
         self.assertEqual([b['force'] for b in self.obs['memberPosts']], [False, True])

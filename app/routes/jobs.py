@@ -116,7 +116,7 @@ def _trigger_description(job) -> str:
 # contract, which doesn't track them either.
 _DURATION_TRACKED_SYSTEM_JOBS = {
     'config_backup_daily', 'recording_retention_daily', 'db_maintenance_daily',
-    'logo_cache_fetch', 'search_index_janitor',
+    'logo_cache_fetch', 'search_index_janitor', 'auto_rule_sweep',
 }
 
 
@@ -428,6 +428,10 @@ def _build_job_list():
         'storage_dirs_check': ('Storage Folder Check', '/maintenance'),
         'account_stats_fold': ('Account Stats Update', '/accounts'),
         'host_resolve_check': ('Stream Host Check', '/settings?q=hosts'),
+        'auto_rule_sweep': ('Auto-record Rules', '/rules'),
+        # The one-shot a guide import (or a refused run) queues: one evaluation of every
+        # enabled rule, coalesced on this id (app/scheduler.py::queue_auto_rule_evaluation).
+        'auto_rules_evaluate': ('Auto-record Rules check', '/rules'),
         # Never a job id of its own - only ever seen as `channel_hide_materialize_retry`,
         # the one-shot queued when a hide-rule pass was refused. Named here so the retry
         # branch below renders it as "Hide Rules retry" rather than a raw job id
@@ -592,6 +596,26 @@ def _build_job_list():
             continue
 
         display_name, edit_url = _RECURRING_META.get(job.id, (job.id, None))
+        if job.id == 'auto_rules_evaluate':
+            reason = (job.kwargs or {}).get('reason')
+            items.append({
+                '_start_utc': next_run_utc,
+                '_end_utc': next_run_utc,
+                '_next_run_utc': next_run_utc,
+                'id': job.id,
+                'display_name': display_name,
+                'type': 'one_off',
+                'next_run_utc': next_run_utc.isoformat(),
+                'next_run_et': _fmt_et(next_run_utc),
+                'next_run_relative': _relative(next_run_utc),
+                'stop_run_et': None,
+                'schedule_description': reason or 'queued after a guide import',
+                'edit_url': edit_url,
+                'run_url': None,
+                'skip_url': None,
+                'overlap': 'green',
+            })
+            continue
         avg_seconds, runs, duration_line = _job_duration_info(job.id)
         item = {
             '_start_utc': next_run_utc,

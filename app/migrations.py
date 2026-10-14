@@ -147,6 +147,7 @@ _BF_PROVIDER_STREAM_ID = 'm087.provider_stream_id'
 #: Discharged by duplicate_streams.backfill_fold() from create_app(): the fold's ranking
 #: reads config, and a step does not.
 _BF_DUPLICATE_FOLD = 'm088.duplicate_fold'
+_BF_ACCOUNT_STREAM_HOST = 'm089.account_stream_host'
 
 
 def _register_backfill(conn, cur, name: str):
@@ -2962,6 +2963,84 @@ def _m088_duplicate_fold(conn, cur):
     conn.commit()
 
 
+def _m089_account_stream_host(conn, cur):
+    """accounts: stream_host - the host most of the account's stream URLs are on, which the
+    Hosts card shows as a row when nothing is listed (dev/changelog/1176).
+
+    Defined as account_links.dominant_host() over the account's stream URLs, the count
+    current_host() makes at sync, so it calls current code under the rule in this module's
+    docstring. Ledger-gated: the backfill commits per account, and every value is recomputed
+    from the URLs, so a re-run from the top is safe."""
+    from .account_links import dominant_host
+
+    cols = {r[1] for r in cur.execute('PRAGMA table_info(accounts)').fetchall()}
+    if not cols:
+        return
+    added = 'stream_host' not in cols
+    if added:
+        _register_backfill(conn, cur, _BF_ACCOUNT_STREAM_HOST)
+        cur.execute('ALTER TABLE accounts ADD COLUMN stream_host VARCHAR(255)')
+        conn.commit()
+    if _backfill_needed(cur, _BF_ACCOUNT_STREAM_HOST, added):
+        account_ids = [r[0] for r in cur.execute('SELECT id FROM accounts').fetchall()]
+        for account_id in account_ids:
+            host = dominant_host(url for (url,) in cur.execute(
+                'SELECT stream_url FROM channels WHERE account_id = ?', (account_id,)).fetchall())
+            cur.execute('UPDATE accounts SET stream_host = ? WHERE id = ?', (host, account_id))
+            conn.commit()
+        log.info('Backfill: stream host stamped on %d accounts', len(account_ids))
+        _finish_backfill(conn, cur, _BF_ACCOUNT_STREAM_HOST)
+
+
+def _m090_recording_rule_id(conn, cur):
+    """recordings: rule_id, the auto-record rule that made a recording
+    (DESIGN-autoschedule.md §2, dev/changelog/1186).
+
+    No backfill and no obligation to register (dev/changelog/686): no rule existed before
+    this column, so NULL - "a person made it" - is the true answer for every existing row.
+    The auto_rules and rule_matches tables are new and come from create_all()."""
+    cols = {r[1] for r in cur.execute('PRAGMA table_info(recordings)').fetchall()}
+    if not cols:
+        return
+    if 'rule_id' not in cols:
+        cur.execute('ALTER TABLE recordings ADD COLUMN rule_id INTEGER REFERENCES auto_rules(id)')
+    cur.execute('CREATE INDEX IF NOT EXISTS ix_recordings_rule_id ON recordings (rule_id)')
+    conn.commit()
+
+
+def _m091_rule_match_rec_name(conn, cur):
+    """rule_matches: rec_name, the name an auto-record rule last gave the recording it made
+    (DESIGN-autoschedule.md §5, dev/changelog/1188).
+
+    No backfill and no obligation to register (dev/changelog/686): NULL means "not known to
+    be the rule's", and retrack never renames a recording whose row carries NULL - the
+    conservative answer for a row written before the column, whose name may have been
+    changed by its user since."""
+    cols = {r[1] for r in cur.execute('PRAGMA table_info(rule_matches)').fetchall()}
+    if not cols:
+        return
+    if 'rec_name' not in cols:
+        cur.execute('ALTER TABLE rule_matches ADD COLUMN rec_name VARCHAR(255)')
+    conn.commit()
+
+
+def _m092_auto_rule_last_problems(conn, cur):
+    """auto_rules: last_problems, the showings a check that ran could not schedule, split out
+    of last_error so that column only ever means "the rule could not run"
+    (DESIGN-autoschedule.md §2, dev/changelog/1189).
+
+    No backfill and no obligation to register (dev/changelog/686): a last_error written before
+    the split may hold either meaning, and the rule's next check - at most an hour away -
+    rewrites both columns. Guessing which meaning an old sentence had would be inferring a
+    fact rather than recording one."""
+    cols = {r[1] for r in cur.execute('PRAGMA table_info(auto_rules)').fetchall()}
+    if not cols:
+        return
+    if 'last_problems' not in cols:
+        cur.execute('ALTER TABLE auto_rules ADD COLUMN last_problems TEXT')
+    conn.commit()
+
+
 def _m081_account_blocks(conn, cur):
     """account_blocks: the stretches of time the user has told ChannelBin to keep off an
     account (app/account_blocks.py, dev/changelog/1151).
@@ -3167,6 +3246,14 @@ SCHEMA_MIGRATIONS = [
      'stamped at sync and backfilled', _m087_channel_provider_stream_id),
     (88, 'channels: duplicate_cluster_id + is_duplicate_loser, the stored duplicate fold, '
      'replacing is_duplicate_stream_url', _m088_duplicate_fold),
+    (89, 'accounts: stream_host, the host most of the account\'s stream URLs are on, stamped '
+     'at sync and backfilled', _m089_account_stream_host),
+    (90, 'recordings: rule_id, the auto-record rule that made a recording',
+     _m090_recording_rule_id),
+    (91, 'rule_matches: rec_name, the name an auto-record rule last gave its recording',
+     _m091_rule_match_rec_name),
+    (92, 'auto_rules: last_problems, the showings a check that ran could not schedule, '
+     'split out of last_error', _m092_auto_rule_last_problems),
 ]
 
 CURRENT_SCHEMA_VERSION = SCHEMA_MIGRATIONS[-1][0]

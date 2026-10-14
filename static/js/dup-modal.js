@@ -10,7 +10,7 @@
 
 /**
  * opts:
- *   groups           - [{suggested_keep_id, channels: [{channel_id, channel_name,
+ *   groups           - [{suggested_keep_id, provider?, channels: [{channel_id, channel_name,
  *                        account_name, in_guide, category_name, score, disabled,
  *                        is_oldest, test_status, tested_et, lifecycle, lifecycle_date}, ...]}, ...]
  *                       (per-channel fields beyond name/account/in_guide are optional -
@@ -113,8 +113,7 @@ function openDupModal(opts) {
       '<p><strong>Select which channel you\'d like to keep from each duplicate set.</strong> ' +
       'Everything you don\'t select is removed.</p>' +
       `<p>${opts.introHtml || ''}</p>` +
-      '<p class="dup-modal-note">These are the same underlying stream, listed more than once ' +
-      'in your provider\'s channel list.</p>' +
+      '<p class="dup-modal-note">Each set is one stream, listed more than once.</p>' +
     '</div>' +
     '<div id="dup-modal-error" style="display:none; color:var(--bad); margin-bottom:0.75rem; font-size:0.875rem;"></div>' +
     `<div id="dup-modal-sets">${setsHtml}</div>` +

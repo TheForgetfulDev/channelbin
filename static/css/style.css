@@ -1564,6 +1564,13 @@ body.scroll-locked { position: fixed; left: 0; right: 0; width: 100%; overflow: 
 .fp-radio input[type=radio] { accent-color: var(--accent); margin-right: 6px; }
 .fp-radio .text-muted { display: block; margin: 2px 0 0 20px; }
 
+/* One checkbox per line with its label beside it, in a dialog's list of things to pick (the
+   Add provider dialog's accounts, the record modal's accounts to block). A select at the end
+   of the line, like the block picker's connection count, sits at the right edge. */
+.check-row { display: flex; align-items: center; gap: 0.5rem; min-height: var(--ctl-h);
+  font-size: var(--fs-md); }
+.check-row .form-control { width: auto; margin-left: auto; }
+
 /* ── Groups tab (DESIGN.md §14) - sectioned channel-group / health-check list ──
    Prefixed `grp-` throughout: `.group-members-table`/`.group-member-row`/etc. are
    already load-bearing for group_detail.html + the Browse "In Guide" expander
@@ -2622,6 +2629,11 @@ th.gd-c-part { text-align: center; }
    Those four are unconverted, not a second implementation - they keep their inline styles
    until something else touches them. */
 .modal-err { color: var(--bad); font-size: var(--fs-sm); margin-bottom: 0.75rem; }
+/* "At most [n] within [h] hours" in the auto-record rule dialog (static/js/auto-rule-modal.js):
+   two short number boxes read as one sentence. The width outranks the field control's
+   width: 100%, which would otherwise stretch each box across the row. */
+.ar-limit { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; font-size: var(--fs-md); }
+.gd-field-ctl .ar-limit input[type=number] { width: 90px; }
 
 /* ── Settings modal: the real Settings page anatomy ────────────────── */
 .modal-panel.modal-wide { max-width: 680px; }
@@ -2652,7 +2664,7 @@ th.gd-c-part { text-align: center; }
    box, which is sized to the value it holds. */
 .gd-field.stack { display: block; }
 .gd-field.stack .gd-field-ctl { width: auto; display: block; margin-top: 8px; }
-.gd-field.stack .gd-field-ctl > input,
+.gd-field.stack .gd-field-ctl > input:where(:not([type=checkbox]):not([type=radio])),
 .gd-field.stack .gd-field-ctl > textarea { width: 100%; }
 .gd-field-left { flex: 1; min-width: 0; }
 .gd-field-lbl { font-size: var(--fs-md); font-weight: 600; color: var(--text); margin-bottom: 2px; }
@@ -2676,8 +2688,12 @@ th.gd-c-part { text-align: center; }
    to every other row (dev/changelog/890). The table is data, not description: it gets the
    body color, and the dim state then has something to dim against. */
 .cg-auto-details .tbl { font-size: var(--fs-sm); color: var(--text); }
-.gd-field-ctl.wide input { width: 100%; }
-.gd-field-ctl select, .gd-field-ctl input, .gd-field-ctl textarea {
+.gd-field-ctl.wide input:where(:not([type=checkbox]):not([type=radio])) { width: 100%; }
+/* Text boxes and selects only: a checkbox or radio given width: 100% stretches across the row
+   and pushes its label to the far side (dev/docs/BUGS.md 2026-10-03 11:01 AM). The exclusion
+   sits inside :where() so the selector keeps its old specificity - a bare :not() would outrank
+   the input[type=file] padding and the datetime/time mono font below. */
+.gd-field-ctl select, .gd-field-ctl input:where(:not([type=checkbox]):not([type=radio])), .gd-field-ctl textarea {
   width: 100%; background: var(--bg3); border: 1px solid var(--border); border-radius: var(--radius-sm);
   color: var(--text); font: inherit; font-size: var(--fs-md); padding: 5px 8px; cursor: pointer;
 }
@@ -2704,7 +2720,7 @@ th.gd-c-part { text-align: center; }
 .pm-tpl-cleanup { margin-top: 2px; }
 .pm-tpl-acts { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
 .gd-field-ctl input[type="file"] { padding: 4px 6px; }
-.gd-field-ctl select:focus, .gd-field-ctl input:focus,
+.gd-field-ctl select:focus, .gd-field-ctl input:where(:not([type=checkbox]):not([type=radio])):focus,
 .gd-field-ctl textarea:focus { outline: none; border-color: var(--accent); }
 .gd-field-ctl input[type=datetime-local], .gd-field-ctl input[type=time] { font-family: var(--font-mono); color-scheme: dark; }
 /* The schedule picker is the shared recur_schedule_fields macro moved in, so it keeps
@@ -3713,8 +3729,6 @@ a.shot-link { display: block; width: fit-content; cursor: zoom-in; }
 .prov-logins { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-left: auto; }
 .prov-pool { font-size: var(--fs-md); color: var(--text-muted); margin-top: 6px; }
 .prov-add-acct { margin-top: 10px; }
-.prov-check { display: flex; align-items: center; gap: 0.5rem; min-height: var(--ctl-h);
-  font-size: var(--fs-md); }
 @media (max-width: 960px) {
   .prov-logins { margin-left: 0; flex-basis: 100%; }
 }
@@ -4191,11 +4205,102 @@ a.shot-link { display: block; width: fit-content; cursor: zoom-in; }
 .acct-block-pick > summary { cursor: pointer; font-size: var(--fs-md); color: var(--text-muted); }
 .acct-block-pick > summary:hover { color: var(--accent-text); }
 .acct-block-pick[open] > summary { margin-bottom: 0.4rem; }
-.acct-block-row { display: flex; align-items: center; gap: 0.5rem; min-height: var(--ctl-h);
-  font-size: var(--fs-md); }
-.acct-block-row .form-control { width: auto; margin-left: auto; }
 /* The account pages' list of blocks in force or still to come, one line each with its
    Unblock button. */
 .acct-block-line { display: flex; align-items: center; gap: 0.75rem; flex-wrap: wrap;
   margin-top: 0.35rem; }
 .acct-block-line .btn { margin-left: auto; }
+
+/* ══ Auto-record rules: the list and a rule's page (mockup 42, dev/changelog/1189) ════════
+   templates/rules.html, templates/rule_detail.html. A rule's page is the group page's shell
+   (.gd-head, .gd-statezone, .gd-actionbar, .gd-sections, .gd-setbar, .card, .statlist) and
+   the list is the recordings list's card-table hybrid (.list-head + .rows .row); only what
+   those have no equivalent for is written here. */
+
+/* The list's tracks: fixed lengths and fr only. The header and each row are separate grid
+   containers, so a content-sized track would size per row and slide the labels off their
+   columns (CLAUDE.md CSS). A named container, the .rec-list / .acct-list pattern: the row
+   starves at its own minimum whether a phone or the sidebar took the room. */
+.rl-list { container-type: inline-size; container-name: rl-list; }
+.rl-list .list-head,
+.rl-list .rows .row { grid-template-columns: minmax(220px, 2.6fr) 124px minmax(170px, 1.5fr) 84px 112px 44px; }
+.rl-list .rows .row { min-height: 64px; }
+.rl-title { min-width: 0; display: flex; flex-direction: column; gap: 3px; }
+.rl-name { font-weight: 600; font-size: var(--fs-base); letter-spacing: -.01em; color: var(--text);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.rl-sum { font-size: var(--fs-sm); color: var(--text-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.rl-cell { font-size: var(--fs-md); color: var(--text-muted); line-height: 1.45; min-width: 0; }
+.rl-cell .day { color: var(--text); font-weight: 500; }
+.rl-cell .sub { display: block; color: var(--text-faint); font-size: var(--fs-sm); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.rl-cell .warnline { display: block; color: var(--warn); font-size: var(--fs-sm); }
+.rl-num { font-size: var(--fs-md); font-family: var(--font-mono); font-variant-numeric: tabular-nums; color: var(--text); text-align: right; }
+.rl-num .zero { color: var(--text-faint); }
+.rl-k { display: none; }
+/* A state badge stays on one line in its 124px column. */
+.rl-status .badge { white-space: nowrap; }
+/* The left edge says the rule's state and nothing else, like a recording row's. */
+.rl-list .row.rs-on::before { background: var(--ok); }
+.rl-list .row.rs-cap::before { background: var(--warn); }
+.rl-list .row.rs-broken::before { background: var(--bad); }
+.rl-list .row.rs-paused::before { background: var(--purple); }
+.rl-list .row.rs-new::before { background: var(--accent); }
+/* Desktop: the meta wrapper dissolves so each count lands in its own header column. */
+.rl-list .rl-meta { display: contents; }
+/* Below the row's real minimum (six tracks, five gaps and the padding come to ~890px): one
+   card per rule. Name and kebab on top, state and the next recording under it, the counts
+   on the last line. */
+@container rl-list (max-width: 900px) {
+  .rl-list .list-head { display: none; }
+  .rl-list .rows .row {
+    grid-template-columns: minmax(0, 1fr) auto; gap: 7px 10px; padding: 11px 12px 11px 16px;
+    grid-template-areas: "title kebab" "status status" "next next" "meta meta";
+  }
+  .rl-list .rl-title { grid-area: title; }
+  .rl-list .rl-name { white-space: normal; overflow-wrap: anywhere; }
+  .rl-list .rl-sum { white-space: normal; }
+  .rl-list .c-actions { grid-area: kebab; align-self: start; }
+  .rl-list .rl-status { grid-area: status; }
+  .rl-list .rl-next { grid-area: next; }
+  .rl-list .rl-meta { grid-area: meta; display: flex; gap: 14px; flex-wrap: wrap; }
+  .rl-list .rl-meta > * { text-align: left; }
+  .rl-list .rl-k { display: inline; color: var(--text-faint); margin-right: 5px; }
+}
+
+/* What it searches for: one row per part of the search, one column, because a value is a
+   phrase rather than a number - so the statlist's two-column border rule is undone. */
+.rl-search-lines { grid-template-columns: 1fr; }
+.rl-search-lines .srow:nth-last-child(-n+2) { border-bottom: 1px solid var(--border-soft); }
+.rl-search-lines .srow:last-child { border-bottom: none; }
+.rl-search-lines .sv { font-family: inherit; font-weight: 500; }
+/* A value naming something that no longer exists - what stops the rule running. */
+.rl-search-lines .sv .gone { color: var(--bad); font-weight: 600; }
+
+/* The ledger tables: Coming up and History. */
+.rl-tbl td { vertical-align: top; }
+.rl-when { white-space: nowrap; color: var(--text-muted); }
+.rl-when .day { display: block; color: var(--text); font-weight: 500; }
+.rl-prog .t { color: var(--text); font-weight: 500; }
+.rl-prog .s { display: block; color: var(--text-muted); font-size: var(--fs-sm); }
+.rl-where { color: var(--text-muted); }
+.rl-where .via { display: block; color: var(--text-faint); font-size: var(--fs-xs); white-space: normal; max-width: 200px; }
+.rl-why { color: var(--text-muted); line-height: 1.45; }
+.rl-why .fate { display: block; margin-top: 3px; color: var(--text-faint); font-size: var(--fs-sm); }
+.rl-why .fate a { color: var(--accent-text); }
+.rl-why .moved { color: var(--accent-text); }
+.rl-why .warned { color: var(--warn); }
+.rl-filter { display: flex; gap: 6px; flex-wrap: wrap; margin: 4px 0 10px; }
+.rl-filter .chip .n { color: var(--text-faint); margin-left: 4px; font-variant-numeric: tabular-nums; }
+.rl-filter .chip.active .n { color: inherit; opacity: .8; }
+.rl-more { display: flex; justify-content: center; padding: 10px 0 2px; }
+@media (max-width: 960px) {
+  .rl-when { white-space: normal; }
+  .rl-where .via { max-width: none; }
+  .rl-when .day { display: inline; margin-right: 6px; }
+}
+
+/* The rule dialog's read-only view of the search it records (static/js/auto-rule-modal.js),
+   with the way to change it. */
+.ar-searchbox { border: 1px solid var(--border-soft); border-radius: var(--radius-sm); background: var(--bg2);
+  padding: 8px 12px; }
+.ar-searchbox-foot { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap;
+  margin-top: 6px; font-size: var(--fs-sm); color: var(--text-faint); }

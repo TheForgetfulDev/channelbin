@@ -22,10 +22,16 @@
 
   // The sections are read off the DOM rather than restated here. One list, so the
   // rail, the picker sheet and the cards cannot disagree about what exists.
+  // Every row, control and section head is rendered once and never replaced, so each is
+  // looked up here once: applyFilters() runs on every keystroke and save, and a
+  // document-wide lookup per row per run is what it used to cost.
   const SECTIONS = $$('.sec-card').map((el) => ({
     id: el.dataset.sec,
     title: el.dataset.secTitle,
     el,
+    rows: $$('.frow', el),
+    cnt: $('[data-cnt]', el),
+    more: $('[data-more]', el),
     total: $$('.frow[data-path]', el).length,
     basic: $$('.frow[data-path]:not([data-tier="advanced"])', el).length,
   }));
@@ -325,6 +331,10 @@
     <button class="rail-a${sec.id === state.cur ? ' here' : ''}" type="button" data-rail="${escHtml(sec.id)}">
       <span>${escHtml(sec.title)}</span><span class="rc" data-rc="${escHtml(sec.id)}">${viewTotal(sec)}</span>
     </button>`).join('');
+  SECTIONS.forEach((sec) => {
+    sec.rail = $(`[data-rail="${CSS.escape(sec.id)}"]`);
+    sec.rc = sec.rail && $('[data-rc]', sec.rail);
+  });
 
   // ── The mobile section picker (DESIGN.md 15.5 item 1) ───────────────────
   // The bar and the sheet are one writer over the same state, so the label on the
@@ -438,7 +448,7 @@
   // differs from its default, so the mark follows without a reload.
   function markChanged(path, changed) {
     if (typeof changed !== 'boolean') return;
-    const row = $(`.frow[data-path="${CSS.escape(path)}"]`);
+    const row = rowOf(path);
     if (!row) return;
     if (changed) row.dataset.changed = 'true';
     else delete row.dataset.changed;
@@ -474,7 +484,9 @@
   // read from the control's live state, so flipping a switch un-dims its rows before the
   // save comes back.
   const GATED = $$('.frow[data-gated-by]');
-  const rowOf = (path) => $(`.frow[data-path="${CSS.escape(path)}"]`);
+  const ROWS = new Map($$('.frow[data-path]').map((r) => [r.dataset.path, r]));
+  const CONTROLS = new Map($$('[data-setting-path]').map((el) => [el.dataset.settingPath, el]));
+  const rowOf = (path) => ROWS.get(path) || null;
   const labelOf = (path) => {
     const row = rowOf(path);
     const name = row && $('.fl-name', row);
@@ -487,7 +499,7 @@
   function unmetGate(pred) {
     const ne = pred.indexOf('!=');
     const path = ne < 0 ? pred : pred.slice(0, ne);
-    const ctl = $(`[data-setting-path="${CSS.escape(path)}"]`);
+    const ctl = CONTROLS.get(path);
     if (!ctl) return null;
     if (ne < 0) return ctl.checked ? null : `${labelOf(path)} is off`;
     const value = pred.slice(ne + 2);
@@ -525,7 +537,7 @@
       let hits = 0;
       let hiddenByView = 0;
       let visible = 0;
-      $$('.frow', sec.el).forEach((row) => {
+      sec.rows.forEach((row) => {
         const matches = (!q || (row.dataset.hay || '').includes(q))
           && (!onlyChanged || row.dataset.changed === 'true');
         // The filters cross tiers: a match shows whatever the view, and the tier badge
@@ -556,17 +568,14 @@
       state.hits[sec.id] = hits;
       state.empty[sec.id] = empty;
       total += hits;
-      const cnt = $(`[data-cnt="${CSS.escape(sec.id)}"]`);
+      const { cnt, rc, rail, more } = sec;
       if (cnt) {
         cnt.textContent = filterCount(hits)
           ?? (empty && sec.total ? plural(sec.total, 'advanced setting') : '');
       }
-      const rc = $(`[data-rc="${CSS.escape(sec.id)}"]`);
       if (rc) rc.textContent = filtering ? hits : viewTotal(sec);
-      const rail = $(`[data-rail="${CSS.escape(sec.id)}"]`);
       if (rail) rail.classList.toggle('nohit', empty);
       sec.el.classList.toggle('nohit', empty);
-      const more = $(`[data-more="${CSS.escape(sec.id)}"]`);
       if (more) {
         const show = !filtering && !empty && hiddenByView > 0;
         more.hidden = !show;

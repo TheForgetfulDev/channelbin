@@ -61,7 +61,7 @@ def _trial(rc, tail=''):
     """A _run_gpu_trial stand-in with a fixed answer, counting its calls."""
     calls = []
 
-    def run(ffmpeg_path, device):
+    def run(ffmpeg_path, device, codec='h264'):
         calls.append((ffmpeg_path, device))
         return rc, tail
     run.calls = calls

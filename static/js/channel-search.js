@@ -172,6 +172,9 @@
     // Held here rather than read from CFG on demand because dismissing it has to take
     // the parameter out of the URL, and the URL is written from this object.
     replaceRec: null,
+    // The third: 'new' (making an auto-record rule) or a rule's id (changing its search).
+    // Held here for replaceRec's reason - dismissing it rewrites the URL from this object.
+    rule: null,
     // Set by setGrain() when the sort could not come with you, cleared the moment you
     // pick one yourself. Shown in the count line, because a list that silently
     // reordered itself is exactly the hidden behavior this project forbids.
@@ -259,6 +262,10 @@
   let loadFailed = '';                       // why the last rows request did not answer
   let facets = {};                           // { dim: { value: count } }
   let facetsCounted = null;                  // null = nothing counted yet
+  /* { dim: why } for the facets the server left out ON PURPOSE for this search (today: the
+     showing's own day, time, length, When and tags under One row per channel). Its words,
+     never re-derived here, said once at the top of the rail and on each `--` it explains. */
+  let facetsUncounted = {};
   let facetsPending = false;                 // a fetchFacets() request is in flight
   /* THE THREE WAYS A NUMBER CAN BE MISSING, kept apart because they read differently and
      only one of them is worth waiting through (dev/changelog/676):
@@ -408,6 +415,11 @@
     const rec = parseInt(p.get('replace_rec'), 10);
     state.replaceRec = (Number.isFinite(rec) && CFG.replaceRec && CFG.replaceRec.id === rec)
       ? rec : null;
+    // Same authority again: the server resolved the rule, and a URL naming one it did not
+    // (a rule deleted since the link was made) is dropped rather than offering a Save to rule
+    // that would answer 404.
+    const rule = p.get('rule');
+    state.rule = (rule && CFG.ruleCtx && CFG.ruleCtx.value === rule) ? rule : null;
   }
 
   /* ── Writing it back ─────────────────────────────────────────────────
@@ -447,6 +459,7 @@
     p.append('per_page', String(state.pageSize));
     if (state.addToGroup !== null) p.append('add_to_group', String(state.addToGroup));
     if (state.replaceRec !== null) p.append('replace_rec', String(state.replaceRec));
+    if (state.rule !== null) p.append('rule', state.rule);
     if (facetDims) facetDims.forEach((k) => p.append('facets', k));
     else if (facetDims !== undefined) p.append('facets', '');   // count none
     // Absent means "compute it inline" (every caller before this parameter existed, and
@@ -855,6 +868,7 @@
         if (seq !== facetSeq) return;
         facets = data.facets || {};
         facetsCounted = data.facets_counted || [];
+        facetsUncounted = data.uncounted || {};
         facetsDeclined = (data.declined || []).includes('facets');
         if (facetsDeclined) declinedWhy = data.declined_reason || '';
         facetsPending = false;
@@ -872,6 +886,7 @@
            ones looking current - the same fix the counts line gets above. */
         facetsDeclined = true;
         facetsCounted = [];
+        facetsUncounted = {};
         renderRail();
       });
   }
@@ -2113,6 +2128,7 @@
     // rather than surviving in the DOM.
     updateSelectionUI();
     renderReplaceBar();
+    renderRuleBar();
   }
 
   /* ── The replace action context ──────────────────────────────────────
@@ -2132,6 +2148,41 @@
     if (!on) return;
     $('#replace-lbl').innerHTML = `Replacing <b>${esc(CFG.replaceRec.name)}</b>. `
       + 'Recording a showing below schedules it and deletes that one.';
+  }
+
+  /* ── The rule action context (dev/changelog/1189) ──────────────────────
+     The third action context, on the same rules: it narrows nothing and is dismissable.
+     `new` is the Rules page's + New rule: the bar says what to do and the results bar's
+     Create rule becomes the primary button. A rule's id is its Edit search: the bar names
+     the rule (from CFG, resolved server-side) and offers Save to rule, and Create rule is
+     not offered anywhere on the page - a second rule is not what that errand is for.
+
+     Programs only, like every rule action: a rule records showings. */
+  const ruleMode = () => (state.rule === null || !CFG.ruleCtx ? null : CFG.ruleCtx.mode);
+
+  function renderRuleBar() {
+    const mode = ruleMode();
+    const bar = $('#rule-bar');
+    if (bar) {
+      bar.style.display = mode ? '' : 'none';
+      if (mode === 'new') {
+        $('#rule-lbl').innerHTML = '<b>New auto-record rule.</b> Search for what you want recorded, '
+          + 'then use <b>Create rule from this search</b>. Whatever the search finds is what the rule records.';
+        $('#rule-x').dataset.tip = 'Stop making a rule. The search stays as it is.';
+      } else if (mode === 'edit') {
+        $('#rule-lbl').innerHTML = `Editing the search for rule <b>${esc(CFG.ruleCtx.name)}</b>. `
+          + 'What this search finds is what the rule records once you save it.';
+        $('#rule-x').dataset.tip = 'Stop editing the rule\'s search. The rule keeps the search it has.';
+      }
+      $('#rule-save').style.display = mode === 'edit' ? '' : 'none';
+      // Save to rule needs a Programs search to save.
+      $('#rule-save').disabled = !isAirings();
+    }
+    const mk = $('#sel-mkrule');
+    if (mk) {
+      mk.style.display = isAirings() && mode !== 'edit' ? '' : 'none';
+      mk.classList.toggle('btn-primary', mode === 'new');
+    }
   }
 
   function renderResults() {
@@ -2740,12 +2791,17 @@
     // a drill-in, or loading a saved search, changes what is listed and never what
     // the user came here to do.
     const context = state.addToGroup;
+    const ruleCtx = state.rule;
     parseState(params);
     state.addToGroup = context;
-    // Same reason as at boot: a restored `when`/`duration` window has to put its controls
-    // back, not only its chip.
+    // Loading a saved search is a natural way to build a rule's search, so the rule errand
+    // survives it too.
+    state.rule = ruleCtx;
+    // Same reason as at boot: a restored `when`/`duration`/`tod` range has to put its
+    // controls back, not only its chip.
     hydrateWhenControls();
     hydrateDurationControls();
+    hydrateTodControls();
     qbox.value = state.q;
     $('#sb-clr').style.display = state.q ? '' : 'none';
     // A saved search or a drill-in can carry a different grain, and the toggle, the
@@ -3031,11 +3087,8 @@
       kind: 'dup',
       title: 'Duplicated stream',
       body: `<div class="sh-note" style="padding-top:2px">${dupOnProvider(d)
-          ? `${nf(d.count)} channels ${esc(dupKeyClause(d))}. Accounts on one provider reach
-          the same stream under the same id, whatever the URL says.`
-          : `${nf(d.count - 1)} other channel${d.count === 2 ? '' : 's'} point at the identical
-          stream URL. They are duplicates because they share a URL, not because they share a
-          name.`}</div>
+          ? `${nf(d.count)} channels ${esc(dupKeyClause(d))}.`
+          : `${nf(d.count - 1)} other channel${d.count === 2 ? '' : 's'} share this stream URL.`}</div>
         ${others.map((o) => `<div class="prow"><span class="pv">${esc(o.name)}</span>
           <span class="hint">${esc(o.category || 'no category')}</span></div>`).join('')}${more}
         <div class="psep"></div>
@@ -3079,7 +3132,7 @@
   /* What makes two searches "the same one". Paging through a saved search, or
      asking for different counts, must not make it read as edited - and the action
      context is an errand rather than part of the search. */
-  const IDENTITY_SKIP = ['page', 'per_page', 'facets', 'add_to_group', 'replace_rec'];
+  const IDENTITY_SKIP = ['page', 'per_page', 'facets', 'add_to_group', 'replace_rec', 'rule'];
   function paramsKey(params) {
     const p = new URLSearchParams(params || '');
     IDENTITY_SKIP.forEach((k) => p.delete(k));
@@ -3198,7 +3251,14 @@
       + (sfError ? `<div class="pnote" style="color:var(--bad)">${esc(sfError)}</div>` : '')
       + `<div class="pnote">Saved on the server, so they follow you across browsers. Each one
            carries the text, the search scope, the match mode, the standing options and every
-           filter - not just the chips.</div>`;
+           filter - not just the chips.</div>`
+      // Programs only: a rule records showings, and a channel has no start time. A rule is
+      // made FROM the search on screen and never stored in this list (DESIGN-autoschedule.md
+      // §8), so it sits below the list as an action of its own.
+      + (isAirings() && ruleMode() !== 'edit' ? `<div class="psep"></div>
+         <div class="pfoot"><button class="btn btn-sm" data-mkrule="1">Create rule from this search&#8230;</button></div>
+         <div class="pnote">A rule records each upcoming program this search finds once, now
+           and whenever the guide refreshes. It is not a saved search.</div>` : '');
   }
 
   /* The phone's Saved surface. It is a chip plus a sheet rather than a dropdown
@@ -3335,6 +3395,32 @@
     return 'Program length';
   };
 
+  /* ── `dow` and `tod`: the day and the clock time a showing starts on ─────────────────
+     `dow` is a closed vocabulary served by the catalog (`dow_values`, Monday first), so it
+     renders like any other facet - except that all seven days show at once (RAIL_SHOW_ALL).
+     `tod` is one range you fill in, wired exactly like Program length: `tod:<from>..<to>`,
+     24-hour HH:MM on the display timezone's clock, both ends included, an end earlier than
+     the start running past midnight. That spelling is app/channel_search.py's TOD_PREFIX /
+     parse_time_of_day() and it is an API - a rule stores it. `<input type="time">` hands over
+     HH:MM whatever clock it draws, so nothing is converted on the way to the URL. */
+  const DOW_KEY = 'dow';
+  const TOD_KEY = 'tod';
+  const TOD_PREFIX = 'tod:';
+  const todRange = { from: '', to: '' };
+
+  const todSet = () => !!(todRange.from || todRange.to);
+  const todValue = () =>
+    (todSet() ? `${TOD_PREFIX}${todRange.from}${WHEN_RANGE_SEP}${todRange.to}` : '');
+  // Phrased to follow the chip's own "Time of day is ...", so it reads as one sentence there.
+  const todLabel = () => {
+    const a = todRange.from ? fmtHhmm(todRange.from) : '';
+    const b = todRange.to ? fmtHhmm(todRange.to) : '';
+    if (a && b) return todRange.from === todRange.to ? a : `${a} to ${b}`;
+    if (a) return `${a} or later`;
+    if (b) return `${b} or earlier`;
+    return 'Time of day';
+  };
+
   /* Read the controls back out of whatever the URL carried, so a reload - or loading a
      saved search - restores the boxes and not just the chip. Without this the chip would
      say "Next 3 hours" over two empty controls, which is a filter you cannot edit. */
@@ -3380,6 +3466,21 @@
     });
   }
 
+  // Same reason as hydrateWhenControls. Each end is taken as sent: a time box shows nothing
+  // for a value it cannot read, and the chip then says what the URL actually holds.
+  function hydrateTodControls() {
+    const f = findF(TOD_KEY);
+    if (!f) return;
+    f.values.concat(f.ex).forEach((v) => {
+      if (!v.startsWith(TOD_PREFIX)) return;
+      const body = v.slice(TOD_PREFIX.length);
+      if (!body.includes(WHEN_RANGE_SEP)) return;
+      const i = body.indexOf(WHEN_RANGE_SEP);
+      todRange.from = body.slice(0, i);
+      todRange.to = body.slice(i + WHEN_RANGE_SEP.length);
+    });
+  }
+
   /* The value reads as the window it currently describes, so the chip says "Next 3 hours"
      and not "Next ..." - a chip has to be readable without opening the facet that made it.
      Singular when n is 1, because "Next 1 days" makes a page look unfinished. */
@@ -3406,6 +3507,8 @@
       // No closed vocabulary at all (unlike `when`'s three fixed values) - the range control
       // is the only source of a value.
       case DURATION_KEY: return durationSet() ? [durationValue()] : [];
+      case TOD_KEY:  return todSet() ? [todValue()] : [];
+      case DOW_KEY:  return (CAT.dow_values || []).map((d) => d.value);
       case 'tag':    return CAT.tags.map((t) => t.name);
       case 'acct':   return CAT.accounts.map((a) => String(a.id));
       case 'health': return CAT.health_values.map((h) => h.value);
@@ -3432,6 +3535,9 @@
       }
       case DURATION_KEY:
         return String(value).startsWith(DUR_PREFIX) ? durationLabel() : value;
+      case TOD_KEY:
+        return String(value).startsWith(TOD_PREFIX) ? todLabel() : value;
+      case DOW_KEY:  return byValue(CAT.dow_values || []) || value;
       case 'chan': {
         const ch = pageChannels().find((c) => String(c.id) === String(value));
         return ch ? ch.name : `Channel #${value}`;
@@ -3503,6 +3609,11 @@
 
   /* ── The rail ────────────────────────────────────────────────────── */
   const RAIL_SHOW = 6;                       // values before the find box and Show all
+  /* Dimensions whose whole vocabulary is always on screen, with no find box. A week is seven
+     days: hiding Sunday behind "Show all 7" - which is what the cutoff of six does - would
+     put the most-asked-for day out of sight on every visit. */
+  const RAIL_SHOW_ALL = new Set([DOW_KEY]);
+  const railShowFor = (key) => (RAIL_SHOW_ALL.has(key) ? Infinity : RAIL_SHOW);
   // Derived from the catalog rather than typed out, so a facet added later
   // starts expanded too instead of silently reintroducing a mix.
   let railOpen = null;
@@ -3514,7 +3625,15 @@
   // render as such - it is NOT a zero (DESIGN-channel-search.md 6).
   function countOf(key, value) {
     if (!facetsCounted || !facetsCounted.includes(key)) return null;
-    return (facets[key] || {})[value] || 0;
+    const counts = facets[key] || {};
+    // A value typed into a control is counted only while it is in the filter, so one the
+    // engine did not name was not counted - a range you took off the search still has its
+    // row here, and "0" beside it would be a number nobody can explain.
+    if (!(value in counts) && FILL_IN_CONTROLS[key]
+        && FILL_IN_PREFIXES.some((p) => String(value).startsWith(p))) {
+      return null;
+    }
+    return counts[value] || 0;
   }
 
   // `attr` is which data-* the box answers to: the rail's boxes are data-railq (one per
@@ -3531,7 +3650,7 @@
     const st = valueState(key, value);
     const kv = `data-key="${esc(key)}" data-value="${esc(value)}"`;
     const countHtml = count === null
-      ? '<span class="pcount uncounted" data-tip="Not counted for this search.">--</span>'
+      ? `<span class="pcount uncounted" data-tip="${tipAttr(facetsUncounted[key] || 'Not counted for this search.')}">--</span>`
       : `<span class="pcount${count ? '' : ' zero'}">${nf(count)}</span>`;
     return `<div class="prow${st ? ' sel-on' : ''}" ${kv}>
       <span class="pv"${tip ? ` data-tip="${tipAttr(tip)}"` : ''}>${esc(label)}</span>${countHtml}
@@ -3545,7 +3664,8 @@
     const n = f ? f.values.length + f.ex.length : 0;
     const hasNeg = !!(f && f.ex.length);
     const values = dimValues(dim.key);
-    const hasBox = values.length > RAIL_SHOW;
+    const show = railShowFor(dim.key);
+    const hasBox = values.length > show;
     const q = (hasBox ? (railQ[dim.key] || '') : '').trim().toLowerCase();
 
     // No reordering, ever: a value must stay where it was when you click it.
@@ -3558,9 +3678,9 @@
     // A value you turned on must never vanish because the list is collapsed, and
     // must never MOVE either. Opening the whole facet is the only spelling that
     // does both.
-    const hiddenSel = scored.slice(RAIL_SHOW).some((x) => x.st !== 0);
+    const hiddenSel = scored.slice(show).some((x) => x.st !== 0);
     const all = railShowAll.has(dim.key) || !!q || hiddenSel;
-    const shown = all ? scored : scored.slice(0, RAIL_SHOW);
+    const shown = all ? scored : scored.slice(0, show);
     // A "show all" under a set of find-box results would be asking twice for the
     // same thing.
     const moreBtn = !q && (scored.length > shown.length || all)
@@ -3580,12 +3700,29 @@
       <div class="fac-b">
         ${box}
         ${shown.map((x) => valueRowHtml(dim.key, x.v, x.label, x.c, x.tip)).join('')}
-        ${shown.length ? '' : '<div class="fac-none">no value matches that</div>'}
-        ${dim.key === WHEN_KEY && !q ? whenControlsHtml() : ''}
-        ${dim.key === DURATION_KEY && !q ? durationControlsHtml() : ''}
+        ${shown.length ? '' : noValueHtml(dim.key, q)}
+        ${fillInControlsHtml(dim.key, q)}
         ${moreBtn}
       </div></div>`;
   }
+
+  /* The controls a dimension's values are typed into rather than picked from, for whichever
+     host is drawing that dimension - the rail, the Filters sheet or the + Filter popover. One
+     answer for all three, because the popover once had none: it offered Program length (and
+     `when`'s two windows) with no way to set them, and said "no value matches that".
+     Hidden while a find box narrows the list, which is about the values that exist. */
+  const FILL_IN_CONTROLS = {
+    [WHEN_KEY]: () => whenControlsHtml(),
+    [TOD_KEY]: () => todControlsHtml(),
+    [DURATION_KEY]: () => durationControlsHtml(),
+  };
+  // The spellings of a typed value, every fill-in's - no closed vocabulary starts with one.
+  const FILL_IN_PREFIXES = [WHEN_NEXT_PREFIX, WHEN_CUSTOM_PREFIX, DUR_PREFIX, TOD_PREFIX];
+  const fillInControlsHtml = (key, q) => (FILL_IN_CONTROLS[key] && !q ? FILL_IN_CONTROLS[key]() : '');
+  // "No value matches that" answers a find box. A fill-in dimension with nothing typed yet
+  // has no values at all, and its controls directly below are the answer.
+  const noValueHtml = (key, q) => (FILL_IN_CONTROLS[key] && !q
+    ? '' : '<div class="fac-none">no value matches that</div>');
 
   /* ── The two `when` values you fill in ───────────────────────────────
      EACH CONTROL SITS UNDER THE VALUE THAT OWNS IT (mockup 25 round 5: "Under each
@@ -3646,12 +3783,30 @@
       <div class="fac-note">Either bound alone is a real filter.</div>`;
   }
 
+  /* Two time boxes, wired like Program length's range. The note names the timezone for the
+     same reason `when`'s does: "6 PM" means nothing until you know whose clock it is. */
+  function todControlsHtml() {
+    return `<div class="when-fill${todSet() ? ' on' : ''}">
+        <span class="wf-l">${esc(todSet() ? todLabel() : 'Starts between...')}</span>
+        <span class="wf-c wf-range">
+          <input type="time" data-todrange="from" value="${esc(todRange.from)}"
+            aria-label="From" data-tip="Showings that START at or after this time. Leave it empty for no lower bound.">
+          <input type="time" data-todrange="to" value="${esc(todRange.to)}"
+            aria-label="To" data-tip="Showings that START at or before this time. Earlier than From means the range runs past midnight. Leave it empty for no upper bound.">
+        </span>
+      </div>
+      <div class="fac-note">On the clock in ${esc(displayTz())}, the display timezone, on any day.
+        Either end alone is a real filter.</div>`;
+  }
+
   /* Editing a control REPLACES the value it owns rather than adding a second one: there
-     is one "Next ..." window and one custom range, so typing a new number must not leave
-     the old window still filtering. Whether that value is currently an include or an
-     exclude is preserved, because retyping a number is not a decision to flip it. */
-  function setWhenValue(prefix, next) {
-    const f = findF(WHEN_KEY);
+     is one "Next ..." window, one custom range, one length range and one clock-time range,
+     so typing a new number must not leave the old one still filtering. `prefix` names which
+     of a dimension's values the control owns - `when` has two fill-ins, the others one.
+     Whether that value is currently an include or an exclude is preserved, because retyping
+     a number is not a decision to flip it. */
+  function setFillValue(key, prefix, next) {
+    const f = findF(key);
     let wasEx = false;
     if (f) {
       wasEx = f.ex.some((v) => v.startsWith(prefix));
@@ -3659,31 +3814,15 @@
       f.ex = f.ex.filter((v) => !v.startsWith(prefix));
     }
     if (next) {
-      const target = getF(WHEN_KEY);
+      const target = getF(key);
       (wasEx ? target.ex : target.values).push(next);
     }
     tidyFilters();
     applyNow();
   }
-
-  /* Only one parametrized value for `duration` (no `next:`-equivalent), so unlike
-     setWhenValue there is no prefix to disambiguate - any existing `dur:` value is simply
-     replaced. */
-  function setDurationValue(next) {
-    const f = findF(DURATION_KEY);
-    let wasEx = false;
-    if (f) {
-      wasEx = f.ex.some((v) => v.startsWith(DUR_PREFIX));
-      f.values = f.values.filter((v) => !v.startsWith(DUR_PREFIX));
-      f.ex = f.ex.filter((v) => !v.startsWith(DUR_PREFIX));
-    }
-    if (next) {
-      const target = getF(DURATION_KEY);
-      (wasEx ? target.ex : target.values).push(next);
-    }
-    tidyFilters();
-    applyNow();
-  }
+  const setWhenValue = (prefix, next) => setFillValue(WHEN_KEY, prefix, next);
+  const setDurationValue = (next) => setFillValue(DURATION_KEY, DUR_PREFIX, next);
+  const setTodValue = (next) => setFillValue(TOD_KEY, TOD_PREFIX, next);
 
   /* Delegated on the document, because the same controls are drawn in the rail at one
      width and inside the Filters sheet at the other - one handler, both hosts. Debounced
@@ -3692,6 +3831,7 @@
      would otherwise run a search of its own. */
   let whenTimer = null;
   let durationTimer = null;
+  let todTimer = null;
   document.addEventListener('input', (e) => {
     const rel = e.target.closest('[data-whenrel]');
     if (rel) {
@@ -3712,6 +3852,16 @@
       durationRange[dur.dataset.durrange] = dur.value;
       clearTimeout(durationTimer);
       durationTimer = setTimeout(() => setDurationValue(durationValue()), DEBOUNCE_MS);
+      return;
+    }
+    // A time box reports `input` once every field holds something, and again for each field
+    // edited after that - each a complete time a pause would apply, so it is debounced like
+    // the number boxes. The region is not redrawn under it meanwhile (rewriteKeepingFocus).
+    const tod = e.target.closest('[data-todrange]');
+    if (tod) {
+      todRange[tod.dataset.todrange] = tod.value;
+      clearTimeout(todTimer);
+      todTimer = setTimeout(() => setTodValue(todValue()), DEBOUNCE_MS);
     }
   });
   document.addEventListener('change', (e) => {
@@ -3790,6 +3940,90 @@
       <span class="rcx">&#187;</span>
       <div class="rspine">${nSet() ? `<span class="rn">${nSet()}</span>` : ''}Filters</div></button>`;
 
+  /* ── Rewriting a region that holds a box someone is typing in ─────────
+     The rail, the Filters sheet and the + Filter popover are each rebuilt whole, and a
+     search response can land while the caret is in one of their boxes - so which box was
+     focused is read off the DOM here, never passed in by whichever caller triggered the
+     render. Every box identifies itself by the attribute below: the find boxes by facet
+     (data-railq, data-popq), the fill-ins by which part of their value they spell. Without
+     this a box drops focus after ONE character.
+
+     A TYPED-VALUE box - `number`, `time`, `datetime-local` - is not rewritten at all while it
+     has focus; the region is redrawn once focus leaves it. Nothing can put such a box back
+     as it was. A number box's caret cannot be placed (Chrome refuses setSelectionRange on
+     it), so the rebuilt box took the next digit at the FRONT: with a pause between them, "2"
+     then "4" made 42, which the browser pass found on Program length (dev/changelog/1187;
+     the end-of-value restore of dev/changelog/414 never reached a number box in Chrome). A
+     date or time box's focus() lands on its FIRST field, so the minutes being typed went into
+     the hour, and one still being filled holds '' until every field is, so a rebuild drew it
+     empty. Responses land up to several seconds after each apply, and the apply itself
+     redraws, so a quarter-second pause was enough. The counts in the region are stale
+     meanwhile, and the spinner already says so. */
+  const FOCUS_ATTRS = ['railq', 'popq', 'whenrel', 'whencustom', 'durrange', 'todrange'];
+  const TYPED_VALUE_TYPES = new Set(['number', 'time', 'datetime-local']);
+  // host element -> the render to run once focus leaves it.
+  const deferredRedraws = new Map();
+
+  function rewriteKeepingFocus(host, html, redraw) {
+    const active = document.activeElement;
+    const inside = !!active && active !== document.body && host.contains(active);
+    if (inside && TYPED_VALUE_TYPES.has(active.type)) {
+      deferredRedraws.set(host, redraw);
+      return false;
+    }
+    deferredRedraws.delete(host);
+    const attr = inside && active.dataset
+      ? FOCUS_ATTRS.find((a) => active.dataset[a] !== undefined) : null;
+    const sel = attr ? `[data-${attr}="${active.dataset[attr]}"]` : null;
+    /* -1 means "put it at the END", which is the only correct answer for the inputs whose
+       caret cannot be read: Chrome raises InvalidStateError on `selectionStart` for
+       `type=number`. Defaulting to 0 instead - which is what a bare try/catch does - restores
+       the caret to the FRONT, so typing "36" lands the 6 before the 3 and applies a 63-hour
+       window. Measured in a real browser (dev/changelog/414); jsdom cannot see it, because
+       jsdom implements selectionStart on a number input where Chrome does not. */
+    let caret = -1;
+    if (sel) { try { caret = active.selectionStart; } catch (e) { caret = -1; } }
+    if (caret === null || caret === undefined) caret = -1;
+    host.innerHTML = html;
+    if (sel) {
+      const inp = host.querySelector(sel);
+      if (inp) {
+        inp.focus();
+        const at = caret < 0 ? String(inp.value || '').length : caret;
+        try { inp.setSelectionRange(at, at); } catch (e) { /* no selection API on this input */ }
+      }
+    }
+    return true;
+  }
+
+  /* When a held-back redraw may run: once focus has LEFT its region and no pointer is down.
+     Leaving the time box is usually a press on something else in the same region - the next
+     day, a standing toggle, "clear" - and mousedown moves focus before mouseup. Redrawing at
+     the focusout detached the pressed button, so its click never arrived and the press did
+     nothing; a Tab onto a button in the region lost focus to the page the same way. So the
+     redraw waits for the release and runs after the click it ends (whose own handler
+     usually redraws first, which clears the hold), and while focus is still somewhere inside
+     the region it keeps waiting - whatever renders next rewrites the region anyway. */
+  let pointerHeld = false;
+  function flushDeferredRedraws() {
+    if (pointerHeld) return;
+    const active = document.activeElement;
+    deferredRedraws.forEach((redraw, host) => {
+      if (active && active !== document.body && host.contains(active)) return;
+      deferredRedraws.delete(host);
+      // A region closed meanwhile (the sheet, the popover) has nothing left to redraw.
+      if (host.isConnected) redraw();
+    });
+  }
+  document.addEventListener('pointerdown', () => { pointerHeld = true; }, true);
+  const releasePointer = () => setTimeout(() => { pointerHeld = false; flushDeferredRedraws(); }, 0);
+  document.addEventListener('pointerup', releasePointer, true);
+  document.addEventListener('pointercancel', releasePointer, true);
+  // On a timer: focus has to land on its new target first.
+  document.addEventListener('focusout', () => {
+    if (deferredRedraws.size) setTimeout(flushDeferredRedraws, 0);
+  });
+
   function renderRail() {
     if (!CAT) return;
     const el = $('#rail');
@@ -3800,32 +4034,6 @@
        (dev/mockups/22-channel-search-mobile.html decision 1). */
     if (isMobile()) { el.innerHTML = ''; return; }
     if (railOpen === null) railOpen = new Set(CAT.dimensions.map((d) => d.key));
-    // The rail is rebuilt whole, and a search response can land while a find box
-    // has the caret in it - so which box was focused is read off the DOM here
-    // rather than passed in by whichever caller happened to trigger the render.
-    // Without this a find box drops focus after one character.
-    const active = document.activeElement;
-    /* Which control had the caret, by the attribute that identifies it. The find boxes
-       are one per facet (data-railq); the `when` fill-ins are one each and identify
-       themselves by which half of their value they spell. All of them are inside the
-       element about to be rewritten, so all of them need restoring - without this a
-       number box drops focus after ONE digit and "180" is unreachable. */
-    const focusSel = !active || !active.dataset ? null
-      : (active.dataset.railq !== undefined ? `[data-railq="${active.dataset.railq}"]`
-        : (active.dataset.whenrel !== undefined ? `[data-whenrel="${active.dataset.whenrel}"]`
-          : (active.dataset.whencustom !== undefined
-            ? `[data-whencustom="${active.dataset.whencustom}"]` : null)));
-    /* -1 means "put it at the END", which is the only correct answer for the inputs whose
-       caret cannot be read: Chrome raises InvalidStateError on `selectionStart` for
-       `type=number` and `type=datetime-local`. Defaulting to 0 instead - which is what a
-       bare try/catch does - restores the caret to the FRONT, so typing "36" lands the 6
-       before the 3 and applies a 63-hour window. Measured in a real browser
-       (dev/changelog/414); jsdom cannot see it, because jsdom implements selectionStart on
-       a number input where Chrome does not. */
-    let caret = -1;
-    if (focusSel) { try { caret = active.selectionStart; } catch (e) { caret = -1; } }
-    if (caret === null || caret === undefined) caret = -1;
-
     el.classList.toggle('collapsed', railCollapsed);
     if (railCollapsed) { el.innerHTML = railStubHtml(); return; }
 
@@ -3840,24 +4048,24 @@
         'Counting every value would cost seconds for this search. The filters still work - '
         + 'only the counts beside them are missing.' + whyDeclined())}">&#9888; Counts not available for this search. The filters still work.</div>`
       : '';
-    el.innerHTML = railBarHtml()
+    /* A facet left out on purpose is not the same statement as the whole rail being declined,
+       so it gets its own line - once, rather than only as the `--` on every row it covers.
+       The sentence is the server's (dev/changelog/1187). */
+    const leftOut = dimsFor().filter((d) => !d.hidden && facetsUncounted[d.key]);
+    const why = leftOut.length ? facetsUncounted[leftOut[0].key] : '';
+    const uncountedNote = (!facetsPending && !facetsDeclined && leftOut.length)
+      ? `<div class="rnote" data-tip="${tipAttr(why)}">&#9888; ${
+        esc(leftOut.map((d) => d.label).join(', '))}: ${esc(why.split('. ')[0].replace(/\.$/, ''))}.</div>`
+      : '';
+    rewriteKeepingFocus(el, railBarHtml()
       + `<div class="rcard"><h4><span class="rt">Narrow it down</span>
           ${facetsPending ? `<span class="spinner rail-spin" data-tip="${tipAttr(
             'Counting how many of the matching ' + (isAirings() ? 'showings' : 'channels')
             + ' fall under every value on this rail. On a broad search that is millions of '
             + 'rows, so it can take a few seconds - the list and the filters work meanwhile.'
           )}"></span>` : ''}
-          ${nSet() ? '<button class="rclr" id="rail-clr">clear</button>' : ''}</h4>${railNote}${cards}</div>`
-      + standingCardHtml();
-
-    if (focusSel) {
-      const inp = $(`#rail ${focusSel}`);
-      if (inp) {
-        inp.focus();
-        const at = caret < 0 ? String(inp.value || '').length : caret;
-        try { inp.setSelectionRange(at, at); } catch (e) { /* no selection API on this input */ }
-      }
-    }
+          ${nSet() ? '<button class="rclr" id="rail-clr">clear</button>' : ''}</h4>${railNote}${uncountedNote}${cards}</div>`
+      + standingCardHtml(), renderRail);
   }
 
   /* ── The Filters sheet: the rail's replacement at phone width ─────────
@@ -3920,13 +4128,14 @@
                                       c: countOf(fDim, v), st: valueState(fDim, v) }));
     if (q) scored = scored.filter((x) => x.label.toLowerCase().includes(q));
     // A value you turned on must never be out of reach behind Show all.
-    const hiddenSel = scored.slice(RAIL_SHOW).some((x) => x.st !== 0);
+    const show = railShowFor(fDim);
+    const hiddenSel = scored.slice(show).some((x) => x.st !== 0);
     const all = railShowAll.has(fDim) || !!q || hiddenSel;
-    const shown = all ? scored : scored.slice(0, RAIL_SHOW);
+    const shown = all ? scored : scored.slice(0, show);
     const moreBtn = !q && (scored.length > shown.length || all)
       ? `<button class="fac-more" data-more="${esc(fDim)}">${
         all ? 'Show less' : `Show all ${nf(scored.length)}`}</button>` : '';
-    const box = values.length > RAIL_SHOW
+    const box = values.length > show
       ? findBoxHtml('rsearch', railQ[fDim] || '', `Find in ${dim.label.toLowerCase()}...`, fDim) : '';
     const make = DIM_CREATE[fDim]
       ? `<div class="prow"><span class="pv text-faint" style="font-size:.8rem">Not listed?</span>
@@ -3935,32 +4144,21 @@
     return `<button class="sh-back" data-fback="1">&#8592; All filters</button>
       ${box}
       ${shown.map((x) => valueRowHtml(fDim, x.v, x.label, x.c)).join('')}
-      ${shown.length ? '' : '<div class="fac-none">no value matches that</div>'}
-      ${fDim === WHEN_KEY && !q ? whenControlsHtml() : ''}
-      ${fDim === DURATION_KEY && !q ? durationControlsHtml() : ''}
+      ${shown.length ? '' : noValueHtml(fDim, q)}
+      ${fillInControlsHtml(fDim, q)}
       ${moreBtn}${make}
       ${dim.help ? `<div class="sh-note">${esc(dim.help)}</div>` : ''}`;
   }
 
+  // The same rewrite the rail gets, for the same reasons - see rewriteKeepingFocus(). The
+  // sheet carries the same find box and the same fill-in boxes, and on a phone the time box
+  // opens a native picker whose owner a rewrite would pull out from under it.
   function renderFiltersSheet() {
     const body = sheetBody();
     if (!body) return;
-    /* The find box is inside the element about to be rewritten, so without this it
-       drops focus after one character - the same problem the rail has and the same
-       fix, and read off the DOM for the same reason: a search response can land
-       while the caret is in there, so the caller cannot be trusted to say. */
-    const active = document.activeElement;
-    const focused = active && active.dataset && active.dataset.railq !== undefined;
-    const caret = focused ? active.selectionStart : 0;
     setSheetTitle(filtersSheetTitle());
-    body.innerHTML = filtersSheetBody();
-    if (focused) {
-      const inp = body.querySelector('[data-railq]');
-      if (inp) {
-        inp.focus();
-        try { inp.setSelectionRange(caret, caret); } catch (e) { /* no selection API here */ }
-      }
-    }
+    // renderOpenSheet, not this: by the time a deferred redraw runs, another sheet may be up.
+    rewriteKeepingFocus(body, filtersSheetBody(), renderOpenSheet);
   }
 
   /* One sheet, three ways in: the Filters chip, the well's + Filter pill, and a
@@ -4117,7 +4315,18 @@
   function syncWellSlot(hasChips) {
     const pw = $('#addfpw2');
     const target = hasChips ? $('#addf-slot-tail') : $('#addf-slot-head');
-    if (pw.parentNode !== target) target.appendChild(pw);
+    if (pw.parentNode === target) { deferredRedraws.delete(pw); return; }
+    /* Moving a node blurs whatever inside it has focus - and the + Filter popover opened from
+       this pill rides inside it, typed boxes and all. Typing the first digit of a Program
+       length there made the first chip, the pill moved after it, and the box lost focus
+       mid-number. The move waits until focus has left the pill (dev/changelog/1187). */
+    const active = document.activeElement;
+    if (active && active !== document.body && pw.contains(active)) {
+      deferredRedraws.set(pw, () => syncWellSlot(!!$('#wellbody .cs-chip')));
+      return;
+    }
+    deferredRedraws.delete(pw);
+    target.appendChild(pw);
   }
 
   const wordsSegHtml = () => `<button data-wjoin="all" class="${state.matchAll ? 'on' : ''}"
@@ -4536,15 +4745,9 @@
   function renderFilterPop({ reposition = false } = {}) {
     const body = $('#fb-pop-body');
     if (!body || !CAT) return;
-    // The panel is rebuilt whole and a search response can land while the caret is in its
-    // find box, so which box was focused is read off the DOM - the same reason renderRail()
-    // does it rather than taking it from whichever caller triggered the render.
-    const active = document.activeElement;
-    const caret = active && active.dataset && active.dataset.popq !== undefined
-      ? active.selectionStart : null;
-
+    let html;
     if (!popDim) {
-      body.innerHTML = '<h5>Add a filter</h5>'
+      html = '<h5>Add a filter</h5>'
         + dimsFor().filter((d) => !d.hidden).map((d) => {
           const f = findF(d.key);
           const n = f ? f.values.length + f.ex.length : 0;
@@ -4558,26 +4761,21 @@
       const dim = dimByKey(popDim) || { key: popDim, label: popDim, help: '' };
       const all = dimValues(popDim);
       const q = popQ.trim().toLowerCase();
-      // Filtered here rather than hidden in place: the caret is restored explicitly below,
+      // Filtered here rather than hidden in place: the caret is restored by the rewrite,
       // which is what the hide-in-place spelling existed to avoid needing.
       const values = q
         ? all.filter((v) => String(dimLabel(popDim, v)).toLowerCase().includes(q)) : all;
-      body.innerHTML = `<button class="pop-back" data-back="1">&#8592; All filters</button>
+      html = `<button class="pop-back" data-back="1">&#8592; All filters</button>
         <h5>${esc(dim.label)}</h5>
-        ${all.length > RAIL_SHOW ? findBoxHtml('pop-search', popQ, `Filter ${dim.label.toLowerCase()}...`, '__pop__', 'popq') : ''}
+        ${all.length > railShowFor(popDim) ? findBoxHtml('pop-search', popQ, `Filter ${dim.label.toLowerCase()}...`, '__pop__', 'popq') : ''}
         <div class="pop-scroll">${values.map((v) =>
           valueRowHtml(popDim, v, String(dimLabel(popDim, v)), countOf(popDim, v))).join('')
-          || '<div class="fac-none">no value matches that</div>'}</div>
+          || noValueHtml(popDim, q)}</div>
+        ${fillInControlsHtml(popDim, q)}
         ${dim.help ? `<div class="pnote">${esc(dim.help)}</div>` : ''}`;
     }
+    if (!rewriteKeepingFocus(body, html, () => renderFilterPop())) return;
 
-    if (caret !== null) {
-      const inp = $('#fb-pop [data-popq]');
-      if (inp) {
-        inp.focus();
-        try { inp.setSelectionRange(caret, caret); } catch (e) { /* no selection API here */ }
-      }
-    }
     // Only where the height really changes (navigating between the two views). Re-anchoring
     // on every count refresh would make an open menu jump under the pointer.
     const menu = $('#fb-pop');
@@ -4810,6 +5008,12 @@
      would shut the panel on every pick. */
   function savedAction(e, redraw) {
     if (e.target.closest('[data-save]')) { saveCurrentSearch(); return; }
+    if (e.target.closest('[data-mkrule]')) {
+      closeMenus();
+      closeSheet();
+      openRuleFromSearch();
+      return;
+    }
 
     const del = e.target.closest('[data-del]');
     if (del) {
@@ -5369,23 +5573,94 @@
     });
   });
 
+  /* Every recording profile, read off the record modal's own picker, which this page already
+     renders - so Schedule selected and Create rule cannot offer different lists. */
+  const recordModalProfiles = () => Array.from(document.querySelectorAll('#modal-profile option'))
+    .filter((o) => o.value)
+    .map((o) => ({ id: Number(o.value), name: o.textContent }));
+
+  /* "Create rule from this search..." (DESIGN-autoschedule.md §8). The search on screen, in
+     the snapshot() spelling a saved search stores, becomes the rule's criteria; the server
+     drops the page-only parts and refuses what a rule cannot use, with a sentence the
+     dialog shows. A save that scheduled something changes those rows' record state, so the
+     results are re-run the way Schedule selected re-runs them. */
+  function openRuleFromSearch() {
+    if (!isAirings()) return;
+    if (typeof openAutoRuleModal !== 'function' || !CFG.autoRule) {
+      showToast('The rule dialog did not load on this page.', { type: 'error' });
+      return;
+    }
+    const params = snapshot();
+    openAutoRuleModal({
+      search: params,
+      summary: describeSaved(params),
+      name: state.q || savedStatus().name || '',
+      profiles: recordModalProfiles(),
+      defaultCap: CFG.autoRule.defaultCap,
+      phrases: CFG.autoRule.phrases,
+      createUrl: CFG.autoRule.createUrl,
+      rulesUrl: CFG.autoRule.rulesUrl,
+      // Arriving from + New rule, making the rule is the end of the errand: the new rule's
+      // page is where it goes on from. Otherwise the search stays on screen, re-run because
+      // a save that scheduled something changed those rows' record state.
+      goToRule: ruleMode() === 'new',
+      onSaved: () => applyNow(false),
+    });
+  }
+
+  $('#sel-mkrule').addEventListener('click', () => openRuleFromSearch());
+
+  /* Save to rule: the search on screen replaces the rule's, through the same PUT the edit
+     dialog uses, sending only `search` - the rule's settings stay as they are. The server
+     refuses what a rule cannot use with a sentence, shown as a toast with the page left as
+     it is so the search can be fixed and saved again. Done, the errand ends on the rule's
+     page, which carries the check's outcome across the navigation. */
+  $('#rule-save').addEventListener('click', async () => {
+    if (ruleMode() !== 'edit' || !isAirings()) return;
+    const btn = $('#rule-save');
+    btn.disabled = true;
+    let res;
+    try {
+      res = await jsonFetch(`${CFG.autoRule.apiBase}${CFG.ruleCtx.id}`, {
+        method: 'PUT', body: JSON.stringify({ search: snapshot() }),
+      });
+    } catch (e) {
+      btn.disabled = false;
+      showToast(e.message || 'The search could not be saved to the rule.', { type: 'error' });
+      return;
+    }
+    const out = res.evaluation
+      ? autoRuleOutcome(`Saved the new search to "${CFG.ruleCtx.name}".`, res.evaluation,
+        CFG.autoRule.phrases)
+      : { type: 'success', text: `Saved the new search to "${CFG.ruleCtx.name}". It is paused, so nothing was checked.` };
+    showToastAfterLoad(out.text, { type: out.type, durationMs: 10000 });
+    location.href = CFG.ruleCtx.url;  // nav-ok: the errand ends on the rule's own page
+  });
+
+  $('#rule-x').addEventListener('click', () => {
+    const editing = ruleMode() === 'edit';
+    state.rule = null;
+    renderRuleBar();
+    renderSavedPop();
+    applyNow(false);
+    showToast(editing
+      ? 'Stopped editing the rule\'s search. The rule keeps the search it has, and this search is unchanged.'
+      : 'Stopped making a rule. The search itself is unchanged.');
+  });
+
   /* Schedule every ticked SHOWING, one recording each, with one profile (dev/changelog/1157).
-     The profiles are read off the record modal's own picker, which this page already
-     renders, so the two dialogs cannot offer different lists. Created and skipped showings
-     leave the selection; a failed one stays ticked, so trying again is one click. */
+     Created and skipped showings leave the selection; a failed one stays ticked, so trying
+     again is one click. */
   $('#sel-sched').addEventListener('click', () => {
     if (!selectedAirings.size) { showToast('Select some showings first.', { type: 'error' }); return; }
     if (typeof openBulkScheduleModal !== 'function') {
       showToast('The scheduling dialog did not load on this page.', { type: 'error' });
       return;
     }
-    const profiles = Array.from(document.querySelectorAll('#modal-profile option'))
-      .filter((o) => o.value)
-      .map((o) => ({ id: Number(o.value), name: o.textContent }));
     openBulkScheduleModal({
       items: Array.from(selectedAirings.entries())
         .map(([id, v]) => ({ epg_id: id, group_id: v.group_id })),
-      profiles,
+      profiles: recordModalProfiles(),
       previewUrl: CFG.bulkPreviewUrl,
       scheduleUrl: CFG.bulkScheduleUrl,
       when: (plan) => `${dayLabel(utcDate(plan.start_time))} ${timeRange(plan)}`,
@@ -5691,11 +5966,12 @@
       loadPrefs(GRAIN_CHANNELS, COL_BY_KEY, CFG.columnPrefs, CFG.cardFieldPrefs);
       loadPrefs(GRAIN_AIRINGS, ACOL_BY_KEY, CFG.airingColumnPrefs, CFG.airingCardFieldPrefs);
       parseState(location.search);
-      // The `when`/`duration` controls are spelled INTO one filter value each, so they have
-      // to be read back out of whatever the URL carried or a reload would show the chip over
-      // empty boxes - a filter you can see but cannot edit.
+      // The `when`/`duration`/`tod` controls are spelled INTO one filter value each, so they
+      // have to be read back out of whatever the URL carried or a reload would show the chip
+      // over empty boxes - a filter you can see but cannot edit.
       hydrateWhenControls();
       hydrateDurationControls();
+      hydrateTodControls();
       $('#cs-q').value = state.q;
       applyColumns();
       renderColsPop();

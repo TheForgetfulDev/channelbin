@@ -942,7 +942,7 @@
               close();
               /* The reload is what re-renders the score, the kebab's remaining count and
                  the timeline's excluded markers together - three regions one updater. */
-              sessionStorage.setItem('cd-rollback-toast', (data.result || {}).detail || 'Health score updated.');
+              showToastAfterLoad((data.result || {}).detail || 'Health score updated.');
               location.reload();
             }).catch(e => showToast(e.message || 'Could not roll the score back.', { type: 'error' }));
             return false;
@@ -998,7 +998,7 @@
                 close();
                 /* The reload re-renders the score, Test History, the latest-test card and
                    the timeline together, as the rollback does. */
-                sessionStorage.setItem('cd-rollback-toast', (res.result || {}).detail || 'Test deleted.');
+                showToastAfterLoad((res.result || {}).detail || 'Test deleted.');
                 location.reload();
               }).catch(e => showToast(e.message || 'Could not delete the test.', { type: 'error' }));
               return false;
@@ -1008,14 +1008,6 @@
       });
     }).catch(e => showToast(e.message || 'Could not load the test.', { type: 'error' }));
   }
-
-  /* The action's own sentence, carried across the reload it triggers. */
-  (function showPendingRollbackToast() {
-    const pending = sessionStorage.getItem('cd-rollback-toast');
-    if (!pending) return;
-    sessionStorage.removeItem('cd-rollback-toast');
-    showToast(pending);
-  })();
 
   function pageAction(act, el) {
     switch (act) {

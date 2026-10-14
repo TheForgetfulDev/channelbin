@@ -19,6 +19,12 @@
       {% else %}<span class="h-mini na">-</span>{% endif %}
       {% if row.pill %}{{ channel_pill(row.pill.label, row.pill.url, logo_url=row.pill.logo_url, initials=row.pill.initials, acct_color=row.pill.acct_color) }}{% endif %}
       {% for acct in distinct_accounts %}{{ account_pill(acct.name, url_for('accounts.account_detail', account_id=acct.id), acct.color, tip='Recorded via account "' ~ acct.name ~ '" - click for the account page.') }}{% endfor %}
+      {% if made_by_rule %}
+      {# dev/changelog/1189. Cancelling a rule's recording sticks: the rule's ledger keeps the
+         decision, so the tooltip says so where the cancel is offered. #}
+      <a class="tip-plain" href="{{ made_by_rule.url }}"
+         data-tip="Made by an auto-record rule.&#10;Cancelling it here sticks: the rule does not schedule this program again.">Scheduled by rule {{ made_by_rule.name }} &rarr;</a>
+      {% endif %}
     </div>
   </div>
   <div class="dh-actions">
@@ -1020,6 +1026,10 @@
 </div>
 
 {# ── Event log (DESIGN.md 3.8): vertical timeline, newest first by default. #}
+{# RECORDING_START_NOT_ARMED is 'bad': a SCHEDULED recording nothing will start until a
+   restart, and this event is its one lasting surface (dev/changelog/1186).
+   RECORDING_RULE_PROGRAM_MOVED is 'warn': the guide moved the program and this recording
+   stayed where it was (dev/changelog/1188). #}
 {% set ev_cls = {
   'STALL_DETECTED': 'warn', 'RESTART_FAILED': 'warn', 'RECORDING_STOPPED_EARLY': 'warn',
   'RECORDING_ABORTED': 'warn', 'SEEK_DAMAGE_DETECTED': 'warn', 'RECORDING_RETRY_SCHEDULED': 'warn',
@@ -1027,17 +1037,20 @@
   'CAPTURE_LOST_TO_OUTAGE': 'warn', 'SEGMENT_DISCARDED': 'warn',
   'FAST_DELIVERY_DETECTED': 'warn',
   'RECORDING_FORMAT_OVERRIDE': 'warn', 'RECORDING_FORMAT_CHANGED': 'warn',
+  'RECORDING_RULE_PROGRAM_MOVED': 'warn',
   'CONVERSION_RESTARTED': 'info', 'DIAGNOSTICS': 'info', 'CAPTURE_PACING_ENABLED': 'info',
   'RECORDING_METADATA_REFRESHED': 'info', 'RECORDING_METADATA_REFRESH_SKIPPED': 'info',
-  'RECORDING_METADATA_EDITED': 'info',
+  'RECORDING_METADATA_EDITED': 'info', 'RECORDING_RULE_RETRACKED': 'info',
   'POSTCAPTURE_ANALYSIS_STARTED': 'info', 'POSTCAPTURE_ANALYSIS_SKIPPED': 'info',
   'MIXED_FRAME_RATE_DETECTED': 'info',
+  'FORMAT_NORMALIZE_NEEDED': 'info',
   'RESTART_SUCCEEDED': 'ok', 'CONCATENATION_DONE': 'ok', 'CONVERSION_DONE': 'ok',
   'CONVERSION_RESUMED': 'ok',
   'FILE_MOVED': 'ok', 'SCRIPT_EXECUTED': 'ok', 'METADATA_SIDECAR_WRITTEN': 'ok',
   'METADATA_SIDECAR_FAILED': 'warn',
   'RECORDING_FAILED': 'bad', 'RECORDING_FAILED_DEAD_STREAM': 'bad',
   'CONCATENATION_FAILED': 'bad', 'CONVERSION_FAILED': 'bad',
+  'RECORDING_START_NOT_ARMED': 'bad',
 } %}
 <div class="card" id="panel-eventlog" data-sec="log">
   <div class="card-head">

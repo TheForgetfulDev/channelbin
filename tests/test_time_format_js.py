@@ -2,7 +2,8 @@
 
 `displayTz`, `displayHour12`, `tzFormatter`, `fmtTimeTz`, `fmtDateTz`, `tzDayKey`,
 `tzDayLabel` and `utcIsoToDate` are the one home for "render this instant in the user's
-display timezone and clock format" (dev/changelog/654). Before they existed, eleven
+display timezone and clock format" (dev/changelog/654); `fmtHhmm` is the same for a bare
+clock reading that names no instant (dev/changelog/1187). Before they existed, eleven
 templates injected the timezone and the 12h/24h flag into their own JS config globals and
 about twenty-five sites re-typed the Intl option object - and the surface that never got
 the plumbing at all, the Live dashboard's timeline, silently rendered the BROWSER's
@@ -30,7 +31,7 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 UTIL_JS = os.path.join(REPO, 'static', 'js', 'util.js')
 
 _EXPORTS = ('displayTz, displayHour12, tzFormatter, fmtTimeTz, fmtDateTz, '
-            'tzDayKey, tzDayLabel, utcIsoToDate')
+            'tzDayKey, tzDayLabel, utcIsoToDate, fmtHhmm')
 
 # argv: [util.js path, tz meta content or '', hour12 meta content or '', expression]
 # A '' content stands for "the tag is absent", which is what a page outside base.html
@@ -164,6 +165,40 @@ class FmtTimeTzTests(_Base):
         of these wrong; Intl with a real zone name gets both."""
         self.assertEqual(self.evaluate(f'fmtTimeTz({SUMMER})'), '7:45 PM')
         self.assertEqual(self.evaluate(f'fmtTimeTz({WINTER})'), '12:30 AM')
+
+
+class FmtHhmmTests(_Base):
+    """A bare clock reading (the channel search's Time of day range, dev/changelog/1187) in
+    the display clock format - app/tz_utils.py::format_clock's browser half."""
+
+    def test_twelve_hour_reading(self):
+        self.assertEqual(self.evaluate("['18:00', '00:00', '12:30', '09:05', '23:59']"
+                                       ".map((v) => fmtHhmm(v))"),
+                         ['6:00 PM', '12:00 AM', '12:30 PM', '9:05 AM', '11:59 PM'])
+
+    def test_twenty_four_hour_reading_is_zero_padded(self):
+        self.assertEqual(self.evaluate("['18:00', '00:00', '9:05'].map((v) => fmtHhmm(v))",
+                                       hour12='false'), ['18:00', '00:00', '09:05'])
+
+    def test_the_timezone_never_moves_it(self):
+        """It names a time on a clock, not an instant - London's display reads 6 PM as
+        6 PM too, and so does a browser in Auckland."""
+        self.assertEqual(self.evaluate("fmtHhmm('18:00')", tz=LONDON), '6:00 PM')
+
+    def test_anything_that_is_not_hh_mm_comes_back_as_it_arrived(self):
+        self.assertEqual(self.evaluate("['', '6pm', '18:00:00', null].map((v) => fmtHhmm(v))"),
+                         ['', '6pm', '18:00:00', ''])
+
+    def test_an_out_of_range_time_is_not_printed_as_a_real_one(self):
+        """The engine refuses these (tz_utils.parse_hhmm), so a chip reading '24:00' as
+        '12:00 PM' would name a range the search is not running."""
+        self.assertEqual(self.evaluate("['24:00', '25:30', '12:60', '99:99']"
+                                       ".map((v) => fmtHhmm(v))"),
+                         ['24:00', '25:30', '12:60', '99:99'])
+
+    def test_a_caller_holding_the_setting_can_pass_it(self):
+        self.assertEqual(self.evaluate("[fmtHhmm('18:00', false), fmtHhmm('18:00', true)]",
+                                       hour12='true'), ['18:00', '6:00 PM'])
 
 
 class FmtDateTzTests(_Base):

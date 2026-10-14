@@ -29,7 +29,7 @@ from ..accounts import (
 from ..channel_groups import group_channel_ids, report_orphaned_guide_groups
 from .. import channel_hiding, duplicate_streams
 from ..config import load_config
-from ..db_utils import retry_on_locked
+from ..db_utils import chunked, retry_on_locked
 from ..logo_cache import get_logo_cache_dir, resolve_logo_url
 from ..storage_dirs import manual_screenshot_paths
 from .. import fmt_utils
@@ -89,11 +89,6 @@ CHANNEL_SEARCH_AIRING_CARD_FIELDS_PREF = 'channel_search_airing_card_fields_v2'
 # static/js/group-create-flow.js and show it once more (dev/changelog/831). Spelled here
 # and in that file, and the two must agree - the JS posts it back to this key.
 GROUP_INTRO_SEEN_PREF = 'group_intro_seen_version'
-
-
-def _chunked(items, size):
-    for i in range(0, len(items), size):
-        yield items[i:i + size]
 from .channel_tests import _serialize_dup_groups
 from .channel_groups import _next_guide_sort_order
 from ..channel_tester import get_status, health_check_profile_payload, health_check_signature
@@ -331,6 +326,29 @@ def _replace_rec_context():
     return {'id': rec.id, 'name': rec.name}
 
 
+def _rule_context():
+    """The auto-record rule errand a `rule=` visit came on (dev/changelog/1189), resolved:
+    {'mode': 'new'}, {'mode': 'edit', 'id', 'name', 'url'}, or None.
+
+    Resolved server-side for the same reasons as `_replace_rec_context()`: the bar names the
+    rule from the database, never from the URL, and a rule deleted since the link was made
+    drops the context with a log line rather than erroring."""
+    from ..channel_search import RULE_CONTEXT_NEW, rule_context_value
+    from ..database import AutoRule
+    value = rule_context_value(request.args.get('rule'))
+    if value is None:
+        return None
+    if value == RULE_CONTEXT_NEW:
+        return {'mode': 'new', 'value': value}
+    rule = db.session.get(AutoRule, int(value))
+    if rule is None:
+        log.info('rule=%s is not an auto-record rule any more - opening the search without '
+                 'the rule context.', value)
+        return None
+    return {'mode': 'edit', 'value': value, 'id': rule.id, 'name': rule.name,
+            'url': url_for('auto_rules.rule_page', rule_id=rule.id)}
+
+
 def _channel_search_page_context():
     """Everything the search shell needs that is not part of the search itself.
 
@@ -338,6 +356,8 @@ def _channel_search_page_context():
     vocabularies all arrive over JSON, so nothing here may grow a per-row loop.
     """
     from ..database import UserPref
+    from ..auto_rules import default_cap as auto_rule_default_cap
+    from .auto_rules import verdict_phrases as auto_rule_phrases
 
     cfg = load_config()
     # Global, not account-scoped: this page has no account selected until the user picks
@@ -406,6 +426,13 @@ def _channel_search_page_context():
         # its padding maths. Four rows on this database - not a per-row cost.
         'profiles': RecordingProfile.query.order_by(RecordingProfile.name).all(),
         'replace_rec': _replace_rec_context(),
+        'rule_ctx': _rule_context(),
+        # "Create rule from this search..." (static/js/auto-rule-modal.js): the cap a rule
+        # without its own runs under, and the verdict wording its first-check toast uses.
+        # The profile list it offers is the record modal's own picker, as Schedule
+        # selected's is.
+        'auto_rule_default_cap': auto_rule_default_cap(cfg),
+        'auto_rule_phrases': auto_rule_phrases(),
     }
 
 
@@ -891,9 +918,8 @@ def channel_detail(channel_id):
 
     # Where this channel's guide comes from and why (DESIGN-epg-sources.md §9.3). A fixed
     # handful of queries whatever the number of sources.
-    from ..epg_sources import channel_guide_view
-    guide_source = channel_guide_view(
-        channel, cfg.get('sync', {}).get('epg_case_sensitive_matching', False))
+    from ..epg_sources import case_sensitive_matching, channel_guide_view
+    guide_source = channel_guide_view(channel, case_sensitive_matching(cfg))
 
     return render_template('channels/detail.html',
         channel=channel,
@@ -1290,7 +1316,7 @@ def missing_delete():
         # paths are collected here - the unlink itself is a non-idempotent side effect and
         # runs after this closure has durably committed, mirroring delete_recording.
         screenshot_paths = []
-        for chunk in _chunked(ids, _DELETE_CHUNK_SIZE):
+        for chunk in chunked(ids, _DELETE_CHUNK_SIZE):
             screenshot_paths.extend(
                 p for (p,) in db.session.query(ChannelTest.screenshot_path)
                 .filter(ChannelTest.channel_id.in_(chunk))
@@ -1303,13 +1329,13 @@ def missing_delete():
         # is DESIGN-channel-groups-model.md 15's breach path 3 with nobody present to
         # confirm it, so it gets an alert after the commit rather than an action here.
         touched_group_ids = set()
-        for chunk in _chunked(ids, _DELETE_CHUNK_SIZE):
+        for chunk in chunked(ids, _DELETE_CHUNK_SIZE):
             touched_group_ids.update(
                 gid for (gid,) in db.session.query(ChannelGroupMember.group_id)
                 .filter(ChannelGroupMember.channel_id.in_(chunk)).distinct().all())
 
         unlinked_recordings = 0
-        for chunk in _chunked(ids, _DELETE_CHUNK_SIZE):
+        for chunk in chunked(ids, _DELETE_CHUNK_SIZE):
             unlinked_recordings += (
                 db.session.query(Recording)
                 .filter(Recording.channel_id.in_(chunk))
@@ -1458,7 +1484,7 @@ def _subscribed_source(channel, raw_source_id):
 def set_channel_epg_key(channel_id):
     """Body {source_id, key}; a blank key clears it. The channel page's Set key / Clear key
     (DESIGN-epg-sources.md §6.1, §9.3), through the one writer."""
-    from ..epg_sources import set_channel_key
+    from ..epg_sources import case_sensitive_matching, set_channel_key
     data = request.get_json(silent=True) or {}
     key = data.get('key')
     if key is not None and not isinstance(key, str):
@@ -1466,7 +1492,7 @@ def set_channel_epg_key(channel_id):
     key = (key or '').strip()
     if len(key) > _EPG_KEY_MAX:
         return jsonify({'error': f'An EPG key is at most {_EPG_KEY_MAX} characters.'}), 400
-    case_sensitive = load_config().get('sync', {}).get('epg_case_sensitive_matching', False)
+    case_sensitive = case_sensitive_matching(load_config())
 
     @retry_on_locked()
     def _set_and_commit():
@@ -1496,11 +1522,11 @@ def set_channel_epg_source_override(channel_id):
     channel's account reads can be chosen; clearing is always allowed, including an
     override on a source the account has since stopped reading."""
     from ..database import EpgSource, EpgSourceSubscription
-    from ..epg_sources import set_source_override
+    from ..epg_sources import case_sensitive_matching, set_source_override
     raw = (request.get_json(silent=True) or {}).get('source_id')
     if raw is not None and (isinstance(raw, bool) or not isinstance(raw, int)):
         return jsonify({'error': 'source_id must be a source id or null'}), 400
-    case_sensitive = load_config().get('sync', {}).get('epg_case_sensitive_matching', False)
+    case_sensitive = case_sensitive_matching(load_config())
 
     @retry_on_locked()
     def _set_and_commit():

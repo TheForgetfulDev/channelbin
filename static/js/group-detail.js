@@ -17,7 +17,6 @@
 
   let ROWS = G.rows.slice();
   let DUP_GROUPS = G.dupGroups.slice();
-  let PROVIDER_COPIES = G.providerCopies.slice();
   let MISSING_CHANNELS = G.missingChannels.slice();
   let COUNTS = G.counts;
   let TOTAL = G.total;
@@ -502,6 +501,13 @@
       values: tagValues,
       match: (r, v) => (r.tags || []).some(t => t && t.name && t.name.toLowerCase() === v),
       available: () => tagValues().length > 0 },
+    // The dimension the duplicates banner's Show points at: every member of a duplicate
+    // set, as the copy kept or an extra (dev/changelog/1175).
+    { k: 'dup',
+      label: 'Duplicates',
+      values: [{ v: 'extra', label: 'Extra copies' }, { v: 'lead', label: 'Lead copies' }],
+      match: (r, v) => r.dup_role === v,
+      available: () => ROWS.some(r => r.dup_role) },
     { k: 'age',
       label: 'Test age',
       values: [{ v: 'stale24', label: 'Not tested in 24h' }, { v: 'never', label: 'Never tested' }],
@@ -783,9 +789,7 @@
     // setup the app deliberately allows, so it renders as two pills rather than one
     // winning and hiding the other.
     h += rowFlags(r).join('');
-    if (r.duplicate_title) {
-      h += `<span class="badge b-warn tip-plain" data-tip="Duplicate feed.&#10;${escHtml(r.duplicate_title)}. Same stream URL, so it is literally the same feed listed twice - it adds nothing to failover and costs an extra test run.">&#10697; duplicate</span>`;
-    }
+    h += dupBadge(r);
     h += missingBadge(r);
     // "No schedule reaches this feed" is a different fact from "this group's Health check
     // switch is off", but they read as the same words - so the note is suppressed when a
@@ -1166,9 +1170,7 @@
       flags.push(`<span class="badge b-fail tip-plain" data-tip="Disabled.&#10;${escHtml(r.disabled_tip || '')}">&#10005; disabled</span>`);
     }
     flags.push(...rowFlags(r));
-    if (r.duplicate_title) {
-      flags.push(`<span class="badge b-warn tip-plain" data-tip="Duplicate feed.&#10;${escHtml(r.duplicate_title)}. Same stream URL, so it is literally the same feed listed twice - it adds nothing to failover and costs an extra test run.">&#10697; duplicate</span>`);
-    }
+    if (dupBadge(r)) flags.push(dupBadge(r));
     if (r.lifecycle === 'missing') flags.push(missingBadge(r));
     const pillSaysUnmonitored = G.hasChannel && r.recording_enabled && !r.test_enabled;
     if (G.hasChannel && !r.monitored && !pillSaysUnmonitored) {
@@ -1637,42 +1639,10 @@
     return items;
   }
 
+  // The chips and their phone form are util.js renderSettingChips(), shared with an
+  // auto-record rule's page; settingItems() above is what this page puts in them.
   function renderSettingsBar() {
-    const host = byId('gd-setbar');
-    // The desktop's wrapping row of pills does not survive 375px: it wraps into an uneven
-    // block, and the one pill carrying an origin line comes out double height beside its
-    // neighbors. Same four facts, same click target, as the app's key/value list
-    // (.statlist, DESIGN.md 3.3) - which is what an account page's Details card already is
-    // and which collapses to one column at 960 on its own. Each row stays a button opening
-    // Settings focused on its key, exactly as the pill did; the chevron is what says so.
-    if (isPhone()) {
-      host.className = '';
-      host.innerHTML = '<div class="statlist">' + settingItems().map(it => {
-        const value = `<span>${escHtml(it.value)}` +
-          (it.sub ? `<span class="srow-sub">${escHtml(it.sub)}</span>` : '') + '</span>';
-        const inner = `<span class="sk">${escHtml(it.label)}</span><span class="sv">${value}` +
-          '<span class="srow-go" aria-hidden="true">&rsaquo;</span></span>';
-        const tip = `${escHtml(it.label)}.&#10;${escHtml(it.tip)} ` +
-                    (it.href ? 'Tap to open that health check.' : 'Tap to change it.');
-        return it.href
-          ? `<a class="srow srow-act tip-plain" href="${escHtml(it.href)}" data-tip="${tip}">${inner}</a>`
-          : `<button type="button" class="srow srow-act tip-plain" data-act="settings"` +
-            ` data-focus="${it.focus}" data-tip="${tip}">${inner}</button>`;
-      }).join('') + '</div>';
-      return;
-    }
-    host.className = 'gd-setbar';
-    host.innerHTML = settingItems().map(it => {
-      const inner = `<span class="gd-chip-lbl">${escHtml(it.label)}</span>` +
-                    `<span class="gd-chip-val">${escHtml(it.value)}</span>` +
-                    (it.sub ? `<span class="gd-sub">${escHtml(it.sub)}</span>` : '');
-      const tip = `${escHtml(it.label)}.&#10;${escHtml(it.tip)} ` +
-                  (it.href ? 'Click to open that health check.' : 'Click to change it.');
-      return it.href
-        ? `<a class="gd-chip tip-plain" href="${escHtml(it.href)}" data-tip="${tip}">${inner}</a>`
-        : `<button type="button" class="gd-chip tip-plain" data-act="settings" data-focus="${it.focus}"` +
-          ` data-tip="${tip}">${inner}</button>`;
-    }).join('');
+    renderSettingChips(byId('gd-setbar'), settingItems(), { phone: isPhone() });
   }
 
   // ── Warning banners (DESIGN-channel-groups-model.md §16) ──────────────────
@@ -1894,7 +1864,14 @@
     // specific set, so the list has to end up showing that set and not an intersection
     // with something left on from earlier. The chip it leaves behind is what says so.
     filterBar.clear();
-    filterBar.toggle('rec', 'on');
+    // The duplicates banner counts every set whatever its switches say, so its Show is the
+    // one target without the recording-enabled floor.
+    if (target === 'dup') {
+      filterBar.toggle('dup', 'extra');
+      filterBar.toggle('dup', 'lead');
+    } else {
+      filterBar.toggle('rec', 'on');
+    }
     let revealed = false;
     if (target === 'epg') {
       // With no id named: every id the banner listed, never a subset. Its list is ordered
@@ -1946,9 +1923,11 @@
   }
 
   // ── Duplicates ────────────────────────────────────────────────────────────
-  // Sole updater for #gd-dup-banner. A duplicate set only costs anything while 2+ of
-  // its members are still enabled, so disabling the extras drops it to the quiet
-  // variant rather than nagging on.
+  // Sole updater for #gd-dup-banner: every duplicate set - the same stream URL, or the same
+  // channel through a provider - in one line (DESIGN-account-providers.md §9,
+  // dev/changelog/1175). Which member duplicates which, and how, is on each member's badge,
+  // so the banner only counts. A set only costs anything while 2+ of its members are still
+  // taking part, so switching the extras off drops it to the quiet variant.
 
   function renderDupBanner() {
     const el = byId('gd-dup-banner');
@@ -1956,51 +1935,36 @@
     if (kebab) kebab.disabled = G.isSystem || !DUP_GROUPS.length;
     if (!DUP_GROUPS.length) { el.style.display = 'none'; return; }
 
-    const sets = DUP_GROUPS.length;
+    const { extras, reason } = dupSetsSummary(DUP_GROUPS);
     const activeSets = DUP_GROUPS.filter(g => (g.channels || []).filter(c => !c.disabled).length > 1).length;
-    const redundant = DUP_GROUPS.reduce((n, g) => n + (g.channels || []).length, 0) - sets;
     const where = G.hasChannel ? 'in this group' : 'in this health check';
+    const show = '<button type="button" class="btn btn-sm" data-act="review-members" data-review="dup">Show</button>';
 
     if (!activeSets) {
-      const why = G.hasChannel ? 'nothing is tested twice and failover never lands on them'
-        : 'nothing is tested twice';
       el.className = 'notice-banner notice-banner-muted';
       el.innerHTML = `<div class="notice-banner-body"><span class="notice-banner-title">` +
-        `${plural(sets, 'duplicate channel set')} ${where} - the extras are disabled, so ${why}.</span></div>`;
+        `${plural(extras, 'duplicate channel')} ${where}, the extras switched off.</span></div>${show}`;
       el.style.display = '';
       return;
     }
 
-    const cost = G.hasChannel
-      ? 'every run tests the same feed more than once, and failover can drop off a failing feed straight onto the very same stream.'
-      : 'each run tests it more than once and burns an extra connection on your account.';
     // An automatic group computes its own membership, so there is nothing to remove
     // here - the fix is in Browse, where the channels themselves live.
     const action = G.isSystem
       ? `<a class="btn btn-sm" href="${escHtml(G.browseUrl)}">Manage in Browse</a>`
-      : `<button type="button" class="btn btn-sm btn-danger-outline" data-act="dedup">Review duplicates&hellip;</button>`;
+      : '<button type="button" class="btn btn-sm btn-danger-outline" data-act="dedup">Remove duplicates&hellip;</button>';
     el.className = 'notice-banner notice-banner-warn';
-    el.innerHTML =
-      `<div class="notice-banner-body">` +
-      `<div class="notice-banner-title">&#9888; ${plural(activeSets, 'duplicate channel set')} ${where}</div>` +
-      `<div class="notice-banner-sub">${plural(redundant, 'channel')} here ` +
-      `${redundant === 1 ? 'points' : 'point'} at a stream another channel already covers, so ${cost} ` +
-      `Keep one from each set, or disable the extras.</div></div>${action}`;
+    el.innerHTML = `<div class="notice-banner-body"><div class="notice-banner-title">` +
+      `&#9888; ${plural(extras, 'duplicate channel')} ${where}, ${escHtml(reason)}</div></div>` +
+      show + action;
     el.style.display = '';
   }
 
-  // Sole updater for #gd-copies-banner. A statement, not a warning: a copy through a
-  // different login is a real backup, so the banner carries no ⚠ and no action - nothing
-  // is removed and no switch moves (DESIGN-account-providers.md §9). The sentences are
-  // built server-side by duplicate_streams.provider_copies(), the same ones the add-time
-  // note shows.
-  function renderCopiesBanner() {
-    const el = byId('gd-copies-banner');
-    if (!PROVIDER_COPIES.length) { el.style.display = 'none'; return; }
-    const lines = PROVIDER_COPIES.map(c => `<div class="notice-banner-sub">${escHtml(c.text)}</div>`).join('');
-    el.innerHTML = `<div class="notice-banner-body"><div class="notice-banner-title">` +
-      `Same channel through a provider</div>${lines}</div>`;
-    el.style.display = '';
+  // One badge for both layouts. `duplicate_title` names the copy it duplicates and how,
+  // built server-side from the same sets the banner counts; the lead carries none.
+  function dupBadge(r) {
+    if (r.dup_role !== 'extra' || !r.duplicate_title) return '';
+    return `<span class="badge b-warn tip-plain" data-tip="${escHtml(r.duplicate_title)}">&#10697; duplicate</span>`;
   }
 
   // What "remove" means differs per page state, and dup-modal.js makes every caller
@@ -2039,11 +2003,12 @@
 
   function openDedup() {
     if (!DUP_GROUPS.length) { showToast('No duplicate channels here - nothing to review.', { type: 'error' }); return; }
+    // Joining a group no longer takes a channel out of the guide (dev/changelog/751), so
+    // leaving one puts nothing back there and the intro does not say it does.
     const intro = G.hasChannel
-      ? 'The channels you don\'t keep are removed from <strong>this group</strong>, which also ' +
-        'takes them out of its health check and their test history here' +
-        '. They are not deleted &mdash; they stay in your channel list and return to the guide as ' +
-        'individual channels if they were in it before.'
+      ? 'Each set starts on its lead copy, the one this group records from first. The others ' +
+        'are removed from <strong>this group</strong> and its health check, not deleted - they ' +
+        'stay in your channel list.'
       : 'The channels you don\'t keep are removed from <strong>this health check</strong> only, along ' +
         'with their test history here. They are not deleted &mdash; they stay in your channel list and ' +
         'in the TV Guide unless you choose otherwise below.';
@@ -2051,6 +2016,7 @@
       groups: DUP_GROUPS,
       showGuideChoice: !G.hasChannel,
       introHtml: intro,
+      submitLabel: `Keep selected, remove ${dupSetsSummary(DUP_GROUPS).extras}`,
       onSubmit: (removals, transfer) => submitDedup(removals, transfer, false),
     });
   }
@@ -2696,6 +2662,7 @@
           groupName: G.groupName,
           deleteUrl: api('delete'),
           attachedChecks: [{ name: G.jobName }],
+          attachedRules: G.autoRules || [],
           onDeleted: () => { reloading = true; location.href = G.groupsUrl; },  // nav-ok: redirect after deleting the group
           onError: (msg) => showActionError(msg),
         });
@@ -3057,7 +3024,6 @@
       .then(data => {
         ROWS = data.rows;
         DUP_GROUPS = data.dup_groups;
-        PROVIDER_COPIES = data.provider_copies;
         MISSING_CHANNELS = data.missing_channels;
         COUNTS = data.counts;
         TOTAL = data.total;
@@ -3082,7 +3048,6 @@
         renderBanners();
         renderSettingsBar();
         renderDupBanner();
-        renderCopiesBanner();
         renderMissingBanner();
         // The rows just changed underneath the bar, so its account values are re-derived
         // and any filter that no longer matches anything present is dropped with its chip.
@@ -3407,7 +3372,6 @@
   renderSummary();
   renderBanners();
   renderDupBanner();
-  renderCopiesBanner();
   renderMissingBanner();
   renderList();
   initBarReveal();

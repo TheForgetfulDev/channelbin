@@ -19,9 +19,10 @@ builder - which is what the `grain` parameter was reserved for when the channel 
 
 Three things about the seam that a future editor gets wrong:
 
-* **The standing options and every dimension except `when` are channel-grain concepts.** On
-  the airing grain they apply to the channel a showing is on, not to the showing. "Hide
-  duplicates" is about two channels sharing a stream URL; it says nothing about two airings.
+* **The standing options and every dimension except the ones about a showing's own time
+  (`when`, `dow`, `tod`, `duration`) are channel-grain concepts.** On the airing grain they
+  apply to the channel a showing is on, not to the showing. "Hide duplicates" is about two
+  channels sharing a stream URL; it says nothing about two airings.
 * **An EPG search field means something different on each grain, and this is deliberate.** On
   the channel grain `epg-title` matches what the channel is airing RIGHT NOW, because a
   channel row shows one program - the one in its `Now airing` column - and a row that matched
@@ -62,6 +63,7 @@ recorded in dev/changelog/395 - do not re-derive them:
   been deleted; wildcards therefore run against the base tables (`search_index.glob_to_like`)
 """
 import logging
+import sqlite3
 import threading
 import time
 from dataclasses import dataclass, field, replace
@@ -284,13 +286,14 @@ class Dimension:
     #: True when one channel can carry several of this dimension's values at once. Such a
     #: dimension cannot be counted with a plain GROUP BY over channels.
     multi: bool = False
-    #: The one grain this dimension exists on, or '' for both. Only `when` is scoped today:
-    #: a channel has no start time, which is the whole reason the two grains exist.
+    #: The one grain this dimension exists on, or '' for both. The ones about a showing's own
+    #: time - `when`, `dow`, `tod`, `duration` - are scoped: a channel has no start time,
+    #: which is the whole reason the two grains exist.
     grain: str = ''
     #: What this dimension MEANS, for the rail's info tooltip. It lives here for the same
     #: reason the label does: a page that spelled it out itself would be a second vocabulary
     #: to keep in step, and a dimension added later would silently ship with no explanation.
-    #: Only the three whose meaning is not self-evident carry one.
+    #: Only the ones whose meaning is not self-evident carry one.
     help: str = ''
 
 
@@ -306,6 +309,21 @@ DIMENSIONS = (
                    '"any of these", so that is not a conflict.\n\n'
                    'There is deliberately no default window. With nothing picked you get '
                    'every future showing, earliest first.'),
+    Dimension('dow', 'Day of week', multi=True, grain=GRAIN_AIRINGS,
+              help='The day a showing STARTS on, in the display timezone. A showing that '
+                   'begins at 11:30 PM Saturday and runs past midnight is a Saturday '
+                   'showing.\n\n'
+                   'It narrows When rather than replacing it: Next 7 days and Sunday is '
+                   'next Sunday. Pick Saturday and Sunday for weekends, and add Time of day '
+                   'for "weekend evenings".\n\n'
+                   'A day the guide does not reach yet counts zero.'),
+    Dimension('tod', 'Time of day', multi=True, grain=GRAIN_AIRINGS,
+              help='The clock time a showing STARTS at, in the display timezone, on any '
+                   'day - it follows the clock across a daylight saving change, so 7 PM is '
+                   '7 PM on both sides of it.\n\n'
+                   'Both ends are included. An end earlier than the start runs past '
+                   'midnight: 10 PM to 2 AM. Either end alone is a real filter: set only '
+                   '"from" for "at or after", or only "to" for "at or before".'),
     Dimension('duration', 'Program length', multi=True, grain=GRAIN_AIRINGS,
               help='How long a showing runs. Only on the Airings grain - a channel has no '
                    'length of its own, only a showing does.\n\n'
@@ -585,6 +603,65 @@ def parse_duration(value: str):
 
 
 # ---------------------------------------------------------------------------
+# `dow` and `tod` - the day and the clock time a showing starts on, in the display timezone
+# ---------------------------------------------------------------------------
+#
+# Two dimensions and not new `when` values, because values inside one dimension mean "any of
+# these": "Sundays" as a `when` value would widen "Next 7 days" instead of narrowing it, and
+# "weekends" and "evenings" could not both be asked for (dev/changelog/1187). Both read the
+# START, like `when`: a showing that begins at 11:30 PM Saturday is a Saturday showing.
+
+#: Monday first, so Saturday and Sunday sit together in the rail. The index of a value here is
+#: Python's `weekday()`, which `_local_weekday()` reproduces in SQL.
+DOW_VALUES = ('mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun')
+DOW_LABELS = {
+    'mon': 'Monday', 'tue': 'Tuesday', 'wed': 'Wednesday', 'thu': 'Thursday',
+    'fri': 'Friday', 'sat': 'Saturday', 'sun': 'Sunday',
+}
+
+#: `tod:<HH:MM>..<HH:MM>`, 24-hour local wall clock, both ends included - the same reading as
+#: `custom:` and `dur:` beside it in the rail. Either end may be empty: `tod:18:00..` is "at or
+#: after 6 PM", `tod:..09:00` is "at or before 9 AM". An end EARLIER than the start runs past
+#: midnight, so `tod:22:00..02:00` is 10 PM through 2 AM. `..` for the same reason as
+#: `custom:` - the times themselves contain colons.
+TOD_PREFIX = 'tod:'
+MINUTES_PER_DAY = 24 * 60
+
+
+def parse_time_of_day(value: str):
+    """`tod:<from>..<to>` -> (from, to) as minutes after local midnight, either possibly None.
+
+    None (whole tuple) when there is no usable range, same reasoning as parse_duration(): an
+    end still being typed is not a registry key and must not 400 the search that produced it.
+    Stricter than parse_duration() in one way: an end that is present but is not a time makes
+    the whole value unusable, rather than leaving the other end to stand alone - `18:00..25:00`
+    read as "after 6 PM" would be a wider search than anyone asked for, and a rule saved with
+    it would record it without anyone noticing.
+    """
+    from .tz_utils import parse_hhmm
+    if not value.startswith(TOD_PREFIX):
+        return None
+    body = value[len(TOD_PREFIX):]
+    if WHEN_RANGE_SEP not in body:
+        return None
+    ends = []
+    for raw in body.split(WHEN_RANGE_SEP, 1):
+        raw = raw.strip()
+        if not raw:
+            ends.append(None)
+            continue
+        try:
+            hour, minute = parse_hhmm(raw)
+        except ValueError:
+            return None
+        ends.append(hour * 60 + minute)
+    lo, hi = ends
+    if lo is None and hi is None:
+        return None
+    return lo, hi
+
+
+# ---------------------------------------------------------------------------
 # Standing options
 # ---------------------------------------------------------------------------
 
@@ -843,6 +920,11 @@ class SearchState:
     #: page's "Find another airing" on a SCHEDULED recording; recording a showing while it is
     #: set also deletes the recording named here (dev/changelog/416).
     replace_rec: int | None = None
+    #: The third action context: `new` ("you came here to make an auto-record rule") or an
+    #: auto-record rule's id ("you came here to change that rule's search"). Same rules as the
+    #: other two - it narrows nothing and is dismissable - and like them it is never part of a
+    #: rule's stored spelling or a saved search's identity (dev/changelog/1189).
+    rule: str | None = None
 
     def __post_init__(self):
         # object.__setattr__ because the value is frozen - the alternative is every caller
@@ -863,9 +945,6 @@ class SearchState:
             if f.key == key:
                 return f
         return None
-
-    def without_dimension(self, key: str) -> 'SearchState':
-        return replace(self, filters=tuple(f for f in self.filters if f.key != key))
 
     # -- serialization ----------------------------------------------------
 
@@ -970,6 +1049,7 @@ class SearchState:
             facets=facets,
             add_to_group=_optional_int(one('add_to_group')),
             replace_rec=_optional_int(one('replace_rec')),
+            rule=rule_context_value(one('rule')),
         )
 
     def to_params(self) -> list:
@@ -1011,7 +1091,160 @@ class SearchState:
             out.append(('add_to_group', str(self.add_to_group)))
         if self.replace_rec is not None:
             out.append(('replace_rec', str(self.replace_rec)))
+        if self.rule is not None:
+            out.append(('rule', self.rule))
         return out
+
+
+#: The `rule` action context's value for "make a new rule".
+RULE_CONTEXT_NEW = 'new'
+
+
+def rule_context_value(value):
+    """`new`, a rule id as a string, or None for anything else. A decoration, so a value that
+    is neither is dropped rather than refused - the same as `_optional_int` does for the
+    other two contexts."""
+    value = (value or '').strip()
+    if value == RULE_CONTEXT_NEW:
+        return value
+    return str(int(value)) if value.isdigit() and int(value) > 0 else None
+
+
+# ---------------------------------------------------------------------------
+# A search in words
+# ---------------------------------------------------------------------------
+
+def _lower_first(text: str) -> str:
+    return text[:1].lower() + text[1:]
+
+
+def _plural_unit(n: int, unit: str) -> str:
+    return f'{n} {unit[:-1] if n == 1 else unit}'
+
+
+def _minutes_text(minutes: int) -> str:
+    if minutes and minutes % 60 == 0:
+        return _plural_unit(minutes // 60, 'hours')
+    return _plural_unit(minutes, 'minutes')
+
+
+def describe_value(key: str, value: str, *, account_names=None, channel_names=None,
+                   tz=None, h24=None) -> str:
+    """One filter value as the search page's chip names it. Pure given `tz` and `h24`; the
+    two name maps answer the dimensions whose values are ids. A value that does not parse is
+    shown as stored rather than guessed at."""
+    from .tz_utils import format_clock, format_local
+    value = str(value)
+    if key == 'when':
+        if value in WHEN_STATIC_LABELS:
+            return WHEN_STATIC_LABELS[value]
+        span = parse_when_next(value)
+        if span is not None:
+            n, unit = value[len(WHEN_NEXT_PREFIX):].split(':')
+            return f'Next {_plural_unit(int(n), unit)}'
+        window = parse_when_custom(value, tz)
+        if window is not None:
+            ends = [format_local(t, 'day_datetime', tz=tz, h24=h24) if t else 'any time'
+                    for t in window]
+            return f'{ends[0]} to {ends[1]}'
+        return value
+    if key == 'dow':
+        return DOW_LABELS.get(value, value)
+    if key == 'tod':
+        ends = parse_time_of_day(value)
+        if ends is None:
+            return value
+        lo, hi = (format_clock(m // 60, m % 60, h24=h24) if m is not None else None
+                  for m in ends)
+        if lo and hi:
+            return lo if lo == hi else f'{lo} to {hi}'
+        return f'{lo} or later' if lo else f'{hi} or earlier'
+    if key == 'duration':
+        bounds = parse_duration(value)
+        if bounds is None:
+            return value
+        lo, hi = bounds
+        if lo is not None and hi is not None:
+            return f'{_minutes_text(lo)} to {_minutes_text(hi)}'
+        return f'Longer than {_minutes_text(lo)}' if lo is not None \
+            else f'Shorter than {_minutes_text(hi)}'
+    if key == 'health':
+        if value == HEALTH_UNTESTED:
+            return HEALTH_UNTESTED_LABEL
+        return health_bands.BAND_NAMES.get(value, value)
+    if key == 'other':
+        return OTHER_LABELS.get(value, value)
+    if key == 'group':
+        return 'Any group' if value == GROUP_ANY else value
+    if key == 'acct':
+        name = (account_names or {}).get(int(value)) if value.isdigit() else None
+        return name or f'#{value}'
+    if key == 'chan':
+        name = (channel_names or {}).get(int(value)) if value.isdigit() else None
+        return name or f'#{value}'
+    return value
+
+
+def describe_state(state, *, account_names=None, channel_names=None, gone=None, tz=None,
+                   h24=None) -> dict:
+    """A search as a person reads it: {'lines': [...], 'summary': str}.
+
+    Each line is {'label', 'neg', 'values': [{'text', 'gone'}]} in the order the search page
+    shows its chips - the text, where it is searched, then each filter in registry order,
+    then each standing option that differs from the grain's default. `gone` is
+    {dimension: set of values} that no longer exist (auto_rules.gone_values), so a page can
+    mark the value that stops a rule from running where it is listed. The summary is one
+    line for a list row. Pure given its arguments - safe in a per-rule loop."""
+    names = {'account_names': account_names, 'channel_names': channel_names,
+             'tz': tz, 'h24': h24}
+    gone = gone or {}
+    lines, summary = [], []
+
+    def line(label, texts, neg=False, key=None):
+        lines.append({'label': label, 'neg': neg, 'values': [
+            {'text': t, 'gone': key is not None and v in gone.get(key, ())}
+            for v, t in texts]})
+
+    if state.q:
+        line('Text', [(state.q, state.q)])
+        if not state.match_all:
+            line('Match', [('any', 'Any of the words')])
+        labels = [FIELD_BY_KEY[k].label for k in state.fields if k in FIELD_BY_KEY]
+        line('Searched in', [(None, ', '.join(labels))])
+        summary.append(state.q if tuple(state.fields) == default_fields_for(state.grain)
+                       else f'{state.q} in {", ".join(labels)}')
+    for dim in DIMENSIONS:
+        f = state.filter_for(dim.key)
+        if f is None:
+            continue
+        for values, neg in ((f.values, False), (f.ex, True)):
+            if not values:
+                continue
+            texts = [(v, describe_value(dim.key, v, **names)) for v in values]
+            line(dim.label, texts, neg=neg, key=dim.key)
+            said = ' or '.join(t for _v, t in texts)
+            if dim.key in ('other', 'when', 'duration'):
+                # Their words are phrases ("In your guide", "Next 7 days") that read
+                # mid-sentence once lowered; a day or a date stays as it is.
+                said = ' or '.join(t if v.startswith(WHEN_CUSTOM_PREFIX) else _lower_first(t)
+                                   for v, t in texts)
+                noun = ''
+            elif dim.key in ('dow', 'tod'):
+                noun = ''
+            else:
+                noun = f'{_lower_first(dim.label)} '
+            summary.append(f'{"not " if neg else ""}{noun}{said}')
+    defaults = default_standing_for(state.grain)
+    for opt in standing_options_for(state.grain):
+        on = opt.key in state.standing
+        if on != (opt.key in defaults):
+            line(opt.label, [(None, 'On' if on else 'Off')])
+            summary.append(f'{_lower_first(opt.label)} {"on" if on else "off"}')
+    if not lines:
+        everything = 'Every upcoming showing' if state.grain == GRAIN_AIRINGS else 'Every channel'
+        line('Search', [(None, everything)])
+        summary.append(everything.lower())
+    return {'lines': lines, 'summary': ', '.join(summary)}
 
 
 def _positive_int(value, default: int) -> int:
@@ -1648,8 +1881,8 @@ def _tag_predicate(tag: Tag, indexed: bool, grain: str = GRAIN_CHANNELS, narrow:
     row's channel rather than about the showing (`tag_hit_predicate`). Both spellings are
     channel-grain expressions; the flag chooses which question, `grain` chooses which shape.
 
-    `tag` is the second exception to "everything except `when` is a channel-grain concept"
-    (DESIGN-channel-search.md §1.1, alongside `when`): on the airings grain this answers "does
+    `tag` is the other exception to "everything except a showing's own time is a channel-grain
+    concept" (DESIGN-channel-search.md §1.1): on the airings grain this answers "does
     THIS showing carry the tag" against the same title/sub_title/description columns
     `app/accounts.py::tags_matching()` checks for the row's own `matched_tags` badge - not
     "does this channel ever air anything matching, at any time," which is what the channel-name
@@ -1882,19 +2115,112 @@ def _duration_predicate(value: str):
     return and_(*clauses)
 
 
+#: `unixepoch()` arrived in SQLite 3.38. The fallback is the same whole seconds - identical on
+#: every one of the 1,348,780 production rows - and works on any SQLite, but costs ~0.5s per
+#: statement over the same scan where `unixepoch()` costs ~0.3s, and the weekday facet runs on
+#: every airings rail request. So the faster one is used wherever it exists, rather than the
+#: oldest SQLite a bare-metal install might carry setting the cost for everyone (Ubuntu 22.04's
+#: is 3.37.2). dev/changelog/1187.
+_HAS_UNIXEPOCH = sqlite3.sqlite_version_info >= (3, 38, 0)
+
+
+def _epoch_seconds(col):
+    if _HAS_UNIXEPOCH:
+        return func.unixepoch(col, type_=db.Integer)
+    return cast(func.strftime('%s', col), db.Integer)
+
+
+def _local_start_seconds(ctx: 'SearchContext'):
+    """A showing's START as whole seconds since 1970-01-01 on the display timezone's clock.
+
+    The stored naive-UTC time plus the UTC offset in force AT THAT INSTANT, taken from
+    `ctx.offset_segments()` - so a showing on either side of a DST change reads its own wall
+    clock, which a single "current offset" could not do. `dow` and `tod` both derive from
+    this one expression, so they cannot disagree about which local day a showing is on.
+
+    Whole seconds and not `julianday()`: a fraction of a day plus a fraction of a day is
+    floating point, and a showing at exactly local midnight can land a hair short of it and be
+    counted on the day before. No index can answer it - it is per row, the same cost class as
+    a wide `when` window, which also has to read every showing's start.
+    """
+    segments = ctx.offset_segments()
+    epoch = _epoch_seconds(EPGEntry.start_time)
+    if len(segments) == 1:
+        return epoch + segments[0][1]
+    return epoch + case(*[(EPGEntry.start_time < until, seconds)
+                          for until, seconds in segments[:-1]],
+                        else_=segments[-1][1])
+
+
+def _local_weekday(ctx: 'SearchContext'):
+    """Python's `weekday()` of a showing's local start, in SQL: 0 is Monday. 1970-01-01, day
+    zero of `_local_start_seconds()`, was a Thursday (3)."""
+    return (_local_start_seconds(ctx) // 86400 + 3) % 7
+
+
+def _dow_predicate(values, ctx: 'SearchContext'):
+    """"Does this SHOWING start on one of these days" - all of a filter's days in ONE test.
+
+    One `IN` rather than one comparison per day ORed together, which is what a dimension's
+    values normally become: the weekday is computed per row, and SQLite would compute it again
+    for every day a row fails to match.
+
+    An unknown day is a 400, not "matches nothing": unlike a `tod:` range there is nothing to
+    be half-way through typing, so a value outside DOW_VALUES is a broken link.
+    """
+    days = []
+    for value in values:
+        if value not in DOW_LABELS:
+            raise SearchStateError(f'unknown Day of week value {value!r} - one of '
+                                   f'{", ".join(DOW_VALUES)}')
+        days.append(DOW_VALUES.index(value))
+    return _local_weekday(ctx).in_(sorted(set(days)))
+
+
+def _tod_predicate(value: str, ctx: 'SearchContext'):
+    """"Does this SHOWING start inside this clock-time range" - both ends included.
+
+    Compared to the minute, so a showing that starts at 9:00:30 PM is a 9:00 PM showing. A
+    range whose end is earlier than its start runs past midnight; it is spelled as the
+    complement of the hours it skips, `NOT BETWEEN`, so the per-row clock time is computed
+    once rather than once per side of an OR.
+
+    A value without the `tod:` prefix is a 400 like any other unknown value; a `tod:` range
+    that does not parse matches nothing, same reasoning as `_when_predicate`.
+    """
+    if not value.startswith(TOD_PREFIX):
+        raise SearchStateError(f'unknown Time of day value {value!r}')
+    parsed = parse_time_of_day(value)
+    if parsed is None:
+        return db.false()
+    lo, hi = parsed
+    minute = (_local_start_seconds(ctx) % 86400) // 60
+    if lo is None:
+        return minute <= hi
+    if hi is None:
+        return minute >= lo
+    if lo <= hi:
+        return minute.between(lo, hi)
+    return not_(minute.between(hi + 1, lo - 1))
+
+
 def _value_predicate(dim_key: str, value: str, ctx: 'SearchContext', grain: str = GRAIN_CHANNELS,
                      narrow: bool = False, hides_past: bool = True):
     """"Does a channel carry this value of this dimension" - one entry per dimension.
 
-    Every dimension here except `when`, `duration` and `tag` is about the CHANNEL, on both
-    grains alike. That is the §1 caveat of DESIGN-channel-search.md, and it is why the airing
-    query can reuse those predicates verbatim: it joins Channel, so a Channel expression
-    composes into it directly. `tag` is the other exception - see `_tag_predicate()`'s
-    docstring. `narrow` and `hides_past` only matter to that branch; every other dimension
-    ignores both.
+    Every dimension here except `when`, `dow`, `tod`, `duration` and `tag` is about the
+    CHANNEL, on both grains alike. That is the §1 caveat of DESIGN-channel-search.md, and it
+    is why the airing query can reuse those predicates verbatim: it joins Channel, so a
+    Channel expression composes into it directly. `tag` is the other exception - see
+    `_tag_predicate()`'s docstring. `narrow` and `hides_past` only matter to that branch;
+    every other dimension ignores both.
     """
     if dim_key == 'when':
         return _when_predicate(value, ctx)
+    if dim_key == 'dow':
+        return _dow_predicate((value,), ctx)
+    if dim_key == 'tod':
+        return _tod_predicate(value, ctx)
     if dim_key == 'duration':
         return _duration_predicate(value)
     if dim_key == 'tag':
@@ -2008,14 +2334,21 @@ def dimension_predicates(state: SearchState, ctx: 'SearchContext', skip: str = '
         if not _in_grain(DIMENSION_BY_KEY[f.key], state.grain):
             continue
         if f.ex:
-            out.append((f.key, not_(or_(*[_value_predicate(f.key, v, ctx, state.grain,
-                                                           tag_narrow, tag_hides_past)
-                                          for v in f.ex]))))
+            out.append((f.key, not_(_any_value_predicate(f.key, f.ex, ctx, state.grain,
+                                                         tag_narrow, tag_hides_past))))
         if f.values:
-            out.append((f.key, or_(*[_value_predicate(f.key, v, ctx, state.grain, tag_narrow,
-                                                      tag_hides_past)
-                                     for v in f.values])))
+            out.append((f.key, _any_value_predicate(f.key, f.values, ctx, state.grain,
+                                                    tag_narrow, tag_hides_past)))
     return out if by_key else [pred for _key, pred in out]
+
+
+def _any_value_predicate(dim_key: str, values, ctx: 'SearchContext', grain: str,
+                         narrow: bool, hides_past: bool):
+    """"Does a row carry any of these values" - the OR of `_value_predicate()` per value,
+    except for `dow`, which answers every day in one `IN` (see `_dow_predicate`)."""
+    if dim_key == 'dow':
+        return _dow_predicate(values, ctx)
+    return or_(*[_value_predicate(dim_key, v, ctx, grain, narrow, hides_past) for v in values])
 
 
 # ---------------------------------------------------------------------------
@@ -2691,6 +3024,9 @@ class SearchContext:
     #: the two cannot be confused into recomputing on every call. See
     #: monitored_channel_ids() for why this one is lazy where the fields above are eager.
     monitored_ids: tuple | None = None
+    #: The display timezone's UTC offsets across the guide, memoized once asked for - see
+    #: offset_segments(). None means "not asked yet".
+    tz_segments: tuple | None = None
 
     @classmethod
     def build(cls, cfg=None) -> 'SearchContext':
@@ -2785,6 +3121,25 @@ class SearchContext:
             from .channel_tester import monitored_channel_ids
             self.monitored_ids = tuple(sorted(monitored_channel_ids()))
         return self.monitored_ids
+
+    def offset_segments(self) -> tuple:
+        """The display timezone's UTC offsets over every start time in `epg_entries`, for
+        `_local_start_seconds()`; memoized for the request.
+
+        The span is read rather than assumed - MIN and MAX of `start_time`, one index seek
+        each - so a guide that keeps years of history (`sync.epg_keep_days: 0`) still reads
+        every showing on its own side of every DST change, and nothing depends on a constant
+        guess at how far back or ahead a guide reaches. Lazy for the same reason as
+        monitored_channel_ids(): only a search that filters or counts by day or time asks.
+        """
+        if self.tz_segments is None:
+            from .tz_utils import get_display_tz, utc_offset_segments
+            lo = db.session.query(func.min(EPGEntry.start_time)).scalar()
+            hi = db.session.query(func.max(EPGEntry.start_time)).scalar()
+            span = [t for t in (lo, hi, self.now) if t is not None]
+            self.tz_segments = utc_offset_segments(self.display_tz or get_display_tz(),
+                                                   min(span), max(span))
+        return self.tz_segments
 
     def probe(self, term_text: str, columns: tuple) -> int:
         """The airing planner's probe, memoized for the request. See airing_probe_count."""
@@ -2971,7 +3326,7 @@ _SPLIT_SAFE_STANDING = frozenset({'showhidden', 'showdup', 'shownotnorm'})
 _DIMENSION_SIDE = {
     'acct': _SIDE_CHANNEL, 'health': _SIDE_CHANNEL, 'cat': _SIDE_CHANNEL,
     'other': _SIDE_CHANNEL, 'group': _SIDE_CHANNEL, 'chan': _SIDE_CHANNEL,
-    'when': _SIDE_EPG, 'duration': _SIDE_EPG,
+    'when': _SIDE_EPG, 'duration': _SIDE_EPG, 'dow': _SIDE_EPG, 'tod': _SIDE_EPG,
 }
 
 
@@ -3676,7 +4031,8 @@ def compute_facets(state: SearchState, ctx: SearchContext,
     that half is what makes a tag mean anything on a generically-named channel.
     """
     wanted = [d for d in visible_dimensions_for(state.grain)
-              if state.facets is None or d.key in state.facets]
+              if (state.facets is None or d.key in state.facets)
+              and not _firstonly_skews(d, state)]
     if text_preds is None:
         text_preds = text_predicates(state, ctx)
 
@@ -3708,11 +4064,50 @@ def compute_facets(state: SearchState, ctx: SearchContext,
     return {d.key: out[d.key] for d in wanted}
 
 
+#: The airing-grain dimensions that describe the SHOWING rather than its channel. `tag` is one
+#: of them on this grain: there a showing answers for itself (see `_tag_predicate`).
+_SHOWING_DIMENSIONS = frozenset({'when', 'dow', 'tod', 'duration', 'tag'})
+
+
+def _firstonly_skews(dim: Dimension, state: SearchState) -> bool:
+    """Would this facet's counts disagree with the list it sits beside? Then it is not counted.
+
+    "One row per channel" keeps each channel's earliest showing OF WHAT THE SEARCH MATCHES. A
+    facet is counted with its own filter removed, so for a dimension about the showing the
+    survivor it counts is each channel's earliest showing on ANY day or at any time - and
+    picking the value re-ranks inside the value. Measured on the production database: the
+    rail read Thursday 0 where filtering to Thursday listed 6,526 showings, and a Time of day
+    range's own row read 97 beside a list of 36,479. A count that disagrees with its list is
+    worse than none, so these are left uncounted (the rail says "not counted") rather than
+    given a second ranking query each. A channel-side dimension is unaffected: removing its
+    filter only adds whole channels, which moves no other channel's earliest showing
+    (dev/changelog/1187).
+    """
+    return (state.grain == GRAIN_AIRINGS and dim.key in _SHOWING_DIMENSIONS
+            and standing_applied(state.standing, 'firstonly'))
+
+
+#: Why `_firstonly_skews()` left a facet uncounted, in a sentence the page shows as it is.
+FIRSTONLY_UNCOUNTED_REASON = (
+    "Not counted while One row per channel is on. It keeps only each channel's earliest "
+    'matching showing, so a count for one day, time, length, When window or tag would not '
+    'match the list you get by picking it.')
+
+
+def uncounted_facets(state: SearchState) -> dict:
+    """`{dimension key: why}` for each facet this state asked for and deliberately did not
+    count - so the rail can say why, once, instead of a column of bare `--` (principle 1).
+    `compute_facets()` leaves exactly these out; both read `_firstonly_skews()`."""
+    return {d.key: FIRSTONLY_UNCOUNTED_REASON for d in visible_dimensions_for(state.grain)
+            if (state.facets is None or d.key in state.facets) and _firstonly_skews(d, state)}
+
+
 #: The dimensions answerable from a row the scan is already reading - a plain expression over
 #: the joined `channels` row, or a FILTER count needing no grouping key of its own - and which
 #: can therefore share a single pass. `group` needs a join from the membership table's small
-#: end and `tag` needs the FTS indexes, so neither can join that pass.
-_SCAN_DIMENSIONS = ('acct', 'cat', 'health', 'other', 'when')
+#: end and `tag` needs the FTS indexes, so neither can join that pass. `dow` is the one
+#: grouping key read off the SHOWING rather than the channel.
+_SCAN_DIMENSIONS = ('acct', 'cat', 'health', 'other', 'when', 'dow')
 
 
 def _combined_facet_scan(dim_keys: tuple, state: SearchState, ctx: SearchContext,
@@ -3753,6 +4148,12 @@ def _combined_facet_scan(dim_keys: tuple, state: SearchState, ctx: SearchContext
         if key in dim_keys:
             group_exprs.append(expr.label(f'facet_{key}'))
             group_keys.append(key)
+    # The weekday is a grouping key rather than seven FILTER riders, and that is measured, not
+    # tidiness: it is computed per row, SQLite does not share one computation between seven
+    # FILTER clauses, and on the production database (1.35M showings) seven riders cost
+    # ~1.9s on top of the scan where one grouping key costs ~0.8s (dev/changelog/1187).
+    # Never on the channel grain, where `dow` is grain-scoped out of `wanted`.
+    weekday = _local_weekday(ctx).label('facet_dow') if airings and 'dow' in dim_keys else None
 
     # Dimensions with a closed vocabulary and no grouping key: one FILTER aggregate per
     # value, over rows this scan is reading anyway. `when` is here rather than in its own
@@ -3779,15 +4180,24 @@ def _combined_facet_scan(dim_keys: tuple, state: SearchState, ctx: SearchContext
 
     if airings and split is not None:
         channel_preds, epg_preds = split
+        # The weekday has to be a key of the TALLY as well as of the outer grouping: the tally
+        # is where a showing is still a showing, and once it is collapsed to one row per
+        # channel there is no start time left to read a day from.
+        tally_keys = [EPGEntry.channel_id.label('cid')]
+        if weekday is not None:
+            tally_keys.append(weekday)
         tally = (db.session.query(
-            EPGEntry.channel_id.label('cid'),
+            *tally_keys,
             func.count(EPGEntry.id).label('n'),
             *[func.count(EPGEntry.id).filter(predicate(v)).label(f'w{i}')
               for _key, values, predicate in epg_riders
               for i, v in enumerate(values)])
             .filter(*epg_preds)
-            .group_by(EPGEntry.channel_id)
+            .group_by(EPGEntry.channel_id, *[k.name for k in tally_keys[1:]])
             .subquery())
+        if weekday is not None:
+            group_exprs.append(tally.c.facet_dow.label('facet_dow'))
+            group_keys.append('dow')
         # SUM over the tally, not COUNT over rows: one tally row already stands for however
         # many showings that channel has. A channel-side rider weights its channel's whole
         # tally, which is the same number the FILTER count produced before the split.
@@ -3805,6 +4215,9 @@ def _combined_facet_scan(dim_keys: tuple, state: SearchState, ctx: SearchContext
         # Registry order, so the unpacking below reads the columns where it expects them.
         riders = channel_riders + epg_riders
     else:
+        if weekday is not None:
+            group_exprs.append(weekday)
+            group_keys.append('dow')
         aggregates = [func.count(counted)]
         for _key, values, predicate in riders:
             aggregates += [func.count(counted).filter(predicate(v)) for v in values]
@@ -3845,9 +4258,25 @@ def _combined_facet_scan(dim_keys: tuple, state: SearchState, ctx: SearchContext
         counts = dict.fromkeys(HEALTH_VALUES, 0)
         counts.update(tallies['health'])
         out['health'] = counts
+    if 'dow' in group_keys:
+        out['dow'] = _weekday_counts(tallies['dow'].items())
     for key, values, _ in riders:
         out[key] = dict(zip(values, rider_totals[key]))
     return out
+
+
+def _weekday_counts(rows) -> dict:
+    """`{day: count}` for every day, from `(weekday index, count)` pairs.
+
+    Seeded at zero for the reason health is, and for one of its own: a day the guide does not
+    reach yet is the answer "nothing there", which is exactly what someone previewing a rule
+    for Sundays needs to see rather than a missing row.
+    """
+    counts = dict.fromkeys(DOW_VALUES, 0)
+    for index, n in rows:
+        if index is not None:
+            counts[DOW_VALUES[int(index)]] += n or 0
+    return counts
 
 
 def _facet_counts(dim: Dimension, state: SearchState, ctx: SearchContext,
@@ -3891,6 +4320,26 @@ def _facet_counts(dim: Dimension, state: SearchState, ctx: SearchContext,
         if not values:
             return {}
         row = over(*[func.count(counted).filter(_duration_predicate(v))
+                     for v in values]).filter(*preds).one()
+        return dict(zip(values, [n or 0 for n in row]))
+
+    if dim.key == 'dow':
+        # Only reached when Day of week is itself filtered, so its own filter has to come off
+        # and it cannot ride the shared scan. Grouped for the same reason it is a grouping key
+        # there (see _combined_facet_scan).
+        weekday = _local_weekday(ctx).label('facet_dow')
+        rows = over(weekday, func.count(counted)).filter(*preds).group_by('facet_dow').all()
+        return _weekday_counts(rows)
+
+    if dim.key == 'tod':
+        # Same shape as `duration`: a range someone typed, so only the current filter's own
+        # value(s) are counted and nothing at all before one is set.
+        current = state.filter_for('tod')
+        values = list(dict.fromkeys(
+            (tuple(current.values) + tuple(current.ex)) if current is not None else ()))
+        if not values:
+            return {}
+        row = over(*[func.count(counted).filter(_tod_predicate(v, ctx))
                      for v in values]).filter(*preds).one()
         return dict(zip(values, [n or 0 for n in row]))
 

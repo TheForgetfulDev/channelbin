@@ -314,94 +314,128 @@ def describe_key(channel) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# What a second copy in a group covers
+# Duplicate sets inside one group
 # ---------------------------------------------------------------------------
 
+COPY_SAME_URL = 'same_url'
 COPY_OTHER_LOGIN = 'other_login'
 COPY_SAME_LOGIN = 'same_login'
 COPY_SAME_ACCOUNT = 'same_account'
 
 
-def provider_copies(channels, new_ids=None) -> list:
-    """The pairs in `channels` that are one channel reached twice through a provider, each
-    with the situation and the sentence a group shows for it (DESIGN-account-providers.md §9).
+def _url_key(url):
+    """The fold's URL rule: a URL with no scheme is malformed, not a duplicate signal."""
+    return url if url and '://' in url else None
 
-    Reads the stored fold: two channels are one channel when they share a
-    `duplicate_cluster_id` and that cluster is keyed on a provider. A pair that also shares
-    its exact stream URL is left out - the URL duplicate warning and banner already say it,
-    and saying it twice in two different ways is noise.
 
-    Each cluster is told against one ANCHOR. With `new_ids` (an add): the anchor is the
-    cluster's first member not being added, and one pair per added member; with no existing
-    member in the cluster, the first added one. Without (the group page): the cluster's
-    first member in list order, and one pair per other member.
+def duplicate_sets(channels, lead_of=None) -> list:
+    """The channels in `channels` that are one stream more than once, as SETS - one per
+    stream - each with the copy a group keeps (its lead) and, for every other copy, which
+    copy it duplicates and how (DESIGN-account-providers.md §9, dev/changelog/1175).
 
-    No query unless two of `channels` share a cluster; three batched queries when they do."""
-    clusters: dict = {}
+    Two channels are one stream when they share an exact stream URL or a stored
+    `duplicate_cluster_id`. A set is the connected whole, so a channel matching one copy by
+    URL and another by provider stream id lands in ONE set: a group page that showed it in
+    two would offer to keep it in one and remove it in the other.
+
+    `lead_of(set_channels)` picks each set's lead and defaults to its first channel. Sets
+    come back in order of their first channel, each set's channels in `channels`' order.
+
+    Returns [{'channels': [...], 'lead': channel, 'provider': name or None,
+              'copies': {channel_id: {'of': channel, 'situation': COPY_*,
+                                      'provider': name or None}}}],
+    `provider` naming the provider when the set holds a copy reached through one.
+
+    No query unless a set holds two different URLs; three batched queries when one does."""
+    parent = {ch.id: ch.id for ch in channels}
+
+    def root(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    first_by_key: dict = {}
     for ch in channels:
-        if ch.duplicate_cluster_id is not None and ch.provider_stream_id is not None:
-            clusters.setdefault(ch.duplicate_cluster_id, []).append(ch)
-    clusters = {k: v for k, v in clusters.items() if len(v) > 1}
-    if not clusters:
+        for key in (('url', _url_key(ch.stream_url)), ('cluster', ch.duplicate_cluster_id)):
+            if key[1] is None:
+                continue
+            first = first_by_key.setdefault(key, ch.id)
+            if first != ch.id:
+                parent[root(ch.id)] = root(first)
+
+    grouped: dict = {}
+    for ch in channels:
+        grouped.setdefault(root(ch.id), []).append(ch)
+    members_list = [m for m in grouped.values() if len(m) > 1]
+    if not members_list:
         return []
 
-    account_ids = {ch.account_id for chs in clusters.values() for ch in chs}
-    accounts = {a.id: a for a in db.session.query(Account.id, Account.name, Account.provider_id)
-                .filter(Account.id.in_(account_ids))}
-    provider_ids = {a.provider_id for a in accounts.values() if a.provider_id is not None}
-    if not provider_ids:
-        return []
-    providers = dict(db.session.query(Provider.id, Provider.name)
-                     .filter(Provider.id.in_(provider_ids)))
-    from .account_links import login_siblings
-    siblings = login_siblings(account_ids)
+    def same_url(a, b):
+        return _url_key(a.stream_url) is not None and a.stream_url == b.stream_url
+
+    def related(a, b):
+        return same_url(a, b) or (a.duplicate_cluster_id is not None
+                                  and a.duplicate_cluster_id == b.duplicate_cluster_id)
+
+    by_cluster = [m for m in members_list if len({ch.stream_url for ch in m}) > 1]
+    accounts, providers, siblings = {}, {}, {}
+    if by_cluster:
+        account_ids = {ch.account_id for m in by_cluster for ch in m}
+        accounts = {a.id: a for a in db.session.query(Account.id, Account.provider_id)
+                    .filter(Account.id.in_(account_ids))}
+        provider_ids = {a.provider_id for a in accounts.values() if a.provider_id is not None}
+        if provider_ids:
+            providers = dict(db.session.query(Provider.id, Provider.name)
+                             .filter(Provider.id.in_(provider_ids)))
+            from .account_links import login_siblings
+            siblings = login_siblings(account_ids)
+
+    def provider_of(ch):
+        acct = accounts.get(ch.account_id)
+        return providers.get(acct.provider_id) if acct is not None else None
 
     out = []
-    for members in clusters.values():
-        anchor_acct = accounts.get(members[0].account_id)
-        if anchor_acct is None or anchor_acct.provider_id is None:
-            continue    # a URL-keyed cluster: the URL warning's business
-        if new_ids is None:
-            anchor, targets, is_member = members[0], members[1:], False
-        else:
-            existing = [ch for ch in members if ch.id not in new_ids]
-            anchor = existing[0] if existing else members[0]
-            targets = [ch for ch in members if ch.id in new_ids and ch is not anchor]
-            is_member = bool(existing)
-        a_acct = accounts[anchor.account_id]
-        provider = providers.get(a_acct.provider_id, '')
-        for ch in targets:
-            if ch.stream_url == anchor.stream_url:
+    for members in members_list:
+        lead = (lead_of(members) if lead_of is not None else None) or members[0]
+        copies = {}
+        set_provider = None
+        for ch in members:
+            if ch is lead:
                 continue
-            t_acct = accounts[ch.account_id]
-            if ch.account_id == anchor.account_id:
-                situation = COPY_SAME_ACCOUNT
-            elif anchor.account_id in siblings.get(ch.account_id, {}):
-                situation = COPY_SAME_LOGIN
+            # Told against the lead when the two match directly; a copy that joined the set
+            # through another copy is told against the first one it does match, because
+            # "a duplicate of the lead" would then be a claim nothing measured.
+            of = lead if related(ch, lead) else next(o for o in members
+                                                     if o is not ch and related(ch, o))
+            if same_url(ch, of):
+                situation, provider = COPY_SAME_URL, None
             else:
-                situation = COPY_OTHER_LOGIN
-            out.append({
-                'channel_id': ch.id, 'channel_name': ch.name, 'account_name': t_acct.name,
-                'other_id': anchor.id, 'other_name': anchor.name,
-                'other_account_name': a_acct.name, 'provider': provider,
-                'situation': situation,
-                'text': _copy_sentence(situation, f'{t_acct.name}: {ch.name}',
-                                       f'{a_acct.name}: {anchor.name}', provider, is_member),
-            })
+                provider = provider_of(ch)
+                if ch.account_id == of.account_id:
+                    situation = COPY_SAME_ACCOUNT
+                elif of.account_id in siblings.get(ch.account_id, {}):
+                    situation = COPY_SAME_LOGIN
+                else:
+                    situation = COPY_OTHER_LOGIN
+                set_provider = set_provider or provider
+            copies[ch.id] = {'of': of, 'situation': situation, 'provider': provider}
+        out.append({'channels': members, 'lead': lead, 'provider': set_provider,
+                    'copies': copies})
     return out
 
 
-def _copy_sentence(situation, this, other, provider, is_member) -> str:
-    """The one spelling of §9's sentences, so the add-time note and the group page's line
-    cannot say two different things. A second copy on a different login is a real backup
-    and is never called redundant."""
-    head = f'{this} is the same channel as {other}' + (', which is already a member' if is_member else '')
+def copy_note(situation, provider) -> str:
+    """How one copy duplicates another, in a few words - the one spelling, for the group
+    page's badge. The situation is kept because it is what tells a real backup (another
+    login) from one that covers nothing (the same login or account)."""
+    if situation == COPY_SAME_URL:
+        return 'Same stream URL.'
+    where = f'Same channel on {provider}' if provider else 'Same channel'
     if situation == COPY_OTHER_LOGIN:
-        return (f'{head}, through a different login on {provider}. It covers a problem with '
-                f'one account, not an outage at {provider}.')
+        return f'{where}, through a different login.'
     if situation == COPY_SAME_LOGIN:
-        return (f'{head}, on the same login, so a problem with that account takes out both. '
-                'If you keep both for their hosts, list the hosts on one account instead.')
+        return f'{where}, on the same login.'
     if situation == COPY_SAME_ACCOUNT:
-        return f'{head}, on the same account, so a problem with that account takes out both.'
+        return f'{where}, on the same account.'
     raise ValueError(f'unknown copy situation {situation!r}')

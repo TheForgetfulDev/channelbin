@@ -54,15 +54,29 @@ function cgPickedHtml(rows, formatFor, known) {
   }).join('')}</div>`;
 }
 
+/* A list of duplicate sets (the `dup_groups` shape) in a few words: how many extra copies
+   they hold - every copy but each set's lead - and why they are duplicates. The one spelling
+   for the add-time note below and the group page's banner (group-detail.js), so the two
+   cannot word the same sets two ways (dev/changelog/1175). */
+function dupSetsSummary(sets) {
+  const list = sets || [];
+  const extras = list.reduce((n, g) => n + (g.channels || []).length - 1, 0);
+  const providers = [...new Set(list.map((g) => g.provider).filter(Boolean))];
+  const across = providers.length ? `across accounts on ${providers.join(', ')}` : '';
+  const byUrl = list.some((g) => !g.provider);
+  const reason = byUrl && across ? `sharing a stream URL or ${across}` : (across || 'sharing a stream URL');
+  return { extras, reason };
+}
+
 /* The soft warnings POST /api/channel-groups and .../members answer with when they refuse
    to proceed unforced (`{success: false, format_mismatch, unverified_format,
-   duplicate_warning, provider_copies}`), rendered as prose plus a Proceed anyway. Declared at file top
+   duplicate_warning, dup_groups}`), rendered as prose plus a Proceed anyway. Declared at file top
    level so the group-create flow draws the identical warnings from the identical response
    rather than paraphrasing them a second time (dev/changelog/831).
 
    `forceId` is the id to put on the Proceed anyway button - the caller owns the click,
    because what "proceed" re-submits is the caller's own request. `dedupId`, when given,
-   adds the "Choose Which to Keep…" button for a caller that can host openDupModal. */
+   adds the "Choose which to keep…" button for a caller that can host openDupModal. */
 function groupWarningsHtml(data, forceId, dedupId) {
   let html = '';
   if (data.format_mismatch) {
@@ -94,20 +108,15 @@ function groupWarningsHtml(data, forceId, dedupId) {
       proves different, you'll be warned to remove it.</span></div>`;
   }
   if (data.duplicate_warning) {
-    html += `<div style="margin-bottom:0.5rem;"><strong style="color:var(--warn);">⚠ Duplicate stream URLs</strong><br>
-      <span style="font-size:12px; color:var(--text-muted);">Some of these channels point at the <em>same</em> stream URL -
-      they add no failover redundancy (if one feed dies, so do the others).</span></div>`;
-  }
-  if (data.provider_copies) {
-    // Not a ⚠: a copy through a different login is a real backup, and the sentence (built
-    // once, server-side, in duplicate_streams.provider_copies) says which kind this is.
-    const lines = data.provider_copies.map((c) => `<li>${escHtml(c.text)}</li>`).join('');
-    html += '<div style="margin-bottom:0.5rem;"><strong>Same channel through a provider</strong>' +
-      `<ul class="small text-muted" style="margin:0.35rem 0 0; padding-left:1.25rem;">${lines}</ul></div>`;
+    // One line for every set, by URL or through a provider (dev/changelog/1175); which copy
+    // duplicates which is what Choose which to keep shows.
+    const { extras, reason } = dupSetsSummary(data.dup_groups);
+    html += `<div style="margin-bottom:0.5rem;"><strong style="color:var(--warn);">⚠ ${extras} duplicate channel${extras === 1 ? '' : 's'}</strong>
+      <span class="small text-muted">${escHtml(reason)}.</span></div>`;
   }
   html += '<div style="display:flex; gap:0.5rem; flex-wrap:wrap;">';
   if (data.duplicate_warning && dedupId) {
-    html += `<button type="button" class="btn btn-sm" id="${dedupId}">Choose Which to Keep…</button>`;
+    html += `<button type="button" class="btn btn-sm" id="${dedupId}">Choose which to keep…</button>`;
   }
   html += `<button type="button" class="btn btn-sm btn-danger-outline" id="${forceId}">Proceed Anyway</button></div>`;
   return html;

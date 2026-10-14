@@ -135,13 +135,11 @@
    went on claiming a member was unmonitored after its Health check switch was turned back
    on, until the page was reloaded. Same contract as every banner above it now. #}
 <div class="notice notice-warn" id="gd-unmonitored-banner" style="display:none;"></div>
-{# Sole updater for this region is renderDupBanner() in group-detail.js, so the
-   load-time and post-refresh states cannot drift apart. #}
+{# Every duplicate set - the same stream URL, or the same channel through a provider - in
+   one banner (DESIGN-account-providers.md §9, dev/changelog/1175). Sole updater is
+   renderDupBanner() in group-detail.js, so the load-time and post-refresh states cannot
+   drift apart. #}
 <div id="gd-dup-banner" class="notice-banner" style="display:none;"></div>
-{# Members that are one channel reached twice through a provider, and what the second copy
-   covers (DESIGN-account-providers.md §9). Sole updater is renderCopiesBanner() in
-   group-detail.js; a same-URL pair is the duplicates banner's and never repeated here. #}
-<div id="gd-copies-banner" class="notice-banner" style="display:none;"></div>
 {# Sole updater for this region is renderMissingBanner() in group-detail.js, same
    contract as the duplicates banner above. #}
 <div id="gd-missing-banner" class="notice-banner" style="display:none;"></div>
@@ -256,7 +254,7 @@
         <button class="menu-item" data-act="clone">Clone</button>
         {% endif %}
         <button class="menu-item" data-act="dedup" id="gd-kebab-dedup"
-                {{ 'disabled' if is_system or not payload.dup_groups else '' }}>Review duplicates&hellip;</button>
+                {{ 'disabled' if is_system or not payload.dup_groups else '' }}>Remove duplicates&hellip;</button>
         <button class="menu-item" data-act="delete-missing" id="gd-kebab-missing"
                 {{ 'disabled' if not payload.missing_channels else '' }}>Delete missing channels&hellip;</button>
         <div class="sep"></div>
@@ -561,6 +559,7 @@ window.GROUP_DETAIL = {
   groupName: {{ group.name | tojson }},
   jobId: {{ job.id }},
   jobName: {{ job.name | tojson }},
+  autoRules: {{ auto_rules | tojson }},
   jobStatus: {{ job.status | tojson }},
   jobRecurring: {{ 'true' if job.recurring else 'false' }},
   hasChannel: {{ 'true' if is_stored else 'false' }},
@@ -578,7 +577,6 @@ window.GROUP_DETAIL = {
   total: {{ payload.total }},
   dupGroups: {{ payload.dup_groups | tojson }},
   missingChannels: {{ payload.missing_channels | tojson }},
-  providerCopies: {{ payload.provider_copies | tojson }},
   missingPreviewUrl: {{ url_for('channels.missing_delete_preview') | tojson }},
   missingDeleteUrl: {{ url_for('channels.missing_delete') | tojson }},
   referenceLabel: {{ payload.reference_label | tojson }},

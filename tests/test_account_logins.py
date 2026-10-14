@@ -38,7 +38,7 @@ from app import connection_limits as connlim  # noqa: E402
 from app.account_blocks import account_limits, add_account_block  # noqa: E402
 from app.alerts import ACCOUNT_LOGIN_REFUSED  # noqa: E402
 from app.database import (  # noqa: E402
-    AccountLogin, Alert, Login, RecordingEvent, RECORDING_LOGIN_REFUSED,
+    Account, AccountLogin, Alert, Login, RecordingEvent, RECORDING_LOGIN_REFUSED,
     REC_STATUS_IN_PROGRESS,
 )
 
@@ -481,7 +481,7 @@ class RouteAndPageTests(_Case):
     def test_the_page_shows_the_hint_with_no_list_and_the_rows_and_the_sum_with_one(self):
         html = self.client.get(f'/accounts/{self.acc_id}').get_data(as_text=True)
         self.assertIn('data-section="logins"', html)
-        self.assertIn("One login, the account's own.", html)
+        self.assertIn('Add another login to run more streams at once', html)
         self.assertEqual(html.count('data-act="login-add"'), 1)
         main, spare = self._list(('main', 'main', 'harbor-secret-one', 1),
                                  ('spare', 'spare', 'harbor-secret-two', 2))
@@ -497,6 +497,62 @@ class RouteAndPageTests(_Case):
         self.assertNotIn('(global)', html.split('Max connections')[1][:400])
         self.assertNotIn('harbor-secret-one', html)
         self.assertNotIn('harbor-secret-two', html)
+
+    def _card(self):
+        html = self.client.get(f'/accounts/{self.acc_id}').get_data(as_text=True)
+        return html.split('data-section="logins"')[1].split('data-section="content"')[0]
+
+    def _own_row(self, card):
+        return card.split('data-login-row="own"')[1].split('</tr>')[0]
+
+    def _set_username(self, username):
+        acc = db.session.get(Account, self.acc_id)
+        acc.username = username
+        acc.password = 'harbor-own-secret'
+        db.session.commit()
+
+    def test_with_nothing_listed_the_accounts_own_login_is_a_row_with_its_seats(self):
+        """dev/changelog/1176: the card used to show only a sentence with no login in it."""
+        self._set_username('main')
+        card = self._card()
+        row = self._own_row(card)
+        self.assertIn("Account's own", row)
+        self.assertIn('<code>main</code>', row)
+        self.assertIn('0 of 1 in use', row)
+        self.assertIn('<span class="cnt">1</span>', card)
+        connlim.try_acquire(self.acc_id, 'recording', 11)
+        row = self._own_row(self._card())
+        self.assertIn('1 of 1 in use', row)
+        self.assertIn('a recording', row)
+        self.assertNotIn('harbor-own-secret', card)
+
+    def test_the_own_row_carries_no_login_id_and_its_menu_edits_the_account(self):
+        row = self._own_row(self._card())
+        self.assertNotIn('data-login-id', row)
+        self.assertIn('data-act="settings"', row)
+        self.assertNotIn('data-act="login-', row)
+
+    def test_an_account_with_no_username_says_the_login_comes_from_the_playlist(self):
+        self.assertIn('from the playlist', self._own_row(self._card()))
+
+    def test_with_logins_listed_the_own_row_says_syncs_only(self):
+        self._set_username('owner')
+        self._list(('main', 'main', 'pw1', 1), ('spare', 'spare', 'pw2', 2))
+        card = self._card()
+        row = self._own_row(card)
+        self.assertIn('<code>owner</code>', row)
+        self.assertIn('Syncs only', row)
+        self.assertNotIn(' in use', row)
+        self.assertIn('<span class="cnt">3</span>', card)
+
+    def test_a_listed_login_with_the_accounts_username_is_not_shown_twice(self):
+        self._set_username('main')
+        self._list(('main', 'main', 'pw1', 1), ('spare', 'spare', 'pw2', 2))
+        card = self._card()
+        self.assertNotIn('data-login-row="own"', card)
+        self.assertEqual(card.count('<code>main</code>'), 1)
+        self.assertIn("The account's own login, also used by syncs", card)
+        self.assertIn('<span class="cnt">2</span>', card)
 
     def test_the_routes_add_edit_move_and_remove_and_never_serve_the_password(self):
         resp = self.client.get(f'/api/accounts/{self.acc_id}/logins')

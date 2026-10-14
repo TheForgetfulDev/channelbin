@@ -148,9 +148,10 @@ def _air_date(rec, tz):
 
     LOCAL, not the stored UTC: a game that airs at 8pm Eastern is stored as the next day in
     UTC, and a library showing tomorrow's date on last night's recording is wrong in the
-    only way a user would ever check. Anchored on program_start_time - the immutable
-    snapshot of when the program aired - and not on when capture happened to begin, which
-    is a different fact and moves with padding, a late start or a retry.
+    only way a user would ever check. Anchored on program_start_time - the snapshot of when
+    the program aired, which only auto-record retrack moves, and then to where the guide
+    moved the program (dev/changelog/1188) - and not on when capture happened to begin,
+    which is a different fact and moves with padding, a late start or a retry.
     """
     if rec.program_start_time is None:
         return None

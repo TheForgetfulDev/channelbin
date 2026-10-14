@@ -49,6 +49,8 @@ import threading
 from collections import namedtuple
 from datetime import datetime, timedelta
 
+from .tz_utils import ago as _ago
+
 log = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -339,21 +341,9 @@ def _probe_db_write():
 # ─────────────────────────────────────────────────────────────────────────────
 # Formatting helpers - plain text only
 # ─────────────────────────────────────────────────────────────────────────────
-# _ago/_ahead are a fourth relative-time register beside the three that
-# tz_utils.relative's docstring names - past-tense, single-unit, rounded prose ("3 hours
-# ago") for a sentence read once, where exact combined units would be noise. Deliberate,
-# not a copy of any of them (dev/changelog/971).
-def _ago(when, now):
-    if when is None:
-        return 'never'
-    hours = (now - when).total_seconds() / 3600
-    if hours < 1:
-        return f'{max(1, int(round(hours * 60)))} minutes ago'
-    if hours < 48:
-        return f'{int(round(hours))} hours ago'
-    return f'{int(round(hours / 24))} days ago'
-
-
+# _ago is tz_utils.ago, the past-tense, single-unit, rounded register ("3 hours ago") for a
+# sentence read once, where exact combined units would be noise (dev/changelog/971; shared
+# with the Rules pages since dev/changelog/1189). _ahead is its future half.
 def _ahead(when, now):
     if when is None:
         return 'nothing'
@@ -442,23 +432,31 @@ def _check_gpu_encoder(ctx):
     if pp.get('video_encoder', 'software') != VIDEO_ENCODER_VAAPI:
         return Result(READY, 'Read recording.post_process.video_encoder',
                       'Not in use - video is re-encoded in software (libx264)')
+    codec = pp.get('video_codec', 'h264') or 'h264'
     if not ctx.tools['ffmpeg'].get('found'):
-        return Result(NOTHING, _gpu_tested(device), 'There is no ffmpeg to test with')
-    return _gpu_trial_result(device, check_gpu_encoder(ctx.tools['ffmpeg']['path'], device))
+        return Result(NOTHING, _gpu_tested(device, codec), 'There is no ffmpeg to test with')
+    return _gpu_trial_result(device, check_gpu_encoder(ctx.tools['ffmpeg']['path'], device,
+                                                       codec))
 
 
-def _gpu_tested(device):
-    return f'Encoded a one-second test clip through {device} with h264_vaapi'
+def _gpu_tested(device, codec='h264'):
+    from .toolchain import VAAPI_ENCODERS
+    return (f'Encoded a one-second test clip through {device} with '
+            f'{VAAPI_ENCODERS.get(codec, "h264_vaapi")}')
 
 
 def _gpu_trial_result(device, trial):
     """The gpu_encoder answer for one trial, whoever ran it."""
-    tested = _gpu_tested(device)
+    codec = getattr(trial, 'codec', 'h264')
+    tested = _gpu_tested(device, codec)
     if trial.ok:
         return Result(READY, tested, f'{device} encoded the test clip'
                       + (' (remembered from an earlier pass)' if trial.cached else ''))
+    fallback = ('every re-encode is H.264 instead - on the GPU if it can encode that, '
+                'otherwise on the CPU (libx264)' if codec == 'hevc'
+                else 'every re-encode runs on the CPU (libx264)')
     return Result(ATTENTION, tested,
-                  f'The test encode failed, so every re-encode runs on the CPU (libx264). '
+                  f'The test encode failed, so {fallback}. '
                   f'ffmpeg reported: {trial.error}. In Docker, pass /dev/dri as a device; '
                   f'if the node is named differently here, set '
                   f'recording.post_process.vaapi_device.')
@@ -1338,6 +1336,7 @@ def record_gpu_trial(device, trial):
 #: The config keys that move the gpu_encoder answer. A save touching one re-answers it at
 #: once rather than leaving the line describing a setting that is no longer in force.
 GPU_CONFIG_KEYS = ('recording.post_process.video_encoder',
+                   'recording.post_process.video_codec',
                    'recording.post_process.vaapi_device', 'ffmpeg.path')
 
 

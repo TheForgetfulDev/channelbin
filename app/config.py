@@ -190,29 +190,57 @@ _DEFAULTS = {
             #   'always'  - re-encode every recording
             #   'never'   - always stream-copy video (fast, but damaged files seek poorly)
             'reencode_mode': 'damaged',
+            #   'damaged' also re-encodes a recording that is not one consistent format: its
+            #   picture size or frame rate changed partway through, or it is bigger than
+            #   max_height below (dev/changelog/1184).
             # Compression tuning for mp4 output. video_crf only applies when a video
             # re-encode actually happens (reencode_mode 'always', or 'damaged' finding
             # damage) - the plain stream-copy path ignores it. audio_bitrate_kbps applies to
             # every mp4 conversion, re-encoded or not, since audio is always re-encoded to
-            # AAC for mp4 output regardless of the video path. It is a total across every
-            # channel: a 5.1 source keeps its six channels at a sixth of it each
-            # (dev/changelog/1163).
+            # AAC for mp4 output regardless of the video path. It is a rate PER STEREO PAIR:
+            # 192 gives stereo 192k and 5.1 576k (dev/changelog/1163, 1184).
             'video_crf': 20,            # libx264 CRF, 0-51, lower = better quality/larger file
-            'audio_bitrate_kbps': 192,  # AAC bitrate for mp4 output
+            'audio_bitrate_kbps': 192,  # AAC bitrate per stereo pair for mp4 output
+            # What every video re-encode produces. Each recording is brought to its OWN
+            # biggest format - the largest picture, the highest frame rate and the widest
+            # audio layout found anywhere in it - never to match other recordings
+            # (dev/changelog/1184). max_height can only lower that: 0 is no cap, else 2160,
+            # 1080 or 720; a recording smaller than the cap is never upscaled past its own
+            # biggest size.
+            'max_height': 0,
+            # 'source' encodes the widest audio layout in the recording; 'stereo' downmixes
+            # every recording to stereo. Applies to every mp4 conversion.
+            'audio_channels': 'source',
+            # Level every recording to -24 LUFS with one measured gain and a peak limiter
+            # (a measuring pass over the audio first). Off: audio keeps its own level.
+            'loudness_normalize': False,
+            # 'h264' or 'hevc'. HEVC is encoded on the GPU only (video_encoder: vaapi) - about
+            # two thirds of the size at the same picture quality (dev/changelog/1183). Without
+            # a working GPU it falls back to H.264, and the recording says so.
+            'video_codec': 'h264',
             # What does the video re-encode: 'software' is libx264 on the CPU; 'vaapi' is
             # the GPU through the render node below (Intel Quick Sync, AMD), which the
             # container reaches only when /dev/dri is passed as a device. A re-encode is
             # the only thing that ever touches the GPU - a stream copy never decodes or
-            # encodes, and decoding stays on the CPU either way. If the GPU is missing or
-            # fails, the conversion completes with libx264 and the recording says so
-            # (dev/changelog/1125).
+            # encodes, and decoding stays on the CPU unless vaapi_decode is on. If the GPU
+            # is missing or fails, the conversion completes with libx264 and the recording
+            # says so (dev/changelog/1125).
             'video_encoder': 'software',
             'vaapi_device': '/dev/dri/renderD128',
             # Constant quantizer for the VAAPI encoder, 0-51. Its own key rather than a
-            # reading of video_crf: CRF is libx264's, and the scales do not line up (qp 20
-            # produced a file 2.3x the size of crf 20 at the same SSIM; 26 matched it,
-            # dev/changelog/1124).
+            # reading of video_crf: CRF is libx264's, and the scales do not line up. 26 is
+            # comparable to crf 20: 91% of the source at VMAF 97.7 against crf 20's 101% at
+            # 96.6 on the same clip (dev/changelog/1183).
             'vaapi_qp': 26,
+            # The same, for HEVC on the GPU: its own key because each codec's qp scale is its
+            # own. 27 measured at 60-67% of the source with VMAF within about a point of
+            # h264_vaapi at 26 (dev/changelog/1183).
+            'vaapi_hevc_qp': 27,
+            # Decode on the GPU too, on recordings the damage scan found clean and that hold
+            # one single format: ~9x less CPU for the same output. Never on a damaged file -
+            # the hardware decoder reports no decode errors, so concealed damage would read
+            # zero - and never on a mixed one, where the hardware decoder dies.
+            'vaapi_decode': False,
             # Conversion resilience (app/postprocessor.py supervised runner). A conversion
             # can be killed mid-flight (ffmpeg crash, a service restart, a stall); these
             # control whether the app restarts it and how it detects a stall.
@@ -843,6 +871,17 @@ _DEFAULTS = {
         # Only dismissed (resolved) alerts are ever removed - active/unread ones are kept
         # regardless of age. 0 = keep forever.
         'keep_days': 90,
+    },
+    # Auto-record rules (app/auto_rules.py, DESIGN-autoschedule.md §9).
+    'auto_scheduling': {
+        # Per-rule cap on SCHEDULED recordings when the rule sets none of its own; a showing
+        # past it is skipped and the rule's cap alert says so. 0 = uncapped.
+        'default_max_upcoming': 10,
+        # The periodic evaluation. Read with a floor of 1: the sweep is the only evaluation
+        # that notices a failed original's replay or the guide draining, so it cannot be off.
+        'sweep_interval_hours': 1,
+        # Ledger rows whose program started longer ago than this are pruned. 0 = keep.
+        'history_keep_days': 90,
     },
     'notifications': {
         'push_rate_limit_seconds': 60,
@@ -2033,16 +2072,3 @@ def resolve_ffprobe_path(configured_path=None, configured_ffmpeg_path=None) -> s
     the provenance it reports), and neither re-derives the other's answer.
     """
     return describe_ffprobe_resolution(configured_path, configured_ffmpeg_path)[0]
-
-
-def parse_tristate_bool(val: str):
-    """Convert a form value ('true'/'false'/'') to Boolean or None - the shared
-    'blank = use global default' convention for nullable Boolean override fields
-    (HealthCheckProfile.screenshots_enabled). Account.url_normalization used this before
-    _m014 turned it into a four-way mode; it now goes through
-    accounts.coerce_normalization_mode instead."""
-    if val == 'true':
-        return True
-    if val == 'false':
-        return False
-    return None

@@ -92,6 +92,29 @@ RECORDING_LOGIN_REFUSED             = 'RECORDING_LOGIN_REFUSED'
 # Logged on the NEW recording when it was created via "Find Another Airing" replace mode
 # (the SCHEDULED recording it replaced is deleted in the same request).
 RECORDING_REPLACED_OTHER            = 'RECORDING_REPLACED_OTHER'
+# An auto-record rule made this recording (app/auto_rules.py, DESIGN-autoschedule.md §6).
+# Written in the same commit as the recording and the rule's ledger row, so it names the
+# rule even after the rule is deleted and Recording.rule_id goes back to NULL. Carries the
+# matched program, the channels it was chosen over and the warnings it was scheduled with.
+RECORDING_RULE_SCHEDULED            = 'RECORDING_RULE_SCHEDULED'
+# The recording's start and stop jobs could not be registered after it was created - twice,
+# since the creating path retries once. The row exists and is SCHEDULED, but nothing will
+# start it until a restart re-registers every future SCHEDULED recording
+# (scheduler.init_scheduler). Its own type: a recording that will not start on its own is a
+# different fact from any of the creation events beside it.
+RECORDING_START_NOT_ARMED           = 'RECORDING_START_NOT_ARMED'
+# The guide moved the program an auto-record rule scheduled this recording for, and the rule
+# moved the recording with it (DESIGN-autoschedule.md §5): the old and new air times and the
+# old and new windows. The only record of where the program was before the move, since the
+# move rewrites program_start_time/program_stop_time.
+RECORDING_RULE_RETRACKED            = 'RECORDING_RULE_RETRACKED'
+# The guide moved this recording's program and the rule did NOT move the recording: the user
+# had edited its times (the rule stops tracking it), it had already started, finished or been
+# cancelled, or another recording already records the program at its new time.
+# Names where the program went and why the recording stayed - a recording capturing a slot
+# its program left must say so on its own page. A different fact from the move above, so a
+# different type.
+RECORDING_RULE_PROGRAM_MOVED        = 'RECORDING_RULE_PROGRAM_MOVED'
 # A SCHEDULED recording's channel_id/url were rewritten by the duplicate-repoint helper
 # (DESIGN-sync-resilience.md §6) - the channel it targeted was missing from the provider
 # feed and the same stream survives on another channel row.
@@ -132,6 +155,12 @@ SEEK_DAMAGE_DETECTED   = 'SEEK_DAMAGE_DETECTED'
 # intact, and reporting a rate change as missing video is the exact defect this pair of
 # events replaced (dev/changelog/866). One flag, one meaning.
 MIXED_FRAME_RATE_DETECTED = 'MIXED_FRAME_RATE_DETECTED'
+# The recording is not one consistent format - its picture size changed partway through, or
+# it is bigger than recording.post_process.max_height - and post_process.reencode_mode=
+# 'damaged' chose to re-encode it to its own biggest format. One event per reason, the reason
+# in extra_data['kind'] (normalize.REASON_*). Like MIXED_FRAME_RATE_DETECTED, never damage
+# (dev/changelog/1184).
+FORMAT_NORMALIZE_NEEDED = 'FORMAT_NORMALIZE_NEEDED'
 # A captured segment was thrown away instead of being joined into the final file, because
 # what came back was the provider's "channel offline" placeholder clip rather than the
 # channel. Detected by ratio, never by byte count: a finite clip drained at 250-500x real
@@ -534,6 +563,28 @@ CANCEL_REASONS = (
     CANCEL_DURING_ANALYSIS, CANCEL_DURING_CONVERSION,
 )
 
+# RuleMatch.action_taken vocabulary - what an auto-record rule decided about one showing
+# (DESIGN-autoschedule.md §2). Every branch over the column names all six.
+RULE_MATCH_SCHEDULED        = 'scheduled'
+RULE_MATCH_SKIPPED_EXISTING = 'skipped_existing'
+RULE_MATCH_SKIPPED_REPEAT   = 'skipped_repeat'
+RULE_MATCH_SKIPPED_CAP      = 'skipped_cap'
+RULE_MATCH_SKIPPED_LIMIT    = 'skipped_limit'
+RULE_MATCH_USER_MODIFIED    = 'user_modified'
+
+RULE_MATCH_ACTIONS = (
+    RULE_MATCH_SCHEDULED, RULE_MATCH_SKIPPED_EXISTING, RULE_MATCH_SKIPPED_REPEAT,
+    RULE_MATCH_SKIPPED_CAP, RULE_MATCH_SKIPPED_LIMIT, RULE_MATCH_USER_MODIFIED,
+)
+# The skip verdicts, every one of which is judged again at the next evaluation: the
+# condition behind each can stop being true (a cancelled winner, a failed original, a freed
+# cap or limit slot). `scheduled` and `user_modified` are not re-judged - see the table in
+# DESIGN-autoschedule.md §2 for the one `scheduled` exception.
+RULE_MATCH_SKIPS = (
+    RULE_MATCH_SKIPPED_EXISTING, RULE_MATCH_SKIPPED_REPEAT,
+    RULE_MATCH_SKIPPED_CAP, RULE_MATCH_SKIPPED_LIMIT,
+)
+
 # ChannelTest.status vocabulary. Shares string values with REC_STATUS_* above and with
 # OD_JOB_STATUS_* below - kept as distinct names because all three are different
 # enumerations that happen to spell some members the same way.
@@ -659,11 +710,19 @@ class Recording(db.Model):
     # adjusts start_time/stop_time (started late, stopped early, aborted) - that drift is
     # exactly what these record. Re-baselined by a user edit of a still-SCHEDULED
     # recording, which is a new plan rather than drift; the RECORDING_EDITED event holds
-    # the previous times (dev/changelog/471).
+    # the previous times (dev/changelog/471). Auto-record retrack re-baselines them the same
+    # way when it moves a still-SCHEDULED rule recording with its program, and its
+    # RECORDING_RULE_RETRACKED event holds the previous times (dev/changelog/1188).
     scheduled_start_time = db.Column(db.DateTime)
     scheduled_stop_time  = db.Column(db.DateTime)
-    program_start_time   = db.Column(db.DateTime)   # naive UTC; immutable EPG program air-time snapshot at creation (None for manual recordings)
-    program_stop_time    = db.Column(db.DateTime)   # naive UTC; immutable EPG program air-time snapshot at creation (None for manual recordings)
+    # naive UTC; the EPG program's own air time, snapshotted at creation (None for manual
+    # recordings). Immutable with ONE exception: auto-record retrack moves both when the guide
+    # moves the program a still-SCHEDULED rule recording was made for, because the listing
+    # lookup, the poster anchor and the sidecar's air date all key on them and would otherwise
+    # point at the slot the program left. RECORDING_RULE_RETRACKED keeps the old pair
+    # (DESIGN-autoschedule.md §5, dev/changelog/1188).
+    program_start_time   = db.Column(db.DateTime)
+    program_stop_time    = db.Column(db.DateTime)
     program_title        = db.Column(db.String(512))  # immutable EPG program title snapshot at creation (None for manual recordings)
     program_sub_title    = db.Column(db.String(512))  # immutable EPG program sub-title snapshot at creation (None for manual recordings)
 
@@ -675,11 +734,12 @@ class Recording(db.Model):
     # irreversible half - a recording whose listing has been pruned can never be described
     # again (dev/changelog/1055).
     #
-    # DELIBERATELY NOT program_*, which is one meaning and keeps it: an immutable snapshot
-    # of what we planned to record. These are "as of record start, falling back to
-    # creation" - written when the recording is scheduled and refreshed again in
-    # recorder.start_recording(), because a recording set up days ahead may be describing a
-    # program the provider has since revised. The two questions stay separately answerable.
+    # DELIBERATELY NOT program_*, which is one meaning and keeps it: a snapshot of what we
+    # planned to record (moved only by retrack, with the program). These are "as of record
+    # start, falling back to creation" - written when the recording is scheduled and
+    # refreshed again in recorder.start_recording(), because a recording set up days ahead
+    # may be describing a program the provider has since revised. The two questions stay
+    # separately answerable.
     metadata_description = db.Column(db.Text)
     metadata_category    = db.Column(db.String(255))
     metadata_rating      = db.Column(db.String(64))
@@ -713,6 +773,11 @@ class Recording(db.Model):
     group_id                 = db.Column(db.Integer, db.ForeignKey('channel_groups.id'), nullable=True)
     # None = no profile; recording uses global config defaults throughout
     profile_id                = db.Column(db.Integer, db.ForeignKey('recording_profiles.id'), nullable=True)
+    # The auto-record rule that made this recording, or None for one a person made. Set to
+    # None on every surviving recording when its rule is deleted; the recording's
+    # RECORDING_RULE_SCHEDULED event still names the rule (DESIGN-autoschedule.md §2).
+    rule_id                   = db.Column(db.Integer, db.ForeignKey('auto_rules.id'),
+                                          nullable=True, index=True)
     channel_health_snapshot  = db.Column(db.Text)           # JSON snapshot of ChannelTest at record-start
     recorded_resolution      = db.Column(db.String(32))     # ffprobe: e.g. "1920x1080"
     recorded_fps             = db.Column(db.Float)          # ffprobe: frames per second
@@ -1162,6 +1227,15 @@ def detach_recording_references(recording_id: int):
     from .alerts import detach_recording_alerts
     from .health_recompute import RECORDING_SOURCE_KINDS
     detach_recording_alerts(recording_id)
+    # A rule's pick keeps what became of it: the ledger reads its fate from here once the
+    # recording is gone, to tell a cancelled pick (a repeat, never recreated) from a failed
+    # one (re-judged) - DESIGN-autoschedule.md §2, §3.4.
+    rec = db.session.get(Recording, recording_id)
+    RuleMatch.query.filter_by(recording_id=recording_id).update(
+        {'recording_id': None,
+         'removed_status': rec.status if rec is not None else None,
+         'removed_cancel_reason': rec.cancel_reason if rec is not None else None},
+        synchronize_session=False)
     ChannelTest.query.filter_by(pre_check_recording_id=recording_id).update(
         {'pre_check_recording_id': None}, synchronize_session=False)
     ChannelHealthExclusion.query.filter(
@@ -1398,6 +1472,11 @@ class Account(db.Model):
     provider_allowed_output_formats = db.Column(db.String(255))  # comma-joined; display only,
     # never a rule for building stream URLs (DESIGN-live-vod.md §4.3).
     provider_stream_origin = db.Column(db.String(255))   # stream_origin_from_server_info() result
+    # The host most of this account's stream URLs are on, as account_links.current_host()
+    # counts it: stamped by every successful sync and moved by a host swap. The Hosts card
+    # reads it instead of counting every URL per page view (dev/changelog/1176). It is
+    # where the STREAMS are, which is often not base_url's host. None = no channels yet.
+    stream_host = db.Column(db.String(255))
     # False = use the global debug.xtream_debug_mode flag only; True = the Fetch & Dump /
     # Sync from dump troubleshooting tools are also enabled for THIS account regardless of
     # the global flag (dev/changelog/547). Meaningless for M3U accounts (no such tooling
@@ -2525,6 +2604,104 @@ class EpgChannelKey(db.Model):
 
     __table_args__ = (
         db.UniqueConstraint('channel_id', 'source_id', name='uq_epg_channel_key'),
+    )
+
+
+class AutoRule(db.Model):
+    """A standing intent to record whatever a saved Programs search finds
+    (app/auto_rules.py, DESIGN-autoschedule.md §2).
+
+    The criteria ARE the search: `search_params` is the query string SearchState.to_params()
+    writes, re-parsed through SearchState.from_params() at every evaluation and never
+    string-edited, so the search page is an exact preview of what the rule matches."""
+    __tablename__ = 'auto_rules'
+    # AUTOINCREMENT for the reason Recording carries it: alert sources name a rule by id
+    # (auto-rule:<id>:...), so a deleted rule's number must never be handed to the next one.
+    __table_args__ = {'sqlite_autoincrement': True}
+
+    id                 = db.Column(db.Integer, primary_key=True)
+    name               = db.Column(db.String(255), nullable=False)
+    # A paused rule is not evaluated; what it already scheduled is untouched.
+    enabled            = db.Column(db.Boolean, nullable=False, default=True)
+    search_params      = db.Column(db.Text, nullable=False)
+    # None = each showing's own default profile, as its Record button picks it.
+    profile_id         = db.Column(db.Integer, db.ForeignKey('recording_profiles.id'))
+    skip_repeats       = db.Column(db.Boolean, nullable=False, default=True)
+    # "At most limit_count within limit_window_hours" - both or neither; None = no limit.
+    limit_count        = db.Column(db.Integer)
+    limit_window_hours = db.Column(db.Integer)
+    # Safety cap override; None = auto_scheduling.default_max_upcoming, 0 = uncapped.
+    max_upcoming       = db.Column(db.Integer)
+    # Bumped by every edit, pause and resume in the same commit. Every write an evaluation
+    # makes for this rule re-reads it and writes nothing if it moved (§4.3). A rename of a
+    # tag or group the search names does NOT bump it - that is the user's own rename
+    # following through, not a change to the rule (§3.2).
+    revision           = db.Column(db.Integer, nullable=False, default=1)
+    created_at         = db.Column(db.DateTime, default=datetime.utcnow)
+    updated_at         = db.Column(db.DateTime, default=datetime.utcnow)
+    last_evaluated_at  = db.Column(db.DateTime)
+    # How far ahead the guide reached for this rule at its last evaluation (§4.5). None
+    # with last_evaluated_at set means the reach it depends on was empty.
+    last_guide_reach   = db.Column(db.DateTime)
+    # Why the last evaluation could not run this rule at all (its search is broken or too
+    # broad, or the check raised); None when it ran. A rule with this set is not running.
+    last_error         = db.Column(db.Text)
+    # The showings the last evaluation that DID run could not schedule or arm, one sentence
+    # each; None when it placed everything. Kept apart from last_error because the two mean
+    # opposite things - the Rules page calls one rule "Not running" and the other a rule
+    # that is running with a problem (dev/changelog/1189).
+    last_problems      = db.Column(db.Text)
+
+
+class RuleMatch(db.Model):
+    """The ledger: one row per showing an auto-record rule judged, and what it decided
+    (DESIGN-autoschedule.md §2). It is what makes evaluation idempotent, makes a
+    cancellation stick, and is the rule's visible history.
+
+    The anchor is the rule plus "the same program" (§3.3) - title_key, episode_key and the
+    program's start - deliberately channel-free, so one row covers a simulcast. Never an
+    EPGEntry id: an import deletes and rewrites listings."""
+    __tablename__ = 'rule_matches'
+
+    id                    = db.Column(db.Integer, primary_key=True)
+    # Deleted explicitly with its rule - foreign keys are off. Indexed by the anchor's
+    # UNIQUE constraint below, which leads with it; a separate index would be its prefix.
+    rule_id               = db.Column(db.Integer, db.ForeignKey('auto_rules.id'),
+                                      nullable=False)
+    channel_id            = db.Column(db.Integer)
+    group_id              = db.Column(db.Integer)
+    title_key             = db.Column(db.String(512), nullable=False)
+    # '' when the listing has none, or when the slot's episode could not be told (§3.3).
+    episode_key           = db.Column(db.String(512), nullable=False, default='')
+    program_title         = db.Column(db.String(512))
+    program_sub_title     = db.Column(db.String(512))
+    program_start_time    = db.Column(db.DateTime, nullable=False)   # naive UTC
+    program_stop_time     = db.Column(db.DateTime, nullable=False)   # naive UTC
+    action_taken          = db.Column(db.String(32), nullable=False)  # RULE_MATCH_*
+    # NULLed by detach_recording_references() when the recording is deleted, which stamps
+    # removed_status/removed_cancel_reason in the same commit: what happened to a pick is a
+    # recorded fact, never inferred from a missing row.
+    recording_id          = db.Column(db.Integer, db.ForeignKey('recordings.id'), index=True)
+    removed_status        = db.Column(db.String(32))
+    removed_cancel_reason = db.Column(db.String(64))
+    # The recording window this rule last wrote. Retrack compares the recording against it:
+    # scheduled_start_time cannot serve, since a user edit re-baselines it (dev/changelog/471).
+    rec_start_time        = db.Column(db.DateTime)
+    rec_stop_time         = db.Column(db.DateTime)
+    # The name this rule last gave the recording. The default name carries the air date, so
+    # retrack renders it again when it moves a recording - but only while the recording still
+    # carries this name: a name the user changed is theirs, whatever happened to the times
+    # (dev/changelog/1188). None on a row written before the column: never renamed.
+    rec_name              = db.Column(db.String(255))
+    # Why, in a sentence: the skip reason, the warnings a recording was scheduled with, or
+    # what retrack did.
+    detail                = db.Column(db.Text)
+    created_at            = db.Column(db.DateTime, default=datetime.utcnow)
+    updated_at            = db.Column(db.DateTime, default=datetime.utcnow)
+
+    __table_args__ = (
+        db.UniqueConstraint('rule_id', 'title_key', 'episode_key', 'program_start_time',
+                            name='uq_rule_matches_anchor'),
     )
 
 

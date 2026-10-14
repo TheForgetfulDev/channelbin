@@ -26,7 +26,7 @@ from ..database import (
     OD_JOB_STATUS_COMPLETED, OD_JOB_STATUS_CANCELLED,
 )
 from ..accounts import (
-    duplicate_groups_within, duplicates_within, lifecycle_states_for_channels,
+    lifecycle_states_for_channels,
     tags_matching, transfer_channel_state,
 )
 from ..channel_groups import (
@@ -57,7 +57,7 @@ from ..db_utils import retry_on_locked
 from ..logo_cache import resolve_logo_url
 from ..tz_utils import local_input_value, format_local
 from .channel_tests import (
-    _serialize_dup_groups, _latest_tests_by_channel, _test_status_label,
+    _serialize_dup_groups, _suggested_keep_id, _latest_tests_by_channel, _test_status_label,
     _channel_result_row, _tally, get_job_result_counts, get_job_result_counts_batch,
     tally_tests, _recur_label, _fmt_et,
     ANY_JOB,
@@ -120,6 +120,17 @@ def _format_warnings(existing_members, new_channels):
     return mismatch, unverified_new
 
 
+def _serialize_dup_sets(sets, cfg, **kwargs):
+    """`duplicate_streams.duplicate_sets()` for the Remove Duplicates modal: the shared
+    serializer, with each set's lead as the pre-selected keeper and the provider named for
+    the banner and the add-time note to put into words."""
+    out = _serialize_dup_groups([s['channels'] for s in sets], cfg, **kwargs)
+    for s, o in zip(sets, out):
+        o['suggested_keep_id'] = s['lead'].id
+        o['provider'] = s['provider']
+    return out
+
+
 def _pending_warnings(existing_members, new_channels, force, ask_format):
     """Every pre-commit warning create_group and add_members raise, in one place so the
     two cannot give different answers to the same question - which they did until
@@ -138,31 +149,27 @@ def _pending_warnings(existing_members, new_channels, force, ask_format):
 
     Warnings, all soft:
       - format_mismatch / unverified_format: _format_warnings() above
-      - duplicate_warning + dup_groups: exact-stream_url duplicate sets within the would-be
-        member list that involve at least one NEW channel (sets purely among existing
-        members were already accepted when they were added)
-      - provider_copies: one note per NEW channel that is the same channel as another
-        would-be member through a provider, naming what that second copy covers
-        (duplicate_streams.provider_copies(), DESIGN-account-providers.md §9). Same gate
-        as the URL warning, for the same reason: both are sentences about failover.
+      - duplicate_warning + dup_groups: duplicate sets within the would-be member list -
+        the same stream URL, or the same channel through a provider
+        (duplicate_streams.duplicate_sets(), DESIGN-account-providers.md §9) - that
+        involve at least one NEW channel (sets purely among existing members were already
+        accepted when they were added). Each set's pre-selected keeper is an existing
+        member when it has one.
     """
     if force or not ask_format:
         return {}
     warnings = {}
 
     new_ids = {ch.id for ch in new_channels}
+    # Existing members first, so each set's default lead - its first channel - is one the
+    # group already holds.
     dup_sets = [
-        g for g in duplicate_groups_within(list(existing_members) + list(new_channels))
-        if any(ch.id in new_ids for ch in g)
+        s for s in duplicate_streams.duplicate_sets(list(existing_members) + list(new_channels))
+        if any(ch.id in new_ids for ch in s['channels'])
     ]
     if dup_sets:
         warnings['duplicate_warning'] = True
-        warnings['dup_groups'] = _serialize_dup_groups(dup_sets, load_config())
-
-    copies = duplicate_streams.provider_copies(list(existing_members) + list(new_channels),
-                                               new_ids=new_ids)
-    if copies:
-        warnings['provider_copies'] = copies
+        warnings['dup_groups'] = _serialize_dup_sets(dup_sets, load_config())
 
     mismatch, unverified_new = _format_warnings(existing_members, new_channels)
     if mismatch:
@@ -194,13 +201,9 @@ def _grouping_events(channels, group, event_type, detail):
 # ── Groups tab list + per-group detail ──────────────────────────────────────
 
 def _group_view(g, latest_by_channel=None, monitored_ids=None, memberships=None,
-                streak_threshold=DEFAULT_FAILING_STREAK_THRESHOLD, cfg=None):
-    """Ranked members + dup info + format state for one group - shared by the group
+                streak_threshold=DEFAULT_FAILING_STREAK_THRESHOLD):
+    """Ranked members + format state for one group - shared by the group
     list, the detail page, and the Browse "In Your Guide → Groups" sub-list.
-
-    `cfg`: pass the request's already-loaded config on any call site inside a per-group
-    loop (the caller of _channel_group_row is one) - never left to fall back to
-    load_config() there, per CLAUDE.md's no-hidden-I/O-in-per-row-loops rule.
 
     `latest_by_channel`: pass a pre-batched channel_id→latest-ChannelTest map spanning
     (at least) this group's members to avoid a per-group query on list views - it's sliced
@@ -223,7 +226,6 @@ def _group_view(g, latest_by_channel=None, monitored_ids=None, memberships=None,
     `format_override` (the pin filtered every one of them, so a recording bypasses it),
     and the empty-group `no_active_match` flag (a reference exists but no *active* member
     reports it - e.g. a locked format no live feed conforms to)."""
-    cfg = cfg if cfg is not None else load_config()
     memberships = list(memberships) if memberships is not None else list(g.memberships)
     unranked = member_channels(memberships)
     member_ids = [ch.id for ch in unranked]
@@ -276,8 +278,6 @@ def _group_view(g, latest_by_channel=None, monitored_ids=None, memberships=None,
         'participating_ids': participating_ids,
         'latest_by_channel': latest_by_channel,
         'scores': {ch.id: effective_score(ch) for ch in members},
-        'dup_titles': duplicates_within(members),
-        'dup_groups': _serialize_dup_groups(duplicate_groups_within(members), cfg),
         'reference_key': ref_key,
         'reference_label': format_label(ref_key),
         'locked': g.locked_format_key is not None,
@@ -475,7 +475,7 @@ def _last_activity(members, checks):
 def _channel_group_row(g, latest_by_channel, monitored_ids, system_job, system_channel_ids,
                        memberships, job, blocking_recordings, tests_by_job,
                        streak_threshold=DEFAULT_FAILING_STREAK_THRESHOLD, ct_cfg=None, cfg=None):
-    view = _group_view(g, latest_by_channel, monitored_ids, memberships, streak_threshold, cfg)
+    view = _group_view(g, latest_by_channel, monitored_ids, memberships, streak_threshold)
     off_tooltip = (_RECORDING_OFF_TOOLTIP if participation_is_recording(g, memberships)
                    else _TEST_DISABLED_TOOLTIP)
     members = [
@@ -724,6 +724,11 @@ def groups_page():
                                                  tests_by_job, streak_threshold, ct_cfg, cfg))
     # The pinned system group stays first under every sort (DESIGN.md §14.1).
     group_rows.sort(key=lambda r: (not r['system'], r['name'].lower()))
+    # Auto-record rules that name each group, for the delete confirm: deleting the group
+    # stops them (DESIGN-autoschedule.md §3.2). One query for the page.
+    rules_by_group = _rules_by_group()
+    for row in group_rows:
+        row['auto_rules'] = rules_by_group.get(row['name'], [])
 
     # For the Create-group modal's client-side name-conflict check and its Manual format
     # mode. Both are per-request, never per row. No health-check profile payload and no
@@ -735,6 +740,16 @@ def groups_page():
         group_names=[g.name for g in groups],
         resolution_options=resolution_options, fps_options=fps_options,
         hc_sig=hc_sig)
+
+
+def _rules_by_group() -> dict:
+    """{group name: [auto-record rule names]} for every rule whose search names the group."""
+    from ..auto_rules import rules_naming
+    out = {}
+    for rule_name, groups in rules_naming('group'):
+        for name in groups:
+            out.setdefault(name, []).append(rule_name)
+    return out
 
 
 def _group_tests(job_names, recordings):
@@ -1117,13 +1132,37 @@ def group_detail_rows(group, job):
     format_source_by_channel = _format_source_map(latest, latest_any) if stored else {}
 
     monitored_ids = monitored_channel_ids() if stored else set()
-    dup_titles = duplicates_within(channels)
     # Computed once here and handed to _serialize_dup_groups (never recomputed there) -
     # the row table and the missing-channels notice below both need it too.
     lifecycle_by_channel = lifecycle_states_for_channels(channels, cfg)
-    dup_groups = _serialize_dup_groups(duplicate_groups_within(channels), cfg, latest,
-                                       sitting_out_ids,
-                                       lifecycle_by_channel=lifecycle_by_channel)
+
+    # One duplicate set per stream, by URL or through a provider, read from the stored fold
+    # (DESIGN-account-providers.md §9, dev/changelog/1175). A stored group's lead is the
+    # copy it would record from first: `channels` is already in rank_members() order, and a
+    # recording-enabled copy beats one the group does not record from, so removing the
+    # extras never changes which feed the group records. The automatic group has no
+    # switches, and keeps the guide-first keeper rule the health check pages use.
+    if stored:
+        def lead_of(chs):
+            return next((ch for ch in chs if ch.id in recording_ids), chs[0])
+    else:
+        def lead_of(chs):
+            keep_id = _suggested_keep_id(chs, lifecycle_by_channel)
+            return next(ch for ch in chs if ch.id == keep_id)
+    dup_sets = duplicate_streams.duplicate_sets(channels, lead_of)
+    dup_groups = _serialize_dup_sets(dup_sets, cfg, tests_by_channel=latest,
+                                     disabled_ids=sitting_out_ids,
+                                     lifecycle_by_channel=lifecycle_by_channel)
+    dup_role, dup_titles = {}, {}
+    for dset in dup_sets:
+        dup_role[dset['lead'].id] = 'lead'
+        for cid, copy in dset['copies'].items():
+            of = copy['of']
+            dup_role[cid] = 'extra'
+            dup_titles[cid] = (
+                f'Duplicate of {of.name} ({of.account.name})'
+                f'{", the lead copy" if of is dset["lead"] else ""}.\n'
+                + duplicate_streams.copy_note(copy['situation'], copy['provider']))
 
     test_duration = resolve_health_check_settings(
         cfg.get('channel_testing', {}), job.profile if job else None)['test_duration_seconds']
@@ -1164,6 +1203,8 @@ def group_detail_rows(group, job):
             # 4K variant, a backup - and the two tags that live in program titles rather than
             # channel names correctly offer nothing here.
             tags=tags_matching(all_tags, ch.name),
+            # 'lead', 'extra' or None - the Duplicates filter's value and the badge's gate.
+            dup_role=dup_role.get(ch.id),
         )
         for ch in channels
     ]
@@ -1177,7 +1218,6 @@ def group_detail_rows(group, job):
     return {
         'rows': rows,
         'dup_groups': dup_groups,
-        'provider_copies': duplicate_streams.provider_copies(channels),
         'missing_channels': missing_channels,
         'counts': counts,
         'total': len(channel_ids),
@@ -1555,6 +1595,8 @@ def build_group_detail_context(group):
         'group': group,
         'job': job,
         'is_stored': is_stored,
+        # For the delete confirm - deleting the group stops these (DESIGN-autoschedule.md §3.2).
+        'auto_rules': _rules_by_group().get(group.name, []),
         'records': records,
         'bar_state': _action_bar_state(job, tester_status),
         'is_system': group.is_system,
@@ -1870,9 +1912,14 @@ def remove_members(group_id):
                 if keeper is None or keeper.id == ch.id or keeper.id not in by_channel:
                     transfer_skipped.append({'channel_id': ch.id,
                                              'reason': 'No valid channel to keep in this group'})
-                elif keeper.stream_url != ch.stream_url:
+                # The same stream either way the group page's sets are built: one URL, or
+                # one stored duplicate cluster (a copy through a provider,
+                # dev/changelog/1175).
+                elif not (keeper.stream_url == ch.stream_url
+                          or (keeper.duplicate_cluster_id is not None
+                              and keeper.duplicate_cluster_id == ch.duplicate_cluster_id)):
                     transfer_skipped.append({'channel_id': ch.id,
-                                             'reason': 'Kept channel no longer shares the stream URL'})
+                                             'reason': 'Kept channel is no longer the same stream'})
                 else:
                     touched_group_ids.update(mm.group_id for mm in ch.group_memberships)
                     transfer_channel_state(ch, keeper, cfg)
@@ -2155,6 +2202,10 @@ def rename_group(group_id):
         return jsonify({'error': 'Group name is required (max 255 characters)'}), 400
     if group_name_conflict(name, exclude_group_id=group_id):
         return jsonify({'error': f'A group named "{name}" already exists'}), 409
+    # An auto-record rule naming the group follows the rename in this same commit
+    # (DESIGN-autoschedule.md §3.2).
+    from ..auto_rules import rename_in_rules
+    rename_in_rules('group', group.name, name)
     group.name = name
     db.session.commit()
     return jsonify({'success': True, 'group_name': group.name})

@@ -59,6 +59,13 @@ ACCOUNT_HOST_ROLLED = 'ACCOUNT_HOST_ROLLED'
 #: at most once per refusal cooldown window per login (dev/changelog/1169).
 ACCOUNT_LOGIN_REFUSED = 'ACCOUNT_LOGIN_REFUSED'
 
+# The three ways an auto-record rule cannot do its job (app/auto_rules.py,
+# DESIGN-autoschedule.md §6). A rule scheduling something is never an alert - its history and
+# the recording's own event show that (dev/changelog/923).
+AUTO_RULE_CAPPED = 'AUTO_RULE_CAPPED'
+AUTO_RULE_BROKEN = 'AUTO_RULE_BROKEN'
+AUTO_RULES_GUIDE_SHORT = 'AUTO_RULES_GUIDE_SHORT'
+
 #: Types nothing raises any more, kept in ALERT_TYPES below purely so the rows already in
 #: the database still render with a label.
 #:
@@ -342,6 +349,22 @@ ALERT_TYPES = {
     GPU_ENCODER_UNAVAILABLE: {
         'label': 'GPU Encoder Not Working (conversion falling back to software)',
         'severity': 'WARN', 'self_clearing': True},
+    # A rule left at least one upcoming showing unscheduled because it already has as many
+    # scheduled recordings as its cap allows: a recording that will not be made. Cleared by
+    # an evaluation that leaves none, or by the rule being paused, edited or deleted.
+    AUTO_RULE_CAPPED: {
+        'label': 'Auto-record Rule At Its Cap', 'severity': 'WARN', 'self_clearing': True},
+    # A rule that cannot run at all - it names something that is gone, its search no longer
+    # parses, or it matches more than the engine will read. Never a rule quietly matching
+    # nothing. Cleared by an evaluation that runs it, or by a pause, edit or delete.
+    AUTO_RULE_BROKEN: {
+        'label': 'Auto-record Rule Cannot Run', 'severity': 'WARN', 'self_clearing': True},
+    # An enabled rule exists and the guide, or a source a rule's matches depend on, reaches
+    # less than a day ahead: every rule would match nothing from it and look fine. One row,
+    # recomputed by every evaluation.
+    AUTO_RULES_GUIDE_SHORT: {
+        'label': 'Guide Too Short For Auto-record Rules', 'severity': 'WARN',
+        'self_clearing': True},
 }
 
 #: The self_clearing types above, as a set. Derived rather than written out a second time:

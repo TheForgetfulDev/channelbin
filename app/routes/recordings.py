@@ -110,7 +110,9 @@ def _apply_edit_and_reschedule(recording_id, name, url, start_utc, stop_utc,
     caller is SCHEDULED-only, so nothing has run yet and there is no drift to
     record - an edit is a new plan, not a deviation from the old one. The
     RECORDING_EDITED event below is what preserves the previous times
-    (dev/changelog/471).
+    (dev/changelog/471). Auto-record retrack is the one other writer that
+    re-baselines them, on the same reasoning (app/auto_rules.py::_move_recording,
+    dev/changelog/1188).
     """
     @retry_on_locked()
     def _apply_edit_and_commit():
@@ -148,7 +150,14 @@ def _apply_edit_and_reschedule(recording_id, name, url, start_utc, stop_utc,
         return old_start != start_utc
 
     start_moved = _apply_edit_and_commit()
+    _rearm_replanned(recording_id, start_utc, stop_utc, start_moved)
 
+
+def _rearm_replanned(recording_id, start_utc, stop_utc, start_moved):
+    """The tail of every re-plan of a SCHEDULED recording, after its commit - a user edit
+    above, and auto-record retrack moving a recording with its program
+    (app/auto_rules.py::_rearm_moved). The old jobs come off before the new ones go on, so
+    a re-arm that fails part way never leaves a start armed at the old time."""
     unschedule_recording(recording_id)
     from flask import current_app
     schedule_recording(current_app._get_current_object(), recording_id, start_utc, stop_utc)
@@ -841,7 +850,7 @@ def _row_times(rec, now, tz):
     "Today" stay true without re-rendering every row (dev/changelog/1144). One function, so
     the page and the tick cannot word the same row two ways. Reads only the row's own
     columns and the in-memory join/analysis registries: no query, no disk."""
-    from ..tz_utils import UTC
+    from ..tz_utils import day_label
     from ..concatenator import concat_progress
     from ..postprocessor import analysis_progress
     # A dict lookup under a lock, no I/O - safe in this per-row builder, which is what the
@@ -853,20 +862,7 @@ def _row_times(rec, now, tz):
     analysis_prog = (analysis_progress(rec.id)
                      if rec.status == REC_STATUS_ANALYZING else None)
 
-    start_l = rec.start_time.replace(tzinfo=UTC).astimezone(tz)
-    today = now.replace(tzinfo=UTC).astimezone(tz).date()
-    d = start_l.date()
-    delta_days = (d - today).days
-    if delta_days == 0:
-        day = 'Today'
-    elif delta_days == 1:
-        day = 'Tomorrow'
-    elif delta_days == -1:
-        day = 'Yesterday'
-    elif d.year == today.year:
-        day = start_l.strftime('%a %b ') + str(start_l.day)
-    else:
-        day = start_l.strftime('%b ') + f'{start_l.day}, {start_l.year}'
+    day = day_label(rec.start_time, now, tz)
 
     # relative line - explicit per section/status, anchored on the honest time
     if rec.status in (REC_STATUS_IN_PROGRESS, REC_STATUS_PAUSED, REC_STATUS_RETRYING):
@@ -1242,6 +1238,22 @@ def recording_times():
     return jsonify({'success': True, 'rows': rows})
 
 
+def read_section_pref(key):
+    """The stored {order, hidden} a page's Customize sections saved under `key`, or None.
+
+    It is user-written JSON, so anything that is not the expected shape falls back to the
+    page's defaults rather than being allowed to 500 a page it only arranges. util.js
+    initSectionLayout() reads the answer."""
+    from ..database import UserPref
+    pref = db.session.get(UserPref, key)
+    try:
+        stored = json.loads(pref.value) if pref and pref.value else None
+    except ValueError:
+        log.warning('Stored section layout %r is not valid JSON - using the defaults.', key)
+        return None
+    return stored if isinstance(stored, dict) and isinstance(stored.get('order'), list) else None
+
+
 @recordings_bp.route('/api/user-prefs/<key>', methods=['GET', 'POST'])
 def user_prefs(key):
     """Server-side per-user UI config (DESIGN.md 3.11: column setup follows the
@@ -1451,9 +1463,20 @@ def recording_detail(recording_id):
                      if rec.status == REC_STATUS_ANALYZING else None)
     conversion_max_attempts = load_config()['recording']['post_process'].get('max_restart_attempts', 3)
     max_dead_stream_retry_attempts = load_config()['watchdog'].get('dead_stream_max_retry_attempts', 10)
+    # The auto-record rule that made this recording, if it still owns it. Deleting a rule
+    # clears rule_id on every recording it keeps, so a set rule_id always names a live rule
+    # (dev/changelog/1186); the RECORDING_RULE_SCHEDULED event keeps the name either way.
+    made_by_rule = None
+    if rec.rule_id is not None:
+        from ..database import AutoRule
+        rule_name = db.session.query(AutoRule.name).filter(AutoRule.id == rec.rule_id).scalar()
+        if rule_name is not None:
+            made_by_rule = {'name': rule_name,
+                            'url': url_for('auto_rules.rule_page', rule_id=rec.rule_id)}
 
     return render_template(
         'recording_detail.html', rec=rec, is_active=is_active,
+        made_by_rule=made_by_rule,
         ts_source_available=ts_source_available,
         segment_files_on_disk=segment_files_on_disk,
         recover_act=recover_act,
@@ -2009,14 +2032,23 @@ def delete_recording(recording_id):
 
 
 def _create_scheduled_recording(cfg, *, name, url, start_utc, stop_utc, channel_id,
-                                 group_id, profile_id, entry=None, blocks=None):
+                                 group_id, profile_id, entry=None, blocks=None, link=None):
     """Create one SCHEDULED recording and arm its start - the one create path, shared by
-    the record modal (new_recording_json) and the bulk schedule (bulk_schedule_json), so
-    the two cannot drift in what a new recording carries (dev/changelog/1157).
+    the record modal (new_recording_json), the bulk schedule (bulk_schedule_json) and
+    auto-record rules (app/auto_rules.py), so none of them can drift in what a new
+    recording carries (dev/changelog/1157).
 
     `entry` is the EPGEntry being recorded, or None for a manual URL. `blocks` is the
     account-block picker's {account_id: slots}, or None to set none. A start already in
-    the past is moved to now and logged as such. Returns the committed Recording.
+    the past is moved to now and logged as such.
+
+    `link(recording)` runs inside the create's own commit unit, after the row is flushed
+    (so it has an id) and before the commit, so whatever it writes lands with the recording
+    or not at all - a rule's provenance, its event and its ledger row (DESIGN-autoschedule.md
+    §4.4). It returns False to call the create off, and then nothing is written and this
+    returns None.
+
+    Returns the committed Recording, or None when `link` called it off.
     """
     now_utc = datetime.utcnow()
     created_after_start = start_utc < now_utc
@@ -2024,8 +2056,10 @@ def _create_scheduled_recording(cfg, *, name, url, start_utc, stop_utc, channel_
         start_utc = now_utc
 
     # Snapshot the EPG program's own air time (independent of what the user
-    # typed into the form) at creation, so it stays immutable even if the
-    # program later shifts in the guide or the recording is edited/adjusted.
+    # typed into the form) at creation, so it stays put even if the program
+    # later shifts in the guide or the recording is edited/adjusted. The one
+    # exception is an auto-record rule's recording, which retrack moves with
+    # its program while nobody has edited its times (dev/changelog/1188).
     # A plain read - not wrapped in retry_on_locked - whose result is captured
     # into plain local variables (not an ORM object reference) before the
     # write closure below, so nothing here is affected by a rollback+retry
@@ -2074,10 +2108,17 @@ def _create_scheduled_recording(cfg, *, name, url, start_utc, stop_utc, channel_
             profile_id=profile_id,
         )
         db.session.add(r)
+        if link is not None:
+            db.session.flush()
+            if not link(r):
+                db.session.rollback()
+                return None
         db.session.commit()
         return r
 
     rec = _create_recording_and_commit()
+    if rec is None:
+        return None
 
     # Saved before the start is armed, so a recording created after its own start time
     # never opens a stream on an account it was asked to keep off.
@@ -2265,14 +2306,22 @@ def _parse_bulk_schedule(data):
     return items, profile, None
 
 
-def _plan_bulk_schedule(items, profile_choice, cfg):
+def _plan_bulk_schedule(items, profile_choice, cfg, skip_overlapped=True):
     """One plan per requested showing, in request order - what would be created and what
     each one would be warned about.
 
     Every showing is judged against the recordings already stored AND the showings before
     it in this same request (`pending`), so eight overlapping picks on a one-connection
     account are seven hard warnings rather than eight clean rows. Each plan carries its
-    private create arguments under '_create'; bulk_plan_payload() strips them."""
+    private create arguments under '_create'; bulk_plan_payload() strips them.
+
+    `skip_overlapped=False` turns off the "Already scheduled / Already being recorded" skip,
+    for auto-record rules only (DESIGN-autoschedule.md §4.3). That state comes from
+    match_recording(), an overlap test against a recording's PADDED window, so a padded
+    neighbor on the same channel reads as this program and a race starting inside the
+    previous race's post-padding would never be recorded. A rule judges identity and full
+    coverage itself, and a partial overlap is a handoff, exactly as for a person's
+    recordings. The person-facing bulk scheduler keeps the skip."""
     from types import SimpleNamespace
     from ..accounts import default_profile_for, filename_naming_for
     from ..channel_search_rows import (
@@ -2286,7 +2335,7 @@ def _plan_bulk_schedule(items, profile_choice, cfg):
     entries = {e.id: e for e in EPGEntry.query.filter(EPGEntry.id.in_(epg_ids)).all()}
     channels = {c.id: c for c in Channel.query.filter(
         Channel.id.in_({e.channel_id for e in entries.values()})).all()}
-    recordings = _recordings_for(list(entries.values()), channels)
+    recordings = _recordings_for(list(entries.values()), channels) if skip_overlapped else {}
     group_ids = {g for _, g in items if g is not None}
     groups = ({g.id: g for g in ChannelGroup.query.filter(ChannelGroup.id.in_(group_ids)).all()}
               if group_ids else {})

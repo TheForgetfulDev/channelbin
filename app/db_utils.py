@@ -328,6 +328,15 @@ def warn_when_pool_is_exhausted(engine, label, ceiling):
         )
 
 
+def chunked(items, size):
+    """Consecutive slices of `items` (a sequence) of at most `size`. The one spelling of
+    the loop every bulk `IN (...)`, `executemany` and batched commit needs: SQLite caps the
+    bound variables in one statement, so a statement over a list of ids is issued per
+    slice (dev/changelog/1179)."""
+    for i in range(0, len(items), size):
+        yield items[i:i + size]
+
+
 def _is_locked_error(exc: OperationalError) -> bool:
     msg = str(exc).lower()
     return 'database is locked' in msg or 'database table is locked' in msg

@@ -1,6 +1,7 @@
 """The facet rail's deferred join: it is equivalent, it is gated, and "Any group" works.
 
-`_combined_facet_scan()` answers account / category / health / Other / When in one pass. On
+`_combined_facet_scan()` answers account / category / health / Other / When / Day of week in
+one pass. On
 the airing grain that pass used to join `channels` to every surviving showing and then
 aggregate; since dev/changelog/729 it applies the epg-side predicates first, tallies showings
 per channel, and joins only that tally. Same counts, far fewer joined rows.
@@ -27,7 +28,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app import channel_search as cs  # noqa: E402
 from app.channel_search import (  # noqa: E402
-    GRAIN_AIRINGS, GRAIN_CHANNELS, SearchState, compute_facets, split_predicates,
+    DOW_VALUES, GRAIN_AIRINGS, GRAIN_CHANNELS, SearchState, compute_facets, split_predicates,
 )
 from tests.support.search import only_hiding  # noqa: E402
 from tests.test_airing_search import TEST_CFG, _AiringTestCase  # noqa: E402
@@ -85,6 +86,14 @@ class SplitEquivalenceTests(_SplitTestCase):
                 filters=(cs.DimensionFilter('when', ('today',), ()),)),
             'when excluded': self.rail_state(
                 filters=(cs.DimensionFilter('when', (), ('today',)),)),
+            # dev/changelog/1187: the weekday is a key of the tally itself, so a day or time
+            # filter on the epg side has to leave both shapes agreeing about every day.
+            'day filter': self.rail_state(
+                filters=(cs.DimensionFilter('dow', DOW_VALUES[:3], ()),)),
+            'time filter': self.rail_state(
+                filters=(cs.DimensionFilter('tod', ('tod:00:00..12:00',), ()),)),
+            'time excluded': self.rail_state(
+                filters=(cs.DimensionFilter('tod', (), ('tod:22:00..02:00',)),)),
             'firstonly on': self.rail_state(
                 standing=only_hiding('showpast', 'firstonly')),
             'grpdedup off': self.rail_state(
@@ -103,6 +112,8 @@ class SplitEquivalenceTests(_SplitTestCase):
         self.assertTrue(sum(split['acct'].values()))
         self.assertTrue(sum(split['when'].values()))
         self.assertTrue(sum(split['cat'].values()))
+        self.assertEqual(sum(split['dow'].values()), sum(split['acct'].values()),
+                         'every counted showing starts on exactly one day')
 
 
 class SplitGateTests(_SplitTestCase):
@@ -129,7 +140,8 @@ class SplitGateTests(_SplitTestCase):
                 self.assertIsNone(split_predicates(state, self.context(), []))
 
     def test_an_epg_side_filter_still_splits(self):
-        for key, value in (('when', 'today'), ('duration', 'min:10')):
+        for key, value in (('when', 'today'), ('duration', 'min:10'), ('dow', 'sat'),
+                           ('tod', 'tod:18:00..23:59')):
             with self.subTest(key):
                 state = self.rail_state(
                     filters=(cs.DimensionFilter(key, (value,), ()),))

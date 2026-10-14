@@ -21,7 +21,12 @@
     const fallout = used.length
       ? `<p style="font-size:.9rem" class="text-muted">Its name is still referenced by ` +
         `${escHtml(used.join(', '))}. Nothing there is deleted or rewritten - those ` +
-        'references simply stop resolving, so check them afterwards.</p>'
+        'references simply stop resolving, so check them afterwards.' +
+        // A rule whose search names a gone tag stops running rather than quietly matching
+        // something else (DESIGN-autoschedule.md §3.2) - the one reference that stops work.
+        (used.some((u) => u.endsWith('auto-record rule'))
+          ? ' An auto-record rule that names it stops scheduling until its search is changed.'
+          : '') + '</p>'
       : '';
     buildModal({
       title: 'Delete tag',

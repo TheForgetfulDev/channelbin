@@ -11,6 +11,8 @@ import os
 import subprocess
 from typing import Optional
 
+from .probe import HDR_TRANSFERS
+
 log = logging.getLogger(__name__)
 
 DEFAULT_SEEK_SECONDS = 5.0
@@ -30,13 +32,6 @@ KEYFRAME_ONLY_ARGS = ['-skip_frame', 'nokey']
 # How much further back the widened retry reaches when seeking from the end of a file.
 WIDEN_SSEOF_SECONDS = 9.0
 
-# A PQ or HLG transfer function is the only thing that proves a source is HDR. Frame width
-# is not, and the 3840-wide trigger this replaced is what made the whole HDR path wrong: it
-# pulled 4K *SDR* into the tonemap chain, where a bar pattern whose mean luma is 102 came
-# back at 66 - every 4K SDR screenshot darkened by a third, and pushed that much closer to
-# the tester's uniformity check. A source that declares no transfer at all is left alone for
-# the same reason, in the other direction: unknown is not a proven HDR (dev/changelog/915).
-HDR_TRANSFERS = ('smpte2084', 'arib-std-b67')
 
 # What ffprobe prints for a colorspace field a stream never stated. It emits the key either
 # way, so these read as absent rather than as a value.
