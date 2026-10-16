@@ -46,7 +46,7 @@ from app.channel_search import MAX_PAGE_SIZE, SearchContext, search  # noqa: E40
 from app.channel_search_rows import REC_DEAD, REC_DONE, REC_LIVE  # noqa: E402
 from app.database import (  # noqa: E402
     Alert, AutoRule, CANCEL_BEFORE_START, CANCEL_DURING_ANALYSIS, CANCEL_DURING_CAPTURE,
-    CANCEL_DURING_CONVERSION, CANCEL_GROUP_CHANGE, RECORDING_RULE_SCHEDULED,
+    CANCEL_DURING_CONVERSION, CANCEL_GROUP_CHANGE, RECORDING_RULE_RELEASED, RECORDING_RULE_SCHEDULED,
     REC_STATUS_ABORTED, REC_STATUS_COMPLETED, REC_STATUS_FAILED, REC_STATUS_IN_PROGRESS,
     REC_STATUS_SCHEDULED, RULE_MATCH_ACTIONS, RULE_MATCH_SCHEDULED, RULE_MATCH_SKIPPED_CAP,
     RULE_MATCH_SKIPPED_EXISTING, RULE_MATCH_SKIPPED_LIMIT, RULE_MATCH_SKIPPED_REPEAT,
@@ -1123,22 +1123,26 @@ class EditTests(_LedgerCase):
     def future_skip_ids(self):
         return [self.row_at(self.rid, s).id for s in self.starts[1:]]
 
-    def test_an_edit_keeps_what_it_scheduled_and_judges_its_skips_afresh(self):
+    def test_an_edit_judges_its_skips_afresh_and_leaves_its_other_rows(self):
         """§8 through the edit route: the revision moves, the rule's skip rows for future
-        showings go, `scheduled` and `user_modified` rows and a past skip stay, and the
-        recording it already made is kept though the edited search no longer matches it."""
+        showings go, `user_modified` rows and a past skip stay. The recording the edited
+        search no longer matches is kept only because the person said so - as an ordinary
+        recording, which is why the cap no longer holds the other two back
+        (dev/changelog/1203)."""
         skip_ids = self.future_skip_ids()
-        resp = self.t.client.put(f'/api/auto-rules/{self.rid}', json={
-            'search': 'grain=airings&q=Cup+Race+-Alpha', 'max_upcoming': 0})
+        body = {'search': 'grain=airings&q=Cup+Race+-Alpha', 'max_upcoming': 0}
+        asked = self.t.client.put(f'/api/auto-rules/{self.rid}', json=body)
+        self.assertEqual(asked.status_code, 409, asked.get_json())
+        body['unmatched'] = {'action': 'keep',
+                             'ids': [r['id'] for r in asked.get_json()['unmatched']]}
+        resp = self.t.client.put(f'/api/auto-rules/{self.rid}', json=body)
         self.assertEqual(resp.status_code, 200, resp.get_json())
         db.session.expire_all()
 
         rule = db.session.get(AutoRule, self.rid)
         self.assertEqual(rule.revision, 2)
         kept = db.session.get(Recording, self.kept.id)
-        self.assertEqual((kept.status, kept.rule_id), (REC_STATUS_SCHEDULED, self.rid))
-        self.assertEqual(self.row_at(self.rid, self.starts[0]).action_taken,
-                         RULE_MATCH_SCHEDULED)
+        self.assertEqual((kept.status, kept.rule_id), (REC_STATUS_SCHEDULED, None))
         self.assertEqual(db.session.get(RuleMatch, self.past_row).action_taken,
                          RULE_MATCH_SKIPPED_REPEAT)
         self.assertEqual(db.session.get(RuleMatch, self.user_row).action_taken,
@@ -1149,6 +1153,7 @@ class EditTests(_LedgerCase):
         self.assertEqual([self.row_at(self.rid, s).action_taken for s in self.starts[1:]],
                          [RULE_MATCH_SCHEDULED, RULE_MATCH_SCHEDULED])
         self.assertEqual(resp.get_json()['evaluation']['scheduled'], 2)
+        self.assertEqual((resp.get_json()['cancelled'], resp.get_json()['kept']), (0, 1))
         self.assertEqual(self.cap_alerts(self.rid), [])
 
     def test_the_revision_and_the_skip_deletion_land_in_one_commit(self):
@@ -1193,6 +1198,227 @@ class EditTests(_LedgerCase):
         db.session.expire_all()
         self.assertEqual(db.session.get(AutoRule, self.rid).revision, 3)
         self.assertEqual(len(self.recordings(self.rid)), 2)
+
+
+# ---------------------------------------------------------------------------
+# §8 - a changed search and the recordings it no longer matches
+# ---------------------------------------------------------------------------
+
+class SearchEditTests(_LedgerCase):
+    """A changed search is not saved until the person says what becomes of the SCHEDULED
+    recordings it no longer matches (dev/docs/BUGS.md 2026-10-15 @ 10:54:26 PM,
+    dev/changelog/1203). The reported case is the setup: a cap of 1, the first race scheduled,
+    the next two held back by the cap, then the search narrowed to exclude the first."""
+
+    NARROWED = 'grain=airings&q=Cup+Race+-Alpha'
+
+    def setUp(self):
+        super().setUp()
+        self.ch = self.channel('Speed')
+        self.starts = [_future(hours=4 + 4 * i) for i in range(3)]
+        for start, episode in zip(self.starts, ('Alpha', 'Bravo', 'Charlie')):
+            self.showing(self.ch, 'Cup Race', start, sub_title=episode)
+        db.session.commit()
+        self.rid = self.rule('grain=airings&q=Cup+Race', max_upcoming=1)
+        self.evaluate(self.rid)
+        (self.first,) = self.recordings(self.rid)
+        self.assertEqual(self.first.program_start_time, self.starts[0])
+        self.search = db.session.get(AutoRule, self.rid).search_params
+
+    def put(self, body):
+        resp = self.t.client.put(f'/api/auto-rules/{self.rid}', json=body)
+        db.session.expire_all()
+        return resp
+
+    def ask(self, search=NARROWED):
+        resp = self.put({'search': search})
+        self.assertEqual(resp.status_code, 409, resp.get_json())
+        return resp.get_json()
+
+    def rows_for_first(self):
+        """The rule's ledger rows for the first race. By program, never by row id: SQLite
+        hands a deleted row's id to the next row inserted."""
+        return [m for m in self.ledger(self.rid) if m.program_start_time == self.starts[0]]
+
+    def assert_unchanged(self):
+        self.assertEqual(db.session.get(AutoRule, self.rid).revision, 1)
+        self.assertEqual(db.session.get(AutoRule, self.rid).search_params, self.search)
+        rec = db.session.get(Recording, self.first.id)
+        self.assertEqual((rec.status, rec.rule_id), (REC_STATUS_SCHEDULED, self.rid))
+        self.assertEqual([self.row_at(self.rid, s).action_taken for s in self.starts],
+                         [RULE_MATCH_SCHEDULED, RULE_MATCH_SKIPPED_CAP, RULE_MATCH_SKIPPED_CAP])
+        self.unscheduled.assert_not_called()
+
+    def test_a_narrowed_search_names_what_it_leaves_behind_and_saves_nothing(self):
+        body = self.ask()
+        self.assertEqual([r['id'] for r in body['unmatched']], [self.first.id])
+        self.assertEqual(body['unmatched'][0]['name'], self.first.name)
+        self.assertTrue(body['unmatched'][0]['when'])
+        self.assertIs(body['determined'], True)
+        self.assertIn('no longer matches 1 recording', body['error'])
+        self.assert_unchanged()
+
+    def test_cancelling_frees_the_cap_for_the_showing_the_new_search_matches(self):
+        """The reported case: the stale recording is cancelled - deleted, unscheduled after the
+        commit - its ledger row goes, and the same save's check schedules the next race."""
+        ids = [r['id'] for r in self.ask()['unmatched']]
+        resp = self.put({'search': self.NARROWED,
+                         'unmatched': {'action': 'cancel', 'ids': ids}})
+        self.assertEqual(resp.status_code, 200, resp.get_json())
+        self.assertEqual((resp.get_json()['cancelled'], resp.get_json()['kept']), (1, 0))
+        self.assertIsNone(db.session.get(Recording, self.first.id))
+        self.unscheduled.assert_called_once_with(self.first.id)
+        self.assertEqual(self.rows_for_first(), [])
+        self.assertEqual(resp.get_json()['evaluation']['scheduled'], 1)
+        (now_scheduled,) = self.recordings(self.rid)
+        self.assertEqual(now_scheduled.program_start_time, self.starts[1])
+        self.assertEqual(self.row_at(self.rid, self.starts[1]).action_taken,
+                         RULE_MATCH_SCHEDULED)
+
+    def test_keeping_makes_it_an_ordinary_recording_that_no_longer_holds_the_cap(self):
+        ids = [r['id'] for r in self.ask()['unmatched']]
+        resp = self.put({'search': self.NARROWED, 'unmatched': {'action': 'keep', 'ids': ids}})
+        self.assertEqual(resp.status_code, 200, resp.get_json())
+        self.assertEqual((resp.get_json()['cancelled'], resp.get_json()['kept']), (0, 1))
+        rec = db.session.get(Recording, self.first.id)
+        self.assertEqual((rec.status, rec.rule_id), (REC_STATUS_SCHEDULED, None))
+        event_row = RecordingEvent.query.filter_by(
+            recording_id=rec.id, event_type=RECORDING_RULE_RELEASED).one()
+        self.assertIn('Test rule', event_row.detail)
+        self.assertIn('no longer counts toward the rule\'s cap', event_row.detail)
+        self.assertEqual(self.rows_for_first(), [])
+        self.unscheduled.assert_not_called()
+        self.assertEqual([r.program_start_time for r in self.recordings(self.rid)],
+                         [self.starts[1]])
+
+    def test_the_settle_and_the_edit_land_in_one_commit(self):
+        """No committed state shows the new search with the stale pick still the rule's, or
+        the pick gone under the old search."""
+        ids = [r['id'] for r in self.ask()['unmatched']]
+        seen = []
+
+        def _after_commit(_session):
+            con = sqlite3.connect(self.t.db_path)
+            try:
+                seen.append((
+                    con.execute('SELECT revision FROM auto_rules WHERE id = ?',
+                                (self.rid,)).fetchone()[0],
+                    con.execute('SELECT COUNT(*) FROM recordings WHERE id = ?',
+                                (self.first.id,)).fetchone()[0],
+                    con.execute('SELECT COUNT(*) FROM rule_matches WHERE rule_id = ? '
+                                'AND program_sub_title = ?', (self.rid, 'Alpha')).fetchone()[0]))
+            finally:
+                con.close()
+
+        event.listen(Session, 'after_commit', _after_commit)
+        try:
+            self.put({'search': self.NARROWED, 'unmatched': {'action': 'cancel', 'ids': ids}})
+        finally:
+            event.remove(Session, 'after_commit', _after_commit)
+        self.assertIn((2, 0, 0), seen)
+        self.assertEqual([s for s in seen if s[0] == 2 and s[1:] != (0, 0)], [],
+                         f'a commit showed the edit without its settle: {seen}')
+        self.assertEqual([s for s in seen if s[0] == 1 and s[1:] != (1, 1)], [],
+                         f'a commit showed the settle without the edit: {seen}')
+
+    def test_a_cancelled_pick_does_not_make_its_replay_a_repeat(self):
+        """The ledger row goes with the cancelled pick. Left behind, a cancelled pick sticks
+        (§3.4, R6) - and the replay the new search does match would be skipped as a repeat
+        of a recording nobody turned down."""
+        other = self.channel('Replay')
+        replay = _future(hours=30)
+        self.showing(other, 'Cup Race', replay, sub_title='Alpha')
+        db.session.commit()
+        narrowed = f'grain=airings&q=Cup+Race&x.chan={self.ch.id}'
+        ids = [r['id'] for r in self.ask(narrowed)['unmatched']]
+        self.assertEqual(ids, [self.first.id])
+        resp = self.put({'search': narrowed, 'unmatched': {'action': 'cancel', 'ids': ids},
+                         'max_upcoming': 0})
+        self.assertEqual(resp.status_code, 200, resp.get_json())
+        self.assertEqual(self.row_at(self.rid, replay).action_taken, RULE_MATCH_SCHEDULED)
+
+    def test_an_unchanged_search_asks_nothing(self):
+        """A rule's pick that its search no longer matches (here: the guide re-titled it) is
+        not the edit's doing, so a save that leaves the search alone does not ask."""
+        stale_at = _future(hours=50)
+        self.showing(self.ch, 'Storm Watch', stale_at)
+        rec = self.library('Storm Watch', stale_at, status=REC_STATUS_SCHEDULED,
+                           channel=self.ch, rule_id=self.rid)
+        self.ledger_row(self.rid, RULE_MATCH_SCHEDULED, 'Storm Watch', stale_at, recording=rec,
+                        channel=self.ch)
+        for body in ({'name': 'Renamed'}, {'search': 'grain=airings&q=Cup+Race'},
+                     {'search': 'q=Cup+Race&grain=airings&sort=title'}):
+            with self.subTest(body=body):
+                self.assertEqual(self.put(body).status_code, 200)
+        self.assertEqual(db.session.get(Recording, rec.id).rule_id, self.rid)
+        self.assertEqual(sorted(r['id'] for r in self.ask()['unmatched']),
+                         sorted([self.first.id, rec.id]),
+                         'a changed search names every pick it does not match')
+
+    def test_a_program_the_guide_moved_or_dropped_is_retracks_not_the_edits(self):
+        """A pick whose program is no longer listed at its time is left to retrack (§5): the
+        edit did not cause it, so it is not offered."""
+        gone_at = _future(hours=60)
+        rec = self.library('Cup Race', gone_at, status=REC_STATUS_SCHEDULED,
+                           sub_title='Delta', channel=self.ch, rule_id=self.rid)
+        self.ledger_row(self.rid, RULE_MATCH_SCHEDULED, 'Cup Race', gone_at, sub_title='Delta',
+                        recording=rec, channel=self.ch)
+        self.assertEqual([r['id'] for r in self.ask()['unmatched']], [self.first.id])
+
+    def test_doubt_keeps_a_recording_off_the_list(self):
+        """An episode-less listing of the title at the pick's time may be the same program,
+        and doubt never offers a recording for cancelling - read as retrack's still-present
+        check reads it."""
+        at = _future(hours=70)
+        self.showing(self.ch, 'Cup Race', at)
+        rec = self.library('Cup Race', at, status=REC_STATUS_SCHEDULED, sub_title='Echo',
+                           channel=self.ch, rule_id=self.rid)
+        self.ledger_row(self.rid, RULE_MATCH_SCHEDULED, 'Cup Race', at, sub_title='Echo',
+                        recording=rec, channel=self.ch)
+        self.assertEqual([r['id'] for r in self.ask()['unmatched']], [self.first.id])
+
+    def test_what_the_person_edited_and_what_already_started_are_never_offered(self):
+        at = _future(hours=80)
+        self.showing(self.ch, 'Cup Race', at, sub_title='Yankee')
+        edited = self.library('Cup Race', at, status=REC_STATUS_SCHEDULED, sub_title='Yankee',
+                              channel=self.ch, rule_id=self.rid,
+                              start=at + timedelta(hours=1), stop=at + timedelta(hours=2))
+        self.ledger_row(self.rid, RULE_MATCH_USER_MODIFIED, 'Cup Race', at, sub_title='Yankee',
+                        recording=edited, channel=self.ch)
+        narrowed = 'grain=airings&q=Cup+Race+-Alpha+-Yankee'
+        self.assertEqual([r['id'] for r in self.ask(narrowed)['unmatched']], [self.first.id])
+        self.set_status(self.first.id, REC_STATUS_IN_PROGRESS)
+        resp = self.put({'search': narrowed})
+        self.assertEqual(resp.status_code, 200, resp.get_json())
+        self.assertEqual(db.session.get(Recording, self.first.id).rule_id, self.rid)
+        self.assertEqual(db.session.get(Recording, edited.id).rule_id, self.rid)
+
+    def test_a_search_it_cannot_compare_asks_about_every_scheduled_pick(self):
+        """Too broad to read: every upcoming SCHEDULED pick is named, and the answer says it
+        could not tell and why - asking about all of them, never about none."""
+        with patch('app.auto_rules._search_rule', return_value=(None, {})):
+            body = self.ask()
+        self.assertIs(body['determined'], False)
+        self.assertIn('more than 1,000 upcoming showings', body['reason'])
+        self.assertEqual([r['id'] for r in body['unmatched']], [self.first.id])
+        self.assert_unchanged()
+
+    def test_the_answer_must_name_every_recording_and_be_well_formed(self):
+        """An answer that misses a recording named now is asked again; a malformed one is
+        refused. Neither saves anything."""
+        for answer in ({'action': 'cancel', 'ids': []}, {'action': 'keep', 'ids': [999999]}):
+            with self.subTest(answer=answer):
+                resp = self.put({'search': self.NARROWED, 'unmatched': answer})
+                self.assertEqual(resp.status_code, 409, resp.get_json())
+                self.assertEqual([r['id'] for r in resp.get_json()['unmatched']],
+                                 [self.first.id])
+        for answer in ('cancel', {'action': 'delete', 'ids': [self.first.id]},
+                       {'action': 'cancel'}, {'action': 'cancel', 'ids': [str(self.first.id)]},
+                       {'action': 'cancel', 'ids': [True]}):
+            with self.subTest(answer=answer):
+                resp = self.put({'search': self.NARROWED, 'unmatched': answer})
+                self.assertEqual(resp.status_code, 400, resp.get_json())
+        self.assert_unchanged()
 
 
 # ---------------------------------------------------------------------------

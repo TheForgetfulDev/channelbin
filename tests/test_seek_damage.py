@@ -220,29 +220,33 @@ class MixedCaptureRateTests(unittest.TestCase):
         self.assertLess(metrics['missing_seconds'], DAMAGE_MIN_MISSING_SECONDS, summary)
 
     def test_the_fixture_really_does_reproduce_the_defect(self):
-        """Without the segment rates, the same file still measures DAMAGED with zero gaps -
-        proof the fixture exercises the defect rather than a file that was always clean."""
-        damaged, metrics, _summary = assess_seek_damage(self.mixed, joined_segments=2)
-        self.assertTrue(damaged, 'fixture does not reproduce the header-rate defect')
+        """Divided by the header rate, as the deficit was before dev/changelog/866, this file
+        is short by more than the damage threshold with zero gaps - proof the fixture
+        exercises the rate defect rather than a file that was always clean."""
+        _damaged, metrics, _summary = assess_seek_damage(self.mixed, joined_segments=2)
+        header_deficit = metrics['span_seconds'] - metrics['packet_count'] / metrics['fps']
+        self.assertGreater(header_deficit, DAMAGE_MIN_MISSING_SECONDS)
         self.assertEqual(metrics['gap_count'], 0,
                          'fixture has real gaps, so it cannot isolate the rate defect')
 
-    def test_deficit_is_divided_by_the_weighted_rate(self):
-        """The number has to be explainable: 20s at 60 and 20s at 15 weight to 37.5fps, and
-        deficit_fps says so while fps keeps reporting what the header claimed."""
-        _damaged, metrics, _summary = assess_seek_damage(
-            self.mixed, joined_segments=2, segment_rates=self.rates)
-        self.assertAlmostEqual(metrics['deficit_fps'], 37.5, places=3)
-        self.assertAlmostEqual(metrics['fps'], 60.0, places=3)
-        self.assertEqual(metrics['capture_fps_values'], [15.0, 60.0])
+    def test_a_rate_change_is_not_missing_video_even_with_no_segment_rates(self):
+        """dev/docs/BUGS.md 2026-10-15 @ 06:12:01 PM. Every packet carries its own duration,
+        so the deficit no longer needs the segments' probes to get a rate change right -
+        which matters because those probes read only each segment's opening."""
+        damaged, metrics, summary = assess_seek_damage(self.mixed, joined_segments=2)
+        self.assertFalse(damaged, summary)
+        self.assertEqual(metrics['deficit_basis'], 'frame_durations')
+        self.assertLess(metrics['deficit_seconds'], 0.5, summary)
 
-    def test_summary_says_the_rate_changed_and_names_both_rates(self):
-        """A corrected number nobody can reproduce is no better than a wrong one."""
-        _damaged, _metrics, summary = assess_seek_damage(
+    def test_the_summary_does_not_explain_the_number_with_an_unused_rate(self):
+        """With every packet dated, the blended rate divided nothing, so the summary names
+        the rate change without claiming the deficit was measured against 37.5 fps."""
+        _damaged, metrics, summary = assess_seek_damage(
             self.mixed, joined_segments=2, segment_rates=self.rates)
+        self.assertEqual(metrics['capture_fps_values'], [15.0, 60.0])
         self.assertIn('Capture frame rate changed mid-recording', summary)
-        self.assertIn('15, 60 fps', summary)
-        self.assertIn('37.50 fps', summary)
+        self.assertIn('counted at its own duration', summary)
+        self.assertNotIn('37.50 fps', summary)
 
     # ── the true positives that must survive the fix ──────────────────────────
     def test_real_damage_in_a_mixed_rate_file_is_still_damage(self):
@@ -272,6 +276,144 @@ class MixedCaptureRateTests(unittest.TestCase):
         unknown = assess_seek_damage(self.mixed, joined_segments=2,
                                      segment_rates=[(20.0, None), (20.0, None)])
         self.assertEqual(without[1]['deficit_seconds'], unknown[1]['deficit_seconds'])
+
+
+
+class _FedPackets:
+    """Stands in for ffprobe: scan_video_timeline reads these packet lines instead of a
+    file's, so a case no encoder will produce - a packet with no duration - is testable."""
+
+    def __init__(self, lines, header_fps):
+        self.lines, self.header_fps = lines, header_fps
+
+    def __enter__(self):
+        from unittest import mock
+        fd, self.path = tempfile.mkstemp(suffix='.ts')
+        os.close(fd)
+
+        def _feed(cmd, on_line, **_kw):
+            for line in self.lines:
+                on_line(line)
+            return 0
+
+        self._patches = [mock.patch('app.probe._stream_probe_lines', _feed),
+                         mock.patch('app.probe._nominal_fps', lambda _p: self.header_fps)]
+        for patch in self._patches:
+            patch.start()
+        return self.path
+
+    def __exit__(self, *exc):
+        for patch in self._patches:
+            patch.stop()
+        os.unlink(self.path)
+
+
+def _packets(start, seconds, fps, dated=True):
+    """CSV packet lines as the scan's ffprobe prints them: pts, dts, duration."""
+    step = 1.0 / fps
+    return [f'{start + i * step:.6f},{start + i * step:.6f},'
+            + (f'{step:.6f}' if dated else 'N/A') for i in range(int(seconds * fps))]
+
+
+class UndatedPacketFallbackTests(unittest.TestCase):
+    """A packet with no duration is counted at a rate: the segments' blended rate when they
+    disagree (dev/changelog/866), the header's otherwise. Pinned here because no fixture an
+    encoder produces leaves a packet undated (dev/changelog/1201)."""
+
+    LINES = _packets(0.0, 20, 60, dated=False) + _packets(20.0, 20, 15, dated=False)
+    RATES = [(20.0, 60.0), (20.0, 15.0)]
+
+    def test_deficit_is_divided_by_the_weighted_rate(self):
+        """20s at 60 and 20s at 15 weight to 37.5fps, and deficit_fps says so while fps
+        keeps reporting what the header claimed."""
+        with _FedPackets(self.LINES, 60.0) as path:
+            damaged, metrics, summary = assess_seek_damage(
+                path, joined_segments=2, segment_rates=self.RATES)
+        self.assertFalse(damaged, summary)
+        self.assertEqual(metrics['deficit_basis'], 'nominal_rate')
+        self.assertAlmostEqual(metrics['deficit_fps'], 37.5, places=3)
+        self.assertAlmostEqual(metrics['fps'], 60.0, places=3)
+        self.assertEqual(metrics['capture_fps_values'], [15.0, 60.0])
+
+    def test_summary_says_the_rate_changed_and_names_both_rates(self):
+        """A corrected number nobody can reproduce is no better than a wrong one."""
+        with _FedPackets(self.LINES, 60.0) as path:
+            _damaged, _metrics, summary = assess_seek_damage(
+                path, joined_segments=2, segment_rates=self.RATES)
+        self.assertIn('Capture frame rate changed mid-recording', summary)
+        self.assertIn('15, 60 fps', summary)
+        self.assertIn('37.50 fps', summary)
+
+    def test_without_rates_an_undated_file_is_measured_at_the_header_rate(self):
+        with _FedPackets(self.LINES, 60.0) as path:
+            damaged, metrics, _summary = assess_seek_damage(path, joined_segments=2)
+        self.assertTrue(damaged)
+        self.assertAlmostEqual(metrics['deficit_seconds'], 40 - 1500 / 60.0, delta=0.1)
+
+    def test_dated_packets_count_their_own_duration_and_undated_ones_the_rate(self):
+        lines = _packets(0.0, 20, 60) + _packets(20.0, 20, 15, dated=False)
+        with _FedPackets(lines, 60.0) as path:
+            metrics = scan_video_timeline(path)
+        self.assertEqual(metrics['deficit_basis'], 'partial_durations')
+        # 20s dated exactly, then 300 undated packets at the header's 60fps = 5s.
+        self.assertAlmostEqual(metrics['deficit_seconds'], 40 - 20 - 5, delta=0.1)
+
+    def test_an_implausible_duration_counts_as_undated(self):
+        """A duration of a second or more is not one frame and must not paper over a gap."""
+        lines = [line.rsplit(',', 1)[0] + ',5.000000' for line in _packets(0.0, 10, 60)]
+        with _FedPackets(lines, 60.0) as path:
+            metrics = scan_video_timeline(path)
+        self.assertEqual(metrics['deficit_basis'], 'nominal_rate')
+        self.assertLess(metrics['deficit_seconds'], 0.1)
+
+
+@unittest.skipUnless(_HAVE_FFMPEG, 'ffmpeg/ffprobe not installed')
+class ShortLowRateOpeningTests(unittest.TestCase):
+    """dev/docs/BUGS.md 2026-10-15 @ 06:12:01 PM - recording 16's segment 4 was probed at
+    720p29.97 two seconds in and then ran at 59.94 for three and a half hours. The deficit
+    was divided by a rate blended from the segments' opening probes (30.62 fps), and read
+    0.0s missing on the page whose capture health said 96.3% of expected frames.
+
+    In miniature: 20s at 60, then a segment that opens on 2s at 30 and runs 18s at 60 with
+    every fifth frame lost - 3.6s of video missing, in steps too small to count as gaps.
+    Its probe says 30 for the whole 20s."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls._dir = tempfile.mkdtemp(prefix='lowopen-')
+        first = os.path.join(cls._dir, 'first60.ts')
+        opening = os.path.join(cls._dir, 'open30.ts')
+        rest = os.path.join(cls._dir, 'rest60lossy.ts')
+        enc = ['-c:v', 'libx264', '-preset', 'ultrafast', '-bf', '0', '-pix_fmt', 'yuv420p']
+        _ffmpeg('-f', 'lavfi', '-i', 'testsrc=size=192x108:rate=60', '-t', '20', *enc, first)
+        _ffmpeg('-f', 'lavfi', '-i', 'testsrc=size=192x108:rate=30', '-t', '2', *enc, opening)
+        _ffmpeg('-f', 'lavfi', '-i', 'testsrc=size=192x108:rate=60', '-t', '18',
+                '-vf', "select='not(eq(mod(n,5),0))'", '-fps_mode', 'passthrough', *enc, rest)
+        listfile = os.path.join(cls._dir, 'list.txt')
+        with open(listfile, 'w') as fh:
+            for part in (first, opening, rest):
+                fh.write(f"file '{part}'\n")
+        cls.joined = os.path.join(cls._dir, 'joined.ts')
+        _ffmpeg('-f', 'concat', '-safe', '0', '-fflags', '+genpts', '-i', listfile,
+                '-c', 'copy', cls.joined)
+        cls.probed_rates = [(20.0, 60.0), (20.0, 30.0)]
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls._dir, ignore_errors=True)
+
+    def test_the_lost_frames_are_counted(self):
+        _damaged, metrics, summary = assess_seek_damage(
+            self.joined, joined_segments=2, segment_rates=self.probed_rates)
+        self.assertEqual(metrics['gap_count'], 0, 'fixture has real gaps')
+        self.assertAlmostEqual(metrics['deficit_seconds'], 3.6, delta=0.3, msg=summary)
+
+    def test_the_blended_rate_would_have_read_nothing_missing(self):
+        """The fixture reproduces the defect: divided by the probes' blend (45 fps) the
+        same packets read as more than complete."""
+        _damaged, metrics, _summary = assess_seek_damage(
+            self.joined, joined_segments=2, segment_rates=self.probed_rates)
+        self.assertLessEqual(metrics['span_seconds'] - metrics['packet_count'] / 45.0, 0.0)
 
 
 if __name__ == '__main__':

@@ -114,10 +114,11 @@ class _ConversionCase(unittest.TestCase):
         self.rid = self.rec.id
         self.out = self.ts[:-3] + '.mp4'
 
-    def _run(self, cfg, side_effect, trial=None):
+    def _run(self, cfg, side_effect, trial=None, kept=0.0):
         """Convert with the encode and the assembly both stubbed. Every attempt writes the
         part file it was asked for, so a death leaves a GPU-encoded part on disk the way a
-        real one does, and the join writes the output so a success completes."""
+        real one does, and the join writes the output so a success completes. `kept` is what
+        salvaging a killed part reports."""
         def attempt(app, rid, cmd, part_file, **kw):
             with open(part_file, 'wb') as fh:
                 fh.write(b'p' * 64)
@@ -132,7 +133,7 @@ class _ConversionCase(unittest.TestCase):
         with mock.patch.object(cfgmod, 'load_config', return_value=cfg), \
              mock.patch.object(ppmod, 'run_conversion_supervised', stub), \
              mock.patch.object(ppmod, 'join_conversion_parts', join), \
-             mock.patch.object(ppmod, 'finalize_part', lambda part, *a, **k: 0.0), \
+             mock.patch.object(ppmod, 'finalize_part', lambda part, *a, **k: kept), \
              mock.patch.object(toolchain, '_run_gpu_trial', trial or _trial(0)):
             do_postprocess(self.t.app, self.rid, self.ts)
         db.session.expire_all()
@@ -212,6 +213,15 @@ class CommandShapeTests(_ConversionCase):
         self._run(_config(), _ok)
         self.assertIn('libx264', self._events(CONVERSION_STARTED)[0].detail)
         self.assertIn('libx264', self._events(CONVERSION_DONE)[0].detail)
+
+    def test_the_started_event_names_the_app_version(self):
+        """The version that converted the recording, which a support bundle built after
+        an upgrade cannot otherwise tell from its own (dev/changelog/1193)."""
+        import json
+        from app.version import __version__
+        self._run(_config(), _ok)
+        extra = json.loads(self._events(CONVERSION_STARTED)[0].extra_data)
+        self.assertEqual(extra['app_version'], __version__)
 
 
 class QualitySettingTests(_ConversionCase):
@@ -296,7 +306,7 @@ class HardwareDeathFallbackTests(_ConversionCase):
     is handled exactly as before, on the same encoder."""
 
     def test_a_hardware_death_retries_with_libx264(self):
-        outcomes = iter([ConversionResult(False, 'died', NO_DISPLAY, out_time=120.0), _ok()])
+        outcomes = iter([ConversionResult(False, 'died', NO_DISPLAY, out_time=120.0, gpu_error=NO_DISPLAY), _ok()])
         stub = self._run(_config(video_encoder='vaapi'), lambda *a, **k: next(outcomes))
         first, second = self._cmds(stub)
         self.assertEqual(first[first.index('-c:v') + 1], 'h264_vaapi')
@@ -305,7 +315,7 @@ class HardwareDeathFallbackTests(_ConversionCase):
         self.assertEqual(db.session.get(Recording, self.rid).status, 'COMPLETED')
 
     def test_the_switch_is_announced_and_the_done_event_names_the_software_encoder(self):
-        outcomes = iter([ConversionResult(False, 'died', NO_DISPLAY, out_time=120.0), _ok()])
+        outcomes = iter([ConversionResult(False, 'died', NO_DISPLAY, out_time=120.0, gpu_error=NO_DISPLAY), _ok()])
         self._run(_config(video_encoder='vaapi'), lambda *a, **k: next(outcomes))
         said = [e for e in self._events(CONVERSION_RESTARTED)
                 if 'GPU encoder failed' in (e.detail or '')]
@@ -317,7 +327,7 @@ class HardwareDeathFallbackTests(_ConversionCase):
 
     def test_the_gpu_encoded_parts_are_discarded(self):
         seen = []
-        outcomes = iter([ConversionResult(False, 'died', NO_DISPLAY, out_time=120.0), _ok()])
+        outcomes = iter([ConversionResult(False, 'died', NO_DISPLAY, out_time=120.0, gpu_error=NO_DISPLAY), _ok()])
 
         def attempt(app, rid, cmd, part_file, **kw):
             seen.append((part_file, os.path.exists(part_path(self.out, 1))))
@@ -332,10 +342,39 @@ class HardwareDeathFallbackTests(_ConversionCase):
         self.assertIn('1 part(s) the GPU already encoded', said)
         self.assertIn('discarded', said)
 
-    def test_the_fallback_costs_one_restart_attempt(self):
-        outcomes = iter([ConversionResult(False, 'died', NO_DISPLAY, out_time=120.0), _ok()])
+    def test_the_fallback_spends_no_restart_attempt(self):
+        """dev/docs/BUGS.md 2026-10-15 @ 03:55:35 PM: the switch to the CPU is not a death
+        the CPU might hit again, so it leaves the budget whole."""
+        outcomes = iter([ConversionResult(False, 'died', NO_DISPLAY, out_time=120.0, gpu_error=NO_DISPLAY), _ok()])
         self._run(_config(video_encoder='vaapi'), lambda *a, **k: next(outcomes))
-        self.assertEqual(db.session.get(Recording, self.rid).conversion_attempts, 1)
+        self.assertEqual(db.session.get(Recording, self.rid).conversion_attempts, 0)
+
+    def test_the_cpu_still_gets_every_restart_after_a_gpu_death(self):
+        """dev/docs/BUGS.md 2026-10-15 @ 03:55:35 PM: a GPU death followed by the full
+        budget of source deaths (each somewhere new, so none is a repeat) still completes."""
+        outcomes = iter([
+            ConversionResult(False, 'died', NO_DISPLAY, out_time=120.0, gpu_error=NO_DISPLAY),
+            ConversionResult(False, 'died', 'Error while decoding stream', out_time=100.0),
+            ConversionResult(False, 'died', 'Error while decoding stream', out_time=200.0),
+            ConversionResult(False, 'died', 'Error while decoding stream', out_time=300.0),
+            _ok()])
+        stub = self._run(_config(video_encoder='vaapi', max_restart_attempts=3),
+                         lambda *a, **k: next(outcomes))
+        encoders = [c[c.index('-c:v') + 1] for c in self._cmds(stub)]
+        self.assertEqual(encoders, ['h264_vaapi'] + ['libx264'] * 4,
+                         'the CPU gets its first try plus all three restarts')
+        rec = db.session.get(Recording, self.rid)
+        self.assertEqual(rec.status, 'COMPLETED')
+        self.assertEqual(rec.conversion_attempts, 3)
+
+    def test_the_fallback_event_says_no_attempt_was_spent(self):
+        """dev/docs/BUGS.md 2026-10-15 @ 03:55:35 PM."""
+        outcomes = iter([ConversionResult(False, 'died', NO_DISPLAY, out_time=120.0, gpu_error=NO_DISPLAY), _ok()])
+        self._run(_config(video_encoder='vaapi'), lambda *a, **k: next(outcomes))
+        said = [e for e in self._events(CONVERSION_RESTARTED)
+                if 'GPU encoder failed' in (e.detail or '')]
+        self.assertEqual(len(said), 1)
+        self.assertIn('does not count against the conversion\'s restart attempts', said[0].detail)
 
     def test_a_death_that_does_not_blame_the_hardware_keeps_the_gpu(self):
         outcomes = iter([

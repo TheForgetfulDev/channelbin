@@ -3041,6 +3041,21 @@ def _m092_auto_rule_last_problems(conn, cur):
     conn.commit()
 
 
+def _m093_recording_converted_gap_seconds(conn, cur):
+    """recordings: converted_gap_seconds, the video a conversion lost that its source still
+    had, measured on the output before the source may be deleted (dev/changelog/1200).
+
+    No backfill: NULL means "not checked", which is the truth for every conversion that ran
+    before the check existed, and a finished file whose source is already gone has nothing
+    to compare against."""
+    cols = {r[1] for r in cur.execute('PRAGMA table_info(recordings)').fetchall()}
+    if not cols:
+        return
+    if 'converted_gap_seconds' not in cols:
+        cur.execute('ALTER TABLE recordings ADD COLUMN converted_gap_seconds FLOAT')
+    conn.commit()
+
+
 def _m081_account_blocks(conn, cur):
     """account_blocks: the stretches of time the user has told ChannelBin to keep off an
     account (app/account_blocks.py, dev/changelog/1151).
@@ -3254,6 +3269,8 @@ SCHEMA_MIGRATIONS = [
      _m091_rule_match_rec_name),
     (92, 'auto_rules: last_problems, the showings a check that ran could not schedule, '
      'split out of last_error', _m092_auto_rule_last_problems),
+    (93, 'recordings: converted_gap_seconds, video the conversion lost that the source has, '
+     'checked before the source is deleted', _m093_recording_converted_gap_seconds),
 ]
 
 CURRENT_SCHEMA_VERSION = SCHEMA_MIGRATIONS[-1][0]

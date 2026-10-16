@@ -417,7 +417,9 @@ Recordings are written to `recording.dvr_output_dir` (default `/dvr`) and, if
 During recording, temporary segment files exist as `<name>_seg_000.ts`, `_seg_001.ts`, and so on.
 They are deleted after successful concatenation. With post-processing enabled the concatenated
 `.ts` is converted to mp4 or mkv, and the source `.ts` is deleted if
-`recording.post_process.delete_source` is on.
+`recording.post_process.delete_source` is on. The converted file is checked for missing video
+first: if it lacks video the `.ts` has, the `.ts` is kept, the recording is flagged and an alert
+is raised, so the conversion can be retried from it.
 
 ## Backup and restore
 

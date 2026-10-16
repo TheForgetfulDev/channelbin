@@ -289,15 +289,35 @@ class MixedRateReencodeTests(_MixedRateFixture, unittest.TestCase):
                       'the CFR normalization was silently dropped')
 
     def test_a_steady_rate_clean_recording_still_stream_copies(self):
-        """The correction must not become a blanket re-encode: with one rate throughout,
-        this fixture's deficit is real and large, so it is damage and stays damage."""
-        self._segments((20, 4096, 60.0), (20, 8192, 60.0))
-        self._run(self._config())
+        """The correction must not become a blanket re-encode: a file that held one rate
+        throughout, with every frame present, is neither damage nor a rate change."""
+        self._segments((20, 4096, 60.0))
+        dest = os.path.join(self.dvr_dir, f'rec_{self.rid}.ts')
+        shutil.copy2(os.path.join(self._dir, 'fast60.ts'), dest)
+        stub = mock.Mock(return_value=ConversionResult(True))
+        with mock.patch.object(cfgmod, 'load_config', return_value=self._config()), \
+             mock.patch.object(ppmod, 'run_conversion_supervised', stub):
+            do_postprocess(self.t.app, self.rid, dest)
+        db.session.expire_all()
 
         self.assertEqual(self._events(MIXED_FRAME_RATE_DETECTED), [],
                          'a steady-rate recording was labelled a rate change')
-        self.assertEqual(len(self._events(SEEK_DAMAGE_DETECTED)), 1,
-                         'the header-rate deficit stopped being reported as damage')
+        self.assertEqual(self._events(SEEK_DAMAGE_DETECTED), [],
+                         'a complete steady-rate recording was called damaged')
+        self.assertNotIn('libx264', stub.call_args.args[2])
+
+    def test_a_rate_change_the_probes_missed_is_still_a_rate_change(self):
+        """dev/docs/BUGS.md 2026-10-15 @ 06:12:01 PM. Both segments' probes read 60fps, but
+        the file's second stretch runs at 15 - recording 17's feed did this inside one
+        segment. Each frame counts its own duration, so the deficit is not mistaken for
+        damage, and the whole-file survey names the rate change."""
+        self._segments((20, 4096, 60.0), (20, 8192, 60.0))
+        stub = self._run(self._config())
+
+        self.assertEqual(self._events(SEEK_DAMAGE_DETECTED), [],
+                         'a rate change was reported as damage')
+        self.assertEqual(len(self._events(MIXED_FRAME_RATE_DETECTED)), 1)
+        self.assertIn('libx264', stub.call_args.args[2])
 
     def test_reencode_never_does_not_act_on_a_rate_change_either(self):
         """The measure/act split covers the new trigger too - a user who set

@@ -355,8 +355,8 @@ class WatchdogThread(threading.Thread):
 
                             _record_probe_and_commit()
                             probe_attempts = _PROBE_MAX_ATTEMPTS
-                            # RECORDING_FORMAT_CHANGED asserts that the FINISHED FILE changes
-                            # format part-way through, so it must not be written for a segment
+                            # RECORDING_FORMAT_CHANGED asserts that the finished file changes
+                            # format at this segment, so it must not be written for a segment
                             # that is about to be thrown out of that file. A provider
                             # placeholder is exactly that case and it reaches this probe
                             # first: it delivers its 2MB within a second and ffmpeg is
@@ -1182,9 +1182,11 @@ class WatchdogThread(threading.Thread):
         return PlaceholderVerdict(content, wall_seconds, content / wall_seconds)
 
     def _check_format_pin(self, seg_id: int, seg_num: int):
-        """Say so when this segment was captured at a different format than the one the
+        """Say so when this segment opened at a different format than the one the
         recording opened with, so the finished file changes format part-way through
-        (DECIDED 12, DESIGN-channel-groups-model.md 5.1).
+        (DECIDED 12, DESIGN-channel-groups-model.md 5.1). The segment's opening is all
+        this sees; the format survey before conversion measures every stretch and writes
+        its own RECORDING_FORMAT_CHANGED (dev/changelog/1201).
 
         Fired here, off the segment's own capture-time probe, rather than at the failover
         that usually causes it. Two reasons, and the second is why it has to be here:
@@ -1214,16 +1216,22 @@ class WatchdogThread(threading.Thread):
             # Every divergent segment gets its own event - each is a distinct fact about a
             # distinct part of the file, and the recording's own detail page is where a
             # mixed-format file is disclosed (dev/changelog/928).
-            detail = (f'Segment {seg_num} was captured at {format_label(got)}, but this '
-                      f'recording opened at {format_label(pin)}. The finished file '
-                      f'changes format part-way through - it plays, but its header '
-                      f'describes only {format_label(pin)}.')
+            # Worded as what the probe saw and no more: it reads the segment's first two
+            # megabytes, and a restart during feed trouble can open on a minute of a lower
+            # format inside hours of the usual one - recording 16 was told its whole file
+            # changed when two minutes of four hours had (dev/changelog/1201). How long a
+            # format held is the whole-file survey's to say.
+            detail = (f'Segment {seg_num} opened at {format_label(got)}, but this '
+                      f'recording opened at {format_label(pin)}, so the file changes format '
+                      f'here. This is read from the segment\'s first seconds only - it says '
+                      f'the format changed, not for how long.')
 
             @retry_on_locked()
             def _log_format_change_and_commit():
                 add_recording_event(self.recording_id, RECORDING_FORMAT_CHANGED,
                                     detail=detail,
-                                    extra={'segment_number': seg_num,
+                                    extra={'basis': 'segment_open',
+                                           'segment_number': seg_num,
                                            'opened_format': list(pin),
                                            'segment_format': list(got)})
                 db.session.commit()

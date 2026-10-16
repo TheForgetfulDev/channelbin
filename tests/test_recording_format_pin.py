@@ -26,6 +26,7 @@ The rules with teeth, each a separate way to get this wrong:
     decision - the same member's feed can drift with no failover at all.
   * Every divergent segment logs its own event; only the first also alerts.
 """
+import json
 import os
 import sys
 import unittest
@@ -290,6 +291,22 @@ class FormatChangeDisclosureTests(_PinCase):
             recording_id=rec.id, event_type=RECORDING_FORMAT_CHANGED).one()
         self.assertIn('1920x1080 @ 60', ev.detail)
         self.assertIn('1280x720 @ 30', ev.detail)
+
+    def test_the_live_event_claims_only_what_the_opening_probe_saw(self):
+        """dev/docs/BUGS.md 2026-10-15 @ 06:12:01 PM - the probe reads a segment's first
+        seconds, and recording 16 was told a segment was 720p30 when only its first minute
+        or two was. The event says where the format changed, never for how long, and says
+        which writer it came from (dev/changelog/1201)."""
+        rec = self._rec()
+        self._segment(rec, 1, SD)
+        seg2 = self._segment(rec, 2, HD)
+        self._watchdog(rec)._check_format_pin(seg2.id, 2)
+        ev = RecordingEvent.query.filter_by(
+            recording_id=rec.id, event_type=RECORDING_FORMAT_CHANGED).one()
+        self.assertIn('Segment 2 opened at', ev.detail)
+        self.assertIn('first seconds only', ev.detail)
+        self.assertNotIn('was captured at', ev.detail)
+        self.assertEqual(json.loads(ev.extra_data)['basis'], 'segment_open')
 
     def test_the_segment_that_set_the_pin_is_not_a_change(self):
         rec = self._rec()

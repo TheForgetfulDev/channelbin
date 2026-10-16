@@ -26,6 +26,7 @@ Three things to keep in mind when changing this module:
 import logging
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
+from types import SimpleNamespace
 from urllib.parse import parse_qsl, urlencode
 
 from sqlalchemy import func, or_, update
@@ -37,7 +38,8 @@ from .database import (
     AutoRule, CANCEL_BEFORE_START, CANCEL_DURING_ANALYSIS, CANCEL_DURING_CAPTURE,
     CANCEL_DURING_CONVERSION, CANCEL_GROUP_CHANGE, Channel, ChannelGroup, EPGEntry,
     REC_STATUS_ABORTED, REC_STATUS_FAILED, REC_STATUS_SCHEDULED, RECORDING_RULE_PROGRAM_MOVED,
-    RECORDING_RULE_RETRACKED, RECORDING_RULE_SCHEDULED, RECORDING_START_NOT_ARMED, Recording,
+    RECORDING_RULE_RELEASED, RECORDING_RULE_RETRACKED, RECORDING_RULE_SCHEDULED,
+    RECORDING_START_NOT_ARMED, Recording,
     RecordingProfile, RULE_MATCH_SCHEDULED,
     RULE_MATCH_SKIPPED_CAP, RULE_MATCH_SKIPPED_EXISTING, RULE_MATCH_SKIPPED_LIMIT,
     RULE_MATCH_SKIPPED_REPEAT, RULE_MATCH_SKIPS, RULE_MATCH_USER_MODIFIED, RuleMatch,
@@ -2261,16 +2263,153 @@ def create_rule(values: RuleValues) -> int:
     return _create()
 
 
-def update_rule(rule_id: int, values: RuleValues) -> bool:
+UNMATCHED_CANCEL = 'cancel'
+UNMATCHED_KEEP = 'keep'
+UNMATCHED_ACTIONS = (UNMATCHED_CANCEL, UNMATCHED_KEEP)
+
+
+@dataclass
+class Unmatched:
+    """The rule's upcoming SCHEDULED recordings a new search would leave behind (§8).
+    `determined` False means the new search could not be compared at all, `reason` says why
+    in a sentence,
+    and `recordings` is then every upcoming SCHEDULED recording of the rule - the person is
+    asked about all of them rather than none."""
+    recordings: list
+    determined: bool = True
+    reason: str = ''
+
+    @property
+    def ids(self) -> set:
+        return {r['id'] for r in self.recordings}
+
+    def payload(self):
+        return {'unmatched': self.recordings, 'determined': self.determined,
+                'reason': self.reason or None}
+
+
+def unmatched_by_search(rule_id: int, search_params: str) -> Unmatched:
+    """Which of the rule's upcoming SCHEDULED picks `search_params` no longer matches (§8).
+
+    Runs the new search once, as the engine would, and keeps a pick only when the search has
+    no showing of its program at its time - "the same program" read leniently, as retrack's
+    still-present check reads it, so an episode-less listing of the title counts as a match
+    and doubt never offers a recording for cancelling. A pick whose program the guide no
+    longer lists at its time is left out too: the program moved or vanished, which is
+    retrack's business (§5), not the edit's. Recordings the person edited (`user_modified`)
+    are theirs and are never offered. Reads only; the caller decides."""
+    from .channel_search import SearchContext, SearchStateError
+    from .config import load_config
+    from .tz_utils import format_local, get_display_tz, is_24h
+
+    now = datetime.utcnow()
+    picks = db.session.query(
+        Recording.id, Recording.name, Recording.start_time, RuleMatch.title_key,
+        RuleMatch.episode_key, RuleMatch.program_start_time,
+    ).join(RuleMatch, RuleMatch.recording_id == Recording.id).filter(
+        RuleMatch.rule_id == rule_id, RuleMatch.action_taken == RULE_MATCH_SCHEDULED,
+        Recording.rule_id == rule_id, Recording.status == REC_STATUS_SCHEDULED,
+        RuleMatch.program_start_time > now,
+    ).order_by(Recording.start_time, Recording.id).all()
+    if not picks:
+        return Unmatched([])
+    tz, h24 = get_display_tz(), is_24h()
+
+    def described(rows):
+        return [{'id': r.id, 'name': r.name,
+                 'when': format_local(r.start_time, 'day_datetime', tz=tz, h24=h24)}
+                for r in rows]
+
+    def undetermined(reason):
+        return Unmatched(described(picks), determined=False, reason=reason)
+
+    try:
+        state = parse_search(search_params)
+    except SearchStateError as exc:
+        return undetermined(f'The new search cannot be read: {exc}.')
+    gone = missing_names(state, known_names([state]))
+    if gone:
+        return undetermined(gone)
+    # _search_rule reads only the run's search context.
+    run = SimpleNamespace(ctx=SearchContext.build(load_config()))
+    try:
+        entries, _wins = _search_rule(state, run)
+    except SearchStateError as exc:
+        return undetermined(f'The new search cannot be run: {exc}.')
+    if entries is None:
+        return undetermined(f'The new search matches more than {MAX_SHOWINGS:,} upcoming '
+                            'showings, which is more than a rule will run.')
+    exact, titled = set(), set()
+    for e in entries:
+        exact.add((title_key(e.title), title_key(e.sub_title), e.start))
+        titled.add((title_key(e.title), e.start))
+    left = [r for r in picks if not _is_listed(exact, titled, r.title_key,
+                                               r.episode_key or '', r.program_start_time)]
+    if left:
+        exact, titled = _guide_keys({r.program_start_time for r in left})
+        left = [r for r in left if _is_listed(exact, titled, r.title_key,
+                                              r.episode_key or '', r.program_start_time)]
+    return Unmatched(described(left))
+
+
+def _cancel_scheduled(rec):
+    """Call off one SCHEDULED recording inside the caller's write unit: deleted, since nothing
+    was captured to keep (dev/changelog/814). The caller unschedules its jobs after the
+    commit."""
+    detach_recording_references(rec.id)
+    db.session.delete(rec)  # hidden-recompute-ok: a Recording, not a group or membership
+
+
+def _settle_unmatched(rule, action, ids) -> tuple:
+    """The person's answer for the picks an edited search left behind (§8), inside the edit's
+    own write unit: ([cancelled recording ids], kept count). Only a recording that is still
+    SCHEDULED and still this rule's is touched - one that started since the question was asked
+    is left alone. Either way its ledger row goes: the rule no longer matches that program, so
+    the row must not keep deciding it - a cancelled pick's row would otherwise make the
+    program's later airings repeats (§3.4) of a recording the person never turned down."""
+    cancelled, kept = [], 0
+    if not ids:
+        return cancelled, kept
+    for rec in Recording.query.filter(Recording.id.in_(sorted(ids))).all():
+        if rec.rule_id != rule.id or rec.status != REC_STATUS_SCHEDULED:
+            continue
+        row_ids = [rid for (rid,) in db.session.query(RuleMatch.id).filter(
+            RuleMatch.rule_id == rule.id, RuleMatch.recording_id == rec.id)]
+        if action == UNMATCHED_CANCEL:
+            _cancel_scheduled(rec)
+            cancelled.append(rec.id)
+        elif action == UNMATCHED_KEEP:
+            rec.rule_id = None
+            add_recording_event(
+                rec.id, RECORDING_RULE_RELEASED,
+                detail=(f'Auto-record rule "{rule.name}" had its search changed and no longer '
+                        'matches this program. Kept as an ordinary recording: it still records '
+                        'as scheduled, but no longer counts toward the rule\'s cap.'),
+                extra={'rule_id': rule.id, 'rule_name': rule.name})
+            kept += 1
+        else:
+            raise ValueError(f'unknown answer for unmatched recordings: {action!r}')
+        if row_ids:
+            RuleMatch.query.filter(RuleMatch.id.in_(row_ids)).delete(
+                synchronize_session=False)
+    return cancelled, kept
+
+
+def update_rule(rule_id: int, values: RuleValues, unmatched=None):
     """Edit a rule (§8): bump its revision and, in the same commit, delete its ledger rows for
-    future showings it did not schedule, so the edited rule judges them afresh. Recordings it
-    already scheduled are kept even if they no longer match - a typo in an edit must not
-    silently drop recordings."""
+    future showings it did not schedule, so the edited rule judges them afresh.
+
+    Recordings it already scheduled are kept unless `unmatched` = (action, recording ids)
+    says otherwise: the person's answer, after unmatched_by_search() named the picks a changed
+    search no longer matches - nothing is dropped without being named first. Returns None
+    when the rule does not exist, else ([cancelled recording ids], kept count)."""
+    from .scheduler import unschedule_recording
+
     @retry_on_locked()
     def _update():
         rule = db.session.get(AutoRule, rule_id)
         if rule is None:
-            return False
+            return None
         rule.name = values.name
         rule.search_params = values.search_params
         rule.profile_id = values.profile_id
@@ -2287,13 +2426,19 @@ def update_rule(rule_id: int, values: RuleValues) -> bool:
             RuleMatch.action_taken.in_(RULE_MATCH_SKIPS),
             RuleMatch.program_start_time > datetime.utcnow(),
         ).delete(synchronize_session=False)
+        # Read after the revision is flushed (the statements here autoflush it), so the write
+        # lock is held and no evaluation can commit a change to these recordings meanwhile.
+        settled = _settle_unmatched(rule, *unmatched) if unmatched else ([], 0)
         db.session.commit()
-        return True
+        return settled
 
-    if not _update():
-        return False
+    result = _update()
+    if result is None:
+        return None
+    for rid in result[0]:
+        unschedule_recording(rid)
     _clear_rule_alerts(rule_id)
-    return True
+    return result
 
 
 def set_rule_enabled(rule_id: int, enabled: bool) -> bool:
@@ -2370,8 +2515,7 @@ def delete_rule(rule_id: int, cancel_scheduled: bool):
         cancelled, kept = [], 0
         for rec in Recording.query.filter_by(rule_id=rule_id).all():
             if cancel_scheduled and rec.status == REC_STATUS_SCHEDULED:
-                detach_recording_references(rec.id)
-                db.session.delete(rec)  # hidden-recompute-ok: a Recording, not a group or membership
+                _cancel_scheduled(rec)
                 cancelled.append(rec.id)
             else:
                 rec.rule_id = None

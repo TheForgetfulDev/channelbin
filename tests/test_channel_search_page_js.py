@@ -737,6 +737,22 @@ class RuleErrandTests(_PageJs, unittest.TestCase):
         self.assertEqual(self.obs['edit_mode']['pending_toast']['message'],
                          'Saved the new search to "Cup Series". 1 scheduled.')
 
+    def test_a_search_that_leaves_recordings_behind_asks_before_it_saves(self):
+        """A 409 naming the scheduled recordings the new search no longer matches opens the
+        question instead of a toast, nothing navigates until it is answered, and the answer
+        goes back with exactly the ids it showed (dev/changelog/1203)."""
+        un = self.obs['unmatched']
+        self.assertTrue(un['asked'])
+        self.assertEqual(un['title'], 'Save new search')
+        self.assertEqual(un['listed'], ['Cup Race - Alpha', 'Cup Race - Bravo'])
+        self.assertFalse(un['navigated_before_answer'])
+        self.assertEqual(un['puts_before_answer'], 1)
+        self.assertEqual(un['answer'], {'action': 'cancel', 'ids': [41, 42]})
+        self.assertTrue(un['navigated'])
+        self.assertEqual(un['pending_toast']['message'],
+                         'Saved the new search to "Cup Series". 2 scheduled recordings '
+                         'cancelled. 1 scheduled.')
+
     def test_dismissing_takes_the_errand_out_of_the_url(self):
         gone = self.obs['dismissed']
         self.assertFalse(gone['bar_shown'])

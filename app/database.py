@@ -76,7 +76,10 @@ RECORDING_FORMAT_OVERRIDE           = 'RECORDING_FORMAT_OVERRIDE'
 # without any failover at all - measured, not assumed: the concat and the mp4 conversion
 # both absorb the change without an error, and the mp4 then declares one resolution for a
 # file that has two (dev/changelog/754). Silence here is exactly the defect this app exists
-# to refuse, so the fact rides on the artifact.
+# to refuse, so the fact rides on the artifact. Two writers, told apart by extra['basis']:
+# 'segment_open' is the watchdog, live, from a segment's first seconds only; 'format_survey'
+# is the post-capture survey, which measures every stretch of the whole file - including a
+# change inside one segment, which the watchdog never sees (dev/changelog/1201).
 RECORDING_FORMAT_CHANGED            = 'RECORDING_FORMAT_CHANGED'
 # Channel-backed (non-group) recording whose frozen Recording.url no longer matched the
 # channel's current stream_url - the provider rewrote its stream domain and/or embedded
@@ -115,6 +118,12 @@ RECORDING_RULE_RETRACKED            = 'RECORDING_RULE_RETRACKED'
 # its program left must say so on its own page. A different fact from the move above, so a
 # different type.
 RECORDING_RULE_PROGRAM_MOVED        = 'RECORDING_RULE_PROGRAM_MOVED'
+# The rule that scheduled this recording had its search changed so that it no longer matches
+# the recording's program, and the person chose to keep it: it stays SCHEDULED as an ordinary
+# recording, with rule_id cleared, so it no longer counts toward the rule's cap or follows its
+# program (DESIGN-autoschedule.md §8, dev/changelog/1203). Without it, the "Scheduled by rule"
+# line on the recording's page disappears with no reason given.
+RECORDING_RULE_RELEASED             = 'RECORDING_RULE_RELEASED'
 # A SCHEDULED recording's channel_id/url were rewritten by the duplicate-repoint helper
 # (DESIGN-sync-resilience.md §6) - the channel it targeted was missing from the provider
 # feed and the same stream survives on another channel row.
@@ -227,6 +236,16 @@ CONVERSION_RESUMED     = 'CONVERSION_RESUMED'
 CONVERSION_DONE        = 'CONVERSION_DONE'
 CONVERSION_FAILED      = 'CONVERSION_FAILED'
 CONVERSION_CANCELLED   = 'CONVERSION_CANCELLED'
+# The finished conversion is missing video its source has - a hole the converter made, found
+# by scanning the output before the source could be deleted. Each gap is named with its
+# times. The recording still completes (the file plays) and the source is kept, so a Retry
+# can convert it again (dev/changelog/1200).
+CONVERTED_FILE_GAPS    = 'CONVERTED_FILE_GAPS'
+# What happened to the joined .ts once a conversion finished: deleted under
+# post_process.delete_source, or kept and why. The deletion was silent before
+# dev/changelog/1200, so a recording whose source was gone could only be inferred.
+SOURCE_DELETED         = 'SOURCE_DELETED'
+SOURCE_KEPT            = 'SOURCE_KEPT'
 FILE_MOVED            = 'FILE_MOVED'
 SCRIPT_EXECUTED        = 'SCRIPT_EXECUTED'
 # Pre-recording health check (DESIGN-prerecord-checks.md §3-4): a channel_tester run fired
@@ -808,6 +827,13 @@ class Recording(db.Model):
     # an audit trail - this column records what the app decided and acted on - but it must
     # never be treated as recomputable.
     timeline_damaged         = db.Column(db.Boolean)
+    # Seconds of video missing from the CONVERTED file beyond what the source was missing,
+    # measured by the same scanner on the output before the source can be deleted
+    # (dev/changelog/1200). NULL = not checked (no conversion, or the scan could not read the
+    # output); 0 = checked and the converter lost nothing; above 0 = the converter made holes,
+    # the source was kept, and the Recordings list badges the row. A column because that
+    # badge displays it per row.
+    converted_gap_seconds    = db.Column(db.Float)
 
     # ── Near-empty/slate segment detection (app/postprocessor.py::_detect_near_empty_segments) ──
     # A segment can be timeline-clean (frames present, evenly spaced) and still be a
@@ -878,6 +904,7 @@ class Recording(db.Model):
 
     # Supervised-conversion monitor state (app/postprocessor.py). All nullable; see
     # migration _m016. conversion_attempts counts every death (crash/stall/restart-kill)
+    # except a GPU death that steps the conversion back to the CPU (dev/changelog/1198),
     # and is reset to 0 by a manual Retry. The progress snapshot lets the detail strip and
     # dashboard render live progress from the row with no extra plumbing.
     # restarts so far this recording

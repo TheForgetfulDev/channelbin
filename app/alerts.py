@@ -264,6 +264,13 @@ ALERT_TYPES = {
         'label': 'Account Login Refused', 'severity': 'WARN'},
     'RECORDING_MOVE_FAILED': {
         'label': 'Recording Move Failed', 'severity': 'ERROR', 'self_clearing': True},
+    # The converted file is missing video its source has, so the source was kept rather than
+    # deleted (dev/changelog/1200). WARN, not ERROR: nothing is lost while the source is on
+    # disk, and a Retry converts it again. Cleared by a later conversion that checks clean,
+    # and at startup once the kept source is gone - deleting it by hand is how the user
+    # accepts the damaged file, since an Active alert offers no Dismiss.
+    'CONVERTED_FILE_GAPS': {
+        'label': 'Converted File Has Gaps', 'severity': 'WARN', 'self_clearing': True},
     # Unlike the two above, this one has no self-clearing path and is not expected to grow
     # one: nothing re-runs a concatenation that found nothing to concatenate, so it is a
     # record of a loss and is cleared only by deleting the recording.

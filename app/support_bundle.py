@@ -51,6 +51,7 @@ import os
 import platform
 import re
 import sys
+import time
 import zipfile
 from collections import Counter
 from datetime import datetime
@@ -716,6 +717,10 @@ def _build_meta(sanitizer, statter):
         'runtime': _runtime_environment(),
         'host': _host_resources(),
         'filesystem_check': statter.disclosure(),
+        # dvr.log is stamped in the process's local time and every database row in UTC, so
+        # matching a log line to an event otherwise means guessing the offset.
+        'log_clock': {'clock': 'process local time', 'utc_offset': time.strftime('%z'),
+                      'tz_name': time.strftime('%Z')},
         'redactions': _redaction_disclosure(sanitizer),
     }
 
@@ -771,14 +776,47 @@ def _filter_log_noise(raw_lines, want):
     return out_lines, len(surviving), noise_count, len(groups)
 
 
+def _read_log_lines(log_path, backup_count):
+    """The last _LOG_SCAN_LINES lines across the live log and its rotated backups,
+    oldest-first, plus the names of the files they came from (oldest-first).
+
+    The live file alone is not enough: dvr.log rotates every week or two, so right after a
+    rotation it holds hours of history and the window collapsed to "since the last
+    rotation" whatever the caps said. Recording 16's conversion made it into its bundle
+    only because the rotation happened to fall before it (dev/changelog/1193).
+    RotatingFileHandler rolls over between records, never inside one, so a record is never
+    split across two files. An unreadable live file raises; a missing backup ends the walk.
+    """
+    from .routes.logs import _tail_lines
+    lines, files = [], []
+    for i in range(max(0, backup_count) + 1):
+        if len(lines) >= _LOG_SCAN_LINES:
+            break
+        path = log_path if i == 0 else f'{log_path}.{i}'
+        try:
+            older = _tail_lines(path, _LOG_SCAN_LINES - len(lines))
+        except FileNotFoundError:
+            if i == 0:
+                raise
+            break
+        except OSError as exc:
+            if i == 0:
+                raise
+            log.warning('Support bundle: could not read rotated log %s: %s', path, exc)
+            break
+        lines = older + lines
+        files.insert(0, os.path.basename(path))
+    return lines, files
+
+
 def _build_log_tail():
     from .config import load_config
-    log_path = load_config().get('logging', {}).get('file')
+    logging_cfg = load_config().get('logging', {})
+    log_path = logging_cfg.get('file')
     if not log_path:
         return '(logging.file is unset - app logs to stdout, not captured here)\n'
-    from .routes.logs import _tail_lines
     try:
-        raw_lines = _tail_lines(log_path, _LOG_SCAN_LINES)
+        raw_lines, files = _read_log_lines(log_path, logging_cfg.get('backup_count') or 0)
     except OSError as exc:
         return f'(could not read {log_path}: {exc})\n'
     kept_lines, kept_count, noise_count, total_records = _filter_log_noise(
@@ -787,7 +825,9 @@ def _build_log_tail():
         return '\n'.join(kept_lines) + '\n'
     note = (
         f'(kept the last {kept_count} application log records of {total_records} '
-        f'scanned; dropped {noise_count} as werkzeug/APScheduler routine noise)\n'
+        f'scanned from {", ".join(files)}; dropped {noise_count} as werkzeug/APScheduler '
+        f'routine noise. Timestamps are this process\'s local time; every timestamp in '
+        f'the JSON files is UTC - meta.json "log_clock" gives the offset)\n'
     )
     return note + '\n'.join(kept_lines) + '\n'
 

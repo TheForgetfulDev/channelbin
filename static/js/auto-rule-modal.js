@@ -5,7 +5,7 @@
    is worded and acted on one way everywhere. Depends on util.js (escHtml, nf, jsonFetch,
    buildModal, fieldRow, showToast).
 
-   Four things to keep in mind:
+   Five things to keep in mind:
 
    * The criteria ARE the search. On create, `search` is the page's own snapshot() string,
      the spelling a saved search stores; the server drops the page-only parts, refuses what a
@@ -13,6 +13,10 @@
      rule's search is changed on the Programs search itself (its Save to rule), so the
      dialog shows it read-only with the way there. A refusal is shown inside the dialog and
      the dialog stays open, because the sentence says what to change.
+   * A changed search that no longer matches some of the rule's scheduled recordings is not
+     saved until the person says what becomes of them (openAutoRuleUnmatched, §8,
+     dev/changelog/1203). The server asks - its 409 names them - and decides; this file
+     only shows the question and sends the answer back.
    * The client-side "set both or neither" check is presentation - it mirrors
      app/auto_rules.py::read_rule_values, which is the enforcement.
    * A save, a resume and a check run the rule's check in the same request (§4.1), so the
@@ -322,6 +326,99 @@ function autoRuleDeletedText(res) {
   }
   if (kept) return `Rule deleted. ${_arCount(kept, 'recording', 'recordings')} kept as ordinary recordings.`;
   return 'Rule deleted.';
+}
+
+/* " 1 scheduled recording cancelled." for an edit's answer ({cancelled, kept}), with its
+   leading space, or '' when the edit settled nothing - read after "Saved the new search". */
+function autoRuleUnmatchedText(res) {
+  const cancelled = Number(res && res.cancelled) || 0;
+  const kept = Number(res && res.kept) || 0;
+  return (cancelled ? ` ${_arCount(cancelled, 'scheduled recording', 'scheduled recordings')} cancelled.` : '')
+    + (kept ? ` ${_arCount(kept, 'recording', 'recordings')} kept as `
+      + `${kept === 1 ? 'an ordinary recording' : 'ordinary recordings'}.` : '');
+}
+
+/**
+ * The question a changed search asks before it is saved (§8): the rule's scheduled
+ * recordings the new search no longer matches, and whether to cancel them or keep them as
+ * ordinary recordings.
+ *   ruleName - the rule's name
+ *   data     - the save's 409 body: {unmatched: [{id, name, when}], determined, reason}
+ *   save(answer) - resends the save with answer = {action, ids}; resolves to the server's
+ *              answer or throws. A 409 naming a new list redraws the dialog with it.
+ *   onSaved(res) - after the save went through
+ */
+function openAutoRuleUnmatched(opts) {
+  const choice = (value, checked, title, meta) =>
+    `<label class="fp-radio"><input type="radio" name="ru-fate" value="${value}"${checked ? ' checked' : ''}>`
+    + ` <strong>${escHtml(title)}</strong><span class="text-muted">${escHtml(meta)}</span></label>`;
+  const body = document.createElement('div');
+  let current = opts.data || {};
+
+  const draw = (notice) => {
+    const recs = current.unmatched || [];
+    const n = recs.length;
+    const them = n === 1 ? 'it' : 'them';
+    const cancel = body.querySelector('input[name="ru-fate"][value="cancel"]');
+    const cancelChosen = cancel ? cancel.checked : true;
+    body.innerHTML =
+      `<p class="modal-err" id="ru-err"${notice ? '' : ' hidden'}>${escHtml(notice || '')}</p>`
+      + (current.determined === false
+        ? `<p class="card-note">ChannelBin could not tell which of the ${_arCount(n, 'recording', 'recordings')} `
+          + `"${escHtml(opts.ruleName)}" has scheduled the new search still matches, so all of them are listed. `
+          + `${escHtml(current.reason || '')}</p>`
+        : `<p class="card-note">The new search no longer matches ${_arCount(n, 'recording', 'recordings')} `
+          + `"${escHtml(opts.ruleName)}" has scheduled:</p>`)
+      + '<div class="statlist">'
+      + recs.map((r) => `<div class="srow"><span class="sk">${escHtml(r.name)}</span>`
+        + `<span class="sv">${escHtml(r.when || '')}</span></div>`).join('')
+      + '</div>'
+      + choice('cancel', cancelChosen,
+        n === 1 ? 'Cancel it' : `Cancel the ${nf(n)} scheduled recordings`,
+        `${n === 1 ? 'It is' : 'They are'} removed before ${n === 1 ? 'it starts' : 'they start'}.`)
+      + choice('keep', !cancelChosen, `Keep ${them} as ordinary recordings`,
+        `${n === 1 ? 'It still records' : 'They still record'} as scheduled, but no longer `
+        + `${n === 1 ? 'belongs' : 'belong'} to the rule or ${n === 1 ? 'counts' : 'count'} toward its cap.`)
+      + '<p class="card-note">Nothing that already started is touched.</p>';
+  };
+  draw('');
+
+  const modal = buildModal({
+    title: 'Save new search',
+    body,
+    footer: [
+      { label: 'Cancel', class: 'btn', onClick: (c) => c() },
+      { label: 'Save to rule', class: 'btn btn-primary', onClick: () => { submit(); return false; } },
+    ],
+  });
+  const confirmBtn = modal.querySelector('.modal-foot .btn-primary');
+
+  async function submit() {
+    const picked = body.querySelector('input[name="ru-fate"]:checked');
+    const answer = {
+      action: picked ? picked.value : 'cancel',
+      ids: (current.unmatched || []).map((r) => r.id),
+    };
+    confirmBtn.disabled = true;
+    let res;
+    try {
+      res = await opts.save(answer);
+    } catch (e) {
+      confirmBtn.disabled = false;
+      if (e.status === 409 && e.data && e.data.unmatched) {
+        current = e.data;
+        draw('The list changed while this was open. Check it again before saving.');
+        return;
+      }
+      const err = body.querySelector('#ru-err');
+      err.textContent = e.message || 'The search could not be saved to the rule.';
+      err.hidden = false;
+      return;
+    }
+    modal.closeModal();
+    if (opts.onSaved) opts.onSaved(res);
+  }
+  return modal;
 }
 
 function openAutoRuleDelete(rule, cfg, onDone) {

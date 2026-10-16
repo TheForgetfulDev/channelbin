@@ -70,6 +70,17 @@ def _evaluate(rule_id, saved=True):
                             else 'The check runs again shortly.')}
 
 
+def _unmatched_answer(answer):
+    """(action, {recording ids}) from a save's `unmatched` answer, or None when it is not one."""
+    if not isinstance(answer, dict) or answer.get('action') not in auto_rules.UNMATCHED_ACTIONS:
+        return None
+    ids = answer.get('ids')
+    if not isinstance(ids, list) or not all(
+            isinstance(i, int) and not isinstance(i, bool) for i in ids):
+        return None
+    return answer['action'], set(ids)
+
+
 def _rule_payload(rule_id):
     found = auto_rules.rule_list([rule_id])
     return found[0] if found else None
@@ -143,8 +154,15 @@ def create_rule_json():
 @auto_rules_bp.route('/api/auto-rules/<int:rule_id>', methods=['PUT'])
 def update_rule_json(rule_id):
     """Edit a rule (§8): its settings from the edit dialog, or its search from the Programs
-    search's Save to rule. Recordings it already scheduled are kept; its skip verdicts for
-    future showings are dropped and judged afresh by the evaluation this runs."""
+    search's Save to rule. Its skip verdicts for future showings are dropped and judged
+    afresh by the evaluation this runs.
+
+    A changed search that no longer matches some of the rule's SCHEDULED recordings is not
+    saved until the person says what becomes of them: the first answer is a 409 naming them
+    (auto_rules.unmatched_by_search), and the save is sent again with `unmatched`:
+    {action: cancel|keep, ids}. The ids must cover every recording named now - a list that
+    grew since the question was asked is asked again - so nothing is cancelled or kept that
+    the person was not shown."""
     rule, err = _rule_or_404(rule_id)
     if err:
         return err
@@ -153,11 +171,32 @@ def update_rule_json(rule_id):
         values = auto_rules.read_rule_values(data, existing=rule)
     except auto_rules.RuleError as exc:
         return jsonify({'error': str(exc)}), 400
-    if not auto_rules.update_rule(rule_id, values):
+    settle = None
+    if values.search_params != rule.search_params:
+        found = auto_rules.unmatched_by_search(rule_id, values.search_params)
+        if found.recordings:
+            answer = data.get('unmatched')
+            read = _unmatched_answer(answer) if answer is not None else None
+            if answer is not None and read is None:
+                return jsonify({'error': 'Say what becomes of the recordings the new search no '
+                                         'longer matches (unmatched: {action: cancel or keep, '
+                                         'ids}).'}), 400
+            if read is None or not found.ids <= read[1]:
+                n = len(found.recordings)
+                return jsonify({
+                    'error': (f'The new search no longer matches {n} recording'
+                              f'{"" if n == 1 else "s"} this rule has scheduled. Say whether '
+                              'to cancel them or keep them, then save again.'),
+                    **found.payload()}), 409
+            settle = (read[0], found.ids)
+    result = auto_rules.update_rule(rule_id, values, unmatched=settle)
+    if result is None:
         return jsonify({'error': 'Rule not found.'}), 404
+    cancelled, kept = result
     evaluation = (_evaluate(rule_id)
                   if db.session.get(AutoRule, rule_id).enabled else None)
-    return jsonify({'success': True, 'rule': _rule_payload(rule_id), 'evaluation': evaluation})
+    return jsonify({'success': True, 'rule': _rule_payload(rule_id), 'evaluation': evaluation,
+                    'cancelled': len(cancelled), 'kept': kept})
 
 
 @auto_rules_bp.route('/api/auto-rules/<int:rule_id>/pause', methods=['POST'])

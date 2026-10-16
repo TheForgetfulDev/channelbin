@@ -373,20 +373,34 @@ DEINTERLACE_VAAPI = 'deinterlace_vaapi=rate=field'
 TONEMAP_VAAPI = 'tonemap_vaapi=format=nv12:t=bt709:m=bt709:p=bt709'
 
 
-def software_video_filter(plan: NormalizePlan):
+def end_pad_filter(seconds):
+    """Hold the last picture for `seconds` after the video ends, so a recording whose
+    video stops before its audio plays through to the end instead of leaving the audio
+    under no picture.
+
+    -fps_mode cfr does not do this on its own. It repeats a frame only when a LATER frame
+    arrives, so it fills a hole inside one run but never pads past the last frame
+    (measured, dev/changelog/1199). The length is measured from the source before the
+    command is built (postprocessor.video_end_pad), never open-ended: an unbounded pad
+    with -shortest would also cut the video wherever the audio ended early."""
+    return f'tpad=stop_mode=clone:stop_duration={seconds:.3f}'
+
+
+def software_video_filter(plan: NormalizePlan, *, end_pad=0.0):
     """The libx264 path's -vf, or None for a recording that needs none - which keeps a
     clean recording's command exactly what it always was."""
-    if not plan.normalize_video:
-        return None
     parts = []
-    if plan.deinterlace:
-        parts.append(DEINTERLACE_SOFTWARE)
-    if plan.scale:
-        parts.append(fit_filter(plan.width, plan.height))
+    if plan.normalize_video:
+        if plan.deinterlace:
+            parts.append(DEINTERLACE_SOFTWARE)
+        if plan.scale:
+            parts.append(fit_filter(plan.width, plan.height))
+    if end_pad:
+        parts.append(end_pad_filter(end_pad))
     return ','.join(parts) or None
 
 
-def gpu_upload_filter(plan: NormalizePlan, *, hevc: bool):
+def gpu_upload_filter(plan: NormalizePlan, *, hevc: bool, end_pad=0.0):
     """The VAAPI path's -vf when the CPU decodes: everything that changes the picture runs
     in software at ONE fixed output size, then the frames are uploaded.
 
@@ -398,12 +412,15 @@ def gpu_upload_filter(plan: NormalizePlan, *, hevc: bool):
     file it is a same-size pass-through (measured: no added CPU on 1080p60).
 
     HDR: Main10 HEVC keeps it (p010 upload); H.264 tone-maps it to SDR on the device.
+    An end pad (end_pad_filter) runs on the software frames, ahead of the upload.
     """
     parts = []
     if plan.deinterlace:
         parts.append(DEINTERLACE_SOFTWARE)
     if plan.width and plan.height:
         parts.append(fit_filter(plan.width, plan.height))
+    if end_pad:
+        parts.append(end_pad_filter(end_pad))
     if plan.hdr:
         parts.append('format=p010,hwupload')
         if not hevc:

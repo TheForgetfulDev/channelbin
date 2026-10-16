@@ -716,6 +716,72 @@ class NoiseFilteringTests(_BundleTestCase):
         self.assertIn('noise', tail)
 
 
+class RotatedLogTests(_BundleTestCase):
+    """dev/changelog/1193: the tail read only the live dvr.log, so its window was "since
+    the last rotation" - on prod a rotation lands every 11-12 days, and a bundle sent the
+    day after one carried about a day of log whatever the record cap allowed. Recording
+    16's conversion lines reached its bundle only because the rotation fell before them."""
+
+    def setUp(self):
+        super().setUp()
+        self.set_config({'logging': {'backup_count': 5}})
+
+    def _write(self, path, *messages):
+        with open(path, 'w') as f:
+            for i, msg in enumerate(messages):
+                f.write(f'2026-01-01 00:00:{i:02d},000 [INFO] app.postprocessor: {msg}\n')
+
+    def test_records_in_a_rotated_file_reach_the_tail(self):
+        self._write(self.log_path + '.2', 'oldest rotated record')
+        self._write(self.log_path + '.1', 'conversion restarting after died')
+        self._write(self.log_path, 'newest live record')
+
+        tail = _unzip(sb.build_support_bundle()).read('dvr.log').decode()
+
+        oldest = tail.index('oldest rotated record')
+        middle = tail.index('conversion restarting after died')
+        newest = tail.index('newest live record')
+        self.assertLess(oldest, middle)
+        self.assertLess(middle, newest)
+        self.assertIn('bundle_test.log.2, bundle_test.log.1, bundle_test.log', tail)
+
+    def test_the_scan_budget_spans_files_rather_than_resetting_per_file(self):
+        real = sb._LOG_SCAN_LINES
+        sb._LOG_SCAN_LINES = 3
+        try:
+            self._write(self.log_path + '.1', 'too old A', 'too old B', 'kept from rotated')
+            self._write(self.log_path, 'live one', 'live two')
+            tail = _unzip(sb.build_support_bundle()).read('dvr.log').decode()
+        finally:
+            sb._LOG_SCAN_LINES = real
+
+        self.assertIn('kept from rotated', tail)
+        self.assertIn('live two', tail)
+        self.assertNotIn('too old', tail)
+
+    def test_a_gap_in_the_backups_ends_the_walk(self):
+        self._write(self.log_path + '.2', 'beyond the gap')
+        self._write(self.log_path, 'live record')
+
+        tail = _unzip(sb.build_support_bundle()).read('dvr.log').decode()
+
+        self.assertIn('live record', tail)
+        self.assertNotIn('beyond the gap', tail)
+
+    def test_backups_past_backup_count_are_not_read(self):
+        self.set_config({'logging': {'backup_count': 0}})
+        self._write(self.log_path + '.1', 'stale backup')
+        self._write(self.log_path, 'live record')
+
+        tail = _unzip(sb.build_support_bundle()).read('dvr.log').decode()
+
+        self.assertNotIn('stale backup', tail)
+
+    def test_meta_states_the_log_clock(self):
+        meta = json.loads(_unzip(sb.build_support_bundle()).read('meta.json'))
+        self.assertRegex(meta['log_clock']['utc_offset'], r'^[+-]\d{4}$')
+
+
 class NameSanitizationTests(_BundleTestCase):
     """dev/changelog/840. The bundle strips the host out of every URL on the ruling that
     even a bare provider hostname is private in the IPTV context, and then used to ship

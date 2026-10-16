@@ -105,6 +105,7 @@
         {% endif %}
         <div class="meta">
           {{ status_badge(r.badge_class, r.badge_label, pulse=r.badge_pulse) }}
+          {% if r.converted_gaps %}<span class="badge b-warn tip-plain" data-tip="The converted file is missing {{ r.converted_gaps }} of video the recording has, so it stalls there. The source .ts was kept - Retry conversion on the recording converts it again.">Gaps in file</span>{% endif %}
           {% if r.pill %}{{ channel_pill(r.pill.label, r.pill.url, logo_url=r.pill.logo_url, initials=r.pill.initials, acct_color=r.pill.acct_color) }}{% endif %}
         </div>
       </div>

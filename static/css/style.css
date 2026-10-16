@@ -1974,6 +1974,8 @@ body.actbar-on #app-toast { bottom: 78px; }
 .live-strip .sep-dot { color: var(--text-faint); }
 .done-strip::before { background: var(--ok); }
 .done-strip .fx { color: var(--ok); font-weight: 800; }
+/* A finished recording whose converted file lost video (dev/changelog/1200). */
+.done-strip .gaps-note { color: var(--warn); }
 .fail-strip::before { background: var(--bad); }
 .fail-strip .fx { color: var(--bad); font-weight: 800; }
 .abort-strip::before { background: var(--text-faint); }
