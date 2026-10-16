@@ -210,6 +210,58 @@ def recording_formats(segments):
     return keys
 
 
+def file_format_stretches(survey):
+    """What a whole-file format survey says about the file's formats, keyed the way the
+    segments are: {'first': key, 'main': key, 'others': [(key, seconds, [(start, end),
+    ...]), ...]}, or None when the survey recorded no stretches (it failed, or predates
+    dev/changelog/1201).
+
+    `main` is the format the file holds longest and `first` the one its header describes;
+    `others` is every other format in order of first appearance, empty for a file that held
+    one format throughout. Adjacent stretches that key the same are one stretch: 59.94 and
+    60 are one format here exactly as they are for the pin.
+
+    Pure - the survey dict is already in hand wherever this is asked. This is the answer
+    to "does the file change format, where, and for how long"; recording_formats() answers
+    only what each segment OPENED at, which a short stretch after a restart can misstate in
+    both directions (dev/changelog/1201)."""
+    runs = (survey or {}).get('format_runs')
+    if not runs:
+        return None
+    totals = {}
+    for w, h, rate, seconds in survey.get('format_seconds') or ():
+        key = format_key_from(f'{w}x{h}', rate)
+        if key is not None:
+            totals[key] = totals.get(key, 0.0) + float(seconds)
+    stretches = {}
+    order = []
+    prev_key = None
+    for start, end, w, h, rate in runs:
+        key = format_key_from(f'{w}x{h}', rate)
+        if key is None:
+            continue
+        if key not in stretches:
+            stretches[key] = []
+            order.append(key)
+        if key == prev_key and stretches[key]:
+            stretches[key][-1] = (stretches[key][-1][0], end)
+        else:
+            stretches[key].append((start, end))
+        prev_key = key
+    # A format first seen past the listed stretches is still in the totals.
+    for key in totals:
+        if key not in stretches:
+            stretches[key] = []
+            order.append(key)
+    if not order:
+        return None
+    for key in order:
+        totals.setdefault(key, sum(e - s for s, e in stretches[key]))
+    main = max(order, key=lambda k: totals[k])
+    return {'first': order[0], 'main': main,
+            'others': [(k, totals[k], stretches[k]) for k in order if k != main]}
+
+
 def format_label(key) -> str:
     """Human-readable label for a format_key tuple, e.g. "1920x1080 @ 60"."""
     if not key:

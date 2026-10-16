@@ -942,7 +942,11 @@ def _row_times(rec, now, tz):
     return day, rel
 
 
-def _index_row(rec, now, tz, thumb_ids, live_seg_bytes=0):
+def _index_row(rec, now, tz, thumb_ids, live_seg_bytes=0, file_formats=None):
+    """file_formats is channel_groups.file_format_stretches() over the recording's format
+    survey, when the caller has it in hand - the detail page does, from events it loaded
+    anyway. Without it the format clause falls back on what each segment opened at, which
+    is all a list row can read without a query per row."""
     # The WAITING derivation is inside rec_status_display, so this row and the Dashboard's
     # row and chip cannot name the same parked recording three different ways.
     section, st_class, badge_class, badge_label, pulse = fmt_utils.rec_status_display(
@@ -1036,12 +1040,22 @@ def _index_row(rec, now, tz, thumb_ids, live_seg_bytes=0):
     spanned = f' Spanned {distinct_channels} channels.' if distinct_channels > 1 else ''
     # A mixed-format file plays (dev/changelog/754), so this adds a sentence rather than moving
     # the pill - what it corrects is a tooltip calling the file a clean, uniform capture.
-    formats = recording_formats(rec.segments)
+    # The segments' probes read only each opening, so that fallback says "opened at" and
+    # never how long; the survey's stretches are the measured answer (dev/changelog/1201).
     format_change = None
-    if len(formats) > 1:
-        format_change = (f'Format changed mid-recording: '
-                         f'{", then ".join(format_label(k) for k in formats)}. The file plays, '
-                         f'but its header describes only {format_label(formats[0])}.')
+    if file_formats is not None:
+        if file_formats['others']:
+            from ..postprocessor import describe_format_stretches
+            format_change = (f'Format changed mid-recording: '
+                             f'{describe_format_stretches(file_formats)}. The file plays, '
+                             f'but its header describes only '
+                             f'{format_label(file_formats["first"])}.')
+    else:
+        formats = recording_formats(rec.segments)
+        if len(formats) > 1:
+            format_change = (f'Format changed mid-recording: segments opened at '
+                             f'{", then ".join(format_label(k) for k in formats)}. The file '
+                             f'plays, but its header describes only {format_label(formats[0])}.')
     format_tail = f' {format_change}' if format_change else ''
     if not rec.segments:
         health = {'cls': 'na', 'label': '-', 'tip': None}
@@ -1138,6 +1152,8 @@ def _index_row(rec, now, tz, thumb_ids, live_seg_bytes=0):
         'health': health, 'format_change': format_change,
         'progress_pct': progress_pct,
         'output_file': os.path.basename(rec.output_path) if rec.output_path else None,
+        'converted_gaps': (fmt_utils.fmt_duration(rec.converted_gap_seconds, with_seconds=True)
+                           if (rec.converted_gap_seconds or 0) > 0 else None),
         'edit': edit,
         # sort keys
         'sort_start': int(rec.start_time.timestamp()),
@@ -1375,6 +1391,13 @@ def recording_detail(recording_id):
             recover_act = 'retry-concat'
     elif rec.status == REC_STATUS_ABORTED and ts_source_available:
         recover_act = 'retry-convert'
+    # A finished recording whose converted file is missing video, and whose source was kept
+    # because of it, can be converted again too (dev/changelog/1200). Its own flag, because
+    # the retry deletes the converted file first and the confirm has to say so.
+    gaps_retry = False
+    if rec.status == REC_STATUS_COMPLETED and (rec.converted_gap_seconds or 0) > 0:
+        from ..postprocessor import kept_source_path
+        gaps_retry = kept_source_path(rec.id) is not None
     cfg = load_config()
     thumb_cfg = cfg.get('recording', {}).get('live_thumbnail', {})
 
@@ -1441,6 +1464,16 @@ def recording_detail(recording_id):
     distinct_accounts = _distinct_accounts(rec, seg_channels)
     event_channel_links = group_event_channel_links(rec.events)
     video, audio, tech_source = _tech_parts(rec)
+    # The whole-file format survey, once the analysis phase has run it, is the measured
+    # answer to which format the file holds and where; the segment probes behind
+    # _tech_parts read only each segment's opening (dev/changelog/1201).
+    from ..channel_groups import file_format_stretches
+    from ..postprocessor import _recorded_survey
+    file_formats = file_format_stretches(_recorded_survey(rec.id))
+    video_basis = 'segment'
+    if file_formats is not None and tech_source == 'capture':
+        video = _fmt_video(*file_formats['main'])
+        video_basis = 'survey'
     # The open segment's bytes_recorded is only written when it ends, so its row, the Size
     # stat and the banner would disagree for the whole segment. The banner's number is this
     # same file's size (watchdog._publish_snapshot); one stat for the one open segment.
@@ -1453,7 +1486,7 @@ def recording_detail(recording_id):
         except OSError:  # ffmpeg has not created the file yet
             live_seg_bytes = 0
     row = _index_row(rec, now, get_display_tz(), {rec.id} if has_shot else set(),
-                     live_seg_bytes=live_seg_bytes)
+                     live_seg_bytes=live_seg_bytes, file_formats=file_formats)
     concat_prog, joinable_count = _join_strip_context(rec)
     # None for every status but ANALYZING, and also for an ANALYZING row whose passes are
     # done or have not started - the strip's generic wording covers that, per
@@ -1480,12 +1513,14 @@ def recording_detail(recording_id):
         ts_source_available=ts_source_available,
         segment_files_on_disk=segment_files_on_disk,
         recover_act=recover_act,
+        gaps_retry=gaps_retry,
         conversion_max_attempts=conversion_max_attempts,
         max_dead_stream_retry_attempts=max_dead_stream_retry_attempts,
         now=now,
         concat_prog=concat_prog, joinable_count=joinable_count,
         analysis_prog=analysis_prog,
-        row=row, video=video, audio=audio, tech_source=tech_source, fmt=_format_profile(rec),
+        row=row, video=video, video_basis=video_basis, audio=audio, tech_source=tech_source,
+        fmt=_format_profile(rec),
         seg_offset=seg_offset, seg_stderr=seg_stderr, seg_channels=seg_channels,
         fast_delivery_segs=fast_delivery_segs,
         live_seg_id=live_seg_id, live_seg_bytes=live_seg_bytes,
@@ -2762,10 +2797,16 @@ def retry_convert(recording_id):
     # FAILED (retry a given-up conversion), CONVERTING or ANALYZING (a row stranded by a
     # restart/crash that nothing is working), or ABORTED (post-processing the user
     # cancelled). Refuse if anything is genuinely live for this id so two chains don't fight
-    # over the same output.
-    if rec.status not in (REC_STATUS_FAILED, REC_STATUS_ANALYZING, REC_STATUS_CONVERTING,
-                          REC_STATUS_ABORTED):
-        flash('Conversion retry is only available for failed, cancelled, or stalled recordings.', 'error')
+    # over the same output. Also a COMPLETED recording whose converted file is missing video
+    # its source has: the source was kept for exactly this (dev/changelog/1200).
+    gaps_source = None
+    if rec.status == REC_STATUS_COMPLETED and (rec.converted_gap_seconds or 0) > 0:
+        from ..postprocessor import kept_source_path
+        gaps_source = kept_source_path(recording_id)
+    if gaps_source is None and rec.status not in (
+            REC_STATUS_FAILED, REC_STATUS_ANALYZING, REC_STATUS_CONVERTING, REC_STATUS_ABORTED):
+        flash('Conversion retry is only available for failed, cancelled, or stalled recordings, '
+              'or a converted file with gaps whose source was kept.', 'error')
         return redirect(url_for('recordings.recording_detail', recording_id=recording_id))
 
     # Two registries, because they answer at different times: is_conversion_active() only
@@ -2776,10 +2817,27 @@ def retry_convert(recording_id):
         flash('Post-processing is already running for this recording.', 'error')
         return redirect(url_for('recordings.recording_detail', recording_id=recording_id))
 
-    ts_path = rec.output_path
-    if not ts_path or not ts_path.endswith('.ts') or not os.path.exists(ts_path):
-        flash('No joined .ts source file found on disk - cannot retry conversion.', 'error')
-        return redirect(url_for('recordings.recording_detail', recording_id=recording_id))
+    damaged_output = None
+    if gaps_source is not None:
+        # The file with the gaps goes first. The new conversion is written under the same
+        # name, and a move on completion would otherwise file it beside the old one as a
+        # renamed copy. Refused rather than half-done when it cannot be deleted.
+        ts_path = gaps_source
+        damaged_output = rec.output_path
+        if damaged_output and damaged_output != ts_path and os.path.exists(damaged_output):
+            try:
+                os.unlink(damaged_output)
+            except OSError as exc:
+                log.warning('Recording %d: could not delete the converted file with gaps %s: %s',
+                            recording_id, damaged_output, exc)
+                flash(f'Could not delete the converted file with gaps ({exc}) - conversion '
+                      f'not retried.', 'error')
+                return redirect(url_for('recordings.recording_detail', recording_id=recording_id))
+    else:
+        ts_path = rec.output_path
+        if not ts_path or not ts_path.endswith('.ts') or not os.path.exists(ts_path):
+            flash('No joined .ts source file found on disk - cannot retry conversion.', 'error')
+            return redirect(url_for('recordings.recording_detail', recording_id=recording_id))
 
     # ANALYZING, not CONVERTING: do_postprocess re-reads the whole .ts before it spawns any
     # ffmpeg, so a row marked CONVERTING here would be back to naming a phase the app is not
@@ -2797,6 +2855,16 @@ def retry_convert(recording_id):
         # row as well as a FAILED one; the next terminal writer names its own.
         r.failure_reason = None
         r.cancel_reason = None
+        if damaged_output is not None:
+            # The row stops naming a file that is gone, and stops describing its gaps.
+            r.output_path = ts_path
+            r.converted_gap_seconds = None
+            add_recording_event(
+                recording_id, DIAGNOSTICS,
+                detail=f'Deleted the converted file with gaps '
+                       f'({os.path.basename(damaged_output)}) to convert again from the '
+                       f'kept source {os.path.basename(ts_path)}.',
+                extra={'kind': 'converted_file_discarded', 'deleted_path': damaged_output})
         db.session.commit()
 
     _mark_analyzing_and_commit()

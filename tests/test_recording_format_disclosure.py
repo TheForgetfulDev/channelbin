@@ -92,7 +92,7 @@ class ListTooltipTests(_Seeded):
         rec = self._rec([('1920x1080', 59.94), ('1280x720', 29.97)])
         health = self._row(rec.id)['health']
         self.assertNotIn('clean capture', health['tip'])
-        self.assertIn('Format changed mid-recording: 1920x1080 @ 60, then 1280x720 @ 30',
+        self.assertIn('Format changed mid-recording: segments opened at 1920x1080 @ 60, then 1280x720 @ 30',
                       health['tip'])
         self.assertIn('header describes only 1920x1080 @ 60', health['tip'])
 
@@ -145,7 +145,7 @@ class DetailPageTests(_Seeded):
         rec = self._rec([('1920x1080', 60), ('1280x720', 30)])
         html = self._page(rec.id)
         self.assertIn('720p30 · format changed', html)
-        self.assertIn('Format changed mid-recording: 1920x1080 @ 60, then 1280x720 @ 30', html)
+        self.assertIn('Format changed mid-recording: segments opened at 1920x1080 @ 60, then 1280x720 @ 30', html)
         row = html[html.index('<span class="sk">Video</span>'):]
         self.assertTrue(row.split('>', 2)[2].startswith('<span class="sv warn'))
 

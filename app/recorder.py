@@ -21,6 +21,7 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from . import db
 from .config import load_config
+from .version import __version__
 from .database import (
     Channel, Recording, RecordingSegment, RecordingEvent, add_recording_event,
     SEGMENT_STARTED, SEGMENT_ENDED, RECORDING_HANDOFF, DIAGNOSTICS, RESTART_ATTEMPTED,
@@ -1778,8 +1779,13 @@ def _launch_segment(app, recording_id: int, seg_num: int) -> str:
             if pace:
                 detail += (f', reading the stream at real-time speed '
                            f'({_PACING_NOTES[pace_source]})')
+            # The version that captured it, which a support bundle built after an upgrade
+            # cannot tell from its own. Segment 1 only: every extra_data renders as a
+            # disclosure in the event log, and one per reconnect is clutter
+            # (dev/changelog/1193).
             add_recording_event(recording_id, SEGMENT_STARTED, detail=detail,
-                                segment_number=seg_num)
+                                segment_number=seg_num,
+                                extra={'app_version': __version__} if seg_num == 1 else None)
             db.session.commit()
             return seg.id
 

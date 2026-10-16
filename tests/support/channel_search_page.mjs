@@ -73,7 +73,7 @@ const JS = ['util.js', 'auto-rule-modal.js', 'channel-search.js'].map(
 function boot({ rows = ROWS, saved = null, url = 'http://localhost:5000/channels',
                 width = 1280, hold = null, holdCounts = false, declineWhy = null,
                 pinnedWidth = null, catalog = CATALOG, uncounted = null,
-                ruleCtx = undefined } = {}) {
+                ruleCtx = undefined, ruleAnswers = null } = {}) {
   const held = [];
   // Mutable, so a scenario can boot normally and start parking only once it is about
   // to do the thing it cares about - the grain flip needs channel rows on screen first.
@@ -96,8 +96,13 @@ function boot({ rows = ROWS, saved = null, url = 'http://localhost:5000/channels
     const entry = { url: href, method, body, signal: opts.signal || null, aborted: false };
     sent.push(entry);
     let payload = { success: true };
+    let status = 200;
     let park = false;
-    if (href.includes('/api/auto-rules')) {
+    if (href.includes('/api/auto-rules') && method === 'PUT' && ruleAnswers && ruleAnswers.length) {
+      // A scenario's own answers to Save to rule, in order - the 409 that names the
+      // recordings a new search no longer matches, then the save (dev/changelog/1203).
+      ({ status, payload } = ruleAnswers.shift());
+    } else if (href.includes('/api/auto-rules')) {
       // The rule errand's two writes: Create rule (POST) and Save to rule (PUT). Answered
       // the way the routes answer a save, with the check's outcome and the rule's page.
       payload = { success: true, url: '/rules/7',
@@ -201,7 +206,7 @@ function boot({ rows = ROWS, saved = null, url = 'http://localhost:5000/channels
       park = holdGrain !== null && (qs.get('grain') || 'channels') === holdGrain;
     }
     const answer = () => ({
-      ok: true, status: 200,
+      ok: status < 400, status,
       headers: { get: () => 'application/json' },
       json: () => Promise.resolve(payload),
       text: () => Promise.resolve(JSON.stringify(payload)),
@@ -950,6 +955,40 @@ async function ruleErrandScenario() {
   obs.edit_mode.put = put ? { url: put.url, body: put.body } : null;
   obs.edit_mode.navigated = c.errors.some((e) => /navigation/i.test(e));
   obs.edit_mode.pending_toast = JSON.parse(c.window.sessionStorage.getItem('app-pending-toast') || 'null');
+
+  /* A new search that leaves scheduled recordings behind: the save's 409 names them, the
+     page asks, and the answer goes back with the ids it showed (dev/changelog/1203). */
+  const UNMATCHED = { error: 'The new search no longer matches 2 recordings this rule has scheduled.',
+                      unmatched: [{ id: 41, name: 'Cup Race - Alpha', when: 'Sun Oct 18, 3:00 PM' },
+                                  { id: 42, name: 'Cup Race - Bravo', when: 'Sun Oct 25, 3:00 PM' }],
+                      determined: true, reason: null };
+  c = boot({ url: `${AIR}&q=Cup&rule=7`, ruleCtx: EDIT, ruleAnswers: [
+    { status: 409, payload: UNMATCHED },
+    { status: 200, payload: { success: true, cancelled: 2, kept: 0,
+                              evaluation: { queued: false, rule_id: 7, scheduled: 1, skipped: {},
+                                            already_scheduled: 0, retracked: 0, error: null,
+                                            problems: null, abandoned: false,
+                                            guide_reach: '2026-10-16T23:00:00' } } },
+  ] });
+  await c.settle();
+  c.click(c.$('#rule-save'));
+  await c.wait(20);
+  const asked = c.$$('.modal').find((m) => m.querySelector('input[name="ru-fate"]')) || null;
+  obs.unmatched = {
+    asked: !!asked,
+    title: asked ? asked.querySelector('.modal-head h2').textContent : null,
+    listed: asked ? Array.from(asked.querySelectorAll('.statlist .sk')).map((e) => e.textContent) : [],
+    navigated_before_answer: c.errors.some((e) => /navigation/i.test(e)),
+    puts_before_answer: c.sent.filter((x) => x.method === 'PUT').length,
+  };
+  if (asked) {
+    c.click(asked.querySelector('.modal-foot .btn-primary'));
+    await c.wait(20);
+  }
+  const answered = c.sent.filter((x) => x.method === 'PUT').pop();
+  obs.unmatched.answer = answered ? answered.body.unmatched || null : null;
+  obs.unmatched.navigated = c.errors.some((e) => /navigation/i.test(e));
+  obs.unmatched.pending_toast = JSON.parse(c.window.sessionStorage.getItem('app-pending-toast') || 'null');
 
   c = boot({ url: `${AIR}&rule=7`, ruleCtx: EDIT });
   await c.settle();

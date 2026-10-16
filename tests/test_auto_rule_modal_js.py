@@ -213,6 +213,64 @@ class AutoRuleModalTests(unittest.TestCase):
         self.assertEqual(self.obs['counts_text'], [words(c) for c in COUNTS])
         self.assertEqual(self.obs['counts_text'][1], '1 scheduled, 2 repeats skipped')
 
+    # -- the question a changed search asks (dev/changelog/1203) ---------------------------
+
+    def test_the_question_lists_each_recording_and_defaults_to_cancelling(self):
+        first = self.obs['unmatched_cancel']['first']
+        self.assertEqual(first['title'], 'Save new search')
+        self.assertIn('The new search no longer matches 2 recordings "Cup <Series>" has '
+                      'scheduled:', first['text'])
+        self.assertEqual(first['listed'], [['Cup Race - Alpha', 'Sun Oct 18, 3:00 PM'],
+                                           ['Cup Race - Bravo', 'Sun Oct 25, 3:00 PM']])
+        self.assertEqual(first['checked'], 'cancel')
+        self.assertEqual(first['choices'], ['Cancel the 2 scheduled recordings',
+                                            'Keep them as ordinary recordings'])
+        self.assertIn('Nothing that already started is touched.', first['text'])
+        self.assertEqual(first['footer'], [['Cancel', 'btn'], ['Save to rule', 'btn btn-primary']])
+
+    def test_the_answer_carries_the_choice_and_every_id_shown(self):
+        cancel = self.obs['unmatched_cancel']
+        self.assertEqual(cancel['saves'], [{'action': 'cancel', 'ids': [41, 42]}])
+        self.assertEqual((cancel['done'], cancel['open']), (1, False))
+        keep = self.obs['unmatched_keep']
+        self.assertEqual(keep['first']['choices'], ['Cancel it', 'Keep it as ordinary recordings'])
+        self.assertEqual(keep['saves'], [{'action': 'keep', 'ids': [41]}])
+        self.assertEqual(keep['done'], 1)
+
+    def test_a_search_it_could_not_compare_says_so_and_lists_them_all(self):
+        """Asking about every recording is the fallback when the comparison cannot be made,
+        and the dialog says that is what it is doing and why."""
+        first = self.obs['unmatched_undetermined']['first']
+        self.assertIn('could not tell which of the 2 recordings "Cup <Series>" has scheduled '
+                      'the new search still matches, so all of them are listed.', first['text'])
+        self.assertIn('more than 1,000 upcoming showings', first['text'])
+        self.assertEqual(len(first['listed']), 2)
+
+    def test_a_list_that_grew_is_shown_again_before_anything_is_saved(self):
+        """A second 409 redraws the dialog with the server's new list, keeps the person's
+        choice, and saves nothing until they press again."""
+        grew = self.obs['unmatched_grew']
+        self.assertEqual(grew['saves'], [{'action': 'keep', 'ids': [41]}])
+        self.assertTrue(grew['open'])
+        self.assertEqual(grew['done'], 0)
+        self.assertEqual(grew['listed_after'], ['Cup Race - Alpha', 'Cup Race - Bravo'])
+        self.assertEqual(grew['checked_after'], 'keep')
+        self.assertTrue(grew['error_shown'])
+        self.assertIn('The list changed', grew['error'])
+
+    def test_a_refusal_stays_in_the_question(self):
+        refused = self.obs['unmatched_refused']
+        self.assertTrue(refused['open'])
+        self.assertEqual(refused['done'], 0)
+        self.assertTrue(refused['error_shown'])
+        self.assertEqual(refused['error'], 'Rule not found.')
+
+    def test_the_saved_toast_says_what_became_of_them(self):
+        self.assertEqual(self.obs['unmatched_text'], [
+            '', ' 1 scheduled recording cancelled.', ' 2 scheduled recordings cancelled.',
+            ' 1 recording kept as an ordinary recording.',
+            ' 1 scheduled recording cancelled. 3 recordings kept as ordinary recordings.'])
+
     def test_number_boxes_never_round_what_was_typed(self):
         """A non-integer goes to the server as typed, so its own sentence refuses it -
         Python's int(1.5) would otherwise quietly store 1."""

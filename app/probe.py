@@ -1,4 +1,5 @@
 """Shared ffprobe utility used by channel tester and post-processor."""
+import heapq
 import json
 import logging
 import math
@@ -542,6 +543,134 @@ def nominal_video_rate(filepath: str, timeout: int = 60):
     return None
 
 
+def stream_ends(filepath: str, timeout: int = 120) -> dict:
+    """Where each video and audio stream of a file ends, in seconds from the file's own start.
+
+    Returns {'duration': <format duration or None>, 'video': [ends], 'audio': [ends]}, or {}
+    when ffprobe cannot read the file. A stream that states no duration is left out of its
+    list rather than guessed at.
+
+    The format duration is the LONGEST stream, so it overstates how far a file reaches
+    whenever one track runs on past the other. A killed conversion part whose audio ran 7
+    minutes past its video was measured that way, and the resume skipped the video in between
+    (dev/changelog/1194). Header-only: no packet is read.
+    """
+    ffprobe_path = resolve_ffprobe_path()
+    cmd = [ffprobe_path, '-v', 'quiet', '-print_format', 'json',
+           '-show_entries', 'format=start_time,duration:stream=codec_type,start_time,duration',
+           filepath]
+    try:
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        except OSError as exc:
+            # See parse_ffprobe: a spawn that fails on argv[0] is this machine's problem.
+            _report_ffprobe_unusable(ffprobe_path, exc, os.path.basename(filepath))
+            return {}
+        if result.returncode != 0:
+            return {}
+        data = json.loads(result.stdout)
+    except (subprocess.SubprocessError, ValueError) as exc:
+        log.debug('stream_ends failed for %s: %s', filepath, exc)
+        return {}
+
+    def _num(raw):
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            return None
+
+    fmt = data.get('format') or {}
+    origin = _num(fmt.get('start_time')) or 0.0
+    out = {'duration': _num(fmt.get('duration')), 'video': [], 'audio': []}
+    for stream in data.get('streams') or []:
+        kind = stream.get('codec_type')
+        if kind not in ('video', 'audio'):
+            continue
+        dur = _num(stream.get('duration'))
+        if dur is None:
+            continue
+        start = _num(stream.get('start_time')) or 0.0
+        out[kind].append(start + dur - origin)
+    return out
+
+
+def tail_track_ends(filepath: str, window: float = 30.0, timeout: int = 120) -> dict:
+    """Where the first video and the first audio track end, in seconds from the file's own
+    start, read from the packets at the end of the file. Returns {'video': end, 'audio': end}
+    with a key left out when that track has no packet in the tail read, or {} when ffprobe
+    cannot read the file.
+
+    stream_ends() cannot answer this on an MPEG-TS whose video stops well before its audio:
+    ffprobe estimates a TS stream's duration from the file's last few hundred KB, so a video
+    track that ended a minute before the audio states no duration at all (measured on ffmpeg
+    7.1 here). This seeks `window` seconds before the end instead - the seek lands on the
+    last video packet at or before that point, however far back it is - and reads to EOF.
+    The cost is the tail itself: about 22 MB for a 15-minute audio-only overhang.
+    """
+    ffprobe_path = resolve_ffprobe_path()
+    head = [ffprobe_path, '-v', 'quiet', '-print_format', 'json',
+            '-show_entries', 'format=start_time,duration:stream=index,codec_type', filepath]
+    try:
+        try:
+            result = subprocess.run(head, capture_output=True, text=True, timeout=timeout)
+        except OSError as exc:
+            # See parse_ffprobe: a spawn that fails on argv[0] is this machine's problem.
+            _report_ffprobe_unusable(ffprobe_path, exc, os.path.basename(filepath))
+            return {}
+        if result.returncode != 0:
+            return {}
+        data = json.loads(result.stdout)
+    except (subprocess.SubprocessError, ValueError) as exc:
+        log.debug('tail_track_ends failed for %s: %s', filepath, exc)
+        return {}
+
+    fmt = data.get('format') or {}
+    origin = _packet_time(str(fmt.get('start_time', ''))) or 0.0
+    duration = _packet_time(str(fmt.get('duration', '')))
+    kinds = {}
+    for stream in data.get('streams') or []:
+        kind = stream.get('codec_type')
+        if kind in ('video', 'audio') and kind not in kinds.values():
+            kinds[stream.get('index')] = kind
+    if not duration or not kinds:
+        return {}
+
+    target = max(origin, origin + duration - window)
+    ends = {}
+
+    def _on_line(line):
+        fields = line.strip().rstrip(',').split(',')
+        if len(fields) < 2:
+            return
+        try:
+            kind = kinds.get(int(fields[0]))
+        except ValueError:
+            return
+        pts = _packet_time(fields[1])
+        if kind is None or pts is None:
+            return
+        dur = _packet_time(fields[2]) if len(fields) > 2 else None
+        end = pts + (dur or 0.0)
+        if end > ends.get(kind, float('-inf')):
+            ends[kind] = end
+
+    tail = [ffprobe_path, '-v', 'quiet', '-read_intervals', f'{target:.3f}%',
+            '-show_entries', 'packet=stream_index,pts_time,duration_time', '-of', 'csv=p=0',
+            filepath]
+    try:
+        returncode = _stream_probe_lines(tail, _on_line, timeout=timeout)
+    except OSError as exc:
+        _report_ffprobe_unusable(ffprobe_path, exc, os.path.basename(filepath))
+        return {}
+    except subprocess.TimeoutExpired:
+        log.warning('Reading the end of %s stalled for %ds - track ends unknown',
+                    os.path.basename(filepath), timeout)
+        return {}
+    if returncode != 0:
+        return {}
+    return {kind: end - origin for kind, end in ends.items()}
+
+
 def _nominal_fps(filepath: str) -> float | None:
     raw = nominal_video_rate(filepath)
     if raw:
@@ -668,6 +797,68 @@ def _parse_sar(raw):
     return num / den if num > 0 and den > 0 else None
 
 
+#: How many format stretches survey_formats() lists. A feed that flaps between two formats
+#: all night must not grow a DIAGNOSTICS row without bound; format_seconds still totals
+#: every stretch and format_run_count says how many there were.
+FORMAT_RUNS_LISTED = 50
+
+
+class _FormatRuns:
+    """survey_formats()' stretch accumulator: one keyframe at a time, in file order.
+
+    A keyframe with no readable rate keeps the stretch's rate rather than starting a new
+    one - unknown is not different. Rates within RATE_SAME_TOLERANCE are one rate, the same
+    rule video_rates uses, so the two answers cannot disagree about how many rates there
+    were."""
+
+    def __init__(self):
+        self.listed = []
+        self.count = 0
+        self._totals = {}
+        self._t0 = None
+        self._run = None
+        self._last_t = None
+        self._last_step = 0.0
+
+    def add(self, t, width, height, rate):
+        if t is None:
+            return
+        if self._t0 is None:
+            self._t0 = t
+        if self._last_t is not None and t > self._last_t:
+            self._last_step = t - self._last_t
+        self._last_t = t if self._last_t is None else max(t, self._last_t)
+        run = self._run
+        if run is not None:
+            same_rate = (rate is None or run['rate'] is None
+                         or abs(rate - run['rate']) / run['rate'] <= RATE_SAME_TOLERANCE)
+            if (width, height) == (run['w'], run['h']) and same_rate:
+                if run['rate'] is None:
+                    run['rate'] = rate
+                return
+            self._close(t)
+        self._run = {'start': t, 'w': width, 'h': height, 'rate': rate}
+
+    def _close(self, end):
+        run = self._run
+        seconds = max(0.0, end - run['start'])
+        key = (run['w'], run['h'], run['rate'])
+        self._totals[key] = self._totals.get(key, 0.0) + seconds
+        self.count += 1
+        if len(self.listed) < FORMAT_RUNS_LISTED:
+            self.listed.append([round(run['start'] - self._t0, 2), round(end - self._t0, 2),
+                                run['w'], run['h'], run['rate']])
+
+    def finish(self):
+        if self._run is not None:
+            self._close(self._last_t + self._last_step)
+            self._run = None
+
+    def totals(self):
+        return [[w, h, rate, round(seconds, 2)]
+                for (w, h, rate), seconds in self._totals.items()]
+
+
 def survey_formats(filepath: str, timeout: int = 600, on_progress=None) -> dict:
     """Every picture size, audio layout, interlacing and transfer function the file carries,
     from ONE whole-file read: video keyframes only (`-skip_frame nokey`) and every audio
@@ -688,15 +879,30 @@ def survey_formats(filepath: str, timeout: int = 600, on_progress=None) -> dict:
         transfers       distinct color_transfer values a keyframe stated
         audio_channels  distinct channel counts across every audio stream
         keyframes, audio_frames  how much was seen, so an empty answer is explainable
+        format_runs     [[start, end, width, height, rate], ...] - WHEN each picture size
+                        and rate held, in seconds from the first keyframe, one entry per
+                        unbroken stretch; the first FORMAT_RUNS_LISTED only
+        format_run_count  how many stretches there were, listed or not
+        format_seconds  [[width, height, rate, seconds], ...] - the total time at each,
+                        over every stretch
+
+    The runs are what tells a short stretch from a long one. The segment probes cannot:
+    recording 16's two restarts each opened on a minute or two of 720p29.97 inside four
+    hours of 1080p59.94, and recording 17's feed dropped to that rate 25s into a segment
+    whose probe had read 1080p59.94 (dev/changelog/1201). A stretch ends at the keyframe
+    that starts the next one, and the last one a keyframe interval after its last
+    keyframe, so a boundary is placed to within one GOP.
     """
     if not filepath or not os.path.exists(filepath):
         return {}
     ffprobe_path = resolve_ffprobe_path()
     cmd = [ffprobe_path, '-v', 'error', '-skip_frame', 'nokey', '-show_entries',
-           'frame=media_type,stream_index,width,height,sample_aspect_ratio,interlaced_frame,'
-           'color_transfer,duration_time,channels', '-of', 'compact=p=0', filepath]
+           'frame=media_type,stream_index,pts_time,best_effort_timestamp_time,width,height,'
+           'sample_aspect_ratio,interlaced_frame,color_transfer,duration_time,channels',
+           '-of', 'compact=p=0', filepath]
     st = {'sizes': set(), 'interlaced': False, 'transfers': set(), 'channels': set(),
           'rates': [], 'video_stream': None, 'keyframes': 0, 'audio_frames': 0}
+    runs = _FormatRuns()
 
     def _on_line(line):
         fields = dict(part.split('=', 1) for part in line.strip().split('|') if '=' in part)
@@ -720,10 +926,15 @@ def survey_formats(filepath: str, timeout: int = 600, on_progress=None) -> dict:
             # A keyframe's duration is one frame at the rate in force there, so a rate change
             # inside one segment shows up here as it does nowhere else.
             duration = _packet_time(fields.get('duration_time', ''))
+            rate = None
             if duration and 0.001 < duration < 1.0:
                 rate = round(1.0 / duration, 3)
                 if not any(abs(rate - r) / r <= RATE_SAME_TOLERANCE for r in st['rates']):
                     st['rates'].append(rate)
+            t = _packet_time(fields.get('pts_time', ''))
+            if t is None:
+                t = _packet_time(fields.get('best_effort_timestamp_time', ''))
+            runs.add(t, w, h, rate)
             transfer = fields.get('color_transfer') or ''
             if transfer and transfer not in ('unknown', 'unspecified', 'reserved'):
                 st['transfers'].add(transfer)
@@ -746,6 +957,7 @@ def survey_formats(filepath: str, timeout: int = 600, on_progress=None) -> dict:
         return {}
     if returncode != 0 or not st['keyframes']:
         return {}
+    runs.finish()
     return {
         'video_sizes': [list(s) for s in sorted(st['sizes'])],
         'interlaced': st['interlaced'],
@@ -754,6 +966,9 @@ def survey_formats(filepath: str, timeout: int = 600, on_progress=None) -> dict:
         'audio_channels': sorted(st['channels']),
         'keyframes': st['keyframes'],
         'audio_frames': st['audio_frames'],
+        'format_runs': runs.listed,
+        'format_run_count': runs.count,
+        'format_seconds': runs.totals(),
     }
 
 
@@ -826,7 +1041,8 @@ def measure_loudness(filepath: str, ffmpeg_path: str, timeout: int = 600,
 
 
 def scan_video_timeline(filepath: str, gap_threshold: float = 0.25, timeout: int = 600,
-                        expected_fps: float | None = None, on_progress=None) -> dict:
+                        expected_fps: float | None = None, on_progress=None,
+                        max_gaps_listed: int = 20) -> dict:
     """Scan every video packet's timestamps and measure timeline damage.
 
     Gaps are counted on the DECODE timeline (dts_time), never the presentation timeline.
@@ -850,10 +1066,12 @@ def scan_video_timeline(filepath: str, gap_threshold: float = 0.25, timeout: int
                          would span the joins rather than the capture)
         packet_count     video packets seen
         fps              nominal frame rate (r_frame_rate)
-        deficit_fps      the rate deficit_seconds was actually divided by - `fps` unless
-                         the caller passed expected_fps. The two differ only on a file
-                         whose capture rate changed partway through, and keeping both is
-                         what makes the deficit number explainable after the fact
+        deficit_basis    how deficit_seconds counted the packets' content time:
+                         'frame_durations' when every packet carried its own duration,
+                         'nominal_rate' when none did (each counts 1/deficit_fps), and
+                         'partial_durations' when some did and the rest fell back
+        deficit_fps      the rate a packet WITHOUT a duration was counted at - `fps` unless
+                         the caller passed expected_fps. Unused on 'frame_durations'
         gap_basis        'dts'; 'none' on the rare stream carrying no DTS at all, where
                          gap_count is 0 and deficit_seconds alone carries the verdict.
                          assess_seek_damage() rewrites it to 'dts-post-concat' when it
@@ -864,17 +1082,28 @@ def scan_video_timeline(filepath: str, gap_threshold: float = 0.25, timeout: int
         gap_seconds      total time inside those gaps
         max_gap_seconds  largest single gap
         backward_count   DTS steps that went backwards (concat-boundary diagnostic)
-        deficit_seconds  span - packet_count/deficit_fps - catches micro-gaps below the
-                         threshold
+        deficit_seconds  span minus the content time the packets account for - catches
+                         micro-gaps below the threshold
         missing_seconds  max(gap_seconds, deficit_seconds) - the headline damage number
+        gaps             [(start, end), ...] in seconds from the file's earliest presented
+                         frame, in file order: the largest max_gaps_listed gaps only, so
+                         gap_count may be larger than len(gaps)
 
-    expected_fps overrides the header rate for the deficit division ONLY. The header rate
-    is whatever the file's first stretch was captured at, so on a concatenation whose
-    segments ran at different rates it turns every frame captured at the lower rate into a
-    missing frame: recording 2 measured 1,200s missing from a 12,949s timeline against 0.41s
-    of real damage (dev/changelog/866). This function measures a file and cannot know it was
-    concatenated, let alone from what - so the corrected rate is a parameter, and
-    assess_seek_damage() is what derives it from the segment rows.
+    Each packet counts as its OWN duration, which the demuxer derives from the stream's
+    timing at that point in the file, so a stretch at 29.97 fps counts 1/29.97 a frame and
+    a stretch at 59.94 counts 1/59.94 - exact across any number of rate changes, including
+    one inside a segment. Dividing the packet count by one rate is what this replaced: the
+    header rate turns every frame of a lower-rate stretch into a missing frame (recording 2,
+    1,200s missing against 0.41s of real damage, dev/changelog/866), and a rate blended from
+    the segments' opening probes was blind when a probe caught only a short opening
+    (recording 16 read 0.0s missing beside 96.3% of expected frames, dev/changelog/1201).
+    Measured on every real capture in the GPU lab's clips and through the concat join:
+    every packet carries a duration at its stretch's rate.
+
+    expected_fps is the fallback for a packet that carries no duration, and only for that.
+    The header rate is whatever the file's first stretch was captured at, so this function -
+    which cannot know the file was concatenated, let alone from what - takes the corrected
+    rate as a parameter, and assess_seek_damage() derives it from the segment rows.
 
     on_progress(read_bytes) reports how far the scan's own ffprobe has read, sampled from
     the same /proc counter run_probe_until_stalled uses. Sampled on a clock rather than per
@@ -889,11 +1118,18 @@ def scan_video_timeline(filepath: str, gap_threshold: float = 0.25, timeout: int
     try:
         fps = _nominal_fps(filepath)
 
+        # ffprobe prints a section's fields in its own order, not show_entries' order; for a
+        # packet that is pts_time, dts_time, duration_time.
         cmd = [ffprobe_path, '-v', 'error', '-select_streams', 'v:0',
-               '-show_entries', 'packet=pts_time,dts_time', '-of', 'csv=p=0', filepath]
+               '-show_entries', 'packet=pts_time,dts_time,duration_time', '-of', 'csv=p=0',
+               filepath]
         st = {'low': None, 'highwater': None, 'count': 0, 'prev_dts': None,
               'dts_low': None, 'dts_high': None, 'saw_dts': False, 'gap_count': 0,
-              'gap_seconds': 0.0, 'max_gap': 0.0, 'backward_count': 0}
+              'gap_seconds': 0.0, 'max_gap': 0.0, 'backward_count': 0,
+              'dur_seconds': 0.0, 'dur_count': 0}
+        # A min-heap of the largest gaps, so a file with thousands of small ones costs a
+        # fixed amount of memory and still names the ones worth reading about.
+        largest = []
 
         def _on_line(line):
             fields = line.strip().rstrip(',').split(',')
@@ -908,6 +1144,12 @@ def scan_video_timeline(filepath: str, gap_threshold: float = 0.25, timeout: int
             # storage order is not the earliest-presented one.
             stamp = pts if pts is not None else dts
             st['count'] += 1
+            # Bounded like survey_formats' keyframe rate: a duration of a second or more is
+            # not one frame of video, and must not be allowed to cover a real gap.
+            duration = _packet_time(fields[2] if len(fields) > 2 else '')
+            if duration is not None and 0.0 < duration < 1.0:
+                st['dur_seconds'] += duration
+                st['dur_count'] += 1
             if st['low'] is None or stamp < st['low']:
                 st['low'] = stamp
             if st['highwater'] is None or stamp > st['highwater']:
@@ -931,6 +1173,11 @@ def scan_video_timeline(filepath: str, gap_threshold: float = 0.25, timeout: int
                         st['gap_seconds'] += step
                         if step > st['max_gap']:
                             st['max_gap'] = step
+                        entry = (step, st['prev_dts'], dts)
+                        if len(largest) < max_gaps_listed:
+                            heapq.heappush(largest, entry)
+                        elif step > largest[0][0]:
+                            heapq.heapreplace(largest, entry)
                 st['prev_dts'] = dts
 
         try:
@@ -955,12 +1202,20 @@ def scan_video_timeline(filepath: str, gap_threshold: float = 0.25, timeout: int
         # misuse impossible instead of merely documented.
         dts_span = (dts_high - dts_low) if (saw_dts and not backward_count) else None
         deficit_fps = expected_fps if expected_fps and expected_fps > 0 else fps
-        deficit = (span - count / deficit_fps) if deficit_fps else 0.0
+        dur_seconds, dur_count = st['dur_seconds'], st['dur_count']
+        undated = count - dur_count
+        if not undated:
+            deficit_basis = 'frame_durations'
+            deficit = span - dur_seconds
+        else:
+            deficit_basis = 'nominal_rate' if not dur_count else 'partial_durations'
+            deficit = (span - dur_seconds - undated / deficit_fps) if deficit_fps else 0.0
         return {
             'span_seconds': span,
             'dts_span_seconds': dts_span,
             'packet_count': count,
             'fps': fps,
+            'deficit_basis': deficit_basis,
             'deficit_fps': deficit_fps,
             'gap_basis': 'dts' if saw_dts else 'none',
             'gap_threshold': gap_threshold,
@@ -970,6 +1225,8 @@ def scan_video_timeline(filepath: str, gap_threshold: float = 0.25, timeout: int
             'backward_count': backward_count,
             'deficit_seconds': max(deficit, 0.0),
             'missing_seconds': max(gap_seconds, deficit, 0.0),
+            'gaps': [(prev - low, cur - low)
+                     for _step, prev, cur in sorted(largest, key=lambda g: g[1])],
         }
     except Exception as exc:
         log.warning('Timeline scan failed for %s: %s', filepath, exc)
@@ -981,11 +1238,11 @@ def assess_seek_damage(filepath: str, *, joined_segments: int = 1, segment_rates
     """Decide whether a recording's video timeline is damaged enough to break seeking.
 
     segment_rates is [(content_seconds, fps), ...] for the segments that were joined, from
-    the capture-time probe already stored on recording_segments. It is used ONLY when those
-    rates disagree, in which case the frame deficit is measured against their duration-
-    weighted mean instead of the file header's single nominal rate - see
-    scan_video_timeline's expected_fps. A recording that held one rate throughout is
-    measured exactly as before, whether or not its rates were supplied.
+    the capture-time probe already stored on recording_segments. It is a fallback: the scan
+    counts each packet at its own duration, and only a packet carrying none is counted at
+    a rate, which is the segments' duration-weighted mean when their rates disagree and the
+    file header's otherwise - see scan_video_timeline's expected_fps. Those probes read
+    each segment's first seconds only, so they are the weaker of the two answers.
 
     The weight is each segment's own CONTENT length, never how long it took to arrive: the
     deficit counts frames against content time, so a stretch that arrived faster than real
@@ -994,7 +1251,8 @@ def assess_seek_damage(filepath: str, *, joined_segments: int = 1, segment_rates
 
     Two facts come back in the metrics when the rates disagree, because the verdict changing
     on a fact the caller cannot see is the failure this replaced: capture_fps_values (the
-    rates the segments actually ran at) and deficit_fps (what the deficit was divided by).
+    rates the segments opened at) and deficit_fps (what a packet without a duration was
+    counted at - deficit_basis says whether any was).
     A mixed-rate file is a real reason to re-encode - CFR normalization is work worth doing -
     but that is a different finding from timeline damage and the caller must act on it under
     its own name, never by letting a false DAMAGED verdict carry it (dev/changelog/866).
@@ -1043,7 +1301,15 @@ def assess_seek_damage(filepath: str, *, joined_segments: int = 1, segment_rates
                f'(largest {metrics["max_gap_seconds"]:.2f}s), frame deficit '
                f'{metrics["deficit_seconds"]:.1f}s, threshold {threshold:.1f}s -> '
                f'{"DAMAGED" if damaged else "OK"}')
-    if mixed:
+    # The blended rate only did anything when some packet lacked a duration of its own;
+    # otherwise the deficit never divided by it, and naming it would explain the number
+    # with a figure that played no part in it.
+    if mixed and metrics['deficit_basis'] == 'frame_durations':
+        rates = ', '.join(f'{r:g}' for r in metrics['capture_fps_values'])
+        summary += (f'. Capture frame rate changed mid-recording (segments opened at '
+                    f'{rates} fps); every frame is counted at its own duration, so the '
+                    f'change is not counted as missing video')
+    elif mixed:
         # Stated before the concat caveat because it changes what the deficit number MEANS,
         # not merely how completely it was measured. Without it the corrected figure is as
         # unexplainable as the wrong one was - a reader comparing it against the header rate

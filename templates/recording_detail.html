@@ -101,6 +101,7 @@
         </div>
       </div>
     {% elif rec.status in ('COMPLETED', 'ABORTED') %}
+      {% if gaps_retry %}<button class="btn btn-primary" data-act="retry-convert-gaps">Retry conversion</button>{% endif %}
       <div class="menu-wrap">
         <button class="btn btn-icon" data-menu>&#8943;</button>
         <div class="menu">
@@ -215,12 +216,18 @@
       </div>
     </div>
   {% elif rec.status in ('COMPLETED', 'ABORTED') %}
+    {#- A kept source to convert again from outranks re-recording, as on a FAILED row. -#}
+    {% if gaps_retry %}
+    <button class="btn btn-primary" data-act="retry-convert-gaps">Retry conversion</button>
+    {% else %}
     <a class="btn" href="{{ find_airing_url }}">&#8635; Record again</a>
+    {% endif %}
     <button class="btn btn-danger" data-act="delete">Delete</button>
     <div class="menu-wrap">
       <button class="btn btn-icon" data-menu>&#8943;</button>
       <div class="menu pop-up">
         <a href="{{ url_for('logs.logs_page') }}">View log lines</a>
+        {% if gaps_retry %}<a href="{{ find_airing_url }}">Record again</a>{% endif %}
         <button class="menu-item" data-secs-open>Customize sections...</button>
         <button class="menu-item" data-copy="{{ rec.url }}">Copy stream URL</button>
         {% if rec.output_path %}<button class="menu-item" data-copy="{{ rec.output_path }}">Copy output path</button>{% endif %}
@@ -397,6 +404,11 @@
   {% if rec.completed_at %}
   <span class="sep-dot">·</span>
   <span>finished <span class="mono">{{ rec.completed_at | local_time_sec }}</span></span>
+  {% endif %}
+  {% if (rec.converted_gap_seconds or 0) > 0 %}
+  <span class="sep-dot">·</span>
+  <span class="gaps-note">the converted file is <b>missing {{ rec.converted_gap_seconds | duration(true) }}</b> of video the recording has
+    {%- if gaps_retry %} - the source <b>.ts</b> was kept, use <b>Retry conversion</b> to convert it again{% endif %}</span>
   {% endif %}
 </div>
 {% elif rec.status == 'FAILED' %}
@@ -757,7 +769,8 @@
         {% set coded_note = ('Encoder frame size: ' ~ fmt.coded ~ '.') if fmt.coded else none %}
         {# A mixed-format file is disclosed here and in the event log, not by an alert
            (dev/changelog/928). #}
-        {% set format_note = (row.format_change ~ '\nThe value shown is the latest segment\'s format.') if row.format_change else none %}
+        {% set video_shown = 'The value shown is the format the file holds longest.' if video_basis == 'survey' else 'The value shown is the latest segment\'s format.' %}
+        {% set format_note = (row.format_change ~ '\n' ~ video_shown) if row.format_change else none %}
         {{ stat_row('Video', ((video or '-') ~ (' · format changed' if row.format_change else '')),
                     sv_cls=('warn' if row.format_change else none),
                     tip=([format_note, tech_tip, coded_note] | select | join('\n')) or none) }}
@@ -1041,13 +1054,15 @@
   'CONVERSION_RESTARTED': 'info', 'DIAGNOSTICS': 'info', 'CAPTURE_PACING_ENABLED': 'info',
   'RECORDING_METADATA_REFRESHED': 'info', 'RECORDING_METADATA_REFRESH_SKIPPED': 'info',
   'RECORDING_METADATA_EDITED': 'info', 'RECORDING_RULE_RETRACKED': 'info',
+  'RECORDING_RULE_RELEASED': 'info',
   'POSTCAPTURE_ANALYSIS_STARTED': 'info', 'POSTCAPTURE_ANALYSIS_SKIPPED': 'info',
   'MIXED_FRAME_RATE_DETECTED': 'info',
   'FORMAT_NORMALIZE_NEEDED': 'info',
   'RESTART_SUCCEEDED': 'ok', 'CONCATENATION_DONE': 'ok', 'CONVERSION_DONE': 'ok',
   'CONVERSION_RESUMED': 'ok',
   'FILE_MOVED': 'ok', 'SCRIPT_EXECUTED': 'ok', 'METADATA_SIDECAR_WRITTEN': 'ok',
-  'METADATA_SIDECAR_FAILED': 'warn',
+  'METADATA_SIDECAR_FAILED': 'warn', 'CONVERTED_FILE_GAPS': 'warn',
+  'SOURCE_DELETED': 'info', 'SOURCE_KEPT': 'info',
   'RECORDING_FAILED': 'bad', 'RECORDING_FAILED_DEAD_STREAM': 'bad',
   'CONCATENATION_FAILED': 'bad', 'CONVERSION_FAILED': 'bad',
   'RECORDING_START_NOT_ARMED': 'bad',
@@ -1196,6 +1211,12 @@ window.onScheduleSaved = () => window.location.reload();
       body: 'The join will run again over the segments on disk. Make sure there is enough free disk space.',
       verb: 'Retry', danger: false,
       run: () => postForm(`/recordings/${RID}/retry-concat`),
+    },
+    'retry-convert-gaps': {
+      title: 'Retry conversion',
+      body: 'The converted file with gaps is deleted and the recording is converted again from the kept .ts file. If the new file has gaps too, the .ts is kept again.',
+      verb: 'Retry', danger: true,
+      run: () => postForm(`/recordings/${RID}/retry-convert`),
     },
     'retry-convert': {
       title: 'Retry conversion',

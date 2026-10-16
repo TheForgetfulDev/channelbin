@@ -25,7 +25,7 @@ import app.config as cfgmod  # noqa: E402
 import app.postprocessor as ppmod  # noqa: E402
 from app import db, toolchain  # noqa: E402
 from app.alerts import GPU_ENCODER_UNAVAILABLE  # noqa: E402
-from app.database import (Alert, RecordingEvent, RecordingSegment, CONVERSION_DONE,  # noqa: E402
+from app.database import (Alert, Recording, RecordingEvent, RecordingSegment, CONVERSION_DONE,  # noqa: E402
                           DIAGNOSTICS)
 from app.postprocessor import ConversionResult, do_postprocess  # noqa: E402
 from tests.support import seed  # noqa: E402
@@ -456,8 +456,8 @@ class GpuDeathTests(_NormalizeCase):
             with open(part_file, 'wb') as fh:
                 fh.write(b'p' * 64)
             if len(calls) == 1:
-                return ConversionResult(False, 'died', '[AVHWFramesContext @ 0x1] '
-                                        'Failed to create surface', out_time=1.0)
+                line = '[AVHWFramesContext @ 0x1] [error] Failed to create surface'
+                return ConversionResult(False, 'died', line, out_time=1.0, gpu_error=line)
             return ConversionResult(True, 'success', out_time=4.0)
         return attempt, calls
 
@@ -495,6 +495,48 @@ class GpuDeathTests(_NormalizeCase):
         self.assertEqual(self._arg(calls[-1], '-c:v'), 'h264_vaapi')
         self.assertEqual(len(self._events('CONVERSION_RESTARTED',
                                           'conversion_gpu_decode_fallback')), 1)
+
+    def test_two_gpu_step_backs_leave_the_cpu_its_whole_budget(self):
+        """dev/docs/BUGS.md 2026-10-15 @ 03:55:35 PM: a GPU-decode death, then a GPU-encode
+        death, then the full budget of source deaths still completes on the CPU. Each
+        step-back used to spend an attempt, which left libx264 two runs instead of four."""
+        self._use('b1080.ts', [('1920x1080', 59.94, 6, False)])
+        gpu = '[AVHWFramesContext @ 0x1] [error] Failed to create surface'
+        outcomes = iter([
+            ConversionResult(False, 'died', gpu, out_time=1.0, gpu_error=gpu),
+            ConversionResult(False, 'died', gpu, out_time=1.0, gpu_error=gpu),
+            ConversionResult(False, 'died', 'Error while decoding stream', out_time=10.0),
+            ConversionResult(False, 'died', 'Error while decoding stream', out_time=20.0),
+            ConversionResult(False, 'died', 'Error while decoding stream', out_time=30.0),
+            ConversionResult(True, 'success', out_time=40.0)])
+        calls = []
+
+        def attempt(app, rid, cmd, part_file, **kw):
+            calls.append(cmd)
+            with open(part_file, 'wb') as fh:
+                fh.write(b'p' * 64)
+            return next(outcomes)
+
+        def join(parts, output_path, *a, **k):
+            with open(output_path, 'wb') as fh:
+                fh.write(b'o' * 128)
+            return ppmod.PartJoinResult(True, 'success', parts=len(parts))
+
+        cfg = _config(video_encoder='vaapi', vaapi_decode=True, max_height=720)
+        with mock.patch.object(cfgmod, 'load_config', return_value=cfg), \
+             mock.patch.object(ppmod, 'run_conversion_supervised', mock.Mock(side_effect=attempt)), \
+             mock.patch.object(ppmod, 'join_conversion_parts', join), \
+             mock.patch.object(ppmod, 'finalize_part', lambda part, *a, **k: 0.0), \
+             mock.patch.object(toolchain, '_run_gpu_trial', _trial(0)):
+            do_postprocess(self.t.app, self.rid, self.ts)
+        db.session.expire_all()
+        self.assertIn('-hwaccel', calls[0])
+        self.assertEqual(self._arg(calls[1], '-c:v'), 'h264_vaapi')
+        self.assertNotIn('-hwaccel', calls[1])
+        self.assertEqual([self._arg(c, '-c:v') for c in calls[2:]], ['libx264'] * 4)
+        rec = db.session.get(Recording, self.rid)
+        self.assertEqual(rec.status, 'COMPLETED')
+        self.assertEqual(rec.conversion_attempts, 3)
 
 
 if __name__ == '__main__':

@@ -160,8 +160,76 @@ const out = {
     null),
 };
 
+/* The question a changed search asks (openAutoRuleUnmatched, dev/changelog/1203). `answers`
+   are what save() does with each press, in order: an object resolves, {reject, status, data}
+   throws the way jsonFetch does. `pick` chooses a radio before the press. */
+const TWO = [{ id: 41, name: 'Cup Race - Alpha', when: 'Sun Oct 18, 3:00 PM' },
+             { id: 42, name: 'Cup Race - Bravo', when: 'Sun Oct 25, 3:00 PM' }];
+async function unmatchedScenario(data, answers, pick, presses = 1) {
+  const { w, errors } = boot({});
+  const saves = [];
+  const done = [];
+  w.openAutoRuleUnmatched({
+    ruleName: 'Cup <Series>', data,
+    save: (answer) => {
+      saves.push(answer);
+      const a = answers.shift();
+      if (a && a.reject) {
+        const e = new w.Error(a.reject);
+        e.status = a.status;
+        e.data = a.data;
+        return Promise.reject(e);
+      }
+      return Promise.resolve(a);
+    },
+    onSaved: (res) => done.push(res),
+  });
+  const first = {
+    title: $(w, '.modal-head h2').textContent,
+    text: $(w, '.modal-body').textContent.replace(/\s+/g, ' ').trim(),
+    listed: $$(w, '.statlist .srow').map((r) => [r.querySelector('.sk').textContent,
+                                                r.querySelector('.sv').textContent]),
+    checked: ($(w, 'input[name="ru-fate"]:checked') || {}).value || null,
+    choices: $$(w, '.fp-radio strong').map((e) => e.textContent),
+    footer: $$(w, '.modal-foot .btn').map((b) => [b.textContent, b.className]),
+  };
+  for (let i = 0; i < presses; i += 1) {
+    if (pick) $(w, `input[name="ru-fate"][value="${pick}"]`).checked = true;
+    $(w, '.modal-foot .btn-primary').click();
+    await settle(w);
+    await settle(w);
+  }
+  const err = $(w, '#ru-err');
+  return {
+    first, saves, done: done.length, open: !!$(w, '.modal'),
+    error_shown: !!err && !err.hidden, error: err ? err.textContent : null,
+    listed_after: $$(w, '.statlist .sk').map((e) => e.textContent),
+    checked_after: ($(w, 'input[name="ru-fate"]:checked') || {}).value || null,
+    errors,
+  };
+}
+
+out.unmatched_cancel = await unmatchedScenario(
+  { unmatched: TWO, determined: true, reason: null }, [{ success: true, cancelled: 2 }], null);
+out.unmatched_keep = await unmatchedScenario(
+  { unmatched: TWO.slice(0, 1), determined: true, reason: null },
+  [{ success: true, kept: 1 }], 'keep');
+out.unmatched_undetermined = await unmatchedScenario(
+  { unmatched: TWO, determined: false,
+    reason: 'The new search matches more than 1,000 upcoming showings, which is more than a rule will run.' },
+  [], null, 0);
+out.unmatched_grew = await unmatchedScenario(
+  { unmatched: TWO.slice(0, 1), determined: true, reason: null },
+  [{ reject: 'asked again', status: 409,
+     data: { unmatched: TWO, determined: true, reason: null } }], 'keep');
+out.unmatched_refused = await unmatchedScenario(
+  { unmatched: TWO, determined: true, reason: null },
+  [{ reject: 'Rule not found.', status: 404, data: { error: 'Rule not found.' } }], null);
+
 // The pure helpers, over the real phrase table.
 const { w } = boot({});
 out.counts_text = FIX.counts.map((c) => w.autoRuleCountsText(c, FIX.phrases));
 out.numbers = ['', '  ', ' 7 ', '0', '1.5', '-2', null].map((v) => w.autoRuleNumber(v));
+out.unmatched_text = [{}, { cancelled: 1 }, { cancelled: 2, kept: 0 }, { kept: 1 },
+                      { cancelled: 1, kept: 3 }].map((r) => w.autoRuleUnmatchedText(r));
 process.stdout.write(JSON.stringify(out));

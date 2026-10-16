@@ -115,6 +115,17 @@ class RecorderPacingTests(unittest.TestCase):
                 self.assertIn('-re', argv,
                               f'-t without -re at segment_duration={segment_duration}')
 
+    def test_segment_start_event_names_the_app_version(self):
+        """A support bundle's meta.json names the version that built the bundle, which
+        after an upgrade is not the one that captured the recording (dev/changelog/1193)."""
+        import json
+        from app.database import RecordingEvent, SEGMENT_STARTED
+        from app.version import __version__
+        self._argv(0)
+        ev = RecordingEvent.query.filter_by(recording_id=self.rec.id,
+                                            event_type=SEGMENT_STARTED).one()
+        self.assertEqual(json.loads(ev.extra_data)['app_version'], __version__)
+
 
     # ── Per-channel and default pacing (dev/changelog/997) ──────────────────────────
     # Guards dev/docs/BUGS.md 2026-09-16 @ 12:44:22 PM "An unpaced capture replays a provider's

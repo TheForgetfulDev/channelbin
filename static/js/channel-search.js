@@ -5613,28 +5613,45 @@
   /* Save to rule: the search on screen replaces the rule's, through the same PUT the edit
      dialog uses, sending only `search` - the rule's settings stay as they are. The server
      refuses what a rule cannot use with a sentence, shown as a toast with the page left as
-     it is so the search can be fixed and saved again. Done, the errand ends on the rule's
-     page, which carries the check's outcome across the navigation. */
+     it is so the search can be fixed and saved again. A new search that no longer matches
+     some of the rule's scheduled recordings comes back as a 409 naming them, and the save
+     goes through only once the person says what becomes of them (openAutoRuleUnmatched,
+     dev/changelog/1203). Done, the errand ends on the rule's page, which carries the
+     check's outcome across the navigation. */
+  const saveSearchToRule = (unmatched) => jsonFetch(`${CFG.autoRule.apiBase}${CFG.ruleCtx.id}`, {
+    method: 'PUT',
+    body: JSON.stringify(unmatched ? { search: snapshot(), unmatched } : { search: snapshot() }),
+  });
+
+  const savedSearchToRule = (res) => {
+    const lead = `Saved the new search to "${CFG.ruleCtx.name}".${autoRuleUnmatchedText(res)}`;
+    const out = res.evaluation
+      ? autoRuleOutcome(lead, res.evaluation, CFG.autoRule.phrases)
+      : { type: 'success', text: `${lead} It is paused, so nothing was checked.` };
+    showToastAfterLoad(out.text, { type: out.type, durationMs: 10000 });
+    location.href = CFG.ruleCtx.url;  // nav-ok: the errand ends on the rule's own page
+  };
+
   $('#rule-save').addEventListener('click', async () => {
     if (ruleMode() !== 'edit' || !isAirings()) return;
     const btn = $('#rule-save');
     btn.disabled = true;
     let res;
     try {
-      res = await jsonFetch(`${CFG.autoRule.apiBase}${CFG.ruleCtx.id}`, {
-        method: 'PUT', body: JSON.stringify({ search: snapshot() }),
-      });
+      res = await saveSearchToRule(null);
     } catch (e) {
       btn.disabled = false;
+      if (e.status === 409 && e.data && e.data.unmatched) {
+        openAutoRuleUnmatched({
+          ruleName: CFG.ruleCtx.name, data: e.data, save: saveSearchToRule,
+          onSaved: savedSearchToRule,
+        });
+        return;
+      }
       showToast(e.message || 'The search could not be saved to the rule.', { type: 'error' });
       return;
     }
-    const out = res.evaluation
-      ? autoRuleOutcome(`Saved the new search to "${CFG.ruleCtx.name}".`, res.evaluation,
-        CFG.autoRule.phrases)
-      : { type: 'success', text: `Saved the new search to "${CFG.ruleCtx.name}". It is paused, so nothing was checked.` };
-    showToastAfterLoad(out.text, { type: out.type, durationMs: 10000 });
-    location.href = CFG.ruleCtx.url;  // nav-ok: the errand ends on the rule's own page
+    savedSearchToRule(res);
   });
 
   $('#rule-x').addEventListener('click', () => {

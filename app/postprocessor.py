@@ -1,18 +1,21 @@
 """Post-processing after concatenation: health data, format conversion and/or file move."""
 import logging
+import math
 import os
 import re
 import shutil
 import subprocess
 import threading
 import time
+from collections import deque
 from contextlib import contextmanager
 from datetime import datetime
 
 from .db_utils import retry_on_locked
 from .fmt_utils import fmt_bytes as _fmt_bytes, fmt_duration
 from .fs_utils import ensure_dir
-from .proc_utils import supervise_ffmpeg, terminate_or_kill
+from .proc_utils import iter_stderr_error_lines, supervise_ffmpeg, terminate_or_kill
+from .version import __version__
 
 log = logging.getLogger(__name__)
 
@@ -423,10 +426,14 @@ class ConversionResult:
     and restarting from the top cannot get past it.
     `decode_errors` is how many frames ffmpeg failed to decode, counted so a conversion
     that finished by concealing damage can still say the damage happened.
+    `gpu_error` is the first error line of a failed attempt that blames the hardware path,
+    read from its whole stderr (None if none did); `error_lines` are its last error lines.
     """
     def __init__(self, success, reason=None, error_msg=None, out_time=None,
-                 decode_errors=0):
+                 decode_errors=0, gpu_error=None, error_lines=None):
         self.success = success
+        self.gpu_error = gpu_error
+        self.error_lines = list(error_lines or [])
         # 'success' | 'died' | 'stalled' | 'no_output' | 'timeout'. 'no_output' is the
         # pre-output budget expiring; 'timeout' survives only for the stall-detection-
         # disabled fallback, and is no longer reachable in the default configuration
@@ -437,6 +444,28 @@ class ConversionResult:
         self.error_msg = error_msg
         self.out_time = out_time
         self.decode_errors = decode_errors
+
+
+def _death_evidence(result, kept=None):
+    """What a dead conversion attempt leaves on the event that follows it, as extra_data.
+
+    Before dev/changelog/1197 a death that did not blame the GPU left nothing here, so its
+    stderr, how far ffmpeg got and how much of its part was kept existed only in dvr.log,
+    and a support bundle lost them once the log rotated (dev/changelog/1193). `out_time` is
+    ffmpeg's last progress position as a source position; `kept` is the salvaged part's
+    content duration - two different things, and in recording 16 they were 7 minutes apart.
+    """
+    evidence = {'reason': result.reason,
+                'out_time_seconds': round(result.out_time or 0.0, 3)}
+    if kept is not None:
+        evidence['kept_seconds'] = round(kept, 3)
+    if result.error_msg:
+        evidence['error_tail'] = result.error_msg
+    if result.error_lines:
+        evidence['error_lines'] = list(result.error_lines)
+    if result.gpu_error:
+        evidence['gpu_error'] = result.gpu_error
+    return evidence
 
 
 # A ConversionResult.reason is an internal token; the event log is read by a person. Every
@@ -549,31 +578,108 @@ def _persist_postprocess_waiting(recording_id, conflict=None):
 # that decodes as errors all the way through - measured on ffmpeg 7.1, dev/changelog/1163.
 PART_MOVFLAGS = '+frag_keyframe+empty_moov+default_base_moof+delay_moov'
 
+# How far apart a kept part's video and audio may end before the longer one is trimmed. A
+# cleanly closed part ends its tracks within one frame of each other (an AAC frame is 21ms, a
+# 29.97 frame 33ms); a killed one has been measured with its audio 7 minutes past its video
+# (dev/changelog/1194).
+PART_STREAM_END_TOLERANCE = 0.1
+
+# ffmpeg's -dts_delta_threshold default, in seconds. Reading an MPEG-TS, ffmpeg closes up any
+# forward timestamp jump bigger than this as a "discontinuity" - per stream. A gap in the
+# video alone is pulled shut while the audio keeps its time, so every frame after it plays
+# that far ahead of its sound for the rest of the file, and the output scans clean (a 15s
+# video gap left by a segment join, measured on ffmpeg 7.1, dev/changelog/1199).
+FFMPEG_DTS_DELTA_DEFAULT = 10.0
+
+# A video track that ends this close to the audio is not padded out to it: an ordinary file's
+# tracks end within a frame or two of each other.
+END_PAD_MIN_SECONDS = 1.0
+
+
+def dts_delta_threshold(max_gap_seconds):
+    """The -dts_delta_threshold that keeps every video gap the source's own timeline scan
+    measured, as an argv value, or None when ffmpeg's default already keeps them all - so a
+    recording with no long gap keeps exactly the command it always had.
+
+    Kept, a gap is filled by -fps_mode cfr with the picture before it and stays in sync with
+    the audio. Derived from the scan rather than set to some large fixed value so that the
+    converter holds a picture across exactly the gaps the recording already reports as
+    damage, and no further: one bad far-future timestamp would otherwise become hours of a
+    repeated frame. The scan measures DTS steps, which are a frame longer than the delta
+    ffmpeg compares, so the scan's figure plus a second is always enough."""
+    if not max_gap_seconds or max_gap_seconds + 1 <= FFMPEG_DTS_DELTA_DEFAULT:
+        return None
+    return str(math.ceil(max_gap_seconds) + 1)
+
+
+def video_end_pad(ts_path):
+    """(seconds, ends): how long the source's video stops short of its audio, and the
+    {'video', 'audio'} ends that were measured. Seconds is 0.0 when the tracks end together,
+    when either end could not be read, or when there is no audio - nothing to pad to."""
+    from .probe import tail_track_ends
+    ends = tail_track_ends(ts_path)
+    video, audio = ends.get('video'), ends.get('audio')
+    if video is None or audio is None or audio - video <= END_PAD_MIN_SECONDS:
+        return 0.0, ends
+    return round(audio - video, 3), ends
+
 # The values of recording.post_process.video_encoder. Compared against these names and never
 # a re-typed literal; app/routes/settings.py whitelists a save against the same pair.
 VIDEO_ENCODER_SOFTWARE = 'software'
 VIDEO_ENCODER_VAAPI = 'vaapi'
 VIDEO_ENCODERS = (VIDEO_ENCODER_SOFTWARE, VIDEO_ENCODER_VAAPI)
 
-# What a died attempt's stderr tail contains when the HARDWARE path is what failed - the
+# What a died attempt's error lines contain when the HARDWARE path is what failed - the
 # device context, the upload filter or the encoder itself - as distinct from the decoder
 # choking on a damaged source, which is the death the restart loop already knows how to
 # treat. Measured on ffmpeg 7.1: a device that cannot be opened reports
 # '[AVHWDeviceContext @ ...] No VA display found for device ...', and every component of
-# the path logs under a tag that names it (dev/changelog/1125).
+# the path logs under a tag that names it (dev/changelog/1125). 'hwaccel' covers hardware
+# decoding (dev/changelog/1184).
 #
-# 'hwaccel' and 'Error reinitializing filters' cover the paths dev/changelog/1184 added:
-# hardware decoding, and the mid-file format change every hardware shape but one died on
-# with that exact message (dev/changelog/1183) - one of which named only `Parsed_null_0`,
-# which no device-specific marker matches. The second is only ever consulted while the GPU
-# is in use, where the software path's auto-reinit is not in play.
+# ONLY ERROR-LEVEL LINES ARE JUDGED. ffmpeg's banner says `h264_vaapi` and `vaapi(tv, ...)`
+# on every GPU run, successful ones included (dev/changelog/1196), and some Intel drivers
+# print a `[h264_vaapi @ ...]` warning on every encode.
 GPU_ERROR_MARKERS = ('AVHWDeviceContext', 'AVHWFramesContext', 'hwupload', 'vaapi', 'VAAPI',
-                     'VA display', 'hwaccel', 'Error reinitializing filters')
+                     'VA display', 'hwaccel')
+
+# The mid-file format change every hardware shape but one died on (dev/changelog/1183), one
+# of them naming only `Parsed_null_0`, which no device marker matches. It counts only from
+# the VIDEO filter graph: the audio graph prints the same words when a corrupt frame's
+# nonsense channel layout cannot be rebuilt (recording 4, dev/changelog/799), and that is
+# the source's damage on any encoder (dev/changelog/1197).
+GPU_VIDEO_GRAPH_TAG = '[vf#'
+GPU_VIDEO_GRAPH_FAILURE = 'Error reinitializing filters'
+
+# How many of a dead attempt's last error lines its restart event keeps.
+DEATH_ERROR_LINES_KEPT = 8
 
 
-def names_gpu_failure(stderr_tail) -> bool:
-    """True when a conversion's last stderr lines blame the hardware encode path."""
-    return any(marker in (stderr_tail or '') for marker in GPU_ERROR_MARKERS)
+def names_gpu_failure(error_line) -> bool:
+    """True when one of a conversion's error-level stderr lines blames the hardware path."""
+    line = error_line or ''
+    if any(marker in line for marker in GPU_ERROR_MARKERS):
+        return True
+    return GPU_VIDEO_GRAPH_TAG in line and GPU_VIDEO_GRAPH_FAILURE in line
+
+
+def read_conversion_errors(stderr_path):
+    """(gpu_lines, last_error_lines) from a dead conversion's level-tagged stderr spool.
+
+    The whole spool, not the tail: recording 16's last 20 lines were audio warnings from the
+    run-on after its video died, so the GPU failure above them was never seen and the
+    conversion resumed on the GPU (dev/changelog/1197). `gpu_lines` are the first few error
+    lines that blame the hardware path - the first is the cause, what follows is ffmpeg
+    tearing down. `last_error_lines` are the attempt's final error lines, whatever they say,
+    so the recording keeps what killed it after dvr.log has rotated.
+    """
+    gpu_lines = []
+    last = deque(maxlen=DEATH_ERROR_LINES_KEPT)
+    for line in iter_stderr_error_lines(stderr_path):
+        last.append(line)
+        if len(gpu_lines) < 3 and names_gpu_failure(line):
+            gpu_lines.append(line)
+    return gpu_lines, list(last)
 
 
 def part_path(output_path: str, index: int) -> str:
@@ -707,24 +813,85 @@ def _persist_conversion_parts(recording_id, **kwargs):
     _do()
 
 
+def _report_kept_part(recording_id, part_no, *, start_at, kept, trimmed_from=None,
+                      out_time=None, tolerance=1.0):
+    """Put on the recording what a salvaged part held, when it is something a person should
+    know: its tracks ended apart and it was cut, or where it ends disagrees with how far the
+    attempt that wrote it said it had got. Writes nothing for an ordinary part.
+
+    `kept` is the part's content duration; `out_time` is ffmpeg's last progress position,
+    already a source position. In recording 16 the two disagreed by seven minutes and nothing
+    said so (dev/changelog/1194). A cut part loses nothing - the next attempt re-encodes from
+    where it now ends - but a track running minutes past the other is a symptom worth keeping.
+    """
+    from . import db
+    from .database import add_recording_event, DIAGNOSTICS
+
+    end_at = start_at + kept
+    disagrees = bool(out_time) and abs(end_at - out_time) > tolerance
+    if not trimmed_from and not disagrees:
+        return
+
+    sentences = []
+    extra = {'kind': 'conversion_part_measured', 'part': part_no,
+             'source_start_seconds': round(start_at, 3), 'kept_seconds': round(kept, 3)}
+    if trimmed_from:
+        sentences.append(
+            f'Encoded part {part_no} had its tracks ending apart '
+            f'({_fmt_track_ends(trimmed_from)} of the part). It was cut to '
+            f'{fmt_duration(kept, with_seconds=True)}, where the shorter track stops, and the '
+            f'conversion continues from there, so nothing in between is skipped.')
+        extra['track_ends_seconds'] = {k: round(v, 3) for k, v in trimmed_from.items()}
+    if disagrees:
+        log.warning('Recording %d: part %d reaches %s into the source, but ffmpeg last '
+                    'reported encoding to %s', recording_id, part_no,
+                    fmt_duration(end_at, with_seconds=True),
+                    fmt_duration(out_time, with_seconds=True))
+        sentences.append(
+            f'The attempt that wrote part {part_no} last reported encoding to '
+            f'{fmt_duration(out_time, with_seconds=True)} into the recording, but the part it '
+            f'left reaches {fmt_duration(end_at, with_seconds=True)}.')
+        extra['progress_out_time_seconds'] = round(out_time, 3)
+
+    @retry_on_locked()
+    def _commit():
+        add_recording_event(recording_id, DIAGNOSTICS, detail=' '.join(sentences), extra=extra)
+        db.session.commit()
+
+    _commit()
+
+
 def finalize_part(part_file: str, ffmpeg_path: str, *, scratch_key, interval=5,
-                  pre_output_timeout=300, stall_seconds=300, label='part', on_spawn=None):
+                  pre_output_timeout=300, stall_seconds=300, label='part', on_spawn=None,
+                  on_trim=None):
     """Make a killed part joinable and measure where it really ends. Returns its content
     duration in seconds, or None if there is nothing usable in it.
 
     A part killed mid-write ends in a truncated fragment. Re-muxing it with -c copy drops that
-    tail, and the duration of the RESULT is the last decodable frame - which is both the only
+    tail, and where the RESULT ends is the last decodable frame - which is both the only
     honest splice point (finding 3: the declared duration overshot by exactly 1.0s) and what
     makes the file safe to hand to the concat demuxer. The two needs are the same operation,
     which is why this is not a probe with a repair bolted on.
+
+    THE PART ENDS WHERE ITS SHORTEST TRACK ENDS, AND THE LONGER ONE IS CUT TO MATCH. A killed
+    part's audio can run minutes past its video. Measured by the format duration - the
+    longest stream - the next attempt resumed past the end of the video, and recording 16
+    shipped with two 7-minute video holes (dev/changelog/1194). The resume point alone does
+    not close the hole: the concat demuxer places the next part at the end of this one's
+    longest track, so a part left untrimmed still joins with the gap. Re-encoding the trimmed
+    stretch costs a few minutes of encoding; skipping it loses the content. `on_trim(ends,
+    kept)` is called after a trim, with the {'video', 'audio'} end each track had before it.
 
     Idempotent: running it against an already-clean part re-muxes it again and returns the
     same duration, so the caller may call it without first knowing whether an earlier attempt
     got to. That is what lets a service restart adopt a part no commit describes.
 
-    Never raises. A part too short to hold a keyframe, or damaged past re-muxing, returns None
-    and is discarded by the caller - honest degradation to "re-encode that stretch".
+    Never raises. A part too short to hold a keyframe, damaged past re-muxing, or whose tracks
+    a trim cannot bring together, returns None and is discarded by the caller - honest
+    degradation to "re-encode that stretch".
     """
+    from .probe import stream_ends
+
     if not part_file or not os.path.exists(part_file):
         return None
     try:
@@ -734,6 +901,50 @@ def finalize_part(part_file: str, ffmpeg_path: str, *, scratch_key, interval=5,
         return None
 
     clean = clean_part_path(part_file)
+
+    def _drop_clean():
+        try:
+            os.unlink(clean)
+        except OSError:
+            pass  # best-effort scratch cleanup
+
+    def _remux(cmd, noun):
+        try:
+            run = supervise_ffmpeg(
+                cmd, clean, scratch_prefix='part', scratch_key=scratch_key,
+                interval=interval, pre_output_timeout=pre_output_timeout,
+                stall_seconds=stall_seconds, progress_signal='size', noun=noun,
+                label=label, on_spawn=on_spawn)
+        except Exception as exc:
+            log.warning('%s: could not %s %s: %s', label, noun, part_file, exc)
+            return False
+        return bool(run and run.success and os.path.exists(clean)
+                    and os.path.getsize(clean) > 0)
+
+    def _extent():
+        """(shortest end, longest end, {'video', 'audio'} ends) of the clean file."""
+        ends = stream_ends(clean)
+        tracks = {k: min(v) for k in ('video', 'audio') if (v := ends.get(k))}
+        if not tracks:
+            # No track states a duration; the format's is all there is, and with no track to
+            # compare it against it cannot overstate one.
+            duration = ends.get('duration')
+            if duration:
+                log.warning('%s: no track of %s states where it ends - measuring it by the '
+                            'file duration', label, os.path.basename(part_file))
+            return duration, duration, tracks
+        return min(tracks.values()), max(tracks.values()), tracks
+
+    def _put_back():
+        try:
+            os.replace(clean, part_file)
+            return True
+        except OSError as exc:
+            log.warning('%s: could not put the re-muxed part back as %s: %s',
+                        label, part_file, exc)
+            _drop_clean()
+            return False
+
     # -fflags +discardcorrupt is what actually drops the tail, and it is not optional:
     # measured on this box, a plain -c copy re-mux reports the right duration while copying
     # the half-written packet through, so the file ends with "Invalid NAL unit size" and the
@@ -741,51 +952,52 @@ def finalize_part(part_file: str, ffmpeg_path: str, *, scratch_key, interval=5,
     # shape of damage this app exists to refuse to ship silently.
     cmd = [ffmpeg_path, '-err_detect', 'ignore_err', '-fflags', '+discardcorrupt',
            '-i', part_file, '-c', 'copy', '-movflags', PART_MOVFLAGS, '-y', clean]
-    try:
-        run = supervise_ffmpeg(
-            cmd, clean, scratch_prefix='part', scratch_key=scratch_key,
-            interval=interval, pre_output_timeout=pre_output_timeout,
-            stall_seconds=stall_seconds, progress_signal='size', noun='part remux',
-            label=label, on_spawn=on_spawn)
-    except Exception as exc:
-        log.warning('%s: could not re-mux %s: %s', label, part_file, exc)
-        run = None
-
-    if run is None or not run.success or not os.path.exists(clean) or os.path.getsize(clean) <= 0:
+    if not _remux(cmd, 'part remux'):
         log.warning('%s: %s holds nothing that survives a re-mux - discarding it',
                     label, os.path.basename(part_file))
-        try:
-            os.unlink(clean)
-        except OSError:
-            pass  # best-effort scratch cleanup
+        _drop_clean()
         return None
 
-    duration = None
-    try:
-        from .probe import parse_ffprobe
-        info = parse_ffprobe(clean, count_packets=False, timeout=120)
-        if info:
-            duration = info.get('duration')
-    except Exception as exc:
-        log.warning('%s: could not probe the re-muxed %s: %s', label, part_file, exc)
-
-    if not duration or duration <= 0:
-        try:
-            os.unlink(clean)
-        except OSError:
-            pass  # best-effort scratch cleanup
+    kept, longest, before = _extent()
+    if not kept or kept <= 0:
+        _drop_clean()
         return None
-
-    try:
-        os.replace(clean, part_file)
-    except OSError as exc:
-        log.warning('%s: could not put the re-muxed part back as %s: %s', label, part_file, exc)
-        try:
-            os.unlink(clean)
-        except OSError:
-            pass  # best-effort scratch cleanup
+    if not _put_back():
         return None
-    return float(duration)
+    if longest - kept <= PART_STREAM_END_TOLERANCE:
+        return float(kept)
+
+    # -c copy -t measured on ffmpeg 7.1 here: a 3s-video / 8s-audio part comes out at
+    # 3.000 / 3.029 and joins with a 0.06s seam where the untrimmed one left a 5.06s hole.
+    trim = [ffmpeg_path, '-i', part_file, '-c', 'copy', '-t', f'{kept:.6f}',
+            '-movflags', PART_MOVFLAGS, '-y', clean]
+    if not _remux(trim, 'part trim'):
+        log.warning('%s: %s could not be cut to its shorter track (%s) - discarding it so '
+                    'that stretch is re-encoded', label, os.path.basename(part_file),
+                    _fmt_track_ends(before))
+        _drop_clean()
+        return None
+    trimmed, trimmed_longest, _after = _extent()
+    if not trimmed or trimmed_longest - trimmed > PART_STREAM_END_TOLERANCE:
+        log.warning('%s: cutting %s to %.3fs left its tracks ending %.3fs apart - discarding '
+                    'it so that stretch is re-encoded', label, os.path.basename(part_file),
+                    kept, (trimmed_longest or 0) - (trimmed or 0))
+        _drop_clean()
+        return None
+    if not _put_back():
+        return None
+    log.warning('%s: %s had its tracks ending apart (%s) - cut to %.3fs so the next part '
+                'starts where the shorter one stopped', label, os.path.basename(part_file),
+                _fmt_track_ends(before), trimmed)
+    if on_trim is not None:
+        on_trim(before, float(trimmed))
+    return float(trimmed)
+
+
+def _fmt_track_ends(ends) -> str:
+    """{'video': 287.96, 'audio': 706.67} -> 'video to 4m 47s, audio to 11m 46s'."""
+    return ', '.join(f'{k} to {fmt_duration(v, with_seconds=True)}'
+                     for k, v in sorted(ends.items(), reverse=True))
 
 
 class PartJoinResult:
@@ -1117,10 +1329,14 @@ def run_conversion_supervised(app, recording_id, cmd, output_path, *,
         _commit_resumed_event()
         ev.publish(recording_id, CONVERSION_RESUMED, {'status': REC_STATUS_CONVERTING, 'waiting': False})
 
-    def _tally_decode_errors(stderr_path, returncode):
+    gpu_lines, error_lines = [], []
+
+    def _read_spool(stderr_path, returncode):
         # Read while the spool still exists - supervise_ffmpeg unlinks it right after this.
-        nonlocal decode_errors
+        nonlocal decode_errors, gpu_lines, error_lines
         decode_errors = _count_decode_errors(stderr_path)
+        if returncode != 0:
+            gpu_lines, error_lines = read_conversion_errors(stderr_path)
 
     try:
         run = supervise_ffmpeg(
@@ -1131,7 +1347,7 @@ def run_conversion_supervised(app, recording_id, cmd, output_path, *,
             noun='conversion', label=f'Recording {recording_id} conversion',
             on_spawn=_register, on_progress=_publish,
             suspend_check=_check_collision, on_suspend=_on_suspend, on_resume=_on_resume,
-            on_exit=_tally_decode_errors)
+            on_exit=_read_spool, level_tags=True)
     finally:
         with _active_lock:
             _active_conversions.pop(recording_id, None)
@@ -1150,7 +1366,8 @@ def run_conversion_supervised(app, recording_id, cmd, output_path, *,
     return ConversionResult(
         run.success, reason=run.reason, error_msg=run.error_msg,
         out_time=(run.out_time or 0.0) + source_offset,
-        decode_errors=decode_errors if run.reason in ('success', 'died') else 0)
+        decode_errors=decode_errors if run.reason in ('success', 'died') else 0,
+        gpu_error=gpu_lines[0] if gpu_lines else None, error_lines=error_lines)
 
 
 # ffmpeg's own wording for a frame it could not decode. Both spellings occur: the first
@@ -1289,11 +1506,11 @@ def reserve_concat_output_path(directory: str, safe_name: str, extensions) -> st
         return candidate
 
 
-#: The two post-processing failure alerts this module raises inline and clears inline, and
-#: the observation that proves each one is over. Both are self_clearing, so an open row sits
-#: under the Alerts page's "Active alerts" card, which offers no Dismiss (dev/changelog/932)
-#: - which is only safe while something actually clears them.
-_RECONCILABLE_ALERTS = ('CONVERSION_FAILED', 'RECORDING_MOVE_FAILED')
+#: The post-processing alerts this module raises inline and clears inline, and the
+#: observation that proves each one is over. All are self_clearing, so an open row sits under
+#: the Alerts page's "Active alerts" card, which offers no Dismiss (dev/changelog/932) -
+#: which is only safe while something actually clears them.
+_RECONCILABLE_ALERTS = ('CONVERSION_FAILED', 'RECORDING_MOVE_FAILED', 'CONVERTED_FILE_GAPS')
 
 
 def reconcile_failure_alerts():
@@ -1316,6 +1533,9 @@ def reconcile_failure_alerts():
       move leaves output_path where it was and the successful one rewrites it, so the
       column answers this directly. A move that is now disabled, or pointed somewhere
       else, is not evidence either way and the row is left alone.
+    - `CONVERTED_FILE_GAPS` - a later conversion checked its output and found nothing
+      missing (`converted_gap_seconds == 0`; NULL is "not checked", not clean), or the source
+      it kept is no longer on disk, which leaves nothing to retry from.
 
     A recording that no longer exists is also left alone: deleting one already dismisses
     and unlinks its alerts (dev/changelog/929), so a dangling id is not a recovery.
@@ -1339,6 +1559,8 @@ def reconcile_failure_alerts():
                  if mv.get('enabled') and mv.get('destination', '').strip() else None)
     recs = {r.id: r for r in Recording.query.filter(
         Recording.id.in_({a.recording_id for a in open_rows})).all()}
+    gaps_ids = {a.recording_id for a in open_rows if a.alert_type == 'CONVERTED_FILE_GAPS'}
+    kept_sources = _kept_source_paths(gaps_ids) if gaps_ids else {}
 
     stale = []
     for a in open_rows:
@@ -1348,6 +1570,13 @@ def reconcile_failure_alerts():
         if a.alert_type == 'CONVERSION_FAILED':
             recovered = rec.status == REC_STATUS_COMPLETED
             observed = f'recording is {rec.status}'
+        elif a.alert_type == 'CONVERTED_FILE_GAPS':
+            kept = kept_sources.get(rec.id)
+            if rec.converted_gap_seconds == 0:
+                recovered, observed = True, 'a later conversion checked clean'
+            else:
+                recovered = not (kept and os.path.exists(kept))
+                observed = f'the kept source {kept or "(none recorded)"} is gone'
         else:
             recovered = bool(move_dest) and bool(rec.output_path) and \
                 os.path.dirname(os.path.normpath(rec.output_path)) == move_dest
@@ -1374,6 +1603,172 @@ def reconcile_failure_alerts():
     return _dismiss()
 
 
+#: A converted file may be missing this much more video than its source before the
+#: difference counts as the converter's. The timeline scanner's own gap threshold: a CFR
+#: re-encode leaves no gap at all (dev/changelog/1199), and a stream copy carries its
+#: source's gaps through unchanged.
+CONVERTED_GAP_TOLERANCE = 0.25
+
+#: Why a source .ts outlived its conversion, as written to SOURCE_KEPT's extra_data.
+SOURCE_KEPT_GAPS = 'converted_file_gaps'
+SOURCE_KEPT_UNCHECKED = 'converted_file_unchecked'
+SOURCE_KEPT_SETTING = 'delete_source_off'
+SOURCE_KEPT_UNLINK_FAILED = 'unlink_failed'
+
+
+def check_converted_output(output_path, *, reencoded, source_metrics, on_progress=None):
+    """Scan a finished conversion's video timeline and measure what the CONVERTER lost.
+
+    Returns {'metrics', 'lost_seconds', 'gaps'}:
+        metrics       probe.scan_video_timeline()'s dict for the output, {} if unreadable
+        lost_seconds  seconds of video missing from the output beyond what the source was
+                      missing; 0.0 when nothing was lost; None when it cannot be said - the
+                      output could not be read, or a stream copy whose source was never
+                      measured
+        gaps          [(start, end), ...] the gaps put down to the converter, in seconds
+                      into the output
+
+    A re-encode runs at -fps_mode cfr, which repeats the frame before every gap the source
+    had, so any gap in its output is one the conversion made: recording 16's two 7-minute
+    holes were exactly that (dev/changelog/1194). A stream copy keeps the source's own gaps,
+    so only what it is missing beyond them counts, and only a gap longer than the source's
+    largest can be named as new. It can only see a gap, never a desync (dev/changelog/1199).
+    """
+    from .probe import scan_video_timeline
+
+    metrics = scan_video_timeline(output_path, on_progress=on_progress)
+    if not metrics:
+        return {'metrics': {}, 'lost_seconds': None, 'gaps': []}
+    out_gap = metrics.get('gap_seconds') or 0.0
+    if reencoded:
+        lost = out_gap if out_gap > CONVERTED_GAP_TOLERANCE else 0.0
+        return {'metrics': metrics, 'lost_seconds': lost,
+                'gaps': list(metrics.get('gaps') or []) if lost else []}
+    if not source_metrics or source_metrics.get('gap_seconds') is None:
+        return {'metrics': metrics, 'lost_seconds': None, 'gaps': []}
+    excess = out_gap - (source_metrics.get('gap_seconds') or 0.0)
+    if excess <= CONVERTED_GAP_TOLERANCE:
+        return {'metrics': metrics, 'lost_seconds': 0.0, 'gaps': []}
+    longest_inherited = (source_metrics.get('max_gap_seconds') or 0.0) + CONVERTED_GAP_TOLERANCE
+    return {'metrics': metrics, 'lost_seconds': excess,
+            'gaps': [g for g in (metrics.get('gaps') or []) if g[1] - g[0] > longest_inherited]}
+
+
+def describe_gaps(gaps):
+    """'4m 47s to 11m 46s (6m 59s), ...' - each gap as positions into the file."""
+    return ', '.join(
+        f'{fmt_duration(start, with_seconds=True)} to {fmt_duration(end, with_seconds=True)} '
+        f'({fmt_duration(end - start, with_seconds=True)})' for start, end in gaps)
+
+
+#: Stretches named per format in describe_format_stretches(); the rest are counted.
+FORMAT_STRETCHES_NAMED = 5
+
+
+def describe_format_stretches(stretches):
+    """'mostly 1920x1080 @ 60; 1280x720 @ 30 for 2m 50s in all - 5m 39s to 7m 21s (1m
+    42s), ...' from channel_groups.file_format_stretches(). The one wording, for the event
+    the survey writes and the recording page that reads the survey back."""
+    from .channel_groups import format_label
+    parts = [f'mostly {format_label(stretches["main"])}']
+    for key, seconds, spans in stretches['others']:
+        named = describe_gaps(spans[:FORMAT_STRETCHES_NAMED])
+        more = len(spans) - FORMAT_STRETCHES_NAMED
+        parts.append(f'{format_label(key)} for {fmt_duration(seconds, with_seconds=True)} in all'
+                     + (f' - {named}' if named else '')
+                     + (f' and {more} more' if more > 0 else ''))
+    return '; '.join(parts)
+
+
+def _dispose_of_source(recording_id, ts_path, output_check, delete_wanted):
+    """Delete a finished conversion's joined .ts, or keep it, and record which and why.
+
+    Kept whatever post_process.delete_source says when the check found video the conversion
+    lost, or could not tell: the source is the only thing a Retry can rebuild the file from,
+    and recording 16 lost its holes for good because it was deleted unchecked
+    (dev/changelog/1200). output_check is check_converted_output()'s result."""
+    from . import db
+    from .database import add_recording_event, SOURCE_DELETED, SOURCE_KEPT
+
+    try:
+        size_note = f' ({_fmt_bytes(os.path.getsize(ts_path))})'
+    except OSError:
+        size_note = ''
+    name = os.path.basename(ts_path)
+    lost = output_check['lost_seconds'] if output_check else None
+    event_type, reason, error = SOURCE_KEPT, None, None
+    if lost:
+        reason = SOURCE_KEPT_GAPS
+        detail = (f'Kept the source {name}{size_note}: the converted file is missing video '
+                  f'it has. Retry conversion converts it again; deleting the recording '
+                  f'removes it.')
+    elif lost is None:
+        reason = SOURCE_KEPT_UNCHECKED
+        detail = (f'Kept the source {name}{size_note}: the converted file could not be '
+                  f'checked against it for missing video.')
+    elif not delete_wanted:
+        reason = SOURCE_KEPT_SETTING
+        detail = (f'Kept the source {name}{size_note}: deleting it after conversion is '
+                  f'turned off (Delete source .ts).')
+    else:
+        try:
+            os.unlink(ts_path)
+        except OSError as exc:
+            log.warning('Could not delete source .ts file %s: %s', ts_path, exc)
+            reason, error = SOURCE_KEPT_UNLINK_FAILED, str(exc)
+            detail = f'Could not delete the source {name}{size_note}, so it is still on disk: {exc}'
+        else:
+            event_type = SOURCE_DELETED
+            detail = (f'Deleted the source {name}{size_note} - the converted file checked '
+                      f'clean against it.')
+            log.info('Recording %d: deleted source %s', recording_id, ts_path)
+    extra = {'path': ts_path}
+    if reason:
+        extra['reason'] = reason
+        log.info('Recording %d: kept source %s (%s)', recording_id, ts_path, reason)
+    if error:
+        extra['error'] = error
+
+    @retry_on_locked()
+    def _commit_source_disposition():
+        add_recording_event(recording_id, event_type, detail=detail, extra=extra)
+        db.session.commit()
+
+    _commit_source_disposition()
+
+
+def _kept_source_paths(recording_ids):
+    """{recording_id: path} from each recording's newest SOURCE_KEPT event, in one query.
+    Paths are not checked against the disk."""
+    import json
+    from .database import RecordingEvent, SOURCE_KEPT
+
+    rows = (RecordingEvent.query
+            .filter(RecordingEvent.recording_id.in_(recording_ids),
+                    RecordingEvent.event_type == SOURCE_KEPT)
+            .order_by(RecordingEvent.id)
+            .all())
+    paths = {}
+    for evt in rows:
+        try:
+            path = json.loads(evt.extra_data).get('path') if evt.extra_data else None
+        except (ValueError, TypeError, AttributeError) as exc:
+            log.warning('Recording %d: unreadable SOURCE_KEPT extra_data: %s',
+                        evt.recording_id, exc)
+            path = None
+        paths[evt.recording_id] = path
+    return paths
+
+
+def kept_source_path(recording_id):
+    """The .ts the newest SOURCE_KEPT event names, if it is still on disk, else None.
+
+    Read from the event because nothing else remembers it: output_path names the converted
+    file once a conversion finishes, and a move can put that file in another folder."""
+    path = _kept_source_paths([recording_id]).get(recording_id)
+    return path if path and os.path.exists(path) else None
+
+
 def do_postprocess(app, recording_id: int, ts_path: str):
     """Run conversion and/or move after a successful concat.
 
@@ -1391,7 +1786,7 @@ def do_postprocess(app, recording_id: int, ts_path: str):
         DIAGNOSTICS, SEEK_DAMAGE_DETECTED, MIXED_FRAME_RATE_DETECTED, FORMAT_NORMALIZE_NEEDED,
         POSTCAPTURE_ANALYSIS_STARTED, POSTCAPTURE_ANALYSIS_SKIPPED,
         CONVERSION_STARTED, CONVERSION_RESTARTED, CONVERSION_YIELDED, CONVERSION_RESUMED,
-        CONVERSION_DONE, CONVERSION_FAILED, CONVERSION_CANCELLED,
+        CONVERSION_DONE, CONVERSION_FAILED, CONVERSION_CANCELLED, CONVERTED_FILE_GAPS,
         FILE_MOVED, CONCATENATION_DONE, SCRIPT_EXECUTED,
         REC_STATUS_ANALYZING, REC_STATUS_CONVERTING,
         REC_STATUS_ABORTED, REC_STATUS_FAILED, REC_STATUS_COMPLETED,
@@ -1945,13 +2340,41 @@ def do_postprocess(app, recording_id: int, ts_path: str):
                     'encoder is set to software. Re-encoding as H.264 with libx264.',
                     {'kind': 'conversion_hevc_needs_gpu'}))
 
+            # Where the converter holds a picture rather than leaving a hole. Inside one run
+            # -fps_mode cfr fills a video gap, but only one ffmpeg keeps as a gap
+            # (dts_delta_threshold), and never past the last frame - so a video that stops
+            # before its audio is padded to it by measurement (dev/changelog/1199).
+            source_max_gap = (timeline_scan[1] or {}).get('max_gap_seconds') if timeline_scan else None
+            dts_threshold = dts_delta_threshold(source_max_gap)
+            if dts_threshold:
+                log.info('Recording %d: the source has a %.1fs video gap - converting with '
+                         '-dts_delta_threshold %s so it is held as a picture, not closed up '
+                         'out of sync with the audio', recording_id, source_max_gap,
+                         dts_threshold)
+            end_pad = 0.0
+            if fmt == 'mp4' and reencode:
+                end_pad, pad_ends = video_end_pad(ts_path)
+                if end_pad:
+                    # Rounded, not truncated: 14.97s read "14s" beside ends of 30s and 45s.
+                    def _secs(x):
+                        return fmt_duration(round(x), with_seconds=True)
+                    encoder_events.append((
+                        f'The video ends {_secs(end_pad)} before the audio (video to '
+                        f'{_secs(pad_ends["video"])}, audio to {_secs(pad_ends["audio"])}), so '
+                        f'the last picture is held to the end of the file. That stretch has '
+                        f'sound but no new video.',
+                        {'kind': 'conversion_end_padded', 'pad_seconds': end_pad,
+                         'video_end': round(pad_ends['video'], 3),
+                         'audio_end': round(pad_ends['audio'], 3)}))
+
             # GPU DECODE, on top of a GPU encode: only where the damage scan ran and found the
             # file clean, and only on one single format. The hardware decoder logs no decode
             # errors, so on a damaged file the concealed-damage count below would read zero;
             # and it dies on a mid-file size change in every shape measured
-            # (dev/changelog/1183).
+            # (dev/changelog/1183). Not with an end pad either: the pad holds software frames
+            # ahead of the upload, the shape measured on the GPU (dev/changelog/1199).
             hw_decode = bool(use_gpu and pp.get('vaapi_decode') and timeline_damaged is False
-                             and src is not None and src.single_format)
+                             and src is not None and src.single_format and not end_pad)
 
             gpu_plan = _plan(software=False)
             sw_plan = _plan(software=True)
@@ -1998,12 +2421,14 @@ def do_postprocess(app, recording_id: int, ts_path: str):
                     db.session.commit()
                     return False
                 r.status = REC_STATUS_CONVERTING
-                db.session.add(RecordingEvent(
-                    recording_id=recording_id,
-                    event_type=CONVERSION_STARTED,
+                # The version that converted it, not the one that later builds a support
+                # bundle: an upgrade in between is the usual order (dev/changelog/1193).
+                add_recording_event(
+                    recording_id, CONVERSION_STARTED,
                     detail=f'Converting {os.path.basename(ts_path)} → '
                            f'{os.path.basename(output_path)}{mode_note}',
-                ))
+                    extra={'app_version': __version__},
+                )
                 db.session.commit()
                 return True
 
@@ -2089,6 +2514,10 @@ def do_postprocess(app, recording_id: int, ts_path: str):
                 plan = _current_plan()
                 c = [ffmpeg_path, '-err_detect', 'ignore_err', '-fflags', '+genpts+discardcorrupt',
                      '-max_error_rate', '1.0']
+                if dts_threshold:
+                    # Every path, the stream copies included: a copy closes a long video
+                    # gap out of sync exactly as a re-encode does (dev/changelog/1199).
+                    c += ['-dts_delta_threshold', dts_threshold]
                 gpu_reencode = use_gpu and fmt == 'mp4' and reencode
                 if gpu_reencode and hw_decode:
                     # The decoded frames stay on the device; -hwaccel_device opens it for the
@@ -2113,16 +2542,23 @@ def do_postprocess(app, recording_id: int, ts_path: str):
                     # yuv420p keeps hardware players (Roku/TV apps) happy; 2s forced IDRs give
                     # dense, guaranteed-clean seek points. CFR at the target rate (nominal
                     # r_frame_rate rationals - avg is skewed by the very gaps being repaired)
-                    # fills timeline holes with duplicated frames instead of leaving PTS jumps.
+                    # fills timeline holes with duplicated frames instead of leaving PTS jumps
+                    # - INSIDE THIS RUN, and only between two frames it is given. It cannot
+                    # reach across a part join (a stream copy; finalize_part keeps the joins
+                    # seamless instead), it fills a gap over ffmpeg's discontinuity threshold
+                    # only because dts_threshold keeps that gap, and it never pads past the
+                    # last frame, which is end_pad's job (measured, dev/changelog/1199).
                     if use_gpu:
                         hevc = gpu_codec == nz.VIDEO_CODEC_HEVC
                         if hw_decode:
                             vf = nz.gpu_decode_filter(plan, hevc=hevc)
                         elif plan.width:
-                            vf = nz.gpu_upload_filter(plan, hevc=hevc)
+                            vf = nz.gpu_upload_filter(plan, hevc=hevc, end_pad=end_pad)
                         else:
                             # Nothing measured a size: the shape that predates normalizing.
                             vf = VAAPI_UPLOAD
+                            if end_pad:
+                                vf = f'{nz.end_pad_filter(end_pad)},{vf}'
                         # format=nv12 does what -pix_fmt yuv420p does for libx264 (8-bit 4:2:0,
                         # a 10-bit SDR source included); an HDR source keeps 10 bits for
                         # Main10 HEVC or is tone-mapped for H.264. -qp is a constant quantizer
@@ -2133,7 +2569,7 @@ def do_postprocess(app, recording_id: int, ts_path: str):
                             gpu_codec, vaapi_hevc_qp if hevc else vaapi_qp,
                             main10=hevc and plan.hdr)
                     else:
-                        vf = nz.software_video_filter(plan)
+                        vf = nz.software_video_filter(plan, end_pad=end_pad)
                         if vf:
                             c += ['-vf', vf]
                         c += ['-c:v', 'libx264', '-preset', 'veryfast', '-crf', str(video_crf),
@@ -2217,6 +2653,8 @@ def do_postprocess(app, recording_id: int, ts_path: str):
             conversion_ok = False
             cancelled = False
             last_error = None
+            # The last dead attempt's evidence, for the give-up event when it is the last.
+            final_death = None
             decode_errors = 0
             prev_death_out_time = None
             repeated_at = None
@@ -2313,21 +2751,26 @@ def do_postprocess(app, recording_id: int, ts_path: str):
                     log.warning('Recording %d: found a partly-encoded file no attempt recorded '
                                 '(%s) - checking what of it survives',
                                 recording_id, os.path.basename(stray))
+                    trimmed_from = {}
                     try:
                         kept = finalize_part(stray, ffmpeg_path, scratch_key=recording_id,
                                              interval=interval,
                                              pre_output_timeout=pre_output_timeout,
                                              stall_seconds=stall_seconds,
                                              label=f'Recording {recording_id} part',
-                                             on_spawn=_track_child)
+                                             on_spawn=_track_child,
+                                             on_trim=lambda ends, _k: trimmed_from.update(ends))
                     finally:
                         _untrack_child()
                     if kept:
+                        part_start = source_covered
                         parts_done += 1
                         source_covered += kept
                         _persist_conversion_parts(
                             recording_id, parts_done=parts_done, source_covered=source_covered,
                             source_complete=False, signature=signature)
+                        _report_kept_part(recording_id, parts_done, start_at=part_start,
+                                          kept=kept, trimmed_from=trimmed_from)
 
                         @retry_on_locked()
                         def _commit_part_adopted(where=source_covered, n=parts_done):
@@ -2399,6 +2842,7 @@ def do_postprocess(app, recording_id: int, ts_path: str):
 
                 if result.success:
                     conversion_ok = True
+                    final_death = None
                     if resumable:
                         # A part ffmpeg closed itself needs no repair - it has a proper
                         # trailer and every fragment is complete - so it is recorded as-is.
@@ -2414,14 +2858,18 @@ def do_postprocess(app, recording_id: int, ts_path: str):
                     break
 
                 last_error = result.error_msg or result.reason
+                kept = None
+                final_death = _death_evidence(result)
 
-                if use_gpu and result.reason == 'died' and names_gpu_failure(result.error_msg):
+                if use_gpu and result.reason == 'died' and result.gpu_error:
                     # THE HARDWARE PATH FAILED, SO THE REST OF THE CONVERSION IS SOFTWARE.
-                    # Only a death that names the device, the upload or the encoder counts:
-                    # any other death is the decoder on a damaged source, which the restart
-                    # loop below already handles, and switching encoders on it would both
-                    # waste the GPU and break the two-deaths-at-one-offset reasoning that
-                    # triggers the audio-copy fallback. Every part the GPU encoded goes -
+                    # Only a death whose error lines name the device, the upload or the
+                    # encoder counts - read from the whole stderr, because the tail is often
+                    # audio warnings from ffmpeg's run-on after the video died (recording 16,
+                    # dev/changelog/1197). Any other death is the decoder on a damaged source,
+                    # which the restart loop below already handles, and switching encoders on
+                    # it would both waste the GPU and break the two-deaths-at-one-offset
+                    # reasoning that triggers the audio-copy fallback. Every part the GPU encoded goes -
                     # the same seam rule as the audio fallback (a file with two encoders'
                     # output joined is exactly what the signature exists to prevent), so the
                     # salvage of the killed part is skipped rather than done for nothing.
@@ -2432,6 +2880,17 @@ def do_postprocess(app, recording_id: int, ts_path: str):
                     # is dropped and the alert and Readiness are moved, so the next
                     # conversion asks the device again instead of trusting a one-second
                     # synthetic pass over a real failure (dev/changelog/1184).
+                    # The line that blamed the hardware, not the tail, is what the alert and
+                    # the event quote; the tail rides along in the evidence.
+                    #
+                    # THE STEP BACK SPENDS NO RESTART ATTEMPT. The budget is for deaths the
+                    # encoder that finishes the job might hit again; a dead GPU says nothing
+                    # about the source, and charging it left the CPU two of its four runs
+                    # when decode and encode both stepped back. It needs no stored cap: each
+                    # firing takes a GPU stage away, so this branch runs at most twice per
+                    # run, and a service restart that re-trials the GPU pays an attempt of
+                    # its own in scheduler.py (dev/changelog/1198).
+                    last_error = result.gpu_error
                     dropped_decode = hw_decode
                     if hw_decode:
                         hw_decode = False
@@ -2446,20 +2905,20 @@ def do_postprocess(app, recording_id: int, ts_path: str):
                     if resumable:
                         signature = parts_signature(
                             _build_cmd(audio_copy=audio_copy_fallback), output_path)
-                    attempt += 1
                     log.warning('Recording %d: the GPU %s failed %s into the source - '
-                                'retrying %s (%d GPU-encoded part(s) discarded): %s',
+                                'retrying %s (%d GPU-encoded part(s) discarded; no restart '
+                                'attempt spent): %s',
                                 recording_id, 'decoder' if dropped_decode else 'encoder',
                                 fmt_duration(result.out_time or 0, with_seconds=True),
                                 'with CPU decoding' if dropped_decode else 'with libx264 on the CPU',
                                 parts_discarded, last_error)
 
                     @retry_on_locked()
-                    def _commit_gpu_fallback_event(where=result.out_time or 0, n=attempt,
+                    def _commit_gpu_fallback_event(where=result.out_time or 0,
                                                    dropped=parts_discarded, sig=signature,
-                                                   err=last_error, decode=dropped_decode):
+                                                   err=last_error, decode=dropped_decode,
+                                                   evidence=final_death):
                         r = db.session.get(Recording, recording_id)
-                        r.conversion_attempts = n
                         # Registered before this attempt writes a part, for the reason the
                         # audio fallback's commit gives.
                         set_conversion_parts(r, signature=sig)
@@ -2482,10 +2941,12 @@ def do_postprocess(app, recording_id: int, ts_path: str):
                                          else 'software-encoded video')
                                       + ', so they were discarded and this attempt starts '
                                         'from the beginning.' if dropped else '')
+                                   + ' This does not count against the conversion\'s '
+                                     'restart attempts.'
                                    + f' ffmpeg reported: {err}',
                             extra={'kind': ('conversion_gpu_decode_fallback' if decode
                                             else 'conversion_gpu_fallback'),
-                                   'device': vaapi_device, 'error': err})
+                                   'device': vaapi_device, 'error': err, **evidence})
                         db.session.commit()
 
                     _commit_gpu_fallback_event()
@@ -2501,13 +2962,15 @@ def do_postprocess(app, recording_id: int, ts_path: str):
                     # the reason the next attempt's -ss is trustworthy. A part with nothing
                     # usable in it is deleted and the offset is left where it was, so the
                     # worst case is re-encoding that stretch rather than skipping it.
+                    trimmed_from = {}
                     try:
                         kept = finalize_part(part_file, ffmpeg_path, scratch_key=recording_id,
                                              interval=interval,
                                              pre_output_timeout=pre_output_timeout,
                                              stall_seconds=stall_seconds,
                                              label=f'Recording {recording_id} part',
-                                             on_spawn=_track_child)
+                                             on_spawn=_track_child,
+                                             on_trim=lambda ends, _k: trimmed_from.update(ends))
                     finally:
                         _untrack_child()
                     if kept:
@@ -2517,6 +2980,13 @@ def do_postprocess(app, recording_id: int, ts_path: str):
                             recording_id, parts_done=parts_done,
                             source_covered=source_covered, source_complete=False,
                             signature=signature)
+                        # The tolerance is one progress poll (out_time lags the file by up
+                        # to that) plus one 2s forced-keyframe fragment (the re-mux drops the
+                        # one that was mid-write, so the file can end that much short of it).
+                        _report_kept_part(recording_id, parts_done, start_at=start_at,
+                                          kept=kept, trimmed_from=trimmed_from,
+                                          out_time=result.out_time,
+                                          tolerance=max(interval, 1.0) + 2.0)
                         log.info('Recording %d: kept %s of encoding from the attempt that '
                                  '%s - %s of the source is now encoded across %d part(s)',
                                  recording_id, fmt_duration(kept, with_seconds=True),
@@ -2531,6 +3001,7 @@ def do_postprocess(app, recording_id: int, ts_path: str):
                                     'be kept - the next one re-encodes from %s',
                                     recording_id, result.reason,
                                     fmt_duration(source_covered, with_seconds=True))
+                    final_death = _death_evidence(result, kept=kept or 0.0)
 
                 # A restart re-reads the same static .ts, so a defect IN THAT FILE stops every
                 # attempt at the same source position. Recording 4 died four times at
@@ -2581,7 +3052,8 @@ def do_postprocess(app, recording_id: int, ts_path: str):
 
                     @retry_on_locked()
                     def _commit_audio_fallback_event(where=result.out_time, n=attempt,
-                                                     dropped=parts_discarded, sig=signature):
+                                                     dropped=parts_discarded, sig=signature,
+                                                     evidence=final_death):
                         r = db.session.get(Recording, recording_id)
                         r.conversion_attempts = n
                         # The NEW signature is registered here, not merely cleared: this is
@@ -2601,7 +3073,8 @@ def do_postprocess(app, recording_id: int, ts_path: str):
                                    + (f' The {dropped} part(s) already encoded cannot be joined '
                                       f'onto audio copied this way, so they were discarded and '
                                       f'this attempt starts from the beginning.'
-                                      if dropped else ''))
+                                      if dropped else ''),
+                            extra={'kind': 'conversion_audio_copy_restart', **evidence})
                         db.session.commit()
 
                     _commit_audio_fallback_event()
@@ -2637,19 +3110,25 @@ def do_postprocess(app, recording_id: int, ts_path: str):
 
                 @retry_on_locked()
                 def _commit_restart_event(n=attempt, reason=result.reason,
-                                          covered=source_covered, nparts=parts_done):
+                                          covered=source_covered, nparts=parts_done,
+                                          stopped_at=result.out_time, evidence=final_death):
                     # What the next attempt will actually do, not a generic "restarting": a
                     # resume that says "restarting" reads as the hours-thrown-away behavior
                     # this replaced, and the difference is the whole point of the feature.
                     where = (f' Resuming from {fmt_duration(covered, with_seconds=True)} in - '
                              f'the {nparts} part(s) already encoded are kept.'
                              if covered > 0 else '')
-                    db.session.add(RecordingEvent(
-                        recording_id=recording_id,
-                        event_type=CONVERSION_RESTARTED,
-                        detail=f'Conversion {_RESTART_REASON_PHRASE.get(reason, reason)}; '
-                               f'restarting (attempt {n} of {max_attempts}).{where}',
-                    ))
+                    # How far ffmpeg got is said beside where it resumes, so a part that ends
+                    # far short of it is visible on the page (recording 16's were 7 minutes
+                    # apart, dev/changelog/1194). The dead attempt's evidence goes in
+                    # extra_data, where a support bundle still has it after dvr.log rotates.
+                    stopped = (f' {fmt_duration(stopped_at, with_seconds=True)} into the source'
+                               if stopped_at else '')
+                    add_recording_event(
+                        recording_id, CONVERSION_RESTARTED,
+                        detail=f'Conversion {_RESTART_REASON_PHRASE.get(reason, reason)}'
+                               f'{stopped}; restarting (attempt {n} of {max_attempts}).{where}',
+                        extra={'kind': 'conversion_restart', **evidence})
                     db.session.commit()
 
                 _commit_restart_event()
@@ -2777,6 +3256,7 @@ def do_postprocess(app, recording_id: int, ts_path: str):
                         # whole feature exists to end.
                         conversion_ok = False
                         last_error = join.error_msg or join.reason
+                        final_death = None
                         log.error('Recording %d: converted every frame but could not '
                                   'assemble the final file: %s', recording_id, last_error,
                                   extra={'recording_id': recording_id})
@@ -2824,11 +3304,91 @@ def do_postprocess(app, recording_id: int, ts_path: str):
             if conversion_ok:
                 converted_size = os.path.getsize(output_path) if os.path.exists(output_path) else 0
 
+                # ── Check the finished file before anything may delete its source ──
+                # Before the CONVERSION_DONE commit, while the row still names the .ts: a
+                # crash during the scan resumes the conversion like any other death, and the
+                # verdict lands in the commit that names the output, so the delete below
+                # acts on a recorded fact rather than on a scan it assumes ran
+                # (dev/changelog/1200).
+                output_check = None
+                if output_path != ts_path:
+                    if not reencode and timeline_scan is None and os.path.exists(ts_path):
+                        # A stream copy is judged against its source, which nothing measured
+                        # when health data is off and reencode_mode is not 'damaged'.
+                        timeline_scan = _scan_recording_timeline(recording_id, ts_path)
+                    output_check = check_converted_output(
+                        output_path, reencoded=reencode,
+                        source_metrics=timeline_scan[1] if timeline_scan else None)
+                    out_metrics = output_check['metrics']
+                    lost_seconds = output_check['lost_seconds']
+                    if not out_metrics:
+                        log.warning('Recording %d: could not read the converted file\'s video '
+                                    'timeline - keeping the source', recording_id)
+                    elif lost_seconds:
+                        log.warning('Recording %d: the converted file is missing %.1fs of video '
+                                    'the source has: %s', recording_id, lost_seconds,
+                                    describe_gaps(output_check['gaps']) or 'gaps not located')
+                    else:
+                        log.info('Recording %d: converted file checked, %d video gap(s) '
+                                 '(%.1fs) against the source', recording_id,
+                                 out_metrics.get('gap_count') or 0,
+                                 out_metrics.get('gap_seconds') or 0.0)
+
+                def _add_output_check_events(check):
+                    """The check's events, inside the CONVERSION_DONE commit."""
+                    metrics, lost = check['metrics'], check['lost_seconds']
+                    extra = {'kind': 'output_timeline_scan', 'reencoded': bool(reencode)}
+                    if not metrics:
+                        extra['scan_failed'] = True
+                        detail = ('Could not read the converted file\'s video timeline, so '
+                                  'it was not checked for gaps - the source .ts is kept.')
+                    else:
+                        extra.update({
+                            'gap_count':       metrics['gap_count'],
+                            'gap_seconds':     round(metrics['gap_seconds'], 3),
+                            'max_gap_seconds': round(metrics['max_gap_seconds'], 3),
+                            'gap_threshold':   metrics['gap_threshold'],
+                            'span_seconds':    round(metrics['span_seconds'], 2),
+                            'packet_count':    metrics['packet_count'],
+                        })
+                        n = metrics['gap_count']
+                        found = ('no video gaps' if not n else
+                                 f'{n} video gap{"" if n == 1 else "s"} totalling '
+                                 f'{fmt_duration(metrics["gap_seconds"], with_seconds=True)}')
+                        if lost is None:
+                            verdict = ('the source was never measured, so they cannot be '
+                                       'told apart from its own')
+                        elif lost:
+                            verdict = 'the conversion lost video the source has'
+                        elif reencode:
+                            verdict = 'nothing lost'
+                        else:
+                            verdict = 'no more than the source itself has'
+                        detail = f'Checked the converted file: {found} - {verdict}.'
+                    add_recording_event(recording_id, DIAGNOSTICS, detail=detail, extra=extra)
+                    if lost:
+                        gaps = check['gaps']
+                        where = (f' in {len(gaps)} gap{"" if len(gaps) == 1 else "s"}: '
+                                 f'{describe_gaps(gaps)}' if gaps else '')
+                        more = ('' if reencode else ' more than the source does')
+                        add_recording_event(
+                            recording_id, CONVERTED_FILE_GAPS,
+                            detail=f'The converted file is missing '
+                                   f'{fmt_duration(lost, with_seconds=True)} of video'
+                                   f'{more}{where}. The file plays, but stalls or freezes '
+                                   f'there. The source .ts was kept, so Retry conversion '
+                                   f'can convert it again.',
+                            extra={'gaps': [[round(a, 3), round(b, 3)] for a, b in gaps],
+                                   'reencoded': bool(reencode)})
+
                 @retry_on_locked()
                 def _commit_conversion_done():
                     r = db.session.get(Recording, recording_id)
                     r.output_path = output_path
                     r.final_file_size = converted_size
+                    r.converted_gap_seconds = (
+                        round(output_check['lost_seconds'], 3)
+                        if output_check and output_check['lost_seconds'] is not None else None)
                     # THE CHECKPOINT IS CLEARED IN THE SAME COMMIT THAT NAMES THE OUTPUT, and
                     # the parts are deleted only after it returns. Clearing it separately -
                     # or, as this did, unlinking the parts first and recording it afterwards -
@@ -2848,6 +3408,8 @@ def do_postprocess(app, recording_id: int, ts_path: str):
                         detail=f'Conversion complete: {os.path.basename(output_path)} '
                                f'({_fmt_bytes(converted_size)}){encoder_note}',
                     ))
+                    if output_check is not None:
+                        _add_output_check_events(output_check)
                     db.session.commit()
 
                 _commit_conversion_done()
@@ -2899,11 +3461,25 @@ def do_postprocess(app, recording_id: int, ts_path: str):
                     log.warning('Recording %d conversion dropped %d undecodable frame(s)',
                                 recording_id, decode_errors)
 
-                if pp.get('delete_source', True) and ts_path != output_path:
-                    try:
-                        os.unlink(ts_path)
-                    except Exception as exc:
-                        log.warning('Could not delete source .ts file %s: %s', ts_path, exc)
+                if output_check and output_check['lost_seconds']:
+                    alerts.create_alert(
+                        'CONVERTED_FILE_GAPS',
+                        f'Converted file has gaps: {rec_name}',
+                        body=(f'The converted file is missing '
+                              f'{fmt_duration(output_check["lost_seconds"], with_seconds=True)} '
+                              f'of video that the recording itself has, so it will stall or '
+                              f'freeze in those places. The source .ts was kept rather than '
+                              f'deleted - Retry conversion on the recording converts it '
+                              f'again.'),
+                        source='postprocessor',
+                        recording_id=recording_id,
+                    )
+                elif output_check and output_check['lost_seconds'] == 0:
+                    alerts.dismiss_open_alerts_for_recording(recording_id, 'CONVERTED_FILE_GAPS')
+
+                if ts_path != output_path and os.path.exists(ts_path):
+                    _dispose_of_source(recording_id, ts_path, output_check,
+                                       pp.get('delete_source', True))
 
                 current_path = output_path
             else:
@@ -2942,11 +3518,10 @@ def do_postprocess(app, recording_id: int, ts_path: str):
                     r.status = REC_STATUS_FAILED
                     r.completed_at = datetime.utcnow()
                     r.failure_reason = FAILURE_CONVERSION_FAILED
-                    db.session.add(RecordingEvent(
-                        recording_id=recording_id,
-                        event_type=CONVERSION_FAILED,
-                        detail=give_up_msg,
-                    ))
+                    add_recording_event(
+                        recording_id, CONVERSION_FAILED, detail=give_up_msg,
+                        extra={'kind': 'conversion_gave_up', **final_death}
+                        if final_death else None)
                     db.session.commit()
                     return True
 
@@ -3279,7 +3854,8 @@ def _recorded_timeline_scan(recording_id):
             'deficit_seconds':  rec.timeline_deficit_seconds if rec else None,
         }
         for k in ('gap_basis', 'gap_threshold', 'backward_count', 'missing_seconds',
-                  'span_seconds', 'packet_count', 'fps', 'capture_fps_values', 'deficit_fps'):
+                  'span_seconds', 'packet_count', 'fps', 'capture_fps_values', 'deficit_fps',
+                  'deficit_basis'):
             if k in extra:
                 metrics[k] = extra[k]
         damaged = bool(rec.timeline_damaged) if rec is not None else False
@@ -3337,6 +3913,7 @@ def _scan_recording_timeline(recording_id, ts_path, analysis_plan=None):
             'span_seconds':    round(metrics['span_seconds'], 2),
             'packet_count':    metrics['packet_count'],
             'fps':             round(metrics['fps'], 3) if metrics['fps'] else metrics['fps'],
+            'deficit_basis':   metrics['deficit_basis'],
         })
         # Only present when the capture rate actually changed, and then both are needed to
         # reproduce deficit_seconds: which rates ran, and which single rate it was divided
@@ -3408,7 +3985,8 @@ def _survey_recording(recording_id, ts_path, analysis_plan=None):
     Recorded on BOTH outcomes, like the damage scan: "checked, one format" is a finding, and
     a survey that failed has to say so or the conversion's choices look unexplained."""
     from . import db
-    from .database import DIAGNOSTICS, add_recording_event
+    from .channel_groups import file_format_stretches, format_label
+    from .database import DIAGNOSTICS, RECORDING_FORMAT_CHANGED, add_recording_event
     from .normalize import channels_label
     from .probe import survey_formats
 
@@ -3428,13 +4006,33 @@ def _survey_recording(recording_id, ts_path, analysis_plan=None):
                   'of each segment, which sees only its first frames')
         extra = {'kind': 'format_survey', 'survey_failed': True}
 
+    # The authoritative format-change disclosure: where each format held and for how long,
+    # read from the whole file. The watchdog's own RECORDING_FORMAT_CHANGED events say only
+    # what a segment opened at, and miss a change inside a segment altogether
+    # (dev/changelog/1201). The measurements stay in the survey's own extra_data, written
+    # in the same commit; `basis` is what tells this event from the watchdog's.
+    stretches = file_format_stretches(survey) if survey else None
+    change = None
+    if stretches and stretches['others']:
+        change = {
+            'detail': (f'The joined file changes format part-way through: '
+                       f'{describe_format_stretches(stretches)}. It plays, but its header '
+                       f'describes only {format_label(stretches["first"])}.'),
+            'extra': {'basis': 'format_survey'},
+        }
+
     @retry_on_locked()
     def _commit_survey():
         add_recording_event(recording_id, DIAGNOSTICS, detail=detail, extra=extra)
+        if change:
+            add_recording_event(recording_id, RECORDING_FORMAT_CHANGED,
+                                detail=change['detail'], extra=change['extra'])
         db.session.commit()
 
     _commit_survey()
     log.info('Recording %d: %s', recording_id, detail)
+    if change:
+        log.warning('Recording %d: %s', recording_id, change['detail'])
     return survey
 
 

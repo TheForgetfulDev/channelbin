@@ -5,6 +5,39 @@ Notable changes to ChannelBin, newest first. This project follows
 release is tagged `v<version>` in git, and the version the app is running is shown in the
 page footer.
 
+## 0.25.0 - 2026-10-15
+
+**Added**
+
+- A finished conversion is checked for missing video before its source .ts is deleted. If video
+  is missing, the source is kept, the recording names each hole with its times, the Recordings
+  list marks it "Gaps in file", an alert is raised, and Retry conversion converts it again from
+  the kept source.
+- A recording's event log names the app version that captured it and the version that converted
+  it.
+
+**Changed**
+
+- Switching a conversion from the GPU to the CPU after a GPU failure no longer uses up one of its
+  restart attempts.
+
+**Fixed**
+
+- A conversion that dies and resumes no longer leaves holes in the video when the dead attempt's
+  audio had run past its video.
+- A conversion holds the last picture across every gap in the video: a long video-only gap no
+  longer closes up and puts the rest of the video ahead of its sound, and video that ends before
+  the audio is padded out.
+- A GPU conversion that dies is diagnosed from all of its error output, so a GPU failure is no
+  longer mistaken for a damaged recording, and an audio fault during a GPU encode is no longer
+  blamed on the GPU.
+- Missing video is measured over the whole file, and the detail page's Video row says how long
+  each format held instead of calling a whole segment the format its opening seconds had.
+- Saving a new search to an auto-record rule asks what to do with the scheduled recordings the
+  new search no longer matches, instead of keeping them scheduled and counting toward the rule's
+  cap.
+- A support bundle's log tail reads across rotated log files.
+
 ## 0.24.0 - 2026-10-14
 
 **Added**

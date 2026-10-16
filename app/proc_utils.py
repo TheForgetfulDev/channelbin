@@ -314,6 +314,46 @@ def count_stderr_matches(path, needle: str = RECONNECT_MARKER,
     return count, False
 
 
+# What `-loglevel level+info` makes ffmpeg write on every line: its own severity, after any
+# '[name @ 0x..] ' context, e.g. '[vf#0:0 @ 0x5570] [error] Error reinitializing filters!'.
+# Measured on ffmpeg 7.1 (dev/changelog/1197). A spool written without the flag carries no
+# tag on any line, so the reader below finds no error lines in it rather than guessing.
+STDERR_LEVEL_ARGS = ['-loglevel', 'level+info']
+_ERROR_LEVEL_RE = re.compile(r'\[(?:error|fatal|panic)\] ')
+
+
+def iter_stderr_error_lines(path, max_bytes: int = STDERR_SCAN_MAX_BYTES):
+    """Yield the error-level lines of a level-tagged stderr spool, oldest first.
+
+    Reads the LAST max_bytes rather than the first: whatever killed the child is at the end,
+    and the cap exists for the same reason as count_stderr_matches' - this sits between a dead
+    ffmpeg and its restart and must not be able to delay it. An error-level line is what
+    separates a failure from the banner, which names the codec and the device on every run,
+    and from warnings a healthy run prints.
+
+    Never raises: an unreadable spool yields nothing.
+    """
+    if not path:
+        return
+    try:
+        with open(path, 'rb') as fh:
+            fh.seek(0, os.SEEK_END)
+            size = fh.tell()
+            start = max(0, size - max_bytes)
+            fh.seek(start)
+            raw = fh.read()
+    except OSError:
+        return
+    text = raw.decode('utf-8', errors='replace').replace('\r', '\n')
+    lines = text.split('\n')
+    if start:
+        lines = lines[1:]  # the seek landed mid-line; that fragment's tag is cut off anyway
+    for line in lines:
+        line = line.strip()
+        if line and _ERROR_LEVEL_RE.search(line):
+            yield line
+
+
 def suspend_process(proc) -> bool:
     """SIGSTOP a child so it releases the CPU without losing what it has already done.
 
@@ -657,7 +697,7 @@ def supervise_ffmpeg(cmd, output_path, *, scratch_prefix, scratch_key, interval,
                      pre_output_timeout, stall_seconds, progress_signal='out_time',
                      noun='job', label='ffmpeg', on_spawn=None, on_progress=None,
                      suspend_check=None, on_suspend=None, on_resume=None,
-                     on_exit=None) -> SupervisedRun:
+                     on_exit=None, level_tags=False) -> SupervisedRun:
     """Spawn one ffmpeg and supervise it under the two rules above. Returns a SupervisedRun.
 
     `noun` ('conversion', 'concat') spells the user-facing error text; `label` prefixes the
@@ -665,7 +705,8 @@ def supervise_ffmpeg(cmd, output_path, *, scratch_prefix, scratch_key, interval,
     registers the child in whatever live registry the caller owns, `on_progress(wall,
     out_time, size)` publishes a tick, and `on_exit(stderr_path, returncode)` fires after
     the loop while the stderr spool still exists, for anything the caller wants to derive
-    from it.
+    from it. `level_tags` has ffmpeg write each line's severity (STDERR_LEVEL_ARGS), which
+    is what lets that hook tell an error line from the banner (iter_stderr_error_lines).
 
     SUSPENSION. `suspend_check(wall, out_time, size)` returns None to keep running, or a
     short reason string to have the child SIGSTOPped until a later call returns None again -
@@ -715,7 +756,7 @@ def supervise_ffmpeg(cmd, output_path, *, scratch_prefix, scratch_key, interval,
 
     # -nostdin: never block on a tty. -progress: machine-readable stats to a file.
     # -stats_period sets how often ffmpeg writes them.
-    full_cmd = cmd[:1] + ['-nostdin'] + cmd[1:]
+    full_cmd = cmd[:1] + ['-nostdin'] + (STDERR_LEVEL_ARGS if level_tags else []) + cmd[1:]
     # Insert -progress/-stats_period just before the output path (last arg).
     full_cmd = full_cmd[:-1] + ['-progress', progress_path, '-stats_period', str(interval)] + full_cmd[-1:]
 

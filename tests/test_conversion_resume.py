@@ -436,6 +436,111 @@ class FinalizePartTests(unittest.TestCase):
         self.assertFalse(os.path.exists(clean_part_path(cut)))
 
 
+@unittest.skipUnless(_HAVE_FFMPEG, 'ffmpeg/ffprobe not installed')
+class TrackOverhangTests(unittest.TestCase):
+    """dev/docs/BUGS.md 2026-10-15 - a killed part whose audio ran past its video.
+
+    Recording 16's GPU conversion died twice, each time leaving a part whose audio ran minutes
+    past its video. finalize_part() measured the part by the format duration - the longest
+    track - so the next attempt resumed past the end of the video, and the concat demuxer
+    placed the next part at the end of the audio. The finished file had two video holes of
+    6m59s and 7m47s. The synthetic part here is the shape measured on this box: 3s of video,
+    8s of audio, fragmented as a conversion part is."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls._dir = tempfile.mkdtemp(prefix='cresume-overhang-')
+        cls.audio_long = os.path.join(cls._dir, 'audio_long.mp4')
+        cls.video_long = os.path.join(cls._dir, 'video_long.mp4')
+        cls.balanced = os.path.join(cls._dir, 'balanced.mp4')
+        cls.next_part = os.path.join(cls._dir, 'next.mp4')
+        for path, vdur, adur in ((cls.audio_long, 3, 8), (cls.video_long, 8, 3),
+                                 (cls.balanced, 4, 4), (cls.next_part, 4, 4)):
+            # Default libx264 settings, B-frames included, as a real part has them - a trim
+            # of the VIDEO track has to cope with frames stored out of display order.
+            _ffmpeg('-f', 'lavfi', '-i', f'testsrc=size=192x108:rate=30:d={vdur}',
+                    '-f', 'lavfi', '-i', f'sine=frequency=440:sample_rate=48000:d={adur}',
+                    '-c:v', 'libx264', '-preset', 'ultrafast', '-pix_fmt', 'yuv420p',
+                    '-force_key_frames', 'expr:gte(t,n_forced*2)', '-c:a', 'aac',
+                    '-movflags', PART_MOVFLAGS, path + '.src.mp4')
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls._dir, ignore_errors=True)
+
+    def _fresh(self, src, name):
+        path = os.path.join(self._dir, name)
+        shutil.copyfile(src + '.src.mp4', path)
+        return path
+
+    def _finalize(self, path, **kw):
+        return finalize_part(path, 'ffmpeg', scratch_key='t', interval=1,
+                             pre_output_timeout=60, stall_seconds=60, **kw)
+
+    def _spread(self, path):
+        ends = probemod.stream_ends(path)
+        tracks = [min(ends['video']), min(ends['audio'])]
+        return max(tracks) - min(tracks)
+
+    def test_the_kept_length_is_where_the_shorter_track_ends(self):
+        part = self._fresh(self.audio_long, 'a1.mp4')
+        kept = self._finalize(part)
+        self.assertIsNotNone(kept)
+        self.assertAlmostEqual(kept, 3.0, delta=0.1,
+                               msg=f'kept {kept}s - the audio ran on to 8s, the video to 3s')
+
+    def test_the_kept_part_has_its_tracks_ending_together(self):
+        # The concat demuxer places the next part at the end of this one's LONGEST track, so
+        # the resume point alone does not close the hole.
+        part = self._fresh(self.audio_long, 'a2.mp4')
+        self._finalize(part)
+        self.assertLessEqual(self._spread(part), ppmod.PART_STREAM_END_TOLERANCE)
+
+    def test_a_join_after_the_overhang_has_no_video_hole(self):
+        out = os.path.join(self._dir, 'joined_overhang.mp4')
+        part = self._fresh(self.audio_long, 'a3.mp4')
+        self._finalize(part)
+        nxt = self._fresh(self.next_part, 'n3.mp4')
+        result = join_conversion_parts([part, nxt], out, 'ffmpeg', scratch_key='t',
+                                       interval=1, pre_output_timeout=120, stall_seconds=120)
+        self.assertTrue(result.success, f'join failed: {result.error_msg}')
+        scan = probemod.scan_video_timeline(out)
+        self.assertLessEqual(scan['max_gap_seconds'], 0.25,
+                             f'the join left a {scan["max_gap_seconds"]:.2f}s video hole')
+
+    def test_a_video_track_running_past_the_audio_is_cut_too(self):
+        part = self._fresh(self.video_long, 'v1.mp4')
+        kept = self._finalize(part)
+        self.assertIsNotNone(kept)
+        self.assertLess(kept, 3.2)
+        self.assertLessEqual(self._spread(part), ppmod.PART_STREAM_END_TOLERANCE)
+
+    def test_a_trim_is_reported_with_where_each_track_ended(self):
+        seen = []
+        part = self._fresh(self.audio_long, 'a4.mp4')
+        kept = self._finalize(part, on_trim=lambda ends, k: seen.append((ends, k)))
+        self.assertEqual(len(seen), 1)
+        ends, reported = seen[0]
+        self.assertAlmostEqual(ends['video'], 3.0, delta=0.1)
+        self.assertAlmostEqual(ends['audio'], 8.0, delta=0.1)
+        self.assertEqual(reported, kept)
+
+    def test_a_part_whose_tracks_already_agree_is_not_cut(self):
+        seen = []
+        part = self._fresh(self.balanced, 'b1.mp4')
+        kept = self._finalize(part, on_trim=lambda ends, k: seen.append(ends))
+        self.assertAlmostEqual(kept, 4.0, delta=0.1)
+        self.assertEqual(seen, [])
+
+    def test_finalizing_a_trimmed_part_again_gives_the_same_answer(self):
+        # A crash between the trim and the commit leaves an unrecorded part that the next run
+        # adopts through this same call; it must land on the same splice point.
+        part = self._fresh(self.audio_long, 'a5.mp4')
+        first = self._finalize(part)
+        second = self._finalize(part)
+        self.assertAlmostEqual(first, second, delta=0.05)
+
+
 # ── the whole cycle: kill, resume, join ───────────────────────────────────────────────
 
 @unittest.skipUnless(_HAVE_FFMPEG, 'ffmpeg/ffprobe not installed')
@@ -840,6 +945,57 @@ class RestartLoopResumeTests(unittest.TestCase):
                   RecordingEvent.query.filter_by(recording_id=self.rid).all()]
         self.assertTrue(any('same point' in (d or '') for d in events),
                         'a repeated stop must be named as the source being damaged there')
+
+    def _measured_events(self):
+        import json
+        return [json.loads(e.extra_data) for e in
+                RecordingEvent.query.filter_by(recording_id=self.rid).all()
+                if json.loads(e.extra_data or '{}').get('kind') == 'conversion_part_measured']
+
+    def _run_with_finalize(self, results, finalize):
+        import app.config as cfgmod
+
+        def _supervised(app_, rid, cmd, dest, **kw):
+            with open(dest, 'wb') as fh:
+                fh.write(b'p' * 64)
+            return results.pop(0)
+
+        with mock.patch.object(cfgmod, 'load_config', return_value=self._config()), \
+                mock.patch.object(probemod, 'nominal_video_rate', return_value=None), \
+                mock.patch.object(ppmod, 'run_conversion_supervised', _supervised), \
+                mock.patch.object(ppmod, 'join_conversion_parts',
+                                  return_value=ppmod.PartJoinResult(True, 'success', parts=2)), \
+                mock.patch.object(ppmod, 'finalize_part', finalize):
+            ppmod.do_postprocess(self.t.app, self.rid, self.ts)
+        db.session.expire_all()
+
+    def test_a_trimmed_part_is_put_on_the_recording(self):
+        """dev/docs/BUGS.md 2026-10-15 - with the trim in place recording 16's shape no longer
+        disagrees with ffmpeg's progress, so the trim itself is what says the audio ran ahead."""
+        def _finalize(part, *a, on_trim=None, **k):
+            on_trim({'video': 287.96, 'audio': 706.67}, 287.96)
+            return 287.96
+
+        self._run_with_finalize([self._dead(out_time=287.95), self._ok()], _finalize)
+        events = self._measured_events()
+        self.assertEqual(len(events), 1, events)
+        self.assertEqual(events[0]['track_ends_seconds'], {'video': 287.96, 'audio': 706.67})
+        self.assertNotIn('progress_out_time_seconds', events[0])
+
+    def test_a_part_that_disagrees_with_ffmpegs_progress_is_put_on_the_recording(self):
+        """dev/docs/BUGS.md 2026-10-15 - recording 16 kept 11m 46s from an attempt ffmpeg said
+        reached 4m 47s, and nothing said so."""
+        self._run_with_finalize([self._dead(out_time=287.95), self._ok()],
+                                lambda part, *a, **k: 706.67)
+        events = self._measured_events()
+        self.assertEqual(len(events), 1, events)
+        self.assertEqual(events[0]['progress_out_time_seconds'], 287.95)
+        self.assertEqual(events[0]['kept_seconds'], 706.67)
+
+    def test_an_ordinary_kept_part_writes_no_measurement_event(self):
+        self._run_with_finalize([self._dead(out_time=120.0), self._ok()],
+                                lambda part, *a, **k: 119.0)
+        self.assertEqual(self._measured_events(), [])
 
     def test_parts_from_different_settings_are_discarded_rather_than_joined(self):
         set_conversion_parts(self.rec, parts_done=1, source_covered=400.0,
