@@ -243,8 +243,8 @@ class WindowOpenRowTests(unittest.TestCase):
 
     def test_each_row_is_badged_as_its_own_status(self):
         block = self._live_block()
-        self.assertIn('badge-paused', block)
-        self.assertIn('badge-retrying', block)
+        self.assertRegex(block, r'class="badge b-paused"[^>]*>PAUSED<')
+        self.assertRegex(block, r'class="badge b-retry"[^>]*>RETRYING<')
 
     def test_the_stat_cells_are_server_rendered_not_left_as_dashes(self):
         """Only a capturing recording emits STATS_SNAPSHOT, so these rows never get an SSE
@@ -257,10 +257,10 @@ class WindowOpenRowTests(unittest.TestCase):
 
     def test_the_badge_and_bar_classes_these_rows_use_are_defined(self):
         """A class emitted with no rule renders unstyled and is silently wrong - and
-        `badge-` is allowlisted in CssDeadClassTests, so nothing else catches this one."""
+        CssDeadClassTests only sees rules with no caller, not callers with no rule."""
         with open('static/css/style.css') as fh:
             css = fh.read()
-        for cls in ('.badge-retrying', '.tl-bar.stalled', '.tl-bar.unknown'):
+        for cls in ('.b-retry', '.b-paused', '.tl-bar.stalled', '.tl-bar.unknown'):
             self.assertIn(cls, css, f'{cls} is emitted but defined in no stylesheet')
 
     def test_the_timeline_bar_class_names_every_status_explicitly(self):

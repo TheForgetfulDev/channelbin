@@ -81,9 +81,9 @@
       {% if entry.kind == 'test' %}
         <span>Health Test</span>
         {% if test_in_progress %}
-        <span class="badge badge-in_progress">IN PROGRESS</span>
+        {{ tm.status_badge('b-running', 'IN PROGRESS') }}
         {% else %}
-        <span class="badge badge-{{ entry.obj.status | lower }}">{{ entry.obj.status }}</span>
+        {{ tm.status_badge(entry.obj | test_status_badge, entry.obj | test_status_label) }}
         {% endif %}
         <span class="text-muted small">
           score {{ entry.obj.quality_score if entry.obj.quality_score is not none else '-' }}
@@ -96,7 +96,7 @@
       {% elif entry.kind == 'recording' %}
         <span>Recording</span>
         <a href="{{ url_for('recordings.recording_detail', recording_id=entry.obj.id) }}">{{ entry.obj.name }}</a>
-        <span class="badge badge-{{ entry.obj.status | lower }}">{{ entry.obj.status }}</span>
+        {{ tm.status_badge(entry.obj.status | rec_status_badge, entry.obj.status | rec_status_label) }}
         {% if entry.obj.health_quality_score is not none %}
         <span class="text-muted small">score {{ entry.obj.health_quality_score }}</span>
         {% endif %}

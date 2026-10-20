@@ -94,9 +94,12 @@
 
 {# ── App design-system macros (DESIGN.md section 3) ── #}
 
-{# Status badge (3.4): cls = b-live/b-done/b-sched/b-fail/b-abort/b-concat/b-paused #}
-{% macro status_badge(cls, label, pulse=false, lg=false) -%}
-<span class="badge {{ cls }}{% if lg %} lg{% endif %}">{% if pulse %}<span class="pulse"></span>{% endif %}{{ label }}</span>
+{# Status badge (3.4): cls = b-live/b-done/b-sched/b-fail/b-abort/b-concat/b-paused/
+   b-retry/b-running/b-warn. A raw Recording.status gets its cls from the `rec_status_badge`
+   filter and a ChannelTest from `test_status_badge` - never a class glued from the status,
+   which was the retired legacy `.badge-*` family (dev/changelog/1212). #}
+{% macro status_badge(cls, label, pulse=false, lg=false, tip=none, id=none) -%}
+<span class="badge {{ cls }}{% if lg %} lg{% endif %}{% if tip %} tip-plain{% endif %}"{% if id %} id="{{ id }}"{% endif %}{% if tip %} data-tip="{{ tip }}"{% endif %}>{% if pulse %}<span class="pulse"></span>{% endif %}{{ label }}</span>
 {%- endmacro %}
 
 {# Channel pill (3.4/3.9): logo image or colored-initials fallback; navigates to url. #}
@@ -202,7 +205,7 @@
    and says it no longer counts. `lifetime_note` is for a row that prints the lifetime score
    it produced when it ran, which the channel's score no longer matches. #}
 {% macro not_counted_badge(label='NOT COUNTED', what='This observation', lifetime_note=true) -%}
-<span class="badge badge-cancelled tip-plain"
+<span class="badge b-warn tip-plain"
       data-tip="Rolled back by hand.&#10;{{ what }} no longer counts toward the channel's health score.{% if lifetime_note %} The lifetime figure beside it is what it produced when it ran.{% endif %}">{{ label }}</span>
 {%- endmacro %}
 

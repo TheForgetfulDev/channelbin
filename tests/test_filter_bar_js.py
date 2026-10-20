@@ -95,7 +95,10 @@ class DrillInTests(_Base):
         """Labels come from a registry that may carry provider-supplied text (an account
         name). An unescaped one is markup injection into the app's own popover."""
         self.assertIn('&lt;b&gt;Warn&lt;/b&gt;', self.obs['drilled_html'])
-        self.assertNotIn('<b>Warn</b>', self.obs['drilled_html'])
+        # Counted as elements rather than searched for as text: the label also rides in an
+        # aria-label, and an HTML serializer writes `<` inside an attribute value verbatim
+        # (it is inert there), so the string test would flag a safe attribute.
+        self.assertEqual(self.obs['drilled_b_elements'], 0)
 
     def test_back_returns_to_the_dimension_list(self):
         self.assertEqual(self.obs['after_back']['menu'], ['Status', 'Account'])
@@ -107,10 +110,10 @@ class DrillInTests(_Base):
 
 class MatchSemanticsTests(_Base):
     """OR inside one dimension, AND across dimensions - the only sensible reading of
-    "Status: Fail, Warn" beside "Account: A"."""
+    "Status is Fail, Warn" beside "Account is A"."""
 
     def test_one_value_filters_the_list_and_leaves_one_chip(self):
-        self.assertEqual(self.obs['one_value']['chips'], ['Status: Fail ✕'])
+        self.assertEqual(self.obs['one_value']['chips'], ['Status is Fail ✕'])
         self.assertEqual(self.obs['one_value']['rows'], ['c'])
         self.assertEqual(self.obs['one_value']['count'], 1)
 
@@ -138,13 +141,13 @@ class ChipTests(_Base):
 
     def test_clicking_a_chip_removes_exactly_that_filter(self):
         self.assertEqual(self.obs['chip_removed']['chips'],
-                         ['Status: Pass ✕', 'Account: Account 2 ✕'])
+                         ['Status is Pass ✕', 'Account is Account 2 ✕'])
         self.assertEqual(self.obs['chip_removed']['rows'], ['b'])
 
     def test_a_chip_names_its_dimension_and_its_value(self):
         """"Fail" alone is ambiguous the moment a second dimension has a value by that
         name; the chip is the only thing on screen saying which filter is on."""
-        self.assertEqual(self.obs['and_across']['chips'][2], 'Account: Account 2 ✕')
+        self.assertEqual(self.obs['and_across']['chips'][2], 'Account is Account 2 ✕')
 
 
 class InvisibleFilterTests(_Base):
@@ -152,7 +155,7 @@ class InvisibleFilterTests(_Base):
     behind a chip that is no longer on screen."""
 
     def test_a_value_that_stops_existing_is_dropped_with_its_chip(self):
-        self.assertEqual(self.obs['before_prune']['chips'], ['Account: Account 1 ✕'])
+        self.assertEqual(self.obs['before_prune']['chips'], ['Account is Account 1 ✕'])
         self.assertEqual(self.obs['after_prune']['chips'], [])
         self.assertEqual(self.obs['after_prune']['count'], 0)
 
@@ -177,7 +180,7 @@ class RoundTripTests(_Base):
 
     def test_set_from_restores_a_saved_selection(self):
         self.assertEqual(self.obs['restored']['chips'],
-                         ['Status: Fail ✕', 'Account: Account 2 ✕'])
+                         ['Status is Fail ✕', 'Account is Account 2 ✕'])
         self.assertEqual(self.obs['restored']['rows'], ['c'])
 
     def test_a_key_no_dimension_owns_is_ignored(self):
@@ -201,13 +204,13 @@ class _Saved(_Base):
 
     def setUp(self):
         self.s = self.obs['saved']
-        for k in ('errors_a', 'errors_b'):
+        for k in ('errors_a', 'errors_b', 'errors_c', 'errors_d', 'errors_e'):
             if any(str(e).startswith('threw:') for e in self.s.get(k, [])):
                 self.fail(f'the saved-filter scenario threw: {self.s[k]}')
 
     def test_neither_saved_page_threw(self):
-        self.assertEqual(self.s['errors_a'], [])
-        self.assertEqual(self.s['errors_b'], [])
+        for k in ('errors_a', 'errors_b', 'errors_c', 'errors_d', 'errors_e'):
+            self.assertEqual(self.s[k], [], k)
 
 
 class SavedFilterSaveTests(_Saved):
@@ -247,7 +250,7 @@ class SavedFilterLoadTests(_Saved):
 
     def test_loading_replaces_the_chips_with_the_saved_ones(self):
         """Account: 1 was on the bar before the load; it must not survive into it."""
-        self.assertEqual(self.s['loaded']['chips'], ['Status: FAIL \u2715', 'Status: WARN \u2715'])
+        self.assertEqual(self.s['loaded']['chips'], ['Status is FAIL \u2715', 'Status is WARN \u2715'])
         self.assertEqual(self.s['loaded']['rows'], ['c', 'd'])
         self.assertEqual(self.s['loaded']['chip'], 'Saved: Failures \u25be')
 
@@ -272,7 +275,7 @@ class SavedFilterDefaultTests(_Saved):
 
     def test_the_default_is_on_the_bar_when_it_is_built(self):
         self.assertEqual(self.s['boot_default']['chips'],
-                         ['Status: PASS \u2715', 'Account: Account 2 \u2715'])
+                         ['Status is PASS \u2715', 'Account is Account 2 \u2715'])
         self.assertEqual(self.s['boot_default']['rows'], ['b'])
 
     def test_a_saved_value_nothing_carries_is_dropped_and_named(self):
@@ -280,7 +283,7 @@ class SavedFilterDefaultTests(_Saved):
         showing more than its name promises."""
         kind, msg = self.s['boot_default']['toasts'][-1]
         self.assertEqual(kind, 'warning')
-        self.assertIn('Status: GONE', msg)
+        self.assertIn('Status is GONE', msg)
         self.assertIn('"Pass on 2"', msg)
         self.assertEqual(self.s['boot_default']['chip'], 'Saved: Pass on 2 (edited) \u25be')
 
@@ -306,6 +309,110 @@ class SavedFilterFailureTests(_Saved):
     def test_deleting_the_one_on_screen_stops_the_chip_naming_it(self):
         self.assertEqual(self.s['deleted']['saved'], ['Account one'])
         self.assertEqual(self.s['deleted']['chip'], 'Saved \u25be')
+
+
+
+class IsNotTests(_Base):
+    """Every value is off, "is" or "is not" - the channel search's three-state rule and chip
+    wording, lifted into the shared bar so the control means the same thing on every page
+    (dev/changelog/1207). A dimension passes a row when it has no "is" values or one
+    matches, AND none of its "is not" values match."""
+
+    def test_an_excluded_value_hides_its_rows_and_only_those(self):
+        self.assertEqual(self.obs['not_one']['rows'], ['a', 'b', 'd'])
+        self.assertEqual(self.obs['not_one']['count'], 1)
+
+    def test_its_chip_says_is_not_and_takes_the_negative_tint(self):
+        self.assertEqual(self.obs['not_one']['chips'], ['Status is not Fail \u2715'])
+        self.assertEqual(self.obs['not_one']['neg'], [True])
+
+    def test_an_included_chip_does_not_take_the_negative_tint(self):
+        self.assertEqual(self.obs['not_switched']['neg'], [False])
+
+    def test_the_popover_lights_the_operator_that_is_on(self):
+        fail = [o for o in self.obs['not_one']['ops'] if o['v'] == 'FAIL'][0]
+        self.assertEqual((fail['is'], fail['not']), (False, True))
+        self.assertIn('neg', fail['row'])
+        others = [o for o in self.obs['not_one']['ops'] if o['v'] != 'FAIL']
+        self.assertTrue(all(not o['is'] and not o['not'] for o in others))
+
+    def test_the_popover_stays_open_while_choosing_an_operator(self):
+        self.assertTrue(self.obs['not_one']['open'])
+
+    def test_pressing_the_other_operator_switches_the_value_not_adds_it(self):
+        """One value is never included and excluded at once - that pair matches nothing
+        and would read as two contradictory chips."""
+        self.assertEqual(self.obs['not_switched']['chips'], ['Status is Fail \u2715'])
+        self.assertEqual(self.obs['not_switched']['rows'], ['c'])
+        self.assertEqual(self.obs['not_switched']['entries'], [['status', 'FAIL']])
+
+    def test_pressing_the_lit_operator_again_turns_the_value_off(self):
+        self.assertEqual(self.obs['not_off']['chips'], [])
+        self.assertEqual(self.obs['not_off']['rows'], ['a', 'b', 'c', 'd'])
+
+    def test_tapping_an_excluded_row_presses_is_as_the_channel_search_does(self):
+        """The row is the "is" control's bigger target, in both implementations - a tap that
+        meant one thing here and another on the channel search is the drift this item
+        exists to remove."""
+        self.assertEqual(self.obs['not_row_off']['entries'], [['status', 'FAIL']])
+        self.assertEqual(self.obs['not_row_off']['rows'], ['c'])
+
+    def test_is_not_ands_across_dimensions(self):
+        """Not FAIL, and account 2: b (PASS) and d (WARN)."""
+        self.assertEqual(self.obs['not_and']['rows'], ['b', 'd'])
+        self.assertEqual(self.obs['not_and']['entries'],
+                         [['status', 'FAIL', 'not'], ['account', '2']])
+
+    def test_clicking_an_is_not_chip_removes_it(self):
+        self.assertEqual(self.obs['not_chip_removed']['chips'], ['Account is Account 2 \u2715'])
+        self.assertEqual(self.obs['not_chip_removed']['rows'], ['b', 'c', 'd'])
+
+    def test_is_and_is_not_in_one_dimension_both_have_to_hold(self):
+        """Tag is X and tag is not Y over a field a row carries several values of: only
+        a, because b has X but also Y. An OR across the two would also let c and d in."""
+        self.assertEqual(self.obs['not_mixed']['rows'], ['a'])
+        self.assertEqual(self.obs['not_mixed']['chips'],
+                         ['Tag is X \u2715', 'Tag is not Y \u2715'])
+
+    def test_a_two_element_pair_reads_as_is_and_a_third_element_only_means_not_as_not(self):
+        """Every URL and saved filter written before "is not" existed is two elements long,
+        and must keep meaning exactly what it meant."""
+        self.assertEqual(self.obs['not_restored']['entries'],
+                         [['status', 'FAIL'], ['status', 'PASS', 'not'], ['account', '1']])
+        self.assertEqual(self.obs['not_restored']['rows'], [])
+
+    def test_operator_presses_notify_the_caller_once_each(self):
+        """Eight operator presses, row taps and chip clicks across the scenarios; setFrom()
+        is not a change."""
+        self.assertEqual(self.obs['not_changes'] - self.obs['changes'], 8)
+
+
+class SavedIsNotTests(_Saved):
+
+    def test_is_not_is_saved_in_the_three_element_shape(self):
+        self.assertEqual(self.s['not_saved']['lastPost']['body']['value'],
+                         [{'name': 'No fails', 'filters': [['status', 'FAIL', 'not']],
+                           'is_default': False}])
+        self.assertEqual(self.s['not_saved']['chip'], 'Saved: No fails \u25be')
+
+    def test_flipping_the_operator_marks_the_saved_filter_edited(self):
+        """Same key, same value, other operator: a different filter, so the chip must not
+        go on claiming the saved one is what is on screen."""
+        self.assertEqual(self.s['not_flipped']['chip'], 'Saved: No fails (edited) \u25be')
+
+    def test_a_record_saved_before_is_not_existed_loads_as_is(self):
+        self.assertEqual(self.s['old_shape']['chips'], ['Status is FAIL \u2715'])
+        self.assertEqual(self.s['old_shape']['rows'], ['c'])
+        self.assertEqual(self.s['old_shape']['chip'], 'Saved: Old \u25be')
+
+    def test_a_pair_with_an_unknown_operator_is_dropped_not_guessed_at(self):
+        self.assertEqual(self.s['bad_op']['chips'], [])
+
+    def test_a_dropped_excluded_value_is_named_with_its_operator(self):
+        kind, msg = self.s['not_dropped']['toasts'][-1]
+        self.assertEqual(kind, 'warning')
+        self.assertIn('Status is not GONE', msg)
+        self.assertEqual(self.s['not_dropped']['chips'], ['Account is Account 2 \u2715'])
 
 
 if __name__ == '__main__':

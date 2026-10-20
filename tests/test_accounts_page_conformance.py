@@ -72,16 +72,24 @@ def _account(name, status='OK', **kw):
     return acc
 
 
+def _cats_json(cats):
+    if cats is None:
+        return None
+    return json.dumps([{'name': n, 'channels': c} for n, c in cats])
+
+
 def _sync_log(account, *, status='SUCCESS', minutes_ago=60, channels=100, epg=1000,
               error=None, seconds=30, added=None, removed=None, malformed=None,
-              duplicate=None):
+              duplicate=None, cats_added=None, cats_removed=None):
+    """cats_added / cats_removed: [(name, channels), ...], or None for "not tracked"."""
     started = datetime.utcnow() - timedelta(minutes=minutes_ago)
     log = AccountSyncLog(
         account_id=account.id, started_at=started,
         completed_at=started + timedelta(seconds=seconds) if seconds is not None else None,
         status=status, channels_synced=channels, epg_entries_synced=epg,
         error_message=error, channels_added=added, channels_removed=removed,
-        skipped_malformed_urls=malformed, skipped_duplicate_stream_ids=duplicate)
+        skipped_malformed_urls=malformed, skipped_duplicate_stream_ids=duplicate,
+        categories_added=_cats_json(cats_added), categories_removed=_cats_json(cats_removed))
     db.session.add(log)
     db.session.flush()
     return log
@@ -347,6 +355,47 @@ class AccountPageTests(unittest.TestCase):
         activity = self._get(acc).split('data-section="activity"')[1].split('</div>\n\n</div>')[0]
         self.assertNotIn('added', activity)
         self.assertNotIn('removed', activity)
+
+    def test_activity_names_new_and_gone_categories_with_links(self):
+        """dev/changelog/1211: each category is named with its channel count and links into
+        search filtered to this account and that category."""
+        acc = _account('Cats', 'OK')
+        _sync_log(acc, added=0, removed=0, cats_added=[('AR| NETFLIX SERIES 4K', 212)],
+                  cats_removed=[('UK| EVENTS', 1)])
+        db.session.commit()
+        activity = self._activity(acc)
+        self.assertIn('New categories:', activity)
+        self.assertIn('AR| NETFLIX SERIES 4K</a> <span class="text-faint">(212 channels)', activity)
+        self.assertIn('Categories gone:', activity)
+        self.assertIn('UK| EVENTS</a> <span class="text-faint">(1 channel)', activity)
+        self.assertIn(f'f.acct={acc.id}&amp;f.cat=AR%7C+NETFLIX+SERIES+4K', activity)
+        self.assertIn('f.cat=UK%7C+EVENTS', activity)
+
+    def test_activity_puts_categories_past_the_first_five_behind_a_click(self):
+        """A first sync lists every category the provider has. The overflow is still on the
+        page - none is dropped - just collapsed."""
+        acc = _account('ManyCats', 'OK')
+        _sync_log(acc, cats_added=[(f'CAT {i:02d}', 100 - i) for i in range(12)],
+                  cats_removed=[])
+        db.session.commit()
+        activity = self._activity(acc)
+        self.assertIn('<summary>and 7 more</summary>', activity)
+        head, more = activity.split('<details class="acct-act-more">')
+        for i in range(5):
+            self.assertIn(f'CAT {i:02d}</a>', head)
+        for i in range(5, 12):
+            self.assertIn(f'CAT {i:02d}</a>', more)
+        self.assertNotIn('Categories gone:', activity)
+
+    def test_activity_says_nothing_about_categories_when_none_changed_or_untracked(self):
+        for name, kw in (('NoChange', {'cats_added': [], 'cats_removed': []}),
+                         ('Untracked', {})):
+            with self.subTest(name):
+                acc = _account(name, 'OK')
+                _sync_log(acc, **kw)
+                db.session.commit()
+                activity = self._activity(acc)
+                self.assertNotIn('categor', activity.lower())
 
     def test_activity_reads_a_running_sync_as_started(self):
         """dev/docs/BUGS.md 2026-09-27 @ 04:50:19 PM: a running sync's log row says
@@ -693,6 +742,14 @@ class AccountsListRowTests(unittest.TestCase):
         _, rows = self._rows()
         self.assertIn('1,250 skipped as malformed URLs', rows[0])
         self.assertIn('332 skipped as duplicate stream IDs', rows[0])
+
+    def test_the_sparkline_tooltip_counts_category_changes(self):
+        """The list carries the counts the account page names (dev/changelog/1211)."""
+        acc = _account('ListCats', 'OK')
+        _sync_log(acc, cats_added=[('A', 3), ('B', 1)], cats_removed=[('C', 9)])
+        db.session.commit()
+        _, rows = self._rows()
+        self.assertIn('2 new categories, 1 category gone', rows[0])
 
     def test_the_provider_error_text_is_not_on_the_row(self):
         """17.1: the status badge and the colored edge carry "this is broken"; the text

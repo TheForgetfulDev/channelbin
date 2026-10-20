@@ -80,6 +80,13 @@ from datetime import datetime, timezone
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _REPO = os.path.dirname(os.path.dirname(_HERE))
 HISTORY_PATH = os.path.join(_REPO, 'tests', 'timing_history.jsonl')
+# The capture tier's runs, kept apart from the default suite's: a capture scenario is minutes of
+# real-time recording, so one of its records in the shared file would be picked up as the
+# shard-weight source (_module_weights reads the latest passing record of any tier) and would
+# push the default suite's records out of the 300-line window (dev/changelog/1223).
+CAPTURE_HISTORY_PATH = os.path.join(_REPO, 'tests', 'capture', 'timing_history.jsonl')
+CAPTURE_DIR = os.path.join(_REPO, 'tests', 'capture')
+CAPTURE_PREFIX = 'scenario_'
 
 # Rolling-baseline tolerance: flag a run that exceeds the recent median by more than this.
 TOL = 0.30
@@ -406,11 +413,11 @@ def _charged(record):
     return agg
 
 
-def _load_history():
-    if not os.path.exists(HISTORY_PATH):
+def _load_history(path=HISTORY_PATH):
+    if not os.path.exists(path):
         return []
     records = []
-    with open(HISTORY_PATH, 'r') as f:
+    with open(path, 'r') as f:
         for line in f:
             line = line.strip()
             if not line:
@@ -422,16 +429,16 @@ def _load_history():
     return records
 
 
-def _append_history(record):
-    records = _load_history()
+def _append_history(record, path=HISTORY_PATH):
+    records = _load_history(path)
     records.append(record)
     if len(records) > MAX_HISTORY_LINES:
         records = records[-MAX_HISTORY_LINES:]
-    tmp = HISTORY_PATH + '.tmp'
+    tmp = path + '.tmp'
     with open(tmp, 'w') as f:
         for r in records:
             f.write(json.dumps(r, sort_keys=True) + '\n')
-    os.replace(tmp, HISTORY_PATH)
+    os.replace(tmp, path)
 
 
 def _median(values):
@@ -618,6 +625,11 @@ def _discover_modules():
     pay the whole import cost N+1 times. There are no test modules below `tests/` itself
     (`tests/support` and `tests/fixtures` hold no `test_*.py`), so the two agree, and
     _assert_no_module_was_dropped is what proves they still do.
+
+    The capture tier (`tests/capture/scenario_*.py`) is left out on purpose and by name, in
+    both this listing and the `-j 1` discover: a scenario is a real-time recording measured
+    in minutes, and it has its own runner, `--capture` (dev/changelog/1223).
+    `tests/test_capture_tier_layout.py` fails if a `test_*.py` ever lands in that folder.
     """
     tests_dir = os.path.join(_REPO, 'tests')
     return sorted(
@@ -819,6 +831,89 @@ def _run_sharded(shards, log_dir=None):
     return merged
 
 
+def _discover_capture_modules():
+    """Every capture-tier scenario module, as dotted names, sorted."""
+    return sorted(
+        'tests.capture.' + f[:-3] for f in os.listdir(CAPTURE_DIR)
+        if f.startswith(CAPTURE_PREFIX) and f.endswith('.py')
+    )
+
+
+def _run_capture(args):
+    """The capture tier: every scenario (or the named ones), serially, in this process.
+
+    Serially because each scenario is a real-time recording against a simulator in this
+    process, and two at once would share the CPU and the simulator's clock. With `--repeat N`
+    the whole set runs N times and stops at the first red pass, which is the admission rule
+    (DESIGN-simulator.md §4: 20 runs in a row). Each pass writes one record to its own
+    history file under the tier `capture`, or `capture:<names>` for a partial run, so a
+    partial run is never compared with a whole one."""
+    modules = _discover_capture_modules()
+    if args.scenario:
+        wanted = [f'tests.capture.{CAPTURE_PREFIX}{n.removeprefix(CAPTURE_PREFIX)}'
+                  for n in args.scenario]
+        unknown = [m for m in wanted if m not in modules]
+        if unknown:
+            raise SystemExit(f'{STATUS_PREFIX} FATAL no capture scenario {unknown}; there are '
+                             f'{[m.rsplit(".", 1)[1] for m in modules]}')
+        modules = wanted
+    tier = 'capture' if not args.scenario else 'capture:' + ','.join(
+        sorted(m.rsplit('.', 1)[1] for m in modules))
+    log_dir = _prepare_log_dir()
+    passed = 0
+    for n in range(1, args.repeat + 1):
+        cpu_before = _cpu_snapshot()
+        suite = unittest.TestLoader().loadTestsFromNames(modules)
+        log_fh = _open_log(log_dir, f'capture-pass{n}.log')
+        runner = unittest.TextTestRunner(
+            resultclass=_TimingResult, verbosity=2,
+            stream=_Tee(sys.stderr, log_fh) if log_fh is not None else sys.stderr)
+        t0 = time.perf_counter()
+        try:
+            result = runner.run(suite)
+        finally:
+            if log_fh is not None:
+                log_fh.close()
+        wall = time.perf_counter() - t0
+        foreign = _foreign_cpu(cpu_before, _cpu_snapshot(), wall)
+        commit, dirty = _git_info()
+        failed_ids = _failed_ids(result)
+        record = {
+            'ts_utc': datetime.now(timezone.utc).isoformat(timespec='seconds'),
+            'git_commit': commit, 'git_dirty': dirty, 'tier': tier, 'jobs': 1,
+            'host': platform.node(), 'python': platform.python_version(),
+            'total_wall': round(wall, 2), 'test_count': result.testsRun,
+            'skipped': len(result.skipped), 'failures': len(result.failures),
+            'errors': len(result.errors),
+            'per_module': {k: round(v, 2) for k, v in _per_module(result.timings).items()},
+            'pass': n, 'of': args.repeat,
+        }
+        if foreign is not None:
+            record['cpu_count'] = os.cpu_count() or 1
+            record['foreign_cpu_s'] = round(foreign[0], 2)
+            record['foreign_cpu_share'] = round(foreign[1], 4)
+        if failed_ids:
+            record['failed_ids'] = _history_safe_ids(failed_ids)[:MAX_FAILED_IDS]
+        prior = _passing_same_tier(_load_history(CAPTURE_HISTORY_PATH), tier, 1)
+        line = _status_line(record, prior)
+        try:
+            _append_history(record, CAPTURE_HISTORY_PATH)
+        except OSError as e:
+            line += f'  (history write failed: {e})'
+        for tid in failed_ids:
+            print(f'{STATUS_PREFIX} FAILED {tid}', file=sys.stderr, flush=True)
+        print(f'{line} - capture pass {n} of {args.repeat}', file=sys.stderr, flush=True)
+        if not result.wasSuccessful():
+            break
+        passed = n
+    if log_dir:
+        print(f'{STATUS_PREFIX} output captured to {os.path.relpath(log_dir, _REPO)}/',
+              file=sys.stderr, flush=True)
+    print(f'{STATUS_PREFIX} capture tier: {passed} of {args.repeat} pass(es) green in a row',
+          file=sys.stderr, flush=True)
+    sys.exit(0 if passed == args.repeat else 1)
+
+
 def _parse_args(argv):
     p = argparse.ArgumentParser(prog='run_tests.sh', add_help=True)
     p.add_argument('-j', '--jobs', type=int,
@@ -828,6 +923,15 @@ def _parse_args(argv):
     p.add_argument('--reverse-shards', action='store_true',
                    help='pack shards lightest-first - a different valid split, for proving '
                         'the suite is order-independent')
+    p.add_argument('--capture', action='store_true',
+                   help='run the capture tier (tests/capture/scenario_*.py) instead of the '
+                        'default suite: real recordings against the simulator, serially')
+    p.add_argument('--repeat', type=int, default=1,
+                   help='with --capture: run it this many times, stopping at the first red '
+                        'pass (the admission rule is 20 in a row)')
+    p.add_argument('--scenario', action='append',
+                   help='with --capture: run only this scenario module (repeatable), named '
+                        'with or without its scenario_ prefix')
     # Internal: how the parent invokes a worker. Not for humans.
     p.add_argument('--worker', action='store_true', help=argparse.SUPPRESS)
     p.add_argument('--emit', help=argparse.SUPPRESS)
@@ -839,6 +943,10 @@ def main(argv=None):
     args = _parse_args(sys.argv[1:] if argv is None else argv)
     if args.worker:
         sys.exit(_run_worker(args.modules, args.emit))
+    if args.capture:
+        _run_capture(args)
+    if args.repeat != 1 or args.scenario:
+        raise SystemExit(f'{STATUS_PREFIX} FATAL --repeat and --scenario apply to --capture only')
     if args.modules:
         # This runner is whole-suite only: it exists to produce one comparable history
         # record. Silently ignoring a named module would run the entire suite while the

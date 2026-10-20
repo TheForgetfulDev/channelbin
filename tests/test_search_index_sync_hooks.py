@@ -149,11 +149,11 @@ class SyncRebuildHookTests(unittest.TestCase):
 
         db.session.expire_all()
         # The sync's own terminal row is asserted BEFORE the channel count, because it is
-        # the only thing that says which phase stopped. This precondition failed once under
-        # a sharded run with a bare `0 != 2` (dev/test-logs/20260818-001153/shard2.log) and
-        # left nothing to tell "cancelled before the upsert" from "the upsert's commit
-        # errored" - two different defects with the same symptom. It has not reproduced
-        # since; when it recurs, this names the phase.
+        # the only thing that says which phase stopped: a bare `0 != 2` cannot tell
+        # "cancelled before the upsert" from "the upsert's commit errored". The one red run
+        # this precondition ever had was the first shape - a cancel injected at the playlist
+        # fetch, run against dev/changelog/720's cancel-inside-a-phase - not a flake
+        # (dev/changelog/1208).
         log_row = AccountSyncLog.query.filter_by(account_id=self.account_id).first()
         self.assertEqual(log_row.status, 'CANCELLED',
                          f'sync ended {log_row.status}, not cancelled: {log_row.error_message}')

@@ -40,8 +40,8 @@ class LiveSegmentRowTests(unittest.TestCase):
         done = seed.make_segment(self.rec, ch, now - timedelta(minutes=5),
                                  now - timedelta(seconds=60), segment_number=1)
         done.bytes_recorded = DONE_BYTES
-        live = seed.make_segment(self.rec, ch, now - timedelta(seconds=60), None,
-                                 segment_number=2)
+        self.live_started = now - timedelta(seconds=60)
+        live = seed.make_segment(self.rec, ch, self.live_started, None, segment_number=2)
         live.bytes_recorded = None
         live.file_path = os.path.join(self.t._tmpdir, 'live_seg_002.ts')
         with open(live.file_path, 'wb') as f:
@@ -77,9 +77,17 @@ class LiveSegmentRowTests(unittest.TestCase):
 
     def test_open_segment_row_shows_avg_rate(self):
         row = self._live_row(self._page())
+        oldest = (datetime.utcnow() - self.live_started).total_seconds()
         m = re.search(r'([\d.]+) Mb/s', row)
         self.assertIsNotNone(m, 'live row has no Avg rate')
-        self.assertAlmostEqual(float(m.group(1)), 5.0, delta=0.2)
+        # The page divides the live size by the segment's age at render time, which is at
+        # least the seeded 60 s and at most its age now. A loaded box can put seconds between
+        # setUp and the render, so the bound comes from the clock, not a fixed tolerance
+        # (dev/changelog/1216).
+        fastest = round(LIVE_BYTES * 8 / 60 / 1e6, 1)
+        slowest = round(LIVE_BYTES * 8 / oldest / 1e6, 1)
+        self.assertTrue(slowest <= float(m.group(1)) <= fastest,
+                        '%s Mb/s is outside %s-%s' % (m.group(1), slowest, fastest))
 
     def test_size_stat_includes_open_segment(self):
         html = self._page()

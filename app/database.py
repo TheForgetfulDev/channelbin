@@ -195,6 +195,16 @@ FAST_DELIVERY_DETECTED = 'FAST_DELIVERY_DETECTED'
 # Its own type because the app acted - and it never writes Channel.pace_realtime, which is
 # the user's answer and not the engine's.
 CAPTURE_PACING_ENABLED = 'CAPTURE_PACING_ENABLED'
+# ffmpeg's video frame count stopped moving while the segment file kept growing - the feed's
+# video stopped and something else, most likely its audio, is still being recorded. A
+# measurement, but its own type rather than a DIAGNOSTICS kind for the reason
+# RECORDING_FORMAT_CHANGED is one: it describes a stretch of the finished file the user
+# needs to see. The event says what the watchdog did about it - a restart, a move to another
+# member, or staying on the audio - since the segment row only says VIDEO_STOPPED. RESUMED
+# is the other end of the same stretch, on the same segment or on the restart that brought
+# the picture back (dev/changelog/1209, 1210).
+CAPTURE_VIDEO_STOPPED  = 'CAPTURE_VIDEO_STOPPED'
+CAPTURE_VIDEO_RESUMED  = 'CAPTURE_VIDEO_RESUMED'
 # Generic carrier for "here is something the app measured", emitted on both good and bad
 # verdicts so a healthy recording still says what was checked (dev/changelog/330). The
 # specific measurement is named in extra_data['kind'] ('timeline_scan', 'capture_health',
@@ -1358,8 +1368,11 @@ class RecordingSegment(db.Model):
     ended_at         = db.Column(db.DateTime)
     # STOP_TIME_REACHED | STALL_KILLED | PROCESS_EXITED | SEGMENT_DURATION_EXPIRED | ERROR
     # | MANUAL_CANCEL | MANUAL_PAUSE | MANUAL_STOP | SERVICE_RESTART | RECORDING_HANDOFF
+    # | VIDEO_STOPPED
     # STALL_KILLED and PROCESS_EXITED are both "the feed died, we restarted", kept apart
-    # because only the first one is us doing the killing (dev/changelog/431).
+    # because only the first one is us doing the killing (dev/changelog/431). VIDEO_STOPPED
+    # is a restart of a feed that had NOT died - its audio was still arriving - and is never
+    # counted as a stall (dev/changelog/1210).
     exit_reason      = db.Column(db.String(64))
     bytes_recorded   = db.Column(db.Integer)
     stall_count      = db.Column(db.Integer, default=0)
@@ -2880,6 +2893,28 @@ class AccountSyncLog(db.Model):
     # before the columns with no alert to recover the count from - never a false zero.
     skipped_malformed_urls       = db.Column(db.Integer)
     skipped_duplicate_stream_ids = db.Column(db.Integer)
+    # The provider categories (Channel.category_name) this sync found new / gone since the
+    # sync before it, as a JSON list of {"name", "channels"} - read through
+    # category_changes(). The count shown is the list's length, so no count column sits
+    # beside it. NULL = not tracked: a sync from before dev/changelog/1211, or one whose
+    # previous sync could not be identified - never a false "nothing changed".
+    categories_added   = db.Column(db.Text)
+    categories_removed = db.Column(db.Text)
+
+    def category_changes(self):
+        """{'added': [...], 'removed': [...]} with each entry {'name', 'channels'}, or None
+        when this sync's category diff was not tracked. A blob that no longer parses reads
+        as not tracked rather than raising, so one bad row cannot take the page down."""
+        if self.categories_added is None or self.categories_removed is None:
+            return None
+        try:
+            added = json.loads(self.categories_added)
+            removed = json.loads(self.categories_removed)
+        except (ValueError, TypeError):
+            return None
+        if not isinstance(added, list) or not isinstance(removed, list):
+            return None
+        return {'added': added, 'removed': removed}
 
 
 class AccountStatDay(db.Model):

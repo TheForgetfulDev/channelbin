@@ -116,7 +116,7 @@ class PageAsItOpensTests(_Base):
 
     def test_the_stream_is_connected_to_the_real_endpoint(self):
         self.assertIn('/api/logs/stream', self.obs['streamUrl'])
-        self.assertEqual(self.obs['status'], {'text': 'Live', 'cls': 'badge badge-in_progress'})
+        self.assertEqual(self.obs['status'], {'text': 'Live', 'cls': 'badge b-done'})
 
     def test_a_noisy_source_is_off_by_default_but_never_absent(self):
         """Off by default is a filter, not a deletion: the rows and the chip both exist."""
@@ -212,7 +212,7 @@ class StatusTests(_Base):
     SCENARIO = 'status'
 
     def test_the_server_rendered_badge_is_the_pre_js_state(self):
-        self.assertEqual(self.obs['atBoot'], {'text': 'Connecting', 'cls': 'badge badge-scheduled'})
+        self.assertEqual(self.obs['atBoot'], {'text': 'Connecting', 'cls': 'badge b-abort'})
 
     def test_an_open_stream_reads_live(self):
         self.assertEqual(self.obs['live']['text'], 'Live')
@@ -221,7 +221,7 @@ class StatusTests(_Base):
     def test_a_dropped_stream_says_reconnecting_not_error(self):
         """connectSSE retries on its own, so the badge must not read as a dead end."""
         self.assertEqual(self.obs['reconnecting']['text'], 'Reconnecting')
-        self.assertEqual(self.obs['reconnecting']['cls'], 'badge badge-aborted')
+        self.assertEqual(self.obs['reconnecting']['cls'], 'badge b-warn')
 
     def test_stop_closes_the_stream_rather_than_relabelling_the_button(self):
         self.assertEqual(self.obs['stopped']['text'], 'Stopped')

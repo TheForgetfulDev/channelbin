@@ -51,6 +51,17 @@ def _test_status_label(t) -> str:
     return 'FAIL'
 
 
+# The badge class per label. Mirrors static/js/group-detail.js::statusBadge, the group
+# page's rendering of the same five labels (dev/changelog/1212).
+TEST_LABEL_BADGES = {
+    'PASS': 'b-done',
+    'WARN': 'b-warn',
+    'FAIL': 'b-fail',
+    'CANCELLED': 'b-abort',
+    'WAITING': 'b-abort',
+}
+
+
 def _suggested_keep_id(group, lifecycle_by_channel):
     """Which member of a duplicate set to pre-select as the keeper: never one the provider
     has removed (lifecycle 'missing') while a non-removed member exists in the group - a
@@ -1399,3 +1410,10 @@ def toggle_job_channel_enabled(job_id, channel_id):
 def test_status_label_filter(t):
     """Jinja access to the one PASS/WARN/FAIL/CANCELLED/WAITING derivation."""
     return _test_status_label(t)
+
+
+@channel_tests_bp.app_template_filter('test_status_badge')
+def test_status_badge_filter(t):
+    """The `.b-*` badge class for a ChannelTest, keyed on its label so a WARN reads amber
+    rather than sharing PASS's color. Pure."""
+    return TEST_LABEL_BADGES[_test_status_label(t)]

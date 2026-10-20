@@ -51,12 +51,19 @@
 {%- if log.skipped_duplicate_stream_ids %}, {{ '{:,}'.format(log.skipped_duplicate_stream_ids) }} skipped as duplicate stream IDs{% endif -%}
 {%- endmacro %}
 
+{# The account page lists these by name; a tooltip carries the counts only. #}
+{% macro category_text(log) -%}
+{%- set cats = log.category_changes() -%}
+{%- if cats and cats.added %}, {{ '{:,}'.format(cats.added | length) }} new categor{{ 'ies' if cats.added | length != 1 else 'y' }}{% endif -%}
+{%- if cats and cats.removed %}, {{ '{:,}'.format(cats.removed | length) }} categor{{ 'ies' if cats.removed | length != 1 else 'y' }} gone{% endif -%}
+{%- endmacro %}
+
 {% macro sync_detail(log) -%}
 {%- if not log.status -%}Sync started.
 {%- elif log.status == 'SUCCESS' -%}
-Sync finished: {{ '{:,}'.format(log.channels_synced or 0) }} channels{% if log.channels_added is not none and log.channels_removed is not none %} ({{ '{:,}'.format(log.channels_added) }} added, {{ '{:,}'.format(log.channels_removed) }} removed){% endif %}{{ skipped_text(log) }}, {{ '{:,}'.format(log.epg_entries_synced or 0) }} program entries{% if log.completed_at and log.started_at %} in {{ (log.completed_at - log.started_at).total_seconds() | duration }}{% endif %}.
+Sync finished: {{ '{:,}'.format(log.channels_synced or 0) }} channels{% if log.channels_added is not none and log.channels_removed is not none %} ({{ '{:,}'.format(log.channels_added) }} added, {{ '{:,}'.format(log.channels_removed) }} removed){% endif %}{{ skipped_text(log) }}{{ category_text(log) }}, {{ '{:,}'.format(log.epg_entries_synced or 0) }} program entries{% if log.completed_at and log.started_at %} in {{ (log.completed_at - log.started_at).total_seconds() | duration }}{% endif %}.
 {%- elif log.status == 'PARTIAL' -%}
-Sync finished with gaps: {{ '{:,}'.format(log.channels_synced or 0) }} channels{% if log.channels_added is not none and log.channels_removed is not none %} ({{ '{:,}'.format(log.channels_added) }} added, {{ '{:,}'.format(log.channels_removed) }} removed){% endif %}{{ skipped_text(log) }}, {{ '{:,}'.format(log.epg_entries_synced or 0) }} program entries. See the account page for why.
+Sync finished with gaps: {{ '{:,}'.format(log.channels_synced or 0) }} channels{% if log.channels_added is not none and log.channels_removed is not none %} ({{ '{:,}'.format(log.channels_added) }} added, {{ '{:,}'.format(log.channels_removed) }} removed){% endif %}{{ skipped_text(log) }}{{ category_text(log) }}, {{ '{:,}'.format(log.epg_entries_synced or 0) }} program entries. See the account page for why.
 {%- elif log.status == 'ERROR' -%}
 Sync failed. See the account page for why.
 {%- elif log.status == 'CANCELLED' -%}

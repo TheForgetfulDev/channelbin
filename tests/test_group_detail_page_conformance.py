@@ -1511,7 +1511,10 @@ class PhoneLayoutTests(unittest.TestCase):
         fn = self.js[self.js.index('function openFilters()'):self.js.index('function afterFilterChange(')]
         self.assertIn('FILTER_DIMS.forEach', fn)
         self.assertIn('d.available()', fn)
-        self.assertIn('filterBar.has(d.k, o.v)', fn)
+        self.assertIn('filterBar.opOf(d.k, o.v)', fn)
+        # The is / is-not control is the bar's own markup, not a sheet-drawn copy of it
+        # (dev/changelog/1207).
+        self.assertIn('filterBar.opHtml(d.k, o.v', fn)
 
     def test_every_sheet_filter_reaches_the_same_state_as_the_desktop_bar(self):
         """One state, two controls. A sheet writing a parallel copy is how a filter comes
@@ -1519,6 +1522,9 @@ class PhoneLayoutTests(unittest.TestCase):
         so a new one cannot arrive without its sheet row working."""
         handler = self.js[self.js.index("const fPick = e.target.closest('[data-fpick]')"):]
         self.assertIn('filterBar.toggle(', handler[:handler.index('return;')])
+        ops = self.js[self.js.index("const fOp = e.target.closest('.gm-fval [data-fop]')"):]
+        self.assertIn('filterBar.toggle(fOp.dataset.fdim, fOp.dataset.fval, fOp.dataset.fop)',
+                      ops[:ops.index('return;')])
 
     def test_the_desktop_bar_is_rebuilt_when_a_sheet_moves_a_filter(self):
         """Otherwise crossing the breakpoint lands on a control still showing the state it

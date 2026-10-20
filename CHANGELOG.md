@@ -5,6 +5,38 @@ Notable changes to ChannelBin, newest first. This project follows
 release is tagged `v<version>` in git, and the version the app is running is shown in the
 page footer.
 
+## 0.26.0 - 2026-10-20
+
+**Added**
+
+- When a feed's video stops but its audio keeps flowing, the recording says so, restarts the
+  capture to get the picture back, and says when it returned. After a few restarts in half an
+  hour, a group recording moves to another member and any other recording keeps the sound.
+- Every list-page filter can exclude a value as well as pick it ("Status is not Failed"), on
+  the recordings list, the Groups tab and a group's member list. Saved filters keep working.
+- A sync names the provider categories that appeared or disappeared since the sync before it,
+  with channel counts and a link into channel search for each one. The Accounts list's sync
+  tooltip counts them.
+- A recording's capture details say what each in-stream reconnect did to the file: the
+  seconds the provider sent again, which the file holds twice, and any hole left in the
+  timeline.
+- The repository includes a simulated IPTV provider that the tests sync against and record
+  from, with streams that stall, drop and lose their video on cue. Its recording tests run
+  nightly in CI.
+
+**Changed**
+
+- Health check badges say Pass, Warn, Fail or Cancelled in the same colors everywhere, so a
+  test that played badly shows amber instead of green. Recording badges use the Recordings
+  list's labels and colors on every page.
+
+**Fixed**
+
+- A segment that connects while the video is out keeps its video track, so the finished file
+  no longer puts that segment's sound in the video track.
+- An account that went longer without a sync than the sync log is kept no longer reports 0
+  channels removed on its next sync.
+
 ## 0.25.0 - 2026-10-15
 
 **Added**

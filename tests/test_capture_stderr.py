@@ -42,6 +42,24 @@ def _spawn_writing(text, exit_code, stderr_fh):
     return proc
 
 
+_BANNER_403 = """ffmpeg version n7.1.5-12-g1fdbca85aa-20260731 Copyright (c) 2000-2026 the FFmpeg developers
+  built with gcc 15.2.0 (crosstool-NG 1.28.0.23_185f348)
+  configuration: --prefix=/ffbuild/prefix --pkg-config-flags=--static --enable-gpl
+  libavutil      59. 39.100 / 59. 39.100
+  libavcodec     61. 19.101 / 61. 19.101
+  libavformat    61.  7.103 / 61.  7.103
+  libavdevice    61.  3.100 / 61.  3.100
+  libavfilter    10.  5.100 / 10.  5.100
+  libswscale      8.  3.100 /  8.  3.100
+  libswresample   5.  3.100 /  5.  3.100
+  libpostproc    58.  3.100 / 58.  3.100
+[http @ 0x56f048e26280] HTTP error 403 Forbidden
+[in#0 @ 0x56f048e1c180] Error opening input: Server returned 403 Forbidden (access denied)
+Error opening input file http://127.0.0.1:18403/u/p/1.
+Error opening input files: Server returned 403 Forbidden (access denied)
+"""
+
+
 class ReadStderrTailTests(unittest.TestCase):
     """The twin cap. Pure function of a path, so no app context is needed."""
 
@@ -96,6 +114,27 @@ class ReadStderrTailTests(unittest.TestCase):
         self._write('')
         self.assertEqual(read_stderr_tail(self.path), '')
 
+    def test_ffmpegs_version_banner_is_dropped(self):
+        """dev/docs/BUGS.md 2026-10-18 02:49 PM: a capture refused at open writes a stderr
+        shorter than the tail, so the banner was most of the tail and its first line - the
+        version - was quoted as a failure's cause in place of the 403 under it. The text is
+        ffmpeg 7.1.5's own, from a 403 at open on this box (configuration line shortened)."""
+        self._write(_BANNER_403)
+        out = read_stderr_tail(self.path)
+        self.assertEqual(out.split('\n')[0], '[http @ 0x56f048e26280] HTTP error 403 Forbidden')
+        for word in ('ffmpeg version', 'built with', 'configuration:', 'libavutil',
+                     'libpostproc'):
+            self.assertNotIn(word, out)
+        self.assertTrue(out.endswith('Server returned 403 Forbidden (access denied)'))
+        # What a RECORDING_RETRY_SCHEDULED or RECORDING_FAILED event quotes as the cause.
+        from app.watchdog import _first_line
+        self.assertIn('403 Forbidden', _first_line(out))
+
+    def test_a_line_that_merely_mentions_a_library_is_kept(self):
+        self._write('[h264 @ 0x1] libavcodec says: decode error\nconfiguration of x failed')
+        self.assertEqual(read_stderr_tail(self.path),
+                         '[h264 @ 0x1] libavcodec says: decode error\nconfiguration of x failed')
+
     def test_invalid_utf8_does_not_raise(self):
         self._write(b'\xff\xfe bad bytes then\nreal message')
         self.assertIn('real message', read_stderr_tail(self.path))
@@ -146,7 +185,7 @@ class SpoolLifecycleTests(unittest.TestCase):
         self.state.stderr_path, self.state.stderr_fh = path, fh
         self.state.process = _spawn_writing('Connection reset by peer\n', 3, fh)
 
-        code, tail, _, _missing = recorder.collect_segment_diagnostics(self.rec.id)
+        code, tail, _, _missing, _jumps = recorder.collect_segment_diagnostics(self.rec.id)
         self.assertEqual(code, 3)
         self.assertIn('Connection reset by peer', tail)
 
@@ -171,7 +210,7 @@ class SpoolLifecycleTests(unittest.TestCase):
 
         self.assertEqual(recorder.collect_segment_diagnostics(self.rec.id)[0], 1)
         self.assertEqual(recorder.collect_segment_diagnostics(self.rec.id),
-                         (1, '', (0, True), False))
+                         (1, '', (0, True), False, None))
 
     def test_credentials_in_the_tail_are_masked(self):
         """ffmpeg echoes its input URL on error, and a provider stream URL carries the
@@ -188,7 +227,7 @@ class SpoolLifecycleTests(unittest.TestCase):
         fh.flush()
         self.state.process = _spawn_writing('', 1, subprocess.DEVNULL)
 
-        _, tail, _reconnects, _missing = recorder.collect_segment_diagnostics(self.rec.id)
+        _, tail, _reconnects, _missing, _jumps = recorder.collect_segment_diagnostics(self.rec.id)
         self.assertNotIn('s3cr3tpass', tail)
         self.assertIn('403', tail)
 
@@ -203,14 +242,14 @@ class SpoolLifecycleTests(unittest.TestCase):
         proc.kill()
         proc.wait(timeout=30)
 
-        code, _, _reconnects, _missing = recorder.collect_segment_diagnostics(self.rec.id)
+        code, _, _reconnects, _missing, _jumps = recorder.collect_segment_diagnostics(self.rec.id)
         self.assertEqual(code, -9)
 
     def test_collect_without_live_state_is_a_no_op(self):
         with recorder._lock:
             recorder._active.pop(self.rec.id, None)
         self.assertEqual(recorder.collect_segment_diagnostics(self.rec.id),
-                         (None, '', (0, True), False))
+                         (None, '', (0, True), False, None))
 
     def test_a_deleted_spool_is_reported_as_missing_not_as_silence(self):
         """dev/docs/BUGS.md 2026-09-14 @ 10:42 - read_stderr_tail returns '' both when
@@ -221,7 +260,8 @@ class SpoolLifecycleTests(unittest.TestCase):
         self.state.process = _spawn_writing('a lot of context\n', 0, fh)
         os.unlink(path)  # what a second app build's sweep did to a live capture
 
-        code, tail, reconnects, spool_missing = recorder.collect_segment_diagnostics(self.rec.id)
+        code, tail, reconnects, spool_missing, _jumps = \
+            recorder.collect_segment_diagnostics(self.rec.id)
         self.assertTrue(spool_missing)
         self.assertEqual(code, 0)
         self.assertEqual(tail, '')
@@ -233,7 +273,8 @@ class SpoolLifecycleTests(unittest.TestCase):
         self.state.stderr_path, self.state.stderr_fh = path, fh
         self.state.process = _spawn_writing('', 0, fh)
 
-        _code, tail, _reconnects, spool_missing = recorder.collect_segment_diagnostics(self.rec.id)
+        _code, tail, _reconnects, spool_missing, _jumps = \
+            recorder.collect_segment_diagnostics(self.rec.id)
         self.assertFalse(spool_missing)
         self.assertEqual(tail, '')
 

@@ -39,8 +39,8 @@ from .channel_groups import (effective_score, pick_best_member, recording_member
                              segment_format_key, DEFAULT_FAILING_STREAK_THRESHOLD)
 from .db_utils import retry_on_locked
 from .fs_utils import PATH_OK, describe_dir_problem, probe_dir
-from .proc_utils import (build_capture_cmd, count_stderr_matches, read_stderr_tail,
-                         terminate_or_kill)
+from .proc_utils import (build_capture_cmd, count_stderr_matches, read_reconnect_jumps,
+                         read_stderr_tail, terminate_or_kill)
 from .url_utils import mask_creds, mask_creds_in_text
 from . import events as ev
 
@@ -1534,8 +1534,8 @@ def _discard_stderr_spool(path, fh):
 
 
 def collect_segment_diagnostics(recording_id: int):
-    """(ffmpeg_exit_code, stderr_tail, reconnects, spool_missing) for the segment that just
-    ended; releases its spool.
+    """(ffmpeg_exit_code, stderr_tail, reconnects, spool_missing, jumps) for the segment that
+    just ended; releases its spool.
 
     Call AFTER terminating the process. poll() is read rather than wait()ed, so a child that
     is somehow still alive yields None - honest, since we genuinely do not know how it ended.
@@ -1550,6 +1550,11 @@ def collect_segment_diagnostics(recording_id: int):
     segment that reconnected eight times would otherwise be indistinguishable from a clean
     one - which is the opposite of what an in-process repair should cost the user in
     visibility.
+
+    `jumps` is what those reconnects did to the file, a `proc_utils.ReconnectJumps` read from
+    the same spool, or None when there was no reconnect: the seconds the provider sent again
+    after each one, which the file holds twice, and any hole ffmpeg's repair left
+    (dev/changelog/1237).
 
     `spool_missing` says the spool this segment was writing to had been deleted by the time
     we came to read it - not that ffmpeg said nothing. The distinction is load-bearing: an
@@ -1568,7 +1573,7 @@ def collect_segment_diagnostics(recording_id: int):
     """
     state = get_state(recording_id)
     if state is None:
-        return None, '', (0, True), False
+        return None, '', (0, True), False, None
     exit_code = state.process.poll() if state.process is not None else None
     path, fh = state.stderr_path, state.stderr_fh
     state.stderr_path, state.stderr_fh = None, None
@@ -1577,7 +1582,7 @@ def collect_segment_diagnostics(recording_id: int):
             fh.close()
         except OSError:
             pass  # the tail read below still tries; a partial spool is better than none
-    tail, reconnects, spool_missing = '', (0, True), False
+    tail, reconnects, spool_missing, jumps = '', (0, True), False, None
     if path and not os.path.exists(path):
         # Tested before the read rather than inferred from an empty tail, because
         # read_stderr_tail returns '' for both. Nothing in this process deletes a spool
@@ -1593,15 +1598,25 @@ def collect_segment_diagnostics(recording_id: int):
         # cannot touch the capture it is describing, and count_stderr_matches is bounded so
         # it cannot delay the restart.
         reconnects = count_stderr_matches(path)
+        if reconnects[0]:
+            jumps = read_reconnect_jumps(path)
         try:
             os.unlink(path)
         except OSError:
             pass  # best-effort; the glob reap in _open_segment_stderr_spool collects strays
-    return exit_code, tail, reconnects, spool_missing
+    return exit_code, tail, reconnects, spool_missing, jumps
+
+
+def _seconds_list(values) -> str:
+    """'4.0, 5.1 and 5.8 s' - the seconds of a few reconnects, read in one breath."""
+    parts = [f'{v:.1f}' for v in values]
+    if len(parts) == 1:
+        return f'{parts[0]} s'
+    return f'{", ".join(parts[:-1])} and {parts[-1]} s'
 
 
 def record_segment_diagnostics(recording_id: int, seg, exit_code, tail, reconnects=(0, True),
-                               spool_missing=False):
+                               spool_missing=False, jumps=None):
     """Write exit_code onto seg and, when there is something to say, add a DIAGNOSTICS event.
 
     Inserts only - the CALLER commits. This joins the caller's existing retry_on_locked unit
@@ -1612,7 +1627,11 @@ def record_segment_diagnostics(recording_id: int, seg, exit_code, tail, reconnec
     a stat with a column does not also live there (CLAUDE.md § Measurements). extra_data
     carries only the stderr tail, which has no column because nothing sorts on a blob. The
     reconnect count has no column either and nothing sorts on it, so it rides the detail
-    string where a human reads it.
+    string where a human reads it. What the reconnects did to the file (`jumps`, a
+    `proc_utils.ReconnectJumps`) rides the detail string too, and extra_data carries the
+    per-reconnect seconds, which have no column either (dev/changelog/1237): a file that
+    plays 86 s for a 60 s window, 142% of its expected frames, is a number nobody can
+    explain unless the event says the provider's buffer was captured again after each drop.
 
     Stays quiet when the exit is uninformative: a negative code is a signal we sent, which
     seg.exit_reason already names, so with no stderr to show there is nothing an event would
@@ -1646,13 +1665,31 @@ def record_segment_diagnostics(recording_id: int, seg, exit_code, tail, reconnec
         times = 'time' if reconnect_count == 1 and reconnects_complete else 'times'
         detail += (f'; the stream dropped and ffmpeg reconnected {howmany} {times} during '
                    f'the segment, without restarting the capture')
+    extra = {'kind': 'capture_stderr'}
+    if reconnect_count and jumps is not None and jumps.replays:
+        # The provider answers each new connection from its buffer, so the content comes
+        # back from before the drop and ffmpeg closes the backward jump: the file holds
+        # those seconds twice on one continuous timeline, which is where a file longer than
+        # its window comes from. A jump closed once per stream leaves a hole as long again
+        # in the timeline, with the content on both sides of it intact (dev/changelog/1237).
+        detail += (f'; each reconnect was answered from the provider\'s buffer again, so the '
+                   f'file holds the seconds before each drop twice: '
+                   f'{_seconds_list(jumps.replays)}, {sum(jumps.replays):.1f} s in all')
+        if jumps.holes:
+            n = len(jumps.holes)
+            detail += (f'; at {n} of them ffmpeg closed the timestamp jump once per stream, '
+                       f'which leaves a hole of about {_seconds_list(jumps.holes)} in the '
+                       f'file\'s timeline with no content missing on either side of it')
+        extra['reconnect_replay_seconds'] = list(jumps.replays)
+        extra['reconnect_hole_seconds'] = list(jumps.holes)
     if spool_missing:
         detail += ('; ffmpeg\'s output was not captured for this segment - another process '
                    'deleted the file it was being written to, so there is no record of what '
                    'it reported')
+    if tail:
+        extra['stderr_tail'] = tail
     add_recording_event(recording_id, DIAGNOSTICS, detail=detail, segment_number=seg_num,
-                        extra={'kind': 'capture_stderr', 'stderr_tail': tail} if tail
-                              else {'kind': 'capture_stderr'})
+                        extra=extra)
 
 
 def _launch_segment(app, recording_id: int, seg_num: int) -> str:
@@ -1712,7 +1749,7 @@ def _launch_segment(app, recording_id: int, seg_num: int) -> str:
             launch_url, _login_id = render_held_login(rec.url, channel.account_id,
                                                       'recording', recording_id)
         cmd = build_capture_cmd(cfg, launch_url, seg_path, segment_duration,
-                                pace_realtime=pace)
+                                pace_realtime=pace, keep_video_track=True)
         log.info('Recording %d seg %d: %s', recording_id, seg_num,
                  mask_creds_in_text(' '.join(cmd)))
 
@@ -2900,7 +2937,7 @@ def _close_active_segment(app, recording_id: int, exit_reason: str):
     # Read outside the retried closure: it consumes the spool (closes and unlinks it), so a
     # lock-retry of the closure would find it already gone and record an empty tail. Reading
     # first makes the values plain locals the retry can safely reuse.
-    exit_code, tail, reconnects, spool_missing = collect_segment_diagnostics(recording_id)
+    exit_code, tail, reconnects, spool_missing, jumps = collect_segment_diagnostics(recording_id)
 
     @retry_on_locked()
     def _close_and_commit():
@@ -2917,7 +2954,7 @@ def _close_active_segment(app, recording_id: int, exit_reason: str):
                                     detail=f'Segment {seg.segment_number} ended: {exit_reason}',
                                     segment_number=seg.segment_number)
                 record_segment_diagnostics(recording_id, seg, exit_code, tail,
-                                           reconnects, spool_missing)
+                                           reconnects, spool_missing, jumps)
                 db.session.commit()
 
     _close_and_commit()

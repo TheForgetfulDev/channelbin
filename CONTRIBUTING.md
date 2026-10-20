@@ -20,6 +20,25 @@ Common types: `feat`, `fix`, `chore`, `docs`, `refactor`, `test`. Scope is optio
 (`fix(recorder): ...`). Keep the summary line under ~72 characters; put detail in the body if
 the change needs explaining.
 
+## Tests
+
+```
+./run_tests.sh              the default suite, split across worker processes
+./run_tests.sh --capture    the capture tier: real recordings against a simulated provider,
+                            about 10 minutes
+```
+
+`run_tests.sh` refuses to start without `ffmpeg`, `ffprobe` and `node` on PATH and
+`node_modules/jsdom` installed (`npm ci`), because the tests that need them skip themselves and
+a green run without them has tested far less than it looks. No test touches the network: sync
+and recording tests run against `sim/`, a simulated IPTV provider - see
+[sim/README.md](sim/README.md). `.github/workflows/tests.yml` runs the default suite on every
+push and pull request, and the capture tier nightly and on demand.
+
+If you fix a bug that a real provider's behavior caused, add that behavior to the simulator as a
+fault and add a test that reproduces the bug through it, so the next change cannot bring it back
+unnoticed.
+
 ## Linting
 
 [`flake8`](https://pypi.org/project/flake8/) catches unused imports, undefined names, and unused
@@ -31,7 +50,7 @@ whenever you want:
 
 ```
 pip install -r requirements-dev.txt
-flake8 app/ run.py tools/ tests/ docker/
+flake8 app/ run.py tools/ tests/ docker/ sim/
 ```
 
 A clean run prints nothing and exits 0. Any output is a real finding worth fixing.

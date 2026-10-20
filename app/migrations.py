@@ -3056,6 +3056,22 @@ def _m093_recording_converted_gap_seconds(conn, cur):
     conn.commit()
 
 
+def _m094_sync_log_category_changes(conn, cur):
+    """account_sync_logs: categories_added / categories_removed, the provider categories a
+    sync found new or gone since the sync before it (dev/changelog/1211).
+
+    No backfill: a past sync's category diff cannot be reconstructed, because the upsert
+    overwrites a moved channel's category_name. NULL means "not tracked", never "nothing
+    changed"."""
+    cols = {r[1] for r in cur.execute('PRAGMA table_info(account_sync_logs)').fetchall()}
+    if not cols:
+        return
+    for col in ('categories_added', 'categories_removed'):
+        if col not in cols:
+            cur.execute(f'ALTER TABLE account_sync_logs ADD COLUMN {col} TEXT')
+    conn.commit()
+
+
 def _m081_account_blocks(conn, cur):
     """account_blocks: the stretches of time the user has told ChannelBin to keep off an
     account (app/account_blocks.py, dev/changelog/1151).
@@ -3271,6 +3287,8 @@ SCHEMA_MIGRATIONS = [
      'split out of last_error', _m092_auto_rule_last_problems),
     (93, 'recordings: converted_gap_seconds, video the conversion lost that the source has, '
      'checked before the source is deleted', _m093_recording_converted_gap_seconds),
+    (94, 'account_sync_logs: categories_added/categories_removed, the provider categories a '
+     'sync found new or gone', _m094_sync_log_category_changes),
 ]
 
 CURRENT_SCHEMA_VERSION = SCHEMA_MIGRATIONS[-1][0]

@@ -1022,6 +1022,40 @@ class SyncLogAddedRemovedMigrationTests(unittest.TestCase):
                          'SCHEMA_MIGRATIONS must stay in ascending version order')
 
 
+class SyncLogCategoryChangesMigrationTests(unittest.TestCase):
+    """Migration 94 - account_sync_logs.categories_added/categories_removed
+    (dev/changelog/1211). Nullable TEXT, no backfill: an old row reads as not tracked."""
+
+    def test_m094_adds_columns_and_is_idempotent(self):
+        import sqlite3
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            conn = sqlite3.connect(os.path.join(td, 'scratch.db'))
+            cur = conn.cursor()
+            cur.execute('CREATE TABLE account_sync_logs (id INTEGER PRIMARY KEY, '
+                        'channels_synced INTEGER)')
+            cur.execute('INSERT INTO account_sync_logs (channels_synced) VALUES (42)')
+            conn.commit()
+
+            M._m094_sync_log_category_changes(conn, cur)
+
+            cols = {r[1] for r in cur.execute('PRAGMA table_info(account_sync_logs)')}
+            self.assertIn('categories_added', cols)
+            self.assertIn('categories_removed', cols)
+            self.assertEqual(cur.execute(
+                'SELECT channels_synced, categories_added, categories_removed '
+                'FROM account_sync_logs').fetchone(), (42, None, None))
+
+            M._m094_sync_log_category_changes(conn, cur)
+            self.assertEqual(
+                {r[1] for r in cur.execute('PRAGMA table_info(account_sync_logs)')}, cols)
+            conn.close()
+
+    def test_m094_registered_at_its_own_version(self):
+        registered = {v: fn for v, _d, fn in M.SCHEMA_MIGRATIONS}
+        self.assertIs(registered.get(94), M._m094_sync_log_category_changes)
+
+
 class ChannelTestMultiTrackMigrationTests(unittest.TestCase):
     """Migration 34 - channel_tests.video_track_count/audio_track_count/extra_tracks
     (dev/changelog/564). Nullable, no backfill - a scratch-DB characterization like m027,

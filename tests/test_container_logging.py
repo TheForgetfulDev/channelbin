@@ -17,7 +17,8 @@ dvr.log` against a config.yaml whose logging.file is the same dvr.log.
 
 logging.basicConfig is a no-op once the root logger has handlers, which it does by the time
 any test runs, so these assert on the handler set built and handed to it rather than on the
-root logger afterwards.
+root logger afterwards - with the root logger's handlers emptied for the call, since that is
+the first boot these describe and _setup_logging builds nothing when it would be ignored.
 
 No BUGS.md entry of its own - the defect is logged under the file-mode entry it was found
 beside, 2026-09-15.
@@ -52,6 +53,7 @@ class _HandlerCase(unittest.TestCase):
             captured['force'] = kwargs.get('force')
 
         with patch.dict(os.environ, env, clear=True), \
+                patch.object(logging.getLogger(), 'handlers', []), \
                 patch('logging.basicConfig', fake_basic_config):
             app_pkg._setup_logging(cfg, **kwargs)
         self.captured = captured
@@ -131,6 +133,45 @@ class ContainerLoggingTests(_HandlerCase):
         files = [h for h in handlers if isinstance(h, logging.FileHandler)]
         self.assertEqual(len(files), 1)
         self.assertIsInstance(files[0], logging.handlers.RotatingFileHandler)
+
+
+class UninstalledHandlersOpenNoFileTests(unittest.TestCase):
+    """dev/docs/BUGS.md 2026-10-19 @ 04:33:57 PM: a _setup_logging call that basicConfig
+    would ignore (the root logger already has handlers, force off) used to build a file
+    handler anyway, opening a log file that was never attached and never closed - one leaked
+    file per make_test_app(). The file a FileHandler opens on construction is the evidence:
+    it exists only if a handler was built for it."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix='cb-log-')
+        self.log_file = os.path.join(self.tmp, 'dvr.log')
+
+    def _setup(self, force):
+        built = []
+
+        def fake_basic_config(**kwargs):
+            built.extend(kwargs.get('handlers') or [])
+
+        # A list of our own, so the _AlertHandler _setup_logging appends never reaches the
+        # real root logger.
+        with patch.object(logging.getLogger(), 'handlers', [logging.NullHandler()]), \
+                patch('logging.basicConfig', fake_basic_config):
+            app_pkg._setup_logging({'logging': {'level': 'INFO', 'file': self.log_file}},
+                                   force=force)
+        self.addCleanup(lambda: [h.close() for h in built])
+        return built
+
+    def test_a_call_basicconfig_would_ignore_opens_no_log_file(self):
+        self.assertEqual(self._setup(force=False), [])
+        self.assertFalse(os.path.exists(self.log_file),
+                         'a handler was built for a file nothing will write or close')
+
+    def test_a_forced_call_still_builds_its_file_handler(self):
+        """The migration re-setup in create_app replaces live handlers, so it must still
+        get a real one - the skip is for the ignored case only."""
+        built = self._setup(force=True)
+        self.assertTrue(any(isinstance(h, logging.FileHandler) for h in built))
+        self.assertTrue(os.path.exists(self.log_file))
 
 
 class ContainerLogFileMigrationTests(unittest.TestCase):

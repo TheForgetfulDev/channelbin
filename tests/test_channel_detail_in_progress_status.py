@@ -59,9 +59,9 @@ class ChannelDetailInProgressStatusTests(unittest.TestCase):
         self.assertEqual(resp.status_code, 200)
         body = resp.get_data(as_text=True)
         self.assertNotIn('badge b-fail', body)
-        self.assertNotIn('>FAILED<', body)
+        self.assertNotIn('>FAIL<', body)
         self.assertIn('Testing now', body)
-        self.assertIn('badge-in_progress', body)
+        self.assertIn('badge b-running', body)
 
     def test_finished_failed_test_still_renders_as_failed(self):
         """A genuinely terminal FAILED test (tester idle) must still say Failed - the fix
@@ -114,8 +114,8 @@ class GroupDetailTimelineInProgressStatusTests(unittest.TestCase):
             resp = self.t.client.get(f'/channel-groups/{self.job.group_id}')
         self.assertEqual(resp.status_code, 200)
         body = resp.get_data(as_text=True)
-        self.assertNotIn('>FAILED<', body)
-        self.assertIn('badge-in_progress', body)
+        self.assertNotIn('>FAIL<', body)
+        self.assertIn('badge b-running', body)
 
     def test_finished_failed_test_in_timeline_still_renders_as_failed(self):
         seed.make_channel_test(self.ch, job_id=self.job.id)
@@ -126,7 +126,7 @@ class GroupDetailTimelineInProgressStatusTests(unittest.TestCase):
             resp = self.t.client.get(f'/channel-groups/{self.job.group_id}')
         self.assertEqual(resp.status_code, 200)
         body = resp.get_data(as_text=True)
-        self.assertIn('>FAILED<', body)
+        self.assertIn('>FAIL<', body)
 
 
 if __name__ == '__main__':

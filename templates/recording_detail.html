@@ -496,6 +496,8 @@
 {% set timeline_label = {
   'STALL_DETECTED': 'Stall',
   'FAST_DELIVERY_DETECTED': 'Faster than live',
+  'CAPTURE_VIDEO_STOPPED': 'Video stopped',
+  'CAPTURE_VIDEO_RESUMED': 'Video back',
   'RESTART_SUCCEEDED': 'Restart',
   'RESTART_FAILED': 'Restart failed',
   'CAPTURE_COMPLETE': 'Stop time reached',
@@ -513,6 +515,8 @@
 {% set event_dot = {
   'STALL_DETECTED': 'stall',
   'FAST_DELIVERY_DETECTED': 'fail',
+  'CAPTURE_VIDEO_STOPPED': 'stall',
+  'CAPTURE_VIDEO_RESUMED': 'restart',
   'RESTART_SUCCEEDED': 'restart',
   'RESTART_FAILED': 'fail',
   'SEGMENT_STARTED': 'start',
@@ -590,13 +594,13 @@
   {% for seg in rec.segments %}
     {% if not loop.first %}
       {% set prev = rec.segments[loop.index0 - 1] %}
-      {# All three of these already put their own milestone on the timeline via the
-         STALL_DETECTED event above - a boundary marker here would double it. ERROR is
-         deliberately NOT in the list: a segment abandoned by group failover is closed by
+      {# Each of these already put its own milestone on the timeline - STALL_DETECTED,
+         FAST_DELIVERY_DETECTED or CAPTURE_VIDEO_STOPPED - so a boundary marker here would
+         double it. ERROR is deliberately NOT in the list: a segment abandoned by group failover is closed by
          _close_active_segment, which emits SEGMENT_ENDED rather than STALL_DETECTED, so
          the boundary marker is the only thing that marks it. #}
       {% if prev.exit_reason not in ('STALL_KILLED', 'PROCESS_EXITED', 'RESTART_NO_DATA',
-                                     'FAST_DELIVERY_KILLED') and seg.started_at %}
+                                     'FAST_DELIVERY_KILLED', 'VIDEO_STOPPED') and seg.started_at %}
         {% set _ = ns_ms.items.append({'ts': seg.started_at, 'kind': 'neutral', 'label': 'Segment boundary', 'prio': 1, 'silent': False}) %}
       {% endif %}
     {% endif %}
@@ -922,6 +926,7 @@
   'PROCESS_EXITED':           ('warn', 'ffmpeg exited on its own - ChannelBin did not kill it. The watchdog noticed within a poll and started a new segment after the restart delay. The exit code beside this pill is ffmpeg\'s own reason.'),
   'RESTART_NO_DATA':          ('bad',  'This segment was a restart attempt and it never produced a byte. The watchdog closed it the moment the reconnect wait ran out, instead of spending a second stall timeout proving the same thing again.'),
   'FAST_DELIVERY_KILLED':     ('bad',  'The feed kept delivering video faster than real time for a sustained stretch, so it was not showing live content. Usually that means the provider was re-serving the same few seconds over and over, though ChannelBin measures the delivery rate rather than the picture. The watchdog stopped this capture rather than let it keep filling the recording.'),
+  'VIDEO_STOPPED':            ('warn', 'The video stopped arriving while the sound kept coming, so the file kept growing and this was not a stall. The watchdog restarted the capture to get the picture back, because a fresh connection usually does. It is not counted as a stall or a failure.'),
   'ERROR':                    ('bad',  'Restart attempt produced no data. ffmpeg reconnected but the new segment stayed empty, so the watchdog killed it.'),
   'MANUAL_CANCEL':            ('na',   'The recording was cancelled manually.'),
   'MANUAL_STOP':              ('na',   'The recording was stopped manually.'),
@@ -981,7 +986,7 @@
                quietly missing from this table is how the whole defect stayed invisible in the
                first place (dev/changelog/957). Distinct from the slate? badge beside it - that
                one flags a segment that was kept. #}
-            {% if seg.excluded %}<span class="badge badge-danger tip-plain" data-tip="{{ discard_tip.get(seg.excluded_reason, 'This segment was discarded and not joined into the final file.') }}">discarded</span>{% endif %}
+            {% if seg.excluded %}{{ status_badge('b-fail', 'discarded', tip=discard_tip.get(seg.excluded_reason, 'This segment was discarded and not joined into the final file.')) }}{% endif %}
             {# Kept, unlike a discarded placeholder: there is real content here and no way to
                tell from length which parts are which, so it is labelled rather than thrown
                away. A segment like this never stalls, so this badge is the only thing on the
@@ -1048,7 +1053,8 @@
   'RECORDING_ABORTED': 'warn', 'SEEK_DAMAGE_DETECTED': 'warn', 'RECORDING_RETRY_SCHEDULED': 'warn',
   'RECORDING_START_DEFERRED': 'warn', 'CONVERSION_YIELDED': 'warn', 'CONVERSION_CANCELLED': 'warn',
   'CAPTURE_LOST_TO_OUTAGE': 'warn', 'SEGMENT_DISCARDED': 'warn',
-  'FAST_DELIVERY_DETECTED': 'warn',
+  'FAST_DELIVERY_DETECTED': 'warn', 'CAPTURE_VIDEO_STOPPED': 'warn',
+  'CAPTURE_VIDEO_RESUMED': 'ok',
   'RECORDING_FORMAT_OVERRIDE': 'warn', 'RECORDING_FORMAT_CHANGED': 'warn',
   'RECORDING_RULE_PROGRAM_MOVED': 'warn',
   'CONVERSION_RESTARTED': 'info', 'DIAGNOSTICS': 'info', 'CAPTURE_PACING_ENABLED': 'info',

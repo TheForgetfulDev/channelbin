@@ -236,7 +236,8 @@ function recStatusVocab() {
       // rather than a borrowed one, which is the honest reading.
       console.error('rec-status-labels meta is not valid JSON', e);
     }
-    _recStatusVocab = (parsed && parsed.labels) ? parsed : { labels: {}, waiting: '' };
+    _recStatusVocab = (parsed && parsed.labels) ? parsed : { labels: {}, badges: {}, waiting: '' };
+    if (!_recStatusVocab.badges) _recStatusVocab.badges = {};
   }
   return _recStatusVocab;
 }
@@ -247,6 +248,13 @@ function recStatusVocab() {
 function recStatusLabel(status) {
   const labels = recStatusVocab().labels;
   return Object.prototype.hasOwnProperty.call(labels, status) ? labels[status] : null;
+}
+
+// The `.b-*` badge class for a Recording.status, from the same server table as the label.
+// null for a status the table does not name, exactly as recStatusLabel() (dev/changelog/1212).
+function recStatusClass(status) {
+  const badges = recStatusVocab().badges;
+  return Object.prototype.hasOwnProperty.call(badges, status) ? badges[status] : null;
 }
 
 // The label a post-processing chain badges as while it is parked waiting for another

@@ -1,0 +1,108 @@
+# A world well past the production install's size, for timing sync, guide import, search and
+# the guide where the costs that grow with the whole database show (dev/sim/bench.py,
+# DESIGN-simulator.md §3.15). Every name in it is invented.
+#
+# Twelve Xtream accounts, 300,000 channels between them, from 57,000 down to 7,200, each with
+# its own backend and login. Each guide covers half the channels a guide would by default,
+# which comes to about 7.9 listings a channel and 2.4 million listings in all (the largest
+# account alone serves 452k, measured with the simulator's own generators). The guide is held
+# there rather than at the default because the database this world produces has to fit on
+# the local disk of the box the bench runs on; the bench states the budget.
+#
+# Every backend plays the tiny test loop: a scale run never records, and the calibrated
+# loops would cost the content cache about 400 MB for nothing.
+#
+# Changing any number here, the seed, or a generator (SIM_VERSION) makes a different world,
+# and the bench keeps its history apart from this one's.
+seed: 67
+calibration: prod
+
+backends:
+  - name: amber
+    channels: 57000
+    content: test_tiny
+  - name: birch
+    channels: 45000
+    content: test_tiny
+  - name: cobalt
+    channels: 35000
+    content: test_tiny
+  - name: dune
+    channels: 30000
+    content: test_tiny
+  - name: ember
+    channels: 25000
+    content: test_tiny
+  - name: fjord
+    channels: 22000
+    content: test_tiny
+  - name: granite
+    channels: 20000
+    content: test_tiny
+  - name: hazel
+    channels: 18000
+    content: test_tiny
+  - name: indigo
+    channels: 15000
+    content: test_tiny
+  - name: juniper
+    channels: 13700
+    content: test_tiny
+  - name: kestrel
+    channels: 12100
+    content: test_tiny
+  - name: linden
+    channels: 7200
+    content: test_tiny
+
+panels:
+  - name: amber-tv
+    backend: amber
+    guide_coverage: 0.5
+  - name: birch-tv
+    backend: birch
+    guide_coverage: 0.5
+  - name: cobalt-tv
+    backend: cobalt
+    guide_coverage: 0.5
+  - name: dune-tv
+    backend: dune
+    guide_coverage: 0.5
+  - name: ember-tv
+    backend: ember
+    guide_coverage: 0.5
+  - name: fjord-tv
+    backend: fjord
+    guide_coverage: 0.5
+  - name: granite-tv
+    backend: granite
+    guide_coverage: 0.5
+  - name: hazel-tv
+    backend: hazel
+    guide_coverage: 0.5
+  - name: indigo-tv
+    backend: indigo
+    guide_coverage: 0.5
+  - name: juniper-tv
+    backend: juniper
+    guide_coverage: 0.5
+  - name: kestrel-tv
+    backend: kestrel
+    guide_coverage: 0.5
+  - name: linden-tv
+    backend: linden
+    guide_coverage: 0.5
+
+logins:
+  - backend: amber
+  - backend: birch
+  - backend: cobalt
+  - backend: dune
+  - backend: ember
+  - backend: fjord
+  - backend: granite
+  - backend: hazel
+  - backend: indigo
+  - backend: juniper
+  - backend: kestrel
+  - backend: linden

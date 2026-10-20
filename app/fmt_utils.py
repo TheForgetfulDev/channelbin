@@ -45,6 +45,12 @@ REC_STATUS_DISPLAY = {
 # table that called two post-capture phases "Recorded" (dev/changelog/1083).
 REC_STATUS_LABELS = {status: row[3] for status, row in REC_STATUS_DISPLAY.items()}
 
+# The badge class per status, for the same browser consumers: a JS-built badge takes its
+# color from this table rather than gluing the raw status onto a class prefix, which is
+# what pulled a new legacy `.badge-*` rule into style.css for every status added
+# (dev/changelog/1212).
+REC_STATUS_BADGES = {status: row[2] for status, row in REC_STATUS_DISPLAY.items()}
+
 # The two statuses in which a recording can be parked waiting for another one to give up
 # the machine. Narrower than "any post-capture phase" on purpose: a join is never parked.
 _WAITABLE_STATUSES = (REC_STATUS_ANALYZING, REC_STATUS_CONVERTING)

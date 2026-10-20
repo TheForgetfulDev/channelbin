@@ -1,0 +1,50 @@
+# A world the size of the production install the calibration profile was measured from, for
+# timing sync, guide import, search and the guide at that scale (dev/sim/bench.py,
+# DESIGN-simulator.md §3.15). Every name in it is invented.
+#
+# Three Xtream accounts sized like that install's: one with many channels and a thin guide,
+# one small with a dense guide, one in between. The guide settings are tuned so the listings
+# served land near what that install imports per sync (about 210k, 490k and 280k), measured
+# with the simulator's own generators:
+#
+#   alpha-tv    57,000 channels   212k listings
+#   bravo-tv    13,700 channels   477k listings
+#   charlie-tv  12,100 channels   275k listings
+#
+# Every backend plays the tiny test loop: a scale run never records, and the calibrated
+# loops would cost the content cache about 400 MB for nothing.
+#
+# Changing any number here, the seed, or a generator (SIM_VERSION) makes a different world,
+# and the bench keeps its history apart from this one's.
+seed: 61
+calibration: prod
+
+backends:
+  - name: alpha
+    channels: 57000
+    content: test_tiny
+  - name: bravo
+    channels: 13700
+    content: test_tiny
+    stream_hosts: 3
+  - name: charlie
+    channels: 12100
+    content: test_tiny
+
+panels:
+  - name: alpha-tv
+    backend: alpha
+    guide_coverage: 0.23
+  - name: bravo-tv
+    backend: bravo
+    guide_days_ahead: 3.0
+    url_shape: {bare: 0.61, live_ts: 0.39}
+    id_spelling: word_dash_number
+  - name: charlie-tv
+    backend: charlie
+    guide_days_ahead: 1.85
+
+logins:
+  - backend: alpha
+  - backend: bravo
+  - backend: charlie

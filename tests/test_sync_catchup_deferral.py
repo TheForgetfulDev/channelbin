@@ -122,7 +122,7 @@ class RecordingWindowTests(unittest.TestCase):
                             stop_time=now - timedelta(minutes=10))
         db.session.commit()
         windows = sched.recording_windows(now=now)
-        self.assertEqual(windows, [(now, now)])
+        self.assertEqual(windows, [(now, now + sched.OVERRUN_BLOCK)])
 
     def test_the_active_guard_being_off_removes_its_windows(self):
         now = datetime.utcnow()
@@ -167,6 +167,24 @@ class SyncIsDeferredNotDroppedTests(unittest.TestCase):
         job = self._retry_job()
         self.assertIsNotNone(job, 'the blocked sync was dropped instead of deferred')
         self.assertGreaterEqual(sched.to_naive_utc(job.next_run_time), stop)
+
+    def test_a_recording_past_its_stop_time_defers_the_retry_into_the_future(self):
+        """dev/docs/BUGS.md 2026-10-18 04:07 PM: a retry that fires as its recording stops
+        finds it still IN_PROGRESS for a moment. The overrunning recording's window was
+        (now, now), which blocks nothing, so the new retry was queued for now - from inside
+        the retry job itself, under the same job id - and APScheduler skipped it as a second
+        running instance and removed it. The sync was then lost until the next interval."""
+        now = datetime.utcnow()
+        seed.make_recording(status='IN_PROGRESS', channel_id=self.channel.id, name='Ending',
+                            start_time=now - timedelta(hours=1),
+                            stop_time=now - timedelta(seconds=2))
+        db.session.commit()
+
+        self._run_job().assert_not_called()
+        job = self._retry_job()
+        self.assertIsNotNone(job, 'the blocked sync was dropped instead of deferred')
+        self.assertGreaterEqual(sched.to_naive_utc(job.next_run_time),
+                                now + sched.OVERRUN_BLOCK - timedelta(seconds=1))
 
     def test_an_upcoming_recording_queues_a_retry_after_it_ends(self):
         now = datetime.utcnow()

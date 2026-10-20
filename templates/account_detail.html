@@ -65,6 +65,19 @@
 {%- if log.skipped_duplicate_stream_ids %}, <span class="tip-plain" data-tip="Duplicate stream IDs skipped.&#10;Entries that repeated a stream ID already seen in this sync, so the second copy was not imported.">{{ '{:,}'.format(log.skipped_duplicate_stream_ids) }} skipped as duplicate stream IDs</span>{% endif -%}
 {%- endmacro %}
 
+{# One provider category, linked to this account's channels in it. A gone category's link
+   finds the channels still holding the name - the ones this sync did not see. #}
+{% macro category_link(c, account_id) -%}
+<a href="{{ url_for('channels.channel_browser', **{'f.acct': account_id, 'f.cat': c.name}) }}">{{ c.name }}</a> <span class="text-faint">({{ '{:,}'.format(c.channels) }} channel{{ 's' if c.channels != 1 }})</span>
+{%- endmacro %}
+
+{# The first few by size, then the rest behind a click: a first sync lists every category
+   the provider has, which runs to 900 on one account (dev/changelog/1211). #}
+{% macro category_list(entries, account_id) -%}
+{%- for c in entries[:5] %}{% if not loop.first %}, {% endif %}{{ category_link(c, account_id) }}{% endfor -%}
+{%- if entries | length > 5 %}, <details class="acct-act-more"><summary>and {{ '{:,}'.format(entries | length - 5) }} more</summary>{% for c in entries[5:] %}{% if not loop.first %}, {% endif %}{{ category_link(c, account_id) }}{% endfor %}</details>{% endif -%}
+{%- endmacro %}
+
 {% block content %}
 <div class="page-head">
   <h1>Accounts</h1>
@@ -254,7 +267,7 @@
            rather than being hidden, per this page's existing zero-is-faint convention -
            providers vary in which fields they send. #}
         <div class="srow"><span class="sk">Provider status</span>
-          <span class="sv{% if account.provider_status %} {{ 'ok' if account.provider_status|lower == 'active' else ('bad' if account.provider_status|lower in ('banned', 'disabled', 'expired') else 'warn') }}{% else %} faint{% endif %} tip-plain" data-tip="Provider status.&#10;The account status the provider itself reports, from its auth response - not whether ChannelBin's last sync succeeded (see Status above).">{{ account.provider_status or 'not reported' }}</span></div>
+          <span class="sv{% if account.provider_status %} {{ 'ok' if account.provider_status|lower == 'active' else ('bad' if account.provider_status|lower in provider_inactive_statuses else 'warn') }}{% else %} faint{% endif %} tip-plain" data-tip="Provider status.&#10;The account status the provider itself reports, from its auth response - not whether ChannelBin's last sync succeeded (see Status above).">{{ account.provider_status or 'not reported' }}</span></div>
         {{ m.stat_row('Trial account',
                       'Yes' if account.provider_is_trial else ('No' if account.provider_is_trial is not none else 'not reported'),
                       'warn' if account.provider_is_trial else ('faint' if account.provider_is_trial is none else none)) }}
@@ -652,6 +665,11 @@
               {% else %}{{ log.status }}
               {% endif %}
             </div>
+            {# Only when something changed: a line on every sync saying nothing moved is noise,
+               and an untracked diff (None) has nothing true to say. #}
+            {% set cats = log.category_changes() if log.status in ('SUCCESS', 'PARTIAL') else none %}
+            {% if cats and cats.added %}<div class="acct-act-sub">New categories: {{ category_list(cats.added, account.id) }}</div>{% endif %}
+            {% if cats and cats.removed %}<div class="acct-act-sub">Categories gone: {{ category_list(cats.removed, account.id) }}</div>{% endif %}
             <div class="acct-act-when">{{ log.started_at | local_time }}</div>
           </div>
         </div>

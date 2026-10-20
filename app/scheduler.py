@@ -1546,6 +1546,14 @@ OCCURRENCE_SAFETY_FACTOR = 1.5
 #: than the one this whole change removes.
 MAX_DEFERRAL_HORIZON_HOURS = 48
 
+#: How far ahead an IN_PROGRESS recording past its stop time still blocks. It is finishing
+#: (the stop job has just fired) or overrunning, and either way it occupies the present. A
+#: window of (now, now) is empty and blocks nothing, so a retry deferred past such a
+#: recording was aimed at "now" from inside the running retry job, which APScheduler then
+#: skipped as a second instance of the same job id and dropped (dev/docs/BUGS.md 2026-10-18
+#: 04:07 PM, found by the full-stack long run, dev/changelog/1224).
+OVERRUN_BLOCK = timedelta(minutes=5)
+
 
 def occurrence_seconds(estimate_seconds) -> float:
     """How much clear time a job needs, from its measured average runtime."""
@@ -1558,8 +1566,9 @@ def recording_windows(*, include_active: bool = True, lead_minutes: int = 0,
                       now: datetime = None) -> list:
     """[(start, end)] naive-UTC intervals a recording guard would refuse to start inside.
 
-    An IN_PROGRESS recording occupies from `now` to its stop time, floored at `now` so an
-    overrunning recording (stop time already past) still blocks the present. A SCHEDULED one
+    An IN_PROGRESS recording occupies from `now` to its stop time; one already past its stop
+    time (finishing, or overrunning) occupies the next OVERRUN_BLOCK, so it still blocks the
+    present. A SCHEDULED one
     occupies from `lead_minutes` BEFORE its start - the window the guard actually refuses in -
     through its stop time.
 
@@ -1578,7 +1587,8 @@ def recording_windows(*, include_active: bool = True, lead_minutes: int = 0,
 
     if include_active:
         for rec in Recording.query.filter_by(status=REC_STATUS_IN_PROGRESS).all():
-            windows.append((now, max(rec.stop_time or now, now)))
+            end = rec.stop_time or now
+            windows.append((now, end if end > now else now + OVERRUN_BLOCK))
 
     for rec in Recording.query.filter(
         Recording.status == REC_STATUS_SCHEDULED,

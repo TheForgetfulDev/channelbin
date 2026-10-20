@@ -57,7 +57,7 @@
   <div class="card-head-actions">
     {# Server-rendered as the settled state, per the rule that initial markup must
        equal "nothing wrong" - dashboard.js turns it green on open and amber on drop. #}
-    <span class="badge badge-scheduled" id="sse-status"
+    <span class="badge b-abort" id="sse-status"
           data-tip="Whether this page is receiving live activity updates.">Connecting</span>
     <button class="btn btn-sm" id="btn-customize"
             data-tip="Choose which sections appear on this page,&#10;and what order they appear in.">Customize</button>
@@ -172,11 +172,10 @@
             </span>
           </span>
           <span class="d-cell d-badge">
-            {#- The badge CLASS keys off the stored status (it is an internal key, not
-                text); the badge TEXT is the label every other surface uses for that
-                status, so this page stops saying CONCATENATING where the Recordings list
-                says JOINING (dev/changelog/961). -#}
-            <span class="badge badge-{{ rec.status | lower }}" id="badge-{{ rec.id }}">{{ rec_status_text.get(rec.id, rec.status) }}</span>
+            {#- Class and text both come from the Recordings list's own table, so this
+                page cannot say CONCATENATING where that list says JOINING
+                (dev/changelog/961), or color a status differently (dev/changelog/1212). -#}
+            {{ m.status_badge(rec.status | rec_status_badge, rec_status_text.get(rec.id, rec.status), id='badge-' ~ rec.id) }}
           </span>
 
           {#- Three stats per row, and WHICH three depends on the status. The full
@@ -295,7 +294,7 @@
             <span class="d-name">{{ health_check.name }}</span>
             <span class="d-meta">{{ 'On demand' if health_check.kind == 'on_demand' else ('Pre-check' if health_check.kind == 'pre_check' else 'Guide channels') }}</span>
           </span>
-          <span class="d-cell d-badge"><span class="badge badge-in_progress" id="hc-status-badge"><span class="pulse"></span>RUNNING</span></span>
+          <span class="d-cell d-badge">{# b-running: a health check running is not an alarm (dev/changelog/816). #}{{ m.status_badge('b-running', 'RUNNING', pulse=true, id='hc-status-badge') }}</span>
           {#- The estimate rides in the Elapsed cell rather than taking a seventh column:
               .dash-head and .drow share ONE grid rule across all three sections, so a new
               track would have to be filled by recordings and accounts too, and at <=960px

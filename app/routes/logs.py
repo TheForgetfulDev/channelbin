@@ -100,6 +100,10 @@ def logs_stream():
     path = _log_file_path()
 
     def generate():
+        # EventSource reports a stream open only once its first byte arrives, so say so at
+        # once rather than at the first log line or keepalive (dev/docs/BUGS.md 2026-06-30
+        # @ 09:00:55 AM, the dashboard's copy of this defect).
+        yield ': connected\n\n'
         if not path or not os.path.isfile(path):
             yield ': no log file configured\n\n'
             return

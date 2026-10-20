@@ -1755,7 +1755,7 @@
      is what Edit/Manage/Re-record is for, and the old Extended Search modal gated its
      own Replace button exactly the same way. */
   const REC_ACTION_REPLACE = {
-    act: 'rec-new', cls: 'btn btn-sm btn-warning', label: 'Replace',
+    act: 'rec-new', cls: 'btn btn-sm btn-danger', label: 'Replace',
     tip: 'Schedule this showing AND delete the recording you came here to replace.\nOne action, '
        + 'not two - the modal opens with the channel, the times and the title filled in, and '
        + 'saving it removes the original.',
@@ -3592,6 +3592,9 @@
     if (f.ex.includes(value)) return -1;
     return 0;
   }
+  // duplicated from static/js/filter-bar.js (toggle with an op) - the same off / is / is-not
+  // rule over this page's server-evaluated SearchState, which the shared bar's client-side
+  // row predicate cannot carry (dev/changelog/1207).
   function toggleValue(key, value, asEx) {
     const f = getF(key);
     const list = asEx ? f.ex : f.values;
@@ -4213,6 +4216,10 @@
      ONE builder for every chip. The mockup's round 2 had a second, near-copy
      renderer for typed words, which is why they read "Search mlb" while every
      other chip read "Category is X". */
+  // duplicated from static/js/filter-bar.js (renderChips) - same "<Field> is / is not
+  // <value>" wording and bad tint; this page groups a field's values into one chip and
+  // edits it in place, which the list pages' one-chip-per-value bar does not
+  // (dev/changelog/1207).
   function chipHtml({ label, neg, value, rm, tip, cls = '', edit = '' }) {
     const ev = edit ? ` data-edit="${esc(edit)}"` : '';
     return `<span class="cs-chip${neg ? ' neg' : ''}${cls ? ` ${cls}` : ''}" data-tip="${tipAttr(tip)}">

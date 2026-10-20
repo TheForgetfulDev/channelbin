@@ -55,6 +55,9 @@ docs/
 README.md
 tests/
 run_tests.sh
+# The simulator is a test provider with its own image; nothing in this one reads it
+# (DESIGN-simulator.md §9.3).
+sim/
 node_modules/
 package.json
 package-lock.json
