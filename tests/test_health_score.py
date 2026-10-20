@@ -3,9 +3,10 @@ channel object and a cfg dict, no DB, no I/O (blend_health_score's docstring: "P
 
 Covers the count-based decay blend, the duration-scaled observation_weight() formula, the
 proportional-loss + instability recording/test quality formula, the capture-quality
-correction formula, and the failover-share half of BUGS.md 2026-07-17 08:50: a group
-recording's final member is scored from only its own post-failover share, so a clean final
-window (0 downtime / 0 restarts) scores 100 no matter how bad the abandoned feeds were.
+correction formula, and (DB-backed, FinalMemberShareTests) the failover-share half of
+BUGS.md 2026-07-17 08:50: a group recording's final member is scored from only its own
+post-failover share, so a clean final window scores 100 no matter how bad the abandoned
+feeds were.
 
 Also see the dev/docs/BUGS.md entry for the health-score-fix work (2026-08-06) this file
 guards: blend_health_score used to weigh a new observation only by elapsed time since the
@@ -23,9 +24,13 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from app.health_score import (  # noqa: E402
     blend_health_score, observation_weight, score_recording_metrics_quality,
     score_capture_quality_correction, apply_failover_health_observation,
+    _final_member_success_quality,
 )
 from app import db  # noqa: E402
-from app.database import Channel, ChannelEvent, CHANNEL_FAILOVER_HEALTH_OBSERVATION  # noqa: E402
+from app.database import (  # noqa: E402
+    Channel, ChannelEvent, CHANNEL_FAILOVER_HEALTH_OBSERVATION, GROUP_FAILOVER,
+    RecordingEvent, add_recording_event,
+)
 from app.routes.channels import _build_channel_timeline  # noqa: E402
 from tests.support.app import make_test_app  # noqa: E402
 from tests.support import seed  # noqa: E402
@@ -179,21 +184,113 @@ class RecordingMetricsQualityTests(unittest.TestCase):
         ten_short, _ = score_recording_metrics_quality(300, 10, 3600, _CFG)
         self.assertLess(ten_short, one_long)
 
-    def test_failover_final_member_share_clean_window_scores_100(self):
-        """BUGS.md 2026-07-17 08:50: the final member's share is (cumulative - snapshot).
-        A clean final window scores 100 even when the whole recording's cumulative counts
-        (attributed to earlier, abandoned feeds) were catastrophic."""
-        cumulative = {'downtime': 400.0, 'restarts': 30}
-        snapshot = {'downtime': 400.0, 'restarts': 30}  # everything happened before failover
-        share_downtime = max(0.0, cumulative['downtime'] - snapshot['downtime'])
-        share_restarts = max(0, cumulative['restarts'] - snapshot['restarts'])
-        score, _ = score_recording_metrics_quality(share_downtime, share_restarts, 300, _CFG)
-        self.assertEqual(score, 100)
-
     def test_whole_recording_scored_when_no_failover(self):
         # sanity: same formula on cumulative (share == cumulative) still penalizes
         score, _ = score_recording_metrics_quality(280, 30, 300, _CFG)
         self.assertEqual(score, 0)
+
+
+class FinalMemberShareTests(unittest.TestCase):
+    """BUGS.md 2026-07-17 08:50: a group recording that failed over scores the member it
+    ENDED on from only that member's share - the cumulative counters minus the
+    `counters_at_failover` snapshot on the last GROUP_FAILOVER event, over the window from
+    that failover to the end of capture - never from the whole recording, which charges it
+    with the downtime of the feeds it escaped. Drives _final_member_success_quality itself
+    over seeded rows; the departing-member half is tests/test_stall_rate_failover.py."""
+
+    def setUp(self):
+        self.t = make_test_app()
+        self.ctx = self.t.app.app_context()
+        self.ctx.push()
+        acct = seed.make_account(name='Share Acct')
+        self.first = seed.make_channel(acct, name='First')
+        self.second = seed.make_channel(acct, name='Second')
+        self.third = seed.make_channel(acct, name='Third')
+        self.grp = seed.make_group(members=[self.first, self.second, self.third])
+        self.start = datetime.utcnow() - timedelta(hours=2)
+        db.session.commit()
+
+    def tearDown(self):
+        self.ctx.pop()
+        self.t.cleanup()
+
+    def _recording(self, downtime, restarts, group=True):
+        rec = seed.make_recording(
+            status='CONCATENATING', channel_id=self.third.id,
+            group_id=self.grp.id if group else None,
+            start_time=self.start, stop_time=self.start + timedelta(hours=2),
+            completed_at=self.start + timedelta(hours=2))
+        rec.total_downtime_seconds = downtime
+        rec.total_restart_count = restarts
+        db.session.commit()
+        return rec
+
+    def _failover(self, rec, at_minutes, downtime, restarts):
+        add_recording_event(rec.id, GROUP_FAILOVER, detail='seeded failover', extra={
+            'counters_at_failover': {
+                'total_stall_count': restarts, 'total_restart_count': restarts,
+                'consecutive_failures_peak': 0, 'total_downtime_seconds': downtime}})
+        db.session.flush()
+        ev = (RecordingEvent.query.filter_by(recording_id=rec.id, event_type=GROUP_FAILOVER)
+              .order_by(RecordingEvent.id.desc()).first())
+        ev.timestamp = self.start + timedelta(minutes=at_minutes)
+        db.session.commit()
+
+    def test_clean_final_window_scores_100_after_catastrophic_earlier_members(self):
+        rec = self._recording(downtime=400, restarts=30)
+        self._failover(rec, at_minutes=90, downtime=400, restarts=30)
+        whole, _ = score_recording_metrics_quality(400, 30, 7200, _CFG)
+        self.assertLess(whole, 100, 'the seed must make the whole recording look bad')
+
+        score, bd = _final_member_success_quality(rec, _CFG)
+        self.assertEqual(score, 100)
+        self.assertEqual(bd['member_share']['downtime_seconds'], 0)
+        self.assertEqual(bd['member_share']['restarts'], 0)
+
+    def test_share_is_cumulative_minus_the_snapshot_over_the_post_failover_window(self):
+        rec = self._recording(downtime=460, restarts=32)
+        self._failover(rec, at_minutes=60, downtime=400, restarts=30)
+
+        score, bd = _final_member_success_quality(rec, _CFG)
+        share = bd['member_share']
+        self.assertEqual(share['downtime_seconds'], 60)
+        self.assertEqual(share['restarts'], 2)
+        # From the failover to completed_at, not the recording's whole two hours.
+        self.assertEqual(share['duration_seconds'], 3600)
+        self.assertEqual(score, score_recording_metrics_quality(60, 2, 3600, _CFG)[0])
+
+    def test_the_last_failover_marks_the_final_members_window(self):
+        rec = self._recording(downtime=500, restarts=40)
+        self._failover(rec, at_minutes=30, downtime=100, restarts=10)
+        self._failover(rec, at_minutes=90, downtime=480, restarts=39)
+
+        _, bd = _final_member_success_quality(rec, _CFG)
+        share = bd['member_share']
+        self.assertEqual(share['downtime_seconds'], 20)
+        self.assertEqual(share['restarts'], 1)
+        self.assertEqual(share['duration_seconds'], 1800)
+
+    def test_counters_below_the_snapshot_never_go_negative(self):
+        rec = self._recording(downtime=100, restarts=5)
+        self._failover(rec, at_minutes=60, downtime=400, restarts=30)
+
+        score, bd = _final_member_success_quality(rec, _CFG)
+        self.assertEqual(bd['member_share']['downtime_seconds'], 0)
+        self.assertEqual(bd['member_share']['restarts'], 0)
+        self.assertEqual(score, 100)
+
+    def test_group_recording_that_never_failed_over_scores_the_whole_recording(self):
+        rec = self._recording(downtime=400, restarts=30)
+        score, bd = _final_member_success_quality(rec, _CFG)
+        self.assertNotIn('member_share', bd)
+        self.assertEqual(score, score_recording_metrics_quality(400, 30, 7200, _CFG)[0])
+
+    def test_single_channel_recording_scores_the_whole_recording(self):
+        rec = self._recording(downtime=400, restarts=30, group=False)
+        self._failover(rec, at_minutes=90, downtime=400, restarts=30)
+        score, bd = _final_member_success_quality(rec, _CFG)
+        self.assertNotIn('member_share', bd)
+        self.assertEqual(score, score_recording_metrics_quality(400, 30, 7200, _CFG)[0])
 
 
 class CaptureQualityCorrectionTests(unittest.TestCase):

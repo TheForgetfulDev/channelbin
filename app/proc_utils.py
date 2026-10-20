@@ -7,6 +7,7 @@ import signal
 import subprocess
 import time
 import uuid
+from typing import NamedTuple
 from urllib.parse import urlsplit
 
 from .config import resolve_ffmpeg_path
@@ -27,7 +28,7 @@ def is_hls_url(url: str) -> bool:
 
 
 def build_capture_cmd(cfg: dict, url: str, output_path: str, duration_seconds: int = 0,
-                      *, pace_realtime: bool = True) -> list:
+                      *, pace_realtime: bool = True, keep_video_track: bool = False) -> list:
     """ffmpeg "connect + stream-copy to file" command, shared by the recorder,
     channel tester, and manual URL test. Every http(s) input is identified with
     http.user_agent; continuous ones also get reconnect flags so all three behave the
@@ -38,12 +39,25 @@ def build_capture_cmd(cfg: dict, url: str, output_path: str, duration_seconds: i
     pace_realtime controls -re and defaults to True because that is the safe value -
     it is what every caller received before dev/changelog/437, so a caller that has
     not reasoned about pacing keeps today's behavior. Read the comment at the flag
-    before changing what a call site passes."""
+    before changing what a call site passes.
+
+    keep_video_track maps every video and audio stream explicitly, so a video track the
+    stream declares is kept even when no video arrives at connect. Under ffmpeg's default
+    selection such a track has no codec parameters and is dropped, which measured two ways
+    on 7.1 (dev/changelog/1210): the segment stays audio-only even after the video comes
+    back 40s later, and the concat demuxer, which matches streams by position, then writes
+    that segment's audio into the joined file's video track. A recording passes it; a test
+    capture does not, because there an audio-only output is how a missing picture is
+    reported. Skipped when extra_output_args carries its own -map, since ffmpeg adds maps
+    together rather than letting the last one win."""
     cmd = [resolve_ffmpeg_path(cfg['ffmpeg']['path'])]
     cmd += input_args(cfg, url, pace_realtime=pace_realtime)
     if duration_seconds and duration_seconds > 0:
         cmd += ['-t', str(duration_seconds)]
-    cmd += cfg['ffmpeg'].get('extra_output_args', [])
+    extra_output = cfg['ffmpeg'].get('extra_output_args', [])
+    if keep_video_track and '-map' not in extra_output:
+        cmd += ['-map', '0:v?', '-map', '0:a?']
+    cmd += extra_output
     cmd += ['-c', 'copy', '-y', output_path]
     return cmd
 
@@ -231,6 +245,32 @@ def report_read_timeout_state(cfg: dict, source: str) -> bool:
 STDERR_TAIL_MAX_BYTES = 4096
 STDERR_TAIL_MAX_LINES = 20
 
+# ffmpeg's version banner, printed at the top of every run that does not pass -hide_banner:
+# the version line, `built with`, `configuration:` (about 2 KB on this box's build) and one
+# line per library. A capture that dies at open writes a stderr shorter than the tail, so
+# without this the banner WAS the tail, and its first line - "ffmpeg version ... Copyright"
+# - is what a failure event quoted as the cause instead of the 403 below it (dev/docs/BUGS.md
+# 2026-10-18 02:49 PM, found by the full-stack runner's ban scenario, dev/changelog/1224).
+_BANNER_LINE = re.compile(r'^(?:(?:ffmpeg|ffprobe) version |built with |configuration: '
+                          r'|lib[a-z]+\s+\d+\.\s*\d+\.\s*\d+ /)')
+
+
+def _read_spool_end(path, max_bytes: int):
+    """The last max_bytes of a stderr spool as bytes (all of it when shorter); None when it
+    cannot be read. Seeks rather than reading the whole file, because a multi-hour
+    capture's spool is unbounded on disk."""
+    if not path:
+        return None
+    try:
+        with open(path, 'rb') as fh:
+            try:
+                fh.seek(-max_bytes, os.SEEK_END)
+            except OSError:
+                fh.seek(0)  # file shorter than max_bytes - seek would land before byte 0
+            return fh.read()
+    except OSError:
+        return None
+
 
 def read_stderr_tail(path, max_bytes: int = STDERR_TAIL_MAX_BYTES,
                      max_lines: int = STDERR_TAIL_MAX_LINES) -> str:
@@ -239,22 +279,17 @@ def read_stderr_tail(path, max_bytes: int = STDERR_TAIL_MAX_BYTES,
     Only ever called once the child has exited, so there is no partial-write race. Seeks
     rather than reading the whole file: a multi-hour capture's stderr is unbounded on disk
     even though what we keep is not. '\\r' is normalized to '\\n' so a progress-stat run
-    splits into lines instead of forming one; blank lines are dropped.
+    splits into lines instead of forming one; blank lines and ffmpeg's version banner are
+    dropped.
 
     Returns '' - not a placeholder string - when there is nothing to say, so callers can
     distinguish "ffmpeg said nothing" from "ffmpeg said something" and stay quiet accordingly.
     """
-    try:
-        with open(path, 'rb') as fh:
-            try:
-                fh.seek(-max_bytes, os.SEEK_END)
-            except OSError:
-                fh.seek(0)  # file shorter than max_bytes - seek would land before byte 0
-            raw = fh.read()
-    except OSError:
+    raw = _read_spool_end(path, max_bytes)
+    if raw is None:
         return ''
     lines = [ln.strip() for ln in raw.decode('utf-8', errors='replace').replace('\r', '\n').split('\n')]
-    lines = [ln for ln in lines if ln]
+    lines = [ln for ln in lines if ln and not _BANNER_LINE.match(ln)]
     if max_lines and len(lines) > max_lines:
         lines = lines[-max_lines:]
     return '\n'.join(lines)
@@ -312,6 +347,75 @@ def count_stderr_matches(path, needle: str = RECONNECT_MARKER,
     except OSError:
         return count, True
     return count, False
+
+
+# What ffmpeg's demuxer logs when it closes up a timestamp jump in an MPEG-TS input:
+# '[vist#0:0/h264 @ 0x..] timestamp discontinuity (stream id=256): -4004001, new offset=
+# 20534869' - the jump in microseconds, negative when the content went backwards. Matched
+# anywhere in the spool because ffmpeg's progress lines end in '\r', so the line often
+# follows a progress line on the same '\n' line.
+_RECONNECT_OR_JUMP_RE = re.compile(
+    rb'(Will reconnect at)|timestamp discontinuity \(stream id=\d+\): (-?\d+), new offset=')
+
+# A closed-up jump under this is not a replay: when ffmpeg closes a reconnect's jump on one
+# stream, the other stream's first packet lands a fraction of a second off and is closed up
+# too (0.12 to 0.20 s measured on the simulator's loops); a provider's connect burst is
+# seconds long (4 s simulated, 13 to 29 s on the real accounts).
+REPLAY_MIN_SECONDS = 1.0
+
+
+class ReconnectJumps(NamedTuple):
+    """What ffmpeg's timestamp repair says each in-process reconnect did to the file
+    (dev/changelog/1237).
+
+    A provider answers a new connection with its buffer, so after a reconnect the content
+    starts seconds before where it broke off and ffmpeg closes the backward jump: the file
+    then holds those seconds twice, back to back, on one continuous timeline. `replays` is
+    that jump per reconnect, in seconds. When the connection broke inside one stream's
+    frame, that stream's last old frame comes out of the demuxer after the other stream's
+    jump was already closed, and ffmpeg closes the jump a second time; the whole offset is
+    then twice the replay and the file's timeline is left with a hole as long as the
+    replay, with no content missing on either side of it. `holes` is that second closure
+    per reconnect it happened at. `complete` is False when the scan hit its byte cap.
+    """
+    replays: tuple
+    holes: tuple
+    complete: bool
+
+
+def read_reconnect_jumps(path, max_bytes: int = STDERR_SCAN_MAX_BYTES,
+                         min_seconds: float = REPLAY_MIN_SECONDS) -> ReconnectJumps:
+    """The ReconnectJumps a child's whole stderr spool records; empty if unreadable.
+
+    Reads the whole spool, bounded like count_stderr_matches() and for the same reason: it
+    runs between a dead ffmpeg and its relaunch. A jump logged before the first reconnect is
+    not attributed to one and is left out, as is a forward jump (content the provider
+    skipped, which is a different disclosure). Never raises.
+    """
+    if not path:
+        return ReconnectJumps((), (), True)
+    try:
+        with open(path, 'rb') as fh:
+            raw = fh.read(max_bytes)
+            complete = not fh.read(1)
+    except OSError:
+        return ReconnectJumps((), (), True)
+    replays, holes, in_block, first = [], [], False, True
+    for m in _RECONNECT_OR_JUMP_RE.finditer(raw):
+        if m.group(1):
+            in_block, first = True, True
+            continue
+        if not in_block:
+            continue
+        seconds = -int(m.group(2)) / 1_000_000
+        if seconds < min_seconds:
+            continue
+        if first:
+            replays.append(round(seconds, 3))
+            first = False
+        else:
+            holes.append(round(seconds, 3))
+    return ReconnectJumps(tuple(replays), tuple(holes), complete)
 
 
 # What `-loglevel level+info` makes ffmpeg write on every line: its own severity, after any
@@ -509,22 +613,89 @@ def read_capture_content_position(path, max_bytes: int = STDERR_TAIL_MAX_BYTES):
     None means "no opinion" and never "something is wrong": ffmpeg's banner occupies the
     first few KB of every spool, so an early read legitimately finds no position at all.
     """
-    if not path:
-        return None
-    try:
-        with open(path, 'rb') as fh:
-            try:
-                fh.seek(-max_bytes, os.SEEK_END)
-            except OSError:
-                fh.seek(0)  # file shorter than max_bytes - seek would land before byte 0
-            raw = fh.read()
-    except OSError:
+    raw = _read_spool_end(path, max_bytes)
+    if raw is None:
         return None
     matches = _TIME_RE.findall(raw.decode('utf-8', errors='replace'))
     if not matches:
         return None
     hours, minutes, seconds = matches[-1]
     return int(hours) * 3600 + int(minutes) * 60 + float(seconds)
+
+
+# ffmpeg 7.1's progress line opens with the VIDEO frame count, `frame=  748`, under a stream
+# copy too. The trailing whitespace is required for the same reason _TIME_RE is anchored: a
+# live spool's last line may be cut mid-number, and `frame=  74` read from `frame=  748`
+# would look like a counter going backwards. ffmpeg 6.1 printed no frame= under a copy and
+# 7.1 prints none for a stream with no video, so neither ever matches - the reader below
+# answers "no opinion" there rather than "no video" (dev/changelog/1209).
+_FRAME_RE = re.compile(r'frame=\s*(\d+)\s')
+
+
+def read_capture_frame_count(path, max_bytes: int = STDERR_TAIL_MAX_BYTES):
+    """Video frames ffmpeg has passed to the output so far, read from its LIVE stderr spool;
+    None when the spool cannot be read or carries no frame count.
+
+    The sibling of read_capture_content_position() and safe for the same reasons: it reads
+    a file the child is appending to, never a pipe, and touches nothing about the spawn."""
+    raw = _read_spool_end(path, max_bytes)
+    if raw is None:
+        return None
+    matches = _FRAME_RE.findall(raw.decode('utf-8', errors='replace'))
+    return int(matches[-1]) if matches else None
+
+
+class VideoArrivalMonitor:
+    """Feed (video frame count, file size) each poll via update(); says when video stopped
+    arriving while the capture kept receiving something else, and when it came back.
+
+    The case this exists for, measured on this box (dev/changelog/1209): a feed whose video
+    stops while its audio keeps flowing. ffmpeg writes its output in 256 KiB blocks, so
+    audio alone grows the file one block every 15-30s at 64-128 kbps - often enough that
+    GrowthMonitor never calls it a stall, so the capture runs on with no picture and
+    nothing says so.
+
+    'stopped' needs BOTH halves: the frame count unmoved for longer than `threshold`, and
+    the file grown since it stopped moving. Without the growth half, a feed that went
+    silent altogether would be reported as "video stopped" a moment before the stall it
+    really is. 'resumed' follows a 'stopped' as soon as the count moves again, and
+    stopped_seconds then says for how long, granular to one poll interval like
+    GrowthMonitor's. A None reading is a gap in the record and changes nothing.
+
+    Pure except for the clock, which is injectable."""
+
+    def __init__(self, threshold: float, clock=time.monotonic):
+        self.threshold = threshold
+        self._clock = clock
+        self.frames = None
+        self.stopped = False
+        self.stopped_seconds = 0.0
+        self._still_since = None
+        self._size_when_still = None
+
+    def update(self, frames, size):
+        """'stopped', 'resumed', or None when nothing changed."""
+        if frames is None:
+            return None
+        now = self._clock()
+        if self.frames is None or frames != self.frames:
+            self.frames = frames
+            still_since, self._still_since = self._still_since, None
+            if self.stopped:
+                self.stopped = False
+                self.stopped_seconds = now - still_since
+                return 'resumed'
+            return None
+        if self._still_since is None:
+            self._still_since = now
+            self._size_when_still = size
+            return None
+        self.stopped_seconds = now - self._still_since
+        if (not self.stopped and self.stopped_seconds > self.threshold
+                and size > self._size_when_still):
+            self.stopped = True
+            return 'stopped'
+        return None
 
 
 def delivery_ratio(content_seconds, wall_seconds):

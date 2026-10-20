@@ -313,16 +313,16 @@ class SavedDefaultTests(_Base):
     SCENARIO = 'saved_default'
 
     def test_the_default_filters_the_list_at_load(self):
-        self.assertEqual(self.obs['atBoot']['chips'], ['Status: COMPLETED \u2715'])
+        self.assertEqual(self.obs['atBoot']['chips'], ['Status is COMPLETED \u2715'])
         self.assertEqual(sorted(self.obs['atBoot']['visible']), sorted([_IDS['done'], _IDS['live']]))
 
     def test_a_value_nothing_carries_is_named_not_dropped_quietly(self):
-        self.assertIn('Channel: No such channel', self.obs['atBoot']['toast'])
+        self.assertIn('Channel is No such channel', self.obs['atBoot']['toast'])
         self.assertEqual(self.obs['atBoot']['chip'], 'Saved: Done only (edited) \u25be')
 
     def test_it_survives_the_swap_and_writes_nothing(self):
         self.assertEqual(self.obs['pageFetches'], 1)
-        self.assertEqual(self.obs['afterSwap']['chips'], ['Status: COMPLETED \u2715'])
+        self.assertEqual(self.obs['afterSwap']['chips'], ['Status is COMPLETED \u2715'])
         self.assertEqual(self.obs['afterSwap']['visible'], [_IDS['done']])
         self.assertEqual(self.obs['posts'], [])
 

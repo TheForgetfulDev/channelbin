@@ -12,18 +12,33 @@ still here for in-process HTTP (account sync, EPG fetch) - nothing does that und
 today, but it is the obvious next foot-gun.
 
 Both hooks raise rather than warn. A test that needs a stream, a playlist, or an EPG
-document fakes it: a local file, a seeded row, `FileXtreamClient`, or a patched client.
-Local-path child processes are unaffected - `test_screenshot_uniform` legitimately runs
-ffmpeg against synthesized local jpgs and must keep working.
+document fakes it: a local file, a seeded row, `FileXtreamClient`, a patched client, or the
+simulator (`sim/`). Local-path child processes are unaffected - `test_screenshot_uniform`
+legitimately runs ffmpeg against synthesized local jpgs and must keep working.
+
+One scoped exception (DESIGN-simulator.md §5, D2): a child's argv may carry a URL when every
+URL in it is http or https on a loopback address and port that a simulator started in this
+process has bound and not yet stopped (`sim.server.listening()`). The address must be the one
+the simulator bound - `localhost` or another 127.* address on the same port is refused - and a
+stopped simulator's URLs are refused like any other. Everything else still raises and is still
+recorded, `example.test` included. netguard reads the registry only when the simulator is
+already imported, so it never imports it.
 """
 import re
 import socket
+import sys
 import threading
 import subprocess
 import traceback
+from urllib.parse import urlsplit
 
 # Schemes that mean "go out on the wire". A bare local path never matches.
-_REMOTE_URL_RE = re.compile(r'\b(?:https?|rtmp|rtmps|rtsp|udp|tcp|tls|ftp|srt)://', re.I)
+_SCHEME = r'(?:https?|rtmp|rtmps|rtsp|udp|tcp|tls|ftp|srt)://'
+_REMOTE_URL_RE = re.compile(r'\b' + _SCHEME, re.I)
+# A whole URL, up to the first character no URL in an argv can hold - or the next scheme, so
+# one argv word carrying two URLs (ffmpeg's `concat:a|b`, a URL inside a query string) is two
+# matches and the embedded one is judged on its own host (dev/changelog/1233).
+_URL_RE = re.compile(r'\b' + _SCHEME + r'(?:(?!' + _SCHEME + r')[^\s\'"<>])*', re.I)
 
 _LOOPBACK_HOSTS = {'localhost', 'localhost.localdomain', '127.0.0.1', '::1', ''}
 
@@ -73,6 +88,38 @@ def _is_loopback(host) -> bool:
     return host in _LOOPBACK_HOSTS or host.startswith('127.')
 
 
+def _simulators() -> frozenset:
+    """(address, port) of every simulator in this process still serving - empty unless the
+    simulator package is already imported."""
+    server = sys.modules.get('sim.server')
+    return server.listening() if server is not None else frozenset()
+
+
+def _url_is_simulator(url: str, allowed: frozenset) -> bool:
+    try:
+        parts = urlsplit(url)
+        port = parts.port
+    except ValueError:
+        return False
+    scheme = parts.scheme.lower()
+    if scheme not in ('http', 'https'):
+        return False
+    host = parts.hostname or ''
+    if not host.startswith('127.'):
+        return False
+    if port is None:
+        port = 443 if scheme == 'https' else 80
+    return (host, port) in allowed
+
+
+def _argv_is_simulator_only(text: str) -> bool:
+    allowed = _simulators()
+    if not allowed:
+        return False
+    urls = [m.group(0) for m in _URL_RE.finditer(text)]
+    return bool(urls) and all(_url_is_simulator(u, allowed) for u in urls)
+
+
 def install():
     """Idempotent - `tests/__init__.py` may be imported more than once per process
     (discovery + an explicit module import), and double-wrapping would stack the
@@ -91,7 +138,7 @@ def install():
         for arg in argv:
             if isinstance(arg, (str, bytes)):
                 text = arg.decode('utf-8', 'replace') if isinstance(arg, bytes) else arg
-                if _REMOTE_URL_RE.search(text):
+                if _REMOTE_URL_RE.search(text) and not _argv_is_simulator_only(text):
                     raise NetworkAccessInTestError(
                         f'Test spawned a child process pointed at a network URL: {text!r}\n'
                         f'  (argv[0]={argv[0]!r})\n'

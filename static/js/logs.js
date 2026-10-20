@@ -276,9 +276,9 @@
     if (stream) stream.close();
     liveEnabled = true;
     $('btn-live').textContent = 'Stop';
-    setStatus('Connecting', 'badge-scheduled');
+    setStatus('Connecting', 'b-abort');
     stream = connectSSE('/api/logs/stream', {
-      onOpen: () => setStatus('Live', 'badge-in_progress', true),
+      onOpen: () => setStatus('Live', 'b-done', true),
       onMessage: (e) => {
         let rec = null;
         try {
@@ -293,7 +293,7 @@
       },
       // connectSSE reconnects on its own, so this is not a dead end and must not
       // be labelled as one.
-      onError: () => setStatus('Reconnecting', 'badge-aborted'),
+      onError: () => setStatus('Reconnecting', 'b-warn'),
     });
   }
 
@@ -301,7 +301,7 @@
     if (stream) { stream.close(); stream = null; }
     liveEnabled = false;
     $('btn-live').textContent = 'Start';
-    setStatus('Stopped', 'badge-scheduled');
+    setStatus('Stopped', 'b-abort');
   }
 
   $('btn-live').addEventListener('click', () => {
@@ -402,7 +402,7 @@
       footer: [
         {
           label: 'Reset',
-          class: 'btn btn-secondary',
+          class: 'btn',
           onClick: () => {
             activeLevels.clear();
             LEVELS.forEach((l) => activeLevels.add(l.id));

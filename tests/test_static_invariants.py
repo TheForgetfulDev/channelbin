@@ -59,6 +59,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 APP_DIR = os.path.join(ROOT, 'app')
 TESTS_DIR = os.path.join(ROOT, 'tests')
 TOOLS_DIR = os.path.join(ROOT, 'tools')
+SIM_DIR = os.path.join(ROOT, 'sim')
 CSS_DIR = os.path.join(ROOT, 'static', 'css')
 JS_DIR = os.path.join(ROOT, 'static', 'js')
 TPL_DIR = os.path.join(ROOT, 'templates')
@@ -604,8 +605,6 @@ class CssDeadClassTests(unittest.TestCase):
     # prefix -> where the name is assembled. NOT a "known failures" list to grow when this
     # test goes red: a genuinely dead class must be deleted, not allowlisted.
     DYNAMIC_PREFIXES = {
-        'badge-':            'dashboard.js `badge badge-${status.toLowerCase()}`; logs.js / '
-                             'notifications.js setStatus(); six templates `badge-{{ status|lower }}`',
         'sev-':              'nav-alerts.js `alert-severity sev-${a.severity}`; '
                              'notifications.js `sev-${escHtml(r.severity)}`',
         'alert-banner-sev-': 'nav-alerts.js `alert-banner alert-banner-sev-${a.severity}`',
@@ -716,7 +715,52 @@ class RetiredUiClassTests(unittest.TestCase):
         'guide-sheet-val': "use `.info-val` (style.css)",
         'guide-sheet-tags': "use `.info-tags` (style.css)",
         'guide-sheet-tag': "use `.info-tag` (style.css)",
+        # The legacy badge family and its two button variants (dev/changelog/1212). A raw
+        # status reaches a `.b-*` class through `rec_status_badge` / `test_status_badge`
+        # in Jinja and util.js::recStatusClass in JS.
+        **{f'badge-{n}': "use `.badge` plus a `.b-*` modifier (DESIGN.md 3.4, dev/changelog/1212)"
+           for n in ('scheduled', 'in_progress', 'concatenating', 'analyzing', 'converting',
+                     'completed', 'failed', 'aborted', 'paused', 'retrying', 'success',
+                     'danger', 'warning', 'waiting', 'running', 'queued', 'scheduled-job',
+                     'cancelled', 'automatic')},
+        'btn-warning': "use `.btn` (or `.btn-danger` when the action destroys data) - "
+                       "DESIGN.md 3.5 has no warning variant (dev/changelog/1212)",
+        'btn-secondary': "use `.btn` - DESIGN.md 3.5 (dev/changelog/1212)",
     }
+
+    # Two retirements the name scan above cannot express. `.table` shares its name with the
+    # element and with prose, so it is looked for only inside a class list; and the legacy
+    # badge family was mostly reached by gluing a status onto `badge-`, which no literal
+    # name matches (dev/changelog/1212).
+    _CLASS_ATTR_RE = re.compile(r'''class(?:Name)?\s*[=:]\s*(["'`])(.*?)\1''')
+    _BADGE_BUILDER_RE = re.compile(r'''\bbadge badge-|['"`]badge-['"`]\s*\+|badge-\{\{\s*[a-z_.]*status''')
+
+    def test_no_class_list_names_the_retired_table_class(self):
+        offenders = []
+        for path in list(_walk(TPL_DIR, '.html')) + list(_walk(JS_DIR, '.js')):
+            for lineno, line in enumerate(_read(path).splitlines(), 1):
+                for m in self._CLASS_ATTR_RE.finditer(line):
+                    if 'table' in m.group(2).split():
+                        offenders.append(f'{_rel(path)}:{lineno}')
+        for path, text in _css_sources():
+            if re.search(r'^\s*\.table\s*[,{.: ]', text, re.M):
+                offenders.append(f'{_rel(path)} defines .table again')
+        self.assertEqual(
+            offenders, [],
+            'A class list names `.table`, whose rule was deleted - use `table.tbl` in a '
+            '`.table-scroll` (DESIGN.md 3.2):\n  ' + '\n  '.join(offenders))
+
+    def test_no_badge_class_is_built_from_a_status(self):
+        offenders = []
+        for path in list(_walk(TPL_DIR, '.html')) + list(_walk(JS_DIR, '.js')):
+            for lineno, line in enumerate(_read(path).splitlines(), 1):
+                if self._BADGE_BUILDER_RE.search(line):
+                    offenders.append(f'{_rel(path)}:{lineno}')
+        self.assertEqual(
+            offenders, [],
+            'A badge class is assembled from `badge-` plus a runtime value - the retired '
+            'legacy family. Take the `.b-*` class from rec_status_badge / test_status_badge '
+            '(Jinja) or recStatusClass (util.js):\n  ' + '\n  '.join(offenders))
 
     def test_no_markup_references_a_retired_class(self):
         offenders = []
@@ -896,7 +940,9 @@ class SubprocessPipeTests(unittest.TestCase):
 
     def test_no_undrained_stderr_pipe(self):
         offenders = []
-        for path in _walk(APP_DIR, '.py'):
+        # The simulator spawns ffmpeg too, and a stalled pipe there would read as a stalled
+        # provider.
+        for path in [*_walk(APP_DIR, '.py'), *_walk(SIM_DIR, '.py')]:
             if os.path.basename(path) == 'proc_utils.py':
                 continue
             for i, line in enumerate(_read(path).splitlines(), 1):
@@ -1935,6 +1981,7 @@ class TaskFileReferenceTests(unittest.TestCase):
         (os.path.join(ROOT, 'templates'), ('.html',)),
         (os.path.join(ROOT, 'tests'), ('.py',)),
         (os.path.join(ROOT, 'tools'), ('.py',)),
+        (SIM_DIR, ('.py', '.yaml')),
     )
     _HARD_FILES = (os.path.join(ROOT, 'run.py'), os.path.join(ROOT, 'README.md'),
                    # Its whole subject is the dev-only documents shipped code cites, so it is
@@ -1979,6 +2026,67 @@ class TaskFileReferenceTests(unittest.TestCase):
             'genuinely has to name one:\n' + '\n'.join(sorted(offenders)))
 
 
+def _app_imports(source):
+    """(line, statement) for every way `source` reaches the application package: an import or
+    from-import of `app` or `app.*`, or `__import__` / `importlib.import_module` named with a
+    literal that is one."""
+    def is_app(name):
+        return name == 'app' or name.startswith('app.')
+
+    hits = []
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.Import):
+            hits += [(node.lineno, f'import {a.name}') for a in node.names if is_app(a.name)]
+        elif isinstance(node, ast.ImportFrom):
+            if node.level == 0 and node.module and is_app(node.module):
+                hits.append((node.lineno, f'from {node.module} import ...'))
+        elif isinstance(node, ast.Call):
+            fn = node.func
+            called = fn.id if isinstance(fn, ast.Name) else (
+                fn.attr if isinstance(fn, ast.Attribute) else '')
+            if called in ('__import__', 'import_module') and node.args:
+                arg = node.args[0]
+                if isinstance(arg, ast.Constant) and isinstance(arg.value, str) and is_app(arg.value):
+                    hits.append((node.lineno, f'{called}({arg.value!r})'))
+    return hits
+
+
+class SimDoesNotImportAppTests(unittest.TestCase):
+    """Nothing in `sim/` may import the application it tests (DESIGN-simulator.md §2,
+    dev/changelog/1217). An oracle that shares code with what it checks agrees with that code's
+    bugs: a simulator that built its playlists with the app's own writer, or read recordings
+    with the app's own probe, would pass every test the app fails."""
+
+    def test_sim_never_imports_app(self):
+        offenders = []
+        for path in _walk(SIM_DIR, '.py'):
+            offenders += [f'{_rel(path)}:{line}: {text}'
+                          for line, text in _app_imports(_read(path))]
+        self.assertEqual(offenders, [],
+                         'sim/ imports the application. The simulator writes and parses '
+                         'everything itself; move the logic into sim/ instead:\n'
+                         + '\n'.join(offenders))
+
+    def test_the_scan_sees_every_spelling(self):
+        planted = textwrap.dedent("""
+            import json
+            import app
+            import app.accounts as accounts
+            from app import db
+            from app.xtream_client import XtreamClient
+            import importlib
+            importlib.import_module('app.recorder')
+            __import__('app')
+            from .lineup import build_backend
+            import apple
+            from application import thing
+        """)
+        self.assertEqual([t for _, t in _app_imports(planted)], [
+            'import app', 'import app.accounts', 'from app import ...',
+            'from app.xtream_client import ...', "import_module('app.recorder')",
+            "__import__('app')"])
+
+
 class BareExceptTests(unittest.TestCase):
     """No broad `except Exception:` / bare `except:` whose entire body is `pass` - a silent
     swallow (CLAUDE.md Error handling). Narrow guards (`except OSError: pass`) are allowed."""
@@ -1988,7 +2096,7 @@ class BareExceptTests(unittest.TestCase):
 
     def test_no_broad_except_pass(self):
         offenders = []
-        for path in _walk(APP_DIR, '.py'):
+        for path in [*_walk(APP_DIR, '.py'), *_walk(SIM_DIR, '.py')]:
             lines = _read(path).splitlines()
             for i, line in enumerate(lines):
                 if not self._BROAD_RE.match(line):
@@ -3528,7 +3636,7 @@ _DOTTED_TOKEN_RE = re.compile(r'`([a-z_][a-z_0-9]*(?:\.[a-z_0-9]+)+)`')
 
 # The docs that ship to the public repo and are therefore read by someone who has none of the
 # dev tree. README.md is the one most likely to accrete a pointer into it.
-_SHIPPED_DOCS = ('README.md', 'CONTRIBUTING.md', 'docs/CONVENTIONS.md')
+_SHIPPED_DOCS = ('README.md', 'CONTRIBUTING.md', 'docs/CONVENTIONS.md', 'sim/README.md')
 
 
 class ShippedDocPointerTests(unittest.TestCase):
@@ -4588,6 +4696,28 @@ class CiWorkflowToolingTests(unittest.TestCase):
             self.text, r'\bnpm (ci|install)\b',
             'the workflow stopped installing node_modules, so every jsdom-backed '
             'client-side test now skips itself on the runner while CI still reports green')
+
+    def test_the_capture_tier_runs_on_a_schedule_and_never_per_push(self):
+        """DESIGN-simulator.md D9 (dev/changelog/1228): the capture tier is ten minutes of
+        real-time recording, so it runs nightly and on demand from this same workflow (one
+        copy of the ffmpeg pins) - and a condition dropped from its step would put it on
+        every push, while one dropped from the suite's step would run both tiers nightly."""
+        capture = self._step_containing('./run_tests.sh --capture')
+        self.assertIsNotNone(capture, 'the workflow no longer runs the capture tier anywhere')
+        cond = re.search(r'^\s*if:\s*(.+)$', capture, re.M)
+        self.assertTrue(cond, 'the capture tier step has no if:, so it runs on every push')
+        self.assertIn('schedule', cond.group(1))
+        self.assertNotIn('push', cond.group(1))
+        self.assertNotIn('pull_request', cond.group(1))
+        self.assertRegex(self.text, r'(?m)^  schedule:\s*\n\s*- cron:',
+                         'the capture tier step waits on a schedule the workflow no longer has')
+        steps = re.split(r'\n      - (?:name|uses):', self.text)
+        suite = next((s for s in steps if re.search(r'run: \./run_tests\.sh\s*$', s, re.M)),
+                     None)
+        self.assertIsNotNone(suite, 'the workflow no longer runs the default suite')
+        cond = re.search(r'^\s*if:\s*(.+)$', suite, re.M)
+        self.assertTrue(cond and 'schedule' not in cond.group(1),
+                        'the default suite step would run on the nightly schedule too')
 
     def test_the_runner_image_is_pinned(self):
         runners = re.findall(r'runs-on:\s*(\S+)', self.text)

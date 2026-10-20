@@ -316,10 +316,13 @@ def create_app(config_overrides=None, start_scheduler=True):
     # The recording-status vocabulary, for the browser's half of it (static/js/util.js's
     # recStatusLabel()). A global rather than a context value because it is a module
     # constant - no request state reaches it and no I/O builds it (dev/changelog/1083).
-    from .fmt_utils import REC_STATUS_LABELS, REC_WAITING_LABEL
+    from .fmt_utils import REC_STATUS_BADGES, REC_STATUS_LABELS, REC_WAITING_LABEL
     app.jinja_env.globals['rec_status_vocab'] = {
-        'labels': REC_STATUS_LABELS, 'waiting': REC_WAITING_LABEL,
+        'labels': REC_STATUS_LABELS, 'badges': REC_STATUS_BADGES, 'waiting': REC_WAITING_LABEL,
     }
+    # The statuses a sync stops on, so the account page marks exactly those red.
+    from .accounts import PROVIDER_INACTIVE_STATUSES
+    app.jinja_env.globals['provider_inactive_statuses'] = PROVIDER_INACTIVE_STATUSES
 
     @app.context_processor
     def inject_globals():
@@ -408,8 +411,14 @@ def _setup_logging(cfg, force=False):
     installed below, which is why exactly one is attached afterwards rather than two.
     """
     level = getattr(logging, cfg['logging'].get('level', 'INFO').upper(), logging.INFO)
-    log_file = cfg['logging'].get('file')
-    if log_file:
+    # basicConfig ignores `handlers` once the root logger has any, and a file handler opens
+    # its file when it is built - so build them only when they will be installed, or each
+    # call leaves an open file nothing ever closes (dev/docs/BUGS.md 2026-10-19 @ 04:33:57 PM).
+    installs = force or not logging.getLogger().handlers
+    log_file = cfg['logging'].get('file') if installs else None
+    if not installs:
+        handlers = []
+    elif log_file:
         os.makedirs(os.path.dirname(log_file), exist_ok=True)
         # Rotate to keep dvr.log bounded on long-running installs. max_bytes <= 0
         # opts out (plain FileHandler, grows forever) for anyone who rotates externally.

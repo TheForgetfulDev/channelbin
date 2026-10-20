@@ -1315,10 +1315,15 @@
         if (d.available && !d.available()) return;
         const vals = typeof d.values === 'function' ? d.values() : d.values;
         if (!vals.length) return;
+        // Each value carries the bar's own is / is-not control beside it, so "is not" can
+        // be set on a phone as well as seen there (dev/changelog/1207).
         h += `<div class="gm-sheet-sec">${escHtml(d.label)}</div>` +
-          vals.map(o => sheetRow(
-            `data-fpick="${escHtml(d.k)}" data-fpickval="${escHtml(o.v)}"`,
-            o.label, filterBar.has(d.k, o.v) ? '&#10003;' : '')).join('');
+          vals.map(o => {
+            const op = filterBar.opOf(d.k, o.v);
+            return `<div class="gm-fval">${sheetRow(
+              `data-fpick="${escHtml(d.k)}" data-fpickval="${escHtml(o.v)}"`,
+              o.label, op === 'is' ? '&#10003;' : '')}${filterBar.opHtml(d.k, o.v, o.label)}</div>`;
+          }).join('');
       });
       // What the desktop Columns popover is at this width. DESIGN.md 9.4's 2026-07-30
       // amendment allows a phone a field-VISIBILITY list but never the popover: a card
@@ -3229,6 +3234,15 @@
     if (fPick) {
       e.preventDefault();
       filterBar.toggle(fPick.dataset.fpick, fPick.dataset.fpickval);
+      afterFilterChange();
+      return;
+    }
+    // The is / is-not control beside a sheet row. Scoped to the sheet: the desktop
+    // popover's copy is the bar's own to handle.
+    const fOp = e.target.closest('.gm-fval [data-fop]');
+    if (fOp) {
+      e.preventDefault();
+      filterBar.toggle(fOp.dataset.fdim, fOp.dataset.fval, fOp.dataset.fop);
       afterFilterChange();
       return;
     }

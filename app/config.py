@@ -357,6 +357,16 @@ _DEFAULTS = {
         # first fires at +24.2 min and 3-in-10 not until +65.0 (dev/changelog/889).
         'stall_move_count': 3,
         'stall_move_window_minutes': 30,
+        # Video stopped while the audio flows: the capture is restarted, because a fresh
+        # connection is what brought the picture back on recording 76, and this shape grows
+        # the file often enough that the stall check above never fires on it
+        # (dev/changelog/1210). At most this many restarts for it on one member inside the
+        # rolling window; past that a group recording moves to another member as a
+        # demotion, and anything else keeps recording the sound until the window frees a
+        # restart again. Never a stall and never a failure - the audio is still arriving.
+        # 0 moves (or stays) at the first detection without restarting on the member.
+        'video_stop_restart_count': 3,
+        'video_stop_window_minutes': 30,
         # Provider placeholder detection: a segment holding more than this many seconds of
         # content per second of wall clock, which ALSO ended on a clean EOF (ffmpeg exited 0
         # by itself), is the provider's finite "channel offline" clip rather than the

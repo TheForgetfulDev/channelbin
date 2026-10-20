@@ -671,10 +671,9 @@
           <div class="latest-line">
             Latest test {{ latest_test.test_started_at | local_time }}
             {% if latest_test.id == in_progress_test_id %}
-            <span class="badge badge-in_progress">IN PROGRESS</span>
+            {{ m.status_badge('b-running', 'IN PROGRESS') }}
             {% else %}
-            <span class="badge badge-{{ latest_test.status | lower }}"
-                  {% if latest_test.error_detail %}title="{{ latest_test.status }}: {{ latest_test.error_detail }}"{% endif %}>{{ latest_test.status }}</span>
+            {{ m.status_badge(latest_test | test_status_badge, latest_test | test_status_label, tip=latest_test.error_detail) }}
             {% endif %}
           </div>
           {% if latest_test.status == 'COMPLETED' %}
@@ -1143,7 +1142,7 @@
               <td data-label="Recording"><a href="{{ url_for('recordings.recording_detail', recording_id=r.id) }}">{{ r.name }}</a></td>
               {#- Label, not the stored enum: this table said ABORTED where the Recordings
                   list said CANCELLED for the same row (dev/changelog/961). -#}
-              <td data-label="Status"><span class="badge badge-{{ r.status | lower }}">{{ r.status | rec_status_label }}</span></td>
+              <td data-label="Status">{{ m.status_badge(r.status | rec_status_badge, r.status | rec_status_label) }}</td>
               <td data-label="Stalls">{{ r.total_stall_count or 0 }}</td>
               <td data-label="Restarts">{{ r.total_restart_count or 0 }}</td>
               <td data-label="Score" class="text-muted small">{{ r.health_quality_score }}</td>
@@ -1209,10 +1208,9 @@
               <td data-label="Tested" class="text-muted small">{{ t.test_started_at | local_time }}</td>
               <td data-label="Status">
                 {% if t.id == in_progress_test_id %}
-                <span class="badge badge-in_progress">IN PROGRESS</span>
+                {{ m.status_badge('b-running', 'IN PROGRESS') }}
                 {% else %}
-                <span class="badge badge-{{ t.status | lower }}"
-                      {% if t.error_detail %}title="{{ t.status }}: {{ t.error_detail }}"{% endif %}>{{ t.status }}</span>
+                {{ m.status_badge(t | test_status_badge, t | test_status_label, tip=t.error_detail) }}
                 {% endif %}
                 {% if t.id in excluded_test_ids %}{{ m.not_counted_badge(what='This health check') }}{% endif %}
               </td>

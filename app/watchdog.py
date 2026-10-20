@@ -17,7 +17,8 @@ from .db_utils import retry_on_locked
 from .account_links import (is_credential_refusal, is_resolution_failure,
                             note_refusal_for_holder, roll_host_for_channel)
 from .probe import parse_ffprobe
-from .proc_utils import (DeliveryRateMonitor, GrowthMonitor, read_capture_content_position,
+from .proc_utils import (DeliveryRateMonitor, GrowthMonitor, VideoArrivalMonitor,
+                         read_capture_content_position, read_capture_frame_count,
                          terminate_or_kill, wait_for_file_data)
 
 log = logging.getLogger(__name__)
@@ -60,6 +61,26 @@ def stalls_within_window(times, now_mono: float, window_seconds: float) -> list:
     and 3-in-10 not until +65.0.
     """
     return [t for t in times if t >= now_mono - window_seconds]
+
+
+def decide_video_stop(restart_times, now_mono: float, window_seconds: float,
+                      budget: int, is_group: bool):
+    """What to do about video that stopped while the audio flows: (action, restart_times,
+    retry_at), action being 'restart', 'move' or 'stay' (dev/changelog/1210).
+
+    A restart while the member has budget left inside the rolling window - the restart is
+    then counted in the returned list. Past the budget a group recording moves; anything
+    else stays and keeps the sound. retry_at is when the oldest restart leaves the window,
+    so a stay (or a move nobody could take) can ask again then; None when no restart will
+    ever be allowed. A rate rather than a total for the stall-rate trigger's reason: a
+    picture that drops once an hour across a long recording should be restarted every time.
+    """
+    recent = stalls_within_window(restart_times, now_mono, window_seconds)
+    if len(recent) < budget:
+        return 'restart', recent + [now_mono], None
+    # +1: stalls_within_window still counts a time exactly window_seconds old.
+    retry_at = recent[len(recent) - budget] + window_seconds + 1 if budget > 0 else None
+    return ('move' if is_group else 'stay'), recent, retry_at
 
 
 class PlaceholderVerdict(NamedTuple):
@@ -247,6 +268,19 @@ class WatchdogThread(threading.Thread):
             # meaning).
             member_fast_delivery_strikes = 0
             member_fast_delivery_channel_id = None
+            # Restarts for video that stopped while the audio flowed (dev/changelog/1210),
+            # member-keyed like the two above, and a third list rather than a share of
+            # either: that feed has neither stalled nor raced ahead.
+            member_video_stop_times = []
+            member_video_stop_channel_id = None
+            # Until this recording has carried video at all, a frame count standing at 0 is
+            # a stream that declares a video track and never sends one - a radio mount,
+            # under keep_video_track - not a picture that stopped.
+            seen_video = self._recording_has_had_video()
+            # (segment number, monotonic time the picture was last seen) once a segment has
+            # been closed or left for a video stop, so a later segment can say the picture
+            # came back and after how long.
+            video_lost = None
 
             log.info('Watchdog started for recording %d', self.recording_id)
 
@@ -284,6 +318,13 @@ class WatchdogThread(threading.Thread):
                 # lands in a window that is not yet full, so it can never be measured on its
                 # own (dev/changelog/964).
                 delivery = DeliveryRateMonitor(fast_delivery_window)
+                # Per segment for the same reason: a new ffmpeg counts frames from zero.
+                video = VideoArrivalMonitor(stall_timeout)
+                # Set when this segment is to be closed and restarted for a video stop - a
+                # fifth way for a segment to end. video_retry_at is when a capture left
+                # running on its audio, out of restarts, asks again.
+                video_restart = False
+                video_retry_at = None
                 # Set by the poll loop below when this segment's feed has been delivering
                 # faster than real time across a full window. A fourth way for a segment to
                 # end, alongside a stall, a self-exit and a dead restart.
@@ -393,6 +434,78 @@ class WatchdogThread(threading.Thread):
                             fast_delivery = FastDeliveryVerdict(
                                 observed, fast_delivery_window)
 
+                    # Is VIDEO still arriving? A feed whose video stops while its audio
+                    # flows grows the file one 256 KiB block at a time, often enough that
+                    # the growth check above never calls it a stall, so without this the
+                    # capture records sound with no picture and nothing says so
+                    # (dev/changelog/1209). A fresh connection is what brought the picture
+                    # back on recording 76, so the capture is restarted for it, within a
+                    # per-member budget (dev/changelog/1210). Only while ffmpeg is alive: a
+                    # dead process stops counting frames too, and the stall handling below
+                    # owns that case.
+                    proc = self.state.process
+                    if proc is not None and proc.poll() is None and not video_restart:
+                        frames = read_capture_frame_count(self.state.stderr_path)
+                        if frames:
+                            seen_video = True
+                        change = video.update(frames, current_size) if seen_video else None
+                        now_mono = time.monotonic()
+                        # The same segment's count moving again, or any frame at all on a
+                        # later one: a new ffmpeg counts from zero.
+                        if video_lost is not None and (
+                                change == 'resumed'
+                                or (frames and video_lost[0] != seg_num)):
+                            self._log_video_resumed(seg_num, frames, video_lost,
+                                                    now_mono - video_lost[1])
+                            video_lost = None
+                            video_retry_at = None
+                        if change == 'stopped' or (
+                                video.stopped and video_retry_at is not None
+                                and now_mono >= video_retry_at):
+                            if video_lost is None:
+                                video_lost = (seg_num, now_mono - video.stopped_seconds)
+                            rec_now = db.session.get(Recording, self.recording_id,
+                                                     populate_existing=True)
+                            if rec_now.channel_id != member_video_stop_channel_id:
+                                member_video_stop_times = []
+                                member_video_stop_channel_id = rec_now.channel_id
+                            budget = cfg['watchdog']['video_stop_restart_count']
+                            window_seconds = cfg['watchdog']['video_stop_window_minutes'] * 60
+                            action, member_video_stop_times, video_retry_at = \
+                                decide_video_stop(member_video_stop_times, now_mono,
+                                                  window_seconds, budget,
+                                                  rec_now.group_id is not None)
+                            if action == 'move':
+                                from .recorder import (failover_group_member,
+                                                       _launch_segment, _close_active_segment)
+                                why = (f'video stopped while the audio kept flowing, '
+                                       f'{len(member_video_stop_times)} restart(s) for it '
+                                       f'already in {window_seconds // 60:.0f} minutes')
+                                if failover_group_member(self.app, self.recording_id, why,
+                                                         demote=True):
+                                    self._log_video_stopped(
+                                        seg_num, video, 'move', member_video_stop_times,
+                                        budget, window_seconds, None, True)
+                                    terminate_or_kill(self.state.process)
+                                    _close_active_segment(self.app, self.recording_id,
+                                                          exit_reason='VIDEO_STOPPED')
+                                    member_video_stop_times = []
+                                    member_video_stop_channel_id = None
+                                    member_stall_times = []
+                                    member_stall_channel_id = None
+                                    member_fast_delivery_strikes = 0
+                                    member_fast_delivery_channel_id = None
+                                    early_fail_times.clear()
+                                    _launch_segment(self.app, self.recording_id, seg_num + 1)
+                                    break
+                                action = 'stay'
+                            self._log_video_stopped(
+                                seg_num, video, action, member_video_stop_times, budget,
+                                window_seconds, video_retry_at, rec_now.group_id is not None)
+                            video_restart = action == 'restart'
+                            if video_restart:
+                                video_retry_at = None
+
                     # wait_for_file_data already proved this segment produced nothing, and
                     # GrowthMonitor started from scratch here needs another stall_timeout to
                     # reach the identical conclusion - the ~11s that put 17 of the 24
@@ -439,10 +552,22 @@ class WatchdogThread(threading.Thread):
                     # is over-delivery that ends in a clean EOF.
                     if fast_delivery is not None and (proc_exited or restart_dead):
                         fast_delivery = None
+                    # Likewise a video-stop restart yields to any other shape on the same
+                    # tick: each of them describes the segment more completely, and every one
+                    # of them restarts it anyway.
+                    if video_restart and (proc_exited or restart_dead or fast_delivery is not None
+                                          or stalled_for > stall_timeout):
+                        video_restart = False
 
                     if (stalled_for > stall_timeout or proc_exited or restart_dead
-                            or fast_delivery is not None):
-                        if fast_delivery is not None:
+                            or fast_delivery is not None or video_restart):
+                        if video_restart:
+                            log.warning(
+                                'Recording %d: seg %d video frame count stood at %s for %.0fs '
+                                'while the file grew - restarting for the picture',
+                                self.recording_id, seg_num, video.frames,
+                                video.stopped_seconds)
+                        elif fast_delivery is not None:
                             log.warning(
                                 'Recording %d: seg %d delivered %.2fx real time across %.0fs '
                                 '- the feed is not advancing, stopping this capture',
@@ -484,7 +609,7 @@ class WatchdogThread(threading.Thread):
                         # above; a positive one means ffmpeg had already died on its own
                         # before we ever declared the stall (dev/changelog/430).
                         from .recorder import collect_segment_diagnostics, record_segment_diagnostics
-                        exit_code, stderr_tail, reconnects, spool_missing = \
+                        exit_code, stderr_tail, reconnects, spool_missing, jumps = \
                             collect_segment_diagnostics(self.recording_id)
 
                         # Was this the provider's "channel offline" clip rather than the
@@ -508,7 +633,7 @@ class WatchdogThread(threading.Thread):
                         # reaches this - but "the feed is dead" is the one thing this
                         # signature proves false, and the streak it would arm ends in a
                         # dead-stream abort naming the wrong cause (dev/changelog/964).
-                        is_early_failure = fast_delivery is None and (
+                        is_early_failure = fast_delivery is None and not video_restart and (
                             placeholder is not None or (
                                 seg_duration <= early_fail_window
                                 and monitor.last_size < early_fail_min_bytes
@@ -537,7 +662,11 @@ class WatchdogThread(threading.Thread):
                         # code beside it is ffmpeg's own answer, which "produced no data"
                         # cannot give. Every state is named - a trailing else that rendered
                         # one of them would swallow the next one added.
-                        if fast_delivery is not None:
+                        if video_restart:
+                            exit_reason = 'VIDEO_STOPPED'
+                            stall_reason = 'video_stopped'
+                            stall_detail = None  # CAPTURE_VIDEO_STOPPED already said so
+                        elif fast_delivery is not None:
                             exit_reason = 'FAST_DELIVERY_KILLED'
                             stall_reason = 'fast_delivery'
                             stall_detail = None  # this shape writes its own event, below
@@ -566,7 +695,15 @@ class WatchdogThread(threading.Thread):
                             seg.bytes_recorded = monitor.last_size
                             record_segment_diagnostics(self.recording_id, seg,
                                                        exit_code, stderr_tail, reconnects,
-                                                       spool_missing)
+                                                       spool_missing, jumps)
+                            if video_restart:
+                                # Not a stall, so none of the stall bookkeeping below: the
+                                # file never stopped growing, and a consecutive failure here
+                                # would let max_consecutive_failures fail a recording that
+                                # still had its sound (dev/changelog/1210). The restart
+                                # itself is counted below like any other.
+                                db.session.commit()
+                                return db.session.get(Recording, self.recording_id)
                             if fast_delivery is not None:
                                 # Everything the stall bookkeeping below does is skipped on
                                 # this path, deliberately. This feed never stopped writing -
@@ -688,7 +825,7 @@ class WatchdogThread(threading.Thread):
                                 'ratio': round(fast_delivery.ratio, 2),
                                 'window_seconds': round(fast_delivery.window_seconds, 1),
                             })
-                        else:
+                        elif not video_restart:
                             ev.publish(self.recording_id, STALL_DETECTED, {
                                 'segment_number': seg_num,
                                 'bytes_at_stall': monitor.last_size,
@@ -869,12 +1006,15 @@ class WatchdogThread(threading.Thread):
                             member_stall_times = []
                             member_stall_channel_id = rec.channel_id
                         now_mono = time.monotonic()
-                        if fast_delivery is None:
+                        # A video-stop restart is not a stall either, and has its own
+                        # budget and its own move.
+                        is_stall = fast_delivery is None and not video_restart
+                        if is_stall:
                             member_stall_times.append(now_mono)
                         member_stall_times = stalls_within_window(
                             member_stall_times, now_mono,
                             thresholds.stall_move_window_minutes * 60)
-                        if (fast_delivery is None
+                        if (is_stall
                                 and rec.group_id is not None
                                 and thresholds.stall_move_count > 0
                                 and len(member_stall_times) >= thresholds.stall_move_count):
@@ -1242,6 +1382,94 @@ class WatchdogThread(threading.Thread):
             log.exception('Recording %d: format-pin check failed on segment %d',
                           self.recording_id, seg_num)
 
+    def _recording_has_had_video(self) -> bool:
+        """Whether an earlier segment of this recording probed with a picture - so a
+        watchdog started for a recording already under way (a service restart) knows video
+        is expected before the first frame of its own segment arrives."""
+        from .database import RecordingSegment
+        return RecordingSegment.query.filter(
+            RecordingSegment.recording_id == self.recording_id,
+            RecordingSegment.probe_resolution.isnot(None),
+        ).first() is not None
+
+    def _log_video_stopped(self, seg_num: int, video, action: str, restart_times,
+                           budget: int, window_seconds: float, retry_at, is_group: bool):
+        """Write the CAPTURE_VIDEO_STOPPED event for the decision decide_video_stop()
+        reached. Worded as what was measured - the frame count and the file - and never as
+        a diagnosis of the picture, which the app does not look at."""
+        seconds = round(video.stopped_seconds, 1)
+        minutes = window_seconds / 60
+        detail = (f'Video stopped arriving on segment {seg_num}: ffmpeg\'s video frame count '
+                  f'has stood at {video.frames} for {seconds:.0f}s while the file kept '
+                  f'growing, so the capture is still receiving something - most likely '
+                  f'audio with no picture.')
+        if action == 'restart':
+            detail += (f' Restarting the capture to get the picture back (restart '
+                       f'{len(restart_times)} of {budget} allowed on this channel in '
+                       f'{minutes:.0f} minutes).')
+        elif action == 'move':
+            detail += (f' It had already been restarted {len(restart_times)} times for this '
+                       f'in {minutes:.0f} minutes, so the recording moved to another member '
+                       f'of its group.')
+        elif action == 'stay':
+            where = ('no other member of its group could take it' if is_group
+                     else 'it records from a single channel')
+            if retry_at is None:
+                detail += (f' Restarting for this is turned off '
+                           f'(watchdog.video_stop_restart_count is 0) and {where}, so the '
+                           f'capture is left running to keep the sound.')
+            else:
+                wait = max(retry_at - time.monotonic(), 0) / 60
+                detail += (f' It has already been restarted {len(restart_times)} times for '
+                           f'this in {minutes:.0f} minutes and {where}, so the capture is left '
+                           f'running to keep the sound. It will be restarted again in about '
+                           f'{max(wait, 1):.0f} minutes if the picture has not come back.')
+        else:
+            log.error('Recording %d: unknown video-stop action %r on segment %d',
+                      self.recording_id, action, seg_num)
+            return
+        from .database import CAPTURE_VIDEO_STOPPED
+        self._write_video_event(seg_num, CAPTURE_VIDEO_STOPPED, detail,
+                                {'frames': video.frames, 'seconds': seconds,
+                                 'action': action, 'restarts': len(restart_times)})
+
+    def _log_video_resumed(self, seg_num: int, frames, video_lost, seconds: float):
+        """Write CAPTURE_VIDEO_RESUMED: the frame count moved again on the segment where the
+        picture stopped, or the restart or move that followed it brought frames."""
+        lost_seg = video_lost[0]
+        seconds = round(seconds, 1)
+        if lost_seg == seg_num:
+            detail = (f'Video resumed on segment {seg_num} after about {seconds:.0f}s with no '
+                      f'new frames.')
+        else:
+            detail = (f'Video is back on segment {seg_num}, about {seconds:.0f}s after it '
+                      f'stopped on segment {lost_seg}.')
+        from .database import CAPTURE_VIDEO_RESUMED
+        self._write_video_event(seg_num, CAPTURE_VIDEO_RESUMED, detail,
+                                {'frames': frames, 'seconds': seconds})
+
+    def _write_video_event(self, seg_num: int, event_type: str, detail: str, extra: dict):
+        """Best-effort diagnostics, like _check_format_pin: a failure to write the event
+        must never touch the capture it describes, so it logs and returns."""
+        from . import db
+
+        try:
+            @retry_on_locked()
+            def _log_video_event_and_commit():
+                add_recording_event(self.recording_id, event_type, detail=detail,
+                                    segment_number=seg_num, extra=extra)
+                db.session.commit()
+
+            _log_video_event_and_commit()
+            log.warning('Recording %d: %s', self.recording_id, detail)
+        except Exception:
+            log.exception('Recording %d: could not record a video-arrival change on '
+                          'segment %d', self.recording_id, seg_num)
+            # This thread keeps one session for its whole run, and a failed commit leaves
+            # it refusing every later query until rolled back - which would turn a lost
+            # diagnostic into a lost watchdog.
+            db.session.rollback()
+
     def _publish_snapshot(self, cfg):
         """Publish a STATS_SNAPSHOT SSE event with current recording metrics."""
         from . import db
@@ -1319,8 +1547,8 @@ class WatchdogThread(threading.Thread):
                         self.recording_id, event_type)
             return False
 
-        exit_code, stderr_tail, reconnects, spool_missing = getattr(
-            self, '_give_up_diagnostics', (None, '', (0, True), False))
+        exit_code, stderr_tail, reconnects, spool_missing, jumps = getattr(
+            self, '_give_up_diagnostics', (None, '', (0, True), False, None))
         if cause is None:
             cause = _first_line(stderr_tail)
         # Fold the reason ffmpeg actually gave into the terminal event's detail and the
@@ -1358,7 +1586,7 @@ class WatchdogThread(threading.Thread):
             recording_id=self.recording_id, ended_at=None
         ).order_by(RecordingSegment.segment_number.desc()).first()
         record_segment_diagnostics(self.recording_id, open_seg, exit_code, stderr_tail,
-                                   reconnects, spool_missing)
+                                   reconnects, spool_missing, jumps)
         db.session.commit()
         # `status` on every frame that moves a row: dashboard.js relabels from it and
         # ignores a frame without one (dev/changelog/1023).

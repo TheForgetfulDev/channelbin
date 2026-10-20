@@ -125,7 +125,7 @@
         <div class="card-head">
           <h2>${escHtml(s.label)}</h2>
           <div class="card-head-actions">
-            <span class="badge ${s.broken ? 'badge-danger' : (s.enabled ? 'badge-success' : 'badge-scheduled')}">${s.broken ? 'Broken' : (s.enabled ? 'Enabled' : 'Disabled')}</span>
+            <span class="badge ${s.broken ? 'b-fail' : (s.enabled ? 'b-done' : 'b-abort')}">${s.broken ? 'Broken' : (s.enabled ? 'Enabled' : 'Disabled')}</span>
             <button class="svc-x" type="button" data-svc-remove="${escHtml(key)}"
               data-tip="Remove ${escHtml(s.label)}&#10;Clears its stored URL and drops it from every routing row. Disabling it instead keeps the URL.">Remove</button>
           </div>

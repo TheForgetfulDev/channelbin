@@ -162,7 +162,7 @@ class CaptureCompleteTests(_Base):
 
     def test_the_row_relabels_to_joining(self):
         self.assertEqual(self.row('live')['text'], 'JOINING')
-        self.assertEqual(self.row('live')['cls'], 'badge badge-concatenating')
+        self.assertEqual(self.row('live')['cls'], 'badge b-concat')
         self.assertEqual(self.obs['refreshes'], 1)
         self.assertEqual(self.obs['reloads'], 0)
 
@@ -181,7 +181,7 @@ class DeadStreamTests(_Base):
 
     def test_the_row_relabels_to_failed(self):
         self.assertEqual(self.row('live')['text'], 'FAILED')
-        self.assertEqual(self.row('live')['cls'], 'badge badge-failed')
+        self.assertEqual(self.row('live')['cls'], 'badge b-fail')
         self.assertEqual(self.obs['refreshes'], 1)
         self.assertEqual(self.obs['reloads'], 0)
 

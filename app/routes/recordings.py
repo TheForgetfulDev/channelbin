@@ -942,7 +942,8 @@ def _row_times(rec, now, tz):
     return day, rel
 
 
-def _index_row(rec, now, tz, thumb_ids, live_seg_bytes=0, file_formats=None):
+def _index_row(rec, now, tz, thumb_ids, live_seg_bytes=0, file_formats=None,
+               thumb_enabled=True):
     """file_formats is channel_groups.file_format_stretches() over the recording's format
     survey, when the caller has it in hand - the detail page does, from events it loaded
     anyway. Without it the format clause falls back on what each segment opened at, which
@@ -1125,11 +1126,15 @@ def _index_row(rec, now, tz, thumb_ids, live_seg_bytes=0, file_formats=None):
                 'acct_color': rec.channel.account.color if rec.channel.account else None}
 
     acct = rec.channel.account if rec.channel else None
-    live = rec.status in (REC_STATUS_IN_PROGRESS, REC_STATUS_PAUSED, REC_STATUS_RETRYING)
     # A SCHEDULED recording has never captured a frame, so a file at its thumbnail
     # path can only be a leftover from a deleted recording whose id SQLite reused -
     # showing it would present another recording's screenshot as this one's.
-    has_thumb = live or (rec.status != REC_STATUS_SCHEDULED and rec.id in thumb_ids)
+    # The rest mirrors what live_thumbnail() serves, so a row never links an image the
+    # route answers 404: nothing while the feature is off, a fresh grab only while
+    # IN_PROGRESS, and otherwise a persisted image (dev/docs/BUGS.md 2026-10-19 07:28 AM).
+    has_thumb = thumb_enabled and (
+        rec.status == REC_STATUS_IN_PROGRESS
+        or (rec.status != REC_STATUS_SCHEDULED and rec.id in thumb_ids))
     progress_pct = None
     if rec.status == REC_STATUS_IN_PROGRESS:
         total = (rec.stop_time - rec.start_time).total_seconds()
@@ -1202,8 +1207,10 @@ def index():
     # persisted images: one directory listing PER FOLDER, never a per-row stat. Either
     # folder alone answers the question a row asks - "is there an image to show" - because
     # finished_image_path() falls back to whichever one exists (dev/changelog/1060).
+    cfg = load_config()
+    thumb_enabled = cfg.get('recording', {}).get('live_thumbnail', {}).get('enabled', True)
     thumb_ids = set()
-    for folder in finished_image_dirs(load_config()):
+    for folder in finished_image_dirs(cfg):
         try:
             for fn in os.listdir(folder):
                 stem, ext = os.path.splitext(fn)
@@ -1214,7 +1221,7 @@ def index():
 
     now = datetime.utcnow()
     tz = get_display_tz()
-    rows = [_index_row(r, now, tz, thumb_ids) for r in recordings]
+    rows = [_index_row(r, now, tz, thumb_ids, thumb_enabled=thumb_enabled) for r in recordings]
     sections = [
         ('In Progress', 'live', [r for r in rows if r['section'] == 'live']),
         ('Scheduled', 'sched', [r for r in rows if r['section'] == 'sched']),
@@ -1439,9 +1446,13 @@ def recording_detail(recording_id):
     # serving route uses, so the page cannot claim an image the route then 404s.
     # SCHEDULED excluded for the same reason as the list row's has_thumb: a file
     # at a not-yet-started recording's path belongs to a deleted, id-reused row.
+    # And none at all while the feature is off: the route answers 404 then, persisted
+    # image or not.
+    thumb_enabled = thumb_cfg.get('enabled', True)
     shot_path = (finished_image_path(rec.id, cfg)
-                 if rec.status not in (REC_STATUS_SCHEDULED, REC_STATUS_IN_PROGRESS) else None)
-    has_shot = rec.status == REC_STATUS_IN_PROGRESS or shot_path is not None
+                 if thumb_enabled
+                 and rec.status not in (REC_STATUS_SCHEDULED, REC_STATUS_IN_PROGRESS) else None)
+    has_shot = thumb_enabled and (rec.status == REC_STATUS_IN_PROGRESS or shot_path is not None)
     shot_mtime = None
     if shot_path:
         shot_mtime = datetime.utcfromtimestamp(os.path.getmtime(shot_path))
@@ -1486,7 +1497,8 @@ def recording_detail(recording_id):
         except OSError:  # ffmpeg has not created the file yet
             live_seg_bytes = 0
     row = _index_row(rec, now, get_display_tz(), {rec.id} if has_shot else set(),
-                     live_seg_bytes=live_seg_bytes, file_formats=file_formats)
+                     live_seg_bytes=live_seg_bytes, file_formats=file_formats,
+                     thumb_enabled=thumb_enabled)
     concat_prog, joinable_count = _join_strip_context(rec)
     # None for every status but ANALYZING, and also for an ANALYZING row whose passes are
     # done or have not started - the strip's generic wording covers that, per
@@ -1528,7 +1540,7 @@ def recording_detail(recording_id):
         event_channel_links=event_channel_links,
         shot_mtime=shot_mtime, has_shot=has_shot,
         stop_local_input=local_input_value(rec.stop_time),
-        thumb_enabled=thumb_cfg.get('enabled', True),
+        thumb_enabled=thumb_enabled,
         thumb_auto_refresh_seconds=thumb_cfg.get('auto_refresh_seconds', 60),
         find_airing_url=find_airing_url,
         meta_panel=_metadata_panel(rec, cfg),
@@ -3000,6 +3012,14 @@ def rec_status_label_filter(status):
     built by _index_row (the Dashboard's rows, the channel page's observations table).
     Pure, so it is safe inside a `{% for %}` (CLAUDE.md, no hidden I/O)."""
     return fmt_utils.rec_status_label(status)
+
+
+@recordings_bp.app_template_filter('rec_status_badge')
+def rec_status_badge_filter(status):
+    """The `.b-*` badge class for a raw Recording.status, from the same table as
+    `rec_status_label` - so a page holding only the stored value colors the badge the way
+    the Recordings list does (dev/changelog/1212). Pure."""
+    return fmt_utils.rec_status_display(status)[2]
 
 
 @recordings_bp.app_template_filter('mask_creds')

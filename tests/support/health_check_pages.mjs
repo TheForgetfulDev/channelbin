@@ -244,6 +244,7 @@ await record('channel_finished', async (start) => {
   const before = {
     bar: c.text('#cd-statusbar .badge'),
     rows: c.$$('#cd-tests tbody tr').length,
+    inProgress: c.$$('#cd-tests .badge.b-running').length,
     available: state(c).healthRollback.available,
     openKey: bd.dataset.bd,
   };
@@ -258,7 +259,7 @@ await record('channel_finished', async (start) => {
     navSig: STATES.done.nav.health_check.sig,
     bar: c.text('#cd-statusbar .badge'),
     rows: c.$$('#cd-tests tbody tr').length,
-    inProgress: c.$$('#cd-tests .badge-in_progress').length,
+    inProgress: c.$$('#cd-tests .badge.b-running').length,
     whatsonKept: c.$('[data-section="whatson"]') === whatson,
     openKeys: c.$$('#cd-timeline details[data-bd][open]').map((d) => d.dataset.bd),
     testerBusy: c.window.CHANNEL_DETAIL.testerBusy,

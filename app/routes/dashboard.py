@@ -538,8 +538,11 @@ def _sse_response(recording_id=None):
     q = ev.subscribe(recording_id)
 
     def generate():
-        yield ': connected\n\n'
+        # The first yield sits inside the try: a client that leaves before the first event
+        # or keepalive closes the generator right here, and only the finally unsubscribes
+        # its queue (dev/docs/BUGS.md 2026-10-19 @ 04:39:29 PM).
         try:
+            yield ': connected\n\n'
             while True:
                 try:
                     data = q.get(timeout=15)

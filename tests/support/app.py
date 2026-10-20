@@ -816,6 +816,17 @@ class TestApp:
             if getattr(state, 'launch_retry', None) is not None:
                 state.launch_retry.join(timeout=5)
 
+        # A recording that ended inside the test hands its files to a join and then a
+        # conversion, each an ffmpeg child on a daemon thread, and neither is in _active. A
+        # test that stops waiting before they finish - a failed capture-tier scenario, above
+        # all - used to leave them running: five re-encodes of deleted temp files ran at full
+        # CPU for half an hour after their tests had ended (dev/docs/BUGS.md 2026-10-18).
+        # The same two calls run.py makes on SIGTERM.
+        from app.concatenator import kill_active_joins
+        from app.postprocessor import kill_active_conversions
+        kill_active_joins()
+        kill_active_conversions()
+
     def _stop_scheduler_dispatch(self):
         """Stop the BackgroundScheduler this TestApp started and clear the module globals.
 

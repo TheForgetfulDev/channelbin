@@ -1,8 +1,21 @@
 name: tests
 
+# Two tiers run from this one file, so the ffmpeg pins below stay in one place. A push or pull
+# request runs the default suite. The capture tier - real recordings against the simulator,
+# about 10 minutes, timing-sensitive - runs nightly and on demand, never per push
+# (DESIGN-simulator.md D9, dev/changelog/1228). A manual run picks either tier.
 on:
   push:
   pull_request:
+  schedule:
+    - cron: "23 7 * * *"
+  workflow_dispatch:
+    inputs:
+      tier:
+        description: "Which tier to run"
+        type: choice
+        options: [capture, suite]
+        default: capture
 
 # The exact ffmpeg this suite runs against, pinned by URL and by the digest GitHub reports
 # for that asset. ChannelBin targets one series (README.md, and the Dockerfile's
@@ -81,4 +94,31 @@ jobs:
         run: npm ci
 
       - name: Run test suite
+        if: github.event_name == 'push' || github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && inputs.tier == 'suite')
         run: ./run_tests.sh
+
+      # The simulator's streams are cut from loops ffmpeg renders once and caches (sim/content.py),
+      # so a nightly run need not render them again. The library keys each loop on its render
+      # spec and the ffmpeg version and re-renders one that does not match, so a stale cache costs
+      # time, never a wrong stream; the key here only decides when a cache is worth restoring.
+      - name: Restore the simulator's content loops
+        if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.tier == 'capture')
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/channelbin-sim/content
+          key: sim-content-${{ env.FFMPEG_SHA256 }}-${{ hashFiles('sim/content.py') }}
+          restore-keys: sim-content-${{ env.FFMPEG_SHA256 }}-
+
+      - name: Run capture tier
+        if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.tier == 'capture')
+        run: ./run_tests.sh --capture
+
+      # Nobody is watching a nightly run, so a red one keeps its evidence: each pass's verbose
+      # log, which names the failing scenario and what ChannelBin and the answer key each said.
+      - name: Keep the capture tier's logs
+        if: failure() && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+        uses: actions/upload-artifact@v6
+        with:
+          name: capture-logs
+          path: dev/test-logs/
+          if-no-files-found: ignore

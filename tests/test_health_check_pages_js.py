@@ -73,6 +73,13 @@ def _observe():
             channel_path = f'/channels/{alpha_id}'
 
         def snapshot(state):
+            # Every client.get() under TestApp shares its pushed app context's session, and
+            # the states below are committed from a nested context's own session, which
+            # expires nothing here. The job row the previous snapshot loaded stayed in this
+            # identity map for as long as a reference cycle kept it alive, so the done page
+            # read RUNNING or COMPLETED depending on when the GC last ran (dev/changelog/1205).
+            # A real page load starts from a fresh session; so does each snapshot.
+            db.session.remove()
             for name, url in (('groups', '/channel-groups'), ('channel', channel_path),
                               ('nav', '/api/nav-status')):
                 resp = client.get(url)
@@ -241,6 +248,7 @@ class ChannelPageRunFinishesTests(_Base):
         self.assertEqual(self.obs['before']['bar'], 'Testing now')
         self.assertEqual(self.obs['bar'], 'Healthy')
         self.assertEqual(self.obs['rows'], 2)
+        self.assertGreater(self.obs['before']['inProgress'], 0)
         self.assertEqual(self.obs['inProgress'], 0)
 
     def test_whats_on_is_left_to_guide_js(self):

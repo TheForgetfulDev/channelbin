@@ -151,6 +151,15 @@ watchdog:
   # A wider window is a looser trigger, not a stricter one.
   stall_move_count: 3
   stall_move_window_minutes: 30
+  # Video stopped while the audio keeps flowing. The file still grows, so the stall check
+  # never fires; the watchdog restarts the capture instead, since a fresh connection is
+  # what usually brings the picture back. At most this many of those restarts on one member
+  # inside the window. After that a group recording moves to another member (demoted, not
+  # burned); anything else keeps recording the sound and restarts again once the window
+  # frees one. Never counted as a stall and never fails a recording. 0 = no restarts on the
+  # member: move at the first detection, or keep recording where there is nowhere to move.
+  video_stop_restart_count: 3
+  video_stop_window_minutes: 30
   # Provider placeholder detection. When a channel is down, an upstream may serve a finite
   # "channel offline" clip instead of a live stream - ffmpeg drains the whole thing in a few
   # seconds, exits 0, and the segment holds ten minutes of black. A segment carrying more

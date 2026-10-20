@@ -209,11 +209,11 @@ body.on-logs .main {
       {# Server-rendered as the state before any JS has run, per the rule that
          initial markup must equal "nothing active" - logs.js moves it to Live
          once the stream is actually open. #}
-      <span class="badge badge-scheduled" id="log-status">Connecting</span>
-      <button id="btn-live" class="btn btn-sm btn-secondary" type="button">Stop</button>
-      <button id="btn-copy" class="btn btn-sm btn-secondary" type="button"
+      <span class="badge b-abort" id="log-status">Connecting</span>
+      <button id="btn-live" class="btn btn-sm" type="button">Stop</button>
+      <button id="btn-copy" class="btn btn-sm" type="button"
               data-tip="Copies only the rows the active filters leave visible.&#10;Copying hidden rows would hand back something other than what is on screen.">Copy</button>
-      <button id="btn-clear" class="btn btn-sm btn-secondary" type="button"
+      <button id="btn-clear" class="btn btn-sm" type="button"
               data-tip="Empties the view only. Nothing on disk is deleted.">Clear</button>
     </div>
   </div>

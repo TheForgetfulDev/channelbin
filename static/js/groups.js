@@ -142,7 +142,8 @@
     const params = new URLSearchParams();
     const q = searchInput.value.trim();
     if (q) params.set('q', q);
-    filterBar.entries().forEach(([k, v]) => params.append('f', `${k}:${v}`));
+    // `x` carries the "is not" ones, the channel search's own f./x. split (dev/changelog/1207).
+    filterBar.entries().forEach(([k, v, op]) => params.append(op === 'not' ? 'x' : 'f', `${k}:${v}`));
     SECTIONS.forEach(section => {
       const st = sectionSort[section];
       if (st.k !== 'name' || st.dir !== 1) params.append('sort', `${section}:${st.k}:${st.dir}`);
@@ -154,10 +155,13 @@
     const params = new URLSearchParams(window.location.search);
     const q = params.get('q');
     if (q) searchInput.value = q;
-    filterBar.setFrom(params.getAll('f').map(entry => {
+    const pairsOf = (name, op) => params.getAll(name).map(entry => {
       const i = entry.indexOf(':');
-      return i === -1 ? null : [entry.slice(0, i), entry.slice(i + 1)];
-    }).filter(Boolean));
+      if (i === -1) return null;
+      const pair = [entry.slice(0, i), entry.slice(i + 1)];
+      return op ? pair.concat(op) : pair;
+    }).filter(Boolean);
+    filterBar.setFrom(pairsOf('f').concat(pairsOf('x', 'not')));
     params.getAll('sort').forEach(entry => {
       const [section, key, dir] = entry.split(':');
       if (SECTIONS.includes(section) && SORT_SPECS[key]) {

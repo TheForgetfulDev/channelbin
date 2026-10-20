@@ -34,11 +34,12 @@ const PAGE = `<!doctype html><html><head><meta name="csrf-token" content="t"></h
 // Four rows over three dimensions, deliberately uneven: two accounts so the counts
 // differ, one row carrying a label with markup in it so escaping is observable, and a
 // dimension nobody offers.
+// `tags` is multi-valued so "is" and "is not" in ONE dimension can disagree about a row.
 const ROWS = [
-  { name: 'a', status: 'PASS', account: '1' },
-  { name: 'b', status: 'PASS', account: '2' },
-  { name: 'c', status: 'FAIL', account: '2' },
-  { name: 'd', status: 'WARN', account: '2' },
+  { name: 'a', status: 'PASS', account: '1', tags: ['x'] },
+  { name: 'b', status: 'PASS', account: '2', tags: ['x', 'y'] },
+  { name: 'c', status: 'FAIL', account: '2', tags: ['y'] },
+  { name: 'd', status: 'WARN', account: '2', tags: [] },
 ];
 
 function boot() {
@@ -61,6 +62,7 @@ function boot() {
   w.eval(`
     var ROWS = ${JSON.stringify(ROWS)};
     var accountOffered = true;
+    var tagOffered = false;
     var changes = 0;
     var DIMS = [
       { k: 'status', label: 'Status',
@@ -72,6 +74,8 @@ function boot() {
         available: () => accountOffered },
       { k: 'never', label: 'Never offered', values: [{v:'x',label:'X'}],
         match: () => true, available: () => false },
+      { k: 'tag', label: 'Tag', values: [{v:'x',label:'X'},{v:'y',label:'Y'}],
+        match: (r, v) => r.tags.includes(v), available: () => tagOffered },
     ];
     var bar = createFilterBar({
       chipsEl: document.getElementById('chips'),
@@ -95,9 +99,27 @@ function boot() {
       document.querySelector('[data-fdim="' + k + '"][data-fval="' + v + '"]').click();
     }
     function clickChip(i) { document.querySelectorAll('#chips .chip.active-filter')[i].click(); }
+    // Falls back to the API when the button is missing, so a bar without the control fails
+    // the test that looks for the control (ops(), below) and every other is-not test on what
+    // it does to the rows, rather than all of them on one thrown querySelector.
+    function clickOp(k, v, op) {
+      const b = document.querySelector('#menu [data-fdim="' + k + '"][data-fval="' + v + '"][data-fop="' + op + '"]');
+      if (b) b.click(); else { bar.toggle(k, v, op); bar.apply(); }
+    }
+    // Per value on screen: which of its two operator buttons is lit, and the row's classes.
+    function ops() {
+      return [...document.querySelectorAll('#menu .fb-val-row')].map(r => ({
+        v: r.querySelector('.fb-val').dataset.fval,
+        is: !!r.querySelector('[data-fop="is"].on-inc'),
+        not: !!r.querySelector('[data-fop="not"].on-exc'),
+        row: r.querySelector('.fb-val').className,
+      }));
+    }
     function snap() {
       return { chips: chipLabels(), rows: visible(), count: bar.count(),
-               menu: menuRows(), open: isOpen(), entries: bar.entries() };
+               menu: menuRows(), open: isOpen(), entries: bar.entries(),
+               neg: [...document.querySelectorAll('#chips .chip.active-filter')].map(c => c.classList.contains('neg')),
+               ops: ops() };
     }
   `);
   return { w, errors };
@@ -115,6 +137,7 @@ out.initial_html = run('document.getElementById("menu").innerHTML');
 run('open(); clickDim("status")');
 out.drilled = run('snap()');
 out.drilled_html = run('document.getElementById("menu").innerHTML');
+out.drilled_b_elements = run('document.querySelectorAll("#menu b").length');
 run('document.querySelector("[data-fback]").click()');
 out.after_back = run('snap()');
 
@@ -151,6 +174,36 @@ run('accountOffered = true; bar.clear(); bar.setFrom([["status","FAIL"],["accoun
 out.restored = run('snap()');
 
 out.changes = run('changes');
+
+/* ── "is not" (dev/changelog/1207) ─────────────────────────────────────── */
+// 19. One value excluded from its own control in the popover.
+run('bar.clear(); bar.render(); open(); clickDim("status"); clickOp("status", "FAIL", "not")');
+out.not_one = run('snap()');
+// 20. Pressing "is" on the same value switches it - one chip, never an include and an
+//     exclude of one value at once.
+run('clickOp("status", "FAIL", "is")');
+out.not_switched = run('snap()');
+// 21. Pressing the lit one again turns the value off.
+run('clickOp("status", "FAIL", "is")');
+out.not_off = run('snap()');
+// 22. Tapping the row of an excluded value presses "is", as the channel search's row does.
+run('clickOp("status", "FAIL", "not"); clickVal("status", "FAIL")');
+out.not_row_off = run('snap()');
+// 23. "is not" ANDs across dimensions like anything else.
+run('clickOp("status", "FAIL", "not"); document.querySelector("[data-fback]").click(); '
+  + 'clickDim("account"); clickVal("account", "2")');
+out.not_and = run('snap()');
+// 24. Clicking an "is not" chip removes it.
+run('clickChip(0)');
+out.not_chip_removed = run('snap()');
+// 25. "is" and "is not" in ONE dimension, over a field a row can carry two values of.
+run('bar.clear(); tagOffered = true; bar.setFrom([["tag", "x"], ["tag", "y", "not"]]); bar.render()');
+out.not_mixed = run('snap()');
+// 26. Old two-element pairs read as "is"; anything but 'not' in the third place does too.
+run('tagOffered = false; bar.clear(); '
+  + 'bar.setFrom([["status", "FAIL"], ["status", "PASS", "not"], ["account", "1", "bogus"]]); bar.render()');
+out.not_restored = run('snap()');
+out.not_changes = run('changes');
 out.errors = errors;
 
 /* ── Saved filters (opts.saved, dev/changelog/1156) ──────────────────────
@@ -307,5 +360,38 @@ try {
   saved.boot_default.badges = w.eval('[...document.querySelectorAll("#saved-menu .badge")].length');
   saved.errors_b = errors;
 } catch (e) { saved.errors_b = [`threw: ${e.message}`]; }
+
+// 27. "is not" saves in the third-element shape, and flipping it marks the filter edited.
+try {
+  const { w, errors } = bootSaved([]);
+  w.eval('bar.toggle("status", "FAIL", "not"); bar.apply(); openSaved(); typeName("No fails"); save()');
+  await tick();
+  saved.not_saved = w.eval('snapS()');
+  w.eval('bar.toggle("status", "FAIL", "is"); bar.apply()');
+  saved.not_flipped = w.eval('snapS()');
+  saved.errors_c = errors;
+} catch (e) { saved.errors_c = [`threw: ${e.message}`]; }
+
+// 28. A record written before "is not" existed loads as "is"; a pair with an operator the
+//     bar does not know is dropped rather than guessed at.
+try {
+  const { w, errors } = bootSaved([
+    { name: 'Old', filters: [['status', 'FAIL']], is_default: true },
+    { name: 'Bad op', filters: [['status', 'PASS', 'maybe']] },
+  ]);
+  saved.old_shape = w.eval('snapS()');
+  w.eval('openSaved(); click(document.querySelector("#saved-menu [data-fsload=\'1\']"))');
+  saved.bad_op = w.eval('snapS()');
+  saved.errors_d = errors;
+} catch (e) { saved.errors_d = [`threw: ${e.message}`]; }
+
+// 29. An excluded value nothing carries any more is named with its operator when dropped.
+try {
+  const { w, errors } = bootSaved([
+    { name: 'No gone', filters: [['status', 'GONE', 'not'], ['account', '2']], is_default: true },
+  ]);
+  saved.not_dropped = w.eval('snapS()');
+  saved.errors_e = errors;
+} catch (e) { saved.errors_e = [`threw: ${e.message}`]; }
 out.saved = saved;
 process.stdout.write(JSON.stringify(out));

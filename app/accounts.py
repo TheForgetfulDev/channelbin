@@ -515,6 +515,46 @@ def parse_provider_account_info(auth_payload: dict) -> dict:
     }
 
 
+#: The provider statuses that mean the account cannot be used: the subscription is over or the
+#: login is barred. The account page marks them red, and a sync stops on them rather than
+#: importing whatever a refused login is answered with (dev/docs/BUGS.md 2026-10-17).
+PROVIDER_INACTIVE_STATUSES = ('banned', 'disabled', 'expired')
+
+
+class ProviderAccountInactive(ValueError):
+    """The provider's own auth answer says the account cannot be used.
+
+    Carries that answer, so the caller can still record what the provider said (its status,
+    its expiry date) on the account before the sync stops."""
+
+    def __init__(self, message: str, auth_payload: dict):
+        super().__init__(message)
+        self.auth_payload = auth_payload
+
+
+def check_xtream_auth(data) -> dict:
+    """The auth answer, if it lets the account be used; otherwise the reason, raised.
+
+    A refused login (`user_info.auth` 0) and an accepted one whose status is Expired, Banned
+    or Disabled both stop here. The second used to go on: every data request after it was
+    refused, and the sync ended PARTIAL with no channels and three alerts that never said
+    why - or, on a first sync, SUCCESS with no channels (dev/docs/BUGS.md 2026-10-17)."""
+    user_info = (data.get('user_info') if isinstance(data, dict) else None) or {}
+    status = str(user_info.get('status') or '')
+    inactive = status.lower() in PROVIDER_INACTIVE_STATUSES
+    if not user_info.get('auth'):
+        if inactive:
+            raise ProviderAccountInactive(
+                f'The provider refused the login and says this account is {status}.', data)
+        raise ValueError('Authentication failed - check username and password')
+    if inactive:
+        exp = parse_epoch_utc(user_info.get('exp_date'))
+        when = f' (expiry date {format_local(exp, "date")})' if exp else ''
+        raise ProviderAccountInactive(f'The provider says this account is {status}{when}.',
+                                      data)
+    return data
+
+
 def construct_stream_url(account: Account, stream_id, mode: str,
                          origin: str | None = None) -> str:
     """Build a stream URL from scratch for a provider that supplied none.
@@ -1195,6 +1235,27 @@ def _apply_hide_rules_after_upsert(account_id: int, account_name: str) -> None:
         db.session.rollback()
 
 
+_INACTIVE_SYNC_STOPPED = (' The sync stopped there, so no channels or listings were changed. '
+                          'Renew or reactivate the account with the provider, then sync again.')
+
+
+def _record_provider_facts(account_id: int, info: dict) -> None:
+    """Store what a refusing auth answer said about the account. Only what it said: a
+    refusal often names the status and nothing else, and the expiry and connection counts
+    the last good sync recorded are still the best known values."""
+    @retry_on_locked()
+    def _store_and_commit():
+        account = db.session.get(Account, account_id)
+        if account is None:
+            return
+        for name, value in info.items():
+            if value is not None:
+                setattr(account, f'provider_{name}', value)
+        db.session.commit()
+
+    _store_and_commit()
+
+
 def _do_sync(account_id: int, stop_event: threading.Event, use_dump: bool = False,
              force_epg_resync: bool = False) -> None:
     cfg = load_config()
@@ -1216,6 +1277,10 @@ def _do_sync(account_id: int, stop_event: threading.Event, use_dump: bool = Fals
     sync_time = datetime.utcnow()
     previous_last_sync_at = account.last_sync_at
     channel_count_baseline = account.channel_count or 0
+    # Read before the sync-log prune below, which can delete the very row it names: an
+    # account that last synced longer ago than sync_log_keep_days loses that row at the start
+    # of this sync, and its per-sync diffs would then have no lower bound.
+    previous_sync_started_at = _previous_sync_started_at(account_id, previous_last_sync_at)
 
     # Read here, not in the except block below: a failed flush leaves the session needing
     # a rollback, so touching `account` down there could raise instead of masking. These
@@ -1293,6 +1358,17 @@ def _do_sync(account_id: int, stop_event: threading.Event, use_dump: bool = Fals
         # authenticate this way.
         provider_info: dict = {}
 
+        # The categories the previous sync saw, read before the upsert below overwrites a
+        # moved channel's category_name - after it, the old name is gone. A first sync has
+        # nothing before it ({}), and a previous sync with no identifiable start leaves the
+        # diff untracked (None) rather than reporting every category as new.
+        if previous_last_sync_at is None:
+            categories_before: dict | None = {}
+        elif previous_sync_started_at is None:
+            categories_before = None
+        else:
+            categories_before = _category_tallies(account_id, previous_sync_started_at)
+
         if account_type == 'm3u':
             # Fetched OUTSIDE the closure below: retry_on_locked re-runs its whole body, so
             # a playlist download in there is re-issued on every lock retry against a
@@ -1334,7 +1410,13 @@ def _do_sync(account_id: int, stop_event: threading.Event, use_dump: bool = Fals
             # where its streams live, which any constructed URL is built on. Re-fetching
             # auth later to get it would be a second provider connection for data we
             # already hold, and these accounts run at max_connections: 1.
-            auth_data = client.check_auth()
+            try:
+                auth_data = client.check_auth()
+            except ProviderAccountInactive as exc:
+                # Recorded before the sync stops, so the account page shows the status and
+                # expiry the provider gave as the reason.
+                _record_provider_facts(account_id, parse_provider_account_info(exc.auth_payload))
+                raise
             log.info('Xtream auth OK for account %d (%s)', account_id, account.name)
 
             stream_origin_used = stream_origin_from_server_info(auth_data)
@@ -1399,34 +1481,23 @@ def _do_sync(account_id: int, stop_event: threading.Event, use_dump: bool = Fals
         # "Removed this sync" = the immediate per-sync diff (channels the previous sync
         # touched that this one didn't) - not _raise_channel_lifecycle_alerts's delayed
         # channel_missing_after_days threshold, confirmed deliberately. A first sync has
-        # no previous sync to diff against, so that's a true zero.
-        #
-        # The lower bound must be the previous sync's own started_at, NOT
-        # previous_last_sync_at (= account.last_sync_at from before this sync, which is
-        # stamped by _mark_success_and_commit's "now" - captured AFTER that previous
-        # sync's own channel upsert already ran and stamped last_seen_at on every channel
-        # it touched). Using previous_last_sync_at directly as the lower bound would always
-        # come out empty: every channel the previous sync touched has a last_seen_at that
-        # predates that sync's own completion timestamp, by construction, so none of them
-        # would ever satisfy ">= previous_last_sync_at" (measured empirically while
-        # implementing this - the naive query always returned 0). The previous sync's own
-        # AccountSyncLog.started_at is captured before that run's upsert (same
-        # _mark_syncing_and_commit pattern as this run's own sync_log), so it correctly
-        # predates every last_seen_at stamp that run wrote. Found by matching completed_at
-        # to previous_last_sync_at - both are the exact same `now` value assigned together
-        # in that prior run's _mark_success_and_commit closure, so this is an exact match,
-        # not a fuzzy one.
-        if previous_last_sync_at is not None:
-            previous_log = AccountSyncLog.query.filter_by(
-                account_id=account_id, completed_at=previous_last_sync_at,
-            ).first()
-            removed_lower_bound = previous_log.started_at if previous_log else previous_last_sync_at
+        # no previous sync to diff against, so that's a true zero; a previous sync whose
+        # start cannot be identified leaves the count untracked (None), never a false 0.
+        if previous_last_sync_at is None:
+            channels_removed_count = 0
+        elif previous_sync_started_at is None:
+            channels_removed_count = None
+        else:
             channels_removed_count = Channel.query.filter_by(account_id=account_id).filter(
                 Channel.last_seen_at < sync_time,
-                Channel.last_seen_at >= removed_lower_bound,
+                Channel.last_seen_at >= previous_sync_started_at,
             ).count()
+
+        if categories_before is None:
+            categories_added_json = categories_removed_json = None
         else:
-            channels_removed_count = 0
+            categories_added_json, categories_removed_json = _category_diff_json(
+                categories_before, _category_tallies(account_id, sync_time))
 
         # Both counts and the duplicate recompute run OUTSIDE the success closure below, and
         # must stay out of it. The closure's first assignment dirties the account row, so the
@@ -1478,6 +1549,8 @@ def _do_sync(account_id: int, stop_event: threading.Event, use_dump: bool = Fals
             sync_log.epg_entries_synced = epg_synced
             sync_log.channels_added = len(new_channel_ids)
             sync_log.channels_removed = channels_removed_count
+            sync_log.categories_added = categories_added_json
+            sync_log.categories_removed = categories_removed_json
             sync_log.skipped_malformed_urls = skipped_malformed
             sync_log.skipped_duplicate_stream_ids = skipped_duplicate
             sync_log.error_message = epg_degradation_reason
@@ -1594,6 +1667,8 @@ def _do_sync(account_id: int, stop_event: threading.Event, use_dump: bool = Fals
         # this same string as its body - masking the one message twice is two chances for the
         # log and the alert to disagree about what was redacted.
         error_message = mask_account_urls_in_text(str(exc), *account_urls)
+        if isinstance(exc, ProviderAccountInactive):
+            error_message += _INACTIVE_SYNC_STOPPED
         # log.error with a pre-rendered traceback, not log.exception: the handler-level
         # CredentialMaskingFilter masks a traceback with the generic heuristics only, and
         # a path-token account URL matches none of them. Marked already_alerted because
@@ -1686,9 +1761,12 @@ _M3U_HEADER_SCAN_LINES = 10
 
 
 def _looks_like_m3u(text: str) -> bool:
-    """True if #EXTM3U appears within the first few non-blank lines."""
+    """True if #EXTM3U appears within the first few non-blank lines. A byte order mark is
+    read past: it is not whitespace to str.strip(), so a text decoded without utf-8-sig
+    still carries it. The one test of "is this a playlist" for every fetch that asks it,
+    the Xtream client's included (dev/docs/BUGS.md 2026-10-17)."""
     seen = 0
-    for line in text.splitlines():
+    for line in text.lstrip('\ufeff').splitlines():
         stripped = line.strip()
         if not stripped:
             continue
@@ -2247,6 +2325,49 @@ def missing_channels_query(account_id, cfg, channel_ids=None):
     return q
 
 
+def _previous_sync_started_at(account_id: int, previous_last_sync_at) -> datetime | None:
+    """started_at of the sync that stamped account.last_sync_at, the lower bound of every
+    per-sync diff ("seen by the previous sync" = last_seen_at at or after it). None when
+    there is no previous sync, or its log row no longer exists.
+
+    The bound must be that sync's own started_at, NOT previous_last_sync_at: last_sync_at is
+    stamped by _mark_success_and_commit's "now", AFTER that sync's upsert stamped last_seen_at
+    on every channel it touched, so ">= previous_last_sync_at" matches none of them (measured -
+    the naive query always returned 0, dev/changelog/480). The log row is found by exact
+    match: its completed_at and the account's last_sync_at are the same `now`, assigned
+    together in that run's _mark_success_and_commit closure."""
+    if previous_last_sync_at is None:
+        return None
+    previous_log = AccountSyncLog.query.filter_by(
+        account_id=account_id, completed_at=previous_last_sync_at).first()
+    return previous_log.started_at if previous_log else None
+
+
+def _category_tallies(account_id: int, seen_since: datetime) -> dict[str, int]:
+    """{category_name: channel count} over the account's channels last seen at or after
+    `seen_since`. Keys are unique by the GROUP BY. A blank category is "no category", not a
+    category of its own, so it is left out."""
+    return dict(
+        db.session.query(Channel.category_name, func.count(Channel.id))
+        .filter(Channel.account_id == account_id,
+                Channel.last_seen_at >= seen_since,
+                Channel.category_name.isnot(None),
+                Channel.category_name != '')
+        .group_by(Channel.category_name).all())
+
+
+def _category_diff_json(before: dict[str, int], after: dict[str, int]) -> tuple[str, str]:
+    """The categories new and gone between two _category_tallies() readings, as the JSON the
+    AccountSyncLog.categories_added/_removed columns hold (dev/changelog/1211). A new
+    category carries its channel count now; a gone one, the count it had the sync before.
+    Largest first, so a page that shows only the first few shows the ones that matter."""
+    def encode(tallies, names):
+        rows = sorted(((n, tallies[n]) for n in names), key=lambda r: (-r[1], r[0]))
+        return json.dumps([{'name': n, 'channels': c} for n, c in rows])
+    return (encode(after, after.keys() - before.keys()),
+            encode(before, before.keys() - after.keys()))
+
+
 def _raise_channel_lifecycle_alerts(account: Account, cfg: dict, sync_time: datetime,
                                     previous_last_sync_at, channel_count_baseline: int,
                                     new_channel_ids: list) -> None:
@@ -2402,6 +2523,18 @@ def _upsert_channels(account: Account, streams: list, cfg: dict | None = None,
         sid = stream.get('stream_id')
         if not sid:
             continue
+        # Some providers list placeholder/template catalog entries (e.g. per-team "NFL
+        # Sunday Ticket" or per-state "Local Affiliates" rows) whose URL line is the literal
+        # string "http" - not a parsing defect on our side, confirmed against the raw feed.
+        # They are not usable channels, so they are skipped rather than imported as dead
+        # rows. Checked ahead of the duplicate test, because such a line carries no id of
+        # its own: in a playlist without CUID every one hashes to the same id, and eight
+        # placeholder rows were counted as one malformed URL and seven duplicate stream ids
+        # (dev/docs/BUGS.md 2026-10-17).
+        raw_url = stream.get('_stream_url')
+        if raw_url and '://' not in raw_url:
+            skipped_malformed += 1
+            continue
         if sid in seen_ids:
             skipped_duplicate += 1
             if len(duplicate_sample) < _DUPLICATE_SAMPLE_CAP:
@@ -2414,15 +2547,10 @@ def _upsert_channels(account: Account, streams: list, cfg: dict | None = None,
         # It is deliberately NOT hardcoded: the shape a provider accepts varies, and the
         # form this used to hardcode (/live/<user>/<pass>/<id>.ts) is the one most often
         # blocked by Cloudflare (DESIGN-live-vod.md §4.3).
-        raw_url = stream.get('_stream_url')
         if not raw_url:
             raw_url = construct_stream_url(account, sid, norm_mode, stream_origin)
         if '://' not in raw_url:
-            # Some providers list placeholder/template catalog entries (e.g. per-team
-            # "NFL Sunday Ticket" or per-state "Local Affiliates" rows) with a garbage
-            # URL like the literal string "http" instead of a real stream - not a
-            # parsing defect on our side, confirmed against the raw feed. These aren't
-            # usable channels, so skip them entirely rather than importing dead rows.
+            # Built on a base URL with no scheme, so no more usable than a placeholder row.
             skipped_malformed += 1
             continue
         stream_url = render_host(normalize_url_with_mode(raw_url, norm_mode),

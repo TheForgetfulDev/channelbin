@@ -124,7 +124,7 @@ function handleStatus(rid, d) {
   row.dataset.waiting = waiting ? '1' : '';
   const badge = document.getElementById(`badge-${rid}`);
   if (badge) {
-    badge.className = `badge badge-${d.status.toLowerCase()}`;
+    badge.className = `badge ${recStatusClass(d.status) || 'b-abort'}`;
     const parked = recWaitingLabel();
     badge.textContent = (waiting && parked) ? parked : label;
   }
@@ -145,7 +145,7 @@ function connect() {
   };
   connectSSE('/api/stream', {
     onOpen() {
-      setStatus('badge-success', '<span class="pulse"></span>Live',
+      setStatus('b-done', '<span class="pulse"></span>Live',
         'This page is receiving live activity updates over SSE.');
     },
     onMessage(e) {
@@ -168,7 +168,7 @@ function connect() {
       handleStatus(rid, d);
     },
     onError() {
-      setStatus('badge-warning', 'Reconnecting',
+      setStatus('b-warn', 'Reconnecting',
         'The activity stream dropped. Numbers below may be stale until it reconnects.');
     },
   });
@@ -213,7 +213,7 @@ function pollHealthCheck() {
         // sort and the SSE connection to whatever was still recording, to refresh one
         // row (dev/changelog/1082).
         const badge = document.getElementById('hc-status-badge');
-        if (badge) { badge.textContent = 'FINISHED'; badge.className = 'badge badge-completed'; }
+        if (badge) { badge.textContent = 'FINISHED'; badge.className = 'badge b-done'; }
         stopHealthCheckWidget();
         requestRefresh('health');
         return;

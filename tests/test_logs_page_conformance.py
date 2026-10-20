@@ -124,7 +124,7 @@ class LogsPageConformanceTests(unittest.TestCase):
         """Server-rendered markup must equal the state before any JS has run."""
         m = re.search(r'<span class="badge ([^"]+)" id="log-status">([^<]+)</span>', self.html)
         self.assertIsNotNone(m, 'the stream status badge is no longer server-rendered')
-        self.assertEqual(m.group(1), 'badge-scheduled')
+        self.assertEqual(m.group(1), 'b-abort')
         self.assertEqual(m.group(2).strip(), 'Connecting')
         self.assertIn("setStatus('Live'", self.js, 'nothing ever promotes the badge to Live')
 

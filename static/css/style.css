@@ -163,8 +163,8 @@ code { font-family: var(--font-mono); background: var(--bg3); padding: 1px 5px; 
 
 /* ── Buttons (DESIGN.md 3.5 - the one system) ───────────────────────
    .btn / .btn-primary / .btn-danger / .btn-icon / .btn-sm are the full
-   sanctioned set. The extra variants below the marker are legacy-only,
-   kept alive until the #4 rollout removes their last call sites. */
+   sanctioned set, plus .btn-accent (15.6). The legacy .btn-warning and
+   .btn-secondary were retired in dev/changelog/1212. */
 .btn {
   font: inherit; font-size: var(--fs-lg); font-weight: 600; cursor: pointer; border-radius: var(--radius-sm);
   border: 1px solid var(--border); background: var(--bg2); color: var(--text);
@@ -185,15 +185,13 @@ code { font-family: var(--font-mono); background: var(--bg3); padding: 1px 5px; 
 .btn-sm { font-size: var(--fs-sm); padding: 4px 10px; }
 .btn-sm.btn-icon { padding: 4px 9px; }
 .btn:disabled, .btn[disabled] { opacity: 0.45; cursor: not-allowed; pointer-events: none; }
-/* legacy variants (pre-DESIGN.md pages only - do not use in new code) */
-.btn-warning { color: var(--warn); }
-.btn-warning:hover { background: var(--warn-soft); border-color: var(--warn); }
-.btn-secondary { color: var(--text-muted); }
-.btn-secondary:hover { background: var(--bg3); }
 
 /* ── Badges (DESIGN.md 3.4 - one badge system) ──────────────────────
-   New code uses the .b-* status set below (in the design-system section);
-   the .badge-* variants here are legacy, kept until #4 removes them. */
+   The color modifiers are the .b-* status set in the design-system section. The legacy
+   .badge-* family, its pre-graphite color literals and the `badge-{{ status }}` builders
+   that kept adding to it were retired in dev/changelog/1212: a raw status reaches a class
+   through fmt_utils.REC_STATUS_DISPLAY (Jinja `rec_status_badge`, util.js recStatusClass)
+   or the `test_status_badge` filter. */
 .badge {
   display: inline-flex; align-items: center; gap: 6px;
   font-size: var(--fs-xs); font-weight: 600; letter-spacing: .02em; text-transform: uppercase;
@@ -201,34 +199,9 @@ code { font-family: var(--font-mono); background: var(--bg3); padding: 1px 5px; 
 }
 .badge .pulse { width: 6px; height: 6px; border-radius: 50%; background: currentColor; animation: pulse 1.6s infinite; }
 .badge.lg { font-size: var(--fs-sm); padding: 3px 13px; }
-.badge-scheduled    { background: rgba(139,148,158,.2); color: var(--text-muted); border: 1px solid var(--border); }
-.badge-in_progress  { background: rgba(63,185,80,.2);   color: var(--ok);      border: 1px solid rgba(63,185,80,.4); }
-.badge-concatenating{ background: rgba(88,166,255,.2);  color: var(--accent);     border: 1px solid rgba(88,166,255,.4); }
-.badge-analyzing    { background: rgba(88,166,255,.2);  color: var(--accent);     border: 1px solid rgba(88,166,255,.4); }
-.badge-converting   { background: rgba(88,166,255,.2);  color: var(--accent);     border: 1px solid rgba(88,166,255,.4); }
-.badge-completed    { background: rgba(88,166,255,.15); color: var(--accent);     border: 1px solid rgba(88,166,255,.4); }
-.badge-failed       { background: rgba(var(--bad-rgb),.15);  color: var(--bad);        border: 1px solid rgba(var(--bad-rgb),.4); }
-.badge-aborted      { background: rgba(210,153,34,.15); color: var(--warn);     border: 1px solid rgba(210,153,34,.4); }
-.badge-paused       { background: rgba(188,140,255,.15); color: var(--purple);    border: 1px solid rgba(188,140,255,.4); }
-/* Same amber the recordings list already gives this state (.b-retry, .row.st-retry) -
-   a dead stream backing off toward a reconnect is a warning, not a failure. Emitted by
-   dashboard.js's `badge badge-${status.toLowerCase()}` since RETRYING shipped, with no
-   rule to land on until dev/changelog/663. */
-.badge-retrying     { background: var(--warn-soft); color: var(--warn); border: 1px solid rgba(var(--warn-rgb),.4); }
-.badge-success      { background: rgba(63,185,80,.2);   color: var(--ok);      border: 1px solid rgba(63,185,80,.4); }
-.badge-danger       { background: rgba(var(--bad-rgb),.15);  color: var(--bad);        border: 1px solid rgba(var(--bad-rgb),.4); }
-.badge-warning      { background: rgba(210,153,34,.15); color: var(--warn);     border: 1px solid rgba(210,153,34,.4); }
-/* .badge-ok/-error/-unsynced/-syncing/-partial lived here for accounts.html and
-   account_logs.html. Both callers are gone (dev/changelog/456): account status is now the
-   shared account_status_badge macro on the design system's own .badge b-* vocabulary, and
-   account_logs.html is retired. Deleted rather than left "in case" - a rule with no caller
-   is the one the next page reaches for by name and gets the wrong colors from. */
 
-/* ── Tables ────────────────────────────────────────────────────────── */
-.table { width: 100%; border-collapse: collapse; font-size: var(--fs-md); }
-.table th { text-align: left; padding: 0.5rem 0.75rem; color: var(--text-muted); font-weight: 600; font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: .5px; border-bottom: 1px solid var(--border); }
-.table td { padding: 0.55rem 0.75rem; border-bottom: 1px solid var(--border); vertical-align: middle; }
-.table tr:hover td { background: var(--bg2); }
+/* .table was retired in dev/changelog/1212 - tables are `table.tbl` in a `.table-scroll`
+   (DESIGN.md 3.2). */
 
 /* ── Forms ─────────────────────────────────────────────────────────── */
 .form-card { background: var(--bg2); border: 1px solid var(--border); border-radius: var(--radius); padding: 1.5rem; max-width: 700px; }
@@ -386,13 +359,6 @@ body.scroll-locked { position: fixed; left: 0; right: 0; width: 100%; overflow: 
 
 /* ── Channel health shared styles ─────────────────────────────────── */
 
-/* Badge variants for channel health */
-.badge-waiting { background: rgba(139,148,158,.15); color: var(--text-muted); border: 1px solid var(--border); }
-.badge-running { background: rgba(63,185,80,.15); color: var(--ok); border: 1px solid rgba(63,185,80,.4); }
-.badge-queued  { background: rgba(139,148,158,.15); color: var(--text-muted); border: 1px solid var(--border); }
-.badge-scheduled-job { background: rgba(88,166,255,.15); color: var(--accent); border: 1px solid rgba(88,166,255,.4); }
-.badge-cancelled { background: rgba(210,153,34,.15); color: var(--warn); border: 1px solid rgba(210,153,34,.4); }
-
 /* Hero card */
 .hero-stats-row { display: flex; gap: 1.5rem; flex-wrap: wrap; margin: 0.75rem 0; }
 .hero-stat { text-align: center; min-width: 80px; }
@@ -433,7 +399,6 @@ body.scroll-locked { position: fixed; left: 0; right: 0; width: 100%; overflow: 
 .screenshot-placeholder.none {
   display: flex; align-items: center; justify-content: center;
 }
-.badge-automatic { background: var(--accent); color: #000; border: 1px solid var(--accent); font-weight: 600; }
 
 /* Responsive: channel health */
 @media (max-width: 960px) {
@@ -1064,6 +1029,22 @@ body.scroll-locked { position: fixed; left: 0; right: 0; width: 100%; overflow: 
 .fb-tick { flex: 0 0 auto; width: 11px; color: var(--accent-text); }
 .fb-lbl { flex: 1 1 auto; }
 .fb-n { color: var(--text-faint); font-size: var(--fs-xs); }
+/* "is not" (dev/changelog/1207). The chip says its operator in words, the way the channel
+   search's chips do, and an excluded value takes the bad tint there and here alike. */
+.fb-op { opacity: .65; font-weight: 600; }
+.chip.active-filter.neg { background: var(--bad-soft); border-color: rgba(var(--bad-rgb), .4); color: var(--bad); }
+.fb-val-row { display: flex; align-items: center; gap: 6px; padding-right: 4px; }
+.menu .fb-val-row button.menu-item.fb-val { flex: 1 1 auto; min-width: 0; }
+.fb-val.neg { color: var(--bad); }
+/* Three-state value control: off, included, excluded, right where you are looking at the
+   value. Promoted out of channel-search.css unchanged, because the shared filter bar draws
+   it as well; its labels are each page's own. */
+.tri { display: inline-flex; border: 1px solid var(--border); border-radius: var(--radius-sm); overflow: hidden; flex: none; }
+.tri button { border: none; background: var(--bg1); color: var(--text-faint); cursor: pointer;
+  font-size: var(--fs-xs); font-weight: 700; padding: 2px 7px; font-family: inherit; min-width: 22px; }
+.tri button:hover { background: var(--bg3); color: var(--text); }
+.tri button.on-inc { background: var(--accent); color: var(--accent-contrast); }
+.tri button.on-exc { background: var(--bad); color: #2a0b0a; }
 /* Saved filters (filter-bar.js opts.saved, dev/changelog/1156). The chip names the saved
    filter on screen, capped so a long name cannot push the chip row off a phone. */
 .fb-saved-cur { display: inline-block; max-width: 14em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; vertical-align: bottom; }
@@ -2897,6 +2878,13 @@ th.gd-c-part { text-align: center; }
   }
   .gm-sheet-sec:first-child { margin-top: 0; }
   .gm-tick { color: var(--accent-text); font-size: var(--fs-sm); flex: 0 0 auto; }
+  /* A Filters-sheet value row with the filter bar's is / is-not control beside it. The
+     row's rule moves to the wrapper so it runs under the control too, and the control is
+     sized for a thumb rather than a pointer, as the channel search's sheet does. */
+  .gm-fval { display: flex; align-items: center; gap: 8px; border-bottom: 1px solid var(--border-soft); }
+  .gm-fval:last-child { border-bottom: none; }
+  .gm-fval .sheet-act { border-bottom: none; flex: 1 1 auto; min-width: 0; }
+  .gm-fval .tri button { height: 32px; padding: 0 10px; font-size: var(--fs-sm); }
 
   .gm-selcount { flex: 0 0 auto; font-size: var(--fs-sm); color: var(--text-muted); }
   /* Reserved unconditionally, deliberately NOT toggled with the bar: coupling the page's
@@ -4037,6 +4025,13 @@ a.shot-link { display: block; width: fit-content; cursor: zoom-in; }
 .acct-act-dot.live { background: var(--accent); }
 .acct-act-body { min-width: 0; }
 .acct-act-line { font-size: var(--fs-md); }
+.acct-act-sub { font-size: var(--fs-sm); color: var(--text-muted); margin-top: 2px; overflow-wrap: anywhere; }
+/* Inline, so the "and N more" toggle sits in the sentence. Opened, Chromium lays the rest out
+   as a block, so it starts on the line below - checked at 375px and desktop. */
+.acct-act-more, .acct-act-more > summary { display: inline; }
+.acct-act-more > summary { cursor: pointer; color: var(--accent); list-style: none; }
+.acct-act-more > summary::-webkit-details-marker { display: none; }
+.acct-act-more[open] > summary { display: none; }
 .acct-act-when { font-size: var(--fs-sm); color: var(--text-faint); margin-top: 1px; }
 
 /* ── The phone's sticky action bar (§17.5 item 3) ────────────────────────────

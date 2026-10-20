@@ -291,14 +291,8 @@
 .menu-panel .col-item { padding: 4px 2px; font-size: var(--fs-md); }
 .menu-panel .col-item.drag-over { outline: 1px dashed var(--accent); }
 
-/* Three-state value control: off, included, excluded, right where you are
-   looking at the value. This is how "is not" is said. */
-.tri { display: inline-flex; border: 1px solid var(--border); border-radius: var(--radius-sm); overflow: hidden; flex: none; }
-.tri button { border: none; background: var(--bg1); color: var(--text-faint); cursor: pointer;
-  font-size: var(--fs-xs); font-weight: 700; padding: 2px 7px; font-family: inherit; min-width: 22px; }
-.tri button:hover { background: var(--bg3); color: var(--text); }
-.tri button.on-inc { background: var(--accent); color: var(--accent-contrast); }
-.tri button.on-exc { background: var(--bad); color: #2a0b0a; }
+/* `.tri`, the three-state value control (off, included, excluded) that is how "is not"
+   is said, lives in style.css - the shared filter bar draws it too (dev/changelog/1207). */
 
 /* One find box everywhere: the + Filter popover and the rail facets. It clears
    from inside itself, and the x exists only when there is something to clear. */

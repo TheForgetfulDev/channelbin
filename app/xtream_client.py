@@ -14,7 +14,8 @@ import requests
 
 from .config import load_config, resolve_app_path, ensure_private_dir, DEFAULT_XTREAM_DUMP_DIR
 from . import db
-from .accounts import _request_headers, _parse_m3u_as_streams
+from .accounts import (ProviderAccountInactive, _looks_like_m3u, _request_headers,
+                       _parse_m3u_as_streams, check_xtream_auth)
 
 log = logging.getLogger(__name__)
 
@@ -165,7 +166,7 @@ class XtreamClient:
             log.warning('Live catalog unavailable (fetch failed): %s', exc)
             return None
         text = resp.text.strip()
-        if text.startswith('#EXTM3U'):
+        if _looks_like_m3u(text):
             # A server answering the JSON endpoint with a playlist has no separate live
             # catalog to consult, so it cannot act as a classification authority.
             log.info('Live catalog endpoint returned M3U (%d bytes), not JSON', len(resp.content))
@@ -197,7 +198,7 @@ class XtreamClient:
     def check_auth(self) -> dict:
         resp = self._fetch(self._api_url(), self._base_params)
         text = resp.text.strip()
-        if text.startswith('#EXTM3U'):
+        if _looks_like_m3u(text):
             # Non-standard server: returns M3U for the auth endpoint - treat as auth success
             log.info('Server returned M3U for auth endpoint (non-standard but accepted as auth OK)')
             return {'user_info': {'auth': 1}}
@@ -210,9 +211,7 @@ class XtreamClient:
                 f'First 300 chars: {preview!r}. '
                 'The base URL may be wrong or this is not an Xtream API server.'
             )
-        if not data.get('user_info', {}).get('auth'):
-            raise ValueError('Authentication failed - check username and password')
-        return data
+        return check_xtream_auth(data)
 
     def get_live_streams(self) -> list:
         """Fetch the playlist (real stream URLs). Live-vs-VOD classification is separate.
@@ -270,9 +269,9 @@ class XtreamClient:
             resp = self._fetch(url, params)
         except Exception as exc:
             raise ValueError(f'Could not fetch M3U from /get.php: {exc}') from exc
-        text = resp.content.decode('utf-8', errors='replace').strip()
+        text = resp.content.decode('utf-8-sig', errors='replace').strip()
         log.info('/get.php returned %d bytes', len(resp.content))
-        if not text.startswith('#EXTM3U'):
+        if not _looks_like_m3u(text):
             raise ValueError(f'Expected M3U from /get.php, got: {text[:100]!r}')
         streams = _parse_m3u_as_streams(text)
         log.info('Parsed %d playlist entries from /get.php M3U', len(streams))
@@ -287,7 +286,7 @@ class XtreamClient:
             log.warning('get_live_categories failed: %s', exc)
             return {}
         text = resp.text.strip()
-        if text.startswith('#EXTM3U'):
+        if _looks_like_m3u(text):
             return {}
         try:
             cats = resp.json()
@@ -360,7 +359,7 @@ class FileXtreamClient:
 
     def check_auth(self) -> dict:
         with open(os.path.join(self.dump_dir, 'auth.json'), encoding='utf-8') as f:
-            return json.load(f)
+            return check_xtream_auth(json.load(f))
 
     def get_live_streams(self) -> list:
         # The raw playlist is preferred over the pre-parsed JSON beside it: re-parsing with
@@ -434,6 +433,11 @@ def dump_xtream_account(app, account_id: int) -> str:
             auth_data = client.check_auth()
             _write_json_file(os.path.join(dump_dir, 'auth.json'), auth_data)
             meta['auth'] = 'ok'
+        except ProviderAccountInactive as exc:
+            # Kept: what the provider said about an account it will not serve is exactly what
+            # a dump of that account is for.
+            _write_json_file(os.path.join(dump_dir, 'auth.json'), exc.auth_payload)
+            meta['auth'] = f'inactive: {exc}'
         except Exception as exc:
             meta['auth'] = f'error: {exc}'
             log.warning('Dump: auth failed for account %d: %s', account_id, exc)
@@ -442,7 +446,7 @@ def dump_xtream_account(app, account_id: int) -> str:
         try:
             resp = client._fetch(client._api_url(), dict(client._base_params, action='get_live_categories'))
             text = resp.text.strip()
-            if not text.startswith('#EXTM3U'):
+            if not _looks_like_m3u(text):
                 cats_raw = resp.json()
                 _write_json_file(os.path.join(dump_dir, 'live_categories.json'), cats_raw)
                 meta['categories'] = len(cats_raw)
@@ -456,7 +460,7 @@ def dump_xtream_account(app, account_id: int) -> str:
         try:
             resp = client._fetch(client._api_url(), dict(client._base_params, action='get_live_streams'))
             text = resp.text.strip()
-            if text.startswith('#EXTM3U'):
+            if _looks_like_m3u(text):
                 with open(os.path.join(dump_dir, 'live_streams_json_api.m3u'), 'w', encoding='utf-8') as f:
                     f.write(text)
                 meta['streams_json_api'] = f'server returned M3U ({len(resp.content)} bytes)'

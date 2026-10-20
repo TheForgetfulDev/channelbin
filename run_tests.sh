@@ -6,13 +6,21 @@
 #   ./run_tests.sh -j 6         More shards. Each worker peaks around 140MB.
 #   ./run_tests.sh --reverse-shards   A different, equally valid shard split. Use it to prove
 #                               a green run is order-independent and not just lucky.
+#   ./run_tests.sh --capture    The capture tier instead: real recordings against the
+#                               simulator (tests/capture/scenario_*.py), serially, about 10
+#                               minutes. --repeat N runs it N times and stops at the first red
+#                               pass (a scenario is admitted after 20 in a row); --scenario
+#                               NAME runs one. Never part of the default run - its modules are
+#                               named scenario_*.py so the default discovery skips them, and
+#                               tests/test_capture_smoke.py is the short set the default run
+#                               does carry (DESIGN-simulator.md §4, dev/changelog/1223).
 #
 # Every form runs the SAME tests: the split is by whole module, and a module that lands in
 # no shard is a hard error rather than a quietly smaller suite. Reach for `-j 1` when
 # debugging anything that smells order-dependent, and see dev/docs/PERF-test-suite.md for
 # where the suite's time actually goes.
 #
-# Playwright (browser/UI tests) is separate: `npx playwright test`, never run from here.
+# The browser suite is separate: `python3 dev/sim/ui.py`, never run from here (dev/changelog/1226).
 # No restart.sh hook by design.
 #
 # Runs through tests/support/timing.py (not raw `unittest discover`): same discovery and

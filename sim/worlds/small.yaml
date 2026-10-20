@@ -1,0 +1,46 @@
+# A small world with each shape a real install has met, for trying the simulator by hand and
+# for tests. Every name in it is invented.
+#
+# - harbor is one backend behind two Xtream panels. The first login works on both, so it is
+#   one account seen through two services; the second is a separate account on the same
+#   backend, sharing its streams but not its seats.
+# - meadow is a backend behind a plain M3U panel, whose guide is served gzipped.
+# - listings is a third-party guide site covering both backends under its own ids.
+seed: 7
+calibration: prod
+
+backends:
+  - name: harbor
+    channels: 300
+    stream_hosts: 2
+  - name: meadow
+    channels: 120
+
+panels:
+  - name: harbor-tv
+    backend: harbor
+    url_shape: {bare: 0.9, live_ts: 0.08, live_m3u8: 0.02}
+  - name: harbor-plus
+    backend: harbor
+    share: 0.95
+    rename: 0.3
+    recategorize: 0.1
+    server_info: api
+    url_shape: {bare: 0.61, live_ts: 0.39}
+    id_spelling: word_dash_number
+  - name: meadow-m3u
+    backend: meadow
+    kind: m3u
+    guide_gzip: true
+
+guide_sites:
+  - name: listings
+    coverage: 0.8
+
+logins:
+  - backend: harbor
+    panels: [harbor-tv, harbor-plus]
+  - backend: harbor
+    panels: [harbor-tv]
+    max_connections: 2
+  - backend: meadow

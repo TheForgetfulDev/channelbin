@@ -21,7 +21,13 @@
 
    Values are strings - they make a round trip through a `data-` attribute, which has no
    other type. Values inside one dimension OR together and different dimensions AND,
-   which is the only sensible reading of "Status: Fail, Warn" beside "Account: A".
+   which is the only sensible reading of "Status is Fail, Warn" beside "Account is A".
+
+   EVERY VALUE IS OFF, "is" OR "is not" - never two at once. A dimension passes a row when
+   it has no "is" values or one of them matches, AND none of its "is not" values match.
+   That is the channel search's three-state rule (app/channel_search.py `Dimension`) and
+   its chip wording, lifted rather than redesigned so the control means the same thing on
+   every page that draws one (dev/changelog/1207).
 
    `row` is whatever the caller filters: a DOM node on a server-rendered list, a plain
    object on a JS-rendered one. Nothing here ever reads a row itself - `match` does - so
@@ -31,7 +37,7 @@
    of which may be the default applied as the page opens. Stored through the generic
    /api/user-prefs row so they follow the user across browsers (DESIGN.md 3.11).
 
-   Rollout: dev/changelog/767; saved filters dev/changelog/1156. */
+   Rollout: dev/changelog/767; saved filters dev/changelog/1156; is / is not dev/changelog/1207. */
 
 function createFilterBar(opts) {
   const chipsEl = opts.chipsEl;
@@ -40,7 +46,7 @@ function createFilterBar(opts) {
   const rowsOf = opts.rows || (() => []);
   const onChange = opts.onChange || (() => {});
 
-  // { dimKey: Set(value) }. Empty is the nothing-active state, and it is also what the
+  // { dimKey: Map(value -> 'is' | 'not') }. Empty is the nothing-active state, and it is also what the
   // server renders, so JS only ever upgrades this page - it is never required to calm
   // one down. An "all values checked means no filter" reading would light the bar on
   // every page load, which is why nothing here has one.
@@ -57,14 +63,23 @@ function createFilterBar(opts) {
     return o ? o.label : v;
   };
 
-  const selected = (k) => active[k] || new Set();
-  const has = (k, v) => !!active[k] && active[k].has(v);
+  const selected = (k) => new Set(active[k] ? active[k].keys() : []);
+  // null when the value is off. `has` stays "is this value included", which is what its
+  // callers asked before "is not" existed.
+  const opOf = (k, v) => (active[k] && active[k].get(v)) || null;
+  const has = (k, v) => opOf(k, v) === 'is';
   const count = () => Object.keys(active).reduce((n, k) => n + active[k].size, 0);
 
-  function toggle(k, v) {
+  /* The is / is-not control: pressing the operator already on turns the value off, pressing
+     the other one switches it. No op is a tap on the value itself, which presses "is" -
+     exactly the channel search's toggleValue(), so an excluded value tapped there and here
+     does the same thing. */
+  function toggle(k, v, op = 'is') {
     if (!dimByKey(k)) return;
-    if (!active[k]) active[k] = new Set();
-    if (active[k].has(v)) active[k].delete(v); else active[k].add(v);
+    if (!active[k]) active[k] = new Map();
+    const cur = active[k].get(v) || null;
+    const next = cur === op ? null : op;
+    if (next) active[k].set(v, next); else active[k].delete(v);
     if (!active[k].size) delete active[k];
   }
 
@@ -72,11 +87,15 @@ function createFilterBar(opts) {
     Object.keys(active).forEach(k => delete active[k]);
   }
 
-  // Flat [key, value] pairs, the same shape setFrom() takes, so a caller that persists
-  // the bar to the URL reads and writes one format.
+  // Flat pairs, the same shape setFrom() takes, so a caller that persists the bar to the
+  // URL reads and writes one format: [key, value] for "is", [key, value, 'not'] for "is
+  // not". The two-element spelling is the only one there was before "is not", so every
+  // saved filter and URL written then still reads as what it meant.
   function entries() {
     const out = [];
-    dims.forEach(d => { if (active[d.k]) active[d.k].forEach(v => out.push([d.k, v])); });
+    dims.forEach(d => {
+      if (active[d.k]) active[d.k].forEach((op, v) => out.push(op === 'not' ? [d.k, v, 'not'] : [d.k, v]));
+    });
     return out;
   }
 
@@ -84,8 +103,8 @@ function createFilterBar(opts) {
     (pairs || []).forEach(pair => {
       const k = pair[0], v = String(pair[1]);
       if (!dimByKey(k)) return;
-      if (!active[k]) active[k] = new Set();
-      active[k].add(v);
+      if (!active[k]) active[k] = new Map();
+      active[k].set(v, pair[2] === 'not' ? 'not' : 'is');
     });
   }
 
@@ -93,7 +112,12 @@ function createFilterBar(opts) {
     return Object.keys(active).every(k => {
       const d = dimByKey(k);
       if (!d) return true;
-      return Array.from(active[k]).some(v => d.match(row, v));
+      let anyIs = false, hitIs = false;
+      for (const [v, op] of active[k]) {
+        if (op === 'not') { if (d.match(row, v)) return false; }
+        else { anyIs = true; if (!hitIs && d.match(row, v)) hitIs = true; }
+      }
+      return !anyIs || hitIs;
     });
   }
 
@@ -106,7 +130,7 @@ function createFilterBar(opts) {
       const d = dimByKey(k);
       if (!d || !isOffered(d)) { delete active[k]; return; }
       const live = new Set(valuesOf(d).map(o => o.v));
-      Array.from(active[k]).forEach(v => { if (!live.has(v)) active[k].delete(v); });
+      Array.from(active[k].keys()).forEach(v => { if (!live.has(v)) active[k].delete(v); });
       if (!active[k].size) delete active[k];
     });
   }
@@ -118,14 +142,17 @@ function createFilterBar(opts) {
     // reshuffles itself as you add a filter is one the eye has to re-read every time.
     dims.forEach(d => {
       if (!active[d.k]) return;
-      Array.from(active[d.k]).forEach(v => {
-        const text = `${d.label}: ${labelOf(d, v)}`;
+      active[d.k].forEach((op, v) => {
+        const word = op === 'not' ? 'is not' : 'is';
+        const text = `${d.label} ${word} ${labelOf(d, v)}`;
         const chip = document.createElement('button');
         chip.type = 'button';
-        chip.className = 'chip active active-filter';
-        chip.innerHTML = `${escHtml(text)} <span class="chip-x" aria-hidden="true">&#10005;</span>`;
+        chip.className = `chip active active-filter${op === 'not' ? ' neg' : ''}`;
+        chip.innerHTML = `${escHtml(d.label)} <span class="fb-op">${word}</span> ` +
+          `${escHtml(labelOf(d, v))} <span class="chip-x" aria-hidden="true">&#10005;</span>`;
         chip.setAttribute('aria-label', `Remove filter ${text}`);
-        chip.addEventListener('click', () => { toggle(d.k, v); apply(); });
+        // Its own operator, so removing an "is not" chip is never pressing "is".
+        chip.addEventListener('click', () => { toggle(d.k, v, op); apply(); });
         chipsEl.insertBefore(chip, anchor);
       });
     });
@@ -156,14 +183,30 @@ function createFilterBar(opts) {
     // question being asked while choosing one.
     const rows = rowsOf() || [];
     return back + vals.map(o => {
-      const on = has(d.k, o.v);
+      const op = opOf(d.k, o.v);
       const n = rows.filter(r => d.match(r, o.v)).length;
-      return `<button class="menu-item fb-val${on ? ' on' : ''}" type="button" ` +
-        `data-fdim="${escHtml(d.k)}" data-fval="${escHtml(o.v)}" aria-pressed="${on}">` +
-        `<span class="fb-tick" aria-hidden="true">${on ? '&#10003;' : ''}</span>` +
+      return `<div class="fb-val-row"><button class="menu-item fb-val${op ? ` on${op === 'not' ? ' neg' : ''}` : ''}" ` +
+        `type="button" data-fdim="${escHtml(d.k)}" data-fval="${escHtml(o.v)}" aria-pressed="${!!op}">` +
+        `<span class="fb-tick" aria-hidden="true">${op === 'is' ? '&#10003;' : ''}</span>` +
         `<span class="fb-lbl">${escHtml(o.label)}</span>` +
-        `<span class="fb-n">${n}</span></button>`;
+        `<span class="fb-n">${n}</span></button>${opHtml(d.k, o.v, o.label)}</div>`;
     }).join('');
+  }
+
+  /* The is / is-not control for one value: the channel search's three-state `.tri`
+     (style.css), worded rather than drawn as + and a minus sign, because a minus is not in
+     the app's glyph set (DESIGN.md 4) and the words are the ones the chip then says.
+     Returned to callers too, so a page that draws the same values somewhere else - the
+     group page's phone sheet - draws this control rather than a second one. A click on it
+     is `toggle(k, v, op)`. */
+  function opHtml(k, v, label) {
+    const op = opOf(k, v);
+    const at = `data-fdim="${escHtml(k)}" data-fval="${escHtml(v)}"`;
+    return `<span class="tri">` +
+      `<button type="button" ${at} data-fop="is" class="${op === 'is' ? 'on-inc' : ''}" ` +
+      `aria-pressed="${op === 'is'}" aria-label="${escHtml(`Only ${label}`)}">is</button>` +
+      `<button type="button" ${at} data-fop="not" class="${op === 'not' ? 'on-exc' : ''}" ` +
+      `aria-pressed="${op === 'not'}" aria-label="${escHtml(`Everything but ${label}`)}">is not</button></span>`;
   }
 
   function renderMenu() {
@@ -199,8 +242,8 @@ function createFilterBar(opts) {
      opts.saved = { chipEl, menuEl, list, prefUrl }: the chip that opens the saved-filter
      popover, the popover itself, the list the server rendered into the page, and the
      /api/user-prefs URL the whole list is written back to. A record is
-     { name, filters: [[k, v], ...], is_default } - `filters` is entries()'s own shape, so
-     there is one spelling of a selection, not two.
+     { name, filters: [[k, v], [k, v, 'not'], ...], is_default } - `filters` is entries()'s
+     own shape, so there is one spelling of a selection, not two.
 
      A saved filter holds the chips only: not the page's search text, not its sort. */
   const sv = opts.saved || null;
@@ -219,8 +262,8 @@ function createFilterBar(opts) {
     (Array.isArray(list) ? list : []).forEach(r => {
       if (!r || typeof r.name !== 'string' || !r.name.trim() || !Array.isArray(r.filters)) return;
       const filters = r.filters
-        .filter(p => Array.isArray(p) && p.length === 2)
-        .map(p => [String(p[0]), String(p[1])]);
+        .filter(p => Array.isArray(p) && (p.length === 2 || (p.length === 3 && p[2] === 'not')))
+        .map(p => (p.length === 3 ? [String(p[0]), String(p[1]), 'not'] : [String(p[0]), String(p[1])]));
       const isDefault = !!r.is_default && !sawDefault;
       if (isDefault) sawDefault = true;
       out.push({ name: r.name.trim(), filters, is_default: isDefault });
@@ -228,9 +271,10 @@ function createFilterBar(opts) {
     return out;
   }
 
-  // What makes two selections "the same one": the same pairs, in any order.
+  // What makes two selections "the same one": the same pairs with the same is / is not,
+  // in any order.
   const pairsKey = (pairs) => JSON.stringify(
-    (pairs || []).map(p => JSON.stringify([String(p[0]), String(p[1])])).sort());
+    (pairs || []).map(p => JSON.stringify([String(p[0]), String(p[1]), p[2] === 'not'])).sort());
   const savedByName = (name) => savedList.find(s => s.name === name) || null;
 
   /* DERIVED from the chips on screen, never a flag each handler must remember to set -
@@ -316,9 +360,9 @@ function createFilterBar(opts) {
     const dropped = s.filters.filter(p => !kept.has(JSON.stringify(p)));
     loadedName = s.name;
     if (dropped.length) {
-      const what = dropped.map(([k, v]) => {
+      const what = dropped.map(([k, v, op]) => {
         const d = dimByKey(k);
-        return d ? `${d.label}: ${labelOf(d, v)}` : `${k}: ${v}`;
+        return `${d ? d.label : k} ${op === 'not' ? 'is not' : 'is'} ${d ? labelOf(d, v) : v}`;
       }).join(', ');
       toast(`Nothing on this list matches ${what} right now, so "${s.name}" was applied without it.`, 'warning');
     }
@@ -418,11 +462,12 @@ function createFilterBar(opts) {
     // way the checkbox list this replaced behaved.
     const back = e.target.closest('[data-fback]');
     if (back) { e.stopPropagation(); openKey = null; renderMenu(); return; }
-    // Checked before [data-fdim] because a value row carries both.
+    // Checked before [data-fdim] because a value row carries both. The is / is-not
+    // buttons carry data-fop; the row itself does not.
     const val = e.target.closest('[data-fval]');
     if (val) {
       e.stopPropagation();
-      toggle(val.dataset.fdim, val.dataset.fval);
+      toggle(val.dataset.fdim, val.dataset.fval, val.dataset.fop || undefined);
       apply();
       return;
     }
@@ -436,5 +481,5 @@ function createFilterBar(opts) {
 
   render();
 
-  return { matches, count, entries, setFrom, clear, toggle, has, selected, render, apply };
+  return { matches, count, entries, setFrom, clear, toggle, has, opOf, opHtml, selected, render, apply };
 }
