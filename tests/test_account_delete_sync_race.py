@@ -33,8 +33,7 @@ from tests.support.seed import make_account  # noqa: E402
 
 class DeleteAccountSyncRaceTests(unittest.TestCase):
     def setUp(self):
-        self.t = make_test_app()
-        self.t.app.config['WTF_CSRF_ENABLED'] = False
+        self.t = make_test_app(csrf=False)
         self.acct = make_account(name='Provider A')
         db.session.commit()
         self.account_id = self.acct.id

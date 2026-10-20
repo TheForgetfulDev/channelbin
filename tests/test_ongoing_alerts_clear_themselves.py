@@ -62,8 +62,7 @@ class _SlotCase(unittest.TestCase):
     """
 
     def setUp(self):
-        self.t = make_test_app()
-        self.t.app.config['WTF_CSRF_ENABLED'] = False
+        self.t = make_test_app(csrf=False)
         self.client = self.t.client
         self.dvr = os.path.join(self.t._tmpdir, 'dvr')
         os.makedirs(self.dvr, exist_ok=True)
@@ -304,8 +303,7 @@ class _GuideCase(unittest.TestCase):
     path 3, reported rather than acted on because no human is present to confirm."""
 
     def setUp(self):
-        self.t = make_test_app()
-        self.t.app.config['WTF_CSRF_ENABLED'] = False
+        self.t = make_test_app(csrf=False)
         self.client = self.t.client
         self.ctx = self.t.app.app_context()
         self.ctx.push()

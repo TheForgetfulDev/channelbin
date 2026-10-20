@@ -289,7 +289,12 @@ class GuideLayoutDefaultsTests(unittest.TestCase):
             js = fh.read()
         with open(os.path.join(REPO, 'static', 'css', 'guide.css'), encoding='utf-8') as fh:
             css = fh.read()
-        self.assertIn("matchMedia('(max-width: 960px)')", js)
+        with open(os.path.join(REPO, 'static', 'js', 'util.js'), encoding='utf-8') as fh:
+            util = fh.read()
+        # The query lives in util.js (MOBILE_MQ, dev/changelog/1244); guide.js listens on it.
+        self.assertNotIn('matchMedia(', js)
+        self.assertIn("MOBILE_MQ.addEventListener('change'", js)
+        self.assertIn("matchMedia('(max-width: 960px)')", util)
         self.assertIn('@media (max-width: 960px)', css)
 
     # ── The channel detail page's "What's On" card (dev/changelog/349) ────────

@@ -84,8 +84,7 @@ class EmptySectionKeepsItsDefaultsTests(unittest.TestCase):
     """
 
     def setUp(self):
-        self.t = make_test_app()
-        self.t.app.config['WTF_CSRF_ENABLED'] = False
+        self.t = make_test_app(csrf=False)
         self.t.sandbox_config({'recording': {'dvr_output_dir': '/dvr', 'logo_cache': None,
                                              'live_thumbnail': None},
                                'channel_testing': None,

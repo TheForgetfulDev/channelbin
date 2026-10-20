@@ -170,8 +170,7 @@ class AnalyzingIsNamedByEverySurfaceTests(unittest.TestCase):
     """CLAUDE.md's states-are-enumerated rule, applied to the status just added."""
 
     def setUp(self):
-        self.t = make_test_app()
-        self.t.app.config['WTF_CSRF_ENABLED'] = False
+        self.t = make_test_app(csrf=False)
         self.acc = seed.make_account()
         self.ch = seed.make_channel(self.acc, stream_id=1, name='Ch')
         db.session.commit()

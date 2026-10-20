@@ -251,6 +251,14 @@ class WatchdogThread(threading.Thread):
             # from the restart branch to the next outer-loop pass. See where it is consumed
             # below for why re-deriving it instead cost ~11s per dead segment.
             restart_no_data_segment = None
+            # Set by a failover branch when it launches the next member's segment: the
+            # moment the dead capture was given up on, banked as downtime when the new
+            # segment writes its first byte. The same-member restart measures that gap
+            # inline (wait_for_file_data); a failover hands off to the outer loop at once,
+            # and until dev/changelog/1242 the reconnect wait on that path was never
+            # counted, so a group recording under-reported downtime by one reconnect per
+            # move against a single-channel one.
+            failover_gap_start = None
             # Stall-rate demotion (dev/changelog/889): monotonic timestamps of the stalls
             # charged to the member currently being recorded, and which member that is.
             # Keyed on the member rather than cleared at each failover site: a move that
@@ -363,6 +371,20 @@ class WatchdogThread(threading.Thread):
                         current_size = os.path.getsize(seg_path)
                     except FileNotFoundError:
                         current_size = 0
+
+                    if failover_gap_start is not None and current_size > 0:
+                        # The new member's first byte: the reconnect wait is over. Read
+                        # outside the closure so a lock-retry charges the same gap.
+                        failover_gap_seconds = time.monotonic() - failover_gap_start
+                        failover_gap_start = None
+
+                        @retry_on_locked()
+                        def _record_failover_gap_and_commit():
+                            r = db.session.get(Recording, self.recording_id)
+                            r.total_downtime_seconds += failover_gap_seconds
+                            db.session.commit()
+
+                        _record_failover_gap_and_commit()
 
                     if probe_attempts < _PROBE_MAX_ATTEMPTS and current_size >= _PROBE_MIN_BYTES:
                         probe_attempts += 1
@@ -592,6 +614,11 @@ class WatchdogThread(threading.Thread):
                             )
                         # ── STALL HANDLING ──────────────────────────────
 
+                        # A failover's segment that never wrote a byte is charged below
+                        # as the stall it is, from its own growth clock; the reconnect
+                        # gap it was going to bank is dropped rather than counted twice.
+                        failover_gap_start = None
+
                         # Dead-stream classification: a segment that stalled quickly
                         # and produced very little data is a candidate "early failure" -
                         # independent of consecutive_failures, and NOT reset just because
@@ -642,8 +669,8 @@ class WatchdogThread(threading.Thread):
                         if is_early_failure:
                             now_mono = time.monotonic()
                             early_fail_times.append(now_mono)
-                            cutoff = now_mono - early_fail_abort_window
-                            early_fail_times[:] = [t for t in early_fail_times if t >= cutoff]
+                            early_fail_times[:] = stalls_within_window(
+                                early_fail_times, now_mono, early_fail_abort_window)
                         else:
                             early_fail_times.clear()
 
@@ -781,9 +808,16 @@ class WatchdogThread(threading.Thread):
                             # RESTART_FAILED row above. Charging stalled_for again would count
                             # the same window twice.
                             r.total_downtime_seconds += stalled_for
-                            r.consecutive_failures += 1
-                            if r.consecutive_failures > r.consecutive_failures_peak:
-                                r.consecutive_failures_peak = r.consecutive_failures
+                            # The failure counter is deduplicated the same way: a restart
+                            # that produced nothing was already counted as one consecutive
+                            # failure by its RESTART_FAILED, and this close-out is the same
+                            # attempt, not a second one. Counting it twice reached
+                            # max_consecutive_failures after half the restarts the setting
+                            # names and reported twice the attempts (dev/changelog/1247).
+                            if not restart_dead:
+                                r.consecutive_failures += 1
+                                if r.consecutive_failures > r.consecutive_failures_peak:
+                                    r.consecutive_failures_peak = r.consecutive_failures
 
                             add_recording_event(self.recording_id, STALL_DETECTED,
                                 detail=stall_detail,
@@ -873,6 +907,7 @@ class WatchdogThread(threading.Thread):
                                         'provider placeholder on first connect',
                                         demote=True, score_departure=False):
                                     early_fail_times.clear()
+                                    failover_gap_start = time.monotonic()
                                     _launch_segment(self.app, self.recording_id, seg_num + 1)
                                     break
                                 # Nowhere to go - a one-member group, or no group at all.
@@ -920,6 +955,7 @@ class WatchdogThread(threading.Thread):
                                     member_stall_times = []
                                     member_stall_channel_id = None
                                     early_fail_times.clear()
+                                    failover_gap_start = time.monotonic()
                                     _launch_segment(self.app, self.recording_id, seg_num + 1)
                                     break
                                 # Nowhere to go, and out of strikes. This is the one place
@@ -947,10 +983,16 @@ class WatchdogThread(threading.Thread):
                         # give-up point instead of aborting; the abort paths run only
                         # once every member has failed (ffmpeg is already dead here -
                         # killed in the stall handling above).
-                        if is_early_failure and len(early_fail_times) >= early_fail_abort_count:
+                        # 0 turns the trip-wire off, as it does for stall_move_count and
+                        # dead_stream_max_retry_attempts; without the guard a 0 aborted on
+                        # the first early failure, the opposite of what the sibling fields
+                        # mean by it (dev/changelog/1242).
+                        if (is_early_failure and early_fail_abort_count > 0
+                                and len(early_fail_times) >= early_fail_abort_count):
                             from .recorder import failover_group_member, _launch_segment
                             if failover_group_member(self.app, self.recording_id, 'dead-stream fast-fail'):
                                 early_fail_times.clear()
+                                failover_gap_start = time.monotonic()
                                 _launch_segment(self.app, self.recording_id, seg_num + 1)
                                 break
                             # exit_code/stderr_tail were collected above (this block's own
@@ -977,6 +1019,7 @@ class WatchdogThread(threading.Thread):
                             from .recorder import failover_group_member, _launch_segment
                             if failover_group_member(self.app, self.recording_id, 'max consecutive failures'):
                                 early_fail_times.clear()
+                                failover_gap_start = time.monotonic()
                                 _launch_segment(self.app, self.recording_id, seg_num + 1)
                                 break
                             # Same reasoning as the dead-stream give-up above: pass the
@@ -1027,6 +1070,7 @@ class WatchdogThread(threading.Thread):
                                 member_stall_times = []
                                 member_stall_channel_id = None
                                 early_fail_times.clear()
+                                failover_gap_start = time.monotonic()
                                 _launch_segment(self.app, self.recording_id, seg_num + 1)
                                 break
                             # Nowhere better to go - a one-member group, or every other
@@ -1135,6 +1179,15 @@ class WatchdogThread(threading.Thread):
                             poll_interval=2,
                         )
 
+                        # A stop that landed while the relaunch was being waited for is a
+                        # teardown, not a verdict: the teardown owns the segment's close
+                        # and the kill, and judging the launch here wrote RESTART_FAILED
+                        # onto a recording stopped on purpose - and, at the failure
+                        # ceiling, failed it and scored the channel for a clean stop
+                        # (dev/changelog/1242).
+                        if self.state.stop_event.is_set():
+                            return
+
                         # Read once, outside both closures below: a lock-retry re-runs the
                         # closure and would otherwise charge the recording a longer gap
                         # each attempt.
@@ -1200,10 +1253,23 @@ class WatchdogThread(threading.Thread):
                                 from .recorder import _close_active_segment
                                 _close_active_segment(self.app, self.recording_id, exit_reason='ERROR')
                                 early_fail_times.clear()
+                                failover_gap_start = time.monotonic()
                                 _launch_segment(self.app, self.recording_id, next_seg_num + 1)
                                 break
                             if rec2.consecutive_failures >= max_failures:
-                                self._give_up(lambda: self._fail_recording(rec2, max_failures))
+                                # The one give-up that reaches _give_up with the row still
+                                # open: every other one arrives from the stall handling,
+                                # which closed it. Closed here the way the failover branch
+                                # above closes it, or a FAILED recording shows its last
+                                # segment still capturing and counting up
+                                # (dev/changelog/1242). The spool is consumed by the close,
+                                # so the cause is passed through rather than re-read.
+                                terminate_or_kill(self.state.process)
+                                from .recorder import _close_active_segment
+                                tail = _close_active_segment(self.app, self.recording_id,
+                                                             exit_reason='ERROR')
+                                self._give_up(lambda: self._fail_recording(
+                                    rec2, max_failures, cause=_first_line(tail)))
                                 return
                             # Hand the verdict to the next outer-loop pass rather than
                             # letting it start a fresh GrowthMonitor and spend another
@@ -1218,6 +1284,12 @@ class WatchdogThread(threading.Thread):
                     self.state.stop_event.wait(timeout=poll)
                 # ── End inner loop ───────────────────────────────────────────
 
+            # A launch on this thread (the restart branch, a failover, a block move) that
+            # passed its own stop check in the instant before the teardown set the event
+            # may have put a fresh child into state.process after the teardown's kill
+            # read it. The teardown cannot see it; this thread can, and it is a no-op on
+            # a child the teardown did reach (dev/changelog/1242).
+            terminate_or_kill(self.state.process)
             log.info('Watchdog exiting for recording %d (stop_event set)', self.recording_id)
 
     def _check_account_block(self, seg_num: int) -> bool:
@@ -1263,7 +1335,11 @@ class WatchdogThread(threading.Thread):
         if self._block_stay_noted == key:
             return False
         self._block_stay_noted = key
-        where = ('it has no member on an account that is not blocked'
+        # Both ways a group move comes back empty-handed: no member off a blocked account,
+        # or the member it would move to sits on an account at its connection limit, in
+        # which case the move was refused and the seat kept (dev/changelog/1242).
+        where = ('no other member of its group can take over right now - each is on a '
+                 'blocked account or on an account at its connection limit'
                  if rec.group_id is not None else 'it records from a single channel')
         channel_name = channel.name
         log.warning('Recording %d: %s, but %s - staying on "%s"',
@@ -1577,16 +1653,19 @@ class WatchdogThread(threading.Thread):
         add_recording_event(self.recording_id, event_type, detail=detail)
         # Whatever ffmpeg said on its way out, attached to the segment that was live when we
         # gave up. Collected in _give_up (see there for why it cannot happen inside this
-        # retried closure); the default covers the paths that reach here without it.
-        # ended_at/exit_reason are deliberately NOT set here: that row is left open by a
-        # separate known defect tracked in the backlog, and closing it is out of scope here.
+        # retried closure); the default covers the paths that reach here without it. Every
+        # give-up closes the row before it reaches here (the stall handling, or the
+        # no-data restart branch's own close), and that close recorded what ffmpeg said on
+        # the row itself - so with nothing open there is nothing to add, and a second,
+        # segment-less copy of the same exit is not written.
         from .database import RecordingSegment
         from .recorder import record_segment_diagnostics
         open_seg = RecordingSegment.query.filter_by(
             recording_id=self.recording_id, ended_at=None
         ).order_by(RecordingSegment.segment_number.desc()).first()
-        record_segment_diagnostics(self.recording_id, open_seg, exit_code, stderr_tail,
-                                   reconnects, spool_missing, jumps)
+        if open_seg is not None:
+            record_segment_diagnostics(self.recording_id, open_seg, exit_code, stderr_tail,
+                                       reconnects, spool_missing, jumps)
         db.session.commit()
         # `status` on every frame that moves a row: dashboard.js relabels from it and
         # ignores a frame without one (dev/changelog/1023).

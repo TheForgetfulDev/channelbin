@@ -20,7 +20,7 @@ import subprocess
 import sys
 import time
 import unittest
-from datetime import datetime, timedelta
+from datetime import timedelta
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -31,129 +31,15 @@ import app.watchdog as wdmod  # noqa: E402
 from app import db  # noqa: E402
 from app.database import STALL_DETECTED, RecordingEvent, RecordingSegment  # noqa: E402
 from app.proc_utils import wait_for_file_data  # noqa: E402
-from app.recorder import RecordingState  # noqa: E402
 from app.watchdog import WatchdogThread  # noqa: E402
 from tests.support import seed  # noqa: E402
 from tests.support.app import make_test_app  # noqa: E402
 
 
-def _sleeper(seconds=120):
-    """A live local child that outlives the test unless something kills it."""
-    return subprocess.Popen([sys.executable, '-c', f'import time; time.sleep({seconds})'],
-                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+from tests.support.watchdog import WatchdogHarness, sleeper  # noqa: E402
 
 
-class _WatchdogHarness(unittest.TestCase):
-    """One recording, one open segment on a static file, one WatchdogThread under our own
-    config. _launch_segment is stubbed throughout: a restart is not what any of these
-    assert, and letting the real one run would spawn ffmpeg at a provider URL."""
-
-    def setUp(self):
-        self.t = make_test_app()
-        self.wd = None
-        self.launched = []
-        self.state = RecordingState(current_segment_num=0)
-
-        now = datetime.utcnow()
-        rec = seed.make_recording(status='IN_PROGRESS', name='wdexit', started_at=now,
-                                  start_time=now, stop_time=now + timedelta(hours=1))
-        self.rid = rec.id
-        self.seg_path = os.path.join(self.t._tmpdir, f'rec_{self.rid}_seg_000.ts')
-        with open(self.seg_path, 'wb') as fh:
-            fh.write(b'\x47' * 4096)
-        db.session.add(RecordingSegment(recording_id=self.rid, segment_number=0,
-                                        file_path=self.seg_path, started_at=now))
-        db.session.commit()
-
-        with recorder._lock:
-            recorder._active[self.rid] = self.state
-
-    def tearDown(self):
-        self.state.stop_event.set()
-        if self.wd is not None:
-            self.wd.join(timeout=15)
-        proc = self.state.process
-        if isinstance(proc, subprocess.Popen) and proc.poll() is None:
-            proc.kill()
-            proc.wait(timeout=10)
-        with recorder._lock:
-            recorder._active.pop(self.rid, None)
-        self.t.cleanup()
-
-    def _exited_capture(self, code=1, stderr_text='Connection reset by peer\n'):
-        """An ffmpeg stand-in that has ALREADY exited, spooling stderr the way the real
-        capture does, so the exit code and tail this path records are real values."""
-        path, fh = recorder._open_segment_stderr_spool(self.t.app, self.rid, 0)
-        self.state.stderr_path, self.state.stderr_fh = path, fh
-        proc = subprocess.Popen(
-            [sys.executable, '-c',
-             f'import sys; sys.stderr.write({stderr_text!r}); sys.stderr.flush(); '
-             f'sys.exit({code})'],
-            stdout=subprocess.DEVNULL, stderr=(fh or subprocess.DEVNULL))
-        proc.wait(timeout=30)
-        self.state.process = proc
-        return proc
-
-    def _cfg(self, stall_timeout, restart_delay=0):
-        return cfgmod._deep_merge(cfgmod.load_config(), {'watchdog': {
-            'poll_interval_seconds': 1,
-            'stall_timeout_seconds': stall_timeout,
-            'restart_delay_seconds': restart_delay,
-            'max_consecutive_failures': 99,
-            'early_fail_abort_count': 99,
-        }})
-
-    def _stub_launch(self, new_process=None):
-        """Stand-in for _launch_segment. Sets stop_event so the watchdog winds down after
-        one restart instead of looping; the real one is checked by its own tests.
-
-        Returns LAUNCH_SPAWNED because that is what the real function returns when a child
-        is running, and the watchdog's restart branch reads it: anything else means the
-        spawn failed and the branch skips its own accounting entirely (dev/changelog/984).
-        A stub returning None would silently turn every restart in this file into a failed
-        launch."""
-        def _stub(app, recording_id, seg_num):
-            self.launched.append(seg_num)
-            if new_process is not None:
-                self.state.process = new_process
-            self.state.stop_event.set()
-            return recorder.LAUNCH_SPAWNED
-        return _stub
-
-    def _run_until_segment_closed(self, stall_timeout, new_process=None, timeout=45):
-        """Start the real thread; return (segment row, seconds until it was closed)."""
-        started = time.monotonic()
-        elapsed = None
-        with mock.patch.object(cfgmod, 'load_config',
-                               return_value=self._cfg(stall_timeout)), \
-             mock.patch.object(recorder, '_launch_segment',
-                               self._stub_launch(new_process)):
-            self.wd = WatchdogThread(self.rid, self.state, self.t.app)
-            self.wd.start()
-            deadline = time.monotonic() + timeout
-            while time.monotonic() < deadline:
-                db.session.expire_all()
-                seg = RecordingSegment.query.filter_by(
-                    recording_id=self.rid, segment_number=0).first()
-                if seg.ended_at is not None:
-                    elapsed = time.monotonic() - started
-                    break
-                time.sleep(0.2)
-            self.state.stop_event.set()
-            self.wd.join(timeout=15)
-        db.session.expire_all()
-        seg = RecordingSegment.query.filter_by(
-            recording_id=self.rid, segment_number=0).first()
-        return seg, elapsed
-
-    def _stall_event(self):
-        db.session.expire_all()
-        return (RecordingEvent.query
-                .filter_by(recording_id=self.rid, event_type=STALL_DETECTED)
-                .order_by(RecordingEvent.id.desc()).first())
-
-
-class ExitedCaptureIsNoticedTests(_WatchdogHarness):
+class ExitedCaptureIsNoticedTests(WatchdogHarness):
 
     def test_an_exited_capture_is_noticed_within_a_poll_not_a_stall_timeout(self):
         """The whole point. stall_timeout is 30s here, so a run that only notices by the
@@ -200,12 +86,12 @@ class ExitedCaptureIsNoticedTests(_WatchdogHarness):
         self.assertEqual(db.session.get(Recording, self.rid).total_stall_count, 1)
 
 
-class LiveButStalledCaptureTests(_WatchdogHarness):
+class LiveButStalledCaptureTests(WatchdogHarness):
 
     def test_a_live_capture_that_stops_growing_is_still_a_stall_kill(self):
         """The pre-existing behavior, which the new branch must not swallow: the process is
         alive, so only the growth timer can catch it and we are the ones doing the killing."""
-        self.state.process = _sleeper()
+        self.state.process = sleeper()
         seg, elapsed = self._run_until_segment_closed(stall_timeout=2)
 
         self.assertIsNotNone(elapsed, 'the segment was never closed out')
@@ -215,7 +101,7 @@ class LiveButStalledCaptureTests(_WatchdogHarness):
         self.assertIn('File stalled at', evt.detail)
 
 
-class DeliberateKillIsNotADeadFeedTests(_WatchdogHarness):
+class DeliberateKillIsNotADeadFeedTests(WatchdogHarness):
 
     def test_kill_all_active_is_not_read_as_a_dead_feed(self):
         """stop_event, not poll(), is what separates 'the feed died' from 'we killed it'.
@@ -223,7 +109,7 @@ class DeliberateKillIsNotADeadFeedTests(_WatchdogHarness):
         the flag, the watchdog reads the shutdown as a stall and spawns a replacement ffmpeg
         on the way out - an orphan writing to a segment the next process knows nothing
         about, which is the exact thing kill_all_active exists to prevent."""
-        self.state.process = _sleeper()
+        self.state.process = sleeper()
         with mock.patch.object(cfgmod, 'load_config', return_value=self._cfg(30)), \
              mock.patch.object(recorder, '_launch_segment', self._stub_launch()):
             self.wd = WatchdogThread(self.rid, self.state, self.t.app)
@@ -240,7 +126,7 @@ class DeliberateKillIsNotADeadFeedTests(_WatchdogHarness):
                           'the shutdown kill was recorded as a stream stall')
 
 
-class RestartWaitTests(_WatchdogHarness):
+class RestartWaitTests(WatchdogHarness):
 
     def test_the_restart_wait_is_handed_the_relaunched_process(self):
         """wait_for_file_data has always accepted proc= and documented that it returns False

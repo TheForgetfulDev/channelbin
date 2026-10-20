@@ -176,8 +176,7 @@ class StrandedCancelRouteEventTypeTests(unittest.TestCase):
     """The cancel route's own branch, for a CONVERTING row with no live conversion."""
 
     def setUp(self):
-        self.t = make_test_app()
-        self.t.app.config['WTF_CSRF_ENABLED'] = False
+        self.t = make_test_app(csrf=False)
 
     def tearDown(self):
         self.t.cleanup()

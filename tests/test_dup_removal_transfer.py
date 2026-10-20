@@ -44,8 +44,7 @@ def _pair(acc, url=SHARED_URL, name_a='Alpha', name_b='Beta', **a_overrides):
 
 class JobRemoveDuplicatesTransferTests(unittest.TestCase):
     def setUp(self):
-        self.t = make_test_app()
-        self.t.app.config['WTF_CSRF_ENABLED'] = False
+        self.t = make_test_app(csrf=False)
         self.acc = seed.make_account()
         db.session.commit()
 
@@ -112,8 +111,7 @@ class JobRemoveDuplicatesTransferTests(unittest.TestCase):
 
 class GroupRemoveMembersTransferTests(unittest.TestCase):
     def setUp(self):
-        self.t = make_test_app()
-        self.t.app.config['WTF_CSRF_ENABLED'] = False
+        self.t = make_test_app(csrf=False)
         self.acc = seed.make_account()
         db.session.commit()
 
@@ -154,8 +152,7 @@ class GroupRemoveMembersTransferTests(unittest.TestCase):
 
 class GuideRemoveDuplicatesTransferTests(unittest.TestCase):
     def setUp(self):
-        self.t = make_test_app()
-        self.t.app.config['WTF_CSRF_ENABLED'] = False
+        self.t = make_test_app(csrf=False)
         self.acc = seed.make_account()
         db.session.commit()
 
@@ -187,8 +184,7 @@ class CrossGroupIsolationTests(unittest.TestCase):
     their own kept channel - the exact cross-set leak this guards against."""
 
     def setUp(self):
-        self.t = make_test_app()
-        self.t.app.config['WTF_CSRF_ENABLED'] = False
+        self.t = make_test_app(csrf=False)
         self.acc = seed.make_account()
         db.session.commit()
 

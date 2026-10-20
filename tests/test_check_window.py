@@ -632,8 +632,7 @@ class OnDemandRouteWindowModeTests(unittest.TestCase):
     already covered above and in test_scheduler_*."""
 
     def setUp(self):
-        self.t = make_test_app()
-        self.t.app.config['WTF_CSRF_ENABLED'] = False
+        self.t = make_test_app(csrf=False)
         self.client = self.t.client
         self.ctx = self.t.app.app_context()
         self.ctx.push()
@@ -771,8 +770,7 @@ class SkipNextWindowJobTests(unittest.TestCase):
     scheduler.skip_next_run(), which has nothing to modify for these jobs."""
 
     def setUp(self):
-        self.t = make_test_app()
-        self.t.app.config['WTF_CSRF_ENABLED'] = False
+        self.t = make_test_app(csrf=False)
         self.client = self.t.client
         self.ctx = self.t.app.app_context()
         self.ctx.push()
@@ -881,8 +879,7 @@ class WindowSettingsValidationTests(ConfigSandbox):
         # start_scheduler=True: a start/end change calls reschedule_window_jobs()
         # (app/scheduler.py), which re-registers hc_window_close - it needs a real
         # scheduler instance to register against.
-        self.t = make_test_app(start_scheduler=True)
-        self.t.app.config['WTF_CSRF_ENABLED'] = False
+        self.t = make_test_app(start_scheduler=True, csrf=False)
         self.client = self.t.client
 
     def tearDown(self):

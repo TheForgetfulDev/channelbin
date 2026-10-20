@@ -384,8 +384,7 @@ class MissingDeletePreviewRouteTests(unittest.TestCase):
 
 class MissingDeleteRouteTests(unittest.TestCase):
     def setUp(self):
-        self.t = make_test_app()
-        self.t.app.config['WTF_CSRF_ENABLED'] = False
+        self.t = make_test_app(csrf=False)
         self.account = seed.make_account(name='Acct A')
         db.session.commit()
 
@@ -589,8 +588,7 @@ class MissingDeleteScreenshotOrderingTests(unittest.TestCase):
     """
 
     def setUp(self):
-        self.t = make_test_app()
-        self.t.app.config['WTF_CSRF_ENABLED'] = False
+        self.t = make_test_app(csrf=False)
         self.account = seed.make_account(name='Acct A')
         db.session.commit()
 
@@ -804,8 +802,7 @@ class ChannelIdScopeRouteTests(unittest.TestCase):
     (dev/changelog/772)."""
 
     def setUp(self):
-        self.t = make_test_app()
-        self.t.app.config['WTF_CSRF_ENABLED'] = False
+        self.t = make_test_app(csrf=False)
         self.account = seed.make_account(name='Acct A')
         db.session.commit()
 
@@ -967,8 +964,7 @@ class GroupAndChannelIdCombinedScopeRouteTests(unittest.TestCase):
     down."""
 
     def setUp(self):
-        self.t = make_test_app()
-        self.t.app.config['WTF_CSRF_ENABLED'] = False
+        self.t = make_test_app(csrf=False)
         self.account = seed.make_account(name='Acct A')
         db.session.commit()
 

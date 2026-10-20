@@ -3,7 +3,8 @@
 
 Four paths deleted ChannelTest rows without unlinking each row's screenshot_path first:
 teardown_test_job() (reached by a standalone job delete and by the group-dissolve
-cascade), remove_channel_from_job(), remove_duplicate_channels(), and _cleanup_old_tests().
+cascade), remove_channel_from_job() (since retired, dev/changelog/1244),
+remove_duplicate_channels(), and _cleanup_old_tests().
 Once the row is gone nothing references the file any more, so no later cleanup pass can
 ever find it - it accumulates in screenshot_dir forever. All four now go through the shared
 app.channel_tester.delete_tests_collecting_screenshots() helper: query the matching rows'
@@ -37,8 +38,7 @@ from tests.support import seed  # noqa: E402
 
 class _Base(unittest.TestCase):
     def setUp(self):
-        self.t = make_test_app()
-        self.t.app.config['WTF_CSRF_ENABLED'] = False
+        self.t = make_test_app(csrf=False)
         self.client = self.t.client
         self._shots = []
 
@@ -125,25 +125,24 @@ class GroupCascadeDeleteUnlinksScreenshotsTests(_Base):
         self.assertEqual(ChannelTest.query.count(), 0)
 
 
-class RemoveChannelFromJobUnlinksScreenshotTests(_Base):
-    """remove_channel_from_job(), DELETE .../on-demand/<job_id>/channels/<channel_id>."""
+class JobScopedMembershipRoutesAreGoneTests(_Base):
+    """The check-shaped door into group membership - POST .../on-demand/<job_id>/channels
+    and DELETE .../channels/<channel_id> - was a second writer of the rows the group routes
+    own, with no caller left in the UI (dev/changelog/1244). A check IS its group, so its
+    members are added and removed through /api/channel-groups/<id>/members; the orphan
+    guard those routes used to share now holds through remove_duplicate_channels below."""
 
-    def test_removing_one_channel_unlinks_only_its_own_screenshot(self):
+    def test_both_urls_answer_not_found(self):
         acc = seed.make_account()
         a = seed.make_channel(acc, name='A')
         b = seed.make_channel(acc, name='B')
         job = seed.make_test_job(name='Job', channels=[a, b])
-        shot_a = self._shot('a.jpg')
-        shot_b = self._shot('b.jpg')
-        seed.make_channel_test(a, job_id=job.id, screenshot_path=shot_a)
-        seed.make_channel_test(b, job_id=job.id, screenshot_path=shot_b)
         db.session.commit()
-
-        resp = self.client.delete(f'/api/channel-tests/on-demand/{job.id}/channels/{a.id}')
-        self.assertEqual(resp.status_code, 200)
-        self.assertFalse(os.path.exists(shot_a))
-        self.assertTrue(os.path.exists(shot_b))
-        self.assertEqual(ChannelTest.query.filter_by(channel_id=a.id).count(), 0)
+        self.assertEqual(self.client.post(f'/api/channel-tests/on-demand/{job.id}/channels',
+                                          json={'channel_ids': [b.id]}).status_code, 404)
+        self.assertEqual(self.client.delete(
+            f'/api/channel-tests/on-demand/{job.id}/channels/{a.id}').status_code, 404)
+        self.assertEqual(ChannelTest.query.count(), 0)
 
 
 class RemoveDuplicateChannelsUnlinksScreenshotsTests(_Base):

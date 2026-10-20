@@ -167,8 +167,7 @@ class SaveSerializationTests(ConfigSandbox):
         self._write_cfg({'recording': {'post_process': {'video_crf': 20,
                                                         'audio_bitrate_kbps': 96}},
                          **_stamp()})
-        self.t = make_test_app()
-        self.t.app.config['WTF_CSRF_ENABLED'] = False
+        self.t = make_test_app(csrf=False)
         self.addCleanup(self.t.cleanup)
 
     def test_concurrent_field_saves_do_not_drop_a_field(self):
@@ -233,8 +232,7 @@ class RouteLockCoverageTests(ConfigSandbox):
     def setUp(self):
         super().setUp()
         self._write_cfg(_stamp())
-        self.t = make_test_app()
-        self.t.app.config['WTF_CSRF_ENABLED'] = False
+        self.t = make_test_app(csrf=False)
         self.addCleanup(self.t.cleanup)
         self.client = self.t.app.test_client()
 

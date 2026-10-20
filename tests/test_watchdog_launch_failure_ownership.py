@@ -41,10 +41,10 @@ from app.database import (  # noqa: E402
 )
 from app.watchdog import WatchdogThread  # noqa: E402
 from tests.support import seed  # noqa: E402
-from tests.test_downtime_accounting import _RestartHarness  # noqa: E402
+from tests.support.watchdog import RestartHarness, sleeper  # noqa: E402
 
 
-class _FailedSpawnHarness(_RestartHarness):
+class _FailedSpawnHarness(RestartHarness):
     """The real WatchdogThread over the REAL _launch_segment, with Popen raising on the
     relaunch. Everything else in the rig is inherited: one IN_PROGRESS recording, one open
     segment, and an opener process that has already exited so the stall is noticed within
@@ -82,8 +82,7 @@ class _FailedSpawnHarness(_RestartHarness):
         reports it alive the way a capture stuck on connect does, and it writes nothing to
         the segment path - which is what makes "was this segment killed on its first poll"
         a question with two different answers."""
-        from tests.test_watchdog_process_exit import _sleeper
-        proc = _sleeper()
+        proc = sleeper()
         self._spawned.append(proc)
         return proc
 

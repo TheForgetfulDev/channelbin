@@ -33,8 +33,7 @@ from app.database import ChannelGroupMember  # noqa: E402
 
 class GroupTimelineScopeTests(unittest.TestCase):
     def setUp(self):
-        self.t = make_test_app()
-        self.t.app.config['WTF_CSRF_ENABLED'] = False
+        self.t = make_test_app(csrf=False)
         self.client = self.t.client
         self.ctx = self.t.app.app_context()
         self.ctx.push()

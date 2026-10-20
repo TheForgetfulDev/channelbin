@@ -21,11 +21,6 @@ function setEl(id, val) {
   if (el) el.textContent = val;
 }
 
-function readJson(id) {
-  const el = document.getElementById(id);
-  if (!el) return null;
-  try { return JSON.parse(el.textContent); } catch (err) { return null; }
-}
 
 // ── SSE: recording cells ─────────────────────────────────────────────────────
 // Carried over unchanged in structure. Only the cell ids it writes changed, because
@@ -128,7 +123,7 @@ function handleStatus(rid, d) {
     const parked = recWaitingLabel();
     badge.textContent = (waiting && parked) ? parked : label;
   }
-  if (d.status === 'COMPLETED') row.style.setProperty('--pct', '100%');
+  if (d.status === statusVocab('REC_STATUS').COMPLETED) row.style.setProperty('--pct', '100%');
   const ask = `${d.status}|${waiting ? 1 : 0}`;
   if (_askedFor.get(rid) === ask) return;
   _askedFor.set(rid, ask);
@@ -309,7 +304,7 @@ const TL = {
   serverNow: 0, readAt: 0,
 };
 
-const isPhone = () => window.matchMedia('(max-width: 960px)').matches;
+// isPhone() is util.js's - the one breakpoint.
 const tlPx = t => (t - TL.start) / MIN * TL.pxPerMin;
 // Through util.js, so the timeline reads the configured display timezone and clock format.
 // This used to be a bare toLocaleTimeString([], ...) with neither, which rendered the
@@ -353,14 +348,14 @@ function jobClash(job, recs, guards) {
   const guardMs = guards.skipWithinMinutes * MIN;
   for (const r of recs) {
     const [rs, re] = recWindow(r);
-    if (guards.skipIfRecordingActive && r.status === 'IN_PROGRESS' && js >= rs && js < re) {
+    if (guards.skipIfRecordingActive && r.status === statusVocab('REC_STATUS').IN_PROGRESS && js >= rs && js < re) {
       return `Will be deferred: "${r.name}" is recording, and syncing now would count `
            + `against this account's connection limit. It retries at the first gap long `
            + `enough to finish in.`;
     }
     // Measured from the recording's START, not from its estimated finish, because
     // that is what scheduler.py compares against.
-    if (r.status === 'SCHEDULED' && rs >= js && rs - js <= guardMs) {
+    if (r.status === statusVocab('REC_STATUS').SCHEDULED && rs >= js && rs - js <= guardMs) {
       return `Will be deferred: "${r.name}" starts within ${guards.skipWithinMinutes} `
            + `minutes of it, and a sync that late risks the recording's first segment. `
            + `It retries at the first gap long enough to finish in.`;
@@ -391,7 +386,7 @@ function tlBar(r, now) {
   // The fill is the captured share of THIS bar, so it is a percentage of the bar's own
   // visible width, not of the window.
   let fill = '';
-  if (r.status === 'IN_PROGRESS' && e > s && rt > l) {
+  if (r.status === statusVocab('REC_STATUS').IN_PROGRESS && e > s && rt > l) {
     const done = (now - s) / (e - s) * 100;
     const visible = (rt - l) / (tlPx(e) - tlPx(s));
     fill = `<span class="tl-fill" style="width:${Math.max(0, Math.min(100, done / visible)).toFixed(2)}%"></span>`;
@@ -505,7 +500,7 @@ function renderTimeline() {
     <button class="btn btn-sm tl-nowbtn" id="tl-nowbtn" type="button" hidden>Now</button>
     <div class="tl-foot">
       <span class="tl-key"><i class="live"></i>Recording</span>
-      <span class="tl-key"><i class="converting"></i>Converting</span>
+      <span class="tl-key"><i class="converting"></i>Finishing</span>
       <span class="tl-key"><i class="scheduled"></i>Scheduled</span>
       <span class="tl-key"><i class="job"></i>Job</span>
       ${nClash ? '<span class="tl-key clash"><i class="jobclash"></i>Job that will be deferred</span>' : ''}
@@ -904,7 +899,7 @@ window.__applyRecordingSignature = (sig) => {
 // Which task row means "a health check is running", from the server's own vocabulary
 // (app/routes/dashboard.py). Keyed on `kind` and never on `label`, which is display text
 // and has been reworded twice on this payload already.
-const BG_HEALTH_KIND = readJson('dash-bg-health-kind');
+const BG_HEALTH_KIND = readBootJson('dash-bg-health-kind');
 
 window.__applyBackgroundTasks = (bg) => {
   if (!BG_HEALTH_KIND || !dashSec('health')) return;
@@ -919,13 +914,13 @@ window.__applyBackgroundTasks = (bg) => {
 // The blob and the moment it was read, together - see TL.serverNow. Called at load and again
 // after every swap of the recording regions, which replaces the blob with a fresh render.
 function readTimeline() {
-  TL.data = readJson('dash-timeline');
+  TL.data = readBootJson('dash-timeline');
   TL.serverNow = TL.data ? TL.data.now : 0;
   TL.readAt = Date.now();
 }
 
 function initDashboard() {
-  const prefs = readJson('dash-sections-pref');
+  const prefs = readBootJson('dash-sections-pref');
   if (prefs) {
     SEC.key = prefs.key;
     SEC.order = prefs.order;

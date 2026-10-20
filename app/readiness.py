@@ -49,6 +49,8 @@ import threading
 from collections import namedtuple
 from datetime import datetime, timedelta
 
+from .fmt_utils import fmt_bytes, plural
+from .toolchain import CONSEQUENCE
 from .tz_utils import ago as _ago
 
 log = logging.getLogger(__name__)
@@ -87,17 +89,6 @@ STATUS_LABELS = {
     NOT_RUN: 'Not run yet',
 }
 
-#: How bad a state is, for picking a capability's own state and the verdict's color. -1
-#: means the state is not a verdict at all and never colors anything above it.
-STATUS_RANK = {
-    READY: 0,
-    UNKNOWN: 1,
-    ATTENTION: 2,
-    PROBLEM: 3,
-    NOTHING: -1,
-    NOT_RUN: -1,
-}
-
 #: What a check costs to answer. CHEAP runs on every evaluation; ON_DEMAND waits to be asked.
 CHEAP = 'cheap'
 ON_DEMAND = 'ondemand'
@@ -110,8 +101,6 @@ CANNOT = 'cannot'        # at least one is a problem
 DEGRADED = 'degraded'    # at least one needs attention
 CAP_UNKNOWN = 'unknown'  # at least one could not be checked
 NOT_SET_UP = 'none'      # at least one has nothing to look at yet
-
-CAP_STATES = (CANNOT, DEGRADED, CAP_UNKNOWN, NOT_SET_UP, CAN)
 
 #: A capability's answer as the report writes it.
 CAP_REPORT_WORD = {CAN: 'YES', CANNOT: 'NO', DEGRADED: 'PARTLY', CAP_UNKNOWN: 'UNKNOWN',
@@ -255,7 +244,7 @@ class Context:
         self.epg_horizon = epg_horizon
 
         self.guide_channels = (db.session.query(func.count(Channel.id))
-                               .filter(Channel.in_guide.is_(True)).scalar() or 0)
+                               .filter(Channel.in_guide.is_(True)).scalar() or 0)  # guide-flag-read-ok: counts own rows; group rows are counted beside it
         self.broken_guide_groups, self.guide_groups = guide_groups_missing_recording_member()
 
         member_ids = [row[0] for row in
@@ -355,33 +344,17 @@ def _ahead(when, now):
     return f'{int(round(hours / 24))} more days'
 
 
-def _tb(value):
-    return f'{value / 2 ** 40:.1f} TB'
-
-
-def _plural(n, one, many=None):
-    return one if n == 1 else (many or one + 's')
-
-
 # ─────────────────────────────────────────────────────────────────────────────
 # The checks
 # ─────────────────────────────────────────────────────────────────────────────
-#: How a resolved binary was found. duplicated from static/js/maintenance.js::toolSource -
-#: the Maintenance card maps the same `source` key in JS because it renders from the stats
-#: payload, and the two surfaces sit on one page and must not describe one fact differently.
-_TOOL_SOURCE = {
-    'path': 'found on PATH',
-    'sibling': 'found beside the configured ffmpeg',
-    'configured': 'set in Settings',
-}
-
-
 def _tool_result(info, name):
     tested = f"Ran {info.get('path') or name} -version"
     if not info.get('found'):
         return Result(PROBLEM, tested,
                       f"It could not be run at {info.get('path') or info.get('configured') or name}")
-    source = _TOOL_SOURCE.get(info.get('source'), 'resolved')
+    # The provenance words are the payload's own (toolchain.source_label), the same string
+    # the Maintenance card beside this row prints.
+    source = info.get('source_label') or 'resolved'
     return Result(READY, tested, f"Version {info.get('version') or 'unknown'}, {source}")
 
 
@@ -475,7 +448,7 @@ def _check_storage_dvr(ctx):
 def _check_storage_dirs(ctx):
     from .fs_utils import PATH_OK, describe_dir_problem
     tested = (f'Probed the {len(ctx.write_dirs)} other '
-              f'{_plural(len(ctx.write_dirs), "folder")} ChannelBin writes to for write access')
+              f'{plural(len(ctx.write_dirs), "folder")} ChannelBin writes to for write access')
     if not ctx.write_dirs:
         return Result(NOTHING, tested, 'Nothing else is configured to be written')
     bad = [(path, role, probe) for path, role, probe in ctx.write_dirs
@@ -494,11 +467,14 @@ def _check_storage_space(ctx):
     if ctx.disk_total is None:
         return Result(UNKNOWN, tested,
                       'No honest answer: the filesystem that holds it did not respond')
-    used_pct = round((ctx.disk_total - ctx.disk_free) / ctx.disk_total * 100, 1) if ctx.disk_total else 0
-    found = f'{_tb(ctx.disk_free)} free, {used_pct}% used'
-    if used_pct > 95:
+    from .routes.system import disk_level, disk_used_pct
+    used_pct = disk_used_pct(ctx.disk_total, ctx.disk_free)
+    found = f'{fmt_bytes(ctx.disk_free)} free, {used_pct}% used'
+    # The same two thresholds the dashboard tile and the Maintenance meter color by.
+    level = disk_level(used_pct)
+    if level == 'bad':
         return Result(PROBLEM, tested, found)
-    if used_pct > 85:
+    if level == 'warn':
         return Result(ATTENTION, tested, found)
     return Result(READY, tested, found)
 
@@ -531,7 +507,7 @@ def _check_scheduler(ctx):
     if ctx.scheduler_jobs is None:
         return Result(UNKNOWN, tested, 'It is running, but its job list could not be read')
     return Result(READY, tested,
-                  f'Running, with {ctx.scheduler_jobs} {_plural(ctx.scheduler_jobs, "job")} registered')
+                  f'Running, with {ctx.scheduler_jobs} {plural(ctx.scheduler_jobs, "job")} registered')
 
 
 def _check_timezone(ctx):
@@ -566,7 +542,7 @@ def _check_accounts_any(ctx):
         return Result(PROBLEM, tested, 'No accounts are set up')
     channels = sum(a.channel_count or 0 for a in ctx.accounts)
     return Result(READY, tested,
-                  f'{len(ctx.accounts)} {_plural(len(ctx.accounts), "account")}, '
+                  f'{len(ctx.accounts)} {plural(len(ctx.accounts), "account")}, '
                   f'{channels:,} channels between them')
 
 
@@ -603,7 +579,7 @@ def _check_account_login(ctx):
             failures.append(f'{_account_name(ctx, account)}: '
                             f'{said.strip().splitlines()[0]}')
     skipped = len(ctx.accounts) - len(xtream)
-    tail = f' ({skipped} M3U {_plural(skipped, "account")} have no login step)' if skipped else ''
+    tail = f' ({skipped} M3U {plural(skipped, "account")} have no login step)' if skipped else ''
     if failures:
         return Result(PROBLEM, tested,
                       f'{len(failures)} of {len(xtream)} refused: ' + '; '.join(failures) + tail)
@@ -612,11 +588,13 @@ def _check_account_login(ctx):
 
 
 def _check_account_sync(ctx):
+    from .database import ACCOUNT_STATUS_ERROR
     tested = "Compared each account's last successful sync against its own interval"
     if not ctx.accounts:
         return Result(NOTHING, tested, 'There are no accounts to sync')
-    bad = [a for a in ctx.accounts if a.status == 'ERROR']
-    never = [a for a in ctx.accounts if a.last_sync_at is None and a.status != 'ERROR']
+    bad = [a for a in ctx.accounts if a.status == ACCOUNT_STATUS_ERROR]
+    never = [a for a in ctx.accounts
+             if a.last_sync_at is None and a.status != ACCOUNT_STATUS_ERROR]
     overdue = []
     worst_ratio = 0.0
     for account in ctx.accounts:
@@ -631,7 +609,7 @@ def _check_account_sync(ctx):
     action = None
     stale = [a for a, _age, _iv in overdue] + never
     if stale:
-        action = Action(f'Sync {len(stale)} {_plural(len(stale), "account")} now',
+        action = Action(f'Sync {len(stale)} {plural(len(stale), "account")} now',
                         [_url('accounts.sync_account_api', account_id=a.id) for a in stale])
     if bad:
         return Result(PROBLEM, tested,
@@ -639,12 +617,12 @@ def _check_account_sync(ctx):
                       + ', '.join(_account_name(ctx, a) for a in bad), action)
     if never:
         return Result(PROBLEM, tested,
-                      f'{len(never)} of {len(ctx.accounts)} {_plural(len(never), "has", "have")} '
+                      f'{len(never)} of {len(ctx.accounts)} {plural(len(never), "has", "have")} '
                       'never synced: ' + ', '.join(_account_name(ctx, a) for a in never),
                       action)
     if worst_ratio > 2:
         return Result(PROBLEM, tested,
-                      f'{len(overdue)} of {len(ctx.accounts)} {_plural(len(overdue), "is", "are")} '
+                      f'{len(overdue)} of {len(ctx.accounts)} {plural(len(overdue), "is", "are")} '
                       'more than two intervals overdue', action)
     if overdue:
         account, age, interval = max(overdue, key=lambda row: row[1] / row[2])
@@ -674,8 +652,8 @@ def _check_guide_content(ctx):
     if not total:
         return Result(ATTENTION, tested, 'Nothing is in the guide yet')
     return Result(READY, tested,
-                  f'{ctx.guide_groups} {_plural(ctx.guide_groups, "group")} and '
-                  f'{ctx.guide_channels} individual {_plural(ctx.guide_channels, "channel")}')
+                  f'{ctx.guide_groups} {plural(ctx.guide_groups, "group")} and '
+                  f'{ctx.guide_channels} individual {plural(ctx.guide_channels, "channel")}')
 
 
 def _check_guide_groups(ctx):
@@ -685,7 +663,7 @@ def _check_guide_groups(ctx):
     broken = ctx.broken_guide_groups
     if broken:
         return Result(PROBLEM, tested,
-                      f'{len(broken)} of {ctx.guide_groups} {_plural(len(broken), "has", "have")} '
+                      f'{len(broken)} of {ctx.guide_groups} {plural(len(broken), "has", "have")} '
                       'nobody switched on: ' + ', '.join(_group_name(ctx, g) for g in broken))
     return Result(READY, tested,
                   f'All {ctx.guide_groups} have at least one, '
@@ -752,12 +730,12 @@ def _check_alerts_unread(ctx):
     warnings = ctx.unread_alerts.get('WARN', 0)
     if errors:
         return Result(PROBLEM, tested,
-                      f'{errors} unread {_plural(errors, "error")} '
-                      f'{_plural(errors, "is", "are")} waiting on the Alerts page')
+                      f'{errors} unread {plural(errors, "error")} '
+                      f'{plural(errors, "is", "are")} waiting on the Alerts page')
     if warnings:
         return Result(READY, tested,
                       f'No unread errors ({warnings} unread '
-                      f'{_plural(warnings, "warning")}, which this does not count)')
+                      f'{plural(warnings, "warning")}, which this does not count)')
     return Result(READY, tested, 'No unread errors')
 
 
@@ -781,13 +759,13 @@ def _url(endpoint, **values):
 # ─────────────────────────────────────────────────────────────────────────────
 CHECKS = (
     # ── This machine ──────────────────────────────────────────────────────
+    # The two `without` sentences are the missing-tool alert's own (toolchain.CONSEQUENCE),
+    # so the alert and this row cannot drift on what a missing binary costs.
     Check('ffmpeg', 'machine', 'ffmpeg is installed', 'ffmpeg', CHEAP,
-          'Nothing can be captured or converted. Every recording and every health check '
-          'fails the moment it starts.',
+          CONSEQUENCE['ffmpeg'],
           Link('Settings', 'settings.settings'), False, _check_ffmpeg),
     Check('ffprobe', 'machine', 'ffprobe is installed', 'ffprobe', CHEAP,
-          'ChannelBin can still record, but it cannot read a stream or a finished file: no '
-          'format detection, no recording health numbers, and no channel-group format matching.',
+          CONSEQUENCE['ffprobe'],
           Link('Settings', 'settings.settings'), False, _check_ffprobe),
     Check('ffmpeg_build', 'machine', 'This ffmpeg has the parts ChannelBin uses',
           'this ffmpeg build', ON_DEMAND,
@@ -1126,8 +1104,8 @@ def _headline(caps, rows, counts):
         first = blocked[0]
         rest = len(blocked) - 1
         lower = first['label'][0].lower() + first['label'][1:]
-        tail = (f', and {rest} other {_plural(rest, "thing")} '
-                f'{_plural(rest, "is", "are")} blocked too') if rest else ''
+        tail = (f', and {rest} other {plural(rest, "thing")} '
+                f'{plural(rest, "is", "are")} blocked too') if rest else ''
         return {'level': 'bad', 'mark': '!',
                 'head': f'Not ready: you cannot {lower}{tail}',
                 'sub': by_id[first['blockers'][0]]['without']}
@@ -1136,14 +1114,14 @@ def _headline(caps, rows, counts):
         lower = first['label'][0].lower() + first['label'][1:]
         return {'level': 'warn', 'mark': '!',
                 'head': (f'Ready to record, but {len(degraded)} '
-                         f'{_plural(len(degraded), "thing")} '
-                         f'{_plural(len(degraded), "is", "are")} not at full strength'),
+                         f'{plural(len(degraded), "thing")} '
+                         f'{plural(len(degraded), "is", "are")} not at full strength'),
                 'sub': (f'You can still {lower}, with a caveat. '
                         + by_id[first['degraded'][0]]['without'])}
     if unsure:
         n = len(unsure)
         return {'level': 'warn', 'mark': '?',
-                'head': f'{n} {_plural(n, "thing")} could not be checked',
+                'head': f'{n} {plural(n, "thing")} could not be checked',
                 'sub': ('Nothing here is known to be broken. These checks could not answer, '
                         'which is not the same as passing, so this card will not claim the '
                         'install is ready.')}
@@ -1152,9 +1130,9 @@ def _headline(caps, rows, counts):
         return {'level': 'ok', 'mark': '✓',
                 'head': 'Ready to record',
                 'sub': (f'Everything checked so far is fine. {n} '
-                        f'{_plural(n, "check costs", "checks cost")} real work - a process, '
-                        f'a provider login, a message - so {_plural(n, "it has", "they have")} '
-                        f'not run. Run {_plural(n, "it", "them")} when you want the full answer.')}
+                        f'{plural(n, "check costs", "checks cost")} real work - a process, '
+                        f'a provider login, a message - so {plural(n, "it has", "they have")} '
+                        f'not run. Run {plural(n, "it", "them")} when you want the full answer.')}
     return {'level': 'ok', 'mark': '✓',
             'head': 'Ready: everything you would want to do works',
             'sub': (f'All {counts["counted"]} checks that count passed: the toolchain, the '

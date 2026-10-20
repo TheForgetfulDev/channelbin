@@ -52,7 +52,7 @@ def _report_ffprobe_unusable(ffprobe_path: str, exc: OSError, context: str) -> N
         from . import toolchain
         log.warning(
             'Could not run ffprobe (looked for it at: %s): %s. %s Probe requested by: %s',
-            ffprobe_path, exc, toolchain._CONSEQUENCE['ffprobe'], context)
+            ffprobe_path, exc, toolchain.CONSEQUENCE['ffprobe'], context)
         # Outside the latch lock: this spawns two processes, and holding a module lock
         # across them would serialize every thread that hits the same failure.
         toolchain.reset_cache()
@@ -262,6 +262,26 @@ def detect_vfr(r_frame_rate, avg_frame_rate):
         return None
     return abs(r - a) / r > 0.02
 
+# A rate no real feed has is no rate. ffprobe reports r_frame_rate as the stream's timebase
+# (90000/1 on MPEG-TS) when a capture holds too few frames to infer one - a segment that
+# opened while the video was out - and that number reached a conversion as `-r 90000
+# -fps_mode:v cfr`, which duplicates every frame about 3,000 times and turns a minute into
+# hours (dev/changelog/1247). Broadcast tops out at 120 fps; the margin is for the odd
+# high-rate feed, not for a timebase.
+MAX_PLAUSIBLE_FPS = 240.0
+
+
+def plausible_fps(value):
+    """The float rate when it is one a video feed could run at, else None."""
+    if value is None:
+        return None
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return None
+    return value if 0 < value <= MAX_PLAUSIBLE_FPS else None
+
+
 # Seek-damage thresholds (see assess_seek_damage): a recording is "damaged" when its
 # video timeline is missing more than this many seconds, or more than this fraction of
 # the total span, whichever is larger. Calibrated against real captures 2026-07-17:
@@ -428,8 +448,10 @@ def parse_ffprobe(filepath: str, count_packets: bool = True, timeout: int = 60,
                         try:
                             num, den = raw.split('/')
                             if int(den) > 0:
-                                val = round(int(num) / int(den), 2)
-                                if val > 0:
+                                # A timebase reported as a rate (90000/1) is skipped, not
+                                # stored: see plausible_fps.
+                                val = plausible_fps(round(int(num) / int(den), 2))
+                                if val:
                                     fps = val
                                     break
                         except (ValueError, ZeroDivisionError):
@@ -518,7 +540,12 @@ def parse_ffprobe(filepath: str, count_packets: bool = True, timeout: int = 60,
 def nominal_video_rate(filepath: str, timeout: int = 60):
     """Nominal video frame rate as ffprobe's raw r_frame_rate rational ('60000/1001'),
     or None. r_frame_rate, not avg_frame_rate - avg is skewed low by timeline gaps in
-    damaged captures, which is exactly when callers need the true rate."""
+    damaged captures, which is exactly when callers need the true rate.
+
+    An r_frame_rate no feed could run at (the 90000/1 timebase a frameless stretch
+    reports) is not returned: avg_frame_rate stands in when it is plausible, else None,
+    so the caller falls back on the rates the segments were probed at rather than
+    converting at 90,000 fps (dev/changelog/1247)."""
     ffprobe_path = resolve_ffprobe_path()
     try:
         cmd = [ffprobe_path, '-v', 'quiet', '-print_format', 'json',
@@ -533,13 +560,24 @@ def nominal_video_rate(filepath: str, timeout: int = 60):
         if result.returncode != 0:
             return None
         streams = json.loads(result.stdout).get('streams', [])
-        raw = streams[0].get('r_frame_rate', '') if streams else ''
-        if '/' in raw:
-            num, den = raw.split('/')
-            if int(den) > 0 and int(num) > 0:
-                return raw
+        return plausible_nominal_rate(streams[0] if streams else {})
     except (subprocess.SubprocessError, OSError, ValueError, json.JSONDecodeError) as exc:
         log.debug('nominal_video_rate failed for %s: %s', filepath, exc)
+    return None
+
+
+def plausible_nominal_rate(stream: dict):
+    """The rational rate to call a stream's nominal rate, from its ffprobe stream dict:
+    r_frame_rate when it is a rate a feed could run at, else avg_frame_rate when that is,
+    else None. Pure - split out of nominal_video_rate so the timebase case is testable
+    without a file."""
+    for key in ('r_frame_rate', 'avg_frame_rate'):
+        raw = stream.get(key, '') or ''
+        if '/' not in raw:
+            continue
+        num, den = raw.split('/')
+        if int(den) > 0 and int(num) > 0 and plausible_fps(int(num) / int(den)):
+            return raw
     return None
 
 

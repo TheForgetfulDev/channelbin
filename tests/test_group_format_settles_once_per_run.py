@@ -89,6 +89,64 @@ class DeferralDuringARunTests(_Case):
         self.assertIs(False, inner.call_args.kwargs.get('defer_group_format'))
 
 
+class _FakeProc:
+    """A Popen'd ffmpeg that produces nothing, so the test ends on its own FAILED path."""
+
+    def __init__(self):
+        self.pid = 4242
+        self.stderr = None
+        self.returncode = None
+        self.signals = []
+
+    def send_signal(self, sig):
+        self.signals.append(sig)
+
+    def poll(self):
+        return self.returncode
+
+    def terminate(self):
+        self.returncode = -15
+
+    def kill(self):
+        self.returncode = -9
+
+    def wait(self, timeout=None):
+        if self.returncode is None:
+            self.returncode = -15
+        return self.returncode
+
+
+class DeferralIsHonoredTests(_Case):
+    """The gate itself: `_run_channel_test_inner` reconciles the group format after a test
+    exactly when the deferral is off. The deferral tests above prove the flag is passed and
+    forwarded; without this, deleting the `if not defer_group_format:` would bring the
+    per-test reconcile back with every case in the file still green."""
+
+    def _drive(self, defer):
+        ch = self._channel('A')
+        spy = mock.Mock()
+        with mock.patch.object(channel_tester, '_recheck_group_format', spy), \
+                mock.patch.object(channel_tester.subprocess, 'Popen',
+                                  lambda *a, **kw: _FakeProc()), \
+                mock.patch.object(channel_tester, '_drain_stderr', lambda *a, **kw: None), \
+                mock.patch.object(channel_tester, 'wait_for_file_data', lambda *a, **kw: False), \
+                mock.patch.object(channel_tester, '_interruptible_sleep', lambda _d: None):
+            channel_tester._run_channel_test_inner(self.t.app, ch.id, defer_group_format=defer)
+        return spy
+
+    def tearDown(self):
+        channel_tester._end_run()
+        super().tearDown()
+
+    def test_a_deferred_test_does_not_reconcile(self):
+        spy = self._drive(defer=True)
+        spy.assert_not_called()
+
+    def test_an_immediate_test_reconciles_once(self):
+        spy = self._drive(defer=False)
+        self.assertEqual(spy.call_count, 1)
+
+
 class SettlePassTests(_Case):
     """The pass itself: both halves, once, per group the run gathered data for."""
 

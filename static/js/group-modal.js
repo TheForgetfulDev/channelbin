@@ -118,7 +118,7 @@ function groupWarningsHtml(data, forceId, dedupId) {
   if (data.duplicate_warning && dedupId) {
     html += `<button type="button" class="btn btn-sm" id="${dedupId}">Choose which to keep…</button>`;
   }
-  html += `<button type="button" class="btn btn-sm btn-danger-outline" id="${forceId}">Proceed Anyway</button></div>`;
+  html += `<button type="button" class="btn btn-sm btn-danger-outline" id="${forceId}">Proceed anyway</button></div>`;
   return html;
 }
 
@@ -315,7 +315,7 @@ function openGroupModal(opts) {
                  data-channel-name="${escHtml(r.channel_name)}"${disabled ? ' disabled' : ''}></td>
           <td class="st-fmt">${fmtBadge(r)}</td>
           <td class="st-ch">
-            <span class="account-dot" style="background:${escHtml(r.account_color || '#30363d')}" title="${escHtml(r.account_name)}"></span>
+            <span class="account-dot" style="background:${escHtml(r.account_color || 'var(--border)')}" title="${escHtml(r.account_name)}"></span>
             <a href="/channels/${r.channel_id}" target="_blank" rel="noopener" class="channel-name-link">${escHtml(r.channel_name)}</a>${missing}
             <div class="st-meta">${meta}</div>
           </td>

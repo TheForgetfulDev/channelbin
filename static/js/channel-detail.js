@@ -393,15 +393,7 @@
   let hcInFlight = false;
   const refreshBusy = () => Boolean(document.querySelector('.menu.open, .modal'));
 
-  function healthState() {
-    const el = byId('cd-health-state');
-    try {
-      return el ? JSON.parse(el.textContent) : {};
-    } catch (e) {
-      console.warn('Unreadable #cd-health-state', e);
-      return {};
-    }
-  }
+  const healthState = () => readBootJson('cd-health-state', {});
 
   function refreshLive() {
     const openBd = Array.from(document.querySelectorAll('#cd-timeline details[data-bd][open]'))
@@ -561,10 +553,10 @@
 
     const describe = (r) => {
       const names = r.display_names.length ? escHtml(r.display_names.join(', ')) : '';
-      const listings = r.entry_count === 0 ? 'no listings'
-        : r.sole_title !== null
-          ? `${r.entry_count.toLocaleString()} listings, one program all day: <em>${escHtml(r.sole_title || '(untitled)')}</em>`
-          : `${r.entry_count.toLocaleString()} listings, ${r.distinct_titles}${r.distinct_titles >= C.epgTitleCap ? '+' : ''} titles`;
+      // The sentence is the server's (epg_sources.directory_row_summary), the same one the
+      // Listings cell and the review page print; only the sole title is rendered here.
+      const listings = escHtml(r.summary)
+        + (r.sole_title !== null ? `: <em>${escHtml(r.sole_title || '(untitled)')}</em>` : '');
       return `<code>${escHtml(r.xml_id)}</code> <span class="text-muted small">${names}` +
         `${names ? ' &middot; ' : ''}${listings}</span>`;
     };

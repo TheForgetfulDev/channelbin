@@ -15,7 +15,7 @@ from ..database import (
     Recording, Account, EpgSource,
     REC_STATUS_SCHEDULED, REC_STATUS_IN_PROGRESS, REC_STATUS_PAUSED, REC_STATUS_RETRYING,
     REC_STATUS_CONCATENATING, REC_STATUS_ANALYZING, REC_STATUS_CONVERTING,
-    WINDOW_OPEN_STATUSES,
+    WINDOW_OPEN_STATUSES, ACCOUNT_STATUS_ERROR, ACCOUNT_STATUS_SYNCING,
 )
 from .. import events as ev
 from .. import account_stats_view
@@ -66,7 +66,7 @@ DASHBOARD_SECTIONS = {
                  'hint': 'Recordings and scheduled jobs on one time axis.',
                  'to': 'Jobs', 'endpoint': 'jobs.jobs_page'},
     'live': {'label': 'Recordings in progress',
-             'hint': 'Capturing or converting right now.',
+             'hint': 'Capturing or finishing right now.',
              'to': 'Recordings', 'endpoint': 'recordings.index'},
     'upcoming': {'label': 'Upcoming recordings',
                  'hint': 'Scheduled, not started yet.',
@@ -184,15 +184,11 @@ def _joining_detail(r):
     because a join always re-runs from the top rather than resuming (see
     concatenator._concat_progress). No entry means the row is queued behind another job,
     which is a real state and reads as the bare name rather than a fabricated 0%."""
-    from ..concatenator import concat_progress
+    from ..concatenator import concat_progress, concat_progress_parts
     prog = concat_progress(r.id)
     if prog is None:
         return r.name
-    bits = []
-    if prog['pct'] is not None:
-        bits.append(f"{prog['pct']:.0f}%")
-    bits.append(f"{prog['joined']} of {prog['of']} segments")
-    return f'{r.name} - {", ".join(bits)}'
+    return f'{r.name} - {", ".join(concat_progress_parts(prog))}'
 
 
 def _analyzing_detail(r):
@@ -203,17 +199,11 @@ def _analyzing_detail(r):
     (postprocessor._analysis_progress). No entry means no pass is reading - between the two
     passes, or before the first one - which reads as the bare name rather than a 0% that
     describes nothing."""
-    from ..postprocessor import analysis_progress
+    from ..postprocessor import analysis_progress, analysis_progress_parts
     prog = analysis_progress(r.id)
     if prog is None:
         return r.name
-    label = prog['pass_label']
-    if prog['of_passes'] > 1:
-        label += f" ({prog['pass_number']} of {prog['of_passes']})"
-    bits = [label]
-    if prog['pct'] is not None:
-        bits.append(f"{prog['pct']:.0f}%")
-    return f'{r.name} - {", ".join(bits)}'
+    return f'{r.name} - {", ".join(analysis_progress_parts(prog))}'
 
 
 # ── DESIGN.md 16.1: the metric strip ────────────────────────────────────────
@@ -272,19 +262,23 @@ def _metric_tiles(recordings, accounts, now):
     """
     from ..fmt_utils import fmt_bytes
     from .recordings import time_ago_filter
-    from .system import DVR_DIR_ROLE, _disk_bytes
+    from .system import DVR_DIR_ROLE, _disk_bytes, disk_level, disk_used_pct
 
     capturing = [r for r in recordings if r.status == REC_STATUS_IN_PROGRESS]
-    converting = [r for r in recordings
-                  if r.status in (REC_STATUS_CONVERTING, REC_STATUS_CONCATENATING,
-                                  REC_STATUS_ANALYZING)]
+    # "Finishing" is the umbrella for the three post-capture phases - joining, checking,
+    # converting. It used to be "converting", which is also the badge for the third phase
+    # alone, so a tile reading "1 converting" sat over a row badged JOINING
+    # (dev/changelog/1247). The same word labels the timeline legend and the HA sensor.
+    finishing = [r for r in recordings
+                 if r.status in (REC_STATUS_CONVERTING, REC_STATUS_CONCATENATING,
+                                 REC_STATUS_ANALYZING)]
     scheduled = [r for r in recordings if r.status == REC_STATUS_SCHEDULED]
 
     dvr_dir = load_config()['recording']['dvr_output_dir']
     disk_total, disk_free = _disk_bytes(dvr_dir, DVR_DIR_ROLE)
-    used_pct = round((disk_total - disk_free) / disk_total * 100) if disk_total else None
+    used_pct = disk_used_pct(disk_total, disk_free)
 
-    err_accounts = [a for a in accounts if a.status == 'ERROR']
+    err_accounts = [a for a in accounts if a.status == ACCOUNT_STATUS_ERROR]
     synced = [a.last_sync_at for a in accounts if a.last_sync_at]
     oldest_sync = min(synced) if synced else None
 
@@ -298,7 +292,7 @@ def _metric_tiles(recordings, accounts, now):
 
     return [
         {'key': 'Capturing now', 'value': str(len(capturing)),
-         'sub': f'{len(converting)} converting' if converting else 'nothing converting',
+         'sub': f'{len(finishing)} finishing' if finishing else 'nothing finishing',
          'cls': 'ok' if capturing else ''},
         {'key': 'Next recording',
          'value': relative(nxt.start_time, style='compact', now=now) if nxt else None,
@@ -310,7 +304,7 @@ def _metric_tiles(recordings, accounts, now):
          'href': url_for('recordings.recording_detail', recording_id=nxt.id) if nxt else None},
         {'key': 'Disk free', 'value': fmt_bytes(disk_free) if disk_free is not None else None,
          'sub': f'{used_pct}% used on {dvr_dir}' if used_pct is not None else f'{dvr_dir} is not mounted',
-         'cls': '' if used_pct is None else 'bad' if used_pct >= 90 else 'warn' if used_pct >= 75 else 'ok'},
+         'cls': disk_level(used_pct) or ''},
         {'key': 'Errors, last hour',
          'value': None if errors is None else str(errors),
          'sub': ('no readable log file' if errors is None
@@ -431,6 +425,58 @@ def _live_row_stats(rows, now):
     return stats
 
 
+def _postcapture_row_cells(rows):
+    """The three stat cells of a JOINING or ANALYZING row: what the phase is doing and how
+    far it has got, from the same in-memory progress registries the Recordings list reads,
+    plus the bytes the capture left. {id: [(key, value, tip), ...]}.
+
+    These rows are past their stop time, so the Elapsed/Remaining pair the capture rows
+    show would read "Remaining 0s" under an Elapsed still counting from the capture start -
+    capture-era numbers under labels that read as current (dev/changelog/1247). Both
+    registry reads are dict lookups under a lock, never a query, so
+    test_scaling_pages::test_dashboard_page holds.
+    """
+    from ..concatenator import concat_progress, concat_progress_parts
+    from ..postprocessor import analysis_progress, analysis_progress_parts
+
+    cells = {}
+    for r in rows:
+        captured = sum((s.bytes_recorded or 0) for s in r.segments if s.ended_at)
+        recorded = ('Captured', captured,
+                    'Bytes the capture wrote to its segments. The finished file is what the '
+                    'join produces from them.')
+        # The words come from the two shared builders, never spelled here, so the Dashboard
+        # and the Recordings list cannot describe one join two ways (tests/test_progress_parts).
+        if r.status == REC_STATUS_CONCATENATING:
+            prog = concat_progress(r.id)
+            if prog is None:
+                cells[r.id] = [('Joining', 'queued',
+                                'Waiting for another join to finish before this one starts.'),
+                               ('Segments', '-', None), recorded]
+            else:
+                parts = concat_progress_parts(prog)   # [pct?, 'N of M segments']
+                cells[r.id] = [('Joining', parts[0] if len(parts) > 1 else 'running',
+                                'How far the join of the segments has got.'),
+                               ('Segments', parts[-1],
+                                'Segments joined so far, of the segments being joined.'),
+                               recorded]
+        elif r.status == REC_STATUS_ANALYZING:
+            prog = analysis_progress(r.id)
+            if prog is None:
+                cells[r.id] = [('Checking', 'between passes',
+                                'No whole-file read is running right now: between two passes, '
+                                'or before the first one.'),
+                               ('Progress', '-', None), recorded]
+            else:
+                parts = analysis_progress_parts(prog)   # ['label (n of m)', pct?]
+                cells[r.id] = [('Checking', parts[0],
+                                'Which whole-file read of the joined file is running.'),
+                               ('Progress', parts[1] if len(parts) > 1 else '-',
+                                'How far through the joined file this pass has read.'),
+                               recorded]
+    return cells
+
+
 @dashboard_bp.route('/')
 def dashboard():
     # Read before the rows: a change landing between the two then makes the next poll
@@ -466,6 +512,7 @@ def dashboard():
         acct_stats=acct_stats,
         next_sync=next_sync_map(accounts),
         live=live, upcoming=upcoming, now=now, live_stats=_live_row_stats(live, now),
+        postcapture_cells=_postcapture_row_cells(live),
         rec_status_class=REC_ROW_STATUS_CLASS,
         # Per row rather than through the rec_status_label filter, because the parked
         # derivation needs a second column off the row. Built from the rows already
@@ -677,7 +724,7 @@ def _activity_status_dict():
         dashboard_bg_count += 1
 
     # Account sync
-    syncing_accounts = Account.query.filter_by(status='SYNCING').all()
+    syncing_accounts = Account.query.filter_by(status=ACCOUNT_STATUS_SYNCING).all()
     for acc in syncing_accounts:
         progress = get_sync_progress(acc.id)
         if progress and progress['phase'] == 'channels' and progress['total']:

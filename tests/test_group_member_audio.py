@@ -240,7 +240,7 @@ class AudioFilterTests(unittest.TestCase):
             self.assertNotIn('visibleRows(', fn)
 
     def test_an_untested_member_matches_no_audio_value(self):
-        """Correct and needing no "Not measured" bucket the way Format has one: this is a
+        """Correct and needing no "Unmeasured" bucket the way Format has one: this is a
         user-driven filter, not the format lock, so "an untested member is never filtered
         out" does not reach it. Each predicate therefore requires the field to be present
         before it compares - a `|| ''`-style fallback would make every untested member match

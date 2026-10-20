@@ -221,8 +221,7 @@ class DeleteTeardownTests(unittest.TestCase):
     """Deleting a channel, or the account that owns it, removes its screenshot files."""
 
     def setUp(self):
-        self.t = make_test_app()
-        self.t.app.config['WTF_CSRF_ENABLED'] = False
+        self.t = make_test_app(csrf=False)
         self.addCleanup(self.t.cleanup)
         self.account = seed.make_account('Acct')
         db.session.commit()

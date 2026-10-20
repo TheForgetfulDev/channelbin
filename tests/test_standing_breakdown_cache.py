@@ -30,6 +30,7 @@ from tests.support.config_sandbox import ConfigSandbox  # noqa: E402
 from tests.support.iocount import IOCounter, all_engines  # noqa: E402
 from tests.support import seed  # noqa: E402
 from tests.support.search import only_hiding  # noqa: E402
+from tests.support.csrf import csrf_token  # noqa: E402
 from app import db, duplicate_streams  # noqa: E402
 from app.accounts import NORM_DISABLED, NORM_MPEGTS  # noqa: E402
 from app.channel_search import (  # noqa: E402
@@ -328,10 +329,7 @@ class SettingsIntegrationTests(ConfigSandbox):
         clear_standing_breakdown_cache()
 
     def _csrf(self):
-        import re
-        html = self.client.get('/settings').get_data(as_text=True)
-        m = re.search(r'name="csrf-token" content="([^"]+)"', html)
-        return m.group(1) if m else None
+        return csrf_token(self.client)
 
     def test_saving_the_ttl_field_clears_whatever_was_cached(self):
         _standing_breakdown_cache[(('showdup',), ())] = (('x', 'y'), 0.0, ({}, 0))

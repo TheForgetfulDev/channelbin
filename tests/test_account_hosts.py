@@ -36,7 +36,7 @@ from app.accounts import _upsert_channels, normalize_url_with_mode  # noqa: E402
 from app.alerts import ACCOUNT_HOST_ROLLED  # noqa: E402
 from app.config import load_config  # noqa: E402
 from app.database import (  # noqa: E402
-    Account, AccountHost, Alert, Channel, RecordingEvent, RECORDING_HOST_ROLLED,
+    Account, AccountHost, Alert, Channel, Recording, RecordingEvent, RECORDING_HOST_ROLLED,
 )
 
 RESOLVE_LINE = ('[tcp @ 0x5972c611fe00] Failed to resolve hostname a1.skyline.example: '
@@ -128,8 +128,7 @@ class _Case(unittest.TestCase):
     account's own URL on a1 too (a directly bought account)."""
 
     def setUp(self):
-        self.t = make_test_app()
-        self.t.app.config['WTF_CSRF_ENABLED'] = False
+        self.t = make_test_app(csrf=False)
         self.client = self.t.app.test_client()
         self.acc = seed.make_account(name='skyline-direct')
         self.acc.m3u_url = 'http://a1.skyline.example/get.php?u=x'
@@ -303,6 +302,73 @@ class RollTests(_Case):
         db.session.expire_all()
         self.assertEqual([h for h, a in self._hosts() if a], ['a3.skyline.example:8080'])
 
+    def test_an_active_host_that_resolves_repairs_urls_stranded_on_another_listed_host(self):
+        """dev/changelog/1243: with [a1 dead, a2 active] and the URLs on a1 (a re-normalize
+        or a sync that raced the roll put them there), every failure used to end in "active
+        host resolves; not rolling" and the URLs stayed on a1 until the next sync."""
+        a2 = AccountHost.query.filter_by(account_id=self.acc_id, host='a2.skyline.example').one()
+        links.set_active_host(self.acc_id, a2.id)
+        links._last_roll_attempt.clear()
+        for cid, url in self.urls.items():
+            db.session.get(Channel, cid).stream_url = url   # back on a1, behind the list's back
+        db.session.commit()
+        # a3 is dead too, so the only host that resolves is the active one.
+        with mock.patch.object(links, 'resolve_host', self._resolver(
+                {'a1.skyline.example', 'a3.skyline.example'})):
+            summary = links.roll_host_for_channel(self.ch_id, trigger='Recording 1 (segment 2)',
+                                                  recording_id=self.rec_id)
+        self.assertEqual((summary['repaired'], summary['old_host'], summary['host'],
+                          summary['channels']), (True, None, 'a2.skyline.example', 3))
+        db.session.expire_all()
+        urls = self._stream_urls()
+        self.assertTrue(all('a2.skyline.example' in urls[cid] for cid in self.urls))
+        self.assertEqual(urls[self.radio_id], 'http://radio.example:8000/mount')
+        self.assertEqual([h for h, a in self._hosts() if a], ['a2.skyline.example'])
+        alerts = _open_alerts(self.acc_id)
+        self.assertEqual(len(alerts), 1)
+        self.assertIn('moved back onto a2.skyline.example', alerts[0].title)
+        events = RecordingEvent.query.filter_by(recording_id=self.rec_id,
+                                                event_type=RECORDING_HOST_ROLLED).all()
+        self.assertEqual(len(events), 1)
+        self.assertIn('moved back onto a2.skyline.example', events[0].detail)
+
+    def test_an_active_host_that_resolves_with_nothing_stranded_changes_nothing(self):
+        a2 = AccountHost.query.filter_by(account_id=self.acc_id, host='a2.skyline.example').one()
+        links.set_active_host(self.acc_id, a2.id)
+        links._last_roll_attempt.clear()
+        with mock.patch.object(links, 'resolve_host', self._resolver(
+                {'a1.skyline.example', 'a3.skyline.example'})):
+            self.assertIsNone(links.roll_host(self.acc_id, 'Recording 1 (segment 2)',
+                                              recording_id=self.rec_id))
+        self.assertEqual(_open_alerts(self.acc_id), [])
+        self.assertEqual(RecordingEvent.query.filter_by(
+            recording_id=self.rec_id, event_type=RECORDING_HOST_ROLLED).count(), 0)
+
+    def test_a_group_recording_launches_its_next_segment_on_the_rolled_host(self):
+        """dev/changelog/1243: the roll's promise ("a running recording picks the new host
+        up at its next segment") rests on recorder._reresolve_channel_url, which skipped
+        group recordings - so a group recording relaunched its frozen rec.url onto the dead
+        host until the member was burned."""
+        from app.recorder import _launch_segment
+        group = seed.make_group(name='Sky', members=[db.session.get(Channel, self.ch_id)])
+        rec = seed.make_recording(status='IN_PROGRESS', channel_id=self.ch_id,
+                                  group_id=group.id, url=self.urls[self.ch_id])
+        db.session.commit()
+        rec_id = rec.id
+        a2 = AccountHost.query.filter_by(account_id=self.acc_id, host='a2.skyline.example').one()
+        links.set_active_host(self.acc_id, a2.id)
+        fake_proc = mock.MagicMock()
+        fake_proc.pid = 4242
+        fake_proc.poll.return_value = 0
+        with mock.patch('app.recorder.subprocess.Popen', return_value=fake_proc) as popen:
+            _launch_segment(self.t.app, rec_id, seg_num=2)
+        cmd = popen.call_args[0][0]
+        self.assertIn('http://a2.skyline.example/live/u/p/1.ts', cmd)
+        self.assertNotIn(self.urls[self.ch_id], cmd)
+        db.session.expire_all()
+        self.assertEqual(db.session.get(Recording, rec_id).channel_id, self.ch_id,
+                         'no failover - the same member, on the rolled host')
+
     def test_a_stall_a_refusal_and_a_404_roll_nothing(self):
         # The hooks ask is_resolution_failure() first; this pins the gate they share.
         for tail in (STALL_TAIL, REFUSED_LINE, NOT_FOUND_LINE):
@@ -385,6 +451,27 @@ class SyncTests(_Case):
             ch = Channel.query.filter_by(account_id=self.acc_id, stream_id=i).one()
             self.assertEqual(ch.stream_url, f'http://a2.skyline.example/live/u/p/{i}.ts')
             self.assertEqual(ch.raw_stream_url, f'http://a1.skyline.example/live/u/p/{i}.ts')
+        radio = Channel.query.filter_by(account_id=self.acc_id, stream_id=9).one()
+        self.assertEqual(radio.stream_url, 'http://radio.example:8000/mount')
+
+    def test_a_roll_that_lands_during_the_sync_is_not_undone_by_it(self):
+        """dev/changelog/1243: the sync snapshots the host list before its row loop, so a
+        roll committed mid-loop was overwritten on every row written after it - and the
+        sync's success then dismissed the roll's alert. The list is read again after the
+        rows are written, in the same transaction, and the rows follow the host active NOW."""
+        self._list('a2.skyline.example')
+        before = (HOSTS, 'a1.skyline.example')
+        after = (HOSTS, 'a2.skyline.example')
+        cfg = load_config()
+        with mock.patch('app.accounts.host_list', side_effect=[before, after]) as host_list, \
+                self.t.app.app_context():
+            acc = db.session.get(Account, self.acc_id)
+            _upsert_channels(acc, self._streams(), cfg)
+            db.session.commit()
+        self.assertEqual(host_list.call_count, 2)
+        for i in (1, 2, 3):
+            ch = Channel.query.filter_by(account_id=self.acc_id, stream_id=i).one()
+            self.assertEqual(ch.stream_url, f'http://a2.skyline.example/live/u/p/{i}.ts')
         radio = Channel.query.filter_by(account_id=self.acc_id, stream_id=9).one()
         self.assertEqual(radio.stream_url, 'http://radio.example:8000/mount')
 

@@ -108,8 +108,7 @@ def mark_checked(rule_id, reach=None, error=None, problems=None):
 
 class _Base(unittest.TestCase):
     def setUp(self):
-        self.t = make_test_app()
-        self.t.app.config['WTF_CSRF_ENABLED'] = False
+        self.t = make_test_app(csrf=False)
         self.client = self.t.app.test_client()
         self.ctx = self.t.app.app_context()
         self.ctx.push()

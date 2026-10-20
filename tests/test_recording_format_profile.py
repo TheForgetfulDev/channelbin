@@ -73,12 +73,12 @@ class FormatProfileSummaryTests(unittest.TestCase):
             self.assertNotIn(word, s)
 
     def test_all_null_row_says_unknown_rather_than_rendering_empty(self):
-        self.assertEqual(_format_profile_summary({}), 'output format: unknown')
+        self.assertEqual(_format_profile_summary({}), 'joined file format: unknown')
 
     def test_summary_names_the_file_it_describes(self):
         """A re-encode changes codec and pixel format, so 'output' is load-bearing - these
         columns are not necessarily the profile of what the provider sent."""
-        self.assertTrue(_format_profile_summary({}).startswith('output format:'))
+        self.assertTrue(_format_profile_summary({}).startswith('joined file format:'))
 
 
 @unittest.skipUnless(_HAVE_FFMPEG, 'ffmpeg/ffprobe not installed')

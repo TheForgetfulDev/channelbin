@@ -122,8 +122,7 @@ class ServiceSaveRejectsPlaceholderTests(unittest.TestCase):
     """POST /api/notifications/services/<name> - the server-side reject."""
 
     def setUp(self):
-        self.t = make_test_app()
-        self.t.app.config['WTF_CSRF_ENABLED'] = False
+        self.t = make_test_app(csrf=False)
         self.client = self.t.app.test_client()
         self.saved = {}
 

@@ -26,10 +26,10 @@
    profile-modal.js's are: tests/test_tag_modal_js.py evaluates this file in node and calls
    them directly. Nothing test-only lives here - no module.exports tail, no injected globals.
 
-   Depends on util.js (escHtml, jsonFetch, showToast, buildModal, fieldRow).
+   Depends on util.js (escHtml, jsonFetch, showToast, buildModal, fieldRow). The default
+   color is the server's (app/ui_constants.py DEFAULT_COLOR), handed in as opts.defaultColor
+   from the page's TAG_CONFIG - no copy of it lives here.
 */
-
-const TAG_DEFAULT_COLOR = '#58a6ff';
 
 /* Trim, drop empties, drop duplicates, keep order. Mirrors _clean_patterns in
    app/routes/tags.py - the server cleans the list again on arrival, so a stray blank row
@@ -66,16 +66,18 @@ function tagValidate(values) {
     return 'At least one match pattern is required.';
   }
   if (!/^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/.test(String(values.color || ''))) {
-    return 'Color must be a hex value like #58a6ff.';
+    return 'Color must be a hex value like #rrggbb.';
   }
   return null;
 }
 
-/* The request body. */
+/* The request body. The color is sent as read - the picker always answers with one
+   (wireColorPicker falls back to the page's default), and the server fills a blank with
+   the same DEFAULT_COLOR. */
 function tagPayload(values) {
   return {
     name: tagNormalizeName(values.name),
-    color: String(values.color || TAG_DEFAULT_COLOR),
+    color: String(values.color || ''),
     patterns: tagCleanPatterns(values.patterns),
   };
 }
@@ -92,6 +94,7 @@ function tagPatternRowHtml(value) {
 function openTagModal(opts) {
   const tag = opts.tag || null;
   const presets = opts.presetColors || [];
+  const defaultColor = opts.defaultColor;
   const onDone = opts.onDone || (() => window.location.reload());
   const patterns = (tag && tag.patterns && tag.patterns.length) ? tag.patterns : [''];
 
@@ -123,12 +126,12 @@ function openTagModal(opts) {
     fieldRow({
       label: 'Color', stack: true,
       meta: 'Used to highlight matching programs in the TV Guide.',
-      control: colorPickerHtml('tag-', tag ? tag.color : TAG_DEFAULT_COLOR, TAG_DEFAULT_COLOR,
+      control: colorPickerHtml('tag-', tag ? tag.color : defaultColor, defaultColor,
         presets.map(([hex, label]) => ({ hex, label }))),
     });
 
   const $ = (sel) => body.querySelector(sel);
-  const readColor = wireColorPicker(body, 'tag-', TAG_DEFAULT_COLOR);
+  const readColor = wireColorPicker(body, 'tag-', defaultColor);
 
   $('#tag-pattern-add').addEventListener('click', () => {
     const rows = $('#tag-patterns');

@@ -14,9 +14,8 @@
   const $ = (sel, root = document) => root.querySelector(sel);
   const $$ = (sel, root = document) => [...root.querySelectorAll(sel)];
 
-  const bootEl = $('#notif-boot');
-  if (!bootEl) return;
-  const BOOT = JSON.parse(bootEl.textContent);
+  const BOOT = readBootJson('notif-boot');
+  if (!BOOT) return;
 
   const SVC = BOOT.services;            // key -> {label, hint, enabled, url, added}
   const ROUTING = BOOT.routing;         // alert type -> {label, severity, in_app, push_services}
@@ -126,7 +125,7 @@
           <h2>${escHtml(s.label)}</h2>
           <div class="card-head-actions">
             <span class="badge ${s.broken ? 'b-fail' : (s.enabled ? 'b-done' : 'b-abort')}">${s.broken ? 'Broken' : (s.enabled ? 'Enabled' : 'Disabled')}</span>
-            <button class="svc-x" type="button" data-svc-remove="${escHtml(key)}"
+            <button class="btn btn-sm btn-danger" type="button" data-svc-remove="${escHtml(key)}"
               data-tip="Remove ${escHtml(s.label)}&#10;Clears its stored URL and drops it from every routing row. Disabling it instead keeps the URL.">Remove</button>
           </div>
         </div>
@@ -203,7 +202,7 @@
   // static markup.
   function renderSevChips() {
     $('#rt-sev-chips').innerHTML = SEVERITIES.map((s) =>
-      `<button class="chip sev${activeSeverities.has(s) ? ' active' : ''}" type="button"
+      `<button class="chip sev${severityToneClass(s)}${activeSeverities.has(s) ? ' active' : ''}" type="button"
         data-sev="${s}">${s}</button>`).join('');
   }
 

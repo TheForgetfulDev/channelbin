@@ -1241,9 +1241,12 @@ class PhoneLayoutTests(unittest.TestCase):
 
     def test_the_breakpoint_is_spelled_once_and_matches_the_stylesheet(self):
         """Two spellings of 768 is how the JS comes to draw cards while the CSS is still
-        showing the table."""
-        self.assertEqual(self.js.count("matchMedia("), 1)
-        self.assertIn("matchMedia('(max-width: 960px)')", self.js)
+        showing the table. The one spelling is util.js's MOBILE_MQ (dev/changelog/1244):
+        this script reads and listens on that object and declares no matchMedia of its own."""
+        self.assertEqual(self.js.count("matchMedia("), 0)
+        self.assertIn("MOBILE_MQ.addEventListener('change'", self.js)
+        with open(os.path.join(REPO, 'static', 'js', 'util.js'), encoding='utf-8') as fh:
+            self.assertIn("matchMedia('(max-width: 960px)')", fh.read())
         self.assertIn('.gm-list, .gd-phonebar, .gm-botpad { display: none; }', self.css)
 
     def test_render_list_is_the_only_entry_point(self):

@@ -13,8 +13,7 @@ from tests.support.app import make_test_app
 
 class DismissAllTests(unittest.TestCase):
     def setUp(self):
-        self.t = make_test_app()
-        self.t.app.config['WTF_CSRF_ENABLED'] = False
+        self.t = make_test_app(csrf=False)
         self.client = self.t.app.test_client()
 
     def tearDown(self):

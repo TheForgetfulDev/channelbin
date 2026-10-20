@@ -41,8 +41,7 @@ def _make_channel(account, sid, raw_url, stream_url=None, url_normalizable=True)
 
 class RenormalizeUrlsApiTests(unittest.TestCase):
     def setUp(self):
-        self.t = make_test_app()
-        self.t.app.config['WTF_CSRF_ENABLED'] = False
+        self.t = make_test_app(csrf=False)
 
     def tearDown(self):
         self.t.cleanup()
@@ -66,6 +65,31 @@ class RenormalizeUrlsApiTests(unittest.TestCase):
         urls = {ch.stream_id: ch.stream_url for ch in Channel.query.filter_by(account_id=acct.id)}
         self.assertEqual(urls[1], 'http://cdn.example/U/P/1')
         self.assertEqual(urls[2], 'http://cdn.example/U/P/2')
+
+    def test_the_active_host_is_rendered_onto_every_rewritten_url(self):
+        """dev/changelog/1243: the three writers of stream_url agree on the host. With the
+        account listed [a1 (dead), a2 (active)], a re-normalize used to write every URL back
+        onto a1 from raw_stream_url, undoing the roll until the next sync."""
+        from app import account_links as links
+        from app.database import AccountHost
+        acct = _make_account(url_normalization=NORM_MPEGTS)
+        _make_channel(acct, 1, 'http://a1.skyline.example/live/U/P/1.ts')
+        _make_channel(acct, 2, 'http://a1.skyline.example/live/U/P/2.m3u8')
+        _make_channel(acct, 9, 'http://radio.example:8000/mount')
+        db.session.commit()
+        links.add_host(acct.id, 'a2.skyline.example')
+        a2 = AccountHost.query.filter_by(account_id=acct.id, host='a2.skyline.example').one()
+        links.set_active_host(acct.id, a2.id)
+
+        resp = self.t.client.post(f'/api/accounts/{acct.id}/renormalize-urls')
+        self.assertEqual(resp.status_code, 200)
+        db.session.expire_all()
+        urls = {ch.stream_id: ch.stream_url for ch in Channel.query.filter_by(account_id=acct.id)}
+        self.assertEqual(urls[1], 'http://a2.skyline.example/U/P/1')
+        self.assertEqual(urls[2], 'http://a2.skyline.example/U/P/2')
+        self.assertEqual(urls[9], 'http://radio.example:8000/mount')
+        raw = {ch.stream_id: ch.raw_stream_url for ch in Channel.query.filter_by(account_id=acct.id)}
+        self.assertEqual(raw[1], 'http://a1.skyline.example/live/U/P/1.ts', 'raw is the provider\'s')
 
     def test_disabled_mode_is_rejected_without_touching_rows(self):
         # An explicit account-level override, not "defer to the global default" - the route

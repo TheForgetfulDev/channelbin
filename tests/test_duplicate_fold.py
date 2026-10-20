@@ -45,8 +45,7 @@ class _Case(unittest.TestCase):
     harbor-direct is unrelated. Nothing is on a provider until a test says so."""
 
     def setUp(self):
-        self.t = make_test_app()
-        self.t.app.config['WTF_CSRF_ENABLED'] = False
+        self.t = make_test_app(csrf=False)
         self.client = self.t.app.test_client()
         now = datetime.utcnow()
         self.now = now

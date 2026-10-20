@@ -38,6 +38,22 @@ REAL_SCHEDULE_MIN_TITLES = 3
 #: The directory stores distinct titles capped here: the only questions asked of the
 #: number are "one?" and "three or more?", and the cap bounds the import's memory.
 DISTINCT_TITLE_CAP = 20
+
+
+def directory_row_summary(entry_count, distinct_titles) -> str:
+    """What a source's file holds for one channel, in one sentence: 'no listings',
+    '1,234 listings, one program all day' or '1,234 listings, 20+ titles'. Every row view
+    (search_directory, channel_guide_view, the review page) carries it as `summary`, so the
+    three surfaces say the same thing and DISTINCT_TITLE_CAP has one spelling. A sole title
+    is rendered by the surface after it, since two of the three set it in <em>."""
+    entry_count = entry_count or 0
+    distinct_titles = distinct_titles or 0
+    if not entry_count:
+        return 'no listings'
+    if distinct_titles == 1:
+        return f'{entry_count:,} listings, one program all day'
+    cap = '+' if distinct_titles >= DISTINCT_TITLE_CAP else ''
+    return f'{entry_count:,} listings, {distinct_titles}{cap} titles'
 #: Programs per channel the directory keeps for the review page to show (§7.5).
 UPCOMING_TITLES = 3
 
@@ -868,7 +884,8 @@ def search_directory(source_id: int, q: str, limit: int = 20) -> list[dict]:
     return [{'xml_id': r.xml_id,
              'display_names': json.loads(r.display_names) if r.display_names else [],
              'entry_count': r.entry_count or 0, 'distinct_titles': r.distinct_titles or 0,
-             'sole_title': r.sole_title if r.distinct_titles == 1 else None}
+             'sole_title': r.sole_title if r.distinct_titles == 1 else None,
+             'summary': directory_row_summary(r.entry_count, r.distinct_titles)}
             for r in rows]
 
 
@@ -1633,6 +1650,8 @@ def channel_guide_view(channel: Channel, case_sensitive: bool) -> dict:
             'entry_count': d.entry_count if d else 0,
             'distinct_titles': d.distinct_titles if d else 0,
             'sole_title': getattr(d, 'sole_title', None) if d and d.distinct_titles == 1 else None,
+            'summary': directory_row_summary(d.entry_count if d else 0,
+                                             d.distinct_titles if d else 0),
             'horizon_until': getattr(d, 'horizon_until', None),
             'refreshed': sid not in no_directory,
             'active': sid == channel.epg_source_id,
@@ -1649,7 +1668,6 @@ def channel_guide_view(channel: Channel, case_sensitive: bool) -> dict:
         'active': active, 'reason': why if computed == channel.epg_source_id else None,
         'hidden': channel.hidden, 'rows': rows, 'override': override,
         'comparable': comparable,
-        'title_cap': DISTINCT_TITLE_CAP,
     }
 
 

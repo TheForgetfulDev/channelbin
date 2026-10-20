@@ -211,7 +211,7 @@ class FilterRegistryTests(unittest.TestCase):
         dims = _dims()
         js = _read('static/js/group-detail.js')
         self.assertIn("const FMT_NONE = 'none'", js)
-        self.assertIn("label: 'Not measured'", js)
+        self.assertIn("label: 'Unmeasured'", js)
         self.assertIn('(rowFormatKey(r) || FMT_NONE) === v', dims)
 
     def test_the_tag_key_is_lowercased_at_build_and_at_lookup(self):
@@ -227,7 +227,7 @@ class FilterRegistryTests(unittest.TestCase):
     def test_format_is_gated_on_having_more_than_one_bucket(self):
         """One bucket means every member already shares it, so the filter could only ever
         select all of them. Format can ask it this way - and FPS, beside it, cannot - because
-        Format carries an explicit "Not measured" bucket that counts toward its own length
+        Format carries an explicit "Unmeasured" bucket that counts toward its own length
         (dev/changelog/770)."""
         self.assertIn('available: () => formatValues().length > 1', _dims())
 

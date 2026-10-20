@@ -116,28 +116,28 @@
        widths (DESIGN.md 9.4), grouping duration/size/health the way mockup 03 does. #}
     <div class="c-stats">
     <div class="c-num" data-col="duration">{% if r.dur_flag %}<span class="dur-flag tip-plain" data-tip="{{ r.dur_tip }}">&#9685;</span>{% endif %}{{ r.dur_str or '-' }}</div>
-    <div class="c-num" data-col="size">{% if r.size_num %}{{ r.size_num }} <span class="unit">{{ r.size_unit }}</span>{% if r.rate %}<span class="sub">{{ r.rate }}</span>{% endif %}{% else %}-{% endif %}</div>
+    <div class="c-num" data-col="size">{% if r.size_num %}{{ r.size_num }} <span class="unit">{{ r.size_unit }}</span>{% if r.rate %}<span class="sub tip-plain" data-tip="{{ r.rate_tip }}">{{ r.rate }}</span>{% endif %}{% else %}-{% endif %}</div>
     <div class="c-health" data-col="health">
       {% if r.health.tip %}<span class="h-mini {{ r.health.cls }} tip-plain" data-tip="{{ r.health.tip }}">{{ r.health.label }}</span>
       {% else %}<span class="h-mini na">-</span>{% endif %}
     </div>
     </div>
     <div class="c-time" data-col="account">{% if r.acct_name %}{{ r.acct_name }}{% else %}<span class="rel">-</span>{% endif %}</div>
-    <div class="c-time" data-col="output">{% if r.output_file %}<span style="font-family:var(--font-mono);font-size:.74rem;word-break:break-all">{{ r.output_file }}</span>{% else %}<span class="rel">-</span>{% endif %}</div>
+    <div class="c-time" data-col="output">{% if r.output_file %}<span style="font-family:var(--font-mono);font-size:var(--fs-sm);word-break:break-all">{{ r.output_file }}</span>{% else %}<span class="rel">-</span>{% endif %}</div>
     <div class="c-actions">
       <button class="btn btn-sm btn-icon" data-menu>&#8943;</button>
       <div class="menu">
         <a href="{{ url_for('recordings.recording_detail', recording_id=r.id) }}">Details</a>
-        {% if r.status == 'SCHEDULED' %}
+        {% if r.status == REC_STATUS.SCHEDULED %}
         <button class="menu-item" data-act="edit-schedule" data-id="{{ r.id }}"
                 data-rec-name="{{ r.name }}"
                 data-edit="{{ r.edit | tojson | forceescape }}">Edit schedule</button>
         <div class="sep"></div>
         <button class="menu-item danger" data-act="cancel" data-id="{{ r.id }}" data-rec-name="{{ r.name }}">Cancel recording</button>
-        {% elif r.status in ('IN_PROGRESS', 'PAUSED', 'RETRYING') %}
+        {% elif r.status in (REC_STATUS.IN_PROGRESS, REC_STATUS.PAUSED, REC_STATUS.RETRYING) %}
         <div class="sep"></div>
         <button class="menu-item danger" data-act="stop" data-id="{{ r.id }}" data-rec-name="{{ r.name }}">Stop recording</button>
-        {% elif r.status in ('COMPLETED', 'FAILED', 'ABORTED') %}
+        {% elif r.status in (REC_STATUS.COMPLETED, REC_STATUS.FAILED, REC_STATUS.ABORTED) %}
         <div class="sep"></div>
         <button class="menu-item danger" data-act="delete" data-id="{{ r.id }}" data-rec-name="{{ r.name }}">Delete</button>
         {% endif %}

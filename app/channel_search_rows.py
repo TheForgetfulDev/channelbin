@@ -477,6 +477,9 @@ def label_group_id(group_ids, groups_by_id):
 
 
 def _iso(value):
+    # duplicated from app/fmt_utils.py::iso_or_none - the row payload deliberately drops
+    # microseconds, so a showing's time is the same string whether it came from the
+    # importer or from a stored recording.
     return value.strftime('%Y-%m-%dT%H:%M:%S') if value else None
 
 

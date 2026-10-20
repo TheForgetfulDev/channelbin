@@ -58,8 +58,7 @@ class _Case(unittest.TestCase):
     the spare has to come from the block."""
 
     def setUp(self):
-        self.t = make_test_app()
-        self.t.app.config['WTF_CSRF_ENABLED'] = False
+        self.t = make_test_app(csrf=False)
         self.dvr = os.path.join(self.t._tmpdir, 'dvr')
         os.makedirs(self.dvr, exist_ok=True)
         self.t.sandbox_config({'recording': {

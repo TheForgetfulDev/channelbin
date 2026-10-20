@@ -168,7 +168,10 @@
   }
 
   /* Fixed, not sticky: it must stay reachable regardless of scroll position. The body
-     reserves its height so the last card cannot end up underneath it. */
+     reserves its height so the last card cannot end up underneath it.
+     duplicated from static/css/style.css .mobile-actbar - that bar stretches every button
+     equally (flex: 1 on each), where this one grows a single primary action and keeps the
+     rest, a <form> among them, at their natural width. */
   .cd-stickybar {
     position: fixed;
     left: 0;
@@ -181,7 +184,7 @@
     padding: 11px 14px calc(11px + env(safe-area-inset-bottom));
     background: var(--bg1);
     border-top: 1px solid var(--border);
-    box-shadow: 0 -4px 16px rgba(0, 0, 0, 0.35);
+    box-shadow: var(--shadow-bar);
   }
   .cd-stickybar .btn { padding: 11px 12px; }
   .cd-stickybar .cd-sb-grow { flex: 1; }
@@ -341,7 +344,7 @@
   {% elif latest_test.id == in_progress_test_id %}
   {{ m.status_badge('b-running', 'Testing now', pulse=true) }}
   <span class="gd-ab-msg">A health check started {{ latest_test.test_started_at | local_time }} is still running.</span>
-  {% elif latest_test.status == 'COMPLETED' and not latest_test.error_detail %}
+  {% elif latest_test.status == TEST_STATUS.COMPLETED and not latest_test.error_detail %}
   <span class="badge b-done">Healthy</span>
   {# All four guide states named explicitly - own row, group's row, both, neither. The
      two-state version read Channel.in_guide alone and so told a channel whose listings
@@ -359,13 +362,13 @@
     Not in the TV Guide.
     {% endif %}
   </span>
-  {% elif latest_test.status == 'COMPLETED' %}
+  {% elif latest_test.status == TEST_STATUS.COMPLETED %}
   <span class="badge b-warn">Passed with warnings</span>
   <span class="gd-ab-msg">Last tested {{ latest_test.test_started_at | local_time }} &middot; {{ latest_test.error_detail }}</span>
-  {% elif latest_test.status == 'FAILED' %}
+  {% elif latest_test.status == TEST_STATUS.FAILED %}
   <span class="badge b-fail">Failing</span>
   <span class="gd-ab-msg">Last tested {{ latest_test.test_started_at | local_time }} &middot; {{ latest_test.error_detail or 'the test failed.' }}</span>
-  {% elif latest_test.status == 'CANCELLED' %}
+  {% elif latest_test.status == TEST_STATUS.CANCELLED %}
   <span class="badge b-abort">Last test cancelled</span>
   <span class="gd-ab-msg">The check running on {{ latest_test.test_started_at | local_time }} was stopped before this channel finished.</span>
   {% else %}
@@ -676,7 +679,7 @@
             {{ m.status_badge(latest_test | test_status_badge, latest_test | test_status_label, tip=latest_test.error_detail) }}
             {% endif %}
           </div>
-          {% if latest_test.status == 'COMPLETED' %}
+          {% if latest_test.status == TEST_STATUS.COMPLETED %}
           <div class="health-summary">
             <div class="health-stat">
               <div class="health-stat-label">Resolution</div>
@@ -703,7 +706,7 @@
             <div class="health-stat">
               <div class="health-stat-label">Bitrate</div>
               <div class="health-stat-value">
-                {% if latest_test.bitrate_kbps %}{{ '%.0f' | format(latest_test.bitrate_kbps) }}<span style="font-size:11px; font-weight:400"> kbps</span>{% else %}--{% endif %}
+                {% if latest_test.bitrate_kbps %}{{ '%.0f' | format(latest_test.bitrate_kbps) }}<span style="font-size:var(--fs-xs); font-weight:400"> kbps</span>{% else %}--{% endif %}
               </div>
             </div>
             <div class="health-stat">
@@ -715,7 +718,7 @@
             {% if latest_test.audio_codec %}
             <div class="health-stat">
               <div class="health-stat-label">Audio</div>
-              <div class="health-stat-value" style="font-size:13px">
+              <div class="health-stat-value" style="font-size:var(--fs-md)">
                 {{ latest_test.audio_codec | upper }}{% if latest_test.audio_channels %} {{ latest_test.audio_channels }}ch{% endif %}
               </div>
             </div>
@@ -727,7 +730,7 @@
             <div class="health-stat">
               <div class="health-stat-label">{{ s.label }}</div>
               <div class="health-stat-value{% if s.cls %} {{ s.cls }}{% endif %}{% if s.tip %} tip-plain{% endif %}"
-                   style="font-size:13px"
+                   style="font-size:var(--fs-md)"
                    {% if s.tip %}data-tip="{{ s.label }}.&#10;{{ s.tip }}"{% endif %}>{{ s.value }}</div>
             </div>
             {% endfor %}
@@ -1017,8 +1020,7 @@
               </div>{% endif %}</td>
             <td data-label="Listings">
               {% if not r.covers %}<span class="text-faint">{{ 'none' if r.refreshed else 'no successful refresh yet' }}</span>
-              {% elif r.sole_title is not none %}{{ '{:,}'.format(r.entry_count) }}, listing one program all day: <em>{{ r.sole_title or '(untitled)' }}</em>
-              {% else %}{{ '{:,}'.format(r.entry_count) }} ({{ r.distinct_titles }}{% if r.distinct_titles >= gs.title_cap %}+{% endif %} titles)
+              {% else %}{{ r.summary }}{% if r.sole_title is not none %}: <em>{{ r.sole_title or '(untitled)' }}</em>{% endif %}
               {% endif %}{% if r.covers and not r.refreshed %}<div class="text-faint small">already held; this source has no successful refresh yet</div>{% endif %}</td>
             <td data-label="Until">{% if r.covers and r.horizon_until %}{{ r.horizon_until | local_time }}{% else %}<span class="text-faint">-</span>{% endif %}</td>
           </tr>
@@ -1142,7 +1144,7 @@
               <td data-label="Recording"><a href="{{ url_for('recordings.recording_detail', recording_id=r.id) }}">{{ r.name }}</a></td>
               {#- Label, not the stored enum: this table said ABORTED where the Recordings
                   list said CANCELLED for the same row (dev/changelog/961). -#}
-              <td data-label="Status">{{ m.status_badge(r.status | rec_status_badge, r.status | rec_status_label) }}</td>
+              <td data-label="Status">{{ m.status_badge(r.status | rec_status_badge, r.status | rec_status_label(r.postprocess_waiting_since)) }}</td>
               <td data-label="Stalls">{{ r.total_stall_count or 0 }}</td>
               <td data-label="Restarts">{{ r.total_restart_count or 0 }}</td>
               <td data-label="Score" class="text-muted small">{{ r.health_quality_score }}</td>
@@ -1349,7 +1351,6 @@ window.CHANNEL_DETAIL = {
   notes: {{ (channel.notes or '') | tojson }},
   healthAdjustment: {{ channel.manual_health_adjustment }},
   healthNote: {{ (channel.manual_health_note or '') | tojson }},
-  epgTitleCap: {{ guide_source.title_cap }},
   defaultProfileId: {{ channel.default_profile_id | tojson }},
   defaultProfileName: {{ (channel.default_profile.name if channel.default_profile else None) | tojson }},
   testEnabled: {{ channel.test_enabled | tojson }},

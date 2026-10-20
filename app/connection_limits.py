@@ -29,6 +29,8 @@ from collections import defaultdict
 from datetime import datetime
 from typing import List, Optional
 
+from .fmt_utils import join_labels
+
 log = logging.getLogger(__name__)
 
 _lock = threading.Lock()
@@ -175,6 +177,60 @@ def try_acquire(account_id: int, holder_kind: str, holder_id) -> bool:
         pool = preferred[0] if preferred else free[0][0]
         _holders[pool].append(key)
         _seat_of[key] = (account_id, pool)
+        return True
+
+
+def move_seat(holder_kind: str, holder_id, from_account_id: int, to_account_id: int) -> bool:
+    """Move the holder's seat from one account to another in one step, or leave it exactly
+    where it is.
+
+    For a live recording failing over across accounts. A release followed by a try_acquire
+    on the target leaves the recording holding no seat at all when the target refuses, and
+    the re-acquire on the account it just left can refuse too - the account may be the one
+    the user just blocked, whose usable limit is 0 - so the recording goes on capturing
+    with a connection nothing counts, and every later block check reads "no seat here" as
+    "nothing to move" (dev/changelog/1242). Decided and done under the one lock: the target
+    pool is found with the old seat still held, and only then is the old seat given up.
+
+    Returns False with nothing changed when no pool on the target has a free seat. When
+    the two accounts share the login the seat is already in, the seat stays and only its
+    attribution moves - one connection, one seat, now counted to the account the recording
+    is on.
+    """
+    from . import db
+    from .account_links import refusal_cooldown
+    from .config import load_config
+    from .database import Account
+    cfg = load_config()
+    default_max_connections = cfg.get('accounts', {}).get('default_max_connections', 1)
+    cooldown = refusal_cooldown(cfg)
+    all_seats = _seats_now([to_account_id])
+    seats = all_seats.get(to_account_id, [])
+    taken = _pool_taken_now([to_account_id], all_seats)
+    key = (holder_kind, holder_id)
+    with _lock:
+        account = db.session.get(Account, to_account_id)
+        if account is None:
+            return False
+        pools = _usable_limits(account, default_max_connections, taken, seats)
+        seated = _seat_of.get(key)
+        current = seated[1] if seated is not None else from_account_id
+        if key in _held_in(current) and any(pool == current for pool, _, _ in pools):
+            _seat_of[key] = (to_account_id, current)
+            return True
+        free = [(pool, refused) for pool, limit, refused in pools if len(_held_in(pool)) < limit]
+        if not free:
+            return False
+        now = datetime.utcnow()
+        preferred = [pool for pool, refused in free if not _refused(refused, now, cooldown)]
+        pool = preferred[0] if preferred else free[0][0]
+        old = _held_in(current)
+        if key in old:
+            old.remove(key)
+            if not old:
+                _holders.pop(current, None)
+        _holders[pool].append(key)
+        _seat_of[key] = (to_account_id, pool)
         return True
 
 
@@ -373,16 +429,7 @@ def pool_holder_counts(account_id: int) -> dict:
 
 
 def _kinds_label(kinds) -> str:
-    return _join_labels(HOLDER_LABELS.get(k, k) for k in kinds)
-
-
-def _join_labels(labels) -> str:
-    labels = list(dict.fromkeys(labels))
-    if not labels:
-        return ''
-    if len(labels) == 1:
-        return labels[0]
-    return ', '.join(labels[:-1]) + ' and ' + labels[-1]
+    return join_labels(HOLDER_LABELS.get(k, k) for k in kinds)
 
 
 def describe_holders(account_id: int) -> str:
@@ -418,7 +465,7 @@ def describe_pool_holders(login_id: int, account_id: Optional[int] = None,
         if account_id is not None and names is not None and owner not in (None, account_id):
             label += f' on {names.get(owner, f"account {owner}")}'
         labels.append(label)
-    return _join_labels(labels)
+    return join_labels(labels)
 
 
 def release(account_id: int, holder_kind: str, holder_id):
@@ -439,28 +486,37 @@ def release(account_id: int, holder_kind: str, holder_id):
             _holders.pop(pool, None)
 
 
-def _strip_kind(account_id: int, holder_kind: str) -> List:
-    """Release every holder of one kind on account_id, across its pools, and return their
-    holder_ids."""
+def _strip_kind(account_id: int, holder_kind: str) -> List[tuple]:
+    """Release every holder of one kind that a recording on account_id would need the seat
+    of, and return (holder_id, account the holder came through) pairs.
+
+    That is every such holder in any of the account's CURRENT pools - whichever account it
+    came through, since a login shared across accounts is one seat set and a preview on the
+    sibling holds the very seat the recording needs (dev/changelog/1243) - plus any holder
+    counted to this account in a pool its list no longer names (a login removed while the
+    seat was held), which is still this account's connection on the provider."""
+    seats = _seats_now([account_id]).get(account_id, [])
+    pools = {login_pool(lid) for lid, _, _ in seats} if seats else {account_id}
     stripped = []
     with _lock:
         for pool in list(_holders):
             holders = _holders[pool]
-            mine = [h for h in holders if h[0] == holder_kind
-                    and _account_of(pool, h) == account_id]
-            for h in mine:
+            mine = [(h, _account_of(pool, h)) for h in holders if h[0] == holder_kind
+                    and (pool in pools or _account_of(pool, h) == account_id)]
+            for h, _ in mine:
                 holders.remove(h)
                 _seat_of.pop(h, None)
             stripped.extend(mine)
             if not holders:
                 _holders.pop(pool, None)
-    return [h[1] for h in stripped]
+    return [(h[1], owner if owner is not None else account_id) for h, owner in stripped]
 
 
-def preempt_tests_for_slot(account_id: int) -> List[int]:
-    """Release every 'test'-kind holder for account_id and return their holder_ids
-    (channel_ids), so the caller (recorder.py, when a recording needs the slot a
-    running channel test currently holds) can kill each test's ffmpeg process.
+def preempt_tests_for_slot(account_id: int) -> List[tuple]:
+    """Release every 'test'-kind holder a recording on account_id needs the seat of and
+    return (channel_id, account the test came through) pairs, so the caller (recorder.py,
+    when a recording needs the slot a running channel test currently holds) can kill each
+    test's ffmpeg process through its own account.
 
     Never releases 'recording'-kind holders - a recording must never force out
     another recording. Recordings always win over tests per product decision;
@@ -469,10 +525,11 @@ def preempt_tests_for_slot(account_id: int) -> List[int]:
     return _strip_kind(account_id, 'test')
 
 
-def preempt_previews_for_slot(account_id: int) -> List[str]:
-    """Release every 'preview'-kind holder for account_id and return their holder_ids
-    (preview session ids), so recorder.py can stop the preview's ffmpeg through
-    app/preview.py. Same doctrine as preempt_tests_for_slot, and the recorder asks this
-    one FIRST: a preview is a person looking, a test is a measurement feeding the health
-    score, so the look yields before the measurement does (dev/changelog/1018)."""
+def preempt_previews_for_slot(account_id: int) -> List[tuple]:
+    """Release every 'preview'-kind holder a recording on account_id needs the seat of and
+    return (preview session id, account the preview came through) pairs, so recorder.py
+    can stop the preview's ffmpeg through app/preview.py. Same doctrine as
+    preempt_tests_for_slot, and the recorder asks this one FIRST: a preview is a person
+    looking, a test is a measurement feeding the health score, so the look yields before
+    the measurement does (dev/changelog/1018)."""
     return _strip_kind(account_id, 'preview')

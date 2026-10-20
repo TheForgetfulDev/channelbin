@@ -261,8 +261,7 @@ class RetryConvertStrandedTests(unittest.TestCase):
     """A CONVERTING row left behind by a restart/crash must be restartable from the UI."""
 
     def setUp(self):
-        self.t = make_test_app()
-        self.t.app.config['WTF_CSRF_ENABLED'] = False
+        self.t = make_test_app(csrf=False)
         # Address the .ts via the row's own output_path under the test tmpdir - never a
         # runtime load_config() dir, which points at the real /dvr.
         self.ts_path = os.path.join(self.t._tmpdir, 'stranded.ts')
@@ -315,8 +314,7 @@ class RestartApiBusyTests(unittest.TestCase):
     script's own guard would refuse invisibly (Popen output goes to DEVNULL)."""
 
     def setUp(self):
-        self.t = make_test_app()
-        self.t.app.config['WTF_CSRF_ENABLED'] = False
+        self.t = make_test_app(csrf=False)
 
     def tearDown(self):
         self.t.cleanup()
@@ -448,8 +446,7 @@ class RestartApiParkedTests(unittest.TestCase):
     restart-parked lookup the confirm reads before it opens."""
 
     def setUp(self):
-        self.t = make_test_app()
-        self.t.app.config['WTF_CSRF_ENABLED'] = False
+        self.t = make_test_app(csrf=False)
 
     def tearDown(self):
         self.t.cleanup()
@@ -523,8 +520,7 @@ class RestartApiDockerTests(unittest.TestCase):
     while still honouring the same busy guard as the non-container path."""
 
     def setUp(self):
-        self.t = make_test_app()
-        self.t.app.config['WTF_CSRF_ENABLED'] = False
+        self.t = make_test_app(csrf=False)
         self._env_patch = patch.dict(os.environ, {'CHANNELBIN_DOCKER': '1'})
         self._env_patch.start()
 
@@ -573,8 +569,7 @@ class RestartInstanceIdTests(unittest.TestCase):
     must hold the old process's id for certain, never a value it guessed."""
 
     def setUp(self):
-        self.t = make_test_app()
-        self.t.app.config['WTF_CSRF_ENABLED'] = False
+        self.t = make_test_app(csrf=False)
 
     def tearDown(self):
         self.t.cleanup()

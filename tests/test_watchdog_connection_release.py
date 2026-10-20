@@ -32,10 +32,10 @@ from app.database import (  # noqa: E402
     RECORDING_FAILED, RECORDING_FAILED_DEAD_STREAM, REC_STATUS_FAILED, Recording,
 )
 from tests.support import seed  # noqa: E402
-from tests.test_downtime_accounting import _RestartHarness, _sleeper  # noqa: E402
+from tests.support.watchdog import RestartHarness, sleeper  # noqa: E402
 
 
-class _ConnectionReleaseHarness(_RestartHarness):
+class _ConnectionReleaseHarness(RestartHarness):
     """Same rig as the downtime/segment-teardown suites, plus a real account+channel
     (so `rec.channel.account_id` resolves) with a slot already registered the way
     `_try_acquire_slot_with_preemption` would have when the recording started."""
@@ -81,7 +81,7 @@ class MaxConsecutiveFailuresGiveUpReleasesSlotTests(_ConnectionReleaseHarness):
 
     def test_slot_is_released_when_the_watchdog_gives_up_with_no_group_to_fail_over_to(self):
         self._extra_watchdog_cfg = {'max_consecutive_failures': 1}
-        self.state.process = _sleeper()
+        self.state.process = sleeper()
         with mock.patch.object(recorder, 'failover_group_member', return_value=False):
             self._run_until_event(RECORDING_FAILED, stall_timeout=1, restart_delay=0,
                                   produces_data=False)
@@ -102,7 +102,7 @@ class DeadStreamGiveUpReleasesSlotTests(_ConnectionReleaseHarness):
         # was written to guard - the retry path (watchdog.dead_stream_max_retry_attempts > 0)
         # is exercised separately in tests/test_dead_stream_retry.py.
         self._extra_watchdog_cfg = {'early_fail_abort_count': 1, 'dead_stream_max_retry_attempts': 0}
-        self.state.process = _sleeper()
+        self.state.process = sleeper()
         with mock.patch.object(recorder, 'failover_group_member', return_value=False):
             self._run_until_event(RECORDING_FAILED_DEAD_STREAM, stall_timeout=1,
                                   restart_delay=0, produces_data=False)
@@ -113,7 +113,7 @@ class DeadStreamGiveUpReleasesSlotTests(_ConnectionReleaseHarness):
             'holder')
 
 
-class ChannelLessRecordingGiveUpTests(_RestartHarness):
+class ChannelLessRecordingGiveUpTests(RestartHarness):
     """Guards dev/docs/BUGS.md 2026-08-15 "Watchdog give-up crashes on channel-less
     (manual URL) recordings". A manual URL-only recording has no channel, so the
     unconditional `connlim.release(rec.channel.account_id, ...)` at the end of both
@@ -124,7 +124,7 @@ class ChannelLessRecordingGiveUpTests(_RestartHarness):
     path completed rather than just that the terminal event was written (that commit
     happens inside `fail_fn()`, before the old crash point).
 
-    Deliberately does NOT assign a channel to `self.rid` - `_WatchdogHarness.setUp`
+    Deliberately does NOT assign a channel to `self.rid` - `WatchdogHarness.setUp`
     (the base rig) already seeds a channel-less recording by default.
     """
 
@@ -147,7 +147,7 @@ class ChannelLessRecordingGiveUpTests(_RestartHarness):
         self.assertIsNone(db.session.get(Recording, self.rid).channel_id,
                           'harness precondition: this recording must be channel-less')
         self._extra_watchdog_cfg = {'max_consecutive_failures': 1}
-        self.state.process = _sleeper()
+        self.state.process = sleeper()
         with mock.patch.object(recorder, 'failover_group_member', return_value=False):
             rec = self._run_until_event(RECORDING_FAILED, stall_timeout=1, restart_delay=0,
                                         produces_data=False)
@@ -157,7 +157,7 @@ class ChannelLessRecordingGiveUpTests(_RestartHarness):
 
     def test_dead_stream_give_up_completes_without_channel(self):
         self._extra_watchdog_cfg = {'early_fail_abort_count': 1, 'dead_stream_max_retry_attempts': 0}
-        self.state.process = _sleeper()
+        self.state.process = sleeper()
         with mock.patch.object(recorder, 'failover_group_member', return_value=False):
             rec = self._run_until_event(RECORDING_FAILED_DEAD_STREAM, stall_timeout=1,
                                         restart_delay=0, produces_data=False)

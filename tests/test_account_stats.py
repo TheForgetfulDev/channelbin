@@ -46,8 +46,7 @@ class _LedgerCase(unittest.TestCase):
     TZ = 'America/New_York'
 
     def setUp(self):
-        self.t = make_test_app()
-        self.t.app.config['WTF_CSRF_ENABLED'] = False
+        self.t = make_test_app(csrf=False)
         patcher = mock.patch('app.config.load_config', _tz_config(self.TZ))
         patcher.start()
         self.addCleanup(patcher.stop)

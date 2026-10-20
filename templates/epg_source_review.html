@@ -12,8 +12,7 @@
 
 {% macro file_cell(f) -%}
   <code>{{ f.xml_id }}</code>
-  <div class="text-faint small">{{ '{:,}'.format(f.entry_count) }} program{{ 's' if f.entry_count != 1 else '' }},
-    {% if f.distinct_titles == 1 %}one title all day{% else %}{{ f.distinct_titles }}{{ '+' if f.distinct_titles >= 20 else '' }} titles{% endif %}{% if f.horizon %}, until {{ f.horizon }}{% endif %}</div>
+  <div class="text-faint small">{{ f.summary }}{% if f.horizon %}, until {{ f.horizon }}{% endif %}</div>
 {%- endmacro %}
 
 {% macro coming_up(f) -%}

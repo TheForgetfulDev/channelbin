@@ -522,7 +522,7 @@ class CssClassDefinedTests(unittest.TestCase):
     # static/js/notifications.js (dev/changelog/440), so a missing rule is invisible to
     # a grep of templates/ - which is how the two shipped invisible-UI bugs above got in.
     JS_EMITTED_CLASSES = ('msel', 'mlbl', 'mopt', 'mo-t', 'mo-s', 'btn-accent',
-                          'svc-x', 'svc-enable', 'rt-cl', 'rt-none', 'alert-severity',
+                          'svc-enable', 'rt-cl', 'rt-none', 'alert-severity',
                           # The shared filter bar (static/js/filter-bar.js). Two of these
                           # shipped with no rule at all: the chip's remove glyph drew as
                           # bare body text, and a chosen value in a drilled-into dimension
@@ -1014,6 +1014,115 @@ class ConfigReadBypassTests(unittest.TestCase):
             'class behind five BUGS.md entries. Call load_config() (or _load_config_file() '
             'for the raw un-merged file dict), or add a `# direct-config-read: <reason>` '
             'marker if this read genuinely must hit the disk:\n' + '\n'.join(offenders))
+
+
+class GuideFlagReadTests(unittest.TestCase):
+    """`Channel.in_guide` means "this channel is its own guide row" and nothing else
+    (CLAUDE.md, dev/changelog/751). "Are its listings in the guide" is the WIDER question -
+    a group member with its own flag off still has its listings on screen through the
+    group's row - and it is `channel_groups.guide_scope_channel_ids()`. A new page that
+    filters `Channel.in_guide == True` and calls it "in the guide" is wrong in a way no
+    test notices until two surfaces disagree in front of the user.
+
+    So a filter on the column outside app/channel_groups.py carries a
+    `# guide-flag-read-ok: <reason>` marker saying which question it is answering (an own-row
+    count, an own-row duplicate, a group's own flag). The marker is the review, not the
+    permission: a reason that says "in the guide" is the defect.
+    """
+
+    _MARKER = 'guide-flag-read-ok'
+    _CANONICAL = 'app/channel_groups.py'
+    _READ_RE = re.compile(r'Channel\.in_guide\s*(==|\.is_\()|filter_by\(in_guide=')
+
+    @classmethod
+    def offenders_in(cls, path):
+        raw_lines = _read(path).splitlines()
+        code_lines = _mask_comments_and_strings(_read(path)).splitlines()
+        out = []
+        for i, line in enumerate(code_lines):
+            if not cls._READ_RE.search(line):
+                continue
+            if cls._MARKER in raw_lines[i] or (i and cls._MARKER in raw_lines[i - 1]):
+                continue
+            out.append(f'{_rel(path)}:{i + 1}: {raw_lines[i].strip()}')
+        return out
+
+    def test_every_bare_guide_flag_filter_says_which_question_it_answers(self):
+        offenders = []
+        for path in _walk(APP_DIR, '.py'):
+            if _rel(path) == self._CANONICAL:
+                continue
+            offenders.extend(self.offenders_in(path))
+        self.assertEqual(
+            offenders, [],
+            'a filter on Channel.in_guide / in_guide=True outside app/channel_groups.py with '
+            'no `# guide-flag-read-ok: <reason>` marker. If the question is "is this channel '
+            'in the guide", the answer is channel_groups.guide_scope_channel_ids(), not the '
+            'column (dev/changelog/751):\n' + '\n'.join(offenders))
+
+    def test_the_scan_sees_the_marked_sites(self):
+        marked = 0
+        for path in _walk(APP_DIR, '.py'):
+            if _rel(path) == self._CANONICAL:
+                continue
+            raw = _read(path)
+            marked += raw.count(self._MARKER)
+        self.assertGreaterEqual(marked, 8, 'the marked sites have gone - the scan is probably '
+                                           'no longer matching the real tree')
+
+    def test_an_unmarked_filter_is_reported(self):
+        import tempfile
+        with tempfile.NamedTemporaryFile('w', suffix='.py', dir=APP_DIR, delete=False) as fh:
+            fh.write("rows = Channel.query.filter(Channel.in_guide.is_(True)).all()\n"
+                     "more = Channel.query.filter_by(in_guide=True).all()\n"
+                     "ok = Channel.query.filter_by(in_guide=True).all()  # guide-flag-read-ok: x\n")
+            path = fh.name
+        try:
+            _read.cache_clear()
+            found = self.offenders_in(path)
+        finally:
+            os.unlink(path)
+            _read.cache_clear()
+        self.assertEqual([f.split(':')[1] for f in found], ['1', '2'])
+
+
+_TOJSON_ATTR_RE = re.compile(r'=\s*"[^"]*\{\{[^}]*\|\s*tojson(?![^}]*\|\s*forceescape)[^}]*\}\}')
+
+
+def find_unescaped_tojson_attributes(text):
+    """1-indexed lines where `| tojson` sits inside a double-quoted HTML attribute with no
+    `| forceescape` after it. Script blocks are left alone: there the filter's own output
+    is what is wanted, and the attribute context is what makes it unsafe."""
+    return [i for i, line in enumerate(text.splitlines(), 1) if _TOJSON_ATTR_RE.search(line)]
+
+
+class JinjaTojsonAttributeTests(unittest.TestCase):
+    """`| tojson` inside a double-quoted attribute needs `| forceescape` (CLAUDE.md's Jinja
+    hazards, a shipped bug class): tojson marks its output safe, so the quotes inside the
+    JSON end the attribute. base.html's meta tags and every data-* payload carry the
+    second filter; this keeps the next one from forgetting it."""
+
+    def test_no_attribute_carries_a_bare_tojson(self):
+        offenders = []
+        for path in _walk(TPL_DIR, '.html'):
+            for lineno in find_unescaped_tojson_attributes(_read(path)):
+                offenders.append(f'{_rel(path)}:{lineno}')
+        self.assertEqual(offenders, [],
+                         '`| tojson` inside a quoted attribute with no `| forceescape` - the '
+                         'JSON\'s own quotes end the attribute:\n' + '\n'.join(offenders))
+
+    def test_the_scan_finds_the_hazard_and_passes_the_fix(self):
+        self.assertEqual(find_unescaped_tojson_attributes(
+            '<div data-x="{{ payload | tojson }}">'), [1])
+        self.assertEqual(find_unescaped_tojson_attributes(
+            '<div data-x="{{ payload | tojson | forceescape }}">'), [])
+        self.assertEqual(find_unescaped_tojson_attributes(
+            '<script type="application/json">{{ payload | tojson }}</script>'), [])
+
+    def test_the_real_tree_uses_the_filter_in_attributes(self):
+        """Vacuity guard: the tree really has attribute-context tojson, all escaped."""
+        hits = sum(_read(path).count('| tojson | forceescape') for path in _walk(TPL_DIR, '.html'))
+        self.assertGreaterEqual(hits, 5)
 
 
 class ConfigWriteBypassTests(unittest.TestCase):

@@ -4,6 +4,7 @@ from datetime import datetime
 from sqlalchemy.ext.hybrid import hybrid_property
 
 from . import db
+from .ui_constants import DEFAULT_COLOR
 
 # ── Event type constants ──────────────────────────────────────────────────────
 
@@ -256,7 +257,13 @@ CONVERTED_FILE_GAPS    = 'CONVERTED_FILE_GAPS'
 # dev/changelog/1200, so a recording whose source was gone could only be inferred.
 SOURCE_DELETED         = 'SOURCE_DELETED'
 SOURCE_KEPT            = 'SOURCE_KEPT'
+# Two outcomes, two types, as for the join and the conversion above: MOVED is the file at
+# its move_on_complete destination (or already there), MOVE_FAILED is a move that left it
+# where it was. FILE_MOVED used to carry both with the outcome only in a `Move FAILED`
+# prefix of the detail, so a failed move rendered in the event log's success color
+# (migration 97 retyped the old rows).
 FILE_MOVED            = 'FILE_MOVED'
+FILE_MOVE_FAILED       = 'FILE_MOVE_FAILED'
 SCRIPT_EXECUTED        = 'SCRIPT_EXECUTED'
 # Pre-recording health check (DESIGN-prerecord-checks.md §3-4): a channel_tester run fired
 # a lead time before this recording's start_time, testing the channel (or would-be group
@@ -646,6 +653,53 @@ OD_JOB_STATUSES = (
 # a run route and a schedule route that each enumerated their own subset is what let a
 # recurring SCHEDULED check belong to neither (dev/changelog/1076).
 OD_JOB_IDLE_STATUSES = tuple(s for s in OD_JOB_STATUSES if s != OD_JOB_STATUS_RUNNING)
+
+# Account.status vocabulary - the account's SYNC state, which the scheduler and the sync
+# routes key off (a SYNCING account refuses a second sync, a restart resets one left SYNCING).
+# Not the provider's own word for the account; that is Account.provider_status.
+ACCOUNT_STATUS_UNSYNCED = 'UNSYNCED'   # added, never fetched: no channels yet
+ACCOUNT_STATUS_SYNCING  = 'SYNCING'
+ACCOUNT_STATUS_OK       = 'OK'         # the last sync finished
+ACCOUNT_STATUS_ERROR    = 'ERROR'      # the last sync failed; the previous import still stands
+ACCOUNT_STATUSES = (
+    ACCOUNT_STATUS_UNSYNCED, ACCOUNT_STATUS_SYNCING, ACCOUNT_STATUS_OK, ACCOUNT_STATUS_ERROR,
+)
+
+# AccountSyncLog.status vocabulary - how one sync run ended. PARTIAL is a run that finished
+# with its EPG degraded (DESIGN-sync-resilience.md 2); SKIPPED is a run that never started
+# because another sync held the account. Shares spellings with the families above and is
+# its own enumeration for the reason TEST_STATUS_* gives.
+SYNC_LOG_IN_PROGRESS = 'IN_PROGRESS'
+SYNC_LOG_SUCCESS     = 'SUCCESS'
+SYNC_LOG_PARTIAL     = 'PARTIAL'
+SYNC_LOG_ERROR       = 'ERROR'
+SYNC_LOG_CANCELLED   = 'CANCELLED'
+SYNC_LOG_SKIPPED     = 'SKIPPED'
+SYNC_LOG_STATUSES = (
+    SYNC_LOG_IN_PROGRESS, SYNC_LOG_SUCCESS, SYNC_LOG_PARTIAL, SYNC_LOG_ERROR,
+    SYNC_LOG_CANCELLED, SYNC_LOG_SKIPPED,
+)
+# The runs that imported something: what "last good sync" and the per-day ledger count.
+SYNC_LOG_IMPORTED = (SYNC_LOG_SUCCESS, SYNC_LOG_PARTIAL)
+
+
+def status_vocabularies():
+    """Every status family above, keyed by its prefix: {'REC_STATUS': {'FAILED': 'FAILED',
+    ...}, 'ACCOUNT_STATUS': {...}, ...}. Read by create_app() into a Jinja global per
+    family (`{% if st == ACCOUNT_STATUS.OK %}`) and into base.html's status-vocab meta tag
+    for util.js::statusVocab(), so a template or a script compares against the one declared
+    spelling and never re-types it. Derived from the module's own constants, so a new member
+    is on every surface the moment it is declared."""
+    families = ('REC_STATUS', 'TEST_STATUS', 'OD_JOB_STATUS', 'ACCOUNT_STATUS', 'SYNC_LOG',
+                'EPG_STATUS', 'JOB_RUN')
+    out = {family: {} for family in families}
+    for name, value in globals().items():
+        if not isinstance(value, str):
+            continue
+        for family in families:
+            if name.startswith(family + '_') and name != family + '_STATUSES':
+                out[family][name[len(family) + 1:]] = value
+    return out
 
 # Statuses that own a live ffmpeg child or an in-flight background thread, so restarting
 # the app (or deleting the row) would strand work. SCHEDULED is deliberately absent - a
@@ -1092,13 +1146,20 @@ class Recording(db.Model):
         instead. That is the point rather than a side effect: a placeholder segment used to
         "cover" its five seconds like any other, which is why recording 19's 61s capture gap
         read as honest while twelve placeholder windows sat inside it (dev/changelog/957).
+
+        A segment that recorded zero bytes covers nothing either - an attempt the stream
+        refused at open, or that timed out waiting for its first byte, was not capturing
+        for the seconds it sat there. With a 20s read timeout each such attempt used to hide
+        20s of a gap (the capture tier's dead-stream scenario measured it, dev/changelog/1223).
+        Only a KNOWN zero is excluded: a NULL byte count means the segment's close never
+        measured its file, and treating unknown as empty would invent gaps.
         """
         start, stop = self.start_time, self.stop_time
         if not start or not stop or stop <= start:
             return 0.0
         spans = []
         for s in self.segments:
-            if s.excluded:
+            if s.excluded or s.bytes_recorded == 0:
                 continue
             if not s.started_at or not s.ended_at:
                 continue
@@ -1466,7 +1527,7 @@ class Account(db.Model):
     username          = db.Column(db.String(255), nullable=False, default='')
     password          = db.Column(db.String(255), nullable=False, default='')
     # UNSYNCED | SYNCING | OK | ERROR
-    status            = db.Column(db.String(32), nullable=False, default='UNSYNCED')
+    status            = db.Column(db.String(32), nullable=False, default=ACCOUNT_STATUS_UNSYNCED)
     last_sync_at      = db.Column(db.DateTime)   # naive UTC
     next_sync_at      = db.Column(db.DateTime)   # naive UTC
     last_error        = db.Column(db.Text)
@@ -1482,7 +1543,7 @@ class Account(db.Model):
     # always get real URLs from their playlist. Backs the /accounts "Constructed URLs"
     # badge; refreshed every sync alongside channel_count/epg_entry_count.
     constructed_stream_url_count = db.Column(db.Integer, default=0, server_default=db.text('0'))
-    color             = db.Column(db.String(32), nullable=False, default='#58a6ff')
+    color             = db.Column(db.String(32), nullable=False, default=DEFAULT_COLOR)
     # None = use the global sync.url_normalization default; otherwise one of
     # accounts.NORM_* ('disabled' / 'mpegts' / 'mpegts_live' / 'hls').
     # Was a Boolean before _m014; legacy True/False rows are coerced by
@@ -1616,7 +1677,10 @@ class AccountHost(db.Model):
     account_id         = db.Column(db.Integer, db.ForeignKey('accounts.id'), nullable=False)
     #: `name[:port]` - the netloc of a stream URL, scheme-less, port kept when the URLs carry one.
     host               = db.Column(db.String(255), nullable=False)
-    position           = db.Column(db.Integer, nullable=False, default=0)
+    # server_default beside the Python default: migration 84's CREATE TABLE carries DEFAULT
+    # 0, and a fresh build has to read the same (MigrationCreateTableParityTests).
+    position           = db.Column(db.Integer, nullable=False, default=0,
+                                   server_default=db.text('0'))
     is_active          = db.Column(db.Boolean, nullable=False, default=False,
                                    server_default=db.text('0'))
     #: When this host last became the active one through a roll or Make active; NULL on the
@@ -1667,7 +1731,8 @@ class AccountLogin(db.Model):
 
     account_id = db.Column(db.Integer, db.ForeignKey('accounts.id'), primary_key=True)
     login_id   = db.Column(db.Integer, db.ForeignKey('logins.id'), primary_key=True)
-    position   = db.Column(db.Integer, nullable=False, default=0)
+    # server_default for the same reason AccountHost.position carries one (migration 85).
+    position   = db.Column(db.Integer, nullable=False, default=0, server_default=db.text('0'))
 
 
 # ── Channel group format strategy ─────────────────────────────────────────────
@@ -2406,7 +2471,7 @@ class OnDemandTestJob(db.Model):
     recur_paused         = db.Column(db.Boolean, nullable=False, default=False,
                                      # recurring settings kept, but no active APScheduler job
                                      server_default=db.text('0'))
-    status_before_schedule = db.Column(db.String(32))  # status to restore to on Unschedule (QUEUED/COMPLETED/CANCELLED)
+    status_before_schedule = db.Column(db.String(32))  # status to restore to on Remove schedule (QUEUED/COMPLETED/CANCELLED)
     # Maintenance window (app/check_window.py): dispatcher-owned instead of an exact
     # recur_hour:recur_minute CronTrigger. recur_hour/recur_minute stay populated when
     # this is True (not nulled) so toggling window mode off restores the previous time.
@@ -2754,7 +2819,7 @@ class Tag(db.Model):
 
     id         = db.Column(db.Integer, primary_key=True)
     name       = db.Column(db.String(255), nullable=False, unique=True)
-    color      = db.Column(db.String(32), nullable=False, default='#58a6ff')
+    color      = db.Column(db.String(32), nullable=False, default=DEFAULT_COLOR)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
     patterns = db.relationship('TagPattern', backref='tag', lazy=True,

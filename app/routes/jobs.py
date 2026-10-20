@@ -161,7 +161,7 @@ def _build_job_list():
     from ..database import (
         Recording, OnDemandTestJob, Account, EpgSource,
         REC_STATUS_SCHEDULED, REC_STATUS_IN_PROGRESS, REC_STATUS_PAUSED, REC_STATUS_RETRYING,
-        OD_JOB_STATUS_SCHEDULED,
+        OD_JOB_STATUS_SCHEDULED, WINDOW_OPEN_STATUSES,
     )
 
     scheduler = get_scheduler()
@@ -264,7 +264,7 @@ def _build_job_list():
         stop_run_utc = to_naive_utc(next_run)
 
         rec = recordings.get(rec_id)
-        if rec and rec.status not in (REC_STATUS_IN_PROGRESS, REC_STATUS_PAUSED, REC_STATUS_RETRYING):
+        if rec and rec.status not in WINDOW_OPEN_STATUSES:
             continue  # orphaned stop job for a finished/aborted recording
         name = rec.name if rec else f'Recording #{rec_id}'
         started = (rec.started_at or rec.start_time) if rec else now
@@ -385,7 +385,9 @@ def _build_job_list():
     from ..scheduler import next_on_demand_run_for_job
     from .channel_tests import _recur_label
 
-    ct_cfg = load_config().get('channel_testing', {})
+    # One load_config() for the whole list - the post-script tail below reads `cfg` too.
+    cfg = load_config()
+    ct_cfg = cfg.get('channel_testing', {})
     # recur_paused=False matches the exact-time branch above: pausing a schedule calls
     # cancel_on_demand_job_schedule(), which removes the APScheduler row and so drops it
     # off this page too - a paused window job (no row to begin with) gets the same result
@@ -664,9 +666,7 @@ def _build_job_list():
         del item['_next_run_utc']
 
     # Event-triggered jobs (not APScheduler-scheduled; run after each recording's pipeline)
-    from ..config import load_config as _load_config
-    _cfg = _load_config()
-    _ps = _cfg['recording'].get('post_script', {})
+    _ps = cfg['recording'].get('post_script', {})
     if _ps.get('enabled', True):
         items.append({
             'id': 'post_complete_script',

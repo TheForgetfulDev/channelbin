@@ -41,8 +41,7 @@ def apply_logo_cache_schedule():
 
 class _LogoCacheJobCase(unittest.TestCase):
     def setUp(self):
-        self.t = make_test_app(start_scheduler=True)
-        self.t.app.config['WTF_CSRF_ENABLED'] = False
+        self.t = make_test_app(start_scheduler=True, csrf=False)
         self.client = self.t.app.test_client()
         self.addCleanup(self.t.cleanup)
 

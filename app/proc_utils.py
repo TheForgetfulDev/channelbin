@@ -5,6 +5,7 @@ import os
 import re
 import signal
 import subprocess
+import tempfile
 import time
 import uuid
 from typing import NamedTuple
@@ -233,14 +234,17 @@ def report_read_timeout_state(cfg: dict, source: str) -> bool:
 # Twin caps on any stderr tail read back off disk. Bytes bound the read, lines bound what a
 # human is shown; 4KB/20 lines comfortably holds an ffmpeg error plus the context above it.
 #
-# Measured on this machine (dev/changelog/430), because ffmpeg's stderr shape is build- and
-# invocation-specific and the documented behavior is not what happens here:
-#   * Redirected to a FILE (which is how the recorder spawns it), ffmpeg 6.x on this box
-#     emits progress with newlines and essentially no '\r' - an 8s `-re -c copy` run produced
-#     CR=0, LF=17. So the byte cap is the load-bearing one; a long capture's spool is large
-#     because there are many lines, not one enormous one.
-#   * '\r' is still normalized rather than assumed absent: a libx264 encode on the same box
-#     did emit one, the flag set differs per call site, and the cost of handling it is a
+# Measured on this machine, because ffmpeg's stderr shape is build- and invocation-specific
+# and the documented behavior is not what happens here:
+#   * Redirected to a FILE (which is how the recorder spawns it), an 8s `-re -c copy` run on
+#     ffmpeg 7.1.5 wrote 15 '\r' and 30 '\n' in about 5 KB - the same counts from a local
+#     file and from a local HTTP source, so the input does not change the shape. The '\r'
+#     carriage returns are the progress line rewriting itself; every line is short. So the
+#     byte cap is the load-bearing one: a long capture's spool is large because there are
+#     many lines, not one enormous one. (An earlier measurement cited CR=0, LF=17 for 6.x -
+#     dev/changelog/430 - and did not reproduce on 6.1.1 or 7.1.5, dev/changelog/913, 1246;
+#     neither conclusion below depended on it.)
+#   * '\r' is normalized rather than assumed absent, and the cost of handling it is a
 #     str.replace. It is defensive, not the primary reason for the byte cap.
 STDERR_TAIL_MAX_BYTES = 4096
 STDERR_TAIL_MAX_LINES = 20
@@ -803,6 +807,47 @@ PROGRESS_SIGNALS = ('out_time', 'size')
 
 _SIGNAL_NOUN = {'out_time': 'output', 'size': 'the output file'}
 
+#: Every `scratch_prefix` a supervised run may use: the mp4/mkv conversion, the segment
+#: join (dev/changelog/947), the re-mux that salvages a killed part and the assembly of those
+#: parts (dev/changelog/955). Spelled once, here, because two reapers match the files - this
+#: module's own stale reap on the next attempt, and recorder.recording_disk_paths() on a
+#: delete - and a prefix only one of them knew about would be reaped by the first and left
+#: on disk forever by the second. supervise_ffmpeg() refuses a prefix outside this tuple.
+SCRATCH_PREFIXES = ('conv', 'concat', 'part', 'join')
+
+
+def scratch_file_paths(scratch_dir: str, prefix: str, key) -> list:
+    """Every progress and stderr scratch file a supervised run under `prefix` could have
+    left for `key` in `scratch_dir`: the per-attempt tokened names found on disk, plus the
+    two untokened names an older build wrote. Listed per key, never as a bare f'{key}*'
+    glob, which would let id 6 match id 64's files."""
+    return (glob.glob(os.path.join(scratch_dir, f'.{prefix}-progress-{key}-*.txt'))
+            + glob.glob(os.path.join(scratch_dir, f'.{prefix}-stderr-{key}-*.log'))
+            + [os.path.join(scratch_dir, f'.{prefix}-progress-{key}.txt'),
+               os.path.join(scratch_dir, f'.{prefix}-stderr-{key}.log')])
+
+
+def concat_list_line(path: str) -> str:
+    """One `file '...'` line for ffmpeg's concat demuxer. The demuxer reads the quoted
+    value with shell-style quoting, so a single quote inside the path has to close the
+    quote, escape the character and reopen it (`'\\''`) - written bare, the path is cut at
+    the quote and the join fails on a file that does not exist. A recording name cannot
+    carry one, but the configured output directory can, and every path in a list starts
+    with it. Measured with ffmpeg 7.1 (dev/changelog/1244)."""
+    return "file '" + path.replace("'", "'\\''") + "'\n"
+
+
+def write_concat_list(paths, *, prefix: str) -> str:
+    """Write a concat-demuxer list naming `paths`, in order, to a fresh temp file and
+    return its path. The caller unlinks it when the run is over. One writer for the join
+    and the part assembly, so the quoting above cannot be right in one and wrong in the
+    other."""
+    fd, list_path = tempfile.mkstemp(prefix=prefix, suffix='.txt')
+    with os.fdopen(fd, 'w') as fh:
+        for p in paths:
+            fh.write(concat_list_line(p))
+    return list_path
+
 
 class SupervisedRun:
     """Outcome of one supervised ffmpeg run.
@@ -896,6 +941,9 @@ def supervise_ffmpeg(cmd, output_path, *, scratch_prefix, scratch_key, interval,
     """
     if progress_signal not in PROGRESS_SIGNALS:
         raise ValueError(f'unknown progress_signal {progress_signal!r}')
+    if scratch_prefix not in SCRATCH_PREFIXES:
+        raise ValueError(f'unknown scratch_prefix {scratch_prefix!r} - add it to SCRATCH_PREFIXES '
+                         'so a delete can reap what it leaves behind')
 
     # Scratch (-progress + stderr tail) sits alongside the output file - both are tiny (KB),
     # and this keeps them inside whatever dir the output lives in rather than a hardcoded
@@ -909,14 +957,7 @@ def supervise_ffmpeg(cmd, output_path, *, scratch_prefix, scratch_key, interval,
     # as stalled at exactly stall_seconds. A shutdown mid-run skips the finally-block
     # unlink, so stale files are routine. See dev/docs/BUGS.md 2026-07-23.
     scratch_dir = os.path.dirname(output_path) or '.'
-    # Both patterns are listed explicitly per key: a bare f'{scratch_key}*' glob would let
-    # id 6 match id 64's scratch files.
-    stale_paths = (
-        glob.glob(os.path.join(scratch_dir, f'.{scratch_prefix}-progress-{scratch_key}-*.txt'))
-        + glob.glob(os.path.join(scratch_dir, f'.{scratch_prefix}-stderr-{scratch_key}-*.log'))
-        + [os.path.join(scratch_dir, f'.{scratch_prefix}-progress-{scratch_key}.txt'),
-           os.path.join(scratch_dir, f'.{scratch_prefix}-stderr-{scratch_key}.log')])
-    for stale in stale_paths:
+    for stale in scratch_file_paths(scratch_dir, scratch_prefix, scratch_key):
         try:
             os.unlink(stale)
         except OSError:

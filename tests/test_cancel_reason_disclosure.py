@@ -48,8 +48,7 @@ class WriterTests(unittest.TestCase):
     """Each path that marks a recording ABORTED stamps its own reason in the same commit."""
 
     def setUp(self):
-        self.t = make_test_app(start_scheduler=False)
-        self.t.app.config['WTF_CSRF_ENABLED'] = False
+        self.t = make_test_app(start_scheduler=False, csrf=False)
 
     def tearDown(self):
         self.t.cleanup()
@@ -60,12 +59,21 @@ class WriterTests(unittest.TestCase):
         self.assertEqual(REC_STATUS_ABORTED, rec.status, 'setup: expected the ABORTED path')
         return rec.cancel_reason
 
-    def test_cancel_while_scheduled(self):
-        rec = seed.make_recording(status=REC_STATUS_SCHEDULED, name='not yet')
-        db.session.commit()
-        resp = self.t.client.post(f'/recordings/{rec.id}/cancel')
-        self.assertEqual(302, resp.status_code)
-        self.assertEqual(CANCEL_BEFORE_START, self._reason(rec.id))
+    def test_cancel_while_scheduled_deletes_the_row_on_both_routes(self):
+        """A SCHEDULED recording captured nothing, so cancelling it deletes the row
+        (dev/changelog/814) - on the form route as well as the JSON one. The form route
+        used to mark it ABORTED with CANCEL_BEFORE_START instead, so one action had two
+        outcomes depending on the endpoint reached (dev/changelog/1247). CANCEL_BEFORE_START
+        stays in the vocabulary for the rows written before that."""
+        for route in ('cancel', 'cancel-json'):
+            rec = seed.make_recording(status=REC_STATUS_SCHEDULED, name='not yet')
+            db.session.commit()
+            rid = rec.id
+            resp = self.t.client.post(f'/recordings/{rid}/{route}')
+            self.assertIn(resp.status_code, (200, 302), route)
+            db.session.expire_all()
+            self.assertIsNone(db.session.get(Recording, rid),
+                              f'{route} left the SCHEDULED row behind')
 
     def test_a_group_change_cancels_its_schedule(self):
         """The one cancel with no person behind it, and the reason the column exists."""
@@ -131,8 +139,7 @@ class WriterCoverageTests(unittest.TestCase):
 
 class RetryClearsReasonTests(unittest.TestCase):
     def setUp(self):
-        self.t = make_test_app(start_scheduler=False)
-        self.t.app.config['WTF_CSRF_ENABLED'] = False
+        self.t = make_test_app(start_scheduler=False, csrf=False)
 
     def tearDown(self):
         self.t.cleanup()

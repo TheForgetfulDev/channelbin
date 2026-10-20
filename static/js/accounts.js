@@ -30,9 +30,6 @@
 (() => {
   'use strict';
 
-  // One spelling of 960 in this file, matching the one in style.css (the pattern
-  // channel-search.js and dashboard.js already follow).
-  const isPhone = () => window.matchMedia('(max-width: 960px)').matches;
   const reload = () => window.location.reload();
 
   // ── Row navigation (§3.9) ────────────────────────────────────────────────
@@ -93,34 +90,11 @@
     run(item.dataset.act, item.closest('.arow'));
   });
 
-  // ── The phone's bottom sheet (§17.5 item 2) ──────────────────────────────
-  function sheetItems(menu) {
-    return Array.from(menu.children).map((el) => {
-      if (el.classList.contains('sep')) return '<div class="sheet-sep"></div>';
-      const label = escHtml(el.textContent.trim());
-      if (el.tagName === 'A') {
-        return `<a class="sheet-act" href="${escHtml(el.getAttribute('href'))}">${label}</a>`;
-      }
-      return `<button class="sheet-act${el.classList.contains('danger') ? ' danger' : ''}" ` +
-        `data-act="${escHtml(el.dataset.act || '')}"${el.disabled ? ' disabled' : ''}>${label}</button>`;
-    }).join('');
-  }
-
+  // ── The phone's bottom sheet (§17.5 item 2) - util.js's openMenuSheet ────────
   function openRowSheet(row) {
     const menu = row.querySelector('.menu');
     if (!menu) return;
-    const body = document.createElement('div');
-    body.className = 'acct-sheet';
-    body.innerHTML = sheetItems(menu);
-    const sheet = buildModal({ title: row.dataset.name, body });
-    body.addEventListener('click', (e) => {
-      const btn = e.target.closest('button[data-act]');
-      if (!btn || btn.disabled) return;
-      // Close first: the sheet's markup goes with it, and the action then runs against a
-      // document holding exactly one copy of everything.
-      sheet.closeModal();
-      run(btn.dataset.act, row);
-    });
+    openMenuSheet(menu, { title: row.dataset.name, onAct: (act) => run(act, row) });
   }
 
   document.addEventListener('click', (e) => {

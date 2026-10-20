@@ -46,16 +46,7 @@
 
   const $ = (sel, root = document) => root.querySelector(sel);
 
-  function readState() {
-    const el = $('#acct-state');
-    if (!el) return {};
-    try {
-      return JSON.parse(el.textContent);
-    } catch (err) {
-      console.warn('The account page state blob did not parse; keeping the last one.', err);
-      return {};
-    }
-  }
+  const readState = () => readBootJson('acct-state', {});
   Object.assign(A, readState());
 
   // ── Formatting ───────────────────────────────────────────────────────────
@@ -67,7 +58,7 @@
     return d ? fmtDateTz(d, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })
       : 'never';
   };
-  const fmtNum = (n) => (n === null || n === undefined ? '--' : Number(n).toLocaleString('en-US'));
+  const fmtNum = (n) => (n === null || n === undefined ? '--' : nf(n));
 
   // ── Action feedback ──────────────────────────────────────────────────────
   const errBox = $('#acct-action-error');
@@ -99,21 +90,23 @@
   let logs = A.logs || [];
   let expanded = false;
 
+  // Keyed on the server's own spellings (util.js statusVocab), never on a literal.
+  const SYNC_LOG = statusVocab('SYNC_LOG');
   const LOG_BADGE = {
-    SUCCESS: ['b-done', 'Success'],
-    PARTIAL: ['b-warn', 'Partial'],
-    ERROR: ['b-fail', 'Error'],
-    CANCELLED: ['b-abort', 'Cancelled'],
+    [SYNC_LOG.SUCCESS]: ['b-done', 'Success'],
+    [SYNC_LOG.PARTIAL]: ['b-warn', 'Partial'],
+    [SYNC_LOG.ERROR]: ['b-fail', 'Error'],
+    [SYNC_LOG.CANCELLED]: ['b-abort', 'Cancelled'],
     // A scheduled sync that never ran (app/accounts.py::record_skipped_sync). Neutral, not
     // an error badge: nothing failed, the occurrence yielded to a recording or to heavier
     // database work and the reason is on the row (dev/changelog/928).
-    SKIPPED: ['b-paused', 'Skipped'],
+    [SYNC_LOG.SKIPPED]: ['b-paused', 'Skipped'],
   };
   function logBadge(status) {
     // b-running, not b-live: a sync in progress is not an alarm (dev/changelog/816). A
     // running sync's row says IN_PROGRESS (app/accounts.py opens it that way); a NULL is
     // read the same.
-    if (!status || status === 'IN_PROGRESS') return '<span class="badge b-running"><span class="pulse"></span>Running</span>';
+    if (!status || status === SYNC_LOG.IN_PROGRESS) return '<span class="badge b-running"><span class="pulse"></span>Running</span>';
     const hit = LOG_BADGE[status];
     // Every state is named; the fallthrough logs and renders the raw value rather than
     // quietly becoming the home for the next status anybody adds.
@@ -126,7 +119,7 @@
 
   function historyRow(log, maxDuration) {
     const secs = log.duration_seconds;
-    const barClass = log.status === 'ERROR' ? ' err' : (log.status === 'PARTIAL' ? ' part' : '');
+    const barClass = log.status === SYNC_LOG.ERROR ? ' err' : (log.status === SYNC_LOG.PARTIAL ? ' part' : '');
     const width = secs === null || !maxDuration
       ? 0 : Math.max(2, Math.round((secs / maxDuration) * 90));
     const duration = secs === null
@@ -500,16 +493,15 @@
   // "Another account's guide" (DESIGN-epg-sources.md §3): a subscription to a source some
   // other account owns and refreshes. Each option says what it would do here today, which
   // is what makes the choice between two sources a decision rather than a guess.
-  const fmtN = (v) => Number(v).toLocaleString('en-US');
 
   function borrowNote(s) {
     if (s.covers === null) {
       return 'No successful refresh yet, so which of this account\'s channels it covers is not known.';
     }
     if (!s.covers) return 'Its last refresh has no listings for any channel on this account.';
-    const out = [`Covers ${fmtN(s.covers)} of this account's channels.`];
-    if (s.fills) out.push(`${fmtN(s.fills)} with no guide now would get one.`);
-    if (s.switches) out.push(`${fmtN(s.switches)} would switch to it from a source listing one program all day.`);
+    const out = [`Covers ${nf(s.covers)} of this account's channels.`];
+    if (s.fills) out.push(`${nf(s.fills)} with no guide now would get one.`);
+    if (s.switches) out.push(`${nf(s.switches)} would switch to it from a source listing one program all day.`);
     if (!s.fills && !s.switches) out.push('Every one of them keeps the guide it has now.');
     return out.join(' ');
   }
@@ -572,7 +564,7 @@
   function confirmSourceRemoval(el, { title, verb, url, what }) {
     const n = Number(el.dataset.activeHere || 0);
     let cost = n
-      ? `${n.toLocaleString('en-US')} channel${n === 1 ? ' on this account gets its' : 's on this account get their'} ` +
+      ? `${nf(n)} channel${n === 1 ? ' on this account gets its' : 's on this account get their'} ` +
         'guide from it now. Each switches to the next source that covers it, or has no guide.'
       : 'No channel on this account gets its guide from it right now.';
     if (el.dataset.readers && verb === 'Delete source') {
@@ -665,17 +657,15 @@
     })),
   };
 
-  // The sticky bar's overflow is a SHEET, not a popover: a control pinned to the bottom of
-  // the viewport would have to open its menu upward over itself (§17.5 item 2). Its markup
-  // is built fresh each time and dropped on close, so a closed sheet can never leave a
-  // second, invisible copy of "Sync now" in the document (§17.6).
+  // The sticky bar's overflow is a SHEET, not a popover (§17.5 item 2) - util.js's
+  // openMenuSheet, built from an item list because this bar has no menu to copy.
   function openPageActionSheet() {
     const items = [
       { act: 'block', label: 'Block account use' },
       { act: 'settings', label: 'Edit settings' },
       { act: 'sections', label: 'Customize sections' },
       { sep: true },
-      { act: 'force-epg', label: 'Force EPG resync', disabled: A.status === 'SYNCING' },
+      { act: 'force-epg', label: 'Force EPG resync', disabled: A.status === statusVocab('ACCOUNT_STATUS').SYNCING },
       { href: A.browseUrl, label: 'Browse channels' },
     ];
     if (A.xtreamDebug && A.accountType === 'xtream') {
@@ -684,22 +674,7 @@
         { act: 'sync-dump', label: 'Sync from dump' });
     }
     items.push({ sep: true }, { act: 'delete', label: 'Delete account', danger: true });
-
-    const body = document.createElement('div');
-    body.className = 'acct-sheet';
-    body.innerHTML = items.map((i) => {
-      if (i.sep) return '<div class="sheet-sep"></div>';
-      if (i.href) return `<a class="sheet-act" href="${escHtml(i.href)}">${escHtml(i.label)}</a>`;
-      return `<button class="sheet-act${i.danger ? ' danger' : ''}" data-act="${i.act}"` +
-        `${i.disabled ? ' disabled' : ''}>${escHtml(i.label)}</button>`;
-    }).join('');
-    const sheet = buildModal({ title: A.name, body });
-    body.addEventListener('click', (e) => {
-      const btn = e.target.closest('button[data-act]');
-      if (!btn || btn.disabled) return;
-      sheet.closeModal();
-      run(btn.dataset.act);
-    });
+    openMenuSheet(items, { title: A.name, onAct: (act) => run(act) });
   }
 
   function run(act, el) {

@@ -693,7 +693,7 @@ def current_stats(account_ids, cfg):
     guide_groups = db.session.query(func.count(ChannelGroup.id)).filter(
         ChannelGroup.in_guide.is_(True)).scalar() or 0
     own_rows = dict(db.session.query(Channel.account_id, func.count(Channel.id))
-                    .filter(Channel.in_guide.is_(True))
+                    .filter(Channel.in_guide.is_(True))  # guide-flag-read-ok: counts own rows, not scope
                     .group_by(Channel.account_id).all())
     rows_total = guide_groups + sum(own_rows.values())
     fed_groups = dict(

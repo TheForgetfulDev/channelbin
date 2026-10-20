@@ -19,12 +19,13 @@ from werkzeug.security import check_password_hash
 
 from .. import db
 from ..config import load_config
+from ..fmt_utils import iso_or_none
 from ..url_utils import mask_account_urls_in_text
 from ..version import __version__
 from ..database import (
     Account, Recording,
     REC_STATUS_SCHEDULED, REC_STATUS_IN_PROGRESS, REC_STATUS_CONCATENATING,
-    REC_STATUS_ANALYZING, REC_STATUS_CONVERTING,
+    REC_STATUS_ANALYZING, REC_STATUS_CONVERTING, ACCOUNT_STATUS_OK, ACCOUNT_STATUS_ERROR,
 )
 
 log = logging.getLogger(__name__)
@@ -67,7 +68,11 @@ def _recording_summary():
     from one query - the same statuses dashboard.py::_metric_tiles reads, recomputed here
     rather than calling it directly since that function returns HTML-formatted tile strings,
     not JSON. Recording.channel is lazy='joined', so reading its name per capturing row
-    costs no query of its own (tests/test_ha_api.py::CapturingListQueryCountTests)."""
+    costs no query of its own (tests/test_ha_api.py::CapturingListQueryCountTests).
+
+    converting_count is the POST-CAPTURE total - recordings being joined, checked or
+    converted - and the integration names its sensor "Finishing" for it. The key itself is
+    the shipped 1.0.x integration's wire contract and keeps its name (dev/changelog/1247)."""
     recs = Recording.query.filter(
         Recording.status.in_([REC_STATUS_IN_PROGRESS, REC_STATUS_CONVERTING,
                               REC_STATUS_CONCATENATING, REC_STATUS_ANALYZING,
@@ -92,7 +97,7 @@ def _recording_summary():
             'channel': r.channel.name if r.channel else None,
             'account_id': r.channel.account_id if r.channel else None,
             'account': account_names.get(r.channel.account_id) if r.channel else None,
-            'started_at': r.started_at.isoformat() if r.started_at else None,
+            'started_at': iso_or_none(r.started_at),
             'stop_time': r.stop_time.isoformat(),
         } for r in capturing],
         'converting_count': len(converting),
@@ -103,10 +108,6 @@ def _recording_summary():
             'start_time': nxt.start_time.isoformat(),
         } if nxt else None,
     }
-
-
-def _iso(value):
-    return value.isoformat() if value else None
 
 
 def _account_status_summary(cfg):
@@ -129,20 +130,20 @@ def _account_status_summary(cfg):
     limits = connlim.limits_for_accounts(accounts, default_max)
     return {
         'total': len(accounts),
-        'ok_count': sum(1 for a in accounts if a.status == 'OK'),
-        'error_count': sum(1 for a in accounts if a.status == 'ERROR'),
+        'ok_count': sum(1 for a in accounts if a.status == ACCOUNT_STATUS_OK),
+        'error_count': sum(1 for a in accounts if a.status == ACCOUNT_STATUS_ERROR),
         'list': [{
             'id': a.id,
             'name': a.name,
             'type': a.account_type,
             'status': a.status,
-            'last_sync_at': _iso(a.last_sync_at),
-            'next_sync_at': _iso(next_sync.get(a.id)),
+            'last_sync_at': iso_or_none(a.last_sync_at),
+            'next_sync_at': iso_or_none(next_sync.get(a.id)),
             'last_error': mask_account_urls_in_text(a.last_error, a.m3u_url, a.epg_url,
                                                     a.base_url),
             'channel_count': a.channel_count or 0,
             'hidden_channel_count': a.hidden_channel_count or 0,
-            'provider_exp_date': _iso(a.provider_exp_date),
+            'provider_exp_date': iso_or_none(a.provider_exp_date),
             'connections_in_use': in_use.get(a.id, 0),
             'max_connections': limits[a.id],
         } for a in accounts],

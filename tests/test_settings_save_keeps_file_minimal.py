@@ -44,8 +44,7 @@ class _SavingRoutes(ConfigSandbox):
     def setUp(self):
         super().setUp()
         self._write_cfg(self.MINIMAL)
-        self.t = make_test_app()
-        self.t.app.config['WTF_CSRF_ENABLED'] = False
+        self.t = make_test_app(csrf=False)
         self.addCleanup(self.t.cleanup)
         self.client = self.t.app.test_client()
         cfgmod.set_restart_needed(False)

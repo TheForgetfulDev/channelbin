@@ -24,15 +24,15 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import app.recorder as recorder  # noqa: E402
 from app import db  # noqa: E402
 from app.database import SEGMENT_ENDED, RecordingSegment  # noqa: E402
-from tests.test_downtime_accounting import _RestartHarness, _sleeper  # noqa: E402
+from tests.support.watchdog import RestartHarness, sleeper  # noqa: E402
 
 
-class AbandonedSegmentClosedOnFailoverTests(_RestartHarness):
+class AbandonedSegmentClosedOnFailoverTests(RestartHarness):
 
     def test_a_failed_restart_that_fails_over_closes_its_segment_row(self):
         """The headline defect: segment_number=1 is the restart that produced no data and
         was abandoned for failover. Its row must not be left with ended_at still NULL."""
-        self.state.process = _sleeper()
+        self.state.process = sleeper()
         with mock.patch.object(recorder, 'failover_group_member', return_value=True):
             self._run_until_event(SEGMENT_ENDED, stall_timeout=3, restart_delay=2,
                                   produces_data=False)

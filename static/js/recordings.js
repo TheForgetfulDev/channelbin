@@ -24,12 +24,6 @@
 (() => {
   'use strict';
 
-  const readJson = (id) => {
-    const el = document.getElementById(id);
-    if (!el) return null;
-    try { return JSON.parse(el.textContent); } catch (err) { return null; }
-  };
-
   const recSub = () => document.getElementById('rec-sub');
   const recList = () => document.querySelector('.rec-list');
 
@@ -55,7 +49,7 @@
     { key: 'account',  label: 'Account',     width: '110px', off: true },
     { key: 'output',   label: 'Output file', width: 'minmax(140px, 1fr)', off: true },
   ];
-  const savedPrefs = readJson('rec-col-prefs');
+  const savedPrefs = readBootJson('rec-col-prefs');
   const colState = savedPrefs && Array.isArray(savedPrefs.order)
     ? savedPrefs
     : { order: COLUMNS.map(c => c.key), hidden: COLUMNS.filter(c => c.off).map(c => c.key) };
@@ -220,8 +214,8 @@
     saved: {
       chipEl: document.getElementById('saved-filters-chip'),
       menuEl: document.getElementById('saved-filters-menu'),
-      list: (readJson('rec-saved-filters') || {}).list,
-      prefUrl: `/api/user-prefs/${(readJson('rec-saved-filters') || {}).key}`,
+      list: (readBootJson('rec-saved-filters') || {}).list,
+      prefUrl: `/api/user-prefs/${(readBootJson('rec-saved-filters') || {}).key}`,
     },
   });
   // A default saved filter is already on the bar by now, and the bar does not notify

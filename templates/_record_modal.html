@@ -32,7 +32,7 @@
       {# Set only by "Find Another Airing" replace mode (guide.js openModal) #}
       <input type="hidden" name="replace_recording_id" id="modal-replace-id" value="">
       <div class="modal-body">
-        <div id="modal-error" style="display:none; color: var(--bad); margin-bottom: 0.75rem; font-size: 0.875rem;"></div>
+        <div id="modal-error" style="display:none; color: var(--bad); margin-bottom: 0.75rem; font-size: var(--fs-lg);"></div>
         {# The program being scheduled, in full - title, subtitle, airtime, length, channel,
            description and matched tags. Filled by guide.js::progHeadHtml and hidden entirely
            when the target is not a real EPG program (the dashboard's and recording detail's
@@ -110,8 +110,8 @@
       <button type="button" class="modal-close" id="active-rec-close-x" aria-label="Close">&#x2715;</button>
     </div>
     <div class="modal-body">
-      <p id="active-rec-name" style="margin: 0 0 1rem; color: var(--text-muted); font-size: 0.9rem;"></p>
-      <div id="active-rec-error" style="display:none; color: var(--bad); margin-bottom: 0.75rem; font-size: 0.875rem;"></div>
+      <p id="active-rec-name" style="margin: 0 0 1rem; color: var(--text-muted); font-size: var(--fs-lg);"></p>
+      <div id="active-rec-error" style="display:none; color: var(--bad); margin-bottom: 0.75rem; font-size: var(--fs-lg);"></div>
       <div class="form-group">
         <label>End Time <span class="tz-label">{{ display_timezone }}</span></label>
         <input type="datetime-local" id="active-rec-stop" class="form-control">

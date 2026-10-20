@@ -191,8 +191,7 @@
      match the one in channel-search.css. (jsdom implements matchMedia but always
      answers `matches: false`, so the test harness stubs it per width - that is
      what makes the breakpoint drivable in a test at all.) */
-  const MOBILE_MQ = window.matchMedia('(max-width: 960px)');
-  const isMobile = () => MOBILE_MQ.matches;
+  const isMobile = isPhone;  // util.js's one breakpoint; the `change` listener is on its MOBILE_MQ
 
   /* ── Sheets ──────────────────────────────────────────────────────────
      A sheet IS a modal: style.css's own <=960px block turns .modal-panel into a

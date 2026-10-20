@@ -246,8 +246,7 @@ class StartupSweepRetryingCaseTests(_RetryingHarness):
 class ConvertingResumeHoldsTheChainClaimTests(unittest.TestCase):
 
     def setUp(self):
-        self.t = make_test_app(start_scheduler=True)
-        self.t.app.config['WTF_CSRF_ENABLED'] = False
+        self.t = make_test_app(start_scheduler=True, csrf=False)
 
     def tearDown(self):
         self.t.cleanup()

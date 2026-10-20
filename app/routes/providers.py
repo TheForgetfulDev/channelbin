@@ -14,6 +14,7 @@ from ..account_links import (create_provider, delete_provider, hosts_for_account
                              logins_for_accounts, rename_provider, set_account_provider,
                              share_login, unshare_login)
 from ..database import Account, Login, Provider
+from ..fmt_utils import join_labels
 
 providers_bp = Blueprint('providers', __name__)
 
@@ -48,7 +49,11 @@ def providers_section(accounts) -> dict | None:
         return {'providers': [], 'choices': choices}
     on_provider = [a for a in accounts if a.provider_id is not None]
     ids = [a.id for a in on_provider]
-    logins_by_account = logins_for_accounts(ids)
+    # Logins are read for EVERY account, not only the ones on a provider: a share can reach
+    # an account on none (kept through a provider's deletion), and a holder map built from
+    # the members alone would draw that login as unshared and offer it to the card's other
+    # members as if it were the member's own (dev/changelog/1243). One query either way.
+    logins_by_account = logins_for_accounts(a.id for a in accounts)
     hosts_by_account = hosts_for_accounts(ids)
     holders = _holders_by_login(logins_by_account)
     counts = connlim.login_pool_counts(holders)
@@ -154,10 +159,7 @@ def sibling_blocks(account_id: int) -> dict:
 
 def _names(ids) -> str:
     rows = dict(db.session.query(Account.id, Account.name).filter(Account.id.in_(ids)).all())
-    listed = [rows.get(i, f'account {i}') for i in ids]
-    if len(listed) <= 1:
-        return ''.join(listed)
-    return ', '.join(listed[:-1]) + ' and ' + listed[-1]
+    return join_labels(rows.get(i, f'account {i}') for i in ids)
 
 
 def _dropped_sentence(account_name: str, dropped) -> str:

@@ -13,9 +13,8 @@
 
   const $ = (sel, root = document) => root.querySelector(sel);
 
-  const bootEl = $('#maintenance-boot');
-  if (!bootEl) return;
-  const BOOT = JSON.parse(bootEl.textContent);
+  const BOOT = readBootJson('maintenance-boot');
+  if (!BOOT) return;
 
   const toast = (msg, isError) =>
     showToast(msg, { type: isError ? 'error' : 'success', durationMs: 2500 });
@@ -337,10 +336,12 @@
   // per index and is NOT the same as `status`: OK-but-stale reports as healthy on
   // `status` alone, and hiding that is the silence this panel exists to end.
   const indexPill = (ix) => {
+    // vocab-literal-ok: the search index's own status words (app/search_index.py STATUS_*),
+    // not a database.py family.
     if (ix.status === 'BUILDING') return ['warn', 'REBUILDING'];
-    if (ix.status === 'FAILED') return ['bad', 'FAILED'];
+    if (ix.status === 'FAILED') return ['bad', 'FAILED'];  // vocab-literal-ok: search index status
     if (ix.status === 'NEVER_BUILT') return ['warn', 'NEVER BUILT'];
-    if (ix.status === 'OK') return ix.ready ? ['ok', 'READY'] : ['warn', 'STALE'];
+    if (ix.status === 'OK') return ix.ready ? ['ok', 'READY'] : ['warn', 'STALE'];  // vocab-literal-ok: search index status
     return ['warn', ix.status];
   };
 
@@ -443,8 +444,10 @@
   // sends null for each, and a meter at 0% would be a number nothing backs.
   const diskMeterHtml = (d) => {
     if (!d.disk_total || d.disk_free === null || d.disk_free === undefined) return '';
-    const usedPct = Math.round((d.disk_total - d.disk_free) / d.disk_total * 100);
-    const cls = usedPct >= 90 ? 'bad' : usedPct >= 75 ? 'warn' : '';
+    // Judged server-side (routes/system.disk_level), so this meter, the dashboard's Disk
+    // free tile and the readiness row on this same page color by one pair of thresholds.
+    const usedPct = d.disk_used_pct;
+    const cls = d.disk_level === 'ok' ? '' : (d.disk_level || '');
     // `stacked` is load-bearing, not decorative: without it the meter is a flex
     // item beside .disk-head, sized by content, and its percentage fill resolves
     // against zero width. See the rule's comment in maintenance.html.
@@ -458,11 +461,7 @@
     </div>`;
   };
 
-  const diskFreeClass = (d) => {
-    if (!d.disk_total) return '';
-    const usedPct = (d.disk_total - d.disk_free) / d.disk_total * 100;
-    return usedPct >= 90 ? 'bad' : usedPct >= 75 ? 'warn' : 'ok';
-  };
+  const diskFreeClass = (d) => d.disk_level || '';
 
   const loadStorageDetails = () => {
     storageEl.innerHTML = '<div class="mrow"><span class="grow">Loading...</span></div>';
@@ -504,19 +503,11 @@
   // as the same kind of readout Storage is and restacks at 375px for free.
   const toolsEl = $('#tools-content');
 
-  // Where the binary came from, which is the half of the answer a path does not give.
-  // A fourth value, `bundled`, named the imageio-ffmpeg fallback until dev/changelog/911
-  // removed it - the server no longer sends it, and an unknown key already falls through
-  // to no provenance line rather than rendering `undefined`. `configured` names the setting
-  // from the payload rather than a literal, because the two binaries have different keys
-  // and a card that told an operator to edit ffmpeg.path to move ffprobe would be sending
-  // them to the wrong field (dev/changelog/914).
-  const toolSource = (t) => {
-    if (t.source === 'path') return 'found on PATH';
-    if (t.source === 'sibling') return 'found beside the configured ffmpeg';
-    if (t.source === 'configured') return `set in ${t.config_key}`;
-    return '';
-  };
+  // Where the binary came from, which is the half of the answer a path does not give. The
+  // words are the payload's own (toolchain.source_label), shared with the readiness row on
+  // this page, so the two cannot describe one fact differently; an absent label falls
+  // through to no provenance line rather than rendering `undefined`.
+  const toolSource = (t) => t.source_label || '';
 
   // Every row is full-width, so the four read down the card as two labelled pairs
   // (ffmpeg, its path, ffprobe, its path). The default two-column .statlist put the

@@ -43,7 +43,7 @@ from tests.support import make_test_app  # noqa: E402
 from tests.support.seed import (  # noqa: E402
     make_account, make_channel, make_channel_test, make_group, make_recording,
 )
-from tests.test_downtime_accounting import _RestartHarness, _sleeper  # noqa: E402
+from tests.support.watchdog import RestartHarness, sleeper  # noqa: E402
 import app.config as cfgmod  # noqa: E402
 
 
@@ -102,7 +102,7 @@ class StallWindowTests(unittest.TestCase):
         self.assertEqual(stalls_within_window([100.0, 400.0, now], now, 0), [now])
 
 
-class _StallTriggerHarness(_RestartHarness):
+class _StallTriggerHarness(RestartHarness):
     """The real WatchdogThread over a group-backed recording whose restarts all succeed -
     the exact shape none of the three dead-feed triggers catches."""
 
@@ -144,7 +144,7 @@ class _StallTriggerHarness(_RestartHarness):
             calls.append({'reason': reason, 'demote': demote, 'stalls_so_far': stalls})
             return False
 
-        self.state.process = _sleeper()
+        self.state.process = sleeper()
         with mock.patch.object(cfgmod, 'load_config',
                                return_value=self._cfg(stall_timeout, restart_delay)), \
              mock.patch.object(recorder, '_launch_segment',

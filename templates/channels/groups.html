@@ -14,7 +14,7 @@
 
 {% include 'channels/_tabs.html' %}
 
-<p class="text-muted" style="font-size:13px; margin-bottom:1rem;">
+<p class="page-intro" style="margin-bottom:1rem;">
   A <strong>channel group</strong> bundles identical feeds of one channel. Turn on
   <strong>Recording</strong> for the members you would record from and the group can be a single TV
   Guide row: recordings start on the healthiest enabled member and fail over to the next-best one if
@@ -26,7 +26,7 @@
 {% if not group_rows %}
 <div class="empty-state">
   <p>No groups yet.</p>
-  <p class="text-muted" style="font-size:13px;">
+  <p class="page-intro">
     Create one from the <a href="{{ url_for('channels.channel_browser') }}">Browse</a> tab
     (select channels &rarr; &ldquo;&#9939; Group Selected&rdquo;), or with the button above.
   </p>

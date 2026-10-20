@@ -112,7 +112,7 @@
 
   function renderLevelChips() {
     lvChips.innerHTML = LEVELS.map((l) =>
-      `<button class="chip lv${activeLevels.has(l.id) ? ' active' : ''}" type="button"
+      `<button class="chip lv${severityToneClass(l.id)}${activeLevels.has(l.id) ? ' active' : ''}" type="button"
         data-level="${escHtml(l.id)}">${escHtml(l.label)}</button>`).join('');
   }
 

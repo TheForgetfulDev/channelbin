@@ -138,8 +138,7 @@ class SettingsFieldClampTests(ConfigSandbox):
 
     def setUp(self):
         super().setUp()
-        self.t = make_test_app()
-        self.t.app.config['WTF_CSRF_ENABLED'] = False
+        self.t = make_test_app(csrf=False)
         self.client = self.t.client
 
     def tearDown(self):

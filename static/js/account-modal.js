@@ -24,10 +24,10 @@
       switching it does not discard what was typed in the other - a mis-click should not
       cost you a pasted URL.
 
-   Depends on util.js (escHtml, jsonFetch, showToast, buildModal, fieldRow).
+   Depends on util.js (escHtml, jsonFetch, showToast, buildModal, fieldRow). The default
+   color arrives with the account JSON (`default_color`, app/ui_constants.py DEFAULT_COLOR)
+   rather than living here as a copy.
 */
-
-const ACCOUNT_DEFAULT_COLOR = '#58a6ff';
 
 /* The eye pair from the secret_reveal_btn macro (templates/_macros.html). Duplicated as
    markup rather than shared, because that macro is Jinja and this control is built in JS -
@@ -69,7 +69,7 @@ function accountPayload(values) {
     base_url: values.base_url,
     username: values.username,
     password: values.password,
-    color: values.color || ACCOUNT_DEFAULT_COLOR,
+    color: values.color,
     url_normalization: values.url_normalization,
     sync_interval_hours: values.sync_interval_hours,
     max_connections: values.max_connections,
@@ -208,7 +208,7 @@ function renderAccountModal(data, onDone) {
     fieldRow({
       label: 'Color', stack: true,
       meta: 'Identifies this account\'s channels in the TV Guide and the channel browser.',
-      control: colorPickerHtml('acct-', a.color, ACCOUNT_DEFAULT_COLOR, data.preset_colors),
+      control: colorPickerHtml('acct-', a.color, data.default_color, data.preset_colors),
     });
 
   const $ = (sel) => body.querySelector(sel);
@@ -246,7 +246,7 @@ function renderAccountModal(data, onDone) {
   // modal and that page render the identical control and had identical copies of it.
   initLocalReveal(body);
 
-  const readColor = wireColorPicker(body, 'acct-', ACCOUNT_DEFAULT_COLOR);
+  const readColor = wireColorPicker(body, 'acct-', data.default_color);
 
   const read = () => ({
     name: $('#acct-name').value,

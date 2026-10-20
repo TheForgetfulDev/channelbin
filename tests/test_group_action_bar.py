@@ -196,7 +196,7 @@ class ActionBarMarkupTests(unittest.TestCase):
 
     def test_a_stuck_run_offers_force_cancel_and_no_run(self):
         actions, _ = self._actions('running')
-        self.assertIn('Force Cancel', actions)
+        self.assertIn('Force cancel', actions)
         self.assertNotIn('Test now', actions)
 
     def test_an_unknown_status_names_itself_and_offers_no_action(self):

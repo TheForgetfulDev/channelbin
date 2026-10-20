@@ -76,7 +76,7 @@ from . import db, health_bands
 from .channel_groups import guide_scope_channel_ids, guide_scope_group_member_ids
 from .duplicate_streams import effective_health, in_any_group_expr  # noqa: F401 - re-exported: the search's callers read them here
 from .database import (Account, AccountSyncLog, Channel, ChannelGroup,
-                       ChannelGroupMember, EPGEntry, Tag)
+                       ChannelGroupMember, EPGEntry, Tag, SYNC_LOG_IMPORTED, SYNC_LOG_SKIPPED)
 from .search_index import (AIRING_PROBE_MAX_ROWS, SEARCH_INDEX_CHANNELS, SEARCH_INDEX_NAMES,
                            SEARCH_INDEX_PROGRAMS, TRIGRAM_MIN_CHARS,
                            airing_narrowing_channel_ids, airing_probe_count, fts_match_term,
@@ -2267,7 +2267,7 @@ def _value_predicate(dim_key: str, value: str, ctx: 'SearchContext', grain: str 
             # The column, deliberately and for the only reason that licenses reading it bare:
             # this value's whole job is to expose "this channel is its own guide row", which
             # is what the column means and all it means (dev/changelog/751).
-            return Channel.in_guide.is_(True)
+            return Channel.in_guide.is_(True)  # guide-flag-read-ok: the own-row facet itself
         if value == OTHER_GUIDE_VIA_GROUP:
             # Membership of an in-guide group, NOT "in scope but without its own row" - a
             # channel that holds a row AND sits in an in-guide group is honestly both, and
@@ -2467,14 +2467,14 @@ def _standing_reject(key: str, ctx: 'SearchContext', row_preds=(), state=None):
             return db.false()
         gates = _group_row_filters(state, ctx)
         if len(gates) == 1:
-            return and_(Channel.in_guide.is_(False),
+            return and_(Channel.in_guide.is_(False),  # guide-flag-read-ok: the via-group facet is "no own row AND a member"
                         Channel.id.in_(ctx.group_member_channel_ids))
         member_of = (select(ChannelGroupMember.channel_id)
                      .select_from(ChannelGroupMember)
                      .join(ChannelGroup, ChannelGroup.id == ChannelGroupMember.group_id)
                      .where(ChannelGroupMember.channel_id == Channel.id, *gates)
                      .correlate(Channel))
-        return and_(Channel.in_guide.is_(False),
+        return and_(Channel.in_guide.is_(False),  # guide-flag-read-ok: the via-group facet, gated per group
                     Channel.id.in_(ctx.group_member_channel_ids), member_of.exists())
     if key == 'showpast':
         # The `+` is a SQLite no-op prefix, and it is load-bearing. Written as
@@ -3062,7 +3062,7 @@ class SearchContext:
             completed_counts = dict(
                 db.session.query(AccountSyncLog.account_id, func.count(AccountSyncLog.id))
                 .filter(AccountSyncLog.account_id.in_(account_ids),
-                        AccountSyncLog.status.in_(['SUCCESS', 'PARTIAL']))
+                        AccountSyncLog.status.in_(SYNC_LOG_IMPORTED))
                 .group_by(AccountSyncLog.account_id).all())
             earliest_by_account = dict(
                 db.session.query(AccountSyncLog.account_id, func.min(AccountSyncLog.started_at))
@@ -3070,7 +3070,7 @@ class SearchContext:
                 # occurrence never ran, so it is not an account's first sync.
                 .filter(AccountSyncLog.account_id.in_(account_ids),
                         db.or_(AccountSyncLog.status.is_(None),
-                               AccountSyncLog.status != 'SKIPPED'))
+                               AccountSyncLog.status != SYNC_LOG_SKIPPED))
                 .group_by(AccountSyncLog.account_id).all())
             new_cutoff = now - timedelta(days=new_days)
             eligible = set()

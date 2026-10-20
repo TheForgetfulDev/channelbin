@@ -22,9 +22,8 @@
   border-bottom: 1px solid var(--border-soft); }
 .mrow:last-child { border-bottom: none; }
 .mrow .grow { flex: 1; min-width: 180px; font-size: var(--fs-md); color: var(--text-muted); line-height: 1.45; }
-.mrow select { background: var(--bg2); border: 1px solid var(--border); border-radius: var(--radius-sm);
-  color: var(--text); font: inherit; font-size: var(--fs-md); padding: 6px 10px; min-width: 200px; max-width: 340px; }
-.mrow select:focus { outline: none; border-color: var(--accent); }
+/* Border, text color and focus come from style.css's shared text-input recipe. */
+.mrow select { background: var(--bg2); font: inherit; font-size: var(--fs-md); padding: 6px 10px; min-width: 200px; max-width: 340px; }
 /* One markup for both breakpoints: a plain inline group beside the prose on
    desktop, a full-width button strip under it on a phone (see the media query). */
 .mrow .mrow-ctl { display: flex; gap: 8px; flex: none; }
@@ -92,9 +91,11 @@
 .rd-lead-bad  { color: var(--bad); font-weight: 600; }
 .rd-lead-warn { color: var(--warn); font-weight: 600; }
 
-/* One check inside an expanded capability. Fixed and `fr` tracks only: the head
-   and each row are separate grid containers, so a content-sized track would
-   slide every row's columns out of line with its neighbours (CLAUDE.md CSS). */
+/* One check inside an expanded capability. There is no header row above these, so
+   the content-sized `auto` actions track is safe here: CLAUDE.md's fixed-and-`fr` rule
+   is for a header and rows that are separate grid containers, where a per-row track
+   width slides the header's labels off their columns. Adding a `.rd-head` means
+   freezing this track to one length first. */
 .rd-row { display: grid; grid-template-columns: 9rem 1fr auto; gap: 0.2rem 0.7rem;
   align-items: center; padding: 0.5rem 0; border-bottom: 1px solid var(--border-soft); }
 .rd-row:last-child { border-bottom: none; }

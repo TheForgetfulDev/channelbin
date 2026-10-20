@@ -104,7 +104,7 @@ def protection_expr():
     A guide row belonging to a GROUP this channel is a member of does not appear here and
     does not need to: the membership itself already protects the channel.
     """
-    return or_(Channel.in_guide.is_(True), duplicate_streams.in_any_group_expr())
+    return or_(Channel.in_guide.is_(True), duplicate_streams.in_any_group_expr())  # guide-flag-read-ok: own row OR any membership, per the docstring
 
 
 @dataclass(frozen=True)

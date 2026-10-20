@@ -5,6 +5,50 @@ Notable changes to ChannelBin, newest first. This project follows
 release is tagged `v<version>` in git, and the version the app is running is shown in the
 page footer.
 
+## 0.27.0 - 2026-10-20
+
+The Bug Buster release: over ninety backlog items closed, nearly all of them fixes.
+
+**Changed**
+
+- Cancelling a scheduled recording removes it, and both cancel buttons now do the same thing.
+- "Finishing" is the word for everything a recording does after capture ends, and every
+  bitrate says what it was measured from.
+- A cancelled recording whose .ts was kept offers Retry conversion first.
+- Buttons, status colors, switches and filter chips look and read the same on every page, and
+  filter chips read as sentences.
+
+**Fixed**
+
+- Stopping a recording just as it starts a new segment no longer leaves a capture running in
+  the background.
+- Resuming a recording that had already finished no longer holds one of the account's
+  connections until the app restarts.
+- A recording moved off an account you blocked keeps a connection instead of being left
+  without one.
+- Retry conversion can no longer start a second post-processing run on a recording that is
+  already being processed.
+- Time lost while a group recording fails over to another member now counts as downtime, and
+  a restart that captured nothing counts as one failure, not two.
+- Setting the early-failure abort count to 0 turns the check off, as the setting says.
+- When a provider moves to a new host, channels no longer drift back to the old one, a
+  channel stuck on a dead host is repaired, and a group recording that restarts reconnects to
+  the new host.
+- A recording now takes its connection back from a preview on another account that shares
+  the same login.
+- A login whose password contains characters such as `?` no longer breaks every stream URL.
+- A multi-segment recording can be joined when the output folder's path contains an
+  apostrophe.
+- Every page that warns about a nearly full disk uses the same threshold.
+- Removing duplicate channels from a health check recalculates their health scores.
+- A restart after a conversion has finished completes the recording instead of marking it
+  failed.
+- The Dashboard's joining and analyzing rows show their progress instead of a stale capture
+  clock, and a recording waiting for a connection reads Waiting on the channel page too.
+- A recording's format details describe the converted file, and a stream reporting a 90000/1
+  timebase is no longer shown as 90000 fps.
+- A failed move after recording has its own entry in the event log.
+
 ## 0.26.0 - 2026-10-20
 
 **Added**

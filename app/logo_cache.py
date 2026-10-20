@@ -69,7 +69,7 @@ def _eligible_channel_ids_query():
     channel group."""
     member_ids = db.session.query(ChannelGroupMember.channel_id).distinct()
     return Channel.query.filter(
-        db.or_(Channel.in_guide.is_(True), Channel.id.in_(member_ids)))
+        db.or_(Channel.in_guide.is_(True), Channel.id.in_(member_ids)))  # guide-flag-read-ok: own row OR any membership, wider than guide scope on purpose
 
 
 def _channels_needing_fetch(limit: int):

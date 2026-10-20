@@ -12,7 +12,7 @@ growth (last_size starts at -1), so the stall clock only began on the second pol
 another full stall_timeout to reach the identical conclusion. 17 of the 24 zero-byte segment
 rows in the whole database sit at 21.1-21.2s because of it.
 
-The production shape matters here and the pre-existing _RestartHarness deliberately does not
+The production shape matters here and the pre-existing RestartHarness deliberately does not
 have it: its non-producing stub leaves the OLD, already-killed process in state.process, so
 the watchdog's proc_exited fast path (dev/changelog/431) fires on the next poll and hides the
 delay. In production the relaunched ffmpeg is alive and stuck on connect. _LiveRestartHarness
@@ -42,12 +42,11 @@ from app.database import (  # noqa: E402
 from app.watchdog import WatchdogThread  # noqa: E402
 from tests.support import seed  # noqa: E402
 from tests.support.app import make_test_app  # noqa: E402
-from tests.test_downtime_accounting import _RestartHarness  # noqa: E402
-from tests.test_watchdog_process_exit import _sleeper  # noqa: E402
+from tests.support.watchdog import RestartHarness, sleeper  # noqa: E402
 
 
-class _LiveRestartHarness(_RestartHarness):
-    """_RestartHarness with the one production detail it omits: a restart that produces no
+class _LiveRestartHarness(RestartHarness):
+    """RestartHarness with the one production detail it omits: a restart that produces no
     data leaves a LIVE process behind, the way a real ffmpeg stuck on connect does."""
 
     def setUp(self):
@@ -62,7 +61,7 @@ class _LiveRestartHarness(_RestartHarness):
         super().tearDown()
 
     def _live(self):
-        proc = _sleeper()
+        proc = sleeper()
         self._spawned.append(proc)
         return proc
 

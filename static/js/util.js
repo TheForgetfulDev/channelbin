@@ -49,6 +49,39 @@ function nf(n) {
   return Number(n || 0).toLocaleString();
 }
 
+// THE mobile breakpoint, as JS sees it. It must stay equal to the `@media (max-width: 960px)`
+// query in style.css and guide.css - CSS decides what a surface LOOKS like and this decides
+// what it is BUILT from, and the two disagreeing at two widths is where landscape phones fell
+// through before dev/changelog/1094. One matchMedia object, so a page that listens for the
+// breakpoint changing (`MOBILE_MQ.addEventListener('change', ...)`) listens on the same one
+// every other page reads; tests/test_static_invariants.py::SingleMobileBreakpointTests holds
+// the number. `var`, deliberately: a page script reads this by name, and only a global-object
+// binding survives every way a script can be loaded - a `const` evaluated through
+// window.eval (how the jsdom harnesses load this file) stays inside that eval. A document
+// with no matchMedia at all (jsdom's default) gets a query that never matches rather than a
+// TypeError that stops every page script after this line.
+var MOBILE_MQ = window.matchMedia  // eslint-disable-line no-var
+  ? window.matchMedia('(max-width: 960px)')
+  : { media: '(max-width: 960px)', matches: false, addEventListener() {}, removeEventListener() {} };
+function isPhone() {
+  return MOBILE_MQ.matches;
+}
+
+// A page's boot block: `<script type="application/json" id="...">` rendered by the server,
+// read once. `fallback` is what a missing or unparseable block answers with (null, or `{}`
+// for a page that spreads it); a block that is present but will not parse is said out loud,
+// because a page silently running on defaults is the state that reads as "nothing happened".
+function readBootJson(id, fallback = null) {
+  const el = document.getElementById(id);
+  if (!el) return fallback;
+  try {
+    return JSON.parse(el.textContent);
+  } catch (err) {
+    console.warn(`The #${id} boot block did not parse; using the fallback.`, err);
+    return fallback;
+  }
+}
+
 // withSeconds=true (default) is for live tickers (elapsed/remaining/downtime) - every
 // current call site is one of those, so seconds show at every scale, not just under 1h.
 // withSeconds=false is the bare DESIGN.md 9.1 form ('3h 1m' / '2h' / '42m') for
@@ -252,9 +285,45 @@ function recStatusLabel(status) {
 
 // The `.b-*` badge class for a Recording.status, from the same server table as the label.
 // null for a status the table does not name, exactly as recStatusLabel() (dev/changelog/1212).
+// The active-tint class for a severity-keyed .chip (style.css .chip.active.tone-*). One map
+// for both vocabularies in use - log levels (WARNING, CRITICAL) and alert severities (WARN,
+// CRIT) - so the Logs and Notifications pages share one rule instead of each tinting its own
+// chips. INFO is .chip.active's own accent look and gets no class. Returns '' or ' tone-x',
+// ready to append to a class list.
+function severityToneClass(level) {
+  const tone = {
+    DEBUG: 'tone-muted',
+    WARN: 'tone-warn', WARNING: 'tone-warn',
+    ERROR: 'tone-bad', CRIT: 'tone-bad', CRITICAL: 'tone-bad',
+  }[String(level || '').toUpperCase()];
+  return tone ? ` ${tone}` : '';
+}
+
 function recStatusClass(status) {
   const badges = recStatusVocab().badges;
   return Object.prototype.hasOwnProperty.call(badges, status) ? badges[status] : null;
+}
+
+// The status vocabularies app/database.py declares (REC_STATUS_*, ACCOUNT_STATUS_*,
+// SYNC_LOG_*, ...), from base.html's status-vocab meta tag, keyed by family:
+// `statusVocab('ACCOUNT_STATUS').SYNCING`, `statusVocab('SYNC_LOG').PARTIAL`. A script
+// compares against these rather than typing the word, so a renamed status cannot leave a
+// comparison that matches nothing. Memoized like recStatusVocab(); a missing or malformed
+// tag, or an unknown family, yields an empty table, and a comparison against an undefined
+// member is simply false.
+let _statusVocab = null;
+function statusVocab(family) {
+  if (_statusVocab === null) {
+    const meta = document.querySelector('meta[name="status-vocab"]');
+    let parsed = null;
+    try {
+      parsed = meta && meta.content ? JSON.parse(meta.content) : null;
+    } catch (e) {
+      console.error('status-vocab meta is not valid JSON', e);
+    }
+    _statusVocab = (parsed && typeof parsed === 'object') ? parsed : {};
+  }
+  return _statusVocab[family] || {};
 }
 
 // The label a post-processing chain badges as while it is parked waiting for another
@@ -609,23 +678,16 @@ async function swapFromServer(selectors, url = location.href) {
 (() => {
   let pop = null;
   let anchor = null;
-  const show = (el) => {
-    // Authored tips write their line break as "&#10;". Markup from a template or a page
-    // script is parsed as HTML, so that entity is already a real newline by the time it is
-    // read back here - but a tip passed as a Jinja MACRO ARGUMENT is autoescaped to
-    // "&amp;#10;", so the attribute genuinely holds those six characters, and textContent
-    // renders exactly what it is handed (dev/docs/BUGS.md 2026-09-11). Decoded in this one
-    // renderer rather than at 126 call sites; both spellings mean the same newline.
-    const text = (el.getAttribute('data-tip') || '').replace(/&#10;/g, '\n');
-    if (!text) return;
-    if (!pop) {
-      pop = document.createElement('div');
-      pop.className = 'tip-pop';
-      document.body.appendChild(pop);
-    }
-    pop.textContent = text;
-    pop.style.display = 'block';
-    anchor = el;
+  let pointer = null;     // last pointer position, to re-find an anchor the page rebuilt
+  let observer = null;
+  // Authored tips write their line break as "&#10;". Markup from a template or a page
+  // script is parsed as HTML, so that entity is already a real newline by the time it is
+  // read back here - but a tip passed as a Jinja MACRO ARGUMENT is autoescaped to
+  // "&amp;#10;", so the attribute genuinely holds those six characters, and textContent
+  // renders exactly what it is handed (dev/docs/BUGS.md 2026-09-11). Decoded in this one
+  // renderer rather than at 126 call sites; both spellings mean the same newline.
+  const tipText = (el) => (el.getAttribute('data-tip') || '').replace(/&#10;/g, '\n');
+  const place = (el) => {
     const r = el.getBoundingClientRect();
     const pw = pop.offsetWidth, ph = pop.offsetHeight;
     const minTop = minVisibleTop();
@@ -636,15 +698,54 @@ async function swapFromServer(selectors, url = location.href) {
     pop.style.left = `${left}px`;
     pop.style.top = `${top}px`;
   };
+  // The coordinates are computed once at hover time, so a page that rebuilds the DOM
+  // under an open tooltip (the dashboard timeline's 60s tick) would otherwise leave it
+  // floating where its anchor used to be, drifting further on every rebuild until the
+  // mouse moves. Hiding before each rebuild is the wrong fix - the tooltip would vanish
+  // once a minute out from under someone reading it - so the open tooltip follows its
+  // anchor instead: a mutation re-measures a surviving anchor, and when the anchor was
+  // replaced, the node now under the pointer carrying the SAME tip takes over
+  // silently. A different tip (or nothing) under the pointer means the thing being
+  // described is gone, and only then does the tooltip close. Observed only while a
+  // tooltip is open, so an idle page pays nothing.
+  const resync = () => {
+    if (!anchor) return;
+    if (anchor.isConnected) { place(anchor); return; }
+    const under = pointer && typeof document.elementFromPoint === 'function'
+      ? document.elementFromPoint(pointer.x, pointer.y) : null;
+    const el = under && under.closest ? under.closest('[data-tip]') : null;
+    if (el && tipText(el) === pop.textContent) { anchor = el; place(el); return; }
+    hide();
+  };
+  const show = (el) => {
+    const text = tipText(el);
+    if (!text) return;
+    if (!pop) {
+      pop = document.createElement('div');
+      pop.className = 'tip-pop';
+      document.body.appendChild(pop);
+    }
+    pop.textContent = text;
+    pop.style.display = 'block';
+    anchor = el;
+    place(el);
+    if (!observer) observer = new MutationObserver(resync);
+    observer.observe(document.documentElement, { childList: true, subtree: true });
+  };
   const hide = () => {
     if (pop) pop.style.display = 'none';
     anchor = null;
+    if (observer) observer.disconnect();
   };
   document.addEventListener('mouseover', (e) => {
+    pointer = { x: e.clientX, y: e.clientY };
     const el = e.target.closest('[data-tip]');
     if (el && el !== anchor) show(el);
     else if (!el && anchor) hide();
   });
+  // mouseover only fires on an element change, so a pointer resting inside a wide anchor
+  // is known only by where it entered; the rebuilt anchor may not cover that point.
+  document.addEventListener('mousemove', (e) => { pointer = { x: e.clientX, y: e.clientY }; }, { passive: true });
   document.addEventListener('scroll', hide, true);
 })();
 
@@ -916,6 +1017,63 @@ function buildModal({ title = '', body = '', footer = [], dismissable = true, on
   syncScrollLock();
   overlay.closeModal = close;
   return overlay;
+}
+
+// The phone's bottom sheet (DESIGN.md 17.5 item 2): the same actions a row's kebab menu
+// offers, as full-width `.sheet-act` rows in a modal, because a control pinned to the bottom
+// of the viewport would otherwise open its menu upward over itself. `source` is either the
+// `.menu` element whose children are copied - data attributes, `disabled`, `href` and the
+// `danger` class included, so the two surfaces cannot offer different actions - or a list of
+// `{act, label, disabled, danger, href}` / `{sep: true}` items. The markup is built fresh
+// each time and dropped on close, so a closed sheet never leaves a second, invisible copy of
+// an action in the document (17.6). A tap closes the sheet FIRST and then calls
+// `onAct(act, copy, original)` - the action then runs against a document holding exactly
+// one copy of everything; `original` is the menu item the row was copied from (null for a
+// list item), for a handler that needs the element still inside its card. The tap does not
+// bubble, so a page's delegated `[data-act]` handler never sees it and runs nothing twice.
+function openMenuSheet(source, { title = '', onAct } = {}) {
+  const body = document.createElement('div');
+  body.className = 'acct-sheet';
+  const originals = new Map();
+  const addSep = () => body.insertAdjacentHTML('beforeend', '<div class="sheet-sep"></div>');
+  if (source instanceof Element) {
+    Array.from(source.children).forEach((item) => {
+      if (item.classList.contains('sep')) { addSep(); return; }
+      const copy = item.cloneNode(true);
+      copy.className = `sheet-act${item.classList.contains('danger') ? ' danger' : ''}`;
+      copy.removeAttribute('data-menu');
+      body.appendChild(copy);
+      originals.set(copy, item);
+    });
+  } else {
+    (source || []).forEach((i) => {
+      if (i.sep) { addSep(); return; }
+      if (i.href) {
+        const a = document.createElement('a');
+        a.className = 'sheet-act';
+        a.href = i.href;
+        a.textContent = i.label;
+        body.appendChild(a);
+        return;
+      }
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.className = `sheet-act${i.danger ? ' danger' : ''}`;
+      b.dataset.act = i.act;
+      if (i.disabled) b.disabled = true;
+      b.textContent = i.label;
+      body.appendChild(b);
+    });
+  }
+  const sheet = buildModal({ title, body });
+  body.addEventListener('click', (e) => {
+    const btn = e.target.closest('button[data-act]');
+    if (!btn || btn.disabled) return;
+    e.stopPropagation();
+    sheet.closeModal();
+    if (onAct) onAct(btn.dataset.act, btn, originals.get(btn) || null);
+  });
+  return sheet;
 }
 
 // The app's one confirm dialog - never the browser's native confirm() (DESIGN.md 3.12,
@@ -1335,8 +1493,8 @@ document.addEventListener('DOMContentLoaded', () => { initSecretReveal(); initLo
 // here on refresh. Callers layer their own context-only states (DISABLED, TESTING) on top.
 function testStatusLabel(t) {
   if (!t) return 'WAITING';
-  if (t.status === 'COMPLETED') return t.error_detail ? 'WARN' : 'PASS';
-  if (t.status === 'CANCELLED') return 'CANCELLED';
+  if (t.status === statusVocab('TEST_STATUS').COMPLETED) return t.error_detail ? 'WARN' : 'PASS';
+  if (t.status === statusVocab('TEST_STATUS').CANCELLED) return 'CANCELLED';
   return 'FAIL';
 }
 

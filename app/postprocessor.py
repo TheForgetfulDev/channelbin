@@ -14,7 +14,8 @@ from datetime import datetime
 from .db_utils import retry_on_locked
 from .fmt_utils import fmt_bytes as _fmt_bytes, fmt_duration
 from .fs_utils import ensure_dir
-from .proc_utils import iter_stderr_error_lines, supervise_ffmpeg, terminate_or_kill
+from .proc_utils import (iter_stderr_error_lines, supervise_ffmpeg, terminate_or_kill,
+                         write_concat_list)
 from .version import __version__
 
 log = logging.getLogger(__name__)
@@ -31,6 +32,20 @@ _active_conversions: dict = {}
 # mistaken for a crash-and-restart. Guarded by _active_lock.
 _cancel_requested: set = set()
 _active_lock = threading.Lock()
+
+
+def _track_conversion(recording_id: int, proc):
+    """Register a conversion-phase ffmpeg - the encode itself, the re-mux that salvages a
+    killed part, the assembly that joins the parts - so kill_active_conversions() and
+    request_cancel_conversion() can reach it. From every consumer's point of view these
+    ARE the conversion, so they share its registry (CLAUDE.md subprocess-discipline)."""
+    with _active_lock:
+        _active_conversions[recording_id] = proc
+
+
+def _untrack_conversion(recording_id: int):
+    with _active_lock:
+        _active_conversions.pop(recording_id, None)
 
 
 def is_conversion_active(recording_id: int) -> bool:
@@ -151,6 +166,19 @@ def analysis_progress(recording_id: int):
     return out
 
 
+def analysis_progress_parts(prog) -> list:
+    """An analysis pass's progress in words, in order: the pass label with "(n of m)" when
+    there is more than one pass, then the percentage when there is one. One builder for the
+    recordings list and the Dashboard, as concatenator.concat_progress_parts is for the join."""
+    label = prog['pass_label']
+    if prog['of_passes'] > 1:
+        label += f" ({prog['pass_number']} of {prog['of_passes']})"
+    parts = [label]
+    if prog['pct'] is not None:
+        parts.append(f"{prog['pct']:.0f}%")
+    return parts
+
+
 @contextmanager
 def _analysis_pass(recording_id: int, label: str, ts_path: str, plan):
     """Publish one whole-file analysis read for as long as it is running, and yield the hook
@@ -180,16 +208,26 @@ def _analysis_pass(recording_id: int, label: str, ts_path: str, plan):
         _clear_analysis_progress(recording_id)
 
 
-def request_cancel_conversion(recording_id: int) -> bool:
+def request_cancel_conversion(recording_id: int, chain_active: bool = False) -> bool:
     """Ask a live conversion to stop: flag it so the restart loop aborts instead of
     restarting, and kill the current ffmpeg. Returns True if a live conversion was found and
     signalled (the loop will set the terminal status), False if none was live (the caller
-    marks the row aborted itself - there is no loop to do it)."""
+    marks the row aborted itself - there is no loop to do it).
+
+    `chain_active` is the caller's reading of concatenator.is_concat_active(): a chain that
+    owns the recording but has no ffmpeg registered right now is between attempts, and the
+    flag alone is the whole cancel - the loop consumes it before it spawns the next one
+    (dev/changelog/1242). The flag is set under the lock before the registry is read, so a
+    spawn that lands in between is killed rather than missed."""
     with _active_lock:
         proc = _active_conversions.get(recording_id)
-        if proc is None:
+        if proc is None and not chain_active:
             return False
         _cancel_requested.add(recording_id)
+    if proc is None:
+        log.info('Cancel requested for recording %d conversion between attempts - the chain '
+                 'stops before its next one', recording_id)
+        return True
     log.info('Cancel requested for recording %d conversion - killing ffmpeg', recording_id)
     terminate_or_kill(proc, hard=True)
     return True
@@ -1033,8 +1071,6 @@ def join_conversion_parts(parts, output_path, ffmpeg_path, *, scratch_key, inter
     Supervised through proc_utils.supervise_ffmpeg() like every other long ffmpeg in this app
     - watching bytes, because writing bytes is the entire job of a stream copy.
     """
-    import tempfile
-
     if not parts:
         return PartJoinResult(False, 'no_parts',
                               error_msg='No encoded parts to assemble.')
@@ -1069,11 +1105,8 @@ def join_conversion_parts(parts, output_path, ffmpeg_path, *, scratch_key, inter
                       f'{_fmt_bytes(bytes_in)}, only {_fmt_bytes(free_bytes)} free. The '
                       f'encoded parts are kept; free space and retry.')
 
-    fd, list_path = tempfile.mkstemp(prefix='dvr_partjoin_', suffix='.txt')
+    list_path = write_concat_list(parts, prefix='dvr_partjoin_')
     try:
-        with os.fdopen(fd, 'w') as fh:
-            for p in parts:
-                fh.write(f"file '{p}'\n")
         cmd = [ffmpeg_path, '-f', 'concat', '-safe', '0', '-i', list_path,
                '-c', 'copy', '-movflags', '+faststart', '-y', output_path]
         log.info('%s: assembling %d part(s), %s: %s', label, len(parts),
@@ -1251,8 +1284,7 @@ def run_conversion_supervised(app, recording_id, cmd, output_path, *,
     suspending_for = None
 
     def _register(proc):
-        with _active_lock:
-            _active_conversions[recording_id] = proc
+        _track_conversion(recording_id, proc)
 
     def _publish(wall, out_time, size):
         pct = None
@@ -1349,8 +1381,7 @@ def run_conversion_supervised(app, recording_id, cmd, output_path, *,
             suspend_check=_check_collision, on_suspend=_on_suspend, on_resume=_on_resume,
             on_exit=_read_spool, level_tags=True)
     finally:
-        with _active_lock:
-            _active_conversions.pop(recording_id, None)
+        _untrack_conversion(recording_id)
         # A run killed while suspended (a cancel, a shutdown) never reaches _on_resume, so
         # the stamp is cleared here too - the attempt is over either way, and a row left
         # claiming to be waiting outlives everything that could clear it.
@@ -1769,6 +1800,130 @@ def kept_source_path(recording_id):
     return path if path and os.path.exists(path) else None
 
 
+def _phase_cancel_check(recording_id: int):
+    """The post-processing chain's phase-boundary cancel check: a function that answers
+    whether the user has cancelled this recording since the chain started and, when they
+    have, records why the chain stopped on the ABORTED row (dev/changelog/667)."""
+    from . import db
+    from .database import Recording, preserve_cancelled_status
+
+    def _stop_if_cancelled(detail):
+        if not cancelled_meanwhile(recording_id):
+            return False
+
+        @retry_on_locked()
+        def _commit_cancel_note():
+            r = db.session.get(Recording, recording_id)
+            preserve_cancelled_status(r, detail)
+            db.session.commit()
+
+        _commit_cancel_note()
+        log.info('Recording %d cancelled - %s', recording_id, detail)
+        return True
+
+    return _stop_if_cancelled
+
+
+def conversion_finished(recording_id: int) -> bool:
+    """Whether this recording's conversion recorded finishing: its newest CONVERSION_DONE
+    is newer than its newest CONVERSION_STARTED (a Retry conversion writes a new start, so
+    an old DONE never speaks for a conversion that was started again).
+
+    A recorded fact, never the file extension: a CONVERTING row whose output_path names
+    the converted file is one the DONE commit already wrote, and the startup sweep used to
+    read that as "the source .ts is missing" and fail a finished recording
+    (dev/changelog/1247).
+    """
+    from . import db
+    from .database import RecordingEvent, CONVERSION_DONE, CONVERSION_STARTED
+    from sqlalchemy import func
+
+    def _newest(event_type):
+        return db.session.query(func.max(RecordingEvent.id)).filter_by(
+            recording_id=recording_id, event_type=event_type).scalar()
+
+    done = _newest(CONVERSION_DONE)
+    if done is None:
+        return False
+    started = _newest(CONVERSION_STARTED)
+    return started is None or done > started
+
+
+def resume_after_conversion(app, recording_id: int):
+    """Pick a recording back up between its CONVERSION_DONE and its COMPLETED, after a
+    service restart landed there: the source disposition if it was never recorded, then
+    the move (unless a FILE_MOVED is already on the record), the sidecar, the post-script
+    and the COMPLETED write. Nothing here re-runs the conversion.
+
+    What is left to do is decided from the events the chain wrote after the DONE, per
+    CLAUDE.md's "already done is a fact you recorded" rule. Under the live-chain claim like
+    every other launch of the chain, so a Retry during it cannot start a second one.
+    """
+    from . import db
+    from .config import load_config
+    from .concatenator import claim_postprocess, release_postprocess
+    from .database import (
+        Recording, RecordingEvent, add_recording_event,
+        CONVERSION_DONE, DIAGNOSTICS, FILE_MOVED, SOURCE_DELETED, SOURCE_KEPT,
+    )
+
+    running_for = claim_postprocess(recording_id)
+    if running_for is not None:
+        log.warning('Post-processing for recording %d is already in progress (%.0fs) - '
+                    'not resuming it a second time', recording_id, running_for,
+                    extra={'recording_id': recording_id})
+        return
+    try:
+        with app.app_context():
+            cfg = load_config()
+            rec = db.session.get(Recording, recording_id)
+            if rec is None or not rec.output_path:
+                return
+            output_path = rec.output_path
+            done_id = db.session.query(RecordingEvent.id).filter_by(
+                recording_id=recording_id, event_type=CONVERSION_DONE
+            ).order_by(RecordingEvent.id.desc()).limit(1).scalar()
+            after = {
+                e.event_type for e in RecordingEvent.query
+                .filter(RecordingEvent.recording_id == recording_id,
+                        RecordingEvent.id > (done_id or 0))
+            }
+            moved = FILE_MOVED in after
+            log.warning('Recording %d: the service restarted after its conversion finished '
+                        'and before it was marked complete - finishing it now%s',
+                        recording_id, ' (the move is already on the record)' if moved else '')
+
+            @retry_on_locked()
+            def _commit_resume_note():
+                add_recording_event(
+                    recording_id, DIAGNOSTICS,
+                    detail='Picking back up after the conversion finished: the service '
+                           'restarted before this recording was marked complete, so the '
+                           'remaining steps run now without converting it again.',
+                    extra={'kind': 'postprocess_resumed_after_conversion', 'moved': moved})
+                db.session.commit()
+
+            _commit_resume_note()
+
+            if not moved and not ({SOURCE_DELETED, SOURCE_KEPT} & after):
+                # The DONE commit put output_path on the converted file, which the chain
+                # names after its source, so the joined .ts is the sibling with the .ts
+                # extension - and the move, which could have put the output elsewhere,
+                # has not happened. converted_gap_seconds is the DONE commit's record of
+                # the output check, which is what the disposition decides on.
+                ts_path = os.path.splitext(output_path)[0] + '.ts'
+                if ts_path != output_path and os.path.exists(ts_path):
+                    _dispose_of_source(recording_id, ts_path,
+                                       {'lost_seconds': rec.converted_gap_seconds},
+                                       cfg['recording']['post_process'].get('delete_source', True))
+            discard_conversion_parts(output_path)
+            _finish_postprocess(app, recording_id, output_path, cfg,
+                                stop_if_cancelled=_phase_cancel_check(recording_id),
+                                do_move=not moved)
+    finally:
+        release_postprocess(recording_id)
+
+
 def do_postprocess(app, recording_id: int, ts_path: str):
     """Run conversion and/or move after a successful concat.
 
@@ -1787,9 +1942,8 @@ def do_postprocess(app, recording_id: int, ts_path: str):
         POSTCAPTURE_ANALYSIS_STARTED, POSTCAPTURE_ANALYSIS_SKIPPED,
         CONVERSION_STARTED, CONVERSION_RESTARTED, CONVERSION_YIELDED, CONVERSION_RESUMED,
         CONVERSION_DONE, CONVERSION_FAILED, CONVERSION_CANCELLED, CONVERTED_FILE_GAPS,
-        FILE_MOVED, CONCATENATION_DONE, SCRIPT_EXECUTED,
         REC_STATUS_ANALYZING, REC_STATUS_CONVERTING,
-        REC_STATUS_ABORTED, REC_STATUS_FAILED, REC_STATUS_COMPLETED,
+        REC_STATUS_ABORTED, REC_STATUS_FAILED,
         FAILURE_CONVERSION_FAILED, CANCEL_DURING_CONVERSION,
     )
     from . import events as ev
@@ -1806,7 +1960,6 @@ def do_postprocess(app, recording_id: int, ts_path: str):
     with app.app_context():
         cfg = load_config()
         pp = cfg['recording']['post_process']
-        mv = cfg['recording']['move_on_complete']
         # Resolved once, from the same settings the phase branches on below, so every pass
         # reports the same denominator - a plan recomputed per pass could name "1 of 2" and
         # then "1 of 1" on one recording.
@@ -1843,19 +1996,7 @@ def do_postprocess(app, recording_id: int, ts_path: str):
         # writing its own terminal status over the ABORTED row. Every terminal write below
         # is additionally guarded by preserve_cancelled_status, for a cancel that lands
         # after the last boundary check (dev/changelog/667).
-        def _stop_if_cancelled(detail):
-            if not cancelled_meanwhile(recording_id):
-                return False
-
-            @retry_on_locked()
-            def _commit_cancel_note():
-                r = db.session.get(Recording, recording_id)
-                preserve_cancelled_status(r, detail)
-                db.session.commit()
-
-            _commit_cancel_note()
-            log.info('Recording %d cancelled - %s', recording_id, detail)
-            return True
+        _stop_if_cancelled = _phase_cancel_check(recording_id)
 
         # ── Analysis phase ────────────────────────────────────────────────────
         # The row moves off CONCATENATING here, at the top, because the concat is over: its
@@ -2670,24 +2811,15 @@ def do_postprocess(app, recording_id: int, ts_path: str):
             # from the files beside it. `signature` is this run's settings; parts recorded
             # under any other settings are not a checkpoint for this run and are discarded
             # rather than joined into a file with a seam in it.
+            # The re-mux that salvages a killed part and the assembly that joins them are
+            # minutes-long stream copies over multi-gigabyte files: long-lived children that
+            # must be reachable from tracked state, or a Cancel during the assembly sets the
+            # flag and kills nothing and a shutdown orphans the child.
             def _track_child(proc):
-                """Register a conversion-phase ffmpeg that is not the encode itself - the
-                re-mux that salvages a killed part, and the assembly that joins them.
-
-                Both are minutes-long stream copies over multi-gigabyte files, so both are
-                long-lived children and both must be reachable from tracked state: without
-                this, a Cancel during the assembly sets the flag and kills nothing, and a
-                shutdown orphans the child (CLAUDE.md subprocess-discipline). The registry is
-                the conversion's own, because from every consumer's point of view these ARE
-                the conversion - it is what kill_active_conversions() and
-                request_cancel_conversion() already reach for.
-                """
-                with _active_lock:
-                    _active_conversions[recording_id] = proc
+                _track_conversion(recording_id, proc)
 
             def _untrack_child():
-                with _active_lock:
-                    _active_conversions.pop(recording_id, None)
+                _untrack_conversion(recording_id)
 
             signature = parts_signature(_build_cmd(), output_path) if resumable else None
             parts_done = 0
@@ -3381,11 +3513,21 @@ def do_postprocess(app, recording_id: int, ts_path: str):
                             extra={'gaps': [[round(a, 3), round(b, 3)] for a, b in gaps],
                                    'reencoded': bool(reencode)})
 
+                # The recorded_* format columns describe the file the user has - the page
+                # labels them "Output audio" and "Measured on the final output file" - so
+                # they are re-read from the converted file, not left describing the joined
+                # .ts the analysis phase probed before conversion. One header probe, outside
+                # the closure (dev/changelog/1247).
+                output_fields = (_output_format_fields(output_path)
+                                 if output_path != ts_path else {})
+
                 @retry_on_locked()
                 def _commit_conversion_done():
                     r = db.session.get(Recording, recording_id)
                     r.output_path = output_path
                     r.final_file_size = converted_size
+                    for k, v in output_fields.items():
+                        setattr(r, k, v)
                     r.converted_gap_seconds = (
                         round(output_check['lost_seconds'], 3)
                         if output_check and output_check['lost_seconds'] is not None else None)
@@ -3544,173 +3686,8 @@ def do_postprocess(app, recording_id: int, ts_path: str):
                                {'success': False, 'cancelled': True, 'status': REC_STATUS_ABORTED})
                 return
 
-        # ── Move ──────────────────────────────────────────────────────────────
-        if _stop_if_cancelled('Post-processing stopped after the conversion step - the file '
-                              'was not moved and the recording was not marked complete.'):
-            return
-
-        if mv.get('enabled') and mv.get('destination', '').strip():
-            destination = mv['destination'].strip()
-            try:
-                # Not a bare makedirs(exist_ok=True): on a stale mount root mkdir returns
-                # EEXIST and makedirs' own isdir() recheck swallows the ESTALE, so it
-                # re-raises "[Errno 17] File exists" and the FILE_MOVED event below sends
-                # the reader hunting a filename collision that does not exist.
-                ensure_dir(destination)
-                dest_path = collision_safe_dest(destination, current_path)
-                if dest_path != current_path:
-                    shutil.move(current_path, dest_path)
-            except Exception as exc:
-                log.error('Recording "%s" (#%d) move failed: %s', rec_name, recording_id, exc,
-                          extra={'recording_id': recording_id, 'already_alerted': True})
-                # Plain local, not `exc` itself - Python deletes `exc` when the except
-                # block exits, so a closure must not capture it directly.
-                move_error = str(exc)
-
-                @retry_on_locked()
-                def _commit_move_failed():
-                    db.session.add(RecordingEvent(
-                        recording_id=recording_id,
-                        event_type=FILE_MOVED,
-                        detail=f'Move FAILED: {move_error} - file remains at {current_path}',
-                    ))
-                    db.session.commit()
-
-                _commit_move_failed()
-                alerts.create_alert(
-                    'RECORDING_MOVE_FAILED',
-                    f'Move failed: {rec_name}',
-                    body=(f'The recording finished and was converted, but could not be moved '
-                          f'to its destination: {move_error}. The file is still at '
-                          f'{current_path}, so nothing was lost. Nothing retries a move on '
-                          f'its own, so this clears when the recording is post-processed '
-                          f'again or deleted.'),
-                    source='postprocessor',
-                    recording_id=recording_id,
-                )
-            else:
-                # Name the rename when one happened - a file that quietly landed under a
-                # different name than the recording is called is exactly the kind of thing
-                # the user has to be able to explain later.
-                if os.path.basename(dest_path) != os.path.basename(current_path):
-                    move_detail = (f'Moved to {dest_path} - renamed, '
-                                   f'{os.path.basename(current_path)} already existed there')
-                elif dest_path == current_path:
-                    move_detail = f'Already at the destination: {dest_path}'
-                else:
-                    move_detail = f'Moved to {dest_path}'
-
-                # from_path is what teardown reads: once output_path names the destination,
-                # nothing else remembers the folder a kept .ts source and any conversion
-                # scratch were left in (recorder.recording_disk_paths, dev/changelog/1041).
-                moved_from = current_path if dest_path != current_path else None
-
-                @retry_on_locked()
-                def _commit_moved():
-                    r = db.session.get(Recording, recording_id)
-                    r.output_path = dest_path
-                    add_recording_event(
-                        recording_id, FILE_MOVED, detail=move_detail,
-                        extra={'from_path': moved_from} if moved_from else None)
-                    db.session.commit()
-
-                _commit_moved()
-                # The file is where it belongs now, so an earlier move failure for this
-                # recording is over. This is the only path that can clear it - there is no
-                # move retry, so it takes a fresh post-process run to get here.
-                alerts.dismiss_open_alerts_for_recording(recording_id, 'RECORDING_MOVE_FAILED')
-                log.info('Recording %d: %s', recording_id, move_detail)
-                current_path = dest_path
-
-        # ── Metadata sidecar ──────────────────────────────────────────────────
-        # After the move and before the post-script: collision_safe_dest() can rename the
-        # video, and the sidecar has to carry the name the file actually ended up with or a
-        # media server reads it onto the wrong item. Running before the script also means a
-        # user's own script finds the sidecar already there.
-        #
-        # Deliberately not inside a try that swallows - write_sidecar() handles its own
-        # failures, logs an event naming the reason, and never raises at a caller that is
-        # one step from marking this recording COMPLETED.
-        from .metadata_sidecar import write_sidecar
-        write_sidecar(recording_id, current_path, cfg)
-
-        # ── Post-completion script ────────────────────────────────────────────
-        ps = cfg['recording'].get('post_script', {})
-        if ps.get('enabled') and ps.get('path', '').strip():
-            script_path = ps['path'].strip()
-            script_timeout = ps.get('timeout_seconds', 300)
-            script_cwd = os.path.dirname(os.path.abspath(script_path)) or None
-            try:
-                script_result = subprocess.run(
-                    [script_path],
-                    cwd=script_cwd,
-                    capture_output=True,
-                    timeout=script_timeout,
-                )
-                if script_result.returncode == 0:
-                    stdout = (script_result.stdout.decode(errors='replace') or '').strip()
-                    detail = f'Script succeeded: {script_path}'
-                    if stdout:
-                        detail += f' - {stdout[:200]}'
-                else:
-                    stderr = script_result.stderr.decode(errors='replace').strip()[-400:]
-                    detail = f'Script failed (exit {script_result.returncode}): {script_path} - {stderr}'
-                log.info('Recording %d post-script result: %s', recording_id, detail[:120])
-            except subprocess.TimeoutExpired:
-                detail = f'Script timed out after {script_timeout}s: {script_path}'
-                log.error('Recording "%s" (#%d) %s', rec_name, recording_id, detail,
-                          extra={'recording_id': recording_id})
-            except Exception as exc:
-                detail = f'Script error: {script_path} - {exc}'
-                log.error('Recording "%s" (#%d) %s', rec_name, recording_id, detail,
-                          extra={'recording_id': recording_id})
-
-            @retry_on_locked()
-            def _commit_script_event():
-                db.session.add(RecordingEvent(
-                    recording_id=recording_id,
-                    event_type=SCRIPT_EXECUTED,
-                    detail=detail,
-                ))
-                db.session.commit()
-
-            _commit_script_event()
-
-        # ── Complete ──────────────────────────────────────────────────────────
-        @retry_on_locked()
-        def _commit_completed():
-            r = db.session.get(Recording, recording_id)
-            if preserve_cancelled_status(
-                    r, 'Post-processing finished after the recording was cancelled - status '
-                       'left ABORTED rather than COMPLETED.'):
-                db.session.commit()
-                return None
-            r.status = REC_STATUS_COMPLETED
-            r.completed_at = datetime.utcnow()
-            if not r.output_path:
-                r.output_path = current_path
-            db.session.commit()
-            return r.output_path, r.final_file_size
-
-        completed = _commit_completed()
-        if completed is None:
-            log.info('Recording %d was cancelled while post-processing ran - left ABORTED', recording_id)
-            return
-        final_output_path, final_size = completed
-
-        # Normally a no-op: the concat step already emitted this recording's capture-phase
-        # observation. Kept as the backstop for a row whose concat ran before changelog 279
-        # shipped and is only now being retried through here.
-        from .health_score import apply_capture_phase_health_observation
-        apply_capture_phase_health_observation(app, recording_id)
-
-        ev.publish(recording_id, CONCATENATION_DONE, {
-            'success': True,
-            'output_path': final_output_path,
-            'final_size': final_size,
-            'status': REC_STATUS_COMPLETED,
-        })
-        log.info('Recording %d post-processing complete: %s', recording_id, final_output_path)
+        _finish_postprocess(app, recording_id, current_path, cfg,
+                            stop_if_cancelled=_stop_if_cancelled)
 
 
 def _joined_segment_count(recording_id):
@@ -4171,8 +4148,12 @@ def _detect_near_empty_segments(recording_id):
         if r is not None:
             r.near_empty_segment_count = flagged_count
             r.near_empty_seconds = flagged_seconds
+        # Bytes per second, named as such: the ratio test is unit-free, but a reader took
+        # the old key `avg_bitrate_bps` at its word and saw 612 kbps on a 4,636 kbps
+        # recording. Rows written under the old key really do hold bytes and are left as
+        # they are (dev/changelog/1247).
         add_recording_event(recording_id, DIAGNOSTICS, detail=f'Near-empty segment scan: {summary}',
-                             extra={'kind': 'near_empty_scan', 'avg_bitrate_bps': round(avg_bps),
+                             extra={'kind': 'near_empty_scan', 'avg_bytes_per_sec': round(avg_bps),
                                     'threshold_ratio': ratio_threshold,
                                     'flagged_segments': sorted(flagged_numbers)})
         db.session.commit()
@@ -4185,8 +4166,10 @@ def _format_profile_summary(fields):
     dict. Pure; every column it reads is nullable and an unknown one is omitted rather than
     rendered as a guess, so a probe that returned only a codec still says something true.
 
-    Says "output format" on purpose: these columns describe the final/converted file, which
-    a re-encode can make differ from the original capture (dev/changelog/335).
+    Says "joined file format": the capture health event is written from the joined .ts
+    before conversion. The columns themselves are re-read from the converted file once a
+    conversion finishes (_output_format_fields), so the page describes the output while
+    this event stays an honest record of what was joined (dev/changelog/1247).
     """
     parts = []
     if fields.get('recorded_video_codec'):
@@ -4205,7 +4188,64 @@ def _format_profile_summary(fields):
         parts.append(f"coded {fields['recorded_coded_resolution']}")
     if fields.get('recorded_bits_per_pixel_frame'):
         parts.append(f"{fields['recorded_bits_per_pixel_frame']} bits/pixel/frame")
-    return f"output format: {' '.join(parts) if parts else 'unknown'}"
+    return f"joined file format: {' '.join(parts) if parts else 'unknown'}"
+
+
+def _format_profile_fields(probe):
+    """The recorded_* columns that describe a file's format, from one parse_ffprobe() dict:
+    picture size and rate, the video and audio codec profile, the overall bitrate and the
+    efficiency stat. Pure and None-safe - a missing input leaves its column NULL.
+
+    One builder for the two files that get described: the joined .ts in the analysis phase
+    and the converted file once a conversion finishes. The frame count, content duration
+    and frame percentage are deliberately not here - they measure the capture and stay
+    with the joined file (dev/changelog/1247).
+    """
+    fields = {
+        'recorded_resolution':         probe.get('resolution'),
+        'recorded_fps':                probe.get('fps'),
+        'recorded_audio_codec':        probe.get('audio_codec'),
+        'recorded_audio_channels':     probe.get('audio_channels'),
+        'recorded_video_codec':        probe.get('video_codec'),
+        'recorded_pix_fmt':            probe.get('pix_fmt'),
+        'recorded_bit_depth':          probe.get('bit_depth'),
+        'recorded_chroma_subsampling': probe.get('chroma_subsampling'),
+        'recorded_interlaced':         probe.get('interlaced'),
+        'recorded_coded_resolution':   probe.get('coded_resolution'),
+        'recorded_is_vfr':             probe.get('is_vfr'),
+        'recorded_audio_sample_rate':  probe.get('audio_sample_rate'),
+        'recorded_audio_bitrate_kbps': probe.get('audio_bitrate_kbps'),
+        'recorded_audio_language':     probe.get('audio_language'),
+    }
+    bitrate_bps = probe.get('bitrate_bps')
+    if bitrate_bps:
+        fields['recorded_bitrate_kbps'] = bitrate_bps / 1000
+    # Efficiency stat, not a better/worse verdict (DESIGN-stream-quality-profile.md §5).
+    # Segments get no bpp: the watchdog probes a file that is still growing, where the
+    # format-level bit_rate is unreliable.
+    from .probe import bits_per_pixel_frame
+    fields['recorded_bits_per_pixel_frame'] = bits_per_pixel_frame(
+        bitrate_bps, probe.get('vid_width'), probe.get('vid_height'), probe.get('fps'))
+    return fields
+
+
+def _output_format_fields(output_path):
+    """The format profile of a finished conversion's output, for the recording row - or {}
+    when the file could not be probed, which leaves the joined file's values standing
+    rather than blanking them. A header-only probe: the format section carries the
+    bitrate, and nothing here needs a packet count."""
+    from .probe import parse_ffprobe
+    try:
+        probe = parse_ffprobe(output_path, count_packets=False)
+    except Exception as exc:
+        log.warning('Could not probe the converted file %s for its format profile: %s',
+                    output_path, exc)
+        return {}
+    if not probe:
+        log.warning('ffprobe returned no data for the converted file %s - the recording '
+                    'keeps the joined file\'s format profile', output_path)
+        return {}
+    return _format_profile_fields(probe)
 
 
 def _gather_recording_health(recording_id, ts_path, rec, cfg, analysis_plan=None):
@@ -4254,40 +4294,15 @@ def _gather_recording_health(recording_id, ts_path, rec, cfg, analysis_plan=None
             }
 
         fields = {
-            'recorded_resolution':       probe.get('resolution'),
-            'recorded_fps':              probe.get('fps'),
             'recorded_frame_count':      probe.get('frame_count'),
             'recorded_duration_seconds': probe.get('duration'),
-            'recorded_audio_codec':      probe.get('audio_codec'),
-            'recorded_audio_channels':   probe.get('audio_channels'),
             'health_gathered_at':        datetime.utcnow(),
-
-            # Format profile of the FINAL/converted output file - a re-encode changes codec
-            # and pixel format, so this is not necessarily what the provider sent;
-            # RecordingSegment.probe_* holds the original capture (dev/changelog/335).
-            'recorded_video_codec':        probe.get('video_codec'),
-            'recorded_pix_fmt':            probe.get('pix_fmt'),
-            'recorded_bit_depth':          probe.get('bit_depth'),
-            'recorded_chroma_subsampling': probe.get('chroma_subsampling'),
-            'recorded_interlaced':         probe.get('interlaced'),
-            'recorded_coded_resolution':   probe.get('coded_resolution'),
-            'recorded_is_vfr':             probe.get('is_vfr'),
-            'recorded_audio_sample_rate':  probe.get('audio_sample_rate'),
-            'recorded_audio_bitrate_kbps': probe.get('audio_bitrate_kbps'),
-            'recorded_audio_language':     probe.get('audio_language'),
         }
-
-        bitrate_bps = probe.get('bitrate_bps')
-        if bitrate_bps:
-            fields['recorded_bitrate_kbps'] = bitrate_bps / 1000
-
-        # Efficiency stat, not a better/worse verdict (DESIGN-stream-quality-profile.md §5).
-        # Pure and None-safe, so a missing input leaves the column NULL without disturbing
-        # anything already gathered. Segments get no bpp: the watchdog probes a file that is
-        # still growing, where the format-level bit_rate is unreliable.
-        from .probe import bits_per_pixel_frame
-        fields['recorded_bits_per_pixel_frame'] = bits_per_pixel_frame(
-            bitrate_bps, probe.get('vid_width'), probe.get('vid_height'), probe.get('fps'))
+        # The format profile columns: written here from the joined .ts, and rewritten from
+        # the converted file once a conversion finishes, so that the page's "final output
+        # file" wording is true whichever file the user ends up with. RecordingSegment.probe_*
+        # holds the original capture either way (dev/changelog/335, 1247).
+        fields.update(_format_profile_fields(probe))
 
         # Use adjusted window (start_time/stop_time may have been updated at actual start/stop)
         adjusted_secs = (rec.stop_time - rec.start_time).total_seconds()
@@ -4357,3 +4372,202 @@ def _gather_recording_health(recording_id, ts_path, rec, cfg, analysis_plan=None
             'detail': f'Capture health check failed: {exc}',
             'extra': {'kind': 'capture_health', 'probe_failed': True},
         }
+
+
+
+def _finish_postprocess(app, recording_id: int, current_path: str, cfg: dict, *,
+                        stop_if_cancelled, do_move: bool = True):
+    """The steps after a finished conversion (or after the join, when conversion is off):
+    move-on-complete, the metadata sidecar, the post-script, and the COMPLETED write.
+
+    Its own function because a service restart can land between CONVERSION_DONE and
+    COMPLETED - a multi-GB move across mounts is minutes - and resume_after_conversion()
+    picks the recording back up here rather than re-running a conversion it recorded
+    finishing. do_move=False is that resume saying a FILE_MOVED is already on the record.
+
+    Runs inside the caller's app context. stop_if_cancelled(detail) is the chain's
+    phase-boundary cancel check. Every commit is its own retry_on_locked closure.
+    """
+    from . import db
+    from .database import (
+        Recording, RecordingEvent, add_recording_event, preserve_cancelled_status,
+        FILE_MOVED, FILE_MOVE_FAILED, CONCATENATION_DONE, SCRIPT_EXECUTED, REC_STATUS_COMPLETED,
+    )
+    from . import events as ev
+    from . import alerts
+
+    rec = db.session.get(Recording, recording_id)
+    rec_name = rec.name if rec is not None else f'#{recording_id}'
+    mv = cfg['recording']['move_on_complete']
+    _stop_if_cancelled = stop_if_cancelled
+
+    # ── Move ──────────────────────────────────────────────────────────────
+    if _stop_if_cancelled('Post-processing stopped after the conversion step - the file '
+                          'was not moved and the recording was not marked complete.'):
+        return
+
+    if do_move and mv.get('enabled') and mv.get('destination', '').strip():
+        destination = mv['destination'].strip()
+        try:
+            # Not a bare makedirs(exist_ok=True): on a stale mount root mkdir returns
+            # EEXIST and makedirs' own isdir() recheck swallows the ESTALE, so it
+            # re-raises "[Errno 17] File exists" and the FILE_MOVE_FAILED event below
+            # sends the reader hunting a filename collision that does not exist.
+            ensure_dir(destination)
+            dest_path = collision_safe_dest(destination, current_path)
+            if dest_path != current_path:
+                shutil.move(current_path, dest_path)
+        except Exception as exc:
+            log.error('Recording "%s" (#%d) move failed: %s', rec_name, recording_id, exc,
+                      extra={'recording_id': recording_id, 'already_alerted': True})
+            # Plain local, not `exc` itself - Python deletes `exc` when the except
+            # block exits, so a closure must not capture it directly.
+            move_error = str(exc)
+
+            @retry_on_locked()
+            def _commit_move_failed():
+                # Its own type, never FILE_MOVED with a FAILED prefix: the event log colors
+                # by type, and recorder.recording_disk_paths() reads FILE_MOVED rows for a
+                # from_path this row does not carry (dev/changelog/1247).
+                db.session.add(RecordingEvent(
+                    recording_id=recording_id,
+                    event_type=FILE_MOVE_FAILED,
+                    detail=f'Move failed: {move_error} - file remains at {current_path}',
+                ))
+                db.session.commit()
+
+            _commit_move_failed()
+            alerts.create_alert(
+                'RECORDING_MOVE_FAILED',
+                f'Move failed: {rec_name}',
+                body=(f'The recording finished and was converted, but could not be moved '
+                      f'to its destination: {move_error}. The file is still at '
+                      f'{current_path}, so nothing was lost. Nothing retries a move on '
+                      f'its own, so this clears when the recording is post-processed '
+                      f'again or deleted.'),
+                source='postprocessor',
+                recording_id=recording_id,
+            )
+        else:
+            # Name the rename when one happened - a file that quietly landed under a
+            # different name than the recording is called is exactly the kind of thing
+            # the user has to be able to explain later.
+            if os.path.basename(dest_path) != os.path.basename(current_path):
+                move_detail = (f'Moved to {dest_path} - renamed, '
+                               f'{os.path.basename(current_path)} already existed there')
+            elif dest_path == current_path:
+                move_detail = f'Already at the destination: {dest_path}'
+            else:
+                move_detail = f'Moved to {dest_path}'
+
+            # from_path is what teardown reads: once output_path names the destination,
+            # nothing else remembers the folder a kept .ts source and any conversion
+            # scratch were left in (recorder.recording_disk_paths, dev/changelog/1041).
+            moved_from = current_path if dest_path != current_path else None
+
+            @retry_on_locked()
+            def _commit_moved():
+                r = db.session.get(Recording, recording_id)
+                r.output_path = dest_path
+                add_recording_event(
+                    recording_id, FILE_MOVED, detail=move_detail,
+                    extra={'from_path': moved_from} if moved_from else None)
+                db.session.commit()
+
+            _commit_moved()
+            # The file is where it belongs now, so an earlier move failure for this
+            # recording is over. This is the only path that can clear it - there is no
+            # move retry, so it takes a fresh post-process run to get here.
+            alerts.dismiss_open_alerts_for_recording(recording_id, 'RECORDING_MOVE_FAILED')
+            log.info('Recording %d: %s', recording_id, move_detail)
+            current_path = dest_path
+
+    # ── Metadata sidecar ──────────────────────────────────────────────────
+    # After the move and before the post-script: collision_safe_dest() can rename the
+    # video, and the sidecar has to carry the name the file actually ended up with or a
+    # media server reads it onto the wrong item. Running before the script also means a
+    # user's own script finds the sidecar already there.
+    #
+    # Deliberately not inside a try that swallows - write_sidecar() handles its own
+    # failures, logs an event naming the reason, and never raises at a caller that is
+    # one step from marking this recording COMPLETED.
+    from .metadata_sidecar import write_sidecar
+    write_sidecar(recording_id, current_path, cfg)
+
+    # ── Post-completion script ────────────────────────────────────────────
+    ps = cfg['recording'].get('post_script', {})
+    if ps.get('enabled') and ps.get('path', '').strip():
+        script_path = ps['path'].strip()
+        script_timeout = ps.get('timeout_seconds', 300)
+        script_cwd = os.path.dirname(os.path.abspath(script_path)) or None
+        try:
+            script_result = subprocess.run(
+                [script_path],
+                cwd=script_cwd,
+                capture_output=True,
+                timeout=script_timeout,
+            )
+            if script_result.returncode == 0:
+                stdout = (script_result.stdout.decode(errors='replace') or '').strip()
+                detail = f'Script succeeded: {script_path}'
+                if stdout:
+                    detail += f' - {stdout[:200]}'
+            else:
+                stderr = script_result.stderr.decode(errors='replace').strip()[-400:]
+                detail = f'Script failed (exit {script_result.returncode}): {script_path} - {stderr}'
+            log.info('Recording %d post-script result: %s', recording_id, detail[:120])
+        except subprocess.TimeoutExpired:
+            detail = f'Script timed out after {script_timeout}s: {script_path}'
+            log.error('Recording "%s" (#%d) %s', rec_name, recording_id, detail,
+                      extra={'recording_id': recording_id})
+        except Exception as exc:
+            detail = f'Script error: {script_path} - {exc}'
+            log.error('Recording "%s" (#%d) %s', rec_name, recording_id, detail,
+                      extra={'recording_id': recording_id})
+
+        @retry_on_locked()
+        def _commit_script_event():
+            db.session.add(RecordingEvent(
+                recording_id=recording_id,
+                event_type=SCRIPT_EXECUTED,
+                detail=detail,
+            ))
+            db.session.commit()
+
+        _commit_script_event()
+
+    # ── Complete ──────────────────────────────────────────────────────────
+    @retry_on_locked()
+    def _commit_completed():
+        r = db.session.get(Recording, recording_id)
+        if preserve_cancelled_status(
+                r, 'Post-processing finished after the recording was cancelled - status '
+                   'left ABORTED rather than COMPLETED.'):
+            db.session.commit()
+            return None
+        r.status = REC_STATUS_COMPLETED
+        r.completed_at = datetime.utcnow()
+        if not r.output_path:
+            r.output_path = current_path
+        db.session.commit()
+        return r.output_path, r.final_file_size
+
+    completed = _commit_completed()
+    if completed is None:
+        log.info('Recording %d was cancelled while post-processing ran - left ABORTED', recording_id)
+        return
+    final_output_path, final_size = completed
+
+    # Normally a no-op: the concat step already emitted this recording's capture-phase
+    # observation. Kept as the backstop for a row whose concat ran before changelog 279
+    # shipped and is only now being retried through here.
+    from .health_score import apply_capture_phase_health_observation
+    apply_capture_phase_health_observation(app, recording_id)
+
+    ev.publish(recording_id, CONCATENATION_DONE, {
+        'success': True,
+        'output_path': final_output_path,
+        'final_size': final_size,
+        'status': REC_STATUS_COMPLETED,
+    })
+    log.info('Recording %d post-processing complete: %s', recording_id, final_output_path)

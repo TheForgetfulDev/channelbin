@@ -172,8 +172,7 @@ class _Live(unittest.TestCase):
         shutil.rmtree(cls.tmp, ignore_errors=True)
 
     def setUp(self):
-        self.t = make_test_app()
-        self.t.app.config['WTF_CSRF_ENABLED'] = False
+        self.t = make_test_app(csrf=False)
         self.client = self.t.client
         self.addCleanup(self.t.cleanup)
         # Every test ends its own session; cleanup's leak check then has nothing to report.

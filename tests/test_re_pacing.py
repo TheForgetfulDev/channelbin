@@ -159,15 +159,17 @@ class RecorderPacingTests(unittest.TestCase):
         from app import recorder
         from app.database import RecordingEvent, SEGMENT_STARTED
         state = recorder.RecordingState()
-        state.stop_event.set()   # the watchdog this launch starts exits at once
         state.auto_paced_channel_ids.add(self.channel.id)
         with recorder._lock:
             recorder._active[self.rec.id] = state
         try:
-            argv = self._argv(0)
+            # The launch itself is what is under test, not the watchdog it would start.
+            # A set stop_event is no longer a way to skip the thread: the launch reads it
+            # as a teardown in progress and abandons the segment (dev/changelog/1242).
+            with mock.patch('app.watchdog.WatchdogThread') as thread_cls:
+                thread_cls.return_value.is_alive.return_value = False
+                argv = self._argv(0)
         finally:
-            if state.watchdog is not None:
-                state.watchdog.join(timeout=10)
             recorder._discard_stderr_spool(state.stderr_path, state.stderr_fh)
             state.stderr_path, state.stderr_fh = None, None
             with recorder._lock:

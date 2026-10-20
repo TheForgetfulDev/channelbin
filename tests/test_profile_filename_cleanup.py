@@ -40,8 +40,7 @@ def _cfg(template='{title} GLOBAL', remove=(), replace=()):
 
 class _Case(unittest.TestCase):
     def setUp(self):
-        self.t = make_test_app()
-        self.t.app.config['WTF_CSRF_ENABLED'] = False
+        self.t = make_test_app(csrf=False)
         self.client = self.t.client
         # A fresh database seeds a `live` tag; its pattern set is pinned here so the
         # assertions do not depend on what the seed happens to carry.

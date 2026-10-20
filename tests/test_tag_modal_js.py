@@ -28,7 +28,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MODAL_JS = os.path.join(REPO, 'static', 'js', 'tag-modal.js')
 
-_EXPORTS = 'tagCleanPatterns, tagNormalizeName, tagValidate, tagPayload, TAG_DEFAULT_COLOR'
+_EXPORTS = 'tagCleanPatterns, tagNormalizeName, tagValidate, tagPayload, openTagModal'
 
 _HARNESS = f"""
 const fs = require('fs');
@@ -58,7 +58,7 @@ class LoadsWithoutADomTests(_Base):
     before DOMContentLoaded on the real page."""
 
     def test_the_file_evaluates_outside_a_browser(self):
-        self.assertEqual(self.evaluate('TAG_DEFAULT_COLOR'), '#58a6ff')
+        self.assertEqual(self.evaluate('typeof openTagModal'), 'function')
 
 
 class PatternCleaningTests(_Base):
@@ -158,11 +158,14 @@ class PayloadTests(_Base):
             "tagPayload({name:'live', color:'#f85149', patterns:[' X ', '', 'X', 'Y']})"
         )['patterns'], ['X', 'Y'])
 
-    def test_a_missing_colour_falls_back_to_the_default(self):
-        """Paired with ApiTests::test_a_missing_colour_falls_back_to_the_default - the two
-        defaults have to be the same value or a tag's colour changes on save."""
+    def test_a_missing_colour_is_sent_blank_for_the_server_to_default(self):
+        """The default color has one home, app/ui_constants.py DEFAULT_COLOR: the server
+        fills a blank with it (ApiTests::test_a_missing_colour_falls_back_to_the_default)
+        and hands it to the picker through TAG_CONFIG. The payload carries no copy, so a
+        blank goes to the server as a blank rather than as a second spelling of the
+        default that could drift from the first."""
         self.assertEqual(self.evaluate(
-            "tagPayload({name:'live', color:'', patterns:['X']})")['color'], '#58a6ff')
+            "tagPayload({name:'live', color:'', patterns:['X']})")['color'], '')
 
     def test_the_body_carries_exactly_the_three_stored_fields(self):
         """No id in the body: the row being edited is identified by the URL. Sending one

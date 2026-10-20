@@ -33,13 +33,13 @@
 {# The primary action, enumerated per status. No trailing else that quietly becomes the
    home for the next status somebody adds (CLAUDE.md, "states are enumerated"). #}
 {% macro status_action(st, account) -%}
-  {% if st == 'SYNCING' %}
+  {% if st == ACCOUNT_STATUS.SYNCING %}
   <button class="btn btn-danger btn-sm" data-act="cancel-sync">Cancel sync</button>
-  {% elif st == 'ERROR' %}
+  {% elif st == ACCOUNT_STATUS.ERROR %}
   <button class="btn btn-primary btn-sm" data-act="sync">&#8635; Retry sync</button>
-  {% elif st == 'UNSYNCED' %}
+  {% elif st == ACCOUNT_STATUS.UNSYNCED %}
   <button class="btn btn-primary btn-sm" data-act="sync">Sync for the first time</button>
-  {% elif st == 'OK' %}
+  {% elif st == ACCOUNT_STATUS.OK %}
   <button class="btn btn-primary btn-sm" data-act="sync">Sync now</button>
   {% endif %}
 {%- endmacro %}
@@ -97,7 +97,7 @@
       {{ m.account_block_badge(blocks) }}
     </div>
     <p class="gd-sub-lead">
-      {% if st == 'UNSYNCED' %}
+      {% if st == ACCOUNT_STATUS.UNSYNCED %}
       {{ 'An Xtream' if is_xtream else 'An M3U' }} account that has never been synced. Nothing has
       been imported from it yet, so it contributes no channels to the guide. Use
       {{ 'Sync for the first time' }} to fetch it.
@@ -120,7 +120,7 @@
      before the line telling you when it last ran. Each says what it MEANS, not just that
      it happened (DESIGN.md §17.3). ────────────────────────────────────────── #}
 <div id="acct-notices">
-{% if st == 'ERROR' and account.last_error %}
+{% if st == ACCOUNT_STATUS.ERROR and account.last_error %}
 <div class="notice notice-bad">
   <strong>&#9888; The last sync failed</strong><br>
   {{ account.last_error }}<br>
@@ -174,7 +174,7 @@
   {% endfor %}
 </div>
 {% endfor %}
-{% if not account.sync_enabled and st != 'UNSYNCED' %}
+{% if not account.sync_enabled and st != ACCOUNT_STATUS.UNSYNCED %}
 <div class="notice notice-info">
   <strong>Automatic sync is off for this account</strong><br>
   Its channel list and guide data will not change until you sync it by hand.
@@ -187,15 +187,15 @@
 <div class="gd-actionbar" id="acct-actionbar">
   {{ status_badge(st) }}
   <span class="gd-ab-msg">
-    {% if st == 'SYNCING' %}
+    {% if st == ACCOUNT_STATUS.SYNCING %}
       Syncing now{% if log_rows and log_rows[0].started_at %}, started {{ log_rows[0].started_at | time_ago }}{% endif %}.
       Counts below are from the previous run until it finishes.
-    {% elif st == 'ERROR' %}
+    {% elif st == ACCOUNT_STATUS.ERROR %}
       The last sync failed {{ account.last_sync_at | time_ago if account.last_sync_at else 'at an unrecorded time' }}.
       {% if account.sync_enabled %}The next automatic attempt is {{ next_sync_at | time_until if next_sync_at else 'not scheduled' }}.{% else %}Automatic sync is off, so there is no next attempt.{% endif %}
-    {% elif st == 'UNSYNCED' %}
+    {% elif st == ACCOUNT_STATUS.UNSYNCED %}
       Never synced. Nothing has been imported from this account yet.
-    {% elif st == 'OK' %}
+    {% elif st == ACCOUNT_STATUS.OK %}
       Synced {{ account.last_sync_at | time_ago if account.last_sync_at else 'at an unrecorded time' }},
       {{ '{:,}'.format(account.channel_count or 0) }} channels{% if account.hidden_channel_count %} ({{ '{:,}'.format(account.hidden_channel_count) }} hidden){% endif %} and
       {{ '{:,}'.format(account.epg_entry_count or 0) }} program entries.
@@ -206,7 +206,7 @@
   </span>
   <div class="gd-ab-actions">
     {{ status_action(st, account) }}
-    {% if st != 'SYNCING' %}
+    {% if st != ACCOUNT_STATUS.SYNCING %}
     <button class="btn btn-sm" data-act="force-epg"
             data-tip="Force EPG resync.&#10;Runs a normal sync but imports the guide data even if it looks much smaller than last time. The collapse guard exists to stop a truncated provider feed wiping a good guide; this bypasses it for one run.">Force EPG resync</button>
     {% endif %}
@@ -252,7 +252,7 @@
         <div class="srow"><span class="sk">Provider</span>
           <span class="sv tip-plain" data-tip="Provider.&#10;The accounts on this provider reach the same backend, so they may share a login and count its seats once. Managed on the Accounts page."><a href="{{ url_for('accounts.accounts_list') }}#provider-{{ provider.id }}">{{ provider.name }}</a></span></div>
         {% endif %}
-        {{ m.stat_row('Status', st, 'ok' if st == 'OK' else ('bad' if st == 'ERROR' else 'faint')) }}
+        {{ m.stat_row('Status', st, 'ok' if st == ACCOUNT_STATUS.OK else ('bad' if st == ACCOUNT_STATUS.ERROR else 'faint')) }}
         <div class="srow"><span class="sk">URL normalization</span>
           <span class="sv tip-plain" data-tip="URL normalization.&#10;Rewrites every stream URL into one consistent shape. Only the shape changes - the address and credentials the provider supplied are kept as they are, and a URL with no user/password/id in it is left alone.{% if settings.norm_example %}&#10;Example: {{ settings.norm_example }}{% endif %}">{{ settings.norm_label }}{% if settings.norm_inherited %} <span class="text-faint sv-inherit">(global)</span>{% endif %}</span></div>
         {{ m.stat_row('Automatic sync', 'On' if account.sync_enabled else 'Off', 'ok' if account.sync_enabled else 'faint') }}
@@ -552,6 +552,7 @@
             <td data-label="Guide from here" class="num">{% if s.active_here %}{{ '{:,}'.format(s.active_here) }}{% else %}<span class="text-faint">0</span>{% endif %}</td>
             <td class="num">
               <span class="menu-wrap">
+                {%- set readers_attr %}{% for r in s.readers %}{{ r.name }} ({{ '{:,}'.format(r.guided) }} channel{{ '' if r.guided == 1 else 's' }} guided from here){{ ', ' if not loop.last }}{% endfor %}{% endset %}
                 <button class="btn btn-sm btn-icon" data-menu aria-label="Actions for {{ s.name }}">&#8943;</button>
                 <div class="menu">
                   {% if s.subscribed %}
@@ -571,12 +572,12 @@
                   <div class="sep"></div>
                   <button class="menu-item danger" data-act="source-delete" data-source-id="{{ s.id }}"
                           data-source-name="{{ s.name }}" data-active-here="{{ s.active_here }}"
-                          data-readers="{% for r in s.readers %}{{ r.name }} ({{ '{:,}'.format(r.guided) }} channel{{ '' if r.guided == 1 else 's' }} guided from here){{ ', ' if not loop.last }}{% endfor %}">Delete</button>
+                          data-readers="{{ readers_attr }}">Delete</button>
                   {% else %}
                   <button class="menu-item" data-act="source-stop" data-source-id="{{ s.id }}"
                           data-source-name="{{ s.name }}" data-active-here="{{ s.active_here }}"
                           {% if not s.owned %}data-owner-name="{{ s.owner_name }}"{% endif %}
-                          data-readers="{% for r in s.readers %}{{ r.name }} ({{ '{:,}'.format(r.guided) }} channel{{ '' if r.guided == 1 else 's' }} guided from here){{ ', ' if not loop.last }}{% endfor %}"
+                          data-readers="{{ readers_attr }}"
                           data-tip="Stop using this guide on this account. Its listings go, and each channel switches to its next source.">Stop using</button>
                   {% endif %}
                 </div>
@@ -616,7 +617,7 @@
          (§17.3): a bare empty box floating where a card should be leaves the section
          unlabelled, which is unidentifiable on a page whose sections the user reorders. #}
       <div class="empty-state"><p><strong>No syncs yet</strong></p>
-        <p class="text-muted" style="font-size:13px;">This account has never been fetched.
+        <p class="page-intro">This account has never been fetched.
           Sync now runs the first one.</p></div>
       {% else %}
       {# One renderer for this region, in account-detail.js, fed from the JSON blob below -
@@ -639,7 +640,7 @@
     <div class="card-body" id="acct-activity-body">
       {% if not log_rows %}
       <div class="empty-state"><p><strong>Nothing has happened yet</strong></p>
-        <p class="text-muted" style="font-size:13px;">Activity appears here once this account has been synced.</p></div>
+        <p class="page-intro">Activity appears here once this account has been synced.</p></div>
       {% else %}
       {# Server-rendered, unlike the history region above: this is the page's own account
          of what happened and it must survive with no JS. It reads the ORM rows directly -
@@ -649,17 +650,17 @@
         {% for log in log_rows[:6] %}
         {# A running sync's row says IN_PROGRESS (app/accounts.py opens it that way); a NULL
            is read the same, as a row from before that. #}
-        {% set running = not log.status or log.status == 'IN_PROGRESS' %}
+        {% set running = not log.status or log.status == SYNC_LOG.IN_PROGRESS %}
         <div class="acct-act">
-          <span class="acct-act-dot {{ 'live' if running else ('bad' if log.status == 'ERROR' else ('warn' if log.status == 'PARTIAL' else ('faint' if log.status in ('CANCELLED', 'SKIPPED') else 'ok'))) }}"></span>
+          <span class="acct-act-dot {{ 'live' if running else ('bad' if log.status == SYNC_LOG.ERROR else ('warn' if log.status == SYNC_LOG.PARTIAL else ('faint' if log.status in (SYNC_LOG.CANCELLED, SYNC_LOG.SKIPPED) else 'ok'))) }}"></span>
           <div class="acct-act-body">
             <div class="acct-act-line">
               {% if running %}Sync started.
-              {% elif log.status == 'SUCCESS' %}Sync finished: {{ '{:,}'.format(log.channels_synced or 0) }} channels{% if log.channels_added is not none and log.channels_removed is not none %} ({% if log.channels_added %}<a href="{{ new_channels_url }}">{{ '{:,}'.format(log.channels_added) }} added</a>{% else %}<span class="text-faint">0 added</span>{% endif %}, {% if log.channels_removed %}<a href="{{ removed_channels_url }}">{{ '{:,}'.format(log.channels_removed) }} removed</a>{% else %}<span class="text-faint">0 removed</span>{% endif %}){% endif %}{{ skipped_clause(log) }}, {{ '{:,}'.format(log.epg_entries_synced or 0) }} program entries{% if log.completed_at and log.started_at %} in {{ (log.completed_at - log.started_at).total_seconds() | duration }}{% endif %}.
-              {% elif log.status == 'PARTIAL' %}Sync finished with gaps: {{ '{:,}'.format(log.channels_synced or 0) }} channels{% if log.channels_added is not none and log.channels_removed is not none %} ({% if log.channels_added %}<a href="{{ new_channels_url }}">{{ '{:,}'.format(log.channels_added) }} added</a>{% else %}<span class="text-faint">0 added</span>{% endif %}, {% if log.channels_removed %}<a href="{{ removed_channels_url }}">{{ '{:,}'.format(log.channels_removed) }} removed</a>{% else %}<span class="text-faint">0 removed</span>{% endif %}){% endif %}{{ skipped_clause(log) }}, {{ '{:,}'.format(log.epg_entries_synced or 0) }} program entries. {{ log.error_message or 'Part of the import did not complete.' }}
-              {% elif log.status == 'ERROR' %}Sync failed. {{ log.error_message or 'No reason was recorded.' }}
-              {% elif log.status == 'CANCELLED' %}Sync cancelled before it finished.
-                            {% elif log.status == 'SKIPPED' %}{# Not "skipped": since dev/changelog/941 most SKIPPED
+              {% elif log.status == SYNC_LOG.SUCCESS %}Sync finished: {{ '{:,}'.format(log.channels_synced or 0) }} channels{% if log.channels_added is not none and log.channels_removed is not none %} ({% if log.channels_added %}<a href="{{ new_channels_url }}">{{ '{:,}'.format(log.channels_added) }} added</a>{% else %}<span class="text-faint">0 added</span>{% endif %}, {% if log.channels_removed %}<a href="{{ removed_channels_url }}">{{ '{:,}'.format(log.channels_removed) }} removed</a>{% else %}<span class="text-faint">0 removed</span>{% endif %}){% endif %}{{ skipped_clause(log) }}, {{ '{:,}'.format(log.epg_entries_synced or 0) }} program entries{% if log.completed_at and log.started_at %} in {{ (log.completed_at - log.started_at).total_seconds() | duration }}{% endif %}.
+              {% elif log.status == SYNC_LOG.PARTIAL %}Sync finished with gaps: {{ '{:,}'.format(log.channels_synced or 0) }} channels{% if log.channels_added is not none and log.channels_removed is not none %} ({% if log.channels_added %}<a href="{{ new_channels_url }}">{{ '{:,}'.format(log.channels_added) }} added</a>{% else %}<span class="text-faint">0 added</span>{% endif %}, {% if log.channels_removed %}<a href="{{ removed_channels_url }}">{{ '{:,}'.format(log.channels_removed) }} removed</a>{% else %}<span class="text-faint">0 removed</span>{% endif %}){% endif %}{{ skipped_clause(log) }}, {{ '{:,}'.format(log.epg_entries_synced or 0) }} program entries. {{ log.error_message or 'Part of the import did not complete.' }}
+              {% elif log.status == SYNC_LOG.ERROR %}Sync failed. {{ log.error_message or 'No reason was recorded.' }}
+              {% elif log.status == SYNC_LOG.CANCELLED %}Sync cancelled before it finished.
+                            {% elif log.status == SYNC_LOG.SKIPPED %}{# Not "skipped": since dev/changelog/941 most SKIPPED
                  rows are a deferral with a retry queued, and the stored message says which of the
                  two this one is. #}Sync did not run. {{ log.error_message or 'No reason was recorded.' }}
               {% else %}{{ log.status }}
@@ -667,7 +668,7 @@
             </div>
             {# Only when something changed: a line on every sync saying nothing moved is noise,
                and an untracked diff (None) has nothing true to say. #}
-            {% set cats = log.category_changes() if log.status in ('SUCCESS', 'PARTIAL') else none %}
+            {% set cats = log.category_changes() if log.status in (SYNC_LOG.SUCCESS, SYNC_LOG.PARTIAL) else none %}
             {% if cats and cats.added %}<div class="acct-act-sub">New categories: {{ category_list(cats.added, account.id) }}</div>{% endif %}
             {% if cats and cats.removed %}<div class="acct-act-sub">Categories gone: {{ category_list(cats.removed, account.id) }}</div>{% endif %}
             <div class="acct-act-when">{{ log.started_at | local_time }}</div>

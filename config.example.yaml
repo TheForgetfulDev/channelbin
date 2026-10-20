@@ -138,7 +138,7 @@ watchdog:
   # max_consecutive_failures, because each restart looks successful; this catches it instead.
   early_fail_window_seconds: 60
   early_fail_min_bytes: 1048576
-  early_fail_abort_count: 3
+  early_fail_abort_count: 3        # 0 = off
   early_fail_abort_window_seconds: 180
   # Once fast-fail trips, retry at 1/2/5/15 minutes then hourly, up to this many attempts
   # or until the recording's own scheduled window ends. 0 = give up immediately.

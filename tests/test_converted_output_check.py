@@ -292,8 +292,7 @@ class ScanGapListTests(_OutputCheckCase):
 
 class RetryFromKeptSourceTests(unittest.TestCase):
     def setUp(self):
-        self.t = make_test_app()
-        self.t.app.config['WTF_CSRF_ENABLED'] = False
+        self.t = make_test_app(csrf=False)
         self.ts = os.path.join(self.t._tmpdir, 'show.ts')
         self.mp4 = os.path.join(self.t._tmpdir, 'done', 'show.mp4')
         os.makedirs(os.path.dirname(self.mp4))

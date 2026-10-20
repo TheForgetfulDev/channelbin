@@ -33,6 +33,7 @@ from ..db_utils import chunked, retry_on_locked
 from ..logo_cache import get_logo_cache_dir, resolve_logo_url
 from ..storage_dirs import manual_screenshot_paths
 from .. import fmt_utils
+from ..fmt_utils import counted
 
 log = logging.getLogger(__name__)
 
@@ -103,7 +104,7 @@ def _guide_conflicts(channel):
         .filter(
             Channel.stream_url == channel.stream_url,
             Channel.id != channel.id,
-            Channel.in_guide == True,
+            Channel.in_guide == True,  # guide-flag-read-ok: two OWN ROWS for one stream is the conflict
         )
         .all()
     )
@@ -373,7 +374,7 @@ def _channel_search_page_context():
     # Review Duplicates is guide-scoped by design - it resolves channels already in the
     # guide that share a stream URL, which is a different question from the account-global
     # DUP badge a row carries. in_guide is true on a handful of rows, so this is cheap.
-    guide_channels = Channel.query.filter_by(in_guide=True).all()
+    guide_channels = Channel.query.filter_by(in_guide=True).all()  # guide-flag-read-ok: own-row duplicates, per the comment above
     dup_groups = _serialize_dup_groups(duplicate_groups_within(guide_channels), cfg)
 
     health_check_profiles = HealthCheckProfile.query.order_by(HealthCheckProfile.name).all()
@@ -1152,7 +1153,7 @@ def _refusal_reason(requested, eligible, blocked_inuse, blocked_active):
     if n_active >= n_inuse and n_active >= n_gone:
         return (f'{subject} can be deleted - '
                 + ('it has' if one else 'they have')
-                + ' a recording scheduled or in progress. Unschedule or abort it first.')
+                + ' a recording scheduled or in progress. Cancel or abort it first.')
     if n_inuse >= n_gone:
         return (f'{subject} can be deleted - '
                 + ('it is' if one else 'they are')
@@ -1874,10 +1875,6 @@ def hide_channels_bulk():
                     'missing': len(ids) - len(found)})
 
 
-def _plural(n: int, word: str) -> str:
-    return f'{n:,} {word}' if n == 1 else f'{n:,} {word}s'
-
-
 def _comparison_summary(c, active_name: str, other_name: str, until_text: str) -> list[str]:
     """What a comparison found, in sentences - every count it judged on, so a verdict can
     always be checked against the rows below it."""
@@ -1887,21 +1884,21 @@ def _comparison_summary(c, active_name: str, other_name: str, until_text: str) -
     if c.verdict == CMP_NO_OVERLAP:
         out.append('The two list no time in common from now on, so there is nothing to compare.')
     elif c.verdict == CMP_IDENTICAL:
-        out.append(f'All {_plural(c.compared, "program")} match.')
+        out.append(f'All {counted(c.compared, "program")} match.')
     elif c.verdict == CMP_DESCRIPTIONS:
-        out.append(f'All {_plural(c.compared, "program")} match, but only one side describes '
+        out.append(f'All {counted(c.compared, "program")} match, but only one side describes '
                    f'{c.description_gaps:,} of them: {active_name} has a description on '
                    f'{c.described_active:,}, {other_name} on {c.described_other:,}.')
     elif c.verdict == CMP_UNRELATED:
-        out.append(f'Only {c.same + c.moved:,} of {_plural(c.compared, "program")} match - '
+        out.append(f'Only {c.same + c.moved:,} of {counted(c.compared, "program")} match - '
                    'probably not the same channel.')
     elif c.verdict in (CMP_MOSTLY, CMP_SHIFTED):
-        out.append(f'{c.same:,} of {_plural(c.compared, "program")} match.')
+        out.append(f'{c.same:,} of {counted(c.compared, "program")} match.')
     else:
         raise ValueError(f'unknown comparison verdict {c.verdict!r}')
     if c.moved:
         move = c.largest_move.total_seconds()
-        out.append(f'{_plural(c.moved, "program")} {"starts" if c.moved == 1 else "start"} '
+        out.append(f'{counted(c.moved, "program")} {"starts" if c.moved == 1 else "start"} '
                    f'at a different time in {other_name}, by up to '
                    f'{fmt_utils.fmt_duration(abs(move))}.')
     parts = []
@@ -1917,7 +1914,7 @@ def _comparison_summary(c, active_name: str, other_name: str, until_text: str) -
         out.append(f'Compared until {until_text}, where the shorter of the two ends.')
     for n, name in ((c.doubled_active, active_name), (c.doubled_other, other_name)):
         if n:
-            out.append(f'{name} lists this channel twice at {_plural(n, "time")} - its file '
+            out.append(f'{name} lists this channel twice at {counted(n, "time")} - its file '
                        'gives two programs the same start time.')
     return out
 

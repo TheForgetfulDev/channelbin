@@ -20,9 +20,9 @@ from ..database import (
     group_event_channel_links,
     REC_STATUS_SCHEDULED, REC_STATUS_IN_PROGRESS, REC_STATUS_PAUSED, REC_STATUS_RETRYING,
     REC_STATUS_CONCATENATING, REC_STATUS_ANALYZING, REC_STATUS_CONVERTING,
-    REC_STATUS_COMPLETED, REC_STATUS_FAILED, REC_STATUS_ABORTED,
+    REC_STATUS_COMPLETED, REC_STATUS_FAILED, REC_STATUS_ABORTED, WINDOW_OPEN_STATUSES,
     FAILURE_ALL_SEGMENTS_PLACEHOLDER,
-    CANCEL_BEFORE_START, CANCEL_DURING_ANALYSIS, CANCEL_DURING_CONVERSION,
+    CANCEL_DURING_ANALYSIS, CANCEL_DURING_CONVERSION,
 )
 from ..channel_groups import (pick_best_member, recording_members,
                               format_eligible_members, recording_formats,
@@ -241,13 +241,16 @@ def _match_channel_by_url(url: str):
     ).first()
     if ch:
         return ch
-    # 2. Loose match: strip /live/ and extensions from both sides
+    # 2. Loose match: strip /live/ and extensions from both sides. Bare columns, not Channel
+    # rows - the comparison needs two strings per channel, and hydrating 137k ORM objects for
+    # it is the shape _upsert_channels was measured paying 2.40s for (dev/changelog/673), on
+    # a box with no swap.
     norm = normalize_url_loose(url)
-    for channel in Channel.query.all():
-        if normalize_url_loose(channel.stream_url or '') == norm:
-            return channel
-        if normalize_url_loose(channel.raw_stream_url or '') == norm:
-            return channel
+    rows = db.session.query(Channel.id, Channel.stream_url, Channel.raw_stream_url)
+    for channel_id, stream_url, raw_stream_url in rows.yield_per(5000):
+        if (normalize_url_loose(stream_url or '') == norm
+                or normalize_url_loose(raw_stream_url or '') == norm):
+            return db.session.get(Channel, channel_id)
     return None
 
 
@@ -672,6 +675,9 @@ def _tech_parts(rec):
 # (static/js/group-detail.js) read identically for the same measurement.
 
 _NONE = fmt_utils.PROFILE_NONE
+# True since dev/changelog/1247: the recorded_* format columns are re-read from the converted
+# file once a conversion finishes (postprocessor._output_format_fields), so a re-encoded
+# audio track reads at the mp4's bitrate and layout, not the joined .ts's.
 _OUTPUT_NOTE = 'Measured on the final output file, not the original capture.'
 
 
@@ -757,7 +763,9 @@ def _audio_profile_note(rec):
     """One tooltip line for the audio detail the Audio row's 'AAC 2.0' label drops.
 
     Always output-derived (there are no probe_* counterparts for these three), so
-    it says 'Output audio' rather than silently reading as the capture's.
+    it says 'Output audio' rather than silently reading as the capture's - and the
+    columns do describe the output, re-read from the converted file when the conversion
+    finished (dev/changelog/1247).
     """
     parts = []
     if rec.recorded_audio_sample_rate:
@@ -851,8 +859,8 @@ def _row_times(rec, now, tz):
     the page and the tick cannot word the same row two ways. Reads only the row's own
     columns and the in-memory join/analysis registries: no query, no disk."""
     from ..tz_utils import day_label
-    from ..concatenator import concat_progress
-    from ..postprocessor import analysis_progress
+    from ..concatenator import concat_progress, concat_progress_parts
+    from ..postprocessor import analysis_progress, analysis_progress_parts
     # A dict lookup under a lock, no I/O - safe in this per-row builder, which is what the
     # /recordings case in tests/test_scaling_pages.py exists to keep true. Only a row that
     # is actually joining can have an entry, so the lookup is skipped for every other status
@@ -865,7 +873,7 @@ def _row_times(rec, now, tz):
     day = day_label(rec.start_time, now, tz)
 
     # relative line - explicit per section/status, anchored on the honest time
-    if rec.status in (REC_STATUS_IN_PROGRESS, REC_STATUS_PAUSED, REC_STATUS_RETRYING):
+    if rec.status in WINDOW_OPEN_STATUSES:
         secs = (rec.stop_time - now).total_seconds()
         rel = f'ends in {_humanize_secs(secs)}' if secs > 0 else 'past stop time'
         if rec.status == REC_STATUS_PAUSED:
@@ -900,10 +908,7 @@ def _row_times(rec, now, tz):
         # another (serialize_concat) falls through to the branch below, because "0%" and
         # "has not started" are different facts and the strip that reads 0% forever is the
         # thing this replaced.
-        parts = ['joining']
-        if concat_prog['pct'] is not None:
-            parts.append(f"{concat_prog['pct']:.0f}%")
-        parts.append(f"{concat_prog['joined']} of {concat_prog['of']} segments")
+        parts = ['joining'] + concat_progress_parts(concat_prog)
         if concat_prog['eta_seconds'] is not None:
             parts.append(f"~{_humanize_secs(concat_prog['eta_seconds'])} left")
         rel = ' · '.join(parts)
@@ -911,12 +916,8 @@ def _row_times(rec, now, tz):
         # Same split as the join above: a pass that is reading says which one and how far,
         # and an ANALYZING row with no pass running (between passes, or queued) falls
         # through to "ended Nm ago" rather than reporting a percentage nothing is moving.
-        parts = [f"checking - {analysis_prog['pass_label']}"]
-        if analysis_prog['of_passes'] > 1:
-            parts[0] += (f" ({analysis_prog['pass_number']} of "
-                         f"{analysis_prog['of_passes']})")
-        if analysis_prog['pct'] is not None:
-            parts.append(f"{analysis_prog['pct']:.0f}%")
+        label, *rest = analysis_progress_parts(analysis_prog)
+        parts = [f'checking - {label}'] + rest
         parts.append(f"{_humanize_secs(analysis_prog['elapsed_seconds'])} elapsed")
         rel = ' · '.join(parts)
     elif rec.status in (REC_STATUS_CONCATENATING, REC_STATUS_ANALYZING):
@@ -969,7 +970,7 @@ def _index_row(rec, now, tz, thumb_ids, live_seg_bytes=0, file_formats=None,
     dur_tip = None
     if rec.status == REC_STATUS_SCHEDULED:
         dur_secs = sched_secs
-    elif rec.status in (REC_STATUS_IN_PROGRESS, REC_STATUS_PAUSED, REC_STATUS_RETRYING):
+    elif rec.status in WINDOW_OPEN_STATUSES:
         captured = sum((s.ended_at - s.started_at).total_seconds()
                        for s in data_segs if s.ended_at)
         active = rec.active_segment
@@ -992,9 +993,22 @@ def _index_row(rec, now, tz, thumb_ids, live_seg_bytes=0, file_formats=None,
     # live size in; the list page does not, since that would be disk I/O per row.
     size_bytes = (rec.final_file_size
                   or sum(s.bytes_recorded or 0 for s in data_segs) + live_seg_bytes or None)
+    # The rate's basis is whichever duration the cell above settled on, and the tooltip
+    # names it: every other duration-derived stat on the page says which of the four it
+    # divides by, and this one did not (dev/changelog/1247).
     rate = None
+    rate_tip = None
     if size_bytes and dur_secs and dur_secs > 60:
         rate = f'{size_bytes * 8 / dur_secs / 1e6:.1f} Mb/s'
+        if rec.status in WINDOW_OPEN_STATUSES:
+            rate_tip = ('Bytes captured so far over the wall clock the capture has run for. '
+                        'A live average - a stall lowers it, a replayed buffer raises it.')
+        elif rec.actual_duration_source == 'file':
+            rate_tip = ('File size over the content length ffprobe measured in the finished '
+                        'file, not over the recording window.')
+        else:
+            rate_tip = ('File size over the span of the segments that captured data - the '
+                        'finished file was not probed for its content length.')
     size_num, size_unit = _size_parts(size_bytes)
 
     # health pill. Three different quantities and the tooltip keeps them apart: downtime is
@@ -1153,7 +1167,7 @@ def _index_row(rec, now, tz, thumb_ids, live_seg_bytes=0, file_formats=None,
         'acct_name': acct.name if acct else None,
         'day': day, 'start': rec.start_time, 'stop': rec.stop_time, 'rel': rel,
         'dur_str': fmt_utils.fmt_duration(dur_secs), 'dur_flag': dur_flag, 'dur_tip': dur_tip,
-        'size_num': size_num, 'size_unit': size_unit, 'rate': rate,
+        'size_num': size_num, 'size_unit': size_unit, 'rate': rate, 'rate_tip': rate_tip,
         'health': health, 'format_change': format_change,
         'progress_pct': progress_pct,
         'output_file': os.path.basename(rec.output_path) if rec.output_path else None,
@@ -1816,8 +1830,8 @@ def _cancel_analysis(recording_id, rec):
 @recordings_bp.route('/recordings/<int:recording_id>/cancel', methods=['POST'])
 def cancel_recording(recording_id):
     # No view-level retry_on_locked: the IN_PROGRESS/PAUSED branch owns no commit and
-    # a lock-retry would re-run abort_recording + file deletion. Only the SCHEDULED
-    # branch's status write is retried, in its own closure below.
+    # a lock-retry would re-run abort_recording + file deletion. The SCHEDULED branch's
+    # row delete is retried inside _unschedule_and_delete_row's own closure.
     rec = db.session.get(Recording, recording_id)
     if rec is None:
         flash('Recording not found.', 'error')
@@ -1828,22 +1842,16 @@ def cancel_recording(recording_id):
         return redirect(url_for('recordings.recording_detail', recording_id=recording_id))
 
     if rec.status == REC_STATUS_SCHEDULED:
-        unschedule_recording(recording_id)
-
-        @retry_on_locked()
-        def _mark_aborted_and_commit():
-            r = db.session.get(Recording, recording_id)
-            add_recording_event(recording_id, RECORDING_ABORTED, detail='Recording cancelled while scheduled')
-            r.status = REC_STATUS_ABORTED
-            r.cancel_reason = CANCEL_BEFORE_START
-            r.completed_at = datetime.utcnow()
-            db.session.commit()
-
-        _mark_aborted_and_commit()
-        dismiss_recording_failing_alerts(recording_id)
+        # The same answer the JSON route gives: a SCHEDULED recording never captured
+        # anything, so cancelling it deletes the row (dev/changelog/814). This branch used
+        # to mark it ABORTED instead, so the outcome depended on which endpoint the caller
+        # reached (dev/changelog/1247).
+        name = rec.name
         end_capture_wait(recording_id)
-        flash(f'Recording "{rec.name}" cancelled.', 'success')
-    elif rec.status in (REC_STATUS_IN_PROGRESS, REC_STATUS_PAUSED, REC_STATUS_RETRYING):
+        _unschedule_and_delete_row(recording_id)
+        log.info('Recording "%s" (#%d) cancelled before it started', name, recording_id)
+        flash(f'Recording "{name}" cancelled.', 'success')
+    elif rec.status in WINDOW_OPEN_STATUSES:
         _abort_and_delete_files(recording_id)
         flash(f'Recording "{rec.name}" cancelled and files deleted.', 'success')
     elif rec.status == REC_STATUS_CONVERTING:
@@ -1873,7 +1881,7 @@ def stop_recording_manual(recording_id):
         flash('Recording not found.', 'error')
         return redirect(url_for('recordings.index'))
 
-    if rec.status not in (REC_STATUS_IN_PROGRESS, REC_STATUS_PAUSED, REC_STATUS_RETRYING):
+    if rec.status not in WINDOW_OPEN_STATUSES:
         flash('Recording is not active.', 'error')
         return redirect(url_for('recordings.recording_detail', recording_id=recording_id))
 
@@ -1916,10 +1924,11 @@ def resume_recording_route(recording_id):
         return redirect(url_for('recordings.recording_detail', recording_id=recording_id))
 
     from flask import current_app
-    from ..scheduler import schedule_recording as _sched
+    from ..scheduler import reschedule_recording_stop
     resume_recording(current_app._get_current_object(), recording_id)
-    # Re-register the stop job in case it was removed
-    _sched(current_app._get_current_object(), recording_id, rec.start_time, rec.stop_time)
+    # Re-register the stop job in case it was removed - the stop job only: the start has
+    # already happened (dev/changelog/1242).
+    reschedule_recording_stop(recording_id, rec.stop_time)
     flash(f'Recording "{rec.name}" resumed.', 'success')
     return redirect(url_for('recordings.recording_detail', recording_id=recording_id))
 
@@ -1931,7 +1940,7 @@ def adjust_stop_time(recording_id):
     rec = db.session.get(Recording, recording_id)
     if rec is None:
         return jsonify({'error': 'Recording not found'}), 404
-    if rec.status not in (REC_STATUS_IN_PROGRESS, REC_STATUS_PAUSED, REC_STATUS_RETRYING):
+    if rec.status not in WINDOW_OPEN_STATUSES:
         return jsonify({'error': 'Recording is not active'}), 400
 
     data = request.get_json(silent=True) or {}
@@ -1970,7 +1979,7 @@ def stop_recording_json(recording_id):
     rec = db.session.get(Recording, recording_id)
     if rec is None:
         return jsonify({'error': 'Recording not found'}), 404
-    if rec.status not in (REC_STATUS_IN_PROGRESS, REC_STATUS_PAUSED, REC_STATUS_RETRYING):
+    if rec.status not in WINDOW_OPEN_STATUSES:
         return jsonify({'error': 'Recording is not active'}), 400
     from flask import current_app
     stop_recording(current_app._get_current_object(), recording_id, reason='MANUAL_STOP')
@@ -2001,9 +2010,9 @@ def resume_recording_json(recording_id):
     if rec.stop_time <= datetime.utcnow():
         return jsonify({'error': 'Stop time has already passed'}), 400
     from flask import current_app
-    from ..scheduler import schedule_recording as _sched
+    from ..scheduler import reschedule_recording_stop
     resume_recording(current_app._get_current_object(), recording_id)
-    _sched(current_app._get_current_object(), rec.id, rec.start_time, rec.stop_time)
+    reschedule_recording_stop(rec.id, rec.stop_time)
     return jsonify({'success': True})
 
 
@@ -2017,7 +2026,7 @@ def cancel_recording_json(recording_id):
     if rec.status in (REC_STATUS_COMPLETED, REC_STATUS_FAILED, REC_STATUS_ABORTED):
         return jsonify({'error': 'Recording is already finished'}), 400
 
-    if rec.status in (REC_STATUS_IN_PROGRESS, REC_STATUS_PAUSED, REC_STATUS_RETRYING):
+    if rec.status in WINDOW_OPEN_STATUSES:
         _abort_and_delete_files(recording_id)
     elif rec.status == REC_STATUS_CONVERTING:
         _cancel_conversion(recording_id, rec)
@@ -2697,7 +2706,6 @@ def set_recording_account_blocks(recording_id):
     A live recording on an account this blocks moves off it within its watchdog's next
     block check (app/watchdog.py::_check_account_block)."""
     from ..account_blocks import rearm_waiting_starts
-    from ..database import WINDOW_OPEN_STATUSES
     rec = db.session.get(Recording, recording_id)
     if rec is None:
         return jsonify({'error': 'Recording not found.'}), 404
@@ -2798,7 +2806,8 @@ def retry_concat(recording_id):
 @recordings_bp.route('/recordings/<int:recording_id>/retry-convert', methods=['POST'])
 def retry_convert(recording_id):
     from flask import current_app
-    from ..concatenator import is_concat_active, run_postprocess_claimed
+    from ..concatenator import (claim_postprocess, release_postprocess,
+                                run_postprocess_claimed)
     from ..postprocessor import is_conversion_active
 
     rec = db.session.get(Recording, recording_id)
@@ -2824,69 +2833,85 @@ def retry_convert(recording_id):
     # Two registries, because they answer at different times: is_conversion_active() only
     # holds once ffmpeg has been spawned, which is the back half of the chain. The analysis
     # phase ahead of it spawns nothing, so a live ANALYZING row is invisible to it and the
-    # live-chain claim is what covers that window.
-    if is_conversion_active(recording_id) or is_concat_active(recording_id):
+    # live-chain claim is what covers that window. The claim is TAKEN here, in the request,
+    # not merely read: a check here followed by a claim in the worker thread let two
+    # requests both pass the check before either thread claimed, so both reset the attempt
+    # budget of the run already going and both flashed "started" (dev/changelog/1242).
+    # Everything from here to the thread start releases it on the way out.
+    if is_conversion_active(recording_id):
+        flash('Post-processing is already running for this recording.', 'error')
+        return redirect(url_for('recordings.recording_detail', recording_id=recording_id))
+    if claim_postprocess(recording_id) is not None:
         flash('Post-processing is already running for this recording.', 'error')
         return redirect(url_for('recordings.recording_detail', recording_id=recording_id))
 
-    damaged_output = None
-    if gaps_source is not None:
-        # The file with the gaps goes first. The new conversion is written under the same
-        # name, and a move on completion would otherwise file it beside the old one as a
-        # renamed copy. Refused rather than half-done when it cannot be deleted.
-        ts_path = gaps_source
-        damaged_output = rec.output_path
-        if damaged_output and damaged_output != ts_path and os.path.exists(damaged_output):
-            try:
-                os.unlink(damaged_output)
-            except OSError as exc:
-                log.warning('Recording %d: could not delete the converted file with gaps %s: %s',
-                            recording_id, damaged_output, exc)
-                flash(f'Could not delete the converted file with gaps ({exc}) - conversion '
-                      f'not retried.', 'error')
+    started = False
+    try:
+        damaged_output = None
+        if gaps_source is not None:
+            # The file with the gaps goes first. The new conversion is written under the
+            # same name, and a move on completion would otherwise file it beside the old one
+            # as a renamed copy. Refused rather than half-done when it cannot be deleted.
+            ts_path = gaps_source
+            damaged_output = rec.output_path
+            if damaged_output and damaged_output != ts_path and os.path.exists(damaged_output):
+                try:
+                    os.unlink(damaged_output)
+                except OSError as exc:
+                    log.warning('Recording %d: could not delete the converted file with gaps '
+                                '%s: %s', recording_id, damaged_output, exc)
+                    flash(f'Could not delete the converted file with gaps ({exc}) - conversion '
+                          f'not retried.', 'error')
+                    return redirect(url_for('recordings.recording_detail',
+                                            recording_id=recording_id))
+        else:
+            ts_path = rec.output_path
+            if not ts_path or not ts_path.endswith('.ts') or not os.path.exists(ts_path):
+                flash('No joined .ts source file found on disk - cannot retry conversion.',
+                      'error')
                 return redirect(url_for('recordings.recording_detail', recording_id=recording_id))
-    else:
-        ts_path = rec.output_path
-        if not ts_path or not ts_path.endswith('.ts') or not os.path.exists(ts_path):
-            flash('No joined .ts source file found on disk - cannot retry conversion.', 'error')
-            return redirect(url_for('recordings.recording_detail', recording_id=recording_id))
 
-    # ANALYZING, not CONVERTING: do_postprocess re-reads the whole .ts before it spawns any
-    # ffmpeg, so a row marked CONVERTING here would be back to naming a phase the app is not
-    # in yet - the defect this status was added to end (dev/changelog/867). do_postprocess
-    # sets it again itself; this write is what the redirect below renders.
-    #
-    # A manual Retry is an operator action that buys a fresh restart budget: reset the
-    # attempt counter to 0.
-    @retry_on_locked()
-    def _mark_analyzing_and_commit():
-        r = db.session.get(Recording, recording_id)
-        r.status = REC_STATUS_ANALYZING
-        r.conversion_attempts = 0
-        # Both hold a value only while the row is terminal, and this one accepts an ABORTED
-        # row as well as a FAILED one; the next terminal writer names its own.
-        r.failure_reason = None
-        r.cancel_reason = None
-        if damaged_output is not None:
-            # The row stops naming a file that is gone, and stops describing its gaps.
-            r.output_path = ts_path
-            r.converted_gap_seconds = None
-            add_recording_event(
-                recording_id, DIAGNOSTICS,
-                detail=f'Deleted the converted file with gaps '
-                       f'({os.path.basename(damaged_output)}) to convert again from the '
-                       f'kept source {os.path.basename(ts_path)}.',
-                extra={'kind': 'converted_file_discarded', 'deleted_path': damaged_output})
-        db.session.commit()
+        # ANALYZING, not CONVERTING: do_postprocess re-reads the whole .ts before it spawns
+        # any ffmpeg, so a row marked CONVERTING here would be back to naming a phase the app
+        # is not in yet - the defect this status was added to end (dev/changelog/867).
+        # do_postprocess sets it again itself; this write is what the redirect below renders.
+        #
+        # A manual Retry is an operator action that buys a fresh restart budget: reset the
+        # attempt counter to 0.
+        @retry_on_locked()
+        def _mark_analyzing_and_commit():
+            r = db.session.get(Recording, recording_id)
+            r.status = REC_STATUS_ANALYZING
+            r.conversion_attempts = 0
+            # Both hold a value only while the row is terminal, and this one accepts an
+            # ABORTED row as well as a FAILED one; the next terminal writer names its own.
+            r.failure_reason = None
+            r.cancel_reason = None
+            if damaged_output is not None:
+                # The row stops naming a file that is gone, and stops describing its gaps.
+                r.output_path = ts_path
+                r.converted_gap_seconds = None
+                add_recording_event(
+                    recording_id, DIAGNOSTICS,
+                    detail=f'Deleted the converted file with gaps '
+                           f'({os.path.basename(damaged_output)}) to convert again from the '
+                           f'kept source {os.path.basename(ts_path)}.',
+                    extra={'kind': 'converted_file_discarded', 'deleted_path': damaged_output})
+            db.session.commit()
 
-    _mark_analyzing_and_commit()
+        _mark_analyzing_and_commit()
 
-    app_obj = current_app._get_current_object()
-    threading.Thread(
-        target=run_postprocess_claimed,
-        args=(app_obj, recording_id, ts_path),
-        daemon=True,
-    ).start()
+        app_obj = current_app._get_current_object()
+        threading.Thread(
+            target=run_postprocess_claimed,
+            args=(app_obj, recording_id, ts_path),
+            kwargs={'claimed': True},
+            daemon=True,
+        ).start()
+        started = True
+    finally:
+        if not started:
+            release_postprocess(recording_id)
 
     flash(f'Conversion retry started for "{rec.name}".', 'success')
     return redirect(url_for('recordings.recording_detail', recording_id=recording_id))
@@ -2903,12 +2928,17 @@ def _cancel_conversion(recording_id, rec):
     """
     from ..postprocessor import (request_cancel_conversion, set_postprocess_wait,
                                  set_conversion_parts, discard_conversion_parts)
+    from ..concatenator import is_concat_active
     from ..database import RecordingEvent, CONVERSION_CANCELLED
 
     # A live conversion: signal its loop to abort (it sets the terminal status + deletes the
     # partial output). A stranded CONVERTING row with no live ffmpeg: mark it here, since no
-    # loop exists to do it.
-    if request_cancel_conversion(recording_id):
+    # loop exists to do it. "Live" is the chain's claim, not the ffmpeg registry alone: a
+    # chain between two attempts - re-muxing a killed part, writing its restart event, or
+    # ahead of its first spawn - has no ffmpeg registered, and reading that as stranded
+    # deleted the parts and marked the row ABORTED under a loop that then spawned the next
+    # attempt anyway (dev/changelog/1242).
+    if request_cancel_conversion(recording_id, chain_active=is_concat_active(recording_id)):
         return f'Cancelling conversion for "{rec.name}".'
 
     # A stranded CONVERTING row's output_path is still the .ts; the partial converted file
@@ -3006,12 +3036,12 @@ def filesize_filter(n):
 
 
 @recordings_bp.app_template_filter('rec_status_label')
-def rec_status_label_filter(status):
+def rec_status_label_filter(status, waiting=False):
     """What a human calls this Recording.status - JOINING for CONCATENATING, CANCELLED for
     ABORTED, and so on. For any template that has a raw status rather than a row context
     built by _index_row (the Dashboard's rows, the channel page's observations table).
     Pure, so it is safe inside a `{% for %}` (CLAUDE.md, no hidden I/O)."""
-    return fmt_utils.rec_status_label(status)
+    return fmt_utils.rec_status_label(status, waiting=bool(waiting))
 
 
 @recordings_bp.app_template_filter('rec_status_badge')

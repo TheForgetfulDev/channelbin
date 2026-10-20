@@ -48,6 +48,34 @@ def _dir_size_recursive(path):
     return total
 
 
+#: How full the recording disk may get before the app says so - one pair of numbers for
+#: every surface that colors it: the dashboard's Disk free tile, the Maintenance page's
+#: meter (through the storage-details payload) and the readiness row (dev/changelog/1244).
+#: They sat beside _disk_bytes() in two places at 75/90 and in a third at 85/95, so one
+#: page drew a 92%-full disk red in its meter and amber in the readiness row beside it.
+DISK_WARN_PCT = 75
+DISK_BAD_PCT = 90
+
+
+def disk_used_pct(total, free):
+    """Whole-number percent used, or None when the filesystem gave no answer."""
+    if not total or free is None:
+        return None
+    return round((total - free) / total * 100)
+
+
+def disk_level(used_pct):
+    """'ok' / 'warn' / 'bad' for a percent used, None for no answer. The one judgment every
+    disk readout colors by."""
+    if used_pct is None:
+        return None
+    if used_pct >= DISK_BAD_PCT:
+        return 'bad'
+    if used_pct >= DISK_WARN_PCT:
+        return 'warn'
+    return 'ok'
+
+
 def _disk_bytes(path, role=None):
     """(total, free) bytes for the filesystem holding `path`, or (None, None).
 
@@ -246,6 +274,7 @@ def storage_details():
     # Both are null when the path has no existing ancestor (an unmounted /dvr),
     # and the page draws no meter rather than a meter reading zero.
     disk_total, disk_free = _disk_bytes(dvr_dir, DVR_DIR_ROLE)
+    used_pct = disk_used_pct(disk_total, disk_free)
 
     return jsonify(
         db_bytes=db_bytes,
@@ -259,6 +288,10 @@ def storage_details():
         backup_bytes=backup_bytes,
         disk_total=disk_total,
         disk_free=disk_free,
+        # Judged here, so the meter colors by the same thresholds as the dashboard tile and
+        # the readiness row rather than carrying a third copy of the numbers.
+        disk_used_pct=used_pct,
+        disk_level=disk_level(used_pct),
     )
 
 

@@ -41,8 +41,7 @@ from app.watchdog import (  # noqa: E402
 )
 from tests.support import seed  # noqa: E402
 from tests.support.app import make_test_app  # noqa: E402
-from tests.test_downtime_accounting import _RestartHarness  # noqa: E402
-from tests.test_watchdog_process_exit import _sleeper  # noqa: E402
+from tests.support.watchdog import RestartHarness, sleeper  # noqa: E402
 
 
 class RetryDelayScheduleTests(unittest.TestCase):
@@ -58,7 +57,7 @@ class RetryDelayScheduleTests(unittest.TestCase):
                          [60, 60, 60])
 
 
-class _RetryHarness(_RestartHarness):
+class _RetryHarness(RestartHarness):
     """Same rig as the sibling connection-release/failure-cause suites: a real account +
     channel so connlim.release() has something to resolve, and the health-score/thumbnail
     side effects of a give-up stubbed out."""
@@ -112,7 +111,7 @@ class ScheduleRetryInsteadOfImmediateFailureTests(_RetryHarness):
     def test_dead_stream_trip_with_budget_and_window_left_enters_retrying_not_failed(self):
         self._extra_watchdog_cfg = {'early_fail_abort_count': 1,
                                     'dead_stream_max_retry_attempts': 3}
-        self.state.process = _sleeper()
+        self.state.process = sleeper()
         with mock.patch.object(recorder, 'failover_group_member', return_value=False):
             rec = self._run_until_event(RECORDING_RETRY_SCHEDULED, stall_timeout=1,
                                         restart_delay=0, produces_data=False)
@@ -136,7 +135,7 @@ class ScheduleRetryInsteadOfImmediateFailureTests(_RetryHarness):
     def test_connection_slot_is_released_while_waiting_to_retry(self):
         self._extra_watchdog_cfg = {'early_fail_abort_count': 1,
                                     'dead_stream_max_retry_attempts': 3}
-        self.state.process = _sleeper()
+        self.state.process = sleeper()
         with mock.patch.object(recorder, 'failover_group_member', return_value=False):
             self._run_until_event(RECORDING_RETRY_SCHEDULED, stall_timeout=1,
                                   restart_delay=0, produces_data=False)
@@ -157,7 +156,7 @@ class RetryBudgetExhaustedFallsThroughTests(_RetryHarness):
         rec.dead_stream_retry_count = 2  # already at the cap
         db.session.commit()
 
-        self.state.process = _sleeper()
+        self.state.process = sleeper()
         with mock.patch.object(recorder, 'failover_group_member', return_value=False):
             rec = self._run_until_event(RECORDING_FAILED_DEAD_STREAM, stall_timeout=1,
                                         restart_delay=0, produces_data=False)
@@ -182,7 +181,7 @@ class WindowExhaustedFallsThroughTests(_RetryHarness):
         rec.stop_time = datetime.utcnow() - timedelta(seconds=1)  # window already over
         db.session.commit()
 
-        self.state.process = _sleeper()
+        self.state.process = sleeper()
         with mock.patch.object(recorder, 'failover_group_member', return_value=False):
             rec = self._run_until_event(RECORDING_FAILED_DEAD_STREAM, stall_timeout=1,
                                         restart_delay=0, produces_data=False)
@@ -200,7 +199,7 @@ class ZeroCapDisablesRetryTests(_RetryHarness):
     def test_max_retry_attempts_zero_behaves_like_before_the_feature(self):
         self._extra_watchdog_cfg = {'early_fail_abort_count': 1,
                                     'dead_stream_max_retry_attempts': 0}
-        self.state.process = _sleeper()
+        self.state.process = sleeper()
         with mock.patch.object(recorder, 'failover_group_member', return_value=False):
             rec = self._run_until_event(RECORDING_FAILED_DEAD_STREAM, stall_timeout=1,
                                         restart_delay=0, produces_data=False)

@@ -24,8 +24,9 @@ backend - a curated copy beside the direct one, or the same backend bought from 
 resellers. Two accounts on one provider may share a login row, which is how one real
 account seen through two services counts its seats once: the pool is the login's, so
 `connection_limits` needs nothing new to count it, and a block on either account takes the
-shared seats from both (`account_blocks.pool_taken()`). Sharing is only within a provider;
-leaving one drops the share. Nothing links by itself.
+shared seats from both (`account_blocks.pool_taken()`). Sharing is only within a provider:
+leaving one, or joining one the other holder is not on, drops the share. Nothing links by
+itself.
 
 An account with no host rows, no login rows and no provider behaves byte for byte as it did
 before the tables existed.
@@ -385,8 +386,10 @@ def roll_host_for_channel(channel_id: int, trigger: str,
 def roll_host(account_id: int, trigger: str, recording_id: Optional[int] = None,
               cfg: Optional[dict] = None) -> Optional[dict]:
     """Move the account onto the next listed host that resolves, because the active one
-    stopped resolving (design §4.4). Returns the summary dict when it rolled, None when it
-    did not - nothing listed to roll to, inside the cooldown, or no listed host resolves.
+    stopped resolving (design §4.4). Returns the summary dict when it rolled - or when the
+    active host resolves but stream URLs were found stranded on another listed host and
+    moved back (`repaired: True`, `old_host: None`) - and None when it changed nothing:
+    nothing listed to roll to, inside the cooldown, or no listed host resolves.
 
     Order: the hosts after the active one in list order, wrapping around, the active one
     last - a resolver hiccup on the active host still gets it re-checked, after the others.
@@ -462,10 +465,34 @@ def roll_host(account_id: int, trigger: str, recording_id: Optional[int] = None,
         return None
     if chosen is active:
         # The active host resolves after all - a resolver blip, or the failure was about a
-        # URL on another host. Nothing to roll onto; the stamp above records it resolved.
-        log.info('Account %d (%s): %s - active host %s resolves; not rolling',
-                 account_id, name, trigger, active.host)
-        return None
+        # URL stranded on a listed host that is not the active one. The second case is real:
+        # a re-normalize or a sync that raced a roll can leave rows on the dead host while
+        # the row says the live one is active, and the next failure lands here again
+        # forever. So the active host is re-rendered onto every listed URL anyway (a no-op
+        # for a row already there, one scan of the account's channels, bounded by the
+        # cooldown), and a repair is said out loud like a roll (dev/changelog/1243).
+        summary = _activate(account_id, active.host)
+        if not summary['channels'] and not summary['account_urls']:
+            log.info('Account %d (%s): %s - active host %s resolves; not rolling',
+                     account_id, name, trigger, active.host)
+            return None
+        summary.update({'old_host': None, 'trigger': trigger, 'repaired': True})
+        log.warning('Account %d (%s): %s - active host %s resolves, but %d stream URLs were '
+                    'on another listed host; moved them back onto %s', account_id, name,
+                    trigger, active.host, summary['channels'], active.host)
+        _raise_rolled_alert(
+            account_id, name,
+            title=f'{name}: {summary["channels"]:,} stream URLs moved back onto {active.host}',
+            body=(f'{trigger} failed to resolve its host, but {active.host}, the active host, '
+                  f'resolves. {summary["channels"]:,} stream URLs on {name} were on another '
+                  f'host from the list'
+                  + (', as was the account\'s own URL' if summary['account_urls'] else '')
+                  + f' - usually a URL re-normalize or a sync that landed during a host '
+                  f'swap - and now use {active.host} again. A running recording picks the '
+                  f'repaired URL up at its next segment.'))
+        if recording_id is not None:
+            _log_recording_roll(recording_id, None, active.host, summary['channels'])
+        return summary
 
     summary = _activate(account_id, chosen.host)
     old = active.host
@@ -490,7 +517,7 @@ def _activate(account_id: int, host: str) -> dict:
     """Flip `is_active` to `host` and rewrite every stream URL on the account whose host is
     listed, plus the account's own URLs when their host is listed, in one retry unit. Shared
     by the roll and the user's Make active. Returns {'host', 'channels', 'account_urls'}."""
-    from .database import Account, AccountHost, Channel
+    from .database import Account, AccountHost
 
     @retry_on_locked()
     def _activate_and_commit():
@@ -504,26 +531,7 @@ def _activate(account_id: int, host: str) -> dict:
                     r.activated_at = now
             elif r.is_active:
                 r.is_active = False
-        changed = []
-        for cid, url in db.session.query(Channel.id, Channel.stream_url).filter(
-                Channel.account_id == account_id).yield_per(2000):
-            rendered = render_host(url, hosts, host)
-            if rendered != url:
-                changed.append({'b_id': cid, 'b_url': rendered})
-        # A Core executemany on the table, on the session's own connection so it rides in
-        # this unit's transaction - the ORM's bulk-update path wants primary keys spelled
-        # its way and would synchronize rows nothing here reads back. stream_url is a
-        # search text column, so the index watermark moves with it; updated_at is
-        # self-assigned to keep it still, because the provider changed nothing
-        # (dev/changelog/673).
-        table = Channel.__table__
-        stmt = (update(table)
-                .where(table.c.id == db.bindparam('b_id'))
-                .values(stream_url=db.bindparam('b_url'),
-                        search_text_updated_at=now, updated_at=table.c.updated_at))
-        conn = db.session.connection()
-        for batch in chunked(changed, _ROLL_CHUNK):
-            conn.execute(stmt, batch)
+        changed = rerender_stream_urls(account_id, hosts, host, now)
         account_urls = 0
         account = db.session.get(Account, account_id)
         if account is not None:
@@ -538,22 +546,61 @@ def _activate(account_id: int, host: str) -> dict:
             if account.stream_host in hosts:
                 account.stream_host = host
         db.session.commit()
-        return {'host': host, 'channels': len(changed), 'account_urls': account_urls}
+        return {'host': host, 'channels': changed, 'account_urls': account_urls}
 
     return _activate_and_commit()
 
 
-def _log_recording_roll(recording_id: int, old: str, new: str, channels: int) -> None:
+def rerender_stream_urls(account_id: int, hosts, host: str, now: Optional[datetime] = None) -> int:
+    """Inside the caller's transaction (no commit): rewrite every stream URL on the account
+    whose host is one of `hosts` onto `host`. Returns the number of rows moved. The one
+    rewrite behind the roll, Make active and the sync's end-of-run check, so the three
+    writers of `stream_url` cannot disagree on the host (dev/changelog/1243)."""
+    from .database import Channel
+    now = now or datetime.utcnow()
+    changed = []
+    for cid, url in db.session.query(Channel.id, Channel.stream_url).filter(
+            Channel.account_id == account_id).yield_per(2000):
+        rendered = render_host(url, hosts, host)
+        if rendered != url:
+            changed.append({'b_id': cid, 'b_url': rendered})
+    if not changed:
+        return 0
+    # A Core executemany on the table, on the session's own connection so it rides in
+    # the caller's transaction - the ORM's bulk-update path wants primary keys spelled
+    # its way and would synchronize rows nothing here reads back. stream_url is a
+    # search text column, so the index watermark moves with it; updated_at is
+    # self-assigned to keep it still, because the provider changed nothing
+    # (dev/changelog/673).
+    table = Channel.__table__
+    stmt = (update(table)
+            .where(table.c.id == db.bindparam('b_id'))
+            .values(stream_url=db.bindparam('b_url'),
+                    search_text_updated_at=now, updated_at=table.c.updated_at))
+    conn = db.session.connection()
+    for batch in chunked(changed, _ROLL_CHUNK):
+        conn.execute(stmt, batch)
+    return len(changed)
+
+
+def _log_recording_roll(recording_id: int, old: Optional[str], new: str, channels: int) -> None:
+    """The recording's own RECORDING_HOST_ROLLED event. `old` is the host that stopped
+    resolving; None means a repair - the active host resolves and stranded URLs were moved
+    back onto it."""
     from .database import RECORDING_HOST_ROLLED, add_recording_event
+    if old is None:
+        detail = (f'{channels:,} stream URLs on the account were on a listed host that is not '
+                  f'the active one; moved back onto {new}. The next segment records from the '
+                  f'repaired URL.')
+    else:
+        detail = (f'The stream host {old} stopped resolving; the account now uses {new} '
+                  f'({channels:,} channels rewritten). The next segment records from the '
+                  f'new URL.')
 
     @retry_on_locked()
     def _log_and_commit():
-        add_recording_event(
-            recording_id, RECORDING_HOST_ROLLED,
-            detail=(f'The stream host {old} stopped resolving; the account now uses {new} '
-                    f'({channels:,} channels rewritten). The next segment records from the '
-                    f'new URL.'),
-            extra={'old_host': old, 'new_host': new, 'channels': channels})
+        add_recording_event(recording_id, RECORDING_HOST_ROLLED, detail=detail,
+                            extra={'old_host': old, 'new_host': new, 'channels': channels})
         db.session.commit()
 
     _log_and_commit()
@@ -742,6 +789,17 @@ def render_held_login(url: str, account_id: int, holder_kind: str, holder_id) ->
 
 # ── Logins: the writer ──────────────────────────────────────────────────────────────────
 
+#: Characters a login's username or password may not carry, because render_login() splices
+#: both into the stream URL's path raw: "/" would add a path segment, "?" starts the query
+#: and "#" the fragment (the stream id after it is lost and the server answers 404, which
+#: is not a credential refusal, so the login would be retried on every segment with nothing
+#: stamped), "%" starts an escape the server decodes, "@" is read as userinfo by some
+#: clients, and whitespace breaks the request line. Refused at the dialog rather than
+#: encoded on the way out: encoding would change what the provider sees for a password
+#: that already carries %XX (dev/changelog/1243).
+_UNRENDERABLE = frozenset('/?#%@')
+
+
 def _validate_login_fields(name: str, username: str, password: Optional[str],
                            max_connections, *, password_required: bool) -> tuple[str, str, Optional[str], int]:
     name = (name or '').strip()
@@ -753,9 +811,13 @@ def _validate_login_fields(name: str, username: str, password: Optional[str],
         raise ValueError('Enter the username.')
     if password_required and not password:
         raise ValueError('Enter the password.')
-    if '/' in username or (password and '/' in password):
-        raise ValueError('A username or password cannot contain "/": it is rendered into '
-                         'the stream URL as a path segment.')
+    for value in (username, password or ''):
+        bad = next((ch for ch in value if ch in _UNRENDERABLE or ch.isspace()), None)
+        if bad is not None:
+            shown = 'a space' if bad.isspace() else f'"{bad}"'
+            raise ValueError(f'A username or password cannot contain {shown}: it is '
+                             f'rendered into the stream URL as a path segment, and this '
+                             f'character would change how the URL is read.')
     try:
         seats = int(max_connections)
     except (TypeError, ValueError):
@@ -1067,24 +1129,30 @@ def _check_provider_name(name: str, exclude_id: Optional[int] = None) -> None:
         raise ValueError(f'A provider named {name} already exists.')
 
 
-def _drop_shares_on_leaving(account, old_provider_id: Optional[int]) -> list:
-    """Inside the caller's unit: the account is leaving `old_provider_id`, so it stops
-    holding any login another account on that provider still holds (design §3.2). Logins
-    only it holds stay. Returns the names of the logins it let go."""
+def _drop_shares_off_provider(account, provider_id: Optional[int]) -> list:
+    """Inside the caller's unit, with `account.provider_id` already set to `provider_id`
+    and flushed: the account stops holding any login it shares with an account that is
+    not on that same provider (design §3.2 - a share lives within one provider). That is
+    the account leaving its provider (every other holder was on it), joining one from
+    none (a share kept through a provider's deletion whose other holder stayed off), or
+    moving between two. On a move to none every share goes. Logins only it holds stay.
+    Returns the names of the logins it let go."""
     from .database import Account, AccountLogin, Login
-    if old_provider_id is None:
-        return []
     mine = db.session.query(AccountLogin).filter(AccountLogin.account_id == account.id).all()
     if not mine:
         return []
-    others = {aid for (aid,) in db.session.query(Account.id).filter(
-        Account.provider_id == old_provider_id, Account.id != account.id).all()}
+    holders = login_holders(r.login_id for r in mine)
+    others = {aid for ids in holders.values() for aid in ids if aid != account.id}
     if not others:
         return []
-    holders = login_holders(r.login_id for r in mine)
+    if provider_id is None:
+        with_me = set()
+    else:
+        with_me = {aid for (aid,) in db.session.query(Account.id).filter(
+            Account.provider_id == provider_id, Account.id.in_(others)).all()}
     dropped = []
     for row in mine:
-        if set(holders.get(row.login_id, [])) & others:
+        if set(holders.get(row.login_id, [])) - {account.id} - with_me:
             login = db.session.get(Login, row.login_id)
             dropped.append(login.name if login else f'#{row.login_id}')
             db.session.delete(row)
@@ -1119,12 +1187,18 @@ def create_provider(name: str, account_ids: Iterable[int]):
         provider = Provider(name=name, created_at=now, updated_at=now)
         db.session.add(provider)
         db.session.flush()
+        # Every account is put on the provider BEFORE any share is judged: two accounts
+        # that kept a share through their old provider's deletion and are now re-created
+        # together must keep it, and judging the first while the second is still on none
+        # would drop it.
+        for account in accounts:
+            account.provider_id = provider.id
+        db.session.flush()
         dropped = {}
         for account in accounts:
-            gone = _drop_shares_on_leaving(account, account.provider_id)
+            gone = _drop_shares_off_provider(account, provider.id)
             if gone:
                 dropped[account.id] = gone
-            account.provider_id = provider.id
         if accounts:
             _refold_duplicates()
         db.session.commit()
@@ -1160,8 +1234,10 @@ def rename_provider(provider_id: int, name: str):
 def delete_provider(provider_id: int) -> tuple[str, int]:
     """Delete a provider: its accounts go back to being on none. Their hosts and logins are
     left alone, and a login two of them share stays shared (design §3.2) - the seat is one
-    real seat whatever the label says, and the account page keeps naming the share. Returns
-    (name, accounts unlinked). Raises LookupError."""
+    real seat whatever the label says, and the account page keeps naming the share. The
+    share is judged again at the next provider change of either account: re-creating the
+    provider with both keeps it, putting one of them on a provider without the other drops
+    it. Returns (name, accounts unlinked). Raises LookupError."""
     from .database import Account, Provider
 
     @retry_on_locked()
@@ -1185,10 +1261,10 @@ def delete_provider(provider_id: int) -> tuple[str, int]:
 
 
 def set_account_provider(account_id: int, provider_id: Optional[int]) -> list:
-    """Put the account on `provider_id`, or on none. Leaving or moving drops the account's
-    hold on any login another account on the old provider still holds (design §3.2).
-    Returns the names of the logins it let go. Raises LookupError for an unknown account or
-    provider."""
+    """Put the account on `provider_id`, or on none. Leaving, joining or moving drops the
+    account's hold on any login shared with an account that is not on the new provider
+    (design §3.2). Returns the names of the logins it let go. Raises LookupError for an
+    unknown account or provider."""
     from .database import Account, Provider
 
     @retry_on_locked()
@@ -1200,8 +1276,9 @@ def set_account_provider(account_id: int, provider_id: Optional[int]) -> list:
             raise LookupError('Provider not found.')
         if account.provider_id == provider_id:
             return []
-        dropped = _drop_shares_on_leaving(account, account.provider_id)
         account.provider_id = provider_id
+        db.session.flush()
+        dropped = _drop_shares_off_provider(account, provider_id)
         _refold_duplicates()
         db.session.commit()
         return dropped

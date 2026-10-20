@@ -291,6 +291,234 @@ class TerminalStatusScanCorrectnessTests(unittest.TestCase):
         self.assertEqual(find_silent_failure_sites(source, 'app/other.py', exempt), [2])
 
 
+def _enclosing_block(tree):
+    """Map every statement to the list of statements it sits in (a body, orelse, finalbody
+    or handler body), so "the same block" can be asked of a site."""
+    owner = {}
+    for node in ast.walk(tree):
+        for field in ('body', 'orelse', 'finalbody'):
+            stmts = getattr(node, field, None)
+            if isinstance(stmts, list):
+                for st in stmts:
+                    owner[st] = stmts
+    return owner
+
+
+def _names_terminal(node, terminal_names):
+    """Whether `node` names one of `terminal_names` - directly, or on either arm of a
+    conditional expression (`status = COMPLETED if ok else FAILED` is a FAILED site)."""
+    if isinstance(node, ast.IfExp):
+        return (_names_terminal(node.body, terminal_names)
+                or _names_terminal(node.orelse, terminal_names))
+    name = None
+    if isinstance(node, ast.Name):
+        name = node.id
+    elif isinstance(node, ast.Attribute):
+        name = node.attr
+    return name in terminal_names
+
+
+def _statement_of(node, parents):
+    while node is not None and not isinstance(node, ast.stmt):
+        node = parents.get(node)
+    return node
+
+
+def find_silent_block_sites(source, terminal_names, surface_calls, surface_targets=()):
+    """Return 1-indexed line numbers of terminal writes in `source` whose own BLOCK carries
+    no surface. A terminal write is an assignment of a name in `terminal_names` (to a bare
+    `status` or to `<x>.status`) or a call handed one as an argument; a surface is a call to
+    one of `surface_calls`, or an assignment to a name in `surface_targets`, anywhere in the
+    same statement list.
+
+    Block-scoped rather than function-scoped (find_silent_failure_sites above) because the
+    channel tester decides FAILED six times inside one 600-line function, and "something
+    in that function logs" would be true of every one of them whatever they did. The block
+    is the site's own statement list and, when that list is a branch of an if/try, the list
+    that statement sits in - a verdict decided in an `else:` and logged by the `if` chain
+    right after it is one path, not two."""
+    tree = ast.parse(source)
+    parents = {}
+    for node in ast.walk(tree):
+        for child in ast.iter_child_nodes(node):
+            parents[child] = node
+    block_of = _enclosing_block(tree)
+
+    def _is_surface(st):
+        for node in ast.walk(st):
+            if isinstance(node, ast.Call) and _called_name(node.func) in surface_calls:
+                return True
+            if isinstance(node, ast.Assign) and any(
+                    isinstance(t, ast.Name) and t.id in surface_targets for t in node.targets):
+                return True
+        return False
+
+    silent = []
+    for node in ast.walk(tree):
+        terminal = False
+        if isinstance(node, ast.Assign) and _names_terminal(node.value, terminal_names):
+            terminal = any((isinstance(t, ast.Name) and t.id == 'status')
+                           or (isinstance(t, ast.Attribute) and t.attr == 'status')
+                           for t in node.targets)
+        elif isinstance(node, ast.Call):
+            terminal = any(_names_terminal(a, terminal_names) for a in node.args)
+        if not terminal:
+            continue
+        st = _statement_of(node, parents)
+        block = block_of.get(st)
+        if block is None:
+            continue
+        if any(_is_surface(sib) for sib in block):
+            continue
+        outer = _statement_of(parents.get(st), parents)
+        outer_block = block_of.get(outer) if outer is not None else None
+        if outer_block is not None and any(_is_surface(sib) for sib in outer_block):
+            continue
+        silent.append(node.lineno)
+    return sorted(set(silent))
+
+
+class ChannelTestFailureSurfaceScanTests(unittest.TestCase):
+    """The rule's second family: a channel test the tester marks FAILED carries, in the same
+    block as the decision, the log line or the error detail that says why. The test row's
+    `error_detail` and its log are the surface the channel page shows; a FAILED test with
+    neither is the recording family's blank detail page, one table over
+    (dev/changelog/1246)."""
+
+    _TERMINAL = frozenset({'TEST_STATUS_FAILED'})
+    _SURFACE_CALLS = frozenset({'_append_log'})
+    _SURFACE_TARGETS = frozenset({'error_detail', 'quality_fail_msg'})
+
+    def _source(self):
+        with open(os.path.join(APP_DIR, 'channel_tester.py'), encoding='utf-8') as fh:
+            return fh.read()
+
+    def test_every_failed_decision_in_the_tester_says_why_in_its_own_block(self):
+        silent = find_silent_block_sites(self._source(), self._TERMINAL,
+                                         self._SURFACE_CALLS, self._SURFACE_TARGETS)
+        self.assertEqual(silent, [], 'app/channel_tester.py marks a test FAILED with no '
+                                     '_append_log / error_detail in the same block: '
+                                     f'lines {silent}')
+
+    def test_the_scan_sees_the_tester_decisions(self):
+        tree = ast.parse(self._source())
+        sites = [n.lineno for n in ast.walk(tree)
+                 if isinstance(n, ast.Assign) and _names_terminal(n.value, self._TERMINAL)]
+        self.assertGreaterEqual(len(sites), 4,
+                                f'found only {len(sites)} TEST_STATUS_FAILED decisions; '
+                                'the tester had six when written')
+
+
+class SearchIndexFailureSurfaceScanTests(unittest.TestCase):
+    """Third family: a search index recorded FAILED raises its standing alert in the same
+    block. The alert is the only surface - the index has no detail page - and a FAILED
+    index sends every search to LIKE, which is the slowness the user would otherwise have
+    to diagnose from nothing."""
+
+    _TERMINAL = frozenset({'STATUS_FAILED'})
+    _SURFACE_CALLS = frozenset({'_alert_rebuild_failed'})
+
+    def _source(self):
+        with open(os.path.join(APP_DIR, 'search_index.py'), encoding='utf-8') as fh:
+            return fh.read()
+
+    def test_every_failed_record_alerts_in_its_own_block(self):
+        silent = find_silent_block_sites(self._source(), self._TERMINAL, self._SURFACE_CALLS)
+        self.assertEqual(silent, [], 'app/search_index.py records an index FAILED with no '
+                                     f'alert in the same block: lines {silent}')
+
+    def test_the_scan_sees_both_record_sites(self):
+        tree = ast.parse(self._source())
+        sites = [n.lineno for n in ast.walk(tree) if isinstance(n, ast.Call)
+                 and any(_names_terminal(a, self._TERMINAL) for a in n.args)]
+        self.assertGreaterEqual(len(sites), 2)
+
+
+class AccountFailureSurfaceTests(unittest.TestCase):
+    """Fourth family: the account page explains a failed sync from `Account.last_error`,
+    and the sync history from the log row's `error_message`. Both are written by the one
+    function that moves an account to ERROR, `accounts.finalize_sync_state`, and every
+    caller that hands it ERROR hands it both messages."""
+
+    def _source(self, rel):
+        with open(os.path.join(os.path.dirname(APP_DIR), rel), encoding='utf-8') as fh:
+            return fh.read()
+
+    def test_finalize_sync_state_writes_the_reason_beside_the_status(self):
+        tree = ast.parse(self._source('app/accounts.py'))
+        fn = next(n for n in ast.walk(tree)
+                  if isinstance(n, ast.FunctionDef) and n.name == 'finalize_sync_state')
+        targets = {t.attr for n in ast.walk(fn) if isinstance(n, ast.Assign)
+                   for t in n.targets if isinstance(t, ast.Attribute)}
+        self.assertTrue({'status', 'last_error', 'error_message'} <= targets, targets)
+
+    def test_every_error_caller_passes_both_messages(self):
+        offenders = []
+        for rel in ('app/accounts.py', 'app/routes/accounts.py', 'app/scheduler.py'):
+            tree = ast.parse(self._source(rel))
+            for node in ast.walk(tree):
+                if not (isinstance(node, ast.Call)
+                        and _called_name(node.func) == 'finalize_sync_state'):
+                    continue
+                if not any(_names_terminal(a, {'ACCOUNT_STATUS_ERROR'}) for a in node.args):
+                    continue
+                kws = {kw.arg for kw in node.keywords}
+                if not {'account_message', 'log_message'} <= kws:
+                    offenders.append(f'{rel}:{node.lineno}')
+        self.assertEqual(offenders, [])
+
+    def test_the_scan_sees_the_error_caller(self):
+        tree = ast.parse(self._source('app/accounts.py'))
+        calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call)
+                 and _called_name(n.func) == 'finalize_sync_state'
+                 and any(_names_terminal(a, {'ACCOUNT_STATUS_ERROR'}) for a in n.args)]
+        self.assertGreaterEqual(len(calls), 1)
+
+
+class BlockScanCorrectnessTests(unittest.TestCase):
+
+    def test_a_decision_with_no_surface_in_its_block_is_reported(self):
+        src = ("def run():\n"
+               "    while True:\n"
+               "        if bad:\n"
+               "            status = TEST_STATUS_FAILED\n"
+               "    _append_log('INFO', 'elsewhere')\n")
+        self.assertEqual(find_silent_block_sites(src, {'TEST_STATUS_FAILED'}, {'_append_log'}),
+                         [4])
+
+    def test_a_verdict_in_a_branch_logged_by_the_chain_after_it_is_one_path(self):
+        src = ("def run():\n"
+               "    if cancelled:\n"
+               "        status = TEST_STATUS_CANCELLED\n"
+               "    else:\n"
+               "        status = TEST_STATUS_COMPLETED if ok else TEST_STATUS_FAILED\n"
+               "    if status == TEST_STATUS_FAILED:\n"
+               "        _append_log('ERROR', 'why')\n")
+        self.assertEqual(find_silent_block_sites(src, {'TEST_STATUS_FAILED'}, {'_append_log'}),
+                         [])
+
+    def test_a_surface_in_the_same_block_suppresses(self):
+        src = ("def run():\n"
+               "    if bad:\n"
+               "        status = TEST_STATUS_FAILED\n"
+               "        _append_log('ERROR', 'why')\n")
+        self.assertEqual(find_silent_block_sites(src, {'TEST_STATUS_FAILED'}, {'_append_log'}),
+                         [])
+
+    def test_an_assignment_surface_counts(self):
+        src = ("def run():\n"
+               "    if bad:\n"
+               "        error_detail = 'why'\n"
+               "        status = TEST_STATUS_FAILED\n")
+        self.assertEqual(find_silent_block_sites(src, {'TEST_STATUS_FAILED'}, set(),
+                                                 {'error_detail'}), [])
+
+    def test_a_call_handed_the_terminal_name_is_a_site(self):
+        src = ("def run():\n"
+               "    _record_state(name, STATUS_FAILED, None)\n")
+        self.assertEqual(find_silent_block_sites(src, {'STATUS_FAILED'}, {'_alert'}), [2])
+
+
 class MissingOutputDirTests(unittest.TestCase):
     def setUp(self):
         self.t = make_test_app()

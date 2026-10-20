@@ -190,7 +190,7 @@
 .cs-chip { display: inline-flex; align-items: center; gap: 5px; height: 26px; padding: 0 4px 0 8px;
   border-radius: 999px; background: var(--accent-soft); border: 1px solid rgba(var(--accent-rgb), .38);
   color: var(--accent-text); font-size: var(--fs-sm); white-space: nowrap; max-width: 340px; }
-.cs-chip.neg { background: var(--bad-soft); border-color: rgba(var(--bad-rgb),.4); color: #f4938f; }
+.cs-chip.neg { background: var(--bad-soft); border-color: rgba(var(--bad-rgb),.4); color: var(--bad-text); }
 .cs-chip.text { background: var(--bg3); border-color: var(--border); color: var(--text); }
 .cs-chip .ck { opacity: .75; font-weight: 600; }
 .cs-chip .cop { border: none; background: none; color: inherit; border-radius: var(--radius-sm); padding: 1px 5px;
@@ -362,7 +362,7 @@
 .nsel { font-size: var(--fs-xs); background: var(--accent); color: var(--accent-contrast);
   border-radius: 999px; padding: 0 6px; font-weight: 700; }
 .fac-h .nsel { margin-left: auto; }
-.nsel.hasneg { background: var(--bad); color: #2a0b0a; }
+.nsel.hasneg { background: var(--bad); color: var(--accent-contrast); }
 .fac-b { display: none; padding: 5px 0 2px; }
 .fac.open .fac-b { display: block; }
 .fac-b .prow { font-size: var(--fs-md); }
@@ -800,11 +800,8 @@
 .when-fill.on { opacity: 1; border-left-color: var(--accent); }
 .wf-l { font-size: var(--fs-xs); color: var(--text-faint); text-transform: uppercase; letter-spacing: .05em; }
 .wf-c { display: flex; gap: 4px; align-items: center; }
-.wf-c input, .wf-c select {
-  background: var(--bg0); border: 1px solid var(--border); border-radius: var(--radius-sm);
-  color: var(--text); font-family: inherit; font-size: var(--fs-sm); padding: 3px 5px; min-width: 0;
-}
-.wf-c input:focus, .wf-c select:focus { outline: none; border-color: var(--accent); }
+/* Border, text color and focus come from style.css's shared text-input recipe. */
+.wf-c input, .wf-c select { background: var(--bg0); font-family: inherit; font-size: var(--fs-sm); padding: 3px 5px; min-width: 0; }
 .wf-n { width: 58px; }
 .wf-u { flex: 1; }
 .wf-range { flex-direction: column; align-items: stretch; }
@@ -960,7 +957,7 @@
   .mn { font-size: var(--fs-xs); font-weight: 700; font-variant-numeric: tabular-nums;
     background: var(--accent); color: var(--accent-contrast); border-radius: 999px; padding: 0 6px; flex: none; }
   .mchip.on .mn { background: var(--accent-text); }
-  .mn.hasneg { background: var(--bad); color: #2a0b0a; }
+  .mn.hasneg { background: var(--bad); color: var(--accent-contrast); }
   .chiprow .push { margin-left: auto; }
   /* Clear all is the one entry on this row that is a .btn rather than a .mchip,
      so it does not inherit the 34px floor above and measured 27.4px in a browser

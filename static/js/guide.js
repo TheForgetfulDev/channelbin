@@ -9,10 +9,7 @@
 const SLOT_MINUTES = 30;        // label every 30 min
 const CUT_WIDTH_PX = 8;         // width of the "gap collapsed" cut divider
 
-// The one breakpoint declaration. It must stay equal to the `@media (max-width: 960px)`
-// query in guide.css - CSS decides what the grid LOOKS like and this decides what it is
-// BUILT from, and the two disagreeing is a class of bug this file has shipped before.
-const MOBILE_MQ = window.matchMedia('(max-width: 960px)');
+// MOBILE_MQ is util.js's one breakpoint declaration; the `change` listener below is on it.
 
 // True at phone widths on any page that has opted in by sending a `layoutMobile` dict.
 // The guide always does; channel detail's "What's On" card did not until its own revamp
@@ -1210,7 +1207,7 @@ function openChannelSheet(ch) {
   let why;
   if (state === 'untested') {
     why = 'This channel has no health score yet. Run a health check to measure it.';
-  } else if (ch.last_test_status === 'FAILED') {
+  } else if (ch.last_test_status === statusVocab('TEST_STATUS').FAILED) {
     why = `The most recent health check FAILED.${ch.last_test_error_detail ? ' ' + ch.last_test_error_detail : ''}`;
   } else if (ch.last_test_error_detail) {
     why = ch.last_test_error_detail;
@@ -1245,7 +1242,7 @@ function openChannelSheet(ch) {
 // The tech readout as plain text for the sheet. Same wording as the desktop column's
 // `no stream data` (12.4) so the two surfaces never describe the same channel differently.
 function channelTechText(ch) {
-  const hasData = ch.last_test_status === 'COMPLETED' &&
+  const hasData = ch.last_test_status === statusVocab('TEST_STATUS').COMPLETED &&
     (ch.last_test_resolution || ch.last_test_fps || ch.last_test_bitrate_kbps || ch.last_test_audio_codec);
   if (!hasData) return 'no stream data';
   const bits = [];
@@ -2123,9 +2120,10 @@ function isCollapseActive() {
 function isChannelHealthHidden(ch) {
   // You are on that channel's own page - hiding it is never the answer (see applyShowFailed).
   if (SINGLE_CHANNEL) return false;
-  if (ch.last_test_status !== 'FAILED') return false;
+  if (ch.last_test_status !== statusVocab('TEST_STATUS').FAILED) return false;
+  const RS = statusVocab('REC_STATUS');
   const hasActiveRec = (ch.recordings || []).some(r =>
-    r.status === 'SCHEDULED' || r.status === 'IN_PROGRESS' || r.status === 'RETRYING');
+    r.status === RS.SCHEDULED || r.status === RS.IN_PROGRESS || r.status === RS.RETRYING);
   if (hasActiveRec) return false;
   return !LAYOUT.show_failed;
 }
@@ -2649,7 +2647,7 @@ function renderHealthBadge(ch) {
     `${healthBandName(score)} - score ${score} / 100`,
     `Lifetime health score over ${n} observation${n === 1 ? '' : 's'}.`,
   ];
-  if (ch.last_test_status === 'FAILED') lines.push('⚠ The most recent health check FAILED.');
+  if (ch.last_test_status === statusVocab('TEST_STATUS').FAILED) lines.push('⚠ The most recent health check FAILED.');
   else if (ch.last_test_error_detail) lines.push(`⚠ ${ch.last_test_error_detail}`);
   badge.dataset.tip = escTipAttr(lines.join('\n'));
 }
@@ -2664,7 +2662,7 @@ function renderTechReadout(ch) {
   if (!box) return;
   if (!techFieldsEnabled()) { box.innerHTML = ''; return; }
 
-  const hasData = ch.last_test_status === 'COMPLETED' &&
+  const hasData = ch.last_test_status === statusVocab('TEST_STATUS').COMPLETED &&
     (ch.last_test_resolution || ch.last_test_fps || ch.last_test_bitrate_kbps || ch.last_test_audio_codec);
   if (!hasData) {
     box.innerHTML = '<span class="guide-tech tip-plain" data-tip="' + escTipAttr(
@@ -2718,9 +2716,10 @@ function applyHealthFilter() {
       if (old) old.remove();
     }
 
-    if (ch.last_test_status === 'FAILED') {
+    if (ch.last_test_status === statusVocab('TEST_STATUS').FAILED) {
+      const RS = statusVocab('REC_STATUS');
       const hasActiveRec = (ch.recordings || []).some(r =>
-        r.status === 'SCHEDULED' || r.status === 'IN_PROGRESS' || r.status === 'RETRYING');
+        r.status === RS.SCHEDULED || r.status === RS.IN_PROGRESS || r.status === RS.RETRYING);
       const cls = hasActiveRec ? 'channel-health-warn' : 'channel-health-failed';
       [sidebarRow, progRow].forEach(el => {
         if (el) el.classList.add(cls);

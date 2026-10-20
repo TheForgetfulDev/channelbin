@@ -67,6 +67,21 @@ class RetiredAlertTypesTests(unittest.TestCase):
             'genuinely needs an alert now, take it out of RETIRED_ALERT_TYPES deliberately '
             'and say why in a changelog. Offenders: ' + '; '.join(offenders))
 
+    def test_the_scan_still_finds_the_live_raise_sites(self):
+        """A walker that matched nothing would pass the test above trivially. Pin the
+        literal raise sites it finds today, and that each names a type that exists - a
+        raise of an unknown type is its own defect (dev/changelog/1246)."""
+        found = []
+        for path in sorted(_APP_DIR.rglob('*.py')):
+            tree = ast.parse(path.read_text(encoding='utf-8'), filename=str(path))
+            found.extend(t for t, _lineno in _raised_alert_types(tree))
+        self.assertGreaterEqual(len(found), 20,
+                                f'the scan found only {len(found)} literal raise sites in '
+                                'app/; it saw 30 when written')
+        self.assertIn('SEARCH_INDEX_REBUILD_FAILED', found)
+        unknown = sorted(set(found) - set(ALERT_TYPES))
+        self.assertEqual([], unknown, f'raised types ALERT_TYPES does not know: {unknown}')
+
     def test_every_retired_type_keeps_its_label(self):
         """Rows already in the database still render, so the entry stays in ALERT_TYPES."""
         missing = sorted(RETIRED_ALERT_TYPES - set(ALERT_TYPES))

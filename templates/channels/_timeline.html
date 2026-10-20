@@ -96,7 +96,7 @@
       {% elif entry.kind == 'recording' %}
         <span>Recording</span>
         <a href="{{ url_for('recordings.recording_detail', recording_id=entry.obj.id) }}">{{ entry.obj.name }}</a>
-        {{ tm.status_badge(entry.obj.status | rec_status_badge, entry.obj.status | rec_status_label) }}
+        {{ tm.status_badge(entry.obj.status | rec_status_badge, entry.obj.status | rec_status_label(entry.obj.postprocess_waiting_since)) }}
         {% if entry.obj.health_quality_score is not none %}
         <span class="text-muted small">score {{ entry.obj.health_quality_score }}</span>
         {% endif %}

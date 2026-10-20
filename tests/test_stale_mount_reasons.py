@@ -153,7 +153,8 @@ class EnsureDirTests(unittest.TestCase):
 
 
 class MoveDestinationReasonTests(unittest.TestCase):
-    """The FILE_MOVED event names the dead mount, not a phantom filename collision."""
+    """The FILE_MOVE_FAILED event names the dead mount, not a phantom filename collision
+    (its own type since dev/changelog/1247; a successful move is FILE_MOVED)."""
 
     def setUp(self):
         self.t = make_test_app()
@@ -186,12 +187,18 @@ class MoveDestinationReasonTests(unittest.TestCase):
         with mock.patch('os.stat', _raise_for(stale_paths)(os.stat)):
             do_postprocess(self.t.app, rid, self.ts_path)
         db.session.expire_all()
-        return rid, [e.detail for e in RecordingEvent.query.filter_by(
-            recording_id=rid, event_type='FILE_MOVED').all()]
+        return rid, [e.detail for e in RecordingEvent.query.filter(
+            RecordingEvent.recording_id == rid,
+            RecordingEvent.event_type.in_(('FILE_MOVED', 'FILE_MOVE_FAILED'))).all()]
+
+    def _failed_moves(self, rid):
+        return RecordingEvent.query.filter_by(recording_id=rid,
+                                              event_type='FILE_MOVE_FAILED').count()
 
     def test_a_stale_destination_is_named_as_unreachable(self):
-        _rid, details = self._run_move({self.dest})
-        self.assertEqual(1, len(details), f'expected one FILE_MOVED event, got {details}')
+        rid, details = self._run_move({self.dest})
+        self.assertEqual(1, len(details), f'expected one move event, got {details}')
+        self.assertEqual(1, self._failed_moves(rid), 'a move that failed carries its own type')
         self.assertIn('not reachable', details[0])
 
     def test_the_event_does_not_report_a_filename_collision(self):
@@ -205,10 +212,10 @@ class MoveDestinationReasonTests(unittest.TestCase):
                       'the event must still say where the recording actually is')
 
     def test_a_healthy_destination_still_moves(self):
-        _rid, details = self._run_move(set())
+        rid, details = self._run_move(set())
         self.assertTrue(os.path.exists(os.path.join(self.dest, 'show.ts')),
                         f'move did not happen: {details}')
-        self.assertNotIn('FAILED', details[0])
+        self.assertEqual(0, self._failed_moves(rid))
 
 
 class DiskReadoutTests(unittest.TestCase):

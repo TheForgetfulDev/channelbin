@@ -25,6 +25,10 @@
      raw enum needs the server's own table or it invents a second one. The TV Guide had
      invented one, and it called two post-capture phases "Recorded" (dev/changelog/1083). #}
   <meta name="rec-status-labels" content="{{ rec_status_vocab | tojson | forceescape }}">
+  {# The status vocabularies (app/database.py::status_vocabularies), served the same way,
+     so a script keys on statusVocab('ACCOUNT_STATUS').SYNCING rather than on a literal of
+     its own - a re-typed status literal matches nothing, forever, without erroring. #}
+  <meta name="status-vocab" content="{{ status_vocab | tojson | forceescape }}">
   <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
   <script src="{{ url_for('static', filename='js/util.js') }}"></script>
   <link rel="apple-touch-icon" sizes="180x180" href="{{ url_for('static', filename='img/logo/channelbin-favicon/apple-touch-icon.png') }}">

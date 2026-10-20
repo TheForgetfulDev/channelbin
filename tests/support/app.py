@@ -440,6 +440,16 @@ def reset_module_globals():
     # is keyed on a recording id that only exists in the previous module's temp DB, and the
     # next module's same-id row would render a join percentage for work that never ran.
     concatenator._concat_progress.clear()
+    # The live-chain claim is a test-and-set on a recording id, not a handle on a thread
+    # or a child: clearing it orphans nothing (the children are _active_join_procs and
+    # postprocessor._active_conversions, which cleanup() has already killed), and a chain
+    # still winding down releases with a pop that tolerates the entry being gone. It
+    # stayed on the allowlist while only the worker thread took the claim and released it
+    # in its own finally; since the Retry-conversion route takes it in the request and
+    # hands it to the worker (dev/changelog/1242), a test that mocks the worker leaves the
+    # claim held, and the next module's same-id recording is then refused its join as
+    # "already in progress".
+    concatenator._active_concats.clear()
     # Same reasoning as its _concat_progress sibling above, and the same contrast with the
     # _active_conversions entry on the allowlist: this one tracks no child process, so
     # clearing it orphans nothing. A leftover entry is keyed on a recording id that only
@@ -554,7 +564,8 @@ def _assert_engines_are_sandboxed(app, wanted_path):
 class TestApp:
     """A live test app + client bound to a temp DB and temp dirs. Call cleanup() when done."""
 
-    def __init__(self, extra_overrides=None, start_scheduler=False, fresh_schema=False):
+    def __init__(self, extra_overrides=None, start_scheduler=False, fresh_schema=False,
+                 csrf=True):
         reset_module_globals()
         self._tmpdir = tempfile.mkdtemp(prefix='dvr_test_')
         self.db_path = os.path.join(self._tmpdir, 'dvr.db')
@@ -667,6 +678,11 @@ class TestApp:
                 raise
 
         self.app = create_app(config_overrides=overrides, start_scheduler=start_scheduler)
+        if not csrf:
+            # The one spelling of "this file is about the route body, not the token"; a
+            # test that exercises the protection itself keeps the default and reads the
+            # token through tests/support/csrf.py::csrf_token().
+            self.app.config['WTF_CSRF_ENABLED'] = False
         _assert_engines_are_sandboxed(self.app, overrides['database']['path'])
         _assert_db_backup_dir_is_sandboxed(overrides, self._tmpdir)
         self._started_scheduler = start_scheduler
@@ -892,7 +908,7 @@ class TestApp:
                 f'{[t.name for t in threading.enumerate() if t.name.startswith("ThreadPoolExecutor-")]})')
 
 
-def make_test_app(extra_overrides=None, start_scheduler=False, fresh_schema=False):
+def make_test_app(extra_overrides=None, start_scheduler=False, fresh_schema=False, csrf=True):
     """Build and return a TestApp (temp DB, scheduler off, dirs/log redirected).
 
     extra_overrides: nested dict deep-merged on top of the built-in test overrides
@@ -902,6 +918,10 @@ def make_test_app(extra_overrides=None, start_scheduler=False, fresh_schema=Fals
     fresh_schema: build the schema with db.create_all() instead of copying the process
         template (_template_db_path). Only for tests asserting on the from-scratch path
         itself - it costs ~110ms more, and every other test observes the same DB either way.
+    csrf: False turns the app-wide CSRF check off, for a route test that is about the
+        route body rather than the token. On by default so route tests exercise production
+        behavior unless they opt out; a test that posts WITH the token reads it through
+        tests/support/csrf.py::csrf_token().
     """
     return TestApp(extra_overrides=extra_overrides, start_scheduler=start_scheduler,
-                   fresh_schema=fresh_schema)
+                   fresh_schema=fresh_schema, csrf=csrf)

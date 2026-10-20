@@ -28,8 +28,7 @@ from app import db  # noqa: E402
 
 class XtreamDebugGateTests(unittest.TestCase):
     def setUp(self):
-        self.t = make_test_app()
-        self.t.app.config['WTF_CSRF_ENABLED'] = False
+        self.t = make_test_app(csrf=False)
         self.acc = seed.make_account()   # an M3U account - never an xtream account
         db.session.commit()
         import app.routes.accounts as acct
@@ -76,8 +75,7 @@ class XtreamDebugPerAccountOverrideTests(unittest.TestCase):
     Xtream account or triggering any actual dump/sync work."""
 
     def setUp(self):
-        self.t = make_test_app()
-        self.t.app.config['WTF_CSRF_ENABLED'] = False
+        self.t = make_test_app(csrf=False)
         self.acc = seed.make_account(name='Under vetting')
         db.session.commit()
         import app.routes.accounts as acct

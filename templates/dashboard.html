@@ -146,15 +146,19 @@
             three stat cells below, so the column header's meaning always matches the
             column's content for THIS row - dashboard.js keeps them fresh as SSE ticks
             update the visible cells. -#}
-        <div class="drow{% if rec.status != 'SCHEDULED' %} has-bar{% endif %} {{ rec_status_class.get(rec.status, 'st-abort') }}"
+        <div class="drow{% if rec.status != REC_STATUS.SCHEDULED %} has-bar{% endif %} {{ rec_status_class.get(rec.status, 'st-abort') }}"
              id="card-{{ rec.id }}" data-id="{{ rec.id }}" data-status="{{ rec.status }}"
              data-waiting="{{ '1' if rec.id in rec_waiting_ids else '' }}"
              data-name="{{ rec.name | lower }}"
              data-href="{{ url_for('recordings.recording_detail', recording_id=rec.id) }}"
-             {%- if rec.status == 'SCHEDULED' %}
+             {%- if rec.status == REC_STATUS.SCHEDULED %}
              data-starts="{{ (rec.start_time - now).total_seconds() }}"
              data-duration="{{ rec.duration_seconds or 0 }}"
-             {%- elif rec.status == 'CONVERTING' %}
+             {%- elif rec.status in (REC_STATUS.CONCATENATING, REC_STATUS.ANALYZING) %}
+             {#- A post-capture row sorts on no elapsed or remaining: its cells show the
+                 phase's progress, which is not a clock (dev/changelog/1247). -#}
+             data-elapsed="" data-remaining="" data-recorded="{{ postcapture_cells[rec.id][2][1] if rec.id in postcapture_cells else '' }}"
+             {%- elif rec.status == REC_STATUS.CONVERTING %}
              data-elapsed="{{ rec.conversion_progress_pct if rec.conversion_progress_pct is not none else '' }}"
              {# A parked row sorts on no remaining, because it renders none: the stored
                 ETA stopped being true the moment the encoder was stopped, and sorting a
@@ -164,7 +168,7 @@
              {%- else %}
              data-elapsed="{{ st[0] if st else '' }}" data-remaining="{{ st[1] if st else '' }}" data-recorded="{{ st[2] if st else '' }}"
              {%- endif %}
-             style="--pct:{{ (rec.conversion_progress_pct or 0) | round(1) if rec.status == 'CONVERTING' else 0 }}%">
+             style="--pct:{{ (rec.conversion_progress_pct or 0) | round(1) if rec.status == REC_STATUS.CONVERTING else 0 }}%">
           <span class="d-title">
             <span class="d-name">{{ rec.name }}</span>
             <span class="d-meta">
@@ -183,18 +187,18 @@
               what changed is that a row has room for three of them, so the rest
               (stalls, failures, downtime, segments) moved into the tap/hover detail.
               dashboard.js's SSE handlers write these ids. -#}
-          {% if rec.status == 'SCHEDULED' and rec.start_deferred_since %}
+          {% if rec.status == REC_STATUS.SCHEDULED and rec.start_deferred_since %}
             {#- A held start: the middle cell names what it is waiting for instead of the
                 duration, the way a parked conversion's does. "Overdue by N min" alone says
                 the start is late but not why (dev/changelog/1141). -#}
             <span class="d-cell"><span class="d-k">Starts</span>{{ rec.start_time | time_until }}</span>
             <span class="d-cell" data-tip="Start held since {{ rec.start_deferred_since | local_time_sec }}.&#10;Starts by itself once that clears, if its window is still open."><span class="d-k">Waiting for</span>{{ rec.start_deferred_for or '-' }}</span>
             <span class="d-cell"><span class="d-k">Start time</span>{{ rec.start_time | local_time }}</span>
-          {% elif rec.status == 'SCHEDULED' %}
+          {% elif rec.status == REC_STATUS.SCHEDULED %}
             <span class="d-cell"><span class="d-k">Starts</span>{{ rec.start_time | time_until }}</span>
             <span class="d-cell"><span class="d-k">Duration</span>{{ rec.duration_seconds | duration }}</span>
             <span class="d-cell"><span class="d-k">Start time</span>{{ rec.start_time | local_time }}</span>
-          {% elif rec.status == 'CONVERTING' and rec.id in rec_waiting_ids %}
+          {% elif rec.status == REC_STATUS.CONVERTING and rec.id in rec_waiting_ids %}
             {#- Parked: the encoder is stopped, so the middle cell names what it is stopped
                 FOR instead of counting down. A stored ETA stops being true the instant the
                 process is SIGSTOPped, and a stopped clock is the thing that misleads - the
@@ -206,13 +210,24 @@
             <span class="d-cell"><span class="d-k">Paused at</span><span id="conv-pct-{{ rec.id }}">{% if rec.conversion_progress_pct is not none %}{{ rec.conversion_progress_pct | round(0) | int }}%{% else %}-{% endif %}</span></span>
             <span class="d-cell" data-tip="Waiting for &quot;{{ rec.postprocess_waiting_on_name }}&quot; to finish.&#10;Conversion resumes by itself once no recordings are active."><span class="d-k">Waiting on</span>{{ rec.postprocess_waiting_on_name or 'another recording' }}</span>
             <span class="d-cell"><span class="d-k">Written</span><span id="conv-bytes-{{ rec.id }}">{{ (rec.conversion_out_size | filesize) if rec.conversion_out_size else '-' }}</span></span>
-          {% elif rec.status == 'CONVERTING' %}
+          {% elif rec.status == REC_STATUS.CONVERTING %}
             <span class="d-cell"><span class="d-k">Complete</span><span id="conv-pct-{{ rec.id }}">{% if rec.conversion_progress_pct is not none %}{{ rec.conversion_progress_pct | round(0) | int }}%{% else %}-{% endif %}</span></span>
             <span class="d-cell"><span class="d-k">Time left</span><span id="conv-eta-{{ rec.id }}">{% if rec.conversion_eta_seconds is not none %}~{{ (rec.conversion_eta_seconds // 60) }} min{% else %}estimating...{% endif %}</span></span>
             <span class="d-cell"><span class="d-k">Written</span><span id="conv-bytes-{{ rec.id }}">{{ (rec.conversion_out_size | filesize) if rec.conversion_out_size else '-' }}</span></span>
+          {% elif rec.id in postcapture_cells %}
+            {#- JOINING and ANALYZING: the phase's own numbers, from the same progress
+                registries the Recordings list reads. These rows are past their stop time,
+                so Elapsed/Remaining would show capture-era numbers under labels that read
+                as current (dev/changelog/1247). No elapsed-/remaining- ids on purpose, which
+                is what keeps dashboard.js's capture-row handlers out of these cells. -#}
+            {% for key, value, tip in postcapture_cells[rec.id] %}
+            <span class="d-cell{% if tip %} tip-plain" data-tip="{{ tip }}{% endif %}"><span class="d-k">{{ key }}</span>{{ (value | filesize) if key == 'Captured' else value }}</span>
+            {% endfor %}
           {% else %}
-            <span class="d-cell"><span class="d-k">Elapsed</span><span id="elapsed-{{ rec.id }}">{{ st[0] | duration(true) if st else '-' }}</span></span>
-            <span class="d-cell"><span class="d-k">Remaining</span><span id="remaining-{{ rec.id }}">{{ st[1] | duration(true) if st else '-' }}</span></span>
+            {#- Capturing, paused or retrying: the window is open, so these clocks are
+                current. Each says which clock it is (dev/changelog/1247). -#}
+            <span class="d-cell tip-plain" data-tip="Since the capture started{% if rec.status != REC_STATUS.IN_PROGRESS %}, including the time it has been {{ 'paused' if rec.status == REC_STATUS.PAUSED else 'waiting to retry' }}{% endif %}."><span class="d-k">Elapsed</span><span id="elapsed-{{ rec.id }}">{{ st[0] | duration(true) if st else '-' }}</span></span>
+            <span class="d-cell tip-plain" data-tip="Until the scheduled stop time."><span class="d-k">Remaining</span><span id="remaining-{{ rec.id }}">{{ st[1] | duration(true) if st else '-' }}</span></span>
             {#- Stalls has no column of its own on a row, so its warning is carried
                 by the byte count it explains. Nothing else re-colors a row cell. -#}
             <span class="d-cell{% if rec.total_stall_count > 5 %} warn{% endif %}" id="bytes-cell-{{ rec.id }}">
