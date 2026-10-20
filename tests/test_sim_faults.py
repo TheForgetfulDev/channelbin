@@ -29,7 +29,7 @@ from sim.faults import (ASSUMED, CATALOG, MEASURED, OBSERVED, REPRODUCED, SYNC_K
                         Ask, FaultBook, FaultError, check_catalog, make_fault)
 from sim.provider import Layout, Provider  # noqa: E402
 from sim.server import THREAD_PREFIX  # noqa: E402
-from tests.support.sim_sync import FAULT_WORLD  # noqa: E402
+from tests.support.sim_sync import FAULT_WORLD, names_a_cut_chunk  # noqa: E402
 
 TESTS = pathlib.Path(__file__).resolve().parent
 AT = dt.datetime(2026, 10, 17, 12, 0)
@@ -225,7 +225,7 @@ class OverHttpTests(unittest.TestCase):
         self.sim.inject('truncated_chunked', 'north-tv', endpoints=['guide'])
         with self.assertRaises(requests.exceptions.ChunkedEncodingError) as cm:
             requests.get(self.acct.epg_url, timeout=10)
-        self.assertIn("InvalidChunkLength(got length b'', 0 bytes read)", str(cm.exception))
+        self.assertTrue(names_a_cut_chunk(str(cm.exception)), str(cm.exception))
 
     def test_gzip_on_the_wire_is_decoded_by_the_client(self):
         plain = requests.get(self.acct.epg_url, timeout=10)

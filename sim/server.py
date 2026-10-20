@@ -207,8 +207,9 @@ class _Handler(BaseHTTPRequestHandler):
             self.wfile.write(b'%x\r\n%s\r\n' % (len(piece), piece))
             self._sent += len(piece)
         # Nothing follows: the connection closes where the next chunk's length line should
-        # be, so the client reads an empty length - what urllib3 reports as
-        # InvalidChunkLength(got length b'', 0 bytes read).
+        # be, so the client reads an empty length - what urllib3 2.0.7 reports as
+        # InvalidChunkLength(got length b'', 0 bytes read) and 2.8.0 as "Response ended
+        # prematurely".
 
     def _write_drip(self, body: bytes, chunk: int, gap: float, stopping: threading.Event):
         for i in range(0, len(body), chunk):

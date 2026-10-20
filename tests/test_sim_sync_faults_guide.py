@@ -20,7 +20,7 @@ from app import db  # noqa: E402
 from app.config import load_config  # noqa: E402
 from app.database import Channel, EPGEntry, XtreamAccount  # noqa: E402
 from app.logo_cache import _fetch_one_logo  # noqa: E402
-from tests.support.sim_sync import FAULT_WORLD, SimSyncCase  # noqa: E402
+from tests.support.sim_sync import FAULT_WORLD, SimSyncCase, names_a_cut_chunk  # noqa: E402
 
 
 class _GuideCase(SimSyncCase):
@@ -57,7 +57,7 @@ class GuideFetchFaultTests(_GuideCase):
         log = self.sync(aid)
         self.assertEqual(log.status, 'PARTIAL')
         self.assertIn('fetch failed', log.error_message)
-        self.assertIn('InvalidChunkLength', log.error_message)
+        self.assertTrue(names_a_cut_chunk(log.error_message), log.error_message)
         self.assertEqual(self.account(aid).status, 'OK')
         alert = self.assertAlert('EPG_SOURCE_FETCH_FAILED', f'epg-source:{sid}:fetch')
         self.assertIn('previous listings were kept', alert.body)

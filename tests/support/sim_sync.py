@@ -23,6 +23,19 @@ from sim import load_world, serve_for_test
 
 from .app import make_test_app
 
+# How requests words a chunked body cut off where the next chunk's length line should be -
+# the simulator's `truncated_chunked`, and sync_log 122's real fetch (dev/docs/BUGS.md
+# 2026-07-21 10:20 AM). The wire is the same; the wording is urllib3's and changed between
+# versions: 2.0.7 says the first, 2.8.0 (what an unpinned install gets, CI and the image
+# included) says the second. A test asserts the cut was reported, never one library's words.
+CUT_CHUNK_TEXTS = ("InvalidChunkLength(got length b'', 0 bytes read)",
+                   'Response ended prematurely')
+
+
+def names_a_cut_chunk(text: str) -> bool:
+    return any(t in (text or '') for t in CUT_CHUNK_TEXTS)
+
+
 # One provider on two Xtream panels - the second carries CUID, declares no stream origin and
 # serves its streams from its own API host, a third of them spelled /live/ - and a plain M3U
 # provider. Small enough that a sync costs little; big enough that a mass URL change crosses

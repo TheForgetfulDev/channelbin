@@ -20,7 +20,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from app.database import CHANNEL_URL_CHANGED, ChannelEvent  # noqa: E402
 from sim.faults import FaultRow  # noqa: E402
 from sim.lineup import TRIPLET_KINDS  # noqa: E402
-from tests.support.sim_sync import FAULT_WORLD, SimSyncCase  # noqa: E402
+from tests.support.sim_sync import FAULT_WORLD, SimSyncCase, names_a_cut_chunk  # noqa: E402
 
 
 def _stream_ids(view):
@@ -360,7 +360,7 @@ class PlaylistFaultTests(SimSyncCase):
         self.sim.inject('truncated_chunked', 'vale-m3u', endpoints=['playlist'])
         log = self.sync(aid)
         self.assertEqual(log.status, 'ERROR')
-        self.assertIn('InvalidChunkLength', log.error_message)
+        self.assertTrue(names_a_cut_chunk(log.error_message), log.error_message)
         self.assertEqual(self.channels(aid), [])
 
     def test_a_slow_playlist_inside_the_timeout_is_read_in_full(self):
