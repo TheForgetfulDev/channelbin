@@ -11,7 +11,7 @@ worker processes, dev/changelog/583): five tests failed that pass serially and p
 `job.status == 'RUNNING'` where it expects `'SCHEDULED'`; `app/search_index.py::_rebuilding`
 left True makes the dashboard's background-activity indicator read `'active'` where
 `test_dashboard_activity_search_index` and `test_failure_observability` expect `'hidden'`
-(dev/docs/BUGS.md 2026-08-11 06:22 PM).
+(dev/docs/BUGS.md 2026-08-11 07:40 PM).
 
 Two halves, and the second is the one that lasts:
 
@@ -61,7 +61,7 @@ RESET = {
     'app/channel_search.py': {'_tag_channel_ids_cache', '_standing_breakdown_cache',
                               '_now_tag_channel_ids_cache'},
     'app/channel_tester.py': {'_state', '_eta_smoother', '_eta_last_sample'},
-    'app/concatenator.py': {'_concat_progress'},
+    'app/concatenator.py': {'_concat_progress', '_active_concats'},
     'app/connection_limits.py': {'_seat_of'},
     'app/config.py': {'_restart_needed'},
     'app/fs_utils.py': {'_last_logged_outcome'},
@@ -83,7 +83,6 @@ ALLOWED = {
     ('app/accounts.py', '_source_locks'): 'clearing would let a second refresh start against an EPG source already refreshing',
     ('app/accounts.py', '_sync_progress'): 'popped by the sync thread itself (accounts.py finally block), keyed to its lifetime',
     ('app/accounts.py', '_sync_cancel_reasons'): 'read by the sync thread after cancellation; clearing loses the reason the UI reports',
-    ('app/concatenator.py', '_active_concats'): 'each concat chain releases its own claim in its finally; clearing would let a second concat start against a recording already being concatenated',
     ('app/concatenator.py', '_active_join_procs'): 'live ffmpeg children, same as postprocessor._active_conversions; the join unregisters its own in its finally and kill_active_joins() is what knows how to tear one down',
     ('app/config.py', '_yaml_cache'): 'self-invalidating - keyed on the parsed path plus its stat, and ConfigSandbox drops it on both edges',
     ('app/events.py', '_subscribers'): 'each SSE generator removes its own queue on disconnect; clearing strands a live stream',

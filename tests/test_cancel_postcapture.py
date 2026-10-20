@@ -47,8 +47,7 @@ class CancelRoutingByStatusTests(unittest.TestCase):
     """Every post-capture status is named explicitly; none falls into a generic abort."""
 
     def setUp(self):
-        self.t = make_test_app()
-        self.t.app.config['WTF_CSRF_ENABLED'] = False
+        self.t = make_test_app(csrf=False)
         self.acc = seed.make_account()
         self.ch = seed.make_channel(self.acc, stream_id=1, name='Ch')
         db.session.commit()
@@ -67,7 +66,7 @@ class CancelRoutingByStatusTests(unittest.TestCase):
              mock.patch('app.routes.recordings.abort_recording') as abort:
             resp = self.t.client.post(f'/recordings/{rid}/cancel-json')
         self.assertEqual(resp.status_code, 200, resp.get_data(as_text=True))
-        req.assert_called_once_with(rid)
+        req.assert_called_once_with(rid, chain_active=False)
         self.assertFalse(abort.called,
                          'a CONVERTING cancel reached abort_recording, which cannot stop ffmpeg')
 

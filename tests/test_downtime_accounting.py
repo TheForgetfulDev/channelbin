@@ -19,9 +19,9 @@ No network and no provider host: every child here is `sys.executable -c ...`, a 
 with no URL in it, which tests/support/netguard.py permits. Segment files are written under
 make_test_app's temp dir, never /dvr.
 """
-import json
 import os
 import sys
+import threading
 import time
 import unittest
 from datetime import datetime, timedelta
@@ -33,87 +33,15 @@ import app.config as cfgmod  # noqa: E402
 import app.recorder as recorder  # noqa: E402
 from app import db  # noqa: E402
 from app.database import (  # noqa: E402
-    RESTART_FAILED, RESTART_SUCCEEDED, STALL_DETECTED, Recording, RecordingEvent,
-    RecordingSegment,
+    RESTART_FAILED, RESTART_SUCCEEDED, Recording, RecordingSegment,
 )
 from app.watchdog import WatchdogThread  # noqa: E402
 from tests.support import seed  # noqa: E402
 from tests.support.app import make_test_app  # noqa: E402
-# One recording, one open segment, one real WatchdogThread under our own config - the
-# same rig dev/changelog/431 built for the process-exit work. Subclassed rather than
-# copied; it holds no assertions of its own.
-from tests.test_watchdog_process_exit import _WatchdogHarness, _sleeper  # noqa: E402
+from tests.support.watchdog import RestartHarness, sleeper  # noqa: E402
 
 
-class _RestartHarness(_WatchdogHarness):
-    """Adds the half the process-exit rig deliberately skipped: a _launch_segment stub
-    that really produces (or fails to produce) a next segment, so the restart delay and
-    the reconnect wait actually elapse and can be measured."""
-
-    def _stub_launch_next(self, *, produces_data):
-        """Stand-in for _launch_segment that creates the next segment row, optionally
-        writes a byte to it, and leaves stop_event alone so the restart resolves normally.
-        A non-producing restart is handed an already-dead process, which is what makes
-        wait_for_file_data give up at once instead of burning the stall timeout.
-
-        Returns LAUNCH_SPAWNED, the real function's answer when a child is running - the
-        watchdog's restart branch skips all of its own accounting for any other value
-        (dev/changelog/984), which is the whole scenario this harness exists to drive."""
-        def _stub(app, recording_id, seg_num):
-            self.launched.append(seg_num)
-            path = os.path.join(self.t._tmpdir, f'rec_{self.rid}_seg_{seg_num:03d}.ts')
-            if produces_data:
-                with open(path, 'wb') as fh:
-                    fh.write(b'\x47' * 1024)
-                self.state.process = _sleeper()
-            else:
-                open(path, 'wb').close()
-            db.session.add(RecordingSegment(recording_id=recording_id,
-                                            segment_number=seg_num, file_path=path,
-                                            started_at=datetime.utcnow()))
-            db.session.commit()
-            self.state.current_segment_num = seg_num
-            return recorder.LAUNCH_SPAWNED
-        return _stub
-
-    def _run_until_event(self, event_type, *, stall_timeout, restart_delay,
-                         produces_data, timeout=60):
-        """Start the real thread and stop it once the restart has resolved."""
-        with mock.patch.object(cfgmod, 'load_config',
-                               return_value=self._cfg(stall_timeout, restart_delay)), \
-             mock.patch.object(recorder, '_launch_segment',
-                               self._stub_launch_next(produces_data=produces_data)):
-            self.wd = WatchdogThread(self.rid, self.state, self.t.app)
-            self.wd.start()
-            deadline = time.monotonic() + timeout
-            seen = False
-            while time.monotonic() < deadline:
-                db.session.expire_all()
-                seen = bool(RecordingEvent.query.filter_by(
-                    recording_id=self.rid, event_type=event_type).first())
-                if seen:
-                    break
-                time.sleep(0.2)
-            self.state.stop_event.set()
-            self.wd.join(timeout=15)
-        self.assertTrue(seen, f'no {event_type} event within {timeout}s')
-        db.session.expire_all()
-        return db.session.get(Recording, self.rid)
-
-    def _stall_seconds(self):
-        """The FIRST stall's detection window, as the event recorded it - the same number
-        the counter is supposed to have banked for it. Deliberately not the latest: a
-        restart that produces nothing leaves a dead process on an empty segment, so the
-        watchdog immediately declares a second, near-zero PROCESS_EXITED stall, and
-        anchoring on that one would compare the total against a window of 0.0 and pass
-        against anything."""
-        evt = (RecordingEvent.query
-               .filter_by(recording_id=self.rid, event_type=STALL_DETECTED)
-               .order_by(RecordingEvent.id.asc()).first())
-        return json.loads(evt.extra_data)['stall_duration']
-
-
-class DowntimeCountsTheWholeGapTests(_RestartHarness):
+class DowntimeCountsTheWholeGapTests(RestartHarness):
 
     # The canonical growth-stall run, kept for the whole class. See _growth_stall_run.
     _growth_run = None
@@ -131,7 +59,7 @@ class DowntimeCountsTheWholeGapTests(_RestartHarness):
         many assertions on it. Do not inline it back into the tests.
         """
         if DowntimeCountsTheWholeGapTests._growth_run is None:
-            self.state.process = _sleeper()
+            self.state.process = sleeper()
             rec = self._run_until_event(RESTART_SUCCEEDED, stall_timeout=3,
                                         restart_delay=2, produces_data=True)
             DowntimeCountsTheWholeGapTests._growth_run = {
@@ -165,7 +93,7 @@ class DowntimeCountsTheWholeGapTests(_RestartHarness):
     def test_a_restart_that_produced_no_data_still_counts_its_gap(self):
         """Dropping it would make the worst captures - the ones whose restarts never come
         back - look like the cleanest ones."""
-        self.state.process = _sleeper()
+        self.state.process = sleeper()
         rec = self._run_until_event(RESTART_FAILED, stall_timeout=3, restart_delay=2,
                                     produces_data=False)
 
@@ -323,6 +251,88 @@ class CaptureGapAndContentTests(unittest.TestCase):
         self.assertEqual(rec.scheduled_duration_seconds, 3600.0)
         self.assertEqual(rec.duration_seconds, 1800.0)
         self.assertAlmostEqual(rec.capture_gap_seconds, 0.0, delta=1)
+
+
+class FailoverBanksTheReconnectWaitTests(RestartHarness):
+    """BUGS.md 2026-10-20 - total_downtime_seconds skips the reconnect wait on every
+    failover branch.
+
+    The same-member restart measures the gap from the stall to the replacement's first
+    byte inline. The five branches that fail over instead launched the next member's
+    segment and handed off to the outer loop at once, banking nothing for the wait until
+    that segment wrote its first byte - so a group recording under-reported downtime by
+    one reconnect per move (dev/changelog/1242).
+    """
+
+    FIRST_BYTE_AFTER = 3.0
+
+    def setUp(self):
+        super().setUp()
+        self._spawned = []
+        self._timers = []
+
+    def tearDown(self):
+        for t in self._timers:
+            t.cancel()
+        for proc in self._spawned:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=10)
+        super().tearDown()
+
+    def _cfg(self, stall_timeout, restart_delay=0):
+        # The first stall hits the ceiling, so the watchdog takes the max-consecutive-
+        # failures branch - a failover, with the move itself stubbed to succeed.
+        return cfgmod._deep_merge(super()._cfg(stall_timeout, restart_delay),
+                                  {'watchdog': {'max_consecutive_failures': 1}})
+
+    def _stub_launch_slow_first_byte(self):
+        """The next member's segment: live child, empty file, first byte after a delay."""
+        def _stub(app, recording_id, seg_num):
+            self.launched.append(seg_num)
+            path = os.path.join(self.t._tmpdir, f'rec_{self.rid}_seg_{seg_num:03d}.ts')
+            open(path, 'wb').close()
+            db.session.add(RecordingSegment(recording_id=recording_id,
+                                            segment_number=seg_num, file_path=path,
+                                            started_at=datetime.utcnow()))
+            db.session.commit()
+            proc = sleeper()
+            self._spawned.append(proc)
+            self.state.process = proc
+            self.state.current_segment_num = seg_num
+
+            def _first_byte():
+                with open(path, 'ab') as fh:
+                    fh.write(b'\x47' * 188)
+            timer = threading.Timer(self.FIRST_BYTE_AFTER, _first_byte)
+            self._timers.append(timer)
+            timer.start()
+            return recorder.LAUNCH_SPAWNED
+        return _stub
+
+    def test_the_wait_for_the_new_member_s_first_byte_is_downtime(self):
+        self._exited_capture()
+        with mock.patch.object(cfgmod, 'load_config', return_value=self._cfg(30)), \
+             mock.patch.object(recorder, 'failover_group_member', return_value=True), \
+             mock.patch.object(recorder, '_launch_segment',
+                               self._stub_launch_slow_first_byte()):
+            self.wd = WatchdogThread(self.rid, self.state, self.t.app)
+            self.wd.start()
+            deadline = time.monotonic() + 25
+            downtime = 0.0
+            while time.monotonic() < deadline:
+                db.session.expire_all()
+                downtime = db.session.get(Recording, self.rid).total_downtime_seconds or 0.0
+                if downtime >= self.FIRST_BYTE_AFTER - 0.5:
+                    break
+                time.sleep(0.2)
+            self.state.stop_event.set()
+            self.wd.join(timeout=15)
+        self.assertEqual(self.launched, [1], 'the failover did not launch the next member')
+        self.assertGreaterEqual(
+            downtime, self.FIRST_BYTE_AFTER - 0.5,
+            f'a failover whose new member took {self.FIRST_BYTE_AFTER}s to write its first '
+            f'byte banked {downtime:.1f}s of downtime')
 
 
 if __name__ == '__main__':

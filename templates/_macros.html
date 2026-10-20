@@ -43,13 +43,13 @@
      radio after mount. schedule-fields.js::prefill() only moves it when the caller
      states a use_window of its own, so a cloned or edited schedule still wins. #}
   <div class="form-group" style="margin:0 0 0.5rem;">
-    <label style="font-size:12px; display:flex; align-items:center; gap:6px; cursor:pointer; width:fit-content;">
+    <label style="font-size:var(--fs-sm); display:flex; align-items:center; gap:6px; cursor:pointer; width:fit-content;">
       <input type="checkbox" id="{{ prefix }}-recurring-cb"> Recurring
     </label>
   </div>
   <div id="{{ prefix }}-oneoff-row" style="display:flex; gap:0.75rem; align-items:flex-end; flex-wrap:wrap; margin-bottom:0.5rem;">
     <div class="form-group" style="margin:0; flex:1; min-width:200px;">
-      <label style="font-size:12px;">{{ oneoff_label }} <span class="tz-label" data-tz-label></span></label>
+      <label style="font-size:var(--fs-sm);">{{ oneoff_label }} <span class="tz-label" data-tz-label></span></label>
       <input type="datetime-local" id="{{ prefix }}-dt" class="form-control">
     </div>
   </div>
@@ -57,11 +57,11 @@
     {% if window_label %}
     <div class="form-group" style="margin:0;">
       <label class="gd-field-lbl" style="display:block;">Run at</label>
-      <label style="font-size:12px; display:flex; align-items:center; gap:6px; cursor:pointer; margin-bottom:2px;">
+      <label style="font-size:var(--fs-sm); display:flex; align-items:center; gap:6px; cursor:pointer; margin-bottom:2px;">
         <input type="radio" name="{{ prefix }}-run-at" id="{{ prefix }}-run-window" value="window" checked>
         Maintenance window ({{ window_label }})
       </label>
-      <label style="font-size:12px; display:flex; align-items:center; gap:6px; cursor:pointer;">
+      <label style="font-size:var(--fs-sm); display:flex; align-items:center; gap:6px; cursor:pointer;">
         <input type="radio" name="{{ prefix }}-run-at" id="{{ prefix }}-run-time" value="time">
         A specific time
       </label>
@@ -69,7 +69,7 @@
     {% endif %}
     <div style="display:flex; gap:0.75rem; align-items:flex-end; flex-wrap:wrap;">
       <div class="form-group" style="margin:0; flex:1; min-width:140px;">
-        <label style="font-size:12px;">Test Day</label>
+        <label style="font-size:var(--fs-sm);">Test Day</label>
         <select id="{{ prefix }}-recur-day" class="form-control">
           <option value="0">Every day</option>
           <option value="1">Sunday</option>
@@ -82,7 +82,7 @@
         </select>
       </div>
       <div class="form-group" id="{{ prefix }}-recur-time-field" style="margin:0; flex:1; min-width:110px;">
-        <label style="font-size:12px;">Time <span class="tz-label" data-tz-label></span></label>
+        <label style="font-size:var(--fs-sm);">Time <span class="tz-label" data-tz-label></span></label>
         <input type="time" id="{{ prefix }}-recur-time" class="form-control">
       </div>
     </div>
@@ -129,14 +129,14 @@
 {# Every status is named; the trailing branch renders the raw value rather than quietly
    becoming the home for the next status anybody adds (CLAUDE.md, enumerated states). #}
 {% macro account_status_badge(status, tip=true) -%}
-  {%- if status == 'OK' %}
+  {%- if status == ACCOUNT_STATUS.OK %}
   <span class="badge b-done{% if tip %} tip-plain" data-tip="OK.&#10;The last sync finished and this account's channels and EPG are current.{% endif %}">OK</span>
-  {%- elif status == 'SYNCING' %}
+  {%- elif status == ACCOUNT_STATUS.SYNCING %}
   {# b-running, not b-live: a sync in progress is not an alarm (dev/changelog/816). #}
   <span class="badge b-running{% if tip %} tip-plain" data-tip="Syncing.&#10;A sync is running right now. The counts shown are from the previous run until it finishes.{% endif %}"><span class="pulse"></span>Syncing</span>
-  {%- elif status == 'ERROR' %}
+  {%- elif status == ACCOUNT_STATUS.ERROR %}
   <span class="badge b-fail{% if tip %} tip-plain" data-tip="Error.&#10;The last sync failed. The channels imported by the previous successful sync are still here and still record; the provider's own reason is on this account's page.{% endif %}">Error</span>
-  {%- elif status == 'UNSYNCED' %}
+  {%- elif status == ACCOUNT_STATUS.UNSYNCED %}
   <span class="badge b-abort{% if tip %} tip-plain" data-tip="Never synced.&#10;This account has been added but has never been fetched, so it has no channels yet.{% endif %}">Never synced</span>
   {%- else %}
   <span class="badge b-abort">{{ status }}</span>
@@ -149,7 +149,7 @@
    somebody adds (CLAUDE.md, "states are enumerated") - an unknown status gets the neutral
    "nothing known" edge deliberately. #}
 {% macro account_edge_class(status) -%}
-{% if status == 'OK' %}st-ok{% elif status == 'SYNCING' %}st-sync{% elif status == 'ERROR' %}st-bad{% else %}st-none{% endif %}
+{% if status == ACCOUNT_STATUS.OK %}st-ok{% elif status == ACCOUNT_STATUS.SYNCING %}st-sync{% elif status == ACCOUNT_STATUS.ERROR %}st-bad{% else %}st-none{% endif %}
 {%- endmacro %}
 
 {% macro account_type_badge(account_type, tip=true) -%}
@@ -191,7 +191,7 @@
    one hiding (dev/docs/BUGS.md 2026-09-21, dev/changelog/1063). #}
 {% macro account_next_sync(account, next_sync_at) -%}
 {%- if not account.sync_enabled %}<span class="text-faint">off</span>
-{%- elif account.status == 'SYNCING' %}<span class="text-muted">running</span>
+{%- elif account.status == ACCOUNT_STATUS.SYNCING %}<span class="text-muted">running</span>
 {%- elif next_sync_at %}{{ next_sync_at | time_until }}
 {%- else %}<span class="text-faint">-</span>{% endif -%}
 {%- endmacro %}

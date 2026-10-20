@@ -44,8 +44,7 @@ class _Case(unittest.TestCase):
     unrelated harbor-direct. Each starts with no provider and no logins."""
 
     def setUp(self):
-        self.t = make_test_app()
-        self.t.app.config['WTF_CSRF_ENABLED'] = False
+        self.t = make_test_app(csrf=False)
         self.client = self.t.app.test_client()
         self.curated = seed.make_account(name='skyline-curated', max_connections=1)
         self.direct = seed.make_account(name='skyline-direct', max_connections=1)
@@ -127,6 +126,31 @@ class ShareTests(_Case):
         self.assertEqual(links.set_account_provider(self.dir_id, other_pid), ['main'])
         self.assertEqual(self._holders(main), [self.cur_id])
 
+    def test_a_share_kept_through_a_deletion_follows_the_next_provider_change(self):
+        """dev/changelog/1243: a share lives within one provider. Deleting the provider keeps
+        it (design §3.2), and the next provider change of either account judges it again:
+        re-creating the provider with both keeps it, putting one of them on a provider the
+        other is not on drops it - the state share_login refuses to create."""
+        pid, main = self._shared_main()
+        links.delete_provider(pid)
+        self.assertEqual(self._holders(main), sorted([self.cur_id, self.dir_id]))
+        pid2 = self._provider(self.cur_id, self.dir_id, name='skyline again')
+        self.assertEqual(self._holders(main), sorted([self.cur_id, self.dir_id]),
+                         're-created together: the share stays')
+        links.delete_provider(pid2)
+        provider, dropped = links.create_provider('sky3', [self.cur_id])
+        self.assertEqual(dropped, {self.cur_id: ['main']})
+        self.assertEqual(self._holders(main), [self.dir_id])
+        # And the one-account move: direct joins harbor while curated stays off every provider.
+        links.delete_provider(provider.id)
+        pid3 = self._provider(self.cur_id, self.dir_id, name='skyline 3')
+        links.share_login(main, self.cur_id)
+        self.assertEqual(self._holders(main), sorted([self.cur_id, self.dir_id]))
+        links.delete_provider(pid3)
+        harbor = self._provider(self.oth_id, name='harbor')
+        self.assertEqual(links.set_account_provider(self.dir_id, harbor), ['main'])
+        self.assertEqual(self._holders(main), [self.cur_id])
+
     def test_unshare_needs_another_holder_and_leaves_the_row_with_it(self):
         _, main = self._shared_main()
         links.unshare_login(main, self.dir_id)
@@ -206,6 +230,34 @@ class PoolAndBlockTests(_Case):
         add_account_block(self.cur_id, datetime.utcnow() + timedelta(hours=1))
         self.assertTrue(connlim.must_yield_to_block(self.dir_id, 7))
 
+    def test_a_recording_preempts_the_siblings_preview_or_test_holding_the_shared_seat(self):
+        """dev/changelog/1243: the strip and the kill used to go by account, so a preview on
+        skyline-direct holding the one seat of the login it shares with skyline-curated was
+        never preempted for a recording on curated, which sat in the slot wait instead."""
+        from app.recorder import _try_acquire_slot_with_preemption
+        _, main = self._shared_main()
+        rec = seed.make_recording(status='IN_PROGRESS', channel_id=self.dir_ch)
+        db.session.commit()
+        self.assertTrue(connlim.try_acquire(self.dir_id, 'preview', 'p1'))
+        self.assertFalse(connlim.try_acquire(self.cur_id, 'recording', rec.id))
+        with mock.patch.object(preview, 'preempt_for_account', return_value=True) as stop_preview, \
+                mock.patch('app.channel_tester.kill_active_test_for_account') as kill_test:
+            self.assertTrue(_try_acquire_slot_with_preemption(self.t.app, rec.id, self.cur_id))
+        stop_preview.assert_called_once_with(self.dir_id)
+        kill_test.assert_not_called()
+        self.assertEqual(connlim._holders[('login', main)], [('recording', rec.id)])
+        connlim.release(self.cur_id, 'recording', rec.id)
+        self.assertTrue(connlim.try_acquire(self.dir_id, 'test', 501))
+        self.assertEqual(connlim.preempt_tests_for_slot(self.cur_id), [(501, self.dir_id)])
+        self.assertEqual(connlim._holders, {})
+
+    def test_preemption_does_not_reach_a_pool_the_recording_cannot_use(self):
+        """A test on harbor-direct's own pool is nothing to a recording on skyline-curated."""
+        self._shared_main()
+        self.assertTrue(connlim.try_acquire(self.oth_id, 'test', 777))
+        self.assertEqual(connlim.preempt_tests_for_slot(self.cur_id), [])
+        self.assertEqual(connlim._holders, {self.oth_id: [('test', 777)]})
+
 
 class PageTests(_Case):
 
@@ -230,6 +282,25 @@ class PageTests(_Case):
         self.assertIn('login: main (shared)', html)
         self.assertIn('Login "main" &middot; 1 seat, 1 in use by a recording on skyline-direct', html)
         self.assertNotIn('Share with harbor-direct', html, 'not on this provider')
+
+    def test_the_section_draws_a_share_that_reaches_an_account_on_no_provider(self):
+        """dev/changelog/1243: the holder map was built from the accounts on a provider
+        only, so a login a member shared with an account on none drew as the member's own
+        and was offered to the card's other members. The table is what is drawn. The state
+        is seeded past the writer here because the writer no longer creates it."""
+        from app.routes.providers import providers_section
+        pid = self._provider(self.cur_id, self.oth_id, name='mixed')
+        main = links.add_login(self.cur_id, 'main', 'main', 'pw1', 1).id
+        db.session.add(AccountLogin(account_id=self.dir_id, login_id=main, position=0))
+        db.session.commit()
+        section = providers_section(Account.query.all())
+        card = next(c for c in section['providers'] if c['id'] == pid)
+        curated = next(r for r in card['accounts'] if r['id'] == self.cur_id)
+        self.assertEqual(curated['logins'][0]['shared'], True)
+        self.assertEqual(curated['logins'][0]['share_targets'],
+                         [{'id': self.oth_id, 'name': 'harbor-direct'}])
+        self.assertEqual(card['pools'][0]['outside'], ['skyline-direct'])
+        self.assertEqual(card['pools'][0]['accounts'], ['skyline-curated', 'skyline-direct'])
 
     def test_the_account_page_names_the_provider_the_share_and_a_siblings_block(self):
         pid, _ = self._shared_main()

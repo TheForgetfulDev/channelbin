@@ -28,8 +28,8 @@
     </div>
   </div>
   <div class="dh-actions">
-    {% if rec.status in ('IN_PROGRESS', 'PAUSED') %}
-      {% if rec.status == 'PAUSED' %}
+    {% if rec.status in (REC_STATUS.IN_PROGRESS, REC_STATUS.PAUSED) %}
+      {% if rec.status == REC_STATUS.PAUSED %}
       <button class="btn" data-act="resume">&#9654; Resume</button>
       {% else %}
       <button class="btn tip-plain" data-act="extend" data-tip="Push the stop time 30 minutes later.">+30 min</button>
@@ -47,7 +47,7 @@
           <button class="menu-item danger" data-act="abort">Abort (discard segments)</button>
         </div>
       </div>
-    {% elif rec.status == 'RETRYING' %}
+    {% elif rec.status == REC_STATUS.RETRYING %}
       <button class="btn btn-danger tip-plain" data-act="stop" data-tip="End the recording now, for good.&#10;Whatever was captured before the retry is joined into the final file.&#10;Can't be resumed.">&#9632; Stop</button>
       <div class="menu-wrap">
         <button class="btn btn-icon" data-menu>&#8943;</button>
@@ -60,7 +60,7 @@
           <button class="menu-item danger" data-act="abort">Abort (discard segments)</button>
         </div>
       </div>
-    {% elif rec.status == 'SCHEDULED' %}
+    {% elif rec.status == REC_STATUS.SCHEDULED %}
       <button class="btn" onclick="openEditModal()">Edit schedule</button>
       <div class="menu-wrap">
         <button class="btn btn-icon" data-menu>&#8943;</button>
@@ -73,7 +73,7 @@
           <button class="menu-item danger" data-act="cancel">Cancel recording</button>
         </div>
       </div>
-    {% elif rec.status == 'FAILED' %}
+    {% elif rec.status == REC_STATUS.FAILED %}
       {# Recovery outranks re-recording whenever there is something on disk to recover
          from. Buried in the kebab, the only visible action on a recording that had
          finished capturing was "Record again", which re-records what the box already
@@ -100,8 +100,13 @@
           <button class="menu-item danger" data-act="delete">Delete recording</button>
         </div>
       </div>
-    {% elif rec.status in ('COMPLETED', 'ABORTED') %}
+    {% elif rec.status in (REC_STATUS.COMPLETED, REC_STATUS.ABORTED) %}
       {% if gaps_retry %}<button class="btn btn-primary" data-act="retry-convert-gaps">Retry conversion</button>{% endif %}
+      {#- A cancelled row whose joined .ts was kept promotes the conversion the strip tells
+          the user to run, the way the FAILED header promotes recovery - the kebab was the
+          only place it lived (dev/changelog/1247). recover_act is 'retry-convert' or nothing
+          on an ABORTED row. -#}
+      {% if recover_act == 'retry-convert' %}<button class="btn btn-primary" data-act="retry-convert">Retry conversion</button>{% endif %}
       <div class="menu-wrap">
         <button class="btn btn-icon" data-menu>&#8943;</button>
         <div class="menu">
@@ -110,25 +115,25 @@
           <a href="{{ find_airing_url }}">Record again</a>
           <button class="menu-item" data-copy="{{ rec.url }}">Copy stream URL</button>
           {% if rec.output_path %}<button class="menu-item" data-copy="{{ rec.output_path }}">Copy output path</button>{% endif %}
-          {% if ts_source_available %}<button class="menu-item" data-act="retry-convert">Retry conversion</button>{% endif %}
+          {% if ts_source_available and recover_act != 'retry-convert' %}<button class="menu-item" data-act="retry-convert">Retry conversion</button>{% endif %}
           <div class="sep"></div>
           <button class="menu-item danger" data-act="delete">Delete recording</button>
         </div>
       </div>
-    {% elif rec.status in ('CONCATENATING', 'ANALYZING', 'CONVERTING') %}
+    {% elif rec.status in (REC_STATUS.CONCATENATING, REC_STATUS.ANALYZING, REC_STATUS.CONVERTING) %}
       {#- CONCATENATING offers no cancel: that step is unreachable from here and is the one
           that makes the file. ANALYZING does, because the file is already whole on disk by
           then and the work still running only reads it (dev/changelog/867). -#}
-      {% if rec.status == 'CONVERTING' %}<button class="btn btn-danger" data-act="cancel-convert">&#9632; Cancel conversion</button>{% endif %}
-      {% if rec.status == 'ANALYZING' %}<button class="btn btn-danger" data-act="cancel-analysis">&#9632; Cancel processing</button>{% endif %}
+      {% if rec.status == REC_STATUS.CONVERTING %}<button class="btn btn-danger" data-act="cancel-convert">&#9632; Cancel conversion</button>{% endif %}
+      {% if rec.status == REC_STATUS.ANALYZING %}<button class="btn btn-danger" data-act="cancel-analysis">&#9632; Cancel processing</button>{% endif %}
       <div class="menu-wrap">
         <button class="btn btn-icon" data-menu>&#8943;</button>
         <div class="menu">
           <a href="{{ url_for('logs.logs_page') }}">View log lines</a>
           <button class="menu-item" data-secs-open>Customize sections...</button>
           <button class="menu-item" data-copy="{{ rec.url }}">Copy stream URL</button>
-          {% if rec.status == 'CONCATENATING' %}<button class="menu-item" data-act="retry-concat">Retry join</button>{% endif %}
-          {% if rec.status == 'CONVERTING' and ts_source_available %}<button class="menu-item" data-act="retry-convert">Retry conversion</button>{% endif %}
+          {% if rec.status == REC_STATUS.CONCATENATING %}<button class="menu-item" data-act="retry-concat">Retry join</button>{% endif %}
+          {% if rec.status == REC_STATUS.CONVERTING and ts_source_available %}<button class="menu-item" data-act="retry-convert">Retry conversion</button>{% endif %}
         </div>
       </div>
     {% else %}
@@ -146,9 +151,9 @@
    so the existing delegated (document-level) handlers cover these buttons too with
    no extra JS - every status gets an explicit branch, matching .dh-actions above. #}
 <div class="mobile-actbar">
-  {% if rec.status in ('IN_PROGRESS', 'PAUSED') %}
+  {% if rec.status in (REC_STATUS.IN_PROGRESS, REC_STATUS.PAUSED) %}
     <button class="btn tip-plain" data-act="extend" data-tip="Push the stop time 30 minutes later.">+30 min</button>
-    {% if rec.status == 'PAUSED' %}
+    {% if rec.status == REC_STATUS.PAUSED %}
     <button class="btn" data-act="resume">&#9654; Resume</button>
     {% else %}
     <button class="btn" data-act="pause">&#9208; Pause</button>
@@ -165,7 +170,7 @@
         <button class="menu-item danger" data-act="abort">Abort (discard segments)</button>
       </div>
     </div>
-  {% elif rec.status == 'RETRYING' %}
+  {% elif rec.status == REC_STATUS.RETRYING %}
     <button class="btn btn-danger" data-act="stop">&#9632; Stop</button>
     <div class="menu-wrap">
       <button class="btn btn-icon" data-menu>&#8943;</button>
@@ -178,7 +183,7 @@
         <button class="menu-item danger" data-act="abort">Abort (discard segments)</button>
       </div>
     </div>
-  {% elif rec.status == 'SCHEDULED' %}
+  {% elif rec.status == REC_STATUS.SCHEDULED %}
     <button class="btn" onclick="openEditModal()">Edit schedule</button>
     <div class="menu-wrap">
       <button class="btn btn-icon" data-menu>&#8943;</button>
@@ -191,7 +196,7 @@
         <button class="menu-item danger" data-act="cancel">Cancel recording</button>
       </div>
     </div>
-  {% elif rec.status == 'FAILED' %}
+  {% elif rec.status == REC_STATUS.FAILED %}
     {# Mirrors the desktop header's promotion, within the bar's two-button budget (9.5):
        when there is something to recover, Delete steps back into the kebab rather than
        the recovery action staying hidden behind it. #}
@@ -215,36 +220,44 @@
         {% endif %}
       </div>
     </div>
-  {% elif rec.status in ('COMPLETED', 'ABORTED') %}
-    {#- A kept source to convert again from outranks re-recording, as on a FAILED row. -#}
-    {% if gaps_retry %}
-    <button class="btn btn-primary" data-act="retry-convert-gaps">Retry conversion</button>
+  {% elif rec.status in (REC_STATUS.COMPLETED, REC_STATUS.ABORTED) %}
+    {#- A kept source to convert again from outranks re-recording, as on a FAILED row:
+        the gaps retry on a finished one, the plain retry on a cancelled one whose joined
+        .ts was kept (dev/changelog/1247). Within the bar's two-button budget (9.5), Delete
+        steps into the kebab when a retry is promoted, as the FAILED bar does. -#}
+    {% set promoted_retry = 'retry-convert-gaps' if gaps_retry else ('retry-convert' if recover_act == 'retry-convert' else none) %}
+    {% if promoted_retry %}
+    <button class="btn btn-primary" data-act="{{ promoted_retry }}">Retry conversion</button>
+    <a class="btn" href="{{ find_airing_url }}">&#8635; Record again</a>
     {% else %}
     <a class="btn" href="{{ find_airing_url }}">&#8635; Record again</a>
-    {% endif %}
     <button class="btn btn-danger" data-act="delete">Delete</button>
+    {% endif %}
     <div class="menu-wrap">
       <button class="btn btn-icon" data-menu>&#8943;</button>
       <div class="menu pop-up">
         <a href="{{ url_for('logs.logs_page') }}">View log lines</a>
-        {% if gaps_retry %}<a href="{{ find_airing_url }}">Record again</a>{% endif %}
         <button class="menu-item" data-secs-open>Customize sections...</button>
         <button class="menu-item" data-copy="{{ rec.url }}">Copy stream URL</button>
         {% if rec.output_path %}<button class="menu-item" data-copy="{{ rec.output_path }}">Copy output path</button>{% endif %}
-        {% if ts_source_available %}<button class="menu-item" data-act="retry-convert">Retry conversion</button>{% endif %}
+        {% if ts_source_available and promoted_retry != 'retry-convert' %}<button class="menu-item" data-act="retry-convert">Retry conversion</button>{% endif %}
+        {% if promoted_retry %}
+        <div class="sep"></div>
+        <button class="menu-item danger" data-act="delete">Delete recording</button>
+        {% endif %}
       </div>
     </div>
-  {% elif rec.status in ('CONCATENATING', 'ANALYZING', 'CONVERTING') %}
-    {% if rec.status == 'CONVERTING' %}<button class="btn btn-danger" data-act="cancel-convert">&#9632; Cancel conversion</button>{% endif %}
-    {% if rec.status == 'ANALYZING' %}<button class="btn btn-danger" data-act="cancel-analysis">&#9632; Cancel processing</button>{% endif %}
+  {% elif rec.status in (REC_STATUS.CONCATENATING, REC_STATUS.ANALYZING, REC_STATUS.CONVERTING) %}
+    {% if rec.status == REC_STATUS.CONVERTING %}<button class="btn btn-danger" data-act="cancel-convert">&#9632; Cancel conversion</button>{% endif %}
+    {% if rec.status == REC_STATUS.ANALYZING %}<button class="btn btn-danger" data-act="cancel-analysis">&#9632; Cancel processing</button>{% endif %}
     <div class="menu-wrap">
       <button class="btn btn-icon" data-menu>&#8943;</button>
       <div class="menu pop-up">
         <a href="{{ url_for('logs.logs_page') }}">View log lines</a>
         <button class="menu-item" data-secs-open>Customize sections...</button>
         <button class="menu-item" data-copy="{{ rec.url }}">Copy stream URL</button>
-        {% if rec.status == 'CONCATENATING' %}<button class="menu-item" data-act="retry-concat">Retry join</button>{% endif %}
-        {% if rec.status == 'CONVERTING' and ts_source_available %}<button class="menu-item" data-act="retry-convert">Retry conversion</button>{% endif %}
+        {% if rec.status == REC_STATUS.CONCATENATING %}<button class="menu-item" data-act="retry-concat">Retry join</button>{% endif %}
+        {% if rec.status == REC_STATUS.CONVERTING and ts_source_available %}<button class="menu-item" data-act="retry-convert">Retry conversion</button>{% endif %}
       </div>
     </div>
   {% else %}
@@ -261,7 +274,7 @@
    While live, the strip's stat spans are owned by the SSE handler (one
    updater per region: the auto-refresh swap skips this slot when live). #}
 <div id="status-strip-slot">
-{% if rec.status == 'IN_PROGRESS' %}
+{% if rec.status == REC_STATUS.IN_PROGRESS %}
 <div class="live-strip">
   <span class="pulse"></span>
   <span><b>Recording</b></span>
@@ -276,13 +289,13 @@
   <span class="sep-dot">·</span>
   <span>failures <span class="mono" id="live-failures">{{ rec.consecutive_failures }}</span></span>
 </div>
-{% elif rec.status == 'PAUSED' %}
+{% elif rec.status == REC_STATUS.PAUSED %}
 <div class="live-strip">
   <span><b>Paused</b></span>
   <span class="sep-dot">·</span>
   <span>capture is stopped and the connection slot is freed - Resume to continue, or Stop to finalize what was captured</span>
 </div>
-{% elif rec.status == 'RETRYING' %}
+{% elif rec.status == REC_STATUS.RETRYING %}
 <div class="live-strip">
   <span class="fx">&#8635;</span>
   <span>The stream reconnected but immediately died - waiting to try again
@@ -291,14 +304,14 @@
   <span class="sep-dot">·</span>
   <span>Stop to finalize what was captured, or Abort to discard it</span>
 </div>
-{% elif rec.status == 'SCHEDULED' %}
+{% elif rec.status == REC_STATUS.SCHEDULED %}
 <div class="live-strip sched-strip">
   <span class="fx">&#128337;</span>
   <span>Scheduled to start <b>{{ rec.start_time | local_time }}</b></span>
   <span class="sep-dot">·</span>
   <span>{{ row.rel }}</span>
 </div>
-{% elif rec.status == 'CONCATENATING' %}
+{% elif rec.status == REC_STATUS.CONCATENATING %}
 {# Two states share this status and they are not the same thing. A join with an ffmpeg
    running reports what it has written; one still queued behind another recording
    (serialize_concat) has not started and says so, rather than showing a 0% that never
@@ -324,7 +337,7 @@
   <span>Capture finished - <b>{{ joinable_count }} segment{{ '' if joinable_count == 1 else 's' }}</b> waiting to be joined into the final file. The join starts as soon as the machine is free.</span>
   {% endif %}
 </div>
-{% elif rec.status == 'ANALYZING' and rec.postprocess_waiting_since %}
+{% elif rec.status == REC_STATUS.ANALYZING and rec.postprocess_waiting_since %}
 {# Parked before the conversion starts. The analysis itself has already finished by the time
    the collision check runs, so the damage-scan wording below would describe work that is
    over while the row sits idle for however long the other recording takes. No pulse: this
@@ -335,7 +348,7 @@
   <span class="sep-dot">·</span>
   <span>waiting since <span class="mono">{{ rec.postprocess_waiting_since | local_time_sec }}</span></span>
 </div>
-{% elif rec.status == 'ANALYZING' %}
+{% elif rec.status == REC_STATUS.ANALYZING %}
 {# The long one, and the reason this status exists: two whole-file reads that scale with
    size (~124s each on a 17.9 GB capture). Naming the size is what makes a wait that looks
    stuck read as work instead - the file is already complete on disk by this point. A pass
@@ -361,7 +374,7 @@
   <span>Segments joined - the recorded file{% if rec.final_file_size %} (<b>{{ rec.final_file_size | filesize }}</b>){% endif %} is being checked for damage before conversion. This reads the whole file, so it takes longer on a large recording.</span>
   {% endif %}
 </div>
-{% elif rec.status == 'CONVERTING' and rec.postprocess_waiting_since %}
+{% elif rec.status == REC_STATUS.CONVERTING and rec.postprocess_waiting_since %}
 {# Parked mid-encode. The ffmpeg is SIGSTOPped, so the ETA below is frozen rather than
    wrong-but-moving, and a stopped clock is the thing that misleads - it is dropped here
    instead of shown (dev/changelog/952, 954). What IS shown is how much survived the pause,
@@ -372,7 +385,7 @@
   <span class="sep-dot">·</span>
   <span>paused since <span class="mono">{{ rec.postprocess_waiting_since | local_time_sec }}</span></span>
 </div>
-{% elif rec.status == 'CONVERTING' %}
+{% elif rec.status == REC_STATUS.CONVERTING %}
 {# Server-rendered from the persisted conversion_* snapshot; the page's 15s status-strip
    swap refreshes it (this status is not is_active, so it is included in that swap). #}
 <div class="live-strip concat-strip">
@@ -393,7 +406,7 @@
   <span>attempt {{ rec.conversion_attempts }} of {{ conversion_max_attempts }}</span>
   {% endif %}
 </div>
-{% elif rec.status == 'COMPLETED' %}
+{% elif rec.status == REC_STATUS.COMPLETED %}
 <div class="live-strip done-strip">
   <span class="fx">&#10003;</span>
   {# joinable_count, not rec.segments|length: a successful concat consumes its segments, so
@@ -411,7 +424,7 @@
     {%- if gaps_retry %} - the source <b>.ts</b> was kept, use <b>Retry conversion</b> to convert it again{% endif %}</span>
   {% endif %}
 </div>
-{% elif rec.status == 'FAILED' %}
+{% elif rec.status == REC_STATUS.FAILED %}
 <div class="live-strip fail-strip">
   <span class="fx">&#10007;</span>
   {# Every branch here names a real state, one per app/database.py FAILURE_* value
@@ -452,7 +465,7 @@
     {%- elif rec.failure_reason in ('CONVERSION_COLLISION', 'CONNECTION_SLOT_TIMEOUT', 'DVR_DIR_UNUSABLE', 'MISSED_AT_STARTUP', 'ACCOUNT_BLOCKED', 'NO_VALID_SEGMENTS', 'PAUSED_NOTHING_CAPTURED') %}nothing was captured - use <b>Record again</b> to reschedule
     {%- else %}nothing recoverable is left on disk - use <b>Record again</b> to reschedule{% endif %}</span>
 </div>
-{% elif rec.status == 'ABORTED' %}
+{% elif rec.status == REC_STATUS.ABORTED %}
 <div class="live-strip abort-strip">
   <span class="fx">&#9632;</span>
   {# Two halves, same shape as the FAILED strip above: why the row was cancelled, then what
@@ -511,7 +524,12 @@
   'RECORDING_EDITED': 'Edited',
   'RECORDING_STOP_TIME_ADJUSTED': 'Stop time adjusted',
   'RECORDING_REPLACED_OTHER': 'Replaced another recording',
+  'GROUP_FAILOVER': 'Failover to another channel',
+  'SEGMENT_DISCARDED': 'Segment discarded (placeholder)',
 } %}
+{# GROUP_FAILOVER and SEGMENT_DISCARDED are the window's two loud events and each gets its
+   own mark: a failover used to show only as the segment boundary dot it shares with every
+   restart, and a discarded segment did not show at all (dev/changelog/1247). #}
 {% set event_dot = {
   'STALL_DETECTED': 'stall',
   'FAST_DELIVERY_DETECTED': 'fail',
@@ -531,6 +549,8 @@
   'RECORDING_EDITED': 'neutral',
   'RECORDING_STOP_TIME_ADJUSTED': 'neutral',
   'RECORDING_REPLACED_OTHER': 'neutral',
+  'GROUP_FAILOVER': 'restart',
+  'SEGMENT_DISCARDED': 'stall',
 } %}
 {# Milestone `kind` distinguishes actual events (colored solid dots) from the two
    flavors of "planned, not what happened" marker (hollow dots, per DESIGN.md 3.8):
@@ -597,8 +617,10 @@
       {# Each of these already put its own milestone on the timeline - STALL_DETECTED,
          FAST_DELIVERY_DETECTED or CAPTURE_VIDEO_STOPPED - so a boundary marker here would
          double it. ERROR is deliberately NOT in the list: a segment abandoned by group failover is closed by
-         _close_active_segment, which emits SEGMENT_ENDED rather than STALL_DETECTED, so
-         the boundary marker is the only thing that marks it. #}
+         _close_active_segment, which emits SEGMENT_ENDED rather than STALL_DETECTED. The
+         GROUP_FAILOVER event carries its own mark since dev/changelog/1247; the boundary
+         stays because the two land within the cluster window and read as one dot whose
+         tooltip names both. #}
       {% if prev.exit_reason not in ('STALL_KILLED', 'PROCESS_EXITED', 'RESTART_NO_DATA',
                                      'FAST_DELIVERY_KILLED', 'VIDEO_STOPPED') and seg.started_at %}
         {% set _ = ns_ms.items.append({'ts': seg.started_at, 'kind': 'neutral', 'label': 'Segment boundary', 'prio': 1, 'silent': False}) %}
@@ -632,7 +654,7 @@
   <div class="hero-grid">
   <div id="hero-thumb" data-sec="shot">
     <div class="sec-title">Screenshot</div>
-    {% if rec.status == 'IN_PROGRESS' and thumb_enabled %}
+    {% if rec.status == REC_STATUS.IN_PROGRESS and thumb_enabled %}
     <div class="bigthumb has-img" id="live-bigthumb">
       <img id="live-thumb-img" alt="Live frame" style="display:none">
       <span id="live-thumb-placeholder">WAITING FOR STREAM DATA&#8230;</span>
@@ -649,10 +671,10 @@
     <div class="bigthumb logo-fallback">
       <img src="{{ row.pill.logo_url }}" alt="{{ row.pill.label }} logo"
            onerror="this.parentElement.classList.remove('logo-fallback'); this.remove();">
-      <span class="shot-age">{% if rec.status == 'SCHEDULED' %}NOT STARTED YET{% else %}NO SCREENSHOT{% endif %}</span>
+      <span class="shot-age">{% if rec.status == REC_STATUS.SCHEDULED %}NOT STARTED YET{% else %}NO SCREENSHOT{% endif %}</span>
     </div>
     {% else %}
-    <div class="bigthumb">{% if rec.status == 'SCHEDULED' %}NOT STARTED YET{% else %}NO SCREENSHOT{% endif %}</div>
+    <div class="bigthumb">{% if rec.status == REC_STATUS.SCHEDULED %}NOT STARTED YET{% else %}NO SCREENSHOT{% endif %}</div>
     {% endif %}
   </div>
   <div class="hero-right" id="hero-right">
@@ -729,15 +751,15 @@
             {% endfor %}
             <span class="run-tl-dot d-{{ rep.kind }} tip-plain" style="left:{{ g.pct | round(2) }}%" data-tip="{{ tns.tip }}"></span>
           {% endfor %}
-          {% if rec.status in ('IN_PROGRESS', 'PAUSED', 'RETRYING') and now >= first_ts and now <= last_ts %}
+          {% if rec.status in (REC_STATUS.IN_PROGRESS, REC_STATUS.PAUSED, REC_STATUS.RETRYING) and now >= first_ts and now <= last_ts %}
           <span class="run-tl-now" style="left:{{ ((now - first_ts).total_seconds() / total_span * 100) | round(2) }}%"></span>
           {% endif %}
         </div>
         <div class="run-tl-times">
           <span>{{ first_ts | local_time_only }}</span>
-          {% if rec.status in ('IN_PROGRESS', 'PAUSED', 'RETRYING') %}
+          {% if rec.status in (REC_STATUS.IN_PROGRESS, REC_STATUS.PAUSED, REC_STATUS.RETRYING) %}
           <span class="now">now · {{ now | local_time_only }}</span>
-          {% elif rec.status == 'FAILED' %}
+          {% elif rec.status == REC_STATUS.FAILED %}
           <span class="fail">failed · {{ (rec.completed_at or last_ts) | local_time_only }}</span>
           {% elif rec.actual_duration_seconds %}
           <span>{{ rec.actual_duration_seconds | int | duration }} captured</span>
@@ -750,10 +772,10 @@
       {% endif %}
     {% endif %}
 
-    {% set has_output_row = rec.output_path or rec.status == 'FAILED' %}
+    {% set has_output_row = rec.output_path or rec.status == REC_STATUS.FAILED %}
     <div class="statlist{% if has_output_row %} has-wide{% endif %}" data-sec="stats">
       <div class="sec-title">Stats</div>
-      {% if rec.status == 'SCHEDULED' %}
+      {% if rec.status == REC_STATUS.SCHEDULED %}
         {{ stat_row('Starts', rec.start_time | local_time) }}
         {{ stat_row('Stops', rec.stop_time | local_time) }}
         {{ stat_row('Scheduled window', rec.scheduled_duration_seconds | int | duration) }}
@@ -765,7 +787,9 @@
       {% else %}
         <div class="srow"><span class="sk">Captured</span><span class="sv{% if row.dur_flag == 'partial' %} warn{% endif %}{% if row.dur_tip %} tip-plain" data-tip="{{ row.dur_tip }}{% endif %}">{% if row.dur_flag %}<span class="dur-flag{% if row.dur_flag == 'partial' %} dur-amber{% endif %}">&#9685;</span>{% endif %}{{ row.dur_str or '-' }} of {{ (rec.scheduled_duration_seconds | int) | duration }}</span></div>
         {{ stat_row('Size', (row.size_num ~ ' ' ~ row.size_unit) if row.size_num else '-') }}
-        {{ stat_row('Bitrate', row.rate or '-') }}
+        {# Size over which of the four durations: the tooltip says, like every other
+           duration-derived stat on this card (dev/changelog/1247). #}
+        {{ stat_row('Bitrate', row.rate or '-', tip=row.rate_tip) }}
         {% set tech_tip = 'From the final output file (recorded before capture-time probing existed).' if tech_source == 'output' else none %}
         {# Coded frame size rides on Video's tooltip rather than getting its own row:
            the resolution beside it already conveys the displayed size. `select` with no
@@ -853,7 +877,7 @@
         {% if rec.completed_at %}{{ stat_row('Completed', rec.completed_at | local_time) }}{% endif %}
         {% if rec.output_path %}
         {{ stat_row('Output', rec.output_path, wide=true) }}
-        {% elif rec.status == 'FAILED' %}
+        {% elif rec.status == REC_STATUS.FAILED %}
         {{ stat_row('Output', 'none - segments kept on disk', wide=true) }}
         {% endif %}
       {% endif %}
@@ -952,7 +976,7 @@
            .xtra and hidden at phone widths (DESIGN.md 9.5) so the table never needs
            sideways scroll on a 375px screen. #}
         <th class="num">#</th><th class="xtra">Started</th><th class="xtra">Ended</th>
-        <th class="num">Duration</th><th class="num xtra">Content</th><th class="num">Size</th><th class="num xtra">Avg rate</th>
+        <th class="num">Duration</th><th class="num xtra">Content</th><th class="num">Size</th><th class="num xtra tip-plain" data-tip="Size over the segment's Duration - the wall clock it ran for, not the Content it holds. A segment that replayed a buffer on connect reads higher here than the feed's real rate.">Avg rate</th>
         <th class="num xtra">Stalls</th><th>Exit</th><th class="xtra">Channel</th><th class="xtra">File</th>
       </tr></thead>
       <tbody>
@@ -971,7 +995,7 @@
              compares frames, so neither the delta nor its tooltip names a cause
              (dev/changelog/966). NULL on every segment captured before this was measured at
              concat time, and on any file ffprobe could not read. #}
-          <td class="num xtra">{% if seg.content_duration_seconds is none %}<span class="muted tip-plain" data-tip="{% if rec.status in ('IN_PROGRESS', 'PAUSED', 'RETRYING', 'CONCATENATING') %}Not measured yet. A segment's content length is measured when the segments are joined, after capture ends.{% else %}Not measured. Segments captured before ChannelBin recorded a per-segment content length are not backfilled - the .ts files are deleted after conversion, so there is nothing left to probe.{% endif %}">-</span>{% else %}{{ (seg.content_duration_seconds | int) | duration(with_seconds=true) }}{% if seg_secs %}
+          <td class="num xtra">{% if seg.content_duration_seconds is none %}<span class="muted tip-plain" data-tip="{% if rec.status in (REC_STATUS.IN_PROGRESS, REC_STATUS.PAUSED, REC_STATUS.RETRYING, REC_STATUS.CONCATENATING) %}Not measured yet. A segment's content length is measured when the segments are joined, after capture ends.{% else %}Not measured. Segments captured before ChannelBin recorded a per-segment content length are not backfilled - the .ts files are deleted after conversion, so there is nothing left to probe.{% endif %}">-</span>{% else %}{{ (seg.content_duration_seconds | int) | duration(with_seconds=true) }}{% if seg_secs %}
             {% set seg_delta = seg.content_duration_seconds - seg_secs %}
             {% set seg_ratio = seg.content_duration_seconds / seg_secs %}
             <span class="exit-code{{ ' bad' if seg_delta < -1 else '' }} tip-plain" data-tip="This segment holds {{ (seg.content_duration_seconds | int) | duration(with_seconds=true) }} of content but ran for {{ (seg_secs | int) | duration(with_seconds=true) }} of wall clock{% if (seg_ratio - 1) | abs >= 0.05 %} - {{ '%.2f' | format(seg_ratio) }}x real time{% endif %}.">{{ '%+d' | format(seg_delta | round | int) }}s</span>
@@ -994,7 +1018,7 @@
             {% if seg.segment_number in fast_delivery_segs %}<span class="badge b-warn tip-plain" data-tip="This segment delivered far more video than the seconds it ran for. Video arriving ahead of the clock is video the provider already had - buffered content served after a reconnect, or the same stretch served over and over. Nothing here compares frames, so this does not say which. Worth checking this part of the recording.">fast</span>{% endif %}</td>
           <td class="num xtra">{{ seg.stall_count or 0 }}</td>
           <td>
-            {% if seg.ended_at is none and rec.status in ('IN_PROGRESS', 'PAUSED', 'RETRYING') %}
+            {% if seg.ended_at is none and rec.status in (REC_STATUS.IN_PROGRESS, REC_STATUS.PAUSED, REC_STATUS.RETRYING) %}
               <span class="exit-pill live tip-plain" data-tip="This segment is capturing right now.">RECORDING</span>
             {% elif seg.exit_reason %}
               {% set ep = exit_pill.get(seg.exit_reason) %}
@@ -1033,7 +1057,7 @@
             {%- if seg_ch.account %} (<a href="{{ url_for('accounts.account_detail', account_id=seg_ch.account.id) }}">{{ seg_ch.account.name }}</a>){% endif %}
             {% else %}<span class="muted">-</span>{% endif %}
           </td>
-          <td class="mono muted xtra" style="font-size:.72rem; overflow-wrap:anywhere">{{ seg.file_path | replace('/dvr/', '') }}</td>
+          <td class="mono muted xtra" style="font-size:var(--fs-xs); overflow-wrap:anywhere">{{ seg.file_path | replace('/dvr/', '') }}</td>
         </tr>
         {% endfor %}
       </tbody>
@@ -1047,7 +1071,11 @@
 {# RECORDING_START_NOT_ARMED is 'bad': a SCHEDULED recording nothing will start until a
    restart, and this event is its one lasting surface (dev/changelog/1186).
    RECORDING_RULE_PROGRAM_MOVED is 'warn': the guide moved the program and this recording
-   stayed where it was (dev/changelog/1188). #}
+   stayed where it was (dev/changelog/1188).
+   A resume refused is an ERROR alert elsewhere, so 'bad'; a failover, a failed pre-check,
+   a late start, a rolled host and a refused login are each a degradation of this run, so
+   'warn'. A handoff, a repoint and a re-resolved URL are the app keeping the recording on
+   the air and read as plain information (dev/changelog/1247). #}
 {% set ev_cls = {
   'STALL_DETECTED': 'warn', 'RESTART_FAILED': 'warn', 'RECORDING_STOPPED_EARLY': 'warn',
   'RECORDING_ABORTED': 'warn', 'SEEK_DAMAGE_DETECTED': 'warn', 'RECORDING_RETRY_SCHEDULED': 'warn',
@@ -1067,11 +1095,15 @@
   'RESTART_SUCCEEDED': 'ok', 'CONCATENATION_DONE': 'ok', 'CONVERSION_DONE': 'ok',
   'CONVERSION_RESUMED': 'ok',
   'FILE_MOVED': 'ok', 'SCRIPT_EXECUTED': 'ok', 'METADATA_SIDECAR_WRITTEN': 'ok',
-  'METADATA_SIDECAR_FAILED': 'warn', 'CONVERTED_FILE_GAPS': 'warn',
+  'METADATA_SIDECAR_FAILED': 'warn', 'CONVERTED_FILE_GAPS': 'warn', 'FILE_MOVE_FAILED': 'bad',
   'SOURCE_DELETED': 'info', 'SOURCE_KEPT': 'info',
   'RECORDING_FAILED': 'bad', 'RECORDING_FAILED_DEAD_STREAM': 'bad',
   'CONCATENATION_FAILED': 'bad', 'CONVERSION_FAILED': 'bad',
   'RECORDING_START_NOT_ARMED': 'bad',
+  'RECORDING_RESUME_REFUSED': 'bad', 'GROUP_FAILOVER': 'warn', 'PRE_CHECK_FAILED': 'warn',
+  'RECORDING_STARTED_LATE': 'warn', 'RECORDING_HOST_ROLLED': 'warn', 'RECORDING_LOGIN_REFUSED': 'warn',
+  'RECORDING_HANDOFF': 'info', 'RECORDING_URL_RERESOLVED': 'info', 'RECORDING_REPOINTED': 'info',
+  'RECORDING_CREATED_AFTER_EVENT_START': 'info',
 } %}
 <div class="card" id="panel-eventlog" data-sec="log">
   <div class="card-head">
@@ -1093,7 +1125,7 @@
         {% if evt.detail %}<div class="ev-detail">{{ evt.detail }}</div>{% endif %}
         {% set links = event_channel_links.get(evt.id) %}
         {% if links %}
-        <div class="ev-detail muted" style="font-size:.8rem">
+        <div class="ev-detail muted" style="font-size:var(--fs-sm)">
           {% for l in links %}<a href="{{ url_for('channels.channel_detail', channel_id=l.channel.id) }}">{{ l.channel.name }}</a>{% if l.account %} · <a href="{{ url_for('accounts.account_detail', account_id=l.account.id) }}">{{ l.account.name }}</a>{% endif %}{% if not loop.last %}<br>{% endif %}{% endfor %}
         </div>
         {% endif %}
@@ -1142,7 +1174,7 @@ const GUIDE_CONFIG = {
   },
 };
 
-{% if rec.status == 'SCHEDULED' %}
+{% if rec.status == REC_STATUS.SCHEDULED %}
 function openEditModal() {
   closeMenus();
   openModal({
@@ -1289,7 +1321,7 @@ window.onScheduleSaved = () => window.location.reload();
       // bodyHtml = the spec supplies complete markup (the delete confirm's switch); a
       // plain `body` string is prose that still needs its paragraph wrapper. Wrapping the
       // former would put a <label> inside a <p>, which the parser closes early.
-      body: spec.bodyHtml || `<p style="font-size:.9rem">${spec.body}</p>`,
+      body: spec.bodyHtml || `<p style="font-size:var(--fs-lg)">${spec.body}</p>`,
       footer: [
         { label: 'Cancel', class: 'btn', onClick: (close) => { close(); } },
         { label: spec.verb, class: spec.danger ? 'btn btn-danger' : 'btn btn-primary',
@@ -1508,7 +1540,7 @@ window.onScheduleSaved = () => window.location.reload();
 })();
 </script>
 {% endif %}
-{% if rec.status == 'IN_PROGRESS' and thumb_enabled %}
+{% if rec.status == REC_STATUS.IN_PROGRESS and thumb_enabled %}
 <script>
 (function() {
   const img = document.getElementById('live-thumb-img');

@@ -172,7 +172,7 @@ class _Supervised:
                     self.mark += 1_000_000
             return self.mark, 0, False
 
-        opts = dict(scratch_prefix='test', scratch_key=1, interval=0.02,
+        opts = dict(scratch_prefix='conv', scratch_key=1, interval=0.02,
                     pre_output_timeout=30, stall_seconds=0,
                     noun='job', label='test job',
                     suspend_check=self._suspend_check,

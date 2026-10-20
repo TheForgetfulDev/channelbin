@@ -201,8 +201,7 @@ class SyncRouteTests(unittest.TestCase):
     """POST /api/accounts/<id>/sync decides the flag server-side."""
 
     def setUp(self):
-        self.t = make_test_app()
-        self.t.app.config['WTF_CSRF_ENABLED'] = False
+        self.t = make_test_app(csrf=False)
         self.account = seed.make_account(name='Routed', sync_enabled=True)
         db.session.commit()
         self.account_id = self.account.id
@@ -251,8 +250,7 @@ class JobsRunNowTests(unittest.TestCase):
     """The Jobs page's Run now on an account's sync job is a manual sync too."""
 
     def setUp(self):
-        self.t = make_test_app(start_scheduler=True)
-        self.t.app.config['WTF_CSRF_ENABLED'] = False
+        self.t = make_test_app(start_scheduler=True, csrf=False)
         self.account = seed.make_account(name='Jobbed', sync_enabled=True)
         self.account.next_sync_at = datetime.utcnow() + timedelta(hours=2)
         db.session.commit()

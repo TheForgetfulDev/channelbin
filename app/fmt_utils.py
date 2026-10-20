@@ -86,10 +86,14 @@ def rec_status_display(status, waiting=False):
     return row
 
 
-def rec_status_label(status):
+def rec_status_label(status, waiting=False):
     """Just the badge label - what a human calls this status. Unknown in, unknown out, so an
-    unrecognized value is shown rather than swallowed."""
-    return rec_status_display(status)[3]
+    unrecognized value is shown rather than swallowed.
+
+    `waiting` is the row's postprocess_waiting_since, as for rec_status_display: a surface
+    that holds the row passes it, so a parked recording reads WAITING there too and not
+    ANALYZING or CONVERTING on one page alone (dev/changelog/1247)."""
+    return rec_status_display(status, waiting=waiting)[3]
 
 
 # ── Stream quality profile vocabulary (dev/changelog/351) ───────────────────
@@ -232,3 +236,33 @@ def fmt_job_duration_line(avg_seconds, runs: int) -> str:
         return 'Expected runtime unknown - this job has never completed a run.'
     basis = f'average of the last {runs} run{"" if runs == 1 else "s"}'
     return f'Usually takes {fmt_duration_phrase(avg_seconds)} ({basis}).'
+
+
+def join_labels(labels) -> str:
+    """'a', 'a and b', 'a, b and c' - the one list sentence (dev/changelog/1244). Repeats
+    are dropped, order kept; empty in, empty string out."""
+    labels = list(dict.fromkeys(labels))
+    if not labels:
+        return ''
+    if len(labels) == 1:
+        return labels[0]
+    return ', '.join(labels[:-1]) + ' and ' + labels[-1]
+
+
+def plural(n, one, many=None) -> str:
+    """The word alone: plural(1, 'folder') -> 'folder', plural(2, 'folder') -> 'folders',
+    plural(2, 'is', 'are') -> 'are'. counted() is the form that carries the number."""
+    return one if n == 1 else (many or one + 's')
+
+
+def counted(n, one, many=None) -> str:
+    """'1 program' / '1,234 programs' - the number and its noun together."""
+    return f'{n:,} {plural(n, one, many)}'
+
+
+def iso_or_none(value):
+    """`value.isoformat()`, or None for a None value - the JSON payload spelling of an
+    optional datetime. app/channel_search_rows.py keeps its own second-precision variant
+    for the row payload, and app/health_score.py its str() fallback for a breakdown that
+    may hold a non-datetime; both say so at the definition."""
+    return value.isoformat() if value else None

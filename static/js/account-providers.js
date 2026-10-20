@@ -11,7 +11,6 @@
    Depends on util.js (escHtml, jsonFetch, showToast, buildModal, confirmModal, fieldRow,
    closeMenus, swapFromServer). */
 (() => {
-  const isPhone = () => window.matchMedia('(max-width: 960px)').matches;
   const section = () => document.getElementById('acct-providers');
 
   function send(url, opts = {}) {
@@ -208,36 +207,15 @@
     run(el.dataset.act, el);
   });
 
-  // ── The phone's bottom sheet (DESIGN.md §17.5) ──────────────────────────
-  // The sheet's buttons are copies of the menu's own items, data attributes included, so
-  // the two surfaces cannot offer different actions.
+  // ── The phone's bottom sheet (DESIGN.md §17.5) - util.js's openMenuSheet ─────
   function openSheet(btn) {
     const menu = btn.parentElement.querySelector('.menu');
     if (!menu) return;
     const card = btn.closest('[data-provider-id]');
-    const body = document.createElement('div');
-    body.className = 'acct-sheet';
-    Array.from(menu.children).forEach((item) => {
-      if (item.classList.contains('sep')) {
-        body.insertAdjacentHTML('beforeend', '<div class="sheet-sep"></div>');
-        return;
-      }
-      const copy = item.cloneNode(true);
-      copy.className = `sheet-act${item.classList.contains('danger') ? ' danger' : ''}`;
-      body.appendChild(copy);
-    });
-    const sheet = buildModal({ title: btn.getAttribute('aria-label') || (card && card.dataset.name) || '', body });
-    body.addEventListener('click', (e) => {
-      const item = e.target.closest('button[data-act]');
-      if (!item || item.disabled) return;
-      e.stopPropagation();
-      sheet.closeModal();
+    openMenuSheet(menu, {
+      title: btn.getAttribute('aria-label') || (card && card.dataset.name) || '',
       // Run against the original item: it is still inside the card the action needs.
-      const original = Array.from(menu.querySelectorAll('[data-act]'))
-        .find((m) => m.dataset.act === item.dataset.act
-          && m.dataset.accountId === item.dataset.accountId
-          && m.dataset.loginId === item.dataset.loginId);
-      run(item.dataset.act, original || item);
+      onAct: (act, copy, original) => run(act, original || copy),
     });
   }
 

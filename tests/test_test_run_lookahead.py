@@ -289,8 +289,7 @@ class ManualRunNowGuardTests(unittest.TestCase):
     through) when force=true or unconflicted, and go through the one shared helper."""
 
     def setUp(self):
-        self.t = make_test_app()
-        self.t.app.config['WTF_CSRF_ENABLED'] = False
+        self.t = make_test_app(csrf=False)
         self.channel = seed.make_channel(seed.make_account())
         db.session.commit()
 

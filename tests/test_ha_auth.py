@@ -14,7 +14,6 @@ Runs against a throwaway temp SQLite DB and a sandboxed config.yaml - never the 
 dvr.db/config.yaml (tests/support/config_sandbox.py::ConfigSandbox).
   python3 -m unittest tests.test_ha_auth
 """
-import re
 import unittest
 
 from werkzeug.security import check_password_hash, generate_password_hash
@@ -22,16 +21,13 @@ from werkzeug.security import check_password_hash, generate_password_hash
 from app import config as cfgmod
 from tests.support.app import make_test_app
 from tests.support.config_sandbox import ConfigSandbox
+from tests.support.csrf import csrf_token
 
 PASSWORD = 'correcthorse-battery-staple'
 
 
 _ConfigSandbox = ConfigSandbox
 
-
-def _csrf_meta(html):
-    m = re.search(r'name="csrf-token" content="([^"]+)"', html)
-    return m.group(1) if m else None
 
 
 class ConfigDefaultsTests(_ConfigSandbox):
@@ -84,7 +80,7 @@ class GenerateKeyEndpointTests(_ConfigSandbox):
         self.addCleanup(self.t.cleanup)
 
     def _csrf(self):
-        return _csrf_meta(self.client.get('/settings').get_data(as_text=True))
+        return csrf_token(self.client)
 
     def test_generate_returns_plaintext_once_and_stores_only_a_hash(self):
         tok = self._csrf()
@@ -127,7 +123,7 @@ class EnableRequiresKeyTests(_ConfigSandbox):
         self.addCleanup(self.t.cleanup)
 
     def _csrf(self):
-        return _csrf_meta(self.client.get('/settings').get_data(as_text=True))
+        return csrf_token(self.client)
 
     def test_enabling_with_no_key_is_rejected(self):
         tok = self._csrf()

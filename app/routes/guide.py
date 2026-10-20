@@ -11,6 +11,7 @@ from ..database import (Account, Channel, ChannelEvent, ChannelGroup, EPGEntry, 
 from ..accounts import (normalize_url, render_filename_template,
                         duplicates_within, lifecycle_states_for_channels,
                         repoint_candidates_for_channels, transfer_channel_state,
+                        transfer_keeper_problem,
                         # Moved beside render_filename_template so the channel search's
                         # airing grain can render a suggested name too (changelog 412).
                         effective_filename_naming as _effective_filename_naming,
@@ -289,7 +290,7 @@ def _guide_row_entries(streak_threshold=DEFAULT_FAILING_STREAK_THRESHOLD):
     no business reaching into the guide's own query layer for it. The extra
     in_guide-group query the helper then repeats is one constant statement per render,
     not per row."""
-    groups = ChannelGroup.query.filter_by(in_guide=True).options(*member_eager_options()).all()
+    groups = ChannelGroup.query.filter_by(in_guide=True).options(*member_eager_options()).all()  # guide-flag-read-ok: a group's own row flag
     # One batched fetch for every group's members, not one query per group in the loop.
     all_member_ids = [m.channel_id for g in groups for m in g.memberships]
     latest_by_channel = _latest_tests_by_channel(all_member_ids, for_job_id=ANY_JOB)
@@ -325,8 +326,6 @@ def guide():
     profiles = RecordingProfile.query.order_by(RecordingProfile.name).all()
     tags = Tag.query.order_by(Tag.name).all()
 
-    # One load_config() for the whole request - never per row (CLAUDE.md no-hidden-I/O).
-    cfg = load_config()
     # The rendered span is the same window the EPG importer stores, so the guide can never
     # promise more days than it has data for. DESIGN.md 12.1 forbids a typed day count in any
     # visible string, so this value feeds every piece of copy naming the window length.
@@ -519,13 +518,9 @@ def remove_duplicate_channels_from_guide():
         if transfer:
             keep_id = r.get('keep_channel_id')
             keeper = db.session.get(Channel, keep_id) if keep_id else None
-            # Server re-validates the keeper from DB ids - never trust the client blindly
-            # (same "server re-validates everything" pattern as the repoint route).
-            if keeper is None or keeper.id == ch.id:
-                transfer_skipped.append({'channel_id': cid, 'reason': 'No valid channel to keep'})
-            elif keeper.stream_url != ch.stream_url:
-                transfer_skipped.append({'channel_id': cid,
-                                         'reason': 'Kept channel no longer shares the stream URL'})
+            problem = transfer_keeper_problem(ch, keeper)
+            if problem:
+                transfer_skipped.append({'channel_id': cid, 'reason': problem})
             else:
                 transfer_channel_state(ch, keeper, cfg)
                 transferred.append(cid)

@@ -98,7 +98,7 @@ function openManualRecordModal() {
     body,
     footer: [
       { label: 'Cancel', class: 'btn' },
-      { label: 'Schedule Recording', class: 'btn btn-primary',
+      { label: 'Schedule recording', class: 'btn btn-primary',
         onClick: (close) => { submit(close); return false; } },
     ],
   });

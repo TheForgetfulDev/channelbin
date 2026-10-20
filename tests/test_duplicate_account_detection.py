@@ -31,8 +31,7 @@ def _make_account(name, account_type='m3u', **kw):
 
 class DuplicateAccountDetectionTests(unittest.TestCase):
     def setUp(self):
-        self.t = make_test_app()
-        self.t.app.config['WTF_CSRF_ENABLED'] = False
+        self.t = make_test_app(csrf=False)
         # Not what's under test here, and make_test_app() doesn't start a real
         # APScheduler (start_scheduler=False), so the route's post-commit
         # schedule_account_sync() call would hit a None scheduler.

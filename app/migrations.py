@@ -188,6 +188,28 @@ def _finish_backfill(conn, cur, name: str):
     conn.commit()
 
 
+def _step_ledger_name(version: int) -> str:
+    return f'step.{version}'
+
+
+def _note_step_started(conn, cur, version: int):
+    """Record, before a step runs, that the runner is attempting it - and say so out loud
+    when the record is already there from an attempt that never stamped.
+
+    Without this the runner wrote nothing before a step, so after a crash between a step's
+    own commit and the version stamp the retry logged the ordinary "Applying schema
+    migration N" line and every guarded ALTER skipped quietly; only a step that owned a
+    backfill ledger entry could say it was resuming. Same ledger, same rule as the
+    backfills (dev/changelog/686): "already done" is a fact the runner recorded, and a
+    resumed attempt is named rather than inferred from a column already being there."""
+    name = _step_ledger_name(version)
+    if _backfill_pending(cur, name):
+        log.warning('Schema migration %d was started by an earlier attempt that did not '
+                    'finish - running it again now; its guarded statements skip whatever '
+                    'that attempt already applied', version)
+    _register_backfill(conn, cur, name)
+
+
 def obligation_pending(name: str) -> bool:
     """Whether `name`'s ledger entry is registered and not yet finished, asked through the
     ORM's own connection rather than a raw migration cursor.
@@ -1983,7 +2005,18 @@ def _rebuild_with_autoincrement(conn, cur, table: str):
         return
 
     tmp_name = f'{table}_autoinc_new'
-    new_sql = _autoincrement_ddl(old_sql, table, tmp_name)
+    copied, carried = _rebuild_table(conn, cur, table, _autoincrement_ddl(old_sql, table, tmp_name),
+                                     tmp_name)
+    log.info('Rebuilt the %s table with AUTOINCREMENT (%d row(s), %d index(es) carried over); '
+             'a deleted id is no longer re-issued', table, copied, carried)
+
+
+def _rebuild_table(conn, cur, table: str, new_sql: str, tmp_name: str):
+    """SQLite's documented copy/drop/rename rebuild of `table` into the shape `new_sql`
+    declares (a CREATE TABLE of `tmp_name`): every column copied by name, the table's own
+    indexes re-run after the rename. The one way this module changes a column's DDL - a
+    primary key's AUTOINCREMENT, a column DEFAULT - since ALTER TABLE cannot. Returns
+    (rows copied, indexes carried). The caller logs what it rebuilt and why."""
     columns = ', '.join(f'"{r[1]}"' for r in cur.execute(f'PRAGMA table_info({table})'))
     index_sql = [r[0] for r in cur.execute(
         "SELECT sql FROM sqlite_master WHERE type='index' AND tbl_name=? AND sql IS NOT NULL "
@@ -1998,8 +2031,7 @@ def _rebuild_with_autoincrement(conn, cur, table: str):
     cur.execute(f'ALTER TABLE {tmp_name} RENAME TO {table}')
     for sql in index_sql:
         cur.execute(sql)
-    log.info('Rebuilt the %s table with AUTOINCREMENT (%d row(s), %d index(es) carried over); '
-             'a deleted id is no longer re-issued', table, copied, len(index_sql))
+    return copied, len(index_sql)
 
 
 def _m055_recordings_autoincrement(conn, cur):
@@ -3098,6 +3130,88 @@ def _m081_account_blocks(conn, cur):
     conn.commit()
 
 
+def _m095_drop_duplicate_exclusion_index(conn, cur):
+    """channel_health_exclusions: drop the second unique index migration 50 left behind.
+
+    create_all() builds the table before any step runs, with the model's
+    UniqueConstraint('uq_health_exclusion') as a table constraint, which SQLite backs with an
+    autoindex (origin `u`). Step 50's `CREATE UNIQUE INDEX IF NOT EXISTS uq_health_exclusion`
+    then found no index under that name and added a second one over the same three columns,
+    so every migrated database carried two and a fresh build one. One extra index write per
+    exclusion and one line of parity drift - small, but the generic migrated-versus-fresh
+    parity test is what has to stay green.
+
+    Dropped only where an autoindex already enforces the uniqueness: on a database whose
+    table step 50's own CREATE TABLE built (a bare scratch connection, no table constraint),
+    the named index is the only uniqueness there is and stays."""
+    indexes = cur.execute('PRAGMA index_list(channel_health_exclusions)').fetchall()
+    # (seq, name, unique, origin, partial)
+    has_autoindex = any(row[2] and row[3] == 'u' for row in indexes)
+    has_named = any(row[1] == 'uq_health_exclusion' for row in indexes)
+    if has_autoindex and has_named:
+        cur.execute('DROP INDEX uq_health_exclusion')
+        log.info('Migration 95: dropped the duplicate uq_health_exclusion index; the table '
+                 'constraint already enforces it')
+    conn.commit()
+
+
+_RETIRED_STRATEGY_DEFAULT = "DEFAULT 'health_check_only'"
+_CURRENT_STRATEGY_DEFAULT = "DEFAULT 'highest_score'"
+
+
+def _m096_channel_groups_strategy_default(conn, cur):
+    """channel_groups: the stored column DEFAULT for format_strategy reads 'highest_score'.
+
+    Migration 71 moved every stored value off the retired `health_check_only` and the model's
+    server_default moved with it, but SQLite cannot change a column default in place, so a
+    database that crossed step 6 before step 71 - every real install - still carried
+    `DEFAULT 'health_check_only'` in its DDL where a fresh build reads `DEFAULT
+    'highest_score'`. The ORM always supplies the value; the writer that would not is a raw
+    INSERT that omits the column, which is what a future migration step is, and it would
+    mint a group with a strategy GROUP_FORMAT_STRATEGIES no longer contains.
+
+    The rebuild keeps the stored DDL's every other character (dev/changelog/937's reasoning
+    for deriving the new DDL from sqlite_master rather than writing it out). Idempotent: a
+    table whose DDL already carries the current default is left alone, so a fresh build and
+    a database this already ran on are no-ops."""
+    row = cur.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='channel_groups'").fetchone()
+    if row is None or _RETIRED_STRATEGY_DEFAULT not in row[0]:
+        return
+    tmp_name = 'channel_groups_default_new'
+    new_sql = re.sub(r'^CREATE TABLE "?channel_groups"? \(', f'CREATE TABLE {tmp_name} (',
+                     row[0], count=1)
+    if new_sql == row[0]:
+        raise RuntimeError('Cannot rebuild channel_groups: its stored CREATE TABLE does not '
+                           f'carry the expected header. Stored DDL:\n{row[0]}')
+    new_sql = new_sql.replace(_RETIRED_STRATEGY_DEFAULT, _CURRENT_STRATEGY_DEFAULT, 1)
+    copied, carried = _rebuild_table(conn, cur, 'channel_groups', new_sql, tmp_name)
+    conn.commit()
+    log.warning('Migration 96: rebuilt channel_groups so its stored DEFAULT for '
+                'format_strategy reads highest_score, the strategy migration 71 moved every '
+                'group to (%d group(s), %d index(es) carried over)', copied, carried)
+
+
+def _m097_file_move_failed_event_type(conn, cur):
+    """Retype the FILE_MOVED recording events that recorded a failed move-on-complete to
+    FILE_MOVE_FAILED (dev/changelog/1247) - the same shape as migration 79 for the join and
+    conversion outcomes, and for the same reason: the detail page colors the event log by
+    type, so a move that left the file behind rendered in the success color.
+
+    The predicate is what the one writer of those rows put in the detail since the first
+    commit: every failed move starts `Move FAILED` and no success does. GLOB rather than
+    LIKE because LIKE is case-insensitive. The type names are spelled out rather than
+    imported, so this step keeps doing what it did when it shipped.
+
+    Re-runnable from the top: an UPDATE by predicate over rows still carrying the old type
+    matches nothing a second time, so it needs no entry in the backfill ledger."""
+    cur.execute('UPDATE recording_events SET event_type = ? '
+                'WHERE event_type = ? AND detail GLOB ?',
+                ('FILE_MOVE_FAILED', 'FILE_MOVED', 'Move FAILED*'))
+    if cur.rowcount:
+        log.info('Retyped %d FILE_MOVED event(s) to FILE_MOVE_FAILED', cur.rowcount)
+
+
 SCHEMA_MIGRATIONS = [
     (1, 'baseline: pre-versioning additive migrations + backfills', _m001_baseline),
     (2, 'recordings: program_title/program_sub_title snapshot columns + backfill', _m002_program_title),
@@ -3289,6 +3403,12 @@ SCHEMA_MIGRATIONS = [
      'checked before the source is deleted', _m093_recording_converted_gap_seconds),
     (94, 'account_sync_logs: categories_added/categories_removed, the provider categories a '
      'sync found new or gone', _m094_sync_log_category_changes),
+    (95, 'channel_health_exclusions: drop the duplicate unique index migration 50 left beside '
+     'the table constraint', _m095_drop_duplicate_exclusion_index),
+    (96, 'channel_groups: rebuild so the stored DEFAULT for format_strategy reads '
+     'highest_score', _m096_channel_groups_strategy_default),
+    (97, 'recording_events: FILE_MOVED rows that recorded a failed move-on-complete move to '
+     'FILE_MOVE_FAILED', _m097_file_move_failed_event_type),
 ]
 
 CURRENT_SCHEMA_VERSION = SCHEMA_MIGRATIONS[-1][0]
@@ -3351,6 +3471,7 @@ def run_migrations(fresh_db: bool, cfg: dict):
         _backup_before_migration(cur, db_version, pending[0][0], cfg)
 
         for version, description, fn in pending:
+            _note_step_started(conn, cur, version)
             log.info('Applying schema migration %d: %s', version, description)
             start = time.monotonic()
             try:
@@ -3366,6 +3487,10 @@ def run_migrations(fresh_db: bool, cfg: dict):
                     'applied_at=excluded.applied_at, duration_ms=excluded.duration_ms',
                     (version, description, __version__, datetime.utcnow(), duration_ms),
                 )
+                # The attempt record closes in the stamp's own transaction, so "started and
+                # not finished" can only ever mean the stamp did not land.
+                cur.execute('UPDATE migration_backfills SET completed_at = ? WHERE name = ?',
+                            (_utc_stamp(), _step_ledger_name(version)))
                 conn.commit()
             except Exception:
                 conn.rollback()

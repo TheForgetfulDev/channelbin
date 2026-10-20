@@ -28,8 +28,7 @@ from app.database import (  # noqa: E402
 
 class _BulkCase(unittest.TestCase):
     def setUp(self):
-        self.t = make_test_app()
-        self.t.app.config['WTF_CSRF_ENABLED'] = False
+        self.t = make_test_app(csrf=False)
         self.acct = seed.make_account(name='Solo', max_connections=1)
         self.other = seed.make_account(name='Other', max_connections=1)
         self.ch1 = seed.make_channel(self.acct, name='One')

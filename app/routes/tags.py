@@ -9,7 +9,7 @@ from ..auto_rules import rename_in_rules, rules_naming
 from ..config import load_config
 from ..database import Tag, TagPattern, RecordingProfile
 from ..db_utils import retry_on_locked
-from ..ui_constants import PRESET_COLORS
+from ..ui_constants import DEFAULT_COLOR, PRESET_COLORS
 
 tags_bp = Blueprint('tags', __name__)
 
@@ -18,8 +18,6 @@ tags_bp = Blueprint('tags', __name__)
 # client-side check is presentation and this column is what the guide paints from: a junk
 # value lands in a `style="background: ..."` attribute on every matching program cell.
 _HEX_RE = re.compile(r'^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$')
-
-_DEFAULT_COLOR = '#58a6ff'
 
 
 @tags_bp.route('/tags')
@@ -37,6 +35,7 @@ def tags_list():
         tags=tags,
         usage=usage,
         preset_colors=PRESET_COLORS,
+        default_color=DEFAULT_COLOR,
         tags_json=[_tag_payload(t) for t in tags],
     )
 
@@ -190,7 +189,7 @@ def _read_tag_body(existing_id: int | None = None):
 
     name = str(body.get('name', '')).strip().lower()
     patterns = _clean_patterns(body.get('patterns') or [])
-    color = str(body.get('color', '') or '').strip() or _DEFAULT_COLOR
+    color = str(body.get('color', '') or '').strip() or DEFAULT_COLOR
 
     if not name:
         return None, 'Name is required.'
@@ -209,6 +208,6 @@ def _read_tag_body(existing_id: int | None = None):
     if not patterns:
         return None, 'At least one match pattern is required.'
     if not _HEX_RE.match(color):
-        return None, 'Color must be a hex value like #58a6ff.'
+        return None, 'Color must be a hex value like #rrggbb.'
 
     return {'name': name, 'patterns': patterns, 'color': color}, None

@@ -60,13 +60,13 @@
 
 {% macro sync_detail(log) -%}
 {%- if not log.status -%}Sync started.
-{%- elif log.status == 'SUCCESS' -%}
+{%- elif log.status == SYNC_LOG.SUCCESS -%}
 Sync finished: {{ '{:,}'.format(log.channels_synced or 0) }} channels{% if log.channels_added is not none and log.channels_removed is not none %} ({{ '{:,}'.format(log.channels_added) }} added, {{ '{:,}'.format(log.channels_removed) }} removed){% endif %}{{ skipped_text(log) }}{{ category_text(log) }}, {{ '{:,}'.format(log.epg_entries_synced or 0) }} program entries{% if log.completed_at and log.started_at %} in {{ (log.completed_at - log.started_at).total_seconds() | duration }}{% endif %}.
-{%- elif log.status == 'PARTIAL' -%}
+{%- elif log.status == SYNC_LOG.PARTIAL -%}
 Sync finished with gaps: {{ '{:,}'.format(log.channels_synced or 0) }} channels{% if log.channels_added is not none and log.channels_removed is not none %} ({{ '{:,}'.format(log.channels_added) }} added, {{ '{:,}'.format(log.channels_removed) }} removed){% endif %}{{ skipped_text(log) }}{{ category_text(log) }}, {{ '{:,}'.format(log.epg_entries_synced or 0) }} program entries. See the account page for why.
-{%- elif log.status == 'ERROR' -%}
+{%- elif log.status == SYNC_LOG.ERROR -%}
 Sync failed. See the account page for why.
-{%- elif log.status == 'CANCELLED' -%}
+{%- elif log.status == SYNC_LOG.CANCELLED -%}
 Sync cancelled before it finished.
 {%- else -%}
 {{ log.status }}
@@ -74,7 +74,7 @@ Sync cancelled before it finished.
 {%- endmacro %}
 
 {% macro sparkline(logs) -%}
-{% set spark_class = {'SUCCESS': '', 'ERROR': 'err', 'PARTIAL': 'part', 'CANCELLED': 'none'} -%}
+{% set spark_class = {SYNC_LOG.SUCCESS: '', SYNC_LOG.ERROR: 'err', SYNC_LOG.PARTIAL: 'part', SYNC_LOG.CANCELLED: 'none'} -%}
 {% set recent = (logs | list)[:5] | reverse | list -%}
 <span class="spark" aria-hidden="true">
 {%- for _ in range(5 - recent | length) %}<i class="none"></i>{% endfor -%}
@@ -102,7 +102,7 @@ Sync cancelled before it finished.
 {% if not accounts %}
 <div class="empty-state">
   <p><strong>No accounts yet</strong></p>
-  <p class="text-muted" style="font-size:13px;">
+  <p class="page-intro">
     Add one to start browsing channels and importing guide data.
   </p>
   <a href="{{ url_for('accounts.new_account') }}" class="btn btn-primary">+ Add Account</a>
@@ -124,7 +124,7 @@ Sync cancelled before it finished.
 <div class="acct-rows">
   {% for account in accounts %}
   {% set acct_type = account.account_type or 'm3u' %}
-  {% set syncing = account.status == 'SYNCING' %}
+  {% set syncing = account.status == ACCOUNT_STATUS.SYNCING %}
   <div class="arow {{ m.account_edge_class(account.status) }}"
        data-id="{{ account.id }}"
        data-name="{{ account.name }}"

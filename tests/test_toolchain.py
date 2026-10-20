@@ -583,8 +583,7 @@ class SettingsSaveReprobesTests(ConfigSandbox):
         super().setUp()
         self._write_cfg({'config_version': cfgmod.CURRENT_CONFIG_VERSION})
         toolchain.reset_cache()
-        self.t = make_test_app()
-        self.t.app.config['WTF_CSRF_ENABLED'] = False
+        self.t = make_test_app(csrf=False)
         self.addCleanup(self.t.cleanup)
         self.addCleanup(toolchain.reset_cache)
         self.client = self.t.app.test_client()

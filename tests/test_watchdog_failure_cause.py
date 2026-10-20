@@ -39,10 +39,10 @@ from app.database import (  # noqa: E402
     RECORDING_FAILED, RECORDING_FAILED_DEAD_STREAM, Recording, RecordingEvent,
 )
 from tests.support import seed  # noqa: E402
-from tests.test_downtime_accounting import _RestartHarness  # noqa: E402
+from tests.support.watchdog import RestartHarness  # noqa: E402
 
 
-class _FailureCauseHarness(_RestartHarness):
+class _FailureCauseHarness(RestartHarness):
     """Same rig as the downtime/segment-teardown/connection-release suites, plus a
     thumbnail-persist stub so a give-up doesn't touch the real /dvr default, and a real
     account+channel (so the give-up's connlim.release(rec.channel.account_id, ...) call -
@@ -79,7 +79,7 @@ class _FailureCauseHarness(_RestartHarness):
         ).order_by(RecordingEvent.id.desc()).first()
 
     def _exited_capture_with_stderr_file(self, code, stderr_text):
-        """Same shape as _WatchdogHarness._exited_capture, but writes stderr_text straight
+        """Same shape as WatchdogHarness._exited_capture, but writes stderr_text straight
         to the spool file rather than passing it as a subprocess -c argv string - a URL in
         argv is exactly what tests/support/netguard.py's Popen guard exists to catch, even
         though nothing here is a real network access."""

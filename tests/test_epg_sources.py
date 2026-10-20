@@ -487,7 +487,7 @@ class PageTests(_Fixture):
         html = self.t.app.test_client().get(f'/channels/{ch.id}').get_data(as_text=True)
         self.assertIn('data-section="guide"', html)
         self.assertIn(f'Listings come from <strong>{self.src.name}</strong>', html)
-        self.assertIn('listing one program all day: <em>NFL - Steelers vs Panthers</em>', html)
+        self.assertIn('one program all day: <em>NFL - Steelers vs Panthers</em>', html)
         self.assertNotIn('filler', html.lower())
 
     def test_the_account_page_lists_its_sources(self):

@@ -32,9 +32,6 @@
 .svc-empty { margin-top: 14px; padding: 30px 18px; text-align: center; border: 1px dashed var(--border);
   border-radius: var(--radius); color: var(--text-muted); font-size: var(--fs-md); line-height: 1.6; }
 .svc-empty .btn { margin-top: 13px; }
-.svc-x { background: none; border: 1px solid var(--border); border-radius: var(--radius-sm);
-  color: var(--text-faint); font: inherit; font-size: var(--fs-sm); padding: 2px 8px; cursor: pointer; }
-.svc-x:hover { color: var(--bad); border-color: var(--bad); }
 .svc-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(330px, 1fr)); gap: 14px; margin-top: 14px; }
 .svc-grid .card { margin-top: 0; }
 .svc-body { padding: 12px 16px 14px; display: flex; flex-direction: column; gap: 9px; }
@@ -44,12 +41,11 @@
 .svc-hint { font-size: var(--fs-sm); color: var(--text-faint); font-family: var(--font-mono);
   word-break: break-all; margin-top: 4px; }
 .svc-actions { display: flex; align-items: center; gap: 8px; margin-top: 2px; }
+/* Border, text color and focus come from style.css's shared text-input recipe. */
 .svc-body .secret-field input[type=text],
-.svc-body input[type=number] { background: var(--bg2); border: 1px solid var(--border);
-  border-radius: var(--radius-sm); color: var(--text); font: inherit; font-size: var(--fs-md);
+.svc-body input[type=number] { background: var(--bg2); font: inherit; font-size: var(--fs-md);
   padding: 6px 10px; width: 100%; }
 .svc-body input[type=number] { max-width: 140px; }
-.svc-body input:focus { outline: none; border-color: var(--accent); }
 
 /* ── Alert routing ────────────────────────────────────────────────────
    One markup for both widths. At >960px the column headers say which control is
@@ -71,10 +67,6 @@
 .rt-filter .search-wrap { flex: none; }
 .rt-filter .chips { flex: 1 1 auto; }
 .rt-shown { font-size: var(--fs-sm); color: var(--text-faint); white-space: nowrap; }
-.chip.sev.active[data-sev="INFO"]  { background: var(--accent-soft); border-color: var(--accent); color: var(--accent-text); }
-.chip.sev.active[data-sev="WARN"]  { background: var(--warn-soft); border-color: var(--warn); color: var(--warn); }
-.chip.sev.active[data-sev="ERROR"],
-.chip.sev.active[data-sev="CRIT"]  { background: var(--bad-soft); border-color: var(--bad); color: var(--bad); }
 
 /* App URL is the one field whose control column stacks: the example link is a
    readout of what was typed, so it belongs under the input rather than beside it.

@@ -10,7 +10,9 @@ Guards asserted here:
   * a stale channel-backed recording launches ffmpeg against the channel's CURRENT
     stream_url and logs one RECORDING_URL_RERESOLVED event with both URLs creds-masked;
   * no event (and no write) when the URL already matches - the common case;
-  * group-backed and manual URL-only recordings are never touched.
+  * a group-backed recording follows its serving member's row the same way, and is left
+    alone while rec.url already is what selection or failover wrote (dev/changelog/1243);
+  * manual URL-only recordings are never touched.
 
 Runs against a throwaway temp SQLite DB - never the live dvr.db.
   python3 -m unittest tests.test_url_drift
@@ -76,9 +78,12 @@ class UrlDriftTests(unittest.TestCase):
         self.assertEqual(db.session.get(Recording, rec.id).url, self.channel.stream_url)
         self.assertEqual(self._events(rec.id), [])
 
-    def test_group_backed_recording_is_not_touched(self):
-        """Group recordings resolve their own member at start and via failover; this
-        helper must not race those writes."""
+    def test_group_backed_recording_is_repointed_when_its_members_row_moved(self):
+        """dev/changelog/1243: a group recording's rec.url is its serving member's URL as of
+        selection or failover. When the member's Channel row moves under the run (a host
+        roll, a sync finding the provider's URLs drifted) the next relaunch has to follow
+        it - until this, the exclusion for group recordings reconnected every relaunch to
+        the dead URL and burned the member as a dead feed."""
         group = make_group(members=[self.channel])
         rec = make_recording(channel_id=self.channel.id, group_id=group.id, url=STALE)
         db.session.commit()
@@ -86,7 +91,21 @@ class UrlDriftTests(unittest.TestCase):
         _reresolve_channel_url(rec.id, load_config())
         db.session.expire_all()
 
-        self.assertEqual(db.session.get(Recording, rec.id).url, STALE)
+        self.assertEqual(db.session.get(Recording, rec.id).url, self.channel.stream_url)
+        self.assertEqual(len(self._events(rec.id)), 1)
+
+    def test_group_backed_recording_on_its_members_current_url_is_left_alone(self):
+        """What selection and failover write is exactly what the re-resolve computes, so
+        a relaunch right after either writes nothing and logs nothing."""
+        group = make_group(members=[self.channel])
+        rec = make_recording(channel_id=self.channel.id, group_id=group.id,
+                             url=self.channel.stream_url)
+        db.session.commit()
+
+        _reresolve_channel_url(rec.id, load_config())
+        db.session.expire_all()
+
+        self.assertEqual(db.session.get(Recording, rec.id).url, self.channel.stream_url)
         self.assertEqual(self._events(rec.id), [])
 
     def test_manual_url_only_recording_is_not_touched(self):

@@ -182,13 +182,13 @@
         {% for hex, label in preset_colors %}
         <label class="color-swatch-label" title="{{ label }}">
           <input type="radio" name="color" value="{{ hex }}"
-                 {% if form.get('color', '#58a6ff') == hex %}checked{% endif %}
+                 {% if form.get('color', default_color) == hex %}checked{% endif %}
                  class="color-radio">
           <span class="color-swatch" style="background: {{ hex }}"></span>
         </label>
         {% endfor %}
         <div class="color-custom">
-          <label style="font-size: 12px; color: var(--text-muted);">Custom:</label>
+          <label style="font-size: var(--fs-sm); color: var(--text-muted);">Custom:</label>
           <input type="text" name="color" id="color-custom-input" class="form-control"
                  style="width: 100px; font-family: var(--font-mono);"
                  value="{{ form.get('color', '') if form.get('color', '') not in (preset_colors | map(attribute=0) | list) else '' }}"

@@ -40,7 +40,7 @@ from app.postprocessor import (  # noqa: E402
 )
 from tests.support import seed  # noqa: E402
 from tests.support.app import make_test_app  # noqa: E402
-from tests.test_conversion_monitor import _FakePopen  # noqa: E402
+from tests.support.fakes import FakePopen  # noqa: E402
 
 
 class _RunnerCase(unittest.TestCase):
@@ -84,7 +84,7 @@ class AdvancingConversionTests(_RunnerCase):
             # out_time climbing steadily, the whole way past pre_output_timeout.
             return next(ticks) * 1_000_000, 4096, False
 
-        fake = _FakePopen(alive_ticks=12, returncode=0)
+        fake = FakePopen(alive_ticks=12, returncode=0)
         result = self._run(fake, progress, stall_seconds=30, pre_output_timeout=0.2)
 
         self.assertTrue(result.success,
@@ -97,7 +97,7 @@ class AdvancingConversionTests(_RunnerCase):
         """The pre-output budget is a real rule, not a disabled one. Stall detection cannot
         see this case - it is gated on out_time > 0 precisely because a damaged source makes
         ffmpeg analyze for minutes before muxing (dev/docs/BUGS.md 2026-07-24)."""
-        fake = _FakePopen(alive_ticks=None)
+        fake = FakePopen(alive_ticks=None)
         result = self._run(fake, lambda p: (0, 0, False),
                            stall_seconds=30, pre_output_timeout=0.3)
 
@@ -112,7 +112,7 @@ class AdvancingConversionTests(_RunnerCase):
         producing output."""
         reads = iter([(2_000_000, 4096, False)] + [(None, None, False)] * 400)
 
-        fake = _FakePopen(alive_ticks=10, returncode=0)
+        fake = FakePopen(alive_ticks=10, returncode=0)
         result = self._run(fake, lambda p: next(reads),
                            stall_seconds=30, pre_output_timeout=0.15)
 
@@ -124,7 +124,7 @@ class AdvancingConversionTests(_RunnerCase):
     def test_frozen_output_is_still_killed_as_a_stall(self):
         """Removing the deadline must not remove the other rule: once output has started and
         then stops, stall_seconds is the authority and still fires."""
-        fake = _FakePopen(alive_ticks=None)
+        fake = FakePopen(alive_ticks=None)
         result = self._run(fake, lambda p: (5_000_000, 4096, False),
                            stall_seconds=0.3, pre_output_timeout=600)
 
@@ -140,7 +140,7 @@ class StallDetectionDisabledTests(_RunnerCase):
 
     def test_wall_clock_applies_when_stall_detection_is_off(self):
         ticks = iter(range(1, 500))
-        fake = _FakePopen(alive_ticks=None)
+        fake = FakePopen(alive_ticks=None)
         result = self._run(fake, lambda p: (next(ticks) * 1_000_000, 4096, False),
                            stall_seconds=0, pre_output_timeout=0.3)
 

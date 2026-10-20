@@ -49,8 +49,7 @@ class _Case(unittest.TestCase):
     start_scheduler = False
 
     def setUp(self):
-        self.t = make_test_app(start_scheduler=self.start_scheduler)
-        self.t.app.config['WTF_CSRF_ENABLED'] = False
+        self.t = make_test_app(start_scheduler=self.start_scheduler, csrf=False)
         self.client = self.t.client
         self.dvr = os.path.join(self.t._tmpdir, 'dvr')
         os.makedirs(self.dvr, exist_ok=True)
@@ -206,11 +205,13 @@ class ClearTests(_Case):
         self._assert_cleared(rid)
 
     def test_cancelling_clears_it(self):
+        """Cancelling a SCHEDULED recording deletes its row (dev/changelog/814, and the
+        form route since dev/changelog/1247), so the wait goes with it."""
         rid = self._scheduled()
         self._wait_on_slot(rid)
         resp = self.client.post(f'/recordings/{rid}/cancel')
         self.assertIn(resp.status_code, (200, 302))
-        self._assert_cleared(rid)
+        self.assertIsNone(self._row(rid))
 
     def test_aborting_clears_it(self):
         rid = self._scheduled()

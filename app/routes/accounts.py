@@ -13,19 +13,23 @@ from ..accounts import (NORM_DISABLED, NORM_MODES, coerce_normalization_mode,
                         report_source_removed, resolve_source_alerts,
                         start_source_refresh, sync_signature, update_source_stale_alert)
 from .. import account_stats_view
+from ..fmt_utils import iso_or_none
 from ..account_links import (add_host, add_login, delete_hosts_for_account,
-                             delete_logins_for_account, hosts_for_accounts, is_refused_now,
-                             logins_for_accounts, move_login, refusal_cooldown, remove_host,
-                             remove_login, set_active_host, update_login)
+                             delete_logins_for_account, host_list, hosts_for_accounts,
+                             is_refused_now, logins_for_accounts, move_login, refusal_cooldown,
+                             remove_host, remove_login, render_host, set_active_host,
+                             update_login)
 from ..account_stats import WINDOWS, today_local, windowed_stats
 from ..channel_groups import report_orphaned_guide_groups
 from ..channel_search import GROUP_ANY, OTHER_NEW, OTHER_REMOVED
 from ..config import load_config, config_default
 from ..database import (Account, AccountBlock, AccountStatDay, Channel, AccountSyncLog,
                         ChannelGroupMember, ChannelTest, EpgSource, EpgSourceSubscription,
-                        EPG_SOURCE_PROVIDER, EPG_SOURCE_URL)
+                        EPG_SOURCE_PROVIDER, EPG_SOURCE_URL, ACCOUNT_STATUS_SYNCING,
+                        ACCOUNT_STATUS_UNSYNCED, SYNC_LOG_SUCCESS, SYNC_LOG_CANCELLED,
+                        SYNC_LOG_IMPORTED)
 from ..db_utils import chunked, retry_on_locked
-from ..epg_sources import (MATCH_DISAGREE, MATCH_NEW, REFRESH_HOURS_CHOICES,
+from ..epg_sources import (MATCH_DISAGREE, MATCH_NEW, REFRESH_HOURS_CHOICES, directory_row_summary,
                            case_sensitive_matching,
                            accept_name_matches, account_sources_view,
                            add_url_source, borrowable_sources, clean_url_source_fields,
@@ -42,7 +46,7 @@ from ..account_blocks import (MAX_ACCOUNT_BLOCK_HOURS, account_limits, add_accou
                               block_views,
                               describe, end_account_block, rearm_waiting_starts,
                               recording_blocks, set_recording_blocks)
-from ..ui_constants import PRESET_COLORS
+from ..ui_constants import DEFAULT_COLOR, PRESET_COLORS
 from ..url_utils import mask_url_path
 from .channels import _DELETE_CHUNK_SIZE
 from .providers import account_provider, providers_section, sibling_blocks
@@ -142,7 +146,7 @@ def _sync_prompts(accounts, next_sync, cfg) -> dict:
     return {
         a.id: {
             'auto': bool(a.sync_enabled),
-            'next_at': next_sync[a.id].isoformat() if next_sync.get(a.id) else None,
+            'next_at': iso_or_none(next_sync.get(a.id)),
             'interval_hours': account_sync_interval_hours(a, cfg),
             'restart_default': restart,
         }
@@ -208,8 +212,8 @@ def _sync_log_json(log):
     is how a first paint and a refresh end up disagreeing."""
     return {
         'id': log.id,
-        'started_at': log.started_at.isoformat() if log.started_at else None,
-        'completed_at': log.completed_at.isoformat() if log.completed_at else None,
+        'started_at': iso_or_none(log.started_at),
+        'completed_at': iso_or_none(log.completed_at),
         'status': log.status,
         'channels': log.channels_synced or 0,
         'epg': log.epg_entries_synced or 0,
@@ -374,12 +378,12 @@ def _account_detail_payload(account, cfg, stats):
     logs = [_sync_log_json(log) for log in rows]
     logins = login_views(account.id, cfg)
     total_syncs = _sync_log_totals(account_ids).get(account.id, 0)
-    last_good = next((log for log in rows if log.status == 'SUCCESS'), None)
+    last_good = next((log for log in rows if log.status == SYNC_LOG_SUCCESS), None)
     # Queried rather than picked out of `rows`: the last ten runs can all be failures, and
     # a failed or cancelled run records no skip counts for the Content card to show.
     last_finished = (AccountSyncLog.query
                      .filter(AccountSyncLog.account_id == account.id,
-                             AccountSyncLog.status.in_(('SUCCESS', 'PARTIAL')))
+                             AccountSyncLog.status.in_(SYNC_LOG_IMPORTED))
                      .order_by(AccountSyncLog.started_at.desc())
                      .first())
     return {
@@ -456,6 +460,7 @@ def account_detail(account_id):
         sync_prompt=_sync_prompts([account], next_sync, cfg)[account.id],
         account_type=(account.account_type or 'm3u'),
         preset_colors=PRESET_COLORS,
+        default_color=DEFAULT_COLOR,
         norm_options=_NORM_OPTIONS,
         sync_hours_choices=_SYNC_HOURS_CHOICES,
         sections=ACCOUNT_SECTIONS,
@@ -492,6 +497,7 @@ def new_account():
                 account=None,
                 form=request.form,
                 preset_colors=PRESET_COLORS,
+        default_color=DEFAULT_COLOR,
                 norm_options=_NORM_OPTIONS,
                 norm_example=_norm_example(request.form.get('url_normalization', '')),
                 global_sync_hours=global_sync_hours,
@@ -514,7 +520,7 @@ def new_account():
             account = Account(
                 name=_field(form, 'name'),
                 account_type=account_type,
-                color=form.get('color', '#58a6ff'),
+                color=form.get('color', DEFAULT_COLOR),
                 url_normalization=coerce_normalization_mode(
                     form.get('url_normalization', '')),
                 sync_interval_hours=int(sync_hours_raw) if sync_hours_raw else None,
@@ -551,6 +557,7 @@ def new_account():
         account=None,
         form={'sync_enabled': True},
         preset_colors=PRESET_COLORS,
+        default_color=DEFAULT_COLOR,
         norm_options=_NORM_OPTIONS,
         norm_example=_norm_example(''),
         global_sync_hours=global_sync_hours,
@@ -600,7 +607,7 @@ def _start_sync(account, *, force=False, force_epg_resync=False, restart_schedul
     nothing for an account with automatic sync off, which has no schedule to move."""
     from ..accounts import run_manual_sync, sync_conflicts
 
-    if account.status == 'SYNCING':
+    if account.status == ACCOUNT_STATUS_SYNCING:
         return False, f'"{account.name}" is already syncing.', []
 
     if not force:
@@ -635,7 +642,7 @@ def _cancel_sync(account):
     @retry_on_locked()
     def _reset():
         finalize_sync_state(
-            account_id, 'UNSYNCED', 'CANCELLED',
+            account_id, ACCOUNT_STATUS_UNSYNCED, SYNC_LOG_CANCELLED,
             account_message='Sync reset (was stuck after service restart)',
             log_message='Reset after service restart',
         )
@@ -813,7 +820,7 @@ def _start_sync_from_dump(account):
     """Debug-only: sync from previously dumped files. Returns (started, message)."""
     from ..accounts import sync_account
 
-    if account.status == 'SYNCING':
+    if account.status == ACCOUNT_STATUS_SYNCING:
         return False, f'"{account.name}" is already syncing.'
     threading.Thread(
         target=sync_account,
@@ -922,6 +929,7 @@ def account_settings_api(account_id):
                          for v, label, example in _NORM_OPTIONS],
         'sync_hours_choices': _SYNC_HOURS_CHOICES,
         'preset_colors': [{'hex': hexval, 'label': label} for hexval, label in PRESET_COLORS],
+        'default_color': DEFAULT_COLOR,
         'global_sync_hours': cfg.get('sync', {}).get('sync_interval_hours', config_default('sync.sync_interval_hours')),
         'global_max_connections': cfg.get('accounts', {}).get('default_max_connections', 1),
         'global_xtream_debug': cfg.get('debug', {}).get('xtream_debug_mode', False),
@@ -947,18 +955,23 @@ def save_account_api(account_id):
 
 
 @retry_on_locked()
-def _renormalize_chunk(chunk_ids, mode):
+def _renormalize_chunk(chunk_ids, mode, listed_hosts=frozenset(), active_host=None):
     """Recompute stream_url/url_normalizable/provider_stream_id for one chunk of channels
-    from their stored raw_stream_url, under `mode`. Deterministic and idempotent (never inserts a row), so a
-    lock-retry re-running the whole chunk is always safe - unlike an INSERT, there is no
-    duplicate-row risk from CLAUDE.md's "one commit per decorated closure" rule."""
+    from their stored raw_stream_url, under `mode`, with the account's active host rendered
+    onto every URL whose raw host is listed (`listed_hosts`/`active_host`, the caller's one
+    `host_list()` read) - exactly what the sync writes, so a re-normalize can never put the
+    account back on a host it rolled off (dev/changelog/1243). Deterministic and idempotent
+    (never inserts a row), so a lock-retry re-running the whole chunk is always safe -
+    unlike an INSERT, there is no duplicate-row risk from CLAUDE.md's "one commit per
+    decorated closure" rule."""
     rows = Channel.query.filter(Channel.id.in_(chunk_ids)).all()
     mappings = []
     stamped_at = datetime.utcnow()
     for ch in rows:
         if not ch.raw_stream_url:
             continue
-        new_url = normalize_url_with_mode(ch.raw_stream_url, mode)
+        new_url = render_host(normalize_url_with_mode(ch.raw_stream_url, mode),
+                              listed_hosts, active_host)
         # One parse for both, as in _upsert_channels, so the pair can never disagree.
         provider_sid = url_provider_stream_id(ch.raw_stream_url)
         normalizable = provider_sid is not None
@@ -969,9 +982,10 @@ def _renormalize_chunk(chunk_ids, mode):
             if new_url != ch.stream_url:
                 # stream_url is one of the four columns ch_fts indexes, so rewriting it
                 # genuinely moves the channels search index's source and has to stamp the
-                # watermark (app/database.py::Channel.search_text_updated_at). This is the
-                # only writer of an indexed column outside _upsert_channels; url_normalizable
-                # and provider_stream_id are not indexed and must not stamp on their own.
+                # watermark (app/database.py::Channel.search_text_updated_at), as the two
+                # other writers of stream_url do (_upsert_channels and the host roll's
+                # account_links.rerender_stream_urls); url_normalizable and
+                # provider_stream_id are not indexed and must not stamp on their own.
                 row['search_text_updated_at'] = stamped_at
             mappings.append(row)
     if mappings:
@@ -999,9 +1013,10 @@ def renormalize_urls_api(account_id):
 
     ids = [cid for (cid,) in db.session.query(Channel.id)
            .filter_by(account_id=account_id).all()]
+    listed_hosts, active_host = host_list(account_id)
     changed = 0
     for chunk in chunked(ids, _DELETE_CHUNK_SIZE):
-        changed += _renormalize_chunk(chunk, mode)
+        changed += _renormalize_chunk(chunk, mode, listed_hosts, active_host)
     if changed:
         duplicate_streams.recompute_and_commit()
 
@@ -1632,6 +1647,7 @@ def _upcoming_view(entry, tz, h24) -> list[dict]:
 def _file_row_view(entry, tz, h24) -> dict:
     return {'xml_id': entry.xml_id, 'entry_count': entry.entry_count,
             'distinct_titles': entry.distinct_titles, 'sole_title': entry.sole_title,
+            'summary': directory_row_summary(entry.entry_count, entry.distinct_titles),
             'horizon': format_local(entry.horizon_until, 'monthday_time', tz=tz, h24=h24)
             if entry.horizon_until else None,
             'upcoming': _upcoming_view(entry, tz, h24)}

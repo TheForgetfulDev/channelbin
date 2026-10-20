@@ -175,6 +175,9 @@ def score_recording_metrics_quality(downtime_seconds: float, restart_count: int,
 
 
 def _iso(dt):
+    # duplicated from app/fmt_utils.py::iso_or_none - a breakdown may be handed an instant
+    # that is already a string (replayed from stored JSON), which that helper would return
+    # unchanged only by accident.
     return dt.isoformat() if hasattr(dt, 'isoformat') else str(dt)
 
 
@@ -902,36 +905,23 @@ def channel_failing_reason(test, channel, cfg) -> Optional[str]:
 
 def _apply_failing_alert(rec, name: str, reason: Optional[str], source: str, is_group: bool):
     """Create-or-dismiss the standing RECORDING_CHANNEL_FAILING alert for one
-    (recording, channel-or-group) pair, keyed by `source`. Dedupe/auto-dismiss mirror
-    app/channel_groups.py::_log_and_alert_reconcile's GROUP_FORMAT_MISMATCH pattern."""
-    from . import db
-    from .database import Alert
+    (recording, channel-or-group) pair, keyed by `source` - the standing-alert pattern's
+    two halves, app/alerts.py::has_open_alert() and dismiss_open_alerts()."""
+    from .alerts import create_alert, dismiss_open_alerts, has_open_alert
     from .tz_utils import format_local
-    from datetime import datetime
 
-    if reason is not None:
-        exists = Alert.query.filter_by(
-            alert_type='RECORDING_CHANNEL_FAILING', source=source, dismissed_at=None
-        ).first()
-        if exists is not None:
-            return
-        from .alerts import create_alert
-        label = 'Group' if is_group else 'Channel'
-        create_alert(
-            'RECORDING_CHANNEL_FAILING',
-            f'Scheduled recording channel failing: {rec.name}',
-            body=(f'{label} "{name}" backing scheduled recording "{rec.name}" '
-                  f'(starts {format_local(rec.start_time)}) is failing: {reason}.'),
-            source=source, recording_id=rec.id)
-    else:
-        @retry_on_locked()
-        def _dismiss():
-            for a in Alert.query.filter_by(
-                    alert_type='RECORDING_CHANNEL_FAILING', source=source, dismissed_at=None
-            ).all():
-                a.dismissed_at = datetime.utcnow()
-            db.session.commit()
-        _dismiss()
+    if reason is None:
+        dismiss_open_alerts('RECORDING_CHANNEL_FAILING', source)
+        return
+    if has_open_alert('RECORDING_CHANNEL_FAILING', source):
+        return
+    label = 'Group' if is_group else 'Channel'
+    create_alert(
+        'RECORDING_CHANNEL_FAILING',
+        f'Scheduled recording channel failing: {rec.name}',
+        body=(f'{label} "{name}" backing scheduled recording "{rec.name}" '
+              f'(starts {format_local(rec.start_time)}) is failing: {reason}.'),
+        source=source, recording_id=rec.id)
 
 
 def _group_failing_reason(group, cfg) -> Optional[str]:

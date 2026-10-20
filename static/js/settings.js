@@ -16,9 +16,8 @@
   const $ = (sel, root = document) => root.querySelector(sel);
   const $$ = (sel, root = document) => [...root.querySelectorAll(sel)];
 
-  const bootEl = $('#settings-boot');
-  if (!bootEl) return;
-  const BOOT = JSON.parse(bootEl.textContent);
+  const BOOT = readBootJson('settings-boot');
+  if (!BOOT) return;
 
   // The sections are read off the DOM rather than restated here. One list, so the
   // rail, the picker sheet and the cards cannot disagree about what exists.

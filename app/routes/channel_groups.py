@@ -27,11 +27,11 @@ from ..database import (
 )
 from ..accounts import (
     lifecycle_states_for_channels,
-    tags_matching, transfer_channel_state,
+    tags_matching, transfer_channel_state, transfer_keeper_problem,
 )
 from ..channel_groups import (
     blocked_account_ids_now, effective_score, rank_members, suggest_candidates, group_reference_key,
-    derived_reference_key, lock_ranking_ids,
+    derived_reference_key, lock_ranking_ids, resolution_pixels,
     classify_group_formats, group_format_outliers, format_key, format_label,
     member_channels, recording_members, test_member_ids, pick_best_member,
     participation_is_recording, participating_member_ids, group_manages_format,
@@ -71,9 +71,9 @@ channel_groups_bp = Blueprint('channel_groups', __name__)
 def _next_guide_sort_order():
     """Groups and channels share one guide ordering space - next slot after both."""
     max_ch = db.session.query(db.func.max(Channel.guide_sort_order))\
-        .filter_by(in_guide=True).scalar() or 0
+        .filter_by(in_guide=True).scalar() or 0  # guide-flag-read-ok: own rows' sort slots
     max_gr = db.session.query(db.func.max(ChannelGroup.guide_sort_order))\
-        .filter_by(in_guide=True).scalar() or 0
+        .filter_by(in_guide=True).scalar() or 0  # guide-flag-read-ok: a group's own row flag
     return max(max_ch, max_gr) + 1
 
 
@@ -891,15 +891,6 @@ def _build_group_timeline(group):
     return entries
 
 
-def _resolution_area(res):
-    """Pixel area of a "WxH" resolution string for biggest-first sorting; 0 if unparseable."""
-    try:
-        w, h = res.lower().split('x')
-        return int(w) * int(h)
-    except (ValueError, AttributeError):
-        return 0
-
-
 def _format_option_sets(group_format):
     """(resolution_options, fps_options) for the Part J Group Format dropdowns.
 
@@ -916,7 +907,7 @@ def _format_option_sets(group_format):
     res_set.update(['1920x1080', '1280x720', '640x480'])
     if group_format['resolution']:
         res_set.add(group_format['resolution'])
-    resolution_options = sorted(res_set, key=_resolution_area, reverse=True)
+    resolution_options = sorted(res_set, key=resolution_pixels, reverse=True)
 
     fps_set = {round(f[0]) for f in
                db.session.query(ChannelTest.fps)
@@ -1608,8 +1599,7 @@ def build_group_detail_context(group):
         'window_label': window_label,
         'health_check_profiles': profiles,
         # Folded once for the page - see the note in groups_page().
-        'check_profiles': health_check_profile_payload(
-            load_config().get('channel_testing', {}), profiles),
+        'check_profiles': health_check_profile_payload(ct_cfg, profiles),
         'inherited_check': inherited_check,
         'cloned_from': cloned_from,
         'guide_listings': _guide_listings_ctx(group) if is_stored else None,
@@ -1682,7 +1672,7 @@ def group_detail_rows_api(group_id):
 @channel_groups_bp.route('/api/channel-groups/<int:group_id>/format-plan')
 def group_format_plan(group_id):
     """Read-only: for each auto-select-format strategy, which video format wins and
-    why, over the group's current members (or a check-only group's computed target
+    why, over the group's current members (or the system group's computed target
     channels).
 
     **Always scoped ANY_JOB, and always ranked over the lock population.** This endpoint
@@ -1859,9 +1849,13 @@ def remove_members(group_id):
     recording-enabled set exactly as unticking it does, and the user is standing right
     here, so it is confirmed rather than merely alerted.
 
-    No view-level retry_on_locked any more: the removal now shares its commit with the
-    demotion, and transfer_channel_state() is a side effect that must not be re-run by a
-    lock retry, so the unit is the closure below rather than the whole view."""
+    The retried unit is the closure below, not the whole view: the removal, the transfer
+    and the demotion share one commit, and a retry re-runs exactly that unit from a
+    rolled-back session. transfer_channel_state() is pure database work (guide flags,
+    membership rows, scheduled-recording repoints, event rows) and is safe to re-run from
+    inside it - its own docstring asks to be called only there. What a view-level decorator
+    over a body with more than one commit would do is re-run work that had already landed,
+    which is the duplicate-row defect the one-commit-per-closure rule exists for."""
     group = db.session.get(ChannelGroup, group_id)
     if group is None:
         return jsonify({'error': 'Group not found'}), 404
@@ -1885,8 +1879,8 @@ def remove_members(group_id):
         return err
     demoting = bool(state['breaches'] and state['in_guide'])
 
-    # transfer_channel_state() reassigns rows across channels and is not safe to re-run,
-    # so the retried unit is this closure and everything it touches is re-fetched inside.
+    # One commit, one closure: everything it touches is re-fetched inside, so a lock retry
+    # re-runs the whole read-modify-write from fresh rows.
     @retry_on_locked()
     def _remove():
         g = db.session.get(ChannelGroup, group_id)
@@ -1907,19 +1901,17 @@ def remove_members(group_id):
             if transfer:
                 keep_id = r.get('keep_channel_id')
                 keeper = db.session.get(Channel, keep_id) if keep_id else None
-                # Server re-validates the keeper from DB ids - never trust the client
-                # blindly (same "server re-validates everything" pattern as repoint).
-                if keeper is None or keeper.id == ch.id or keeper.id not in by_channel:
-                    transfer_skipped.append({'channel_id': ch.id,
-                                             'reason': 'No valid channel to keep in this group'})
                 # The same stream either way the group page's sets are built: one URL, or
                 # one stored duplicate cluster (a copy through a provider,
                 # dev/changelog/1175).
-                elif not (keeper.stream_url == ch.stream_url
-                          or (keeper.duplicate_cluster_id is not None
-                              and keeper.duplicate_cluster_id == ch.duplicate_cluster_id)):
-                    transfer_skipped.append({'channel_id': ch.id,
-                                             'reason': 'Kept channel is no longer the same stream'})
+                problem = transfer_keeper_problem(
+                    ch, keeper, member_ids=by_channel, where=' in this group',
+                    same_stream=lambda src, kp: (
+                        kp.stream_url == src.stream_url
+                        or (kp.duplicate_cluster_id is not None
+                            and kp.duplicate_cluster_id == src.duplicate_cluster_id)))
+                if problem:
+                    transfer_skipped.append({'channel_id': ch.id, 'reason': problem})
                 else:
                     touched_group_ids.update(mm.group_id for mm in ch.group_memberships)
                     transfer_channel_state(ch, keeper, cfg)
@@ -1967,6 +1959,20 @@ def remove_members(group_id):
                     'cancelled_recordings': len(cancelled)})
 
 
+def _live_recording_refusal(group, rec, doing: str):
+    """The 409 every path that could strand a running recording answers with: the gate below
+    and delete_group. `doing` is the action in the sentence ("Turning off the last member it
+    can record from", "Deleting the group"). static/js reads `recording_in_progress`, so the
+    payload keys are an API."""
+    until = format_local(rec.stop_time, style='clock', none_value='an unknown time')
+    return jsonify({
+        'error': (f'"{group.name}" is recording until {until}. {doing} would leave that '
+                  'recording with nowhere to fail over to. Let it finish, or abort it '
+                  'deliberately, then come back to this.'),
+        'recording_in_progress': {'recording_id': rec.id, 'name': rec.name, 'until': until},
+    }), 409
+
+
 def _invariant_gate(group, losing_channel_ids, confirmed):
     """DESIGN-channel-groups-model.md 15, enforced. Returns (error_response, state) -
     `error_response` is non-None when the caller must stop.
@@ -1993,16 +1999,8 @@ def _invariant_gate(group, losing_channel_ids, confirmed):
     if not state['breaches']:
         return None, state
     if state['live']:
-        rec = state['live'][0]
-        until = format_local(rec.stop_time, style='clock', none_value='an unknown time')
-        return (jsonify({
-            'error': (f'"{group.name}" is recording until {until}. Turning off the last '
-                      'member it can record from would leave that recording with nowhere '
-                      'to fail over to. Let it finish, or abort it deliberately, then '
-                      'come back to this.'),
-            'recording_in_progress': {'recording_id': rec.id, 'name': rec.name,
-                                      'until': until},
-        }), 409), state
+        return _live_recording_refusal(
+            group, state['live'][0], 'Turning off the last member it can record from'), state
     if not confirmed:
         return (jsonify({
             'error': 'This would leave the group with no member to record from.',
@@ -2697,15 +2695,7 @@ def delete_group(group_id):
 
     live = group_live_recordings(group)
     if live:
-        rec = live[0]
-        until = format_local(rec.stop_time, style='clock', none_value='an unknown time')
-        return jsonify({
-            'error': (f'"{group.name}" is recording until {until}. Deleting the group '
-                      'would leave that recording with nowhere to fail over to. Let it '
-                      'finish, or abort it deliberately, then come back to this.'),
-            'recording_in_progress': {'recording_id': rec.id, 'name': rec.name,
-                                      'until': until},
-        }), 409
+        return _live_recording_refusal(group, live[0], 'Deleting the group')
     scheduled = group_scheduled_recordings(group)
     if scheduled and not (request.get_json(silent=True) or {}).get('confirm'):
         return jsonify({

@@ -26,6 +26,7 @@ from .account_links import (is_credential_refusal, is_resolution_failure,
                             note_refusal_for_holder, render_held_login,
                             roll_host_for_channel)
 from .config import config_default
+from .fmt_utils import iso_or_none
 from .postprocessor import EtaSmoother
 from .proc_utils import GrowthMonitor, terminate_or_kill, wait_for_file_data
 from .storage_dirs import SCREENSHOTS, image_dir
@@ -237,13 +238,13 @@ def get_status() -> dict:
             'current_channel_name': s.current_channel_name,
             'current_channel_url': mask_creds(s.current_channel_url),
             'current_phase': s.current_phase,
-            'current_test_started_at': s.current_test_started_at.isoformat() if s.current_test_started_at else None,
+            'current_test_started_at': iso_or_none(s.current_test_started_at),
             'current_test_drop_count': s.current_test_drop_count,
             'current_test_screenshot_url': screenshot_url,
             'current_live_bytes': s.current_live_bytes,
             'current_connect_attempt': s.current_connect_attempt,
             'max_connect_attempts': s.max_connect_attempts,
-            'wait_started_at': s.wait_started_at.isoformat() if s.wait_started_at else None,
+            'wait_started_at': iso_or_none(s.wait_started_at),
             'wait_duration_seconds': s.wait_duration_seconds,
             'last_channel_name': s.last_channel_name,
             'last_channel_id': s.last_channel_id,
@@ -252,7 +253,7 @@ def get_status() -> dict:
             'total_channels': s.total_channels,
             'completed_channels': s.completed_channels,
             'eta_seconds': s.eta_seconds,
-            'run_started_at': s.run_started_at.isoformat() if s.run_started_at else None,
+            'run_started_at': iso_or_none(s.run_started_at),
             'last_skip_reason': s.last_skip_reason,
             'current_job_id': s.current_job_id,
             'run_kind': s.run_kind,

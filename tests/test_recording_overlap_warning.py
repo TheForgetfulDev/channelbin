@@ -27,8 +27,7 @@ from app.tz_utils import local_input_value, parse_local_to_utc  # noqa: E402
 
 class _RecordingOverlapCase(unittest.TestCase):
     def setUp(self):
-        self.t = make_test_app()
-        self.t.app.config['WTF_CSRF_ENABLED'] = False
+        self.t = make_test_app(csrf=False)
         self.start = datetime.utcnow() + timedelta(hours=2)
         self.stop = self.start + timedelta(hours=1)
 

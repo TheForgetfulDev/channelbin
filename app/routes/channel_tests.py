@@ -9,16 +9,17 @@ from flask import (
 from sqlalchemy import func
 
 from .. import db
+from ..fmt_utils import iso_or_none
 from ..database import (
     Channel, ChannelTest, OnDemandTestJob, HealthCheckProfile,
-    ChannelGroup, ChannelGroupMember, Recording,
+    ChannelGroup, Recording,
     TEST_STATUS_COMPLETED, TEST_STATUS_CANCELLED, TEST_STATUS_FAILED,
     OD_JOB_STATUS_QUEUED, OD_JOB_STATUS_SCHEDULED, OD_JOB_STATUS_RUNNING,
     OD_JOB_STATUS_CANCELLED, OD_JOB_IDLE_STATUSES,
 )
 from ..accounts import (
     duplicates_within, duplicate_groups_within, lifecycle_states_for_channels,
-    transfer_channel_state,
+    transfer_channel_state, transfer_keeper_problem,
 )
 from ..channel_groups import (effective_score, check_target_channels,
                               set_participation, build_group_with_members,
@@ -181,7 +182,7 @@ def _build_test_dict(t, test_duration_seconds=config_default('channel_testing.te
         'started_et': format_local(t.test_started_at, 'monthday_time', none_value=None),
         # Naive-UTC ISO string so the client can compute test age (the "not tested in 24h"
         # filter). JS appends 'Z' when parsing, matching the rest of this page's timestamps.
-        'tested_at': t.test_started_at.isoformat() if t.test_started_at else None,
+        'tested_at': iso_or_none(t.test_started_at),
         'resolution': t.resolution,
         'fps': round(t.fps, 1) if t.fps else None,
         'frame_count': t.frame_count,
@@ -570,7 +571,7 @@ def apply_job_schedule(job, sched, prior_status):
     non-idempotent-side-effect rule. Create, reschedule and clone all schedule through
     this one function (dev/changelog/1077).
 
-    `prior_status` is what Unschedule restores; it is left alone when the job was already
+    `prior_status` is what Remove schedule restores; it is left alone when the job was already
     SCHEDULED (an edit of an existing schedule)."""
     from ..scheduler import schedule_on_demand_job
     recurring = sched['recurring']
@@ -1191,83 +1192,6 @@ def test_selected_on_demand_job(job_id):
     return jsonify({'success': True, 'job_id': job_id, 'channels_to_test': len(subset)})
 
 
-@channel_tests_bp.route('/api/channel-tests/on-demand/<int:job_id>/channels', methods=['POST'])
-@retry_on_locked()
-def add_channels_to_job(job_id):
-    """Add one or more channels to an existing (non-running) on-demand job's group."""
-    job = db.session.get(OnDemandTestJob, job_id)
-    if job is None:
-        return jsonify({'error': 'Job not found'}), 404
-    if job.status == OD_JOB_STATUS_RUNNING:
-        return jsonify({'error': 'Cannot modify a running job'}), 409
-    group, error = _editable_job_group_or_error(job)
-    if group is None:
-        return error
-
-    data = request.get_json(force=True, silent=True) or {}
-    new_ids = data.get('channel_ids') or []
-    if not new_ids:
-        return jsonify({'error': 'At least one channel is required'}), 400
-
-    existing_set = {m.channel_id for m in group.memberships}
-    next_pos = len(group.memberships)
-    valid_ids = {ch.id for ch in Channel.query.filter(Channel.id.in_(new_ids)).all()}
-
-    added = []
-    for cid in new_ids:
-        if cid in valid_ids and cid not in existing_set:
-            db.session.add(ChannelGroupMember(group_id=group.id, channel_id=cid,
-                                              position=next_pos + len(added)))
-            existing_set.add(cid)
-            added.append(cid)
-
-    if not added:
-        return jsonify({'error': 'No new valid channels to add'}), 400
-
-    channel_hiding.recompute(added)
-    touch_group(group)
-    db.session.commit()
-    channel_count = len(existing_set)
-    return jsonify({'success': True, 'job_id': job_id, 'added_count': len(added), 'channel_count': channel_count})
-
-
-@channel_tests_bp.route('/api/channel-tests/on-demand/<int:job_id>/channels/<int:channel_id>', methods=['DELETE'])
-def remove_channel_from_job(job_id, channel_id):
-    """Remove a channel from an existing (non-running) on-demand job's group, along with
-    its history."""
-    job = db.session.get(OnDemandTestJob, job_id)
-    if job is None:
-        return jsonify({'error': 'Job not found'}), 404
-    if job.status == OD_JOB_STATUS_RUNNING:
-        return jsonify({'error': 'Cannot modify a running job'}), 409
-    group, error = _editable_job_group_or_error(job)
-    if group is None:
-        return error
-
-    membership = next((m for m in group.memberships if m.channel_id == channel_id), None)
-    if membership is None:
-        return jsonify({'error': 'Channel is not part of this job'}), 404
-    if len(group.memberships) == 1:
-        return jsonify({'error': 'Cannot remove the last channel from a test'}), 400
-
-    from ..channel_tester import delete_tests_collecting_screenshots
-    from ..recorder import delete_files
-
-    @retry_on_locked()
-    def _remove_and_commit():
-        db.session.delete(membership)
-        paths = delete_tests_collecting_screenshots(
-            ChannelTest.query.filter_by(job_id=job_id, channel_id=channel_id))
-        # Losing its last group membership is what lets a deferred hide finally take effect.
-        channel_hiding.recompute([channel_id])
-        touch_group(group)
-        db.session.commit()
-        return paths
-
-    delete_files(_remove_and_commit())
-    return jsonify({'success': True, 'job_id': job_id, 'channel_count': len(group.memberships)})
-
-
 @channel_tests_bp.route('/api/channel-tests/on-demand/<int:job_id>/remove-duplicates', methods=['POST'])
 def remove_duplicate_channels(job_id):
     """Bulk-remove losing duplicate channels from a job (and its ChannelTest history),
@@ -1299,7 +1223,7 @@ def remove_duplicate_channels(job_id):
 
     cfg = load_config()
 
-    from ..channel_tester import delete_tests_collecting_screenshots
+    from ..health_recompute import apply_tests_deletion
     from ..recorder import delete_files
 
     @retry_on_locked()
@@ -1318,14 +1242,10 @@ def remove_duplicate_channels(job_id):
             if transfer and ch is not None:
                 keep_id = r.get('keep_channel_id')
                 keeper = db.session.get(Channel, keep_id) if keep_id else None
-                # Server re-validates the keeper from DB ids - never trust the client blindly
-                # (same "server re-validates everything" pattern as the repoint route).
-                if keeper is None or keeper.id == ch.id or keeper.id not in by_channel:
-                    transfer_skipped.append({'channel_id': cid,
-                                             'reason': 'No valid channel to keep in this test'})
-                elif keeper.stream_url != ch.stream_url:
-                    transfer_skipped.append({'channel_id': cid,
-                                             'reason': 'Kept channel no longer shares the stream URL'})
+                problem = transfer_keeper_problem(ch, keeper, member_ids=by_channel,
+                                                  where=' in this test')
+                if problem:
+                    transfer_skipped.append({'channel_id': cid, 'reason': problem})
                 else:
                     transfer_channel_state(ch, keeper, cfg)
                     transferred.append(cid)
@@ -1341,9 +1261,21 @@ def remove_duplicate_channels(job_id):
         # first still sees the membership (dev/changelog/1138).
         channel_hiding.recompute(left_the_group)
 
-        screenshot_paths = delete_tests_collecting_screenshots(ChannelTest.query.filter(
-            ChannelTest.job_id == job_id, ChannelTest.channel_id.in_(remove_ids)
-        ))
+        # Each channel's tests on this check go with it, and a channel whose stored score
+        # still counts one of them is recomputed from what remains - the way deleting one
+        # test from Test History already does (health_recompute.apply_test_deletion), so a
+        # score never carries tests that are no longer on record. Only channels where a
+        # deleted test counted move, or the pruned-residual shortfall would move scores
+        # for no visible reason (dev/changelog/1149).
+        screenshot_paths = []
+        for cid in remove_ids:
+            channel = db.session.get(Channel, cid)
+            if channel is None:
+                continue
+            _result, paths = apply_tests_deletion(
+                channel, ChannelTest.query.filter_by(job_id=job_id, channel_id=cid), cfg,
+                reason=f'its tests on health check "{job.name}" were deleted')
+            screenshot_paths.extend(paths)
         # Both outcomes change the group's member set: a plain removal deletes the
         # membership, and a transfer moves it onto the keeper.
         touch_group(group)

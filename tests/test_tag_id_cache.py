@@ -25,6 +25,7 @@ from tests.support.config_sandbox import ConfigSandbox  # noqa: E402
 from tests.support.iocount import IOCounter, all_engines  # noqa: E402
 from tests.support import seed  # noqa: E402
 from tests.support.search import only_hiding  # noqa: E402
+from tests.support.csrf import csrf_token  # noqa: E402
 from app import db  # noqa: E402
 from app.database import EPGEntry, Tag, TagPattern  # noqa: E402
 from app.channel_search import (  # noqa: E402
@@ -307,8 +308,7 @@ class TagDeleteEvictsCacheTests(unittest.TestCase):
     behind under a tag id nothing looks up again."""
 
     def setUp(self):
-        self.t = make_test_app()
-        self.t.app.config['WTF_CSRF_ENABLED'] = False
+        self.t = make_test_app(csrf=False)
         self.client = self.t.app.test_client()
         self.ctx = self.t.app.app_context()
         self.ctx.push()
@@ -359,10 +359,7 @@ class SettingsToggleClearsCacheTests(ConfigSandbox):
         clear_tag_channel_ids_cache()
 
     def _csrf(self):
-        import re
-        html = self.client.get('/settings').get_data(as_text=True)
-        m = re.search(r'name="csrf-token" content="([^"]+)"', html)
-        return m.group(1) if m else None
+        return csrf_token(self.client)
 
     def test_flipping_the_field_off_clears_whatever_was_cached(self):
         _tag_channel_ids_cache[123] = ((), 'x', frozenset())

@@ -182,9 +182,23 @@ def _tool_entry(name, config_key, configured_path, resolved, source):
         # name unchanged when nothing resolves, and calling that 'path' would be this
         # module claiming a provenance it does not have.
         'source': source if banner is not None else None,
+        # The provenance in words, for every surface that shows it (the Maintenance card,
+        # the readiness row): one spelling here rather than a map per renderer, which had
+        # already drifted on `configured` (dev/changelog/1244).
+        'source_label': source_label(source, config_key) if banner is not None else None,
         'version': version,
         'banner': banner,
     }
+
+
+def source_label(source, config_key) -> str:
+    if source == SOURCE_PATH:
+        return 'found on PATH'
+    if source == SOURCE_SIBLING:
+        return 'found beside the configured ffmpeg'
+    if source == SOURCE_CONFIGURED:
+        return f'set in {config_key}'
+    return 'resolved'
 
 
 def _describe_ffmpeg(configured_path):
@@ -607,7 +621,10 @@ def ffprobe_missing(configured_ffmpeg_path=None, configured_ffprobe_path=None) -
                               configured_ffprobe_path)['ffprobe']['found']
 
 
-_CONSEQUENCE = {
+#: What stops working without each binary. Read by the missing-tool alert and log line here
+#: and by the readiness check's `without` (app/readiness.py), so the two cannot say
+#: different things about the same loss.
+CONSEQUENCE = {
     'ffmpeg': ('Nothing can be captured or converted without it: every recording and every '
                'health check will fail as soon as it starts.'),
     'ffprobe': ('It ships alongside ffmpeg but is a separate binary. Without it ChannelBin '
@@ -648,7 +665,7 @@ def report_tool_state(source: str, configured_ffmpeg_path=None, configured_ffpro
             # for any ERROR record, which would duplicate the row created just below.
             log.warning(
                 'Could not run %s (looked for it at: %s). %s Observed at: %s',
-                name, info['path'], _CONSEQUENCE[name], source)
+                name, info['path'], CONSEQUENCE[name], source)
 
     if not has_app_context():
         return tools
@@ -662,7 +679,7 @@ def report_tool_state(source: str, configured_ffmpeg_path=None, configured_ffpro
                     EXTERNAL_TOOL_MISSING,
                     f'{name} is missing, so part of ChannelBin cannot work',
                     body=(f'ChannelBin could not run {name}. It was looked for at '
-                          f'"{tools[name]["path"]}". {_CONSEQUENCE[name]} '
+                          f'"{tools[name]["path"]}". {CONSEQUENCE[name]} '
                           f'Install ffmpeg (which supplies both ffmpeg and ffprobe) on this '
                           f'machine, or set ffmpeg.path in Settings to the absolute path of '
                           f'an ffmpeg binary - ChannelBin takes ffprobe from the same '

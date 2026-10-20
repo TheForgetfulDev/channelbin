@@ -135,8 +135,7 @@ class AccountsPageSyncGuardTests(unittest.TestCase):
     """
 
     def setUp(self):
-        self.t = make_test_app()
-        self.t.app.config['WTF_CSRF_ENABLED'] = False
+        self.t = make_test_app(csrf=False)
         self.account = seed.make_account(name='Conflicted')
         db.session.commit()
         self.account_id = self.account.id
@@ -220,8 +219,7 @@ class JobsRunNowSyncGuardTests(unittest.TestCase):
     """
 
     def setUp(self):
-        self.t = make_test_app()
-        self.t.app.config['WTF_CSRF_ENABLED'] = False
+        self.t = make_test_app(csrf=False)
         self.account = seed.make_account(name='Conflicted')
         db.session.commit()
         self.account_id = self.account.id

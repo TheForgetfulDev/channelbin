@@ -85,15 +85,14 @@ class RegistryTests(unittest.TestCase):
                 self.assertIn(check.cost, (readiness.CHEAP, readiness.ON_DEMAND))
                 self.assertIn(check.area, {aid for aid, _label in readiness.AREAS})
 
-    def test_every_status_has_a_rank(self):
-        """A state with no rank silently sorts as whatever the dict default would be."""
-        for status in readiness.STATUSES:
-            self.assertIn(status, readiness.STATUS_RANK)
-
-    def test_every_capability_state_has_a_mark_and_a_colour(self):
-        for state in readiness.CAP_STATES:
-            self.assertIn(state, readiness.CAP_MARK)
-            self.assertIn(state, readiness.CAP_HEALTH)
+    def test_every_capability_state_has_a_mark_a_colour_and_a_report_word(self):
+        """The five states are the ones _capability_state() can answer; each of the three
+        tables that render one must know every one of them."""
+        states = {readiness.CAN, readiness.CANNOT, readiness.DEGRADED, readiness.CAP_UNKNOWN,
+                  readiness.NOT_SET_UP}
+        self.assertEqual(set(readiness.CAP_REPORT_WORD), states)
+        self.assertEqual(set(readiness.CAP_MARK), states)
+        self.assertEqual(set(readiness.CAP_HEALTH), states)
 
     def test_the_checks_that_cost_something_are_the_four_that_were_designed_that_way(self):
         """A cheap check that becomes expensive has to be declared ON_DEMAND in the same

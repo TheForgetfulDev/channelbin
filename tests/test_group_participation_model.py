@@ -114,8 +114,7 @@ class SchemaDefaultsTests(unittest.TestCase):
 
 class ParticipationRouteTests(unittest.TestCase):
     def setUp(self):
-        self.t = make_test_app()
-        self.t.app.config['WTF_CSRF_ENABLED'] = False
+        self.t = make_test_app(csrf=False)
         self.client = self.t.client
         self.ctx = self.t.app.app_context()
         self.ctx.push()
@@ -180,8 +179,7 @@ class ParticipationRouteTests(unittest.TestCase):
 
 class FormatStrategyRouteTests(unittest.TestCase):
     def setUp(self):
-        self.t = make_test_app()
-        self.t.app.config['WTF_CSRF_ENABLED'] = False
+        self.t = make_test_app(csrf=False)
         self.client = self.t.client
         self.ctx = self.t.app.app_context()
         self.ctx.push()
@@ -235,8 +233,7 @@ class LockFiltersRatherThanUnticksTests(unittest.TestCase):
     no member matches must leave every membership row exactly as the user left it."""
 
     def setUp(self):
-        self.t = make_test_app()
-        self.t.app.config['WTF_CSRF_ENABLED'] = False
+        self.t = make_test_app(csrf=False)
         self.client = self.t.client
         self.ctx = self.t.app.app_context()
         self.ctx.push()
@@ -383,8 +380,7 @@ class GroupEventTimelineTests(unittest.TestCase):
     principle 1 inverted, and it is what this class exists to keep fixed."""
 
     def setUp(self):
-        self.t = make_test_app()
-        self.t.app.config['WTF_CSRF_ENABLED'] = False
+        self.t = make_test_app(csrf=False)
         self.client = self.t.client
         self.ctx = self.t.app.app_context()
         self.ctx.push()
@@ -457,8 +453,7 @@ class FormatStrategyEventTests(unittest.TestCase):
     the other."""
 
     def setUp(self):
-        self.t = make_test_app()
-        self.t.app.config['WTF_CSRF_ENABLED'] = False
+        self.t = make_test_app(csrf=False)
         self.client = self.t.client
         self.ctx = self.t.app.app_context()
         self.ctx.push()
@@ -560,8 +555,7 @@ class JobChannelToggleLoggingTests(unittest.TestCase):
     while this one existed."""
 
     def setUp(self):
-        self.t = make_test_app()
-        self.t.app.config['WTF_CSRF_ENABLED'] = False
+        self.t = make_test_app(csrf=False)
         self.client = self.t.client
         self.ctx = self.t.app.app_context()
         self.ctx.push()

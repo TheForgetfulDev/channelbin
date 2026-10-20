@@ -29,8 +29,7 @@ REMOVE_URL = '/api/guide/channels/remove'
 
 class _GuideRowRoutes(unittest.TestCase):
     def setUp(self):
-        self.t = make_test_app()
-        self.t.app.config['WTF_CSRF_ENABLED'] = False
+        self.t = make_test_app(csrf=False)
         self.ctx = self.t.app.app_context()
         self.ctx.push()
         self.acct = seed.make_account()

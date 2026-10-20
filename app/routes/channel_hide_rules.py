@@ -19,6 +19,7 @@ from ..database import (Account, Channel, ChannelHideRule,
                         HIDE_TARGETS, HIDE_TARGET_CATEGORY_GLOB, HIDE_TARGET_CATEGORY_EXACT,
                         HIDE_TARGET_NAME_GLOB)
 from ..db_utils import retry_on_locked
+from ..fmt_utils import iso_or_none
 
 channel_hide_rules_bp = Blueprint('channel_hide_rules', __name__)
 
@@ -45,9 +46,9 @@ def _rule_payload(rule: ChannelHideRule) -> dict:
         'enabled': bool(rule.enabled),
         'match_count': rule.match_count,
         'deferred_count': rule.deferred_count,
-        'counted_at': rule.counted_at.isoformat() if rule.counted_at else None,
-        'created_at': rule.created_at.isoformat() if rule.created_at else None,
-        'updated_at': rule.updated_at.isoformat() if rule.updated_at else None,
+        'counted_at': iso_or_none(rule.counted_at),
+        'created_at': iso_or_none(rule.created_at),
+        'updated_at': iso_or_none(rule.updated_at),
     }
 
 

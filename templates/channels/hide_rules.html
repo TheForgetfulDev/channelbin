@@ -60,6 +60,7 @@
 /* Sortable table headers - shared by the rules table and the category picker table. */
 .tbl th.sortable { cursor: pointer; user-select: none; white-space: nowrap; }
 .tbl th.sortable:hover { color: var(--text); }
+/* 9px, the type scale's floor - a sort caret is a glyph beside a heading, not text. */
 .sort-caret { display: inline-block; margin-left: 4px; font-size: 9px; color: var(--text-faint); opacity: 0; transition: transform .12s; }
 .sort-caret.active { opacity: 1; color: var(--text-muted); }
 .sort-caret.desc { transform: rotate(180deg); }
@@ -101,11 +102,10 @@
 .rule-form-row { display: flex; gap: 12px; margin-bottom: 12px; }
 .rule-form-row > label { flex: 1; min-width: 0; display: block; }
 .rule-form-row .fl-label { font-size: var(--fs-md); font-weight: 600; color: var(--text); margin-bottom: 4px; display: block; }
+/* Border, text color and focus come from style.css's shared text-input recipe. */
 .rule-form-row select, .rule-form-row input[type=text] {
-  background: var(--bg2); border: 1px solid var(--border); border-radius: var(--radius-sm);
-  color: var(--text); font: inherit; font-size: var(--fs-md); padding: 7px 10px; width: 100%; }
+  background: var(--bg2); font: inherit; font-size: var(--fs-md); padding: 7px 10px; width: 100%; }
 .rule-form-row input[type=text].mono { font-family: var(--font-mono); }
-.rule-form-row select:focus, .rule-form-row input:focus { outline: none; border-color: var(--accent); }
 
 .preview-box { border: 1px solid var(--border-soft); border-radius: var(--radius-sm); background: var(--bg2);
   padding: 12px 14px; min-height: 46px; }
@@ -145,7 +145,7 @@
   <button class="btn btn-primary" id="hr-add-btn" type="button">+ Add Rule</button>
 </div>
 
-<p class="text-muted" style="font-size:13px; margin: 0 0 1rem;">
+<p class="page-intro" style="margin: 0 0 1rem;">
   Take channels out of your way without deleting them - a blanket rule over a provider
   category or a channel name, on top of hiding one channel at a time from its own page.
   A hidden channel leaves search, the pickers and the counts, keeps its detail page, and

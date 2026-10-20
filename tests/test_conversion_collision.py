@@ -35,6 +35,7 @@ import app.postprocessor as ppmod  # noqa: E402
 import app.proc_utils as pumod  # noqa: E402
 from tests.support.app import make_test_app  # noqa: E402
 from tests.support import seed  # noqa: E402
+from tests.support.fakes import FakePopen  # noqa: E402
 from app import db  # noqa: E402
 from app.database import (  # noqa: E402
     Recording, RecordingEvent, CONVERSION_YIELDED, RECORDING_START_DEFERRED,
@@ -328,50 +329,6 @@ class WaitForConversionClearTests(unittest.TestCase):
 
 
 # ── run_conversion_supervised: in-loop preemption (fake Popen, no real ffmpeg) ────────────
-class _FakePopen:
-    """Stands in for a conversion ffmpeg. alive_ticks=None -> never exits on its own;
-    otherwise poll() returns None for that many calls, then the returncode."""
-    def __init__(self, *args, alive_ticks=None, returncode=0, **kwargs):
-        self._polls = 0
-        self._alive_ticks = alive_ticks
-        self._rc = returncode
-        self.returncode = None
-        self.terminated = False
-        self.signals = []
-
-    def send_signal(self, sig):
-        # SIGSTOP/SIGCONT are how a conversion yields without dying, so a fake that swallows
-        # them silently would let a suspension that never happened look like one that did.
-        self.signals.append(sig)
-
-    @property
-    def suspended(self):
-        stops = [s for s in self.signals if s in (signal.SIGSTOP, signal.SIGCONT)]
-        return bool(stops) and stops[-1] == signal.SIGSTOP
-
-    def poll(self):
-        self._polls += 1
-        if self._alive_ticks is not None and self._polls > self._alive_ticks:
-            self.returncode = self._rc
-            return self._rc
-        return None
-
-    def terminate(self):
-        self.terminated = True
-        if self.returncode is None:
-            self.returncode = self._rc
-
-    def kill(self):
-        self.terminated = True
-        if self.returncode is None:
-            self.returncode = self._rc
-
-    def wait(self, timeout=None):
-        if self.returncode is None:
-            self.returncode = self._rc
-        return self.returncode
-
-
 class RunnerCollisionTests(unittest.TestCase):
     def setUp(self):
         self.t = make_test_app()
@@ -401,14 +358,14 @@ class RunnerCollisionTests(unittest.TestCase):
     def test_yields_to_an_in_progress_recording(self):
         seed.make_recording(status=REC_STATUS_IN_PROGRESS, name='blocker')
         db.session.commit()
-        fake = _FakePopen(alive_ticks=3)
+        fake = FakePopen(alive_ticks=3)
         self._run(fake, collision_policy='cancel')
         self.assertIn(signal.SIGSTOP, fake.signals, 'did not yield to an IN_PROGRESS recording')
 
     def test_does_not_yield_when_policy_is_off(self):
         seed.make_recording(status=REC_STATUS_IN_PROGRESS, name='blocker')
         db.session.commit()
-        fake = _FakePopen(alive_ticks=2, returncode=0)
+        fake = FakePopen(alive_ticks=2, returncode=0)
         result = self._run(fake, collision_policy='off')
         self.assertTrue(result.success, 'policy off must never yield')
         self.assertNotIn(signal.SIGSTOP, fake.signals)
@@ -418,13 +375,13 @@ class RunnerCollisionTests(unittest.TestCase):
         # through a colliding recording untouched under this policy.
         seed.make_recording(status=REC_STATUS_IN_PROGRESS, name='blocker')
         db.session.commit()
-        fake = _FakePopen(alive_ticks=2, returncode=0)
+        fake = FakePopen(alive_ticks=2, returncode=0)
         result = self._run(fake, collision_policy='wait')
         self.assertTrue(result.success, "'wait' policy must not suspend the conversion")
         self.assertNotIn(signal.SIGSTOP, fake.signals)
 
     def test_does_not_yield_when_nothing_conflicts(self):
-        fake = _FakePopen(alive_ticks=2, returncode=0)
+        fake = FakePopen(alive_ticks=2, returncode=0)
         result = self._run(fake, collision_policy='cancel')
         self.assertTrue(result.success)
 
@@ -433,7 +390,7 @@ class RunnerCollisionTests(unittest.TestCase):
         capture and then started on top of that capture's 42.6 GB concat."""
         seed.make_recording(status=REC_STATUS_CONCATENATING, name='joining')
         db.session.commit()
-        fake = _FakePopen(alive_ticks=3)
+        fake = FakePopen(alive_ticks=3)
         self._run(fake, collision_policy='cancel')
         self.assertIn(signal.SIGSTOP, fake.signals,
                       'did not yield to a recording that was joining its segments')
@@ -442,7 +399,7 @@ class RunnerCollisionTests(unittest.TestCase):
         seed.make_recording(status=REC_STATUS_ANALYZING, name='parked',
                             postprocess_waiting_since=datetime.utcnow())
         db.session.commit()
-        fake = _FakePopen(alive_ticks=2, returncode=0)
+        fake = FakePopen(alive_ticks=2, returncode=0)
         result = self._run(fake, collision_policy='cancel')
         self.assertTrue(result.success)
         self.assertNotIn(signal.SIGSTOP, fake.signals,
@@ -489,13 +446,13 @@ class InRunWindowNarrowingTests(unittest.TestCase):
         """The control half of the pair: it passes with or without the narrowing, and is
         here so the other half cannot be satisfied by a window that simply stopped working.
         A yield that never fires at all is the failure mode this catches."""
-        fake = _FakePopen(alive_ticks=3)
+        fake = FakePopen(alive_ticks=3)
         self._run_at(5_000_000, fake)   # 5s of 100s done -> 95s window, 60s away: inside
         self.assertIn(signal.SIGSTOP, fake.signals,
                       'a conversion with 95s of source left must still step aside')
 
     def test_does_not_yield_when_barely_any_source_is_left(self):
-        fake = _FakePopen(alive_ticks=2, returncode=0)
+        fake = FakePopen(alive_ticks=2, returncode=0)
         result = self._run_at(90_000_000, fake)  # 90s done -> 10s window, 60s away: outside
         self.assertTrue(result.success)
         self.assertNotIn(signal.SIGSTOP, fake.signals,

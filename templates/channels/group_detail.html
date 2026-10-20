@@ -201,7 +201,7 @@
     {% if bar_state == 'running' %}
     <button class="btn btn-danger btn-sm" data-act="stop">Stop</button>
     {% elif bar_state == 'stuck' %}
-    <button class="btn btn-danger btn-sm" data-act="force-cancel">Force Cancel</button>
+    <button class="btn btn-danger btn-sm" data-act="force-cancel">Force cancel</button>
     {% elif bar_state == 'scheduled_once' %}
     <button class="btn btn-primary btn-sm" data-act="run-now">&#9654; Test now</button>
     {% elif bar_state in ('scheduled_recurring', 'queued', 'completed', 'cancelled') %}
@@ -238,7 +238,7 @@
         {% if bar_state in ('scheduled_once', 'scheduled_recurring') %}
         {# The system check included: its schedule is the user's to set or remove like
            any other, even though the check itself can never be deleted (changelog 1068). #}
-        <button class="menu-item" data-act="unschedule">Unschedule</button>
+        <button class="menu-item" data-act="unschedule">Remove schedule</button>
         {% endif %}
         {% if bar_state == 'cancelled' %}
         {# Secondary to "Test now" on purpose, and named for what makes it different:

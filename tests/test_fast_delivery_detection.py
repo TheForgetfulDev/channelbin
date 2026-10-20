@@ -320,7 +320,7 @@ class WatchdogFastDeliveryTests(unittest.TestCase):
         }})
 
     def _run(self, rate=5.0, ratio=1.5, window=1.0, strikes=3, early_fail=99, timeout=30,
-             reconnects=0):
+             reconnects=0, on_deadline=None):
         def _stub_launch(app, recording_id, seg_num):
             self.launched.append(seg_num)
 
@@ -353,6 +353,10 @@ class WatchdogFastDeliveryTests(unittest.TestCase):
                 if seg.ended_at is not None and resolved:
                     break
                 time.sleep(0.1)
+            # Before the thread is told to stop: a negative case's chance to see the
+            # watchdog still alive and polling rather than long gone.
+            if on_deadline is not None:
+                on_deadline()
             self.state.stop_event.set()
             self.wd.join(timeout=15)
         db.session.expire_all()
@@ -434,19 +438,51 @@ class WatchdogFastDeliveryTests(unittest.TestCase):
     def test_the_member_takes_the_score_hit(self):
         self.assertEqual(self._default_detection()['observations'], 1)
 
+    def _run_left_alone(self, **kw):
+        """_run() for a case whose verdict is "nothing happened", with the two things that
+        make that a verdict rather than an absence: the watchdog was still alive and
+        polling when the wait ended, and the stand-in capture had written progress for it
+        to read. The bare negatives (segment open, no event) are also what a watchdog that
+        never polled, a spool nothing wrote to, or a reader returning None every tick
+        would produce. Returns (segment, the content positions the detector read)."""
+        samples = []
+        alive_at_deadline = []
+
+        def _counting(path):
+            pos = read_capture_content_position(path)
+            samples.append(pos)
+            return pos
+        with mock.patch('app.watchdog.read_capture_content_position', _counting):
+            seg = self._run(on_deadline=lambda: alive_at_deadline.append(self.wd.is_alive()),
+                            **kw)
+        self.assertEqual(alive_at_deadline, [True],
+                         'the watchdog was not alive when the wait ended - it never sat '
+                         'through the window, it left')
+        self.assertGreater(os.path.getsize(self.state.stderr_path), 0,
+                           'the stand-in capture wrote no progress for the detector to read')
+        return seg, samples
+
     def test_a_real_time_feed_is_left_alone(self):
         """The detector has to sit still through an ordinary capture. 1.0x for the whole
         run is what all 26 measured long segments look like."""
-        seg = self._run(rate=1.0, timeout=6)
+        seg, samples = self._run_left_alone(rate=1.0, timeout=6)
         self.assertIsNone(seg.ended_at)
         self.assertEqual(RecordingEvent.query.filter_by(
             recording_id=self.rid, event_type=FAST_DELIVERY_DETECTED).count(), 0)
+        seen = [p for p in samples if p is not None]
+        self.assertGreaterEqual(
+            len(seen), 5,   # window 1.0s / poll 0.2s
+            f'the detector read {len(seen)} real positions - not a window\'s worth, so '
+            f'"left alone" is not a verdict it reached')
 
     def test_a_disabled_detector_keeps_the_capture(self):
-        seg = self._run(rate=5.0, ratio=0, timeout=6)
+        """ratio=0 means no DeliveryRateMonitor at all, so the proof here is the other
+        half: the watchdog kept polling the live capture and read no positions by design."""
+        seg, samples = self._run_left_alone(rate=5.0, ratio=0, timeout=6)
         self.assertIsNone(seg.ended_at)
         self.assertEqual(RecordingEvent.query.filter_by(
             recording_id=self.rid, event_type=FAST_DELIVERY_DETECTED).count(), 0)
+        self.assertEqual(samples, [], 'a disabled detector must not read positions at all')
 
     def test_strikes_left_means_the_same_member_is_retried(self):
         """Nothing died here, and a provider stuck re-serving its buffer has a real chance

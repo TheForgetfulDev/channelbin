@@ -29,7 +29,7 @@ from .database import (
     RECORDING_URL_RERESOLVED, RECORDING_RESUME_REFUSED,
     RECORDING_FAILED, RECORDING_START_DEFERRED, RECORDING_ABORTED, RECORDING_PAUSED,
     REC_STATUS_SCHEDULED, REC_STATUS_IN_PROGRESS, REC_STATUS_PAUSED, REC_STATUS_RETRYING,
-    REC_STATUS_FAILED, REC_STATUS_ABORTED,
+    REC_STATUS_FAILED, REC_STATUS_ABORTED, WINDOW_OPEN_STATUSES,
     FAILURE_CONVERSION_COLLISION, FAILURE_CONNECTION_SLOT_TIMEOUT, FAILURE_DVR_DIR_UNUSABLE,
     FAILURE_LAUNCH_FAILED, FAILURE_ACCOUNT_BLOCKED,
     CANCEL_DURING_CAPTURE,
@@ -39,8 +39,9 @@ from .channel_groups import (effective_score, pick_best_member, recording_member
                              segment_format_key, DEFAULT_FAILING_STREAK_THRESHOLD)
 from .db_utils import retry_on_locked
 from .fs_utils import PATH_OK, describe_dir_problem, probe_dir
-from .proc_utils import (build_capture_cmd, count_stderr_matches, read_reconnect_jumps,
-                         read_stderr_tail, terminate_or_kill)
+from .proc_utils import (SCRATCH_PREFIXES, build_capture_cmd, count_stderr_matches,
+                         read_reconnect_jumps, read_stderr_tail, scratch_file_paths,
+                         terminate_or_kill)
 from .url_utils import mask_creds, mask_creds_in_text
 from . import events as ev
 
@@ -230,18 +231,12 @@ def recording_disk_paths(recording_id: int, cfg: dict = None) -> list:
         # Supervised-run scratch (progress + stderr tail) is written alongside the output
         # file and unlinked in proc_utils.supervise_ffmpeg's finally, so these only survive
         # a shutdown that skipped it - after which a delete is the last thing that will ever
-        # look at them. All four prefixes: 'conv' is the mp4/mkv conversion, 'concat' the
-        # segment join (dev/changelog/947), 'part' the re-mux that salvages a killed part and
-        # 'join' the assembly of those parts (dev/changelog/955). Patterns are copied from
-        # that function's own stale-reap list
-        # and listed per id for the same reason: a bare f'{recording_id}*' glob would let
-        # id 6 match id 64's files.
+        # look at them. The prefixes and the filename shapes are proc_utils' own
+        # (SCRATCH_PREFIXES, scratch_file_paths), so a new supervised caller is reaped here
+        # the moment it exists.
         scratch_dir = os.path.dirname(stem) or '.'
-        for prefix in ('conv', 'concat', 'part', 'join'):
-            paths.extend(glob.glob(os.path.join(scratch_dir, f'.{prefix}-progress-{recording_id}-*.txt')))
-            paths.extend(glob.glob(os.path.join(scratch_dir, f'.{prefix}-stderr-{recording_id}-*.log')))
-            paths.append(os.path.join(scratch_dir, f'.{prefix}-progress-{recording_id}.txt'))
-            paths.append(os.path.join(scratch_dir, f'.{prefix}-stderr-{recording_id}.log'))
+        for prefix in SCRATCH_PREFIXES:
+            paths.extend(scratch_file_paths(scratch_dir, prefix, recording_id))
         # The partly-encoded parts a resumable conversion checkpoints into
         # (dev/changelog/955). Enumerated off the SAME extension family as the stem above,
         # for the same reason: a killed re-encode leaves the row naming its .ts with parts
@@ -1212,19 +1207,25 @@ def _close_open_segment(recording_id: int, seg_id: int, seg_num: int, detail: st
 def _abandon_raced_segment(recording_id: int, seg_id: int, seg_num: int, seg_path: str):
     """Release a segment row created after its recording was already torn down.
 
-    Only _launch_segment's `state is None` branch reaches this: the row was committed a moment
-    after a concurrent abort/stop had already closed every open segment, so no other path knows
-    it exists. Left alone it keeps ended_at NULL forever and the detail page's
-    `(seg.ended_at or now)` fallback renders an ever-growing duration for a segment that never
-    captured anything, next to a partial .ts the abort's own delete pass had already walked past.
+    Only _launch_segment's torn-down branches reach this: the row was committed a moment
+    after a concurrent abort/stop had already closed every open segment, or while one was
+    closing them, so no other path knows it exists. Left alone it keeps ended_at NULL forever
+    and the detail page's `(seg.ended_at or now)` fallback renders an ever-growing duration
+    for a segment that never captured anything, next to a partial .ts the abort's own delete
+    pass had already walked past.
+
+    A row the teardown did reach - closed by its _close_active_segment because the commit
+    landed before that pass - is left as the teardown wrote it, file included: the join that
+    follows a stop takes every closed segment with bytes, and deleting one from under it
+    would be a second teardown disagreeing with the first.
 
     The caller has already killed ffmpeg, so the file is not still being written when it goes.
     """
     @retry_on_locked()
     def _close_raced_segment_and_commit():
         seg = db.session.get(RecordingSegment, seg_id)
-        if seg is None:
-            return
+        if seg is None or seg.ended_at is not None:
+            return False
         seg.ended_at = datetime.utcnow()
         seg.exit_reason = 'TEARDOWN_RACE'
         add_recording_event(
@@ -1233,8 +1234,10 @@ def _abandon_raced_segment(recording_id: int, seg_id: int, seg_num: int, seg_pat
                     f'segment was launching, so it captured nothing and its file was deleted'),
             segment_number=seg_num)
         db.session.commit()
+        return True
 
-    _close_raced_segment_and_commit()
+    if not _close_raced_segment_and_commit():
+        return
 
     try:
         os.unlink(seg_path)
@@ -1284,6 +1287,15 @@ def resume_recording(app, recording_id: int):
     with app.app_context():
         rec = db.session.get(Recording, recording_id)
         if rec is None:
+            return
+        # Before anything is acquired. The resume_<id> job that reaches here is re-armed
+        # by _defer_resume_for_slot and survives a restart, so it can fire on a row the
+        # stop job has since joined or failed; a resume that took a seat and registered
+        # live state first, and only then found _launch_segment refusing the status, held
+        # both for the life of the process (dev/changelog/1242).
+        if rec.status not in WINDOW_OPEN_STATUSES:
+            log.warning('resume_recording: recording %d is %s - nothing to resume',
+                        recording_id, rec.status)
             return
 
         # Look for a segment left "open" (no ended_at) BEFORE touching status or launching
@@ -1407,13 +1419,17 @@ def _reresolve_channel_url(recording_id: int, cfg: dict) -> None:
 
     Called from _launch_segment because that is the ONLY consumer of rec.url - which makes
     this one call site cover record start, service-restart resume, and every watchdog segment
-    relaunch (so a sync landing mid-recording rescues a stalling one). Group-backed recordings
-    are excluded: they re-resolve their member at start and have failover_group_member() for
-    the mid-recording case, and both write rec.url themselves. Manual URL-only recordings
-    (channel_id None) have no channel to resolve against and are left alone.
+    relaunch (so a sync landing mid-recording rescues a stalling one). A group-backed
+    recording is covered too: rec.channel is its serving member, and what selection and
+    failover write into rec.url is exactly normalize_url(member.stream_url, member.account),
+    so re-reading it here changes nothing unless the member's Channel row moved under the
+    run - a host roll, a sync that found the provider's URLs drifted - which is the case
+    that used to reconnect every relaunch to the dead host until the member was burned
+    (dev/changelog/1243). Manual URL-only recordings (channel_id None) have no channel to
+    resolve against and are left alone.
     """
     rec = db.session.get(Recording, recording_id)
-    if rec is None or rec.group_id is not None or rec.channel_id is None:
+    if rec is None or rec.channel_id is None:
         return
     channel = rec.channel
     if channel is None or not channel.stream_url:
@@ -1431,8 +1447,8 @@ def _reresolve_channel_url(recording_id: int, cfg: dict) -> None:
         r = db.session.get(Recording, recording_id)
         r.url = fresh
         add_recording_event(recording_id, RECORDING_URL_RERESOLVED,
-            detail=(f'Stream URL for channel "{channel.name}" changed since this recording '
-                    f'was created; recording from the channel\'s current URL '
+            detail=(f'Stream URL for channel "{channel.name}" changed since it was last '
+                    f'written to this recording; recording from the channel\'s current URL '
                     f'({mask_creds(stale)} -> {mask_creds(fresh)})'),
             extra={'channel_id': channel.id,
                    'old_url': mask_creds(stale),
@@ -1829,17 +1845,31 @@ def _launch_segment(app, recording_id: int, seg_num: int) -> str:
         seg_id = _record_segment_started_and_commit()
 
         state = get_state(recording_id)
-        if state is None:
-            # A teardown ran concurrently: it closed every open segment and popped _active
-            # BEFORE the row above was committed, so nothing else will ever close this one.
-            # Releasing it here is the create path's own teardown obligation - the kill and
-            # the unlink stay outside the retried closure, since neither is idempotent.
+        if state is None or state.stop_event.is_set():
+            # A teardown ran concurrently. Either it has finished - it closed every open
+            # segment and popped _active BEFORE the row above was committed - or it has
+            # begun: stop_event is the first thing every teardown sets, and a launch that
+            # passes this point after it would hand the teardown's kill a process it has
+            # already looked at and leave this one reachable from nothing, holding a
+            # connection whose seat is about to be released (dev/changelog/1242). Either
+            # way nothing else will ever close this row or kill this child. Releasing them
+            # here is the create path's own teardown obligation - the kill and the unlink
+            # stay outside the retried closure, since neither is idempotent.
             terminate_or_kill(proc, hard=True)
             _discard_stderr_spool(stderr_path, stderr_fh)
             _abandon_raced_segment(recording_id, seg_id, seg_num, seg_path)
             return LAUNCH_ABANDONED
 
         state.process = proc
+        if state.stop_event.is_set():
+            # The teardown set the event between the check above and the assignment. Its
+            # kill read state.process before this write, so it reaped the old child or
+            # nothing; this one is ours to end, and the teardown's own close of the open
+            # row is honored rather than repeated (_abandon_raced_segment).
+            terminate_or_kill(proc, hard=True)
+            _discard_stderr_spool(stderr_path, stderr_fh)
+            _abandon_raced_segment(recording_id, seg_id, seg_num, seg_path)
+            return LAUNCH_ABANDONED
         state.current_segment_num = seg_num
         state.current_segment_paced = pace
         # The previous segment's spool is closed and unlinked by whichever terminal path
@@ -2137,23 +2167,32 @@ def failover_group_member(app, recording_id: int, reason: str, demote: bool = Fa
         skipped_busy_account = [ch for ch in members if ch.id in busy_account
                                 and ch.id not in busy and ch.id != best.id]
 
-        # Cross-account switch: swap connection slots. The acquire can now refuse rather
-        # than exceed the target account's limit (dev/changelog/854), so the release is
-        # undone when it does - re-acquiring the slot this same recording released a line
-        # earlier cannot fail, which is what keeps a live recording from ever being left
-        # holding no slot at all.
+        # Cross-account switch: move the connection seat. The acquire can refuse rather
+        # than exceed the target account's limit (dev/changelog/854), and the move is one
+        # step - the old seat is given up only once the new one is taken - so a refusal
+        # changes nothing. A release followed by a re-acquire on the old account used to be
+        # how this was done, and the re-acquire was assumed unable to fail; it fails
+        # whenever the old account is the one the user just blocked, whose usable limit
+        # is 0, which is exactly when a block move asks (dev/changelog/1242).
         #
         # Refusing the swap is the whole answer here, and deliberately not a wait: this
         # runs on the watchdog thread with the capture already dead, and blocking it would
         # stall the recording's own supervision. Returning False drops the caller into its
         # existing dead-stream retry/abort path, which is itself a wait-and-retry loop and
-        # re-enters this function with the accounts re-read.
+        # re-enters this function with the accounts re-read; a block move is re-asked on
+        # the watchdog's stay recheck, and the seat it still holds is what keeps that
+        # recheck asking.
         old_account_id = old_channel.account_id if old_channel else None
         if old_account_id is not None and best.account_id != old_account_id:
             from . import connection_limits as connlim
-            connlim.release(old_account_id, 'recording', recording_id)
-            if not _try_acquire_slot_with_preemption(app, recording_id, best.account_id):
-                connlim.try_acquire(old_account_id, 'recording', recording_id)
+            target_account_id = best.account_id
+
+            def _move_seat():
+                return connlim.move_seat('recording', recording_id, old_account_id,
+                                         target_account_id)
+
+            if not _try_acquire_slot_with_preemption(app, recording_id, target_account_id,
+                                                     acquire=_move_seat):
                 log.warning('Recording %d: cannot fail over to "%s" - account "%s" is at its '
                             'connection limit and every slot is held by another recording; '
                             'not exceeding it (%s)',
@@ -2300,9 +2339,9 @@ def _preempt_sync_for_recording(recording_id: int, account_id: int):
     recording must not block on anything. The cancelled sync self-heals at its next
     interval fire.
     """
-    from .database import Account
+    from .database import Account, ACCOUNT_STATUS_SYNCING
     account = db.session.get(Account, account_id)
-    if account is None or account.status != 'SYNCING':
+    if account is None or account.status != ACCOUNT_STATUS_SYNCING:
         return
 
     from .accounts import cancel_sync
@@ -2317,8 +2356,14 @@ def _preempt_sync_for_recording(recording_id: int, account_id: int):
                  recording_id, account_id, account.name)
 
 
-def _try_acquire_slot_with_preemption(app, recording_id: int, account_id: int) -> bool:
+def _try_acquire_slot_with_preemption(app, recording_id: int, account_id: int,
+                                      acquire=None) -> bool:
     """Acquire a connection slot on account_id for this recording, or return False.
+
+    `acquire` is the one call that registers the seat, tried once before any preemption
+    and once after each; the default is a plain try_acquire on `account_id`. A failover
+    passes connection_limits.move_seat so the seat it already holds on the old account is
+    given up in the same step the new one is taken (dev/changelog/1242).
 
     Recordings still always win over the two actors that do not hold a stream open on
     the user's behalf: an in-flight sync on this account is cancelled, and a running
@@ -2336,24 +2381,35 @@ def _try_acquire_slot_with_preemption(app, recording_id: int, account_id: int) -
     _preempt_sync_for_recording(recording_id, account_id)
 
     from . import connection_limits as connlim
-    if connlim.try_acquire(account_id, 'recording', recording_id):
+    if acquire is None:
+        def acquire():
+            return connlim.try_acquire(account_id, 'recording', recording_id)
+    if acquire():
         return True
     # A live preview yields first: someone looking at a channel is worth less than a
     # measurement feeding its health score, and far less than the recording itself.
-    if connlim.preempt_previews_for_slot(account_id):
+    # Both strips follow the POOL, not the account: a login shared across accounts is one
+    # seat set, so the preview or test holding its seat may have come through the sibling
+    # account, and the kill is routed to the account it came through (dev/changelog/1243).
+    previews = connlim.preempt_previews_for_slot(account_id)
+    if previews:
         from . import preview
-        preview.preempt_for_account(account_id)
-        log.warning('Recording %d: preempted a live preview on account %d',
-                    recording_id, account_id)
-        if connlim.try_acquire(account_id, 'recording', recording_id):
+        for holder_account_id in dict.fromkeys(a for _, a in previews):
+            preview.preempt_for_account(holder_account_id)
+            log.warning('Recording %d: preempted a live preview on account %d%s',
+                        recording_id, holder_account_id,
+                        '' if holder_account_id == account_id
+                        else f' (sharing a login with account {account_id})')
+        if acquire():
             return True
-    preempted = connlim.preempt_tests_for_slot(account_id)
-    for _channel_id in preempted:
+    for _channel_id, holder_account_id in connlim.preempt_tests_for_slot(account_id):
         from . import channel_tester
-        channel_tester.kill_active_test_for_account(app, account_id)
-        log.warning('Recording %d: preempted a running channel test on account %d',
-                    recording_id, account_id)
-    return connlim.try_acquire(account_id, 'recording', recording_id)
+        channel_tester.kill_active_test_for_account(app, holder_account_id)
+        log.warning('Recording %d: preempted a running channel test on account %d%s',
+                    recording_id, holder_account_id,
+                    '' if holder_account_id == account_id
+                    else f' (sharing a login with account {account_id})')
+    return acquire()
 
 
 def _earlier_waiter_for_slot(recording_id: int, account_id: int, start_time: datetime):
@@ -2750,13 +2806,19 @@ def stop_recording(app, recording_id: int, reason: str = 'STOP_TIME_REACHED'):
     """Signal the watchdog to stop and kill the current ffmpeg process."""
     with app.app_context():
         had_state = _teardown_active_ffmpeg(app, recording_id, exit_reason=reason)
+        # The capture is over whichever branch below finishes it, so a resume or retry
+        # still armed for it - a RETRYING recording's backoff, a resume deferred for a
+        # seat - must not fire on the finished row (dev/changelog/1242). abort_recording
+        # removes every per-recording job itself.
+        from .scheduler import unschedule_recording_resumes
+        unschedule_recording_resumes(recording_id)
 
         if not had_state:
             # May already be done, paused, or waiting on a dead-stream retry; concat only
             # applies while the recording is still alive in one of those senses. RETRYING has
             # no active ffmpeg either (same as PAUSED), so it reaches this branch too.
             rec = db.session.get(Recording, recording_id)
-            if not (rec and rec.status in (REC_STATUS_IN_PROGRESS, REC_STATUS_PAUSED, REC_STATUS_RETRYING)):
+            if not (rec and rec.status in WINDOW_OPEN_STATUSES):
                 return
 
             # A RETRYING window that ended is reached by two persisted jobs - stop_<id> and
@@ -2933,7 +2995,10 @@ def _schedule_launch_retry(app, recording_id: int, seg_num: int, delay):
     thread.start()
 
 
-def _close_active_segment(app, recording_id: int, exit_reason: str):
+def _close_active_segment(app, recording_id: int, exit_reason: str) -> str:
+    """Close the newest open segment row with `exit_reason`, recording what ffmpeg said on
+    the way out. Returns that stderr tail - the spool is consumed here, so a caller that
+    goes on to fail the recording passes the cause through rather than reading it again."""
     # Read outside the retried closure: it consumes the spool (closes and unlinks it), so a
     # lock-retry of the closure would find it already gone and record an empty tail. Reading
     # first makes the values plain locals the retry can safely reuse.
@@ -2958,6 +3023,7 @@ def _close_active_segment(app, recording_id: int, exit_reason: str):
                 db.session.commit()
 
     _close_and_commit()
+    return tail
 
 
 def _snapshot_channel_health(rec):

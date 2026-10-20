@@ -182,8 +182,7 @@ class SystemGroupEnforcementTests(unittest.TestCase):
     """
 
     def setUp(self):
-        self.t = make_test_app()
-        self.t.app.config['WTF_CSRF_ENABLED'] = False
+        self.t = make_test_app(csrf=False)
         self.acct = make_account()
         self.sys_grp = ChannelGroup.query.filter_by(is_system=True).first()
         db.session.commit()
@@ -227,8 +226,7 @@ class HealthCheckOnlyGroupTests(unittest.TestCase):
     being assembled (DESIGN-channel-groups-model.md §14.1, dev/changelog/1077)."""
 
     def setUp(self):
-        self.t = make_test_app()
-        self.t.app.config['WTF_CSRF_ENABLED'] = False
+        self.t = make_test_app(csrf=False)
         self.acct = make_account()
         self.grp = make_group(name='Check Bag', members=[], in_guide=False, recording=False)
         db.session.commit()
@@ -396,8 +394,7 @@ class GroupJobDeleteGuardTests(unittest.TestCase):
     deleted on its own at all (dev/changelog/1077)."""
 
     def setUp(self):
-        self.t = make_test_app()
-        self.t.app.config['WTF_CSRF_ENABLED'] = False
+        self.t = make_test_app(csrf=False)
         self.acct = make_account()
 
     def tearDown(self):
@@ -481,8 +478,7 @@ class GroupNameUniquenessTests(unittest.TestCase):
     covers the pinned system group's name too (decided 2026-07-25)."""
 
     def setUp(self):
-        self.t = make_test_app()
-        self.t.app.config['WTF_CSRF_ENABLED'] = False
+        self.t = make_test_app(csrf=False)
         self.acct = make_account()
         self.existing = make_group(name='My Group', members=[])
         db.session.commit()

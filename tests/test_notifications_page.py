@@ -171,8 +171,7 @@ class ServiceRemovalTests(unittest.TestCase):
     """
 
     def setUp(self):
-        self.t = make_test_app()
-        self.t.app.config['WTF_CSRF_ENABLED'] = False  # jsonFetch supplies the token in the app
+        self.t = make_test_app(csrf=False)
         self.client = self.t.app.test_client()
         self.saved = {}
 

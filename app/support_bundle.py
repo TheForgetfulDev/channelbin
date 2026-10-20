@@ -59,6 +59,7 @@ from io import BytesIO
 
 from . import db
 from .config import mask_config
+from .fmt_utils import iso_or_none
 from .database import (
     Account, Channel, ChannelEvent, ChannelGroup, ChannelGroupEvent,
     ChannelGroupMember, JobRun, Recording, RecordingEvent,
@@ -527,7 +528,7 @@ def _apscheduler_jobs():
             # None where APScheduler has paused the job: it keeps the row and clears the
             # time, which is precisely the shape a "my recording never started" report is
             # about, so it must survive as a null rather than be dropped.
-            'next_run_time': when.isoformat() if when else None,
+            'next_run_time': iso_or_none(when),
         })
     return {'note': _APSCHEDULER_NOTE, 'job_count': len(jobs), 'jobs': jobs}
 

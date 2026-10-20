@@ -4,6 +4,10 @@
    no-JS fallback - an undefined custom property fails silently and would collapse every
    row (CLAUDE.md CSS rule), so it must exist even though guide.js always overwrites it. */
 :root { --guide-rowh: 72px; }
+/* The day header's height. The day-segment label fills it and the time header sticks
+   directly below it, so all three read this one value - a density change cannot leave
+   the time header's sticky offset behind the row it is meant to clear. */
+:root { --guide-dayh: 28px; }
 
 /* ── Toolbar (DESIGN.md 12.2) ───────────────────────────────────────────────── */
 /* The .toolbar class on the bar itself is what makes every control 36px: --ctl-h is scoped
@@ -793,7 +797,7 @@
   font-weight: 700;
   text-align: center;
   white-space: nowrap;
-  color: #0b1220;
+  color: var(--accent-contrast);
   /* The band modifier (.hb-*, static/css/style.css) carries the fill; this file decides only
      that the badge is filled rather than tinted. One declared band list, five components. */
   background: var(--hb, var(--bg3));
@@ -849,7 +853,7 @@
    `position: sticky` is inert there - it is retained because the channel detail page's
    "What's On" strip still nests them inside .guide-program-area, where it does the work. */
 .guide-day-header {
-  height: 28px;
+  height: var(--guide-dayh);
   display: flex;
   background: var(--bg2);
   border-bottom: 1px solid var(--border);
@@ -873,8 +877,8 @@
   left: 0;
   display: inline-block;
   padding: 0 0.6rem;
-  height: 28px;
-  line-height: 28px;
+  height: var(--guide-dayh);
+  line-height: var(--guide-dayh);
   font-size: 12px;
   font-weight: 600;
   color: var(--text);
@@ -892,7 +896,7 @@
   background: var(--bg3);
   border-bottom: 1px solid var(--border);
   position: sticky;
-  top: 28px;
+  top: var(--guide-dayh);
   z-index: 5;
   min-width: max-content;
 }
@@ -1609,7 +1613,7 @@
   display: inline-block;
   font-size: 10px;
   background: var(--warn);
-  color: #000;
+  color: var(--accent-contrast);
   padding: 1px 5px;
   border-radius: 999px;
   font-weight: 700;

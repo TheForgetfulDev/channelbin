@@ -30,7 +30,8 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from .config import load_config, config_default
 from . import admission, db, duplicate_streams
-from .account_links import clear_rolled_alert_after_sync, current_host, host_list, render_host
+from .account_links import (clear_rolled_alert_after_sync, current_host, host_list, render_host,
+                            rerender_stream_urls)
 from .channel_groups import touch_group
 from .database import (
     Account, Alert, Channel, ChannelEvent, ChannelGroupMember, EPGEntry, AccountSyncLog,
@@ -39,6 +40,9 @@ from .database import (
     Recording, add_recording_event,
     CHANNEL_URL_CHANGED, CHANNEL_ADDED_TO_GUIDE, CHANNEL_REMOVED_FROM_GUIDE,
     RECORDING_REPOINTED, REC_STATUS_IN_PROGRESS, REC_STATUS_SCHEDULED,
+    ACCOUNT_STATUS_SYNCING, ACCOUNT_STATUS_OK, ACCOUNT_STATUS_ERROR, ACCOUNT_STATUS_UNSYNCED,
+    SYNC_LOG_IN_PROGRESS, SYNC_LOG_SUCCESS, SYNC_LOG_PARTIAL, SYNC_LOG_ERROR,
+    SYNC_LOG_CANCELLED, SYNC_LOG_SKIPPED, SYNC_LOG_IMPORTED,
 )
 from .db_utils import chunked, current_wal_size_bytes, retry_on_locked
 from .epg_sources import (
@@ -152,7 +156,7 @@ def sync_signature() -> str:
     sync-log id moves when one starts, which is the only trace left by a sync that starts
     and fails inside a single poll interval - the syncing set is the same at both polls."""
     syncing = (db.session.query(Account.id)
-               .filter(Account.status == 'SYNCING')
+               .filter(Account.status == ACCOUNT_STATUS_SYNCING)
                .order_by(Account.id).all())
     latest_log_id = db.session.query(func.max(AccountSyncLog.id)).scalar() or 0
     return f"{','.join(str(account_id) for (account_id,) in syncing)}|{latest_log_id}"
@@ -1129,7 +1133,7 @@ def record_skipped_sync(account_id: int, reason: str) -> None:
             account_id=account_id,
             started_at=now,
             completed_at=now,
-            status='SKIPPED',
+            status=SYNC_LOG_SKIPPED,
             channels_synced=0,
             epg_entries_synced=0,
             error_message=reason,
@@ -1167,7 +1171,7 @@ def finalize_sync_state(account_id: int, account_status: str, log_status: str,
     else:
         log_row = (
             AccountSyncLog.query
-            .filter_by(account_id=account_id, status='IN_PROGRESS')
+            .filter_by(account_id=account_id, status=SYNC_LOG_IN_PROGRESS)
             .order_by(AccountSyncLog.started_at.desc())
             .first()
         )
@@ -1194,7 +1198,7 @@ def _mark_sync_cancelled(account_id: int, sync_log, detail: str | None = None) -
     def _do():
         db.session.rollback()
         finalize_sync_state(
-            account_id, 'UNSYNCED', 'CANCELLED',
+            account_id, ACCOUNT_STATUS_UNSYNCED, SYNC_LOG_CANCELLED,
             # Slicing, not [0], so an empty reason can't IndexError inside a commit closure.
             account_message=f'Sync {reason[:1].lower()}{reason[1:]}',
             log_message=reason,
@@ -1296,12 +1300,12 @@ def _do_sync(account_id: int, stop_event: threading.Event, use_dump: bool = Fals
     # Mark syncing and create log entry
     @retry_on_locked()
     def _mark_syncing_and_commit():
-        account.status = 'SYNCING'
+        account.status = ACCOUNT_STATUS_SYNCING
         account.last_error = None
         log_entry = AccountSyncLog(
             account_id=account_id,
             started_at=datetime.utcnow(),
-            status='IN_PROGRESS',
+            status=SYNC_LOG_IN_PROGRESS,
         )
         db.session.add(log_entry)
         db.session.commit()
@@ -1524,7 +1528,7 @@ def _do_sync(account_id: int, stop_event: threading.Event, use_dump: bool = Fals
         def _mark_success_and_commit():
             now = datetime.utcnow()
             interval_hours = account.sync_interval_hours or sync_cfg.get('sync_interval_hours', config_default('sync.sync_interval_hours'))
-            account.status = 'OK'
+            account.status = ACCOUNT_STATUS_OK
             account.last_sync_at = now
             account.next_sync_at = now + timedelta(hours=interval_hours)
             account.channel_count = channel_count_total
@@ -1543,7 +1547,7 @@ def _do_sync(account_id: int, stop_event: threading.Event, use_dump: bool = Fals
             # that "succeeded" with a silently-empty EPG must be distinguishable from a
             # fully-healthy one (DESIGN-sync-resilience.md §2). account.status stays OK:
             # it's a control value the scheduler/route guards key off, not a display concern.
-            sync_log.status = 'PARTIAL' if epg_degradation_reason else 'SUCCESS'
+            sync_log.status = SYNC_LOG_PARTIAL if epg_degradation_reason else SYNC_LOG_SUCCESS
             sync_log.completed_at = now
             sync_log.channels_synced = channels_synced
             sync_log.epg_entries_synced = epg_synced
@@ -1684,7 +1688,7 @@ def _do_sync(account_id: int, stop_event: threading.Event, use_dump: bool = Fals
         def _mark_error_and_commit():
             db.session.rollback()
             finalize_sync_state(
-                account_id, 'ERROR', 'ERROR',
+                account_id, ACCOUNT_STATUS_ERROR, SYNC_LOG_ERROR,
                 account_message=error_message,
                 log_message=error_message,
                 sync_log_id=getattr(sync_log, 'id', None),
@@ -2077,7 +2081,7 @@ def get_sync_duration_estimate(account_id: int):
     rows = (
         AccountSyncLog.query
         .filter(AccountSyncLog.account_id == account_id,
-                AccountSyncLog.status.in_(['SUCCESS', 'PARTIAL']),
+                AccountSyncLog.status.in_(SYNC_LOG_IMPORTED),
                 AccountSyncLog.completed_at.isnot(None))
         .order_by(AccountSyncLog.started_at.desc(), AccountSyncLog.id.desc())
         .limit(JOB_RUN_HISTORY_LIMIT).all()
@@ -2108,7 +2112,7 @@ def lifecycle_states_for_channels(channels, cfg, accounts_by_id=None) -> dict:
     completed_counts = dict(
         db.session.query(AccountSyncLog.account_id, func.count(AccountSyncLog.id))
         .filter(AccountSyncLog.account_id.in_(account_ids),
-                AccountSyncLog.status.in_(['SUCCESS', 'PARTIAL']))
+                AccountSyncLog.status.in_(SYNC_LOG_IMPORTED))
         .group_by(AccountSyncLog.account_id)
         .all()
     )
@@ -2119,7 +2123,7 @@ def lifecycle_states_for_channels(channels, cfg, accounts_by_id=None) -> dict:
         # date nothing was ever imported on (dev/changelog/928).
         .filter(AccountSyncLog.account_id.in_(account_ids),
                 db.or_(AccountSyncLog.status.is_(None),
-                       AccountSyncLog.status != 'SKIPPED'))
+                       AccountSyncLog.status != SYNC_LOG_SKIPPED))
         .group_by(AccountSyncLog.account_id)
         .all()
     )
@@ -2177,6 +2181,27 @@ def repoint_candidates_for_channels(channels, cfg, lifecycle_by_channel):
         if survivors:
             result[ch.id] = survivors[0]
     return result
+
+
+def transfer_keeper_problem(source, keeper, *, member_ids=None, where: str = '',
+                            same_stream=None):
+    """Why `keeper` may not take `source`'s state in a Remove Duplicate Channels request,
+    or None when it may. The one validation behind every dedup surface (the TV Guide's,
+    a health check's, a group's), so what makes a keeper valid cannot drift between them:
+    the keeper has to exist, be another channel, be inside the surface's own set when it
+    has one (`member_ids`), and be the same stream - one stream_url unless the caller
+    passes its own `same_stream(source, keeper)` (the group page also accepts one stored
+    duplicate cluster, dev/changelog/1175). `where` finishes the first sentence
+    (' in this group'). The server re-validates from database ids and never trusts the
+    client's pairing, same as the repoint route."""
+    if keeper is None or keeper.id == source.id or (
+            member_ids is not None and keeper.id not in member_ids):
+        return f'No valid channel to keep{where}'
+    same = (same_stream(source, keeper) if same_stream is not None
+            else keeper.stream_url == source.stream_url)
+    if not same:
+        return 'Kept channel is no longer the same stream'
+    return None
 
 
 def transfer_channel_state(source: Channel, dest: Channel, cfg: dict) -> str:
@@ -2643,6 +2668,18 @@ def _upsert_channels(account: Account, streams: list, cfg: dict | None = None,
         db.session.bulk_update_mappings(Channel, changed)
     _stamp_last_seen(unchanged_ids, sync_time)
     db.session.flush()
+    # The host list was read once before the loop, and a roll can commit while the loop
+    # runs: every row written after it would then carry the host that just died, and this
+    # sync's success would dismiss the roll's alert. Read it again now, in the same
+    # transaction as the rows, and move them onto the host that is active NOW
+    # (dev/changelog/1243). Costs one small query per sync; the rewrite runs only when the
+    # active host moved.
+    listed_now, active_now = host_list(account.id)
+    if active_now and active_now != active_host:
+        moved = rerender_stream_urls(account.id, listed_now, active_now, sync_time)
+        log.warning('Account %d (%s): the active host moved from %s to %s during the sync; '
+                    '%d stream URLs re-rendered onto %s', account.id, account.name,
+                    active_host or 'none', active_now, moved, active_now)
     return synced, skipped_malformed, skipped_duplicate, drifted, [ch.id for ch in new_channels]
 
 
@@ -2872,11 +2909,7 @@ def report_source_removed(source_id: int, source_name: str, cause: str, readers,
     if mine:
         body += f' {len(mine) - len(lost):,} of those channel(s) now take their guide from another source'
         if lost:
-            sample = [n for (n,) in db.session.query(Channel.name).filter(
-                Channel.id.in_(lost[:_LOST_CHANNELS_NAMED])).order_by(Channel.name)]
-            more = len(lost) - len(sample)
-            body += (f'; {len(lost):,} have no guide from any source now: {", ".join(sample)}'
-                     + (f', and {more:,} more' if more > 0 else ''))
+            body += f'; {len(lost):,} have no guide from any source now: {_named_sample(lost)}'
         body += '.'
     from .alerts import create_alert
     create_alert('EPG_SOURCE_REMOVED', f'EPG source "{source_name}" was removed', body,
@@ -3565,13 +3598,8 @@ def _report_source_outcome(source_id: int, reason: str | None,
         return
     lost_body = ''
     if lost_channel_ids:
-        sample = [n for (n,) in db.session.query(Channel.name).filter(
-            Channel.id.in_(list(lost_channel_ids)[:_LOST_CHANNELS_NAMED]))
-            .order_by(Channel.name)]
-        more = len(lost_channel_ids) - len(sample)
         lost_body = (f'{len(lost_channel_ids):,} channel(s) that had a guide from EPG source '
-                     f'"{name}" have none from any source now: {", ".join(sample)}'
-                     + (f', and {more:,} more' if more > 0 else '') + '.')
+                     f'"{name}" have none from any source now: {_named_sample(lost_channel_ids)}.')
     _raise_or_resolve_standing_alert(
         'EPG_SOURCE_COVERAGE_LOST', source=f'epg-source:{source_id}:coverage',
         active=bool(lost_channel_ids),
@@ -3581,6 +3609,16 @@ def _report_source_outcome(source_id: int, reason: str | None,
 
 #: How many channel names EPG_SOURCE_COVERAGE_LOST spells out before "and N more".
 _LOST_CHANNELS_NAMED = 10
+
+
+def _named_sample(channel_ids) -> str:
+    """'Alpha, Beta, Gamma, and 4 more' - the first _LOST_CHANNELS_NAMED channels by name,
+    then how many were left unnamed. One spelling for both coverage-lost bodies."""
+    ids = list(channel_ids)
+    sample = [n for (n,) in db.session.query(Channel.name).filter(
+        Channel.id.in_(ids[:_LOST_CHANNELS_NAMED])).order_by(Channel.name)]
+    more = len(ids) - len(sample)
+    return ', '.join(sample) + (f', and {more:,} more' if more > 0 else '')
 _EPG_STATUS_BY_ALERT = {
     'EPG_SOURCE_FETCH_FAILED': EPG_STATUS_FAILED,
     'EPG_SOURCE_COLLAPSE_REFUSED': EPG_STATUS_REFUSED,

@@ -33,6 +33,7 @@ from app.alerts import AUTH_GATE_INERT
 from app.database import Alert
 from tests.support.app import make_test_app
 from tests.support.config_sandbox import ConfigSandbox
+from tests.support.csrf import csrf_token, csrf_meta, csrf_field  # noqa: E402
 
 PASSWORD = 'correcthorse-battery-staple'
 
@@ -48,14 +49,6 @@ class _ConfigSandbox(ConfigSandbox):
         self.addCleanup(authmod._failures.clear)
 
 
-def _csrf_meta(html):
-    m = re.search(r'name="csrf-token" content="([^"]+)"', html)
-    return m.group(1) if m else None
-
-
-def _csrf_field(html):
-    m = re.search(r'name="csrf_token" value="([^"]+)"', html)
-    return m.group(1) if m else None
 
 
 class GateOffByDefaultTests(_ConfigSandbox):
@@ -184,7 +177,7 @@ class LoginFlowTests(_ConfigSandbox):
 
     def _login_token(self):
         r = self.client.get('/login')
-        return _csrf_field(r.get_data(as_text=True))
+        return csrf_field(r.get_data(as_text=True))
 
     def test_correct_password_redirects_to_root(self):
         tok = self._login_token()
@@ -248,7 +241,7 @@ class SessionSemanticsTests(_ConfigSandbox):
         with self.client.session_transaction() as sess:
             sess['pre_existing_junk'] = 'should not survive'
         r = self.client.get('/login')
-        tok = _csrf_field(r.get_data(as_text=True))
+        tok = csrf_field(r.get_data(as_text=True))
         self.client.post('/login', data={'password': PASSWORD, 'csrf_token': tok})
         with self.client.session_transaction() as sess:
             self.assertNotIn('pre_existing_junk', sess)
@@ -319,7 +312,7 @@ class PasswordChangeRevocationTests(_ConfigSandbox):
     def _signed_in_client(self):
         c = self.t.app.test_client()
         r = c.get('/login')
-        tok = _csrf_field(r.get_data(as_text=True))
+        tok = csrf_field(r.get_data(as_text=True))
         r = c.post('/login', data={'password': PASSWORD, 'csrf_token': tok},
                    follow_redirects=False)
         self.assertEqual(r.status_code, 302)
@@ -337,7 +330,7 @@ class PasswordChangeRevocationTests(_ConfigSandbox):
         """
         from flask import g
         g.pop('csrf_token', None)
-        return _csrf_meta(client.get('/settings').get_data(as_text=True))
+        return csrf_meta(client.get('/settings').get_data(as_text=True))
 
     def test_other_sessions_are_signed_out_and_the_changing_one_is_not(self):
         changer = self._signed_in_client()
@@ -496,7 +489,7 @@ class RecoveryPathTests(_ConfigSandbox):
     def test_new_password_accepted_with_the_gate_off_and_an_old_hash_present(self):
         c = self._app_with({'enabled': False, 'password_hash': generate_password_hash('forgotten'),
                             'session_timeout_minutes': 0, 'cookie_secure': False})
-        tok = _csrf_meta(c.get('/settings').get_data(as_text=True))
+        tok = csrf_meta(c.get('/settings').get_data(as_text=True))
         r = c.post('/api/settings/password',
                    json={'new_password': 'a-new-one-1', 'confirm_password': 'a-new-one-1'},
                    headers={'X-CSRFToken': tok})
@@ -508,9 +501,9 @@ class RecoveryPathTests(_ConfigSandbox):
         c = self._app_with({'enabled': True, 'password_hash': generate_password_hash(PASSWORD),
                             'session_timeout_minutes': 0, 'cookie_secure': False})
         r = c.get('/login')
-        tok = _csrf_field(r.get_data(as_text=True))
+        tok = csrf_field(r.get_data(as_text=True))
         c.post('/login', data={'password': PASSWORD, 'csrf_token': tok})
-        tok = _csrf_meta(c.get('/settings').get_data(as_text=True))
+        tok = csrf_meta(c.get('/settings').get_data(as_text=True))
         r = c.post('/api/settings/password',
                    json={'new_password': 'a-new-one-1', 'confirm_password': 'a-new-one-1'},
                    headers={'X-CSRFToken': tok})
@@ -530,11 +523,11 @@ class LockoutTests(_ConfigSandbox):
     def test_locked_out_after_five_failures_and_alert_is_raised(self):
         for _ in range(5):
             r = self.client.get('/login')
-            tok = _csrf_field(r.get_data(as_text=True))
+            tok = csrf_field(r.get_data(as_text=True))
             self.client.post('/login', data={'password': 'wrong', 'csrf_token': tok})
 
         r = self.client.get('/login')
-        tok = _csrf_field(r.get_data(as_text=True))
+        tok = csrf_field(r.get_data(as_text=True))
         r = self.client.post('/login', data={'password': PASSWORD, 'csrf_token': tok})
         self.assertEqual(r.status_code, 429)
         self.assertIn('too many', r.get_data(as_text=True).lower())
@@ -552,8 +545,7 @@ class PasswordEndpointTests(_ConfigSandbox):
         self.addCleanup(self.t.cleanup)
 
     def _csrf(self):
-        r = self.client.get('/settings')
-        return _csrf_meta(r.get_data(as_text=True))
+        return csrf_token(self.client)
 
     def test_enabling_without_a_password_is_rejected_via_field_endpoint(self):
         tok = self._csrf()
@@ -599,7 +591,7 @@ class PasswordEndpointTests(_ConfigSandbox):
                              headers={'X-CSRFToken': tok})
         self.assertEqual(r.status_code, 200)
         r = self.client.get('/login')
-        tok = _csrf_field(r.get_data(as_text=True))
+        tok = csrf_field(r.get_data(as_text=True))
         r = self.client.post('/login', data={'password': 'first-password-1', 'csrf_token': tok},
                              follow_redirects=False)
         self.assertEqual(r.status_code, 302)
@@ -639,8 +631,7 @@ class DisableClearsPasswordTests(_ConfigSandbox):
         self.addCleanup(self.t.cleanup)
 
     def _csrf(self):
-        r = self.client.get('/settings')
-        return _csrf_meta(r.get_data(as_text=True))
+        return csrf_token(self.client)
 
     def _set_password_and_enable(self, password):
         tok = self._csrf()
@@ -655,7 +646,7 @@ class DisableClearsPasswordTests(_ConfigSandbox):
         # The gate is now live for this same test client's session too - log in, or every
         # request after this point (including this test's own follow-up calls) 401s.
         r = self.client.get('/login')
-        tok = _csrf_field(r.get_data(as_text=True))
+        tok = csrf_field(r.get_data(as_text=True))
         r = self.client.post('/login', data={'password': password, 'csrf_token': tok},
                              follow_redirects=False)
         self.assertEqual(r.status_code, 302)
@@ -827,7 +818,7 @@ class InertGateSurfaceTests(_ConfigSandbox):
         client = t.app.test_client()
         # The gate is inert, so /settings is reachable with no session - which is the whole
         # point of the state, and what makes this recovery path work at all.
-        tok = _csrf_meta(client.get('/settings').get_data(as_text=True))
+        tok = csrf_meta(client.get('/settings').get_data(as_text=True))
         r = client.post('/api/settings/password',
                         json={'new_password': PASSWORD, 'confirm_password': PASSWORD},
                         headers={'X-CSRFToken': tok})

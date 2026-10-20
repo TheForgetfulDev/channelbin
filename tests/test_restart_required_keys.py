@@ -4,7 +4,7 @@ Both are read exactly once, inside create_app() - behind_proxy wires ProxyFix, s
 registers the /mockups blueprint - but neither was in RESTART_REQUIRED_KEYS, so the raw
 config.yaml editor wrote them and flashed the bare "Settings saved." with no restart notice.
 The user got a success message for a change that had not taken effect and would not until an
-unrelated restart happened to pick it up (dev/docs/BUGS.md 2026-08-12 09:31, dev/changelog/586).
+unrelated restart happened to pick it up (dev/docs/BUGS.md 2026-08-12 06:16 AM, dev/changelog/586).
 
 ConfigSandbox, not a bare TestCase: save_config() writes _CONFIG_PATH and the /settings POST
 route reaches it through a module-top import, so an unsandboxed run would rewrite the real
@@ -124,8 +124,7 @@ class RawYamlEditorFlashTests(ConfigSandbox):
         self._write_cfg(_cfg())
         set_restart_needed(False)
         self.addCleanup(set_restart_needed, False)
-        self.t = make_test_app()
-        self.t.app.config['WTF_CSRF_ENABLED'] = False
+        self.t = make_test_app(csrf=False)
         self.addCleanup(self.t.cleanup)
         self.client = self.t.app.test_client()
 

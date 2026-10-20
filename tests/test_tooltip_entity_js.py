@@ -86,6 +86,49 @@ class TooltipLineBreakTests(unittest.TestCase):
         self.assertEqual(plain['displayed'], 'block')
 
 
+@unittest.skipIf(shutil.which('node') is None, 'node not installed')
+@unittest.skipUnless(os.path.isdir(JSDOM), 'jsdom not installed (npm install)')
+class TooltipFollowsRebuiltAnchorTests(unittest.TestCase):
+    """Guards dev/docs/BUGS.md 2026-10-20 "The shared tooltip kept its old coordinates when
+    the node under it was rebuilt".
+
+    The tooltip's coordinates were computed once, at hover time. The dashboard timeline
+    replaces its markup every 60 seconds and slides its bars 4px a minute, so a tooltip
+    left open over it drifted out of alignment for as long as the mouse stayed still.
+    The fix is in the one shared renderer: while a tooltip is open it watches the DOM,
+    re-measures an anchor that survived a mutation, hands itself to the node now under the
+    pointer when that node carries the same tip, and closes only when what is under the
+    pointer is something else. tests/support/tooltip.mjs stubs elementFromPoint and the
+    anchors' rects, so each outcome is visible as the popover's `left` or `display`."""
+
+    def setUp(self):
+        self.obs = _observe()
+        self.assertEqual(self.obs['errors'], [], 'util.js must load cleanly')
+        self.rb = self.obs['rebuild']
+
+    def test_a_surviving_anchor_is_re_measured_when_the_page_changes_around_it(self):
+        s = self.rb['survivor']
+        self.assertEqual(s['leftAtHover'], '120px')
+        self.assertEqual(s['leftAfter'], '220px',
+                         'the anchor moved and the page mutated, but the tooltip stayed put')
+        self.assertEqual(s['displayed'], 'block')
+
+    def test_a_replacement_carrying_the_same_tip_takes_over_without_a_flicker(self):
+        same = self.rb['sameTip']
+        self.assertEqual(same['displayed'], 'block', 'the tooltip closed on a rebuild')
+        self.assertEqual(same['left'], '320px', 'the tooltip did not move onto the new node')
+        self.assertEqual(same['text'], 'Live: Channel 5')
+        # The replacement IS the anchor now, so hovering it must not re-open or re-place.
+        self.assertEqual(self.rb['reHover'], {'left': '320px', 'displayed': 'block'})
+
+    def test_a_replacement_carrying_a_different_tip_closes_the_tooltip(self):
+        self.assertEqual(self.rb['otherTip']['displayed'], 'none',
+                         'the tooltip kept describing a node that is no longer under the pointer')
+
+    def test_nothing_with_a_tip_under_the_pointer_closes_it_too(self):
+        self.assertEqual(self.rb['nothingUnder']['displayed'], 'none')
+
+
 class MacroTipEscapingTests(unittest.TestCase):
     """Why the decode above is load-bearing, pinned on the server side."""
 

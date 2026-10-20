@@ -41,15 +41,11 @@ class DeadStreamScenario(CaptureCase):
         self.assertTrue(self.lost(answer, ak.REASON_REFUSED), answer.describe())
         # Everything before the retry is lost, and ChannelBin's capture gap - wall clock in
         # the window with no segment capturing - is the measure of it: the content lost is
-        # that gap less the retry's connect burst, which reaches back into it. Except that
-        # covered_capture_seconds counts a refused segment's few seconds as coverage, though
-        # it captured nothing, so the gap reads short by those spans - the answer key's
-        # finding, tracked in the backlog. The term goes when that is fixed.
-        empty = sum((s.ended_at - s.started_at).total_seconds() for s in segs
-                    if not s.bytes_recorded and s.ended_at)
-        self.assertAlmostEqual(answer.lost_seconds, gap - BURST + empty, delta=1.0,
-                               msg=f'{answer.describe()}\ngap {gap:.2f}, empty spans '
-                                   f'{empty:.2f}')
+        # that gap less the retry's connect burst, which reaches back into it. A refused
+        # segment's seconds are in the gap, not in the coverage: it captured nothing
+        # (dev/changelog/1247).
+        self.assertAlmostEqual(answer.lost_seconds, gap - BURST, delta=1.0,
+                               msg=f'{answer.describe()}\ngap {gap:.2f}')
 
 
 if __name__ == '__main__':

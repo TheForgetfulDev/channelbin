@@ -118,8 +118,7 @@ class _Case(unittest.TestCase):
     credentials, plus a radio mount and a third-party feed with foreign credentials."""
 
     def setUp(self):
-        self.t = make_test_app()
-        self.t.app.config['WTF_CSRF_ENABLED'] = False
+        self.t = make_test_app(csrf=False)
         self.client = self.t.app.test_client()
         self.acc = seed.make_account(name='harbor-direct', max_connections=1)
         self.chans = []
@@ -230,7 +229,7 @@ class SeatTests(_Case):
         main, spare = self._list(('main', 'main', 'pw1', 1), ('spare', 'spare', 'pw2', 1))
         connlim.try_acquire(self.acc_id, 'recording', 11)
         connlim.try_acquire(self.acc_id, 'test', 501)
-        self.assertEqual(connlim.preempt_tests_for_slot(self.acc_id), [501])
+        self.assertEqual(connlim.preempt_tests_for_slot(self.acc_id), [(501, self.acc_id)])
         self.assertEqual(self._pool(spare), [])
         self.assertEqual(self._pool(main), [('recording', 11)])
         self.assertTrue(connlim.try_acquire(self.acc_id, 'recording', 12))
@@ -434,6 +433,23 @@ class ListWriterTests(_Case):
             with self.assertRaises(ValueError, msg=str(bad)):
                 links.add_login(self.acc_id, *bad)
         self.assertEqual([lg.name for lg in links.logins_for_account(self.acc_id)], ['main'])
+
+    def test_a_character_that_would_change_how_the_url_is_read_is_refused(self):
+        """dev/changelog/1243: render_login() splices the pair into the path raw, so a "?"
+        in a password turns the stream id into a query string and every segment 404s with
+        nothing stamped (a 404 is not a credential refusal). Caught at the dialog."""
+        for username, password in (('u?x', 'p'), ('u', 'p#1'), ('u', 'p%20q'), ('u@h', 'p'),
+                                   ('u', 'p w'), ('u\tx', 'p'), ('u', 'p/q')):
+            with self.assertRaises(ValueError, msg=(username, password)) as caught:
+                links.add_login(self.acc_id, 'x', username, password, 1)
+            self.assertIn('cannot contain', str(caught.exception))
+        main = links.add_login(self.acc_id, 'main', 'main', 'pw1', 1).id
+        with self.assertRaises(ValueError):
+            links.update_login(self.acc_id, main, 'main', 'main', 'new#pw', 1)
+        self.assertEqual(db.session.get(Login, main).password, 'pw1')
+        # The characters a real password does carry still pass.
+        links.update_login(self.acc_id, main, 'main', 'Ma.in-1_2', 'p.W-x_9~!', 1)
+        self.assertEqual(db.session.get(Login, main).password, 'p.W-x_9~!')
 
     def test_edit_keeps_the_password_when_blank_and_clears_the_stamp_on_a_new_credential(self):
         main, = self._list(('main', 'main', 'pw1', 1))

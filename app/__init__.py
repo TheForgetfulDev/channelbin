@@ -323,6 +323,20 @@ def create_app(config_overrides=None, start_scheduler=True):
     # The statuses a sync stops on, so the account page marks exactly those red.
     from .accounts import PROVIDER_INACTIVE_STATUSES
     app.jinja_env.globals['provider_inactive_statuses'] = PROVIDER_INACTIVE_STATUSES
+    # The account and sync-log status vocabularies (app/database.py), so a template
+    # compares `status == ACCOUNT_STATUS.OK` against the one declared spelling rather than
+    # re-typing it - the shape of the incident where a re-typed literal matched nothing
+    # forever (CLAUDE.md, "one flag, one meaning"). Constants: no request state, no I/O.
+    from types import SimpleNamespace
+    from .database import status_vocabularies
+    vocab = status_vocabularies()
+    for family, members in vocab.items():
+        app.jinja_env.globals[family] = SimpleNamespace(**members)
+    # The same vocabularies for the browser: base.html serves them in a meta tag that
+    # util.js::statusVocab() reads, the way the health bands and the recording-status
+    # labels already travel, so a script keys on `statusVocab('ACCOUNT_STATUS').SYNCING`
+    # and never on a spelling of its own.
+    app.jinja_env.globals['status_vocab'] = vocab
 
     @app.context_processor
     def inject_globals():
@@ -593,7 +607,7 @@ def _ensure_system_health_job():
     """
     from sqlalchemy import text
     from .config import config_write_lock, _load_config_file, _write_config_file
-    from .database import ChannelGroup, OnDemandTestJob
+    from .database import ChannelGroup, OnDemandTestJob, OD_JOB_STATUS_SCHEDULED
     log = logging.getLogger(__name__)
 
     # The job's channel list is its group's membership; the system group's membership
@@ -623,7 +637,7 @@ def _ensure_system_health_job():
         db.session.add(OnDemandTestJob(
             name='TV Guide Channels',
             is_system=True,
-            status='SCHEDULED',
+            status=OD_JOB_STATUS_SCHEDULED,
             recurring=True,
             recur_day=0,
             recur_hour=2,

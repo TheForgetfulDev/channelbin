@@ -17,7 +17,7 @@
    hides the [data-section] cards, so a swap never undoes it. */
 (() => {
   const CFG = window.RULE_CONFIG || {};
-  const PHONE = window.matchMedia('(max-width: 960px)');
+  const PHONE = MOBILE_MQ;  // util.js's one breakpoint
   // Read from the status bar each time: a swap replaces it with the rule as it is now.
   const bar = () => document.getElementById('rule-actionbar');
   const dialog = () => JSON.parse(bar().dataset.dialog);

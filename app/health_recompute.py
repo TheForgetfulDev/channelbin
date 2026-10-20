@@ -59,6 +59,7 @@ from typing import List
 
 from sqlalchemy import or_
 
+from .fmt_utils import iso_or_none
 from .health_score import blend_health_score, observation_weight
 
 log = logging.getLogger(__name__)
@@ -574,7 +575,7 @@ def apply_test_deletion(channel, test, cfg):
     label = _test_label(test)
     facts = {
         'test_id': test.id,
-        'test_started_at': test.test_started_at.isoformat() if test.test_started_at else None,
+        'test_started_at': iso_or_none(test.test_started_at),
         'status': test.status,
         'quality_score': test.quality_score,
         'job_id': test.job_id,
@@ -605,6 +606,49 @@ def apply_test_deletion(channel, test, cfg):
 
     return ({'detail': detail, 'counted': counted, 'score_before': before,
              'score_after': score, 'remaining': count}, paths)
+
+
+def apply_tests_deletion(channel, tests, cfg, reason: str):
+    """Delete several of `channel`'s ChannelTest rows at once (a channel leaving a health
+    check takes its tests on that check with it) and, if any of them counted, rewrite the
+    score from what remains - the bulk form of apply_test_deletion, same contract: mutates,
+    adds and deletes, does NOT commit, returns (result, screenshot_paths) for the caller to
+    unlink after its commit. `tests` is a ChannelTest query scoped to this channel.
+
+    The ledger is read BEFORE the deletes, because afterwards nothing could tell a test that
+    was just deleted from one pruned long ago - and only a channel where a deleted test was
+    counting is replayed, or the pruned-residual shortfall would move scores for no visible
+    reason (dev/changelog/1149). `result` is None when nothing deleted was counting and the
+    score is left exactly where it is.
+    """
+    from . import db
+    from .channel_tester import delete_tests_collecting_screenshots
+    from .database import ChannelEvent, ChannelTest, CHANNEL_HEALTH_RECOMPUTED
+
+    ledger = observation_ledger(channel.id, cfg)
+    test_ids = [tid for (tid,) in tests.with_entities(ChannelTest.id)]
+    counted = [tid for tid in test_ids if _deleted_test_counted(ledger, tid)]
+    paths = delete_tests_collecting_screenshots(tests)
+    if not counted:
+        return None, paths
+
+    gone = {(SOURCE_TEST, tid) for tid in counted}
+    remaining = [o for o in ledger if o.key not in gone]
+    samples_before = channel.health_score_sample_count
+    before, score, count = _rewrite_from_ledger(channel, remaining, cfg)
+    detail = (f'Health score recomputed from the {count} observation'
+              f'{"s" if count != 1 else ""} still on record - {reason}, '
+              f'{_score_words(before, score)}')
+    db.session.add(ChannelEvent(
+        channel_id=channel.id, timestamp=datetime.utcnow(),
+        event_type=CHANNEL_HEALTH_RECOMPUTED, detail=detail,
+        extra_data=json.dumps({
+            'reason': reason, 'deleted_test_ids': test_ids, 'counted_test_ids': counted,
+            'score_before': before, 'score_after': score,
+            'observations_counted': count, 'sample_count_before': samples_before,
+        })))
+    return ({'detail': detail, 'score_before': before, 'score_after': score,
+             'observations_counted': count, 'sample_count_before': samples_before}, paths)
 
 
 def repair_duplicated_capture_corrections(cfg):

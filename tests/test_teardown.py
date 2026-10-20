@@ -48,13 +48,12 @@ from app.watchdog import WatchdogThread  # noqa: E402
 # not re-run anything.
 from tests.test_launch_failure_retry import _LaunchRetryTestCase  # noqa: E402
 from tests.test_watchdog_connection_release import _ConnectionReleaseHarness  # noqa: E402
-from tests.test_watchdog_process_exit import _sleeper  # noqa: E402
+from tests.support.watchdog import sleeper  # noqa: E402
 
 
 class DeleteScheduledTeardownTests(unittest.TestCase):
     def setUp(self):
-        self.t = make_test_app(start_scheduler=True)
-        self.t.app.config['WTF_CSRF_ENABLED'] = False
+        self.t = make_test_app(start_scheduler=True, csrf=False)
         self.acc = seed.make_account()
         self.ch = seed.make_channel(self.acc, stream_id=1, name='Ch')
         db.session.commit()
@@ -89,12 +88,16 @@ class DeleteScheduledTeardownTests(unittest.TestCase):
 
 
 class CancelScheduledEmitsEventTests(unittest.TestCase):
-    """Cancelling a SCHEDULED recording must leave a RECORDING_ABORTED event on the row,
-    same as the IN_PROGRESS path already does - guards dev/docs/BUGS.md 2026-07-25 @ ~08:00 PM ET."""
+    """Cancelling a SCHEDULED recording through the form route tears everything down: the
+    APScheduler start/stop jobs and the row itself, with no orphaned events left naming it.
+
+    This used to guard dev/docs/BUGS.md 2026-07-25 @ ~08:00 PM ET (the row stayed, marked
+    ABORTED with no event). Since dev/changelog/814 a cancel before start deletes the row,
+    and since dev/changelog/1247 the form route does too, so the teardown it guards is the
+    delete's."""
 
     def setUp(self):
-        self.t = make_test_app(start_scheduler=True)
-        self.t.app.config['WTF_CSRF_ENABLED'] = False
+        self.t = make_test_app(start_scheduler=True, csrf=False)
         self.acc = seed.make_account()
         self.ch = seed.make_channel(self.acc, stream_id=1, name='Ch')
         db.session.commit()
@@ -110,14 +113,17 @@ class CancelScheduledEmitsEventTests(unittest.TestCase):
         rid = rec.id
         schedule_recording(self.t.app, rid, rec.start_time, rec.stop_time)
 
+        self.assertIsNotNone(get_scheduler().get_job(f'start_{rid}'), 'setup: job armed')
+
         resp = self.t.client.post(f'/recordings/{rid}/cancel')
         self.assertEqual(resp.status_code, 302, resp.get_data(as_text=True))
 
-        self.assertEqual(db.session.get(Recording, rid).status, 'ABORTED')
-        events = RecordingEvent.query.filter_by(recording_id=rid).all()
-        self.assertTrue(
-            any(e.event_type == 'RECORDING_ABORTED' for e in events),
-            f'no RECORDING_ABORTED event on cancelled SCHEDULED recording; got {[e.event_type for e in events]}')
+        db.session.expire_all()
+        self.assertIsNone(db.session.get(Recording, rid), 'the SCHEDULED row is deleted')
+        self.assertEqual([], RecordingEvent.query.filter_by(recording_id=rid).all(),
+                         'no event may outlive the row it names')
+        self.assertIsNone(get_scheduler().get_job(f'start_{rid}'))
+        self.assertIsNone(get_scheduler().get_job(f'stop_{rid}'))
 
 
 class CancelJsonRejectsTerminalStatusTests(unittest.TestCase):
@@ -126,8 +132,7 @@ class CancelJsonRejectsTerminalStatusTests(unittest.TestCase):
     dev/docs/BUGS.md 2026-08-15 @ ~12:00 AM ET."""
 
     def setUp(self):
-        self.t = make_test_app(start_scheduler=True)
-        self.t.app.config['WTF_CSRF_ENABLED'] = False
+        self.t = make_test_app(start_scheduler=True, csrf=False)
         self.acc = seed.make_account()
         self.ch = seed.make_channel(self.acc, stream_id=1, name='Ch')
         db.session.commit()
@@ -371,7 +376,7 @@ class WatchdogGiveUpReleasesEverythingTests(_ConnectionReleaseHarness):
 
         This is the state _mark_recording_failed's kill exists for, in its own words:
         the last restart attempt's ffmpeg is still running, it just has not produced data
-        yet. _RestartHarness's produces_data=False stub hands over an already-dead process
+        yet. RestartHarness's produces_data=False stub hands over an already-dead process
         instead, which lets the stall path's kill satisfy an assertion meant for the
         give-up's - the test passed against a give-up that killed nothing until this rig
         replaced it.
@@ -383,13 +388,13 @@ class WatchdogGiveUpReleasesEverythingTests(_ConnectionReleaseHarness):
                                             segment_number=seg_num, file_path=path,
                                             started_at=datetime.utcnow()))
             db.session.commit()
-            self.state.process = _sleeper()
+            self.state.process = sleeper()
             self.relaunched.append(self.state.process)
             self.state.current_segment_num = seg_num
         return _stub
 
     def _run_until_give_up(self, event_type, timeout=60):
-        """Deliberately never sets stop_event, unlike _RestartHarness._run_until_event:
+        """Deliberately never sets stop_event, unlike RestartHarness._run_until_event:
         the give-up has to wind its own thread down, and setting the flag here would make
         the thread-exit assertion below pass for the wrong reason. tearDown sets it
         regardless, so a give-up that hangs cannot hang the suite."""
@@ -423,7 +428,7 @@ class WatchdogGiveUpReleasesEverythingTests(_ConnectionReleaseHarness):
         # branch worth guarding is the one after a restart that produced no data, where
         # the replacement ffmpeg is still running.
         self._extra_watchdog_cfg = {'max_consecutive_failures': 2}
-        self.state.process = _sleeper()
+        self.state.process = sleeper()
         self.relaunched.append(self.state.process)
         path, fh = recorder._open_segment_stderr_spool(self.t.app, self.rid, 0)
         self.state.stderr_path, self.state.stderr_fh = path, fh
@@ -522,8 +527,8 @@ class ShutdownReleasesEverythingTests(unittest.TestCase):
         """The three loops in kill_all_active each run over the whole set; collapsing any
         of them to the first entry would leave the other recordings' ffmpeg children alive
         and writing after the process that owned them is gone."""
-        _rid_a, _state_a, _ = self._live_recording('shutdown-a', _sleeper())
-        _rid_b, _state_b, _ = self._live_recording('shutdown-b', _sleeper())
+        _rid_a, _state_a, _ = self._live_recording('shutdown-a', sleeper())
+        _rid_b, _state_b, _ = self._live_recording('shutdown-b', sleeper())
 
         recorder.kill_all_active()
 
@@ -535,8 +540,8 @@ class ShutdownReleasesEverythingTests(unittest.TestCase):
         reads the shutdown as a stall and spawns a replacement ffmpeg on the way out. It is
         also what a pending launch-retry thread waits on, so both must wind down for every
         recording, not just the one that happened to be first."""
-        _rid_a, state_a, _ = self._live_recording('shutdown-a', _sleeper())
-        _rid_b, state_b, _ = self._live_recording('shutdown-b', _sleeper())
+        _rid_a, state_a, _ = self._live_recording('shutdown-a', sleeper())
+        _rid_b, state_b, _ = self._live_recording('shutdown-b', sleeper())
         exited = []
         threads = []
         for label, state in (('a', state_a), ('b', state_b)):
@@ -571,7 +576,7 @@ class ShutdownReleasesEverythingTests(unittest.TestCase):
         """The deliberate non-release. Segment files and their rows are how a restarted
         service picks the recording back up (scheduler.resume_in_progress_recordings), so
         a shutdown that tidied them away would destroy the capture it is protecting."""
-        rid, _state, seg_path = self._live_recording('shutdown-a', _sleeper())
+        rid, _state, seg_path = self._live_recording('shutdown-a', sleeper())
 
         recorder.kill_all_active()
 
@@ -601,8 +606,7 @@ class DeleteUnlinksWhatNamesTheRecordingTests(unittest.TestCase):
     OLD_DISMISSAL = datetime(2026, 1, 1, 0, 0, 0)
 
     def setUp(self):
-        self.t = make_test_app(start_scheduler=True)
-        self.t.app.config['WTF_CSRF_ENABLED'] = False
+        self.t = make_test_app(start_scheduler=True, csrf=False)
         self.acc = seed.make_account()
         self.ch = seed.make_channel(self.acc, stream_id=1, name='Ch')
         db.session.commit()

@@ -5,14 +5,13 @@ import json
 import logging
 import os
 import shutil
-import tempfile
 import threading
 import time
 from collections import namedtuple
 from datetime import datetime
 
 from .fmt_utils import fmt_bytes as _fmt_bytes, fmt_duration
-from .proc_utils import delivery_ratio, supervise_ffmpeg, terminate_or_kill
+from .proc_utils import delivery_ratio, supervise_ffmpeg, terminate_or_kill, write_concat_list
 
 log = logging.getLogger(__name__)
 
@@ -139,6 +138,18 @@ def concat_progress(recording_id: int):
         out = {k: v for k, v in entry.items() if not k.startswith('_')}
     out['elapsed_seconds'] = max(0.0, time.monotonic() - out.pop('started'))
     return out
+
+
+def concat_progress_parts(prog) -> list:
+    """The join's progress in words, in order: the percentage when there is one, then
+    "N of M segments". One builder for the recordings list and the Dashboard, so a change
+    to what the registry reports (the clamp at 99, the count) reads the same on both; each
+    page adds its own framing (an ETA, the name) around these."""
+    parts = []
+    if prog['pct'] is not None:
+        parts.append(f"{prog['pct']:.0f}%")
+    parts.append(f"{prog['joined']} of {prog['of']} segments")
+    return parts
 
 
 def _track_join_child(recording_id: int, proc, output_path: str):
@@ -268,7 +279,20 @@ def do_concatenation(app, recording_id: int, *, reason: str = 'Stop time reached
         _release_concat(recording_id)
 
 
-def run_postprocess_claimed(app, recording_id: int, ts_path: str):
+def claim_postprocess(recording_id: int):
+    """Take the live-chain claim for a post-processing run started outside do_concatenation,
+    in the thread that decides to start it. None when taken; otherwise the seconds the chain
+    that already holds it has been running. The holder hands it to run_postprocess_claimed
+    (claimed=True), which releases it, or releases it itself through release_postprocess
+    when the run never starts (dev/changelog/1242)."""
+    return _claim_concat(recording_id)
+
+
+def release_postprocess(recording_id: int):
+    _release_concat(recording_id)
+
+
+def run_postprocess_claimed(app, recording_id: int, ts_path: str, *, claimed: bool = False):
     """do_postprocess() under the live-chain claim, for callers that reach post-processing
     without going through do_concatenation - today only the Retry conversion route.
 
@@ -278,13 +302,17 @@ def run_postprocess_claimed(app, recording_id: int, ts_path: str):
     False for the whole analysis phase (no ffmpeg has been spawned yet), so a second Retry
     in that window starts a duplicate chain that re-probes the same file and races the first
     one to spawn a conversion.
+
+    `claimed=True` says the caller already holds the claim (claim_postprocess) and this run
+    inherits it; the release is this function's either way.
     """
-    running_for = _claim_concat(recording_id)
-    if running_for is not None:
-        log.warning('Post-processing for recording %d is already in progress (%.0fs) - '
-                    'refusing to start a second one', recording_id, running_for,
-                    extra={'recording_id': recording_id})
-        return
+    if not claimed:
+        running_for = _claim_concat(recording_id)
+        if running_for is not None:
+            log.warning('Post-processing for recording %d is already in progress (%.0fs) - '
+                        'refusing to start a second one', recording_id, running_for,
+                        extra={'recording_id': recording_id})
+            return
     try:
         from .postprocessor import do_postprocess
         do_postprocess(app, recording_id, ts_path)
@@ -815,10 +843,8 @@ def _run_concatenation(app, recording_id: int, *, reason: str):
                         error_msg = str(exc)
                 else:
                     # Write concat.txt and run ffmpeg concat
-                    concat_txt = os.path.join(tempfile.gettempdir(), f'dvr_{recording_id}_concat.txt')
-                    with open(concat_txt, 'w') as f:
-                        for seg in valid_segments:
-                            f.write(f"file '{seg.file_path}'\n")
+                    concat_txt = write_concat_list([seg.file_path for seg in valid_segments],
+                                                   prefix=f'dvr_{recording_id}_concat_')
 
                     @retry_on_locked()
                     def _mark_concat_started_and_commit():

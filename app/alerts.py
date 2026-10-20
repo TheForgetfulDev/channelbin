@@ -601,7 +601,11 @@ def create_alert(alert_type: str, title: str, body: str = None,
                  source: str = None, recording_id: int = None):
     """Create an in-app Alert and enqueue push notifications per config routing.
 
-    Safe to call from any thread (uses Flask app context internally).
+    Callers must hold an app context - a request, a job's `with app.app_context()`, or one
+    a background thread pushed for itself. Nothing here pushes one: this module holds no
+    app reference, and off-context the first query would raise and the alert would be lost
+    inside a logged "Failed to write alert row". So an off-context call is refused up front
+    with a WARNING that names the alert, and writes nothing (dev/changelog/1244).
     Skips an unknown alert_type with a WARNING (a misspelled type is an alert that would
     otherwise never fire), and silently skips alert_types the user has ignored via a
     matching IgnoredAlertPattern (the underlying condition is still logged normally by
@@ -610,6 +614,11 @@ def create_alert(alert_type: str, title: str, body: str = None,
     type_meta = ALERT_TYPES.get(alert_type)
     if type_meta is None:
         log.warning('create_alert: unknown alert_type %r, not raised: %s', alert_type, title)
+        return
+    from flask import has_app_context
+    if not has_app_context():
+        log.warning('create_alert(%s) was called with no app context, so the alert was not '
+                    'written - the caller must push one: %s', alert_type, title)
         return
 
     if _record_if_ignored(alert_type, title):

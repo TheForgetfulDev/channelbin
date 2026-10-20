@@ -208,8 +208,7 @@ class ComparisonTitleAdoptsHelperTests(unittest.TestCase):
 class _RuleCase(unittest.TestCase):
 
     def setUp(self):
-        self.t = make_test_app()
-        self.t.app.config['WTF_CSRF_ENABLED'] = False
+        self.t = make_test_app(csrf=False)
         self.armed = patch('app.routes.recordings.schedule_recording').start()
         self.addCleanup(patch.stopall)
         self.acc = seed.make_account()

@@ -105,8 +105,7 @@ class SystemJobRunNowTests(unittest.TestCase):
     request - a refusal comes back as a 409 naming the blocker, never a silent deferral."""
 
     def setUp(self):
-        self.t = make_test_app(start_scheduler=True)
-        self.t.app.config['WTF_CSRF_ENABLED'] = False
+        self.t = make_test_app(start_scheduler=True, csrf=False)
         self.client = self.t.app.test_client()
 
     def tearDown(self):

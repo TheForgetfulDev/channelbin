@@ -43,10 +43,16 @@
   --accent: #4f9cf7; --accent-rgb: 79,156,247;
   --accent-soft: rgba(79,156,247,.14);
   --accent-text: #7cb5f9;
-  --accent-contrast: #0c0e12; /* dark text on an accent-filled control */
-  --ok: #3fb659;   --ok-rgb: 63,182,89;    --ok-soft: rgba(63,182,89,.14);
-  --bad: #ef5350;  --bad-rgb: 239,83,80;   --bad-soft: rgba(239,83,80,.13);
-  --warn: #d9a62e; --warn-rgb: 217,166,46; --warn-soft: rgba(217,166,46,.14);
+  /* Dark text on ANY filled control - an accent, status or band fill alike. One value on
+     purpose: a filled chip must not be near-black on one page and white on the next, and
+     the light fills (--accent, --warn, --ok, the bands) all take the same dark ink. */
+  --accent-contrast: #0c0e12;
+  /* Each status color also has a -text tint, the readable light version for prose or a
+     chip label sitting on its own -soft background (the way --accent-text pairs with
+     --accent-soft). The bare status color is for edges, fills and short badge text. */
+  --ok: #3fb659;   --ok-rgb: 63,182,89;    --ok-soft: rgba(63,182,89,.14);   --ok-text: #8fd9a1;
+  --bad: #ef5350;  --bad-rgb: 239,83,80;   --bad-soft: rgba(239,83,80,.13);  --bad-text: #f0a5a3;
+  --warn: #d9a62e; --warn-rgb: 217,166,46; --warn-soft: rgba(217,166,46,.14); --warn-text: #e8c98a;
   --live: #ef5350;
   /* Health-score bands (app/health_bands.py). Four steps from green to red, because the
      status family above only has three and Great must not read identically to Good.
@@ -70,8 +76,21 @@
      because the rule itself needs it twice (width and flex-basis). Measured, not
      picked: see the fit note above .sidebar. */
   --sidebar-w: 232px;
+  /* Width of the status-colored left edge drawn as an inset ::before bar on rows, cards,
+     tiles and the live strip (dev/changelog/878). Every host reserves it in its padding as
+     calc(<breathing room> + var(--edge-w)), so widening the edge is one edit here rather
+     than sixteen coupled literals. */
+  --edge-w: 3px;
+  /* Height of the "labeled current value" bar a phone shows in place of a toolbar it has
+     folded into a sheet (.pickbar): Logs' filter bar, Settings' section picker. 44px is
+     DESIGN.md 3.9's click-target floor. Settings reads it a second time to keep a section
+     heading from scrolling under the bar. */
+  --pick-h: 44px;
   --shadow-row: 0 1px 2px rgba(0,0,0,.25);
   --shadow-pop: 0 8px 24px rgba(0,0,0,.45);
+  /* A bar pinned to the bottom of a phone viewport casts upward, so it is the third
+     shadow rather than --shadow-pop flipped: the two sticky action bars share it. */
+  --shadow-bar: 0 -4px 16px rgba(0,0,0,.35);
   /* density (comfortable) */
   --row-pad: 14px 18px;
   --row-gap: 8px;
@@ -101,7 +120,7 @@
   /* PAUSED is the one state DESIGN.md section 1 gives no status colour to - it is
      neither ok/warn/bad - so this sits outside the palette on purpose. It is a
      real value, not one of the retired aliases. */
-  --purple: #bc8cff;
+  --purple: #bc8cff; --purple-rgb: 188,140,255; --purple-soft: rgba(188,140,255,.15);
 }
 
 /* Base 16px (DESIGN.md 1 "Type"; the old body{zoom:1.1} hack is gone - the TV Guide
@@ -208,13 +227,36 @@ code { font-family: var(--font-mono); background: var(--bg3); padding: 1px 5px; 
 .form-group { margin-bottom: 1rem; }
 .form-row { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
 label { display: block; font-size: var(--fs-md); font-weight: 600; margin-bottom: 0.3rem; }
+/* ── The one text-input / select recipe ──────────────────────────────
+   Border, radius, text color and the focus state, written once. Every context listed
+   here adds only what differs - its surface (bg1/bg2/bg3), font, size, padding and width -
+   so a focus-ring or border change lands everywhere at once. A new text control joins
+   this list instead of restating the recipe, which had been written eight times over
+   before it was consolidated. The page-local contexts (Maintenance's .mrow,
+   Notifications' .svc-body, Settings' .yaml-pane, Hide rules' .rule-form-row, the search
+   page's .wf-c) are named here rather than carrying copies in their pages; their own rules
+   keep only their differences. tests/test_css_token_restatements.py holds this to one
+   spelling of the focus rule. */
+.form-control, .search, .tagcombo select, .cust-grid input, .fd-tpl,
+.fr-ctl input[type=text], .fr-ctl input[type=number], .fr-ctl input[type=time], .fr-ctl select, .fr-ctl textarea,
+.gd-field-ctl select, .gd-field-ctl input:where(:not([type=checkbox]):not([type=radio])), .gd-field-ctl textarea,
+.mrow select, .svc-body .secret-field input[type=text], .svc-body input[type=number], .yaml-pane textarea,
+.wf-c input, .wf-c select, .rule-form-row select, .rule-form-row input[type=text] {
+  border: 1px solid var(--border); border-radius: var(--radius-sm); color: var(--text);
+}
+.form-control:focus, .search:focus, .tagcombo select:focus, .cust-grid input:focus, .fd-tpl:focus,
+.fr-ctl input:focus, .fr-ctl select:focus, .fr-ctl textarea:focus,
+.gd-field-ctl select:focus, .gd-field-ctl input:where(:not([type=checkbox]):not([type=radio])):focus, .gd-field-ctl textarea:focus,
+.mrow select:focus, .svc-body .secret-field input[type=text]:focus, .svc-body input[type=number]:focus, .yaml-pane textarea:focus,
+.wf-c input:focus, .wf-c select:focus, .rule-form-row select:focus, .rule-form-row input[type=text]:focus {
+  outline: none; border-color: var(--accent);
+}
 .form-control {
   display: block; width: 100%;
-  background: var(--bg3); border: 1px solid var(--border); border-radius: var(--radius-sm);
-  color: var(--text); font-size: var(--fs-md); font-family: var(--font);
+  background: var(--bg3); font-size: var(--fs-md); font-family: var(--font);
   padding: 0.45rem 0.75rem;
 }
-.form-control:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 2px rgba(var(--accent-rgb), .2); }
+.form-control:focus { box-shadow: 0 0 0 2px rgba(var(--accent-rgb), .2); }
 .form-hint { font-size: var(--fs-xs); color: var(--text-muted); margin-top: 0.2rem; display: block; }
 .form-label-row { display: flex; align-items: baseline; justify-content: space-between; gap: 0.5rem; margin-bottom: 0.3rem; }
 .form-label-row label { margin-bottom: 0; }
@@ -425,7 +467,7 @@ body.scroll-locked { position: fixed; left: 0; right: 0; width: 100%; overflow: 
   max-width: 300px;
   min-width: 180px;
   line-height: 1.5;
-  box-shadow: 0 4px 16px rgba(0,0,0,0.35);
+  box-shadow: var(--shadow-pop);
   pointer-events: auto;
   display: flex;
   flex-direction: column;
@@ -468,6 +510,7 @@ body.scroll-locked { position: fixed; left: 0; right: 0; width: 100%; overflow: 
    .badge + .b-*. .qbadge-ok/.qbadge-muted were retired with their last non-guide callers
    (dev/changelog/579). */
 .qbadge {
+  /* 2px, below --radius-sm on purpose: a 6px radius on a 14px-tall badge is a pill. */
   font-size: var(--fs-3xs); padding: 1px 4px; border-radius: 2px;
   background: var(--bg2); color: var(--text-muted);
   white-space: nowrap; flex-shrink: 0; line-height: 1.4;
@@ -915,6 +958,9 @@ body.scroll-locked { position: fixed; left: 0; right: 0; width: 100%; overflow: 
    sticky sidebar next to it invites exactly that assumption). */
 .colmain { flex: 1; min-width: 0; display: flex; flex-direction: column; }
 .topbar {
+  /* 52px is the desktop bar's own height, not --topnav-h: the two bars are never on
+     screen together, and nothing sticks under this one (it scrolls away), so the mobile
+     token's "offset by exactly this" contract does not apply here. */
   flex: none; height: 52px; display: flex; align-items: center; gap: 10px;
   padding: 0 30px; background: var(--bg1); border-bottom: 1px solid var(--border-soft);
 }
@@ -932,6 +978,27 @@ body.scroll-locked { position: fixed; left: 0; right: 0; width: 100%; overflow: 
 .page-head { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 6px; flex-wrap: wrap; }
 .page-head h1 { font-size: var(--fs-3xl); font-weight: 700; letter-spacing: -.015em; display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
 .page-head .sub { font-size: var(--fs-md); color: var(--text-muted); font-weight: 400; }
+/* The sentence or two under a page or card heading saying what the surface is for. One
+   class, so the pages stop hand-writing the same inline style at a size (13px) that is
+   not on the type scale; margins stay the page's own. */
+.page-intro { font-size: var(--fs-md); color: var(--text-muted); }
+/* ── Phone picker bar ───────────────────────────────────────────────────
+   The "labeled current value" button a phone shows where a desktop toolbar or rail was
+   folded into a bottom sheet: a small uppercase label, the current value, an optional
+   count, a caret. Logs' filter bar and Settings' section picker are the two callers;
+   each page decides when the bar shows (its own media query) and what the sheet holds.
+   .on lights it while something is hidden behind it. */
+.pickbar { display: flex; align-items: center; gap: 9px; width: 100%; height: var(--pick-h);
+  background: var(--bg1); border: 1px solid var(--border); border-radius: var(--radius-sm);
+  color: var(--text); font: inherit; padding: 0 12px; cursor: pointer; text-align: left; }
+.pickbar .pb-lbl { font-size: var(--fs-2xs); text-transform: uppercase; letter-spacing: .08em;
+  color: var(--text-faint); font-weight: 700; flex: none; }
+.pickbar .pb-cur { flex: 1; min-width: 0; font-size: var(--fs-lg); font-weight: 600;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pickbar .pb-n { font-size: var(--fs-xs); color: var(--text-faint); font-variant-numeric: tabular-nums; flex: none; }
+.pickbar .pb-caret { color: var(--text-muted); flex: none; }
+.pickbar.on { border-color: var(--accent); }
+.pickbar.on .pb-cur { color: var(--accent-text); }
 /* The optional subtitle of 3.10, when it is a sentence rather than the short
    count/label that rides inside the h1 as .sub. Measured rather than free: 76ch
    is where a line stops being comfortably readable at this size. */
@@ -944,12 +1011,8 @@ body.scroll-locked { position: fixed; left: 0; right: 0; width: 100%; overflow: 
 
 /* ── Toolbar / filter bar (DESIGN.md 3.11) ─────────────────────────── */
 .toolbar { display: flex; align-items: center; gap: var(--toolbar-gap); margin: 16px 0 14px; flex-wrap: wrap; }
-.search {
-  background: var(--bg1); border: 1px solid var(--border); border-radius: var(--radius-sm);
-  color: var(--text); font: inherit; font-size: var(--fs-lg); padding: 7px 12px; width: 250px;
-}
+.search { background: var(--bg1); font: inherit; font-size: var(--fs-lg); padding: 7px 12px; width: 250px; }
 .search::placeholder { color: var(--text-faint); }
-.search:focus { outline: none; border-color: var(--accent); }
 .chips { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
 .chip {
   font: inherit; font-size: var(--fs-sm); font-weight: 500; color: var(--text-muted); background: var(--bg1);
@@ -957,6 +1020,14 @@ body.scroll-locked { position: fixed; left: 0; right: 0; width: 100%; overflow: 
 }
 .chip:hover { color: var(--text); }
 .chip.active { background: var(--accent-soft); border-color: var(--accent); color: var(--accent-text); }
+/* Severity-keyed chips (Logs' level filter, Notifications' routing filter): the active
+   tint follows the tone, not the page. INFO is .chip.active's own accent look and needs
+   no class; util.js::severityToneClass() maps both pages' vocabularies (WARNING and
+   WARN, CRITICAL and CRIT) onto these three, so a third page with severity chips writes
+   no mapping of its own. */
+.chip.active.tone-warn { background: var(--warn-soft); border-color: var(--warn); color: var(--warn); }
+.chip.active.tone-bad { background: var(--bad-soft); border-color: var(--bad); color: var(--bad); }
+.chip.active.tone-muted { background: var(--bg3); border-color: var(--text-faint); color: var(--text); }
 .toolbar .right { margin-left: auto; display: flex; align-items: center; gap: 10px; font-size: var(--fs-md); color: var(--text-muted); }
 
 /* Control sizing on a bar (DESIGN.md 3.5 + 3.11, promoted from 12.8).
@@ -1044,7 +1115,7 @@ body.scroll-locked { position: fixed; left: 0; right: 0; width: 100%; overflow: 
   font-size: var(--fs-xs); font-weight: 700; padding: 2px 7px; font-family: inherit; min-width: 22px; }
 .tri button:hover { background: var(--bg3); color: var(--text); }
 .tri button.on-inc { background: var(--accent); color: var(--accent-contrast); }
-.tri button.on-exc { background: var(--bad); color: #2a0b0a; }
+.tri button.on-exc { background: var(--bad); color: var(--accent-contrast); }
 /* Saved filters (filter-bar.js opts.saved, dev/changelog/1156). The chip names the saved
    filter on screen, capped so a long name cannot push the chip row off a phone. */
 .fb-saved-cur { display: inline-block; max-width: 14em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; vertical-align: bottom; }
@@ -1147,13 +1218,9 @@ body.scroll-locked { position: fixed; left: 0; right: 0; width: 100%; overflow: 
 .cust-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 9px 12px; }
 .cust-grid label { display: flex; flex-direction: column; gap: 3px; font-size: var(--fs-sm);
   color: var(--text-muted); font-weight: 400; margin: 0; }
-.cust-grid input { background: var(--bg2); border: 1px solid var(--border); border-radius: var(--radius-sm);
-  color: var(--text); font: inherit; font-size: var(--fs-md); padding: 5px 9px; width: 100%; }
-.cust-grid input:focus { outline: none; border-color: var(--accent); }
+.cust-grid input { background: var(--bg2); font: inherit; font-size: var(--fs-md); padding: 5px 9px; width: 100%; }
 
-.fd-tpl { width: 100%; background: var(--bg2); border: 1px solid var(--border); border-radius: var(--radius-sm);
-  color: var(--text); font-family: var(--font-mono); font-size: var(--fs-lg); padding: 9px 12px; }
-.fd-tpl:focus { outline: none; border-color: var(--accent); }
+.fd-tpl { width: 100%; background: var(--bg2); font-family: var(--font-mono); font-size: var(--fs-lg); padding: 9px 12px; }
 .fd-lbl { font-size: var(--fs-sm); font-weight: 600; color: var(--text-muted); margin-bottom: 6px; display: block; }
 .vchips { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
 .vchip { background: var(--bg2); border: 1px solid var(--border); border-radius: var(--radius-sm);
@@ -1165,9 +1232,7 @@ body.scroll-locked { position: fixed; left: 0; right: 0; width: 100%; overflow: 
 .tagcombo { display: inline-flex; align-items: center; gap: 3px; background: var(--bg2);
   border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 2px 4px 2px 9px;
   font-family: var(--font-mono); font-size: var(--fs-sm); color: var(--text-muted); }
-.tagcombo select { background: var(--bg3); border: 1px solid var(--border); border-radius: var(--radius-sm);
-  color: var(--text); font-family: var(--font-mono); font-size: var(--fs-sm); padding: 2px 4px; max-width: 130px; }
-.tagcombo select:focus { outline: none; border-color: var(--accent); }
+.tagcombo select { background: var(--bg3); font-family: var(--font-mono); font-size: var(--fs-sm); padding: 2px 4px; max-width: 130px; }
 .tagcombo .tc-add { font-family: var(--font); font-size: var(--fs-xs); font-weight: 600; margin-left: 4px;
   background: none; border: 1px solid var(--border); border-radius: var(--radius-sm); color: var(--accent-text);
   padding: 2px 8px; cursor: pointer; }
@@ -1276,11 +1341,12 @@ body.scroll-locked { position: fixed; left: 0; right: 0; width: 100%; overflow: 
   /* Status colour is a 3px inset bar (::before below), clipped by this row's own
      overflow:hidden so it follows the rounded corner instead of fading out partway
      around it - a real border-left of mismatched width does not (measured,
-     dev/changelog/878). padding-left reserves the bar's width plus the 1px the row
-     would otherwise carry on that side, so the grid columns stay where they were. */
-  padding-left: 19px;
+     dev/changelog/878). padding-left reserves the bar's width (--edge-w) plus the 16px
+     the content always had past the old 1px border, so the grid columns stay where they
+     were. */
+  padding-left: calc(16px + var(--edge-w));
 }
-.rows .row::before { content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: 3px; background: var(--border-soft); }
+.rows .row::before { content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: var(--edge-w); background: var(--border-soft); }
 .rows .row:hover { border-top-color: var(--border); border-right-color: var(--border); border-bottom-color: var(--border); background: var(--bg2); }
 /* Reflow to the mobile card layout whenever .rec-list's actual available width drops
    below the row's real minimum (measured empirically, dev/changelog/561: ~794px with
@@ -1294,7 +1360,7 @@ body.scroll-locked { position: fixed; left: 0; right: 0; width: 100%; overflow: 
 @container rec-list (max-width: 800px) {
   .rec-list .list-head { display: none; }
   .rec-list .rows .row {
-    display: grid; gap: 7px; padding: 11px 12px 11px 16px;
+    display: grid; gap: 7px; padding: 11px 12px 11px calc(13px + var(--edge-w));
     grid-template-columns: 76px minmax(0,1fr) auto;
     grid-template-areas: "title title kebab" "time time time" "stats stats stats";
   }
@@ -1399,7 +1465,7 @@ body.scroll-locked { position: fixed; left: 0; right: 0; width: 100%; overflow: 
 .b-fail { background: var(--bad-soft); color: var(--bad); }
 .b-abort { background: var(--bg3); color: var(--text-muted); }
 .b-concat { background: var(--warn-soft); color: var(--warn); }
-.b-paused { background: rgba(188,140,255,.15); color: var(--purple); }
+.b-paused { background: var(--purple-soft); color: var(--purple); }
 .b-retry { background: var(--warn-soft); color: var(--warn); }
 /* A health check that is simply running. Deliberately NOT .b-live, which is the recording
    red: a check doing its job is not an alarm, and four shipped surfaces read as one until
@@ -1466,10 +1532,10 @@ body.scroll-locked { position: fixed; left: 0; right: 0; width: 100%; overflow: 
 
 /* ── Inline notice / alert box (modal bodies - convert & clone flows) ── */
 .notice { border-radius: var(--radius); padding: 10px 12px; font-size: var(--fs-md); margin-bottom: 1rem; line-height: 1.5; }
-.notice-warn { background: var(--warn-soft); border: 1px solid rgba(var(--warn-rgb),.4); color: #e8c98a; }
-.notice-bad { background: var(--bad-soft); border: 1px solid rgba(var(--bad-rgb),.4); color: #f0a5a3; }
-.notice-info { background: var(--accent-soft); border: 1px solid rgba(88,166,255,.35); color: var(--accent-text); }
-.notice-ok { background: var(--ok-soft); border: 1px solid rgba(63,185,80,.4); color: #8fd9a1; }
+.notice-warn { background: var(--warn-soft); border: 1px solid rgba(var(--warn-rgb),.4); color: var(--warn-text); }
+.notice-bad { background: var(--bad-soft); border: 1px solid rgba(var(--bad-rgb),.4); color: var(--bad-text); }
+.notice-info { background: var(--accent-soft); border: 1px solid rgba(var(--accent-rgb),.35); color: var(--accent-text); }
+.notice-ok { background: var(--ok-soft); border: 1px solid rgba(var(--ok-rgb),.4); color: var(--ok-text); }
 .rec-block-list { margin: 0.4rem 0 0 1.1rem; font-size: var(--fs-md); }
 .rec-block-list li { margin-bottom: 2px; }
 /* The explainer above the warning-banner stack (DESIGN-channel-groups-model.md §16), and
@@ -1567,9 +1633,9 @@ body.scroll-locked { position: fixed; left: 0; right: 0; width: 100%; overflow: 
      bar's width so .grp-expand keeps its old flush-left position. It keys off the
      data-health attribute the row already carries for filtering/sorting - there is no
      separate stripe element. */
-  padding-left: 3px;
+  padding-left: var(--edge-w);
 }
-.grp-item::before { content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: 3px; background: var(--border-soft); }
+.grp-item::before { content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: var(--edge-w); background: var(--border-soft); }
 /* Must not repaint the left border - that edge carries the health colour. */
 .grp-item:hover { border-top-color: var(--border); border-right-color: var(--border); border-bottom-color: var(--border); background: var(--bg2); }
 .grp-item[data-health="st-ok"]::before   { background: var(--ok); }
@@ -1943,12 +2009,12 @@ body.actbar-on #app-toast { bottom: 78px; }
 .live-strip {
   display: flex; align-items: center; gap: 14px; flex-wrap: wrap; position: relative; overflow: hidden;
   background: var(--bg1); border: 1px solid var(--border-soft); border-left: none;
-  border-radius: var(--radius); padding: 10px 16px 10px 19px; margin-top: 12px; font-size: var(--fs-md); color: var(--text-muted);
+  border-radius: var(--radius); padding: 10px 16px 10px calc(16px + var(--edge-w)); margin-top: 12px; font-size: var(--fs-md); color: var(--text-muted);
 }
 /* Status colour is this inset bar, clipped by the strip's own overflow:hidden so it
    follows the rounded corner instead of fading out partway around it like a real
    border-left of mismatched width does (measured, dev/changelog/878). */
-.live-strip::before { content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: 3px; background: var(--live); }
+.live-strip::before { content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: var(--edge-w); background: var(--live); }
 .live-strip .pulse { width: 8px; height: 8px; border-radius: 50%; background: var(--live); animation: pulse 1.6s infinite; flex-shrink: 0; }
 .live-strip b { color: var(--text); font-weight: 600; }
 .live-strip .mono { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
@@ -2194,13 +2260,10 @@ body.actbar-on #app-toast { bottom: 78px; }
   border-radius: 999px; padding: 1px 8px; white-space: nowrap; }
 .frow[data-changed] .fr-changed { display: inline-flex; }
 .fr-ctl input[type=text], .fr-ctl input[type=number], .fr-ctl input[type=time], .fr-ctl select {
-  background: var(--bg2); border: 1px solid var(--border); border-radius: var(--radius-sm);
-  color: var(--text); font: inherit; font-size: var(--fs-md); padding: 6px 10px; width: 100%; min-width: 0; }
+  background: var(--bg2); font: inherit; font-size: var(--fs-md); padding: 6px 10px; width: 100%; min-width: 0; }
 .fr-ctl input[type=time] { color-scheme: dark; }
-.fr-ctl input:focus, .fr-ctl select:focus, .fr-ctl textarea:focus { outline: none; border-color: var(--accent); }
 .fr-ctl input[readonly] { background: var(--bg1); color: var(--text-muted); cursor: default; }
-.fr-ctl textarea { background: var(--bg2); border: 1px solid var(--border); border-radius: var(--radius-sm);
-  color: var(--text); font-family: var(--font-mono); font-size: var(--fs-sm); padding: 6px 10px;
+.fr-ctl textarea { background: var(--bg2); font-family: var(--font-mono); font-size: var(--fs-sm); padding: 6px 10px;
   width: 100%; resize: vertical; }
 
 /* ── Entity colour dot ─────────────────────────────────────────────
@@ -2256,6 +2319,15 @@ body.actbar-on #app-toast { bottom: 78px; }
 }
 .switch input:checked + .knob { background: var(--accent-soft); border-color: var(--accent); }
 .switch input:checked + .knob::after { transform: translateX(16px); background: var(--accent); }
+/* A switch the page cannot move must not look like one it can (the dead-knob class
+   DESIGN.md 11.2 names): dimmed, a not-allowed cursor, and an on-but-locked switch
+   still reads as on. On the component, never per page - a page-local rule once
+   outranked the component's own opacity and showed the native checkbox through the
+   knob (dev/changelog/739). */
+.switch:has(input:disabled) { cursor: not-allowed; }
+.switch input:disabled { cursor: not-allowed; }
+.switch input:disabled + .knob { opacity: .45; }
+.switch input:checked:disabled + .knob { background: var(--accent-soft); border-color: var(--accent); }
 
 /* ── Design-system responsive: THE mobile breakpoint (≤960px) ────────
    960 is the app's single mobile breakpoint. The shell (sidebar → top bar) and the
@@ -2298,8 +2370,8 @@ body.actbar-on #app-toast { bottom: 78px; }
      full-width (never truncated/squeezed beside the thumb), badges+time on their own
      line, duration/size/health grouped into one mono stats line via .c-stats. */
   .rows .row {
-    /* left pad matches the desktop rule's 19px reservation for the status bar (see .rows .row) */
-    display: grid; gap: 7px; padding: 11px 12px 11px 16px;
+    /* left pad keeps the status bar's --edge-w reservation (see .rows .row) */
+    display: grid; gap: 7px; padding: 11px 12px 11px calc(13px + var(--edge-w));
     grid-template-columns: 76px minmax(0,1fr) auto;
     grid-template-areas: "title title kebab" "time time time" "stats stats stats";
   }
@@ -2336,7 +2408,7 @@ body.actbar-on #app-toast { bottom: 78px; }
     display: flex; align-items: center; gap: 8px; position: fixed; left: 0; right: 0; bottom: 0;
     z-index: 130; background: var(--bg1); border-top: 1px solid var(--border-soft);
     padding: 10px 14px calc(10px + env(safe-area-inset-bottom));
-    box-shadow: 0 -4px 16px rgba(0,0,0,.35);
+    box-shadow: var(--shadow-bar);
   }
   .mobile-actbar .btn { flex: 1; justify-content: center; }
   .mobile-actbar .menu-wrap, .mobile-actbar .menu-wrap .btn { flex: none; }
@@ -2677,8 +2749,7 @@ th.gd-c-part { text-align: center; }
    sits inside :where() so the selector keeps its old specificity - a bare :not() would outrank
    the input[type=file] padding and the datetime/time mono font below. */
 .gd-field-ctl select, .gd-field-ctl input:where(:not([type=checkbox]):not([type=radio])), .gd-field-ctl textarea {
-  width: 100%; background: var(--bg3); border: 1px solid var(--border); border-radius: var(--radius-sm);
-  color: var(--text); font: inherit; font-size: var(--fs-md); padding: 5px 8px; cursor: pointer;
+  width: 100%; background: var(--bg3); font: inherit; font-size: var(--fs-md); padding: 5px 8px; cursor: pointer;
 }
 /* A multi-line box is typed into rather than picked from, so it keeps the text caret and
    the ability to be dragged taller. Height comes from its own rows attribute. */
@@ -2703,8 +2774,6 @@ th.gd-c-part { text-align: center; }
 .pm-tpl-cleanup { margin-top: 2px; }
 .pm-tpl-acts { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
 .gd-field-ctl input[type="file"] { padding: 4px 6px; }
-.gd-field-ctl select:focus, .gd-field-ctl input:where(:not([type=checkbox]):not([type=radio])):focus,
-.gd-field-ctl textarea:focus { outline: none; border-color: var(--accent); }
 .gd-field-ctl input[type=datetime-local], .gd-field-ctl input[type=time] { font-family: var(--font-mono); color-scheme: dark; }
 /* The schedule picker is the shared recur_schedule_fields macro moved in, so it keeps
    its own form-group layout rather than the two-column field anatomy around it. */
@@ -2789,7 +2858,7 @@ th.gd-c-part { text-align: center; }
      list's header labels off their columns (CLAUDE.md, the list-grid rule). */
   .gm-card {
     background: var(--bg2); border: 1px solid var(--border-soft); border-left: none;
-    border-radius: var(--radius); padding: 10px 12px 10px 15px;
+    border-radius: var(--radius); padding: 10px 12px 10px calc(12px + var(--edge-w));
     position: relative; overflow: hidden;
     /* The status band, copied in shape from .grp-item and the recordings rows - a
        3px inset bar clipped by this card's own overflow:hidden, so it follows the
@@ -2798,7 +2867,7 @@ th.gd-c-part { text-align: center; }
        attribute and the same five tokens those two use, because a third spelling of
        one convention is how they drift. */
   }
-  .gm-card::before { content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: 3px; background: var(--border-soft); }
+  .gm-card::before { content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: var(--edge-w); background: var(--border-soft); }
   .gm-card[data-health="st-ok"]::before   { background: var(--ok); }
   .gm-card[data-health="st-warn"]::before { background: var(--warn); }
   .gm-card[data-health="st-bad"]::before  { background: var(--bad); }
@@ -2863,7 +2932,7 @@ th.gd-c-part { text-align: center; }
      control rather than as a number on the first. */
   .gm-count {
     display: inline-block; min-width: 16px; padding: 0 4px; margin-left: 4px;
-    border-radius: 999px; background: var(--accent); color: #fff;
+    border-radius: 999px; background: var(--accent); color: var(--accent-contrast);
     font-size: var(--fs-2xs); text-align: center;
   }
   /* The sort direction caret on the Sort chip. The sortable column headers go away with
@@ -3163,12 +3232,12 @@ a.shot-link { display: block; width: fit-content; cursor: zoom-in; }
 .mtile {
   background: var(--bg1); border: 1px solid var(--border-soft); border-left: none; border-radius: var(--radius);
   position: relative; overflow: hidden;
-  padding: 10px 13px 10px 16px; box-shadow: var(--shadow-row); min-width: 0;
+  padding: 10px 13px 10px calc(13px + var(--edge-w)); box-shadow: var(--shadow-row); min-width: 0;
 }
 /* Status colour is this inset bar, clipped by the tile's own overflow:hidden so it
    follows the rounded corner instead of fading out partway around it like a real
    border-left of mismatched width does (measured, dev/changelog/878). */
-.mtile::before { content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: 3px; background: var(--border); }
+.mtile::before { content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: var(--edge-w); background: var(--border); }
 .mtile[data-href] { cursor: pointer; }
 .mtile[data-href]:hover { background: var(--bg2); }
 .mtile.ok::before   { background: var(--ok); }
@@ -3223,9 +3292,9 @@ a.shot-link { display: block; width: fit-content; cursor: zoom-in; }
      the same neutral tone as the other three sides - only a row with a matching status
      class (below) draws a real color, so a status this page doesn't classify (the
      health check row) is visually unchanged. */
-  padding-left: 19px;
+  padding-left: calc(16px + var(--edge-w));
 }
-.dash-rows .drow::before { content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: 3px; background: var(--border-soft); }
+.dash-rows .drow::before { content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: var(--edge-w); background: var(--border-soft); }
 .dash-rows .drow:hover { background: var(--bg2); }
 /* Every recording status this page shows is named explicitly (CLAUDE.md, "states are
    enumerated") - same class names and colors as the recordings list's `.row.st-*`, so the
@@ -3393,6 +3462,8 @@ a.shot-link { display: block; width: fit-content; cursor: zoom-in; }
    away from. */
 .tl-foot { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; margin: 10px var(--tl-pad) 0; font-size: var(--fs-sm); color: var(--text-muted); }
 .tl-key { display: inline-flex; align-items: center; gap: 5px; }
+/* The two swatch radii below sit under --radius-sm on purpose: a 6px radius on a 9-10px
+   swatch is a circle, and the swatch has to read as the square or diamond it keys. */
 .tl-key i { width: 10px; height: 10px; border-radius: 3px; border: 1px solid var(--border); }
 .tl-key i.live { background: var(--bad-soft); border-color: var(--live); }
 .tl-key i.converting { background: var(--accent-soft); border-color: var(--accent); }
@@ -3435,7 +3506,7 @@ a.shot-link { display: block; width: fit-content; cursor: zoom-in; }
   /* Two up. Only the first two tiles are above the fold, so the ORDER of
      _metric_tiles() is doing more work here than it does on desktop. */
   .dash-pulse { grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 16px; }
-  .mtile { padding: 9px 11px 9px 14px; }
+  .mtile { padding: 9px 11px 9px calc(11px + var(--edge-w)); }
   .mtile .m-v { font-size: var(--fs-2xl); }
 
   .dash-head { display: none; }
@@ -3446,8 +3517,8 @@ a.shot-link { display: block; width: fit-content; cursor: zoom-in; }
      auto-placement can spread them across a row without numbering them. */
   .dash-rows .drow {
     grid-template-columns: 1fr 1fr 1fr;
-    /* left pad matches the desktop rule's 19px reservation for the status bar (see .dash-rows .drow) */
-    gap: 7px 10px; padding: 11px 12px 11px 13px; align-items: start;
+    /* left pad keeps the status bar's --edge-w reservation (see .dash-rows .drow) */
+    gap: 7px 10px; padding: 11px 12px 11px calc(10px + var(--edge-w)); align-items: start;
   }
   /* Row 1: the name takes two columns and wraps rather than truncating (9.4
      forbids squeezing it); the action sits beside it. */
@@ -3520,10 +3591,10 @@ a.shot-link { display: block; width: fit-content; cursor: zoom-in; }
      this row's own overflow:hidden so the color follows the rounded corner instead of
      fading out partway around it like a real border-left of mismatched width does
      (measured, dev/changelog/878); padding-left reserves the bar's width so the tracks
-     do not move between the head and the rows. Keep the two in step. */
-  padding-left: 19px;
+     do not move between the head and the rows; the bar's width is --edge-w. */
+  padding-left: calc(16px + var(--edge-w));
 }
-.acct-rows .arow::before { content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: 3px; background: var(--border-soft); }
+.acct-rows .arow::before { content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: var(--edge-w); background: var(--border-soft); }
 /* Must not repaint the left border - that edge carries the status color, and repainting it
    makes the status vanish on mouseover. */
 .acct-rows .arow:hover {
@@ -3585,8 +3656,8 @@ a.shot-link { display: block; width: fit-content; cursor: zoom-in; }
      hyphenless token as often as not. */
   .acct-head { display: none; }
   .acct-rows .arow {
-    /* left pad matches the desktop rule's 19px reservation for the status bar (see .acct-rows .arow) */
-    gap: 7px 8px; padding: 11px 12px 11px 16px;
+    /* left pad keeps the status bar's --edge-w reservation (see .acct-rows .arow) */
+    gap: 7px 8px; padding: 11px 12px 11px calc(13px + var(--edge-w));
     /* max-content is deliberate and is confined to the status badge's own column: the
        header is hidden at this width, so there is nothing for a content-sized track to
        slide out of alignment, and it is what lets the status badge sit flush against the
@@ -3640,7 +3711,7 @@ a.shot-link { display: block; width: fit-content; cursor: zoom-in; }
 @container acct-list (max-width: 715px) {
   .acct-list .acct-head { display: none; }
   .acct-list .acct-rows .arow {
-    gap: 7px 8px; padding: 11px 12px 11px 16px;
+    gap: 7px 8px; padding: 11px 12px 11px calc(13px + var(--edge-w));
     grid-template-columns: max-content 1fr;
     grid-template-areas:
       "name   name"
@@ -4249,7 +4320,7 @@ a.shot-link { display: block; width: fit-content; cursor: zoom-in; }
 @container rl-list (max-width: 900px) {
   .rl-list .list-head { display: none; }
   .rl-list .rows .row {
-    grid-template-columns: minmax(0, 1fr) auto; gap: 7px 10px; padding: 11px 12px 11px 16px;
+    grid-template-columns: minmax(0, 1fr) auto; gap: 7px 10px; padding: 11px 12px 11px calc(13px + var(--edge-w));
     grid-template-areas: "title kebab" "status status" "next next" "meta meta";
   }
   .rl-list .rl-title { grid-area: title; }

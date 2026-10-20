@@ -19,6 +19,7 @@ import app.postprocessor as ppmod  # noqa: E402
 import app.proc_utils as pumod  # noqa: E402
 from tests.support.app import make_test_app  # noqa: E402
 from tests.support import seed  # noqa: E402
+from tests.support.fakes import FakePopen  # noqa: E402
 from app import db  # noqa: E402
 from app.database import (  # noqa: E402
     Recording, RecordingEvent, Alert, CONVERSION_RESTARTED,
@@ -194,8 +195,7 @@ class RestartBudgetTests(unittest.TestCase):
 # ── Manual retry resets the counter; double-run guard ─────────────────────────
 class RetryAndGuardTests(unittest.TestCase):
     def setUp(self):
-        self.t = make_test_app()
-        self.t.app.config['WTF_CSRF_ENABLED'] = False
+        self.t = make_test_app(csrf=False)
         self.rec = seed.make_recording(status='FAILED', name='conv', conversion_attempts=3)
         self.ts = os.path.join(self.t._tmpdir, f'rec_{self.rec.id}.ts')
         with open(self.ts, 'wb') as fh:
@@ -251,8 +251,7 @@ class RetryAndGuardTests(unittest.TestCase):
 # ── Cancel conversion ─────────────────────────────────────────────────────────
 class CancelConversionTests(unittest.TestCase):
     def setUp(self):
-        self.t = make_test_app()
-        self.t.app.config['WTF_CSRF_ENABLED'] = False
+        self.t = make_test_app(csrf=False)
         self.rec = seed.make_recording(status='CONVERTING', name='conv', conversion_attempts=1)
         self.ts = os.path.join(self.t._tmpdir, f'rec_{self.rec.id}.ts')
         with open(self.ts, 'wb') as fh:
@@ -317,45 +316,6 @@ class ProgressPersistenceTests(unittest.TestCase):
 
 
 # ── Runner death / stall detection (fake Popen, no real ffmpeg) ───────────────
-class _FakePopen:
-    """Stands in for a conversion ffmpeg. alive_ticks=None → never exits on its own;
-    otherwise poll() returns None for that many calls, then the returncode."""
-    def __init__(self, *args, alive_ticks=None, returncode=0, **kwargs):
-        self._polls = 0
-        self._alive_ticks = alive_ticks
-        self._rc = returncode
-        self.returncode = None
-        self.terminated = False
-        self.signals = []
-
-    def send_signal(self, sig):
-        # terminate_or_kill() continues a possibly-suspended child before every teardown
-        # (dev/changelog/952), so a fake that cannot take a signal is not a faithful one.
-        self.signals.append(sig)
-
-    def poll(self):
-        self._polls += 1
-        if self._alive_ticks is not None and self._polls > self._alive_ticks:
-            self.returncode = self._rc
-            return self._rc
-        return None
-
-    def terminate(self):
-        self.terminated = True
-        if self.returncode is None:
-            self.returncode = self._rc
-
-    def kill(self):
-        self.terminated = True
-        if self.returncode is None:
-            self.returncode = self._rc
-
-    def wait(self, timeout=None):
-        if self.returncode is None:
-            self.returncode = self._rc
-        return self.returncode
-
-
 class RunnerDetectionTests(unittest.TestCase):
     def setUp(self):
         self.t = make_test_app()
@@ -380,7 +340,7 @@ class RunnerDetectionTests(unittest.TestCase):
                 interval=interval, stall_seconds=stall_seconds)
 
     def test_detects_process_death(self):
-        fake = _FakePopen(alive_ticks=1, returncode=1)
+        fake = FakePopen(alive_ticks=1, returncode=1)
         result = self._run(fake, lambda p: (None, None, False))
         self.assertFalse(result.success)
         self.assertEqual(result.reason, 'died')
@@ -388,14 +348,14 @@ class RunnerDetectionTests(unittest.TestCase):
             self.assertNotIn(self.rid, _active_conversions)
 
     def test_detects_clean_success(self):
-        fake = _FakePopen(alive_ticks=1, returncode=0)
+        fake = FakePopen(alive_ticks=1, returncode=0)
         result = self._run(fake, lambda p: (50_000_000, 1000, False))
         self.assertTrue(result.success)
         self.assertEqual(result.reason, 'success')
 
     def test_stall_kills_when_enabled(self):
         # Output started (out_time > 0) then froze → stall detector must kill it.
-        fake = _FakePopen(alive_ticks=None)
+        fake = FakePopen(alive_ticks=None)
         result = self._run(fake, lambda p: (5_000_000, 1000, False), stall_seconds=1, interval=0.1)
         self.assertFalse(result.success)
         self.assertEqual(result.reason, 'stalled')
@@ -403,7 +363,7 @@ class RunnerDetectionTests(unittest.TestCase):
 
     def test_no_stall_kill_when_disabled(self):
         # Same frozen output, but stall detection off; it finishes on its own.
-        fake = _FakePopen(alive_ticks=3, returncode=0)
+        fake = FakePopen(alive_ticks=3, returncode=0)
         result = self._run(fake, lambda p: (5_000_000, 1000, False), stall_seconds=0, interval=0.05)
         self.assertTrue(result.success)
 
@@ -411,7 +371,7 @@ class RunnerDetectionTests(unittest.TestCase):
         # out_time stays 0 the whole time (ffmpeg still analysing a badly-damaged source,
         # #64's live false-positive). This is NOT a stall - the stall clock must not start
         # until output begins. The process finishes on its own past stall_seconds.
-        fake = _FakePopen(alive_ticks=None)
+        fake = FakePopen(alive_ticks=None)
         # Alive for ~0.6s of no-output, then let the pre-output budget end it cleanly.
         result = self._run(fake, lambda p: (0, 0, False), stall_seconds=0.3,
                            interval=0.05, pre_output_timeout=0.5)
@@ -470,7 +430,7 @@ class StaleProgressFileTests(unittest.TestCase):
     def test_stale_progress_file_does_not_latch_the_stall_monitor(self):
         # The fake process writes no progress at all, so the only out_time readable
         # anywhere on disk is the stale 5400s one. It must never reach the stall monitor.
-        fake = _FakePopen(alive_ticks=None)
+        fake = FakePopen(alive_ticks=None)
         result = self._run(fake, stall_seconds=0.3, pre_output_timeout=1.0)
         self.assertNotEqual(result.reason, 'stalled',
                             'a leftover progress file from an earlier attempt killed a '
@@ -478,7 +438,7 @@ class StaleProgressFileTests(unittest.TestCase):
         self.assertEqual(result.reason, 'no_output')
 
     def test_leftover_scratch_files_are_reaped_before_spawn(self):
-        self._run(_FakePopen(alive_ticks=1, returncode=0), stall_seconds=0,
+        self._run(FakePopen(alive_ticks=1, returncode=0), stall_seconds=0,
                   pre_output_timeout=1.0)
         for p in self.stale:
             self.assertFalse(os.path.exists(p),
@@ -489,7 +449,7 @@ class StaleProgressFileTests(unittest.TestCase):
 
         def _record(argv, *a, **kw):
             seen.add(argv[argv.index('-progress') + 1])
-            return _FakePopen(alive_ticks=1, returncode=0)
+            return FakePopen(alive_ticks=1, returncode=0)
 
         for _ in range(3):
             with mock.patch.object(pumod.subprocess, 'Popen', side_effect=_record):

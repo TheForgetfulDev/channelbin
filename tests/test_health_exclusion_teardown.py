@@ -38,8 +38,7 @@ from tests.support import seed  # noqa: E402
 
 class _Base(unittest.TestCase):
     def setUp(self):
-        self.t = make_test_app()
-        self.t.app.config['WTF_CSRF_ENABLED'] = False
+        self.t = make_test_app(csrf=False)
         self.account = seed.make_account()
         self.channel = seed.make_channel(self.account, name='Excluded Channel')
         db.session.commit()

@@ -361,6 +361,84 @@ class AuditInsertIdempotentReRunTests(unittest.TestCase):
                             'the audit row must record the latest application, not the stale one')
 
 
+class StepAttemptLedgerTests(unittest.TestCase):
+    """The runner records that it is attempting a step before the step runs, and names a
+    retry out loud (dev/changelog/1246).
+
+    Before this, nothing was written ahead of a step, so after a crash between a step's own
+    commit and the version stamp the retry logged the ordinary "Applying schema migration N"
+    line while every guarded ALTER skipped quietly; only the two backfill steps could say
+    they were resuming. The attempt record closes in the stamp's own transaction, so a
+    record that is open can only mean the stamp did not land.
+    """
+
+    def setUp(self):
+        self.t = make_test_app()
+
+    def tearDown(self):
+        self.t.cleanup()
+
+    def _ledger_row(self, version):
+        conn = db.engine.raw_connection()
+        try:
+            return conn.cursor().execute(
+                'SELECT registered_at, completed_at FROM migration_backfills WHERE name = ?',
+                (M._step_ledger_name(version),)).fetchone()
+        finally:
+            conn.close()
+
+    def test_a_clean_run_records_the_attempt_and_closes_it_with_the_stamp(self):
+        version = M.CURRENT_SCHEMA_VERSION
+        _set_user_version(version - 1)
+        with _harmless_last_step(), self.assertLogs('app.migrations', level='INFO') as logs:
+            M.run_migrations(fresh_db=False, cfg=_sandboxed_cfg(self.t))
+        self.assertFalse(any('started by an earlier attempt' in line for line in logs.output),
+                         'a first attempt must not be announced as a retry')
+        row = self._ledger_row(version)
+        self.assertIsNotNone(row, 'the attempt was never recorded')
+        self.assertIsNotNone(row[1], 'the attempt record was not closed with the stamp')
+        self.assertEqual(_user_version(), version)
+
+    def test_a_retry_after_an_unstamped_attempt_says_so(self):
+        version = M.CURRENT_SCHEMA_VERSION
+        _set_user_version(version - 1)
+        conn = db.engine.raw_connection()
+        try:
+            cur = conn.cursor()
+            cur.execute(M._BACKFILL_LEDGER_DDL)
+            cur.execute('INSERT INTO migration_backfills (name, registered_at) VALUES (?, ?)',
+                        (M._step_ledger_name(version), 'earlier'))
+            conn.commit()
+        finally:
+            conn.close()
+        with _harmless_last_step(), self.assertLogs('app.migrations', level='WARNING') as logs:
+            M.run_migrations(fresh_db=False, cfg=_sandboxed_cfg(self.t))
+        self.assertTrue(any(f'Schema migration {version} was started by an earlier attempt'
+                            in line for line in logs.output), logs.output)
+        row = self._ledger_row(version)
+        self.assertIsNotNone(row[1], 'the retry must close the record it resumed')
+
+    def test_a_step_that_raises_leaves_its_attempt_open(self):
+        """The record is what the next start reads; a failed step must not close it."""
+        version = M.CURRENT_SCHEMA_VERSION
+        _set_user_version(version - 1)
+        original = M.SCHEMA_MIGRATIONS
+
+        def _boom(conn, cur):
+            raise RuntimeError('simulated mid-step failure')
+        M.SCHEMA_MIGRATIONS = original[:-1] + [(version, 'boom', _boom)]
+        try:
+            with self.assertRaises(RuntimeError), \
+                    self.assertLogs('app.migrations', level='CRITICAL'):
+                M.run_migrations(fresh_db=False, cfg=_sandboxed_cfg(self.t))
+        finally:
+            M.SCHEMA_MIGRATIONS = original
+        row = self._ledger_row(version)
+        self.assertIsNotNone(row, 'the attempt must be on record before the step runs')
+        self.assertIsNone(row[1], 'a failed step must leave its attempt open')
+        self.assertEqual(_user_version(), version - 1)
+
+
 class GroupKindSchemaTests(unittest.TestCase):
     """Groups unification 1/4 (DESIGN-groups-unification.md, additive half): the
     channel_group_members join table on a fresh schema, and _m009's guarded ADD COLUMN

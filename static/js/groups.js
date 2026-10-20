@@ -46,9 +46,11 @@
     // from the rows each time, so a refresh that changes them changes the menu too.
     { k: 'account', label: 'Account', values: () => [...new Set(allItems.flatMap(r => (r.dataset.accounts || '').split('|').filter(Boolean)))]
       .sort().map(a => ({ v: a, label: a })), match: (row, v) => (row.dataset.accounts || '').split('|').includes(v) },
-    { k: 'guide', label: 'TV Guide', values: [
-      { v: 'in', label: 'In the guide' },
-      { v: 'out', label: 'Not in the guide' },
+    // Every value here is a word that follows the chip's "<Field> is" / "is not" as a
+    // sentence (dev/changelog/1207); the stored `v` never changes, only the label does.
+    { k: 'guide', label: 'Guide row', values: [
+      { v: 'in', label: 'Present' },
+      { v: 'out', label: 'Absent' },
     ], match: (row, v) => row.dataset.guide === v },
     // The group's OWN check, which every group has (dev/changelog/1077) - so the buckets
     // are what its schedule is, not whether one exists. `_check_dimension` computes it.
@@ -57,11 +59,11 @@
       { v: 'once', label: 'One time' },
       { v: 'none', label: 'No schedule' },
     ], match: (row, v) => row.dataset.check === v },
-    { k: 'issue', label: 'Needs attention', values: [
+    { k: 'issue', label: 'Issue', values: [
       { v: 'mismatch', label: 'Mixed format' },
-      { v: 'unmon', label: 'Not monitored' },
-      { v: 'empty', label: 'No channels' },
-      { v: 'untested', label: 'Has untested channels' },
+      { v: 'unmon', label: 'Unmonitored' },
+      { v: 'empty', label: 'Empty' },
+      { v: 'untested', label: 'Untested channels' },
     ], match: (row, v) => (row.dataset.issues || '').split(' ').includes(v) },
   ];
 

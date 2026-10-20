@@ -111,27 +111,18 @@ class MembershipMovesTheDateTests(_GroupDateCase):
         self.assertEqual(200, r.status_code, r.get_data(as_text=True))
         self.assertGreater(self._updated_at(grp.id), STALE)
 
-    def test_adding_a_channel_to_a_health_check_moves_the_date(self):
-        """The reported case: channels added to a health check from its own page, which
-        writes the same membership rows through a different route."""
+    def test_a_health_checks_channels_move_the_date_through_the_group_routes(self):
+        """The reported case was channels added to a health check from its own page, which
+        wrote the same membership rows through a second, check-shaped door. That door is
+        gone (dev/changelog/1244): a check IS its group, so its page adds and removes members
+        through the group routes above, and the group's date moves with them."""
         ch1 = make_channel(self.acct, name='Feed 1')
         ch2 = make_channel(self.acct, name='Feed 2')
         job = make_test_job(name='FS2', channels=[ch1])
         self._stale(job.group)
         group_id = job.group_id
-        r = self.client.post(f'/api/channel-tests/on-demand/{job.id}/channels',
-                             json={'channel_ids': [ch2.id]})
-        self.assertEqual(200, r.status_code, r.get_data(as_text=True))
-        self.assertGreater(self._updated_at(group_id), STALE)
-
-    def test_removing_a_channel_from_a_health_check_moves_the_date(self):
-        ch1 = make_channel(self.acct, name='Feed 1')
-        ch2 = make_channel(self.acct, name='Feed 2')
-        job = make_test_job(name='FS2', channels=[ch1, ch2])
-        self._stale(job.group)
-        group_id = job.group_id
-        r = self.client.delete(
-            f'/api/channel-tests/on-demand/{job.id}/channels/{ch2.id}')
+        r = self.client.post(f'/api/channel-groups/{group_id}/members',
+                             json={'channel_ids': [ch2.id], 'force': True})
         self.assertEqual(200, r.status_code, r.get_data(as_text=True))
         self.assertGreater(self._updated_at(group_id), STALE)
 

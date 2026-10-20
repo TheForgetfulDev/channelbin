@@ -371,7 +371,7 @@ class RecordingDiagnosticsTests(unittest.TestCase):
         what the provider sent - the event has to say which file it is describing."""
         detail = self._run_and_health_detail()
 
-        self.assertIn('output format:', detail)
+        self.assertIn('joined file format:', detail)
         self.assertIn('h264', detail)
 
     def test_capture_health_detail_names_the_capture_gaps(self):

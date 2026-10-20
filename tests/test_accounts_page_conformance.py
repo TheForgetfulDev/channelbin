@@ -998,8 +998,7 @@ class CommitRetryTests(unittest.TestCase):
     failing."""
 
     def setUp(self):
-        self.t = make_test_app()
-        self.t.app.config['WTF_CSRF_ENABLED'] = False
+        self.t = make_test_app(csrf=False)
         self.client = self.t.app.test_client()
 
     def tearDown(self):

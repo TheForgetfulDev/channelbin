@@ -326,7 +326,7 @@
     const out = Array.from(seen)
       .sort((a, b) => (height(b) - height(a)) || (fps(b) - fps(a)) || a.localeCompare(b))
       .map(k => ({ v: k, label: k }));
-    if (unmeasured) out.push({ v: FMT_NONE, label: 'Not measured' });
+    if (unmeasured) out.push({ v: FMT_NONE, label: 'Unmeasured' });
     return out;
   };
 
@@ -385,7 +385,7 @@
   // one member. "More than one value" is not that test for anything a health check measures:
   // a member that was never tested carries no value at all, so on a group whose 17 measured
   // members are all AAC and whose other 7 have never run, picking AAC still narrows 24 rows
-  // to 17. Format escapes this only because it carries an explicit "Not measured" bucket that
+  // to 17. Format escapes this only because it carries an explicit "Unmeasured" bucket that
   // counts toward its own length - the test-derived dimensions below have none by design
   // (an untested member matching no audio value is correct), so they ask this instead.
   // Account is not routed through it: every row has one whether or not it was ever tested,
@@ -407,7 +407,7 @@
     const out = Array.from(seen.keys())
       .sort((a, b) => a.toLowerCase().localeCompare(b.toLowerCase()))
       .map(id => ({ v: epgKey(id), label: id }));
-    // Its own bucket rather than nothing, for the same reason Format carries "Not measured":
+    // Its own bucket rather than nothing, for the same reason Format carries "Unmeasured":
     // a member with no id would otherwise be a row no value can select, on the one page
     // whose banner is about which ids these members carry. And it is not a mismatch -
     // unknown is not proven-different (DESIGN-channel-groups-model.md 8).
@@ -420,15 +420,17 @@
     return n > 1 || (n === 1 && ROWS.some(r => !has(r)));
   };
 
+  // Every value label follows the chip's "<Field> is" / "is not" as a sentence
+  // (dev/changelog/1207); the stored `v` never changes, only the words do.
   const FILTER_DIMS = [
     { k: 'rec',
       label: 'Recording',
-      values: [{ v: 'on', label: 'Eligible' }, { v: 'off', label: 'Not eligible' }],
+      values: [{ v: 'on', label: 'Eligible' }, { v: 'off', label: 'Ineligible' }],
       match: (r, v) => !!r.recording_enabled === (v === 'on'),
       available: () => G.hasChannel },
     { k: 'test',
       label: 'Health check',
-      values: [{ v: 'on', label: 'Tested by this group' }, { v: 'off', label: 'Not tested' }],
+      values: [{ v: 'on', label: 'Monitored' }, { v: 'off', label: 'Unmonitored' }],
       match: (r, v) => !!r.test_enabled === (v === 'on'),
       available: () => G.hasChannel },
     { k: 'status',
@@ -454,7 +456,7 @@
       match: (r, v) => { const n = rowFps(r); return n !== null && String(n) === v; },
       available: () => partitions(fpsValues, r => rowFps(r) !== null) },
     // A member with no test carries no audio and therefore matches no audio value. That is
-    // right and needs no "Not measured" bucket the way Format has one: this is a filter the
+    // right and needs no "Unmeasured" bucket the way Format has one: this is a filter the
     // user drives, not the format lock, so the "an untested member is never filtered out"
     // rule does not reach it (DESIGN-channel-groups-model.md 5).
     { k: 'audio',
@@ -505,12 +507,12 @@
     // set, as the copy kept or an extra (dev/changelog/1175).
     { k: 'dup',
       label: 'Duplicates',
-      values: [{ v: 'extra', label: 'Extra copies' }, { v: 'lead', label: 'Lead copies' }],
+      values: [{ v: 'extra', label: 'An extra copy' }, { v: 'lead', label: 'The kept copy' }],
       match: (r, v) => r.dup_role === v,
       available: () => ROWS.some(r => r.dup_role) },
     { k: 'age',
       label: 'Test age',
-      values: [{ v: 'stale24', label: 'Not tested in 24h' }, { v: 'never', label: 'Never tested' }],
+      values: [{ v: 'stale24', label: 'Over 24h' }, { v: 'never', label: 'Untested' }],
       // Never-tested is stale by any reading, so it matches both - a member with no test
       // at all is exactly what "not tested in 24h" is being asked about.
       match: (r, v) => {
@@ -1038,8 +1040,8 @@
   // drawing is what the suite sees and why the browser pass is not optional here.
   // ══════════════════════════════════════════════════════════════════════════
 
-  const MOBILE_MQ = window.matchMedia('(max-width: 960px)');
-  const isPhone = () => MOBILE_MQ.matches;
+  // MOBILE_MQ and isPhone() are util.js's - the one breakpoint; the `change` listener
+  // below is on that same object.
 
   // Which of the shared fields a card can draw, in `colState.order`'s order so the phone
   // and the desktop agree about what is on. `fps` is deliberately absent: the Format field
@@ -2702,7 +2704,8 @@
       case 'force-cancel':
         confirmModal({
           title: 'Force cancel check',
-          message: 'This check is marked Cancelled. You can test it again, or resume where it stopped.',
+          message: 'This check is marked as running, but nothing is running it. Marking it ' +
+            'stopped lets you test again; a recurring schedule keeps going.',
           confirmLabel: 'Force cancel',
         }).then((ok) => { if (ok) postAndReload(jobApi('force-cancel')); });
         return;

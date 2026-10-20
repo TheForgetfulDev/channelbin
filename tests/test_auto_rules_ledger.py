@@ -94,8 +94,7 @@ def _season(now):
 class _LedgerCase(unittest.TestCase):
 
     def setUp(self):
-        self.t = make_test_app()
-        self.t.app.config['WTF_CSRF_ENABLED'] = False
+        self.t = make_test_app(csrf=False)
         self.armed = patch('app.routes.recordings.schedule_recording').start()
         # delete_rule() imports unschedule_recording at call time; the cancel routes hold
         # their own module-level binding.

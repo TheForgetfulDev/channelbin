@@ -41,8 +41,7 @@ def _test(channel, resolution, fps):
 
 class CloneGroupTests(unittest.TestCase):
     def setUp(self):
-        self.t = make_test_app()
-        self.t.app.config['WTF_CSRF_ENABLED'] = False
+        self.t = make_test_app(csrf=False)
         self.acct = make_account()
         self.hd = make_channel(self.acct, name='HD feed')
         self.sd = make_channel(self.acct, name='SD feed')
@@ -99,8 +98,7 @@ class CloneGroupTests(unittest.TestCase):
 
 class CreateCheckAttachedToGroupTests(unittest.TestCase):
     def setUp(self):
-        self.t = make_test_app()
-        self.t.app.config['WTF_CSRF_ENABLED'] = False
+        self.t = make_test_app(csrf=False)
         self.acct = make_account()
         self.ch1 = make_channel(self.acct, name='Feed A')
         self.ch2 = make_channel(self.acct, name='Feed B')

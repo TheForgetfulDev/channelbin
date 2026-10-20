@@ -158,8 +158,7 @@ class ImagesAreServedFromImagesDirTests(unittest.TestCase):
     """The readers, not just the helper: a changed images_dir is what gets served."""
 
     def setUp(self):
-        self.t = make_test_app()
-        self.t.app.config['WTF_CSRF_ENABLED'] = False
+        self.t = make_test_app(csrf=False)
         self.images = os.path.join(self.t._tmpdir, 'chosen-images')
         self.t.sandbox_config({'recording': {'images_dir': self.images}})
 

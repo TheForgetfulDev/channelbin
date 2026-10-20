@@ -44,8 +44,7 @@ class _EveryArtifactCase(unittest.TestCase):
     names the destination - and every other file kind seeded beside it."""
 
     def setUp(self):
-        self.t = make_test_app(start_scheduler=True)
-        self.t.app.config['WTF_CSRF_ENABLED'] = False
+        self.t = make_test_app(start_scheduler=True, csrf=False)
         tmp = self.t._tmpdir
         self.dvr = os.path.join(tmp, 'dvr')
         self.dest = os.path.join(tmp, 'dvr-complete')

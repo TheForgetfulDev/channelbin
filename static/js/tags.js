@@ -14,6 +14,7 @@
   const openEditor = (tag) => openTagModal({
     tag,
     presetColors: CFG.presetColors,
+    defaultColor: CFG.defaultColor,
   });
 
   function openDelete(tag) {

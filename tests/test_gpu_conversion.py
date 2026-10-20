@@ -537,8 +537,7 @@ class ReadinessCheckTests(unittest.TestCase):
 class SettingsSaveTests(ConfigSandbox):
     def setUp(self):
         super().setUp()
-        self.t = make_test_app()
-        self.t.app.config['WTF_CSRF_ENABLED'] = False
+        self.t = make_test_app(csrf=False)
         self.client = self.t.client
 
     def tearDown(self):
@@ -712,8 +711,7 @@ class SaveRunsTheTrialTests(ConfigSandbox):
     def setUp(self):
         super().setUp()
         toolchain.reset_cache()
-        self.t = make_test_app()
-        self.t.app.config['WTF_CSRF_ENABLED'] = False
+        self.t = make_test_app(csrf=False)
         self.client = self.t.client
         readiness.reset_for_tests()
         listing = mock.patch.object(toolchain, '_run_listing', return_value=None)

@@ -21,6 +21,7 @@ from ..config import (load_config, save_config, config_default, is_restart_neede
 from ..database import (
     REC_STATUS_IN_PROGRESS, REC_STATUS_PAUSED, REC_STATUS_RETRYING,
     REC_STATUS_CONCATENATING, REC_STATUS_ANALYZING, REC_STATUS_CONVERTING,
+    ACCOUNT_STATUS_SYNCING, OD_JOB_STATUS_RUNNING,
 )
 from ..accounts import (TEMPLATE_VARIABLES, _TAG_TOKEN_RE, render_filename_template,
                         tag_template_variables)
@@ -707,9 +708,9 @@ def _restart_blocking_rows(busy):
     rows += [{
         'id': None,
         'name': job.name,
-        'status': 'RUNNING',
+        'status': OD_JOB_STATUS_RUNNING,
         'label': f'Health check "{job.name}" is running',
-    } for job in OnDemandTestJob.query.filter_by(status='RUNNING')
+    } for job in OnDemandTestJob.query.filter_by(status=OD_JOB_STATUS_RUNNING)
                                 .order_by(OnDemandTestJob.id).all()]
 
     # A pre-record check or a "Test now" click - one live probe, and no job row to report
@@ -740,9 +741,9 @@ def _restart_blocking_rows(busy):
     rows += [{
         'id': None,
         'name': acc.name,
-        'status': 'SYNCING',
+        'status': ACCOUNT_STATUS_SYNCING,
         'label': f'Account "{acc.name}" is syncing',
-    } for acc in Account.query.filter_by(status='SYNCING').order_by(Account.id).all()]
+    } for acc in Account.query.filter_by(status=ACCOUNT_STATUS_SYNCING).order_by(Account.id).all()]
 
     # A source refreshing outside its owner's sync (tools/check_busy.py::
     # refreshing_epg_sources for why it blocks). One inside a sync is named by the account.
@@ -753,7 +754,7 @@ def _restart_blocking_rows(busy):
         'label': f'EPG source "{src.name}" is refreshing',
     } for src in EpgSource.query.join(Account, Account.id == EpgSource.owner_account_id)
                               .filter(EpgSource.refresh_started_at.isnot(None),
-                                      Account.status != 'SYNCING')
+                                      Account.status != ACCOUNT_STATUS_SYNCING)
                               .order_by(EpgSource.id).all()]
 
     return rows
@@ -972,7 +973,7 @@ def api_search_index_rebuild():
     # Refused rather than queued: a sync ends with its own rebuild, so a manual one started
     # mid-sync spends ~76s of CPU on an index the sync's next insert makes stale - during the
     # exact window this whole batch exists to keep quiet.
-    syncing = Account.query.filter_by(status='SYNCING').first()
+    syncing = Account.query.filter_by(status=ACCOUNT_STATUS_SYNCING).first()
     if syncing is not None:
         return jsonify({'error': (
             f'"{syncing.name}" is syncing right now, and a sync rebuilds the search indexes '

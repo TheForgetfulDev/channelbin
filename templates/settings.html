@@ -14,10 +14,9 @@
    has them.
    ══════════════════════════════════════════════════════════════════════════ */
 
-/* Height of the mobile section-picker bar. Read, never restated: the sticky
-   offset, the scroll-margin the jump targets use and the scrollspy's reading
-   line are all one value derived from this. */
-.set-page { --pick-h: 42px; }
+/* The mobile section-picker bar's height is style.css's --pick-h (the shared .pickbar).
+   Read, never restated: the sticky offset, the scroll-margin the jump targets use and the
+   scrollspy's reading line are all derived from it. */
 
 /* The main control on this toolbar, so it gets more room than the shared 250px. */
 .set-page .toolbar .search { width: 340px; max-width: 100%; }
@@ -143,10 +142,12 @@
 #no-hits-slot .card { margin-top: 0; margin-bottom: 14px; }
 
 /* ── The config.yaml pane ─────────────────────────────────────────────── */
+/* Text color and focus come from style.css's shared text-input recipe; the softer
+   border and the card radius are this pane's own, because it is a page-sized sheet of
+   text rather than a control on a row. */
 .yaml-pane textarea { width: 100%; min-height: 460px; background: var(--bg1);
-  border: 1px solid var(--border-soft); border-radius: var(--radius); color: var(--text);
+  border-color: var(--border-soft); border-radius: var(--radius);
   font-family: var(--font-mono); font-size: var(--fs-sm); line-height: 1.55; padding: 14px 16px; resize: vertical; }
-.yaml-pane textarea:focus { outline: none; border-color: var(--accent); }
 .yaml-foot { display: flex; align-items: center; gap: 12px; margin-top: 12px; flex-wrap: wrap; }
 .yaml-foot .note, .yaml-check .note { font-size: var(--fs-sm); color: var(--text-muted); }
 .yaml-check { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-top: 12px; }
@@ -166,17 +167,8 @@
    you are in, driven by the same scrollspy the rail uses. Its list is a bottom
    sheet, which is what buildModal() already becomes at these widths (9.6). */
 .secpick { display: none; }
-.secpick-btn { display: flex; align-items: center; gap: 9px; width: 100%; height: var(--pick-h);
-  background: var(--bg1); border: 1px solid var(--border); border-radius: var(--radius-sm);
-  color: var(--text); font: inherit; padding: 0 12px; cursor: pointer; text-align: left; }
-.secpick-btn .sp-lbl { font-size: var(--fs-2xs); text-transform: uppercase; letter-spacing: .08em;
-  color: var(--text-faint); font-weight: 700; flex: none; }
-.secpick-btn .sp-cur { flex: 1; min-width: 0; font-size: var(--fs-lg); font-weight: 600;
-  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.secpick-btn .sp-n { font-size: var(--fs-xs); color: var(--text-faint);
-  font-variant-numeric: tabular-nums; flex: none; }
-.secpick-btn .sp-caret { color: var(--text-muted); flex: none; }
-.secpick.nohit .sp-cur { color: var(--text-faint); }
+/* The bar itself is style.css's .pickbar (shared with Logs' filter bar). */
+.secpick.nohit .pb-cur { color: var(--text-faint); }
 .sp-row { display: flex; align-items: center; gap: 10px; width: 100%; padding: 11px 10px;
   border: none; background: none; font: inherit; color: var(--text-muted); text-align: left;
   border-radius: var(--radius-sm); cursor: pointer; }
@@ -294,11 +286,11 @@
   <div id="xtier-slot"></div>
 
   <div class="secpick" id="secpick">
-    <button class="secpick-btn" id="secpick-btn" type="button" aria-haspopup="dialog">
-      <span class="sp-lbl">Section</span>
-      <span class="sp-cur" id="sp-cur">Display</span>
-      <span class="sp-n" id="sp-n"></span>
-      <span class="sp-caret">&#9662;</span>
+    <button class="pickbar" id="secpick-btn" type="button" aria-haspopup="dialog">
+      <span class="pb-lbl">Section</span>
+      <span class="pb-cur" id="sp-cur">Display</span>
+      <span class="pb-n" id="sp-n"></span>
+      <span class="pb-caret">&#9662;</span>
     </button>
   </div>
 
@@ -477,7 +469,7 @@
         {{ field_number('watchdog.early_fail_min_bytes', 'Dead-stream: early-failure min bytes',
            'A candidate segment must also produce fewer than this many bytes to count as an early failure (default 1MB).', wd.get('early_fail_min_bytes', 1048576), tier='advanced') }}
         {{ field_number('watchdog.early_fail_abort_count', 'Dead-stream: consecutive early failures to abort',
-           'Automatically abort the recording once this many consecutive early-failure segments occur - catches a stream that reconnects but immediately dies each time, which would otherwise never trip "Max consecutive failures" above.', wd.get('early_fail_abort_count', 3), tier='advanced') }}
+           'Automatically abort the recording once this many consecutive early-failure segments occur - catches a stream that reconnects but immediately dies each time, which would otherwise never trip "Max consecutive failures" above. 0 turns this off.', wd.get('early_fail_abort_count', 3), tier='advanced') }}
         {{ field_number('watchdog.early_fail_abort_window_seconds', 'Dead-stream: abort window (seconds)',
            'The consecutive early failures must occur within this time window to trigger the automatic abort.', wd.get('early_fail_abort_window_seconds', 180), tier='advanced') }}
         {{ field_number('watchdog.dead_stream_max_retry_attempts', 'Dead-stream: max retry attempts',

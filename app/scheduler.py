@@ -29,8 +29,8 @@ _scheduler: BackgroundScheduler = None
 _app = None
 
 
-# All jobstore writes must go through these two wrappers, never _scheduler.add_job/
-# remove_job directly: the jobstore's own engine can hit "database is locked" past
+# All jobstore writes must go through these three wrappers, never _scheduler.add_job/
+# remove_job/modify_job directly: the jobstore's own engine can hit "database is locked" past
 # busy_timeout, and an unretried failure 500s the calling route (seen live 2026-07-16).
 # Safe to retry - a locked error means the write never happened, and add_job is only
 # ever called with replace_existing=True. rollback_session=False because these never
@@ -44,6 +44,11 @@ def _add_job(**kwargs):
 @retry_on_locked(rollback_session=False)
 def _remove_job(job_id):
     _scheduler.remove_job(job_id)
+
+
+@retry_on_locked(rollback_session=False)
+def _modify_job(job_id, **changes):
+    _scheduler.modify_job(job_id, **changes)
 
 
 def remove_job_if_exists(job_id) -> bool:
@@ -351,6 +356,15 @@ def unschedule_recording(recording_id: int):
         remove_job_if_exists(job_id)
 
 
+def unschedule_recording_resumes(recording_id: int):
+    """Remove the two jobs that would bring a capture back - the dead-stream retry and the
+    deferred resume - for a recording whose capture has just ended. The stop path's half of
+    unschedule_recording: the stop job is the one firing, so it is left alone
+    (dev/changelog/1242)."""
+    for job_id in (f'retry_{recording_id}', f'resume_{recording_id}'):
+        remove_job_if_exists(job_id)
+
+
 def schedule_dead_stream_retry(recording_id: int, run_date: datetime):
     """Register/replace the one-shot retry_<id> job: dead-stream fast-fail backoff
     (CLAUDE.md Product Principle 2, app/watchdog.py::WatchdogThread._schedule_dead_stream_retry).
@@ -473,16 +487,25 @@ def _resume_job(recording_id):
         resume_recording(_app, recording_id)
 
 
-def _register_stop_job(rec):
-    """Register/replace the date-triggered job that fires _stop_job at rec.stop_time."""
+def reschedule_recording_stop(recording_id: int, run_date: datetime):
+    """Re-register stop_<id> alone at run_date - what a manual resume restores. It used to
+    call schedule_recording(), which also re-armed start_<id> at a start time already
+    passed, so every resume fired a start that refused itself as already IN_PROGRESS, and a
+    pre-check that skipped itself as not SCHEDULED (dev/changelog/1242). Same shape as
+    reschedule_recording_start above."""
     _add_job(
         func=_stop_job,
         trigger='date',
-        run_date=rec.stop_time,
-        args=[rec.id],
-        id=f'stop_{rec.id}',
+        run_date=run_date,
+        args=[recording_id],
+        id=f'stop_{recording_id}',
         replace_existing=True,
     )
+
+
+def _register_stop_job(rec):
+    """Register/replace the date-triggered job that fires _stop_job at rec.stop_time."""
+    reschedule_recording_stop(rec.id, rec.stop_time)
 
 
 # A shortfall under this is the ordinary cost of restarting the service within a minute
@@ -577,6 +600,8 @@ def resume_in_progress_recordings(app):
             REC_STATUS_CONCATENATING, REC_STATUS_ANALYZING, REC_STATUS_CONVERTING,
             REC_STATUS_FAILED,
             FAILURE_SOURCE_MISSING, FAILURE_CONVERSION_FAILED, FAILURE_MISSED_AT_STARTUP,
+            ACCOUNT_STATUS_SYNCING, ACCOUNT_STATUS_ERROR, ACCOUNT_STATUS_UNSYNCED,
+            SYNC_LOG_CANCELLED,
         )
         from .recorder import (start_recording, resume_recording, stop_recording,
                                close_open_segment_after_unclean_stop, OPEN_SEG_REFUSED)
@@ -596,13 +621,14 @@ def resume_in_progress_recordings(app):
             # meaning"). last_sync_at is set only on a genuine successful sync
             # (app/accounts.py::_mark_success_and_commit), so it is a recorded
             # fact, not an inference.
-            stuck_accounts = Account.query.filter_by(status='SYNCING').all()
+            stuck_accounts = Account.query.filter_by(status=ACCOUNT_STATUS_SYNCING).all()
             for acc in stuck_accounts:
-                resumed_status = 'ERROR' if acc.last_sync_at is not None else 'UNSYNCED'
+                resumed_status = (ACCOUNT_STATUS_ERROR if acc.last_sync_at is not None
+                                  else ACCOUNT_STATUS_UNSYNCED)
                 log.info('Account %d (%s) was SYNCING at startup - resetting to %s',
                          acc.id, acc.name, resumed_status)
                 finalize_sync_state(
-                    acc.id, resumed_status, 'CANCELLED',
+                    acc.id, resumed_status, SYNC_LOG_CANCELLED,
                     account_message='Sync interrupted by service restart',
                     log_message='Interrupted by service restart',
                 )
@@ -732,7 +758,8 @@ def resume_in_progress_recordings(app):
         # conversion_attempts first, and if that exhausts the budget mark FAILED (same
         # give-up path as the supervised loop) rather than resurrecting it forever.
         from .config import load_config as _load_config
-        from .postprocessor import is_conversion_active
+        from .postprocessor import (is_conversion_active, conversion_finished,
+                                    resume_after_conversion)
         from .database import CONVERSION_FAILED
         from . import alerts as _alerts
         _pp = _load_config()['recording']['post_process']
@@ -752,6 +779,20 @@ def resume_in_progress_recordings(app):
             if is_conversion_active(rec.id):
                 # A live conversion is already running for this id (shouldn't happen at
                 # startup, but never launch a second ffmpeg on the same output).
+                continue
+            if conversion_finished(rec.id) and ts_path and os.path.exists(ts_path):
+                # The conversion recorded finishing and output_path names its file: the
+                # restart landed in the stretch after CONVERSION_DONE (source disposition,
+                # a move that can take minutes, the sidecar, the script) and before the
+                # COMPLETED write. Resume there. Reading output_path's extension instead
+                # used to fail a finished recording as "source .ts missing"
+                # (dev/changelog/1247).
+                log.info('Recording %d was CONVERTING at restart with its conversion already '
+                         'finished → finishing post-processing without converting again',
+                         rec.id)
+                resumed_here.add(rec.id)
+                threading.Thread(target=resume_after_conversion, args=(app, rec.id),
+                                 daemon=True).start()
                 continue
             if not ts_path or not ts_path.endswith('.ts') or not os.path.exists(ts_path):
                 log.warning('Recording %d was CONVERTING but source .ts is missing → marking FAILED', rec.id)
@@ -1290,7 +1331,7 @@ def schedule_account_sync(app, account_id: int, *, force_reschedule: bool = Fals
 
     with app.app_context():
         from . import db
-        from .database import Account
+        from .database import Account, ACCOUNT_STATUS_UNSYNCED
         from .config import load_config
 
         account = db.session.get(Account, account_id)
@@ -1320,7 +1361,7 @@ def schedule_account_sync(app, account_id: int, *, force_reschedule: bool = Fals
         now = datetime.utcnow()
         if account.next_sync_at is not None and account.next_sync_at > now:
             candidate = account.next_sync_at
-        elif account.status == 'UNSYNCED' or account.next_sync_at is None:
+        elif account.status == ACCOUNT_STATUS_UNSYNCED or account.next_sync_at is None:
             candidate = now + timedelta(minutes=1)
         else:
             candidate = now + timedelta(hours=interval)
@@ -2878,7 +2919,7 @@ def skip_next_run(job_id: str):
     new_next = job.trigger.get_next_fire_time(job.next_run_time, job.next_run_time)
     if new_next is None:
         return None
-    _scheduler.modify_job(job_id, next_run_time=new_next)
+    _modify_job(job_id, next_run_time=new_next)
     log.info('Skipped next run of %s - new next run: %s', job_id, new_next)
     return new_next
 
