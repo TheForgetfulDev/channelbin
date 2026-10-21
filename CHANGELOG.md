@@ -5,6 +5,17 @@ Notable changes to ChannelBin, newest first. This project follows
 release is tagged `v<version>` in git, and the version the app is running is shown in the
 page footer.
 
+## 0.27.1 - 2026-10-20
+
+A maintenance release that closes the security advisories GitHub reported against the test
+suite's dependencies.
+
+**Fixed**
+
+- Two packages used only by the test suite (undici and source-map-js) are updated to versions
+  that close seven reported security advisories. Neither was ever loaded by the app or
+  included in the container image.
+
 ## 0.27.0 - 2026-10-20
 
 The Bug Buster release: over ninety backlog items closed, nearly all of them fixes.
