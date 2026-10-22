@@ -164,6 +164,26 @@ class CoverageTests(_PlaceholderDbCase):
         # including the 50s the placeholder segment used to "cover".
         self.assertAlmostEqual(rec.capture_gap_seconds, 3600.0 - 100.0, places=1)
 
+    def test_a_failed_recording_that_kept_nothing_reports_the_whole_window_as_gap(self):
+        """dev/docs/BUGS.md 2026-10-21 10:46 PM: prod recording 26 spent its three-hour
+        window on the placeholder clip, and the page showed 8m 17s of downtime and no capture
+        gap at all, because the gap waited on a captured length the recording never had."""
+        for n in range(3):
+            self._seg(n + 1, start_offset=n * 40, span=10, excluded=SEGMENT_EXCLUDED_PLACEHOLDER)
+        db.session.expire_all()
+        rec = db.session.get(Recording, self.rec.id)
+        self.assertIsNone(rec.capture_gap_seconds, 'still capturing: not over yet')
+        rec.status = 'FAILED'
+        rec.completed_at = self.now + timedelta(hours=1)
+        db.session.commit()
+        self.assertIsNone(rec.actual_duration_seconds)
+        self.assertAlmostEqual(rec.capture_gap_seconds, 3600.0, places=1)
+
+        page = self.t.client.get('/recordings').get_data(as_text=True)
+        self.assertIn('Nothing of the channel was captured.', page)
+        self.assertNotIn('Partial file kept on disk', page)
+        self.assertIn('1h 0m 0s of the recording window with nothing capturing at all', page)
+
     def test_captured_duration_excludes_discarded_segments(self):
         self._seg(1, start_offset=0, span=100)
         self._seg(2, start_offset=100, span=50, excluded=SEGMENT_EXCLUDED_PLACEHOLDER)

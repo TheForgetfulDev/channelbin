@@ -1194,8 +1194,15 @@ class Recording(db.Model):
         Deliberately NOT a column, like the two properties around it - every input already
         has one, and deriving it keeps a single source of truth (CLAUDE.md §Measurements)
         while staying correct for every recording already in the database.
+
+        A FAILED or ABORTED recording that captured nothing usable has no actual duration,
+        and is the one whose gap is the whole window - so "over" is the status, not the
+        presence of a length. Gating on the length hid the stat exactly when it was largest:
+        prod recording 26 read 8m 17s of downtime and no gap for a three-hour window spent on
+        the provider's placeholder clip (dev/docs/BUGS.md 2026-10-21 10:46 PM).
         """
-        if self.actual_duration_seconds is None:
+        if (self.actual_duration_seconds is None
+                and self.status not in (REC_STATUS_FAILED, REC_STATUS_ABORTED)):
             return None
         return max(0.0, self.duration_seconds - self.covered_capture_seconds)
 

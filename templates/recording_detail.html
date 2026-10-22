@@ -316,7 +316,7 @@
 {% elif rec.status == REC_STATUS.RETRYING %}
 <div class="live-strip">
   <span class="fx">&#8635;</span>
-  <span>The stream reconnected but immediately died - waiting to try again
+  <span>The stream kept failing right after each reconnect - waiting to try again
     {%- if rec.next_retry_at %} at <b>{{ rec.next_retry_at | local_time_sec }}</b>{% endif %}
     (attempt <b>{{ rec.dead_stream_retry_count }}</b> of <b>{{ max_dead_stream_retry_attempts }}</b>)</span>
   <span class="sep-dot">·</span>

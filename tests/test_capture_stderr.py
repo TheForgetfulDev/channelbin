@@ -127,8 +127,8 @@ class ReadStderrTailTests(unittest.TestCase):
             self.assertNotIn(word, out)
         self.assertTrue(out.endswith('Server returned 403 Forbidden (access denied)'))
         # What a RECORDING_RETRY_SCHEDULED or RECORDING_FAILED event quotes as the cause.
-        from app.watchdog import _first_line
-        self.assertIn('403 Forbidden', _first_line(out))
+        from app.proc_utils import stderr_cause
+        self.assertIn('403 Forbidden', stderr_cause(out))
 
     def test_a_line_that_merely_mentions_a_library_is_kept(self):
         self._write('[h264 @ 0x1] libavcodec says: decode error\nconfiguration of x failed')
@@ -138,6 +138,62 @@ class ReadStderrTailTests(unittest.TestCase):
     def test_invalid_utf8_does_not_raise(self):
         self._write(b'\xff\xfe bad bytes then\nreal message')
         self.assertIn('real message', read_stderr_tail(self.path))
+
+
+# Prod recording 26's segment 1 tail, verbatim but for the output name: the provider's
+# placeholder clip drained in 10 s. Its first line is a stream description, which is what
+# each of the recording's dead-stream retries quoted as the cause.
+_PLACEHOLDER_TAIL = """Stream #0:0[0x100]: Video: h264 (Baseline) ([27][0][0][0] / 0x001B), yuv420p(tv, bt709, progressive), 1920x1080 [SAR 1:1 DAR 16:9], 30 fps, 30 tbr, 90k tbn
+Stream #0:1[0x101](eng): Audio: aac (LC) ([15][0][0][0] / 0x000F), 44100 Hz, stereo, fltp, 44 kb/s
+Stream mapping:
+Stream #0:0 -> #0:0 (copy)
+Stream #0:1 -> #0:1 (copy)
+Output #0, mpegts, to '/dvr/incomplete/Error_Fail_Show_26_seg_001.ts':
+Metadata:
+encoder         : Lavf61.7.103
+title           : Failure to Launch
+Stream #0:0: Video: h264 (Baseline) ([27][0][0][0] / 0x001B), yuv420p(tv, bt709, progressive), 1920x1080 [SAR 1:1 DAR 16:9], q=2-31, 30 fps, 30 tbr, 90k tbn
+Stream #0:1(eng): Audio: aac (LC) ([15][0][0][0] / 0x000F), 44100 Hz, stereo, fltp, 44 kb/s
+Press [q] to stop, [?] for help
+frame=  280 fps=0.0 q=-1.0 size=     222KiB time=00:00:09.28 bitrate= 195.9kbits/s speed=18.6x
+[http @ 0x55b4a66aab00] Will reconnect at 14472616 in 0 second(s), error=End of file.
+[http @ 0x55b4a66aab00] Will reconnect at 14472616 in 1 second(s), error=End of file.
+frame=17998 fps=11997 q=-1.0 size=   14080KiB time=00:09:59.97 bitrate= 192.2kbits/s speed= 400x
+[in#0/mpegts @ 0x55b4a66ffe00] Error during demuxing: Input/output error
+frame=18000 fps=8101 q=-1.0 Lsize=   14133KiB time=00:10:00.04 bitrate= 193.0kbits/s speed= 270x"""
+
+
+class StderrCauseTests(unittest.TestCase):
+    """dev/docs/BUGS.md 2026-10-21 10:36 PM: the cause a give-up or a dead-stream retry
+    quotes is the first line in which ffmpeg says what went wrong, not the tail's first line,
+    which on a long capture is wherever the 20-line cut fell."""
+
+    def test_a_long_tail_quotes_the_failure_not_the_stream_description(self):
+        from app.proc_utils import stderr_cause
+        self.assertEqual(stderr_cause(_PLACEHOLDER_TAIL),
+                         '[http @ 0x55b4a66aab00] Will reconnect at 14472616 in 0 second(s), '
+                         'error=End of file.')
+
+    def test_a_tail_of_progress_lines_has_no_cause(self):
+        """Recording 2's fast-delivery abort quoted a progress line, bitrate and all."""
+        from app.proc_utils import stderr_cause
+        tail = '\n'.join(f'frame={n} fps=201 q=-1.0 size=  296960KiB time=00:06:27.77 '
+                         f'bitrate=6273.5kbits/s speed=3.35x' for n in range(20))
+        self.assertEqual(stderr_cause(tail), '')
+        self.assertEqual(stderr_cause(''), '')
+
+    def test_the_specific_refusal_wins_over_the_generic_one_after_it(self):
+        from app.proc_utils import stderr_cause
+        tail = ('[http @ 0x5] HTTP error 405 Method Not Allowed\n'
+                'Error opening input: Server returned 4XX Client Error, but not one of '
+                '40{0,1,3,4}')
+        self.assertEqual(stderr_cause(tail), '[http @ 0x5] HTTP error 405 Method Not Allowed')
+
+    def test_a_three_digit_bitrate_is_not_a_status_code(self):
+        from app.proc_utils import stderr_cause
+        tail = ('Stream #0:1: Audio: ac3, 48000 Hz, 5.1(side), fltp, 448 kb/s\n'
+                '[http @ 0x5] Stream ends prematurely at 300000, should be 1844')
+        self.assertIn('prematurely', stderr_cause(tail))
 
 
 class SpoolLifecycleTests(unittest.TestCase):
@@ -428,6 +484,23 @@ class RecordDiagnosticsTests(unittest.TestCase):
         """ffmpeg dying on its own is always worth a line, whether or not it explained."""
         self._record(4, '')
         self.assertEqual(len(self._events()), 1)
+
+    def test_a_placeholder_clips_reconnects_are_not_called_drops(self):
+        """dev/docs/BUGS.md 2026-10-21 10:45 PM: every one of prod recording 26's 21
+        placeholder segments said "the stream dropped and ffmpeg reconnected 4 times". The
+        four were ffmpeg reading the end of a finite file, at open and when it ran out."""
+        recorder.record_segment_diagnostics(self.rec.id, self.seg, 0, _PLACEHOLDER_TAIL,
+                                            (4, True), placeholder=True)
+        db.session.commit()
+        detail = self._events()[0].detail
+        self.assertNotIn('stream dropped', detail)
+        self.assertIn('4 reconnects at the end of the placeholder clip', detail)
+
+    def test_a_live_streams_reconnects_are_still_drops(self):
+        recorder.record_segment_diagnostics(self.rec.id, self.seg, 0, 'boom', (2, True))
+        db.session.commit()
+        self.assertIn('the stream dropped and ffmpeg reconnected 2 times',
+                      self._events()[0].detail)
 
     def test_null_segment_does_not_raise(self):
         """The give-up path may find no open segment row to attach to."""

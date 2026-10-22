@@ -1653,7 +1653,7 @@ def _seconds_list(values) -> str:
 
 
 def record_segment_diagnostics(recording_id: int, seg, exit_code, tail, reconnects=(0, True),
-                               spool_missing=False, jumps=None):
+                               spool_missing=False, jumps=None, placeholder=False):
     """Write exit_code onto seg and, when there is something to say, add a DIAGNOSTICS event.
 
     Inserts only - the CALLER commits. This joins the caller's existing retry_on_locked unit
@@ -1700,8 +1700,18 @@ def record_segment_diagnostics(recording_id: int, seg, exit_code, tail, reconnec
         # fact it is rather than hedging about a bound nobody hit.
         howmany = f'at least {reconnect_count}' if not reconnects_complete else f'{reconnect_count}'
         times = 'time' if reconnect_count == 1 and reconnects_complete else 'times'
-        detail += (f'; the stream dropped and ffmpeg reconnected {howmany} {times} during '
-                   f'the segment, without restarting the capture')
+        if placeholder:
+            # ffmpeg reads a finite clip's end at open, for its duration, and again when the
+            # clip runs out; both log a reconnect at the clip's last byte that finds nothing.
+            # None of them is a drop, and "the stream dropped" beside the discard said there
+            # was a live stream to drop (dev/docs/BUGS.md 2026-10-21 10:45 PM).
+            word = 'reconnect' if times == 'time' else 'reconnects'
+            detail += (f'; ffmpeg logged {howmany} {word} '
+                       f'at the end of the placeholder clip, which found nothing more - '
+                       f'the clip is a file with an end, not a live stream that dropped')
+        else:
+            detail += (f'; the stream dropped and ffmpeg reconnected {howmany} {times} during '
+                       f'the segment, without restarting the capture')
     extra = {'kind': 'capture_stderr'}
     if reconnect_count and jumps is not None and jumps.replays:
         # The provider answers each new connection from its buffer, so the content comes
@@ -1825,6 +1835,8 @@ def _launch_segment(app, recording_id: int, seg_num: int) -> str:
                     connlim.release(rec.channel.account_id, 'recording', recording_id)
                 from .health_score import apply_recording_health_observation
                 apply_recording_health_observation(app, recording_id, 'failed')
+                from .alerts import clear_recording_retrying_alert
+                clear_recording_retrying_alert(recording_id)
             else:
                 # Non-idempotent side effects, so they follow the commit rather than
                 # sitting inside _handle_launch_failure's retried closure.
@@ -2998,10 +3010,16 @@ def _capture_produced_data(recording_id: int) -> bool:
     return False
 
 
-def stop_recording(app, recording_id: int, reason: str = 'STOP_TIME_REACHED'):
-    """Signal the watchdog to stop and kill the current ffmpeg process."""
+def stop_recording(app, recording_id: int, reason: str = 'STOP_TIME_REACHED',
+                   join_reason: str = None):
+    """Signal the watchdog to stop and kill the current ffmpeg process. `join_reason` is
+    the CAPTURE_COMPLETE text when the join starts for something other than the stop
+    time."""
     with app.app_context():
         had_state = _teardown_active_ffmpeg(app, recording_id, exit_reason=reason)
+        # Whatever happens next, nothing more will be retried.
+        from .alerts import clear_recording_retrying_alert
+        clear_recording_retrying_alert(recording_id)
         # The capture is over whichever branch below finishes it, so a resume or retry
         # still armed for it - a RETRYING recording's backoff, a resume deferred for a
         # seat - must not fire on the finished row (dev/changelog/1242). abort_recording
@@ -3035,7 +3053,8 @@ def stop_recording(app, recording_id: int, reason: str = 'STOP_TIME_REACHED'):
 
         from .concatenator import do_concatenation
         threading.Thread(
-            target=do_concatenation, args=(app, recording_id), daemon=True
+            target=do_concatenation, args=(app, recording_id), daemon=True,
+            kwargs={'reason': join_reason} if join_reason else {},
         ).start()
 
 
@@ -3076,6 +3095,8 @@ def abort_recording(app, recording_id: int):
             unschedule_recording(recording_id)
             from .health_score import dismiss_recording_failing_alerts
             dismiss_recording_failing_alerts(recording_id)
+            from .alerts import clear_recording_retrying_alert
+            clear_recording_retrying_alert(recording_id)
             end_capture_wait(recording_id)
 
         ev.publish(recording_id, RECORDING_ABORTED, {'status': REC_STATUS_ABORTED})

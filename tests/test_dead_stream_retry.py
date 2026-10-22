@@ -20,21 +20,26 @@ no-op path - that path itself is what `NoSchedulerGracefulNoopTests` asserts on 
 other test here only cares about the DB-side transition, not the APScheduler job.
 """
 import os
+import subprocess
 import sys
+import threading
+import time
 import unittest
 from datetime import datetime, timedelta
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import app.config as cfgmod  # noqa: E402
 import app.recorder as recorder  # noqa: E402
 import app.scheduler as sched  # noqa: E402
 import app.watchdog as wdmod  # noqa: E402
 from app import connection_limits as connlim  # noqa: E402
 from app import db  # noqa: E402
+from app.alerts import RECORDING_RETRYING  # noqa: E402
 from app.database import (  # noqa: E402
     RECORDING_FAILED_DEAD_STREAM, RECORDING_RESUMED, RECORDING_RETRY_SCHEDULED,
-    Recording, RecordingEvent,
+    Alert, Recording, RecordingEvent,
 )
 from app.watchdog import (  # noqa: E402
     _dead_stream_retry_delay_minutes, finalize_dead_stream_retry_exhausted,
@@ -55,6 +60,17 @@ class RetryDelayScheduleTests(unittest.TestCase):
     def test_fifth_attempt_and_beyond_is_hourly(self):
         self.assertEqual([_dead_stream_retry_delay_minutes(n) for n in (5, 6, 20)],
                          [60, 60, 60])
+
+    def test_the_longest_wait_caps_the_ladder(self):
+        """dev/changelog/1264: hourly waits checked prod recording 26's channel twice in
+        the last two and a half hours of a live race; the default cap is 10 minutes."""
+        self.assertEqual([_dead_stream_retry_delay_minutes(n, 10) for n in range(1, 8)],
+                         [1, 2, 5, 10, 10, 10, 10])
+        self.assertEqual([_dead_stream_retry_delay_minutes(n, 60) for n in (4, 5)], [15, 60])
+
+    def test_the_default_cap_is_ten_minutes(self):
+        from app.config import _DEFAULTS
+        self.assertEqual(_DEFAULTS['watchdog']['dead_stream_retry_max_delay_minutes'], 10)
 
 
 class _RetryHarness(RestartHarness):
@@ -145,6 +161,148 @@ class ScheduleRetryInsteadOfImmediateFailureTests(_RetryHarness):
             'RETRYING must free the connection slot - nothing is capturing during the wait')
         self.assertTrue(connlim.try_acquire(self.account_id, 'recording', 99999),
                         'a different recording still could not get the slot')
+
+
+class RetryPastTheWindowTests(_RetryHarness):
+    """dev/changelog/1264: a retry that would come at or after the stop time is not
+    scheduled. Prod recording 26's last trip came 27 minutes before its stop time and
+    announced "Retrying (attempt 7/10) in 60 min", an attempt that could never fire
+    (dev/docs/BUGS.md 2026-10-21 10:45 PM). The capture ends at the trip instead: joined
+    when it captured anything, failed as a dead stream when it captured nothing."""
+
+    def _window_ends_in(self, seconds):
+        self._extra_watchdog_cfg = {'early_fail_abort_count': 1,
+                                    'dead_stream_max_retry_attempts': 10}
+        rec = db.session.get(Recording, self.rid)
+        rec.stop_time = datetime.utcnow() + timedelta(seconds=seconds)  # 1 min retry is past it
+        db.session.commit()
+
+    def test_nothing_captured_fails_as_a_dead_stream_and_says_why(self):
+        self._window_ends_in(40)
+        with open(self.seg_path, 'wb'):
+            pass  # the segment captured nothing
+        self.state.process = sleeper()
+        with mock.patch.object(recorder, 'failover_group_member', return_value=False):
+            rec = self._run_until_event(RECORDING_FAILED_DEAD_STREAM, stall_timeout=1,
+                                        restart_delay=0, produces_data=False)
+
+        self.assertEqual(rec.status, 'FAILED')
+        self.assertEqual(rec.dead_stream_retry_count, 0)
+        self.assertIsNone(self._last_event(RECORDING_RETRY_SCHEDULED),
+                          'a retry past the window must not be scheduled')
+        self.assertIn('before another retry could come',
+                      self._last_event(RECORDING_FAILED_DEAD_STREAM).detail)
+
+    def test_a_capture_that_got_something_is_joined_now(self):
+        self._window_ends_in(40)
+        stopped = threading.Event()
+        calls = []
+
+        def _stop(app, recording_id, reason='STOP_TIME_REACHED', join_reason=None):
+            calls.append((recording_id, reason, join_reason))
+            stopped.set()
+
+        self.state.process = sleeper()
+        with mock.patch.object(recorder, 'failover_group_member', return_value=False), \
+             mock.patch.object(recorder, 'stop_recording', side_effect=_stop), \
+             mock.patch.object(cfgmod, 'load_config', return_value=self._cfg(1, 0)), \
+             mock.patch.object(recorder, '_launch_segment',
+                               self._stub_launch_next(produces_data=False)):
+            self.wd = wdmod.WatchdogThread(self.rid, self.state, self.t.app)
+            self.wd.start()
+            self.assertTrue(stopped.wait(45), 'the capture was not ended at the trip')
+            self.wd.join(timeout=15)
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][1], 'DEAD_STREAM_NO_RETRY')
+        self.assertIn('before another retry could come', calls[0][2])
+        db.session.expire_all()
+        rec = db.session.get(Recording, self.rid)
+        self.assertNotEqual(rec.status, 'RETRYING')
+        self.assertIsNone(self._last_event(RECORDING_RETRY_SCHEDULED))
+
+    def test_a_retry_inside_the_window_still_says_when(self):
+        self._extra_watchdog_cfg = {'early_fail_abort_count': 1,
+                                    'dead_stream_max_retry_attempts': 10}
+        self.state.process = sleeper()
+        with mock.patch.object(recorder, 'failover_group_member', return_value=False):
+            self._run_until_event(RECORDING_RETRY_SCHEDULED, stall_timeout=1,
+                                  restart_delay=0, produces_data=False)
+        evt = self._last_event(RECORDING_RETRY_SCHEDULED)
+        self.assertIn('Retrying (attempt 1/10) in 1 min', evt.detail)
+
+
+class RetryingAlertTests(_RetryHarness):
+    """dev/changelog/1264: a recording waiting on a dead stream raises one ERROR alert,
+    and it comes down when the recording ends. Prod recording 26's only warning was
+    dismissed when it started and nothing replaced it for three hours."""
+
+    def _open(self):
+        return Alert.query.filter_by(recording_id=self.rid, alert_type=RECORDING_RETRYING,
+                                     dismissed_at=None).all()
+
+    def test_entering_retrying_raises_one_error_alert(self):
+        self._extra_watchdog_cfg = {'early_fail_abort_count': 1,
+                                    'dead_stream_max_retry_attempts': 10}
+        self.state.process = sleeper()
+        with mock.patch.object(recorder, 'failover_group_member', return_value=False):
+            rec = self._run_until_event(RECORDING_RETRY_SCHEDULED, stall_timeout=1,
+                                        restart_delay=0, produces_data=False)
+        rows = self._open()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].severity, 'ERROR')
+        self.assertIn('not capturing anything', rows[0].body)
+        self.assertIn('no more than 10 min apart', rows[0].body)
+
+        # A second trip on the same outage raises nothing new.
+        wdmod.raise_recording_retrying_alert(rec, 3, 10, 10, None)
+        self.assertEqual(len(self._open()), 1)
+
+    def test_the_recording_ending_clears_it(self):
+        rec = db.session.get(Recording, self.rid)
+        wdmod.raise_recording_retrying_alert(rec, 3, 1, 10, None)
+        self.assertEqual(len(self._open()), 1)
+        with mock.patch('app.concatenator.do_concatenation'):
+            recorder.stop_recording(self.t.app, self.rid)
+        db.session.expire_all()
+        self.assertEqual(self._open(), [])
+
+    def test_a_segment_capturing_past_the_dead_stream_window_clears_it(self):
+        """The stream came back: the segment is still growing once it can no longer count
+        as an early failure, so "not capturing" would now be false."""
+        rec = db.session.get(Recording, self.rid)
+        wdmod.raise_recording_retrying_alert(rec, 3, 1, 10, None)
+        writer = subprocess.Popen(
+            [sys.executable, '-c',
+             'import sys, time\n'
+             'while True:\n'
+             '    open(sys.argv[1], "ab").write(b"G" * 4096); time.sleep(0.2)',
+             self.seg_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.state.process = writer
+        cfg = self._cfg(30, 0)
+        cfg['watchdog']['early_fail_window_seconds'] = 2
+        try:
+            with mock.patch.object(cfgmod, 'load_config', return_value=cfg):
+                self.wd = wdmod.WatchdogThread(self.rid, self.state, self.t.app)
+                self.wd.start()
+                deadline = time.monotonic() + 20
+                while time.monotonic() < deadline and self._open():
+                    time.sleep(0.25)
+                    db.session.expire_all()
+                self.state.stop_event.set()
+                self.wd.join(timeout=15)
+        finally:
+            writer.kill()
+            writer.wait(timeout=10)
+        db.session.expire_all()
+        self.assertEqual(self._open(), [])
+
+    def test_aborting_clears_it(self):
+        rec = db.session.get(Recording, self.rid)
+        wdmod.raise_recording_retrying_alert(rec, 3, 1, 10, None)
+        recorder.abort_recording(self.t.app, self.rid)
+        db.session.expire_all()
+        self.assertEqual(self._open(), [])
 
 
 class RetryBudgetExhaustedFallsThroughTests(_RetryHarness):
