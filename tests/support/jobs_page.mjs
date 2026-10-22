@@ -13,14 +13,14 @@
    Faked: the network, and the nav-status payload's background tasks and recording
    signature, which a scenario rewrites to say "something changed".
 
-   argv: <fixture dir> <repo root>. The fixture dir holds empty.html, a.html, b.html and
-   nav.json. */
+   argv: <fixture dir> <repo root>. The fixture dir holds empty.html, a.html, b.html,
+   run.html (an EPG refresh row with Run now) and nav.json. */
 import fs from 'fs';
 import { JSDOM, VirtualConsole } from 'jsdom';
 
 const [, , DIR, REPO] = process.argv;
 const read = (f) => fs.readFileSync(`${DIR}/${f}`, 'utf8');
-const PAGES = { empty: read('empty.html'), a: read('a.html'), b: read('b.html') };
+const PAGES = { empty: read('empty.html'), a: read('a.html'), b: read('b.html'), run: read('run.html') };
 const NAV = JSON.parse(read('nav.json'));
 const JS = ['util.js', 'jobs.js'].map((f) => fs.readFileSync(`${REPO}/static/js/${f}`, 'utf8'));
 
@@ -37,7 +37,7 @@ function boot(start, { serve = start } = {}) {
   vc.on('warn', (...a) => warnings.push(a.map(String).join(' ')));
 
   // What the "server" currently answers. A scenario moves it.
-  const server = { page: serve, nav: JSON.parse(JSON.stringify(NAV)) };
+  const server = { page: serve, nav: JSON.parse(JSON.stringify(NAV)), runReply: { success: true } };
   const sent = [];
   const posts = [];
   const fetchStub = (target, opts = {}) => {
@@ -54,7 +54,8 @@ function boot(start, { serve = start } = {}) {
         json: () => Promise.reject(new Error('not json')),
       });
     }
-    const payload = url.pathname === '/api/nav-status' ? server.nav : { success: true };
+    const payload = url.pathname === '/api/nav-status' ? server.nav
+      : url.pathname.endsWith('/run-now') ? server.runReply : { success: true };
     return Promise.resolve({
       ok: true,
       status: 200,
@@ -82,10 +83,13 @@ function boot(start, { serve = start } = {}) {
   const { document } = window;
   window.scrollTo = () => {};
   JS.forEach((src) => window.eval(src));
+  const toasts = [];
+  const realToast = window.showToast;
+  window.showToast = (msg, opts) => { toasts.push([msg, (opts && opts.type) || null]); return realToast(msg, opts); };
 
   const $ = (s) => document.querySelector(s);
   const c = {
-    window, document, server, sent, posts, errors, navigations, warnings, $,
+    window, document, server, sent, posts, errors, navigations, warnings, toasts, $,
     settle: (ms = 60) => new Promise((r) => setTimeout(r, ms)),
     poll: async () => { window.fetchNavStatus(); await c.settle(); },
     click: (el) => el.dispatchEvent(new window.MouseEvent('click', { bubbles: true, cancelable: true })),
@@ -221,5 +225,25 @@ await record('from_empty', async (start) => {
     after: { rows: c.rows().length, empty: Boolean(c.$('#jb-live .empty-state')), count: c.count() },
   };
 });
+
+/* ── Run now, answered with a refusal or a start ────────────────────── */
+const runNow = async (start, reply) => {
+  const c = start('run');
+  c.server.runReply = reply;
+  await c.settle();
+  c.click(c.$('#jb-live [data-menu]'));
+  c.click(c.$('#jb-live .menu-item[data-act="run"]'));
+  const modal = c.$('.modal');
+  const go = modal && Array.from(modal.querySelectorAll('button'))
+    .find((b) => b.textContent.trim() === 'Run now');
+  if (go) c.click(go);
+  await c.settle(200);
+  return { errors: c.errors, modalShown: Boolean(go), posts: c.posts, toasts: c.toasts };
+};
+await record('run_refused', (start) => runNow(start, {
+  success: true, refresh_started: false,
+  message: 'An account sync is running, so the refresh of "Guide" waits. It retries at 3:00 PM.',
+}));
+await record('run_plain', (start) => runNow(start, { success: true }));
 
 process.stdout.write(JSON.stringify(out), () => process.exit(0));

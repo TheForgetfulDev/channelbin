@@ -58,7 +58,7 @@ def _observe():
 
 @unittest.skipIf(shutil.which('node') is None, 'node not installed')
 @unittest.skipIf(not os.path.isdir(JSDOM), 'jsdom not installed (npm install)')
-class _Base(unittest.TestCase):
+class _Base:
 
     @classmethod
     def setUpClass(cls):
@@ -70,7 +70,7 @@ class _Base(unittest.TestCase):
         self.assertEqual(self.obs['errors'], [])
 
 
-class PickedChannelListTests(_Base):
+class PickedChannelListTests(_Base, unittest.TestCase):
     """The selection is a list of channels, not a row of chips."""
 
     def test_the_selection_renders_as_list_rows(self):
@@ -102,7 +102,7 @@ class PickedChannelListTests(_Base):
         self.assertEqual(self.obs['fixed_with_selection']['open']['picked_dots'], 1)
 
 
-class SuggestLoadingStateTests(_Base):
+class SuggestLoadingStateTests(_Base, unittest.TestCase):
     """"+ Add Matching Channels" while the suggest fetch is out."""
 
     def test_the_modal_says_it_is_working(self):
@@ -131,7 +131,7 @@ class SuggestLoadingStateTests(_Base):
         self.assertIs(frame['submit_disabled'], False)
 
 
-class SuggestSettleTests(_Base):
+class SuggestSettleTests(_Base, unittest.TestCase):
     """The two endings that used to leave an empty modal with nothing said."""
 
     def test_an_empty_result_says_so(self):
@@ -162,7 +162,7 @@ class SuggestSettleTests(_Base):
         self.assertIn('Service Unavailable', frame['error_text'])
 
 
-class SuggestProviderRemovedTests(_Base):
+class SuggestProviderRemovedTests(_Base, unittest.TestCase):
     """A suggestion the provider has already dropped carries the same Missing badge the
     group's member table and the Remove Duplicates modal show (dev/docs/BUGS.md 2026-09-19
     @ 02:38:01 PM). Marked, not filtered: it is still a row and still checkable."""
@@ -179,7 +179,7 @@ class SuggestProviderRemovedTests(_Base):
         self.assertTrue(rows['FS1 backup']['checkable'])
 
 
-class SingleSeedPathUnchangedTests(_Base):
+class SingleSeedPathUnchangedTests(_Base, unittest.TestCase):
     """The group detail page's per-row "Group with duplicates" seeds suggestions too, but
     it never opened on an empty body - it has its selection and its name field from the
     first frame - so it is deliberately untouched by the loading state."""
@@ -197,7 +197,7 @@ class SingleSeedPathUnchangedTests(_Base):
         self.assertFalse(self.obs['single_seed']['settled']['empty_shown'])
 
 
-class DuplicateSetsWarningTests(_Base):
+class DuplicateSetsWarningTests(_Base, unittest.TestCase):
     """The add-time duplicate note is one line for every set, by URL or through a provider
     (dev/changelog/1175, DESIGN-account-providers.md §9), counting the extra copies rather
     than printing a sentence per pair."""

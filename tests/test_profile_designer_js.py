@@ -40,13 +40,11 @@ def _observe():
 
 @unittest.skipIf(shutil.which('node') is None, 'node not installed')
 @unittest.skipIf(not os.path.isdir(JSDOM), 'jsdom not installed (npm install)')
-class _Base(unittest.TestCase):
+class _Base:
     SCENARIO = ''
 
     @classmethod
     def setUpClass(cls):
-        if not cls.SCENARIO:
-            raise unittest.SkipTest('base class - carries no cases')
         cls.obs = _observe()[cls.SCENARIO]
         if 'error' in cls.obs:
             raise AssertionError(f'{cls.SCENARIO} threw:\n{cls.obs["error"]}')
@@ -55,7 +53,7 @@ class _Base(unittest.TestCase):
         self.assertEqual(self.obs['errors'], [])
 
 
-class UseTemplateThenSaveTests(_Base):
+class UseTemplateThenSaveTests(_Base, unittest.TestCase):
     SCENARIO = 'use_template_then_save'
 
     def test_the_step_is_the_same_overlay(self):
@@ -90,7 +88,7 @@ class UseTemplateThenSaveTests(_Base):
         self.assertEqual(body['name'], 'Sports edited')
 
 
-class EscapeLadderTests(_Base):
+class EscapeLadderTests(_Base, unittest.TestCase):
     SCENARIO = 'escape_ladder'
 
     def test_escape_in_the_picker_returns_to_the_designer(self):
@@ -113,7 +111,7 @@ class EscapeLadderTests(_Base):
         self.assertEqual(self.obs['closed']['modals'], 0)
 
 
-class BlankProfileTests(_Base):
+class BlankProfileTests(_Base, unittest.TestCase):
     SCENARIO = 'blank_profile_starts_from_global'
 
     def test_the_form_says_it_inherits(self):
@@ -132,7 +130,7 @@ class BlankProfileTests(_Base):
         self.assertEqual(body['filename_tags_remove'], ['hd'])
 
 
-class ClearToGlobalTests(_Base):
+class ClearToGlobalTests(_Base, unittest.TestCase):
     SCENARIO = 'clear_to_global'
 
     def test_clearing_sends_no_template_and_empty_lists(self):
@@ -143,7 +141,7 @@ class ClearToGlobalTests(_Base):
         self.assertEqual(body['filename_tags_remove'], [])
 
 
-class CloseFromStepTests(_Base):
+class CloseFromStepTests(_Base, unittest.TestCase):
     SCENARIO = 'close_from_step'
 
     def test_the_x_closes_everything_and_a_reopen_works(self):
@@ -152,7 +150,7 @@ class CloseFromStepTests(_Base):
         self.assertTrue(self.obs['reopened']['designer'])
 
 
-class SettingsHostTests(_Base):
+class SettingsHostTests(_Base, unittest.TestCase):
     SCENARIO = 'settings_host'
 
     def test_settings_saves_to_config_and_closes(self):

@@ -357,15 +357,22 @@ class WatchdogThread(threading.Thread):
                     self._publish_snapshot(cfg)
 
                     # The user blocked the account this segment is on: move to another
-                    # member at a boundary we make ourselves, or stay and say so.
-                    if time.monotonic() >= self._block_check_at:
-                        if self._check_account_block(seg_num):
-                            member_stall_times = []
-                            member_stall_channel_id = None
-                            member_fast_delivery_strikes = 0
-                            member_fast_delivery_channel_id = None
-                            early_fail_times.clear()
-                            break
+                    # member at a boundary we make ourselves, or stay and say so. A request
+                    # the user just made (Switch channel, or a block from the recording's
+                    # page) is asked first and at once, on this thread - the one that may
+                    # stop a capture (dev/changelog/1254).
+                    if self.state.move_request is not None:
+                        moved = self._check_move_request(seg_num)
+                    else:
+                        moved = (time.monotonic() >= self._block_check_at
+                                 and self._check_account_block(seg_num))
+                    if moved:
+                        member_stall_times = []
+                        member_stall_channel_id = None
+                        member_fast_delivery_strikes = 0
+                        member_fast_delivery_channel_id = None
+                        early_fail_times.clear()
+                        break
 
                     try:
                         current_size = os.path.getsize(seg_path)
@@ -1291,6 +1298,34 @@ class WatchdogThread(threading.Thread):
             # a child the teardown did reach (dev/changelog/1242).
             terminate_or_kill(self.state.process)
             log.info('Watchdog exiting for recording %d (stop_event set)', self.recording_id)
+
+    def _check_move_request(self, seg_num: int) -> bool:
+        """Carry out the request a route left on the state (recorder.MoveRequest): a
+        switch to the member the user picked, or the block check run now. Returns True
+        when the recording moved and the next segment has been launched - the caller then
+        leaves this segment's poll loop. The request is taken off the state before anything
+        else, so a request that raises is never retried in a loop, and `done` is set on
+        every path, so the route waiting on it is always answered (dev/changelog/1254)."""
+        req = self.state.move_request
+        if req is None:
+            return False
+        self.state.move_request = None
+        try:
+            if req.target_channel_id is None:
+                req.moved = self._check_account_block(seg_num)
+                return req.moved
+            from .recorder import failover_group_member, _launch_segment, _close_active_segment
+            if failover_group_member(self.app, self.recording_id, 'you asked for it',
+                                     target_channel_id=req.target_channel_id):
+                terminate_or_kill(self.state.process)
+                _close_active_segment(self.app, self.recording_id, exit_reason='CHANNEL_SWITCHED')
+                _launch_segment(self.app, self.recording_id, seg_num + 1)
+                self._block_stay_noted = None
+                req.moved = True
+                return True
+            return False
+        finally:
+            req.done.set()
 
     def _check_account_block(self, seg_num: int) -> bool:
         """Move this recording off an account the user has blocked since it started, or

@@ -18,6 +18,7 @@
       {% if row.health.tip %}<span class="h-mini {{ row.health.cls }} tip-plain" data-tip="{{ row.health.tip }}">{{ row.health.label }}</span>
       {% else %}<span class="h-mini na">-</span>{% endif %}
       {% if row.pill %}{{ channel_pill(row.pill.label, row.pill.url, logo_url=row.pill.logo_url, initials=row.pill.initials, acct_color=row.pill.acct_color) }}{% endif %}
+      {% if row.member_pill %}{{ channel_pill(row.member_pill.label, row.member_pill.url, logo_url=row.member_pill.logo_url, initials=row.member_pill.initials, acct_color=row.member_pill.acct_color, tip=row.member_pill.tip) }}{% endif %}
       {% for acct in distinct_accounts %}{{ account_pill(acct.name, url_for('accounts.account_detail', account_id=acct.id), acct.color, tip='Recorded via account "' ~ acct.name ~ '" - click for the account page.') }}{% endfor %}
       {% if made_by_rule %}
       {# dev/changelog/1189. Cancelling a rule's recording sticks: the rule's ledger keeps the
@@ -34,11 +35,19 @@
       {% else %}
       <button class="btn tip-plain" data-act="extend" data-tip="Push the stop time 30 minutes later.">+30 min</button>
       <button class="btn tip-plain" data-act="pause" data-tip="Pause capturing, keep the recording open.&#10;ffmpeg stops and the connection slot is freed; Resume later.&#10;The paused span becomes a gap in the output.">&#9208; Pause</button>
+      {% if rec.group_id %}
+      {# A group recording only: the Switch channel dialog (static/js/recording-switch.js,
+         dev/changelog/1254). "Channel", not "member" - a group's member is a channel
+         everywhere but on the group's own page. #}
+      <button class="btn tip-plain" data-act="switch" data-tip="Move this recording to another channel in the group now.&#10;You pick the channel; the recording carries on from it.">Switch channel</button>
+      {% endif %}
       {% endif %}
       <button class="btn btn-danger tip-plain" data-act="stop" data-tip="End the recording now, for good.&#10;Capture stops and the segments are joined into the final file.&#10;Can't be resumed.">&#9632; Stop</button>
       <div class="menu-wrap">
         <button class="btn btn-icon" data-menu>&#8943;</button>
         <div class="menu">
+          <button class="menu-item" data-act="block">Block accounts...</button>
+          <div class="sep"></div>
           <a href="{{ url_for('logs.logs_page') }}">View log lines</a>
           <button class="menu-item" data-secs-open>Customize sections...</button>
           <a href="{{ find_airing_url }}">Find another airing</a>
@@ -52,6 +61,8 @@
       <div class="menu-wrap">
         <button class="btn btn-icon" data-menu>&#8943;</button>
         <div class="menu">
+          <button class="menu-item" data-act="block">Block accounts...</button>
+          <div class="sep"></div>
           <a href="{{ url_for('logs.logs_page') }}">View log lines</a>
           <button class="menu-item" data-secs-open>Customize sections...</button>
           <a href="{{ find_airing_url }}">Find another airing</a>
@@ -162,6 +173,11 @@
     <div class="menu-wrap">
       <button class="btn btn-icon" data-menu>&#8943;</button>
       <div class="menu pop-up">
+        {% if rec.status == REC_STATUS.IN_PROGRESS and rec.group_id %}
+        <button class="menu-item" data-act="switch">Switch channel...</button>
+        {% endif %}
+        <button class="menu-item" data-act="block">Block accounts...</button>
+        <div class="sep"></div>
         <a href="{{ url_for('logs.logs_page') }}">View log lines</a>
         <button class="menu-item" data-secs-open>Customize sections...</button>
         <a href="{{ find_airing_url }}">Find another airing</a>
@@ -175,6 +191,8 @@
     <div class="menu-wrap">
       <button class="btn btn-icon" data-menu>&#8943;</button>
       <div class="menu pop-up">
+        <button class="menu-item" data-act="block">Block accounts...</button>
+        <div class="sep"></div>
         <a href="{{ url_for('logs.logs_page') }}">View log lines</a>
         <button class="menu-item" data-secs-open>Customize sections...</button>
         <a href="{{ find_airing_url }}">Find another airing</a>
@@ -667,9 +685,9 @@
            onerror="this.parentElement.classList.remove('has-img'); this.replaceWith('NO SCREENSHOT');">
       {% if shot_mtime %}<span class="shot-age">captured {{ shot_mtime | local_time_only }}</span>{% endif %}
     </div>
-    {% elif row.pill and row.pill.logo_url %}
+    {% elif (row.member_pill or row.pill) and (row.member_pill or row.pill).logo_url %}
     <div class="bigthumb logo-fallback">
-      <img src="{{ row.pill.logo_url }}" alt="{{ row.pill.label }} logo"
+      <img src="{{ (row.member_pill or row.pill).logo_url }}" alt="{{ (row.member_pill or row.pill).label }} logo"
            onerror="this.parentElement.classList.remove('logo-fallback'); this.remove();">
       <span class="shot-age">{% if rec.status == REC_STATUS.SCHEDULED %}NOT STARTED YET{% else %}NO SCREENSHOT{% endif %}</span>
     </div>
@@ -958,6 +976,7 @@
   'SERVICE_RESTART':          ('na',   'The segment was closed because the service restarted.'),
   'TEARDOWN_RACE':            ('na',   'This segment was starting at the exact moment the recording was torn down, so it captured nothing. Its file was deleted and the row was closed rather than left open.'),
   'ACCOUNT_BLOCKED':          ('na',   'You blocked the account this segment was on, so the recording moved to a member on another account and this segment was closed there. Nothing was wrong with the feed, and it was not scored for the move.'),
+  'CHANNEL_SWITCHED':         ('na',   'You switched the recording to another channel in the group, so this segment was closed here. Nothing was wrong with the feed, and it was not scored for the move.'),
 } %}
 {# Why a row was kept out of the final file. Keyed on RecordingSegment.excluded_reason, which
    is a different question from the exit pill above (how the segment ended) and reads beside
@@ -1197,6 +1216,7 @@ window.onScheduleSaved = () => window.location.reload();
 {% endif %}
 </script>
 <script src="{{ url_for('static', filename='js/guide.js') }}"></script>
+<script src="{{ url_for('static', filename='js/recording-switch.js') }}"></script>
 <script>
 (() => {
   const RID = {{ rec.id }};
@@ -1310,6 +1330,13 @@ window.onScheduleSaved = () => window.location.reload();
     }
     const btn = e.target.closest('[data-act]');
     if (!btn) return;
+    // Switch channel and Block accounts open dialogs of their own
+    // (static/js/recording-switch.js) rather than a confirm-and-run.
+    if (window.recordingDialogs && window.recordingDialogs[btn.dataset.act]) {
+      closeMenus();
+      window.recordingDialogs[btn.dataset.act](RID);
+      return;
+    }
     const spec = ACTIONS[btn.dataset.act];
     if (!spec) return;
     const go = () => Promise.resolve(spec.run())
@@ -1798,6 +1825,9 @@ window.onScheduleSaved = () => window.location.reload();
   }
 
   timer = setInterval(refreshPage, REFRESH_INTERVAL_MS);
+  // The Switch channel and Block accounts dialogs (recording-switch.js) ask for a swap
+  // right after a move, so the chip and the event log follow it without the wait.
+  window.__refreshRecordingPage = refreshPage;
 })();
 </script>
 {% endblock %}

@@ -88,13 +88,13 @@
   {% for r in rows %}
   <div class="row {{ r.st_class }}" data-href="{{ url_for('recordings.recording_detail', recording_id=r.id) }}" data-id="{{ r.id }}"
        data-name="{{ r.name|lower }}" data-status="{{ r.status }}"
-       data-channel="{{ r.pill.label if r.pill else '' }}" data-account="{{ r.acct_name or '' }}"
+       data-channel="{{ r.pill.label if r.pill else '' }}" data-member="{{ r.member_pill.label if r.member_pill else '' }}" data-account="{{ r.acct_name or '' }}"
        data-start="{{ r.sort_start }}" data-dur="{{ r.sort_dur }}" data-size="{{ r.sort_size }}" data-health="{{ r.sort_health }}">
     <div class="c-title">
       {% if r.thumb_url %}
       <div class="thumb has-img" data-shot="{{ r.thumb_url }}"><img src="{{ r.thumb_url }}" alt="" loading="lazy" onerror="this.parentElement.classList.remove('has-img'); this.remove();"></div>
-      {% elif r.pill and r.pill.logo_url %}
-      <div class="thumb logo-fallback"><img src="{{ r.pill.logo_url }}" alt="" loading="lazy" onerror="this.parentElement.classList.remove('logo-fallback'); this.remove(); this.parentElement.textContent='-';"></div>
+      {% elif (r.member_pill or r.pill) and (r.member_pill or r.pill).logo_url %}
+      <div class="thumb logo-fallback"><img src="{{ (r.member_pill or r.pill).logo_url }}" alt="" loading="lazy" onerror="this.parentElement.classList.remove('logo-fallback'); this.remove(); this.parentElement.textContent='-';"></div>
       {% else %}
       <div class="thumb">-</div>
       {% endif %}
@@ -107,6 +107,7 @@
           {{ status_badge(r.badge_class, r.badge_label, pulse=r.badge_pulse) }}
           {% if r.converted_gaps %}<span class="badge b-warn tip-plain" data-tip="The converted file is missing {{ r.converted_gaps }} of video the recording has, so it stalls there. The source .ts was kept - Retry conversion on the recording converts it again.">Gaps in file</span>{% endif %}
           {% if r.pill %}{{ channel_pill(r.pill.label, r.pill.url, logo_url=r.pill.logo_url, initials=r.pill.initials, acct_color=r.pill.acct_color) }}{% endif %}
+          {% if r.member_pill %}{{ channel_pill(r.member_pill.label, r.member_pill.url, logo_url=r.member_pill.logo_url, initials=r.member_pill.initials, acct_color=r.member_pill.acct_color, tip=r.member_pill.tip) }}{% endif %}
         </div>
       </div>
     </div>

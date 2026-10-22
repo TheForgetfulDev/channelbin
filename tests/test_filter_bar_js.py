@@ -51,7 +51,7 @@ def _observe():
 
 @unittest.skipIf(shutil.which('node') is None, 'node not installed')
 @unittest.skipIf(not os.path.isdir(JSDOM), 'jsdom not installed (npm install)')
-class _Base(unittest.TestCase):
+class _Base:
 
     @classmethod
     def setUpClass(cls):
@@ -63,7 +63,7 @@ class _Base(unittest.TestCase):
         self.assertEqual(self.obs['errors'], [])
 
 
-class NothingActiveTests(_Base):
+class NothingActiveTests(_Base, unittest.TestCase):
     """Server-rendered initial state must equal the nothing-active state: JS may upgrade
     the page, it must never be required to calm one down (CLAUDE.md frontend rules)."""
 
@@ -85,7 +85,7 @@ class NothingActiveTests(_Base):
         self.assertNotIn('Never offered', self.obs['after_back']['menu'])
 
 
-class DrillInTests(_Base):
+class DrillInTests(_Base, unittest.TestCase):
     """One popover, two levels: the dimensions, then one dimension's values."""
 
     def test_values_carry_the_count_of_rows_that_match_them(self):
@@ -108,7 +108,7 @@ class DrillInTests(_Base):
         self.assertTrue(self.obs['after_back']['open'])
 
 
-class MatchSemanticsTests(_Base):
+class MatchSemanticsTests(_Base, unittest.TestCase):
     """OR inside one dimension, AND across dimensions - the only sensible reading of
     "Status is Fail, Warn" beside "Account is A"."""
 
@@ -137,7 +137,7 @@ class MatchSemanticsTests(_Base):
         self.assertIn('✓Fail1', self.obs['one_value']['menu'])
 
 
-class ChipTests(_Base):
+class ChipTests(_Base, unittest.TestCase):
 
     def test_clicking_a_chip_removes_exactly_that_filter(self):
         self.assertEqual(self.obs['chip_removed']['chips'],
@@ -150,7 +150,7 @@ class ChipTests(_Base):
         self.assertEqual(self.obs['and_across']['chips'][2], 'Account is Account 2 ✕')
 
 
-class InvisibleFilterTests(_Base):
+class InvisibleFilterTests(_Base, unittest.TestCase):
     """The one state this must never come to rest in: a filter still hiding rows from
     behind a chip that is no longer on screen."""
 
@@ -171,7 +171,7 @@ class InvisibleFilterTests(_Base):
         self.assertEqual(self.obs['after_unoffer']['menu'], ['Status'])
 
 
-class RoundTripTests(_Base):
+class RoundTripTests(_Base, unittest.TestCase):
     """entries()/setFrom() are what a URL-persisted bar rides on (the Groups tab)."""
 
     def test_entries_are_flat_key_value_pairs(self):
@@ -189,7 +189,7 @@ class RoundTripTests(_Base):
         self.assertEqual(self.obs['restored']['count'], 2)
 
 
-class OnChangeTests(_Base):
+class OnChangeTests(_Base, unittest.TestCase):
 
     def test_the_caller_is_notified_once_per_user_change(self):
         """Four value/chip clicks in the scenario above; render() and setFrom() are not
@@ -213,7 +213,7 @@ class _Saved(_Base):
             self.assertEqual(self.s[k], [], k)
 
 
-class SavedFilterSaveTests(_Saved):
+class SavedFilterSaveTests(_Saved, unittest.TestCase):
 
     def test_nothing_saved_reads_plain(self):
         self.assertEqual(self.s['empty']['chip'], 'Saved \u25be')
@@ -246,7 +246,7 @@ class SavedFilterSaveTests(_Saved):
         self.assertEqual(self.s['overwritten']['chip'], 'Saved: Failures \u25be')
 
 
-class SavedFilterLoadTests(_Saved):
+class SavedFilterLoadTests(_Saved, unittest.TestCase):
 
     def test_loading_replaces_the_chips_with_the_saved_ones(self):
         """Account: 1 was on the bar before the load; it must not survive into it."""
@@ -258,7 +258,7 @@ class SavedFilterLoadTests(_Saved):
         self.assertFalse(self.s['loaded']['open'])
 
 
-class SavedFilterDefaultTests(_Saved):
+class SavedFilterDefaultTests(_Saved, unittest.TestCase):
 
     def test_set_default_marks_exactly_one_and_keeps_the_popover_open(self):
         self.assertEqual([r['is_default'] for r in self.s['default_one']['lastPost']['body']['value']],
@@ -295,7 +295,7 @@ class SavedFilterDefaultTests(_Saved):
         self.assertEqual(self.s['boot_default']['posts'], 0)
 
 
-class SavedFilterFailureTests(_Saved):
+class SavedFilterFailureTests(_Saved, unittest.TestCase):
 
     def test_a_failed_write_is_undone_on_screen_and_the_popover_says_so(self):
         self.assertEqual(self.s['delete_pending']['saved'], ['Failures'])
@@ -312,7 +312,7 @@ class SavedFilterFailureTests(_Saved):
 
 
 
-class IsNotTests(_Base):
+class IsNotTests(_Base, unittest.TestCase):
     """Every value is off, "is" or "is not" - the channel search's three-state rule and chip
     wording, lifted into the shared bar so the control means the same thing on every page
     (dev/changelog/1207). A dimension passes a row when it has no "is" values or one
@@ -387,7 +387,7 @@ class IsNotTests(_Base):
         self.assertEqual(self.obs['not_changes'] - self.obs['changes'], 8)
 
 
-class SavedIsNotTests(_Saved):
+class SavedIsNotTests(_Saved, unittest.TestCase):
 
     def test_is_not_is_saved_in_the_three_element_shape(self):
         self.assertEqual(self.s['not_saved']['lastPost']['body']['value'],

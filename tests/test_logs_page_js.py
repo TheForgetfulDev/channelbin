@@ -92,13 +92,11 @@ def _observe():
 
 @unittest.skipIf(shutil.which('node') is None, 'node not installed')
 @unittest.skipIf(not os.path.isdir(JSDOM), 'jsdom not installed (npm install)')
-class _Base(unittest.TestCase):
+class _Base:
     SCENARIO = ''
 
     @classmethod
     def setUpClass(cls):
-        if not cls.SCENARIO:
-            raise unittest.SkipTest('base class - carries the shared cases only')
         cls.obs = _observe()[cls.SCENARIO]
         if isinstance(cls.obs, dict) and 'error' in cls.obs:
             raise AssertionError(f'{cls.SCENARIO} threw in the page:\n{cls.obs["error"]}')
@@ -107,7 +105,7 @@ class _Base(unittest.TestCase):
         self.assertEqual(self.obs['errors'], [])
 
 
-class PageAsItOpensTests(_Base):
+class PageAsItOpensTests(_Base, unittest.TestCase):
     SCENARIO = 'boot'
 
     def test_the_history_is_rendered(self):
@@ -145,7 +143,7 @@ class PageAsItOpensTests(_Base):
         self.assertEqual(counts['app.scheduler'], '0')
 
 
-class FilterTests(_Base):
+class FilterTests(_Base, unittest.TestCase):
     SCENARIO = 'filter'
 
     def test_turning_a_level_off_hides_its_rows(self):
@@ -170,7 +168,7 @@ class FilterTests(_Base):
         self.assertEqual(self.obs['restored'], 5)
 
 
-class SearchTests(_Base):
+class SearchTests(_Base, unittest.TestCase):
     SCENARIO = 'search'
 
     def test_the_search_filters_to_matching_lines(self):
@@ -185,7 +183,7 @@ class SearchTests(_Base):
         self.assertEqual(self.obs['afterClear'], 5)
 
 
-class StreamTests(_Base):
+class StreamTests(_Base, unittest.TestCase):
     SCENARIO = 'stream'
 
     def test_a_new_line_is_appended(self):
@@ -208,7 +206,7 @@ class StreamTests(_Base):
         self.assertTrue(self.obs['unknownRowVisible'])
 
 
-class StatusTests(_Base):
+class StatusTests(_Base, unittest.TestCase):
     SCENARIO = 'status'
 
     def test_the_server_rendered_badge_is_the_pre_js_state(self):
@@ -233,7 +231,7 @@ class StatusTests(_Base):
                         f'no toast explained the stop: {self.obs["toasts"]}')
 
 
-class ClearAndCopyTests(_Base):
+class ClearAndCopyTests(_Base, unittest.TestCase):
     SCENARIO = 'clearAndCopy'
 
     def test_copy_takes_only_what_is_on_screen(self):
@@ -262,7 +260,7 @@ class ClearAndCopyTests(_Base):
         self.assertEqual(self.obs['countAfterEmit'], '1 lines')
 
 
-class PhoneSheetTests(_Base):
+class PhoneSheetTests(_Base, unittest.TestCase):
     SCENARIO = 'sheet'
 
     def test_the_bar_says_what_is_currently_filtered(self):
@@ -293,7 +291,7 @@ class PhoneSheetTests(_Base):
         self.assertTrue(self.obs['noteGone'], "the sheet's note was left in the toolbar")
 
 
-class EmptyHistoryTests(_Base):
+class EmptyHistoryTests(_Base, unittest.TestCase):
     SCENARIO = 'emptyHistory'
 
     def test_an_empty_history_says_so(self):

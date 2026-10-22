@@ -1684,14 +1684,17 @@ async function loadBlockPicker(prefix, recordingId) {
   const accounts = data.accounts || [];
   if (!accounts.length) return;
   list.innerHTML = accounts.map((a) => {
+    // Only an account with more than one connection has a choice to make - block all of
+    // them, or leave ChannelBin some - and it reads as a sentence beside the name, so the
+    // select cannot look like it belongs to the row below it (dev/changelog/1254).
     let slots = '';
     if (a.limit > 1) {
-      const opts = [`<option value="">All ${a.limit} connections</option>`];
+      const opts = [`<option value="">all ${a.limit} connections</option>`];
       for (let n = 1; n < a.limit; n++) {
-        opts.push(`<option value="${n}"${a.slots === n ? ' selected' : ''}>${n} of ${a.limit}</option>`);
+        opts.push(`<option value="${n}"${a.slots === n ? ' selected' : ''}>${n} of its ${a.limit} connections</option>`);
       }
-      slots = `<select name="block_slots_${a.id}" class="form-control" `
-        + `aria-label="Connections to block on ${escHtml(a.name)}">${opts.join('')}</select>`;
+      slots = `<span class="acct-block-slots">block <select name="block_slots_${a.id}" class="form-control" `
+        + `aria-label="Connections to block on ${escHtml(a.name)}">${opts.join('')}</select></span>`;
     }
     return `<label class="check-row"><input type="checkbox" name="block_account_ids" `
       + `value="${a.id}"${a.blocked ? ' checked' : ''}>`

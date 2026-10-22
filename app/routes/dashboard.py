@@ -328,22 +328,14 @@ def _timeline_payload(recordings, accounts, now):
     Times are epoch milliseconds UTC so the client does no timezone arithmetic; the labels
     on the axis are formatted by the browser in the user's own zone.
 
-    Jobs carry `est_seconds: None` because the app has NO runtime estimates yet. DESIGN.md
-    16.3 is explicit about what that must render: an outline with no length, never a number
-    invented to make the bar legible. That consequence was accepted when the section was
-    approved ("So we'll have to add runtime estimates as a feature").
-
-    CALL ORDER IS LOAD-BEARING. `_build_job_list()` does a `db.session.get()` per scheduled
-    recording and per sync job. Those cost no SQL here only because the caller has already
-    loaded the same Recording and Account rows into this session, so every one of them is an
-    identity-map hit. Moving this call ahead of those queries turns it into per-row I/O on a
-    page that renders a row-scaling list.
+    Every job's runtime estimate, and the recording guard the scheduler will apply to it,
+    are `_build_job_list()`'s - the same numbers /jobs shows, so the two pages cannot
+    disagree about how long a job runs or whether it will yield (DESIGN.md 16.3, 16.4). A
+    job with no run history arrives with `est_seconds: None` and draws as an outline with
+    no length, never a number invented to make the bar legible.
     """
     from .jobs import _build_job_list
 
-    # Same section app/scheduler.py and app/accounts.py read the guards from - the
-    # mark on the axis has to describe what those two will actually do.
-    sync_cfg = load_config().get('sync', {})
     account_color = {a.id: a.color for a in accounts}
 
     def _ms(dt):
@@ -377,13 +369,12 @@ def _timeline_payload(recordings, accounts, now):
             'id': job['id'],
             'name': job['display_name'],
             'start': _ms(datetime.fromisoformat(job['next_run_utc'])),
-            # No estimate exists anywhere in the app yet, so this is None on every job and
-            # the client draws the unknown state. See this function's docstring.
-            'est_seconds': None,
-            'runs': 0,
-            # Only an account sync is subject to the guards below, so only it is eligible
-            # to be marked. Matched on the id, not on display_name, which is user data.
-            'is_sync': job['id'].startswith('account_sync_'),
+            'est_seconds': job['est_seconds'],
+            # /jobs' own sentence, so the tooltip and the table word it once.
+            'duration_line': job.get('duration_line'),
+            # None for a job no recording can defer - only those with one are eligible to
+            # be marked (16.4).
+            'guard': job.get('recording_guard'),
             'url': '/jobs',
         })
 
@@ -391,12 +382,6 @@ def _timeline_payload(recordings, accounts, now):
         'now': _ms(now),
         'recordings': rows,
         'jobs': jobs,
-        # 16.4: the thresholds come from config, never from a typed number, because the
-        # warning has to describe what scheduler.py will ACTUALLY do.
-        'syncGuards': {
-            'skipIfRecordingActive': bool(sync_cfg.get('skip_sync_if_recording_active', True)),
-            'skipWithinMinutes': int(sync_cfg.get('skip_sync_if_recording_within_minutes', 5)),
-        },
     }
 
 

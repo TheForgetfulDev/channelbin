@@ -59,6 +59,11 @@ from app.proc_utils import SupervisedRun  # noqa: E402
 
 _HAVE_FFMPEG = bool(shutil.which('ffmpeg') and shutil.which('ffprobe'))
 
+# The supervisor's poll for the real finalize/join runs below. Their children finish in a
+# fraction of a second, and the supervisor sleeps a whole interval before it sees that, so
+# a 1s poll was most of each run (dev/changelog/1259).
+_POLL = 0.1
+
 
 def _ffmpeg(*args):
     subprocess.run(['ffmpeg', '-v', 'error', '-y', *args], check=True, timeout=180)
@@ -392,14 +397,14 @@ class FinalizePartTests(unittest.TestCase):
         # the original measurement, and resuming there lost 60 frames silently.
         cut = self._truncated_copy('cut2.mp4')
         declared = _probe_duration(cut)
-        kept = finalize_part(cut, 'ffmpeg', scratch_key='t', interval=1,
+        kept = finalize_part(cut, 'ffmpeg', scratch_key='t', interval=_POLL,
                              pre_output_timeout=60, stall_seconds=60)
         self.assertIsNotNone(kept)
         self.assertLessEqual(kept, (declared or 0) + 0.001)
 
     def test_the_finalized_part_decodes_clean_to_its_end(self):
         cut = self._truncated_copy('cut3.mp4')
-        finalize_part(cut, 'ffmpeg', scratch_key='t', interval=1,
+        finalize_part(cut, 'ffmpeg', scratch_key='t', interval=_POLL,
                       pre_output_timeout=60, stall_seconds=60)
         self.assertEqual(_decode_error_count(cut), 0,
                          'the re-mux must drop the fragment that was mid-write')
@@ -407,9 +412,9 @@ class FinalizePartTests(unittest.TestCase):
     def test_it_is_idempotent_so_a_restart_may_call_it_without_knowing(self):
         # This is what lets a service restart adopt a part no commit describes.
         cut = self._truncated_copy('cut4.mp4')
-        first = finalize_part(cut, 'ffmpeg', scratch_key='t', interval=1,
+        first = finalize_part(cut, 'ffmpeg', scratch_key='t', interval=_POLL,
                               pre_output_timeout=60, stall_seconds=60)
-        second = finalize_part(cut, 'ffmpeg', scratch_key='t', interval=1,
+        second = finalize_part(cut, 'ffmpeg', scratch_key='t', interval=_POLL,
                                pre_output_timeout=60, stall_seconds=60)
         self.assertAlmostEqual(first, second, places=2)
 
@@ -417,7 +422,7 @@ class FinalizePartTests(unittest.TestCase):
         garbage = os.path.join(self._dir, 'garbage.mp4')
         with open(garbage, 'wb') as fh:
             fh.write(b'not an mp4' * 32)
-        self.assertIsNone(finalize_part(garbage, 'ffmpeg', scratch_key='t', interval=1,
+        self.assertIsNone(finalize_part(garbage, 'ffmpeg', scratch_key='t', interval=_POLL,
                                         pre_output_timeout=20, stall_seconds=20))
 
     def test_a_missing_part_reports_none(self):
@@ -431,7 +436,7 @@ class FinalizePartTests(unittest.TestCase):
 
     def test_the_clean_scratch_does_not_outlive_the_call(self):
         cut = self._truncated_copy('cut5.mp4')
-        finalize_part(cut, 'ffmpeg', scratch_key='t', interval=1,
+        finalize_part(cut, 'ffmpeg', scratch_key='t', interval=_POLL,
                       pre_output_timeout=60, stall_seconds=60)
         self.assertFalse(os.path.exists(clean_part_path(cut)))
 
@@ -474,7 +479,7 @@ class TrackOverhangTests(unittest.TestCase):
         return path
 
     def _finalize(self, path, **kw):
-        return finalize_part(path, 'ffmpeg', scratch_key='t', interval=1,
+        return finalize_part(path, 'ffmpeg', scratch_key='t', interval=_POLL,
                              pre_output_timeout=60, stall_seconds=60, **kw)
 
     def _spread(self, path):
@@ -502,7 +507,7 @@ class TrackOverhangTests(unittest.TestCase):
         self._finalize(part)
         nxt = self._fresh(self.next_part, 'n3.mp4')
         result = join_conversion_parts([part, nxt], out, 'ffmpeg', scratch_key='t',
-                                       interval=1, pre_output_timeout=120, stall_seconds=120)
+                                       interval=_POLL, pre_output_timeout=120, stall_seconds=120)
         self.assertTrue(result.success, f'join failed: {result.error_msg}')
         scan = probemod.scan_video_timeline(out)
         self.assertLessEqual(scan['max_gap_seconds'], 0.25,
@@ -594,14 +599,14 @@ class SpliceFidelityTests(unittest.TestCase):
         with open(p1, 'wb') as fh:
             fh.write(raw[:int(len(raw) * 0.82)])
 
-        covered = finalize_part(p1, 'ffmpeg', scratch_key='t', interval=1,
+        covered = finalize_part(p1, 'ffmpeg', scratch_key='t', interval=_POLL,
                                 pre_output_timeout=60, stall_seconds=60)
         self.assertIsNotNone(covered, 'the killed part held nothing usable')
 
         # Part 2 picks up from the last decodable frame of part 1 - not from 7.0.
         self._encode_part(p2, start_at=covered)
 
-        result = join_conversion_parts([p1, p2], out, 'ffmpeg', scratch_key='t', interval=1,
+        result = join_conversion_parts([p1, p2], out, 'ffmpeg', scratch_key='t', interval=_POLL,
                                        pre_output_timeout=120, stall_seconds=120)
         self.assertTrue(result.success, f'join failed: {result.error_msg}')
         self.assertEqual(result.parts, 2)
@@ -621,7 +626,7 @@ class SpliceFidelityTests(unittest.TestCase):
         out = os.path.join(self._dir, 'single.mp4')
         p1 = part_path(out, 1)
         self._encode_part(p1)
-        result = join_conversion_parts([p1], out, 'ffmpeg', scratch_key='t', interval=1,
+        result = join_conversion_parts([p1], out, 'ffmpeg', scratch_key='t', interval=_POLL,
                                        pre_output_timeout=120, stall_seconds=120)
         self.assertTrue(result.success, f'join failed: {result.error_msg}')
         self.assertAlmostEqual(_probe_duration(out), self.ref_duration, delta=0.25)

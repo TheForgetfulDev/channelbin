@@ -118,6 +118,27 @@ class RecordingState:
     # Whether the segment now running was launched with -re, so the watchdog can tell a
     # paced capture that still misbehaved (pacing is not the fix) from an unpaced one.
     current_segment_paced: bool = False
+    # A user's request to move this recording, left here by a route and carried out by the
+    # recording's own watchdog at the top of its next poll (app/watchdog.py::
+    # _check_move_request). The request thread records intent; the one thread that drives
+    # the capture is the only one that stops an ffmpeg or launches the next segment, so a
+    # switch cannot race the watchdog's own failover or block check (dev/changelog/1254).
+    move_request: Optional['MoveRequest'] = None
+
+
+@dataclass
+class MoveRequest:
+    """What a user asked of a running group recording, for its watchdog to carry out.
+
+    `target_channel_id` names the member to switch to; None asks for the account-block
+    check to run now rather than at its next 15 s cadence - a block the user just set from
+    the recording's own page. The watchdog sets `done` once it has acted, with `moved`
+    saying whether the recording changed member; the route that asked reads the recording's
+    newest event for what happened, so the user is told in the same words the recording
+    keeps."""
+    target_channel_id: Optional[int] = None
+    done: threading.Event = field(default_factory=threading.Event)
+    moved: bool = False
 
 
 # Where a segment's real-time pacing decision came from. Every value is named, and the
@@ -2002,8 +2023,132 @@ def _pin_eligible_members(members, pin, latest_by_channel):
     return keep, False
 
 
+def _pick_by_tiers(members, latest_by_channel, stay_put, busy, busy_account, demoted,
+                   streak_threshold):
+    """The failover's preference tiers, best-first; the first that yields a member wins.
+    The inner three are the long-standing busy cascade - prefer a member whose account has
+    a free slot, then any free member, then knowingly take the best busy one rather than
+    abort (busy-member skip rule; no handoff fires mid-recording, so both recordings share
+    the feed's provider connection).
+
+    A demote pass wraps a second round outside them: every tier is tried against the
+    not-yet-demoted members first, and only then re-tried with the demoted ones allowed
+    back in. That second round is what keeps a small group cycling instead of running dry
+    - a three-member group goes A -> B -> C -> A - and it ranks by health score, which each
+    demotion has just made more honest about this run."""
+    best = None
+    for preferred in ([demoted, frozenset()] if demoted else [frozenset()]):
+        base = set(stay_put) | set(preferred)
+        for tier in (base | busy | busy_account, base | busy, base):
+            best = pick_best_member(members, latest_by_channel, exclude_ids=tier,
+                                    streak_threshold=streak_threshold)
+            if best is not None:
+                break
+        if best is not None:
+            break
+    return best
+
+
+SwitchChoice = namedtuple('SwitchChoice', 'channel ok why warn')
+
+
+def switch_choices(recording_id: int) -> list:
+    """Every channel the Switch channel dialog offers for a running group recording, with
+    whether it can be picked right now and why, in the order the manual move reads them
+    (failover_group_member with a target): the one on screen, a feed that died this run,
+    a blocked account, an account at its limit, then the format against this recording's.
+    One reading for the dialog and the route, so they cannot disagree (dev/changelog/1254).
+
+    A member whose Recording switch is off is not offered at all (dev/changelog/1254): the
+    switch is the user's own answer to "would I record from this feed", and a dialog on the
+    recording page is not where that answer changes. A format that differs from the recording's is
+    offered and marked `warn` - the lock filters, it never refuses. Requires an app context;
+    [] for anything that is not a group recording running in this process."""
+    from .account_blocks import blocked_account_ids
+    from .routes.channel_tests import _latest_tests_by_channel
+    from . import connection_limits as connlim
+    rec = db.session.get(Recording, recording_id)
+    state = get_state(recording_id)
+    if rec is None or rec.group is None or state is None:
+        return []
+    members = recording_members(rec.group.memberships)
+    account_ids = {ch.account_id for ch in members}
+    blocked = blocked_account_ids(account_ids)
+    full = connlim.accounts_without_free_recording_slot(
+        account_ids, exclude_holder=('recording', recording_id))
+    latest = _latest_tests_by_channel([ch.id for ch in members])
+    pin = recording_format_pin(recording_id)
+    current = rec.channel
+    out = []
+    for ch in members:
+        key = format_key(latest.get(ch.id))
+        warn = False
+        if ch.id == rec.channel_id:
+            ok, why = False, 'Recording from it now.'
+        elif ch.id in state.failed_member_ids:
+            ok, why = False, ('Its feed died earlier in this recording - not offered again '
+                              'this run.')
+        elif ch.account_id in blocked:
+            ok, why = False, f'"{ch.account.name}" is blocked for the rest of this recording.'
+        elif ch.account_id in full and (current is None or ch.account_id != current.account_id):
+            ok, why = False, (f'"{ch.account.name}" is at its connection limit - every slot '
+                              f'is held by another recording.')
+        elif key is None:
+            ok, why = True, ('Never tested - its format is unknown, so it is not filtered '
+                             'on format.')
+        elif pin is not None and key != pin:
+            ok, why, warn = True, (f'Records at {format_label(key)}; this recording is at '
+                                   f'{format_label(pin)}, so the file changes format where '
+                                   f'you switch.'), True
+        elif pin is not None:
+            ok, why = True, f'Same format as this recording ({format_label(key)}).'
+        else:
+            ok, why = True, f'Records at {format_label(key)}.'
+        if ok and ch.id in state.demoted_member_ids:
+            why += ' Moved off earlier in this recording for stalling.'
+        out.append(SwitchChoice(ch, ok, why, warn))
+    return out
+
+
+def block_move_preview(recording_id: int, pending: dict):
+    """What blocking `pending` ({account_id: slots}) would do to a running group recording,
+    answered before the block is saved rather than discovered by the watchdog 15 s later
+    (dev/changelog/1254). None when the blocks leave the account the recording is on with
+    a usable slot; otherwise {'to': Channel or None, 'held': bool} - the member the block
+    move would land on, read with the move's own filters and tiers, and whether that member
+    sits on an account at its connection limit, where the seat move is refused and the
+    recording stays put. Advisory: a partial block that still leaves the account a slot
+    reads as no move here even where the watchdog's own seat count would say otherwise."""
+    from .account_blocks import blocked_account_ids, split_blocked
+    from .routes.channel_tests import _latest_tests_by_channel
+    rec = db.session.get(Recording, recording_id)
+    state = get_state(recording_id)
+    if rec is None or rec.group is None or state is None or rec.channel is None:
+        return None
+    current = rec.channel
+    members = [ch for ch in recording_members(rec.group.memberships)
+               if ch.id not in state.failed_member_ids]
+    blocked = blocked_account_ids({ch.account_id for ch in members} | {current.account_id},
+                                  pending=pending)
+    if current.account_id not in blocked:
+        return None
+    members, _ = split_blocked(members, blocked)
+    latest = _latest_tests_by_channel([ch.id for ch in members])
+    selection = format_eligible_members(rec.group, members, latest)
+    members, _ = _pin_eligible_members(selection.members, recording_format_pin(recording_id),
+                                       latest)
+    busy = _busy_channel_ids(recording_id)
+    busy_account = _busy_account_channel_ids(members, recording_id)
+    stay_put = {current.id} | {ch.id for ch in members if ch.account_id == current.account_id}
+    streak = load_config().get('channel_testing', {}).get(
+        'failing_streak_threshold', DEFAULT_FAILING_STREAK_THRESHOLD)
+    best = _pick_by_tiers(members, latest, stay_put, busy, busy_account, frozenset(), streak)
+    return {'to': best, 'held': best is not None and best.id in busy_account}
+
+
 def failover_group_member(app, recording_id: int, reason: str, demote: bool = False,
-                          score_departure: bool = True, block_move: bool = False) -> bool:
+                          score_departure: bool = True, block_move: bool = False,
+                          target_channel_id: Optional[int] = None) -> bool:
     """Switch a group-backed recording to its next-best untried member after its
     active feed died (failed restart / dead-stream trip / max consecutive
     failures - the watchdog's three give-up points). Returns True if switched -
@@ -2043,6 +2188,16 @@ def failover_group_member(app, recording_id: int, reason: str, demote: bool = Fa
     is never scored: nothing about the feed was wrong, and a block must not count against
     anything. Its account being blocked is what keeps it from being chosen again.
 
+    `target_channel_id` is the user's own pick - the recording page's Switch channel
+    (dev/changelog/1254). Like a block move the departing member is neither burned, demoted
+    nor scored; unlike every other path there is no ranking, because the choice was made.
+    The format filters are not applied either: a pick that differs from the recording's
+    format is the user overriding the lock on purpose, and the event says so rather than
+    refusing (the lock filters, it never refuses - dev/changelog/754). A target that is no
+    longer available by the time the watchdog acts - its feed died, its account was blocked
+    - is written on the recording as a DIAGNOSTICS event and the recording stays put. The
+    connection seat moves exactly as for every other cross-account move.
+
     Members on a blocked account are dropped on every path, before either format filter, the
     same way a member that already failed is. Unlike record start there is no fall back to
     them: a live recording with nowhere unblocked to go keeps the member it has.
@@ -2059,8 +2214,9 @@ def failover_group_member(app, recording_id: int, reason: str, demote: bool = Fa
         if state is None:
             return False
 
+        manual = target_channel_id is not None
         old_channel = rec.channel
-        if rec.channel_id is not None and not block_move:
+        if rec.channel_id is not None and not block_move and not manual:
             if demote:
                 state.demoted_member_ids.add(rec.channel_id)
             else:
@@ -2082,70 +2238,92 @@ def failover_group_member(app, recording_id: int, reason: str, demote: bool = Fa
             members, blocked_account_ids({ch.account_id for ch in members}))
         from .routes.channel_tests import _latest_tests_by_channel
         latest_by_channel = _latest_tests_by_channel([ch.id for ch in members])
-        # Same filter as record start, so a failover cannot land on a format the group
-        # would have refused to start on. When the lock leaves nothing, it hands back the
-        # unfiltered list rather than an empty one - a live capture is never abandoned to
-        # a format rule (15.2, principle 2).
-        selection = format_eligible_members(rec.group, members, latest_by_channel)
-        members = selection.members
-        # Then this run's own constraint: a recording does not change format mid-run
-        # (DECIDED 12). Independent of the lock - it holds even when the group manages no
-        # format - and applied after it, so the lock's survivors are what the pin ranks
-        # over rather than the other way round.
-        pin = recording_format_pin(recording_id)
-        members, pin_override = _pin_eligible_members(members, pin, latest_by_channel)
-        busy = _busy_channel_ids(recording_id)
-        # Prefer a member whose account can actually take the swap. The cross-account
-        # branch below refuses rather than exceeding the target's limit
-        # (dev/changelog/854), so without this the ranking sends the failover straight
-        # into that refusal while an idle account sits a row lower (dev/changelog/855).
-        # Applied after both format filters, so it cannot pre-empt their own
-        # zero-survivors overrides.
-        busy_account = _busy_account_channel_ids(members, recording_id)
-        # Preference tiers, best-first: the first that yields a member wins. The inner
-        # three are the long-standing busy cascade - prefer a member whose account has a
-        # free slot, then any free member, then knowingly take the best busy one rather
-        # than abort (busy-member skip rule; no handoff fires mid-recording, so both
-        # recordings share the feed's provider connection).
-        #
-        # A demote pass wraps a second round outside them: every tier is tried against the
-        # not-yet-demoted members first, and only then re-tried with the demoted ones
-        # allowed back in. That second round is what keeps a small group cycling instead
-        # of running dry - a three-member group goes A -> B -> C -> A - and it ranks by
-        # health score, which each demotion has just made more honest about this run.
-        demoted = state.demoted_member_ids if demote else frozenset()
-        # Excluded from every tier on the demote path: moving to the member we are already
-        # on is not a move. Nothing needs this off the demote path, where the current
-        # member is in failed_member_ids and `members` already dropped it.
-        #
-        # Excluded HERE and not before the format filters, which is the deliberate
-        # difference from the burn path: a stalling member is still a survivor of the lock
-        # and of the pin, so leaving it in is what stops it from being the sole survivor
-        # that a zero-survivors override would otherwise fire on. Staying put is the right
-        # answer to "only the member you are on matches the locked format" - the override
-        # exists to keep a dying recording alive, and this one is not dying.
-        stay_put = ({rec.channel_id} if ((demote or block_move) and rec.channel_id is not None)
-                    else frozenset())
-        if block_move and old_channel is not None:
-            # A partial block leaves the account some slots, so its other members survive
-            # the blocked-account drop above - but moving to one of them keeps the very
-            # connection the block asked back.
-            stay_put = set(stay_put) | {ch.id for ch in members
-                                        if ch.account_id == old_channel.account_id}
-        best = None
-        for preferred in ([demoted, frozenset()] if demoted else [frozenset()]):
-            base = stay_put | set(preferred)
-            for tier in (base | busy | busy_account, base | busy, base):
-                best = pick_best_member(members, latest_by_channel, exclude_ids=tier,
-                                        streak_threshold=streak_threshold)
-                if best is not None:
-                    break
-            if best is not None:
-                break
+        pin_mismatch = False
+        target_key = None
+        if manual:
+            # The user's pick. No ranking and no format filter - but the busy sets are
+            # still read, so the event can say what the pick cost, and the pin is read so
+            # a format change is named rather than discovered in the file.
+            best = next((ch for ch in members if ch.id == target_channel_id), None)
+            selection = None
+            pin = recording_format_pin(recording_id)
+            pin_override = False
+            demoted = frozenset()
+            busy = _busy_channel_ids(recording_id)
+            busy_account = _busy_account_channel_ids(members, recording_id)
+            if best is None:
+                target = db.session.get(Channel, target_channel_id)
+                target_name = target.name if target is not None else f'channel {target_channel_id}'
+                why = ('its feed already died during this recording'
+                       if target_channel_id in state.failed_member_ids else
+                       'its account is blocked for this recording'
+                       if target is not None and any(ch.account_id == target.account_id
+                                                     for ch in skipped_blocked) else
+                       'it is no longer a member this group records from')
+                log.warning('Recording %d: not switching to "%s" - %s', recording_id,
+                            target_name, why)
+
+                @retry_on_locked()
+                def _log_switch_refused_and_commit():
+                    add_recording_event(
+                        recording_id, DIAGNOSTICS,
+                        detail=(f'Not switched to "{target_name}": {why}. The recording stays '
+                                f'on "{old_channel.name if old_channel else "?"}".'),
+                        extra={'kind': 'switch_refused', 'group_id': rec.group_id,
+                               'to_channel_id': target_channel_id})
+                    db.session.commit()
+
+                _log_switch_refused_and_commit()
+                return False
+            target_key = format_key(latest_by_channel.get(best.id))
+            pin_mismatch = pin is not None and target_key is not None and target_key != pin
+        else:
+            # Same filter as record start, so a failover cannot land on a format the group
+            # would have refused to start on. When the lock leaves nothing, it hands back the
+            # unfiltered list rather than an empty one - a live capture is never abandoned to
+            # a format rule (15.2, principle 2).
+            selection = format_eligible_members(rec.group, members, latest_by_channel)
+            members = selection.members
+            # Then this run's own constraint: a recording does not change format mid-run
+            # (DECIDED 12). Independent of the lock - it holds even when the group manages no
+            # format - and applied after it, so the lock's survivors are what the pin ranks
+            # over rather than the other way round.
+            pin = recording_format_pin(recording_id)
+            members, pin_override = _pin_eligible_members(members, pin, latest_by_channel)
+            busy = _busy_channel_ids(recording_id)
+            # Prefer a member whose account can actually take the swap. The cross-account
+            # branch below refuses rather than exceeding the target's limit
+            # (dev/changelog/854), so without this the ranking sends the failover straight
+            # into that refusal while an idle account sits a row lower (dev/changelog/855).
+            # Applied after both format filters, so it cannot pre-empt their own
+            # zero-survivors overrides.
+            busy_account = _busy_account_channel_ids(members, recording_id)
+            demoted = state.demoted_member_ids if demote else frozenset()
+            # Excluded from every tier on the demote path: moving to the member we are already
+            # on is not a move. Nothing needs this off the demote path, where the current
+            # member is in failed_member_ids and `members` already dropped it.
+            #
+            # Excluded HERE and not before the format filters, which is the deliberate
+            # difference from the burn path: a stalling member is still a survivor of the lock
+            # and of the pin, so leaving it in is what stops it from being the sole survivor
+            # that a zero-survivors override would otherwise fire on. Staying put is the right
+            # answer to "only the member you are on matches the locked format" - the override
+            # exists to keep a dying recording alive, and this one is not dying.
+            stay_put = ({rec.channel_id} if ((demote or block_move) and rec.channel_id is not None)
+                        else frozenset())
+            if block_move and old_channel is not None:
+                # A partial block leaves the account some slots, so its other members survive
+                # the blocked-account drop above - but moving to one of them keeps the very
+                # connection the block asked back.
+                stay_put = set(stay_put) | {ch.id for ch in members
+                                            if ch.account_id == old_channel.account_id}
+            best = _pick_by_tiers(members, latest_by_channel, stay_put, busy, busy_account,
+                                  demoted, streak_threshold)
         took_busy = best is not None and best.id in busy
         took_busy_account = best is not None and best.id in busy_account
         took_demoted = best is not None and best.id in demoted
         if best is None:
+            # Never reached on a manual move: its pick was resolved above.
             if block_move:
                 log.info('Recording %d: group "%s" has no member off a blocked account (%s) - '
                          'staying on the current member', recording_id, rec.group.name, reason)
@@ -2231,7 +2409,7 @@ def failover_group_member(app, recording_id: int, reason: str, demote: bool = Fa
             busy_note += (' - rolled over to a free account, past: '
                           + ', '.join(f'"{ch.name}"' for ch in skipped_busy_account))
         override_note = ''
-        if selection.override:
+        if selection is not None and selection.override:
             override_note = (f' - no member matches the locked format '
                              f'{format_label(selection.reference)}, so the lock was '
                              f'overridden to keep the recording going')
@@ -2242,11 +2420,23 @@ def failover_group_member(app, recording_id: int, reason: str, demote: bool = Fa
         if took_demoted:
             override_note += (' - every other member has already been moved off during '
                               'this recording, so this is the best of them')
-        if skipped_blocked and not block_move:
+        if skipped_blocked and not block_move and not manual:
             override_note += (' - skipped member(s) on a blocked account: '
                               + ', '.join(f'"{ch.name}" ({ch.account.name})'
                                           for ch in skipped_blocked))
-        if block_move:
+        if manual:
+            if pin_mismatch:
+                override_note += (f' - "{best.name}" records at {format_label(target_key)} and '
+                                  f'this recording is at {format_label(pin)}, so the file '
+                                  f'changes format here rather than refusing your pick')
+            elif target_key is None:
+                override_note += (f' - "{best.name}" has never been tested, so its format is '
+                                  f'unknown until this segment is probed')
+            detail = (f'Group "{rec.group.name}": you asked to move from "{old_name}" to '
+                      f'"{best.name}" ({best.account.name}, score {effective_score(best)}). '
+                      f'Nothing was wrong with "{old_name}"; it is not scored for the move'
+                      f'{busy_note}{override_note}')
+        elif block_move:
             detail = (f'Group "{rec.group.name}": {reason} - moving from "{old_name}" to '
                       f'"{best.name}" ({best.account.name}, score {effective_score(best)}). '
                       f'Nothing was wrong with "{old_name}"; it is not scored for the move'
@@ -2288,6 +2478,11 @@ def failover_group_member(app, recording_id: int, reason: str, demote: bool = Fa
                        'demoted': demote,
                        'took_demoted': took_demoted,
                        'block_move': block_move,
+                       # True = the user picked this member (Switch channel); from_channel_id
+                       # is neither burned nor demoted, and the format filters were the
+                       # user's to override - format_mismatch says whether they were.
+                       'manual': manual,
+                       'format_mismatch': pin_mismatch,
                        'skipped_blocked_channel_ids': [ch.id for ch in skipped_blocked],
                        # Cumulative counters through the just-abandoned member - lets the
                        # terminal observation score the final member from only its own share
@@ -2307,7 +2502,7 @@ def failover_group_member(app, recording_id: int, reason: str, demote: bool = Fa
         # for that member, independent of the recording's own terminal observation.
         # A demoted member did NOT die, so it is scored on what it actually measured
         # instead of the fail floor (see apply_stall_demotion_health_observation).
-        if old_channel is not None and score_departure and not block_move:
+        if old_channel is not None and score_departure and not block_move and not manual:
             if demote:
                 from .health_score import apply_stall_demotion_health_observation
                 apply_stall_demotion_health_observation(
@@ -2323,6 +2518,7 @@ def failover_group_member(app, recording_id: int, reason: str, demote: bool = Fa
             'to_channel': best.name,
             'reason': reason,
             'demoted': demote,
+            'manual': manual,
         })
         return True
 

@@ -113,29 +113,51 @@ def _trigger_description(job) -> str:
 
 # Job kinds this page has run-history for (dev/changelog/592) - hc_window_dispatch/
 # hc_window_close are deliberately excluded, matching the approved dev/mockups/29 rail
-# contract, which doesn't track them either.
+# contract, which doesn't track them either. Account syncs and health checks are tracked
+# too, under their own families (see _history_key).
 _DURATION_TRACKED_SYSTEM_JOBS = {
     'config_backup_daily', 'recording_retention_daily', 'db_maintenance_daily',
     'logo_cache_fetch', 'search_index_janitor', 'auto_rule_sweep',
 }
 
 
-def _job_duration_info(job_id: str, account_id: int = None):
-    """(avg_seconds, runs, duration_line) for a _build_job_list item - avg_seconds/runs
-    None/0 and duration_line None when this job kind has no run history tracked at all
-    (an untracked kind, distinct from a tracked kind with zero completed runs yet, which
-    returns a real "Expected runtime unknown" line via fmt_job_duration_line)."""
+def _history_key(row_id: str):
+    """The run history a row's runtime estimate is read from, or None for a job with none
+    tracked at all (distinct from a tracked job with zero completed runs yet, which still
+    gets a real "Expected runtime unknown" line). A retry runs its base job's body, so it
+    reads the base job's history - its own id never has any."""
+    m = re.match(r'^account_sync(?:_retry)?_(\d+)$', row_id)
+    if m:
+        return ('sync', int(m.group(1)))
+    m = re.match(r'^od_(?:job_(?:retry_)?|window_)(\d+)$', row_id)
+    if m:
+        return f'od_job_{m.group(1)}'
+    base = row_id[:-len('_retry')] if row_id.endswith('_retry') else row_id
+    return base if base in _DURATION_TRACKED_SYSTEM_JOBS else None
+
+
+def _apply_duration_estimates(items):
+    """Fill every row's est_seconds / runs / duration_line from two batched queries, and
+    stretch a row with an estimate to its expected end so the overlap check below sees the
+    run's length rather than its start alone."""
+    from ..accounts import get_sync_duration_estimates
+    from ..database import get_job_duration_estimates
     from ..fmt_utils import fmt_job_duration_line
 
-    if account_id is not None:
-        from ..accounts import get_sync_duration_estimate
-        avg_seconds, runs = get_sync_duration_estimate(account_id)
-    elif job_id in _DURATION_TRACKED_SYSTEM_JOBS:
-        from ..database import get_job_duration_estimate
-        avg_seconds, runs = get_job_duration_estimate(job_id)
-    else:
-        return None, 0, None
-    return avg_seconds, runs, fmt_job_duration_line(avg_seconds, runs)
+    keyed = [(item, _history_key(item['id'])) for item in items]
+    keys = {key for _item, key in keyed if key is not None}
+    estimates = {('sync', aid): est for aid, est in get_sync_duration_estimates(
+        {k[1] for k in keys if isinstance(k, tuple)}).items()}
+    estimates.update(get_job_duration_estimates({k for k in keys if isinstance(k, str)}))
+    for item, key in keyed:
+        if key is None:
+            item['est_seconds'], item['runs'] = None, 0
+            continue
+        avg_seconds, runs = estimates.get(key, (None, 0))
+        item['est_seconds'], item['runs'] = avg_seconds, runs
+        item['duration_line'] = fmt_job_duration_line(avg_seconds, runs)
+        if avg_seconds:
+            item['_end_utc'] = item['_start_utc'] + timedelta(seconds=avg_seconds)
 
 
 _OVERLAP_WARN_SECONDS = 300  # 5 minutes
@@ -155,6 +177,28 @@ def _interval_gap_seconds(a_start, a_end, b_start, b_end) -> float:
     return (a_start - b_end).total_seconds()
 
 
+def _recording_guard(what: str, section: dict, active_key: str, within_key: str,
+                     within_default: int, active_applies: bool = True):
+    """What the scheduler does with this job when a recording is near it at fire time, as
+    data the dashboard's timeline can mark it from (DESIGN.md 16.4). Read from the same
+    config keys the guards themselves read, never retyped: `active` = deferred while any
+    recording is capturing, `within_minutes` = deferred when one starts that soon (0 = off)."""
+    return {
+        'what': what,
+        'active': bool(active_applies and section.get(active_key, True)),
+        'within_minutes': int(section.get(within_key, within_default) or 0),
+    }
+
+
+def _check_guard(ct_cfg: dict, od) -> dict:
+    """A health check's recording guard (channel_tester.run_on_demand_test_job): the
+    starts-soon one applies to every scheduled run, the capturing one to the automatic
+    TV Guide Channels check only."""
+    return _recording_guard('health check', ct_cfg, 'skip_if_recording_active',
+                            'skip_if_recording_within_minutes', 10,
+                            active_applies=bool(od is not None and od.is_system))
+
+
 def _build_job_list():
     """Return a list of job dicts for the jobs page/API."""
     from ..scheduler import get_scheduler
@@ -168,8 +212,17 @@ def _build_job_list():
     if scheduler is None:
         return []
 
+    from ..config import load_config
+
     raw_jobs = scheduler.get_jobs()
     now = datetime.utcnow()
+    # One load_config() for the whole list - the guards, the window checks and the
+    # post-script tail all read it.
+    cfg = load_config()
+    ct_cfg = cfg.get('channel_testing', {})
+    sync_guard = _recording_guard('sync', cfg.get('sync', {}),
+                                  'skip_sync_if_recording_active',
+                                  'skip_sync_if_recording_within_minutes', 5)
 
     # Separate recording start/stop jobs from others
     start_ids: dict[int, object] = {}  # recording_id → job
@@ -365,6 +418,7 @@ def _build_job_list():
                                      else _trigger_description(job) if is_recurring else None),
             'edit_url': _check_group_url(od),
             'overlap': 'green',
+            'recording_guard': _check_guard(ct_cfg, od),
         }
         if is_retry:
             # No Run Now and no Skip: this row is already the deferral of a run that could not
@@ -381,13 +435,9 @@ def _build_job_list():
     # Recurring maintenance-window checks (recur_use_window=True) have no APScheduler job
     # at all - hc_window_dispatch owns starting them (app/check_window.py) - so they never
     # match the od_job_<id> regex above and would otherwise vanish from this page entirely.
-    from ..config import load_config
     from ..scheduler import next_on_demand_run_for_job
     from .channel_tests import _recur_label
 
-    # One load_config() for the whole list - the post-script tail below reads `cfg` too.
-    cfg = load_config()
-    ct_cfg = cfg.get('channel_testing', {})
     # recur_paused=False matches the exact-time branch above: pausing a schedule calls
     # cancel_on_demand_job_schedule(), which removes the APScheduler row and so drops it
     # off this page too - a paused window job (no row to begin with) gets the same result
@@ -415,6 +465,7 @@ def _build_job_list():
             'edit_url': _check_group_url(od),
             'skip_url': f'/api/channel-tests/on-demand/{od.id}/skip-next',
             'overlap': 'green',
+            'recording_guard': _check_guard(ct_cfg, od),
         })
 
     # Known recurring jobs (non-sync)
@@ -481,10 +532,9 @@ def _build_job_list():
             account_name = account.name if account else f'Account {account_id}'
             td = getattr(job.trigger, 'interval', None)
             hours = int(td.total_seconds() / 3600) if td else '?'
-            avg_seconds, runs, duration_line = _job_duration_info(job.id, account_id=account_id)
             items.append({
                 '_start_utc': next_run_utc,
-                '_end_utc': next_run_utc + timedelta(seconds=avg_seconds) if avg_seconds else next_run_utc,
+                '_end_utc': next_run_utc,
                 '_next_run_utc': next_run_utc,
                 'id': job.id,
                 'display_name': f'Sync: {account_name}',
@@ -498,8 +548,7 @@ def _build_job_list():
                 'run_url': f'/api/jobs/{job.id}/run-now',
                 'skip_url': f'/api/jobs/{job.id}/skip-next',
                 'overlap': 'green',
-                'runs': runs,
-                'duration_line': duration_line,
+                'recording_guard': sync_guard,
             })
             continue
 
@@ -513,10 +562,9 @@ def _build_job_list():
             src_name = src.name if src else f'EPG source {source_id}'
             td = getattr(job.trigger, 'interval', None)
             hours = int(td.total_seconds() / 3600) if td else '?'
-            avg_seconds, runs, duration_line = _job_duration_info(job.id)
             items.append({
                 '_start_utc': next_run_utc,
-                '_end_utc': next_run_utc + timedelta(seconds=avg_seconds) if avg_seconds else next_run_utc,
+                '_end_utc': next_run_utc,
                 '_next_run_utc': next_run_utc,
                 'id': job.id,
                 'display_name': (f'EPG refresh retry: {src_name}' if is_retry
@@ -533,8 +581,6 @@ def _build_job_list():
                 'run_url': None if is_retry else f'/api/jobs/{job.id}/run-now',
                 'skip_url': None,
                 'overlap': 'green',
-                'runs': runs,
-                'duration_line': duration_line,
             })
             continue
 
@@ -546,13 +592,13 @@ def _build_job_list():
             account_id = int(m.group(1))
             account = accounts.get(account_id)
             account_name = account.name if account else f'Account {account_id}'
-            avg_seconds, runs, duration_line = _job_duration_info(job.id, account_id=account_id)
             items.append({
                 '_start_utc': next_run_utc,
-                '_end_utc': next_run_utc + timedelta(seconds=avg_seconds) if avg_seconds else next_run_utc,
+                '_end_utc': next_run_utc,
                 '_next_run_utc': next_run_utc,
                 'id': job.id,
                 'display_name': f'Sync retry: {account_name}',
+                'recording_guard': sync_guard,
                 'type': 'one_off',
                 'next_run_utc': next_run_utc.isoformat(),
                 'next_run_et': _fmt_et(next_run_utc),
@@ -564,8 +610,6 @@ def _build_job_list():
                 'run_url': None,
                 'skip_url': None,
                 'overlap': 'green',
-                'runs': runs,
-                'duration_line': duration_line,
             })
             continue
 
@@ -575,10 +619,9 @@ def _build_job_list():
         # rather than as an unexplained raw job id.
         if job.id.endswith('_retry') and job.id[:-len('_retry')] in _RECURRING_META:
             base_name, edit_url = _RECURRING_META[job.id[:-len('_retry')]]
-            avg_seconds, runs, duration_line = _job_duration_info(job.id)
             items.append({
                 '_start_utc': next_run_utc,
-                '_end_utc': next_run_utc + timedelta(seconds=avg_seconds) if avg_seconds else next_run_utc,
+                '_end_utc': next_run_utc,
                 '_next_run_utc': next_run_utc,
                 'id': job.id,
                 'display_name': f'{base_name} retry',
@@ -592,8 +635,6 @@ def _build_job_list():
                 'run_url': None,
                 'skip_url': None,
                 'overlap': 'green',
-                'runs': runs,
-                'duration_line': duration_line,
             })
             continue
 
@@ -618,10 +659,9 @@ def _build_job_list():
                 'overlap': 'green',
             })
             continue
-        avg_seconds, runs, duration_line = _job_duration_info(job.id)
         item = {
             '_start_utc': next_run_utc,
-            '_end_utc': next_run_utc + timedelta(seconds=avg_seconds) if avg_seconds else next_run_utc,
+            '_end_utc': next_run_utc,
             '_next_run_utc': next_run_utc,
             'id': job.id,
             'display_name': display_name,
@@ -634,8 +674,6 @@ def _build_job_list():
             'edit_url': edit_url,
             'skip_url': f'/api/jobs/{job.id}/skip-next',
             'overlap': 'green',
-            'runs': runs,
-            'duration_line': duration_line,
         }
         if job.id in run_now_supported:
             item['run_url'] = f'/api/jobs/{job.id}/run-now'
@@ -643,6 +681,8 @@ def _build_job_list():
             item['run_disabled_reason'] = _RUN_NOW_REASONS.get(
                 job.id, f'Running "{display_name}" on demand is not supported yet.')
         items.append(item)
+
+    _apply_duration_estimates(items)
 
     # Sort by _next_run_utc
     items.sort(key=lambda x: x['_next_run_utc'])
@@ -813,7 +853,8 @@ def run_job_now(job_id):
         refusal = run_system_job_now(job_id)
         if refusal is not None:
             return jsonify({'error': f'Not started: {refusal.reason}'}), 409
-        return jsonify({'success': True, 'message': 'Started'})
+        # No message: the page names the job itself ("Storage Folder Check started.").
+        return jsonify({'success': True})
 
     if job_id == 'config_backup_daily':
         from ..config_backup import do_backup

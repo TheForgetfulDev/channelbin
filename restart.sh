@@ -34,7 +34,13 @@ DVR_OUTPUT_DIR="$(cd "$SCRIPT_DIR" && python3 -c 'from app.config import load_co
 #
 # BUSY_TEXT is the human half of that output: check_busy.py's trailing `blocking-kinds:`
 # line is parsed below rather than shown, so it is stripped from everything printed.
-if pgrep -f "python.*run\.py" > /dev/null 2>&1; then
+#
+# APP_PATTERN names the app's own launch line ("python3 run.py", nothing between the
+# interpreter and the script) and nothing else: the older "python.*run\.py" also matched
+# "python3 dev/sim/run.py" and killed a full-stack simulator run mid-scenario
+# (dev/changelog/1252).
+APP_PATTERN='python[0-9.]* run\.py$'
+if pgrep -f "$APP_PATTERN" > /dev/null 2>&1; then
     BUSY_ROWS="$(cd "$SCRIPT_DIR" && python3 tools/check_busy.py)" && BUSY=0 || BUSY=1
     BUSY_TEXT="$(echo "$BUSY_ROWS" | grep -v '^blocking-kinds:' || true)"
     if [ "$FORCE" -eq 0 ] && [ "$BUSY" -eq 1 ]; then
@@ -69,18 +75,18 @@ fi
 # can take longer than 1s to shut down, and starting the new process while the old
 # one is still alive causes both to "resume" any in-progress recording, spawning
 # duplicate ffmpeg processes.
-if pgrep -f "python.*run\.py" > /dev/null 2>&1; then
+if pgrep -f "$APP_PATTERN" > /dev/null 2>&1; then
     echo "Stopping existing run.py..."
-    pkill -f "python.*run\.py"
+    pkill -f "$APP_PATTERN"
 
     for i in $(seq 1 30); do
-        pgrep -f "python.*run\.py" > /dev/null 2>&1 || break
+        pgrep -f "$APP_PATTERN" > /dev/null 2>&1 || break
         sleep 1
     done
 
-    if pgrep -f "python.*run\.py" > /dev/null 2>&1; then
+    if pgrep -f "$APP_PATTERN" > /dev/null 2>&1; then
         echo "Existing run.py did not exit after 30s, sending SIGKILL..."
-        pkill -9 -f "python.*run\.py"
+        pkill -9 -f "$APP_PATTERN"
         sleep 1
     fi
 fi

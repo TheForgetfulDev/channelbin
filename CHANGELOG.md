@@ -5,6 +5,34 @@ Notable changes to ChannelBin, newest first. This project follows
 release is tagged `v<version>` in git, and the version the app is running is shown in the
 page footer.
 
+## 0.28.0 - 2026-10-21
+
+Switch channel and Block accounts: a running group recording can now be steered from its own
+page.
+
+**Added**
+
+- A group recording shows a chip for the channel it is recording from, beside the group's
+  chip, on the recordings list, the dashboard and the recording's page. The recordings list
+  can be searched by that channel's name.
+- Switch channel moves a running group recording to another channel in the group. It lists
+  every channel the group records from with why each one can or cannot be picked, and asks
+  what to do with the channel it leaves.
+- Block accounts on a running group recording's page blocks the account it is recording on
+  and moves it off right away, saying before you save what the block will do to the
+  recording.
+
+**Fixed**
+
+- The dashboard timeline shows how long each job usually takes instead of calling every
+  runtime unknown.
+- The timeline marks a sync or health check that will wait for a recording, including one
+  booked to be capturing by the time the job is due.
+- Health checks keep a run history, so the Jobs page can estimate how long one takes and a
+  check moved out of a recording's way is pushed back by its own usual length.
+- Run now on a job shows what the server said, including when the job is waiting rather than
+  started.
+
 ## 0.27.1 - 2026-10-20
 
 A maintenance release that closes the security advisories GitHub reported against the test

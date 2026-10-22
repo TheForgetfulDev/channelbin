@@ -665,13 +665,8 @@ def _scaling_recording_id():
 
 def _seed_scheduled_recordings(n):
     """n SCHEDULED recordings, each with the start/stop APScheduler pair the real scheduler
-    creates - the Scheduled Jobs page's largest row family.
-
-    Deliberately NOT seeding accounts: `_job_duration_info()` runs one estimate query per
-    account sync job, which scales with account count rather than row count, and a real
-    install has a handful of accounts against potentially hundreds of scheduled recordings.
-    The recording rows are the ones that actually grow, and they are what this measures.
-    """
+    creates - the Scheduled Jobs page's largest row family. The sync and health check rows,
+    whose runtime estimates are read from run history, are _seed_scheduled_checks below."""
     base = datetime.utcnow() + timedelta(days=1)
     for i in range(n):
         seed.make_recording(status=REC_STATUS_SCHEDULED, name=f'sched_{i}',
@@ -690,6 +685,32 @@ class _FakeJob:
         self.id = job_id
         self.next_run_time = next_run_time
         self.trigger = types.SimpleNamespace()
+
+
+def _seed_scheduled_checks(n):
+    """n accounts and n groups with a scheduled health check, each with run history - the
+    rows whose runtime estimate _build_job_list() reads, in two batched queries rather than
+    one per row (dev/changelog/1258)."""
+    from app.database import JOB_RUN_SUCCESS, JobRun
+    base = datetime(2026, 1, 1)
+    for i in range(n):
+        acc = seed.make_account(name=f'acct_{i}')
+        db.session.add(AccountSyncLog(account_id=acc.id, started_at=base,
+                                      completed_at=base + timedelta(minutes=2),
+                                      status='SUCCESS'))
+        check = seed.make_test_job(name=f'check_{i}', status='SCHEDULED', recurring=True,
+                                   recur_day=0, recur_hour=2, recur_minute=0)
+        db.session.add(JobRun(job_id=f'od_job_{check.id}', started_at=base,
+                              finished_at=base + timedelta(minutes=9), outcome=JOB_RUN_SUCCESS))
+    db.session.commit()
+
+
+def _fake_scheduler_for_scheduled_checks():
+    when = datetime.utcnow() + timedelta(hours=1)
+    jobs = [_FakeJob(f'account_sync_{a.id}', when) for a in Account.query.all()]
+    jobs += [_FakeJob(f'od_job_{j.id}', when) for j in OnDemandTestJob.query.filter_by(
+        status='SCHEDULED').all()]
+    return types.SimpleNamespace(get_jobs=lambda: jobs)
 
 
 def _fake_scheduler_for_scheduled_recordings():
@@ -831,6 +852,15 @@ class PageScalingTests(unittest.TestCase):
             prepare=lambda: mock.patch.object(
                 scheduler_mod, 'get_scheduler',
                 return_value=_fake_scheduler_for_scheduled_recordings()))
+
+    def test_jobs_page_sync_and_check_rows(self):
+        """Each sync and health check row carries a runtime estimate from its run history;
+        reading it per row was one query per account and would have been one per check."""
+        self._assert_row_independent(
+            _seed_scheduled_checks, '/jobs',
+            prepare=lambda: mock.patch.object(
+                scheduler_mod, 'get_scheduler',
+                return_value=_fake_scheduler_for_scheduled_checks()))
 
     def test_accounts_list_page(self):
         self._assert_row_independent(_seed_accounts, '/accounts')

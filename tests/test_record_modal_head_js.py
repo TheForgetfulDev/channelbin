@@ -86,13 +86,11 @@ def _observe():
 
 @unittest.skipIf(shutil.which('node') is None, 'node not installed')
 @unittest.skipIf(not os.path.isdir(JSDOM), 'jsdom not installed (npm install)')
-class _Base(unittest.TestCase):
+class _Base:
     SCENARIO = ''
 
     @classmethod
     def setUpClass(cls):
-        if not cls.SCENARIO:
-            raise unittest.SkipTest('base class - carries no cases')
         cls.obs = _observe()[cls.SCENARIO]
         if isinstance(cls.obs, dict) and 'error' in cls.obs:
             raise AssertionError(f'{cls.SCENARIO} threw in the page:\n{cls.obs["error"]}')
@@ -101,7 +99,7 @@ class _Base(unittest.TestCase):
         self.assertEqual(self.obs['errors'], [])
 
 
-class FullProgramHeaderTests(_Base):
+class FullProgramHeaderTests(_Base, unittest.TestCase):
     """A real EPG program: everything the deleted sheet showed, in the modal."""
     SCENARIO = 'full_program'
 
@@ -151,7 +149,7 @@ class FullProgramHeaderTests(_Base):
                          '#modal-name-hint is what the header replaced')
 
 
-class BareProgramHeaderTests(_Base):
+class BareProgramHeaderTests(_Base, unittest.TestCase):
     """A program the provider gave nothing but a title and a time. Every absent field
     renders NOTHING rather than an empty element - an empty `.info-desc` is a blank gap
     the user cannot explain."""
@@ -170,7 +168,7 @@ class BareProgramHeaderTests(_Base):
         self.assertEqual(self.obs['labels'], ['When', 'Day', 'Channel'])
 
 
-class NoProgramHeaderTests(_Base):
+class NoProgramHeaderTests(_Base, unittest.TestCase):
     """The dashboard's and the recording detail page's "edit a scheduled recording"
     callers pass a recording, not a program - there is nothing to describe, and an empty
     box above the form is worse than no box."""
@@ -185,7 +183,7 @@ class NoProgramHeaderTests(_Base):
         self.assertEqual(self.obs['html'], '')
 
 
-class DummySlotHeaderTests(_Base):
+class DummySlotHeaderTests(_Base, unittest.TestCase):
     """A filler slot on a channel with no EPG data. Scheduling off it is allowed - that
     is how you record a channel the provider publishes no listings for - but there is no
     program to describe."""
@@ -196,7 +194,7 @@ class DummySlotHeaderTests(_Base):
         self.assertFalse(self.obs['headVisible'])
 
 
-class MobileProgramTests(_Base):
+class MobileProgramTests(_Base, unittest.TestCase):
     """Phone width goes straight to the record modal, like desktop - the program sheet
     that used to stand in front of it is gone, and the details it carried are here."""
     SCENARIO = 'mobile_program'
@@ -215,7 +213,7 @@ class MobileProgramTests(_Base):
         self.assertEqual(self.obs['desc'], LONG_DESC)
 
 
-class GroupNoteTests(_Base):
+class GroupNoteTests(_Base, unittest.TestCase):
     """The channel-group disclosure, shortened to one sentence (dev/changelog/1050) while
     still naming the member it would record from (dev/changelog/904)."""
     SCENARIO = 'group_note'

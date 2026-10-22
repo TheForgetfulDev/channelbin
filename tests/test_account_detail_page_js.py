@@ -120,13 +120,11 @@ def _observe():
 
 @unittest.skipIf(shutil.which('node') is None, 'node not installed')
 @unittest.skipIf(not os.path.isdir(JSDOM), 'jsdom not installed (npm install)')
-class _Base(unittest.TestCase):
+class _Base:
     SCENARIO = ''
 
     @classmethod
     def setUpClass(cls):
-        if not cls.SCENARIO:
-            raise unittest.SkipTest('base class - carries the shared cases only')
         cls.obs = _observe()[cls.SCENARIO]
         if isinstance(cls.obs, dict) and 'error' in cls.obs:
             raise AssertionError(f'{cls.SCENARIO} threw in the page:\n{cls.obs["error"]}')
@@ -135,7 +133,7 @@ class _Base(unittest.TestCase):
         self.assertEqual(self.obs['errors'], [])
 
 
-class PageAsItOpensTests(_Base):
+class PageAsItOpensTests(_Base, unittest.TestCase):
     SCENARIO = 'boot'
 
     def test_the_page_registers_its_hook_on_the_nav_status_poll(self):
@@ -159,7 +157,7 @@ class PageAsItOpensTests(_Base):
                          self.obs['warnings'])
 
 
-class SyncFinishesTests(_Base):
+class SyncFinishesTests(_Base, unittest.TestCase):
     """The reported defect itself: "Syncing now" and Cancel sync outlived the sync."""
     SCENARIO = 'finished'
 
@@ -207,7 +205,7 @@ class SyncFinishesTests(_Base):
         self.assertEqual(self.obs['pageFetchesAfterNextPoll'], 1)
 
 
-class FirstSyncTests(_Base):
+class FirstSyncTests(_Base, unittest.TestCase):
     """A page opened on a never-synced account: its history card holds the "No syncs yet"
     state, which is server-rendered, until the first run exists."""
     SCENARIO = 'first_sync'
@@ -229,7 +227,7 @@ class FirstSyncTests(_Base):
         self.assertIn('Sync finished', self.obs['after']['activity'])
 
 
-class OpenMenuTests(_Base):
+class OpenMenuTests(_Base, unittest.TestCase):
     SCENARIO = 'menu_open'
 
     def test_an_open_menu_holds_the_refresh_back(self):
@@ -243,7 +241,7 @@ class OpenMenuTests(_Base):
         self.assertIn('Synced', self.obs['afterClose']['barMsg'])
 
 
-class AgedRenderTests(_Base):
+class AgedRenderTests(_Base, unittest.TestCase):
     """"Synced 4m ago" and "Next sync in 23h 44m" drift while no sync changes anything."""
     SCENARIO = 'aged'
 
@@ -261,7 +259,7 @@ class AgedRenderTests(_Base):
         self.assertTrue(self.obs['sameHistRow'])
 
 
-class FailedRefreshTests(_Base):
+class FailedRefreshTests(_Base, unittest.TestCase):
     SCENARIO = 'failed_fetch'
 
     def test_a_failed_refresh_leaves_the_page_as_it_was_and_says_so(self):
@@ -277,7 +275,7 @@ class FailedRefreshTests(_Base):
         self.assertIn('Synced', self.obs['retried']['barMsg'])
 
 
-class ExpandedHistoryTests(_Base):
+class ExpandedHistoryTests(_Base, unittest.TestCase):
     """"All N syncs" is the user's choice and outlives a refresh."""
     SCENARIO = 'expanded'
 
@@ -302,7 +300,7 @@ class ExpandedHistoryTests(_Base):
         self.assertIn('All 12 syncs', self.obs['closed']['moreBtn'])
 
 
-class ActionRefreshTests(_Base):
+class ActionRefreshTests(_Base, unittest.TestCase):
     SCENARIO = 'action'
 
     def test_cancel_sync_refreshes_in_place_rather_than_reloading(self):

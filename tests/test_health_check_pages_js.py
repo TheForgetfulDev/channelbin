@@ -133,13 +133,11 @@ def _observe():
 
 @unittest.skipIf(shutil.which('node') is None, 'node not installed')
 @unittest.skipIf(not os.path.isdir(JSDOM), 'jsdom not installed (npm install)')
-class _Base(unittest.TestCase):
+class _Base:
     SCENARIO = ''
 
     @classmethod
     def setUpClass(cls):
-        if not cls.SCENARIO:
-            raise unittest.SkipTest('base class - carries the shared cases only')
         cls.obs = _observe()[cls.SCENARIO]
         if isinstance(cls.obs, dict) and 'error' in cls.obs:
             raise AssertionError(f'{cls.SCENARIO} threw in the page:\n{cls.obs["error"]}')
@@ -150,7 +148,7 @@ class _Base(unittest.TestCase):
 
 # ── Groups list ──────────────────────────────────────────────────────────
 
-class GroupsListAsItOpensTests(_Base):
+class GroupsListAsItOpensTests(_Base, unittest.TestCase):
     SCENARIO = 'groups_boot'
 
     def test_the_list_registers_its_hook_on_the_nav_status_poll(self):
@@ -166,7 +164,7 @@ class GroupsListAsItOpensTests(_Base):
         self.assertEqual(self.obs['running'], 1)
 
 
-class GroupsListRunFinishesTests(_Base):
+class GroupsListRunFinishesTests(_Base, unittest.TestCase):
     """The reported defect: a finished check kept reading Running, and the members kept
     their load-time verdicts."""
     SCENARIO = 'groups_finished'
@@ -204,7 +202,7 @@ class GroupsListRunFinishesTests(_Base):
         self.assertTrue(self.obs['collapsesAfterSwap'])
 
 
-class GroupsListMenuOpenTests(_Base):
+class GroupsListMenuOpenTests(_Base, unittest.TestCase):
     """Swapping a row out from under an open kebab would close it mid-choice."""
     SCENARIO = 'groups_menu_open'
 
@@ -216,7 +214,7 @@ class GroupsListMenuOpenTests(_Base):
 
 # ── Channel page ─────────────────────────────────────────────────────────
 
-class ChannelPageAsItOpensTests(_Base):
+class ChannelPageAsItOpensTests(_Base, unittest.TestCase):
     SCENARIO = 'channel_boot'
 
     def test_the_page_registers_its_hook_on_the_nav_status_poll(self):
@@ -233,7 +231,7 @@ class ChannelPageAsItOpensTests(_Base):
         self.assertIs(self.obs['testerBusy'], True)
 
 
-class ChannelPageRunFinishesTests(_Base):
+class ChannelPageRunFinishesTests(_Base, unittest.TestCase):
     """The reported defect: a check started elsewhere left "Testing now", the score and the
     history in place until a reload."""
     SCENARIO = 'channel_finished'
@@ -271,7 +269,7 @@ class ChannelPageRunFinishesTests(_Base):
         self.assertTrue(self.obs['stickyEnabled'])
 
 
-class ChannelPageTestNowTests(_Base):
+class ChannelPageTestNowTests(_Base, unittest.TestCase):
     """Test now no longer runs a reload poll of its own - the nav poll is the page's one
     updater for a result."""
     SCENARIO = 'channel_test_now'
@@ -284,16 +282,13 @@ class ChannelPageTestNowTests(_Base):
         self.assertTrue(self.obs['disabled'])
 
 
-class ChannelPageScreenshotTests(_Base):
+class ChannelPageScreenshotTests(_Base, unittest.TestCase):
     """Capture screenshot posts once, lands in the Health card through the same swap a
     test result uses, and opens the frame (dev/changelog/1160)."""
     SCENARIO = 'channel_screenshot'
 
     def test_the_page_ran_without_errors(self):
         self.assertEqual(self.obs['errors'], [])
-
-    def test_the_sticky_test_button_is_given_back(self):
-        self.skipTest('not this scenario')
 
     def test_it_is_offered_in_the_bar_and_the_kebab(self):
         self.assertTrue(self.obs['inKebab'])
@@ -311,7 +306,7 @@ class ChannelPageScreenshotTests(_Base):
         self.assertTrue(self.obs['enabledAfter'])
 
 
-class ChannelPageMenuOpenTests(_Base):
+class ChannelPageMenuOpenTests(_Base, unittest.TestCase):
     SCENARIO = 'channel_menu_open'
 
     def test_an_open_menu_holds_the_swap_until_it_closes(self):
@@ -320,7 +315,7 @@ class ChannelPageMenuOpenTests(_Base):
         self.assertEqual(self.obs['afterClose'], {'pageFetches': 1, 'bar': 'Healthy'})
 
 
-class ChannelPageAddToGroupWarnedTests(_Base):
+class ChannelPageAddToGroupWarnedTests(_Base, unittest.TestCase):
     """dev/docs/BUGS.md 2026-10-02 @ 08:42:25 AM - Add to channel group read the server's
     `{success: false, ...warnings}` answer as success: it closed and reloaded, and the channel
     had not been added."""

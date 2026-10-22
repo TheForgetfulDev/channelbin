@@ -86,12 +86,23 @@
     refresh();
   }
 
+  // The server's own sentence when it sent one: Run now on an EPG refresh that admission
+  // refused answers 200 with `refresh_started: false` and a message saying what it waits
+  // behind, and "started." over that would report a run that did not happen.
+  function startedMessage(res, name) {
+    const said = (res && res.message) || `${name} started`;
+    const msg = /[.!?]$/.test(said) ? said : `${said}.`;
+    return { msg, notStarted: Boolean(res && res.refresh_started === false) };
+  }
+
   function run(url, body, skipUrl, name) {
     jsonFetch(url, { method: 'POST', body })
-      .then(() => {
-        if (!skipUrl) { refreshAfter(`${name} started.`); return null; }
+      .then((res) => {
+        const { msg, notStarted } = startedMessage(res, name);
+        if (notStarted) { showToast(msg, { type: 'warning' }); stale = true; refresh(); return null; }
+        if (!skipUrl) { refreshAfter(msg); return null; }
         return jsonFetch(skipUrl, { method: 'POST' })
-          .then(() => refreshAfter(`${name} started, and its next scheduled run was skipped.`))
+          .then(() => refreshAfter(`${msg} Its next scheduled run was skipped.`))
           .catch((e) => showToast(
             `${name} started, but its next scheduled run could not be skipped: ${e.message}`,
             { type: 'warning' }));

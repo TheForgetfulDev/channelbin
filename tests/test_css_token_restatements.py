@@ -160,6 +160,23 @@ class SharedRecipeTests(unittest.TestCase):
         self.assertEqual(len(hits), 1, f'the focus recipe is written once, in style.css: {hits}')
         self.assertTrue(hits[0].startswith('static/css/style.css:'), hits)
 
+    def test_no_focus_rule_outside_the_recipe_sets_the_accent_border(self):
+        """The line scan above only sees the recipe spelled on one line. The search page's
+        two find boxes carried an eleventh copy with `outline: none` in their base rule and
+        a bare `:focus { border-color: var(--accent) }`, which it could not match
+        (dev/changelog/1261). This one reads rules, not lines."""
+        rule = re.compile(r'([^{}]+)\{([^{}]*)\}')
+        focus = re.compile(r':focus(?![-\w])')
+        hits = []
+        for path, text in _css_sources():
+            for m in rule.finditer(text):
+                selectors, body = m.group(1), m.group(2)
+                if focus.search(selectors) and re.search(r'border-color:\s*var\(--accent\)', body):
+                    line = text.count('\n', 0, m.start(2)) + 1
+                    hits.append(f'{_rel(path)}:{line}')
+        self.assertEqual(len(hits), 1, f'an input focus border is the recipe in style.css: {hits}')
+        self.assertTrue(hits[0].startswith('static/css/style.css:'), hits)
+
     def test_page_intros_use_the_class_not_an_inline_size(self):
         """Eleven pages had `<p class="text-muted" style="font-size:13px">` - the same recipe
         at a size that is not on the type scale. It is .page-intro now."""

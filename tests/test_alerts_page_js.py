@@ -103,13 +103,11 @@ def _observe():
 
 @unittest.skipIf(shutil.which('node') is None, 'node not installed')
 @unittest.skipIf(not os.path.isdir(JSDOM), 'jsdom not installed (npm install)')
-class _Base(unittest.TestCase):
+class _Base:
     SCENARIO = ''
 
     @classmethod
     def setUpClass(cls):
-        if not cls.SCENARIO:
-            raise unittest.SkipTest('base class - carries the shared cases only')
         cls.obs = _observe()[cls.SCENARIO]
         if isinstance(cls.obs, dict) and 'error' in cls.obs:
             raise AssertionError(f'{cls.SCENARIO} threw in the page:\n{cls.obs["error"]}')
@@ -118,7 +116,7 @@ class _Base(unittest.TestCase):
         self.assertEqual(self.obs['errors'], [])
 
 
-class PageAsItOpensTests(_Base):
+class PageAsItOpensTests(_Base, unittest.TestCase):
     SCENARIO = 'boot'
 
     def test_the_page_registers_its_hook_on_the_nav_status_poll(self):
@@ -134,7 +132,7 @@ class PageAsItOpensTests(_Base):
         self.assertEqual(self.obs['pageFetches'], 0)
 
 
-class NewAlertTests(_Base):
+class NewAlertTests(_Base, unittest.TestCase):
     """The gap the item closed: a new alert reached the nav counts and never the page."""
     SCENARIO = 'raised'
 
@@ -156,7 +154,7 @@ class NewAlertTests(_Base):
         self.assertEqual(self.obs['pageFetchesAfterNextPoll'], 1)
 
 
-class SelfClearedTests(_Base):
+class SelfClearedTests(_Base, unittest.TestCase):
     SCENARIO = 'cleared'
 
     def test_a_problem_that_cleared_itself_leaves_the_active_card(self):
@@ -164,7 +162,7 @@ class SelfClearedTests(_Base):
         self.assertEqual(self.obs['after'], ['past'])
 
 
-class EmptiedTests(_Base):
+class EmptiedTests(_Base, unittest.TestCase):
     SCENARIO = 'emptied'
 
     def test_the_empty_state_arrives_by_swap_not_by_reload(self):
@@ -174,7 +172,7 @@ class EmptiedTests(_Base):
         self.assertEqual(self.obs['pageFetches'], 1)
 
 
-class OpenMenuTests(_Base):
+class OpenMenuTests(_Base, unittest.TestCase):
     SCENARIO = 'menu_open'
 
     def test_an_open_menu_holds_the_refresh_back(self):
@@ -188,7 +186,7 @@ class OpenMenuTests(_Base):
         self.assertEqual(self.obs['afterClose']['past'], ['note', 'failed'])
 
 
-class OpenDetailsTests(_Base):
+class OpenDetailsTests(_Base, unittest.TestCase):
     """An open disclosure does not hold the page - one left open would freeze it - so the
     swap has to put it back open."""
     SCENARIO = 'details_open'
@@ -203,7 +201,7 @@ class OpenDetailsTests(_Base):
         self.assertEqual(self.obs['toggleLabel'], 'Hide details')
 
 
-class AgedRenderTests(_Base):
+class AgedRenderTests(_Base, unittest.TestCase):
     """"20m 3s ago" drifts while no alert changes."""
     SCENARIO = 'aged'
 
@@ -218,7 +216,7 @@ class AgedRenderTests(_Base):
         self.assertEqual(self.obs['rightAfter'], 1)
 
 
-class MarkReadTests(_Base):
+class MarkReadTests(_Base, unittest.TestCase):
     """One writer per region: an action asks for the server's copy of the cards rather than
     editing the row, so the row says what the server says."""
     SCENARIO = 'mark_read'
@@ -240,7 +238,7 @@ class MarkReadTests(_Base):
         self.assertTrue(self.obs['landed']['navCountFetched'])
 
 
-class FailedRefreshTests(_Base):
+class FailedRefreshTests(_Base, unittest.TestCase):
     SCENARIO = 'failed_fetch'
 
     def test_a_failed_refresh_leaves_the_page_and_says_so(self):

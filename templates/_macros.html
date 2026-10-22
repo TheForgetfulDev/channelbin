@@ -103,8 +103,8 @@
 {%- endmacro %}
 
 {# Channel pill (3.4/3.9): logo image or colored-initials fallback; navigates to url. #}
-{% macro channel_pill(label, url, logo_url=none, initials='?', acct_color=none) -%}
-<a class="ch-pill" href="{{ url }}">
+{% macro channel_pill(label, url, logo_url=none, initials='?', acct_color=none, tip=none) -%}
+<a class="ch-pill{% if tip %} tip-plain" data-tip="{{ tip }}{% endif %}" href="{{ url }}">
   {%- if logo_url %}<img class="ch-logo" src="{{ logo_url }}" alt="" loading="lazy">
   {%- else %}<span class="ch-logo" style="background: {{ acct_color or 'var(--bg3)' }}">{{ initials }}</span>{% endif %}
   {{- label -}}

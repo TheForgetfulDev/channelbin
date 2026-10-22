@@ -73,13 +73,11 @@ def _observe():
 
 @unittest.skipIf(shutil.which('node') is None, 'node not installed')
 @unittest.skipIf(not os.path.isdir(JSDOM), 'jsdom not installed (npm install)')
-class _Base(unittest.TestCase):
+class _Base:
     SCENARIO = ''
 
     @classmethod
     def setUpClass(cls):
-        if not cls.SCENARIO:
-            raise unittest.SkipTest('base class - carries the shared cases only')
         cls.obs = _observe()[cls.SCENARIO]
         if isinstance(cls.obs, dict) and 'error' in cls.obs:
             raise AssertionError(f'{cls.SCENARIO} threw in the page:\n{cls.obs["error"]}')
@@ -88,7 +86,7 @@ class _Base(unittest.TestCase):
         self.assertEqual(self.obs['errors'], [])
 
 
-class FastRestartTests(_Base):
+class FastRestartTests(_Base, unittest.TestCase):
     SCENARIO = 'fast'
 
     def test_a_changed_id_reloads_without_any_failed_poll(self):
@@ -97,7 +95,7 @@ class FastRestartTests(_Base):
         self.assertEqual(self.obs['status'], 'Back online - reloading...')
 
 
-class OldProcessStillAnsweringTests(_Base):
+class OldProcessStillAnsweringTests(_Base, unittest.TestCase):
     SCENARIO = 'same'
 
     def test_the_old_id_does_not_reload(self):
@@ -111,7 +109,7 @@ class OldProcessStillAnsweringTests(_Base):
         self.assertFalse(self.obs['reloadButton'])
 
 
-class SlowRestartTests(_Base):
+class SlowRestartTests(_Base, unittest.TestCase):
     SCENARIO = 'slow'
 
     def test_the_escape_hatch_appears_without_a_failed_poll(self):
@@ -119,14 +117,14 @@ class SlowRestartTests(_Base):
         self.assertEqual(self.obs['reloads'], 0)
 
 
-class FallbackWithoutAnIdTests(_Base):
+class FallbackWithoutAnIdTests(_Base, unittest.TestCase):
     SCENARIO = 'fallback'
 
     def test_a_good_poll_after_a_drop_reloads(self):
         self.assertEqual(self.obs['reloads'], 1)
 
 
-class FallbackNoDropTests(_Base):
+class FallbackNoDropTests(_Base, unittest.TestCase):
     SCENARIO = 'fallbackNoDrop'
 
     def test_good_polls_alone_do_not_reload_without_an_id(self):
@@ -134,7 +132,7 @@ class FallbackNoDropTests(_Base):
         self.assertEqual(self.obs['reloads'], 0)
 
 
-class ConfirmOutsideContainerTests(_Base):
+class ConfirmOutsideContainerTests(_Base, unittest.TestCase):
     SCENARIO = 'confirmBare'
 
     def test_no_restart_policy_warning(self):
@@ -142,7 +140,7 @@ class ConfirmOutsideContainerTests(_Base):
         self.assertNotIn('restart policy', self.obs['text'])
 
 
-class ConfirmInContainerTests(_Base):
+class ConfirmInContainerTests(_Base, unittest.TestCase):
     SCENARIO = 'confirmDocker'
 
     def test_the_restart_policy_requirement_is_stated(self):
@@ -154,7 +152,7 @@ class ConfirmInContainerTests(_Base):
 
 
 
-class ConfirmNamesParkedTests(_Base):
+class ConfirmNamesParkedTests(_Base, unittest.TestCase):
     SCENARIO = 'confirmParked'
 
     def test_the_parked_row_and_its_cost_are_named(self):
@@ -164,14 +162,14 @@ class ConfirmNamesParkedTests(_Base):
         self.assertTrue(self.obs['button'])
 
 
-class ConfirmNothingParkedTests(_Base):
+class ConfirmNothingParkedTests(_Base, unittest.TestCase):
     SCENARIO = 'confirmBare'
 
     def test_no_parked_section_when_nothing_is_parked(self):
         self.assertNotIn('Parked, waiting', self.obs['text'])
 
 
-class ConfirmParkedLookupFailedTests(_Base):
+class ConfirmParkedLookupFailedTests(_Base, unittest.TestCase):
     SCENARIO = 'confirmParkedLookupFailed'
 
     def test_the_confirm_still_opens_and_says_it_could_not_check(self):
@@ -179,7 +177,7 @@ class ConfirmParkedLookupFailedTests(_Base):
         self.assertIn('Could not check for parked conversions', self.obs['text'])
 
 
-class RefusalListsParkedApartTests(_Base):
+class RefusalListsParkedApartTests(_Base, unittest.TestCase):
     SCENARIO = 'refusedWithParked'
 
     def test_blocking_and_parked_are_separate_lists(self):
