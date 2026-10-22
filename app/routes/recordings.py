@@ -1075,10 +1075,14 @@ def _index_row(rec, now, tz, thumb_ids, live_seg_bytes=0, file_formats=None,
     if not rec.segments:
         health = {'cls': 'na', 'label': '-', 'tip': None}
     elif rec.status == REC_STATUS_FAILED:
+        # A failed recording is never joined, so what is on disk is its segments - and when
+        # every one was discarded there is nothing of the channel there at all.
+        kept = ('Segments kept on disk.' if data_segs
+                else 'Nothing of the channel was captured.')
         health = {'cls': 'bad', 'label': f'⚠ {stalls + (rec.consecutive_failures or 0)}',
                   'tip': (f'{len(rec.segments)} segments · {stalls} stalls · '
-                          f'{rec.consecutive_failures or 0} consecutive failed restarts. '
-                          f'Partial file kept on disk.{missing}{spanned}{format_tail}')}
+                          f'{fmt_utils.counted(rec.consecutive_failures or 0, "consecutive failed restart")}. '
+                          f'{kept}{missing}{spanned}{format_tail}')}
     elif stalls > 0:
         downtime = (f' {fmt_utils.fmt_duration(rec.total_downtime_seconds, with_seconds=True)} '
                     f'with nothing being written.') if rec.total_downtime_seconds else ''

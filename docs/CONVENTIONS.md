@@ -20,9 +20,8 @@ rather than a broken link.
 
 ## What gets cited
 
-- **CLAUDE.md and AGENTS.md** - the coding standards. Canonical homes for shared helpers, the rules
-  around database writes and subprocess handling, and the defect classes that keep coming back. The
-  same rules written twice, one copy for Claude and one for other AI tools.
+- **CLAUDE.md** - the coding standards. Canonical homes for shared helpers, the rules around
+  database writes and subprocess handling, and the defect classes that keep coming back.
 - **DESIGN.md and the DESIGN-*.md set** - the UI standard, plus one design record per subsystem:
   recording concurrency, channel search, secret handling, live vs. VOD classification, and so on.
 - **dev/docs/BUGS.md** - an append-only log of every defect I have fixed, each with its symptom,

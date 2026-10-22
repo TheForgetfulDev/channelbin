@@ -473,7 +473,9 @@
         {{ field_number('watchdog.early_fail_abort_window_seconds', 'Dead-stream: abort window (seconds)',
            'The consecutive early failures must occur within this time window to trigger the automatic abort.', wd.get('early_fail_abort_window_seconds', 180), tier='advanced') }}
         {{ field_number('watchdog.dead_stream_max_retry_attempts', 'Dead-stream: max retry attempts',
-           'Once the dead-stream abort above trips, retry at 1/2/5/15 minutes then hourly (fixed schedule) instead of giving up immediately, up to this many total attempts or until the recording\'s own scheduled window ends, whichever comes first. 0 disables retrying.', wd.get('dead_stream_max_retry_attempts', 10), tier='advanced') }}
+           'Once the dead-stream abort above trips, retry at 1, 2, 5 and 15 minutes then hourly instead of giving up immediately, never waiting longer than the cap below, up to this many total attempts. A retry that would come after the recording\'s window ends is not scheduled. 0 disables retrying.', wd.get('dead_stream_max_retry_attempts', 10), tier='advanced') }}
+        {{ field_number('watchdog.dead_stream_retry_max_delay_minutes', 'Dead-stream: longest wait between retries (minutes)',
+           'The retry schedule above never waits longer than this between attempts, so a channel that comes back mid-recording is found within this many minutes. Each attempt opens up to three short connections to the provider. Minimum 1.', wd.get('dead_stream_retry_max_delay_minutes', 10), tier='advanced') }}
       </div>
     {% endcall %}
 

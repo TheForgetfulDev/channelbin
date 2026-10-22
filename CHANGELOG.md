@@ -5,6 +5,31 @@ Notable changes to ChannelBin, newest first. This project follows
 release is tagged `v<version>` in git, and the version the app is running is shown in the
 page footer.
 
+## 0.29.0 - 2026-10-22
+
+Dead-stream retries come sooner.
+
+**Added**
+
+- A recording waiting on a dead stream raises an error alert, which clears by itself when the
+  stream comes back or the recording ends.
+- An advanced setting for the longest wait between dead-stream retries.
+
+**Changed**
+
+- Dead-stream retries wait at most 10 minutes between attempts by default, instead of stepping
+  up to an hour.
+- A retry that would come after the recording's window ends is no longer scheduled. The
+  recording ends there and keeps what it captured.
+
+**Fixed**
+
+- Retry events name what actually went wrong, instead of quoting an unrelated line of ffmpeg
+  output.
+- A discarded placeholder segment no longer claims the stream dropped and reconnected.
+- A failed or stopped recording that captured nothing shows its whole window as a capture gap.
+- A failed recording's tooltip says what is actually on disk.
+
 ## 0.28.0 - 2026-10-21
 
 Switch channel and Block accounts: a running group recording can now be steered from its own

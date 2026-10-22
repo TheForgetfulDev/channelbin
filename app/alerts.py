@@ -39,6 +39,11 @@ EXTERNAL_TOOL_MISSING = 'EXTERNAL_TOOL_MISSING'
 #: raises and dismisses it by type, one row per configured device (dev/changelog/1125).
 GPU_ENCODER_UNAVAILABLE = 'GPU_ENCODER_UNAVAILABLE'
 
+#: A recording is waiting on a dead stream (RETRYING) and capturing nothing. Named because
+#: app/watchdog.py raises it and clear_recording_retrying_alert() below dismisses it
+#: (dev/changelog/1264).
+RECORDING_RETRYING = 'RECORDING_RETRYING'
+
 #: The APScheduler loop thread exited, so nothing scheduled fires again until the app
 #: restarts. Named because app/scheduler.py raises it from the dying thread and dismisses
 #: it by type when the next start brings the loop back (dev/changelog/1114).
@@ -227,6 +232,13 @@ ALERT_TYPES = {
         'label': 'Recording Failed (Waited For A Connection Slot)', 'severity': 'ERROR'},
     'RECORDING_CHANNEL_FAILING': {
         'label': 'Scheduled Recording Channel Failing', 'severity': 'WARN', 'self_clearing': True},
+    # ERROR, unlike the pre-start warning above: this is content being lost right now, and
+    # the person may still have time to record it some other way. One row per outage,
+    # cleared when a segment captures past the dead-stream window again or the recording
+    # ends (dev/changelog/1264).
+    RECORDING_RETRYING: {
+        'label': 'Recording Not Capturing (Retrying A Dead Stream)', 'severity': 'ERROR',
+        'self_clearing': True},
     'SEARCH_INDEX_REBUILD_FAILED': {
         'label': 'Search Index Rebuild Failed', 'severity': 'ERROR', 'self_clearing': True},
     'CONVERSION_FAILED': {
@@ -508,6 +520,12 @@ def dismiss_open_alerts_for_recording(recording_id: int, alert_type: str = None)
             db.session.commit()
 
     _dismiss()
+
+
+def clear_recording_retrying_alert(recording_id: int):
+    """Dismiss a recording's RECORDING_RETRYING row: its stream is capturing again, or
+    the recording is ending and nothing more will be retried. A no-op when none stands."""
+    dismiss_open_alerts_for_recording(recording_id, RECORDING_RETRYING)
 
 
 def detach_recording_alerts(recording_id: int):

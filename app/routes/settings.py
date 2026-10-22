@@ -273,6 +273,8 @@ def api_settings_field():
     # so the UI stays live. (General settings validation is otherwise pre-existing-absent.)
     _numeric_clamps = {
         'recording.post_process.max_restart_attempts': (0, None),
+        # A wait cap of 0 would retry in a tight loop against a dead stream.
+        'watchdog.dead_stream_retry_max_delay_minutes': (1, None),
         # Floor of 1, not 0: this one is never a disable switch. A 0 would kill every
         # conversion on its first poll, before ffmpeg could possibly have muxed anything.
         'recording.post_process.pre_output_timeout_seconds': (1, None),

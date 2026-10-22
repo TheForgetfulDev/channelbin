@@ -19,7 +19,7 @@ from .account_links import (is_credential_refusal, is_resolution_failure,
 from .probe import parse_ffprobe
 from .proc_utils import (DeliveryRateMonitor, GrowthMonitor, VideoArrivalMonitor,
                          read_capture_content_position, read_capture_frame_count,
-                         terminate_or_kill, wait_for_file_data)
+                         stderr_cause, terminate_or_kill, wait_for_file_data)
 
 log = logging.getLogger(__name__)
 
@@ -36,18 +36,30 @@ _PROBE_MAX_ATTEMPTS = 3
 _BLOCK_CHECK_SECONDS = 15
 _BLOCK_STAY_RECHECK_SECONDS = 300
 
-# Dead-stream retry backoff (Product Principle 2), deliberately hardcoded (2026-08-12) - only
-# the total attempt cap (watchdog.dead_stream_max_retry_attempts) is configurable, not this
-# cadence.
+# Dead-stream retry backoff (Product Principle 2). The ladder is fixed (2026-08-12); what is
+# configurable is the attempt cap (watchdog.dead_stream_max_retry_attempts) and the longest
+# wait (watchdog.dead_stream_retry_max_delay_minutes, default 10), which the ladder never
+# exceeds. Uncapped, its hourly steps checked prod recording 26's channel twice in the last
+# two and a half hours of a live race (dev/changelog/1264).
 _DEAD_STREAM_RETRY_DELAYS_MINUTES = [1, 2, 5, 15]  # then 60 for every attempt after the 4th
 
+# What _schedule_dead_stream_retry() did, for the caller to act on.
+RETRY_SCHEDULED = 'scheduled'
+RETRY_PAST_WINDOW = 'past_window'   # attempts were left, but the next would come after stop
+RETRY_NONE = 'none'                 # out of attempts, retrying off, or the window is over
 
-def _dead_stream_retry_delay_minutes(attempt_number: int) -> int:
-    """1-indexed attempt number -> minutes to wait before that attempt fires."""
+
+def _dead_stream_retry_delay_minutes(attempt_number: int, max_delay_minutes=None) -> int:
+    """1-indexed attempt number -> minutes to wait before that attempt fires, never more
+    than max_delay_minutes when one is given."""
     idx = attempt_number - 1
     if idx < len(_DEAD_STREAM_RETRY_DELAYS_MINUTES):
-        return _DEAD_STREAM_RETRY_DELAYS_MINUTES[idx]
-    return 60
+        delay = _DEAD_STREAM_RETRY_DELAYS_MINUTES[idx]
+    else:
+        delay = 60
+    if max_delay_minutes:
+        delay = min(delay, max(1, int(max_delay_minutes)))
+    return delay
 
 
 def stalls_within_window(times, now_mono: float, window_seconds: float) -> list:
@@ -81,6 +93,40 @@ def decide_video_stop(restart_times, now_mono: float, window_seconds: float,
     # +1: stalls_within_window still counts a time exactly window_seconds old.
     retry_at = recent[len(recent) - budget] + window_seconds + 1 if budget > 0 else None
     return ('move' if is_group else 'stay'), recent, retry_at
+
+
+def raise_recording_retrying_alert(rec, streak, delay_minutes, max_delay_minutes, cause):
+    """Raise RECORDING_RETRYING the first time a recording starts waiting on a dead stream.
+
+    Once per outage, not per retry: a channel serving its placeholder trips again a minute
+    after every attempt, and a push each time would be the alert crying wolf. The row stands
+    until the stream is back or the recording ends (alerts.clear_recording_retrying_alert).
+    Nothing said so before: prod recording 26's pre-check warning was dismissed when it
+    started, and the next alert came when the window was over (dev/changelog/1264).
+    """
+    from .alerts import RECORDING_RETRYING, create_alert, has_open_alert
+    source = f'recording:{rec.id}:retrying'
+    if has_open_alert(RECORDING_RETRYING, source):
+        return
+    channel = f' "{rec.channel.name}"' if rec.channel_id and rec.channel else ''
+    left = max(1, round((rec.stop_time - datetime.utcnow()).total_seconds() / 60))
+    create_alert(
+        RECORDING_RETRYING,
+        f'Recording not capturing: {rec.name}',
+        body=(f'Recording "{rec.name}" (#{rec.id}) is not capturing anything: the '
+              f'channel{channel} failed on {streak} connections in a row'
+              + (f' ({cause})' if cause else '') +
+              f'. ChannelBin will retry in {delay_minutes} min, then no more than '
+              f'{max_delay_minutes} min apart, until the stream comes back or the window ends in '
+              f'{left} min. This clears by itself when either happens.'),
+        source=source,
+        recording_id=rec.id,
+    )
+
+
+#: The cause a dead-stream retry or give-up names when the segment that tripped it was the
+#: provider's placeholder clip.
+PLACEHOLDER_CAUSE = "the provider served its placeholder clip in place of the channel"
 
 
 class PlaceholderVerdict(NamedTuple):
@@ -160,13 +206,6 @@ def member_has_delivered(recording_id: int, channel_id: int, before_segment_numb
         RecordingSegment.bytes_recorded > 0,
         RecordingSegment.excluded_reason.is_(None),
     ).first() is not None
-
-
-def _first_line(tail: str) -> str:
-    """The first line of a (possibly multi-line, already credential-masked) stderr
-    tail - the single most specific thing ffmpeg said, for folding into a one-line
-    event/alert message. '' for an empty tail."""
-    return tail.split('\n', 1)[0] if tail else ''
 
 
 class WatchdogThresholds(NamedTuple):
@@ -350,6 +389,9 @@ class WatchdogThread(threading.Thread):
                 # format-pin event has to wait for the stall handling below to decide
                 # whether this segment is being kept - see where it is consumed.
                 deferred_format_pin = None
+                # Once per segment: a standing RECORDING_RETRYING row comes down when this
+                # segment proves the stream is back (below).
+                retry_alert_checked = False
 
                 # ── Inner poll loop: watch this segment ──────────────────────
                 while not self.state.stop_event.is_set():
@@ -443,6 +485,17 @@ class WatchdogThread(threading.Thread):
                                 self._check_format_pin(seg_id, seg_num)
 
                     stalled_for = monitor.update(current_size)
+
+                    # Still growing past the dead-stream window, so this segment can no
+                    # longer count as an early failure: the stream is back, and a standing
+                    # "not capturing" alert would now be false. A placeholder clip ends in
+                    # seconds and never gets this far (dev/changelog/1264).
+                    if (not retry_alert_checked and stalled_for == 0 and seg.started_at
+                            and (datetime.utcnow() - seg.started_at).total_seconds()
+                            > early_fail_window):
+                        retry_alert_checked = True
+                        from .alerts import clear_recording_retrying_alert
+                        clear_recording_retrying_alert(self.recording_id)
 
                     # Is the CONTENT advancing, or only the file? A provider re-serving the
                     # same few seconds writes bytes at full rate and keeps ffmpeg's frame
@@ -729,7 +782,8 @@ class WatchdogThread(threading.Thread):
                             seg.bytes_recorded = monitor.last_size
                             record_segment_diagnostics(self.recording_id, seg,
                                                        exit_code, stderr_tail, reconnects,
-                                                       spool_missing, jumps)
+                                                       spool_missing, jumps,
+                                                       placeholder=placeholder is not None)
                             if video_restart:
                                 # Not a stall, so none of the stall bookkeeping below: the
                                 # file never stopped growing, and a consecutive failure here
@@ -974,7 +1028,7 @@ class WatchdogThread(threading.Thread):
                                 self._give_up(lambda: self._fail_recording_fast_delivery(
                                     rec, member_fast_delivery_strikes, fast_delivery.ratio,
                                     fast_delivery.window_seconds,
-                                    cause=_first_line(stderr_tail)))
+                                    cause=stderr_cause(stderr_tail)))
                                 return
                             # Strikes left: fall through to the ordinary restart below and
                             # try this member again on a fresh connection - paced, when the
@@ -1010,15 +1064,40 @@ class WatchdogThread(threading.Thread):
                             # returns an empty tail on a second call - so the real cause has
                             # to be passed through explicitly rather than left for _give_up
                             # to (fail to) find on its own.
-                            cause = _first_line(stderr_tail)
-                            max_retry_attempts = cfg['watchdog']['dead_stream_max_retry_attempts']
-                            if self._schedule_dead_stream_retry(
-                                    rec, len(early_fail_times), early_fail_abort_window,
-                                    max_retry_attempts, cause):
+                            # A placeholder clip ends cleanly, so its stderr names no cause
+                            # worth quoting; what it was is the cause.
+                            cause = (PLACEHOLDER_CAUSE if placeholder is not None
+                                     else stderr_cause(stderr_tail))
+                            streak = len(early_fail_times)
+                            outcome = self._schedule_dead_stream_retry(
+                                rec, streak, early_fail_abort_window,
+                                cfg['watchdog']['dead_stream_max_retry_attempts'],
+                                cfg['watchdog']['dead_stream_retry_max_delay_minutes'], cause)
+                            if outcome == RETRY_SCHEDULED:
+                                return
+                            if outcome == RETRY_PAST_WINDOW:
+                                # Nothing more will be tried, so the capture ends now rather
+                                # than idling to its stop time. What it captured is joined,
+                                # as the stop job would have; with nothing at all it is the
+                                # dead stream it looks like (dev/changelog/1264).
+                                from .recorder import _capture_produced_data
+                                minutes_left = max(1, round(
+                                    (rec.stop_time - datetime.utcnow()).total_seconds() / 60))
+                                why = (f'{streak} consecutive early failures within '
+                                       f'{early_fail_abort_window}s - stream appears dead, and '
+                                       f'the window ends in {minutes_left} min, before another '
+                                       f'retry could come')
+                                if _capture_produced_data(self.recording_id):
+                                    self._end_capture_no_retry_left(
+                                        why + (f' - {cause}' if cause else ''))
+                                    return
+                                self._give_up(lambda: self._fail_recording_dead_stream(
+                                    rec, streak, early_fail_abort_window, cause=cause,
+                                    window_note=(f', and the window ends in {minutes_left} '
+                                                 f'min, before another retry could come')))
                                 return
                             self._give_up(lambda: self._fail_recording_dead_stream(
-                                rec, len(early_fail_times), early_fail_abort_window,
-                                cause=cause))
+                                rec, streak, early_fail_abort_window, cause=cause))
                             return
 
                         # Check failure limit before attempting restart
@@ -1033,7 +1112,7 @@ class WatchdogThread(threading.Thread):
                             # already-collected cause through rather than rely on _give_up's
                             # redundant (and by now empty) re-collection.
                             self._give_up(lambda: self._fail_recording(
-                                rec, max_failures, cause=_first_line(stderr_tail)))
+                                rec, max_failures, cause=stderr_cause(stderr_tail)))
                             return
 
                         # ── Stall-rate demotion (dev/changelog/889) ─────────────
@@ -1276,7 +1355,7 @@ class WatchdogThread(threading.Thread):
                                 tail = _close_active_segment(self.app, self.recording_id,
                                                              exit_reason='ERROR')
                                 self._give_up(lambda: self._fail_recording(
-                                    rec2, max_failures, cause=_first_line(tail)))
+                                    rec2, max_failures, cause=stderr_cause(tail)))
                                 return
                             # Hand the verdict to the next outer-loop pass rather than
                             # letting it start a fresh GrowthMonitor and spend another
@@ -1661,7 +1740,7 @@ class WatchdogThread(threading.Thread):
         exit_code, stderr_tail, reconnects, spool_missing, jumps = getattr(
             self, '_give_up_diagnostics', (None, '', (0, True), False, None))
         if cause is None:
-            cause = _first_line(stderr_tail)
+            cause = stderr_cause(stderr_tail)
         # Fold the reason ffmpeg actually gave into the terminal event's detail and the
         # alert body (built from log_msg by the _AlertHandler in app/__init__.py) - not
         # just the DIAGNOSTICS row one scroll away. Already credential-masked upstream by
@@ -1739,7 +1818,20 @@ class WatchdogThread(threading.Thread):
             connlim.release(rec.channel.account_id, 'recording', self.recording_id)
         return marked
 
-    def _fail_recording_dead_stream(self, rec, streak, window_seconds, cause=None):
+    def _end_capture_no_retry_left(self, why: str):
+        """End a capture whose stream died with no retry left inside its window, and join
+        what it captured - the same path the stop job takes, started now with the reason
+        named, rather than idling in RETRYING to the stop time. ffmpeg is already dead and
+        its segment closed; stop_recording() releases the slot and the live state."""
+        from .recorder import stop_recording
+        log.warning('Recording %d: %s - ending the capture and joining what was captured',
+                    self.recording_id, why)
+        stop_recording(self.app, self.recording_id, reason='DEAD_STREAM_NO_RETRY',
+                       join_reason=f'{why}. Ending the capture now and joining what was '
+                                   f'captured')
+
+    def _fail_recording_dead_stream(self, rec, streak, window_seconds, cause=None,
+                                    window_note=''):
         from .database import RECORDING_FAILED_DEAD_STREAM
         # dead_stream_retry_count > 0 means this recording already retried and died again -
         # say so, so the terminal event reads honestly as "gave up after trying" rather than
@@ -1755,7 +1847,8 @@ class WatchdogThread(threading.Thread):
                 'dead stream, aborting%s'
                 % (rec.name, self.recording_id, streak, window_seconds, retried_note)),
             detail=(f'Aborting: {streak} consecutive early failures within {window_seconds}s '
-                    f'- stream appears to reconnect but immediately dies{retried_note}'),
+                    f'- stream appears to reconnect but immediately dies{retried_note}'
+                    f'{window_note}'),
             sse_extra={
                 'early_fail_streak': streak,
                 'window_seconds': window_seconds,
@@ -1860,10 +1953,17 @@ class WatchdogThread(threading.Thread):
             connlim.release(rec.channel.account_id, 'recording', self.recording_id)
         return marked
 
-    def _schedule_dead_stream_retry(self, rec, streak, window_seconds, max_attempts, cause) -> bool:
+    def _schedule_dead_stream_retry(self, rec, streak, window_seconds, max_attempts,
+                                    max_delay_minutes, cause) -> str:
         """Instead of giving up on a dead-stream trip immediately, back off and try again
-        later (Product Principle 2) - unless the retry budget or the recording's own window
-        is already exhausted, in which case the caller falls through to the normal give-up.
+        later (Product Principle 2). Returns RETRY_SCHEDULED when it did; otherwise nothing
+        was written and the caller ends the capture - RETRY_PAST_WINDOW when attempts were
+        left but the next one would come at or after the stop time, RETRY_NONE when the
+        budget, the setting or the window itself leaves nothing to try.
+
+        A retry past the window is not scheduled (dev/changelog/1264): an attempt that can
+        never fire is no attempt, and announcing one promised the user a retry after the
+        recording had ended (dev/docs/BUGS.md 2026-10-21 10:45 PM).
 
         Deliberately does NOT go through _give_up(): that call is for a TERMINAL abandonment
         (it dings the channel's health score and persists a "final" thumbnail), and entering
@@ -1878,10 +1978,13 @@ class WatchdogThread(threading.Thread):
 
         now = datetime.utcnow()
         if max_attempts <= 0 or rec.dead_stream_retry_count >= max_attempts or rec.stop_time <= now:
-            return False
+            return RETRY_NONE
 
-        delay_minutes = _dead_stream_retry_delay_minutes(rec.dead_stream_retry_count + 1)
+        delay_minutes = _dead_stream_retry_delay_minutes(rec.dead_stream_retry_count + 1,
+                                                         max_delay_minutes)
         next_at = now + timedelta(minutes=delay_minutes)
+        if next_at >= rec.stop_time:
+            return RETRY_PAST_WINDOW
 
         @retry_on_locked()
         def _mark_retrying_and_commit():
@@ -1915,7 +2018,8 @@ class WatchdogThread(threading.Thread):
             'max_attempts': max_attempts,
             'next_retry_at': next_at.strftime('%Y-%m-%dT%H:%M:%S'),
         })
-        return True
+        raise_recording_retrying_alert(r, streak, delay_minutes, max_delay_minutes, cause)
+        return RETRY_SCHEDULED
 
     def _give_up(self, fail_fn):
         """Run a watchdog give-up: the terminal fail call, then the health-score
@@ -1937,6 +2041,8 @@ class WatchdogThread(threading.Thread):
         # is no subtracting it back out (dev/changelog/984).
         if not fail_fn():
             return
+        from .alerts import clear_recording_retrying_alert
+        clear_recording_retrying_alert(self.recording_id)
         from .health_score import apply_recording_health_observation
         apply_recording_health_observation(self.app, self.recording_id, 'failed')
         from .recorder import persist_final_thumbnail

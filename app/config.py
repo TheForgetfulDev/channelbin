@@ -346,6 +346,9 @@ _DEFAULTS = {
         # immediately, up to this many total attempts - whichever comes first against the
         # recording's own scheduled window. 0 = no retries, same as pre-retry behavior.
         'dead_stream_max_retry_attempts': 10,
+        # ...and no wait between attempts is ever longer than this. Hourly waits left prod
+        # recording 26 checked twice in its last two and a half hours (dev/changelog/1264).
+        'dead_stream_retry_max_delay_minutes': 10,
         # Stall-rate demotion: move a group-backed recording off a member that stalls this
         # many times inside a rolling window, even though every restart succeeds. The three
         # trip-wires above are all "the feed is dead" shaped and a feed that always comes

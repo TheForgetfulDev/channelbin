@@ -143,6 +143,8 @@ watchdog:
   # Once fast-fail trips, retry at 1/2/5/15 minutes then hourly, up to this many attempts
   # or until the recording's own scheduled window ends. 0 = give up immediately.
   dead_stream_max_retry_attempts: 10
+  # The longest wait between those retries, in minutes (at least 1).
+  dead_stream_retry_max_delay_minutes: 10
   # Stall-rate demotion. A group-backed recording moves to another member when the one it
   # is on stalls this many times inside the window, even though every restart succeeds -
   # the case none of the three trip-wires above catches. The member is demoted, not burned:

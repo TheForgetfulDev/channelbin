@@ -299,6 +299,39 @@ def read_stderr_tail(path, max_bytes: int = STDERR_TAIL_MAX_BYTES,
     return '\n'.join(lines)
 
 
+# A line in which ffmpeg says something went wrong. Words only, never an HTTP status number:
+# a stream line's audio bitrate ("448 kb/s") and a progress line's ("bitrate= 400.2kbits/s")
+# carry three-digit numbers too, and every status ffmpeg reports comes with words this
+# already matches ("Server returned 404 Not Found", "5XX Server Error").
+_CAUSE_LINE = re.compile(
+    r'error|fail|refused|denied|forbidden|not found|unauthori[sz]ed|timed out|invalid'
+    r'|prematurely|could not|cannot|unable|no such|end of file|broken pipe|reset by peer',
+    re.IGNORECASE)
+# Lines that can hold one of those words without being about a failure: the progress line,
+# and a metadata row ("title           : ..."), which carries the program's own name, and the
+# Input/Output header, which carries the output path built from it.
+_NOT_A_CAUSE_LINE = re.compile(r'^(?:frame=|size=|(?:Input|Output) #|\w+\s+: )')
+
+
+def stderr_cause(tail: str) -> str:
+    """The first line of a stderr tail in which ffmpeg says what went wrong, for folding
+    into a one-line event or alert as the cause; '' when no line does.
+
+    Not simply the tail's first line: the tail is the END of the spool, so on any capture
+    that ran for more than a few seconds its first line is wherever the cut fell - a stream
+    description, a mapping line, a progress line - and that is what eight dead-stream retries
+    of prod recording 26 and a fast-delivery abort of recording 2 quoted as their cause
+    (dev/docs/BUGS.md 2026-10-21 10:36 PM). The FIRST matching line rather than the last,
+    because ffmpeg names the specific failure before the generic one that ends the run:
+    "HTTP error 405 Method Not Allowed" before "Server returned 4XX Client Error", and
+    "error=Connection timed out" before "Error during demuxing: Input/output error".
+    """
+    for line in (tail or '').split('\n'):
+        if _CAUSE_LINE.search(line) and not _NOT_A_CAUSE_LINE.match(line):
+            return line
+    return ''
+
+
 # What ffmpeg's http protocol logs each time it drops a connection and opens a new one,
 # whatever the cause: '[http @ 0x..] Will reconnect at <byte offset> in <n> second(s),
 # error=Connection timed out.' - or 'error=End of file' when the provider served a finite
