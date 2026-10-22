@@ -234,21 +234,22 @@ label { display: block; font-size: var(--fs-md); font-weight: 600; margin-bottom
    this list instead of restating the recipe, which had been written eight times over
    before it was consolidated. The page-local contexts (Maintenance's .mrow,
    Notifications' .svc-body, Settings' .yaml-pane, Hide rules' .rule-form-row, the search
-   page's .wf-c) are named here rather than carrying copies in their pages; their own rules
-   keep only their differences. tests/test_css_token_restatements.py holds this to one
-   spelling of the focus rule. */
+   page's .wf-c and its find boxes .pop-search/.rsearch) are named here rather than
+   carrying copies in their pages; their own rules keep only their differences.
+   tests/test_css_token_restatements.py holds this to one spelling of the focus rule. */
 .form-control, .search, .tagcombo select, .cust-grid input, .fd-tpl,
 .fr-ctl input[type=text], .fr-ctl input[type=number], .fr-ctl input[type=time], .fr-ctl select, .fr-ctl textarea,
 .gd-field-ctl select, .gd-field-ctl input:where(:not([type=checkbox]):not([type=radio])), .gd-field-ctl textarea,
 .mrow select, .svc-body .secret-field input[type=text], .svc-body input[type=number], .yaml-pane textarea,
-.wf-c input, .wf-c select, .rule-form-row select, .rule-form-row input[type=text] {
+.wf-c input, .wf-c select, .rule-form-row select, .rule-form-row input[type=text], .pop-search, .rsearch {
   border: 1px solid var(--border); border-radius: var(--radius-sm); color: var(--text);
 }
 .form-control:focus, .search:focus, .tagcombo select:focus, .cust-grid input:focus, .fd-tpl:focus,
 .fr-ctl input:focus, .fr-ctl select:focus, .fr-ctl textarea:focus,
 .gd-field-ctl select:focus, .gd-field-ctl input:where(:not([type=checkbox]):not([type=radio])):focus, .gd-field-ctl textarea:focus,
 .mrow select:focus, .svc-body .secret-field input[type=text]:focus, .svc-body input[type=number]:focus, .yaml-pane textarea:focus,
-.wf-c input:focus, .wf-c select:focus, .rule-form-row select:focus, .rule-form-row input[type=text]:focus {
+.wf-c input:focus, .wf-c select:focus, .rule-form-row select:focus, .rule-form-row input[type=text]:focus,
+.pop-search:focus, .rsearch:focus {
   outline: none; border-color: var(--accent);
 }
 .form-control {
@@ -1617,6 +1618,25 @@ body.scroll-locked { position: fixed; left: 0; right: 0; width: 100%; overflow: 
 .check-row { display: flex; align-items: center; gap: 0.5rem; min-height: var(--ctl-h);
   font-size: var(--fs-md); }
 .check-row .form-control { width: auto; margin-left: auto; }
+/* The block picker's connection count reads as a sentence beside the account's name
+   ("Delta One  block [all 2 connections]"), not as a select parked at the right edge where
+   it read as the next row's (dev/changelog/1254). */
+.acct-block-pick .check-row .form-control { margin-left: 0; }
+.acct-block-slots { display: inline-flex; align-items: center; gap: 6px; color: var(--text-muted); font-size: var(--fs-sm); }
+
+/* The Switch channel dialog (static/js/recording-switch.js, dev/changelog/1254): one
+   .fp-radio per channel the group records from - its name, account pill and health chip
+   on the first line, why it can or cannot be picked on the second. */
+.sw-list { margin: 6px 0 14px; }
+.sw-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.sw-row .sw-name { font-weight: 600; }
+.sw-row .ch-pill { pointer-events: none; }
+.fp-radio.sw-off { color: var(--text-muted); }
+.fp-radio.sw-off .sw-name { font-weight: 500; }
+.sw-why { display: block; margin: 2px 0 0 20px; font-size: var(--fs-sm); color: var(--text-muted); }
+.sw-why.warn { color: var(--warn); }
+.sw-q { margin: 14px 0 4px; font-weight: 600; }
+.sw-from { color: var(--text-muted); margin: 0 0 8px; }
 
 /* ── Groups tab (DESIGN.md §14) - sectioned channel-group / health-check list ──
    Prefixed `grp-` throughout: `.group-members-table`/`.group-member-row`/etc. are

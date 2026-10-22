@@ -803,6 +803,7 @@ def run_on_demand_test_job(app, job_id: int, channel_id_subset: Optional[List[in
     wait_sec = 180
     completed = False
     skipped = False
+    loop_started = None
 
     try:
         # ── Phase 1: load data, set RUNNING (short-lived context) ─────────────
@@ -884,6 +885,7 @@ def run_on_demand_test_job(app, job_id: int, channel_id_subset: Optional[List[in
             # ── Phase 2: run tests - no outer app context ──────────────────────
             # run_channel_test() opens its own short-lived context per channel,
             # so there are no nested/concurrent sessions to cause lock conflicts.
+            loop_started = datetime.utcnow()
             completed = _run_channel_loop(app, channels, wait_sec, job_id=job_id,
                                           test_duration_sec=test_duration_sec)
 
@@ -901,7 +903,26 @@ def run_on_demand_test_job(app, job_id: int, channel_id_subset: Optional[List[in
         # half-updated state the run created.
         if not skipped and channels:
             _settle_group_formats(app, [ch.id for ch in channels])
+        if loop_started is not None and channel_id_subset is None:
+            _record_check_run(app, job_id, loop_started, completed)
         _end_run()
+
+
+def _record_check_run(app, job_id: int, started: datetime, completed: bool):
+    """One run of the whole check into its job's run history (`od_job_<id>`, the id its
+    APScheduler entry has), which the deferral past a recording sizes its gap from and /jobs
+    and the Dashboard timeline read their runtime estimate off (dev/changelog/592, 941). A
+    resumed or restarted run covers only part of the group, so it is never recorded - its
+    time is not the check's. A run stopped short is recorded FAILED, which the estimate
+    leaves out. Best-effort: history is never worth failing a run's teardown over."""
+    from sqlalchemy.exc import SQLAlchemyError
+    from .database import JOB_RUN_FAILED, JOB_RUN_SUCCESS, record_job_run
+    try:
+        with app.app_context():
+            record_job_run(f'od_job_{job_id}', started, datetime.utcnow(),
+                           JOB_RUN_SUCCESS if completed else JOB_RUN_FAILED)
+    except SQLAlchemyError:
+        log.exception('Could not record the run history of health check job %d', job_id)
 
 
 def _settle_group_formats(app, tested_channel_ids):

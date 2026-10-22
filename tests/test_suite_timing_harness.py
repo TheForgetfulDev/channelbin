@@ -43,7 +43,7 @@ J3_HISTORY_FIXTURE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'f
                                   'timing_history_j3.jsonl')
 
 
-class _Expensive(unittest.TestCase):
+class _Expensive:
     """Everything in setUpClass, nothing in the tests - test_channel_search_page_js's
     shape, which is the shape the old harness could not see at all."""
 
@@ -58,7 +58,7 @@ class _Expensive(unittest.TestCase):
         pass
 
 
-class _Cheap(unittest.TestCase):
+class _Cheap:
     """The ordinary shape: no class fixture, the cost is inside the test."""
 
     def test_one(self):
@@ -71,9 +71,15 @@ def _key(cls):
 
 
 def _run(*classes):
-    """Drive _TimingResult over the given TestCase classes and return (result, wall)."""
+    """Drive _TimingResult over the given classes and return (result, wall).
+
+    `_Expensive` and `_Cheap` become a TestCase only here: declared as one at module level,
+    the real suite would collect and run them too (dev/changelog/1260)."""
+    cases = [c if issubclass(c, unittest.TestCase)
+             else type(c.__name__, (c, unittest.TestCase), {'__module__': c.__module__})
+             for c in classes]
     suite = unittest.TestSuite(
-        unittest.TestLoader().loadTestsFromTestCase(c) for c in classes)
+        unittest.TestLoader().loadTestsFromTestCase(c) for c in cases)
     runner = unittest.TextTestRunner(resultclass=_TimingResult, verbosity=0,
                                      stream=io.StringIO())
     t0 = time.perf_counter()

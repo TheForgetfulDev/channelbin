@@ -79,13 +79,11 @@ def _observe():
 
 @unittest.skipIf(shutil.which('node') is None, 'node not installed')
 @unittest.skipIf(not os.path.isdir(JSDOM), 'jsdom not installed (npm install)')
-class _Base(unittest.TestCase):
+class _Base:
     SCENARIO = ''
 
     @classmethod
     def setUpClass(cls):
-        if not cls.SCENARIO:
-            raise unittest.SkipTest('base class - carries no cases')
         cls.obs = _observe()[cls.SCENARIO]
         if isinstance(cls.obs, dict) and 'error' in cls.obs:
             raise AssertionError(f'{cls.SCENARIO} threw in the page:\n{cls.obs["error"]}')
@@ -94,7 +92,7 @@ class _Base(unittest.TestCase):
         self.assertEqual(self.obs['errors'], [])
 
 
-class NoManualEditTests(_Base):
+class NoManualEditTests(_Base, unittest.TestCase):
     """The unmodified case: a profile change is still allowed to recompute both fields
     from the program's own start/stop, because the user never touched them."""
     SCENARIO = 'no_manual_edit'
@@ -110,7 +108,7 @@ class NoManualEditTests(_Base):
         self.assertTrue(self.obs['noteVisible'])
 
 
-class HandTypedStartSurvivesProfileChangeTests(_Base):
+class HandTypedStartSurvivesProfileChangeTests(_Base, unittest.TestCase):
     """The actual bug: BUGS.md 2026-08-06. A hand-typed Start must survive a later
     profile change even when that profile has zero start-time padding of its own."""
     SCENARIO = 'hand_typed_start_survives_profile_change'
@@ -130,7 +128,7 @@ class HandTypedStartSurvivesProfileChangeTests(_Base):
         self.assertIn('ends 15 min late', self.obs['noteText'])
 
 
-class BothHandEditedTests(_Base):
+class BothHandEditedTests(_Base, unittest.TestCase):
     """Both fields hand-edited: a profile change must leave both exactly alone."""
     SCENARIO = 'both_hand_edited'
 
@@ -143,7 +141,7 @@ class BothHandEditedTests(_Base):
         self.assertIn('were left as entered', self.obs['noteText'])
 
 
-class ReopenClearsEditFlagTests(_Base):
+class ReopenClearsEditFlagTests(_Base, unittest.TestCase):
     """Opening the modal for a different program is a fresh start - the "user already
     edited this" tracking must not leak from one program's modal session to the next."""
     SCENARIO = 'reopen_clears_edit_flag'
@@ -162,7 +160,7 @@ if __name__ == '__main__':
     unittest.main()
 
 
-class ProfileChangeRenamesTests(_Base):
+class ProfileChangeRenamesTests(_Base, unittest.TestCase):
     """A profile carries its own filename template and tag cleanup, so picking one in a
     new-recording modal re-asks the server for the name, as it re-pads the times
     (dev/changelog/1161)."""
@@ -188,7 +186,7 @@ class ProfileChangeRenamesTests(_Base):
         self.assertIsNone(self.obs['requests'][1]['profile_id'])
 
 
-class TypedNameSurvivesTests(_Base):
+class TypedNameSurvivesTests(_Base, unittest.TestCase):
     SCENARIO = 'typed_name_survives_profile_change'
 
     def test_a_typed_name_is_kept_and_not_even_asked_about(self):
@@ -196,7 +194,7 @@ class TypedNameSurvivesTests(_Base):
         self.assertEqual(self.obs['requests'], [])
 
 
-class EditDoesNotRenameTests(_Base):
+class EditDoesNotRenameTests(_Base, unittest.TestCase):
     SCENARIO = 'edit_does_not_rename'
 
     def test_a_scheduled_recordings_name_is_left_alone(self):

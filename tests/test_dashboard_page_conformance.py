@@ -16,11 +16,9 @@ round caught, that a careless edit would quietly undo:
   * 16.3's scale has ONE definition in the tree. The TV Guide and this timeline draw
     the same density, and a second hand-typed copy diverges the first time either is
     tuned - invisibly, because neither page alone shows the disagreement.
-  * 16.3 also rules what an estimate-less job renders: an outline with no length,
-    never a number invented to make the bar legible. The app has no runtime estimates
-    yet, so this is the state EVERY job takes today.
-  * 16.4's thresholds come from app/config.py, not from a typed number, because the
-    warning has to describe what scheduler.py will actually do.
+  * 16.3's estimate-less outline and 16.4's config-read guard thresholds are asserted
+    against real job rows in tests/test_jobs_schedule_truth.py - this class renders with
+    no scheduler, so a job-by-job loop here would check nothing.
   * 16.6: `[hidden]` must win outright, one composer per region, and a section's head
     count and the rows under it come from one computation.
 
@@ -149,15 +147,6 @@ class DashboardPageConformanceTests(unittest.TestCase):
         self.assertIn('Booked show', names, 'a hidden section emptied the axis')
         self.assertIn('Capturing now', names)
 
-    def test_the_timeline_carries_no_invented_runtime_estimate(self):
-        """16.3: a job with no run history draws as an outline with NO LENGTH. The app
-        has no estimates at all yet, so every job must arrive with a null one - a
-        default of 0-plus-a-minimum, or any placeholder, puts a number on the axis
-        that nothing backs."""
-        for job in self._timeline()['jobs']:
-            self.assertIsNone(job['est_seconds'],
-                              f"job {job['id']} arrived with an invented runtime")
-
     def test_the_timeline_does_not_draw_recordings_twice(self):
         """_build_job_list() models a scheduled recording as a job (`start_<id>`), and
         those are the same recordings the lanes already draw. Keeping them would put
@@ -166,15 +155,6 @@ class DashboardPageConformanceTests(unittest.TestCase):
         for job in self._timeline()['jobs']:
             self.assertFalse(job['id'].startswith(('start_', 'active_')),
                              f"{job['id']} is a recording drawn on the jobs rail")
-
-    def test_the_sync_guard_thresholds_come_from_config(self):
-        """16.4: the marks describe what scheduler.py will actually do, so they are
-        read from app/config.py rather than typed into the page."""
-        from app.config import load_config
-        cfg = load_config()['sync']
-        guards = self._timeline()['syncGuards']
-        self.assertEqual(guards['skipWithinMinutes'], cfg['skip_sync_if_recording_within_minutes'])
-        self.assertEqual(guards['skipIfRecordingActive'], cfg['skip_sync_if_recording_active'])
 
     def test_the_row_grid_uses_no_content_dependent_track(self):
         """CLAUDE.md's per-row-grid rule. The head and each row are separate grid

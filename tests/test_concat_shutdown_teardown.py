@@ -391,7 +391,12 @@ class SupervisedJoinShutdownTests(_ConcatCase):
             return proc
 
         def _join():
-            with mock.patch('app.config.load_config', return_value=self.cfg), \
+            # The supervisor polls its child every CONCAT_POLL_INTERVAL_SECONDS (5s), so
+            # after the kill the join thread slept out the rest of a poll before it could be
+            # joined - ~5s of each test spent waiting on nothing this test asserts
+            # (dev/changelog/1259).
+            with mock.patch.object(catmod, 'CONCAT_POLL_INTERVAL_SECONDS', 0.1), \
+                 mock.patch('app.config.load_config', return_value=self.cfg), \
                  mock.patch('app.recorder.persist_final_thumbnail'), \
                  mock.patch('app.recorder.persist_poster_frame'), \
                  mock.patch('app.health_score.apply_capture_phase_health_observation'), \

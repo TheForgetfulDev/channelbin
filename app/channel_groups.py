@@ -744,6 +744,7 @@ PARTICIPATION_FIELDS = {
 PARTICIPATION_SURFACES = {
     'group_page': None,
     'check_channel_list': "from the health check's channel list",
+    'recording_page': "from a running recording's Switch channel dialog",
 }
 
 
@@ -1634,7 +1635,9 @@ def group_channel_ids(group):
 
 
 def teardown_test_job(job):
-    """Release what creating an OnDemandTestJob acquired: its APScheduler entry and its
+    """Release what creating an OnDemandTestJob acquired: its APScheduler entry, its run
+    history (JobRun rows under its `od_job_<id>` scheduler id - SQLite can hand a deleted
+    job's id to the next one, which would then inherit its runtime estimate) and its
     ChannelTest rows (lazy='dynamic' means the relationship needs an explicit bulk
     delete, not just deleting the job row). Caller still deletes the job row itself
     (and the group, where that's appropriate) afterward. Shared by the single-job
@@ -1647,9 +1650,10 @@ def teardown_test_job(job):
     app.recorder.delete_files() only after that closure's commit has durably
     succeeded (tests/test_static_invariants.py::RetryOnLockedSideEffectTests)."""
     from .channel_tester import delete_tests_collecting_screenshots
-    from .database import ChannelTest
+    from .database import ChannelTest, JobRun
     from .scheduler import cancel_on_demand_job_schedule
     cancel_on_demand_job_schedule(job)
+    JobRun.query.filter_by(job_id=f'od_job_{job.id}').delete(synchronize_session=False)
     return delete_tests_collecting_screenshots(ChannelTest.query.filter_by(job_id=job.id))
 
 

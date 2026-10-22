@@ -64,13 +64,11 @@ def _observe():
 
 @unittest.skipIf(shutil.which('node') is None, 'node not installed')
 @unittest.skipIf(not os.path.isdir(JSDOM), 'jsdom not installed (npm install)')
-class _Base(unittest.TestCase):
+class _Base:
     SCENARIO = ''
 
     @classmethod
     def setUpClass(cls):
-        if not cls.SCENARIO:
-            raise unittest.SkipTest('base class - carries the shared cases only')
         cls.obs = _observe()[cls.SCENARIO]
         if isinstance(cls.obs, dict) and 'error' in cls.obs:
             raise AssertionError(f'{cls.SCENARIO} threw in the page:\n{cls.obs["error"]}')
@@ -79,7 +77,7 @@ class _Base(unittest.TestCase):
         self.assertEqual(self.obs['errors'], [])
 
 
-class BaselinePayloadTests(_Base):
+class BaselinePayloadTests(_Base, unittest.TestCase):
     SCENARIO = 'baseline'
 
     def test_the_hook_is_registered_on_this_page(self):
@@ -96,7 +94,7 @@ class BaselinePayloadTests(_Base):
         self.assertEqual(self.obs['polls'], 0)
 
 
-class StaleThenBuildingTests(_Base):
+class StaleThenBuildingTests(_Base, unittest.TestCase):
     """The sequence a real account sync produces, and the reason the trigger is not
     watching `ready`: the watermark moves (stale) before the rebuild starts (building),
     so the boolean is false at both steps and only the reason names which is which."""
@@ -121,7 +119,7 @@ class StaleThenBuildingTests(_Base):
                          {'disabled': True, 'label': 'Rebuilding...'})
 
 
-class PollStopsWhereItAlwaysDidTests(_Base):
+class PollStopsWhereItAlwaysDidTests(_Base, unittest.TestCase):
     SCENARIO = 'pollStops'
 
     def test_the_poll_that_started_is_the_cards_own_three_second_one(self):
@@ -136,7 +134,7 @@ class PollStopsWhereItAlwaysDidTests(_Base):
         self.assertIn('READY', self.obs['text'])
 
 
-class OneReaderAtATimeTests(_Base):
+class OneReaderAtATimeTests(_Base, unittest.TestCase):
     SCENARIO = 'standsOffWhilePolling'
 
     def test_a_further_change_adds_no_second_reader(self):
@@ -144,7 +142,7 @@ class OneReaderAtATimeTests(_Base):
         self.assertEqual(self.obs['after'], self.obs['whilePolling'])
 
 
-class HookIsNotAWriterTests(_Base):
+class HookIsNotAWriterTests(_Base, unittest.TestCase):
     SCENARIO = 'hookWritesNothing'
 
     def test_the_rows_change_only_when_the_loader_answers(self):
@@ -152,14 +150,14 @@ class HookIsNotAWriterTests(_Base):
         self.assertTrue(self.obs['changedAfterFetch'])
 
 
-class AbsentPayloadTests(_Base):
+class AbsentPayloadTests(_Base, unittest.TestCase):
     SCENARIO = 'emptyPayload'
 
     def test_no_search_block_is_not_a_change(self):
         self.assertEqual(self.obs['after'], self.obs['base'])
 
 
-class TriggeredFetchFailureTests(_Base):
+class TriggeredFetchFailureTests(_Base, unittest.TestCase):
     SCENARIO = 'triggeredFetchFails'
 
     def test_the_card_says_it_could_not_read_the_status(self):

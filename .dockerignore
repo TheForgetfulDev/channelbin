@@ -42,6 +42,7 @@ CLAUDE.md
 AGENTS.md
 CONTRIBUTING.md
 .claude/
+.forgejo/
 .mcp.json
 .playwright-mcp/
 scripts/

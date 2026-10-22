@@ -13,7 +13,7 @@ from flask import (
 
 from .. import db
 from ..database import (
-    Recording, Channel, ChannelGroup, Account, EPGEntry, RecordingEvent,
+    Recording, Channel, ChannelGroup, Account, EPGEntry, RecordingEvent, RecordingSegment,
     RECORDING_CREATED_AFTER_EVENT_START, RECORDING_EDITED, RECORDING_STOP_TIME_ADJUSTED,
     RECORDING_REPLACED_OTHER, RESTART_BLOCKING_STATUSES, RECORDING_ABORTED,
     DIAGNOSTICS, add_recording_event, detach_recording_references,
@@ -26,7 +26,7 @@ from ..database import (
 )
 from ..channel_groups import (pick_best_member, recording_members,
                               format_eligible_members, recording_formats,
-                              format_label, DEFAULT_FAILING_STREAK_THRESHOLD)
+                              format_label, effective_score, DEFAULT_FAILING_STREAK_THRESHOLD)
 from ..health_score import dismiss_recording_failing_alerts, evaluate_and_alert_recording
 from ..metadata_sidecar import globally_enabled
 from ..recording_metadata import (
@@ -37,10 +37,10 @@ from ..scheduler import schedule_recording, unschedule_recording
 from ..recorder import (
     abort_recording, get_state, stop_recording, pause_recording, resume_recording,
     get_live_segment_path, recording_disk_paths, recording_image_paths, delete_files, end_capture_wait,
-    finished_image_dirs, finished_image_path,
+    finished_image_dirs, finished_image_path, MoveRequest, switch_choices, block_move_preview,
 )
 from ..tz_utils import parse_local_to_utc, local_input_value, format_local
-from ..account_blocks import recording_blocks, set_recording_blocks
+from ..account_blocks import recording_blocks, set_recording_blocks, rearm_waiting_starts
 from ..accounts import normalize_url, normalize_url_loose
 from ..config import load_config, resolve_ffmpeg_path
 from ..logo_cache import resolve_logo_url
@@ -1121,17 +1121,37 @@ def _index_row(rec, now, tz, thumb_ids, live_seg_bytes=0, file_formats=None,
 
     # channel/group pill (channel/group relationships are lazy='joined')
     pill = None
+    member_pill = None
     group = rec.group
     if group is not None:
         # A group recording's channel_id is stamped to its serving member at creation
         # (new_recording_json) and re-stamped at record start / failover (recorder.py,
         # watchdog.py) - never left unset for a real group recording - so rec.channel is
         # the same "who is actually serving this" answer the TV Guide's group row shows.
+        # It gets a chip of its own beside the group's (dev/changelog/1252): the group
+        # chip carries the group's initials and the member chip carries the member's logo
+        # and account, so neither chip wears the other's identity. The row's logo fallback
+        # reads the member chip for the same reason.
         pill = {'label': group.name,
                 'url': url_for('channel_groups.group_detail', group_id=group.id),
-                'logo_url': resolve_logo_url(rec.channel) if rec.channel else None,
+                'logo_url': None,
                 'initials': _channel_initials(group.name),
-                'acct_color': rec.channel.account.color if (rec.channel and rec.channel.account) else None}
+                'acct_color': None}
+        if rec.channel is not None:
+            if rec.status == REC_STATUS_SCHEDULED:
+                member_tip = f'The member of "{group.name}" this recording is set to start on.'
+            elif rec.status in WINDOW_OPEN_STATUSES:
+                member_tip = (f'The member of "{group.name}" this recording is capturing from '
+                              f'right now - it changes when the recording fails over.')
+            else:
+                member_tip = f'The member of "{group.name}" this recording ended on.'
+            member_pill = {
+                'label': rec.channel.name,
+                'url': url_for('channels.channel_detail', channel_id=rec.channel.id),
+                'logo_url': resolve_logo_url(rec.channel),
+                'initials': _channel_initials(rec.channel.name),
+                'acct_color': rec.channel.account.color if rec.channel.account else None,
+                'tip': member_tip}
     elif rec.channel is not None:
         pill = {'label': rec.channel.name,
                 'url': url_for('channels.channel_detail', channel_id=rec.channel.id),
@@ -1163,7 +1183,7 @@ def _index_row(rec, now, tz, thumb_ids, live_seg_bytes=0, file_formats=None,
         'badge_class': badge_class, 'badge_label': badge_label, 'badge_pulse': pulse,
         'thumb_url': url_for('recordings.live_thumbnail', recording_id=rec.id) if has_thumb else None,
         'tech_line': tech_line, 'tech_source': tech_source,
-        'pill': pill,
+        'pill': pill, 'member_pill': member_pill,
         'acct_name': acct.name if acct else None,
         'day': day, 'start': rec.start_time, 'stop': rec.stop_time, 'rel': rel,
         'dur_str': fmt_utils.fmt_duration(dur_secs), 'dur_flag': dur_flag, 'dur_tip': dur_tip,
@@ -2699,34 +2719,213 @@ def account_block_options():
     } for a in accounts]})
 
 
+# How long a route waits for the recording's watchdog to answer a move request. The
+# watchdog polls every watchdog.poll_interval_seconds (5 by default) and may be inside a
+# restart delay; a request it has not answered by then is still on the state and is
+# carried out at its next poll - the response says so rather than guessing.
+_MOVE_WAIT_SECONDS = 12
+
+
+def _parse_blocks(items):
+    """The picker's payload as {account_id: slots}, or (None, error message)."""
+    wanted = {}
+    for item in items or []:
+        try:
+            aid = int(item.get('account_id'))
+            slots = item.get('slots')
+            slots = None if slots in (None, '') else int(slots)
+        except (AttributeError, TypeError, ValueError):
+            return None, 'Each block needs an account_id and optional slots.'
+        if slots is not None and slots < 1:
+            return None, 'Slots must be at least 1.'
+        wanted[aid] = slots
+    return wanted, None
+
+
+def _latest_event_detail(recording_id):
+    ev = (RecordingEvent.query.filter_by(recording_id=recording_id)
+          .order_by(RecordingEvent.id.desc()).first())
+    return ev.detail if ev is not None else ''
+
+
+def _ask_watchdog(rec, state, request_):
+    """Leave `request_` for the recording's watchdog and wait for its answer. Returns the
+    JSON fields that say what happened: `moved`, `from`, `to` and `message`, the message
+    being the recording's own newest event so the user reads the same words the recording
+    keeps. `moved` is None when the watchdog had not answered within the wait."""
+    from_name = rec.channel.name if rec.channel else None
+    state.move_request = request_
+    done = request_.done.wait(timeout=_MOVE_WAIT_SECONDS)
+    db.session.expire_all()
+    rec = db.session.get(Recording, rec.id)
+    if not done:
+        return {'moved': None, 'from': from_name, 'to': None,
+                'message': ("Asked. The recording's watchdog carries it out at its next check; "
+                            "the event log says what it did.")}
+    return {'moved': request_.moved, 'from': from_name,
+            'to': rec.channel.name if request_.moved and rec.channel else None,
+            'message': _latest_event_detail(rec.id)}
+
+
 @recordings_bp.route('/api/recordings/<int:recording_id>/account-blocks', methods=['POST'])
 def set_recording_account_blocks(recording_id):
     """Replace the accounts a recording blocks, for as long as it can still open a stream -
-    the in-progress modal's picker. Body: {"blocks": [{"account_id": 1, "slots": null}]}.
-    A live recording on an account this blocks moves off it within its watchdog's next
-    block check (app/watchdog.py::_check_account_block)."""
-    from ..account_blocks import rearm_waiting_starts
+    the in-progress modal's picker and the recording page's Block accounts dialog. Body:
+    {"blocks": [{"account_id": 1, "slots": null}]}. A live recording on an account this
+    blocks moves off it at once: the watchdog is asked to run its block check now rather
+    than at its next 15 s cadence, and the answer (`moved`, `from`, `to`, `message`) rides
+    on the response so the page can say what the block did (dev/changelog/1254)."""
     rec = db.session.get(Recording, recording_id)
     if rec is None:
         return jsonify({'error': 'Recording not found.'}), 404
     if rec.status not in (REC_STATUS_SCHEDULED,) + tuple(WINDOW_OPEN_STATUSES):
         return jsonify({'error': 'Only a scheduled or running recording can block accounts.'}), 400
     data = request.get_json(silent=True) or {}
-    wanted = {}
-    for item in data.get('blocks') or []:
-        try:
-            aid = int(item.get('account_id'))
-            slots = item.get('slots')
-            slots = None if slots in (None, '') else int(slots)
-        except (AttributeError, TypeError, ValueError):
-            return jsonify({'error': 'Each block needs an account_id and optional slots.'}), 400
-        if slots is not None and slots < 1:
-            return jsonify({'error': 'Slots must be at least 1.'}), 400
-        wanted[aid] = slots
-    if set_recording_blocks(recording_id, wanted):
-        rearm_waiting_starts()
-        return jsonify({'success': True, 'message': 'Blocked accounts updated.'})
-    return jsonify({'success': True, 'message': 'Nothing to change.'})
+    wanted, problem = _parse_blocks(data.get('blocks'))
+    if problem:
+        return jsonify({'error': problem}), 400
+    if not set_recording_blocks(recording_id, wanted):
+        return jsonify({'success': True, 'message': 'Nothing to change.'})
+    rearm_waiting_starts()
+    state = get_state(recording_id)
+    answer = {}
+    if state is not None and rec.status == REC_STATUS_IN_PROGRESS and rec.group_id is not None:
+        answer = _ask_watchdog(rec, state, MoveRequest())
+    return jsonify({'success': True, 'message': 'Blocked accounts updated.', **answer})
+
+
+@recordings_bp.route('/api/recordings/<int:recording_id>/block-preview')
+def recording_block_preview(recording_id):
+    """What the Block accounts dialog says before a block is saved: whether the blocks in
+    `blocks` (the picker's payload, JSON in the query string) take the account the
+    recording is on, and if so where the recording would move (dev/changelog/1254)."""
+    rec = db.session.get(Recording, recording_id)
+    if rec is None:
+        return jsonify({'error': 'Recording not found.'}), 404
+    try:
+        items = json.loads(request.args.get('blocks') or '[]')
+    except ValueError:
+        return jsonify({'error': 'blocks must be JSON.'}), 400
+    wanted, problem = _parse_blocks(items if isinstance(items, list) else None)
+    if problem:
+        return jsonify({'error': problem}), 400
+    if rec.status != REC_STATUS_IN_PROGRESS or rec.group_id is None or rec.channel is None:
+        return jsonify({'success': True, 'affects': False})
+    preview = block_move_preview(recording_id, wanted)
+    if preview is None:
+        return jsonify({'success': True, 'affects': False})
+    to = preview['to']
+    return jsonify({
+        'success': True, 'affects': True,
+        'current': {'name': rec.channel.name, 'account': rec.channel.account.name},
+        'to': ({'name': to.name, 'account': to.account.name, 'score': effective_score(to)}
+               if to is not None else None),
+        'held': preview['held'],
+    })
+
+
+@recordings_bp.route('/api/recordings/<int:recording_id>/switch-options')
+def recording_switch_options(recording_id):
+    """What the Switch channel dialog lists: every channel the group records from, with
+    whether it can be picked right now and why (recorder.switch_choices)."""
+    rec = db.session.get(Recording, recording_id)
+    if rec is None:
+        return jsonify({'error': 'Recording not found.'}), 404
+    if rec.status != REC_STATUS_IN_PROGRESS or rec.group_id is None:
+        return jsonify({'error': 'Only a group recording capturing right now can switch channels.'}), 400
+    if get_state(recording_id) is None:
+        return jsonify({'error': 'This recording is not being captured by this process.'}), 400
+    since = (RecordingSegment.query
+             .filter_by(recording_id=recording_id, channel_id=rec.channel_id)
+             .order_by(RecordingSegment.segment_number.desc()).first())
+    return jsonify({
+        'success': True,
+        'group': rec.group.name,
+        'current': ({'channel_id': rec.channel.id, 'name': rec.channel.name,
+                     'account': rec.channel.account.name} if rec.channel else None),
+        'since': fmt_utils.iso_or_none(since.started_at) if since is not None else None,
+        'choices': [{
+            'channel_id': c.channel.id,
+            'name': c.channel.name,
+            'account': {'id': c.channel.account.id, 'name': c.channel.account.name,
+                        'color': c.channel.account.color},
+            # The chip's whole number, as every health chip shows it; None = never scored.
+            'score': None if c.channel.health_score is None else effective_score(c.channel),
+            'ok': c.ok, 'why': c.why, 'warn': c.warn,
+        } for c in switch_choices(recording_id)],
+    })
+
+
+# What the Switch channel dialog may ask of the channel it leaves. `off` goes through the
+# one participation writer (channel_groups.set_participation - this IS the explicit user
+# action), `block` through the one block writer; `keep` writes nothing.
+SWITCH_LEAVE_CHOICES = ('keep', 'off', 'block')
+
+
+@recordings_bp.route('/api/recordings/<int:recording_id>/switch-channel', methods=['POST'])
+def switch_recording_channel(recording_id):
+    """Move a running group recording to the member the user picked, now. Body:
+    {"channel_id": 123, "leave": "keep" | "off" | "block"}.
+
+    The route validates the pick against switch_choices() - the same reading the dialog
+    drew - and then only records intent: the move itself is made by the recording's
+    watchdog (app/watchdog.py::_check_move_request), the one thread that stops an ffmpeg
+    and launches the next segment, so a switch cannot race the watchdog's own failover or
+    block check. The leave-behind answer is applied here, after the watchdog reports the
+    move, so a switch that did not happen changes nothing else (dev/changelog/1254)."""
+    from ..channel_groups import set_participation
+    rec = db.session.get(Recording, recording_id)
+    if rec is None:
+        return jsonify({'error': 'Recording not found.'}), 404
+    if rec.status != REC_STATUS_IN_PROGRESS or rec.group_id is None:
+        return jsonify({'error': 'Only a group recording capturing right now can switch channels.'}), 400
+    state = get_state(recording_id)
+    if state is None:
+        return jsonify({'error': 'This recording is not being captured by this process.'}), 400
+    data = request.get_json(silent=True) or {}
+    try:
+        channel_id = int(data.get('channel_id'))
+    except (TypeError, ValueError):
+        return jsonify({'error': 'Pick the channel to switch to.'}), 400
+    leave = data.get('leave') or 'keep'
+    if leave not in SWITCH_LEAVE_CHOICES:
+        return jsonify({'error': 'leave must be keep, off or block.'}), 400
+    choice = next((c for c in switch_choices(recording_id) if c.channel.id == channel_id), None)
+    if choice is None:
+        return jsonify({'error': 'That channel is not one this group records from.'}), 400
+    if not choice.ok:
+        return jsonify({'error': f'Not switched to "{choice.channel.name}": {choice.why}'}), 400
+    old = rec.channel
+    old_id, old_account_id = (old.id, old.account_id) if old else (None, None)
+
+    answer = _ask_watchdog(rec, state, MoveRequest(target_channel_id=channel_id))
+    left = ''
+    if answer['moved'] and old_id is not None:
+        # The move landed, so the target is now the member recording - and it has Recording
+        # on (switch_choices offers nothing else), so turning the old one off cannot empty
+        # the group's recording-enabled set and needs no guide-invariant gate.
+        if leave == 'off':
+            @retry_on_locked()
+            def _turn_off_and_commit():
+                from ..database import ChannelGroupMember
+                membership = ChannelGroupMember.query.filter_by(
+                    group_id=rec.group_id, channel_id=old_id).first()
+                if membership is not None and set_participation(
+                        membership, 'recording_enabled', False, surface='recording_page'):
+                    db.session.commit()
+                    return True
+                return False
+
+            if _turn_off_and_commit():
+                left = (f'Recording is now off for "{old.name}" in "{rec.group.name}" - turn it '
+                        f'back on from the group page.')
+        elif leave == 'block':
+            blocks = dict(recording_blocks(recording_id))
+            blocks[old_account_id] = None
+            if set_recording_blocks(recording_id, blocks):
+                rearm_waiting_starts()
+            left = f'"{old.account.name}" is blocked for the rest of this recording.'
+    return jsonify({'success': True, 'left': left, **answer})
 
 
 @recordings_bp.route('/recordings/<int:recording_id>/delete-json', methods=['POST'])

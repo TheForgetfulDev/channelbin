@@ -303,13 +303,15 @@ function boot({ rows = ROWS, saved = null, url = 'http://localhost:5000/channels
        both requests land within a microtask of the timer firing and the remaining ~180ms
        was pure slack, 57 settles over. 450ms stays as a hard cap, so a scenario that
        really does take that long (anything with parked requests) behaves exactly as it
-       did before. */
+       did before. The cap never skips the first look: with scenarios sharing one event
+       loop the 265ms timer can itself fire past the cap, and returning before any poll
+       would let a request the debounce queued behind it go unseen. */
     settle: async () => {
       const CAP = 450;
       const t0 = Date.now();
       await new Promise((r) => setTimeout(r, 265));
       let last = -1;
-      while (Date.now() - t0 < CAP) {
+      while (last === -1 || Date.now() - t0 < CAP) {
         if (sent.length === last && held.length === 0) return;
         last = sent.length;
         await new Promise((r) => setTimeout(r, 10));
@@ -2134,33 +2136,56 @@ const run = async () => {
   }
   out.catalog_fields = CATALOG.fields;
   out.catalog_sorts = CATALOG.sorts;
-  out.boot = await bootScenario();
-  out.box = await boxScenario();
-  out.suggestion_facets = await suggestionFacetScenario();
-  out.table = await tableScenario();
-  out.name_col = await nameColScenario();
-  out.saved = await savedScenario();
-  out.page_size = await pageSizeScenario();
-  out.context = await contextScenario();
-  out.rule_errand = await ruleErrandScenario();
-  out.guide_action = await guideActionScenario();
-  out.mobile = await mobileScenario();
-  out.mobile_sheets = await mobileSheetsScenario();
-  out.airing = await airingScenario();
-  out.nav_click = await navClickScenario();
-  out.when = await whenScenario();
-  out.day_time = await dayTimeScenario();
-  out.airing_mobile = await airingMobileScenario();
-  out.loading = await loadingScenario();
-  out.loading_flip = await loadingFlipScenario();
-  out.loading_fail = await loadingFailScenario();
-  out.superseded = await supersededScenario();
-  out.readiness = await readinessScenario();
-  out.counts_split = await countsSplitScenario();
-  out.counts_split_channels = await countsSplitChannelGrainScenario();
-  out.declined_numbers = await declinedNumbersScenario();
-  out.served_numbers = await servedNumbersScenario();
-  out.standing_inversion = await standingInversionScenario();
+  /* Most of this run is waiting out the page's real debounce, ~114 settle() calls, so the
+     scenarios that only read where the page SETTLES run a few at a time: each boot() owns
+     its window, fetch stub and request lists, and nothing here mutates shared state. The
+     pool stays small because one event loop serves them all - a boot is ~0.5-1s of
+     synchronous script, and more of them at once would make every pending timer late.
+     The scenarios in ALONE are about the page's timers MID-FLIGHT (the 600ms spinner
+     window, debounce generations, a request parked and released), and they run one at a
+     time after the pool has drained, exactly as they did when the whole run was serial
+     (dev/changelog/1259). A new scenario that observes an intermediate frame goes in ALONE. */
+  const POOLED = [
+    ['boot', bootScenario],
+    ['box', boxScenario],
+    ['suggestion_facets', suggestionFacetScenario],
+    ['table', tableScenario],
+    ['name_col', nameColScenario],
+    ['saved', savedScenario],
+    ['page_size', pageSizeScenario],
+    ['context', contextScenario],
+    ['rule_errand', ruleErrandScenario],
+    ['guide_action', guideActionScenario],
+    ['mobile', mobileScenario],
+    ['mobile_sheets', mobileSheetsScenario],
+    ['airing', airingScenario],
+    ['nav_click', navClickScenario],
+    ['when', whenScenario],
+    ['day_time', dayTimeScenario],
+    ['airing_mobile', airingMobileScenario],
+    ['declined_numbers', declinedNumbersScenario],
+    ['served_numbers', servedNumbersScenario],
+    ['standing_inversion', standingInversionScenario],
+  ];
+  const ALONE = [
+    ['loading', loadingScenario],
+    ['loading_flip', loadingFlipScenario],
+    ['loading_fail', loadingFailScenario],
+    ['superseded', supersededScenario],
+    ['readiness', readinessScenario],
+    ['counts_split', countsSplitScenario],
+    ['counts_split_channels', countsSplitChannelGrainScenario],
+  ];
+  const POOL_SIZE = 4;
+  const queue = POOLED.slice();
+  const worker = async () => {
+    while (queue.length) {
+      const [key, scenario] = queue.shift();
+      out[key] = await scenario();
+    }
+  };
+  await Promise.all(Array.from({ length: POOL_SIZE }, worker));
+  for (const [key, scenario] of ALONE) out[key] = await scenario();
   out.decline_why = DECLINE_WHY;
   out.catalog_by_grain = CATALOG.by_grain;
   out.catalog_when_values = CATALOG.when_values;

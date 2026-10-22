@@ -136,11 +136,13 @@ class SurroundConversionTests(_ConversionCase):
         raw = open(part, 'rb').read()
         with open(part, 'wb') as fh:
             fh.write(raw[:int(len(raw) * 0.7)])
-        kept = finalize_part(part, 'ffmpeg', scratch_key='t', interval=1,
+        # A 0.1s poll: the supervisor sleeps a whole interval before it sees the child has
+        # finished, and these finish in a fraction of a second (dev/changelog/1259).
+        kept = finalize_part(part, 'ffmpeg', scratch_key='t', interval=0.1,
                              pre_output_timeout=30, stall_seconds=30)
         self.assertIsNotNone(kept, 'the part up to its last whole fragment is usable')
         out = os.path.join(self.t._tmpdir, 'joined.mp4')
-        result = join_conversion_parts([part], out, 'ffmpeg', scratch_key='t', interval=1,
+        result = join_conversion_parts([part], out, 'ffmpeg', scratch_key='t', interval=0.1,
                                        pre_output_timeout=30, stall_seconds=30)
         self.assertTrue(result.success, result.error_msg)
         self.assertEqual(_audio(out), [('ac3', 6)])

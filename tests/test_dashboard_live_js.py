@@ -128,13 +128,11 @@ def _observe():
 
 @unittest.skipIf(shutil.which('node') is None, 'node not installed')
 @unittest.skipIf(not os.path.isdir(JSDOM), 'jsdom not installed (npm install)')
-class _Base(unittest.TestCase):
+class _Base:
     SCENARIO = ''
 
     @classmethod
     def setUpClass(cls):
-        if not cls.SCENARIO:
-            raise unittest.SkipTest('base class - carries the shared cases only')
         cls.obs = _observe()[cls.SCENARIO]
         if isinstance(cls.obs, dict) and 'error' in cls.obs:
             raise AssertionError(f'{cls.SCENARIO} threw in the page:\n{cls.obs["error"]}')
@@ -157,7 +155,7 @@ class RenderedStateTests(unittest.TestCase):
         self.assertEqual(obs[str(_IDS['conv'])]['text'], 'CONVERTING')
 
 
-class CaptureCompleteTests(_Base):
+class CaptureCompleteTests(_Base, unittest.TestCase):
     SCENARIO = 'capture_complete'
 
     def test_the_row_relabels_to_joining(self):
@@ -167,7 +165,7 @@ class CaptureCompleteTests(_Base):
         self.assertEqual(self.obs['reloads'], 0)
 
 
-class AbortedTests(_Base):
+class AbortedTests(_Base, unittest.TestCase):
     SCENARIO = 'aborted'
 
     def test_the_row_relabels_to_cancelled(self):
@@ -176,7 +174,7 @@ class AbortedTests(_Base):
         self.assertEqual(self.obs['reloads'], 0)
 
 
-class DeadStreamTests(_Base):
+class DeadStreamTests(_Base, unittest.TestCase):
     SCENARIO = 'dead_stream'
 
     def test_the_row_relabels_to_failed(self):
@@ -186,7 +184,7 @@ class DeadStreamTests(_Base):
         self.assertEqual(self.obs['reloads'], 0)
 
 
-class YieldTests(_Base):
+class YieldTests(_Base, unittest.TestCase):
     SCENARIO = 'yield'
 
     def test_a_parked_conversion_badges_waiting(self):
@@ -195,7 +193,7 @@ class YieldTests(_Base):
         self.assertEqual(self.obs['reloads'], 0)
 
 
-class ResumeTests(_Base):
+class ResumeTests(_Base, unittest.TestCase):
     SCENARIO = 'resume'
 
     def test_a_resumed_conversion_badges_converting(self):
@@ -204,7 +202,7 @@ class ResumeTests(_Base):
         self.assertEqual(self.obs['reloads'], 0)
 
 
-class ProgressRepeatTests(_Base):
+class ProgressRepeatTests(_Base, unittest.TestCase):
     SCENARIO = 'progress_repeats'
 
     def test_repeated_progress_neither_relabels_nor_rerenders(self):
@@ -215,7 +213,7 @@ class ProgressRepeatTests(_Base):
         self.assertEqual(self.row('parked')['text'], 'WAITING')
 
 
-class StaleSwapTests(_Base):
+class StaleSwapTests(_Base, unittest.TestCase):
     SCENARIO = 'stale_swap'
 
     def test_one_change_asks_for_one_rerender_even_when_the_server_lags(self):
@@ -230,7 +228,7 @@ class StaleSwapTests(_Base):
         self.assertEqual(self.row('live')['text'], 'JOINING')
 
 
-class StatsRepeatTests(_Base):
+class StatsRepeatTests(_Base, unittest.TestCase):
     SCENARIO = 'stats_repeat'
 
     def test_a_snapshot_repeating_the_status_does_nothing(self):
@@ -238,7 +236,7 @@ class StatsRepeatTests(_Base):
         self.assertEqual(self.row('live')['text'], 'RECORDING')
 
 
-class NoStatusTests(_Base):
+class NoStatusTests(_Base, unittest.TestCase):
     SCENARIO = 'no_status'
 
     def test_a_frame_without_a_status_never_relabels(self):

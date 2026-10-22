@@ -87,13 +87,11 @@ def _observe():
 
 @unittest.skipIf(shutil.which('node') is None, 'node not installed')
 @unittest.skipIf(not os.path.isdir(JSDOM), 'jsdom not installed (npm install)')
-class _Base(unittest.TestCase):
+class _Base:
     SCENARIO = ''
 
     @classmethod
     def setUpClass(cls):
-        if not cls.SCENARIO:
-            raise unittest.SkipTest('base class - carries the shared cases only')
         cls.obs = _observe()[cls.SCENARIO]
         if 'error' in cls.obs:
             raise AssertionError(f'{cls.SCENARIO} threw in the page:\n{cls.obs["error"]}')
@@ -102,7 +100,7 @@ class _Base(unittest.TestCase):
         self.assertEqual(self.obs['errors'], [])
 
 
-class NeverChosenOpensInBasicTests(_Base):
+class NeverChosenOpensInBasicTests(_Base, unittest.TestCase):
     SCENARIO = 'basic_boot'
 
     def test_only_the_basic_fields_show(self):
@@ -145,7 +143,7 @@ class NeverChosenOpensInBasicTests(_Base):
         self.assertEqual(self.obs['placeholder'], 'Search 132 settings by name, description or key')
 
 
-class SearchInBasicTests(_Base):
+class SearchInBasicTests(_Base, unittest.TestCase):
     SCENARIO = 'basic_search'
 
     def test_a_match_outside_basic_is_shown_and_marked(self):
@@ -175,7 +173,7 @@ class SearchInBasicTests(_Base):
         self.assertEqual(self.obs['posts'], [])
 
 
-class NoticeSwitchTests(_Base):
+class NoticeSwitchTests(_Base, unittest.TestCase):
     SCENARIO = 'notice_switch'
 
     def test_show_advanced_saves_the_choice_and_keeps_what_was_found(self):
@@ -186,7 +184,7 @@ class NoticeSwitchTests(_Base):
         self.assertEqual(len(self.obs['cleared']['shownPaths']), 132)
 
 
-class FooterSwitchTests(_Base):
+class FooterSwitchTests(_Base, unittest.TestCase):
     SCENARIO = 'footer_switch'
 
     def test_a_card_footer_switches_the_whole_page_and_saves_it(self):
@@ -196,7 +194,7 @@ class FooterSwitchTests(_Base):
                          [{'path': f'/api/user-prefs/{SETTINGS_VIEW_PREF}', 'body': {'value': True}}])
 
 
-class SavedAdvancedTests(_Base):
+class SavedAdvancedTests(_Base, unittest.TestCase):
     SCENARIO = 'advanced_boot'
 
     def test_a_saved_advanced_choice_opens_in_advanced(self):
@@ -213,7 +211,7 @@ class SavedAdvancedTests(_Base):
                          [{'path': f'/api/user-prefs/{SETTINGS_VIEW_PREF}', 'body': {'value': False}}])
 
 
-class DeepLinkTests(_Base):
+class DeepLinkTests(_Base, unittest.TestCase):
     SCENARIO = 'deep_link'
 
     def test_a_link_to_an_advanced_setting_lands_on_it_in_basic(self):
@@ -226,7 +224,7 @@ CHANGED = ['recording.retention_days', 'watchdog.poll_interval_seconds',
            'sync.epg_collapse_threshold_percent']
 
 
-class ChangedChipTests(_Base):
+class ChangedChipTests(_Base, unittest.TestCase):
     SCENARIO = 'changed_chip'
 
     def test_the_marks_come_from_the_server_and_the_chip_counts_them(self):
@@ -280,7 +278,7 @@ class ChangedChipTests(_Base):
         self.assertEqual(self.obs['posts'], [])
 
 
-class ChangedSaveTests(_Base):
+class ChangedSaveTests(_Base, unittest.TestCase):
     SCENARIO = 'changed_save'
 
     def test_a_save_back_to_the_default_clears_the_mark_and_the_row_leaves_the_list(self):
@@ -291,7 +289,7 @@ class ChangedSaveTests(_Base):
         self.assertEqual(self.obs['changedChip']['count'], '2')
 
 
-class ChangedReloadTests(_Base):
+class ChangedReloadTests(_Base, unittest.TestCase):
     SCENARIO = 'changed_reload'
 
     def test_a_reload_with_changed_1_lands_on_the_same_list(self):
@@ -299,7 +297,7 @@ class ChangedReloadTests(_Base):
         self.assertTrue(self.obs['changedChip']['active'])
 
 
-class NothingChangedTests(_Base):
+class NothingChangedTests(_Base, unittest.TestCase):
     SCENARIO = 'changed_none'
 
     def test_the_chip_stays_and_says_zero(self):
@@ -312,7 +310,7 @@ class NothingChangedTests(_Base):
         self.assertIsNone(self.obs['clicked']['verdict'] or None)
 
 
-class NothingChangedReloadTests(_Base):
+class NothingChangedReloadTests(_Base, unittest.TestCase):
     SCENARIO = 'changed_none_reload'
 
     def test_the_page_says_nothing_is_changed_and_the_chip_can_still_turn_off(self):
@@ -346,7 +344,7 @@ def _gpu_gated(prefix):
     return out
 
 
-class GatedRowTests(_Base):
+class GatedRowTests(_Base, unittest.TestCase):
     """A field nothing reads while a switch or mode elsewhere on the page says so fades and
     shows a badge naming that gate, and follows the control live (DESIGN.md 15.9, dev/changelog/1007)."""
     SCENARIO = 'gates'
@@ -420,7 +418,7 @@ if __name__ == '__main__':
     unittest.main()
 
 
-class YamlValidateTests(_Base):
+class YamlValidateTests(_Base, unittest.TestCase):
     """The config.yaml tab's Validate button (dev/changelog/1044)."""
     SCENARIO = 'yaml_validate'
 

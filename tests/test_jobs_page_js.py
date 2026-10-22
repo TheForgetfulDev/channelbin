@@ -53,6 +53,12 @@ STATE_B = [
     _job('start_7', 'Record: The Bear', 'Sep 29, 2026 09:00 PM', 'in 6h', type='one_off'),
 ]
 
+# A row whose Run now the server may answer with a refusal (an EPG refresh admission held back).
+RUN_STATE = [
+    _job('epg_source_refresh_3', 'EPG refresh: Guide', 'Sep 29, 2026 05:00 PM', 'in 2h',
+         run_url='/api/jobs/epg_source_refresh_3/run-now', edit_url='/accounts/1'),
+]
+
 _RESULT = None
 
 
@@ -69,7 +75,7 @@ def _observe():
             with open(os.path.join(tmp, name), 'w', encoding='utf-8') as f:
                 f.write(body)
 
-        for state, jobs in (('empty', []), ('a', STATE_A), ('b', STATE_B)):
+        for state, jobs in (('empty', []), ('a', STATE_A), ('b', STATE_B), ('run', RUN_STATE)):
             with mock.patch('app.routes.jobs._build_job_list', return_value=jobs):
                 resp = client.get('/jobs')
             if resp.status_code != 200:
@@ -93,13 +99,11 @@ def _observe():
 
 @unittest.skipIf(shutil.which('node') is None, 'node not installed')
 @unittest.skipIf(not os.path.isdir(JSDOM), 'jsdom not installed (npm install)')
-class _Base(unittest.TestCase):
+class _Base:
     SCENARIO = ''
 
     @classmethod
     def setUpClass(cls):
-        if not cls.SCENARIO:
-            raise unittest.SkipTest('base class - carries the shared cases only')
         cls.obs = _observe()[cls.SCENARIO]
         if isinstance(cls.obs, dict) and 'error' in cls.obs:
             raise AssertionError(f'{cls.SCENARIO} threw in the page:\n{cls.obs["error"]}')
@@ -112,7 +116,7 @@ A_ROWS = ['Account sync: Alpha', 'Config Backup']
 B_ROWS = ['Account sync: Alpha', 'Config Backup', 'Record: The Bear']
 
 
-class PageAsItOpensTests(_Base):
+class PageAsItOpensTests(_Base, unittest.TestCase):
     SCENARIO = 'boot'
 
     def test_the_page_registers_both_hooks_on_the_nav_status_poll(self):
@@ -128,7 +132,7 @@ class PageAsItOpensTests(_Base):
         self.assertEqual(self.obs['rows'], A_ROWS)
 
 
-class BackgroundChangeTests(_Base):
+class BackgroundChangeTests(_Base, unittest.TestCase):
     SCENARIO = 'background_change'
 
     def test_a_sync_starting_swaps_in_the_new_table_and_count(self):
@@ -140,7 +144,7 @@ class BackgroundChangeTests(_Base):
         self.assertEqual(self.obs['afterNextPoll'], 1)
 
 
-class RecordingChangeTests(_Base):
+class RecordingChangeTests(_Base, unittest.TestCase):
     """A recording's start/stop jobs are rows here, so its signature moving is a trigger."""
     SCENARIO = 'recording_change'
 
@@ -149,7 +153,7 @@ class RecordingChangeTests(_Base):
         self.assertEqual(self.obs['rows'], B_ROWS)
 
 
-class OpenMenuTests(_Base):
+class OpenMenuTests(_Base, unittest.TestCase):
     SCENARIO = 'menu_open'
 
     def test_an_open_menu_holds_the_refresh_back(self):
@@ -165,7 +169,7 @@ class OpenMenuTests(_Base):
         self.assertEqual(self.obs['afterClose']['rows'], B_ROWS)
 
 
-class AgedRenderTests(_Base):
+class AgedRenderTests(_Base, unittest.TestCase):
     """"in 5m" drifts while nothing changes."""
     SCENARIO = 'aged'
 
@@ -180,7 +184,7 @@ class AgedRenderTests(_Base):
         self.assertEqual(self.obs['rightAfter'], 1)
 
 
-class SkipActionTests(_Base):
+class SkipActionTests(_Base, unittest.TestCase):
     SCENARIO = 'skip_action'
 
     def test_skip_swaps_the_table_instead_of_reloading_the_page(self):
@@ -192,12 +196,36 @@ class SkipActionTests(_Base):
         self.assertEqual(self.obs['navigations'], 0)
 
 
-class FromEmptyTests(_Base):
+class FromEmptyTests(_Base, unittest.TestCase):
     SCENARIO = 'from_empty'
 
     def test_the_first_jobs_replace_the_empty_state(self):
         self.assertEqual(self.obs['before'], {'rows': 0, 'empty': True, 'count': '0 jobs'})
         self.assertEqual(self.obs['after'], {'rows': 2, 'empty': False, 'count': '2 jobs'})
+
+
+class RunNowRefusedTests(_Base, unittest.TestCase):
+    """Run now on an EPG refresh that admission held back answers 200 with
+    `refresh_started: false` and a sentence naming what it waits behind; the toast used to
+    say "started." over it (dev/docs/BUGS.md 2026-10-21, dev/changelog/1258)."""
+    SCENARIO = 'run_refused'
+
+    def test_the_toast_says_it_waits_not_that_it_started(self):
+        self.assertTrue(self.obs['modalShown'])
+        self.assertEqual(self.obs['posts'], ['/api/jobs/epg_source_refresh_3/run-now'])
+        self.assertEqual(len(self.obs['toasts']), 1, self.obs['toasts'])
+        msg, kind = self.obs['toasts'][0]
+        self.assertIn('waits', msg)
+        self.assertNotIn('started', msg)
+        self.assertEqual(kind, 'warning')
+
+
+class RunNowStartedTests(_Base, unittest.TestCase):
+    """A reply with no sentence of its own still names the job it started."""
+    SCENARIO = 'run_plain'
+
+    def test_the_toast_names_the_job(self):
+        self.assertEqual([m for m, _k in self.obs['toasts']], ['EPG refresh: Guide started.'])
 
 
 if __name__ == '__main__':

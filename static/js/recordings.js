@@ -184,7 +184,8 @@
     const q = searchInput.value.trim().toLowerCase();
     let visible = 0;
     allRows().forEach(row => {
-      const searchMatch = !q || row.dataset.name.includes(q) || (row.dataset.channel || '').toLowerCase().includes(q);
+      const searchMatch = !q || row.dataset.name.includes(q) || (row.dataset.channel || '').toLowerCase().includes(q)
+        || (row.dataset.member || '').toLowerCase().includes(q);
       const show = searchMatch && filterBar.matches(row);
       row.style.display = show ? '' : 'none';
       if (show) visible++;

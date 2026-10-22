@@ -91,7 +91,7 @@ _CHILD_TZ = 'Pacific/Auckland'
 
 
 @unittest.skipIf(shutil.which('node') is None, 'node not installed')
-class _Base(unittest.TestCase):
+class _Base:
     tz = ET
     hour12 = 'true'
 
@@ -115,7 +115,7 @@ class _Base(unittest.TestCase):
         self.assertNotIn(ambient, (ET, LONDON, 'UTC'))
 
 
-class DisplaySettingSourceTests(_Base):
+class DisplaySettingSourceTests(_Base, unittest.TestCase):
     """The two settings come from the meta tags and nowhere else."""
 
     def test_timezone_comes_from_the_meta_tag(self):
@@ -139,7 +139,7 @@ class DisplaySettingSourceTests(_Base):
         self.assertIs(self.evaluate('displayHour12()', hour12='gibberish'), True)
 
 
-class FmtTimeTzTests(_Base):
+class FmtTimeTzTests(_Base, unittest.TestCase):
     def test_renders_in_the_display_timezone_not_utc(self):
         self.assertEqual(self.evaluate(f'fmtTimeTz({WINTER})'), '12:30 AM')
         self.assertEqual(self.evaluate(f'fmtTimeTz({WINTER})', tz=LONDON), '5:30 AM')
@@ -167,7 +167,7 @@ class FmtTimeTzTests(_Base):
         self.assertEqual(self.evaluate(f'fmtTimeTz({WINTER})'), '12:30 AM')
 
 
-class FmtHhmmTests(_Base):
+class FmtHhmmTests(_Base, unittest.TestCase):
     """A bare clock reading (the channel search's Time of day range, dev/changelog/1187) in
     the display clock format - app/tz_utils.py::format_clock's browser half."""
 
@@ -201,7 +201,7 @@ class FmtHhmmTests(_Base):
                                        hour12='true'), ['18:00', '6:00 PM'])
 
 
-class FmtDateTzTests(_Base):
+class FmtDateTzTests(_Base, unittest.TestCase):
     def test_default_shape_is_the_long_day_form(self):
         self.assertEqual(self.evaluate(f'fmtDateTz({WINTER})'), 'Thursday, Jan 15')
 
@@ -233,7 +233,7 @@ class FmtDateTzTests(_Base):
         self.assertEqual(self.evaluate(f'fmtDateTz({WINTER})'), 'Thursday, Jan 15')
 
 
-class TzDayKeyTests(_Base):
+class TzDayKeyTests(_Base, unittest.TestCase):
     def test_key_is_iso_ordered_and_string_sortable(self):
         self.assertEqual(self.evaluate(f'tzDayKey({WINTER})'), '2026-01-15')
 
@@ -247,7 +247,7 @@ class TzDayKeyTests(_Base):
         self.assertEqual(self.evaluate(f'tzDayKey({WINTER})', hour12='false'), '2026-01-15')
 
 
-class TzDayLabelTests(_Base):
+class TzDayLabelTests(_Base, unittest.TestCase):
     def test_today_tomorrow_yesterday_are_relative_to_now(self):
         self.assertEqual(self.evaluate('tzDayLabel(new Date())'), 'Today')
         self.assertEqual(
@@ -268,7 +268,7 @@ class TzDayLabelTests(_Base):
         self.assertEqual(got, 'Today')
 
 
-class UtcIsoToDateTests(_Base):
+class UtcIsoToDateTests(_Base, unittest.TestCase):
     def test_naive_string_is_read_as_utc_not_browser_local(self):
         """The API sends naive UTC. JavaScript reads an unsuffixed string as LOCAL, so
         without the appended Z every timestamp in the app would be off by the browser's
@@ -293,7 +293,7 @@ class UtcIsoToDateTests(_Base):
         self.assertIsNone(self.evaluate("utcIsoToDate('not a date')"))
 
 
-class FormatterCacheTests(_Base):
+class FormatterCacheTests(_Base, unittest.TestCase):
     def test_same_options_return_the_identical_formatter_object(self):
         """The cache is load-bearing, not an optimization: channel-search.js formats a
         time and a day label for every row of a result page over 136,130 channels, and

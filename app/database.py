@@ -1429,6 +1429,8 @@ class RecordingSegment(db.Model):
     ended_at         = db.Column(db.DateTime)
     # STOP_TIME_REACHED | STALL_KILLED | PROCESS_EXITED | SEGMENT_DURATION_EXPIRED | ERROR
     # | MANUAL_CANCEL | MANUAL_PAUSE | MANUAL_STOP | SERVICE_RESTART | RECORDING_HANDOFF
+    # | ACCOUNT_BLOCKED (the user blocked its account, dev/changelog/1151)
+    # | CHANNEL_SWITCHED (the user picked another member, dev/changelog/1254)
     # | VIDEO_STOPPED
     # STALL_KILLED and PROCESS_EXITED are both "the feed died, we restarted", kept apart
     # because only the first one is us doing the killing (dev/changelog/431). VIDEO_STOPPED
@@ -3094,18 +3096,39 @@ def record_job_run(job_id: str, started_at: datetime, finished_at: datetime, out
     _prune()
 
 
+def recent_duration_averages(key_col, id_col, start_col, end_col, keys, *criteria) -> dict:
+    """{key: (avg_seconds, run_count)} over each key's JOB_RUN_HISTORY_LIMIT most recent rows
+    matching `criteria`, newest by (start_col, id_col). One query for any number of keys, so
+    a page listing every job asks once rather than once per row (CLAUDE.md no-hidden-I/O).
+    A key with no matching row is absent; callers read it as (None, 0)."""
+    keys = {k for k in keys if k is not None}
+    if not keys:
+        return {}
+    rank = db.func.row_number().over(partition_by=key_col,
+                                     order_by=(start_col.desc(), id_col.desc())).label('rank')
+    ranked = (db.session.query(key_col.label('key'), start_col.label('started'),
+                               end_col.label('finished'), rank)
+              .filter(key_col.in_(keys), *criteria).subquery())
+    totals = {}
+    for key, started, finished in (db.session.query(ranked.c.key, ranked.c.started,
+                                                    ranked.c.finished)
+                                   .filter(ranked.c.rank <= JOB_RUN_HISTORY_LIMIT)):
+        total, runs = totals.get(key, (0.0, 0))
+        totals[key] = (total + (finished - started).total_seconds(), runs + 1)
+    return {key: (total / runs, runs) for key, (total, runs) in totals.items()}
+
+
+def get_job_duration_estimates(job_ids) -> dict:
+    """{job_id: (avg_seconds, run_count)} over each job's stored history (successful runs
+    only - a FAILED run's wall-clock time isn't a useful estimate of how long the job takes
+    to actually do its work). A job with no completed run is absent - the caller must render
+    that as an explicit "unknown", never fall back to another job's number (CLAUDE.md
+    Product Principle 1 / the approved dev/mockups/29 contract)."""
+    return recent_duration_averages(JobRun.job_id, JobRun.id, JobRun.started_at,
+                                    JobRun.finished_at, job_ids,
+                                    JobRun.outcome == JOB_RUN_SUCCESS)
+
+
 def get_job_duration_estimate(job_id: str):
-    """(avg_seconds, run_count) over job_id's stored history (successful runs only - a
-    FAILED run's wall-clock time isn't a useful estimate of how long the job takes to
-    actually do its work). (None, 0) when there is no completed run yet - the caller must
-    render that as an explicit "unknown", never fall back to another job's number
-    (CLAUDE.md Product Principle 1 / the approved dev/mockups/29 contract)."""
-    rows = (
-        JobRun.query.filter_by(job_id=job_id, outcome=JOB_RUN_SUCCESS)
-        .order_by(JobRun.started_at.desc(), JobRun.id.desc())
-        .limit(JOB_RUN_HISTORY_LIMIT).all()
-    )
-    if not rows:
-        return None, 0
-    total = sum((row.finished_at - row.started_at).total_seconds() for row in rows)
-    return total / len(rows), len(rows)
+    """get_job_duration_estimates() for one job: (avg_seconds, run_count), or (None, 0)."""
+    return get_job_duration_estimates([job_id]).get(job_id, (None, 0))

@@ -2062,34 +2062,30 @@ def channel_lifecycle_state(channel: Channel, account: Account, cfg: dict,
     return None, None
 
 
-def get_sync_duration_estimate(account_id: int):
-    """(avg_seconds, run_count) over this account's most recent completed syncs, capped
-    at database.JOB_RUN_HISTORY_LIMIT rows - the account-sync half of the "estimated job
-    runtime" feature (dev/changelog/592). Keyed per account, never averaged across
-    accounts: a 34,012-channel sync and an 8,804-channel one are not the same job with
-    the same average.
+def get_sync_duration_estimates(account_ids) -> dict:
+    """{account_id: (avg_seconds, run_count)} over each account's most recent completed
+    syncs, capped at database.JOB_RUN_HISTORY_LIMIT rows - the account-sync half of the
+    "estimated job runtime" feature (dev/changelog/592). Keyed per account, never averaged
+    across accounts: a 34,012-channel sync and an 8,804-channel one are not the same job
+    with the same average.
 
     Reuses AccountSyncLog rather than the generic JobRun table in database.py - this data
     already exists here, so a second copy would be exactly the duplication CLAUDE.md's
     "search before you write" rule forbids. PARTIAL counts as completed (a degraded-but-
     finished sync still took real wall-clock time); IN_PROGRESS/ERROR/CANCELLED don't -
     an aborted run's elapsed time isn't a useful estimate of how long the job takes to
-    actually finish. (None, 0) when there is no completed sync yet.
+    actually finish. An account with no completed sync yet is absent.
     """
-    from .database import JOB_RUN_HISTORY_LIMIT
+    from .database import recent_duration_averages
+    return recent_duration_averages(
+        AccountSyncLog.account_id, AccountSyncLog.id, AccountSyncLog.started_at,
+        AccountSyncLog.completed_at, account_ids,
+        AccountSyncLog.status.in_(SYNC_LOG_IMPORTED), AccountSyncLog.completed_at.isnot(None))
 
-    rows = (
-        AccountSyncLog.query
-        .filter(AccountSyncLog.account_id == account_id,
-                AccountSyncLog.status.in_(SYNC_LOG_IMPORTED),
-                AccountSyncLog.completed_at.isnot(None))
-        .order_by(AccountSyncLog.started_at.desc(), AccountSyncLog.id.desc())
-        .limit(JOB_RUN_HISTORY_LIMIT).all()
-    )
-    if not rows:
-        return None, 0
-    total = sum((row.completed_at - row.started_at).total_seconds() for row in rows)
-    return total / len(rows), len(rows)
+
+def get_sync_duration_estimate(account_id: int):
+    """get_sync_duration_estimates() for one account: (avg_seconds, run_count), or (None, 0)."""
+    return get_sync_duration_estimates([account_id]).get(account_id, (None, 0))
 
 
 def lifecycle_states_for_channels(channels, cfg, accounts_by_id=None) -> dict:

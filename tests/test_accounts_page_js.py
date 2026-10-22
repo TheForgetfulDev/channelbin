@@ -103,13 +103,11 @@ def _observe():
 
 @unittest.skipIf(shutil.which('node') is None, 'node not installed')
 @unittest.skipIf(not os.path.isdir(JSDOM), 'jsdom not installed (npm install)')
-class _Base(unittest.TestCase):
+class _Base:
     SCENARIO = ''
 
     @classmethod
     def setUpClass(cls):
-        if not cls.SCENARIO:
-            raise unittest.SkipTest('base class - carries the shared cases only')
         cls.obs = _observe()[cls.SCENARIO]
         if isinstance(cls.obs, dict) and 'error' in cls.obs:
             raise AssertionError(f'{cls.SCENARIO} threw in the page:\n{cls.obs["error"]}')
@@ -118,7 +116,7 @@ class _Base(unittest.TestCase):
         self.assertEqual(self.obs['errors'], [])
 
 
-class PageAsItOpensTests(_Base):
+class PageAsItOpensTests(_Base, unittest.TestCase):
     SCENARIO = 'boot'
 
     def test_the_list_registers_its_hook_on_the_nav_status_poll(self):
@@ -135,7 +133,7 @@ class PageAsItOpensTests(_Base):
         self.assertEqual(self.obs['alpha']['status'], 'SYNCING')
 
 
-class SyncFinishesTests(_Base):
+class SyncFinishesTests(_Base, unittest.TestCase):
     """The reported defect itself (dev/docs/BUGS.md 2026-09-11 06:38)."""
     SCENARIO = 'finished'
 
@@ -171,7 +169,7 @@ class SyncFinishesTests(_Base):
         self.assertTrue(self.obs['menuOpensOnSwappedRow'])
 
 
-class OpenMenuTests(_Base):
+class OpenMenuTests(_Base, unittest.TestCase):
     SCENARIO = 'menu_open'
 
     def test_an_open_menu_holds_the_refresh_back(self):
@@ -185,7 +183,7 @@ class OpenMenuTests(_Base):
         self.assertEqual(self.obs['afterClose']['alpha']['status'], 'OK')
 
 
-class AgedRenderTests(_Base):
+class AgedRenderTests(_Base, unittest.TestCase):
     """"Synced 4m ago" and "in 23h 44m" drift while no sync changes anything."""
     SCENARIO = 'aged'
 
@@ -200,7 +198,7 @@ class AgedRenderTests(_Base):
         self.assertEqual(self.obs['rightAfter'], 1)
 
 
-class FailedRefreshTests(_Base):
+class FailedRefreshTests(_Base, unittest.TestCase):
     SCENARIO = 'failed_fetch'
 
     def test_a_failed_refresh_leaves_the_page_as_it_was_and_says_so(self):
@@ -218,7 +216,7 @@ class FailedRefreshTests(_Base):
         self.assertEqual(self.obs['retried']['alpha']['status'], 'OK')
 
 
-class FromEmptyTests(_Base):
+class FromEmptyTests(_Base, unittest.TestCase):
     SCENARIO = 'from_empty'
 
     def test_the_first_accounts_replace_the_empty_state_without_a_reload(self):
@@ -232,7 +230,7 @@ if __name__ == '__main__':
     unittest.main(verbosity=2)
 
 
-class StatsSectionTests(_Base):
+class StatsSectionTests(_Base, unittest.TestCase):
     """The account stats under the list (dev/changelog/1029) are outside the live region:
     the minute swap must not redraw them or throw away a sort the user picked."""
     SCENARIO = 'stats_swap'
@@ -244,7 +242,7 @@ class StatsSectionTests(_Base):
         self.assertTrue(self.obs['sortKept'])
 
 
-class WindowChipTests(_Base):
+class WindowChipTests(_Base, unittest.TestCase):
     SCENARIO = 'window_chip'
 
     def test_a_chip_saves_the_window_to_the_shared_pref_then_follows_its_link(self):
@@ -255,7 +253,7 @@ class WindowChipTests(_Base):
         self.assertEqual(self.obs['navigations'], 1)
 
 
-class TableSortTests(_Base):
+class TableSortTests(_Base, unittest.TestCase):
     SCENARIO = 'sort'
 
     def test_names_sort_both_ways_and_the_totals_row_stays_last(self):
@@ -274,7 +272,7 @@ class TableSortTests(_Base):
         self.assertIn('Pass rate', self.obs['chipLabel'])
 
 
-class ColumnTooltipTests(_Base):
+class ColumnTooltipTests(_Base, unittest.TestCase):
     SCENARIO = 'column_tip'
 
     def test_the_column_tooltip_names_each_account_in_its_color(self):

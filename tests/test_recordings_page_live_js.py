@@ -124,13 +124,11 @@ def _observe():
 
 @unittest.skipIf(shutil.which('node') is None, 'node not installed')
 @unittest.skipIf(not os.path.isdir(JSDOM), 'jsdom not installed (npm install)')
-class _Base(unittest.TestCase):
+class _Base:
     SCENARIO = ''
 
     @classmethod
     def setUpClass(cls):
-        if not cls.SCENARIO:
-            raise unittest.SkipTest('base class - carries the shared cases only')
         cls.obs = _observe()[cls.SCENARIO]
         if isinstance(cls.obs, dict) and 'error' in cls.obs:
             raise AssertionError(f'{cls.SCENARIO} threw in the page:\n{cls.obs["error"]}')
@@ -139,7 +137,7 @@ class _Base(unittest.TestCase):
         self.assertEqual(self.obs['errors'], [])
 
 
-class BootTests(_Base):
+class BootTests(_Base, unittest.TestCase):
     SCENARIO = 'boot'
 
     def test_the_hook_is_registered_and_the_signatures_agree(self):
@@ -157,7 +155,7 @@ class BootTests(_Base):
         self.assertIn('cancel', self.obs['soonActs'])
 
 
-class StartedTests(_Base):
+class StartedTests(_Base, unittest.TestCase):
     SCENARIO = 'started'
 
     def test_the_row_moves_to_in_progress_and_offers_stop(self):
@@ -176,7 +174,7 @@ class StartedTests(_Base):
         self.assertEqual(self.obs['after']['pageFetchesAfterNextPoll'], 1)
 
 
-class FinishedTests(_Base):
+class FinishedTests(_Base, unittest.TestCase):
     SCENARIO = 'finished'
 
     def test_a_finished_recording_stops_offering_stop(self):
@@ -189,7 +187,7 @@ class FinishedTests(_Base):
         self.assertEqual(self.obs['navigations'], [])
 
 
-class SearchAndSortTests(_Base):
+class SearchAndSortTests(_Base, unittest.TestCase):
     SCENARIO = 'search_and_sort'
 
     def test_the_search_still_filters_the_new_rows(self):
@@ -204,7 +202,7 @@ class SearchAndSortTests(_Base):
         self.assertEqual(self.obs['liveOrder'], [_IDS['live'], _IDS['soon']])
 
 
-class FilterTests(_Base):
+class FilterTests(_Base, unittest.TestCase):
     SCENARIO = 'filter'
 
     def test_a_filter_chip_survives_and_filters_the_new_rows(self):
@@ -214,7 +212,7 @@ class FilterTests(_Base):
         self.assertEqual(sorted(self.obs['visibleAfter']), sorted([_IDS['live'], _IDS['done']]))
 
 
-class MenuHoldTests(_Base):
+class MenuHoldTests(_Base, unittest.TestCase):
     SCENARIO = 'menu_hold'
 
     def test_an_open_row_menu_holds_the_swap(self):
@@ -229,7 +227,7 @@ class MenuHoldTests(_Base):
         self.assertEqual(self.obs['afterClose']['soonSection'], 'live')
 
 
-class TickTests(_Base):
+class TickTests(_Base, unittest.TestCase):
     SCENARIO = 'tick'
 
     def test_a_background_tab_is_not_ticked(self):
@@ -248,7 +246,7 @@ class TickTests(_Base):
         self.assertEqual(self.obs['timesFetchesRightAfter'], 1)
 
 
-class ActionTests(_Base):
+class ActionTests(_Base, unittest.TestCase):
     SCENARIO = 'action'
 
     def test_a_delete_refreshes_the_list_instead_of_reloading(self):
@@ -307,7 +305,7 @@ class TimesEndpointTests(unittest.TestCase):
 
 
 
-class SavedDefaultTests(_Base):
+class SavedDefaultTests(_Base, unittest.TestCase):
     """A saved filter marked default is on before the list is first seen, and survives the
     live swap (dev/changelog/1156)."""
     SCENARIO = 'saved_default'

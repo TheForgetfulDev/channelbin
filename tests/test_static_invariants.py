@@ -2348,6 +2348,60 @@ class PatchCreateTests(unittest.TestCase):
                          [(1, 'mock.patch.object'), (2, 'mock.patch')])
 
 
+def _collected_base_offenders(source):
+    """(lineno, name) for each module-level `_Name` class that the test loader collects as a
+    TestCase and that carries test methods of its own."""
+    cases, out = set(), []
+    for node in ast.parse(source).body:
+        if not isinstance(node, ast.ClassDef):
+            continue
+        bases = [ast.unparse(b) for b in node.bases]
+        if not any(b.endswith('TestCase') or b in cases for b in bases):
+            continue
+        cases.add(node.name)
+        if node.name.startswith('_') and any(
+                isinstance(f, ast.FunctionDef) and f.name.startswith('test') for f in node.body):
+            out.append((node.lineno, node.name))
+    return out
+
+
+class CollectedBaseClassTests(unittest.TestCase):
+    """A shared base that carries test methods is a plain mixin, not a TestCase.
+
+    The loader collects every module-level TestCase, the underscore included. Fifteen
+    scenario bases skipped themselves from setUpClass, so every run reported 16 skips that
+    meant nothing and a real skip could hide among them; three more ran their shared test
+    once over with nothing to observe, and two timing fixtures ran as real tests
+    (dev/changelog/1260). Declare the base as `class _Base:` and each case as
+    `class X(_Base, unittest.TestCase)`.
+    """
+
+    def test_no_base_class_is_collected_with_tests_of_its_own(self):
+        offenders = []
+        for path in _walk(TESTS_DIR, '.py'):
+            for lineno, name in _collected_base_offenders(_read(path)):
+                offenders.append(f'{_rel(path)}:{lineno}: {name}')
+        self.assertEqual(
+            sorted(offenders), [],
+            'These underscore bases are TestCases with test methods, so the suite collects '
+            'and runs (or skips) them on their own (dev/changelog/1260). Make each a plain '
+            'mixin and put unittest.TestCase on the classes built from it:\n'
+            + '\n'.join(sorted(offenders)))
+
+    def test_the_detector_names_the_shape(self):
+        planted = ("class _Base(unittest.TestCase):\n"
+                   "    def test_shared(self): pass\n"
+                   "class _More(_Base):\n"
+                   "    def test_more(self): pass\n"
+                   "class _Fixture(unittest.TestCase):\n"
+                   "    def setUp(self): pass\n"
+                   "class _Mixin:\n"
+                   "    def test_shared(self): pass\n"
+                   "class RealTests(_Mixin, unittest.TestCase):\n"
+                   "    def test_real(self): pass\n")
+        self.assertEqual(_collected_base_offenders(planted), [(1, '_Base'), (3, '_More')])
+
+
 class JinjaBuiltinTests(unittest.TestCase):
     """Python builtins used as kwargs inside a Jinja expression raise UndefinedError at render
     (`request.args.get('x', type=int)`) - CLAUDE.md Jinja hazards."""

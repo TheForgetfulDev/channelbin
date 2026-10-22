@@ -330,35 +330,47 @@ const jobWindow = j => [j.start, j.start + (j.est_seconds || 0) * 1000];
 /* Why a job is worth flagging, as prose, or null.
 
    16.4: the timeline exists to surface a decision the app already makes in the dark.
-   scheduler.py yields a scheduled account sync when a recording is in progress, or when
-   one starts within skip_sync_if_recording_within_minutes - and today the user learns
-   this afterwards, if at all. The wording mirrors accounts.py's sync_conflicts, which
-   already names the conflict AND its consequence.
+   The scheduler defers a scheduled account sync or health check when a recording is
+   capturing at fire time, or when one starts within the job's lead time - and the user
+   learns this afterwards, if at all. `job.guard` is that rule as _build_job_list() reads
+   it from config (routes/jobs.py::_recording_guard): which kind of job it is, whether the
+   capturing guard applies, and the lead time in minutes (0 = off). The wording mirrors
+   accounts.py's sync_conflicts, which already names the conflict AND its consequence.
 
    "Deferred", not "skipped": since dev/changelog/941 the occurrence is not dropped - the
-   scheduler queues one retry at the first gap long enough to finish the sync in, which
-   appears on this same timeline as its own account_sync_retry_<id> mark. A tooltip that
-   still threatened a skip would describe a behavior the backend no longer has. */
-function jobClash(job, recs, guards) {
+   scheduler queues one retry at the first gap long enough to finish the job in, which
+   appears on this same timeline as its own retry mark. A tooltip that still threatened
+   a skip would describe a behavior the backend no longer has. */
+function jobClash(job, recs) {
+  const g = job.guard;
   // Only a job that has not fired yet. Both guards are evaluated by the scheduler AT
   // FIRE TIME, so a run already under way cannot be deferred by them - saying otherwise
   // would put a warning on the axis that the code behind it would never produce.
-  if (!job.is_sync || job.start <= TL.data.now) return null;
+  if (!g || job.start <= TL.data.now) return null;
   const [js] = jobWindow(job);
-  const guardMs = guards.skipWithinMinutes * MIN;
+  const REC = statusVocab('REC_STATUS');
+  const retry = `It retries at the first gap long enough to finish in.`;
   for (const r of recs) {
     const [rs, re] = recWindow(r);
-    if (guards.skipIfRecordingActive && r.status === statusVocab('REC_STATUS').IN_PROGRESS && js >= rs && js < re) {
-      return `Will be deferred: "${r.name}" is recording, and syncing now would count `
-           + `against this account's connection limit. It retries at the first gap long `
-           + `enough to finish in.`;
+    // A recording booked across the job's start is capturing by the time the job fires,
+    // even though it is still SCHEDULED now - that is the guard's most common case, not
+    // an edge of it.
+    if (g.active && (r.status === REC.IN_PROGRESS || r.status === REC.SCHEDULED)
+        && js >= rs && js < re) {
+      return `Will be deferred: "${r.name}" ${r.status === REC.IN_PROGRESS ? 'is' : 'will be'} `
+           + `recording then, and running this ${g.what} alongside it would count against `
+           + `the connection limit. ${retry}`;
     }
     // Measured from the recording's START, not from its estimated finish, because
-    // that is what scheduler.py compares against.
-    if (r.status === statusVocab('REC_STATUS').SCHEDULED && rs >= js && rs - js <= guardMs) {
-      return `Will be deferred: "${r.name}" starts within ${guards.skipWithinMinutes} `
-           + `minutes of it, and a sync that late risks the recording's first segment. `
-           + `It retries at the first gap long enough to finish in.`;
+    // that is what the scheduler compares against.
+    if (g.within_minutes > 0 && r.status === REC.SCHEDULED && rs >= js
+        && rs - js <= g.within_minutes * MIN) {
+      // Each kind's own reason, as its guard words it: sync_conflicts for a sync,
+      // imminent_recording_conflict for a health check.
+      const why = g.what === 'sync' ? `a sync that late risks the recording's first segment`
+        : `a ${g.what} then may compete with it for the connection limit`;
+      return `Will be deferred: "${r.name}" starts within ${g.within_minutes} `
+           + `minutes of it, and ${why}. ${retry}`;
     }
   }
   return null;
@@ -399,14 +411,9 @@ function tlBar(r, now) {
     <span class="tl-ch">${escHtml(r.channel || '')}</span></div>`;
 }
 
-function jobDurationLine(j) {
-  // 16.3: a job with no run history is drawn as an outline with NO LENGTH, because
-  // the app has no estimate and inventing one puts a number on the axis that nothing
-  // backs. Every job takes this branch today - runtime estimates do not exist yet.
-  if (!j.est_seconds) return 'Expected runtime unknown - this job has no recorded run history.';
-  return `Usually takes about ${fmtDur(j.est_seconds, false)} `
-       + `(average of the last ${j.runs} run${j.runs === 1 ? '' : 's'}).`;
-}
+// The server's sentence (routes/jobs.py, the one /jobs shows), so the two pages word an
+// estimate - or its absence - identically. None for a job with no history tracked at all.
+const jobDurationLine = j => j.duration_line || null;
 
 function jobMark(j, clash) {
   const [s, e] = jobWindow(j);
@@ -468,7 +475,7 @@ function renderTimeline() {
     ticks.push(`<span class="tl-tick${anchor}" style="left:${px.toFixed(1)}px">${escHtml(fmtClock(t))}</span>`);
   }
 
-  const clashes = jobsIn.map(j => jobClash(j, inWin, TL.data.syncGuards));
+  const clashes = jobsIn.map(j => jobClash(j, inWin));
   const nClash = clashes.filter(Boolean).length;
   const laneHtml = lanes.map(L => `<div class="tl-lane">${L.map(r => tlBar(r, now)).join('')}</div>`).join('')
     || '<div class="tl-lane"></div>';

@@ -216,13 +216,11 @@ def _observe():
 
 @unittest.skipIf(shutil.which('node') is None, 'node not installed')
 @unittest.skipIf(not os.path.isdir(JSDOM), 'jsdom not installed (npm install)')
-class _Base(unittest.TestCase):
+class _Base:
     SCENARIO = ''
 
     @classmethod
     def setUpClass(cls):
-        if not cls.SCENARIO:
-            raise unittest.SkipTest('base class - carries the shared cases only')
         cls.obs = _observe()[cls.SCENARIO]
         if isinstance(cls.obs, dict) and 'error' in cls.obs:
             raise AssertionError(f'{cls.SCENARIO} threw in the page:\n{cls.obs["error"]}')
@@ -231,7 +229,7 @@ class _Base(unittest.TestCase):
         self.assertEqual(self.obs['errors'], [])
 
 
-class BootTests(_Base):
+class BootTests(_Base, unittest.TestCase):
     SCENARIO = 'boot'
 
     def test_both_hooks_are_registered_on_the_nav_status_poll(self):
@@ -255,7 +253,7 @@ class BootTests(_Base):
         self.assertEqual(self.obs['runFetches'], 0)
 
 
-class SyncFinishedTests(_Base):
+class SyncFinishedTests(_Base, unittest.TestCase):
     SCENARIO = 'sync_finished'
 
     def test_the_section_is_swapped_for_a_fresh_server_render(self):
@@ -279,7 +277,7 @@ class SyncFinishedTests(_Base):
         self.assertEqual(self.obs['pageFetchesAfterNextPoll'], 1)
 
 
-class SortTests(_Base):
+class SortTests(_Base, unittest.TestCase):
     SCENARIO = 'sort_survives'
 
     def test_the_sort_was_actually_applied_before_the_swap(self):
@@ -297,7 +295,7 @@ class SortTests(_Base):
         self.assertEqual(self.obs['reversible']['names'], ['zulu', 'alpha'])
 
 
-class UnsortedTests(_Base):
+class UnsortedTests(_Base, unittest.TestCase):
     SCENARIO = 'unsorted_stays'
 
     def test_an_unsorted_section_stays_in_the_servers_order(self):
@@ -308,7 +306,7 @@ class UnsortedTests(_Base):
         self.assertIsNone(self.obs['sorted'])
 
 
-class CheckStartsTests(_Base):
+class CheckStartsTests(_Base, unittest.TestCase):
     SCENARIO = 'check_starts'
 
     def test_the_page_opened_with_no_run(self):
@@ -329,7 +327,7 @@ class CheckStartsTests(_Base):
         self.assertIn('RUNNING', self.obs['after']['badge'])
 
 
-class OnePollChainTests(_Base):
+class OnePollChainTests(_Base, unittest.TestCase):
     SCENARIO = 'one_poll_chain'
 
     def test_the_run_is_polled(self):
@@ -347,7 +345,7 @@ class OnePollChainTests(_Base):
         self.assertTrue(self.obs['hasCard'])
 
 
-class RunChangesTests(_Base):
+class RunChangesTests(_Base, unittest.TestCase):
     SCENARIO = 'run_changes'
 
     def test_the_card_started_on_the_first_run(self):
@@ -369,7 +367,7 @@ class RunChangesTests(_Base):
         self.assertEqual(self.obs['chains'], 1)
 
 
-class CheckEndsTests(_Base):
+class CheckEndsTests(_Base, unittest.TestCase):
     SCENARIO = 'check_ends'
 
     def test_the_page_opened_mid_run(self):
@@ -394,7 +392,7 @@ class CheckEndsTests(_Base):
         self.assertEqual(self.obs['ended']['pageFetchesAfterNavPoll'], 1)
 
 
-class FailedRefreshTests(_Base):
+class FailedRefreshTests(_Base, unittest.TestCase):
     SCENARIO = 'failed_refresh'
 
     def test_a_failed_refresh_leaves_the_page_as_it_was(self):
@@ -415,7 +413,7 @@ class FailedRefreshTests(_Base):
         self.assertIn('alpha:OK', self.obs['retried']['statuses'])
 
 
-class AgedTests(_Base):
+class AgedTests(_Base, unittest.TestCase):
     SCENARIO = 'aged'
 
     def test_a_fresh_render_is_not_refetched(self):
@@ -431,7 +429,7 @@ class AgedTests(_Base):
         self.assertEqual(self.obs['rightAfter'], 1)
 
 
-class HiddenSectionTests(_Base):
+class HiddenSectionTests(_Base, unittest.TestCase):
     SCENARIO = 'hidden_section'
 
     def test_a_section_hidden_in_customize_is_not_refetched_on_the_tick(self):
@@ -517,7 +515,7 @@ if __name__ == '__main__':
 # ── The recording regions (dev/changelog/1143) ─────────────────────────────
 
 
-class RecordingBootTests(_Base):
+class RecordingBootTests(_Base, unittest.TestCase):
     SCENARIO = 'rec_boot'
 
     def test_the_hook_is_registered_on_the_nav_status_poll(self):
@@ -533,7 +531,7 @@ class RecordingBootTests(_Base):
         self.assertEqual(self.obs['pageFetches'], 0)
 
 
-class RecordingStartedByPollTests(_Base):
+class RecordingStartedByPollTests(_Base, unittest.TestCase):
     """The defect: a recording that started while / was open stayed under Upcoming as
     Scheduled, the live section kept its empty state and the tiles kept their counts."""
     SCENARIO = 'rec_started_by_poll'
@@ -573,7 +571,7 @@ class RecordingStartedByPollTests(_Base):
         self.assertEqual(self.obs['after']['pageFetchesAfterNextPoll'], 1)
 
 
-class RecordingStartedBySseTests(_Base):
+class RecordingStartedBySseTests(_Base, unittest.TestCase):
     """The row's own status frame moves it at once, rather than at the next nav poll - the
     job the 3s page reload used to do."""
     SCENARIO = 'rec_started_by_sse'
@@ -585,7 +583,7 @@ class RecordingStartedBySseTests(_Base):
         self.assertEqual(self.obs['navigations'], [])
 
 
-class RecordingFinishedTests(_Base):
+class RecordingFinishedTests(_Base, unittest.TestCase):
     SCENARIO = 'rec_finished'
 
     def test_a_finished_recording_leaves_the_live_section_without_a_reload(self):
@@ -596,7 +594,7 @@ class RecordingFinishedTests(_Base):
         self.assertEqual(self.obs['navigations'], [])
 
 
-class RecordingUserStateTests(_Base):
+class RecordingUserStateTests(_Base, unittest.TestCase):
     SCENARIO = 'rec_user_state'
 
     def test_the_sort_survives_and_takes_in_the_new_row(self):
@@ -610,7 +608,7 @@ class RecordingUserStateTests(_Base):
         self.assertTrue(self.obs['liveHidden'])
 
 
-class ReorderTests(_Base):
+class ReorderTests(_Base, unittest.TestCase):
     SCENARIO = 'rec_reorder'
 
     def test_a_customize_move_still_reorders(self):
@@ -619,7 +617,7 @@ class ReorderTests(_Base):
         self.assertEqual(self.obs['after'][i - 1], 'live')
 
 
-class RecordingMinuteTickTests(_Base):
+class RecordingMinuteTickTests(_Base, unittest.TestCase):
     """"Starts in 5m" and the Next recording tile drift while nothing changes, so the
     signature alone cannot keep them true."""
     SCENARIO = 'rec_minute_tick'
