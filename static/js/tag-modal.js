@@ -111,8 +111,8 @@ function openTagModal(opts) {
     '</div>' +
     fieldRow({
       label: 'Name', stack: true,
-      meta: 'Lowercase letters, numbers, hyphens and underscores. This is the value used ' +
-        'in filename template placeholders - <code>{tag:name}</code> and <code>{!tag:name}</code>.',
+      meta: 'Lowercase letters, numbers, hyphens and underscores. A file name uses it as ' +
+        '<code>{tag:name}</code>, which writes the name when the program has the marker.',
       control: `<input type="text" id="tag-name" value="${escHtml(tag ? tag.name : '')}" ` +
         'placeholder="e.g. live, new">',
     }) +

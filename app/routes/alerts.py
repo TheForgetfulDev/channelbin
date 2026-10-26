@@ -13,7 +13,7 @@ GET  /alerts/ignored            - Ignored-alert-pattern management page
 POST /api/alerts/ignored/<id>/remove - Remove one suppression rule
 """
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from flask import Blueprint, jsonify, render_template, request, url_for
 from sqlalchemy import case, func
@@ -24,6 +24,7 @@ from ..alerts import (ALERT_TYPES, SELF_CLEARING_ALERT_TYPES, is_self_clearing,
                       normalize_alert_title)
 from ..channel_search import OTHER_NEW, OTHER_REMOVED
 from ..database import Alert, IgnoredAlertPattern
+from ..config import load_config
 from ..db_utils import retry_on_locked
 from ..tz_utils import format_local
 
@@ -34,6 +35,11 @@ _LIFECYCLE_ALERT_OTHER_VALUE = {
     'SYNC_CHANNELS_NEW': OTHER_NEW,
     'SYNC_CHANNELS_MISSING': OTHER_REMOVED,
 }
+
+#: How long an alert the app took down stays on the Alerts page's default view. A badge that
+#: came and went during a stall is otherwise gone without a trace by the time anyone opens the
+#: page (dev/changelog/1293).
+CLEARED_RECENTLY = timedelta(hours=24)
 
 _OD_JOB_SOURCE_RE = re.compile(r'^od_job_(\d+)$')
 _ACCOUNT_SYNC_SOURCE_RE = re.compile(r'^account_sync(?:_retry)?_(\d+)$')
@@ -76,7 +82,7 @@ def _resolve_alert_link(a: Alert) -> tuple[str, str] | None:
     other_value = _LIFECYCLE_ALERT_OTHER_VALUE.get(a.alert_type)
     if other_value is not None and len(parts) == 3 and parts[0] == 'account' and parts[1].isdigit():
         return (url_for('channels.channel_browser', **{'f.other': other_value, 'f.acct': parts[1]}),
-                'Channels')
+                'Channel Search')
 
     if len(parts) >= 2 and parts[1].isdigit():
         if parts[0] == 'group':
@@ -130,6 +136,7 @@ def _alert_to_dict(a: Alert) -> dict:
         'created_at':  _fmt(a.created_at),
         'read_at':     _fmt(a.read_at),
         'dismissed_at': _fmt(a.dismissed_at),
+        'cleared_by_app': bool(a.cleared_by_app),
         'is_unread':   a.read_at is None,
         'self_clearing': is_self_clearing(a.alert_type),
         'is_active_problem': _is_active_problem(a),
@@ -168,22 +175,35 @@ def alert_center():
     if not include_dismissed:
         q = q.filter(Alert.dismissed_at.is_(None))
     alerts = q.limit(500).all()
+    # Its own query in both views: the default view loads no dismissed rows at all, and
+    # with them included a cleared row is listed here rather than a second time under Past.
+    cleared_alerts = Alert.query.filter(
+        Alert.cleared_by_app.is_(True),
+        Alert.dismissed_at >= datetime.utcnow() - CLEARED_RECENTLY,
+    ).order_by(Alert.dismissed_at.desc()).limit(100).all()
+    cleared_ids = {a.id for a in cleared_alerts}
     # Partitioned in Python off a frozenset lookup rather than as two queries: the rows are
     # already loaded, and a second query here would be one more per page for no new data
     # (CLAUDE.md, no hidden I/O in per-row loops - tests/test_scaling_pages.py measures it).
     active_alerts, past_alerts = [], []
     for a in alerts:
+        if a.id in cleared_ids:
+            continue
         (active_alerts if _is_active_problem(a) else past_alerts).append(a)
     unread_count = Alert.query.filter(Alert.read_at.is_(None),
                                       Alert.dismissed_at.is_(None)).count()
-    alert_links = {a.id: _resolve_alert_link(a) for a in alerts}
+    alert_links = {a.id: _resolve_alert_link(a) for a in alerts + cleared_alerts}
     return render_template('alerts.html',
                            active_alerts=active_alerts,
                            past_alerts=past_alerts,
+                           cleared_alerts=cleared_alerts,
                            include_dismissed=include_dismissed,
                            unread_count=unread_count,
                            alert_links=alert_links,
-                           alert_sig=alert_sig)
+                           alert_sig=alert_sig,
+                           # The page says how long a "not capturing" alert outlives the
+                           # stream's return; the watchdog clears it on this same key.
+                           early_fail_window=load_config()['watchdog']['early_fail_window_seconds'])
 
 
 @alerts_bp.route('/api/alerts')
@@ -312,7 +332,8 @@ def api_dismiss(alert_id):
     now = datetime.utcnow()
     if alert.read_at is None:
         alert.read_at = now
-    alert.dismissed_at = now
+    if alert.dismissed_at is None:
+        alert.dismissed_at = now
     db.session.commit()
     return jsonify({'success': True})
 
@@ -367,7 +388,10 @@ def _dismiss_alert(alert_id):
     now = datetime.utcnow()
     if alert.read_at is None:
         alert.read_at = now
-    alert.dismissed_at = now
+    # An alert that already cleared itself keeps when it cleared: ignoring one from the
+    # Cleared recently card must not restamp it as a fresh dismissal.
+    if alert.dismissed_at is None:
+        alert.dismissed_at = now
     db.session.commit()
     return True
 

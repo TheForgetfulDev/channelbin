@@ -19,6 +19,7 @@ which these tests assert on. Every harness runs under `make_test_app()`'s defaul
 no-op path - that path itself is what `NoSchedulerGracefulNoopTests` asserts on directly; every
 other test here only cares about the DB-side transition, not the APScheduler job.
 """
+import json
 import os
 import subprocess
 import sys
@@ -142,6 +143,11 @@ class ScheduleRetryInsteadOfImmediateFailureTests(_RetryHarness):
         evt = self._last_event(RECORDING_RETRY_SCHEDULED)
         self.assertIn('attempt 1/3', evt.detail)
         self.assertIn('1 min', evt.detail)
+        # The streak and cause ride on the event so the recording page can word the trip
+        # the way the alert does (app/recording_story.py, dev/changelog/1270).
+        extra = json.loads(evt.extra_data)
+        self.assertEqual(extra['streak'], 1)
+        self.assertIn('cause', extra)
 
         self.assertIsNone(
             RecordingEvent.query.filter_by(
@@ -255,12 +261,28 @@ class RetryingAlertTests(_RetryHarness):
         self.assertIn('no more than 10 min apart', rows[0].body)
 
         # A second trip on the same outage raises nothing new.
-        wdmod.raise_recording_retrying_alert(rec, 3, 10, 10, None)
+        wdmod.raise_recording_retrying_alert(rec, 3, 10, 10, None, 60)
         self.assertEqual(len(self._open()), 1)
+
+    def test_the_body_says_how_long_the_stream_must_keep_coming(self):
+        """dev/changelog/1274 (first-time-user finding 27): the alert clears only once a segment
+        grows past early_fail_window_seconds, so it stood about a minute after
+        RESTART_SUCCEEDED on a page promising it clears itself. The body names the
+        configured window, read by the watchdog, not a number of its own."""
+        self._extra_watchdog_cfg = {'early_fail_abort_count': 1,
+                                    'dead_stream_max_retry_attempts': 10,
+                                    'early_fail_window_seconds': 47}
+        self.state.process = sleeper()
+        with mock.patch.object(recorder, 'failover_group_member', return_value=False):
+            self._run_until_event(RECORDING_RETRY_SCHEDULED, stall_timeout=1,
+                                  restart_delay=0, produces_data=False)
+        rows = self._open()
+        self.assertEqual(len(rows), 1)
+        self.assertIn('kept coming for 47 s', rows[0].body)
 
     def test_the_recording_ending_clears_it(self):
         rec = db.session.get(Recording, self.rid)
-        wdmod.raise_recording_retrying_alert(rec, 3, 1, 10, None)
+        wdmod.raise_recording_retrying_alert(rec, 3, 1, 10, None, 60)
         self.assertEqual(len(self._open()), 1)
         with mock.patch('app.concatenator.do_concatenation'):
             recorder.stop_recording(self.t.app, self.rid)
@@ -271,7 +293,7 @@ class RetryingAlertTests(_RetryHarness):
         """The stream came back: the segment is still growing once it can no longer count
         as an early failure, so "not capturing" would now be false."""
         rec = db.session.get(Recording, self.rid)
-        wdmod.raise_recording_retrying_alert(rec, 3, 1, 10, None)
+        wdmod.raise_recording_retrying_alert(rec, 3, 1, 10, None, 60)
         writer = subprocess.Popen(
             [sys.executable, '-c',
              'import sys, time\n'
@@ -299,7 +321,7 @@ class RetryingAlertTests(_RetryHarness):
 
     def test_aborting_clears_it(self):
         rec = db.session.get(Recording, self.rid)
-        wdmod.raise_recording_retrying_alert(rec, 3, 1, 10, None)
+        wdmod.raise_recording_retrying_alert(rec, 3, 1, 10, None, 60)
         recorder.abort_recording(self.t.app, self.rid)
         db.session.expire_all()
         self.assertEqual(self._open(), [])

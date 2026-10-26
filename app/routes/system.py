@@ -1,9 +1,12 @@
 import os
+import threading
+import time
 
 from flask import Blueprint, jsonify, render_template, request
 
 from ..config import load_config
 from ..config_backup import get_backup_dir
+from ..db_utils import wal_size_bytes
 from ..fs_utils import (DirProbe, PATH_MISSING, PATH_OK, PATH_UNREACHABLE,
                         classify_oserror, probe_dir, probe_writable_dir)
 # Re-exported: the dashboard, the HA API and Readiness import the roles from here.
@@ -179,13 +182,34 @@ def _system_stats_dict():
             except OSError:
                 same_drive = True
 
-    return {
+    stats = {
         'cpu_percent': cpu,
         'memory': mem_info,
         'disk_dvr': disk_dvr,
         'disk_complete': disk_complete if not same_drive else None,
         'same_drive': same_drive,
     }
+    with _last_stats_lock:
+        _last_stats.update(at=time.monotonic(), value=stats)
+    return stats
+
+
+#: The last stats any poll measured, so a page's first paint can show them instead of
+#: dashes until its own first poll answers (dev/changelog/1292). Measuring them in the
+#: context processor would cost every page the 0.1 s CPU sample.
+_last_stats: dict = {}
+_last_stats_lock = threading.Lock()
+#: How old a measurement may be and still be drawn: two of the default 15 s polls.
+LAST_STATS_MAX_AGE = 30
+
+
+def cached_system_stats():
+    """The last measured stats if they are fresh, otherwise None. Never measures."""
+    with _last_stats_lock:
+        cached = dict(_last_stats)
+    if cached.get('at') is not None and time.monotonic() - cached['at'] < LAST_STATS_MAX_AGE:
+        return cached['value']
+    return None
 
 
 @system_bp.route('/maintenance')
@@ -239,12 +263,20 @@ def storage_details():
     images_dir = images_root(cfg)
     backup_dir = get_backup_dir()
 
+    # The whole database is dvr.db plus its -wal: on a new install nearly everything is still
+    # in the write-ahead log, and dvr.db alone read "4.0 KB" beside 1,844 programs
+    # (dev/docs/BUGS.md 2026-10-26 09:35:01 AM). The -wal share is sent on its own so the
+    # row can say it.
     db_bytes = None
+    db_wal_bytes = None
     if db_path and os.path.isfile(db_path):
         try:
-            db_bytes = os.path.getsize(db_path)
+            main_bytes = os.path.getsize(db_path)
         except OSError:
-            pass
+            main_bytes = None
+        if main_bytes is not None:
+            db_wal_bytes = wal_size_bytes(db_path)
+            db_bytes = main_bytes + db_wal_bytes
 
     dvr_bytes = None
     dvr_file_count = None
@@ -278,6 +310,7 @@ def storage_details():
 
     return jsonify(
         db_bytes=db_bytes,
+        db_wal_bytes=db_wal_bytes,
         db_path=db_path,
         dvr_dir=dvr_dir,
         dvr_bytes=dvr_bytes,

@@ -276,9 +276,17 @@ class CaptureTests(_AnswerKey):
     def test_a_reconnect_inside_a_segment_holds_the_burst_twice(self):
         """A silent connection, then ffmpeg's own reconnect inside the segment: the new
         connection's burst sends again what the first one sent, so the segment holds that
-        stretch twice. Its file timeline counts the repeat; the distinct content does not."""
+        stretch twice. Its file timeline counts the repeat; the distinct content does not.
+
+        How long the repeat is depends on where the loop stands when the first connection
+        opens: both connections open at a keyframe, the same one or the next (2.1 s on), so the
+        repeat is what the first sent or that less a keyframe interval. It is read from the
+        ledger, never a fixed figure. When the silence cuts a frame short, ffmpeg closes the
+        backward jump once per stream and leaves a hole in the file's timeline as long as the
+        repeat (dev/changelog/1237), so the capture runs long enough to read the second
+        connection past where the first one stopped either way (dev/docs/BUGS.md 2026-10-25)."""
         self.sim.inject('silent_socket', self.label, times=1, after_bytes=200_000)
-        path = self.capture(8)
+        path = self.capture(12)
         answer = ak.check(self.sim, [path], min_gap=0.25)
         self.assertAnswer(answer, not answer.problems, 'no problems')
         runs = answer.stretches
@@ -291,11 +299,16 @@ class CaptureTests(_AnswerKey):
         overlap = sum(max(0.0, min(b0, b1) - max(a0, a1))
                       for a0, b0 in runs[0].pieces for a1, b1 in runs[1].pieces)
         self.assertAlmostEqual(answer.repeated_seconds, overlap, places=5)
-        self.assertGreater(answer.repeated_seconds, 1.0)
+        # Send time against shown time: B-frames move either edge by up to three frames.
+        sent_twice = silent.offered[1] - again.offered[0]
+        self.assertGreater(sent_twice, 0.5)
+        self.assertAlmostEqual(answer.repeated_seconds, sent_twice, delta=4 * FRAME,
+                               msg=answer.describe())
         self.assertEqual(answer.lost, [])
         seg = answer.segments[0]
         self.assertLessEqual(seg.unidentified, 1)   # at most the frame the silence cut short
-        self.assertGreater(seg.file_video_seconds - seg.distinct_seconds, 1.0)
+        self.assertGreater(seg.file_video_seconds - seg.distinct_seconds,
+                           answer.repeated_seconds - 2 * FRAME)
 
     def test_a_gap_between_segments_is_lost_and_says_no_connection_was_sending(self):
         """Two segments with the channel clock moved 30 s on between them: the gap is lost,
@@ -325,12 +338,21 @@ class CaptureTests(_AnswerKey):
         frames, the loss starts where the window does
         plus the time a frame is sent ahead of when it is shown (0.68 to 0.89 s on this loop),
         and only the frames inside the window are put down to the fault - a B-frame missing
-        where the segment ends is not."""
+        where the segment ends is not.
+
+        The burst opens at a keyframe up to 2.1 s before its 4 s, so the window lands 1 to
+        3.1 s into the segment and its last withheld frame is shown up to 6.1 s in. A 5 s
+        segment ended inside the window on 4 of 10 runs, and the answer then counted only what
+        was withheld before the recording's last frame (dev/docs/BUGS.md 2026-10-25 07:04 pm).
+        7 s always holds video past the window, which costs up to 2.2 s of real time."""
         start = at(-3.0)
         self.sim.inject('video_stops', self.label, start=start, end=start + dt.timedelta(
             seconds=2))
-        answer = ak.check(self.sim, [self.capture(5)])
+        answer = ak.check(self.sim, [self.capture(7)])
         self.assertAnswer(answer, not answer.problems, 'no problems')
+        s0 = start.replace(tzinfo=dt.timezone.utc).timestamp()
+        self.assertAnswer(answer, answer.stretches[-1].end > s0 + 2 + 1.0,
+                          'the recording holds video past the window')
         withheld = [x for x in answer.lost if x.reason == ak.REASON_WITHHELD]
         self.assertAnswer(answer, withheld, 'something withheld')
         self.assertTrue(all('video_stops' in x.detail for x in withheld))
@@ -340,7 +362,6 @@ class CaptureTests(_AnswerKey):
         total = sum(x.seconds for x in withheld)
         self.assertAnswer(answer, 58 * FRAME - 1e-3 <= total <= 62 * FRAME + 1e-3,
                           f'{total / FRAME:.2f} frames withheld')
-        s0 = start.replace(tzinfo=dt.timezone.utc).timestamp()
         lead = withheld[0].start - s0
         self.assertAnswer(answer, 0.6 < lead < 1.0, f'lead {lead:.3f}')
         self.assertAnswer(answer, withheld[-1].end < s0 + 2 + 1.0, 'nothing past the window')

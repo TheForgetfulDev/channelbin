@@ -58,6 +58,9 @@ class HideRulesPageTests(unittest.TestCase):
         cls.app = cls.t.app
         cls.client = cls.app.test_client()
         with cls.app.app_context():
+            # The divider-row defaults every install starts with (dev/changelog/1276) would
+            # change the rule tiles' counts; this page's tiles are tested over one known rule.
+            ChannelHideRule.query.delete()
             acct = seed.make_account(name='Test Provider')
             cls.acct_id = acct.id
             # One channel offered, one hidden by hand, one hidden-but-deferred (in the
@@ -127,10 +130,10 @@ class HideRulesPageTests(unittest.TestCase):
         self.assertEqual(len(links), 2, f'expected both nav shells to link Hide Rules, got {links}')
         for cls in links:
             self.assertIn('active', cls)
-        # Setup, not Channels, and never a hub tab: the Channels tabs are on their way out,
-        # so a tab there would be a destination with no menu entry (dev/changelog/782).
-        tabs = _read('templates/channels/_tabs.html')
-        self.assertNotIn('hide_rules', tabs)
+        # Setup, not Channels, and never a hub tab: a tab would be a destination with no
+        # menu entry (dev/changelog/782). The Channels tab strip itself is gone
+        # (dev/changelog/1277), so no page may include it again.
+        self.assertFalse(os.path.exists(os.path.join(REPO, 'templates/channels/_tabs.html')))
         self.assertNotIn('channels/_tabs.html', _read('templates/channels/hide_rules.html'))
 
     def test_config_blob_carries_the_seeded_rule(self):

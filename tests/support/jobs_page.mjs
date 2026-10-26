@@ -17,6 +17,7 @@
    run.html (an EPG refresh row with Run now) and nav.json. */
 import fs from 'fs';
 import { JSDOM, VirtualConsole } from 'jsdom';
+import { fakeLayout } from './jsdom_layout.mjs';
 
 const [, , DIR, REPO] = process.argv;
 const read = (f) => fs.readFileSync(`${DIR}/${f}`, 'utf8');
@@ -82,6 +83,7 @@ function boot(start, { serve = start } = {}) {
   const { window } = dom;
   const { document } = window;
   window.scrollTo = () => {};
+  fakeLayout(window);
   JS.forEach((src) => window.eval(src));
   const toasts = [];
   const realToast = window.showToast;

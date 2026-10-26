@@ -85,7 +85,7 @@
        page, so it is the one destination that is not a category of anything. #}
     <a class="nav-link{% if request.endpoint == 'dashboard.dashboard' %} active{% endif %}" href="{{ url_for('dashboard.dashboard') }}">{{ nav_icon('live') }}<span class="nav-t">Dashboard</span> <span class="nav-count nav-count-live"{% if not nav_live_count %} style="display:none"{% endif %}>{{ nav_live_count }}</span><span class="nav-pip pip-live"{% if not nav_live_count %} style="display:none"{% endif %}></span></a>
     <div class="nav-section"><span class="nav-t">Library</span></div>
-    <a class="nav-link{% if request.endpoint == 'recordings.index' %} active{% endif %}" href="{{ url_for('recordings.index') }}">{{ nav_icon('recordings') }}<span class="nav-t">Recordings</span> <span class="nav-count">{{ nav_recordings_total }}</span><span class="nav-pip"></span></a>
+    <a class="nav-link{% if request.endpoint == 'recordings.index' %} active{% endif %}" href="{{ url_for('recordings.index') }}">{{ nav_icon('recordings') }}<span class="nav-t">Recordings</span> <span class="nav-count nav-count-recordings" data-tip="Every recording on this install, in any state: scheduled, recording, finished or failed.">{{ nav_recordings_total }}</span><span class="nav-pip"></span></a>
     {# Auto-record rules (DESIGN-autoschedule.md §8), beside the recordings they make. #}
     <a class="nav-link{% if request.endpoint and request.endpoint.startswith('auto_rules.') %} active{% endif %}" href="{{ url_for('auto_rules.rules_page') }}">{{ nav_icon('rules') }}<span class="nav-t">Auto-record</span></a>
     <a class="nav-link{% if request.endpoint == 'guide.guide' %} active{% endif %}" href="{{ url_for('guide.guide') }}">{{ nav_icon('guide') }}<span class="nav-t">TV Guide</span></a>
@@ -94,6 +94,13 @@
        Channel Groups tab now, alongside channel groups. #}
     <a class="nav-link{% if request.endpoint in ('channel_groups.groups_page', 'channel_groups.group_detail', 'channels.channels_health_checks', 'channels.channels_health_checks_guide', 'channels.health_check_detail') %} active{% endif %}" href="{{ url_for('channel_groups.groups_page') }}">{{ nav_icon('groups') }}<span class="nav-t">Channel Groups</span></a>
     <div class="nav-section"><span class="nav-t">Setup</span></div>
+    {# First under Setup and louder than its neighbors while any of the four setup steps is
+       undone, and not drawn once they are (DESIGN.md 16.7). The count is setup_steps'
+       cached one, kept current by the /api/nav-status poll; with no cached answer the link
+       starts hidden and the first poll shows it. Maintenance's icon, because an unapproved
+       page has not earned one of its own and Readiness is what it hands off to. #}
+    {%- set gs_left = nav_setup.left if nav_setup else 0 %}
+    <a class="nav-link nav-gs{% if request.endpoint == 'setup.get_started' %} active{% endif %}" href="{{ url_for('setup.get_started') }}"{% if not gs_left %} style="display:none"{% endif %}>{{ nav_icon('maint') }}<span class="nav-t">Get started</span> <span class="nav-count nav-count-setup">{{ gs_left }} left</span></a>
     <a class="nav-link{% if request.endpoint and request.endpoint.startswith('accounts.') %} active{% endif %}" href="{{ url_for('accounts.accounts_list') }}">{{ nav_icon('accounts') }}<span class="nav-t">Accounts</span></a>
     <a class="nav-link{% if request.endpoint and request.endpoint.startswith('profiles.') %} active{% endif %}" href="{{ url_for('profiles.profiles_list') }}">{{ nav_icon('recprofile') }}<span class="nav-t">Recording Profiles</span></a>
     <a class="nav-link{% if request.endpoint and request.endpoint.startswith('health_check_profiles.') %} active{% endif %}" href="{{ url_for('health_check_profiles.health_check_profiles_list') }}">{{ nav_icon('hcprofile') }}<span class="nav-t">Health Check Profiles</span></a>
@@ -245,12 +252,12 @@
   {% block scripts %}{% endblock %}
   <script>
   (function() {
-    // Not util.js fmtBytes - this takes a GB-unit number (disk API), not raw bytes.
+    // The disk API sends binary GB; util.js fmtBytes is the one formatter, so this reads the
+    // same as the Dashboard's Disk free tile. Its own TB step divided by 1000, which put
+    // "14.1 TB free" here beside "13.8 TB" on the tile (dev/docs/BUGS.md 2026-10-26 09:35:02 AM).
     function fmtGb(gb) {
       if (gb === null || gb === undefined) return '-';
-      if (gb >= 1000) return (gb / 1000).toFixed(1) + ' TB';
-      if (gb >= 1)    return gb.toFixed(1) + ' GB';
-      return Math.round(gb * 1024) + ' MB';
+      return fmtBytes(gb * 1073741824);
     }
     function setAll(key, text, title, colorPct, warnAt, dangerAt) {
       document.querySelectorAll('[data-ss="' + key + '"]').forEach(function(el) {
@@ -290,23 +297,25 @@
     // The sidebar block and the top bar's stats chip are two renderings of ONE
     // payload (DESIGN.md 2 / 9.7, amended 2026-07-29) - built here, from the same
     // `d`, so they can never disagree. Same vocabulary as the activity tooltips
-    // below (<strong> heading, .tt-name, .tt-detail), never a fourth one.
+    // below (<strong> heading, .tt-name, .tt-detail), never a fourth one. Each line is a
+    // <div>: showTooltip() opens the tip as display:block, so inline spans ran together
+    // ("RAM 32%Disk 7.8 GB freev0.29.0", dev/docs/BUGS.md 2026-10-23 @ 09:00:52 AM).
     var _tipHtml = null;
     function buildStatsTip(d) {
       var lines = ['<strong>System</strong>'];
       if (d.cpu_percent !== null && d.cpu_percent !== undefined && d.memory) {
-        lines.push('<span class="tt-name">CPU ' + d.cpu_percent.toFixed(0) +
-                   '% &middot; RAM ' + d.memory.percent.toFixed(0) + '%</span>');
+        lines.push('<div class="tt-name">CPU ' + d.cpu_percent.toFixed(0) +
+                   '% &middot; RAM ' + d.memory.percent.toFixed(0) + '%</div>');
       }
       if (d.disk_dvr) {
-        lines.push('<span class="tt-name">' + escHtml(d.same_drive ? 'Disk' : d.disk_dvr.path) +
-                   ' ' + fmtGb(d.disk_dvr.free_gb) + ' free</span>');
+        lines.push('<div class="tt-name">' + escHtml(d.same_drive ? 'Disk' : d.disk_dvr.path) +
+                   ' ' + fmtGb(d.disk_dvr.free_gb) + ' free</div>');
       }
       if (d.disk_complete) {
-        lines.push('<span class="tt-name">' + escHtml(d.disk_complete.path) +
-                   ' ' + fmtGb(d.disk_complete.free_gb) + ' free</span>');
+        lines.push('<div class="tt-name">' + escHtml(d.disk_complete.path) +
+                   ' ' + fmtGb(d.disk_complete.free_gb) + ' free</div>');
       }
-      lines.push('<span class="tt-detail">v{{ app_version }}</span>');
+      lines.push('<div class="tt-detail">v{{ app_version }}</div>');
       return lines.join('');
     }
     window.__applyStats = applyStats;
@@ -684,21 +693,41 @@
     window.__applyIndicators = applyIndicators;
   })();
   </script>
+  {# What the menu's badges and the footer were last measured at, so they are drawn at first
+     paint by their own appliers below instead of waiting on the first poll (dev/changelog/1292).
+     Cached answers only: a key is null when nothing fresh is cached, and its applier is skipped. #}
+  <script type="application/json" id="nav-boot">{{ {'readiness': nav_readiness, 'alerts': nav_alert_counts, 'stats': nav_stats} | tojson }}</script>
   <script>
   (function() {
+    // "2 things: X, Y" for a badge's tooltip, so a count says what it is counting.
+    function listTip(lead, labels) {
+      return lead + (labels && labels.length ? ':\n' + labels.join('\n') : '.');
+    }
     function applyLiveCount(activity) {
       // Dashboard sidebar count = every Dashboard-visible in-progress activity
       // (live/converting/concatenating recordings, account syncs, a running
       // channel health check) - not just recordings actively capturing. The
-      // server computes the combined total.
+      // server computes the combined total and names each one.
       var n = (activity && typeof activity.dashboard_activity_count === 'number')
         ? activity.dashboard_activity_count : 0;
+      var tip = listTip(n + (n === 1 ? ' thing' : ' things') + ' running now',
+                        activity && activity.dashboard_activity_labels);
       document.querySelectorAll('.nav-count-live').forEach(function(el) {
         el.textContent = n;
         el.style.display = n > 0 ? '' : 'none';
+        el.setAttribute('data-tip', tip);
       });
       document.querySelectorAll('.nav-pip.pip-live').forEach(function(pip) {
         pip.style.display = n > 0 ? '' : 'none';
+      });
+    }
+    // The Recordings total, so a recording scheduled from this page counts without a
+    // navigation; it was render-only and said 0 through a whole recording
+    // (dev/docs/BUGS.md 2026-10-23 06:36:02 AM).
+    function applyRecordingsTotal(total) {
+      if (typeof total !== 'number') return;
+      document.querySelectorAll('.nav-count-recordings').forEach(function(el) {
+        el.textContent = total;
       });
     }
     // Maintenance's Readiness counts: blocked capabilities in red, degraded in amber -
@@ -709,17 +738,36 @@
     function applyReadiness(readiness) {
       var bad = (readiness && readiness.blocked) || 0;
       var warn = (readiness && readiness.degraded) || 0;
-      var put = function(sel, value) {
+      var put = function(sel, value, tip) {
         document.querySelectorAll(sel).forEach(function(el) {
           el.textContent = value;
           el.style.display = value > 0 ? '' : 'none';
+          el.setAttribute('data-tip', tip);
         });
       };
-      put('.nav-count-ready-bad', bad);
-      put('.nav-count-ready-warn', warn);
+      // The capabilities themselves, so a number that moves during a first sync says which
+      // ones moved it.
+      put('.nav-count-ready-bad', bad, listTip(
+        bad + (bad === 1 ? ' thing you would want to do is' : ' things you would want to do are')
+        + ' blocked', readiness && readiness.blocked_labels));
+      put('.nav-count-ready-warn', warn, listTip(
+        warn + (warn === 1 ? ' thing works, but needs' : ' things work, but need') + ' attention',
+        readiness && readiness.degraded_labels));
       document.querySelectorAll('.nav-pip.pip-ready').forEach(function(pip) {
         pip.classList.toggle('pip-bad', bad > 0);
         pip.style.display = bad + warn > 0 ? '' : 'none';
+      });
+    }
+    // The Get started link: shown with its count while setup steps are left, hidden once
+    // none are. Skipped on a payload with no setup block, so a poll that could not read the
+    // steps leaves the link as the page rendered it.
+    function applySetup(setup) {
+      if (!setup || typeof setup.left !== 'number' || !setup.total) return;
+      document.querySelectorAll('.nav-link.nav-gs').forEach(function(a) {
+        a.style.display = setup.left > 0 ? '' : 'none';
+        a.querySelectorAll('.nav-count-setup').forEach(function(el) {
+          el.textContent = setup.left + ' left';
+        });
       });
     }
     // The ONE writer of the Maintenance counts, exposed the way nav-alerts.js exposes its
@@ -727,10 +775,12 @@
     // so silencing a check moves the badge on the click rather than at the next poll. The
     // card never writes these nodes itself.
     window.__applyReadiness = applyReadiness;
+    var polled = false;
     function fetchNavStatus() {
       fetch('/api/nav-status')
         .then(function(r) { return r.json(); })
         .then(function(d) {
+          polled = true;
           if (window.__applyStats)      window.__applyStats(d.stats);
           if (window.__applyAlerts)     window.__applyAlerts(d.alerts);
           if (window.__applyIndicators) window.__applyIndicators(d.activity);
@@ -745,7 +795,9 @@
           // script could neither wrap it nor replace it without dropping the chips.
           if (window.__applyBackgroundTasks) window.__applyBackgroundTasks(d.activity.background);
           applyLiveCount(d.activity);
+          applyRecordingsTotal(d.recordings_total);
           applyReadiness(d.readiness);
+          applySetup(d.setup);
           // Rail tooltips carry the counts, so they are re-derived after the
           // badges move - one writer, run last.
           if (window.__applyRailTips) window.__applyRailTips();
@@ -753,6 +805,17 @@
         .catch(function() {});
     }
     window.fetchNavStatus = fetchNavStatus;
+    // At DOMContentLoaded: the first moment util.js's reader is certain to exist, in a
+    // browser and in a test harness alike. Skipped if a poll has already answered, since
+    // the boot block is the older of the two readings.
+    document.addEventListener('DOMContentLoaded', function() {
+      if (polled) return;
+      var boot = readBootJson('nav-boot', {});
+      if (boot.stats && window.__applyStats) window.__applyStats(boot.stats);
+      if (boot.alerts && window.__applyAlerts) window.__applyAlerts(boot.alerts);
+      if (boot.readiness) applyReadiness(boot.readiness);
+      if (window.__applyRailTips) window.__applyRailTips();
+    });
     fetchNavStatus();
     setInterval(fetchNavStatus, Math.max(5, {{ nav_poll_interval_ms // 1000 }}) * 1000);
   })();

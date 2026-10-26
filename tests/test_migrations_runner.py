@@ -139,7 +139,7 @@ class SchemaTemplateFidelityTests(unittest.TestCase):
         """create_app seeds the system health job and default tags only when it sees a
         brand-new DB. A preseeded app skips both branches, so those rows must already be
         in the template - otherwise every test starts without them."""
-        from app.database import ChannelGroup, OnDemandTestJob, Tag
+        from app.database import ChannelGroup, ChannelHideRule, OnDemandTestJob, Tag
         seeded = make_test_app()
         try:
             self.assertIsNotNone(ChannelGroup.query.filter_by(is_system=True).first(),
@@ -147,6 +147,8 @@ class SchemaTemplateFidelityTests(unittest.TestCase):
             self.assertTrue(OnDemandTestJob.query.count(),
                             'template is missing the pinned system health job')
             self.assertTrue(Tag.query.count(), 'template is missing the seeded default tags')
+            self.assertTrue(ChannelHideRule.query.count(),
+                            'template is missing the seeded default hide rules')
         finally:
             seeded.cleanup()
 

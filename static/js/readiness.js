@@ -33,15 +33,15 @@
     ready:     { label: 'Ready', cls: 'b-done',
                  tip: 'Checked, and it is fine.' },
     unknown:   { label: 'Could not check', cls: 'b-warn',
-                 tip: 'The check itself could not run.\nThat is not the same as passing, so it is never shown as one.' },
+                 tip: 'The check could not run, so the result is unknown.' },
     attention: { label: 'Attention', cls: 'b-warn',
-                 tip: 'It works today, but it is degraded or it will bite you later.' },
+                 tip: 'It works for now, but needs fixing.' },
     problem:   { label: 'Problem', cls: 'b-fail',
                  tip: 'Something is broken right now.' },
     nothing:   { label: 'Nothing to check', cls: 'b-abort',
-                 tip: 'There is nothing on this install for this check to look at.' },
+                 tip: 'There is nothing here to check yet.' },
     not_run:   { label: 'Not run yet', cls: 'b-abort',
-                 tip: 'This one costs real work - a process, a provider login, a message - so it\nonly runs when you ask. Nothing expensive happens because you opened the page.' },
+                 tip: 'Runs only when you ask, because it starts a process, logs in to a provider\nor sends a message.' },
     checking:  { label: 'Checking', cls: 'b-running', tip: 'Running right now.' },
   };
 
@@ -107,8 +107,7 @@
     }
     const unsure = rows(cap.unknown);
     if (unsure.length) {
-      return `Not known. ${escHtml(noun(unsure[0]))} could not be checked at all, and a check
-        that failed to answer is never counted as a pass.`;
+      return `Not known. ${escHtml(noun(unsure[0]))} could not be checked.`;
     }
     if (cap.state === 'none') {
       const nothing = rows(cap.nothing);
@@ -121,9 +120,8 @@
     }
     const notRun = rows(cap.not_run);
     if (notRun.length) {
-      return `Yes, as far as everything that has been checked. ${notRun.length}
-        ${plural(notRun.length, 'check behind this costs', 'checks behind this cost')} real work
-        and ${plural(notRun.length, 'has', 'have')} not been run.`;
+      return `Yes so far. ${notRun.length}
+        ${plural(notRun.length, 'check behind this has', 'checks behind this have')} not been run yet.`;
     }
     const ignored = cap.ignored.length
       ? ` <span class="rd-dv">(${cap.ignored.length} ignored)</span>` : '';
@@ -131,10 +129,16 @@
   }
 
   /* One click here, or a link to the page that owns it - never both on one row. The server
-     decides which by sending exactly one of `action` and `link`. */
+     decides which by sending exactly one of `action` and `link`. A row with nothing to check
+     offers its link only when it says how to set the thing up (`setup`), because only then
+     is the empty state something the user can change (dev/changelog/1271). */
   function fixButtons(row) {
     const status = statusOf(row);
-    if (status === 'ready' || status === 'nothing' || status === 'checking') return '';
+    if (status === 'nothing') {
+      return row.setup && row.link ? `<a class="btn btn-sm" href="${escHtml(row.link.url)}">${
+        escHtml(row.link.label)} <span aria-hidden="true">&rarr;</span></a>` : '';
+    }
+    if (status === 'ready' || status === 'checking') return '';
     if (status === 'not_run') {
       return `<button class="btn btn-sm btn-primary" data-run="${escHtml(row.id)}">Run it</button>`;
     }
@@ -160,9 +164,8 @@
     }
     if (statusOf(row) === 'ready') return '';
     return `<button class="btn btn-sm" data-ignore="${escHtml(row.id)}"
-      data-tip="Stop counting this one. It stays on the page, dimmed, with whatever it
-found still shown - it just stops blocking the verdict and stops adding to the
-count beside Maintenance.">Ignore this</button>`;
+      data-tip="Stop counting this check. It stays on the page, dimmed, but no longer
+affects the verdict or the count beside Maintenance.">Ignore this</button>`;
   }
 
   function detailBlock(row) {
@@ -171,21 +174,23 @@ count beside Maintenance.">Ignore this</button>`;
     lines.push(['What came back', escHtml(row.found),
       status === 'problem' ? 'bad' : (status === 'attention' ? 'warn' : '')]);
     if (status !== 'ready' && status !== 'nothing') {
-      lines.push(['What that costs you', escHtml(row.without), '']);
+      lines.push(['What breaks', escHtml(row.without), '']);
+    }
+    if (row.setup && status === 'nothing') {
+      lines.push(['How to set it up', escHtml(row.setup), '']);
     }
     if (row.note && (status === 'not_run' || status === 'checking')) {
-      lines.push(['Why it waits', escHtml(row.note), '']);
+      lines.push(['When it runs', escHtml(row.note), '']);
     }
     if (row.ignored) {
-      lines.push(['Ignored', 'You told ChannelBin not to count this one. It is still checked '
-        + 'and still shown; it just does not block the verdict or add to the count beside '
-        + 'Maintenance. It stays ignored until you say otherwise.', '']);
+      lines.push(['Ignored', 'Still checked, but not counted in the verdict or the count '
+        + 'beside Maintenance. Stop ignoring to count it again.', '']);
     }
     if (row.link && row.action) {
-      lines.push(['Where it lives', escHtml(row.link.label), '']);
+      lines.push(['Where to change it', escHtml(row.link.label), '']);
     }
     if (Array.isArray(row.detail) && row.detail.length) {
-      lines.push(['Component by component', row.detail.map((c) => {
+      lines.push(['Components', row.detail.map((c) => {
         const good = c.available === true;
         const mark = good ? '✓' : (c.available === null ? '?' : '×');
         return `<div class="rd-comp"><span class="${good ? 'rd-comp-ok' : 'rd-comp-x'}">${mark}</span>
@@ -195,7 +200,7 @@ count beside Maintenance.">Ignore this</button>`;
     }
     lines.push(['Last checked', row.last_run
       ? escHtml(fmtTimeTz(new Date(row.last_run)))
-      : (status === 'not_run' ? 'never - it waits for you' : 'when this card loaded'), '']);
+      : (status === 'not_run' ? 'Never' : 'When the page loaded'), '']);
     return `<div class="rd-detail">${lines.map(([k, v, cls]) =>
       `<div class="rd-dk">${escHtml(k)}</div><div class="rd-dv ${cls}">${v}</div>`).join('')}</div>`;
   }
@@ -228,9 +233,13 @@ count beside Maintenance.">Ignore this</button>`;
     // One blocker gets its fix on the summary row. Several do not: there is no one button
     // for three different problems, so the row gets a count and the fixes live on the
     // individual checks inside it.
-    const act = worst && single ? fixButtons(worst) : '';
+    let act = worst && single ? fixButtons(worst) : '';
+    if (cap.state === 'none') {
+      const settable = byId(cap.nothing.find((id) => (byId(id) || {}).setup));
+      if (settable) act = fixButtons(settable);
+    }
     const chip = bad > 1
-      ? `<span class="chip" data-tip="Open this row to see each one, what it costs you and how to fix it.">${bad} to fix</span>`
+      ? `<span class="chip" data-tip="Open this row to see what is wrong and how to fix each one.">${bad} to fix</span>`
       : '';
     const order = ['problem', 'unknown', 'attention', 'not_run', 'nothing', 'ready'];
     const ordered = rows.slice().sort((a, b) =>
@@ -259,17 +268,19 @@ count beside Maintenance.">Ignore this</button>`;
     const unsure = d.capabilities.filter((c) => c.state === 'unknown').length;
     if (blocked) {
       return ['b-fail', 'Not ready',
-        `${blocked} ${plural(blocked, 'thing')} you would want to do cannot be done right now.`];
+        `${blocked} ${plural(blocked, 'thing')} cannot be done right now.`];
     }
     if (degraded) {
-      return ['b-warn', 'Degraded',
-        'Everything works. Some of it is degraded or heading somewhere bad.'];
+      // The verdict's own words: "Degraded" beside "Ready to record, but 1 thing needs
+      // attention" read as two answers (dev/changelog/1292).
+      return ['b-warn', 'Needs attention',
+        'Everything works, but some of it needs attention.'];
     }
     if (unsure) {
       return ['b-warn', 'Unknown',
-        'A check could not answer, so nothing here claims to be ready.'];
+        'At least one check could not get an answer.'];
     }
-    return ['b-done', 'Ready', 'Every check that counts passed.'];
+    return ['b-done', 'Ready', 'Every check passed.'];
   }
 
   function render() {
@@ -282,16 +293,24 @@ count beside Maintenance.">Ignore this</button>`;
 
     const notRun = d.counts.not_run;
     runAllBtn.textContent = notRun
-      ? `Run ${notRun} ${plural(notRun, 'check')} that ${plural(notRun, 'costs', 'cost')} something`
+      ? `Run ${notRun} more ${plural(notRun, 'check')}`
       : 'Run every check again';
+    // What each check does when run: its own `note`, the sentence its row shows while it
+    // waits, so the button and the rows cannot describe one check two ways.
+    const costly = d.checks.filter((c) => c.cost === 'ondemand'
+      && (!notRun || c.status === 'not_run'));
+    runAllBtn.setAttribute('data-tip', costly.map((c) => `${c.label}: ${c.note}`).join('\n\n'));
 
     const v = d.verdict;
     const c = d.counts;
-    const meta = [`${c.counted} checks behind ${d.capabilities.length} things you might want to do`,
-      `${c.ready} ready`];
+    // Every state that counted a check is named, so the parts add up to the total. Leaving
+    // out "nothing to check" made "24 checks · 16 ready · 2 need attention · 4 not run yet"
+    // add to 22 (dev/docs/BUGS.md 2026-10-26 09:35:03 AM).
+    const meta = [`${c.counted} checks`, `${c.ready} ready`];
     if (c.attention) meta.push(`${c.attention} need attention`);
     if (c.problem) meta.push(`${c.problem} ${plural(c.problem, 'problem')}`);
     if (c.unknown) meta.push(`${c.unknown} could not be checked`);
+    if (c.nothing) meta.push(`${c.nothing} with nothing to check yet`);
     if (c.not_run) meta.push(`${c.not_run} not run yet`);
     // Always named, even at zero-free: the point of silencing is that the count stops
     // shouting, not that the page stops admitting it was told to look away.
@@ -311,8 +330,8 @@ count beside Maintenance.">Ignore this</button>`;
         </div>
       </div>
       ${progress}
-      <p class="rd-intro">What this install can and cannot do, and what stands behind each
-        answer. Open a row to see every check behind it, what it tested and how to fix it.</p>
+      <p class="rd-intro">What this install can do right now. Open a row to see the checks
+        behind it, what each one found and how to fix it.</p>
       <div class="rd-caps">${d.capabilities.map(capRow).join('')}</div>`;
   }
 
@@ -383,7 +402,7 @@ count beside Maintenance.">Ignore this</button>`;
     ).then(() => {
       showToast(`${row.action.label} - done. Re-checking.`);
     }).catch((e) => {
-      showToast(`That did not work: ${e.message}`, { type: 'error' });
+      showToast(`${row.action.label} failed: ${e.message}`, { type: 'error' });
     }).finally(() => {
       state.busy.delete(id);
       load();

@@ -146,10 +146,12 @@ class GroupsPageRenderTests(unittest.TestCase):
         self.assertEqual(resp.status_code, 200)
         body = resp.get_data(as_text=True)
         self.assertIn('A Channel Group', body)
-        # One section now: a health check is a schedule a group carries, not a second
-        # kind of object with a list of its own (DESIGN-channel-groups-model.md DECIDED 2).
+        # One section for the user's groups: a health check is a schedule a group carries,
+        # not a second kind of object with a list of its own (DESIGN-channel-groups-model.md
+        # DECIDED 2). The automatic check sits apart above it (dev/changelog/1289).
         self.assertIn('id="grp-list-groups"', body)
-        self.assertIn('TV Guide Channels', body)  # the pinned system group, in that list
+        self.assertIn('id="grp-list-auto"', body)
+        self.assertIn('TV Guide health check', body)
 
     def test_empty_group_renders_without_error(self):
         make_group(name='Empty', members=[])

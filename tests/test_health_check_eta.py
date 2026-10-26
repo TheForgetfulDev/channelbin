@@ -305,7 +305,9 @@ class EtaOnThePagesTests(unittest.TestCase):
         self._live_run(eta_seconds=None)
         html = self.client.get('/').get_data(as_text=True)
         self.assertIn('id="hc-eta"', html)
-        self.assertNotIn(' left</span>', html)
+        # Scoped to the page body: the menu's Get started link carries an "N left" count of
+        # its own (dev/changelog/1280).
+        self.assertNotIn(' left</span>', html[html.index('<main class="main'):])
 
     def test_the_group_page_carries_the_hero_stat(self):
         self._live_run(eta_seconds=780)

@@ -124,6 +124,8 @@ function boot(which, start, { serve = start } = {}) {
       histRows: document.querySelectorAll('#acct-hist .hist-row').length,
       histBadges: Array.from(document.querySelectorAll('#acct-hist .hist-row .h-res'))
         .map((b) => b.textContent.trim()),
+      histDurs: Array.from(document.querySelectorAll('#acct-hist .hist-row .h-dur .mono'))
+        .map((b) => b.textContent.trim()),
       histEmpty: Boolean($('#acct-hist-body .empty-state')),
       moreBtn: text('#acct-hist-more'),
       activity: text('#acct-activity-body'),

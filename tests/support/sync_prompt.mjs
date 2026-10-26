@@ -97,6 +97,7 @@ const out = {
   default_off: await scenario({ prompt: on({ restart_default: false }), clicks: ['Sync now'] }),
   toggled_off: await scenario({ prompt: on(), toggle: true, clicks: ['Sync now'] }),
   overdue: await scenario({ prompt: on({ next_at: naive(-300) }) }),
+  never_synced: await scenario({ prompt: on({ never_synced: true, next_at: naive(55) }) }),
   one_hour: await scenario({ prompt: on({ interval_hours: 1 }) }),
   cancelled: await scenario({ prompt: on(), clicks: ['Cancel'] }),
   conflict: await scenario({ prompt: on(), toggle: true, conflictFirst: true,

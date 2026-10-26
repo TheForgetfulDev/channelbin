@@ -76,13 +76,11 @@ class MaintenancePageConformanceTests(unittest.TestCase):
                          ['m-readiness', 'm-storage', 'm-tools', 'm-index', 'm-backup',
                           'm-bundle', 'm-service'])
 
-    def test_the_return_to_settings_is_a_back_link(self):
-        """DESIGN.md 4/16.1: a back link above the h1, never a forward jump-off."""
-        back = re.search(r'<a class="back" href="([^"]+)"[^>]*>(.*?)</a>', self.html, re.S)
-        self.assertIsNotNone(back, 'the back link is gone')
-        self.assertEqual(back.group(1), '/settings')
-        self.assertIn('Settings', back.group(2))
-        self.assertLess(self.html.index('class="back"'), self.html.index('<h1'))
+    def test_no_back_link_to_settings(self):
+        """DESIGN.md 4/16.1 (amended in dev/changelog/1277): Maintenance is its own sidebar
+        destination, so a back arrow to Settings points sideways, not back."""
+        self.assertNotIn('class="back"', self.html)
+        self.assertNotIn('Moved off Settings', self.html)
 
     def test_every_panel_the_move_brought_across_is_here(self):
         """The controls, not just the cards: a card that arrived without its own

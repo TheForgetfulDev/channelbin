@@ -1025,6 +1025,42 @@ class RowPayloadTests(_AiringTestCase):
         # ...and not to the OTHER member's identical showing, which nothing is recording.
         self.assertEqual(rows[('Wembley Cup Final', self.sky.id)]['record_state'], 'none')
 
+    def test_a_partial_recording_says_so_and_a_whole_one_does_not(self):
+        """dev/docs/BUGS.md 2026-10-22 09:04:44 PM - the "Recorded" badge on a finished showing carries
+        the reason it is not the whole showing, so the page can say Partial as the guide
+        does; a whole recording carries nothing."""
+        start, stop = self.ended.start_time, self.ended.stop_time
+        rec = seed.make_recording(status='COMPLETED', name='old', channel_id=self.espn.id,
+                                  start_time=start, stop_time=stop,
+                                  recorded_duration_seconds=180)
+        seed.make_segment(rec, self.espn, start, stop)
+        db.session.commit()
+        row = next(r for r in self.rows(standing=only_hiding())
+                   if r['title'] == 'Old Wembley Show')
+        self.assertEqual(row['record_state'], 'recorded')
+        self.assertIn('3m captured of', row['recording']['partial'])
+        rec.recorded_duration_seconds = (stop - start).total_seconds()
+        db.session.commit()
+        row = next(r for r in self.rows(standing=only_hiding())
+                   if r['title'] == 'Old Wembley Show')
+        self.assertIsNone(row['recording']['partial'])
+
+    def test_the_users_own_stop_is_carried_apart_from_partial(self):
+        """dev/changelog/1287 - a showing the user stopped early, with nothing else missing,
+        is not Partial; the row carries the user's own Stop for a quiet badge instead."""
+        start = self.ended.start_time
+        stop = start + timedelta(seconds=158)
+        rec = seed.make_recording(status='COMPLETED', name='old', channel_id=self.espn.id,
+                                  start_time=start, stop_time=stop,
+                                  recorded_duration_seconds=155)
+        rec.scheduled_stop_time = self.ended.stop_time
+        seed.make_segment(rec, self.espn, start, stop, exit_reason='MANUAL_STOP')
+        db.session.commit()
+        row = next(r for r in self.rows(standing=only_hiding())
+                   if r['title'] == 'Old Wembley Show')
+        self.assertIsNone(row['recording']['partial'])
+        self.assertTrue(row['recording']['stopped'].startswith('You stopped it after 2m 35s'))
+
     def test_a_suggested_filename_is_rendered_server_side(self):
         """The template can come from the channel's default profile and its {tag:...} tokens
         resolve against Tag rows - neither of which the browser has. Leaving it out would

@@ -490,7 +490,7 @@ function designerFootHtml() {
 }
 
 const FD_PICKER_FOOT = `<span class="modal-foot-note">The full search - facets, saved searches, the
-    columns picker - lives on the Channels page. This is the same rows, cut down to picking one.</span>
+    columns picker - lives on Channel Search. This is the same rows, cut down to picking one.</span>
   <button class="btn" type="button" data-fd-back>&larr; Template</button>`;
 
 function renderStep() {

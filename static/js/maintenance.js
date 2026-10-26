@@ -359,7 +359,7 @@
       return `<div class="ix-row">
         <span class="ix-name">${escHtml(ix.label)}</span>
         <span class="h-mini ${cls}">${escHtml(label)}</span>
-        <span class="ix-meta">${ix.row_count === null ? DASH : `${ix.row_count.toLocaleString()} rows`}</span>
+        <span class="ix-meta">${ix.row_count === null ? DASH : `${ix.row_count.toLocaleString()} ${escHtml(ix.unit)}`}</span>
         <span class="ix-meta">${ix.duration_ms === null ? DASH : fmtDur(ix.duration_ms / 1000)}</span>
         <span class="ix-meta">${ix.rebuilt_at === null ? 'never built' : escHtml(ix.rebuilt_at)}</span>
         ${why}${err}
@@ -431,9 +431,17 @@
   // ── Storage ─────────────────────────────────────────────────────────────
   const storageEl = $('#storage-details-content');
 
-  const srow = (k, v, cls) =>
+  const srow = (k, v, cls, tip) =>
     `<div class="srow"><span class="sk">${escHtml(k)}</span>
-       <span class="sv${cls ? ` ${cls}` : ''}">${escHtml(v)}</span></div>`;
+       <span class="sv${cls ? ` ${cls}` : ''}"${tip ? ` data-tip="${escHtml(tip)}"` : ''}>${escHtml(v)}</span></div>`;
+
+  // The database is dvr.db and its -wal together, and the share still in the -wal is said,
+  // since on a new install that is nearly all of it (dev/docs/BUGS.md 2026-10-26 09:35:01 AM).
+  const dbTip = (d) => (d.db_wal_bytes
+    ? `${fmtBytes(d.db_bytes - d.db_wal_bytes)} in the database file and ${fmtBytes(d.db_wal_bytes)} `
+      + 'of recent changes in its write-ahead log (the -wal file beside it), which the '
+      + 'database folds in over time.'
+    : null);
 
   // A directory the server could not measure reports null rather than 0. Keeping
   // the row and dashing the value says so: "we did not measure this" and "this is
@@ -471,7 +479,7 @@
           srow('Recordings', bytesOrDash(d.dvr_bytes)),
           srow('Files', d.dvr_file_count === null || d.dvr_file_count === undefined
             ? DASH : d.dvr_file_count.toLocaleString()),
-          srow('Database', bytesOrDash(d.db_bytes)),
+          srow('Database', bytesOrDash(d.db_bytes), '', dbTip(d)),
           srow('Images', bytesOrDash(d.images_bytes)),
           srow('Config backups', bytesOrDash(d.backup_bytes)),
         ];

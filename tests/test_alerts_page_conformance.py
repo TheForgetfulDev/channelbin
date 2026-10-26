@@ -95,6 +95,14 @@ class AlertsPageConformanceTests(unittest.TestCase):
     def test_the_page_renders(self):
         self.assertEqual(self.client.get('/alerts').status_code, 200)
 
+    def test_the_intro_says_how_long_a_not_capturing_alert_waits(self):
+        """Finding 27 of dev/docs/UX-first-time-user-2026-10.md: the alert stood about a
+        minute after the stream returned on a page saying alerts clear themselves. The
+        intro names the watchdog's own early-fail window, the key it clears on."""
+        from app.config import load_config
+        window = load_config()['watchdog']['early_fail_window_seconds']
+        self.assertRegex(self.html, rf'kept coming for\s+{window} s\b')
+
     def test_page_has_exactly_one_h1_and_it_names_the_page(self):
         """DESIGN.md 3.10 - the page used to title itself with an h2."""
         h1s = re.findall(r'<h1[^>]*>(.*?)</h1>', self.html, re.S)
@@ -407,7 +415,7 @@ class AlertsChannelLifecycleLinkTests(unittest.TestCase):
         html = self.client.get('/alerts').get_data(as_text=True)
         self.assertIn(f'/channels?f.other=new&amp;f.acct={acct_id}', html)
         self.assertIn(f'/channels?f.other=removed&amp;f.acct={acct_id}', html)
-        self.assertIn('>Channels &rarr;', html)
+        self.assertIn('>Channel Search &rarr;', html)
 
     def test_an_alert_with_no_recognizable_source_gets_no_link(self):
         """A malformed or missing `source` must not crash the page - it just gets no
@@ -418,4 +426,4 @@ class AlertsChannelLifecycleLinkTests(unittest.TestCase):
                   source='not-the-expected-shape')
             db.session.commit()
         html = self.client.get('/alerts').get_data(as_text=True)
-        self.assertEqual(html.count('>Channels &rarr;'), 0)
+        self.assertEqual(html.count('>Channel Search &rarr;'), 0)

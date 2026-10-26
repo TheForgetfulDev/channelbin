@@ -1212,6 +1212,24 @@ def _mark_sync_cancelled(account_id: int, sync_log, detail: str | None = None) -
         log.exception('Failed to persist cancelled state for account %d', account_id)
 
 
+def _publish_channel_count(account_id: int) -> None:
+    """Write `Account.channel_count` as soon as the upsert has committed, ahead of the hide
+    pass that writes `hidden_channel_count` beside it.
+
+    Left to the success commit alone, a first sync read "0 channels, 3 hidden" for as long as
+    its guide import ran, the hidden count being the only one of the pair already written
+    (dev/docs/BUGS.md 2026-10-26 08:57:26 AM). The success commit still writes it again; a count of the
+    table is what it is either way, so a sync that fails or is cancelled after this point
+    leaves the right number behind."""
+    @retry_on_locked()
+    def _count_and_commit():
+        account = db.session.get(Account, account_id)
+        account.channel_count = Channel.query.filter_by(account_id=account_id).count()
+        db.session.commit()
+
+    _count_and_commit()
+
+
 def _apply_hide_rules_after_upsert(account_id: int, account_name: str) -> None:
     """Re-apply the channel hide rules to this account, between the channel upsert and the
     EPG import.
@@ -1231,8 +1249,12 @@ def _apply_hide_rules_after_upsert(account_id: int, account_name: str) -> None:
     """
     from . import channel_hiding
     try:
+        # The pass also recounts every rule's matches, which follow the channel table and
+        # this is the door that fills it: two scans over the whole table, 0.66s on the
+        # 136,940-row database (DESIGN-channel-hiding.md §10), once per sync
+        # (dev/changelog/1291).
         channel_hiding.materialize(f'sync of {account_name}', account_id=account_id,
-                                   force=True, stats=False)
+                                   force=True)
     except SQLAlchemyError:
         log.warning('Could not apply hide rules for account %d after sync; the next pass '
                     'will pick it up', account_id, exc_info=True)
@@ -1394,6 +1416,7 @@ def _do_sync(account_id: int, stop_event: threading.Event, use_dump: bool = Fals
             (channels_synced, skipped_malformed, skipped_duplicate, drifted,
              new_channel_ids) = _upsert_m3u_channels_and_commit()
             rebuild_needed = True
+            _publish_channel_count(account_id)
             _apply_hide_rules_after_upsert(account_id, account.name)
             _raise_if_cancelled(stop_event, _CANCEL_KEPT_EPG)
         else:
@@ -1443,6 +1466,7 @@ def _do_sync(account_id: int, stop_event: threading.Event, use_dump: bool = Fals
             (channels_synced, skipped_malformed, skipped_duplicate, drifted,
              new_channel_ids) = _upsert_xtream_channels_and_commit()
             rebuild_needed = True
+            _publish_channel_count(account_id)
             _apply_hide_rules_after_upsert(account_id, account.name)
             _raise_if_cancelled(stop_event, _CANCEL_KEPT_EPG)
 
@@ -1921,6 +1945,8 @@ def _raise_or_resolve_standing_alert(alert_type: str, source: str, active: bool,
     Canonical home for this pattern - the EPG_SOURCE_* alerts and SYNC_FEED_SHRUNK need the
     identical shape; reuse this instead of another copy.
     """
+    from .alerts import create_alert, mark_cleared
+
     @retry_on_locked()
     def _refresh_or_dismiss_existing():
         existing = Alert.query.filter(
@@ -1937,15 +1963,13 @@ def _raise_or_resolve_standing_alert(alert_type: str, source: str, active: bool,
                 a.created_at = datetime.utcnow()
                 a.read_at = None
         else:
-            for a in existing:
-                a.dismissed_at = datetime.utcnow()
+            mark_cleared(existing)
         db.session.commit()
         return True
 
     if _refresh_or_dismiss_existing() or not active:
         return
 
-    from .alerts import create_alert
     create_alert(alert_type, title=title, body=body, source=source)
 
 

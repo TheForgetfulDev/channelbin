@@ -58,6 +58,8 @@ _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 NAV_LABELS = [
     'Dashboard',
     'Recordings', 'Auto-record', 'TV Guide', 'Channel Search', 'Channel Groups',
+    # Always in the markup, hidden once setup is done (dev/changelog/1280).
+    'Get started',
     'Accounts', 'Recording Profiles', 'Health Check Profiles', 'Tags', 'Hide Rules',
     'Jobs', 'Alerts', 'Logs', 'Maintenance', 'Settings',
 ]
@@ -312,6 +314,20 @@ class ShellSourceTests(unittest.TestCase):
         base = _read('templates/base.html')
         for token in ('setup_links', 'setup_active', 'setup_flyout', 'activity_dots'):
             self.assertNotIn(token, base, f'{token} still in base.html')
+
+    def test_stats_tip_puts_each_reading_on_its_own_line(self):
+        """dev/docs/BUGS.md 2026-10-23 @ 09:00:52 AM: showTooltip() opens the tip as
+        display:block, which overrides .dot-tooltip's flex column, so the stats tip's
+        inline <span> lines ran together ("RAM 32%Disk 7.8 GB freev0.29.0"). Every line
+        the builder pushes must be a block element of its own."""
+        base = _read('templates/base.html')
+        self.assertIn("tooltip.style.display = 'block'", base,
+                      'showTooltip no longer forces block; re-check what this test guards')
+        body = _slice(base, 'function buildStatsTip(d) {', 'return lines.join')
+        pushed = re.findall(r"lines\.push\('(<\w+)", body)
+        self.assertEqual(len(pushed), 4, body)
+        for tag in pushed:
+            self.assertEqual(tag, '<div', f'a stats tip line opens with {tag}, which is inline')
 
     def test_mobile_drawer_opens_on_the_left(self):
         css = _read('static/css/style.css')

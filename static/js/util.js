@@ -99,6 +99,7 @@ function fmtDur(s, withSeconds = true) {
   }
   if (h && m) return `${h}h ${m}m`;
   if (h) return `${h}h`;
+  if (!m && sec) return `${sec}s`;
   return `${m}m`;
 }
 
@@ -747,6 +748,12 @@ async function swapFromServer(selectors, url = location.href) {
   // is known only by where it entered; the rebuilt anchor may not cover that point.
   document.addEventListener('mousemove', (e) => { pointer = { x: e.clientX, y: e.clientY }; }, { passive: true });
   document.addEventListener('scroll', hide, true);
+  // A mouse press on the anchor closes its tip, the way a native title does: the Readiness
+  // card's "Run 4 more checks" kept its long tip open over the rows the run was rewriting
+  // (dev/changelog/1292). Mouse only - a tap is how a phone opens a tip in the first place.
+  document.addEventListener('pointerdown', (e) => {
+    if (anchor && e.pointerType === 'mouse' && anchor.contains(e.target)) hide();
+  }, true);
 })();
 
 // Sticky-header-aware top clamp (DESIGN.md 9.6/10.4): a tooltip must never render
@@ -932,6 +939,16 @@ function syncScrollLock() {
 function overlayOpenAboveDrawer() {
   return Array.from(document.querySelectorAll(OVERLAY_SEL))
     .some(el => !el.classList.contains('topnav-menu') && el.getClientRects().length > 0);
+}
+
+// True when any overlay is visibly open - the question a page asks before swapping in a
+// fresh render, since a swap under an open menu or dialog yanks it away mid-choice. Never
+// a bare `querySelector('.modal')`: the record dialog sits hidden on every page with a
+// guide grid, so that match is always true and the page never refreshes at all
+// (dev/docs/BUGS.md 2026-10-23 06:36 AM).
+function overlayOpen() {
+  return Array.from(document.querySelectorAll(OVERLAY_SEL))
+    .some(el => el.getClientRects().length > 0);
 }
 
 // Modal builder (DESIGN.md 3.12 anatomy). Returns the overlay element; call

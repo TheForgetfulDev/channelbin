@@ -53,10 +53,12 @@
 
 .jb-name { display: flex; align-items: center; gap: 8px; font-weight: 500; }
 .jb-rel, .jb-stop { font-size: var(--fs-xs); color: var(--text-muted); margin-top: 2px; }
+/* What the job does, under its name. Indented past the dot so the names stay one column. */
+.jb-what { font-size: var(--fs-xs); color: var(--text-muted); margin: 2px 0 0 17px; }
 
 .jb-legend {
-  display: flex; gap: 18px; flex-wrap: wrap; align-items: center;
-  margin-top: 12px; font-size: var(--fs-sm); color: var(--text-muted);
+  display: flex; gap: 6px 18px; flex-wrap: wrap; align-items: center;
+  margin-bottom: 12px; font-size: var(--fs-sm); color: var(--text-muted);
 }
 .jb-legend span { display: inline-flex; align-items: center; gap: 6px; }
 </style>
@@ -73,6 +75,15 @@
    the empty state too, so a page that opened with no jobs picks up the first one. #}
 <div id="jb-live">
 {% if jobs %}
+{# Above the table, not under it: below a long list nobody reached it, and the dots and row
+   edges read as unexplained (dev/changelog/1277). #}
+<div class="jb-legend">
+  The dot beside each job says how close its next run is to another job's; red and yellow also mark the row's edge.
+  Neither is a problem on its own: jobs that would slow each other down take turns, and a recording never waits for one.
+  <span><span class="jb-dot red"></span> Same time as another job</span>
+  <span><span class="jb-dot yellow"></span> Within 5 minutes of one</span>
+  <span><span class="jb-dot green"></span> Nothing nearby</span>
+</div>
 <div class="card">
   <div class="card-head"><h2>Jobs <span class="cnt">{{ jobs | length }}</span></h2></div>
   <div class="card-body table-scroll">
@@ -95,6 +106,7 @@
                     data-tip="{% if job.overlap == 'red' %}Overlaps another job&#10;This job runs at the same time as at least one other.{% elif job.overlap == 'yellow' %}Runs close to another job&#10;Another job starts within 5 minutes of this one.{% else %}No conflict&#10;Nothing else is scheduled near this job.{% endif %}"></span>
               {{ job.display_name }}
             </div>
+            {% if job.get('what') %}<div class="jb-what">{{ job.what }}</div>{% endif %}
           </td>
           <td data-label="Type">
             {# Every type gets its own branch - a new one added to _build_job_list
@@ -161,12 +173,6 @@
       </tbody>
     </table>
   </div>
-</div>
-
-<div class="jb-legend">
-  <span><span class="jb-dot red"></span> Overlapping jobs</span>
-  <span><span class="jb-dot yellow"></span> Within 5 minutes</span>
-  <span><span class="jb-dot green"></span> No conflict</span>
 </div>
 {% else %}
 <div class="empty-state">

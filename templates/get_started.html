@@ -1,0 +1,199 @@
+{% extends "base.html" %}
+{% block title %}Get started - ChannelBin{% endblock %}
+
+{#  Get started (dev/mockups/44-first-run-setup.html, approved at round 3, dev/changelog/1278;
+    built in dev/changelog/1280). Every step's state comes from app/setup_steps.py::page(),
+    read fresh on each load and stored nowhere, which is why nothing here can be dismissed or
+    ticked off by hand. #gs-live is swapped by static/js/get-started.js when the nav poll's
+    sync or recording signature moves, so a first sync or a first recording moves the page on
+    without a reload. #}
+
+{% block content %}
+{% macro step_item(s) -%}
+  {%- set open = s.display in ('now', 'problem', 'wait') or (s.optional and s.display == 'todo') -%}
+  <li class="gs-step {{ s.display }}" data-step="{{ s.id }}">
+    <span class="gs-mark">{% if s.display == 'done' %}&#10003;{% elif s.display == 'problem' %}!{% else %}{{ s.n }}{% endif %}</span>
+    <div class="gs-main">
+      <div class="gs-head"><span class="gs-title">{{ s.title }}</span>{% if s.optional %}<span class="gs-tag">Optional</span>{% endif %}</div>
+      <div class="gs-state">{{ s.state }}</div>
+      {% if open and s.body %}<div class="gs-body">{{ s.body }}</div>{% endif %}
+      {% if s.link %}
+      <div class="gs-acts">
+        <a class="btn{% if s.display in ('now', 'problem', 'wait') %} btn-primary{% endif %}" href="{{ s.link.url }}">{{ s.link.label }} <span class="arw">&#8594;</span></a>
+        {%- if s.keep_examples %}
+        <button type="button" class="btn" data-examples-keep>Keep the examples</button>
+        {%- endif %}
+        {%- if open %}{% for m in s.more %}
+        <a class="btn" href="{{ m.url }}">{{ m.label }} <span class="arw">&#8594;</span></a>
+        {%- endfor %}{% endif %}
+      </div>
+      {% endif %}
+      {%- if s.id == 'account' and setup.offer_examples %}{{ examples_offer(setup.offer_examples) }}{% endif %}
+    </div>
+  </li>
+{%- endmacro %}
+
+{#- The examples branch of the account step (app/examples.py, dev/changelog/1281). It says
+    in full what the button adds, and the button asks once more before anything loads; every
+    name in it comes from the constants the load itself reads. The button comes before the
+    list so a phone has it on the first screen (dev/changelog/1288). -#}
+{% macro examples_offer(o) -%}
+  <div class="gs-try" id="gs-try">
+    <div class="gs-try-head">No IPTV provider yet?</div>
+    <p>Try ChannelBin first with free, legal channels from
+      <a href="{{ o.site_url }}" target="_blank" rel="noopener">M3UPT</a> (opens in a new tab), a
+      public list of channels the broadcasters themselves stream online.</p>
+    <div class="gs-acts"><button type="button" class="btn" data-examples-load>Try it with example channels</button></div>
+    <p>The button adds:</p>
+    <ul>
+      <li>An account named "{{ o.account_name }}" that reads M3UPT's playlist and program
+        listings: about a thousand channels, mostly Portuguese TV and radio, with English-language
+        news among them. Its first sync starts straight away.</li>
+      <li>{{ o.guide_count }} English-language channels in your TV Guide: {{ o.guide }}.</li>
+      <li>A channel group, "{{ o.group_name }}", holding two Bloomberg TV feeds that share one
+        program listing, which is what a channel group is for.</li>
+      <li>A health check on {{ o.test_channel }}.</li>
+    </ul>
+    <p>Everything it adds is marked as an example. Delete the examples takes it all out again in
+      one step, including an example channel you later put in the guide yourself; your
+      recordings stay. If M3UPT turns out to be all you want, Keep the examples makes
+      them your own instead.</p>
+  </div>
+{%- endmacro %}
+
+{% macro examples_card(ex) -%}
+  <div class="card gs-card" id="gs-examples">
+    <div class="card-head"><h2>Example channels</h2>
+      {%- if not ex.loading %}
+      <div class="card-head-actions"><button type="button" class="btn btn-sm" data-examples-keep>Keep the examples</button>
+        <button type="button" class="btn btn-sm btn-danger" data-examples-remove>Delete the examples</button></div>
+      {%- endif %}
+    </div>
+    <div class="card-body">
+      {% if ex.loading %}
+      <p><b>Loading.</b> {{ ex.loading.step }} The first sync fetches about a thousand channels
+        and their listings from M3UPT, which takes a minute or two. This page moves on by
+        itself.</p>
+      {% endif %}
+      <p>These came from <a href="{{ ex.site_url }}" target="_blank" rel="noopener">M3UPT</a>, a
+        public list of free channels the broadcasters themselves stream online.
+        {% for a in ex.accounts %}<a href="{{ url_for('accounts.account_detail', account_id=a.id) }}">{{ a.name }}</a>
+        has {{ '{:,}'.format(a.channels) }} channels{{ ', ' if not loop.last else '' }}{% endfor %}{% if ex.accounts %},
+        {{ ex.guide }} of them in your TV Guide.{% endif %}
+        {% if ex.groups %}The example channel group{{ 's' if ex.groups | length != 1 }}:
+        {% for g in ex.groups %}<a href="{{ url_for('channel_groups.group_detail', group_id=g.id) }}">{{ g.name }}</a>{{ ', ' if not loop.last else '.' }}{% endfor %}{% endif %}</p>
+      <p>Delete the examples takes out the example account and everything on its channels,
+        including an example channel you put in the guide or tested yourself. Your recordings
+        stay, those made from an example channel included, and so does everything on your own
+        accounts. Keep the examples makes them an ordinary account and channel group instead,
+        if M3UPT is all you want.</p>
+    </div>
+  </div>
+{%- endmacro %}
+
+<div class="page-head">
+  <h1>Get started
+    {% if setup %}<span class="sub" id="gs-sub">{% if setup.finished %}all {{ setup.total }} steps done{% else %}{{ setup.done }} of {{ setup.total }} steps done{% endif %}</span>{% endif %}
+  </h1>
+</div>
+<p class="page-intro">The four steps that take a new install to its first recording, in order,
+  and a few more worth doing after. Each one is checked against what is actually set up every
+  time this page loads, so it ticks itself off when the thing exists, and comes back if you
+  undo it.</p>
+
+{#- data-waiting asks get-started.js for the minute tick as well, so "first sync starts in
+    4m" keeps counting down while nothing else changes. -#}
+<div id="gs-live" data-sync-sig="{{ sync_sig }}" data-rec-sig="{{ rec_sig }}"
+     {%- if setup and (setup.steps | selectattr('display', 'equalto', 'wait') | list
+                       or (setup.examples and setup.examples.loading)) %} data-waiting="1"{% endif %}>
+{% if not setup %}
+  <div class="notice notice-warn gs-done-note">The setup steps could not be read just now, so
+    this page cannot say what is done. The reason is in the log. The Readiness check on
+    <a href="{{ url_for('system.maintenance') }}">Maintenance</a> checks the same things.</div>
+{% else %}
+  {% if setup.finished %}
+  <div class="notice notice-info gs-done-note">ChannelBin is set up. The steps under it are
+    optional. The dashboard banner and this page's menu link are gone now; the Readiness check
+    on Maintenance links back here.</div>
+  {% endif %}
+  <ol class="gs-steps">
+    {% for s in setup.steps %}{{ step_item(s) }}{% endfor %}
+  </ol>
+  {% if setup.examples %}{{ examples_card(setup.examples) }}{% endif %}
+
+  <div class="sec-head gs-opt-head"><h2>Worth doing next</h2></div>
+  <ol class="gs-steps">
+    {% for s in setup.optional %}{{ step_item(s) }}{% endfor %}
+  </ol>
+{% endif %}
+
+  <div class="card gs-card" id="gs-search">
+    <div class="card-head"><h2>Finding things: two kinds of search</h2></div>
+    <div class="card-body">
+      <p>Channel Search asks first what you want to search, and the two answers find different
+        things.</p>
+      <div class="gs-pair">
+        <div class="gs-half">
+          <h3>Search Channels</h3>
+          <p>One row per channel. It answers "which of my channels is this?" Use it to find a
+            channel by name, then add it to the TV Guide, test it, or put it in a group. It
+            looks at channel names unless you tell it otherwise.</p>
+          <a class="btn btn-sm" href="{{ search_channels_url }}">Search Channels <span class="arw">&#8594;</span></a>
+        </div>
+        <div class="gs-half">
+          <h3>Search Programs (EPG)</h3>
+          <p>One row per showing, earliest first, from your accounts' program listings. It
+            answers "when is this on, and on which channel?" Type a show, a team or a word
+            from a description, and every showing it finds has its time and a Record button.
+            An auto-record rule is one of these searches, saved.</p>
+          <a class="btn btn-sm" href="{{ search_programs_url }}">Search Programs (EPG) <span class="arw">&#8594;</span></a>
+        </div>
+      </div>
+      <p>Click into the search box to see <b>Search in</b>, which picks what your words are
+        matched against: channel name, category and ids, or program title, episode and
+        description. On Search Channels a program field matches only what each channel is
+        showing right now. <b>All words</b> or <b>Any word</b>, beside the box, says whether
+        every word has to match. <b>+ Filter</b> narrows the results by account, category,
+        health, channel group, tag or status, and on programs by when, day and time of day.
+        <b>Saved searches</b> keeps a search under a name.</p>
+    </div>
+  </div>
+
+{% if setup %}
+  <div class="card gs-card gs-finish" id="gs-finish">
+    <div class="card-head"><h2>Then: the Readiness check</h2>
+      <div class="card-head-actions"><a class="btn btn-sm" href="{{ url_for('system.maintenance') }}">Readiness check <span class="arw">&#8594;</span></a></div>
+    </div>
+    <div class="card-body">
+      <p>The steps above are what you have to do. The Readiness check on Maintenance tests the
+        rest: that each login still works, that every folder ChannelBin writes to is writable,
+        that search is indexed, and that a notification actually arrives.</p>
+      <p>The numbers beside Maintenance in the menu come from it.{% if setup.readiness.clears_some %}
+        On a new install most of them clear by themselves once an account is added and the
+        guide has channels in it. While an account's first sync runs, one or two more can show
+        for a minute or so, until the sync and the search index catch up.{% endif %}
+        Point at one in the menu to see what it is counting.</p>
+      {% set rd = setup.readiness %}
+      {% if rd.blocked or rd.degraded %}
+      <ul>
+        {% if rd.blocked %}<li><span class="nav-count nav-count-ready-bad">{{ rd.blocked | length }}</span>
+          {% if rd.blocked | length == 1 %}thing you would want to do is{% else %}things you would want to do are{% endif %}
+          blocked: {% for label in rd.blocked %}"{{ label }}"{{ ', ' if not loop.last }}{% endfor %}.</li>{% endif %}
+        {% if rd.degraded %}<li><span class="nav-count nav-count-ready-warn">{{ rd.degraded | length }}</span>
+          {% if rd.degraded | length == 1 %}works, but needs attention{% else %}work, but need attention{% endif %}:
+          {% for label in rd.degraded %}"{{ label }}"{{ ', ' if not loop.last }}{% endfor %}.</li>{% endif %}
+      </ul>
+      {% else %}
+      <p>Right now there is nothing beside it: nothing is blocked and nothing needs
+        attention.</p>
+      {% endif %}
+    </div>
+  </div>
+{% endif %}
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script src="{{ url_for('static', filename='js/get-started.js') }}"></script>
+<script src="{{ url_for('static', filename='js/examples.js') }}"></script>
+{% endblock %}

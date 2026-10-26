@@ -92,16 +92,21 @@ def _png_chunk(kind: bytes, data: bytes) -> bytes:
 
 
 def png(key: str, size: int = 64) -> bytes:
-    """A small logo: two colors and a diagonal band, all fixed by `key` (hex)."""
+    """A small logo: two colors in four quarters split off-center, all fixed by `key` (hex).
+
+    Not a diagonal band: cropped to the app's round channel chip, a band across a circle is
+    a no-entry sign, and a first-time user read one arriving mid-recording as a warning
+    (dev/changelog/1275)."""
     n = int(key[:12] or '0', 16)
     bg = ((n >> 16) & 0xff, (n >> 8) & 0xff, n & 0xff)
     fg = (255 - bg[0], 255 - bg[1], 255 - bg[2])
-    width = 4 + (n >> 24) % (size // 3)
+    cx = size // 4 + (n >> 24) % (size // 2)
+    cy = size // 4 + (n >> 32) % (size // 2)
     rows = bytearray()
     for y in range(size):
         rows.append(0)
         for x in range(size):
-            rows.extend(fg if abs(x - y) < width else bg)
+            rows.extend(fg if (x < cx) != (y < cy) else bg)
     header = struct.pack('>IIBBBBB', size, size, 8, 2, 0, 0, 0)
     return (b'\x89PNG\r\n\x1a\n' + _png_chunk(b'IHDR', header)
             + _png_chunk(b'IDAT', zlib.compress(bytes(rows), 9)) + _png_chunk(b'IEND', b''))

@@ -677,7 +677,33 @@ const REC_CHIP = {
   ABORTED: null,
 };
 
-function recChipFor(status) {
+// A COMPLETED recording whose file is not the whole program. Not a status of its own, so
+// it sits beside the table rather than in it: `partial` is the server's sentence saying why
+// (app/recording_story.py::partial_note), and a green "Recorded" over 3 minutes of a
+// 100-minute program read as all good (dev/changelog/1270).
+const REC_CHIP_PARTIAL = { cls: 'rec-partial', badge: 'rec-badge-partial', glyph: '⚠', word: 'Partial' };
+// A COMPLETED recording the user stopped early, with nothing else missing: `stopped` is the
+// server's sentence (app/recording_story.py::stopped_early_note). Said, but quiet - the amber
+// Partial over the user's own Stop read as a fault (dev/changelog/1287). The cell keeps Done's
+// wash, which is drawn only over the part that was recorded.
+const REC_CHIP_STOPPED = { cls: 'rec-done', badge: 'rec-badge-stopped', glyph: '■', word: 'Stopped early' };
+
+// A SCHEDULED recording whose start time has come. Not a status of its own either: the
+// recorder flips it to IN_PROGRESS within seconds, and until it does "Scheduled" over a
+// program already being started read as if the click had not worked (dev/changelog/1290).
+const REC_CHIP_STARTING = { cls: 'rec-scheduled', badge: 'rec-badge-scheduled', glyph: '', word: 'Starting',
+                            detail: 'The start time has come and the capture is starting. This changes to Recording within a few seconds.' };
+
+// True for a SCHEDULED recording whose own start time is not in the future.
+function recStarting(status, startIso) {
+  if (status !== statusVocab('REC_STATUS').SCHEDULED || !startIso) return false;
+  return utcIsoToDate(startIso).getTime() <= Date.now();
+}
+
+function recChipFor(status, partial, stopped, starting) {
+  if (starting && status === statusVocab('REC_STATUS').SCHEDULED) return REC_CHIP_STARTING;
+  if (partial && status === statusVocab('REC_STATUS').COMPLETED) return REC_CHIP_PARTIAL;
+  if (stopped && status === statusVocab('REC_STATUS').COMPLETED) return REC_CHIP_STOPPED;
   if (Object.prototype.hasOwnProperty.call(REC_CHIP, status)) return REC_CHIP[status];
   // No trailing fallback that renders a real state: a status added to app/fmt_utils.py and
   // not to the table above would otherwise inherit whichever colour and word sat in the
@@ -686,8 +712,8 @@ function recChipFor(status) {
   return null;
 }
 
-function recCssClass(status) {
-  const chip = recChipFor(status);
+function recCssClass(status, partial) {
+  const chip = recChipFor(status, partial);
   return chip ? chip.cls : '';
 }
 
@@ -695,8 +721,8 @@ function recCssClass(status) {
 // is written for the Recordings list's upper-case badges, and the guide's chips are sentence case
 // (DESIGN.md 4) - so this recases the one table rather than keeping a second one in the
 // guide's own casing, which is the thing that drifted.
-function recChipWord(status) {
-  const chip = recChipFor(status);
+function recChipWord(status, partial, stopped, starting) {
+  const chip = recChipFor(status, partial, stopped, starting);
   if (!chip) return null;
   if (chip.word) return chip.word;
   const label = recStatusLabel(status);
@@ -709,13 +735,37 @@ function recChipWord(status) {
 // is the chip's own word rather than a second copy of it - typing the two separately is how
 // "✓ Converting" ended up over a tooltip headed "Converting" while "✓ Recorded" sat over
 // one headed "Recorded" for a phase that had not finished.
-function recStatusBadge(status) {
-  const chip = recChipFor(status);
-  const word = recChipWord(status);
+//
+// `cellPx` is the program cell's drawn width, when there is one. A cell too narrow for the
+// glyph and the word keeps the glyph alone, with the word in the tooltip and the label: the
+// clipped "RECORDIN" a phone showed for a program already half over said less than the
+// glyph does (dev/changelog/1290). The fit is worked out from the badge's own type size
+// rather than measured, so drawing a grid never reads layout back once per cell.
+const REC_BADGE_CHAR_PX = 6.2;   // .rec-badge: 9px bold uppercase, letter-spacing .04em
+const REC_BADGE_GLYPH_PX = 12;   // the glyph and the space after it
+const REC_CELL_PAD_PX = 16;      // .guide-program's side padding and borders, both sides
+
+function recBadgeFits(word, hasGlyph, cellPx) {
+  if (!(cellPx > 0)) return true;
+  const need = word.length * REC_BADGE_CHAR_PX + (hasGlyph ? REC_BADGE_GLYPH_PX : 0);
+  return need <= cellPx - REC_CELL_PAD_PX;
+}
+
+function recStatusBadge(status, partial, stopped, starting, cellPx) {
+  const chip = recChipFor(status, partial, stopped, starting);
+  const word = recChipWord(status, partial, stopped, starting);
   if (!chip || !word) return '';
-  const text = chip.glyph ? `${chip.glyph} ${word}` : word;
-  const tip = `${word}\n${chip.detail}`;
-  return `<div class="rec-badge ${chip.badge} tip-plain" data-tip="${escTipAttr(tip)}">${text}</div>`;
+  const glyphOnly = Boolean(chip.glyph) && !recBadgeFits(word, true, cellPx);
+  const text = glyphOnly ? chip.glyph : (chip.glyph ? `${chip.glyph} ${word}` : word);
+  let detail = chip.detail;
+  if (chip === REC_CHIP_PARTIAL) {
+    detail = `Recorded, but not the whole program: ${partial}\nOpen the recording to see what happened.`;
+  } else if (chip === REC_CHIP_STOPPED) {
+    detail = `${stopped} The file holds what was recorded up to then.`;
+  }
+  const tip = `${word}\n${detail}`;
+  const label = glyphOnly ? ` aria-label="${escHtml(word)}"` : '';
+  return `<div class="rec-badge ${chip.badge} tip-plain" data-tip="${escTipAttr(tip)}"${label}>${text}</div>`;
 }
 
 // Tooltips travel through an HTML attribute, so newlines are encoded and the shared portal
@@ -875,13 +925,14 @@ function programRowFor(id) {
 // One builder for a program cell's inner markup, shared by the normal and collapsed render
 // paths so the enabled field set can never differ between them. Field order is fixed by
 // DESIGN.md 12.5: recording chip, title, subtitle, description, time line, tag dots.
-function programCellHtml(prog, ch) {
-  return cellActiveFields(prog).map(f => cellFieldHtml(f, prog, ch)).join('');
+function programCellHtml(prog, ch, cellPx) {
+  return cellActiveFields(prog).map(f => cellFieldHtml(f, prog, ch, cellPx)).join('');
 }
 
-function cellFieldHtml(field, prog, ch) {
+function cellFieldHtml(field, prog, ch, cellPx) {
   switch (field) {
-    case 'rec_status': return recStatusBadge(prog.recording_status);
+    case 'rec_status': return recStatusBadge(prog.recording_status, prog.recording_partial, prog.recording_stopped,
+      recStarting(prog.recording_status, prog.recording_start_time), cellPx);
     case 'title':      return `<div class="guide-program-title">${escHtml(prog.title || ch.name)}</div>`;
     case 'subtitle':   return `<div class="guide-program-subtitle">${escHtml(prog.sub_title)}</div>`;
     case 'description':return `<div class="guide-program-desc">${escHtml(prog.description)}</div>`;
@@ -934,7 +985,7 @@ function renderProgramRows() {
         const leftPx  = bandLeftMin * PIXELS_PER_MINUTE;
         const widthPx = (bandRightMin - bandLeftMin) * PIXELS_PER_MINUTE;
 
-        const bandStatusClass = ' ' + recCssClass(rec.status);
+        const bandStatusClass = ' ' + recCssClass(rec.status, rec.partial);
         const band = document.createElement('div');
         band.className = 'guide-recording-band' + bandStatusClass;
         band.style.left  = leftPx + 'px';
@@ -962,7 +1013,7 @@ function renderProgramRows() {
       const widthPx = Math.max(2, (visStopMin - visStartMin) * PIXELS_PER_MINUTE - 2);
 
       const el = document.createElement('div');
-      const progRecClass = prog.has_recording ? (' has-recording ' + recCssClass(prog.recording_status)) : '';
+      const progRecClass = prog.has_recording ? (' has-recording ' + recCssClass(prog.recording_status, prog.recording_partial)) : '';
       el.className = 'guide-program' + progRecClass + (prog.is_dummy ? ' is-dummy' : '');
       if (widthPx < 60) el.classList.add('narrow');
       el.style.left  = leftPx + 'px';
@@ -987,7 +1038,7 @@ function renderProgramRows() {
         el.style.setProperty('--rec-right', rightPct + '%');
       }
 
-      el.innerHTML = programCellHtml(prog, ch);
+      el.innerHTML = programCellHtml(prog, ch, widthPx);
 
       el.addEventListener('click', () => openModal(prog, ch));
       row.appendChild(el);
@@ -1239,12 +1290,40 @@ function openChannelSheet(ch) {
   });
 }
 
-// The tech readout as plain text for the sheet. Same wording as the desktop column's
-// `no stream data` (12.4) so the two surfaces never describe the same channel differently.
+// Whether the last health check left stream details to show.
+function hasStreamDetails(ch) {
+  return ch.last_test_status === statusVocab('TEST_STATUS').COMPLETED &&
+    !!(ch.last_test_resolution || ch.last_test_fps || ch.last_test_bitrate_kbps || ch.last_test_audio_codec);
+}
+
+// What row two says when there are no stream details, as [label, tooltip]. It names WHY, so
+// the line explains itself without a hover - a bare "no stream data" beside the `--` badge
+// left a first-time user unable to tell what either meant (12.4, dev/changelog/1276).
+function noStreamDetailsText(ch) {
+  const st = statusVocab('TEST_STATUS');
+  switch (ch.last_test_status) {
+    case st.FAILED:
+      return ['last check failed',
+        'No stream details\nThe most recent health check on this channel failed, so nothing was measured.'];
+    case st.CANCELLED:
+      return ['last check cancelled',
+        'No stream details\nThe most recent health check on this channel was cancelled before it measured anything.'];
+    case st.COMPLETED:
+      return ['no stream details',
+        'No stream details\nThe last health check passed but the stream reported no resolution, frame rate, bitrate or audio.'];
+    case null:
+    case undefined:
+      return ['not tested yet',
+        'No stream details\nResolution, frame rate, bitrate and audio are measured by a health check, and this channel has not had one yet.'];
+    default:
+      return ['no stream details', `No stream details\nThe last health check ended as ${ch.last_test_status}.`];
+  }
+}
+
+// The tech readout as plain text for the sheet. Same wording as the desktop column's row two
+// (12.4) so the two surfaces never describe the same channel differently.
 function channelTechText(ch) {
-  const hasData = ch.last_test_status === statusVocab('TEST_STATUS').COMPLETED &&
-    (ch.last_test_resolution || ch.last_test_fps || ch.last_test_bitrate_kbps || ch.last_test_audio_codec);
-  if (!hasData) return 'no stream data';
+  if (!hasStreamDetails(ch)) return noStreamDetailsText(ch)[0];
   const bits = [];
   if (ch.last_test_resolution) {
     const height = ch.last_test_resolution.split('x')[1];
@@ -1525,6 +1604,17 @@ let _modalNameProg = null;
 let _modalNameEdited = false;
 let _modalNameSeq = 0;
 
+// Whether the open modal schedules a new recording of a program, the only case where a
+// program already on can lose its aired part (an edit is of a recording not yet started).
+let _modalLateApplicable = false;
+// The title and button a new recording opened with, and whether this open may say "Record
+// now" instead while the program is already on. "Schedule recording" for a show that is on
+// made a first-time user stop and wonder whether it would record now or later
+// (dev/changelog/1290). A replace keeps its own words: it also deletes a recording.
+let _modalBaseTitle = 'Schedule recording';
+let _modalRecordNowOk = false;
+const RECORD_NOW_LABEL = 'Record now';
+
 // Mirrors app/url_utils.py::mask_creds (the canonical masker, also behind the mask_creds
 // Jinja filter) so the same masking can be applied client-side to URLs populated purely
 // from JSON. Keep the rules below in sync with that function.
@@ -1772,6 +1862,38 @@ function applyProfilePadding() {
   }
 }
 
+// The server moves a start time already past to "now", so the field's past time is not
+// when recording begins and the aired part will not be in the file - said before the
+// user confirms rather than left to the RECORDING_CREATED_AFTER_EVENT_START event
+// (dev/changelog/1275). Read from the field, so a start typed into the future clears it.
+function applyLateNote() {
+  const note = document.getElementById('modal-late-note');
+  if (!note) return;
+  const startVal = document.getElementById('modal-start').value;
+  const now = Date.now();
+  const progStart = _modalBaseStartIso ? new Date(`${_modalBaseStartIso}Z`).getTime() : NaN;
+  const progStop = _modalBaseStopIso ? new Date(`${_modalBaseStopIso}Z`).getTime() : NaN;
+  const startsPast = Boolean(startVal) && tzInputValueToDate(startVal, TZ).getTime() <= now;
+  const late = _modalLateApplicable && startsPast && progStart < now && progStop > now;
+  applyRecordNowLabels(late);
+  if (!late) {
+    note.style.display = 'none';
+    return;
+  }
+  const aired = fmtDur((now - progStart) / 1000, false);
+  note.textContent = `This program started ${aired} ago. The recording starts the moment you `
+    + `press ${document.getElementById('modal-submit').textContent}, so the first ${aired} `
+    + 'will not be in the file.';
+  note.style.display = '';
+}
+
+function applyRecordNowLabels(late) {
+  if (!_modalRecordNowOk) return;
+  const now = late === true;
+  document.getElementById('modal-title').textContent = now ? RECORD_NOW_LABEL : _modalBaseTitle;
+  document.getElementById('modal-submit').textContent = now ? RECORD_NOW_LABEL : 'Schedule recording';
+}
+
 function applyProfileName() {
   const prog = _modalNameProg;
   const sel = document.getElementById('modal-profile');
@@ -1832,6 +1954,10 @@ function openModal(prog, ch, opts = {}) {
   urlDisplay.value = maskCreds(prog.stream_url);
   urlDisplay.dataset.revealed = 'false';
   document.getElementById('modal-url-toggle').textContent = 'Show';
+  // Closed on every open, like the rest of the form's state: a disclosure opened on one
+  // program would otherwise stay open for the next.
+  const urlPick = document.getElementById('modal-url-pick');
+  if (urlPick) urlPick.open = false;
   document.getElementById('modal-start').value      = startET;
   document.getElementById('modal-stop').value       = stopET;
   document.getElementById('modal-epg-id').value     = prog.id;
@@ -1908,6 +2034,11 @@ function openModal(prog, ch, opts = {}) {
     deleteBtn.style.display  = 'none';
     detailLinkDiv.style.display = 'none';
   }
+  // After the labels above, which applyLateNote() may replace with "Record now".
+  _modalBaseTitle = title.textContent;
+  _modalRecordNowOk = !isEdit && !replaceRecId;
+  _modalLateApplicable = !isEdit;
+  applyLateNote();
 
   document.getElementById('record-modal').style.display = 'flex';
   syncScrollLock();
@@ -1921,8 +2052,23 @@ function showModalError(msg, conflicts) {
 // recording answers {success: false, overlap_warning, connection_limit_warning} rather than
 // failing outright (dev/changelog/858); this is what turns that into a warning-with-a-way-past
 // rather than the caller silently treating an unconfirmed response as success.
+// When to ask /api/nav-status again after a recording that starts now is saved. The grid
+// redrew the moment the save answered, before the recorder had started, and nothing asked
+// again until the next nav poll - so the cell said SCHEDULED for 8 to 10 s and the red
+// recording pill came late (dev/changelog/1290). Each answer that moves the recording
+// signature re-reads the grid through __applyRecordingSignature, so three tries cover a slow
+// start without polling for good.
+const START_FOLLOWUP_MS = [1500, 4000, 8000];
+
+function followStartingRecording() {
+  if (typeof window.fetchNavStatus !== 'function') return;
+  START_FOLLOWUP_MS.forEach((ms) => setTimeout(() => window.fetchNavStatus(), ms));
+}
+
 async function submitModalForm(form, data) {
   const isReplace = document.getElementById('modal-replace-id').value !== '';
+  const startVal = document.getElementById('modal-start').value;
+  const startsNow = Boolean(startVal) && tzInputValueToDate(startVal, TZ).getTime() <= Date.now();
   try {
     const resp = await jsonFetch(form.action, { method: 'POST', body: data });
     if (resp && resp.success === false) {
@@ -1938,6 +2084,7 @@ async function submitModalForm(form, data) {
     // Pages with no guide grid (fetchAndRender is a no-op there) set this to refresh
     // their own display after a schedule/edit save - see index.html, recording_detail.html.
     if (typeof window.onScheduleSaved === 'function') window.onScheduleSaved();
+    if (startsNow) followStartingRecording();
   } catch (e) {
     showModalError(e.message || 'Request failed. Check your connection.', e.data && e.data.conflicts);
   }
@@ -2296,7 +2443,7 @@ function renderProgramRowsCollapsed(terms) {
         const widthPx = ((ov.clEnd - ov.clStart) / 60000) * PIXELS_PER_MINUTE;
         if (widthPx <= 0) return;
 
-        const bandStatusClass = ' ' + recCssClass(rec.status);
+        const bandStatusClass = ' ' + recCssClass(rec.status, rec.partial);
         const band = document.createElement('div');
         band.className = 'guide-recording-band' + bandStatusClass;
         band.style.left  = leftPx + 'px';
@@ -2324,7 +2471,7 @@ function renderProgramRowsCollapsed(terms) {
         const widthPx = Math.max(2, ((ov.clEnd - ov.clStart) / 60000) * PIXELS_PER_MINUTE - 2);
 
         const el = document.createElement('div');
-        const progRecClass = prog.has_recording ? (' has-recording ' + recCssClass(prog.recording_status)) : '';
+        const progRecClass = prog.has_recording ? (' has-recording ' + recCssClass(prog.recording_status, prog.recording_partial)) : '';
         el.className = 'guide-program' + progRecClass + (prog.is_dummy ? ' is-dummy' : '');
         if (widthPx < 60) el.classList.add('narrow');
         el.style.left  = leftPx + 'px';
@@ -2348,7 +2495,7 @@ function renderProgramRowsCollapsed(terms) {
           }
         }
 
-        el.innerHTML = programCellHtml(prog, ch);
+        el.innerHTML = programCellHtml(prog, ch, widthPx);
 
         el.addEventListener('click', () => openModal(prog, ch));
         row.appendChild(el);
@@ -2450,11 +2597,31 @@ function renderTagKey(terms) {
     `${escHtml(name)}</span>`).join('');
 }
 
+// The colour key for the channel column's health dots (13.5), which carry a band's colour
+// and nothing else: at phone width a tester saw orange, grey and green dots beside channel
+// names with nothing saying what they meant (dev/changelog/1290). Only the bands on a
+// channel actually listed are named, in the declared order, and the host is shown at phone
+// width only (guide.css) - above it the numeric badge says its own band.
+function renderHealthKey(channels) {
+  const host = document.getElementById('guide-sb-healthkey');
+  if (!host) return;
+  const seen = new Set();
+  channels.forEach(ch => { if (!isChannelHealthHidden(ch)) seen.add(healthState(ch)); });
+  const vocab = healthBands();
+  const bands = vocab.bands.concat([vocab.untested]).filter(b => seen.has(b.key));
+  host.innerHTML = bands.length
+    ? '<span class="guide-legend-item">Health</span>' + bands.map(b =>
+      `<span class="guide-legend-item" data-band="${escHtml(b.key)}">` +
+      `<span class="guide-legend-dot ${escHtml(b.css)}"></span>${escHtml(b.name)}</span>`).join('')
+    : '';
+}
+
 // Status bar counts (12.6 as amended - the account legend beside them is server-rendered,
 // since accounts do not change while the page is open).
 function updateStatusBar(shownChannels, shownPrograms, terms) {
   const el = document.getElementById('guide-sb-counts');
   renderTagKey(terms);
+  renderHealthKey(channelData);
   if (!el) return;
   // A single-channel card counts programs, not channels: "1 of 1 channels" says nothing.
   if (SINGLE_CHANNEL) {
@@ -2466,7 +2633,10 @@ function updateStatusBar(shownChannels, shownPrograms, terms) {
   const chanPart = shownChannels === total
     ? `${total} channel${total === 1 ? '' : 's'}`
     : `${shownChannels} of ${total} channels`;
-  el.textContent = `${chanPart}  ·  ${shownPrograms} program${shownPrograms === 1 ? '' : 's'} shown`;
+  // Over the whole span the grid holds, not the part in view: "61 programs shown" with one
+  // block on screen read as a count of what was visible (dev/changelog/1292).
+  el.textContent = `${chanPart}  ·  ${shownPrograms} program${shownPrograms === 1 ? '' : 's'} `
+    + `over ${WINDOW_DAYS} day${WINDOW_DAYS === 1 ? '' : 's'}`;
 }
 
 // Single dispatcher for the whole render pipeline.
@@ -2631,7 +2801,11 @@ function renderHealthBadge(ch) {
   // the badge, so the dot and the number can no more disagree than the badge's colour and
   // its own number can. Hidden by CSS on desktop.
   const dot = document.querySelector(`.guide-health-dot[data-channel-id="${ch.id}"]`);
-  if (dot) dot.className = `guide-health-dot hb-${state === 'untested' ? 'none' : state}`;
+  if (dot) {
+    dot.className = `guide-health-dot hb-${state === 'untested' ? 'none' : state}`;
+    dot.setAttribute('role', 'img');
+    dot.setAttribute('aria-label', `Health: ${healthBandName(effectiveHealthScore(ch))}`);
+  }
 
   const badge = document.querySelector(`.guide-health-badge[data-channel-id="${ch.id}"]`);
   if (!badge) return;
@@ -2659,18 +2833,15 @@ function renderHealthBadge(ch) {
 // Resolution / frame rate / bitrate / audio, each user-toggleable (12.3), separated by a
 // middot at --text-muted - the separator is punctuation between two readable values, and
 // --border is a hairline colour too faint to use for a glyph (12.4). A channel with no
-// successful health check reads `no stream data` rather than showing blanks.
+// stream details says why rather than showing blanks.
 function renderTechReadout(ch) {
   const box = document.querySelector(`.guide-channel-tech[data-channel-id="${ch.id}"]`);
   if (!box) return;
   if (!techFieldsEnabled()) { box.innerHTML = ''; return; }
 
-  const hasData = ch.last_test_status === statusVocab('TEST_STATUS').COMPLETED &&
-    (ch.last_test_resolution || ch.last_test_fps || ch.last_test_bitrate_kbps || ch.last_test_audio_codec);
-  if (!hasData) {
-    box.innerHTML = '<span class="guide-tech tip-plain" data-tip="' + escTipAttr(
-      'No stream details\nThese are measured by a health check. This channel has not been tested successfully yet.') +
-      '">no stream data</span>';
+  if (!hasStreamDetails(ch)) {
+    const [label, tip] = noStreamDetailsText(ch);
+    box.innerHTML = `<span class="guide-tech tip-plain" data-tip="${escTipAttr(tip)}">${escHtml(label)}</span>`;
     return;
   }
 
@@ -3044,11 +3215,15 @@ document.addEventListener('DOMContentLoaded', function () {
   // but never for a field the user has since hand-edited (dev/docs/BUGS.md 2026-08-06).
   const modalStartInput = document.getElementById('modal-start');
   const modalStopInput  = document.getElementById('modal-stop');
-  if (modalStartInput) modalStartInput.addEventListener('input', () => { _modalStartEdited = true; });
+  if (modalStartInput) {
+    modalStartInput.addEventListener('input', () => { _modalStartEdited = true; applyLateNote(); });
+  }
   if (modalStopInput)  modalStopInput.addEventListener('input',  () => { _modalStopEdited = true; });
   const modalProfileSel = document.getElementById('modal-profile');
   if (modalProfileSel) {
-    modalProfileSel.addEventListener('change', () => { applyProfilePadding(); applyProfileName(); });
+    modalProfileSel.addEventListener('change', () => {
+      applyProfilePadding(); applyProfileName(); applyLateNote();
+    });
   }
   const modalNameInput = document.getElementById('modal-name');
   if (modalNameInput) modalNameInput.addEventListener('input', () => { _modalNameEdited = true; });
@@ -3191,6 +3366,20 @@ document.addEventListener('DOMContentLoaded', function () {
 
     // Auto-refresh EPG every 5 minutes (preserves scroll position via fetchAndRender)
     setInterval(fetchAndRender, 5 * 60 * 1000);
+
+    // A recording starting, ending or being scheduled elsewhere re-reads the grid on the
+    // next nav poll rather than at the 5-minute tick, which left a running recording's
+    // cell saying SCHEDULED (dev/docs/BUGS.md 2026-10-23 06:36:01 AM). The first poll only records:
+    // the grid was fetched moments before it. Waits while an overlay is open, since a
+    // re-render closes the popover or modal it was opened from; the next poll asks again.
+    let recSig;
+    window.__applyRecordingSignature = (sig) => {
+      if (typeof sig !== 'string') return;
+      if (recSig === undefined) { recSig = sig; return; }
+      if (sig === recSig || overlayOpen()) return;
+      recSig = sig;
+      fetchAndRender();
+    };
   }
 
   // Re-render program cells on viewport width change (rotation, browser resize).

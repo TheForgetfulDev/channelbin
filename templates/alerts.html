@@ -53,6 +53,7 @@
 .al-row.unread .al-title { font-weight: 700; }
 .al-meta { font-size: var(--fs-xs); color: var(--text-faint); margin-top: 3px; }
 .al-meta code { font-family: var(--font-mono); font-size: .95em; }
+.al-cleared { font-size: var(--fs-sm); color: var(--text-muted); margin-top: 3px; }
 .al-link { display: inline-block; font-size: var(--fs-sm); margin-top: 5px; }
 /* Disclosure for the alert body. The body is a raw multi-line string (a
    traceback, an ffmpeg tail), so it keeps its own newlines and wraps rather
@@ -96,8 +97,12 @@
   </div>
 </div>
 <p class="page-sub">Active alerts are problems that are still true right now. Each one clears
-  itself once it is fixed, so it has no Dismiss. Past alerts already happened and stay until you
-  dismiss them. Things only worth knowing, like a group's format moving or a provider adding
+  itself once it is fixed, so it has no Dismiss. Some wait a little to be sure the fix holds:
+  a recording's "not capturing" alert stays until its stream has kept coming for
+  {{ early_fail_window }} s, which is how ChannelBin tells the channel from a provider's short
+  placeholder clip. Alerts that cleared themselves in the last day stay under Cleared recently,
+  so one that came and went while you were away is still here to read.
+  Past alerts already happened and stay until you dismiss them. Things only worth knowing, like a group's format moving or a provider adding
   channels, are shown on that group or account instead. Dismissing an alert only hides it here -
   it is never what deletes a recording or a log line.</p>
 
@@ -105,9 +110,11 @@
    template's render context, so reaching for it here would resolve to Undefined and every
    deep link would silently vanish. `active` drops Dismiss for a problem that is still
    happening - the dismiss routes refuse it as well, since hiding the menu item is not
-   enforcement (dev/changelog/932). #}
-{% macro alert_row(a, link, active) %}
-<div class="al-row{% if a.read_at is none %} unread{% endif %}" data-sev="{{ a.severity }}"
+   enforcement (dev/changelog/932). `cleared` is an alert the app took down because its
+   problem ended: it says when, and draws no unread edge, since nothing is left for anyone
+   to do about it (dev/changelog/1293). #}
+{% macro alert_row(a, link, active, cleared=False) %}
+<div class="al-row{% if a.read_at is none and not cleared %} unread{% endif %}" data-sev="{{ a.severity }}"
      id="alert-{{ a.id }}" data-id="{{ a.id }}">
   <span class="alert-severity sev-{{ a.severity }}">{{ a.severity }}</span>
   <div class="al-body">
@@ -116,7 +123,9 @@
       {% if a.created_at %}{{ a.created_at | local_time }}&nbsp;&middot;&nbsp;{{ a.created_at | time_ago }}{% endif %}
       {% if a.source %}&nbsp;&middot;&nbsp;<code>{{ a.source }}</code>{% endif %}
       {% if a.alert_type %}&nbsp;&middot;&nbsp;{{ a.alert_type }}{% endif %}
-      {% if a.dismissed_at %}&nbsp;&middot;&nbsp;<em>dismissed</em>{% endif %}
+      {% if cleared %}
+      <div class="al-cleared">Cleared itself {{ a.dismissed_at | local_time }}{% if a.created_at %}, {{ ((a.dismissed_at - a.created_at).total_seconds()) | duration }} after it was raised{% endif %}</div>
+      {% elif a.dismissed_at %}&nbsp;&middot;&nbsp;<em>dismissed</em>{% endif %}
     </div>
     {% if link %}
     <a class="al-link" href="{{ link[0] }}">{{ link[1] }} &rarr;</a>
@@ -135,6 +144,9 @@
       {% if active %}
       <button class="menu-item" data-act="ignore">Ignore future alerts like this</button>
       <span class="pop-title">Clears itself once fixed</span>
+      {% elif cleared %}
+      <button class="menu-item" data-act="ignore">Ignore future alerts like this</button>
+      <span class="pop-title">Already cleared itself</span>
       {% elif a.dismissed_at is none %}
       <button class="menu-item" data-act="ignore">Ignore future alerts like this</button>
       <button class="menu-item danger" data-act="dismiss">Dismiss</button>
@@ -165,6 +177,20 @@
 </div>
 {% endif %}
 
+{% if cleared_alerts %}
+<div class="card" id="al-card-cleared">
+  <div class="card-head">
+    <h2>Cleared recently <span class="cnt">{{ cleared_alerts | length }}</span></h2>
+  </div>
+  <div class="card-body">
+    <p class="page-intro">Problems ChannelBin saw end in the last 24 hours. Each one leaves this list a day after it cleared.</p>
+    <div id="alerts-cleared">
+      {% for a in cleared_alerts %}{{ alert_row(a, alert_links.get(a.id), False, True) }}{% endfor %}
+    </div>
+  </div>
+</div>
+{% endif %}
+
 {% if past_alerts %}
 <div class="card" id="al-card-past">
   <div class="card-head">
@@ -178,7 +204,7 @@
 </div>
 {% endif %}
 
-{% if not active_alerts and not past_alerts %}
+{% if not active_alerts and not past_alerts and not cleared_alerts %}
 <div class="empty-state">
   <p>No alerts{% if include_dismissed %}, dismissed ones included{% endif %}.</p>
   {% if not include_dismissed %}

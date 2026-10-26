@@ -203,8 +203,8 @@ class ContentCardTests(_StatsCase):
         from app import account_stats
         cur = account_stats.current_stats([acc.id], load_config())[acc.id]
         content = _card(self.get(f'/accounts/{acc.id}'), 'content')
-        self.assertEqual(_text(_srow(content, 'In a channel group')), str(cur['in_group']))
-        self.assertEqual(_text(_srow(content, 'Recording on')), str(cur['recording_memberships']))
+        self.assertEqual(_text(_srow(content, 'In your groups')), str(cur['in_group']))
+        self.assertEqual(_text(_srow(content, 'Recording in groups')), str(cur['recording_memberships']))
         self.assertEqual(_text(_srow(content, 'Guide rows it can feed')),
                          f"{cur['guide_rows_fed']} of {cur['guide_rows_total']}")
         self.assertEqual(_text(_srow(content, 'Average health score')),
@@ -223,7 +223,7 @@ class ContentCardTests(_StatsCase):
         seed.make_group(name='G', members=[ch])
         db.session.commit()
         content = _card(self.get(f'/accounts/{acc.id}'), 'content')
-        group_row = _srow(content, 'In a channel group')
+        group_row = _srow(content, 'In your groups')
         self.assertIn('f.group=__any__', group_row)
         self.assertIn(f'f.acct={acc.id}', group_row)
         self.assertNotIn('<a ', _srow(content, 'Failing right now'))
@@ -235,7 +235,7 @@ class ContentCardTests(_StatsCase):
         content = _card(self.get(f'/accounts/{acc.id}'), 'content')
         self.assertIn('Not tested yet', content)
         self.assertIn('text-faint">-', _srow(content, 'Average health score'))
-        for label in ('In a channel group', 'Recording on', 'Failing right now'):
+        for label in ('In your groups', 'Recording in groups', 'Failing right now'):
             row = _srow(content, label)
             self.assertIn('text-faint">0', row, label)
             self.assertNotIn('<a ', row, label)

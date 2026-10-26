@@ -368,6 +368,10 @@ def rollback_preview(channel, cfg):
         'excluded_count': len(ledger) - len(counting),
         'unledgered': max(0, stored_count - len(ledger)),
         'manual_adjustment': adjustment,
+        # How many recordings the counting observations came from. One recording usually
+        # leaves two (scored as it finished, corrected once its capture was analyzed), so
+        # an observation count alone read as two recordings (dev/changelog/1271).
+        'recordings': len({o.source_id for o in counting if o.kind in RECORDING_SOURCE_KINDS}),
         'current_score': None if channel.health_score is None else int(round(channel.health_score)),
         'current_effective': effective_score(channel) if channel.health_score is not None else None,
         'next': None,

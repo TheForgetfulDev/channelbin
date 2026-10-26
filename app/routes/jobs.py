@@ -124,7 +124,7 @@ _DURATION_TRACKED_SYSTEM_JOBS = {
 def _history_key(row_id: str):
     """The run history a row's runtime estimate is read from, or None for a job with none
     tracked at all (distinct from a tracked job with zero completed runs yet, which still
-    gets a real "Expected runtime unknown" line). A retry runs its base job's body, so it
+    gets a real "not known yet" line). A retry runs its base job's body, so it
     reads the base job's history - its own id never has any."""
     m = re.match(r'^account_sync(?:_retry)?_(\d+)$', row_id)
     if m:
@@ -193,7 +193,7 @@ def _recording_guard(what: str, section: dict, active_key: str, within_key: str,
 def _check_guard(ct_cfg: dict, od) -> dict:
     """A health check's recording guard (channel_tester.run_on_demand_test_job): the
     starts-soon one applies to every scheduled run, the capturing one to the automatic
-    TV Guide Channels check only."""
+    TV Guide health check only."""
     return _recording_guard('health check', ct_cfg, 'skip_if_recording_active',
                             'skip_if_recording_within_minutes', 10,
                             active_applies=bool(od is not None and od.is_system))
@@ -468,28 +468,49 @@ def _build_job_list():
             'recording_guard': _check_guard(ct_cfg, od),
         })
 
-    # Known recurring jobs (non-sync)
+    # Known recurring jobs (non-sync): the name, where its settings are, and one line on
+    # what it does - a first-time user met "Maintenance Window Dispatch" and "Search Index
+    # Janitor" with nothing to say what either was for (dev/changelog/1293).
     _RECURRING_META = {
-        'config_backup_daily': ('Config Backup', '/settings?q=config_backup'),
-        'recording_retention_daily': ('Recording Retention', '/settings?q=retention_days'),
-        'db_maintenance_daily': ('Database Maintenance', '/settings?q=keep_days'),
-        'hc_window_dispatch': ('Maintenance Window Dispatch', '/settings?q=channel_testing.window'),
-        'hc_window_close': ('Maintenance Window Close', '/settings?q=channel_testing.window'),
-        'logo_cache_fetch': ('Logo Cache Fetch', '/settings?q=logo_cache'),
-        'search_index_janitor': ('Search Index Janitor',
-                                 '/settings?q=index_janitor_grace_minutes'),
-        'storage_dirs_check': ('Storage Folder Check', '/maintenance'),
-        'account_stats_fold': ('Account Stats Update', '/accounts'),
-        'host_resolve_check': ('Stream Host Check', '/settings?q=hosts'),
-        'auto_rule_sweep': ('Auto-record Rules', '/rules'),
+        'config_backup_daily': ('Config Backup', '/settings?q=config_backup',
+                                'Saves a copy of your settings file.'),
+        'recording_retention_daily': ('Recording Retention', '/settings?q=retention_days',
+                                      'Deletes finished recordings older than you chose to '
+                                      'keep them.'),
+        'db_maintenance_daily': ('Database Maintenance', '/settings?q=keep_days',
+                                 'Clears out old dismissed alerts and past guide listings.'),
+        'hc_window_dispatch': ('Health Check Window: Start', '/settings?q=channel_testing.window',
+                               'Starts the next health check that is due, while the health '
+                               'check window is open.'),
+        'hc_window_close': ('Health Check Window: End', '/settings?q=channel_testing.window',
+                            'Stops any health check still running when the window closes.'),
+        'logo_cache_fetch': ('Channel Logo Download', '/settings?q=logo_cache',
+                             'Saves channel logos locally, so pages do not load them from '
+                             'the provider.'),
+        'search_index_janitor': ('Search Index Repair',
+                                 '/settings?q=index_janitor_grace_minutes',
+                                 'Rebuilds a search index that has stayed broken, if nothing '
+                                 'else has.'),
+        'storage_dirs_check': ('Storage Folder Check', '/maintenance',
+                               'Checks that the folders recordings are saved to can still be '
+                               'written.'),
+        'account_stats_fold': ('Account Stats Update', '/accounts',
+                               'Adds the last hour\'s usage to each account\'s numbers.'),
+        'host_resolve_check': ('Stream Host Check', '/settings?q=hosts',
+                               'Checks that each account\'s stream servers can still be '
+                               'found.'),
+        'auto_rule_sweep': ('Auto-record Rules', '/rules',
+                            'Schedules what your auto-record rules match.'),
         # The one-shot a guide import (or a refused run) queues: one evaluation of every
         # enabled rule, coalesced on this id (app/scheduler.py::queue_auto_rule_evaluation).
-        'auto_rules_evaluate': ('Auto-record Rules check', '/rules'),
+        'auto_rules_evaluate': ('Auto-record Rules check', '/rules',
+                                'Checks your auto-record rules against the new listings.'),
         # Never a job id of its own - only ever seen as `channel_hide_materialize_retry`,
         # the one-shot queued when a hide-rule pass was refused. Named here so the retry
         # branch below renders it as "Hide Rules retry" rather than a raw job id
         # (dev/changelog/928).
-        'channel_hide_materialize': ('Hide Rules', '/channels/hide-rules'),
+        'channel_hide_materialize': ('Hide Rules', '/channels/hide-rules',
+                                     'Applies your hide rules to the channel list.'),
     }
 
     # Explains, per job, what it does and why Run Now isn't offered - shown in the greyed
@@ -498,7 +519,7 @@ def _build_job_list():
     dispatch_minutes = ct_cfg.get('window', {}).get('dispatch_interval_minutes', 5)
     _RUN_NOW_REASONS = {
         'hc_window_dispatch': (
-            'Maintenance Window Dispatch starts the next due health check inside your '
+            'Health Check Window: Start runs the next due health check inside your '
             f'configured maintenance window, checking every {dispatch_minutes} minute'
             f'{"s" if dispatch_minutes != 1 else ""} '
             '(channel_testing.window.dispatch_interval_minutes). Run now is not offered: '
@@ -506,12 +527,12 @@ def _build_job_list():
             'one interval away.'
         ),
         'hc_window_close': (
-            'Maintenance Window Close hard-stops any health checks still running when the '
+            'Health Check Window: End hard-stops any health checks still running when the '
             'maintenance window ends, and reports what was left over. Run now is not '
             'offered, because running it by hand would stop checks that are mid-run.'
         ),
         'search_index_janitor': (
-            'Search Index Janitor rebuilds a search index that has been unusable for longer '
+            'Search Index Repair rebuilds a search index that has been unusable for longer '
             'than its grace window with nothing else repairing it. To rebuild right now, use '
             'Maintenance -> Search index -> Rebuild now.'
         ),
@@ -618,13 +639,14 @@ def _build_job_list():
         # shape as the sync retry above, named off the base job so the two read as a pair
         # rather than as an unexplained raw job id.
         if job.id.endswith('_retry') and job.id[:-len('_retry')] in _RECURRING_META:
-            base_name, edit_url = _RECURRING_META[job.id[:-len('_retry')]]
+            base_name, edit_url, what = _RECURRING_META[job.id[:-len('_retry')]]
             items.append({
                 '_start_utc': next_run_utc,
                 '_end_utc': next_run_utc,
                 '_next_run_utc': next_run_utc,
                 'id': job.id,
                 'display_name': f'{base_name} retry',
+                'what': what,
                 'type': 'one_off',
                 'next_run_utc': next_run_utc.isoformat(),
                 'next_run_et': _fmt_et(next_run_utc),
@@ -638,7 +660,7 @@ def _build_job_list():
             })
             continue
 
-        display_name, edit_url = _RECURRING_META.get(job.id, (job.id, None))
+        display_name, edit_url, what = _RECURRING_META.get(job.id, (job.id, None, None))
         if job.id == 'auto_rules_evaluate':
             reason = (job.kwargs or {}).get('reason')
             items.append({
@@ -647,6 +669,7 @@ def _build_job_list():
                 '_next_run_utc': next_run_utc,
                 'id': job.id,
                 'display_name': display_name,
+                'what': what,
                 'type': 'one_off',
                 'next_run_utc': next_run_utc.isoformat(),
                 'next_run_et': _fmt_et(next_run_utc),
@@ -665,6 +688,7 @@ def _build_job_list():
             '_next_run_utc': next_run_utc,
             'id': job.id,
             'display_name': display_name,
+            'what': what,
             'type': 'recurring',
             'next_run_utc': next_run_utc.isoformat(),
             'next_run_et': _fmt_et(next_run_utc),

@@ -13,7 +13,7 @@
   <a href="{{ url_for('recordings.new_recording') }}" class="btn btn-primary head-action-schedule">+ Schedule recording</a>
   {# Mobile only (DESIGN.md 9.3): scheduling happens from the guide at mobile widths,
      so the header action links there instead of a "+ Schedule" button with no destination. #}
-  <a href="{{ url_for('guide.guide') }}" class="btn btn-primary head-action-guide">TV Guide</a>
+  <a href="{{ url_for('guide.guide') }}" class="btn btn-primary head-action-guide">TV Guide <span class="arw">&#8594;</span></a>
 </div>
 
 {% if total == 0 %}
@@ -70,7 +70,8 @@
 <div class="list-head" id="list-head">
   <span class="sortable" data-sort="name">Recording name<span class="sort-ind"></span></span>
   <span class="sortable" data-col="time" data-sort="start">Time<span class="sort-ind"></span></span>
-  <span class="sortable num" data-col="duration" data-sort="dur">Duration<span class="sort-ind"></span></span>
+  {# The mark before a duration had no word anywhere on the page (dev/changelog/1293). #}
+  <span class="sortable num tip" data-col="duration" data-sort="dur" data-tip="How long the recording is.&#10;An amber &#9685; before it: it captured less than it was scheduled for. A grey one: it is still recording, or you stopped it early. Point at the mark for the numbers.">Duration<span class="sort-ind"></span></span>
   <span class="sortable num" data-col="size" data-sort="size">Size<span class="sort-ind"></span></span>
   <span class="sortable num tip" data-col="health" data-sort="health" data-tip="Segments / stalls.&#10;A stall is a moment the stream stopped and the watchdog restarted ffmpeg - each restart starts a new segment.">Health<span class="sort-ind"></span></span>
   <span data-col="account">Account</span>
@@ -92,7 +93,11 @@
        data-start="{{ r.sort_start }}" data-dur="{{ r.sort_dur }}" data-size="{{ r.sort_size }}" data-health="{{ r.sort_health }}">
     <div class="c-title">
       {% if r.thumb_url %}
-      <div class="thumb has-img" data-shot="{{ r.thumb_url }}"><img src="{{ r.thumb_url }}" alt="" loading="lazy" onerror="this.parentElement.classList.remove('has-img'); this.remove();"></div>
+      {#- A live row has no frame until the capture has written one, and an empty grey box
+          read as broken: it falls back the way a row with no screenshot does - the
+          channel's logo, else "-". -#}
+      {% set fb_logo = (r.member_pill or r.pill).logo_url if (r.member_pill or r.pill) else none %}
+      <div class="thumb has-img" data-shot="{{ r.thumb_url }}"{% if fb_logo %} data-logo="{{ fb_logo }}"{% endif %}><img src="{{ r.thumb_url }}" alt="" loading="lazy" onerror="const t = this.parentElement; t.classList.remove('has-img'); if (t.dataset.logo) { t.classList.add('logo-fallback'); this.onerror = () => { t.classList.remove('logo-fallback'); this.remove(); t.textContent = '-'; }; this.src = t.dataset.logo; delete t.dataset.logo; } else { this.remove(); t.textContent = '-'; }"></div>
       {% elif (r.member_pill or r.pill) and (r.member_pill or r.pill).logo_url %}
       <div class="thumb logo-fallback"><img src="{{ (r.member_pill or r.pill).logo_url }}" alt="" loading="lazy" onerror="this.parentElement.classList.remove('logo-fallback'); this.remove(); this.parentElement.textContent='-';"></div>
       {% else %}
@@ -116,7 +121,7 @@
        data-col order, per applyColumns()) and becomes one mono stats line at mobile
        widths (DESIGN.md 9.4), grouping duration/size/health the way mockup 03 does. #}
     <div class="c-stats">
-    <div class="c-num" data-col="duration">{% if r.dur_flag %}<span class="dur-flag tip-plain" data-tip="{{ r.dur_tip }}">&#9685;</span>{% endif %}{{ r.dur_str or '-' }}</div>
+    <div class="c-num" data-col="duration">{% if r.dur_flag %}<span class="dur-flag{% if r.dur_flag == 'stopped' %} dur-quiet{% endif %} tip-plain" data-tip="{{ r.dur_tip }}">&#9685;</span>{% endif %}{{ r.dur_str or '-' }}</div>
     <div class="c-num" data-col="size">{% if r.size_num %}{{ r.size_num }} <span class="unit">{{ r.size_unit }}</span>{% if r.rate %}<span class="sub tip-plain" data-tip="{{ r.rate_tip }}">{{ r.rate }}</span>{% endif %}{% else %}-{% endif %}</div>
     <div class="c-health" data-col="health">
       {% if r.health.tip %}<span class="h-mini {{ r.health.cls }} tip-plain" data-tip="{{ r.health.tip }}">{{ r.health.label }}</span>

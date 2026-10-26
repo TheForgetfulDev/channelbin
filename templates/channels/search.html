@@ -3,10 +3,10 @@
 {# _record_modal.html calls csrf_field() unqualified, so it has to be in this
    template's namespace too - `m.csrf_field` is not the same name to an include. #}
 {% from '_macros.html' import csrf_field %}
-{% block title %}Channels - ChannelBin{% endblock %}
+{% block title %}Channel Search - ChannelBin{% endblock %}
 
 {#
-  The channel search (the Browse tab). Approved design:
+  The channel search (Channel Search in the sidebar). Approved design:
   dev/mockups/21-channel-search-desktop.html. Contract, registries and response
   envelope: dev/docs/DESIGN-channel-search.md - read that before changing a
   parameter name, because once other pages link in here the URL is an API.
@@ -33,7 +33,7 @@
    which is what 3.10 expects of a page whose actions all live in its own toolbar
    (dev/changelog/810, 811). #}
 <div class="page-head">
-  <h1>Channels</h1>
+  <h1>Channel Search</h1>
   {# Phone only (CSS): the two whole-database cleanups below are page-level actions
      rather than search controls, so at 375 they are overflow behind this rather than
      two danger buttons competing with the search box for the top of the screen
@@ -86,7 +86,7 @@
               <span class="mag" aria-hidden="true">&#128269;</span>
               <input id="cs-q" type="text" autocomplete="off" spellcheck="false"
                      aria-label="Search channels"
-                     placeholder="Search channels and what is on them">
+                     placeholder="Search by channel name">
               <span class="syn" id="syn" style="display:none"></span>
               <span class="scount" id="scount"></span>
               <span class="spinner sspin" id="sb-spin"></span>
@@ -242,17 +242,20 @@
           <button class="btn btn-sm btn-ghost" id="sel-ctx-x" type="button"
                   data-tip="Stop adding to that group. The search itself is left alone.">&times;</button>
         </span>
-        {# One grouping action, and the only primary on this bar. "Test selected" used to
-           sit beside it and since the groups revamp did substantially the same job - it
-           opened the health-check modal in ad hoc mode, where the server creates a group
-           anyway - behind a modal that looked nothing like this one's (dev/changelog/831).
-           The single-channel ad hoc test survives on the phone row sheet and on a
-           channel's own page, which have no group to work from. #}
-        <button class="btn btn-sm btn-primary" id="sel-group" type="button">+ Group selected (0)</button>
+        {# The guide action leads and is the only primary on this bar: putting a channel in
+           the guide is what most people tick one for, and the checkbox plus this bar is the
+           only way to do it from a desktop row (dev/changelog/860). A first-time user read
+           a highlighted "Group selected" as the way in (dev/changelog/1290). #}
+        <button class="btn btn-sm btn-primary" id="sel-add" type="button">+ Add selected to guide (0)</button>
         {# Airings only, and only once a showing is ticked: the one selection-bar action
            that acts on SHOWINGS rather than channels (dev/changelog/1157). #}
         <button class="btn btn-sm" id="sel-sched" type="button" style="display:none">Schedule selected (0)</button>
-        <button class="btn btn-sm" id="sel-add" type="button">+ Add selected to guide (0)</button>
+        {# One grouping action. "Test selected" used to sit beside it and since the groups
+           revamp did substantially the same job - it opened the health-check modal in ad hoc
+           mode, where the server creates a group anyway - behind a modal that looked nothing
+           like this one's (dev/changelog/831). The single-channel ad hoc test survives on the
+           phone row sheet and on a channel's own page, which have no group to work from. #}
+        <button class="btn btn-sm" id="sel-group" type="button">+ Group selected (0)</button>
         {# Hide is not Delete and not Remove: nothing is destroyed and nothing leaves a
            list it was put in by hand. A channel in the TV Guide or a group is not refused
            either - its hide is recorded and deferred, and the response names it. #}

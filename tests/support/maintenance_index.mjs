@@ -43,6 +43,7 @@ const ixRow = (name, label, status, ready, reason) => ({
   label,
   status,
   row_count: 136130,
+  unit: name,
   duration_ms: 76000,
   error: null,
   rebuilt_at: 'Sep 21, 3:04 PM',
@@ -54,7 +55,7 @@ const answer = (status, ready, reason, rebuilding = false) => ({
   rebuilding,
   indexes: [
     ixRow('channels', 'Channels (names, groups, EPG titles)', status, ready, reason),
-    ixRow('programs', 'Programs (upcoming airings)', status, ready, reason),
+    ixRow('programs', 'Programs (upcoming, each once per channel)', status, ready, reason),
   ],
 });
 const A_OK = answer('OK', true, '');

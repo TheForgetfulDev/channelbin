@@ -20,24 +20,29 @@
 </div>
 <p class="page-sub">
   An account is one IPTV provider connection. ChannelBin syncs its channel list and guide
-  data on a schedule; nothing is fetched until you sync it for the first time.
+  data on a schedule, and the first sync starts about a minute after you add it.
 </p>
 
 <div class="form-card">
   <form method="post">
       {{ csrf_field() }}
 
+    {# Xtream first and by default: a provider's welcome message is almost always a server,
+       a username and a password, which is an Xtream Codes login (dev/changelog/1272). #}
     <div class="form-group">
       <label>Account Type <span class="required">*</span></label>
       <select name="account_type" id="account-type" class="form-control">
-        <option value="m3u" {% if form.get('account_type', 'm3u') == 'm3u' %}selected{% endif %}>
-          M3U Playlist + XMLTV EPG
+        <option value="xtream" {% if form.get('account_type', 'xtream') == 'xtream' %}selected{% endif %}>
+          Xtream Codes
         </option>
-        <option value="xtream" {% if form.get('account_type') == 'xtream' %}selected{% endif %}>
-          Xtream API
+        <option value="m3u" {% if form.get('account_type', 'xtream') == 'm3u' %}selected{% endif %}>
+          M3U playlist
         </option>
       </select>
-      <span class="form-hint">M3U works with any IPTV provider. Xtream API uses the provider's Xtream Codes login.</span>
+      <span class="form-hint">
+        Most providers send a server address, a username and a password: that is Xtream Codes.
+        Pick M3U playlist if you were given one long link instead.
+      </span>
     </div>
 
     <div class="form-group">
@@ -62,11 +67,11 @@
     {# ── Xtream fields ── #}
     <div id="fields-xtream" style="display:none">
       <div class="form-group">
-        <label>Base URL <span class="required">*</span></label>
+        <label>Server <span class="required">*</span></label>
         <input type="text" name="base_url" id="xtream-base-url" class="form-control"
                value="{{ form.get('base_url', '') }}"
                placeholder="http://your-provider.com">
-        <span class="form-hint">Provider URL without trailing slash. Example: <code>http://provider.com:8080</code></span>
+        <span class="form-hint">The server address your provider gave you, port included if it has one. Example: <code>http://provider.com:8080</code></span>
       </div>
       <div class="form-row">
         <div class="form-group">
@@ -76,9 +81,9 @@
                  autocomplete="off">
         </div>
         <div class="form-group">
-          <label>Password</label>
+          <label>Password <span class="required">*</span></label>
           <div class="secret-field">
-            <input type="password" name="password" class="form-control"
+            <input type="password" name="password" id="xtream-password" class="form-control"
                    autocomplete="new-password" placeholder="Password">
             {{ secret_reveal_btn(local=true) }}
           </div>
@@ -94,20 +99,21 @@
     {# Both types: it becomes an EPG source on the account (dev/changelog/1104). An Xtream
        account also has its provider's own guide, which comes first in priority. #}
     <div class="form-group">
-      <label>XMLTV EPG URL <span class="form-hint-inline">(optional)</span></label>
+      <label>TV guide (EPG) URL <span class="form-hint-inline">(optional)</span></label>
       <input type="url" name="epg_url" class="form-control"
              value="{{ form.get('epg_url', '') }}"
              placeholder="http://example.com/guide.xml.gz">
       <span class="form-hint">
-        A TV guide file, plain or <code>.gz</code>. It is added as an EPG source and fetched
-        right away. An Xtream account already gets its provider's guide, and this one fills
-        the channels that guide does not cover. Change or remove it later under EPG sources
-        on the account page.
+        The EPG is the program guide: what is on each channel and when. An Xtream account
+        brings its provider's guide with it, so leave this empty unless that guide is missing
+        channels. For an M3U playlist, paste the guide link your provider gave you (an XMLTV
+        file, plain or <code>.gz</code>). It is fetched right away, and you can change or
+        remove it later under EPG sources on the account page.
       </span>
     </div>
 
     <div class="form-group">
-      <label>URL Normalization</label>
+      <label>URL Normalization <span class="form-hint-inline">(most people leave this as it is)</span></label>
       <select name="url_normalization" class="form-control" id="url-norm-select">
         {% for val, label, example in norm_options %}
         <option value="{{ val }}" data-example="{{ example }}"
@@ -117,8 +123,9 @@
       <span class="form-hint">
         Rewrites every stream URL into one consistent form. Only the URL's shape changes -
         the address and credentials the provider supplied are always kept as-is, and a URL
-        that has no <code>user/password/id</code> in it is left untouched.
-        The global default is set in Settings under <code>sync.url_normalization</code>.
+        that has no <code>user/password/id</code> in it is left untouched. Change it only if
+        channels will not play. The default is in
+        <a href="{{ url_for('settings.settings', q='sync.url_normalization') }}">Settings</a>.
       </span>
       {# Server-rendered to match the current selection, so the "nothing active" state is
          already correct before any JS runs (CLAUDE.md Frontend rendering). #}
@@ -141,8 +148,9 @@
         {% endfor %}
       </select>
       <span class="form-hint">
-        How often to refresh channels and EPG data for this account.
-        "Default" follows <code>sync.sync_interval_hours</code> in Settings.
+        How often to refresh this account's channels and guide. Most people leave this as it
+        is; "Default" follows the sync interval in
+        <a href="{{ url_for('settings.settings', q='sync.sync_interval_hours') }}">Settings</a>.
       </span>
     </div>
 
@@ -152,10 +160,12 @@
              value="{{ form.get('max_connections', '') }}"
              placeholder="Default ({{ global_max_connections }})">
       <span class="form-hint">
-        Maximum concurrent connections this app will open to this provider - recordings
-        and channel tests combined (account sync does not count against this). Leave
-        blank to use the global default (<code>accounts.default_max_connections</code>
-        in Settings).
+        How many streams ChannelBin may open on this account at once - recordings, health
+        checks and previews together (a sync does not count). Set it to your plan's limit,
+        often 1 or 2; the account page shows the limit your provider reports after the first
+        sync. Leave it blank to use the default in
+        <a href="{{ url_for('settings.settings', q='accounts.default_max_connections') }}">Settings</a>
+        ({{ global_max_connections }}).
       </span>
     </div>
 
@@ -237,6 +247,7 @@ const switchType = (v) => {
   document.getElementById('m3u-url').required = (v === 'm3u');
   document.getElementById('xtream-base-url').required = (v === 'xtream');
   document.getElementById('xtream-username').required = (v === 'xtream');
+  document.getElementById('xtream-password').required = (v === 'xtream');
 };
 typeSelect.addEventListener('change', () => switchType(typeSelect.value));
 switchType(typeSelect.value);

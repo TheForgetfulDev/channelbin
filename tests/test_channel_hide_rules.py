@@ -44,6 +44,11 @@ class _RuleTestCase(unittest.TestCase):
         self.t.app.config['WTF_CSRF_ENABLED'] = False
         self.ctx_mgr = self.t.app.app_context()
         self.ctx_mgr.push()
+        # Every install starts with the divider-row rules (dev/changelog/1276); these tests
+        # count rules and matches from a known set, so they start from none.
+        # tests/test_default_hide_rules.py owns the defaults.
+        ChannelHideRule.query.delete()
+        db.session.commit()
         self.acct = seed.make_account(name='Alpha')
 
     def tearDown(self):

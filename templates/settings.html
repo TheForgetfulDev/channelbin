@@ -591,11 +591,11 @@
         <div class="sec-sub"><strong>Scheduling around recordings</strong></div>
         <div class="sec-note">
           The automatic guide run's schedule (and pausing it) is managed on the
-          <a href="{{ url_for('channels.channels_health_checks') }}">TV Guide Channels</a>
+          <a href="{{ url_for('channels.channels_health_checks') }}">TV Guide health check</a>
           health check, like any other health check.
         </div>
         {{ field_bool('channel_testing.skip_if_recording_active', 'Defer health check during recording',
-           'Hold the scheduled TV Guide Channels health check while a recording is in progress. It retries at the first gap long enough to finish in.', ct.get('skip_if_recording_active', True), tier='advanced') }}
+           'Hold the scheduled TV Guide health check while a recording is in progress. It retries at the first gap long enough to finish in.', ct.get('skip_if_recording_active', True), tier='advanced') }}
         {{ field_number('channel_testing.skip_if_recording_within_minutes', 'Defer health check window (minutes)',
            'If a recording is scheduled to start within this many minutes, hold a scheduled health check run (system or custom) and retry it later, and warn before starting a manual one. 0 = off.', ct.get('skip_if_recording_within_minutes', 10), tier='advanced') }}
       </div>
@@ -769,14 +769,14 @@
 
     {% call section('system', 'System') %}
       {{ field_readonly('flask.port', 'Flask port',
-         'Port the app listens on. Edit in the config.yaml tab; restart required.',
+         'Port the app listens on. Under Docker this is the container\'s port, and the one you browse to is whatever your compose file maps to it. Edit in the config.yaml tab; restart required.',
          fsk.get('port', 5000), tier='advanced') }}
       {{ field_readonly('flask.host', 'Flask host',
          'Bind address for the Flask server. Edit in the config.yaml tab; restart required.',
          fsk.get('host', '0.0.0.0'), tier='advanced') }}
       {% if fsk.get('host', '0.0.0.0') in ('0.0.0.0', '', '::') %}
       {% call field_shell('', '⚠ Reachable from any device on this network',
-         'Bound to ' ~ fsk.get('host', '0.0.0.0') ~ ':' ~ fsk.get('port', 5000) ~ ', so every device on your LAN can reach this app - ' ~
+         'Listening on every network address (' ~ (fsk.get('host') or '0.0.0.0') ~ '), so every device on your LAN can reach this app - ' ~
          ('and the login gate below is on, but it is a shared password, not per-user auth.' if auth_has_password and authcfg.get('enabled')
           else 'and it has no authentication (see the Security section above to turn on the password gate).') ~
          ' If your reverse proxy runs on this same machine, you can set flask.host: 127.0.0.1 in the config.yaml tab to make the raw port unreachable except from the proxy. Do not do this if the proxy (or the devices you browse from) run on a different host - it will break access.', false, false, 'network exposure bind reachable lan security host', true, 'warn') %}{% endcall %}

@@ -42,6 +42,18 @@ class SettingsPageConformanceTests(unittest.TestCase):
         """
         self.assertEqual(len(re.findall(r'<h1[ >]', self.html)), 1)
 
+    def test_the_bind_warning_names_no_port(self):
+        """dev/docs/BUGS.md 2026-10-23 @ 09:00:53 AM: the "reachable from any device"
+        warning said "Bound to 0.0.0.0:5000" - the port inside a container - to a user
+        browsing on the 5002 their compose file mapped it to. The warning names the address
+        only; the Flask port row says the two ports can differ under Docker."""
+        i = self.html.index('Reachable from any device on this network')
+        desc = re.search(r'<div class="fl-desc">(.*?)</div>', self.html[i:], re.S).group(1)
+        self.assertIn('Listening on every network address (0.0.0.0)', desc)
+        self.assertNotRegex(desc, r'0\.0\.0\.0:\d+')
+        port_row = self.html[self.html.index('data-path="flask.port"'):]
+        self.assertIn('Under Docker this is the container', port_row[:2000])
+
     def test_the_settings_search_has_a_clear_control(self):
         """DESIGN.md 3.11: a search field on a filter bar carries a clear x.
 

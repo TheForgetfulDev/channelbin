@@ -614,7 +614,7 @@ class DetailPageTests(unittest.TestCase):
         self.assertEqual(resp.status_code, 200)
         html = resp.get_data(as_text=True)
         for ev_type, cls in ((CAPTURE_VIDEO_STOPPED, 'warn'), (CAPTURE_VIDEO_RESUMED, 'ok')):
-            li = html[:html.index(f'<span class="ev-type">{ev_type}</span>')]
+            li = html[:html.index(f'<span class="ev-code">{ev_type}</span>')]
             self.assertTrue(li[li.rindex('<li class="ev '):].startswith(f'<li class="ev {cls}"'),
                             ev_type)
         self.assertIn('stopped-detail', html)

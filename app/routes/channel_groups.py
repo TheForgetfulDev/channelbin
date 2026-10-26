@@ -591,7 +591,7 @@ def _channel_group_row(g, latest_by_channel, monitored_ids, system_job, system_c
 
 def _system_group_row(g, latest_by_channel, channels, disabled_ids, job, tests_by_job,
                       ct_cfg=None):
-    """The pinned "TV Guide Channels" row. Its membership is computed rather than stored
+    """The pinned "TV Guide health check" row. Its membership is computed rather than stored
     (channel_groups.check_target_channels), so it cannot go through _channel_group_row's
     membership path; `channels`/`disabled_ids` are that already-resolved target set,
     built once in groups_page() rather than per-row."""
@@ -722,8 +722,11 @@ def groups_page():
                                                  memberships_by_group.get(g.id, []), job,
                                                  blocking_by_group.get(g.id, []),
                                                  tests_by_job, streak_threshold, ct_cfg, cfg))
-    # The pinned system group stays first under every sort (DESIGN.md §14.1).
-    group_rows.sort(key=lambda r: (not r['system'], r['name'].lower()))
+    # The automatic one is drawn in a section of its own above the user's groups, so it is
+    # never counted or described as one of them (dev/changelog/1289).
+    system_row = next((r for r in group_rows if r['system']), None)
+    group_rows = sorted((r for r in group_rows if not r['system']),
+                        key=lambda r: r['name'].lower())
     # Auto-record rules that name each group, for the delete confirm: deleting the group
     # stops them (DESIGN-autoschedule.md §3.2). One query for the page.
     rules_by_group = _rules_by_group()
@@ -737,6 +740,7 @@ def groups_page():
     resolution_options, fps_options = _format_option_sets({'resolution': '', 'fps': None})
     return render_template('channels/groups.html',
         group_rows=group_rows,
+        system_row=system_row,
         group_names=[g.name for g in groups],
         resolution_options=resolution_options, fps_options=fps_options,
         hc_sig=hc_sig)
@@ -788,7 +792,7 @@ def _build_group_timeline(group):
 
     Membership still comes from check_target_channels(), not `group.memberships`, for the
     ChannelEvent pull: the system group stores no membership rows (it is computed from the
-    guide), so reading the relationship directly gave "TV Guide Channels" a permanently
+    guide), so reading the relationship directly gave "TV Guide health check" a permanently
     empty timeline.
 
     The members' ChannelEvent pull is deliberately narrow - grouping and failover only.
@@ -1611,8 +1615,6 @@ def build_group_detail_context(group):
         'group_names': [n for (n,) in db.session.query(ChannelGroup.name).all()],
         'tester_status': tester_status,
         'in_progress_test_id': in_progress_test_id,
-        'created_et': _fmt_et(group.created_at),
-        'updated_et': _fmt_et(group.updated_at),
         'last_run_et': _fmt_et(job.completed_at) if job.completed_at else None,
         'sec_key': sec_key,
         'col_key': col_key,
@@ -2231,7 +2233,7 @@ def toggle_group_guide(group_id):
     if group is None:
         return jsonify({'error': 'Group not found'}), 404
     if group.is_system:
-        return jsonify({'error': 'The TV Guide Channels group cannot appear in the guide.'}), 400
+        return jsonify({'error': 'The TV Guide health check cannot appear in the guide.'}), 400
     if group.in_guide:
         # hidden-recompute-ok: ChannelGroup.in_guide. A member is protected from being
         # hidden by its MEMBERSHIP row, not by whether its group is a guide row, so
@@ -2300,7 +2302,7 @@ def set_group_format(group_id):
     if group is None:
         return jsonify({'error': 'Group not found'}), 404
     if group.is_system:
-        return jsonify({'error': 'The TV Guide Channels group has no group format.'}), 400
+        return jsonify({'error': 'The TV Guide health check has no group format.'}), 400
     refused = _needs_promotion_or_none(group)
     if refused is not None:
         return refused
@@ -2363,7 +2365,7 @@ def set_group_format_strategy(group_id):
     if group is None:
         return jsonify({'error': 'Group not found'}), 404
     if group.is_system:
-        return jsonify({'error': 'The TV Guide Channels group has no format strategy.'}), 400
+        return jsonify({'error': 'The TV Guide health check has no format strategy.'}), 400
     refused = _needs_promotion_or_none(group)
     if refused is not None:
         return refused
@@ -2430,7 +2432,7 @@ def promote_group(group_id):
     if group is None:
         return jsonify({'error': 'Group not found'}), 404
     if group.is_system:
-        return jsonify({'error': 'The TV Guide Channels group cannot be promoted.'}), 400
+        return jsonify({'error': 'The TV Guide health check cannot be promoted.'}), 400
 
     data = request.get_json(silent=True) or {}
     strategy = data.get('strategy')
@@ -2569,7 +2571,7 @@ def set_group_warnings(group_id):
     if group is None:
         return jsonify({'error': 'Group not found'}), 404
     if group.is_system:
-        return jsonify({'error': 'The TV Guide Channels group has no warnings to hide.'}), 400
+        return jsonify({'error': 'The TV Guide health check has no warnings to hide.'}), 400
 
     shown = (request.get_json(silent=True) or {}).get('warnings')
     if not isinstance(shown, dict) or not shown:
@@ -2605,7 +2607,7 @@ def set_group_guide_listings(group_id):
     if group is None:
         return jsonify({'error': 'Group not found'}), 404
     if group.is_system:
-        return jsonify({'error': 'The TV Guide Channels group has no guide row of its own.'}), 400
+        return jsonify({'error': 'The TV Guide health check has no guide row of its own.'}), 400
     raw = (request.get_json(silent=True) or {}).get('channel_id')
     if raw is not None and (isinstance(raw, bool) or not isinstance(raw, int)):
         return jsonify({'error': 'channel_id must be a channel id or null'}), 400
@@ -2637,7 +2639,7 @@ def set_group_default_profile(group_id):
     if group is None:
         return jsonify({'error': 'Group not found'}), 404
     if group.is_system:
-        return jsonify({'error': 'The TV Guide Channels group has no guide row of its own.'}), 400
+        return jsonify({'error': 'The TV Guide health check has no guide row of its own.'}), 400
     raw = (request.get_json(silent=True) or {}).get('profile_id')
     if raw is not None and (isinstance(raw, bool) or not isinstance(raw, int)):
         return jsonify({'error': 'profile_id must be a recording profile id or null'}), 400
@@ -2688,7 +2690,7 @@ def delete_group(group_id):
     if group is None:
         return jsonify({'error': 'Group not found'}), 404
     if group.is_system:
-        return jsonify({'error': 'The TV Guide Channels group cannot be deleted'}), 400
+        return jsonify({'error': 'The TV Guide health check cannot be deleted'}), 400
     job = group.check
     if job is not None and job.status == OD_JOB_STATUS_RUNNING:
         return jsonify({'error': f'Health check "{job.name}" still running - stop before deleting this group'}), 409
@@ -2710,6 +2712,16 @@ def delete_group(group_id):
             },
         }), 409
 
+    cancelled = dissolve_group(group_id)
+    return jsonify({'success': True, 'cancelled_recordings': len(cancelled)})
+
+
+def dissolve_group(group_id):
+    """delete_group's write half, for a caller that has already asked its two questions: no
+    check RUNNING and no capture under way on the group. Cancels what is still scheduled on
+    it, deletes the check, the memberships and the group, then unlinks the check's
+    screenshots and deregisters the cancelled recordings once that has committed. Returns
+    the cancelled recording ids. Shared with Delete the examples (app/examples.py)."""
     @retry_on_locked()
     def _delete():
         g = db.session.get(ChannelGroup, group_id)
@@ -2737,7 +2749,7 @@ def delete_group(group_id):
     # The group is gone, so an alert saying its guide row cannot record names a row that
     # no longer exists - and its deep link would 404 (dev/changelog/933).
     resolve_broken_guide_row(group_id)
-    return jsonify({'success': True, 'cancelled_recordings': len(cancelled)})
+    return cancelled
 
 
 @channel_groups_bp.route('/api/channel-groups/<int:group_id>/clone', methods=['POST'])
@@ -2878,7 +2890,7 @@ def clone_info(group_id):
     if group is None:
         return jsonify({'error': 'Group not found'}), 404
     if group.is_system:
-        return jsonify({'error': 'Cannot clone the pinned TV Guide Channels check'}), 400
+        return jsonify({'error': 'The TV Guide health check cannot be cloned'}), 400
 
     memberships = list(group.memberships)
     channels = member_channels(memberships)
@@ -2958,7 +2970,7 @@ def group_record_context(group_id):
     if group is None:
         return jsonify({'error': 'Group not found'}), 404
     if group.is_system:
-        return jsonify({'error': 'The pinned TV Guide Channels check is not a '
+        return jsonify({'error': 'The TV Guide health check is not a '
                                  'recording source'}), 400
 
     memberships = list(group.memberships)

@@ -1,10 +1,11 @@
 import threading
 from datetime import datetime, timedelta
+from urllib.parse import urlsplit
 
 from flask import (Blueprint, render_template, request, redirect, url_for, flash, current_app,
                    abort, jsonify)
 
-from .. import db, duplicate_streams
+from .. import channel_hiding, db, duplicate_streams
 from ..accounts import (NORM_DISABLED, NORM_MODES, coerce_normalization_mode,
                         norm_mode_example, norm_mode_label, normalize_url_with_mode,
                         resolve_normalization_mode, url_provider_stream_id,
@@ -146,6 +147,7 @@ def _sync_prompts(accounts, next_sync, cfg) -> dict:
     return {
         a.id: {
             'auto': bool(a.sync_enabled),
+            'never_synced': a.last_sync_at is None,
             'next_at': iso_or_none(next_sync.get(a.id)),
             'interval_hours': account_sync_interval_hours(a, cfg),
             'restart_default': restart,
@@ -409,6 +411,7 @@ def _account_detail_payload(account, cfg, stats):
         # the credential, and no heuristic can tell (DESIGN-secrets.md §4.2, DESIGN.md §17.4).
         'endpoint': mask_url_path(account.base_url if (account.account_type or 'm3u') == 'xtream'
                                   else account.m3u_url),
+        'stream_host_differs': _stream_host_differs(account),
         'epg_sources': account_sources_view(account.id, _epg_source_schedule()),
         'source_hours_choices': REFRESH_HOURS_CHOICES,
         # The filtered channel-browser links the new/missing counts point at. These were also
@@ -487,7 +490,7 @@ def new_account():
     global_max_connections = cfg.get('accounts', {}).get('default_max_connections', 1)
 
     if request.method == 'POST':
-        errors = _validate_account_form(request.form)
+        errors = _validate_account_form(request.form, new=True)
         xmltv = _form_xmltv_fields(request.form, errors)
         if errors:
             for e in errors:
@@ -549,7 +552,7 @@ def new_account():
 
         if dup is not None:
             flash(_duplicate_warning(dup, account_type), 'warning')
-        flash(f'Account "{account_name}" added. Click Sync Now to fetch channels.', 'success')
+        flash(_added_message(account_id, account_name), 'success')
         return redirect(url_for('accounts.accounts_list'))
 
     return render_template(
@@ -591,6 +594,46 @@ def _require_xtream_debug(account):
 # exactly one implementation of "sync this account" and one message string for it. The
 # form-POST routes these helpers were also written for are gone as of DESIGN.md §17: the
 # list page no longer posts a form (dev/changelog/456).
+
+def _stream_host_differs(account) -> bool:
+    """Whether the provider serves this Xtream account's streams from another host than the
+    one its channel list comes from - normal, and said so on the account page, because two
+    hosts side by side otherwise read as a fault (dev/changelog/1272). Hostnames only: the
+    page shows both URLs in full for anyone who needs the scheme and port."""
+    if (account.account_type or 'm3u') != 'xtream' or not account.provider_stream_origin:
+        return False
+    api = urlsplit(account.base_url or '').hostname
+    streams = urlsplit(account.provider_stream_origin).hostname
+    return bool(api and streams and api.lower() != streams.lower())
+
+
+def _added_message(account_id: int, name: str) -> str:
+    """The toast after Add Account: when the first sync actually starts, as the scheduler
+    registered it, and where Sync now is on the page the toast lands on - the row's menu
+    (dev/changelog/1272)."""
+    from .recordings import time_until_filter
+
+    # A column query, not the identity map: schedule_account_sync() wrote next_sync_at
+    # from its own app context, so the Account loaded by the insert above is stale.
+    sync_enabled, next_at = (db.session.query(Account.sync_enabled, Account.next_sync_at)
+                             .filter(Account.id == account_id).one())
+    added = f'Account "{name}" added.'
+    if not sync_enabled:
+        return (f'{added} Automatic sync is off, so nothing is fetched until you choose '
+                'Sync now from its ⋯ menu.')
+    # A first sync is registered a minute out (scheduler.schedule_account_sync), and the page
+    # shows it running at the next status poll after that: "under a minute" was a hair true
+    # and read as broken at 70 seconds (dev/changelog/1291).
+    now = datetime.utcnow()
+    if not next_at or next_at <= now:
+        when = 'starts shortly'
+    elif (next_at - now).total_seconds() <= 90:
+        when = 'starts in about a minute'
+    else:
+        when = f'starts {time_until_filter(next_at)}'
+    return (f'{added} Its first sync {when} and fetches its channels and guide. '
+            'To start it right away, choose Sync now from its ⋯ menu.')
+
 
 def _start_sync(account, *, force=False, force_epg_resync=False, restart_schedule=False):
     """Start a manual sync. Returns (started, message, conflicts).
@@ -782,6 +825,9 @@ def _delete_account_and_jobs(account_id):
         return name
 
     name = _delete()
+    if channel_ids:
+        # Its channels leave every rule that matched them (dev/changelog/1291).
+        channel_hiding.refresh_rule_stats_and_commit()
     for sid in owned_source_ids:
         resolve_source_alerts(sid)
     outcome = (reresolve_channels(list(guided_elsewhere), _case_sensitive(),
@@ -1850,7 +1896,7 @@ def _field(form, key: str) -> str:
     return '' if value is None else str(value).strip()
 
 
-def _validate_account_form(form) -> list[str]:
+def _validate_account_form(form, *, new=False) -> list[str]:
     errors = []
     if not _field(form, 'name'):
         errors.append('Name is required.')
@@ -1860,9 +1906,12 @@ def _validate_account_form(form) -> list[str]:
             errors.append('M3U URL is required.')
     else:
         if not _field(form, 'base_url'):
-            errors.append('Base URL is required.')
+            errors.append('Server is required.')
         if not _field(form, 'username'):
             errors.append('Username is required.')
+        # Adding only: on an edit a blank password means "keep the stored one".
+        if new and not form.get('password'):
+            errors.append('Password is required.')
     max_conn_raw = _field(form, 'max_connections')
     if max_conn_raw and not (max_conn_raw.isdigit() and int(max_conn_raw) >= 1):
         errors.append('Max connections must be a positive whole number.')

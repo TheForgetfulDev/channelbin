@@ -137,7 +137,7 @@ class DetailPageTests(_Seeded):
         db.session.commit()
         html = self._page(rec.id)
         for ev_type in (RECORDING_FORMAT_OVERRIDE, RECORDING_FORMAT_CHANGED):
-            li = html[:html.index(f'<span class="ev-type">{ev_type}</span>')]
+            li = html[:html.index(f'<span class="ev-code">{ev_type}</span>')]
             self.assertTrue(li[li.rindex('<li class="ev '):].startswith('<li class="ev warn"'),
                             ev_type)
 

@@ -5,7 +5,7 @@
    context, plus a matching `profiles: {...}` map in the page's GUIDE_CONFIG. #}
 
 {% macro block_picker(prefix) -%}
-<details class="form-group acct-block-pick" id="{{ prefix }}-blocks" style="display:none">
+<details class="form-group form-disclose acct-block-pick" id="{{ prefix }}-blocks" style="display:none">
   <summary>Block account use during this recording<span id="{{ prefix }}-blocks-count"></span></summary>
   <span class="form-hint">Nothing in ChannelBin opens a stream on a blocked account while this
     recording can still record - so a TV can watch live on it. A channel group records from
@@ -41,6 +41,11 @@
            view, and a long description above it would push it off screen
            (dev/changelog/1050). #}
         <div id="modal-prog-head" class="prog-head" style="display:none"></div>
+        {# A program already on: the recording starts at "now", not at the past start time
+           the field shows. Filled by guide.js::applyLateNote (dev/changelog/1275). Right
+           under the program, the first thing read: lower down, a phone's sheet put it below
+           the fold behind its own buttons (dev/changelog/1290). #}
+        <div id="modal-late-note" class="notice notice-warn" style="display:none"></div>
         {# Group target only: names the member that would serve this recording right now and
            says the choice can still move. Filled by guide.js::showGroupNote - the answer is
            fetched per open because the recorder re-resolves it at start time, so a value
@@ -49,15 +54,6 @@
         <div class="form-group">
           <label>Recording Name <span class="required">*</span></label>
           <input type="text" name="name" id="modal-name" class="form-control" required>
-        </div>
-        <div class="form-group">
-          <label>Stream URL <span class="required">*</span></label>
-          <input type="hidden" name="url" id="modal-url" required>
-          <div class="manual-url-row">
-            <input type="text" id="modal-url-display" class="form-control" readonly>
-            <button type="button" class="btn btn-sm" id="modal-url-toggle">Show</button>
-            <button type="button" class="btn btn-sm" id="modal-url-copy">Copy</button>
-          </div>
         </div>
         <div class="form-row">
           <div class="form-group">
@@ -87,6 +83,19 @@
            guide.js::loadBlockPicker; block_accounts_loaded is set only once the list has
            loaded, so a failed lookup leaves the recording's blocks alone rather than
            clearing them. #}
+        {# The channel's own URL, filled in by guide.js::openModal. Collapsed: nobody has to
+           read it to record a channel, and both first-time testers stopped on it unsure
+           whether they were meant to check or change it (dev/changelog/1290). #}
+        <details class="form-group form-disclose" id="modal-url-pick">
+          <summary>Stream URL</summary>
+          <input type="hidden" name="url" id="modal-url" required>
+          <div class="manual-url-row">
+            <input type="text" id="modal-url-display" class="form-control" readonly
+                   aria-label="Stream URL">
+            <button type="button" class="btn btn-sm" id="modal-url-toggle">Show</button>
+            <button type="button" class="btn btn-sm" id="modal-url-copy">Copy</button>
+          </div>
+        </details>
         {{ block_picker('modal') }}
         <div id="modal-detail-link" style="display:none; margin-bottom: 0.75rem;">
           <a id="modal-detail-anchor" href="#" class="btn btn-sm" target="_blank">View recording details →</a>

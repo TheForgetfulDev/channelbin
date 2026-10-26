@@ -77,6 +77,30 @@
     display LABEL would break the moment somebody reworded it (dev/changelog/1082). -#}
 <script type="application/json" id="dash-bg-health-kind">{{ bg_health_kind | tojson }}</script>
 
+{#- The setup banner (DESIGN.md 16.2, app/setup_steps.py): read from the install on every
+    render, never dismissed, nothing stored. The wrapper is always drawn, empty once setup
+    is done, so dashboard.js's account and recording swaps can bring the banner in or take
+    it away - a first sync finishing moves it on without a reload. -#}
+<div id="dash-setup">
+  {%- if setup and not setup.finished %}
+  {% set lead = setup.lead %}
+  <div class="gs-banner" data-step="{{ lead.id }}">
+    <div class="gs-b-main">
+      <div class="gs-b-eyebrow">Get started &middot; {{ setup.done }} of {{ setup.total }} done</div>
+      <div class="gs-b-title">{{ setup.lead_word }}: {{ lead.title }}</div>
+      <div class="gs-b-text">{{ lead.short }}</div>
+      <div class="gs-segs" aria-hidden="true">
+        {%- for s in setup.steps %}<i class="gs-seg{% if loop.index <= setup.done %} done{% endif %}"></i>{% endfor -%}
+      </div>
+    </div>
+    <div class="gs-b-acts">
+      <a class="btn gs-b-go" href="{{ url_for('setup.get_started') }}">Get started <span class="arw">&#8594;</span></a>
+      {% if lead.link %}<a class="btn gs-b-second" href="{{ lead.link.url }}">{{ lead.link.label }} <span class="arw">&#8594;</span></a>{% endif %}
+    </div>
+  </div>
+  {%- endif %}
+</div>
+
 {#- data-rec-sig is the recording signature this render was read at; dashboard.js compares
     /api/nav-status's recording_signature against it and swaps the recording regions - the
     header count, these tiles, the timeline blob and the two record sections - when they
@@ -116,7 +140,7 @@
     {% if not rows %}
       {% if key == 'live' %}
         {{ empty('Nothing recording right now',
-                 'Schedule a recording from the TV Guide, or record a channel now from the Channels page.') }}
+                 'Schedule a recording from the TV Guide, or record a channel now from Channel Search.') }}
       {% else %}
         {{ empty('Nothing scheduled',
                  'Anything you schedule from the TV Guide shows up here until it starts.') }}
@@ -294,8 +318,15 @@
   {% elif key == 'health' %}
     {{ sec_head(key, 1 if health_check else 0) }}
     {% if not health_check %}
+      {% if guide_check and guide_check[1] %}
       {{ empty('No health check running',
-               'Start one from the Groups page, or wait for the nightly run.') }}
+               '"%s" tests the channels in your TV Guide %s.' % (guide_check[0], guide_check[1])) }}
+      {% elif guide_check %}
+      {{ empty('No health check running',
+               '"%s" has no schedule, so nothing tests your TV Guide channels on its own.' % guide_check[0]) }}
+      {% else %}
+      {{ empty('No health check running', 'Test now on a channel\'s page checks it once.') }}
+      {% endif %}
     {% else %}
       <div class="dash-head">
         <span>Health check</span><span>Status</span><span>Elapsed</span>

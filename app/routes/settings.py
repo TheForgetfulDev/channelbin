@@ -908,8 +908,12 @@ def api_support_bundle():
 # 'programs') say nothing about which search box goes slow when one is unusable.
 _SEARCH_INDEX_LABELS = {
     'channels': 'Channels (names, groups, EPG titles)',
-    'programs': 'Programs (upcoming airings)',
+    # Not "airings": chan_prog holds each upcoming program once per channel, so a show on
+    # three times is one row here and three airings on Search Programs (dev/changelog/1292).
+    'programs': 'Programs (upcoming, each once per channel)',
 }
+#: What one row of each index is, so its count says what it counts rather than "rows".
+_SEARCH_INDEX_UNITS = {'channels': 'channels', 'programs': 'programs'}
 
 
 @settings_bp.route('/api/settings/search-index')
@@ -939,6 +943,7 @@ def api_search_index_status():
             'label': _SEARCH_INDEX_LABELS.get(name, name),
             'status': state.status if state else 'NEVER_BUILT',
             'row_count': state.row_count if state else None,
+            'unit': _SEARCH_INDEX_UNITS.get(name, 'rows'),
             'duration_ms': state.duration_ms if state else None,
             'error': (state.error or None) if state else None,
             # Formatted server-side: the display timezone lives in config and JS must never

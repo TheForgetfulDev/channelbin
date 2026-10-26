@@ -54,7 +54,7 @@ from ..channel_search import (DEFAULT_FIELDS, DEFAULT_PAGE_SIZE, DEFAULT_SORT,
                               STANDING_OPTIONS, WHEN_STATIC_LABELS, WHEN_STATIC_VALUES,
                               SearchContext, SearchState, SearchStateError,
                               default_fields_for, default_standing_for,
-                              dimensions_for, full_scan_reason,
+                              dimensions_for, field_examples, full_scan_reason,
                               probe_degraded_reason, search, search_counts,
                               search_facets, standing_options_for, uncounted_facets)
 from ..channel_search_rows import build_rows
@@ -790,13 +790,14 @@ def channel_search_catalog_api():
     # control has to let you exclude something you cannot currently see).
     categories = sorted(
         name for (name,) in db.session.query(Channel.category_name).distinct().all() if name)
+    examples = field_examples()
 
     return jsonify({
         'success': True,
         'grains': list(IMPLEMENTED_GRAINS),
         'default_grain': GRAIN_CHANNELS,
         'fields': [{'key': f.key, 'label': f.label, 'group': f.group, 'source': f.source,
-                    'hint': f.hint}
+                    'hint': examples.get(f.key, '')}
                    for f in FIELDS],
         # The Search-in pane's headings, in render order. Served rather than spelled in the
         # page, so a group added later cannot end up with fields under no heading.

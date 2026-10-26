@@ -276,6 +276,23 @@ class SyncFinishedTests(_Base, unittest.TestCase):
         self.assertEqual(self.obs['syncSig'], self.obs['navSig'])
         self.assertEqual(self.obs['pageFetchesAfterNextPoll'], 1)
 
+    def test_the_setup_banner_counts_the_first_sync_without_a_reload(self):
+        """The first-sync step promises the banner moves on by itself; it rides on this
+        same swap (dev/changelog/1279)."""
+        self.assertEqual(self.obs['setupBefore'], 'Get started · 0 of 4 done')
+        self.assertEqual(self.obs['setupAfter'], 'Get started · 1 of 4 done')
+
+
+class SetupFollowsRecordingTests(_Base, unittest.TestCase):
+    SCENARIO = 'setup_follows_recording'
+
+    def test_a_first_recording_moves_the_setup_banner_on_in_the_same_fetch(self):
+        """Scheduling a recording is a setup step, so the recording regions' swap carries
+        the banner too (dev/changelog/1279)."""
+        self.assertEqual(self.obs['before'], 'Get started · 1 of 4 done')
+        self.assertEqual(self.obs['after'], 'Get started · 2 of 4 done')
+        self.assertEqual(self.obs['pageFetches'], 1)
+
 
 class SortTests(_Base, unittest.TestCase):
     SCENARIO = 'sort_survives'

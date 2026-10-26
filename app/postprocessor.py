@@ -1572,6 +1572,7 @@ def reconcile_failure_alerts():
     and unlinks its alerts (dev/changelog/929), so a dangling id is not a recovery.
     """
     from . import db
+    from .alerts import mark_cleared
     from .config import load_config
     from .database import Alert, Recording, REC_STATUS_COMPLETED
 
@@ -1625,9 +1626,7 @@ def reconcile_failure_alerts():
     @retry_on_locked()
     def _dismiss():
         rows = Alert.query.filter(Alert.id.in_(stale), Alert.dismissed_at.is_(None)).all()
-        now = datetime.utcnow()
-        for row in rows:
-            row.dismissed_at = now
+        mark_cleared(rows)
         db.session.commit()
         return len(rows)
 
@@ -3484,9 +3483,14 @@ def do_postprocess(app, recording_id: int, ts_path: str):
                             'packet_count':    metrics['packet_count'],
                         })
                         n = metrics['gap_count']
+                        # A tenth of a second under a minute, as the log line says it:
+                        # whole seconds wrote "3 video gaps totalling 0s" beside a log
+                        # reading 0.9s (dev/docs/BUGS.md 2026-10-22 08:13:58 PM).
+                        gap_s = metrics['gap_seconds']
+                        total = (f'{gap_s:.1f}s' if gap_s < 60
+                                 else fmt_duration(gap_s, with_seconds=True))
                         found = ('no video gaps' if not n else
-                                 f'{n} video gap{"" if n == 1 else "s"} totalling '
-                                 f'{fmt_duration(metrics["gap_seconds"], with_seconds=True)}')
+                                 f'{n} video gap{"" if n == 1 else "s"} totalling {total}')
                         if lost is None:
                             verdict = ('the source was never measured, so they cannot be '
                                        'told apart from its own')

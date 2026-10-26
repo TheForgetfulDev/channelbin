@@ -48,8 +48,8 @@
    hand-written copies of one length is the coupled-values defect CLAUDE.md names; this is
    the single definition both read. */
 .sline { --sline-gap: 8px; display: flex; align-items: flex-start; gap: var(--sline-gap); }
-/* The suggestion menu anchors to the BOX, not to the line, so the all/any
-   control beside it cannot stretch the menu wider than the input. */
+/* The suggestion menu anchors to the BOX, not to the line: it starts at the box's
+   left edge, and its width is its own (.sugg below), not the line's. */
 .sbox-wrap { position: relative; flex: 1; min-width: 0; }
 .sbox { display: flex; align-items: center; gap: 8px; min-height: var(--ctl-h); background: var(--bg1);
   border: 1px solid var(--border); border-radius: var(--radius); padding: 4px 8px;
@@ -93,7 +93,13 @@
    dismissal purposes - see closeOverlays() in channel-search.js.
    max-height here is a FLOOR: sizeSugg() overwrites it with the space actually
    left below the box, so "fits without scrolling" is measured, not assumed. */
-.sugg { display: none; position: absolute; z-index: 320; top: calc(100% + 5px); left: 0; right: 0;
+/* At least the box's width, and wider than the box when there is room: with the rail and
+   the sidebar both open the box measured 456px at 1280, which left the suggestions pane
+   148px - the typed text drew as "e.." and every channel name drew as nothing
+   (dev/changelog/1290). 640px is what gives that pane room for a name and its hint.
+   sizeSugg() caps it at the viewport, so the extra width never pushes past the window. */
+.sugg { display: none; position: absolute; z-index: 320; top: calc(100% + 5px); left: 0;
+  min-width: 100%; width: 640px; box-sizing: border-box;
   background: var(--bg2); border: 1px solid var(--border); border-radius: var(--radius);
   box-shadow: var(--shadow-pop); padding: 6px; max-height: 400px; overflow-y: auto; }
 .sugg.show { display: block; }
@@ -104,9 +110,14 @@
 .sitem:hover, .sitem.sel { background: var(--accent-soft); }
 .sitem .sico { width: 20px; text-align: center; flex: none; color: var(--text-faint); font-size: var(--fs-lg); }
 .sitem.sel .sico { color: var(--accent-text); }
-.sitem .stxt { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* The label is what the row is, so it keeps a floor and the hint (a category, a count) is
+   what gives way: a channel's long category once took the whole row and drew its name at
+   0px (dev/changelog/1290). */
+.sitem .stxt { flex: 1; min-width: 7em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .sitem .skey { color: var(--text-faint); font-size: var(--fs-sm); }
-.sitem .shint { font-size: var(--fs-xs); color: var(--text-faint); font-family: var(--font-mono); flex: none; }
+.sitem .shint { font-size: var(--fs-xs); color: var(--text-faint); font-family: var(--font-mono);
+  flex: 0 1 auto; min-width: 0; max-width: 40%; overflow: hidden; text-overflow: ellipsis;
+  white-space: nowrap; }
 .sitem kbd { font-family: var(--font-mono); font-size: var(--fs-2xs); background: var(--bg0); border: 1px solid var(--border);
   border-bottom-width: 2px; border-radius: var(--radius-sm); padding: 1px 4px; color: var(--text-muted); }
 /* The syntax help lives under a rule in this menu rather than behind a button:
@@ -130,6 +141,13 @@
   background: var(--accent); color: var(--accent-contrast); border-radius: 999px; padding: 0 6px;
   font-size: var(--fs-2xs); font-weight: 700; font-family: var(--font-mono); letter-spacing: 0;
 }
+/* The info marker is a ring drawn here around a plain "i", never the U+24D8 character: a
+   system without a font carrying that glyph draws a blank box, which a first-time user read
+   as a stray grey bar (dev/changelog/1276). */
+.fwhat { display: inline-flex; align-items: center; justify-content: center; flex: none;
+  width: 1.1em; height: 1.1em; border: 1px solid currentColor; border-radius: 999px;
+  font-family: var(--font-mono); font-style: normal; font-weight: 700; line-height: 1;
+  text-transform: none; letter-spacing: 0; }
 .sugg-scope .fwhat { color: var(--text-faint); font-size: var(--fs-xs); cursor: help; margin-left: 4px; }
 /* Padding, not margin: .prow:hover paints a background that must run the full
    width of the pane. */
@@ -370,7 +388,7 @@
 .fac-none { font-size: var(--fs-sm); color: var(--text-faint); font-style: italic; padding: 4px 2px; }
 .fac-b .findwrap { margin-bottom: 5px; }
 .fac-b .rsearch { height: 26px; font-size: var(--fs-sm); }
-.fac-h .fwhat { color: var(--text-faint); font-size: var(--fs-xs); cursor: help; font-weight: 400; }
+.fac-h .fwhat { color: var(--text-faint); font-size: var(--fs-xs); cursor: help; }
 /* `margin-left: auto` here means a following .nsel must drop its own auto
    margin, or flexbox splits the free space between the two and the button lands
    mid-header instead of at its right edge. */
@@ -1100,6 +1118,8 @@
      current scope with a way into that sheet. That footer is what keeps the
      link between what you type and what it matches after the switches moved
      out of view. */
+  /* One pane needs no extra width, and the box is the screen's width down here. */
+  .sugg { width: auto; right: 0; }
   .sugg-scope { display: none; }
   .sugg-2col { display: block; }
   .sitem { padding: 8px 9px; font-size: var(--fs-lg); }
@@ -1109,6 +1129,33 @@
   .sugg-scopeline .ssl-v { color: var(--text-muted); flex: 1; min-width: 0;
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .sugg-scopeline .ssl-go { color: var(--accent-text); font-weight: 600; flex: none; }
+}
+
+/* ── A phone held sideways: a short screen, not a narrow one ──────────────
+   At 844x390 the controls above the list ended at 591px, so not one channel was on the
+   first screen, and the sticky box and chip row alone took 182px of the 338 under the top
+   bar (dev/changelog/1290). A HEIGHT query on top of the one width breakpoint, not a second
+   width: the arrangement is still the phone's, only the vertical room differs.
+   - The grain pills go beside the search box. The question above them goes: the two pills
+     answer it on their own, and at this width they and the box fit one line.
+   - Nothing sticks. A sticky band of half the screen leaves a sliver to scroll through.
+     With nothing sticking, .cs-stick stops being a box at all, so the chip row and the
+     filter row can share a line.
+   - The heading's count goes: the count line under it says the same number and more.
+   Measured in a browser at 844x390: the first card moved from 549px to 343px, its name line
+   in view, with no alert banner showing. An app-wide alert banner still pushes it down by
+   its own height (52px measured, which put the card at 395). */
+@media (max-width: 960px) and (max-height: 500px) {
+  .cs-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 8px; }
+  .cs-stick { display: contents; }
+  .searchzone { flex: 1 1 100%; display: flex; align-items: center; gap: 8px; }
+  #grainslot-panel { flex: none; margin-bottom: 0; }
+  .grainask-lbl { display: none; }
+  .grainpill { flex: none; padding: 0 10px; }
+  .searchzone .sline { flex: 1; min-width: 0; }
+  .chiprow { flex: none; margin-top: 0; }
+  .cs-bar.nav-panel .well { flex: 1 1 260px; min-width: 0; min-height: 0; padding: 4px 9px; margin-top: 0; }
+  .cb-all h2 { display: none; }
 }
 
 /* ── Schedule selected (static/js/bulk-schedule-modal.js, dev/changelog/1157) ──

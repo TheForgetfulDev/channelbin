@@ -150,7 +150,9 @@
   category or a channel name, on top of hiding one channel at a time from its own page.
   A hidden channel leaves search, the pickers and the counts, keeps its detail page, and
   stops having EPG imported for it. A channel in your TV Guide or a channel group stays
-  visible until you remove it from there, no matter what a rule says.
+  visible until you remove it from there, no matter what a rule says. ChannelBin starts with
+  five channel name rules that hide the divider rows providers list between sections, such
+  as <code>#### US CLASSIC ####</code>; edit or delete them like any other.
 </p>
 
 {# Saved-but-not-applied. A refused pass leaves the rules committed and `Channel.hidden`
@@ -168,7 +170,7 @@
 <div class="dash-pulse">
   <div class="mtile"><div class="m-k">Hidden now</div><div class="m-v">{{ '{:,}'.format(hidden_count) }}</div><div class="m-s">channels</div></div>
   <div class="mtile"><div class="m-k">Rules active</div><div class="m-v">{{ enabled_rules }} <span style="font-size:var(--fs-lg);color:var(--text-faint);font-weight:400;">/ {{ rules | length }}</span></div><div class="m-s">enabled / total</div></div>
-  <div class="mtile{{ ' warn' if deferred_count else '' }}" data-tip="Matched by a rule, but kept visible because they're in your TV Guide or a channel group."><div class="m-k">Kept visible</div><div class="m-v">{{ '{:,}'.format(deferred_count) }}</div><div class="m-s">deferred</div></div>
+  <div class="mtile{{ ' warn' if deferred_count else '' }}" data-tip="Matched by a rule, but kept visible because they're in your TV Guide or a channel group."><div class="m-k">Kept visible</div><div class="m-v">{{ '{:,}'.format(deferred_count) }}</div><div class="m-s">in guide or a group</div></div>
   <div class="mtile"><div class="m-k">Still offered</div><div class="m-v">{{ '{:,}'.format(total_channels - hidden_count) }}</div><div class="m-s">channels</div></div>
 </div>
 

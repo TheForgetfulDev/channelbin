@@ -72,7 +72,7 @@ class DescribeStateTests(unittest.TestCase):
             ('Account', False, [('Main', False)]),
             ('Health', False, [('Good', False)]),
             ('Channel group', True, [('CW', False)]),
-            ('Other', False, [('In your guide', False)]),
+            ('Status', False, [('In your guide', False)]),
             ('Channel', False, [('NBC East', False)])])
         self.assertEqual(d['summary'], 'next 7 days, Saturday or Sunday, 6:00 PM or later, '
                                        'longer than 2 hours, tag live, account Main, '

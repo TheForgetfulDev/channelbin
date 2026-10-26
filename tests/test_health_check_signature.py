@@ -164,7 +164,7 @@ class HealthCheckSignatureTests(unittest.TestCase):
         nav = self.client.get('/api/nav-status').get_json()
         self.assertEqual(nav['health_check'], {'sig': sig, 'busy': False})
         groups = self.client.get('/channel-groups').get_data(as_text=True)
-        self.assertIn(f'id="grp-list-groups" data-section="groups" data-hc-sig="{sig}"', groups)
+        self.assertIn(f'id="grp-lists" data-hc-sig="{sig}"', groups)
         detail = self.client.get(f'/channels/{self.ch_id}').get_data(as_text=True)
         self.assertIn(f'id="cd-statusbar" data-hc-sig="{sig}"', detail)
 

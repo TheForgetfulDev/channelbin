@@ -68,6 +68,9 @@ def _observe():
                                    test_ended_at=now - timedelta(hours=2),
                                    quality_score=90, lifetime_score_after=90,
                                    quality_breakdown=_BREAKDOWN)
+            # Listings put the What's on grid on the page, and with it the record dialog
+            # that sits hidden in the DOM - the shape every real channel with a guide has.
+            seed.make_epg_entry(alpha, title='Alpha Live', offset_minutes=-10)
             db.session.commit()
             alpha_id, job_id = alpha.id, pair.check.id
             channel_path = f'/channels/{alpha_id}'
@@ -230,6 +233,12 @@ class ChannelPageAsItOpensTests(_Base, unittest.TestCase):
     def test_tester_busy_comes_from_the_poll(self):
         self.assertIs(self.obs['testerBusy'], True)
 
+    def test_the_page_carries_the_hidden_record_dialog(self):
+        """What every scenario below runs against: a channel with listings, whose page
+        holds #record-modal hidden from the first paint. A page without it is the one
+        that let the defect through (dev/docs/BUGS.md 2026-10-23 06:36 AM)."""
+        self.assertTrue(self.obs['hiddenModal'])
+
 
 class ChannelPageRunFinishesTests(_Base, unittest.TestCase):
     """The reported defect: a check started elsewhere left "Testing now", the score and the
@@ -335,6 +344,20 @@ class ChannelPageAddToGroupWarnedTests(_Base, unittest.TestCase):
     def test_proceed_anyway_resends_forced_and_then_reloads(self):
         self.assertEqual([b['force'] for b in self.obs['memberPosts']], [False, True])
         self.assertEqual(self.obs['navigationsAfterProceed'], 1)
+
+
+class ChannelTestButtonsFollowTheRunTests(_Base, unittest.TestCase):
+    """dev/docs/BUGS.md 2026-10-26: the live refresh redrew Test now clickable while the test
+    it had started was still running, and the phone bar's button was handed back enabled."""
+    SCENARIO = 'channel_test_follows_the_run'
+
+    def test_every_test_button_is_disabled_while_this_channel_tests(self):
+        self.assertGreaterEqual(len(self.obs['during']), 2)
+        self.assertTrue(all(self.obs['during']), self.obs['during'])
+
+    def test_they_are_enabled_before_and_after(self):
+        self.assertFalse(any(self.obs['before']), self.obs['before'])
+        self.assertFalse(any(self.obs['after']), self.obs['after'])
 
 
 if __name__ == '__main__':

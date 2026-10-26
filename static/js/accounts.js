@@ -66,6 +66,9 @@
         // The SAME modal the account page opens - it takes an account id and nothing else.
         openAccountModal({ accountId: id, onDone: reload });
         return;
+      case 'examples-remove':
+        window.removeExamples();
+        return;
       case 'delete':
         confirmDeleteAccount({
           id: id,

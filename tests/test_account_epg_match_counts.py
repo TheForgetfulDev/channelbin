@@ -112,9 +112,9 @@ class AccountEpgMatchCountsTests(unittest.TestCase):
                 db.session.add(seed.EPGEntry(
                     channel_id=ch.id, title='Show',
                     start_time=base, stop_time=base + timedelta(hours=1)))
-            # 1 id set, no programs -> "EPG id set, no match"
+            # 1 id set, no programs -> "Listings not found"
             seed.make_channel(acc)
-            # 1 with no EPG id at all -> "No EPG id" (make_channel always sets one)
+            # 1 with no EPG id at all -> "No guide id" (make_channel always sets one)
             seed.make_channel(acc).epg_channel_id = ''
             # channel_count is a cache column refreshed by a real sync (BUGS.md-unrelated
             # to the EPG-match diagnostic, which counts Channel rows live) - set it to
@@ -126,9 +126,9 @@ class AccountEpgMatchCountsTests(unittest.TestCase):
             self.assertEqual(resp.status_code, 200)
             html = resp.get_data(as_text=True)
             self.assertEqual(_stat(html, 'Channels'), 4)
-            self.assertEqual(_stat(html, 'Channels with EPG match'), 2)
-            self.assertEqual(_stat(html, 'EPG id set, no match'), 1)
-            self.assertEqual(_stat(html, 'No EPG id'), 1)
+            self.assertEqual(_stat(html, 'Channels with listings'), 2)
+            self.assertEqual(_stat(html, 'Listings not found'), 1)
+            self.assertEqual(_stat(html, 'No guide id'), 1)
         finally:
             t.cleanup()
 

@@ -19,7 +19,6 @@ rule the feature is built on rather than a detail of one check's wording:
 Runs against a throwaway temp SQLite DB - never the live dvr.db.
   python3 -m unittest tests.test_readiness
 """
-import contextlib
 import json
 import os
 import unittest
@@ -31,29 +30,8 @@ import requests
 from app import db, readiness
 from app.database import UserPref, XtreamAccount
 from tests.support import seed
+from tests.support.readiness import patched, result
 from tests.support.app import make_test_app
-
-
-@contextlib.contextmanager
-def patched(**results):
-    """Swap one or more checks for fixed answers, by check id.
-
-    The registry holds a direct reference to each check's function, so patching the module
-    attribute would not reach it - the tuple is what has to be replaced.
-    """
-    swapped = tuple(
-        c._replace(run=(lambda result: lambda ctx: result)(results[c.id]))
-        if c.id in results else c
-        for c in readiness.CHECKS)
-    unknown = sorted(set(results) - {c.id for c in readiness.CHECKS})
-    assert not unknown, f'no such check: {unknown}'
-    with mock.patch.object(readiness, 'CHECKS', swapped), \
-            mock.patch.dict(readiness.CHECKS_BY_ID, {c.id: c for c in swapped}):
-        yield
-
-
-def result(status, found='found', tested='tested'):
-    return readiness.Result(status, tested, found)
 
 
 class RegistryTests(unittest.TestCase):
@@ -634,10 +612,12 @@ class UnreadErrorsCheckTests(_AppCase):
         clear = next(c for c in payload['capabilities'] if c['id'] == 'clear')
         self.assertEqual(clear['state'], readiness.CANNOT,
                          'the card still shows the unread error on its own row')
-        self.assertEqual(payload['nav'], {'blocked': 0, 'degraded': 0})
+        self.assertEqual(payload['nav'], {'blocked': 0, 'degraded': 0,
+                                          'blocked_labels': [], 'degraded_labels': []})
         self.assertEqual(payload['verdict']['level'], 'ok')
         self.assertIn('1 unread error is waiting on the Alerts page', payload['verdict']['sub'])
-        self.assertEqual(readiness.nav_summary(), {'blocked': 0, 'degraded': 0})
+        self.assertEqual(readiness.nav_summary(), {'blocked': 0, 'degraded': 0,
+                                                   'blocked_labels': [], 'degraded_labels': []})
 
 
 class GuideGroupReadTests(unittest.TestCase):

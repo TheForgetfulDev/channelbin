@@ -44,25 +44,10 @@
   'GROUP_WARNING_MUTED': 'neutral',
   'GROUP_GUIDE_ADDED': 'start', 'GROUP_GUIDE_REMOVED': 'stopped',
   'GROUP_GUIDE_BROKEN': 'failed', 'GROUP_GUIDE_LISTINGS_SET': 'neutral',
-  'GROUP_DEFAULT_PROFILE_SET': 'neutral',
+  'GROUP_DEFAULT_PROFILE_SET': 'neutral', 'GROUP_EXAMPLE_KEPT': 'neutral',
 } %}
-{# ChannelGroupEvent types read badly through the generic underscores-to-Title-Case
-   fallback ("Group Member Participation"), so each gets a written label. The fallback
-   still covers a type added later (DESIGN-channel-groups-model.md 4.5). #}
-{% set group_ev_label = {
-  'GROUP_MEMBER_PARTICIPATION': 'Participation Changed',
-  'CHANNEL_GROUP_FORMAT_MISMATCH': 'Format Mismatch',
-  'CHANNEL_GROUP_FORMAT_RESOLVED': 'Format Resolved',
-  'GROUP_FORMAT_STRATEGY_APPLIED': 'Format Strategy Applied',
-  'GROUP_FORMAT_STRATEGY_BLOCKED': 'Format Strategy Found Nothing',
-  'GROUP_CHECK_TARGETS_CHANGED': 'Check Targets Changed',
-  'GROUP_WARNING_MUTED': 'Warning Banner Changed',
-  'GROUP_GUIDE_ADDED': 'Added To The TV Guide',
-  'GROUP_GUIDE_REMOVED': 'Removed From The TV Guide',
-  'GROUP_GUIDE_BROKEN': 'In The Guide With Nothing To Record',
-  'GROUP_GUIDE_LISTINGS_SET': 'Guide Listings Changed',
-  'GROUP_DEFAULT_PROFILE_SET': 'Default Profile Changed',
-} %}
+{# Every event row is named by `event_label`, the one table of plain names in
+   app/database.py (dev/changelog/1293). #}
 {% import '_macros.html' as tm %}
 <div class="ch-timeline-log">
   {% for entry in entries %}
@@ -101,7 +86,7 @@
         <span class="text-muted small">score {{ entry.obj.health_quality_score }}</span>
         {% endif %}
       {% elif entry.kind == 'recording_event' %}
-        <span>{{ entry.obj.event_type | replace('_', ' ') | title }}</span>
+        <span>{{ entry.obj.event_type | event_label }}</span>
         {% if entry.obj.detail %}<span class="text-muted small">{{ entry.obj.detail }}</span>{% endif %}
         {% if entry.channel_links %}
         <div class="text-muted small">
@@ -109,10 +94,10 @@
         </div>
         {% endif %}
       {% elif entry.kind == 'channel_event' %}
-        <span>{{ entry.obj.event_type | replace('_', ' ') | title }}</span>
+        <span>{{ entry.obj.event_type | event_label }}</span>
         {% if entry.obj.detail %}<span class="text-muted small">{{ entry.obj.detail }}</span>{% endif %}
       {% elif entry.kind == 'group_event' %}
-        <span>{{ group_ev_label.get(entry.obj.event_type, entry.obj.event_type | replace('_', ' ') | title) }}</span>
+        <span>{{ entry.obj.event_type | event_label }}</span>
         {% if entry.obj.detail %}<span class="text-muted small">{{ entry.obj.detail }}</span>{% endif %}
       {% endif %}
 

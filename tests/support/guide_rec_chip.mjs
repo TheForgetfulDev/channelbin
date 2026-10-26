@@ -103,7 +103,77 @@ const unknown = {
 };
 unknown.complained = errors.length > unknownBefore;
 
-console.log(JSON.stringify({ errors: bootErrors, vocab, chips, unknown }));
+// A COMPLETED recording the server called partial (app/recording_story.py::partial_note),
+// beside the same status with no sentence: the mark must change only when there is one.
+const PARTIAL = '3m captured of 1h 20m scheduled.';
+const partialHolder = window.document.createElement('div');
+partialHolder.innerHTML = window.recStatusBadge('COMPLETED', PARTIAL);
+const pnode = partialHolder.firstElementChild;
+const partial = {
+  sentence: PARTIAL,
+  text: pnode ? pnode.textContent.trim() : null,
+  tip: pnode ? pnode.getAttribute('data-tip') : null,
+  badgeClass: pnode ? pnode.className : null,
+  cls: window.recCssClass('COMPLETED', PARTIAL),
+  wholeCls: window.recCssClass('COMPLETED', null),
+  // A partial sentence on a status that is not finished must not change that status's mark.
+  liveCls: window.recCssClass('IN_PROGRESS', PARTIAL),
+};
+
+// A COMPLETED recording the user stopped early (app/recording_story.py::stopped_early_note):
+// said, but not in the partial chip's amber (dev/changelog/1287).
+const STOPPED = 'You stopped it after 2m 35s of 8m scheduled.';
+const stoppedHolder = window.document.createElement('div');
+stoppedHolder.innerHTML = window.recStatusBadge('COMPLETED', null, STOPPED);
+const snode = stoppedHolder.firstElementChild;
+const stopped = {
+  sentence: STOPPED,
+  text: snode ? snode.textContent.trim() : null,
+  tip: snode ? snode.getAttribute('data-tip') : null,
+  badgeClass: snode ? snode.className : null,
+  cls: window.recCssClass('COMPLETED', null),
+  // A partial sentence outranks it: something else went missing too.
+  bothText: (() => {
+    const h = window.document.createElement('div');
+    h.innerHTML = window.recStatusBadge('COMPLETED', PARTIAL, STOPPED);
+    return h.firstElementChild ? h.firstElementChild.textContent.trim() : null;
+  })(),
+  liveText: (() => {
+    const h = window.document.createElement('div');
+    h.innerHTML = window.recStatusBadge('IN_PROGRESS', null, STOPPED);
+    return h.firstElementChild ? h.firstElementChild.textContent.trim() : null;
+  })(),
+};
+
+// A SCHEDULED recording whose start time has come reads Starting, not Scheduled, until the
+// recorder flips it (dev/changelog/1290); and a cell too narrow for glyph and word keeps the
+// glyph alone, with the word in its label.
+const badge = (...args) => {
+  const h = window.document.createElement('div');
+  h.innerHTML = window.recStatusBadge(...args);
+  const n = h.firstElementChild;
+  return n ? { text: n.textContent.trim(), tip: n.getAttribute('data-tip'),
+               label: n.getAttribute('aria-label') } : null;
+};
+const isoAt = (minutes) => new Date(Date.now() + minutes * 60000).toISOString().slice(0, 19);
+const starting = {
+  past: window.recStarting('SCHEDULED', isoAt(-1)),
+  future: window.recStarting('SCHEDULED', isoAt(30)),
+  running: window.recStarting('IN_PROGRESS', isoAt(-1)),
+  none: window.recStarting('SCHEDULED', null),
+  chip: badge('SCHEDULED', null, null, true),
+  plain: badge('SCHEDULED', null, null, false),
+  liveIgnoresIt: badge('IN_PROGRESS', null, null, true),
+};
+const narrow = {
+  wide: badge('IN_PROGRESS', null, null, false, 200),
+  narrow: badge('IN_PROGRESS', null, null, false, 50),
+  unknownWidth: badge('IN_PROGRESS'),
+  noGlyphNarrow: badge('SCHEDULED', null, null, false, 50),
+};
+
+console.log(JSON.stringify({ errors: bootErrors, vocab, chips, unknown, partial, stopped,
+                             starting, narrow }));
 // /guide's own setInterval(updateNowLine, ...) / setInterval(fetchAndRender, ...) keep the
 // event loop alive forever otherwise - this harness never needs them to fire.
 process.exit(0);

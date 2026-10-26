@@ -299,8 +299,10 @@ class PagesCarryThePromptTests(unittest.TestCase):
         return resp.get_data(as_text=True)
 
     def _expected(self):
-        return {'auto': True, 'next_at': self.next_at.isoformat(), 'interval_hours': 6,
-                'restart_default': True}
+        # seed.make_account() leaves last_sync_at unset, so the account has never synced -
+        # the dialog skips its question for it (dev/changelog/1272).
+        return {'auto': True, 'never_synced': True, 'next_at': self.next_at.isoformat(),
+                'interval_hours': 6, 'restart_default': True}
 
     def test_the_list_row_carries_it(self):
         import html as html_mod

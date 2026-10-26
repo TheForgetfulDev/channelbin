@@ -129,6 +129,24 @@ class TooltipFollowsRebuiltAnchorTests(unittest.TestCase):
         self.assertEqual(self.rb['nothingUnder']['displayed'], 'none')
 
 
+@unittest.skipIf(shutil.which('node') is None, 'node not installed')
+@unittest.skipIf(not os.path.isdir(JSDOM), 'jsdom not installed (npm install)')
+class PressClosesTipTests(unittest.TestCase):
+    """dev/changelog/1292: the Readiness card's "Run 4 more checks" kept its long tip open
+    over the rows the run was rewriting, because nothing but the pointer leaving closed it.
+    A mouse press now closes a tip the way a native title does; a touch press does not,
+    since a tap is how a phone opens one."""
+
+    def setUp(self):
+        self.obs = _observe()
+
+    def test_a_touch_press_leaves_the_tip_open(self):
+        self.assertEqual(self.obs['press']['afterTouch'], 'block')
+
+    def test_a_mouse_press_closes_it(self):
+        self.assertEqual(self.obs['press']['afterMouse'], 'none')
+
+
 class MacroTipEscapingTests(unittest.TestCase):
     """Why the decode above is load-bearing, pinned on the server side."""
 

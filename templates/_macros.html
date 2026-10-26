@@ -163,6 +163,9 @@
 {# The badges that are true of an account rather than of its status. Both are conditions a
    user has to be able to see without opening the account. #}
 {% macro account_extra_badges(account, tip=true) -%}
+  {%- if account.is_example %}
+  <span class="badge b-auto{% if tip %} tip-plain" data-tip="Example.&#10;Added by Try it with example channels on Get started. Delete the examples on this account's page takes it out with everything that came with it.{% endif %}">Example</span>
+  {%- endif %}
   {%- if account.constructed_stream_url_count %}
   <span class="badge b-warn{% if tip %} tip-plain" data-tip="Constructed URLs.&#10;This provider supplied no stream URL for {{ account.constructed_stream_url_count }} of its channels, so ChannelBin built them from the stream origin the provider declares. Often normal, and not a problem while the channels play.{% endif %}">Constructed URLs</span>
   {%- endif %}
@@ -192,8 +195,15 @@
 {% macro account_next_sync(account, next_sync_at) -%}
 {%- if not account.sync_enabled %}<span class="text-faint">off</span>
 {%- elif account.status == ACCOUNT_STATUS.SYNCING %}<span class="text-muted">running</span>
-{%- elif next_sync_at %}{{ next_sync_at | time_until }}
+{%- elif next_sync_at %}{{ next_sync_at | time_until(compact=true) }}
 {%- else %}<span class="text-faint">-</span>{% endif -%}
+{%- endmacro %}
+
+{# An account's hidden-channel count, saying what hides a channel and linking to the page
+   that lists the rules. A bare "(3 hidden)" left a first-time user asking what hid them
+   (dev/changelog/1291). #}
+{% macro hidden_channels_link(n) -%}
+<a class="hidden-link tip-plain" href="{{ url_for('channel_hide_rules.hide_rules_page') }}" data-tip="Hidden channels.&#10;A hide rule, or Hide channel on a channel's own page, keeps these out of search, the pickers and the guide import. ChannelBin starts with rules that hide the divider rows providers list between sections. Hide Rules lists every rule and what it matches.">{{ '{:,}'.format(n) }} hidden</a>
 {%- endmacro %}
 
 {# Card header (3.3). #}

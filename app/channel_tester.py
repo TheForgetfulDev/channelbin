@@ -590,7 +590,7 @@ def monitored_channel_ids():
 
     "Active recurring" is channel_groups.active_recurring_jobs()' definition, read from
     there rather than restated. Effective set per job:
-      - system 'TV Guide Channels' job: **one channel per guide row, plus one per group
+      - system 'TV Guide health check' job: **one channel per guide row, plus one per group
         with no schedule of its own** - a standalone in-guide channel, or the member
         currently serving a group's row (channel_groups.system_check_targets,
         dev/changelog/752). A group's non-serving members are deliberately NOT covered:
@@ -761,7 +761,7 @@ def run_on_demand_test_job(app, job_id: int, channel_id_subset: Optional[List[in
                             force: bool = False):
     """Test the channels of the job's attached group (channel_groups.check_run_channels:
     stored membership in position order, or the live in-guide+test_enabled set for the
-    system 'TV Guide Channels' group, which also honors
+    system 'TV Guide health check' group, which also honors
     channel_testing.skip_if_recording_active).
 
     Called from a background thread. Only one run can be active at a time.
@@ -837,7 +837,7 @@ def run_on_demand_test_job(app, job_id: int, channel_id_subset: Optional[List[in
                 active_rec = Recording.query.filter_by(status=REC_STATUS_IN_PROGRESS).first()
             if active_rec is not None:
                 msg = 'A recording is currently in progress'
-                log.info('Deferring TV Guide Channels run - %s', msg)
+                log.info('Deferring TV Guide health check run - %s', msg)
                 _defer_run_past_recording(job_id, ct_cfg, msg)
                 skipped = True
                 return
@@ -931,7 +931,7 @@ def _settle_group_formats(app, tested_channel_ids):
     pass that used to run after every single test (dev/changelog/934).
 
     **Keyed on the channels actually tested, not on the job's own group.** The automatic
-    "TV Guide Channels" job probes one member of each guide row and one member of each
+    "TV Guide health check" job probes one member of each guide row and one member of each
     scheduleless group (dev/changelog/752), so its `job.group` is the system group, which
     has no strategy of its own - reading that instead would starve exactly the groups the
     fallback exists to serve.

@@ -24,7 +24,7 @@ from ..accounts import (
 from ..channel_groups import (effective_score, check_target_channels,
                               set_participation, build_group_with_members,
                               group_name_conflict, evaluate_and_reconcile_group,
-                              touch_group)
+                              touch_group, schedule_is_live)
 from .. import channel_hiding
 from ..config import load_config, config_default
 from ..db_utils import retry_on_locked
@@ -373,6 +373,40 @@ def _recur_label(job, ct_cfg=None):
     return label
 
 
+def schedule_phrase(job, ct_cfg=None):
+    """When `job` will next test anything, as a phrase that ends a sentence ("every day at
+    2:00 AM", "once, on Oct 23 at 9:00 PM"), or None when nothing will fire on its own.
+
+    Gated on schedule_is_live(), the one answer to "will this check still run", so no
+    sentence built on it can promise a test from a paused or unscheduled check."""
+    if job is None or not schedule_is_live(job):
+        return None
+    if job.recurring:
+        label = _recur_label(job, ct_cfg)
+        return label[0].lower() + label[1:]
+    if job.scheduled_start_time is None:
+        return None
+    return f'once, on {format_local(job.scheduled_start_time)}'
+
+
+def guide_check_note(job, ct_cfg=None):
+    """The sentence every Add to Guide path says about the automatic TV Guide health check,
+    which a channel joins by gaining a guide row. Without it the channel's Testing
+    chip changed on its own and the user was never told why (dev/changelog/1271).
+
+    Worded for one channel or many, so the bulk add and the single add share it. None when
+    there is no system check to speak of. The caller leaves it out for a channel whose own
+    health checks are switched off, which the check skips."""
+    if job is None:
+        return None
+    phrase = schedule_phrase(job, ct_cfg)
+    if phrase:
+        return (f'Channels in the guide are also tested by "{job.name}", which ChannelBin '
+                f'keeps by itself, {phrase}.')
+    return (f'Channels in the guide also join "{job.name}", which ChannelBin keeps by '
+            'itself, but it has no schedule right now, so nothing tests them on its own.')
+
+
 # ── Legacy URL redirects ─────────────────────────────────────────────────────
 
 @channel_tests_bp.route('/channel-tests')
@@ -479,7 +513,7 @@ def _editable_job_group_or_error(job):
     if group is None:
         return None, (jsonify({'error': 'This check has no attached group'}), 409)
     if group.is_system:
-        return None, (jsonify({'error': 'The TV Guide Channels check tests whatever is in the guide - manage channels from the guide instead'}), 400)
+        return None, (jsonify({'error': 'The TV Guide health check tests whatever is in the guide - manage channels from the guide instead'}), 400)
     return group, None
 
 
@@ -1300,7 +1334,7 @@ def remove_duplicate_channels(job_id):
 def toggle_job_channel_enabled(job_id, channel_id):
     """Enable/disable a channel within a job without removing it or its history.
 
-    For the system TV Guide Channels job this flips Channel.test_enabled - the same flag
+    For the system TV Guide health check job this flips Channel.test_enabled - the same flag
     the group's computed membership reads - rather than a membership row (the system
     group has none). Otherwise it flips the membership's own test_enabled, through
     channel_groups.py::set_participation() so the move reaches the group's Activity

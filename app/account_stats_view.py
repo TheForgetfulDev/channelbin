@@ -11,6 +11,7 @@ page for every account together.
 """
 import json
 import math
+from datetime import timedelta
 
 from . import account_stats, db
 from .database import Account
@@ -43,11 +44,19 @@ TIPS = {
                "failed. Cancelled checks are not counted either way - a cancelled check says "
                "nothing about the channel."),
     'rate': 'Pass rate.&#10;Passed as a share of passed plus failed. Blank when no check ran.',
-    'in_group': ('In a channel group.&#10;Channels of this account that belong to at least one '
-                 'channel group. Each channel counts once however many groups it is in.'),
-    'rec_enabled': ("Recording on.&#10;Group memberships of this account's channels with "
-                    "Recording on, i.e. feeds a group may actually record from. Counts "
-                    "memberships, so one channel in two groups counts twice."),
+    # Both say the automatic TV Guide health check is not counted, because a first-time
+    # user read "In a group 0" for a channel that group held (dev/changelog/1271). It is a
+    # health check over the guide, not a group anyone records from, and In the TV Guide
+    # already counts the channels it holds.
+    'in_group': ('In your groups.&#10;Channels of this account that belong to at least one '
+                 'channel group you made. Each channel counts once however many groups it is '
+                 'in. The TV Guide health check, which ChannelBin keeps by itself, is not '
+                 'counted - In the TV Guide counts those channels.'),
+    'rec_enabled': ("Recording in groups.&#10;Group memberships of this account's channels "
+                    "with Recording on, i.e. feeds a group may actually record from. Counts "
+                    "memberships, so one channel in two groups counts twice. A channel "
+                    "recorded from its own guide row is not counted here: only a group can "
+                    "move a recording to another feed."),
     'guide': ("In the TV Guide.&#10;Channels whose listings reach your TV Guide - their own "
               "row, or through a group's row."),
     'epg': ('With EPG.&#10;Channels with an EPG id that has a program showing in the next 24 '
@@ -125,7 +134,14 @@ def fmt_capture(seconds):
 
 
 def fmt_hours(seconds):
-    return f'{seconds / 3600:.1f} h' if seconds else '0 h'
+    """A chart's capture total. Under an hour it is a duration, since a tenth of an hour is
+    six minutes and a 2-minute recording drew a full bar labeled "0.0 h"
+    (dev/changelog/1291)."""
+    if not seconds:
+        return '0 h'
+    if seconds < 3600:
+        return fmt_capture(seconds)
+    return f'{seconds / 3600:.1f} h'
 
 
 def fmt_count(n):
@@ -175,14 +191,24 @@ def pie(title, scope, accounts, values, fmt, empty):
 # Trend columns
 # ---------------------------------------------------------------------------
 
-def _bucket_labels(unit, start):
-    """(axis label, tooltip title) for a bucket starting on `start`."""
+def _week_range(start):
+    """'Oct 18-24', or 'Sep 28-Oct 4' across a month end."""
+    end = start + timedelta(days=6)
+    if end.month == start.month:
+        return f'{start:%b} {start.day}-{end.day}'
+    return f'{start:%b} {start.day}-{end:%b} {end.day}'
+
+
+def _bucket_labels(unit, start, ranged=False):
+    """(axis label, tooltip title) for a bucket starting on `start`. `ranged` spells a week's
+    axis label as its whole range, for a chart with room for it: a lone bar labeled "Oct 18"
+    read as a wrong date rather than the week starting then (dev/changelog/1272)."""
     if unit == 'day':
         short = f'{start:%b} {start.day}'
         return short, short
     if unit == 'week':
-        short = f'{start:%b} {start.day}'
-        return short, f'Week of {short}'
+        span = _week_range(start)
+        return (span if ranged else f'{start:%b} {start.day}'), f'Week of {span}'
     if unit == 'month':
         return f'{start:%b}', f'{start:%b} {start.year}'
     if unit == 'quarter':
@@ -195,6 +221,9 @@ def _bucket_labels(unit, start):
 
 # At most this many axis labels; past it every Nth is shown (and always the last).
 _AXIS_LABELS = 8
+# A week's range ('Sep 28-Oct 4') fits under its column on a phone-width card only when
+# there are this few columns; past it the axis keeps the shorter start date.
+_RANGED_WEEK_COLUMNS = 4
 
 
 def columns(trend, layers, fmt, empty):
@@ -214,7 +243,8 @@ def columns(trend, layers, fmt, empty):
     step = 1 if n <= _AXIS_LABELS else math.ceil(n / _AXIS_LABELS)
     cols, axis, tips = [], [], []
     for i, bucket in enumerate(buckets):
-        short, title = _bucket_labels(trend['unit'], bucket['start'])
+        short, title = _bucket_labels(trend['unit'], bucket['start'],
+                                      ranged=n <= _RANGED_WEEK_COLUMNS)
         segs = [{'cls': layer.get('cls'), 'color': layer.get('color'),
                  'pct': f"{100 * layer['values'][i] / peak:.2f}"}
                 for layer in layers if layer['values'][i]]
@@ -341,9 +371,9 @@ def section_context(window, cfg, app, account_ids=None):
         pie('In the TV Guide', 'now', accounts,
             {a.id: current[a.id]['guide_channels'] for a in accounts}, fmt_count,
             'No channel is in the TV Guide yet.'),
-        pie('In a channel group', 'now', accounts,
+        pie('In your groups', 'now', accounts,
             {a.id: current[a.id]['in_group'] for a in accounts}, fmt_count,
-            'No channel is in a group yet.'),
+            'No channel is in a group you made yet.'),
     ]
 
     def checks_detail(aid):

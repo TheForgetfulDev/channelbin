@@ -804,8 +804,11 @@
 }
 
 /* Desktop shows the numeric badge; the corner dot is mobile's carrier for the same state
-   (13.5), switched on in the ≤960px block below. */
+   (13.5), switched on in the ≤960px block below - and so is the dots' key in the status bar,
+   since the colour is all a dot says (dev/changelog/1290). */
 .guide-health-dot { display: none; }
+.guide-sb-healthkey { display: none; }
+.guide-sb-healthkey .guide-legend-dot { background: var(--hb, var(--text-faint)); }
 
 .guide-health-badge.hb-none {
   background: var(--bg3);
@@ -1027,6 +1030,18 @@
   );
 }
 
+/* Partial: a finished recording whose file is not the whole program - the warn wash of
+   Retrying rather than Done's green, so it does not read as all good (dev/changelog/1270). */
+.guide-program.has-recording.rec-partial {
+  background: linear-gradient(
+    to right,
+    var(--bg3) var(--rec-left),
+    rgba(var(--warn-rgb), 0.12) var(--rec-left),
+    rgba(var(--warn-rgb), 0.12) var(--rec-right),
+    var(--bg3) var(--rec-right)
+  );
+}
+
 .guide-program.has-recording:hover {
   background: rgba(var(--ok-rgb), 0.22);
 }
@@ -1050,11 +1065,17 @@
   line-height: 13px;
   height: 13px;
   white-space: nowrap;
+  /* A word that still does not fit ends in an ellipsis rather than a hard cut; the glyph-only
+     form (guide.js::recStatusBadge) is what a too-narrow cell normally gets. */
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 .rec-badge-active { color: var(--bad); }
 .rec-badge-paused { color: var(--warn); }
 .rec-badge-retry  { color: var(--warn); }
 .rec-badge-done   { color: var(--ok); }
+.rec-badge-partial { color: var(--warn); }
+.rec-badge-stopped { color: var(--text-muted); }
 .rec-badge-scheduled { color: var(--accent-text); }
 
 /* 12.5: tag dots always take their own line when shown. There is one tag layout, not two. */
@@ -1098,6 +1119,7 @@
 .guide-recording-band.rec-active    { background: rgba(var(--ok-rgb), 0.10); }
 .guide-recording-band.rec-paused    { background: rgba(var(--ok-rgb), 0.06); }
 .guide-recording-band.rec-done      { background: rgba(var(--ok-rgb), 0.08); }
+.guide-recording-band.rec-partial   { background: rgba(var(--warn-rgb), 0.08); }
 
 .guide-recording-outline {
   position: absolute;
@@ -1115,6 +1137,7 @@
   border-style: dashed;
   opacity: 0.7;
 }
+.guide-recording-outline.rec-partial { border-color: rgba(var(--warn-rgb), 0.6); }
 
 .guide-program.is-dummy {
   opacity: 0.55;
@@ -1414,6 +1437,7 @@
 
   /* The health dot: state colour only, in the logo's corner. Never-tested is its own
      unknown treatment, never a fabricated state colour (13.5). */
+  .guide-sb-healthkey { display: flex; margin-left: 0; }
   .guide-health-dot {
     display: block;
     position: absolute;

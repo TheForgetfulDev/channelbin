@@ -5,6 +5,53 @@ Notable changes to ChannelBin, newest first. This project follows
 release is tagged `v<version>` in git, and the version the app is running is shown in the
 page footer.
 
+## 0.30.0 - 2026-10-26
+
+Get started, example channels, cleaner pages.
+
+**Added**
+
+- A Get started page that walks a new install through its four setup steps, with a dashboard
+  banner and a menu link that go away once setup is done.
+- Try it with example channels: one button adds free public channels to try ChannelBin before
+  adding your own IPTV provider, then Keep the examples or Delete the examples when you decide.
+- A recording that had trouble opens with a plain account of what happened: what went wrong,
+  what ChannelBin did about it, and what file is left.
+- Alerts that ChannelBin clears by itself stay on the Alerts page for a day under Cleared
+  recently.
+- Every event has a plain name on a recording's event log and on the channel and group
+  Activity timelines.
+- A quick start guide and a user guide, with new screenshots in them and in the README.
+
+**Changed**
+
+- A provider's divider rows, such as "##### NEWS #####", are hidden by default hide rules on
+  new installs and on upgrade.
+- The group ChannelBin makes by itself is now called "TV Guide health check", and every page
+  that names it says what it does.
+- Every page goes by the name its menu entry uses.
+- Add Account defaults to Xtream.
+- The record dialog says Record now for a show already on, and Channel Search's selection bar
+  leads with Add selected to guide.
+- The TV Guide and Channel Search mark a partial recording Partial instead of Recorded, and a
+  recording stopped early with nothing else missing reads Stopped early.
+- Menu badges and the footer show with the page, and each badge says what it counts.
+
+**Fixed**
+
+- A recording's page agrees with itself: restarts, downtime, capture gaps and joined segments
+  add up, and the page follows a status change.
+- A running recording's page says whether anything is being captured and keeps up through a
+  restart, and a capture that came back no longer carries its old failure count.
+- A stop ChannelBin made itself no longer shows as a red error exit.
+- The channel page shows a test result as it lands, and the TV Guide and the menu's Recordings
+  count follow a recording as it starts.
+- A manual Stop no longer logs "Stop time reached".
+- Hide Rules' match counts follow the channel list after a sync.
+- The Readiness summary adds up, the database size includes its write-ahead log, and the
+  footer and the dashboard show the same free space.
+- Channel Search's info marker no longer draws as a blank box.
+
 ## 0.29.0 - 2026-10-22
 
 Dead-stream retries come sooner.

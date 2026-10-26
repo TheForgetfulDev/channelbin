@@ -459,6 +459,7 @@ async function boxScenario() {
   await c.settle();
   const obs = {};
 
+  obs.placeholder_default = c.bar().placeholder;
   c.type(c.bar(), 'espn wembley');
   await c.settle();
   obs.text_chip_html = c.$('#wellbody').innerHTML;
@@ -484,6 +485,7 @@ async function boxScenario() {
   c.change(title);
   await c.settle();
   obs.fields_after_tick = c.params().in || [];
+  obs.placeholder_three_fields = c.bar().placeholder;
 
   // ...and turning every one of them off must leave something searched, out loud.
   for (const key of ['epg-desc', 'epg-title', 'name']) {
@@ -556,6 +558,34 @@ async function suggestionFacetScenario() {
   c.type(c.bar(), 'alpha');
   obs.sugg_html_nonzero_count = c.$('#sugg').innerHTML;
 
+  obs.errors = c.errors;
+  return obs;
+}
+
+/* The count beside the typed text is the LAST FINISHED search's total, so between a
+   keystroke and its answer it described the previous search - every channel, beside the
+   first letter typed (dev/docs/BUGS.md 2026-10-26). It may only show once the search for
+   exactly that text has answered. Observes the frame before the answer, so it runs ALONE. */
+async function suggestionCountScenario() {
+  const c = boot();
+  await c.settle();
+  const obs = {};
+  const textHint = () => {
+    const item = c.$$('#sugg .sitem').find((el) => {
+      const t = el.querySelector('.stxt');
+      return t && t.textContent.trim() === 'zzz-nothing';
+    });
+    if (!item) return 'no text row';
+    const h = item.querySelector('.shint');
+    return h ? h.textContent.trim() : '';
+  };
+  obs.total_before = c.$('#all-head-count').textContent.trim();
+  c.focus(c.bar());
+  c.type(c.bar(), 'zzz-nothing');
+  obs.hint_before_answer = textHint();
+  await c.settle();
+  c.type(c.bar(), 'zzz-nothing');
+  obs.hint_after_answer = textHint();
   obs.errors = c.errors;
   return obs;
 }
@@ -1028,7 +1058,10 @@ async function guideActionScenario() {
     label: c.$('#sel-add').textContent.trim(),
     disabled: !!c.$('#sel-add').disabled,
     note: c.$('#sel-guide-note').textContent.trim(),
+    // Which of the bar's own buttons are drawn as the lead (dev/changelog/1290).
+    primaries: c.$$('#sel-bar > button.btn-primary').map((b) => b.id),
   });
+  obs.bar_button_order = c.$$('#sel-bar > button').map((b) => b.id);
 
   const outBox = boxFor((v) => !v);
   const inBox = boxFor((v) => v);
@@ -1242,6 +1275,7 @@ async function mobileSheetsScenario() {
   obs.row_sheet_actions = c.$$('.cs-sheet .prow[data-act]').map((el) => el.dataset.act);
   obs.row_sheet_has_select = !!c.$('.cs-sheet [data-rowsel]');
   obs.row_sheet_has_test = !!c.$('.cs-sheet [data-rowtest]');
+  obs.row_sheet_note = (c.$('.cs-sheet .sh-note:last-child') || {}).textContent || '';
   c.click(c.$('.cs-sheet [data-rowsel]'));
   await c.wait(20);
   obs.card_ticked_after_selecting_in_the_sheet =
@@ -2175,6 +2209,7 @@ const run = async () => {
     ['readiness', readinessScenario],
     ['counts_split', countsSplitScenario],
     ['counts_split_channels', countsSplitChannelGrainScenario],
+    ['suggestion_count', suggestionCountScenario],
   ];
   const POOL_SIZE = 4;
   const queue = POOLED.slice();

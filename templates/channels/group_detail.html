@@ -33,11 +33,9 @@
 
 {% block content %}
 <div class="page-head">
-  <h1>Channels</h1>
+  <h1>Channel Groups</h1>
   <a href="{{ url_for('channel_groups.groups_page') }}" class="btn">&larr; All Groups</a>
 </div>
-
-{% include 'channels/_tabs.html' %}
 
 {# ── Header ─────────────────────────────────────────────────────────────── #}
 <div class="gd-head">
@@ -52,11 +50,11 @@
       {% elif is_stored %}
       <span class="gd-kind tip-plain" data-tip="Channel group.&#10;Duplicate feeds of one channel. No member is enabled for recording, so nothing records from it and it holds no guide row - it is a health check until Recording is turned on for a member.">&#9939;</span>
       {% else %}
-      <span class="gd-kind tip-plain" data-tip="Health check.&#10;A set of channels tested on a schedule to confirm they still play. Never appears in the guide, never records.">&#10003;</span>
+      <span class="gd-kind tip-plain" data-tip="Health check.&#10;{{ system_check_sentence }} It never appears in the guide and never records.">&#10003;</span>
       {% endif %}
       <h2>{{ group.name }}</h2>
       {% if is_system %}
-      <span class="badge b-auto tip-plain" data-tip="Automatic group.&#10;ChannelBin maintains this one. Its channels are every TV Guide channel with testing enabled, recalculated whenever the guide changes. You cannot edit or delete it.">Automatic</span>
+      <span class="badge b-auto tip-plain" data-tip="Automatic.&#10;{{ system_check_sentence }} ChannelBin keeps its list up to date by itself, so there is nothing to edit, and it cannot be deleted.">Automatic</span>
       {% endif %}
       {% if is_stored and group.health_score is not none %}
       {% set hscore = [[group.health_score | round | int, 100] | min, 0] | max %}
@@ -85,15 +83,19 @@
       recording, so nothing records from it yet - it is a health check, testing those feeds on its
       schedule. Turning Recording on for a member is what promotes it.
       {% else %}
-      Tests every channel currently in your <a href="{{ url_for('guide.guide') }}">TV Guide</a>. Its channel list is
-      computed from the guide and updates itself - add or remove channels from the
-      <a href="{{ url_for('channels.channel_browser') }}">Browse</a> tab.
+      {{ system_check_sentence }} Its list follows your <a href="{{ url_for('guide.guide') }}">TV Guide</a>
+      by itself{% if not payload.total %}, so there is nothing to test until you add a channel from
+      <a href="{{ url_for('channels.channel_browser') }}">Channel Search</a>{% else %} - add or remove
+      channels from <a href="{{ url_for('channels.channel_browser') }}">Channel Search</a>{% endif %}.
       {% endif %}
     </p>
   </div>
   <div class="gd-dates">
-    Created {{ created_et }}<br>
-    Updated {{ updated_et }}
+    {# The same two lines, in the same formats, as the channel and account pages. The
+       automatic one is made at first start, before any account, so it does not claim a
+       user created it (dev/changelog/1289). #}
+    {% if is_system %}Made by ChannelBin {{ group.created_at | local_date }}{% else %}Added {{ group.created_at | local_date }}{% endif %}<br>
+    Updated {{ group.updated_at | local_time }}
     {% if cloned_from %}
     <br>
     {% if cloned_from.detail_url %}

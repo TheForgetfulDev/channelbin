@@ -143,10 +143,9 @@ class SearchField:
     #: Wrap the column before matching. Only stream_id needs it (an INTEGER that the user
     #: types as text); everything else is already text.
     cast_text: bool = False
-    #: An EXAMPLE of what this field holds, for the Search-in pane's right-hand column. Here
-    #: rather than in the page for the same reason the label is: a field added later would
-    #: otherwise ship with a blank column and nobody would notice.
-    hint: str = ''
+    #: The Channel attribute the Search-in pane's Example column reads off one of the user's
+    #: own channels (field_examples()). Empty for a field with no example to show.
+    example_attr: str = ''
 
 
 #: The Search-in pane's headings, in render order. A group is a HEADING and nothing else -
@@ -158,9 +157,9 @@ FIELD_GROUPS = (
     (FIELD_GROUP_EPG,
      'Switch any of these on and your search also runs against your guide data - what is '
      "scheduled on each channel - not just the channel's own name, ids and category."
-     '\n\nOn Channels, a channel matches when the program it is airing RIGHT NOW matches - '
-     'the one in its Now airing column. On Guide (EPG), every showing is matched on its own, '
-     'so that is where to look for what is on later.'),
+     '\n\nOn Search Channels, a channel matches when the program it is airing RIGHT NOW '
+     'matches - the one in its Now airing column. On Search Programs (EPG), every showing is '
+     'matched on its own, so that is where to look for what is on later.'),
 )
 
 
@@ -176,19 +175,21 @@ _PROG = db.Table('chan_prog', db.MetaData(),
 
 FIELDS = (
     SearchField('name', 'Channel name', FIELD_GROUP_CHANNEL, SOURCE_CHANNEL,
-                'name', Channel.name, hint='FS2 (720p)'),
+                'name', Channel.name, example_attr='name'),
     SearchField('cat', 'Category', FIELD_GROUP_CHANNEL, SOURCE_CHANNEL,
-                'category_name', Channel.category_name, hint='WORLD CUP 2026'),
+                'category_name', Channel.category_name, example_attr='category_name'),
     # No fts_column on purpose: ch_fts indexes name/stream_url/epg_channel_id/category_name,
     # and stream_id is an INTEGER besides. Adding it would mean dropping and rebuilding the
     # channels index; measured 21ms as a plain CAST + LIKE scan, on a field that ships off,
     # so it is not worth a migration. Revisit only if it becomes a default field.
     SearchField('sid', 'Stream id', FIELD_GROUP_CHANNEL, SOURCE_CHANNEL,
-                None, Channel.stream_id, cast_text=True, hint='2077000'),
+                None, Channel.stream_id, cast_text=True, example_attr='stream_id'),
     SearchField('tvg', 'EPG id', FIELD_GROUP_CHANNEL, SOURCE_CHANNEL,
-                'epg_channel_id', Channel.epg_channel_id, hint='foxsports2.us'),
+                'epg_channel_id', Channel.epg_channel_id, example_attr='epg_channel_id'),
+    # The stream id, not a piece of the URL: a URL's path can carry the login or a token,
+    # and the stream id is only offered when the URL really contains it.
     SearchField('url', 'Stream URL', FIELD_GROUP_CHANNEL, SOURCE_CHANNEL,
-                'stream_url', Channel.stream_url, hint='45570'),
+                'stream_url', Channel.stream_url, example_attr='stream_id'),
     SearchField('epg-title', 'Program title', FIELD_GROUP_EPG, SOURCE_PROGRAM,
                 'title', _PROG.c.title),
     SearchField('epg-sub', 'Episode / subtitle', FIELD_GROUP_EPG, SOURCE_PROGRAM,
@@ -200,6 +201,31 @@ FIELDS = (
                 'description', _PROG.c.description),
 )
 FIELD_BY_KEY = {f.key: f for f in FIELDS}
+
+
+def field_examples() -> dict:
+    """{field key: example} from ONE of the user's own channels, for the Search-in pane.
+
+    Fixed examples read as channels the user was meant to have (dev/changelog/1290), so the
+    example is a real value or nothing: a guide channel first, then any channel that is
+    offered, and an install with no channels shows no Example column at all. At most two
+    single-row reads per catalog load: the first seeks ix_channels_in_guide (1.6 ms on the
+    dev box's 202,890 channels), and the fallback takes no ORDER BY, which cost a 21 ms sort.
+    """
+    offered = Channel.query.filter(Channel.hidden.is_(False))
+    sample = (offered.filter(Channel.in_guide.is_(True)).order_by(Channel.id).first()  # guide-flag-read-ok: own row = a channel the user picked
+              or offered.first())
+    if sample is None:
+        return {}
+    out = {}
+    for f in FIELDS:
+        value = getattr(sample, f.example_attr, None) if f.example_attr else None
+        if value is None or str(value).strip() == '':
+            continue
+        if f.key == 'url' and str(value) not in (sample.stream_url or ''):
+            continue
+        out[f.key] = str(value)
+    return out
 #: What a caller that names no fields gets, PER GRAIN - because the two grains are asking
 #: different questions and one shared default answered neither well. On the channel grain a
 #: row IS a channel, so the name is the whole default: adding `epg-title` there made a typed
@@ -330,14 +356,17 @@ DIMENSIONS = (
                    'Either bound alone is a real filter: set only "at least" for "longer '
                    'than X", or only "at most" for "shorter than X".'),
     Dimension('tag', 'Tag', multi=True,
-              help="A label you put on a channel yourself, not the provider's, so it "
-                   "survives a sync. A tag is a set of literal patterns, not a column: a "
-                   "channel carries the tag when its name, or something it is airing, "
-                   "contains one of that tag's patterns.\n\n"
-                   'On Channels "something it is airing" means the program on RIGHT NOW - '
+              help="A label of yours, not the provider's, so it survives a sync. A tag is "
+                   "a set of literal patterns, not a column: a channel carries the tag when "
+                   "its name, or something it is airing, contains one of that tag's "
+                   "patterns.\n\n"
+                   'ChannelBin starts you with two, live and new. They find the small raised '
+                   '"Live" and "New" marks some providers put in channel names and program '
+                   'titles. Change or delete them on the Tags page.\n\n'
+                   'On Search Channels "something it is airing" means the program on RIGHT NOW - '
                    'the one in the Now airing column - so the tag beside a row always '
-                   'describes what that row is showing. On Guide (EPG) each showing answers '
-                   'for itself.'),
+                   'describes what that row is showing. On Search Programs (EPG) each showing '
+                   'answers for itself.'),
     Dimension('acct', 'Account'),
     Dimension('health', 'Health'),
     Dimension('group', 'Channel group', multi=True,
@@ -345,7 +374,7 @@ DIMENSIONS = (
                    'fail over between them. Exclude "Any group" to find every channel '
                    'that is in no group at all.'),
     Dimension('cat', 'Category'),
-    Dimension('other', 'Other', multi=True,
+    Dimension('other', 'Status', multi=True,
               help="Deleted by provider: no longer present in the account's synced feed. "
                    'Excluding it here is the only way this list hides them - nothing hides '
                    'them from the TV Guide, from groups, or from a recording that '

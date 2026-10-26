@@ -14,9 +14,14 @@
    the What's on card is its region, and the test is that the swap leaves it alone.
 
    argv: <fixture dir> <repo root>. The fixture dir holds meta.json and, per state in
-   idle/running/done, groups-<state>.html, channel-<state>.html and nav-<state>.json. */
+   idle/running/done, groups-<state>.html, channel-<state>.html and nav-<state>.json.
+   The channel has program data, so its page carries the What's on grid and the record
+   dialog that sits hidden beside it - every real channel with listings does, and a
+   channel without them is what let the always-busy refresh pass (dev/docs/BUGS.md
+   2026-10-23 06:36 AM). */
 import fs from 'fs';
 import { JSDOM, VirtualConsole } from 'jsdom';
+import { fakeLayout } from './jsdom_layout.mjs';
 
 const [, , DIR, REPO] = process.argv;
 const read = (f) => fs.readFileSync(`${DIR}/${f}`, 'utf8');
@@ -106,6 +111,7 @@ function boot(page, start, { query = '', answers = {} } = {}) {
   const { document } = window;
   window.scrollTo = () => {};
   window.HTMLElement.prototype.scrollIntoView = () => {};
+  fakeLayout(window);
   spec.js.forEach((f) => window.eval(fs.readFileSync(`${REPO}/static/js/${f}`, 'utf8')));
 
   const c = {
@@ -117,6 +123,9 @@ function boot(page, start, { query = '', answers = {} } = {}) {
     click: (el) => el.dispatchEvent(new window.MouseEvent('click', { bubbles: true, cancelable: true })),
     pageFetches: () => sent.filter((p) => p === spec.path).length,
     text: (s) => (document.querySelector(s) || { textContent: '' }).textContent.replace(/\s+/g, ' ').trim(),
+    // The dialog a click just opened: buildModal appends it to <body>, after the record
+    // dialogs the What's on card keeps hidden in the page.
+    dialog: () => Array.from(document.querySelectorAll('.modal')).pop(),
   };
   return c;
 }
@@ -144,7 +153,7 @@ await record('groups_boot', async (start) => {
   return {
     errors: c.errors,
     hook: typeof c.window.__applyHealthCheck,
-    listSig: c.$('#grp-list-groups').dataset.hcSig,
+    listSig: c.$('#grp-lists').dataset.hcSig,
     navSig: STATES.running.nav.health_check.sig,
     running: c.$$('#grp-list-groups .badge.b-running').length,
     pageFetches: c.pageFetches(),
@@ -176,7 +185,7 @@ await record('groups_finished', async (start) => {
     before,
     pageFetches: c.pageFetches(),
     swapped: pairAfter !== pair && item(c, 'other') !== other,
-    listSig: c.$('#grp-list-groups').dataset.hcSig,
+    listSig: c.$('#grp-lists').dataset.hcSig,
     navSig: STATES.done.nav.health_check.sig,
     running: c.$$('#grp-list-groups .badge.b-running').length,
     statuses: Array.from(pairAfter.querySelectorAll('tr.grp-mrow')).map((r) => r.dataset.status),
@@ -229,6 +238,9 @@ await record('channel_boot', async (start) => {
     bar: c.text('#cd-statusbar .badge'),
     testerBusy: c.window.CHANNEL_DETAIL.testerBusy,
     pageFetches: c.pageFetches(),
+    // The What's on card's record dialog, in the DOM and hidden from the first paint.
+    hiddenModal: Boolean(c.$('#record-modal.modal'))
+      && c.$('#record-modal').style.display === 'none',
   };
 });
 
@@ -270,7 +282,7 @@ await record('channel_finished', async (start) => {
   after.pageFetchesAfterNextPoll = c.pageFetches();
   // The step-back confirm quotes the swapped state, not the one the page loaded with.
   c.click(c.$('#cd-health [data-act="health-step-back"]'));
-  after.stepBackBody = c.text('.modal .modal-body');
+  after.stepBackBody = c.dialog().querySelector('.modal-body').textContent.replace(/\s+/g, ' ').trim();
   return after;
 });
 
@@ -287,6 +299,21 @@ await record('channel_test_now', async (start) => {
     navigations: c.navigations.length,
     disabled: c.$('#cd-statusbar [data-act="test-now"]').disabled,
   };
+});
+
+// A test of this channel starts and ends while the page is open: every Test button follows
+// it, the phone bar's included, which is not a swapped region (dev/changelog/1289).
+await record('channel_test_follows_the_run', async (start) => {
+  const c = start('channel', 'idle');
+  await c.settle();
+  const buttons = () => c.$$('[data-act="test-now"]').map((b) => b.disabled);
+  const before = buttons();
+  c.server.state = 'running';
+  await c.poll();
+  const during = buttons();
+  c.server.state = 'done';
+  await c.poll();
+  return { errors: c.errors, before, during, after: buttons() };
 });
 
 await record('channel_screenshot', async (start) => {
@@ -346,7 +373,7 @@ await record('channel_add_to_group_warned', async (start) => {
   const radio = c.$('input[name="cd-grp"]');
   radio.checked = true;
   radio.dispatchEvent(new c.window.Event('change', { bubbles: true }));
-  c.click(c.$('.modal-foot .btn-primary'));
+  c.click(c.dialog().querySelector('.modal-foot .btn-primary'));
   await c.settle();
   const warned = {
     modalOpen: Boolean(c.$('#cd-grp-warnings')),

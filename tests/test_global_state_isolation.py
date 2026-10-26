@@ -64,12 +64,15 @@ RESET = {
     'app/concatenator.py': {'_concat_progress', '_active_concats'},
     'app/connection_limits.py': {'_seat_of'},
     'app/config.py': {'_restart_needed'},
+    'app/examples.py': {'_loading'},
     'app/fs_utils.py': {'_last_logged_outcome'},
     'app/postprocessor.py': {'_analysis_progress'},
     'app/preview.py': {'_sessions', '_reaper'},
     'app/probe.py': {'_missing_reported'},
     'app/readiness.py': {'_ondemand', '_nav_cache'},
+    'app/routes/system.py': {'_last_stats'},
     'app/search_index.py': {'_rebuilding', '_stale_since'},
+    'app/setup_steps.py': {'_nav_cache'},
     'app/toolchain.py': {'_gpu_trial'},
 }
 
