@@ -160,7 +160,9 @@ function renderRulesSection() {
   const el = document.getElementById('rules-section');
   el.innerHTML = `<div class="card">
     <div class="card-head"><h2>Rules <span class="cnt">${scoped.length}</span></h2></div>
-    <div class="card-body">${ruleTableHtml(scoped, 'No rules match this filter yet. Click + Add Rule to create one.')}</div>
+    <div class="card-body">${ruleTableHtml(scoped, selectedAccounts.size
+      ? 'No rules match the Account pills picked above. Click a picked pill again to clear it, or + Add Rule to make one.'
+      : 'No rules yet. + Add Rule makes one.')}</div>
   </div>`;
   wireSortHeaders(el, ruleSort, () => renderRulesSection());
   el.querySelectorAll('[data-act="toggle-rule"]').forEach(cb => cb.addEventListener('change', () => {

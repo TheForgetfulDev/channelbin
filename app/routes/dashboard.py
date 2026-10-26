@@ -12,18 +12,20 @@ from sqlalchemy.orm import selectinload
 
 from .. import db
 from ..database import (
-    Recording, Account, EpgSource,
+    Recording, RecordingEvent, Account, EpgSource, STALL_DETECTED,
+    REC_STATUS_COMPLETED, REC_STATUS_FAILED, REC_STATUS_ABORTED,
     REC_STATUS_SCHEDULED, REC_STATUS_IN_PROGRESS, REC_STATUS_PAUSED, REC_STATUS_RETRYING,
     REC_STATUS_CONCATENATING, REC_STATUS_ANALYZING, REC_STATUS_CONVERTING,
     WINDOW_OPEN_STATUSES, ACCOUNT_STATUS_ERROR, ACCOUNT_STATUS_SYNCING,
 )
 from .. import events as ev
-from .. import account_stats_view
+from .. import account_stats_view, setup_steps
 from ..config import load_config
 from ..tz_utils import UTC, to_naive_utc, format_local, relative
 from ..accounts import get_sync_progress, next_sync_map, sync_signature
-from .channel_tests import get_active_run_summary
-from ..fmt_utils import REC_STATUS_DISPLAY, rec_is_waiting, rec_status_display
+from .channel_tests import get_active_run_summary, schedule_phrase
+from ..fmt_utils import REC_STATUS_DISPLAY, counted, rec_is_waiting, rec_status_display
+from ..recording_story import partial_note, stopped_early_note
 
 dashboard_bp = Blueprint('dashboard', __name__)
 log = logging.getLogger(__name__)
@@ -218,6 +220,43 @@ def _analyzing_detail(r):
 _ERROR_WINDOW = timedelta(hours=1)
 _ERROR_SCAN_LINES = 4000
 
+# How far back the timeline reaches for recordings that have already finished, so one that
+# stalled and ended a few minutes ago is still on the axis rather than gone from the page the
+# moment it completed (dev/changelog/1270).
+# duplicated from static/js/dashboard.js TL_BACK_HOURS - the server picks the finished rows
+# the axis's back half can show, the browser draws the axis.
+TIMELINE_BACK = timedelta(hours=2)
+FINISHED_STATUSES = (REC_STATUS_COMPLETED, REC_STATUS_FAILED, REC_STATUS_ABORTED)
+
+
+def recently_finished(now):
+    """Recordings that captured something and whose window ended inside TIMELINE_BACK.
+    One query; segments come with them for partial_note()."""
+    return (Recording.query.options(selectinload(Recording.segments))
+            .filter(Recording.status.in_(FINISHED_STATUSES),
+                    Recording.started_at.isnot(None),
+                    Recording.stop_time > now - TIMELINE_BACK,
+                    Recording.start_time < now)
+            .order_by(Recording.start_time).all())
+
+
+def _stalls_last_hour(recordings, now):
+    """(stalls, recordings that had one) in the last hour, from the STALL_DETECTED events of
+    the recordings handed in - the ones under way or finished inside TIMELINE_BACK, which is
+    every recording that can have a stall that recent. Counted from the events rather than
+    from a recording's running total, so a stall from three hours into a long capture is not
+    counted as this hour's, and a recording that finished a minute ago still is."""
+    ids = [r.id for r in recordings if r.started_at]
+    if not ids:
+        return 0, 0
+    stalls, recs = (db.session.query(func.count(RecordingEvent.id),
+                                     func.count(func.distinct(RecordingEvent.recording_id)))
+                    .filter(RecordingEvent.recording_id.in_(ids),
+                            RecordingEvent.event_type == STALL_DETECTED,
+                            RecordingEvent.timestamp >= now - _ERROR_WINDOW)
+                    .one())
+    return stalls or 0, recs or 0
+
 
 def _recent_error_counts(now):
     """(errors, criticals, lines_seen) in the last hour, from the tail of the log file.
@@ -255,7 +294,7 @@ def _recent_error_counts(now):
     return errors, crits, seen
 
 
-def _metric_tiles(recordings, accounts, now):
+def _metric_tiles(recordings, accounts, now, finished=()):
     """The six tiles of DESIGN.md 16.1's metric strip, each derived from data already read.
 
     `cls` is one of '', 'ok', 'warn', 'bad' and drives the tile's left rule and value color.
@@ -286,8 +325,7 @@ def _metric_tiles(recordings, accounts, now):
     # display timezone, so the cutoff is datetime.now() rather than utcnow().
     errors, crits, log_lines = _recent_error_counts(datetime.now())
 
-    stalls = sum((r.total_stall_count or 0) for r in capturing)
-    downtime = sum((r.total_downtime_seconds or 0) for r in capturing)
+    stalls, stalled_recs = _stalls_last_hour(list(recordings) + list(finished), now)
     nxt = scheduled[0] if scheduled else None
 
     return [
@@ -305,14 +343,24 @@ def _metric_tiles(recordings, accounts, now):
         {'key': 'Disk free', 'value': fmt_bytes(disk_free) if disk_free is not None else None,
          'sub': f'{used_pct}% used on {dvr_dir}' if used_pct is not None else f'{dvr_dir} is not mounted',
          'cls': disk_level(used_pct) or ''},
-        {'key': 'Errors, last hour',
+        # Both tiles name what they count. "Errors 0" beside a recording that had just
+        # stalled six times read as the app saying nothing went wrong: a stall is logged as
+        # a warning, not an error, and the stall tile counted only what was capturing at
+        # that moment (dev/changelog/1270). "60 min" rather than "last hour" because the
+        # longer key was cut to "LOG ERRORS, LAS..." at 1280 (dev/changelog/1292).
+        {'key': 'Errors, 60 min',
          'value': None if errors is None else str(errors),
          'sub': ('no readable log file' if errors is None
                  else f'{crits} critical' if crits else f'{log_lines} log lines'),
-         'cls': '' if errors is None else 'bad' if crits else 'warn' if errors else 'ok'},
-        {'key': 'Stalls, live', 'value': str(stalls),
-         'sub': f'{int(downtime)}s lost' if downtime else 'no lost time',
-         'cls': 'bad' if stalls > 5 else 'warn' if stalls else 'ok'},
+         'cls': '' if errors is None else 'bad' if crits else 'warn' if errors else 'ok',
+         'tip': ('ERROR and CRITICAL lines ChannelBin wrote to its log in the last hour.\n'
+                 'A stall is a warning, not an error - the stall tile counts those.')},
+        {'key': 'Stalls, 60 min', 'value': str(stalls),
+         'sub': f'on {counted(stalled_recs, "recording")}' if stalls else 'none',
+         'cls': 'bad' if stalls > 5 else 'warn' if stalls else 'ok',
+         'tip': ('Times a stream stopped delivering video in the last hour, on any recording - '
+                 'capturing now or already finished. Each recording\'s page says what '
+                 'happened and what ChannelBin did about it.')},
         {'key': 'Accounts', 'value': f'{len(accounts) - len(err_accounts)} of {len(accounts)}',
          'sub': 'never synced' if oldest_sync is None else f'oldest sync {time_ago_filter(oldest_sync)}',
          'cls': 'bad' if err_accounts else 'ok'},
@@ -321,7 +369,7 @@ def _metric_tiles(recordings, accounts, now):
 
 # ── DESIGN.md 16.3/16.4: what the timeline is drawn from ────────────────────
 
-def _timeline_payload(recordings, accounts, now):
+def _timeline_payload(recordings, accounts, now, finished=()):
     """Everything the timeline draws, as one JSON blob on the page (the GUIDE_CONFIG
     pattern) rather than a second endpoint - it is the same data this render already read.
 
@@ -352,6 +400,35 @@ def _timeline_payload(recordings, accounts, now):
             'start': _ms(r.start_time),
             'end': _ms(r.stop_time),
             'url': f'/recordings/{r.id}',
+        })
+    # A finished row says how it went, since its bar no longer carries a live state: a
+    # partial file, stalls, a failure or a cancel each read differently from a clean one.
+    for r in finished:
+        if r.status == REC_STATUS_FAILED:
+            note, trouble = 'Failed - open the recording for why.', True
+        elif r.status == REC_STATUS_ABORTED:
+            note, trouble = 'Cancelled.', False
+        else:
+            partial = partial_note(r)
+            # The user's own Stop is said, and is not trouble (dev/changelog/1287).
+            stopped = stopped_early_note(r)
+            stalls = r.total_stall_count or 0
+            parts = ([f'Partial: {partial}'] if partial else []) + (
+                [stopped] if stopped else []) + (
+                [f'Finished after {counted(stalls, "stall")}.'] if stalls else [])
+            note = ' '.join(parts) or 'Finished cleanly.'
+            trouble = bool(partial or stalls)
+        rows.append({
+            'id': r.id,
+            'name': r.name,
+            'status': r.status,
+            'channel': r.channel.name if r.channel else None,
+            'color': account_color.get(r.channel.account_id) if r.channel else None,
+            'start': _ms(r.started_at or r.start_time),
+            'end': _ms(r.stop_time),
+            'url': f'/recordings/{r.id}',
+            'note': note,
+            'trouble': trouble,
         })
 
     jobs = []
@@ -467,6 +544,17 @@ def dashboard():
     # Read before the rows: a change landing between the two then makes the next poll
     # re-render once more, where the other order would leave that change unseen.
     rec_sig = recording_signature()
+    sync_sig = sync_signature()
+    # Before any row this page renders: its Readiness write probe rolls back the session,
+    # which would expire every loaded row and reload each one lazily (app/setup_steps.py).
+    # After the two signatures, so a change landing in between re-renders the banner too.
+    try:
+        setup = setup_steps.evaluate()
+    except Exception as exc:                              # noqa: BLE001 - logged; never break the page
+        # The banner is a pointer, not the page: a Readiness context that cannot be built
+        # costs the banner, never the dashboard under it. nav_summary() makes the same call.
+        log.warning('dashboard: setup steps could not be read, banner left out: %s', exc)
+        setup = None
     # selectinload segments: the active-card template counts `rec.segments | length` per
     # non-scheduled row, which is a lazy per-row load (N+1) without this - one batched query
     # instead. Guarded by test_scaling_pages::test_dashboard_page.
@@ -474,13 +562,25 @@ def dashboard():
         Recording.status.in_(DASHBOARD_REC_STATUSES)
     ).order_by(Recording.start_time).all()
     accounts = Account.query.order_by(Account.created_at).all()
+    finished = recently_finished(datetime.utcnow())
     # The account rows' second line (DESIGN.md 16.1): the same macros /accounts draws, from
     # the same numbers, so the two pages cannot disagree about an account's health. Rows
     # only - the windowed Usage section stays on /accounts (dev/changelog/1063). Unlike
     # section_context() this commits nothing, so it does not have to run before the queries
     # above; see its docstring.
-    acct_stats = account_stats_view.rows_context(load_config(), accounts)
+    cfg = load_config()
+    acct_stats = account_stats_view.rows_context(cfg, accounts)
     health_check = get_active_run_summary()
+    # What the Channel health section says while nothing runs: when the guide's own check
+    # next tests anything. It used to send a new user to Channel Groups to start one, beside
+    # a health check that already existed (dev/changelog/1289).
+    guide_check = None
+    if health_check is None:
+        from ..database import OnDemandTestJob
+        sys_job = OnDemandTestJob.query.filter_by(is_system=True).first()
+        if sys_job is not None:
+            guide_check = (sys_job.name,
+                           schedule_phrase(sys_job, cfg.get('channel_testing', {})))
     now = datetime.utcnow()
 
     # The two record sections are cut from the ONE query above rather than re-queried, so a
@@ -494,6 +594,7 @@ def dashboard():
     return render_template(
         'dashboard.html',
         recordings=active, accounts=accounts, health_check=health_check,
+        guide_check=guide_check,
         acct_stats=acct_stats,
         next_sync=next_sync_map(accounts),
         live=live, upcoming=upcoming, now=now, live_stats=_live_row_stats(live, now),
@@ -513,11 +614,12 @@ def dashboard():
         # function rather than between a page and a lookalike. The health kind is handed over
         # for the same reason the status labels above are: a client decision keyed on a
         # string the server owns.
-        sync_sig=sync_signature(),
+        sync_sig=sync_sig,
         rec_sig=rec_sig,
+        setup=setup,
         bg_health_kind=BG_KIND_HEALTH_CHECK,
-        metrics=_metric_tiles(active, accounts, now),
-        timeline=_timeline_payload(active, accounts, now),
+        metrics=_metric_tiles(active, accounts, now, finished),
+        timeline=_timeline_payload(active, accounts, now, finished),
     )
 
 
@@ -692,7 +794,7 @@ def _activity_status_dict():
     # Dashboard-visible subset of bg_tasks, i.e. items that also show up as a row in a
     # Dashboard page section (accounts, health). Search index rebuild is deliberately
     # excluded below - it has no Dashboard section of its own, only the top-bar chip.
-    dashboard_bg_count = 0
+    dashboard_bg_tasks = []
 
     # Channel health test
     if ct['is_running']:
@@ -706,7 +808,7 @@ def _activity_status_dict():
         bg_tasks.append({'kind': BG_KIND_HEALTH_CHECK,
                          'label': 'Channel health test', 'detail': detail,
                          'href': url_for('jobs.jobs_page')})
-        dashboard_bg_count += 1
+        dashboard_bg_tasks.append(bg_tasks[-1])
 
     # Account sync
     syncing_accounts = Account.query.filter_by(status=ACCOUNT_STATUS_SYNCING).all()
@@ -721,7 +823,7 @@ def _activity_status_dict():
         bg_tasks.append({'kind': BG_KIND_ACCOUNT_SYNC,
                          'label': 'Account sync', 'detail': detail,
                          'href': url_for('accounts.account_detail', account_id=acc.id)})
-        dashboard_bg_count += 1
+        dashboard_bg_tasks.append(bg_tasks[-1])
 
     # An EPG source refreshing on its own - its interval job or Refresh now. One inside an
     # account's sync is that sync's work and already shown above.
@@ -733,7 +835,7 @@ def _activity_status_dict():
                          'label': 'EPG source refresh', 'detail': f'Refreshing {src.name}',
                          'href': url_for('accounts.account_detail',
                                          account_id=src.owner_account_id)})
-        dashboard_bg_count += 1
+        dashboard_bg_tasks.append(bg_tasks[-1])
 
     # The three post-capture phases - already counted via `live` on the Dashboard's own
     # recording sections (IN_PROGRESS + CONCATENATING + ANALYZING + CONVERTING all render as
@@ -765,11 +867,11 @@ def _activity_status_dict():
             bg_tasks.append({'kind': BG_KIND_POST_CAPTURE,
                              'label': row_label, 'detail': detail,
                              'href': url_for('recordings.recording_detail', recording_id=r.id)})
-            dashboard_bg_count += 1
+            dashboard_bg_tasks.append(bg_tasks[-1])
 
     # Search index rebuild - the window between "sync complete" and "index rebuilt" (up to
     # ~90s) used to have no indicator at all, even though real work was still happening
-    # (dev/changelog/461). Not part of dashboard_bg_count: no Dashboard page section shows it.
+    # (dev/changelog/461). Not part of dashboard_bg_tasks: no Dashboard page section shows it.
     from ..search_index import rebuilding_index_names
     for name in rebuilding_index_names():
         bg_tasks.append({'kind': BG_KIND_SEARCH_INDEX,
@@ -782,7 +884,7 @@ def _activity_status_dict():
     # other three kinds are deliberately NOT read from here: tester, sync and rebuild each
     # already have a row above built from the database, with progress detail the registry
     # does not carry, and reporting them twice would say the same work is happening twice.
-    # Not part of dashboard_bg_count - maintenance has no Dashboard page section, same as
+    # Not part of dashboard_bg_tasks - maintenance has no Dashboard page section, same as
     # the rebuild entry above.
     from ..admission import KIND_MAINTENANCE, describe_active
     admission_held = describe_active()
@@ -818,7 +920,7 @@ def _activity_status_dict():
             sys_job = OnDemandTestJob.query.filter_by(is_system=True).first()
             if sys_job:
                 _BG_SYSTEM_NAMES[f'od_job_{sys_job.id}'] = (
-                    'TV Guide Channels Health Check', url_for('jobs.jobs_page'))
+                    sys_job.name, url_for('jobs.jobs_page'))
 
             def _bg_label(job_id):
                 if job_id in _BG_SYSTEM_NAMES:
@@ -885,7 +987,13 @@ def _activity_status_dict():
         # live_recs rather than only IN_PROGRESS because the Dashboard page's own
         # "Recordings in progress" section renders every window-open status too; the
         # badge and that section have to describe the same set.
-        'dashboard_activity_count': len(live_recs) + dashboard_bg_count,
+        'dashboard_activity_count': len(live_recs) + len(dashboard_bg_tasks),
+        # What that count is counting, one line each, for the badge's tooltip: a "1" that
+        # came and went during a first sync with nothing to say it was the sync is the
+        # defect dev/changelog/1292 fixed.
+        'dashboard_activity_labels': (
+            [f'{_WINDOW_OPEN_LABEL[r.status]}: {r.name}' for r in live_recs]
+            + [f"{t['label']}: {t['detail']}" for t in dashboard_bg_tasks]),
     }
 
 
@@ -933,19 +1041,29 @@ def nav_status():
     from ..channel_tester import health_check_signature
     from .alerts import _unread_alert_summary, alert_signature
     from ..readiness import nav_summary
-    return jsonify(
+    sync_sig = sync_signature()
+    # The sidebar's Recordings count, the same COUNT inject_globals renders it from.
+    recordings_total = db.session.query(func.count(Recording.id)).scalar() or 0
+    payload = dict(
         stats=_system_stats_dict(),
         alerts=_unread_alert_summary(),
         activity=_activity_status_dict(),
         search=_search_readiness_dict(),
-        account_sync=sync_signature(),
+        account_sync=sync_sig,
         alert_signature=alert_signature(),
         recording_signature=recording_signature(),
+        recordings_total=recordings_total,
         health_check=health_check_signature(),
-        # Cached for 30s inside nav_summary(), and never able to run an on-demand check -
-        # a poll that spawned a process or opened a provider connection would be the exact
-        # thing the Readiness card refuses to do on page load (dev/changelog/950).
-        readiness=nav_summary(),
     )
+    # The Get started link's count. Cached like Readiness's, and keyed on the sync signature
+    # and the recording count read just above, so a first sync or a first recording moves it
+    # at the next poll. Before Readiness's own: an evaluation here refreshes that cache too,
+    # so the two never cost two evaluations in one poll.
+    payload['setup'] = setup_steps.nav_summary(sync_sig, recordings_total)
+    # Cached for 30s inside nav_summary(), and never able to run an on-demand check - a poll
+    # that spawned a process or opened a provider connection would be the exact thing the
+    # Readiness card refuses to do on page load (dev/changelog/950).
+    payload['readiness'] = nav_summary()
+    return jsonify(**payload)
 
 

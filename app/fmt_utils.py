@@ -117,8 +117,12 @@ VFR_TIP = ('Variable frame rate: the declared and average frame rates disagree. 
            'drift audio sync in a long recording.')
 VFR_UNKNOWN_TIP = 'Constant-vs-variable frame rate was not determined for this stream.'
 CFR_TIP = 'Constant frame rate: the declared and average frame rates agree.'
-EFFICIENCY_TIP = ('Bits per pixel per frame = bitrate / (width x height x fps). A standard '
-                  'compression-efficiency stat, not a better/worse verdict.')
+# Named for what the number is: "Efficiency 0.1428" meant nothing to a first-time user
+# (dev/changelog/1289).
+EFFICIENCY_LABEL = 'Bits per pixel'
+EFFICIENCY_TIP = ('Bits per pixel per frame = bitrate / (width x height x fps): how much data '
+                  'the encoder spends on each pixel. A standard compression stat, not a '
+                  'better/worse verdict.')
 TIMELINE_GAP_TIP = ('Presentation-time gaps found in the test clip - the source dropped or '
                     'paused mid-stream.')
 CODED_TIP = "The encoder's padded frame size, which differs from the displayed resolution."
@@ -176,7 +180,10 @@ def fmt_duration(seconds, with_seconds=False):
     """Canonical duration text (DESIGN.md 9.1): 'Xh Ym' / 'Xh' / 'Xm', never colon-style
     ('3:01' reads as a clock time). with_seconds=True keeps seconds where they carry
     meaning (segment durations, live elapsed/remaining/downtime tickers, an offset into
-    a recording). None in, None out - the caller renders its own placeholder."""
+    a recording). None in, None out - the caller renders its own placeholder.
+
+    Under a minute it is seconds either way: "0m" for 24 seconds of capture read as nothing
+    captured (dev/docs/BUGS.md 2026-10-22 08:13:57 PM). Keep in step with util.js::fmtDur."""
     if seconds is None:
         return None
     s = max(0, int(seconds))
@@ -192,6 +199,8 @@ def fmt_duration(seconds, with_seconds=False):
         return f'{h}h {m}m'
     if h:
         return f'{h}h'
+    if not m and sec:
+        return f'{sec}s'
     return f'{m}m'
 
 
@@ -227,13 +236,14 @@ def fmt_duration_phrase(seconds):
 def fmt_job_duration_line(avg_seconds, runs: int) -> str:
     """The Scheduled Jobs page's estimated-runtime line for one job, from
     (avg_seconds, runs) as returned by database.get_job_duration_estimate() /
-    accounts.get_sync_duration_estimate(). Wording matches the approved
-    dev/mockups/29 dashboard-rail mockup's jobDurationLine() exactly (dev/changelog/592) -
-    that mockup is the contract for this string, not a draft to re-derive from. avg_seconds is None
+    accounts.get_sync_duration_estimate(). The "Usually takes" wording is the approved
+    dev/mockups/29 dashboard-rail mockup's jobDurationLine() (dev/changelog/592); the
+    no-run-yet line was reworded in dev/changelog/1277, because a first-time user read
+    "never completed a run" on built-in jobs as a failure. avg_seconds is None
     (never 0 - a job that has never completed a run must never borrow another job's
     number) when the job has no completed run yet."""
     if avg_seconds is None:
-        return 'Expected runtime unknown - this job has never completed a run.'
+        return 'How long it takes is not known yet - it has not finished a run here.'
     basis = f'average of the last {runs} run{"" if runs == 1 else "s"}'
     return f'Usually takes {fmt_duration_phrase(avg_seconds)} ({basis}).'
 

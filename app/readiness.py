@@ -60,7 +60,7 @@ log = logging.getLogger(__name__)
 # ─────────────────────────────────────────────────────────────────────────────
 #: Checked, and it is fine.
 READY = 'ready'
-#: It works today, but it is degraded or it will bite you later.
+#: It works for now, but needs fixing.
 ATTENTION = 'attention'
 #: Something is broken right now.
 PROBLEM = 'problem'
@@ -138,8 +138,14 @@ IGNORED_PREF_KEY = 'readiness_ignored'
 #: its second line. For a check that is a nudge rather than a claim about whether the install
 #: works - an unread error is on the Alerts page already, with its own nav badge, so a second
 #: badge for it is one alarm counted twice (dev/changelog/1039).
-Check = namedtuple('Check', 'id area label short cost without link ignorable run note advisory')
-Check.__new__.__defaults__ = (None, False, None, None, False)
+#:
+#: `setup` is how to set the thing up, for a check that can find NOTHING because the user has
+#: not set it up yet rather than because the install has nothing of the kind. A NOTHING row
+#: that carries one also offers its link; one without stays a plain statement
+#: (dev/changelog/1271).
+Check = namedtuple('Check',
+                   'id area label short cost without link ignorable run note advisory setup')
+Check.__new__.__defaults__ = (None, False, None, None, False, None)
 
 #: Where a check is fixed when it cannot be fixed in place. `endpoint` is resolved through
 #: url_for at evaluation time, so a renamed view function fails the test suite rather than
@@ -466,7 +472,7 @@ def _check_storage_space(ctx):
     tested = f'Asked the filesystem holding {ctx.dvr_dir} how much is left'
     if ctx.disk_total is None:
         return Result(UNKNOWN, tested,
-                      'No honest answer: the filesystem that holds it did not respond')
+                      'The filesystem that holds it did not respond')
     from .routes.system import disk_level, disk_used_pct
     used_pct = disk_used_pct(ctx.disk_total, ctx.disk_free)
     found = f'{fmt_bytes(ctx.disk_free)} free, {used_pct}% used'
@@ -523,7 +529,7 @@ def _check_secret_key(ctx):
     tested = 'Checked that a session signing key is stored'
     if not ctx.secret_key_set:
         return Result(PROBLEM, tested, 'No key is set')
-    return Result(READY, tested, 'A key is set (never shown here or anywhere else)')
+    return Result(READY, tested, 'A key is set')
 
 
 def _check_auth_gate(ctx):
@@ -533,7 +539,7 @@ def _check_auth_gate(ctx):
         return Result(PROBLEM, tested, 'Login is on but no password is stored')
     if gate_active(ctx.auth_cfg):
         return Result(READY, tested, 'Login is on and a password is set')
-    return Result(READY, tested, 'Login is off, which is a choice this app supports')
+    return Result(READY, tested, 'Login is off')
 
 
 def _check_accounts_any(ctx):
@@ -563,8 +569,8 @@ def _check_account_login(ctx):
     xtream = [a for a in ctx.accounts if a.account_type == 'xtream']
     if not xtream:
         return Result(NOTHING, 'Looked for an account with a login endpoint to test',
-                      'Every account is an M3U/XMLTV pair, which has no login step - its URLs '
-                      'are only exercised by a sync')
+                      'Every account is an M3U/XMLTV pair, which has no login step. Its URLs '
+                      'are checked by each sync instead')
     timeout = ctx.cfg.get('sync', {}).get('request_timeout_seconds', 30)
     failures = []
     for account in xtream:
@@ -657,9 +663,12 @@ def _check_guide_content(ctx):
 
 
 def _check_guide_groups(ctx):
-    tested = 'Checked each guide group for at least one member with Recording switched on'
+    tested = 'Checked each group in the guide for at least one channel with Recording on'
     if not ctx.guide_groups:
-        return Result(NOTHING, tested, 'No groups are in the guide')
+        # Not "none of your channel groups": the guide's own health check is listed on
+        # Channel Groups too, and read as a group this sentence denied (dev/changelog/1289).
+        return Result(NOTHING, tested, 'No channel group of yours is a guide row yet. You '
+                      'only need one to fail over between copies of a channel')
     broken = ctx.broken_guide_groups
     if broken:
         return Result(PROBLEM, tested,
@@ -667,16 +676,17 @@ def _check_guide_groups(ctx):
                       'nobody switched on: ' + ', '.join(_group_name(ctx, g) for g in broken))
     return Result(READY, tested,
                   f'All {ctx.guide_groups} have at least one, '
-                  f'{ctx.recording_members} recording members in total')
+                  f'{ctx.recording_members} {plural(ctx.recording_members, "channel")} with '
+                  'Recording on in total')
 
 
 def _check_channels_tested(ctx):
     # No one-click fix on purpose: starting a health check run means choosing which
     # channels and which profile, so there is no single URL to POST - and the rule is act
     # in place only where it is one click (dev/changelog/950).
-    tested = 'Looked for a health check result on every recording-enabled guide-group member'
+    tested = 'Looked for a health check result on every channel with Recording on in a guide group'
     if not ctx.recording_members:
-        return Result(NOTHING, tested, 'There are no recording members to check')
+        return Result(NOTHING, tested, 'No group in the guide has a channel with Recording on yet')
     found = (f'{ctx.tested_members} of {ctx.recording_members} have been checked at least once')
     if ctx.tested_members < ctx.recording_members:
         return Result(ATTENTION, tested, found)
@@ -684,7 +694,7 @@ def _check_channels_tested(ctx):
 
 
 def _check_search_index(ctx):
-    tested = "Read each index's state and asked whether it is safe to query, not just whether it built"
+    tested = "Read each index's state and checked that it is ready to query"
     reasons = [reason for _ready, reason in (ctx.index_channels, ctx.index_programs) if reason]
     action = Action('Rebuild now', [_url('settings.api_search_index_rebuild')])
     if reasons:
@@ -735,7 +745,7 @@ def _check_alerts_unread(ctx):
     if warnings:
         return Result(READY, tested,
                       f'No unread errors ({warnings} unread '
-                      f'{plural(warnings, "warning")}, which this does not count)')
+                      f'{plural(warnings, "warning")}, not counted here)')
     return Result(READY, tested, 'No unread errors')
 
 
@@ -769,20 +779,18 @@ CHECKS = (
           Link('Settings', 'settings.settings'), False, _check_ffprobe),
     Check('ffmpeg_build', 'machine', 'This ffmpeg has the parts ChannelBin uses',
           'this ffmpeg build', ON_DEMAND,
-          'A build missing a component fails only at the moment it is needed, which is '
-          'usually the end of a long recording.',
+          'A missing component fails only when it is needed, which is usually the '
+          'conversion at the end of a long recording.',
           Link('Maintenance', 'system.maintenance'), True, _check_ffmpeg_build,
-          'Lists every filter and codec the build carries, which costs two processes, so it '
-          'never runs because you opened the page.'),
+          'Starts two ffmpeg processes to list the filters and codecs in this build. Runs '
+          'only when you ask.'),
     Check('gpu_encoder', 'machine', 'The GPU encoder works', 'the GPU encoder', ON_DEMAND,
-          'Every video re-encode runs on the CPU instead, which finishes the same file but '
-          'occupies most of the machine for the length of the conversion.',
+          'Video re-encodes run on the CPU instead. The file comes out the same, but the '
+          'conversion uses most of the CPU while it runs.',
           Link('Settings', 'settings.settings'), True, _check_gpu_encoder,
-          'Encodes a one-second test clip through the device, which costs a process, so it '
-          'never runs because you opened the page. It also runs when you turn the GPU '
-          'encoder on in Settings, when the app starts with it on, and before every '
-          'conversion that would use it, and each of those updates this line. Answers at '
-          'once while the encoder is set to Software.'),
+          'Encodes a one-second test clip on the GPU. Runs when you ask, when you turn the '
+          'GPU encoder on in Settings, when the app starts with it on, and before each '
+          'conversion that uses it. With the encoder set to Software it answers at once.'),
     Check('storage_dvr', 'machine', 'The recording folder works', 'the recording folder', CHEAP,
           'Any recording that starts now fails immediately, with nothing captured.',
           Link('Settings', 'settings.settings'), False, _check_storage_dvr),
@@ -798,43 +806,40 @@ CHECKS = (
           Link('Recordings', 'recordings.index'), True, _check_storage_space),
     Check('db_local', 'machine', 'The database is on local disk', 'where the database lives',
           CHEAP,
-          'SQLite over a network filesystem loses writes and locks unpredictably. A DVR '
-          'database on a network share is a corruption waiting to happen.',
+          'SQLite on a network filesystem can lose writes and lock up, and that can '
+          'corrupt the database.',
           Link('Settings', 'settings.settings'), False, _check_db_local),
     Check('db_write', 'machine', 'The database accepts writes', 'writing to the database', CHEAP,
           'Nothing can be scheduled, recorded or synced. The app loads and then fails at the '
           'first action.',
           Link('Maintenance', 'system.maintenance'), False, _check_db_write),
     Check('scheduler', 'machine', 'The scheduler is running', 'the scheduler', CHEAP,
-          'Scheduled recordings never start, and nothing would say so until you noticed the '
-          'file was never made.',
+          'Scheduled recordings do not start.',
           Link('Jobs', 'jobs.jobs_page'), False, _check_scheduler),
     Check('timezone', 'machine', 'A display timezone is set', 'the display timezone', CHEAP,
-          'Every time on every page, and every recording window, would be read in UTC. A '
-          'show would appear to be on at the wrong hour.',
+          'Times on every page and every recording window are in UTC, so shows appear at '
+          'the wrong hour.',
           Link('Settings', 'settings.settings'), False, _check_timezone),
     Check('secret_key', 'machine', 'The session signing key is set', 'the session signing key',
           CHEAP,
           'Sessions cannot be signed, so nobody stays logged in and the login gate can be '
-          'walked around.',
+          'bypassed.',
           Link('Settings', 'settings.settings'), False, _check_secret_key),
     Check('auth_gate', 'machine', 'The login gate does what you asked', 'the login gate', CHEAP,
-          'Login switched on with no password stored serves every page unauthenticated while '
-          'looking protected. That is worse than having it off on purpose.',
+          'Login is on but no password is stored, so every page is open to anyone.',
           Link('Settings', 'settings.settings'), False, _check_auth_gate),
 
     # ── Your provider ─────────────────────────────────────────────────────
     Check('accounts_any', 'provider', 'You have at least one account', 'your provider accounts',
           CHEAP,
-          'There are no channels, no guide and nothing to record. This is the first thing a '
-          'new install needs.',
+          'There are no channels, no guide and nothing to record until you add one.',
           Link('Accounts', 'accounts.accounts_list'), False, _check_accounts_any),
     Check('account_login', 'provider', 'Every account still logs in', 'the provider logins',
           ON_DEMAND,
           'An account whose credentials have lapsed keeps its old channel list, so nothing '
           'looks wrong until a recording tries to open a stream and the provider refuses.',
           Link('Accounts', 'accounts.accounts_list'), True, _check_account_login,
-          'Opens a connection to each provider, so it never runs because you opened the page.'),
+          'Logs in to each provider. Runs only when you ask.'),
     Check('account_sync', 'provider', 'Every account synced recently', 'the account syncs', CHEAP,
           'Channels the provider has moved or dropped go on looking fine in your guide until '
           'the moment you try to record one.',
@@ -848,39 +853,42 @@ CHECKS = (
     Check('guide_content', 'content', 'The TV Guide has something in it',
           'what is in the TV Guide', CHEAP,
           'The guide is empty, so there is nothing to browse and nothing to schedule from.',
-          Link('Channels', 'channels.channel_browser'), False, _check_guide_content),
+          Link('Channel Search', 'channels.channel_browser'), False, _check_guide_content),
     Check('guide_groups', 'content', 'Every group in the guide can record', 'the guide groups',
           CHEAP,
-          'The guide row looks completely normal and cannot produce a file. This is the one '
-          'thing in the group model the app refuses outright rather than warning about.',
-          Link('Channel groups', 'channel_groups.groups_page'), False, _check_guide_groups),
-    Check('channels_tested', 'content', 'The channels you record from have been checked',
-          'the channel health checks', CHEAP,
+          'The guide row looks normal, but recording from it produces no file.',
+          Link('Channel Groups', 'channel_groups.groups_page'), False, _check_guide_groups,
+          setup=('A recording already reconnects to its own channel when the feed drops, '
+                 'without any of this. To have it move to another copy of the channel '
+                 'instead, put the same channel from more than one source into a channel '
+                 'group, switch Recording on for them, and add the group to the guide. The '
+                 'TV Guide health check, which ChannelBin keeps by itself, records nothing, '
+                 'so it is not counted here.')),
+    Check('channels_tested', 'content', 'The channels your groups switch between have been checked',
+          'the health checks on group channels', CHEAP,
           'An untested feed has no measured format, so a group cannot rank it or fail over to '
           'it with any confidence.',
-          Link('Channel groups', 'channel_groups.groups_page'), True, _check_channels_tested),
+          Link('Channel Groups', 'channel_groups.groups_page'), True, _check_channels_tested),
     Check('search_index', 'content', 'Channel and program search are indexed',
           'the search indexes', CHEAP,
-          'Search still returns correct results, but by scanning instead of by index. On a '
-          'large channel list that is the difference between instant and several seconds.',
+          'Search still works, but it scans every row instead of using the index, which can '
+          'take several seconds on a large channel list.',
           Link('Maintenance', 'system.maintenance'), True, _check_search_index),
 
     # ── Being told ────────────────────────────────────────────────────────
     Check('notify_any', 'told', 'Something is set up to tell you',
           'your notification services', CHEAP,
-          'A failed recording is only ever discovered by opening the app and looking. That is '
-          'the exact silence ChannelBin was built to end.',
+          'You only find out about a failed recording by opening the app.',
           Link('Notifications', 'settings.notifications_settings'), True, _check_notify_any),
     Check('notify_delivers', 'told', 'Each service can actually deliver',
           'notification delivery', ON_DEMAND,
-          'A service that is configured but silently failing is worse than no service: the '
-          'app believes it told you.',
+          'A service that is set up but failing sends nothing, and the app thinks you were '
+          'told.',
           Link('Notifications', 'settings.notifications_settings'), True, _check_notify_delivers,
-          'Sends a real message, so it never runs because you opened the page.'),
+          'Sends a real message through each service. Runs only when you ask.'),
     Check('alerts_unread', 'told', 'No unread errors', 'unread errors', CHEAP,
-          'An error you have not read yet is something going wrong that you do not know '
-          'about. It is listed here so it is not missed; the Alerts badge already counts it, '
-          'so it does not add to the one beside Maintenance.',
+          'These are errors you have not seen yet. The Alerts badge already counts them, so '
+          'they do not add to the count beside Maintenance.',
           Link('Alerts', 'alerts.alert_center'), True, _check_alerts_unread, None, True),
 )
 
@@ -902,25 +910,28 @@ CAPABILITIES = (
     Capability('record', 'Record a program right now',
                _cap('ffmpeg', 'storage_dvr', 'storage_space', 'db_write', 'accounts_any',
                     'account_login', 'guide_content')),
-    Capability('schedule', 'Start a recording on its own while you are out',
+    Capability('schedule', 'Start scheduled recordings on time',
                _cap('scheduler', 'db_write', 'timezone', 'account_sync')),
     Capability('guide', 'See what is on',
                _cap('epg_loaded', 'guide_content', 'account_sync', 'accounts_any')),
-    Capability('failover', 'Survive a feed dropping mid-recording',
+    # Not "survive a feed dropping": every recording reconnects to its own channel, set up
+    # or not, and a first-time user read "nothing is set up" minutes after a recording had
+    # done exactly that (dev/changelog/1271). What a group adds is a second feed to move to.
+    Capability('failover', 'Move to a backup channel if a feed dies mid-recording',
                _cap('guide_groups', 'ffprobe', 'channels_tested')),
     Capability('convert', 'Convert a finished recording to MP4',
                _cap('ffmpeg', 'ffmpeg_build', 'gpu_encoder')),
-    Capability('measure', 'Know how good a recording actually was', _cap('ffprobe')),
+    Capability('measure', 'Measure how good a recording was', _cap('ffprobe')),
     Capability('shots', 'Take screenshots and live thumbnails',
                _cap('ffmpeg', 'ffmpeg_build')),
-    Capability('search', 'Search your channels and programs instantly', _cap('search_index')),
+    Capability('search', 'Search your channels and programs quickly', _cap('search_index')),
     Capability('notify', 'Be told when something breaks',
                _cap('notify_any', 'notify_delivers')),
     Capability('files', 'Save thumbnails, screenshots, backups and diagnostics',
                _cap('storage_dirs')),
-    Capability('safe', 'Keep your database and your schedule intact',
+    Capability('safe', 'Keep the database safe and the login working',
                _cap('db_local', 'db_write', 'secret_key', 'auth_gate')),
-    Capability('clear', 'Read every error the app has raised', _cap('alerts_unread')),
+    Capability('clear', 'See every error', _cap('alerts_unread')),
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1019,7 +1030,7 @@ def _resolve(check, ctx, stored):
     if check.cost == ON_DEMAND:
         answer = stored.get(check.id)
         if answer is None:
-            return Result(NOT_RUN, 'Not run yet - it waits for you to ask',
+            return Result(NOT_RUN, 'Not run yet',
                           'No answer yet'), None
         return Result(answer['status'], answer['tested'], answer['found'],
                       answer.get('action'), answer.get('detail')), answer.get('at')
@@ -1114,30 +1125,27 @@ def _headline(caps, rows, counts):
         lower = first['label'][0].lower() + first['label'][1:]
         return {'level': 'warn', 'mark': '!',
                 'head': (f'Ready to record, but {len(degraded)} '
-                         f'{plural(len(degraded), "thing")} '
-                         f'{plural(len(degraded), "is", "are")} not at full strength'),
-                'sub': (f'You can still {lower}, with a caveat. '
+                         f'{plural(len(degraded), "thing needs", "things need")} attention'),
+                'sub': (f'You can still {lower}. '
                         + by_id[first['degraded'][0]]['without'])}
     if unsure:
         n = len(unsure)
         return {'level': 'warn', 'mark': '?',
                 'head': f'{n} {plural(n, "thing")} could not be checked',
-                'sub': ('Nothing here is known to be broken. These checks could not answer, '
-                        'which is not the same as passing, so this card will not claim the '
-                        'install is ready.')}
+                'sub': ('Nothing is known to be broken, but these checks did not get an '
+                        'answer, so it is not known whether this install is ready.')}
     if counts[NOT_RUN]:
         n = counts[NOT_RUN]
         return {'level': 'ok', 'mark': '✓',
                 'head': 'Ready to record',
-                'sub': (f'Everything checked so far is fine. {n} '
-                        f'{plural(n, "check costs", "checks cost")} real work - a process, '
-                        f'a provider login, a message - so {plural(n, "it has", "they have")} '
-                        f'not run. Run {plural(n, "it", "them")} when you want the full answer.')}
+                'sub': (f'Everything checked so far is fine. {n} {plural(n, "check")} '
+                        f'{plural(n, "waits", "wait")} until you run {plural(n, "it", "them")}, '
+                        'because each one starts a process, logs in to a provider or sends '
+                        'a message.')}
     return {'level': 'ok', 'mark': '✓',
             'head': 'Ready: everything you would want to do works',
-            'sub': (f'All {counts["counted"]} checks that count passed: the toolchain, the '
-                    'storage, the database, your accounts, the guide and the way you get told '
-                    'when something goes wrong.')}
+            'sub': (f'All {counts["counted"]} checks passed: ffmpeg, storage, the database, '
+                    'your accounts, the guide and notifications.')}
 
 
 def evaluate(ctx=None, ignored=None, pseudonymize=False) -> dict:
@@ -1170,6 +1178,7 @@ def evaluate(ctx=None, ignored=None, pseudonymize=False) -> dict:
             'found': result.found,
             'without': check.without,
             'note': check.note,
+            'setup': check.setup,
             'detail': result.detail,
             'ignorable': check.ignorable,
             'ignored': check.id in ignored,
@@ -1193,6 +1202,9 @@ def evaluate(ctx=None, ignored=None, pseudonymize=False) -> dict:
     payload = {
         'checks': rows,
         'capabilities': caps,
+        # What the nav counts were taken over, so a page that explains those numbers names
+        # the same capabilities they count (app/setup_steps.py::page).
+        'headline_capabilities': headline_caps,
         'verdict': _verdict(headline_caps, rows,
                             _status_counts([r for r in counted if not r['advisory']])),
         'counts': counts,
@@ -1235,21 +1247,40 @@ def report_text(payload) -> str:
             lines.append(f"      found:   {row['found']}")
             if row['status'] not in (READY, NOTHING):
                 lines.append(f"      cost:    {row['without']}")
+            if row['status'] == NOTHING and row['setup']:
+                lines.append(f"      set up:  {row['setup']}")
         lines.append('')
     return '\n'.join(lines)
 
 
 def nav_counts(caps) -> dict:
-    """{'blocked': n, 'degraded': n} - what the Maintenance nav link counts.
+    """{'blocked': n, 'degraded': n, ...} - what the Maintenance nav link counts.
 
     Capabilities, not checks: one broken binary blocks four capabilities, and a tally of
     checks would read as four alarms for one problem. An ignored check has already been
-    left out of every capability's state, so it cannot reach this.
+    left out of every capability's state, so it cannot reach this. The labels ride along
+    so the badge can say which capabilities it is counting: a count that rose during a
+    first sync with nothing beside it to say why is the defect dev/changelog/1292 fixed.
     """
+    blocked = [c['label'] for c in caps if c['state'] == CANNOT]
+    degraded = [c['label'] for c in caps if c['state'] == DEGRADED]
     return {
-        'blocked': sum(1 for c in caps if c['state'] == CANNOT),
-        'degraded': sum(1 for c in caps if c['state'] == DEGRADED),
+        'blocked': len(blocked),
+        'degraded': len(degraded),
+        'blocked_labels': blocked,
+        'degraded_labels': degraded,
     }
+
+
+def cached_nav():
+    """The nav counts if a fresh answer is cached, otherwise None. Never evaluates: the
+    context processor that renders the menu at first paint runs after a page has loaded its
+    rows, and the evaluation's write probe would roll every one of them back."""
+    with _lock:
+        cached = dict(_nav_cache)
+    if cached.get('at') and (datetime.utcnow() - cached['at']).total_seconds() < NAV_CACHE_SECONDS:
+        return cached['value']
+    return None
 
 
 def nav_summary() -> dict:
@@ -1260,15 +1291,14 @@ def nav_summary() -> dict:
     it reads whatever has already been asked for, so a poll can never spawn a process or
     open a provider connection.
     """
-    with _lock:
-        cached = dict(_nav_cache)
-    if cached.get('at') and (datetime.utcnow() - cached['at']).total_seconds() < NAV_CACHE_SECONDS:
-        return cached['value']
+    cached = cached_nav()
+    if cached is not None:
+        return cached
     try:
         return evaluate()['nav']
     except Exception as exc:                              # noqa: BLE001 - never break the poll
         log.warning('readiness: nav summary failed: %s', exc)
-        return {'blocked': 0, 'degraded': 0}
+        return {'blocked': 0, 'degraded': 0, 'blocked_labels': [], 'degraded_labels': []}
 
 
 def _store_ondemand(check_id, result):

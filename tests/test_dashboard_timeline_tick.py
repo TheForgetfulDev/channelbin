@@ -29,6 +29,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timedelta
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -63,6 +64,10 @@ def _observe():
             # hour to go, so the bar is inside the window with a fill that can grow.
             make_recording(status=REC_STATUS_IN_PROGRESS, name='Live', channel_id=ch.id)
             make_recording(status=REC_STATUS_SCHEDULED, name='Upcoming', channel_id=ch.id)
+            # Past the window's far edge, so the count line has something to call "later".
+            far = datetime.utcnow() + timedelta(days=3)
+            make_recording(status=REC_STATUS_SCHEDULED, name='Far off', channel_id=ch.id,
+                           start_time=far, stop_time=far + timedelta(hours=1))
             db.session.commit()
         html = t.app.test_client().get('/').get_data(as_text=True)
         with open(os.path.join(tmp, 'page.html'), 'w', encoding='utf-8') as f:
@@ -94,6 +99,15 @@ class TimelineClockTests(unittest.TestCase):
         self.assertGreaterEqual(self.obs['initial']['bars'], 2)
         self.assertTrue(self.obs['initial']['tickLefts'])
         self.assertTrue(self.obs['initial']['fillWidths'])
+
+    def test_the_count_line_says_where_the_rest_are_and_what_a_job_is(self):
+        """dev/changelog/1292: "9 jobs in this window, 3 outside it" on an empty install
+        left a new user asking what jobs they had set up, and where "outside" was."""
+        counts = self.obs['initial']['counts']
+        self.assertIn('1 more later', counts)
+        self.assertNotIn('outside', counts)
+        self.assertTrue(any("ChannelBin's own scheduled work" in t
+                            for t in self.obs['initial']['tips']))
 
     def test_a_sixty_second_tick_is_registered(self):
         self.assertEqual(self.obs['ticksFound'], 1,

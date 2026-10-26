@@ -36,7 +36,7 @@
   let bgSig;
   let recSig;
 
-  const busy = () => Boolean(document.querySelector('#jb-live .menu.open, .modal'));
+  const busy = overlayOpen;
 
   function refresh() {
     if (!document.getElementById('jb-live') || inFlight || busy()) return;

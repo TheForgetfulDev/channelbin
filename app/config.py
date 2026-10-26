@@ -786,12 +786,12 @@ _DEFAULTS = {
         'dir': '',                      # '' -> system temp dir; where the rolling segment window is written
     },
     'channel_testing': {
-        # Enable/schedule for the automatic guide run live on the 'TV Guide Channels'
+        # Enable/schedule for the automatic guide run live on the 'TV Guide health check'
         # system health-check row (OnDemandTestJob.is_system), not in config.
         # Both guards DEFER rather than skip since dev/changelog/941 - the occurrence is
         # retried at the first gap long enough to finish the run in. The keys keep their
         # historical names; renaming a live config leaf breaks every existing config.yaml.
-        'skip_if_recording_active': True,       # defer the TV Guide Channels run if a recording is IN_PROGRESS
+        'skip_if_recording_active': True,       # defer the TV Guide health check run if a recording is IN_PROGRESS
         'skip_if_recording_within_minutes': 10, # defer ANY scheduled run, warn before a manual one; 0 = off
         'test_duration_seconds': 30,
         'wait_between_channels_seconds': 30,

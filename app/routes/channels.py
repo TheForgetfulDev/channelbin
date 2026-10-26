@@ -15,7 +15,7 @@ from ..database import (
     EpgChannelKey, Recording,
     ChannelTest, ChannelEvent, ChannelHealthExclusion, OnDemandTestJob, Tag,
     RecordingProfile, HealthCheckProfile,
-    CHANNEL_ADDED_TO_GUIDE, CHANNEL_REMOVED_FROM_GUIDE, CHANNEL_HEALTH_OVERRIDE_CHANGED,
+    CHANNEL_REMOVED_FROM_GUIDE, CHANNEL_HEALTH_OVERRIDE_CHANGED,
     REC_STATUS_SCHEDULED, REC_STATUS_IN_PROGRESS, REC_STATUS_PAUSED, REC_STATUS_RETRYING,
     REC_STATUS_CONCATENATING, REC_STATUS_ANALYZING, REC_STATUS_COMPLETED,
     REC_STATUS_FAILED, REC_STATUS_ABORTED,
@@ -90,8 +90,7 @@ CHANNEL_SEARCH_AIRING_CARD_FIELDS_PREF = 'channel_search_airing_card_fields_v2'
 # static/js/group-create-flow.js and show it once more (dev/changelog/831). Spelled here
 # and in that file, and the two must agree - the JS posts it back to this key.
 GROUP_INTRO_SEEN_PREF = 'group_intro_seen_version'
-from .channel_tests import _serialize_dup_groups
-from .channel_groups import _next_guide_sort_order
+from .channel_tests import _serialize_dup_groups, guide_check_note, schedule_phrase
 from ..channel_tester import get_status, health_check_profile_payload, health_check_signature
 
 channels_bp = Blueprint('channels', __name__)
@@ -464,7 +463,7 @@ def channels_health_checks():
 
 @channels_bp.route('/channels/health-checks/guide')
 def channels_health_checks_guide():
-    """Old URL - the guide run is now the TV Guide Channels system health check."""
+    """Old URL - the guide run is now the TV Guide health check, the system one."""
     sys_job = OnDemandTestJob.query.filter_by(is_system=True).first()
     if sys_job is None:
         return redirect(url_for('channels.channels_health_checks'))
@@ -591,7 +590,7 @@ def _health_checks_for_channel(channel):
     Resolves membership per job rather than building the whole monitored-channel
     set (`channel_tester.monitored_channel_ids()`), because this page asks about
     exactly one channel: a stored group is a membership lookup, and the system
-    "TV Guide Channels" group's membership is computed (in_guide, minus
+    "TV Guide health check" group's membership is computed (in_guide, minus
     test_enabled=False) and would otherwise load the entire guide. The
     disabled-member rule matches channel_groups.check_run_channels(): a run tests a
     member when both its membership's test_enabled and the channel-wide one are on."""
@@ -679,7 +678,7 @@ def _quality_profile_stats(t):
         stats.append(stat('Frame Rate', 'Constant', tip=fmt_utils.CFR_TIP))
 
     if t.bits_per_pixel_frame:
-        stats.append(stat('Efficiency', f'{t.bits_per_pixel_frame:.4f}',
+        stats.append(stat(fmt_utils.EFFICIENCY_LABEL, f'{t.bits_per_pixel_frame:.4f}',
                           tip=fmt_utils.EFFICIENCY_TIP))
     # Gaps are the exception to "always show the card": a clean clip has zero, and a zero
     # card would read as a finding where there is none.
@@ -868,6 +867,19 @@ def channel_detail(channel_id):
 
     cfg = load_config()
     lifecycle_by_channel = _lifecycle_states_for_channels([channel], cfg)
+    # Which check will test it next and when, for a channel no test has reached yet - so
+    # "never tested" on a channel that is enrolled says what happens next rather than
+    # reading as a contradiction of its own Testing chip (dev/changelog/1271).
+    ct_cfg = cfg.get('channel_testing', {})
+    next_check = None
+    for job in health_checks:
+        phrase = schedule_phrase(job, ct_cfg)
+        if phrase:
+            next_check = (job, phrase)
+            break
+    # Add to Guide also enrolls the channel in the guide's own check; its tooltip says so.
+    add_guide_note = (guide_check_note(system_job, ct_cfg)
+                      if not channel.in_guide and channel.test_enabled else None)
 
     # The Health card's "Latest screenshot" tile shows a hand capture while it is newer than
     # the latest test (dev/changelog/1160). No stat of the file: the column is the record.
@@ -930,6 +942,8 @@ def channel_detail(channel_id):
         window_label=window_label,
         channel_kind_groups=channel_kind_groups,
         guide_via_groups=guide_via_groups,
+        next_check=next_check,
+        add_guide_note=add_guide_note,
         hide=hide,
         health_checks=health_checks,
         lifecycle_state=lifecycle_state,
@@ -1013,17 +1027,11 @@ def toggle_channel(channel_id):
             query = urlencode({'dup_block': channel.id, 'dup_names': names})
             return redirect(f'{next_url}{sep}{query}')
 
-    # Place at end of guide. Channels and groups share one ordering space, so the
-    # next slot must clear both (see channel_groups._next_guide_sort_order).
-    channel.guide_sort_order = _next_guide_sort_order()
-    channel.in_guide = True
-    db.session.add(ChannelEvent(
-        channel_id=channel.id, event_type=CHANNEL_ADDED_TO_GUIDE,
-        detail=f'Added to guide at position {channel.guide_sort_order}',
-    ))
-    flash(f'"{channel.name}" added to guide.', 'success')
-
-    channel_hiding.recompute([channel.id])
+    from .guide import give_own_guide_row
+    give_own_guide_row(channel)
+    note = (guide_check_note(OnDemandTestJob.query.filter_by(is_system=True).first())
+            if channel.test_enabled else None)
+    flash(f'"{channel.name}" added to guide.' + (f' {note}' if note else ''), 'success')
     db.session.commit()
     return redirect(next_url)
 
@@ -1391,6 +1399,9 @@ def missing_delete():
     if refusal is not None:
         log.info('Channel delete refused (%d requested): %s', len(requested_ids), refusal)
         return jsonify({'error': refusal}), 409
+    if deleted_count:
+        # A deleted channel leaves every rule that matched it (dev/changelog/1291).
+        channel_hiding.refresh_rule_stats_and_commit()
     delete_files(screenshot_paths)
     broken = report_orphaned_guide_groups(
         touched, cause='The channels it could record from were deleted as missing from '

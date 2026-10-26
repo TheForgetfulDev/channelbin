@@ -9,6 +9,11 @@
     one profiles query; never ask per row where a tag is referenced. #}
 
 {% block content %}
+<style>
+/* A provider's markers are superscript letters (ᴸᶦᵛᵉ), about half the height of the text
+   around them, so at the table's code size they could not be read (dev/changelog/1277). */
+.tag-pat { font-size: var(--fs-xl); }
+</style>
 <div class="page-head">
   <h1>Tags
     <span class="sub">{{ tags | length }} tag{{ 's' if tags | length != 1 else '' }}</span>
@@ -16,10 +21,13 @@
   <button class="btn btn-primary" id="tag-add">+ Add Tag</button>
 </div>
 <p class="page-sub">
-  Tags detect text patterns - the tiny stylized <code>ᴸᶦᵛᵉ</code> / <code>ᴺᵉʷ</code> markers
-  IPTV providers embed in program titles - so they can be inserted, replaced, or removed in
-  filename templates via <code>{tag:name}</code>. They also highlight and filter programs in
-  the TV Guide and in EPG searches.
+  Tags find the little markers IPTV providers put in program titles, like the tiny
+  <code class="tag-pat">ᴸᶦᵛᵉ</code> and <code class="tag-pat">ᴺᵉʷ</code>. In the TV Guide and in
+  program searches, a tag highlights the programs that carry its marker and lets you filter
+  on them. In a recording's file name, <code>{tag:live}</code> writes "live" when the program
+  has that marker and nothing when it does not, and the file name settings can remove or
+  replace the marker itself. ChannelBin starts with two, live and new, for the markers most
+  providers use; edit or delete them like any other.
 </p>
 
 {% if not tags %}
@@ -54,7 +62,7 @@
             <strong>{{ tag.name }}</strong>
           </td>
           <td data-label="Match patterns" class="muted">
-            {% for p in tag.patterns %}<code>{{ p.pattern }}</code>{% if not loop.last %} {% endif %}{% endfor %}
+            {% for p in tag.patterns %}<code class="tag-pat">{{ p.pattern }}</code>{% if not loop.last %} {% endif %}{% endfor %}
           </td>
           {# Named, not counted: "2 places" would make the user hunt for them. A tag is
              referenced by name, so deleting one silently changes what these render. #}

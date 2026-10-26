@@ -109,7 +109,7 @@
     if (!added.length) {
       bar.insertAdjacentHTML('beforeend',
         '<div class="svc-empty">No notification services yet, so nothing is pushed anywhere. ' +
-        'Alerts are still raised and still visible in the Alert Center.' +
+        'Alerts are still raised and still listed on the Alerts page.' +
         '<div><button class="btn btn-primary btn-sm" type="button" data-msel="addsvc">Add a service</button></div></div>');
       grid.style.display = 'none';
       grid.innerHTML = '';
@@ -186,7 +186,7 @@
           <div class="rt-name">${escHtml(r.label)} <span class="alert-severity sev-${escHtml(r.severity)}">${escHtml(r.severity)}</span></div>
           <div class="rt-key">${escHtml(key)}</div>
         </td>
-        <td><span class="rt-cl">Show in the Alert Center</span>
+        <td><span class="rt-cl">Show on the Alerts page</span>
           <label class="switch"><input type="checkbox" data-rt-inapp="${escHtml(key)}"${r.in_app ? ' checked' : ''}><span class="knob"></span></label></td>
         <td class="rt-push"><span class="rt-cl">Push to</span>${picks}</td>
       </tr>`;

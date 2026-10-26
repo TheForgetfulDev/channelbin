@@ -186,5 +186,102 @@ class NoChipStatusTests(_Base):
                 self.assertFalse(self.chip(status)['complained'])
 
 
+
+class PartialChipTests(_Base):
+    """dev/docs/BUGS.md 2026-10-22 09:04:44 PM: a finished recording that captured 3 minutes of a
+    100-minute program drew the same green "✓ Recorded" as a whole one. The server now sends
+    why a finished recording is partial (app/recording_story.py::partial_note) and the chip
+    says Partial, in amber, with the reason in its tooltip."""
+
+    def test_a_partial_recording_reads_partial_not_recorded(self):
+        p = self.obs['partial']
+        self.assertEqual(p['text'], '⚠ Partial')
+        self.assertIn('rec-badge-partial', p['badgeClass'])
+        self.assertEqual(p['cls'], 'rec-partial')
+
+    def test_the_tooltip_carries_the_servers_reason(self):
+        p = self.obs['partial']
+        self.assertTrue(p['tip'].startswith('Partial\n'), p['tip'])
+        self.assertIn(p['sentence'], p['tip'])
+
+    def test_a_whole_recording_and_a_live_one_keep_their_own_marks(self):
+        p = self.obs['partial']
+        self.assertEqual(p['wholeCls'], self.chip(REC_STATUS_COMPLETED)['cls'])
+        self.assertEqual(p['liveCls'], self.chip('IN_PROGRESS')['cls'])
+
+
+class StoppedEarlyChipTests(_Base):
+    """dev/changelog/1287: a recording the user started late and stopped on purpose drew the
+    amber "⚠ Partial", and the user looked for a fault that was not there. The server sends
+    the user's own Stop separately (app/recording_story.py::stopped_early_note) and the chip
+    says so without the warning."""
+
+    def test_the_users_own_stop_reads_stopped_early_not_partial(self):
+        s = self.obs['stopped']
+        self.assertEqual(s['text'], '■ Stopped early')
+        self.assertIn('rec-badge-stopped', s['badgeClass'])
+        self.assertNotIn('rec-badge-partial', s['badgeClass'])
+
+    def test_the_tooltip_carries_the_servers_sentence(self):
+        s = self.obs['stopped']
+        self.assertTrue(s['tip'].startswith('Stopped early\n'), s['tip'])
+        self.assertIn(s['sentence'], s['tip'])
+
+    def test_something_else_missing_still_reads_partial(self):
+        self.assertEqual(self.obs['stopped']['bothText'], '⚠ Partial')
+
+    def test_a_live_recording_keeps_its_own_mark(self):
+        self.assertEqual(self.obs['stopped']['liveText'], self.chip('IN_PROGRESS')['text'])
+
+
+
+class StartingChipTests(_Base):
+    """dev/changelog/1290: after Record on a program already on, the cell said "Scheduled"
+    for 8 to 10 s and a tester wondered whether it had worked. A SCHEDULED recording whose
+    start time has come reads Starting until the recorder flips it."""
+
+    def test_only_a_scheduled_recording_past_its_start_is_starting(self):
+        s = self.obs['starting']
+        self.assertTrue(s['past'])
+        self.assertFalse(s['future'])
+        self.assertFalse(s['running'])
+        self.assertFalse(s['none'])
+
+    def test_it_reads_starting_with_a_tooltip_of_its_own(self):
+        s = self.obs['starting']
+        self.assertEqual(s['chip']['text'], 'Starting')
+        self.assertTrue(s['chip']['tip'].startswith('Starting\n'), s['chip']['tip'])
+        self.assertEqual(s['plain']['text'], self.chip('SCHEDULED')['text'])
+
+    def test_a_running_recording_keeps_its_own_mark(self):
+        self.assertEqual(self.obs['starting']['liveIgnoresIt']['text'],
+                         self.chip('IN_PROGRESS')['text'])
+
+
+class NarrowCellChipTests(_Base):
+    """dev/changelog/1290: on a phone a program already half over drew "RECORDIN", cut by its
+    own cell. A cell too narrow for glyph and word keeps the glyph, with the word in the
+    tooltip and the label."""
+
+    def test_a_wide_cell_keeps_glyph_and_word(self):
+        self.assertEqual(self.obs['narrow']['wide']['text'], self.chip('IN_PROGRESS')['text'])
+        self.assertIsNone(self.obs['narrow']['wide']['label'])
+
+    def test_a_narrow_cell_keeps_the_glyph_and_names_the_state(self):
+        n = self.obs['narrow']['narrow']
+        glyph, word = self.chip('IN_PROGRESS')['text'].split(' ', 1)
+        self.assertEqual(n['text'], glyph)
+        self.assertEqual(n['label'], word)
+        self.assertTrue(n['tip'].startswith(f'{word}\n'))
+
+    def test_no_width_means_the_whole_chip(self):
+        self.assertEqual(self.obs['narrow']['unknownWidth']['text'],
+                         self.chip('IN_PROGRESS')['text'])
+
+    def test_a_chip_with_no_glyph_keeps_its_word(self):
+        self.assertEqual(self.obs['narrow']['noGlyphNarrow']['text'],
+                         self.chip('SCHEDULED')['text'])
+
+
 if __name__ == '__main__':
     unittest.main()

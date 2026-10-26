@@ -175,6 +175,11 @@ function boot(start, { serve = start } = {}) {
     pageFetches: () => sent.filter((p) => p === '/').length,
     runFetches: () => sent.filter((p) => p === '/api/channel-tests/active-run').length,
     syncSig: () => (sec('accounts') || { dataset: {} }).dataset.syncSig,
+    // The setup banner's "N of 4 done", or null with no banner on the page.
+    setupDone: () => {
+      const el = $('#dash-setup .gs-b-eyebrow');
+      return el ? el.textContent.trim() : null;
+    },
     hasCard: () => Boolean($('#hc-card')),
     hcName: () => ($('#hc-card .d-name') || { textContent: null }).textContent,
     badge: () => ($('#hc-status-badge') || { textContent: null }).textContent,
@@ -231,10 +236,13 @@ await record('sync_finished', async (start) => {
   await c.settle();
   const before = c.sec('accounts');
   const otherBefore = c.sec('live');
+  const setupBefore = c.setupDone();
   c.server.state = 'synced';
   await c.poll();
   const after = {
     errors: c.errors,
+    setupBefore,
+    setupAfter: c.setupDone(),
     pageFetches: c.pageFetches(),
     statuses: c.acctStatuses(),
     sameSection: c.sec('accounts') === before,
@@ -470,6 +478,16 @@ await record('rec_started_by_poll', async (start) => {
   await c.poll();
   after.pageFetchesAfterNextPoll = c.pageFetches();
   return { errors: c.errors, navigations: c.navigations, before, after };
+});
+
+/* ── A first recording is scheduled; the setup banner moves on ────────── */
+await record('setup_follows_recording', async (start) => {
+  const c = start('synced');
+  await c.settle();
+  const before = c.setupDone();
+  c.server.state = 'scheduled';
+  await c.poll();
+  return { errors: c.errors, before, after: c.setupDone(), pageFetches: c.pageFetches() };
 });
 
 /* ── A recording starts; its own SSE frame is the first to hear ──────── */

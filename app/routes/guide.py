@@ -2,10 +2,12 @@ import json
 from datetime import datetime, timedelta
 
 from flask import Blueprint, render_template, request, redirect, url_for, jsonify
+from sqlalchemy.orm import selectinload
 
 from .. import db
 from ..database import (Account, Channel, ChannelEvent, ChannelGroup, EPGEntry, EpgSource,
-                        Recording, RecordingProfile, Tag, SavedSearch, UserPref,
+                        OnDemandTestJob, Recording, RecordingProfile, Tag, SavedSearch,
+                        UserPref,
                         CHANNEL_ADDED_TO_GUIDE, CHANNEL_REMOVED_FROM_GUIDE,
                         REC_STATUS_ABORTED, REC_STATUS_FAILED)
 from ..accounts import (normalize_url, render_filename_template,
@@ -21,6 +23,7 @@ from ..channel_groups import (effective_score, rank_members, member_channels,
                               guide_listings_member, fill_listings,
                               DEFAULT_FAILING_STREAK_THRESHOLD)
 from .. import channel_hiding
+from ..recording_story import partial_note, stopped_early_note
 from ..config import load_config
 from ..db_utils import retry_on_locked
 from ..logo_cache import resolve_logo_url
@@ -31,7 +34,7 @@ from ..recording_match import (build_rec_indexes as _build_rec_indexes,
                                candidate_recs as _candidate_recs,
                                match_recording as _match_recording)
 from ..tz_utils import get_display_tz
-from .channel_tests import _latest_tests_by_channel, ANY_JOB
+from .channel_tests import _latest_tests_by_channel, ANY_JOB, guide_check_note
 from .channels import _guide_conflicts, _parse_requested_ids, _BadRequestedIds
 from .channel_groups import _next_guide_sort_order
 
@@ -234,6 +237,13 @@ def _program_dict(ch, entry, start, stop, *, stream_url, template, tag_cleanup, 
         'has_recording': has_rec,
         'recording_id': rec.id if has_rec else None,
         'recording_status': rec.status if has_rec else None,
+        # Why a finished recording is not the whole program, or None - the guide's mark
+        # reads it so a 3-minute capture of a 100-minute program is not a green "Recorded"
+        # (dev/changelog/1270). The caller loads the recording's segments with it.
+        'recording_partial': partial_note(rec) if has_rec else None,
+        # The user's own Stop, when it is the whole reason the file is short: a quiet mark of
+        # its own rather than the amber Partial (dev/changelog/1287).
+        'recording_stopped': stopped_early_note(rec) if has_rec else None,
         'recording_start_time': rec.start_time.strftime('%Y-%m-%dT%H:%M:%S') if has_rec else None,
         'recording_stop_time': rec.stop_time.strftime('%Y-%m-%dT%H:%M:%S') if has_rec else None,
         'recording_profile_id': rec.profile_id if has_rec else None,
@@ -396,6 +406,28 @@ def delete_saved_search(search_id):
     return jsonify({'success': True})
 
 
+def give_own_guide_row(channel):
+    """Give `channel` its own guide row at the end of the guide, without committing. The
+    one spelling of the write behind every Add to Guide - this route, the channel page's
+    form (routes/channels.py::toggle_channel) and the example channels (app/examples.py) -
+    so none of them can leave out the event or the hiding recompute."""
+    # Channels and groups share one guide ordering space - the next slot must
+    # clear both, or a channel lands on a group's sort position.
+    channel.guide_sort_order = _next_guide_sort_order()
+    channel.in_guide = True
+    # Gaining a guide row used to leave no trace on the channel's own timeline from the
+    # search page, so the two ways of doing one thing disagreed about whether it happened
+    # (dev/changelog/792).
+    db.session.add(ChannelEvent(
+        channel_id=channel.id, event_type=CHANNEL_ADDED_TO_GUIDE,
+        detail=f'Added to guide at position {channel.guide_sort_order}',
+    ))
+    # A guide row keeps a channel visible even when something says hide it, so gaining
+    # one has to rewrite the answer - otherwise a hidden channel added to the guide
+    # stays out of every picker that put it there.
+    channel_hiding.recompute([channel.id])
+
+
 @guide_bp.route('/api/guide/channels/<int:channel_id>/add', methods=['POST'])
 @retry_on_locked()
 def add_channel_to_guide(channel_id):
@@ -409,6 +441,7 @@ def add_channel_to_guide(channel_id):
 
     force = request.args.get('force') == '1' or bool((request.get_json(silent=True) or {}).get('force'))
 
+    note = None
     if not channel.in_guide:
         if not force:
             conflicts = _guide_conflicts(channel)
@@ -420,25 +453,14 @@ def add_channel_to_guide(channel_id):
                     'channel_name': channel.name,
                     'conflicting_channels': [{'id': c.id, 'name': c.name} for c in conflicts],
                 })
-        # Channels and groups share one guide ordering space - the next slot must
-        # clear both, or a channel lands on a group's sort position.
-        channel.guide_sort_order = _next_guide_sort_order()
-        channel.in_guide = True
-        # Same event the form path writes (routes/channels.py::toggle_channel). Gaining a
-        # guide row from the search page used to leave no trace on the channel's own
-        # timeline, so the two ways of doing one thing disagreed about whether it happened
-        # (dev/changelog/792).
-        db.session.add(ChannelEvent(
-            channel_id=channel.id, event_type=CHANNEL_ADDED_TO_GUIDE,
-            detail=f'Added to guide at position {channel.guide_sort_order}',
-        ))
-        # A guide row keeps a channel visible even when something says hide it, so gaining
-        # one has to rewrite the answer - otherwise a hidden channel added to the guide
-        # stays out of every picker that put it there.
-        channel_hiding.recompute([channel.id])
+        give_own_guide_row(channel)
         db.session.commit()
+        # The same sentence the channel page's flash carries (dev/changelog/1271).
+        if channel.test_enabled:
+            note = guide_check_note(OnDemandTestJob.query.filter_by(is_system=True).first())
 
-    return jsonify({'success': True, 'in_guide': True, 'channel_name': channel.name})
+    return jsonify({'success': True, 'in_guide': True, 'channel_name': channel.name,
+                    'note': note})
 
 
 @guide_bp.route('/api/guide/channels/remove', methods=['POST'])
@@ -565,7 +587,9 @@ def epg_api():
         row_entries = _guide_row_entries(streak_threshold)
 
     # Load all recordings in the time window for has_recording check
-    window_recordings = Recording.query.filter(
+    # Segments come with them: partial_note() reads a finished recording's capture spans,
+    # and a lazy load per recording would make the grid one query per recording.
+    window_recordings = Recording.query.options(selectinload(Recording.segments)).filter(
         Recording.start_time < window_end,
         Recording.stop_time > window_start,
         Recording.status.notin_([REC_STATUS_ABORTED, REC_STATUS_FAILED]),
@@ -699,6 +723,7 @@ def epg_api():
                 'start_time': r.start_time.strftime('%Y-%m-%dT%H:%M:%S'),
                 'stop_time': r.stop_time.strftime('%Y-%m-%dT%H:%M:%S'),
                 'status': r.status,
+                'partial': partial_note(r),
             })
         row = {
             # Group rows use a synthetic 'g<id>' - matches the data-channel-id the

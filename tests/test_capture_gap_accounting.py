@@ -155,7 +155,7 @@ class ListPageGapReportingTests(_Base):
         tip = self._tip(rec.id)
 
         self.assertIn('nothing capturing at all', tip)
-        self.assertIn('more content than the time the capture ran', tip)
+        self.assertIn('longer than the time ChannelBin spent capturing', tip)
 
     def test_a_clean_capture_says_neither(self):
         """Every clean capture is a few seconds off its window (ffmpeg start latency, and a

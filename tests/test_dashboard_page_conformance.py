@@ -455,7 +455,7 @@ class MetricStripTests(unittest.TestCase):
         with patch('app.routes.logs._log_file_path', return_value='/nonexistent/dvr.log'):
             tiles = dict((k.strip(), (v.strip(), s.strip())) for k, v, s in
                          self._tiles(self.client.get('/').get_data(as_text=True)))
-        value, sub = tiles['Errors, last hour']
+        value, sub = tiles['Errors, 60 min']
         self.assertNotEqual(value, '0')
         self.assertIn('no readable log', sub)
 
@@ -720,7 +720,7 @@ class RowHealthEdgeAndSortTests(unittest.TestCase):
             self.assertNotIn(marker, html, f'{marker} belongs to /accounts, not the dashboard')
 
     def test_the_signal_line_omits_the_configuration_counts(self):
-        """The trim is the point (dev/changelog/1063). "In a group", "Recording on",
+        """The trim is the point (dev/changelog/1063). "In your groups", "Recording in groups",
         "Guide rows" and "With EPG" describe how an account is set up, not whether it needs
         attention, and stay on /accounts - otherwise this is the whole section again."""
         with self.t.app.app_context():
@@ -728,7 +728,7 @@ class RowHealthEdgeAndSortTests(unittest.TestCase):
             db.session.commit()
             acct_id = acc.id
         row = self._account_row(self.client.get('/').get_data(as_text=True), acct_id)
-        for label in ('In a group', 'Recording on', 'Guide rows', 'With EPG'):
+        for label in ('In your groups', 'Recording in groups', 'Guide rows', 'With EPG'):
             self.assertNotIn(label, row, f'{label} is /accounts detail, not a dashboard signal')
 
     def test_an_account_with_auto_sync_off_says_so_under_next_sync(self):

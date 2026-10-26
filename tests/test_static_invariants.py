@@ -2820,6 +2820,7 @@ _EXEMPT_COMMIT_SITES = frozenset({
     ('app/__init__.py', '_ensure_system_health_job'),
     ('app/__init__.py', '_announce_guide_check_retarget'),
     ('app/__init__.py', '_seed_default_tags'),
+    ('app/__init__.py', '_seed_default_hide_rules'),
     ('app/migrations.py', '_backfill_url_normalization'),
     ('app/migrations.py', '_backfill_duplicate_flags'),
     ('app/migrations.py', '_backfill_health_scores'),
@@ -3799,7 +3800,8 @@ _DOTTED_TOKEN_RE = re.compile(r'`([a-z_][a-z_0-9]*(?:\.[a-z_0-9]+)+)`')
 
 # The docs that ship to the public repo and are therefore read by someone who has none of the
 # dev tree. README.md is the one most likely to accrete a pointer into it.
-_SHIPPED_DOCS = ('README.md', 'CONTRIBUTING.md', 'docs/CONVENTIONS.md', 'sim/README.md')
+_SHIPPED_DOCS = ('README.md', 'CONTRIBUTING.md', 'docs/CONVENTIONS.md', 'docs/QUICK-START.md',
+                 'docs/USER-GUIDE.md', 'sim/README.md')
 
 
 class ShippedDocPointerTests(unittest.TestCase):

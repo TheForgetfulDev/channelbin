@@ -127,7 +127,7 @@ class NotificationsPageConformanceTests(unittest.TestCase):
         import os
         js = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                                'static', 'js', 'notifications.js'), encoding='utf-8').read()
-        self.assertIn('Show in the Alert Center', js)
+        self.assertIn('Show on the Alerts page', js)
         self.assertIn('>Push to<', js)
         html = self._html()
         self.assertIn('.rt-cl { display: none;', html)

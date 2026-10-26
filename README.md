@@ -38,6 +38,8 @@ It's actually been really fun using the search and surfacing channels that I did
   - [GPU conversion (optional)](#gpu-conversion-optional)
   - [Running it directly](#running-it-directly)
 - [First run](#first-run)
+  - [Quick start guide](docs/QUICK-START.md)
+  - [User guide](docs/USER-GUIDE.md)
 - [Configuration](#configuration)
 - [Network binding and exposure](#network-binding-and-exposure)
 - [Output files](#output-files)
@@ -85,7 +87,7 @@ and hands them to whatever you already use to watch them.
 - Recording profiles, so a set of capture and post-processing choices can be applied by name.
 - Optional retention sweep for old recordings.
 
-<img src="docs/screenshots/03-recording-segments.png" alt="Recording detail page, the Segments card. Segment rows with per-segment size and duration plus the header count, so the many-segments-one-file model is visible without prose.">
+<img src="docs/screenshots/recording-what-happened.png" alt="A finished recording whose stream kept dropping. What happened says in plain words that the file holds 12m 30s of video, that the stream stopped delivering video 14 times and a retry got it back, that 6m 17s of the window had nothing capturing, and that ChannelBin could not reach the server but cannot tell whose fault that was. Below it, a frame from the recording, a timeline of when it was capturing, and the file's format, restarts, downtime and capture gaps.">
 
 **Knowing what happened**
 
@@ -99,7 +101,7 @@ and hands them to whatever you already use to watch them.
 - Alerts, with optional push delivery to Discord, Pushover, Home Assistant, email, or WhatsApp
   via Apprise service URLs, rate limited so one bad night does not become forty notifications.
 
-<img src="docs/screenshots/06-live-dashboard.png" alt="Live Dashboard, the app's landing page at /: an in-progress recording showing the live tiles - elapsed, remaining, bytes, stall count.">
+<img src="docs/screenshots/dashboard-live.png" alt="The Live Dashboard with two recordings in progress: tiles for what is capturing now, the next recording, free disk space, errors and stalls in the last hour and account syncs, a timeline of recordings and jobs around now, and each running recording's elapsed and remaining time and size.">
 
 **Channels and health**
 
@@ -118,7 +120,7 @@ and hands them to whatever you already use to watch them.
 - Per-account connection limits, so ChannelBin never opens more simultaneous streams to a
   provider than the account actually allows.
 
-<img src="docs/screenshots/04-group-health-check.png" alt="Group detail page for ten messy duplicate-named feeds of one channel, paired with a health check. This run caught every member genuinely dead at the source (the provider's CDN cluster serving nothing but 404s) and reported it plainly rather than staying silent.">
+<img src="docs/screenshots/channel-group.png" alt="A channel group holding three copies of Red Bull TV from two accounts, each turned on for recording and for the group's health check, with its last test result, score, picture format, bitrate and a screenshot. The best-scoring copy is starred; a recording starts there and fails over to the next.">
 
 **Guide and search**
 
@@ -129,7 +131,9 @@ and hands them to whatever you already use to watch them.
 - An EPG browser for finding a program across every channel that carries it.
 - Tags for organizing channels your own way.
 
-<img src="docs/screenshots/05-channel-search.png" alt="Browse page (channel search). Mid-search with a query typed, the filter chips visible, and the total-match count on screen - a large count is the point of the shot.">
+<img src="docs/screenshots/tv-guide.png" alt="The TV Guide: a grid of channels down the side and programs across the next few hours, each channel with its health score, and recordings marked on the programs they belong to.">
+
+<img src="docs/screenshots/channel-search.png" alt="Channel Search with &quot;sports&quot; typed in: 7 matching channels out of 1,478, what each is airing now and which account it is on, with filters down the side for tag, account, health band and channel group, each showing how many of the results it would keep.">
 
 **Accounts and operations**
 
@@ -144,7 +148,7 @@ and hands them to whatever you already use to watch them.
 - Optional password gate for the whole app.
 - A read-only Home Assistant integration.
 
-<img src="docs/screenshots/07-mobile-guide.png" alt="Mobile, 375px wide, app only. The TV Guide at phone width." width="375">
+<img src="docs/screenshots/phone-tv-guide.png" alt="The TV Guide on a phone, 375 pixels wide: the menu folds into a button, channels run down the left with their logos and a dot for their health, and programs scroll sideways from now." width="300">
 
 ---
 
@@ -303,17 +307,19 @@ default.
 
 ## First run
 
-1. **Add an account** under Accounts: an Xtream login, or an M3U playlist URL plus an XMLTV EPG
-   URL. Save it and run a sync. The first sync of a large provider takes a while and reports what
-   it imported.
-2. **Look at the guide.** Programs come from the EPG your account supplied. If the guide is empty
-   or misaligned, that is a signal about the EPG feed, not about ChannelBin.
-3. **Group your duplicate feeds** for the channels you care about most, under Groups. This is the
-   single highest-value setup step: it is what lets a recording pick the best feed at start time
-   and fail over mid-recording.
-4. **Run health checks** on those groups so the scores mean something before you rely on them.
-5. **Schedule a recording** from the guide, or from Recordings for a manual one, and watch it on
-   the Live Dashboard.
+A new install opens on the Dashboard with a **Get started** banner that walks you through four
+steps: add your IPTV account, confirm the machine can record, put the channels you watch in the
+TV Guide, and record something. No IPTV provider yet? Get started can load free example
+channels so you can try it first.
+
+- **[Quick start](docs/QUICK-START.md)** - those four steps in detail, from a new install to a
+  recording on disk.
+- **[User guide](docs/USER-GUIDE.md)** - what comes next: reading a recording's page, health
+  checks, channel groups and failover, auto-record rules, conversion and notifications.
+
+Once you have the basics, grouping the duplicate feeds of the channels you care about most is
+the single most useful thing to set up: it is what lets a recording start on the best feed and
+fail over to another one mid-recording.
 
 ## Configuration
 
@@ -441,7 +447,7 @@ the whole procedure - there is no restore command or wizard.
 **Why there is no export/import feature:** a sanitized export cannot be re-imported (the secrets
 are what make it work) and an importable export cannot be sanitized, so one feature cannot serve
 both purposes. This file-set copy *is* the backup and restore story. The Support Bundle
-(Settings > Backup & Restore) is the separate, sanitized-for-sharing diagnostic story - it is for
+(Maintenance > Support bundle) is the separate, sanitized-for-sharing diagnostic story - it is for
 getting troubleshooting data to someone else, not for restoring your own install.
 
 ### Automatic backups

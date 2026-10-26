@@ -104,7 +104,7 @@
       {% else %}
       Channels and guide data come from {{ "the provider's Xtream API" if is_xtream else 'an M3U playlist' }},
       {% if account.sync_enabled %}refreshed automatically every {{ settings.interval_hours }} hours{% else %}refreshed only when you ask for it, because automatic sync is off{% endif %}.
-      It currently supplies <strong>{{ '{:,}'.format(account.channel_count or 0) }}</strong> channels{% if account.hidden_channel_count %} (<strong>{{ '{:,}'.format(account.hidden_channel_count) }}</strong> hidden){% endif %},
+      It currently supplies <strong>{{ '{:,}'.format(account.channel_count or 0) }}</strong> channels{% if account.hidden_channel_count %} (<strong>{{ m.hidden_channels_link(account.hidden_channel_count) }}</strong>){% endif %},
       <strong>{{ '{:,}'.format(cur.guide_channels) }}</strong> of them in your TV Guide, and
       <strong>{{ '{:,}'.format(account.epg_entry_count or 0) }}</strong> program entries.
       {% endif %}
@@ -120,6 +120,21 @@
      before the line telling you when it last ran. Each says what it MEANS, not just that
      it happened (DESIGN.md §17.3). ────────────────────────────────────────── #}
 <div id="acct-notices">
+{# The account "Try it with example channels" added (app/examples.py, dev/changelog/1281):
+   said first, so nobody mistakes it for their own provider, with its way out beside it. #}
+{% if account.is_example %}
+<div class="notice notice-info" id="acct-example">
+  <strong>This is the example account</strong><br>
+  Get started added it so ChannelBin can be tried before adding your own IPTV provider. It reads the free
+  channels on <a href="https://m3upt.com/" target="_blank" rel="noopener">M3UPT</a>, a public
+  list of channels the broadcasters themselves stream online. Delete the examples takes out this
+  account, everything on its channels and the example channel group, including an example
+  channel you put in the guide or tested yourself. Your recordings stay. If M3UPT is all you
+  want, Keep the examples makes this an ordinary account instead.
+  <div class="acct-block-line"><button type="button" class="btn btn-sm" data-examples-keep>Keep the examples</button>
+    <button type="button" class="btn btn-sm btn-danger" data-examples-remove>Delete the examples</button></div>
+</div>
+{% endif %}
 {% if st == ACCOUNT_STATUS.ERROR and account.last_error %}
 <div class="notice notice-bad">
   <strong>&#9888; The last sync failed</strong><br>
@@ -189,7 +204,8 @@
   <span class="gd-ab-msg">
     {% if st == ACCOUNT_STATUS.SYNCING %}
       Syncing now{% if log_rows and log_rows[0].started_at %}, started {{ log_rows[0].started_at | time_ago }}{% endif %}.
-      Counts below are from the previous run until it finishes.
+      The channel count below updates once the channel list is in; the program count waits
+      for the sync to finish.
     {% elif st == ACCOUNT_STATUS.ERROR %}
       The last sync failed {{ account.last_sync_at | time_ago if account.last_sync_at else 'at an unrecorded time' }}.
       {% if account.sync_enabled %}The next automatic attempt is {{ next_sync_at | time_until if next_sync_at else 'not scheduled' }}.{% else %}Automatic sync is off, so there is no next attempt.{% endif %}
@@ -197,7 +213,7 @@
       Never synced. Nothing has been imported from this account yet.
     {% elif st == ACCOUNT_STATUS.OK %}
       Synced {{ account.last_sync_at | time_ago if account.last_sync_at else 'at an unrecorded time' }},
-      {{ '{:,}'.format(account.channel_count or 0) }} channels{% if account.hidden_channel_count %} ({{ '{:,}'.format(account.hidden_channel_count) }} hidden){% endif %} and
+      {{ '{:,}'.format(account.channel_count or 0) }} channels{% if account.hidden_channel_count %} ({{ m.hidden_channels_link(account.hidden_channel_count) }}){% endif %} and
       {{ '{:,}'.format(account.epg_entry_count or 0) }} program entries.
       {% if account.sync_enabled %}Next sync {{ next_sync_at | time_until if next_sync_at else 'not scheduled' }}.{% else %}Automatic sync is off.{% endif %}
     {% else %}
@@ -226,7 +242,11 @@
                 data-tip="Sync from dump.&#10;Runs a sync against the dumped files instead of the live API. Debug mode only.">Sync from dump</button>
         {% endif %}
         <div class="sep"></div>
+        {% if account.is_example %}
+        <button class="menu-item danger" data-act="examples-remove">Delete the examples</button>
+        {% else %}
         <button class="menu-item danger" data-act="delete">Delete account</button>
+        {% endif %}
       </div>
     </span>
   </div>
@@ -274,10 +294,14 @@
         {{ m.stat_row('Expires',
                       account.provider_exp_date | local_date if account.provider_exp_date else 'not reported',
                       none if account.provider_exp_date else 'faint') }}
+        {# Amber only when ChannelBin may open MORE than the provider allows - that is the
+           case where a connection can be refused or end another stream. Using fewer than
+           the plan allows is safe, and says so in plain words (dev/changelog/1272). #}
         {% set pmax = account.provider_max_connections %}
-        {% set pmax_mismatch = pmax is not none and pmax != settings.max_connections %}
+        {% set pmax_over = pmax is not none and settings.max_connections > pmax %}
+        {% set pmax_under = pmax is not none and settings.max_connections < pmax %}
         <div class="srow"><span class="sk">Provider max connections</span>
-          <span class="sv{% if pmax is none %} faint{% elif pmax_mismatch %} warn{% else %} faint{% endif %} tip-plain" data-tip="Provider max connections.&#10;The simultaneous-connection cap this provider reports for the account - separate from the Max connections setting above, which is what ChannelBin itself enforces.{% if pmax_mismatch %} These disagree.{% endif %}">{{ pmax if pmax is not none else 'not reported' }}{% if pmax_mismatch %} <span class="text-faint">(configured: {{ settings.max_connections }})</span>{% endif %}</span></div>
+          <span class="sv{% if pmax_over %} warn{% else %} faint{% endif %} tip-plain" data-tip="Provider max connections.&#10;The simultaneous-connection cap this provider reports for the account - separate from the Max connections setting above, which is what ChannelBin itself enforces.{% if pmax_over %}&#10;&#10;ChannelBin may open {{ settings.max_connections }} at once, more than the {{ pmax }} the provider allows, so a recording or check can be refused or cut another stream off. Lower Max connections to {{ pmax }} in Edit settings.{% elif pmax_under %}&#10;&#10;ChannelBin opens at most {{ settings.max_connections }} at once, fewer than the provider allows. That is safe. To use all {{ pmax }}, raise Max connections in Edit settings.{% endif %}">{{ pmax if pmax is not none else 'not reported' }}{% if pmax_over %} <span class="text-faint">(ChannelBin may open {{ settings.max_connections }})</span>{% elif pmax_under %} <span class="text-faint">(ChannelBin uses {{ settings.max_connections }})</span>{% endif %}</span></div>
         {{ m.stat_row('Active connections (last sync)',
                       account.provider_active_connections if account.provider_active_connections is not none else 'not reported',
                       'faint',
@@ -286,19 +310,24 @@
                       account.provider_allowed_output_formats.replace(',', ', ') if account.provider_allowed_output_formats else 'not reported',
                       'faint',
                       tip='Allowed output formats.&#10;What the provider says it supports. Informational only - ChannelBin does not use this to decide how stream URLs are built.') }}
-        {{ m.stat_row('Declared stream origin',
-                      account.provider_stream_origin or 'not reported',
-                      'faint',
-                      tip='Declared stream origin.&#10;Where the provider says its streams are served, from its own auth response. This is NOT the Server address below, which is the API endpoint the channel list and EPG are fetched from.') }}
         {% endif %}
         {{ m.stat_row('Last sync', account.last_sync_at | local_time if account.last_sync_at else 'never', 'faint') }}
         {{ m.stat_row('Next sync',
                       (next_sync_at | time_until if next_sync_at else 'not scheduled') if account.sync_enabled else 'off',
                       none if account.sync_enabled else 'faint') }}
         {# The endpoint is wide, and it is MASKED: an account's own URL is secret in full,
-           because for a path-token provider the path IS the credential (§17.4). #}
+           because for a path-token provider the path IS the credential (§17.4).
+
+           The stream origin sits right under it, labeled by what it is for and saying out
+           loud when it is another host: two hosts side by side read as a fault until the
+           page said that is normal. They are never merged (CLAUDE.md, the API endpoint and
+           the stream endpoint are two different things; dev/changelog/1272). #}
         <div class="srow wide"><span class="sk">{{ 'Server' if is_xtream else 'Playlist' }}</span>
-          <span class="sv endpoint tip-plain" data-tip="The address ChannelBin fetches this account's data from. Shown masked: an account URL is secret in full, because some providers put the credential in the path itself.&#10;&#10;This is NOT where the streams come from. The provider declares its stream origin separately and it is frequently a different host.">{{ endpoint or 'not set' }}</span></div>
+          <span class="sv endpoint tip-plain" data-tip="The address ChannelBin fetches this account's channel list and guide from. Shown masked: an account URL is secret in full, because some providers put the credential in the path itself.&#10;&#10;This is NOT where the streams come from. The provider names its stream server separately{% if is_xtream %} (Streams served from, below){% endif %}, and it is often a different host - that is normal.">{{ endpoint or 'not set' }}</span></div>
+        {% if is_xtream %}
+        <div class="srow wide"><span class="sk">Streams served from</span>
+          <span class="sv faint tip-plain" data-tip="Streams served from.&#10;Where the provider says its streams are served, from its own auth response (its declared stream origin). Providers often keep the channel list and the streams on separate servers, so a different host from the Server above is normal.">{{ account.provider_stream_origin or 'not reported' }}{% if stream_host_differs %}<span class="sv-note">A different host from the server, which is normal: the channel list and the streams come from separate servers.</span>{% endif %}</span></div>
+        {% endif %}
         {% if account.username %}
         <div class="srow wide"><span class="sk">Username</span><span class="sv endpoint">{{ account.username }}</span></div>
         {% endif %}
@@ -451,29 +480,29 @@
     <div class="card-body" id="acct-content-body">
       <div class="statlist">
         <div class="srow"><span class="sk">Channels</span><span class="sv">
-          {% if account.channel_count %}<a class="sv-link" href="{{ url_for('channels.channel_browser', **{'f.acct': account.id}) }}">{{ '{:,}'.format(account.channel_count) }}</a>{% else %}<span class="text-faint">0</span>{% endif %}{% if account.hidden_channel_count %} <span class="text-faint">({{ '{:,}'.format(account.hidden_channel_count) }} hidden)</span>{% endif %}</span></div>
+          {% if account.channel_count %}<a class="sv-link" href="{{ url_for('channels.channel_browser', **{'f.acct': account.id}) }}">{{ '{:,}'.format(account.channel_count) }}</a>{% else %}<span class="text-faint">0</span>{% endif %}{% if account.hidden_channel_count %} <span class="text-faint">({{ m.hidden_channels_link(account.hidden_channel_count) }})</span>{% endif %}</span></div>
         <div class="srow"><span class="sk">In the TV Guide</span><span class="sv">
           {% if cur.guide_channels %}<a class="sv-link" href="{{ url_for('channels.channel_browser', **{'f.acct': account.id, 'f.other': 'guide'}) }}">{{ '{:,}'.format(cur.guide_channels) }}</a>{% else %}<span class="text-faint">0</span>{% endif %}</span></div>
-        <div class="srow"><span class="sk">Program entries</span><span class="sv">
+        <div class="srow"><span class="sk tip-plain" data-tip="Program entries.&#10;Every listing in this account's guide data: one per showing, across all its channels and every day the provider sends, the ones that already aired included. Search Programs counts only the showings still to come.">Program entries</span><span class="sv">
           {% if account.epg_entry_count %}{{ '{:,}'.format(account.epg_entry_count) }}{% else %}<span class="text-faint">0</span>{% endif %}</span></div>
-        {{ m.stat_row('Channels with EPG match',
+        {{ m.stat_row('Channels with listings',
                       '{:,}'.format(cur.epg.with_epg),
                       'ok' if cur.epg.with_epg else 'faint',
-                      tip='Channels with EPG match.&#10;Channels with an EPG id set that currently has a program showing in the next 24h.') }}
-        {{ m.stat_row('EPG id set, no match',
+                      tip='Channels with listings.&#10;Channels whose guide has something on in the next 24 hours, so the TV Guide can show what is on.') }}
+        {{ m.stat_row('Listings not found',
                       '{:,}'.format(cur.epg.no_match),
                       'warn' if cur.epg.no_match else 'faint',
-                      tip='EPG id set, no match.&#10;Channels with an EPG id set, but no program data currently matches it - likely a naming mismatch with the provider guide, or a guide the account does not carry.') }}
-        {{ m.stat_row('No EPG id',
+                      tip='Listings not found.&#10;The provider names a guide id for these channels (the EPG id that ties a channel to its listings), but the guide data has nothing under that id in the next 24 hours. Usually the guide spells the channel differently, or does not carry it.') }}
+        {{ m.stat_row('No guide id',
                       '{:,}'.format(cur.epg.no_id),
                       'faint',
-                      tip='No EPG id.&#10;Channels with no EPG id at all, so no guide data can be matched to them.') }}
+                      tip='No guide id.&#10;The provider gives these channels no guide id (EPG id), so no listings can be matched to them.') }}
         {# What the account is right now - the list row's second line, here in full (DESIGN.md
            §17.7). Failing right now is not a link: it counts losing streaks as well as the
            failing band, and no channel-search filter finds exactly that set. #}
-        <div class="srow"><span class="sk">In a channel group</span><span class="sv tip-plain" data-tip="{{ stats.tips.in_group }}">
+        <div class="srow"><span class="sk">In your groups</span><span class="sv tip-plain" data-tip="{{ stats.tips.in_group }}">
           {% if cur.in_group %}<a class="sv-link" href="{{ url_for('channels.channel_browser', **{'f.acct': account.id, 'f.group': group_any}) }}">{{ '{:,}'.format(cur.in_group) }}</a>{% else %}<span class="text-faint">0</span>{% endif %}</span></div>
-        <div class="srow"><span class="sk">Recording on</span><span class="sv tip-plain" data-tip="{{ stats.tips.rec_enabled }}">{{ acst.num(cur.recording_memberships) }}</span></div>
+        <div class="srow"><span class="sk">Recording in groups</span><span class="sv tip-plain" data-tip="{{ stats.tips.rec_enabled }}">{{ acst.num(cur.recording_memberships) }}</span></div>
         <div class="srow"><span class="sk">Guide rows it can feed</span><span class="sv tip-plain" data-tip="{{ stats.rows_tip }}">{{ acst.num(cur.guide_rows_fed) }} <span class="text-faint">of {{ '{:,}'.format(cur.guide_rows_total) }}</span></span></div>
         <div class="srow"><span class="sk">Average health score</span><span class="sv tip-plain" data-tip="{{ stats.tips.avg }}">
           {%- if cur.avg_score is none %}<span class="text-faint">-</span>{% else %}<span class="{{ cur.avg_score | health_css(health_bands) }} hb-text">{{ cur.avg_score | round | int }}</span>{% endif -%}
@@ -719,6 +748,7 @@ window.ACCOUNT_DETAIL = {
   xtreamDebug: {{ 'true' if xtream_debug else 'false' }},
   browseUrl: {{ url_for('channels.channel_browser', **{'f.acct': account.id}) | tojson }},
   accountsUrl: {{ url_for('accounts.accounts_list') | tojson }},
+  isExample: {{ 'true' if account.is_example else 'false' }},
   sourceHours: {{ source_hours_choices | list | tojson }},
   maxConnections: {{ settings.max_connections }},
   blockMaxHours: {{ block_max_hours }},
@@ -728,4 +758,5 @@ window.ACCOUNT_DETAIL = {
 <script src="{{ url_for('static', filename='js/account-actions.js') }}"></script>
 <script src="{{ url_for('static', filename='js/account-detail.js') }}"></script>
 <script src="{{ url_for('static', filename='js/account-stats.js') }}"></script>
+{% if account.is_example %}<script src="{{ url_for('static', filename='js/examples.js') }}"></script>{% endif %}
 {% endblock %}

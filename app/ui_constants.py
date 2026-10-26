@@ -6,14 +6,16 @@
 # the JS carrying a copy. It is the first preset swatch.
 DEFAULT_COLOR = '#58a6ff'
 
-# (hex, label) preset swatches for the account and tag color pickers.
+# (hex, label) preset swatches for the account and tag color pickers. Each one is a color
+# its label names and no two read alike: Teal was a second green and Orange a pink until
+# dev/changelog/1291.
 PRESET_COLORS = [
     (DEFAULT_COLOR, 'Blue'),
     ('#3fb950', 'Green'),
     ('#f85149', 'Red'),
     ('#d29922', 'Yellow'),
     ('#bc8cff', 'Purple'),
-    ('#ff7b72', 'Orange'),
-    ('#39d353', 'Teal'),
-    ('#e8b4fb', 'Pink'),
+    ('#f0803c', 'Orange'),
+    ('#2bb3a6', 'Teal'),
+    ('#f778ba', 'Pink'),
 ]

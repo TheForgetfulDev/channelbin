@@ -67,8 +67,8 @@
       label: 'Channels', tab: 'Channels', noun: 'channel', pinLabel: 'Channel', pinSort: 'name',
       what: 'One row per CHANNEL. Answers "which of my channels carry this".\n\n'
           + 'Matching on a guide field here means "this channel is airing something that '
-          + 'matches RIGHT NOW" - the program in the Now airing column. Switch to Guide (EPG) '
-          + 'to search everything that is on later.',
+          + 'matches RIGHT NOW" - the program in the Now airing column. Switch to Search Programs '
+          + '(EPG) to search everything that is on later.',
     },
     [GRAIN_AIRINGS]: {
       label: 'Airings', tab: 'Guide (EPG)', noun: 'airing', pinLabel: 'Program', pinSort: 'title',
@@ -248,8 +248,10 @@
   let CAT = null;                            // the catalog, once fetched
   // `channelsMatched: null` is stated rather than left undefined: null is this number's
   // "not in yet", and the count line branches on exactly that.
+  // `q` is the text the rows answer, so a number drawn beside the box's text can tell
+  // whether it is about that text at all (dev/changelog/1290).
   const emptyResult = () => ({ rows: [], total: 0, pages: 1, standingHidden: {},
-                               channelsMatched: null, degraded: '' });
+                               channelsMatched: null, degraded: '', q: null });
   let last = emptyResult();
   /* Is what is on screen an honest answer to the question currently being asked?
      True from boot (nothing has been fetched yet), true again whenever the rows in
@@ -727,6 +729,7 @@
     // (DESIGN-channel-search.md §10), so it stays bundled rather than paying a second
     // round trip for no benefit.
     const skipCounts = isAirings();
+    const askedQ = state.q;
     jsonFetch(`${CFG.searchUrl}?${toParams({ facets: null, counts: !skipCounts, seq }).toString()}`,
               { signal: ctl.signal })
       .then((data) => {
@@ -743,6 +746,7 @@
              which the rows on screen already disprove. */
           channelsMatched: typeof data.channels_matched === 'number' ? data.channels_matched : null,
           standingHidden: data.standing_hidden, degraded: data.degraded || '',
+          q: askedQ,
         };
         /* The server declines the counts itself while the index is unusable, whatever this
            request asked for - the rows are what it is protecting. Believe its answer rather
@@ -1801,8 +1805,22 @@
     scheduled: { cls: 'b-auto', label: 'Scheduled', tip: 'A recording is already scheduled for this showing.' },
     recorded: { cls: 'b-done', label: 'Recorded', tip: 'This showing has been recorded.' },
   };
+  /* A finished recording that is not the whole showing - the server's sentence says why
+     (app/recording_story.py::partial_note), the same mark the TV Guide draws. */
   const recBadge = (row) => {
-    const b = REC_BADGE[row.record_state];
+    const partial = row.record_state === 'recorded' && row.recording && row.recording.partial;
+    /* The user's own Stop as the whole reason: said, without the amber mark
+       (app/recording_story.py::stopped_early_note, dev/changelog/1287). */
+    const stopped = row.record_state === 'recorded' && row.recording && row.recording.stopped;
+    let b = REC_BADGE[row.record_state];
+    if (partial) {
+      b = { cls: 'b-warn', label: 'Partial',
+            tip: `Recorded, but not the whole showing: ${row.recording.partial}\nOpen the recording to see what happened.` };
+    } else if (stopped) {
+      // .b-abort is the app's neutral grey pill.
+      b = { cls: 'b-abort', label: 'Stopped early',
+            tip: `${row.recording.stopped} The file holds what was recorded up to then.` };
+    }
     return b ? `<span class="badge ${b.cls}" data-tip="${tipAttr(b.tip)}">${esc(b.label)}</span>` : '';
   };
 
@@ -2087,7 +2105,7 @@
         ? `<p>The search could not be run.</p><div class="es-hint">${esc(loadFailed)}</div>`
         : `<p>No ${esc(grainUi().noun)}s match this search.</p><div class="es-hint">${
         state.q ? `Searching ${esc(scope)}. Widen it in ${isMobile()
-          ? '<u id="es-scope">Searching in</u>.'
+          ? '<u id="es-scope">Search in</u>.'
           : '<b>Search in</b> - click into the search box.'}`
                 : 'No search text - your filters exclude everything.'}${
         standingHiddenTotal() ? ` &middot; ${nf(standingHiddenTotal())} hidden by your standing options` : ''}</div>`;
@@ -2261,6 +2279,9 @@
       ? (short ? `Remove (${nf(n)})` : `Remove selected from guide (${nf(n)})`)
       : (short ? `+ Guide (${nf(n)})` : `+ Add selected to guide (${nf(n)})`);
     $('#sel-add').disabled = mode === 'mixed';
+    // The bar's lead action only while it adds and nothing else leads: the group errand's
+    // own "+ Add Channels" is what that bar is for (dev/changelog/1290).
+    $('#sel-add').classList.toggle('btn-primary', mode === 'add' && state.addToGroup === null);
     $('#sel-guide-note').textContent = mode === 'mixed'
       ? `${nf(inGuide)} of the ${nf(n)} selected channels already have their own guide row.`
         + ' Select channels that are all in, or all out, of your guide.'
@@ -2452,6 +2473,25 @@
     Object.values(last.standingHidden || {}).reduce((a, b) => a + b, 0);
   const fieldLabels = () =>
     (CAT ? CAT.fields.filter((f) => state.fields.includes(f.key)).map((f) => f.label) : []);
+  // The scope in a few words, for the phone chip: the field when there is one, the count when
+  // there are several - "Searching in 1" left a first-time user asking one what.
+  const scopeSummary = () => {
+    const labels = fieldLabels();
+    return labels.length === 1 ? labels[0] : `${labels.length} fields`;
+  };
+  // A label read mid-sentence: "Channel name" becomes "channel name", "EPG id" stays.
+  const midSentence = (label) => (/^[A-Z][a-z]/.test(label)
+    ? label[0].toLowerCase() + label.slice(1) : label);
+  /* The box's placeholder says what typing will match, from the same scope the results line
+     and the chip name. A fixed "Search channels and what is on them" described a scope the
+     channel grain's default does not have (dev/changelog/1276). */
+  function renderPlaceholder() {
+    const labels = fieldLabels().map(midSentence);
+    if (!labels.length) return;
+    $('#cs-q').placeholder = labels.length === 1 ? `Search by ${labels[0]}`
+      : labels.length === 2 ? `Search by ${labels[0]} or ${labels[1]}`
+        : `Search ${labels.length} fields`;
+  }
 
   /* The trailing "Reason: ..." line both decline surfaces carry, spelled once. The server's
      own sentence wins; `last.degraded` is the fallback for a response predating
@@ -2461,6 +2501,13 @@
     const why = declinedWhy || last.degraded || '';
     return why ? `\n\nReason: ${why}` : '';
   };
+
+  /* What one airing is, beside the number that counts them: the account's program count,
+     the search index's and this one all differ, and each page now says what it counts
+     (dev/changelog/1292). */
+  const AIRINGS_NOUN_TIP = 'An airing is one showing: a program on three times is three '
+    + 'airings.\nShowings that have ended are left out unless "Show airings that have ended" '
+    + 'is on.';
 
   function renderCount() {
     const total = last.total;
@@ -2527,7 +2574,8 @@
          no single noun covers both. */
       : (total
         ? `Showing <strong>${nf(from)}-${nf(to)}</strong> of <strong>${nf(total)}</strong> `
-          + (airings ? `airing${total === 1 ? '' : 's'}` : `match${total === 1 ? '' : 'es'}`)
+          + (airings ? `<span class="tip" data-tip="${tipAttr(AIRINGS_NOUN_TIP)}">airing${
+            total === 1 ? '' : 's'}</span>` : `match${total === 1 ? '' : 'es'}`)
           + onChannels
         : '<strong>No</strong> matches'));
     // Skipped when the phrase above already carries it as its denominator, so the line never
@@ -2604,7 +2652,7 @@
       // sheet, and pointing at a box that no longer holds the control would be a dead end.
       parts.push(`<span class="sep">&middot;</span> <span class="scope-say" id="cs-scope" data-tip="${tipAttr(
         `Searching ${fieldLabels().join(', ')}.\n\n${isMobile()
-          ? 'Tap to open Searching in.'
+          ? 'Tap to open Search in.'
           : 'Click to put the caret back in the search box, where Search in lives.'}`)}">searching ${esc(fieldLabels().join(', '))}</span>`);
     }
     // A degraded search is correct but slower. Reported, never merely logged.
@@ -2726,7 +2774,7 @@
     jsonFetch(`${CFG.addGuideUrlBase}${id}/add`, { method: 'POST' })
       .then((data) => {
         if (!data.duplicate_warning) {
-          showToast(`"${data.channel_name || 'Channel'}" added to your guide.`);
+          showToast(`"${data.channel_name || 'Channel'}" added to your guide.${data.note ? ` ${data.note}` : ''}`);
           applyNow(false);
           return;
         }
@@ -2740,7 +2788,10 @@
         }).then((ok) => {
           if (!ok) return null;
           return jsonFetch(`${CFG.addGuideUrlBase}${id}/add?force=1`, { method: 'POST' })
-            .then(() => { showToast(`"${data.channel_name}" added to your guide.`); applyNow(false); });
+            .then((forced) => {
+              showToast(`"${data.channel_name}" added to your guide.${forced.note ? ` ${forced.note}` : ''}`);
+              applyNow(false);
+            });
         });
       })
       .catch((e) => showToast(e.message || 'Could not add that channel.', { type: 'error' }));
@@ -2903,10 +2954,9 @@
       ${row.dup ? `<div class="prow drill" data-act="dup-badge" data-id="${row.id}">
         <span class="pico">&#9282;</span>
         <span class="pv">${nf(row.dup.count)} channels ${esc(dupKeyClause(row.dup))}</span></div>` : ''}
-      <div class="sh-note">Selecting from in here and ticking the card's checkbox write the same
-        selection, so a one-channel action and a fifty-channel action are one path rather than
-        two.${isAirings() ? ' <b>Selecting a showing also selects its channel</b> for the channel '
-        + 'actions - several showings on one channel are one channel there.' : ''}</div>`;
+      <div class="sh-note">Select adds this ${thing} to the ones you have ticked, and the bar at
+        the bottom acts on all of them at once.${isAirings() ? ' <b>Selecting a showing also '
+        + 'selects its channel</b>, for the actions that work on channels.' : ''}</div>`;
   }
 
   function openRowSheet(id, airId = null) {
@@ -3689,7 +3739,7 @@
       ? `<button class="fac-more" data-more="${dim.key}">${all ? 'Show less' : `Show all ${nf(scored.length)}`}</button>` : '';
     const box = hasBox
       ? findBoxHtml('rsearch', railQ[dim.key] || '', `Find in ${dim.label.toLowerCase()}...`, dim.key) : '';
-    const what = dim.help ? ` <span class="fwhat" data-tip="${tipAttr(dim.help)}">&#9432;</span>` : '';
+    const what = dim.help ? ` <span class="fwhat" data-tip="${tipAttr(dim.help)}">i</span>` : '';
     // The create button is inside the header's own click target, so its branch
     // has to be tested BEFORE the header's, or creating would just collapse the
     // facet. It is deliberately reachable with the facet collapsed.
@@ -4401,11 +4451,11 @@
        them here BECAUSE its toolbar is hidden below the breakpoint, and the well is on
        screen at both. Carrying them again is two live copies of one control - which is
        exactly what a first port of this row shipped, a visible duplicate Clear all
-       (DESIGN-group-search-rows.md §5.4). The row is Searching in, Sort and Saved
+       (DESIGN-group-search-rows.md §5.4). The row is Search in, Sort and Saved
        searches; the well's own + Filter opens the Filters sheet. */
     bits.push(`<button class="mchip${scopeIsDefault() ? '' : ' on'}" data-mchip="scope"
       data-tip="${tipAttr(`Searching ${fieldLabels().join(', ')}.\n${SCOPE_WHY}`)}"
-      >Searching in<span class="mn">${state.fields.length}</span></button>`);
+      >Search in: ${esc(scopeSummary())}</button>`);
     bits.push(`<button class="mchip${sortIsDefault() ? '' : ' on'}" data-mchip="sort"
       data-tip="Sort the list. There are no column headers at this width, so this is where sorting lives."
       >Sort: ${esc(sortLabel(state.sort))} ${state.sortDesc ? '&#9660;' : '&#9650;'}</button>`);
@@ -4456,7 +4506,7 @@
     return (CAT.field_groups || []).map((g) => {
       const fields = CAT.fields.filter((f) => f.group === g.name);
       if (!fields.length) return '';
-      const what = g.help ? ` <span class="fwhat" data-tip="${tipAttr(g.help)}">&#9432;</span>` : '';
+      const what = g.help ? ` <span class="fwhat" data-tip="${tipAttr(g.help)}">i</span>` : '';
       // Derived from the group's own fields rather than declared, so a group that gains or
       // loses examples cannot end up with a column title over an empty column.
       const ex = fields.some((f) => f.hint) ? '<span class="fex">Example</span>' : '';
@@ -4484,8 +4534,8 @@
   }
 
   const scopeSuggHtml = () => `<div class="sugg-scope" id="suggscope">
-    <div class="sgroup stitle">Searching in <span class="scnt">${state.fields.length}</span>
-      <span class="fwhat" data-tip="${tipAttr(SCOPE_WHY)}">&#9432;</span></div>
+    <div class="sgroup stitle">Search in <span class="scnt">${state.fields.length}</span>
+      <span class="fwhat" data-tip="${tipAttr(SCOPE_WHY)}">i</span></div>
     ${fieldRowsHtml()}</div>`;
 
   /* ── The Searching-in sheet ──────────────────────────────────────────
@@ -4502,7 +4552,7 @@
      is not focus-dependent, so the popover's mousedown-preventDefault, its blur
      guard and its refocus dance have no counterpart down here. */
   const scopeSheetTitle = () =>
-    `Searching in (${state.fields.length} of ${CAT ? CAT.fields.length : 0})`;
+    `Search in (${state.fields.length} of ${CAT ? CAT.fields.length : 0})`;
 
   const scopeSheetBody = () => `<div class="fgroup">Match</div>
     <div class="seg">${wordsSegHtml()}</div>
@@ -4608,8 +4658,13 @@
         out.push({ kind: 'dim', label: d.label, dim: d.key, ico: dimIcon(d.key) }));
       return out;
     }
+    /* The count is the last finished search's, so it is shown only when that search was
+       for exactly this text. Between a keystroke and its answer it was the previous
+       search's total - every channel, beside the first letter typed - which a first-time
+       user read as the number of matches (dev/docs/BUGS.md 2026-10-26). */
+    const answered = !resultsPending && last.q === raw.trim() && typeof last.total === 'number';
     out.push({ group: 'Search', kind: 'text', label: raw.trim(), ico: '&#128269;',
-               hint: nf(last.total) });
+               hint: answered ? nf(last.total) : '' });
     const parsed = parseQuery(raw);
     const term = (parsed.inc[parsed.inc.length - 1] || '').toLowerCase();
     if (!term) return out;
@@ -4686,7 +4741,7 @@
        into that sheet. THAT FOOTER IS OWED: it is the only thing keeping the link between what
        you are typing and what it matches after the switches moved out of view. */
     const scopeFoot = phone
-      ? `<div class="sugg-scopeline" data-openscope="1"><span>Searching in</span>
+      ? `<div class="sugg-scopeline" data-openscope="1"><span>Search in</span>
           <span class="ssl-v">${esc(fieldLabels().join(', '))}</span>
           <span class="ssl-go">change</span></div>`
       : '';
@@ -4707,6 +4762,8 @@
     const r = el.getBoundingClientRect ? el.getBoundingClientRect() : null;
     if (!r || !r.top) return;
     el.style.maxHeight = `${Math.max(SUGG_MIN, window.innerHeight - r.top - SUGG_GAP)}px`;
+    // The CSS width is wider than the box (dev/changelog/1290); the window is the limit.
+    el.style.maxWidth = `${Math.max(SUGG_MIN, window.innerWidth - r.left - SUGG_GAP)}px`;
   }
   const closeSugg = () => { suggIdx = -1; suggOpen = false; $('#sugg').classList.remove('show'); };
   const negTerm = (t) => `-${/\s/.test(t) ? `"${t}"` : t}`;
@@ -4819,6 +4876,7 @@
     renderWordsSeg();
     // Phone only; a no-op above the breakpoint, where #tbar is the toolbar.
     renderChipRow();
+    renderPlaceholder();
     renderSugg();                              // no-ops unless the box has focus
     // Which saved search this is, and whether it has been edited since - derived
     // from the state itself, so it tracks every change without a call site.
@@ -5442,6 +5500,8 @@
       const results = await Promise.all(
         ids.map((id) => jsonFetch(`${CFG.addGuideUrlBase}${id}/add`, { method: 'POST' })));
       let added = results.filter((d) => d.success && !d.duplicate_warning).length;
+      // The server words it for one channel or many, so any one of them speaks for all.
+      let note = (results.find((d) => d.note) || {}).note;
       const warned = results.filter((d) => d.duplicate_warning);
       if (warned.length) {
         const lines = warned.map((w) => `${w.channel_name} shares a stream URL with: `
@@ -5457,9 +5517,11 @@
           const forced = await Promise.all(warned.map((w) =>
             jsonFetch(`${CFG.addGuideUrlBase}${w.channel_id}/add?force=1`, { method: 'POST' })));
           added += forced.filter((d) => d.success).length;
+          note = note || (forced.find((d) => d.note) || {}).note;
         }
       }
-      showToast(`${nf(added)} channel${added === 1 ? '' : 's'} added to your guide.`);
+      showToast(`${nf(added)} channel${added === 1 ? '' : 's'} added to your guide.${
+        added && note ? ` ${note}` : ''}`);
       applyNow(false);
     } catch (err) {
       showToast(err.message || 'Could not add every channel. Try again.', { type: 'error' });

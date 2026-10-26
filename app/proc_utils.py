@@ -311,6 +311,11 @@ _CAUSE_LINE = re.compile(
 # and a metadata row ("title           : ..."), which carries the program's own name, and the
 # Input/Output header, which carries the output path built from it.
 _NOT_A_CAUSE_LINE = re.compile(r'^(?:frame=|size=|(?:Input|Output) #|\w+\s+: )')
+# What ffmpeg 7.1 prints when ChannelBin's own SIGTERM interrupts a read ("[in#0/mpegts @
+# 0x..] Error during demuxing: Immediate exit requested", measured with a stalled HTTP feed).
+# It names the stop, not why the stream died, and quoting it as the cause blamed every stall
+# kill on itself (dev/changelog/1287).
+_OUR_OWN_STOP = re.compile(r'Immediate exit requested', re.IGNORECASE)
 
 
 def stderr_cause(tail: str) -> str:
@@ -327,7 +332,8 @@ def stderr_cause(tail: str) -> str:
     "error=Connection timed out" before "Error during demuxing: Input/output error".
     """
     for line in (tail or '').split('\n'):
-        if _CAUSE_LINE.search(line) and not _NOT_A_CAUSE_LINE.match(line):
+        if (_CAUSE_LINE.search(line) and not _NOT_A_CAUSE_LINE.match(line)
+                and not _OUR_OWN_STOP.search(line)):
             return line
     return ''
 

@@ -30,6 +30,13 @@ DEFAULT_FAILING_STREAK_THRESHOLD = 3
 MATCH_REASON_STRENGTH = {'epg_id+name': 0, 'epg_id': 1, 'name': 2}
 FORMAT_STATUS_STRENGTH = {'confirmed': 0, 'unverified': 1, 'different': 2}
 
+# The automatic group's name and the one sentence every page that names it uses, so no page
+# explains it as a group of identical feeds or as the TV Guide itself (dev/changelog/1289).
+# The stored rows carry the name; migration 100 renamed the old "TV Guide Channels" ones.
+SYSTEM_CHECK_NAME = 'TV Guide health check'
+SYSTEM_CHECK_SENTENCE = ('Automatic health check: it tests all channels that you have added '
+                         'to your TV Guide.')
+
 
 def effective_score(channel) -> int:
     """0-100 ranking score: lifetime health score (neutral 50 if never observed)
@@ -1537,7 +1544,7 @@ def _fallback_serving_member(group, streak_threshold=DEFAULT_FAILING_STREAK_THRE
 
 
 def system_check_targets(streak_threshold=DEFAULT_FAILING_STREAK_THRESHOLD):
-    """The ordered channel list the automatic "TV Guide Channels" check probes.
+    """The ordered channel list the automatic "TV Guide health check" probes.
 
     **One probe per guide row, plus one per scheduleless group** - deliberate, and the
     reason health checks exist at all (DESIGN-channel-groups-model.md 6):
@@ -1604,7 +1611,7 @@ def check_target_channels(group):
     place that resolves the system group's computed membership
     (DESIGN-groups-unification.md: is_system membership is never stored).
 
-    - is_system ("TV Guide Channels"): system_check_targets() - one probe per guide row
+    - is_system ("TV Guide health check"): system_check_targets() - one probe per guide row
       plus one per scheduleless group, NOT every in-guide channel and never every member
       of every group (dev/changelog/752). Excluded means Channel.test_enabled=False (all
       are listed so excluded ones stay visible/toggleable, mirroring how stored groups
@@ -1904,9 +1911,9 @@ def _dismiss_format_mismatch_alerts(group, channel_ids=None):
     over-match a longer group id - `group:2:ch:%` requires the literal `group:2:ch:`
     prefix, which `group:20:ch:5` does not have."""
     from . import db
+    from .alerts import mark_cleared
     from .database import Alert
     from .db_utils import retry_on_locked
-    from datetime import datetime
 
     @retry_on_locked()
     def _dismiss():
@@ -1917,9 +1924,7 @@ def _dismiss_format_mismatch_alerts(group, channel_ids=None):
         else:
             q = q.filter(Alert.source.in_(
                 [f'group:{group.id}:ch:{cid}' for cid in channel_ids]))
-        now = datetime.utcnow()
-        for a in q.all():
-            a.dismissed_at = now
+        mark_cleared(q.all())
         db.session.commit()
     _dismiss()
 

@@ -13,12 +13,11 @@
      title="Schedule a one-off recording for something not yet in your TV Guide - e.g. a program with no EPG data, or a stream from an account you haven't added to ChannelBin yet.">
     Add manual recording
   </a>
-  {# Lands pre-filtered on guide SCOPE - every channel whose listings reach this page,
-     which includes the members of each group row. That is wider than what the grid draws
-     (a group is ONE row here, and its members are not rows at all), so this is the closest
-     honest answer the channel grain can give, not a mirror of the guide. Mirroring it needs
-     channel groups to be search results in their own right - dev/docs/DESIGN-group-search-rows.md. #}
-  <a href="{{ url_for('channels.channel_browser', **{'f.other': 'guide'}) }}" class="btn btn-primary">Manage channels</a>
+  {# Lands on every channel, unfiltered. Managing the guide is mostly ADDING to it, and a
+     landing pre-filtered to the guide's own channels hid every one that could be added until
+     the user found and removed the chip (dev/changelog/1276). Each row says whether it is
+     already in the guide, and "Status: In your guide" narrows to them in one click. #}
+  <a href="{{ url_for('channels.channel_browser') }}" class="btn btn-primary">Manage channels</a>
   </div>
 </div>
 
@@ -297,6 +296,10 @@
    meaningless without the legend, which is why it is not optional here. #}
 <div class="guide-statusbar">
   <span id="guide-sb-counts"></span>
+  {# Phone width only (guide.css): the key for the channel column's health dots, written by
+     guide.js::renderHealthKey from the bands actually on screen. Empty is the nothing-active
+     state. #}
+  <span class="guide-sb-legend guide-sb-healthkey" id="guide-sb-healthkey"></span>
   <span class="guide-sb-legend">
     {% for acc in accounts %}
     <span class="guide-legend-item">

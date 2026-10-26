@@ -20,6 +20,9 @@
   // which has Recording on - the row's data-records attribute, which the Purpose filter
   // below reads (dev/changelog/1077).
   const SECTIONS = ['groups'];
+  // Every list the filter counts. The automatic check has its own section above the user's
+  // groups and no sort of its own - it is one row (dev/changelog/1289).
+  const LIST_SECTIONS = ['auto', 'groups'];
 
   // A row carries its own health class plus its schedule's (data-healths), so one row
   // matches if EITHER does.
@@ -97,18 +100,25 @@
       row.style.display = show ? '' : 'none';
       if (show) visible++;
     });
-    SECTIONS.forEach(section => {
+    LIST_SECTIONS.forEach(section => {
       const list = document.getElementById(`grp-list-${section}`);
       if (!list) return;
       const shown = Array.from(list.children).filter(r => r.style.display !== 'none').length;
       const head = document.querySelector(`.sec-head[data-section="${section}"]`);
       list.style.display = shown ? '' : 'none';
+      document.querySelectorAll(`[data-section-note="${section}"]`).forEach(n => {
+        n.style.display = shown ? '' : 'none';
+      });
       if (head) {
         head.style.display = shown ? '' : 'none';
         const cnt = head.querySelector('.cnt');
         if (cnt) cnt.textContent = shown;
       }
     });
+    // "You have no channel groups yet" answers an empty list, never a filtered one.
+    const groupsList = document.getElementById('grp-list-groups');
+    const emptyEl = document.getElementById('grp-empty');
+    if (groupsList && emptyEl) emptyEl.style.display = groupsList.children.length ? 'none' : '';
     noResults.style.display = visible === 0 ? '' : 'none';
     filterCountEl.textContent = `${visible} of ${allItems.length} shown`;
     syncUrl();
@@ -399,14 +409,14 @@
   // an open kebab closes it mid-choice, and a dialog was opened against the old row - and
   // the next poll asks again.
   let hcInFlight = false;
-  const refreshBusy = () => Boolean(document.querySelector('.menu.open, .modal'));
+  const refreshBusy = overlayOpen;
 
   function refreshList() {
     const open = allItems.filter(r => {
       const d = r.querySelector('.grp-detail');
       return d && !d.hidden;
     }).map(r => r.dataset.group);
-    return swapFromServer(['#grp-list-groups']).then(() => {
+    return swapFromServer(['#grp-lists']).then(() => {
       allItems = Array.from(document.querySelectorAll('.grp-item'));
       open.forEach(gid => {
         const item = document.querySelector(`.grp-item[data-group="${gid}"]`);
@@ -423,7 +433,7 @@
   }
 
   window.__applyHealthCheck = (hc) => {
-    const list = document.getElementById('grp-list-groups');
+    const list = document.getElementById('grp-lists');
     if (!list || !hc || typeof hc.sig !== 'string' || hcInFlight || refreshBusy()) return;
     if (hc.sig === list.dataset.hcSig) return;
     hcInFlight = true;

@@ -627,10 +627,9 @@ def ffprobe_missing(configured_ffmpeg_path=None, configured_ffprobe_path=None) -
 CONSEQUENCE = {
     'ffmpeg': ('Nothing can be captured or converted without it: every recording and every '
                'health check will fail as soon as it starts.'),
-    'ffprobe': ('It ships alongside ffmpeg but is a separate binary. Without it ChannelBin '
-                'can still record, but it cannot read a stream or a finished file: no '
-                'format detection, no recording health numbers, and no channel-group '
-                'format matching.'),
+    'ffprobe': ('Recording still works, but ChannelBin cannot read a stream or a finished '
+                'file: no format detection, no recording health numbers and no channel-group '
+                'format matching. ffprobe comes with ffmpeg but is a separate program.'),
 }
 
 

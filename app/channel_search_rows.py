@@ -62,6 +62,7 @@ import logging
 from datetime import datetime
 
 from sqlalchemy import case, select
+from sqlalchemy.orm import selectinload
 
 from . import db, duplicate_streams, health_bands
 from .channel_search import (FIELDS, GRAIN_AIRINGS, GRAIN_CHANNELS,
@@ -76,6 +77,7 @@ from .database import (Channel, ChannelGroup, ChannelGroupMember, EPGEntry, Prov
                        REC_STATUS_COMPLETED,
                        REC_STATUS_ABORTED, REC_STATUS_FAILED)
 from .recording_match import build_rec_indexes, candidate_recs, match_recording
+from .recording_story import partial_note, stopped_early_note
 from .url_utils import mask_creds
 
 log = logging.getLogger(__name__)
@@ -383,6 +385,13 @@ def _airing_rows(result, state, ctx) -> list:
                 'status': rec.status,
                 'start_time': _iso(rec.start_time),
                 'stop_time': _iso(rec.stop_time),
+                # Why a finished recording is not the whole showing, or None - the badge
+                # says Partial rather than Recorded then, as the guide does
+                # (dev/changelog/1270).
+                'partial': partial_note(rec),
+                # The user's own Stop as the whole reason, said without the amber mark
+                # (dev/changelog/1287).
+                'stopped': stopped_early_note(rec),
             },
             # Rendered here rather than on the page: the template can come from the channel's
             # default profile and the {tag:...} tokens resolve against Tag rows, neither of
@@ -560,7 +569,8 @@ def _recordings_for(entries, channels_by_id) -> dict:
     window_start = min(s for s, _ in spans)
     window_stop = max(s for _, s in spans)
 
-    candidates = Recording.query.filter(
+    # Segments come with them: partial_note() reads a finished recording's capture spans.
+    candidates = Recording.query.options(selectinload(Recording.segments)).filter(
         Recording.stop_time >= window_start,
         Recording.start_time <= window_stop,
         Recording.status.notin_(REC_DEAD),

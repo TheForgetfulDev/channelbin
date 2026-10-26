@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 
 from flask import (
     Blueprint, render_template, request, redirect, url_for, flash, jsonify,
-    send_file, abort,
+    send_file, abort, make_response,
 )
 
 from .. import db
@@ -16,7 +16,9 @@ from ..database import (
     Recording, Channel, ChannelGroup, Account, EPGEntry, RecordingEvent, RecordingSegment,
     RECORDING_CREATED_AFTER_EVENT_START, RECORDING_EDITED, RECORDING_STOP_TIME_ADJUSTED,
     RECORDING_REPLACED_OTHER, RESTART_BLOCKING_STATUSES, RECORDING_ABORTED,
-    DIAGNOSTICS, add_recording_event, detach_recording_references,
+    DIAGNOSTICS, RESTART_ATTEMPTED, RESTART_FAILED, RESTART_SUCCEEDED, STALL_DETECTED,
+    FAST_DELIVERY_DETECTED, RECORDING_RESUMED,
+    add_recording_event, detach_recording_references,
     group_event_channel_links,
     REC_STATUS_SCHEDULED, REC_STATUS_IN_PROGRESS, REC_STATUS_PAUSED, REC_STATUS_RETRYING,
     REC_STATUS_CONCATENATING, REC_STATUS_ANALYZING, REC_STATUS_CONVERTING,
@@ -47,7 +49,7 @@ from ..logo_cache import resolve_logo_url
 from ..screenshot import capture_screenshot
 from ..storage_dirs import THUMBNAILS, image_dir
 from ..url_utils import mask_creds as _mask_creds_str
-from .. import fmt_utils
+from .. import fmt_utils, recording_story
 
 recordings_bp = Blueprint('recordings', __name__)
 log = logging.getLogger(__name__)
@@ -754,7 +756,7 @@ def _format_profile(rec):
         rows.append(_profile_row('Frame rate', f'{fps:.1f} fps constant' if fps else 'Constant',
                                  tip=note.strip() or None))
     if bpp:
-        rows.append(_profile_row('Efficiency', f'{bpp:.4f}',
+        rows.append(_profile_row(fmt_utils.EFFICIENCY_LABEL, f'{bpp:.4f}',
                                  tip=fmt_utils.EFFICIENCY_TIP + '\n' + _OUTPUT_NOTE))
     return {'rows': rows, 'source': src, 'coded': coded, 'audio_note': audio_note}
 
@@ -943,25 +945,76 @@ def _row_times(rec, now, tz):
     return day, rel
 
 
-def _index_row(rec, now, tz, thumb_ids, live_seg_bytes=0, file_formats=None,
-               thumb_enabled=True):
-    """file_formats is channel_groups.file_format_stretches() over the recording's format
-    survey, when the caller has it in hand - the detail page does, from events it loaded
-    anyway. Without it the format clause falls back on what each segment opened at, which
-    is all a list row can read without a query per row."""
-    # The WAITING derivation is inside rec_status_display, so this row and the Dashboard's
-    # row and chip cannot name the same parked recording three different ways.
-    section, st_class, badge_class, badge_label, pulse = fmt_utils.rec_status_display(
-        rec.status, waiting=bool(rec.postprocess_waiting_since))
+#: Seconds with no new byte before the live page stops calling a capture live. The page's
+#: script reads it off the strip, so the strip and the screenshot's tag change their answer
+#: at the same moment.
+LIVE_STALE_SECONDS = 15
 
-    day, rel = _row_times(rec, now, tz)
+# The watchdog's last word on a capture that is not getting data: it is reconnecting (a
+# stall, a restart under way or one that got nothing, a resume), or a restart got the stream
+# back. The page's script keeps the same flag from the same events as they arrive.
+_RECONNECTING_AFTER = {
+    STALL_DETECTED: True, FAST_DELIVERY_DETECTED: True, RESTART_ATTEMPTED: True,
+    RESTART_FAILED: True, RECORDING_RESUMED: True, RESTART_SUCCEEDED: False,
+}
 
+
+def _live_capture(rec, live_seg, live_seg_bytes, now):
+    """The live strip's first render: its numbers, whether data is arriving, whether the
+    watchdog is reconnecting, whether this recording has captured anything yet. It used to
+    render "Recording" with dashes and wait for the first SSE frame, which could be half a
+    minute away while a restart was waited out (dev/changelog/1285). The numbers are the
+    ones watchdog._publish_snapshot sends, worked out the same way. Whether data is arriving
+    comes from the open segment's size, already stat'ed, and the events the page holds:
+    nothing reads a time off the file, because /dvr's mtimes come from the share's clock.
+
+    The page's script re-derives `label` from the same three facts on every frame; the two
+    must stay in step."""
+    capturing = live_seg is not None and live_seg_bytes > 0
+    reconnecting = False
+    for e in reversed(rec.events):
+        if e.event_type in _RECONNECTING_AFTER:
+            reconnecting = _RECONNECTING_AFTER[e.event_type]
+            break
+    had_data = capturing or any(s.bytes_recorded and not s.excluded for s in rec.segments)
+    if capturing:
+        label = 'Recording'
+    elif not had_data and not reconnecting:
+        label = 'Connecting'
+    else:
+        label = 'Not capturing'
+    return {'capturing': capturing, 'reconnecting': reconnecting and not capturing,
+            'had_data': had_data, 'label': label,
+            'segment_number': live_seg.segment_number if live_seg is not None else None,
+            'segment_bytes': live_seg_bytes,
+            'elapsed': (now - rec.started_at).total_seconds() if rec.started_at else 0,
+            'remaining': max(0, (rec.stop_time - now).total_seconds()),
+            'total_bytes': sum(s.bytes_recorded or 0 for s in rec.segments
+                               if s.ended_at is not None and not s.excluded) + live_seg_bytes}
+
+
+def _open_segment_bytes(seg):
+    """The open segment's size on disk. Its bytes_recorded is written only when it ends, so
+    without this a live recording's size lags by the whole open segment - the list read 42
+    MB beside its own page's 76.8 MB (dev/docs/BUGS.md 2026-10-22 08:13:56 PM). One stat per live
+    recording, so a page pays for the recordings under way, never for its row count."""
+    if seg is None or not seg.file_path:
+        return 0
+    try:
+        return os.path.getsize(seg.file_path)
+    except OSError:  # ffmpeg has not created the file yet
+        return 0
+
+
+def _dur_size_cells(rec, now, live_seg_bytes=0):
+    """A row's duration and size cells - the two that grow while a recording runs, so the
+    list's minute tick re-asks them for its live rows (recording_times) from this same
+    function the page renders them with."""
     sched_secs = rec.scheduled_duration_seconds
     # Discarded segments are out: this list stands in for the file, and both numbers it
     # feeds - captured-so-far and the size shown before a final file exists - would
     # otherwise credit the recording with content the app deliberately threw away.
     data_segs = [s for s in rec.segments if s.bytes_recorded and not s.excluded]
-    stalls = rec.total_stall_count or 0
 
     # duration cell: scheduled window for SCHEDULED rows; captured-so-far while
     # live; actual (file, else segment span) once terminal - four different
@@ -973,24 +1026,40 @@ def _index_row(rec, now, tz, thumb_ids, live_seg_bytes=0, file_formats=None,
     elif rec.status in WINDOW_OPEN_STATUSES:
         captured = sum((s.ended_at - s.started_at).total_seconds()
                        for s in data_segs if s.ended_at)
+        # The open segment counts once it has written a byte. A restart still waiting for
+        # its first one is not capture, and counting it made the number fall when that
+        # restart closed with nothing: "Captured 53s", then 45s (dev/changelog/1285).
         active = rec.active_segment
-        if active:
+        if active and live_seg_bytes:
             captured += (now - active.started_at).total_seconds()
         dur_secs = captured
         dur_flag = 'live'
         verb = 'Waiting to retry' if rec.status == REC_STATUS_RETRYING else 'Recording'
         dur_tip = (f'{verb} - {fmt_utils.fmt_duration(captured)} captured so far '
                    f'of {fmt_utils.fmt_duration(sched_secs)} scheduled.')
+    elif (rec.status in (REC_STATUS_CONCATENATING, REC_STATUS_ANALYZING, REC_STATUS_CONVERTING)
+          and rec.actual_duration_seconds is None):
+        # Capture is over and the file's own length is not measured until the join has
+        # probed it, so this stretch read "-" where the page had just shown a number
+        # (dev/changelog/1285). The segments' span is what was captured.
+        dur_secs = rec.captured_duration_seconds
+        dur_tip = ('Measured from the segments that captured data. The file\'s own length '
+                   'replaces it once the segments are joined.')
     else:
         dur_secs = rec.actual_duration_seconds
-        if dur_secs and sched_secs and dur_secs < sched_secs * 0.98:
+        # The user's own Stop gets a quiet mark of its own, not the amber partial one
+        # (dev/changelog/1287).
+        stopped = recording_story.stopped_early_note(rec)
+        if stopped:
+            dur_flag = 'stopped'
+            dur_tip = stopped
+        elif recording_story.short_capture(rec):
             dur_flag = 'partial'
             dur_tip = (f'Partial - {fmt_utils.fmt_duration(dur_secs)} captured of '
                        f'{fmt_utils.fmt_duration(sched_secs)} scheduled.')
 
-    # size: final file once it exists, else data written to segments so far. The open
-    # segment has no bytes_recorded until it ends, so a caller that stat'ed it passes the
-    # live size in; the list page does not, since that would be disk I/O per row.
+    # size: final file once it exists, else data written to segments so far plus the open
+    # segment's size, which the caller stat'ed (_open_segment_bytes).
     size_bytes = (rec.final_file_size
                   or sum(s.bytes_recorded or 0 for s in data_segs) + live_seg_bytes or None)
     # The rate's basis is whichever duration the cell above settled on, and the tooltip
@@ -1009,45 +1078,41 @@ def _index_row(rec, now, tz, thumb_ids, live_seg_bytes=0, file_formats=None,
         else:
             rate_tip = ('File size over the span of the segments that captured data - the '
                         'finished file was not probed for its content length.')
+    elif rec.status in WINDOW_OPEN_STATUSES:
+        rate_tip = 'Shown once a minute has been captured.'
     size_num, size_unit = _size_parts(size_bytes)
+    return {'dur_secs': dur_secs, 'dur_str': fmt_utils.fmt_duration(dur_secs),
+            'dur_flag': dur_flag, 'dur_tip': dur_tip, 'size_bytes': size_bytes,
+            'size_num': size_num, 'size_unit': size_unit, 'rate': rate, 'rate_tip': rate_tip}
+
+
+def _index_row(rec, now, tz, thumb_ids, live_seg_bytes=0, file_formats=None,
+               thumb_enabled=True):
+    """file_formats is channel_groups.file_format_stretches() over the recording's format
+    survey, when the caller has it in hand - the detail page does, from events it loaded
+    anyway. Without it the format clause falls back on what each segment opened at, which
+    is all a list row can read without a query per row."""
+    # The WAITING derivation is inside rec_status_display, so this row and the Dashboard's
+    # row and chip cannot name the same parked recording three different ways.
+    section, st_class, badge_class, badge_label, pulse = fmt_utils.rec_status_display(
+        rec.status, waiting=bool(rec.postprocess_waiting_since))
+
+    day, rel = _row_times(rec, now, tz)
+    cells = _dur_size_cells(rec, now, live_seg_bytes)
+    dur_secs, size_bytes = cells['dur_secs'], cells['size_bytes']
+    data_segs = [s for s in rec.segments if s.bytes_recorded and not s.excluded]
+    stalls = rec.total_stall_count or 0
 
     # health pill. Three different quantities and the tooltip keeps them apart: downtime is
     # the capture-time gap counter, the gap figure is wall clock with no segment running at
     # all (measured after the fact from the segment clocks), and the content figure compares
     # the delivered length against that capture time (dev/changelog/432, 942).
     # Gated on the same 2% the duration cell's 'partial' flag uses, so the two agree: every
-    # clean capture is a few seconds off its window (ffmpeg start latency, and a connect-time
-    # buffer on the other side) and saying so on every row would be noise. The detail page
-    # shows both figures unconditionally.
-    window = rec.duration_seconds
-    gap_secs = rec.capture_gap_seconds
-    vs_capture = rec.content_vs_capture_seconds
-    missing = (f' {fmt_utils.fmt_duration(gap_secs, with_seconds=True)} of the recording '
-               f'window with nothing capturing at all.') if (
-                   gap_secs and window and gap_secs >= window * 0.02) else ''
-    if vs_capture and window and abs(vs_capture) >= window * 0.02:
-        missing += (
-            f' The file holds {fmt_utils.fmt_duration(abs(vs_capture), with_seconds=True)} '
-            f'{"more" if vs_capture > 0 else "less"} content than the time the capture ran.')
-    # Unconditional, unlike the two figures above: a discard is an action the app took, not a
-    # measurement that is a few seconds off on every clean capture, so there is no noise floor
-    # to clear and nothing to gate it on.
-    if rec.discarded_segment_count:
-        missing += (
-            f' {rec.discarded_segment_count} segment'
-            f'{"" if rec.discarded_segment_count == 1 else "s"} discarded '
-            f'({fmt_utils.fmt_duration(rec.discarded_seconds or 0, with_seconds=True)} of '
-            f'provider placeholder video), not joined into the file.')
-    # Unconditional for the same reason as the discard above: the threshold behind this is
-    # already three times clear of the worst honest surplus ever measured here, so there is
-    # no noise floor left for a percentage gate to clear.
-    if rec.fast_delivery_segment_count:
-        fast_secs = fmt_utils.fmt_duration(rec.fast_delivery_seconds or 0, with_seconds=True)
-        missing += (
-            f' {rec.fast_delivery_segment_count} segment'
-            f'{"" if rec.fast_delivery_segment_count == 1 else "s"} delivered video faster '
-            f'than real time ({fast_secs} of the file) - kept, but worth checking before '
-            f'you watch.')
+    # clean capture is a few seconds off its window and saying so on every row would be
+    # noise. The detail page shows both figures unconditionally. The clauses are
+    # recording_story's, so this tooltip and the recording page word them once
+    # (dev/changelog/1270).
+    missing = ''.join(f' {c}' for c in recording_story.trouble_clauses(rec))
     # Distinct channels this recording's segments actually used - free to compute, rec.segments
     # is already loaded/iterated above for data_segs/stalls. >1 means a channel-group recording
     # had to change channels at least once (same-account restart never changes channel_id).
@@ -1080,6 +1145,7 @@ def _index_row(rec, now, tz, thumb_ids, live_seg_bytes=0, file_formats=None,
         kept = ('Segments kept on disk.' if data_segs
                 else 'Nothing of the channel was captured.')
         health = {'cls': 'bad', 'label': f'⚠ {stalls + (rec.consecutive_failures or 0)}',
+                  'text': f'⚠ {fmt_utils.counted(stalls, "stall")}',
                   'tip': (f'{len(rec.segments)} segments · {stalls} stalls · '
                           f'{fmt_utils.counted(rec.consecutive_failures or 0, "consecutive failed restart")}. '
                           f'{kept}{missing}{spanned}{format_tail}')}
@@ -1087,6 +1153,7 @@ def _index_row(rec, now, tz, thumb_ids, live_seg_bytes=0, file_formats=None,
         downtime = (f' {fmt_utils.fmt_duration(rec.total_downtime_seconds, with_seconds=True)} '
                     f'with nothing being written.') if rec.total_downtime_seconds else ''
         health = {'cls': 'warn', 'label': f'⚠ {stalls}',
+                  'text': f'⚠ {fmt_utils.counted(stalls, "stall")}',
                   'tip': (f'{len(rec.segments)} segments · {stalls} stalls, recovered '
                           f'automatically.{downtime}{missing}{spanned}{format_tail}')}
     elif rec.fast_delivery_segment_count:
@@ -1095,13 +1162,13 @@ def _index_row(rec, now, tz, thumb_ids, live_seg_bytes=0, file_formats=None,
         # "clean capture" tick on the worst recording in the set. The pill carries no number
         # because the number beside a ⚠ everywhere else on this page is a stall count, and
         # this state has none (dev/changelog/966).
-        health = {'cls': 'warn', 'label': '⚠',
+        health = {'cls': 'warn', 'label': '⚠', 'text': '⚠ not clean',
                   'tip': (f'{len(rec.segments)} segment'
                           f'{"s" if len(rec.segments) != 1 else ""} · 0 stalls, but the '
                           f'capture was not clean.{missing}{spanned}{format_tail}')}
     else:
         clean = '' if format_change else ' - clean capture'
-        health = {'cls': 'ok', 'label': '✓',
+        health = {'cls': 'ok', 'label': '✓', 'text': '✓ no stalls',
                   'tip': (f'{len(rec.segments)} segment{"s" if len(rec.segments) != 1 else ""} '
                           f'· 0 stalls{clean}.{missing}{spanned}{format_tail}')}
 
@@ -1190,8 +1257,11 @@ def _index_row(rec, now, tz, thumb_ids, live_seg_bytes=0, file_formats=None,
         'pill': pill, 'member_pill': member_pill,
         'acct_name': acct.name if acct else None,
         'day': day, 'start': rec.start_time, 'stop': rec.stop_time, 'rel': rel,
-        'dur_str': fmt_utils.fmt_duration(dur_secs), 'dur_flag': dur_flag, 'dur_tip': dur_tip,
-        'size_num': size_num, 'size_unit': size_unit, 'rate': rate, 'rate_tip': rate_tip,
+        'dur_str': cells['dur_str'], 'dur_flag': cells['dur_flag'], 'dur_tip': cells['dur_tip'],
+        # The recording page's precise form; the list keeps the short one (dev/changelog/1287).
+        'dur_long': fmt_utils.fmt_duration(cells['dur_secs'], with_seconds=True),
+        'size_num': cells['size_num'], 'size_unit': cells['size_unit'],
+        'rate': cells['rate'], 'rate_tip': cells['rate_tip'],
         'health': health, 'format_change': format_change,
         'progress_pct': progress_pct,
         'output_file': os.path.basename(rec.output_path) if rec.output_path else None,
@@ -1259,7 +1329,10 @@ def index():
 
     now = datetime.utcnow()
     tz = get_display_tz()
-    rows = [_index_row(r, now, tz, thumb_ids, thumb_enabled=thumb_enabled) for r in recordings]
+    rows = [_index_row(r, now, tz, thumb_ids, thumb_enabled=thumb_enabled,
+                       live_seg_bytes=(_open_segment_bytes(r.active_segment)
+                                       if r.status == REC_STATUS_IN_PROGRESS else 0))
+            for r in recordings]
     sections = [
         ('In Progress', 'live', [r for r in rows if r['section'] == 'live']),
         ('Scheduled', 'sched', [r for r in rows if r['section'] == 'sched']),
@@ -1286,9 +1359,11 @@ def recording_times():
     Re-rendering the whole list to move "in 5 min" to "in 4 min" costs about 1.3 ms and
     1.7 KB per recording - 2.7 s and 3.3 MB at 2,000 recordings, every minute, per open tab.
     This answers the two cells that move with the clock alone, from the same _row_times()
-    the page itself renders them with, in one query and no per-row I/O. What a row IS
+    the page itself renders them with, in one query and no per-row I/O - plus, for the few
+    rows still recording, their duration and size cells. What a row IS
     (status, section, menu) is the full re-render's job, driven by recording_signature()
     (dev/changelog/1144)."""
+    from sqlalchemy.orm import selectinload
     from ..tz_utils import get_display_tz
     now = datetime.utcnow()
     tz = get_display_tz()
@@ -1296,6 +1371,18 @@ def recording_times():
     for rec in Recording.query.all():
         day, rel = _row_times(rec, now, tz)
         rows[rec.id] = {'day': day, 'rel': rel}
+    # A row whose window is open also has two cells that grow with the clock - captured so
+    # far and size - and without this they froze at whatever the last full render read,
+    # minutes behind the recording's own page. Its own query, with the segments, so the
+    # finished rows never load theirs; one stat per live recording.
+    for rec in (Recording.query.options(selectinload(Recording.segments))
+                .filter(Recording.status.in_(WINDOW_OPEN_STATUSES)).all()):
+        live_bytes = (_open_segment_bytes(rec.active_segment)
+                      if rec.status == REC_STATUS_IN_PROGRESS else 0)
+        cells = _dur_size_cells(rec, now, live_bytes)
+        rows[rec.id]['cells'] = {k: cells[k] for k in ('dur_str', 'dur_flag', 'dur_tip',
+                                                       'size_num', 'size_unit', 'rate',
+                                                       'rate_tip')}
     return jsonify({'success': True, 'rows': rows})
 
 
@@ -1419,6 +1506,13 @@ def recording_detail(recording_id):
         s.file_path and os.path.exists(s.file_path) and os.path.getsize(s.file_path) > 0
         for s in rec.segments
     )
+    # Which rows' files are gone, said on the Segments table once capture is over: a join
+    # deletes them, and a table still listing "segment_001.ts" under an event log saying the
+    # .ts was deleted read as the log being wrong (dev/changelog/1287). Not asked while
+    # capturing, when every file is there and the page is swapped every 15 s.
+    seg_files_gone = (set() if rec.status in WINDOW_OPEN_STATUSES else
+                      {s.id for s in rec.segments
+                       if s.file_path and not os.path.exists(s.file_path)})
     # The one answer to "what recovers this finished-badly recording", read by the header, the
     # mobile action bar and the status strip alike. Placeholder segments are on disk but a Retry
     # join refuses them again for the same reason, so they recover nothing (dev/changelog/990).
@@ -1527,24 +1621,56 @@ def recording_detail(recording_id):
     # stat and the banner would disagree for the whole segment. The banner's number is this
     # same file's size (watchdog._publish_snapshot); one stat for the one open segment.
     live_seg = rec.active_segment if is_active else None
-    live_seg_id, live_seg_bytes = None, 0
-    if live_seg is not None and live_seg.file_path:
-        live_seg_id = live_seg.id
-        try:
-            live_seg_bytes = os.path.getsize(live_seg.file_path)
-        except OSError:  # ffmpeg has not created the file yet
-            live_seg_bytes = 0
+    live_seg_id = live_seg.id if live_seg is not None and live_seg.file_path else None
+    live_seg_bytes = _open_segment_bytes(live_seg)
+    # Counted from the events the page already holds, so the Restarts row and the activity
+    # log below it cannot disagree: total_restart_count counts only the restarts that got
+    # the stream back, and "Restarts 0" beside six RESTART_ATTEMPTED read as a contradiction.
+    restart_attempts = sum(1 for e in rec.events if e.event_type == RESTART_ATTEMPTED)
+    # A "Recording not capturing" alert outlives the stream's return by the dead-stream window
+    # (dev/changelog/1264), so the page that says the stream is back also says when the red
+    # banner above it goes. Asked only while it can be true: one query, live pages only.
+    retry_alert_clears_after = None
+    if rec.status == REC_STATUS_IN_PROGRESS:
+        from ..alerts import recording_retrying_alert_open
+        if recording_retrying_alert_open(rec.id):
+            retry_alert_clears_after = cfg['watchdog']['early_fail_window_seconds']
+    story = recording_story.what_happened(rec, restart_attempts, seg_stderr,
+                                          open_segment_bytes=live_seg_bytes,
+                                          retry_alert_clears_after=retry_alert_clears_after)
     row = _index_row(rec, now, get_display_tz(), {rec.id} if has_shot else set(),
                      live_seg_bytes=live_seg_bytes, file_formats=file_formats,
                      thumb_enabled=thumb_enabled)
+    live_capture = (_live_capture(rec, live_seg, live_seg_bytes, now)
+                    if rec.status == REC_STATUS_IN_PROGRESS else None)
     concat_prog, joinable_count = _join_strip_context(rec)
+    # Why the join's count is smaller than the Segments row, said beside it: "Joined 2
+    # segments" on a page listing 7, five of them empty, was left for the reader to work out.
+    # A NULL byte count is a segment closed on an error path that never measured its file;
+    # the finished join counts only measured bytes (postprocessor._joined_segment_count), so
+    # those are named as their own reason rather than folded into "no data".
+    join_left_out = {
+        'empty': sum(1 for s in rec.segments if not s.excluded and s.bytes_recorded == 0),
+        'unmeasured': sum(1 for s in rec.segments
+                          if not s.excluded and s.bytes_recorded is None and s.ended_at),
+        'discarded': sum(1 for s in rec.segments if s.excluded),
+    }
     # None for every status but ANALYZING, and also for an ANALYZING row whose passes are
     # done or have not started - the strip's generic wording covers that, per
     # postprocessor.analysis_progress.
     from ..postprocessor import analysis_progress
     analysis_prog = (analysis_progress(rec.id)
                      if rec.status == REC_STATUS_ANALYZING else None)
-    conversion_max_attempts = load_config()['recording']['post_process'].get('max_restart_attempts', 3)
+    pp_cfg = cfg['recording']['post_process']
+    conversion_max_attempts = pp_cfg.get('max_restart_attempts', 3)
+    # What happens to the file once the join is done, so a conversion nobody asked for on
+    # this page does not arrive unannounced (one global setting; no profile overrides it).
+    after_join = {
+        'convert': bool(pp_cfg.get('enabled', True)),
+        'format': str(pp_cfg.get('format', 'mp4')).lstrip('.').upper(),
+        'delete_source': bool(pp_cfg.get('delete_source', True)),
+        'settings_url': url_for('settings.settings', q='recording.post_process.enabled'),
+    }
     max_dead_stream_retry_attempts = load_config()['watchdog'].get('dead_stream_max_retry_attempts', 10)
     # The auto-record rule that made this recording, if it still owns it. Deleting a rule
     # clears rule_id on every recording it keeps, so a set rule_id always names a live rule
@@ -1557,17 +1683,20 @@ def recording_detail(recording_id):
             made_by_rule = {'name': rule_name,
                             'url': url_for('auto_rules.rule_page', rule_id=rec.rule_id)}
 
-    return render_template(
+    page = render_template(
         'recording_detail.html', rec=rec, is_active=is_active,
         made_by_rule=made_by_rule,
+        live_capture=live_capture, live_stale_seconds=LIVE_STALE_SECONDS,
         ts_source_available=ts_source_available,
-        segment_files_on_disk=segment_files_on_disk,
+        segment_files_on_disk=segment_files_on_disk, seg_files_gone=seg_files_gone,
         recover_act=recover_act,
         gaps_retry=gaps_retry,
         conversion_max_attempts=conversion_max_attempts,
+        after_join=after_join,
         max_dead_stream_retry_attempts=max_dead_stream_retry_attempts,
         now=now,
-        concat_prog=concat_prog, joinable_count=joinable_count,
+        concat_prog=concat_prog, joinable_count=joinable_count, join_left_out=join_left_out,
+        restart_attempts=restart_attempts, story=story,
         analysis_prog=analysis_prog,
         row=row, video=video, video_basis=video_basis, audio=audio, tech_source=tech_source,
         fmt=_format_profile(rec),
@@ -1585,6 +1714,13 @@ def recording_detail(recording_id):
         profiles=profiles,  # _record_modal.html + GUIDE_CONFIG.profiles expect this name
         blocked_accounts=_recording_block_labels(rec.id),
     )
+    # The page keeps itself current by swapping regions in place, so the document a browser
+    # cached is only what it looked like at its last full load. Back served that copy: the
+    # What happened of a recording still joining, over one that had finished
+    # (dev/changelog/1285). Never stored, so Back asks again.
+    resp = make_response(page)
+    resp.headers['Cache-Control'] = 'no-store'
+    return resp
 
 
 def _recording_block_labels(recording_id):
@@ -2211,7 +2347,7 @@ def _create_scheduled_recording(cfg, *, name, url, start_utc, stop_utc, channel_
             db.session.add(RecordingEvent(
                 recording_id=rec.id,
                 event_type=RECORDING_CREATED_AFTER_EVENT_START,
-                detail='Recording created after the program\'s scheduled start time; start_time set to now',
+                detail='The program had already started, so the recording started right away',
             ))
             db.session.commit()
 
@@ -2263,9 +2399,9 @@ def new_recording_json():
         if group is None:
             group_id = None
         elif group.is_system:
-            # The pinned TV Guide Channels group has computed membership and is not a
+            # The pinned TV Guide health check's group has computed membership and is not a
             # recording source (server-side enforcement, not just UI).
-            return jsonify({'error': 'The TV Guide Channels group cannot back a '
+            return jsonify({'error': 'The TV Guide health check cannot back a '
                                      'recording.'}), 400
         else:
             # The channel_id the modal supplies for a group row is the guide's serving
@@ -3293,8 +3429,11 @@ def time_ago_filter(dt):
 
 
 @recordings_bp.app_template_filter('time_until')
-def time_until_filter(dt):
+def time_until_filter(dt, compact=False):
     """How long until a scheduled time - and, when it has already passed, how far overdue.
+
+    `compact` is for a narrow number column, where "in under a minute" was cut to "in under
+    a m..." (dev/changelog/1291); it reads "in <1m" beside "in 11h 47m" instead.
 
     A past timestamp used to render as the literal word "now", which is a claim rather than
     a reading: one real account's next sync said "now" indefinitely because nothing had
@@ -3315,7 +3454,10 @@ def time_until_filter(dt):
         return f'in {h}h {m}m'
     if m:
         return f'in {m}m {s}s'
-    return f'in {s}s'
+    # Not seconds: every page that shows this is server-rendered and redraws at most once a
+    # minute, so "in 59s" sat still for a minute and read as a broken countdown
+    # (dev/changelog/1272).
+    return 'in <1m' if compact else 'in under a minute'
 
 
 def _overdue_by(seconds: int) -> str:

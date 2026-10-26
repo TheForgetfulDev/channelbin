@@ -246,7 +246,7 @@ class DetailPageStripTests(unittest.TestCase):
         # The ffmpeg is SIGSTOPped, so the persisted ETA cannot advance. A stopped clock
         # shown as a countdown is the thing that misleads.
         html = self._page(REC_STATUS_CONVERTING, pct=66.4, out_size=4_600_000_000, eta=7200)
-        self.assertNotIn('Conversion in progress', html)
+        self.assertNotIn('Converting to', html)
         self.assertNotIn('120 min left', html)
 
     def test_parked_mid_conversion_says_the_encoded_part_is_kept(self):
@@ -255,7 +255,7 @@ class DetailPageStripTests(unittest.TestCase):
 
     def test_an_unparked_converting_row_still_shows_progress_and_eta(self):
         html = self._page(REC_STATUS_CONVERTING, parked=False, pct=66.4, eta=7200)
-        self.assertIn('Conversion in progress', html)
+        self.assertIn('Converting to', html)
         self.assertIn('120 min left', html)
 
 

@@ -303,7 +303,16 @@ class SearchBoxTests(_PageJs, unittest.TestCase):
 
     def test_focusing_the_box_opens_the_scope_pane_and_the_suggestions(self):
         self.assertTrue(self.obs['sugg_open'])
-        self.assertIn('Searching in', self.obs['sugg_html'])
+        self.assertIn('Search in', self.obs['sugg_html'])
+        self.assertNotIn('Searching in', self.obs['sugg_html'],
+                         'one name for the scope control (dev/changelog/1276)')
+
+    def test_the_placeholder_says_what_the_scope_matches(self):
+        """A fixed "Search channels and what is on them" over a name-only default scope
+        told a first-time user a different scope from the chip and the results line
+        (dev/changelog/1276)."""
+        self.assertEqual('Search by channel name', self.obs['placeholder_default'])
+        self.assertEqual('Search 3 fields', self.obs['placeholder_three_fields'])
 
     def test_every_registry_field_gets_a_switch_and_none_is_disabled(self):
         """Description search ships working and indexed (dev/changelog/395), so the
@@ -825,6 +834,18 @@ class BulkGuideActionTests(_PageJs, unittest.TestCase):
         accidental bulk remove is one click."""
         self.assertTrue(self.obs['selection_survives_remove'])
 
+    def test_adding_to_the_guide_leads_the_bar(self):
+        """A first-time user ticked a channel to put it in the guide and found the
+        highlighted button was "+ Group selected" (dev/changelog/1290). The guide action is
+        first and is the bar's one primary while it adds."""
+        self.assertEqual(self.obs['bar_button_order'][0], 'sel-add')
+        self.assertEqual(self.obs['only_not_in_guide']['primaries'], ['sel-add'])
+
+    def test_remove_and_the_mixed_case_are_not_drawn_as_the_lead(self):
+        """Primary styling says "this is what you came for", which a removal is not."""
+        self.assertEqual(self.obs['only_in_guide']['primaries'], [])
+        self.assertEqual(self.obs['mixed']['primaries'], [])
+
     def test_no_row_carries_a_guide_control_at_this_width(self):
         """dev/changelog/860: the checkbox plus this bar is the ONE path to the guide from
         the desktop list. A channel row's "+ Add to Guide" was the widest thing on the row
@@ -835,6 +856,27 @@ class BulkGuideActionTests(_PageJs, unittest.TestCase):
         self.assertEqual(self.obs['row_guide_controls'], 0)
         self.assertEqual(self.obs['group_guide_controls'], 0)
         self.assertGreater(self.obs['group_rows_on_screen'], 0)
+
+
+class SuggestionCountTests(_PageJs, unittest.TestCase):
+    """The number beside the typed text in the suggestion menu (dev/docs/BUGS.md
+    2026-10-26 @ 08:13:13 am ET).
+
+    It was the last finished search's total, so right after typing it was the previous
+    search's - a tester typed "euronews" and read "e.. 925", every channel, as the count of
+    matches. It shows only once the search for exactly that text has answered."""
+
+    SCENARIO = 'suggestion_count'
+
+    def test_no_number_is_shown_before_the_text_is_searched(self):
+        self.assertNotEqual(self.obs['total_before'], '')
+        self.assertEqual(self.obs['hint_before_answer'], '')
+
+    def test_the_answer_for_that_text_is_shown_once_it_lands(self):
+        self.assertEqual(self.obs['hint_after_answer'], '0')
+
+    def test_the_page_raised_no_errors(self):
+        self.assertEqual(self.obs['errors'], [])
 
 
 class MobilePageTests(_PageJs, unittest.TestCase):
@@ -858,10 +900,14 @@ class MobilePageTests(_PageJs, unittest.TestCase):
         self.assertGreater(self.obs['card_count'], 0)
 
     def test_the_chip_row_carries_every_entry_point(self):
-        """The chip row REPLACES the toolbar at this width - Filters, Searching in,
+        """The chip row REPLACES the toolbar at this width - Filters, Search in,
         Sort and Saved are all in it, because two live copies of one control is how
         the two come to disagree."""
         self.assertEqual(self.obs['chips'], ['scope', 'sort', 'saved'])
+
+    def test_the_scope_chip_names_the_field_not_a_bare_count(self):
+        """"Searching in 1" left a first-time user asking one what (dev/changelog/1276)."""
+        self.assertEqual('Search in: Channel name', self.obs['scope_chip_text'].strip())
 
     def test_the_sort_chip_names_the_field_and_the_direction(self):
         """The sortable column headers go away with the table, so this chip is the
@@ -1032,6 +1078,13 @@ class MobileSheetTests(_PageJs, unittest.TestCase):
 
     def test_the_row_sheet_holds_every_single_channel_action(self):
         self.assertIn('open-channel', self.obs['row_sheet_actions'])
+
+    def test_the_row_sheet_note_says_what_select_does(self):
+        """It described the code path ("one path rather than two"), which a first-time user
+        could not parse (dev/changelog/1276)."""
+        note = ' '.join(self.obs['row_sheet_note'].split())
+        self.assertIn('the bar at the bottom acts on all of them', note)
+        self.assertNotIn('path', note)
         self.assertTrue(set(self.obs['row_sheet_actions']) & {'add-guide', 'in-guide'})
         self.assertTrue(self.obs['row_sheet_has_test'])
         self.assertTrue(self.obs['row_sheet_has_select'])

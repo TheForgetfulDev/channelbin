@@ -358,7 +358,7 @@ class QualityProfileStatsTests(unittest.TestCase):
         self.assertEqual(s['Chroma']['value'], '4:2:0')
         self.assertEqual(s['Scan']['value'], 'Progressive')
         self.assertEqual(s['Frame Rate']['value'], 'Constant')
-        self.assertEqual(s['Efficiency']['value'], '0.0821')
+        self.assertEqual(s['Bits per pixel']['value'], '0.0821')
         self.assertIsNone(s['Scan']['cls'])
         self.assertIsNone(s['Frame Rate']['cls'])
 
@@ -391,7 +391,7 @@ class QualityProfileStatsTests(unittest.TestCase):
                         bits_per_pixel_frame=None)
         self.assertNotIn('Bit Depth', s)
         self.assertNotIn('Chroma', s)
-        self.assertNotIn('Efficiency', s)
+        self.assertNotIn('Bits per pixel', s)
 
     def test_single_track_counts_render_no_tracks_card(self):
         # The normal case (1 video, 1 audio) must not add a card - only a genuine

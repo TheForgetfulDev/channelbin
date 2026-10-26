@@ -41,7 +41,7 @@ class ResolveAlertLinkTests(unittest.TestCase):
         link, label = _resolve_alert_link(a)
         self.assertIn('/channels', link)
         self.assertIn('f.acct=5', link)
-        self.assertEqual(label, 'Channels')
+        self.assertEqual(label, 'Channel Search')
 
     def test_sync_channels_missing_links_to_filtered_channel_browser(self):
         a = self._alert(alert_type='SYNC_CHANNELS_MISSING', source='account:9:channels-missing')

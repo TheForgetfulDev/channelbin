@@ -55,6 +55,7 @@ Design, reasoning and measurements: dev/docs/DESIGN-channel-hiding.md, dev/chang
 counts).
 """
 import json
+import logging
 from dataclasses import dataclass, field
 from datetime import datetime
 
@@ -66,6 +67,8 @@ from .database import (Account, Channel, ChannelEvent, ChannelGroupMember, Chann
                        HIDE_TARGET_CATEGORY_EXACT, HIDE_TARGET_CATEGORY_GLOB,
                        HIDE_TARGET_NAME_GLOB)
 from .db_utils import retry_on_locked
+
+log = logging.getLogger(__name__)
 
 #: `Channel.hidden_reason` values - which source produced the current answer. The three rule
 #: sources deliberately share their `ChannelHideRule.target` spelling: one fact ("a category
@@ -85,6 +88,15 @@ HIDE_REASON_LABELS = {
 
 #: The longest pattern `validate_pattern()` accepts, matching the column width.
 MAX_PATTERN_LENGTH = 512
+
+#: The global name rules a new install starts with: the divider rows a provider puts between
+#: its sections ("##### NEWS #####"), which are not channels and cannot be recorded. Ordinary
+#: rules once written - edited or deleted like any other, and never written again, because
+#: the only writers are the fresh-install seed and migration 98, each of which runs once.
+#: `##*##` and `♬♬*♬♬` are measured: 3,457 and 9 rows across the four real accounts, every
+#: `#`-led name among 202,890 a divider. The other three are the simulator's divider shapes,
+#: seen on no real account here (dev/changelog/1276).
+DEFAULT_NAME_GLOBS = ('##*##', '♬♬*♬♬', '==*==', '--*--', '[*][*]*[*][*]')
 
 #: What `set_hidden_override()` will accept, and what each value means.
 OVERRIDE_VALUES = {
@@ -424,8 +436,8 @@ class MaterializeResult:
     reason: str = ''
 
 
-def materialize(label: str, channel_ids=None, account_id=None, force=False,
-                stats=True) -> MaterializeResult:
+def materialize(label: str, channel_ids=None, account_id=None,
+                force=False) -> MaterializeResult:
     """Recompute the hidden answer over a whole table (or a whole account) and commit it,
     holding an admission ticket for the duration.
 
@@ -456,17 +468,37 @@ def materialize(label: str, channel_ids=None, account_id=None, force=False,
             return n
 
         rows = _recompute_and_commit()
-
-        if stats:
-            @retry_on_locked()
-            def _refresh_stats_and_commit():
-                refresh_rule_stats()
-                db.session.commit()
-
-            _refresh_stats_and_commit()
+        refresh_rule_stats_and_commit()
         return MaterializeResult(granted=True, rows=rows)
     finally:
         admission.release(ticket)
+
+
+def apply_default_rules() -> None:
+    """Discharge migration 98's obligation: hide what the default rules it just wrote match.
+
+    A rule hides nothing until a recompute runs, and on an existing install the next one is
+    whenever each account next syncs, so a divider would sit there for hours under a rule
+    claiming to hide it. Run from create_app() before the scheduler starts, with no ticket for
+    the same reason `duplicate_streams.backfill_fold()` takes none: nothing else is running.
+    A recompute, and stamped in the same commit as the work, so a crash between the two
+    re-runs it harmlessly."""
+    from .migrations import _BF_DEFAULT_HIDE_RULES, finish_obligation, obligation_pending
+    if not obligation_pending(_BF_DEFAULT_HIDE_RULES):
+        return
+
+    @retry_on_locked()
+    def _apply_and_commit():
+        recompute()
+        refresh_rule_stats()
+        finish_obligation(_BF_DEFAULT_HIDE_RULES)
+        db.session.commit()
+
+    _apply_and_commit()
+    hidden = db.session.query(func.count(Channel.id)).filter(
+        Channel.hidden_reason == HIDE_REASON_NAME_GLOB).scalar() or 0
+    log.info('Default hide rules for provider divider rows applied: %d channel(s) now hidden '
+             'by a name rule. Delete the rules on Hide Rules to list those rows again.', hidden)
 
 
 # ---------------------------------------------------------------------------
@@ -643,6 +675,22 @@ def refresh_rule_stats(rules=None) -> int:
             rule.counted_at = now
 
     return len(rules)
+
+
+def refresh_rule_stats_and_commit() -> None:
+    """`refresh_rule_stats()` in a retried unit of its own, for a caller whose channel table
+    just changed under the rules: a pass, a sync, a bulk channel or account delete.
+
+    The counts follow the channel table, not the rules, so every door that adds or removes
+    channels owes a recount. A sync that skipped it left a new install's rules at "Matches 0"
+    beside "Hidden now 3", because the last count ran at startup over an empty table
+    (dev/docs/BUGS.md 2026-10-26 08:57:25 AM)."""
+    @retry_on_locked()
+    def _refresh_and_commit():
+        refresh_rule_stats()
+        db.session.commit()
+
+    _refresh_and_commit()
 
 
 # ---------------------------------------------------------------------------

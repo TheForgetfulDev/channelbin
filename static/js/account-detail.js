@@ -117,6 +117,10 @@
     return `<span class="badge ${hit[0]}">${hit[1]}</span>`;
   }
 
+  // Seconds kept under an hour, and a sub-second run said as one: a 48-channel sync takes
+  // under a second, and fmtDur's minutes-only form read it as "0m" (dev/changelog/1291).
+  const syncDur = (secs) => (secs < 1 ? 'under 1s' : fmtDur(secs, secs < 3600));
+
   function historyRow(log, maxDuration) {
     const secs = log.duration_seconds;
     const barClass = log.status === SYNC_LOG.ERROR ? ' err' : (log.status === SYNC_LOG.PARTIAL ? ' part' : '');
@@ -125,7 +129,7 @@
     const duration = secs === null
       ? '<span class="text-faint">running</span>'
       : `<span class="hist-bar"><span class="bar${barClass}" style="width:${width}px"></span>` +
-        `<span class="mono">${escHtml(fmtDur(secs, false))}</span></span>`;
+        `<span class="mono">${escHtml(syncDur(secs))}</span></span>`;
     return '<div class="hist-row">' +
       `<span class="h-when mono">${escHtml(fmtWhen(log.started_at))}</span>` +
       `<span class="h-res">${logBadge(log.status)}</span>` +
@@ -145,7 +149,7 @@
     const head = '<div class="hist-head">' +
       '<span>Started</span><span>Result</span><span class="h-num">Channels</span>' +
       '<span class="h-num">EPG</span>' +
-      `<span class="tip-plain" data-tip="How long the sync took.&#10;Bars are scaled against the longest run shown here, ${escHtml(fmtDur(maxDuration, false))}.">Duration</span>` +
+      `<span class="tip-plain" data-tip="How long the sync took.&#10;Bars are scaled against the longest run shown here, ${escHtml(syncDur(maxDuration))}.">Duration</span>` +
       '<span>Error</span></div>';
     box.innerHTML = head + logs.map((l) => historyRow(l, maxDuration)).join('');
   }
@@ -647,6 +651,7 @@
     'sync-dump': () => post(`/api/accounts/${A.id}/sync-from-dump`, { method: 'POST' }).then(reload),
     // The account page knows its own sync count, so its confirm names all three totals;
     // the list row omits that clause rather than inventing a number it does not have.
+    'examples-remove': () => window.removeExamples(),
     delete: () => confirmDeleteAccount(Object.assign(hooks(), {
       id: A.id,
       name: A.name,
@@ -673,7 +678,9 @@
         { act: 'dump', label: 'Fetch & dump' },
         { act: 'sync-dump', label: 'Sync from dump' });
     }
-    items.push({ sep: true }, { act: 'delete', label: 'Delete account', danger: true });
+    items.push({ sep: true }, A.isExample
+      ? { act: 'examples-remove', label: 'Delete the examples', danger: true }
+      : { act: 'delete', label: 'Delete account', danger: true });
     openMenuSheet(items, { title: A.name, onAct: (act) => run(act) });
   }
 

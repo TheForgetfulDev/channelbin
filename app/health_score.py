@@ -1028,13 +1028,12 @@ def dismiss_recording_failing_alerts(recording_id: int):
     (DESIGN-prerecord-checks.md §2). No-op if none exist. Whole-function retry is safe
     here: every retry re-queries fresh and the only side effect is this commit."""
     from . import db
+    from .alerts import mark_cleared
     from .database import Alert
-    from datetime import datetime
 
     prefix = f'recfail:rec:{recording_id}:'
-    for a in Alert.query.filter(
-            Alert.alert_type == 'RECORDING_CHANNEL_FAILING',
-            Alert.source.like(f'{prefix}%'),
-            Alert.dismissed_at.is_(None)).all():
-        a.dismissed_at = datetime.utcnow()
+    mark_cleared(Alert.query.filter(
+        Alert.alert_type == 'RECORDING_CHANNEL_FAILING',
+        Alert.source.like(f'{prefix}%'),
+        Alert.dismissed_at.is_(None)).all())
     db.session.commit()

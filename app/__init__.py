@@ -246,10 +246,16 @@ def create_app(config_overrides=None, start_scheduler=True):
         # Migration 88's: the fold's ranking reads sync.channel_missing_after_days from the
         # cfg held here (dev/changelog/1172).
         duplicate_streams.backfill_fold(cfg)
+        # Migration 98's: a default hide rule hides nothing until the one writer of
+        # Channel.hidden runs, which is ORM code (dev/changelog/1276).
+        from . import channel_hiding
+        channel_hiding.apply_default_rules()
         duplicate_streams.install_listener()
         _ensure_system_health_job()
         if tags_table_is_new:
             _seed_default_tags()
+        if fresh:
+            _seed_default_hide_rules()
         _ensure_dvr_dir(cfg)
         _ensure_image_dirs(cfg)
         _configure_sqlite(app.config['SQLITE_CACHE_SIZE_MB'],
@@ -309,9 +315,16 @@ def create_app(config_overrides=None, start_scheduler=True):
         band = _health_bands.band_by_key(bands, _health_bands.band_for(score, bands))
         return band.label if band is not None else ''
 
+    # Pure: a dict lookup on a module constant, so it is safe inside a `{% for %}`.
+    from .database import event_label as _event_label
+    app.template_filter('event_label')(_event_label)
+
     # A global rather than a context value so the imported field macros see it without
     # `with context`. Pure: reads the _DEFAULTS constant only (dev/changelog/1003).
     app.jinja_env.globals['default_display'] = default_display
+    # The one sentence every page that names the automatic group explains it with.
+    from .channel_groups import SYSTEM_CHECK_SENTENCE
+    app.jinja_env.globals['system_check_sentence'] = SYSTEM_CHECK_SENTENCE
 
     # The recording-status vocabulary, for the browser's half of it (static/js/util.js's
     # recStatusLabel()). A global rather than a context value because it is a module
@@ -349,6 +362,23 @@ def create_app(config_overrides=None, start_scheduler=True):
         nav_recordings_total = db.session.query(db.func.count(Recording.id)).scalar() or 0
         nav_live_count = (db.session.query(db.func.count(Recording.id))
                           .filter(Recording.status == REC_STATUS_IN_PROGRESS).scalar() or 0)
+        # The Get started link's "N left": the cached count, and only while the facts it was
+        # read from are unchanged. Never an evaluation here - this runs after the page has
+        # loaded its rows, and the Readiness write probe would roll every one of them back.
+        # No cached answer renders the link hidden; the nav poll fills it in.
+        from . import setup_steps
+        nav_setup = setup_steps.cached_nav(setup_steps.state_key(recordings=nav_recordings_total))
+        # The rest of the menu's badges and the footer's stats, drawn at first paint rather
+        # than after the first poll, which left them missing or dashed on a slow load
+        # (dev/changelog/1292). Readiness and the stats are the cached answers only, never a
+        # measurement, for the same reason as the count above; the alert counts are one
+        # grouped COUNT.
+        from . import readiness
+        from .routes.alerts import _unread_severity_counts
+        from .routes.system import cached_system_stats
+        nav_readiness = readiness.cached_nav()
+        nav_alert_counts = _unread_severity_counts()
+        nav_stats = cached_system_stats()
         # Collapsed-sidebar state, server-side so <body class="nav-min"> is in the
         # first paint - localStorage could only apply it after JS runs, which
         # flashes the expanded sidebar on every navigation. One constant query.
@@ -370,6 +400,10 @@ def create_app(config_overrides=None, start_scheduler=True):
             'nav_poll_interval_ms': int(nav_poll_seconds) * 1000,
             'nav_recordings_total': nav_recordings_total,
             'nav_live_count': nav_live_count,
+            'nav_setup': nav_setup,
+            'nav_readiness': nav_readiness,
+            'nav_alert_counts': nav_alert_counts,
+            'nav_stats': nav_stats,
             'nav_collapsed': nav_collapsed,
             # From current_app.config, not a DB query - no per-request I/O added.
             'auth_enabled': bool((current_app.config.get('AUTH') or {}).get('enabled')),
@@ -590,7 +624,7 @@ def _table_exists(table_name: str) -> bool:
 
 
 def _ensure_system_health_job():
-    """Guarantee the pinned 'TV Guide Channels' system OnDemandTestJob row exists, and
+    """Guarantee the pinned 'TV Guide health check' system OnDemandTestJob row exists, and
     strip the legacy channel_testing schedule keys from config.yaml once it does.
 
     Migration _m004 creates the row for existing DBs (copying the legacy keys' values),
@@ -608,6 +642,7 @@ def _ensure_system_health_job():
     from sqlalchemy import text
     from .config import config_write_lock, _load_config_file, _write_config_file
     from .database import ChannelGroup, OnDemandTestJob, OD_JOB_STATUS_SCHEDULED
+    from .channel_groups import SYSTEM_CHECK_NAME
     log = logging.getLogger(__name__)
 
     # The job's channel list is its group's membership; the system group's membership
@@ -623,11 +658,11 @@ def _ensure_system_health_job():
     group_row = db.session.execute(text(
         'SELECT id FROM channel_groups WHERE is_system = 1 LIMIT 1')).first()
     if group_row is None:
-        system_group = ChannelGroup(name='TV Guide Channels', is_system=True)
+        system_group = ChannelGroup(name=SYSTEM_CHECK_NAME, is_system=True)
         db.session.add(system_group)
         db.session.commit()
         group_id = system_group.id
-        log.info('Created system group: TV Guide Channels')
+        log.info('Created system group: %s', SYSTEM_CHECK_NAME)
     else:
         group_id = group_row[0]
 
@@ -635,7 +670,7 @@ def _ensure_system_health_job():
         'SELECT id, group_id FROM on_demand_test_jobs WHERE is_system = 1 LIMIT 1')).first()
     if job_row is None:
         db.session.add(OnDemandTestJob(
-            name='TV Guide Channels',
+            name=SYSTEM_CHECK_NAME,
             is_system=True,
             status=OD_JOB_STATUS_SCHEDULED,
             recurring=True,
@@ -646,7 +681,7 @@ def _ensure_system_health_job():
             group_id=group_id,
         ))
         db.session.commit()
-        log.info('Created system health-check job: TV Guide Channels')
+        log.info('Created system health-check job: %s', SYSTEM_CHECK_NAME)
     elif job_row[1] is None:
         db.session.execute(text('UPDATE on_demand_test_jobs SET group_id = :gid WHERE id = :jid'),
                            {'gid': group_id, 'jid': job_row[0]})
@@ -670,7 +705,7 @@ def _ensure_system_health_job():
                 if removed:
                     _write_config_file(raw)
                     log.info('Removed legacy channel_testing schedule keys from config.yaml: %s '
-                             '(schedule now lives on the TV Guide Channels health check)',
+                             '(schedule now lives on the TV Guide health check)',
                              ', '.join(removed))
 
 
@@ -694,6 +729,21 @@ def _seed_default_tags():
     db.session.add(new)
     db.session.commit()
     log.info('Seeded default tags: live, new')
+
+
+def _seed_default_hide_rules():
+    """The divider-row hide rules, once, on the startup that creates the database. An older
+    install gets the same rules from migration 98 instead, and neither ever runs twice, so a
+    rule the user deletes stays deleted. Nothing to recompute: a new database has no channels.
+
+    Startup-only commit, outside retry_on_locked for the same reason as _seed_default_tags."""
+    from .channel_hiding import DEFAULT_NAME_GLOBS
+    from .database import ChannelHideRule, HIDE_TARGET_NAME_GLOB
+    for pattern in DEFAULT_NAME_GLOBS:
+        db.session.add(ChannelHideRule(target=HIDE_TARGET_NAME_GLOB, pattern=pattern))
+    db.session.commit()
+    logging.getLogger(__name__).info('Seeded %d default hide rules for provider divider rows',
+                                     len(DEFAULT_NAME_GLOBS))
 
 
 def _ensure_dvr_dir(cfg):

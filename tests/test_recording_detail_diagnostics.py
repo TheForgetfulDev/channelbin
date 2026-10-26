@@ -161,7 +161,7 @@ class DiagnosticsRenderTests(unittest.TestCase):
         # The milestone strip renders a label per event it recognises; DIAGNOSTICS has no
         # timeline_label entry, so the type appears exactly once - in the event-log row.
         self.assertEqual(html.count('>DIAGNOSTICS<'), 1)
-        self.assertIn(f'<span class="ev-type">{DIAGNOSTICS}</span>', html)
+        self.assertIn(f'<span class="ev-code">{DIAGNOSTICS}</span>', html)
 
     def test_add_recording_event_payload_round_trips_to_the_page(self):
         """End-to-end through the real writer helper, not a hand-built row."""

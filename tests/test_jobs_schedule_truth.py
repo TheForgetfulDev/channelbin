@@ -286,7 +286,7 @@ class TimelinePayloadTests(unittest.TestCase):
         """16.3: an outline with no length, never a placeholder number."""
         job = self._payload_jobs(history=False)['db_maintenance_daily']
         self.assertIsNone(job['est_seconds'])
-        self.assertIn('Expected runtime unknown', job['duration_line'])
+        self.assertIn('not known yet', job['duration_line'])
 
     def test_a_job_with_history_carries_its_estimate(self):
         job = self._payload_jobs(history=True)['db_maintenance_daily']

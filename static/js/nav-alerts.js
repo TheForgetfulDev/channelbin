@@ -25,10 +25,14 @@
   function applyCounts({ error_count: red = 0, warn_count: warn = 0 }) {
     document.querySelectorAll('.nav-count-bad').forEach((el) => {
       el.textContent = red;
+      el.setAttribute('data-tip', `${red} unread ${red === 1 ? 'error' : 'errors'}.`
+        + '\nReading one takes it out of the count. Some clear themselves once the problem is fixed, and the Alerts page keeps those for a day.');
       setShown(el, red > 0);
     });
     document.querySelectorAll('.nav-count-warn').forEach((el) => {
       el.textContent = warn;
+      el.setAttribute('data-tip', `${warn} unread ${warn === 1 ? 'warning' : 'warnings'}.`
+        + '\nReading one takes it out of the count. Some clear themselves once the problem is fixed, and the Alerts page keeps those for a day.');
       setShown(el, warn > 0);
     });
     // The pip stands in for both counts on the rail, so it hides with them - a mark that

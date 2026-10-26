@@ -74,9 +74,9 @@ class GroupsFilterUrlTests(unittest.TestCase):
         for k in ('is_url', 'not_url', 'picked', 'removed'):
             self.assertEqual(self.obs[k]['errors'], [], k)
 
-    # Every database also carries the app's own "TV Guide Channels" group, which is not a
+    # Every database also carries the app's own "TV Guide health check", which is not a
     # guide row - so it lands on the "not in the guide" side with Other.
-    NOT_IN_GUIDE = ['other', 'tv guide channels']
+    NOT_IN_GUIDE = ['other', 'tv guide health check']
 
     def test_an_f_parameter_still_reads_as_is(self):
         self.assertEqual(self.obs['is_url']['shown'], ['pair'])
@@ -91,7 +91,7 @@ class GroupsFilterUrlTests(unittest.TestCase):
         self.assertEqual(self.obs['picked']['search'], '?x=guide:in')
         self.assertEqual(sorted(self.obs['picked']['shown']), self.NOT_IN_GUIDE)
         self.assertEqual(self.obs['removed']['search'], '')
-        self.assertEqual(sorted(self.obs['removed']['shown']), ['other', 'pair', 'tv guide channels'])
+        self.assertEqual(sorted(self.obs['removed']['shown']), ['other', 'pair', 'tv guide health check'])
 
 
 if __name__ == '__main__':

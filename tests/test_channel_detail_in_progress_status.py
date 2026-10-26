@@ -18,24 +18,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from tests.support.app import make_test_app  # noqa: E402
 from tests.support import seed  # noqa: E402
+from tests.support.tester import running_status as _running_status  # noqa: E402
 from app import db  # noqa: E402
-
-
-def _running_status(channel_id):
-    return {
-        'is_running': True, 'stop_requested': False,
-        'current_channel_id': channel_id, 'current_channel_name': 'Test Channel',
-        'current_channel_url': '', 'current_phase': 'testing',
-        'current_test_started_at': None, 'current_test_drop_count': 0,
-        'current_test_screenshot_url': None, 'current_live_bytes': 0,
-        'current_connect_attempt': 1, 'max_connect_attempts': 1,
-        'wait_started_at': None, 'wait_duration_seconds': None,
-        'last_channel_name': None, 'last_channel_id': None,
-        'next_channel_name': None, 'next_channel_id': None,
-        'total_channels': 1, 'completed_channels': 0, 'run_started_at': None,
-        'last_skip_reason': None, 'current_job_id': None, 'run_kind': 'job',
-        'pre_check_recording_id': None, 'logs': [],
-    }
 
 
 class ChannelDetailInProgressStatusTests(unittest.TestCase):

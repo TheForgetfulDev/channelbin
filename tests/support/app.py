@@ -353,7 +353,10 @@ def reset_module_globals():
     import app.probe as probe
     import app.readiness as readiness
     import app.routes.channel_search as channel_search_routes
+    import app.routes.system as system_routes
     import app.search_index as search_index
+    import app.setup_steps as setup_steps
+    import app.examples as examples
     import app.toolchain as toolchain
 
     # A run abandoned mid-flight leaves its admission ticket held, and the next module's
@@ -414,6 +417,14 @@ def reset_module_globals():
     # it had been asked for here - and the cached nav counts would survive a test that
     # seeds a completely different database.
     readiness.reset_for_tests()
+    # The menu's "N left" is cached the same way and for the same reason.
+    setup_steps.reset_for_tests()
+    # The footer's last measured stats, drawn at first paint: a previous module's patched
+    # disk would otherwise render on this module's pages.
+    system_routes._last_stats.clear()
+    # A load the previous module started (or a test left marked running) would refuse every
+    # later load and removal as "still loading".
+    examples.reset_for_tests()
     # save_config() latches this for any RESTART_REQUIRED_KEYS write, so one module's
     # settings save leaves the next module's pages rendering a restart-required banner.
     config._restart_needed = False

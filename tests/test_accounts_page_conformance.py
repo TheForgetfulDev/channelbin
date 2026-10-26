@@ -36,6 +36,8 @@ decision from section 17 that a careless edit would quietly undo:
 Runs against a throwaway temp SQLite DB - never the live dvr.db.
   python3 -m unittest tests.test_accounts_page_conformance
 """
+import colorsys
+import itertools
 import json
 import os
 import re
@@ -252,14 +254,14 @@ class AccountPageTests(unittest.TestCase):
         self.assertIn('Active connections (last sync)', details)
         self.assertIn('Allowed output formats', details)
         self.assertIn('ts, m3u8', details)
-        self.assertIn('Declared stream origin', details)
+        self.assertIn('Streams served from', details)
         self.assertIn('http://cdn.x.test:80', details)
 
         m3u = _account('M3u No Provider Info')
         db.session.commit()
         details = self._get(m3u).split('data-section="details"')[1].split('data-section=')[0]
         self.assertNotIn('Provider status', details)
-        self.assertNotIn('Declared stream origin', details)
+        self.assertNotIn('Streams served from', details)
 
     def test_provider_account_info_missing_fields_render_as_not_reported(self):
         """Different providers return different fields (dev/changelog/534) - a field the
@@ -271,29 +273,53 @@ class AccountPageTests(unittest.TestCase):
         details = self._get(xt).split('data-section="details"')[1].split('data-section=')[0]
         self.assertIn('not reported', details)
 
-    def test_provider_max_connections_mismatch_is_flagged(self):
-        """The backlog ask: warn when the provider's reported cap disagrees with what
-        ChannelBin is configured to enforce."""
-        mismatched = XtreamAccount(name='Mismatched', account_type='xtream',
-                                   base_url='http://x.test', username='u', password='p',
-                                   status='OK', max_connections=1,
-                                   provider_max_connections=5)
-        db.session.add(mismatched)
+    def _pmax_row(self, name, configured, reported):
+        acc = XtreamAccount(name=name, account_type='xtream', base_url='http://x.test',
+                            username='u', password='p', status='OK',
+                            max_connections=configured, provider_max_connections=reported)
+        db.session.add(acc)
         db.session.commit()
-        details = self._get(mismatched).split('data-section="details"')[1].split('data-section=')[0]
-        row = self._srow(details, 'Provider max connections')
-        self.assertIn('warn', row)
-        self.assertIn('configured: 1', row)
+        details = self._get(acc).split('data-section="details"')[1].split('data-section=')[0]
+        return self._srow(details, 'Provider max connections')
 
-        matched = XtreamAccount(name='Matched', account_type='xtream',
-                                base_url='http://x.test', username='u', password='p',
-                                status='OK', max_connections=5,
-                                provider_max_connections=5)
-        db.session.add(matched)
-        db.session.commit()
-        details = self._get(matched).split('data-section="details"')[1].split('data-section=')[0]
-        row = self._srow(details, 'Provider max connections')
-        self.assertNotIn('warn', row)
+    def test_provider_max_connections_warns_only_when_channelbin_may_open_more(self):
+        """dev/docs/BUGS.md 2026-10-22 10:19:03 PM. Amber is for the direction that can get
+        a connection refused - ChannelBin allowed more than the provider allows. Using fewer
+        is safe and says so in words, never in a warning color."""
+        under = self._pmax_row('Under', configured=1, reported=5)
+        self.assertNotIn('warn', under)
+        self.assertIn('(ChannelBin uses 1)', under)
+        self.assertIn('That is safe', under)
+
+        over = self._pmax_row('Over', configured=3, reported=1)
+        self.assertIn('sv warn', over)
+        self.assertIn('(ChannelBin may open 3)', over)
+        self.assertIn('Lower Max connections to 1', over)
+
+        matched = self._pmax_row('Matched', configured=5, reported=5)
+        self.assertNotIn('warn', matched)
+        self.assertNotIn('ChannelBin uses', matched)
+        self.assertNotIn('ChannelBin may open', matched)
+
+    def test_a_stream_host_unlike_the_server_says_that_is_normal(self):
+        """dev/changelog/1272 (first-time-user finding 15): two hosts side by side read as a
+        fault until the page said otherwise. Said in the page, not only a tooltip; the two
+        stay separate rows."""
+        def details_for(name, origin):
+            acc = XtreamAccount(name=name, account_type='xtream', base_url='http://panel.test:8080',
+                                username='u', password='p', status='OK',
+                                provider_stream_origin=origin)
+            db.session.add(acc)
+            db.session.commit()
+            return self._get(acc).split('data-section="details"')[1].split('data-section=')[0]
+
+        other = self._srow(details_for('Two hosts', 'http://cdn.other.test:80'), 'Streams served from')
+        self.assertIn('http://cdn.other.test:80', other)
+        self.assertIn('class="sv-note"', other)
+        self.assertIn('which is normal', other)
+
+        same = self._srow(details_for('One host', 'http://PANEL.test:80'), 'Streams served from')
+        self.assertNotIn('sv-note', same)
 
     def test_a_zero_count_is_faint_text_rather_than_a_link_to_an_empty_page(self):
         """17.3: Content's numbers are jump-offs, but a zero has nothing to jump to."""
@@ -650,7 +676,7 @@ class AccountsListRowTests(unittest.TestCase):
         db.session.commit()
         _, rows = self._rows()
         row = rows[0]
-        for label in ('Channels', 'In guide', 'EPG', 'Next sync'):
+        for label in ('Channels', 'In guide', 'Programs', 'Next sync'):
             self.assertIn(f'<span class="a-k">{label}</span>', row)
         self.assertEqual(row.count('class="a-num"'), 4)
         self.assertIn('1,234', row)
@@ -671,7 +697,7 @@ class AccountsListRowTests(unittest.TestCase):
         row = rows[0]
         self.assertEqual(row.count('class="a-num"'), 4)
         cell = row.split('<span class="a-k">Channels</span>')[1].split('class="a-num"')[0]
-        self.assertIn('<span class="a-note">9,441 hidden</span>', cell)
+        self.assertRegex(cell, r'<span class="a-note"><a class="hidden-link[^>]*>9,441 hidden</a></span>')
         self.assertNotIn('(9,441', row)
         css = open(os.path.join(REPO, 'static', 'css', 'style.css')).read()
         rule = re.search(r'\.arow \.a-num \.a-note \{(.*?)\}', css, re.S)
@@ -1050,6 +1076,24 @@ class TimeUntilOverdueTests(unittest.TestCase):
         """"overdue by 3s" reads as a fault when it is the clock ticking past the mark."""
         self.assertEqual(self._filter()(datetime.utcnow() - timedelta(seconds=3)), 'overdue')
 
+    def test_under_a_minute_is_not_a_seconds_countdown(self):
+        """dev/changelog/1272 (first-time-user finding 11): every page using this filter is
+        server-rendered and redraws at most once a minute, so "in 59s" sat still and read as
+        a broken countdown."""
+        f = self._filter()
+        self.assertEqual(f(datetime.utcnow() + timedelta(seconds=50)), 'in under a minute')
+        self.assertTrue(f(datetime.utcnow() + timedelta(minutes=3, seconds=30)).startswith('in 3m'))
+
+    def test_the_next_sync_column_reads_under_a_minute_in_its_own_width(self):
+        """Second first-time-user test, finding 16 (dev/changelog/1291): the list's Next sync
+        column cut "in under a minute" to "in under a m..."."""
+        a = _account('Soon', 'UNSYNCED')
+        a.next_sync_at = datetime.utcnow() + timedelta(seconds=50)
+        db.session.commit()
+        html = self.t.app.test_client().get('/accounts').get_data(as_text=True)
+        self.assertIn('in &lt;1m', html)
+        self.assertNotIn('in under a minute', html)
+
     def test_no_past_time_renders_as_now(self):
         f = self._filter()
         for delta in (timedelta(seconds=1), timedelta(hours=5), timedelta(days=30)):
@@ -1059,6 +1103,198 @@ class TimeUntilOverdueTests(unittest.TestCase):
         f = self._filter()
         self.assertTrue(f(datetime.utcnow() + timedelta(hours=3)).startswith('in '))
         self.assertEqual(f(None), '?')
+
+
+class HiddenCountLinkTests(unittest.TestCase):
+    """Second first-time-user test, finding 11 (dev/changelog/1291): "(3 hidden)" on the
+    Accounts list and the account page said nothing about what hid them."""
+
+    def setUp(self):
+        self.t = make_test_app()
+        self.addCleanup(self.t.cleanup)
+        self.acct = _account('Northwind', channel_count=48)
+        self.acct.hidden_channel_count = 3
+        db.session.commit()
+
+    def test_both_pages_link_the_count_to_hide_rules_and_say_what_hides_a_channel(self):
+        client = self.t.app.test_client()
+        for url in ('/accounts', f'/accounts/{self.acct.id}'):
+            html = client.get(url).get_data(as_text=True)
+            links = re.findall(r'<a class="hidden-link[^"]*" href="([^"]+)" data-tip="([^"]+)">'
+                               r'3 hidden</a>', html)
+            self.assertTrue(links, url)
+            for href, tip in links:
+                self.assertEqual(href, '/channels/hide-rules')
+                self.assertIn('hide rule', tip)
+                self.assertIn('Hide channel', tip)
+
+
+class PresetColorTests(unittest.TestCase):
+    """dev/docs/BUGS.md 2026-10-26 08:57:29 AM: the account and tag pickers offered "Green"
+    and "Teal" two degrees of hue apart, and an "Orange" that read as pink."""
+
+    @staticmethod
+    def _hue(hexval):
+        r, g, b = (int(hexval[i:i + 2], 16) / 255 for i in (1, 3, 5))
+        return colorsys.rgb_to_hsv(r, g, b)[0] * 360
+
+    def test_no_two_swatches_share_a_hue(self):
+        from app.ui_constants import PRESET_COLORS
+        for (a, la), (b, lb) in itertools.combinations(PRESET_COLORS, 2):
+            gap = abs(self._hue(a) - self._hue(b))
+            self.assertGreaterEqual(min(gap, 360 - gap), 15, f'{la} {a} and {lb} {b}')
+
+    def test_orange_sits_between_red_and_yellow(self):
+        from app.ui_constants import PRESET_COLORS
+        hue = {label: self._hue(h) for h, label in PRESET_COLORS}
+        self.assertLess(hue['Red'], hue['Orange'])
+        self.assertLess(hue['Orange'], hue['Yellow'])
+
+
+class AddFirstAccountTests(unittest.TestCase):
+    """Adding the first account, as a first-time user met it (dev/changelog/1272,
+    `dev/docs/UX-first-time-user-2026-10.md` findings 11-15): a provider sends a server,
+    a username and a password, the form must read as asking for exactly that, and what
+    happens next must be said where the user lands."""
+
+    def setUp(self):
+        self.t = make_test_app(csrf=False)
+        self.client = self.t.app.test_client()
+
+    def tearDown(self):
+        self.t.cleanup()
+
+    def _form(self):
+        return self.client.get('/accounts/new').get_data(as_text=True)
+
+    def test_the_form_starts_on_xtream_described_as_what_a_provider_sends(self):
+        html = self._form()
+        selected = re.search(r'<option value="(\w+)" selected>\s*([^<]*)', html)
+        self.assertIsNotNone(selected)
+        self.assertEqual(selected.group(1), 'xtream')
+        self.assertEqual(selected.group(2).strip(), 'Xtream Codes')
+        # What each type means is the hint's, under the select: at 375 an option carrying
+        # it was cut mid-word (second first-time-user test, finding 26, dev/changelog/1291).
+        self.assertIn('a server address, a username and a password: that is Xtream Codes',
+                      ' '.join(html.split()))
+        self.assertLess(html.index('value="xtream"'), html.index('value="m3u"'))
+        self.assertIn('<label>Server <span class="required">*</span></label>', html)
+        self.assertNotIn('Base URL', html)
+
+    def test_the_password_is_marked_required(self):
+        html = self._form()
+        self.assertIn('<label>Password <span class="required">*</span></label>', html)
+        self.assertIn("getElementById('xtream-password').required = (v === 'xtream')", html)
+
+    def test_the_help_text_names_no_config_key(self):
+        """Finding 13, the Add Account half only: Settings keeps its keys beside each label
+        on purpose. Here they read as developer text, so the hint says it in words and links
+        to Settings instead."""
+        html = self._form()
+        for key in ('sync.url_normalization', 'sync.sync_interval_hours',
+                    'accounts.default_max_connections'):
+            self.assertNotIn(f'<code>{key}</code>', html, key)
+            self.assertIn(f'q={key}', html, f'{key}: the hint links to the setting instead')
+
+    def test_the_form_explains_epg_and_what_can_be_left_alone(self):
+        html = self._form()
+        self.assertIn('The EPG is the program guide', html)
+        self.assertIn('URL Normalization <span class="form-hint-inline">(most people leave this as it is)', html)
+        self.assertNotIn('nothing is fetched until you sync it', html,
+                         'the first sync is scheduled a minute after the add')
+
+    def test_an_xtream_account_needs_a_password_to_be_added(self):
+        """dev/docs/BUGS.md 2026-10-22 10:19:01 PM."""
+        base = {'name': 'No Pass', 'account_type': 'xtream', 'base_url': 'http://x.test',
+                'username': 'u', 'color': '#58a6ff', 'sync_enabled': 'on'}
+        res = self.client.post('/accounts/new', data=base)
+        self.assertEqual(res.status_code, 200)
+        self.assertIn('Password is required.', res.get_data(as_text=True))
+        self.assertEqual(Account.query.filter_by(name='No Pass').count(), 0)
+
+        res = self.client.post('/accounts/new', data={**base, 'password': 'p'})
+        self.assertEqual(res.status_code, 302)
+        self.assertEqual(Account.query.filter_by(name='No Pass').count(), 1)
+
+    def test_the_added_toast_says_when_the_first_sync_starts_and_where_sync_now_is(self):
+        """Finding 11: the toast said "Click Sync Now", and the list has no such button -
+        Sync now is in the row's menu. It also did not say a sync was already coming."""
+        res = self.client.post('/accounts/new', data={
+            'name': 'Fresh', 'account_type': 'xtream', 'base_url': 'http://x.test',
+            'username': 'u', 'password': 'p', 'color': '#58a6ff', 'sync_enabled': 'on'},
+            follow_redirects=True)
+        html = res.get_data(as_text=True)
+        self.assertNotIn('Click Sync Now', html)
+        self.assertIn('Its first sync starts', html)
+        # The flash reaches the page through tojson, which writes the glyph as \\u22ef.
+        self.assertIn('choose Sync now from its \\u22ef menu', html)
+
+    def test_the_toast_reads_the_scheduled_time(self):
+        from app.routes.accounts import _added_message
+        on = seed.make_account(name='Soon')
+        on.next_sync_at = datetime.utcnow() + timedelta(seconds=50)
+        off = seed.make_account(name='Off')
+        off.sync_enabled = False
+        db.session.commit()
+        self.assertIn('Its first sync starts in about a minute', _added_message(on.id, 'Soon'))
+        message = _added_message(off.id, 'Off')
+        self.assertIn('Automatic sync is off', message)
+        self.assertNotIn('first sync starts', message)
+
+    def test_the_list_row_tells_the_dialog_whether_the_account_ever_synced(self):
+        """dev/docs/BUGS.md 2026-10-22 10:19:00 PM: the Sync now dialog skips its
+        skip-the-next-sync question for an account that has never synced."""
+        never = _account('Never', 'UNSYNCED')
+        synced = _account('Synced', 'OK', last_sync_at=datetime.utcnow() - timedelta(hours=1))
+        db.session.commit()
+        html = self.client.get('/accounts').get_data(as_text=True)
+
+        def prompt(account):
+            row = html.split(f'data-id="{account.id}"')[1]
+            raw = re.search(r'data-sync-prompt="([^"]*)"', row).group(1)
+            return json.loads(raw.replace('&#34;', '"'))
+
+        self.assertIs(prompt(never)['never_synced'], True)
+        self.assertIs(prompt(synced)['never_synced'], False)
+
+
+class AccountsListLabelTests(unittest.TestCase):
+    """dev/docs/BUGS.md 2026-10-22 10:19:02 PM: the cell labels belong to the card layout
+    only; where the list has its header row they printed every heading twice."""
+
+    def setUp(self):
+        with open(os.path.join(REPO, 'static', 'css', 'style.css')) as fh:
+            self.css = fh.read()
+
+    def _block(self, opener):
+        start = self.css.index(opener)
+        depth, i = 0, self.css.index('{', start)
+        for j in range(i, len(self.css)):
+            depth += {'{': 1, '}': -1}.get(self.css[j], 0)
+            if depth == 0:
+                return self.css[i:j]
+        raise AssertionError(opener)
+
+    def test_the_list_row_hides_the_cell_labels(self):
+        base = re.search(r'^\.arow \.a-num \.a-k \{(.*?)\}', self.css, re.S | re.M)
+        self.assertIsNotNone(base)
+        self.assertIn('display: none', base.group(1))
+
+    def test_both_card_layouts_show_them(self):
+        phone = self._block('@media (max-width: 960px) {\n  /* §17.5 item 1')
+        self.assertIn('.acct-head { display: none; }', phone)
+        self.assertRegex(phone, r'\.arow \.a-num \.a-k \{ display: block;')
+        narrow = self._block('@container acct-list (max-width: 715px)')
+        self.assertIn('.acct-list .acct-head { display: none; }', narrow)
+        self.assertRegex(narrow, r'\.acct-list \.arow \.a-num \.a-k \{ display: block;')
+
+    def test_the_epg_column_says_what_it_counts(self):
+        with open(os.path.join(REPO, 'templates', 'accounts.html')) as fh:
+            html = fh.read()
+        head = html.split('<div class="acct-head">')[1].split('</div>')[0]
+        self.assertIn('>Programs</span>', head)
+        self.assertIn("Every listing in this account's guide data", head)
+        self.assertNotIn('>EPG<', head)
 
 
 if __name__ == '__main__':

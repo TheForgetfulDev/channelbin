@@ -1372,12 +1372,13 @@ def resume_recording(app, recording_id: int):
             @retry_on_locked()
             def _claim_retry_resumed_and_commit():
                 from .database import RECORDING_RESUMED
+                from .watchdog import close_retry_wait
+                r = db.session.get(Recording, recording_id)
+                close_retry_wait(r, datetime.utcnow())
                 if not _claim_status_row(recording_id, (REC_STATUS_RETRYING,),
                                          REC_STATUS_IN_PROGRESS):
                     db.session.rollback()
                     return False
-                r = db.session.get(Recording, recording_id)
-                r.next_retry_at = None
                 add_recording_event(recording_id, RECORDING_RESUMED,
                                     detail=f'Retry attempt {r.dead_stream_retry_count} - reconnecting')
                 db.session.commit()
@@ -1691,6 +1692,12 @@ def record_segment_diagnostics(recording_id: int, seg, exit_code, tail, reconnec
         code_str = 'ffmpeg exit code unknown'
     elif exit_code < 0:
         code_str = f'ffmpeg killed by signal {-exit_code}'
+    elif (exit_code == 255 and seg is not None and seg.exit_reason
+          and seg.exit_reason != 'PROCESS_EXITED'):
+        # ffmpeg 7.1's code for the SIGTERM ChannelBin stops it with, so beside a stop of
+        # ChannelBin's own it is not a failure - the Segments table reads it the same way
+        # (dev/changelog/1287, 1293).
+        code_str = 'ffmpeg stopped when ChannelBin told it to (exit code 255)'
     else:
         code_str = f'ffmpeg exited {exit_code}'
     detail = f'Segment {seg_num} capture ended: {code_str}' if seg_num is not None \
@@ -1979,7 +1986,10 @@ def _handoff_stop_old_recording(app, old_recording_id: int, new_recording_id: in
     _log_old_handoff_and_commit()
 
     from .concatenator import do_concatenation
-    threading.Thread(target=do_concatenation, args=(app, old_recording_id), daemon=True).start()
+    threading.Thread(
+        target=do_concatenation, args=(app, old_recording_id), daemon=True,
+        kwargs={'reason': f'Handed off to recording #{new_recording_id}; beginning the join'},
+    ).start()
     ev.publish(old_recording_id, RECORDING_HANDOFF, {'handed_off_to': new_recording_id})
 
 
@@ -3048,8 +3058,21 @@ def stop_recording(app, recording_id: int, reason: str = 'STOP_TIME_REACHED',
                     app, recording_id, cause='scheduled window ended during the retry wait')
                 return
 
+            if rec.status == REC_STATUS_RETRYING:
+                from .watchdog import close_retry_wait
+
+                @retry_on_locked()
+                def _close_retry_wait_and_commit():
+                    r = db.session.get(Recording, recording_id)
+                    close_retry_wait(r, datetime.utcnow())
+                    db.session.commit()
+
+                _close_retry_wait_and_commit()
+
         if reason == 'MANUAL_STOP':
             _log_manual_stop_and_commit(recording_id)
+            # do_concatenation's default names the stop time, which a Stop never reached.
+            join_reason = join_reason or 'Stopped by the user; beginning the join'
 
         from .concatenator import do_concatenation
         threading.Thread(
@@ -3077,9 +3100,11 @@ def abort_recording(app, recording_id: int):
         if rec:
             @retry_on_locked()
             def _mark_aborted_and_commit():
+                from .watchdog import close_retry_wait
                 r = db.session.get(Recording, recording_id)
                 add_recording_event(recording_id, RECORDING_ABORTED, detail='Recording manually cancelled')
                 now = datetime.utcnow()
+                close_retry_wait(r, now)
                 r.status = REC_STATUS_ABORTED
                 r.cancel_reason = CANCEL_DURING_CAPTURE
                 r.stop_time = now

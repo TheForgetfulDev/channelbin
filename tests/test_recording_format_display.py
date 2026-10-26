@@ -213,13 +213,13 @@ class EfficiencyTests(unittest.TestCase):
     def test_efficiency_omitted_when_unknown(self):
         view = _format_profile(_rec(segments=[_seg(**FULL_SEG)]))
 
-        self.assertNotIn('Efficiency', [r['label'] for r in view['rows']])
+        self.assertNotIn('Bits per pixel', [r['label'] for r in view['rows']])
 
     def test_efficiency_says_which_file_it_measured_even_on_a_capture_profile(self):
         view = _format_profile(_rec(segments=[_seg(**FULL_SEG)],
                                     recorded_bits_per_pixel_frame=0.0421))
 
-        eff = _row(view, 'Efficiency')
+        eff = _row(view, 'Bits per pixel')
         self.assertEqual(eff['value'], '0.0421')
         self.assertEqual(view['source'], 'capture')
         self.assertIn('final output file', eff['tip'])

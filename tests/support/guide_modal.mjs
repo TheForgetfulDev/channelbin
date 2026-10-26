@@ -97,7 +97,7 @@ function boot() {
     window, document, errors, $, nameRequests,
     typeName: (v) => type($('#modal-name'), v),
     nameValue: () => $('#modal-name').value,
-    openModal: (prog, ch) => window.openModal(prog, ch),
+    openModal: (prog, ch, opts) => window.openModal(prog, ch, opts),
     typeStart: (v) => type($('#modal-start'), v),
     typeStop: (v) => type($('#modal-stop'), v),
     selectProfile: (v) => change($('#modal-profile'), v),
@@ -105,6 +105,10 @@ function boot() {
     stopValue: () => $('#modal-stop').value,
     noteText: () => (($('#modal-padding-note') || {}).textContent || '').trim(),
     noteVisible: () => $('#modal-padding-note').style.display !== 'none',
+    lateText: () => (($('#modal-late-note') || {}).textContent || '').trim(),
+    lateVisible: () => Boolean($('#modal-late-note')) && $('#modal-late-note').style.display !== 'none',
+    labels: () => ({ title: $('#modal-title').textContent.trim(),
+                     submit: $('#modal-submit').textContent.trim() }),
   };
 }
 
@@ -227,6 +231,118 @@ await record('edit_does_not_rename', async () => {
   await settle(c.window);
   await settle(c.window);
   return { errors: c.errors, name: c.nameValue(), requests: c.nameRequests };
+});
+
+/* ── A program already on: the modal says the aired part will be missed ─────────────────
+   dev/changelog/1275. Times are relative to the real clock, since "already on" is a
+   question about now; the fixed 2026-08 program above has long since ended, which is the
+   "nothing to say" case for every scenario before this one. */
+const isoAgo = (minutes) => new Date(Date.now() - minutes * 60000).toISOString().slice(0, 19);
+const ON_NOW = { ...PROG, id: 601, start_time: isoAgo(20), stop_time: isoAgo(-40) };
+
+await record('late_program', async () => {
+  const c = boot();
+  c.openModal(ON_NOW, CH);
+  return { errors: c.errors, visible: c.lateVisible(), text: c.lateText() };
+});
+
+await record('late_program_start_typed_future', async () => {
+  const c = boot();
+  c.openModal(ON_NOW, CH);
+  const before = c.lateVisible();
+  c.typeStart('2099-01-01T20:00');
+  return { errors: c.errors, before, visible: c.lateVisible() };
+});
+
+await record('late_program_profile_change_keeps_it', async () => {
+  const c = boot();
+  c.openModal(ON_NOW, CH);
+  c.selectProfile('1');
+  return { errors: c.errors, visible: c.lateVisible(), text: c.lateText() };
+});
+
+await record('future_program', async () => {
+  const c = boot();
+  c.openModal({ ...PROG, id: 602, start_time: isoAgo(-30), stop_time: isoAgo(-90) }, CH);
+  return { errors: c.errors, visible: c.lateVisible() };
+});
+
+await record('late_then_edit_hides_it', async () => {
+  const c = boot();
+  c.openModal(ON_NOW, CH);
+  const before = c.lateVisible();
+  c.openModal({ ...ON_NOW, has_recording: true, recording_id: 78, recording_status: 'SCHEDULED',
+                recording_start_time: isoAgo(-60), recording_stop_time: isoAgo(-120),
+                recording_profile_id: null }, CH);
+  return { errors: c.errors, before, visible: c.lateVisible() };
+});
+
+/* ── A program already on says "Record now", and its warning comes first ───────────────
+   dev/changelog/1290: "Schedule recording" for a show already on made a tester stop and
+   wonder whether it would record now or later, and on a phone the warning sat below the
+   fold behind the sheet's buttons. */
+await record('record_now_labels', async () => {
+  const c = boot();
+  c.openModal(ON_NOW, CH);
+  const late = c.labels();
+  c.typeStart('2099-01-01T20:00');
+  const typedFuture = c.labels();
+  c.openModal({ ...PROG, id: 603, start_time: isoAgo(-30), stop_time: isoAgo(-90) }, CH);
+  const future = c.labels();
+  return { errors: c.errors, late, typedFuture, future, lateText: (() => {
+    c.openModal(ON_NOW, CH); return c.lateText(); })() };
+});
+
+await record('replace_keeps_its_words', async () => {
+  const c = boot();
+  c.openModal(ON_NOW, CH, { replaceRecId: 55 });
+  return { errors: c.errors, labels: c.labels(), lateText: c.lateText() };
+});
+
+await record('modal_layout', async () => {
+  const c = boot();
+  c.openModal(ON_NOW, CH);
+  const body = c.$('#record-modal .modal-body');
+  const order = Array.from(body.querySelectorAll('#modal-late-note, #modal-name, #modal-start'))
+    .map((el) => el.id);
+  const pick = c.$('#modal-url-pick');
+  const inPick = pick ? Boolean(pick.querySelector('#modal-url-display')) : false;
+  const openedOnce = pick ? (pick.open = true, true) : false;
+  c.openModal(ON_NOW, CH);
+  return { errors: c.errors, order, isDetails: pick ? pick.tagName : null, inPick, openedOnce,
+           openAfterReopen: pick ? pick.open : null,
+           urlValue: c.$('#modal-url').value };
+});
+
+/* ── After saving a recording that starts now, the page asks again soon ─────────────────
+   dev/changelog/1290: the grid redrew before the recorder started and nothing asked again
+   until the next nav poll, so the cell said SCHEDULED for 8 to 10 s. */
+await record('start_followup', async () => {
+  const run = async (prog) => {
+    const c = boot();
+    const followups = [];
+    const delays = [];
+    c.window.fetchNavStatus = () => followups.push('nav');
+    // Any timer of a second or more runs at once, and the ones that asked for nav status
+    // are the follow-ups - their delays are what the assertions read.
+    const realTimeout = c.window.setTimeout;
+    c.window.setTimeout = (fn, delay, ...rest) => {
+      if (delay >= 1000) {
+        const before = followups.length;
+        fn();
+        if (followups.length > before) delays.push(delay);
+        return 0;
+      }
+      return realTimeout.call(c.window, fn, delay, ...rest);
+    };
+    c.openModal(prog, CH);
+    c.$('#modal-form').dispatchEvent(new c.window.Event('submit', { bubbles: true, cancelable: true }));
+    await settle(c.window);
+    await settle(c.window);
+    return { errors: c.errors, followups: followups.length, delays };
+  };
+  return { now: await run(ON_NOW),
+           later: await run({ ...PROG, id: 604, start_time: isoAgo(-30), stop_time: isoAgo(-90) }) };
 });
 
 console.log(JSON.stringify(out));

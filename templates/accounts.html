@@ -117,7 +117,8 @@ Sync cancelled before it finished.
   <span>Status</span>
   <span class="num">Channels</span>
   <span class="num">In guide</span>
-  <span class="num">EPG</span>
+  {# "EPG" beside a number did not say what it counted (dev/changelog/1272). #}
+  <span class="num tip-plain" data-tip="Programs.&#10;Every listing in this account's guide data: one per showing, across all its channels and every day the provider sends, the ones that already aired included. Search Programs counts only the showings still to come.">Programs</span>
   <span class="num">Next sync</span>
   <span></span>
 </div>
@@ -145,9 +146,9 @@ Sync cancelled before it finished.
     {# One wrapper, dissolved with display:contents on desktop so each number lands in its
        own header column, and a real 2x2 grid of fixed halves on a phone (§17.5 item 1). #}
     <span class="a-nums">
-      <span class="a-num"><span class="a-k">Channels</span>{{ '{:,}'.format(account.channel_count or 0) }}{% if account.hidden_channel_count %}<span class="a-note">{{ '{:,}'.format(account.hidden_channel_count) }} hidden</span>{% endif %}</span>
+      <span class="a-num"><span class="a-k">Channels</span>{{ '{:,}'.format(account.channel_count or 0) }}{% if account.hidden_channel_count %}<span class="a-note">{{ m.hidden_channels_link(account.hidden_channel_count) }}</span>{% endif %}</span>
       <span class="a-num"><span class="a-k">In guide</span>{{ '{:,}'.format(guide_counts.get(account.id, 0)) }}</span>
-      <span class="a-num"><span class="a-k">EPG</span>{{ '{:,}'.format(account.epg_entry_count or 0) }}</span>
+      <span class="a-num"><span class="a-k">Programs</span>{{ '{:,}'.format(account.epg_entry_count or 0) }}</span>
       <span class="a-num"><span class="a-k">Next sync</span>{{ m.account_next_sync(account, next_sync[account.id]) }}</span>
     </span>
     {# The trailing cell keeps its own class even though it holds one button, or it takes
@@ -171,7 +172,13 @@ Sync cancelled before it finished.
           <button class="menu-item" data-act="settings">Edit settings</button>
           <a class="menu-item" href="{{ url_for('channels.channel_browser', **{'f.acct': account.id}) }}">Browse channels</a>
           <div class="sep"></div>
+          {# The example account's way out is the examples' own delete, which also takes the
+             example group a bare account delete would leave empty (dev/changelog/1288). #}
+          {% if account.is_example %}
+          <button class="menu-item danger" data-act="examples-remove">Delete the examples</button>
+          {% else %}
           <button class="menu-item danger" data-act="delete">Delete account</button>
+          {% endif %}
         </div>
       </span>
     </span>
@@ -199,6 +206,7 @@ Sync cancelled before it finished.
 <script src="{{ url_for('static', filename='js/account-modal.js') }}"></script>
 <script src="{{ url_for('static', filename='js/account-actions.js') }}"></script>
 <script src="{{ url_for('static', filename='js/accounts.js') }}"></script>
+{% if accounts | selectattr('is_example') | list %}<script src="{{ url_for('static', filename='js/examples.js') }}"></script>{% endif %}
 <script src="{{ url_for('static', filename='js/account-providers.js') }}"></script>
 <script src="{{ url_for('static', filename='js/account-stats.js') }}"></script>
 {% endblock %}

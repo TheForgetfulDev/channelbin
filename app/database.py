@@ -421,6 +421,135 @@ GROUP_GUIDE_LISTINGS_SET        = 'GROUP_GUIDE_LISTINGS_SET'
 # app/channel_groups.py::set_default_profile). extra_data names the new and previous
 # profile ids and why it moved - by hand, or because the profile was deleted.
 GROUP_DEFAULT_PROFILE_SET       = 'GROUP_DEFAULT_PROFILE_SET'
+# This example group stopped being one and stayed: ChannelGroup.is_example was cleared,
+# either by Delete the examples because a channel of the user's own had been added to it
+# (dev/changelog/1281) or by Keep the examples (dev/changelog/1288). The detail says
+# which. Written only by app/examples.py. Group-wide, so channel_id is NULL.
+GROUP_EXAMPLE_KEPT              = 'GROUP_EXAMPLE_KEPT'
+
+# ── What a person calls each event type ───────────────────────────────────────
+#
+# The one display name for every recording, channel and group event type. A label, never a
+# rename: the type itself is what Logs, support bundles and every query key on, so the event
+# log shows it beside the label (dev/changelog/1293). Every self-named constant above has an
+# entry - tests/test_event_labels.py fails a new type that arrives without one - and
+# event_label() still has a fallback for a stored type no constant names any more.
+EVENT_LABELS = {
+    # Recording events
+    SEGMENT_STARTED: 'Segment started',
+    SEGMENT_ENDED: 'Segment ended',
+    STALL_DETECTED: 'Stream stalled',
+    RESTART_ATTEMPTED: 'Restarting the capture',
+    RESTART_SUCCEEDED: 'Capture restarted',
+    RESTART_FAILED: 'Restart got no data',
+    CAPTURE_COMPLETE: 'Capture finished',
+    CONCATENATION_STARTED: 'Putting the segments into one file',
+    CONCATENATION_DONE: 'Segments put into one file',
+    CONCATENATION_FAILED: 'Could not put the segments into one file',
+    RECORDING_FAILED: 'Recording failed',
+    RECORDING_FAILED_DEAD_STREAM: 'Failed: the stream sent nothing',
+    RECORDING_RETRY_SCHEDULED: 'Will try the stream again',
+    RECORDING_RESUMED: 'Picked back up',
+    RECORDING_RESUME_REFUSED: 'Not picked back up: a capture is already running',
+    CAPTURE_LOST_TO_OUTAGE: 'Capture lost while ChannelBin was down',
+    RECORDING_START_DEFERRED: 'Start delayed',
+    RECORDING_ABORTED: 'Cancelled',
+    RECORDING_PAUSED: 'Paused',
+    RECORDING_MANUALLY_STOPPED: 'Stopped by hand',
+    RECORDING_CREATED_AFTER_EVENT_START: 'Created after the program started',
+    RECORDING_STARTED_LATE: 'Started late',
+    RECORDING_STOPPED_EARLY: 'Stopped before its stop time',
+    RECORDING_EDITED: 'Times edited',
+    RECORDING_STOP_TIME_ADJUSTED: 'Stop time changed',
+    RECORDING_HANDOFF: 'Handed the channel to the next recording',
+    GROUP_MEMBER_SELECTED: 'Channel chosen from the group',
+    GROUP_FAILOVER: 'Switched to another channel',
+    RECORDING_FORMAT_OVERRIDE: 'Recorded outside the group\'s format',
+    RECORDING_FORMAT_CHANGED: 'Picture format changed',
+    RECORDING_URL_RERESOLVED: 'Stream address updated',
+    RECORDING_HOST_ROLLED: 'Moved to the account\'s next server',
+    RECORDING_LOGIN_REFUSED: 'Login refused',
+    RECORDING_REPLACED_OTHER: 'Replaced another recording',
+    RECORDING_RULE_SCHEDULED: 'Scheduled by an auto-record rule',
+    RECORDING_START_NOT_ARMED: 'Will not start on its own',
+    RECORDING_RULE_RETRACKED: 'Moved with its program',
+    RECORDING_RULE_PROGRAM_MOVED: 'Program moved, recording stayed',
+    RECORDING_RULE_RELEASED: 'No longer follows its rule',
+    RECORDING_REPOINTED: 'Moved to another copy of the channel',
+    RECORDING_METADATA_REFRESHED: 'Description updated from the guide',
+    RECORDING_METADATA_REFRESH_SKIPPED: 'Description kept as you set it',
+    RECORDING_METADATA_EDITED: 'Description edited',
+    METADATA_SIDECAR_WRITTEN: 'Media server files written',
+    METADATA_SIDECAR_FAILED: 'Could not write the media server files',
+    SEEK_DAMAGE_DETECTED: 'Gaps found in the file',
+    MIXED_FRAME_RATE_DETECTED: 'Frame rate changed',
+    FORMAT_NORMALIZE_NEEDED: 'Format needs evening out',
+    SEGMENT_DISCARDED: 'Segment thrown away',
+    FAST_DELIVERY_DETECTED: 'Stream came faster than live',
+    CAPTURE_PACING_ENABLED: 'Reading the stream at live speed',
+    CAPTURE_VIDEO_STOPPED: 'Video stopped',
+    CAPTURE_VIDEO_RESUMED: 'Video back',
+    DIAGNOSTICS: 'Technical detail',
+    POSTCAPTURE_ANALYSIS_STARTED: 'Checking the file',
+    POSTCAPTURE_ANALYSIS_SKIPPED: 'File check already done',
+    CONVERSION_STARTED: 'Converting',
+    CONVERSION_RESTARTED: 'Conversion restarted',
+    CONVERSION_YIELDED: 'Conversion waiting for a recording',
+    CONVERSION_RESUMED: 'Conversion resumed',
+    CONVERSION_DONE: 'Converted',
+    CONVERSION_FAILED: 'Conversion failed',
+    CONVERSION_CANCELLED: 'Conversion cancelled',
+    CONVERTED_FILE_GAPS: 'Converted file has gaps',
+    SOURCE_DELETED: 'Original .ts deleted',
+    SOURCE_KEPT: 'Original .ts kept',
+    FILE_MOVED: 'File moved',
+    FILE_MOVE_FAILED: 'Could not move the file',
+    SCRIPT_EXECUTED: 'Script ran',
+    PRE_CHECK_PASSED: 'Pre-recording check passed',
+    PRE_CHECK_FAILED: 'Pre-recording check failed',
+    PRE_CHECK_SKIPPED: 'Pre-recording check skipped',
+    # Channel events
+    CHANNEL_ADDED_TO_GUIDE: 'Added to the TV Guide',
+    CHANNEL_REMOVED_FROM_GUIDE: 'Removed from the TV Guide',
+    CHANNEL_HEALTH_OVERRIDE_CHANGED: 'Health offset changed',
+    CHANNEL_GROUPED: 'Added to a group',
+    CHANNEL_UNGROUPED: 'Removed from a group',
+    CHANNEL_FAILOVER_HEALTH_OBSERVATION: 'A recording left it after it died',
+    CHANNEL_STALL_DEMOTION_HEALTH_OBSERVATION: 'A recording left it for stalling',
+    CHANNEL_PLACEHOLDER_HEALTH_OBSERVATION: 'Sent the provider\'s offline clip',
+    CHANNEL_FAST_DELIVERY_HEALTH_OBSERVATION: 'Sent the stream faster than live',
+    CHANNEL_URL_CHANGED: 'Stream address changed',
+    CHANNEL_HIDE_OVERRIDE_CHANGED: 'Hidden or shown by hand',
+    CHANNEL_HEALTH_ROLLBACK: 'Health score rolled back',
+    CHANNEL_HEALTH_RECOMPUTED: 'Health score recalculated',
+    CHANNEL_TEST_DELETED: 'Health test deleted',
+    CHANNEL_EPG_SOURCE_CHANGED: 'Guide source changed',
+    CHANNEL_EPG_KEY_CHANGED: 'Guide id changed',
+    CHANNEL_EPG_SOURCE_OVERRIDE_CHANGED: 'Guide source chosen by hand',
+    # Group events
+    GROUP_MEMBER_PARTICIPATION: 'Participation changed',
+    CHANNEL_GROUP_FORMAT_MISMATCH: 'Format mismatch',
+    CHANNEL_GROUP_FORMAT_RESOLVED: 'Format resolved',
+    GROUP_FORMAT_STRATEGY_APPLIED: 'Format strategy applied',
+    GROUP_FORMAT_STRATEGY_BLOCKED: 'Format strategy found nothing',
+    GROUP_CHECK_TARGETS_CHANGED: 'Check targets changed',
+    GROUP_WARNING_MUTED: 'Warning banner changed',
+    GROUP_GUIDE_ADDED: 'Added to the TV Guide',
+    GROUP_GUIDE_REMOVED: 'Removed from the TV Guide',
+    GROUP_GUIDE_BROKEN: 'In the guide with nothing to record',
+    GROUP_GUIDE_LISTINGS_SET: 'Guide listings changed',
+    GROUP_DEFAULT_PROFILE_SET: 'Default profile changed',
+    GROUP_EXAMPLE_KEPT: 'No longer an example',
+}
+
+
+def event_label(event_type):
+    """What a person calls an event type. A type with no entry - a stored row whose constant
+    was retired - reads as its own words in sentence case rather than as nothing."""
+    if not event_type:
+        return ''
+    return EVENT_LABELS.get(event_type) or event_type.replace('_', ' ').capitalize()
+
 
 # ── Models ────────────────────────────────────────────────────────────────────
 #
@@ -779,8 +908,9 @@ class Recording(db.Model):
     # Dead-stream fast-fail retry budget (watchdog.dead_stream_max_retry_attempts). Counts
     # attempts scheduled, not just fired - incremented when status -> RETRYING, never reset
     # (a mid-window recovery that later dies again keeps counting against the same budget, so
-    # a flapping stream cannot re-arm 10 fresh attempts per trip). next_retry_at is display-only
-    # (the retry_<id> APScheduler job is the actual timer) and is cleared on leaving RETRYING.
+    # a flapping stream cannot re-arm 10 fresh attempts per trip). next_retry_at is not the
+    # timer (the retry_<id> APScheduler job is); it is shown on the page, and clearing it is
+    # the record that the wait was charged to downtime (watchdog.close_retry_wait).
     dead_stream_retry_count   = db.Column(db.Integer, nullable=False, default=0,
                                           server_default=db.text('0'))
     next_retry_at             = db.Column(db.DateTime)
@@ -1187,9 +1317,11 @@ class Recording(db.Model):
         all, or None until the recording is over. A fact about the clock, not a claim about
         content: what the feed would have carried during a gap is unknowable from here.
 
-        Distinct from total_downtime_seconds, which is a superset - downtime also counts
+        Distinct from total_downtime_seconds, and mostly inside it - downtime also counts
         the no-growth window inside a segment that had stopped delivering but had not yet
-        been killed, which this cannot see because that segment was still running.
+        been killed, which this cannot see because that segment was still running. Only two
+        things are here and not in downtime: time spent paused (the user's choice, not a
+        loss) and the seconds before the first segment opened.
 
         Deliberately NOT a column, like the two properties around it - every input already
         has one, and deriving it keeps a single source of truth (CLAUDE.md §Measurements)
@@ -1597,6 +1729,11 @@ class Account(db.Model):
     #: dev/changelog/1170): "these accounts reach the same backend". NULL = on none, which is
     #: every account until the user says otherwise. Written only by app/account_links.py.
     provider_id       = db.Column(db.Integer, db.ForeignKey('providers.id'))
+    #: Created by "Try it with example channels" (app/examples.py, dev/changelog/1281) and
+    #: nothing else: Delete the examples deletes exactly the accounts carrying it. Never set
+    #: on an account the user added, and never derived from the name or the URL.
+    is_example        = db.Column(db.Boolean, nullable=False, default=False,
+                                  server_default=db.text('0'))
     created_at        = db.Column(db.DateTime, default=datetime.utcnow)
     updated_at        = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -1808,10 +1945,15 @@ class ChannelGroup(db.Model):
 
     id               = db.Column(db.Integer, primary_key=True)
     name             = db.Column(db.String(255), nullable=False)
-    # The pinned "TV Guide Channels" system group: membership computed dynamically
+    # The pinned "TV Guide health check" system group: membership computed dynamically
     # (in_guide + test_enabled) at run/display time, no stored membership rows, not
     # deletable.
     is_system        = db.Column(db.Boolean, nullable=False, default=False,
+                                 server_default=db.text('0'))
+    #: Created by "Try it with example channels" (app/examples.py, dev/changelog/1281).
+    #: A group holding a channel the user added is theirs by then: Delete the examples
+    #: keeps it, clears this and says so on the group's timeline.
+    is_example       = db.Column(db.Boolean, nullable=False, default=False,
                                  server_default=db.text('0'))
     in_guide         = db.Column(db.Boolean, nullable=False, default=False)
     # Shares the same numeric ordering space as Channel.guide_sort_order
@@ -2459,7 +2601,7 @@ class OnDemandTestJob(db.Model):
 
     id                   = db.Column(db.Integer, primary_key=True)
     name                 = db.Column(db.String(512), nullable=False)
-    # The single pinned "TV Guide Channels" system job: its channel list is resolved
+    # The single pinned "TV Guide health check" system job: its channel list is resolved
     # dynamically at run/display time via its is_system group - one channel per guide row
     # plus one per group with no schedule of its own, minus any whose channel-wide
     # test_enabled is off (channel_groups.system_check_targets, dev/changelog/752). It
@@ -2872,6 +3014,11 @@ class Alert(db.Model):
     created_at   = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
     read_at      = db.Column(db.DateTime)       # null = unread
     dismissed_at = db.Column(db.DateTime)       # null = active
+    # True when the app set dismissed_at because the condition ended, never when a person
+    # dismissed it - the one way to tell "it went away" from "someone hid it". Written only by
+    # app/alerts.py::mark_cleared() (dev/changelog/1293).
+    cleared_by_app = db.Column(db.Boolean, nullable=False, default=False,
+                               server_default=db.text('0'))
 
 
 class IgnoredAlertPattern(db.Model):

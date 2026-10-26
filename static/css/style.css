@@ -658,8 +658,8 @@ body.scroll-locked { position: fixed; left: 0; right: 0; width: 100%; overflow: 
   color: var(--bad);
 }
 
-/* Tab strip. Started life as the Channels hub's own strip
-   (templates/channels/_tabs.html) and was promoted to a generic component when
+/* Tab strip. Started life as the Channels hub's own strip (retired in
+   dev/changelog/1277) and was promoted to a generic component when
    Settings adopted it for GUI/config.yaml (dev/changelog/439) - the page had a
    second, bespoke pill tab bar doing the same job. Works as either <a> or
    <button>, hence the button resets. */
@@ -1431,6 +1431,7 @@ body.scroll-locked { position: fixed; left: 0; right: 0; width: 100%; overflow: 
 .dur-flag { color: var(--warn); font-weight: 700; margin-right: 5px; }
 .row.st-live .dur-flag { color: var(--text-faint); } /* live = expected-partial */
 .dur-amber { color: var(--warn); }
+.dur-flag.dur-quiet { color: var(--text-faint); } /* stopped early by the user: short, not trouble */
 .c-health { font-size: var(--fs-sm); color: var(--text-muted); text-align: right; }
 .h-mini { display: inline-flex; align-items: center; gap: 4px; font-size: var(--fs-xs); font-weight: 700; border-radius: 999px; padding: 2px 9px; }
 .h-mini.ok { background: var(--ok-soft); color: var(--ok); }
@@ -2039,6 +2040,17 @@ body.actbar-on #app-toast { bottom: 78px; }
 .live-strip b { color: var(--text); font-weight: 600; }
 .live-strip .mono { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
 .live-strip .sep-dot { color: var(--text-faint); }
+/* Under way but nothing arriving - the watchdog's state, not the recording's status
+   (dev/changelog/1285): the stall amber, and a dot that stops pulsing. */
+.live-strip.not-capturing::before { background: var(--warn); }
+.live-strip.not-capturing .pulse { background: var(--warn); animation: none; }
+/* A wrapped strip starts its next line with the separator, which read as a stray "-" on a
+   phone (dev/changelog/1275). CSS cannot hide only the dot that lands at a line start, so
+   the phone drops them all and the column gap does the separating. */
+@media (max-width: 960px) {
+  .live-strip { row-gap: 4px; }
+  .live-strip .sep-dot { display: none; }
+}
 .done-strip::before { background: var(--ok); }
 .done-strip .fx { color: var(--ok); font-weight: 800; }
 /* A finished recording whose converted file lost video (dev/changelog/1200). */
@@ -2085,6 +2097,8 @@ body.actbar-on #app-toast { bottom: 78px; }
   background: rgba(0,0,0,.55); color: #fff; border-radius: 999px; padding: 2px 8px; display: flex; align-items: center; gap: 5px;
 }
 .bigthumb .live-tag .pulse { width: 6px; height: 6px; border-radius: 50%; background: var(--live); animation: pulse 1.6s infinite; }
+/* Nothing written for a while: the frame shown is the last one there is, not live video. */
+.bigthumb .live-tag.stale .pulse { display: none; }
 .bigthumb .shot-age { position: absolute; bottom: 8px; right: 8px; font-size: var(--fs-2xs); color: rgba(255,255,255,.55); background: rgba(0,0,0,.5); border-radius: 999px; padding: 2px 7px; font-family: var(--font-mono); }
 .hero-right { min-width: 0; display: flex; flex-direction: column; gap: 14px; }
 
@@ -2140,14 +2154,24 @@ body.actbar-on #app-toast { bottom: 78px; }
 .ev.warn::before { border-color: var(--warn); }
 .ev.bad::before  { border-color: var(--bad); }
 .ev-head { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
-.ev-type { font-size: var(--fs-xs); font-weight: 700; letter-spacing: .04em; font-family: var(--font-mono); color: var(--text-muted); }
+.ev-type { font-size: var(--fs-sm); font-weight: 600; color: var(--text-muted); }
 .ev.info .ev-type { color: var(--accent-text); }
 .ev.ok .ev-type   { color: var(--ok); }
 .ev.warn .ev-type { color: var(--warn); }
 .ev.bad .ev-type  { color: var(--bad); }
 .ev-time { font-size: var(--fs-xs); color: var(--text-faint); font-family: var(--font-mono); }
 .ev-seg { font-size: var(--fs-xs); color: var(--text-faint); background: var(--bg2); border-radius: 999px; padding: 0 8px; }
+.ev-code { font-size: var(--fs-xs); color: var(--text-faint); font-family: var(--font-mono); overflow-wrap: anywhere; }
 .ev-detail { font-size: var(--fs-md); color: var(--text-muted); margin-top: 1px; overflow-wrap: anywhere; }
+/* A finished recording's log ran to ~7,800px on a phone, burying everything else on the
+   page (dev/changelog/1275). The phone shows the first ten in the chosen order until asked;
+   the desktop has the width to show them all. recording_detail.html re-applies "show all"
+   after the 15s panel swap. */
+.ev-more { display: none; }
+@media (max-width: 960px) {
+  .evlog.ev-clip > .ev:nth-child(n+11) { display: none; }
+  .ev-more { display: inline-flex; }
+}
 /* DIAGNOSTICS disclosure (dev/changelog/334): the headline numbers stay in .ev-detail,
    the measured-but-not-column-worthy rest hides behind this. Open state is re-applied
    after the 15s panel swap by recording_detail.html's __applyEvDisclosures. */
@@ -2588,6 +2612,10 @@ body.actbar-on #app-toast { bottom: 78px; }
 .gd-chip:hover, a.gd-chip:hover { text-decoration: none; }
 
 .card-note { font-size: var(--fs-md); color: var(--text-muted); margin: 0 0 2px; max-width: 78ch; }
+/* The recording page's "What happened" card (dev/changelog/1270): plain sentences, read
+   top to bottom, so a list rather than a stat grid. */
+.story { margin: 6px 0 8px; padding-left: 1.2em; max-width: 78ch; font-size: var(--fs-md); line-height: 1.5; }
+.story li + li { margin-top: 4px; }
 
 /* ── Channels table ────────────────────────────────────────────────── */
 /* The four standing filter controls this page used to carry (.gd-filter and its two
@@ -3123,6 +3151,10 @@ th.gd-c-part { text-align: center; }
 .health-score-block { display: flex; align-items: center; gap: 1rem; }
 .health-score-num { font-size: var(--fs-display-lg); font-weight: 800; line-height: 1; letter-spacing: -.02em; font-variant-numeric: tabular-nums; color: var(--hb, var(--text)); }
 .health-score-meta { font-size: var(--fs-sm); color: var(--text-muted); line-height: 1.6; min-width: 0; }
+/* A score from fewer than 3 observations keeps its band's color, dimmed, beside the word
+   "Early" - the Groups list already dims a group score under 3 the same way. A full-strength
+   green 100 beside "too few to rely on" read as two verdicts (dev/changelog/1289). */
+.health-score-num.hs-early, .h-mini.hs-early { opacity: .55; }
 .health-score-meta .hs-lbl { font-size: var(--fs-2xs); text-transform: uppercase; letter-spacing: .06em; color: var(--text-faint); }
 .health-score-meta .hs-line { display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap; }
 .health-lower { display: flex; align-items: flex-start; gap: 1.4rem; }
@@ -3222,7 +3254,7 @@ a.shot-link { display: block; width: fit-content; cursor: zoom-in; }
    so it comes from a fallback that ships no bold face and the browser has nothing
    to synthesize from. Size and -webkit-text-stroke are the two levers that do
    work, so both are used. Do not "tidy" this back to font-weight (16.6). */
-.sec-head .sec-actions .btn .arw {
+.sec-head .sec-actions .btn .arw, .gs-banner .btn .arw, .gs-acts .btn .arw, .gs-half .btn .arw {
   margin-left: 2px; font-size: 1.25em; line-height: 1;
   opacity: 1; -webkit-text-stroke: .6px currentColor;
   /* The glyph sits high in its em box; this drops it onto the text baseline. */
@@ -3239,6 +3271,106 @@ a.shot-link { display: block; width: fit-content; cursor: zoom-in; }
   background: var(--bg1); border: 1px solid var(--border-soft); border-radius: var(--radius);
 }
 .dash-empty strong { display: block; color: var(--text); font-size: var(--fs-base); font-weight: 600; margin-bottom: 5px; }
+
+/* ── The setup banner (16.2, mockup 44) ──────────────────────────────
+   Solid accent on purpose: on a new install it is the only thing on the page worth
+   reading. Shown from app/setup_steps.py's reading of the install and from nothing
+   stored, so it has no dismiss. The bar fills from the left by the done count, never
+   per step: a new install's machine step passes before anyone acts, and a per-step
+   fill lit the second segment under a banner naming step 1 (dev/changelog/1278). */
+.gs-banner {
+  display: flex; align-items: center; gap: 18px 28px; flex-wrap: wrap;
+  border-radius: var(--radius); padding: 20px 24px; margin-bottom: 18px;
+  background: var(--accent); color: var(--accent-contrast);
+}
+.gs-b-main { flex: 1 1 360px; min-width: 0; }
+.gs-b-eyebrow {
+  font-size: var(--fs-xs); font-weight: 700; letter-spacing: .08em; text-transform: uppercase;
+  opacity: .85;
+}
+.gs-b-title { font-size: var(--fs-2xl); font-weight: 700; line-height: 1.25; margin-top: 4px; }
+.gs-b-text { font-size: var(--fs-lg); line-height: 1.5; margin-top: 4px; opacity: .92; max-width: 70ch; }
+/* Equal fr tracks in one grid, however many steps there are: nothing to slide. */
+.gs-segs {
+  display: grid; grid-auto-flow: column; grid-auto-columns: minmax(0, 1fr);
+  gap: 6px; margin-top: 14px; max-width: 360px;
+}
+.gs-seg { height: 6px; border-radius: 999px; background: currentColor; opacity: .28; }
+.gs-seg.done { opacity: 1; }
+.gs-b-acts { display: flex; flex-direction: column; align-items: stretch; gap: 8px; flex: 0 0 auto; }
+.gs-b-acts .btn { justify-content: center; }
+.gs-b-acts .gs-b-go {
+  background: var(--accent-contrast); color: var(--accent); border-color: var(--accent-contrast);
+  font-weight: 700;
+}
+.gs-b-acts .gs-b-go:hover { background: var(--accent-contrast); filter: brightness(1.25); }
+/* The lead step's own page, second to Get started: outlined, so the filled button stays the
+   one that reads first. */
+.gs-b-acts .gs-b-second { background: transparent; color: var(--accent-contrast); border-color: var(--accent-contrast); }
+.gs-b-acts .gs-b-second:hover { background: transparent; color: var(--accent-contrast); text-decoration: underline; }
+
+/* ── The Get started page (16.7, mockup 44) ──────────────────────────
+   One step per card: a status mark in a fixed column, then the step. A fixed track, so the
+   marks line up down the list whatever a title wraps to. The look per state is
+   app/setup_steps.py's DISPLAY: done, problem, wait, later, and the two TODO looks - now
+   (the one step to do next, accented) and todo. */
+.gs-steps { list-style: none; margin: 14px 0 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
+.gs-step {
+  display: grid; grid-template-columns: 28px 1fr; gap: 0 14px; align-items: start;
+  background: var(--bg1); border: 1px solid var(--border-soft); border-radius: var(--radius);
+  padding: 14px 18px; box-shadow: var(--shadow-row);
+}
+.gs-step.now { border-color: rgba(var(--accent-rgb), .5); }
+.gs-step.problem { border-color: rgba(var(--bad-rgb), .5); }
+.gs-step.wait { border-color: rgba(var(--warn-rgb), .45); }
+.gs-main { min-width: 0; }
+.gs-mark {
+  width: 28px; height: 28px; border-radius: 999px; display: flex; align-items: center;
+  justify-content: center; font-weight: 700; font-size: var(--fs-sm); font-family: var(--font-mono);
+  background: var(--bg2); color: var(--text-muted); border: 1px solid var(--border);
+}
+.gs-step.done .gs-mark { background: var(--ok-soft); color: var(--ok-text); border-color: transparent; }
+.gs-step.now .gs-mark { background: var(--accent-soft); color: var(--accent-text); border-color: var(--accent); }
+.gs-step.problem .gs-mark { background: var(--bad-soft); color: var(--bad-text); border-color: transparent; }
+.gs-step.wait .gs-mark { background: var(--warn-soft); color: var(--warn-text); border-color: transparent; }
+.gs-head { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; min-width: 0; }
+.gs-title { font-size: var(--fs-base); font-weight: 600; color: var(--text); }
+.gs-step.later .gs-title { color: var(--text-muted); }
+.gs-tag { font-size: var(--fs-xs); color: var(--text-faint); }
+.gs-state { font-size: var(--fs-md); color: var(--text-muted); margin-top: 3px; line-height: 1.45; }
+.gs-step.problem .gs-state { color: var(--bad-text); }
+.gs-body { font-size: var(--fs-md); color: var(--text); line-height: 1.55; margin-top: 8px; max-width: 72ch; }
+.gs-acts { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 12px; }
+.gs-done-note { margin-top: 14px; }
+.gs-opt-head { margin: 22px 2px 0; }
+/* The search card and the hand-off to Readiness. The Maintenance numbers are the sidebar's
+   own classes, inline, so the explanation shows the very badge it explains. */
+.gs-card { margin-top: 22px; }
+.gs-card p, .gs-card ul { font-size: var(--fs-md); line-height: 1.55; max-width: 72ch; }
+.gs-card p { margin: 8px 0 0; }
+.gs-card p:first-child { margin-top: 0; }
+.gs-card ul { margin: 6px 0 0; padding-left: 18px; }
+.gs-card .nav-count { display: inline-block; vertical-align: 1px; margin: 0 2px; }
+.gs-pair { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; margin-top: 12px; }
+.gs-half { background: var(--bg2); border: 1px solid var(--border-soft); border-radius: var(--radius); padding: 12px 14px; }
+.gs-half h3 { font-size: var(--fs-lg); font-weight: 600; margin: 0; }
+.gs-half p { margin: 6px 0 10px; }
+/* The account step's examples branch (dev/changelog/1281): the .gs-half panel inside the
+   step, so it reads as the second way through the step rather than a step of its own. */
+.gs-try { background: var(--bg2); border: 1px solid var(--border-soft); border-radius: var(--radius); padding: 12px 14px; margin-top: 14px; max-width: 76ch; }
+.gs-try-head { font-size: var(--fs-base); font-weight: 600; }
+.gs-try p, .gs-try ul { font-size: var(--fs-md); line-height: 1.55; margin: 6px 0 0; }
+.gs-try ul { padding-left: 18px; }
+.gs-try .gs-acts { margin-top: 10px; }
+
+/* ── The Get started menu link: first under Setup, louder than its neighbors, and not
+   drawn once the four steps are done (base.html, from setup_steps' cached count). No tint
+   of its own: the tint is the current page's mark, and two tinted items read as two
+   selected ones (dev/changelog/1288). Its own page tints it through .active as usual. ── */
+.nav-link.nav-gs, .nav-link.nav-gs:hover { color: var(--accent-text); font-weight: 600; }
+.nav-link.nav-gs .nav-i { color: var(--accent-text); }
+.nav-count.nav-count-setup,
+.nav-link.active .nav-count.nav-count-setup { background: var(--accent); color: var(--accent-contrast); font-weight: 600; }
 
 /* ── The metric strip (16.1) ─────────────────────────────────────────
    It carries facts about the SYSTEM - disk, error rate, sync freshness - rather
@@ -3466,6 +3598,11 @@ a.shot-link { display: block; width: fit-content; cursor: zoom-in; }
 /* Window still open, nothing capturing inside it: PAUSED and RETRYING (TL_BAR_CLASS in
    dashboard.js). Amber, matching this state's colour everywhere else in the app. */
 .tl-bar.stalled    { background: var(--warn-soft); border-color: var(--warn); }
+/* Finished rows (dev/changelog/1270): green when clean, amber when the file came out
+   partial or stalled, red when the recording failed. */
+.tl-bar.done       { background: var(--ok-soft); border-color: var(--ok); }
+.tl-bar.done.trouble { background: var(--warn-soft); border-color: var(--warn); }
+.tl-bar.failed     { background: var(--bad-soft); border-color: var(--bad); }
 /* A status TL_BAR_CLASS does not name. Deliberately unlike every real state - a bar that
    silently borrowed one of their colours is the defect this replaced. */
 .tl-bar.unknown    { background: var(--bg3); border-style: dashed; border-color: var(--text-faint); }
@@ -3488,6 +3625,9 @@ a.shot-link { display: block; width: fit-content; cursor: zoom-in; }
 .tl-key i.live { background: var(--bad-soft); border-color: var(--live); }
 .tl-key i.converting { background: var(--accent-soft); border-color: var(--accent); }
 .tl-key i.scheduled { background: var(--bg2); }
+.tl-key i.done { background: var(--ok-soft); border-color: var(--ok); }
+.tl-key i.trouble { background: var(--warn-soft); border-color: var(--warn); }
+.tl-key i.failed { background: var(--bad-soft); border-color: var(--bad); }
 .tl-key i.job { background: var(--accent); border-color: var(--accent); transform: rotate(45deg) scale(.8); }
 .tl-key i.jobclash { background: var(--warn-soft); border-color: var(--warn); transform: rotate(45deg) scale(.8); }
 .tl-key.clash { color: var(--warn); }
@@ -3526,6 +3666,11 @@ a.shot-link { display: block; width: fit-content; cursor: zoom-in; }
   /* Two up. Only the first two tiles are above the fold, so the ORDER of
      _metric_tiles() is doing more work here than it does on desktop. */
   .dash-pulse { grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 16px; }
+  .gs-banner { padding: 16px; margin-bottom: 16px; }
+  .gs-b-title { font-size: var(--fs-xl); }
+  .gs-b-acts { flex: 1 1 100%; }
+  .gs-step { padding: 12px 14px; gap: 0 12px; }
+  .gs-pair { grid-template-columns: minmax(0, 1fr); }
   .mtile { padding: 9px 11px 9px calc(11px + var(--edge-w)); }
   .mtile .m-v { font-size: var(--fs-2xl); }
 
@@ -3643,8 +3788,11 @@ a.shot-link { display: block; width: fit-content; cursor: zoom-in; }
   font-size: var(--fs-md); font-family: var(--font-mono); font-variant-numeric: tabular-nums;
   min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
+/* The cell's own label is the card layout's (both blocks below turn it on). Wherever the
+   row is a list row, .acct-head already names the column above it, and the label printed
+   every heading twice (dev/changelog/1272). */
 .arow .a-num .a-k {
-  display: block; font-family: var(--font); font-size: var(--fs-xs); text-transform: uppercase;
+  display: none; font-family: var(--font); font-size: var(--fs-xs); text-transform: uppercase;
   letter-spacing: .06em; color: var(--text-faint); margin-bottom: 1px; text-align: right;
 }
 /* A qualifier on its own line under the number (the Channels cell's hidden count) rather
@@ -3656,6 +3804,10 @@ a.shot-link { display: block; width: fit-content; cursor: zoom-in; }
   margin-top: 1px; overflow: hidden; text-overflow: ellipsis;
 }
 .acct-rows .arow:has(.a-note) .a-num { align-self: start; }
+/* An account's hidden count (macro hidden_channels_link): a link to Hide Rules that keeps
+   the color of the text around it, underlined so it reads as one. */
+.hidden-link { color: inherit; text-decoration: underline dotted; text-underline-offset: 2px; }
+.hidden-link:hover { color: var(--accent-text); }
 /* The trailing cell keeps its own class even though it holds one button: an unclassed cell
    takes the default grid order and shifts every header label off its column (§17.6). */
 .arow .a-actions { display: flex; justify-content: flex-end; }
@@ -3714,7 +3866,7 @@ a.shot-link { display: block; width: fit-content; cursor: zoom-in; }
     margin-top: 2px; padding-top: 9px; border-top: 1px solid var(--border-soft);
   }
   .arow .a-num { text-align: left; }
-  .arow .a-num .a-k { text-align: left; font-size: var(--fs-2xs); }
+  .arow .a-num .a-k { display: block; text-align: left; font-size: var(--fs-2xs); }
   /* Taller than desktop's 14px so it does not read as a hairline beside 16px text. It is
      not a tap target - nothing inside a row is (§17.5 item 6). */
   .spark { height: 16px; gap: 3px; }
@@ -3754,7 +3906,7 @@ a.shot-link { display: block; width: fit-content; cursor: zoom-in; }
     margin-top: 2px; padding-top: 9px; border-top: 1px solid var(--border-soft);
   }
   .acct-list .arow .a-num { text-align: left; }
-  .acct-list .arow .a-num .a-k { text-align: left; font-size: var(--fs-2xs); }
+  .acct-list .arow .a-num .a-k { display: block; text-align: left; font-size: var(--fs-2xs); }
   .acct-list .spark { height: 16px; gap: 3px; }
   .acct-list .spark i { width: 5px; }
 }
@@ -4055,6 +4207,12 @@ a.shot-link { display: block; width: fit-content; cursor: zoom-in; }
 .statlist .sv.faint { color: var(--text-faint); font-weight: 500; }
 /* "(global)" after an inherited value: the value is the fact, the marker is the footnote. */
 .statlist .sv .sv-inherit { font-weight: 400; font-size: .92em; }
+/* A sentence under a value saying what it means for the user - prose, so not the value
+   column's mono, and on its own line so the value above it still reads alone. */
+.statlist .sv .sv-note {
+  display: block; margin-top: 2px; font-family: var(--font); font-size: var(--fs-sm);
+  font-weight: 400; color: var(--text-muted); word-break: normal;
+}
 /* A count that is a jump-off to the page listing what it counts (§17.3). It keeps the
    value column's mono/tabular alignment - a link that changed the font would make the
    Content card's numbers stop lining up with the Details card's. */
@@ -4286,18 +4444,21 @@ a.shot-link { display: block; width: fit-content; cursor: zoom-in; }
   .cg-picked { max-height: 196px; }
 }
 
-/* ── Account blocks (app/account_blocks.py, dev/changelog/1151) ─────────────
-   The record modal's "Block account use during this recording" picker. Collapsed until
-   opened: most recordings block nothing, and the modal must not grow a list of every
-   account for them. */
-.acct-block-pick > summary { cursor: pointer; font-size: var(--fs-md); color: var(--text-muted); }
-.acct-block-pick > summary:hover { color: var(--accent-text); }
-.acct-block-pick[open] > summary { margin-bottom: 0.4rem; }
+/* ── A form field collapsed until opened ───────────────────────────────────
+   The record modal's "Block account use during this recording" picker (app/account_blocks.py,
+   dev/changelog/1151) and its Stream URL (dev/changelog/1290). Collapsed because most
+   recordings block nothing and nobody needs to read the URL to record a channel: the modal
+   must not grow a list of every account, or a field a first-time user cannot act on. */
+.form-disclose > summary { cursor: pointer; font-size: var(--fs-md); color: var(--text-muted); }
+.form-disclose > summary:hover { color: var(--accent-text); }
+.form-disclose[open] > summary { margin-bottom: 0.4rem; }
 /* The account pages' list of blocks in force or still to come, one line each with its
    Unblock button. */
 .acct-block-line { display: flex; align-items: center; gap: 0.75rem; flex-wrap: wrap;
   margin-top: 0.35rem; }
 .acct-block-line .btn { margin-left: auto; }
+/* A second button sits beside the first, not split off from it by a second auto margin. */
+.acct-block-line .btn + .btn { margin-left: 0; }
 
 /* ══ Auto-record rules: the list and a rule's page (mockup 42, dev/changelog/1189) ════════
    templates/rules.html, templates/rule_detail.html. A rule's page is the group page's shell

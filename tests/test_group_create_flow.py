@@ -248,7 +248,10 @@ class SelectionBarTests(_Base):
         html = self.client.get('/channels?q=fox').get_data(as_text=True)
         self.assertNotIn('id="sel-test"', html)
 
-    def test_the_group_action_is_the_bars_only_primary(self):
+    def test_the_guide_action_is_the_bars_only_primary(self):
+        """Still one primary, and since dev/changelog/1290 it is the guide action: a
+        first-time user read a highlighted "Group selected" as the way to put a channel in
+        the guide. Grouping keeps its place on the bar as an ordinary button."""
         html = self.client.get('/channels?q=fox').get_data(as_text=True)
         bar = html[html.index('id="sel-bar"'):html.index('id="sel-guide-note"')]
         primaries = [line for line in bar.splitlines() if 'btn-primary' in line]
@@ -256,7 +259,8 @@ class SelectionBarTests(_Base):
         # only while adding to a named group and never alongside the selection actions.
         primaries = [line for line in primaries if 'sel-ctx-add' not in line]
         self.assertEqual(len(primaries), 1, primaries)
-        self.assertIn('id="sel-group"', primaries[0])
+        self.assertIn('id="sel-add"', primaries[0])
+        self.assertIn('id="sel-group"', bar)
 
     def test_the_flows_script_is_loaded_after_the_modal_it_borrows_from(self):
         """It draws the server's soft warnings through group-modal.js's own builder, so

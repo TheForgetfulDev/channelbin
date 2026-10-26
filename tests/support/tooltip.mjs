@@ -121,6 +121,22 @@ async function boot() {
   const nothingUnder = { displayed: pop().style.display };
 
   result.rebuild = { survivor, sameTip, reHover, otherTip, nothingUnder };
+
+  // 5. A press on the anchor: a mouse press closes the tip, the way a native title does;
+  //    a touch press does not, since a tap is how a phone opens one (dev/changelog/1292).
+  const press = (el, pointerType) => {
+    const ev = w.PointerEvent
+      ? new w.PointerEvent('pointerdown', { bubbles: true, pointerType })
+      : Object.assign(new w.Event('pointerdown', { bubbles: true }), { pointerType });
+    el.dispatchEvent(ev);
+  };
+  const plain = w.document.getElementById('plain');
+  hover(w.document.getElementById('elsewhere'), 0, 0);
+  hover(plain, 0, 0);
+  press(plain, 'touch');
+  const afterTouch = pop().style.display;
+  press(plain, 'mouse');
+  result.press = { afterTouch, afterMouse: pop().style.display };
   return result;
 }
 

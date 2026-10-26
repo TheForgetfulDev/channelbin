@@ -130,7 +130,7 @@ class RenderingByAccountCountTests(_StatsCase):
         self.assertIn('id="acst-table"', html)
         self.assertNotIn('id="usage-card"', html)
         for title in ('Recorded time', 'Health checks passed', 'In the TV Guide',
-                      'In a channel group'):
+                      'In your groups'):
             self.assertIn(f'<h2>{title}</h2>', _section(html))
 
     def test_one_account_renders_the_usage_card_in_its_place(self):
@@ -329,8 +329,8 @@ class RowSecondLineTests(_StatsCase):
         html = self.get()
         row = html[html.index('data-id="%d"' % a.id):html.index('id="acct-stats"')]
         more = row[row.index('class="a-more"'):]
-        self.assertIn(f'In a group</span>{cur["in_group"]}', more)
-        self.assertIn(f'Recording on</span>{cur["recording_memberships"]}', more)
+        self.assertIn(f'In your groups</span>{cur["in_group"]}', more)
+        self.assertIn(f'Recording in groups</span>{cur["recording_memberships"]}', more)
         self.assertIn('Failing now', more)
         self.assertEqual(cur['tested'], 2)
         # Two tested channels: one Great, one Poor, each drawn and named in the band bar.
@@ -347,7 +347,7 @@ class RowSecondLineTests(_StatsCase):
         self.assertIn('class="a-more"', live)
         self.assertIn('class="a-bands"', live)
         labels = re.findall(r'<span class="a-k" data-tip="[^"]+">([^<]+)</span>', live)
-        self.assertEqual(labels, ['In a group', 'Recording on', 'Guide rows', 'With EPG',
+        self.assertEqual(labels, ['In your groups', 'Recording in groups', 'Guide rows', 'With EPG',
                                   'Avg score', 'Failing now', 'Health bands'])
 
     def test_an_untested_account_says_so_rather_than_drawing_an_empty_bar(self):
@@ -365,7 +365,11 @@ class ViewHelperTests(unittest.TestCase):
         from datetime import date
         d = date(2026, 8, 9)
         self.assertEqual(account_stats_view._bucket_labels('day', d), ('Aug 9', 'Aug 9'))
-        self.assertEqual(account_stats_view._bucket_labels('week', d), ('Aug 9', 'Week of Aug 9'))
+        self.assertEqual(account_stats_view._bucket_labels('week', d), ('Aug 9', 'Week of Aug 9-15'))
+        self.assertEqual(account_stats_view._bucket_labels('week', d, ranged=True),
+                         ('Aug 9-15', 'Week of Aug 9-15'))
+        self.assertEqual(account_stats_view._bucket_labels('week', date(2026, 9, 27), ranged=True),
+                         ('Sep 27-Oct 3', 'Week of Sep 27-Oct 3'))
         self.assertEqual(account_stats_view._bucket_labels('month', d), ('Aug', 'Aug 2026'))
         self.assertEqual(account_stats_view._bucket_labels('quarter', date(2026, 7, 1)),
                          ('Q3 26', 'Q3 2026'))
@@ -390,6 +394,31 @@ class ViewHelperTests(unittest.TestCase):
         self.assertEqual(labelled[-1], 19)
         self.assertTrue(c['cols'][0]['zero'], 'a bucket with nothing is drawn as a stub')
         self.assertEqual(c['peak'], '2.0 h')
+
+    def test_a_short_weekly_chart_labels_each_week_as_its_range(self):
+        """dev/changelog/1272 (first-time-user finding 15): a lone weekly bar labeled
+        "Oct 18" read as a wrong date, not as the week starting then. A chart with room for
+        it says the whole week; a long one keeps the short start date so labels do not
+        collide on a phone."""
+        def axis(n):
+            trend = self._trend(n)
+            return account_stats_view.columns(
+                trend, [{'name': 'A', 'color': '#fff', 'values': [1] * n}],
+                account_stats_view.fmt_hours, 'empty')['axis']
+
+        self.assertEqual(axis(1), ['Jan 4-10'])
+        self.assertEqual(axis(4)[-1], 'Jan 25-31')
+        self.assertEqual(axis(5)[0], 'Jan 4')
+
+    def test_a_peak_under_an_hour_is_a_duration_not_0_0_h(self):
+        """Second first-time-user test, finding 26 (dev/docs/BUGS.md 2026-10-26 08:57:28 AM): a
+        2-minute recording drew a full-height bar under a peak label of "0.0 h"."""
+        trend = self._trend(1)
+        c = account_stats_view.columns(
+            trend, [{'name': 'A', 'color': '#fff', 'values': [120]}],
+            account_stats_view.fmt_hours, 'empty')
+        self.assertEqual(c['peak'], '2m')
+        self.assertEqual(account_stats_view.fmt_hours(5400), '1.5 h')
 
     def test_columns_with_nothing_in_them_are_the_empty_sentence(self):
         trend = self._trend(3)

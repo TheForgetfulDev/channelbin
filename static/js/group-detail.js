@@ -972,8 +972,8 @@
     else if (t.is_vfr) grid += item('Frame rate', 'Variable', 'val-warn',
       'Variable frame rate: the declared and average frame rates disagree. Can drift audio sync in a long recording.');
     else grid += item('Frame rate', `${t.fps ? t.fps.toFixed(1) : '?'} fps constant`);
-    if (t.bits_per_pixel_frame) grid += item('Efficiency', t.bits_per_pixel_frame.toFixed(4), '',
-      'Bits per pixel per frame = bitrate / (width x height x fps). A standard compression-efficiency stat, not a better/worse verdict.');
+    if (t.bits_per_pixel_frame) grid += item('Bits per pixel', t.bits_per_pixel_frame.toFixed(4), '',
+      'Bits per pixel per frame = bitrate / (width x height x fps): how much data the encoder spends on each pixel. A standard compression stat, not a better/worse verdict.');
     if (t.coded_resolution) grid += item('Coded size', escHtml(t.coded_resolution), '',
       'The encoder\'s padded frame size, which differs from the displayed resolution.');
     grid += audioItems() || item('Audio', '&mdash;');
@@ -2532,7 +2532,10 @@
     if (act === 'add-guide') {
       jsonFetch(`/api/guide/channels/${r.channel_id}/add`, { method: 'POST' })
         .then(data => {
-          if (data.success) { showToast(`"${r.channel_name}" added to the TV Guide.`); refreshRows(); }
+          if (data.success) {
+            showToast(`"${r.channel_name}" added to the TV Guide.${data.note ? ` ${data.note}` : ''}`);
+            refreshRows();
+          }
           else showToast(data.error || 'Already in the guide, or needs confirmation from Channel Search.', { type: 'warning' });
         })
         .catch(e => showToast(e.message || 'Could not add to the guide.', { type: 'error' }));

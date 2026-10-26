@@ -215,14 +215,13 @@
 }
 </style>
 
-{# The panels came OFF Settings, so returning there is going back, not a
-   forward jump-off (DESIGN.md 4 / 16.1). #}
-<a class="back" href="{{ url_for('settings.settings') }}">&larr; Settings</a>
+{# No back link: Maintenance is a sidebar destination of its own, so "<- Settings" pointed
+   sideways rather than back the way you came (DESIGN.md 4 / 16.1, dev/changelog/1277). #}
 <div class="page-head">
   <h1>Maintenance</h1>
 </div>
 <p class="page-sub">Backups, the support bundle, service control, the search indexes and
-  disk usage. Moved off Settings so that page holds settings only.</p>
+  disk usage.</p>
 
 {# Card order is DESIGN.md 16.1, settled at desktop round 2: Storage, Index,
    Backup, Service - the two you read first, then the two you act on. The
@@ -245,8 +244,11 @@
   <div class="card-head">
     <h2>Readiness check <span class="badge b-abort" id="rd-head-pill">Checking</span></h2>
     <div class="card-head-actions">
+      {#- Always here: once the four setup steps are done the dashboard banner and the menu
+          link are both gone, and this is the way back to the steps (DESIGN.md 16.7). -#}
+      <a class="btn btn-sm" href="{{ url_for('setup.get_started') }}">Get started <span class="arw">&#8594;</span></a>
       <button class="btn btn-sm" id="rd-copy">Copy report</button>
-      <button class="btn btn-sm btn-primary" id="rd-runall">Run the checks that cost something</button>
+      <button class="btn btn-sm btn-primary" id="rd-runall">Run the remaining checks</button>
     </div>
   </div>
   <div class="card-body">

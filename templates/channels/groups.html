@@ -1,37 +1,25 @@
 {% extends "base.html" %}
-{% block title %}Groups - ChannelBin{% endblock %}
+{% block title %}Channel Groups - ChannelBin{% endblock %}
 
 {% from "_macros.html" import channel_pill, account_pill, status_badge %}
 
 {% block content %}
 <div class="page-head">
-  <h1>Channels</h1>
-  <div style="display:flex; gap:.5rem;">
-    <a href="{{ url_for('guide.guide') }}" class="btn">&larr; TV Guide</a>
-    <button class="btn btn-primary" id="btn-new-group">+ New Group</button>
-  </div>
+  <h1>Channel Groups</h1>
+  {# No back link and no Browse/Groups tab strip: this is a sidebar destination, and both
+     only repeated links the sidebar carries (the same call dev/changelog/811 made for
+     Channel Search, applied here in dev/changelog/1277). #}
+  <button class="btn btn-primary" id="btn-new-group">+ New Group</button>
 </div>
-
-{% include 'channels/_tabs.html' %}
 
 <p class="page-intro" style="margin-bottom:1rem;">
-  A <strong>channel group</strong> bundles identical feeds of one channel. Turn on
-  <strong>Recording</strong> for the members you would record from and the group can be a single TV
-  Guide row: recordings start on the healthiest enabled member and fail over to the next-best one if
-  it dies. A <strong>health check</strong> is a schedule the group carries, testing its members to
-  confirm they still play &mdash; every group has exactly one, created with it, and a group with no
-  member enabled for recording is simply a health check.
+  A <strong>channel group</strong> you make holds copies of one channel, from one provider or
+  several. Turn on <strong>Recording</strong> for the copies you would record from and the group
+  can be a single TV Guide row: recordings start on the healthiest one and fail over to the
+  next-best if it dies. Every group carries one <strong>health check</strong>, a schedule that
+  tests its channels to confirm they still play, and a group with no member enabled for
+  recording is simply a health check.
 </p>
-
-{% if not group_rows %}
-<div class="empty-state">
-  <p>No groups yet.</p>
-  <p class="page-intro">
-    Create one from the <a href="{{ url_for('channels.channel_browser') }}">Browse</a> tab
-    (select channels &rarr; &ldquo;&#9939; Group Selected&rdquo;), or with the button above.
-  </p>
-</div>
-{% else %}
 
 <div class="toolbar">
   <span class="search-wrap" id="search-wrap">
@@ -54,7 +42,9 @@
 </div>
 
 {% macro member_table(g) %}
-{% if not g.members %}
+{% if not g.members and g.system %}
+<p class="text-muted small" style="padding:.5rem .25rem;">Nothing to test yet: it fills itself as you add channels to your TV Guide.</p>
+{% elif not g.members %}
 <p class="text-muted small" style="padding:.5rem .25rem;">No channels yet.</p>
 {% else %}
 <p class="grp-mnote" data-mnote="{{ g.id }}">
@@ -183,11 +173,15 @@
     <button type="button" class="grp-expand" aria-expanded="false" aria-label="Toggle channels"
             {% if not g.members %}disabled{% endif %}><span class="grp-caret"></span></button>
     <div class="grp-row" data-expand="{{ g.id }}"{% if g.detail_url %} data-detail-url="{{ g.detail_url }}"{% endif %}>
-      <span class="grp-kind tip-plain" data-tip="Channel group.&#10;Duplicate feeds of one channel. Turn Recording on for the members you would record from; whichever is healthiest serves the guide row and starts a recording.">&#9939;</span>
+      {% if g.system %}
+      <span class="grp-kind tip-plain" data-tip="Health check.&#10;{{ system_check_sentence }} It never appears in the guide and never records.">&#10003;</span>
+      {% else %}
+      <span class="grp-kind tip-plain" data-tip="Channel group.&#10;Copies of one channel. Turn Recording on for the members you would record from; whichever is healthiest serves the guide row and starts a recording.">&#9939;</span>
+      {% endif %}
       <span class="grp-name">{{ g.name }}</span>
-      {% if g.system %}<span class="badge b-auto tip-plain" data-tip="Automatic group.&#10;ChannelBin maintains this one. Its channels are every TV Guide channel with testing enabled, recalculated whenever the guide changes. You cannot edit or delete it.">Automatic</span>{% endif %}
+      {% if g.system %}<span class="badge b-auto tip-plain" data-tip="Automatic.&#10;{{ system_check_sentence }} ChannelBin keeps its list up to date by itself, so there is nothing to edit, and it cannot be deleted.">Automatic</span>{% endif %}
       {% if g.health_score is not none %}<span class="badge {{ g.health_score | health_css(health_bands) }}{{ ' tip-plain' if g.health_n < 3 else '' }}"{% if g.health_n < 3 %} data-tip="Group health {{ g.health_score }}.&#10;Built from only {{ g.health_n }} recording(s) - dimmed because under 3 is not yet a trend." style="opacity:.55;"{% endif %}>&#9733;{{ g.health_score }}</span>{% endif %}
-      <span class="grp-meta">{{ g.member_count }} channel{{ 's' if g.member_count != 1 else '' }}{% if g.recording_count %} &middot; {{ g.recording_count }} recording{% endif %}</span>
+      <span class="grp-meta">{% if g.system and not g.member_count %}Nothing to test yet{% else %}{{ g.member_count }} channel{{ 's' if g.member_count != 1 else '' }}{% endif %}{% if g.recording_count %} &middot; {{ g.recording_count }} recording{% endif %}</span>
       {% if g.reference_label %}<span class="group-list-fmt tip-plain" data-tip="Group reference format.&#10;{{ 'Locked. Channels that do not match are not used for a recording.' if g.locked else 'Auto - taken from the healthiest member.' }}">{{ g.reference_label }}{% if g.locked %} &#128274;{% endif %}</span>{% endif %}
       {% if g.best_active %}<span class="grp-meta tip-plain" data-tip="Best channel.&#10;Recordings start on this feed and fail over from here.">
         <span class="acct-dot" style="background:{{ g.best_active.account_color }}"></span>{{ g.best_active.name }}</span>{% endif %}
@@ -220,7 +214,7 @@
           <button class="menu-item" data-act="run-check" data-group="{{ g.id }}" data-job="{{ g.check.job_id }}">Test now</button>
           {% endif %}
           <div class="sep"></div>
-          <button class="menu-item" data-act="clone" data-group="{{ g.id }}">Clone</button>
+          <button class="menu-item" data-act="clone" data-group="{{ g.id }}"{% if g.system %} disabled{% endif %}>Clone</button>
           <div class="sep"></div>
           <button class="menu-item danger" data-act="delete" data-group="{{ g.id }}"{% if g.system %} disabled{% endif %}>Delete group</button>
         </div>
@@ -233,7 +227,20 @@
 </div>
 {% endmacro %}
 
-<div class="sec-head" data-section="groups">Groups <span class="cnt">{{ group_rows | length }}</span><span class="line"></span>
+{# data-hc-sig: the health-check signature this list was read at. groups.js swaps both lists
+   for a fresh render when nav-status carries a different one (dev/changelog/1158). The
+   automatic check has a section of its own so it is never counted or described as one of
+   the user's groups (dev/changelog/1289). #}
+<div id="grp-lists" data-hc-sig="{{ hc_sig }}">
+{% if system_row %}
+<div class="sec-head" data-section="auto">Automatic <span class="cnt">1</span><span class="line"></span></div>
+<p class="page-intro" data-section-note="auto">{{ system_check_sentence }}</p>
+<div class="grp-list-compact" id="grp-list-auto" data-section="auto">
+  {{ group_row(system_row) }}
+</div>
+{% endif %}
+
+<div class="sec-head" data-section="groups">Your groups <span class="cnt">{{ group_rows | length }}</span><span class="line"></span>
   <span class="menu-wrap">
     <button class="chip" id="sort-chip-groups" data-menu>Sort: Group name &#9662;</button>
     <div class="menu" id="sort-menu-groups">
@@ -246,13 +253,19 @@
     </div>
   </span>
 </div>
-{# data-hc-sig: the health-check signature this list was read at. groups.js swaps the list
-   for a fresh render when nav-status carries a different one (dev/changelog/1158). #}
-<div class="grp-list-compact" id="grp-list-groups" data-section="groups" data-hc-sig="{{ hc_sig }}">
+<div class="grp-list-compact" id="grp-list-groups" data-section="groups">
   {% for g in group_rows %}{{ group_row(g) }}{% endfor %}
 </div>
-
-{% endif %}
+{# Shown by groups.js whenever the list above is empty, so deleting the last group brings it
+   back without a reload. #}
+<div class="empty-state" id="grp-empty"{% if group_rows %} style="display:none"{% endif %}>
+  <p>You have no channel groups yet.</p>
+  <p class="page-intro">
+    Create one from <a href="{{ url_for('channels.channel_browser') }}">Channel Search</a>
+    (select channels &rarr; &ldquo;&#9939; Group Selected&rdquo;), or with the button above.
+  </p>
+</div>
+</div>
 
 <style>
 .grp-list-compact { display: flex; flex-direction: column; gap: 0.5rem; margin-bottom: 1.5rem; }

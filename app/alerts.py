@@ -250,6 +250,12 @@ ALERT_TYPES = {
     # each one is work already lost, not a degradation.
     'SYNC_FAILED': {
         'label': 'Account Sync Failed', 'severity': 'ERROR', 'self_clearing': True},
+    # "Try it with example channels" finished without doing everything it said it would
+    # (app/examples.py, dev/changelog/1281): the body names each part that did not happen
+    # and why. WARN: the examples are a demonstration, so nothing of the user's is at risk.
+    # Not self-clearing - nothing re-runs the load - so the user dismisses it.
+    'EXAMPLES_INCOMPLETE': {
+        'label': 'Example Channels Loaded Only In Part', 'severity': 'WARN'},
     # An account that has fallen a whole sync interval past due because its scheduled syncs
     # keep being deferred past recordings (dev/changelog/941). WARN, not ERROR: nothing has
     # been lost yet, the channel list and guide are just going stale. An individual deferred
@@ -451,6 +457,23 @@ def has_open_alert(alert_type: str, source: str) -> bool:
         alert_type=alert_type, source=source, dismissed_at=None).first() is not None
 
 
+def mark_cleared(rows, now=None) -> bool:
+    """Take down the open alerts in `rows` because what they describe is over - the app's
+    half of dismissed_at, as against a person's Dismiss. Mutates without committing and
+    returns whether anything changed; an already-dismissed row keeps its timestamp and its
+    owner. Every place the app takes an alert down comes through here, so the Alerts page's
+    "Cleared recently" card can tell "it went away" from "someone hid it"
+    (dev/changelog/1293, enforced by tests/test_alerts_cleared_recently.py)."""
+    now = now or datetime.utcnow()
+    changed = False
+    for row in rows:
+        if row.dismissed_at is None:
+            row.dismissed_at = now
+            row.cleared_by_app = True
+            changed = True
+    return changed
+
+
 def dismiss_open_alerts(alert_type: str, source: str):
     """Dismiss every undismissed alert of this (type, source) pair - the clear half of
     has_open_alert's pattern. A no-op when nothing stands, so it is safe to call on every
@@ -463,12 +486,8 @@ def dismiss_open_alerts(alert_type: str, source: str):
     def _dismiss():
         rows = Alert.query.filter_by(
             alert_type=alert_type, source=source, dismissed_at=None).all()
-        if not rows:
-            return
-        now = datetime.utcnow()
-        for row in rows:
-            row.dismissed_at = now
-        db.session.commit()
+        if mark_cleared(rows):
+            db.session.commit()
     _dismiss()
 
 
@@ -480,22 +499,25 @@ def _dismiss_recording_alerts(recording_id: int, alert_type: str = None,
     Mutates without committing and returns whether anything changed; the two wrappers
     below own the commit. An already-dismissed row keeps its original timestamp, per the
     anchors-only-move-forward rule.
+
+    Only the non-unlink case is a clear: a recording being deleted takes its alerts down
+    because the person deleted it, not because anything recovered, so those rows are not
+    "Cleared recently" on the Alerts page.
     """
     from .database import Alert
 
     q = Alert.query.filter(Alert.recording_id == recording_id)
     if alert_type is not None:
         q = q.filter(Alert.alert_type == alert_type)
+    rows = q.all()
+    if not unlink:
+        return mark_cleared(rows)
     now = datetime.utcnow()
-    changed = False
-    for row in q.all():
+    for row in rows:
         if row.dismissed_at is None:
             row.dismissed_at = now
-            changed = True
-        if unlink:
-            row.recording_id = None
-            changed = True
-    return changed
+        row.recording_id = None
+    return bool(rows)
 
 
 def dismiss_open_alerts_for_recording(recording_id: int, alert_type: str = None):
@@ -526,6 +548,14 @@ def clear_recording_retrying_alert(recording_id: int):
     """Dismiss a recording's RECORDING_RETRYING row: its stream is capturing again, or
     the recording is ending and nothing more will be retried. A no-op when none stands."""
     dismiss_open_alerts_for_recording(recording_id, RECORDING_RETRYING)
+
+
+def recording_retrying_alert_open(recording_id: int) -> bool:
+    """Whether a recording's RECORDING_RETRYING row still stands - the read half of the
+    clear above, keyed the same way."""
+    from .database import Alert
+    return Alert.query.filter_by(alert_type=RECORDING_RETRYING, recording_id=recording_id,
+                                 dismissed_at=None).first() is not None
 
 
 def detach_recording_alerts(recording_id: int):

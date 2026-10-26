@@ -228,7 +228,10 @@
   // The kebab handler is delegated on document (util.js), so nothing inside a row
   // may stopPropagation on the way up - that would swallow the event before it
   // reaches document and the menu would never open. The row guards itself instead.
-  const NO_NAV = '.c-actions, .ch-pill, .thumb.has-img, .menu, [data-tip]';
+  // The health pill is the exception among tooltips: its tooltip is a summary of the
+  // recording page's "What happened" card, and a tap on a phone opens no tooltip, so a
+  // pill that swallowed the tap left the one plain account out of reach (dev/changelog/1270).
+  const NO_NAV = '.c-actions, .ch-pill, .thumb.has-img, .menu, [data-tip]:not(.h-mini)';
   bindNavClicks(document, (e) => {
     const row = e.target.closest('.rec-list .rows .row');
     return row && !e.target.closest(NO_NAV) ? row.dataset.href : null;
@@ -283,6 +286,25 @@
     tick();
   };
 
+  // A row still recording: its duration and size cells grow with the clock too.
+  // duplicated from templates/index.html - the duration and size cells, written by the
+  // minute tick into a row the swap rendered, so the row is never re-rendered for them.
+  function writeLiveCells(row, c) {
+    const dur = row.querySelector('[data-col="duration"]');
+    const size = row.querySelector('[data-col="size"]');
+    if (dur) {
+      const flag = c.dur_flag
+        ? `<span class="dur-flag${c.dur_flag === 'stopped' ? ' dur-quiet' : ''} tip-plain" data-tip="${escHtml(c.dur_tip || '')}">&#9685;</span>` : '';
+      dur.innerHTML = flag + escHtml(c.dur_str || '-');
+    }
+    if (size) {
+      const rate = c.rate
+        ? `<span class="sub tip-plain" data-tip="${escHtml(c.rate_tip || '')}">${escHtml(c.rate)}</span>` : '';
+      size.innerHTML = c.size_num
+        ? `${escHtml(c.size_num)} <span class="unit">${escHtml(c.size_unit)}</span>${rate}` : '-';
+    }
+  }
+
   /* The clock cells. Written by id into rows the swap already rendered, never adding or
      removing one - which rows exist is the swap's job. Skipped in a background tab; the
      first poll after the tab comes back finds the cells a minute stale and ticks then. */
@@ -299,6 +321,7 @@
           const rel = row.querySelector('[data-col="time"] .rel');
           if (day) day.textContent = t.day;
           if (rel) rel.textContent = t.rel;
+          if (t.cells) writeLiveCells(row, t.cells);
         });
         tickedAt = Date.now();
       })

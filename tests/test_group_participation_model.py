@@ -418,7 +418,7 @@ class GroupEventTimelineTests(unittest.TestCase):
         self.assertIn(ev.detail, timeline,
                       'a fact the app recorded but never shows is the defect this table '
                       'was added to remove')
-        self.assertIn('Participation Changed', timeline,
+        self.assertIn('Participation changed', timeline,
                       'the row needs a label, not a bare detail string')
 
     def test_the_entry_links_back_to_the_membership_it_is_about(self):
@@ -439,7 +439,7 @@ class GroupEventTimelineTests(unittest.TestCase):
         db.session.commit()
         timeline = self._timeline_html()
         self.assertIn('Locked to 1920x1080 60fps by highest score', timeline)
-        self.assertIn('Format Strategy Applied', timeline)
+        self.assertIn('Format strategy applied', timeline)
 
 
 class FormatStrategyEventTests(unittest.TestCase):
@@ -515,7 +515,7 @@ class FormatStrategyEventTests(unittest.TestCase):
         timeline = self._timeline_html()
         self.assertIn(self._event().detail, timeline,
                       'a lock move nobody can see is the silence principle 1 refuses')
-        self.assertIn('Format Strategy Applied', timeline)
+        self.assertIn('Format strategy applied', timeline)
 
     def test_the_detail_names_the_format_the_lock_moved_from(self):
         """The nightly re-evaluation's case: a standing strategy whose lock was written
@@ -626,7 +626,7 @@ class JobChannelToggleLoggingTests(unittest.TestCase):
         start = html.find('ch-timeline-log')
         timeline = html[start:] if start != -1 else ''
         self.assertIn(str(escape(detail)), timeline)
-        self.assertIn('Participation Changed', timeline)
+        self.assertIn('Participation changed', timeline)
 
     def test_the_system_group_branch_still_writes_the_channel_wide_switch(self):
         """Characterization, not a defect guard: it passes either way and is here so the

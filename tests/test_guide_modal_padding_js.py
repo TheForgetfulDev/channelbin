@@ -156,6 +156,78 @@ class ReopenClearsEditFlagTests(_Base, unittest.TestCase):
         self.assertEqual(self.obs['reopenedStart'], '2026-08-11T16:00')
 
 
+
+class RecordNowForAProgramAlreadyOnTests(_Base, unittest.TestCase):
+    """"Schedule recording" for a show already on made a first-time tester stop and wonder
+    whether it would record now or later (dev/changelog/1290). While the warning applies, the
+    dialog and its button say Record now, and the warning names that button."""
+    SCENARIO = 'record_now_labels'
+
+    def test_a_program_already_on_reads_record_now(self):
+        self.assertEqual(self.obs['late'], {'title': 'Record now', 'submit': 'Record now'})
+
+    def test_a_start_typed_into_the_future_goes_back_to_schedule(self):
+        self.assertEqual(self.obs['typedFuture'],
+                         {'title': 'Schedule recording', 'submit': 'Schedule recording'})
+
+    def test_a_program_not_yet_on_reads_schedule(self):
+        self.assertEqual(self.obs['future'],
+                         {'title': 'Schedule recording', 'submit': 'Schedule recording'})
+
+    def test_the_warning_names_the_button_it_is_about(self):
+        self.assertIn('the moment you press Record now', self.obs['lateText'])
+
+
+class ReplaceKeepsItsOwnWordsTests(_Base, unittest.TestCase):
+    """A replace also deletes the recording it replaces, so its button keeps saying so."""
+    SCENARIO = 'replace_keeps_its_words'
+
+    def test_replace_is_not_relabelled(self):
+        self.assertEqual(self.obs['labels'],
+                         {'title': 'Replace recording', 'submit': 'Replace recording'})
+
+    def test_the_warning_names_the_replace_button(self):
+        self.assertIn('the moment you press Replace recording', self.obs['lateText'])
+
+
+class RecordModalLayoutTests(_Base, unittest.TestCase):
+    """On a phone the aired-part warning sat below the fold behind the sheet's buttons, and
+    both testers stopped on a Stream URL field they could not act on (dev/changelog/1290)."""
+    SCENARIO = 'modal_layout'
+
+    def test_the_warning_comes_before_the_form_fields(self):
+        self.assertEqual(self.obs['order'], ['modal-late-note', 'modal-name', 'modal-start'])
+
+    def test_the_stream_url_is_inside_a_disclosure(self):
+        self.assertEqual(self.obs['isDetails'], 'DETAILS')
+        self.assertTrue(self.obs['inPick'])
+
+    def test_the_disclosure_is_closed_again_on_the_next_open(self):
+        self.assertTrue(self.obs['openedOnce'])
+        self.assertFalse(self.obs['openAfterReopen'])
+
+    def test_the_url_still_goes_with_the_form(self):
+        self.assertEqual(self.obs['urlValue'], 'http://example.test/live/1')
+
+
+class StartFollowUpTests(_Base, unittest.TestCase):
+    """The grid redrew the moment the save answered, before the recorder had started, and
+    nothing asked again until the next nav poll, so the guide cell said SCHEDULED for 8 to
+    10 s and the red pill came late (dev/changelog/1290)."""
+    SCENARIO = 'start_followup'
+
+    def test_the_page_booted_without_errors(self):
+        self.assertEqual(self.obs['now']['errors'], [])
+        self.assertEqual(self.obs['later']['errors'], [])
+
+    def test_a_recording_that_starts_now_is_followed_up_soon(self):
+        self.assertGreaterEqual(self.obs['now']['followups'], 1)
+        self.assertLessEqual(min(self.obs['now']['delays']), 2000)
+
+    def test_a_recording_for_later_is_not(self):
+        self.assertEqual(self.obs['later']['followups'], 0)
+
+
 if __name__ == '__main__':
     unittest.main()
 
@@ -200,3 +272,49 @@ class EditDoesNotRenameTests(_Base, unittest.TestCase):
     def test_a_scheduled_recordings_name_is_left_alone(self):
         self.assertEqual(self.obs['name'], 'Stored name')
         self.assertEqual(self.obs['requests'], [])
+
+
+class ProgramAlreadyOnSaysWhatIsMissedTests(_Base, unittest.TestCase):
+    """A program that started 20 minutes ago opened "Schedule recording" with the past start
+    time and nothing else; the user learned the first 20 minutes were lost from the
+    RECORDING_CREATED_AFTER_EVENT_START event (dev/changelog/1275). The server moves a past
+    start to now, so the modal says so before the user confirms."""
+    SCENARIO = 'late_program'
+
+    def test_the_note_shows(self):
+        self.assertTrue(self.obs['visible'])
+
+    def test_it_says_how_much_has_aired_and_that_it_will_be_missing(self):
+        self.assertIn('started 20m ago', self.obs['text'])
+        self.assertIn('the first 20m will not be in the file', self.obs['text'])
+
+
+class TypedFutureStartClearsTheLateNoteTests(_Base, unittest.TestCase):
+    SCENARIO = 'late_program_start_typed_future'
+
+    def test_a_start_typed_into_the_future_takes_the_note_away(self):
+        self.assertTrue(self.obs['before'])
+        self.assertFalse(self.obs['visible'])
+
+
+class ProfileChangeKeepsTheLateNoteTests(_Base, unittest.TestCase):
+    SCENARIO = 'late_program_profile_change_keeps_it'
+
+    def test_the_note_survives_a_profile_pick_that_does_not_move_the_start(self):
+        self.assertTrue(self.obs['visible'])
+        self.assertIn('started 20m ago', self.obs['text'])
+
+
+class FutureProgramHasNoLateNoteTests(_Base, unittest.TestCase):
+    SCENARIO = 'future_program'
+
+    def test_nothing_is_said_about_a_program_not_yet_on(self):
+        self.assertFalse(self.obs['visible'])
+
+
+class EditOfAScheduledRecordingHasNoLateNoteTests(_Base, unittest.TestCase):
+    SCENARIO = 'late_then_edit_hides_it'
+
+    def test_an_edit_opened_after_a_late_schedule_does_not_carry_the_note_over(self):
+        self.assertTrue(self.obs['before'])
+        self.assertFalse(self.obs['visible'])

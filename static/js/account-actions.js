@@ -73,6 +73,12 @@ function confirmAccountSync(id, name, prompt, opts = {}) {
     accountSync(id, opts);
     return;
   }
+  // An account that has never synced has nothing to skip: its scheduled sync IS the first
+  // one, and this sync stands in for it if it succeeds (dev/changelog/1272).
+  if (prompt.never_synced) {
+    accountSync(id, Object.assign({}, opts, { restartSchedule: true }));
+    return;
+  }
   const clock = (d) => `${tzDayLabel(d)} ${fmtTimeTz(d)}`;
   const secs = (next.getTime() - Date.now()) / 1000;
   // Under a minute, or already overdue, a countdown would read wrong.

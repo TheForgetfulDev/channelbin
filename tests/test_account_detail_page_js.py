@@ -102,7 +102,8 @@ def _observe():
             acc.last_sync_at = datetime.utcnow()
             log = db.session.get(AccountSyncLog, running[key])
             log.status = 'SUCCESS'
-            log.completed_at = datetime.utcnow()
+            # Under a second, as a 48-channel first sync really runs (dev/changelog/1291).
+            log.completed_at = log.started_at + timedelta(milliseconds=400)
             log.channels_synced = 120
         db.session.commit()
         snapshot('done')
@@ -215,6 +216,11 @@ class FirstSyncTests(_Base, unittest.TestCase):
         self.assertFalse(self.obs['during']['histEmpty'])
         self.assertEqual(self.obs['during']['histBadges'], ['Running'])
         self.assertEqual(self.obs['after']['histBadges'], ['Success'])
+
+    def test_a_sub_second_run_says_so_rather_than_0m(self):
+        """A first-time user read "Duration 0m" for a sync it had just watched finish
+        (dev/docs/BUGS.md 2026-10-26 08:57:27 AM)."""
+        self.assertEqual(self.obs['after']['histDurs'], ['under 1s'])
 
     def test_the_first_sync_button_becomes_cancel_then_sync(self):
         self.assertIn('sync', self.obs['before']['barActs'])

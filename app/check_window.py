@@ -150,7 +150,7 @@ def _day_matches(job, day_num: int) -> bool:
 def _window_eligible_for_day(occurrence_start_utc: datetime, statuses):
     """Window-dispatched recurring checks whose recur_day matches this occurrence's local
     day and are not paused, in `statuses`. Ordered (0 if is_system else 1, last_full_run_at
-    ASC nulls first, id) - the system 'TV Guide Channels' check always first, then a
+    ASC nulls first, id) - the system 'TV Guide health check' always first, then a
     self-stabilizing least-recently-fully-run rotation (see due_jobs() for the reasoning)."""
     from .database import OnDemandTestJob
 

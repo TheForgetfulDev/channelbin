@@ -49,7 +49,7 @@ function accountValidate(values) {
   if (values.account_type === 'm3u') {
     if (!String(values.m3u_url || '').trim()) return 'M3U URL is required.';
   } else {
-    if (!String(values.base_url || '').trim()) return 'Base URL is required.';
+    if (!String(values.base_url || '').trim()) return 'Server is required.';
     if (!String(values.username || '').trim()) return 'Username is required.';
   }
   const conn = String(values.max_connections || '').trim();
@@ -111,10 +111,11 @@ function renderAccountModal(data, onDone) {
   body.innerHTML =
     fieldRow({
       label: 'Account type',
-      meta: 'M3U works with any IPTV provider. Xtream API uses the provider\'s Xtream Codes login.',
+      meta: 'A server address, a username and a password is Xtream Codes. One long ' +
+        'playlist link is M3U playlist.',
       control: '<select id="acct-type">' +
-        `<option value="m3u"${a.account_type === 'm3u' ? ' selected' : ''}>M3U playlist + XMLTV EPG</option>` +
-        `<option value="xtream"${a.account_type === 'xtream' ? ' selected' : ''}>Xtream API</option>` +
+        `<option value="xtream"${a.account_type === 'xtream' ? ' selected' : ''}>Xtream Codes</option>` +
+        `<option value="m3u"${a.account_type === 'm3u' ? ' selected' : ''}>M3U playlist</option>` +
         '</select>',
     }) +
     fieldRow({
@@ -133,9 +134,9 @@ function renderAccountModal(data, onDone) {
     }) +
     // ── Xtream fields ──
     fieldRow({
-      label: 'Base URL', stack: true, id: 'base',
-      meta: 'Provider URL without a trailing slash, e.g. <code>http://provider.com:8080</code>. ' +
-        'This is the API endpoint, not the stream origin.',
+      label: 'Server', stack: true, id: 'base',
+      meta: 'The server address your provider gave you, e.g. <code>http://provider.com:8080</code>. ' +
+        'The channel list and guide come from here; the streams may come from another host.',
       control: `<input type="text" id="acct-base" value="${escHtml(a.base_url)}">`,
     }) +
     fieldRow({
@@ -193,9 +194,10 @@ function renderAccountModal(data, onDone) {
     }) +
     fieldRow({
       label: 'Max simultaneous connections',
-      meta: 'The cap on concurrent connections to this provider - recordings and channel ' +
-        'tests combined. Account sync does not count against it. Blank follows the global ' +
-        `default (${escHtml(String(data.global_max_connections))}).`,
+      meta: 'How many streams ChannelBin may open on this account at once - recordings, ' +
+        'health checks and previews together (a sync does not count). Set it to your ' +
+        'plan\'s limit. Blank follows the default in Settings ' +
+        `(${escHtml(String(data.global_max_connections))}).`,
       control: '<input type="number" id="acct-conn" min="1" step="1" ' +
         `value="${escHtml(String(a.max_connections))}" placeholder="Default (${escHtml(String(data.global_max_connections))})">`,
     }) +

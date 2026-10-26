@@ -15,7 +15,9 @@
     <h1>{{ rec.name }}</h1>
     <div class="dh-meta">
       <span id="status-badge" data-status="{{ rec.status }}">{{ status_badge(row.badge_class, row.badge_label, pulse=row.badge_pulse, lg=true) }}</span>
-      {% if row.health.tip %}<span class="h-mini {{ row.health.cls }} tip-plain" data-tip="{{ row.health.tip }}">{{ row.health.label }}</span>
+      {#- Words here, where the list has a column heading to lean on and this page has none:
+          a bare green check beside the status read as nothing at all. -#}
+      {% if row.health.tip %}<span class="h-mini {{ row.health.cls }} tip-plain" data-tip="{{ row.health.tip }}">{{ row.health.text or row.health.label }}</span>
       {% else %}<span class="h-mini na">-</span>{% endif %}
       {% if row.pill %}{{ channel_pill(row.pill.label, row.pill.url, logo_url=row.pill.logo_url, initials=row.pill.initials, acct_color=row.pill.acct_color) }}{% endif %}
       {% if row.member_pill %}{{ channel_pill(row.member_pill.label, row.member_pill.url, logo_url=row.member_pill.logo_url, initials=row.member_pill.initials, acct_color=row.member_pill.acct_color, tip=row.member_pill.tip) }}{% endif %}
@@ -293,19 +295,28 @@
    updater per region: the auto-refresh swap skips this slot when live). #}
 <div id="status-strip-slot">
 {% if rec.status == REC_STATUS.IN_PROGRESS %}
-<div class="live-strip">
+{#- The watchdog's state, not the recording's status: IN_PROGRESS covers every restart that
+    got nothing, and a strip that said "Recording" through all of them contradicted the
+    picture beside it (dev/changelog/1285). The first render is the server's reading
+    (routes/recordings.py::_live_capture); the script below takes over from the same facts. -#}
+<div class="live-strip{% if not live_capture.capturing %} not-capturing{% endif %}" id="live-strip"
+     data-capturing="{{ 'yes' if live_capture.capturing else 'no' }}"
+     data-reconnecting="{{ 'yes' if live_capture.reconnecting else 'no' }}"
+     data-had-data="{{ 'yes' if live_capture.had_data else 'no' }}"
+     data-seg="{{ live_capture.segment_number if live_capture.segment_number is not none else '' }}"
+     data-seg-bytes="{{ live_capture.segment_bytes }}" data-stale-ms="{{ live_stale_seconds * 1000 }}">
   <span class="pulse"></span>
-  <span><b>Recording</b></span>
+  <span><b id="live-state">{{ live_capture.label }}</b><span id="live-state-why"></span></span>
   <span class="sep-dot">·</span>
-  <span>elapsed <span class="mono" id="live-elapsed">-</span></span>
+  <span>elapsed <span class="mono" id="live-elapsed">{{ live_capture.elapsed | duration(true) }}</span></span>
   <span class="sep-dot">·</span>
-  <span>remaining <span class="mono" id="live-remaining">-</span></span>
+  <span>remaining <span class="mono" id="live-remaining">{{ live_capture.remaining | duration(true) }}</span></span>
   <span class="sep-dot">·</span>
-  <span><span class="mono" id="live-bytes">-</span> recorded</span>
+  <span><span class="mono" id="live-bytes">{{ live_capture.total_bytes | filesize if live_capture.total_bytes else '0 B' }}</span> recorded</span>
   <span class="sep-dot">·</span>
   <span>stalls <span class="mono" id="live-stalls">{{ rec.total_stall_count }}</span></span>
   <span class="sep-dot">·</span>
-  <span>failures <span class="mono" id="live-failures">{{ rec.consecutive_failures }}</span></span>
+  <span>failures in a row <span class="mono" id="live-failures">{{ rec.consecutive_failures }}</span></span>
 </div>
 {% elif rec.status == REC_STATUS.PAUSED %}
 <div class="live-strip">
@@ -320,7 +331,7 @@
     {%- if rec.next_retry_at %} at <b>{{ rec.next_retry_at | local_time_sec }}</b>{% endif %}
     (attempt <b>{{ rec.dead_stream_retry_count }}</b> of <b>{{ max_dead_stream_retry_attempts }}</b>)</span>
   <span class="sep-dot">·</span>
-  <span>Stop to finalize what was captured, or Abort to discard it</span>
+  <span>Stop keeps what was captured; Abort, in the &#8943; menu, discards it</span>
 </div>
 {% elif rec.status == REC_STATUS.SCHEDULED %}
 <div class="live-strip sched-strip">
@@ -340,7 +351,7 @@
 <div class="live-strip concat-strip">
   <span class="pulse"></span>
   {% if concat_prog %}
-  <span>Joining <b>{{ joinable_count }} segment{{ '' if joinable_count == 1 else 's' }}</b> into the final file</span>
+  <span>Joining <b>{{ joinable_count }}{% if rec.segments | length > joinable_count %} of {{ rec.segments | length }}{% endif %} segment{{ '' if (rec.segments | length) == 1 else 's' }}</b> into the final file</span>
   {% if concat_prog.pct is not none %}
   <span class="sep-dot">·</span>
   <span><b>{{ concat_prog.pct | round(0) | int }}%</b></span>
@@ -352,7 +363,7 @@
   <span class="sep-dot">·</span>
   <span>{% if concat_prog.eta_seconds is not none %}~{{ concat_prog.eta_seconds | duration(true) }} left{% else %}estimating time left{% endif %}</span>
   {% else %}
-  <span>Capture finished - <b>{{ joinable_count }} segment{{ '' if joinable_count == 1 else 's' }}</b> waiting to be joined into the final file. The join starts as soon as the machine is free.</span>
+  <span>Capture finished - <b>{{ joinable_count }}{% if rec.segments | length > joinable_count %} of {{ rec.segments | length }}{% endif %} segment{{ '' if (rec.segments | length) == 1 else 's' }}</b> waiting to be joined into the final file. The join starts as soon as the machine is free.</span>
   {% endif %}
 </div>
 {% elif rec.status == REC_STATUS.ANALYZING and rec.postprocess_waiting_since %}
@@ -408,7 +419,9 @@
    swap refreshes it (this status is not is_active, so it is included in that swap). #}
 <div class="live-strip concat-strip">
   <span class="pulse"></span>
-  <span>Conversion in progress</span>
+  {#- Says why: a conversion runs after every join while the setting is on, and a user who
+      only pressed Stop had no other way to learn that (dev/changelog/1275). -#}
+  <span>Converting to <b>{{ after_join.format }}</b>, as <a href="{{ after_join.settings_url }}">Settings</a> does for every recording</span>
   {% if rec.conversion_out_size %}
   <span class="sep-dot">·</span>
   <span><b>{{ rec.conversion_out_size | filesize }}</b> written</span>
@@ -418,7 +431,9 @@
   <span><b>{{ rec.conversion_progress_pct | round(0) | int }}%</b> complete</span>
   {% endif %}
   <span class="sep-dot">·</span>
-  <span>{% if rec.conversion_eta_seconds is not none %}~{% if rec.conversion_eta_seconds >= 60 %}{{ rec.conversion_eta_seconds // 60 }} min{% else %}{{ rec.conversion_eta_seconds }} sec{% endif %} left{% else %}estimating time left{% endif %}</span>
+  {#- At 100% there is nothing left to estimate: "100% complete · estimating time left" read as
+      two answers at once (dev/changelog/1285). -#}
+  <span>{% if rec.conversion_eta_seconds is not none %}~{% if rec.conversion_eta_seconds >= 60 %}{{ rec.conversion_eta_seconds // 60 }} min{% else %}{{ rec.conversion_eta_seconds }} sec{% endif %} left{% elif (rec.conversion_progress_pct or 0) >= 99.5 %}finishing up{% else %}estimating time left{% endif %}</span>
   {% if rec.conversion_attempts %}
   <span class="sep-dot">·</span>
   <span>attempt {{ rec.conversion_attempts }} of {{ conversion_max_attempts }}</span>
@@ -431,7 +446,19 @@
      this is counted from the rows that were actually fed to it (the files are gone). The
      row count includes zero-byte segments and discarded placeholders, which is how a join
      of 16 used to describe itself as 19 here and on the strip above. #}
-  <span>Joined <b>{{ joinable_count }} segment{{ '' if joinable_count == 1 else 's' }}</b>{% if rec.final_file_size %} &rarr; <b>{{ rec.final_file_size | filesize }}</b>{% endif %}</span>
+  <span>Joined <b>{{ joinable_count }}{% if rec.segments | length > joinable_count %} of {{ rec.segments | length }}{% endif %} segment{{ '' if (rec.segments | length) == 1 else 's' }}</b>{% if rec.final_file_size %} &rarr; <b>{{ rec.final_file_size | filesize }}</b>{% endif %}</span>
+  {% if join_left_out.empty %}
+  <span class="sep-dot">·</span>
+  <span>{{ join_left_out.empty }} held no data</span>
+  {% endif %}
+  {% if join_left_out.unmeasured %}
+  <span class="sep-dot">·</span>
+  <span>{{ join_left_out.unmeasured }} ended on an error with no size recorded</span>
+  {% endif %}
+  {% if join_left_out.discarded %}
+  <span class="sep-dot">·</span>
+  <span>{{ join_left_out.discarded }} discarded as the provider's placeholder</span>
+  {% endif %}
   {% if rec.completed_at %}
   <span class="sep-dot">·</span>
   <span>finished <span class="mono">{{ rec.completed_at | local_time_sec }}</span></span>
@@ -517,6 +544,23 @@
 <div class="live-strip abort-strip">
   <span class="fx">?</span>
   <span>Status: <b>{{ rec.status }}</b> (unrecognized - check the event log below)</span>
+</div>
+{% endif %}
+</div>
+
+{# ── What happened (dev/changelog/1270): the plain account of a recording that hit trouble,
+   in sentences on the page itself. Its only home used to be the Recordings list's hover
+   tooltip, which a tap on a phone cannot open. Worded in app/recording_story.py, which the
+   list's tooltip and the retry alert share. The slot always renders so the 15s swap has a
+   node on both sides. #}
+<div id="story-slot">
+{% if story %}
+<div class="card" id="panel-story">
+  <div class="card-head"><h2>What happened</h2></div>
+  <div class="card-body">
+    <ul class="story">{% for line in story %}<li>{{ line }}</li>{% endfor %}</ul>
+    <p class="card-note">The event log below has the technical detail.</p>
+  </div>
 </div>
 {% endif %}
 </div>
@@ -673,10 +717,14 @@
   <div id="hero-thumb" data-sec="shot">
     <div class="sec-title">Screenshot</div>
     {% if rec.status == REC_STATUS.IN_PROGRESS and thumb_enabled %}
+    {#- What the box says before its first picture lands follows what the server knows: a
+        recording with data on disk is waiting on the frame grab, not on the stream, and "WAITING
+        FOR STREAM DATA" under a LIVE tag with 80 MB recorded said both (dev/changelog/1285). -#}
+    {% set capturing_now = live_capture and live_capture.capturing %}
     <div class="bigthumb has-img" id="live-bigthumb">
       <img id="live-thumb-img" alt="Live frame" style="display:none">
-      <span id="live-thumb-placeholder">WAITING FOR STREAM DATA&#8230;</span>
-      <span class="live-tag"><span class="pulse"></span>LIVE</span>
+      <span id="live-thumb-placeholder">{% if live_capture and live_capture.total_bytes %}LOADING THE PICTURE&#8230;{% else %}WAITING FOR STREAM DATA&#8230;{% endif %}</span>
+      <span class="live-tag{% if not capturing_now %} stale{% endif %}" id="live-thumb-tag"><span class="pulse"></span><span id="live-thumb-tag-text">{{ 'LIVE' if capturing_now else 'NO NEW VIDEO' }}</span></span>
       <span class="shot-age" id="live-thumb-captured"></span>
     </div>
     {% elif has_shot %}
@@ -780,7 +828,7 @@
           {% elif rec.status == REC_STATUS.FAILED %}
           <span class="fail">failed · {{ (rec.completed_at or last_ts) | local_time_only }}</span>
           {% elif rec.actual_duration_seconds %}
-          <span>{{ rec.actual_duration_seconds | int | duration }} captured</span>
+          <span>{{ rec.actual_duration_seconds | int | duration(with_seconds=true) }} captured</span>
           {% else %}
           <span></span>
           {% endif %}
@@ -803,11 +851,47 @@
         {{ stat_row('Program length', rec.program_duration_seconds | int | duration) }}
         {% endif %}
       {% else %}
-        <div class="srow"><span class="sk">Captured</span><span class="sv{% if row.dur_flag == 'partial' %} warn{% endif %}{% if row.dur_tip %} tip-plain" data-tip="{{ row.dur_tip }}{% endif %}">{% if row.dur_flag %}<span class="dur-flag{% if row.dur_flag == 'partial' %} dur-amber{% endif %}">&#9685;</span>{% endif %}{{ row.dur_str or '-' }} of {{ (rec.scheduled_duration_seconds | int) | duration }}</span></div>
+        {#- Which of the four durations each number is, said on the row itself: "of 1h 20m"
+            beside a 1h 40m program read as a wrong length, and a finished recording's
+            Captured is the video's length where an account's Recorded time is connection
+            wall clock, so the two differ by design. -#}
+        {% set live_window = rec.status in (REC_STATUS.IN_PROGRESS, REC_STATUS.PAUSED, REC_STATUS.RETRYING) %}
+        {#- While capturing, the strip above owns the numbers that move by themselves - its
+            size and clock come over SSE every few seconds, this card is swapped every 15 - so
+            they are shown there only. Both at once read as two sizes for one file (38.5 MB
+            beside 35 MB) and two lengths (elapsed 1m 0s beside Captured 56s,
+            dev/changelog/1285). -#}
+        {% set strip_owns_totals = rec.status == REC_STATUS.IN_PROGRESS %}
+        {% set sched_start = rec.scheduled_start_time or rec.start_time %}
+        {% set sched_stop = rec.scheduled_stop_time or rec.stop_time %}
+        {% set into = (sched_start - rec.program_start_time).total_seconds() if rec.program_start_time else 0 %}
+        {% if not strip_owns_totals %}
+        {% set cap_tip = ([row.dur_tip, none if live_window else 'This is the length of the finished video. An account\'s Recorded time counts the wall clock of every connection instead, retries included, so it reads a little higher.'] | select | join('\n')) or none %}
+        {#- "of 8m scheduled" for a 30-minute program was the time left when it was scheduled,
+            and nothing on the row said so (dev/changelog/1285). The length carries its
+            seconds, as What happened's does: "2m" here beside "2m 35s of video" there read as
+            two files (dev/changelog/1287). -#}
+        <div class="srow"><span class="sk">Captured</span><span class="sv{% if row.dur_flag == 'partial' %} warn{% endif %}{% if cap_tip %} tip-plain" data-tip="{{ cap_tip }}{% endif %}">{% if row.dur_flag %}<span class="dur-flag{% if row.dur_flag == 'partial' %} dur-amber{% elif row.dur_flag == 'stopped' %} dur-quiet{% endif %}">&#9685;</span>{% endif %}{{ row.dur_long or '-' }} of {{ (rec.scheduled_duration_seconds | int) | duration }} scheduled{% if into >= 60 %}, from {{ into | int | duration }} into the program{% endif %}</span></div>
+        {% endif %}
+        {% if rec.program_duration_seconds is not none and (rec.program_duration_seconds - rec.scheduled_duration_seconds) | abs >= 60 %}
+        {% set short_end = (rec.program_stop_time - sched_stop).total_seconds() %}
+        {{ stat_row('Program length', rec.program_duration_seconds | int | duration,
+                    tip=('How long the guide says the program runs.'
+                         ~ ('\nThis recording was scheduled to start ' ~ (into | int | duration) ~ ' after the program began, so that part was never going to be captured.' if into >= 60 else '')
+                         ~ ('\nIt was scheduled to stop ' ~ (short_end | int | duration) ~ ' before the program ends.' if short_end >= 60 else '')
+                         ~ ('\nIts window runs past the program on purpose (padding).' if into < 60 and short_end < 60 else ''))) }}
+        {% endif %}
+        {% if not strip_owns_totals %}
         {{ stat_row('Size', (row.size_num ~ ' ' ~ row.size_unit) if row.size_num else '-') }}
+        {% endif %}
         {# Size over which of the four durations: the tooltip says, like every other
-           duration-derived stat on this card (dev/changelog/1247). #}
-        {{ stat_row('Bitrate', row.rate or '-', tip=row.rate_tip) }}
+           duration-derived stat on this card (dev/changelog/1247). While the window is open
+           it is an average, and is labeled one: a plain "Bitrate 3.5 Mb/s" during a stall
+           read as data still arriving. Before it has a minute to average over it says so,
+           where a bare "-" beside the Segments table's 7.2 Mb/s read as missing
+           (dev/changelog/1285). #}
+        {{ stat_row('Avg bitrate' if live_window else 'Bitrate',
+                    row.rate or ('after the first minute' if live_window else '-'), tip=row.rate_tip) }}
         {% set tech_tip = 'From the final output file (recorded before capture-time probing existed).' if tech_source == 'output' else none %}
         {# Coded frame size rides on Video's tooltip rather than getting its own row:
            the resolution beside it already conveys the displayed size. `select` with no
@@ -832,10 +916,15 @@
         {{ stat_row('Segments', rec.segments | length) }}
         {{ stat_row('Stalls', rec.total_stall_count, sv_cls=('warn' if rec.total_stall_count else none)) }}
         {% set error_segments = rec.segments | selectattr('exit_reason', 'in', ('RESTART_NO_DATA', 'ERROR')) | list %}
-        {{ stat_row('Errors', error_segments | length, sv_cls=('warn' if error_segments else none),
-                    tip='Segments where a restart attempt produced zero bytes before the recording moved on (RESTART_NO_DATA / ERROR in the Exit column) - distinct from Stalls, which counts every stall regardless of what happened next.') }}
-        {{ stat_row('Restarts', rec.total_restart_count,
-                    tip='Only counts restarts that resumed writing data after a stall. A restart that came back with zero bytes doesn\'t count here - the watchdog declares that attempt dead immediately and either retries again or the recording fails over to another channel (see the Segments list below for which). Restarts can be lower than Segments minus 1 for this reason.') }}
+        {#- Restarts, Restarts with no data and Failures in a row count three different
+            things, and each label says which: as "Restarts 0", "Errors 4" and "Consecutive
+            failures 0 (peak 6)" beside six RESTART_ATTEMPTED in the log, they read as one
+            number disagreeing with itself. -#}
+        {{ stat_row('Restarts',
+                    (restart_attempts ~ ' tried · ' ~ rec.total_restart_count ~ ' got the stream back') if restart_attempts else rec.total_restart_count,
+                    tip='Tried: every restart started after a stall or a failed launch - each RESTART_ATTEMPTED in the activity log below.\nGot the stream back: restarts whose new segment started writing again. The others produced nothing (Restarts with no data), or the recording moved to another channel or into a wait before trying again.') }}
+        {{ stat_row('Restarts with no data', error_segments | length, sv_cls=('warn' if error_segments else none),
+                    tip='Segments where a restart produced zero bytes before the recording moved on (RESTART_NO_DATA / ERROR in the Exit column) - distinct from Stalls, which counts every stall regardless of what happened next.') }}
         {# Downtime, Capture gaps and Content vs capture time are three stats on purpose,
            never one corrected number (dev/changelog/432, 942). Downtime is a live counter
            over the write stream; Capture gaps is measured after the fact from the segment
@@ -849,7 +938,7 @@
            CLAUDE.md's time-and-counter-accounting rule. #}
         {{ stat_row('Downtime', (rec.total_downtime_seconds | int) | duration(with_seconds=true),
                     sv_cls=('warn' if rec.total_downtime_seconds else none),
-                    tip='Wall-clock time with nothing being written: for each stall, the gap between the last byte and the stall being noticed, plus the restart delay and the wait for the replacement segment to start writing.\nCapture gaps below is the subset of this where no capture process was running at all; the rest is time a segment was still alive but had stopped delivering.') }}
+                    tip='Wall-clock time with nothing being written: for each stall, the gap between the last byte and the stall being noticed, plus the restart delay and the wait for the replacement segment to start writing, plus any wait before trying a dead stream again.\nCapture gaps below is the part of this where no capture process was running at all; the rest is time a segment was still alive but had stopped delivering. Capture gaps can still read a little higher, because it also counts time spent paused and the seconds before the first segment opened.') }}
         {% if rec.capture_gap_seconds is not none %}
         {% set gap_pct = (rec.capture_gap_seconds / rec.duration_seconds * 100) if rec.duration_seconds else none %}
         {# The Captured row above counts against the SCHEDULED window and these count against
@@ -890,14 +979,27 @@
                     sv_cls='warn',
                     tip='Segment(s) whose bitrate is far below the recording\'s own average - likely a blank/slate screen or error card. The timeline itself is clean (no gaps), which is why this is a separate check from Capture gaps.') }}
         {% endif %}
-        {{ stat_row('Consecutive failures', rec.consecutive_failures ~ ' (peak ' ~ rec.consecutive_failures_peak ~ ')', sv_cls=('ok' if not rec.consecutive_failures else 'bad'),
-                    tip='The current run of stalls and failed restarts with no successful restart in between, and the highest that run ever reached this recording (peak). Resets to 0 on a successful restart or a channel failover. Reaching the configured limit is what triggers a failover to another channel, or gives up if there is nowhere left to go.') }}
+        {{ stat_row('Failures in a row', rec.consecutive_failures ~ ' now · ' ~ rec.consecutive_failures_peak ~ ' at most', sv_cls=('ok' if not rec.consecutive_failures else 'bad'),
+                    tip='The current run of stalls and failed restarts with no successful restart in between (now), and the longest that run got during this recording (at most). Resets to 0 on a successful restart or a channel failover. Reaching the configured limit is what triggers a failover to another channel, or gives up if there is nowhere left to go. The strip at the top shows the same "now" number while recording.') }}
         {% if rec.completed_at %}{{ stat_row('Completed', rec.completed_at | local_time) }}{% endif %}
         {% if rec.output_path %}
         {{ stat_row('Output', rec.output_path, wide=true) }}
         {% elif rec.status == REC_STATUS.FAILED %}
         {{ stat_row('Output', 'none - segments kept on disk', wide=true) }}
         {% endif %}
+      {% endif %}
+      {#- What the join will be followed by, while that is still ahead: a conversion that
+          arrived after Stop with nothing having said one was coming read as something going
+          wrong (dev/changelog/1275). Future tense and no "join": "After the join: Converted
+          to MP4" read as done from the first second, and "the join" as joining a channel
+          (dev/changelog/1287). -#}
+      {% if rec.status in (REC_STATUS.SCHEDULED, REC_STATUS.IN_PROGRESS, REC_STATUS.PAUSED, REC_STATUS.RETRYING, REC_STATUS.CONCATENATING, REC_STATUS.ANALYZING) %}
+      {{ stat_row('Finished file',
+                  ('Will be converted to ' ~ after_join.format ~ (', and the .ts deleted' if after_join.delete_source else ', and the .ts kept'))
+                  if after_join.convert else 'Will stay a .ts file',
+                  tip=('Conversion is one setting for every recording, in Settings under Conversion ("Post-process (remux)"). It starts after the recording ends, once its segments are joined into one .ts file and that file is checked.'
+                       ~ (' The .ts is kept anyway when the converted file turns out to be missing video the .ts has, so the conversion can be retried.' if after_join.convert and after_join.delete_source else ''))
+                       if after_join.convert else 'Conversion is off in Settings under Conversion ("Post-process (remux)"), so the .ts its segments are joined into after the recording ends is the finished file.') }}
       {% endif %}
     </div>
   </div>
@@ -1052,6 +1154,14 @@
             {% if seg.ffmpeg_exit_code is not none %}
               {% if seg.ffmpeg_exit_code < 0 %}
               <span class="exit-code tip-plain" data-tip="ffmpeg was stopped by signal {{ -seg.ffmpeg_exit_code }} - that is ChannelBin ending it, which is what the exit reason describes.">sig {{ -seg.ffmpeg_exit_code }}</span>
+              {#- 255 is how ffmpeg 7.1 exits when it catches the SIGTERM ChannelBin stops it
+                  with (measured), so after any stop of ChannelBin's own - a Stop, the stop
+                  time, a stall kill - it agrees with the pill like a signal does. Only beside
+                  PROCESS_EXITED, or with no reason recorded, is it ffmpeg giving up; a red
+                  "rc 255 - it gave up" beside the user's own Stop read as a failure
+                  (dev/changelog/1287). -#}
+              {% elif seg.ffmpeg_exit_code == 255 and seg.exit_reason and seg.exit_reason != 'PROCESS_EXITED' %}
+              <span class="exit-code tip-plain" data-tip="255 is the code ffmpeg exits with when it is told to stop. ChannelBin stopped it, which is what the exit reason describes.">rc 255</span>
               {% elif seg.ffmpeg_exit_code > 0 %}
               <span class="exit-code bad tip-plain" data-tip="ffmpeg exited on its own with error code {{ seg.ffmpeg_exit_code }} - it gave up before ChannelBin stopped it.">rc {{ seg.ffmpeg_exit_code }}</span>
               {% else %}
@@ -1076,7 +1186,8 @@
             {%- if seg_ch.account %} (<a href="{{ url_for('accounts.account_detail', account_id=seg_ch.account.id) }}">{{ seg_ch.account.name }}</a>){% endif %}
             {% else %}<span class="muted">-</span>{% endif %}
           </td>
-          <td class="mono muted xtra" style="font-size:var(--fs-xs); overflow-wrap:anywhere">{{ seg.file_path | replace('/dvr/', '') }}</td>
+          <td class="mono muted xtra" style="font-size:var(--fs-xs); overflow-wrap:anywhere">{{ seg.file_path | replace('/dvr/', '') }}
+            {%- if seg.id in seg_files_gone %} <span class="tip-plain" data-tip="This segment's own file is no longer on disk.{% if rec.output_path %} The segments were joined into the finished file and then deleted, which is what happens to every recording{{ ' - this one was discarded, so its video was left out' if seg.excluded else '' }}.{% endif %}">· no longer on disk</span>{% endif %}</td>
         </tr>
         {% endfor %}
       </tbody>
@@ -1086,7 +1197,9 @@
 {% endif %}
 </div>
 
-{# ── Event log (DESIGN.md 3.8): vertical timeline, newest first by default. #}
+{# ── Event log (DESIGN.md 3.8): vertical timeline, newest first by default. Each row leads
+   with the type's plain name and keeps the type itself in small print, since that is what
+   Logs and support bundles spell (dev/changelog/1293). #}
 {# RECORDING_START_NOT_ARMED is 'bad': a SCHEDULED recording nothing will start until a
    restart, and this event is its one lasting surface (dev/changelog/1186).
    RECORDING_RULE_PROGRAM_MOVED is 'warn': the guide moved the program and this recording
@@ -1131,15 +1244,17 @@
   </div>
   <div class="card-body">
     {% if rec.events %}
-    <ul class="evlog" id="evlog">
+    {% set ev_clip = rec.events | length > 10 %}
+    <ul class="evlog{% if ev_clip %} ev-clip{% endif %}" id="evlog">
       {% for evt in rec.events | reverse %}
       {# data-ev-id keys the disclosure-state re-apply after the 15s panel swap. It must be
          the DB id, not the loop index: new events arriving shift every index. #}
       <li class="ev {{ ev_cls.get(evt.event_type, 'info') }}" data-ev-id="{{ evt.id }}">
         <div class="ev-head">
-          <span class="ev-type">{{ evt.event_type }}</span>
+          <span class="ev-type">{{ evt.event_type | event_label }}</span>
           <span class="ev-time">{{ evt.timestamp | local_time_sec }}</span>
           {% if evt.segment_number is not none %}<span class="ev-seg">seg {{ evt.segment_number + seg_offset }}</span>{% endif %}
+          <span class="ev-code">{{ evt.event_type }}</span>
         </div>
         {% if evt.detail %}<div class="ev-detail">{{ evt.detail }}</div>{% endif %}
         {% set links = event_channel_links.get(evt.id) %}
@@ -1162,6 +1277,7 @@
       </li>
       {% endfor %}
     </ul>
+    {% if ev_clip %}<button type="button" class="btn btn-sm ev-more" id="ev-more">Show all {{ rec.events | length }} events</button>{% endif %}
     {% else %}
     <div class="empty-state">No events yet.</div>
     {% endif %}
@@ -1389,13 +1505,41 @@ window.onScheduleSaved = () => window.location.reload();
   const initList = document.getElementById('evlog');
   if (initList) initList.dataset.order = 'newest';
 
+  // ── Phone "Show all N events" - the swapped-in copy arrives clipped again, so the
+  //    choice is held here and re-applied with the order above.
+  let evShowAll = false;
+  window.__applyEvShowAll = () => {
+    if (!evShowAll) return;
+    const list = document.getElementById('evlog');
+    if (list) list.classList.remove('ev-clip');
+    const more = document.getElementById('ev-more');
+    if (more) more.remove();
+  };
+  document.addEventListener('click', (e) => {
+    if (!e.target.closest('#ev-more')) return;
+    evShowAll = true;
+    window.__applyEvShowAll();
+  });
+
   // ── DIAGNOSTICS disclosures - open/closed state survives the panel swap.
   //    refreshPage() replaces #panel-eventlog's outerHTML every 15s and keeps doing it
   //    right through CONVERTING (not a terminal status), which is exactly when these
   //    events are written - so without this an expanded disclosure snaps shut under the
   //    reader. Keyed on the event's DB id: the swapped-in list can have new events at the
   //    top, and it can be in either sort order, so nothing positional survives.
-  const evOpen = new Set();
+  //    The live page also RELOADS on a status change (a stall into RETRYING and back), and
+  //    a reload drops anything held in memory: the "why" a reader had opened on a stalled
+  //    segment snapped shut under them on exactly the recording they were reading it for.
+  //    So both sets are mirrored to sessionStorage, per recording and per tab; a browser
+  //    that refuses storage still gets the in-memory half.
+  const OPEN_KEY = 'rec-detail-open:{{ rec.id }}';
+  const readOpen = (k) => {
+    try { return new Set(JSON.parse(sessionStorage.getItem(`${OPEN_KEY}:${k}`) || '[]')); } catch (_) { return new Set(); }
+  };
+  const saveOpen = (k, set) => {
+    try { sessionStorage.setItem(`${OPEN_KEY}:${k}`, JSON.stringify([...set])); } catch (_) { /* storage refused: memory only */ }
+  };
+  const evOpen = readOpen('ev');
   window.__applyEvDisclosures = () => {
     document.querySelectorAll('#evlog .ev[data-ev-id] > .ev-extra').forEach((d) => {
       d.open = evOpen.has(d.parentElement.dataset.evId);
@@ -1406,12 +1550,14 @@ window.onScheduleSaved = () => window.location.reload();
   // reader who opened a stall's stderr while the recording is still going is exactly the
   // person this feature exists for. Keyed on the segment number, which is stable across
   // swaps; the row's position is not, since new segments append.
-  const segOpen = new Set();
+  const segOpen = readOpen('seg');
   window.__applySegDisclosures = () => {
     document.querySelectorAll('#panel-segments-slot .seg-why[data-seg-no]').forEach((d) => {
       d.open = segOpen.has(d.dataset.segNo);
     });
   };
+  window.__applyEvDisclosures();
+  window.__applySegDisclosures();
   // 'toggle' does not bubble, so this listens in the capture phase rather than delegating.
   document.addEventListener('toggle', (e) => {
     const d = e.target;
@@ -1420,12 +1566,14 @@ window.onScheduleSaved = () => window.location.reload();
       const segNo = d.dataset.segNo;
       if (!segNo) return;
       if (d.open) segOpen.add(segNo); else segOpen.delete(segNo);
+      saveOpen('seg', segOpen);
       return;
     }
     if (!d.classList.contains('ev-extra')) return;
     const id = d.parentElement && d.parentElement.dataset.evId;
     if (!id) return;
     if (d.open) evOpen.add(id); else evOpen.delete(id);
+    saveOpen('ev', evOpen);
   }, true);
 })();
 </script>
@@ -1540,21 +1688,117 @@ window.onScheduleSaved = () => window.location.reload();
 <script>
 (function() {
   const rid = {{ rec.id }};
+  const strip = document.getElementById('live-strip');
+
+  // Is data arriving, and if not, is the watchdog reconnecting? One reading for the strip's
+  // label and the screenshot's tag, so the two cannot disagree. The open segment's byte
+  // count is what says data is arriving - the screenshot is re-grabbed from the end of that
+  // segment, so during a stall it is a fresh copy of an old frame, and the recording's total
+  // can step up when a closed segment's last flush is counted. No snapshot arrives while the
+  // watchdog waits out a restart, which is why a timer re-reads it and the watchdog's own
+  // events move it: a strip that waited for the next snapshot said "Recording" and
+  // "stalls 0" through every restart that got nothing (dev/changelog/1285).
+  const STALE_MS = strip ? Number(strip.dataset.staleMs) : 15000;
+  const live = {
+    seg: strip && strip.dataset.seg !== '' ? Number(strip.dataset.seg) : null,
+    segBytes: strip ? Number(strip.dataset.segBytes) : 0,
+    // When data was last seen arriving. The server's "capturing" is a reading, not a
+    // sighting: it starts the clock, but no "for 15s" is printed off it.
+    lastDataAt: !strip || strip.dataset.capturing === 'yes' ? Date.now() : null,
+    seen: false,
+    reconnecting: !!strip && strip.dataset.reconnecting === 'yes',
+    hadData: !strip || strip.dataset.hadData === 'yes',
+  };
+  // The events that say the watchdog is reconnecting, or that a restart got the stream
+  // back. The same table as routes/recordings.py::_RECONNECTING_AFTER, which renders the
+  // first frame; a resume needs no entry here because it reloads the page.
+  const RECONNECTING_AFTER = {
+    STALL_DETECTED: true, FAST_DELIVERY_DETECTED: true, RESTART_ATTEMPTED: true,
+    RESTART_FAILED: true, RESTART_SUCCEEDED: false,
+  };
+  function dataArrived() {
+    live.lastDataAt = Date.now();
+    live.seen = true;
+    live.hadData = true;
+    live.reconnecting = false;
+  }
+  const setText = (id, v) => {
+    const el = document.getElementById(id);
+    if (el && v !== undefined && v !== null) el.textContent = v;
+  };
+
+  // The same three-way reading as routes/recordings.py::_live_capture.
+  function render() {
+    const capturing = live.lastDataAt !== null && !live.reconnecting
+      && Date.now() - live.lastDataAt <= STALE_MS;
+    const tag = document.getElementById('live-thumb-tag');
+    const tagText = document.getElementById('live-thumb-tag-text');
+    if (tag && tagText) {
+      tag.classList.toggle('stale', !capturing);
+      tagText.textContent = capturing ? 'LIVE' : 'NO NEW VIDEO';
+    }
+    if (!strip) return;
+    strip.classList.toggle('not-capturing', !capturing);
+    let label = 'Recording';
+    let why = '';
+    if (!capturing && !live.hadData && !live.reconnecting) {
+      label = 'Connecting';
+      why = " - waiting for the stream's first data";
+    } else if (!capturing) {
+      label = live.seen ? `Not capturing for ${fmtDur((Date.now() - live.lastDataAt) / 1000)}` : 'Not capturing';
+      why = live.reconnecting ? ' - reconnecting to the stream' : ' - no new data from the stream';
+    }
+    setText('live-state', label);
+    setText('live-state-why', why);
+  }
+  render();
+  setInterval(render, 5000);
+
+  // The watchdog's events change what the swapped regions show too - the header's stall
+  // count, Details, the Segments table, the event log - so they ask for the swap now rather
+  // than at the next 15s tick, and the strip and the rest of the page move together.
+  let swapSoon = null;
+  function refreshSoon() {
+    clearTimeout(swapSoon);
+    swapSoon = setTimeout(() => {
+      if (window.__refreshRecordingPage) window.__refreshRecordingPage();
+    }, 1000);
+  }
 
   const sse = connectSSE(`/api/stream/${rid}`, {
     onMessage(e) {
       const msg = JSON.parse(e.data);
       if (msg.recording_id !== rid) return;
-      const d = msg.data;
-      if (msg.event === 'STATS_SNAPSHOT') {
-        const elapsedEl = document.getElementById('live-elapsed');
-        if (!elapsedEl) return;
-        elapsedEl.textContent = fmtDur(d.elapsed_seconds);
-        document.getElementById('live-remaining').textContent = fmtDur(d.remaining_seconds);
-        document.getElementById('live-bytes').textContent     = fmtBytes(d.total_bytes);
-        document.getElementById('live-stalls').textContent    = d.stall_count;
-        document.getElementById('live-failures').textContent  = d.consecutive_failures;
+      const d = msg.data || {};
+      // A frame that names a different status is the fast path of the status-change reload
+      // below; the 15s check there catches a transition that published no frame.
+      if (d.status && window.__reloadOnStatusChange && window.__reloadOnStatusChange(d.status)) {
+        sse.close();
+        return;
       }
+      if (msg.event === 'STATS_SNAPSHOT') {
+        const segBytes = d.current_segment_bytes || 0;
+        if (segBytes > 0 && (d.current_segment_number !== live.seg || segBytes > live.segBytes)) {
+          dataArrived();
+        }
+        live.seg = d.current_segment_number;
+        live.segBytes = segBytes;
+        setText('live-elapsed', fmtDur(d.elapsed_seconds));
+        setText('live-remaining', fmtDur(d.remaining_seconds));
+        setText('live-bytes', fmtBytes(d.total_bytes));
+        setText('live-stalls', d.stall_count);
+        setText('live-failures', d.consecutive_failures);
+        render();
+      }
+      if (msg.event in RECONNECTING_AFTER) {
+        if (RECONNECTING_AFTER[msg.event]) live.reconnecting = true;
+        else dataArrived();
+        setText('live-stalls', d.stall_count);
+        setText('live-failures', d.consecutive_failures);
+        render();
+        refreshSoon();
+      }
+      if (msg.event === 'SEGMENT_STARTED' || msg.event === 'GROUP_FAILOVER') refreshSoon();
       if (['CAPTURE_COMPLETE','RECORDING_FAILED','RECORDING_ABORTED','CONCATENATION_DONE','CONCATENATION_FAILED','RECORDING_PAUSED'].includes(msg.event)) {
         sse.close();
         setTimeout(() => location.reload(), 2000);
@@ -1577,10 +1821,18 @@ window.onScheduleSaved = () => window.location.reload();
   const baseUrl = "{{ url_for('recordings.live_thumbnail', recording_id=rec.id) }}";
   const AUTO_REFRESH_MS = {{ thumb_auto_refresh_seconds }} * 1000;
   let lastObjectUrl = null;
+  let fetchedAt = null;
 
-  function formatCapturedAt(unixSeconds) {
-    return fmtTimeTz(new Date(unixSeconds * 1000), { seconds: true });
+  // How old the picture on screen is, counting up between refreshes. It used to be the
+  // clock time of the grab, which stood still for the minute between refreshes under a
+  // LIVE tag and read as a frozen page (dev/changelog/1285). Counted from when this page
+  // got it, on this browser's own clock, so no server clock is compared against it.
+  function markAge() {
+    if (!capturedEl || fetchedAt === null) return;
+    const age = (Date.now() - fetchedAt) / 1000;
+    capturedEl.textContent = age < 5 ? 'updated just now' : `updated ${fmtDur(age)} ago`;
   }
+  setInterval(markAge, 5000);
 
   async function refresh() {
     const url = baseUrl + '?t=' + Date.now();
@@ -1592,12 +1844,15 @@ window.onScheduleSaved = () => window.location.reload();
       img.src = objectUrl;
       if (lastObjectUrl) URL.revokeObjectURL(lastObjectUrl);
       lastObjectUrl = objectUrl;
-      const capturedAt = res.headers.get('X-Thumb-Captured-At');
-      if (capturedAt && capturedEl) capturedEl.textContent = formatCapturedAt(Number(capturedAt));
+      fetchedAt = Date.now();
+      markAge();
       img.style.display = 'block';
       placeholder.style.display = 'none';
     } catch (e) {
       img.style.display = 'none';
+      // The server rendered "loading" only for a recording with data on disk, so a failed
+      // grab there is no picture yet, not a stream still to arrive.
+      if (/^LOADING/.test(placeholder.textContent)) placeholder.textContent = 'NO PICTURE YET';
       placeholder.style.display = '';
     }
   }
@@ -1758,6 +2013,7 @@ window.onScheduleSaved = () => window.location.reload();
         await swapFromServer(['#panel-program', '#panel-eventlog']);
         if (window.__applySectionLayout) window.__applySectionLayout();
         if (window.__applyEvOrder) window.__applyEvOrder();
+        if (window.__applyEvShowAll) window.__applyEvShowAll();
         if (window.__applyEvDisclosures) window.__applyEvDisclosures();
       } catch (e) {
         err.textContent = e.message || 'Could not save.';
@@ -1790,12 +2046,33 @@ window.onScheduleSaved = () => window.location.reload();
   // panel-program is in the list because the record-start refresh can rewrite the synopsis
   // while this page is open on a SCHEDULED recording. swapFromServer needs the node on
   // both sides, so a manual capture - which never has the card - simply skips it.
-  const SWAP_IDS = ['detail-head-slot', 'hero-right', 'panel-program',
+  const SWAP_IDS = ['detail-head-slot', 'story-slot', 'hero-right', 'panel-program',
                     'panel-segments-slot', 'panel-eventlog'];
-  if (initialStatus !== 'IN_PROGRESS' && initialStatus !== 'PAUSED') {
+  const REC = statusVocab('REC_STATUS');
+  if (initialStatus !== REC.IN_PROGRESS && initialStatus !== REC.PAUSED) {
     SWAP_IDS.push('status-strip-slot');
   }
   let timer = null;
+
+  // A move into or out of IN_PROGRESS or PAUSED reloads the page. Those two pages render
+  // regions no swap reaches - the strip (SSE-owned), the live screenshot and the scripts
+  // that drive them - so swapping only the header left a RETRYING badge over a strip still
+  // saying "Recording" beside a LIVE screenshot (dev/docs/BUGS.md 2026-10-22 08:13:55 PM).
+  const LIVE_PAGES = [REC.IN_PROGRESS, REC.PAUSED];
+  let reloading = false;
+  window.__reloadOnStatusChange = (status) => {
+    if (reloading || !status || status === initialStatus) return reloading;
+    if (!LIVE_PAGES.includes(initialStatus) && !LIVE_PAGES.includes(status)) return false;
+    reloading = true;
+    clearInterval(timer);
+    location.reload();
+    return true;
+  };
+
+  // A page the back-forward cache hands back is the document as it was left, and this one
+  // is only right as of its last swap; the route's no-store covers the other way an old copy
+  // came back, the HTTP cache (dev/changelog/1285).
+  window.addEventListener('pageshow', (e) => { if (e.persisted) location.reload(); });
 
   const initialBadge = document.getElementById('status-badge');
   if (initialBadge && TERMINAL_STATUSES.includes(initialBadge.dataset.status)) {
@@ -1811,11 +2088,13 @@ window.onScheduleSaved = () => window.location.reload();
       // two more (tl/stats) ride inside #hero-right, so without this the
       // Details card sinks below them within 15s and hidden sections return.
       if (window.__applyEvOrder) window.__applyEvOrder();
+      if (window.__applyEvShowAll) window.__applyEvShowAll();
       if (window.__applyEvDisclosures) window.__applyEvDisclosures();
       if (window.__applySegDisclosures) window.__applySegDisclosures();
       if (window.__applySectionLayout) window.__applySectionLayout();
 
       const badge = document.getElementById('status-badge');
+      if (badge && window.__reloadOnStatusChange(badge.dataset.status)) return;
       if (badge && TERMINAL_STATUSES.includes(badge.dataset.status)) {
         clearInterval(timer);
       }

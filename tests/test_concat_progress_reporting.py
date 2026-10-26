@@ -394,7 +394,7 @@ class JoinSurfaceTests(_ConcatCase):
         with self.t.app.test_client() as c:
             html = c.get(f'/recordings/{self.rid}').get_data(as_text=True)
 
-        self.assertIn('<b>3 segments</b> waiting to be joined', html)
+        self.assertIn('<b>3 of 5 segments</b> waiting to be joined', html)
         self.assertNotIn('<b>5 segments</b>', html)
 
     def test_a_queued_join_says_it_has_not_started(self):
@@ -416,7 +416,7 @@ class JoinSurfaceTests(_ConcatCase):
         with self.t.app.test_client() as c:
             html = c.get(f'/recordings/{self.rid}').get_data(as_text=True)
 
-        self.assertIn('Joined <b>3 segments</b>', html)
+        self.assertIn('Joined <b>3 of 5 segments</b>', html)
 
     def test_the_recordings_list_row_shows_the_percent(self):
         """The list's relative line for this status was only "ended Nm ago"."""

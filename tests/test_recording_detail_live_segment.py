@@ -89,12 +89,13 @@ class LiveSegmentRowTests(unittest.TestCase):
         self.assertTrue(slowest <= float(m.group(1)) <= fastest,
                         '%s Mb/s is outside %s-%s' % (m.group(1), slowest, fastest))
 
-    def test_size_stat_includes_open_segment(self):
+    def test_the_pages_size_includes_open_segment(self):
+        """While capturing, the page's one size is the strip's (dev/changelog/1285), and its
+        first render counts the open segment the way the SSE frames that follow it do."""
         html = self._page()
-        stat = html.split('id="hero-right"', 1)[1]
-        from app.routes.recordings import _size_parts
-        num, unit = _size_parts(DONE_BYTES + LIVE_BYTES)
-        self.assertIn(f'{num} {unit}', stat)
+        self.assertIn(f'id="live-bytes">{filesize_filter(DONE_BYTES + LIVE_BYTES)}<', html)
+        stat = html.split('id="hero-right"', 1)[1].split('id="panel-segments-slot"', 1)[0]
+        self.assertNotIn('<span class="sk">Size</span>', stat)
 
     def test_content_tip_does_not_blame_old_data_while_recording(self):
         row = self._live_row(self._page())

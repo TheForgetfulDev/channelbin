@@ -59,6 +59,17 @@ class SyncPromptTests(unittest.TestCase):
             self.assertEqual(len(seen['calls']), 1, name)
             self.assertNotIn('restart_schedule', seen['calls'][0]['body'], name)
 
+    def test_a_never_synced_account_is_not_asked_about_skipping(self):
+        """dev/docs/BUGS.md 2026-10-22 10:19:00 PM (the Sync now dialog asked a never-synced account
+        about skipping its next sync). The scheduled sync of an account that has never synced
+        IS its first sync, so there is nothing to skip: no dialog, and the run stands in for
+        the scheduled one, so a first sync a user starts by hand is not followed a minute later
+        by the scheduled one doing it again."""
+        seen = self.obs['never_synced']
+        self.assertFalse(seen['modal'])
+        self.assertEqual(len(seen['calls']), 1)
+        self.assertIs(seen['calls'][0]['body'].get('restart_schedule'), True)
+
     def test_the_dialog_names_the_scheduled_sync_it_would_skip(self):
         seen = self.obs['default_on']
         self.assertTrue(seen['modal'])

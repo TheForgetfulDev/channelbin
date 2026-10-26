@@ -69,10 +69,10 @@
       { focus: 'profile', label: 'Profile', value: state.profileName || 'None',
         note: 'Pre-selected when scheduling from the guide',
         tip: 'The recording profile pre-selected when you schedule this channel from the guide. It can still be changed per recording.' },
-      { focus: 'pace', label: 'Real-time read', value: paceValue(),
+      { focus: 'pace', label: 'Read at play speed', value: paceValue(),
         note: 'Record no faster than the stream plays',
         tip: 'Whether recordings read this stream at real-time speed, the way a video player does. Helps a provider that re-sends its buffered video on every reconnect.' },
-      { focus: 'health', label: 'Health offset',
+      { focus: 'health', label: 'Score adjustment',
         value: state.adjustment ? (state.adjustment > 0 ? `+${state.adjustment}` : String(state.adjustment)) : 'None',
         note: 'Nudges the computed score',
         tip: 'Nudges the computed health score up or down (-100 to +100). The adjusted score is what ranks this channel against the others in its group.' },
@@ -118,7 +118,7 @@
     ];
     const paceSel = state.paceRealtime === null ? 'default' : (state.paceRealtime ? 'on' : 'off');
     h += fieldRow({
-      label: 'Read at real-time speed',
+      label: 'Read at play speed',
       meta: 'Record no faster than the stream plays, the way a video player does. Most channels record ' +
         'the same either way; it helps a provider that answers every reconnect by sending its buffered ' +
         'video again. Default follows the setting in Settings. With Default and that setting off, a ' +
@@ -130,7 +130,7 @@
 
     h += `<fieldset class="gd-fset${focus === 'health' ? ' hi' : ''}"><div class="gd-fset-head">Health</div>`;
     h += fieldRow({
-      label: 'Manual health offset',
+      label: 'Manual score adjustment',
       meta: 'Nudges the computed score up or down (-100 to +100). The adjusted score is what ranks this ' +
         'channel against the other channels in its group.',
       control: `<input type="number" id="cd-adjust" min="-100" max="100" step="1" name="adjustment" value="${state.adjustment}">`,
@@ -147,7 +147,7 @@
     if (C.guideCheckJobId) {
       h += fieldRow({
         label: 'Test with the guide check',
-        meta: 'The automatic "TV Guide Channels" health check tests one channel per guide row - a standalone ' +
+        meta: 'The automatic "TV Guide health check" tests one channel per guide row - a standalone ' +
           'channel like this one, or the member currently serving a group\'s row. Turn this off to leave this ' +
           'channel out of that run - it does not affect any health check you built yourself.',
         control: `<label class="switch"><input type="checkbox" id="cd-test-enabled"${state.testEnabled ? ' checked' : ''}><span class="knob"></span></label>`,
@@ -391,7 +391,7 @@
   // dialog too), and the next poll asks again.
   const LIVE_REGIONS = ['#cd-statusbar', '#cd-health', '#cd-timeline', '#cd-tests'];
   let hcInFlight = false;
-  const refreshBusy = () => Boolean(document.querySelector('.menu.open, .modal'));
+  const refreshBusy = overlayOpen;
 
   const healthState = () => readBootJson('cd-health-state', {});
 
@@ -402,9 +402,11 @@
       document.querySelectorAll('#cd-timeline details[data-bd]').forEach(d => {
         if (openBd.includes(d.dataset.bd)) d.open = true;
       });
-      // The phone's sticky bar is not a swapped region, so the Test button a click
-      // disabled there is given back here, as the status bar's is by being replaced.
-      document.querySelectorAll('.cd-stickybar [data-act="test-now"]').forEach(b => { b.disabled = false; });
+      // The phone's sticky bar is not a swapped region, so its Test buttons follow the
+      // status bar's, which the server renders disabled while this channel is testing.
+      const barTest = document.querySelector('#cd-statusbar [data-act="test-now"]');
+      const testing = Boolean(barTest && barTest.disabled);
+      document.querySelectorAll('.cd-stickybar [data-act="test-now"]').forEach(b => { b.disabled = testing; });
     });
   }
 

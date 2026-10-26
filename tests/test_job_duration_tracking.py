@@ -178,7 +178,7 @@ class DurationLineWordingTests(unittest.TestCase):
     def test_unknown_job(self):
         self.assertEqual(
             fmt_job_duration_line(None, 0),
-            'Expected runtime unknown - this job has never completed a run.')
+            'How long it takes is not known yet - it has not finished a run here.')
 
     def test_known_average_states_what_it_is_an_average_of(self):
         line = fmt_job_duration_line(300, 3)
@@ -212,7 +212,7 @@ class BuildJobListDurationWiringTests(unittest.TestCase):
         item = next(i for i in items if i['id'] == f'account_sync_{self.account.id}')
         self.assertEqual(item['runs'], 0)
         self.assertEqual(item['duration_line'],
-                          'Expected runtime unknown - this job has never completed a run.')
+                          'How long it takes is not known yet - it has not finished a run here.')
 
     def test_account_sync_with_history_reports_the_average(self):
         from app.routes.jobs import _build_job_list
@@ -236,7 +236,7 @@ class BuildJobListDurationWiringTests(unittest.TestCase):
         item = next(i for i in items if i['id'] == 'db_maintenance_daily')
         self.assertEqual(item['runs'], 0)
         self.assertEqual(item['duration_line'],
-                          'Expected runtime unknown - this job has never completed a run.')
+                          'How long it takes is not known yet - it has not finished a run here.')
 
     def test_untracked_window_jobs_carry_no_duration_line(self):
         """hc_window_dispatch/hc_window_close are deliberately excluded - the approved

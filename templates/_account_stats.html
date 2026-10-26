@@ -80,8 +80,8 @@
    skips [data-tip]). #}
 {% macro row_more(cur, s, bands) -%}
 <span class="a-more">
-  <span class="a-x"><span class="a-k" data-tip="{{ s.tips.in_group }}">In a group</span>{{ num(cur.in_group) }}</span>
-  <span class="a-x"><span class="a-k" data-tip="{{ s.tips.rec_enabled }}">Recording on</span>{{ num(cur.recording_memberships) }}</span>
+  <span class="a-x"><span class="a-k" data-tip="{{ s.tips.in_group }}">In your groups</span>{{ num(cur.in_group) }}</span>
+  <span class="a-x"><span class="a-k" data-tip="{{ s.tips.rec_enabled }}">Recording in groups</span>{{ num(cur.recording_memberships) }}</span>
   <span class="a-x"><span class="a-k" data-tip="{{ s.rows_tip }}">Guide rows</span>{{ num(cur.guide_rows_fed) }} <span class="text-faint">of {{ '{:,}'.format(cur.guide_rows_total) }}</span></span>
   <span class="a-x"><span class="a-k" data-tip="{{ s.tips.epg }}">With EPG</span>{{ num(cur.epg.with_epg) }}</span>
   {{ stat_avg(cur, s, bands) }}
@@ -93,7 +93,7 @@
 {# The Dashboard row's second line. Deliberately a SUBSET of row_more above, not a second
    version of it: the dashboard answers "does anything need me right now", so it carries
    the two numbers and the band bar that move on their own, and leaves the four
-   configuration counts (In a group, Recording on, Guide rows, With EPG) to /accounts,
+   configuration counts (In your groups, Recording in groups, Guide rows, With EPG) to /accounts,
    where you go when you are asking what an account is set up to do. The Usage charts stay
    off the dashboard entirely for the same reason (dev/changelog/1063). #}
 {% macro row_signal(cur, s, bands) -%}

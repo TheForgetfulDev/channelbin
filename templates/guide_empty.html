@@ -13,7 +13,12 @@
 <div class="empty-state">
   {% if reason == 'no_accounts' %}
     <p>No accounts added yet.</p>
-    <a href="{{ url_for('accounts.new_account') }}" class="btn btn-primary">Add an Account</a>
+    <a href="{{ url_for('accounts.new_account') }}" class="btn btn-primary">Add an account</a>
+    {# The same condition Get started offers the examples on: no account at all
+       (dev/changelog/1288). #}
+    <p class="text-muted small" style="margin-top: 0.75rem;">
+      No IPTV provider yet? <a href="{{ url_for('setup.get_started') }}#gs-try">Get started</a> can load free example channels to try it with.
+    </p>
   {% elif reason == 'no_channels' %}
     <p>No channels added to your guide yet.</p>
     <a href="{{ url_for('channels.channel_browser') }}" class="btn btn-primary">Browse channels</a>

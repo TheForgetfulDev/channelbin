@@ -388,13 +388,18 @@ const TL_BAR_CLASS = {
   ANALYZING: 'converting',
   CONVERTING: 'converting',
   SCHEDULED: 'scheduled',
+  // Finished rows reach the axis's back half so a recording that just ended is not simply
+  // gone (dev/changelog/1270). A finished row that had trouble adds `trouble` (tlBar).
+  COMPLETED: 'done',
+  FAILED: 'failed',
+  ABORTED: 'done',
 };
 
 function tlBar(r, now) {
   const [s, e] = recWindow(r);
   const l = Math.max(0, tlPx(s));
   const rt = Math.min(TL.width, tlPx(e));
-  const cls = TL_BAR_CLASS[r.status] || 'unknown';
+  const cls = (TL_BAR_CLASS[r.status] || 'unknown') + (r.trouble ? ' trouble' : '');
   // The fill is the captured share of THIS bar, so it is a percentage of the bar's own
   // visible width, not of the window.
   let fill = '';
@@ -404,7 +409,7 @@ function tlBar(r, now) {
     fill = `<span class="tl-fill" style="width:${Math.max(0, Math.min(100, done / visible)).toFixed(2)}%"></span>`;
   }
   const clip = (tlPx(s) < 0 ? ' clip-l' : '') + (tlPx(e) > TL.width ? ' clip-r' : '');
-  const tip = `${r.name}\n${r.channel || ''}\n${fmtClock(s)} - ${fmtClock(e)}`;
+  const tip = `${r.name}\n${r.channel || ''}\n${fmtClock(s)} - ${fmtClock(e)}${r.note ? `\n${r.note}` : ''}`;
   return `<div class="tl-bar ${cls}${clip}" style="left:${l.toFixed(1)}px;width:${(rt - l).toFixed(1)}px"
     data-id="${r.id}" data-tip="${escHtml(tip)}" data-sheet="rec">${fill}
     <span class="tl-name">${escHtml(r.name)}</span>
@@ -431,6 +436,12 @@ function jobMark(j, clash) {
     data-tip="${escHtml(tip)}" data-sheet="job"><i></i></span>`;
 }
 
+// A job is the app's own work, which an install with nothing recorded still has - the count
+// line read as something the user had set up (dev/changelog/1292).
+const TL_COUNT_TIP = 'A job is ChannelBin\'s own scheduled work: account syncs, backups, '
+  + 'health checks and cleanup. They run whether or not anything is being recorded.\n'
+  + 'Jobs lists every one and when it runs next.';
+
 function renderTimeline() {
   const host = document.getElementById('tl');
   if (!host || !TL.data) return;
@@ -449,7 +460,11 @@ function renderTimeline() {
     const [s, e] = jobWindow(j);
     return e >= TL.start && s <= TL.end;
   });
-  const outside = (recs.length - inWin.length) + (TL.data.jobs.length - jobsIn.length);
+  // Split by side, so the count line can say "later" rather than an "outside it" that left a
+  // reader asking where (dev/changelog/1292).
+  const later = recs.filter(r => recWindow(r)[0] >= TL.end).length
+    + TL.data.jobs.filter(j => jobWindow(j)[0] > TL.end).length;
+  const earlier = (recs.length - inWin.length) + (TL.data.jobs.length - jobsIn.length) - later;
 
   // Greedy lane packing. Two recordings that overlap in time land in different lanes,
   // which is the whole point - an overlap is a real thing to see.
@@ -484,6 +499,7 @@ function renderTimeline() {
   const railHtml = jobsIn.length
     ? `<div class="tl-rail">${jobsIn.map((j, i) => jobMark(j, clashes[i])).join('')}</div>` : '';
   const nowLeft = tlPx(now).toFixed(1);
+  const REC = statusVocab('REC_STATUS');
   const counts = `${inWin.length} recording${inWin.length === 1 ? '' : 's'}, `
                + `${jobsIn.length} job${jobsIn.length === 1 ? '' : 's'}`;
 
@@ -509,9 +525,14 @@ function renderTimeline() {
       <span class="tl-key"><i class="live"></i>Recording</span>
       <span class="tl-key"><i class="converting"></i>Finishing</span>
       <span class="tl-key"><i class="scheduled"></i>Scheduled</span>
+      <span class="tl-key"><i class="done"></i>Finished</span>
+      ${inWin.some(r => r.trouble && r.status !== REC.FAILED)
+        ? '<span class="tl-key"><i class="trouble"></i>Finished with trouble</span>' : ''}
+      ${inWin.some(r => r.status === REC.FAILED) ? '<span class="tl-key"><i class="failed"></i>Failed</span>' : ''}
       <span class="tl-key"><i class="job"></i>Job</span>
       ${nClash ? '<span class="tl-key clash"><i class="jobclash"></i>Job that will be deferred</span>' : ''}
-      <span class="tl-off">${escHtml(counts)} in this window${outside ? `, ${outside} outside it` : ''}</span>
+      <span class="tl-off" data-tip="${escHtml(TL_COUNT_TIP)}">${escHtml(counts)} in this window${
+        later ? `, ${later} more later` : ''}${earlier ? `, ${earlier} earlier` : ''}</span>
     </div>`;
 
   wireScroller();
@@ -787,11 +808,13 @@ document.addEventListener('change', e => {
 // What each refresh key swaps. `recordings` is five nodes because one change moves all
 // of them: a start takes a row out of Upcoming, puts one in progress, changes the
 // "Capturing now" tile and the header's count, and recolors a bar on the timeline.
+// #dash-setup rides on both: an account's first sync and a first recording are each a
+// setup step, and either one moves the banner on.
 const REGIONS = {
-  accounts: ['.dash-sec[data-sec="accounts"]'],
+  accounts: ['.dash-sec[data-sec="accounts"]', '#dash-setup'],
   health: ['.dash-sec[data-sec="health"]'],
   recordings: ['#dash-sub', '.dash-pulse', '#dash-timeline',
-               '.dash-sec[data-sec="live"]', '.dash-sec[data-sec="upcoming"]'],
+               '.dash-sec[data-sec="live"]', '.dash-sec[data-sec="upcoming"]', '#dash-setup'],
 };
 const RERENDER_MS = 60 * 1000;
 

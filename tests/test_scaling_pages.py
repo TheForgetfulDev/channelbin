@@ -214,6 +214,17 @@ def _seed_readiness_shape(n):
     db.session.commit()
 
 
+def _seed_get_started(n):
+    """The Readiness shape, plus n health check results and n recordings - every table the
+    Get started page's steps read (dev/changelog/1280). The page draws a fixed eight steps
+    whatever the numbers are, so a per-row read behind one of them would go unseen."""
+    _seed_readiness_shape(n)
+    for ch in seed.Channel.query.all():
+        seed.make_channel_test(ch)
+        seed.make_recording(status='COMPLETED', channel_id=ch.id)
+    db.session.commit()
+
+
 def _seed_search_channels(n):
     """n channels with a program each, plus the three things the channel search's row
     payload enriches beyond the channel row itself (dev/changelog/398): a duplicate cluster,
@@ -804,6 +815,9 @@ class PageScalingTests(unittest.TestCase):
         # happens and where the guard belongs.
         self._assert_row_independent(_seed_readiness_shape, '/api/readiness')
 
+    def test_get_started_page(self):
+        self._assert_row_independent(_seed_get_started, '/get-started')
+
     def test_groups_page(self):
         self._assert_row_independent(_seed_groups, '/channel-groups')
 
@@ -1037,6 +1051,7 @@ COVERED = {
     'profiles.profiles_list': 'test_profiles_page',
     'health_check_profiles.health_check_profiles_list': 'test_health_check_profiles_page',
     'jobs.jobs_page': 'test_jobs_page',
+    'setup.get_started': 'test_get_started_page',
 }
 
 #: Page endpoints that cannot scale with row count, and the checkable reason why. A reason

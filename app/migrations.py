@@ -148,6 +148,9 @@ _BF_PROVIDER_STREAM_ID = 'm087.provider_stream_id'
 #: reads config, and a step does not.
 _BF_DUPLICATE_FOLD = 'm088.duplicate_fold'
 _BF_ACCOUNT_STREAM_HOST = 'm089.account_stream_host'
+#: Discharged by channel_hiding.apply_default_rules() from create_app(): the hidden answer is
+#: written by channel_hiding.recompute() alone, which is ORM code a step cannot call.
+_BF_DEFAULT_HIDE_RULES = 'm098.default_hide_rules'
 
 
 def _register_backfill(conn, cur, name: str):
@@ -3104,6 +3107,50 @@ def _m094_sync_log_category_changes(conn, cur):
     conn.commit()
 
 
+def _m099_is_example(conn, cur):
+    """accounts.is_example + channel_groups.is_example, the rows "Try it with example
+    channels" created and Delete the examples deletes (app/examples.py, dev/changelog/1281).
+
+    No backfill: nothing created before this existed is an example, so 0 is the true value
+    for every existing row, and the server default writes it."""
+    for table in ('accounts', 'channel_groups'):
+        cols = {r[1] for r in cur.execute(f'PRAGMA table_info({table})').fetchall()}
+        if cols and 'is_example' not in cols:
+            cur.execute(f'ALTER TABLE {table} ADD COLUMN is_example BOOLEAN NOT NULL '
+                        'DEFAULT 0')
+    conn.commit()
+
+
+def _m100_rename_system_check(conn, cur):
+    """The automatic group and its job, "TV Guide Channels", become "TV Guide health check"
+    (dev/changelog/1289): two first-time users read the old name as the TV Guide menu and as
+    a group of identical feeds. Only rows still carrying the old name move - the group's
+    rename route does not refuse the system group, so a name someone chose stays theirs.
+
+    Both names are spelled out rather than imported, so this step keeps doing what it did
+    when it shipped. Re-runnable from the top: an UPDATE by predicate over rows still
+    carrying the old name matches nothing a second time."""
+    for table in ('channel_groups', 'on_demand_test_jobs'):
+        cur.execute(f'UPDATE {table} SET name = ? WHERE is_system = 1 AND name = ?',
+                    ('TV Guide health check', 'TV Guide Channels'))
+        if cur.rowcount:
+            log.info('Renamed the system %s row to "TV Guide health check"', table)
+
+
+def _m101_alert_cleared_by_app(conn, cur):
+    """alerts.cleared_by_app - the app took this alert down because what it described is
+    over, as opposed to a person dismissing it (dev/changelog/1293). The Alerts page lists
+    the last day of these under "Cleared recently".
+
+    No backfill: which earlier dismissals were the app's was never recorded, and guessing
+    from the alert type would call a deleted recording's alerts "cleared". 0 is the honest
+    value for them, and they only ever count for a day."""
+    cols = {r[1] for r in cur.execute('PRAGMA table_info(alerts)').fetchall()}
+    if cols and 'cleared_by_app' not in cols:
+        cur.execute('ALTER TABLE alerts ADD COLUMN cleared_by_app BOOLEAN NOT NULL DEFAULT 0')
+    conn.commit()
+
+
 def _m081_account_blocks(conn, cur):
     """account_blocks: the stretches of time the user has told ChannelBin to keep off an
     account (app/account_blocks.py, dev/changelog/1151).
@@ -3210,6 +3257,38 @@ def _m097_file_move_failed_event_type(conn, cur):
                 ('FILE_MOVE_FAILED', 'FILE_MOVED', 'Move FAILED*'))
     if cur.rowcount:
         log.info('Retyped %d FILE_MOVED event(s) to FILE_MOVE_FAILED', cur.rowcount)
+
+
+def _m098_default_hide_rules(conn, cur):
+    """channel_hide_rules: the global name rules that hide a provider's divider rows
+    ("##### NEWS #####"), on an install that predates them (dev/changelog/1276). A fresh
+    install gets the same rules from create_app()'s seed; this step is the one-time fact for
+    everything older, so a rule the user deletes afterwards is never written again.
+
+    The patterns are spelled out rather than read from channel_hiding.DEFAULT_NAME_GLOBS, so
+    this step keeps writing what it wrote when it shipped. Inserting a rule hides nothing by
+    itself; the obligation registered first is discharged by
+    channel_hiding.apply_default_rules() from create_app().
+
+    Re-runnable from the top: a pattern already present as a global name rule is skipped."""
+    cols = {r[1] for r in cur.execute('PRAGMA table_info(channel_hide_rules)').fetchall()}
+    if not cols:
+        return
+    _register_backfill(conn, cur, _BF_DEFAULT_HIDE_RULES)
+    now = _utc_stamp()
+    added = 0
+    # duplicated from app/channel_hiding.py::DEFAULT_NAME_GLOBS - a shipped step freezes its data
+    for pattern in ('##*##', '♬♬*♬♬', '==*==', '--*--', '[*][*]*[*][*]'):
+        exists = cur.execute('SELECT 1 FROM channel_hide_rules WHERE account_id IS NULL '
+                             'AND target = ? AND pattern = ?',
+                             ('name_glob', pattern)).fetchone()
+        if exists:
+            continue
+        cur.execute('INSERT INTO channel_hide_rules (account_id, target, pattern, enabled, '
+                    'created_at) VALUES (NULL, ?, ?, 1, ?)', ('name_glob', pattern, now))
+        added += 1
+    if added:
+        log.info('Added %d default hide rule(s) for provider divider rows', added)
 
 
 SCHEMA_MIGRATIONS = [
@@ -3409,6 +3488,14 @@ SCHEMA_MIGRATIONS = [
      'highest_score', _m096_channel_groups_strategy_default),
     (97, 'recording_events: FILE_MOVED rows that recorded a failed move-on-complete move to '
      'FILE_MOVE_FAILED', _m097_file_move_failed_event_type),
+    (98, 'channel_hide_rules: the default global name rules that hide provider divider rows',
+     _m098_default_hide_rules),
+    (99, 'accounts + channel_groups: is_example, what "Try it with example channels" created',
+     _m099_is_example),
+    (100, 'channel_groups + on_demand_test_jobs: the system "TV Guide Channels" rows become '
+     '"TV Guide health check"', _m100_rename_system_check),
+    (101, 'alerts: cleared_by_app, an alert the app took down because its condition ended',
+     _m101_alert_cleared_by_app),
 ]
 
 CURRENT_SCHEMA_VERSION = SCHEMA_MIGRATIONS[-1][0]

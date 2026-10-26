@@ -203,6 +203,22 @@ class ReencodeOutputTests(_OutputCheckCase):
         self.assertEqual(len(scans), 1, 'a clean check says it ran')
         self.assertIn('no video gaps', scans[0].detail)
 
+    def test_a_sub_second_gap_total_keeps_its_tenths(self):
+        """dev/docs/BUGS.md 2026-10-22 08:13:58 PM: "3 video gaps totalling 0s" beside a log
+        line reading 0.9s for the same check."""
+        self._source('clean.ts')
+
+        def check(*a, **k):
+            return {'metrics': {'gap_count': 3, 'gap_seconds': 0.93, 'max_gap_seconds': 0.4,
+                                'gap_threshold': 0.25, 'span_seconds': 20.0,
+                                'packet_count': 600},
+                    'lost_seconds': 0.0, 'gaps': []}
+
+        self._convert(_config(), 'clean.mp4', check=check)
+        scans = [e for e in self._events(DIAGNOSTICS)
+                 if self._extra(e).get('kind') == 'output_timeline_scan']
+        self.assertIn('3 video gaps totalling 0.9s', scans[0].detail)
+
     def test_a_clean_reconversion_dismisses_the_open_gaps_alert(self):
         from app import alerts
         self._source('clean.ts')
