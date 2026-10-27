@@ -33,7 +33,8 @@ import app.config as cfgmod  # noqa: E402
 import app.recorder as recorder  # noqa: E402
 from app import db  # noqa: E402
 from app.database import (  # noqa: E402
-    RESTART_FAILED, RESTART_SUCCEEDED, Recording, RecordingSegment,
+    RESTART_FAILED, RESTART_SUCCEEDED, STALL_DETECTED, Recording, RecordingEvent,
+    RecordingSegment,
 )
 from app.watchdog import WatchdogThread  # noqa: E402
 from tests.support import seed  # noqa: E402
@@ -253,6 +254,72 @@ class CaptureGapAndContentTests(unittest.TestCase):
         self.assertAlmostEqual(rec.capture_gap_seconds, 0.0, delta=1)
 
 
+class ZeroByteSegmentIsDownForItsWholeLifeTests(RestartHarness):
+    """BUGS.md 2026-10-26 - a segment that never wrote a byte was charged from the growth
+    clock, which starts a poll late, so Capture gaps read larger than Downtime.
+
+    GrowthMonitor's last size starts at -1, so the first 0 it sees counts as growth and the
+    stall clock starts at the SECOND poll, itself some time after the launch. A segment that
+    wrote nothing covers no capture time, so its whole span is a capture gap - and the
+    uncharged head of it is gap time that is not downtime. The README's demo recording had
+    eleven such segments and read Capture gaps 6m 17s against Downtime 5m 16s
+    (dev/changelog/1303).
+    """
+
+    LIFE_BEFORE_WATCHDOG = 10.0
+
+    def _backdate_empty_segment(self):
+        """The open segment as a capture that sat for LIFE_BEFORE_WATCHDOG seconds with
+        nothing arriving before the watchdog looked at it."""
+        open(self.seg_path, 'wb').close()
+        seg = RecordingSegment.query.filter_by(recording_id=self.rid, segment_number=0).first()
+        seg.started_at = datetime.utcnow() - timedelta(seconds=self.LIFE_BEFORE_WATCHDOG)
+        db.session.commit()
+
+    def test_an_exited_capture_that_wrote_nothing_is_charged_from_its_start(self):
+        """ffmpeg waited out its read timeout and died with 0 bytes: the growth clock saw
+        the death on its first poll and charged nothing for the seconds before it."""
+        self._backdate_empty_segment()
+        self._exited_capture()
+        rec = self._run_until_event(RESTART_SUCCEEDED, stall_timeout=30, restart_delay=0,
+                                    produces_data=True)
+
+        self.assertGreaterEqual(
+            rec.total_downtime_seconds, self.LIFE_BEFORE_WATCHDOG - 0.5,
+            f'downtime {rec.total_downtime_seconds:.1f}s for a segment that was open '
+            f'{self.LIFE_BEFORE_WATCHDOG:.0f}s with nothing arriving - the time before the '
+            f'growth clock started is not being charged')
+
+    def test_a_live_capture_that_never_writes_is_charged_from_its_start(self):
+        """The process is alive and the file stays empty: the stall is declared a poll late
+        and timed from there, so the segment's first seconds and one poll go uncharged."""
+        self._backdate_empty_segment()
+        self.state.process = sleeper()
+        rec = self._run_until_event(RESTART_SUCCEEDED, stall_timeout=2, restart_delay=0,
+                                    produces_data=True)
+
+        self.assertGreaterEqual(
+            rec.total_downtime_seconds, self.LIFE_BEFORE_WATCHDOG + 2 - 0.5,
+            f'downtime {rec.total_downtime_seconds:.1f}s for a segment open '
+            f'{self.LIFE_BEFORE_WATCHDOG:.0f}s before a 2s stall timeout - charged from the '
+            f'growth clock rather than from the segment start')
+
+    def test_a_segment_that_wrote_bytes_is_still_charged_from_the_growth_clock(self):
+        """The other side: a segment that delivered and then stalled is charged its no-growth
+        window only. Its life before the stall was capture, not downtime, and charging it
+        would turn every healthy minute before a stall into loss."""
+        seg = RecordingSegment.query.filter_by(recording_id=self.rid, segment_number=0).first()
+        seg.started_at = datetime.utcnow() - timedelta(seconds=self.LIFE_BEFORE_WATCHDOG)
+        db.session.commit()
+        self.state.process = sleeper()
+        rec = self._run_until_event(RESTART_SUCCEEDED, stall_timeout=2, restart_delay=0,
+                                    produces_data=True)
+
+        self.assertLess(rec.total_downtime_seconds, self.LIFE_BEFORE_WATCHDOG,
+                        f'downtime {rec.total_downtime_seconds:.1f}s charges a segment that '
+                        f'held data for the time it was capturing')
+
+
 class FailoverBanksTheReconnectWaitTests(RestartHarness):
     """BUGS.md 2026-10-20 - total_downtime_seconds skips the reconnect wait on every
     failover branch.
@@ -309,6 +376,59 @@ class FailoverBanksTheReconnectWaitTests(RestartHarness):
             timer.start()
             return recorder.LAUNCH_SPAWNED
         return _stub
+
+    def _stub_launch_slow_spawn_no_data(self, spawn_after):
+        """The next member's segment: a launch that takes `spawn_after` seconds to open
+        (a slow connect), then a live child whose file never grows."""
+        def _stub(app, recording_id, seg_num):
+            time.sleep(spawn_after)
+            self.launched.append(seg_num)
+            path = os.path.join(self.t._tmpdir, f'rec_{self.rid}_seg_{seg_num:03d}.ts')
+            open(path, 'wb').close()
+            db.session.add(RecordingSegment(recording_id=recording_id,
+                                            segment_number=seg_num, file_path=path,
+                                            started_at=datetime.utcnow()))
+            db.session.commit()
+            proc = sleeper()
+            self._spawned.append(proc)
+            self.state.process = proc
+            self.state.current_segment_num = seg_num
+            return recorder.LAUNCH_SPAWNED
+        return _stub
+
+    def test_a_new_member_that_never_writes_is_charged_from_the_give_up(self):
+        """BUGS.md 2026-10-26 - the failover's reconnect gap was dropped when the new member's
+        segment never wrote a byte, and the growth clock that replaced it started a poll
+        after the segment opened, which was itself a slow connect after the give-up."""
+        self._exited_capture()
+        spawn_after = 2.0
+        with mock.patch.object(cfgmod, 'load_config', return_value=self._cfg(2)), \
+             mock.patch.object(recorder, 'failover_group_member', return_value=True), \
+             mock.patch.object(recorder, '_launch_segment',
+                               self._stub_launch_slow_spawn_no_data(spawn_after)):
+            self.wd = WatchdogThread(self.rid, self.state, self.t.app)
+            self.wd.start()
+            deadline = time.monotonic() + 25
+            seen = False
+            while time.monotonic() < deadline:
+                db.session.expire_all()
+                stalls = RecordingEvent.query.filter_by(
+                    recording_id=self.rid, event_type=STALL_DETECTED).count()
+                if stalls >= 2:
+                    seen = True
+                    break
+                time.sleep(0.2)
+            self.state.stop_event.set()
+            self.wd.join(timeout=15)
+        self.assertTrue(seen, 'the new member\'s empty segment was never closed as a stall')
+        db.session.expire_all()
+        downtime = db.session.get(Recording, self.rid).total_downtime_seconds or 0.0
+        # The give-up, the slow spawn, the first poll and the 2s stall timeout are all
+        # time with nothing captured; the growth clock alone would see only the last.
+        self.assertGreaterEqual(
+            downtime, spawn_after + 2 - 0.5,
+            f'a failover whose new member took {spawn_after}s to open and never wrote a byte '
+            f'banked {downtime:.1f}s of downtime')
 
     def test_the_wait_for_the_new_member_s_first_byte_is_downtime(self):
         self._exited_capture()

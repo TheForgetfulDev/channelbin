@@ -1060,6 +1060,20 @@ class Recording(db.Model):
     fast_delivery_segment_count = db.Column(db.Integer)
     fast_delivery_seconds       = db.Column(db.Float)
 
+    # ── The whole-file format survey's verdict (app/postprocessor.py::_survey_recording) ──
+    # What the joined file holds, read off every keyframe before the conversion: the format
+    # it holds longest, the one its header describes (its first stretch), and how many
+    # seconds are in any other format. Columns because the Recordings list shows the
+    # verdict on every row and cannot read a survey event per row (CLAUDE.md, no hidden I/O
+    # in per-row loops); the survey's stretches themselves stay on its DIAGNOSTICS event,
+    # which the recording page reads once. NULL main = never surveyed (captured before the
+    # survey existed, or not converted), and the list falls back on what each segment
+    # opened at; 0.0 other seconds = surveyed and one format throughout, which is a real
+    # answer that silences the segment-probe clause (dev/changelog/1307).
+    format_survey_main          = db.Column(db.String(32))   # format_label(), e.g. "1920x1080 @ 60"
+    format_survey_first         = db.Column(db.String(32))
+    format_survey_other_seconds = db.Column(db.Float)
+
     # ── Stream format profile of the FINAL/CONVERTED output file ──────────────
     # Mirrors the ChannelTest quality-profile columns (DESIGN-stream-quality-profile.md)
     # but takes this model's recorded_ prefix, which is what keeps "of the output file"
@@ -1257,6 +1271,22 @@ class Recording(db.Model):
         return None
 
     @property
+    def reconnect_count(self):
+        """How many times ffmpeg dropped the connection and opened a new one WITHOUT the
+        segment ending, over every segment - the repair ffmpeg.read_timeout_seconds exists
+        to make possible. Summed from RecordingSegment.reconnect_count, which the segment's
+        close writes, over segments the caller has already loaded: a list row iterates them
+        anyway, so this costs no query (dev/changelog/1306). Segments closed before the
+        column existed are NULL there and count nothing here."""
+        return sum(s.reconnect_count or 0 for s in self.segments)
+
+    @property
+    def reconnects_truncated(self) -> bool:
+        """Whether any segment's reconnect count is a floor rather than a fact, because its
+        stderr scan hit its byte limit - every surface then says "at least"."""
+        return any(s.reconnects_truncated for s in self.segments)
+
+    @property
     def covered_capture_seconds(self):
         """Wall-clock seconds inside the recording window during which some segment was
         actually capturing - the union of the segment spans, clipped to the window.
@@ -1321,7 +1351,10 @@ class Recording(db.Model):
         the no-growth window inside a segment that had stopped delivering but had not yet
         been killed, which this cannot see because that segment was still running. Only two
         things are here and not in downtime: time spent paused (the user's choice, not a
-        loss) and the seconds before the first segment opened.
+        loss) and the seconds before the first segment opened. A segment that wrote nothing
+        is in both: its whole span is a gap here, and the watchdog charges downtime for its
+        whole life rather than from its growth clock, which starts a poll late
+        (dev/changelog/1303).
 
         Deliberately NOT a column, like the two properties around it - every input already
         has one, and deriving it keeps a single source of truth (CLAUDE.md §Measurements)
@@ -1604,6 +1637,19 @@ class RecordingSegment(db.Model):
     probe_coded_resolution   = db.Column(db.String(32))  # coded_width x coded_height, only when != resolution
     probe_is_vfr             = db.Column(db.Boolean)     # r_frame_rate vs avg_frame_rate mismatch; NULL = undetermined
     probed_at            = db.Column(db.DateTime)
+    # A second, later reading of the same two fields off the segment's TAIL, taken once
+    # the segment that sets the recording's format pin has run a while (app/watchdog.py).
+    # The opening probe reads the first two megabytes, and a provider in trouble can
+    # serve a minute of a lower format before settling (dev/changelog/1201); a pin taken
+    # from that minute would steer every failover to the lower format for the whole run.
+    # The opening columns above keep answering "what did this segment open at" - the
+    # RECORDING_FORMAT_CHANGED events and the Segments table read them - and these answer
+    # "what did it settle at", which is what recorder.recording_format_pin() prefers
+    # (dev/changelog/1308). NULL = not re-read (the segment ended first, or it is not the
+    # pin's segment), never "the same".
+    probe_settled_resolution = db.Column(db.String(32))
+    probe_settled_fps        = db.Column(db.Float)
+    probe_settled_at         = db.Column(db.DateTime)
     # How many seconds of content this segment's finished file actually holds, ffprobed
     # once at concat time (app/concatenator.py) rather than by the watchdog: the watchdog
     # sees a file that is still growing, so its duration would be whatever had arrived by
@@ -1628,6 +1674,16 @@ class RecordingSegment(db.Model):
     # bytes and diagnostics intact - excluding beats deleting, because the discard has to be
     # explainable six weeks later from the recording's own detail page.
     excluded_reason      = db.Column(db.String(64))
+    # How many times ffmpeg dropped the connection and opened a new one inside this segment,
+    # without the segment ending - counted over its whole stderr spool when it closes
+    # (recorder.record_segment_diagnostics). A column because the recording page's Stats
+    # card and the Recordings list's health tooltip show the recording's total, and a count
+    # that lived only in a DIAGNOSTICS detail string left the list calling a segment that
+    # reconnected eight times a clean capture (dev/changelog/1306). NULL = closed before
+    # this was recorded; 0 = closed and never reconnected. reconnects_truncated says the
+    # count is a floor: the scan stopped at its byte limit (proc_utils.STDERR_SCAN_MAX_BYTES).
+    reconnect_count      = db.Column(db.Integer)
+    reconnects_truncated = db.Column(db.Boolean)
 
     channel = db.relationship('Channel')
 
@@ -2240,8 +2296,12 @@ class Channel(db.Model):
     search_text_updated_at = db.Column(db.DateTime, index=True)
     # DERIVED: the source whose listings are in epg_entries for this channel, written only
     # by epg_sources.resolve_active_source() and rewritten by any import
-    # (DESIGN-epg-sources.md §5). NULL = no source covers it.
-    epg_source_id          = db.Column(db.Integer, db.ForeignKey('epg_sources.id'))
+    # (DESIGN-epg-sources.md §5). NULL = no source covers it. Indexed (migration 102): every
+    # import and re-resolve counts channels per source on it, and the account page reads
+    # other accounts' readers off it - 135 ms warm and 3.0 s cold per count as a scan of
+    # 201,057 channels, against +0.1 s on a 50,000-row bulk UPDATE of the column measured
+    # for the index (dev/changelog/1298).
+    epg_source_id          = db.Column(db.Integer, db.ForeignKey('epg_sources.id'), index=True)
     # USER-OWNED: the source the user chose for this channel (DESIGN-epg-sources.md §6.2).
     # Participation-switch rule - no sync or refresh writes it; one writer,
     # epg_sources.set_source_override(). It counts only while the account reads that
@@ -2839,6 +2899,13 @@ class EpgAlternateEntry(db.Model):
 
     __table_args__ = (
         db.Index('ix_epg_alt_source_channel', 'source_id', 'channel_id'),
+        # By channel alone, for the three statements that name no source: the Channel
+        # cascade's per-channel SELECT on an account delete, the hide purge and the channel
+        # bulk delete. Without it each is a scan of the whole table - 11.6 ms per channel at
+        # 200,000 rows, 57,711 channels on the largest account, so about eleven minutes
+        # inside the delete's one transaction; 0.023 ms with it. Measured against +3 s per
+        # 200,000 alternate inserts on the import side (migration 102, dev/changelog/1298).
+        db.Index('ix_epg_alt_channel', 'channel_id'),
     )
 
 

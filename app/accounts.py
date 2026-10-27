@@ -46,12 +46,12 @@ from .database import (
 )
 from .db_utils import chunked, current_wal_size_bytes, retry_on_locked
 from .epg_sources import (
-    DISTINCT_TITLE_CAP, REASON_NONE, UPCOMING_TITLES, DirectoryRow, accepted_keys,
-    add_held_coverage, apply_winners, case_sensitive_matching, channel_key, demote,
+    DISTINCT_TITLE_CAP, UPCOMING_TITLES, DirectoryRow, accepted_keys,
+    apply_winners, case_sensitive_matching, channel_key, demote,
     directory_coverage, drop_alternates,
-    ensure_provider_source, file_id_for, held_coverage, norm_key, promote, provider_xmltv_url,
-    refresh_source_counts, resolve_active_source, sources_refreshed_by_sync, subscriber_ids,
-    subscriptions_for, sources_without_directory, write_directory,
+    ensure_provider_source, file_id_for, held_coverage, holding_rows, norm_key, promote,
+    provider_xmltv_url, refresh_source_counts, resolve_row, sources_refreshed_by_sync,
+    subscriber_ids, subscriptions_for, sources_without_directory, write_directory,
 )
 from .fmt_utils import fmt_bytes
 from .tz_utils import format_local, parse_epoch_utc, to_naive_utc
@@ -1486,6 +1486,10 @@ def _do_sync(account_id: int, stop_event: threading.Event, use_dump: bool = Fals
         # gave it.
         epg_synced = 0
         degraded: list[str] = []
+        # A source skipped because another thread was already refreshing it: named in the
+        # sync log so the 0 it contributed has a reason, but not a degradation - nothing
+        # about the guide is wrong, so the sync does not finish PARTIAL over it.
+        skipped: list[str] = []
         for source in sources_refreshed_by_sync(account_id):
             if use_dump and source.kind == EPG_SOURCE_PROVIDER:
                 xmltv_path = os.path.join(dump_dir, 'xmltv.xml')
@@ -1502,9 +1506,12 @@ def _do_sync(account_id: int, stop_event: threading.Event, use_dump: bool = Fals
                     source, timeout, epg_days, cfg, force_epg_resync=force_epg_resync,
                     stop_event=stop_event)
             epg_synced += synced
-            if reason:
+            if reason and reason.startswith(REFRESH_SKIPPED):
+                skipped.append(f'EPG source "{source.name}": {reason}')
+            elif reason:
                 degraded.append(f'EPG source "{source.name}": {reason}')
         epg_degradation_reason = ' '.join(degraded) or None
+        epg_log_notes = ' '.join(degraded + skipped) or None
 
         # "Removed this sync" = the immediate per-sync diff (channels the previous sync
         # touched that this one didn't) - not _raise_channel_lifecycle_alerts's delayed
@@ -1581,7 +1588,9 @@ def _do_sync(account_id: int, stop_event: threading.Event, use_dump: bool = Fals
             sync_log.categories_removed = categories_removed_json
             sync_log.skipped_malformed_urls = skipped_malformed
             sync_log.skipped_duplicate_stream_ids = skipped_duplicate
-            sync_log.error_message = epg_degradation_reason
+            # On a SUCCESS this carries only the refresh-skipped notes, which the account
+            # page's log line shows beside the counts.
+            sync_log.error_message = epg_log_notes
             db.session.commit()
 
         _mark_success_and_commit()
@@ -1910,10 +1919,17 @@ def _write_channel_url_drift_events(drifted: list) -> None:
 # added later - CLAUDE.md "a trailing else must never be the rendering of a real state".
 # The prefixes are literals this module owns at both write sites; nothing outside parses
 # them (they are also the user-facing text of AccountSyncLog.error_message).
+#: refresh_source()'s reason when another thread already held the source's lock. Not a
+#: degradation: the other refresh is importing the same file, so this maps to no alert and
+#: never marks a sync PARTIAL - it is named in the sync log so the 0 it contributed has a
+#: reason (dev/changelog/1298).
+REFRESH_SKIPPED = 'refresh skipped:'
+
 EPG_DEGRADATION_ALERT_TYPES = {
     'fetch failed:': 'EPG_SOURCE_FETCH_FAILED',
     'import refused:': 'EPG_SOURCE_COLLAPSE_REFUSED',
     'import truncated:': 'EPG_SOURCE_IMPORT_TRUNCATED',
+    REFRESH_SKIPPED: None,
 }
 
 
@@ -2789,9 +2805,14 @@ def refresh_source(source: EpgSource, timeout: int, epg_days: int, cfg: dict | N
     source_id = source.id
     lock = _get_source_lock(source_id)
     if not lock.acquire(blocking=False):
-        log.info('EPG source %d (%s) is already being refreshed - skipped', source_id,
-                 source.name)
-        return 0, None
+        # A reason, not (0, None): inside a sync that pair reads as a healthy import of
+        # nothing, so the sync log said this source contributed 0 entries and the toast
+        # had already said "Refreshing X now" for a refresh that never ran
+        # (dev/changelog/1298). The prefix maps to no alert - someone IS refreshing it.
+        log.warning('EPG source %d (%s) is already being refreshed - skipped', source_id,
+                    source.name)
+        return 0, (f'{REFRESH_SKIPPED} another refresh of it was already running, so this '
+                   'one did nothing; its listings are whatever that refresh imports.')
     try:
         _set_refreshing(source_id, True)
         try:
@@ -3300,17 +3321,18 @@ def _import_source(source: EpgSource, xml_bytes: bytes, epg_days: int, case_sens
             channel_map.setdefault(k, []).append(c.id)
 
     if not channel_map:
-        # The directory is still written: it is what the name-match review page proposes
-        # from, and an account whose channels carry no ids at all is exactly the one that
-        # needs it (DESIGN-epg-sources.md §7.5, dev/changelog/1105).
-        count = _count_projected_epg_entries(
-            xml_bytes, {}, case_sensitive, window_start, window_end,
-            stop_event=stop_event, cancel_detail=kept_detail)
-        if count.parse_error is None:
-            write_directory(source_id, count.directory or [])
-        log.info('No visible channels with an EPG key for EPG source %d (%s), skipping import',
-                 source_id, source_name)
-        return _ImportResult(0, None, None)
+        # No visible channel has a key into this source, so the file matches nothing and
+        # the import writes no listing. Everything else still happens below: the directory
+        # is written (the name-match review page proposes from it, and an account whose
+        # channels carry no ids at all is exactly the one that needs it, DESIGN-epg-sources.md
+        # §7.5), the channels still pointing here are resolved away from this source, and
+        # its in-window rows in both tables are deleted. Returning here instead left the
+        # one channel whose key was just cleared showing this source's old schedule forever,
+        # with the pointer, the counts and an OK badge all saying otherwise
+        # (dev/docs/BUGS.md 2026-10-26, dev/changelog/1298). The collapse guard's threshold
+        # branches are skipped: a 0-entry import is the expected outcome, not a collapse.
+        log.info('No visible channels with an EPG key for EPG source %d (%s): importing '
+                 'nothing and clearing what it held', source_id, source_name)
 
     threshold_pct = (cfg or {}).get('sync', {}).get('epg_collapse_threshold_percent', 20)
     baseline = _visible_source_baseline(source_id)
@@ -3319,7 +3341,8 @@ def _import_source(source: EpgSource, xml_bytes: bytes, epg_days: int, case_sens
         stop_event=stop_event, cancel_detail=kept_detail)
     projected = count.projected
     reason = None
-    if threshold_pct > 0 and baseline == 0 and b'<programme' not in xml_bytes:
+    if (threshold_pct > 0 and baseline == 0 and channel_map
+            and b'<programme' not in xml_bytes):
         # Unarmed guard, empty feed. Nothing would be lost by importing it, but it would be
         # a SUCCESS with 0 entries and no word on any surface - the state a source lands in
         # one refresh after a real empty-feed refusal, once pruning has emptied its baseline.
@@ -3338,6 +3361,8 @@ def _import_source(source: EpgSource, xml_bytes: bytes, epg_days: int, case_sens
                       f'stopped after {projected} projected entries ({count.parse_error}). '
                       'Old EPG data was kept; use "Force EPG Resync" to import whatever '
                       'does parse.')
+        elif not channel_map:
+            pass
         elif count.programs_seen == 0:
             reason = _empty_feed_reason(xml_bytes, count.channels_seen, baseline)
         elif projected < min_required:
@@ -3379,32 +3404,36 @@ def _import_source(source: EpgSource, xml_bytes: bytes, epg_days: int, case_sens
     changes: dict[int, tuple] = {}
     reasons: dict[int, str] = {}
     winners: dict[int, int | None] = {}
-    lost: list[int] = []
     covered_here = 0
+    here = coverage.get(source_id, {})
     for c in channels:
-        if c.hidden:
-            new, why = None, REASON_NONE
-        else:
-            ordered = order.get(c.account_id, [])
-            cov = {}
-            allowed = set(ordered) | ({c.epg_source_override_id}
-                                      if c.epg_source_override_id else set())
-            for sid in allowed:
-                k = channel_key(c.epg_channel_id, user_keys.get((c.id, sid)))
-                hit = coverage.get(sid, {}).get(norm_key(k, case_sensitive)) if k else None
-                if hit is not None:
-                    cov[sid] = hit
-            if held:
-                add_held_coverage(cov, c.id, held, allowed)
-            if source_id in cov and c.account_id in subscribed:
+        new, why = resolve_row(c, order.get(c.account_id, []), user_keys, coverage,
+                                case_sensitive, held)
+        if not c.hidden and c.account_id in subscribed:
+            k = channel_key(c.epg_channel_id, user_keys.get((c.id, source_id)))
+            if k and norm_key(k, case_sensitive) in here:
                 covered_here += 1
-            new, why = resolve_active_source(c.epg_source_override_id, ordered, cov)
         winners[c.id] = new
         if new != c.epg_source_id:
             changes[c.id] = (c.epg_source_id, new)
             reasons[c.id] = why
-            if c.epg_source_id is not None and new is None and not c.hidden:
-                lost.append(c.id)
+    # A winner other than this source must already hold the channel's rows - the guard
+    # reresolve_channels() and set_source_override() apply, and the import lacked
+    # (dev/docs/BUGS.md 2026-10-26). The directory can say a source covers a channel before
+    # its listings are here (a key saved as "waits", a borrowed channel with no donor), and
+    # pointing the channel there empties its guide until that source's own refresh while
+    # the channel page names the new source as active with nothing in it. Until then the
+    # channel keeps its stored winner, which is also where this source's rows land for it.
+    # Never for this source: its rows are about to be written.
+    held_rows = holding_rows({new for _old, new in changes.values()
+                               if new not in (source_id, None)}, list(changes))
+    for ch_id, (old, new) in list(changes.items()):
+        if new not in (source_id, None) and (new, ch_id) not in held_rows:
+            del changes[ch_id]
+            del reasons[ch_id]
+            winners[ch_id] = old
+    lost = [c.id for c in channels if not c.hidden and c.id in changes
+            and changes[c.id] == (c.epg_source_id, None) and c.epg_source_id is not None]
 
     # A change of winner is a move between the two tables, never a re-fetch (§5.4). Done
     # before the delete and the inserts, so a cancel partway through the inserts leaves no
@@ -3547,8 +3576,8 @@ def _import_source(source: EpgSource, xml_bytes: bytes, epg_days: int, case_sens
 
     # Alternates are kept only for channels with an active source (§4).
     orphaned = [ch for ch, (old, new) in changes.items() if new is None and old is not None]
-    for sid in {changes[ch][0] for ch in orphaned}:
-        drop_alternates([ch for ch in orphaned if changes[ch][0] == sid], sid)
+    if orphaned:
+        drop_alternates(orphaned)
 
     @retry_on_locked()
     def _refresh_counts_and_commit():
@@ -3562,6 +3591,20 @@ def _import_source(source: EpgSource, xml_bytes: bytes, epg_days: int, case_sens
         _set_sync_progress(progress_id, 'epg', synced, None)
     log.info('Imported %d EPG entries from EPG source %d (%s)', synced, source_id, source_name)
     return _ImportResult(synced, truncated_reason, lost)
+
+
+def report_refresh_interrupted(source_id: int) -> None:
+    """The outcome a refresh never got to write because the service restarted under it,
+    written by the startup clear of `refresh_started_at` (scheduler). The import may have
+    committed its window delete and stopped partway through the inserts, so the source may
+    hold part of its file - the same state the parse-error path reports, under the same
+    status and alert, worded for what is known: it MAY be short, since a restart during the
+    fetch lost nothing (dev/docs/BUGS.md 2026-10-26). The next successful refresh clears
+    both, as it clears any truncation."""
+    _report_source_outcome(
+        source_id,
+        'import truncated: the service restarted while this source was being refreshed, so '
+        'its listings may be incomplete until its next successful refresh.', None)
 
 
 def _report_source_outcome(source_id: int, reason: str | None,

@@ -27,6 +27,15 @@ log = logging.getLogger(__name__)
 # before the header read, and give up after this many empty results.
 _PROBE_MIN_BYTES = 2 * 1024 * 1024
 _PROBE_MAX_ATTEMPTS = 3
+# The settled-format re-read of the segment the recording's format pin is taken from
+# (dev/changelog/1308): this long after its opening probe, read its last _SETTLED_TAIL_BYTES
+# the same way. The opening probe sees the first two megabytes, and a provider in trouble
+# can open on a minute of a lower format inside hours of its usual one (dev/changelog/1201).
+# Measured on this box: a tail read of 512 KiB finds the format, 64 KiB does not always,
+# so the tail is read generously and only once the file is twice its size, or the "tail"
+# is the opening again.
+_PIN_RECHECK_SECONDS = 300
+_SETTLED_TAIL_BYTES = 4 * 1024 * 1024
 
 # How often a live recording asks whether the user has blocked the account it is on
 # (app/account_blocks.py), and how long it waits to ask again after finding nowhere else to
@@ -326,6 +335,9 @@ class WatchdogThread(threading.Thread):
             # from the restart branch to the next outer-loop pass. See where it is consumed
             # below for why re-deriving it instead cost ~11s per dead segment.
             restart_no_data_segment = None
+            # The moment that verdict was reached - the end of the wait RESTART_FAILED banked
+            # - so the seconds from there to the segment's close are charged too.
+            restart_no_data_since = None
             # Set by a failover branch when it launches the next member's segment: the
             # moment the dead capture was given up on, banked as downtime when the new
             # segment writes its first byte. The same-member restart measures that gap
@@ -423,12 +435,21 @@ class WatchdogThread(threading.Thread):
                 # Consumed once, for the one segment it was recorded against: a later
                 # segment must be judged on its own growth, not on a stale verdict.
                 restart_produced_no_data = (restart_no_data_segment == seg_num)
+                restart_verdict_at = restart_no_data_since if restart_produced_no_data else None
                 restart_no_data_segment = None
+                restart_no_data_since = None
                 # Capture-time format probe: once per segment, as soon as it has
                 # enough data for a stable header read (DESIGN.md section 5 - tech
                 # info describes the original capture). Bounded attempts so a
                 # header ffprobe can't return empty forever and hammer every poll.
                 probe_attempts = 0 if seg.probe_resolution is None else _PROBE_MAX_ATTEMPTS
+                # When to re-read the format this segment settled at, if it is the segment
+                # the pin comes from (dev/changelog/1308): armed here for a segment probed
+                # before this watchdog started (a service restart), below when its opening
+                # probe lands, and cleared once the re-read is taken.
+                settled_check_at = None
+                if seg.probed_at is not None and seg.probe_settled_at is None:
+                    settled_check_at = self._settled_check_deadline(seg.id, seg.probed_at)
                 # Set when the capture process was already dead at probe time, so the
                 # format-pin event has to wait for the stall handling below to decide
                 # whether this segment is being kept - see where it is consumed.
@@ -531,6 +552,13 @@ class WatchdogThread(threading.Thread):
                                 deferred_format_pin = (seg_id, seg_num)
                             else:
                                 self._check_format_pin(seg_id, seg_num)
+                            settled_check_at = self._settled_check_deadline(
+                                seg_id, datetime.utcnow())
+
+                    if settled_check_at is not None and time.monotonic() >= settled_check_at:
+                        # subprocess side effect (ffprobe) - runs OUTSIDE any retry closure
+                        settled_check_at = self._reread_settled_format(
+                            seg.id, seg_num, seg_path, current_size)
 
                     stalled_for = monitor.update(current_size)
 
@@ -722,17 +750,41 @@ class WatchdogThread(threading.Thread):
                             )
                         # ── STALL HANDLING ──────────────────────────────
 
-                        # A failover's segment that never wrote a byte is charged below
-                        # as the stall it is, from its own growth clock; the reconnect
-                        # gap it was going to bank is dropped rather than counted twice.
-                        failover_gap_start = None
-
                         # Dead-stream classification: a segment that stalled quickly
                         # and produced very little data is a candidate "early failure" -
                         # independent of consecutive_failures, and NOT reset just because
                         # the next restart briefly produces a few bytes (see below).
                         seg_duration = (datetime.utcnow() - seg.started_at).total_seconds()
                         seg_channel_id = seg.channel_id
+
+                        # A segment that never wrote a byte was down for its whole life, and
+                        # the growth clock understates that: the monitor reads the first 0
+                        # as growth (its last size starts at -1) and starts timing at the
+                        # second poll, which itself came some time after the launch. A poll
+                        # interval or more per such segment, and the README's demo recording
+                        # had eleven of them - 61 s that Capture gaps counted (a zero-byte
+                        # segment covers nothing) and Downtime did not, under a tooltip
+                        # saying gaps sit inside downtime (dev/changelog/1303). Charged from
+                        # the earliest moment nothing was being captured: the failover
+                        # give-up when this segment was a failover's (the reconnect gap it
+                        # was going to bank, taken here instead of dropped), the verdict
+                        # when it was a restart whose wait RESTART_FAILED already banked,
+                        # else its own start. Not a fast-delivery kill or a video-stop
+                        # restart, which wrote bytes by definition.
+                        if (monitor.last_size <= 0 and fast_delivery is None
+                                and not video_restart):
+                            if restart_dead and restart_verdict_at is not None:
+                                stalled_for = max(stalled_for,
+                                                  time.monotonic() - restart_verdict_at)
+                            elif failover_gap_start is not None:
+                                stalled_for = max(stalled_for,
+                                                  time.monotonic() - failover_gap_start)
+                            else:
+                                stalled_for = max(stalled_for, seg_duration)
+                        # A failover's segment that wrote bytes and then stalled is charged
+                        # below from its own growth clock; its reconnect gap was banked at
+                        # the first byte, so there is nothing left of it to count here.
+                        failover_gap_start = None
 
                         # Kill current ffmpeg
                         terminate_or_kill(self.state.process)
@@ -910,12 +962,14 @@ class WatchdogThread(threading.Thread):
                             # give-up and failover branch from silently dropping its share.
                             # Granular to one poll interval: GrowthMonitor starts its clock
                             # at the first poll that OBSERVED no growth, not at the last byte.
+                            # That window sits inside the segment's own span, which is why
+                            # it is Downtime and not a capture gap.
                             #
-                            # On the restart_dead branch this is 0.0 and that is correct, not
-                            # a dropped charge: those seconds were spent inside
-                            # wait_for_file_data and are already banked as gap_seconds on the
-                            # RESTART_FAILED row above. Charging stalled_for again would count
-                            # the same window twice.
+                            # On the restart_dead branch this is only the seconds since the
+                            # verdict, not a dropped charge: the wait itself was spent inside
+                            # wait_for_file_data and is already banked as gap_seconds on the
+                            # RESTART_FAILED row above. Charging it again would count the
+                            # same window twice.
                             r.total_downtime_seconds += stalled_for
                             # The failure counter is deduplicated the same way: a restart
                             # that produced nothing was already counted as one consecutive
@@ -1326,7 +1380,8 @@ class WatchdogThread(threading.Thread):
                         # Read once, outside both closures below: a lock-retry re-runs the
                         # closure and would otherwise charge the recording a longer gap
                         # each attempt.
-                        gap_seconds = time.monotonic() - gap_start
+                        verdict_at = time.monotonic()
+                        gap_seconds = verdict_at - gap_start
 
                         if restart_ok:
                             @retry_on_locked()
@@ -1412,6 +1467,7 @@ class WatchdogThread(threading.Thread):
                             # fall-through path needs it: the two branches above have
                             # already closed the segment out or ended the recording.
                             restart_no_data_segment = next_seg_num
+                            restart_no_data_since = verdict_at
 
                         # Break inner loop → outer loop picks up new segment
                         break
@@ -1422,8 +1478,12 @@ class WatchdogThread(threading.Thread):
             # A launch on this thread (the restart branch, a failover, a block move) that
             # passed its own stop check in the instant before the teardown set the event
             # may have put a fresh child into state.process after the teardown's kill
-            # read it. The teardown cannot see it; this thread can, and it is a no-op on
-            # a child the teardown did reach (dev/changelog/1242).
+            # read it. The teardown cannot see it; this thread can (dev/changelog/1242).
+            # On the child the teardown did reach this sends nothing: the event is set
+            # before the teardown's SIGTERM, so this thread gets here while ffmpeg is still
+            # writing its trailer, and a second SIGTERM would make it drop the trailer and
+            # the last seconds the muxer held. terminate_or_kill() sends one SIGTERM per
+            # child and waits for every later caller (dev/docs/BUGS.md 2026-10-26).
             terminate_or_kill(self.state.process)
             log.info('Watchdog exiting for recording %d (stop_event set)', self.recording_id)
 
@@ -1620,6 +1680,91 @@ class WatchdogThread(threading.Thread):
         except Exception:
             log.exception('Recording %d: format-pin check failed on segment %d',
                           self.recording_id, seg_num)
+
+    def _settled_check_deadline(self, seg_id: int, probed_at):
+        """When (monotonic) to re-read this segment's settled format, or None when it is
+        not the segment the recording's pin is read from - a later segment's settled
+        format moves nothing, so it is not read (dev/changelog/1308)."""
+        from .recorder import recording_format_pin_segment
+        try:
+            pin_seg = recording_format_pin_segment(self.recording_id)
+        except Exception:
+            log.exception('Recording %d: could not find the pin segment', self.recording_id)
+            return None
+        if pin_seg is None or pin_seg.id != seg_id:
+            return None
+        elapsed = max(0.0, (datetime.utcnow() - probed_at).total_seconds())
+        return time.monotonic() + max(0.0, _PIN_RECHECK_SECONDS - elapsed)
+
+    def _reread_settled_format(self, seg_id: int, seg_num: int, seg_path: str, size: int):
+        """Read the format the pin's segment is carrying now, off its tail, and record it
+        as the segment's settled format. Says so when it differs from what the segment
+        opened at: the file changes format inside this segment, and the recording's pin
+        follows the later reading from here on (dev/changelog/1308).
+
+        Returns the next deadline when the file is still too small for its tail to be
+        anything but its opening, else None - taken, or given up. Best-effort like the
+        opening probe: a failure here must never touch the capture it is describing."""
+        from . import db
+        from .database import RecordingSegment, RECORDING_FORMAT_CHANGED
+        from .channel_groups import format_key_from, format_label, segment_format_key
+
+        if size < 2 * _SETTLED_TAIL_BYTES:
+            return time.monotonic() + _PIN_RECHECK_SECONDS
+        try:
+            info = parse_ffprobe(seg_path, count_packets=False, timeout=15,
+                                 skip_bytes=max(0, size - _SETTLED_TAIL_BYTES))
+        except Exception:
+            log.exception('Recording %d: settled-format read failed on segment %d',
+                          self.recording_id, seg_num)
+            return None
+        settled = format_key_from(info.get('resolution'), info.get('fps'))
+        if settled is None:
+            log.info('Recording %d: segment %d tail probe found no video format - the '
+                     'pin keeps the opening reading', self.recording_id, seg_num)
+            return None
+
+        now = datetime.utcnow()
+        minutes = max(1, round(_PIN_RECHECK_SECONDS / 60))
+
+        @retry_on_locked()
+        def _record_settled_and_commit():
+            s = db.session.get(RecordingSegment, seg_id)
+            if s is None:
+                return None
+            s.probe_settled_resolution = info.get('resolution')
+            s.probe_settled_fps = info.get('fps')
+            s.probe_settled_at = now
+            opened = segment_format_key(s)
+            if opened is not None and settled != opened:
+                add_recording_event(
+                    self.recording_id, RECORDING_FORMAT_CHANGED,
+                    detail=(f'Segment {seg_num} opened at {format_label(opened)}, but '
+                            f'{minutes} minutes in it was carrying {format_label(settled)}, '
+                            f'so the file changes format inside this segment. The '
+                            f'recording\'s format pin follows the later reading from here '
+                            f'on: a failover now prefers channels at '
+                            f'{format_label(settled)}. How long each format held is the '
+                            f'whole-file survey\'s to say, after the capture.'),
+                    segment_number=seg_num,
+                    extra={'basis': 'segment_settled', 'segment_number': seg_num,
+                           'opened_format': list(opened), 'settled_format': list(settled)})
+                db.session.commit()
+                return opened
+            db.session.commit()
+            return None
+
+        try:
+            opened = _record_settled_and_commit()
+        except Exception:
+            log.exception('Recording %d: could not record segment %d settled format',
+                          self.recording_id, seg_num)
+            return None
+        if opened is not None:
+            log.warning('Recording %d: segment %d opened at %s but settled at %s - the '
+                        'format pin follows the settled reading', self.recording_id,
+                        seg_num, format_label(opened), format_label(settled))
+        return None
 
     def _recording_has_had_video(self) -> bool:
         """Whether an earlier segment of this recording probed with a picture - so a

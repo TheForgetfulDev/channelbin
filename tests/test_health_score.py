@@ -153,10 +153,22 @@ class RecordingMetricsQualityTests(unittest.TestCase):
         self.assertEqual(bd['penalties'], [])
 
     def test_downtime_penalized_proportionally(self):
-        # 360s lost of 3600s = 10% -> base 90, no restarts -> no instability
+        # 360s of 3600s with nothing being written = 10% -> base 90, no restarts -> no
+        # instability
         score, bd = score_recording_metrics_quality(360, 0, 3600, _CFG)
         self.assertEqual(score, 90)
         self.assertEqual(bd['base'], 90.0)
+
+    def test_the_penalty_line_says_what_it_measures(self):
+        """Downtime is time with nothing being written, not content lost: a provider that
+        replays its buffer after each reconnect hands the content back, and "464s lost"
+        beside a file longer than its window was a number nobody could explain
+        (dev/changelog/1305). The penalty's size is unchanged - only its name."""
+        _score, bd = score_recording_metrics_quality(464, 27, 10189, _CFG)
+        [lost] = [p for p in bd['penalties'] if p['reason'] == 'time_lost']
+        self.assertEqual(lost['detail'], '464s of 10189s with nothing being written (4.6%)')
+        self.assertNotIn('lost', lost['detail'])
+        self.assertAlmostEqual(lost['amount'], -4.554, places=2)
 
     def test_restarts_penalized_by_instability_rate(self):
         # 0 downtime, 2 restarts in 1 hour x 2.0/hr = -4 -> 96

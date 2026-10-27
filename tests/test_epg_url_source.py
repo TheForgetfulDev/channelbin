@@ -282,8 +282,43 @@ class RefreshTests(_Fixture):
         lock.acquire()
         try:
             with mock.patch('app.accounts._refresh_source') as inner:
-                self.assertEqual(accounts_mod.refresh_source(self.src, 5, 3), (0, None))
+                synced, reason = accounts_mod.refresh_source(self.src, 5, 3)
             inner.assert_not_called()
+        finally:
+            lock.release()
+        # A reason, not None: (0, None) read as a healthy import of nothing inside a sync
+        # (dev/changelog/1298). The prefix routes to no alert.
+        self.assertEqual(synced, 0)
+        self.assertTrue(reason.startswith(accounts_mod.REFRESH_SKIPPED), reason)
+        self.assertIsNone(accounts_mod._epg_degradation_alert_type(reason))
+
+    def test_a_skipped_source_is_named_in_the_sync_log_without_marking_it_partial(self):
+        """dev/changelog/1298: inside _do_sync the skip used to be indistinguishable from a
+        healthy 0-entry import - SUCCESS, 0 contributed, nothing said."""
+        import threading
+        from app.database import AccountSyncLog
+        lock = accounts_mod._get_source_lock(self.src.id)
+        lock.acquire()
+        try:
+            with mock.patch('app.accounts._fetch_m3u_streams', return_value=[]):
+                accounts_mod._do_sync(self.acct.id, threading.Event())
+        finally:
+            lock.release()
+        log_row = (AccountSyncLog.query.filter_by(account_id=self.acct.id)
+                   .order_by(AccountSyncLog.id.desc()).first())
+        self.assertEqual(log_row.status, 'SUCCESS')
+        self.assertIn('refresh skipped', log_row.error_message or '')
+        self.assertIn(self.src.name, log_row.error_message)
+        page = self.t.app.test_client().get(f'/accounts/{self.acct.id}').get_data(as_text=True)
+        self.assertIn('refresh skipped', page)
+
+    def test_the_skip_is_logged_at_warning(self):
+        lock = accounts_mod._get_source_lock(self.src.id)
+        lock.acquire()
+        try:
+            with self.assertLogs('app.accounts', level='WARNING') as logs:
+                accounts_mod.refresh_source(self.src, 5, 3)
+            self.assertTrue(any('already being refreshed' in m for m in logs.output))
         finally:
             lock.release()
 

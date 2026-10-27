@@ -170,13 +170,17 @@ class RestartWithNoDataIsActedOnTests(_LiveRestartHarness):
         self.assertEqual(run['bytes_recorded'], 0)
 
     def test_the_event_names_the_reason_and_the_zero_detection_window(self):
-        """Product Principle 1: the event log has to say which shape this was. The 0.0s
-        stall_duration is the fix's own evidence - the detection window is zero because the
-        answer was already in hand, and it is what a later analysis pass reads."""
+        """Product Principle 1: the event log has to say which shape this was. The near-zero
+        stall_duration is the fix's own evidence - no detection window was spent because the
+        answer was already in hand, and it is what a later analysis pass reads. Not exactly
+        0.0 since dev/changelog/1303: the seconds between the no-data verdict and this close
+        are charged too, so an empty segment's whole life is downtime - a fraction of a
+        poll, never the stall timeout."""
         run = self._dead_restart_run()
 
         self.assertEqual(run['extra']['stall_reason'], 'restart_no_data')
-        self.assertEqual(run['extra']['stall_duration'], 0.0)
+        self.assertLess(run['extra']['stall_duration'], 2.0,
+                        'a detection window was spent re-deriving the no-data verdict')
         self.assertIn('produced no data', run['detail'])
 
     def test_the_already_banked_reconnect_wait_is_not_charged_twice(self):

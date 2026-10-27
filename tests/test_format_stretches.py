@@ -24,7 +24,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from app import db  # noqa: E402
 from app.channel_groups import file_format_stretches  # noqa: E402
 from app.database import (  # noqa: E402
-    DIAGNOSTICS, RECORDING_FORMAT_CHANGED, REC_STATUS_COMPLETED, RecordingEvent,
+    DIAGNOSTICS, RECORDING_FORMAT_CHANGED, REC_STATUS_COMPLETED, Recording, RecordingEvent,
     RecordingSegment, add_recording_event,
 )
 from app.postprocessor import describe_format_stretches  # noqa: E402
@@ -247,12 +247,29 @@ class SurveyEventTests(_Seeded):
         self.assertIn('256x144 @ 30 for', ev.detail)
         self.assertIn('header describes only 384x216 @ 60', ev.detail)
 
+    def test_the_verdict_is_written_to_the_recording_in_the_same_commit(self):
+        """The Recordings list reads these three columns, not the survey event
+        (dev/changelog/1307): the format the file holds longest, the one its header
+        describes, and the seconds in any other format."""
+        from app.postprocessor import _survey_recording
+        rec = self._rec([(BIG[0], 59.94)])
+        _survey_recording(rec.id, self.mixed)
+        db.session.expire_all()
+        rec = db.session.get(Recording, rec.id)
+        self.assertEqual(rec.format_survey_main, '384x216 @ 60')
+        self.assertEqual(rec.format_survey_first, '384x216 @ 60')
+        self.assertAlmostEqual(rec.format_survey_other_seconds, 3.0, delta=1.5)
+
     def test_one_format_throughout_writes_no_change(self):
         from app.postprocessor import _survey_recording
         rec = self._rec([(BIG[0], 59.94)])
         _survey_recording(rec.id, self.steady)
         db.session.expire_all()
         self.assertEqual(self._changed(rec.id), [])
+        rec = db.session.get(Recording, rec.id)
+        self.assertEqual(rec.format_survey_main, '384x216 @ 60')
+        self.assertEqual(rec.format_survey_other_seconds, 0.0,
+                         'surveyed and one format throughout is a measured 0, not NULL')
         survey = [e for e in RecordingEvent.query.filter_by(
             recording_id=rec.id, event_type=DIAGNOSTICS).all()
             if json.loads(e.extra_data or '{}').get('kind') == 'format_survey']

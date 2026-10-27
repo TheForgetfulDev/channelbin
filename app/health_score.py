@@ -104,6 +104,20 @@ def score_recording_success_quality(recording, cfg: dict) -> Tuple[int, dict]:
     (whole-recording) score. For per-member attribution of a group recording that failed
     over, callers compute a member's share and call score_recording_metrics_quality directly.
 
+    Downtime is the time input on purpose, and it is downtime, not content lost: wall clock
+    with nothing being written, which the penalty line names as such. A provider that
+    answers each reconnect from its buffer hands much of that time back at the join
+    (recording 14: 464 s of downtime, a file 437 s longer than its window), and crediting
+    it back is the one thing this must never do - recording 19's feed delivered 8h38m of the
+    same lap in 2h18m, and a credit would have rewarded the worst capture in the set for
+    being broken (dev/changelog/942, 964). Downtime is the one figure the observation has
+    that a frozen feed cannot inflate, and the stall it measures happened whatever the
+    provider replayed afterwards. The per-seam alternative - credit each gap with the
+    following segment's surplus, capped at a back-buffer's size and only off a segment not
+    flagged for fast delivery - was weighed and not built: it moves a score like recording
+    14's by about four points and puts a second feed classifier on the score path
+    (dev/changelog/1305).
+
     Returns (score, breakdown) - see score_test_quality for the shared breakdown shape.
     """
     return score_recording_metrics_quality(
@@ -142,12 +156,16 @@ def score_recording_metrics_quality(downtime_seconds: float, restart_count: int,
     scores either a whole recording or one group member's share of it, and is reused
     directly by score_test_quality (a test is scored the same way).
 
-    Quality is proportional to how much of the window was actually lost
-    (downtime_seconds / duration_seconds), not a flat penalty per stall/restart event -
-    a recording that lost 1.58% of its content to 19 successfully-recovered restarts no
-    longer scores an 8/100 indistinguishable from a total failure. A separate instability
-    term penalizes event *frequency* on top of that, so many short interruptions score
-    worse than one contiguous outage of the same total length.
+    Quality is proportional to how much of the window had nothing being written
+    (downtime_seconds / duration_seconds; a test's share of frames that never arrived), not
+    a flat penalty per stall/restart event - a recording that was stalled for 1.58% of its
+    window across 19 successfully-recovered restarts no longer scores an 8/100
+    indistinguishable from a total failure. A separate instability term penalizes event
+    *frequency* on top of that, so many short interruptions score worse than one contiguous
+    outage of the same total length. The penalty line says "with nothing being written"
+    rather than "lost": on a feed that replays its buffer after a reconnect the content
+    comes back and the file is complete, and a line calling that time lost beside a file
+    longer than its window was a number nobody could explain (dev/changelog/1305).
 
     Returns (score, breakdown) - see score_test_quality for the shared breakdown shape.
     """
@@ -161,8 +179,8 @@ def score_recording_metrics_quality(downtime_seconds: float, restart_count: int,
     penalties = []
     if downtime_seconds:
         penalties.append({'reason': 'time_lost',
-                           'detail': f'{downtime_seconds:.0f}s lost of {window:.0f}s '
-                                     f'({affected_fraction * 100:.1f}%)',
+                           'detail': f'{downtime_seconds:.0f}s of {window:.0f}s with nothing '
+                                     f'being written ({affected_fraction * 100:.1f}%)',
                            'amount': -(affected_fraction * 100)})
     if restart_count:
         penalties.append({'reason': 'instability',

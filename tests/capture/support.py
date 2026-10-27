@@ -484,6 +484,30 @@ class CaptureCase(unittest.TestCase):
     def lost(answer: ak.Answer, *reasons) -> list:
         return [x for x in answer.lost if x.reason in reasons]
 
+    def assertGapsInsideDowntime(self, rid: int, slack: float = 1.0):
+        """Capture gaps sit inside Downtime, but for time spent paused and the seconds before
+        the first segment opened - what the recording page's Downtime tooltip and the
+        `capture_gap_seconds` docstring promise. Nothing here pauses, so only the second
+        exception is allowed for. `slack` covers the commit-to-commit slivers between one
+        charge ending and the next beginning, measured under 1 s (dev/changelog/1303)."""
+        # Read off the row before segments() opens a fresh session and detaches it.
+        rec = self.fresh(Recording, rid)
+        gap = rec.capture_gap_seconds or 0.0
+        downtime = rec.total_downtime_seconds or 0.0
+        start = rec.start_time
+        segs = self.segments(rid)
+        first = min((s.started_at for s in segs if s.started_at), default=None)
+        before_first = (max(0.0, (first - start).total_seconds())
+                        if first is not None else 0.0)
+        self.assertLessEqual(
+            gap, downtime + before_first + slack,
+            f'Capture gaps {gap:.2f}s exceed Downtime {downtime:.2f}s by more than the '
+            f'{before_first:.2f}s before the first segment opened (plus {slack:.1f}s slack); '
+            f'segments: ' + ', '.join(
+                f'#{s.segment_number} {s.bytes_recorded or 0}B '
+                f'{(s.ended_at - s.started_at).total_seconds() if s.ended_at else "open"}s'
+                for s in segs))
+
     def assertAgrees(self, answer: ak.Answer, claims: dict, tolerance: float = 0.5):
         wrong = answer.compare(claims, tolerance)
         self.assertEqual([str(m) for m in wrong], [],

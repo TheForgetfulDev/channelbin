@@ -295,10 +295,40 @@ DAMAGE_MIN_MISSING_FRACTION = 0.01
 # reported as a rate change (dev/changelog/866).
 RATE_SAME_TOLERANCE = 0.02
 
+# The exact length of one frame at each rate broadcast video runs at, in seconds. MPEG-TS
+# timestamps are whole 90 kHz ticks, so a 59.94 fps frame's duration reads 1501 ticks
+# against a true 1501.5 (23.976 fps: 3753 against 3753.75), and summing what ffprobe
+# prints loses half a tick a frame - 0.2 s "missing" over a ten-minute capture that held
+# every frame, on the rate 63% of prod's channels run at (dev/changelog/1304). A packet
+# duration within _FRAME_SNAP_TICKS of one of these counts as the exact figure.
+_EXACT_FRAME_SECONDS = tuple(sorted(
+    1.0 / rate for rate in (24000 / 1001, 24.0, 25.0, 30000 / 1001, 30.0, 50.0,
+                            60000 / 1001, 60.0, 100.0, 120000 / 1001, 120.0)))
+_TICK_SECONDS = 1.0 / 90000
+_FRAME_SNAP_TICKS = 1.5
+
+
+def exact_frame_seconds(duration: float) -> float:
+    """`duration` as the exact frame length it is a tick-rounded spelling of, else itself.
+
+    Nearest wins, so 1501 ticks (a tick under 59.94's 1501.5, a tick over 60's 1500) counts
+    as a 59.94 frame and 1500 as a 60 one; anything further than _FRAME_SNAP_TICKS from
+    every rate - a variable-rate stream, a dropped-frame double - is counted as printed."""
+    best = min(_EXACT_FRAME_SECONDS, key=lambda exact: abs(exact - duration))
+    if abs(best - duration) <= _FRAME_SNAP_TICKS * _TICK_SECONDS:
+        return best
+    return duration
+
 
 def parse_ffprobe(filepath: str, count_packets: bool = True, timeout: int = 60,
-                  stall_timeout: int = 60, on_progress=None) -> dict:
+                  stall_timeout: int = 60, on_progress=None, skip_bytes: int = 0) -> dict:
     """Return dict with video/audio stream metadata and format info.
+
+    skip_bytes > 0 reads the stream from that far into the file instead of its head
+    (-skip_initial_bytes): a header-only probe of a growing MPEG-TS capture's TAIL, which
+    is how the watchdog re-reads the format a segment settled at after opening on a short
+    stretch of another (dev/changelog/1308). Measured on this box: ffprobe resyncs on the
+    188-byte packet boundary and reports the format in force at that offset.
 
     Keys: resolution, fps, duration, bitrate_bps, frame_count, vid_width,
           vid_height, color_transfer, color_primaries, color_space, color_range,
@@ -337,6 +367,8 @@ def parse_ffprobe(filepath: str, count_packets: bool = True, timeout: int = 60,
     ]
     if count_packets:
         cmd.append('-count_packets')
+    if skip_bytes and skip_bytes > 0:
+        cmd += ['-skip_initial_bytes', str(int(skip_bytes))]
     cmd += [
         '-show_streams',
         '-show_format',
@@ -1130,7 +1162,10 @@ def scan_video_timeline(filepath: str, gap_threshold: float = 0.25, timeout: int
     Each packet counts as its OWN duration, which the demuxer derives from the stream's
     timing at that point in the file, so a stretch at 29.97 fps counts 1/29.97 a frame and
     a stretch at 59.94 counts 1/59.94 - exact across any number of rate changes, including
-    one inside a segment. Dividing the packet count by one rate is what this replaced: the
+    one inside a segment. "Exact" because a duration is read as the frame length it is a
+    tick-rounded spelling of (exact_frame_seconds): ffprobe prints 1501 ticks for a 59.94
+    frame whose true length is 1501.5, and summed as printed a complete capture drifted half
+    a tick a frame (dev/changelog/1304). Dividing the packet count by one rate is what this replaced: the
     header rate turns every frame of a lower-rate stretch into a missing frame (recording 2,
     1,200s missing against 0.41s of real damage, dev/changelog/866), and a rate blended from
     the segments' opening probes was blind when a probe caught only a short opening
@@ -1161,9 +1196,9 @@ def scan_video_timeline(filepath: str, gap_threshold: float = 0.25, timeout: int
         cmd = [ffprobe_path, '-v', 'error', '-select_streams', 'v:0',
                '-show_entries', 'packet=pts_time,dts_time,duration_time', '-of', 'csv=p=0',
                filepath]
-        st = {'low': None, 'highwater': None, 'count': 0, 'prev_dts': None,
-              'dts_low': None, 'dts_high': None, 'saw_dts': False, 'gap_count': 0,
-              'gap_seconds': 0.0, 'max_gap': 0.0, 'backward_count': 0,
+        st = {'low': None, 'highwater': None, 'high_dur': None, 'count': 0,
+              'prev_dts': None, 'dts_low': None, 'dts_high': None, 'saw_dts': False,
+              'gap_count': 0, 'gap_seconds': 0.0, 'max_gap': 0.0, 'backward_count': 0,
               'dur_seconds': 0.0, 'dur_count': 0}
         # A min-heap of the largest gaps, so a file with thousands of small ones costs a
         # fixed amount of memory and still names the ones worth reading about.
@@ -1186,12 +1221,18 @@ def scan_video_timeline(filepath: str, gap_threshold: float = 0.25, timeout: int
             # not one frame of video, and must not be allowed to cover a real gap.
             duration = _packet_time(fields[2] if len(fields) > 2 else '')
             if duration is not None and 0.0 < duration < 1.0:
+                # The tick-rounded duration ffprobe prints, as the exact frame length it
+                # stands for - see _EXACT_FRAME_SECONDS.
+                duration = exact_frame_seconds(duration)
                 st['dur_seconds'] += duration
                 st['dur_count'] += 1
+            else:
+                duration = None
             if st['low'] is None or stamp < st['low']:
                 st['low'] = stamp
             if st['highwater'] is None or stamp > st['highwater']:
                 st['highwater'] = stamp
+                st['high_dur'] = duration
 
             # Decode timeline: the only basis gap accounting runs on. Packets missing a
             # DTS are skipped rather than substituted with PTS - mixing the two timelines
@@ -1242,12 +1283,21 @@ def scan_video_timeline(filepath: str, gap_threshold: float = 0.25, timeout: int
         deficit_fps = expected_fps if expected_fps and expected_fps > 0 else fps
         dur_seconds, dur_count = st['dur_seconds'], st['dur_count']
         undated = count - dur_count
+        # The content the packets should fill runs to the END of the last presented frame,
+        # one frame past the max PTS the span stops at. Measured against the span alone a
+        # complete file read one frame short, and the clamp at zero hid both that and any
+        # single-frame loss behind it (dev/changelog/1304). span_seconds itself stays
+        # max - min PTS, the duration a player reports.
+        last_frame = st['high_dur']
+        if last_frame is None:
+            last_frame = (1.0 / deficit_fps) if deficit_fps else 0.0
+        extent = span + last_frame
         if not undated:
             deficit_basis = 'frame_durations'
-            deficit = span - dur_seconds
+            deficit = extent - dur_seconds
         else:
             deficit_basis = 'nominal_rate' if not dur_count else 'partial_durations'
-            deficit = (span - dur_seconds - undated / deficit_fps) if deficit_fps else 0.0
+            deficit = (extent - dur_seconds - undated / deficit_fps) if deficit_fps else 0.0
         return {
             'span_seconds': span,
             'dts_span_seconds': dts_span,

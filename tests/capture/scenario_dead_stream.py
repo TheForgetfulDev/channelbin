@@ -16,7 +16,7 @@ from app.database import (REC_STATUS_COMPLETED, Recording, RECORDING_RESUMED,
                           RECORDING_RETRY_SCHEDULED)
 from sim import answer_key as ak
 
-from .support import BURST, CaptureCase, at
+from .support import BURST, KEYFRAME_SECONDS, CaptureCase, at
 
 
 class DeadStreamScenario(CaptureCase):
@@ -43,9 +43,36 @@ class DeadStreamScenario(CaptureCase):
         # the window with no segment capturing - is the measure of it: the content lost is
         # that gap less the retry's connect burst, which reaches back into it. A refused
         # segment's seconds are in the gap, not in the coverage: it captured nothing
-        # (dev/changelog/1247).
-        self.assertAlmostEqual(answer.lost_seconds, gap - BURST, delta=1.0,
-                               msg=f'{answer.describe()}\ngap {gap:.2f}')
+        # (dev/changelog/1247). The burst starts at the keyframe at or before BURST seconds
+        # back (DESIGN-simulator.md §3.10), so it can reach up to KEYFRAME_SECONDS further:
+        # a tolerance of 1 s around BURST alone failed one run in six on a 2 s keyframe
+        # interval (dev/docs/BUGS.md 2026-10-26 11:56 PM).
+        msg = f'{answer.describe()}\ngap {gap:.2f}'
+        self.assertLessEqual(answer.lost_seconds, gap - BURST + 1.0, msg)
+        self.assertGreaterEqual(answer.lost_seconds, gap - BURST - KEYFRAME_SECONDS - 1.0, msg)
+        self.assertGapsInsideDowntime(rid)
+
+    def test_a_silent_channel_is_retried_and_its_gaps_sit_inside_its_downtime(self):
+        """The README's demo recording shape (dev/changelog/1295, 1303): the connection is
+        accepted and nothing arrives, so each attempt sits for ffmpeg's read timeout and
+        dies with no bytes. Three of those call the stream dead, the retry a minute later
+        records the rest. Every one of those empty segments is a capture gap, and Downtime
+        has to hold all of it - the growth clock alone charged each one a poll interval
+        short, and the demo's eleven put Capture gaps a minute over Downtime."""
+        ch = self.channel()
+        silence = self.sim.inject('no_answer', self.label(ch.id), start=at(-5), end=at(900))
+        rid = self.record(ch, seconds=110)
+        self.wait_event(rid, RECORDING_RETRY_SCHEDULED, 90)
+        self.sim.clear(silence)
+        rec = self.finish(rid, 220)
+
+        self.assertEqual(rec.status, REC_STATUS_COMPLETED, self.event_types(rid))
+        self.assertEvent(rid, RECORDING_RESUMED)
+        segs = self.segments(rid)
+        self.assertGreaterEqual(len(segs), 4, 'three silent segments, then the retry')
+        self.assertEqual([s.bytes_recorded or 0 for s in segs[:3]], [0, 0, 0],
+                         'the silent attempts should have written nothing')
+        self.assertGapsInsideDowntime(rid)
 
 
 if __name__ == '__main__':

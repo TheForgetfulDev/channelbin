@@ -643,13 +643,24 @@ def resume_in_progress_recordings(app):
             # restart, so every stamp present now is orphaned, and one left set would make
             # the restart guard refuse forever (tools/check_busy.py).
             from .database import EpgSource
-            n = EpgSource.query.filter(EpgSource.refresh_started_at.isnot(None)).update(
-                {'refresh_started_at': None}, synchronize_session=False)
-            if n:
-                log.info('Cleared %d EPG source refresh(es) interrupted by the restart', n)
+            stale = [sid for (sid,) in db.session.query(EpgSource.id).filter(
+                EpgSource.refresh_started_at.isnot(None))]
+            if stale:
+                EpgSource.query.filter(EpgSource.id.in_(stale)).update(
+                    {'refresh_started_at': None}, synchronize_session=False)
+                log.warning('Cleared %d EPG source refresh(es) interrupted by the restart',
+                            len(stale))
             db.session.commit()
+            return stale
 
-        _clear_stale_source_refreshes()
+        # Each interrupted source then gets the outcome the refresh never wrote: its import
+        # may have deleted its window and stopped partway through the inserts, and with
+        # only the stamp cleared the card kept the previous refresh's OK beside a guide
+        # that stops partway through the window (dev/docs/BUGS.md 2026-10-26). Outside the
+        # closure above: it raises an alert, and every commit of its own.
+        from .accounts import report_refresh_interrupted
+        for source_id in _clear_stale_source_refreshes():
+            report_refresh_interrupted(source_id)
 
         @retry_on_locked()
         def _clear_stale_postprocess_waits():

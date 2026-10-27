@@ -6,6 +6,7 @@ import re
 import signal
 import subprocess
 import tempfile
+import threading
 import time
 import uuid
 from typing import NamedTuple
@@ -536,10 +537,34 @@ def resume_process(proc) -> bool:
     return True
 
 
+_term_sent_lock = threading.Lock()
+
+
+def _claim_first_terminate(proc) -> bool:
+    """True for the one caller that gets to SIGTERM this child; every later caller waits
+    for the exit instead. Decided under a lock, because the two callers this exists for
+    run on different threads a few milliseconds apart."""
+    with _term_sent_lock:
+        first = not getattr(proc, 'channelbin_term_sent', False)
+        proc.channelbin_term_sent = True
+    return first
+
+
 def terminate_or_kill(proc, timeout: float = 5.0, hard: bool = False):
     """Stop a child process: SIGTERM, escalating to SIGKILL if it hasn't exited
     within timeout. hard=True skips straight to SIGKILL. No-op if proc is None or
-    already exited; always reaps after SIGKILL so no zombie is left."""
+    already exited; always reaps after SIGKILL so no zombie is left.
+
+    A child gets ONE SIGTERM from this app, however many callers reach it. ffmpeg's first
+    SIGTERM is a graceful stop - it stops reading, drains what its muxer still holds and
+    writes the trailer; its second is an immediate exit: every I/O call fails with
+    "Immediate exit requested", the trailer is never written, and whatever the muxer
+    held goes with it. Measured on a scheduled stop (dev/docs/BUGS.md 2026-10-26): the
+    stop job's SIGTERM and the watchdog's, sent on its way out a few milliseconds later,
+    cost the last 3 to 4 seconds of every recording they both reached, with ffmpeg's own
+    progress line counting 110 more frames than the file held. A second graceful caller
+    therefore waits out the grace and escalates to SIGKILL exactly as the first would,
+    without signaling again; hard=True still kills at once."""
     if proc is None or proc.poll() is not None:
         return
     # Continue first, always. A SIGSTOPped child does not act on SIGTERM until something
@@ -552,7 +577,8 @@ def terminate_or_kill(proc, timeout: float = 5.0, hard: bool = False):
     # (dev/changelog/952).
     resume_process(proc)
     if not hard:
-        proc.terminate()
+        if _claim_first_terminate(proc):
+            proc.terminate()
         try:
             proc.wait(timeout=timeout)
             return

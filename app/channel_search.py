@@ -394,7 +394,10 @@ DIMENSIONS = (
                    'one channel the automatic TV Guide check probes for each guide row and '
                    'for each group that has no schedule of its own. Exclude it to find the '
                    'holes in your monitoring. It is not the same as never tested, which is '
-                   'about the past rather than about coverage now.'),
+                   'about the past rather than about coverage now.\n\n'
+                   'Has a guide source override means you pinned the channel\'s guide to one '
+                   'EPG source on its channel page. It counts whether or not that source has '
+                   'listings for the channel right now; the channel page says which.'),
     Dimension('chan', 'Channel', hidden=True),
 )
 DIMENSION_BY_KEY = {d.key: d for d in DIMENSIONS}
@@ -461,8 +464,16 @@ OTHER_PROVIDER = 'provider'
 #: spelling of it - and a second one would be a disagreement the user sees as a channel the
 #: filter calls unmonitored while the group page says it is being checked.
 OTHER_MONITORED = 'monitored'
+#: The user pinned this channel's guide to one EPG source (`Channel.epg_source_override_id`,
+#: DESIGN-epg-sources.md §6.2). The column exists so the channels someone pinned can be
+#: listed in one place instead of found one channel page at a time (dev/changelog/1298).
+#: Set, not in force: an override on a source that has no listings for the channel today,
+#: or that the account stopped reading, still counts - it is the user's answer, and the
+#: channel page says which of the two holds.
+OTHER_SOURCE_OVERRIDE = 'srcoverride'
 OTHER_VALUES = (OTHER_REMOVED, OTHER_NEW, OTHER_IN_GUIDE, OTHER_GUIDE_OWN_ROW,
-                OTHER_GUIDE_VIA_GROUP, OTHER_DUP_URL, OTHER_PROVIDER, OTHER_MONITORED)
+                OTHER_GUIDE_VIA_GROUP, OTHER_DUP_URL, OTHER_PROVIDER, OTHER_MONITORED,
+                OTHER_SOURCE_OVERRIDE)
 #: The rail's wording for those four, from the approved mockup. Here rather than in the
 #: template because the values are a registry and their labels are part of it - a page that
 #: spelled them itself would be a second vocabulary to keep in step.
@@ -475,6 +486,7 @@ OTHER_LABELS = {
     OTHER_DUP_URL: 'Duplicated stream',
     OTHER_PROVIDER: 'On a provider',
     OTHER_MONITORED: 'Monitored by a health check',
+    OTHER_SOURCE_OVERRIDE: 'Has a guide source override',
 }
 
 
@@ -2314,6 +2326,8 @@ def _value_predicate(dim_key: str, value: str, ctx: 'SearchContext', grain: str 
             # once per request rather than once per facet aggregate - see
             # SearchContext.monitored_channel_ids().
             return Channel.id.in_(ctx.monitored_channel_ids())
+        if value == OTHER_SOURCE_OVERRIDE:
+            return Channel.epg_source_override_id.isnot(None)
         raise SearchStateError(f'unknown Other value {value!r}')
     if dim_key == 'chan':
         parsed = _optional_int(value)
@@ -2773,6 +2787,10 @@ def _group_other_predicate(value: str, ctx: 'SearchContext'):
         return ChannelGroup.in_guide.is_(True)
     if value in (OTHER_GUIDE_OWN_ROW, OTHER_REMOVED, OTHER_NEW, OTHER_DUP_URL,
                  OTHER_PROVIDER):
+        return db.false()
+    if value == OTHER_SOURCE_OVERRIDE:
+        # A guide source override is a channel's (its page is where it is set); a group's
+        # guide row takes its listings from the member it serves from.
         return db.false()
     if value == OTHER_MONITORED:
         monitored = ctx.monitored_channel_ids()

@@ -394,16 +394,23 @@ def _move(channel_ids, source_id: int, src_model, dst_model) -> int:
     return moved
 
 
-def _holding_alternates(source_ids, channel_ids) -> set[tuple[int, int]]:
-    """{(source_id, channel_id)} for the pairs where the alternates hold at least one of
-    the source's rows for the channel. One query per source per chunk, on the table's
-    (source_id, channel_id) index."""
+def holding_rows(source_ids, channel_ids) -> set[tuple[int, int]]:
+    """{(source_id, channel_id)} for the pairs where the database holds at least one of the
+    source's rows for the channel, in EITHER table - the guard every resolver applies before
+    it points a channel at a new winner (reresolve_channels(), set_source_override(), the
+    import). Rows in the alternates are what a move promotes; rows already in epg_entries
+    mean the move happened and only the pointer is behind, which is what a process death
+    between the row moves and apply_winners() leaves - read from the alternates alone, that
+    channel was skipped by every later re-resolve and never repaired (dev/changelog/1298).
+    One query per source per chunk per table, each on an index that leads with or reaches
+    the channel."""
     out: set[tuple[int, int]] = set()
     for sid in source_ids:
         for chunk in _chunks(channel_ids):
-            out.update((sid, cid) for (cid,) in db.session.query(EpgAlternateEntry.channel_id)
-                       .filter(EpgAlternateEntry.source_id == sid,
-                               EpgAlternateEntry.channel_id.in_(chunk)).distinct())
+            for model in (EpgAlternateEntry, EPGEntry):
+                out.update((sid, cid) for (cid,) in db.session.query(model.channel_id)
+                           .filter(_of_source(model, sid), model.channel_id.in_(chunk))
+                           .distinct())
     return out
 
 
@@ -483,14 +490,17 @@ def promote(channel_ids, source_id: int) -> int:
     return _move(channel_ids, source_id, EpgAlternateEntry, EPGEntry)
 
 
-def drop_alternates(channel_ids, source_id: int) -> None:
+def drop_alternates(channel_ids) -> None:
     """Alternates are kept only for channels with an active source (DESIGN-epg-sources.md
-    §4): a channel with no winner would otherwise collect every source's leftovers."""
+    §4): every source's rows for these channels go, since a channel with no winner would
+    otherwise collect every source's leftovers. Called for the channels an import or a
+    re-resolve left with no winner. It used to take a source and drop only the OLD winner's
+    alternates, which were never there - the old winner's rows were active - so it dropped
+    nothing (dev/changelog/1298). On ix_epg_alt_channel."""
     for chunk in _chunks(channel_ids):
         @retry_on_locked()
         def _drop_and_commit(chunk=chunk):
             EpgAlternateEntry.query.filter(
-                EpgAlternateEntry.source_id == source_id,
                 EpgAlternateEntry.channel_id.in_(chunk)).delete(synchronize_session=False)
             db.session.commit()
         _drop_and_commit()
@@ -820,9 +830,9 @@ def set_source_override(channel: Channel, source: EpgSource | None, *,
         _keys, _wanted, directory = _channel_directory(channel, order, case_sensitive)
         winner, why = resolve_active_source(new_id, order,
                                             _channel_coverage(channel, order, directory))
-        if winner is None or (winner != old_winner and not db.session.query(
-                EpgAlternateEntry.id).filter(_of_source(EpgAlternateEntry, winner),
-                                             EpgAlternateEntry.channel_id == channel.id).first()):
+        if winner is None or (winner != old_winner
+                              and (winner, channel.id) not in holding_rows([winner],
+                                                                            [channel.id])):
             winner = old_winner
     if winner != old_winner:
         if old_winner is not None:
@@ -1010,7 +1020,7 @@ def update_url_source(source: EpgSource, fields: dict) -> bool:
     return url_changed
 
 
-def _resolve_row(r, order: list[int], keys: dict, coverage: dict,
+def resolve_row(r, order: list[int], keys: dict, coverage: dict,
                  case_sensitive: bool, held=None) -> tuple[int | None, str]:
     """resolve_active_source() for one channel row (id, epg_channel_id, hidden,
     epg_source_override_id) over its account's `order`, from preloaded keys and directory
@@ -1039,11 +1049,12 @@ def reresolve_channels(channel_ids, case_sensitive: bool, *,
     import (a source deleted, or an account no longer reading one). Nothing is fetched: the
     next source's listings are already in the alternates table.
 
-    A channel whose new winner holds none of its rows in the alternates is left as it is:
+    A channel whose new winner holds none of its rows in either table is left as it is:
     the directory can say a source covers a channel before its listings are here (a key or
     a borrowed channel waiting for the source's next refresh), and moving the guide there
     would empty it until then (dev/changelog/1107). That source's import settles it. A
-    source with no directory yet covers what it holds rows for (held_coverage()).
+    source with no directory yet covers what it holds rows for (held_coverage()). A channel
+    left with no winner keeps no alternates (§4).
 
     `previous` names the winner a channel had when the caller has already cleared its
     pointer (the source is gone), so the CHANNEL_EPG_SOURCE_CHANGED event can still say
@@ -1068,17 +1079,18 @@ def reresolve_channels(channel_ids, case_sensitive: bool, *,
     held_rows = held_coverage(unrefreshed, [r.id for r in rows]) if unrefreshed else None
     decided = {}
     for r in rows:
-        new, why = _resolve_row(r, order.get(r.account_id, []), keys, coverage,
+        new, why = resolve_row(r, order.get(r.account_id, []), keys, coverage,
                                 case_sensitive, held_rows)
         if new != r.epg_source_id:
             decided[r.id] = (new, why)
-    held = _holding_alternates({new for new, _why in decided.values() if new is not None},
-                               list(decided))
+    held = holding_rows({new for new, _why in decided.values() if new is not None},
+                         list(decided))
 
     changes: dict[int, tuple[int | None, int | None]] = {}
     reasons: dict[int, str] = {}
     demotions: dict[int, list[int]] = {}
     promotions: dict[int, list[int]] = {}
+    orphaned: list[int] = []
     for r in rows:
         if r.id not in decided:
             continue
@@ -1091,10 +1103,14 @@ def reresolve_channels(channel_ids, case_sensitive: bool, *,
             demotions.setdefault(r.epg_source_id, []).append(r.id)
         if new is not None:
             promotions.setdefault(new, []).append(r.id)
+        else:
+            orphaned.append(r.id)
     for sid, ids in demotions.items():
         demote(ids, sid)
     for sid, ids in promotions.items():
         promote(ids, sid)
+    if orphaned:
+        drop_alternates(orphaned)
     names = dict(source_names or {})
     names.update(db.session.query(EpgSource.id, EpgSource.name).filter(
         EpgSource.id.in_(list(promotions) + list(demotions))))
@@ -1188,7 +1204,7 @@ def stop_using_source(account_id: int, source_id: int,
             EpgSourceSubscription.account_id == account_id,
             EpgSourceSubscription.source_id == source_id))
         for model in (EPGEntry, EpgAlternateEntry):
-            db.session.execute(delete(model).where(model.source_id == source_id,
+            db.session.execute(delete(model).where(_of_source(model, source_id),
                                                    model.channel_id.in_(mine)))
         db.session.execute(update(Channel).where(
             Channel.account_id == account_id, Channel.epg_source_id == source_id)
@@ -1358,7 +1374,7 @@ def borrowable_sources(account_id: int, case_sensitive: bool) -> list[dict]:
                 if not k or norm_key(k, case_sensitive) not in coverage[s.id]:
                     continue
                 covers += 1
-                new, _why = _resolve_row(r, trial, keys, coverage, case_sensitive,
+                new, _why = resolve_row(r, trial, keys, coverage, case_sensitive,
                                          held_rows)
                 if new == s.id:
                     if r.epg_source_id is None:
@@ -1529,6 +1545,38 @@ STATUS_DISPLAY = {
 }
 KIND_LABELS = {EPG_SOURCE_PROVIDER: "Provider's guide (xmltv.php)",
                EPG_SOURCE_URL: 'XMLTV URL'}
+
+
+def refreshing_source_names(account_ids=(), source_ids=()) -> list[str]:
+    """The names of the sources with a refresh in flight among `source_ids` and every
+    source an account in `account_ids` reads - the one question every user action that
+    re-resolves channels or moves their rows asks before it writes (Set key, Clear key, the
+    review page's Accept, Use this source, Move up/down, Delete source, Stop using,
+    Subscribe). An import of any source the account reads decides the same channels'
+    winners and moves the same rows, so a write landing beside it can leave one channel
+    with two schedules from one source in one table (dev/changelog/1298). Six routes each
+    asked a narrower version of this; now there is one, and `refresh_busy_message()` is
+    its one wording. Ordered by name so the message is reproducible."""
+    account_ids = [a for a in account_ids if a is not None]
+    source_ids = [s for s in source_ids if s is not None]
+    q = EpgSource.query.filter(EpgSource.refresh_started_at.isnot(None))
+    clauses = []
+    if source_ids:
+        clauses.append(EpgSource.id.in_(source_ids))
+    if account_ids:
+        clauses.append(EpgSource.id.in_(
+            select(EpgSourceSubscription.source_id)
+            .where(EpgSourceSubscription.account_id.in_(account_ids))))
+    if not clauses:
+        return []
+    return [name for (name,) in q.filter(db.or_(*clauses)).with_entities(EpgSource.name)
+            .order_by(EpgSource.name)]
+
+
+def refresh_busy_message(names, then: str = 'Try again once the refresh has finished.') -> str:
+    """The 409 a route answers while refreshing_source_names() is non-empty. `then` is what
+    the user does next, where the action has its own verb ("Delete it once ...")."""
+    return f'"{names[0]}" is being refreshed right now. {then}'
 
 
 def account_sources_view(account_id: int, schedule: dict | None = None) -> list[dict]:
