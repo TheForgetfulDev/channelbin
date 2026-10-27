@@ -471,8 +471,15 @@ class CancelledRetryPromotionTests(unittest.TestCase):
         self.assertNotIn('<button class="menu-item" data-act="retry-convert">', html,
                          'the promoted control is not also buried in the kebab')
         kebab_delete = html.count('<button class="menu-item danger" data-act="delete">Delete recording</button>')
-        self.assertEqual(2, kebab_delete, 'Delete steps into the mobile kebab too, as on a FAILED row')
-        self.assertNotIn('<button class="btn btn-danger" data-act="delete">Delete</button>', html)
+        self.assertEqual(2, kebab_delete, 'Delete is in the desktop kebab and the phone kebab')
+        # The phone bar holds two of: a promoted retry, Play, Delete (DESIGN.md 9.5 as amended
+        # in dev/changelog/1312). The kept .ts plays through the preview pipeline
+        # (dev/changelog/1314), so Play takes the second slot and Delete moves to the kebab;
+        # Record again is in the kebab either way.
+        bar = html[html.index('<div class="mobile-actbar">'):]
+        bar = bar[:bar.index('<div class="menu-wrap">')]
+        self.assertEqual(re.findall(r'data-act="([\w-]+)"', bar), ['retry-convert', 'play'])
+        self.assertNotIn('Record again', bar)
 
     def test_a_cancelled_row_without_a_ts_promotes_nothing(self):
         html = self._page(REC_STATUS_ABORTED, with_ts=False)

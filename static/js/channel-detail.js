@@ -252,29 +252,12 @@
 
   function copyStreamUrl(btn) {
     const url = byId('stream-url-text').dataset.fullUrl;
-    const done = () => {
-      btn.textContent = 'Copied!';
-      setTimeout(() => { btn.textContent = 'Copy'; }, 2000);
-    };
-    const fallback = () => {
-      const ta = document.createElement('textarea');
-      ta.value = url;
-      ta.style.cssText = 'position:fixed;opacity:0';
-      document.body.appendChild(ta);
-      ta.select();
-      document.execCommand('copy');
-      document.body.removeChild(ta);
-      done();
-    };
-    // navigator.clipboard is undefined outside a secure context (plain http:// on a LAN
-    // IP, not localhost) - calling .writeText on it throws synchronously and skips the
-    // .catch() fallback entirely, so the button silently does nothing (dev/docs/BUGS.md
-    // 2026-08-09). Guard existence first, same pattern as guide.js's modal-url-copy.
-    if (navigator.clipboard && navigator.clipboard.writeText) {
-      navigator.clipboard.writeText(url).then(done).catch(fallback);
-    } else {
-      fallback();
-    }
+    copyText(url)
+      .then(() => {
+        btn.textContent = 'Copied!';
+        setTimeout(() => { btn.textContent = 'Copy'; }, 2000);
+      })
+      .catch(e => showToast(e.message, { type: 'error' }));
   }
 
   async function repointChannel() {
@@ -638,47 +621,17 @@
   // button and the close/Esc/backdrop paths all run onClose, and leaving the page fires a
   // pagehide beacon. The server's idle reaper is the backstop for a tab that dies
   // without either, so a stop here is prompt rather than load-bearing.
-  //
-  // hls.js is loaded on the first click rather than with the page: it is the one third-
-  // party script in the app (static/vendor/hls.js/NOTICE.md) and 386 KB nobody should pay
-  // for on every channel page load.
-  let hlsLoading = null;
-  function loadHlsJs() {
-    if (window.Hls) return Promise.resolve(window.Hls);
-    if (!hlsLoading) {
-      hlsLoading = new Promise((resolve, reject) => {
-        const s = document.createElement('script');
-        s.src = C.urls.hlsJs;
-        s.onload = () => resolve(window.Hls);
-        s.onerror = () => { hlsLoading = null; reject(new Error('Could not load the video player script.')); };
-        document.head.appendChild(s);
-      });
-    }
-    return hlsLoading;
-  }
 
   function openPreview() {
-    const stage = document.createElement('div');
-    stage.innerHTML = `
-      <div class="cd-preview-stage">
-        <video class="cd-preview-video" playsinline controls></video>
-        <button type="button" class="btn btn-primary cd-preview-play" hidden>Play</button>
-      </div>
-      <div class="cd-preview-status" role="status">Starting…</div>`;
-    const video = stage.querySelector('video');
-    const playBtn = stage.querySelector('.cd-preview-play');
-    const statusEl = stage.querySelector('.cd-preview-status');
+    const player = buildPlayerStage();
+    const { video, setStatus, tryPlay } = player;
+    setStatus('Starting…');
 
     let session = null;     // the start response: status_url / playlist_url / stop_url
     let hls = null;
     let pollTimer = null;
     let closed = false;
     let recoveredOnce = false;
-
-    const setStatus = (text, kind = '') => {
-      statusEl.textContent = text;
-      statusEl.dataset.kind = kind;
-    };
 
     // pagehide cannot wait for a fetch and sendBeacon cannot set headers, so the token
     // travels as a form field, which the CSRF check accepts just the same.
@@ -699,15 +652,13 @@
     const detachPlayer = () => {
       clearTimeout(pollTimer);
       if (hls) { hls.destroy(); hls = null; }
-      video.pause();
-      video.removeAttribute('src');
-      video.load();
+      player.detach();
     };
 
     const modal = buildModal({
       title: `Preview - ${C.channelName}`,
-      body: stage,
-      panelClass: 'modal-wide cd-preview-modal',
+      body: player.el,
+      panelClass: 'modal-wide player-modal',
       footer: [{ label: '■ Stop', class: 'btn', onClick: (close) => close() }],
       onClose: () => {
         closed = true;
@@ -727,18 +678,6 @@
       setStatus(why || 'Stopped.', s.reason === 'user' ? '' : 'error');
     };
 
-    const tryPlay = () => {
-      const p = video.play();
-      if (!p || !p.catch) return;
-      p.then(() => { playBtn.hidden = true; })
-       .catch((err) => {
-         if (err && err.name === 'NotAllowedError') {
-           playBtn.hidden = false;
-           setStatus('Ready - press Play. The browser would not start sound on its own.');
-         }
-       });
-    };
-    playBtn.addEventListener('click', tryPlay);
     video.addEventListener('playing', () => {
       if (closed || !session) return;
       setStatus(session.transcode_audio
@@ -764,33 +703,19 @@
       }
     };
 
-    // Prefer hls.js wherever Media Source Extensions exist (desktop Chrome/Firefox/Edge,
-    // Android Chrome), fall back to the browser's own HLS where it is the only option
-    // (iOS Safari), and say so where there is neither.
     const attach = () => {
-      const url = session.playlist_url;
-      const nativeHls = video.canPlayType('application/vnd.apple.mpegurl');
-      const useNative = () => {
-        video.src = url;
-        video.addEventListener('loadedmetadata', tryPlay, { once: true });
-      };
-      loadHlsJs()
-        .then((Hls) => {
-          if (Hls && Hls.isSupported()) {
-            hls = new Hls({ liveSyncDurationCount: 3, liveMaxLatencyDurationCount: 8 });
-            hls.on(Hls.Events.MANIFEST_PARSED, tryPlay);
-            hls.on(Hls.Events.ERROR, onHlsError);
-            hls.loadSource(url);
-            hls.attachMedia(video);
-          } else if (nativeHls) {
-            useNative();
-          } else {
-            setStatus('This browser cannot play HLS video, so the preview cannot show here.', 'error');
-          }
+      attachHls(video, session.playlist_url, {
+        src: C.urls.hlsJs,
+        config: { liveSyncDurationCount: 3, liveMaxLatencyDurationCount: 8 },
+        onReady: tryPlay,
+        onError: onHlsError,
+      })
+        .then((h) => {
+          if (closed) { if (h) h.destroy(); return; }
+          hls = h;
         })
         .catch((e) => {
-          if (nativeHls) useNative();
-          else setStatus(e.message || 'Could not load the video player script.', 'error');
+          if (!closed) setStatus(e.message || 'Could not load the video player script.', 'error');
         });
     };
 

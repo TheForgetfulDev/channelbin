@@ -29,11 +29,23 @@ Rules this module enforces, each of which a test in tests/test_preview.py guards
   never replaces the preview someone is watching; the one-at-a-time rule is about watched
   sessions (dev/changelog/1160).
 
+* A session's source is a channel or a recording's finished file (start_file_playback,
+  dev/changelog/1314). A file session holds no provider connection, so nothing about slots,
+  preemption or account blocks applies to it; it is still the one watched session, it ends
+  on its own at the end of the file, and it has no hard cap - the cap bounds a provider
+  connection, and the idle reaper still catches a closed tab. Seeking is starting a new
+  session at the new offset, which replaces the old one before its ffmpeg starts.
+* A file session over a recording still capturing may follow the segment the recorder is
+  writing (CapturePlace, dev/changelog/1316). The recorder never learns it is there: the
+  reaper reads its live state and ends the follower, by name, when that segment is left or
+  the capture stops, and the player starts the next session itself.
+
 Session state is process-local (like recorder._active): a restart kills the ffmpeg this
 process owned, so there is nothing to recover. Full reasoning: dev/changelog/1018.
 """
 import logging
 import os
+import re
 import secrets
 import shutil
 import subprocess
@@ -49,8 +61,8 @@ from . import connection_limits as connlim
 from .account_links import (is_credential_refusal, is_resolution_failure,
                             note_refusal_for_holder, render_held_login,
                             roll_host_for_channel)
-from .proc_utils import (PREVIEW_PLAYLIST, PREVIEW_SEGMENT_RE, build_preview_cmd,
-                         read_stderr_tail, terminate_or_kill)
+from .proc_utils import (PREVIEW_PLAYLIST, PREVIEW_SEGMENT_RE, build_file_playback_cmd,
+                         build_preview_cmd, read_stderr_tail, terminate_or_kill)
 from .url_utils import mask_creds_in_text
 
 log = logging.getLogger(__name__)
@@ -73,6 +85,13 @@ REASON_REPLACED = 'replaced'
 REASON_SHUTDOWN = 'shutdown'
 REASON_LAUNCH_FAILED = 'launch_failed'
 REASON_CAPTURED = 'captured'
+# File sessions only.
+REASON_FILE_END = 'file_end'
+REASON_PAST_END = 'past_end'
+REASON_READ_FAILED = 'read_failed'
+# Sessions following a segment the recorder is writing (dev/changelog/1316).
+REASON_SEGMENT_CHANGED = 'segment_changed'
+REASON_CAPTURE_STOPPED = 'capture_stopped'
 
 REASON_TEXT = {
     REASON_USER: 'Stopped.',
@@ -85,7 +104,56 @@ REASON_TEXT = {
     REASON_SHUTDOWN: 'Stopped - the app is restarting.',
     REASON_LAUNCH_FAILED: 'Could not start ffmpeg.',
     REASON_CAPTURED: 'Stopped - the screenshot was taken.',
+    REASON_FILE_END: 'Reached the end of the recording.',
+    REASON_PAST_END: 'Nothing to play from there - it is past the end of the file.',
+    REASON_READ_FAILED: 'ffmpeg stopped reading the recording\'s file.',
+    REASON_SEGMENT_CHANGED: 'The recording moved on to a new segment file.',
+    REASON_CAPTURE_STOPPED: 'The recording stopped capturing.',
 }
+
+# Where a channel's wording does not fit a recording's file.
+FILE_REASON_TEXT = {
+    REASON_IDLE: 'Stopped - nothing has played this recording for a while.',
+    REASON_CONNECT_TIMEOUT: 'Stopped - ffmpeg read nothing playable from the file in time.',
+    REASON_REPLACED: 'Stopped - a channel preview or another playback was started.',
+}
+
+# Where a follower's wording differs from a finished file's.
+FOLLOW_REASON_TEXT = {
+    REASON_CONNECT_TIMEOUT: 'Stopped - the capture wrote nothing ffmpeg could play to its '
+                            'segment file in time.',
+}
+
+# How long a follower may take to its first playable segment. A capture's ffmpeg writes its
+# file in 256 KiB blocks, so a low-bitrate channel grows in steps several seconds apart and
+# the follower needs a few of them before it can cut its first segment: measured 0.4-6 s at
+# 1.5-8 Mbps and 17-21 s at 270 kbps (dev/changelog/1316). An audio-only channel is slower
+# still, so the channel preview's connect timeout would end a follower that is working.
+FOLLOW_START_SECONDS = 60.0
+
+SOURCE_CHANNEL = 'channel'
+SOURCE_FILE = 'file'
+
+
+@dataclass(frozen=True)
+class CapturePlace:
+    """Where a file session over a recording that is still capturing sits on the recording's
+    timeline (app/playback.py::capture_timeline). `base` is the position the segment file
+    starts at; `span_end` where it ends, None while it is being written. `follow_state` is the
+    recorder's live state when the file is the one being written: the session then follows it
+    and ends when that state stops being the recording's, or moves to another segment - read
+    from the recorder's in-memory state, which the recorder never learns is being read.
+    `live` says the session was started at the live edge rather than at a position."""
+    segment_number: int
+    base: float
+    span_end: Optional[float] = None
+    follow_state: Optional[object] = None
+    live: bool = False
+
+# A file session's window spans at least this long, so a pause shorter than it resumes from
+# the segments still on disk. recording-player.js stops a session paused for longer than
+# PAUSE_HOLD_S (30 s) and restarts it where it was.
+FILE_WINDOW_SECONDS = 60
 
 # What a session is for. A WATCH session is the modal's player; a CAPTURE session exists
 # only until capture_frame() has one segment to take a frame from.
@@ -129,7 +197,8 @@ class PreviewSession:
     stderr_path: str
     transcode_audio: bool
     idle_timeout: float
-    max_seconds: float
+    # None: no hard cap (a file session).
+    max_seconds: Optional[float]
     connect_timeout: float
     proc: Optional[subprocess.Popen] = None
     state: str = STATE_STARTING
@@ -152,6 +221,19 @@ class PreviewSession:
     # here because the seat is released before the start failure's stderr is read, and a
     # credential refusal has to be stamped on the login that was actually sent.
     login_id: Optional[int] = None
+    source: str = SOURCE_CHANNEL
+    # File sessions: the recording, the file (never sent to the browser) and where in it this
+    # session was started. source_done records that ffmpeg reached the end of the file and
+    # exited cleanly; the session stays up until the player has fetched what is left.
+    recording_id: Optional[int] = None
+    recording_name: str = ''
+    file_path: str = field(default='', repr=False)
+    offset: float = 0.0
+    source_done: bool = False
+    # Set when the session is over a recording still capturing; `following` when its ffmpeg
+    # reads a segment file the recorder is still writing, and so never reaches an end.
+    capture: Optional[CapturePlace] = field(default=None, repr=False)
+    following: bool = False
     # _finish() claims a session under _lock and tears it down under _teardown_lock, so a
     # second finisher blocks until the first is done rather than returning early.
     _finishing: bool = False
@@ -165,15 +247,42 @@ class PreviewSession:
     def playlist_path(self) -> str:
         return os.path.join(self.dir, PREVIEW_PLAYLIST)
 
+    @property
+    def label(self) -> str:
+        if self.source == SOURCE_FILE and self.capture is not None:
+            where = 'following' if self.following else f'from {self.offset:.0f}s of'
+            return (f'recording {self.recording_id} ({self.recording_name}), {where} segment '
+                    f'{self.capture.segment_number}')
+        if self.source == SOURCE_FILE:
+            return f'recording {self.recording_id} ({self.recording_name}) from {self.offset:.0f}s'
+        return f'channel {self.channel_id} ({self.channel_name})'
+
+    def reason_text(self) -> str:
+        if not self.reason:
+            return ''
+        if self.following and self.reason in FOLLOW_REASON_TEXT:
+            return FOLLOW_REASON_TEXT[self.reason]
+        if self.source == SOURCE_FILE and self.reason in FILE_REASON_TEXT:
+            return FILE_REASON_TEXT[self.reason]
+        return REASON_TEXT.get(self.reason, '')
+
     def to_dict(self) -> dict:
         now = time.monotonic()
         return {
             'session_id': self.id,
+            'source': self.source,
             'channel_id': self.channel_id,
             'channel_name': self.channel_name,
+            'recording_id': self.recording_id,
+            'offset': self.offset,
+            'source_done': self.source_done,
+            'following': self.following,
+            'capture': ({'segment_number': self.capture.segment_number,
+                         'base': self.capture.base, 'span_end': self.capture.span_end,
+                         'live': self.capture.live} if self.capture else None),
             'state': self.state,
             'reason': self.reason,
-            'reason_text': REASON_TEXT.get(self.reason, '') if self.reason else '',
+            'reason_text': self.reason_text(),
             'detail': self.detail,
             'transcode_audio': self.transcode_audio,
             'elapsed_seconds': round(now - self.started_mono, 1) if self.started_mono else 0,
@@ -329,6 +438,85 @@ def _launch(channel_id: int, purpose: str) -> PreviewSession:
     return session
 
 
+def start_file_playback(recording_id: int, recording_name: str, path: str, offset: float,
+                        transcode_audio: bool,
+                        capture: Optional[CapturePlace] = None) -> PreviewSession:
+    """Play a recording's finished file from `offset` seconds, replacing whatever session is
+    being watched - a channel preview, or this recording's own session at its old offset,
+    which is what a seek is. The caller has already decided the file may be played and
+    resolved `path` from the recording's row (app/playback.py); nothing here reads a path
+    from a request.
+
+    Takes no connection slot: no provider is involved, so nothing can preempt it and it can
+    preempt nothing. Raises PreviewRefused (500) when the directory or ffmpeg cannot be
+    created. The old session is torn down - its ffmpeg dead - before the new one launches,
+    so two readers never share the file.
+
+    `capture` places a session over a recording that is still capturing; with a
+    `follow_state` the file is the segment being written and ffmpeg follows it from `offset`."""
+    from .config import load_config
+
+    cfg = load_config()
+    pcfg = cfg.get('preview', {}) or {}
+    segment_seconds = int(pcfg.get('segment_seconds', 2))
+    watched = live_session(PURPOSE_WATCH)
+    if watched is not None:
+        _finish(watched, REASON_REPLACED)
+
+    session = PreviewSession(
+        id=secrets.token_urlsafe(12),
+        channel_id=None,
+        channel_name='',
+        account_id=None,
+        dir='',
+        stderr_path='',
+        transcode_audio=transcode_audio,
+        idle_timeout=float(pcfg.get('idle_timeout_seconds', 15)),
+        max_seconds=None,
+        connect_timeout=float(pcfg.get('connect_timeout_seconds', 20)),
+        started_mono=time.monotonic(),
+        source=SOURCE_FILE,
+        recording_id=recording_id,
+        recording_name=recording_name,
+        file_path=path,
+        offset=float(offset),
+        capture=capture,
+        following=bool(capture and capture.follow_state is not None),
+    )
+    if session.following:
+        session.connect_timeout = max(session.connect_timeout, FOLLOW_START_SECONDS)
+    with _lock:
+        _sessions[session.id] = session
+        _prune_ended_locked()
+
+    try:
+        session.dir = tempfile.mkdtemp(prefix='channelbin-preview-', dir=pcfg.get('dir') or None)
+    except OSError as exc:
+        _finish(session, REASON_LAUNCH_FAILED, detail=str(exc))
+        raise PreviewRefused(f'Could not create the playback directory: {exc}', 500)
+    session.stderr_path = os.path.join(session.dir, 'ffmpeg.stderr')
+
+    list_size = max(6, -(-FILE_WINDOW_SECONDS // max(segment_seconds, 1)))
+    cmd = build_file_playback_cmd(cfg, path, session.dir, offset=session.offset,
+                                  segment_seconds=segment_seconds, list_size=list_size,
+                                  transcode_audio=transcode_audio, follow=session.following)
+    log.info('Playback %s: %s%s - %s', session.id, session.label,
+             ' with audio re-encoded to AAC' if transcode_audio else '', ' '.join(cmd))
+    try:
+        # stderr to a file, never a pipe (dev/changelog/430); its tail names a read failure.
+        with open(session.stderr_path, 'wb') as err:
+            proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                    stderr=err)
+    except OSError as exc:
+        log.error('Playback %s: could not start ffmpeg: %s', session.id, exc)
+        _finish(session, REASON_LAUNCH_FAILED, detail=str(exc))
+        raise PreviewRefused(f'Could not start ffmpeg: {exc}', 500)
+    with _lock:
+        session.proc = proc
+    _ensure_reaper()
+    return session
+
+
 def _finish(session: PreviewSession, reason: str, detail: str = '') -> bool:
     """Tear down everything `session` acquired - ffmpeg, the connection slot, the segment
     directory - and only THEN mark it STOPPED with `reason`. The order is the contract:
@@ -350,10 +538,15 @@ def _finish(session: PreviewSession, reason: str, detail: str = '') -> bool:
             return False
     try:
         try:
-            terminate_or_kill(proc)
+            # A follower waiting at the end of a growing file does not act on the one SIGTERM
+            # terminate_or_kill sends, so it would sit out the whole grace before the SIGKILL
+            # (measured, dev/changelog/1316). Its output is a throwaway window with no
+            # trailer to finish, and a seek waits on this teardown.
+            terminate_or_kill(proc, hard=session.following)
         finally:
             try:
-                connlim.release(session.account_id, 'preview', session.id)
+                if session.source == SOURCE_CHANNEL:
+                    connlim.release(session.account_id, 'preview', session.id)
             finally:
                 if session.dir:
                     shutil.rmtree(session.dir, ignore_errors=True)
@@ -363,10 +556,12 @@ def _finish(session: PreviewSession, reason: str, detail: str = '') -> bool:
             session.detail = detail
     finally:
         session._teardown_lock.release()
-    level = (logging.INFO if reason in (REASON_USER, REASON_REPLACED, REASON_CAPTURED)
+    level = (logging.INFO if reason in (REASON_USER, REASON_REPLACED, REASON_CAPTURED,
+                                        REASON_FILE_END, REASON_SEGMENT_CHANGED,
+                                        REASON_CAPTURE_STOPPED)
              else logging.WARNING)
-    log.log(level, 'Preview %s: channel %d (%s) stopped - %s%s', session.id,
-            session.channel_id, session.channel_name, reason, f' ({detail})' if detail else '')
+    log.log(level, 'Preview %s: %s stopped - %s%s', session.id, session.label, reason,
+            f' ({detail})' if detail else '')
     return True
 
 
@@ -547,15 +742,25 @@ def capture_frame(channel_id: int, output_path: str, ffmpeg_path: str) -> str:
         shutil.rmtree(scratch, ignore_errors=True)
 
 
+_EXTINF_RE = re.compile(r'^#EXTINF:(\d+(?:\.\d+)?)', re.M)
+
+
 def _playlist_is_playable(path: str) -> bool:
+    """The playlist lists a segment with something in it. A seek past the end of a file
+    makes ffmpeg exit 0 having written one segment of 0.000 s (measured, dev/changelog/1314),
+    which is a playlist with nothing to play."""
     try:
         with open(path, 'r', encoding='utf-8', errors='replace') as fh:
-            return '#EXTINF' in fh.read()
+            text = fh.read()
     except OSError:
         return False
+    return any(float(d) > 0 for d in _EXTINF_RE.findall(text))
 
 
 def _check(session: PreviewSession):
+    if session.source == SOURCE_FILE:
+        _check_file(session)
+        return
     now = time.monotonic()
     proc = session.proc
     rc = proc.poll() if proc is not None else None
@@ -567,12 +772,7 @@ def _check(session: PreviewSession):
         return
     if session.state == STATE_STARTING:
         if _playlist_is_playable(session.playlist_path):
-            with _lock:
-                if session.live:
-                    session.state = STATE_READY
-                    session.ready_mono = now
-                    session.last_seen_mono = now
-            log.info('Preview %s: playable after %.1fs', session.id, now - session.started_mono)
+            _mark_ready(session, now)
         elif now - session.started_mono > session.connect_timeout:
             tail = mask_creds_in_text(read_stderr_tail(session.stderr_path))
             _finish(session, REASON_CONNECT_TIMEOUT, detail=tail)
@@ -584,6 +784,72 @@ def _check(session: PreviewSession):
             return
     if now - session.started_mono > session.max_seconds:
         _finish(session, REASON_MAX_DURATION)
+
+
+def _mark_ready(session: PreviewSession, now: float) -> None:
+    with _lock:
+        if session.live:
+            session.state = STATE_READY
+            session.ready_mono = now
+            session.last_seen_mono = now
+    log.info('Preview %s: playable after %.1fs', session.id, now - session.started_mono)
+
+
+def _check_file(session: PreviewSession):
+    """The reaper's rules for a file session. ffmpeg exiting 0 is the end of the file, not
+    the end of the session: the player still has the last segments to fetch, so the session
+    stays up until it stops fetching and then ends as REASON_FILE_END. No hard cap.
+
+    A following session never reaches an end, so it ends when the recorder does: when the
+    recording's live state is no longer the one it was started on (stopped, paused, retrying,
+    failed, resumed into a new state) or has moved to another segment file."""
+    if session.following and _capture_moved_on(session):
+        return
+    now = time.monotonic()
+    proc = session.proc
+    rc = proc.poll() if proc is not None else None
+    if rc is not None and not session.source_done:
+        if rc != 0:
+            _finish(session, REASON_READ_FAILED,
+                    detail=f'ffmpeg exited with code {rc}: '
+                           + (read_stderr_tail(session.stderr_path) or 'it wrote no error.'))
+            return
+        if session.state == STATE_STARTING and not _playlist_is_playable(session.playlist_path):
+            _finish(session, REASON_PAST_END)
+            return
+        if session.state == STATE_STARTING:
+            _mark_ready(session, now)
+        with _lock:
+            session.source_done = True
+        log.info('Preview %s: %s - ffmpeg reached the end of the file', session.id,
+                 session.label)
+    if session.state == STATE_STARTING:
+        if _playlist_is_playable(session.playlist_path):
+            _mark_ready(session, now)
+        elif now - session.started_mono > session.connect_timeout:
+            _finish(session, REASON_CONNECT_TIMEOUT,
+                    detail=read_stderr_tail(session.stderr_path))
+            return
+    if session.state == STATE_READY and session.last_seen_mono is not None:
+        if now - session.last_seen_mono > session.idle_timeout:
+            _finish(session, REASON_FILE_END if session.source_done else REASON_IDLE)
+
+
+def _capture_moved_on(session: PreviewSession) -> bool:
+    """End a following session whose segment the recorder has left; True if it did. Reads
+    the recorder's in-memory state only - no database, nothing the recorder waits on."""
+    from .recorder import get_state
+
+    state = get_state(session.recording_id)
+    if state is not session.capture.follow_state:
+        _finish(session, REASON_CAPTURE_STOPPED)
+        return True
+    if state.current_segment_num != session.capture.segment_number:
+        _finish(session, REASON_SEGMENT_CHANGED,
+                detail=f'Segment {session.capture.segment_number} ended; the recording is now '
+                       f'writing segment {state.current_segment_num}.')
+        return True
+    return False
 
 
 def _roll_if_unresolved(session: PreviewSession, tail: str) -> None:

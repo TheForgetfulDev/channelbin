@@ -2208,6 +2208,48 @@ body.actbar-on #app-toast { bottom: 78px; }
   border: 1px solid var(--border); box-shadow: var(--shadow-pop);
 }
 
+/* ── Video player (DESIGN.md 3.18; built by util.js buildPlayerStage) ──
+   The one deliberately non-palette surface: video letterboxes against the darkest ground the
+   palette has, never a mid-tone. A 16:9 box so the modal has its shape before the first
+   frame, and a phone's bottom sheet (9.6) does not jump when it lands. */
+.modal-panel.player-modal { max-width: 960px; }
+.player-stage {
+  position: relative;
+  aspect-ratio: 16 / 9;
+  background: var(--bg0);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+}
+.player-video { display: block; width: 100%; height: 100%; }
+.player-play {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+}
+.player-status {
+  margin-top: 10px;
+  font-size: var(--fs-sm);
+  color: var(--text-muted);
+  white-space: pre-line;
+  overflow-wrap: anywhere;
+}
+.player-status[data-kind="ok"] { color: var(--ok); }
+.player-status[data-kind="error"] { color: var(--bad); }
+.player-status[data-kind="warn"] { color: var(--warn); }
+/* The seek controls a file played through the preview pipeline needs, since the browser's own
+   scrubber only spans the rolling window (recording-player.js, dev/changelog/1314). */
+.player-seek { display: flex; flex-direction: column; gap: 8px; margin-top: 10px; }
+.player-seek-bar { width: 100%; accent-color: var(--accent); }
+.player-seek-row { display: flex; flex-wrap: wrap; justify-content: center; gap: 6px; }
+.player-pause { min-width: 72px; }
+.player-pos {
+  text-align: center;
+  font-size: var(--fs-sm);
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
 /* ── Modal anatomy (DESIGN.md 3.12; built by util.js buildModal) ───── */
 .modal-panel {
   position: relative; z-index: 1; width: 100%; max-width: 560px; max-height: 90vh;

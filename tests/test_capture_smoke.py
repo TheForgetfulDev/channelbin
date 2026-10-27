@@ -38,8 +38,11 @@ class CaptureSmokeTests(CaptureCase):
 
     def test_a_recording_survives_a_silent_socket_and_converts(self):
         ch = self.channel()
-        rid = self.record(ch, seconds=12)
+        # A connection fault reaches only connections opened after it, and record() can start
+        # within a millisecond, so the silence is set before the recording is scheduled
+        # (dev/docs/BUGS.md 2026-10-27 12:21 PM).
         self.sim.inject('silent_socket', self.label(ch.id), after_bytes=400_000, times=1)
+        rid = self.record(ch, seconds=12)
         rec = self.finish(rid, 90)
 
         self.assertEqual(rec.status, REC_STATUS_COMPLETED, self.event_types(rid))

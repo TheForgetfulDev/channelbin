@@ -1099,6 +1099,11 @@ NOT_ROW_SCALING = {
         'Serves one screenshot file from disk. Not a page and renders no rows.'),
     'recordings.live_thumbnail': (
         'Serves one JPEG for one recording. Not a page and renders no rows.'),
+    'recordings.recording_file': (
+        'Serves one recording\'s own file (dev/changelog/1312). Not a page and renders no rows.'),
+    'recordings.recording_file_check': (
+        'Opens one recording\'s file and answers with one JSON object about it. Not a page and '
+        'renders no rows.'),
 }
 
 

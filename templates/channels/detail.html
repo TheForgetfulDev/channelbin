@@ -199,35 +199,6 @@
 @media (min-width: 961px) {
   .menu button.menu-item.cd-phone-only { display: none; }
 }
-
-/* Live preview modal (static/js/channel-detail.js openPreview). The stage is the one
-   deliberately non-palette surface on the page: video letterboxes against the darkest
-   ground the palette has, never a mid-tone. A 16:9 box so the modal has its shape before
-   the first frame, and a phone's bottom sheet (style.css 9.6) does not jump when it lands. */
-.modal-panel.cd-preview-modal { max-width: 960px; }
-.cd-preview-stage {
-  position: relative;
-  aspect-ratio: 16 / 9;
-  background: var(--bg0);
-  border-radius: var(--radius-sm);
-  overflow: hidden;
-}
-.cd-preview-video { display: block; width: 100%; height: 100%; }
-.cd-preview-play {
-  position: absolute;
-  left: 50%;
-  top: 50%;
-  transform: translate(-50%, -50%);
-}
-.cd-preview-status {
-  margin-top: 10px;
-  font-size: var(--fs-sm);
-  color: var(--text-muted);
-  white-space: pre-line;
-  overflow-wrap: anywhere;
-}
-.cd-preview-status[data-kind="ok"] { color: var(--ok); }
-.cd-preview-status[data-kind="error"] { color: var(--bad); }
 </style>
 
 {# The channel's name is the page's one heading and the way back sits above it, the recording

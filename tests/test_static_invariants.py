@@ -4975,5 +4975,35 @@ class NativeConfirmDialogTests(unittest.TestCase):
             'with the action verb on its button (DESIGN.md 3.12 and 4, dev/changelog/1162)')
 
 
+class ClipboardBypassTests(unittest.TestCase):
+    """A copy is util.js::copyText(), never navigator.clipboard directly.
+
+    dev/docs/BUGS.md 2026-10-27, dev/changelog/1312. navigator.clipboard exists only in a
+    secure context, so on plain http to a LAN IP or hostname it is undefined and a direct call
+    throws before its .catch() can run - the recording page's Copy output path silently did
+    nothing there, and two pages carried their own fallback copies. copyText() owns the
+    fallback; this keeps a fourth copy from appearing.
+    """
+
+    _PATTERN = re.compile(r'navigator\s*\.\s*clipboard\b')
+    _COMMENTS = NativeConfirmDialogTests._COMMENTS
+    _HOME = os.path.join(JS_DIR, 'util.js')
+
+    def test_no_direct_clipboard_access(self):
+        offenders = []
+        paths = list(_walk(JS_DIR, '.js')) + list(_walk(TPL_DIR, '.html'))
+        for path in sorted(paths):
+            if os.path.abspath(path) == os.path.abspath(self._HOME):
+                continue
+            code = self._COMMENTS.sub(lambda m: re.sub(r'[^\n]', ' ', m.group(0)), _read(path))
+            for i, line in enumerate(code.splitlines()):
+                if self._PATTERN.search(line):
+                    offenders.append(f'{_rel(path)}:{i + 1}: {line.strip()}')
+        self.assertEqual(
+            offenders, [],
+            'navigator.clipboard used directly. Use util.js::copyText(), which works on a '
+            'plain-http origin too (dev/changelog/1312)')
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

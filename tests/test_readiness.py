@@ -489,7 +489,7 @@ class ReportTests(_AppCase):
                             'static', 'js', 'readiness.js')
         with open(path, encoding='utf-8') as fh:
             js = fh.read()
-        self.assertIn('writeText(state.data.report)', js)
+        self.assertIn('copyText(state.data.report)', js)
         self.assertNotIn('function reportText', js)
 
 

@@ -21,7 +21,7 @@ PLAYLIST_MIMETYPE = 'application/vnd.apple.mpegurl'
 SEGMENT_MIMETYPE = 'video/mp2t'
 
 
-def _urls(session_id: str) -> dict:
+def session_urls(session_id: str) -> dict:
     return {
         'status_url': url_for('preview.preview_status', session_id=session_id),
         'playlist_url': url_for('preview.preview_playlist', session_id=session_id),
@@ -35,7 +35,7 @@ def start_channel_preview(channel_id):
         session = preview.start_preview(channel_id)
     except preview.PreviewRefused as exc:
         return jsonify({'error': exc.message}), exc.status
-    return jsonify({'success': True, **session.to_dict(), **_urls(session.id)})
+    return jsonify({'success': True, **session.to_dict(), **session_urls(session.id)})
 
 
 @preview_bp.route('/api/channels/<int:channel_id>/screenshot', methods=['POST'])
@@ -92,7 +92,7 @@ def preview_status(session_id):
     session = preview.get_session(session_id)
     if session is None:
         return jsonify({'error': 'No such preview'}), 404
-    return jsonify({'success': True, **session.to_dict(), **_urls(session.id)})
+    return jsonify({'success': True, **session.to_dict(), **session_urls(session.id)})
 
 
 @preview_bp.route('/api/preview/<session_id>/stop', methods=['POST'])

@@ -1633,17 +1633,6 @@ function maskCreds(url) {
   return url;
 }
 
-function fallbackCopy(text, cb) {
-  const ta = document.createElement('textarea');
-  ta.value = text;
-  ta.style.cssText = 'position:fixed;opacity:0';
-  document.body.appendChild(ta);
-  ta.select();
-  document.execCommand('copy');
-  document.body.removeChild(ta);
-  cb();
-}
-
 function addSecondsToUtcIso(isoStr, seconds) {
   const d = new Date(isoStr + 'Z');
   d.setUTCSeconds(d.getUTCSeconds() + seconds);
@@ -3300,12 +3289,9 @@ document.addEventListener('DOMContentLoaded', function () {
   document.getElementById('modal-url-copy').addEventListener('click', function () {
     const raw = document.getElementById('modal-url').value;
     const btn = this;
-    const done = () => { btn.textContent = 'Copied!'; setTimeout(() => { btn.textContent = 'Copy'; }, 2000); };
-    if (navigator.clipboard && navigator.clipboard.writeText) {
-      navigator.clipboard.writeText(raw).then(done).catch(() => fallbackCopy(raw, done));
-    } else {
-      fallbackCopy(raw, done);
-    }
+    copyText(raw)
+      .then(() => { btn.textContent = 'Copied!'; setTimeout(() => { btn.textContent = 'Copy'; }, 2000); })
+      .catch((e) => showToast(e.message, { type: 'error' }));
   });
 
   // Modal form - intercept submit and stay on guide. Replace mode instead navigates to the

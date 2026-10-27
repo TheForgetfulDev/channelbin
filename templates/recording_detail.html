@@ -32,6 +32,9 @@
   </div>
   <div class="dh-actions">
     {% if rec.status in (REC_STATUS.IN_PROGRESS, REC_STATUS.PAUSED) %}
+      {#- Watching the capture as it is written, or what was captured before a pause
+          (dev/changelog/1316). -#}
+      {% if play_offer.play %}<button class="btn tip-plain" data-act="play" data-tip="Watch this recording as it is captured, or skip back into what it has so far.">Play</button>{% endif %}
       {% if rec.status == REC_STATUS.PAUSED %}
       <button class="btn" data-act="resume">&#9654; Resume</button>
       {% else %}
@@ -59,6 +62,7 @@
         </div>
       </div>
     {% elif rec.status == REC_STATUS.RETRYING %}
+      {% if play_offer.play %}<button class="btn tip-plain" data-act="play" data-tip="Watch what was captured before the stream dropped.">Play</button>{% endif %}
       <button class="btn btn-danger tip-plain" data-act="stop" data-tip="End the recording now, for good.&#10;Whatever was captured before the retry is joined into the final file.&#10;Can't be resumed.">&#9632; Stop</button>
       <div class="menu-wrap">
         <button class="btn btn-icon" data-menu>&#8943;</button>
@@ -98,6 +102,8 @@
       {% elif recover_act == 'retry-concat' %}
       <button class="btn btn-primary" data-act="retry-concat">Retry join</button>
       {% endif %}
+      {#- A kept .ts plays through the preview pipeline (dev/changelog/1314). -#}
+      {% if play_offer.play %}<button class="btn" data-act="play">Play</button>{% endif %}
       <a class="btn" href="{{ find_airing_url }}">&#8635; Record again</a>
       <div class="menu-wrap">
         <button class="btn btn-icon" data-menu>&#8943;</button>
@@ -106,6 +112,7 @@
           <button class="menu-item" data-secs-open>Customize sections...</button>
           <button class="menu-item" data-copy="{{ rec.url }}">Copy stream URL</button>
           {% if rec.output_path %}<button class="menu-item" data-copy="{{ rec.output_path }}">Copy output path</button>{% endif %}
+          {% if play_offer.download %}<button class="menu-item" data-act="download">Download file</button>{% endif %}
           {% if not ts_source_available and not segment_files_on_disk %}
           <button class="menu-item" data-act="retry-concat">Retry join</button>
           {% endif %}
@@ -120,6 +127,10 @@
           only place it lived (dev/changelog/1247). recover_act is 'retry-convert' or nothing
           on an ABORTED row. -#}
       {% if recover_act == 'retry-convert' %}<button class="btn btn-primary" data-act="retry-convert">Retry conversion</button>{% endif %}
+      {#- Play is the page's main action on a finished recording, unless a retry is promoted
+          beside it (dev/changelog/1312). Offered from the row alone: the file is first
+          touched when it is clicked. -#}
+      {% if play_offer.play %}<button class="btn{{ '' if (gaps_retry or recover_act == 'retry-convert') else ' btn-primary' }}" data-act="play">Play</button>{% endif %}
       <div class="menu-wrap">
         <button class="btn btn-icon" data-menu>&#8943;</button>
         <div class="menu">
@@ -128,6 +139,7 @@
           <a href="{{ find_airing_url }}">Record again</a>
           <button class="menu-item" data-copy="{{ rec.url }}">Copy stream URL</button>
           {% if rec.output_path %}<button class="menu-item" data-copy="{{ rec.output_path }}">Copy output path</button>{% endif %}
+          {% if play_offer.download %}<button class="menu-item" data-act="download">Download file</button>{% endif %}
           {% if ts_source_available and recover_act != 'retry-convert' %}<button class="menu-item" data-act="retry-convert">Retry conversion</button>{% endif %}
           <div class="sep"></div>
           <button class="menu-item danger" data-act="delete">Delete recording</button>
@@ -175,6 +187,9 @@
     <div class="menu-wrap">
       <button class="btn btn-icon" data-menu>&#8943;</button>
       <div class="menu pop-up">
+        {#- The bar's two slots stay Pause/Resume and Stop (DESIGN.md 9.5); Play leads the
+            kebab (dev/changelog/1316). -#}
+        {% if play_offer.play %}<button class="menu-item" data-act="play">Play</button>{% endif %}
         {% if rec.status == REC_STATUS.IN_PROGRESS and rec.group_id %}
         <button class="menu-item" data-act="switch">Switch channel...</button>
         {% endif %}
@@ -193,6 +208,7 @@
     <div class="menu-wrap">
       <button class="btn btn-icon" data-menu>&#8943;</button>
       <div class="menu pop-up">
+        {% if play_offer.play %}<button class="menu-item" data-act="play">Play</button>{% endif %}
         <button class="menu-item" data-act="block">Block accounts...</button>
         <div class="sep"></div>
         <a href="{{ url_for('logs.logs_page') }}">View log lines</a>
@@ -232,6 +248,8 @@
         <button class="menu-item" data-secs-open>Customize sections...</button>
         <button class="menu-item" data-copy="{{ rec.url }}">Copy stream URL</button>
         {% if rec.output_path %}<button class="menu-item" data-copy="{{ rec.output_path }}">Copy output path</button>{% endif %}
+        {% if play_offer.play %}<button class="menu-item" data-act="play">Play</button>{% endif %}
+        {% if play_offer.download %}<button class="menu-item" data-act="download">Download file</button>{% endif %}
         {% if not recover_act %}
         {% if not ts_source_available and not segment_files_on_disk %}<button class="menu-item" data-act="retry-concat">Retry join</button>{% endif %}
         {% else %}
@@ -241,27 +259,27 @@
       </div>
     </div>
   {% elif rec.status in (REC_STATUS.COMPLETED, REC_STATUS.ABORTED) %}
-    {#- A kept source to convert again from outranks re-recording, as on a FAILED row:
-        the gaps retry on a finished one, the plain retry on a cancelled one whose joined
-        .ts was kept (dev/changelog/1247). Within the bar's two-button budget (9.5), Delete
-        steps into the kebab when a retry is promoted, as the FAILED bar does. -#}
+    {#- The bar holds two of, in this order: a promoted retry (a kept source to convert again
+        from, as on a FAILED row - dev/changelog/1247), Play, Delete. What does not fit goes
+        to the kebab. Record again lives in the kebab: re-recording a finished program is
+        rare, and with it in the bar a first-time tester read the red Delete beside it as
+        the page's main action (DESIGN.md 9.5, dev/changelog/1312). -#}
     {% set promoted_retry = 'retry-convert-gaps' if gaps_retry else ('retry-convert' if recover_act == 'retry-convert' else none) %}
-    {% if promoted_retry %}
-    <button class="btn btn-primary" data-act="{{ promoted_retry }}">Retry conversion</button>
-    <a class="btn" href="{{ find_airing_url }}">&#8635; Record again</a>
-    {% else %}
-    <a class="btn" href="{{ find_airing_url }}">&#8635; Record again</a>
-    <button class="btn btn-danger" data-act="delete">Delete</button>
-    {% endif %}
+    {% set delete_in_bar = not (promoted_retry and play_offer.play) %}
+    {% if promoted_retry %}<button class="btn btn-primary" data-act="{{ promoted_retry }}">Retry conversion</button>{% endif %}
+    {% if play_offer.play %}<button class="btn{{ '' if promoted_retry else ' btn-primary' }}" data-act="play">Play</button>{% endif %}
+    {% if delete_in_bar %}<button class="btn btn-danger" data-act="delete">Delete</button>{% endif %}
     <div class="menu-wrap">
       <button class="btn btn-icon" data-menu>&#8943;</button>
       <div class="menu pop-up">
         <a href="{{ url_for('logs.logs_page') }}">View log lines</a>
         <button class="menu-item" data-secs-open>Customize sections...</button>
+        <a href="{{ find_airing_url }}">Record again</a>
         <button class="menu-item" data-copy="{{ rec.url }}">Copy stream URL</button>
         {% if rec.output_path %}<button class="menu-item" data-copy="{{ rec.output_path }}">Copy output path</button>{% endif %}
+        {% if play_offer.download %}<button class="menu-item" data-act="download">Download file</button>{% endif %}
         {% if ts_source_available and promoted_retry != 'retry-convert' %}<button class="menu-item" data-act="retry-convert">Retry conversion</button>{% endif %}
-        {% if promoted_retry %}
+        {% if not delete_in_bar %}
         <div class="sep"></div>
         <button class="menu-item danger" data-act="delete">Delete recording</button>
         {% endif %}
@@ -1339,6 +1357,8 @@ window.onScheduleSaved = () => window.location.reload();
 </script>
 <script src="{{ url_for('static', filename='js/guide.js') }}"></script>
 <script src="{{ url_for('static', filename='js/recording-switch.js') }}"></script>
+<script src="{{ url_for('static', filename='js/recording-player.js') }}"
+        data-hls-js="{{ url_for('static', filename='vendor/hls.js/hls.light.min.js') }}"></script>
 <script>
 (() => {
   const RID = {{ rec.id }};
@@ -1446,8 +1466,9 @@ window.onScheduleSaved = () => window.location.reload();
   document.addEventListener('click', (e) => {
     const copyBtn = e.target.closest('[data-copy]');
     if (copyBtn) {
-      navigator.clipboard.writeText(copyBtn.dataset.copy);
-      showToast('Copied to clipboard');
+      copyText(copyBtn.dataset.copy)
+        .then(() => showToast('Copied to clipboard'))
+        .catch((err) => showToast(err.message, { type: 'error' }));
       return;
     }
     const btn = e.target.closest('[data-act]');
