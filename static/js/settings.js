@@ -292,9 +292,9 @@
             label: 'Copy', class: 'btn', onClick: () => {
               const el = body.querySelector('#ha-key-value');
               el.select();
-              navigator.clipboard.writeText(el.value)
+              copyText(el.value)
                 .then(() => toast('Copied'))
-                .catch(() => toast('Copy failed - clipboard access was denied', true));
+                .catch((e) => toast(e.message, true));
               return false;
             },
           },

@@ -97,8 +97,15 @@ report a problem, this is what to copy.
 - **Switch channel** moves a running recording to another copy of the channel in its group.
 - **Abort** (in the **⋯** menu) kills the recording and discards what it captured. Use Stop
   unless you really do not want the file.
-- **Copy output path** gives you the file's location on disk. ChannelBin cannot play or
-  download a finished recording from the browser yet.
+- **Play** on a finished recording plays its file in the browser. A converted MP4 plays with
+  the browser's own controls for pausing and skipping. A recording kept as a `.ts` or `.mkv`
+  file - and a failed or cancelled one whose file was kept - is repackaged for the browser as
+  it plays, so it gets a position bar and skip buttons of its own under the picture, and each
+  skip takes a moment to start again at the new spot. If the drive holding your recordings has
+  spun down to save power, the first few seconds are spent waiting for it to wake, and the
+  player says so.
+- **Download file** (in the **⋯** menu) saves the recording's file to your computer.
+  **Copy output path** gives you the file's location on disk.
 - **Record again** on a finished recording, and **Find another airing** on one that went
   wrong, open a Programs search for the same title, so you can pick another showing on any of
   your channels.

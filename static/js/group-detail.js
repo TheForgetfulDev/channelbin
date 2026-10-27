@@ -3370,10 +3370,10 @@
       const rows = [...el.children].filter(r => !r.classList.contains('gd-log-empty'));
       if (!rows.length) { showToast('Nothing to copy.', { type: 'error' }); return; }
       try {
-        await navigator.clipboard.writeText(rows.map(r => r.textContent).join('\n'));
+        await copyText(rows.map(r => r.textContent).join('\n'));
         showToast(`Copied ${plural(rows.length, 'log line')}.`);
       } catch (err) {
-        showToast('Copy failed - clipboard access was denied.', { type: 'error' });
+        showToast(err.message, { type: 'error' });
       }
     });
   }

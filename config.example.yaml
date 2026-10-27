@@ -428,7 +428,8 @@ preview:
   # into a rolling HLS window on local disk and the browser plays it. Video is never
   # re-encoded; audio is converted to AAC only when the browser cannot decode it. A
   # preview holds one of the account's connections and gives it up to any recording that
-  # needs it. One preview at a time.
+  # needs it. One preview at a time. A recording's .ts or .mkv played from its page goes
+  # through the same window, takes no connection, and is not limited by max_seconds.
   segment_seconds: 2                     # HLS segment length; the stream's keyframe interval is the floor
   idle_timeout_seconds: 15               # stop when nothing has fetched the playlist for this long (a closed tab)
   max_seconds: 600                       # hard cap on one preview - it is a look, not a viewer

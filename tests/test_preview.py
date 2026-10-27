@@ -27,7 +27,9 @@ import app.connection_limits as connlim  # noqa: E402
 import app.preview as preview  # noqa: E402
 from app import db  # noqa: E402
 from app.config import load_config  # noqa: E402
-from app.proc_utils import build_capture_cmd, build_preview_cmd, input_args  # noqa: E402
+from app.proc_utils import (build_capture_cmd, build_file_playback_cmd,  # noqa: E402
+                            build_preview_cmd, input_args)
+from tests.support.seed import make_recording  # noqa: E402
 
 _HAVE_FFMPEG = shutil.which('ffmpeg') is not None
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -78,6 +80,71 @@ class BuildPreviewCmdTests(unittest.TestCase):
         self.assertIn('-reconnect', input_args(_CFG, 'http://h/a', pace_realtime=False))
         self.assertIn('-re', input_args(_CFG, '/f.ts', pace_realtime=True))
         self.assertNotIn('-re', input_args(_CFG, '/f.ts', pace_realtime=False))
+
+
+class BuildFilePlaybackCmdTests(unittest.TestCase):
+    """dev/changelog/1314: a recording's file through the preview's window."""
+
+    def test_input_half_is_a_files_never_a_streams(self):
+        cmd = build_file_playback_cmd(_CFG, '/dvr/a b:c.ts', '/x', offset=3600)
+        joined = ' '.join(cmd)
+        for flag in ('-user_agent', '-reconnect', '-rw_timeout', '-re '):
+            self.assertNotIn(flag, joined)
+        # Paced to real time after a burst, so a viewer never reads the share faster than
+        # they watch.
+        self.assertIn('-readrate 1 -readrate_initial_burst', joined)
+        # Input seek: -ss before -i, and a colon in the path is never a protocol.
+        self.assertLess(cmd.index('-ss'), cmd.index('-i'))
+        self.assertEqual(cmd[cmd.index('-ss') + 1], '3600.000')
+        self.assertEqual(cmd[cmd.index('-i') + 1], 'file:/dvr/a b:c.ts')
+
+    def test_output_timestamps_are_positions_in_the_recording(self):
+        """Measured: without the zero mux delay the muxer adds 1.4 s, without -copyts the
+        output restarts at zero - either way the player cannot tell where it landed."""
+        joined = ' '.join(build_file_playback_cmd(_CFG, '/a.ts', '/x', offset=10))
+        self.assertIn('-copyts -start_at_zero -muxdelay 0 -muxpreload 0', joined)
+
+    def test_a_file_playlist_ends_with_the_file(self):
+        joined = ' '.join(build_file_playback_cmd(_CFG, '/a.ts', '/x'))
+        self.assertNotIn('omit_endlist', joined)
+        self.assertIn('delete_segments', joined)
+
+    def test_offset_zero_does_not_seek(self):
+        self.assertNotIn('-ss', build_file_playback_cmd(_CFG, '/a.ts', '/x', offset=0))
+
+    def test_output_half_is_the_channel_previews(self):
+        """One window for both sources, so a browser receives a file as it receives a channel;
+        only the channel's never-ending playlist differs."""
+        def tail(cmd):
+            out = cmd[cmd.index('-map'):]
+            flags = out.index('-hls_flags') + 1
+            out[flags] = out[flags].replace('+omit_endlist', '')
+            return out
+        for transcode in (False, True):
+            self.assertEqual(
+                tail(build_file_playback_cmd(_CFG, '/a.ts', '/x', transcode_audio=transcode,
+                                             list_size=6)),
+                tail(build_preview_cmd(_CFG, 'http://h/1', '/x', transcode_audio=transcode)))
+        self.assertNotIn('libx264', ' '.join(build_file_playback_cmd(_CFG, '/a.ts', '/x')))
+
+
+    def test_following_a_segment_being_written(self):
+        """dev/changelog/1316: read past the end of the file, from an input seek, paced like a
+        finished file so a follower behind live never reads the share faster than it plays."""
+        cmd = build_file_playback_cmd(_CFG, '/dvr/seg.ts', '/x', offset=30, follow=True)
+        joined = ' '.join(cmd)
+        self.assertLess(cmd.index('-follow'), cmd.index('-i'))
+        self.assertEqual(cmd[cmd.index('-follow') + 1], '1')
+        self.assertIn('-readrate 1 -readrate_initial_burst', joined)
+        self.assertEqual(cmd[cmd.index('-ss') + 1], '30.000')
+        # -sseof landed past what a young file held and then never produced a segment.
+        self.assertNotIn('-sseof', joined)
+        # The playlist never ends - neither does the file, as far as ffmpeg knows.
+        self.assertIn('omit_endlist', joined)
+        self.assertIn('-copyts -start_at_zero -muxdelay 0 -muxpreload 0', joined)
+
+    def test_only_a_follower_follows(self):
+        self.assertNotIn('-follow', build_file_playback_cmd(_CFG, '/a.ts', '/x'))
 
 
 class AudioPolicyTests(unittest.TestCase):
@@ -402,6 +469,373 @@ class RouteGuardTests(_Live):
         resp = self.client.post('/api/channels/999999/preview')
         self.assertEqual(resp.status_code, 404)
         self.assertIn('error', resp.get_json())
+
+
+def _first_pts(data: bytes, tmpdir: str) -> float:
+    """The earliest packet timestamp in one served segment."""
+    path = os.path.join(tmpdir, 'probe-seg.ts')
+    with open(path, 'wb') as fh:
+        fh.write(data)
+    out = subprocess.run(['ffprobe', '-v', 'error', '-show_entries', 'packet=pts_time',
+                          '-read_intervals', '%+#10', '-of', 'csv=p=0', path],
+                         capture_output=True, text=True, timeout=30).stdout
+    return min(float(x.strip(',')) for x in out.split() if x.strip(',') not in ('', 'N/A'))
+
+
+@unittest.skipUnless(_HAVE_FFMPEG, 'ffmpeg not available')
+class FileSessionTests(_Live):
+    """A recording's finished file played through the preview pipeline (dev/changelog/1314).
+
+    What these prove with a real ffmpeg: the file session takes no provider connection, a
+    seek finishes the old session (ffmpeg dead, directory gone) before the new ffmpeg starts,
+    the output's timestamps are positions in the recording, the end of the file is named and
+    is not the end of the session, and every other way it ends says why."""
+
+    def setUp(self):
+        super().setUp()
+        self.dvr = os.path.join(self.t._tmpdir, 'dvr')
+        os.makedirs(self.dvr, exist_ok=True)
+        self.file = os.path.join(self.dvr, 'Race day.ts')
+        shutil.copyfile(self.clip, self.file)
+
+    def _rec(self, path=None, status='COMPLETED', acodec='aac', duration=None, vcodec='h264'):
+        rec = make_recording(status=status, name='Race day', output_path=path or self.file,
+                             recorded_video_codec=vcodec, recorded_audio_codec=acodec,
+                             recorded_duration_seconds=(self.CLIP_SECONDS if duration is None
+                                                        else duration or None))
+        db.session.commit()
+        return rec
+
+    def _play(self, rec, offset=0):
+        return self.client.post(f'/api/recordings/{rec.id}/playback', json={'offset': offset})
+
+    def _file_session(self, offset=0, path=None):
+        return preview.start_file_playback(1, 'Race day', path or self.file, offset,
+                                           transcode_audio=False)
+
+    def test_plays_from_the_offset_and_takes_no_connection(self):
+        rec = self._rec()
+        resp = self._play(rec, 20)
+        self.assertEqual(resp.status_code, 200, resp.get_json())
+        data = resp.get_json()
+        sid = data['session_id']
+        self.assertEqual((data['source'], data['recording_id'], data['offset']), ('file', rec.id, 20))
+        self.assertIsNone(data['max_seconds'])
+        self.assertNotIn(self.file, resp.get_data(as_text=True))
+        self.assertEqual(connlim._holders.get(self.account.id, []), [])
+        self.assertFalse(any(h for hs in connlim._holders.values() for h in hs if h[1] == sid))
+        self._wait_state(sid, preview.STATE_READY)
+
+        body = self.client.get(data['playlist_url']).get_data(as_text=True)
+        seg_name = re.search(r'^(seg\d{5}\.ts)$', body, re.M).group(1)
+        seg = self.client.get(f'/api/preview/{sid}/{seg_name}').get_data()
+        # The output's timestamps ARE positions in the recording: the first segment starts
+        # where the seek landed - the keyframe at 20 s in this 1 s-GOP clip, audio a little
+        # before it. A mux delay left in would put it 1.4 s later.
+        first = _first_pts(seg, self.tmp)
+        self.assertGreater(first, 19.0)
+        self.assertLess(first, 20.6)
+        self.client.post(data['stop_url'])
+
+    def test_a_seek_finishes_the_old_session_before_the_new_ffmpeg_starts(self):
+        first = self._file_session(0)
+        self._wait_state(first.id, preview.STATE_READY)
+        seen = {}
+        real_popen = subprocess.Popen
+
+        def popen(*args, **kwargs):
+            seen['old_ffmpeg_exit'] = first.proc.poll()
+            seen['old_dir_exists'] = os.path.exists(first.dir)
+            seen['old_state'] = first.state
+            return real_popen(*args, **kwargs)
+        with mock.patch.object(preview.subprocess, 'Popen', side_effect=popen):
+            second = self._file_session(25)
+        self.assertIsNotNone(seen['old_ffmpeg_exit'], 'two ffmpegs would read the file at once')
+        self.assertFalse(seen['old_dir_exists'])
+        self.assertEqual(seen['old_state'], preview.STATE_STOPPED)
+        self.assertEqual(first.reason, preview.REASON_REPLACED)
+        self.assertIn('another playback', first.reason_text())
+        self.assertEqual(preview.live_session().id, second.id)
+
+    def test_the_end_of_the_file_is_named_and_the_player_can_finish(self):
+        with self._config_with(idle_timeout_seconds=1):
+            session = self._file_session(self.CLIP_SECONDS - 3)
+        self.assertTrue(_wait(lambda: session.source_done, 15.0), session.to_dict())
+        # ffmpeg is done; the session is not - the player still has segments to fetch.
+        self.assertTrue(session.live)
+        self.assertEqual(session.state, preview.STATE_READY)
+        with open(session.playlist_path, encoding='utf-8') as fh:
+            self.assertIn('#EXT-X-ENDLIST', fh.read())
+        self.assertTrue(_wait(lambda: not session.live, 8.0))
+        self.assertEqual(session.reason, preview.REASON_FILE_END)
+        self.assertFalse(os.path.exists(session.dir))
+
+    def test_an_offset_past_the_end_says_so(self):
+        session = self._file_session(self.CLIP_SECONDS + 60)
+        self.assertTrue(_wait(lambda: not session.live, 15.0))
+        self.assertEqual(session.reason, preview.REASON_PAST_END)
+        self.assertIn('past the end', session.reason_text())
+
+    def test_a_file_that_cannot_be_read_shows_ffmpegs_error(self):
+        session = self._file_session(0, path=os.path.join(self.dvr, 'gone.ts'))
+        self.assertTrue(_wait(lambda: not session.live, 15.0))
+        self.assertEqual(session.reason, preview.REASON_READ_FAILED)
+        self.assertIn('No such file or directory', session.detail)
+        self.assertIn('gone.ts', session.detail)
+
+    def test_no_hard_cap(self):
+        """preview.max_seconds bounds a provider connection; a file session holds none and
+        ends at the end of the file by itself."""
+        with self._config_with(max_seconds=1):
+            session = self._file_session(0)
+        self._wait_state(session.id, preview.STATE_READY)
+        for _ in range(6):
+            self.assertIsNotNone(preview.touch_playlist(session.id))
+            time.sleep(0.5)
+        self.assertTrue(session.live, f'{session.reason} {session.detail}')
+
+    def test_nobody_watching_stops_it_by_name(self):
+        with self._config_with(idle_timeout_seconds=1):
+            session = self._file_session(0)
+        self.assertTrue(_wait(lambda: not session.live, 15.0))
+        self.assertEqual(session.reason, preview.REASON_IDLE)
+        self.assertIn('this recording', session.reason_text())
+        self.assertIsNotNone(session.proc.poll())
+
+    def test_a_recording_cannot_preempt_it_and_it_holds_nothing_to_release(self):
+        session = self._file_session(0)
+        self.assertFalse(preview.preempt_for_account(self.account.id))
+        self.assertTrue(session.live)
+        with mock.patch.object(preview.connlim, 'release') as release:
+            preview.stop_preview(session.id)
+        release.assert_not_called()
+
+    def test_shutdown_kills_it(self):
+        session = self._file_session(0)
+        preview.kill_all_previews()
+        self.assertEqual(session.reason, preview.REASON_SHUTDOWN)
+        self.assertIsNotNone(session.proc.poll())
+        self.assertFalse(os.path.exists(session.dir))
+
+    def test_one_watched_session_across_both_sources(self):
+        channel_sid = self._start().get_json()['session_id']
+        file_session = self._file_session(0)
+        self.assertEqual(preview.get_session(channel_sid).reason, preview.REASON_REPLACED)
+        self.assertEqual(self._holders(), [])
+        again = self._start().get_json()['session_id']
+        self.assertEqual(file_session.reason, preview.REASON_REPLACED)
+        self.client.post(f'/api/preview/{again}/stop')
+
+    def test_audio_a_browser_lacks_is_re_encoded(self):
+        data = self._play(self._rec(acodec='ac3')).get_json()
+        self.assertTrue(data['transcode_audio'])
+        self.client.post(data['stop_url'])
+        data = self._play(self._rec(acodec='aac')).get_json()
+        self.assertFalse(data['transcode_audio'])
+        self.client.post(data['stop_url'])
+
+    def test_an_mkv_plays_too(self):
+        mkv = os.path.join(self.dvr, 'Race day.mkv')
+        subprocess.run(['ffmpeg', '-v', 'error', '-y', '-i', self.clip, '-c', 'copy', mkv],
+                       check=True, timeout=60)
+        data = self._play(self._rec(path=mkv), 5).get_json()
+        self._wait_state(data['session_id'], preview.STATE_READY)
+        self.assertIn('#EXTINF', self.client.get(data['playlist_url']).get_data(as_text=True))
+        self.client.post(data['stop_url'])
+
+    def test_a_kept_ts_on_a_failed_recording_plays(self):
+        data = self._play(self._rec(status='FAILED')).get_json()
+        self.assertEqual(data.get('source'), 'file', data)
+        self.client.post(data['stop_url'])
+
+
+class _FakeCapture:
+    """The one thing a follower reads from the recorder: its live state and segment number."""
+
+    def __init__(self, segment):
+        self.current_segment_num = segment
+
+
+@unittest.skipUnless(_HAVE_FFMPEG, 'ffmpeg not available')
+class FollowerTests(_Live):
+    """A session following the segment the recorder is writing (dev/changelog/1316), with a
+    real ffmpeg writing a real .ts at real time beside it. What these prove: the follower
+    plays a file that is still growing, ends by name the moment the recorder moves to another
+    segment or stops, dies at once rather than after the terminate grace, and a new follower
+    on the next segment plays - the player's way across a segment change."""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        # A capture's ffmpeg writes in 256 KiB blocks, and a follower needs a few before its
+        # first segment; at the shared clip's ~270 kbps that is 20 s. 2 Mbps is a block a
+        # second, closer to a real channel.
+        cls.dense = os.path.join(cls.tmp, 'dense.ts')
+        subprocess.run(
+            ['ffmpeg', '-v', 'error', '-y',
+             '-f', 'lavfi', '-i', 'testsrc2=size=640x360:rate=30',
+             '-f', 'lavfi', '-i', 'sine=frequency=440:sample_rate=48000',
+             '-t', '30', '-c:v', 'libx264', '-preset', 'ultrafast', '-b:v', '2M',
+             '-g', '30', '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-f', 'mpegts', cls.dense],
+            check=True, timeout=180)
+
+    def setUp(self):
+        super().setUp()
+        self.dvr = os.path.join(self.t._tmpdir, 'dvr')
+        os.makedirs(self.dvr, exist_ok=True)
+        self.state = _FakeCapture(1)
+        self.live_state = self.state
+        patcher = mock.patch('app.recorder.get_state', side_effect=lambda rid: self.live_state)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _writer(self, name, seconds=30):
+        path = os.path.join(self.dvr, name)
+        proc = subprocess.Popen(['ffmpeg', '-v', 'error', '-re', '-i', self.dense, '-t', str(seconds),
+                                 '-c', 'copy', '-f', 'mpegts', '-y', path],
+                                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL)
+        self.addCleanup(lambda: (proc.kill(), proc.wait()))
+        self.assertTrue(_wait(lambda: os.path.exists(path) and os.path.getsize(path) > 0, 15))
+        return path, proc
+
+    def _follow(self, path, segment, base=0.0, offset=0):
+        place = preview.CapturePlace(segment_number=segment, base=base,
+                                     follow_state=self.state, live=True)
+        return preview.start_file_playback(1, 'Race day', path, offset, transcode_audio=False,
+                                           capture=place)
+
+    def test_follows_a_growing_file_and_moves_with_the_segment(self):
+        seg1, _ = self._writer('race_1_seg_001.ts')
+        first = self._follow(seg1, 1)
+        self.assertTrue(first.following)
+        self._wait_state(first.id, preview.STATE_READY)
+        listed = preview._listed_segments(first.playlist_path)
+        self.assertTrue(_wait(lambda: len(preview._listed_segments(first.playlist_path))
+                              > len(listed), 10), 'the window must grow as the file does')
+        with open(first.playlist_path, encoding='utf-8') as fh:
+            self.assertNotIn('#EXT-X-ENDLIST', fh.read())
+
+        # The recorder moves on: segment 2 starts, and the follower on 1 ends by name.
+        seg2, _ = self._writer('race_1_seg_002.ts')
+        moved = time.monotonic()
+        self.state.current_segment_num = 2
+        self.assertTrue(_wait(lambda: not first.live, 5))
+        self.assertEqual(first.reason, preview.REASON_SEGMENT_CHANGED)
+        self.assertIn('segment 2', first.detail)
+        self.assertIsNotNone(first.proc.poll())
+        self.assertFalse(os.path.exists(first.dir))
+        # Killed outright: a follower ignores the one SIGTERM, which would cost the 5 s grace.
+        self.assertLess(time.monotonic() - moved, 3.0)
+
+        second = self._follow(seg2, 2, base=12.0)
+        self._wait_state(second.id, preview.STATE_READY)
+        self.assertEqual(second.to_dict()['capture'],
+                         {'segment_number': 2, 'base': 12.0, 'span_end': None, 'live': True})
+
+        # The capture stops (stop, pause, retry, failure: the recorder drops its state).
+        self.live_state = None
+        self.assertTrue(_wait(lambda: not second.live, 5))
+        self.assertEqual(second.reason, preview.REASON_CAPTURE_STOPPED)
+        self.assertIsNotNone(second.proc.poll())
+
+    def test_a_capture_that_writes_nothing_is_named_not_waited_on_forever(self):
+        stalled = os.path.join(self.dvr, 'race_1_seg_001.ts')
+        with open(stalled, 'wb') as fh:
+            fh.write(b'\0' * 188)
+        with self._config_with(connect_timeout_seconds=1), \
+                mock.patch.object(preview, 'FOLLOW_START_SECONDS', 2):
+            session = self._follow(stalled, 1)
+        self.assertTrue(_wait(lambda: not session.live, 10))
+        self.assertEqual(session.reason, preview.REASON_CONNECT_TIMEOUT)
+        self.assertIn('the capture wrote nothing', session.reason_text())
+
+    def test_a_follower_gets_longer_than_a_channel_to_start(self):
+        seg, _ = self._writer('race_1_seg_001.ts')
+        with self._config_with(connect_timeout_seconds=20):
+            session = self._follow(seg, 1)
+        self.assertEqual(session.connect_timeout, preview.FOLLOW_START_SECONDS)
+
+    def test_a_resumed_recording_is_a_new_capture(self):
+        """Pause then Resume makes a new live state; a follower on the old one has nothing
+        left to follow even though the segment number may read the same."""
+        seg, _ = self._writer('race_1_seg_001.ts')
+        session = self._follow(seg, 1)
+        self.live_state = _FakeCapture(1)
+        self.assertTrue(_wait(lambda: not session.live, 5))
+        self.assertEqual(session.reason, preview.REASON_CAPTURE_STOPPED)
+
+    def test_a_follower_waiting_at_the_end_of_a_finished_file_stops_at_once(self):
+        seg, writer = self._writer('race_1_seg_001.ts', seconds=6)
+        session = self._follow(seg, 1)
+        self._wait_state(session.id, preview.STATE_READY)
+        writer.wait(timeout=15)
+        time.sleep(1)                      # at the end of the file, waiting for more
+        began = time.monotonic()
+        preview.stop_preview(session.id)
+        self.assertLess(time.monotonic() - began, 2.0)
+        self.assertIsNotNone(session.proc.poll())
+
+    def test_shutdown_kills_a_follower(self):
+        seg, _ = self._writer('race_1_seg_001.ts')
+        session = self._follow(seg, 1)
+        preview.kill_all_previews()
+        self.assertEqual(session.reason, preview.REASON_SHUTDOWN)
+        self.assertIsNotNone(session.proc.poll())
+        self.assertFalse(os.path.exists(session.dir))
+
+
+class FilePlaybackRouteRefusalTests(_Live):
+    """What POST /api/recordings/<id>/playback refuses, without starting anything."""
+
+    def setUp(self):
+        super().setUp()
+        self.dvr = os.path.join(self.t._tmpdir, 'dvr')
+        os.makedirs(self.dvr, exist_ok=True)
+
+    def _rec(self, name='a.ts', status='COMPLETED', duration=40.0, folder=None):
+        path = os.path.join(folder or self.dvr, name)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, 'wb') as fh:
+            fh.write(b'\0' * 188)
+        rec = make_recording(status=status, name='Race day', output_path=path,
+                             recorded_video_codec='h264', recorded_audio_codec='aac',
+                             recorded_duration_seconds=duration)
+        db.session.commit()
+        return rec
+
+    def _play(self, rec, body):
+        resp = self.client.post(f'/api/recordings/{rec.id}/playback', json=body)
+        return resp.status_code, resp.get_json()
+
+    def test_refusals_start_nothing(self):
+        mp4 = self._rec('a.mp4')
+        ts = self._rec('a.ts')
+        outside = self._rec('b.ts', folder=os.path.join(self.t._tmpdir, 'not-dvr'))
+        cases = [
+            (mp4, {'offset': 0}, 409, "browser's own player"),
+            (ts, {'offset': -1}, 400, '0 or more'),
+            (ts, {'offset': 'soon'}, 400, 'number of seconds'),
+            (ts, {'offset': float('inf')}, 400, '0 or more'),
+            (ts, {'offset': 40}, 400, 'past the end of the recording (40s)'),
+            (outside, {'offset': 0}, 403, 'outside the recording folder'),
+        ]
+        for rec, body, code, words in cases:
+            with self.subTest(body=body, path=rec.output_path):
+                got, data = self._play(rec, body)
+                self.assertEqual(got, code, data)
+                self.assertIn(words, data['error'])
+        self.assertIsNone(preview.live_session())
+        self.assertEqual(self.client.post('/api/recordings/987654/playback', json={}).status_code,
+                         404)
+
+    def test_the_check_tells_the_player_which_route_and_how_long(self):
+        rec = self._rec('a.ts', duration=7236.9)
+        data = self.client.get(f'/recordings/{rec.id}/file/check').get_json()
+        self.assertTrue(data['pipeline'])
+        self.assertFalse(data['native'])
+        self.assertEqual(data['duration'], 7236.9)
+        self.assertEqual(data['playback_url'], f'/api/recordings/{rec.id}/playback')
 
 
 if __name__ == '__main__':

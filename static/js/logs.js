@@ -337,10 +337,10 @@
     if (!rows.length) { showToast('Nothing to copy.', { type: 'error' }); return; }
     const text = rows.map((r) => [...r.children].map((c) => c.textContent).join('  ')).join('\n');
     try {
-      await navigator.clipboard.writeText(text);
+      await copyText(text);
       showToast(`Copied ${rows.length.toLocaleString()} log line${rows.length === 1 ? '' : 's'}.`);
     } catch (e) {
-      showToast('Copy failed - clipboard access was denied.', { type: 'error' });
+      showToast(e.message, { type: 'error' });
     }
   });
 

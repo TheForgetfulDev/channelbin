@@ -5,6 +5,23 @@ Notable changes to ChannelBin, newest first. This project follows
 release is tagged `v<version>` in git, and the version the app is running is shown in the
 page footer.
 
+## 0.32.0 - 2026-10-27
+
+Play your recordings in the browser.
+
+**Added**
+
+- Recordings can now be played in your browser. This is not intended to replace a proper
+  media player, but it can be used to preview your recordings.
+- Completed recordings also have an option to download the file.
+- In progress recordings can be watched while it records. You can play anywhere from the
+  beginning of the file up to ~10 seconds behind live.
+
+**Fixed**
+
+- Copy to clipboard works on pages served over plain http, where it silently did nothing
+  before.
+
 ## 0.31.0 - 2026-10-27
 
 Recording numbers that agree.

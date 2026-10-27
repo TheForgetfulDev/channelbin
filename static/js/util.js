@@ -1436,6 +1436,116 @@ function openLightbox(src, alt = 'Screenshot') {
   syncScrollLock();
 }
 
+// Copy text to the clipboard. Resolves once copied, rejects when the browser refused both ways.
+// navigator.clipboard exists only in a secure context - https or localhost - so on plain http
+// to a LAN IP or hostname it is undefined, and calling it throws before any .catch() can run:
+// the copy silently did nothing (dev/docs/BUGS.md 2026-08-09). The textarea + execCommand path
+// works on any origin. The one copy helper; nothing else touches navigator.clipboard.
+function copyText(text) {
+  const legacy = () => new Promise((resolve, reject) => {
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.setAttribute('readonly', '');
+    ta.style.cssText = 'position:fixed;opacity:0';
+    document.body.appendChild(ta);
+    ta.select();
+    let ok = false;
+    try { ok = document.execCommand('copy'); } catch (_) { ok = false; }
+    ta.remove();
+    if (ok) resolve(); else reject(new Error('Copy failed - the browser blocked clipboard access.'));
+  });
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    return navigator.clipboard.writeText(text).catch(legacy);
+  }
+  return legacy();
+}
+
+// The one video player (DESIGN.md 3.18): a 16:9 stage on the darkest ground, a Play button that
+// appears only when the browser will not start sound by itself, and a status line that names
+// what is happening. The channel preview (static/js/channel-detail.js) and the recording page's
+// player (static/js/recording-player.js) both build theirs here; each owns its source.
+function buildPlayerStage() {
+  const el = document.createElement('div');
+  el.innerHTML = `
+    <div class="player-stage">
+      <video class="player-video" playsinline controls></video>
+      <button type="button" class="btn btn-primary player-play" hidden>Play</button>
+    </div>
+    <div class="player-status" role="status"></div>`;
+  const video = el.querySelector('video');
+  const playBtn = el.querySelector('.player-play');
+  const statusEl = el.querySelector('.player-status');
+  const setStatus = (text, kind = '') => {
+    statusEl.textContent = text;
+    statusEl.dataset.kind = kind;
+  };
+  const tryPlay = () => {
+    const p = video.play();
+    if (!p || !p.catch) return;
+    p.then(() => { playBtn.hidden = true; })
+      .catch((err) => {
+        if (err && err.name === 'NotAllowedError') {
+          playBtn.hidden = false;
+          setStatus('Ready - press Play. The browser would not start sound on its own.');
+        }
+      });
+  };
+  playBtn.addEventListener('click', tryPlay);
+  const detach = () => {
+    video.pause();
+    video.removeAttribute('src');
+    video.load();
+  };
+  return { el, video, setStatus, tryPlay, detach };
+}
+
+// hls.js is loaded on the first Play rather than with the page: it is the one third-party
+// script in the app (static/vendor/hls.js/NOTICE.md) and 386 KB nobody should pay for on every
+// page load. `src` is the vendored file's URL, which the page hands its player script.
+let _hlsLoading = null;
+function loadHlsJs(src) {
+  if (window.Hls) return Promise.resolve(window.Hls);
+  if (!_hlsLoading) {
+    _hlsLoading = new Promise((resolve, reject) => {
+      const s = document.createElement('script');
+      s.src = src;
+      s.onload = () => resolve(window.Hls);
+      s.onerror = () => { _hlsLoading = null; reject(new Error('Could not load the video player script.')); };
+      document.head.appendChild(s);
+    });
+  }
+  return _hlsLoading;
+}
+
+// Play an HLS playlist the server is writing (app/preview.py) in `video`. hls.js wherever
+// Media Source Extensions exist (desktop Chrome/Firefox/Edge, Android Chrome), the browser's
+// own HLS where it is the only option (iOS Safari). Resolves to the Hls instance, or null on
+// the browser's own path; rejects with a user-facing Error when the browser has neither.
+// `onReady` runs when there is something to play; `onError` gets hls.js's error events.
+function attachHls(video, url, { src, config = {}, onReady, onError, onInitPts } = {}) {
+  const nativeHls = video.canPlayType('application/vnd.apple.mpegurl');
+  const useNative = () => {
+    video.src = url;
+    if (onReady) video.addEventListener('loadedmetadata', onReady, { once: true });
+    return null;
+  };
+  return loadHlsJs(src)
+    .catch((e) => { if (nativeHls) return null; throw e; })
+    .then((Hls) => {
+      if (Hls && Hls.isSupported()) {
+        const hls = new Hls(config);
+        if (onReady) hls.on(Hls.Events.MANIFEST_PARSED, onReady);
+        if (onError) hls.on(Hls.Events.ERROR, onError);
+        if (onInitPts) hls.on(Hls.Events.INIT_PTS_FOUND, onInitPts);
+        hls.loadSource(url);
+        hls.attachMedia(video);
+        return hls;
+      }
+      if (nativeHls) return useNative();
+      throw new Error('This browser cannot play HLS video, so it cannot play here.');
+    });
+}
+
 // In-field secret reveal (eyeball). A masked secret input renders SECRET_MASK; clicking the
 // button fetches the real value from /api/settings/reveal (gated server-side to sensitive
 // leaves) and toggles it back. State is read off the input's value, so no per-button flag can

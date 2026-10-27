@@ -429,8 +429,10 @@ affects the verdict or the count beside Maintenance.">Ignore this</button>`;
     if (ev.target.closest('#rd-copy')) {
       // Written server-side (app/readiness.py::report_text), the same text the support
       // bundle ships as readiness.txt.
-      if (navigator.clipboard && state.data) navigator.clipboard.writeText(state.data.report);
-      showToast('Report copied.');
+      if (!state.data) return;
+      copyText(state.data.report)
+        .then(() => showToast('Report copied.'))
+        .catch((e) => showToast(e.message, { type: 'error' }));
       return;
     }
     // A link out of the card is a real navigation, not a row toggle.

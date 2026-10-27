@@ -171,5 +171,6 @@
     refresh();
   }
 
-  window.recordingDialogs = { switch: openSwitch, block: openBlock };
+  window.recordingDialogs = Object.assign(window.recordingDialogs || {},
+    { switch: openSwitch, block: openBlock });
 })();

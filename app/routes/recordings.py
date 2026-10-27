@@ -17,7 +17,7 @@ from ..database import (
     RECORDING_CREATED_AFTER_EVENT_START, RECORDING_EDITED, RECORDING_STOP_TIME_ADJUSTED,
     RECORDING_REPLACED_OTHER, RESTART_BLOCKING_STATUSES, RECORDING_ABORTED,
     DIAGNOSTICS, RESTART_ATTEMPTED, RESTART_FAILED, RESTART_SUCCEEDED, STALL_DETECTED,
-    FAST_DELIVERY_DETECTED, RECORDING_RESUMED,
+    FAST_DELIVERY_DETECTED, RECORDING_RESUMED, GROUP_FAILOVER, SEGMENT_ENDED,
     add_recording_event, detach_recording_references,
     group_event_channel_links,
     REC_STATUS_SCHEDULED, REC_STATUS_IN_PROGRESS, REC_STATUS_PAUSED, REC_STATUS_RETRYING,
@@ -1509,6 +1509,15 @@ def _distinct_accounts(rec, seg_channels: dict) -> list:
     return accounts
 
 
+def _kept_ts_on_disk(rec) -> bool:
+    """The recording's output is a joined .ts that is still on disk - the source a Retry
+    conversion works from, and on a FAILED or ABORTED row the one file there is to download.
+    A filesystem call, so never per row."""
+    return bool(
+        rec.output_path and rec.output_path.endswith('.ts') and os.path.exists(rec.output_path)
+    )
+
+
 @recordings_bp.route('/recordings/<int:recording_id>')
 def recording_detail(recording_id):
     rec = db.session.get(Recording, recording_id)
@@ -1517,9 +1526,7 @@ def recording_detail(recording_id):
         return redirect(url_for('recordings.index'))
     state = get_state(recording_id)
     is_active = state is not None
-    ts_source_available = bool(
-        rec.output_path and rec.output_path.endswith('.ts') and os.path.exists(rec.output_path)
-    )
+    ts_source_available = _kept_ts_on_disk(rec)
     # What a failed recording still has to work with. The two are not the same thing and a
     # FAILED page used to claim both at once: a successful concat consumes its segments, so
     # "segments kept on disk" is false for exactly the recordings that do have a recoverable
@@ -1559,6 +1566,9 @@ def recording_detail(recording_id):
     if rec.status == REC_STATUS_COMPLETED and (rec.converted_gap_seconds or 0) > 0:
         from ..postprocessor import kept_source_path
         gaps_retry = kept_source_path(rec.id) is not None
+    # Play and Download, decided from the row's columns alone - a finished file is touched
+    # only when the user clicks one of them (app/playback.py, dev/changelog/1312).
+    play_offer = _play_offer(rec, ts_source_available)
     cfg = load_config()
     thumb_cfg = cfg.get('recording', {}).get('live_thumbnail', {})
 
@@ -1713,6 +1723,7 @@ def recording_detail(recording_id):
         segment_files_on_disk=segment_files_on_disk, seg_files_gone=seg_files_gone,
         recover_act=recover_act,
         gaps_retry=gaps_retry,
+        play_offer=play_offer,
         conversion_max_attempts=conversion_max_attempts,
         after_join=after_join,
         max_dead_stream_retry_attempts=max_dead_stream_retry_attempts,
@@ -1958,6 +1969,280 @@ def live_thumbnail(recording_id):
     resp.headers['Cache-Control'] = 'no-store'
     resp.headers['X-Thumb-Captured-At'] = str(int(os.path.getmtime(thumb_path)))
     return resp
+
+
+def _play_offer(rec, kept_source_on_disk: bool):
+    """playback.offer() with the capture's own codec when the recording is still in its capture
+    window - read from segment rows the page has loaded, never from a file."""
+    from .. import playback
+    vcodec = (playback.capture_codecs(rec.segments)[0]
+              if rec.status in WINDOW_OPEN_STATUSES else None)
+    return playback.offer(rec, kept_source_on_disk=kept_source_on_disk,
+                          capture_video_codec=vcodec)
+
+
+def _file_urls(recording_id: int) -> dict:
+    # Relative URLs: an absolute one built behind a TLS-terminating proxy can come out as
+    # http:// and be blocked as mixed content, while a relative one is right on any origin -
+    # bare IP, hostname, http or https (dev/changelog/1312).
+    return {
+        'media_url': url_for('recordings.recording_file', recording_id=recording_id),
+        'download_url': url_for('recordings.recording_file', recording_id=recording_id,
+                                download=1),
+        'playback_url': url_for('recordings.start_recording_playback',
+                                recording_id=recording_id),
+    }
+
+
+@recordings_bp.route('/recordings/<int:recording_id>/file/check')
+def recording_file_check(recording_id):
+    """Run when the user clicks Play or Download, and only then: wakes the storage, proves
+    the file is still where ChannelBin left it, and says how long that took. A recording
+    page never touches a finished file on load (app/playback.py)."""
+    from .. import playback
+    rec = db.session.get(Recording, recording_id)
+    if rec is None:
+        return jsonify({'error': 'Recording not found.'}), 404
+    if rec.status in WINDOW_OPEN_STATUSES:
+        # Still capturing: there is no finished file to wake, and the storage the capture
+        # writes to is awake. The start route reads the segment rows.
+        o = _play_offer(rec, False)
+        return jsonify({
+            'success': True,
+            'name': rec.name,
+            'opened_seconds': 0,
+            'native': False,
+            'pipeline': False,
+            'capture': o.capture,
+            'download': False,
+            # Start at the live edge: something is being written right now.
+            'live': rec.status == REC_STATUS_IN_PROGRESS and get_state(rec.id) is not None,
+            'reason': o.reason,
+            'caveat': o.caveat,
+            'video_codec': o.video_codec,
+            'audio_codec': o.audio_codec,
+            **_file_urls(recording_id),
+        })
+    try:
+        opened = playback.open_for_playback(rec, load_config(),
+                                            kept_source_on_disk=_kept_ts_on_disk(rec))
+    except playback.PlaybackRefused as exc:
+        return jsonify({'error': exc.message}), exc.status
+    o = playback.offer(rec, kept_source_on_disk=True)
+    return jsonify({
+        'success': True,
+        'name': os.path.basename(opened['path']),
+        'size': opened['size'],
+        'opened_seconds': round(opened['seconds'], 1),
+        'native': o.native,
+        'pipeline': o.pipeline,
+        'capture': False,
+        'download': True,
+        # The position bar's whole length: the content duration ffprobe measured on the file,
+        # not the scheduled or requested one. None when it was never measured.
+        'duration': rec.recorded_duration_seconds,
+        'reason': o.reason,
+        'caveat': o.caveat,
+        'video_codec': o.video_codec,
+        'audio_codec': o.audio_codec,
+        **_file_urls(recording_id),
+    })
+
+
+@recordings_bp.route('/recordings/<int:recording_id>/file')
+def recording_file(recording_id):
+    """The recording's own file, by id - never by a path from the request. Range requests are
+    answered (send_file conditional=True), which is what lets the browser's player seek
+    without reading the file from the start; `?download=1` makes it an attachment under the
+    file's own name."""
+    from .. import playback
+    rec = db.session.get(Recording, recording_id)
+    if rec is None:
+        return jsonify({'error': 'Recording not found.'}), 404
+    try:
+        path = playback.resolve_file(rec, load_config(), kept_source_on_disk=_kept_ts_on_disk(rec))
+    except playback.PlaybackRefused as exc:
+        return jsonify({'error': exc.message}), exc.status
+    download = request.args.get('download') == '1'
+    try:
+        resp = send_file(path, mimetype=playback.mimetype_for(path), conditional=True,
+                         as_attachment=download, download_name=os.path.basename(path))
+    except FileNotFoundError as exc:
+        refusal = playback.missing_file_refusal(recording_id, path, exc)
+        return jsonify({'error': refusal.message}), refusal.status
+    except OSError as exc:
+        log.warning('Recording %d: storage error serving %s: %s', recording_id, path, exc)
+        refusal = playback.storage_refusal(path, exc)
+        return jsonify({'error': refusal.message}), refusal.status
+    # The file is the recording's and does not change once finished, but a Retry conversion
+    # replaces it under the same URL; revalidating is a cheap stat on a disk that is awake.
+    resp.headers['Cache-Control'] = 'no-cache'
+    return resp
+
+
+@recordings_bp.route('/api/recordings/<int:recording_id>/playback', methods=['POST'])
+def start_recording_playback(recording_id):
+    """Play a file the browser cannot take by itself through the preview pipeline, from
+    `offset` seconds (JSON body). A seek is another call with a new offset: it replaces the
+    session before the new one starts (app/preview.py). The player calls this after the
+    click's check has woken the storage; the session is then driven through the preview's
+    own status, playlist and stop routes."""
+    import math
+
+    from .. import playback, preview
+    from .preview import session_urls
+    rec = db.session.get(Recording, recording_id)
+    if rec is None:
+        return jsonify({'error': 'Recording not found.'}), 404
+    body = request.get_json(silent=True) or {}
+    try:
+        offset = float(body.get('offset') or 0)
+    except (TypeError, ValueError):
+        return jsonify({'error': 'The position to play from must be a number of seconds.'}), 400
+    if not math.isfinite(offset) or offset < 0:
+        return jsonify({'error': 'The position to play from must be 0 or more seconds.'}), 400
+    if rec.status in WINDOW_OPEN_STATUSES:
+        o = _play_offer(rec, False)
+        if not o.capture:
+            return jsonify({'error': o.reason or 'This recording has nothing to play.'}), 409
+        return _start_capture_playback(rec, body, offset)
+    if rec.status in (REC_STATUS_CONCATENATING, REC_STATUS_ANALYZING, REC_STATUS_CONVERTING):
+        # Reached from a player that was following the capture when it stopped.
+        return jsonify({'error': 'Its final file is being made from the captured segments '
+                                 'now.'}), 409
+    kept = _kept_ts_on_disk(rec)
+    o = playback.offer(rec, kept_source_on_disk=kept)
+    if not o.pipeline:
+        return jsonify({'error': (
+            'This recording plays in the browser\'s own player.' if o.native
+            else (o.reason or 'This recording has no finished file to play.'))}), 409
+    duration = rec.recorded_duration_seconds
+    if duration and offset >= duration:
+        return jsonify({'error': (
+            f'{fmt_utils.fmt_duration(offset, with_seconds=True)} is past the end of the '
+            f'recording ({fmt_utils.fmt_duration(duration, with_seconds=True)}).')}), 400
+    try:
+        path = playback.resolve_file(rec, load_config(), kept_source_on_disk=kept)
+        session = preview.start_file_playback(
+            rec.id, rec.name, path, offset,
+            transcode_audio=preview.audio_needs_transcode(rec.recorded_audio_codec))
+    except playback.PlaybackRefused as exc:
+        return jsonify({'error': exc.message}), exc.status
+    except preview.PreviewRefused as exc:
+        return jsonify({'error': exc.message}), exc.status
+    return jsonify({'success': True, **session.to_dict(), **session_urls(session.id)})
+
+
+def _start_capture_playback(rec, body: dict, offset: float):
+    """Play a recording still in its capture window from `offset` seconds of what has been
+    captured, or from the live edge when the body says `live` (dev/changelog/1316).
+
+    The timeline is the joinable segments laid end to end (playback.capture_timeline). A
+    position in a finished segment plays it from there and ends with it; one in the segment
+    being written follows that file, which ends when the recorder leaves it - the player then
+    asks again, with `moved_from` naming the segment it was on so the answer can say why the
+    recording moved, in the recording's own events."""
+    from .. import playback, preview
+    from ..concatenator import joinable_segments
+    from .preview import session_urls
+
+    state = get_state(rec.id) if rec.status == REC_STATUS_IN_PROGRESS else None
+    segments = sorted(rec.segments, key=lambda s: s.segment_number)
+    spans = playback.capture_timeline(joinable_segments(segments), datetime.utcnow(),
+                                      state.current_segment_num if state else None)
+    # 409 for both "not yet" answers: the player asks again while the recording is capturing.
+    if not spans:
+        return jsonify({'error': 'Nothing has been captured yet.'}), 409
+    captured = spans[-1].end
+    position = offset
+    if body.get('live'):
+        # Nothing being written (paused, retrying, or the player's follower outlived the
+        # capture): "live" is the last few seconds that were captured.
+        position = captured if state is not None else max(0.0, captured - playback.LIVE_SNAP_SECONDS)
+    resolved = playback.resolve_capture_position(spans, position)
+    if resolved is None and state is not None:
+        return jsonify({'error': (
+            f'The capture is starting segment {state.current_segment_num}, which has not '
+            'written anything yet.')}), 409
+    if resolved is None:
+        return jsonify({'error': (
+            f'{fmt_utils.fmt_duration(position, with_seconds=True)} is past what has been '
+            f'captured so far ({fmt_utils.fmt_duration(captured, with_seconds=True)}).')}), 400
+    span, at, live = resolved
+    if live:
+        # A few seconds before what is written so far; the follower's burst reads up to it.
+        at = max(0.0, span.length - playback.FOLLOW_FROM_END_SECONDS)
+    seg = next(s for s in segments if s.segment_number == span.segment_number)
+    acodec = seg.probe_audio_codec or playback.capture_codecs(segments)[1]
+    place = preview.CapturePlace(
+        segment_number=span.segment_number, base=span.base,
+        span_end=None if span.growing else span.end,
+        follow_state=state if span.growing else None, live=live)
+    try:
+        path = playback.resolve_segment_file(rec, span.file_path, load_config())
+        session = preview.start_file_playback(
+            rec.id, rec.name, path, at,
+            transcode_audio=preview.audio_needs_transcode(acodec),
+            capture=place)
+    except playback.PlaybackRefused as exc:
+        return jsonify({'error': exc.message}), exc.status
+    except preview.PreviewRefused as exc:
+        return jsonify({'error': exc.message}), exc.status
+    return jsonify({
+        'success': True, **session.to_dict(), **session_urls(session.id),
+        # What has been captured so far, by the segments' clocks; it grows while capturing.
+        'captured_seconds': round(captured, 1),
+        'capturing': state is not None,
+        'capture_note': _capture_note(rec.status, state is not None),
+        'moved_because': _why_segment_ended(rec.id, body.get('moved_from')),
+    })
+
+
+def _capture_note(status: str, capturing: bool) -> str:
+    """What the player says about a recording in its capture window that is not writing
+    anything right now. Every window status is named (CLAUDE.md, states are enumerated)."""
+    if capturing:
+        return ''
+    if status == REC_STATUS_PAUSED:
+        return 'The recording is paused, so this plays what was captured before the pause.'
+    if status == REC_STATUS_RETRYING:
+        return ('The stream dropped and the recording is waiting to try it again, so this plays '
+                'what was captured before the drop.')
+    if status == REC_STATUS_IN_PROGRESS:
+        return 'Nothing is being written right now, so this plays what has been captured.'
+    log.warning('No capture note for status %r', status)
+    return ''
+
+
+def _why_segment_ended(recording_id: int, segment_number) -> str:
+    """The recording's own account of why `segment_number` ended: its stall and failover
+    events, then the segment's end, as written. '' when nothing names it."""
+    try:
+        segment_number = int(segment_number)
+    except (TypeError, ValueError):
+        return ''
+    seg = (RecordingSegment.query
+           .filter_by(recording_id=recording_id, segment_number=segment_number).first())
+    if seg is None:
+        return ''
+    nxt = (RecordingSegment.query
+           .filter(RecordingSegment.recording_id == recording_id,
+                   RecordingSegment.segment_number > segment_number)
+           .order_by(RecordingSegment.segment_number).first())
+    window = [RecordingEvent.recording_id == recording_id,
+              RecordingEvent.timestamp >= seg.started_at]
+    if nxt is not None:
+        window.append(RecordingEvent.timestamp <= nxt.started_at)
+    events = (RecordingEvent.query
+              .filter(*window,
+                      db.or_(db.and_(RecordingEvent.segment_number == segment_number,
+                                     RecordingEvent.event_type.in_((STALL_DETECTED,
+                                                                    SEGMENT_ENDED))),
+                             RecordingEvent.event_type == GROUP_FAILOVER))
+              .order_by(RecordingEvent.id).all())
+    order = {STALL_DETECTED: 0, GROUP_FAILOVER: 1, SEGMENT_ENDED: 2}
+    picked = sorted(events, key=lambda e: order[e.event_type])
+    return ' '.join(e.detail.rstrip('.') + '.' for e in picked if e.detail)
 
 
 # Refusing is the honest answer for a CONCATENATING row. The join is the step that produces

@@ -183,11 +183,12 @@ In the TV Guide a finished recording is marked:
 
 ## Where your file is
 
-**ChannelBin cannot play or download a finished recording from the browser yet.** The file is in
-your recording folder (`/dvr` by default; on Docker, wherever you mapped that volume), named
-from the date, the title, the episode and the channel. **Copy output path** on the recording's
-page gives you its exact path. Play it with any player that opens MP4 files, or point Plex,
-Jellyfin or Emby at the folder.
+**Play** on a finished recording's page plays it right in the browser, and **Download file** in
+its **⋯** menu saves it to your computer. The file itself is in your recording folder (`/dvr` by
+default; on Docker, wherever you mapped that volume), named from the date, the title, the
+episode and the channel. **Copy output path** on the recording's page gives you its exact path,
+so you can also play it with any player that opens MP4 files, or point Plex, Jellyfin or Emby at
+the folder.
 
 ## Trying it without an IPTV provider
 

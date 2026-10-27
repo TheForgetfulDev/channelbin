@@ -90,14 +90,83 @@ def build_preview_cmd(cfg: dict, url: str, out_dir: str, *, segment_seconds: int
     so a provider with a 5 s GOP produces 5 s segments whatever segment_seconds says."""
     cmd = [resolve_ffmpeg_path(cfg['ffmpeg']['path'])]
     cmd += input_args(cfg, url, pace_realtime=pace_realtime)
-    cmd += ['-map', '0:v:0?', '-map', '0:a:0?', '-sn', '-dn', '-c:v', 'copy']
+    cmd += _hls_window_args(out_dir, segment_seconds=segment_seconds, list_size=list_size,
+                            transcode_audio=transcode_audio, live=True)
+    return cmd
+
+
+#: How much of a recording's file build_file_playback_cmd reads ahead before pacing to real
+#: time, so the player has a buffer at once instead of waiting a segment per segment.
+FILE_PLAYBACK_BURST_SECONDS = 10
+
+
+def build_file_playback_cmd(cfg: dict, path: str, out_dir: str, *, offset: float = 0.0,
+                            segment_seconds: int = 2, list_size: int = 30,
+                            transcode_audio: bool = False, follow: bool = False) -> list:
+    """ffmpeg command that plays a finished recording's file from `offset` seconds through
+    the preview's rolling HLS window (app/preview.py file sessions, dev/docs/DESIGN-playback.md).
+
+    The output half is build_preview_cmd's, so a browser receives a file exactly as it receives
+    a channel. The input half is a file's, not a stream's: none of input_args()' connect flags
+    apply, and the user's extra_input_args are written for a provider's stream.
+
+    Measured on this box's CIFS share against a 4.3-hour, 3 GB .ts (dev/changelog/1314):
+      * -ss before -i seeks by timestamp without decoding; the first segment existed 0.11-0.17 s
+        after launch at offsets of 1, 2.5 and 4.2 hours. Video starts on the first keyframe at
+        or after the offset and audio a fraction of a second before it, so the landing is up to
+        one keyframe interval late - the player reads where it actually landed (below).
+      * -copyts -start_at_zero with the mpegts mux delay at 0 makes every output timestamp the
+        position in the recording, in seconds from its start. Without the zero mux delay the
+        muxer adds a fixed 1.4 s, and without -copyts the output restarts near zero and the
+        landing point is lost. The player turns the first timestamp into the position it shows.
+      * -readrate 1 with an initial burst paces the read to real time after the first few
+        seconds, so a viewer reads the share at the recording's own bitrate and never faster
+        than they watch - the share is the one captures write to.
+    The playlist ends with ENDLIST when the file does, so the player plays the last segments
+    and stops rather than waiting on a live edge that will never move.
+
+    `follow` reads a segment file the recorder is still writing (ffmpeg's file protocol keeps
+    reading past the end of the file instead of stopping there), so ffmpeg never reaches an
+    end and the playlist stays open. Live is a follower started a few seconds before what is
+    written so far: the burst reads up to the end, and from there the file's own growth paces
+    it. Measured on the CIFS share with a 1080p 8 Mbps capture writing at real time
+    (dev/changelog/1316): the follower opens the file read-only and takes no lock, and the
+    writer's write() latency and growth were the same with and without one attached; -ss lands
+    within a keyframe of the position asked for, as on a finished file. -sseof was tried and
+    dropped: on a file only a few seconds old it landed past what was written and, when the
+    file then stopped growing, never produced a segment. Any seek on a followed file that has
+    stopped growing can wait forever for data past its end, which preview.py's start timeout
+    names. A follower waiting at the end of the file does not act on ffmpeg's first SIGTERM,
+    so it is stopped with SIGKILL (preview._finish)."""
+    cmd = [resolve_ffmpeg_path(cfg['ffmpeg']['path'])]
+    if follow:
+        cmd += ['-follow', '1']
+    cmd += ['-readrate', '1', '-readrate_initial_burst', str(FILE_PLAYBACK_BURST_SECONDS)]
+    if offset and offset > 0:
+        cmd += ['-ss', f'{offset:.3f}']
+    # file: so a path with a colon in it can never be read as a protocol name.
+    cmd += ['-i', f'file:{path}', '-copyts', '-start_at_zero', '-muxdelay', '0',
+            '-muxpreload', '0']
+    cmd += _hls_window_args(out_dir, segment_seconds=segment_seconds, list_size=list_size,
+                            transcode_audio=transcode_audio, live=follow)
+    return cmd
+
+
+def _hls_window_args(out_dir: str, *, segment_seconds: int, list_size: int,
+                     transcode_audio: bool, live: bool) -> list:
+    """The output half shared by build_preview_cmd and build_file_playback_cmd: one video and
+    one audio stream copied (audio to stereo AAC only when the browser cannot decode it) into a
+    rolling HLS window. `live` keeps the playlist open forever (omit_endlist); a file's playlist
+    is ended by ffmpeg when the file is."""
+    cmd = ['-map', '0:v:0?', '-map', '0:a:0?', '-sn', '-dn', '-c:v', 'copy']
     if transcode_audio:
         cmd += ['-c:a', 'aac', '-b:a', '128k', '-ac', '2']
     else:
         cmd += ['-c:a', 'copy']
+    flags = 'delete_segments+independent_segments' + ('+omit_endlist' if live else '')
     cmd += ['-f', 'hls', '-hls_time', str(segment_seconds), '-hls_list_size', str(list_size),
             '-hls_delete_threshold', '3',
-            '-hls_flags', 'delete_segments+independent_segments+omit_endlist',
+            '-hls_flags', flags,
             '-hls_segment_filename', os.path.join(out_dir, PREVIEW_SEGMENT_PATTERN),
             '-y', os.path.join(out_dir, PREVIEW_PLAYLIST)]
     return cmd
