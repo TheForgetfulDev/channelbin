@@ -295,7 +295,11 @@ class DegradationPrefixTests(unittest.TestCase):
     """The prefix -> alert type map is the whole discriminator, so it has to be total."""
 
     def test_every_registered_type_exists_in_the_alert_registry(self):
+        # None is a registered answer, not a missing one: a prefix that is not a degradation
+        # (REFRESH_SKIPPED, dev/changelog/1298) routes to no alert on purpose.
         for prefix, alert_type in EPG_DEGRADATION_ALERT_TYPES.items():
+            if alert_type is None:
+                continue
             self.assertIn(alert_type, ALERT_TYPES, f'{prefix!r} routes to an unknown type')
 
     def test_each_registered_prefix_routes_to_its_own_type(self):

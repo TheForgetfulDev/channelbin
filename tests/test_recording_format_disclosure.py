@@ -122,6 +122,44 @@ class ListTooltipTests(_Seeded):
                         excluded_at=1)
         self.assertIsNone(self._row(rec.id)['format_change'])
 
+    # The survey's verdict on the row (dev/changelog/1307): the list says what the page
+    # says, read from three columns rather than a survey event per row.
+    def _surveyed(self, rec, main, first, other_seconds):
+        row = db.session.get(Recording, rec.id)
+        row.format_survey_main = main
+        row.format_survey_first = first
+        row.format_survey_other_seconds = other_seconds
+        db.session.commit()
+
+    def test_a_change_inside_one_segment_reaches_the_list_through_the_survey(self):
+        """Every segment opened at the same format, so the segment clause says nothing;
+        the survey found two minutes of another format inside one of them."""
+        rec = self._rec([('1920x1080', 60), ('1920x1080', 60)])
+        self._surveyed(rec, '1920x1080 @ 60', '1920x1080 @ 60', 170.0)
+        health = self._row(rec.id)['health']
+        self.assertNotIn('clean capture', health['tip'])
+        self.assertIn('Format changed mid-recording: mostly 1920x1080 @ 60, with 2m 50s in '
+                      'other formats', health['tip'])
+        self.assertIn('header describes only 1920x1080 @ 60', health['tip'])
+
+    def test_a_survey_of_one_format_overrules_the_segment_openings_on_the_list(self):
+        """Recording 16's row: a restart segment opened at 720p30 for a minute, and the
+        list went on naming it a format the file changed to for good."""
+        rec = self._rec([('1920x1080', 60), ('1280x720', 30)])
+        self._surveyed(rec, '1920x1080 @ 60', '1920x1080 @ 60', 0.0)
+        row = self._row(rec.id)
+        self.assertIsNone(row['format_change'])
+        self.assertIn('clean capture', row['health']['tip'])
+
+    def test_the_header_format_is_the_surveys_first_stretch(self):
+        rec = self._rec([('1280x720', 30)])
+        self._surveyed(rec, '1920x1080 @ 60', '1280x720 @ 30', 7200.0)
+        self.assertIn('header describes only 1280x720 @ 30', self._row(rec.id)['health']['tip'])
+
+    def test_without_a_survey_the_list_reads_the_segment_openings(self):
+        rec = self._rec([('1920x1080', 60), ('1280x720', 30)])
+        self.assertIn('segments opened at', self._row(rec.id)['health']['tip'])
+
 
 class DetailPageTests(_Seeded):
 

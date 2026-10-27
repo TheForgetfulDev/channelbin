@@ -36,7 +36,7 @@ from .database import (
 )
 from .channel_groups import (effective_score, pick_best_member, recording_members,
                              format_eligible_members, format_key, format_label,
-                             segment_format_key, DEFAULT_FAILING_STREAK_THRESHOLD)
+                             segment_pin_format_key, DEFAULT_FAILING_STREAK_THRESHOLD)
 from .db_utils import retry_on_locked
 from .fs_utils import PATH_OK, describe_dir_problem, probe_dir
 from .proc_utils import (SCRATCH_PREFIXES, build_capture_cmd, count_stderr_matches,
@@ -1664,8 +1664,8 @@ def record_segment_diagnostics(recording_id: int, seg, exit_code, tail, reconnec
     The exit code goes in the column and in the event's detail string, NEVER in extra_data -
     a stat with a column does not also live there (CLAUDE.md § Measurements). extra_data
     carries only the stderr tail, which has no column because nothing sorts on a blob. The
-    reconnect count has no column either and nothing sorts on it, so it rides the detail
-    string where a human reads it. What the reconnects did to the file (`jumps`, a
+    reconnect count goes in the segment's own column too (the Stats card and the list row
+    sum it) and in the detail string where a human reads it. What the reconnects did to the file (`jumps`, a
     `proc_utils.ReconnectJumps`) rides the detail string too, and extra_data carries the
     per-reconnect seconds, which have no column either (dev/changelog/1237): a file that
     plays 86 s for a 60 s window, 142% of its expected frames, is a number nobody can
@@ -1681,9 +1681,14 @@ def record_segment_diagnostics(recording_id: int, seg, exit_code, tail, reconnec
     on any surface distinguished "ffmpeg had nothing to say" from "its output was destroyed"
     (dev/changelog/967). Saying so is Product Principle 1 applied to the diagnostic itself.
     """
+    reconnect_count, reconnects_complete = reconnects
     if seg is not None:
         seg.ffmpeg_exit_code = exit_code
-    reconnect_count, reconnects_complete = reconnects
+        # Written before the quiet-exit return below: a segment that reconnected zero
+        # times is a measured 0, not an unknown, and the columns are what the Stats card
+        # and the list row read (dev/changelog/1306).
+        seg.reconnect_count = reconnect_count
+        seg.reconnects_truncated = not reconnects_complete
     if (not tail and not reconnect_count and not spool_missing
             and not (exit_code is not None and exit_code > 0)):
         return
@@ -1993,6 +1998,19 @@ def _handoff_stop_old_recording(app, old_recording_id: int, new_recording_id: in
     ev.publish(old_recording_id, RECORDING_HANDOFF, {'handed_off_to': new_recording_id})
 
 
+def recording_format_pin_segment(recording_id: int):
+    """The segment the recording's format pin is read from - the EARLIEST one that
+    carries a capture-time probe and was not discarded - or None. The watchdog asks this
+    to know which segment to re-read once it has run a while (dev/changelog/1308)."""
+    return (RecordingSegment.query
+            .filter(RecordingSegment.recording_id == recording_id,
+                    RecordingSegment.probe_resolution.isnot(None),
+                    RecordingSegment.probe_fps.isnot(None),
+                    RecordingSegment.excluded_reason.is_(None))
+            .order_by(RecordingSegment.segment_number.asc())
+            .first())
+
+
 def recording_format_pin(recording_id: int):
     """The format this recording is committed to for the rest of its run - the
     format_key of the EARLIEST segment that carries a capture-time probe
@@ -2008,15 +2026,14 @@ def recording_format_pin(recording_id: int):
     opens as is the first segment that did. A discarded segment is excluded for the same
     reason and it is not a fine point - a provider placeholder is 1080p30, so letting one
     set the pin locks a 59.94 fps recording to 30 fps and filters out every real member for
-    the rest of the run (dev/changelog/957). Requires an app context."""
-    seg = (RecordingSegment.query
-           .filter(RecordingSegment.recording_id == recording_id,
-                   RecordingSegment.probe_resolution.isnot(None),
-                   RecordingSegment.probe_fps.isnot(None),
-                   RecordingSegment.excluded_reason.is_(None))
-           .order_by(RecordingSegment.segment_number.asc())
-           .first())
-    return segment_format_key(seg)
+    the rest of the run (dev/changelog/957).
+
+    That segment's SETTLED reading wins over its opening one when the watchdog has taken
+    it (segment_pin_format_key): the opening probe sees the first two megabytes, and a
+    provider in trouble can open on a minute of a lower format inside hours of its usual
+    one (dev/changelog/1201), which would steer every failover to the lower format for
+    the whole run (dev/changelog/1308). Requires an app context."""
+    return segment_pin_format_key(recording_format_pin_segment(recording_id))
 
 
 def _pin_eligible_members(members, pin, latest_by_channel):

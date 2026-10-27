@@ -464,14 +464,19 @@ class ConversionResult:
     and restarting from the top cannot get past it.
     `decode_errors` is how many frames ffmpeg failed to decode, counted so a conversion
     that finished by concealing damage can still say the damage happened.
+    `concealed_frames` is how many frames the decoder DID decode by concealing damaged
+    macroblocks - visible damage that is in the output, which the first count never sees
+    (the GPU lab's damaged clip converted with 0 decode errors and one concealed I-frame,
+    dev/changelog/1196, 1309).
     `gpu_error` is the first error line of a failed attempt that blames the hardware path,
     read from its whole stderr (None if none did); `error_lines` are its last error lines.
     """
     def __init__(self, success, reason=None, error_msg=None, out_time=None,
-                 decode_errors=0, gpu_error=None, error_lines=None):
+                 decode_errors=0, gpu_error=None, error_lines=None, concealed_frames=0):
         self.success = success
         self.gpu_error = gpu_error
         self.error_lines = list(error_lines or [])
+        self.concealed_frames = concealed_frames
         # 'success' | 'died' | 'stalled' | 'no_output' | 'timeout'. 'no_output' is the
         # pre-output budget expiring; 'timeout' survives only for the stall-detection-
         # disabled fallback, and is no longer reachable in the default configuration
@@ -1279,6 +1284,7 @@ def run_conversion_supervised(app, recording_id, cmd, output_path, *,
                           if expected_duration else expected_duration)
     smoother = EtaSmoother(remaining_duration)
     decode_errors = 0
+    concealed_frames = 0
     # The conflict _check_collision most recently decided to yield to, so _on_suspend can
     # record WHO the pause is for without asking the database a second question.
     suspending_for = None
@@ -1365,8 +1371,9 @@ def run_conversion_supervised(app, recording_id, cmd, output_path, *,
 
     def _read_spool(stderr_path, returncode):
         # Read while the spool still exists - supervise_ffmpeg unlinks it right after this.
-        nonlocal decode_errors, gpu_lines, error_lines
+        nonlocal decode_errors, concealed_frames, gpu_lines, error_lines
         decode_errors = _count_decode_errors(stderr_path)
+        concealed_frames = _count_concealed_frames(stderr_path)
         if returncode != 0:
             gpu_lines, error_lines = read_conversion_errors(stderr_path)
 
@@ -1387,17 +1394,20 @@ def run_conversion_supervised(app, recording_id, cmd, output_path, *,
         # claiming to be waiting outlives everything that could clear it.
         _persist_postprocess_waiting(recording_id, None)
 
-    # decode_errors is attributed only to a run that reached the end of the source; a
-    # killed attempt's count describes the part it got through, not the file.
+    # decode_errors and concealed_frames are attributed only to a run that reached the end
+    # of the source; a killed attempt's count describes the part it got through, not the
+    # file.
     #
     # out_time is returned as a SOURCE position, offset included, because every consumer
     # reasons about the source: the restart loop compares where two attempts stopped to tell a
     # damaged file from a transient failure, and that comparison is meaningless between two
     # attempts that started at different places.
+    counted = run.reason in ('success', 'died')
     return ConversionResult(
         run.success, reason=run.reason, error_msg=run.error_msg,
         out_time=(run.out_time or 0.0) + source_offset,
-        decode_errors=decode_errors if run.reason in ('success', 'died') else 0,
+        decode_errors=decode_errors if counted else 0,
+        concealed_frames=concealed_frames if counted else 0,
         gpu_error=gpu_lines[0] if gpu_lines else None, error_lines=error_lines)
 
 
@@ -1408,11 +1418,48 @@ def run_conversion_supervised(app, recording_id, cmd, output_path, *,
 _DECODE_ERROR_MARKERS = ('Error submitting packet to decoder',
                          'Decoding error:')
 
+# libavcodec's error-resilience line, one per frame it finished by concealing damaged
+# macroblocks: "concealing 65 DC, 65 AC, 65 MV errors in P frame". The frame is in the
+# output and the picture is wrong in it. Measured on this box's ffmpeg 7.1 over a
+# deliberately damaged H.264 MPEG-TS: that line and the CLI's "corrupt decoded frame" each
+# appear once per such frame, so only one is counted; HEVC damage logs neither (its decoder
+# drops the frame with "Could not find ref with POC"), and the timeline scan is what sees
+# that (dev/changelog/1309).
+_CONCEALED_FRAME_MARKER = ('concealing ', ' errors in ')
+
 
 # ffmpeg collapses a run of identical lines into one of these instead of repeating it, so
 # a naive per-line count reports 1 where the source lost 200 frames. The number reaches the
 # user, and a number that is quietly a floor is worse than no number at all.
 _REPEATED_RE = re.compile(r'Last message repeated (\d+) times?')
+
+
+def _count_logged_frames(stderr_path, is_match):
+    """How many lines of the whole stderr spool `is_match` accepts, with a "Last message
+    repeated N times" line attributed to whatever it repeats - so it counts N more only
+    when the line it collapsed was itself a match. Counted over the whole spool rather
+    than tailed because the tail holds only the last few KB and the interesting damage
+    is usually thousands of lines back."""
+    count = 0
+    last_matched = False
+    try:
+        with open(stderr_path, 'r', errors='replace') as fh:
+            for line in fh:
+                if is_match(line):
+                    count += 1
+                    last_matched = True
+                    continue
+                repeated = _REPEATED_RE.search(line)
+                if repeated:
+                    # Consecutive repeat lines all collapse the same original message,
+                    # so last_matched is deliberately left alone here.
+                    if last_matched:
+                        count += int(repeated.group(1))
+                    continue
+                last_matched = False
+    except OSError:
+        return 0  # best-effort: a missing spool must never fail the conversion
+    return count
 
 
 def _count_decode_errors(stderr_path):
@@ -1421,30 +1468,18 @@ def _count_decode_errors(stderr_path):
     Conversion runs with -max_error_rate 1.0, which stops ffmpeg aborting a conversion
     over decode errors alone; without this count a file whose audio was silently patched
     over would finish looking indistinguishable from a clean one.
-
-    A "Last message repeated N times" line is attributed to whatever it repeats, so it
-    counts N more only when the line it collapsed was itself a decode error.
     """
-    count = 0
-    last_was_error = False
-    try:
-        with open(stderr_path, 'r', errors='replace') as fh:
-            for line in fh:
-                if any(marker in line for marker in _DECODE_ERROR_MARKERS):
-                    count += 1
-                    last_was_error = True
-                    continue
-                repeated = _REPEATED_RE.search(line)
-                if repeated:
-                    # Consecutive repeat lines all collapse the same original message,
-                    # so last_was_error is deliberately left alone here.
-                    if last_was_error:
-                        count += int(repeated.group(1))
-                    continue
-                last_was_error = False
-    except OSError:
-        return 0  # best-effort: a missing spool must never fail the conversion
-    return count
+    return _count_logged_frames(
+        stderr_path, lambda line: any(marker in line for marker in _DECODE_ERROR_MARKERS))
+
+
+def _count_concealed_frames(stderr_path):
+    """How many frames the decoder finished by concealing damaged macroblocks, over the
+    whole stderr spool - frames that ARE in the output, with the damage painted over. A
+    different number from _count_decode_errors, and not a subset of it: a concealed frame
+    was decoded, so the decode-error count stays at 0 for it (dev/changelog/1196)."""
+    return _count_logged_frames(
+        stderr_path, lambda line: all(part in line for part in _CONCEALED_FRAME_MARKER))
 
 
 def collision_safe_dest(destination: str, source_path: str) -> str:
@@ -2796,6 +2831,7 @@ def do_postprocess(app, recording_id: int, ts_path: str):
             # The last dead attempt's evidence, for the give-up event when it is the last.
             final_death = None
             decode_errors = 0
+            concealed_frames = 0
             prev_death_out_time = None
             repeated_at = None
             audio_copy_fallback = False
@@ -2970,6 +3006,7 @@ def do_postprocess(app, recording_id: int, ts_path: str):
                 # a real outcome - success, death, stall - which is why the restart budget
                 # below can be spent without checking whether the attempt merely yielded.
                 decode_errors = max(decode_errors, result.decode_errors or 0)
+                concealed_frames = max(concealed_frames, result.concealed_frames or 0)
 
                 if result.success:
                     conversion_ok = True
@@ -3589,23 +3626,34 @@ def do_postprocess(app, recording_id: int, ts_path: str):
 
                     _commit_audio_copy_note()
 
-                if decode_errors:
+                if decode_errors or concealed_frames:
                     # The conversion succeeded only because -max_error_rate let it run past
-                    # frames it could not decode. Those frames are missing from the output,
-                    # so the file is not the clean success its size and status suggest.
+                    # frames it could not decode, or because the decoder painted over
+                    # damaged ones. The first kind is missing from the output and the second
+                    # is in it with the damage, so the file is not the clean success its size
+                    # and status suggest. Two numbers because they are two different things;
+                    # the sentence says each only when it is non-zero.
                     @retry_on_locked()
-                    def _commit_decode_errors_event(n=decode_errors):
+                    def _commit_decode_errors_event(n=decode_errors, c=concealed_frames):
+                        parts = []
+                        if n:
+                            parts.append(f'{n} frame(s) in the source could not be decoded and '
+                                         f'were dropped from the output')
+                        if c:
+                            parts.append(f'{c} frame(s) were decoded by concealing damaged '
+                                         f'blocks, so the picture is wrong in them')
                         add_recording_event(
                             recording_id, DIAGNOSTICS,
-                            detail=f'Conversion concealed damage: {n} frame(s) in the source '
-                                   f'could not be decoded and were dropped from the output.',
-                            extra={'kind': 'conversion_decode_errors', 'decode_errors': n},
+                            detail='Conversion concealed damage: ' + '; '.join(parts) + '.',
+                            extra={'kind': 'conversion_decode_errors', 'decode_errors': n,
+                                   'concealed_frames': c},
                         )
                         db.session.commit()
 
                     _commit_decode_errors_event()
-                    log.warning('Recording %d conversion dropped %d undecodable frame(s)',
-                                recording_id, decode_errors)
+                    log.warning('Recording %d conversion: %d undecodable frame(s) dropped, '
+                                '%d frame(s) decoded with concealed damage',
+                                recording_id, decode_errors, concealed_frames)
 
                 if output_check and output_check['lost_seconds']:
                     alerts.create_alert(
@@ -4004,10 +4052,20 @@ def _survey_recording(recording_id, ts_path, analysis_plan=None):
 
     @retry_on_locked()
     def _commit_survey():
+        from .database import Recording
         add_recording_event(recording_id, DIAGNOSTICS, detail=detail, extra=extra)
         if change:
             add_recording_event(recording_id, RECORDING_FORMAT_CHANGED,
                                 detail=change['detail'], extra=change['extra'])
+        # The verdict the Recordings list shows on every row, written in the survey's own
+        # commit so the row and the event can never disagree (dev/changelog/1307). A
+        # failed survey leaves the columns NULL: "not surveyed" is the truth, and the list
+        # keeps reading what each segment opened at.
+        rec = db.session.get(Recording, recording_id)
+        if rec is not None and stretches:
+            rec.format_survey_main = format_label(stretches['main'])
+            rec.format_survey_first = format_label(stretches['first'])
+            rec.format_survey_other_seconds = float(sum(s for _k, s, _spans in stretches['others']))
         db.session.commit()
 
     _commit_survey()

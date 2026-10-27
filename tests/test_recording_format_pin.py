@@ -124,6 +124,38 @@ class FormatPinTests(_PinCase):
         self.assertEqual(recording_format_pin(rec_a.id), SD)
         self.assertEqual(recording_format_pin(rec_b.id), HD)
 
+    # The settled reading (dev/changelog/1308): the pin's segment re-read off its tail a
+    # while after it opened. A provider in trouble can open on a minute of a lower format.
+    def _settle(self, seg, key):
+        seg.probe_settled_resolution, seg.probe_settled_fps = key[0], float(key[1])
+        seg.probe_settled_at = datetime.utcnow()
+        db.session.commit()
+
+    def test_the_settled_reading_wins_over_the_opening(self):
+        rec = self._rec()
+        seg = self._segment(rec, 1, SD)
+        self._settle(seg, HD)
+        self.assertEqual(recording_format_pin(rec.id), HD)
+
+    def test_the_opening_still_answers_what_the_segment_opened_at(self):
+        """segment_format_key is what the format-change events and the Segments table
+        read, and the settled reading must not rewrite it."""
+        rec = self._rec()
+        seg = self._segment(rec, 1, SD)
+        self._settle(seg, HD)
+        self.assertEqual(segment_format_key(seg), SD)
+
+    def test_a_later_segments_settled_reading_moves_nothing(self):
+        rec = self._rec()
+        self._segment(rec, 1, SD)
+        self._settle(self._segment(rec, 2, SD), HD)
+        self.assertEqual(recording_format_pin(rec.id), SD)
+
+    def test_a_settled_reading_matching_the_opening_changes_nothing(self):
+        rec = self._rec()
+        self._settle(self._segment(rec, 1, SD), SD)
+        self.assertEqual(recording_format_pin(rec.id), SD)
+
     def test_segment_format_key_rounds_fps_like_format_key(self):
         """59.94 and 60 are the same format - one rounding rule, or two callers disagree
         about whether a failover changed anything."""

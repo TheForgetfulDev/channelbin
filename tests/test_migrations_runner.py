@@ -934,6 +934,95 @@ class RecordingDiagnosticsSchemaTests(unittest.TestCase):
                         f'{sorted(self._SEGMENT_COLS - seg_model)}')
 
 
+class RecordingNumbersColumnsTests(unittest.TestCase):
+    """Migrations 103-105 (dev/changelog/1306, 1307, 1308): the segment's in-process
+    reconnect count, the format survey's verdict on the recording, and the pin segment's
+    settled probe. Scratch-DB characterizations like m020's, plus the one assertion with
+    teeth: the columns each step adds exist on the models, or a fresh create_all() DB and
+    an upgraded one disagree about the schema."""
+
+    _SEGMENT_COLS = {'reconnect_count', 'reconnects_truncated',
+                     'probe_settled_resolution', 'probe_settled_fps', 'probe_settled_at'}
+    _RECORDING_COLS = {'format_survey_main', 'format_survey_first',
+                       'format_survey_other_seconds'}
+
+    def _scratch(self):
+        import sqlite3
+        import tempfile
+        td = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__('shutil').rmtree(td, ignore_errors=True))
+        conn = sqlite3.connect(os.path.join(td, 'scratch.db'))
+        cur = conn.cursor()
+        cur.execute('CREATE TABLE recordings (id INTEGER PRIMARY KEY, name VARCHAR(255))')
+        cur.execute('CREATE TABLE recording_segments (id INTEGER PRIMARY KEY, '
+                    'recording_id INTEGER NOT NULL, probe_fps FLOAT)')
+        cur.execute('CREATE TABLE recording_events (id INTEGER PRIMARY KEY, '
+                    'recording_id INTEGER, event_type VARCHAR(64), extra_data TEXT)')
+        conn.commit()
+        return conn, cur
+
+    def test_steps_add_their_columns_and_run_twice_without_error(self):
+        conn, cur = self._scratch()
+        for _ in range(2):
+            M._m103_segment_reconnects(conn, cur)
+            M._m104_format_survey_verdict(conn, cur)
+            M._m105_segment_settled_probe(conn, cur)
+        seg_cols = {r[1] for r in cur.execute('PRAGMA table_info(recording_segments)')}
+        rec_cols = {r[1] for r in cur.execute('PRAGMA table_info(recordings)')}
+        self.assertTrue(self._SEGMENT_COLS <= seg_cols, sorted(self._SEGMENT_COLS - seg_cols))
+        self.assertTrue(self._RECORDING_COLS <= rec_cols, sorted(self._RECORDING_COLS - rec_cols))
+        conn.close()
+
+    def test_column_sets_match_the_models(self):
+        from app.database import Recording, RecordingSegment
+        seg_model = {c.name for c in RecordingSegment.__table__.columns}
+        rec_model = {c.name for c in Recording.__table__.columns}
+        self.assertTrue(self._SEGMENT_COLS <= seg_model, sorted(self._SEGMENT_COLS - seg_model))
+        self.assertTrue(self._RECORDING_COLS <= rec_model, sorted(self._RECORDING_COLS - rec_model))
+
+    def test_steps_are_registered_in_order(self):
+        registered = {v: fn for v, _d, fn in M.SCHEMA_MIGRATIONS}
+        self.assertIs(registered.get(103), M._m103_segment_reconnects)
+        self.assertIs(registered.get(104), M._m104_format_survey_verdict)
+        self.assertIs(registered.get(105), M._m105_segment_settled_probe)
+
+    def test_m104_backfills_the_verdict_from_the_newest_survey_event(self):
+        """The same stretches the postprocessor writes from, so an old row says what a new
+        one would; the newest survey wins, a failed one leaves NULL, no event leaves NULL."""
+        import json
+        conn, cur = self._scratch()
+        cur.executemany("INSERT INTO recordings (id, name) VALUES (?, ?)",
+                        [(1, 'mixed'), (2, 'steady'), (3, 'failed'), (4, 'never')])
+        mixed = {'kind': 'format_survey',
+                 'format_runs': [[0.0, 100.0, 1920, 1080, 60.0], [100.0, 130.0, 1280, 720, 30.0],
+                                 [130.0, 400.0, 1920, 1080, 59.94]],
+                 'format_seconds': [[1920, 1080, 60.0, 370.0], [1280, 720, 30.0, 30.0]]}
+        stale = {'kind': 'format_survey',
+                 'format_runs': [[0.0, 400.0, 640, 360, 25.0]],
+                 'format_seconds': [[640, 360, 25.0, 400.0]]}
+        steady = {'kind': 'format_survey',
+                  'format_runs': [[0.0, 400.0, 1920, 1080, 60.0]],
+                  'format_seconds': [[1920, 1080, 60.0, 400.0]]}
+        cur.executemany(
+            "INSERT INTO recording_events (recording_id, event_type, extra_data) VALUES (?, ?, ?)",
+            [(1, 'DIAGNOSTICS', json.dumps(stale)),
+             (1, 'DIAGNOSTICS', json.dumps(mixed)),
+             (2, 'DIAGNOSTICS', json.dumps(steady)),
+             (2, 'DIAGNOSTICS', json.dumps({'kind': 'capture_health'})),
+             (3, 'DIAGNOSTICS', json.dumps({'kind': 'format_survey', 'survey_failed': True}))])
+        conn.commit()
+        M._m104_format_survey_verdict(conn, cur)
+        rows = {r[0]: r[1:] for r in cur.execute(
+            'SELECT id, format_survey_main, format_survey_first, format_survey_other_seconds '
+            'FROM recordings')}
+        self.assertEqual(rows[1], ('1920x1080 @ 60', '1920x1080 @ 60', 30.0))
+        self.assertEqual(rows[2], ('1920x1080 @ 60', '1920x1080 @ 60', 0.0))
+        self.assertEqual(rows[3], (None, None, None))
+        self.assertEqual(rows[4], (None, None, None))
+        self.assertFalse(M._backfill_pending(cur, M._BF_FORMAT_SURVEY_VERDICT))
+        conn.close()
+
+
 class ChannelFailureStreakMigrationTests(unittest.TestCase):
     """Migration 26 - channels.consecutive_test_failures + backfill (dev/changelog/478).
     The raw ADD COLUMN half is a scratch-DB characterization like m020 above; the
@@ -1642,6 +1731,11 @@ _CURRENT_CODE_IMPORTS = {
     ('_backfill_consecutive_test_failures', '.database.ChannelTest'): _MODELS,
     ('_backfill_consecutive_test_failures', '.database.TEST_STATUS_CANCELLED'): _MODELS,
     ('_backfill_consecutive_test_failures', '.database.TEST_STATUS_FAILED'): _MODELS,
+    # recordings.format_survey_* are defined as what file_format_stretches() reads off the
+    # survey event today - the postprocessor writes them through the same function, so an
+    # old row and a new one say the same thing (dev/changelog/1307).
+    ('_backfill_format_survey_verdict', '.channel_groups.file_format_stretches'): _DEFINED_BY,
+    ('_backfill_format_survey_verdict', '.channel_groups.format_label'): _DEFINED_BY,
     # Decides where the pre-migration snapshot lands. Runs before any step and stamps
     # nothing into the database it is backing up.
     ('_backup_before_migration', '.config.db_backup_dir'): _PLUMBING,

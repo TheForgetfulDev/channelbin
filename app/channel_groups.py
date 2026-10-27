@@ -198,6 +198,20 @@ def segment_format_key(seg):
                            getattr(seg, 'probe_fps', None))
 
 
+def segment_pin_format_key(seg):
+    """The format_key a RecordingSegment contributes to its recording's PIN: the later,
+    settled reading of its tail when the watchdog took one (`probe_settled_resolution` /
+    `probe_settled_fps`), else what it opened at. segment_format_key() keeps answering
+    "what did it open at" for the format-change events and the Segments table; only the
+    pin prefers the settled reading, because the pin's job is to match the file as it is
+    going to be, not as its first two megabytes were (dev/changelog/1308)."""
+    if seg is None:
+        return None
+    settled = format_key_from(getattr(seg, 'probe_settled_resolution', None),
+                              getattr(seg, 'probe_settled_fps', None))
+    return settled if settled is not None else segment_format_key(seg)
+
+
 def recording_formats(segments):
     """The distinct segment_format_keys a recording's file holds, in the order they first
     appear, over segments already loaded in segment order. More than one means the finished

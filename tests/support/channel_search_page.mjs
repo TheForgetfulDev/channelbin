@@ -1639,7 +1639,13 @@ async function dayTimeScenario() {
   obs.tod_box_kept_focus = c.document.activeElement === box('to');
   obs.tod_box_same_node_while_focused = !!toBefore && box('to') === toBefore;
   obs.tod_label_while_focused = ((fac('tod') && fac('tod').querySelector('.wf-l')) || {}).textContent || '';
-  if (toBefore) { toBefore.blur(); await c.wait(20); }
+  // The catch-up runs on a 0 ms timer after the focusout, which four pooled scenarios in
+  // one event loop can hold off for longer than any flat sleep allows (dev/docs/BUGS.md
+  // 2026-10-26): polled, with the cap saying "never" apart from "late".
+  if (toBefore) {
+    toBefore.blur();
+    obs.tod_redraw_waited_ms = await c.waitUntil(() => box('to') !== toBefore && !!box('to'));
+  }
   obs.tod_box_redrawn_after_blur = !!toBefore && box('to') !== toBefore && !!box('to');
   obs.tod_label_after_retype = ((fac('tod') && fac('tod').querySelector('.wf-l')) || {}).textContent || '';
 

@@ -915,6 +915,12 @@
         {% endif %}
         {{ stat_row('Segments', rec.segments | length) }}
         {{ stat_row('Stalls', rec.total_stall_count, sv_cls=('warn' if rec.total_stall_count else none)) }}
+        {#- In-process reconnects are not stalls and not restarts: ffmpeg dropped the
+            connection and opened a new one inside a segment, which the two rows beside this
+            never count (dev/changelog/1306). -#}
+        {% set reconnects = rec.reconnect_count %}
+        {{ stat_row('Reconnects', ('at least ' if rec.reconnects_truncated else '') ~ reconnects, sv_cls=('warn' if reconnects else none),
+                    tip='Times ffmpeg dropped the stream and opened a new connection inside a segment, without the segment ending - its own repair, allowed by the read timeout. Not a stall (the file kept growing) and not a restart (the capture was not relaunched). Each one is on the segment\'s capture-ended line in the activity log, with what the provider sent again after it.' ~ (' "At least": one segment\'s log was longer than the scan reads, so its count is a floor.' if rec.reconnects_truncated else '')) }}
         {% set error_segments = rec.segments | selectattr('exit_reason', 'in', ('RESTART_NO_DATA', 'ERROR')) | list %}
         {#- Restarts, Restarts with no data and Failures in a row count three different
             things, and each label says which: as "Restarts 0", "Errors 4" and "Consecutive

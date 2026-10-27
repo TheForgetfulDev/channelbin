@@ -37,7 +37,8 @@ from ..epg_sources import (MATCH_DISAGREE, MATCH_NEW, REFRESH_HOURS_CHOICES, dir
                            delete_sources_for_account, delete_url_source,
                            ensure_provider_source, foreign_guided_channels, foreign_readers, has_directory,
                            forget_reader, move_source, name_match_review, propose_again,
-                           reject_name_matches, rejected_name_matches, reresolve_channels,
+                           refresh_busy_message, refreshing_source_names, reject_name_matches,
+                           rejected_name_matches, reresolve_channels, subscriber_ids,
                            stop_using_source, subscribe_to_source, update_url_source,
                            use_source_again)
 from ..logo_cache import delete_cached_logos
@@ -1462,11 +1463,14 @@ def delete_epg_source_api(account_id, source_id):
     _account, source, err = _json_owned_source(account_id, source_id)
     if err:
         return err
-    if source.refresh_started_at is not None:
-        return jsonify({'error': f'"{source.name}" is being refreshed right now. Delete it '
-                                 'once the refresh has finished.'}), 409
     name = source.name
     readers = foreign_readers([source_id], account_id)
+    # Its own refresh would go on writing rows for a source that no longer exists, and the
+    # re-resolve of every channel it guided races an import of any source their accounts read.
+    busy = refreshing_source_names([account_id] + [r.account_id for r in readers], [source_id])
+    if busy:
+        return jsonify({'error': refresh_busy_message(
+            busy, 'Delete it once the refresh has finished.')}), 409
     guided_elsewhere = foreign_guided_channels([source_id], account_id)
     from ..scheduler import remove_epg_source_jobs
     remove_epg_source_jobs(source_id)
@@ -1508,9 +1512,9 @@ def stop_using_epg_source_api(account_id, source_id):
     source = db.session.get(EpgSource, source_id)
     if source is None:
         return jsonify({'error': 'EPG source not found.'}), 404
-    if source.refresh_started_at is not None:
-        return jsonify({'error': f'"{source.name}" is being refreshed right now. Try again '
-                                 'once the refresh has finished.'}), 409
+    busy = refreshing_source_names([account_id], [source_id])
+    if busy:
+        return jsonify({'error': refresh_busy_message(busy)}), 409
     done = stop_using_source(account_id, source_id, _case_sensitive())
     if done is None:
         return jsonify({'error': 'This account is not using that source.'}), 400
@@ -1560,13 +1564,9 @@ def move_epg_source_api(account_id, source_id):
     if direction not in ('up', 'down'):
         return jsonify({'error': 'direction must be "up" or "down"'}), 400
     # An import resolving these channels at the same time would race the moves.
-    busy = [name for (name,) in db.session.query(EpgSource.name)
-            .join(EpgSourceSubscription, EpgSourceSubscription.source_id == EpgSource.id)
-            .filter(EpgSourceSubscription.account_id == account_id,
-                    EpgSource.refresh_started_at.isnot(None))]
+    busy = refreshing_source_names([account_id])
     if busy:
-        return jsonify({'error': f'"{busy[0]}" is being refreshed right now. Try again once '
-                                 'the refresh has finished.'}), 409
+        return jsonify({'error': refresh_busy_message(busy)}), 409
     done = move_source(account_id, source_id, -1 if direction == 'up' else 1,
                        _case_sensitive())
     if done is None:
@@ -1642,9 +1642,9 @@ def subscribe_epg_source_api(account_id):
     if source.owner_account_id == account_id:
         return jsonify({'error': 'That source belongs to this account - use Use again on '
                                  'its row instead.'}), 400
-    if source.refresh_started_at is not None:
-        return jsonify({'error': f'"{source.name}" is being refreshed right now. Try again '
-                                 'once the refresh has finished.'}), 409
+    busy = refreshing_source_names([account_id], [source.id])
+    if busy:
+        return jsonify({'error': refresh_busy_message(busy)}), 409
     owner_name = source.owner.name if source.owner else 'its account'
     done = subscribe_to_source(account_id, source.id, _case_sensitive())
     if done is None:
@@ -1787,6 +1787,11 @@ def accept_name_matches_api(source_id):
     picks = _review_picks(request.get_json(silent=True) or {})
     if not picks:
         return jsonify({'error': 'Nothing selected.'}), 400
+    # Each accepted key writes the channel's rows as Set key does, for channels on every
+    # account reading the source.
+    busy = refreshing_source_names(subscriber_ids(source_id), [source_id])
+    if busy:
+        return jsonify({'error': refresh_busy_message(busy)}), 409
     done = accept_name_matches(source, picks, _case_sensitive())
     parts = [f'Accepted {done.applied:,} name match{"es" if done.applied != 1 else ""}.']
     if done.waiting:

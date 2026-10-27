@@ -48,7 +48,8 @@ from app.database import (AccountSyncLog, Channel, ChannelGroup,  # noqa: E402
 from app.channel_search import (  # noqa: E402
     DEFAULT_FIELDS, DEFAULT_SORT, DEFAULT_STANDING, GRAIN_AIRINGS, GROUP_ANY,
     HEALTH_VALUES, MAX_PAGE_SIZE, OTHER_DUP_URL, OTHER_GUIDE_OWN_ROW, OTHER_GUIDE_VIA_GROUP,
-    OTHER_IN_GUIDE, OTHER_MONITORED, OTHER_NEW, OTHER_PROVIDER, OTHER_REMOVED, OTHER_VALUES,
+    OTHER_IN_GUIDE, OTHER_MONITORED, OTHER_NEW, OTHER_PROVIDER, OTHER_REMOVED,
+    OTHER_SOURCE_OVERRIDE, OTHER_VALUES,
     STANDING_OPTIONS, DimensionFilter, SearchContext, SearchState, SearchStateError,
     search, standing_applied)
 from app.search_index import rebuild_search_indexes  # noqa: E402
@@ -1224,6 +1225,32 @@ class StandingOptionTests(_EngineTestCase):
                          frozenset({'shownoepg', 'showuntested', 'showmembers'}))
 
 
+class SourceOverrideFilterTests(_EngineTestCase):
+    """The `srcoverride` Status value (dev/changelog/1298): the channels whose guide the
+    user pinned to one EPG source, which DESIGN-epg-sources.md §6.2 put the column on
+    `channels` to list and which could only be found one channel page at a time."""
+
+    def setUp(self):
+        super().setUp()
+        from tests.support.seed import make_epg_source
+        src = make_epg_source(self.acct)
+        # Pinned, not in force: the source has no listings for it. The filter reads the
+        # user's answer, not whether it currently decides the guide.
+        self.bbc.epg_source_override_id = src.id
+        db.session.commit()
+
+    def test_include_lists_the_pinned_channels_and_exclude_the_rest(self):
+        self.assertEqual(self.names(self.no_standing(
+            filters=(DimensionFilter('other', (OTHER_SOURCE_OVERRIDE,)),))), ['BBC World News'])
+        self.assertNotIn('BBC World News', self.names(self.no_standing(
+            filters=(DimensionFilter('other', ex=(OTHER_SOURCE_OVERRIDE,)),))))
+
+    def test_the_facet_count_matches_the_filter(self):
+        facets = search(SearchState(standing=only_hiding(), facets=('other',)),
+                        self.context()).facets['other']
+        self.assertEqual(facets[OTHER_SOURCE_OVERRIDE], 1)
+
+
 class FacetCountTests(_EngineTestCase):
     """The rail's counts: what they include, and what they must not."""
 
@@ -1263,7 +1290,7 @@ class FacetCountTests(_EngineTestCase):
         self.assertEqual(empty['other'],
                          {OTHER_REMOVED: 0, OTHER_NEW: 0, OTHER_IN_GUIDE: 0,
                           OTHER_GUIDE_OWN_ROW: 0, OTHER_GUIDE_VIA_GROUP: 0, OTHER_DUP_URL: 0,
-                          OTHER_PROVIDER: 0, OTHER_MONITORED: 0})
+                          OTHER_PROVIDER: 0, OTHER_MONITORED: 0, OTHER_SOURCE_OVERRIDE: 0})
         # Spelled out rather than built from OTHER_VALUES on purpose: this is the assertion
         # that a value added to the registry reaches the rail, so deriving it from the
         # registry would make it agree with itself and check nothing.

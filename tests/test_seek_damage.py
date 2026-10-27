@@ -367,6 +367,107 @@ class UndatedPacketFallbackTests(unittest.TestCase):
         self.assertLess(metrics['deficit_seconds'], 0.1)
 
 
+_NTSC60 = 1001 / 60000          # one 59.94 fps frame, exactly
+_NTSC60_PRINTED = '0.016678'    # what ffprobe prints for it: 1501 whole ticks of 1501.5
+
+
+def _ntsc60_packets(frames, skip=()):
+    """CSV packet lines for `frames` frames at 59.94 fps as ffprobe prints them off an
+    MPEG-TS: timestamps at the exact rate, durations rounded to whole 90 kHz ticks. Frames
+    whose index is in `skip` are left out, as a dropped frame would be."""
+    return [f'{i * _NTSC60:.6f},{i * _NTSC60:.6f},{_NTSC60_PRINTED}'
+            for i in range(frames) if i not in skip]
+
+
+class TickRoundedDurationTests(unittest.TestCase):
+    """dev/docs/BUGS.md 2026-10-26 - a flawless 59.94 fps capture read about a second an
+    hour missing, because the scan summed packet durations as ffprobe prints them (1501
+    ticks, half a tick short of a true frame) and measured them against a span that stops
+    at the last frame's start (dev/changelog/1304)."""
+
+    TEN_MINUTES = 36_000
+
+    def test_a_complete_59_94_capture_reads_nothing_missing(self):
+        with _FedPackets(_ntsc60_packets(self.TEN_MINUTES), 60000 / 1001) as path:
+            metrics = scan_video_timeline(path)
+        self.assertEqual(metrics['deficit_basis'], 'frame_durations')
+        self.assertLess(metrics['deficit_seconds'], 0.001,
+                        f'{metrics["deficit_seconds"]:.3f}s missing on a capture that held '
+                        f'every frame - the half-tick drift is back')
+
+    def test_the_drift_was_real(self):
+        """The arithmetic this replaced, on the same packets: half a tick a frame, less the
+        one frame the span stops short by. Pins the size of what the fix removed."""
+        drift = self.TEN_MINUTES * (_NTSC60 - float(_NTSC60_PRINTED)) - _NTSC60
+        self.assertGreater(drift, 0.15)
+        self.assertLess(drift, 0.25)
+
+    def test_one_dropped_frame_reads_as_one_frame(self):
+        """The extent runs to the end of the last frame, so a single lost frame is no longer
+        hidden behind the span's one-frame shortfall and the clamp at zero."""
+        with _FedPackets(_ntsc60_packets(self.TEN_MINUTES, skip={18_000}),
+                         60000 / 1001) as path:
+            metrics = scan_video_timeline(path)
+        self.assertAlmostEqual(metrics['deficit_seconds'], _NTSC60, delta=0.002)
+
+    def test_a_real_hole_still_reads_its_full_size(self):
+        skip = set(range(18_000, 18_000 + 300))   # 5 s of frames gone
+        with _FedPackets(_ntsc60_packets(self.TEN_MINUTES, skip=skip), 60000 / 1001) as path:
+            metrics = scan_video_timeline(path)
+        self.assertAlmostEqual(metrics['deficit_seconds'], 300 * _NTSC60, delta=0.002)
+        self.assertEqual(metrics['gap_count'], 1)
+
+    def test_durations_snap_only_to_a_rate_they_are_a_tick_from(self):
+        from app.probe import exact_frame_seconds
+        tick = 1 / 90000
+        self.assertAlmostEqual(exact_frame_seconds(1501 * tick), 1001 / 60000, places=12)
+        self.assertAlmostEqual(exact_frame_seconds(1502 * tick), 1001 / 60000, places=12)
+        self.assertAlmostEqual(exact_frame_seconds(1500 * tick), 1 / 60, places=12)
+        self.assertAlmostEqual(exact_frame_seconds(3753 * tick), 1001 / 24000, places=12)
+        self.assertAlmostEqual(exact_frame_seconds(3003 * tick), 1001 / 30000, places=12)
+        self.assertEqual(exact_frame_seconds(0.04), 0.04)        # 25 fps is already exact
+        self.assertEqual(exact_frame_seconds(0.05), 0.05)        # 20 fps: not a broadcast rate
+        self.assertEqual(exact_frame_seconds(1510 * tick), 1510 * tick)   # too far from any
+
+
+@unittest.skipUnless(_HAVE_FFMPEG, 'ffmpeg/ffprobe not installed')
+class TickRoundedDurationOnDiskTests(unittest.TestCase):
+    """The same drift on a clip this box's ffmpeg wrote and its ffprobe read - the fed packets
+    above assume what ffprobe prints, this measures it. Three minutes: long enough for the
+    drift to clear the one frame the span stops short by (10,789 frames x half a tick)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls._dir = tempfile.mkdtemp(prefix='ntsc60-')
+        cls.clip = os.path.join(cls._dir, 'ntsc60.ts')
+        _ffmpeg('-f', 'lavfi', '-i', 'testsrc=size=192x108:rate=60000/1001', '-t', '180',
+                '-c:v', 'libx264', '-preset', 'ultrafast', '-bf', '0',
+                '-pix_fmt', 'yuv420p', cls.clip)
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls._dir, ignore_errors=True)
+
+    def test_ffprobe_prints_tick_rounded_durations(self):
+        out = subprocess.run(
+            ['ffprobe', '-v', 'error', '-select_streams', 'v:0', '-show_entries',
+             'packet=pts_time,duration_time', '-of', 'csv=p=0', self.clip],
+            capture_output=True, text=True, check=True, timeout=120).stdout
+        pts, printed = [], 0.0
+        for line in out.splitlines():
+            p, d = line.strip().rstrip(',').split(',')[:2]
+            pts.append(float(p))
+            printed += float(d)
+        self.assertGreater(len(pts), 10_000)
+        self.assertGreater(max(pts) - min(pts) - printed, 0.03,
+                           'ffprobe no longer rounds a 59.94 frame short - the snap may be moot')
+
+    def test_the_scan_reads_nothing_missing(self):
+        metrics = scan_video_timeline(self.clip)
+        self.assertEqual(metrics['deficit_basis'], 'frame_durations')
+        self.assertLess(metrics['deficit_seconds'], 0.001, metrics)
+
+
 @unittest.skipUnless(_HAVE_FFMPEG, 'ffmpeg/ffprobe not installed')
 class ShortLowRateOpeningTests(unittest.TestCase):
     """dev/docs/BUGS.md 2026-10-15 @ 06:12:01 PM - recording 16's segment 4 was probed at

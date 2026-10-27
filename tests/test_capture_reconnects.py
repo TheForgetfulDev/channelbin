@@ -17,6 +17,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timedelta
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -24,7 +25,7 @@ from tests.support.app import make_test_app  # noqa: E402
 from tests.support import seed  # noqa: E402
 from app import db  # noqa: E402
 from app import recorder  # noqa: E402
-from app.database import DIAGNOSTICS, RecordingEvent, RecordingSegment  # noqa: E402
+from app.database import DIAGNOSTICS, Recording, RecordingEvent, RecordingSegment  # noqa: E402
 from app.proc_utils import (RECONNECT_MARKER, ReconnectJumps,  # noqa: E402
                             count_stderr_matches, read_reconnect_jumps, read_stderr_tail)
 
@@ -312,6 +313,29 @@ class ReconnectDisclosureTests(unittest.TestCase):
         db.session.commit()
         self.assertNotIn('reconnect', self._events()[0].detail)
 
+    # The count's column (dev/changelog/1306): the Stats card and the Recordings list sum it,
+    # where the detail string above is one line per segment in the activity log.
+    def test_the_count_is_written_to_the_segment_row(self):
+        self._record(-15, '', (8, True))
+        db.session.expire_all()
+        seg = db.session.get(RecordingSegment, self.seg.id)
+        self.assertEqual(seg.reconnect_count, 8)
+        self.assertFalse(seg.reconnects_truncated)
+
+    def test_a_quiet_exit_still_records_a_measured_zero(self):
+        """The early return that keeps a SIGTERM exit off the event log must not keep the
+        count off the row: 0 reconnects is a fact, NULL would mean never counted."""
+        self._record(-15, '', (0, True))
+        self.assertEqual(self._events(), [])
+        db.session.expire_all()
+        self.assertEqual(db.session.get(RecordingSegment, self.seg.id).reconnect_count, 0)
+
+    def test_a_truncated_scan_marks_the_row_as_a_floor(self):
+        self._record(4, '', (12, False))
+        db.session.expire_all()
+        self.assertTrue(db.session.get(RecordingSegment, self.seg.id).reconnects_truncated)
+
+
     # What the reconnects did to the file (dev/changelog/1237): a file that plays 86 s for a
     # 60 s window is a number nobody can explain unless the event says the provider's buffer
     # was captured again after each drop.
@@ -353,6 +377,72 @@ class ReconnectDisclosureTests(unittest.TestCase):
         self._record(4, '', (3, True), ReconnectJumps((), (), True))
         self.assertIn('reconnected 3 times', self._events()[0].detail)
         self.assertNotIn('twice', self._events()[0].detail)
+
+
+class ReconnectSurfacesTests(unittest.TestCase):
+    """The recording's total, and the two surfaces that read it: the list row's health
+    tooltip and the Stats card (dev/changelog/1306). Before the column the list read
+    "0 stalls - clean capture" for a recording whose one segment reconnected eight times."""
+
+    def setUp(self):
+        self.t = make_test_app()
+        self.now = datetime.utcnow()
+
+    def tearDown(self):
+        self.t.cleanup()
+
+    def _rec(self, counts):
+        rec = seed.make_recording(start_time=self.now - timedelta(seconds=3600),
+                                  stop_time=self.now, status='COMPLETED')
+        for n, (count, truncated) in enumerate(counts):
+            db.session.add(RecordingSegment(
+                recording_id=rec.id, segment_number=n, file_path=f'/nonexistent-{n}.ts',
+                started_at=self.now - timedelta(seconds=3600 - n * 600),
+                ended_at=self.now - timedelta(seconds=3000 - n * 600),
+                bytes_recorded=4096, stall_count=0,
+                reconnect_count=count, reconnects_truncated=truncated))
+        db.session.commit()
+        return rec.id
+
+    def _row(self, rec_id):
+        from app.routes.recordings import _index_row
+        from app.tz_utils import get_display_tz
+        db.session.expire_all()
+        return _index_row(db.session.get(Recording, rec_id), datetime.utcnow(),
+                          get_display_tz(), set())
+
+    def test_the_recording_total_sums_its_segments(self):
+        rid = self._rec([(3, False), (5, False), (None, None)])
+        rec = db.session.get(Recording, rid)
+        self.assertEqual(rec.reconnect_count, 8)
+        self.assertFalse(rec.reconnects_truncated)
+
+    def test_one_truncated_segment_makes_the_total_a_floor(self):
+        rid = self._rec([(3, False), (5, True)])
+        self.assertTrue(db.session.get(Recording, rid).reconnects_truncated)
+
+    def test_the_list_row_no_longer_calls_a_reconnecting_capture_clean(self):
+        health = self._row(self._rec([(8, False)]))['health']
+        self.assertEqual(health['cls'], 'ok', 'a reconnect is ffmpeg\'s own repair - green')
+        self.assertNotIn('clean capture', health['tip'])
+        self.assertIn('reconnected 8 times inside a segment', health['tip'])
+
+    def test_the_list_row_hedges_a_truncated_count(self):
+        self.assertIn('at least 12 times', self._row(self._rec([(12, True)]))['health']['tip'])
+
+    def test_a_single_reconnect_is_singular(self):
+        self.assertIn('reconnected 1 time inside', self._row(self._rec([(1, False)]))['health']['tip'])
+
+    def test_no_reconnects_keeps_the_clean_wording(self):
+        tip = self._row(self._rec([(0, False)]))['health']['tip']
+        self.assertIn('clean capture', tip)
+        self.assertNotIn('reconnected', tip)
+
+    def test_the_stats_card_has_a_reconnects_row(self):
+        rid = self._rec([(8, False)])
+        html = self.t.client.get(f'/recordings/{rid}').get_data(as_text=True)
+        self.assertIn('Reconnects', html)
+        self.assertIn('without the segment ending', html)
 
 
 if __name__ == '__main__':

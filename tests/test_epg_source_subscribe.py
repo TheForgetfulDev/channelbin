@@ -287,3 +287,11 @@ class QueryPlanTests(_TwoAccounts):
         from app.epg_sources import demote
         self._assert_channel_index(lambda: self._subscribe())
         self._assert_channel_index(lambda: demote([self.gap.id], self.src.id))
+
+    def test_stop_using_reaches_rows_by_channel(self):
+        """dev/docs/BUGS.md 2026-10-26: stop_using_source()'s deletes named the source and
+        its channels with a plain `source_id ==`, the one statement in the module that
+        walked every row the source holds."""
+        from app.epg_sources import stop_using_source
+        self._subscribe()
+        self._assert_channel_index(lambda: stop_using_source(self.beta.id, self.src.id, False))

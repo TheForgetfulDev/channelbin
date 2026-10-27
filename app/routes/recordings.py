@@ -1130,6 +1130,15 @@ def _index_row(rec, now, tz, thumb_ids, live_seg_bytes=0, file_formats=None,
                              f'{describe_format_stretches(file_formats)}. The file plays, '
                              f'but its header describes only '
                              f'{format_label(file_formats["first"])}.')
+    elif rec.format_survey_main is not None:
+        # The survey's verdict, stored on the row for exactly this reader (dev/changelog/1307):
+        # the same whole-file answer the page gives, without the survey's stretches, so a
+        # list row and the page never disagree about whether the file changes format.
+        if rec.format_survey_other_seconds:
+            format_change = (f'Format changed mid-recording: mostly {rec.format_survey_main}, '
+                             f'with {fmt_utils.fmt_duration(rec.format_survey_other_seconds, with_seconds=True)} '
+                             f'in other formats. The file plays, but its header describes '
+                             f'only {rec.format_survey_first or rec.format_survey_main}.')
     else:
         formats = recording_formats(rec.segments)
         if len(formats) > 1:
@@ -1137,6 +1146,16 @@ def _index_row(rec, now, tz, thumb_ids, live_seg_bytes=0, file_formats=None,
                              f'{", then ".join(format_label(k) for k in formats)}. The file '
                              f'plays, but its header describes only {format_label(formats[0])}.')
     format_tail = f' {format_change}' if format_change else ''
+    # In-process reconnects (dev/changelog/1306): a segment that dropped and reopened its
+    # connection eight times is not a clean capture, whatever the stall count says.
+    reconnects = rec.reconnect_count
+    if reconnects:
+        howmany = f'at least {reconnects}' if rec.reconnects_truncated else f'{reconnects}'
+        reconnect_tail = (f' The stream dropped and ffmpeg reconnected {howmany} '
+                          f'time{"" if reconnects == 1 and not rec.reconnects_truncated else "s"} '
+                          f'inside a segment, without restarting the capture.')
+    else:
+        reconnect_tail = ''
     if not rec.segments:
         health = {'cls': 'na', 'label': '-', 'tip': None}
     elif rec.status == REC_STATUS_FAILED:
@@ -1148,14 +1167,14 @@ def _index_row(rec, now, tz, thumb_ids, live_seg_bytes=0, file_formats=None,
                   'text': f'⚠ {fmt_utils.counted(stalls, "stall")}',
                   'tip': (f'{len(rec.segments)} segments · {stalls} stalls · '
                           f'{fmt_utils.counted(rec.consecutive_failures or 0, "consecutive failed restart")}. '
-                          f'{kept}{missing}{spanned}{format_tail}')}
+                          f'{kept}{missing}{reconnect_tail}{spanned}{format_tail}')}
     elif stalls > 0:
         downtime = (f' {fmt_utils.fmt_duration(rec.total_downtime_seconds, with_seconds=True)} '
                     f'with nothing being written.') if rec.total_downtime_seconds else ''
         health = {'cls': 'warn', 'label': f'⚠ {stalls}',
                   'text': f'⚠ {fmt_utils.counted(stalls, "stall")}',
                   'tip': (f'{len(rec.segments)} segments · {stalls} stalls, recovered '
-                          f'automatically.{downtime}{missing}{spanned}{format_tail}')}
+                          f'automatically.{downtime}{missing}{reconnect_tail}{spanned}{format_tail}')}
     elif rec.fast_delivery_segment_count:
         # A frozen or looping feed writes bytes at full rate and keeps ffmpeg's frame counter
         # moving, so it never stalls and never restarts - which meant this row read a green
@@ -1165,12 +1184,15 @@ def _index_row(rec, now, tz, thumb_ids, live_seg_bytes=0, file_formats=None,
         health = {'cls': 'warn', 'label': '⚠', 'text': '⚠ not clean',
                   'tip': (f'{len(rec.segments)} segment'
                           f'{"s" if len(rec.segments) != 1 else ""} · 0 stalls, but the '
-                          f'capture was not clean.{missing}{spanned}{format_tail}')}
+                          f'capture was not clean.{missing}{reconnect_tail}{spanned}{format_tail}')}
     else:
-        clean = '' if format_change else ' - clean capture'
+        # A reconnect is ffmpeg's own repair of a dropped feed, kept inside the segment, so
+        # the pill stays green like a mixed-format file's does - but the words "clean
+        # capture" are not true of it (dev/changelog/1306).
+        clean = '' if (format_change or reconnects) else ' - clean capture'
         health = {'cls': 'ok', 'label': '✓', 'text': '✓ no stalls',
                   'tip': (f'{len(rec.segments)} segment{"s" if len(rec.segments) != 1 else ""} '
-                          f'· 0 stalls{clean}.{missing}{spanned}{format_tail}')}
+                          f'· 0 stalls{clean}.{missing}{reconnect_tail}{spanned}{format_tail}')}
 
     video, audio, tech_source = _tech_parts(rec)
     tech_line = ' · '.join(p for p in (video, audio) if p) or None

@@ -3151,6 +3151,127 @@ def _m101_alert_cleared_by_app(conn, cur):
     conn.commit()
 
 
+def _m102_epg_source_indexes(conn, cur):
+    """Two indexes the EPG sources review measured as missing (dev/changelog/1298).
+
+    ix_channels_epg_source: `refresh_source_counts()` counts channels per source on
+    `epg_source_id` at the end of every import and re-resolve, `foreign_readers()` groups on
+    it for every account page, and the deletes collect affected channels on it - each a
+    scan of every channel (135 ms warm, 3.0 s cold on 201,057 channels). ix_epg_alt_channel:
+    the Channel cascade on an account delete, the hide purge and the channel bulk delete
+    read epg_alternate_entries by channel alone, which the (source_id, channel_id) index
+    cannot serve - one scan per channel, 11.6 ms each at 200,000 rows. The write costs
+    measured for both are on the model definitions. CREATE INDEX IF NOT EXISTS, so the step
+    is re-runnable from the top."""
+    cur.execute('CREATE INDEX IF NOT EXISTS ix_channels_epg_source_id '
+                'ON channels (epg_source_id)')
+    cur.execute('CREATE INDEX IF NOT EXISTS ix_epg_alt_channel '
+                'ON epg_alternate_entries (channel_id)')
+    conn.commit()
+
+
+def _m103_segment_reconnects(conn, cur):
+    """recording_segments: reconnect_count + reconnects_truncated - how many times ffmpeg
+    dropped and reopened its connection inside the segment, counted off the whole stderr
+    spool when the segment closes (dev/changelog/1306).
+
+    No backfill: the count lived in the segment's DIAGNOSTICS detail string as prose, and a
+    segment closed before this column existed stays NULL - "not recorded", which is the
+    truth, where a 0 would claim it never reconnected."""
+    cols = {r[1] for r in cur.execute('PRAGMA table_info(recording_segments)').fetchall()}
+    if not cols:
+        return
+    if 'reconnect_count' not in cols:
+        cur.execute('ALTER TABLE recording_segments ADD COLUMN reconnect_count INTEGER')
+    if 'reconnects_truncated' not in cols:
+        cur.execute('ALTER TABLE recording_segments ADD COLUMN reconnects_truncated BOOLEAN')
+    conn.commit()
+
+
+_BF_FORMAT_SURVEY_VERDICT = 'm104.format_survey_verdict'
+
+
+def _m104_format_survey_verdict(conn, cur):
+    """recordings: format_survey_main, format_survey_first, format_survey_other_seconds -
+    the whole-file format survey's verdict, for the Recordings list, which cannot read a
+    survey event per row (dev/changelog/1307).
+
+    Backfilled from each recording's newest `format_survey` DIAGNOSTICS event, whose
+    extra_data holds the survey's stretches: the same `file_format_stretches` the
+    postprocessor applies when it writes the columns, so an old row and a new one say the
+    same thing. A recording with no such event, or whose survey failed, stays NULL and the
+    list keeps reading what its segments opened at. Registered before the ALTER and
+    re-runnable from the top (dev/changelog/686)."""
+    cols = {r[1] for r in cur.execute('PRAGMA table_info(recordings)').fetchall()}
+    if not cols:
+        return
+    registered = False
+    if 'format_survey_main' not in cols:
+        _register_backfill(conn, cur, _BF_FORMAT_SURVEY_VERDICT)
+        registered = True
+        cur.execute('ALTER TABLE recordings ADD COLUMN format_survey_main VARCHAR(32)')
+    if 'format_survey_first' not in cols:
+        cur.execute('ALTER TABLE recordings ADD COLUMN format_survey_first VARCHAR(32)')
+    if 'format_survey_other_seconds' not in cols:
+        cur.execute('ALTER TABLE recordings ADD COLUMN format_survey_other_seconds FLOAT')
+    conn.commit()
+    if _backfill_needed(cur, _BF_FORMAT_SURVEY_VERDICT, registered):
+        _backfill_format_survey_verdict(cur)
+        conn.commit()
+        _finish_backfill(conn, cur, _BF_FORMAT_SURVEY_VERDICT)
+
+
+def _backfill_format_survey_verdict(cur):
+    """Raw SQL over recording_events, newest format_survey event per recording; a recompute
+    from the top, so a resumed attempt rewrites every row rather than extending any."""
+    import json
+    from .channel_groups import file_format_stretches, format_label
+    rows = cur.execute(
+        "SELECT recording_id, extra_data FROM recording_events "
+        "WHERE event_type = 'DIAGNOSTICS' AND extra_data LIKE '%\"format_survey\"%' "
+        "ORDER BY recording_id ASC, id DESC").fetchall()
+    seen = set()
+    for recording_id, raw in rows:
+        if recording_id in seen:
+            continue
+        try:
+            extra = json.loads(raw) if raw else {}
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(extra, dict) or extra.get('kind') != 'format_survey':
+            continue
+        seen.add(recording_id)
+        if extra.get('survey_failed'):
+            continue
+        stretches = file_format_stretches({k: v for k, v in extra.items() if k != 'kind'})
+        if not stretches:
+            continue
+        cur.execute(
+            'UPDATE recordings SET format_survey_main = ?, format_survey_first = ?, '
+            'format_survey_other_seconds = ? WHERE id = ?',
+            (format_label(stretches['main']), format_label(stretches['first']),
+             float(sum(s for _k, s, _spans in stretches['others'])), recording_id))
+
+
+def _m105_segment_settled_probe(conn, cur):
+    """recording_segments: probe_settled_resolution, probe_settled_fps, probe_settled_at -
+    a second reading of the pin segment's format off its tail, taken by the watchdog once
+    the segment has run a while (dev/changelog/1308).
+
+    No backfill: NULL means "not re-read", which is true of every segment captured before
+    the watchdog did this."""
+    cols = {r[1] for r in cur.execute('PRAGMA table_info(recording_segments)').fetchall()}
+    if not cols:
+        return
+    if 'probe_settled_resolution' not in cols:
+        cur.execute('ALTER TABLE recording_segments ADD COLUMN probe_settled_resolution VARCHAR(32)')
+    if 'probe_settled_fps' not in cols:
+        cur.execute('ALTER TABLE recording_segments ADD COLUMN probe_settled_fps FLOAT')
+    if 'probe_settled_at' not in cols:
+        cur.execute('ALTER TABLE recording_segments ADD COLUMN probe_settled_at DATETIME')
+    conn.commit()
+
+
 def _m081_account_blocks(conn, cur):
     """account_blocks: the stretches of time the user has told ChannelBin to keep off an
     account (app/account_blocks.py, dev/changelog/1151).
@@ -3496,6 +3617,15 @@ SCHEMA_MIGRATIONS = [
      '"TV Guide health check"', _m100_rename_system_check),
     (101, 'alerts: cleared_by_app, an alert the app took down because its condition ended',
      _m101_alert_cleared_by_app),
+    (102, 'channels.epg_source_id and epg_alternate_entries.channel_id: indexes for the '
+     'per-source counts and the per-channel deletes that scanned', _m102_epg_source_indexes),
+    (103, 'recording_segments: reconnect_count + reconnects_truncated, the in-process '
+     'reconnects a segment\'s close counted off its stderr', _m103_segment_reconnects),
+    (104, 'recordings: format_survey_main/first/other_seconds, the whole-file format '
+     'survey\'s verdict for the Recordings list, backfilled from the survey events',
+     _m104_format_survey_verdict),
+    (105, 'recording_segments: probe_settled_resolution/fps/at, the format the pin\'s '
+     'segment was carrying a while after it opened', _m105_segment_settled_probe),
 ]
 
 CURRENT_SCHEMA_VERSION = SCHEMA_MIGRATIONS[-1][0]

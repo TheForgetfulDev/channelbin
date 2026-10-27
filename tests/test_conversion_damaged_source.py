@@ -15,6 +15,7 @@ Three invariants are guarded here:
   3. A conversion that finished only by dropping undecodable frames says so - the whole
      point of tolerating damage is that the damage stays visible (product principle 1).
 """
+import json
 import os
 import sys
 import unittest
@@ -29,7 +30,7 @@ from tests.support import seed  # noqa: E402
 from app import db  # noqa: E402
 from app.database import Recording, RecordingEvent, CONVERSION_RESTARTED, CONVERSION_FAILED  # noqa: E402
 from app.postprocessor import (  # noqa: E402
-    ConversionResult, do_postprocess, _count_decode_errors,
+    ConversionResult, do_postprocess, _count_concealed_frames, _count_decode_errors,
     _active_conversions, _active_lock,
 )
 
@@ -264,6 +265,31 @@ class DecodeErrorDisclosureTests(_ConversionCase):
                  if 'concealed damage' in (e.detail or '')]
         self.assertEqual(diags, [], 'no damage, no event')
 
+    def test_concealed_frames_alone_are_reported(self):
+        """dev/changelog/1196's case: nothing undecodable, one frame painted over. Before
+        dev/changelog/1309 that conversion finished with no event at all."""
+        cfg = _config()
+        self._run(cfg, lambda *a, **k: ConversionResult(
+            True, 'success', out_time=18000.0, decode_errors=0, concealed_frames=1))
+        diags = [e for e in self._events('DIAGNOSTICS')
+                 if 'concealed damage' in (e.detail or '')]
+        self.assertEqual(len(diags), 1, 'a concealed frame is damage and must be said')
+        self.assertIn('1 frame(s) were decoded by concealing', diags[0].detail)
+        self.assertNotIn('could not be decoded', diags[0].detail)
+        extra = json.loads(diags[0].extra_data)
+        self.assertEqual(extra['concealed_frames'], 1)
+        self.assertEqual(extra['decode_errors'], 0)
+
+    def test_both_counts_share_one_event(self):
+        cfg = _config()
+        self._run(cfg, lambda *a, **k: ConversionResult(
+            True, 'success', out_time=18000.0, decode_errors=3, concealed_frames=7))
+        diags = [e for e in self._events('DIAGNOSTICS')
+                 if 'concealed damage' in (e.detail or '')]
+        self.assertEqual(len(diags), 1)
+        self.assertIn('3 frame(s) in the source could not be decoded', diags[0].detail)
+        self.assertIn('7 frame(s) were decoded by concealing', diags[0].detail)
+
     def test_errors_from_an_earlier_attempt_are_not_lost(self):
         # The successful attempt may be clean while an earlier one hit the damage; the
         # output still came from the same damaged source.
@@ -328,6 +354,36 @@ class CountDecodeErrorsTests(unittest.TestCase):
             '[aist#0:1/aac] Decoding error: Invalid data found\n'
         )
         self.assertEqual(_count_decode_errors(self.path), 1)
+
+    # The concealed count (dev/changelog/1309): the lines below are what this box's ffmpeg
+    # 7.1 printed, at the conversion's level+info, over a deliberately damaged H.264 TS.
+    CONCEALED_LOG = (
+        '[info] [mpegts @ 0x1] Packet corrupt (stream = 0, dts = 567441).\n'
+        '[error] [h264 @ 0x2] error while decoding MB 8 5\n'
+        '[info] [h264 @ 0x2] concealing 65 DC, 65 AC, 65 MV errors in P frame\n'
+        '[warning] [vist#0:0/h264 @ 0x3] [dec:h264 @ 0x4] corrupt decoded frame\n'
+        '[info] [h264 @ 0x2] concealing 8160 DC, 8160 AC, 8160 MV errors in I frame\n'
+        '    Last message repeated 3 times\n'
+        '[warning] [vist#0:0/h264 @ 0x3] [dec:h264 @ 0x4] corrupt decoded frame\n'
+        '    Last message repeated 3 times\n'
+    )
+
+    def test_concealed_frames_are_counted_once_each(self):
+        """One line per frame from the decoder's error resilience, with the collapsed
+        repeats attributed to it; the CLI's "corrupt decoded frame" names the same frames
+        and is not counted again."""
+        self._write(self.CONCEALED_LOG)
+        self.assertEqual(_count_concealed_frames(self.path), 5)
+
+    def test_a_concealed_frame_is_not_a_decode_error(self):
+        """The GPU lab's damaged clip: visible damage, and a decode-error count of 0 -
+        the two numbers are two different things (dev/changelog/1196)."""
+        self._write(self.CONCEALED_LOG)
+        self.assertEqual(_count_decode_errors(self.path), 0)
+
+    def test_concealed_count_is_zero_on_a_clean_log(self):
+        self._write('size=  100kB time=00:00:01.00 bitrate=1.0kbits/s speed=1x\n')
+        self.assertEqual(_count_concealed_frames(self.path), 0)
 
     def test_consecutive_repeat_lines_all_belong_to_the_same_message(self):
         self._write(

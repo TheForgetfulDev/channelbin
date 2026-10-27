@@ -5,6 +5,40 @@ Notable changes to ChannelBin, newest first. This project follows
 release is tagged `v<version>` in git, and the version the app is running is shown in the
 page footer.
 
+## 0.31.0 - 2026-10-27
+
+Recording numbers that agree.
+
+**Added**
+
+- A recording's Stats card counts reconnects: the times the stream dropped and reopened
+  inside a segment. The Recordings list no longer calls such a capture clean.
+- A conversion counts the frames the decoder repaired by concealing damage, beside the
+  frames it could not decode at all.
+- Channel Search can list every channel whose guide is pinned to one EPG source.
+
+**Changed**
+
+- A recording's format is read again a few minutes in, so a feed that opened on a short
+  stretch of a lower format no longer sets the format for the whole run. The activity log
+  shows when it moves.
+- The Recordings list reads a recording's format from the whole-file survey, so a row and its
+  page agree on whether the file changed format.
+- The capture-quality score's downtime line says it measures time with nothing being written,
+  not content lost.
+
+**Fixed**
+
+- A scheduled recording no longer loses the last few seconds before its stop time.
+- Downtime counts the whole of a segment that captured nothing, so it no longer reads less
+  than the capture gaps inside it.
+- A complete 59.94 fps recording no longer shows a fraction of a second missing for every ten
+  minutes recorded.
+- An EPG source refresh that was skipped, or cut short by a restart is logged instead of
+  reading as a healthy import.
+- Changing a channel's guide source while a refresh is running is refused with a message
+  instead of racing the refresh.
+
 ## 0.30.0 - 2026-10-26
 
 Get started, example channels, cleaner pages.

@@ -1496,7 +1496,8 @@ def _subscribed_source(channel, raw_source_id):
 def set_channel_epg_key(channel_id):
     """Body {source_id, key}; a blank key clears it. The channel page's Set key / Clear key
     (DESIGN-epg-sources.md §6.1, §9.3), through the one writer."""
-    from ..epg_sources import case_sensitive_matching, set_channel_key
+    from ..epg_sources import (case_sensitive_matching, refresh_busy_message,
+                               refreshing_source_names, set_channel_key)
     data = request.get_json(silent=True) or {}
     key = data.get('key')
     if key is not None and not isinstance(key, str):
@@ -1514,6 +1515,11 @@ def set_channel_epg_key(channel_id):
         source = _subscribed_source(channel, data.get('source_id'))
         if source is None:
             return 400, "That EPG source isn't one this channel's account reads."
+        # The key write deletes and re-inserts the channel's rows for the source and moves
+        # the old winner's; an import of any source the account reads does the same.
+        busy = refreshing_source_names([channel.account_id], [source.id])
+        if busy:
+            return 409, refresh_busy_message(busy)
         change = set_channel_key(channel, source, key, case_sensitive=case_sensitive)
         db.session.commit()
         return 200, change
@@ -1533,8 +1539,8 @@ def set_channel_epg_source_override(channel_id):
     override (DESIGN-epg-sources.md §6.2, §9.3), through the one writer. Only a source the
     channel's account reads can be chosen; clearing is always allowed, including an
     override on a source the account has since stopped reading."""
-    from ..database import EpgSource, EpgSourceSubscription
-    from ..epg_sources import case_sensitive_matching, set_source_override
+    from ..epg_sources import (case_sensitive_matching, refresh_busy_message,
+                               refreshing_source_names, set_source_override)
     raw = (request.get_json(silent=True) or {}).get('source_id')
     if raw is not None and (isinstance(raw, bool) or not isinstance(raw, int)):
         return jsonify({'error': 'source_id must be a source id or null'}), 400
@@ -1551,14 +1557,9 @@ def set_channel_epg_source_override(channel_id):
             if source is None:
                 return 400, "That EPG source isn't one this channel's account reads."
         # An import resolving this channel's winner at the same time would race the moves.
-        refreshing = [name for (name,) in db.session.query(EpgSource.name)
-                      .join(EpgSourceSubscription,
-                            EpgSourceSubscription.source_id == EpgSource.id)
-                      .filter(EpgSourceSubscription.account_id == channel.account_id,
-                              EpgSource.refresh_started_at.isnot(None))]
-        if refreshing:
-            return 409, (f'"{refreshing[0]}" is being refreshed right now. Try again once the '
-                         'refresh has finished.')
+        busy = refreshing_source_names([channel.account_id])
+        if busy:
+            return 409, refresh_busy_message(busy)
         change = set_source_override(channel, source, case_sensitive=case_sensitive)
         db.session.commit()
         return 200, change
