@@ -43,7 +43,7 @@
 /* A toolbar button's label, dropped at phone widths so the button becomes icon-only (13.3).
    The icon ships in the markup at every width and is hidden on desktop, so there is one
    button and one handler rather than a mobile duplicate. */
-.guide-icon { display: none; }
+.guide-icon { display: none; width: 16px; height: 16px; }
 .guide-btn-label { display: inline; }
 
 .guide-cluster-label {
@@ -1644,3 +1644,16 @@
   margin-top: 2px;
   white-space: nowrap;
 }
+
+/* ── The program chooser (12.10 / 13.10, static/js/program-chooser.js) ──────────
+   Everything else it draws is shared: the side panel and the tiles (style.css 3.19, 3.20),
+   the record dialog's .prog-head program header, this file's .rec-badge chip. What lives
+   here is the line above the program saying where it stands, and the group row's note. */
+.chooser-state { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+.chooser-state .rec-badge { font-size: var(--fs-2xs); height: auto; line-height: 1.3; }
+.chooser-air {
+  font-size: var(--fs-2xs); font-weight: 700; text-transform: uppercase; letter-spacing: 0.04em;
+  color: var(--text-muted);
+}
+.chooser-air.is-on { color: var(--live); }
+.chooser-note { font-size: var(--fs-xs); color: var(--text-faint); line-height: 1.4; margin: 0 0 10px; }

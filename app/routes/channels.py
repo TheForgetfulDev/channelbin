@@ -919,6 +919,9 @@ def channel_detail(channel_id):
     from ..channel_search import DimensionFilter
     chan_epg_search_url = airing_search_url(
         filters=(DimensionFilter('chan', (str(channel.id),), ()),))
+    # The What's On card's program chooser: "where else is THIS program on", so program
+    # titles only (the recording page's Find another airing asks the same question).
+    program_airings_url = airing_search_url(fields=('epg-title',))
 
     # How many step-backs are available and what the next one would leave the score at -
     # both promised in the confirm dialogs, so both come from the same replay that will run
@@ -955,6 +958,7 @@ def channel_detail(channel_id):
         total_epg_count=total_epg_count,
         guide_source=guide_source,
         chan_epg_search_url=chan_epg_search_url,
+        program_airings_url=program_airings_url,
         test_history=test_history,
         test_pagination=test_pagination,
         per_page=per_page,

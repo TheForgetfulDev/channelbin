@@ -122,12 +122,14 @@ something by the time you depend on it.
 
 ## Step 4: Record something
 
-Open the **TV Guide** and click a program.
+Open the **TV Guide** and click a program. A panel opens with the program's details and what
+you can do with it: record it, test or preview the channel, copy its stream URL, find other
+airings, or go to the channel's page. On a phone it opens as a sheet from the bottom.
 
-- For a program that has not started, the dialog's button is **Schedule recording**.
-- For a program that is already on, the button is **Record now**. The dialog says how long ago it
-  started and that **that part will not be in the file**. ChannelBin can only record from the
-  moment you press the button.
+- For a program that has not started, the first action is **Schedule recording**.
+- For a program that is already on, it is **Record now**. The dialog it opens says how long ago
+  the program started and that **that part will not be in the file**. ChannelBin can only
+  record from the moment you press the button.
 
 <img src="screenshots/record-now.png" alt="The Record now dialog for a program that started 11 minutes ago: the program's time, channel and description, an amber note that the first 11 minutes will not be in the file, then the recording name, start and stop times, recording profile, and the folded Stream URL and Block account use sections." width="460">
 

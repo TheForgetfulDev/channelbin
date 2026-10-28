@@ -327,6 +327,28 @@ function statusVocab(family) {
   return _statusVocab[family] || {};
 }
 
+// The one way a script draws an icon: a meaning from the registry (app/icons.py), drawn
+// from the generated MDI sprite. Writes exactly the markup the Jinja icon() global does
+// (tests/test_icon_registry.py holds the two equal). An unknown name draws nothing and says
+// so in the console - a typo is a missing icon, never a broken page.
+let _iconMeta = null;
+function icon(name, cls = '') {
+  if (_iconMeta === null) {
+    const meta = document.querySelector('meta[name="icon-sprite"]');
+    _iconMeta = {
+      url: meta ? meta.content : '',
+      names: new Set(((meta && meta.dataset.names) || '').split(' ').filter(Boolean)),
+    };
+  }
+  if (!_iconMeta.names.has(name)) {
+    console.error(`no icon named "${name}" in app/icons.py`);
+    return '';
+  }
+  const classes = cls ? `icon ${cls}` : 'icon';
+  return `<svg class="${escHtml(classes)}" data-icon="${name}" aria-hidden="true">`  // icon-ok: the registry's own markup
+    + `<use href="${escHtml(_iconMeta.url)}#i-${name}"></use></svg>`;
+}
+
 // The label a post-processing chain badges as while it is parked waiting for another
 // recording to give up the machine (app/fmt_utils.py::REC_WAITING_LABEL).
 function recWaitingLabel() {
@@ -1048,12 +1070,18 @@ function buildModal({ title = '', body = '', footer = [], dismissable = true, on
 // one copy of everything; `original` is the menu item the row was copied from (null for a
 // list item), for a handler that needs the element still inside its card. The tap does not
 // bubble, so a page's delegated `[data-act]` handler never sees it and runs nothing twice.
-function openMenuSheet(source, { title = '', onAct } = {}) {
+// With `tiles: true` a list's items render as actionTilesHtml() icon tiles instead of rows,
+// under an optional `head` (HTML: what the actions are about) and over a plain-text `note`
+// (why a greyed tile is greyed - a tile has no room to say so itself).
+function openMenuSheet(source, { title = '', onAct, tiles = false, head = '', note = '' } = {}) {
   const body = document.createElement('div');
   body.className = 'acct-sheet';
   const originals = new Map();
   const addSep = () => body.insertAdjacentHTML('beforeend', '<div class="sheet-sep"></div>');
-  if (source instanceof Element) {
+  if (tiles) {
+    body.innerHTML = head + actionTilesHtml(source || [])
+      + (note ? `<p class="act-tiles-note">${escHtml(note)}</p>` : '');
+  } else if (source instanceof Element) {
     Array.from(source.children).forEach((item) => {
       if (item.classList.contains('sep')) { addSep(); return; }
       const copy = item.cloneNode(true);
@@ -1092,6 +1120,75 @@ function openMenuSheet(source, { title = '', onAct } = {}) {
   });
   return sheet;
 }
+
+// Actions as icon tiles (DESIGN.md 3.20): an icon over a short label, in a grid. Items are
+// openMenuSheet's list shape plus `icon` (a registry name) and `tip`; a `{sep}` has no tile
+// form and is skipped. An item with `href` stays a real link, so a middle-click opens a tab.
+function actionTilesHtml(items) {
+  return `<div class="act-tiles">${items.filter((i) => !i.sep).map((i) => {
+    const inner = `${icon(i.icon)}<span class="act-tile-label">${escHtml(i.label)}</span>`;
+    const tip = i.tip ? ` data-tip="${escHtml(i.tip)}"` : '';
+    if (i.href) return `<a class="act-tile" href="${escHtml(i.href)}"${tip}>${inner}</a>`;
+    return `<button type="button" class="act-tile" data-act="${escHtml(i.act)}"`
+      + `${i.disabled ? ' disabled' : ''}${tip}>${inner}</button>`;
+  }).join('')}</div>`;
+}
+
+// The desktop side panel (DESIGN.md 3.19): docked to the right edge with no scrim, so the
+// page beside it stays live and a second open refills it rather than stacking another. One
+// panel at a time - opening it again runs the previous caller's onClose first. Deliberately
+// not in OVERLAY_SEL: it locks no scroll and holds no page refresh, so a caller whose page
+// re-renders under it keeps its contents current itself.
+let _sidePanel = null;
+function openSidePanel({ title = '', body = '', onClose = null } = {}) {
+  if (_sidePanel) {
+    const prev = _sidePanel.onClose;
+    _sidePanel = null;
+    if (prev) prev();
+  }
+  let panel = document.getElementById('side-panel');
+  if (!panel) {
+    panel = document.createElement('aside');
+    panel.id = 'side-panel';
+    panel.className = 'side-panel';
+    panel.tabIndex = -1;
+    panel.innerHTML = '<div class="side-panel-head"><h2></h2>'
+      + `<button type="button" class="modal-close" aria-label="Close">${icon('close')}</button></div>`
+      + '<div class="side-panel-body"></div>';
+    panel.querySelector('.modal-close').addEventListener('click', () => closeSidePanel());
+    document.body.appendChild(panel);
+  }
+  panel.querySelector('h2').textContent = title;
+  panel.setAttribute('aria-label', title);
+  const bodyEl = panel.querySelector('.side-panel-body');
+  bodyEl.innerHTML = '';
+  if (body instanceof Node) bodyEl.appendChild(body);
+  else bodyEl.innerHTML = body;
+  bodyEl.scrollTop = 0;
+  panel.hidden = false;
+  _sidePanel = { onClose };
+  panel.focus({ preventScroll: true });
+  return panel;
+}
+
+function closeSidePanel() {
+  if (!_sidePanel) return;
+  const { onClose } = _sidePanel;
+  _sidePanel = null;
+  const panel = document.getElementById('side-panel');
+  if (panel) {
+    panel.hidden = true;
+    panel.querySelector('.side-panel-body').innerHTML = '';
+  }
+  if (onClose) onClose();
+}
+
+// Escape closes the panel only when nothing is open above it. Capture phase, so the question
+// is asked before any other Escape handler has closed whatever was on top.
+document.addEventListener('keydown', (e) => {
+  if (e.key !== 'Escape' || !_sidePanel || overlayOpen()) return;
+  closeSidePanel();
+}, true);
 
 // The app's one confirm dialog - never the browser's native confirm() (DESIGN.md 3.12,
 // dev/changelog/1162). Resolves true on the action button, false on Cancel, ×, the backdrop

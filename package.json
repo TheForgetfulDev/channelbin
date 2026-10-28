@@ -12,6 +12,7 @@
   "license": "MIT",
   "type": "commonjs",
   "devDependencies": {
+    "@mdi/js": "7.4.47",
     "@playwright/test": "^1.61.1",
     "@types/node": "^26.1.1",
     "jsdom": "^29.1.1"

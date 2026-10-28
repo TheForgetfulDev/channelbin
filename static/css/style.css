@@ -154,6 +154,12 @@ h3 { font-size: var(--fs-base); font-weight: 600; margin-bottom: 0.5rem; }
    - a zero count, an "off", a missing measurement. The token existed long before the
    utility did; every page that wanted it was spelling the var() inline. */
 .text-faint { color: var(--text-faint); }
+/* An icon from the registry (app/icons.py, drawn by icon() in Jinja and util.js): an MDI
+   path on currentColor, sized by the text around it. The record icon is red wherever it
+   appears, and greys out with a disabled control like any other (dev/changelog/1320). */
+.icon { width: 1em; height: 1em; fill: currentColor; vertical-align: -0.125em; flex: none; }
+.icon[data-icon="record"] { color: var(--live); }
+:disabled .icon[data-icon="record"] { color: inherit; }
 .text-warning { color: var(--warn); }
 /* Promoted out of channels/detail.html's scoped block during the channel-detail
    revamp - it sits beside .text-warning at every call site. */
@@ -4394,6 +4400,55 @@ a.shot-link { display: block; width: fit-content; cursor: zoom-in; }
   .sheet-act.danger { color: var(--bad); }
   .sheet-act[disabled] { color: var(--text-faint); cursor: not-allowed; }
   .sheet-sep { height: 7px; }
+}
+
+/* ── Action tiles (DESIGN.md 3.20, util.js::actionTilesHtml) ───────────────
+   An icon over a short label: the TV Guide program chooser's actions, in its side panel and
+   its phone sheet alike. The icon takes the accent color except where the registry gives a
+   meaning its own (record is red), and greys with a disabled tile. Approved as mockup 45. */
+.act-tiles { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px; }
+.act-tile {
+  display: flex; flex-direction: column; align-items: center; justify-content: flex-start; gap: 6px;
+  min-height: 66px; padding: 11px 4px 8px; border: 1px solid var(--border);
+  border-radius: var(--radius-sm); background: var(--bg2); color: var(--text);
+  font: inherit; font-size: var(--fs-xs); line-height: 1.25; text-align: center;
+  cursor: pointer; text-decoration: none;
+}
+.act-tile:hover { background: var(--bg3); text-decoration: none; }
+.act-tile[disabled] { color: var(--text-faint); cursor: not-allowed; }
+.act-tile[disabled]:hover { background: var(--bg2); }
+.act-tile .icon { width: 24px; height: 24px; }
+.act-tile .icon:not([data-icon="record"]) { color: var(--accent-text); }
+.act-tile[disabled] .icon { color: inherit; }
+.act-tiles-note { font-size: var(--fs-xs); color: var(--text-faint); line-height: 1.4; margin: 8px 0 0; }
+
+/* ── Side panel (DESIGN.md 3.19, util.js::openSidePanel) ───────────────────
+   Docked right with no scrim, so the page beside it stays live. Above the page's sticky bars,
+   below every .modal (200), so a dialog an action opens is never under it. */
+.side-panel {
+  position: fixed; top: 0; right: 0; bottom: 0; z-index: 150; width: 360px;
+  display: flex; flex-direction: column;
+  background: var(--bg1); border-left: 1px solid var(--border); box-shadow: var(--shadow-pop);
+}
+.side-panel[hidden] { display: none; }
+.side-panel:focus { outline: none; }
+.side-panel-head {
+  display: flex; align-items: flex-start; justify-content: space-between; gap: 12px;
+  padding: 14px 18px; border-bottom: 1px solid var(--border-soft);
+}
+.side-panel-head h2 {
+  font-size: var(--fs-base); font-weight: 600; margin: 0; border: none; padding: 0;
+  overflow-wrap: anywhere;
+}
+.side-panel-body { padding: 12px 14px; overflow-y: auto; min-height: 0; }
+
+@media (max-width: 960px) {
+  /* The phone's form of the same surface is a bottom sheet; this only covers a window
+     narrowed past the breakpoint while a panel is open. */
+  .side-panel { width: 100%; border-left: none; }
+  /* As many tiles a row as fit, so a phone held sideways spreads them along the width. */
+  .act-tiles { grid-template-columns: repeat(auto-fill, minmax(104px, 1fr)); }
+  .act-tile { min-height: 72px; }
 }
 
 /* ── The group-create flow (static/js/group-create-flow.js) ─────────────────

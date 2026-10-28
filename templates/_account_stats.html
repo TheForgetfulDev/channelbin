@@ -135,7 +135,7 @@
     <div class="acst-share-empty">{{ p.empty }}</div>
     {%- else -%}
     <div class="acst-pie">
-      <svg viewBox="0 0 100 100" role="img" aria-label="{{ p.title }}">
+      <svg viewBox="0 0 100 100" role="img" aria-label="{{ p.title }}">{# icon-ok: a data chart, not an icon #}
         {%- for arc in p.arcs %}<circle r="25" cx="50" cy="50" fill="none" stroke="{{ arc.color }}" stroke-width="50" stroke-dasharray="{{ arc.dash }}" stroke-dashoffset="{{ arc.offset }}" transform="rotate(-90 50 50)" data-tip="{{ arc.tip }}"></circle>{% endfor -%}
       </svg>
       <div class="acst-plegend">
