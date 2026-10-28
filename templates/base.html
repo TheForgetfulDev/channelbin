@@ -29,6 +29,10 @@
      so a script keys on statusVocab('ACCOUNT_STATUS').SYNCING rather than on a literal of
      its own - a re-typed status literal matches nothing, forever, without erroring. #}
   <meta name="status-vocab" content="{{ status_vocab | tojson | forceescape }}">
+  {# Where util.js::icon() finds the sprite, so it draws the same <use href> as the Jinja
+     icon() global (app/icons.py) under any URL prefix, and the registry's names, so a
+     script asking for a name that does not exist says so in the console. #}
+  <meta name="icon-sprite" content="{{ url_for('static', filename=icon_sprite) }}" data-names="{{ icon_names }}">
   <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
   <script src="{{ url_for('static', filename='js/util.js') }}"></script>
   <link rel="apple-touch-icon" sizes="180x180" href="{{ url_for('static', filename='img/logo/channelbin-favicon/apple-touch-icon.png') }}">

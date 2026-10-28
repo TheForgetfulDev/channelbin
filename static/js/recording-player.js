@@ -14,7 +14,8 @@
      is a new session at the new position. Nothing is re-encoded but audio a browser lacks.
 
    The page's delegated click handler hands `play` and `download` here through
-   window.recordingDialogs. */
+   window.recordingDialogs; the TV Guide's program chooser calls the same `play` for a
+   recording still capturing. */
 
 (() => {
   // How long the wait stays a plain "Opening the file" before it explains itself, and when
@@ -481,7 +482,9 @@
     };
   }
 
-  function openPlayer(rid) {
+  // `name` titles the dialog; the recording page's own heading stands in when it is left
+  // out. The TV Guide's program chooser passes the program's title (dev/changelog/1321).
+  function openPlayer(rid, name) {
     const player = buildPlayerStage();
     const { setStatus } = player;
     let closed = false;
@@ -490,7 +493,7 @@
     const isClosed = () => closed;
 
     const modal = buildModal({
-      title: `Play - ${recName()}`,
+      title: `Play - ${name || recName()}`,
       body: player.el,
       panelClass: 'modal-wide player-modal',
       footer: [{ label: 'Download', class: 'btn', onClick: () => { if (info) startDownload(info); return false; } }],

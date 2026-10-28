@@ -358,7 +358,10 @@ def guide():
                            guide_layout_pref_key=GUIDE_LAYOUT_PREF_KEY,
                            guide_layout_mobile=layout_mobile,
                            guide_layout_mobile_pref_key=GUIDE_LAYOUT_MOBILE_PREF_KEY,
-                           airing_search_url=airing_search_url())
+                           airing_search_url=airing_search_url(),
+                           # The program chooser's Other airings: "where else is THIS
+                           # program on", so program titles only.
+                           program_airings_url=airing_search_url(fields=('epg-title',)))
 
 
 @guide_bp.route('/guide/channels')

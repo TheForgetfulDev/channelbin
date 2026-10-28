@@ -350,6 +350,12 @@ def create_app(config_overrides=None, start_scheduler=True):
     # labels already travel, so a script keys on `statusVocab('ACCOUNT_STATUS').SYNCING`
     # and never on a spelling of its own.
     app.jinja_env.globals['status_vocab'] = vocab
+    # The one way a template draws an icon (app/icons.py). Pure: a dict lookup and
+    # url_for, so it is safe inside a `{% for %}`.
+    from .icons import ICONS as _ICONS, SPRITE as _ICON_SPRITE, make_jinja_icon
+    app.jinja_env.globals['icon'] = make_jinja_icon(url_for)
+    app.jinja_env.globals['icon_sprite'] = _ICON_SPRITE
+    app.jinja_env.globals['icon_names'] = ' '.join(_ICONS)
 
     @app.context_processor
     def inject_globals():

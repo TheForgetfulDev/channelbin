@@ -5,6 +5,18 @@ Notable changes to ChannelBin, newest first. This project follows
 release is tagged `v<version>` in git, and the version the app is running is shown in the
 page footer.
 
+## 0.33.0 - 2026-10-28
+
+More choices when you click a program.
+
+**Added**
+
+- Clicking a program in the TV Guide opens a list of actions instead of going straight to the
+  record dialog: schedule a recording, test the channel, preview it live, copy the stream URL,
+  open the recording or play it while it records, find other airings, or go to the channel or
+  group page.
+- The channel page's What's on card opens the same list.
+
 ## 0.32.0 - 2026-10-27
 
 Play your recordings in the browser.

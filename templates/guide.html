@@ -130,8 +130,8 @@
     {# 12.2 as amended: a plain .btn, not .btn-primary - one primary per page, and that is
        Manage channels in the header. At phone widths the label is swapped for the icon
        (13.3) by CSS rather than by a second button, so there is still one control and one
-       handler. The glyph is the MDI "magnify" path as an inline SVG filled with
-       currentColor - never an emoji, which renders in emoji colour and ignores the theme. #}
+       handler. The glyph is the registry's `search` icon (app/icons.py) - never an emoji,
+       which renders in emoji color and ignores the theme. #}
     {# A BUTTON and not an anchor, because it carries the filter box's live text with it -
        an href rendered here would be frozen at page load. guide.js reads #guide-search and
        appends `q=`; the base URL comes from the server, built through
@@ -139,9 +139,7 @@
     <button class="btn btn-sm tip-plain" id="btn-airing-search"
             aria-label="Search all EPG data"
             data-airing-search-url="{{ airing_search_url }}"
-            data-tip="Search all EPG data&#10;The filter box only narrows what is already on screen. This opens the Airings search, which searches every program on every channel, including channels not in your guide."><svg
-        class="guide-icon" viewBox="0 0 24 24" width="16" height="16" fill="currentColor"
-        aria-hidden="true"><path d="M9.5,3A6.5,6.5 0 0,1 16,9.5C16,11.11 15.41,12.59 14.44,13.73L14.71,14H15.5L20.5,19L19,20.5L14,15.5V14.71L13.73,14.44C12.59,15.41 11.11,16 9.5,16A6.5,6.5 0 0,1 3,9.5A6.5,6.5 0 0,1 9.5,3M9.5,5C7,5 5,7 5,9.5C5,12 7,14 9.5,14C12,14 14,12 14,9.5C14,7 12,5 9.5,5Z"/></svg><span
+            data-tip="Search all EPG data&#10;The filter box only narrows what is already on screen. This opens the Airings search, which searches every program on every channel, including channels not in your guide.">{{ icon('search', 'guide-icon') }}<span
         class="guide-btn-label">Search all…</span></button>
   </div>
 
@@ -326,6 +324,9 @@ const GUIDE_CONFIG = {
   recDetailUrlBase: '/recordings/',  // + id
   chDetailUrlBase: '/channels/',           // + channel id (mobile channel sheet, 13.10)
   groupDetailUrlBase: '/channel-groups/',  // + group id, for a group row
+  // The program chooser's Other airings, + &q=<title> (routes/channels.py::airing_search_url,
+  // the one speller of the search's parameters).
+  programAiringsUrl: {{ program_airings_url | tojson }},
   windowDays: {{ guide_window_days }},
   // Layout state and the key it persists under (DESIGN.md 12.3). This object is the SAME
   // declaration the checkboxes above were rendered from, so a checkbox's markup cannot
@@ -352,6 +353,11 @@ const MANUAL_RECORD_CONFIG = {
 };
 </script>
 <script src="{{ url_for('static', filename='js/guide.js') }}"></script>
+<script src="{{ url_for('static', filename='js/live-preview.js') }}"
+        data-hls-js="{{ url_for('static', filename='vendor/hls.js/hls.light.min.js') }}"></script>
+<script src="{{ url_for('static', filename='js/recording-player.js') }}"
+        data-hls-js="{{ url_for('static', filename='vendor/hls.js/hls.light.min.js') }}"></script>
+<script src="{{ url_for('static', filename='js/program-chooser.js') }}"></script>
 <script src="{{ url_for('static', filename='js/manual_record.js') }}"></script>
 <script>
   window.onManualRecordSaved = fetchAndRender;

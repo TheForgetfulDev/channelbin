@@ -24,8 +24,9 @@ lives here.
 What it cannot cover: jsdom computes no layout, so this says nothing about how the header
 looks - only about what text and elements it contains. The grid cell click itself is not
 driven either (it needs a rendered grid); `ProgramSheetIsGoneTests` below covers that half
-by reading the shipped file, which is what makes the phone path structural rather than
-conditional.
+by reading the shipped file. Since dev/changelog/1321 a cell click opens the program chooser
+first, on every width, and its record tile opens this modal; tests/test_program_chooser_js.py
+drives that.
 
 Runs against a throwaway temp SQLite DB - never the live one.
   python3 -m unittest tests.test_record_modal_head_js
@@ -252,13 +253,15 @@ class ProgramSheetIsGoneTests(unittest.TestCase):
         for name in ('openProgramSheet', 'programSheetActions', 'openProgramTarget'):
             self.assertNotIn(name, self.src, f'{name} survived the sheet removal')
 
-    def test_every_program_cell_opens_the_record_modal(self):
+    def test_every_program_cell_opens_the_same_thing(self):
         """Two render paths build program cells - the normal grid and the collapsed-gap
-        one - and they have to agree. Either one left on a sheet would be a phone-only
-        divergence nothing else in the suite can see."""
+        one - and they have to agree. Either one left on something else would be a
+        divergence nothing else in the suite can see. Since dev/changelog/1321 both open the
+        program chooser, whose record tile opens this modal on every width
+        (tests/test_program_chooser_js.py)."""
         handlers = re.findall(r"el\.addEventListener\('click', \(\) => (\w+)\(prog, ch\)\);",
                               self.src)
-        self.assertEqual(handlers, ['openModal', 'openModal'])
+        self.assertEqual(handlers, ['openProgramChooser', 'openProgramChooser'])
 
 
 if __name__ == '__main__':

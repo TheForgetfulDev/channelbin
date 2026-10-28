@@ -542,6 +542,9 @@ function fetchAndRender() {
     .then(data => {
       channelData = data.channels || [];
       renderGuide();
+      // The program chooser's side panel holds no refresh (util.js::openSidePanel), so it
+      // re-reads its program from the new data rather than going on showing the old state.
+      document.dispatchEvent(new CustomEvent('guide:data'));
       if (isInitial) {
         scrollToNow();
       } else {
@@ -1040,7 +1043,7 @@ function renderProgramRows() {
 
       el.innerHTML = programCellHtml(prog, ch, widthPx);
 
-      el.addEventListener('click', () => openModal(prog, ch));
+      el.addEventListener('click', () => openProgramChooser(prog, ch));
       row.appendChild(el);
     });
   });
@@ -1648,8 +1651,9 @@ function addSecondsToUtcIso(isoStr, seconds) {
    Returns '' for a target that is not a real EPG program: a dummy filler slot, or the
    {recording_id, title, stream_url} shape the dashboard and the recording detail page pass
    when editing an already-scheduled recording. Those have no program to describe, and an
-   empty box is worse than no box. The caller hides the container on ''. */
-function progHeadHtml(prog) {
+   empty box is worse than no box. The caller hides the container on ''. `withTitle: false`
+   is for a surface whose own heading already carries the title (the program chooser). */
+function progHeadHtml(prog, { withTitle = true } = {}) {
   if (!prog.id || prog.is_dummy || !prog.title) return '';
   const fmtT = iso => fmtTimeTz(utcIsoToDate(iso));
   const start = new Date(prog.start_time + 'Z');
@@ -1662,7 +1666,7 @@ function progHeadHtml(prog) {
     `<span class="info-tag"><span class="color-dot" style="background:${escHtml(t.color)}"></span>` +
     `${escHtml(t.name)}</span>`).join('');
 
-  return `<h3 class="prog-head-title">${escHtml(prog.title)}</h3>` +
+  return (withTitle ? `<h3 class="prog-head-title">${escHtml(prog.title)}</h3>` : '') +
     (prog.sub_title ? `<p class="info-sub">${escHtml(prog.sub_title)}</p>` : '') +
     sheetLine('When', `${fmtT(prog.start_time)} - ${fmtT(prog.stop_time)}  ·  ${fmtDur(mins * 60, false)}`) +
     sheetLine('Day', fmtDateTz(start)) +
@@ -2486,7 +2490,7 @@ function renderProgramRowsCollapsed(terms) {
 
         el.innerHTML = programCellHtml(prog, ch, widthPx);
 
-        el.addEventListener('click', () => openModal(prog, ch));
+        el.addEventListener('click', () => openProgramChooser(prog, ch));
         row.appendChild(el);
       });
     });
