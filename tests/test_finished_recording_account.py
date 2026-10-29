@@ -251,7 +251,7 @@ class WhatComesNextTests(_Base):
         rec.status = 'RETRYING'
         rec.stop_time = self.now + timedelta(hours=1)
         db.session.commit()
-        self.assertIn('Abort, in the &#8943; menu, discards it', self._page(rec))
+        self.assertIn('Abort, in the <svg class="icon" data-icon="more"', self._page(rec))
 
     def test_the_segments_table_says_a_joined_segments_file_is_gone(self):
         rec = self._rec(600, 600)

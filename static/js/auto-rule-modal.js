@@ -152,7 +152,7 @@ function openAutoRuleModal(opts) {
           `<span class="sv">${escHtml(v)}</span></div>`).join('') +
         '</div><div class="ar-searchbox-foot"><span>Editing it opens the Programs search with this ' +
         'search loaded.</span>' +
-        `<a class="btn btn-sm" href="${escHtml(rule.edit_search_url || '')}">Edit search &rarr;</a></div></div>`,
+        `<a class="btn btn-sm" href="${escHtml(rule.edit_search_url || '')}">Edit search ${icon('forward')}</a></div></div>`,
     }) : '') +
     fieldRow({
       // Stacked: the 220px control column cut "Each showing's default profile" short.
@@ -258,8 +258,8 @@ function openAutoRuleModal(opts) {
     } else {
       const out = autoRuleOutcome('Rule saved.', res.evaluation, opts.phrases);
       const link = res.url
-        ? `<a href="${escHtml(res.url)}">${escHtml(payload.name)} &rarr;</a>`
-        : `<a href="${escHtml(opts.rulesUrl || '/rules')}">Rules &rarr;</a>`;
+        ? `<a href="${escHtml(res.url)}">${escHtml(payload.name)} ${icon('forward')}</a>`
+        : `<a href="${escHtml(opts.rulesUrl || '/rules')}">Rules ${icon('forward')}</a>`;
       showToast(`${escHtml(out.text)} ${link}`, { type: out.type, html: true, durationMs: 12000 });
     }
     if (opts.onSaved) opts.onSaved(res);

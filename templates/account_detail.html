@@ -36,7 +36,7 @@
   {% if st == ACCOUNT_STATUS.SYNCING %}
   <button class="btn btn-danger btn-sm" data-act="cancel-sync">Cancel sync</button>
   {% elif st == ACCOUNT_STATUS.ERROR %}
-  <button class="btn btn-primary btn-sm" data-act="sync">&#8635; Retry sync</button>
+  <button class="btn btn-primary btn-sm" data-act="sync">{{ icon('refresh') }} Retry sync</button>
   {% elif st == ACCOUNT_STATUS.UNSYNCED %}
   <button class="btn btn-primary btn-sm" data-act="sync">Sync for the first time</button>
   {% elif st == ACCOUNT_STATUS.OK %}
@@ -81,7 +81,7 @@
 {% block content %}
 <div class="page-head">
   <h1>Accounts</h1>
-  <a href="{{ url_for('accounts.accounts_list') }}" class="btn">&larr; All Accounts</a>
+  <a href="{{ url_for('accounts.accounts_list') }}" class="btn">{{ icon('back') }} All Accounts</a>
 </div>
 
 {# ── Header ─────────────────────────────────────────────────────────────── #}
@@ -137,7 +137,7 @@
 {% endif %}
 {% if st == ACCOUNT_STATUS.ERROR and account.last_error %}
 <div class="notice notice-bad">
-  <strong>&#9888; The last sync failed</strong><br>
+  <strong>{{ icon('warning') }} The last sync failed</strong><br>
   {{ account.last_error }}<br>
   The channels imported by the previous successful sync are still here and still record; only new
   channel and guide data has stopped arriving.
@@ -146,7 +146,7 @@
 {% endif %}
 {% if account.constructed_stream_url_count %}
 <div class="notice notice-warn">
-  <strong>&#9888; {{ '{:,}'.format(account.constructed_stream_url_count) }} stream URLs were built by ChannelBin</strong><br>
+  <strong>{{ icon('warning') }} {{ '{:,}'.format(account.constructed_stream_url_count) }} stream URLs were built by ChannelBin</strong><br>
   This provider supplied no stream URL for {{ '{:,}'.format(account.constructed_stream_url_count) }}
   of its {{ '{:,}'.format(account.channel_count or 0) }} channels, so they were constructed from the
   stream origin the provider declares in its auth response{% if constructed_mode_label %}, in the
@@ -227,7 +227,7 @@
             data-tip="Force EPG resync.&#10;Runs a normal sync but imports the guide data even if it looks much smaller than last time. The collapse guard exists to stop a truncated provider feed wiping a good guide; this bypasses it for one run.">Force EPG resync</button>
     {% endif %}
     <span class="menu-wrap">
-      <button class="btn btn-sm btn-icon" data-menu aria-label="More actions">&#8943;</button>
+      <button class="btn btn-sm btn-icon" data-menu aria-label="More actions">{{ icon('more') }}</button>
       <div class="menu" id="acct-kebab">
         <button class="menu-item" data-act="block">Block account use&hellip;</button>
         <button class="menu-item" data-act="settings">Edit settings&hellip;</button>
@@ -382,7 +382,7 @@
               {% endif %}</td>
             <td class="num">
               <span class="menu-wrap">
-                <button class="btn btn-sm btn-icon" data-menu aria-label="Actions for {{ h.host }}">&#8943;</button>
+                <button class="btn btn-sm btn-icon" data-menu aria-label="Actions for {{ h.host }}">{{ icon('more') }}</button>
                 <div class="menu">
                   <button class="menu-item" data-act="host-activate" data-host-id="{{ h.id }}" data-host="{{ h.host }}"{% if h.is_active %} disabled{% endif %}
                           data-tip="Move every stream URL on this account to this host now.">Make active</button>
@@ -433,7 +433,7 @@
               {% endif %}</td>
             <td class="num">
               <span class="menu-wrap">
-                <button class="btn btn-sm btn-icon" data-menu aria-label="Actions for login {{ lg.name }}">&#8943;</button>
+                <button class="btn btn-sm btn-icon" data-menu aria-label="Actions for login {{ lg.name }}">{{ icon('more') }}</button>
                 <div class="menu">
                   <button class="menu-item" data-act="login-edit" data-login-id="{{ lg.id }}" data-shared-with="{{ lg.shared_with | join(', ') }}">Edit</button>
                   <button class="menu-item" data-act="login-move" data-login-id="{{ lg.id }}" data-direction="up"{% if lg.first %} disabled{% endif %}>Move up</button>
@@ -455,7 +455,7 @@
             <td data-label="Refused"><span class="text-faint tip-plain" data-tip="Refusals are tracked on listed logins, where another login can take over.">Not tracked</span></td>
             <td class="num">
               <span class="menu-wrap">
-                <button class="btn btn-sm btn-icon" data-menu aria-label="Actions for the account's own login">&#8943;</button>
+                <button class="btn btn-sm btn-icon" data-menu aria-label="Actions for the account's own login">{{ icon('more') }}</button>
                 <div class="menu">
                   <button class="menu-item" data-act="settings">Edit account</button>
                 </div>
@@ -474,7 +474,7 @@
   <div class="card" data-section="content">
     <div class="card-head"><h2>Content</h2>
       <div class="card-head-actions">
-        <a class="btn btn-sm" href="{{ url_for('channels.channel_browser', **{'f.acct': account.id}) }}">Browse channels <span class="arw">&#8594;</span></a>
+        <a class="btn btn-sm" href="{{ url_for('channels.channel_browser', **{'f.acct': account.id}) }}">Browse channels <span class="arw">{{ icon('forward') }}</span></a>
       </div>
     </div>
     <div class="card-body" id="acct-content-body">
@@ -582,11 +582,11 @@
             <td class="num">
               <span class="menu-wrap">
                 {%- set readers_attr %}{% for r in s.readers %}{{ r.name }} ({{ '{:,}'.format(r.guided) }} channel{{ '' if r.guided == 1 else 's' }} guided from here){{ ', ' if not loop.last }}{% endfor %}{% endset %}
-                <button class="btn btn-sm btn-icon" data-menu aria-label="Actions for {{ s.name }}">&#8943;</button>
+                <button class="btn btn-sm btn-icon" data-menu aria-label="Actions for {{ s.name }}">{{ icon('more') }}</button>
                 <div class="menu">
                   {% if s.subscribed %}
                   <a class="menu-item" href="{{ url_for('accounts.epg_source_review', source_id=s.id) }}"
-                     data-tip="Channels whose name matches one in this source's file, for you to accept or reject. Nothing changes until you accept one.">Name matches &rarr;</a>
+                     data-tip="Channels whose name matches one in this source's file, for you to accept or reject. Nothing changes until you accept one.">Name matches {{ icon('forward') }}</a>
                   {% if n_read > 1 %}
                   <button class="menu-item" data-act="source-move" data-direction="up" data-source-id="{{ s.id }}"{% if loop.index == 1 %} disabled{% endif %}
                           data-tip="Earlier sources win a channel when more than one has listings for it. Each channel's guide is re-decided from listings already here.">Move up</button>
@@ -663,7 +663,7 @@
   <div class="card" data-section="activity">
     <div class="card-head"><h2>Activity</h2>
       <div class="card-head-actions">
-        <a class="btn btn-sm" href="{{ url_for('logs.logs_page') }}">Logs <span class="arw">&#8594;</span></a>
+        <a class="btn btn-sm" href="{{ url_for('logs.logs_page') }}">Logs <span class="arw">{{ icon('forward') }}</span></a>
       </div>
     </div>
     <div class="card-body" id="acct-activity-body">
@@ -718,7 +718,7 @@
 <div class="acct-stickybar actbar-reveal" id="acct-stickybar" aria-hidden="true">
   <div class="acct-stickybar-in" id="acct-stickybar-in">
     {{ status_action(st, account) }}
-    <button class="btn btn-icon" data-act="page-actions" aria-label="More actions">&#8943;</button>
+    <button class="btn btn-icon" data-act="page-actions" aria-label="More actions">{{ icon('more') }}</button>
   </div>
 </div>
 {% endblock %}

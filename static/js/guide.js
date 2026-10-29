@@ -21,11 +21,19 @@ function isMobileGuide() {
   return MOBILE_MQ.matches && !!GUIDE_CONFIG.layoutMobile;
 }
 
-// A page embedding the grid for ONE known channel (channel detail's What's On card). It
-// draws no channel column and cannot sort or hide channels, so every control over those is
-// omitted rather than rendered inert. Declared once here because both the row-height
-// calculation and the mobile Layout sheet have to agree about it.
-const SINGLE_CHANNEL = !!GUIDE_CONFIG.singleChannel;
+// Where this grid is drawn - one value, and every branch over it names each state:
+//   'page'       the TV Guide itself.
+//   'channel'    channel detail's What's On card: ONE known channel. It draws no channel
+//                column and cannot sort or hide channels, so every control over those is
+//                omitted rather than rendered inert.
+//   'schedules'  a group page's What's On card: the group's own row and every distinct EPG
+//                schedule its channels carry, each with a channel column of its own built by
+//                guide-schedules.js. No sort, no health filter, no search (dev/changelog/1324).
+// Declared once here because the row height, the health filter, the status bar and the
+// mobile Layout sheet all have to agree about it.
+const EMBEDS = ['page', 'channel', 'schedules'];
+const EMBED = GUIDE_CONFIG.embed || 'page';
+if (!EMBEDS.includes(EMBED)) console.error(`guide: unknown embed mode ${EMBED}`);
 
 let PIXELS_PER_MINUTE = isMobileGuide() ? PX_PER_MIN_MOBILE : PX_PER_MIN_DESKTOP;
 
@@ -176,14 +184,24 @@ function saveSortState() {
 // The health filter is a CSS class on the grid body, so the server-rendered markup already
 // carries the user's stored choice and this only re-asserts it.
 //
-// Never applied to a single-channel embed. "Include failed channels" is off by default and
-// that page offers no control to turn it on, so applying it would blank the row on the
+// Applied on the guide page only. "Include failed channels" is off by default and neither
+// card offers a control to turn it on: on the channel embed it would blank the row on the
 // detail page of every channel whose last check failed - the one page where you most need
-// to see it. isChannelHealthHidden() carries the same guard; both are needed, because this
-// is a CSS rule and that is the JS predicate, and neither goes through the other.
+// to see it - and on the schedules embed its rows are schedules, not channels.
+// isChannelHealthHidden() carries the same guard; both are needed, because this is a CSS
+// rule and that is the JS predicate, and neither goes through the other.
+function healthFilterApplies() {
+  switch (EMBED) {
+    case 'page': return true;
+    case 'channel': return false;
+    case 'schedules': return false;
+  }
+  return false;
+}
+
 function applyShowFailed() {
   const body = document.getElementById('guide-wrap');
-  if (body) body.classList.toggle('hide-failed-channels', !SINGLE_CHANNEL && !LAYOUT.show_failed);
+  if (body) body.classList.toggle('hide-failed-channels', healthFilterApplies() && !LAYOUT.show_failed);
 }
 
 function wireLayoutPopover() {
@@ -194,7 +212,7 @@ function wireLayoutPopover() {
 
   btn.addEventListener('click', e => {
     e.stopPropagation();
-    // The same ⚙ control opens the desktop popover or mobile's Layout sheet (13.6) - one
+    // The same Layout control opens the desktop popover or mobile's Layout sheet (13.6) - one
     // button, one stored fact, two surfaces.
     if (isMobileGuide()) { pop.hidden = true; openLayoutSheet(); return; }
     closePopovers(pop);
@@ -324,7 +342,7 @@ function updateSortLabel() {
   const arrowEl = document.getElementById('guide-sort-arrow');
   if (fieldEl) fieldEl.textContent = sortKey === 'guide' && !sortReversed ? '' : spec.label;
   if (arrowEl) {
-    arrowEl.textContent = sortKey === 'guide' && !sortReversed ? '' : (sortReversed ? '▴' : '▾');
+    arrowEl.innerHTML = sortKey === 'guide' && !sortReversed ? '' : icon(sortReversed ? 'sort-asc' : 'sort-desc');
   }
 }
 
@@ -337,7 +355,7 @@ function renderSortOptions() {
     const dirLabel = active ? (sortReversed ? s.reversed : s.natural) : '';
     return `<button type="button" class="guide-pop-row${active ? ' is-active' : ''}" data-sort-key="${s.key}">` +
       `${escHtml(s.label)}` +
-      (active ? `<span class="guide-pop-row-arrow">${escHtml(dirLabel)} ${sortReversed ? '▴' : '▾'}</span>` : '') +
+      (active ? `<span class="guide-pop-row-arrow">${escHtml(dirLabel)} ${icon(sortReversed ? 'sort-asc' : 'sort-desc')}</span>` : '') +
       '</button>';
   }).join('');
 }
@@ -397,14 +415,19 @@ function cellFieldOrder() {
 function cellActiveFields(prog) {
   const real = !prog.is_dummy && prog.title;
   const on = new Set(['title']);
-  if (LAYOUT.rec_status && prog.has_recording) on.add('rec_status');
+  // On the schedules card a recording is the group's, so its chip is drawn on the group's
+  // own row only, and tag dots are not offered there.
+  const schedules = EMBED === 'schedules';
+  if (LAYOUT.rec_status && prog.has_recording && !(schedules && prog.on_schedule)) {
+    on.add('rec_status');
+  }
   if (LAYOUT.subtitle && real && prog.sub_title) on.add('subtitle');
   // 13.9 is a hard rule, not a default: a description never renders in a phone-width cell,
   // it lives in the record modal the cell opens. There is no checkbox to turn it on there.
   if (!isMobileGuide() && LAYOUT.description && real && prog.description) on.add('description');
   if (LAYOUT.start_time || LAYOUT.end_time || LAYOUT.duration) on.add('time');
   // Tag dots always take their own line when shown (12.5).
-  if (LAYOUT.tag_dots && (prog.matched_tags || []).length) on.add('tag_dots');
+  if (LAYOUT.tag_dots && !schedules && (prog.matched_tags || []).length) on.add('tag_dots');
   return cellFieldOrder().filter(f => on.has(f));
 }
 
@@ -424,8 +447,10 @@ function techFieldsEnabled() {
 function channelContentHeight() {
   // A single-channel embed draws no channel column, so it must not be held open by one -
   // the ch_* fields are still at their defaults there because the card offers no control
-  // over them, and honouring those would size every row for a column nobody can see.
-  if (SINGLE_CHANNEL) return 0;
+  // over them, and honouring those would size every row for a column nobody can see. The
+  // schedules embed's column is its own (guide-schedules.js), and so is its height.
+  if (EMBED === 'channel') return 0;
+  if (EMBED === 'schedules') return schedColumnHeight();
   if (isMobileGuide()) {
     return LAYOUT.ch_logo_only
       ? CHAN_LINE_MOBILE.logo + CHAN_LINE_MOBILE.padV
@@ -445,6 +470,8 @@ function computeRowHeight(terms) {
       if (h > max) max = h;
     });
   });
+  // The schedules embed also draws outlines of programs a schedule lacks, two lines each.
+  if (EMBED === 'schedules') max = Math.max(max, schedOutlineHeight());
   return Math.max(44, max + CELL_LINE.padV + CELL_LINE.offset, channelContentHeight());
 }
 
@@ -533,6 +560,7 @@ function fetchAndRender() {
   const endIso   = windowEnd.toISOString().replace('Z', '');
   let url = `${GUIDE_CONFIG.epgUrl}?start=${encodeURIComponent(startIso)}&end=${encodeURIComponent(endIso)}`;
   if (GUIDE_CONFIG.channelId) url += `&channel_id=${GUIDE_CONFIG.channelId}`;
+  if (EMBED === 'schedules') url += `&group_id=${GUIDE_CONFIG.groupId}&schedules=1`;
 
   fetch(url)
     .then(r => {
@@ -540,7 +568,9 @@ function fetchAndRender() {
       return r.json();
     })
     .then(data => {
-      channelData = data.channels || [];
+      // The schedules card keeps the whole payload and shows the rows its own controls pick;
+      // channelData is always exactly what is on screen, so every consumer below agrees.
+      channelData = EMBED === 'schedules' ? schedLoad(data) : (data.channels || []);
       renderGuide();
       // The program chooser's side panel holds no refresh (util.js::openSidePanel), so it
       // re-reads its program from the new data rather than going on showing the old state.
@@ -643,7 +673,7 @@ function renderTimeHeader() {
 // ── Recording state helpers ───────────────────────────────────────────────────
 
 // How the guide draws one Recording.status, and ONLY the parts that are the guide's own:
-// the cell's edge colour, the chip's colour, the glyph, and the sentence explaining the
+// the cell's edge colour, the chip's colour, the icon, and the sentence explaining the
 // phase. The WORD is not here - it comes from the server's one status vocabulary
 // (app/fmt_utils.py, via util.js::recStatusLabel), because a status is stored under one
 // name and shown under another and a page that spells its own ends up disagreeing with the
@@ -656,25 +686,25 @@ function renderTimeHeader() {
 // cells, so a chip for them would have no data behind it. `null` says that deliberately -
 // an absent entry is a status nobody decided about, and recChipFor says so out loud.
 const REC_CHIP = {
-  SCHEDULED:     { cls: 'rec-scheduled', badge: 'rec-badge-scheduled', glyph: '',
+  SCHEDULED:     { cls: 'rec-scheduled', badge: 'rec-badge-scheduled', icon: '',
                    detail: 'A recording is set up for this program but has not started yet.' },
-  IN_PROGRESS:   { cls: 'rec-active', badge: 'rec-badge-active', glyph: '⏺',
+  IN_PROGRESS:   { cls: 'rec-active', badge: 'rec-badge-active', icon: 'record',
                    detail: 'Capture is running for this program.' },
-  PAUSED:        { cls: 'rec-paused', badge: 'rec-badge-paused', glyph: '⏸',
+  PAUSED:        { cls: 'rec-paused', badge: 'rec-badge-paused', icon: 'pause',
                    detail: 'The recording for this program is paused and is not capturing.' },
-  RETRYING:      { cls: 'rec-retry', badge: 'rec-badge-retry', glyph: '↻',
+  RETRYING:      { cls: 'rec-retry', badge: 'rec-badge-retry', icon: 'retrying',
                    detail: 'The stream reconnected but immediately died - waiting to try again.' },
-  CONCATENATING: { cls: 'rec-done', badge: 'rec-badge-done', glyph: '✓',
+  CONCATENATING: { cls: 'rec-done', badge: 'rec-badge-done', icon: 'finishing',
                    detail: 'Capture finished; the segments are being joined into the final file.' },
-  ANALYZING:     { cls: 'rec-done', badge: 'rec-badge-done', glyph: '✓',
+  ANALYZING:     { cls: 'rec-done', badge: 'rec-badge-done', icon: 'finishing',
                    detail: 'Capture finished and joined; the file is being checked before conversion.' },
-  CONVERTING:    { cls: 'rec-done', badge: 'rec-badge-done', glyph: '✓',
+  CONVERTING:    { cls: 'rec-done', badge: 'rec-badge-done', icon: 'finishing',
                    detail: 'Capture finished; the file is being converted to its final format.' },
   // The one place the guide deliberately says a different word than the Recordings list:
   // a finished recording is "Recorded" here, not "Completed". Whether that is the right
   // word is a naming call nobody has made; overriding it in one line keeps the question
   // askable without reopening a second table (dev/changelog/1083).
-  COMPLETED:     { cls: 'rec-done', badge: 'rec-badge-done', glyph: '✓', word: 'Recorded',
+  COMPLETED:     { cls: 'rec-done', badge: 'rec-badge-done', icon: 'ok', word: 'Recorded',
                    detail: 'This program was recorded and the file is in your library.' },
   FAILED:  null,
   ABORTED: null,
@@ -684,17 +714,17 @@ const REC_CHIP = {
 // it sits beside the table rather than in it: `partial` is the server's sentence saying why
 // (app/recording_story.py::partial_note), and a green "Recorded" over 3 minutes of a
 // 100-minute program read as all good (dev/changelog/1270).
-const REC_CHIP_PARTIAL = { cls: 'rec-partial', badge: 'rec-badge-partial', glyph: '⚠', word: 'Partial' };
+const REC_CHIP_PARTIAL = { cls: 'rec-partial', badge: 'rec-badge-partial', icon: 'warning', word: 'Partial' };
 // A COMPLETED recording the user stopped early, with nothing else missing: `stopped` is the
 // server's sentence (app/recording_story.py::stopped_early_note). Said, but quiet - the amber
 // Partial over the user's own Stop read as a fault (dev/changelog/1287). The cell keeps Done's
 // wash, which is drawn only over the part that was recorded.
-const REC_CHIP_STOPPED = { cls: 'rec-done', badge: 'rec-badge-stopped', glyph: '■', word: 'Stopped early' };
+const REC_CHIP_STOPPED = { cls: 'rec-done', badge: 'rec-badge-stopped', icon: 'stop', word: 'Stopped early' };
 
 // A SCHEDULED recording whose start time has come. Not a status of its own either: the
 // recorder flips it to IN_PROGRESS within seconds, and until it does "Scheduled" over a
 // program already being started read as if the click had not worked (dev/changelog/1290).
-const REC_CHIP_STARTING = { cls: 'rec-scheduled', badge: 'rec-badge-scheduled', glyph: '', word: 'Starting',
+const REC_CHIP_STARTING = { cls: 'rec-scheduled', badge: 'rec-badge-scheduled', icon: '', word: 'Starting',
                             detail: 'The start time has come and the capture is starting. This changes to Recording within a few seconds.' };
 
 // True for a SCHEDULED recording whose own start time is not in the future.
@@ -736,21 +766,21 @@ function recChipWord(status, partial, stopped, starting) {
 // The chip's meaning is carried by its colour, so it carries a tooltip with a distinct text
 // per state rather than relying on the colour alone (DESIGN.md 12.7). The tooltip's heading
 // is the chip's own word rather than a second copy of it - typing the two separately is how
-// "✓ Converting" ended up over a tooltip headed "Converting" while "✓ Recorded" sat over
+// "Converting" ended up over a tooltip headed "Converting" while "Recorded" sat over
 // one headed "Recorded" for a phase that had not finished.
 //
 // `cellPx` is the program cell's drawn width, when there is one. A cell too narrow for the
-// glyph and the word keeps the glyph alone, with the word in the tooltip and the label: the
+// icon and the word keeps the icon alone, with the word in the tooltip and the label: the
 // clipped "RECORDIN" a phone showed for a program already half over said less than the
-// glyph does (dev/changelog/1290). The fit is worked out from the badge's own type size
+// icon does (dev/changelog/1290). The fit is worked out from the badge's own type size
 // rather than measured, so drawing a grid never reads layout back once per cell.
 const REC_BADGE_CHAR_PX = 6.2;   // .rec-badge: 9px bold uppercase, letter-spacing .04em
-const REC_BADGE_GLYPH_PX = 12;   // the glyph and the space after it
+const REC_BADGE_ICON_PX = 12;    // the icon and the space after it
 const REC_CELL_PAD_PX = 16;      // .guide-program's side padding and borders, both sides
 
-function recBadgeFits(word, hasGlyph, cellPx) {
+function recBadgeFits(word, hasIcon, cellPx) {
   if (!(cellPx > 0)) return true;
-  const need = word.length * REC_BADGE_CHAR_PX + (hasGlyph ? REC_BADGE_GLYPH_PX : 0);
+  const need = word.length * REC_BADGE_CHAR_PX + (hasIcon ? REC_BADGE_ICON_PX : 0);
   return need <= cellPx - REC_CELL_PAD_PX;
 }
 
@@ -758,8 +788,8 @@ function recStatusBadge(status, partial, stopped, starting, cellPx) {
   const chip = recChipFor(status, partial, stopped, starting);
   const word = recChipWord(status, partial, stopped, starting);
   if (!chip || !word) return '';
-  const glyphOnly = Boolean(chip.glyph) && !recBadgeFits(word, true, cellPx);
-  const text = glyphOnly ? chip.glyph : (chip.glyph ? `${chip.glyph} ${word}` : word);
+  const iconOnly = Boolean(chip.icon) && !recBadgeFits(word, true, cellPx);
+  const text = iconOnly ? icon(chip.icon) : (chip.icon ? `${icon(chip.icon)} ${escHtml(word)}` : escHtml(word));
   let detail = chip.detail;
   if (chip === REC_CHIP_PARTIAL) {
     detail = `Recorded, but not the whole program: ${partial}\nOpen the recording to see what happened.`;
@@ -767,7 +797,7 @@ function recStatusBadge(status, partial, stopped, starting, cellPx) {
     detail = `${stopped} The file holds what was recorded up to then.`;
   }
   const tip = `${word}\n${detail}`;
-  const label = glyphOnly ? ` aria-label="${escHtml(word)}"` : '';
+  const label = iconOnly ? ` aria-label="${escHtml(word)}"` : '';
   return `<div class="rec-badge ${chip.badge} tip-plain" data-tip="${escTipAttr(tip)}"${label}>${text}</div>`;
 }
 
@@ -1043,9 +1073,17 @@ function renderProgramRows() {
 
       el.innerHTML = programCellHtml(prog, ch, widthPx);
 
-      el.addEventListener('click', () => openProgramChooser(prog, ch));
+      if (EMBED === 'schedules') {
+        // A schedule's cell records from the group's own row, never from the channel the
+        // card happened to show; schedCellClick() says so when nothing can record.
+        schedDecorateCell(el, prog, ch);
+        el.addEventListener('click', () => schedCellClick(prog, ch));
+      } else {
+        el.addEventListener('click', () => openProgramChooser(prog, ch));
+      }
       row.appendChild(el);
     });
+    if (EMBED === 'schedules') schedRowExtras(row, ch, totalMin);
   });
 }
 
@@ -1168,6 +1206,15 @@ function jumpToInstant(date) {
 function wireChannelTaps() {
   const col = document.getElementById('guide-channel-col');
   if (!col) return;
+  // The schedules card's column cells open the schedule's details on every width - they
+  // are not channels, and the card is already on the group's page.
+  if (EMBED === 'schedules') {
+    col.addEventListener('click', e => {
+      const row = e.target.closest('.guide-channel-row[data-sched]');
+      if (row) schedOpenDetails(row.dataset.sched);
+    });
+    return;
+  }
   col.addEventListener('click', e => {
     const row = e.target.closest('.guide-channel-row');
     if (!row || !isMobileGuide()) return;
@@ -1420,7 +1467,11 @@ function layoutSheetHtml() {
     `<label class="guide-sheet-cb"><input type="checkbox" data-layout="${key}"` +
     `${LAYOUT[key] ? ' checked' : ''}> ${escHtml(label)}</label>`;
 
-  const order = cellFieldOrder();
+  // The schedules card offers no recording chip or tag dots: its rows are schedules, and a
+  // recording is the group's, drawn on its own row.
+  const order = EMBED === 'schedules'
+    ? cellFieldOrder().filter(f => f === 'title' || f === 'subtitle' || f === 'time')
+    : cellFieldOrder();
   const fieldLabel = {
     rec_status: 'Recording status', title: 'Title', subtitle: 'Subtitle / episode',
     time: 'Time', tag_dots: 'Matched-tag dots',
@@ -1436,16 +1487,20 @@ function layoutSheetHtml() {
       `<input type="checkbox" ${fixed ? 'checked disabled' : `data-layout="${key}"${on ? ' checked' : ''}`}> ` +
       `${escHtml(fieldLabel[f])}${fixed ? ' <span class="guide-sheet-note">(always)</span>' : ''}</label>` +
       `<span class="guide-sheet-move">` +
-      `<button type="button" data-move="-1" data-field="${f}"${i === 0 ? ' disabled' : ''} aria-label="Move up">▲</button>` +
-      `<button type="button" data-move="1" data-field="${f}"${i === order.length - 1 ? ' disabled' : ''} aria-label="Move down">▼</button>` +
+      `<button type="button" data-move="-1" data-field="${f}"${i === 0 ? ' disabled' : ''} aria-label="Move up">${icon('move-up')}</button>` +
+      `<button type="button" data-move="1" data-field="${f}"${i === order.length - 1 ? ' disabled' : ''} aria-label="Move down">${icon('move-down')}</button>` +
       `</span></div>`;
   }).join('');
+
+  // The schedules embed's sheet is its own: the fold, then the cell fields it offers.
+  if (EMBED === 'schedules') return schedLayoutSheetHtml(cb, fieldRows);
 
   // The single-channel embed's sheet is the desktop popover's subset, for the same reason:
   // the channel column, the sort and "Include failed channels" all act on a list of
   // channels this card does not have. The hint says so rather than leaving their absence to
   // be noticed, and it is the one place the two sheets' copy diverges.
-  const channelParts = SINGLE_CHANNEL ? '' :
+  const single = EMBED === 'channel';
+  const channelParts = single ? '' :
     '<h4>Channel column</h4>' +
     cb('ch_logo_only', 'Logo only (narrower column)') +
     '<h4>Sort channels</h4>' +
@@ -1458,12 +1513,12 @@ function layoutSheetHtml() {
   return channelParts +
     '<h4>Grid behavior</h4>' +
     cb('collapse_gaps', 'Collapse gaps') +
-    (SINGLE_CHANNEL ? '' : cb('show_failed', 'Include failed channels')) +
+    (single ? '' : cb('show_failed', 'Include failed channels')) +
     '<h4>Program cell fields</h4>' + fieldRows +
     '<p class="guide-sheet-hint">Fields render in this order. Descriptions are not shown in ' +
     'grid cells at this width - tap a program to read one. Rows size to the tallest cell, ' +
     'so nothing clips.' +
-    (SINGLE_CHANNEL ? ' The guide\'s channel-column, sort and "Include failed channels" ' +
+    (single ? ' The guide\'s channel-column, sort and "Include failed channels" ' +
       'settings are not here: this card is one known channel and shows no channel column.' : '') +
     '</p>';
 }
@@ -2261,8 +2316,8 @@ function isCollapseActive() {
 // has no active/scheduled recording (that combination gets channel-health-warn instead, which is
 // never hidden), and "Include failed channels" is currently off.
 function isChannelHealthHidden(ch) {
-  // You are on that channel's own page - hiding it is never the answer (see applyShowFailed).
-  if (SINGLE_CHANNEL) return false;
+  // On a card hiding a row is never the answer (see applyShowFailed).
+  if (!healthFilterApplies()) return false;
   if (ch.last_test_status !== statusVocab('TEST_STATUS').FAILED) return false;
   const RS = statusVocab('REC_STATUS');
   const hasActiveRec = (ch.recordings || []).some(r =>
@@ -2612,12 +2667,14 @@ function renderHealthKey(channels) {
 // Status bar counts (12.6 as amended - the account legend beside them is server-rendered,
 // since accounts do not change while the page is open).
 function updateStatusBar(shownChannels, shownPrograms, terms) {
+  // The schedules card counts schedules and channels in its own words, in its own bar.
+  if (EMBED === 'schedules') { schedStatusBar(); return; }
   const el = document.getElementById('guide-sb-counts');
   renderTagKey(terms);
   renderHealthKey(channelData);
   if (!el) return;
   // A single-channel card counts programs, not channels: "1 of 1 channels" says nothing.
-  if (SINGLE_CHANNEL) {
+  if (EMBED === 'channel') {
     const total = channelData.reduce((n, ch) => n + (ch.programs || []).length, 0);
     el.textContent = `${shownPrograms} of ${total} program${total === 1 ? '' : 's'}  ·  ${filterModeText(terms)}`;
     return;
@@ -2634,6 +2691,9 @@ function updateStatusBar(shownChannels, shownPrograms, terms) {
 
 // Single dispatcher for the whole render pipeline.
 function renderGuide() {
+  // The schedules card's rows are built from data, not served as markup, so they are laid
+  // down before anything reads or fills them.
+  if (EMBED === 'schedules') schedBuildRows();
   const searchInput = document.getElementById('guide-search');
   const q = searchInput ? searchInput.value.trim() : '';
   const terms = parseSearchTerms(q);
@@ -2768,7 +2828,7 @@ function renderGroupBadge(ch) {
   const badge = document.querySelector(`.guide-group-badge[data-channel-id="${ch.id}"]`);
   if (!badge) return;
   const memberLines = (ch.members || []).map((m, i) =>
-    `${i + 1}. ${m.name} (${m.account_name}) - ★${m.effective_score}${m.scored ? '' : ' (untested)'}`);
+    `${i + 1}. ${m.name} (${m.account_name}) - score ${m.effective_score}${m.scored ? '' : ' (untested)'}`);
   badge.dataset.tip = escTipAttr(
     `Channel group - records from the best of ${ch.member_count || 0} feeds\n` +
     `Active: ${ch.active_channel_name || '-'}` +
@@ -2817,8 +2877,8 @@ function renderHealthBadge(ch) {
     `${healthBandName(score)} - score ${score} / 100`,
     `Lifetime health score over ${n} observation${n === 1 ? '' : 's'}.`,
   ];
-  if (ch.last_test_status === statusVocab('TEST_STATUS').FAILED) lines.push('⚠ The most recent health check FAILED.');
-  else if (ch.last_test_error_detail) lines.push(`⚠ ${ch.last_test_error_detail}`);
+  if (ch.last_test_status === statusVocab('TEST_STATUS').FAILED) lines.push('The most recent health check FAILED.');
+  else if (ch.last_test_error_detail) lines.push(ch.last_test_error_detail);
   badge.dataset.tip = escTipAttr(lines.join('\n'));
 }
 
@@ -2895,7 +2955,7 @@ function applyHealthFilter() {
         const badge = document.createElement('span');
         badge.className = 'health-fail-badge tip-plain';
         badge.dataset.tip = 'Health check FAILED - but this channel has a scheduled recording';
-        badge.textContent = '⚠ Health FAIL';
+        badge.innerHTML = `${icon('warning')} Health FAIL`;
         const info = sidebarRow.querySelector('.guide-channel-info');
         if (info) info.appendChild(badge);
       }
@@ -2979,7 +3039,7 @@ function renderSavedSearchDropdown(dropdownEl, inputEl, saveBtn, onSelect) {
     <div class="saved-search-row" data-id="${s.id}">
       <span class="saved-search-text">${escHtml(s.query)}</span>
       <button type="button" class="saved-search-delete" data-id="${s.id}"
-              title="Delete saved search" aria-label="Delete saved search">&times;</button>
+              title="Delete saved search" aria-label="Delete saved search">${icon('close')}</button>
     </div>
   `).join('');
 
@@ -3082,12 +3142,16 @@ document.addEventListener('DOMContentLoaded', function () {
     });
 
     // Instant search (debounced)
+    // The schedules card has no Find cluster: the search box is absent there.
     const guideSearchWrap = document.querySelector('.guide-search-wrap');
-    document.getElementById('guide-search').addEventListener('input', function () {
-      if (guideSearchWrap) guideSearchWrap.classList.toggle('has-value', this.value.length > 0);
-      clearTimeout(searchTimer);
-      searchTimer = setTimeout(() => renderGuide(), 200);
-    });
+    const guideSearch = document.getElementById('guide-search');
+    if (guideSearch) {
+      guideSearch.addEventListener('input', function () {
+        if (guideSearchWrap) guideSearchWrap.classList.toggle('has-value', this.value.length > 0);
+        clearTimeout(searchTimer);
+        searchTimer = setTimeout(() => renderGuide(), 200);
+      });
+    }
 
     const guideSearchClear = document.getElementById('guide-search-clear');
     if (guideSearchClear) {

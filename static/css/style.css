@@ -168,9 +168,6 @@ h3 { font-size: var(--fs-base); font-weight: 600; margin-bottom: 0.5rem; }
 code { font-family: var(--font-mono); background: var(--bg3); padding: 1px 5px; border-radius: var(--radius-sm); font-size: var(--fs-sm); }
 
 /* ── Layout ────────────────────────────────────────────────────────── */
-/* The caret is the app's standard "this opens a menu" chrome; it outlived the
-   top navbar it was named for and is now the guide's menu affordance. */
-.nav-caret { font-size: var(--fs-3xs); }
 
 /* ── Restart-required banner ───────────────────────────────────────── */
 .restart-banner {
@@ -648,7 +645,7 @@ body.scroll-locked { position: fixed; left: 0; right: 0; width: 100%; overflow: 
 .sev-INFO  { background: var(--accent-soft); color: var(--accent-text); }
 
 /* The banner's details view (static/js/nav-alerts.js): a severity-and-time line over the
-   body, and the ⋯ pinned left so the two real buttons keep the right-hand side. */
+   body, and the kebab pinned left so the two real buttons keep the right-hand side. */
 .alert-detail-meta {
   display: flex; align-items: center; flex-wrap: wrap; gap: 4px 8px;
   font-size: var(--fs-sm); color: var(--text-muted); margin-bottom: 10px;
@@ -832,11 +829,10 @@ body.scroll-locked { position: fixed; left: 0; right: 0; width: 100%; overflow: 
    reset to match every .nav-link <a> around it. */
 .nav-logout-form { margin: 0; }
 .nav-logout-btn { width: 100%; background: none; border: none; cursor: pointer; font: inherit; text-align: left; }
-/* Icons are inline SVG on currentColor, so they inherit the hover/active colour the
-   label already had and never become a second source of truth for "which page am I
-   on". One definition (base.html nav_icon) serves both shells. */
-.nav-i { width: 18px; height: 18px; flex: none; fill: none; stroke: currentColor;
-  stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; }
+/* Nav icons are the registry's (app/icons.py) on currentColor, so they inherit the
+   hover/active colour the label already had and never become a second source of truth for
+   "which page am I on". One definition in base.html serves both shells. */
+.nav-i { width: 18px; height: 18px; }
 .sys-mini { margin-top: auto; border-top: 1px solid var(--border-soft); padding: 8px 8px 0; font-size: var(--fs-xs); color: var(--text-faint); font-family: var(--font-mono); line-height: 1.45; }
 .sys-mini .sm-val { color: var(--text-muted); }
 .sys-mini .sm-row { padding: 1px 0; }
@@ -853,8 +849,7 @@ body.scroll-locked { position: fixed; left: 0; right: 0; width: 100%; overflow: 
   color: var(--text-muted); cursor: pointer; font: inherit; line-height: 1;
 }
 .navcollapse:hover { color: var(--text); background: var(--bg3); border-color: var(--accent); }
-.navcollapse .ncx { width: 17px; height: 17px; fill: none; stroke: currentColor;
-  stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
+.navcollapse .ncx { width: 17px; height: 17px; }
 /* The divider exists only in the collapsed rail; expanded, the brand row is one
    line and there is nothing to divide. */
 .brand-rule { display: none; border: 0; height: 1px; background: var(--border-soft); margin: 0; }
@@ -919,7 +914,7 @@ body.scroll-locked { position: fixed; left: 0; right: 0; width: 100%; overflow: 
 .actchip:hover { text-decoration: none; }
 .actchip .pulse { width: 7px; height: 7px; border-radius: 50%; background: currentColor; animation: pulse 1.6s infinite; }
 /* Dim = something's scheduled but nothing is running: a static hollow ring, echoing
-   the tooltip's own ○ (dim) vs ● (active) glyph language rather than inventing a
+   the tooltip's own inactive (dim) vs active icon language rather than inventing a
    second visual system. No animation, no count - see .chip-n hidden via JS. */
 .actchip.dim .pulse { background: transparent; border: 1.5px solid currentColor; animation: none; }
 .chip-rec { background: var(--bad-soft); color: var(--live); }
@@ -929,8 +924,7 @@ body.scroll-locked { position: fixed; left: 0; right: 0; width: 100%; overflow: 
    same urgency for a readout that is always there. Icon-only, numbers in the tip. */
 .chip-stats { background: var(--bg2); color: var(--text-muted); padding: 5px 9px; }
 .chip-stats:hover, .chip-stats.on { color: var(--text); background: var(--bg3); }
-.chip-i { width: 15px; height: 15px; display: block; fill: none; stroke: currentColor;
-  stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
+.chip-i { width: 15px; height: 15px; display: block; }
 .topnav .spacer { flex: 1; }
 .topnav-toggle {
   background: none; border: 1px solid var(--border); border-radius: var(--radius-sm);
@@ -1755,7 +1749,7 @@ body.scroll-locked { position: fixed; left: 0; right: 0; width: 100%; overflow: 
 }
 .secret-reveal-btn:hover { color: var(--text); }
 .secret-reveal-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
-.secret-reveal-btn svg { width: 15px; height: 15px; display: block; }
+.secret-reveal-btn .icon { width: 15px; height: 15px; display: block; }
 .secret-reveal-btn .eye-off { display: none; }
 .secret-reveal-btn.revealed .eye-on { display: none; }
 .secret-reveal-btn.revealed .eye-off { display: block; }
@@ -2422,8 +2416,8 @@ body.actbar-on #app-toast { bottom: 78px; }
 .switch input:checked:disabled + .knob { background: var(--accent-soft); border-color: var(--accent); }
 
 /* ── Design-system responsive: THE mobile breakpoint (≤960px) ────────
-   960 is the app's single mobile breakpoint. The shell (sidebar → top bar) and the
-   components (tables → cards, rows → stacks) move together at it, and no CSS or JS may
+   960 is the app's single mobile breakpoint. The shell (sidebar -> top bar) and the
+   components (tables -> cards, rows -> stacks) move together at it, and no CSS or JS may
    introduce a second one - `tests/test_static_invariants.py::SingleMobileBreakpointTests`
    fails on a stray 768px/900px query.
 

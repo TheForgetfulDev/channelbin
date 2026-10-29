@@ -261,7 +261,14 @@ class ProgramSheetIsGoneTests(unittest.TestCase):
         (tests/test_program_chooser_js.py)."""
         handlers = re.findall(r"el\.addEventListener\('click', \(\) => (\w+)\(prog, ch\)\);",
                               self.src)
-        self.assertEqual(handlers, ['openProgramChooser', 'openProgramChooser'])
+        # The group page's schedules card goes through its own hook first, which opens the
+        # same chooser unless nothing records from the group (dev/changelog/1324).
+        self.assertEqual(handlers, ['schedCellClick', 'openProgramChooser', 'openProgramChooser'])
+        with open(os.path.join(os.path.dirname(GUIDE_JS), 'guide-schedules.js'),
+                  encoding='utf-8') as fh:
+            hook = re.search(r'function schedCellClick\(prog, ch\) \{(.*?)\n\}', fh.read(), re.S)
+        self.assertIsNotNone(hook, 'schedCellClick() not found in guide-schedules.js')
+        self.assertIn('openProgramChooser(prog, ch);', hook.group(1))
 
 
 if __name__ == '__main__':

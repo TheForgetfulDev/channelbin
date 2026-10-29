@@ -30,7 +30,7 @@
         <td data-label="{{ 'Outcome' if past else 'Decision' }}">{{ m.status_badge(e.badge[0], e.badge[1], pulse=e.pulse) }}</td>
         <td data-label="Why" class="rl-why">
           {%- for text, cls in e.detail %}{% if cls %}<span class="{{ cls }}">{{ text }}</span>{% else %}{{ text }}{% endif %}{% endfor %}
-          {%- if e.fate or e.rec %}<span class="fate">{{ e.fate }}{% if e.rec %} <a href="{{ url_for('recordings.recording_detail', recording_id=e.rec.id) }}">{{ e.rec.name }} &rarr;</a>{% endif %}</span>{% endif -%}
+          {%- if e.fate or e.rec %}<span class="fate">{{ e.fate }}{% if e.rec %} <a href="{{ url_for('recordings.recording_detail', recording_id=e.rec.id) }}">{{ e.rec.name }} {{ icon('forward') }}</a>{% endif %}</span>{% endif -%}
         </td>
       </tr>
       {% endfor %}
@@ -42,7 +42,7 @@
 {% block content %}
 <div class="page-head">
   <h1>Auto-record rules</h1>
-  <a href="{{ url_for('auto_rules.rules_page') }}" class="btn">&larr; All Rules</a>
+  <a href="{{ url_for('auto_rules.rules_page') }}" class="btn">{{ icon('back') }} All Rules</a>
 </div>
 
 <div class="gd-head">
@@ -89,7 +89,7 @@
       <button class="btn btn-sm" data-act="resume">Resume</button>
       {% endif %}
       <span class="menu-wrap">
-        <button class="btn btn-sm btn-icon" data-menu aria-label="More actions">&#8943;</button>
+        <button class="btn btn-sm btn-icon" data-menu aria-label="More actions">{{ icon('more') }}</button>
         <div class="menu pop-left">
           <button class="menu-item" data-act="edit">Edit settings&hellip;</button>
           <a class="menu-item" href="{{ rule.search_url }}">Open search</a>
@@ -128,7 +128,7 @@
     <div class="card-head">
       <h2>What it searches for</h2>
       <div class="card-head-actions">
-        <a class="btn btn-sm" href="{{ rule.search_url }}">Open search <span class="arw">&rarr;</span></a>
+        <a class="btn btn-sm" href="{{ rule.search_url }}">Open search <span class="arw">{{ icon('forward') }}</span></a>
         <a class="btn btn-sm" href="{{ rule.edit_search_url }}">Edit search</a>
       </div>
     </div>

@@ -32,7 +32,7 @@
   </div>
   {% if guide.tone == 'warn' %}
   <a class="btn btn-sm" href="{{ url_for('accounts.accounts_list') }}"
-     data-tip="Sync now and the automatic sync switch live on each account.">Accounts &rarr;</a>
+     data-tip="Sync now and the automatic sync switch live on each account.">Accounts {{ icon('forward') }}</a>
   {% endif %}
 </div>
 
@@ -80,7 +80,7 @@
       </span>
       <span class="c-actions">
         <span class="menu-wrap">
-          <button class="btn btn-sm btn-icon" data-menu aria-label="Actions for {{ r.name }}">&#8943;</button>
+          <button class="btn btn-sm btn-icon" data-menu aria-label="Actions for {{ r.name }}">{{ icon('more') }}</button>
           <div class="menu pop-left">
             {% if r.enabled %}
             <button class="menu-item" data-act="pause">Pause</button>

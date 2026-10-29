@@ -820,7 +820,7 @@ def status_vocabularies():
     spelling and never re-types it. Derived from the module's own constants, so a new member
     is on every surface the moment it is declared."""
     families = ('REC_STATUS', 'TEST_STATUS', 'OD_JOB_STATUS', 'ACCOUNT_STATUS', 'SYNC_LOG',
-                'EPG_STATUS', 'JOB_RUN')
+                'EPG_STATUS', 'EPG_SCAN', 'JOB_RUN')
     out = {family: {} for family in families}
     for name, value in globals().items():
         if not isinstance(value, str):
@@ -2927,6 +2927,113 @@ class EpgChannelKey(db.Model):
 
     __table_args__ = (
         db.UniqueConstraint('channel_id', 'source_id', name='uq_epg_channel_key'),
+    )
+
+
+# ── The EPG similarity scan (app/epg_similarity.py, dev/changelog/1325) ─────────
+# One scan at a time holds rows: the run that finishes replaces the last one's rows in
+# the commit that marks it SUCCESS, so the pages always read one whole result.
+
+EPG_SCAN_RUNNING = 'RUNNING'
+EPG_SCAN_SUCCESS = 'SUCCESS'
+EPG_SCAN_FAILED  = 'FAILED'
+
+
+class EpgScan(db.Model):
+    """One run of the similarity scan: when it read the listings, what it found, and why
+    it stopped if it did not finish. A RUNNING row left by a process that died is marked
+    FAILED at the next startup (epg_similarity.reconcile_interrupted_scans())."""
+    __tablename__ = 'epg_scans'
+
+    id             = db.Column(db.Integer, primary_key=True)
+    started_at     = db.Column(db.DateTime, nullable=False)
+    finished_at    = db.Column(db.DateTime)
+    status         = db.Column(db.String(16), nullable=False)   # EPG_SCAN_*
+    listings_as_of = db.Column(db.DateTime)   # "from now on" as the scan read it
+    listings       = db.Column(db.Integer)    # listings read, both tables
+    schedules      = db.Column(db.Integer)    # distinct (source, file id) schedules
+    clusters       = db.Column(db.Integer)    # same-programs clusters of two or more
+    identical      = db.Column(db.Integer)    # clusters identical in every way
+    links          = db.Column(db.Integer)    # related pairs across clusters
+    elapsed_ms     = db.Column(db.Integer)
+    error          = db.Column(db.Text)
+
+
+class EpgScanSchedule(db.Model):
+    """One distinct schedule the scan read: a (source, file id) pair and the numbers that
+    say how good a copy it is. `cluster` groups schedules whose programs and times are the
+    same over everything held (equal `h_programs`); the other hashes say which facets of
+    two schedules in a cluster differ - every column a page would sort or filter on is a
+    column, the facet hashes included, so the page never re-reads the listings."""
+    __tablename__ = 'epg_scan_schedules'
+
+    id             = db.Column(db.Integer, primary_key=True)
+    scan_id        = db.Column(db.Integer, db.ForeignKey('epg_scans.id'), nullable=False)
+    source_id      = db.Column(db.Integer, db.ForeignKey('epg_sources.id'))
+    epg_id         = db.Column(db.String(255), nullable=False)
+    spellings      = db.Column(db.Text)      # JSON list of the keys as channels spell them
+    cluster        = db.Column(db.Integer, nullable=False)   # per scan; equal h_programs
+    active         = db.Column(db.Boolean, nullable=False, default=False)  # some channel's guide
+    channel_count  = db.Column(db.Integer, nullable=False, default=0)
+    listings       = db.Column(db.Integer, nullable=False, default=0)
+    until          = db.Column(db.DateTime)  # the last stop it lists
+    described      = db.Column(db.Integer, nullable=False, default=0)   # listings with a description
+    desc_chars     = db.Column(db.Integer, nullable=False, default=0)   # description characters, total
+    subtitled      = db.Column(db.Integer, nullable=False, default=0)
+    marked         = db.Column(db.Integer, nullable=False, default=0)   # titles carrying provider marks
+    h_programs     = db.Column(db.String(32), nullable=False)   # comparison titles + starts
+    h_titles       = db.Column(db.String(32), nullable=False)   # titles as spelled + starts
+    h_stops        = db.Column(db.String(32), nullable=False)   # starts + stops
+    h_subtitles    = db.Column(db.String(32), nullable=False)
+    h_descriptions = db.Column(db.String(32), nullable=False)
+    h_extra        = db.Column(db.String(32), nullable=False)   # category + rating
+    h_exact        = db.Column(db.String(32), nullable=False)   # every field
+
+    __table_args__ = (
+        db.Index('ix_epg_scan_schedules_scan_cluster', 'scan_id', 'cluster'),
+        db.Index('ix_epg_scan_schedules_scan_source_id', 'scan_id', 'source_id', 'epg_id'),
+    )
+
+
+class EpgScanScheduleChannel(db.Model):
+    """Which channels read a scanned schedule - a row per channel, so a page can filter
+    schedules by channel name or by group membership in SQL."""
+    __tablename__ = 'epg_scan_schedule_channels'
+
+    id          = db.Column(db.Integer, primary_key=True)
+    scan_id     = db.Column(db.Integer, db.ForeignKey('epg_scans.id'), nullable=False)
+    schedule_id = db.Column(db.Integer, db.ForeignKey('epg_scan_schedules.id'), nullable=False)
+    channel_id  = db.Column(db.Integer, db.ForeignKey('channels.id'), nullable=False)
+
+    __table_args__ = (
+        db.Index('ix_epg_scan_schedule_channels_schedule', 'schedule_id'),
+        db.Index('ix_epg_scan_schedule_channels_scan_channel', 'scan_id', 'channel_id'),
+    )
+
+
+class EpgScanLink(db.Model):
+    """Two schedules in different clusters that epg_sources.compare_listings() judged
+    related over the stretch both list - its verdict and counts, as the compare-sources
+    page shows them. `a_id` < `b_id`; unrelated and no-overlap pairs are not stored."""
+    __tablename__ = 'epg_scan_links'
+
+    id               = db.Column(db.Integer, primary_key=True)
+    scan_id          = db.Column(db.Integer, db.ForeignKey('epg_scans.id'), nullable=False)
+    a_id             = db.Column(db.Integer, db.ForeignKey('epg_scan_schedules.id'), nullable=False)
+    b_id             = db.Column(db.Integer, db.ForeignKey('epg_scan_schedules.id'), nullable=False)
+    verdict          = db.Column(db.String(16), nullable=False)   # epg_sources.CMP_*
+    compared         = db.Column(db.Integer, nullable=False, default=0)
+    same             = db.Column(db.Integer, nullable=False, default=0)
+    moved            = db.Column(db.Integer, nullable=False, default=0)
+    different        = db.Column(db.Integer, nullable=False, default=0)
+    only_a           = db.Column(db.Integer, nullable=False, default=0)
+    only_b           = db.Column(db.Integer, nullable=False, default=0)
+    description_gaps = db.Column(db.Integer, nullable=False, default=0)
+    largest_move_min = db.Column(db.Integer)
+
+    __table_args__ = (
+        db.Index('ix_epg_scan_links_a', 'scan_id', 'a_id'),
+        db.Index('ix_epg_scan_links_b', 'scan_id', 'b_id'),
     )
 
 

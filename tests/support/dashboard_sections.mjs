@@ -192,7 +192,8 @@ function boot(start, { serve = start } = {}) {
       .map((s) => s.dataset.sec),
     sortedCol: (key) => {
       const h = sec(key) && sec(key).querySelector('.dash-head .sortable.sorted');
-      return h ? `${h.dataset.sort}:${h.querySelector('.sort-ind').textContent.trim()}` : null;
+      const ic = h && h.querySelector('.sort-ind [data-icon]');
+      return h ? `${h.dataset.sort}:${ic ? ic.dataset.icon : ''}` : null;
     },
     sortHeader: (key, col) => sec(key).querySelector(`.dash-head .sortable[data-sort="${col}"]`),
   };

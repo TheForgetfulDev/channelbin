@@ -81,7 +81,7 @@
   <div class="card-head-actions">
     <button class="btn btn-sm" id="al-read-all">Mark all read</button>
     <span class="menu-wrap">
-      <button class="btn btn-sm btn-icon" data-menu aria-label="More actions">&#8943;</button>
+      <button class="btn btn-sm btn-icon" data-menu aria-label="More actions">{{ icon('more') }}</button>
       <div class="menu pop-left">
         {% if include_dismissed %}
         <a href="{{ url_for('alerts.alert_center') }}">Hide dismissed</a>
@@ -128,7 +128,7 @@
       {% elif a.dismissed_at %}&nbsp;&middot;&nbsp;<em>dismissed</em>{% endif %}
     </div>
     {% if link %}
-    <a class="al-link" href="{{ link[0] }}">{{ link[1] }} &rarr;</a>
+    <a class="al-link" href="{{ link[0] }}">{{ link[1] }} {{ icon('forward') }}</a>
     {% endif %}
     {% if a.body and a.body != a.title %}
     <button class="al-toggle" data-act="detail">Show details</button>
@@ -136,7 +136,7 @@
     {% endif %}
   </div>
   <span class="menu-wrap al-actions">
-    <button class="btn btn-sm btn-icon" data-menu aria-label="More actions">&#8943;</button>
+    <button class="btn btn-sm btn-icon" data-menu aria-label="More actions">{{ icon('more') }}</button>
     <div class="menu pop-left">
       {% if a.read_at is none %}
       <button class="menu-item" data-act="read">Mark read</button>

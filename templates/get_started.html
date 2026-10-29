@@ -12,19 +12,19 @@
 {% macro step_item(s) -%}
   {%- set open = s.display in ('now', 'problem', 'wait') or (s.optional and s.display == 'todo') -%}
   <li class="gs-step {{ s.display }}" data-step="{{ s.id }}">
-    <span class="gs-mark">{% if s.display == 'done' %}&#10003;{% elif s.display == 'problem' %}!{% else %}{{ s.n }}{% endif %}</span>
+    <span class="gs-mark">{% if s.display == 'done' %}{{ icon('ok') }}{% elif s.display == 'problem' %}!{% else %}{{ s.n }}{% endif %}</span>
     <div class="gs-main">
       <div class="gs-head"><span class="gs-title">{{ s.title }}</span>{% if s.optional %}<span class="gs-tag">Optional</span>{% endif %}</div>
       <div class="gs-state">{{ s.state }}</div>
       {% if open and s.body %}<div class="gs-body">{{ s.body }}</div>{% endif %}
       {% if s.link %}
       <div class="gs-acts">
-        <a class="btn{% if s.display in ('now', 'problem', 'wait') %} btn-primary{% endif %}" href="{{ s.link.url }}">{{ s.link.label }} <span class="arw">&#8594;</span></a>
+        <a class="btn{% if s.display in ('now', 'problem', 'wait') %} btn-primary{% endif %}" href="{{ s.link.url }}">{{ s.link.label }} <span class="arw">{{ icon('forward') }}</span></a>
         {%- if s.keep_examples %}
         <button type="button" class="btn" data-examples-keep>Keep the examples</button>
         {%- endif %}
         {%- if open %}{% for m in s.more %}
-        <a class="btn" href="{{ m.url }}">{{ m.label }} <span class="arw">&#8594;</span></a>
+        <a class="btn" href="{{ m.url }}">{{ m.label }} <span class="arw">{{ icon('forward') }}</span></a>
         {%- endfor %}{% endif %}
       </div>
       {% endif %}
@@ -138,7 +138,7 @@
           <p>One row per channel. It answers "which of my channels is this?" Use it to find a
             channel by name, then add it to the TV Guide, test it, or put it in a group. It
             looks at channel names unless you tell it otherwise.</p>
-          <a class="btn btn-sm" href="{{ search_channels_url }}">Search Channels <span class="arw">&#8594;</span></a>
+          <a class="btn btn-sm" href="{{ search_channels_url }}">Search Channels <span class="arw">{{ icon('forward') }}</span></a>
         </div>
         <div class="gs-half">
           <h3>Search Programs (EPG)</h3>
@@ -146,7 +146,7 @@
             answers "when is this on, and on which channel?" Type a show, a team or a word
             from a description, and every showing it finds has its time and a Record button.
             An auto-record rule is one of these searches, saved.</p>
-          <a class="btn btn-sm" href="{{ search_programs_url }}">Search Programs (EPG) <span class="arw">&#8594;</span></a>
+          <a class="btn btn-sm" href="{{ search_programs_url }}">Search Programs (EPG) <span class="arw">{{ icon('forward') }}</span></a>
         </div>
       </div>
       <p>Click into the search box to see <b>Search in</b>, which picks what your words are
@@ -162,7 +162,7 @@
 {% if setup %}
   <div class="card gs-card gs-finish" id="gs-finish">
     <div class="card-head"><h2>Then: the Readiness check</h2>
-      <div class="card-head-actions"><a class="btn btn-sm" href="{{ url_for('system.maintenance') }}">Readiness check <span class="arw">&#8594;</span></a></div>
+      <div class="card-head-actions"><a class="btn btn-sm" href="{{ url_for('system.maintenance') }}">Readiness check <span class="arw">{{ icon('forward') }}</span></a></div>
     </div>
     <div class="card-body">
       <p>The steps above are what you have to do. The Readiness check on Maintenance tests the

@@ -936,7 +936,7 @@ def _format_option_sets(group_format):
 #   records   = at least one member has Recording on, so a recording (and a guide row)
 #               can start from this group at all - what the page says about itself
 # Every section keys off those, through build_group_detail_context().
-GROUP_DETAIL_SECTIONS = ('summary', 'settings', 'channels', 'activity')
+GROUP_DETAIL_SECTIONS = ('summary', 'settings', 'channels', 'whatson', 'activity')
 
 # Optional Channels-table columns, per facet. Structural columns (select, caret,
 # Channel, actions) are never user-hideable and are not listed here.
@@ -1460,7 +1460,8 @@ def build_group_detail_context(group):
     from .channels import _ListPagination, CHANNEL_HEALTH_PAGE_SIZES
     from ..channel_tester import get_status, health_check_profile_payload
 
-    ct_cfg = load_config().get('channel_testing', {})
+    cfg = load_config()
+    ct_cfg = cfg.get('channel_testing', {})
     from ..check_window import format_window_label
     window_label = format_window_label(ct_cfg)
     is_stored = not group.is_system
@@ -1586,10 +1587,29 @@ def build_group_detail_context(group):
                            if src_group is not None else None),
         }
 
+    # The What's On card (dev/changelog/1324): any stored group with a channel carrying an
+    # EPG id, in the guide or not - checking a group before it goes in is half the point.
+    # Decided from the rows already built; the grid itself is fetched by guide.js.
+    whatson = None
+    if is_stored and any(r['epg_channel_id'] for r in payload['rows']):
+        from .guide import (read_group_whatson_layout, GROUP_WHATSON_LAYOUT_PREF_KEY,
+                            GROUP_WHATSON_LAYOUT_MOBILE_PREF_KEY)
+        from .channels import airing_search_url
+        whatson = {
+            'layout': read_group_whatson_layout(cfg),
+            'layout_mobile': read_group_whatson_layout(cfg, mobile=True),
+            'layout_pref_key': GROUP_WHATSON_LAYOUT_PREF_KEY,
+            'layout_mobile_pref_key': GROUP_WHATSON_LAYOUT_MOBILE_PREF_KEY,
+            'window_days': max(1, int(cfg.get('sync', {}).get('epg_days_ahead', 3) or 3)),
+            'program_airings_url': airing_search_url(fields=('epg-title',)),
+        }
+    sections = [s for s in GROUP_DETAIL_SECTIONS if s != 'whatson' or whatson is not None]
+
     return {
         'group': group,
         'job': job,
         'is_stored': is_stored,
+        'whatson': whatson,
         # For the delete confirm - deleting the group stops these (DESIGN-autoschedule.md §3.2).
         'auto_rules': _rules_by_group().get(group.name, []),
         'records': records,
@@ -1620,7 +1640,7 @@ def build_group_detail_context(group):
         'col_key': col_key,
         'section_pref': json.loads(sec_pref.value) if sec_pref and sec_pref.value else None,
         'column_pref': json.loads(col_pref.value) if col_pref and col_pref.value else None,
-        'sections': list(GROUP_DETAIL_SECTIONS),
+        'sections': sections,
         'columns': list(GROUP_DETAIL_COLUMNS[col_key]),
         'columns_off': list(GROUP_DETAIL_COLUMNS_OFF),
         'timeline_entries': entries,

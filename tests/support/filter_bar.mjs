@@ -89,7 +89,8 @@ function boot() {
       return [...document.querySelectorAll('#chips .chip.active-filter')].map(c => c.textContent.trim());
     }
     function menuRows() {
-      return [...document.querySelectorAll('#menu .menu-item')].map(b => b.textContent.trim());
+      return [...document.querySelectorAll('#menu .menu-item')].map(b =>
+        (b.querySelector('.fb-tick [data-icon="ok"]') ? '[ok]' : '') + b.textContent.trim());
     }
     function visible() { return ROWS.filter(r => bar.matches(r)).map(r => r.name); }
     function open() { document.getElementById('add').click(); }

@@ -57,6 +57,11 @@ ICONS = {
     'delete': 'delete-outline',
     'health-check': 'heart-pulse',
     'logout': 'logout',
+    'menu-collapse': 'chevron-double-left',
+    'menu-expand': 'chevron-double-right',
+    'stats': 'chart-bar',
+    'bottom': 'arrow-collapse-down',
+    'repoint': 'swap-horizontal',
 
     # Status marks.
     'ok': 'check',
@@ -73,12 +78,15 @@ ICONS = {
     'time': 'clock-outline',
     'active': 'circle',
     'inactive': 'circle-outline',
+    'unknown': 'help-circle-outline',
+    'not-set-up': 'minus-circle-outline',
 
     # The sidebar's destinations. Recordings and Channel Groups use `recordings` and `group`.
     'nav-dashboard': 'view-dashboard-outline',
     'nav-auto-record': 'calendar-sync',
     'nav-guide': 'television-guide',
     'nav-channel-search': 'text-search',
+    'nav-epg-manager': 'calendar-multiple-check',
     'nav-get-started': 'rocket-launch-outline',
     'nav-accounts': 'account-key-outline',
     'nav-rec-profiles': 'movie-cog-outline',

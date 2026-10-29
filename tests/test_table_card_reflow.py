@@ -45,6 +45,10 @@ REFLOWING_PAGES = {
     # The account stats comparison (dev/changelog/1029); drawn only with two or more
     # accounts, so the fixture below seeds a second one.
     '/accounts': 1,
+    # The EPG Manager's similarity scan (dev/changelog/1325): one cluster, one table. The
+    # fixture's channel holds the same program from two sources, so a stored scan of it
+    # is a two-copy cluster.
+    '/epg-manager': 1,
 }
 
 # Tables built in JavaScript, so no server render contains them. The source file is what
@@ -133,6 +137,12 @@ class LabelledCellTests(unittest.TestCase):
             cls.rule_id = rule.id
             cls.channel_id = ch.id
             cls.account_id = acc.id
+            from app import epg_similarity
+            from app.database import EpgScan, EPG_SCAN_RUNNING
+            scan = EpgScan(started_at=datetime.utcnow(), status=EPG_SCAN_RUNNING)
+            db.session.add(scan)
+            db.session.commit()
+            epg_similarity._persist(scan.id, epg_similarity.scan_listings(cfg={}))
             cls.source_id = src.id
         cls.patcher = mock.patch('app.routes.jobs._build_job_list', return_value=JOBS)
         cls.patcher.start()
@@ -278,7 +288,8 @@ class OptInTests(unittest.TestCase):
                       'templates/channels/detail.html', 'templates/_account_stats.html',
                       'templates/account_detail.html',
                       'templates/epg_source_review.html',
-                      'templates/channels/guide_compare.html'} | {p for p, _b, _n in REFLOWING_JS}
+                      'templates/channels/guide_compare.html',
+                      'templates/epg_manager.html'} | {p for p, _b, _n in REFLOWING_JS}
         self.assertEqual(
             registered, found,
             'A file opts into .tbl-cards but is not covered above (or is covered and no '

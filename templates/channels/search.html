@@ -26,7 +26,7 @@
 #}
 
 {% block content %}
-{# NO BACK LINK. This page carried a "&larr; TV Guide" button from when it was only
+{# NO BACK LINK. This page carried a back button to the TV Guide from when it was only
    reachable through the guide's Manage channels. It is a top-level sidebar destination
    now, so that arrow pointed sideways at an unrelated page rather than back the way you
    came, which is the one thing DESIGN.md 4 reserves it for. The head is an h1 alone,
@@ -41,7 +41,7 @@
      would hold something. #}
   {% if missing_count or dup_groups %}
   <button class="page-kebab" id="page-kebab" type="button"
-          aria-label="Channel list actions">&#8943;</button>
+          aria-label="Channel list actions">{{ icon('more') }}</button>
   {% endif %}
 </div>
 
@@ -83,7 +83,7 @@
           <span id="wjoin-left"></span>
           <div class="sbox-wrap">
             <div class="sbox" id="sbox">
-              <span class="mag" aria-hidden="true">&#128269;</span>
+              <span class="mag" aria-hidden="true">&#128269;</span>  {# icon-ok: the page's granted pictorial glyphs (DESIGN.md 4) #}
               <input id="cs-q" type="text" autocomplete="off" spellcheck="false"
                      aria-label="Search channels"
                      placeholder="Search by channel name">
@@ -91,7 +91,7 @@
               <span class="scount" id="scount"></span>
               <span class="spinner sspin" id="sb-spin"></span>
               <button class="sclr" id="sb-clr" type="button" style="display:none"
-                      data-tip="Clear the text. Filters stay.">&#10005;</button>
+                      data-tip="Clear the text. Filters stay.">{{ icon('close') }}</button>
             </div>
             <div class="sugg" id="sugg"></div>
           </div>
@@ -99,12 +99,12 @@
              than in a toolbar under it. Moves to the chip row at phone width. #}
           <div class="menu-wrap" id="sf-wrap">
             <button class="btn btn-sm" id="sf-btn" type="button" data-menu
-                    data-tip="Saved searches.&#10;Saves the text, the match mode, the search scope, the standing options and every filter chip under a name.">&#128190; Saved searches</button>
+                    data-tip="Saved searches.&#10;Saves the text, the match mode, the search scope, the standing options and every filter chip under a name.">&#128190; Saved searches</button>  {# icon-ok: the page's granted pictorial glyphs (DESIGN.md 4) #}
             <div class="menu menu-panel pop-left" id="sf-pop"><div id="sf-pop-body"></div></div>
           </div>
           <span class="sf-name" id="sf-current"></span>
           <span class="sf-dirty" id="sf-dirty" style="display:none"
-                data-tip="This saved search has been changed since it was loaded. Save it again to keep the change.">&#9679; edited</span>
+                data-tip="This saved search has been changed since it was loaded. Save it again to keep the change.">{{ icon('active') }} edited</span>
         </div>
       </div>
 
@@ -156,11 +156,11 @@
     <div class="missing-bar">
       {% if missing_count %}
       <button class="btn btn-sm btn-danger" id="missing-btn" type="button"
-              data-tip="Deletes channels that have not appeared in a sync in a while. Opens a preview listing what would be deleted and what is excluded because it is in the guide, in a group, or has a recording.">&#128465; Delete Missing Channels ({{ missing_count }}{% if missing_hidden_count %}, {{ missing_hidden_count }} hidden{% endif %})</button>
+              data-tip="Deletes channels that have not appeared in a sync in a while. Opens a preview listing what would be deleted and what is excluded because it is in the guide, in a group, or has a recording.">{{ icon('delete') }} Delete Missing Channels ({{ missing_count }}{% if missing_hidden_count %}, {{ missing_hidden_count }} hidden{% endif %})</button>
       {% endif %}
       {% if dup_groups %}
       <button class="btn btn-sm btn-danger" id="review-dup-btn" type="button"
-              data-tip="Resolves channels IN YOUR GUIDE that share a stream URL. That list is guide-scoped - it is not the account-global DUP flag a row's badge carries.">&#128465; Review Duplicates&#8230;</button>
+              data-tip="Resolves channels IN YOUR GUIDE that share a stream URL. That list is guide-scoped - it is not the account-global DUP flag a row's badge carries.">{{ icon('delete') }} Review Duplicates&#8230;</button>
       {% endif %}
     </div>
 
@@ -173,7 +173,7 @@
     <div class="cs-replace-bar" id="replace-bar" style="display:none">
       <span class="cs-replace-lbl" id="replace-lbl"></span>
       <button class="btn btn-sm btn-ghost" id="replace-x" type="button"
-              data-tip="Stop replacing that recording. The search itself is left alone, and the scheduled recording stays as it is.">&times;</button>
+              data-tip="Stop replacing that recording. The search itself is left alone, and the scheduled recording stays as it is.">{{ icon('close') }}</button>
     </div>
 
     {# The THIRD action context (DESIGN-channel-search.md §3, dev/changelog/1189): making an
@@ -182,7 +182,7 @@
     <div class="cs-replace-bar" id="rule-bar" style="display:none">
       <span class="cs-replace-lbl" id="rule-lbl"></span>
       <button class="btn btn-sm btn-primary" id="rule-save" type="button" style="display:none">Save to rule</button>
-      <button class="btn btn-sm btn-ghost" id="rule-x" type="button">&times;</button>
+      <button class="btn btn-sm btn-ghost" id="rule-x" type="button">{{ icon('close') }}</button>
     </div>
 
     <div class="cb-all">
@@ -203,9 +203,9 @@
         <button class="btn btn-sm" id="sel-mkrule" type="button" style="display:none"
                 data-tip="Create rule from this search.&#10;Records each upcoming program this search finds, once, now and whenever the guide refreshes.">Create rule from this search&#8230;</button>
         <div class="menu-wrap">
-          <button class="btn btn-sm" id="cols-btn" type="button" data-menu>&#9881; Columns</button>
+          <button class="btn btn-sm" id="cols-btn" type="button" data-menu>{{ icon('layout') }} Columns</button>
           <div class="menu menu-panel" id="cols-pop">
-            <h5>Columns - drag &#8942;&#8942; to reorder</h5>
+            <h5>Columns - drag {{ icon('drag') }} to reorder</h5>
             <div id="cols-list"></div>
             <div class="pnote">Saved to the server, so it follows you across browsers. The
               Channel column is pinned first, exactly as the recordings list pins its name column.</div>
@@ -240,7 +240,7 @@
           <span class="sel-ctx-lbl" id="sel-ctx-lbl"></span>
           <button class="btn btn-sm btn-primary" id="sel-ctx-add" type="button">+ Add Channels</button>
           <button class="btn btn-sm btn-ghost" id="sel-ctx-x" type="button"
-                  data-tip="Stop adding to that group. The search itself is left alone.">&times;</button>
+                  data-tip="Stop adding to that group. The search itself is left alone.">{{ icon('close') }}</button>
         </span>
         {# The guide action leads and is the only primary on this bar: putting a channel in
            the guide is what most people tick one for, and the checkbox plus this bar is the

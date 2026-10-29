@@ -299,7 +299,16 @@ await record('refill_and_escape', async () => {
 
 await record('single_channel', async () => {
   const c = boot();
-  c.window.eval('GUIDE_CONFIG.singleChannel = true');
+  c.window.eval("GUIDE_CONFIG.embed = 'channel'");
+  c.open(prog(), row([]));
+  await c.settle();
+  return { errors: c.errors, tiles: c.tiles() };
+});
+
+// The group page's What's On card is on the group's own page (dev/changelog/1324).
+await record('schedules_card', async () => {
+  const c = boot();
+  c.window.eval("GUIDE_CONFIG.embed = 'schedules'");
   c.open(prog(), row([]));
   await c.settle();
   return { errors: c.errors, tiles: c.tiles() };

@@ -586,6 +586,32 @@ def _seed_guide_compare(n):
     db.session.commit()
 
 
+def _seed_epg_manager(n):
+    """n clusters of two ids carrying one schedule on two sources, scanned and stored -
+    the EPG Manager page (dev/changelog/1325). The page chooses its clusters in SQL and
+    loads that page's schedules, channels and links in fixed queries; a per-cluster or
+    per-schedule lookup would show here."""
+    from app import epg_similarity
+    from app.database import EpgScan, EPG_SCAN_RUNNING
+    acc = seed.make_account(name='Scaling Manager A')
+    acc2 = seed.make_account(name='Scaling Manager B')
+    src = seed.make_epg_source(acc, name='Scaling Manager Source A')
+    src2 = seed.make_epg_source(acc2, name='Scaling Manager Source B')
+    base = datetime.utcnow() + timedelta(hours=1)
+    for i in range(n):
+        for acct, source, eid in ((acc, src, f'a{i}.test'), (acc2, src2, f'b{i}.test')):
+            ch = seed.make_channel(acct, name=f'Manager {i} on {source.name}',
+                                   epg_channel_id=eid, epg_source_id=source.id)
+            for h in range(3):
+                seed.make_epg_entry(ch, title=f'Station {i} show {h}', description='About it.',
+                                    start_time=base + timedelta(hours=h), source_id=source.id)
+    db.session.commit()
+    scan = EpgScan(started_at=datetime.utcnow(), status=EPG_SCAN_RUNNING)
+    db.session.add(scan)
+    db.session.commit()
+    epg_similarity._persist(scan.id, epg_similarity.scan_listings(cfg={}))
+
+
 def _scaling_compare_channel_id():
     return Channel.query.filter_by(name='Scaling Compare Channel').one().id
 
@@ -897,6 +923,11 @@ class PageScalingTests(unittest.TestCase):
                     _seed_guide_compare,
                     lambda: f'/channels/{_scaling_compare_channel_id()}/guide-compare?diff={diff}')
 
+    def test_epg_manager_page(self):
+        for query in ('', '?kind=details', '?q=Manager'):
+            with self.subTest(query=query):
+                self._assert_row_independent(_seed_epg_manager, f'/epg-manager{query}')
+
     def test_group_detail_page(self):
         self._assert_row_independent(_seed_group_members, lambda: f'/channel-groups/{_scaling_group_id()}')
 
@@ -1037,6 +1068,7 @@ COVERED = {
     'channels.channel_browser': 'test_channels_hub_page',
     'channels.channel_detail': 'test_channel_detail_page',
     'channels.channel_guide_compare': 'test_channel_guide_compare_page',
+    'epg_manager.epg_manager': 'test_epg_manager_page',
     'channel_groups.groups_page': 'test_groups_page',
     'channel_groups.group_detail': 'test_group_detail_page',
     'alerts.alert_center': 'test_alerts_page',
@@ -1084,7 +1116,7 @@ NOT_ROW_SCALING = {
         'arrive from /api/logs/history, which is a file tail hard-capped at 5000 lines and '
         'touches no database row.'),
     'system.maintenance': (
-        'Seven cards whose contents all arrive by fetch. The only server-rendered values are '
+        'Eight cards whose contents all arrive by fetch. The only server-rendered values are '
         'the backup schedule and the Docker flag, which are config, not measurement. The '
         'Readiness card is the one whose payload counts rows, and /api/readiness carries its '
         'own case above (test_readiness_report).'),

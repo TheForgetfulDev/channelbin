@@ -159,7 +159,7 @@
   // before a section was removed is dropped by initSectionLayout, never rendered.
 
   const SEC_NAMES = { summary: 'Summary', settings: 'Settings', channels: 'Channels',
-                      activity: 'Activity timeline' };
+                      whatson: "What's On", activity: 'Activity timeline' };
   const secStateName = { both: 'channel group', check: 'automatic health check' }[G.secKey];
   const sectionLayout = initSectionLayout({
     config: G,
@@ -250,7 +250,7 @@
       // entry was until dev/changelog/1064.
       item.draggable = true;
       item.dataset.key = key;
-      item.innerHTML = `<span class="grip">&#8942;&#8942;</span>` +
+      item.innerHTML = `<span class="grip">${icon('drag')}</span>` +
         `<input type="checkbox" ${fieldOn(key) ? 'checked' : ''}> ${escHtml(COL_LABEL[key])}`;
       item.querySelector('input').addEventListener('change', (e) => {
         toggleField(key, e.target.checked);
@@ -595,7 +595,7 @@
     const st = rowStatus(r);
     const t = r.last_test;
     if (st === 'DISABLED') {
-      return `<span class="badge b-abort tip-plain" data-tip="Disabled.&#10;${escHtml(r.disabled_tip || 'Excluded here. Still usable everywhere else.')}">&#10005; Disabled</span>` +
+      return `<span class="badge b-abort tip-plain" data-tip="Disabled.&#10;${escHtml(r.disabled_tip || 'Excluded here. Still usable everywhere else.')}">${icon('failed')} Disabled</span>` +
         (t ? `<div class="gd-sub">Last: ${testStatusLabel(t)}</div>` : '');
     }
     // b-running: a channel simply being tested is not an alarm (dev/changelog/816).
@@ -613,7 +613,7 @@
     if (s === null) return '<span class="text-muted tip-plain" data-tip="No score.&#10;A score needs at least one completed test or recording on this feed.">&mdash;</span>';
     const n = r.health_score_sample_count || 0;
     const cls = healthBandCss(s);
-    return `<span class="num hb-text ${cls} tip-plain" data-tip="Health score ${s}.&#10;Lifetime 0-100 from this feed's own history: connect time, stalls, and whether it held its declared format. Built from ${plural(n, 'observation')}.">&#9733;${s}</span>`;
+    return `<span class="num hb-text ${cls} tip-plain" data-tip="Health score ${s}.&#10;Lifetime 0-100 from this feed's own history: connect time, stalls, and whether it held its declared format. Built from ${plural(n, 'observation')}.">${icon('health-score')}${s}</span>`;
   }
 
   function bitrateCell(t) {
@@ -781,11 +781,11 @@
     let h = `<div class="gd-namecell">${logoHtml(r)}` +
       `<a href="/channels/${r.channel_id}" class="gd-name-link${dim ? ' dim' : ''}">${escHtml(r.channel_name)}</a>`;
     if (G.hasChannel && r.is_best && r.recording_enabled) {
-      h += ` <span class="gd-best tip-plain" data-tip="Best eligible member.&#10;Highest health score among the members switched on for recording, so a recording starts here and fails over downward.">&#9733;</span>`;
+      h += ` <span class="gd-best tip-plain" data-tip="Best eligible member.&#10;Highest health score among the members switched on for recording, so a recording starts here and fails over downward.">${icon('best')}</span>`;
     }
     h += '<span class="gd-flags">';
     if (r.disabled && st !== 'DISABLED') {
-      h += `<span class="badge b-fail tip-plain" data-tip="Disabled.&#10;${escHtml(r.disabled_tip || '')}">&#10005; disabled</span>`;
+      h += `<span class="badge b-fail tip-plain" data-tip="Disabled.&#10;${escHtml(r.disabled_tip || '')}">${icon('failed')} disabled</span>`;
     }
     // A member can hold more than one - "recording on, mismatched and unmonitored" is a
     // setup the app deliberately allows, so it renders as two pills rather than one
@@ -901,7 +901,7 @@
       case 'acts':
         return `<td class="gd-c-acts"><span class="gd-rowacts">` +
           `<a href="/channels/${r.channel_id}" class="btn btn-sm">Details</a>` +
-          `<button class="btn btn-sm btn-icon" data-rowmenu="${r.channel_id}" aria-label="More actions">&#8943;</button>` +
+          `<button class="btn btn-sm btn-icon" data-rowmenu="${r.channel_id}" aria-label="More actions">${icon('more')}</button>` +
           `</span></td>`;
       default: return '<td></td>';
     }
@@ -987,7 +987,7 @@
     if (t.interlaced) flags += '<span class="badge b-warn">Interlaced</span>';
     if (t.is_vfr) flags += '<span class="badge b-warn">VFR</span>';
     if (t.timeline_gap_count) flags += `<span class="badge b-fail">${t.timeline_gap_count} timeline gap${t.timeline_gap_count === 1 ? '' : 's'}</span>`;
-    if (!flags) flags = '<span class="h-mini ok">&#10003; Clean profile</span>';
+    if (!flags) flags = `<span class="h-mini ok">${icon('ok')} Clean profile</span>`;
 
     return `<div class="gd-q">${shot}<div class="gd-q-grid">${grid}<div class="gd-q-flags">${flags}</div></div></div>`;
   }
@@ -1005,7 +1005,7 @@
         : `Sort by ${escHtml(c.label)}.&#10;Click to sort; click again to reverse. Untested channels sort to the bottom either way.`;
       return `<th class="sortable${on ? ' sorted' : ''}${PART_COLS[c.k] ? ` gd-c-${c.k} gd-c-part` : ''}" data-sort="${c.k}"` +
         ` data-tip="${tip}">` +
-        `${escHtml(c.label)}<span class="arr">${on ? (sortDir < 0 ? ' ▾' : ' ▴') : ''}</span></th>`;
+        `${escHtml(c.label)}<span class="arr">${on ? ' ' + icon(sortDir < 0 ? 'sort-desc' : 'sort-asc') : ''}</span></th>`;
     }).join('') + '</tr>';
 
     const rows = visibleRows();
@@ -1067,7 +1067,7 @@
         const s = rowScore(r);
         bits.push(s === null
           ? '<span class="text-muted">no score</span>'
-          : `<span class="hb-text ${healthBandCss(s)}">&#9733;${s}</span>`);
+          : `<span class="hb-text ${healthBandCss(s)}">${icon('health-score')}${s}</span>`);
       } else if (k === 'res') {
         const fmt = t && t.resolution
           ? escHtml(t.resolution) + (t.fps ? ` @ ${t.fps.toFixed(0)}` : '')
@@ -1155,7 +1155,7 @@
     h += `${logoHtml(r)}<div class="gm-headline">` +
       `<a href="/channels/${r.channel_id}" class="gm-name gd-name-link${dim ? ' dim' : ''}">${escHtml(r.channel_name)}</a>`;
     if (G.hasChannel && r.is_best && r.recording_enabled) {
-      h += ` <span class="gd-best tip-plain" data-tip="Best eligible member.&#10;Highest health score among the members switched on for recording, so a recording starts here and fails over downward.">&#9733;</span>`;
+      h += ` <span class="gd-best tip-plain" data-tip="Best eligible member.&#10;Highest health score among the members switched on for recording, so a recording starts here and fails over downward.">${icon('best')}</span>`;
     }
     if (fieldOn('account')) {
       h += `<div class="gm-acct"><span class="acct-dot" style="background:${escHtml(r.account_color || '')}"></span>` +
@@ -1169,7 +1169,7 @@
     // rowFlags(), so there is one authority for what a member is flagged for.
     const flags = [];
     if (r.disabled && st !== 'DISABLED') {
-      flags.push(`<span class="badge b-fail tip-plain" data-tip="Disabled.&#10;${escHtml(r.disabled_tip || '')}">&#10005; disabled</span>`);
+      flags.push(`<span class="badge b-fail tip-plain" data-tip="Disabled.&#10;${escHtml(r.disabled_tip || '')}">${icon('failed')} disabled</span>`);
     }
     flags.push(...rowFlags(r));
     if (dupBadge(r)) flags.push(dupBadge(r));
@@ -1194,7 +1194,7 @@
         ? `<button class="btn" data-expand="${r.channel_id}">${expanded.has(r.channel_id) ? 'Hide info' : 'Info'}</button>`
         : '') +
       `<a href="/channels/${r.channel_id}" class="btn">Details</a>` +
-      `<button class="btn btn-icon" data-rowmenu="${r.channel_id}" aria-label="More actions">&#8943;</button>` +
+      `<button class="btn btn-icon" data-rowmenu="${r.channel_id}" aria-label="More actions">${icon('more')}</button>` +
       '</div>';
     if (expanded.has(r.channel_id)) h += `<div class="gm-drawer">${drawer(r)}</div>`;
     return h + '</div>';
@@ -1261,7 +1261,7 @@
     // The sortable column headers go away with the table, so this chip is the only thing
     // left saying what the list is ordered by and in which direction (DESIGN.md 9.4).
     sortChip.innerHTML = `Sort: ${escHtml(sortLabel())} ` +
-      `<span class="gm-dir">${sortDir < 0 ? '&#9662;' : '&#9652;'}</span>`;
+      `<span class="gm-dir">${icon(sortDir < 0 ? 'sort-desc' : 'sort-asc')}</span>`;
     // The desktop draws one chip per active filter; at this width they collapse into the
     // count on this one chip, which is what replaces being able to see them all at once.
     const n = filterBar.count();
@@ -1324,7 +1324,7 @@
             const op = filterBar.opOf(d.k, o.v);
             return `<div class="gm-fval">${sheetRow(
               `data-fpick="${escHtml(d.k)}" data-fpickval="${escHtml(o.v)}"`,
-              o.label, op === 'is' ? '&#10003;' : '')}${filterBar.opHtml(d.k, o.v, o.label)}</div>`;
+              o.label, op === 'is' ? icon('ok') : '')}${filterBar.opHtml(d.k, o.v, o.label)}</div>`;
           }).join('');
       });
       // What the desktop Columns popover is at this width. DESIGN.md 9.4's 2026-07-30
@@ -1334,7 +1334,7 @@
       // desktop too - which is the point for anyone with a single account.
       h += '<div class="gm-sheet-sec">Fields on each card</div>' +
         PICKABLE_FIELDS().map(k =>
-          sheetRow(`data-fieldpick="${k}"`, COL_LABEL[k], fieldOn(k) ? '&#10003;' : '')).join('');
+          sheetRow(`data-fieldpick="${k}"`, COL_LABEL[k], fieldOn(k) ? icon('ok') : '')).join('');
       body.innerHTML = h;
     };
     draw();
@@ -1458,8 +1458,8 @@
       const n = selected.size;
       bar.innerHTML = `<span class="gm-selcount">${n} selected</span>` +
         '<button class="btn" data-act="select-all-visible">All</button>' +
-        `<button class="btn btn-primary" data-act="bulk-sheet"${n ? '' : ' disabled'}>Actions &#9652;</button>` +
-        '<button class="btn btn-icon" data-act="select-done" aria-label="Leave selection mode">&times;</button>';
+        `<button class="btn btn-primary" data-act="bulk-sheet"${n ? '' : ' disabled'}>Actions ${icon('move-up')}</button>` +
+        `<button class="btn btn-icon" data-act="select-done" aria-label="Leave selection mode">${icon('close')}</button>`;
     } else {
       bar.innerHTML = '';
       const inline = byId('gd-inline-actions');
@@ -1487,7 +1487,7 @@
       more.className = 'btn btn-icon';
       more.dataset.act = 'overflow';
       more.setAttribute('aria-label', 'More actions');
-      more.innerHTML = '&#8943;';
+      more.innerHTML = icon('more');
       bar.appendChild(more);
     }
     syncBar();
@@ -1728,7 +1728,7 @@
     let mixed = '';
     const n = WARN.format_blocked_count;
     if (WARN.format_warns && n && !muted.has('format')) {
-      mixed = `<strong>&#9940; Mixed video format in this group</strong><br>` +
+      mixed = `<strong>${icon('blocking')} Mixed video format in this group</strong><br>` +
         `Group format is pinned by hand to <strong>${escHtml(fmt)}</strong>, and ` +
         `${plural(n, 'member')} with Recording on report a different resolution or frame rate. ` +
         `${n === 1 ? 'It is' : 'They are'} still switched on for recording, and ` +
@@ -1751,7 +1751,7 @@
       const who = WARN.override_member_name || 'the highest-ranked member';
       const at = WARN.override_member_format
         ? ` at ${escHtml(WARN.override_member_format)}` : '';
-      override = `<strong>&#9940; No member matches the group format</strong><br>` +
+      override = `<strong>${icon('blocking')} No member matches the group format</strong><br>` +
         `All ${plural(WARN.recording_count, 'recording-enabled member')} report a format other ` +
         `than <strong>${escHtml(fmt)}</strong>. ChannelBin will still record rather than skip: ` +
         `the next recording runs from <strong>${escHtml(who)}</strong>${at}, and the recording ` +
@@ -1768,7 +1768,7 @@
     const ids = WARN.epg_ids || [];
     if (G.inGuide && ids.length > 1 && !muted.has('epg')) {
       const shown = ids.slice(0, 6);
-      epg = '<strong>&#9888; These members carry different EPG data</strong><br>' +
+      epg = `<strong>${icon('warning')} These members carry different EPG data</strong><br>` +
         'This group fills one guide row per program from whichever member wins, so ' +
         `${ids.length} different program schedules would paint one row. The listings would ` +
         'look plausible and be wrong.' +
@@ -1788,6 +1788,11 @@
         '<div class="gd-ban-acts">' +
         '<button type="button" class="btn btn-sm" data-act="review-members" data-review="epg">' +
         'Review members</button> ' +
+        // The What's On card answers what the tally cannot: whether the ids carry different
+        // programs or the same ones (dev/changelog/1324). Offered only where it is drawn.
+        (byId('sched-card')
+          ? '<button type="button" class="btn btn-sm" data-act="compare-schedules">Compare schedules</button> '
+          : '') +
         muteBtn('epg', 'For when you know these feeds are the same channel even though their EPG ids differ.') +
         '</div>';
     }
@@ -1826,7 +1831,7 @@
     // its settings say, which §16.2 keeps out of the hide-able set.
     let broken = '';
     if (WARN.guide_broken) {
-      broken = '<strong>&#9940; In the TV Guide with nothing to record from</strong><br>' +
+      broken = `<strong>${icon('blocking')} In the TV Guide with nothing to record from</strong><br>` +
         'No member of this group is switched on for recording, so its guide row cannot ' +
         'produce a file. The row is still here on purpose - pulling it without asking is ' +
         'not something ChannelBin does - but a recording started from it now has no ' +
@@ -1845,7 +1850,7 @@
     let unmon = '';
     const un = WARN.unmonitored_count || 0;
     if (un && !muted.has('unmonitored')) {
-      unmon = `<strong>&#9888; ${plural(un, 'channel')} not monitored</strong><br>` +
+      unmon = `<strong>${icon('warning')} ${plural(un, 'channel')} not monitored</strong><br>` +
         `No active recurring health check covers ${un === 1 ? 'it' : 'them'}, so a ` +
         'provider-side resolution or frame-rate change will not be re-checked automatically.' +
         ' <a href="#" data-act="schedule">Schedule this group\'s health check</a>.' +
@@ -1866,6 +1871,19 @@
   // every target; the EPG banner adds the ids it named, and turns on the column that shows
   // them - a filter chip reading "EPG id: x" over a table with no such column names the
   // answer without showing it (dev/changelog/898).
+  // The EPG banner's Compare schedules: the What's On card, which the user may have hidden
+  // with Customize sections - said, rather than a button that scrolls to nothing.
+  function showScheduleCard() {
+    const card = byId('sched-card');
+    if (!card) return;
+    if (getComputedStyle(card).display === 'none') {
+      showToast("The What's On card is hidden on this page. Customize sections shows it again.",
+        { type: 'info' });
+      return;
+    }
+    card.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+
   function reviewMembers(target, epgId) {
     // Replaces whatever was filtered rather than adding to it: the banner is naming one
     // specific set, so the list has to end up showing that set and not an intersection
@@ -1962,7 +1980,7 @@
       : '<button type="button" class="btn btn-sm btn-danger-outline" data-act="dedup">Remove duplicates&hellip;</button>';
     el.className = 'notice-banner notice-banner-warn';
     el.innerHTML = `<div class="notice-banner-body"><div class="notice-banner-title">` +
-      `&#9888; ${plural(extras, 'duplicate channel')} ${where}, ${escHtml(reason)}</div></div>` +
+      `${icon('warning')} ${plural(extras, 'duplicate channel')} ${where}, ${escHtml(reason)}</div></div>` +
       show + action;
     el.style.display = '';
   }
@@ -1971,7 +1989,7 @@
   // built server-side from the same sets the banner counts; the lead carries none.
   function dupBadge(r) {
     if (r.dup_role !== 'extra' || !r.duplicate_title) return '';
-    return `<span class="badge b-warn tip-plain" data-tip="${escHtml(r.duplicate_title)}">&#10697; duplicate</span>`;
+    return `<span class="badge b-warn tip-plain" data-tip="${escHtml(r.duplicate_title)}">${icon('duplicate')} duplicate</span>`;
   }
 
   // What "remove" means differs per page state, and dup-modal.js makes every caller
@@ -2044,7 +2062,7 @@
     el.className = 'notice-banner notice-banner-warn';
     el.innerHTML =
       `<div class="notice-banner-body">` +
-      `<div class="notice-banner-title">&#9888; ${plural(MISSING_CHANNELS.length, 'channel')} ${where} ` +
+      `<div class="notice-banner-title">${icon('warning')} ${plural(MISSING_CHANNELS.length, 'channel')} ${where} ` +
       `no longer seen in a provider sync</div>` +
       `<div class="notice-banner-sub">Still listed here, but the provider has stopped sending ` +
       `${MISSING_CHANNELS.length === 1 ? 'it' : 'them'} for a while.</div></div>` +
@@ -2624,6 +2642,7 @@
       // empty string on the "no EPG id at all" link, which is a bucket and not a missing
       // argument, so it must not be collapsed into the no-id-named case above.
       case 'review-epg': reviewMembers('epg', el.dataset.epg); return;
+      case 'compare-schedules': showScheduleCard(); return;
       case 'schedule': openSettingsModal('check'); return;
       case 'sections': sectionLayout.open(); return;
       case 'dedup': openDedup(); return;
@@ -3013,7 +3032,7 @@
     if (btn) {
       btn.disabled = n === 0 || running;
       btn.title = running ? 'A health check is already running' : '';
-      btn.textContent = n ? `▶ Test selected (${n})` : '▶ Test selected';
+      btn.innerHTML = n ? `${icon('test')} Test selected (${n})` : `${icon('test')} Test selected`;
     }
     // The two bulk participation menus, which exist on any stored group.
     ['gd-bulk-rec', 'gd-bulk-test'].forEach(id => {

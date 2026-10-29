@@ -136,7 +136,7 @@
     const status = statusOf(row);
     if (status === 'nothing') {
       return row.setup && row.link ? `<a class="btn btn-sm" href="${escHtml(row.link.url)}">${
-        escHtml(row.link.label)} <span aria-hidden="true">&rarr;</span></a>` : '';
+        escHtml(row.link.label)} ${icon('forward')}</a>` : '';
     }
     if (status === 'ready' || status === 'checking') return '';
     if (status === 'not_run') {
@@ -151,7 +151,7 @@
     }
     if (row.link) {
       return `<a class="btn btn-sm" href="${escHtml(row.link.url)}">${
-        escHtml(row.link.label)} <span aria-hidden="true">&rarr;</span></a>`;
+        escHtml(row.link.label)} ${icon('forward')}</a>`;
     }
     return '';
   }
@@ -192,7 +192,7 @@ affects the verdict or the count beside Maintenance.">Ignore this</button>`;
     if (Array.isArray(row.detail) && row.detail.length) {
       lines.push(['Components', row.detail.map((c) => {
         const good = c.available === true;
-        const mark = good ? '✓' : (c.available === null ? '?' : '×');
+        const mark = icon(good ? 'ok' : (c.available === null ? 'unknown' : 'failed'));
         return `<div class="rd-comp"><span class="${good ? 'rd-comp-ok' : 'rd-comp-x'}">${mark}</span>
           <span><strong>${escHtml(c.label)}</strong> &middot; ${escHtml(c.used_for)}${
           good ? '' : `<br><span class="rd-dv bad">${escHtml(c.without)}</span>`}</span></div>`;
@@ -211,7 +211,7 @@ affects the verdict or the count beside Maintenance.">Ignore this</button>`;
     const status = statusOf(row);
     return `<div class="rd-row s-${escHtml(status)}${open ? ' open' : ''}${
       row.ignored ? ' rd-muted' : ''}" data-row="${escHtml(key)}">
-      <div class="rd-rname" data-rowtoggle="${escHtml(key)}"><span class="rd-rcaret">&#9656;</span>${
+      <div class="rd-rname" data-rowtoggle="${escHtml(key)}"><span class="rd-rcaret">${icon('expand')}</span>${
       escHtml(row.label)}</div>
       <div class="rd-rfound">${pill(status)} ${escHtml(row.found)}</div>
       <div class="rd-ract">${fixButtons(row)}${ignoreButton(row)}</div>
@@ -250,7 +250,7 @@ affects the verdict or the count beside Maintenance.">Ignore this</button>`;
         <button type="button" class="grp-expand" aria-expanded="${open}"
                 aria-label="Show the checks behind this" data-cap="${escHtml(cap.id)}"><span class="grp-caret"></span></button>
         <div class="rd-caprow" data-cap="${escHtml(cap.id)}">
-          <div class="rd-capmark" aria-hidden="true">${escHtml(cap.mark)}</div>
+          <div class="rd-capmark" aria-hidden="true">${icon(cap.mark)}</div>
           <div class="rd-capname">${escHtml(cap.label)}</div>
           <div class="rd-capwhy">${reasonLine(cap)}</div>
           <div class="rd-capact">${chip}${act}</div>
@@ -322,7 +322,7 @@ affects the verdict or the count beside Maintenance.">Ignore this</button>`;
       : '';
 
     content.innerHTML = `<div class="rd-verdict ${escHtml(v.level)}">
-        <div class="rd-vmark" aria-hidden="true">${escHtml(v.mark)}</div>
+        <div class="rd-vmark" aria-hidden="true">${icon(v.mark)}</div>
         <div class="rd-vbody">
           <div class="rd-vhead">${escHtml(v.head)}</div>
           <div class="rd-vsub">${escHtml(v.sub)}</div>

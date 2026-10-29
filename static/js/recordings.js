@@ -91,7 +91,7 @@
       item.className = 'col-item';
       item.draggable = true;
       item.dataset.key = key;
-      item.innerHTML = `<span class="grip">&#8942;&#8942;</span><input type="checkbox" ${colState.hidden.includes(key) ? '' : 'checked'}> ${col.label}`;
+      item.innerHTML = `<span class="grip">${icon('drag')}</span><input type="checkbox" ${colState.hidden.includes(key) ? '' : 'checked'}> ${col.label}`;
       item.querySelector('input').addEventListener('change', (e) => {
         if (e.target.checked) colState.hidden = colState.hidden.filter(k => k !== key);
         else if (!colState.hidden.includes(key)) colState.hidden.push(key);
@@ -134,11 +134,11 @@
     document.querySelectorAll('.list-head .sortable').forEach(h => {
       const active = h.dataset.sort === sortKey;
       h.classList.toggle('sorted', active);
-      h.querySelector('.sort-ind').textContent = active ? (sortDir === 'desc' ? ' ▾' : ' ▴') : '';
+      h.querySelector('.sort-ind').innerHTML = active ? ' ' + icon(sortDir === 'desc' ? 'sort-desc' : 'sort-asc') : '';
     });
     if (sortChip) {
       const label = SORT_LABEL[sortKey] || sortKey;
-      sortChip.textContent = `Sort: ${label} ${sortDir === 'desc' ? '▾' : '▴'}`;
+      sortChip.innerHTML = `Sort: ${escHtml(label)} ${icon(sortDir === 'desc' ? 'sort-desc' : 'sort-asc')}`;
     }
   };
   const setSort = (key) => {
@@ -294,7 +294,7 @@
     const size = row.querySelector('[data-col="size"]');
     if (dur) {
       const flag = c.dur_flag
-        ? `<span class="dur-flag${c.dur_flag === 'stopped' ? ' dur-quiet' : ''} tip-plain" data-tip="${escHtml(c.dur_tip || '')}">&#9685;</span>` : '';
+        ? `<span class="dur-flag${c.dur_flag === 'stopped' ? ' dur-quiet' : ''} tip-plain" data-tip="${escHtml(c.dur_tip || '')}">${icon('partial')}</span>` : '';
       dur.innerHTML = flag + escHtml(c.dur_str || '-');
     }
     if (size) {

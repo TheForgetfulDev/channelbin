@@ -90,7 +90,7 @@ function groupWarningsHtml(data, forceId, dedupId) {
     }).join('');
     const untested = (data.format_mismatch.untested || []).map((c) => escHtml(c.channel_name)).join(', ');
     html += '<div style="margin-bottom:0.5rem;">' +
-      '<strong style="color:var(--warn);">⚠ Mixed resolution / frame rate</strong><br>' +
+      `<strong style="color:var(--warn);">${icon('warning')} Mixed resolution / frame rate</strong><br>` +
       '<span class="text-muted small">These feeds are not all the same format. This group ' +
       'records, so its group format decides which members may be picked - the ones that do ' +
       'not match stay in the group, stay switched on, and are skipped until they match ' +
@@ -102,7 +102,7 @@ function groupWarningsHtml(data, forceId, dedupId) {
   }
   if (data.unverified_format) {
     const names = data.unverified_format.map((c) => escHtml(c.channel_name)).join(', ');
-    html += `<div style="margin-bottom:0.5rem;"><strong style="color:var(--warn);">⚠ Format not verified</strong><br>
+    html += `<div style="margin-bottom:0.5rem;"><strong style="color:var(--warn);">${icon('warning')} Format not verified</strong><br>
       <span style="font-size:12px; color:var(--text-muted);">${names} - no health data yet, so we can't
       confirm the resolution/frame rate matches this group. Run a health check to verify; if it later
       proves different, you'll be warned to remove it.</span></div>`;
@@ -111,7 +111,7 @@ function groupWarningsHtml(data, forceId, dedupId) {
     // One line for every set, by URL or through a provider (dev/changelog/1175); which copy
     // duplicates which is what Choose which to keep shows.
     const { extras, reason } = dupSetsSummary(data.dup_groups);
-    html += `<div style="margin-bottom:0.5rem;"><strong style="color:var(--warn);">⚠ ${extras} duplicate channel${extras === 1 ? '' : 's'}</strong>
+    html += `<div style="margin-bottom:0.5rem;"><strong style="color:var(--warn);">${icon('warning')} ${extras} duplicate channel${extras === 1 ? '' : 's'}</strong>
       <span class="small text-muted">${escHtml(reason)}.</span></div>`;
   }
   html += '<div style="display:flex; gap:0.5rem; flex-wrap:wrap;">';
@@ -288,16 +288,16 @@ function openGroupModal(opts) {
       // (shown for visibility but not addable - the create/add guard would hard-block it).
       const fmtBadge = (r) => {
         if (r.format_status === 'confirmed')
-          return `<span class="badge b-done" title="${escHtml(r.format || '')}">✓ same format</span>`;
+          return `<span class="badge b-done" title="${escHtml(r.format || '')}">${icon('ok')} same format</span>`;
         if (r.format_status === 'different')
-          return `<span class="badge b-fail" title="${escHtml(r.format || '')} - different resolution/frame rate">✗ mismatch</span>`;
-        return `<span class="badge b-warn" title="no health data - run a health check to confirm">⚠ unverified</span>`;
+          return `<span class="badge b-fail" title="${escHtml(r.format || '')} - different resolution/frame rate">${icon('failed')} mismatch</span>`;
+        return `<span class="badge b-warn" title="no health data - run a health check to confirm">${icon('warning')} unverified</span>`;
       };
       results.forEach(r => { if (r.selectable === false) nonSelectableIds.add(Number(r.channel_id)); });
       // Stat cells come from the candidate's latest health test; unknowns render as "-".
       const numCell = (v) => (v === null || v === undefined || v === '') ? '-' : v;
       const brCell = (kbps) => (kbps === null || kbps === undefined) ? '-' : `${(kbps / 1000).toFixed(2)} MB/s`;
-      const scoreCell = (v) => (v === null || v === undefined) ? '-' : `★${Math.round(v)}`;
+      const scoreCell = (v) => (v === null || v === undefined) ? '-' : `${icon('health-score')}${Math.round(v)}`;
       const rowsHtml = results.map(r => {
         const disabled = r.selectable === false;
         const curGroups = r.current_groups || [];
@@ -341,9 +341,9 @@ function openGroupModal(opts) {
       // Header copy: explain what "suggested" means and how format is confirmed. When the
       // seed itself is untested, no candidate can be confirmed - say so once for the list.
       document.getElementById('group-suggest-note').innerHTML = data.seed_format_known
-        ? `Matched by EPG ID / name; <strong>✓ same format</strong> is confirmed against this
+        ? `Matched by EPG ID / name; <strong>${icon('ok')} same format</strong> is confirmed against this
            channel's ${escHtml(data.seed_format)} health data so grouped feeds stay one format for
-           clean failover. <strong>⚠ unverified</strong> feeds have no health data yet.`
+           clean failover. <strong>${icon('warning')} unverified</strong> feeds have no health data yet.`
         : `Matched by EPG ID / name. This channel has no health data, so resolution/frame-rate
            couldn't be confirmed for any suggestion - run a health check to verify before grouping.`;
       if (data.different_count) {

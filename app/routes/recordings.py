@@ -1157,31 +1157,31 @@ def _index_row(rec, now, tz, thumb_ids, live_seg_bytes=0, file_formats=None,
     else:
         reconnect_tail = ''
     if not rec.segments:
-        health = {'cls': 'na', 'label': '-', 'tip': None}
+        health = {'cls': 'na', 'icon': None, 'label': '-', 'tip': None}
     elif rec.status == REC_STATUS_FAILED:
         # A failed recording is never joined, so what is on disk is its segments - and when
         # every one was discarded there is nothing of the channel there at all.
         kept = ('Segments kept on disk.' if data_segs
                 else 'Nothing of the channel was captured.')
-        health = {'cls': 'bad', 'label': f'⚠ {stalls + (rec.consecutive_failures or 0)}',
-                  'text': f'⚠ {fmt_utils.counted(stalls, "stall")}',
+        health = {'cls': 'bad', 'icon': 'warning', 'label': f'{stalls + (rec.consecutive_failures or 0)}',
+                  'text': fmt_utils.counted(stalls, 'stall'),
                   'tip': (f'{len(rec.segments)} segments · {stalls} stalls · '
                           f'{fmt_utils.counted(rec.consecutive_failures or 0, "consecutive failed restart")}. '
                           f'{kept}{missing}{reconnect_tail}{spanned}{format_tail}')}
     elif stalls > 0:
         downtime = (f' {fmt_utils.fmt_duration(rec.total_downtime_seconds, with_seconds=True)} '
                     f'with nothing being written.') if rec.total_downtime_seconds else ''
-        health = {'cls': 'warn', 'label': f'⚠ {stalls}',
-                  'text': f'⚠ {fmt_utils.counted(stalls, "stall")}',
+        health = {'cls': 'warn', 'icon': 'warning', 'label': f'{stalls}',
+                  'text': fmt_utils.counted(stalls, 'stall'),
                   'tip': (f'{len(rec.segments)} segments · {stalls} stalls, recovered '
                           f'automatically.{downtime}{missing}{reconnect_tail}{spanned}{format_tail}')}
     elif rec.fast_delivery_segment_count:
         # A frozen or looping feed writes bytes at full rate and keeps ffmpeg's frame counter
         # moving, so it never stalls and never restarts - which meant this row read a green
         # "clean capture" tick on the worst recording in the set. The pill carries no number
-        # because the number beside a ⚠ everywhere else on this page is a stall count, and
+        # because the number beside a warning icon everywhere else on this page is a stall count, and
         # this state has none (dev/changelog/966).
-        health = {'cls': 'warn', 'label': '⚠', 'text': '⚠ not clean',
+        health = {'cls': 'warn', 'icon': 'warning', 'label': '', 'text': 'not clean',
                   'tip': (f'{len(rec.segments)} segment'
                           f'{"s" if len(rec.segments) != 1 else ""} · 0 stalls, but the '
                           f'capture was not clean.{missing}{reconnect_tail}{spanned}{format_tail}')}
@@ -1190,7 +1190,7 @@ def _index_row(rec, now, tz, thumb_ids, live_seg_bytes=0, file_formats=None,
         # the pill stays green like a mixed-format file's does - but the words "clean
         # capture" are not true of it (dev/changelog/1306).
         clean = '' if (format_change or reconnects) else ' - clean capture'
-        health = {'cls': 'ok', 'label': '✓', 'text': '✓ no stalls',
+        health = {'cls': 'ok', 'icon': 'ok', 'label': '', 'text': 'no stalls',
                   'tip': (f'{len(rec.segments)} segment{"s" if len(rec.segments) != 1 else ""} '
                           f'· 0 stalls{clean}.{missing}{reconnect_tail}{spanned}{format_tail}')}
 

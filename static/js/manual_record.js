@@ -163,9 +163,9 @@ async function runManualUrlTest() {
       if (data.audio_sample_rate) a += ` ${Math.round(data.audio_sample_rate / 1000)}kHz`;
       parts.push(a);
     }
-    showManualTestResult(true, '✓ Connected - ' + (parts.join(' · ') || 'received a data stream'));
+    showManualTestResult(true, icon('ok') + ' Connected - ' + (parts.join(' · ') || 'received a data stream'));
   } catch (e) {
-    showManualTestResult(false, '✗ ' + (e.message || 'Request failed. Check your connection.'));
+    showManualTestResult(false, icon('failed') + ' ' + escHtml(e.message || 'Request failed. Check your connection.'));
   } finally {
     btn.disabled = false;
     btn.classList.remove('btn-spinner');

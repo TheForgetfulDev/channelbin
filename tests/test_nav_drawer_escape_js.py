@@ -102,9 +102,12 @@ function runDrawer({ open, above, key }) {
   let consulted = 0;
   const syncScrollLock = () => { syncCalls++; };
   const overlayOpenAboveDrawer = () => { consulted++; return !!above; };
+  // util.js's icon(), in the shape of its markup: the toggle redraws its own icon on every
+  // open and close.
+  const icon = (name) => `<svg class="icon" data-icon="${name}" aria-hidden="true"></svg>`;
 
-  new Function('document', 'window', 'syncScrollLock', 'overlayOpenAboveDrawer',
-               drawerSource())(document, window, syncScrollLock, overlayOpenAboveDrawer);
+  new Function('document', 'window', 'syncScrollLock', 'overlayOpenAboveDrawer', 'icon',
+               drawerSource())(document, window, syncScrollLock, overlayOpenAboveDrawer, icon);
 
   const handlers = docListeners.keydown || [];
   handlers.forEach((fn) => fn({ key, stopImmediatePropagation() {}, stopPropagation() {} }));

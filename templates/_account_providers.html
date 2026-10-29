@@ -20,7 +20,7 @@
       <div class="card-head"><h2>{{ p.name }}</h2>
         <div class="card-head-actions">
           <span class="menu-wrap">
-            <button class="btn btn-sm btn-icon" data-menu data-sheet aria-label="Actions for provider {{ p.name }}">&#8943;</button>
+            <button class="btn btn-sm btn-icon" data-menu data-sheet aria-label="Actions for provider {{ p.name }}">{{ icon('more') }}</button>
             <div class="menu">
               <button class="menu-item" data-act="prov-rename">Rename</button>
               {% for a in p.accounts %}
@@ -46,7 +46,7 @@
             {% for lg in a.logins %}
             <span class="menu-wrap">
               <button class="chip{% if lg.shared %} active{% endif %}" data-menu data-sheet
-                      aria-label="Login {{ lg.name }} on {{ a.name }}">login: {{ lg.name }}{% if lg.shared %} (shared){% endif %} &#9662;</button>
+                      aria-label="Login {{ lg.name }} on {{ a.name }}">login: {{ lg.name }}{% if lg.shared %} (shared){% endif %} {{ icon('dropdown') }}</button>
               <div class="menu">
                 {% for t in lg.share_targets %}
                 <button class="menu-item" data-act="prov-share" data-login-id="{{ lg.id }}" data-login="{{ lg.name }}" data-account-id="{{ t.id }}">Share with {{ t.name }}</button>

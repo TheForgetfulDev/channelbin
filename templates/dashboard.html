@@ -33,7 +33,7 @@
   <div class="sec-head">
     <h2>{{ d.label }}{% if count %} <span class="cnt">{{ count }}</span>{% endif %}</h2>
     <span class="sec-actions">
-      <a class="btn btn-sm" href="{{ url_for(d.endpoint) }}">{{ d.to }} <span class="arw">&#8594;</span></a>
+      <a class="btn btn-sm" href="{{ url_for(d.endpoint) }}">{{ d.to }} <span class="arw">{{ icon('forward') }}</span></a>
     </span>
   </div>
 {% endmacro %}
@@ -94,8 +94,8 @@
       </div>
     </div>
     <div class="gs-b-acts">
-      <a class="btn gs-b-go" href="{{ url_for('setup.get_started') }}">Get started <span class="arw">&#8594;</span></a>
-      {% if lead.link %}<a class="btn gs-b-second" href="{{ lead.link.url }}">{{ lead.link.label }} <span class="arw">&#8594;</span></a>{% endif %}
+      <a class="btn gs-b-go" href="{{ url_for('setup.get_started') }}">Get started <span class="arw">{{ icon('forward') }}</span></a>
+      {% if lead.link %}<a class="btn gs-b-second" href="{{ lead.link.url }}">{{ lead.link.label }} <span class="arw">{{ icon('forward') }}</span></a>{% endif %}
     </div>
   </div>
   {%- endif %}

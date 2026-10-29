@@ -80,11 +80,11 @@ class GroupsFilterUrlTests(unittest.TestCase):
 
     def test_an_f_parameter_still_reads_as_is(self):
         self.assertEqual(self.obs['is_url']['shown'], ['pair'])
-        self.assertEqual(self.obs['is_url']['chips'], ['Guide row is Present ✕'])
+        self.assertEqual(self.obs['is_url']['chips'], ['Guide row is Present'])
 
     def test_an_x_parameter_reads_as_is_not(self):
         self.assertEqual(sorted(self.obs['not_url']['shown']), self.NOT_IN_GUIDE)
-        self.assertEqual(self.obs['not_url']['chips'], ['Guide row is not Present ✕'])
+        self.assertEqual(self.obs['not_url']['chips'], ['Guide row is not Present'])
         self.assertEqual(self.obs['not_url']['search'], '?x=guide:in')
 
     def test_choosing_is_not_writes_x_and_removing_it_clears_the_url(self):

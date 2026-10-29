@@ -343,7 +343,7 @@ class GuideLayoutDefaultsTests(unittest.TestCase):
         self.assertIn('layoutMobile:', html)
         self.assertIn(WHATSON_LAYOUT_PREF_KEY, html)
         self.assertIn(WHATSON_LAYOUT_MOBILE_PREF_KEY, html)
-        self.assertIn('singleChannel: true', html)
+        self.assertIn("embed: 'channel'", html)
 
     def test_whatson_popover_renders_only_settings_it_can_act_on(self):
         """The card draws no channel column and has no channel list, so the channel-column
@@ -366,19 +366,26 @@ class GuideLayoutDefaultsTests(unittest.TestCase):
         Two independent mechanisms hide a row - the `hide-failed-channels` CSS class that
         applyShowFailed() puts on #guide-wrap, and the isChannelHealthHidden() predicate the
         renderer and the counts go through - and neither consults the other, so BOTH carry
-        the guard. Asserted against the source because the outcome is a rendered CSS rule,
+        the guard, through healthFilterApplies(), which must answer false for both card
+        embeds. Asserted against the source because the outcome is a rendered CSS rule,
         which only a browser could observe; this at least cannot go one-sided silently.
         (The card gained #guide-wrap when it adopted the shipped grid markup in
-        dev/changelog/349 - before that the class landed on nothing.)"""
+        dev/changelog/349 - before that the class landed on nothing. The embed became one
+        enumerated mode in dev/changelog/1324.)"""
         with open(GUIDE_JS, encoding='utf-8') as fh:
             src = fh.read()
         for fn in ('applyShowFailed', 'isChannelHealthHidden'):
             body = re.search(r'function %s\(\w*\) \{(.*?)\n\}' % fn, src, re.S)
             self.assertIsNotNone(body, f'{fn}() not found in guide.js')
-            self.assertIn('SINGLE_CHANNEL', body.group(1),
-                          f'{fn}() no longer exempts a single-channel embed from the '
+            self.assertIn('healthFilterApplies()', body.group(1),
+                          f'{fn}() no longer exempts a card embed from the '
                           f'"Include failed channels" filter - a failed channel\'s own '
                           f'detail page will render an empty What\'s On row.')
+        gate = re.search(r'function healthFilterApplies\(\) \{(.*?)\n\}', src, re.S)
+        self.assertIsNotNone(gate, 'healthFilterApplies() not found in guide.js')
+        for mode, answer in (('page', 'true'), ('channel', 'false'), ('schedules', 'false')):
+            self.assertRegex(gate.group(1), r"case '%s': return %s;" % (mode, answer),
+                             f'healthFilterApplies() must answer {answer} for {mode!r}')
 
     def test_whatson_stored_pref_round_trips_into_the_popover(self):
         """A saved card Layout is what the popover renders, per field."""

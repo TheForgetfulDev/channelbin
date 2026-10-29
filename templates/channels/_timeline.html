@@ -72,7 +72,7 @@
         {% endif %}
         <span class="text-muted small">
           score {{ entry.obj.quality_score if entry.obj.quality_score is not none else '-' }}
-          → lifetime {{ entry.obj.lifetime_score_after if entry.obj.lifetime_score_after is not none else '-' }}
+          → lifetime {{ entry.obj.lifetime_score_after if entry.obj.lifetime_score_after is not none else '-' }}  {# icon-ok: an arrow in a sentence, not an icon #}
         </span>
         {# Which run produced that score. A group aggregates several checks plus the
            pre-recording checks its own recordings ran, and the numbers alone cannot say
@@ -101,7 +101,7 @@
         {% if entry.obj.detail %}<span class="text-muted small">{{ entry.obj.detail }}</span>{% endif %}
       {% endif %}
 
-      {# The user rolled the score back past this observation, so the "→ lifetime N" it
+      {# The user rolled the score back past this observation, so the "lifetime N" it
          prints above is what it produced at the time and no longer describes the channel.
          A row that silently disagrees with the score is exactly the number nobody can
          explain, so it says so (app/health_recompute.py, dev/changelog/895). The entry is
@@ -150,7 +150,7 @@
         {% if bb.first_observation %}
         <div class="ch-breakdown-row">First observation - score set directly to {{ bb.new_score | round(1) }}</div>
         {% else %}
-        <div class="ch-breakdown-row">{{ bb.old_score | round(1) }} → {{ bb.new_score | round(1) }} (half-life {{ bb.half_life_samples }} samples, decay {{ bb.decay | round(3) }}, effective α {{ bb.effective_alpha | round(3) }}, weight ×{{ bb.source_weight | round(2) }})</div>
+        <div class="ch-breakdown-row">{# icon-ok: an arrow and a multiplication sign in a sentence #}{{ bb.old_score | round(1) }} → {{ bb.new_score | round(1) }} (half-life {{ bb.half_life_samples }} samples, decay {{ bb.decay | round(3) }}, effective α {{ bb.effective_alpha | round(3) }}, weight ×{{ bb.source_weight | round(2) }})</div>
         {% endif %}
         {% endif %}
       </details>

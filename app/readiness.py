@@ -106,8 +106,10 @@ NOT_SET_UP = 'none'      # at least one has nothing to look at yet
 CAP_REPORT_WORD = {CAN: 'YES', CANNOT: 'NO', DEGRADED: 'PARTLY', CAP_UNKNOWN: 'UNKNOWN',
                    NOT_SET_UP: 'NOT SET UP'}
 
-#: The mark drawn on the capability row, and the left-edge color class `.grp-item` keys off.
-CAP_MARK = {CAN: '✓', CANNOT: '×', DEGRADED: '!', CAP_UNKNOWN: '?', NOT_SET_UP: '–'}
+#: The mark drawn on the capability row (a registry meaning, app/icons.py), and the left-edge
+#: color class `.grp-item` keys off.
+CAP_MARK = {CAN: 'ok', CANNOT: 'failed', DEGRADED: 'warning', CAP_UNKNOWN: 'unknown',
+            NOT_SET_UP: 'not-set-up'}
 CAP_HEALTH = {CAN: 'st-ok', CANNOT: 'st-bad', DEGRADED: 'st-warn',
               CAP_UNKNOWN: 'st-warn', NOT_SET_UP: 'st-none'}
 
@@ -1117,32 +1119,32 @@ def _headline(caps, rows, counts):
         lower = first['label'][0].lower() + first['label'][1:]
         tail = (f', and {rest} other {plural(rest, "thing")} '
                 f'{plural(rest, "is", "are")} blocked too') if rest else ''
-        return {'level': 'bad', 'mark': '!',
+        return {'level': 'bad', 'mark': 'failed',
                 'head': f'Not ready: you cannot {lower}{tail}',
                 'sub': by_id[first['blockers'][0]]['without']}
     if degraded:
         first = degraded[0]
         lower = first['label'][0].lower() + first['label'][1:]
-        return {'level': 'warn', 'mark': '!',
+        return {'level': 'warn', 'mark': 'warning',
                 'head': (f'Ready to record, but {len(degraded)} '
                          f'{plural(len(degraded), "thing needs", "things need")} attention'),
                 'sub': (f'You can still {lower}. '
                         + by_id[first['degraded'][0]]['without'])}
     if unsure:
         n = len(unsure)
-        return {'level': 'warn', 'mark': '?',
+        return {'level': 'warn', 'mark': 'unknown',
                 'head': f'{n} {plural(n, "thing")} could not be checked',
                 'sub': ('Nothing is known to be broken, but these checks did not get an '
                         'answer, so it is not known whether this install is ready.')}
     if counts[NOT_RUN]:
         n = counts[NOT_RUN]
-        return {'level': 'ok', 'mark': '✓',
+        return {'level': 'ok', 'mark': 'ok',
                 'head': 'Ready to record',
                 'sub': (f'Everything checked so far is fine. {n} {plural(n, "check")} '
                         f'{plural(n, "waits", "wait")} until you run {plural(n, "it", "them")}, '
                         'because each one starts a process, logs in to a provider or sends '
                         'a message.')}
-    return {'level': 'ok', 'mark': '✓',
+    return {'level': 'ok', 'mark': 'ok',
             'head': 'Ready: everything you would want to do works',
             'sub': (f'All {counts["counted"]} checks passed: ffmpeg, storage, the database, '
                     'your accounts, the guide and notifications.')}

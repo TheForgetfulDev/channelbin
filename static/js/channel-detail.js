@@ -159,7 +159,7 @@
         ? `Tested by ${state.checks.map(n => `<strong>${escHtml(n)}</strong>`).join(', ')}. ` +
           'Enrollment is edited from the check itself - the chips in the title bar link to each one.'
         : 'No health check tests this channel on a schedule, so a provider-side change would not be ' +
-          'caught automatically. Create one from the &#8943; menu.',
+          'caught automatically. Create one from the ' + icon('more') + ' menu.',
       full: true,
     });
     h += '</fieldset>';
@@ -167,7 +167,7 @@
     h += `<fieldset class="gd-fset${focus === 'notes' ? ' hi' : ''}"><div class="gd-fset-head">Notes</div>`;
     h += fieldRow({
       label: 'Notes',
-      meta: 'Anything you want to remember about this channel. A note puts a &#128221; marker in the title bar.',
+      meta: 'Anything you want to remember about this channel. A note puts a ' + icon('note') + ' marker in the title bar.',
       // `stack`, not `full`: full is the no-control shape, and it left this textarea in
       // the 220px right-hand column with the label above it rather than at the panel's
       // width. The width and the resize handle both come from the .stack rules in

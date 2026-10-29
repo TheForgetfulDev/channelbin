@@ -26,9 +26,10 @@ DROPDOWN_JS = os.path.join(REPO, 'static', 'js', 'dropdown.js')
 
 _EXPORTS = 'ddKeyParts, ddPickLabel, dropdownTriggerHtml, registerDropdown'
 
-# escHtml lives in util.js, which is loaded ahead of dropdown.js on every page. The
-# stub is the same escaping, not a different one - it exists so this can evaluate one
-# file rather than the whole shared bundle. `document` is stubbed only far enough for
+# escHtml and icon live in util.js, which is loaded ahead of dropdown.js on every page.
+# The escHtml stub is the same escaping, not a different one, and the icon stub writes the
+# registry markup's shape - they exist so this can evaluate one file rather than the whole
+# shared bundle. `document` is stubbed only far enough for
 # registerDropdown to wire its delegated listeners into nothing; every assertion below
 # is about a pure function's return value, never about a dispatched event.
 _HARNESS = f"""
@@ -37,10 +38,13 @@ function escHtml(s) {{
   return String(s == null ? '' : s).replace(/[&<>"']/g, c => (
     {{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[c]));
 }}
+function icon(name, cls = '') {{
+  return `<svg class="icon${{cls ? ' ' + cls : ''}}" data-icon="${{name}}" aria-hidden="true"></svg>`;
+}}
 const document = {{ addEventListener() {{}}, getElementById() {{ return null; }},
                    querySelectorAll() {{ return []; }} }};
 const src = fs.readFileSync(process.argv[1], 'utf8');
-const api = new Function('escHtml', 'document', src + '\\nreturn {{{_EXPORTS}}};')(escHtml, document);
+const api = new Function('escHtml', 'document', 'icon', src + '\\nreturn {{{_EXPORTS}}};')(escHtml, document, icon);
 const {{{_EXPORTS}}} = api;
 console.log(JSON.stringify(eval(process.argv[2])));
 """

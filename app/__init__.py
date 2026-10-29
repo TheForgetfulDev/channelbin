@@ -233,6 +233,10 @@ def create_app(config_overrides=None, start_scheduler=True):
         # rather than later: no scheduler job and no request can have started a rebuild yet,
         # so anything found BUILDING is provably stranded (dev/changelog/425).
         reconcile_interrupted_builds()
+        # The same shape for the EPG similarity scan: a RUNNING row here is a process that
+        # died mid-scan, and a page would otherwise show it running forever.
+        from .epg_similarity import reconcile_interrupted_scans
+        reconcile_interrupted_scans()
         # A repair a migration step cannot perform itself: undoing a double-counted health
         # observation is a full replay of the channel's ledger, which is ORM code and only
         # exists here. The step registered the obligation; this discharges it, and does

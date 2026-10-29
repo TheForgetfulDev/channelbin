@@ -29,7 +29,7 @@
     retry/timeout settings, so you can pick them by name when creating a health check.
     Having none is normal: every health check, the automatic TV Guide health check included,
     uses the defaults in <a href="{{ url_for('settings.settings') }}#sec-channel-testing">Settings
-    &rarr; Channel Health Checks</a> until you give it a profile.
+    {{ icon('forward') }} Channel Health Checks</a> until you give it a profile.
   </p>
   <button class="btn btn-primary" id="hcp-add-empty">+ Add Profile</button>
 </div>
@@ -62,7 +62,7 @@
        default grid order and shifts every header label off its column. #}
     <span class="p-actions">
       <span class="menu-wrap">
-        <button class="btn btn-sm btn-icon" data-menu aria-label="Actions for {{ p.name }}">&#8943;</button>
+        <button class="btn btn-sm btn-icon" data-menu aria-label="Actions for {{ p.name }}">{{ icon('more') }}</button>
         <div class="menu pop-left">
           <button class="menu-item" data-act="edit" data-profile="{{ p.id }}">Edit</button>
           <div class="sep"></div>

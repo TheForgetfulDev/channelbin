@@ -3272,6 +3272,91 @@ def _m105_segment_settled_probe(conn, cur):
     conn.commit()
 
 
+def _m106_epg_scans(conn, cur):
+    """The EPG similarity scan's result tables (app/epg_similarity.py, dev/changelog/1325).
+
+    No backfill and no obligation to register (dev/changelog/686): an upgrading database
+    has never been scanned, and "no scan yet" is what the page says until one runs.
+    CREATE TABLE/INDEX IF NOT EXISTS throughout, so this step is re-runnable from the top."""
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS epg_scans (
+            id             INTEGER PRIMARY KEY,
+            started_at     DATETIME NOT NULL,
+            finished_at    DATETIME,
+            status         VARCHAR(16) NOT NULL,
+            listings_as_of DATETIME,
+            listings       INTEGER,
+            schedules      INTEGER,
+            clusters       INTEGER,
+            identical      INTEGER,
+            links          INTEGER,
+            elapsed_ms     INTEGER,
+            error          TEXT
+        )
+    ''')
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS epg_scan_schedules (
+            id             INTEGER PRIMARY KEY,
+            scan_id        INTEGER NOT NULL REFERENCES epg_scans(id),
+            source_id      INTEGER REFERENCES epg_sources(id),
+            epg_id         VARCHAR(255) NOT NULL,
+            spellings      TEXT,
+            cluster        INTEGER NOT NULL,
+            active         BOOLEAN NOT NULL,
+            channel_count  INTEGER NOT NULL,
+            listings       INTEGER NOT NULL,
+            until          DATETIME,
+            described      INTEGER NOT NULL,
+            desc_chars     INTEGER NOT NULL,
+            subtitled      INTEGER NOT NULL,
+            marked         INTEGER NOT NULL,
+            h_programs     VARCHAR(32) NOT NULL,
+            h_titles       VARCHAR(32) NOT NULL,
+            h_stops        VARCHAR(32) NOT NULL,
+            h_subtitles    VARCHAR(32) NOT NULL,
+            h_descriptions VARCHAR(32) NOT NULL,
+            h_extra        VARCHAR(32) NOT NULL,
+            h_exact        VARCHAR(32) NOT NULL
+        )
+    ''')
+    cur.execute('CREATE INDEX IF NOT EXISTS ix_epg_scan_schedules_scan_cluster '
+                'ON epg_scan_schedules (scan_id, cluster)')
+    cur.execute('CREATE INDEX IF NOT EXISTS ix_epg_scan_schedules_scan_source_id '
+                'ON epg_scan_schedules (scan_id, source_id, epg_id)')
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS epg_scan_schedule_channels (
+            id          INTEGER PRIMARY KEY,
+            scan_id     INTEGER NOT NULL REFERENCES epg_scans(id),
+            schedule_id INTEGER NOT NULL REFERENCES epg_scan_schedules(id),
+            channel_id  INTEGER NOT NULL REFERENCES channels(id)
+        )
+    ''')
+    cur.execute('CREATE INDEX IF NOT EXISTS ix_epg_scan_schedule_channels_schedule '
+                'ON epg_scan_schedule_channels (schedule_id)')
+    cur.execute('CREATE INDEX IF NOT EXISTS ix_epg_scan_schedule_channels_scan_channel '
+                'ON epg_scan_schedule_channels (scan_id, channel_id)')
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS epg_scan_links (
+            id               INTEGER PRIMARY KEY,
+            scan_id          INTEGER NOT NULL REFERENCES epg_scans(id),
+            a_id             INTEGER NOT NULL REFERENCES epg_scan_schedules(id),
+            b_id             INTEGER NOT NULL REFERENCES epg_scan_schedules(id),
+            verdict          VARCHAR(16) NOT NULL,
+            compared         INTEGER NOT NULL,
+            same             INTEGER NOT NULL,
+            moved            INTEGER NOT NULL,
+            different        INTEGER NOT NULL,
+            only_a           INTEGER NOT NULL,
+            only_b           INTEGER NOT NULL,
+            description_gaps INTEGER NOT NULL,
+            largest_move_min INTEGER
+        )
+    ''')
+    cur.execute('CREATE INDEX IF NOT EXISTS ix_epg_scan_links_a ON epg_scan_links (scan_id, a_id)')
+    cur.execute('CREATE INDEX IF NOT EXISTS ix_epg_scan_links_b ON epg_scan_links (scan_id, b_id)')
+    conn.commit()
+
+
 def _m081_account_blocks(conn, cur):
     """account_blocks: the stretches of time the user has told ChannelBin to keep off an
     account (app/account_blocks.py, dev/changelog/1151).
@@ -3626,6 +3711,8 @@ SCHEMA_MIGRATIONS = [
      _m104_format_survey_verdict),
     (105, 'recording_segments: probe_settled_resolution/fps/at, the format the pin\'s '
      'segment was carrying a while after it opened', _m105_segment_settled_probe),
+    (106, 'epg_scans + epg_scan_schedules + epg_scan_schedule_channels + epg_scan_links: '
+     'the EPG similarity scan\'s last result', _m106_epg_scans),
 ]
 
 CURRENT_SCHEMA_VERSION = SCHEMA_MIGRATIONS[-1][0]

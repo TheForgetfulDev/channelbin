@@ -298,17 +298,17 @@ class SortTests(_Base, unittest.TestCase):
     SCENARIO = 'sort_survives'
 
     def test_the_sort_was_actually_applied_before_the_swap(self):
-        self.assertEqual(self.obs['sortedBefore'], 'name:▴')
+        self.assertEqual(self.obs['sortedBefore'], 'name:sort-asc')
         self.assertEqual(self.obs['namesBefore'], ['alpha', 'zulu'])
 
     def test_the_sort_survives_the_swap(self):
         """A rebuild re-applies every piece of active state. The sort lived in a closure
         bound to the old headers, so it silently reverted to the server's order."""
-        self.assertEqual(self.obs['sortedAfter'], 'name:▴')
+        self.assertEqual(self.obs['sortedAfter'], 'name:sort-asc')
         self.assertEqual(self.obs['namesAfter'], ['alpha', 'zulu'])
 
     def test_the_swapped_in_headers_still_sort(self):
-        self.assertEqual(self.obs['reversible']['sorted'], 'name:▾')
+        self.assertEqual(self.obs['reversible']['sorted'], 'name:sort-desc')
         self.assertEqual(self.obs['reversible']['names'], ['zulu', 'alpha'])
 
 
@@ -618,7 +618,7 @@ class RecordingUserStateTests(_Base, unittest.TestCase):
         # The server's own order is Zeta, Alpha, Mid (by start time).
         self.assertEqual(self.obs['sortedBefore'], [_REC['alpha'], _REC['zeta']])
         self.assertEqual(self.obs['sortedAfter'], [_REC['alpha'], _REC['soon'], _REC['zeta']])
-        self.assertEqual(self.obs['sortedCol'], 'name:\u25b4')
+        self.assertEqual(self.obs['sortedCol'], 'name:sort-asc')
 
     def test_a_section_hidden_in_customize_stays_hidden(self):
         self.assertTrue(self.obs['liveHiddenBefore'])

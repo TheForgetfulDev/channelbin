@@ -198,7 +198,7 @@ class SearchAndSortTests(_Base, unittest.TestCase):
 
     def test_the_sort_survives(self):
         """Alpha before Zeta by name; the server renders In Progress newest-start first."""
-        self.assertEqual(self.obs['sortedCol'], 'name:▴')
+        self.assertEqual(self.obs['sortedCol'], 'name:sort-asc')
         self.assertEqual(self.obs['liveOrder'], [_IDS['live'], _IDS['soon']])
 
 
@@ -311,16 +311,16 @@ class SavedDefaultTests(_Base, unittest.TestCase):
     SCENARIO = 'saved_default'
 
     def test_the_default_filters_the_list_at_load(self):
-        self.assertEqual(self.obs['atBoot']['chips'], ['Status is COMPLETED \u2715'])
+        self.assertEqual(self.obs['atBoot']['chips'], ['Status is COMPLETED'])
         self.assertEqual(sorted(self.obs['atBoot']['visible']), sorted([_IDS['done'], _IDS['live']]))
 
     def test_a_value_nothing_carries_is_named_not_dropped_quietly(self):
         self.assertIn('Channel is No such channel', self.obs['atBoot']['toast'])
-        self.assertEqual(self.obs['atBoot']['chip'], 'Saved: Done only (edited) \u25be')
+        self.assertEqual(self.obs['atBoot']['chip'], 'Saved: Done only (edited)')
 
     def test_it_survives_the_swap_and_writes_nothing(self):
         self.assertEqual(self.obs['pageFetches'], 1)
-        self.assertEqual(self.obs['afterSwap']['chips'], ['Status is COMPLETED \u2715'])
+        self.assertEqual(self.obs['afterSwap']['chips'], ['Status is COMPLETED'])
         self.assertEqual(self.obs['afterSwap']['visible'], [_IDS['done']])
         self.assertEqual(self.obs['posts'], [])
 

@@ -20,8 +20,11 @@ from ..accounts import (normalize_url, render_filename_template,
                         default_profile_for, tags_matching as _matched_tags)
 from ..channel_groups import (effective_score, rank_members, member_channels,
                               guide_row_targets, member_eager_options,
-                              guide_listings_member, fill_listings,
+                              guide_listings_member, fill_listings, member_schedules,
+                              serving_member, blocked_account_ids_now,
                               DEFAULT_FAILING_STREAK_THRESHOLD)
+from ..epg_sources import (Listing, listing_agreement, keys_read, case_sensitive_matching,
+                           AGREE_DOUBLED, AGREE_PAST, AGREE_REFERENCE, COMPARE_VERDICTS)
 from .. import channel_hiding
 from ..recording_story import partial_note, stopped_early_note
 from ..config import load_config
@@ -145,7 +148,34 @@ def _coerce_layout_value(key, value, default):
     return None
 
 
-def read_guide_layout(cfg, pref_key, mobile=False):
+# The group page's What's On card (dev/changelog/1324): its own keys, so it never reshapes
+# the TV Guide or the channel page's card, and its own defaults - mockup 46's approved
+# shape, with every time field but duration on. `fold_same` is the card's one control the
+# guide does not have; rec_status and tag_dots are not offered there (guide.js draws the
+# recording chip on the group's own row only).
+GROUP_WHATSON_LAYOUT_PREF_KEY = 'group_whatson_layout_desktop'
+GROUP_WHATSON_LAYOUT_MOBILE_PREF_KEY = 'group_whatson_layout_mobile'
+GROUP_WHATSON_LAYOUT_DEFAULTS = {
+    'fold_same': False,
+    'subtitle': True,
+    'description': True,
+    'start_time': True,
+    'end_time': True,
+    'duration': False,
+    'tag_dots': False,
+    'collapse_gaps': False,
+}
+
+
+def read_group_whatson_layout(cfg, mobile=False):
+    """The group What's On card's stored Layout, read through read_guide_layout()'s merge
+    rules under the card's own key and defaults."""
+    return read_guide_layout(
+        cfg, GROUP_WHATSON_LAYOUT_MOBILE_PREF_KEY if mobile else GROUP_WHATSON_LAYOUT_PREF_KEY,
+        mobile=mobile, overrides=GROUP_WHATSON_LAYOUT_DEFAULTS)
+
+
+def read_guide_layout(cfg, pref_key, mobile=False, overrides=None):
     """Stored Layout pref merged over the defaults, ignoring keys we don't know about.
 
     An unknown key in a stale pref must never reach the template (it would render a
@@ -155,9 +185,12 @@ def read_guide_layout(cfg, pref_key, mobile=False):
     Public because the channel detail page's "What's On" card embeds the same grid and
     reads its own Layout through here, under its own pref keys (dev/changelog/349). This
     module owns the defaults and the merge rules for every caller; a second reader would
-    be a second set of them.
+    be a second set of them. `overrides` is a caller's own defaults over the guide's, and
+    may name a key the guide does not have.
     """
     layout = _guide_layout_defaults(cfg, mobile=mobile)
+    if overrides:
+        layout.update(overrides)
     pref = db.session.get(UserPref, pref_key)
     if pref and pref.value:
         try:
@@ -306,6 +339,117 @@ def _guide_row_entries(streak_threshold=DEFAULT_FAILING_STREAK_THRESHOLD):
     latest_by_channel = _latest_tests_by_channel(all_member_ids, for_job_id=ANY_JOB)
     return guide_row_targets(streak_threshold=streak_threshold,
                              latest_by_channel=latest_by_channel)
+
+
+def _one_group_row(group, streak_threshold):
+    """([row entry], records) for one group's row, in or out of the guide.
+
+    The row names the member guide_row_targets() would - serving_member() over the same
+    inputs. A group nobody records from has no serving member and paints no guide row, so
+    its card shows what the row would hold, led by the best-ranked channel, and `records`
+    is False: nothing may be recorded from it."""
+    latest = _latest_tests_by_channel([m.channel_id for m in group.memberships], for_job_id=ANY_JOB)
+    serving = serving_member(group, latest, streak_threshold=streak_threshold,
+                             blocked_account_ids=blocked_account_ids_now()).member
+    if serving is not None:
+        return [('group', group, serving)], True
+    ranked = rank_members(member_channels(group.memberships), latest,
+                          streak_threshold=streak_threshold)
+    return ([('group', group, ranked[0])] if ranked else []), False
+
+
+def _iso(dt):
+    return dt.strftime('%Y-%m-%dT%H:%M:%S') if dt is not None else None
+
+
+def _schedules_payload(group, row, ref_entries, lead_channel_id, cell, entries_by_channel,
+                       cfg, records, source_names):
+    """The What's On card's schedules for `group` (dev/changelog/1324): every distinct
+    schedule its channels carry (channel_groups.member_schedules()), each judged program by
+    program against the group's own row (`row`, whose listings are `ref_entries`) with
+    epg_sources.listing_agreement(). Also marks the row's own programs.
+
+    Works over rows the caller already holds - `entries_by_channel` is epg_api's one
+    windowed query, which covers every member - plus keys_read()'s two queries, so the
+    cost does not grow with the member count. `cell` builds one program dict the way the
+    group row's are built, so a schedule's cell records from the group, as the row does."""
+    now = datetime.utcnow()
+    members = member_channels(group.memberships)
+    recording_on = {m.channel_id: bool(m.recording_enabled) for m in group.memberships}
+    cs = case_sensitive_matching(cfg)
+    reads = keys_read(members, cs)
+
+    def listing(e):
+        return Listing(e.title, e.sub_title, e.description, e.start_time, e.stop_time)
+
+    ref = [listing(e) for e in ref_entries]
+    # A group row with no listings at all is the guide's one-hour dummy slots; there is
+    # nothing to judge against and every schedule reads as having no listings.
+    seen_starts = set()
+    for p, x in (zip(row['programs'], ref) if ref else ()):
+        if x.start in seen_starts:
+            p['agreement'] = AGREE_DOUBLED
+        elif x.stop <= now:
+            p['agreement'] = AGREE_PAST
+        else:
+            p['agreement'] = AGREE_REFERENCE
+        seen_starts.add(x.start)
+    if not ref:
+        for p in row['programs']:
+            p['agreement'] = AGREE_REFERENCE
+
+    def member(ch):
+        return {'id': ch.id, 'name': ch.name, 'account_name': ch.account.name,
+                'recording_enabled': recording_on.get(ch.id, False)}
+
+    verdict_order = {v: i for i, v in enumerate(COMPARE_VERDICTS)}
+    rows = []
+    for s in member_schedules(members, reads, entries_by_channel, cs):
+        entries = entries_by_channel.get(s.channels[0].id, [])
+        cmp, agreements, lacking = listing_agreement(ref, [listing(e) for e in entries], now)
+        programs = []
+        for e, a in zip(entries, agreements):
+            p = cell(e)
+            # A schedule's row, not the group's: the recording chip is drawn on the
+            # group's own row only (guide.js::cellActiveFields).
+            p['on_schedule'] = True
+            p['agreement'] = a.kind
+            p['gap'] = a.gap
+            p['partner'] = ({'title': a.partner.title, 'start_time': _iso(a.partner.start),
+                             'stop_time': _iso(a.partner.stop)} if a.partner else None)
+            programs.append(p)
+        key = f'{s.source_id or 0}:{s.file_id}'
+        if s.split:
+            key += f':{s.channels[0].id}'
+        rows.append({
+            'key': key,
+            'epg_id': s.file_id,
+            'spellings': s.spellings,
+            'source_name': source_names.get(s.source_id) if s.source_id is not None else None,
+            'lead': any(ch.id == lead_channel_id for ch in s.channels),
+            'split': s.split,
+            'verdict': cmp.verdict,
+            'counts': {'compared': cmp.compared, 'same': cmp.same, 'moved': cmp.moved,
+                       'different': cmp.different, 'only_guide': cmp.only_active,
+                       'only_here': cmp.only_other, 'doubled': cmp.doubled_other,
+                       'largest_move_min': (int(cmp.largest_move.total_seconds() // 60)
+                                            if cmp.largest_move else None)},
+            'ends': _iso(max((e.stop_time for e in entries), default=None)),
+            'members': [member(ch) for ch in s.channels],
+            'programs': programs,
+            'missing': [{'title': x.title, 'start_time': _iso(x.start), 'stop_time': _iso(x.stop)}
+                        for x in lacking],
+        })
+    rows.sort(key=lambda r: (not r['lead'], verdict_order[r['verdict']], r['epg_id'].lower()))
+    return {
+        'records': records,
+        'serving_name': row.get('active_channel_name'),
+        'pinned_name': row.get('listings_pinned_name'),
+        'borrowed': row.get('listings_from') or [],
+        'lead_key': next((r['key'] for r in rows if r['lead']), None),
+        'rows': rows,
+        'no_epg_id': [member(ch) for ch in members if not reads[ch.id].key],
+    }
 
 
 @guide_bp.route('/guide')
@@ -582,10 +726,23 @@ def epg_api():
     tz = get_display_tz()
 
     channel_id_param = request.args.get('channel_id', type=int)
+    group_id_param = request.args.get('group_id', type=int)
+    # The group page's What's On card: the group's row plus every distinct schedule its
+    # channels carry, judged against it (dev/changelog/1324).
+    want_schedules = bool(group_id_param) and request.args.get('schedules') == '1'
+    group_records = True
     if channel_id_param:
         # Single-channel view (e.g. the channel detail page) - works regardless of
         # in_guide/grouping, since a channel can have EPG data without being in the guide.
         row_entries = [('channel', ch, None) for ch in Channel.query.filter_by(id=channel_id_param).all()]
+    elif group_id_param:
+        # One group's row whether or not it is in the guide - the card is for checking a
+        # group before it goes in.
+        group = (ChannelGroup.query.options(*member_eager_options(with_accounts=True))
+                 .filter_by(id=group_id_param).first())
+        if group is None:
+            return jsonify({'error': 'Group not found'}), 404
+        row_entries, group_records = _one_group_row(group, streak_threshold)
     else:
         row_entries = _guide_row_entries(streak_threshold)
 
@@ -650,6 +807,7 @@ def epg_api():
         return entries_by_channel.get(channel_id, [])
 
     result_channels = []
+    schedules_payload = None
     for kind, obj, active in row_entries:
         group = obj if kind == 'group' else None
         ch = active if group is not None else obj
@@ -780,9 +938,28 @@ def epg_api():
                 'listings_from': [listings_names[cid] for cid in borrowed_ids],
             })
         result_channels.append(row)
+        if want_schedules and group is not None:
+            # Called only inside this iteration, so the loop's own ch/group/recs are the
+            # ones it reads. A schedule's cell records from the group's row, never from a
+            # channel the card happened to show (enforcement stays on the group path).
+            def cell(entry):
+                return _program_dict(
+                    ch, entry, entry.start_time, entry.stop_time, stream_url=stream_url,
+                    template=template, tag_cleanup=tag_cleanup,
+                    rec=_match_recording(channel_recs, entry.start_time, entry.stop_time),
+                    all_tags=all_tags, tags_by_name=tags_by_name, tz=tz,
+                    source_names=source_names, display_name=group.name, group_id=group.id)
+            schedules_payload = _schedules_payload(
+                group, row, entries, chain[0], cell, entries_by_channel, cfg, group_records,
+                source_names)
 
-    return jsonify({
+    payload = {
         'window_start': window_start.strftime('%Y-%m-%dT%H:%M:%S'),
         'window_end': window_end.strftime('%Y-%m-%dT%H:%M:%S'),
         'channels': result_channels,
-    })
+    }
+    if want_schedules:
+        payload['schedules'] = schedules_payload or {'records': group_records, 'rows': [],
+                                                     'no_epg_id': [], 'serving_name': None,
+                                                     'pinned_name': None, 'lead_key': None}
+    return jsonify(payload)

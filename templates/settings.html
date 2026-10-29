@@ -268,7 +268,7 @@
     <div class="search-wrap" id="swrap">
       <input type="text" class="search" id="ssearch" autocomplete="off"
              placeholder="Search settings by name, description or key">
-      <button class="search-clear" id="sclear" type="button" aria-label="Clear the search">&times;</button>
+      <button class="search-clear" id="sclear" type="button" aria-label="Clear the search">{{ icon('close') }}</button>
     </div>
     <span class="chip" id="shits" style="display:none"></span>
     <button type="button" class="chip" id="schanged" aria-pressed="false">Changed from default <span class="chip-count" id="schanged-n"></span></button>
@@ -290,7 +290,7 @@
       <span class="pb-lbl">Section</span>
       <span class="pb-cur" id="sp-cur">Display</span>
       <span class="pb-n" id="sp-n"></span>
-      <span class="pb-caret">&#9662;</span>
+      <span class="pb-caret">{{ icon('dropdown') }}</span>
     </button>
   </div>
 
@@ -775,7 +775,7 @@
          'Bind address for the Flask server. Edit in the config.yaml tab; restart required.',
          fsk.get('host', '0.0.0.0'), tier='advanced') }}
       {% if fsk.get('host', '0.0.0.0') in ('0.0.0.0', '', '::') %}
-      {% call field_shell('', '⚠ Reachable from any device on this network',
+      {% call field_shell('', icon('warning') ~ ' Reachable from any device on this network',
          'Listening on every network address (' ~ (fsk.get('host') or '0.0.0.0') ~ '), so every device on your LAN can reach this app - ' ~
          ('and the login gate below is on, but it is a shared password, not per-user auth.' if auth_has_password and authcfg.get('enabled')
           else 'and it has no authentication (see the Security section above to turn on the password gate).') ~

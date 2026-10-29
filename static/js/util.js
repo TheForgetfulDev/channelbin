@@ -35,7 +35,7 @@ function globMatch(text, term) {
   return new RegExp(globRegExpBody(term), 'i').test(String(text ?? ''));
 }
 
-// null/undefined → '-' (unknown), 0 → '0 B'; scales to TB with one decimal.
+// null/undefined -> '-' (unknown), 0 -> '0 B'; scales to TB with one decimal.
 function fmtBytes(n) {
   if (n === null || n === undefined) return '-';
   if (n < 1024) return `${Math.round(n)} B`;
@@ -87,6 +87,12 @@ function readBootJson(id, fallback = null) {
 // withSeconds=false is the bare DESIGN.md 9.1 form ('3h 1m' / '2h' / '42m') for
 // static/summary durations, which are otherwise server-rendered via the `duration`
 // Jinja filter (app/routes/recordings.py::_fmt_duration) - keep the two in sync.
+// '1 program' / '3 programs' - a number with its noun. The JS half of
+// app/fmt_utils.py::counted(), same arguments.
+function counted(n, one, many) {
+  return `${n.toLocaleString()} ${n === 1 ? one : (many || `${one}s`)}`;
+}
+
 function fmtDur(s, withSeconds = true) {
   s = Math.floor(Math.max(0, s || 0));
   const h = Math.floor(s / 3600);
@@ -330,17 +336,20 @@ function statusVocab(family) {
 // The one way a script draws an icon: a meaning from the registry (app/icons.py), drawn
 // from the generated MDI sprite. Writes exactly the markup the Jinja icon() global does
 // (tests/test_icon_registry.py holds the two equal). An unknown name draws nothing and says
-// so in the console - a typo is a missing icon, never a broken page.
+// so in the console - a typo is a missing icon, never a broken page. The names come from
+// base.html's <meta name="icon-sprite">; a document without it (a jsdom harness that
+// evaluates one script, not a page) has nothing to check against, so it draws every name
+// from the sprite's own path and the static scan in test_icon_registry.py does the checking.
 let _iconMeta = null;
 function icon(name, cls = '') {
   if (_iconMeta === null) {
     const meta = document.querySelector('meta[name="icon-sprite"]');
     _iconMeta = {
-      url: meta ? meta.content : '',
-      names: new Set(((meta && meta.dataset.names) || '').split(' ').filter(Boolean)),
+      url: meta ? meta.content : '/static/icons/mdi-sprite.svg',
+      names: meta ? new Set((meta.dataset.names || '').split(' ').filter(Boolean)) : null,
     };
   }
-  if (!_iconMeta.names.has(name)) {
+  if (_iconMeta.names !== null && !_iconMeta.names.has(name)) {
     console.error(`no icon named "${name}" in app/icons.py`);
     return '';
   }
@@ -573,7 +582,7 @@ function recordingWarningsHtml(data, recDetailUrlBase) {
       + `${escHtml(c.title)} (${escHtml(c.channel_name)}) - ${escHtml(c.start_time)} to ${escHtml(c.stop_time)}</a></li>`
     ).join('');
     return `<div style="margin-bottom:0.5rem;">
-      <strong style="color:var(--warn);">⚠ ${escHtml(heading)}</strong><br>
+      <strong style="color:var(--warn);">${icon('warning')} ${escHtml(heading)}</strong><br>
       <span class="text-muted small">${escHtml(w.message)}</span>
       ${items ? `<ul class="small" style="margin:0.35rem 0 0; padding-left:1.25rem;">${items}</ul>` : ''}
     </div>`;
@@ -975,10 +984,10 @@ function overlayOpen() {
 
 // Modal builder (DESIGN.md 3.12 anatomy). Returns the overlay element; call
 // .remove() on it (or use the returned close()) to dismiss programmatically.
-//   buildModal({ title, body, footer: [{label, class, onClick}], dismissable })
+//   buildModal({ title, body, footer: [{label, class, onClick, icon, iconAfter}], dismissable })
 // body: Node or HTML string. footer onClick(closeFn); returning false keeps
 // the modal open (e.g. validation failure). dismissable=false disables the
-// Esc/backdrop/× close paths for destructive-confirm flows.
+// Esc/backdrop/close-button paths for destructive-confirm flows.
 function buildModal({ title = '', body = '', footer = [], dismissable = true, onClose = null,
                       panelClass = '', footNote = '' } = {}) {
   const overlay = document.createElement('div');
@@ -1018,7 +1027,7 @@ function buildModal({ title = '', body = '', footer = [], dismissable = true, on
   if (dismissable) {
     const x = document.createElement('button');
     x.className = 'modal-close';
-    x.innerHTML = '&#x2715;';
+    x.innerHTML = icon('close');
     x.addEventListener('click', close);
     head.appendChild(x);
     backdrop.addEventListener('click', close);
@@ -1038,10 +1047,10 @@ function buildModal({ title = '', body = '', footer = [], dismissable = true, on
       foot.appendChild(note);
       overlay.footNote = note;
     }
-    footer.forEach(({ label, class: cls = 'btn', onClick = null }) => {
+    footer.forEach(({ label, class: cls = 'btn', onClick = null, icon: before = null, iconAfter = null }) => {
       const b = document.createElement('button');
       b.className = cls;
-      b.textContent = label;
+      b.innerHTML = `${before ? icon(before) : ''}${escHtml(label)}${iconAfter ? icon(iconAfter) : ''}`;
       b.addEventListener('click', () => {
         if (onClick && onClick(close) === false) return;
         if (!onClick) close();
@@ -1191,7 +1200,7 @@ document.addEventListener('keydown', (e) => {
 }, true);
 
 // The app's one confirm dialog - never the browser's native confirm() (DESIGN.md 3.12,
-// dev/changelog/1162). Resolves true on the action button, false on Cancel, ×, the backdrop
+// dev/changelog/1162). Resolves true on the action button, false on Cancel, the close button, the backdrop
 // and Escape. Copy follows DESIGN.md 4: `message` says what will happen, `consequence` is
 // the destructive consequence (only when there is one), `confirmLabel` is the action verb.
 // Every text field is plain text; `list` renders names as a list rather than a joined line.
@@ -1319,8 +1328,8 @@ function initSectionLayout({ config, saveUrl, names, note = '' }) {
         secState.order.map((s, i) =>
           `<div class="seclayout-row"><label><input type="checkbox" data-sec="${s}"` +
           `${secState.hidden.includes(s) ? '' : ' checked'}> ${escHtml(names[s] || s)}</label>` +
-          `<span class="seclayout-mv"><button data-secup="${s}"${i === 0 ? ' disabled' : ''} aria-label="Move up">&#9650;</button>` +
-          `<button data-secdn="${s}"${i === secState.order.length - 1 ? ' disabled' : ''} aria-label="Move down">&#9660;</button></span></div>`
+          `<span class="seclayout-mv"><button data-secup="${s}"${i === 0 ? ' disabled' : ''} aria-label="Move up">${icon('move-up')}</button>` +
+          `<button data-secdn="${s}"${i === secState.order.length - 1 ? ' disabled' : ''} aria-label="Move down">${icon('move-down')}</button></span></div>`
         ).join('');
     };
     draw();

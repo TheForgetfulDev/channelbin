@@ -246,7 +246,7 @@
     <div class="card-head-actions">
       {#- Always here: once the four setup steps are done the dashboard banner and the menu
           link are both gone, and this is the way back to the steps (DESIGN.md 16.7). -#}
-      <a class="btn btn-sm" href="{{ url_for('setup.get_started') }}">Get started <span class="arw">&#8594;</span></a>
+      <a class="btn btn-sm" href="{{ url_for('setup.get_started') }}">Get started <span class="arw">{{ icon('forward') }}</span></a>
       <button class="btn btn-sm" id="rd-copy">Copy report</button>
       <button class="btn btn-sm btn-primary" id="rd-runall">Run the remaining checks</button>
     </div>
@@ -288,6 +288,22 @@
   </div>
 </div>
 
+{# The EPG similarity scan (dev/changelog/1325): drawn by epg-manager.js from
+   /api/epg-manager/scan, the same rows as the Search index card above. The result itself
+   is the EPG Manager page. #}
+<div class="card" id="m-epg">
+  <div class="card-head"><h2>EPG similarity scan</h2></div>
+  <div class="card-body">
+    <div id="epg-scan-card"><div class="mrow"><span class="grow">Loading...</span></div></div>
+    <div class="mrow">
+      <span class="grow">Reads every EPG schedule in the guide and finds the ids carrying the
+        same one - about a minute on a full guide. Run by hand; the result is on the
+        <a href="{{ url_for('epg_manager.epg_manager') }}">EPG Manager</a> page.</span>
+      <div class="mrow-ctl"><button class="btn btn-sm" data-act="epg-scan">Scan now</button></div>
+    </div>
+  </div>
+</div>
+
 <div class="card" id="m-backup">
   <div class="card-head">
     <h2>Backup &amp; Restore</h2>
@@ -309,7 +325,7 @@
     </div>
     <div class="mrow">
       <span class="grow">For a full disaster-recovery backup (the whole file set: dvr.db +
-        config.yaml + instance/), see README.md &rarr; Backup &amp; Restore.</span>
+        config.yaml + instance/), see README.md, Backup &amp; Restore.</span>
     </div>
   </div>
 </div>
@@ -377,6 +393,7 @@
 {% endblock %}
 
 {% block scripts %}
+<script src="{{ url_for('static', filename='js/epg-manager.js') }}"></script>
 <script src="{{ url_for('static', filename='js/maintenance.js') }}"></script>
 <script src="{{ url_for('static', filename='js/readiness.js') }}"></script>
 {% endblock %}

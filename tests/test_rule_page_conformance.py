@@ -193,7 +193,8 @@ class ShellTests(_Ledger):
         h1s = re.findall(r'<h1[^>]*>(.*?)</h1>', self.html, re.S)
         self.assertEqual([_text(h) for h in h1s], ['Auto-record rules'])
         head = self.html.split('<div class="page-head">')[1].split('</div>')[0]
-        self.assertIn('<a href="/rules" class="btn">&larr; All Rules</a>', head)
+        self.assertIn('<a href="/rules" class="btn"><svg class="icon" data-icon="back"', head)
+        self.assertIn('#i-back"></use></svg> All Rules</a>', head)
 
     def test_the_header_names_the_rule_and_its_state(self):
         head = self.html.split('<div class="gd-head">')[1].split('<div class="gd-statezone">')[0]
@@ -242,7 +243,7 @@ class ShellTests(_Ledger):
 
     def test_card_heads_carry_their_own_actions(self):
         search = _section(self.html, 'search')
-        self.assertIn('Open search <span class="arw">&rarr;</span></a>', search)
+        self.assertIn('Open search <span class="arw"><svg class="icon" data-icon="forward"', search)
         self.assertIn('>Edit search</a>', search)
         self.assertIn('data-act="check">Check now</button>', _section(self.html, 'checks'))
         self.assertIn('data-act="edit">Edit settings</button>', _section(self.html, 'settings'))
@@ -310,7 +311,7 @@ class LedgerTests(_Ledger):
         rec = self.recs[self.failed]
         tr = self.ledger_row(html, self.failed)
         self.assertIn('The recording failed, so a later airing of it is not a repeat.', _text(tr))
-        self.assertIn(f'<a href="/recordings/{rec.id}">{rec.name} &rarr;</a>', tr)
+        self.assertIn(f'<a href="/recordings/{rec.id}">{rec.name} <svg class="icon" data-icon="forward"', tr)
         self.assertIn('You aborted it while it was recording.', _text(self.ledger_row(html, self.aborted)))
         self.assertIn('A change to its channel group called it off.',
                       _text(self.ledger_row(html, self.called_off)))
@@ -579,7 +580,7 @@ class RecordingPageTests(_Base):
         html = self.get(f'/recordings/{rec.id}')
         meta = html.split('<div class="dh-meta">')[1].split('<div class="dh-actions">')[0]
         self.assertIn(f'href="/rules/{rid}"', meta)
-        self.assertIn('Scheduled by rule NASCAR Cup Series &rarr;</a>', meta)
+        self.assertIn('Scheduled by rule NASCAR Cup Series <svg class="icon" data-icon="forward"', meta)
 
     def test_one_a_person_made_does_not(self):
         start = datetime.utcnow() + timedelta(days=1)

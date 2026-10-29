@@ -670,7 +670,7 @@ function wireDashSec(sec) {
     headers.forEach(h => {
       const active = h.dataset.sort === state.key;
       h.classList.toggle('sorted', active);
-      h.querySelector('.sort-ind').textContent = active ? (state.dir === 'desc' ? ' ▾' : ' ▴') : '';
+      h.querySelector('.sort-ind').innerHTML = active ? ' ' + icon(state.dir === 'desc' ? 'sort-desc' : 'sort-asc') : '';
     });
   };
   headers.forEach(h => {
@@ -736,8 +736,8 @@ function customizeBody() {
       <label class="switch"><input type="checkbox" data-cz-on="${k}"${SEC.on[k] ? ' checked' : ''}><span class="knob"></span></label>
       <span class="cz-name">${escHtml(d.label)}<small>${escHtml(d.hint)}</small></span>
       <span class="cz-move">
-        <button type="button" data-cz-up="${k}"${i === 0 ? ' disabled' : ''} aria-label="Move up">&uarr;</button>
-        <button type="button" data-cz-down="${k}"${i === SEC.order.length - 1 ? ' disabled' : ''} aria-label="Move down">&darr;</button>
+        <button type="button" data-cz-up="${k}"${i === 0 ? ' disabled' : ''} aria-label="Move up">${icon('move-up')}</button>
+        <button type="button" data-cz-down="${k}"${i === SEC.order.length - 1 ? ' disabled' : ''} aria-label="Move down">${icon('move-down')}</button>
       </span></div>`;
   }).join('');
 }

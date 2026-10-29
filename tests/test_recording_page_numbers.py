@@ -227,7 +227,8 @@ class LivePageNumbersTests(_LivePage, unittest.TestCase):
     def test_the_health_badge_has_words(self):
         html = self._get(f'/recordings/{self.rid}').get_data(as_text=True)
         head = html.split('id="detail-head-slot"', 1)[1].split('dh-actions', 1)[0]
-        self.assertIn('✓ no stalls', head)
+        self.assertIn('data-icon="ok"', head)
+        self.assertIn('no stalls', head)
 
     def test_the_strip_says_failures_in_a_row(self):
         html = self._get(f'/recordings/{self.rid}').get_data(as_text=True)

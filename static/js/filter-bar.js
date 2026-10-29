@@ -149,7 +149,7 @@ function createFilterBar(opts) {
         chip.type = 'button';
         chip.className = `chip active active-filter${op === 'not' ? ' neg' : ''}`;
         chip.innerHTML = `${escHtml(d.label)} <span class="fb-op">${word}</span> ` +
-          `${escHtml(labelOf(d, v))} <span class="chip-x" aria-hidden="true">&#10005;</span>`;
+          `${escHtml(labelOf(d, v))} <span class="chip-x" aria-hidden="true">${icon('close')}</span>`;
         chip.setAttribute('aria-label', `Remove filter ${text}`);
         // Its own operator, so removing an "is not" chip is never pressing "is".
         chip.addEventListener('click', () => { toggle(d.k, v, op); apply(); });
@@ -175,7 +175,7 @@ function createFilterBar(opts) {
 
   function dimHtml(d) {
     const vals = valuesOf(d);
-    const back = '<button class="pop-back" type="button" data-fback>&#9666; All filters</button>' +
+    const back = `<button class="pop-back" type="button" data-fback>${icon('back')} All filters</button>` +
       `<div class="pop-title">${escHtml(d.label)}</div>`;
     if (!vals.length) return back + '<div class="pop-note">No values to filter by.</div>';
     // Counted against every row the caller owns, not against what the other filters have
@@ -187,7 +187,7 @@ function createFilterBar(opts) {
       const n = rows.filter(r => d.match(r, o.v)).length;
       return `<div class="fb-val-row"><button class="menu-item fb-val${op ? ` on${op === 'not' ? ' neg' : ''}` : ''}" ` +
         `type="button" data-fdim="${escHtml(d.k)}" data-fval="${escHtml(o.v)}" aria-pressed="${!!op}">` +
-        `<span class="fb-tick" aria-hidden="true">${op === 'is' ? '&#10003;' : ''}</span>` +
+        `<span class="fb-tick" aria-hidden="true">${op === 'is' ? icon('ok') : ''}</span>` +
         `<span class="fb-lbl">${escHtml(o.label)}</span>` +
         `<span class="fb-n">${n}</span></button>${opHtml(d.k, o.v, o.label)}</div>`;
     }).join('');
@@ -296,8 +296,8 @@ function createFilterBar(opts) {
     const st = savedStatus();
     sv.chipEl.innerHTML = st.name
       ? `Saved: <span class="fb-saved-cur">${escHtml(st.name)}</span>` +
-        `${st.dirty ? ' <span class="fb-saved-dirty">(edited)</span>' : ''} &#9662;`
-      : 'Saved &#9662;';
+        `${st.dirty ? ' <span class="fb-saved-dirty">(edited)</span>' : ''} ${icon('dropdown')}`
+      : `Saved ${icon('dropdown')}`;
   }
 
   function savedHtml() {
@@ -309,7 +309,7 @@ function createFilterBar(opts) {
         ? 'Stop applying this filter when the page opens.'
         : 'Apply this filter every time the page opens.'}">${s.is_default ? 'Clear default' : 'Set default'}</button>` +
       `<button class="btn btn-sm btn-icon" type="button" data-fsdel="${i}" ` +
-      `aria-label="Delete saved filter ${escHtml(s.name)}">&times;</button></div>`).join('');
+      `aria-label="Delete saved filter ${escHtml(s.name)}">${icon('close')}</button></div>`).join('');
     return '<div class="pop-title">Saved filters</div>' +
       (rows || '<div class="fb-saved-empty">Nothing saved yet. Add filters, then name them here.</div>') +
       '<div class="fb-saved-foot">' +

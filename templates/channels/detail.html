@@ -38,28 +38,6 @@
   color: var(--text); cursor: pointer; }
 .gs-lookup-item:hover, .gs-lookup-item:focus-visible { border-color: var(--accent); }
 
-/* The guide's toolbar sticks to the viewport because it belongs to the page. This one
-   belongs to a card, so it scrolls with it - a bar that detaches from its own card and
-   floats over the rest of the page is the mobile divergence round 6 called out. The
-   full-bleed backdrop goes with it: there is nothing scrolling underneath to cover. */
-.cd-guide-toolbar {
-  position: static;
-  box-shadow: none;
-  /* .toolbar's own 16px top margin is sized for a bar under a page heading; inside a card
-     body it doubles up with the body's padding. */
-  margin: 4px 0 0.6rem;
-  padding-bottom: 0.6rem;
-  border-bottom: 1px solid var(--border-soft);
-}
-
-/* .guide-body is drawn as the BOTTOM half of a box whose top half is the sticky
-   .guide-head, which this page does not have (the header track stays inside the scroller
-   here - see the markup comment). So it closes its own box. */
-.channel-whats-on .guide-body {
-  border-top: 1px solid var(--border);
-  border-radius: var(--radius);
-}
-
 /* One control, two presentations (13.3): the glyph ships at every width and the label is
    dropped at phone widths. Written here rather than reusing guide.css's .guide-icon /
    .guide-btn-label because guide.css is only loaded when this channel actually has EPG
@@ -204,7 +182,7 @@
 {# The channel's name is the page's one heading and the way back sits above it, the recording
    page's shape (DESIGN.md 3.10). A "Channel Search" h1 read as the page's title to both
    first-time testers, even arriving from the guide (dev/changelog/1289). #}
-<a class="back" href="{{ url_for('channels.channel_browser') }}">&larr; Channel Search</a>
+<a class="back" href="{{ url_for('channels.channel_browser') }}">{{ icon('back') }} Channel Search</a>
 
 {# ── Header ─────────────────────────────────────────────────────────────── #}
 <div class="gd-head">
@@ -233,7 +211,7 @@
           {% if final_health_score is not none %}
           {% set hs_early = channel.health_score_sample_count < 3 %}
           <span class="h-mini {{ final_health_score | health_css(health_bands) }}{{ ' hs-early' if hs_early }} tip-plain"
-                data-tip="Channel health {{ final_health_score }}{{ ', early' if hs_early }}.&#10;Lifetime 0-100 quality score from this channel's tests and recordings. {{ channel.health_score_sample_count }} observation{{ 's' if channel.health_score_sample_count != 1 else '' }}{{ ', too few to rely on yet' if hs_early }}.">&#9733; {{ final_health_score }}</span>
+                data-tip="Channel health {{ final_health_score }}{{ ', early' if hs_early }}.&#10;Lifetime 0-100 quality score from this channel's tests and recordings. {{ channel.health_score_sample_count }} observation{{ 's' if channel.health_score_sample_count != 1 else '' }}{{ ', too few to rely on yet' if hs_early }}.">{{ icon('health-score') }} {{ final_health_score }}</span>
           {% endif %}
           {% if channel.in_guide %}
           <span class="badge b-done tip-plain"
@@ -272,14 +250,14 @@
              enough, and the un-marked chips are groups that render no row at all. #}
           {% for g in channel_kind_groups %}
           <a href="{{ url_for('channel_groups.group_detail', group_id=g.id) }}" class="mem-chip grp{{ ' grp-guided' if g.in_guide }} tip-plain"
-             data-tip="Channel group &quot;{{ g.name }}&quot;.&#10;{{ 'In the TV Guide: it renders one row, filled by whichever member is serving it, and this channel is one of them.' if g.in_guide else 'Not in the TV Guide - it renders no row. Recordings from it pick its best-scoring member and fail over.' }} Click to open it."><span class="mc-glyph">&#9939;</span> {{ g.name }}{% if g.in_guide %} <span class="mc-mark">&#10003;</span>{% endif %}</a>
+             data-tip="Channel group &quot;{{ g.name }}&quot;.&#10;{{ 'In the TV Guide: it renders one row, filled by whichever member is serving it, and this channel is one of them.' if g.in_guide else 'Not in the TV Guide - it renders no row. Recordings from it pick its best-scoring member and fail over.' }} Click to open it."><span class="mc-glyph">{{ icon('group') }}</span> {{ g.name }}{% if g.in_guide %} <span class="mc-mark">{{ icon('ok') }}</span>{% endif %}</a>
           {% endfor %}
           {% for job in health_checks %}
           <a href="{{ url_for('channels.health_check_detail', job_id=job.id) }}" class="mem-chip chk tip-plain"
-             data-tip="Health check &quot;{{ job.name }}&quot;.&#10;Tests this channel on a schedule to confirm it still plays. Never appears in the guide, never records. Click to open it."><span class="mc-glyph">&#10003;</span> {{ job.name }}</a>
+             data-tip="Health check &quot;{{ job.name }}&quot;.&#10;Tests this channel on a schedule to confirm it still plays. Never appears in the guide, never records. Click to open it."><span class="mc-glyph">{{ icon('health-check') }}</span> {{ job.name }}</a>
           {% endfor %}
           {% if channel.notes %}
-          <span class="note-indicator tip-plain" data-tip="This channel has a note.&#10;{{ channel.notes }}">&#128221;</span>
+          <span class="note-indicator tip-plain" data-tip="This channel has a note.&#10;{{ channel.notes }}">{{ icon('note') }}</span>
           {% endif %}
         </div>
       </div>
@@ -383,21 +361,21 @@
        a test starts, and drew the button clickable again mid-test (dev/changelog/1289). #}
     {% if testing_now %}
     <button class="btn btn-primary btn-sm tip-plain" data-act="test-now" disabled
-            data-tip="Testing now.&#10;A test of this channel is already running. This page updates itself when it finishes.">&#9654; Test now</button>
+            data-tip="Testing now.&#10;A test of this channel is already running. This page updates itself when it finishes.">{{ icon('test') }} Test now</button>
     {% else %}
     <button class="btn btn-primary btn-sm tip-plain" data-act="test-now"
-            data-tip="Test now.&#10;Runs a one-off &quot;does this play right now?&quot; check - a short capture and probe, distinct from a scheduled health check. Honors this account's connection limit.">&#9654; Test now</button>
+            data-tip="Test now.&#10;Runs a one-off &quot;does this play right now?&quot; check - a short capture and probe, distinct from a scheduled health check. Honors this account's connection limit.">{{ icon('test') }} Test now</button>
     {% endif %}
     <span class="menu-wrap">
-      <button class="btn btn-sm btn-icon" data-menu aria-label="More actions">&#8943;</button>
+      <button class="btn btn-sm btn-icon" data-menu aria-label="More actions">{{ icon('more') }}</button>
       {# Memberships are links in the title, so the kebab is actions only. #}
       <div class="menu" id="cd-kebab">
         {# Phone only: the sticky bar's sheet is built from this menu, and the bar itself has
            no room for a fourth button. On desktop Preview is the header button above. #}
         <button class="menu-item cd-phone-only" data-act="preview">Preview</button>
         <button class="menu-item" data-act="screenshot">Capture screenshot</button>
-        <button class="menu-item" data-act="add-group">&#9939; Add to channel group&hellip;</button>
-        <button class="menu-item" data-act="create-check">&#10003; Create health check for this channel</button>
+        <button class="menu-item" data-act="add-group">{{ icon('group') }} Add to channel group&hellip;</button>
+        <button class="menu-item" data-act="create-check">{{ icon('health-check') }} Create health check for this channel</button>
         <div class="sep"></div>
         <button class="menu-item" data-act="settings">Settings&hellip;</button>
         <button class="menu-item" data-act="sections">Customize sections&hellip;</button>
@@ -417,7 +395,7 @@
         {% endif %}
         {% if repoint_candidate %}
         <div class="sep"></div>
-        <button class="menu-item" data-act="repoint">&#8635; Re-point channel&hellip;</button>
+        <button class="menu-item" data-act="repoint">{{ icon('repoint') }} Re-point channel&hellip;</button>
         {% endif %}
         {# Offered only while the provider has stopped listing this channel. Deleting one
            the provider still serves would be undone by the next sync, which upserts on
@@ -425,7 +403,7 @@
            dev/changelog/772. The route re-derives the same condition. #}
         {% if lifecycle_state == 'missing' %}
         <div class="sep"></div>
-        <button class="menu-item danger" data-act="delete-channel">&#128465; Delete channel&hellip;</button>
+        <button class="menu-item danger" data-act="delete-channel">{{ icon('delete') }} Delete channel&hellip;</button>
         {% endif %}
       </div>
     </span>
@@ -476,7 +454,7 @@
     </form>
     {% endif %}
     {% for g in channel_kind_groups %}
-    <a class="btn btn-sm" href="{{ url_for('channel_groups.group_detail', group_id=g.id) }}">{{ g.name }} &rarr;</a>
+    <a class="btn btn-sm" href="{{ url_for('channel_groups.group_detail', group_id=g.id) }}">{{ g.name }} {{ icon('forward') }}</a>
     {% endfor %}
   </div>
   {% endif %}
@@ -496,17 +474,17 @@
      list different actions. #}
 <div class="cd-stickybar">
   {% if repoint_candidate %}
-  <button type="button" class="btn btn-primary cd-sb-grow" data-act="repoint">&#8635; Re-point</button>
-  <button type="button" class="btn" data-act="test-now"{% if testing_now %} disabled{% endif %}>&#9654; Test</button>
+  <button type="button" class="btn btn-primary cd-sb-grow" data-act="repoint">{{ icon('repoint') }} Re-point</button>
+  <button type="button" class="btn" data-act="test-now"{% if testing_now %} disabled{% endif %}>{{ icon('test') }} Test</button>
   {% else %}
-  <button type="button" class="btn btn-primary cd-sb-grow" data-act="test-now"{% if testing_now %} disabled{% endif %}>&#9654; Test now</button>
+  <button type="button" class="btn btn-primary cd-sb-grow" data-act="test-now"{% if testing_now %} disabled{% endif %}>{{ icon('test') }} Test now</button>
   <form method="POST" action="{{ url_for('channels.toggle_channel', channel_id=channel.id) }}" class="cd-sb-form">
     {{ csrf_field() }}
     <input type="hidden" name="next" value="{{ url_for('channels.channel_detail', channel_id=channel.id) }}">
     <button type="submit" class="btn">{{ 'Remove' if channel.in_guide else '+ Guide' }}</button>
   </form>
   {% endif %}
-  <button type="button" class="btn btn-icon" data-act="actions-sheet" aria-label="More actions">&#8943;</button>
+  <button type="button" class="btn btn-icon" data-act="actions-sheet" aria-label="More actions">{{ icon('more') }}</button>
 </div>
 
 {# ── Recovery available (DESIGN-sync-resilience.md §6) ────────────────────
@@ -514,7 +492,7 @@
      conditional alert chrome, so it is not part of the reorderable set. #}
 {% if repoint_candidate %}
 <div class="recovery-card">
-  <div class="rc-head">&#8635; Recovery available</div>
+  <div class="rc-head">{{ icon('repoint') }} Recovery available</div>
   <div class="rc-body">
     This channel is missing from {{ channel.account.name }}'s synced feed, but the same stream is
     available as
@@ -524,7 +502,7 @@
     channel.
   </div>
   <div class="rc-actions">
-    <button type="button" class="btn btn-primary btn-sm" data-act="repoint">&#8635; Re-point to "{{ repoint_candidate.name }}"</button>
+    <button type="button" class="btn btn-primary btn-sm" data-act="repoint">{{ icon('repoint') }} Re-point to "{{ repoint_candidate.name }}"</button>
   </div>
 </div>
 {% endif %}
@@ -549,7 +527,7 @@
            has no score, and an action that can only refuse is not an action. #}
         {% if health_rollback.available %}
         <span class="menu-wrap">
-          <button class="btn btn-sm btn-icon" data-menu aria-label="Health score actions">&#8943;</button>
+          <button class="btn btn-sm btn-icon" data-menu aria-label="Health score actions">{{ icon('more') }}</button>
           <div class="menu">
             <button class="menu-item" data-act="health-step-back">Step back one observation ({{ health_rollback.available }} available)</button>
             <button class="menu-item danger" data-act="health-reset">Reset health score&hellip;</button>
@@ -647,7 +625,7 @@
           </div>
           {% elif latest_test.screenshot_path and latest_test.screenshot_pruned %}
           <div class="shot-frame screenshot-placeholder pruned"
-               title="Screenshot was pruned by the retention policy. Change how many screenshots are kept per test in Settings &rarr; Channel Health Checks.">
+               title="Screenshot was pruned by the retention policy. Change how many screenshots are kept per test in Settings &gt; Channel Health Checks.">
             Screenshot pruned
           </div>
           {% elif latest_test.screenshot_path %}
@@ -786,7 +764,7 @@
         <a href="{{ chan_epg_search_url }}"
            class="btn btn-sm tip-plain cd-epg-btn" aria-label="Search all EPG data for this channel"
            data-tip="Search all EPG data.&#10;The filter box only narrows what is already on this row. This searches every program on this channel, including ones outside the guide window.">{{ icon('search', 'cd-epg-icon') }}<span
-            class="cd-epg-label">Search all programs &rarr;</span></a>
+            class="cd-epg-label">Search all programs {{ icon('forward') }}</span></a>
       </div>
     </div>
     <div class="card-body">
@@ -800,9 +778,9 @@
          is load-bearing, not decorative: the --ctl-h control-height token is scoped to that
          container in style.css, and without it the Tags and Layout buttons render shorter
          than the timenav beside them. `guide-toolbar` carries the cluster/search-affordance
-         rules in guide.css; `cd-guide-toolbar` un-sticks it, because this bar belongs to a
+         rules in guide.css; `guide-card-toolbar` un-sticks it, because this bar belongs to a
          card and not to the page. #}
-      <div class="toolbar guide-toolbar cd-guide-toolbar" id="guide-toolbar">
+      <div class="toolbar guide-toolbar guide-card-toolbar" id="guide-toolbar">
         <div class="guide-cluster guide-cluster-when">
           <span class="guide-cluster-label">When</span>
           {# One segmented control, chevrons pointing outward from the readout. Each button
@@ -833,16 +811,16 @@
             <input type="text" id="guide-search" class="search guide-search-input"
                    placeholder="Filter visible&hellip;" autocomplete="off">
             <button type="button" class="guide-search-save" id="guide-search-save"
-                    title="Save this search" aria-label="Save this search">&#9734;</button>
+                    title="Save this search" aria-label="Save this search">{{ icon('save-search') }}</button>
             <button type="button" class="guide-search-clear" id="guide-search-clear"
-                    title="Clear filter" aria-label="Clear filter">&times;</button>
+                    title="Clear filter" aria-label="Clear filter">{{ icon('close') }}</button>
             <div class="saved-search-dropdown" id="guide-search-dropdown" style="display:none"></div>
           </div>
           {% if tags %}
           <div class="tag-filter-wrap" id="tag-filter-wrap">
             <button type="button" class="btn btn-sm tip-plain" id="tag-filter-toggle"
                     data-tip="Tag filter&#10;Include or exclude programs by tag.&#10;Exclude always beats include - a program carrying an excluded tag is hidden no matter what.">
-              <span id="tag-filter-summary">Tags</span> <span class="nav-caret">&#9662;</span>
+              <span id="tag-filter-summary">Tags</span> {{ icon('dropdown') }}
             </button>
             <div class="tag-filter-panel" id="tag-filter-panel" style="display:none">
               <div class="tag-filter-section">
@@ -886,7 +864,7 @@
           <div class="guide-pop-wrap" id="guide-layout-wrap">
             <button type="button" class="btn btn-sm tip-plain" id="btn-layout"
                     aria-label="Layout"
-                    data-tip="Layout&#10;Choose what this row shows: which fields appear in each program cell, and how the timeline behaves. The row resizes to fit whatever you enable.">&#9881;<span class="guide-btn-label"> Layout &#9662;</span></button>
+                    data-tip="Layout&#10;Choose what this row shows: which fields appear in each program cell, and how the timeline behaves. The row resizes to fit whatever you enable.">{{ icon('layout') }}<span class="guide-btn-label"> Layout</span> {{ icon('dropdown') }}</button>
             <div class="guide-pop" id="guide-layout-pop" hidden>
               <h4>Grid behavior</h4>
               <label class="tip-plain"
@@ -920,7 +898,7 @@
          its own card. Nested inside the scroller its `position: sticky` does the horizontal
          work on its own, which is why guide.css keeps those rules (see its comment above
          .guide-day-header). #}
-      <div class="guide-outer channel-whats-on">
+      <div class="guide-outer guide-card-grid">
         <div class="guide-body" id="guide-wrap">
           {# Hidden - keeps guide.js's per-channel-row bookkeeping (search/filter, health
              classes) working without showing a redundant channel sidebar; this page already
@@ -982,7 +960,7 @@
     <div class="card-head"><h2>Guide source</h2>
       {% if gs.comparable and not gs.hidden %}<div class="card-head-actions">
         <a href="{{ url_for('channels.channel_guide_compare', channel_id=channel.id) }}" class="btn btn-sm"
-           data-tip="This channel's listings beside each other guide's, lined up by start time.">Compare sources &rarr;</a>
+           data-tip="This channel's listings beside each other guide's, lined up by start time.">Compare sources {{ icon('forward') }}</a>
       </div>{% endif %}
     </div>
     <div class="card-body">
@@ -1021,7 +999,7 @@
               <div class="text-faint small">{{ 'provider id' if r.key_origin == 'provider' else ('your key' if r.key_origin == 'manual' else 'accepted name match') }}</div>
               {% else %}<span class="text-faint">none - cannot be matched</span>{% endif %}
               {% if r.key_pending %}<div class="small text-warning">{{ gs_pending[r.key_pending] }}
-                {% if r.key_pending != 'not-in-file' and r.key_pending != 'no-key' %}<a href="{{ url_for('accounts.account_detail', account_id=r.owner_id) }}">{{ r.owner_name }} &rarr;</a>{% endif %}</div>{% endif %}
+                {% if r.key_pending != 'not-in-file' and r.key_pending != 'no-key' %}<a href="{{ url_for('accounts.account_detail', account_id=r.owner_id) }}">{{ r.owner_name }} {{ icon('forward') }}</a>{% endif %}</div>{% endif %}
               {% if r.subscribed %}<div class="gs-key-actions">
                 <button type="button" class="btn btn-sm" data-act="epg-key-set" data-source-id="{{ r.id }}" data-source-name="{{ r.name }}" data-key="{{ r.user_key or '' }}">Set key</button>
                 {% if r.user_key %}<button type="button" class="btn btn-sm" data-act="epg-key-clear" data-source-id="{{ r.id }}" data-source-name="{{ r.name }}">Clear key</button>{% endif %}
@@ -1058,11 +1036,11 @@
         {% if timeline_pagination and timeline_pagination.pages > 1 %}
         <div class="test-history-pagination">
           {% if timeline_pagination.has_prev %}
-          <a href="{{ url_for('channels.channel_detail', channel_id=channel.id, timeline_per_page=timeline_per_page, timeline_page=timeline_pagination.prev_num) }}" class="btn btn-sm">&larr; Prev</a>
+          <a href="{{ url_for('channels.channel_detail', channel_id=channel.id, timeline_per_page=timeline_per_page, timeline_page=timeline_pagination.prev_num) }}" class="btn btn-sm">{{ icon('back') }} Prev</a>
           {% endif %}
           <span class="text-muted small">Page {{ timeline_pagination.page }} of {{ timeline_pagination.pages }}</span>
           {% if timeline_pagination.has_next %}
-          <a href="{{ url_for('channels.channel_detail', channel_id=channel.id, timeline_per_page=timeline_per_page, timeline_page=timeline_pagination.next_num) }}" class="btn btn-sm">Next &rarr;</a>
+          <a href="{{ url_for('channels.channel_detail', channel_id=channel.id, timeline_per_page=timeline_per_page, timeline_page=timeline_pagination.next_num) }}" class="btn btn-sm">Next {{ icon('forward') }}</a>
           {% endif %}
         </div>
         {% endif %}
@@ -1105,7 +1083,7 @@
       {% if duplicate_channels %}
       <div class="dup-block">
         <div class="dup-head">
-          <strong>&#9888; Duplicate stream</strong><br>
+          <strong>{{ icon('warning') }} Duplicate stream</strong><br>
           {% if duplicate_key.kind == 'provider' %}
           The same stream as {{ duplicate_channels | length }} other channel{{ 's' if duplicate_channels | length != 1 else '' }}: id {{ duplicate_key.stream_id }} on {{ duplicate_key.provider }}.
           {% else %}
@@ -1183,11 +1161,11 @@
         {% if test_pagination and test_pagination.pages > 1 %}
         <div class="test-history-pagination">
           {% if test_pagination.has_prev %}
-          <a href="{{ url_for('channels.channel_detail', channel_id=channel.id, per_page=per_page, page=test_pagination.prev_num) }}" class="btn btn-sm">&larr; Prev</a>
+          <a href="{{ url_for('channels.channel_detail', channel_id=channel.id, per_page=per_page, page=test_pagination.prev_num) }}" class="btn btn-sm">{{ icon('back') }} Prev</a>
           {% endif %}
           <span class="text-muted small">Page {{ test_pagination.page }} of {{ test_pagination.pages }}</span>
           {% if test_pagination.has_next %}
-          <a href="{{ url_for('channels.channel_detail', channel_id=channel.id, per_page=per_page, page=test_pagination.next_num) }}" class="btn btn-sm">Next &rarr;</a>
+          <a href="{{ url_for('channels.channel_detail', channel_id=channel.id, per_page=per_page, page=test_pagination.next_num) }}" class="btn btn-sm">Next {{ icon('forward') }}</a>
           {% endif %}
         </div>
         {% endif %}
@@ -1267,7 +1245,7 @@
                 {% if t.screenshot_path %}
                   {% if t.screenshot_pruned %}
                   <div class="test-row-screenshot screenshot-placeholder pruned"
-                       title="Screenshot was pruned by the retention policy. Change how many screenshots are kept per test in Settings &rarr; Channel Health Checks.">
+                       title="Screenshot was pruned by the retention policy. Change how many screenshots are kept per test in Settings &gt; Channel Health Checks.">
                     Pruned
                   </div>
                   {% else %}
@@ -1292,7 +1270,7 @@
                    refuses it too (routes/channels.py::_deletable_test_or_error). #}
                 {% if t.id != in_progress_test_id %}
                 <span class="menu-wrap">
-                  <button class="btn btn-sm btn-icon" data-menu aria-label="Actions for this health check">&#8943;</button>
+                  <button class="btn btn-sm btn-icon" data-menu aria-label="Actions for this health check">{{ icon('more') }}</button>
                   <div class="menu pop-left">
                     <button class="menu-item danger" data-act="delete-test" data-test-id="{{ t.id }}">Delete test&hellip;</button>
                   </div>
@@ -1340,7 +1318,7 @@ const GUIDE_CONFIG = {
   layoutMobilePrefKey: {{ whatson_layout_mobile_pref_key | tojson }},
   // This card is one known channel with no channel column, no sort and nothing to include
   // or hide, so guide.js must not offer any of those in the mobile Layout sheet.
-  singleChannel: true,
+  embed: 'channel',
   // The program chooser's Other airings: this program's title, searched in program titles
   // (routes/channels.py::airing_search_url, the one speller of the search's parameters).
   programAiringsUrl: {{ program_airings_url | tojson }},

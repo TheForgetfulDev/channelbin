@@ -94,7 +94,7 @@
 }
 </style>
 
-<a class="back" href="{{ url_for('settings.settings') }}">&larr; Settings</a>
+<a class="back" href="{{ url_for('settings.settings') }}">{{ icon('back') }} Settings</a>
 <div class="page-head">
   <h1>Notifications <span class="sub" id="notif-count"></span></h1>
   <div class="card-head-actions">
@@ -135,7 +135,7 @@
     <div class="rt-filter">
       <div class="search-wrap" id="rt-search-wrap">
         <input type="search" id="rt-search" class="search" placeholder="Filter alert types" autocomplete="off">
-        <button class="search-clear" id="rt-search-clear" type="button" aria-label="Clear the filter">&times;</button>
+        <button class="search-clear" id="rt-search-clear" type="button" aria-label="Clear the filter">{{ icon('close') }}</button>
       </div>
       <div class="chips" id="rt-sev-chips"></div>
       <button class="chip" id="rt-push-chip" type="button" data-tip="Only alert types with at least one push service selected">Pushes somewhere</button>
