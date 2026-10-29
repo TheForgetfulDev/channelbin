@@ -163,6 +163,67 @@ def folded_variants(source_id: int, case_sensitive: bool,
     return out
 
 
+class KeyRead(NamedTuple):
+    source_id: int | None   # the channel's active source, Channel.epg_source_id
+    key: str | None         # channel_key() into that source
+    file_id: str | None     # the id of its file the import reads for the key, or None
+
+
+def keys_read(channels, case_sensitive: bool) -> dict[int, KeyRead]:
+    """{channel id: KeyRead} - which schedule each channel's guide listings are: its active
+    source, its key into it (the accepted user key, else the provider's id, §7.1), and the
+    file id that key reads (file_id_for()). Two channels hold the same listings exactly
+    when their (source_id, file_id) are equal, because the import maps every channel
+    reading one file id onto the same programs. Keys differing only in case are NOT
+    enough: a file listing both spellings gives each its own schedule (dev/changelog/1139).
+
+    `file_id` is None when the directory lists no programs under any spelling of the key
+    (a source never refreshed, or an id the file does not carry). Two queries whatever the
+    channel count."""
+    channels = list(channels)
+    reads = keys_read_into([(ch, ch.epg_source_id) for ch in channels], case_sensitive)
+    return {ch.id: reads[(ch.id, ch.epg_source_id)] for ch in channels}
+
+
+def keys_read_into(pairs, case_sensitive: bool) -> dict[tuple[int, int | None], KeyRead]:
+    """{(channel id, source id): KeyRead} - keys_read() for a stated source per channel
+    rather than the channel's active one, so the listings a source holds for a channel as
+    an alternate (epg_alternate_entries) can be named by the schedule they are: the same
+    (source, file id) identity, whichever table the rows sit in. `pairs` is an iterable of
+    (Channel, source id or None); a channel may appear with several sources. Two queries
+    whatever the pair count; the directory is read in one IN list over every key wanted
+    (chunked when the list is long), so a guide-wide caller pays it once."""
+    pairs = list(pairs)
+    sids = {sid for _ch, sid in pairs if sid is not None}
+    user = accepted_keys(sids)
+    out: dict[tuple[int, int | None], KeyRead] = {}
+    wanted: dict[int, set] = {}
+    for ch, sid in pairs:
+        key = channel_key(ch.epg_channel_id, user.get((ch.id, sid))) if sid is not None \
+            else (ch.epg_channel_id or None)
+        out[(ch.id, sid)] = KeyRead(sid, key, None)
+        if sid is not None and key:
+            wanted.setdefault(sid, set()).add(key.lower())
+    if not wanted:
+        return out
+    variants: dict[tuple[int, str], dict[str, int]] = {}
+    lowered = sorted(set().union(*wanted.values()))
+    for piece in chunked(lowered, 500):
+        for source_id, xml_id, n in (
+                db.session.query(EpgSourceChannel.source_id, EpgSourceChannel.xml_id,
+                                 EpgSourceChannel.entry_count)
+                .filter(EpgSourceChannel.source_id.in_(list(wanted)),
+                        EpgSourceChannel.entry_count > 0,
+                        func.lower(EpgSourceChannel.xml_id).in_(piece))):
+            if xml_id.lower() in wanted[source_id]:
+                variants.setdefault((source_id, norm_key(xml_id, case_sensitive)), {})[xml_id] = n
+    for unit, kr in out.items():
+        if kr.source_id is not None and kr.key:
+            fid = file_id_for(kr.key, variants.get((kr.source_id, norm_key(kr.key, case_sensitive)), {}))
+            out[unit] = kr._replace(file_id=fid)
+    return out
+
+
 def default_source_name(account_name: str, kind: str) -> str:
     if kind == EPG_SOURCE_PROVIDER:
         return f'{account_name} provider guide'
@@ -2172,6 +2233,69 @@ def compare_listings(active, other) -> Comparison:
         description_gaps=gaps, largest_move=max(moves, key=abs) if moves else None,
         doubled_active=sum(1 for r in rows if r.kind == ROW_DOUBLED_ACTIVE),
         doubled_other=sum(1 for r in rows if r.kind == ROW_DOUBLED_OTHER))
+
+
+# How one listing stands against a reference schedule, for a display that draws both
+# (the group page's What's On card, dev/changelog/1324). Derived from the comparator's
+# ROW_* kinds, never decided a second way.
+AGREE_SAME = 'same'
+AGREE_MOVED = 'moved'
+AGREE_DIFFERENT = 'different'
+AGREE_ONLY_HERE = 'only-here'       # nothing in the reference starts within five minutes
+AGREE_DOUBLED = 'doubled'           # a second listing at a moment already listed
+AGREE_OUTSIDE = 'outside'           # past the stretch both list, so not judged
+AGREE_PAST = 'past'                 # over before now; the comparison starts from now
+AGREE_REFERENCE = 'reference'       # a listing of the reference itself
+AGREEMENTS = (AGREE_SAME, AGREE_MOVED, AGREE_DIFFERENT, AGREE_ONLY_HERE, AGREE_DOUBLED,
+              AGREE_OUTSIDE, AGREE_PAST, AGREE_REFERENCE)
+#: The side of a same-program pair that has the only description.
+GAP_REFERENCE = 'reference'
+GAP_OTHER = 'other'
+
+
+class Agreement(NamedTuple):
+    kind: str
+    partner: Listing | None   # the reference's listing it was paired with (same/moved/different)
+    gap: str | None           # GAP_* on a same pair described on one side only
+
+
+def listing_agreement(reference, other, now):
+    """(Comparison, [Agreement] parallel to `other`, [reference Listing other lacks]) -
+    `other` judged listing by listing against `reference`, both from now on, by
+    compare_listings(). The lacking ones are the reference's counted listings with no
+    partner that overlap nothing `other` lists, so a display can outline them without
+    drawing one over a real listing. Pure."""
+    ref_live = [x for x in reference if x.stop > now]
+    oth_live = [x for x in other if x.stop > now]
+    cmp = compare_listings(ref_live, oth_live)
+    by_other = {id(r.other): r for r in cmp.rows if r.other is not None}
+    out = []
+    for x in other:
+        if x.stop <= now:
+            out.append(Agreement(AGREE_PAST, None, None))
+            continue
+        r = by_other[id(x)]
+        if r.kind == ROW_DOUBLED_OTHER:
+            out.append(Agreement(AGREE_DOUBLED, None, None))
+        elif not r.counted:
+            out.append(Agreement(AGREE_OUTSIDE, None, None))
+        elif r.kind == ROW_SAME:
+            gap = None
+            if r.active.described != r.other.described:
+                gap = GAP_REFERENCE if r.active.described else GAP_OTHER
+            out.append(Agreement(AGREE_SAME, r.active, gap))
+        elif r.kind == ROW_MOVED:
+            out.append(Agreement(AGREE_MOVED, r.active, None))
+        elif r.kind == ROW_DIFFERENT:
+            out.append(Agreement(AGREE_DIFFERENT, r.active, None))
+        elif r.kind == ROW_ONLY_OTHER:
+            out.append(Agreement(AGREE_ONLY_HERE, None, None))
+        else:
+            raise ValueError(f'comparator row kind {r.kind!r} on the other side')
+    lacking = [r.active for r in cmp.rows
+               if r.kind == ROW_ONLY_ACTIVE and r.counted
+               and not any(y.start < r.active.stop and r.active.start < y.stop for y in other)]
+    return cmp, out, lacking
 
 
 class SourceComparison(NamedTuple):

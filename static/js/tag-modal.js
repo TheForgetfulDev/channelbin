@@ -86,7 +86,7 @@ function tagPatternRowHtml(value) {
   return '<div class="pattern-row">' +
     `<input type="text" class="tag-pattern" value="${escHtml(value || '')}" placeholder="e.g. ᴸᶦᵛᵉ">` +
     '<button type="button" class="btn btn-sm tag-pattern-remove" aria-label="Remove pattern" ' +
-    'title="Remove">&#x2715;</button>' +
+    `title="Remove">${icon('close')}</button>` +
     '</div>';
 }
 

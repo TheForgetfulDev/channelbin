@@ -1321,6 +1321,69 @@ def fill_listings(chain, entries_by_channel):
     return placed
 
 
+class Schedule(collections.namedtuple(
+        'Schedule', 'source_id file_id channels spellings split')):
+    """One distinct EPG schedule among a set of channels (dev/changelog/1324).
+
+    source_id   the channels' active source, or None for channels that have none
+    file_id     the id of that source's file they read (epg_sources.keys_read()), or their
+                key as spelled when the directory names no file id for it
+    channels    the Channels on it, in the order they were given
+    spellings   their keys as they spell them, the most common first
+    split       True when channels reading this one id hold different listings, so this is
+                one part of them. The import maps every channel reading a file id onto the
+                same programs, so this should never happen; it is checked, not assumed."""
+
+
+def member_schedules(channels, reads, entries_by_channel, case_sensitive):
+    """The distinct schedules `channels` carry: one per (active source, file id read),
+    `reads` being epg_sources.keys_read() over them. A channel with no key carries no
+    schedule and is left out - unknown is not mismatched.
+
+    Keyed on the id READ, never on the key folded for case: a file listing `FoxSports2.us`
+    and `foxsports2.us` gives each its own schedule, and prod has exactly that
+    (dev/changelog/1139, 1324). Pure: `entries_by_channel` is the caller's one windowed
+    query, and it is what the identical-listings check compares."""
+    def listing_sig(ch):
+        return tuple((e.title, e.sub_title, e.description, e.start_time, e.stop_time)
+                     for e in entries_by_channel.get(ch.id, ()))
+
+    return collapse_schedules(channels, lambda ch: reads.get(ch.id), listing_sig,
+                              case_sensitive)
+
+
+def collapse_schedules(units, read_of, sig_of, case_sensitive):
+    """The collapse member_schedules() is built on, over any units: one Schedule per
+    (active source, file id read) among `units`, `read_of(unit)` being its KeyRead (None or
+    keyless units carry no schedule and are left out) and `sig_of(unit)` a value equal for
+    two units exactly when their listings are - the tuple of rows for the card, a hash of
+    them for the guide-wide similarity scan, which collapses (channel, source) pairs so an
+    alternate source's rows and an active one's land on the same schedule. Units reading
+    one id whose signatures differ become parts of their own, marked `split`. Pure."""
+    from .epg_sources import norm_key
+    buckets: dict = {}
+    for unit in units:
+        r = read_of(unit)
+        if r is None or not r.key:
+            continue
+        ident = r.file_id if r.file_id is not None else norm_key(r.key, case_sensitive)
+        buckets.setdefault((r.source_id, ident), []).append(unit)
+
+    out = []
+    for (source_id, _ident), members in buckets.items():
+        parts: dict = {}
+        for unit in members:
+            parts.setdefault(sig_of(unit), []).append(unit)
+        split = len(parts) > 1
+        for part in sorted(parts.values(), key=len, reverse=True):
+            counts = collections.Counter(read_of(unit).key for unit in part)
+            spellings = sorted(counts, key=lambda k: (-counts[k], k))
+            file_id = read_of(part[0]).file_id
+            out.append(Schedule(source_id, file_id if file_id is not None else spellings[0],
+                                part, spellings, split))
+    return out
+
+
 def guide_scope_channel_ids():
     """Subquery of the channel ids whose listings can reach the TV Guide: every in-guide
     channel, plus every member of an in-guide group.
@@ -1381,17 +1444,21 @@ def guide_scope_group_member_ids():
     return _guide_scope_group_members_q().scalar_subquery()
 
 
-def member_eager_options():
+def member_eager_options(with_accounts=False):
     """Eager-load options for a query that will rank a whole set of groups' members.
 
     Both helpers below walk every group and read `g.memberships` and each membership's
     `.channel`, and both relationships are lazy - so without these the walk is two queries
     per group and the Groups page's cost scales with how many groups exist
     (tests/test_scaling_pages.py is what caught it). selectinload makes it two constant
-    statements however many groups there are."""
+    statements however many groups there are. `with_accounts` adds each channel's account,
+    for a caller that names or reads it per member."""
     from sqlalchemy.orm import selectinload
-    from .database import ChannelGroup, ChannelGroupMember
-    return (selectinload(ChannelGroup.memberships).selectinload(ChannelGroupMember.channel),)
+    from .database import Channel, ChannelGroup, ChannelGroupMember
+    chain = selectinload(ChannelGroup.memberships).selectinload(ChannelGroupMember.channel)
+    if with_accounts:
+        chain = chain.selectinload(Channel.account)
+    return (chain,)
 
 
 # Who a group would record from right now, as one value. `member` is the channel a

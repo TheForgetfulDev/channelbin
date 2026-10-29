@@ -52,33 +52,9 @@
   {# One nav definition rendered twice (sidebar + mobile menu) - classes only,
      no ids, so the two copies can't collide. #}
 
-  {# One glyph per destination, shared by both shells by construction: a glyph
-     that differed between the sidebar and the drawer would be a defect (DESIGN.md
-     2 / 9.7). The dict lives inside the macro so it cannot be shadowed by a
-     page-level {% set %}; keys are read with [] because dot-notation would
-     collide with dict methods on any key named items/values/get. #}
-  {% macro nav_icon(key) -%}
-    {%- set icons = {
-      'recordings': '<circle cx="9" cy="9" r="6.6"/><circle cx="9" cy="9" r="2.6" fill="currentColor" stroke="none"/>',
-      'rules': '<path d="M3.4 7.4A5.8 5.8 0 0 1 13.6 5.4"/><path d="M15.4 3.2v3.4H12"/><path d="M14.6 10.6A5.8 5.8 0 0 1 4.4 12.6"/><path d="M2.6 14.8v-3.4H6"/><circle cx="9" cy="9" r="2.2" fill="currentColor" stroke="none"/>',
-      'guide': '<rect x="2" y="3.5" width="14" height="11" rx="1.5"/><path d="M2 7.5h14M7 7.5v7M11.5 7.5v7"/>',
-      'live': '<circle cx="9" cy="9" r="1.9" fill="currentColor" stroke="none"/><path d="M5.8 5.8a4.6 4.6 0 0 0 0 6.4M12.2 12.2a4.6 4.6 0 0 0 0-6.4"/><path d="M3.4 3.4a8 8 0 0 0 0 11.2M14.6 14.6a8 8 0 0 0 0-11.2"/>',
-      'browse': '<rect x="2" y="5.5" width="14" height="10" rx="1.5"/><path d="M6 2.5 9 5.5l3-3"/>',
-      'groups': '<path d="M9 2.2 16 6 9 9.8 2 6z"/><path d="M2.4 9.6 9 13.2l6.6-3.6"/>',
-      'accounts': '<circle cx="9" cy="6.2" r="3.1"/><path d="M3.3 15.6c0-3.1 2.5-4.9 5.7-4.9s5.7 1.8 5.7 4.9"/>',
-      'recprofile': '<path d="M3 5.5h2.2M9.4 5.5h5.6"/><circle cx="7.3" cy="5.5" r="2"/><path d="M3 12.5h6.1M13.5 12.5h1.5"/><circle cx="11.5" cy="12.5" r="2"/>',
-      'hcprofile': '<rect x="2" y="3.5" width="14" height="11" rx="2"/><path d="M4.6 9h2.1l1.2-2.8L10 11.4l1.1-2.4h2.3"/>',
-      'tags': '<path d="M2.6 8.2V2.6h5.6l7 7-5.6 5.6z"/><circle cx="5.5" cy="5.5" r="1.1"/>',
-      'hiderules': '<path d="M1.8 9S4.6 4.4 9 4.4 16.2 9 16.2 9 13.4 13.6 9 13.6 1.8 9 1.8 9z"/><circle cx="9" cy="9" r="2.1"/><path d="M3.4 15.2 14.6 2.8"/>',
-      'jobs': '<path d="M15 9a6 6 0 1 1-1.9-4.4"/><path d="M15.4 2.6v3.4h-3.4"/>',
-      'alerts': '<path d="M4.6 12.2V8a4.4 4.4 0 0 1 8.8 0v4.2l1.4 1.9H3.2z"/><path d="M7.4 14.1a1.6 1.6 0 0 0 3.2 0"/>',
-      'logs': '<path d="M4 2.4h6.4L14 6v9.6H4z"/><path d="M10.2 2.6V6H14"/><path d="M6.4 9.4h5.2M6.4 12h3.6"/>',
-      'maint': '<path d="M11.6 2.6a3.9 3.9 0 0 0-4.4 5.2L2.6 12.4l2 2 4.6-4.6a3.9 3.9 0 0 0 5.2-4.4l-2.3 2.3-2-.6-.6-2z"/>',
-      'settings': '<circle cx="9" cy="9" r="2.6"/><path d="M9 1.4v2.2M9 14.4v2.2M16.6 9h-2.2M3.6 9H1.4M14.4 3.6l-1.6 1.6M5.2 12.8l-1.6 1.6M14.4 14.4l-1.6-1.6M5.2 5.2 3.6 3.6"/>',
-      'logout': '<path d="M7.4 2.6H3.6a1 1 0 0 0-1 1v10.8a1 1 0 0 0 1 1h3.8"/><path d="M12.2 5.6 15.4 9l-3.2 3.4M6.4 9h9"/>',
-    } -%}
-    <svg class="nav-i" viewBox="0 0 18 18" aria-hidden="true">{{ icons[key] | safe }}</svg>
-  {%- endmacro %}
+  {# One icon per destination, from the registry (app/icons.py), shared by both shells by
+     construction: an icon that differed between the sidebar and the drawer would be a
+     defect (DESIGN.md 2 / 9.7). #}
 
   {# Setup renders inline like every other section in both shells (DESIGN.md 2,
      amended 2026-07-29). The desktop flyout it used to hide behind is gone.
@@ -87,16 +63,19 @@
   {% macro nav_sections() %}
     {# Dashboard sits above every section heading, not inside one: it is the landing
        page, so it is the one destination that is not a category of anything. #}
-    <a class="nav-link{% if request.endpoint == 'dashboard.dashboard' %} active{% endif %}" href="{{ url_for('dashboard.dashboard') }}">{{ nav_icon('live') }}<span class="nav-t">Dashboard</span> <span class="nav-count nav-count-live"{% if not nav_live_count %} style="display:none"{% endif %}>{{ nav_live_count }}</span><span class="nav-pip pip-live"{% if not nav_live_count %} style="display:none"{% endif %}></span></a>
+    <a class="nav-link{% if request.endpoint == 'dashboard.dashboard' %} active{% endif %}" href="{{ url_for('dashboard.dashboard') }}">{{ icon('nav-dashboard', 'nav-i') }}<span class="nav-t">Dashboard</span> <span class="nav-count nav-count-live"{% if not nav_live_count %} style="display:none"{% endif %}>{{ nav_live_count }}</span><span class="nav-pip pip-live"{% if not nav_live_count %} style="display:none"{% endif %}></span></a>
     <div class="nav-section"><span class="nav-t">Library</span></div>
-    <a class="nav-link{% if request.endpoint == 'recordings.index' %} active{% endif %}" href="{{ url_for('recordings.index') }}">{{ nav_icon('recordings') }}<span class="nav-t">Recordings</span> <span class="nav-count nav-count-recordings" data-tip="Every recording on this install, in any state: scheduled, recording, finished or failed.">{{ nav_recordings_total }}</span><span class="nav-pip"></span></a>
+    <a class="nav-link{% if request.endpoint == 'recordings.index' %} active{% endif %}" href="{{ url_for('recordings.index') }}">{{ icon('recordings', 'nav-i') }}<span class="nav-t">Recordings</span> <span class="nav-count nav-count-recordings" data-tip="Every recording on this install, in any state: scheduled, recording, finished or failed.">{{ nav_recordings_total }}</span><span class="nav-pip"></span></a>
     {# Auto-record rules (DESIGN-autoschedule.md §8), beside the recordings they make. #}
-    <a class="nav-link{% if request.endpoint and request.endpoint.startswith('auto_rules.') %} active{% endif %}" href="{{ url_for('auto_rules.rules_page') }}">{{ nav_icon('rules') }}<span class="nav-t">Auto-record</span></a>
-    <a class="nav-link{% if request.endpoint == 'guide.guide' %} active{% endif %}" href="{{ url_for('guide.guide') }}">{{ nav_icon('guide') }}<span class="nav-t">TV Guide</span></a>
-    <a class="nav-link{% if request.endpoint in ('channels.channel_browser', 'channels.channel_detail') %} active{% endif %}" href="{{ url_for('channels.channel_browser') }}">{{ nav_icon('browse') }}<span class="nav-t">Channel Search</span></a>
+    <a class="nav-link{% if request.endpoint and request.endpoint.startswith('auto_rules.') %} active{% endif %}" href="{{ url_for('auto_rules.rules_page') }}">{{ icon('nav-auto-record', 'nav-i') }}<span class="nav-t">Auto-record</span></a>
+    <a class="nav-link{% if request.endpoint == 'guide.guide' %} active{% endif %}" href="{{ url_for('guide.guide') }}">{{ icon('nav-guide', 'nav-i') }}<span class="nav-t">TV Guide</span></a>
+    {# EPG Manager (dev/changelog/1325): the tools that work across every account's guide,
+       beside the guide they describe. #}
+    <a class="nav-link{% if request.endpoint and request.endpoint.startswith('epg_manager.') %} active{% endif %}" href="{{ url_for('epg_manager.epg_manager') }}">{{ icon('nav-epg-manager', 'nav-i') }}<span class="nav-t">EPG Manager</span></a>
+    <a class="nav-link{% if request.endpoint in ('channels.channel_browser', 'channels.channel_detail') %} active{% endif %}" href="{{ url_for('channels.channel_browser') }}">{{ icon('nav-channel-search', 'nav-i') }}<span class="nav-t">Channel Search</span></a>
     {# No separate Health Checks link (DESIGN.md §14.1) - health checks live on the
        Channel Groups tab now, alongside channel groups. #}
-    <a class="nav-link{% if request.endpoint in ('channel_groups.groups_page', 'channel_groups.group_detail', 'channels.channels_health_checks', 'channels.channels_health_checks_guide', 'channels.health_check_detail') %} active{% endif %}" href="{{ url_for('channel_groups.groups_page') }}">{{ nav_icon('groups') }}<span class="nav-t">Channel Groups</span></a>
+    <a class="nav-link{% if request.endpoint in ('channel_groups.groups_page', 'channel_groups.group_detail', 'channels.channels_health_checks', 'channels.channels_health_checks_guide', 'channels.health_check_detail') %} active{% endif %}" href="{{ url_for('channel_groups.groups_page') }}">{{ icon('group', 'nav-i') }}<span class="nav-t">Channel Groups</span></a>
     <div class="nav-section"><span class="nav-t">Setup</span></div>
     {# First under Setup and louder than its neighbors while any of the four setup steps is
        undone, and not drawn once they are (DESIGN.md 16.7). The count is setup_steps'
@@ -104,19 +83,19 @@
        starts hidden and the first poll shows it. Maintenance's icon, because an unapproved
        page has not earned one of its own and Readiness is what it hands off to. #}
     {%- set gs_left = nav_setup.left if nav_setup else 0 %}
-    <a class="nav-link nav-gs{% if request.endpoint == 'setup.get_started' %} active{% endif %}" href="{{ url_for('setup.get_started') }}"{% if not gs_left %} style="display:none"{% endif %}>{{ nav_icon('maint') }}<span class="nav-t">Get started</span> <span class="nav-count nav-count-setup">{{ gs_left }} left</span></a>
-    <a class="nav-link{% if request.endpoint and request.endpoint.startswith('accounts.') %} active{% endif %}" href="{{ url_for('accounts.accounts_list') }}">{{ nav_icon('accounts') }}<span class="nav-t">Accounts</span></a>
-    <a class="nav-link{% if request.endpoint and request.endpoint.startswith('profiles.') %} active{% endif %}" href="{{ url_for('profiles.profiles_list') }}">{{ nav_icon('recprofile') }}<span class="nav-t">Recording Profiles</span></a>
-    <a class="nav-link{% if request.endpoint and request.endpoint.startswith('health_check_profiles.') %} active{% endif %}" href="{{ url_for('health_check_profiles.health_check_profiles_list') }}">{{ nav_icon('hcprofile') }}<span class="nav-t">Health Check Profiles</span></a>
-    <a class="nav-link{% if request.endpoint and request.endpoint.startswith('tags.') %} active{% endif %}" href="{{ url_for('tags.tags_list') }}">{{ nav_icon('tags') }}<span class="nav-t">Tags</span></a>
+    <a class="nav-link nav-gs{% if request.endpoint == 'setup.get_started' %} active{% endif %}" href="{{ url_for('setup.get_started') }}"{% if not gs_left %} style="display:none"{% endif %}>{{ icon('nav-get-started', 'nav-i') }}<span class="nav-t">Get started</span> <span class="nav-count nav-count-setup">{{ gs_left }} left</span></a>
+    <a class="nav-link{% if request.endpoint and request.endpoint.startswith('accounts.') %} active{% endif %}" href="{{ url_for('accounts.accounts_list') }}">{{ icon('nav-accounts', 'nav-i') }}<span class="nav-t">Accounts</span></a>
+    <a class="nav-link{% if request.endpoint and request.endpoint.startswith('profiles.') %} active{% endif %}" href="{{ url_for('profiles.profiles_list') }}">{{ icon('nav-rec-profiles', 'nav-i') }}<span class="nav-t">Recording Profiles</span></a>
+    <a class="nav-link{% if request.endpoint and request.endpoint.startswith('health_check_profiles.') %} active{% endif %}" href="{{ url_for('health_check_profiles.health_check_profiles_list') }}">{{ icon('nav-hc-profiles', 'nav-i') }}<span class="nav-t">Health Check Profiles</span></a>
+    <a class="nav-link{% if request.endpoint and request.endpoint.startswith('tags.') %} active{% endif %}" href="{{ url_for('tags.tags_list') }}">{{ icon('nav-tags', 'nav-i') }}<span class="nav-t">Tags</span></a>
     {# Setup, not Channels: hide rules configure what the provider's feed offers you, in the
        same way an account or a tag does. The Channels hub's tabs are on their way out, so a
        tab there would be a destination with no menu entry (dev/changelog/782). #}
-    <a class="nav-link{% if request.endpoint == 'channel_hide_rules.hide_rules_page' %} active{% endif %}" href="{{ url_for('channel_hide_rules.hide_rules_page') }}">{{ nav_icon('hiderules') }}<span class="nav-t">Hide Rules</span></a>
+    <a class="nav-link{% if request.endpoint == 'channel_hide_rules.hide_rules_page' %} active{% endif %}" href="{{ url_for('channel_hide_rules.hide_rules_page') }}">{{ icon('nav-hide-rules', 'nav-i') }}<span class="nav-t">Hide Rules</span></a>
     <div class="nav-section"><span class="nav-t">System</span></div>
-    <a class="nav-link{% if request.endpoint and request.endpoint.startswith('jobs.') %} active{% endif %}" href="{{ url_for('jobs.jobs_page') }}">{{ nav_icon('jobs') }}<span class="nav-t">Jobs</span></a>
-    <a class="nav-link{% if request.endpoint and request.endpoint.startswith('alerts.') %} active{% endif %}" href="{{ url_for('alerts.alert_center') }}">{{ nav_icon('alerts') }}<span class="nav-t">Alerts</span> <span class="nav-count nav-count-bad" data-unit="error" style="display:none"></span><span class="nav-count nav-count-warn" data-unit="warning" style="display:none"></span><span class="nav-pip pip-alert" style="display:none"></span></a>
-    <a class="nav-link{% if request.endpoint and request.endpoint.startswith('logs.') %} active{% endif %}" href="{{ url_for('logs.logs_page') }}">{{ nav_icon('logs') }}<span class="nav-t">Logs</span></a>
+    <a class="nav-link{% if request.endpoint and request.endpoint.startswith('jobs.') %} active{% endif %}" href="{{ url_for('jobs.jobs_page') }}">{{ icon('nav-jobs', 'nav-i') }}<span class="nav-t">Jobs</span></a>
+    <a class="nav-link{% if request.endpoint and request.endpoint.startswith('alerts.') %} active{% endif %}" href="{{ url_for('alerts.alert_center') }}">{{ icon('nav-alerts', 'nav-i') }}<span class="nav-t">Alerts</span> <span class="nav-count nav-count-bad" data-unit="error" style="display:none"></span><span class="nav-count nav-count-warn" data-unit="warning" style="display:none"></span><span class="nav-pip pip-alert" style="display:none"></span></a>
+    <a class="nav-link{% if request.endpoint and request.endpoint.startswith('logs.') %} active{% endif %}" href="{{ url_for('logs.logs_page') }}">{{ icon('nav-logs', 'nav-i') }}<span class="nav-t">Logs</span></a>
     {# Second to last, between Logs and Settings (DESIGN.md 16.1). Matched on the
        endpoint rather than the blueprint: system_bp also owns the /api/system/*
        endpoints, which render no nav. #}
@@ -125,12 +104,12 @@
        are queried app-wide by static/js/nav-alerts.js, which would write the alert numbers
        into this badge (dev/changelog/950). Rendered hidden and filled in by the
        /api/nav-status poll, so the first paint is the nothing-active state. #}
-    <a class="nav-link{% if request.endpoint == 'system.maintenance' %} active{% endif %}" href="{{ url_for('system.maintenance') }}">{{ nav_icon('maint') }}<span class="nav-t">Maintenance</span> <span class="nav-count nav-count-ready-bad" data-unit="blocked thing" style="display:none"></span><span class="nav-count nav-count-ready-warn" data-unit="degraded thing" style="display:none"></span><span class="nav-pip pip-ready" style="display:none"></span></a>
-    <a class="nav-link{% if request.endpoint and request.endpoint.startswith('settings.') %} active{% endif %}" href="{{ url_for('settings.settings') }}">{{ nav_icon('settings') }}<span class="nav-t">Settings</span></a>
+    <a class="nav-link{% if request.endpoint == 'system.maintenance' %} active{% endif %}" href="{{ url_for('system.maintenance') }}">{{ icon('nav-maintenance', 'nav-i') }}<span class="nav-t">Maintenance</span> <span class="nav-count nav-count-ready-bad" data-unit="blocked thing" style="display:none"></span><span class="nav-count nav-count-ready-warn" data-unit="degraded thing" style="display:none"></span><span class="nav-pip pip-ready" style="display:none"></span></a>
+    <a class="nav-link{% if request.endpoint and request.endpoint.startswith('settings.') %} active{% endif %}" href="{{ url_for('settings.settings') }}">{{ icon('nav-settings', 'nav-i') }}<span class="nav-t">Settings</span></a>
     {% if auth_enabled %}
     <form method="post" action="{{ url_for('auth.logout') }}" class="nav-logout-form">
       <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-      <button type="submit" class="nav-link nav-logout-btn">{{ nav_icon('logout') }}<span class="nav-t">Log out</span></button>
+      <button type="submit" class="nav-link nav-logout-btn">{{ icon('logout', 'nav-i') }}<span class="nav-t">Log out</span></button>
     </form>
     {% endif %}
   {% endmacro %}
@@ -154,10 +133,10 @@
      All three are BUTTONS, never links (dev/changelog/949). A chip's job is to open
      its tooltip, and the tooltip's rows are the links - a chip that navigated on tap
      meant a phone could never read it, because the tap that would reveal it left the
-     page instead. The tip carries its own `Dashboard →` / `Jobs →` footer for the
+     page instead. The tip carries its own `Dashboard` / `Jobs` jump-off footer for the
      destination the chip itself used to be. #}
   {% macro activity_chips() %}
-    <button class="actchip chip-stats" type="button" aria-label="System stats"><svg class="chip-i" viewBox="0 0 16 16" aria-hidden="true"><path d="M3 13V7.4M8 13V3.2M13 13V9.6"/></svg></button>
+    <button class="actchip chip-stats" type="button" aria-label="System stats">{{ icon('stats', 'chip-i') }}</button>
     <button class="actchip chip-rec" type="button" aria-label="Recording activity" style="display:none"><span class="pulse"></span><span class="chip-n">0</span></button>
     <button class="actchip chip-job" type="button" aria-label="Background activity" style="display:none"><span class="pulse"></span><span class="chip-n">0</span></button>
   {% endmacro %}
@@ -165,7 +144,7 @@
   {# Hamburger first in the DOM, not floated left, so reading order matches paint
      order and tab order stays sane (DESIGN.md 9.2, amended 2026-07-29). #}
   <nav class="topnav">
-    <button class="topnav-toggle" id="topnav-toggle" aria-label="Menu" aria-expanded="false">&#9776;</button>
+    <button class="topnav-toggle" id="topnav-toggle" aria-label="Menu" aria-expanded="false">{{ icon('menu') }}</button>
     <a class="brand" href="{{ url_for('dashboard.dashboard') }}"><img src="{{ url_for('static', filename='img/logo/channelbin-logo.png') }}" alt="" width="26" height="26"><span class="nav-t">ChannelBin</span></a>
     <div class="spacer"></div>
     <div class="nav-indicators">{{ activity_chips() }}</div>
@@ -187,7 +166,7 @@
         <hr class="brand-rule">
         <button class="navcollapse" type="button"
                 aria-label="{% if nav_collapsed %}Expand the main menu{% else %}Collapse the main menu{% endif %}"
-                data-tip="{% if nav_collapsed %}Show the main menu again{% else %}Shrink the main menu to icons and give the page the extra width{% endif %}"><svg class="ncx" viewBox="0 0 18 18" aria-hidden="true">{% if nav_collapsed %}<path d="M7 4l5 5-5 5"/><path d="M15 4v10"/>{% else %}<path d="M11 4 6 9l5 5"/><path d="M3 4v10"/>{% endif %}</svg></button>
+                data-tip="{% if nav_collapsed %}Show the main menu again{% else %}Shrink the main menu to icons and give the page the extra width{% endif %}">{{ icon('menu-expand' if nav_collapsed else 'menu-collapse', 'ncx') }}</button>
       </div>
       {{ nav_sections() }}
       {{ sys_mini() }}
@@ -213,14 +192,14 @@
         <span class="alert-banner-time" id="alert-banner-time"></span>
         <a href="{{ url_for('alerts.alert_center') }}" class="alert-banner-link" id="alert-banner-more" style="display:none"></a>
         <button type="button" class="alert-banner-dismiss" id="alert-banner-read" aria-label="Mark read"
-                data-tip="Mark read.&#10;Takes it off the banner and out of the count. It stays on the Alerts page.">&times;</button>
+                data-tip="Mark read.&#10;Takes it off the banner and out of the count. It stays on the Alerts page.">{{ icon('close') }}</button>
       </div>
       {% endif %}
       {# The static (server-rendered) banner and the JS poller's banner are two
          renderings of ONE message - set once here so a future edit can't drift
          them apart; the JS side clones #restart-banner-msg's innerHTML instead
          of carrying its own copy of the sentence. #}
-      {% set restart_banner_msg %}&#9888; Restart required - some changes won't take effect until the service is restarted.
+      {% set restart_banner_msg %}{{ icon('warning') }} Restart required - some changes won't take effect until the service is restarted.
         Restart it from the <a href="{{ url_for('system.maintenance') }}">Maintenance</a> page.{% endset %}
       <template id="restart-banner-msg">{{ restart_banner_msg | safe }}</template>
       {% if restart_needed %}
@@ -356,7 +335,7 @@
         menu.classList.toggle('open', open);
         if (scrim) scrim.classList.toggle('open', open);
         toggle.setAttribute('aria-expanded', open ? 'true' : 'false');
-        toggle.innerHTML = open ? '&#x2715;' : '&#9776;';
+        toggle.innerHTML = open ? icon('close') : icon('menu');
         // Single mutator for the drawer and its scrim, so one sync answers for every close
         // path: scrim click, nav-link click, the toggle, and the >960px resize close.
         syncScrollLock();
@@ -484,7 +463,7 @@
     // Where the chip itself used to go. It is a button now, so the tip is the only
     // route to the page that lists this kind of work.
     function tipMore(href, label) {
-      return '<a class="tt-more" href="' + escHtml(href) + '">' + escHtml(label) + ' &rarr;</a>';
+      return '<a class="tt-more" href="' + escHtml(href) + '">' + escHtml(label) + ' ' + icon('forward') + '</a>';
     }
     var MORE_REC = {{ url_for('dashboard.dashboard') | tojson }};
     var MORE_JOB = {{ url_for('jobs.jobs_page') | tojson }};
@@ -492,7 +471,7 @@
     function buildRecTooltip(data) {
       var lines = [];
       if (data.state === 'active') {
-        lines.push('<strong>&#x25CF; Recording</strong>');
+        lines.push('<strong>' + icon('active') + ' Recording</strong>');
         // state_label names what each row is actually doing - a stream that died and is
         // backing off toward a reconnect reads as "Waiting to retry", not as a capture.
         data.active.forEach(function(r) {
@@ -501,7 +480,7 @@
                              ' &mdash; ' + fmtSecs(r.seconds_remaining)));
         });
       } else if (data.state === 'dim') {
-        lines.push('<strong>&#x25CB; No active recording</strong>');
+        lines.push('<strong>' + icon('inactive') + ' No active recording</strong>');
         if (data.next_scheduled) {
           var ns = data.next_scheduled;
           lines.push(tipItem(ns.href, 'Next: ' + ns.name,
@@ -518,12 +497,12 @@
     function buildBgTooltip(data) {
       var lines = [];
       if (data.state === 'active') {
-        lines.push('<strong>&#x25CF; Background activity</strong>');
+        lines.push('<strong>' + icon('active') + ' Background activity</strong>');
         data.tasks.forEach(function(t) {
           lines.push(tipItem(t.href, t.label, t.detail ? escHtml(t.detail) : ''));
         });
       } else if (data.state === 'dim') {
-        lines.push('<strong>&#x25CB; Background jobs scheduled</strong>');
+        lines.push('<strong>' + icon('inactive') + ' Background jobs scheduled</strong>');
         if (data.next_scheduled) {
           var ns = data.next_scheduled;
           lines.push(tipItem(ns.href, 'Next: ' + ns.label,

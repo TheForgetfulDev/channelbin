@@ -100,7 +100,7 @@ class DashboardPageConformanceTests(unittest.TestCase):
                    for m in re.findall(r'<a class="btn btn-sm" href="[^"]*">(.*?)</a>', head, re.S)]
         self.assertTrue(actions)
         for label in actions:
-            self.assertRegex(label, r'^\s*\S.*<span class="arw">\s*(&#8594;|→)\s*</span>\s*$',
+            self.assertRegex(label, r'^\s*\S.*<span class="arw">\s*<svg class="icon" data-icon="forward".*?</svg>\s*</span>\s*$',
                              f'the jump-off arrow is not its own element: {label!r}')
 
     def test_each_section_action_names_its_own_destination(self):

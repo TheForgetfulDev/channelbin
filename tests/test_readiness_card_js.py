@@ -83,10 +83,10 @@ class ReadinessCardTests(unittest.TestCase):
         self.assertIn('Nothing is set up for this yet', self.r['capWhy'])
 
     def test_the_summary_row_links_to_where_it_is_set_up(self):
-        self.assertEqual(self.r['capAction'], 'Channel Groups →')
+        self.assertEqual(self.r['capAction'], 'Channel Groups')
 
     def test_the_opened_row_says_how_to_set_it_up(self):
-        self.assertEqual(self.r['rowAction'], 'Channel Groups →')
+        self.assertEqual(self.r['rowAction'], 'Channel Groups')
         self.assertIn('How to set it up', self.r['rowDetail'])
         self.assertIn('reconnects to its own channel', self.r['rowDetail'])
 

@@ -167,7 +167,7 @@ class DetailsTests(_Base):
     def test_two_buttons_with_the_destination_primary(self):
         m = self.obs['details']['modal']
         self.assertEqual(m['buttons'], [{'label': 'Mark read', 'cls': 'btn'},
-                                        {'label': 'Account →', 'cls': 'btn btn-primary'}])
+                                        {'label': 'Account', 'cls': 'btn btn-primary'}])
 
     def test_ignore_sits_behind_the_footer_more_menu(self):
         m = self.obs['details']['modal']

@@ -36,7 +36,7 @@
 {% block content %}
 <div class="page-head">
   <h1>Name matches <span class="sub">{{ source.name }}</span></h1>
-  <a href="{{ url_for('accounts.account_detail', account_id=owner.id) }}" class="btn">&larr; {{ owner.name }}</a>
+  <a href="{{ url_for('accounts.account_detail', account_id=owner.id) }}" class="btn">{{ icon('back') }} {{ owner.name }}</a>
 </div>
 <p class="page-sub">
   Channels whose name matches exactly one channel in this source's file. Nothing changes until
@@ -82,7 +82,7 @@
   {% endif %}
   {% if can_refresh %}
   <button class="btn btn-sm" data-act="refresh"
-          data-tip="Fetch this source's file now. Accepted matches get their listings from it at its next refresh.">&#8635; Refresh now</button>
+          data-tip="Fetch this source's file now. Accepted matches get their listings from it at its next refresh.">{{ icon('refresh') }} Refresh now</button>
   {% endif %}
 </div>
 
@@ -138,9 +138,9 @@
 </div>
 {% if pages > 1 %}
 <div class="test-history-pagination nm-pager">
-  {% if page > 1 %}<a href="{{ qs(view, page - 1) }}" class="btn btn-sm">&larr; Prev</a>{% endif %}
+  {% if page > 1 %}<a href="{{ qs(view, page - 1) }}" class="btn btn-sm">{{ icon('back') }} Prev</a>{% endif %}
   <span class="text-faint small">Page {{ page }} of {{ pages }} ({{ '{:,}'.format(total) }})</span>
-  {% if page < pages %}<a href="{{ qs(view, page + 1) }}" class="btn btn-sm">Next &rarr;</a>{% endif %}
+  {% if page < pages %}<a href="{{ qs(view, page + 1) }}" class="btn btn-sm">Next {{ icon('forward') }}</a>{% endif %}
 </div>
 {% endif %}
 {% endif %}

@@ -8,6 +8,9 @@
    directly below it, so all three read this one value - a density change cannot leave
    the time header's sticky offset behind the row it is meant to clear. */
 :root { --guide-dayh: 28px; }
+/* The time header's height, read by the schedules card's corner cell too, which has to end
+   exactly where the two headers do. */
+:root { --guide-timeh: 36px; }
 
 /* ── Toolbar (DESIGN.md 12.2) ───────────────────────────────────────────────── */
 /* The .toolbar class on the bar itself is what makes every control 36px: --ctl-h is scoped
@@ -29,6 +32,21 @@
   /* Full-bleed backdrop so grid rows scrolling under the sticky bar are covered even
      though .main has horizontal padding. */
   box-shadow: 0 0 0 12px var(--bg1);
+}
+
+/* The same bar inside a card (channel detail's and the group page's What's On): it scrolls
+   with its card, since a bar that detaches from its own card and floats over the rest of
+   the page is the mobile divergence round 6 of the channel page called out
+   (dev/changelog/347). The full-bleed backdrop goes with it - nothing scrolls under it.
+   .toolbar's own 16px top margin is sized for a bar under a page heading; inside a card
+   body it doubles up with the body's padding. Promoted from channels/detail.html's
+   .cd-guide-toolbar when the group page's card became its second user (dev/changelog/1324). */
+.guide-toolbar.guide-card-toolbar {
+  position: static;
+  box-shadow: none;
+  margin: 4px 0 0.6rem;
+  padding-bottom: 0.6rem;
+  border-bottom: 1px solid var(--border-soft);
 }
 
 .guide-cluster {
@@ -605,7 +623,7 @@
   color: var(--accent-text);
 }
 
-/* Sits between the sort field label and the button's own .nav-caret, so it needs air on
+/* Sits between the sort field label and the button's own dropdown caret, so it needs air on
    both sides or the two chevrons read as one doubled glyph. */
 .guide-sort-arrow { font-size: 11px; color: var(--accent-text); margin-left: 2px; }
 
@@ -618,6 +636,14 @@
   border-top: 0;
   border-radius: 0 0 var(--radius) var(--radius);
   overflow: hidden;
+}
+
+/* .guide-body is drawn as the BOTTOM half of a box whose top half is the sticky .guide-head.
+   A card has no .guide-head (its header track stays inside the scroller), so it closes its
+   own box. Promoted from channels/detail.html with the toolbar rule above. */
+.guide-card-grid .guide-body {
+  border-top: 1px solid var(--border);
+  border-radius: var(--radius);
 }
 
 
@@ -894,7 +920,7 @@
 .guide-day-segment.narrow .guide-day-segment-label { font-size: 11px; padding: 0 0.4rem; }
 
 .guide-time-header {
-  height: 36px;
+  height: var(--guide-timeh);
   display: flex;
   background: var(--bg3);
   border-bottom: 1px solid var(--border);
@@ -1355,18 +1381,14 @@
   }
   /* The readout is the day picker's only trigger at this width, so it carries the app's
      standard "this opens something" caret (mockup 20). */
-  .timenav-readout-day::after {
-    content: ' \25BE';
-    font-size: 9px;
-    color: var(--text-faint);
-  }
+  .timenav-readout-caret { display: inline-block; font-size: 9px; color: var(--text-faint); }
   .timenav-readout-time { font-size: 11px; }
 
-  /* Row 2 holds the filter, Tags, Length and the ⚙ together. `flex-basis` must be 0, not
+  /* Row 2 holds the filter, Tags, Length and the Layout button together. `flex-basis` must be 0, not
      auto: with `auto` the cluster claims its content's intrinsic width - a text input plus
      several buttons - which fills the line and pushes the Layout cluster onto a row of its
      own. That is what `width: 100%` did before it, and what 13.3 says must not happen.
-     Basis 0 makes it absorb whatever is left after the ⚙ instead of demanding it first.
+     Basis 0 makes it absorb whatever is left after the Layout button instead of demanding it first.
      `flex-wrap: wrap` lets the buttons spill onto their own line under the search box if
      Tags and Length are both present and don't fit beside it, rather than overflowing. */
   .guide-cluster-find {
@@ -1377,7 +1399,7 @@
     flex-wrap: wrap;
   }
   .guide-toolbar .guide-search-wrap { max-width: none; flex: 1 1 auto; min-width: 0; }
-  /* Layout's ⚙ joins the Find row rather than claiming a third one (13.3). */
+  /* The Layout button joins the Find row rather than claiming a third one (13.3). */
   .guide-cluster-layout { margin-left: 0; flex: 0 0 auto; }
   .guide-cluster-layout .guide-pop-wrap { display: flex; }
 
@@ -1657,3 +1679,151 @@
 }
 .chooser-air.is-on { color: var(--live); }
 .chooser-note { font-size: var(--fs-xs); color: var(--text-faint); line-height: 1.4; margin: 0 0 10px; }
+
+/* ── The schedules embed: the group page's What's On card (dev/changelog/1324) ──
+   guide.js's `schedules` mode, drawn by static/js/guide-schedules.js. Everything else the
+   card shows is an existing component: the guide's toolbar, .timenav, Layout popover, grid,
+   cells, headers, now line and status bar (this file), .chip/.chips, .badge + .b-*, .card,
+   .page-intro and .card-note (style.css). What is here is only what is new: the schedule cell
+   in the channel column, the agreement tints on a program cell, the description marks, the
+   outlines and the "no listings" band. Ported from mockup 46's .gwo- rules and audited
+   against style.css and this file - the card's toolbar and grid box are the shared
+   .guide-card-toolbar / .guide-card-grid above, not copies. */
+
+.sched-intro { margin-bottom: 4px; }
+.sched-summary { font-size: var(--fs-sm); color: var(--text-muted); margin: 0 0 6px; line-height: 1.5; }
+.sched-summary strong { color: var(--text); font-weight: 600; }
+
+.sched-chips .chip { white-space: nowrap; }
+/* The card has no Find cluster, which is what pushes the guide's Layout to the right. */
+.sched-cluster-layout { margin-left: auto; }
+.sched-layout-btn { display: inline-flex; align-items: center; gap: 4px; }
+.sched-short { display: none; }
+
+/* The corner ends exactly where the two header tracks do, so the column's cells line up
+   with the program rows beside them. */
+.sched-corner {
+  height: calc(var(--guide-dayh) + var(--guide-timeh));
+  display: flex;
+  align-items: flex-end;
+  padding: 0 0.6rem 6px;
+  border-bottom: 1px solid var(--border);
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+
+/* Full width, so a badge's max-width: 100% is the column's width and not its own. */
+.sched-cell { width: 100%; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.sched-cell-top { width: 100%; display: flex; align-items: center; gap: 6px; min-width: 0; }
+/* A verdict that does not fit is cut with an ellipsis, never spilled into the timeline. */
+.sched-cell-top .badge {
+  display: inline-block; min-width: 0; max-width: 100%; flex: 0 1 auto;
+  font-size: var(--fs-2xs); padding: 1px 7px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+/* The bare count beside the verdict is the phone's; desktop says it under the id. */
+.sched-count { display: none; font-size: 11px; color: var(--text-muted); white-space: nowrap; flex: 0 0 auto; }
+/* max-width: the phone column aligns its lines to the start, which sizes each to its content
+   - without a cap a long id runs past the 120px column instead of taking its ellipsis. */
+.sched-id {
+  font-family: var(--font-mono); font-size: 11px; color: var(--text);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%;
+}
+.sched-meta { font-size: 10px; color: var(--text-faint); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.sched-fold {
+  font-size: 10px; color: var(--ok-text); background: var(--ok-soft);
+  border-radius: 999px; padding: 0 6px; white-space: nowrap; flex: 0 0 auto;
+}
+.sched-guide-lbl { font-size: 11px; font-weight: 600; color: var(--accent-text); white-space: nowrap; }
+
+/* The group's own row keeps the tint the guide gives a group row. */
+.sched-grid .guide-row.sched-guide-row { background: rgba(var(--accent-rgb), .04); }
+
+/* Agreement tints on a program cell: a soft fill and a matching border. */
+.sched-k-moved { --sched-tint: var(--warn); --sched-tint-soft: var(--warn-soft); }
+.sched-k-different { --sched-tint: var(--bad); --sched-tint-soft: var(--bad-soft); }
+.sched-k-only-here { --sched-tint: var(--accent); --sched-tint-soft: var(--accent-soft); }
+.sched-k-doubled { --sched-tint: var(--band-fair); --sched-tint-soft: var(--band-fair-soft); }
+.sched-grid .guide-program.sched-tinted { background: var(--sched-tint-soft); border-color: var(--sched-tint); }
+
+/* A second listing at a moment already listed: the pair split the row, top and bottom. */
+.sched-grid .guide-program.sched-k-doubled {
+  top: calc(var(--guide-rowh) / 2);
+  height: calc(var(--guide-rowh) / 2 - 4px);
+  z-index: 3;
+}
+.sched-grid .guide-program.sched-pair-top { height: calc(var(--guide-rowh) / 2 - 4px); }
+.sched-grid .guide-program.sched-k-doubled > :not(.guide-program-title),
+.sched-grid .guide-program.sched-pair-top > :not(.guide-program-title):not(.sched-gapmark) { display: none; }
+
+/* Not judged (already over, or past what both schedules list): drawn, but quieter. */
+.sched-k-past, .sched-k-outside { opacity: .55; }
+
+/* A program the guide has and this schedule does not: its outline only. */
+.sched-grid .guide-program.sched-ghost {
+  background: transparent;
+  border: 1px dashed var(--text-faint);
+}
+.sched-grid .guide-program.sched-ghost .guide-program-title { color: var(--text-faint); font-style: italic; }
+
+/* The same program, with a description on one side only - always the guide versus this
+   row. A ring: the guide's has one, this one does not. A dot: this one has one, the
+   guide's does not. Two shapes, so the side reads without color. */
+.sched-gapmark {
+  position: absolute; top: 5px; right: 5px; width: 7px; height: 7px; border-radius: 50%;
+}
+.sched-gapmark.sched-gap-reference { border: 1.5px solid var(--text-muted); background: transparent; }
+.sched-gapmark.sched-gap-other { background: var(--text-muted); }
+
+/* Where a schedule has nothing: after its last listing, or the whole row. */
+.sched-band {
+  position: absolute; top: 3px; height: calc(var(--guide-rowh) - 7px);
+  display: flex; align-items: center; padding: 0 0.6rem;
+  border-radius: var(--radius-sm);
+  background: repeating-linear-gradient(135deg, var(--bg2) 0 6px, var(--bg1) 6px 12px);
+  border: 1px dashed var(--border);
+  color: var(--text-faint); font-size: 11px; white-space: nowrap; overflow: hidden;
+}
+.sched-band span { position: sticky; left: 8px; }
+
+/* Legend swatches in the status bar. */
+.sched-sw { position: relative; width: 14px; height: 10px; border-radius: 3px; flex: 0 0 auto; border: 1px solid var(--border); background: var(--bg3); }
+.sched-sw.sched-tinted { background: var(--sched-tint-soft); border-color: var(--sched-tint); }
+.sched-sw.sched-ghost { background: transparent; border: 1px dashed var(--text-faint); }
+.sched-sw.sched-k-outside { opacity: .55; }
+.sched-sw.sched-sw-gap::after {
+  content: ''; position: absolute; top: 1px; right: 1px; width: 6px; height: 6px; border-radius: 50%;
+}
+.sched-sw.sched-sw-gap.sched-gap-reference::after { border: 1.5px solid var(--text-muted); }
+.sched-sw.sched-sw-gap.sched-gap-other::after { background: var(--text-muted); }
+
+/* The schedule's details sheet. */
+.sched-detail-verdict { margin: 0 0 10px; }
+.sched-detail-verdict .badge { margin-right: 6px; }
+.sched-detail-members { list-style: none; padding: 0; margin: 6px 0 0; }
+.sched-detail-members li { display: flex; align-items: center; gap: 8px; padding: 5px 0; border-bottom: 1px solid var(--border-soft); }
+.sched-detail-members li:last-child { border-bottom: none; }
+.sched-detail-members .sched-mname { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sched-detail-h { font-size: var(--fs-2xs); font-weight: 700; letter-spacing: .08em; text-transform: uppercase; color: var(--text-muted); margin-top: 12px; }
+
+@media (max-width: 960px) {
+  /* Full words on desktop, short ones on a phone beside a visible label: the guide hides
+     its cluster labels here because its chips name themselves, and "All" or "Same" alone
+     would not. */
+  .sched-long { display: none; }
+  .sched-short { display: inline; }
+  .sched-toolbar .sched-cluster .guide-cluster-label { display: inline; }
+  .sched-toolbar .sched-cluster { flex-wrap: wrap; }
+  .sched-cluster-layout { margin-left: 0; }
+  .sched-count { display: inline; }
+  /* 120px, not the guide's 84px mini column: a schedule cell carries a verdict and an id,
+     not a logo (mockup 46, round 1). */
+  .guide-outer.sched-grid { --guide-chw: 120px; }
+  .sched-grid .guide-channel-row { align-items: stretch; padding: 4px 6px; }
+  .sched-cell { align-items: flex-start; }
+  .sched-cell-top { flex-wrap: wrap; gap: 3px; }
+  .sched-meta { display: none; }
+  .sched-corner { padding: 0 6px 6px; font-size: 9px; }
+}

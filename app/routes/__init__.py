@@ -21,6 +21,7 @@ from .ha import ha_bp
 from .preview import preview_bp
 from .auto_rules import auto_rules_bp
 from .setup import setup_bp
+from .epg_manager import epg_manager_bp
 
 
 def register_blueprints(app):
@@ -47,3 +48,4 @@ def register_blueprints(app):
     app.register_blueprint(auth_bp)
     app.register_blueprint(ha_bp)
     app.register_blueprint(setup_bp)
+    app.register_blueprint(epg_manager_bp)

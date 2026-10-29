@@ -205,7 +205,7 @@ body.on-logs .main {
     <p>Set <strong>logging.file</strong> in Settings to a writable path and restart. The
       application is still logging - without a file it writes to standard output, which is
       wherever this process's output goes (<code>docker logs</code> for a container).</p>
-    <a class="btn" href="{{ url_for('settings.settings') }}">Settings &rarr;</a>
+    <a class="btn" href="{{ url_for('settings.settings') }}">Settings {{ icon('forward') }}</a>
   </div>
   {% endif %}
 
@@ -215,7 +215,7 @@ body.on-logs .main {
     <button class="pickbar" id="logfilter-btn" type="button">
       <span class="pb-lbl">Filter</span>
       <span class="pb-cur" id="lf-cur"></span>
-      <span class="pb-caret">&#9662;</span>
+      <span class="pb-caret">{{ icon('dropdown') }}</span>
     </button>
   </div>
 
@@ -227,7 +227,7 @@ body.on-logs .main {
       <div class="log-chips lt-lv" id="lv-chips"></div>
       <div class="search-wrap" id="log-search-wrap">
         <input type="search" id="log-search" class="search" placeholder="Filter messages" autocomplete="off">
-        <button class="search-clear" id="log-search-clear" type="button" aria-label="Clear the filter">&times;</button>
+        <button class="search-clear" id="log-search-clear" type="button" aria-label="Clear the filter">{{ icon('close') }}</button>
       </div>
     </div>
   </div>
@@ -236,7 +236,7 @@ body.on-logs .main {
     <div class="log-box" id="log-box">
       <div class="log-empty" id="log-empty">Loading history...</div>
     </div>
-    <button class="btn btn-sm btn-tobottom" id="btn-bottom" type="button" hidden>&darr; Bottom</button>
+    <button class="btn btn-sm btn-tobottom" id="btn-bottom" type="button" hidden>{{ icon('bottom') }} Bottom</button>
   </div>
 
   <div class="log-foot">

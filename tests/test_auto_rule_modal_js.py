@@ -123,12 +123,12 @@ class AutoRuleModalTests(unittest.TestCase):
         self.assertTrue(toast['html'])
         self.assertEqual(toast['type'], 'success')
         self.assertIn('Rule saved. 2 scheduled, 1 repeat skipped.', toast['msg'])
-        self.assertIn('<a href="/rules">Rules &rarr;</a>', toast['msg'])
+        self.assertIn('<a href="/rules">Rules <svg class="icon" data-icon="forward"', toast['msg'])
 
     def test_the_toast_links_the_new_rules_page_when_the_answer_names_it(self):
         msg = self.obs['with_page']['toasts'][-1]['msg']
-        self.assertIn('<a href="/rules/4">Cup &lt;Series&gt; &rarr;</a>', msg)
-        self.assertNotIn('Rules &rarr;', msg)
+        self.assertIn('<a href="/rules/4">Cup &lt;Series&gt; <svg class="icon" data-icon="forward"', msg)
+        self.assertNotIn('>Rules <svg', msg)
 
     def test_a_refusal_stays_in_the_dialog_with_the_servers_sentence(self):
         run = self.obs['refused']

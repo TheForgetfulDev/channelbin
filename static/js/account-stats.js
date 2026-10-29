@@ -68,12 +68,12 @@
       const on = th.dataset.sort === sortKey;
       th.classList.toggle('sorted', on);
       th.setAttribute('aria-sort', on ? (sortDir < 0 ? 'descending' : 'ascending') : 'none');
-      th.querySelector('.arr').textContent = on ? (sortDir < 0 ? ' ▾' : ' ▴') : '';
+      th.querySelector('.arr').innerHTML = on ? ' ' + icon(sortDir < 0 ? 'sort-desc' : 'sort-asc') : '';
     });
     const label = document.querySelector('#acst-sort-chip .acst-sort-label');
     if (label) {
-      label.textContent = sortKey
-        ? `${LABELS[sortKey]} ${sortDir < 0 ? '▾' : '▴'}` : 'Account order';
+      label.innerHTML = sortKey
+        ? `${escHtml(LABELS[sortKey])} ${icon(sortDir < 0 ? 'sort-desc' : 'sort-asc')}` : 'Account order';
     }
   }
 

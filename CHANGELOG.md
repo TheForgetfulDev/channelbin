@@ -5,6 +5,28 @@ Notable changes to ChannelBin, newest first. This project follows
 release is tagged `v<version>` in git, and the version the app is running is shown in the
 page footer.
 
+## 0.34.0 - 2026-10-29
+
+Compare EPG schedules across your guide.
+
+**Added**
+
+- A channel group's page has a What's On card that lines up every EPG schedule the group's
+  channels carry under the group's TV Guide row, and tints each program by how it differs.
+  Show every channel or only the ones set to record, and every schedule, only the matching
+  ones, or only the ones that differ.
+- A new EPG Manager page scans every account's guide and finds the EPG ids that carry the
+  same schedule: identical in every way, the same programs with some details differing
+  (descriptions, subtitles, end times, or the New and Live title tags), or related. Each copy
+  shows its program count, how far ahead it lists, and its details, so you can pick the best
+  source and id for a channel. The scan runs in the background and can be started from the
+  page or from Maintenance.
+
+**Changed**
+
+- Every icon in the app, the sidebar included, now comes from one consistent icon set, so the
+  same action looks the same on every page.
+
 ## 0.33.0 - 2026-10-28
 
 More choices when you click a program.

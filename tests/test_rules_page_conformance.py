@@ -362,9 +362,9 @@ class NavTests(_Base):
     def test_it_has_its_own_glyph(self):
         html = self.get()
         sidebar = html.split('<aside class="sidebar">')[1].split('</aside>')[0]
-        icons = re.findall(r'<svg class="nav-i"[^>]*>(.*?)</svg>\s*<span class="nav-t">([^<]+)<',
+        icons = re.findall(r'<svg class="icon nav-i" data-icon="([^"]+)"[^>]*>.*?</svg>\s*<span class="nav-t">([^<]+)<',
                            sidebar, re.S)
-        by_label = {label: svg for svg, label in icons}
+        by_label = {label: name for name, label in icons}
         self.assertIn('Auto-record', by_label)
         others = [svg for label, svg in by_label.items() if label != 'Auto-record']
         self.assertNotIn(by_label['Auto-record'], others)

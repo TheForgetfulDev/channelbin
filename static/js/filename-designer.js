@@ -175,7 +175,7 @@ function warnText() {
   const unknown = (S.preview && S.preview.unknown) || [];
   if (!unknown.length) return '';
   const verb = unknown.length === 1 ? 'is not a variable' : 'are not variables';
-  return `⚠ ${unknown.join(', ')} ${verb} - it will appear literally in the filename.`;
+  return `${unknown.join(', ')} ${verb} - it will appear literally in the filename.`;
 }
 
 /* The subject line: three sources, and each says what it IS rather than just showing a
@@ -432,7 +432,7 @@ function pickerBodyHtml() {
       <div class="search-wrap${S.pkq ? ' has-text' : ''}" id="fd-pkwrap">
         <input type="text" class="search" id="fd-pksearch" autocomplete="off" value="${escHtml(S.pkq)}"
                placeholder="Search what is on by program or channel">
-        <button class="search-clear" id="fd-pkclear" type="button" aria-label="Clear the search">&times;</button>
+        <button class="search-clear" id="fd-pkclear" type="button" aria-label="Clear the search">${icon('close')}</button>
       </div>
       <span class="pk-count" id="fd-pkcount">${pickerCountText(rows)}</span>
     </div>
@@ -491,7 +491,7 @@ function designerFootHtml() {
 
 const FD_PICKER_FOOT = `<span class="modal-foot-note">The full search - facets, saved searches, the
     columns picker - lives on Channel Search. This is the same rows, cut down to picking one.</span>
-  <button class="btn" type="button" data-fd-back>&larr; Template</button>`;
+  <button class="btn" type="button" data-fd-back>${icon('back')} Template</button>`;
 
 function renderStep() {
   if (!fdModal) return;

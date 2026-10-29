@@ -123,7 +123,8 @@ function boot(start) {
     },
     sortedCol: () => {
       const h = $('.list-head .sortable.sorted');
-      return h ? `${h.dataset.sort}:${h.querySelector('.sort-ind').textContent.trim()}` : null;
+      const ic = h && h.querySelector('.sort-ind [data-icon]');
+      return h ? `${h.dataset.sort}:${ic ? ic.dataset.icon : ''}` : null;
     },
     chips: () => Array.from(document.querySelectorAll('#filter-chips .chip.active-filter'))
       .map((el) => el.textContent.trim()),

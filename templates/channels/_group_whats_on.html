@@ -1,0 +1,128 @@
+{#  The group page's What's On card (dev/changelog/1324, mockup 46). Every distinct EPG
+    schedule the group's channels carry, lined up under the group's own row - what the TV
+    Guide shows for it - and tinted where it differs. A display only: it never warns,
+    alerts or writes (dev/changelog/1155).
+
+    guide.js draws the grid in its `schedules` embed mode and static/js/guide-schedules.js
+    builds the rows, the channel column and the card's own controls, all from
+    /api/guide/epg?group_id=...&schedules=1. The ids below are guide.js's own: the grid,
+    the time navigation, the day picker and the Layout popover are the guide's, not copies.
+
+    The chips and the Layout button carry no `tip-plain`: that class sets
+    `border-bottom: none` after .chip and .btn in style.css, which takes their bottom
+    borders off (seen in mockup 46's round 3). #}
+{% from '_macros.html' import csrf_field %}
+<div class="card" data-section="whatson" id="sched-card">
+  <div class="card-head">
+    <h2>What's On</h2>
+    <div class="card-head-actions"><span class="text-muted small" id="sched-head-count"></span>
+      <a href="{{ url_for('epg_manager.epg_manager', group_id=group.id) }}" class="btn btn-sm tip-plain"
+         data-tip="EPG Manager&#10;The similarity scan's result for this group's schedules: which other ids across the whole guide carry the same programs, and how each copy compares.">EPG Manager {{ icon('forward') }}</a></div>
+  </div>
+  <div class="card-body">
+    <p class="page-intro sched-intro">Every EPG schedule this group's channels carry, lined up
+      under the one the TV Guide shows for the group. A program that is not the same as the
+      guide's is tinted by how it differs.</p>
+    <div class="sched-summary" id="sched-summary"></div>
+
+    <div class="toolbar guide-toolbar guide-card-toolbar sched-toolbar" id="guide-toolbar">
+      <div class="guide-cluster guide-cluster-when">
+        <span class="guide-cluster-label">When</span>
+        <div class="timenav" id="guide-timenav">
+          <button type="button" data-nav="-1440" class="tip-plain"
+                  data-tip="Back one day&#10;Scrolls the grid 24 hours earlier.">&laquo; 24h</button>
+          <button type="button" data-nav="-60" class="tip-plain"
+                  data-tip="Back one hour&#10;Scrolls the grid 60 minutes earlier.">&lsaquo; 1h</button>
+          <button type="button" class="timenav-readout tip-plain" id="guide-readout"
+                  data-tip="Visible window&#10;The day and time range currently on screen.&#10;Click to jump to a day.">
+            <span class="timenav-readout-day" id="guide-readout-day">Loading&hellip;</span>
+            <span class="timenav-readout-time" id="guide-readout-time"></span>
+          </button>
+          <button type="button" data-nav="60" class="tip-plain"
+                  data-tip="Forward one hour&#10;Scrolls the grid 60 minutes later.">1h &rsaquo;</button>
+          <button type="button" data-nav="1440" class="tip-plain"
+                  data-tip="Forward one day&#10;Scrolls the grid 24 hours later.">24h &raquo;</button>
+          <button type="button" class="timenav-now tip-plain" id="btn-now"
+                  data-tip="Jump to now&#10;Scrolls back to the current time, marked by the red line.">Now</button>
+        </div>
+        <div class="guide-pop guide-pop-left" id="guide-daypicker" hidden></div>
+      </div>
+
+      <div class="guide-cluster sched-cluster">
+        <span class="guide-cluster-label">Channels</span>
+        <div class="chips sched-chips" id="sched-chan">
+          <button type="button" class="chip active" data-chan="all"
+                  data-tip="All channels&#10;Every channel in the group, whether or not its Recording switch is on."><span class="sched-long">All</span><span class="sched-short">All</span></button>
+          <button type="button" class="chip" data-chan="rec"
+                  data-tip="Recording on&#10;Only channels whose Recording switch is on - the ones a recording from this group can use. The EPG banner counts these."><span class="sched-long">Recording on</span><span class="sched-short">Rec on</span></button>
+        </div>
+      </div>
+
+      <div class="guide-cluster sched-cluster">
+        <span class="guide-cluster-label">Show</span>
+        <div class="chips sched-chips" id="sched-show">
+          <button type="button" class="chip active" data-show="all"
+                  data-tip="Every schedule&#10;Every distinct schedule, under the guide's.">All</button>
+          <button type="button" class="chip" data-show="same"
+                  data-tip="Same as the guide&#10;Only schedules carrying the guide's programs: identical, or identical apart from descriptions.">Same</button>
+          <button type="button" class="chip" data-show="different"
+                  data-tip="Different from the guide&#10;Only schedules that are not the guide's programs: mostly the same, shifted, unrelated, or no listings at all.">Different</button>
+        </div>
+      </div>
+
+      {# The card's own Layout, shaped like the channel page's What's On popover (12.3) and
+         saved under its own keys, so it never reshapes the TV Guide. Every checkbox's
+         `checked` comes from the dict guide.js starts from. #}
+      <div class="guide-cluster guide-cluster-layout sched-cluster-layout">
+        <div class="guide-pop-wrap" id="guide-layout-wrap">
+          <button type="button" class="btn btn-sm sched-layout-btn" id="btn-layout" aria-label="Layout"
+                  data-tip="Layout&#10;Choose what this card shows: whether schedules the same as the guide get a row, and which fields appear in each program cell. Rows resize to fit.">{{ icon('layout') }}<span class="guide-btn-label"> Layout</span> {{ icon('dropdown') }}</button>
+          <div class="guide-pop" id="guide-layout-pop" hidden>
+            <h4>Rows</h4>
+            <label class="tip-plain"
+                   data-tip="Fold the same schedules&#10;Schedules carrying the guide's programs - identical, or identical apart from descriptions - get no row of their own. The guide row says how many it folded, and its tooltip names them.&#10;Choosing Show: Same shows them anyway.">
+              <input type="checkbox" data-layout="fold_same" {{ 'checked' if whatson.layout.fold_same }}> Fold schedules the same as the guide into its row</label>
+            <div class="guide-pop-hr"></div>
+            <h4>Program cell fields</h4>
+            <label class="is-fixed"><input type="checkbox" checked disabled> Title <span class="guide-pop-note">(always)</span></label>
+            <label><input type="checkbox" data-layout="subtitle" {{ 'checked' if whatson.layout.subtitle }}> Subtitle / episode</label>
+            <label class="tip-plain"
+                   data-tip="Description&#10;Up to two lines in each cell. Never on a phone, where a cell is too narrow - as in the TV Guide.">
+              <input type="checkbox" data-layout="description" {{ 'checked' if whatson.layout.description }}> Description</label>
+            <div class="guide-pop-hr"></div>
+            <h4>Time</h4>
+            <label><input type="checkbox" data-layout="start_time" {{ 'checked' if whatson.layout.start_time }}> Start time</label>
+            <label><input type="checkbox" data-layout="end_time" {{ 'checked' if whatson.layout.end_time }}> End time</label>
+            <label><input type="checkbox" data-layout="duration" {{ 'checked' if whatson.layout.duration }}> Duration</label>
+            <div class="guide-pop-hint">Saved for this card only: the TV Guide and the channel
+              page's What's On keep their own layouts. The grid sizes its rows to the tallest
+              cell, so nothing clips.</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    {# The header track stays INSIDE .guide-program-area, as on the channel page's card:
+       a card's header sticking to the viewport would detach it from its own card. #}
+    <div class="guide-outer guide-card-grid sched-grid">
+      <div class="guide-body" id="guide-wrap">
+        <div class="guide-channel-col" id="guide-channel-col"></div>
+        <div class="guide-program-area" id="guide-program-area">
+          <div class="guide-day-header" id="guide-day-header"></div>
+          <div class="guide-time-header" id="guide-time-header"></div>
+          <div class="guide-program-rows" id="guide-program-rows"></div>
+        </div>
+      </div>
+    </div>
+    {# A sibling of the grid: the guide row stays, the note says why nothing is under it. #}
+    <div class="guide-empty" id="sched-empty" hidden></div>
+
+    <div class="guide-statusbar">
+      <span id="sched-counts"></span>
+      <div class="guide-sb-legend" id="sched-legend"></div>
+    </div>
+    <p class="card-note" id="sched-noid" hidden></p>
+
+    {% with profiles=recording_profiles %}{% include "_record_modal.html" %}{% endwith %}
+  </div>
+</div>

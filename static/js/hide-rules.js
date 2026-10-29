@@ -91,8 +91,8 @@ function sortBy(rows, keyFn, dir) {
 }
 function sortTh(col, label, sortState, extraClass) {
   const active = sortState.col === col;
-  const dirClass = active && sortState.dir === 'desc' ? ' desc' : '';
-  return `<th class="sortable${extraClass ? ' ' + extraClass : ''}" data-sortcol="${col}">${escHtml(label)}<span class="sort-caret${active ? ' active' : ''}${dirClass}">▾</span></th>`;
+  const dir = active && sortState.dir === 'desc' ? 'sort-desc' : 'sort-asc';
+  return `<th class="sortable${extraClass ? ' ' + extraClass : ''}" data-sortcol="${col}">${escHtml(label)}${icon(dir, `sort-caret${active ? ' active' : ''}`)}</th>`;
 }
 function wireSortHeaders(root, sortState, onSort) {
   root.querySelectorAll('th.sortable').forEach(th => th.addEventListener('click', () => {
@@ -132,7 +132,7 @@ function ruleRowHtml(r) {
     <td data-label="Account"><span class="rule-scope-badge">${escHtml(accountLabel(r.account_id))}</span></td>
     <td data-label="Matches" class="num"><span class="rule-match-n" data-tip="${nf(r.match_count)} of ${nf(scopeTotal)} channels in scope">${nf(r.match_count)}</span>${deferredHtml}</td>
     <td data-label="On"><label class="switch" data-tip="${r.enabled ? 'On - this rule is being applied' : 'Off - kept for later, not applied right now'}"><input type="checkbox" ${r.enabled ? 'checked' : ''} data-act="toggle-rule" data-id="${r.id}"><span class="knob"></span></label></td>
-    <td style="text-align:right"><span class="menu-wrap"><button class="btn btn-sm btn-icon" data-menu aria-label="More actions for this rule">&#8943;</button><div class="menu pop-left">${menuItems}</div></span></td>
+    <td style="text-align:right"><span class="menu-wrap"><button class="btn btn-sm btn-icon" data-menu aria-label="More actions for this rule">${icon('more')}</button><div class="menu pop-left">${menuItems}</div></span></td>
   </tr>`;
 }
 
@@ -564,10 +564,10 @@ function categoryPickerGroupedHtml(rows) {
     const isOpen = picker.openGroups.has(prefix);
     return `<div class="cat-group${isOpen ? ' open' : ''}" id="${gid}">
       <div class="cat-group-head" data-toggle="${gid}" data-prefix="${escHtml(prefix)}">
-        <span class="cat-group-caret">&#9654;</span>
+        <span class="cat-group-caret">${icon('expand')}</span>
         <span class="cat-group-name">${escHtml(prefix.trim() || '(other)')}</span>
         <span class="cat-group-meta">${grows.length} categor${grows.length === 1 ? 'y' : 'ies'} &middot; ${nf(total)} channels</span>
-        <button class="btn btn-sm" data-hideall="${escHtml(prefix)}">Hide all &rarr;</button>
+        <button class="btn btn-sm" data-hideall="${escHtml(prefix)}">Hide all ${icon('forward')}</button>
       </div>
       <div class="cat-group-body">${categoryPickerTableHtml(grows)}</div>
     </div>`;

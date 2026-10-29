@@ -1,0 +1,184 @@
+{% extends "base.html" %}
+{% block title %}EPG Manager - ChannelBin{% endblock %}
+
+{#  EPG Manager (dev/changelog/1325): the tools that work across every account's guide.
+    The first is the similarity scan - which EPG ids carry the same schedule, grouped so a
+    person can see the copies side by side and pick a source and an id from evidence: the
+    listings each copy holds, how far ahead, how many carry descriptions and how much, the
+    subtitles, the providers' title marks (ᴺᵉʷ, ᴸᶦᵛᵉ). Read-only: nothing here writes a
+    key, an override, an alert or an event (dev/changelog/1155); a change is made on the
+    channel page, where it always was.
+
+    Server-rendered and paged. #em-main is the one region epg-manager.js swaps from the
+    server when a scan finishes. #}
+{% import '_macros.html' as m %}
+
+{% block content %}
+<style>
+  .em-state { display: flex; flex-wrap: wrap; gap: 6px 18px; align-items: center; font-size: var(--fs-md); color: var(--text-muted); margin: 0 0 12px; }
+  .em-state strong { color: var(--text); font-weight: 600; }
+  .em-filters { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 0 0 12px; }
+  .em-filters form { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .em-filters select { background: var(--bg1); font: inherit; font-size: var(--fs-md); padding: 6px 10px; }
+  .em-cluster { border: 1px solid var(--border); border-radius: var(--radius); margin-bottom: 14px; overflow: hidden; }
+  .em-cluster-head { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; padding: 8px 12px; background: var(--bg2); font-size: var(--fs-md); }
+  .em-cluster-head .grow { flex: 1; color: var(--text-muted); }
+  .em-cluster .table-scroll { margin: 0; }
+  .em-cluster .tbl { margin: 0; }
+  .em-id { font-family: var(--font-mono); font-size: var(--fs-sm); word-break: break-all; }
+  .em-lead { color: var(--ok); font-weight: 600; font-size: var(--fs-xs); margin-left: 4px; }
+  .em-chans { font-size: var(--fs-sm); color: var(--text-muted); }
+  .em-diff { font-size: var(--fs-sm); }
+  .em-links { padding: 8px 12px; border-top: 1px solid var(--border); display: flex; flex-direction: column; gap: 6px; font-size: var(--fs-md); }
+  .em-link { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; }
+  .em-link .text-muted { flex-basis: 100%; }
+  .em-pager { margin-top: 12px; }
+  @media (max-width: 960px) {
+    .em-link .text-muted { flex-basis: auto; }
+  }
+</style>
+
+<div class="page-head">
+  <h1>EPG Manager</h1>
+  <button type="button" class="btn btn-primary" data-act="epg-scan"{% if running %} disabled{% endif %}>{{ 'Scanning...' if running else 'Scan now' }}</button>
+</div>
+<p class="page-sub">
+  Tools that work across every account's guide. The similarity scan reads every EPG schedule
+  the database holds and finds the ids carrying the same one, so you can see the copies side
+  by side and choose a source and an id by what each copy holds. Nothing here changes a
+  channel's guide: that is done on the channel page.
+</p>
+
+<div id="em-main" data-running="{{ '1' if running else '0' }}">
+<div class="card" id="em-similar">
+  <div class="card-head">
+    <h2>Similar schedules</h2>
+    <div class="card-head-actions">
+      {% if group %}<a href="{{ url_for('channel_groups.group_detail', group_id=group.id) }}" class="btn btn-sm">{{ icon('back') }} {{ group.name }}</a>{% endif %}
+    </div>
+  </div>
+  <div class="card-body">
+    <div class="em-state" id="em-scan-state">
+      {% if running %}
+        <span>{{ m.status_badge('b-sched', 'Scanning', pulse=true) }}</span>
+        <span>Started {{ scan_json.started_at }}. The page refreshes when it finishes - about a minute on a full guide.</span>
+      {% elif failed %}
+        <span>{{ m.status_badge('b-fail', 'Last scan failed') }}</span>
+        <span>{{ scan_json.finished_at }}: {{ scan.error }}</span>
+      {% endif %}
+      {% if result %}
+        <span>Scanned <strong>{{ scan_when }}</strong>, listings from {{ listings_as_of }} on</span>
+        <span><strong>{{ '{:,}'.format(result.schedules) }}</strong> schedules over {{ counted(result.listings, 'listing') }}</span>
+        <span><strong>{{ '{:,}'.format(result.clusters) }}</strong> carried by two or more ids, {{ '{:,}'.format(result.identical) }} of them identical in every way</span>
+        <span><strong>{{ '{:,}'.format(result.links) }}</strong> related pairs</span>
+        <span>{{ '%.1f' | format((result.elapsed_ms or 0) / 1000) }} s</span>
+      {% elif not running and not failed %}
+        <span>Not scanned yet.</span>
+      {% endif %}
+    </div>
+
+    {% if not result %}
+    <div class="empty-state">
+      <p>No scan result yet.</p>
+      <p class="text-muted">Scan now reads every schedule in the guide - about a minute on a full one - and lists the ids that carry the same programs.</p>
+    </div>
+    {% else %}
+    <div class="em-filters">
+      <form method="get" action="{{ url_for('epg_manager.epg_manager') }}">
+        {% if kind %}<input type="hidden" name="kind" value="{{ kind }}">{% endif %}
+        {% if group %}<input type="hidden" name="group_id" value="{{ group.id }}">{% endif %}
+        <div class="search-wrap"><input type="search" class="search" name="q" value="{{ q }}" placeholder="EPG id or channel name" aria-label="Search by EPG id or channel name"></div>
+        <select name="source" aria-label="Source" onchange="this.form.submit()">
+          <option value="">Every source</option>
+          {% for s in sources %}<option value="{{ s.id }}"{% if s.id == source_id %} selected{% endif %}>{{ s.name }}</option>{% endfor %}
+        </select>
+        <button type="submit" class="btn btn-sm">Search</button>
+        {% if q or source_id %}<a href="{{ qs(q=none, source=none) }}" class="btn btn-sm">Clear</a>{% endif %}
+      </form>
+      {% if group %}
+      <span class="chip active tip-plain" data-tip="Only clusters that include a schedule one of this group's channels carries.">Group: {{ group.name }} <a href="{{ qs(group_id=none) }}" aria-label="Show every group">{{ icon('close') }}</a></span>
+      {% endif %}
+    </div>
+
+    <div class="tabs">
+      <a href="{{ qs(kind=none) }}" class="tab{{ ' active' if not kind else '' }}">All <span class="cnt">{{ '{:,}'.format(counts['']) }}</span></a>
+      <a href="{{ qs(kind='identical') }}" class="tab{{ ' active' if kind == 'identical' else '' }}"
+         data-tip="Every copy holds the same titles, times, subtitles, descriptions, categories and ratings. Any of these ids could stand in for the others.">Identical in every way <span class="cnt">{{ '{:,}'.format(counts.identical) }}</span></a>
+      <a href="{{ qs(kind='details') }}" class="tab{{ ' active' if kind == 'details' else '' }}"
+         data-tip="The same programs at the same times, with some field differing - title marks, descriptions, subtitles, end times. The columns say which copy has more.">Same programs, details differ <span class="cnt">{{ '{:,}'.format(counts.details) }}</span></a>
+      <a href="{{ qs(kind='related') }}" class="tab{{ ' active' if kind == 'related' else '' }}"
+         data-tip="Schedules that agree where both list but differ somewhere: one stops sooner, a few programs differ, or programs are shifted. Judged the way the compare-sources page judges two sources.">Related <span class="cnt">{{ '{:,}'.format(counts.related) }}</span></a>
+    </div>
+
+    {% if not clusters %}
+    <div class="empty-state">
+      <p>Nothing matches.</p>
+      <p class="text-muted">{% if q or source_id or group %}Clear the search, source or group filter to see every cluster.{% else %}Every schedule in the guide is carried by one id and relates to no other.{% endif %}</p>
+    </div>
+    {% else %}
+    {% for c in clusters %}
+    <div class="em-cluster" data-cluster="{{ c.id }}">
+      <div class="em-cluster-head">
+        {% if c.n > 1 %}{{ m.status_badge('b-done' if c.identical else 'b-sched', c.kind_label) }}{% else %}{{ m.status_badge('b-abort', c.kind_label) }}{% endif %}
+        <span class="grow">{{ counted(c.n, 'id') }} carrying {% if c.n > 1 %}this schedule{% else %}it{% endif %}{% if c.links %}, related to {{ counted(c.links | length, 'other') }}{% endif %}</span>
+      </div>
+      <div class="table-scroll">
+        <table class="tbl tbl-cards">
+          <thead><tr>
+            <th>EPG id</th><th>Source</th><th>Channels</th>
+            <th class="num" data-tip="Programs listed from now on.">Programs</th>
+            <th data-tip="When this copy's listings end.">Until</th>
+            <th class="num" data-tip="Programs with a description, and the total characters of description text.">Described</th>
+            <th class="num" data-tip="Programs with a subtitle.">Subtitles</th>
+            <th class="num" data-tip="Titles carrying a provider's mark - the small ᴺᵉʷ, ᴸᶦᵛᵉ and similar tags some feeds add. A copy with them searches differently from one without.">Title marks</th>
+            <th data-tip="What differs from the first copy, which is the guide for a channel when one is, else the copy with the most description text.">Differs</th>
+          </tr></thead>
+          <tbody>
+          {% for s in c.copies %}
+          <tr data-schedule="{{ s.id }}">
+            <td data-label="EPG id"><span class="em-id">{{ s.epg_id }}</span>{% if s.is_lead and c.n > 1 %}<span class="em-lead">first</span>{% endif %}
+              {% if s.spellings %}<div class="text-faint small">Also spelled {{ s.spellings | join(', ') }}</div>{% endif %}
+              {% if not s.active %}<div class="text-faint small">Not the guide for any channel</div>{% endif %}</td>
+            <td data-label="Source">{{ s.source_name }}</td>
+            <td data-label="Channels"><span class="em-chans">{{ s.channels | join(', ') }}{% if s.more_channels %} and {{ counted(s.more_channels, 'more', 'more') }}{% endif %}</span></td>
+            <td data-label="Programs" class="num">{{ '{:,}'.format(s.listings) }}</td>
+            <td data-label="Until">{{ s.until or '-' }}</td>
+            <td data-label="Described" class="num">{{ '{:,}'.format(s.described) }}<span class="text-faint small"> / {{ '{:,}'.format(s.desc_chars) }} chars</span></td>
+            <td data-label="Subtitles" class="num">{{ '{:,}'.format(s.subtitled) }}</td>
+            <td data-label="Title marks" class="num">{{ '{:,}'.format(s.marked) }}</td>
+            <td data-label="Differs" class="em-diff">{% if s.is_lead %}<span class="text-faint">-</span>{% elif s.same_as_lead %}<span class="text-muted">Nothing</span>{% else %}{{ s.differs_in | join(', ') | capitalize }}{% endif %}</td>
+          </tr>
+          {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      {% if c.links %}
+      <div class="em-links">
+        {% for l in c.links %}
+        <div class="em-link">
+          {{ m.status_badge(l.badge, l.label) }}
+          <span><span class="em-id">{{ l.from.epg_id }}</span> and <a href="{{ qs(q=l.to.epg_id, kind=none, page=none) }}" class="em-id">{{ l.to.epg_id }}</a> on {{ l.to.source_name }}{% if l.to.channels %} ({{ l.to.channels | join(', ') }}{% if l.to.more_channels %} and {{ l.to.more_channels }} more{% endif %}){% endif %}</span>
+          <span class="text-muted">{{ l.summary }}</span>
+        </div>
+        {% endfor %}
+      </div>
+      {% endif %}
+    </div>
+    {% endfor %}
+    {% if pages > 1 %}
+    <div class="test-history-pagination em-pager">
+      {% if page > 1 %}<a href="{{ qs(page=page - 1) }}" class="btn btn-sm">{{ icon('back') }} Prev</a>{% endif %}
+      <span class="text-faint small">Page {{ page }} of {{ pages }} ({{ counted(total, 'cluster') }})</span>
+      {% if page < pages %}<a href="{{ qs(page=page + 1) }}" class="btn btn-sm">Next {{ icon('forward') }}</a>{% endif %}
+    </div>
+    {% endif %}
+    {% endif %}
+    {% endif %}
+  </div>
+</div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script src="{{ url_for('static', filename='js/epg-manager.js') }}"></script>
+{% endblock %}

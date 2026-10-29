@@ -1229,7 +1229,7 @@
       const c = reg[k];
       if (!c) return '';
       return `<label class="col-item" draggable="true" data-col="${esc(k)}">
-        <span class="grip">&#8942;&#8942;</span>
+        <span class="grip">${icon('drag')}</span>
         <input type="checkbox" data-col="${esc(k)}"${colState().hidden.includes(k) ? '' : ' checked'}>
         ${esc(c.label)}</label>`;
     }).join('');
@@ -1266,7 +1266,7 @@
   }
 
   const sortInd = (key) =>
-    state.sort === key ? `<span class="sort-ind">${state.sortDesc ? '&#9660;' : '&#9650;'}</span>` : '';
+    state.sort === key ? `<span class="sort-ind">${icon(state.sortDesc ? 'sort-desc' : 'sort-asc')}</span>` : '';
 
   function headCell(label, sortKey, extraClass = '') {
     const cls = [extraClass, canSort(sortKey) ? 'sortable' : '',
@@ -1330,8 +1330,8 @@
     const tip = `Duplicate stream.\n${d.count} channels ${dupKeyClause(d)}. The other` +
       `${d.count === 2 ? '' : 's'}:\n` +
       shown.map((c) => `  ${c.name}   (${c.category || 'no category'})`).join('\n') + more + hidden +
-      '\n\nClick to see just that cluster. A "← Your search" button appears so you can return.';
-    return `<span class="badge b-warn" data-act="dup-badge" data-id="${row.id}" data-tip="${tipAttr(tip)}">DUP &times;${d.count}</span>`;
+      '\n\nClick to see just that cluster. A "Your search" button appears so you can return.';
+    return `<span class="badge b-warn" data-act="dup-badge" data-id="${row.id}" data-tip="${tipAttr(tip)}">DUP &times;${d.count}</span>`;  // icon-ok: a multiplication sign, not an icon
   }
 
   /* ONE renderer per field, for BOTH surfaces: a table cell wraps it in .acell and
@@ -1368,7 +1368,7 @@
         // null is "never tested", which is not zero.
         return { html: row.health === null
           ? '<span class="h-mini hb-none" data-tip="Never tested.">--</span>'
-          : `<span class="h-mini ${healthBandCss(row.health)}" data-tip="Channel health ${row.health.toFixed(1)}.&#10;Lifetime 0-100 score from this channel's tests and recordings.">&#9733; ${row.health.toFixed(0)}</span>` };
+          : `<span class="h-mini ${healthBandCss(row.health)}" data-tip="Channel health ${row.health.toFixed(1)}.&#10;Lifetime 0-100 score from this channel's tests and recordings.">${icon('health-score')} ${row.health.toFixed(0)}</span>` };
       case 'groups': {
         // The pill OPENS the group it names rather than the channel the row is about -
         // a group name on screen is an address, and the row's own click target is the
@@ -1377,7 +1377,7 @@
         return { html: gs.length
           ? `<a href="${CFG.groupDetailUrlBase}${gs[0].id}" class="badge b-abort"
                data-tip="${tipAttr(`In group: ${gs.map((g) => g.name).join(', ')}`
-                 + `\n\nOpens "${gs[0].name}".`)}">&#9939; ${esc(gs[0].name)}${
+                 + `\n\nOpens "${gs[0].name}".`)}">${icon('group')} ${esc(gs[0].name)}${
                  gs.length > 1 ? ` +${gs.length - 1}` : ''}</a>` : '' };
       }
       case 'tags':
@@ -1483,7 +1483,7 @@
     ? `<span class="kept" data-tip="${tipAttr(`Kept out of the ${row.dup.count} channels that ${dupKeyClause(row.dup)}, because it is ${row.dup.kept_reason}.\n${KEEP_RULE}`)}">KEPT</span>`
     : '');
   const noteBadge = (row) => (row.notes
-    ? `<span data-tip="${tipAttr(row.notes)}" style="cursor:help">&#128221;</span>` : '');
+    ? `<span data-tip="${tipAttr(row.notes)}" style="cursor:help">${icon('note')}</span>` : '');
 
   /* Its own guide row, said as a badge rather than as a button. The per-row
      "+ Add to Guide" control is gone from this grain (dev/changelog/860) - the checkbox and
@@ -1550,7 +1550,7 @@
         ${rows ? `<div class="cc-rows">${rows}</div>` : ''}
       </div>
       <button class="cc-kebab" data-rowkebab="${row.id}" type="button"
-        aria-label="More for ${esc(row.name)}">&#8943;</button>
+        aria-label="More for ${esc(row.name)}">${icon('more')}</button>
     </div>`;
   }
 
@@ -1618,7 +1618,7 @@
       case 'health':
         return { html: g.health === null
           ? '<span class="h-mini hb-none" data-tip="This group has never been scored.">--</span>'
-          : `<span class="h-mini ${healthBandCss(g.health)}" data-tip="Group health ${g.health.toFixed(1)}.&#10;Lifetime 0-100 score across every recording made from this group, all members combined.">&#9733; ${g.health.toFixed(0)}</span>` };
+          : `<span class="h-mini ${healthBandCss(g.health)}" data-tip="Group health ${g.health.toFixed(1)}.&#10;Lifetime 0-100 score across every recording made from this group, all members combined.">${icon('health-score')} ${g.health.toFixed(0)}</span>` };
       case 'airing': {
         const p = g.airing;
         if (!p) return { html: '' };
@@ -1685,7 +1685,7 @@
         <div class="cc-rows">${memberRow}${rows}</div>
       </div>
       <button class="cc-kebab" data-groupkebab="${g.id}" type="button"
-        aria-label="More for ${esc(g.name)}">&#8943;</button>
+        aria-label="More for ${esc(g.name)}">${icon('more')}</button>
     </div>`;
   }
 
@@ -1996,7 +1996,7 @@
         ${rows ? `<div class="cc-rows">${rows}</div>` : ''}
       </div>
       <button class="cc-kebab" data-rowkebab="${ch.id}" data-air="${row.id}" type="button"
-        aria-label="More for ${esc(row.title)}">&#8943;</button>
+        aria-label="More for ${esc(row.title)}">${icon('more')}</button>
     </div>`;
   }
 
@@ -2023,7 +2023,7 @@
      governs BUTTONS - a pill that names a mode is a label, not a verb, and it performs no
      work - and this page already ships three pictorial glyphs of its own. */
   const GRAIN_LABELS = { channels: 'Search Channels', airings: 'Search Programs (EPG)' };
-  const GRAIN_ICONS = { channels: '&#128250;', airings: '&#128197;' };
+  const GRAIN_ICONS = { channels: '&#128250;', airings: '&#128197;' };  // icon-ok: the page's granted pictorial glyphs (DESIGN.md 4)
 
   function renderGrainToggles() {
     const slot = $('#grainslot-panel');
@@ -2227,9 +2227,9 @@
     const pages = Math.max(1, last.pages || 1);
     const sizes = pageSizeOptions();
     const turns = last.total > state.pageSize
-      ? `<button class="btn btn-sm" data-pg="prev"${state.page <= 1 ? ' disabled' : ''}>&larr; Prev</button>
+      ? `<button class="btn btn-sm" data-pg="prev"${state.page <= 1 ? ' disabled' : ''}>${icon('back')} Prev</button>
          <span class="pg-lbl">Page ${nf(state.page)} of ${nf(pages)}</span>
-         <button class="btn btn-sm" data-pg="next"${state.page >= pages ? ' disabled' : ''}>Next &rarr;</button>`
+         <button class="btn btn-sm" data-pg="next"${state.page >= pages ? ' disabled' : ''}>Next ${icon('forward')}</button>`
       : '';
     // Shown whenever a smaller size would page, not only when this one does: at 250 with
     // 180 results there are no page turns, and hiding the size menu with them would leave
@@ -2567,7 +2567,7 @@
         + 'correct.' + whyDeclined())}">- total not counted</span>`
       : countsFailed ? `Showing these <strong>${nf(to)}</strong> <span class="uncounted" data-tip="${tipAttr(
         `The total could not be counted.\nReason: ${countsFailed}`
-        + '\n\nThe rows shown are complete and correct.')}">&#9888; total not counted</span>`
+        + '\n\nThe rows shown are complete and correct.')}">${icon('warning')} total not counted</span>`
       /* "airings" rather than "matches" on this grain: the noun is what says WHAT was
          counted, and it is the half of the confusion the channel count cannot fix on its
          own. The channel grain keeps "matches", where a row may be a channel or a group and
@@ -2658,7 +2658,7 @@
     // A degraded search is correct but slower. Reported, never merely logged.
     if (last.degraded && !resultsPending) {
       parts.push(`<span class="sep">&middot;</span> <span class="degraded" data-tip="${tipAttr(
-        `This search ran without its index and is slower than usual.\nReason: ${last.degraded}\nResults are the same.`)}">&#9888; unindexed</span>`);
+        `This search ran without its index and is slower than usual.\nReason: ${last.degraded}\nResults are the same.`)}">${icon('warning')} unindexed</span>`);
     }
     // A row refresh that failed (most often a timeout on a broad filter) leaves the OLD
     // rows on screen rather than claiming nothing matched - but nothing else here said
@@ -2668,13 +2668,13 @@
     if (loadFailed && !resultsPending && last.total) {
       parts.push(`<span class="sep">&middot;</span> <span class="stale-fail" data-tip="${tipAttr(
         `These are the results from before your last change - the search could not be `
-        + `refreshed.\nReason: ${loadFailed}`)}">&#9888; not refreshed</span>`);
+        + `refreshed.\nReason: ${loadFailed}`)}">${icon('warning')} not refreshed</span>`);
     }
     // The way back out of a DUP drill-in. It is only ever here because something
     // replaced the user's search for them, so it stays until it is used.
     if (searchSnapshot) {
       parts.push('<button class="cs-back" id="cs-back" data-tip="Put back the search and filters '
-                 + 'you had before you clicked that DUP badge.">&larr; Your search</button>');
+                 + `you had before you clicked that DUP badge.">${icon('back')} Your search</button>`);
     }
     $('#cs-count').innerHTML = parts.join(' ');
 
@@ -2743,7 +2743,7 @@
        would put a false statement on screen for the other three, so the headline states
        only what is true in all four, and the reason line below names which one it is - the
        same server-supplied-reason pattern the count line and facet rail use for a decline. */
-    el.innerHTML = `&#9888; Searches are running without their index right now. Rows that `
+    el.innerHTML = `${icon('warning')} Searches are running without their index right now. Rows that `
       + `come back are complete and correct, but totals and filter counts may not be `
       + `available, and a search can be slower than usual or fail to complete. This clears `
       + `once the index next rebuilds - normally at the end of an account sync, or `
@@ -2876,7 +2876,7 @@
     state.standing.add('showdup');
     applyNow();
     showToast(`Showing the ${row.dup.count} channels that ${dupKeyClause(row.dup)}. `
-              + 'Use "← Your search" to return.');
+              + 'Use "Your search" to return.');
   }
 
   /* ── The row kebab sheet ─────────────────────────────────────────────
@@ -2919,7 +2919,7 @@
       : (REC_SHEET_LABELS[air.record_state] || REC_SHEET_LABELS.none);
     return `<div class="prow drill${dead ? ' off' : ''}"${dead ? '' : ` data-act="${a.act}"`}
         data-air="${air.id}" data-id="${air.channel.id}">
-      <span class="pico">${dead ? '&#8709;' : '&#9679;'}</span>
+      <span class="pico">${icon(dead ? 'inactive' : 'active')}</span>
       <span class="pv">${esc(label)}</span>
       <span class="hint">${esc(dayLabel(start))} ${start ? esc(fmtTimeTz(start)) : ''}</span></div>`;
   }
@@ -2938,21 +2938,21 @@
   function rowSheetChannelRows(row, sel, air = null) {
     const thing = air ? 'showing' : 'channel';
     return `<div class="prow drill" data-act="open-channel" data-id="${row.id}">
-        <span class="pico">&#8599;</span><span class="pv">Open channel detail</span></div>
+        <span class="pico">${icon('forward')}</span><span class="pv">Open channel detail</span></div>
       ${row.in_guide
         ? `<div class="prow drill" data-act="in-guide" data-id="${row.id}">
-            <span class="pico">&#10003;</span><span class="pv">Remove from the TV Guide</span></div>`
+            <span class="pico">${icon('ok')}</span><span class="pv">Remove from the TV Guide</span></div>`
         : `<div class="prow drill" data-act="add-guide" data-id="${row.id}">
-            <span class="pico">&#43;</span><span class="pv">Add to the TV Guide</span>
+            <span class="pico">${icon('add')}</span><span class="pv">Add to the TV Guide</span>
             ${(row.guide_via || []).length
               ? `<span class="hint">already in it via ${esc(row.guide_via[0].name)}</span>` : ''}</div>`}
       <div class="prow drill" data-rowtest="${row.id}">
-        <span class="pico">&#9889;</span><span class="pv">Test this channel</span></div>
+        <span class="pico">${icon('test')}</span><span class="pv">Test this channel</span></div>
       <div class="prow drill" data-rowsel="${row.id}"${air ? ` data-rowair="${air.id}"` : ''}>
-        <span class="pico">${sel ? '&#10005;' : '&#10003;'}</span>
+        <span class="pico">${icon(sel ? 'close' : 'ok')}</span>
         <span class="pv">${sel ? `Deselect this ${thing}` : `Select this ${thing}`}</span></div>
       ${row.dup ? `<div class="prow drill" data-act="dup-badge" data-id="${row.id}">
-        <span class="pico">&#9282;</span>
+        <span class="pico">${icon('duplicate')}</span>
         <span class="pv">${nf(row.dup.count)} channels ${esc(dupKeyClause(row.dup))}</span></div>` : ''}
       <div class="sh-note">Select adds this ${thing} to the ones you have ticked, and the bar at
         the bottom acts on all of them at once.${isAirings() ? ' <b>Selecting a showing also '
@@ -3026,11 +3026,11 @@
       kind: 'group',
       title,
       body: `<div class="prow drill" data-act="open-group" data-id="${g.id}">
-          <span class="pico">&#8599;</span><span class="pv">Open the group</span></div>
+          <span class="pico">${icon('forward')}</span><span class="pv">Open the group</span></div>
         ${g.serving
-          ? `<div class="prow"><span class="pico">&#9673;</span>
+          ? `<div class="prow"><span class="pico">${icon('active')}</span>
               <span class="pv">Would record from ${esc(g.serving.name)}</span></div>`
-          : `<div class="prow"><span class="pico">&#9888;</span>
+          : `<div class="prow"><span class="pico">${icon('warning')}</span>
               <span class="pv">No recording-enabled member</span></div>`}
         <div class="sh-note">${nf(g.member_count)} channel${g.member_count === 1 ? '' : 's'}${
           g.recording_member_count === g.member_count
@@ -3290,7 +3290,7 @@
           ? 'Stop opening this page with this search. A bare /channels then shows everything again.'
           : 'Open this page with this search already applied. The address bar shows it too, because the server redirects rather than applying it silently.')}"
           >${s.is_default ? 'clear default' : 'set default'}</button>
-        <button class="btn btn-sm btn-ghost" data-del="${i}" data-tip="Delete this saved search.">&times;</button>
+        <button class="btn btn-sm btn-ghost" data-del="${i}" data-tip="Delete this saved search.">${icon('close')}</button>
       </div>`).join('');
     return (rows || '<div class="pnote" style="margin-top:0">Nothing saved yet. Build a search, then name it here.</div>')
       + `<div class="psep"></div>
@@ -3695,7 +3695,7 @@
   function findBoxHtml(cls, value, placeholder, key, attr = 'railq') {
     return `<span class="findwrap"><input class="${cls}" data-${esc(attr)}="${esc(key)}"
       value="${esc(value)}" placeholder="${esc(placeholder)}" autocomplete="off" spellcheck="false">
-      ${value ? `<button class="fclr" data-findclr="${esc(key)}" data-tip="Clear this">&#10005;</button>` : ''}</span>`;
+      ${value ? `<button class="fclr" data-findclr="${esc(key)}" data-tip="Clear this">${icon('close')}</button>` : ''}</span>`;
   }
 
   function valueRowHtml(key, value, label, count, tip) {
@@ -3747,7 +3747,7 @@
       ? ` <button class="fac-make" data-make="${dim.key}">${esc(DIM_CREATE[dim.key].label)}</button>` : '';
 
     return `<div class="fac${open ? ' open' : ''}" data-fac="${dim.key}">
-      <div class="fac-h" data-fach="${dim.key}"><span class="caret">&#9654;</span><span class="fac-name">${esc(dim.label)}</span>${what}${make}
+      <div class="fac-h" data-fach="${dim.key}"><span class="caret">${icon('expand')}</span><span class="fac-name">${esc(dim.label)}</span>${what}${make}
         ${n ? `<span class="nsel${hasNeg ? ' hasneg' : ''}">${n}</span>` : ''}</div>
       <div class="fac-b">
         ${box}
@@ -4098,7 +4098,7 @@
     const railNote = (!facetsPending && facetsDeclined)
       ? `<div class="rnote" data-tip="${tipAttr(
         'Counting every value would cost seconds for this search. The filters still work - '
-        + 'only the counts beside them are missing.' + whyDeclined())}">&#9888; Counts not available for this search. The filters still work.</div>`
+        + 'only the counts beside them are missing.' + whyDeclined())}">${icon('warning')} Counts not available for this search. The filters still work.</div>`
       : '';
     /* A facet left out on purpose is not the same statement as the whole rail being declined,
        so it gets its own line - once, rather than only as the `--` on every row it covers.
@@ -4106,7 +4106,7 @@
     const leftOut = dimsFor().filter((d) => !d.hidden && facetsUncounted[d.key]);
     const why = leftOut.length ? facetsUncounted[leftOut[0].key] : '';
     const uncountedNote = (!facetsPending && !facetsDeclined && leftOut.length)
-      ? `<div class="rnote" data-tip="${tipAttr(why)}">&#9888; ${
+      ? `<div class="rnote" data-tip="${tipAttr(why)}">${icon('warning')} ${
         esc(leftOut.map((d) => d.label).join(', '))}: ${esc(why.split('. ')[0].replace(/\.$/, ''))}.</div>`
       : '';
     rewriteKeepingFocus(el, railBarHtml()
@@ -4193,7 +4193,7 @@
       ? `<div class="prow"><span class="pv text-faint" style="font-size:.8rem">Not listed?</span>
           <button class="fac-make" data-make="${esc(fDim)}">${esc(DIM_CREATE[fDim].label)}</button></div>` : '';
 
-    return `<button class="sh-back" data-fback="1">&#8592; All filters</button>
+    return `<button class="sh-back" data-fback="1">${icon('back')} All filters</button>
       ${box}
       ${shown.map((x) => valueRowHtml(fDim, x.v, x.label, x.c)).join('')}
       ${shown.length ? '' : noValueHtml(fDim, q)}
@@ -4275,7 +4275,7 @@
       <span class="ck">${esc(label)}</span>
       <span class="cop">${neg ? 'is not' : 'is'}</span>
       <span class="cv"${ev}>${esc(value)}</span>
-      <button class="cx" data-rm="${esc(rm)}" data-tip="Remove">&#10005;</button></span>`;
+      <button class="cx" data-rm="${esc(rm)}" data-tip="Remove">${icon('close')}</button></span>`;
   }
 
   const dimByKey = (key) => (CAT ? CAT.dimensions.find((d) => d.key === key) : null) || null;
@@ -4416,7 +4416,7 @@
     join.innerHTML = `<span class="menu-wrap">
       <button class="btn btn-sm wjoin" type="button" data-menu
         data-tip="${tipAttr(`${WJOIN_TIP[cur]}\n\nWhich of the words you type have to match. `
-          + 'It is a property of the SEARCH, not a filter.')}">${esc(WJOIN_LABEL[cur])} &#9662;</button>
+          + 'It is a property of the SEARCH, not a filter.')}">${esc(WJOIN_LABEL[cur])} ${icon('dropdown')}</button>
       <div class="menu">${Object.keys(WJOIN_LABEL).map((k) =>
         `<button class="menu-item" type="button" data-wjoin="${k}">${esc(WJOIN_LABEL[k])}</button>`).join('')}</div>
     </span>`;
@@ -4442,7 +4442,7 @@
     // One button, two things: the table's Columns popover up there, the card's
     // Fields sheet down here. A second button would be a control that exists at
     // one width only and confuses the other.
-    $('#cols-btn').innerHTML = isMobile() ? '&#9881; Fields' : '&#9881; Columns';
+    $('#cols-btn').innerHTML = isMobile() ? `${icon('layout')} Fields` : `${icon('layout')} Columns`;
     if (!CAT || !isMobile()) { row.innerHTML = ''; return; }
     const st = savedStatus();
     const bits = [];
@@ -4458,17 +4458,17 @@
       >Search in: ${esc(scopeSummary())}</button>`);
     bits.push(`<button class="mchip${sortIsDefault() ? '' : ' on'}" data-mchip="sort"
       data-tip="Sort the list. There are no column headers at this width, so this is where sorting lives."
-      >Sort: ${esc(sortLabel(state.sort))} ${state.sortDesc ? '&#9660;' : '&#9650;'}</button>`);
+      >Sort: ${esc(sortLabel(state.sort))} ${icon(state.sortDesc ? 'sort-desc' : 'sort-asc')}</button>`);
     // Its full name and its disk glyph, not the abbreviation: nothing on this row needs
     // the four characters back (DESIGN-group-search-rows.md §5.4).
     bits.push(`<button class="mchip${st.name ? ' on' : ''}" data-mchip="saved"
       data-tip="${tipAttr('Saved searches.\nSaves the text, the match mode, the search scope, '
-        + 'the standing options and every filter chip under a name.')}">&#128190; Saved searches</button>`);
+        + 'the standing options and every filter chip under a name.')}">&#128190; Saved searches</button>`);  // icon-ok: the page's granted pictorial glyphs (DESIGN.md 4)
     if (st.name) {
       bits.push(`<span class="sf-name">${esc(st.name)}</span>`);
       if (st.dirty) {
         bits.push('<span class="sf-dirty" data-tip="This saved search has been changed since it '
-          + 'was loaded. Save it again to keep the change.">&#9679; edited</span>');
+          + `was loaded. Save it again to keep the change.">${icon('active')} edited</span>`);
       }
     }
     row.innerHTML = bits.join('');
@@ -4588,7 +4588,7 @@
   const sortSheetBody = () => sortKeys().map((k) => {
     const on = state.sort === k;
     return `<div class="sort-opt${on ? ' on-field' : ''}" data-sortkey="${esc(k)}">
-      <span class="arrow">${on ? (state.sortDesc ? '&#9660;' : '&#9650;') : ''}</span>
+      <span class="arrow">${on ? icon(state.sortDesc ? 'sort-desc' : 'sort-asc') : ''}</span>
       <span class="pv">${esc(sortLabel(k))}</span>
       <span class="dir">${esc(sortDirWords(k, on ? state.sortDesc : false))}</span></div>`;
   }).join('')
@@ -4636,9 +4636,9 @@
   const SUGG_MIN = 260;          // never squeeze it past useless
   // Presentation only, so it is not in the catalog - a dimension added later gets the
   // fallback rather than a blank cell.
-  const DIM_ICON = { tag: '&#9873;', acct: '&#9679;', health: '&#9829;', group: '&#9707;',
-                     cat: '&#9636;', other: '&#9881;', chan: '&#9654;' };
-  const dimIcon = (key) => DIM_ICON[key] || '&#9679;';
+  const DIM_ICON = { tag: '&#9873;', acct: '&#9679;', health: '&#9829;', group: '&#9707;',  // icon-ok: the page's granted pictorial glyphs (DESIGN.md 4)
+                     cat: '&#9636;', other: '&#9881;', chan: '&#9654;' };  // icon-ok: same
+  const dimIcon = (key) => DIM_ICON[key] || '&#9679;';  // icon-ok: same
   const SYNTAX_HTML = `<div class="sugg-syn">
     <code>-word</code> excludes it &#183; <code>*</code> and <code>?</code> are wildcards,
     e.g. <code>fox*</code> &#183; <code>"two words"</code> stays together</div>`;
@@ -4663,7 +4663,7 @@
        search's total - every channel, beside the first letter typed - which a first-time
        user read as the number of matches (dev/docs/BUGS.md 2026-10-26). */
     const answered = !resultsPending && last.q === raw.trim() && typeof last.total === 'number';
-    out.push({ group: 'Search', kind: 'text', label: raw.trim(), ico: '&#128269;',
+    out.push({ group: 'Search', kind: 'text', label: raw.trim(), ico: '&#128269;',  // icon-ok: the page's granted pictorial glyphs (DESIGN.md 4)
                hint: answered ? nf(last.total) : '' });
     const parsed = parseQuery(raw);
     const term = (parsed.inc[parsed.inc.length - 1] || '').toLowerCase();
@@ -4828,7 +4828,7 @@
       // which is what the hide-in-place spelling existed to avoid needing.
       const values = q
         ? all.filter((v) => String(dimLabel(popDim, v)).toLowerCase().includes(q)) : all;
-      html = `<button class="pop-back" data-back="1">&#8592; All filters</button>
+      html = `<button class="pop-back" data-back="1">${icon('back')} All filters</button>
         <h5>${esc(dim.label)}</h5>
         ${all.length > railShowFor(popDim) ? findBoxHtml('pop-search', popQ, `Filter ${dim.label.toLowerCase()}...`, '__pop__', 'popq') : ''}
         <div class="pop-scroll">${values.map((v) =>
@@ -5009,7 +5009,7 @@
          sheet because the chip row stays above it; these two triggers sit in the page
          BODY, and an open sheet covers them - a browser pass confirmed the sheet's own
          content is what a tap at those coordinates reaches, so a toggle branch here could
-         never fire. The sheet closes by its ✕ and by its scrim, which is what it has
+         never fire. The sheet closes by its close button and by its scrim, which is what it has
          always done for both of these. */
       const sheetFor = { 'cols-btn': openFieldsSheet, addf2: () => openFiltersSheet(null) }[trigger.id];
       if (sheetFor) { e.preventDefault(); e.stopPropagation(); sheetFor(); return; }
@@ -5953,11 +5953,11 @@
   function openPageSheet() {
     const rows = [];
     if (missingBtn) {
-      rows.push(`<div class="prow drill" data-page-act="missing"><span class="pico">&#128465;</span>
+      rows.push(`<div class="prow drill" data-page-act="missing"><span class="pico">${icon('delete')}</span>
         <span class="pv">${esc(missingBtn.textContent.trim())}</span></div>`);
     }
     if (reviewDupBtn) {
-      rows.push(`<div class="prow drill" data-page-act="dups"><span class="pico">&#128465;</span>
+      rows.push(`<div class="prow drill" data-page-act="dups"><span class="pico">${icon('delete')}</span>
         <span class="pv">${esc(reviewDupBtn.textContent.trim())}</span></div>`);
     }
     const sheet = openSheet({

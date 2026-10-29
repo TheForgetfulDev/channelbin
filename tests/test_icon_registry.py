@@ -9,8 +9,8 @@ draw with the `icon()` Jinja global and scripts with `util.js::icon()`. These ho
   * the checked-in sprite is exactly what the generator writes, so a registry edit without
     a rebuild cannot ship, and no path is ever hand-copied;
   * the Jinja and JS calls draw byte-identical markup;
-  * no file gains a raw icon glyph or an inline `<svg>` - today's files are frozen at their
-    current counts until the app-wide conversion takes them to zero.
+  * no file draws a raw icon glyph or an inline `<svg>` at all - the app-wide conversion
+    (dev/changelog/1327) took every file to zero, and the count only stays there.
 
   python3 -m unittest tests.test_icon_registry
 """
@@ -58,8 +58,19 @@ def _build_tool():
     return mod
 
 
-# A call of the registry's icon(), not nav_icon() or a method named icon.
-_CALL_RE = re.compile(r"""(?<![\w.$])icon\(\s*(['"`])([^'"`$]*)\1""")
+# A call of the registry's icon(), not a method named icon: the whole first argument, so a
+# ternary (`icon(dead ? 'inactive' : 'active')`) is read too, never only a bare literal.
+_CALL_RE = re.compile(r'(?<![\w.$])icon\(((?:[^(),]|\([^()]*\))*)')
+_LITERAL_RE = re.compile(r"""(['"`])([^'"`$]*)\1""")
+
+
+def _names_drawn(source):
+    for call in _CALL_RE.finditer(source):
+        # A ternary's condition may compare against a string ('desc'); the names are the
+        # literals after its `?`.
+        arg = call.group(1).split('?', 1)[-1]
+        for lit in _LITERAL_RE.finditer(arg):
+            yield lit.group(2)
 
 
 class RegistryShapeTests(unittest.TestCase):
@@ -82,13 +93,15 @@ class RegistryShapeTests(unittest.TestCase):
         from app.icons import ICONS
         used, unknown = [], []
         for path in list(_walk(TPL_DIR, '.html')) + list(_walk(JS_DIR, '.js')):
-            for m in _CALL_RE.finditer(_read(path)):
-                used.append(m.group(2))
-                if m.group(2) not in ICONS:
-                    unknown.append(f'{_rel(path)}: icon({m.group(2)!r})')
+            for name in _names_drawn(_read(path)):
+                used.append(name)
+                if name not in ICONS:
+                    unknown.append(f'{_rel(path)}: icon({name!r})')
         self.assertEqual(unknown, [], 'icon() asked for a meaning app/icons.py does not have')
-        # The scan is not vacuous: the guide and the channel page draw `search` through it.
+        # The scan is not vacuous: the guide draws `search`, and channel-search.js's sheet
+        # rows pick `inactive` in a ternary.
         self.assertIn('search', used)
+        self.assertIn('inactive', used)
 
     def test_record_is_red(self):
         css = _read(os.path.join(CSS_DIR, 'style.css'))
@@ -239,79 +252,21 @@ def scan_raw_icons():
 
 
 class NoNewRawIconTests(unittest.TestCase):
-    """No file gains a raw icon glyph or an inline <svg>; an icon is drawn with icon().
+    """No file draws a raw icon glyph or an inline <svg>; an icon is drawn with icon().
 
-    ALLOWANCE freezes every file that drew icons another way when the registry shipped, at
-    (glyphs, inline svgs). It only goes down: a file under its allowance fails too, so the
-    number is lowered in the same change that converts something, and the backlog's
-    app-wide conversion takes it to an empty dict. The channel search page's own emoji
-    (templates/channels/search.html, static/js/channel-search.js) are a granted exception
-    (DESIGN.md §4), counted here like everything else so the conversion has to ask about
-    them rather than sweep them.
+    ALLOWANCE froze every file that drew icons another way when the registry shipped, at
+    (glyphs, inline svgs), and could only go down; the app-wide conversion
+    (dev/changelog/1327) emptied it, so every file is now held at (0, 0). It stays as the
+    ratchet's shape: a file that has to draw one for a while is listed here with its count,
+    and leaves the dict when converted.
 
     A line that legitimately draws one carries `icon-ok: <reason>` - a data chart, the
-    registry's own markup.
+    registry's own markup, an arrow or a multiplication sign inside a sentence, and the
+    channel search page's granted pictorial glyphs (DESIGN.md §4: the grain pills' emoji,
+    the search box's magnifier, Saved searches, the facet icons).
     """
 
-    ALLOWANCE = {
-        'static/css/guide.css': (4, 0),
-        'static/css/style.css': (6, 0),
-        'static/js/account-modal.js': (0, 2),
-        'static/js/account-stats.js': (4, 0),
-        'static/js/auto-rule-modal.js': (3, 0),
-        'static/js/channel-detail.js': (2, 0),
-        'static/js/channel-search.js': (61, 0),
-        'static/js/check-modal.js': (1, 0),
-        'static/js/dashboard.js': (4, 0),
-        'static/js/dropdown.js': (1, 0),
-        'static/js/filename-designer.js': (3, 0),
-        'static/js/filter-bar.js': (6, 0),
-        'static/js/group-create-flow.js': (3, 0),
-        'static/js/group-detail.js': (31, 0),
-        'static/js/group-modal.js': (9, 0),
-        'static/js/group-promote-modal.js': (1, 0),
-        'static/js/groups.js': (4, 0),
-        'static/js/guide.js': (23, 0),
-        'static/js/hide-rules.js': (4, 0),
-        'static/js/manual_record.js': (2, 0),
-        'static/js/nav-alerts.js': (4, 0),
-        'static/js/readiness.js': (5, 0),
-        'static/js/recordings.js': (7, 0),
-        'static/js/settings.js': (0, 2),
-        'static/js/tag-modal.js': (1, 0),
-        'static/js/util.js': (8, 0),
-        'templates/_account_providers.html': (2, 0),
-        'templates/_macros.html': (1, 2),
-        'templates/_record_modal.html': (5, 0),
-        'templates/account_detail.html': (13, 0),
-        'templates/accounts.html': (1, 0),
-        'templates/alerts.html': (3, 0),
-        'templates/alerts_ignored.html': (2, 0),
-        'templates/base.html': (12, 3),
-        'templates/channels/_timeline.html': (4, 0),
-        'templates/channels/detail.html': (37, 0),
-        'templates/channels/group_detail.html': (17, 0),
-        'templates/channels/groups.html': (15, 0),
-        'templates/channels/guide_compare.html': (1, 0),
-        'templates/channels/hide_rules.html': (1, 0),
-        'templates/channels/search.html': (14, 0),
-        'templates/dashboard.html': (3, 0),
-        'templates/epg_source_review.html': (4, 0),
-        'templates/get_started.html': (6, 0),
-        'templates/guide.html': (9, 0),
-        'templates/health_check_profiles.html': (2, 0),
-        'templates/index.html': (9, 0),
-        'templates/jobs.html': (1, 0),
-        'templates/logs.html': (4, 0),
-        'templates/maintenance.html': (2, 0),
-        'templates/notifications_settings.html': (2, 0),
-        'templates/profiles.html': (1, 0),
-        'templates/recording_detail.html': (42, 0),
-        'templates/rule_detail.html': (4, 0),
-        'templates/rules.html': (2, 0),
-        'templates/settings.html': (3, 0),
-        'templates/tags.html': (1, 0),
-    }
+    ALLOWANCE = {}
 
     def test_no_file_draws_more_raw_icons_than_its_allowance(self):
         found = scan_raw_icons()

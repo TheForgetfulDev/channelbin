@@ -111,9 +111,12 @@ class ChipVocabularyTests(_Base):
         """The defect itself: a join is not a finished recording, and neither is an
         analysis. Each of the three post-capture phases gets the word the Recordings list
         uses for it, not the word for the state after them."""
-        self.assertEqual('✓ Joining', self.chip(REC_STATUS_CONCATENATING)['text'])
-        self.assertEqual('✓ Analyzing', self.chip(REC_STATUS_ANALYZING)['text'])
-        self.assertEqual('✓ Converting', self.chip(REC_STATUS_CONVERTING)['text'])
+        self.assertEqual('Joining', self.chip(REC_STATUS_CONCATENATING)['text'])
+        self.assertEqual('Analyzing', self.chip(REC_STATUS_ANALYZING)['text'])
+        self.assertEqual('Converting', self.chip(REC_STATUS_CONVERTING)['text'])
+        # Each wears the finishing icon, not the finished one (app/icons.py).
+        for st in (REC_STATUS_CONCATENATING, REC_STATUS_ANALYZING, REC_STATUS_CONVERTING):
+            self.assertEqual('finishing', self.chip(st)['icon'])
 
     def test_every_chip_word_is_the_servers_word_for_that_status(self):
         """The general form of the rule, so a status added later cannot drift. The guide
@@ -125,15 +128,14 @@ class ChipVocabularyTests(_Base):
             with self.subTest(status=status):
                 text = self.chip(status)['text']
                 self.assertIsNotNone(text, f'{status} draws no chip at all')
-                # The chip may lead with a glyph; the word is what follows it.
-                word = text.split(' ')[-1]
-                self.assertEqual(REC_STATUS_LABELS[status].lower(), word.lower())
+                # The chip's icon has no text; the word is the whole of it.
+                self.assertEqual(REC_STATUS_LABELS[status].lower(), text.lower())
 
     def test_completed_is_the_one_deliberate_difference(self):
         """The guide calls a finished recording "Recorded", not "Completed". Whether that
         is the right word is a naming call nobody has made - this pins the exception so it
         stays the only one rather than becoming a second table again."""
-        self.assertEqual('✓ Recorded', self.chip(REC_STATUS_COMPLETED)['text'])
+        self.assertEqual('Recorded', self.chip(REC_STATUS_COMPLETED)['text'])
 
     def test_no_two_statuses_share_a_chip_word(self):
         """What the user actually saw: two different states wearing one label, with no way
@@ -195,7 +197,8 @@ class PartialChipTests(_Base):
 
     def test_a_partial_recording_reads_partial_not_recorded(self):
         p = self.obs['partial']
-        self.assertEqual(p['text'], '⚠ Partial')
+        self.assertEqual(p['text'], 'Partial')
+        self.assertEqual(p['icon'], 'warning')
         self.assertIn('rec-badge-partial', p['badgeClass'])
         self.assertEqual(p['cls'], 'rec-partial')
 
@@ -218,7 +221,8 @@ class StoppedEarlyChipTests(_Base):
 
     def test_the_users_own_stop_reads_stopped_early_not_partial(self):
         s = self.obs['stopped']
-        self.assertEqual(s['text'], '■ Stopped early')
+        self.assertEqual(s['text'], 'Stopped early')
+        self.assertEqual(s['icon'], 'stop')
         self.assertIn('rec-badge-stopped', s['badgeClass'])
         self.assertNotIn('rec-badge-partial', s['badgeClass'])
 
@@ -228,7 +232,7 @@ class StoppedEarlyChipTests(_Base):
         self.assertIn(s['sentence'], s['tip'])
 
     def test_something_else_missing_still_reads_partial(self):
-        self.assertEqual(self.obs['stopped']['bothText'], '⚠ Partial')
+        self.assertEqual(self.obs['stopped']['bothText'], 'Partial')
 
     def test_a_live_recording_keeps_its_own_mark(self):
         self.assertEqual(self.obs['stopped']['liveText'], self.chip('IN_PROGRESS')['text'])
@@ -260,17 +264,20 @@ class StartingChipTests(_Base):
 
 class NarrowCellChipTests(_Base):
     """dev/changelog/1290: on a phone a program already half over drew "RECORDIN", cut by its
-    own cell. A cell too narrow for glyph and word keeps the glyph, with the word in the
+    own cell. A cell too narrow for icon and word keeps the icon, with the word in the
     tooltip and the label."""
 
-    def test_a_wide_cell_keeps_glyph_and_word(self):
-        self.assertEqual(self.obs['narrow']['wide']['text'], self.chip('IN_PROGRESS')['text'])
-        self.assertIsNone(self.obs['narrow']['wide']['label'])
+    def test_a_wide_cell_keeps_icon_and_word(self):
+        wide = self.obs['narrow']['wide']
+        self.assertEqual(wide['text'], self.chip('IN_PROGRESS')['text'])
+        self.assertEqual(wide['icon'], 'record')
+        self.assertIsNone(wide['label'])
 
-    def test_a_narrow_cell_keeps_the_glyph_and_names_the_state(self):
+    def test_a_narrow_cell_keeps_the_icon_and_names_the_state(self):
         n = self.obs['narrow']['narrow']
-        glyph, word = self.chip('IN_PROGRESS')['text'].split(' ', 1)
-        self.assertEqual(n['text'], glyph)
+        word = self.chip('IN_PROGRESS')['text']
+        self.assertEqual(n['text'], '')
+        self.assertEqual(n['icon'], 'record')
         self.assertEqual(n['label'], word)
         self.assertTrue(n['tip'].startswith(f'{word}\n'))
 
@@ -278,7 +285,7 @@ class NarrowCellChipTests(_Base):
         self.assertEqual(self.obs['narrow']['unknownWidth']['text'],
                          self.chip('IN_PROGRESS')['text'])
 
-    def test_a_chip_with_no_glyph_keeps_its_word(self):
+    def test_a_chip_with_no_icon_keeps_its_word(self):
         self.assertEqual(self.obs['narrow']['noGlyphNarrow']['text'],
                          self.chip('SCHEDULED')['text'])
 

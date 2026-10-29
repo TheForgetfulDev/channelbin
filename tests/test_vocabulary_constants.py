@@ -127,7 +127,7 @@ def find_python_literal_sites(source, words):
 _TPL_LITERAL_RE = re.compile(
     r"(?:status|\bst)\s*(?:==|!=|\bin\b|\bnot in\b)\s*\(?\s*'([A-Z_]+)'(?:\s*,\s*'([A-Z_]+)')*")
 _TPL_REF_RE = re.compile(r'\b(REC_STATUS|TEST_STATUS|OD_JOB_STATUS|ACCOUNT_STATUS|SYNC_LOG|'
-                         r'EPG_STATUS|JOB_RUN)\.([A-Z_]+)')
+                         r'EPG_STATUS|EPG_SCAN|JOB_RUN)\.([A-Z_]+)')
 _JS_LITERAL_RE = re.compile(r"\.(?:status|last_test_status|event_type)\s*(?:===|!==)\s*'([A-Z_]+)'")
 
 

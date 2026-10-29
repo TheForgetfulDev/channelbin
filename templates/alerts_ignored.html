@@ -7,7 +7,7 @@
     new list component - no page-local CSS needed. #}
 
 {% block content %}
-<a class="back" href="{{ url_for('alerts.alert_center') }}">&larr; Alerts</a>
+<a class="back" href="{{ url_for('alerts.alert_center') }}">{{ icon('back') }} Alerts</a>
 <div class="page-head">
   <h1>Ignored Alerts
     <span class="sub">{{ patterns | length }} pattern{{ 's' if patterns | length != 1 else '' }}</span>
@@ -50,7 +50,7 @@
           <td class="muted small">{{ p.last_matched_at | local_time if p.last_matched_at else 'Never' }}</td>
           <td style="text-align:right;">
             <span class="menu-wrap">
-              <button class="btn btn-sm btn-icon" data-menu aria-label="More actions">&#8943;</button>
+              <button class="btn btn-sm btn-icon" data-menu aria-label="More actions">{{ icon('more') }}</button>
               <div class="menu pop-left">
                 <button class="menu-item" data-act="remove" data-id="{{ p.id }}">Remove</button>
               </div>

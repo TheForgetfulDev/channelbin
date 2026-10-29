@@ -193,7 +193,7 @@ class GroupsPageRenderTests(unittest.TestCase):
         # time - only the *visible* label must stop looking like a schedule.
         self.assertIn('Inherited coverage', full_chip)
         self.assertEqual('Inherited coverage', visible_label)
-        self.assertNotIn('&#8635;', visible_label)  # the recurring-schedule glyph
+        self.assertNotIn('data-icon="health-check"', visible_label)  # the recurring-schedule icon
         self.assertNotIn('2:00', visible_label)  # the system job's own run time
 
 

@@ -21,7 +21,7 @@
       (DESIGN-channel-groups-model.md §5), so it is said before the click. Two buckets,
       and they are not the same claim: a measured format that differs is proven different,
       while a channel with no health data is unknown, and unknown is never filtered out.
-   4. A ← Back never costs you your work. Screen 2's typed name and picked mode ride
+   4. A Back never costs you your work. Screen 2's typed name and picked mode ride
       through screen 1 and come back.
 
    Depends on util.js (escHtml, jsonFetch, showToast, buildModal, fieldRow),
@@ -143,7 +143,7 @@ function openGroupCreateFlow(opts) {
   const introNeeded = () => introSeen < GROUP_INTRO_VERSION;
   const groupLink = (id, name) => `<a href="${escHtml(detailBase + id)}">${escHtml(name)}</a>`;
 
-  // Both fetched once and then reused across every screen and every ← Back: the existing
+  // Both fetched once and then reused across every screen and every Back: the existing
   // groups the picker offers (with the in_guide/lock data the one true warning is judged
   // against), and each picked channel's measured format. `formats` stays null until it
   // lands, which is not the same as "every channel is untested" - see cgPickedHtml.
@@ -272,7 +272,7 @@ function openGroupCreateFlow(opts) {
       // The arrow is what marks this as navigation rather than an action (CLAUDE.md UI
       // naming). Nothing is behind this screen when the intro is dismissed, so it is not
       // drawn then.
-      footer.push({ label: '← Back', class: 'btn',
+      footer.push({ label: 'Back', icon: 'back', class: 'btn',
         onClick: (close) => { close(); openIntroScreen(typed, mode); return false; } });
     }
     footer.push({ label: 'Continue', class: 'btn btn-primary',

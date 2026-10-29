@@ -429,7 +429,7 @@ function openCreateCheckModal(opts) {
       // than a fourth way to dismiss - the arrow is what marks it as navigation
       // (CLAUDE.md UI naming). Everything else keeps today's Cancel.
       opts.onBack
-        ? { label: '← Back', class: 'btn', onClick: (close) => { close(); opts.onBack(); return false; } }
+        ? { label: 'Back', icon: 'back', class: 'btn', onClick: (close) => { close(); opts.onBack(); return false; } }
         : { label: 'Cancel', class: 'btn', onClick: (close) => close() },
       { label: ACTIONS.schedule.label, class: 'btn btn-primary', onClick: (close) => { submit(close); return false; } },
     ],

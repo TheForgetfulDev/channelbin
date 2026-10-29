@@ -56,6 +56,7 @@ KIND_MAINTENANCE = 'maintenance'
 KIND_HIDING = 'hiding'
 KIND_LEDGER = 'ledger'
 KIND_RULES = 'rules'
+KIND_EPG_SCAN = 'epg_scan'
 
 # Human prose for a refusal message, so a refused caller can hand the reason straight to a
 # user-facing surface without restating it. Keep these lowercase noun phrases - they are
@@ -68,6 +69,7 @@ KIND_LABELS = {
     KIND_HIDING: 'a channel hide rule pass',
     KIND_LEDGER: 'an account stats catch-up',
     KIND_RULES: 'an auto-record rule check',
+    KIND_EPG_SCAN: 'an EPG similarity scan',
 }
 
 # The yield order, as a table rather than as branches scattered across four modules.
@@ -108,6 +110,11 @@ KIND_LABELS = {
 #   evaluation takes seconds. Sync deliberately does not - a refused sync writes a skipped
 #   row into the account's own history for a few seconds' wait, and the sync's import
 #   queues the next evaluation anyway (DESIGN-autoschedule.md §4.2).
+# - **EPG scan** - the EPG similarity scan (app/epg_similarity.py), a person's manual run
+#   over every listing the database holds, about half a minute on a full guide. It yields
+#   to sync and to maintenance, the two things that rewrite the listings it reads, and to
+#   itself. Maintenance yields to it in turn: a scan is short, and EPG cleanup deleting
+#   rows under it would make its numbers describe nothing.
 # - **Maintenance** yields to everything but the ledger, itself included. It is the most
 #   deferrable work in the app (pruning, retention, WAL reporting) and the heaviest per run,
 #   because EPG cleanup drags a full `programs` rebuild behind it.
@@ -120,8 +127,9 @@ BLOCKED_BY = {
     KIND_HIDING: (KIND_SYNC, KIND_HIDING),
     KIND_LEDGER: (KIND_SYNC, KIND_MAINTENANCE, KIND_LEDGER),
     KIND_RULES: (KIND_SYNC, KIND_REBUILD, KIND_MAINTENANCE, KIND_RULES),
+    KIND_EPG_SCAN: (KIND_SYNC, KIND_MAINTENANCE, KIND_EPG_SCAN),
     KIND_MAINTENANCE: (KIND_TESTER, KIND_SYNC, KIND_REBUILD, KIND_HIDING, KIND_RULES,
-                       KIND_MAINTENANCE),
+                       KIND_EPG_SCAN, KIND_MAINTENANCE),
 }
 
 

@@ -56,7 +56,7 @@ function dropdownTriggerHtml(key, extraClass = '', prefix = '') {
   const label = def ? def.label(arg) : '';
   return `<button class="btn btn-sm msel${extraClass ? ' ' + extraClass : ''}" type="button" ` +
     `data-msel="${escHtml(key)}"${prefix ? ` data-mpre="${escHtml(prefix)}"` : ''}>` +
-    `<span class="mlbl">${escHtml(prefix + label)}</span><span aria-hidden="true">&#9662;</span></button>`;
+    `<span class="mlbl">${escHtml(prefix + label)}</span>${icon('dropdown')}</button>`;
 }
 
 /* One writer for every trigger label on the page. */

@@ -77,7 +77,8 @@ class OneCheckPerGroupTests(_Base):
     are gone with the second check."""
 
     def test_the_sections_no_longer_carry_a_linked_card(self):
-        self.assertEqual(('summary', 'settings', 'channels', 'activity'),
+        self.assertNotIn('linked', GROUP_DETAIL_SECTIONS)
+        self.assertEqual(('summary', 'settings', 'channels', 'whatson', 'activity'),
                          GROUP_DETAIL_SECTIONS)
 
     def test_a_group_page_names_its_one_check(self):

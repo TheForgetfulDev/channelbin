@@ -51,6 +51,7 @@ BG_KIND_EPG_SOURCE_REFRESH = 'epg_source_refresh'
 BG_KIND_POST_CAPTURE = 'post_capture'
 BG_KIND_SEARCH_INDEX = 'search_index'
 BG_KIND_MAINTENANCE = 'maintenance'
+BG_KIND_EPG_SCAN = 'epg_scan'
 
 
 # ── DESIGN.md 16.1/16.2: the sections, their order, and their one jump-off ───
@@ -886,13 +887,19 @@ def _activity_status_dict():
     # does not carry, and reporting them twice would say the same work is happening twice.
     # Not part of dashboard_bg_tasks - maintenance has no Dashboard page section, same as
     # the rebuild entry above.
-    from ..admission import KIND_MAINTENANCE, describe_active
+    from ..admission import KIND_EPG_SCAN, KIND_MAINTENANCE, describe_active
     admission_held = describe_active()
     for kind, label, _age in admission_held:
         if kind == KIND_MAINTENANCE:
             bg_tasks.append({'kind': BG_KIND_MAINTENANCE,
                              'label': 'Database maintenance', 'detail': label or 'Running',
                              'href': url_for('system.maintenance')})
+        elif kind == KIND_EPG_SCAN:
+            # The EPG similarity scan (dev/changelog/1325): the registry is its only
+            # live record too, the same way as maintenance above.
+            bg_tasks.append({'kind': BG_KIND_EPG_SCAN,
+                             'label': 'EPG similarity scan', 'detail': label or 'Running',
+                             'href': url_for('epg_manager.epg_manager')})
 
     bg_active = bool(bg_tasks)
 

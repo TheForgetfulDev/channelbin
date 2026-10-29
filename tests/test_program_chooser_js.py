@@ -259,6 +259,16 @@ class SingleChannelTests(_Base, unittest.TestCase):
         self.assertNotIn('Channel page', _labels(self.obs['tiles']))
 
 
+class SchedulesCardTests(_Base, unittest.TestCase):
+    """The group page's What's On card is already on the group's page (dev/changelog/1324)."""
+    SCENARIO = 'schedules_card'
+
+    def test_no_link_to_a_detail_page(self):
+        labels = _labels(self.obs['tiles'])
+        self.assertNotIn('Channel page', labels)
+        self.assertNotIn('Channel group page', labels)
+
+
 class PhoneTests(_Base, unittest.TestCase):
     SCENARIO = 'phone'
 

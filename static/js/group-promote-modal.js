@@ -195,7 +195,7 @@ function openPromoteModal(opts) {
     // §14.1: named as ONE outcome rather than as two separate warnings, because it is one
     // outcome - the user cannot see the combination by reading either half.
     if (state.enable === 'all' && state.unmatched === 'stop' && nUnmatched > 0) {
-      h += `<div class="notice notice-warn"><strong>&#9888; ${nUnmatched} member` +
+      h += `<div class="notice notice-warn"><strong>${icon('warning')} ${nUnmatched} member` +
         `${nUnmatched === 1 ? '' : 's'} will be set to record without being monitored.</strong><br>` +
         'That is allowed, and the member list will keep saying so. ChannelBin may pick ' +
         `${nUnmatched === 1 ? 'it' : 'one of them'} for a recording without knowing whether ` +

@@ -204,13 +204,13 @@ class DuplicateSetsWarningTests(_Base, unittest.TestCase):
 
     def test_provider_sets_are_one_line_counting_the_extras(self):
         w = self.obs['duplicate_sets_warning']['provider']
-        self.assertIn('⚠ 2 duplicate channels across accounts on <b>Strong</b>.', w['text'])
+        self.assertIn('2 duplicate channels across accounts on <b>Strong</b>.', w['text'])
         self.assertEqual(w['items'], 0)
         self.assertEqual(w['bold'], 0, 'the provider name is escaped')
 
     def test_url_sets_say_so(self):
         w = self.obs['duplicate_sets_warning']['url']
-        self.assertIn('⚠ 1 duplicate channel sharing a stream URL.', w['text'])
+        self.assertIn('1 duplicate channel sharing a stream URL.', w['text'])
 
     def test_both_kinds_share_the_line(self):
         w = self.obs['duplicate_sets_warning']['both']

@@ -613,6 +613,9 @@ class CssDeadClassTests(unittest.TestCase):
         'd-':                'recording_detail.html `run-tl-dot d-{{ rep.kind }}` (the segment timeline)',
         'hb-':               'the health-band modifier (app/health_bands.py): guide.js '
                              '`hb-${state}`, util.js::healthBandCss, and Jinja `| health_css`',
+        'sched-k-':          'guide-schedules.js::schedDecorateCell `sched-k-${prog.agreement}` '
+                             '(epg_sources.AGREE_*, dev/changelog/1324)',
+        'sched-gap-':        'guide-schedules.js `sched-gap-${prog.gap}` (epg_sources.GAP_*)',
     }
 
     # `.org` / `.w3` come from URLs inside the CSS (w3.org, fonts), not selectors.

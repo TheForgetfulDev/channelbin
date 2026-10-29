@@ -11,9 +11,9 @@
      hides at zero. Both nav copies (sidebar and phone drawer) carry the pair.
    * The rail has room for one mark, so the pip takes the worst color present.
    * The banner shows the alert the server picked (the most severe unread one). Its title
-     opens details, × marks it read in one click, "+N more" goes to Alerts.
+     opens details, the close icon marks it read in one click, "+N more" goes to Alerts.
    * Details has two buttons, Mark read and the destination. "Ignore future alerts like
-     this" stays reachable from here (dev/changelog/615), one level down behind ⋯. */
+     this" stays reachable from here (dev/changelog/615), one level down behind the kebab. */
 (() => {
   'use strict';
 
@@ -126,7 +126,7 @@
     }];
     if (a.link) {
       footer.push({
-        label: `${a.link_label} →`, class: 'btn btn-primary',
+        label: a.link_label, iconAfter: 'forward', class: 'btn btn-primary',
         onClick: (close) => { close(); window.location.href = a.link; },  // nav-ok: modal button
       });
     }
@@ -134,7 +134,7 @@
 
     const more = document.createElement('span');
     more.className = 'menu-wrap alert-detail-more';
-    more.innerHTML = '<button type="button" class="btn btn-icon" data-menu aria-label="More actions">&#8943;</button>'
+    more.innerHTML = `<button type="button" class="btn btn-icon" data-menu aria-label="More actions">${icon('more')}</button>`
       + '<div class="menu pop-up pop-left">'
       + '<button type="button" class="menu-item">Ignore future alerts like this</button></div>';
     more.querySelector('.menu-item').addEventListener('click', () => {

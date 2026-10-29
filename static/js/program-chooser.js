@@ -101,8 +101,9 @@
       acts.push({ icon: 'airings', label: 'Other airings', href: airings,
         tip: `Every showing of "${prog.title}" on every channel` });
     }
-    // The channel page's own What's on card is already that page.
-    if (!GUIDE_CONFIG.singleChannel) {
+    // Either card is already on that page: the channel page's What's On, and the group
+    // page's, whose every cell records from the group.
+    if ((GUIDE_CONFIG.embed || 'page') === 'page') {
       acts.push(ch.is_group
         ? { icon: 'group', label: 'Channel group page', href: GUIDE_CONFIG.groupDetailUrlBase + ch.group_id }
         : { icon: 'channel', label: 'Channel page', href: GUIDE_CONFIG.chDetailUrlBase + ch.id });
@@ -154,7 +155,7 @@
     jsonFetch(`/api/channels/${encodeURIComponent(t.id)}/test-now`, { method: 'POST' })
       .then((data) => {
         // The channel page refreshes itself when the result lands; the guide does not.
-        showToast(GUIDE_CONFIG.singleChannel
+        showToast(GUIDE_CONFIG.embed === 'channel'
           ? (data.message || `Testing "${t.name}" now.`)
           : `Testing "${t.name}" now. Its channel page shows the result when the test finishes.`);
       })

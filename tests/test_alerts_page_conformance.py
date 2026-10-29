@@ -415,7 +415,7 @@ class AlertsChannelLifecycleLinkTests(unittest.TestCase):
         html = self.client.get('/alerts').get_data(as_text=True)
         self.assertIn(f'/channels?f.other=new&amp;f.acct={acct_id}', html)
         self.assertIn(f'/channels?f.other=removed&amp;f.acct={acct_id}', html)
-        self.assertIn('>Channel Search &rarr;', html)
+        self.assertIn('>Channel Search <svg class="icon" data-icon="forward"', html)
 
     def test_an_alert_with_no_recognizable_source_gets_no_link(self):
         """A malformed or missing `source` must not crash the page - it just gets no
@@ -426,4 +426,4 @@ class AlertsChannelLifecycleLinkTests(unittest.TestCase):
                   source='not-the-expected-shape')
             db.session.commit()
         html = self.client.get('/alerts').get_data(as_text=True)
-        self.assertEqual(html.count('>Channel Search &rarr;'), 0)
+        self.assertEqual(html.count('>Channel Search <svg class="icon" data-icon="forward"'), 0)

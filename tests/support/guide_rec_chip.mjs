@@ -87,6 +87,7 @@ for (const status of STATUSES) {
     html,
     cls: window.recCssClass(status),
     text: node ? node.textContent.trim() : null,
+    icon: node && node.querySelector('[data-icon]') ? node.querySelector('[data-icon]').dataset.icon : null,
     tip: node ? node.getAttribute('data-tip') : null,
     badgeClass: node ? node.className : null,
     complained: errors.length > before,
@@ -112,6 +113,7 @@ const pnode = partialHolder.firstElementChild;
 const partial = {
   sentence: PARTIAL,
   text: pnode ? pnode.textContent.trim() : null,
+  icon: pnode && pnode.querySelector('[data-icon]') ? pnode.querySelector('[data-icon]').dataset.icon : null,
   tip: pnode ? pnode.getAttribute('data-tip') : null,
   badgeClass: pnode ? pnode.className : null,
   cls: window.recCssClass('COMPLETED', PARTIAL),
@@ -129,6 +131,7 @@ const snode = stoppedHolder.firstElementChild;
 const stopped = {
   sentence: STOPPED,
   text: snode ? snode.textContent.trim() : null,
+  icon: snode && snode.querySelector('[data-icon]') ? snode.querySelector('[data-icon]').dataset.icon : null,
   tip: snode ? snode.getAttribute('data-tip') : null,
   badgeClass: snode ? snode.className : null,
   cls: window.recCssClass('COMPLETED', null),
@@ -146,14 +149,15 @@ const stopped = {
 };
 
 // A SCHEDULED recording whose start time has come reads Starting, not Scheduled, until the
-// recorder flips it (dev/changelog/1290); and a cell too narrow for glyph and word keeps the
-// glyph alone, with the word in its label.
+// recorder flips it (dev/changelog/1290); and a cell too narrow for icon and word keeps the
+// icon alone, with the word in its label.
 const badge = (...args) => {
   const h = window.document.createElement('div');
   h.innerHTML = window.recStatusBadge(...args);
   const n = h.firstElementChild;
   return n ? { text: n.textContent.trim(), tip: n.getAttribute('data-tip'),
-               label: n.getAttribute('aria-label') } : null;
+               label: n.getAttribute('aria-label'),
+               icon: n.querySelector('[data-icon]') ? n.querySelector('[data-icon]').dataset.icon : null } : null;
 };
 const isoAt = (minutes) => new Date(Date.now() + minutes * 60000).toISOString().slice(0, 19);
 const starting = {

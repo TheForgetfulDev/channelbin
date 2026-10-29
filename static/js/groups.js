@@ -212,7 +212,7 @@
     const chip = document.getElementById(`sort-chip-${section}`);
     if (chip) {
       const descNow = (spec.desc ? 1 : -1) * st.dir > 0;
-      chip.textContent = `Sort: ${SORT_LABELS[st.k]} ${descNow ? '▾' : '▴'}`;
+      chip.innerHTML = `Sort: ${escHtml(SORT_LABELS[st.k])} ${icon(descNow ? 'sort-desc' : 'sort-asc')}`;
     }
     syncUrl();
   }
@@ -251,7 +251,7 @@
     const th = table.querySelector(`th[data-msort="${key}"]`);
     table.querySelectorAll('th.sortable').forEach(h => {
       h.classList.toggle('sorted', h === th);
-      h.querySelector('.arr').textContent = h === th ? (dir === 1 ? ' ▴' : ' ▾') : '';
+      h.querySelector('.arr').innerHTML = h === th ? ' ' + icon(dir === 1 ? 'sort-asc' : 'sort-desc') : '';
     });
     const tbody = table.querySelector('tbody');
     sortChildren(tbody, 'tr', (row) => {

@@ -57,7 +57,7 @@ _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # (dev/changelog/1186; named Auto-record in dev/changelog/1189).
 NAV_LABELS = [
     'Dashboard',
-    'Recordings', 'Auto-record', 'TV Guide', 'Channel Search', 'Channel Groups',
+    'Recordings', 'Auto-record', 'TV Guide', 'EPG Manager', 'Channel Search', 'Channel Groups',
     # Always in the markup, hidden once setup is done (dev/changelog/1280).
     'Get started',
     'Accounts', 'Recording Profiles', 'Health Check Profiles', 'Tags', 'Hide Rules',
@@ -174,7 +174,8 @@ class RenderedShellTests(unittest.TestCase):
             self.assertLess(shell.index('>Dashboard</span>'), shell.index('class="nav-section"'))
 
     def test_both_shells_render_the_same_icon_set(self):
-        icons_of = lambda s: re.findall(r'<svg class="nav-i"[^>]*>(.*?)</svg>', s, re.S)
+        # Every destination draws its registry icon with icon(name, 'nav-i') (app/icons.py).
+        icons_of = lambda s: re.findall(r'<svg class="(?:icon )?nav-i[^"]*"[^>]*>(.*?)</svg>', s, re.S)
         sidebar_icons = icons_of(self._sidebar())
         drawer_icons = icons_of(self._drawer())
         self.assertEqual(len(sidebar_icons), len(NAV_LABELS))

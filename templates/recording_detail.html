@@ -4,7 +4,7 @@
 {% block main_class %}detail-page{% endblock %}
 
 {% block content %}
-<a class="back" href="{{ url_for('recordings.index') }}">&larr; Recordings</a>
+<a class="back" href="{{ url_for('recordings.index') }}">{{ icon('back') }} Recordings</a>
 
 {# ── Header (DESIGN.md 3.8/3.10): h1 + badge + pills; contextual actions right.
    The whole slot is swapped by the 15s auto-refresh, so action handlers below
@@ -17,7 +17,7 @@
       <span id="status-badge" data-status="{{ rec.status }}">{{ status_badge(row.badge_class, row.badge_label, pulse=row.badge_pulse, lg=true) }}</span>
       {#- Words here, where the list has a column heading to lean on and this page has none:
           a bare green check beside the status read as nothing at all. -#}
-      {% if row.health.tip %}<span class="h-mini {{ row.health.cls }} tip-plain" data-tip="{{ row.health.tip }}">{{ row.health.text or row.health.label }}</span>
+      {% if row.health.tip %}<span class="h-mini {{ row.health.cls }} tip-plain" data-tip="{{ row.health.tip }}">{% if row.health.icon %}{{ icon(row.health.icon) }} {% endif %}{{ row.health.text or row.health.label }}</span>
       {% else %}<span class="h-mini na">-</span>{% endif %}
       {% if row.pill %}{{ channel_pill(row.pill.label, row.pill.url, logo_url=row.pill.logo_url, initials=row.pill.initials, acct_color=row.pill.acct_color) }}{% endif %}
       {% if row.member_pill %}{{ channel_pill(row.member_pill.label, row.member_pill.url, logo_url=row.member_pill.logo_url, initials=row.member_pill.initials, acct_color=row.member_pill.acct_color, tip=row.member_pill.tip) }}{% endif %}
@@ -26,7 +26,7 @@
       {# dev/changelog/1189. Cancelling a rule's recording sticks: the rule's ledger keeps the
          decision, so the tooltip says so where the cancel is offered. #}
       <a class="tip-plain" href="{{ made_by_rule.url }}"
-         data-tip="Made by an auto-record rule.&#10;Cancelling it here sticks: the rule does not schedule this program again.">Scheduled by rule {{ made_by_rule.name }} &rarr;</a>
+         data-tip="Made by an auto-record rule.&#10;Cancelling it here sticks: the rule does not schedule this program again.">Scheduled by rule {{ made_by_rule.name }} {{ icon('forward') }}</a>
       {% endif %}
     </div>
   </div>
@@ -36,10 +36,10 @@
           (dev/changelog/1316). -#}
       {% if play_offer.play %}<button class="btn tip-plain" data-act="play" data-tip="Watch this recording as it is captured, or skip back into what it has so far.">Play</button>{% endif %}
       {% if rec.status == REC_STATUS.PAUSED %}
-      <button class="btn" data-act="resume">&#9654; Resume</button>
+      <button class="btn" data-act="resume">{{ icon('resume') }} Resume</button>
       {% else %}
       <button class="btn tip-plain" data-act="extend" data-tip="Push the stop time 30 minutes later.">+30 min</button>
-      <button class="btn tip-plain" data-act="pause" data-tip="Pause capturing, keep the recording open.&#10;ffmpeg stops and the connection slot is freed; Resume later.&#10;The paused span becomes a gap in the output.">&#9208; Pause</button>
+      <button class="btn tip-plain" data-act="pause" data-tip="Pause capturing, keep the recording open.&#10;ffmpeg stops and the connection slot is freed; Resume later.&#10;The paused span becomes a gap in the output.">{{ icon('pause') }} Pause</button>
       {% if rec.group_id %}
       {# A group recording only: the Switch channel dialog (static/js/recording-switch.js,
          dev/changelog/1254). "Channel", not "member" - a group's member is a channel
@@ -47,9 +47,9 @@
       <button class="btn tip-plain" data-act="switch" data-tip="Move this recording to another channel in the group now.&#10;You pick the channel; the recording carries on from it.">Switch channel</button>
       {% endif %}
       {% endif %}
-      <button class="btn btn-danger tip-plain" data-act="stop" data-tip="End the recording now, for good.&#10;Capture stops and the segments are joined into the final file.&#10;Can't be resumed.">&#9632; Stop</button>
+      <button class="btn btn-danger tip-plain" data-act="stop" data-tip="End the recording now, for good.&#10;Capture stops and the segments are joined into the final file.&#10;Can't be resumed.">{{ icon('stop') }} Stop</button>
       <div class="menu-wrap">
-        <button class="btn btn-icon" data-menu>&#8943;</button>
+        <button class="btn btn-icon" data-menu>{{ icon('more') }}</button>
         <div class="menu">
           <button class="menu-item" data-act="block">Block accounts...</button>
           <div class="sep"></div>
@@ -63,9 +63,9 @@
       </div>
     {% elif rec.status == REC_STATUS.RETRYING %}
       {% if play_offer.play %}<button class="btn tip-plain" data-act="play" data-tip="Watch what was captured before the stream dropped.">Play</button>{% endif %}
-      <button class="btn btn-danger tip-plain" data-act="stop" data-tip="End the recording now, for good.&#10;Whatever was captured before the retry is joined into the final file.&#10;Can't be resumed.">&#9632; Stop</button>
+      <button class="btn btn-danger tip-plain" data-act="stop" data-tip="End the recording now, for good.&#10;Whatever was captured before the retry is joined into the final file.&#10;Can't be resumed.">{{ icon('stop') }} Stop</button>
       <div class="menu-wrap">
-        <button class="btn btn-icon" data-menu>&#8943;</button>
+        <button class="btn btn-icon" data-menu>{{ icon('more') }}</button>
         <div class="menu">
           <button class="menu-item" data-act="block">Block accounts...</button>
           <div class="sep"></div>
@@ -80,7 +80,7 @@
     {% elif rec.status == REC_STATUS.SCHEDULED %}
       <button class="btn" onclick="openEditModal()">Edit schedule</button>
       <div class="menu-wrap">
-        <button class="btn btn-icon" data-menu>&#8943;</button>
+        <button class="btn btn-icon" data-menu>{{ icon('more') }}</button>
         <div class="menu">
           <a href="{{ url_for('logs.logs_page') }}">View log lines</a>
           <button class="menu-item" data-secs-open>Customize sections...</button>
@@ -104,9 +104,9 @@
       {% endif %}
       {#- A kept .ts plays through the preview pipeline (dev/changelog/1314). -#}
       {% if play_offer.play %}<button class="btn" data-act="play">Play</button>{% endif %}
-      <a class="btn" href="{{ find_airing_url }}">&#8635; Record again</a>
+      <a class="btn" href="{{ find_airing_url }}">{{ icon('record-again') }} Record again</a>
       <div class="menu-wrap">
-        <button class="btn btn-icon" data-menu>&#8943;</button>
+        <button class="btn btn-icon" data-menu>{{ icon('more') }}</button>
         <div class="menu">
           <a href="{{ url_for('logs.logs_page') }}">View log lines</a>
           <button class="menu-item" data-secs-open>Customize sections...</button>
@@ -132,7 +132,7 @@
           touched when it is clicked. -#}
       {% if play_offer.play %}<button class="btn{{ '' if (gaps_retry or recover_act == 'retry-convert') else ' btn-primary' }}" data-act="play">Play</button>{% endif %}
       <div class="menu-wrap">
-        <button class="btn btn-icon" data-menu>&#8943;</button>
+        <button class="btn btn-icon" data-menu>{{ icon('more') }}</button>
         <div class="menu">
           <a href="{{ url_for('logs.logs_page') }}">View log lines</a>
           <button class="menu-item" data-secs-open>Customize sections...</button>
@@ -149,10 +149,10 @@
       {#- CONCATENATING offers no cancel: that step is unreachable from here and is the one
           that makes the file. ANALYZING does, because the file is already whole on disk by
           then and the work still running only reads it (dev/changelog/867). -#}
-      {% if rec.status == REC_STATUS.CONVERTING %}<button class="btn btn-danger" data-act="cancel-convert">&#9632; Cancel conversion</button>{% endif %}
-      {% if rec.status == REC_STATUS.ANALYZING %}<button class="btn btn-danger" data-act="cancel-analysis">&#9632; Cancel processing</button>{% endif %}
+      {% if rec.status == REC_STATUS.CONVERTING %}<button class="btn btn-danger" data-act="cancel-convert">{{ icon('stop') }} Cancel conversion</button>{% endif %}
+      {% if rec.status == REC_STATUS.ANALYZING %}<button class="btn btn-danger" data-act="cancel-analysis">{{ icon('stop') }} Cancel processing</button>{% endif %}
       <div class="menu-wrap">
-        <button class="btn btn-icon" data-menu>&#8943;</button>
+        <button class="btn btn-icon" data-menu>{{ icon('more') }}</button>
         <div class="menu">
           <a href="{{ url_for('logs.logs_page') }}">View log lines</a>
           <button class="menu-item" data-secs-open>Customize sections...</button>
@@ -164,7 +164,7 @@
     {% else %}
       {# unknown status: log-visible, no actions offered #}
       <div class="menu-wrap">
-        <button class="btn btn-icon" data-menu>&#8943;</button>
+        <button class="btn btn-icon" data-menu>{{ icon('more') }}</button>
         <div class="menu"><a href="{{ url_for('logs.logs_page') }}">View log lines</a></div>
       </div>
     {% endif %}
@@ -179,13 +179,13 @@
   {% if rec.status in (REC_STATUS.IN_PROGRESS, REC_STATUS.PAUSED) %}
     <button class="btn tip-plain" data-act="extend" data-tip="Push the stop time 30 minutes later.">+30 min</button>
     {% if rec.status == REC_STATUS.PAUSED %}
-    <button class="btn" data-act="resume">&#9654; Resume</button>
+    <button class="btn" data-act="resume">{{ icon('resume') }} Resume</button>
     {% else %}
-    <button class="btn" data-act="pause">&#9208; Pause</button>
+    <button class="btn" data-act="pause">{{ icon('pause') }} Pause</button>
     {% endif %}
-    <button class="btn btn-danger" data-act="stop">&#9632; Stop</button>
+    <button class="btn btn-danger" data-act="stop">{{ icon('stop') }} Stop</button>
     <div class="menu-wrap">
-      <button class="btn btn-icon" data-menu>&#8943;</button>
+      <button class="btn btn-icon" data-menu>{{ icon('more') }}</button>
       <div class="menu pop-up">
         {#- The bar's two slots stay Pause/Resume and Stop (DESIGN.md 9.5); Play leads the
             kebab (dev/changelog/1316). -#}
@@ -204,9 +204,9 @@
       </div>
     </div>
   {% elif rec.status == REC_STATUS.RETRYING %}
-    <button class="btn btn-danger" data-act="stop">&#9632; Stop</button>
+    <button class="btn btn-danger" data-act="stop">{{ icon('stop') }} Stop</button>
     <div class="menu-wrap">
-      <button class="btn btn-icon" data-menu>&#8943;</button>
+      <button class="btn btn-icon" data-menu>{{ icon('more') }}</button>
       <div class="menu pop-up">
         {% if play_offer.play %}<button class="menu-item" data-act="play">Play</button>{% endif %}
         <button class="menu-item" data-act="block">Block accounts...</button>
@@ -222,7 +222,7 @@
   {% elif rec.status == REC_STATUS.SCHEDULED %}
     <button class="btn" onclick="openEditModal()">Edit schedule</button>
     <div class="menu-wrap">
-      <button class="btn btn-icon" data-menu>&#8943;</button>
+      <button class="btn btn-icon" data-menu>{{ icon('more') }}</button>
       <div class="menu pop-up">
         <a href="{{ url_for('logs.logs_page') }}">View log lines</a>
         <button class="menu-item" data-secs-open>Customize sections...</button>
@@ -239,10 +239,10 @@
     {% if recover_act %}
     <button class="btn btn-primary" data-act="{{ recover_act }}">{{ 'Retry conversion' if recover_act == 'retry-convert' else 'Retry join' }}</button>
     {% endif %}
-    <a class="btn" href="{{ find_airing_url }}">&#8635; Record again</a>
+    <a class="btn" href="{{ find_airing_url }}">{{ icon('record-again') }} Record again</a>
     {% if not recover_act %}<button class="btn btn-danger" data-act="delete">Delete</button>{% endif %}
     <div class="menu-wrap">
-      <button class="btn btn-icon" data-menu>&#8943;</button>
+      <button class="btn btn-icon" data-menu>{{ icon('more') }}</button>
       <div class="menu pop-up">
         <a href="{{ url_for('logs.logs_page') }}">View log lines</a>
         <button class="menu-item" data-secs-open>Customize sections...</button>
@@ -270,7 +270,7 @@
     {% if play_offer.play %}<button class="btn{{ '' if promoted_retry else ' btn-primary' }}" data-act="play">Play</button>{% endif %}
     {% if delete_in_bar %}<button class="btn btn-danger" data-act="delete">Delete</button>{% endif %}
     <div class="menu-wrap">
-      <button class="btn btn-icon" data-menu>&#8943;</button>
+      <button class="btn btn-icon" data-menu>{{ icon('more') }}</button>
       <div class="menu pop-up">
         <a href="{{ url_for('logs.logs_page') }}">View log lines</a>
         <button class="menu-item" data-secs-open>Customize sections...</button>
@@ -286,10 +286,10 @@
       </div>
     </div>
   {% elif rec.status in (REC_STATUS.CONCATENATING, REC_STATUS.ANALYZING, REC_STATUS.CONVERTING) %}
-    {% if rec.status == REC_STATUS.CONVERTING %}<button class="btn btn-danger" data-act="cancel-convert">&#9632; Cancel conversion</button>{% endif %}
-    {% if rec.status == REC_STATUS.ANALYZING %}<button class="btn btn-danger" data-act="cancel-analysis">&#9632; Cancel processing</button>{% endif %}
+    {% if rec.status == REC_STATUS.CONVERTING %}<button class="btn btn-danger" data-act="cancel-convert">{{ icon('stop') }} Cancel conversion</button>{% endif %}
+    {% if rec.status == REC_STATUS.ANALYZING %}<button class="btn btn-danger" data-act="cancel-analysis">{{ icon('stop') }} Cancel processing</button>{% endif %}
     <div class="menu-wrap">
-      <button class="btn btn-icon" data-menu>&#8943;</button>
+      <button class="btn btn-icon" data-menu>{{ icon('more') }}</button>
       <div class="menu pop-up">
         <a href="{{ url_for('logs.logs_page') }}">View log lines</a>
         <button class="menu-item" data-secs-open>Customize sections...</button>
@@ -301,7 +301,7 @@
   {% else %}
     {# unknown status: log-visible, no actions offered - matches .dh-actions above #}
     <div class="menu-wrap">
-      <button class="btn btn-icon" data-menu>&#8943;</button>
+      <button class="btn btn-icon" data-menu>{{ icon('more') }}</button>
       <div class="menu pop-up"><a href="{{ url_for('logs.logs_page') }}">View log lines</a></div>
     </div>
   {% endif %}
@@ -344,16 +344,16 @@
 </div>
 {% elif rec.status == REC_STATUS.RETRYING %}
 <div class="live-strip">
-  <span class="fx">&#8635;</span>
+  <span class="fx">{{ icon('retrying') }}</span>
   <span>The stream kept failing right after each reconnect - waiting to try again
     {%- if rec.next_retry_at %} at <b>{{ rec.next_retry_at | local_time_sec }}</b>{% endif %}
     (attempt <b>{{ rec.dead_stream_retry_count }}</b> of <b>{{ max_dead_stream_retry_attempts }}</b>)</span>
   <span class="sep-dot">·</span>
-  <span>Stop keeps what was captured; Abort, in the &#8943; menu, discards it</span>
+  <span>Stop keeps what was captured; Abort, in the {{ icon('more') }} menu, discards it</span>
 </div>
 {% elif rec.status == REC_STATUS.SCHEDULED %}
 <div class="live-strip sched-strip">
-  <span class="fx">&#128337;</span>
+  <span class="fx">{{ icon('time') }}</span>
   <span>Scheduled to start <b>{{ rec.start_time | local_time }}</b></span>
   <span class="sep-dot">·</span>
   <span>{{ row.rel }}</span>
@@ -390,7 +390,7 @@
    over while the row sits idle for however long the other recording takes. No pulse: this
    phase is genuinely doing nothing (dev/changelog/954). #}
 <div class="live-strip concat-strip">
-  <span class="fx">&#9208;</span>
+  <span class="fx">{{ icon('pause') }}</span>
   <span><b>Waiting</b> - the file has been checked and is ready to convert, but recording <b>"{{ rec.postprocess_waiting_on_name }}"</b> {{ rec.postprocess_waiting_on_state }}. The conversion will start automatically when no recordings are active.</span>
   <span class="sep-dot">·</span>
   <span>waiting since <span class="mono">{{ rec.postprocess_waiting_since | local_time_sec }}</span></span>
@@ -427,7 +427,7 @@
    instead of shown (dev/changelog/952, 954). What IS shown is how much survived the pause,
    because the whole point of item 2 was that none of it is thrown away. #}
 <div class="live-strip concat-strip">
-  <span class="fx">&#9208;</span>
+  <span class="fx">{{ icon('pause') }}</span>
   <span><b>Paused{% if rec.conversion_progress_pct is not none %} at {{ rec.conversion_progress_pct | round(0) | int }}%{% endif %}</b>{% if rec.conversion_out_size %} - <b>{{ rec.conversion_out_size | filesize }}</b> written so far and kept{% endif %}, waiting on recording <b>"{{ rec.postprocess_waiting_on_name }}"</b> to complete. Conversion will resume automatically when no recordings are active.</span>
   <span class="sep-dot">·</span>
   <span>paused since <span class="mono">{{ rec.postprocess_waiting_since | local_time_sec }}</span></span>
@@ -459,12 +459,12 @@
 </div>
 {% elif rec.status == REC_STATUS.COMPLETED %}
 <div class="live-strip done-strip">
-  <span class="fx">&#10003;</span>
+  <span class="fx">{{ icon('ok') }}</span>
   {# joinable_count, not rec.segments|length: a successful concat consumes its segments, so
      this is counted from the rows that were actually fed to it (the files are gone). The
      row count includes zero-byte segments and discarded placeholders, which is how a join
      of 16 used to describe itself as 19 here and on the strip above. #}
-  <span>Joined <b>{{ joinable_count }}{% if rec.segments | length > joinable_count %} of {{ rec.segments | length }}{% endif %} segment{{ '' if (rec.segments | length) == 1 else 's' }}</b>{% if rec.final_file_size %} &rarr; <b>{{ rec.final_file_size | filesize }}</b>{% endif %}</span>
+  <span>Joined <b>{{ joinable_count }}{% if rec.segments | length > joinable_count %} of {{ rec.segments | length }}{% endif %} segment{{ '' if (rec.segments | length) == 1 else 's' }}</b>{% if rec.final_file_size %} {{ icon('forward') }} <b>{{ rec.final_file_size | filesize }}</b>{% endif %}</span>
   {% if join_left_out.empty %}
   <span class="sep-dot">·</span>
   <span>{{ join_left_out.empty }} held no data</span>
@@ -489,7 +489,7 @@
 </div>
 {% elif rec.status == REC_STATUS.FAILED %}
 <div class="live-strip fail-strip">
-  <span class="fx">&#10007;</span>
+  <span class="fx">{{ icon('failed') }}</span>
   {# Every branch here names a real state, one per app/database.py FAILURE_* value
      (tests/test_failure_reason_disclosure.py enforces it). The trailing else claims
      nothing it cannot know: it used to say "the stream could not be reached" and was
@@ -530,7 +530,7 @@
 </div>
 {% elif rec.status == REC_STATUS.ABORTED %}
 <div class="live-strip abort-strip">
-  <span class="fx">&#9632;</span>
+  <span class="fx">{{ icon('stop') }}</span>
   {# Two halves, same shape as the FAILED strip above: why the row was cancelled, then what
      is left on disk. One branch per app/database.py CANCEL_* value
      (tests/test_cancel_reason_disclosure.py enforces it). This whole strip used to be the
@@ -889,7 +889,7 @@
             and nothing on the row said so (dev/changelog/1285). The length carries its
             seconds, as What happened's does: "2m" here beside "2m 35s of video" there read as
             two files (dev/changelog/1287). -#}
-        <div class="srow"><span class="sk">Captured</span><span class="sv{% if row.dur_flag == 'partial' %} warn{% endif %}{% if cap_tip %} tip-plain" data-tip="{{ cap_tip }}{% endif %}">{% if row.dur_flag %}<span class="dur-flag{% if row.dur_flag == 'partial' %} dur-amber{% elif row.dur_flag == 'stopped' %} dur-quiet{% endif %}">&#9685;</span>{% endif %}{{ row.dur_long or '-' }} of {{ (rec.scheduled_duration_seconds | int) | duration }} scheduled{% if into >= 60 %}, from {{ into | int | duration }} into the program{% endif %}</span></div>
+        <div class="srow"><span class="sk">Captured</span><span class="sv{% if row.dur_flag == 'partial' %} warn{% endif %}{% if cap_tip %} tip-plain" data-tip="{{ cap_tip }}{% endif %}">{% if row.dur_flag %}<span class="dur-flag{% if row.dur_flag == 'partial' %} dur-amber{% elif row.dur_flag == 'stopped' %} dur-quiet{% endif %}">{{ icon('partial') }}</span>{% endif %}{{ row.dur_long or '-' }} of {{ (rec.scheduled_duration_seconds | int) | duration }} scheduled{% if into >= 60 %}, from {{ into | int | duration }} into the program{% endif %}</span></div>
         {% endif %}
         {% if rec.program_duration_seconds is not none and (rec.program_duration_seconds - rec.scheduled_duration_seconds) | abs >= 60 %}
         {% set short_end = (rec.program_stop_time - sched_stop).total_seconds() %}
@@ -1680,7 +1680,7 @@ window.onScheduleSaved = () => window.location.reload();
         item.className = 'col-item';
         item.draggable = true;
         item.dataset.key = key;
-        item.innerHTML = `<span class="grip">&#8942;&#8942;</span><input type="checkbox" ${state.hidden.includes(key) ? '' : 'checked'}> ${s.label}`;
+        item.innerHTML = `<span class="grip">${icon('drag')}</span><input type="checkbox" ${state.hidden.includes(key) ? '' : 'checked'}> ${s.label}`;
         item.querySelector('input').addEventListener('change', (e) => {
           if (e.target.checked) state.hidden = state.hidden.filter(k => k !== key);
           else if (!state.hidden.includes(key)) state.hidden.push(key);

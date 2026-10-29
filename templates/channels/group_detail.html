@@ -34,7 +34,7 @@
 {% block content %}
 <div class="page-head">
   <h1>Channel Groups</h1>
-  <a href="{{ url_for('channel_groups.groups_page') }}" class="btn">&larr; All Groups</a>
+  <a href="{{ url_for('channel_groups.groups_page') }}" class="btn">{{ icon('back') }} All Groups</a>
 </div>
 
 {# ── Header ─────────────────────────────────────────────────────────────── #}
@@ -46,11 +46,11 @@
          (DESIGN-channel-groups-model.md DECIDED 2). What changes is the claim the
          tooltip makes, which has to match what `records` says. #}
       {% if is_stored and records %}
-      <span class="gd-kind tip-plain" data-tip="Channel group.&#10;Appears in the TV Guide as one row. Records the best enabled channel and fails over to the next-best feed.">&#9939;</span>
+      <span class="gd-kind tip-plain" data-tip="Channel group.&#10;Appears in the TV Guide as one row. Records the best enabled channel and fails over to the next-best feed.">{{ icon('group') }}</span>
       {% elif is_stored %}
-      <span class="gd-kind tip-plain" data-tip="Channel group.&#10;Duplicate feeds of one channel. No member is enabled for recording, so nothing records from it and it holds no guide row - it is a health check until Recording is turned on for a member.">&#9939;</span>
+      <span class="gd-kind tip-plain" data-tip="Channel group.&#10;Duplicate feeds of one channel. No member is enabled for recording, so nothing records from it and it holds no guide row - it is a health check until Recording is turned on for a member.">{{ icon('group') }}</span>
       {% else %}
-      <span class="gd-kind tip-plain" data-tip="Health check.&#10;{{ system_check_sentence }} It never appears in the guide and never records.">&#10003;</span>
+      <span class="gd-kind tip-plain" data-tip="Health check.&#10;{{ system_check_sentence }} It never appears in the guide and never records.">{{ icon('health-check') }}</span>
       {% endif %}
       <h2>{{ group.name }}</h2>
       {% if is_system %}
@@ -59,7 +59,7 @@
       {% if is_stored and group.health_score is not none %}
       {% set hscore = [[group.health_score | round | int, 100] | min, 0] | max %}
       <span class="h-mini {{ hscore | health_css(health_bands) }} tip-plain"
-            data-tip="Group health {{ hscore }}.&#10;Total-churn recording quality across all channels, weighted toward the feeds recordings actually use. Built from {{ group.health_score_sample_count }} recording observation{{ 's' if group.health_score_sample_count != 1 else '' }}.">&#9733; {{ hscore }}</span>
+            data-tip="Group health {{ hscore }}.&#10;Total-churn recording quality across all channels, weighted toward the feeds recordings actually use. Built from {{ group.health_score_sample_count }} recording observation{{ 's' if group.health_score_sample_count != 1 else '' }}.">{{ icon('health-score') }} {{ hscore }}</span>
       {% endif %}
       {% if is_stored and group.in_guide %}
       {# Group membership stopped hiding a member's own guide row in dev/changelog/751 -
@@ -205,9 +205,9 @@
     {% elif bar_state == 'stuck' %}
     <button class="btn btn-danger btn-sm" data-act="force-cancel">Force cancel</button>
     {% elif bar_state == 'scheduled_once' %}
-    <button class="btn btn-primary btn-sm" data-act="run-now">&#9654; Test now</button>
+    <button class="btn btn-primary btn-sm" data-act="run-now">{{ icon('test') }} Test now</button>
     {% elif bar_state in ('scheduled_recurring', 'queued', 'completed', 'cancelled') %}
-    <button class="btn btn-primary btn-sm" data-act="start">&#9654; Test now</button>
+    <button class="btn btn-primary btn-sm" data-act="start">{{ icon('test') }} Test now</button>
     {% endif %}
     {# The four secondary actions leave the bar at phone width: .mobile-actbar clones this
        element's children, and at 375px five buttons scroll sideways inside it with only two
@@ -225,7 +225,7 @@
     <button class="btn btn-sm" data-act="guide-toggle">{{ 'Remove from Guide' if group.in_guide else '+ Add to Guide' }}</button>
     {% endif %}
     <span class="menu-wrap">
-      <button class="btn btn-sm btn-icon" data-menu aria-label="More actions">&#8943;</button>
+      <button class="btn btn-sm btn-icon" data-menu aria-label="More actions">{{ icon('more') }}</button>
       <div class="menu" id="gd-kebab">
         {% if is_stored and not is_system %}
         <button class="menu-item" data-act="rename">Rename</button>
@@ -394,7 +394,7 @@
         <span class="search-wrap" id="gd-search-wrap">
           <input class="search" id="gd-search" placeholder="Filter by channel name&hellip;">
           <button class="search-clear" id="gd-search-clear" type="button" aria-label="Clear search"
-                  data-tip="Clear filter.&#10;Empties the box and shows every channel again.">&times;</button>
+                  data-tip="Clear filter.&#10;Empties the box and shows every channel again.">{{ icon('close') }}</button>
         </span>
         {# ONE filter control (DESIGN.md 3.11), not four standing ones. + Filter opens the
            dimension list; every chosen value comes back as its own removable chip, so the
@@ -418,9 +418,9 @@
           </div>
         </div>
         <span class="menu-wrap gd-phone-hide">
-          <button class="btn btn-sm" data-menu>&#9881; Columns</button>
+          <button class="btn btn-sm" data-menu>{{ icon('layout') }} Columns</button>
           <div class="menu" id="gd-col-menu">
-            <div class="pop-title">Columns - drag &#8942;&#8942; to reorder</div>
+            <div class="pop-title">Columns - drag {{ icon('drag') }} to reorder</div>
             <div class="pop-note">Saved to the server - follows you across browsers. Kept separately
               for a health-check view and a channel-group-only view.</div>
           </div>
@@ -434,14 +434,14 @@
         <label class="gd-bulk-lbl"><input type="checkbox" id="gd-select-all"> Select all visible</label>
         <span class="text-muted small" id="gd-sel-count">0 selected</span>
         <button class="btn btn-sm" id="gd-clear-selection" style="display:none;">Clear</button>
-        <button class="btn btn-primary btn-sm" id="gd-test-selected" disabled>&#9654; Test selected</button>
+        <button class="btn btn-primary btn-sm" id="gd-test-selected" disabled>{{ icon('test') }} Test selected</button>
         {% if is_stored %}
         {# Setting one switch 30 times is the work the columns exist to make cheap, so the
            selection gets the same two verbs a row does. Both go through the same route,
            and therefore the same single writer, as the row switches. #}
         <span class="menu-wrap">
           <button class="btn btn-sm" id="gd-bulk-rec" data-menu disabled
-                  data-tip="Recording.&#10;Turn the Recording switch on or off for every selected member at once.">Recording &#9662;</button>
+                  data-tip="Recording.&#10;Turn the Recording switch on or off for every selected member at once.">Recording {{ icon('dropdown') }}</button>
           <div class="menu">
             <button class="menu-item" data-bulk="rec:on">Turn on</button>
             <button class="menu-item" data-bulk="rec:off">Turn off</button>
@@ -449,7 +449,7 @@
         </span>
         <span class="menu-wrap">
           <button class="btn btn-sm" id="gd-bulk-test" data-menu disabled
-                  data-tip="Health check.&#10;Turn the Health check switch on or off for every selected member at once.">Health check &#9662;</button>
+                  data-tip="Health check.&#10;Turn the Health check switch on or off for every selected member at once.">Health check {{ icon('dropdown') }}</button>
           <div class="menu">
             <button class="menu-item" data-bulk="test:on">Turn on</button>
             <button class="menu-item" data-bulk="test:off">Turn off</button>
@@ -495,6 +495,8 @@
     </div>
   </div>
 
+  {% if whatson %}{% include 'channels/_group_whats_on.html' %}{% endif %}
+
   <div class="card" data-section="activity">
     <div class="card-head"><h2>Activity timeline</h2></div>
     <div class="card-body">
@@ -516,11 +518,11 @@
         {% if timeline_pagination and timeline_pagination.pages > 1 %}
         <div class="test-history-pagination">
           {% if timeline_pagination.has_prev %}
-          <a href="{{ request.path }}?timeline_per_page={{ timeline_per_page }}&timeline_page={{ timeline_pagination.prev_num }}" class="btn btn-sm">&larr; Prev</a>
+          <a href="{{ request.path }}?timeline_per_page={{ timeline_per_page }}&timeline_page={{ timeline_pagination.prev_num }}" class="btn btn-sm">{{ icon('back') }} Prev</a>
           {% endif %}
           <span class="text-muted small">Page {{ timeline_pagination.page }} of {{ timeline_pagination.pages }}</span>
           {% if timeline_pagination.has_next %}
-          <a href="{{ request.path }}?timeline_per_page={{ timeline_per_page }}&timeline_page={{ timeline_pagination.next_num }}" class="btn btn-sm">Next &rarr;</a>
+          <a href="{{ request.path }}?timeline_per_page={{ timeline_per_page }}&timeline_page={{ timeline_pagination.next_num }}" class="btn btn-sm">Next {{ icon('forward') }}</a>
           {% endif %}
         </div>
         {% endif %}
@@ -622,4 +624,38 @@ window.GROUP_DETAIL = {
 {# Ahead of group-detail.js, which builds its filter bar at load (DESIGN.md 3.11). #}
 <script src="{{ url_for('static', filename='js/filter-bar.js') }}"></script>
 <script src="{{ url_for('static', filename='js/group-detail.js') }}"></script>
+{% if whatson %}
+{# The What's On card: the TV Guide's own grid in its `schedules` embed mode
+   (dev/changelog/1324). guide.css only loads where a grid is drawn. #}
+<link rel="stylesheet" href="{{ url_for('static', filename='css/guide.css') }}">
+<script>
+const GUIDE_CONFIG = {
+  embed: 'schedules',
+  epgUrl: '{{ url_for("guide.epg_api") }}',
+  groupId: {{ group.id }},
+  savedSearchesUrl: '{{ url_for("guide.list_saved_searches") }}',
+  newRecordingUrl: '{{ url_for("recordings.new_recording") }}',
+  editRecordingUrlBase: '/recordings/',
+  recDetailUrlBase: '/recordings/',
+  windowDays: {{ whatson.window_days }},
+  // The card's own Layout, under its own keys (routes/guide.py::GROUP_WHATSON_LAYOUT_PREF_KEY).
+  // `layoutMobile` is also the opt-in to the mobile guide's behaviors (guide.js::isMobileGuide).
+  layout: {{ whatson.layout | tojson }},
+  layoutPrefKey: {{ whatson.layout_pref_key | tojson }},
+  layoutMobile: {{ whatson.layout_mobile | tojson }},
+  layoutMobilePrefKey: {{ whatson.layout_mobile_pref_key | tojson }},
+  programAiringsUrl: {{ whatson.program_airings_url | tojson }},
+  profiles: {
+    {% for p in recording_profiles %}
+    '{{ p.id }}': { prePaddingMinutes: {{ p.pre_padding_minutes }}, postPaddingMinutes: {{ p.post_padding_minutes }} },
+    {% endfor %}
+  },
+};
+</script>
+<script src="{{ url_for('static', filename='js/guide.js') }}"></script>
+<script src="{{ url_for('static', filename='js/guide-schedules.js') }}"></script>
+<script src="{{ url_for('static', filename='js/recording-player.js') }}"
+        data-hls-js="{{ url_for('static', filename='vendor/hls.js/hls.light.min.js') }}"></script>
+<script src="{{ url_for('static', filename='js/program-chooser.js') }}"></script>
+{% endif %}
 {% endblock %}

@@ -107,14 +107,19 @@ class OpenSignatureTests(_Capture):
     def test_a_first_byte_slower_than_the_read_timeout_fails_the_open(self):
         """dev/changelog/958: -rw_timeout bounds the first read, and ffmpeg does not reconnect
         out of a timed-out open."""
-        f = self.sim.inject('slow_first_byte', self.label, seconds=2.5)
-        rc, text, size, _ = self.capture(seconds=3)
+        # ffmpeg gives up about 0.1 s past the read timeout. Each delay sits seconds from that
+        # edge, because a loaded box eats into the margin from both sides: the simulator
+        # answers late, and a starved ffmpeg can wake to an answer that came after its
+        # deadline. A 0.5 s delay against a 1 s timeout went red in a full suite run
+        # (dev/changelog/1328).
+        f = self.sim.inject('slow_first_byte', self.label, seconds=6.0)
+        rc, text, size, _ = self.capture(seconds=3, read_timeout=3)
         self.assertNotEqual(rc, 0)
         self.assertEqual(size, 0)
         self.assertIn(TIMED_OUT, text)
         self.sim.clear(f)
         self.sim.inject('slow_first_byte', self.label, seconds=0.5)
-        rc, text, size, _ = self.capture(seconds=3)
+        rc, text, size, _ = self.capture(seconds=3, read_timeout=3)
         self.assertEqual(rc, 0)
         self.assertGreater(size, 0)
 

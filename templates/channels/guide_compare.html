@@ -46,7 +46,7 @@
 
 <div class="page-head">
   <h1>Compare guide sources <span class="sub">{{ channel.name }}</span></h1>
-  <a href="{{ url_for('channels.channel_detail', channel_id=channel.id) }}" class="btn">&larr; {{ channel.name }}</a>
+  <a href="{{ url_for('channels.channel_detail', channel_id=channel.id) }}" class="btn">{{ icon('back') }} {{ channel.name }}</a>
 </div>
 <p class="page-sub">
   What each guide this channel's account reads lists for it, from now on, lined up by start

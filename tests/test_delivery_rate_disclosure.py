@@ -351,7 +351,7 @@ class ListPagePillTests(unittest.TestCase):
         health = self._row(rec.id)['health']
 
         self.assertEqual(health['cls'], 'warn')
-        self.assertNotIn('✓', health['label'])
+        self.assertNotEqual(health['icon'], 'ok')
         self.assertIn('faster than real time', health['tip'])
         self.assertIn('worth checking', health['tip'])
 
@@ -363,7 +363,7 @@ class ListPagePillTests(unittest.TestCase):
         health = self._row(rec.id)['health']
 
         self.assertEqual(health['cls'], 'ok')
-        self.assertIn('✓', health['label'])
+        self.assertEqual(health['icon'], 'ok')
         self.assertNotIn('faster than real time', health['tip'])
 
     def test_a_stalling_recording_reports_both_its_stalls_and_the_flag(self):

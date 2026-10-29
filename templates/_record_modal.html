@@ -22,7 +22,7 @@
   <div class="modal-panel">
     <div class="modal-head">
       <h2 id="modal-title">Schedule recording</h2>
-      <button type="button" class="modal-close" id="modal-close" aria-label="Close">&#x2715;</button>
+      <button type="button" class="modal-close" id="modal-close" aria-label="Close">{{ icon('close') }}</button>
     </div>
     <form id="modal-form" method="post">
       {{ csrf_field() }}
@@ -69,7 +69,7 @@
         <div class="form-group">
           <div class="form-label-row">
             <label>Recording Profile</label>
-            <a href="{{ url_for('profiles.profiles_list') }}" target="_blank" class="form-label-link">Manage profiles →</a>
+            <a href="{{ url_for('profiles.profiles_list') }}" target="_blank" class="form-label-link">Manage profiles {{ icon('forward') }}</a>
           </div>
           <select name="profile_id" id="modal-profile" class="form-control">
             <option value="">None (use global defaults)</option>
@@ -98,7 +98,7 @@
         </details>
         {{ block_picker('modal') }}
         <div id="modal-detail-link" style="display:none; margin-bottom: 0.75rem;">
-          <a id="modal-detail-anchor" href="#" class="btn btn-sm" target="_blank">View recording details →</a>
+          <a id="modal-detail-anchor" href="#" class="btn btn-sm" target="_blank">View recording details {{ icon('forward') }}</a>
         </div>
       </div>
       <div class="modal-foot">
@@ -116,7 +116,7 @@
   <div class="modal-panel">
     <div class="modal-head">
       <h2 id="active-rec-title">Recording in progress</h2>
-      <button type="button" class="modal-close" id="active-rec-close-x" aria-label="Close">&#x2715;</button>
+      <button type="button" class="modal-close" id="active-rec-close-x" aria-label="Close">{{ icon('close') }}</button>
     </div>
     <div class="modal-body">
       <p id="active-rec-name" style="margin: 0 0 1rem; color: var(--text-muted); font-size: var(--fs-lg);"></p>
@@ -128,7 +128,7 @@
       </div>
       {{ block_picker('active-rec') }}
       <div style="margin-bottom: 0.75rem;">
-        <a id="active-rec-detail-anchor" href="#" class="btn btn-sm" target="_blank">View recording details →</a>
+        <a id="active-rec-detail-anchor" href="#" class="btn btn-sm" target="_blank">View recording details {{ icon('forward') }}</a>
       </div>
     </div>
     <div class="modal-foot" style="justify-content: flex-start; flex-wrap: wrap;">

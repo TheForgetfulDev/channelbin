@@ -37,7 +37,7 @@
               data-tip="Back one hour&#10;Scrolls the grid 60 minutes earlier.">&lsaquo; 1h</button>
       <button type="button" class="timenav-readout tip-plain" id="guide-readout"
               data-tip="Visible window&#10;The day and time range currently on screen - it reads live from the grid's scroll position.&#10;Click to jump to a day.">
-        <span class="timenav-readout-day" id="guide-readout-day">Loading…</span>
+        <span class="timenav-readout-day" id="guide-readout-day">Loading…</span>{{ icon('dropdown', 'timenav-readout-caret') }}
         <span class="timenav-readout-time" id="guide-readout-time"></span>
       </button>
       <button type="button" data-nav="60" class="tip-plain"
@@ -57,16 +57,16 @@
       <input type="text" id="guide-search" class="search guide-search-input"
              placeholder="Filter visible…" autocomplete="off">
       <button type="button" class="guide-search-save" id="guide-search-save"
-              title="Save this search" aria-label="Save this search">&#9734;</button>
+              title="Save this search" aria-label="Save this search">{{ icon('save-search') }}</button>
       <button type="button" class="guide-search-clear" id="guide-search-clear"
-              title="Clear filter" aria-label="Clear filter">&times;</button>
+              title="Clear filter" aria-label="Clear filter">{{ icon('close') }}</button>
       <div class="saved-search-dropdown" id="guide-search-dropdown" style="display:none"></div>
     </div>
     {% if tags %}
     <div class="tag-filter-wrap" id="tag-filter-wrap">
       <button type="button" class="btn btn-sm tip-plain" id="tag-filter-toggle"
               data-tip="Tag filter&#10;Include or exclude programs by tag.&#10;Exclude always beats include - a program carrying an excluded tag is hidden no matter what.">
-        <span id="tag-filter-summary">Tags</span> <span class="nav-caret">&#9662;</span>
+        <span id="tag-filter-summary">Tags</span> {{ icon('dropdown') }}
       </button>
       <div class="tag-filter-panel" id="tag-filter-panel" style="display:none">
         <div class="tag-filter-section">
@@ -104,7 +104,7 @@
     <div class="dur-filter-wrap" id="dur-filter-wrap">
       <button type="button" class="btn btn-sm tip-plain" id="dur-filter-toggle"
               data-tip="Program length&#10;Show only programs longer and/or shorter than a length you set. Leave a box empty to not bound that side.">
-        <span id="dur-filter-summary">Length</span> <span class="nav-caret">&#9662;</span>
+        <span id="dur-filter-summary">Length</span> {{ icon('dropdown') }}
       </button>
       <div class="dur-filter-panel tag-filter-panel" id="dur-filter-panel" style="display:none">
         <label class="dur-filter-row">
@@ -153,7 +153,7 @@
          CSS at ≤960px; guide.js branches on the same breakpoint for which surface to open. #}
       <button type="button" class="btn btn-sm tip-plain" id="btn-layout"
               aria-label="Layout"
-              data-tip="Layout&#10;Choose what the guide shows: which fields appear in each program cell and in the channel column, and how the grid itself behaves. Rows resize to fit whatever you enable.">&#9881;<span class="guide-btn-label"> Layout &#9662;</span></button>
+              data-tip="Layout&#10;Choose what the guide shows: which fields appear in each program cell and in the channel column, and how the grid itself behaves. Rows resize to fit whatever you enable.">{{ icon('layout') }}<span class="guide-btn-label"> Layout</span> {{ icon('dropdown') }}</button>
       <div class="guide-pop" id="guide-layout-pop" hidden>
         <h4>Grid behavior</h4>
         <label class="tip-plain"
@@ -201,11 +201,11 @@
          verbatim with mobile (13.7). #}
       <button type="button" class="guide-sort-btn tip-plain" id="guide-sort-btn"
               data-tip="Sort channels&#10;Choose what the channel list is ordered by. Pick the active field again to reverse the direction.">
-        {# The trailing caret is the app's standard "this opens a menu" chrome (.nav-caret,
+        {# The trailing caret is the app's standard "this opens a menu" chrome (the dropdown icon,
            9px muted, as on the Tags button); the direction arrow next to it is the ACTIVE
            SORT indicator (10.3's convention). They are adjacent, so the size and color
            difference is what keeps them from reading as one doubled arrow. #}
-        Channel <span class="guide-sort-field" id="guide-sort-field"></span><span class="guide-sort-arrow" id="guide-sort-arrow"></span> <span class="nav-caret">&#9662;</span>
+        Channel <span class="guide-sort-field" id="guide-sort-field"></span><span class="guide-sort-arrow" id="guide-sort-arrow"></span> {{ icon('dropdown') }}
       </button>
       <div class="guide-pop guide-pop-left" id="guide-sort-pop" hidden>
         <h4>Sort channels by</h4>
@@ -252,10 +252,10 @@
             <div class="guide-channel-meta">
               {% if row.is_group %}
               <span class="qbadge guide-group-badge tip-plain" data-channel-id="{{ row.dom_id }}"
-                    data-tip="Channel group - records from the best of {{ row.member_count }} feeds">⛓{{ row.member_count }}</span>
+                    data-tip="Channel group - records from the best of {{ row.member_count }} feeds">{{ icon('group') }}{{ row.member_count }}</span>
               {% endif %}
               <span class="guide-lifecycle-badge" data-channel-id="{{ row.dom_id }}"></span>
-              {% if row.notes %}<span class="note-indicator tip-plain" data-tip="{{ row.notes }}">📝</span>{% endif %}
+              {% if row.notes %}<span class="note-indicator tip-plain" data-tip="{{ row.notes }}">{{ icon('note') }}</span>{% endif %}
               <span class="guide-dup-badges" data-channel-id="{{ row.dom_id }}"></span>
             </div>
           </div>

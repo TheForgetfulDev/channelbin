@@ -13,7 +13,7 @@
   <a href="{{ url_for('recordings.new_recording') }}" class="btn btn-primary head-action-schedule">+ Schedule recording</a>
   {# Mobile only (DESIGN.md 9.3): scheduling happens from the guide at mobile widths,
      so the header action links there instead of a "+ Schedule" button with no destination. #}
-  <a href="{{ url_for('guide.guide') }}" class="btn btn-primary head-action-guide">TV Guide <span class="arw">&#8594;</span></a>
+  <a href="{{ url_for('guide.guide') }}" class="btn btn-primary head-action-guide">TV Guide <span class="arw">{{ icon('forward') }}</span></a>
 </div>
 
 {% if total == 0 %}
@@ -36,13 +36,13 @@
        is still there at phone widths, where .toolbar .right is hidden. filter-bar.js
        writes the label: which saved filter is on, and whether it has been changed. #}
     <div class="menu-wrap">
-      <button class="chip" id="saved-filters-chip" type="button" data-menu>Saved &#9662;</button>
+      <button class="chip" id="saved-filters-chip" type="button" data-menu>Saved {{ icon('dropdown') }}</button>
       <div class="menu pop-left" id="saved-filters-menu"></div>
     </div>
     {# Mobile only (DESIGN.md 9.4): desktop sorts via the column headers, which
        don't exist at mobile widths - this chip is the mobile sort control. #}
     <div class="menu-wrap sort-chip-wrap">
-      <button class="chip" id="sort-chip" data-menu>Sort: Time &#9662;</button>
+      <button class="chip" id="sort-chip" data-menu>Sort: Time {{ icon('dropdown') }}</button>
       <div class="menu" id="sort-menu">
         <div class="pop-title">Sort by</div>
         <button class="menu-item" data-sortfield="start">Date</button>
@@ -54,9 +54,9 @@
   </div>
   <div class="right">
     <div class="menu-wrap">
-      <button class="btn btn-sm" data-menu>&#9881; Columns</button>
+      <button class="btn btn-sm" data-menu>{{ icon('layout') }} Columns</button>
       <div class="menu" id="columns-menu">
-        <div class="pop-title">Columns - drag &#8942;&#8942; to reorder</div>
+        <div class="pop-title">Columns - drag {{ icon('drag') }} to reorder</div>
         <div class="pop-note">Saved to the server - follows you across browsers.</div>
       </div>
     </div>
@@ -71,7 +71,7 @@
   <span class="sortable" data-sort="name">Recording name<span class="sort-ind"></span></span>
   <span class="sortable" data-col="time" data-sort="start">Time<span class="sort-ind"></span></span>
   {# The mark before a duration had no word anywhere on the page (dev/changelog/1293). #}
-  <span class="sortable num tip" data-col="duration" data-sort="dur" data-tip="How long the recording is.&#10;An amber &#9685; before it: it captured less than it was scheduled for. A grey one: it is still recording, or you stopped it early. Point at the mark for the numbers.">Duration<span class="sort-ind"></span></span>
+  <span class="sortable num tip" data-col="duration" data-sort="dur" data-tip="How long the recording is.&#10;An amber mark before it: it captured less than it was scheduled for. A grey one: it is still recording, or you stopped it early. Point at the mark for the numbers.">Duration<span class="sort-ind"></span></span>
   <span class="sortable num" data-col="size" data-sort="size">Size<span class="sort-ind"></span></span>
   <span class="sortable num tip" data-col="health" data-sort="health" data-tip="Segments / stalls.&#10;A stall is a moment the stream stopped and the watchdog restarted ffmpeg - each restart starts a new segment.">Health<span class="sort-ind"></span></span>
   <span data-col="account">Account</span>
@@ -121,17 +121,17 @@
        data-col order, per applyColumns()) and becomes one mono stats line at mobile
        widths (DESIGN.md 9.4), grouping duration/size/health the way mockup 03 does. #}
     <div class="c-stats">
-    <div class="c-num" data-col="duration">{% if r.dur_flag %}<span class="dur-flag{% if r.dur_flag == 'stopped' %} dur-quiet{% endif %} tip-plain" data-tip="{{ r.dur_tip }}">&#9685;</span>{% endif %}{{ r.dur_str or '-' }}</div>
+    <div class="c-num" data-col="duration">{% if r.dur_flag %}<span class="dur-flag{% if r.dur_flag == 'stopped' %} dur-quiet{% endif %} tip-plain" data-tip="{{ r.dur_tip }}">{{ icon('partial') }}</span>{% endif %}{{ r.dur_str or '-' }}</div>
     <div class="c-num" data-col="size">{% if r.size_num %}{{ r.size_num }} <span class="unit">{{ r.size_unit }}</span>{% if r.rate %}<span class="sub tip-plain" data-tip="{{ r.rate_tip }}">{{ r.rate }}</span>{% endif %}{% else %}-{% endif %}</div>
     <div class="c-health" data-col="health">
-      {% if r.health.tip %}<span class="h-mini {{ r.health.cls }} tip-plain" data-tip="{{ r.health.tip }}">{{ r.health.label }}</span>
+      {% if r.health.tip %}<span class="h-mini {{ r.health.cls }} tip-plain" data-tip="{{ r.health.tip }}">{% if r.health.icon %}{{ icon(r.health.icon) }}{% endif %}{{ r.health.label }}</span>
       {% else %}<span class="h-mini na">-</span>{% endif %}
     </div>
     </div>
     <div class="c-time" data-col="account">{% if r.acct_name %}{{ r.acct_name }}{% else %}<span class="rel">-</span>{% endif %}</div>
     <div class="c-time" data-col="output">{% if r.output_file %}<span style="font-family:var(--font-mono);font-size:var(--fs-sm);word-break:break-all">{{ r.output_file }}</span>{% else %}<span class="rel">-</span>{% endif %}</div>
     <div class="c-actions">
-      <button class="btn btn-sm btn-icon" data-menu>&#8943;</button>
+      <button class="btn btn-sm btn-icon" data-menu>{{ icon('more') }}</button>
       <div class="menu">
         <a href="{{ url_for('recordings.recording_detail', recording_id=r.id) }}">Details</a>
         {% if r.status == REC_STATUS.SCHEDULED %}

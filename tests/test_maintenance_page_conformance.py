@@ -71,10 +71,13 @@ class MaintenancePageConformanceTests(unittest.TestCase):
         Readiness check sits FIRST, above all of it, settled at mockup round 1: a verdict
         below the fold on a seven-card page is not a verdict (dev/changelog/945, built
         in dev/changelog/950).
+
+        The EPG similarity scan sits with the Search index, the other on-demand pass over
+        the database with a readout and a Run-now (dev/changelog/1325).
         """
         self.assertEqual(re.findall(r'<div class="card" id="(m-[a-z]+)"', self.html),
-                         ['m-readiness', 'm-storage', 'm-tools', 'm-index', 'm-backup',
-                          'm-bundle', 'm-service'])
+                         ['m-readiness', 'm-storage', 'm-tools', 'm-index', 'm-epg',
+                          'm-backup', 'm-bundle', 'm-service'])
 
     def test_no_back_link_to_settings(self):
         """DESIGN.md 4/16.1 (amended in dev/changelog/1277): Maintenance is its own sidebar
