@@ -59,7 +59,6 @@
 
   // ── Small helpers ─────────────────────────────────────────────────────────
 
-  const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
   const byId = (id) => document.getElementById(id);
 
   function rowScore(r) {
@@ -613,12 +612,12 @@
     if (s === null) return '<span class="text-muted tip-plain" data-tip="No score.&#10;A score needs at least one completed test or recording on this feed.">&mdash;</span>';
     const n = r.health_score_sample_count || 0;
     const cls = healthBandCss(s);
-    return `<span class="num hb-text ${cls} tip-plain" data-tip="Health score ${s}.&#10;Lifetime 0-100 from this feed's own history: connect time, stalls, and whether it held its declared format. Built from ${plural(n, 'observation')}.">${icon('health-score')}${s}</span>`;
+    return `<span class="num hb-text ${cls} tip-plain" data-tip="Health score ${s}.&#10;Lifetime 0-100 from this feed's own history: connect time, stalls, and whether it held its declared format. Built from ${counted(n, 'observation')}.">${icon('health-score')}${s}</span>`;
   }
 
   function bitrateCell(t) {
     if (!t || t.bitrate_kbps === null || t.bitrate_kbps === undefined) return '<span class="text-muted">&mdash;</span>';
-    const str = `${(t.bitrate_kbps / 1000).toFixed(2)} MB/s`;
+    const str = fmtBitrate(t.bitrate_kbps);
     const w = parseInt(((t.resolution || '').split('x')[0]) || '0', 10);
     const threshold = w >= 1920 ? 1000 : (w >= 1280 ? 600 : 300);
     if (t.bitrate_kbps >= threshold) return str;
@@ -745,7 +744,7 @@
         const days = Math.max(0, Math.floor((Date.now() - new Date(at + 'Z').getTime()) / 86400000));
         out.push({ cls: 'b-warn', pill: 'Not monitored',
           title: 'Recording on, health check off - data is going stale.',
-          detail: `Last checked ${days === 0 ? 'today' : plural(days, 'day') + ' ago'}. ChannelBin ` +
+          detail: `Last checked ${days === 0 ? 'today' : counted(days, 'day') + ' ago'}. ChannelBin ` +
             'will rank this on data that may no longer be true - it may be selected for a ' +
             'scheduled recording when we no longer know its current format, its current quality, ' +
             'or whether it still works. Turn its health check back on and give this group a ' +
@@ -834,7 +833,7 @@
         return `<td class="gd-c-caret">${canExpand(r)
           ? `<span class="gd-caret" data-expand="${r.channel_id}" data-tip="Stream profile.&#10;Codec, bit depth, chroma, scan type, frame-rate stability and the screenshot from the last test. Clicking anywhere on the row does the same thing."></span>`
           : ''}</td>`;
-      case 'name': return `<td>${nameCell(r)}</td>`;
+      case 'name': return `<td class="gd-c-name">${nameCell(r)}</td>`;
       case 'status': return `<td>${statusBadge(r)}</td>`;
       case 'score': return `<td>${scoreCell(r)}</td>`;
       case 'res': {
@@ -1092,7 +1091,7 @@
       } else if (k === 'framePct' && t && t.frame_pct !== null && t.frame_pct !== undefined) {
         bits.push(`${t.frame_pct.toFixed(1)}% frames`);
       } else if (k === 'drops' && t && t.drop_count !== null && t.drop_count !== undefined) {
-        bits.push(plural(t.drop_count, 'drop'));
+        bits.push(counted(t.drop_count, 'drop'));
       } else if (k === 'epg' && r.epg_channel_id) {
         // Labeled, unlike every other bit on this line: a bare provider id beside a
         // resolution and a bitrate reads as neither, and the phone has no column header
@@ -1207,18 +1206,63 @@
       : '<div class="empty-state">No channels match.</div>';
   }
 
-  // The single entry point every caller uses. Which of the two drawings runs is the only
-  // thing the breakpoint decides; the one that is not drawn is emptied rather than left
-  // holding a stale second copy of the list.
+  // CARDS FOR ROOM (dev/changelog/1345): the phone arrangement, taken in a desktop window
+  // too narrow for the table. The table is drawn first and measured; if its box has to
+  // scroll sideways - a contained sideways drag is not an acceptable answer at any width -
+  // the cards are drawn in its place and the card says so. Decided from the box's own
+  // width, not the viewport: the sidebar, the window and the user's column setup all
+  // decide it together, and only the box knows the answer. Measured on every draw and on
+  // resize, so a wider window gets its table back. Nothing is measured under jsdom
+  // (clientWidth is 0 there), which keeps the suite on the desktop drawing.
+  let cardsForRoom = false;
+  const channelsCard = () => document.querySelector('[data-section="channels"]');
+  const tableOverflows = () => {
+    const wrap = channelsCard().querySelector('.table-scroll');
+    return !!wrap && wrap.clientWidth > 0 && wrap.scrollWidth > wrap.clientWidth + 1;
+  };
+  // Only a real transition has side effects: renderList() measures on every draw, and a
+  // draw that lands in the same mode must not close a sheet or drop a selection.
+  function setCardsForRoom(on) {
+    channelsCard().classList.toggle('gd-cards-for-room', on);
+    if (on === cardsForRoom) return;
+    cardsForRoom = on;
+    if (!on) closeSheet();
+    const bar = byId('gd-phonebar') || channelsCard().querySelector('.gd-phonebar');
+    const old = bar && bar.querySelector('.gd-room-note');
+    if (old) old.remove();
+    if (on && bar) {
+      bar.insertAdjacentHTML('beforeend', '<span class="gd-room-note tip-plain" data-tip="The table of ' +
+        'channels does not fit this window - it would need a sideways scroll - so each channel ' +
+        'is a card instead. Widen the window, or turn columns off, and the table comes back, ' +
+        'with the bulk actions that need it.">' +
+        'Cards: the table does not fit this window</span>');
+    }
+  }
+
+  // The single entry point every caller uses. Which of the two drawings runs is decided
+  // by the breakpoint, and above it by whether the table fits; the one that is not drawn
+  // is emptied rather than left holding a stale second copy of the list.
   function renderList() {
-    const phone = isPhone();
+    let phone = isPhone();
     if (phone) {
+      setCardsForRoom(false);
       byId('gd-thead').innerHTML = '';
       byId('gd-tbody').innerHTML = '';
       renderCards();
     } else {
+      // The table is drawn with the cards class off so its box measures the real room;
+      // all of this lands in one task, so a window that needs cards never paints the table.
+      channelsCard().classList.remove('gd-cards-for-room');
       byId('gd-list').innerHTML = '';
       renderTable();
+      const over = tableOverflows();
+      if (over) {
+        byId('gd-thead').innerHTML = '';
+        byId('gd-tbody').innerHTML = '';
+        renderCards();
+        phone = true;
+      }
+      setCardsForRoom(over);
     }
     // The count reads plain until something is filtering, and only then says what it is
     // out of - a permanent "6 of 6" is noise. On a desktop the bulk bar's own
@@ -1414,7 +1458,7 @@
   function openBulkSheet() {
     const n = selected.size;
     const body = document.createElement('div');
-    const forN = (dir) => `Turn ${dir} for ${plural(n, 'member')}`;
+    const forN = (dir) => `Turn ${dir} for ${counted(n, 'member')}`;
     let h = '';
     if (G.hasChannel) {
       h += `<div class="gm-sheet-sec">${escHtml(COL_LABEL.rec)}</div>` +
@@ -1433,7 +1477,7 @@
     if (missingIds.length) {
       h += '<div class="gm-sheet-sec">Missing channels</div>' +
         sheetRow('data-act="delete-missing-selected"',
-          `Delete ${plural(missingIds.length, 'missing channel')}…`, null, true);
+          `Delete ${counted(missingIds.length, 'missing channel')}…`, null, true);
     }
     body.innerHTML = h;
     return sheet(buildModal({
@@ -1730,7 +1774,7 @@
     if (WARN.format_warns && n && !muted.has('format')) {
       mixed = `<strong>${icon('blocking')} Mixed video format in this group</strong><br>` +
         `Group format is pinned by hand to <strong>${escHtml(fmt)}</strong>, and ` +
-        `${plural(n, 'member')} with Recording on report a different resolution or frame rate. ` +
+        `${counted(n, 'member')} with Recording on report a different resolution or frame rate. ` +
         `${n === 1 ? 'It is' : 'They are'} still switched on for recording, and ` +
         `${n === 1 ? 'is' : 'are'} skipped when a recording picks a member - nothing has been ` +
         `turned off, and ${n === 1 ? 'it becomes' : 'they become'} eligible again on ` +
@@ -1752,7 +1796,7 @@
       const at = WARN.override_member_format
         ? ` at ${escHtml(WARN.override_member_format)}` : '';
       override = `<strong>${icon('blocking')} No member matches the group format</strong><br>` +
-        `All ${plural(WARN.recording_count, 'recording-enabled member')} report a format other ` +
+        `All ${counted(WARN.recording_count, 'recording-enabled member')} report a format other ` +
         `than <strong>${escHtml(fmt)}</strong>. ChannelBin will still record rather than skip: ` +
         `the next recording runs from <strong>${escHtml(who)}</strong>${at}, and the recording ` +
         'itself will say so on its detail page.' +
@@ -1777,11 +1821,11 @@
         // you are looking at. Same inline `<a data-act>` the unmonitored banner uses.
         '<ul class="gd-epg-list">' + shown.map(e =>
           `<li><a href="#" data-act="review-epg" data-epg="${escHtml(e.epg_channel_id)}">` +
-          `${escHtml(e.epg_channel_id)}</a> - ${plural(e.count, 'member')}</li>`).join('') +
+          `${escHtml(e.epg_channel_id)}</a> - ${counted(e.count, 'member')}</li>`).join('') +
         (ids.length > 6 ? `<li>and ${ids.length - 6} more</li>` : '') + '</ul>' +
         (WARN.epg_missing_count
           ? `<div class="gd-sub"><a href="#" data-act="review-epg" data-epg="">` +
-            `${plural(WARN.epg_missing_count, 'member')}</a> ` +
+            `${counted(WARN.epg_missing_count, 'member')}</a> ` +
             `${WARN.epg_missing_count === 1 ? 'has' : 'have'} no EPG id at all, which is ` +
             'unknown rather than mismatched.</div>'
           : '') +
@@ -1850,7 +1894,7 @@
     let unmon = '';
     const un = WARN.unmonitored_count || 0;
     if (un && !muted.has('unmonitored')) {
-      unmon = `<strong>${icon('warning')} ${plural(un, 'channel')} not monitored</strong><br>` +
+      unmon = `<strong>${icon('warning')} ${counted(un, 'channel')} not monitored</strong><br>` +
         `No active recurring health check covers ${un === 1 ? 'it' : 'them'}, so a ` +
         'provider-side resolution or frame-rate change will not be re-checked automatically.' +
         ' <a href="#" data-act="schedule">Schedule this group\'s health check</a>.' +
@@ -1968,7 +2012,7 @@
     if (!activeSets) {
       el.className = 'notice-banner notice-banner-muted';
       el.innerHTML = `<div class="notice-banner-body"><span class="notice-banner-title">` +
-        `${plural(extras, 'duplicate channel')} ${where}, the extras switched off.</span></div>${show}`;
+        `${counted(extras, 'duplicate channel')} ${where}, the extras switched off.</span></div>${show}`;
       el.style.display = '';
       return;
     }
@@ -1980,7 +2024,7 @@
       : '<button type="button" class="btn btn-sm btn-danger-outline" data-act="dedup">Remove duplicates&hellip;</button>';
     el.className = 'notice-banner notice-banner-warn';
     el.innerHTML = `<div class="notice-banner-body"><div class="notice-banner-title">` +
-      `${icon('warning')} ${plural(extras, 'duplicate channel')} ${where}, ${escHtml(reason)}</div></div>` +
+      `${icon('warning')} ${counted(extras, 'duplicate channel')} ${where}, ${escHtml(reason)}</div></div>` +
       show + action;
     el.style.display = '';
   }
@@ -2012,7 +2056,7 @@
         showToast(`${G.groupName} has left the TV Guide - the duplicates you removed were ` +
           'the only members switched on for recording' +
           (resp.cancelled_recordings
-            ? `, and ${plural(resp.cancelled_recordings, 'scheduled recording')} was cancelled.`
+            ? `, and ${counted(resp.cancelled_recordings, 'scheduled recording')} was cancelled.`
             : '.'), { type: 'warning' });
       }
       return { ok: true };
@@ -2062,7 +2106,7 @@
     el.className = 'notice-banner notice-banner-warn';
     el.innerHTML =
       `<div class="notice-banner-body">` +
-      `<div class="notice-banner-title">${icon('warning')} ${plural(MISSING_CHANNELS.length, 'channel')} ${where} ` +
+      `<div class="notice-banner-title">${icon('warning')} ${counted(MISSING_CHANNELS.length, 'channel')} ${where} ` +
       `no longer seen in a provider sync</div>` +
       `<div class="notice-banner-sub">Still listed here, but the provider has stopped sending ` +
       `${MISSING_CHANNELS.length === 1 ? 'it' : 'them'} for a while.</div></div>` +
@@ -2607,7 +2651,7 @@
       showToast(`"${r.channel_name}" removed.` + (resp && resp.left_guide
         ? ` ${G.groupName} has left the TV Guide - it was the last member switched on for ` +
           'recording' + (resp.cancelled_recordings
-          ? `, and ${plural(resp.cancelled_recordings, 'scheduled recording')} was cancelled.`
+          ? `, and ${counted(resp.cancelled_recordings, 'scheduled recording')} was cancelled.`
           : '.')
         : ''), { type: (resp && resp.left_guide) ? 'warning' : 'success' });
       refreshRows();
@@ -2823,7 +2867,7 @@
       lines.push('Turning it off removes this group from the TV Guide, because a guide row ' +
         'with nothing to record from is a row that cannot produce a file.');
       if (facts.scheduled_count) {
-        lines.push(`${plural(facts.scheduled_count, 'scheduled recording')} on this group ` +
+        lines.push(`${counted(facts.scheduled_count, 'scheduled recording')} on this group ` +
           `${facts.scheduled_count === 1 ? 'would be' : 'would be'} cancelled as well.`);
       }
     } else {
@@ -2927,7 +2971,7 @@
       (resp && resp.left_guide
         ? ` ${G.groupName} has left the TV Guide` +
           (resp.cancelled_recordings
-            ? `, and ${plural(resp.cancelled_recordings, 'scheduled recording')} was cancelled.`
+            ? `, and ${counted(resp.cancelled_recordings, 'scheduled recording')} was cancelled.`
             : '.')
         : (left ? '' : ' No member is enabled for recording now, so nothing can record from ' +
           'this group.')),
@@ -2984,15 +3028,15 @@
     }).then(data => {
       const moved = data.moved || 0;
       if (data.left_guide) {
-        showToast(`${label} turned off for ${plural(moved, 'member')}. ${G.groupName} has ` +
+        showToast(`${label} turned off for ${counted(moved, 'member')}. ${G.groupName} has ` +
           'left the TV Guide - nothing is switched on for recording any more' +
           (data.cancelled_recordings
-            ? `, and ${plural(data.cancelled_recordings, 'scheduled recording')} was cancelled.`
+            ? `, and ${counted(data.cancelled_recordings, 'scheduled recording')} was cancelled.`
             : '.'), { type: 'warning' });
         return;
       }
       if (!moved) {
-        showToast(`All ${plural(ids.length, 'selected member')} already had ` +
+        showToast(`All ${counted(ids.length, 'selected member')} already had ` +
           `${label.toLowerCase()} ${on ? 'on' : 'off'}. Nothing changed.`);
         return;
       }
@@ -3000,7 +3044,7 @@
       // names the result rather than reporting a count and stopping.
       const risky = (which === 'test' && !on)
         ? ids.filter(id => { const r = rowById(id); return r && r.recording_enabled; }).length : 0;
-      showToast(`${label} turned ${on ? 'on' : 'off'} for ${plural(moved, 'member')}.` + (risky
+      showToast(`${label} turned ${on ? 'on' : 'off'} for ${counted(moved, 'member')}.` + (risky
         ? ` ${risky} of them ${risky === 1 ? 'is' : 'are'} switched on for recording and will no ` +
           `longer be checked - ChannelBin may pick ${risky === 1 ? 'it' : 'one of them'} for a ` +
           'recording without knowing whether it still works.'
@@ -3390,7 +3434,7 @@
       if (!rows.length) { showToast('Nothing to copy.', { type: 'error' }); return; }
       try {
         await copyText(rows.map(r => r.textContent).join('\n'));
-        showToast(`Copied ${plural(rows.length, 'log line')}.`);
+        showToast(`Copied ${counted(rows.length, 'log line')}.`);
       } catch (err) {
         showToast(err.message, { type: 'error' });
       }
@@ -3429,4 +3473,11 @@
   };
   if (MOBILE_MQ.addEventListener) MOBILE_MQ.addEventListener('change', onBreakpointChange);
   else if (MOBILE_MQ.addListener) MOBILE_MQ.addListener(onBreakpointChange);
+  // Within the desktop arrangement the room changes without the breakpoint moving, and
+  // whether the table fits is re-decided from it (cards for room, above).
+  let resizeTimer = null;
+  window.addEventListener('resize', () => {
+    clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(() => { if (!isPhone()) renderList(); }, 120);
+  });
 })();

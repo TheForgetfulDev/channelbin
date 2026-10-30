@@ -49,6 +49,13 @@ function nf(n) {
   return Number(n || 0).toLocaleString();
 }
 
+// A bitrate given in kilobits per second, as the app writes it everywhere: megabits a second,
+// 'Mb/s' - never 'MB/s', which is bytes and eight times the number (dev/changelog/1341). The
+// caller decides what an unknown rate reads as; this formats a number only.
+function fmtBitrate(kbps, digits = 2) {
+  return `${(Number(kbps) / 1000).toFixed(digits)} Mb/s`;
+}
+
 // THE mobile breakpoint, as JS sees it. It must stay equal to the `@media (max-width: 960px)`
 // query in style.css and guide.css - CSS decides what a surface LOOKS like and this decides
 // what it is BUILT from, and the two disagreeing at two widths is where landscape phones fell
@@ -87,10 +94,18 @@ function readBootJson(id, fallback = null) {
 // withSeconds=false is the bare DESIGN.md 9.1 form ('3h 1m' / '2h' / '42m') for
 // static/summary durations, which are otherwise server-rendered via the `duration`
 // Jinja filter (app/routes/recordings.py::_fmt_duration) - keep the two in sync.
+// The word alone: plural(1, 'folder') -> 'folder', plural(2, 'folder') -> 'folders',
+// plural(2, 'is', 'are') -> 'are'. The JS half of app/fmt_utils.py::plural(); counted() is
+// the form that carries the number. The one pluralizer for page scripts - six of them each
+// wrote their own before these existed (dev/changelog/1343).
+function plural(n, one, many) {
+  return Number(n) === 1 ? one : (many || `${one}s`);
+}
+
 // '1 program' / '3 programs' - a number with its noun. The JS half of
 // app/fmt_utils.py::counted(), same arguments.
 function counted(n, one, many) {
-  return `${n.toLocaleString()} ${n === 1 ? one : (many || `${one}s`)}`;
+  return `${nf(n)} ${plural(n, one, many)}`;
 }
 
 function fmtDur(s, withSeconds = true) {

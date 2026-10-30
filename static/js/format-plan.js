@@ -257,7 +257,7 @@ function formatPlanTable(plan, strategy, pin, derived) {
     .sort((a, b) => (b.rank_count - a.rank_count) || (b.count - a.count))
     .map((b) => {
       const isWinner = !!(entry && entry.key && b.label === entry.label);
-      const bitrate = b.median_bitrate_kbps == null ? '--' : `${(b.median_bitrate_kbps / 1000).toFixed(2)} MB/s`;
+      const bitrate = b.median_bitrate_kbps == null ? '--' : fmtBitrate(b.median_bitrate_kbps);
       const bpp = b.median_bpp == null ? '--' : b.median_bpp.toFixed(3);
       const label = isWinner
         ? `<strong>${escHtml(b.label)}</strong> <span class="pr-flag pr-picked">winner</span>`

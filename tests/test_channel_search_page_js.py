@@ -534,7 +534,7 @@ class PinnedNameColumnTests(_PageJs, unittest.TestCase):
                         self.obs['track_unmeasured'])
 
     def test_the_column_freezes_to_what_the_cell_actually_holds(self):
-        """310px of content in a column whose min-width is 190px: the frozen value has
+        """310px of content in a column whose min-width is 170px: the frozen value has
         to follow the content, or the cell is clipped for the life of the page."""
         self.assertEqual(self.obs['track_measured'], '310px')
 
@@ -2141,5 +2141,74 @@ class StandingInversionTests(_PageJs, unittest.TestCase):
                             'assertion cannot tell them apart')
 
 
+class TuckedColumnsTests(_PageJs, unittest.TestCase):
+    """Columns tucked away for room (dev/changelog/1346).
+
+    A desktop window narrower than the visible columns' floors - the facet rail open at
+    1440px, the sidebar back at 961 - used to push the row past its box and the Record
+    button off the right edge into a sideways scroll. The rightmost columns are now set
+    aside, last one first, until the floors fit the room the list has; the Columns button
+    and the picker both say which, and nothing is saved.
+    """
+
+    SCENARIO = 'tucked'
+
+    def test_with_room_nothing_is_tucked(self):
+        self.assertEqual(self.obs['wide_btn']['text'], 'Columns')
+        self.assertEqual(self.obs['wide_btn']['tip'], '')
+        self.assertIn('Health', self.obs['wide_head'])
+
+    def test_the_rightmost_columns_go_until_the_row_fits(self):
+        """870px of room against the airing grain's five default columns: Groups and
+        Description go, When, Health and Channel stay, and the Record button is still on
+        every row."""
+        head = self.obs['narrow_head']
+        self.assertNotIn('Groups', head)
+        self.assertNotIn('Description', head)
+        for kept in ('Program', 'When', 'Health', 'Channel'):
+            self.assertIn(kept, head, head)
+        self.assertEqual(self.obs['narrow_record_buttons'], self.obs['narrow_rows'])
+        self.assertGreater(self.obs['narrow_rows'], 0)
+        # Every row draws exactly the header's cells: tick, logo, Program, three columns,
+        # the Record track.
+        self.assertEqual(set(self.obs['narrow_cells']), {7}, self.obs['narrow_cells'])
+        self.assertNotIn('84px', self.obs['narrow_track'])
+
+    def test_the_button_and_the_picker_say_which_are_tucked(self):
+        self.assertEqual(self.obs['narrow_btn']['text'], 'Columns 2 tucked')
+        self.assertIn('Groups, Description', self.obs['narrow_btn']['tip'])
+        picker = {p['col']: p for p in self.obs['narrow_picker']}
+        for key in ('desc', 'groups'):
+            self.assertTrue(picker[key]['checked'], 'a tucked column is still on')
+            self.assertTrue(picker[key]['tucked'], key)
+        for key in ('when', 'health', 'channel'):
+            self.assertFalse(picker[key]['tucked'], key)
+
+    def test_the_sort_column_goes_last(self):
+        """700px sorted by Channel: Health goes instead of the Channel column the list is
+        ordered by, so the sort runs on a column that is on screen as long as any other
+        column can give."""
+        head = self.obs['sorted_head']
+        self.assertIn('Channel', head)
+        self.assertNotIn('Health', head)
+        self.assertEqual(self.obs['sorted_btn']['text'], 'Columns 3 tucked')
+
+    def test_at_the_floor_only_the_program_and_record_remain_and_the_sort_is_named(self):
+        """400px of room, the airing grain's default sort (When): every column is tucked, When
+        last, the Record button is still on every row, and the button's tip says the list is
+        still sorted by When."""
+        head = self.obs['floor_head']
+        for gone in ('When', 'Health', 'Channel', 'Description', 'Groups'):
+            self.assertNotIn(gone, head, head)
+        self.assertIn('Program', head)
+        self.assertEqual(self.obs['floor_btn']['text'], 'Columns 5 tucked')
+        self.assertIn('still sorted by When', self.obs['floor_btn']['tip'])
+        self.assertEqual(self.obs['floor_record_buttons'], self.obs['narrow_rows'])
+
+    def test_a_phone_tucks_nothing(self):
+        self.assertEqual(self.obs['phone_btn']['text'], 'Fields')
+        self.assertGreater(self.obs['phone_cards'], 0)
+
 if __name__ == '__main__':
     unittest.main()
+

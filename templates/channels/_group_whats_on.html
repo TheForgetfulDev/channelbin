@@ -8,9 +8,8 @@
     /api/guide/epg?group_id=...&schedules=1. The ids below are guide.js's own: the grid,
     the time navigation, the day picker and the Layout popover are the guide's, not copies.
 
-    The chips and the Layout button carry no `tip-plain`: that class sets
-    `border-bottom: none` after .chip and .btn in style.css, which takes their bottom
-    borders off (seen in mockup 46's round 3). #}
+    The chips and the Layout button carry no `tip-plain`: a tooltip needs only `data-tip`,
+    and the class cancels `.tip`'s underline, which none of them has. #}
 {% from '_macros.html' import csrf_field %}
 <div class="card" data-section="whatson" id="sched-card">
   <div class="card-head">

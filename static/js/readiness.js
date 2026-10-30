@@ -60,7 +60,6 @@
   };
 
   const byId = (id) => (state.data ? state.data.checks.find((c) => c.id === id) : null);
-  const plural = (n, one, many) => (n === 1 ? one : (many || `${one}s`));
 
   function pill(status) {
     const s = STATUS[status] || STATUS.unknown;

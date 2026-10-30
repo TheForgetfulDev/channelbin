@@ -72,8 +72,8 @@ class LiveSegmentRowTests(unittest.TestCase):
 
     def test_open_segment_row_shows_live_size(self):
         row = self._live_row(self._page())
-        self.assertIn(f'<td class="num">{filesize_filter(LIVE_BYTES)}</td>', row)
-        self.assertNotIn('<td class="num">0 B</td>', row)
+        self.assertIn(f'<td class="num" data-label="Size">{filesize_filter(LIVE_BYTES)}</td>', row)
+        self.assertNotIn('<td class="num" data-label="Size">0 B</td>', row)
 
     def test_open_segment_row_shows_avg_rate(self):
         row = self._live_row(self._page())

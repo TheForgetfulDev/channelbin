@@ -32,7 +32,6 @@
      service you never touched, and 15.2 settled that this costs no new key. */
   const addedServices = () => ALL.filter((k) => SVC[k].added);
   const enabledServices = () => ALL.filter((k) => SVC[k].enabled);
-  const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
 
   // ── Alert routing filter: 21 types and growing needs search + severity/push
   // filtering. Severities match what ALERT_TYPES actually uses (app/alerts.py).
@@ -87,7 +86,7 @@
   // ── Header count ────────────────────────────────────────────────────────
   function syncCount() {
     $('#notif-count').textContent =
-      `${enabledServices().length} of ${plural(addedServices().length, 'added service')} enabled`;
+      `${enabledServices().length} of ${counted(addedServices().length, 'added service')} enabled`;
   }
 
   // ── Services region: one writer for the bar, the cards and the empty state ──

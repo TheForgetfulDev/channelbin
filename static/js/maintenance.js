@@ -19,8 +19,6 @@
   const toast = (msg, isError) =>
     showToast(msg, { type: isError ? 'error' : 'success', durationMs: 2500 });
 
-  const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
-
   // ── Backup & Restore ────────────────────────────────────────────────────
   const backupSel = $('#backup-select');
 
@@ -41,7 +39,7 @@
           backupSel.appendChild(opt);
         });
         $('#backup-list-meta').textContent = backups.length
-          ? `${plural(backups.length, 'backup')} available.`
+          ? `${counted(backups.length, 'backup')} available.`
           : 'No backups found yet.';
         updateBackupButtons();
       })

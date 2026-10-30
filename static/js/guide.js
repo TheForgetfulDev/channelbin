@@ -1380,7 +1380,7 @@ function channelTechText(ch) {
     bits.push(height ? `${height}p` : ch.last_test_resolution);
   }
   if (ch.last_test_fps) bits.push(`${Math.round(ch.last_test_fps)}fps`);
-  if (ch.last_test_bitrate_kbps) bits.push(`${(ch.last_test_bitrate_kbps / 1000).toFixed(1)} Mbps`);
+  if (ch.last_test_bitrate_kbps) bits.push(fmtBitrate(ch.last_test_bitrate_kbps, 1));
   if (ch.last_test_audio_codec) {
     bits.push(ch.last_test_audio_channels
       ? `${ch.last_test_audio_codec} ${ch.last_test_audio_channels}ch`
@@ -2909,9 +2909,9 @@ function renderTechReadout(ch) {
       `Frame rate\n${ch.last_test_fps.toFixed(2)} frames per second as reported by the stream.`]);
   }
   if (LAYOUT.ch_bitrate && ch.last_test_bitrate_kbps) {
-    const mbps = ch.last_test_bitrate_kbps / 1000;
-    bits.push([`${mbps.toFixed(1)} Mbps`,
-      `Video bitrate\nAverage ${mbps.toFixed(1)} Mbps, so roughly ${fmtBytes(ch.last_test_bitrate_kbps * 1000 / 8 * 3600)} per hour recorded.`]);
+    const rate = fmtBitrate(ch.last_test_bitrate_kbps, 1);
+    bits.push([rate,
+      `Video bitrate\nAverage ${rate}, so roughly ${fmtBytes(ch.last_test_bitrate_kbps * 1000 / 8 * 3600)} per hour recorded.`]);
   }
   if (LAYOUT.ch_audio && ch.last_test_audio_codec) {
     const chans = ch.last_test_audio_channels;

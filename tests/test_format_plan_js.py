@@ -4,9 +4,9 @@ formatPlanTable). Planned 2026-08-06, shipped in dev/changelog/494.
 
 Same technique as tests/test_check_modal_js.py: the helpers are top-level functions in
 format-plan.js precisely so this can evaluate the file in node and call them directly.
-format-plan.js depends on escHtml (util.js) only at call time, not at definition time, so
-the harness stubs a minimal escHtml before evaluating - matching how the real page always
-loads util.js first.
+format-plan.js depends on escHtml and fmtBitrate (util.js) only at call time, not at
+definition time, so the harness stubs both before evaluating - matching how the real page
+always loads util.js first.
 """
 import json
 import os
@@ -29,6 +29,7 @@ _HARNESS = f"""
 const fs = require('fs');
 global.escHtml = (s) => String(s == null ? '' : s)
   .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+global.fmtBitrate = (kbps, digits = 2) => `${{(Number(kbps) / 1000).toFixed(digits)}} Mb/s`;
 const src = fs.readFileSync(process.argv[1], 'utf8');
 const api = new Function(src + '\\nreturn {{{_EXPORTS}}};')();
 const {{{_EXPORTS}}} = api;
@@ -135,7 +136,7 @@ class TableTests(_Base):
 
     def test_bitrate_formatted_as_mb_per_s_matching_bitratecell(self):
         html = self.evaluate(f"formatPlanTable({_PLAN}, 'highest_bitrate')")
-        self.assertIn('3.74 MB/s', html)
+        self.assertIn('3.74 Mb/s', html)
 
     def test_uses_the_shared_table_system(self):
         html = self.evaluate(f"formatPlanTable({_PLAN}, 'highest_bitrate')")

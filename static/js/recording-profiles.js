@@ -17,18 +17,16 @@
     posterSpec: CFG.posterSpec,
   });
 
-  const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
-
   function openDelete(profile) {
     const recs = (CFG.recCounts || {})[profile.id] || 0;
     const chans = (CFG.channelCounts || {})[profile.id] || 0;
     const groups = (CFG.groupCounts || {})[profile.id] || 0;
     const rules = (CFG.ruleCounts || {})[profile.id] || 0;
     const defaults = [];
-    if (chans) defaults.push(plural(chans, 'channel'));
-    if (groups) defaults.push(plural(groups, 'channel group'));
+    if (chans) defaults.push(counted(chans, 'channel'));
+    if (groups) defaults.push(counted(groups, 'channel group'));
     const attached = [];
-    if (recs) attached.push(plural(recs, 'recording'));
+    if (recs) attached.push(counted(recs, 'recording'));
     if (defaults.length) attached.push(`${defaults.join(' and ')} using it as a default`);
     const fallout = (attached.length
       ? `<p style="font-size:.9rem" class="text-muted">${escHtml(attached.join(', '))} ` +
@@ -38,7 +36,7 @@
       // A rule's profile carries its padding, which is what keeps a race that runs long,
       // so losing it is said separately (DESIGN-autoschedule.md §8).
       + (rules
-        ? `<p style="font-size:.9rem" class="text-muted">${escHtml(plural(rules, 'auto-record rule'))} ` +
+        ? `<p style="font-size:.9rem" class="text-muted">${escHtml(counted(rules, 'auto-record rule'))} ` +
           `${rules === 1 ? 'uses' : 'use'} it and will record with each showing's own default ` +
           'profile instead, padding included.</p>'
         : '');

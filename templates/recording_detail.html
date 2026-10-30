@@ -1115,23 +1115,23 @@
 <div class="card">
   <div class="card-head"><h2>Segments <span class="cnt">{{ rec.segments | length }}</span></h2></div>
   <div class="card-body table-scroll">
-    <table class="tbl">
+    <table class="tbl tbl-cards cards-under-900">
       <thead><tr>
-        {# Essentials columns (#/Duration/Size/Exit) always show; the rest are marked
-           .xtra and hidden at phone widths (DESIGN.md 9.5) so the table never needs
-           sideways scroll on a 375px screen. #}
-        <th class="num">#</th><th class="xtra">Started</th><th class="xtra">Ended</th>
-        <th class="num">Duration</th><th class="num xtra">Content</th><th class="num">Size</th><th class="num xtra tip-plain" data-tip="Size over the segment's Duration - the wall clock it ran for, not the Content it holds. A segment that replayed a buffer on connect reads higher here than the feed's real rate.">Avg rate</th>
-        <th class="num xtra">Stalls</th><th>Exit</th><th class="xtra">Channel</th><th class="xtra">File</th>
+        {# Eleven columns, and on a phone each row is a card of eleven labelled lines
+           (.tbl-cards, DESIGN.md 3.2) rather than a table with half its columns hidden
+           (dev/changelog/1344). #}
+        <th class="num">#</th><th>Started</th><th>Ended</th>
+        <th class="num">Duration</th><th class="num">Content</th><th class="num">Size</th><th class="num tip-plain" data-tip="Size over the segment's Duration - the wall clock it ran for, not the Content it holds. A segment that replayed a buffer on connect reads higher here than the feed's real rate.">Avg rate</th>
+        <th class="num">Stalls</th><th>Exit</th><th>Channel</th><th>File</th>
       </tr></thead>
       <tbody>
         {% for seg in rec.segments %}
         <tr>
-          <td class="num">{{ seg.segment_number + seg_offset }}</td>
-          <td class="mono xtra">{{ seg.started_at | local_time_sec if seg.started_at else '-' }}</td>
-          <td class="mono xtra">{% if seg.ended_at %}{{ seg.ended_at | local_time_sec }}{% else %}<span class="muted">-</span>{% endif %}</td>
+          <td class="num" data-label="Segment">{{ seg.segment_number + seg_offset }}</td>
+          <td class="mono" data-label="Started">{{ seg.started_at | local_time_sec if seg.started_at else '-' }}</td>
+          <td class="mono" data-label="Ended">{% if seg.ended_at %}{{ seg.ended_at | local_time_sec }}{% else %}<span class="muted">-</span>{% endif %}</td>
           {% set seg_secs = ((seg.ended_at or now) - seg.started_at).total_seconds() if seg.started_at else none %}
-          <td class="num">{{ (seg_secs | int) | duration(with_seconds=true) if seg_secs is not none else '-' }}</td>
+          <td class="num" data-label="Duration">{{ (seg_secs | int) | duration(with_seconds=true) if seg_secs is not none else '-' }}</td>
           {# How much content the finished segment file holds, against the Duration beside it
              (its wall clock). A plus is content that arrived faster than real time, which
              means the provider already had it: a buffer replayed after a reconnect lands a
@@ -1140,7 +1140,7 @@
              compares frames, so neither the delta nor its tooltip names a cause
              (dev/changelog/966). NULL on every segment captured before this was measured at
              concat time, and on any file ffprobe could not read. #}
-          <td class="num xtra">{% if seg.content_duration_seconds is none %}<span class="muted tip-plain" data-tip="{% if rec.status in (REC_STATUS.IN_PROGRESS, REC_STATUS.PAUSED, REC_STATUS.RETRYING, REC_STATUS.CONCATENATING) %}Not measured yet. A segment's content length is measured when the segments are joined, after capture ends.{% else %}Not measured. Segments captured before ChannelBin recorded a per-segment content length are not backfilled - the .ts files are deleted after conversion, so there is nothing left to probe.{% endif %}">-</span>{% else %}{{ (seg.content_duration_seconds | int) | duration(with_seconds=true) }}{% if seg_secs %}
+          <td class="num" data-label="Content">{% if seg.content_duration_seconds is none %}<span class="muted tip-plain" data-tip="{% if rec.status in (REC_STATUS.IN_PROGRESS, REC_STATUS.PAUSED, REC_STATUS.RETRYING, REC_STATUS.CONCATENATING) %}Not measured yet. A segment's content length is measured when the segments are joined, after capture ends.{% else %}Not measured. Segments captured before ChannelBin recorded a per-segment content length are not backfilled - the .ts files are deleted after conversion, so there is nothing left to probe.{% endif %}">-</span>{% else %}{{ (seg.content_duration_seconds | int) | duration(with_seconds=true) }}{% if seg_secs %}
             {% set seg_delta = seg.content_duration_seconds - seg_secs %}
             {% set seg_ratio = seg.content_duration_seconds / seg_secs %}
             <span class="exit-code{{ ' bad' if seg_delta < -1 else '' }} tip-plain" data-tip="This segment holds {{ (seg.content_duration_seconds | int) | duration(with_seconds=true) }} of content but ran for {{ (seg_secs | int) | duration(with_seconds=true) }} of wall clock{% if (seg_ratio - 1) | abs >= 0.05 %} - {{ '%.2f' | format(seg_ratio) }}x real time{% endif %}.">{{ '%+d' | format(seg_delta | round | int) }}s</span>
@@ -1148,8 +1148,8 @@
           {# The open segment has no bytes_recorded until it ends; the route stat'ed its file
              so this row grows with the banner rather than reading 0 B (dev/changelog/1040). #}
           {% set seg_bytes = seg.bytes_recorded or (live_seg_bytes if seg.id == live_seg_id else 0) %}
-          <td class="num">{{ seg_bytes | filesize if seg_bytes else '0 B' }}</td>
-          <td class="num xtra">{% if seg_bytes and seg_secs and seg_secs > 10 %}{{ '%.1f' | format(seg_bytes * 8 / seg_secs / 1000000) }} Mb/s{% else %}<span class="muted">-</span>{% endif %}
+          <td class="num" data-label="Size">{{ seg_bytes | filesize if seg_bytes else '0 B' }}</td>
+          <td class="num" data-label="Avg rate">{% if seg_bytes and seg_secs and seg_secs > 10 %}{{ '%.1f' | format(seg_bytes * 8 / seg_secs / 1000000) }} Mb/s{% else %}<span class="muted">-</span>{% endif %}
             {% if seg.near_empty %}<span class="badge b-warn tip-plain" data-tip="This segment's bitrate is far below the recording's own average - likely a blank/slate screen or error card, even though the timeline itself is clean.">slate?</span>{% endif %}
             {# Shown rather than hidden: a discarded segment is a thing the app DID, and a row
                quietly missing from this table is how the whole defect stayed invisible in the
@@ -1161,8 +1161,8 @@
                away. A segment like this never stalls, so this badge is the only thing on the
                row that says the capture was not clean. #}
             {% if seg.segment_number in fast_delivery_segs %}<span class="badge b-warn tip-plain" data-tip="This segment delivered far more video than the seconds it ran for. Video arriving ahead of the clock is video the provider already had - buffered content served after a reconnect, or the same stretch served over and over. Nothing here compares frames, so this does not say which. Worth checking this part of the recording.">fast</span>{% endif %}</td>
-          <td class="num xtra">{{ seg.stall_count or 0 }}</td>
-          <td>
+          <td class="num" data-label="Stalls">{{ seg.stall_count or 0 }}</td>
+          <td data-label="Exit">
             {% if seg.ended_at is none and rec.status in (REC_STATUS.IN_PROGRESS, REC_STATUS.PAUSED, REC_STATUS.RETRYING) %}
               <span class="exit-pill live tip-plain" data-tip="This segment is capturing right now.">RECORDING</span>
             {% elif seg.exit_reason %}
@@ -1204,13 +1204,16 @@
             </details>
             {% endif %}
           </td>
-          <td class="xtra">
+          <td data-label="Channel">
             {% set seg_ch = seg_channels.get(seg.channel_id) %}
             {% if seg_ch %}<a href="{{ url_for('channels.channel_detail', channel_id=seg_ch.id) }}">{{ seg_ch.name }}</a>
             {%- if seg_ch.account %} (<a href="{{ url_for('accounts.account_detail', account_id=seg_ch.account.id) }}">{{ seg_ch.account.name }}</a>){% endif %}
             {% else %}<span class="muted">-</span>{% endif %}
           </td>
-          <td class="mono muted xtra" style="font-size:var(--fs-xs); overflow-wrap:anywhere">{{ seg.file_path | replace('/dvr/', '') }}
+          {# The file's own name; the folder is the recording's and the same on every row, and
+             spelled out in full it was the column the table squeezed to one character a line
+             at 1280px (dev/changelog/1345). The whole path is the tooltip. #}
+          <td class="mono muted" data-label="File" style="font-size:var(--fs-xs); overflow-wrap:anywhere"><span class="tip-plain" data-tip="{{ seg.file_path }}">{{ seg.file_path.rsplit('/', 1)[-1] }}</span>
             {%- if seg.id in seg_files_gone %} <span class="tip-plain" data-tip="This segment's own file is no longer on disk.{% if rec.output_path %} The segments were joined into the finished file and then deleted, which is what happens to every recording{{ ' - this one was discarded, so its video was left out' if seg.excluded else '' }}.{% endif %}">· no longer on disk</span>{% endif %}</td>
         </tr>
         {% endfor %}

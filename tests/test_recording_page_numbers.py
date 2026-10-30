@@ -200,7 +200,10 @@ class LiveListSizeTests(_LivePage, unittest.TestCase):
         cells = rows[str(self.rid)]['cells']
         num, unit = self._expected()
         self.assertEqual((cells['size_num'], cells['size_unit']), (num, unit))
-        self.assertEqual(cells['dur_str'], '24s')
+        # 24 s at setUp, read against the wall clock at request time: a busy box can spend a
+        # second or more between the two, so the bound is a window, as the strip test's is
+        # (dev/docs/BUGS.md 2026-10-29 09:15:09 PM).
+        self.assertRegex(cells['dur_str'], r'^2[4-9]s$')
         self.assertNotIn('cells', rows[str(done.id)])
 
     def test_a_live_thumbnail_that_fails_falls_back_to_the_logo(self):
