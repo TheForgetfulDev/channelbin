@@ -296,7 +296,7 @@ function openGroupModal(opts) {
       results.forEach(r => { if (r.selectable === false) nonSelectableIds.add(Number(r.channel_id)); });
       // Stat cells come from the candidate's latest health test; unknowns render as "-".
       const numCell = (v) => (v === null || v === undefined || v === '') ? '-' : v;
-      const brCell = (kbps) => (kbps === null || kbps === undefined) ? '-' : `${(kbps / 1000).toFixed(2)} MB/s`;
+      const brCell = (kbps) => (kbps === null || kbps === undefined) ? '-' : fmtBitrate(kbps);
       const scoreCell = (v) => (v === null || v === undefined) ? '-' : `${icon('health-score')}${Math.round(v)}`;
       const rowsHtml = results.map(r => {
         const disabled = r.selectable === false;

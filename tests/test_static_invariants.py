@@ -548,7 +548,11 @@ class CssClassDefinedTests(unittest.TestCase):
                           # both badges shipped with no rule, drawn grey like any plain
                           # count (dev/docs/BUGS.md 2026-09-18 @ 09:48:43 PM,
                           # dev/changelog/1038).
-                          'nav-count-ready-bad', 'nav-count-ready-warn', 'pip-ready')
+                          'nav-count-ready-bad', 'nav-count-ready-warn', 'pip-ready',
+                          # Columns tucked away for room on the channel search, and the
+                          # group page's cards-for-room note and wrapping name cell
+                          # (dev/changelog/1345, 1346).
+                          'col-tucked', 'cols-tucked', 'gd-room-note', 'gd-c-name')
 
     def test_js_emitted_component_classes_are_defined(self):
         text = '\n'.join(t for _p, t in _css_sources())
@@ -729,6 +733,12 @@ class RetiredUiClassTests(unittest.TestCase):
         'btn-warning': "use `.btn` (or `.btn-danger` when the action destroys data) - "
                        "DESIGN.md 3.5 has no warning variant (dev/changelog/1212)",
         'btn-secondary': "use `.btn` - DESIGN.md 3.5 (dev/changelog/1212)",
+        # Hiding a table's non-essential columns on a phone was the answer before the card
+        # reflow existed; its last caller, the recording page's Segments table, reflows to
+        # `.tbl-cards` instead (dev/changelog/1344).
+        'xtra': "opt the table into `.tbl-cards` with a `data-label` on every cell "
+                "(DESIGN.md 3.2) - a phone gets every column as a card line, not half of "
+                "them hidden (dev/changelog/1344)",
     }
 
     # Two retirements the name scan above cannot express. `.table` shares its name with the
@@ -793,6 +803,31 @@ class RetiredUiClassTests(unittest.TestCase):
             revived, [],
             'A class listed as retired has a rule again. Either remove it from RETIRED '
             f'(and say why it came back) or delete the rule: {revived}')
+
+
+class TipPlainScopeTests(unittest.TestCase):
+    """`.tip-plain` cancels `.tip`'s dotted underline and may do nothing else.
+
+    Written as a bare `.tip-plain { border-bottom: none; }` it had the same specificity as
+    `.btn` and `.chip` and came after both, so the 22 buttons carrying the class for their
+    tooltip lost their bottom border and read as cut off (dev/changelog/1340; measured in a
+    browser during mockup 46, dev/changelog/1323). The rule is compound, `.tip.tip-plain`, so a
+    control that only wants a tooltip can carry the class and keep its border.
+    """
+
+    _BARE_RULE_RE = re.compile(r'^\s*\.tip-plain\s*\{([^}]*)\}', re.M)
+
+    def test_no_bare_tip_plain_rule_touches_a_border(self):
+        offenders = []
+        for path, text in _css_sources():
+            for m in self._BARE_RULE_RE.finditer(text):
+                if 'border' in m.group(1):
+                    offenders.append(f'{_rel(path)}: .tip-plain {{{m.group(1).strip()}}}')
+        self.assertEqual(
+            offenders, [],
+            'A bare `.tip-plain` rule sets a border, which strips the bottom border off every '
+            '`.btn` and `.chip` that carries the class for its tooltip - scope the reset to '
+            '`.tip.tip-plain`:\n  ' + '\n  '.join(offenders))
 
 
 class JsTimezoneTests(unittest.TestCase):

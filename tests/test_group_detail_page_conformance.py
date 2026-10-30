@@ -1298,13 +1298,13 @@ class PhoneLayoutTests(unittest.TestCase):
     def test_the_switch_row_is_padded_for_a_thumb(self):
         """11px, not 7px: measured at 375px the row came out ~35px tall at 7px, and these two
         switches are the controls the whole page exists to set. 11px puts it at ~44px."""
-        rule = self.css[self.css.index('  .gm-part {'):self.css.index('  .gm-part:last-child')]
+        rule = self.css[self.css.index('\n.gm-part {'):self.css.index('\n.gm-part:last-child')]
         self.assertIn('padding: 11px 0;', rule)
 
     def test_the_cards_buttons_do_not_match_the_surface_under_them(self):
         """`.btn`'s background is `--bg2` and so is `.gm-card`'s, so only the border said
         they were controls at all."""
-        rule = self.css[self.css.index('  .gm-acts .btn {'):self.css.index('  .gm-acts .btn:hover')]
+        rule = self.css[self.css.index('\n.gm-acts .btn {'):self.css.index('\n.gm-acts .btn:hover')]
         self.assertIn('background: var(--bg3);', rule)
         self.assertIn('justify-content: center;', rule)
 
@@ -1548,7 +1548,7 @@ class PhoneLayoutTests(unittest.TestCase):
         """Two live copies of one control is how the two come to disagree - the desktop's
         four filter controls and its Columns popover leave, and the chips row arrives."""
         phone_block = self.css[self.css.index('  .gd-statezone { display: flex;'):]
-        phone_block = phone_block[:phone_block.index('  .gm-card {')]
+        phone_block = phone_block[:phone_block.index('  .gm-botpad {')]
         self.assertIn('[data-section="channels"] .table-scroll,', phone_block)
         self.assertIn('[data-section="channels"] .gd-bulkbar,', phone_block)
         self.assertIn('.gd-phone-hide { display: none; }', phone_block)

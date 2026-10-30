@@ -73,7 +73,7 @@ const JS = ['util.js', 'auto-rule-modal.js', 'channel-search.js'].map(
 function boot({ rows = ROWS, saved = null, url = 'http://localhost:5000/channels',
                 width = 1280, hold = null, holdCounts = false, declineWhy = null,
                 pinnedWidth = null, catalog = CATALOG, uncounted = null,
-                ruleCtx = undefined, ruleAnswers = null } = {}) {
+                ruleCtx = undefined, ruleAnswers = null, listRoom = null } = {}) {
   const held = [];
   // Mutable, so a scenario can boot normally and start parking only once it is about
   // to do the thing it cares about - the grain flip needs channel rows on screen first.
@@ -269,6 +269,16 @@ function boot({ rows = ROWS, saved = null, url = 'http://localhost:5000/channels
         Object.defineProperty(w.Element.prototype, 'scrollWidth', {
           configurable: true,
           get() { return this.classList.contains('a-namecell') ? pinnedWidth : 0; },
+        });
+      }
+      /* The one other measurement a scenario may hand in: how wide the list's box is,
+         which fitColumns() compares against the columns' floors to tuck the rightmost
+         away for room (dev/changelog/1346). Only #ch-list answers; everything else keeps
+         answering 0, as above. */
+      if (listRoom !== null) {
+        Object.defineProperty(w.Element.prototype, 'clientWidth', {
+          configurable: true,
+          get() { return this.id === 'ch-list' ? listRoom : 0; },
         });
       }
     },
@@ -748,6 +758,66 @@ async function nameColScenario() {
   await huge.settle();
   obs.track_clamped = thirdTrack(huge);
   obs.errors = unmeasured.errors.concat(measured.errors, huge.errors);
+  return obs;
+}
+
+/* ── 3b. Columns tucked away for room (dev/changelog/1346) ─────────────────── */
+async function tuckedScenario() {
+  const obs = {};
+  const headLabels = (p) => p.$$('#ahead > div').map((d) => d.textContent.trim());
+  const cellsPerRow = (p) => p.$$('#ch-list .arow').map((r) => r.children.length);
+  const colsBtn = (p) => ({
+    text: p.$('#cols-btn').textContent.replace(/\s+/g, ' ').trim(),
+    tip: p.$('#cols-btn').getAttribute('data-tip') || '',
+  });
+  const picker = (p) => p.$$('#cols-list .col-item').map((el) => ({
+    col: el.dataset.col, checked: el.querySelector('input').checked,
+    tucked: !!el.querySelector('.col-tucked'),
+  }));
+
+  // Room for everything: nothing is tucked and the button says only "Columns".
+  const wide = boot({ listRoom: 1400 });
+  await wide.settle();
+  obs.wide_head = headLabels(wide);
+  obs.wide_btn = colsBtn(wide);
+  obs.wide_cells = cellsPerRow(wide);
+
+  // The airing grain in the room the facet rail leaves at 1440px: the floors of its five
+  // default columns, the lead tracks, the pinned column and the Record track come to about
+  // 1,000px, so the rightmost columns go until they fit, and the Record button stays.
+  const narrow = boot({ url: 'http://localhost:5000/channels?grain=airings', listRoom: 870 });
+  await narrow.settle();
+  obs.narrow_head = headLabels(narrow);
+  obs.narrow_btn = colsBtn(narrow);
+  obs.narrow_cells = cellsPerRow(narrow);
+  obs.narrow_picker = picker(narrow);
+  obs.narrow_record_buttons = narrow.$$('#ch-list .arow .a-act button').length;
+  obs.narrow_rows = narrow.$$('#ch-list .arow').length;
+  obs.narrow_track = narrow.$('#col-css').textContent;
+
+  // Less room still, sorted by Channel: Groups, Description and then Health go, and the
+  // Channel column the list is sorted by stays although it is the next to the right.
+  const sorted = boot({ url: 'http://localhost:5000/channels?grain=airings&sort=channel', listRoom: 700 });
+  await sorted.settle();
+  obs.sorted_head = headLabels(sorted);
+  obs.sorted_btn = colsBtn(sorted);
+
+  // The least room a desktop gives: 961px wide with the facet rail open leaves about 400px.
+  // Every column goes, the sort column (When, the default) last of all, and the button says
+  // the list is still sorted by it.
+  const floor = boot({ url: 'http://localhost:5000/channels?grain=airings', listRoom: 400 });
+  await floor.settle();
+  obs.floor_head = headLabels(floor);
+  obs.floor_btn = colsBtn(floor);
+  obs.floor_record_buttons = floor.$$('#ch-list .arow .a-act button').length;
+
+  // A phone has cards, not columns: nothing is tucked there however narrow.
+  const phone = boot({ url: 'http://localhost:5000/channels?grain=airings', width: 375, listRoom: 340 });
+  await phone.settle();
+  obs.phone_btn = colsBtn(phone);
+  obs.phone_cards = phone.$$('#ch-list .ccard, #ch-list .acard').length;
+
+  obs.errors = wide.errors.concat(narrow.errors, sorted.errors, floor.errors, phone.errors);
   return obs;
 }
 
@@ -2206,6 +2276,7 @@ const run = async () => {
     ['declined_numbers', declinedNumbersScenario],
     ['served_numbers', servedNumbersScenario],
     ['standing_inversion', standingInversionScenario],
+    ['tucked', tuckedScenario],
   ];
   const ALONE = [
     ['loading', loadingScenario],

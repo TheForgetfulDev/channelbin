@@ -307,6 +307,10 @@
 /* The columns picker is style.css's .col-item list; only the tighter spacing a
    panel needs is ours. */
 .menu-panel .col-item { padding: 4px 2px; font-size: var(--fs-md); }
+/* A column that is on but tucked away for room (channel-search.js::fitColumns) says so
+   in the picker and on the Columns button, so an on-but-absent column is never silent. */
+.menu-panel .col-item .col-tucked { margin-left: auto; font-size: var(--fs-xs); color: var(--text-faint); white-space: nowrap; cursor: help; }
+#cols-btn .cols-tucked { margin-left: 2px; }
 .menu-panel .col-item.drag-over { outline: 1px dashed var(--accent); }
 
 /* `.tri`, the three-state value control (off, included, excluded) that is how "is not"
@@ -534,7 +538,12 @@
    takes its minimum from the item, so without this the column could collapse
    under a page of short names. It lives on the cell because .acell sets
    min-width: 0 for the ellipsis and that has to stay. */
-.a-namecell { display: flex; align-items: center; gap: .4rem; min-width: 190px; }
+/* 170, not the 190 it was: at 961px with the facet rail open the airing grain has about
+   391px for its row, and with every column tucked (dev/changelog/1346) the two lead tracks,
+   the Record track, the gaps and the padding leave 171 for the name - 190 was 19px of
+   sideways scroll at the one width where nothing else is left to give. The JS floor
+   (channel-search.js NAME_COL_FLOOR) is this number. */
+.a-namecell { display: flex; align-items: center; gap: .4rem; min-width: 170px; }
 /* The name is the only shrinkable item in this cell - a `.badge` has no overflow of
    its own, so its minimum size is its own text - which means the name is what gives
    way when the badges outgrow the column, and it gives way all the way to zero. A row

@@ -1510,7 +1510,10 @@ body.scroll-locked { position: fixed; left: 0; right: 0; width: 100%; overflow: 
    .tip-pop element positioned by JS (flips at viewport edges, escapes
    scroll containers - the mockups' CSS-::after variant is superseded). */
 .tip { cursor: help; border-bottom: 1px dotted var(--text-faint); }
-.tip-plain { border-bottom: none; }
+/* Compound on purpose: the reset cancels .tip's dotted underline and nothing else. Written
+   bare it had .btn's and .chip's specificity and came after both, so every button and chip
+   carrying tip-plain lost its bottom border and read as cut off (dev/changelog/1340). */
+.tip.tip-plain { border-bottom: none; }
 .tip-pop {
   position: fixed; background: var(--bg3); border: 1px solid var(--border); color: var(--text);
   font-size: var(--fs-sm); font-weight: 400; line-height: 1.4; text-align: left; text-transform: none; letter-spacing: 0;
@@ -1828,8 +1831,14 @@ table.tbl { width: 100%; border-collapse: collapse; font-size: var(--fs-md); }
   font-family: var(--font-mono); color: var(--text-muted);
   white-space: pre-wrap; overflow-wrap: anywhere;
 }
-/* Essentials columns on phones (DESIGN.md 9.5) - tablet/desktop keep every column. */
-@media (max-width: 960px) { .tbl .xtra { display: none; } }
+
+/* On a phone the scale's smallest step reads as tiny - 10.7px is under the 11px floor a
+   phone's own type guidance sets - so the step is raised to the next one there. Every
+   event-type code, segment badge and uppercase key on a phone moves with it; the desktop
+   keeps the full scale (dev/changelog/1345). */
+@media (max-width: 960px) {
+  :root { --fs-2xs: var(--fs-xs); }
+}
 
 /* ── Table as cards on a phone (DESIGN.md 3.2, opt-in) ──────────────
    `.tbl-cards` beside `.tbl`, never a change to `.tbl` itself: a table inside a modal is
@@ -1888,6 +1897,67 @@ table.tbl { width: 100%; border-collapse: collapse; font-size: var(--fs-md); }
   }
   /* A trailing actions cell has no column header to sit opposite. */
   .tbl-cards td:not([data-label])::before { content: none; }
+}
+
+/* ── Table as cards in a narrow desktop column (DESIGN.md 3.2, opt-in) ──
+   `.table-scroll` is a named size container, so a table too wide for the column it sits
+   in can take the card form off the room it actually has rather than the viewport - the
+   same move `.rec-list` makes for its rows (dev/changelog/561). Just above the mobile
+   breakpoint the sidebar is back and the content column is about 670px, less room than
+   a phone's card layout had, and a contained sideways drag is not an acceptable answer at
+   any width (dev/changelog/1345). Opt-in per table with a threshold class, because most
+   tables fit that band as tables and would only lose density as cards: `cards-under-900`
+   for a table that needs about 900px of column (the Segments table, the account
+   comparison), `cards-under-1100` for one that needs about 1,100 (Test History). Both
+   thresholds were measured in the browser suite (dev/sim/ui.py, the 961 and 1280
+   projects). The two blocks below are duplicated from the ≤960px block above - a
+   container query and a media query cannot share one prelude - and the three change
+   together. container-type:inline-size breaks position:sticky for descendants; no table
+   in a `.table-scroll` has one. */
+.table-scroll { container-type: inline-size; container-name: table-scroll; }
+@container table-scroll (max-width: 900px) {
+  .tbl-cards.cards-under-900, .tbl-cards.cards-under-900 tbody, .tbl-cards.cards-under-900 tr, .tbl-cards.cards-under-900 td { display: block; }
+  .tbl-cards.cards-under-900 thead { display: none; }
+  .tbl-cards.cards-under-900 tbody tr {
+    background: var(--bg2); border: 1px solid var(--border-soft);
+    border-radius: var(--radius); padding: 3px 12px; margin-bottom: 10px;
+  }
+  .tbl-cards.cards-under-900 tbody tr:last-child { margin-bottom: 0; }
+  .tbl-cards.cards-under-900 tbody tr:hover td { background: none; }
+  .tbl-cards.cards-under-900 td {
+    padding: 7px 0; border-bottom: 1px solid var(--border-soft);
+    text-align: right; overflow: hidden; overflow-wrap: anywhere;
+  }
+  .tbl-cards.cards-under-900 td:last-child { border-bottom: none; }
+  .tbl-cards.cards-under-900 td::before {
+    content: attr(data-label);
+    float: left; max-width: 45%; margin: 1px 14px 0 0; text-align: left;
+    font-size: var(--fs-xs); font-weight: 600; letter-spacing: .07em;
+    text-transform: uppercase; color: var(--text-faint);
+  }
+  .tbl-cards.cards-under-900 td:not([data-label])::before { content: none; }
+}
+@container table-scroll (max-width: 1100px) {
+  .tbl-cards.cards-under-1100, .tbl-cards.cards-under-1100 tbody, .tbl-cards.cards-under-1100 tr, .tbl-cards.cards-under-1100 td { display: block; }
+  .tbl-cards.cards-under-1100 thead { display: none; }
+  .tbl-cards.cards-under-1100 tbody tr {
+    background: var(--bg2); border: 1px solid var(--border-soft);
+    border-radius: var(--radius); padding: 3px 12px; margin-bottom: 10px;
+  }
+  .tbl-cards.cards-under-1100 tbody tr:last-child { margin-bottom: 0; }
+  .tbl-cards.cards-under-1100 tbody tr:hover td { background: none; }
+  .tbl-cards.cards-under-1100 td {
+    padding: 7px 0; border-bottom: 1px solid var(--border-soft);
+    text-align: right; overflow: hidden; overflow-wrap: anywhere;
+  }
+  .tbl-cards.cards-under-1100 td:last-child { border-bottom: none; }
+  .tbl-cards.cards-under-1100 td::before {
+    content: attr(data-label);
+    float: left; max-width: 45%; margin: 1px 14px 0 0; text-align: left;
+    font-size: var(--fs-xs); font-weight: 600; letter-spacing: .07em;
+    text-transform: uppercase; color: var(--text-faint);
+  }
+  .tbl-cards.cards-under-1100 td:not([data-label])::before { content: none; }
 }
 
 /* ── Info block (a thing's own details: subtitle, labelled lines, body text, tags) ──
@@ -2668,11 +2738,18 @@ body.actbar-on #app-toast { bottom: 78px; }
 .gd-bulk-lbl { display: inline-flex; align-items: center; gap: 6px; cursor: pointer; font-size: var(--fs-sm); color: var(--text-muted); margin: 0; }
 .gd-bulk-lbl input { accent-color: var(--accent); }
 .gd-table { width: 100%; border-collapse: collapse; font-size: var(--fs-md); }
+/* Headers may wrap: "HEALTH CHECK" held to one line is 30px wider than the 74px switch
+   column under it, and that air was part of what pushed a three-member table past a 1440px
+   window into the cards (dev/changelog/1345). */
 .gd-table th {
   text-align: left; font-size: var(--fs-xs); font-weight: 600; letter-spacing: .07em; text-transform: uppercase;
-  color: var(--text-faint); padding: 9px 10px 7px; border-bottom: 1px solid var(--border-soft); white-space: nowrap;
+  color: var(--text-faint); padding: 9px 8px 7px; border-bottom: 1px solid var(--border-soft); white-space: normal;
 }
-.gd-table td { padding: 8px 10px; border-bottom: 1px solid var(--border-soft); vertical-align: middle; white-space: nowrap; }
+.gd-table td { padding: 8px 8px; border-bottom: 1px solid var(--border-soft); vertical-align: middle; white-space: nowrap; }
+/* The one cell whose text is allowed to wrap: a channel name is the widest thing on the
+   row and the only one whose width is the provider's choice, so it gives first
+   (dev/changelog/1345). */
+.gd-table td.gd-c-name { white-space: normal; min-width: 150px; }
 .gd-table tr.gd-row { cursor: pointer; }
 .gd-table tr.gd-row.no-profile { cursor: default; }
 .gd-table tr.gd-row:hover td { background: var(--bg2); }
@@ -2725,7 +2802,7 @@ th.gd-c-part { text-align: center; }
 /* The Account column (dev/changelog/1064). Clamped on the inner name, not the <td>, for the
    reason .gd-epg-id above already carries: a sortable column's <th> has no `gd-c-*` class to
    put the matching width on. The dot never shrinks - it is the fast read down the column. */
-.gd-acct { display: inline-flex; align-items: center; gap: 6px; max-width: 170px; vertical-align: bottom; }
+.gd-acct { display: inline-flex; align-items: center; gap: 6px; max-width: 140px; vertical-align: bottom; }
 .gd-acct .acct-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
 .gd-acct-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .gd-name-link { color: var(--text); }
@@ -2943,109 +3020,6 @@ th.gd-c-part { text-align: center; }
   .gd-phonebar { display: flex; }
   .gm-list { display: flex; flex-direction: column; gap: 10px; }
 
-  /* The card. A grid-free stack on purpose: nothing here depends on two containers
-     resolving a track to the same width, which is the defect class that slid the desktop
-     list's header labels off their columns (CLAUDE.md, the list-grid rule). */
-  .gm-card {
-    background: var(--bg2); border: 1px solid var(--border-soft); border-left: none;
-    border-radius: var(--radius); padding: 10px 12px 10px calc(12px + var(--edge-w));
-    position: relative; overflow: hidden;
-    /* The status band, copied in shape from .grp-item and the recordings rows - a
-       3px inset bar clipped by this card's own overflow:hidden, so it follows the
-       rounded corner instead of fading out partway around it like a real border-left
-       of mismatched width does (measured, dev/changelog/878). Same data-health
-       attribute and the same five tokens those two use, because a third spelling of
-       one convention is how they drift. */
-  }
-  .gm-card::before { content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: var(--edge-w); background: var(--border-soft); }
-  .gm-card[data-health="st-ok"]::before   { background: var(--ok); }
-  .gm-card[data-health="st-warn"]::before { background: var(--warn); }
-  .gm-card[data-health="st-bad"]::before  { background: var(--bad); }
-  .gm-card[data-health="st-run"]::before  { background: var(--accent); }
-  .gm-card[data-health="st-none"]::before { background: var(--text-faint); }
-  /* Selection repaints the other three edges only - the left one carries status, and a
-     selected card still has to say whether its feed is passing. */
-  .gm-card.sel {
-    background: var(--accent-soft);
-    border-top-color: var(--accent); border-right-color: var(--accent); border-bottom-color: var(--accent);
-  }
-  /* Only the system group, whose membership is computed and which therefore has no
-     participation switches to explain itself with (DECIDED 3). */
-  .gm-card.is-disabled { opacity: .4; }
-  .gm-card.is-disabled .gm-name { text-decoration: line-through; }
-
-  .gm-top { display: flex; align-items: flex-start; gap: 9px; }
-  .gm-check { flex: 0 0 auto; margin-top: 3px; width: 18px; height: 18px; accent-color: var(--accent); }
-  /* DESIGN.md 9.4: the name takes the full line and wraps, never truncated. min-width:0
-     on the flex child is what actually lets it wrap instead of forcing the row wider
-     than the phone. */
-  .gm-headline { flex: 1; min-width: 0; }
-  .gm-name { display: inline; font-weight: 600; word-break: break-word; }
-  .gm-acct { display: flex; align-items: center; gap: 5px; font-size: var(--fs-xs); color: var(--text-muted); margin-top: 2px; }
-  .gm-acct .acct-dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; }
-  .gm-status { flex: 0 0 auto; }
-  .gm-flags { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 7px; }
-  .gm-stats { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-top: 7px; font-size: var(--fs-sm); color: var(--text-muted); }
-  .gm-sep { color: var(--text-faint); }
-
-  /* The two switches, each on its own labeled row: a switch with no column header above
-     it is unanswerable without one.
-     The 11px vertical padding is a MEASURED decision, not a style. At 375px the row came
-     out ~35px tall at 7px, and these two are the controls the whole page exists to set.
-     The row is the tap target rather than the knob - the label wraps the whole thing, so
-     a thumb anywhere across the card's width hits it - and 11px puts it at ~44px. */
-  .gm-parts { margin-top: 9px; border-top: 1px solid var(--border-soft); }
-  .gm-part {
-    display: flex; align-items: center; justify-content: space-between;
-    gap: 12px; padding: 11px 0; margin: 0; cursor: pointer;
-    border-bottom: 1px solid var(--border-soft);
-  }
-  .gm-part:last-child { border-bottom: none; }
-  .gm-part-lbl { font-size: var(--fs-sm); color: var(--text); }
-
-  /* .btn's own background is --bg2 and so is .gm-card's, so these buttons were painted
-     the same color as the surface they sit on and only their border said they were
-     controls at all. --bg3 is the layer above --bg2 ("hover-on-bg2"), which uses the
-     palette rather than inventing a button color for one surface. justify-content is the
-     other half: flex:1 stretches them, and without it every label sits hard left.
-     Full .btn and not .btn-sm - DESIGN.md 3.5 keeps .btn-sm genuinely small for dense
-     desktop table and card-footer contexts, and at 375px these came out 28.5px beside the
-     43px switch rows directly above them on the same card. */
-  .gm-acts { display: flex; gap: 6px; margin-top: 9px; }
-  .gm-acts .btn { flex: 1; justify-content: center; background: var(--bg3); border-color: var(--border); }
-  .gm-acts .btn:hover { background: var(--border); }
-  .gm-acts .btn-icon { flex: 0 0 auto; }
-  .gm-drawer { margin-top: 9px; border-top: 1px solid var(--border-soft); padding-top: 9px; }
-
-  /* The active-filter count inside the Filters chip. Deliberately not .badge, which is
-     an uppercase 2px/10px standalone pill - inside a --ctl-h chip it reads as a second
-     control rather than as a number on the first. */
-  .gm-count {
-    display: inline-block; min-width: 16px; padding: 0 4px; margin-left: 4px;
-    border-radius: 999px; background: var(--accent); color: var(--accent-contrast);
-    font-size: var(--fs-2xs); text-align: center;
-  }
-  /* The sort direction caret on the Sort chip. The sortable column headers go away with
-     the table, so this chip is the only thing left saying how the list is ordered. */
-  .gm-dir { color: var(--text-muted); }
-
-  /* Section headings inside a bottom sheet; the rows themselves are the shared
-     .sheet-act. */
-  .gm-sheet-sec {
-    font-size: var(--fs-2xs); text-transform: uppercase; letter-spacing: .06em;
-    color: var(--text-faint); margin: 12px 0 2px;
-  }
-  .gm-sheet-sec:first-child { margin-top: 0; }
-  .gm-tick { color: var(--accent-text); font-size: var(--fs-sm); flex: 0 0 auto; }
-  /* A Filters-sheet value row with the filter bar's is / is-not control beside it. The
-     row's rule moves to the wrapper so it runs under the control too, and the control is
-     sized for a thumb rather than a pointer, as the channel search's sheet does. */
-  .gm-fval { display: flex; align-items: center; gap: 8px; border-bottom: 1px solid var(--border-soft); }
-  .gm-fval:last-child { border-bottom: none; }
-  .gm-fval .sheet-act { border-bottom: none; flex: 1 1 auto; min-width: 0; }
-  .gm-fval .tri button { height: 32px; padding: 0 10px; font-size: var(--fs-sm); }
-
-  .gm-selcount { flex: 0 0 auto; font-size: var(--fs-sm); color: var(--text-muted); }
   /* Reserved unconditionally, deliberately NOT toggled with the bar: coupling the page's
      height to the bar's visibility would let showing it change the scroll height
      underneath the very observer deciding whether to show it (.acct-stickybar carries the
@@ -3053,6 +3027,130 @@ th.gd-c-part { text-align: center; }
      because above it the bar can never appear at all. */
   .gm-botpad { display: block; height: 76px; }
 }
+
+/* The card and the sheets' own pieces, at every width: inert until a `.gm-list` is shown,
+   which the ≤960px block above does on a phone and the cards-for-room class below does in
+   a desktop window the table does not fit. */
+/* The card. A grid-free stack on purpose: nothing here depends on two containers
+   resolving a track to the same width, which is the defect class that slid the desktop
+   list's header labels off their columns (CLAUDE.md, the list-grid rule). */
+.gm-card {
+  background: var(--bg2); border: 1px solid var(--border-soft); border-left: none;
+  border-radius: var(--radius); padding: 10px 12px 10px calc(12px + var(--edge-w));
+  position: relative; overflow: hidden;
+  /* The status band, copied in shape from .grp-item and the recordings rows - a
+     3px inset bar clipped by this card's own overflow:hidden, so it follows the
+     rounded corner instead of fading out partway around it like a real border-left
+     of mismatched width does (measured, dev/changelog/878). Same data-health
+     attribute and the same five tokens those two use, because a third spelling of
+     one convention is how they drift. */
+}
+.gm-card::before { content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: var(--edge-w); background: var(--border-soft); }
+.gm-card[data-health="st-ok"]::before   { background: var(--ok); }
+.gm-card[data-health="st-warn"]::before { background: var(--warn); }
+.gm-card[data-health="st-bad"]::before  { background: var(--bad); }
+.gm-card[data-health="st-run"]::before  { background: var(--accent); }
+.gm-card[data-health="st-none"]::before { background: var(--text-faint); }
+/* Selection repaints the other three edges only - the left one carries status, and a
+   selected card still has to say whether its feed is passing. */
+.gm-card.sel {
+  background: var(--accent-soft);
+  border-top-color: var(--accent); border-right-color: var(--accent); border-bottom-color: var(--accent);
+}
+/* Only the system group, whose membership is computed and which therefore has no
+   participation switches to explain itself with (DECIDED 3). */
+.gm-card.is-disabled { opacity: .4; }
+.gm-card.is-disabled .gm-name { text-decoration: line-through; }
+
+.gm-top { display: flex; align-items: flex-start; gap: 9px; }
+.gm-check { flex: 0 0 auto; margin-top: 3px; width: 18px; height: 18px; accent-color: var(--accent); }
+/* DESIGN.md 9.4: the name takes the full line and wraps, never truncated. min-width:0
+   on the flex child is what actually lets it wrap instead of forcing the row wider
+   than the phone. */
+.gm-headline { flex: 1; min-width: 0; }
+.gm-name { display: inline; font-weight: 600; word-break: break-word; }
+.gm-acct { display: flex; align-items: center; gap: 5px; font-size: var(--fs-xs); color: var(--text-muted); margin-top: 2px; }
+.gm-acct .acct-dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; }
+.gm-status { flex: 0 0 auto; }
+.gm-flags { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 7px; }
+.gm-stats { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-top: 7px; font-size: var(--fs-sm); color: var(--text-muted); }
+.gm-sep { color: var(--text-faint); }
+
+/* The two switches, each on its own labeled row: a switch with no column header above
+   it is unanswerable without one.
+   The 11px vertical padding is a MEASURED decision, not a style. At 375px the row came
+   out ~35px tall at 7px, and these two are the controls the whole page exists to set.
+   The row is the tap target rather than the knob - the label wraps the whole thing, so
+   a thumb anywhere across the card's width hits it - and 11px puts it at ~44px. */
+.gm-parts { margin-top: 9px; border-top: 1px solid var(--border-soft); }
+.gm-part {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 12px; padding: 11px 0; margin: 0; cursor: pointer;
+  border-bottom: 1px solid var(--border-soft);
+}
+.gm-part:last-child { border-bottom: none; }
+.gm-part-lbl { font-size: var(--fs-sm); color: var(--text); }
+
+/* .btn's own background is --bg2 and so is .gm-card's, so these buttons were painted
+   the same color as the surface they sit on and only their border said they were
+   controls at all. --bg3 is the layer above --bg2 ("hover-on-bg2"), which uses the
+   palette rather than inventing a button color for one surface. justify-content is the
+   other half: flex:1 stretches them, and without it every label sits hard left.
+   Full .btn and not .btn-sm - DESIGN.md 3.5 keeps .btn-sm genuinely small for dense
+   desktop table and card-footer contexts, and at 375px these came out 28.5px beside the
+   43px switch rows directly above them on the same card. */
+.gm-acts { display: flex; gap: 6px; margin-top: 9px; }
+.gm-acts .btn { flex: 1; justify-content: center; background: var(--bg3); border-color: var(--border); }
+.gm-acts .btn:hover { background: var(--border); }
+.gm-acts .btn-icon { flex: 0 0 auto; }
+.gm-drawer { margin-top: 9px; border-top: 1px solid var(--border-soft); padding-top: 9px; }
+
+/* The active-filter count inside the Filters chip. Deliberately not .badge, which is
+   an uppercase 2px/10px standalone pill - inside a --ctl-h chip it reads as a second
+   control rather than as a number on the first. */
+.gm-count {
+  display: inline-block; min-width: 16px; padding: 0 4px; margin-left: 4px;
+  border-radius: 999px; background: var(--accent); color: var(--accent-contrast);
+  font-size: var(--fs-2xs); text-align: center;
+}
+/* The sort direction caret on the Sort chip. The sortable column headers go away with
+   the table, so this chip is the only thing left saying how the list is ordered. */
+.gm-dir { color: var(--text-muted); }
+
+/* Section headings inside a bottom sheet; the rows themselves are the shared
+   .sheet-act. */
+.gm-sheet-sec {
+  font-size: var(--fs-2xs); text-transform: uppercase; letter-spacing: .06em;
+  color: var(--text-faint); margin: 12px 0 2px;
+}
+.gm-sheet-sec:first-child { margin-top: 0; }
+.gm-tick { color: var(--accent-text); font-size: var(--fs-sm); flex: 0 0 auto; }
+/* A Filters-sheet value row with the filter bar's is / is-not control beside it. The
+   row's rule moves to the wrapper so it runs under the control too, and the control is
+   sized for a thumb rather than a pointer, as the channel search's sheet does. */
+.gm-fval { display: flex; align-items: center; gap: 8px; border-bottom: 1px solid var(--border-soft); }
+.gm-fval:last-child { border-bottom: none; }
+.gm-fval .sheet-act { border-bottom: none; flex: 1 1 auto; min-width: 0; }
+.gm-fval .tri button { height: 32px; padding: 0 10px; font-size: var(--fs-sm); }
+
+.gm-selcount { flex: 0 0 auto; font-size: var(--fs-sm); color: var(--text-muted); }
+
+/* CARDS FOR ROOM (dev/changelog/1345): the phone arrangement in a desktop window too
+   narrow for the member table. group-detail.js draws the table, measures its box, and
+   sets this class on the Channels card when the box would have to scroll sideways; the
+   three display rules are duplicated from the ≤960px block above - a media query and a
+   class cannot share one prelude - and change together. The note beside the chips is
+   what says why the cards are there. */
+.gd-cards-for-room .table-scroll,
+.gd-cards-for-room .gd-bulkbar,
+.gd-cards-for-room .gd-phone-hide { display: none; }
+.gd-cards-for-room .gd-phonebar { display: flex; }
+.gd-cards-for-room .gm-list { display: flex; flex-direction: column; gap: 10px; }
+/* The phone's selection mode needs the phone's bottom bar, which only the ≤960px block
+   shows, so the Select chip is not offered here; the note says a wider window has the bulk
+   actions. */
+.gd-cards-for-room #gd-chip-select { display: none; }
+.gd-room-note { margin-left: auto; font-size: var(--fs-sm); color: var(--text-muted); }
 
 /* ── Responsive ────────────────────────────────────────────────────── */
 @media (max-width: 960px) {

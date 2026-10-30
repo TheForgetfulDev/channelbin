@@ -1000,9 +1000,24 @@
   const colReg = () => (isAirings() ? ACOL_BY_KEY : COL_BY_KEY);
   const colList = () => (isAirings() ? AIRING_COLUMNS : COLUMNS);
   const colState = () => colStates[state.grain];
+  /* COLUMNS TUCKED AWAY FOR ROOM, per grain. A desktop window narrower than the columns'
+     floors - the facet rail open at 1440px, or the sidebar back at 961 - used to push the
+     row past its box, and with it the Record button, the one control the airing grain
+     exists for, off the right edge into a sideways scroll (dev/changelog/1346). Instead the
+     rightmost columns are set aside, last one first, until the floors fit the room the
+     list has, and come back the moment it widens. Transient and never saved: the user's
+     column setup is what they chose, this is what the window can show of it. The Columns
+     button and the picker both say which are tucked, so a column that is on and not on
+     screen is never a silent state; the sort column is never tucked, for the same reason
+     guardSortAgainstHidden() exists. */
+  const tucked = { [GRAIN_CHANNELS]: new Set(), [GRAIN_AIRINGS]: new Set() };
+  const tuckedCols = () => tucked[state.grain];
   const visibleCols = () =>
-    colState().order.filter((k) => !colState().hidden.includes(k)).map((k) => colReg()[k])
-      .filter(Boolean);
+    colState().order.filter((k) => !colState().hidden.includes(k) && !tuckedCols().has(k))
+      .map((k) => colReg()[k]).filter(Boolean);
+  // The columns that are on, tucked or not: what the picker and the button describe.
+  const visibleColsAll = () =>
+    colState().order.filter((k) => !colState().hidden.includes(k)).map((k) => colReg()[k]).filter(Boolean);
 
   /* Which card LINES are drawn, below the breakpoint. DESIGN.md 9.4 says "no
      Columns control on phones", overridden in mockup 22 round 2
@@ -1172,6 +1187,60 @@
     return mins.reduce((a, b) => a + b, 0) + gap * mins.length + pad * 2;
   }
 
+  /* The floor the pinned column keeps whatever the room: `.a-namecell`'s own min-width,
+     which the frozen track cannot beat anyway. Below it the row has stopped being about a
+     channel. 170 is what a 961px window with the facet rail open leaves the name once every
+     column is tucked (channel-search.css says the sum). */
+  const NAME_COL_FLOOR = 170;
+
+  /* Decide which columns are tucked for the room the list has now; true when the set
+     changed, so the caller knows the rows need redrawing. Nothing is measured under
+     jsdom (clientWidth is 0 there) and nothing is tucked on a phone, where the rows are
+     cards and a column is a card line. */
+  function fitColumns() {
+    const set = tuckedCols();
+    const before = Array.from(set).join(',');
+    set.clear();
+    const room = isMobile() ? 0 : (($('#ch-list') || {}).clientWidth || 0);
+    if (room) {
+      // Rightmost first; the column the list is sorted by goes last of all, so it stays as
+      // long as anything else can give - at 961px with the facet rail open the airing grain's
+      // default sort, When, is the last column standing and still 180px too wide, and the
+      // honest answer there is Program and Record alone with the button saying so.
+      const cols = visibleCols();
+      const isSort = (c) => !!(c.sort && c.sort === state.sort);
+      const candidates = cols.filter((c) => !isSort(c)).map((c) => c.key).reverse()
+        .concat(cols.filter(isSort).map((c) => c.key));
+      while (room < nonNameBudget() + NAME_COL_FLOOR && candidates.length) set.add(candidates.shift());
+    }
+    const changed = Array.from(set).join(',') !== before;
+    if (changed) { renderColsBtn(); renderColsPop(); }
+    return changed;
+  }
+
+  /* One button, two things: the table's Columns popover on a desktop, the card's Fields
+     sheet on a phone. A second button would be a control that exists at one width only
+     and confuses the other. On a desktop it also carries how many columns are tucked
+     for room, and names them. */
+  function renderColsBtn() {
+    const btn = $('#cols-btn');
+    if (!btn) return;
+    if (isMobile()) { btn.innerHTML = `${icon('layout')} Fields`; btn.removeAttribute('data-tip'); return; }
+    const names = Array.from(tuckedCols()).map((k) => (colReg()[k] || {}).label).filter(Boolean);
+    btn.innerHTML = `${icon('layout')} Columns${names.length
+      ? ` <span class="nsel cols-tucked">${nf(names.length)} tucked</span>` : ''}`;
+    if (names.length) {
+      const sortCol = visibleColsAll().find((c) => c.sort && c.sort === state.sort && tuckedCols().has(c.key));
+      btn.setAttribute('data-tip', `${names.length === 1 ? 'A column is' : `${names.length} columns are`} `
+        + `tucked away for room: ${names.join(', ')}.\n\nThere is not room for every `
+        + 'column you have on; the rightmost go first and come back when there is. '
+        + 'Your column setup is unchanged.'
+        + (sortCol ? `\n\nThe list is still sorted by ${sortCol.label}, even though that column is tucked.` : ''));
+    } else {
+      btn.removeAttribute('data-tip');
+    }
+  }
+
   function freezeNameCol() {
     // Below the breakpoint the generated rule does not apply - and there is no
     // table down there at all - so anything measured belongs to the card grid and
@@ -1190,12 +1259,12 @@
        first two alone is what let a page of long names widen the row past its container
        at 1440 while every other track sat on its floor with nothing to give.
 
-       A floor of 190 (`.a-namecell`'s own min-width, which the frozen track cannot beat
-       anyway) rather than letting a narrow window drive this to nothing: below that the
+       A floor of NAME_COL_FLOOR (`.a-namecell`'s own min-width, which the frozen track
+       cannot beat anyway) rather than letting a narrow window drive this to nothing: below that the
        row has stopped being about a channel, and the honest answer is the list's own
        horizontal scrollbar, not a nameless row. */
     const room = ($('#ch-list') || {}).clientWidth || 0;
-    const avail = room ? Math.max(190, room - nonNameBudget()) : Infinity;
+    const avail = room ? Math.max(NAME_COL_FLOOR, room - nonNameBudget()) : Infinity;
     nameColCssByGrain[state.grain] =
       `${Math.min(Math.ceil(w), NAME_COL_CAP[state.grain], avail)}px`;
     applyColumns();
@@ -1228,10 +1297,16 @@
     $('#cols-list').innerHTML = colState().order.map((k) => {
       const c = reg[k];
       if (!c) return '';
+      // A tucked column is still ON - its box stays ticked - and says why it is not on
+      // screen, so the picker never shows a ticked column the table is not drawing
+      // without a reason beside it.
+      const tuck = tuckedCols().has(k)
+        ? ' <span class="col-tucked" data-tip="On, but tucked away for room: there is not room for every column you have on. It comes back when there is.">tucked for room</span>'
+        : '';
       return `<label class="col-item" draggable="true" data-col="${esc(k)}">
         <span class="grip">${icon('drag')}</span>
         <input type="checkbox" data-col="${esc(k)}"${colState().hidden.includes(k) ? '' : ' checked'}>
-        ${esc(c.label)}</label>`;
+        ${esc(c.label)}${tuck}</label>`;
     }).join('');
   }
 
@@ -2077,6 +2152,9 @@
   function renderResultsArea() {
     const list = $('#ch-list');
     const empty = $('#all-empty');
+    // Before any row is drawn: the rows and the header take their cells from
+    // visibleCols(), which this settles for the room the list has now.
+    fitColumns();
     $('#all-loading').style.display = resultsPending ? '' : 'none';
     if (resultsPending) {
       /* The table STAYS, so the header keeps saying what is being loaded - an empty
@@ -4345,12 +4423,23 @@
     // status line instead of an invitation.
     // last.total is null while fetchCounts() is still out (dev/changelog/598) - "0 of N"
     // would be a wrong claim, not a pending one.
+    // On the airing grain the total counts showings, not channels, so "N of M channels"
+    // put two units either side of one "of". It reads "N airings on K channels" there, the
+    // count line's own phrase (dev/changelog/1080), with K the matched-channel count the
+    // same response carries; while that number is missing the line names the airings alone
+    // rather than borrowing the library size as a denominator (dev/changelog/1342).
     // esc()'d below, so this is plain text - no HTML entities.
-    const empty = state.q
-      ? (last.total === null
-        ? 'no filters - counting matches…'
-        : `no filters - ${nf(last.total)} of ${nf(CAT ? CAT.total_channels : 0)} channels match what you typed`)
-      : 'add a filter';
+    const typedMatch = () => {
+      if (last.total === null) return 'no filters - counting matches…';
+      if (!isAirings()) {
+        return `no filters - ${nf(last.total)} of ${nf(CAT ? CAT.total_channels : 0)} channels match what you typed`;
+      }
+      const airings = `${nf(last.total)} airing${last.total === 1 ? '' : 's'}`;
+      const k = last.channelsMatched;
+      const on = typeof k === 'number' ? ` on ${nf(k)} channel${k === 1 ? '' : 's'}` : '';
+      return `no filters - ${airings}${on} match what you typed`;
+    };
+    const empty = state.q ? typedMatch() : 'add a filter';
     /* The row is LABELED, with its count on the label, and that replaces the old inline
        "Active filters" rather than joining it - two labels on one row is exactly the
        difference DESIGN.md §11.1 exists to catch (dev/changelog/810). The count is omitted
@@ -4439,10 +4528,7 @@
 
   function renderChipRow() {
     const row = $('#chiprow');
-    // One button, two things: the table's Columns popover up there, the card's
-    // Fields sheet down here. A second button would be a control that exists at
-    // one width only and confuses the other.
-    $('#cols-btn').innerHTML = isMobile() ? `${icon('layout')} Fields` : `${icon('layout')} Columns`;
+    renderColsBtn();
     if (!CAT || !isMobile()) { row.innerHTML = ''; return; }
     const st = savedStatus();
     const bits = [];
@@ -5424,6 +5510,11 @@
      stopPropagation is needed here, and the list is deliberately NOT rebuilt on
      a tick (rebuilding would detach the node mid-click; the drop handler that
      does rebuild runs on a drag event, not a click). */
+  // The "tucked for room" note sits inside the column's label; a click on it must read as
+  // a hover on the note, not as a toggle of the column.
+  $('#cols-list').addEventListener('click', (e) => {
+    if (e.target.closest('.col-tucked')) e.preventDefault();
+  });
   $('#cols-list').addEventListener('change', (e) => {
     const cb = e.target.closest('input[data-col]');
     if (cb) setColumnVisible(cb.dataset.col, cb.checked);
@@ -5981,10 +6072,15 @@
   // space it was measured in changes. The bar's sticky offset does not need a call
   // here any more - the ResizeObserver set up alongside syncBarOffset() above already
   // fires on any box-size change to .cs-bar, a window resize included.
+  // A narrower window may also mean a column has to be tucked, or a wider one that a
+  // tucked column comes back: that changes which cells every row draws, so the rows are
+  // redrawn (which re-freezes the name track itself); otherwise only the freeze is retaken.
   let resizeTimer = null;
   window.addEventListener('resize', () => {
     clearTimeout(resizeTimer);
-    resizeTimer = setTimeout(() => { freezeNameCol(); }, 120);
+    resizeTimer = setTimeout(() => {
+      if (fitColumns() && !resultsPending) renderResultsArea(); else freezeNameCol();
+    }, 120);
   });
 
   // Sidebar-width overflow (dev/docs/BUGS.md): #ch-list is its own scroll box (see

@@ -567,9 +567,14 @@ class ReadinessReportTests(_BundleTestCase):
         return _unzip(sb.build_support_bundle(**kw)).read('readiness.txt').decode()
 
     def test_the_bundle_ships_the_copy_report_text(self):
+        """The disk is read once per rendering, so the two renderings compared here are two
+        readings of a live disk; on a box at 97% with a run writing beside the suite the free
+        figure moved from 2.1 to 2.0 GB between them and the test went red on a diff that
+        never touched either side (dev/docs/BUGS.md 2026-10-30). Both readings are pinned."""
         from app import readiness
-        shipped = self._report()
-        expected = readiness.evaluate()['report']
+        with patch('app.routes.system._disk_bytes', return_value=(100 * 1024 ** 3, 40 * 1024 ** 3)):
+            shipped = self._report()
+            expected = readiness.evaluate()['report']
 
         def body(text):
             return [line for line in text.splitlines() if not line.startswith('Generated ')]

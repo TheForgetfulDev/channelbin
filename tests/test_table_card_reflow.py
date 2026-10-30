@@ -203,6 +203,23 @@ class LabelledCellTests(unittest.TestCase):
         for table in tables:
             self._assert_labelled('/channels/<id>', table)
 
+    def test_recording_detail_labels_every_cell(self):
+        # Seeded: the Segments table draws only once the recording has a segment. It was the
+        # last `.tbl` on a real page with no card form, surviving a phone by hiding five of
+        # its eleven columns (dev/changelog/1344).
+        with self.t.app.app_context():
+            from app.database import REC_STATUS_COMPLETED
+            from tests.support.seed import make_recording
+            rec = make_recording(status=REC_STATUS_COMPLETED, channel_id=self.channel_id,
+                                 with_segment=True)
+            db.session.commit()
+            rid = rec.id
+        html = self.client.get(f'/recordings/{rid}').get_data(as_text=True)
+        tables = _card_tables(html)
+        self.assertEqual(1, len(tables), 'the Segments table should render as .tbl-cards')
+        for table in tables:
+            self._assert_labelled('/recordings/<id>', table)
+
     def test_account_detail_labels_every_cell(self):
         # Seeded like the channel page: the EPG sources table renders only when the
         # account reads a source (DESIGN-epg-sources.md §9.2), and the Hosts table only
@@ -285,6 +302,7 @@ class OptInTests(unittest.TestCase):
                     if 'tbl-cards' in _read(os.path.relpath(path, REPO)):
                         found.add(os.path.relpath(path, REPO))
         registered = {'templates/tags.html', 'templates/jobs.html', 'templates/rule_detail.html',
+                      'templates/recording_detail.html',
                       'templates/channels/detail.html', 'templates/_account_stats.html',
                       'templates/account_detail.html',
                       'templates/epg_source_review.html',

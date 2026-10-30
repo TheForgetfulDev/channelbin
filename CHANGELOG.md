@@ -5,6 +5,33 @@ Notable changes to ChannelBin, newest first. This project follows
 release is tagged `v<version>` in git, and the version the app is running is shown in the
 page footer.
 
+## 0.35.0 - 2026-10-30
+
+Tables that fit the window.
+
+**Added**
+
+- On Search Programs, when the window is too narrow for every column you have turned on, the
+  rightmost columns are set aside so the Record button stays in view. The Columns button says
+  how many are tucked away, and they come back when the window is wider. Your column setup is
+  never changed.
+- In a narrow desktop window, wide tables switch to the card layout phones use, so no table
+  scrolls sideways. A channel group's member table does the same when it does not fit, with a
+  note saying why.
+
+**Changed**
+
+- On a phone, the recording page's Segments table shows each segment as a card with every
+  field labeled, instead of hiding five columns.
+
+**Fixed**
+
+- Bitrates on the channel group page, the new group dialog and the format plan read in
+  megabits per second. They were labeled MB/s, megabytes, eight times the real figure.
+- Buttons that carry a tooltip keep their bottom border instead of looking cut off.
+- Searching programs with no filters says how many airings matched on how many channels. It
+  used to call the airing count a channel count.
+
 ## 0.34.0 - 2026-10-29
 
 Compare EPG schedules across your guide.

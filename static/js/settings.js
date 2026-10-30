@@ -57,13 +57,10 @@
   const toast = (msg, isError) =>
     showToast(msg, { type: isError ? 'error' : 'success', durationMs: 2500 });
 
-  // `many` is for words that do not take a bare s ("match" -> "matches").
-  const plural = (n, word, many = `${word}s`) => `${n} ${n === 1 ? word : many}`;
-
   // A section's count while a filter is on, the one wording the head, the picker bar and
   // the sheet all use. Null when nothing filters, where each shows its own plain count.
   const filterCount = (n) => {
-    if (state.q.trim()) return n ? plural(n, 'match', 'matches') : 'no matches';
+    if (state.q.trim()) return n ? counted(n, 'match', 'matches') : 'no matches';
     if (state.changed) return n ? `${n} changed` : 'none changed';
     return null;
   };
@@ -569,7 +566,7 @@
       const { cnt, rc, rail, more } = sec;
       if (cnt) {
         cnt.textContent = filterCount(hits)
-          ?? (empty && sec.total ? plural(sec.total, 'advanced setting') : '');
+          ?? (empty && sec.total ? counted(sec.total, 'advanced setting') : '');
       }
       if (rc) rc.textContent = filtering ? hits : viewTotal(sec);
       if (rail) rail.classList.toggle('nohit', empty);
@@ -615,7 +612,7 @@
     // would be a lie about what was found.
     chip.textContent = filtering
       ? `${total} of ${FIELD_TOTAL} settings` +
-        (surfaces.length ? ` + ${plural(surfaces.length, 'page')}` : '')
+        (surfaces.length ? ` + ${counted(surfaces.length, 'page')}` : '')
       : '';
 
     // A filter in Basic that reached Advanced rows says so above the results, with the
