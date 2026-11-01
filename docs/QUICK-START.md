@@ -22,17 +22,18 @@ No IPTV provider yet? You can try everything below with free example channels fi
 ## The setup banner and Get started
 
 A new install opens on the Dashboard with a banner across the top: **Get started · 1 of 4
-done**, the step to do next, and a progress bar. The banner has two buttons. **Get started**
-opens the full list of steps, and the second button goes straight to the page where the next
-step is done.
+done**, the step to do next, and a progress bar. The steps go in order, starting at step 1, and
+if a later step has a problem the banner says so on a line of its own. The banner has two
+buttons. **Get started** opens the full list of steps, and the second button goes straight to
+the page where the next step is done.
 
 ![The Dashboard on a new install: the Get started banner reads "1 of 4 done" and "Next: Add your IPTV account(s)", with Get started and Accounts buttons and a progress bar, above the dashboard's empty tiles.](screenshots/dashboard-get-started.png)
 
 The four steps are:
 
 1. Add your IPTV account(s)
-2. This machine can record
-3. Put the channels you watch in the TV Guide
+2. Set up this machine to record
+3. Add a channel to the TV Guide
 4. Record something
 
 ![The Get started page on a new install: step 1, Add your IPTV account(s), is open with an Accounts button and the box that offers free example channels; step 2, This machine can record, is ticked; steps 3 and 4 wait for the steps before them.](screenshots/get-started.png)
@@ -44,7 +45,7 @@ start, which is why a brand-new install already says "1 of 4 done".
 
 **Get started** also shows in the menu, under Setup, with how many steps are left. Once all
 four are done, the banner and the menu link go away. You can still reach the page from the
-Readiness check on Maintenance.
+Readiness check.
 
 ## Step 1: Add your account
 
@@ -82,18 +83,18 @@ comes with a few **Hide Rules** that hide the divider rows some providers put be
 of their channel list, such as `#### US CLASSIC ####`, because they are not real channels. Click
 the count to see the rules. You can edit or delete them like any rule you make yourself.
 
-## Step 2: This machine can record
+## Step 2: Set up this machine to record
 
 ChannelBin checks that ffmpeg and ffprobe are installed, that the recording folder exists and
 can be written to, that there is free space, and that the database, the scheduler and the
 timezone are all working. On the Docker image all of this is normally fine before you touch
 anything.
 
-If something is wrong, the step is flagged, names the problem and links to where to fix it. It
-ticks itself off once the problem is fixed. The usual cause is a recording folder the app's user
+If something is wrong, the step is flagged, names the problem and links to where to fix it,
+straight to the setting when the fix is one on Settings. Reload Get started once you have fixed it, and the step shows as done. The usual cause is a recording folder the app's user
 cannot write to. See PUID / PGID in the [README](../README.md#puid--pgid).
 
-## Step 3: Put the channels you watch in the TV Guide
+## Step 3: Add a channel to the TV Guide
 
 The TV Guide starts empty on purpose. A provider's list is often thousands of channels, most of
 them nothing you would watch, and each channel in the guide also gets a health check every
@@ -221,15 +222,15 @@ When your subscription arrives, open Get started and choose one of:
 
 ## Then: the Readiness check
 
-The four steps are what you have to do. The **Readiness check** on **Maintenance** tests the
-rest: that each login still works, that every folder ChannelBin writes to is writable, that
+The four steps are what you have to do. The **Readiness check**, under **System** in the menu,
+tests the rest: that each login still works, that every folder ChannelBin writes to is writable, that
 search is indexed, and that a notification actually arrives. Some of its checks cost something
 (they open a stream or send a message), so they wait for you to click the button that runs
 them, which says how many are left, such as **Run 4 more checks**.
 
-![The Readiness check on Maintenance: "Ready to record, but 1 thing needs attention", then one row per thing the install can do, such as Record a program right now and Start scheduled recordings on time, each ticked or flagged with the reason. "Be told when something breaks" is amber because no notification service is on.](screenshots/readiness-check.png)
+![The Readiness check: "Ready to record, but 1 thing needs attention", then one row per thing the install can do, such as Record a program and Start scheduled recordings on time, each ticked or flagged with the reason. "Be told when something breaks" is amber because no notification service is on.](screenshots/readiness-check.png)
 
-The numbers beside **Maintenance** in the menu come from it: red for things that are blocked,
+The numbers beside **Readiness** in the menu come from it: red for things that are blocked,
 amber for things that work but need attention. Point at a number to see what it counts. On a
 new install most of them clear by themselves once an account is added and the guide has
 channels in it.

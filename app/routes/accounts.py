@@ -21,7 +21,7 @@ from ..account_links import (add_host, add_login, delete_hosts_for_account,
                              remove_host, remove_login, render_host, set_active_host,
                              update_login)
 from ..account_stats import WINDOWS, today_local, windowed_stats
-from ..channel_groups import report_orphaned_guide_groups
+from ..channel_groups import clear_guide_listings_pins_on, report_orphaned_guide_groups
 from ..channel_search import GROUP_ANY, OTHER_NEW, OTHER_REMOVED
 from ..config import load_config, config_default
 from ..database import (Account, AccountBlock, AccountStatDay, Channel, AccountSyncLog,
@@ -803,18 +803,22 @@ def _delete_account_and_jobs(account_id):
         if account is None:
             return None
         name = account.name
-        # Not in the ORM cascade: the ledger has no relationship on Account, and a day row
-        # left behind would credit a future account that reused the id.
+        # Not in the ORM cascade: the ledger has no relationship on Account. Account ids are
+        # never re-issued (migration 107), so a row left behind would credit nobody - it would
+        # sit in the table for good. The fold refuses a gone account in the statement that
+        # writes, so it cannot put one back after this commit (dev/changelog/1373).
         AccountStatDay.query.filter_by(account_id=account_id).delete(synchronize_session=False)
-        # Nor its blocks, which would otherwise block a future account that reused the id.
+        # Nor its blocks, for the same reason.
         AccountBlock.query.filter_by(account_id=account_id).delete(synchronize_session=False)
-        # Nor its host list, for the same reason (app/account_links.py is its one writer),
-        # nor its login list and the logins no other account holds.
+        # Nor its host list (app/account_links.py is its one writer), nor its login list and
+        # the logins no other account holds.
         delete_hosts_for_account(account_id)
         delete_logins_for_account(account_id)
         # Nor are its EPG sources, which may hold hundreds of thousands of rows across two
         # tables and are bulk-deleted rather than cascaded (DESIGN-epg-sources.md §9.5).
         delete_sources_for_account(account_id)
+        # A group pinned to one of these channels goes back to automatic, and says why.
+        clear_guide_listings_pins_on(channel_ids)
         # hidden-recompute-ok: the cascade takes memberships only of channels it deletes
         # too, so no surviving channel loses a protection.
         db.session.delete(account)

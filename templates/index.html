@@ -3,6 +3,19 @@
 
 {% from "_macros.html" import status_badge, channel_pill, csrf_field %}
 
+{# Schedule recording asks how: a .menu on desktop, the same three links as tiles in the
+   phone's bottom sheet (static/js/recordings.js). In the header and on the empty page. #}
+{% macro schedule_menu() %}
+<span class="menu-wrap">
+  <button type="button" class="btn btn-primary" data-menu data-sched-menu aria-haspopup="true">Schedule recording {{ icon('dropdown', 'btn-caret') }}</button>
+  <div class="menu">
+    <a href="{{ url_for('guide.guide') }}">{{ icon('nav-guide') }} From the TV Guide</a>
+    <a href="{{ url_for('channels.channel_browser', grain='airings') }}">{{ icon('airings') }} From a search</a>
+    <a href="{{ url_for('recordings.new_recording') }}">{{ icon('time') }} Manual recording</a>
+  </div>
+</span>
+{% endmacro %}
+
 {% block content %}
 <div class="page-head">
   {#- data-rec-sig is the recording signature this render was read at; static/js/recordings.js
@@ -10,16 +23,18 @@
       list when they differ. It sits here because this span is on the empty page too
       (dev/changelog/1144). -#}
   <h1>Recordings <span class="sub" id="rec-sub" data-rec-sig="{{ rec_sig }}">{{ total }} total{% if live_now %} · {{ live_now }} recording now{% endif %}</span></h1>
-  <a href="{{ url_for('recordings.new_recording') }}" class="btn btn-primary head-action-schedule">+ Schedule recording</a>
-  {# Mobile only (DESIGN.md 9.3): scheduling happens from the guide at mobile widths,
-     so the header action links there instead of a "+ Schedule" button with no destination. #}
-  <a href="{{ url_for('guide.guide') }}" class="btn btn-primary head-action-guide">TV Guide <span class="arw">{{ icon('forward') }}</span></a>
+  {# The same pair at every width (DESIGN.md 9.3, amended 2026-10-31): the rules that
+     schedule by themselves, and a one-off recording. #}
+  <div class="card-head-actions">
+    <a href="{{ url_for('auto_rules.rules_page') }}" class="btn btn-primary">Auto-record <span class="arw">{{ icon('forward') }}</span></a>
+    {{ schedule_menu() }}
+  </div>
 </div>
 
 {% if total == 0 %}
   <div class="empty-state">
     <p>No recordings yet.</p>
-    <p style="margin-top:12px"><a href="{{ url_for('recordings.new_recording') }}" class="btn btn-primary">+ Schedule recording</a></p>
+    <p style="margin-top:12px">{{ schedule_menu() }}</p>
   </div>
 {% else %}
 

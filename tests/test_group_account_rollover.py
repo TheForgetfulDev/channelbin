@@ -35,6 +35,7 @@ from app.database import (  # noqa: E402
     GROUP_FAILOVER, RECORDING_EDITED, REC_STATUS_SCHEDULED, REC_STATUS_IN_PROGRESS,
 )
 from app.tz_utils import local_input_value  # noqa: E402
+from tests.support.clock import tomorrow_local_noon  # noqa: E402
 
 
 def _selection_event(recording_id):
@@ -278,7 +279,7 @@ class ScheduleTimeRollsOverToAFreeAccountTests(_GroupCase):
     def setUp(self):
         super().setUp()
         self.t.app.config['WTF_CSRF_ENABLED'] = False
-        self.start = datetime.utcnow() + timedelta(hours=2)
+        self.start = tomorrow_local_noon()
         self.stop = self.start + timedelta(hours=1)
 
     def _post(self, channel_id, group_id, **extra):
@@ -365,7 +366,7 @@ class EditReResolvesTheMemberTests(_GroupCase):
     def setUp(self):
         super().setUp()
         self.t.app.config['WTF_CSRF_ENABLED'] = False
-        self.old_start = datetime.utcnow() + timedelta(hours=2)
+        self.old_start = tomorrow_local_noon()
         self.old_stop = self.old_start + timedelta(hours=1)
         self.new_start = self.old_start + timedelta(hours=3)
         self.new_stop = self.new_start + timedelta(hours=1)

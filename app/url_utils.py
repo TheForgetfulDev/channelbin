@@ -42,6 +42,17 @@ _URL_IN_TEXT_RE = re.compile(r'https?://[^\s\'"<>()\[\]]+')
 _REQUEST_TARGET_RE = re.compile(r'(\burl: )(/[^\s\'"<>()\[\]]*)')
 _TARGET_ORIGIN = 'http://request-target.invalid'
 
+# The request line werkzeug's access log prints: `"GET /live/u/p/7.ts HTTP/1.1"`. The output
+# feed (app/routes/output_feed.py) takes its credentials in that path and in the query of its
+# `.php` endpoints, so a request line is the one place a bare path carries them.
+_REQUEST_LINE_RE = re.compile(r'("(?:GET|HEAD|POST) )(/[^\s"]*)')
+
+
+def _mask_request_path(path: str) -> str:
+    path = re.sub(r'(/(?:live|movie|series)/)([^/]+)/([^/]+)(/)', r'\1***/***\4', path)
+    return re.sub(r'(?i)((?:username|password|user|pass)=)[^&]+', r'\1***', path)
+
+
 # Punctuation that commonly trails a URL in prose ("...from http://h/a/b/c.") and would
 # otherwise defeat the $-anchored bare-path rule.
 _TRAILING_PUNCT = '.,;:!?'
@@ -81,6 +92,11 @@ def mask_creds_in_text(text):
         text = _REQUEST_TARGET_RE.sub(
             lambda m: m.group(1) + mask_creds(_TARGET_ORIGIN + m.group(2))[len(_TARGET_ORIGIN):],
             text)
+    if '"GET /' in text or '"HEAD /' in text or '"POST /' in text:
+        # An access-log request line. Only the two credential shapes an Xtream path can
+        # carry are masked, never the bare <a>/<b>/<id> rule: that one is anchored to a whole
+        # URL and would eat every three-segment page path in the log.
+        text = _REQUEST_LINE_RE.sub(lambda m: m.group(1) + _mask_request_path(m.group(2)), text)
     if '://' not in text:
         return text
 

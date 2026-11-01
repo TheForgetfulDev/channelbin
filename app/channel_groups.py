@@ -1180,10 +1180,12 @@ def set_warning_muted(group, kind, muted) -> bool:
 
 
 # Why a group's guide-listings pin moved, as GROUP_GUIDE_LISTINGS_SET's extra_data carries
-# it. `removed` is the pinned channel leaving the group through the member-removal route.
+# it. `removed` is the pinned channel leaving the group through the member-removal route;
+# `channel_deleted` is the pinned channel itself being deleted (dev/changelog/1375).
 GUIDE_LISTINGS_REASONS = {
     'user': 'by hand',
     'removed': 'because {previous} was removed from the group',
+    'channel_deleted': 'because {previous} was deleted',
 }
 
 
@@ -1193,9 +1195,9 @@ def set_guide_listings_member(group, channel, reason='user'):
 
     THE only writer of ChannelGroup.guide_listings_channel_id. Which feed's guide data a
     person trusts is their judgment call, so nothing derives or moves it on their behalf
-    (the participation-switch rule, CLAUDE.md); the one non-user reason is the pinned
-    channel being removed from the group by the member-removal route, which is a person's
-    action too and says so in the event. Enforced by
+    (the participation-switch rule, CLAUDE.md); the non-user reasons are the pinned channel
+    being removed from the group or deleted outright, each a person's action too, and each
+    says so in the event. Enforced by
     tests/test_static_invariants.py::GuideListingsWriteBypassTests.
 
     `channel` must be a current member - the caller validates, and a non-member is a
@@ -1267,6 +1269,21 @@ def set_default_profile(group, profile, reason='user'):
         extra_data=json.dumps({'profile_id': new_id, 'previous': previous_id,
                                'reason': reason})))
     return True
+
+
+def clear_guide_listings_pins_on(channel_ids):
+    """Set every group pinned to one of `channel_ids` back to automatic, ahead of those
+    channels being deleted. Channel ids are re-issued, so a pin left naming a deleted
+    channel could re-attach to an unrelated feed that later joins the group, with no event
+    for it (dev/changelog/1375). Called before the delete, while the channel's name can
+    still be read into the event. Returns how many pins it cleared; no commit."""
+    from .database import ChannelGroup
+    from .db_utils import chunked
+    groups = []
+    for chunk in chunked(list(channel_ids), 500):
+        groups.extend(ChannelGroup.query.filter(
+            ChannelGroup.guide_listings_channel_id.in_(chunk)).all())
+    return sum(1 for g in groups if set_guide_listings_member(g, None, reason='channel_deleted'))
 
 
 def guide_listings_member(group):
@@ -1470,7 +1487,8 @@ ServingChoice = collections.namedtuple('ServingChoice', 'member selection')
 
 def serving_member(group, latest_by_channel=None,
                    streak_threshold=DEFAULT_FAILING_STREAK_THRESHOLD,
-                   blocked_account_ids=frozenset()) -> ServingChoice:
+                   blocked_account_ids=frozenset(), members=None,
+                   exclude_ids=frozenset()) -> ServingChoice:
     """The member `group` would record from right now - format lock filters, health score
     ranks (DESIGN-channel-groups-model.md 5, dev/changelog/753).
 
@@ -1492,14 +1510,22 @@ def serving_member(group, latest_by_channel=None,
     `blocked_account_ids` - the accounts the user has blocked right now
     (app/account_blocks.py) - is dropped before the format lock, as record start drops it,
     and for the same reason it is passed in rather than read here. When every member is
-    blocked they all stay: the row still names the member a recording would wait on."""
-    members = recording_members(group.memberships) if group is not None else []
+    blocked they all stay: the row still names the member a recording would wait on.
+
+    `members` narrows the choice to a subset of the recording-enabled members (the output
+    feed's accounts allowlist, DESIGN-output-feed.md 5.3), and `exclude_ids` drops members
+    that already failed this play (its failover, 4.5) - both are handed in so the feed asks
+    this one function rather than re-deriving the filter."""
+    if members is None:
+        members = recording_members(group.memberships) if group is not None else []
+    else:
+        members = list(members)
     if blocked_account_ids:
         unblocked = [ch for ch in members if ch.account_id not in blocked_account_ids]
         members = unblocked or members
     selection = format_eligible_members(group, members, latest_by_channel or {})
     return ServingChoice(
-        pick_best_member(selection.members, latest_by_channel,
+        pick_best_member(selection.members, latest_by_channel, exclude_ids=exclude_ids,
                          streak_threshold=streak_threshold),
         selection)
 
@@ -1533,7 +1559,7 @@ def guide_row_targets(streak_threshold=DEFAULT_FAILING_STREAK_THRESHOLD,
     Both callers batch it; a new one that does not would paint a row naming a member the
     recorder would not have picked. Must be called inside an app context."""
     from .database import Channel, ChannelGroup
-    entries = [((ch.guide_sort_order or 0, ch.name.lower()), ('channel', ch, None))
+    entries = [(guide_row_sort_key(ch), ('channel', ch, None))
                for ch in Channel.query.filter(Channel.in_guide.is_(True)).all()]
     blocked = blocked_account_ids_now()
     for g in ChannelGroup.query.filter_by(in_guide=True).options(*member_eager_options()).all():
@@ -1545,9 +1571,16 @@ def guide_row_targets(streak_threshold=DEFAULT_FAILING_STREAK_THRESHOLD,
                                  blocked_account_ids=blocked).member
         if serving is None:
             continue
-        entries.append(((g.guide_sort_order or 0, g.name.lower()), ('group', g, serving)))
+        entries.append((guide_row_sort_key(g), ('group', g, serving)))
     entries.sort(key=lambda e: e[0])
     return [e[1] for e in entries]
+
+
+def guide_row_sort_key(row):
+    """Where a channel or a group sits in the guide's one ordering space: its
+    guide_sort_order, then its name. The one spelling, read by the guide's rows above and
+    by the output feed's channel numbers, so an IPTV app lists the channels in the guide's order."""
+    return (row.guide_sort_order or 0, row.name.lower())
 
 
 def schedule_is_live(job):

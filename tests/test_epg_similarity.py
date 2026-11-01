@@ -287,11 +287,15 @@ class RunTests(_Case):
         return scan
 
     def _wait(self, scan_id):
+        """Until the row has left RUNNING and the run's ticket is back: run_scan commits the
+        status before its `finally` releases the ticket, so a check that stopped at the status
+        could start the next scan, or read admission, inside that gap."""
         import time
         for _ in range(200):
             db.session.remove()
             scan = db.session.get(EpgScan, scan_id)
-            if scan.status != EPG_SCAN_RUNNING:
+            if (scan.status != EPG_SCAN_RUNNING
+                    and admission.KIND_EPG_SCAN not in admission.active_kinds()):
                 return scan
             time.sleep(0.05)
         self.fail('the scan never finished')

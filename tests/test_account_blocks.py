@@ -40,6 +40,7 @@ from app.database import (  # noqa: E402
     REC_STATUS_COMPLETED, REC_STATUS_FAILED, FAILURE_ACCOUNT_BLOCKED,
 )
 from app.tz_utils import local_input_value  # noqa: E402
+from tests.support.clock import tomorrow_local_noon  # noqa: E402
 
 
 def _events(recording_id, event_type):
@@ -367,7 +368,7 @@ class RouteTests(_Case):
         self.assertEqual(blocks.blocked_account_ids([self.tv_id]), set())
 
     def _post_new(self, **extra):
-        start = datetime.utcnow() + timedelta(hours=2)
+        start = tomorrow_local_noon()
         data = {
             'name': 'Big Game', 'url': 'http://example.test/live/1',
             'start_time': local_input_value(start),
@@ -400,9 +401,14 @@ class RouteTests(_Case):
         rid = self._scheduled(channel_id=self.ch_spare_id, start_offset=7200)
         blocks.set_recording_blocks(rid, {self.tv_id: None})
         rec = db.session.get(Recording, rid)
+        # The instants ride beside the wall text, as the dialog posts them: this window is
+        # now-relative, and in the hour a DST fall-back repeats both ends show as one time
+        # (dev/docs/BUGS.md 2026-10-31 @ 11:27:31 PM ET).
         data = {'name': rec.name, 'url': rec.url,
                 'start_time': local_input_value(rec.start_time),
-                'stop_time': local_input_value(rec.stop_time)}
+                'start_time_utc': f'{rec.start_time:%Y-%m-%dT%H:%M:%S}Z',
+                'stop_time': local_input_value(rec.stop_time),
+                'stop_time_utc': f'{rec.stop_time:%Y-%m-%dT%H:%M:%S}Z'}
         with mock.patch('app.routes.recordings._apply_edit_and_reschedule'):
             resp = self.t.client.post(f'/recordings/{rid}/edit-json', data=data)
         self.assertEqual(resp.status_code, 200, resp.get_json())

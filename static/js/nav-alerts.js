@@ -80,17 +80,17 @@
   }
 
   // Shown for an alert that is still true and clears itself (dev/changelog/932). Without
-  // it, Mark read looks like it disposed of the problem: the banner goes and the count
-  // drops, while the condition it named is still live and still listed under Active alerts.
+  // it, Mark read looks like it disposed of the problem while the condition it named is
+  // still live, so it says what Mark read does and does not do here (dev/changelog/1368).
   function activeNotice(severity) {
     const el = document.createElement('div');
     const red = severity === 'CRIT' || severity === 'ERROR';
     el.className = `notice notice-${red ? 'bad' : 'warn'}`;
     const label = document.createElement('strong');
     label.textContent = 'Still active.';
-    el.append(label, document.createTextNode(
-      ' It clears itself once this is fixed. Marking it read takes it off the banner and out '
-      + 'of the count, and it stays under Active alerts until then.'));
+    el.append(label, document.createTextNode(' It clears itself once this is fixed.'
+      + ' Marking it read hides the banner and takes it out of the alert count,'
+      + " but it stays under Active alerts until it's fixed."));
     return el;
   }
 
@@ -168,5 +168,7 @@
   window.__applyAlerts = (d) => {
     applyCounts(d);
     if ('banner' in d) applyBanner(d.banner, d.more || 0);
+    // A folded System section copies these counts, so it is rebuilt when they move.
+    if (window.__applyNavFolds) window.__applyNavFolds();
   };
 })();

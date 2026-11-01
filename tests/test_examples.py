@@ -26,6 +26,7 @@ and the health check are stubbed.
   python3 -m unittest tests.test_examples
 """
 import os
+import re
 import sqlite3
 import tempfile
 import unittest
@@ -85,6 +86,8 @@ class LoadStartTests(_Case):
         self.assertTrue(acc.is_example)
         self.assertEqual((acc.name, acc.account_type, acc.m3u_url),
                          (examples.ACCOUNT_NAME, 'm3u', examples.PLAYLIST_URL))
+        # Nothing measured says M3UPT allows two (dev/changelog/1371).
+        self.assertEqual(acc.max_connections, 1)
         # The listings are a url source the account owns and reads - the same shape the Add
         # account form gives an XMLTV URL - so the sync refreshes it like any other.
         src = EpgSource.query.filter_by(owner_account_id=acc.id).one()
@@ -189,6 +192,42 @@ class LoadThreadTests(_Case):
         [alert] = self.alerts()
         self.assertIn('HTTP 503 from m3upt.com', alert.body)
         self.assertNotIn('traceback', alert.body)
+
+    def test_the_example_accounts_one_connection_is_enough_for_the_loads_health_check(self):
+        """The real one-off test path, stubbed only past the connection slot: on an account
+        allowing examples.MAX_CONNECTIONS, the load's health check gets the slot and holds
+        the account at its limit while it runs (dev/changelog/1371)."""
+        from app import channel_tester, connection_limits
+        acc = make_account(name=examples.ACCOUNT_NAME, is_example=True,
+                           max_connections=examples.MAX_CONNECTIONS)
+        acc.status = ACCOUNT_STATUS_UNSYNCED
+        db.session.commit()
+        acc_id = acc.id
+
+        def fake_sync(app, account_id, **_kw):
+            with app.app_context():
+                a = db.session.get(Account, account_id)
+                a.status, a.last_sync_at = ACCOUNT_STATUS_OK, datetime.utcnow()
+                for n in ALL_NAMES:
+                    make_channel(a, name=n)
+                db.session.commit()
+
+        held = []
+
+        def fake_inner(app, channel_id, **_kw):
+            with app.app_context():
+                held.append((channel_id, connection_limits.at_limit(acc_id)))
+            return 7
+
+        with mock.patch('app.accounts.run_manual_sync', side_effect=fake_sync), \
+                mock.patch.object(channel_tester, '_run_channel_test_inner',
+                                  side_effect=fake_inner):
+            examples._load(self.t.app, acc_id)
+        db.session.expire_all()
+        bbc = Channel.query.filter_by(account_id=acc_id, name=examples.TEST_CHANNEL).one()
+        self.assertEqual(held, [(bbc.id, True)])
+        self.assertEqual(self.alerts(), [])
+        self.assertFalse(connection_limits.at_limit(acc_id))
 
     def test_a_health_check_that_could_not_run_is_named(self):
         self.run_load(tested=None)
@@ -360,10 +399,34 @@ class PageTests(_Case):
         self.assertIn('id="gs-examples"', html)
         self.assertIn('data-examples-remove', html)
 
+    def account_step(self, html):
+        m = re.search(r'<li class="gs-step [^"]*" data-step="account">.*?</li>', html, re.S)
+        self.assertIsNotNone(m, 'no account step on the page')
+        return m.group(0)
+
+    def test_the_account_step_offers_delete_beside_keep(self):
+        """Delete the examples was only in the card far down the page (dev/changelog/1371)."""
+        self.example_account()
+        step = self.account_step(self.get())
+        self.assertIn('data-examples-keep', step)
+        self.assertIn('data-examples-remove', step)
+        self.assertLess(step.index('data-examples-keep'), step.index('data-examples-remove'))
+
+    def test_the_account_step_hides_keep_and_delete_while_a_load_runs(self):
+        """The server refuses both until the load is done, as the card already shows."""
+        self.example_account()
+        with examples._lock:
+            examples._loading.update({'account_id': 1, 'started_at': datetime.utcnow(),
+                                      'step': 'Running a health check on BBC News.'})
+        step = self.account_step(self.get())
+        self.assertNotIn('data-examples-keep', step)
+        self.assertNotIn('data-examples-remove', step)
+
     def test_no_page_promises_that_what_the_user_added_survives(self):
-        """BUGS.md 2026-10-26: the promise against the delete's own behavior. The offer, the
-        examples card and the example account's page all say an example channel the user put
-        in the guide goes with the examples."""
+        """BUGS.md 2026-10-26: the promise against the delete's own behavior. The examples
+        card and the example account's page say an example channel the user put in the guide
+        goes with the examples. The offer's shorter wording (dev/changelog/1367) spells out
+        neither, but must still promise nothing false."""
         offer = self.get()
         ex = self.example_account()
         card = self.get()
@@ -371,6 +434,7 @@ class PageTests(_Case):
         for name, html in (('offer', offer), ('card', card), ('account page', account)):
             self.assertNotIn('Anything you added yourself stays', html, name)
             self.assertNotIn('leaves anything you added yourself', html, name)
+        for name, html in (('card', card), ('account page', account)):
             self.assertIn('put in the guide', html, name)
             self.assertRegex(html, r'[Yy]our\s+recordings\s+stay', name)
 

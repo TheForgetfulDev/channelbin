@@ -12,7 +12,6 @@ import os
 import shutil
 import subprocess
 import sys
-import tempfile
 import time
 import unittest
 from datetime import datetime, timedelta
@@ -29,7 +28,7 @@ from app.database import (  # noqa: E402
 )
 from app.postprocessor import ConversionResult, do_postprocess  # noqa: E402
 from app.probe import scan_video_timeline  # noqa: E402
-from tests.support import seed  # noqa: E402
+from tests.support import clips, seed  # noqa: E402
 from tests.support.app import make_test_app  # noqa: E402
 
 _HAVE_FFMPEG = bool(shutil.which('ffmpeg') and shutil.which('ffprobe'))
@@ -67,21 +66,21 @@ def _config(**pp_overrides):
     }})
 
 
+def _build_sources(d):
+    """The source clips every class reads from, built once per process (tests/support/clips.py)."""
+    _clip(os.path.join(d, 'clean.mp4'))
+    _clip(os.path.join(d, 'hole.mp4'), drop=[(5, 13)])
+    _clip(os.path.join(d, 'clean.ts'), fmt='mpegts')
+    _clip(os.path.join(d, 'hole.ts'), drop=[(5, 13)], fmt='mpegts')
+    _clip(os.path.join(d, 'three.mp4'), drop=[(2, 3), (6, 9), (12, 14)])
+
+
 @unittest.skipUnless(_HAVE_FFMPEG, 'needs ffmpeg and ffprobe on PATH')
 class _OutputCheckCase(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.src = tempfile.mkdtemp(prefix='outcheck-src-')
-        d = cls.src
-        _clip(os.path.join(d, 'clean.mp4'))
-        _clip(os.path.join(d, 'hole.mp4'), drop=[(5, 13)])
-        _clip(os.path.join(d, 'clean.ts'), fmt='mpegts')
-        _clip(os.path.join(d, 'hole.ts'), drop=[(5, 13)], fmt='mpegts')
-        _clip(os.path.join(d, 'three.mp4'), drop=[(2, 3), (6, 9), (12, 14)])
-
-    @classmethod
-    def tearDownClass(cls):
-        shutil.rmtree(cls.src, ignore_errors=True)
+        # Shared and read-only: the tests copy out of it or scan a file in place.
+        cls.src = clips.shared(__name__, _build_sources, prefix='outcheck-src-')
 
     def setUp(self):
         toolchain.reset_cache()

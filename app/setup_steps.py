@@ -1,11 +1,13 @@
 """The first-run setup steps: what a new install still needs, read from what is set up.
 
 Four steps take an install from empty to its first recording - an account that has synced,
-a machine that can record, something in the TV Guide, a recording. The dashboard's banner
-leads with the first one that needs the user and goes away by itself once all four are
-done; the Get started page lists them with what each is for, adds the optional steps worth
-doing next, explains the two kinds of search, and hands off to the Readiness check. Design
-record: `dev/mockups/44-first-run-setup.html`, `dev/changelog/1278`, `1279`, `1280`.
+a machine set up to record, a channel in the TV Guide, a recording. The dashboard's banner
+leads with the first one not done, in order, names any later step with a problem under it,
+and goes away by itself once all four are done; the Get started page lists them with what
+each is for, adds the optional steps worth doing next, explains the two kinds of search,
+and hands off to the Readiness check. Design
+record: `dev/mockups/44-first-run-setup.html`, `dev/changelog/1278`, `1279`, `1280`,
+`1367`.
 
 **Nothing here is ever stored.** A step is done because the thing exists right now, never
 because a flag says it was done once: a stored "setup complete" goes stale the moment
@@ -32,7 +34,8 @@ log = logging.getLogger(__name__)
 
 #: The step is there now.
 DONE = 'done'
-#: Something is wrong that the user has to fix; the banner leads with it.
+#: Something is wrong that the user has to fix; the banner names it even when it does not
+#: lead (see `_also`).
 PROBLEM = 'problem'
 #: Under way with nothing for the user to do (an account's first sync).
 WAITING = 'waiting'
@@ -53,7 +56,7 @@ DISPLAY = {DONE: 'done', PROBLEM: 'problem', WAITING: 'wait', BLOCKED: 'later'}
 NOW = 'now'
 PLAIN = 'todo'
 
-#: The Readiness checks behind "This machine can record": everything the Record and
+#: The Readiness checks behind "Set up this machine to record": everything the Record and
 #: Schedule capabilities need from the box itself, plus ffprobe, without which a recording
 #: cannot be measured.
 MACHINE_CHECKS = ('ffmpeg', 'ffprobe', 'storage_dvr', 'storage_space', 'db_write',
@@ -105,8 +108,8 @@ def _account_step(ctx):
     if not accounts:
         return _step('account', title, TODO, 'No account added yet.',
                      'Add the server, username and password your provider sent you. '
-                     'ChannelBin fetches the channels and listings from there. No subscription '
-                     'to hand? Get started has free example channels to try it with.',
+                     'ChannelBin fetches the channels and listings from there. No IPTV '
+                     'provider yet? Get started has free example channels to try it with.',
                      _link('Accounts', 'accounts.accounts_list'),
                      body='Your provider sent you either a server address with a username and '
                           'password, or a playlist link. Add it on Accounts with + Add account, '
@@ -136,9 +139,10 @@ def _account_step(ctx):
                  _link('Accounts', 'accounts.accounts_list'),
                  body='The example channels are a trial, and Delete the examples takes them out '
                       'again in one step. Add the account your provider sent you on Accounts '
-                      'with + Add account, and this step ticks itself off once it has synced. '
+                      'with + Add account, and this step is done once it has synced. '
                       'If the example channels are all you want, Keep the examples '
-                      'makes them an ordinary account instead.',
+                      'removes their "example" flag, and Get started counts the account as '
+                      'yours.',
                  defer=True, keep_examples=True)
 
 
@@ -187,18 +191,18 @@ def _first_sync_step(title, accounts):
 
 
 def _machine_step(rows):
-    title = 'This machine can record'
+    title = 'Set up this machine to record'
     counted = [rows[cid] for cid in MACHINE_CHECKS if not rows[cid]['ignored']]
     bad = [r for r in counted if r['status'] in (readiness.PROBLEM, readiness.UNKNOWN)]
     if bad:
         first = bad[0]
         verb = 'Could not check' if first['status'] == readiness.UNKNOWN else 'Problem with'
         more = f' {len(bad) - 1} more on the Readiness check.' if len(bad) > 1 else ''
-        link = first['link'] or _link('Maintenance', 'system.maintenance')
+        link = first['link'] or _link('Readiness check', 'system.readiness_page')
         return _step('machine', title, PROBLEM,
                      f"{verb} {first['short']}: {first['found']}.{more}", link=link,
-                     body=f"{first['without']} This step is checked again every time the page "
-                          'loads, so it ticks itself off once that is fixed.')
+                     body=f"{first['without']} Reload this page to check {first['short']} again "
+                          "after you've fixed the issue.")
     return _step('machine', title, DONE,
                  f"ffmpeg {_lower_first(rows['ffmpeg']['found'])}. Recording folder: "
                  f"{rows['storage_dvr']['found']}. Times show in {rows['timezone']['found']}.",
@@ -206,25 +210,26 @@ def _machine_step(rows):
 
 
 def _guide_step(ctx, rows, account_done):
-    title = 'Put the channels you watch in the TV Guide'
+    title = 'Add a channel to the TV Guide'
     guide = rows['guide_content']
     if guide['status'] == readiness.READY:
         return _step('guide', title, DONE, f"{guide['found']} in the guide.",
-                     link=_link('Channel Search', 'channels.channel_browser'))
+                     link=_link('Search', 'channels.channel_browser'))
     if not account_done:
         return _step('guide', title, BLOCKED,
                      'Comes after adding an account: there are no channels yet.')
     channels = sum(a.channel_count or 0 for a in ctx.accounts)
     return _step('guide', title, TODO,
                  f'{channels:,} channels came in, none in the guide yet.',
-                 f'{channels:,} channels came in and none are in the guide yet. Pick the ones '
-                 'you watch in Channel Search.',
-                 _link('Channel Search', 'channels.channel_browser'),
+                 f'{channels:,} channels came in and none are in the guide yet. Find one you '
+                 'watch or want to record in Search and add it.',
+                 _link('Search', 'channels.channel_browser'),
                  body="ChannelBin does not put every channel in the guide for you. A provider's "
                       'list is often thousands of channels, most of them nothing you would '
                       'watch, and each channel in the guide is also health-checked on a '
-                      'schedule. Find the ones you want in Channel Search with Search Channels, '
-                      'and use Add to Guide on each.')
+                      'schedule. Find a channel you watch or want to record with Search '
+                      'Channels on the Search page and use Add to Guide on it. Add more the same '
+                      'way whenever you like.')
 
 
 def _record_step(recordings, guide_done):
@@ -240,7 +245,7 @@ def _record_step(recordings, guide_done):
                  'Open the TV Guide and click a program to record it.',
                  _link('TV Guide', 'guide.guide'),
                  body='Open the TV Guide and click a program to record it, or find it with '
-                      'Search Programs (EPG) on Channel Search, where every showing has a Record '
+                      'Search Programs (EPG) on the Search page, where every showing has a Record '
                       'button. If the stream drops partway through, ChannelBin reconnects by '
                       "itself, and the recording's page says what happened and how much was "
                       'lost.')
@@ -257,7 +262,7 @@ def _test_step(latest, latest_example, account_done, now):
         name, when = latest
         return _step('test', title, DONE,
                      f'The latest health check was on {name}, {ago(when, now)}.',
-                     link=_link('Channel Search', 'channels.channel_browser'))
+                     link=_link('Search', 'channels.channel_browser'))
     if not account_done:
         return _step('test', title, BLOCKED, 'Comes after adding an account.')
     if latest_example is not None:
@@ -267,7 +272,7 @@ def _test_step(latest, latest_example, account_done, now):
     else:
         state = 'No channel has been checked yet.'
     return _step('test', title, TODO, state,
-                 link=_link('Channel Search', 'channels.channel_browser'),
+                 link=_link('Search', 'channels.channel_browser'),
                  more=[_link('Channel Groups', 'channel_groups.groups_page')],
                  body='A health check opens a channel for a short while and measures what it '
                       'sends: whether it plays, its resolution and frame rate, and whether it '
@@ -325,10 +330,10 @@ def _notify_step(ctx):
     names = [SERVICE_LABELS.get(s, s) for s in ctx.notify_enabled]
     if names:
         return _step('notify', title, DONE,
-                     f'{join_labels(names)} {"is" if len(names) == 1 else "are"} on.',
+                     f'{join_labels(names)} {"is" if len(names) == 1 else "are"} enabled.',
                      link=_link('Notifications', 'settings.notifications_settings'))
     services = list(SERVICE_LABELS.values())
-    return _step('notify', title, TODO, 'No notification service is on.',
+    return _step('notify', title, TODO, readiness.NO_NOTIFY_ENABLED,
                  link=_link('Notifications', 'settings.notifications_settings'),
                  body='Without one, you find out about a failed recording only by opening '
                       'ChannelBin and looking. Add a service on Notifications: '
@@ -338,16 +343,14 @@ def _notify_step(ctx):
 # ── Putting it together ─────────────────────────────────────────────────────────
 
 def _lead(steps):
-    """The step the banner leads with: one that needs the user beats the next one in order,
-    so a missing ffmpeg is said even though the account step comes first. A deferred step
-    waits until no other is left to do. Never a BLOCKED step - one of those always has an
-    earlier step that is not done."""
-    for step in steps:
-        if step['status'] == PROBLEM:
-            return step
+    """The step the banner leads with: the first one not done, in step order, so a new
+    install starts at the account even while a later step has a problem, which `_also` keeps
+    on the banner (dev/changelog/1367). A deferred
+    step waits until no other is left to do. Never a BLOCKED step - one of those always has
+    an earlier step that is not done."""
     deferred = None
     for step in steps:
-        if step['status'] in (WAITING, TODO):
+        if step['status'] in (PROBLEM, WAITING, TODO):
             if not step['defer']:
                 return step
             deferred = deferred or step
@@ -356,15 +359,19 @@ def _lead(steps):
     return deferred
 
 
-def _display(core, optional):
-    """Each step's look on the page. The first core TODO is the accented one, unless a core
-    step already says it needs the user (a problem) or is under way - those carry their own
-    color, and two accented steps would be two answers to "what now". A deferred step is
-    accented only once it is the last one to do; an optional step never is."""
-    todo = [s for s in core if s['status'] == TODO]
-    accent = None
-    if not any(s['status'] in (PROBLEM, WAITING) for s in core):
-        accent = next((s for s in todo if not s['defer']), None) or next(iter(todo), None)
+def _also(steps, lead):
+    """The core steps after the lead that have a problem: in-order leading must never hide
+    one, so the banner names them under its lead."""
+    if lead is None:
+        return []
+    return [s for s in steps if s['status'] == PROBLEM and s['n'] > lead['n']]
+
+
+def _display(core, optional, lead):
+    """Each step's look on the page. The banner's lead is the accented step when it is a
+    TODO, so the page and the banner give one answer to "what now"; a lead that is a problem
+    or under way carries its own color instead. An optional step is never accented."""
+    accent = lead if lead is not None and lead['status'] == TODO else None
     for step in core + optional:
         if step['status'] == TODO:
             step['display'] = NOW if step is accent else PLAIN
@@ -466,6 +473,7 @@ def _summarize(steps):
         'finished': lead is None,
         'lead': lead,
         'lead_word': LEAD_WORD[lead['status']] if lead else None,
+        'also': _also(steps, lead),
     }
 
 
@@ -498,7 +506,7 @@ def evaluate(key=None) -> dict:
 
 def page() -> dict:
     """`evaluate()`'s answer plus what only the Get started page shows: the optional steps,
-    each step's look, and which capabilities the Maintenance numbers are counting right now.
+    each step's look, and which capabilities the Readiness numbers are counting right now.
     The same rule about loading rows first applies."""
     from sqlalchemy import func
     from . import db
@@ -531,7 +539,7 @@ def page() -> dict:
     for n, step in enumerate(optional, len(result['steps']) + 1):
         step['optional'] = True
         step['n'] = n
-    _display(result['steps'], optional)
+    _display(result['steps'], optional, result['lead'])
     result['optional'] = optional
     result['examples'] = examples.summary()
     # "Try it with example channels" is offered only on an install with no account at all:

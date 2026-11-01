@@ -66,6 +66,7 @@ RESET = {
     'app/config.py': {'_restart_needed'},
     'app/examples.py': {'_loading'},
     'app/fs_utils.py': {'_last_logged_outcome'},
+    'app/output_feed.py': {'_sessions', '_redirects', '_reaper'},
     'app/postprocessor.py': {'_analysis_progress'},
     'app/preview.py': {'_sessions', '_reaper'},
     'app/probe.py': {'_missing_reported'},

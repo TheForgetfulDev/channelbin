@@ -1,8 +1,8 @@
-/* Drives the REAL Readiness card on Maintenance in jsdom and prints what it observed as
+/* Drives the REAL Readiness check page in jsdom and prints what it observed as
    JSON. Called by tests/test_readiness_card_js.py, which owns every assertion - this file
    only reports. Same shape as tests/support/maintenance_restart.mjs.
 
-   What is real: the markup the /maintenance route rendered, the payload readiness.evaluate()
+   What is real: the markup the /readiness route rendered, the payload readiness.evaluate()
    built on a seeded install, and util.js + readiness.js evaluated as shipped. Faked: the
    network (every /api/readiness answer is that payload).
 
@@ -31,7 +31,7 @@ const respond = (body) => Promise.resolve({
 const dom = new JSDOM(html, {
   runScripts: 'dangerously',
   pretendToBeVisual: true,
-  url: 'http://localhost:5000/maintenance',
+  url: 'http://localhost:5000/readiness',
   virtualConsole: vc,
   beforeParse(w) {
     w.fetch = (target) => respond(String(target).includes('/api/readiness') ? payload : {});
@@ -59,9 +59,36 @@ const out = {
   verdictHead: text($('.rd-vhead')),
   pill: text($('#rd-head-pill')),
 };
-click($('.rd-caprow[data-cap="failover"]'));
+// Text selected to copy, then the mouse let go over the row: a click on it, not a toggle.
+const selectIn = (el) => {
+  const range = document.createRange();
+  range.selectNodeContents(el);
+  window.getSelection().removeAllRanges();
+  window.getSelection().addRange(range);
+};
+// Each step puts the row back the way it found it, so a toggle the guard failed to stop is
+// reported by its own field rather than derailing the steps after it.
+const capRowEl = () => $('.rd-caprow[data-cap="failover"]');
+const capOpen = () => !!capItem().querySelector('.grp-detail');
+const rowToggle = () => capItem().querySelector('[data-rowtoggle="failover:guide_groups"]');
+const rowOpen = () => !!capItem().querySelector('[data-row="failover:guide_groups"] .rd-detail');
+selectIn(capItem().querySelector('.rd-capwhy'));
+click(capRowEl());
 await wait(5);
-click(capItem().querySelector('[data-rowtoggle="failover:guide_groups"]'));
+out.capOpenedOverSelection = capOpen();
+out.capSelectionKept = window.getSelection().toString().length > 0;
+window.getSelection().removeAllRanges();
+if (capOpen()) { click(capRowEl()); await wait(5); }
+click(capRowEl());
+await wait(5);
+out.capOpenedOnClick = capOpen();
+selectIn(rowToggle());
+click(rowToggle());
+await wait(5);
+out.rowOpenedOverSelection = rowOpen();
+window.getSelection().removeAllRanges();
+if (rowOpen()) { click(rowToggle()); await wait(5); }
+click(rowToggle());
 await wait(5);
 const row = capItem().querySelector('[data-row="failover:guide_groups"]');
 out.rowAction = text(row.querySelector('.rd-ract a'));
@@ -73,7 +100,7 @@ const degraded = { ...payload, nav: { ...payload.nav, blocked: 0, degraded: 1 } 
 const dom2 = new JSDOM(html, {
   runScripts: 'dangerously',
   pretendToBeVisual: true,
-  url: 'http://localhost:5000/maintenance',
+  url: 'http://localhost:5000/readiness',
   virtualConsole: vc,
   beforeParse(w) {
     w.fetch = (target) => respond(String(target).includes('/api/readiness') ? degraded : {});

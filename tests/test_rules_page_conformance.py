@@ -37,6 +37,7 @@ from datetime import datetime, timedelta
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from tests.support.app import make_test_app  # noqa: E402
+from tests.support.clock import tomorrow_local_noon  # noqa: E402
 from tests.support import seed  # noqa: E402
 from app import auto_rules, db  # noqa: E402
 from app.database import (  # noqa: E402
@@ -177,9 +178,12 @@ class ListPageTests(_Base):
         now = datetime.utcnow()
         self.reach = now + timedelta(days=3)
         self.on = make_rule('Busy', profile_id=profile.id)
-        rec = add_recording(self.on, 'SCHEDULED', now + timedelta(days=1), 'Busy rec')
-        add_recording(self.on, 'SCHEDULED', now + timedelta(days=2), 'Busy rec two')
-        add_row(self.on, RULE_MATCH_SCHEDULED, now + timedelta(days=1), rec.id,
+        # Local noon, not now + 24h: on a day a DST change makes 25 hours long, now + 24h
+        # can still be today, and the cell would rightly say so (dev/changelog/1383).
+        tomorrow = tomorrow_local_noon()
+        rec = add_recording(self.on, 'SCHEDULED', tomorrow, 'Busy rec')
+        add_recording(self.on, 'SCHEDULED', tomorrow + timedelta(days=1), 'Busy rec two')
+        add_row(self.on, RULE_MATCH_SCHEDULED, tomorrow, rec.id,
                 detail='Scheduled on NBC. Scheduled with a warning: the account is full.',
                 title='Cup Race')
         mark_checked(self.on, reach=self.reach)
@@ -350,13 +354,14 @@ class NavTests(_Base):
         for cls in self._links(self.get('/tags')):
             self.assertNotIn('active', cls)
 
-    def test_it_is_called_auto_record_right_after_recordings(self):
+    def test_it_is_called_auto_record_under_setup_after_accounts(self):
+        """Set up once and left to run, so Setup rather than beside Recordings, whose
+        header links here instead (DESIGN.md 2, amended 2026-10-31)."""
         html = self.get()
         sidebar = html.split('<aside class="sidebar">')[1].split('</aside>')[0]
         labels = re.findall(r'<span class="nav-t">([^<]+)</span>', sidebar)
-        i = labels.index('Recordings')
-        self.assertEqual(labels[i - 1], 'Library')
-        self.assertEqual(labels[i + 1], 'Auto-record')
+        i = labels.index('Auto-record')
+        self.assertEqual(labels[i - 2:i], ['Setup', 'Accounts'])
         self.assertNotIn('Rules', labels)
 
     def test_it_has_its_own_glyph(self):

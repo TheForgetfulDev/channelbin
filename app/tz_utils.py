@@ -114,6 +114,32 @@ def parse_local_to_utc(value: str) -> datetime:
     return dt.astimezone(UTC).replace(tzinfo=None)
 
 
+def parse_form_time(value: str, instant: str = '') -> datetime:
+    """A datetime-local form value plus the instant the form says it stands for, as naive UTC.
+
+    Wall text alone cannot say which pass of an hour a DST fall-back repeats it means, and
+    parse_local_to_utc reads it as the first, so a program in the second 1 AM hour was
+    recorded an hour early (dev/docs/BUGS.md 2026-10-31 @ 11:27:31 PM ET). `instant` is the
+    UTC instant ('...Z' or with an offset) the browser filled the field from, or the pass the
+    user picked; it wins whenever it shows as the same wall text, and is ignored otherwise, so
+    a field typed into without clearing it still means what it says. Raises ValueError like
+    parse_local_to_utc on bad wall text; a bad `instant` is ignored."""
+    wall_utc = parse_local_to_utc(value)
+    if not instant:
+        return wall_utc
+    try:
+        at = datetime.fromisoformat(instant)
+    except (TypeError, ValueError):
+        log.warning('Ignoring unparseable form instant %r', instant)
+        return wall_utc
+    if at.tzinfo is None:
+        return wall_utc
+    at = at.astimezone(UTC).replace(tzinfo=None, microsecond=0)
+    if local_input_value(at) != local_input_value(wall_utc):
+        return wall_utc
+    return at
+
+
 def format_clock(hour: int, minute: int, h24: bool = None) -> str:
     """A bare time-of-day (no date) as 'H:MM' (24h) or 'H:MM AM/PM' (12h), per the display
     time format setting - the formatting _recur_label already did inline for recur_hour/

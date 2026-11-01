@@ -15,6 +15,8 @@ from app.database import (
     RECORDING_METADATA_REFRESHED, RECORDING_METADATA_REFRESH_SKIPPED,
 )
 from app.recording_metadata import find_program_entry, refresh_from_guide
+from app.tz_utils import local_input_value
+from tests.support.clock import tomorrow_local_noon
 from tests.support import make_test_app, seed
 
 
@@ -44,13 +46,13 @@ class CreationSnapshotTests(unittest.TestCase):
         self.t.cleanup()
 
     def _post(self, **extra):
-        start = datetime.now() + timedelta(hours=1)
+        start = tomorrow_local_noon()
         stop = start + timedelta(hours=1)
         data = {
             'name': 'snapshot_rec',
             'url': 'http://example.test/live/1',
-            'start_time': start.strftime('%Y-%m-%dT%H:%M'),
-            'stop_time': stop.strftime('%Y-%m-%dT%H:%M'),
+            'start_time': local_input_value(start),
+            'stop_time': local_input_value(stop),
             'channel_id': str(self.channel.id),
         }
         data.update(extra)

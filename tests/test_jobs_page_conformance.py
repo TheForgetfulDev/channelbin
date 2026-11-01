@@ -96,6 +96,13 @@ class JobsPageConformanceTests(unittest.TestCase):
             self.html, r'<div class="card-body table-scroll">\s*<table class="tbl tbl-cards">')
         self.assertNotIn('jobs-table', self.html)
 
+    def test_the_name_column_is_not_a_repeat_of_the_card_title(self):
+        """Under a card titled Jobs, a bare `Job` header read as a repeat
+        (dev/changelog/1368). The phone card's label follows the header."""
+        self.assertIn('<th>Job name</th>', self.html)
+        self.assertIn('<td data-label="Job name">', self.html)
+        self.assertNotIn('<th>Job</th>', self.html)
+
     def test_overlap_is_an_edge_and_a_dot_not_a_row_tint(self):
         """DESIGN.md 3.4. The page previously set a tinted `background` on the
         `tr` for red and yellow, which is the status tint the section rules out

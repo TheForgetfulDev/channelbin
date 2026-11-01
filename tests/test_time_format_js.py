@@ -249,11 +249,40 @@ class TzDayKeyTests(_Base, unittest.TestCase):
 
 class TzDayLabelTests(_Base, unittest.TestCase):
     def test_today_tomorrow_yesterday_are_relative_to_now(self):
+        """Noon on the neighboring days, not now plus or minus 24 hours: a day a DST change
+        makes 25 hours long puts now + 24h on the same date (dev/changelog/1383)."""
+        from datetime import datetime, timedelta, timezone
+        from zoneinfo import ZoneInfo
+        today = datetime.now(ZoneInfo(ET)).date()
+
+        def noon(days):
+            at = datetime.combine(today + timedelta(days=days), datetime.min.time(),
+                                  ZoneInfo(ET)).replace(hour=12)
+            return f"new Date('{at.astimezone(timezone.utc):%Y-%m-%dT%H:%M:%S}Z')"
         self.assertEqual(self.evaluate('tzDayLabel(new Date())'), 'Today')
-        self.assertEqual(
-            self.evaluate('tzDayLabel(new Date(Date.now() + 86400000))'), 'Tomorrow')
-        self.assertEqual(
-            self.evaluate('tzDayLabel(new Date(Date.now() - 86400000))'), 'Yesterday')
+        self.assertEqual(self.evaluate(f'tzDayLabel({noon(1)})'), 'Tomorrow')
+        self.assertEqual(self.evaluate(f'tzDayLabel({noon(-1)})'), 'Yesterday')
+
+    def _at(self, now_ms, target):
+        """tzDayLabel(target) with the clock pinned at `now_ms` (a Date.UTC expression)."""
+        return self.evaluate(
+            '(() => { const R = Date; const NOW = ' + now_ms + '; '
+            'class F extends R { constructor(...a) { if (a.length) super(...a); else super(NOW); } '
+            'static now() { return NOW; } } globalThis.Date = F; '
+            'try { return tzDayLabel(new R(' + target + ')); } finally { globalThis.Date = R; } })()')
+
+    def test_the_neighboring_days_are_named_across_a_dst_change(self):
+        """now +/- 24 hours is not tomorrow/yesterday on a 23- or 25-hour day
+        (dev/docs/BUGS.md 2026-11-01 @ 12:18:05 AM ET)."""
+        # 12:30 AM EDT on the 25-hour 2026-11-01: noon Nov 2 is tomorrow.
+        self.assertEqual(self._at('Date.UTC(2026, 10, 1, 4, 30)', 'Date.UTC(2026, 10, 2, 17, 0)'),
+                         'Tomorrow')
+        # 11:30 PM EST on 2027-03-13, before the 23-hour day: 1 AM Mar 14 is tomorrow.
+        self.assertEqual(self._at('Date.UTC(2027, 2, 14, 4, 30)', 'Date.UTC(2027, 2, 14, 6, 0)'),
+                         'Tomorrow')
+        # 11:30 PM EST on 2026-11-01: noon Oct 31 is not yesterday, Nov 1 morning is today.
+        self.assertEqual(self._at('Date.UTC(2026, 10, 2, 4, 30)', 'Date.UTC(2026, 10, 1, 9, 0)'),
+                         'Today')
 
     def test_a_distant_day_gets_the_short_date(self):
         self.assertEqual(self.evaluate(f'tzDayLabel({WINTER})'), 'Thu, Jan 15')

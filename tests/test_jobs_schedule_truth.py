@@ -31,7 +31,6 @@ import os
 import shutil
 import subprocess
 import tempfile
-import types
 import unittest
 from datetime import datetime, timedelta, timezone
 from unittest import mock
@@ -43,6 +42,7 @@ from app import scheduler as scheduler_mod
 from app.database import JobRun, OnDemandTestJob, record_job_run, JOB_RUN_SUCCESS
 from tests.support import seed
 from tests.support.app import make_test_app
+from tests.support.scheduler_fakes import FakeJob, fake_scheduler
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 JSDOM = os.path.join(REPO, 'node_modules', 'jsdom')
@@ -111,18 +111,6 @@ def _scheduler_add_job_sites():
     return sites, contention_bases
 
 
-class _FakeJob:
-    def __init__(self, job_id, next_run, trigger=None, kwargs=None):
-        self.id = job_id
-        self.next_run_time = next_run.replace(tzinfo=timezone.utc)
-        self.trigger = trigger or IntervalTrigger(hours=1)
-        self.kwargs = kwargs or {}
-
-
-def _fake_scheduler(jobs):
-    return types.SimpleNamespace(get_jobs=lambda: list(jobs))
-
-
 class EveryScheduledJobIsNamedTests(unittest.TestCase):
     """(a)"""
 
@@ -153,10 +141,10 @@ class EveryScheduledJobIsNamedTests(unittest.TestCase):
             _sites, bases = _scheduler_add_job_sites()
             ids = {i.format(**fill) for samples in SAMPLE_IDS.values() for i in samples}
             ids |= {f'{b}_retry' for b in bases}
-            jobs = [_FakeJob(job_id, now + timedelta(minutes=10 + n))
+            jobs = [FakeJob(job_id, now + timedelta(minutes=10 + n))
                     for n, job_id in enumerate(sorted(ids))]
             with mock.patch.object(scheduler_mod, 'get_scheduler',
-                                   return_value=_fake_scheduler(jobs)):
+                                   return_value=fake_scheduler(jobs)):
                 items = _build_job_list()
         finally:
             t.cleanup()
@@ -185,7 +173,7 @@ class _JobListCase(unittest.TestCase):
     def _items(self, jobs):
         from app.routes.jobs import _build_job_list
         with mock.patch.object(scheduler_mod, 'get_scheduler',
-                               return_value=_fake_scheduler(jobs)):
+                               return_value=fake_scheduler(jobs)):
             return {item['id']: item for item in _build_job_list()}
 
 
@@ -196,7 +184,7 @@ class RetryReadsItsBaseJobsEstimateTests(_JobListCase):
         start = datetime(2026, 1, 1)
         record_job_run('db_maintenance_daily', start, start + timedelta(minutes=6),
                        JOB_RUN_SUCCESS)
-        items = self._items([_FakeJob('db_maintenance_daily_retry',
+        items = self._items([FakeJob('db_maintenance_daily_retry',
                                       self.now + timedelta(minutes=30))])
         item = items['db_maintenance_daily_retry']
         self.assertEqual(item['est_seconds'], 360)
@@ -270,11 +258,11 @@ class TimelinePayloadTests(unittest.TestCase):
                 record_job_run('db_maintenance_daily', start, start + timedelta(minutes=3),
                                JOB_RUN_SUCCESS)
             now = datetime.utcnow()
-            jobs = [_FakeJob('db_maintenance_daily', now + timedelta(hours=1)),
-                    _FakeJob(f'account_sync_{acc.id}', now + timedelta(hours=2)),
-                    _FakeJob('hc_window_dispatch', now + timedelta(hours=3))]
+            jobs = [FakeJob('db_maintenance_daily', now + timedelta(hours=1)),
+                    FakeJob(f'account_sync_{acc.id}', now + timedelta(hours=2)),
+                    FakeJob('hc_window_dispatch', now + timedelta(hours=3))]
             with mock.patch.object(scheduler_mod, 'get_scheduler',
-                                   return_value=_fake_scheduler(jobs)), \
+                                   return_value=fake_scheduler(jobs)), \
                     _guarded_config(sync_within=7):
                 payload = _timeline_payload([], [acc], now)
             return {j['id'].split('_')[0] if j['id'].startswith('account_sync_') else j['id']: j
@@ -328,7 +316,7 @@ def _timeline_tips(setup):
             jobs, patches = setup(datetime.utcnow())
             db.session.commit()
             with mock.patch.object(scheduler_mod, 'get_scheduler',
-                                   return_value=_fake_scheduler(jobs)), patches:
+                                   return_value=fake_scheduler(jobs)), patches:
                 html = t.app.test_client().get('/').get_data(as_text=True)
         with open(os.path.join(tmp, 'page.html'), 'w', encoding='utf-8') as fh:
             fh.write(html)
@@ -374,11 +362,11 @@ class TimelineMarksTests(unittest.TestCase):
             record_job_run('config_backup_daily', start, start + timedelta(minutes=8),
                            JOB_RUN_SUCCESS)
             jobs = [
-                _FakeJob(f'account_sync_{acc.id}', now + timedelta(minutes=60)),
-                _FakeJob(f'od_job_{custom.id}', now + timedelta(minutes=240)),
-                _FakeJob(f'od_job_{system.id}', now + timedelta(minutes=420)),
-                _FakeJob(f'od_job_retry_{custom.id}', now + timedelta(minutes=430)),
-                _FakeJob('config_backup_daily', now + timedelta(minutes=600)),
+                FakeJob(f'account_sync_{acc.id}', now + timedelta(minutes=60)),
+                FakeJob(f'od_job_{custom.id}', now + timedelta(minutes=240)),
+                FakeJob(f'od_job_{system.id}', now + timedelta(minutes=420)),
+                FakeJob(f'od_job_retry_{custom.id}', now + timedelta(minutes=430)),
+                FakeJob('config_backup_daily', now + timedelta(minutes=600)),
             ]
             cls.names = {'sync': 'Sync: Acct', 'custom': 'Health check: Custom check',
                          'system': f'Health check: {system.name}', 'backup': 'Config Backup'}
@@ -438,11 +426,104 @@ class TimelineZeroLeadTimeTests(unittest.TestCase):
                                 start_time=now + timedelta(minutes=60),
                                 stop_time=now + timedelta(minutes=90))
             db.session.flush()
-            return ([_FakeJob(f'account_sync_{acc.id}', now + timedelta(minutes=60))],
+            return ([FakeJob(f'account_sync_{acc.id}', now + timedelta(minutes=60))],
                     _guarded_config(sync_within=0, sync_active=False))
-        tips = [tip for tip in _timeline_tips(setup) if tip.startswith('Sync: Acct\n')]
+        # The hourly stand-in's later occurrences are on the rail too (dev/changelog/1354);
+        # the one at the recording's moment is the next run.
+        tips = [tip for tip in _timeline_tips(setup)
+                if tip.startswith('Sync: Acct\nNext run ')]
         self.assertEqual(len(tips), 1, tips)
         self.assertNotIn('Will be deferred', tips[0])
+
+
+class TimelineOccurrencesTests(unittest.TestCase):
+    """A recording-guarded job is on the rail once per occurrence inside the window, not
+    once per job (dev/changelog/1354): a 6-hour sync fires twice in 12 hours, and a
+    recording booked over the second run deferred it with nothing on the axis saying so."""
+
+    def _payload(self, jobs, **guard):
+        from app.routes.dashboard import _timeline_payload
+        t = make_test_app()
+        try:
+            acc = seed.make_account(name='Acct')
+            od = seed.make_test_job(name='Nightly', status='SCHEDULED', recurring=True,
+                                    recur_day=0, recur_hour=2, recur_minute=0)
+            db.session.commit()
+            now = datetime.utcnow()
+            built = jobs(now, acc, od)
+            with mock.patch.object(scheduler_mod, 'get_scheduler',
+                                   return_value=fake_scheduler(built)), \
+                    _guarded_config(**guard):
+                return now, _timeline_payload([], [acc], now)
+        finally:
+            t.cleanup()
+
+    def test_an_hourly_sync_is_listed_once_per_run_in_the_window(self):
+        now, payload = self._payload(lambda now, acc, od: [
+            FakeJob(f'account_sync_{acc.id}', now + timedelta(minutes=60))])
+        self.assertEqual(payload['horizon_hours'], 12)
+        marks = [j for j in payload['jobs'] if j['id'].startswith('account_sync_')]
+        self.assertEqual([j['occurrence'] for j in marks], list(range(12)))
+        starts = [j['start'] for j in marks]
+        self.assertEqual(sorted(starts), starts)
+        self.assertTrue(all(b - a == 3600 * 1000 for a, b in zip(starts, starts[1:])))
+        self.assertEqual(len({j['name'] for j in marks}), 1)
+        self.assertTrue(all(j['guard'] for j in marks))
+
+    def test_a_probe_and_a_retry_get_one_mark_each(self):
+        """The 5-minute probes would put 144 marks a day on the rail; a retry is one run."""
+        _now, payload = self._payload(lambda now, acc, od: [
+            FakeJob('hc_window_dispatch', now + timedelta(minutes=5),
+                     trigger=IntervalTrigger(minutes=5)),
+            FakeJob(f'account_sync_retry_{acc.id}', now + timedelta(minutes=30))])
+        ids = [j['id'] for j in payload['jobs']]
+        self.assertEqual(ids.count('hc_window_dispatch'), 1)
+        self.assertEqual(len([i for i in ids if i.startswith('account_sync_retry_')]), 1)
+
+    def test_a_daily_check_appears_once_when_its_next_run_is_the_only_one_in_reach(self):
+        """The later runs are the trigger's own: a daily cron's second run is a day out."""
+        from apscheduler.triggers.cron import CronTrigger
+
+        def jobs(now, acc, od):
+            trigger = CronTrigger(hour=2)
+            first = trigger.get_next_fire_time(None, now.replace(tzinfo=timezone.utc))
+            return [FakeJob(f'od_job_{od.id}',
+                             first.astimezone(timezone.utc).replace(tzinfo=None),
+                             trigger=trigger)]
+        _now, payload = self._payload(jobs)
+        self.assertEqual(len([j for j in payload['jobs'] if j['id'].startswith('od_job_')]), 1)
+
+
+@unittest.skipIf(shutil.which('node') is None, 'node not installed')
+@unittest.skipIf(not os.path.isdir(JSDOM), 'jsdom not installed (npm install)')
+class TimelineLaterOccurrenceMarksTests(unittest.TestCase):
+    """The deferral on a job's SECOND run inside the window is drawn, through the shipped
+    dashboard.js (dev/changelog/1354)."""
+
+    @classmethod
+    def setUpClass(cls):
+        def setup(now):
+            acc = seed.make_account(name='Acct')
+            ch = seed.make_channel(acc)
+            # Booked across the hourly sync's second occurrence (+120m), clear of its first.
+            seed.make_recording(status='SCHEDULED', name='Covers second run', channel_id=ch.id,
+                                start_time=now + timedelta(minutes=110),
+                                stop_time=now + timedelta(minutes=150))
+            db.session.flush()
+            return ([FakeJob(f'account_sync_{acc.id}', now + timedelta(minutes=60))],
+                    _guarded_config(sync_within=0))
+        cls.tips = [tip for tip in _timeline_tips(setup) if tip.startswith('Sync: Acct\n')]
+
+    def test_the_second_occurrence_is_on_the_rail_and_marked(self):
+        again = [tip for tip in self.tips if '\nRuns again ' in tip]
+        self.assertTrue(again, self.tips)
+        self.assertIn('Will be deferred', again[0])
+        self.assertIn('"Covers second run" will be recording then', again[0])
+
+    def test_the_next_run_is_not(self):
+        first = [tip for tip in self.tips if '\nNext run ' in tip]
+        self.assertEqual(len(first), 1, self.tips)
+        self.assertNotIn('Will be deferred', first[0])
 
 
 if __name__ == '__main__':

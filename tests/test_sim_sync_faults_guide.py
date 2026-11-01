@@ -70,10 +70,13 @@ class GuideFetchFaultTests(_GuideCase):
     def test_a_guide_that_stops_sending_past_the_read_timeout_is_a_failed_fetch(self):
         """Characterization: a drip slower than `sync.request_timeout_seconds` times out the
         fetch, and the listings are kept."""
-        self.t.sandbox_config({'sync': {'request_timeout_seconds': 1}})
         aid = self.add_xtream()
         self.synced(aid)
         held = self.entry_count(aid)
+        # The one-second timeout is for the dripped fetch only. Set before the healthy sync
+        # above, it timed out that sync's own guide read on a loaded box (dev/docs/BUGS.md
+        # 2026-10-30 01:56 PM), and the characterization never ran.
+        self.t.sandbox_config({'sync': {'request_timeout_seconds': 1}})
         self.sim.inject('slow_drip', 'north-tv', endpoints=['guide'], chunk_bytes=65536,
                         gap_seconds=1.5)
         log = self.sync(aid)

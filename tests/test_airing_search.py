@@ -1289,7 +1289,11 @@ class QueryPlanTests(_AiringTestCase):
         they had. Anchored to the constant rather than to a literal hour: moving the
         threshold is a measurement decision, moving the RULE is a defect."""
         margin = timedelta(minutes=5)
-        start = self.now.replace(second=0, microsecond=0)
+        # A `custom:` value is local wall-clock time, so its width is measured across the
+        # display zone's offsets; noon keeps the window clear of a DST change, which would
+        # stretch a 55-minute wall-clock window past the threshold (dev/docs/BUGS.md
+        # 2026-10-31 @ 08:47:34 PM ET).
+        start = self.now.replace(hour=12, minute=0, second=0, microsecond=0)
 
         def custom(width):
             stop = start + width

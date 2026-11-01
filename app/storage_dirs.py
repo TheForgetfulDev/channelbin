@@ -9,7 +9,7 @@ writability check at all was a line on the container's stdout that fired even fo
 install that records somewhere else (dev/changelog/1009).
 
 Product principle 1: a directory the user configured and the app cannot write to is a
-stopped feature, so it reaches the Readiness card and the Alert Center, not only a log.
+stopped feature, so it reaches the Readiness check and the Alert Center, not only a log.
 """
 import logging
 import os
@@ -78,6 +78,11 @@ PROFILE_POSTER_ROLE = StorageRole(
     'Profile poster directory',
     'A poster image cannot be uploaded to a recording profile, and recordings made under '
     'a profile that has one get a captured frame as their poster instead.')
+
+#: The folders the Readiness check's "Take screenshots and live thumbnails" answers for: the
+#: frames ChannelBin captures itself. Uploaded profile posters and cached logos are not
+#: captures, so they stay with the other folders (dev/changelog/1366).
+IMAGE_ROLES = (LIVE_THUMBNAIL_ROLE, POSTER_FRAME_ROLE, SCREENSHOT_ROLE)
 
 
 #: The subfolders of recording.images_dir, one per kind of image (dev/changelog/1012). Each
@@ -209,4 +214,47 @@ def sweep_write_dirs(cfg: dict, capture_log_dir: str = None) -> list:
         probe = probe_writable_dir(path)
         report_storage_path(path, probe, role)
         results.append((path, role, probe))
+    clear_unconfigured_path_alerts(cfg, capture_log_dir)
     return results
+
+
+def clear_unconfigured_path_alerts(cfg: dict, capture_log_dir: str = None) -> list:
+    """Take down the standing alert of every path that is no longer a configured write
+    directory, and return those paths.
+
+    A path's alert clears when a probe of that path answers, and nothing probes a path once
+    the settings have moved off it or switched its feature off - so its alert stood in
+    Active alerts forever, promising to clear itself over a folder the app no longer uses
+    (dev/changelog/1361). No stat() here, only config against the open rows, so a settings
+    save can call it inline. Never raises: a save that already landed must not fail on it.
+    """
+    from flask import has_app_context
+    from . import db
+    from .alerts import STORAGE_PATH_UNUSABLE, mark_cleared
+    from .database import Alert
+    from .db_utils import retry_on_locked
+    from .fs_utils import forget_dir_outcome
+
+    if not has_app_context():
+        return []
+    configured = {path for path, _role in configured_write_dirs(cfg, capture_log_dir)}
+
+    @retry_on_locked()
+    def _clear_and_commit():
+        rows = [a for a in Alert.query.filter_by(alert_type=STORAGE_PATH_UNUSABLE,
+                                                 dismissed_at=None)
+                if a.source not in configured]
+        paths = [a.source for a in rows]
+        if mark_cleared(rows):
+            db.session.commit()
+        return paths
+
+    try:
+        cleared = _clear_and_commit()
+    except Exception:
+        log.exception('Could not clear storage-path alerts for unconfigured folders')
+        return []
+    for path in cleared:
+        forget_dir_outcome(path)
+        log.info('Storage-path alert for %s cleared: it is no longer a configured folder', path)
+    return cleared

@@ -214,7 +214,7 @@ def cached_system_stats():
 
 @system_bp.route('/maintenance')
 def maintenance():
-    """The four operational panels that used to sit at the bottom of Settings.
+    """The operational panels that used to sit at the bottom of Settings.
 
     DESIGN.md 7 ruled them off that page and DESIGN.md 16 settles the page they
     landed on: named Maintenance, second to last in the nav, cards ordered
@@ -231,6 +231,17 @@ def maintenance():
         backup_enabled=backup_cfg.get('enabled', True),
         is_docker=bool(os.environ.get('CHANNELBIN_DOCKER')),
     )
+
+
+@system_bp.route('/readiness')
+def readiness_page():
+    """The Readiness check, on a page of its own: "can this install record?" is not
+    maintenance, and a new user looking for it would not look there (dev/changelog/1366).
+
+    Renders nothing but the shell. The checks, the verdict and the capability rows all
+    arrive from /api/readiness, whose three expensive checks wait to be asked.
+    """
+    return render_template('readiness.html')
 
 
 @system_bp.route('/api/system/stats')

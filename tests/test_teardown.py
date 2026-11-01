@@ -43,6 +43,8 @@ from app.database import (  # noqa: E402
 from app import scheduler as sched_mod  # noqa: E402
 from app.scheduler import schedule_recording, get_scheduler  # noqa: E402
 from app.watchdog import WatchdogThread  # noqa: E402
+from app.tz_utils import local_input_value  # noqa: E402
+from tests.support.clock import tomorrow_local_noon  # noqa: E402
 # The two rigs that already know how to fake a live capture cheaply, subclassed rather
 # than copied. Neither base class carries tests of its own, so importing them here does
 # not re-run anything.
@@ -709,14 +711,14 @@ class DeleteUnlinksWhatNamesTheRecordingTests(unittest.TestCase):
         rid, open_id, _old_id = self._recording_with_alerts(
             status='SCHEDULED', start_time=future, stop_time=future + timedelta(hours=1))
 
-        # The form parses local time and converts to UTC, so these are display-local.
-        start = datetime.now() + timedelta(days=2)
+        # The form posts display-local wall text; local noon is never inside a DST change.
+        start = tomorrow_local_noon() + timedelta(days=1)
         stop = start + timedelta(hours=1)
         resp = self.t.client.post('/recordings/new-json', data={
             'name': 'the replacement',
             'url': 'http://example.test/live/9',
-            'start_time': start.strftime('%Y-%m-%dT%H:%M'),
-            'stop_time': stop.strftime('%Y-%m-%dT%H:%M'),
+            'start_time': local_input_value(start),
+            'stop_time': local_input_value(stop),
             'replace_recording_id': str(rid),
         })
         self.assertEqual(resp.status_code, 200, resp.get_data(as_text=True))

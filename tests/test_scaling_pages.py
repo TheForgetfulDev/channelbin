@@ -164,6 +164,15 @@ def _seed_converting(n):
     db.session.commit()
 
 
+def _prepare_unusable_dvr_dir():
+    """os.stat answering ESTALE for the sandboxed DVR directory around the measured request
+    only - the transition the storage alert is raised on. Read from the sandboxed config
+    the way the page reads it, so the path is the one the readout will probe."""
+    from tests.support.fakes import stale_stat
+    dvr_dir = config_mod.load_config()['recording']['dvr_output_dir']
+    return mock.patch('os.stat', stale_stat({dvr_dir}))
+
+
 def _seed_alerts(n):
     """n unread alerts - the Alert center renders one row each, and every row runs
     the `local_time` template filter, which is the exact shape that made `/` take
@@ -212,6 +221,33 @@ def _seed_readiness_shape(n):
             start_time=datetime.utcnow(),
             stop_time=datetime.utcnow() + timedelta(hours=1)))
     db.session.commit()
+
+
+def _seed_guide_scope(n):
+    """n guide channels and n guide groups of two members each, every channel with a
+    program - what the output feed serves, with a health check on half the members so the
+    group's format lock has something to read."""
+    acc = seed.make_account(name='Provider')
+    other = seed.make_account(name='Provider B')
+    for i in range(n):
+        ch = seed.make_channel(acc, name=f'Guide channel {i}', in_guide=True,
+                               category_name=f'Category {i % 3}')
+        a = seed.make_channel(acc, name=f'Member A {i}')
+        b = seed.make_channel(other, name=f'Member B {i}')
+        seed.make_channel_test(a, all_null=False, status='COMPLETED')
+        grp = seed.make_group(name=f'Guide group {i}', members=[a, b])
+        grp.guide_sort_order = 1000 + i
+        for c in (ch, a, b):
+            db.session.add(seed.EPGEntry(
+                channel_id=c.id, title=f'Show {i}',
+                start_time=datetime.utcnow(),
+                stop_time=datetime.utcnow() + timedelta(hours=1)))
+    db.session.commit()
+
+
+def _enable_output_feed(t):
+    t.sandbox_config({'integrations': {'output_feed': {
+        'enabled': True, 'username': 'tv', 'password': 'tv'}}})
 
 
 def _seed_get_started(n):
@@ -771,7 +807,7 @@ class PageScalingTests(unittest.TestCase):
 
     SMALL, LARGE = 8, 80
 
-    def _measure(self, seed_fn, n_rows, path, prepare=None):
+    def _measure(self, seed_fn, n_rows, path, prepare=None, configure=None):
         """`path` is either a literal URL or a callable run after seeding, for pages whose
         URL carries the seeded row's own id. Hard-coding an id here is a trap: the app
         auto-creates the "TV Guide Channels" system group at startup, so it - not the
@@ -786,6 +822,8 @@ class PageScalingTests(unittest.TestCase):
         """
         t = make_test_app()
         try:
+            if configure is not None:
+                configure(t)
             seed_fn(n_rows)
             url = path() if callable(path) else path
             ctx = prepare() if prepare is not None else None
@@ -802,9 +840,9 @@ class PageScalingTests(unittest.TestCase):
         finally:
             t.cleanup()
 
-    def _assert_row_independent(self, seed_fn, path, prepare=None):
-        small = self._measure(seed_fn, self.SMALL, path, prepare)
-        large = self._measure(seed_fn, self.LARGE, path, prepare)
+    def _assert_row_independent(self, seed_fn, path, prepare=None, configure=None):
+        small = self._measure(seed_fn, self.SMALL, path, prepare, configure)
+        large = self._measure(seed_fn, self.LARGE, path, prepare, configure)
         path = small.url
         self.assertEqual(
             small.queries, large.queries,
@@ -836,7 +874,7 @@ class PageScalingTests(unittest.TestCase):
         self._assert_row_independent(_seed_guide_channels, '/channels')
 
     def test_readiness_report(self):
-        # Not a page: the Readiness card lives on Maintenance, whose contents all arrive by
+        # Not a page: the Readiness page is a shell whose contents all arrive by
         # fetch, so this endpoint is where the per-account and per-group work actually
         # happens and where the guard belongs.
         self._assert_row_independent(_seed_readiness_shape, '/api/readiness')
@@ -852,6 +890,16 @@ class PageScalingTests(unittest.TestCase):
 
     def test_dashboard_page(self):
         self._assert_row_independent(_seed_converting, '/')
+
+    def test_dashboard_page_when_the_dvr_dir_turns_unusable(self):
+        """The request on which the DVR directory first stops answering raises the standing
+        storage alert from inside the disk readout, and that alert's commit once expired
+        every row the render had loaded - 26 queries at 8 CONVERTING rows against 170 at
+        80 (dev/docs/BUGS.md 2026-09-18 07:34 AM). The sandboxed /dvr then left the suite
+        with no request that reached the path at all; this seeds the dead directory on
+        purpose. The write itself now waits for the view to return
+        (tests/test_storage_path_alert.py, dev/changelog/1355)."""
+        self._assert_row_independent(_seed_converting, '/', prepare=_prepare_unusable_dvr_dir)
 
     def test_alerts_page(self):
         self._assert_row_independent(_seed_alerts, '/alerts')
@@ -881,6 +929,22 @@ class PageScalingTests(unittest.TestCase):
     def test_recording_detail_page(self):
         self._assert_row_independent(_seed_recording_history,
                                      lambda: f'/recordings/{_scaling_recording_id()}')
+
+    def test_output_feed_catalog(self):
+        """Not a page: the output feed's catalog, playlist and guide answers are built for an
+        IPTV app from the guide scope, and each is one keyed query however many channels and
+        groups the guide holds (DESIGN-output-feed.md 7)."""
+        self._assert_row_independent(
+            _seed_guide_scope, '/player_api.php?username=tv&password=tv&action=get_live_streams',
+            configure=_enable_output_feed)
+
+    def test_output_feed_playlist(self):
+        self._assert_row_independent(_seed_guide_scope, '/get.php?username=tv&password=tv',
+                                     configure=_enable_output_feed)
+
+    def test_output_feed_xmltv(self):
+        self._assert_row_independent(_seed_guide_scope, '/xmltv.php?username=tv&password=tv',
+                                     configure=_enable_output_feed)
 
     def test_jobs_page(self):
         """The Scheduled Jobs page's rows come from the scheduler, not from a query, so the
@@ -1084,6 +1148,9 @@ COVERED = {
     'health_check_profiles.health_check_profiles_list': 'test_health_check_profiles_page',
     'jobs.jobs_page': 'test_jobs_page',
     'setup.get_started': 'test_get_started_page',
+    'output_feed.player_api': 'test_output_feed_catalog',
+    'output_feed.get_php': 'test_output_feed_playlist',
+    'output_feed.xmltv': 'test_output_feed_xmltv',
 }
 
 #: Page endpoints that cannot scale with row count, and the checkable reason why. A reason
@@ -1116,10 +1183,12 @@ NOT_ROW_SCALING = {
         'arrive from /api/logs/history, which is a file tail hard-capped at 5000 lines and '
         'touches no database row.'),
     'system.maintenance': (
-        'Eight cards whose contents all arrive by fetch. The only server-rendered values are '
-        'the backup schedule and the Docker flag, which are config, not measurement. The '
-        'Readiness card is the one whose payload counts rows, and /api/readiness carries its '
-        'own case above (test_readiness_report).'),
+        'Seven cards whose contents all arrive by fetch. The only server-rendered values are '
+        'the backup schedule and the Docker flag, which are config, not measurement.'),
+    'system.readiness_page': (
+        'The page shell only: the head, its buttons and an empty #rd-content. Every check '
+        'and capability arrives from /api/readiness, which counts rows and carries its own '
+        'case above (test_readiness_report).'),
     'settings.settings': (
         'Renders config.yaml, whose size is bounded by the key set in app/config.py. Nothing '
         'on it grows with a database table.'),
@@ -1136,6 +1205,10 @@ NOT_ROW_SCALING = {
     'recordings.recording_file_check': (
         'Opens one recording\'s file and answers with one JSON object about it. Not a page and '
         'renders no rows.'),
+    'output_feed.live': (
+        'Plays ONE channel to an IPTV app: resolves one feed id and either redirects or relays '
+        'its stream. Not a page and renders no rows; the catalog answers it lists from carry '
+        'their own cases (test_output_feed_catalog and siblings).'),
 }
 
 

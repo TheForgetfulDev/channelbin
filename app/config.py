@@ -118,7 +118,8 @@ RESTART_REQUIRED_KEYS = {
 
 # Leaf paths whose values should never be written to the log verbatim (secrets/tokens).
 _SENSITIVE_EXACT_PATHS = {'flask.secret_key', 'auth.password_hash',
-                          'integrations.home_assistant.api_key_hash'}
+                          'integrations.home_assistant.api_key_hash',
+                          'integrations.output_feed.password'}
 
 # One fixed mask string rendered by every settings READ surface for a sensitive leaf, and
 # recognized by save_config() on WRITE to mean "keep the stored secret" (round-trip). ASCII
@@ -511,6 +512,29 @@ _DEFAULTS = {
             'enabled': False,
             'api_key_hash': '',           # werkzeug scrypt hash - NEVER the plaintext
         },
+        # The output feed: ChannelBin as an Xtream/M3U/XMLTV source an IPTV app adds as an
+        # account, serving the TV Guide's channels and groups (app/output_feed.py,
+        # dev/docs/DESIGN-output-feed.md). The first optional module: off by default, one
+        # switch, nothing runs or is written while it is off. None of these keys needs a
+        # restart - the blueprint is always registered and reads them per request.
+        'output_feed': {
+            'enabled': False,
+            'username': '',
+            # Plaintext, a sensitive leaf (masked on every read surface, round-tripped on
+            # write). Not a hash on purpose: the client sends the pair on every request,
+            # including the one that starts each play, and check_password_hash measured
+            # 147 ms per call where a constant-time compare is 1 us (design doc section 6.2).
+            'password': '',
+            'mode': 'proxy',              # proxy | redirect - output_feed.MODES
+            'accounts': [],               # account ids the feed may serve from; [] = all
+            'held_seats': {},             # account id -> seats kept free for the IPTV app (redirect mode)
+            'buffer_mb': 16,              # the in-memory ring per viewer (proxy mode)
+            'reserve_seconds': 3,         # how far behind live the IPTV app plays; 0 = pass-through
+            'max_viewers': 3,             # concurrent relay sessions
+            'idle_seconds': 30,           # a client that has read nothing for this long is gone
+            'max_session_hours': 12,      # the hard cap on one session
+            'xmltv_days': 3,              # listings depth in xmltv.php
+        },
     },
     'database': {
         'path': os.path.join(_APP_ROOT, 'dvr.db'),
@@ -749,6 +773,10 @@ _DEFAULTS = {
         # prior sync's cached epg_entry_count (DESIGN-sync-resilience.md §4) - guards against
         # a transient garbage/empty XMLTV fetch wiping future EPG. 0 = disabled.
         'epg_collapse_threshold_percent': 20,
+        # Raise EPG_SOURCE_COVERAGE_LOST only when one import leaves at least this percent
+        # of the channels that had a guide with none. A smaller loss is routine provider
+        # churn and is written to the account's sync log instead. 0 = every loss alerts.
+        'epg_coverage_lost_alert_percent': 10,
         # Refuse to apply the provider's live-channel catalog when doing so would cut the
         # account below this percent of its prior channel_count (DESIGN-live-vod.md §4.1) -
         # a truncated catalog must not silently decimate a working channel list. The
@@ -1019,8 +1047,21 @@ def config_default(path: str):
     A fallback that restates a default as a literal drifts from it - four Settings rows
     and nine code fallbacks had (dev/changelog/1003). Raises KeyError for a path that is
     not a leaf of _DEFAULTS, so a typo fails loudly instead of rendering a blank.
+
+    An empty map (`integrations.output_feed.held_seats: {}`) is a value, not a container:
+    _flatten() yields no leaf under it, so it is answered from the tree itself.
     """
-    return _DEFAULT_LEAVES[path]
+    try:
+        return _DEFAULT_LEAVES[path]
+    except KeyError:
+        node = _DEFAULTS
+        for key in path.split('.'):
+            if not isinstance(node, dict) or key not in node:
+                raise
+            node = node[key]
+        if node == {}:
+            return {}
+        raise
 
 
 def changed_from_default(cfg: dict) -> list:
@@ -1051,7 +1092,7 @@ def default_display(path: str) -> str:
         return 'true' if value else 'false'
     if isinstance(value, float) and value.is_integer():
         return str(int(value))
-    if value == '' or value == []:
+    if value == '' or value == [] or value == {}:
         return '(empty)'
     if isinstance(value, list):
         return ', '.join(str(v) for v in value)

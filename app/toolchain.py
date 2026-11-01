@@ -465,7 +465,7 @@ def _report_gpu_state(device, ok, error, codec='h264'):
                       f'Unraid template), not as a folder mapping, and it is only '
                       f'available on a Linux host. If the node is named differently on '
                       f'this machine, set recording.post_process.vaapi_device. '
-                      f'Maintenance > Readiness re-runs the test on demand, and this '
+                      f'The Readiness check re-runs the test on demand, and this '
                       f'alert clears itself once it passes.'),
                 source=source)
     except Exception:

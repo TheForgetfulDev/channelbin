@@ -1,5 +1,5 @@
-"""Tier 0 - the Readiness card's empty failover row and its run-all button, driven in a
-real DOM (dev/changelog/1271).
+"""Tier 0 - the Readiness check's empty failover row, its run-all button and its row toggles,
+driven in a real DOM (dev/changelog/1271, 1366).
 
 The first-time-user test opened "Survive a feed dropping mid-recording" right after a
 recording had reconnected through a dropped feed, read "Nothing is set up for this yet. The
@@ -13,9 +13,14 @@ Invariants:
       to change.
   (c) The run-all button's tooltip names every check it would run and what each costs, in
       the check's own words.
+  (d) A click that ends a drag-select toggles nothing, on a capability row or a check row,
+      and the selection survives it (dev/docs/BUGS.md 2026-10-31 @ 01:47:58 PM).
+  (e) An empty capability's reason line prints the empty check's finding alone, without
+      the check's noun in front of it - the finding is already a sentence
+      (dev/changelog/1366).
 
 tests/support/readiness_card.mjs drives the shipped util.js + readiness.js against the markup
-/maintenance rendered and the payload readiness.evaluate() built; every assertion lives here.
+/readiness rendered and the payload readiness.evaluate() built; every assertion lives here.
 
   python3 -m unittest tests.test_readiness_card_js
 """
@@ -50,7 +55,7 @@ def _observe():
         acc = seed.make_account()
         seed.make_channel(acc, stream_id=1, name='Northwind News', in_guide=True)
         db.session.commit()
-        page = t.client.get('/maintenance').get_data(as_text=True)
+        page = t.client.get('/readiness').get_data(as_text=True)
         payload = readiness.evaluate()
         with open(os.path.join(tmp, 'page.html'), 'w', encoding='utf-8') as f:
             f.write(page)
@@ -81,6 +86,20 @@ class ReadinessCardTests(unittest.TestCase):
     def test_the_failover_row_names_a_backup_channel(self):
         self.assertIn('backup channel', self.r['capName'])
         self.assertIn('Nothing is set up for this yet', self.r['capWhy'])
+
+    def test_an_empty_reason_line_does_not_repeat_the_checks_noun(self):
+        """"The account syncs: There are no accounts to sync" said the same thing twice."""
+        found = next(c['found'] for c in self.payload['checks'] if c['id'] == 'guide_groups')
+        self.assertEqual(self.r['capWhy'], f'Nothing is set up for this yet. {found}.')
+
+    def test_a_drag_select_on_a_capability_row_toggles_nothing(self):
+        self.assertIs(self.r['capOpenedOverSelection'], False)
+        self.assertIs(self.r['capSelectionKept'], True)
+        self.assertIs(self.r['capOpenedOnClick'], True, 'a plain click must still open it')
+
+    def test_a_drag_select_on_a_check_row_toggles_nothing(self):
+        self.assertIs(self.r['rowOpenedOverSelection'], False)
+        self.assertIn('How to set it up', self.r['rowDetail'], 'a plain click must still open it')
 
     def test_the_summary_row_links_to_where_it_is_set_up(self):
         self.assertEqual(self.r['capAction'], 'Channel Groups')

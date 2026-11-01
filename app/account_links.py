@@ -358,8 +358,8 @@ def set_active_host(account_id: int, host_id: int) -> dict:
 
 def delete_hosts_for_account(account_id: int) -> int:
     """Drop the account's host rows inside the caller's delete unit (no commit here): the
-    account is going, and a row left behind would list hosts for a future account that
-    reused the id. Returns the count removed."""
+    account is going, and a row left behind would list hosts for an account that no longer
+    exists. Returns the count removed."""
     from .database import AccountHost
     return AccountHost.query.filter_by(account_id=account_id).delete(synchronize_session=False)
 

@@ -1,4 +1,5 @@
 {% extends "base.html" %}
+{% from "_macros.html" import page_about %}
 {% block title %}Name matches - {{ source.name }} - ChannelBin{% endblock %}
 
 {#  Name-match review (DESIGN-epg-sources.md §7.5, dev/changelog/1105).
@@ -38,12 +39,12 @@
   <h1>Name matches <span class="sub">{{ source.name }}</span></h1>
   <a href="{{ url_for('accounts.account_detail', account_id=owner.id) }}" class="btn">{{ icon('back') }} {{ owner.name }}</a>
 </div>
-<p class="page-sub">
+{% call page_about() %}
   Channels whose name matches exactly one channel in this source's file. Nothing changes until
   you accept a match, and every channel you don't accept keeps matching on the EPG id its
   provider gives it. Check the programs coming up before accepting: a name can point at the
   wrong channel.
-</p>
+{% endcall %}
 
 <div id="nm-main" data-source-id="{{ source.id }}" data-owner-id="{{ owner.id }}">
 {% if not refreshed %}

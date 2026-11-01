@@ -1,4 +1,5 @@
 {% extends "base.html" %}
+{% from "_macros.html" import page_about %}
 {% block title %}Ignored Alerts - ChannelBin{% endblock %}
 
 {#  Ignored-alert-pattern management (dev/changelog/539).
@@ -13,10 +14,10 @@
     <span class="sub">{{ patterns | length }} pattern{{ 's' if patterns | length != 1 else '' }}</span>
   </h1>
 </div>
-<p class="page-sub">Alerts matching one of these patterns are suppressed before they ever
+{% call page_about() %}Alerts matching one of these patterns are suppressed before they ever
   reach the Alerts page - the underlying condition still gets logged normally, it just
   stops being surfaced here or pushed. Removing a pattern lets matching alerts start
-  appearing again.</p>
+  appearing again.{% endcall %}
 
 {% if not patterns %}
 <div class="empty-state">

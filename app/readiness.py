@@ -135,7 +135,7 @@ IGNORED_PREF_KEY = 'readiness_ignored'
 #: works"), which is right beside a state pill and wrong in the middle of a sentence.
 #: `without` is what stops working, and it is what the verdict's second line quotes.
 #:
-#: `advisory` means shown but never counted toward the headline or the Maintenance nav badge:
+#: `advisory` means shown but never counted toward the headline or the Readiness nav badge:
 #: its row and its capability row still carry the real state, and a green verdict names it in
 #: its second line. For a check that is a nudge rather than a claim about whether the install
 #: works - an unread error is on the Alerts page already, with its own nav badge, so a second
@@ -151,8 +151,12 @@ Check.__new__.__defaults__ = (None, False, None, None, False, None)
 
 #: Where a check is fixed when it cannot be fixed in place. `endpoint` is resolved through
 #: url_for at evaluation time, so a renamed view function fails the test suite rather than
-#: shipping a dead button (the Jinja-hazard rule, applied to a JSON payload).
-Link = namedtuple('Link', 'label endpoint')
+#: shipping a dead button (the Jinja-hazard rule, applied to a JSON payload). `q` is the
+#: Settings search the link opens with, so it lands on the setting the check is about rather
+#: than the top of the page (dev/changelog/1367); `tests/test_setup_steps.py` holds every one
+#: to finding a row there.
+Link = namedtuple('Link', 'label endpoint q')
+Link.__new__.__defaults__ = (None,)
 
 #: What one check found. `action` is the one-click fix, present only when there genuinely is
 #: one. Act in place where it is one click, and send the user to the page that owns it
@@ -191,7 +195,7 @@ class Context:
         from .fs_utils import (filesystem_type, is_network_filesystem, probe_dir,
                                probe_writable_dir)
         from .search_index import readiness_map, SEARCH_INDEX_CHANNELS, SEARCH_INDEX_NAMES
-        from .storage_dirs import configured_write_dirs
+        from .storage_dirs import IMAGE_ROLES, configured_write_dirs
         from .toolchain import describe_tools
         from .tz_utils import get_display_tz_name
         # _disk_bytes lives in the route module because the sidebar meter and the
@@ -214,10 +218,15 @@ class Context:
         # Probed here and never reported: the standing alerts belong to the disk readout and
         # the storage_dirs_check job, and a page load moving an alert would be a third
         # writer. A fixed handful of stat() calls, however many rows the install has.
-        self.write_dirs = [(path, role, probe_writable_dir(path))
-                           for path, role in configured_write_dirs(
-                               self.cfg, current_app.config.get('CAPTURE_LOG_DIR'))
-                           if path != self.dvr_dir]
+        # Split in two so each folder is probed once and answers for one check: the image
+        # folders stand behind screenshots, and a broken backup folder must not block those
+        # (dev/changelog/1366).
+        probed = [(path, role, probe_writable_dir(path))
+                  for path, role in configured_write_dirs(
+                      self.cfg, current_app.config.get('CAPTURE_LOG_DIR'))
+                  if path != self.dvr_dir]
+        self.image_dirs = [row for row in probed if row[1] in IMAGE_ROLES]
+        self.write_dirs = [row for row in probed if row[1] not in IMAGE_ROLES]
         self.disk_total, self.disk_free = _disk_bytes(self.dvr_dir, DVR_DIR_ROLE)
 
         self.db_path = self.cfg['database']['path']
@@ -227,6 +236,9 @@ class Context:
 
         self.tz_name = get_display_tz_name()
         self.secret_key_set = bool(current_app.config.get('SECRET_KEY'))
+        # A fixed number of queries when the feed is on, none when it is off.
+        from .output_feed import readiness_facts
+        self.feed = readiness_facts(self.cfg)
         self.auth_cfg = current_app.config.get('AUTH') or {}
         self.docker = bool(os.environ.get('CHANNELBIN_DOCKER'))
 
@@ -275,7 +287,6 @@ class Context:
 
         notif = self.cfg.get('notifications', {})
         services = notif.get('services', {}) or {}
-        self.notify_services = sorted(services)
         self.notify_enabled = sorted(name for name, svc in services.items()
                                      if isinstance(svc, dict) and svc.get('enabled'))
 
@@ -361,7 +372,7 @@ def _tool_result(info, name):
         return Result(PROBLEM, tested,
                       f"It could not be run at {info.get('path') or info.get('configured') or name}")
     # The provenance words are the payload's own (toolchain.source_label), the same string
-    # the Maintenance card beside this row prints.
+    # Maintenance's External tools card prints.
     source = info.get('source_label') or 'resolved'
     return Result(READY, tested, f"Version {info.get('version') or 'unknown'}, {source}")
 
@@ -453,21 +464,33 @@ def _check_storage_dvr(ctx):
     return Result(READY, tested, f'{ctx.dvr_dir} is there and writable')
 
 
-def _check_storage_dirs(ctx):
+def _probed_dirs_result(tested, dirs, none_found):
+    """storage_images and storage_dirs, which differ only in which folders they were handed:
+    every unusable folder named with its role and why, never a bare count."""
     from .fs_utils import PATH_OK, describe_dir_problem
-    tested = (f'Probed the {len(ctx.write_dirs)} other '
-              f'{plural(len(ctx.write_dirs), "folder")} ChannelBin writes to for write access')
-    if not ctx.write_dirs:
-        return Result(NOTHING, tested, 'Nothing else is configured to be written')
-    bad = [(path, role, probe) for path, role, probe in ctx.write_dirs
-           if probe.outcome != PATH_OK]
+    if not dirs:
+        return Result(NOTHING, tested, none_found)
+    bad = [(path, role, probe) for path, role, probe in dirs if probe.outcome != PATH_OK]
     if bad:
         return Result(ATTENTION, tested,
-                      f'{len(bad)} of {len(ctx.write_dirs)} unusable: '
+                      f'{len(bad)} of {len(dirs)} unusable: '
                       + '; '.join(f'{role.what}: {describe_dir_problem(path, probe)}'
                                   for path, role, probe in bad))
-    return Result(READY, tested,
-                  'All writable: ' + ', '.join(role.what for _p, role, _pr in ctx.write_dirs))
+    return Result(READY, tested, 'All writable: ' + ', '.join(role.what for _p, role, _pr in dirs))
+
+
+def _check_storage_images(ctx):
+    n = len(ctx.image_dirs)
+    return _probed_dirs_result(
+        f'Probed the {n} {plural(n, "folder")} thumbnails and screenshots are saved in for '
+        'write access', ctx.image_dirs, 'Thumbnails and health check screenshots are both off')
+
+
+def _check_storage_dirs(ctx):
+    n = len(ctx.write_dirs)
+    return _probed_dirs_result(
+        f'Probed the {n} other {plural(n, "folder")} ChannelBin writes to for write access',
+        ctx.write_dirs, 'Nothing else is configured to be written')
 
 
 def _check_storage_space(ctx):
@@ -542,6 +565,43 @@ def _check_auth_gate(ctx):
     if gate_active(ctx.auth_cfg):
         return Result(READY, tested, 'Login is on and a password is set')
     return Result(READY, tested, 'Login is off')
+
+
+def _check_output_feed(ctx):
+    """Evaluated only while the feed is on: a credential is stored, the ring holds the
+    reserve, something is served, and every held-seats account still exists. The detail
+    carries the URL to type into the IPTV app (DESIGN-output-feed.md section 8)."""
+    from .output_feed import MODE_REDIRECT, max_reserve_seconds
+    feed = ctx.feed
+    tested = 'Read the output feed settings and counted what the TV Guide would serve'
+    if not feed['enabled']:
+        return Result(NOTHING, tested, 'The output feed is off')
+    fcfg = (ctx.cfg.get('integrations') or {}).get('output_feed') or {}
+    url = (ctx.cfg.get('notifications', {}).get('base_url') or '').strip()
+    detail = (f'In an IPTV app, add an Xtream Codes account with the server set to '
+              f'{url or "this ChannelBin address"} and the feed\'s username and password.')
+    if not feed['credentials_set']:
+        return Result(PROBLEM, tested,
+                      'The feed is on but has no username or password, so every request '
+                      'is refused', detail=detail)
+    if not feed['reserve_fits']:
+        return Result(PROBLEM, tested,
+                      f'The buffer ({fcfg.get("buffer_mb")} MB) cannot hold the reserve '
+                      f'({fcfg.get("reserve_seconds")} s) - at most '
+                      f'{max_reserve_seconds(fcfg.get("buffer_mb"))} s fits, so every play '
+                      f'would be cut as too slow', detail=detail)
+    if feed['missing_held_accounts']:
+        ids = ', '.join(str(a) for a in feed['missing_held_accounts'])
+        return Result(ATTENTION, tested,
+                      f'Seats are held for accounts that no longer exist ({ids})',
+                      detail=detail)
+    if not feed['served']:
+        return Result(ATTENTION, tested,
+                      'The TV Guide is empty, so the IPTV app sees no channels', detail=detail)
+    mode = 'relayed through ChannelBin' if feed['mode'] != MODE_REDIRECT else 'played straight from the provider'
+    return Result(READY, tested,
+                  f'{feed["served"]} {plural(feed["served"], "channel")} served, {mode}',
+                  detail=detail)
 
 
 def _check_accounts_any(ctx):
@@ -704,23 +764,26 @@ def _check_search_index(ctx):
     return Result(READY, tested, 'Both the channel and the program index are ready')
 
 
+#: The one sentence for "nothing will be sent", whatever config.yaml holds: every install
+#: carries a stanza for each service on offer, so a stanza is not a sign anyone set one up
+#: (dev/docs/BUGS.md 2026-10-31 @ 05:31:19 PM).
+NO_NOTIFY_ENABLED = 'No notification services are enabled.'
+
+
 def _check_notify_any(ctx):
-    tested = 'Counted the notification services that are switched on'
-    if not ctx.notify_services:
-        return Result(ATTENTION, tested, 'No notification services are configured at all')
+    tested = 'Counted the notification services that are enabled'
     if not ctx.notify_enabled:
-        return Result(ATTENTION, tested,
-                      f'None of the {len(ctx.notify_services)} configured services is switched on')
+        return Result(ATTENTION, tested, NO_NOTIFY_ENABLED)
     return Result(READY, tested,
-                  f'{len(ctx.notify_enabled)} on: ' + ', '.join(ctx.notify_enabled))
+                  f'{len(ctx.notify_enabled)} enabled: ' + ', '.join(ctx.notify_enabled))
 
 
 def _check_notify_delivers(ctx):
     """On-demand: send one real message through every enabled service."""
     from .notifications import send_test
-    tested = 'Sent one real test message through each service that is switched on'
+    tested = 'Sent one real test message through each enabled service'
     if not ctx.notify_enabled:
-        return Result(NOTHING, tested, 'Nothing is switched on, so there was nothing to send')
+        return Result(NOTHING, tested, NO_NOTIFY_ENABLED)
     failures = []
     for name in ctx.notify_enabled:
         ok, err = send_test(name)
@@ -775,10 +838,10 @@ CHECKS = (
     # so the alert and this row cannot drift on what a missing binary costs.
     Check('ffmpeg', 'machine', 'ffmpeg is installed', 'ffmpeg', CHEAP,
           CONSEQUENCE['ffmpeg'],
-          Link('Settings', 'settings.settings'), False, _check_ffmpeg),
+          Link('Settings', 'settings.settings', 'ffmpeg.path'), False, _check_ffmpeg),
     Check('ffprobe', 'machine', 'ffprobe is installed', 'ffprobe', CHEAP,
           CONSEQUENCE['ffprobe'],
-          Link('Settings', 'settings.settings'), False, _check_ffprobe),
+          Link('Settings', 'settings.settings', 'ffmpeg.ffprobe_path'), False, _check_ffprobe),
     Check('ffmpeg_build', 'machine', 'This ffmpeg has the parts ChannelBin uses',
           'this ffmpeg build', ON_DEMAND,
           'A missing component fails only when it is needed, which is usually the '
@@ -789,19 +852,25 @@ CHECKS = (
     Check('gpu_encoder', 'machine', 'The GPU encoder works', 'the GPU encoder', ON_DEMAND,
           'Video re-encodes run on the CPU instead. The file comes out the same, but the '
           'conversion uses most of the CPU while it runs.',
-          Link('Settings', 'settings.settings'), True, _check_gpu_encoder,
+          Link('Settings', 'settings.settings', 'recording.post_process.video_encoder'), True,
+          _check_gpu_encoder,
           'Encodes a one-second test clip on the GPU. Runs when you ask, when you turn the '
           'GPU encoder on in Settings, when the app starts with it on, and before each '
           'conversion that uses it. With the encoder set to Software it answers at once.'),
     Check('storage_dvr', 'machine', 'The recording folder works', 'the recording folder', CHEAP,
-          'Any recording that starts now fails immediately, with nothing captured.',
-          Link('Settings', 'settings.settings'), False, _check_storage_dvr),
+          "Any recording that starts now fails immediately because it can't write.",
+          Link('Settings', 'settings.settings', 'recording.dvr_output_dir'), False, _check_storage_dvr),
+    Check('storage_images', 'machine', 'The thumbnail and screenshot folders work',
+          'the image folders', CHEAP,
+          'Recordings still capture, but the thumbnails, poster frames or health check '
+          'screenshots that folder holds stop being saved, depending on which one.',
+          Link('Settings', 'settings.settings', 'recording.images_dir'), False, _check_storage_images),
     Check('storage_dirs', 'machine', 'Every other folder ChannelBin writes to works',
           'the other storage folders', CHEAP,
-          'Whatever that folder holds stops being saved - thumbnails, health check '
-          'screenshots, capture diagnostics, backups or moved recordings, depending on which '
-          'one. Recording itself carries on.',
-          Link('Settings', 'settings.settings'), False, _check_storage_dirs),
+          'Whatever that folder holds stops working - capture diagnostics, health check '
+          'clips, live previews, cached logos, profile posters, backups or moved '
+          'recordings, depending on which one. Recording itself carries on.',
+          Link('Settings', 'settings.settings', 'directory'), False, _check_storage_dirs),
     Check('storage_space', 'machine', 'There is room to record', 'free disk space', CHEAP,
           'A recording that runs out of disk stops mid-capture, and what was written up to '
           'that point is all you get.',
@@ -810,7 +879,7 @@ CHECKS = (
           CHEAP,
           'SQLite on a network filesystem can lose writes and lock up, and that can '
           'corrupt the database.',
-          Link('Settings', 'settings.settings'), False, _check_db_local),
+          Link('Settings', 'settings.settings', 'database.path'), False, _check_db_local),
     Check('db_write', 'machine', 'The database accepts writes', 'writing to the database', CHEAP,
           'Nothing can be scheduled, recorded or synced. The app loads and then fails at the '
           'first action.',
@@ -821,15 +890,25 @@ CHECKS = (
     Check('timezone', 'machine', 'A display timezone is set', 'the display timezone', CHEAP,
           'Times on every page and every recording window are in UTC, so shows appear at '
           'the wrong hour.',
-          Link('Settings', 'settings.settings'), False, _check_timezone),
+          Link('Settings', 'settings.settings', 'display.timezone'), False, _check_timezone),
     Check('secret_key', 'machine', 'The session signing key is set', 'the session signing key',
           CHEAP,
           'Sessions cannot be signed, so nobody stays logged in and the login gate can be '
           'bypassed.',
-          Link('Settings', 'settings.settings'), False, _check_secret_key),
+          Link('Settings', 'settings.settings', 'flask.secret_key'), False, _check_secret_key),
     Check('auth_gate', 'machine', 'The login gate does what you asked', 'the login gate', CHEAP,
           'Login is on but no password is stored, so every page is open to anyone.',
-          Link('Settings', 'settings.settings'), False, _check_auth_gate),
+          Link('Settings', 'settings.settings', 'auth.enabled'), False, _check_auth_gate),
+    Check('output_feed', 'machine', 'The output feed can serve an IPTV app', 'the output feed',
+          CHEAP,
+          'An IPTV app that added ChannelBin as an account sees no channels, or is refused on '
+          'every request.',
+          Link('Settings', 'settings.settings', 'integrations.output_feed'), True,
+          _check_output_feed,
+          setup=('Turn on the output feed in Settings > Integrations, give it a username '
+                 'and password, and add ChannelBin to an IPTV app as an Xtream Codes account. '
+                 'The app then lists the TV Guide\'s channels and groups, with the guide\'s '
+                 'listings, and a group plays as one channel with failover.')),
 
     # ── Your provider ─────────────────────────────────────────────────────
     Check('accounts_any', 'provider', 'You have at least one account', 'your provider accounts',
@@ -855,7 +934,7 @@ CHECKS = (
     Check('guide_content', 'content', 'The TV Guide has something in it',
           'what is in the TV Guide', CHEAP,
           'The guide is empty, so there is nothing to browse and nothing to schedule from.',
-          Link('Channel Search', 'channels.channel_browser'), False, _check_guide_content),
+          Link('Search', 'channels.channel_browser'), False, _check_guide_content),
     Check('guide_groups', 'content', 'Every group in the guide can record', 'the guide groups',
           CHEAP,
           'The guide row looks normal, but recording from it produces no file.',
@@ -880,9 +959,10 @@ CHECKS = (
     # ── Being told ────────────────────────────────────────────────────────
     Check('notify_any', 'told', 'Something is set up to tell you',
           'your notification services', CHEAP,
-          'You only find out about a failed recording by opening the app.',
+          "You can see in ChannelBin if there's an error, but no external notifications "
+          'are enabled.',
           Link('Notifications', 'settings.notifications_settings'), True, _check_notify_any),
-    Check('notify_delivers', 'told', 'Each service can actually deliver',
+    Check('notify_delivers', 'told', 'Each enabled service can actually deliver',
           'notification delivery', ON_DEMAND,
           'A service that is set up but failing sends nothing, and the app thinks you were '
           'told.',
@@ -890,7 +970,7 @@ CHECKS = (
           'Sends a real message through each service. Runs only when you ask.'),
     Check('alerts_unread', 'told', 'No unread errors', 'unread errors', CHEAP,
           'These are errors you have not seen yet. The Alerts badge already counts them, so '
-          'they do not add to the count beside Maintenance.',
+          'they do not add to the count beside Readiness in the menu.',
           Link('Alerts', 'alerts.alert_center'), True, _check_alerts_unread, None, True),
 )
 
@@ -909,7 +989,7 @@ CHECKS_BY_ID = {c.id: c for c in CHECKS}
 Capability = namedtuple('Capability', 'id label needs')
 
 CAPABILITIES = (
-    Capability('record', 'Record a program right now',
+    Capability('record', 'Record a program',
                _cap('ffmpeg', 'storage_dvr', 'storage_space', 'db_write', 'accounts_any',
                     'account_login', 'guide_content')),
     Capability('schedule', 'Start scheduled recordings on time',
@@ -924,16 +1004,19 @@ CAPABILITIES = (
     Capability('convert', 'Convert a finished recording to MP4',
                _cap('ffmpeg', 'ffmpeg_build', 'gpu_encoder')),
     Capability('measure', 'Measure how good a recording was', _cap('ffprobe')),
+    # Answers for its own folders, and only those: storage_dirs would also block it over a
+    # broken backup folder (dev/changelog/1366).
     Capability('shots', 'Take screenshots and live thumbnails',
-               _cap('ffmpeg', 'ffmpeg_build')),
+               _cap('ffmpeg', 'ffmpeg_build', 'storage_images')),
     Capability('search', 'Search your channels and programs quickly', _cap('search_index')),
     Capability('notify', 'Be told when something breaks',
                _cap('notify_any', 'notify_delivers')),
     Capability('files', 'Save thumbnails, screenshots, backups and diagnostics',
-               _cap('storage_dirs')),
+               _cap('storage_images', 'storage_dirs')),
     Capability('safe', 'Keep the database safe and the login working',
                _cap('db_local', 'db_write', 'secret_key', 'auth_gate')),
     Capability('clear', 'See every error', _cap('alerts_unread')),
+    Capability('tv', 'Watch your channels and groups from a third-party IPTV app', _cap('output_feed')),
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1123,13 +1206,14 @@ def _headline(caps, rows, counts):
                 'head': f'Not ready: you cannot {lower}{tail}',
                 'sub': by_id[first['blockers'][0]]['without']}
     if degraded:
+        # The check's own `without`, with nothing in front of it. A `without` says what stops
+        # working, so a sentence about what still works cannot precede it without
+        # contradicting it (dev/docs/BUGS.md 2026-10-31 @ 05:31:19 PM).
         first = degraded[0]
-        lower = first['label'][0].lower() + first['label'][1:]
         return {'level': 'warn', 'mark': 'warning',
                 'head': (f'Ready to record, but {len(degraded)} '
                          f'{plural(len(degraded), "thing needs", "things need")} attention'),
-                'sub': (f'You can still {lower}. '
-                        + by_id[first['degraded'][0]]['without'])}
+                'sub': by_id[first['degraded'][0]]['without']}
     if unsure:
         n = len(unsure)
         return {'level': 'warn', 'mark': 'unknown',
@@ -1188,7 +1272,9 @@ def evaluate(ctx=None, ignored=None, pseudonymize=False) -> dict:
             # One click here, or a link to the page that owns it - never both on one row.
             'action': ({'label': action.label, 'urls': list(action.urls)}
                        if action is not None else None),
-            'link': ({'label': check.link.label, 'url': _url(check.link.endpoint)}
+            'link': ({'label': check.link.label,
+                      'url': _url(check.link.endpoint, **({'q': check.link.q} if check.link.q
+                                                          else {}))}
                      if action is None and check.link else None),
         })
 
@@ -1256,7 +1342,7 @@ def report_text(payload) -> str:
 
 
 def nav_counts(caps) -> dict:
-    """{'blocked': n, 'degraded': n, ...} - what the Maintenance nav link counts.
+    """{'blocked': n, 'degraded': n, ...} - what the Readiness nav link counts.
 
     Capabilities, not checks: one broken binary blocks four capabilities, and a tally of
     checks would read as four alarms for one problem. An ignored check has already been

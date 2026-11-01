@@ -18,6 +18,7 @@ from .channel_search import channel_search_bp
 from .channel_hide_rules import channel_hide_rules_bp
 from .auth import auth_bp
 from .ha import ha_bp
+from .output_feed import output_feed_bp
 from .preview import preview_bp
 from .auto_rules import auto_rules_bp
 from .setup import setup_bp
@@ -47,5 +48,9 @@ def register_blueprints(app):
     app.register_blueprint(channel_hide_rules_bp)
     app.register_blueprint(auth_bp)
     app.register_blueprint(ha_bp)
+    # Always registered, gated per request, so turning the feed on needs no restart and a
+    # URL that answers 401 while it is off is indistinguishable from a wrong password
+    # (DESIGN-output-feed.md 6.3).
+    app.register_blueprint(output_feed_bp)
     app.register_blueprint(setup_bp)
     app.register_blueprint(epg_manager_bp)

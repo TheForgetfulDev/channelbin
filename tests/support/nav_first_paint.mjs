@@ -38,7 +38,7 @@ await new Promise((r) => setTimeout(r, 20));
 
 const d = w.document;
 const badge = (sel) => {
-  const el = d.querySelector(`.sidebar ${sel}`);
+  const el = d.querySelector(`.sidebar .nav-link ${sel}`);
   return el ? {
     text: el.textContent.trim(),
     shown: el.style.display !== 'none',

@@ -988,7 +988,7 @@ def build_support_bundle(include_names: bool = False) -> bytes:
                 log.error('Support bundle: %s failed: %s', filename, exc)
                 errors[filename] = str(exc)
 
-        # The Readiness card's own Copy report text, not a second rendering of the checks:
+        # The Readiness page's own Copy report text, not a second rendering of the checks:
         # report_text() is the one writer, so a new or reworded check reaches the bundle
         # with no edit here. Group names are not swept from free text (_group_to_dict), so
         # the checks name groups and accounts by id themselves in this mode. On-demand
@@ -1007,6 +1007,16 @@ def build_support_bundle(include_names: bool = False) -> bytes:
         except Exception as exc:
             log.error('Support bundle: apscheduler_jobs.json failed: %s', exc)
             errors['apscheduler_jobs.json'] = str(exc)
+
+        # The output feed's own lines (DESIGN-output-feed.md section 8): its settings minus
+        # the credentials, who is watching now and the last session ends by reason - ids
+        # only, so no channel or account name rides along.
+        try:
+            from .output_feed import bundle_facts
+            _write_json('output_feed.json', bundle_facts(load_config()))
+        except Exception as exc:
+            log.error('Support bundle: output_feed.json failed: %s', exc)
+            errors['output_feed.json'] = str(exc)
 
         # Last, not first: its redaction disclosure reports how many account-name
         # occurrences were swept out of free text, and its filesystem_check reports what

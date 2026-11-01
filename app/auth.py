@@ -31,7 +31,7 @@ ALWAYS_OPEN = {'auth.login', 'auth.logout', 'static'}
 # to that blueprint later inherits the bypass automatically instead of silently also
 # requiring a browser login on top of its own gate. Never add a blueprint here whose own
 # gate is not deny-by-default - this bypass trusts it completely.
-SELF_GATED_BLUEPRINTS = {'ha'}
+SELF_GATED_BLUEPRINTS = {'ha', 'output_feed'}
 
 # The source key for the standing "enabled but no password" alert. One constant, not the
 # observing path's name, so startup and every settings save address the same row rather

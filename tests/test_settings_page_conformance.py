@@ -54,6 +54,32 @@ class SettingsPageConformanceTests(unittest.TestCase):
         port_row = self.html[self.html.index('data-path="flask.port"'):]
         self.assertIn('Under Docker this is the container', port_row[:2000])
 
+    def _bind_warning_open_tag(self):
+        i = self.html.index('Reachable from any device on this network')
+        start = self.html.rindex('<div class="frow', 0, i)
+        return self.html[start:self.html.index('>\n', start) + 1]
+
+    def test_the_bind_warning_search_text_stays_inside_its_attribute(self):
+        """dev/docs/BUGS.md 2026-10-31 @ 04:46:08 PM: the warning's label starts with
+        icon('warning'), which is Markup, so field_shell's data-hay skipped escaping and
+        the SVG's first quote ended the attribute - a lowercased copy of the warning
+        rendered as page text above the real one. Any label carrying an icon must keep
+        its search text inside the attribute, with no tag in it."""
+        tag = self._bind_warning_open_tag()
+        hay = re.search(r'data-hay="([^"]*)"', tag).group(1)
+        self.assertNotIn('<', hay)
+        self.assertIn('reachable from any device on this network', hay)
+        self.assertTrue(hay.rstrip().endswith('network exposure bind reachable lan security host'),
+                        hay[-120:])
+
+    def test_the_bind_warning_shows_in_the_advanced_view_only(self):
+        """dev/docs/BUGS.md 2026-10-31 @ 04:46:08 PM: the setting the warning tells you to
+        change, flask.host, is Advanced, so the warning is too. It carries a tier with no
+        path, so it stays out of the Basic/Advanced setting counts."""
+        tag = self._bind_warning_open_tag()
+        self.assertIn('data-tier="advanced"', tag)
+        self.assertNotIn('data-path', tag)
+
     def test_the_settings_search_has_a_clear_control(self):
         """DESIGN.md 3.11: a search field on a filter bar carries a clear x.
 
@@ -524,6 +550,8 @@ class TierTests(unittest.TestCase):
         'sync.sync_interval_hours', 'sync.epg_days_ahead', 'channel_testing.screenshots_enabled',
         'channel_testing.window.start', 'channel_testing.window.end', 'auth.enabled',
         'integrations.home_assistant.enabled',
+        'integrations.output_feed.enabled', 'integrations.output_feed.username',
+        'integrations.output_feed.password', 'integrations.output_feed.mode',
     }
 
     @classmethod
@@ -549,14 +577,14 @@ class TierTests(unittest.TestCase):
 
     def test_the_basic_set_is_exactly_the_approved_one(self):
         tiers = self._tiers(self.basic_html)
-        self.assertEqual(len(tiers), 133)
+        self.assertEqual(len(tiers), 146)
         self.assertEqual({p for p, t in tiers.items() if t == 'basic'}, self.BASIC)
         self.assertEqual({t for t in tiers.values()}, {'basic', 'advanced'})
 
     def test_every_advanced_row_carries_its_badge_and_no_basic_row_does(self):
         rows = re.findall(r'data-path="([^"]+)" data-tier="[^"]*".*?<div class="fl-label">(.*?)</div>',
                           self.basic_html, re.S)
-        self.assertEqual(len(rows), 133)
+        self.assertEqual(len(rows), 146)
         for path, badge in rows:
             with self.subTest(path=path):
                 self.assertEqual('tier-badge' in badge, path not in self.BASIC)
@@ -637,7 +665,7 @@ class ChangedFromDefaultTests(unittest.TestCase):
 
     def test_every_setting_row_carries_the_mark_and_the_attribute_turns_it_on(self):
         html = self._page()
-        self.assertEqual(html.count('<div class="fr-changed">Changed from default</div>'), 133)
+        self.assertEqual(html.count('<div class="fr-changed">Changed from default</div>'), 146)
         self.assertIn('.frow[data-changed] .fr-changed { display: inline-flex; }', self._css())
 
     def test_a_value_saved_equal_to_its_default_is_not_a_change(self):
@@ -688,6 +716,7 @@ class ChangedFromDefaultTests(unittest.TestCase):
 
 
 PP = 'recording.post_process'
+OF = 'integrations.output_feed'
 
 
 class GatingAndOverrideTests(unittest.TestCase):
@@ -737,6 +766,17 @@ class GatingAndOverrideTests(unittest.TestCase):
         'recording.live_thumbnail.poster_frame_offset_seconds': ['recording.live_thumbnail.enabled'],
         'auth.session_timeout_minutes': ['auth.enabled'],
         'config_backup.backup_hour_et': ['config_backup.enabled'],
+        # The output feed (dev/changelog/1365): everything reads only while it is on; the
+        # relay knobs only in proxy mode, the held seats only in redirect mode.
+        f'{OF}.mode': [f'{OF}.enabled'],
+        f'{OF}.accounts': [f'{OF}.enabled'],
+        f'{OF}.held_seats': [f'{OF}.enabled', f'{OF}.mode!=proxy'],
+        f'{OF}.reserve_seconds': [f'{OF}.enabled', f'{OF}.mode!=redirect'],
+        f'{OF}.buffer_mb': [f'{OF}.enabled', f'{OF}.mode!=redirect'],
+        f'{OF}.max_viewers': [f'{OF}.enabled', f'{OF}.mode!=redirect'],
+        f'{OF}.idle_seconds': [f'{OF}.enabled', f'{OF}.mode!=redirect'],
+        f'{OF}.max_session_hours': [f'{OF}.enabled', f'{OF}.mode!=redirect'],
+        f'{OF}.xmltv_days': [f'{OF}.enabled'],
     }
 
     # Each is read with its apparent gate off, so dimming it would be a false claim.

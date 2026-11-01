@@ -19,9 +19,10 @@ are in the [README](../README.md).
 - [Getting told when something breaks](#getting-told-when-something-breaks)
 - [Keeping ChannelBin off an account while you watch](#keeping-channelbin-off-an-account-while-you-watch)
 - [Hiding channels and tagging programs](#hiding-channels-and-tagging-programs)
-- [Maintenance, Jobs and Logs](#maintenance-jobs-and-logs)
+- [Readiness, Maintenance, Jobs and Logs](#readiness-maintenance-jobs-and-logs)
 - [Settings](#settings)
 - [Home Assistant](#home-assistant)
+- [Watching your channels in an IPTV app](#watching-your-channels-in-an-iptv-app)
 
 ## Reading a recording's page
 
@@ -304,15 +305,17 @@ tag highlights the programs that carry its marker in the TV Guide and in program
 lets you filter on them. In a filename template, `{tag:live}` writes "live" when the program has
 that marker and nothing when it does not. ChannelBin starts with two, live and new.
 
-## Maintenance, Jobs and Logs
+## Readiness, Maintenance, Jobs and Logs
 
-**Maintenance** is where to look when you want to know whether the install itself is healthy:
+**Readiness**, under System in the menu, is where to look when you want to know whether the
+install itself is healthy: every login, folder, tool and service ChannelBin depends on, each with
+what it found and what breaks without it. The checks that cost something (opening a stream,
+sending a notification) wait for you to click the button that runs them, which says how many are
+left, such as **Run 4 more checks**. The red and amber numbers beside Readiness in the menu come
+from here.
 
-- **Readiness check**: every login, folder, tool and service ChannelBin depends on, each with what
-  it found and what breaks without it. The checks that cost something (opening a stream, sending
-  a notification) wait for you to click the button that runs them, which says how many are
-  left, such as **Run 4 more checks**. The red and amber numbers beside Maintenance in the menu
-  come from here.
+**Maintenance** holds the rest of the upkeep:
+
 - **Storage**, **External tools** and **Search index**: disk space, the ffmpeg and ffprobe
   versions, and the state of the search index.
 - **Backup & Restore**: back up your settings now, or pick an earlier backup, see what it would
@@ -346,3 +349,25 @@ recording, unread alerts, account health and more, as Home Assistant entities. S
 including turning on the API it uses under **Settings → Integrations**, is in the
 [README](../README.md#home-assistant-integration). Home Assistant can also be a notification
 service, under [Getting told when something breaks](#getting-told-when-something-breaks).
+
+## Watching your channels in an IPTV app
+
+ChannelBin can be an Xtream Codes source itself, so an IPTV app such as TiviMate adds it as an
+account and sees exactly your TV Guide - every channel and group in it, in the guide's order,
+with the guide's own listings - instead of the provider's whole list. A group is one channel in
+the app, played from the member ChannelBin would record from right now, and if that member dies
+the picture moves to another one without the app noticing.
+
+Turn it on under **Settings → Integrations**: give the feed a short username and password, turn
+the **Output feed for an IPTV app** switch on, then add ChannelBin to the IPTV app as an Xtream Codes
+account using the address shown beside the switch. Put a channel in the TV Guide and it is in
+the app; take it out and it is gone at the app's next refresh.
+
+A recording always wins. In the default **Proxy** mode ChannelBin holds the provider connection
+for the IPTV app, and when a recording needs it the app is cut and the Alerts page names the recording
+that took it; the app tunes in again on its own once a connection is free. **Redirect** mode sends
+the IPTV app straight to the provider instead - no failover, and ChannelBin cannot see when it
+stops, so tell it how many connections to leave alone with **Seats kept free for the IPTV app**.
+The Dashboard's **Watching now** section shows who is playing what, and why the last sessions
+ended. The setup steps and the two modes in more detail are in the
+[README](../README.md#output-feed-for-an-iptv-app).

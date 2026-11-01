@@ -430,7 +430,10 @@ function jobMark(j, clash) {
   const pos = bar
     ? `left:${Math.max(0, l).toFixed(1)}px;width:${w.toFixed(1)}px`
     : `left:${Math.max(0, Math.min(TL.width, l)).toFixed(1)}px`;
-  const tip = [j.name, `Next run ${fmtClock(s)} (${fmtUntil(s)})`, jobDurationLine(j), clash]
+  // The first mark is the job's next run; a later occurrence inside the window says so,
+  // since the same job is on the rail more than once (dev/changelog/1354).
+  const when = j.occurrence ? 'Runs again' : 'Next run';
+  const tip = [j.name, `${when} ${fmtClock(s)} (${fmtUntil(s)})`, jobDurationLine(j), clash]
     .filter(Boolean).join('\n');
   return `<span class="${cls}" style="${pos}" data-job="${escHtml(j.id)}"
     data-tip="${escHtml(tip)}" data-sheet="job"><i></i></span>`;
@@ -449,7 +452,8 @@ function renderTimeline() {
   const now = TL.data.now;
   TL.pxPerMin = isPhone() ? PX_PER_MIN_MOBILE : PX_PER_MIN_DESKTOP;
   TL.start = now - TL_BACK_HOURS * HOUR;
-  TL.end = now + TL_FWD_HOURS * HOUR;
+  // The server's reach, since it listed each job's occurrences for exactly that window.
+  TL.end = now + (TL.data.horizon_hours || TL_FWD_HOURS) * HOUR;
   TL.width = Math.round((TL.end - TL.start) / MIN * TL.pxPerMin);
 
   // The timeline reads its data DIRECTLY, never through the section-visibility set:
@@ -614,7 +618,7 @@ document.addEventListener('click', e => {
   if (!lines.length) return;
   buildModal({
     title: lines[0],
-    body: lines.slice(1).map(l => `<p class="page-sub">${escHtml(l)}</p>`).join(''),
+    body: lines.slice(1).map(l => `<p class="page-intro">${escHtml(l)}</p>`).join(''),
     footer: [
       { label: 'Close', class: 'btn' },
       { label: 'Open', class: 'btn btn-primary', onClick: () => { location.href = href; return false; } },  // nav-ok: the phone sheet's Open button, a tap

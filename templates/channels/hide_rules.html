@@ -1,7 +1,8 @@
 {% extends "base.html" %}
-{% block title %}Hide Rules - ChannelBin{% endblock %}
+{% from "_macros.html" import page_about %}
+{% block title %}Hide Channels - ChannelBin{% endblock %}
 
-{#  Hide Rules (dev/changelog/780).
+{#  Hide Channels, named Hide Rules until dev/changelog/1363 (dev/changelog/780).
 
     Built from the approved dev/mockups/35-hide-rules.html round 4. The summary
     tiles below are real Channel.hidden/hidden_deferred aggregates from
@@ -138,13 +139,13 @@
 </style>
 
 <div class="page-head">
-  <h1>Hide Rules
+  <h1>Hide Channels
     <span class="sub">{{ rules | length }} rule{{ 's' if rules | length != 1 else '' }}</span>
   </h1>
   <button class="btn btn-primary" id="hr-add-btn" type="button">+ Add Rule</button>
 </div>
 
-<p class="page-intro" style="margin: 0 0 1rem;">
+{% call page_about() %}
   Take channels out of your way without deleting them - a blanket rule over a provider
   category or a channel name, on top of hiding one channel at a time from its own page.
   A hidden channel leaves search, the pickers and the counts, keeps its detail page, and
@@ -152,7 +153,7 @@
   visible until you remove it from there, no matter what a rule says. ChannelBin starts with
   five channel name rules that hide the divider rows providers list between sections, such
   as <code>#### US CLASSIC ####</code>; edit or delete them like any other.
-</p>
+{% endcall %}
 
 {# Saved-but-not-applied. A refused pass leaves the rules committed and `Channel.hidden`
    stale, which looks exactly like a rule that did nothing - so the reason and the retry

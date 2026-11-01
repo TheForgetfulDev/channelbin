@@ -171,6 +171,28 @@
     });
   });
 
+  // ── The output feed's switch waits for a credential ───────────────────────
+  // Server-rendered disabled until a username and password exist (the route refuses the
+  // switch without them too). Typing both into the two fields un-disables it on the spot
+  // rather than after a reload; clearing either disables it again.
+  const feedToggle = $('input[data-setting-path="integrations.output_feed.enabled"]');
+  const feedUser = $('input[data-setting-path="integrations.output_feed.username"]');
+  const feedPass = $('input[data-setting-path="integrations.output_feed.password"]');
+  if (feedToggle && feedUser && feedPass) {
+    const sync = () => {
+      const ready = feedUser.value.trim() !== '' && feedPass.value !== '';
+      feedToggle.disabled = !ready;
+      const label = feedToggle.closest('label');
+      if (label) {
+        label.classList.toggle('tip-plain', !ready);
+        if (ready) delete label.dataset.tip;
+        else label.dataset.tip = 'Set a username and password below first';
+      }
+    };
+    feedUser.addEventListener('blur', sync);
+    feedPass.addEventListener('blur', sync);
+  }
+
   // ── Turn off the login gate ───────────────────────────────────────────────
   // Disabling clears the stored password server-side too (app/routes/settings.py -
   // api_settings_field), so this has to confirm the current password first rather than

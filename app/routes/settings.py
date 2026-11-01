@@ -13,7 +13,7 @@ from ruamel.yaml.error import YAMLError as RoundTripYAMLError
 from flask import (Blueprint, render_template, request, redirect, url_for, flash,
                    jsonify, send_file, current_app, session)
 
-from .. import health_bands
+from .. import health_bands, output_feed
 from ..config import (load_config, save_config, config_default, is_restart_needed,
                       RESTART_REQUIRED_KEYS, set_nested, mask_config, redact_sensitive_diff_lines, _is_sensitive_path,
                       _load_config_file, config_write_lock, load_for_edit, changed_from_default,
@@ -139,12 +139,21 @@ def _save_raw_yaml(data):
         apply_logo_cache_schedule()
     if not changed:
         return 'No changes detected.'
+    _clear_unconfigured_storage_alerts(load_config())
     gpu = _refresh_gpu_after_save(changed)
     gpu_note = f' {_gpu_trial_sentence(gpu)}' if gpu else ''
     if any(path in RESTART_REQUIRED_KEYS for path, _, _ in changed):
         return ('Settings saved. Restart the service for all changes to take effect.'
                 + gpu_note)
     return 'Settings saved.' + gpu_note
+
+
+def _clear_unconfigured_storage_alerts(cfg):
+    """After a save, take down the alert of any folder `cfg` (the saved config) no longer
+    uses, rather than leaving it for the next storage check up to five minutes later
+    (dev/changelog/1361). Called outside the config lock: it commits to the database."""
+    from ..storage_dirs import clear_unconfigured_path_alerts
+    clear_unconfigured_path_alerts(cfg, current_app.config.get('CAPTURE_LOG_DIR'))
 
 
 def _refresh_gpu_after_save(changed):
@@ -245,6 +254,14 @@ def _render_settings(yaml_text=None, yaml_problems=None):
         page_size_options=[(n, str(n)) for n in PAGE_SIZE_OPTIONS],
         page_size_value=configured_page_size(unmasked_cfg),
         timezone_options=timezone_options,
+        # The address the IPTV app types in is whatever this request arrived on - the feed's
+        # stream endpoint is ChannelBin itself, never an account's base_url.
+        feed_url=request.host_url.rstrip('/'),
+        feed_credentials_set=output_feed.credentials_set(
+            (unmasked_cfg.get('integrations') or {}).get('output_feed') or {}),
+        feed_held_seats_lines=[f'{a}: {n}' for a, n in sorted(
+            output_feed.held_seats_map(
+                (unmasked_cfg.get('integrations') or {}).get('output_feed') or {}).items())],
     )
 
 
@@ -425,6 +442,60 @@ def api_settings_field():
                 return jsonify({'error': 'Generate an API key before enabling the Home '
                                          'Assistant integration'}), 400
 
+        # The output feed (app/output_feed.py). Same server-side shape as the Home Assistant
+        # gate above: the switch is disabled on the page until a credential exists, and the
+        # route refuses it too. The reserve must fit the ring whichever of the two moved, and
+        # held seats are typed as `account_id: seats` lines and stored as the map the model
+        # reads (DESIGN-output-feed.md 9).
+        if path.startswith('integrations.output_feed.'):
+            from .. import output_feed
+            feed_cfg = cfg.get('integrations', {}).get('output_feed', {})
+            leaf = path[len('integrations.output_feed.'):]
+            if leaf == 'enabled' and value:
+                if not output_feed.credentials_set(feed_cfg):
+                    return jsonify({'error': 'Set a username and password before turning the '
+                                             'output feed on'}), 400
+            if leaf == 'mode' and value not in output_feed.MODES:
+                return jsonify({'error': 'Pick one of ' + ', '.join(output_feed.MODES)}), 400
+            if leaf in ('buffer_mb', 'reserve_seconds', 'max_viewers', 'idle_seconds',
+                        'max_session_hours', 'xmltv_days'):
+                try:
+                    value = int(value)
+                except (TypeError, ValueError):
+                    return jsonify({'error': 'Value must be a whole number'}), 400
+                floor = 0 if leaf == 'reserve_seconds' else 1
+                value = max(floor, value)
+            if leaf in ('buffer_mb', 'reserve_seconds'):
+                trial = dict(feed_cfg, **{leaf: value})
+                if not output_feed.reserve_fits(trial):
+                    return jsonify({'error': (
+                        f'A {trial["buffer_mb"]} MB buffer cannot hold {trial["reserve_seconds"]} '
+                        f'seconds of reserve - at most '
+                        f'{output_feed.max_reserve_seconds(trial["buffer_mb"])} seconds fits '
+                        f'(about 1 MB per second at a typical HD bitrate, with room to spare). '
+                        f'Lower the reserve or raise the buffer.')}), 400
+            if leaf == 'accounts':
+                ids = []
+                for raw in (value or []):
+                    try:
+                        ids.append(int(str(raw).strip()))
+                    except ValueError:
+                        return jsonify({'error': f'"{raw}" is not an account id - one whole '
+                                                 f'number per line'}), 400
+                value = ids
+            if leaf == 'held_seats':
+                held = {}
+                for raw in (value or []):
+                    account_id, sep, seats = str(raw).partition(':')
+                    try:
+                        if not sep:
+                            raise ValueError
+                        held[str(int(account_id.strip()))] = max(0, int(seats.strip()))
+                    except ValueError:
+                        return jsonify({'error': f'"{raw}" is not "account id: seats" - one '
+                                                 f'pair per line, like 2: 1'}), 400
+                value = held
+
         # Enforcement lives server-side (CLAUDE.md): the Security card disables this toggle
         # client-side until a password exists, but the route must refuse it too.
         if path == 'auth.enabled':
@@ -449,7 +520,8 @@ def api_settings_field():
         # Read back under the same lock, so the answer describes this save and not one that
         # landed after it. The page marks a changed row from it, so setting a field back to
         # its default clears the mark without a reload.
-        still_changed = path in changed_from_default(load_config())
+        saved_cfg = load_config()
+        still_changed = path in changed_from_default(saved_cfg)
 
     needs_restart = any(p in RESTART_REQUIRED_KEYS for p, _, _ in changed)
 
@@ -515,6 +587,17 @@ def api_settings_field():
     if path == 'recording.logo_cache.enabled':
         from ..scheduler import apply_logo_cache_schedule
         apply_logo_cache_schedule()
+
+    # Turning the feed off ends every IPTV app watching through it, by name: a relay left running
+    # would go on holding a provider seat for a feature the user just switched off.
+    if path == 'integrations.output_feed.enabled' and not value:
+        from .. import output_feed
+        ended = output_feed.stop_all(output_feed.REASON_DISABLED)
+        if ended:
+            log.info('Output feed turned off: ended %d viewer session(s)', ended)
+
+    if changed:
+        _clear_unconfigured_storage_alerts(saved_cfg)
 
     payload = {'success': True, 'restart_required': needs_restart,
                'changed_from_default': still_changed}
@@ -874,6 +957,7 @@ def api_rollback():
     # toolchain, the search caches) are a pre-existing gap and are not widened here.
     from ..scheduler import apply_logo_cache_schedule
     apply_logo_cache_schedule()
+    _clear_unconfigured_storage_alerts(load_config())
     return jsonify({'success': True})
 
 

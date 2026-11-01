@@ -1,4 +1,5 @@
 {% extends "base.html" %}
+{% from "_macros.html" import page_about %}
 {% block title %}EPG Manager - ChannelBin{% endblock %}
 
 {#  EPG Manager (dev/changelog/1325): the tools that work across every account's guide.
@@ -42,12 +43,12 @@
   <h1>EPG Manager</h1>
   <button type="button" class="btn btn-primary" data-act="epg-scan"{% if running %} disabled{% endif %}>{{ 'Scanning...' if running else 'Scan now' }}</button>
 </div>
-<p class="page-sub">
+{% call page_about() %}
   Tools that work across every account's guide. The similarity scan reads every EPG schedule
   the database holds and finds the ids carrying the same one, so you can see the copies side
   by side and choose a source and an id by what each copy holds. Nothing here changes a
   channel's guide: that is done on the channel page.
-</p>
+{% endcall %}
 
 <div id="em-main" data-running="{{ '1' if running else '0' }}">
 <div class="card" id="em-similar">

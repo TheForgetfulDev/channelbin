@@ -1,5 +1,5 @@
 {% extends "base.html" %}
-{% from '_macros.html' import csrf_field, secret_reveal_btn %}
+{% from '_macros.html' import csrf_field, secret_reveal_btn, page_about %}
 {% block title %}Add Account - ChannelBin{% endblock %}
 
 {#  Add an account (DESIGN.md §17.1, §17.4).
@@ -18,10 +18,10 @@
 <div class="page-head">
   <h1>Add Account</h1>
 </div>
-<p class="page-sub">
+{% call page_about() %}
   An account is one IPTV provider connection. ChannelBin syncs its channel list and guide
   data on a schedule, and the first sync starts about a minute after you add it.
-</p>
+{% endcall %}
 
 <div class="form-card">
   <form method="post">

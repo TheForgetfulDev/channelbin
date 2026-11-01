@@ -4,7 +4,7 @@ import os
 import threading
 import time
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from flask import (
     Blueprint, render_template, request, redirect, url_for, flash, jsonify,
@@ -41,7 +41,7 @@ from ..recorder import (
     get_live_segment_path, recording_disk_paths, recording_image_paths, delete_files, end_capture_wait,
     finished_image_dirs, finished_image_path, MoveRequest, switch_choices, block_move_preview,
 )
-from ..tz_utils import parse_local_to_utc, local_input_value, format_local
+from ..tz_utils import parse_form_time, format_local
 from ..account_blocks import recording_blocks, set_recording_blocks, rearm_waiting_starts
 from ..accounts import normalize_url, normalize_url_loose
 from ..config import load_config, resolve_ffmpeg_path
@@ -79,12 +79,12 @@ def _parse_recording_form(form):
 
     start_utc = stop_utc = None
     try:
-        start_utc = parse_local_to_utc(start_str)
+        start_utc = parse_form_time(start_str, form.get('start_time_utc', '').strip())
     except ValueError:
         errors.append('Invalid start time.')
 
     try:
-        stop_utc = parse_local_to_utc(stop_str)
+        stop_utc = parse_form_time(stop_str, form.get('stop_time_utc', '').strip())
     except ValueError:
         errors.append('Invalid stop time.')
 
@@ -94,8 +94,51 @@ def _parse_recording_form(form):
     return name, url, start_utc, stop_utc, errors
 
 
+def _opened_window(form):
+    """The (start, stop) an edit dialog was opened on, as naive UTC to the second, or None
+    when the form did not say - a caller with no dialog, or a value with no offset, which
+    could not be read as an instant."""
+    raw = (form.get('opened_start_utc', '').strip(), form.get('opened_stop_utc', '').strip())
+    if not all(raw):
+        return None
+    try:
+        parsed = [datetime.fromisoformat(v) for v in raw]
+    except ValueError:
+        parsed = None
+    if parsed is None or any(p.tzinfo is None for p in parsed):
+        log.warning('Edit posted an unreadable opened window %r; saving without the '
+                    'moved-since-opened check', raw)
+        return None
+    return tuple(p.astimezone(timezone.utc).replace(tzinfo=None, microsecond=0) for p in parsed)
+
+
+def _window_moved(rec, opened):
+    return opened is not None and (
+        rec.start_time.replace(microsecond=0), rec.stop_time.replace(microsecond=0)) != opened
+
+
+def _window_moved_response(rec):
+    """409 for an edit made against times that changed after its dialog opened: auto-record
+    retrack moves a SCHEDULED recording with its program, and writing the old window back
+    would read as the user's own edit, which retrack then never touches again
+    (dev/docs/BUGS.md 2026-10-31 @ 11:27:32 PM ET). The current window rides along so the
+    dialog can show it."""
+    return jsonify({
+        'error': (f'This recording was moved since this dialog opened. It is now '
+                  f'{format_local(rec.start_time)} to {format_local(rec.stop_time)}. Any time '
+                  f'you did not change now shows the new one; Save again to keep your edit.'),
+        'start_time': rec.start_time.strftime('%Y-%m-%dT%H:%M:%S'),
+        'stop_time': rec.stop_time.strftime('%Y-%m-%dT%H:%M:%S'),
+    }), 409
+
+
+class _WindowMoved(Exception):
+    pass
+
+
 def _apply_edit_and_reschedule(recording_id, name, url, start_utc, stop_utc,
-                               profile_id=_UNSET, channel_id=_UNSET, member_reason=None):
+                               profile_id=_UNSET, channel_id=_UNSET, member_reason=None,
+                               opened=None):
     """Persist an edit to a SCHEDULED recording, then re-register its jobs.
 
     Only the mutate+commit is retried; the scheduler side effects must run
@@ -115,10 +158,18 @@ def _apply_edit_and_reschedule(recording_id, name, url, start_utc, stop_utc,
     (dev/changelog/471). Auto-record retrack is the one other writer that
     re-baselines them, on the same reasoning (app/auto_rules.py::_move_recording,
     dev/changelog/1188).
+
+    `opened` is the window the edit was decided against; when the row no longer holds it,
+    nothing is written and _WindowMoved is raised. Checked here, on the row re-read inside
+    the retried unit, because retrack can move it between the route's first read and this.
     """
     @retry_on_locked()
     def _apply_edit_and_commit():
-        r = db.session.get(Recording, recording_id)
+        # populate_existing: the route already loaded this row, and a plain get() answers from
+        # that copy, which cannot see a move committed since.
+        r = db.session.get(Recording, recording_id, populate_existing=True)
+        if _window_moved(r, opened):
+            raise _WindowMoved()
         if profile_id is not _UNSET:
             r.profile_id = profile_id
         old_start, old_stop = r.start_time, r.stop_time
@@ -1739,7 +1790,7 @@ def recording_detail(recording_id):
         distinct_accounts=distinct_accounts,
         event_channel_links=event_channel_links,
         shot_mtime=shot_mtime, has_shot=has_shot,
-        stop_local_input=local_input_value(rec.stop_time),
+        stop_utc_iso=rec.stop_time.strftime('%Y-%m-%dT%H:%M:%SZ'),
         thumb_enabled=thumb_enabled,
         thumb_auto_refresh_seconds=thumb_cfg.get('auto_refresh_seconds', 60),
         find_airing_url=find_airing_url,
@@ -2413,7 +2464,7 @@ def adjust_stop_time(recording_id):
     data = request.get_json(silent=True) or {}
     stop_str = data.get('stop_time', '').strip()
     try:
-        stop_utc = parse_local_to_utc(stop_str)
+        stop_utc = parse_form_time(stop_str, str(data.get('stop_time_utc') or '').strip())
     except ValueError:
         return jsonify({'error': 'Invalid stop time format'}), 400
 
@@ -2659,14 +2710,17 @@ def _create_scheduled_recording(cfg, *, name, url, start_utc, stop_utc, channel_
             db.session.commit()
 
         _log_created_after_start_and_commit()
+    else:
+        # Schedule-time half of DESIGN-prerecord-checks.md §2 (dev/changelog/478): warn now
+        # if the channel/group this recording just landed on is already failing, rather than
+        # waiting for the next scheduled test to happen to run assess_scheduled_recording_impact.
+        # Before the start is armed, so the start's own dismiss always comes after it; and
+        # not for a recording starting right away, which a pre-start warning cannot help
+        # and which used to keep one over a finished recording (dev/changelog/1361).
+        evaluate_and_alert_recording(rec, cfg)
 
     from flask import current_app
     schedule_recording(current_app._get_current_object(), rec.id, start_utc, stop_utc)
-
-    # Schedule-time half of DESIGN-prerecord-checks.md §2 (dev/changelog/478): warn now
-    # if the channel/group this recording just landed on is already failing, rather than
-    # waiting for the next scheduled test to happen to run assess_scheduled_recording_impact.
-    evaluate_and_alert_recording(rec, cfg)
 
     return rec
 
@@ -3104,6 +3158,9 @@ def edit_recording_json(recording_id):
     name, url, start_utc, stop_utc, errors = _parse_recording_form(request.form)
     if errors:
         return jsonify({'error': ' '.join(errors)}), 400
+    opened = _opened_window(request.form)
+    if _window_moved(rec, opened):
+        return _window_moved_response(rec)
 
     wanted_blocks = _parse_block_form(request.form)
     # The blocks this edit will leave in place, for the member stamp and the warning. The
@@ -3134,14 +3191,23 @@ def edit_recording_json(recording_id):
     profile_id_raw = request.form.get('profile_id', '').strip()
     profile_id = int(profile_id_raw) if profile_id_raw.isdigit() else None
 
+    # The blocks are written after the edit, so an edit refused for a moved window leaves
+    # them as they were too.
+    try:
+        _apply_edit_and_reschedule(
+            recording_id, name, url, start_utc, stop_utc, profile_id=profile_id,
+            channel_id=channel_id if member_reason is not None else _UNSET,
+            member_reason=member_reason, opened=opened)
+    except _WindowMoved:
+        db.session.rollback()
+        current = db.session.get(Recording, recording_id)
+        if current is None:
+            return jsonify({'error': 'Recording not found.'}), 404
+        return _window_moved_response(current)
+
     if wanted_blocks is not None and set_recording_blocks(recording_id, wanted_blocks):
         from ..account_blocks import rearm_waiting_starts
         rearm_waiting_starts()
-
-    _apply_edit_and_reschedule(
-        recording_id, name, url, start_utc, stop_utc, profile_id=profile_id,
-        channel_id=channel_id if member_reason is not None else _UNSET,
-        member_reason=member_reason)
 
     return jsonify({'success': True})
 

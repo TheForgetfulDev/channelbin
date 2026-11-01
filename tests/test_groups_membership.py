@@ -206,14 +206,18 @@ class SystemGroupEnforcementTests(unittest.TestCase):
         self.assertEqual(resp.status_code, 400)
 
     def test_system_group_cannot_back_a_recording(self):
-        from datetime import datetime, timedelta
-        start = datetime.now() + timedelta(hours=1)
+        from datetime import timedelta
+        from app.tz_utils import local_input_value
+        from tests.support.clock import tomorrow_local_noon
+        # Local noon: an hour from now could land in the hour a fall-back repeats, posting
+        # start == stop, and the 400 would then be for that instead.
+        start = tomorrow_local_noon()
         stop = start + timedelta(hours=1)
         resp = self.t.client.post('/recordings/new-json', data={
             'name': 'nope',
             'url': 'http://example.test/live/1',
-            'start_time': start.strftime('%Y-%m-%dT%H:%M'),
-            'stop_time': stop.strftime('%Y-%m-%dT%H:%M'),
+            'start_time': local_input_value(start),
+            'stop_time': local_input_value(stop),
             'group_id': str(self.sys_grp.id),
         })
         self.assertEqual(resp.status_code, 400)

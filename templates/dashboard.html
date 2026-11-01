@@ -89,6 +89,10 @@
       <div class="gs-b-eyebrow">Get started &middot; {{ setup.done }} of {{ setup.total }} done</div>
       <div class="gs-b-title">{{ setup.lead_word }}: {{ lead.title }}</div>
       <div class="gs-b-text">{{ lead.short }}</div>
+      {#- Leading in order must not hide a later step's problem (dev/changelog/1367). -#}
+      {%- for s in setup.also %}
+      <div class="gs-b-also">Also needs you: step {{ s.n }}, {{ s.title }}.</div>
+      {%- endfor %}
       <div class="gs-segs" aria-hidden="true">
         {%- for s in setup.steps %}<i class="gs-seg{% if loop.index <= setup.done %} done{% endif %}"></i>{% endfor -%}
       </div>
@@ -140,7 +144,7 @@
     {% if not rows %}
       {% if key == 'live' %}
         {{ empty('Nothing recording right now',
-                 'Schedule a recording from the TV Guide, or record a channel now from Channel Search.') }}
+                 'Schedule a recording from the TV Guide, or record a channel now from Search.') }}
       {% else %}
         {{ empty('Nothing scheduled',
                  'Anything you schedule from the TV Guide shows up here until it starts.') }}
@@ -354,6 +358,68 @@
             <a class="btn btn-sm" href="{{ health_check.detail_url }}">Details</a>
           </span>
         </div>
+      </div>
+    {% endif %}
+
+  {#- ── Watching now: the output feed's IPTV apps (DESIGN-output-feed.md 8). Rendered only
+        while the feed is on - the route leaves the key out of section_order otherwise.
+        Each row names what the IPTV app asked for, the channel actually playing and why a
+        session ended, so a cut is never a number nobody can explain. -#}
+  {% elif key == 'viewers' and feed %}
+    {{ sec_head(key, feed.live | length) }}
+    {% if feed.mode == 'redirect' %}
+      {% if not feed.redirects %}
+        {{ empty('No IPTV app has tuned in yet',
+                 'In redirect mode the IPTV app plays straight from the provider, so ChannelBin sees each tune-in and never when it ends.') }}
+      {% else %}
+      <div class="dash-head">
+        <span>Tuned in</span><span>Played</span><span>When</span><span>IPTV app</span><span></span><span></span>
+      </div>
+      <div class="dash-rows">
+        {% for r in feed.redirects %}
+        <div class="drow" data-href="{{ url_for('channels.channel_detail', channel_id=r.channel_id) }}">
+          <span class="d-title">
+            <span class="d-name">{{ r.label }}</span>
+            <span class="d-meta">{{ r.channel_name }}</span>
+          </span>
+          <span class="d-cell d-badge">{{ m.status_badge('b-sched', 'REDIRECTED') }}</span>
+          <span class="d-cell"><span class="d-k">When</span>{{ r.at | local_time_only }}</span>
+          <span class="d-cell"><span class="d-k">IPTV app</span>{{ r.client }}</span>
+          <span class="d-cell"></span>
+          <span class="c-actions"></span>
+        </div>
+        {% endfor %}
+      </div>
+      <div class="page-intro">ChannelBin cannot see when a redirected play ends, so these rows never close.</div>
+      {% endif %}
+    {% elif not feed.live and not feed.ended %}
+      {{ empty('No IPTV app is watching',
+               'An IPTV app that has added this ChannelBin as an Xtream account shows up here when it plays a channel.') }}
+    {% else %}
+      <div class="dash-head">
+        <span>Watching</span><span>Status</span><span>Elapsed</span><span>Relayed</span><span>IPTV app</span><span></span>
+      </div>
+      <div class="dash-rows">
+        {% for s in feed.live + feed.ended %}
+        <div class="drow{{ ' st-live' if s.state != 'STOPPED' else '' }}" data-href="{{ url_for('channels.channel_detail', channel_id=s.channel_id) }}">
+          <span class="d-title">
+            <span class="d-name">{{ s.label }}</span>
+            <span class="d-meta">
+              {%- if s.state != 'STOPPED' %}playing {{ s.channel_name }}
+              {%- else %}{{ s.reason_text }}{% if s.detail %} {{ s.detail }}{% endif %}{% endif -%}
+              {%- if s.failovers %} &middot; moved {{ s.failovers | length }}x{% endif -%}
+            </span>
+          </span>
+          <span class="d-cell d-badge">
+            {%- if s.state != 'STOPPED' %}{{ m.status_badge('b-running', 'WATCHING', pulse=true) }}
+            {%- else %}{{ m.status_badge('b-abort', 'ENDED') }}{% endif -%}
+          </span>
+          <span class="d-cell"><span class="d-k">Elapsed</span>{{ s.elapsed_seconds | duration }}</span>
+          <span class="d-cell"><span class="d-k">Relayed</span>{{ s.bytes_sent | filesize }}</span>
+          <span class="d-cell"><span class="d-k">IPTV app</span>{{ s.client }}</span>
+          <span class="c-actions"></span>
+        </div>
+        {% endfor %}
       </div>
     {% endif %}
   {% endif %}

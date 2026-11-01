@@ -43,8 +43,9 @@ SITE_URL = 'https://m3upt.com/'
 PLAYLIST_URL = 'https://m3upt.com/iptv'
 LISTINGS_URL = 'https://m3upt.com/epg'
 ACCOUNT_NAME = 'Example channels (M3UPT)'
-#: Free streams have no seat limit, and two lets a recording and a health check run at once.
-MAX_CONNECTIONS = 2
+#: Nothing measured says M3UPT allows more than one, so the account assumes one. The load
+#: needs no more: its one health check is a single channel, and nothing else streams then.
+MAX_CONNECTIONS = 1
 
 #: Picked from M3UPT's list on 2026-10-24: English-language, carried with listings, and each
 #: opened by ffprobe with no extra headers. Matched by name; one that is gone is named in the

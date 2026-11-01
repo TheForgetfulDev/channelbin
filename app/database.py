@@ -336,8 +336,8 @@ CHANNEL_TEST_DELETED = 'CHANNEL_TEST_DELETED'
 # The EPG source a channel's guide comes from moved from one source to another
 # (app/epg_sources.py, DESIGN-epg-sources.md §5.4). Written only for a move between two
 # sources: a channel gaining its first guide or losing its last is counted on the source
-# and, for a loss, named in EPG_SOURCE_COVERAGE_LOST - one event per channel per provider
-# hiccup would bury the timeline (dev/changelog/1101).
+# and, for a loss, named on the sync log and, past its threshold, in EPG_SOURCE_COVERAGE_LOST -
+# one event per channel per provider hiccup would bury the timeline (dev/changelog/1101, 1360).
 CHANNEL_EPG_SOURCE_CHANGED = 'CHANNEL_EPG_SOURCE_CHANGED'
 # The user set or cleared this channel's EPG key for one source (EpgChannelKey, written only
 # by app/epg_sources.py::set_channel_key). extra_data carries source_id, the key and what
@@ -426,6 +426,12 @@ GROUP_DEFAULT_PROFILE_SET       = 'GROUP_DEFAULT_PROFILE_SET'
 # (dev/changelog/1281) or by Keep the examples (dev/changelog/1288). The detail says
 # which. Written only by app/examples.py. Group-wide, so channel_id is NULL.
 GROUP_EXAMPLE_KEPT              = 'GROUP_EXAMPLE_KEPT'
+# An IPTV app watching this group through the output feed was moved to another member because
+# the one it was on died (app/output_feed.py, dev/docs/DESIGN-output-feed.md section 4.5).
+# A fact about the group, not a recording: no Recording row exists for a viewer. The
+# detail names the member that failed and the one that took over; channel_id is the new
+# member.
+GROUP_VIEWER_FAILOVER           = 'GROUP_VIEWER_FAILOVER'
 
 # ── What a person calls each event type ───────────────────────────────────────
 #
@@ -540,6 +546,7 @@ EVENT_LABELS = {
     GROUP_GUIDE_LISTINGS_SET: 'Guide listings changed',
     GROUP_DEFAULT_PROFILE_SET: 'Default profile changed',
     GROUP_EXAMPLE_KEPT: 'No longer an example',
+    GROUP_VIEWER_FAILOVER: 'An IPTV app was moved to another channel',
 }
 
 
@@ -864,6 +871,9 @@ def parked_restart_phrase(status, waiting_on_name, progress_pct):
 # SCHEDULED under a `start_time > now` clause matches them zero times, forever, without
 # erroring (dev/changelog/663).
 WINDOW_OPEN_STATUSES = (REC_STATUS_IN_PROGRESS, REC_STATUS_PAUSED, REC_STATUS_RETRYING)
+
+# Statuses whose capture is over for good: nothing will close a segment such a row left open.
+REC_ENDED_STATUSES = (REC_STATUS_COMPLETED, REC_STATUS_FAILED, REC_STATUS_ABORTED)
 
 
 class Recording(db.Model):
@@ -1710,6 +1720,8 @@ class Account(db.Model):
     fields on top of this table, discriminated by account_type.
     """
     __tablename__ = 'accounts'
+    # A deleted account's id is never re-issued (migration 107, dev/changelog/1373).
+    __table_args__ = {'sqlite_autoincrement': True}
 
     id                = db.Column(db.Integer, primary_key=True)
     name              = db.Column(db.String(255), nullable=False)
@@ -3460,3 +3472,35 @@ def get_job_duration_estimates(job_ids) -> dict:
 def get_job_duration_estimate(job_id: str):
     """get_job_duration_estimates() for one job: (avg_seconds, run_count), or (None, 0)."""
     return get_job_duration_estimates([job_id]).get(job_id, (None, 0))
+
+
+def latest_run_per_key(key_col, id_col, start_col, end_col, outcome_col, detail_col, keys,
+                       *criteria) -> dict:
+    """{key: (started, finished, outcome, detail)} - each key's newest row by (start_col,
+    id_col) among those matching `criteria`. One query for any number of keys, the shape
+    recent_duration_averages() uses for the average, so the Scheduled Jobs page's "last
+    run" line costs one query per history table rather than one per row (CLAUDE.md
+    no-hidden-I/O). `detail_col` may be None. A key with no matching row is absent."""
+    from sqlalchemy import null
+    keys = {k for k in keys if k is not None}
+    if not keys:
+        return {}
+    detail = detail_col if detail_col is not None else null()
+    rank = db.func.row_number().over(partition_by=key_col,
+                                     order_by=(start_col.desc(), id_col.desc())).label('rank')
+    ranked = (db.session.query(key_col.label('key'), start_col.label('started'),
+                               end_col.label('finished'), outcome_col.label('outcome'),
+                               detail.label('detail'), rank)
+              .filter(key_col.in_(keys), *criteria).subquery())
+    return {key: (started, finished, outcome, detail_text)
+            for key, started, finished, outcome, detail_text in
+            db.session.query(ranked.c.key, ranked.c.started, ranked.c.finished,
+                             ranked.c.outcome, ranked.c.detail)
+            .filter(ranked.c.rank == 1)}
+
+
+def get_job_last_runs(job_ids) -> dict:
+    """{job_id: (started_at, finished_at, outcome, None)} - the newest recorded run of each
+    job, whatever its outcome: a job that keeps failing is the case this exists to show."""
+    return latest_run_per_key(JobRun.job_id, JobRun.id, JobRun.started_at, JobRun.finished_at,
+                              JobRun.outcome, None, job_ids)

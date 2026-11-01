@@ -18,7 +18,7 @@
     const ok = await confirmModal({
       title: 'Load the example channels?',
       message: 'ChannelBin adds the M3UPT example account and syncs it now, then puts a few '
-        + 'channels in the TV Guide, makes the example channel group and runs one health check.',
+        + 'channels in the TV Guide, makes the example channel group, and runs one health check.',
       confirmLabel: 'Load the examples',
     });
     if (!ok) return;
@@ -76,9 +76,8 @@
   async function keep(btn) {
     const ok = await confirmModal({
       title: 'Keep the examples?',
-      message: 'The example account and the example channel group become ordinary ones, '
-        + 'for when M3UPT is all you want. Delete the examples no longer applies to them, and '
-        + 'Get started counts the account as yours.',
+      message: 'The "example" flag on the M3UPT account and channel group will be removed. '
+        + 'The "Get started" check counts the account as yours.',
       confirmLabel: 'Keep the examples',
     });
     if (!ok) return;

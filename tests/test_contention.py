@@ -30,6 +30,8 @@ from tests.support.app import make_test_app  # noqa: E402
 from tests.support.contention import CommitLockInjector, _locked_error  # noqa: E402
 from app import db  # noqa: E402
 from app.db_utils import retry_on_locked  # noqa: E402
+from app.tz_utils import local_input_value  # noqa: E402
+from tests.support.clock import tomorrow_local_noon  # noqa: E402
 from app.database import Recording, RecordingEvent, RECORDING_CREATED_AFTER_EVENT_START  # noqa: E402
 
 
@@ -177,17 +179,17 @@ class CreateRecordingContentionTests(unittest.TestCase):
             recorder.start_recording = self._real_start_recording
 
     def _post_past_start(self):
-        # start_time a full day in the past (in display-local terms - the form parses
-        # local and converts to UTC) → created_after_start → the SECOND commit (the
-        # CREATED_AFTER_EVENT_START event) fires, which is the one we lock. A day's
-        # margin keeps it past regardless of the display-tz UTC offset.
-        start = datetime.now() - timedelta(days=1)
-        stop = datetime.now() + timedelta(hours=1)
+        # start_time a day or more in the past → created_after_start → the SECOND commit
+        # (the CREATED_AFTER_EVENT_START event) fires, which is the one we lock. Anchored
+        # on local noon, which no DST change reaches (dev/docs/BUGS.md 2026-10-31
+        # @ 08:47:34 PM ET).
+        stop = tomorrow_local_noon()
+        start = stop - timedelta(days=2)
         return self.t.client.post('/recordings/new-json', data={
             'name': 'contention_rec',
             'url': 'http://example.test/live/9',
-            'start_time': start.strftime('%Y-%m-%dT%H:%M'),
-            'stop_time': stop.strftime('%Y-%m-%dT%H:%M'),
+            'start_time': local_input_value(start),
+            'stop_time': local_input_value(stop),
         })
 
     def test_lock_on_second_commit_yields_exactly_one_row(self):

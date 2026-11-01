@@ -13,7 +13,7 @@ conflict) exactly as it did before.
 import os
 import sys
 import unittest
-from datetime import datetime, timedelta
+from datetime import timedelta
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -23,12 +23,13 @@ from tests.support import seed  # noqa: E402
 from app import db  # noqa: E402
 from app.database import Recording, REC_STATUS_SCHEDULED  # noqa: E402
 from app.tz_utils import local_input_value, parse_local_to_utc  # noqa: E402
+from tests.support.clock import tomorrow_local_noon  # noqa: E402
 
 
 class _RecordingOverlapCase(unittest.TestCase):
     def setUp(self):
         self.t = make_test_app(csrf=False)
-        self.start = datetime.utcnow() + timedelta(hours=2)
+        self.start = tomorrow_local_noon()
         self.stop = self.start + timedelta(hours=1)
 
     def tearDown(self):

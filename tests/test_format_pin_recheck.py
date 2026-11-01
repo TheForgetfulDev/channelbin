@@ -19,7 +19,6 @@ import os
 import shutil
 import subprocess
 import sys
-import tempfile
 import time
 import unittest
 from datetime import datetime, timedelta
@@ -35,6 +34,7 @@ from app.database import RECORDING_FORMAT_CHANGED, RecordingEvent, RecordingSegm
 from app.probe import parse_ffprobe  # noqa: E402
 from app.recorder import recording_format_pin  # noqa: E402
 from app.watchdog import WatchdogThread  # noqa: E402
+from tests.support import clips  # noqa: E402
 from tests.support.watchdog import WatchdogHarness, sleeper  # noqa: E402
 
 _HAVE_FFMPEG = bool(shutil.which('ffmpeg') and shutil.which('ffprobe'))
@@ -71,12 +71,9 @@ class TailProbeTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls._dir = tempfile.mkdtemp(prefix='pinrecheck-')
-        cls.clip = _mixed_clip(cls._dir)
-
-    @classmethod
-    def tearDownClass(cls):
-        shutil.rmtree(cls._dir, ignore_errors=True)
+        # Shared with SettledFormatRecheckTests and read-only (tests/support/clips.py).
+        cls.clip = os.path.join(clips.shared(__name__, _mixed_clip, prefix='pinrecheck-'),
+                                'mixed.ts')
 
     def test_the_head_reads_the_opening_and_the_tail_the_settled_format(self):
         size = os.path.getsize(self.clip)
@@ -94,12 +91,9 @@ class SettledFormatRecheckTests(WatchdogHarness):
 
     @classmethod
     def setUpClass(cls):
-        cls._dir = tempfile.mkdtemp(prefix='pinrecheck-wd-')
-        cls.clip = _mixed_clip(cls._dir)
-
-    @classmethod
-    def tearDownClass(cls):
-        shutil.rmtree(cls._dir, ignore_errors=True)
+        # The same shared clip TailProbeTests probes; setUp copies it out, nothing writes in.
+        cls.clip = os.path.join(clips.shared(__name__, _mixed_clip, prefix='pinrecheck-'),
+                                'mixed.ts')
 
     def setUp(self):
         super().setUp()

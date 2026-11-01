@@ -50,6 +50,11 @@ class DashboardPageConformanceTests(unittest.TestCase):
         # none rewrites the state it was rendered from (dev/changelog/979).
         cls.t = make_test_app()
         cls.client = cls.t.app.test_client()
+        # The output feed on, so its Watching-now section is on the page beside the five
+        # that are always there; test_the_feed_section_exists_only_while_the_feed_is_on
+        # covers the other state.
+        cls.t.sandbox_config({'integrations': {'output_feed': {
+            'enabled': True, 'username': 'tv', 'password': 'tv'}}})
         with cls.t.app.app_context():
             acc = make_account(name='Acct One')
             ch = make_channel(acc, name='Channel One')
@@ -121,6 +126,23 @@ class DashboardPageConformanceTests(unittest.TestCase):
         hidden = {k for k, h in rendered if h}
         # `upcoming` starts off: the timeline already answers "what is booked and when".
         self.assertEqual(hidden, {'upcoming'})
+
+    def test_the_feed_section_exists_only_while_the_feed_is_on(self):
+        """An optional module that is off has no card and no Customize toggle
+        (DESIGN-output-feed.md 12): the section and its definition both leave the page."""
+        from app.routes.dashboard import DASHBOARD_FEED_SECTION
+        self.assertIn(f'data-sec="{DASHBOARD_FEED_SECTION}"', self.html)
+        self.assertIn('No IPTV app is watching', self.html)
+        self.t.sandbox_config({})
+        try:
+            html = self.client.get('/').get_data(as_text=True)
+        finally:
+            self.t.sandbox_config({'integrations': {'output_feed': {
+                'enabled': True, 'username': 'tv', 'password': 'tv'}}})
+        self.assertNotIn(f'data-sec="{DASHBOARD_FEED_SECTION}"', html)
+        defs = json.loads(re.search(r'id="dash-sections-pref">(.*?)</script>', html, re.S).group(1))
+        self.assertNotIn(DASHBOARD_FEED_SECTION, defs['defs'])
+        self.assertNotIn(DASHBOARD_FEED_SECTION, defs['order'])
 
     def test_a_hidden_section_is_hidden_by_the_attribute_not_by_a_style(self):
         """16.6's `[hidden]` reset is what makes this work, so the markup is entitled

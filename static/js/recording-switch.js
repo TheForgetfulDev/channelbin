@@ -95,13 +95,13 @@
   async function openBlock(rid) {
     const prefix = 'rec-blk';
     // A <label> heading, not .sec-title: that class is a phone-only sub-region title and is
-    // display:none on the desktop.
+    // display:none on the desktop. The hint is the record modal's own (templates/
+    // _record_modal.html::block_picker, which this page always includes), so it has one copy.
+    const hint = document.querySelector('#active-rec-blocks .form-hint')?.textContent.trim() || '';
+    if (!hint) console.warn('recording-switch: no #active-rec-blocks hint on this page; the Block dialog shows none');
     const body = `<div class="acct-block-pick form-group" id="${prefix}-blocks" style="display:none">
         <label>Block account use during this recording</label>
-        <span class="form-hint">Nothing in ChannelBin opens a stream on a blocked account while this
-          recording can still record - so a TV can watch live on it. A channel group records from
-          members on other accounts; with nowhere else to go, the recording waits for the block to end
-          and records what is left.</span>
+        <span class="form-hint">${esc(hint.replace(/\s+/g, ' '))}</span>
         <input type="hidden" id="${prefix}-blocks-loaded" value="">
         <span id="${prefix}-blocks-count" hidden></span>
         <div id="${prefix}-blocks-list"></div>

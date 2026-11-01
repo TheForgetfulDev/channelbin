@@ -14,7 +14,6 @@ import os
 import shutil
 import subprocess
 import sys
-import tempfile
 import unittest
 from datetime import datetime, timedelta
 from unittest import mock
@@ -28,7 +27,7 @@ from app.alerts import GPU_ENCODER_UNAVAILABLE  # noqa: E402
 from app.database import (Alert, Recording, RecordingEvent, RecordingSegment, CONVERSION_DONE,  # noqa: E402
                           DIAGNOSTICS)
 from app.postprocessor import ConversionResult, do_postprocess  # noqa: E402
-from tests.support import seed  # noqa: E402
+from tests.support import clips, seed  # noqa: E402
 from tests.support.app import make_test_app  # noqa: E402
 
 _HAVE_FFMPEG = bool(shutil.which('ffmpeg') and shutil.which('ffprobe'))
@@ -110,31 +109,31 @@ def _trial(rc, tail='', by_codec=None):
     return run
 
 
+def _build_sources(d):
+    """The source clips every class reads from, built once per process (tests/support/clips.py)."""
+    # 720p29.97 stereo, then 1080p59.94 5.1: a failover onto a bigger member.
+    _clip(os.path.join(d, 'a720.ts'), '1280x720', '30000/1001', 2)
+    _clip(os.path.join(d, 'b1080.ts'), '1920x1080', '60000/1001', 6)
+    _concat(os.path.join(d, 'mixed.ts'),
+            [os.path.join(d, 'a720.ts'), os.path.join(d, 'b1080.ts')], d)
+    _clip(os.path.join(d, 'int.ts'), '1920x1080', '60000/1001', 2,
+          vf='tinterlace=mode=interleave_top,setfield=tff',
+          extra=('-flags', '+ildct+ilme', '-x264opts', 'tff=1'))
+    _clip(os.path.join(d, 'ana.ts'), '1440x1080', '25', 2, vf='setsar=4/3')
+    # setparams, not -color_trc: the encoder takes its color tags from the frames.
+    pq = 'setparams=color_trc=smpte2084:color_primaries=bt2020:colorspace=bt2020nc'
+    _clip(os.path.join(d, 'hdr.ts'), '1280x720', '25', 2, vf=pq)
+    _clip(os.path.join(d, 'hdr1080.ts'), '1920x1080', '50', 2, vf=pq)
+    _concat(os.path.join(d, 'hdrmixed.ts'),
+            [os.path.join(d, 'hdr.ts'), os.path.join(d, 'hdr1080.ts')], d)
+
+
 @unittest.skipUnless(_HAVE_FFMPEG, 'needs ffmpeg and ffprobe on PATH')
 class _NormalizeCase(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.src = tempfile.mkdtemp(prefix='normalize-src-')
-        d = cls.src
-        # 720p29.97 stereo, then 1080p59.94 5.1: a failover onto a bigger member.
-        _clip(os.path.join(d, 'a720.ts'), '1280x720', '30000/1001', 2)
-        _clip(os.path.join(d, 'b1080.ts'), '1920x1080', '60000/1001', 6)
-        _concat(os.path.join(d, 'mixed.ts'),
-                [os.path.join(d, 'a720.ts'), os.path.join(d, 'b1080.ts')], d)
-        _clip(os.path.join(d, 'int.ts'), '1920x1080', '60000/1001', 2,
-              vf='tinterlace=mode=interleave_top,setfield=tff',
-              extra=('-flags', '+ildct+ilme', '-x264opts', 'tff=1'))
-        _clip(os.path.join(d, 'ana.ts'), '1440x1080', '25', 2, vf='setsar=4/3')
-        # setparams, not -color_trc: the encoder takes its color tags from the frames.
-        pq = 'setparams=color_trc=smpte2084:color_primaries=bt2020:colorspace=bt2020nc'
-        _clip(os.path.join(d, 'hdr.ts'), '1280x720', '25', 2, vf=pq)
-        _clip(os.path.join(d, 'hdr1080.ts'), '1920x1080', '50', 2, vf=pq)
-        _concat(os.path.join(d, 'hdrmixed.ts'),
-                [os.path.join(d, 'hdr.ts'), os.path.join(d, 'hdr1080.ts')], d)
-
-    @classmethod
-    def tearDownClass(cls):
-        shutil.rmtree(cls.src, ignore_errors=True)
+        # Shared and read-only: _use() copies out of it, nothing writes into it.
+        cls.src = clips.shared(__name__, _build_sources, prefix='normalize-src-')
 
     def setUp(self):
         toolchain.reset_cache()

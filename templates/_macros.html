@@ -87,6 +87,17 @@
 
 {# ── App design-system macros (DESIGN.md section 3) ── #}
 
+{# What a page is for (3.21), directly under its .page-head. Rendered closed and never opened
+   by the server: a returning user should not scroll past it on every visit, and the one
+   visible line is how a new user finds it. A native <details>, so it needs no script and the
+   browser's find-in-page still reaches the text. #}
+{% macro page_about() -%}
+<details class="page-about">
+  <summary>{{ icon('about') }}<span>About this page</span>{{ icon('expand', 'pa-caret') }}</summary>
+  <div class="page-about-body">{{ caller() }}</div>
+</details>
+{%- endmacro %}
+
 {# Status badge (3.4): cls = b-live/b-done/b-sched/b-fail/b-abort/b-concat/b-paused/
    b-retry/b-running/b-warn. A raw Recording.status gets its cls from the `rec_status_badge`
    filter and a ChannelTest from `test_status_badge` - never a class glued from the status,
@@ -196,7 +207,7 @@
    that lists the rules. A bare "(3 hidden)" left a first-time user asking what hid them
    (dev/changelog/1291). #}
 {% macro hidden_channels_link(n) -%}
-<a class="hidden-link tip-plain" href="{{ url_for('channel_hide_rules.hide_rules_page') }}" data-tip="Hidden channels.&#10;A hide rule, or Hide channel on a channel's own page, keeps these out of search, the pickers and the guide import. ChannelBin starts with rules that hide the divider rows providers list between sections. Hide Rules lists every rule and what it matches.">{{ '{:,}'.format(n) }} hidden</a>
+<a class="hidden-link tip-plain" href="{{ url_for('channel_hide_rules.hide_rules_page') }}" data-tip="Hidden channels.&#10;A hide rule, or Hide channel on a channel's own page, keeps these out of search, the pickers and the guide import. ChannelBin starts with rules that hide the divider rows providers list between sections. Hide Channels lists every rule and what it matches.">{{ '{:,}'.format(n) }} hidden</a>
 {%- endmacro %}
 
 {# Card header (3.3). #}
@@ -222,7 +233,10 @@
    `tier` is 'basic' or 'advanced' on every call with a path (DESIGN.md 15.9). It
    has a default only because Jinja refuses a bare argument after defaulted ones:
    a missing tier renders an empty data-tier, and
-   tests/test_static_invariants.py::SettingsTierDeclaredTests fails the build.
+   tests/test_static_invariants.py::SettingsTierDeclaredTests fails the build. A row
+   with no path (a notice, not a setting) may still pass a tier to choose its view.
+   data-hay is tag-stripped: a label carrying icon() is Markup, which skips escaping, and
+   its quotes once ended the attribute early (dev/changelog/1369).
    `changed_paths` comes from the page's context when it imports this macro `with
    context` (Settings does; dev/changelog/1006): a changed row carries data-changed, which
    shows the "Changed from default" mark under its control. Every row renders the mark so
@@ -242,8 +256,8 @@
 {% macro field_shell(path, label, description, restart=false, readonly=false, hay='', full=false, row_class='', tier=none, gated_by=none, overridable_by=none) %}
 {%- set changed = path and changed_paths is defined and path in changed_paths %}
 {%- set default_disp = '' if readonly else default_display(path) %}
-<div class="frow{{ ' full' if full else '' }}{{ ' ' ~ row_class if row_class else '' }}"{% if path %} data-path="{{ path }}" data-tier="{{ tier or '' }}"{% endif %}{% if changed %} data-changed="true"{% endif %}{% if gated_by %} data-gated-by="{{ gated_by|join(' ') }}"{% endif %}
-     data-hay="{{ (label ~ ' ' ~ description ~ ' ' ~ default_disp ~ ' ' ~ path ~ ' ' ~ hay)|lower }}">
+<div class="frow{{ ' full' if full else '' }}{{ ' ' ~ row_class if row_class else '' }}"{% if path %} data-path="{{ path }}"{% endif %}{% if path or tier %} data-tier="{{ tier or '' }}"{% endif %}{% if changed %} data-changed="true"{% endif %}{% if gated_by %} data-gated-by="{{ gated_by|join(' ') }}"{% endif %}
+     data-hay="{{ (label ~ ' ' ~ description ~ ' ' ~ default_disp ~ ' ' ~ path ~ ' ' ~ hay)|striptags|lower }}">
   <div class="fl">
     <div class="fl-label"><span class="fl-name">{{ label }}</span>{% if restart %} <span class="restart-badge">{{ icon('restart') }} restart required</span>{% endif %}{% if readonly %} <span class="restart-badge">read-only - edit in config.yaml</span>{% endif %}{% if overridable_by %} <a class="override-badge" href="{{ url_for(OVERRIDE_BADGES[overridable_by][1]) }}">{{ OVERRIDE_BADGES[overridable_by][0] }}</a>{% endif %}{% if gated_by %} <span class="gate-badge" hidden></span>{% endif %}{% if tier == 'advanced' %} <span class="tier-badge">Advanced</span>{% endif %}</div>
     <div class="fl-desc">{{ description }}</div>

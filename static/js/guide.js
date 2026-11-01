@@ -1876,12 +1876,10 @@ function applyProfilePadding() {
   // Never clobber a field the user has already typed into by hand - only the
   // untouched field gets recomputed from the program's own unpadded start/stop.
   if (!_modalStartEdited) {
-    document.getElementById('modal-start').value =
-      dateToTzInputValue(new Date(addSecondsToUtcIso(_modalBaseStartIso, -preMin * 60) + 'Z'), TZ);
+    modalTimes().start.set(new Date(addSecondsToUtcIso(_modalBaseStartIso, -preMin * 60) + 'Z'));
   }
   if (!_modalStopEdited) {
-    document.getElementById('modal-stop').value =
-      dateToTzInputValue(new Date(addSecondsToUtcIso(_modalBaseStopIso, postMin * 60) + 'Z'), TZ);
+    modalTimes().stop.set(new Date(addSecondsToUtcIso(_modalBaseStopIso, postMin * 60) + 'Z'));
   }
 
   if (note) {
@@ -1917,11 +1915,11 @@ function applyProfilePadding() {
 function applyLateNote() {
   const note = document.getElementById('modal-late-note');
   if (!note) return;
-  const startVal = document.getElementById('modal-start').value;
+  const start = modalTimes().start.instant();
   const now = Date.now();
   const progStart = _modalBaseStartIso ? new Date(`${_modalBaseStartIso}Z`).getTime() : NaN;
   const progStop = _modalBaseStopIso ? new Date(`${_modalBaseStopIso}Z`).getTime() : NaN;
-  const startsPast = Boolean(startVal) && tzInputValueToDate(startVal, TZ).getTime() <= now;
+  const startsPast = Boolean(start) && start.getTime() <= now;
   const late = _modalLateApplicable && startsPast && progStart < now && progStop > now;
   applyRecordNowLabels(late);
   if (!late) {
@@ -1963,6 +1961,33 @@ function applyProfileName() {
     { type: 'error' }));
 }
 
+// The record dialog's two time fields and the active recording's stop field, built on first
+// use: every caller of openModal reaches it from a click, after the markup exists.
+let _modalTimes = null;
+function modalTimes() {
+  if (!_modalTimes) {
+    const field = (id, onPick = null) => wallTimeField(document.getElementById(id), {
+      hidden: document.getElementById(`${id}-utc`), note: document.getElementById(`${id}-dst`),
+      onPick,
+    });
+    // A picked pass is the user's, like a typed time: padding and a 409 refill leave it.
+    _modalTimes = {
+      start: field('modal-start', () => { _modalStartEdited = true; applyLateNote(); }),
+      stop: field('modal-stop', () => { _modalStopEdited = true; }),
+      activeStop: field('active-rec-stop'),
+    };
+  }
+  return _modalTimes;
+}
+
+// The window an edit was opened on, sent back with the save so the server can refuse one
+// made after retrack or another tab moved the recording (dev/docs/BUGS.md 2026-10-31
+// @ 11:27:32 PM ET). Empty for a new recording.
+function setOpenedWindow(startIso, stopIso) {
+  document.getElementById('modal-opened-start').value = startIso ? `${startIso}Z` : '';
+  document.getElementById('modal-opened-stop').value = stopIso ? `${stopIso}Z` : '';
+}
+
 function openModal(prog, ch, opts = {}) {
   const isActive = prog.has_recording && prog.recording_id &&
     (prog.recording_status === 'IN_PROGRESS' || prog.recording_status === 'PAUSED' ||
@@ -1993,8 +2018,6 @@ function openModal(prog, ch, opts = {}) {
 
   const startSrc = isEdit ? prog.recording_start_time : prog.start_time;
   const stopSrc  = isEdit ? prog.recording_stop_time  : prog.stop_time;
-  const startET  = dateToTzInputValue(new Date(startSrc + 'Z'), TZ);
-  const stopET   = dateToTzInputValue(new Date(stopSrc + 'Z'), TZ);
 
   document.getElementById('modal-name').value       = prog.suggested_name || prog.title;
   document.getElementById('modal-url').value        = prog.stream_url;
@@ -2006,8 +2029,10 @@ function openModal(prog, ch, opts = {}) {
   // program would otherwise stay open for the next.
   const urlPick = document.getElementById('modal-url-pick');
   if (urlPick) urlPick.open = false;
-  document.getElementById('modal-start').value      = startET;
-  document.getElementById('modal-stop').value       = stopET;
+  modalTimes().start.set(new Date(startSrc + 'Z'));
+  modalTimes().stop.set(new Date(stopSrc + 'Z'));
+  if (isEdit && !replaceRecId) setOpenedWindow(startSrc, stopSrc);
+  else setOpenedWindow(null, null);
   document.getElementById('modal-epg-id').value     = prog.id;
   // Prefer the program's own channel_id: a group row's ch.id is the synthetic
   // 'g<id>' DOM key, while prog.channel_id is the group's real active member.
@@ -2115,8 +2140,8 @@ function followStartingRecording() {
 
 async function submitModalForm(form, data) {
   const isReplace = document.getElementById('modal-replace-id').value !== '';
-  const startVal = document.getElementById('modal-start').value;
-  const startsNow = Boolean(startVal) && tzInputValueToDate(startVal, TZ).getTime() <= Date.now();
+  const start = modalTimes().start.instant();
+  const startsNow = Boolean(start) && start.getTime() <= Date.now();
   try {
     const resp = await jsonFetch(form.action, { method: 'POST', body: data });
     if (resp && resp.success === false) {
@@ -2134,6 +2159,14 @@ async function submitModalForm(form, data) {
     if (typeof window.onScheduleSaved === 'function') window.onScheduleSaved();
     if (startsNow) followStartingRecording();
   } catch (e) {
+    // An edit refused because the recording moved since the dialog opened: every time the
+    // user did not type takes the window it is on now, so a second Save is a decision made
+    // against the real times; a typed one is theirs and stays.
+    if (e.status === 409 && e.data && e.data.start_time && e.data.stop_time) {
+      if (!_modalStartEdited) modalTimes().start.set(new Date(`${e.data.start_time}Z`));
+      if (!_modalStopEdited) modalTimes().stop.set(new Date(`${e.data.stop_time}Z`));
+      setOpenedWindow(e.data.start_time, e.data.stop_time);
+    }
     showModalError(e.message || 'Request failed. Check your connection.', e.data && e.data.conflicts);
   }
 }
@@ -2171,8 +2204,7 @@ function openActiveRecModal(prog) {
   document.getElementById('active-rec-name').textContent = prog.title +
     (prog.channel_name ? '  -  ' + prog.channel_name : '');
 
-  const stopET = dateToTzInputValue(new Date(prog.recording_stop_time + 'Z'), TZ);
-  document.getElementById('active-rec-stop').value = stopET;
+  modalTimes().activeStop.set(new Date(prog.recording_stop_time + 'Z'));
 
   document.getElementById('active-rec-detail-anchor').href =
     GUIDE_CONFIG.recDetailUrlBase + prog.recording_id;
@@ -3299,7 +3331,9 @@ document.addEventListener('DOMContentLoaded', function () {
     try {
       await jsonFetch('/recordings/' + recId + '/adjust-stop', {
         method: 'POST',
-        body: JSON.stringify({ stop_time: stopVal }),
+        body: JSON.stringify({
+          stop_time: stopVal, stop_time_utc: modalTimes().activeStop.utc(),
+        }),
       });
       // A running recording on an account this now blocks moves off it within its
       // watchdog's next check (app/watchdog.py::_check_account_block).

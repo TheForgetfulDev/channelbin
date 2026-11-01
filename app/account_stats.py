@@ -51,7 +51,7 @@ from bisect import bisect_right
 from collections import defaultdict
 from datetime import date, datetime, timedelta
 
-from sqlalchemy import case, func
+from sqlalchemy import bindparam, case, exists, func, or_, select
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from . import admission, db
@@ -59,7 +59,8 @@ from .channel_groups import DEFAULT_FAILING_STREAK_THRESHOLD, guide_scope_channe
 from .channel_search import effective_health, health_band_expr
 from .database import (Account, AccountStatDay, AccountStatState, Channel, ChannelEvent,
                        ChannelGroup, ChannelGroupMember, ChannelTest, EPGEntry,
-                       RecordingSegment, CHANNEL_FAILOVER_HEALTH_OBSERVATION,
+                       Recording, RecordingSegment, REC_ENDED_STATUSES,
+                       CHANNEL_FAILOVER_HEALTH_OBSERVATION,
                        CHANNEL_FAST_DELIVERY_HEALTH_OBSERVATION,
                        CHANNEL_PLACEHOLDER_HEALTH_OBSERVATION,
                        CHANNEL_STALL_DEMOTION_HEALTH_OBSERVATION, TEST_STATUS_COMPLETED,
@@ -126,6 +127,29 @@ def _first_unfinished_id(model, finished_col, watermark):
             .filter(model.id > watermark, finished_col.is_(None)).scalar())
 
 
+# How long after a recording ended its open segment still holds the watermark. A terminal
+# path commits the status first and closes the segment in a later commit (abort kills
+# ffmpeg and reads its stderr spool in between), so a segment on a just-ended recording is
+# usually about to close with its real length; passing it in that gap would lose the whole
+# capture from the ledger for good. An hour is far past any teardown, and a recording with
+# no completed_at keeps holding until the startup sweep closes its segment.
+_ENDED_SEGMENT_GRACE = timedelta(hours=1)
+
+
+def _first_unfinished_segment_id(watermark):
+    """The lowest open segment that can still close. One left open on a recording that
+    ended over `_ENDED_SEGMENT_GRACE` ago never will, so it must not hold the watermark - the
+    fold passes it with no capture time, and the startup sweep closes it out loud
+    (dev/changelog/1374)."""
+    settled = datetime.utcnow() - _ENDED_SEGMENT_GRACE
+    return (db.session.query(func.min(RecordingSegment.id))
+            .join(Recording, Recording.id == RecordingSegment.recording_id)
+            .filter(RecordingSegment.id > watermark, RecordingSegment.ended_at.is_(None),
+                    or_(Recording.status.notin_(REC_ENDED_STATUSES),
+                        Recording.completed_at.is_(None),
+                        Recording.completed_at > settled)).scalar())
+
+
 def _local_day(dt, tz):
     return tz_utils.to_local(dt, tz).date().isoformat()
 
@@ -133,7 +157,7 @@ def _local_day(dt, tz):
 def _fold_segments(state, tz, inc, limit):
     """Add segments above the watermark to `inc`. Returns (new watermark, more pending)."""
     wm = state.segment_watermark
-    stop = _first_unfinished_id(RecordingSegment, RecordingSegment.ended_at, wm)
+    stop = _first_unfinished_segment_id(wm)
     q = (db.session.query(RecordingSegment.id, RecordingSegment.recording_id,
                           Channel.account_id, RecordingSegment.started_at,
                           RecordingSegment.ended_at, RecordingSegment.stall_count,
@@ -146,9 +170,9 @@ def _fold_segments(state, tz, inc, limit):
     if not rows:
         return wm, False
 
-    # The first joined segment of each recording on each account. Every lower id is already
-    # finished (the watermark never passes an unfinished row), so "the minimum id among
-    # joined segments" is final by the time any segment is folded.
+    # The first joined segment of each recording on each account. Segment ids only grow and
+    # every lower id has already been passed, so "the minimum id among joined segments" is
+    # final by the time any segment is folded.
     rec_ids = {r.recording_id for r in rows}
     firsts = {sid for (sid,) in (
         db.session.query(func.min(RecordingSegment.id))
@@ -164,7 +188,8 @@ def _fold_segments(state, tz, inc, limit):
         day['segments'] += 1
         day['stalls'] += r.stall_count or 0
         if r.excluded_reason is None:
-            day['capture_seconds'] += max(0.0, (r.ended_at - r.started_at).total_seconds())
+            if r.ended_at is not None:
+                day['capture_seconds'] += max(0.0, (r.ended_at - r.started_at).total_seconds())
             if r.id in firsts:
                 day['recordings'] += 1
     return rows[-1].id, len(rows) == limit
@@ -213,7 +238,16 @@ def _fold_events(state, tz, inc, limit):
     return ceiling, False
 
 
-_INSERT_DAY = sqlite_insert(AccountStatDay.__table__)
+_DAY_COLUMNS = ('account_id', 'day') + _LEDGER_COLUMNS
+# The fold reads Channel.account_id in an earlier statement than this one, and Python's
+# sqlite3 opens no transaction for a SELECT, so an account delete can commit in between.
+# The existence check therefore lives inside the writing statement, which runs on the latest
+# snapshot once it holds the write lock: a gone account's day is dropped, never written
+# after its delete has cleared the ledger (dev/changelog/1373).
+_INSERT_DAY = sqlite_insert(AccountStatDay.__table__).from_select(
+    _DAY_COLUMNS,
+    select(*(bindparam(c, type_=AccountStatDay.__table__.c[c].type) for c in _DAY_COLUMNS))
+    .where(exists().where(Account.__table__.c.id == bindparam('account_id'))))
 _UPSERT = _INSERT_DAY.on_conflict_do_update(
     index_elements=['account_id', 'day'],
     set_={c: AccountStatDay.__table__.c[c] + _INSERT_DAY.excluded[c] for c in _LEDGER_COLUMNS})
@@ -228,13 +262,25 @@ def _fold_chunk(tz, tz_name, limit):
 
     @retry_on_locked()
     def _fold_and_commit():
-        state = _state() or _new_state(tz_name)
+        state = _state()
+        created = state is None
+        if created:
+            state = _new_state(tz_name)
         inc = defaultdict(lambda: defaultdict(float))
         seg_wm, seg_more = _fold_segments(state, tz, inc, limit)
         test_wm, test_more = _fold_tests(state, tz, inc, limit)
         event_wm, event_more = _fold_events(state, tz, inc, limit)
         passed = ((seg_wm - state.segment_watermark) + (test_wm - state.test_watermark)
                   + (event_wm - state.event_watermark))
+        more = seg_more or test_more or event_more
+        rebuild_finished = not more and state.rebuild_started_at is not None and (
+            state.rebuilt_at is None or state.rebuilt_at < state.rebuild_started_at)
+
+        if not (passed or created or rebuild_finished):
+            # Nothing moved, so nothing is written: a page view during a recording must not
+            # queue for the one SQLite writer to commit a no-op (dev/changelog/1374).
+            db.session.rollback()
+            return 0, more
 
         if inc:
             # One executemany upsert on uq_account_stat_day, adding to whatever the day
@@ -249,11 +295,9 @@ def _fold_chunk(tz, tz_name, limit):
         state.segment_watermark = max(state.segment_watermark, seg_wm)
         state.test_watermark = max(state.test_watermark, test_wm)
         state.event_watermark = max(state.event_watermark, event_wm)
-        more = seg_more or test_more or event_more
         now = datetime.utcnow()
         state.refreshed_at = now
-        if not more and state.rebuild_started_at is not None and (
-                state.rebuilt_at is None or state.rebuilt_at < state.rebuild_started_at):
+        if rebuild_finished:
             state.rebuilt_at = now
             log.info('Account stats ledger rebuild finished')
         db.session.commit()
@@ -336,15 +380,23 @@ def rebuild_ledger(reason='requested'):
 
 
 def pending_rows():
-    """Source rows above the watermarks - an upper bound on what the next fold reads."""
+    """Source rows the next fold can pass - an upper bound on what it reads. Rows behind an
+    unfinished segment or test are not counted: while a recording runs, its open segment
+    holds every later one back, and counting them sent every Accounts page view into a fold
+    that could pass nothing (dev/changelog/1374)."""
     state = _state()
     seg_wm = state.segment_watermark if state else 0
     test_wm = state.test_watermark if state else 0
     event_wm = state.event_watermark if state else 0
-    return (db.session.query(func.count(RecordingSegment.id))
-            .filter(RecordingSegment.id > seg_wm).scalar()
-            + db.session.query(func.count(ChannelTest.id))
-            .filter(ChannelTest.id > test_wm).scalar()
+    segs = db.session.query(func.count(RecordingSegment.id)).filter(RecordingSegment.id > seg_wm)
+    seg_stop = _first_unfinished_segment_id(seg_wm)
+    if seg_stop is not None:
+        segs = segs.filter(RecordingSegment.id < seg_stop)
+    tests = db.session.query(func.count(ChannelTest.id)).filter(ChannelTest.id > test_wm)
+    test_stop = _first_unfinished_id(ChannelTest, ChannelTest.test_ended_at, test_wm)
+    if test_stop is not None:
+        tests = tests.filter(ChannelTest.id < test_stop)
+    return (segs.scalar() + tests.scalar()
             + db.session.query(func.count(ChannelEvent.id))
             .filter(ChannelEvent.id > event_wm).scalar())
 

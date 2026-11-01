@@ -66,7 +66,7 @@ def remove_examples():
 
 @setup_bp.route('/api/examples/keep', methods=['POST'])
 def keep_examples():
-    """Keep the examples: the example account and group become ordinary ones."""
+    """Keep the examples: the "example" flag comes off the example account and group."""
     kept, message = examples.keep()
     if not kept:
         return jsonify({'error': message}), 409

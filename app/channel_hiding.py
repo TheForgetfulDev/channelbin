@@ -498,7 +498,7 @@ def apply_default_rules() -> None:
     hidden = db.session.query(func.count(Channel.id)).filter(
         Channel.hidden_reason == HIDE_REASON_NAME_GLOB).scalar() or 0
     log.info('Default hide rules for provider divider rows applied: %d channel(s) now hidden '
-             'by a name rule. Delete the rules on Hide Rules to list those rows again.', hidden)
+             'by a name rule. Delete the rules on Hide Channels to list those rows again.', hidden)
 
 
 # ---------------------------------------------------------------------------

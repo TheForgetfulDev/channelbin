@@ -254,11 +254,13 @@ class DeadThreadIsReportedTests(_LiveSchedulerCase):
             self.assertFalse(sched.scheduler_is_live())
 
     def test_the_activity_chip_drops_the_upcoming_jobs_of_a_dead_loop(self):
-        from datetime import timedelta
+        from datetime import timedelta, timezone
         # A named system job inside the chip's one-hour window, so the live answer and
-        # the dead answer differ on this seed.
-        sched._add_job(func=_probe_job, trigger='date',
-                       run_date=datetime.utcnow() + timedelta(minutes=5),
+        # the dead answer differ on this seed. On its real daily cadence: the chip dims
+        # only for a job that recurs less often than hourly (dev/changelog/1353), and a
+        # one-shot wearing a housekeeping job's id is not a shape the scheduler produces.
+        sched._add_job(func=_probe_job, trigger='interval', hours=24,
+                       next_run_time=datetime.now(timezone.utc) + timedelta(minutes=5),
                        id='config_backup_daily', replace_existing=True)
 
         def background():

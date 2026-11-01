@@ -7,10 +7,11 @@
 {% macro block_picker(prefix) -%}
 <details class="form-group form-disclose acct-block-pick" id="{{ prefix }}-blocks" style="display:none">
   <summary>Block account use during this recording<span id="{{ prefix }}-blocks-count"></span></summary>
-  <span class="form-hint">Nothing in ChannelBin opens a stream on a blocked account while this
-    recording can still record - so a TV can watch live on it. A channel group records from
-    members on other accounts; with nowhere else to go, the recording waits for the block to end
-    and records what is left.</span>
+  {#- static/js/recording-switch.js::openBlock() copies this hint into the running recording's
+      Block dialog, so this is its only copy. -#}
+  <span class="form-hint">This recording will prevent using the account(s) you
+    block here, even if the top channel in the group is on that account. If there are no other
+    accounts available, the recording waits for the block to end.</span>
   <input type="hidden" name="block_accounts_loaded" id="{{ prefix }}-blocks-loaded" value="">
   <div id="{{ prefix }}-blocks-list"></div>
 </details>
@@ -31,6 +32,15 @@
       <input type="hidden" name="group_id" id="modal-group-id" value="">
       {# Set only by "Find Another Airing" replace mode (guide.js openModal) #}
       <input type="hidden" name="replace_recording_id" id="modal-replace-id" value="">
+      {# The instant each time field holds, which bare wall text cannot say inside an hour a
+         DST change repeats; kept by util.js::wallTimeField, preferred by
+         app/tz_utils.py::parse_form_time. The opened_* pair is the window an edit was
+         opened on, so a save made after something else moved it is refused
+         (app/routes/recordings.py::edit_recording_json). #}
+      <input type="hidden" name="start_time_utc" id="modal-start-utc" value="">
+      <input type="hidden" name="stop_time_utc" id="modal-stop-utc" value="">
+      <input type="hidden" name="opened_start_utc" id="modal-opened-start" value="">
+      <input type="hidden" name="opened_stop_utc" id="modal-opened-stop" value="">
       <div class="modal-body">
         <div id="modal-error" style="display:none; color: var(--bad); margin-bottom: 0.75rem; font-size: var(--fs-lg);"></div>
         {# The program being scheduled, in full - title, subtitle, airtime, length, channel,
@@ -65,6 +75,8 @@
             <input type="datetime-local" name="stop_time" id="modal-stop" class="form-control" required>
           </div>
         </div>
+        <div id="modal-start-dst" class="notice notice-warn" style="display:none"></div>
+        <div id="modal-stop-dst" class="notice notice-warn" style="display:none"></div>
         <div id="modal-padding-note" class="notice notice-info" style="display:none"></div>
         <div class="form-group">
           <div class="form-label-row">
@@ -126,6 +138,7 @@
         <input type="datetime-local" id="active-rec-stop" class="form-control">
         <span class="form-hint">Must be in the future. Changes take effect immediately.</span>
       </div>
+      <div id="active-rec-stop-dst" class="notice notice-warn" style="display:none"></div>
       {{ block_picker('active-rec') }}
       <div style="margin-bottom: 0.75rem;">
         <a id="active-rec-detail-anchor" href="#" class="btn btn-sm" target="_blank">View recording details {{ icon('forward') }}</a>

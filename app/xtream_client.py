@@ -14,6 +14,8 @@ import requests
 
 from .config import load_config, resolve_app_path, ensure_private_dir, DEFAULT_XTREAM_DUMP_DIR
 from . import db
+from .fmt_utils import fmt_bytes
+from .url_utils import mask_account_urls_in_text
 from .accounts import (ProviderAccountInactive, _looks_like_m3u, _request_headers,
                        _parse_m3u_as_streams, check_xtream_auth)
 
@@ -144,6 +146,10 @@ class XtreamClient:
         self._catalog_cache: list | None = None
         self._catalog_attempted: bool = False
         self._catalog_m3u_text: str | None = None
+        # Why the catalog could not be used, in words that go straight into the sync log and
+        # the alert - None while it is usable or not yet asked. Masked, since a requests
+        # exception names the credentialed URL it fetched.
+        self.catalog_problem: str | None = None
 
     def _api_url(self) -> str:
         return f'{self.base_url}/player_api.php'
@@ -163,26 +169,39 @@ class XtreamClient:
             resp = self._fetch(self._api_url(),
                                dict(self._base_params, action='get_live_streams'))
         except Exception as exc:
-            log.warning('Live catalog unavailable (fetch failed): %s', exc)
-            return None
+            return self._catalog_unusable(f'the request failed: {exc}')
         text = resp.text.strip()
+        answer = f'HTTP {resp.status_code}, {fmt_bytes(len(resp.content))}'
         if _looks_like_m3u(text):
             # A server answering the JSON endpoint with a playlist has no separate live
             # catalog to consult, so it cannot act as a classification authority.
-            log.info('Live catalog endpoint returned M3U (%d bytes), not JSON', len(resp.content))
             self._catalog_m3u_text = text
-            return None
+            return self._catalog_unusable(
+                f'the provider answered with an M3U playlist instead of its JSON channel list '
+                f'({answer})')
         try:
             rows = resp.json()
-        except Exception:
-            log.warning('Live catalog unavailable: non-JSON response (%s)',
-                        text[:120].replace('\n', ' '))
-            return None
+        except ValueError:
+            preview = text[:120].replace('\n', ' ')
+            return self._catalog_unusable(
+                f'the provider\'s answer was not JSON ({answer}), starting "{preview}"')
         if not isinstance(rows, list):
-            log.warning('Live catalog unavailable: unexpected payload type %s', type(rows).__name__)
-            return None
+            shape = 'an object' if isinstance(rows, dict) else f'a {type(rows).__name__}'
+            return self._catalog_unusable(
+                f'the provider answered with {shape} instead of a list of channels ({answer})')
+        if not rows:
+            # Never "no live channels": a provider with a playlist full of them is not out of
+            # live channels, its catalog came back empty. Silent until dev/changelog/1359.
+            return self._catalog_unusable(
+                f'the provider answered with an empty list ({answer}), naming no live channels '
+                f'at all')
         self._catalog_cache = rows
         return rows
+
+    def _catalog_unusable(self, why: str) -> None:
+        self.catalog_problem = mask_account_urls_in_text(why, self.base_url)
+        log.warning('Live catalog unavailable: %s', self.catalog_problem)
+        return None
 
     def _fetch(self, url: str, params: dict) -> requests.Response:
         resp = requests.get(url, params=params, timeout=self.timeout, headers=self._headers)
@@ -356,6 +375,7 @@ class FileXtreamClient:
         self.base_url = base_url.rstrip('/')
         self.username = username
         self.password = password
+        self.catalog_problem: str | None = None   # XtreamClient.catalog_problem's twin
 
     def check_auth(self) -> dict:
         with open(os.path.join(self.dump_dir, 'auth.json'), encoding='utf-8') as f:
@@ -385,10 +405,12 @@ class FileXtreamClient:
     def get_live_stream_ids(self) -> tuple[set, set] | None:
         p = os.path.join(self.dump_dir, 'live_streams_json_api.json')
         if not os.path.exists(p):
+            self.catalog_problem = 'the dump being synced from holds no live channel list'
             return None
         with open(p, encoding='utf-8') as f:
             rows = json.load(f)
         if not isinstance(rows, list) or not rows:
+            self.catalog_problem = 'the dump being synced from holds an empty live channel list'
             return None
         return _live_keys_from_json(rows)
 
@@ -513,12 +535,15 @@ def dump_xtream_account(app, account_id: int) -> str:
 
 def _fetch_and_classify_xtream_streams(account, client: XtreamClient, cfg: dict | None = None,
                                        stream_origin: str | None = None
-                                       ) -> tuple[list, str, int]:
+                                       ) -> tuple[list, str, int, str | None]:
     """Fetch channels via Xtream JSON/M3U API and classify live-vs-VOD.
 
     Returns (streams, classification outcome, count of channels whose stream URL will have
-    to be CONSTRUCTED rather than supplied by the provider). The latter two are surfaced as
-    alerts by the caller (DESIGN-live-vod.md §4, §4.3).
+    to be CONSTRUCTED rather than supplied by the provider, classification note). The outcome
+    and the count are surfaced as alerts by the caller (DESIGN-live-vod.md §4, §4.3). The
+    note is None when classification applied, and otherwise one sentence saying what the
+    provider sent and what was imported because of it - the caller writes it to the sync
+    log and the alert, so the sync that raised the alert says why (dev/changelog/1359).
 
     Deliberately does no database work: the caller hands `streams` to `_upsert_channels`
     inside its own retry_on_locked closure, so a lock retry re-runs the write without
@@ -554,6 +579,7 @@ def _fetch_and_classify_xtream_streams(account, client: XtreamClient, cfg: dict 
     # completely ordinary-looking SUCCESS while every URL in the account was a guess.
     constructed = sum(1 for s in streams if not s.get('_stream_url'))
 
+    note = None
     if outcome == CLASSIFY_APPLIED and constructed == len(streams) and streams:
         # Nothing was filtered - the entries ARE the catalog, so there was no playlist to
         # classify. Saying "kept N of N playlist entries" here would misdescribe the run
@@ -571,10 +597,29 @@ def _fetch_and_classify_xtream_streams(account, client: XtreamClient, cfg: dict 
                     'playlist unfiltered instead.',
                     account.id, stats['refused_kept'], stats['floor'], threshold,
                     account.channel_count or 0)
+        if stats['refused_kept']:
+            matched = (f'matched only {stats["refused_kept"]:,} of the playlist\'s '
+                       f'{stats["parsed"]:,} entries, under the {stats["floor"]:,.0f} that '
+                       f'{threshold}% of the previous {account.channel_count or 0:,} channels '
+                       f'allows')
+        else:
+            matched = f'matched none of the playlist\'s {stats["parsed"]:,} entries'
+        note = (f'Live channel filter refused: the provider\'s live channel list {matched}, '
+                f'so all {stats["parsed"]:,} were imported without that check.')
+    elif outcome == CLASSIFY_UNAVAILABLE:
+        problem = (getattr(client, 'catalog_problem', None)
+                   or 'the provider\'s live channel list could not be read')
+        log.warning('Account %d live classification UNAVAILABLE - %s. Importing %d playlist '
+                    'entries unfiltered.', account.id, problem, stats['parsed'])
+        if stats['parsed']:
+            imported = (f'All {stats["parsed"]:,} playlist entries were imported without that '
+                        f'check.')
+        else:
+            imported = 'The playlist was empty as well, so nothing was imported.'
+        note = f'Could not tell live channels from VOD: {problem}. {imported}'
     else:
-        log.warning('Account %d live classification UNAVAILABLE - the provider catalog could '
-                    'not be read. Importing %d playlist entries unfiltered.',
-                    account.id, stats['parsed'])
+        log.error('Account %d live classification returned unknown outcome %r', account.id,
+                  outcome)
 
     if constructed:
         log.warning('Account %d: %d of %d stream URL(s) had to be CONSTRUCTED because the '
@@ -590,4 +635,4 @@ def _fetch_and_classify_xtream_streams(account, client: XtreamClient, cfg: dict 
         if not stream.get('category_name') and stream.get('category_id'):
             stream['category_name'] = categories.get(str(stream['category_id']), '')
 
-    return streams, outcome, constructed
+    return streams, outcome, constructed, note

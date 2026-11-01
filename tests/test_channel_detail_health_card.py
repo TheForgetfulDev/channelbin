@@ -129,7 +129,7 @@ class ChannelPageHeadingTests(unittest.TestCase):
         h1s = re.findall(r'<h1[^>]*>(.*?)</h1>', body, re.S)
         self.assertEqual([h.strip() for h in h1s], ['Heading Channel'])
         self.assertIn('class="back" href="/channels"><svg class="icon" data-icon="back"', body)
-        self.assertIn('#i-back"></use></svg> Channel Search</a>', body)
+        self.assertIn('#i-back"></use></svg> Search</a>', body)
         self.assertLess(body.index('class="back"'), body.index('<h1'))
 
 

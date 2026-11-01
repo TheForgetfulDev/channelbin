@@ -195,8 +195,11 @@ class DetailsTests(_Base):
         - the banner goes and the count drops while the condition is still live."""
         m = self.obs['detailsActiveError']
         self.assertIsNotNone(m['notice'])
-        self.assertIn('Still active.', m['notice']['text'])
-        self.assertIn('stays under Active alerts', m['notice']['text'])
+        self.assertEqual(
+            m['notice']['text'],
+            "Still active. It clears itself once this is fixed. Marking it read hides the banner"
+            " and takes it out of the alert count, but it stays under Active alerts until it's"
+            " fixed.")
         self.assertTrue(m['noticeBeforeBody'])
         self.assertEqual(m['body'], 'It answers with Stale file handle.')
 

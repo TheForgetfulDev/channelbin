@@ -4,6 +4,7 @@ Scheduled Jobs page and API.
 GET /jobs              - HTML page listing all APScheduler jobs
 GET /api/jobs/scheduled - JSON list of all jobs with metadata
 """
+import functools
 import logging
 import os
 import re
@@ -40,6 +41,147 @@ _RECORDING_SIDE_JOBS = {
     'retry': ('dead-stream retry', 'Dead-stream retry'),
     'resume': ('resumes', 'Resume'),
 }
+_RECORDING_JOB_RE = re.compile(r'^(?:start|stop|precheck|retry|resume)_\d+$')
+
+# Known recurring jobs (non-sync): the name, where its settings are, and one line on
+# what it does - a first-time user met "Maintenance Window Dispatch" and "Search Index
+# Janitor" with nothing to say what either was for (dev/changelog/1293). Module-level
+# because the nav's background chip names its next job from the same table
+# (routes/dashboard.py::_activity_status_dict), so the two surfaces cannot spell one
+# job two ways.
+RECURRING_META = {
+    'config_backup_daily': ('Config Backup', '/settings?q=config_backup',
+                            'Saves a copy of your settings file.'),
+    'recording_retention_daily': ('Recording Retention', '/settings?q=retention_days',
+                                  'Deletes finished recordings older than you chose to '
+                                  'keep them.'),
+    'db_maintenance_daily': ('Database Maintenance', '/settings?q=keep_days',
+                             'Clears out old dismissed alerts and past guide listings.'),
+    'hc_window_dispatch': ('Health Check Window: Start', '/settings?q=channel_testing.window',
+                           'Starts the next health check that is due, while the health '
+                           'check window is open.'),
+    'hc_window_close': ('Health Check Window: End', '/settings?q=channel_testing.window',
+                        'Stops any health check still running when the window closes.'),
+    'logo_cache_fetch': ('Channel Logo Download', '/settings?q=logo_cache',
+                         'Saves channel logos locally, so pages do not load them from '
+                         'the provider.'),
+    'search_index_janitor': ('Search Index Repair',
+                             '/settings?q=index_janitor_grace_minutes',
+                             'Rebuilds a search index that has stayed broken, if nothing '
+                             'else has.'),
+    'storage_dirs_check': ('Storage Folder Check', '/readiness',
+                           'Checks that the folders recordings are saved to can still be '
+                           'written.'),
+    'account_stats_fold': ('Account Stats Update', '/accounts',
+                           'Adds the last hour\'s usage to each account\'s numbers.'),
+    'host_resolve_check': ('Stream Host Check', '/settings?q=hosts',
+                           'Checks that each account\'s stream servers can still be '
+                           'found.'),
+    'auto_rule_sweep': ('Auto-record Rules', '/rules',
+                        'Schedules what your auto-record rules match.'),
+    # The one-shot a guide import (or a refused run) queues: one evaluation of every
+    # enabled rule, coalesced on this id (app/scheduler.py::queue_auto_rule_evaluation).
+    'auto_rules_evaluate': ('Auto-record Rules check', '/rules',
+                            'Checks your auto-record rules against the new listings.'),
+    # Never a job id of its own - only ever seen as `channel_hide_materialize_retry`,
+    # the one-shot queued when a hide-rule pass was refused. Named here so the retry
+    # branch below renders it as "Hide Channels retry" rather than a raw job id
+    # (dev/changelog/928).
+    'channel_hide_materialize': ('Hide Channels', '/channels/hide-rules',
+                                 'Applies your hide rules to the channel list.'),
+}
+
+# Jobs that are a few queries or a stat() every few minutes and own no run history: they
+# cannot get in another job's way, so the overlap check leaves them out on both sides.
+# With them in, 4 of 10 rows on the dev box were yellow and none was a real conflict - a
+# dot that is usually wrong teaches people to ignore it (dev/changelog/1352). An explicit
+# set rather than a runtime threshold because none of these has history to measure.
+PROBE_JOBS = frozenset({
+    'hc_window_dispatch', 'hc_window_close', 'storage_dirs_check', 'host_resolve_check',
+    'account_stats_fold',
+})
+
+# How far ahead the Dashboard timeline looks (static/js/dashboard.js reads it from the
+# payload), and so how far a recording-guarded job's later occurrences are listed.
+TIMELINE_HORIZON_HOURS = 12
+_LATER_RUNS_CAP = 48
+
+# A job recurring at least this often is always about to run, so "starts within the hour"
+# says nothing about it; only a job on a longer cadence dims the nav's background chip.
+BG_DIM_MIN_CADENCE = timedelta(hours=1)
+
+
+def _trigger_cadence(trigger):
+    """How often a job recurs, or None for a one-shot. Every CronTrigger this app registers
+    is a daily or weekly wall-clock time, so it reads as a day without inspecting its
+    fields - either is longer than the hour the one caller compares against."""
+    name = type(trigger).__name__
+    if name == 'IntervalTrigger':
+        return getattr(trigger, 'interval', None)
+    if name == 'CronTrigger':
+        return timedelta(days=1)
+    return None
+
+
+def retry_base_job_id(job_id: str):
+    """The job a one-shot retry stands in for: `db_maintenance_daily_retry` ->
+    `db_maintenance_daily`, `account_sync_retry_5` -> `account_sync_5`,
+    `od_job_retry_3` -> `od_job_3`. None when `job_id` is not a retry."""
+    if job_id.endswith('_retry'):
+        return job_id[:-len('_retry')]
+    m = re.match(r'^(account_sync|epg_source_refresh|od_job)_retry_(\d+)$', job_id)
+    return f'{m.group(1)}_{m.group(2)}' if m else None
+
+
+def dims_background_chip(job, get_job) -> bool:
+    """Whether this scheduled job, due soon, should put the nav's background chip in its
+    dim "something starts within the hour" state.
+
+    The rule is cadence, not a list of names: a job that recurs every 5 or 60 minutes is
+    always imminent, so dimming for it would leave the chip dim permanently - which is
+    what the hand-picked list it replaces (three kinds, 2026-08-05) was protecting
+    against. A daily or multi-hour job is real news when it is an hour out. A recording's
+    own jobs belong to the Recording chip; a probe (PROBE_JOBS) is never news; a booked
+    health check is; a retry inherits its base job's answer, and a one-shot with no base
+    (the rules check an import queues, the hide-rule retry) or whose base is no longer
+    scheduled is work nobody waits for (dev/changelog/1353).
+    `get_job` resolves a base job by id, so a retry can be judged by what it retries."""
+    if _RECORDING_JOB_RE.match(job.id) or job.id in PROBE_JOBS:
+        return False
+    cadence = _trigger_cadence(job.trigger)
+    if cadence is not None:
+        return cadence > BG_DIM_MIN_CADENCE
+    if re.match(r'^od_job_\d+$', job.id):
+        return True
+    base = retry_base_job_id(job.id)
+    if base is None:
+        return False
+    base_job = get_job(base)
+    # A retry whose base is no longer scheduled is orphaned (the hide-rule retry's base
+    # is never a job at all), and nothing waits for an orphan.
+    return base_job is not None and dims_background_chip(base_job, get_job)
+
+
+def _later_fire_times(job, until_utc: datetime) -> list:
+    """ISO naive-UTC times of the job's occurrences after its next run and up to
+    `until_utc`, walked with the trigger's own get_next_fire_time() the way skip_next_run
+    does - so the timeline draws what APScheduler will do, not an interval arithmetic of its
+    own. Empty for a one-shot or a stand-in without a trigger."""
+    nxt = getattr(getattr(job, 'trigger', None), 'get_next_fire_time', None)
+    if nxt is None or job.next_run_time is None:
+        return []
+    out = []
+    prev = job.next_run_time
+    while len(out) < _LATER_RUNS_CAP:
+        fire = nxt(prev, prev)
+        if fire is None:
+            break
+        fire_utc = to_naive_utc(fire)
+        if fire_utc > until_utc:
+            break
+        out.append(fire_utc.isoformat())
+        prev = fire
+    return out
 
 
 def _fmt_et(dt_utc: datetime) -> str:
@@ -136,28 +278,109 @@ def _history_key(row_id: str):
     return base if base in _DURATION_TRACKED_SYSTEM_JOBS else None
 
 
-def _apply_duration_estimates(items):
-    """Fill every row's est_seconds / runs / duration_line from two batched queries, and
-    stretch a row with an estimate to its expected end so the overlap check below sees the
-    run's length rather than its start alone."""
-    from ..accounts import get_sync_duration_estimates
-    from ..database import get_job_duration_estimates
+#: The last-run line's tones, read by the template as a class on the line.
+LAST_RUN_OK, LAST_RUN_WARN, LAST_RUN_BAD = 'ok', 'warn', 'bad'
+_UNTRACKED_LAST_RUN_LINE = 'Past runs are not recorded for this job.'
+_DETAIL_MAX = 160
+
+
+@functools.lru_cache(maxsize=None)
+def _warn_unknown_outcome(outcome):
+    """Once per unknown word for the life of the process - the page is rendered on every
+    nav poll, and a WARNING per render would say nothing the first one did not."""
+    log.warning('Scheduled Jobs: run outcome %r has no wording, shown as is', outcome)
+
+
+def _last_run_phrase(outcome: str, seconds, detail: str):
+    """(phrase, tone) for one recorded run, from the outcome vocabulary of whichever
+    history table it came from. Every member is named: an outcome this does not know is
+    shown as its own word in the warning tone and logged, never dropped."""
+    from ..database import (
+        JOB_RUN_SUCCESS, JOB_RUN_FAILED, SYNC_LOG_SUCCESS, SYNC_LOG_PARTIAL, SYNC_LOG_ERROR,
+        SYNC_LOG_CANCELLED, SYNC_LOG_SKIPPED, EPG_STATUS_OK, EPG_STATUS_FAILED,
+        EPG_STATUS_REFUSED, EPG_STATUS_TRUNCATED,
+    )
+    from ..fmt_utils import fmt_duration_phrase
+
+    took = f' in {fmt_duration_phrase(seconds)}' if seconds is not None else ''
+    # JobRun and AccountSyncLog both spell their good outcome SUCCESS; the two FAILED/ERROR
+    # spellings are different tables' words for the same thing.
+    words = {
+        JOB_RUN_SUCCESS: (f'finished{took}', LAST_RUN_OK),
+        JOB_RUN_FAILED: ('failed', LAST_RUN_BAD),
+        SYNC_LOG_SUCCESS: (f'finished{took}', LAST_RUN_OK),
+        SYNC_LOG_PARTIAL: (f'finished with problems{took}', LAST_RUN_WARN),
+        SYNC_LOG_ERROR: ('failed', LAST_RUN_BAD),
+        SYNC_LOG_CANCELLED: ('canceled', LAST_RUN_WARN),
+        SYNC_LOG_SKIPPED: ('skipped', LAST_RUN_WARN),
+        EPG_STATUS_OK: ('finished', LAST_RUN_OK),
+        EPG_STATUS_FAILED: ('failed', LAST_RUN_BAD),
+        EPG_STATUS_REFUSED: ('refused', LAST_RUN_WARN),
+        EPG_STATUS_TRUNCATED: ('stopped early', LAST_RUN_WARN),
+    }
+    if outcome in words:
+        phrase, tone = words[outcome]
+    else:
+        _warn_unknown_outcome(outcome)
+        phrase, tone = str(outcome).lower(), LAST_RUN_WARN
+    if detail and tone != LAST_RUN_OK:
+        detail = ' '.join(str(detail).split())
+        if len(detail) > _DETAIL_MAX:
+            detail = detail[:_DETAIL_MAX - 3].rstrip() + '...'
+        phrase = f'{phrase} - {detail}'
+    return phrase, tone
+
+
+def _set_last_run(item, started, finished, outcome, detail):
+    """Write one recorded run onto a row: when it ended, how it went, and the line that
+    says so. `finished` None (a source whose refresh is dated once) reads as the start."""
+    from ..fmt_utils import fmt_job_last_run_line
+    ended = finished or started
+    seconds = (finished - started).total_seconds() if finished and started else None
+    phrase, tone = _last_run_phrase(outcome, seconds, detail)
+    item['last_run_utc'] = ended.isoformat()
+    item['last_run_tone'] = tone
+    item['last_run_line'] = fmt_job_last_run_line(_fmt_et(ended), phrase)
+    item['last_run_tracked'] = True
+
+
+def _apply_run_history(items):
+    """Fill every row's est_seconds / runs / duration_line and its last-run fields from
+    four batched queries (two per history table), and stretch a row with an estimate to
+    its expected end so the overlap check below sees the run's length rather than its
+    start alone. A recurring job with no history tracked says so in words; a tracked one
+    with no run yet keeps the estimate line's own "not known yet" and no last-run line, so
+    the two sentences never say one thing twice (dev/changelog/1351)."""
+    from ..accounts import get_sync_duration_estimates, get_sync_last_runs
+    from ..database import get_job_duration_estimates, get_job_last_runs
     from ..fmt_utils import fmt_job_duration_line
 
     keyed = [(item, _history_key(item['id'])) for item in items]
     keys = {key for _item, key in keyed if key is not None}
-    estimates = {('sync', aid): est for aid, est in get_sync_duration_estimates(
-        {k[1] for k in keys if isinstance(k, tuple)}).items()}
-    estimates.update(get_job_duration_estimates({k for k in keys if isinstance(k, str)}))
+    account_ids = {k[1] for k in keys if isinstance(k, tuple)}
+    job_ids = {k for k in keys if isinstance(k, str)}
+    estimates = {('sync', aid): est for aid, est in
+                 get_sync_duration_estimates(account_ids).items()}
+    estimates.update(get_job_duration_estimates(job_ids))
+    last_runs = {('sync', aid): run for aid, run in get_sync_last_runs(account_ids).items()}
+    last_runs.update(get_job_last_runs(job_ids))
     for item, key in keyed:
+        item.setdefault('last_run_line', None)
+        item.setdefault('last_run_tone', None)
+        item.setdefault('last_run_utc', None)
+        item.setdefault('last_run_tracked', key is not None)
         if key is None:
             item['est_seconds'], item['runs'] = None, 0
+            if item['type'] == 'recurring' and not item['last_run_tracked']:
+                item['last_run_line'] = _UNTRACKED_LAST_RUN_LINE
             continue
         avg_seconds, runs = estimates.get(key, (None, 0))
         item['est_seconds'], item['runs'] = avg_seconds, runs
         item['duration_line'] = fmt_job_duration_line(avg_seconds, runs)
         if avg_seconds:
             item['_end_utc'] = item['_start_utc'] + timedelta(seconds=avg_seconds)
+        if key in last_runs:
+            _set_last_run(item, *last_runs[key])
 
 
 _OVERLAP_WARN_SECONDS = 300  # 5 minutes
@@ -216,6 +439,7 @@ def _build_job_list():
 
     raw_jobs = scheduler.get_jobs()
     now = datetime.utcnow()
+    horizon_utc = now + timedelta(hours=TIMELINE_HORIZON_HOURS)
     # One load_config() for the whole list - the guards, the window checks and the
     # post-script tail all read it.
     cfg = load_config()
@@ -419,6 +643,9 @@ def _build_job_list():
             'edit_url': _check_group_url(od),
             'overlap': 'green',
             'recording_guard': _check_guard(ct_cfg, od),
+            # Every occurrence inside the timeline's window, not only the next one, so a
+            # recording booked over the second run is marked too (dev/changelog/1354).
+            'later_runs_utc': _later_fire_times(job, horizon_utc) if is_recurring else [],
         }
         if is_retry:
             # No Run Now and no Skip: this row is already the deferral of a run that could not
@@ -467,51 +694,6 @@ def _build_job_list():
             'overlap': 'green',
             'recording_guard': _check_guard(ct_cfg, od),
         })
-
-    # Known recurring jobs (non-sync): the name, where its settings are, and one line on
-    # what it does - a first-time user met "Maintenance Window Dispatch" and "Search Index
-    # Janitor" with nothing to say what either was for (dev/changelog/1293).
-    _RECURRING_META = {
-        'config_backup_daily': ('Config Backup', '/settings?q=config_backup',
-                                'Saves a copy of your settings file.'),
-        'recording_retention_daily': ('Recording Retention', '/settings?q=retention_days',
-                                      'Deletes finished recordings older than you chose to '
-                                      'keep them.'),
-        'db_maintenance_daily': ('Database Maintenance', '/settings?q=keep_days',
-                                 'Clears out old dismissed alerts and past guide listings.'),
-        'hc_window_dispatch': ('Health Check Window: Start', '/settings?q=channel_testing.window',
-                               'Starts the next health check that is due, while the health '
-                               'check window is open.'),
-        'hc_window_close': ('Health Check Window: End', '/settings?q=channel_testing.window',
-                            'Stops any health check still running when the window closes.'),
-        'logo_cache_fetch': ('Channel Logo Download', '/settings?q=logo_cache',
-                             'Saves channel logos locally, so pages do not load them from '
-                             'the provider.'),
-        'search_index_janitor': ('Search Index Repair',
-                                 '/settings?q=index_janitor_grace_minutes',
-                                 'Rebuilds a search index that has stayed broken, if nothing '
-                                 'else has.'),
-        'storage_dirs_check': ('Storage Folder Check', '/maintenance',
-                               'Checks that the folders recordings are saved to can still be '
-                               'written.'),
-        'account_stats_fold': ('Account Stats Update', '/accounts',
-                               'Adds the last hour\'s usage to each account\'s numbers.'),
-        'host_resolve_check': ('Stream Host Check', '/settings?q=hosts',
-                               'Checks that each account\'s stream servers can still be '
-                               'found.'),
-        'auto_rule_sweep': ('Auto-record Rules', '/rules',
-                            'Schedules what your auto-record rules match.'),
-        # The one-shot a guide import (or a refused run) queues: one evaluation of every
-        # enabled rule, coalesced on this id (app/scheduler.py::queue_auto_rule_evaluation).
-        'auto_rules_evaluate': ('Auto-record Rules check', '/rules',
-                                'Checks your auto-record rules against the new listings.'),
-        # Never a job id of its own - only ever seen as `channel_hide_materialize_retry`,
-        # the one-shot queued when a hide-rule pass was refused. Named here so the retry
-        # branch below renders it as "Hide Rules retry" rather than a raw job id
-        # (dev/changelog/928).
-        'channel_hide_materialize': ('Hide Rules', '/channels/hide-rules',
-                                     'Applies your hide rules to the channel list.'),
-    }
 
     # Explains, per job, what it does and why Run Now isn't offered - shown in the greyed
     # Run Now item's toast for anything not in _run_now_supported_jobs(). dispatch_minutes is
@@ -570,6 +752,7 @@ def _build_job_list():
                 'skip_url': f'/api/jobs/{job.id}/skip-next',
                 'overlap': 'green',
                 'recording_guard': sync_guard,
+                'later_runs_utc': _later_fire_times(job, horizon_utc),
             })
             continue
 
@@ -583,7 +766,7 @@ def _build_job_list():
             src_name = src.name if src else f'EPG source {source_id}'
             td = getattr(job.trigger, 'interval', None)
             hours = int(td.total_seconds() / 3600) if td else '?'
-            items.append({
+            epg_item = {
                 '_start_utc': next_run_utc,
                 '_end_utc': next_run_utc,
                 '_next_run_utc': next_run_utc,
@@ -602,7 +785,14 @@ def _build_job_list():
                 'run_url': None if is_retry else f'/api/jobs/{job.id}/run-now',
                 'skip_url': None,
                 'overlap': 'green',
-            })
+            }
+            # A source's run history is the row itself (last_refresh_at / last_status /
+            # last_error), already fetched above - no JobRun rows are written for it.
+            epg_item['last_run_tracked'] = True
+            refreshed = (src.last_refresh_at or src.last_success_at) if src else None
+            if src is not None and src.last_status and refreshed is not None:
+                _set_last_run(epg_item, refreshed, None, src.last_status, src.last_error)
+            items.append(epg_item)
             continue
 
         # One-shot deferred-sync retries: account_sync_retry_<id>. Own branch because
@@ -638,8 +828,8 @@ def _build_job_list():
         # refused a maintenance job (app/scheduler.py::_defer_job_for_contention). Same
         # shape as the sync retry above, named off the base job so the two read as a pair
         # rather than as an unexplained raw job id.
-        if job.id.endswith('_retry') and job.id[:-len('_retry')] in _RECURRING_META:
-            base_name, edit_url, what = _RECURRING_META[job.id[:-len('_retry')]]
+        if job.id.endswith('_retry') and job.id[:-len('_retry')] in RECURRING_META:
+            base_name, edit_url, what = RECURRING_META[job.id[:-len('_retry')]]
             items.append({
                 '_start_utc': next_run_utc,
                 '_end_utc': next_run_utc,
@@ -660,7 +850,7 @@ def _build_job_list():
             })
             continue
 
-        display_name, edit_url, what = _RECURRING_META.get(job.id, (job.id, None, None))
+        display_name, edit_url, what = RECURRING_META.get(job.id, (job.id, None, None))
         if job.id == 'auto_rules_evaluate':
             reason = (job.kwargs or {}).get('reason')
             items.append({
@@ -706,15 +896,21 @@ def _build_job_list():
                 job.id, f'Running "{display_name}" on demand is not supported yet.')
         items.append(item)
 
-    _apply_duration_estimates(items)
+    _apply_run_history(items)
 
     # Sort by _next_run_utc
     items.sort(key=lambda x: x['_next_run_utc'])
 
-    # Overlap detection: interval-based
+    # Overlap detection: interval-based. A probe (PROBE_JOBS) is on neither side of it: it
+    # takes a moment and cannot get in anything's way, so it neither colors a neighbor nor
+    # takes a color from one. Its own dot says so (overlap_probe) rather than claiming
+    # "nothing nearby" when something is.
     for i, a in enumerate(items):
+        if a['id'] in PROBE_JOBS:
+            a['overlap_probe'] = True
+            continue
         for j, b in enumerate(items):
-            if i == j:
+            if i == j or b['id'] in PROBE_JOBS:
                 continue
             if _intervals_overlap(a['_start_utc'], a['_end_utc'], b['_start_utc'], b['_end_utc']):
                 a['overlap'] = 'red'

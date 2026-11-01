@@ -244,9 +244,11 @@ class TsConnection:
                 if left is not None:
                     g1 = min(g1, self.g + left)
                 piece = shape(timing, self.g, g1, live)
+                yield piece
+                # After the yield: a write that raised closes the generator here, so `offered()`
+                # never counts a piece the server did not write (dev/changelog/1385).
                 self.g = g1
                 self.sent += len(piece)
-                yield piece
                 if g1 < due:
                     continue        # still catching up - the burst - so no pause
                 self._caught_up = True
@@ -340,9 +342,9 @@ class ClipConnection:
                 g1 = min(due, self.g + CHUNK_PACKETS)
                 piece = loop.cut(self.g, g1, self.base90)
                 if self._skip:
-                    piece, self._skip = piece[self._skip:], 0
-                self.g = g1
+                    piece = piece[self._skip:]
                 yield piece
+                self.g, self._skip = g1, 0     # after the yield, as TsConnection.pieces()
                 if g1 < due:
                     continue
             stopping.wait(TICK_SECONDS)
@@ -387,8 +389,8 @@ class Mp3Connection:
             if due > self.f:
                 f1 = min(due, self.f + 256)
                 piece = self.loop.cut(self.f, f1)
-                self.f = f1
                 yield piece
+                self.f = f1                     # after the yield, as TsConnection.pieces()
                 if f1 < due:
                     continue
             stopping.wait(TICK_SECONDS)

@@ -1,22 +1,22 @@
-/* The Readiness check card on Maintenance: what this install can and cannot do, and what
-   stands behind each answer. Server side is app/readiness.py, which owns the registries,
+/* The Readiness check page (templates/readiness.html): what this install can and cannot do,
+   and what stands behind each answer. Server side is app/readiness.py, which owns the registries,
    the states and the verdict sentence. Rules and design record: dev/changelog/950, built
    from dev/mockups/40-readiness.html.
 
-   ONE updater for the card: render(). Every action mutates `state` and calls it; nothing
-   writes into #rd-content anywhere else. Events are delegated on the card, because render()
+   ONE updater for the page: render(). Every action mutates `state` and calls it; nothing
+   writes into #rd-content anywhere else. Events are delegated on #readiness, because render()
    replaces its innerHTML and per-element handlers bound once at load would be destroyed by
    the first rebuild.
 
    The nav counts are NOT written here. base.html owns those nodes and exposes
-   window.__applyReadiness as their one writer - this card hands it the `nav` block of
+   window.__applyReadiness as their one writer - this page hands it the `nav` block of
    whatever payload it just fetched, so silencing a check moves the badge on the click
    rather than at the next poll. */
 (() => {
   'use strict';
 
-  const card = document.getElementById('m-readiness');
-  if (!card) return;
+  const root = document.getElementById('readiness');
+  if (!root) return;
 
   const content = document.getElementById('rd-content');
   const headPill = document.getElementById('rd-head-pill');
@@ -110,7 +110,9 @@
     }
     if (cap.state === 'none') {
       const nothing = rows(cap.nothing);
-      return `Nothing is set up for this yet. ${escHtml(noun(nothing[0]))}: ${escHtml(nothing[0].found)}`;
+      // A NOTHING finding is a whole sentence on its own ("There are no accounts to sync"),
+      // so the check's noun in front of it only repeated it (dev/changelog/1366).
+      return `Nothing is set up for this yet. ${escHtml(nothing[0].found)}.`;
     }
     const running = cap.needs.filter((id) => state.checking.has(id));
     if (running.length) {
@@ -164,7 +166,7 @@
     if (statusOf(row) === 'ready') return '';
     return `<button class="btn btn-sm" data-ignore="${escHtml(row.id)}"
       data-tip="Stop counting this check. It stays on the page, dimmed, but no longer
-affects the verdict or the count beside Maintenance.">Ignore this</button>`;
+affects the verdict or the count beside Readiness in the menu.">Ignore this</button>`;
   }
 
   function detailBlock(row) {
@@ -183,7 +185,7 @@ affects the verdict or the count beside Maintenance.">Ignore this</button>`;
     }
     if (row.ignored) {
       lines.push(['Ignored', 'Still checked, but not counted in the verdict or the count '
-        + 'beside Maintenance. Stop ignoring to count it again.', '']);
+        + 'beside Readiness in the menu. Stop ignoring to count it again.', '']);
     }
     if (row.link && row.action) {
       lines.push(['Where to change it', escHtml(row.link.label), '']);
@@ -220,8 +222,8 @@ affects the verdict or the count beside Maintenance.">Ignore this</button>`;
 
   /* One capability. `.grp-item` and its children are style.css's own expanding row - the
      same anatomy the Channel Groups page uses - so the left-edge state colour comes from
-     `data-health` with no rule of this card's own. Rows are NOT auto-opened: eleven rows with
-     four open is a long card, and the reason line already says how many are wrong
+     `data-health` with no rule of this page's own. Rows are NOT auto-opened: eleven rows with
+     four open is a long page, and the reason line already says how many are wrong
      (dev/changelog/950). */
   function capRow(cap) {
     const open = state.open.has(cap.id);
@@ -330,7 +332,7 @@ affects the verdict or the count beside Maintenance.">Ignore this</button>`;
       </div>
       ${progress}
       <p class="rd-intro">What this install can do right now. Open a row to see the checks
-        behind it, what each one found and how to fix it.</p>
+        behind it, what each one found, and how to fix it.</p>
       <div class="rd-caps">${d.capabilities.map(capRow).join('')}</div>`;
   }
 
@@ -346,8 +348,8 @@ affects the verdict or the count beside Maintenance.">Ignore this</button>`;
     jsonFetch('/api/readiness')
       .then(apply)
       .catch((e) => {
-        content.innerHTML = `<div class="mrow"><span class="grow">Could not load the readiness
-          check: ${escHtml(e.message)}</span></div>`;
+        content.innerHTML = `<p class="rd-intro">Could not load the readiness check:
+          ${escHtml(e.message)}</p>`;
       });
   }
 
@@ -415,7 +417,7 @@ affects the verdict or the count beside Maintenance.">Ignore this</button>`;
       .catch((e) => showToast(`Could not change that: ${e.message}`, { type: 'error' }));
   }
 
-  card.addEventListener('click', (ev) => {
+  root.addEventListener('click', (ev) => {
     const run = ev.target.closest('[data-run]');
     if (run) { ev.stopPropagation(); runCheck(run.dataset.run); return; }
     const fix = ev.target.closest('[data-fix]');
@@ -434,8 +436,11 @@ affects the verdict or the count beside Maintenance.">Ignore this</button>`;
         .catch((e) => showToast(e.message, { type: 'error' }));
       return;
     }
-    // A link out of the card is a real navigation, not a row toggle.
+    // A link out of the page is a real navigation, not a row toggle.
     if (ev.target.closest('a[href]')) return;
+    // A drag that selected text to copy is not a click on the row: toggling re-renders the
+    // list and wipes the selection (dev/docs/BUGS.md 2026-10-31 @ 01:47:58 PM).
+    if (hasSelectionIn(root)) return;
     // The check row inside an expanded capability is matched BEFORE the capability itself:
     // the inner row is nested in the outer one and both would otherwise match.
     const rowToggle = ev.target.closest('[data-rowtoggle]');

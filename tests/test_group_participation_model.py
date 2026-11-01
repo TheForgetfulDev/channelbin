@@ -717,12 +717,12 @@ class DetailPageSelfDescriptionTests(unittest.TestCase):
         self.assertIn('no member enabled for recording', lead)
 
     def test_the_two_pages_do_not_describe_one_group_two_ways(self):
-        """The finding itself: groups.html says "a group with no member enabled for
+        """The finding itself: groups.html says "a group with no channels enabled for
         recording is simply a health check" while this page, for the identical group,
         called it a channel group that records."""
         grp = self._fresh()
         listed = ' '.join(self.client.get('/channel-groups').get_data(as_text=True).split())
-        self.assertIn('no member enabled for recording is simply a health check', listed,
+        self.assertIn('no channels enabled for recording is simply a health check', listed,
                       'the list page sentence the detail page is held to')
         lead = self._lead(grp)
         self.assertNotIn('Records the best', lead)

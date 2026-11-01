@@ -68,15 +68,14 @@ class MaintenancePageConformanceTests(unittest.TestCase):
         External tools sits second, with Storage, on 16.1's own read-then-act split:
         it is a readout with no controls (dev/changelog/910).
 
-        Readiness check sits FIRST, above all of it, settled at mockup round 1: a verdict
-        below the fold on a seven-card page is not a verdict (dev/changelog/945, built
-        in dev/changelog/950).
+        The Readiness check sat first until it became a page of its own: it answers "can
+        this install record", which is not maintenance (dev/changelog/1366).
 
         The EPG similarity scan sits with the Search index, the other on-demand pass over
         the database with a readout and a Run-now (dev/changelog/1325).
         """
         self.assertEqual(re.findall(r'<div class="card" id="(m-[a-z]+)"', self.html),
-                         ['m-readiness', 'm-storage', 'm-tools', 'm-index', 'm-epg',
+                         ['m-storage', 'm-tools', 'm-index', 'm-epg',
                           'm-backup', 'm-bundle', 'm-service'])
 
     def test_no_back_link_to_settings(self):
@@ -174,62 +173,29 @@ class StorageDetailsPayloadTests(unittest.TestCase):
                                stats['disk_dvr']['total_gb'], delta=0.1)
 
 
-class ReadinessCardConformanceTests(unittest.TestCase):
-    """The Readiness card's own markup against the decisions that produced it.
-
-    Design record: dev/mockups/40-readiness.html, dev/changelog/945, 948, 950. Each case
-    is a call a careless edit would quietly undo.
-    """
+class ReadinessMovedOffTests(unittest.TestCase):
+    """The Readiness check left this page for its own (dev/changelog/1366). Its markup,
+    script and menu counts went with it, so nothing here may still draw half of it."""
 
     @classmethod
     def setUpClass(cls):
-        # One app and one render for the whole class: every case reads the markup and
-        # none rewrites the state it was rendered from (dev/changelog/979).
         cls.t = make_test_app()
-        cls.client = cls.t.app.test_client()
-        cls.html = cls.client.get('/maintenance').get_data(as_text=True)
+        cls.html = cls.t.app.test_client().get('/maintenance').get_data(as_text=True)
 
     @classmethod
     def tearDownClass(cls):
         cls.t.cleanup()
 
-    def test_the_card_head_carries_its_own_state_pill(self):
-        """On this page the verdict sits below a heading that says Maintenance, so the head
-        has to say whether the install is ready without being read to the bottom."""
-        self.assertRegex(self.html, r'<h2>Readiness check <span class="badge [^"]*" id="rd-head-pill"')
+    def test_no_readiness_card_or_script(self):
+        self.assertNotIn('rd-content', self.html)
+        self.assertNotIn('js/readiness.js', self.html)
 
-    def test_the_first_paint_is_the_nothing_active_state(self):
-        """Server-rendered initial state must equal the nothing-active state - JS may
-        upgrade it, never be required to calm it down (CLAUDE.md frontend rule). So the
-        card ships a neutral pill and no verdict at all until /api/readiness answers."""
-        head = self.html[self.html.index('id="m-readiness"'):self.html.index('id="m-storage"')]
-        self.assertIn('b-abort', head, 'the head pill starts neutral, never Ready or Not ready')
-        self.assertNotIn('rd-verdict', head, 'the verdict is never server-rendered')
-
-    def test_the_card_loads_its_own_script(self):
-        self.assertIn('js/readiness.js', self.html)
-
-    def test_the_maintenance_nav_link_carries_both_counts(self):
-        """The amber count sits beside the red one, the way Alerts shows both.
-
-        Their own class names, deliberately: static/js/nav-alerts.js queries
-        .nav-count-bad / .nav-count-warn app-wide, so reusing those would write the ALERT
-        numbers into this badge.
-        """
+    def test_the_maintenance_nav_link_carries_no_readiness_count(self):
         link = re.search(r'<a class="nav-link[^"]*" href="/maintenance">.*?</a>',
                          self.html, re.S)
         self.assertIsNotNone(link, 'the Maintenance nav link is gone')
-        self.assertIn('nav-count-ready-bad', link.group(0))
-        self.assertIn('nav-count-ready-warn', link.group(0))
-        self.assertNotIn('nav-count-bad', link.group(0))
-        self.assertNotIn('nav-count-warn', link.group(0))
-
-    def test_the_counts_start_hidden(self):
-        link = re.search(r'<a class="nav-link[^"]*" href="/maintenance">.*?</a>',
-                         self.html, re.S).group(0)
-        for cls in ('nav-count-ready-bad', 'nav-count-ready-warn', 'pip-ready'):
-            self.assertRegex(link, rf'{cls}"[^>]*style="display:none"',
-                             f'{cls} is rendered visible before anything has been measured')
+        self.assertNotIn('nav-count-ready', link.group(0))
+        self.assertNotIn('pip-ready', link.group(0))
 
 
 if __name__ == '__main__':

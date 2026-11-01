@@ -43,7 +43,7 @@ from .lineup import (KIND_LIVE, KIND_SEPARATOR, TRIPLET_KINDS, BackendChannel, G
 from .content import TS_PROFILES
 from .names import invented_stem
 from .rand import derive, rng
-from .world import LOGIN_STATUSES, LOGO_HOST
+from .world import LOGIN_STATUSES, LOGO_HOST, OVER_LIMIT_POLICIES
 from .writers import gzip_bytes
 
 SCOPE_LOGIN = 'login'
@@ -774,6 +774,12 @@ def _answer_bare_status(provider, ask, f):
     return (f.params['status'], b'', _HTML)
 
 
+def _answer_catalog_empty(provider, ask, f):
+    if ask.login is None or ask.refused:
+        return None
+    return (200, b'[]', 'application/json')
+
+
 def _answer_auth_as_playlist(provider, ask, f):
     if ask.login is None or ask.refused:
         return None
@@ -910,6 +916,13 @@ _KINDS = (
           'logs record it',
           'player_api.php answers a valid login with the M3U playlist instead of JSON',
           panel_kinds=('xtream',), apply=_answer_auth_as_playlist),
+    _kind('catalog_empty', SCOPE_PANEL, LAYER_ANSWER, (EP_CATALOG,), OBSERVED,
+          'dev/changelog/1359, BUGS.md 2026-10-30 08:34 PM; prod\'s 2026-10-30 07:52 sync of the '
+          'largest playlist account logged the catalog unavailable and none of the lines its '
+          'fetch, M3U, non-JSON and wrong-type paths write, which leaves an empty list',
+          'the live channel list answers a valid login with an empty JSON list while the '
+          'playlist still lists every channel',
+          panel_kinds=('xtream',), apply=_answer_catalog_empty),
     _kind('playlist_down', SCOPE_PANEL, LAYER_ANSWER, (EP_PLAYLIST,), MEASURED,
           'dev/changelog/1100 (get.php answering HTTP 884 with an empty body on every sync '
           'since August), 261, DESIGN-live-vod.md §4.3; observed in prod',
@@ -1176,6 +1189,10 @@ _KINDS = (
 NEEDS_START = ('timestamp_jump', 'hls_discontinuity')
 
 CATALOG = {k.name: k for k in _KINDS}
+# A world's over-limit policy is provider behavior a scenario can exercise with no inject():
+# kick_oldest was seen once on a real login (DESIGN-simulator.md §3.10, dev/changelog/1220).
+# A scenario names the ones its world triggers in PROVIDER_BEHAVIORS (dev/changelog/1388).
+OVER_LIMIT_BASIS = {'refuse': ASSUMED, 'kick_oldest': MEASURED, 'allow_then_ban': ASSUMED}
 SYNC_KINDS = tuple(k.name for k in _KINDS if k.scope not in STREAM_SCOPES)
 STREAM_KINDS = tuple(k.name for k in _KINDS if k.scope in STREAM_SCOPES)
 
@@ -1206,9 +1223,12 @@ def check_catalog() -> list[str]:
                     check(default, name)
                 except FaultError as exc:
                     problems.append(f'{k.name}: default {exc}')
+    if set(OVER_LIMIT_BASIS) != set(OVER_LIMIT_POLICIES):
+        problems.append(f'OVER_LIMIT_BASIS covers {sorted(OVER_LIMIT_BASIS)}, the policies are '
+                        f'{sorted(OVER_LIMIT_POLICIES)}')
     return problems
 
 
-__all__ = ['ASSUMED', 'CATALOG', 'MEASURED', 'OBSERVED', 'REPRODUCED', 'STREAM_KINDS',
-           'SYNC_KINDS', 'ActiveFault', 'Ask', 'Fault', 'FaultBook', 'FaultError', 'Kind',
+__all__ = ['ASSUMED', 'CATALOG', 'MEASURED', 'OBSERVED', 'OVER_LIMIT_BASIS', 'REPRODUCED',
+           'STREAM_KINDS', 'SYNC_KINDS', 'ActiveFault', 'Ask', 'Fault', 'FaultBook', 'FaultError', 'Kind',
            'Trigger', 'View', 'faults_from_world', 'is_channel_label', 'make_fault']

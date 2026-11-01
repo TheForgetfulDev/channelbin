@@ -5,6 +5,67 @@ Notable changes to ChannelBin, newest first. This project follows
 release is tagged `v<version>` in git, and the version the app is running is shown in the
 page footer.
 
+## 0.36.0 - 2026-11-01
+
+Watch your TV Guide in an IPTV app.
+
+**Added**
+
+- An optional output feed lets an IPTV app such as TiviMate add ChannelBin as an Xtream Codes
+  account. The app sees exactly your TV Guide: every channel and group in it, in the same
+  order, with the same listings. A group plays as one channel from the member ChannelBin would
+  record from, and moves to another member mid-stream if that one dies. A recording always
+  gets the provider connection first, and says so on the Alerts page and the recording's
+  timeline. Off by default; one switch in Settings, no restart.
+- The Readiness check has its own page, under System beside Alerts, and now also checks the
+  folders screenshots and live thumbnails are written to.
+- Each row on the Scheduled Jobs page says when the job last ran and how it went, so a backup
+  that has failed for a week no longer looks like one that succeeded.
+
+**Changed**
+
+- The menu leads with Get started, Dashboard, TV Guide, Search and Recordings, then Channels &
+  guide, Setup and System. Setup and System fold, and a folded heading carries any red or
+  amber count from the pages inside it. Channel Search is now Search, and Hide Rules is Hide
+  Channels. On a phone, the top bar has TV Guide and Search shortcuts.
+- The Recordings page has one Schedule recording button that asks how: from the TV Guide,
+  from a search, or a manual recording.
+- Each page's description sits behind an "About this page" line under the title, closed until
+  you open it.
+- The Dashboard's setup banner goes through the four steps in order, and a Readiness check's
+  Settings link opens Settings at the setting it is about. Delete the examples sits beside
+  Keep the examples at the top of Get started.
+- A guide refresh that leaves a few channels with no listings is noted on the account's
+  Activity instead of raising an alert. Only a loss of at least 10% of the channels that had a
+  guide (a setting) reaches Alerts.
+- The Dashboard timeline marks every run of a job inside the 12 hours it shows, not only the
+  next one. The "runs close to another job" dot on Scheduled Jobs leaves out the quick
+  five-minute checks, so it marks jobs that could actually get in each other's way.
+
+**Fixed**
+
+- On the night the clocks fall back, a program in the second 1 AM hour is recorded in its own
+  hour. The record and edit forms read every repeated time as the first one, so such a
+  recording started an hour early or was cut an hour short. A time the clocks repeat or skip
+  now gets a note saying which one it is, with a switch for a repeated one.
+- Times entered in the hours after a clock change are no longer an hour off, and "Tomorrow" is
+  labeled correctly on the days the clocks change.
+- Saving an edit dialog that was opened before Auto-record moved the recording no longer puts
+  the old times back. It says the recording moved and shows the new times.
+- Alerts that outlived their cause now clear: storage alerts for folders no longer in use, and
+  a failing-channel warning raised after the recording had already started. Lost-guide alerts
+  can be dismissed like any other.
+- When a sync cannot tell live channels from VOD, the sync log and the alert say why, and the
+  sync finishes as Partial.
+- When a channel that a group's TV Guide row was pinned to is deleted, the group goes back to
+  automatic listings and says so, instead of keeping a pin that could later attach to an
+  unrelated channel. A deleted account's id is never reused by a new account.
+- The Maintenance page's backup list picks up the nightly backup, and one taken in another
+  tab, without a reload.
+- The Dashboard no longer slows down as more recordings are converting.
+- The "Reachable from any device on this network" warning in Settings no longer shows a
+  garbled copy of itself, and Readiness's notification check counts only enabled services.
+
 ## 0.35.0 - 2026-10-30
 
 Tables that fit the window.

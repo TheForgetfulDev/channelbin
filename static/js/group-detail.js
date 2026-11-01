@@ -2598,7 +2598,7 @@
             showToast(`"${r.channel_name}" added to the TV Guide.${data.note ? ` ${data.note}` : ''}`);
             refreshRows();
           }
-          else showToast(data.error || 'Already in the guide, or needs confirmation from Channel Search.', { type: 'warning' });
+          else showToast(data.error || 'Already in the guide, or needs confirmation from Search.', { type: 'warning' });
         })
         .catch(e => showToast(e.message || 'Could not add to the guide.', { type: 'error' }));
       return;

@@ -1,4 +1,5 @@
 {% extends "base.html" %}
+{% from "_macros.html" import page_about %}
 {% block title %}Tags - ChannelBin{% endblock %}
 
 {#  Tags list (dev/changelog/448).
@@ -20,7 +21,7 @@
   </h1>
   <button class="btn btn-primary" id="tag-add">+ Add Tag</button>
 </div>
-<p class="page-sub">
+{% call page_about() %}
   Tags find the little markers IPTV providers put in program titles, like the tiny
   <code class="tag-pat">ᴸᶦᵛᵉ</code> and <code class="tag-pat">ᴺᵉʷ</code>. In the TV Guide and in
   program searches, a tag highlights the programs that carry its marker and lets you filter
@@ -28,7 +29,7 @@
   has that marker and nothing when it does not, and the file name settings can remove or
   replace the marker itself. ChannelBin starts with two, live and new, for the markers most
   providers use; edit or delete them like any other.
-</p>
+{% endcall %}
 
 {% if not tags %}
 <div class="empty-state">

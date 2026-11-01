@@ -190,11 +190,16 @@ ALERT_TYPES = {
     'EPG_SOURCE_IMPORT_TRUNCATED': {
         'label': 'EPG Source Import Cut Short (Truncated Feed)', 'severity': 'WARN',
         'self_clearing': True},
-    # An import left channels that had a guide with none from any source. The one surface
-    # that sees a feed landing just above the collapse threshold: the guard counts rows,
-    # this names channels (DESIGN-epg-sources.md §9.1).
-    'EPG_SOURCE_COVERAGE_LOST': {
-        'label': 'Channels Lost Their Guide', 'severity': 'WARN', 'self_clearing': True},
+    # An import left channels that had a guide with none from any source - at least
+    # sync.epg_coverage_lost_alert_percent of them; a smaller loss is routine provider churn
+    # and is named on the sync log only (dev/changelog/1360). The one surface that sees a
+    # feed landing just above the collapse threshold: the guard counts rows, this names
+    # channels (DESIGN-epg-sources.md §9.1). Not self_clearing: it reports something one
+    # import did, and the next import counts only channels that still had a guide, so
+    # nothing ever observes the loss being over. One row per lossy import, dismissed by the
+    # user - it used to clear on the next import that lost nothing new, which hid a loss
+    # nobody had read while the channels stayed dark (dev/changelog/1361).
+    'EPG_SOURCE_COVERAGE_LOST': {'label': 'Channels Lost Their Guide', 'severity': 'WARN'},
     # A source on its own refresh interval with no good refresh in twice that interval. A
     # source riding its owner's sync is covered by SYNC_ACCOUNT_OVERDUE instead
     # (DESIGN-epg-sources.md §12.1).
@@ -322,6 +327,13 @@ ALERT_TYPES = {
         'self_clearing': True},
     'SECOND_INSTANCE_DETECTED': {
         'label': 'Second Live Instance Detected', 'severity': 'CRIT'},
+    # The output feed (app/output_feed.py, DESIGN-output-feed.md section 8). INFO for the two
+    # about one viewer: a recording taking an IPTV app's seat is ChannelBin doing what it is for, and
+    # the IPTV app reconnects on its own; the point is that the cut is named, never silent. WARN
+    # for a group played with nothing servable - that one is a configuration to fix.
+    'VIEWER_PREEMPTED': {'label': 'IPTV App Cut For A Recording', 'severity': 'INFO'},
+    'VIEWER_REFUSED': {'label': 'IPTV App Refused', 'severity': 'INFO'},
+    'FEED_NO_MEMBER': {'label': 'Output Feed Group Has Nothing To Play', 'severity': 'WARN'},
     # The one thread every scheduled recording, sync and window check depends on has
     # exited. Self-clearing because the only thing that ends the condition is the next
     # start, and init_scheduler() dismisses the row there (dev/changelog/1114).
@@ -587,12 +599,36 @@ def update_storage_path_alert(path, probe, what: str, consequence: str):
     Callers must gate this on an actual change of outcome: the disk readout behind it is
     polled every 15s per open browser tab, and an ungated call would put two queries on
     every one of those polls forever.
+
+    Inside a request the write waits until the view has returned. The readout runs in
+    the middle of the Dashboard's render, and the commit the alert needs expires every
+    row that render had loaded, so the timeline then re-read each recording and its
+    segments one query at a time - 26 queries at 8 rows against 170 at 80, on the one
+    request where a folder first turned unusable or recovered (dev/changelog/1355). An
+    after-request function still runs inside the request's app context, on an error
+    response the app builds too, so the alert lands after the page is built. Two edges
+    of that: the page which discovers the dead folder renders without the alert it just
+    raised - the next nav-status poll shows it - and with exception propagation on
+    (flask.debug, or a test app) an unhandled view exception skips the after-request
+    functions, so the alert then waits for the path's next change of state. Off a
+    request (the storage sweep, readiness) the write is immediate as before.
     """
-    from flask import has_app_context
-    from .fs_utils import PATH_OK, describe_dir_problem
+    from flask import after_this_request, has_app_context, has_request_context
 
     if not has_app_context():
         return
+    if has_request_context():
+        @after_this_request
+        def _write_after_render(response):
+            _write_storage_path_alert(path, probe, what, consequence)
+            return response
+        return
+    _write_storage_path_alert(path, probe, what, consequence)
+
+
+def _write_storage_path_alert(path, probe, what, consequence):
+    from .fs_utils import PATH_OK, describe_dir_problem
+
     try:
         if probe.outcome == PATH_OK:
             dismiss_open_alerts(STORAGE_PATH_UNUSABLE, path)

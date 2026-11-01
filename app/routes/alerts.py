@@ -82,7 +82,7 @@ def _resolve_alert_link(a: Alert) -> tuple[str, str] | None:
     other_value = _LIFECYCLE_ALERT_OTHER_VALUE.get(a.alert_type)
     if other_value is not None and len(parts) == 3 and parts[0] == 'account' and parts[1].isdigit():
         return (url_for('channels.channel_browser', **{'f.other': other_value, 'f.acct': parts[1]}),
-                'Channel Search')
+                'Search')
 
     if len(parts) >= 2 and parts[1].isdigit():
         if parts[0] == 'group':
