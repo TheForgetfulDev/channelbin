@@ -543,7 +543,7 @@ class CssClassDefinedTests(unittest.TestCase):
                           'rd-capact', 'rd-whylist', 'rd-row', 'rd-rname', 'rd-rcaret',
                           'rd-rfound', 'rd-ract', 'rd-muted', 'rd-detail', 'rd-dk', 'rd-dv',
                           'rd-comp', 'rd-progress', 'rd-bar', 'rd-intro',
-                          # Maintenance's Readiness nav badges and rail pip. The markup
+                          # The Readiness link's nav badges and rail pip. The markup
                           # is in base.html, but only applyReadiness() ever shows them, and
                           # both badges shipped with no rule, drawn grey like any plain
                           # count (dev/docs/BUGS.md 2026-09-18 @ 09:48:43 PM,
@@ -739,6 +739,9 @@ class RetiredUiClassTests(unittest.TestCase):
         'xtra': "opt the table into `.tbl-cards` with a `data-label` on every cell "
                 "(DESIGN.md 3.2) - a phone gets every column as a card line, not half of "
                 "them hidden (dev/changelog/1344)",
+        'page-sub': "a page's what-it-is-for text is `{% call page_about() %}` "
+                    "(_macros.html, DESIGN.md 3.21), closed by default; a short muted "
+                    "sentence elsewhere is `.page-intro`",
     }
 
     # Two retirements the name scan above cannot express. `.table` shares its name with the
@@ -2520,7 +2523,8 @@ class SettingsTierDeclaredTests(unittest.TestCase):
     refuses a bare argument after defaulted ones), so a call that forgets it renders an
     empty data-tier and shows in both views. This is the enforcement point (DESIGN.md 15.9,
     dev/changelog/1005). A call with an empty path (the LAN-exposure warning) is not a
-    setting and has no tier.
+    setting, so it is not held to this; it may pass a tier to choose its view
+    (dev/changelog/1369).
     """
 
     _FIELD_MACROS = HandTypedSettingsDefaultTests._FIELD_MACROS

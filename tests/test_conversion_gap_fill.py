@@ -14,7 +14,6 @@ import os
 import shutil
 import subprocess
 import sys
-import tempfile
 import unittest
 from datetime import datetime, timedelta
 from unittest import mock
@@ -26,7 +25,7 @@ import app.postprocessor as ppmod  # noqa: E402
 from app import db, toolchain  # noqa: E402
 from app.database import Recording, RecordingEvent, RecordingSegment, DIAGNOSTICS  # noqa: E402
 from app.postprocessor import ConversionResult, do_postprocess  # noqa: E402
-from tests.support import seed  # noqa: E402
+from tests.support import clips, seed  # noqa: E402
 from tests.support.app import make_test_app  # noqa: E402
 
 _HAVE_FFMPEG = bool(shutil.which('ffmpeg') and shutil.which('ffprobe'))
@@ -78,25 +77,25 @@ def _config(**pp_overrides):
     }})
 
 
+def _build_sources(d):
+    """The source clips every class reads from, built once per process (tests/support/clips.py)."""
+    # A capture segment whose video stopped 15s before its audio, then a whole one: the
+    # concat demuxer places segment 2 after segment 1's audio, leaving a 15s video gap.
+    _clip(os.path.join(d, 'short.ts'), 10, 25)
+    _clip(os.path.join(d, 'whole.ts'), 20, 20)
+    _concat(os.path.join(d, 'seam.ts'),
+            [os.path.join(d, 'short.ts'), os.path.join(d, 'whole.ts')], d)
+    # The video stops 15s before the audio at the end of the file.
+    _clip(os.path.join(d, 'tail.ts'), 10, 25)
+    _clip(os.path.join(d, 'clean.ts'), 10, 10)
+
+
 @unittest.skipUnless(_HAVE_FFMPEG, 'needs ffmpeg and ffprobe on PATH')
 class _GapCase(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.src = tempfile.mkdtemp(prefix='gapfill-src-')
-        d = cls.src
-        # A capture segment whose video stopped 15s before its audio, then a whole one: the
-        # concat demuxer places segment 2 after segment 1's audio, leaving a 15s video gap.
-        _clip(os.path.join(d, 'short.ts'), 10, 25)
-        _clip(os.path.join(d, 'whole.ts'), 20, 20)
-        _concat(os.path.join(d, 'seam.ts'),
-                [os.path.join(d, 'short.ts'), os.path.join(d, 'whole.ts')], d)
-        # The video stops 15s before the audio at the end of the file.
-        _clip(os.path.join(d, 'tail.ts'), 10, 25)
-        _clip(os.path.join(d, 'clean.ts'), 10, 10)
-
-    @classmethod
-    def tearDownClass(cls):
-        shutil.rmtree(cls.src, ignore_errors=True)
+        # Shared and read-only: _use() copies out of it, nothing writes into it.
+        cls.src = clips.shared(__name__, _build_sources, prefix='gapfill-src-')
 
     def setUp(self):
         toolchain.reset_cache()

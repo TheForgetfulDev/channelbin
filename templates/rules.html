@@ -1,4 +1,5 @@
 {% extends "base.html" %}
+{% from "_macros.html" import page_about %}
 {% import "_macros.html" as m %}
 {% block title %}Auto-record rules - ChannelBin{% endblock %}
 
@@ -17,11 +18,11 @@
   </h1>
   <a class="btn btn-primary" href="{{ page_config.newRuleUrl }}">+ New rule</a>
 </div>
-<p class="page-sub">
+{% call page_about() %}
   A rule is a saved Programs search that records whatever it finds. Each upcoming program it
   matches is scheduled once as an ordinary recording, now and again whenever the guide
   refreshes, so a weekly event gets recorded without coming back to schedule it.
-</p>
+{% endcall %}
 
 <div id="rules-body">
 {# How far the guide reaches and what refreshes it: a rule can only schedule what is listed. #}

@@ -782,6 +782,10 @@ body.scroll-locked { position: fixed; left: 0; right: 0; width: 100%; overflow: 
 .sidebar {
   width: var(--sidebar-w); flex: 0 0 var(--sidebar-w); background: var(--bg1); border-right: 1px solid var(--border-soft);
   padding: 14px 12px; position: sticky; top: 0; height: 100vh; overflow-y: auto;
+  /* The browser's default scrollbar is the light one against this dark menu. Scoped to
+     the two menus rather than color-scheme on :root, which would restyle every native form
+     control in the app as well. Same recipe and fallback note as .tl-scroll. */
+  scrollbar-width: thin; scrollbar-color: var(--border) transparent;
   display: flex; flex-direction: column;
   /* z-index required: sticky creates a stacking context, so a popover anchored
      inside (the collapsed rail's tooltips) can only paint above the main column
@@ -794,10 +798,35 @@ body.scroll-locked { position: fixed; left: 0; right: 0; width: 100%; overflow: 
 .brand:hover { text-decoration: none; color: var(--text); }
 .brand img { width: 22px; height: 22px; display: block; flex-shrink: 0; }
 .brand .nav-t { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.nav-section { font-size: var(--fs-xs); font-weight: 600; letter-spacing: .09em; color: var(--text-faint); text-transform: uppercase; padding: 9px 8px 3px; }
-/* Dashboard leads the menu with no heading above it, so it supplies the top offset
-   the first section heading used to give the nav under the brand row. */
-.brand-row + .nav-link { margin-top: 5px; }
+/* A menu section (DESIGN.md 2, amended 2026-10-31, mockup 48). Each one starts with a
+   hairline, so its heading reads as the start of a new group and never as a row of the
+   section above. The heading is the button that folds it: the rows' size, brighter and
+   bolder than a row. While folded it shows a second line naming the pages inside (each
+   name unbreakable, so a wrapped line breaks between pages) and .nav-sum, the copies of
+   any red or amber count inside, which base.html's applyNavFolds() fills. */
+.nav-sec { border-top: 1px solid var(--border-soft); margin-top: 8px; padding-top: 4px; }
+.nav-section {
+  display: block; width: 100%; background: none; border: none; border-radius: var(--radius-sm);
+  font: inherit; font-size: var(--fs-lg); font-weight: 600; color: var(--text);
+  text-align: left; padding: 6px 8px;
+}
+/* Only a folding heading is a button; Channels & guide's plain heading is the same text
+   without the pointer or the hover (dev/changelog/1372). */
+.nav-fold { cursor: pointer; }
+.nav-fold:hover { background: var(--bg2); }
+.nav-fh { display: flex; align-items: center; gap: 6px; }
+.nav-fh .nav-t { flex: 1; min-width: 0; }
+.nav-car { width: 15px; height: 15px; transition: transform .12s ease; }
+.nav-sec:not(.is-folded) .nav-car { transform: rotate(90deg); }
+.nav-sum { display: inline-flex; gap: 4px; align-items: center; }
+.nav-sum .nav-count-bad + .nav-count-warn,
+.nav-sum .nav-count-ready-bad + .nav-count-ready-warn { margin-left: -1px; }
+.nav-hint { display: block; margin-top: 3px; font-size: var(--fs-sm); font-weight: 400; color: var(--text-faint); line-height: 1.35; }
+.nav-hn { white-space: nowrap; }
+.nav-sec:not(.is-folded) .nav-hint,
+.nav-sec:not(.is-folded) .nav-sum,
+.nav-sec.is-folded .nav-sec-body { display: none; }
+.nav-sec.is-folded .nav-section { padding-bottom: 7px; }
 /* The icon joins the row, so the label takes the slack and the count stays pinned
    right - what justify-content: space-between did on its own with two children. */
 .nav-link {
@@ -817,7 +846,7 @@ body.scroll-locked { position: fixed; left: 0; right: 0; width: 100%; overflow: 
 .nav-count.nav-count-warn,
 .nav-link.active .nav-count.nav-count-warn { background: var(--warn-soft); color: var(--warn); font-weight: 600; }
 .nav-count-bad + .nav-count-warn { margin-left: -5px; }
-/* Maintenance's Readiness pair: blocked in red, degraded in amber. Distinct names from the
+/* The Readiness link's pair: blocked in red, degraded in amber. Distinct names from the
    Alerts pair so nav-alerts.js never writes alert numbers here (dev/changelog/950); the
    rules themselves were missing until dev/changelog/1038. */
 .nav-count.nav-count-ready-bad,
@@ -841,7 +870,9 @@ body.scroll-locked { position: fixed; left: 0; right: 0; width: 100%; overflow: 
    A 32px bordered button at the top right of the brand row; collapsed, CSS
    `order` lifts it above the logo and reveals the hairline between them, while
    the DOM order stays brand -> rule -> button in both states. */
-.brand-row { display: flex; align-items: center; gap: 8px; padding: 0 2px 4px; min-height: 34px; }
+/* The margin is the offset above the menu's first row. On the row itself it went missing
+   whenever that row is Get started, hidden once setup is done. */
+.brand-row { display: flex; align-items: center; gap: 8px; padding: 0 2px 4px; min-height: 34px; margin-bottom: 5px; }
 .brand-row .brand { flex: 1; }
 .navcollapse {
   flex: none; width: 32px; height: 32px; display: inline-flex; align-items: center; justify-content: center;
@@ -884,9 +915,13 @@ body.scroll-locked { position: fixed; left: 0; right: 0; width: 100%; overflow: 
   body.nav-min .nav-count { display: none; }
   body.nav-min .nav-pip { display: block; }
   /* A section heading with no room for its word becomes the hairline it was
-     already drawing in the reader's head. */
-  body.nav-min .nav-section { padding: 9px 6px 8px; }
+     already drawing in the reader's head. Nothing folds on the rail: it is icons only,
+     so every destination stays one click away. */
+  body.nav-min .nav-section { padding: 9px 6px 8px; pointer-events: none; }
   body.nav-min .nav-section::after { content: ''; display: block; height: 1px; background: var(--border-soft); }
+  body.nav-min .nav-sec { border-top: none; margin-top: 0; padding-top: 0; }
+  body.nav-min .nav-sec.is-folded .nav-sec-body { display: block; }
+  body.nav-min .nav-hint, body.nav-min .nav-sum, body.nav-min .nav-car { display: none; }
   /* Hidden outright, not squeezed into the rail: the numbers did not go anywhere,
      the top bar's stats chip carries them in both states. Without that chip this
      rule would be exactly the silent drop the app never does. */
@@ -926,22 +961,29 @@ body.scroll-locked { position: fixed; left: 0; right: 0; width: 100%; overflow: 
 .chip-stats:hover, .chip-stats.on { color: var(--text); background: var(--bg3); }
 .chip-i { width: 15px; height: 15px; display: block; }
 .topnav .spacer { flex: 1; }
-.topnav-toggle {
+/* The TV Guide and Search shortcuts (DESIGN.md 9.2, amended 2026-10-31) are the menu
+   button's size and frame, quieter than it, and lit like an active menu row on their page. */
+.topnav-toggle, .topnav-sc {
   background: none; border: 1px solid var(--border); border-radius: var(--radius-sm);
   color: var(--text); font-size: var(--fs-xl); cursor: pointer; padding: 3px 10px; line-height: 1.4;
 }
+.topnav-sc { display: inline-flex; align-items: center; color: var(--text-muted); }
+.topnav-sc:hover { color: var(--text); background: var(--bg2); text-decoration: none; }
+.topnav-sc.active { color: var(--accent-text); background: var(--accent-soft); border-color: var(--accent); }
+.topnav-sc + .topnav-sc { margin-left: -4px; }
 .topnav-menu {
   display: none; position: fixed; top: var(--topnav-h); left: 0; right: 0; bottom: 0; overflow-y: auto;
+  scrollbar-width: thin; scrollbar-color: var(--border) transparent;
   background: var(--bg1); border-bottom: 1px solid var(--border-soft);
   padding: 6px 12px 18px; z-index: 139;
 }
 .topnav-menu.open { display: block; }
 .topnav-menu .nav-link { padding: 10px 8px; font-size: var(--fs-base); }
-/* Density trim (DESIGN.md 9.7) so the menu doesn't scroll on a normal phone.
-   Scoped to .topnav-menu on purpose: .nav-section is shared with the desktop
-   sidebar, and an unscoped trim re-tightens approved desktop density.
-   Tap targets are never densified to buy fit - .nav-link stays at 10px 8px (3.9). */
-.topnav-menu .nav-section { padding: 10px 8px 4px; }
+/* The phone menu's headings match its rows' size, and a folding one is a tap target, open
+   or folded, so it gets the height a row has (3.9); the plain heading keeps the same height
+   so the headings line up. Scoped to .topnav-menu: .nav-section is shared with the desktop
+   sidebar. */
+.topnav-menu .nav-sec .nav-section { font-size: var(--fs-base); padding: 10px 8px; }
 .menu-scrim { position: fixed; top: var(--topnav-h); left: 0; right: 0; bottom: 0; z-index: 138; background: rgba(0,0,0,.45); display: none; }
 /* ≥601px: the same single-column menu becomes a drawer + scrim on the LEFT, the
    same side as the button that opened it (DESIGN.md 9.7, amended 2026-07-29; a
@@ -950,6 +992,10 @@ body.scroll-locked { position: fixed; left: 0; right: 0; width: 100%; overflow: 
 @media (min-width: 601px) and (max-width: 960px) {
   .topnav-menu { left: 0; right: auto; width: 340px; border-right: 1px solid var(--border-soft); box-shadow: var(--shadow-pop); }
   .menu-scrim.open { display: block; }
+}
+/* A portrait phone has no room for the wordmark beside the shortcuts; the logo stays. */
+@media (max-width: 480px) {
+  .topnav .brand .nav-t { display: none; }
 }
 
 /* ── Desktop main column + its top bar (DESIGN.md 2, amended 2026-07-29) ──
@@ -1000,13 +1046,19 @@ body.scroll-locked { position: fixed; left: 0; right: 0; width: 100%; overflow: 
 .pickbar .pb-caret { color: var(--text-muted); flex: none; }
 .pickbar.on { border-color: var(--accent); }
 .pickbar.on .pb-cur { color: var(--accent-text); }
-/* The optional subtitle of 3.10, when it is a sentence rather than the short
-   count/label that rides inside the h1 as .sub. Measured rather than free: 76ch
-   is where a line stops being comfortably readable at this size. */
-.page-sub { font-size: var(--fs-md); color: var(--text-muted); line-height: 1.5; max-width: 76ch; margin-bottom: 2px; }
-/* Mobile-only header action (DESIGN.md 9.3) - the desktop schedule button hides at
-   ≤960px in favor of a "TV Guide" link, since scheduling happens from the guide. */
-.head-action-guide { display: none; }
+/* What a page is for (DESIGN.md 3.21, the page_about() macro): one line under the header,
+   closed by default, the text in a panel once opened. Measured rather than free: 76ch is
+   where a line stops being comfortably readable at this size. */
+.page-about { margin-bottom: 2px; }
+.page-about > summary { display: inline-flex; align-items: center; gap: 6px; padding: 5px 0;
+  font-size: var(--fs-md); color: var(--text-muted); cursor: pointer; list-style: none; user-select: none; }
+.page-about > summary::-webkit-details-marker { display: none; }
+.page-about > summary:hover { color: var(--accent-text); }
+.page-about .pa-caret { transition: transform .15s; }
+.page-about[open] .pa-caret { transform: rotate(90deg); }
+.page-about-body { font-size: var(--fs-md); color: var(--text-muted); line-height: 1.5; max-width: 76ch;
+  margin: 2px 0 8px; padding: 10px 14px; background: var(--bg1); border: 1px solid var(--border);
+  border-radius: var(--radius); }
 .back { display: inline-flex; align-items: center; gap: 6px; font-size: var(--fs-md); color: var(--text-muted); margin-bottom: 14px; }
 .back:hover { color: var(--accent-text); text-decoration: none; }
 
@@ -2591,8 +2643,6 @@ body.actbar-on #app-toast { bottom: 78px; }
      is affected, not just one page (dev/changelog/755). */
   .toolbar .search-wrap { flex: 1 1 100%; }
   .toolbar .search-wrap .search { width: 100%; }
-  .head-action-schedule { display: none; }
-  .head-action-guide { display: inline-flex; }
   .sort-chip-wrap { display: inline-flex; }
 
   /* ── The filename designer on a phone (DESIGN.md 15.5 item 3) ──────────
@@ -3430,6 +3480,7 @@ a.shot-link { display: block; width: fit-content; cursor: zoom-in; }
 }
 .gs-b-title { font-size: var(--fs-2xl); font-weight: 700; line-height: 1.25; margin-top: 4px; }
 .gs-b-text { font-size: var(--fs-lg); line-height: 1.5; margin-top: 4px; opacity: .92; max-width: 70ch; }
+.gs-b-also { font-size: var(--fs-md); font-weight: 700; line-height: 1.5; margin-top: 6px; }
 /* Equal fr tracks in one grid, however many steps there are: nothing to slide. */
 .gs-segs {
   display: grid; grid-auto-flow: column; grid-auto-columns: minmax(0, 1fr);
@@ -3783,19 +3834,17 @@ a.shot-link { display: block; width: fit-content; cursor: zoom-in; }
 .tl-job { position: absolute; top: 8px; bottom: 0; width: 16px; margin-left: -8px; display: flex; align-items: center; justify-content: center; cursor: pointer; }
 .tl-job i { width: 9px; height: 9px; transform: rotate(45deg); border-radius: 1px; background: var(--accent); border: 1px solid var(--accent); }
 .tl-job:hover i { filter: brightness(1.3); }
-.tl-job.done i { background: transparent; border-color: var(--text-faint); }
-.tl-job.running i { background: var(--ok); border-color: var(--ok); animation: jobpulse 1.6s ease-in-out infinite; }
+/* No running or finished state: a job under way is the nav chip's and the Dashboard's
+   activity section's to show, and a rail that drew it too would be a second updater for
+   one fact (dev/changelog/1354). */
 /* An estimate the app does not have is drawn as an OUTLINE, never as a length.
-   Guessing a width here would put a number on the axis that nothing backs (16.3).
-   Every job renders this today - the app has no runtime history yet. */
+   Guessing a width here would put a number on the axis that nothing backs (16.3). */
 .tl-job.unknown i { background: transparent; border-style: dotted; border-color: var(--text-muted); }
 .tl-job.clash i { background: var(--warn-soft); border-color: var(--warn); }
-@keyframes jobpulse { 50% { opacity: .45; } }
 /* Wide enough to read: drawn as a real bar on the same axis as the recordings
    above it, so its length means what theirs does. */
 .tl-job.bar { width: auto; margin-left: 0; justify-content: flex-start; border-radius: var(--radius-sm); background: var(--accent-soft); border: 1px solid var(--accent); min-width: 4px; }
 .tl-job.bar i { display: none; }
-.tl-job.bar.running { background: var(--ok-soft); border-color: var(--ok); }
 .tl-job.bar.clash { background: var(--warn-soft); border-color: var(--warn); }
 
 /* ── Mobile (16.5) ───────────────────────────────────────────────────
@@ -3944,7 +3993,7 @@ a.shot-link { display: block; width: fit-content; cursor: zoom-in; }
   margin-top: 1px; overflow: hidden; text-overflow: ellipsis;
 }
 .acct-rows .arow:has(.a-note) .a-num { align-self: start; }
-/* An account's hidden count (macro hidden_channels_link): a link to Hide Rules that keeps
+/* An account's hidden count (macro hidden_channels_link): a link to Hide Channels that keeps
    the color of the text around it, underlined so it reads as one. */
 .hidden-link { color: inherit; text-decoration: underline dotted; text-underline-offset: 2px; }
 .hidden-link:hover { color: var(--accent-text); }
@@ -4368,6 +4417,10 @@ a.shot-link { display: block; width: fit-content; cursor: zoom-in; }
   margin-left: 2px; font-size: 1.25em; line-height: 1;
   -webkit-text-stroke: .6px currentColor; position: relative; top: .5px;
 }
+/* A menu trigger's caret, drawn as large as that arrow: the registry's menu-down is a small
+   triangle in the middle of its box, and at 1em it read as a dot beside the arrow. The
+   negative margins hand the box's empty edges back, so the button keeps its height. */
+.btn .btn-caret { width: 1.5em; height: 1.5em; margin: -.25em -.4em -.25em -.15em; }
 
 /* ── Sync history ────────────────────────────────────────────────────────────
    ONE markup for both breakpoints (§17.5 item 5): every column survives at every

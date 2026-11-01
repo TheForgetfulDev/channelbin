@@ -46,6 +46,8 @@ from app.health_score import (  # noqa: E402
 )
 from tests.support import make_test_app  # noqa: E402
 from tests.support import seed  # noqa: E402
+from app.tz_utils import local_input_value  # noqa: E402
+from tests.support.clock import tomorrow_local_noon  # noqa: E402
 
 ALERT_TYPE = 'RECORDING_CHANNEL_FAILING'
 
@@ -312,7 +314,7 @@ class ScheduleTimeAlertTests(unittest.TestCase):
     def setUp(self):
         # start_scheduler=True: new_recording_json's schedule_recording() call needs a
         # live APScheduler instance to register the start/stop jobs against. Every
-        # start_time below is an hour in the future, so nothing actually fires during
+        # start_time below is tomorrow, so nothing actually fires during
         # the test (same reasoning as CreateRecordingContentionTests would need if it
         # weren't deliberately testing the immediate-fire path).
         self.t = make_test_app(start_scheduler=True)
@@ -328,13 +330,13 @@ class ScheduleTimeAlertTests(unittest.TestCase):
         self.t.cleanup()
 
     def _post(self, **fields):
-        start = datetime.utcnow() + timedelta(hours=1)
+        start = tomorrow_local_noon()
         stop = start + timedelta(hours=1)
         data = {
             'name': 'Test Rec',
             'url': 'http://example.test/live/1',
-            'start_time': start.strftime('%Y-%m-%dT%H:%M'),
-            'stop_time': stop.strftime('%Y-%m-%dT%H:%M'),
+            'start_time': local_input_value(start),
+            'stop_time': local_input_value(stop),
         }
         data.update(fields)
         return self.t.client.post('/recordings/new-json', data=data)

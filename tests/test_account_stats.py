@@ -449,6 +449,70 @@ class CatchUpTests(_LedgerCase):
         self.assertEqual(self.totals(self.a)['capture_seconds'], 0)
 
 
+class EndedRecordingOpenSegmentTests(_LedgerCase):
+    """BUGS.md 2026-10-31 08:20 PM: the segment watermark stopped at any open segment, with
+    no check that its recording could still close it, and a page view during any recording
+    counted rows the fold could not pass and committed a no-op on every load."""
+
+    def test_open_segment_on_an_ended_recording_does_not_hold_the_watermark(self):
+        stuck_rec = seed.make_recording(status='ABORTED', channel_id=self.ch_a.id,
+                                        completed_at=datetime.utcnow() - timedelta(hours=2))
+        stuck = seed.make_segment(stuck_rec, self.ch_a, T0, None, 0)
+        rec = seed.make_recording(status='COMPLETED', channel_id=self.ch_b.id)
+        later = seed.make_segment(rec, self.ch_b, T0, T0 + timedelta(minutes=5), 0)
+        db.session.commit()
+        account_stats.refresh_ledger()
+        self.assertEqual(self.totals(self.b)['capture_seconds'], 300)
+        a = self.totals(self.a)
+        self.assertEqual((a['capture_seconds'], a['segments'], a['recordings']), (0, 1, 1),
+                         'the stuck segment counts as a segment with no capture time')
+        self.assertEqual(db.session.get(AccountStatState, 1).segment_watermark, later.id)
+        self.assertGreater(later.id, stuck.id)
+
+    def test_a_just_aborted_recordings_open_segment_still_holds_the_watermark(self):
+        """Abort commits ABORTED before it kills ffmpeg and closes the segment. A fold in
+        that gap must wait for the close, or the segment's whole length is lost."""
+        rec = seed.make_recording(status='ABORTED', channel_id=self.ch_a.id,
+                                  completed_at=datetime.utcnow())
+        closing = seed.make_segment(rec, self.ch_a, T0, None, 0)
+        db.session.commit()
+        account_stats.refresh_ledger()
+        self.assertEqual(self.totals(self.a)['segments'], 0)
+        seg = db.session.get(RecordingSegment, closing.id)
+        seg.ended_at = T0 + timedelta(hours=3)
+        db.session.commit()
+        account_stats.refresh_ledger()
+        self.assertEqual(self.totals(self.a)['capture_seconds'], 3 * 3600)
+
+    def test_rows_behind_a_running_segment_are_not_pending(self):
+        running_rec = seed.make_recording(status='IN_PROGRESS', channel_id=self.ch_a.id)
+        seed.make_segment(running_rec, self.ch_a, T0, None, 0)
+        rec = seed.make_recording(status='COMPLETED', channel_id=self.ch_b.id)
+        seed.make_segment(rec, self.ch_b, T0, T0 + timedelta(minutes=5), 0)
+        running_test = seed.make_channel_test(self.ch_a, status='FAILED', test_started_at=T0,
+                                              test_ended_at=None)
+        seed.make_channel_test(self.ch_b, status='COMPLETED', test_started_at=T0)
+        db.session.commit()
+        account_stats.refresh_ledger()
+        self.assertEqual(account_stats.pending_rows(), 0)
+        self.assertGreater(running_test.id, 0)
+
+    def test_a_fold_that_passes_nothing_writes_nothing(self):
+        running_rec = seed.make_recording(status='IN_PROGRESS', channel_id=self.ch_a.id)
+        seed.make_segment(running_rec, self.ch_a, T0, None, 0)
+        rec = seed.make_recording(status='COMPLETED', channel_id=self.ch_b.id)
+        seed.make_segment(rec, self.ch_b, T0, T0 + timedelta(minutes=5), 0)
+        db.session.commit()
+        account_stats.refresh_ledger()
+        before = db.session.get(AccountStatState, 1).refreshed_at
+        with mock.patch.object(account_stats.db.session, 'commit',
+                               side_effect=AssertionError('a no-op fold committed')):
+            account_stats.refresh_ledger()
+            self.assertIsNone(account_stats.ensure_fresh(self.t.app))
+        db.session.expire_all()
+        self.assertEqual(db.session.get(AccountStatState, 1).refreshed_at, before)
+
+
 class AccountPageTests(_LedgerCase):
 
     def recorded_time(self, account):
@@ -472,6 +536,42 @@ class AccountPageTests(_LedgerCase):
         db.session.commit()
         self.assertEqual(self.recorded_time(self.a), fmt_duration(7200))
         self.assertEqual(self.recorded_time(self.b), fmt_duration(1800))
+
+    def test_fold_writes_nothing_for_an_account_deleted_after_its_rows_were_read(self):
+        """BUGS.md 2026-10-31 08:14 PM: the fold reads Channel.account_id, then upserts in a
+        later statement; an account delete landing between the two left day rows for an
+        account that no longer existed. The delete is run where it would land, after the
+        last read and before the write."""
+        rec = seed.make_recording(status='COMPLETED', channel_id=self.ch_a.id)
+        seed.make_segment(rec, self.ch_a, T0, T0 + timedelta(hours=1), 0)
+        rec_b = seed.make_recording(status='COMPLETED', channel_id=self.ch_b.id)
+        seg_b = seed.make_segment(rec_b, self.ch_b, T0, T0 + timedelta(hours=2), 0)
+        db.session.commit()
+        gone = self.b.id
+        real_fold_events = account_stats._fold_events
+
+        def _fold_events_then_delete(*args):
+            out = real_fold_events(*args)
+            db.session.execute(db.text('DELETE FROM accounts WHERE id = :i'), {'i': gone})
+            return out
+
+        with mock.patch.object(account_stats, '_fold_events', _fold_events_then_delete):
+            account_stats.refresh_ledger()
+        db.session.expire_all()
+        self.assertEqual(AccountStatDay.query.filter_by(account_id=gone).count(), 0,
+                         'the fold wrote a day row for an account deleted under it')
+        self.assertEqual(self.totals(self.a)['capture_seconds'], 3600)
+        self.assertEqual(db.session.get(AccountStatState, 1).segment_watermark, seg_b.id)
+
+    def test_a_deleted_accounts_id_is_never_handed_to_the_next_account(self):
+        """BUGS.md 2026-10-31 08:14 PM: `accounts` re-issued the newest deleted id, so the
+        next account created inherited whatever still named it."""
+        gone = self.b.id
+        resp = self.t.client.delete(f'/api/accounts/{gone}')
+        self.assertEqual(resp.status_code, 200, resp.get_data(as_text=True))
+        fresh = seed.make_account(name='Provider C')
+        db.session.commit()
+        self.assertGreater(fresh.id, gone, 'a deleted account id was handed to a new account')
 
     def test_account_delete_removes_its_ledger_rows(self):
         rec = seed.make_recording(status='COMPLETED', channel_id=self.ch_a.id)

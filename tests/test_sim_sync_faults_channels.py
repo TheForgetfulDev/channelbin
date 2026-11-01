@@ -156,11 +156,14 @@ class TrialAccountTests(SimSyncCase):
 class AuthAnswerTests(SimSyncCase):
     def test_an_auth_answered_with_a_playlist_imports_it_unclassified(self):
         """Characterization: a panel answering player_api.php with M3U is accepted; the
-        playlist still supplies every channel, and the missing catalog is reported."""
+        playlist still supplies every channel, and the missing catalog is reported on the
+        sync row as well as by the alert (dev/changelog/1359)."""
         aid = self.add_xtream()
         self.sim.inject('auth_as_playlist', 'north-tv')
         log = self.sync(aid)
-        self.assertEqual(log.status, 'SUCCESS')
+        self.assertEqual(log.status, 'PARTIAL')
+        self.assertIn('answered with an M3U playlist instead of its JSON channel list',
+                      log.error_message)
         self.assertEqual(log.channels_synced, len(self.sim.view('north-tv').rows))
         self.assertAlert('SYNC_LIVE_CLASSIFY_UNAVAILABLE', f'account:{aid}:live-classify')
         account = self.account(aid)
@@ -376,13 +379,49 @@ class PlaylistFaultTests(SimSyncCase):
 
     def test_an_unreadable_catalog_imports_the_playlist_and_says_so(self):
         """Characterization (DESIGN-live-vod.md §4): with no catalog to classify by, the
-        playlist is imported unfiltered and the standing alert says so."""
+        playlist is imported unfiltered, and the sync row and the standing alert both name
+        what came back (dev/changelog/1359)."""
         aid = self.add_xtream()
         self.sim.inject('nonstandard_status', 'north-tv', endpoints=['catalog'])
         log = self.sync(aid)
-        self.assertEqual(log.status, 'SUCCESS')
+        self.assertEqual(log.status, 'PARTIAL')
         self.assertEqual(log.channels_synced, len(self.sim.view('north-tv').rows))
-        self.assertAlert('SYNC_LIVE_CLASSIFY_UNAVAILABLE', f'account:{aid}:live-classify')
+        self.assertIn('the request failed: ', log.error_message)
+        self.assertIn('884', log.error_message)
+        alert = self.assertAlert('SYNC_LIVE_CLASSIFY_UNAVAILABLE', f'account:{aid}:live-classify')
+        self.assertIn(log.error_message, alert.body)
+
+    def test_an_empty_catalog_is_named_on_the_sync_row_and_in_the_alert(self):
+        """Guards dev/docs/BUGS.md 2026-10-30 08:34 PM (empty live catalog): a catalog answered with
+        `[]` while the playlist is whole imports the playlist unfiltered, finishes PARTIAL,
+        and the sync row, the log and the alert all say the provider sent an empty list - the
+        alert adding what came in and what to try, and never the credentials. It clears on
+        the next sync that can read the catalog."""
+        aid = self.add_xtream()
+        self.assertEqual(self.sync(aid).status, 'SUCCESS')
+        password = self.sim.account('north-tv').password
+        fault = self.sim.inject('catalog_empty', 'north-tv')
+        with self.assertLogs('app.xtream_client', 'WARNING') as logs:
+            log = self.sync(aid)
+        self.assertEqual(log.status, 'PARTIAL')
+        self.assertEqual(log.channels_synced, len(self.sim.view('north-tv').rows))
+        self.assertIn('the provider answered with an empty list (HTTP 200, ', log.error_message)
+        self.assertTrue(log.error_message.startswith('Could not tell live channels from VOD:'),
+                        log.error_message)
+        self.assertTrue(any('Live catalog unavailable: the provider answered with an empty '
+                            'list' in line for line in logs.output), logs.output)
+        alert = self.assertAlert('SYNC_LIVE_CLASSIFY_UNAVAILABLE', f'account:{aid}:live-classify')
+        self.assertTrue(alert.body.startswith(log.error_message), alert.body)
+        self.assertIn('This sync added no new channels', alert.body)
+        self.assertIn('What to try: run Sync now', alert.body)
+        for text in (log.error_message, alert.body, *logs.output):
+            self.assertNotIn(password, text)
+
+        self.sim.clear(fault)
+        log = self.sync(aid)
+        self.assertEqual(log.status, 'SUCCESS')
+        self.assertIsNone(log.error_message)
+        self.assertNoAlert('SYNC_LIVE_CLASSIFY_UNAVAILABLE')
 
     def test_gzip_on_the_wire_changes_nothing(self):
         """Characterization: every answer compressed with Content-Encoding is read exactly as

@@ -17,7 +17,6 @@ ESTALE is simulated rather than provoked - neither condition reproduces from a c
 checkout on a healthy mount. Every directory is under the test's own tmpdir, never /dvr.
   python3 -m unittest tests.test_storage_path_alert
 """
-import errno
 import os
 import unittest
 from unittest import mock
@@ -26,20 +25,7 @@ from app import fs_utils
 from app.alerts import STORAGE_PATH_UNUSABLE
 from app.database import Alert
 from tests.support.app import make_test_app
-
-
-def _stale_stat(paths):
-    """os.stat that answers ESTALE for `paths` and delegates everything else.
-
-    Patching os.stat globally without the delegation takes the interpreter down with it.
-    """
-    real = os.stat
-
-    def fake(path, *a, **kw):
-        if str(path) in paths:
-            raise OSError(errno.ESTALE, os.strerror(errno.ESTALE), str(path))
-        return real(path, *a, **kw)
-    return fake
+from tests.support.fakes import stale_stat
 
 
 class StoragePathAlertTests(unittest.TestCase):
@@ -59,7 +45,7 @@ class StoragePathAlertTests(unittest.TestCase):
         from app.routes.system import _system_stats_dict
         if not stale:
             return _system_stats_dict()
-        with mock.patch('os.stat', _stale_stat(set(stale))):
+        with mock.patch('os.stat', stale_stat(set(stale))):
             return _system_stats_dict()
 
     def _alerts(self, source=None):
@@ -118,6 +104,32 @@ class StoragePathAlertTests(unittest.TestCase):
         self._poll()
         self.assertEqual([], self._alerts())
 
+    def test_inside_a_request_the_write_waits_for_the_view(self):
+        """Inside a request the alert is written after the view returns, never in the
+        middle of it: the commit it needs expires every row the render has loaded, which
+        turned the Dashboard timeline into one query per recording on the request where
+        the DVR directory first turned unusable (dev/docs/BUGS.md 2026-09-18 07:34 AM,
+        dev/changelog/1355). The response still carries the alert out."""
+        import errno
+        from app.alerts import update_storage_path_alert
+        from app.fs_utils import DirProbe, PATH_UNREACHABLE
+        from app.storage_dirs import DVR_DIR_ROLE
+        probe = DirProbe(PATH_UNREACHABLE, errno.ESTALE, 'Stale file handle')
+        with self.t.app.test_request_context('/'):
+            update_storage_path_alert(self.mount, probe, DVR_DIR_ROLE.what,
+                                      DVR_DIR_ROLE.consequence)
+            self.assertEqual([], self._alerts(), 'the alert was written mid-request')
+            self.t.app.process_response(self.t.app.response_class())
+        rows = self._alerts()
+        self.assertEqual(1, len(rows))
+        self.assertEqual(self.mount, rows[0].source)
+
+    def test_through_a_request_the_alert_still_lands(self):
+        with mock.patch('os.stat', stale_stat({self.mount})):
+            resp = self.t.client.get('/api/system/stats')
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(1, len(self._alerts()))
+
 
 class MoveDestinationAlertTests(unittest.TestCase):
     """The move-on-complete destination is a configured storage path too, and used not
@@ -139,7 +151,7 @@ class MoveDestinationAlertTests(unittest.TestCase):
 
     def _poll(self, stale=()):
         from app.routes.system import _system_stats_dict
-        with mock.patch('os.stat', _stale_stat(set(stale))):
+        with mock.patch('os.stat', stale_stat(set(stale))):
             return _system_stats_dict()
 
     def test_an_unreachable_destination_raises_its_own_alert(self):

@@ -161,7 +161,11 @@ class SyncShrinkTests(unittest.TestCase):
 
         log_row = AccountSyncLog.query.filter_by(account_id=self.account.id).order_by(
             AccountSyncLog.id.desc()).first()
-        self.assertEqual(log_row.status, 'SUCCESS')
+        # PARTIAL, not SUCCESS: the dump's live channel list is empty too, so the live
+        # filter could not run, and that sync row says so (dev/changelog/1359).
+        self.assertEqual(log_row.status, 'PARTIAL')
+        self.assertIn('The playlist was empty as well, so nothing was imported.',
+                      log_row.error_message)
         # channels_synced counts what this sync SAW, not what survives in the DB - the two
         # diverging is exactly the signal Sync resilience C alerts on.
         self.assertEqual(log_row.channels_synced, 0)

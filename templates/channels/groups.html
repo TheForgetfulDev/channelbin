@@ -1,7 +1,7 @@
 {% extends "base.html" %}
 {% block title %}Channel Groups - ChannelBin{% endblock %}
 
-{% from "_macros.html" import channel_pill, account_pill, status_badge %}
+{% from "_macros.html" import channel_pill, account_pill, status_badge, page_about %}
 
 {% block content %}
 <div class="page-head">
@@ -12,14 +12,16 @@
   <button class="btn btn-primary" id="btn-new-group">+ New Group</button>
 </div>
 
-<p class="page-intro" style="margin-bottom:1rem;">
-  A <strong>channel group</strong> you make holds copies of one channel, from one provider or
-  several. Turn on <strong>Recording</strong> for the copies you would record from and the group
-  can be a single TV Guide row: recordings start on the healthiest one and fail over to the
-  next-best if it dies. Every group carries one <strong>health check</strong>, a schedule that
-  tests its channels to confirm they still play, and a group with no member enabled for
-  recording is simply a health check.
-</p>
+{% call page_about() %}
+  A channel group holds one or more channels (from one provider or several). The group can then
+  be used to run health checks on any channel(s) in it. If you add multiple matching channels
+  and enable recording on them, you can add the group as one channel to your TV Guide. You can
+  then record on that channel and it will record from the healthiest channel in the group, then
+  fail over to the next-best if it dies, and will continue for as many channels as you have in
+  the group. The group health check tests the channels to confirm they work and to identify the
+  highest quality channels. A group with no channels enabled for recording is simply a health
+  check.
+{% endcall %}
 
 <div class="toolbar">
   <span class="search-wrap" id="search-wrap">
@@ -261,7 +263,7 @@
 <div class="empty-state" id="grp-empty"{% if group_rows %} style="display:none"{% endif %}>
   <p>You have no channel groups yet.</p>
   <p class="page-intro">
-    Create one from <a href="{{ url_for('channels.channel_browser') }}">Channel Search</a>
+    Create one from <a href="{{ url_for('channels.channel_browser') }}">Search</a>
     (select channels, then &ldquo;{{ icon('group') }} Group Selected&rdquo;), or with the button above.
   </p>
 </div>

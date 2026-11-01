@@ -14,7 +14,7 @@ rule the feature is built on rather than a detail of one check's wording:
   * Silencing is a registry flag, enforced server-side. A check whose failure means the
     install cannot do its job may not be silenced however the request is shaped.
   * A silenced check stops counting - toward the verdict, toward the capability it sits
-    behind, and toward the count beside Maintenance - and is still reported.
+    behind, and toward the count beside Readiness in the menu - and is still reported.
 
 Runs against a throwaway temp SQLite DB - never the live dvr.db.
   python3 -m unittest tests.test_readiness
@@ -82,11 +82,13 @@ class RegistryTests(unittest.TestCase):
     def test_nothing_that_means_the_install_is_broken_can_be_silenced(self):
         """Which checks may be silenced is the one judgment call in the feature, so it is
         pinned here rather than left to whoever edits the registry next."""
+        # output_feed is ignorable on purpose: an IPTV app that cannot play is a feature not
+        # working, not an install that is broken (DESIGN-output-feed.md 12).
         self.assertEqual(
             sorted(c.id for c in readiness.CHECKS if not c.ignorable),
             ['accounts_any', 'auth_gate', 'db_local', 'db_write', 'ffmpeg', 'ffprobe',
              'guide_content', 'guide_groups', 'scheduler', 'secret_key', 'storage_dirs',
-             'storage_dvr', 'timezone'])
+             'storage_dvr', 'storage_images', 'timezone'])
 
 
 class _AppCase(unittest.TestCase):
@@ -120,7 +122,7 @@ class EvaluationTests(_AppCase):
         self.assertEqual(row['status'], readiness.NOT_RUN)
 
     def test_an_ondemand_check_that_has_not_run_does_not_drag_its_capability_down(self):
-        """Otherwise "Record a program right now" is grey on every load, because the
+        """Otherwise "Record a program" is grey on every load, because the
         provider-login check sits behind it - the opposite of "nothing expensive happens
         because you looked".
 
@@ -427,6 +429,64 @@ class AccountSyncSentenceTests(_AppCase):
         row = next(r for r in readiness.evaluate()['checks'] if r['id'] == 'account_sync')
         self.assertEqual(row['status'], readiness.READY)
         self.assertIn('the oldest 11 hours ago', row['found'])
+
+
+class NotifyCountTests(_AppCase):
+    """dev/docs/BUGS.md 2026-10-31 @ 05:31:19 PM: a new install carries a stanza for every
+    service on offer, and the check read those stanzas as "configured"."""
+
+    def _notify_any_found(self, services):
+        from app.config import load_config as real_load
+        cfg = real_load()
+        cfg['notifications'] = {**cfg.get('notifications', {}), 'services': services}
+        with mock.patch('app.config.load_config', return_value=cfg):
+            ctx = readiness.Context()
+        row = next(r for r in readiness.evaluate(ctx=ctx)['checks'] if r['id'] == 'notify_any')
+        return row
+
+    def test_stanzas_nobody_enabled_read_as_none_enabled_not_as_configured(self):
+        names = ('pushover', 'discord', 'ntfy', 'telegram', 'home_assistant')
+        row = self._notify_any_found({n: {'enabled': False, 'url': ''} for n in names})
+        self.assertEqual(row['status'], readiness.ATTENTION)
+        self.assertEqual(row['found'], 'No notification services are enabled.')
+
+    def test_no_stanzas_at_all_reads_the_same(self):
+        self.assertEqual(self._notify_any_found({})['found'],
+                         'No notification services are enabled.')
+
+    def test_an_enabled_service_is_named(self):
+        row = self._notify_any_found({'pushover': {'enabled': True}, 'ntfy': {'enabled': False}})
+        self.assertEqual(row['status'], readiness.READY)
+        self.assertEqual(row['found'], '1 enabled: pushover')
+
+
+class DegradedVerdictTests(_AppCase):
+    """dev/docs/BUGS.md 2026-10-31 @ 05:31:19 PM: the warning verdict opened "You can still
+    <capability>." and then quoted what stops working, so it said yes and no at once."""
+
+    def test_every_degraded_verdict_is_the_checks_own_consequence(self):
+        fine = result(readiness.READY)
+        for cap in readiness.CAPABILITIES:
+            for cid in cap.needs:
+                check = readiness.CHECKS_BY_ID[cid]
+                # An on-demand answer comes from a run, not from `patched`.
+                if check.advisory or check.cost == readiness.ON_DEMAND:
+                    continue
+                answers = {c.id: fine for c in readiness.CHECKS}
+                answers[cid] = result(readiness.ATTENTION)
+                with self.subTest(check=cid), patched(**answers):
+                    verdict = readiness.evaluate()['verdict']
+                    self.assertEqual(verdict['mark'], 'warning')
+                    self.assertFalse(verdict['sub'].startswith('You can still'), verdict['sub'])
+                    self.assertEqual(verdict['sub'], check.without)
+
+    def test_no_notifications_says_what_you_still_have_and_what_is_missing(self):
+        answers = {c.id: result(readiness.READY) for c in readiness.CHECKS}
+        answers['notify_any'] = result(readiness.ATTENTION)
+        with patched(**answers):
+            verdict = readiness.evaluate()['verdict']
+        self.assertEqual(verdict['sub'], "You can see in ChannelBin if there's an error, but "
+                                         'no external notifications are enabled.')
 
 
 class ReportTests(_AppCase):

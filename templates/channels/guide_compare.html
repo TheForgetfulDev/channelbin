@@ -1,4 +1,5 @@
 {% extends "base.html" %}
+{% from "_macros.html" import page_about %}
 {% import '_macros.html' as m %}
 {% block title %}Compare guide sources - {{ channel.name }} - ChannelBin{% endblock %}
 
@@ -48,11 +49,11 @@
   <h1>Compare guide sources <span class="sub">{{ channel.name }}</span></h1>
   <a href="{{ url_for('channels.channel_detail', channel_id=channel.id) }}" class="btn">{{ icon('back') }} {{ channel.name }}</a>
 </div>
-<p class="page-sub">
+{% call page_about() %}
   What each guide this channel's account reads lists for it, from now on, lined up by start
   time. Two listings are the same program when their titles match and they start within five
   minutes of each other. Nothing here changes which guide the channel uses.
-</p>
+{% endcall %}
 
 {% if not active_source %}
 <div class="empty-state">

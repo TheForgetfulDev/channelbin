@@ -16,7 +16,10 @@ replaced it:
     whatever the priority, per-source delete scope and baseline, and a change of winner
     MOVING rows (never both sources' rows in `epg_entries` at once).
   - CoverageLostTests: a channel that had a guide and has none from any source is named
-    in EPG_SOURCE_COVERAGE_LOST; a refused refresh neither raises nor clears it.
+    in EPG_SOURCE_COVERAGE_LOST, one row per lossy import that only the user dismisses;
+    a refused refresh raises nothing.
+  - CoverageLostThresholdTests: a loss under sync.epg_coverage_lost_alert_percent is a
+    note on the sync log, not an alert; at or past it, both.
   - TeardownTests: account delete takes its sources and every row under them; the hide
     purge and the retention prune cover the alternates table.
   - MigrationTests: m072 turns each account's EPG into a source, stamps the rows, and an
@@ -41,9 +44,10 @@ from app import db  # noqa: E402
 from app import migrations as M  # noqa: E402
 from app.accounts import _do_sync, cleanup_old_epg_entries, import_source  # noqa: E402
 from app.channel_hiding import purge_hidden_epg  # noqa: E402
-from app.database import (Account, Alert, Channel, ChannelEvent, EPGEntry,  # noqa: E402
-                          EpgAlternateEntry, EpgSource, EpgSourceChannel,
-                          EpgSourceSubscription, XtreamAccount, CHANNEL_EPG_SOURCE_CHANGED)
+from app.database import (Account, AccountSyncLog, Alert, Channel,  # noqa: E402
+                          ChannelEvent, EPGEntry, EpgAlternateEntry, EpgSource,
+                          EpgSourceChannel, EpgSourceSubscription, XtreamAccount,
+                          CHANNEL_EPG_SOURCE_CHANGED, SYNC_LOG_SUCCESS)
 from app.epg_sources import (Coverage, REASON_NONE, REASON_ONLY_LISTING,  # noqa: E402
                              REASON_OVERRIDE, REASON_PRIORITY, REASON_REAL_SCHEDULE,
                              normalize_name, resolve_active_source)
@@ -290,7 +294,10 @@ class CoverageLostTests(_Fixture):
         self.assertIsNone(self._coverage_alert().dismissed_at,
                           'a refusal changed no channel\'s guide, so it cannot clear this')
 
-    def test_a_healthy_refresh_clears_it(self):
+    def test_a_refresh_that_loses_nothing_new_leaves_it_for_the_user(self):
+        """dev/changelog/1361: the next import counts only channels that still had a guide,
+        so losing nothing new says nothing about the lost ones - clearing on it hid a loss
+        nobody had read while the channels stayed dark."""
         self._channel('Keeper', 'k.test')
         self._channel('Lost', 'l.test')
         no_guard = {'sync': {'epg_collapse_threshold_percent': 0}}
@@ -299,7 +306,105 @@ class CoverageLostTests(_Fixture):
         import_source(self.src, _xmltv(_schedule('k.test', REAL)), epg_days=3, cfg=no_guard)
         import_source(self.src, _xmltv(_schedule('k.test', REAL)), epg_days=3, cfg=no_guard)
         db.session.expire_all()
-        self.assertIsNotNone(self._coverage_alert().dismissed_at)
+        self.assertIsNone(self._coverage_alert().dismissed_at)
+
+    def test_a_second_loss_is_its_own_row(self):
+        """dev/changelog/1361: refreshed in place, the second loss rewrote the first's
+        channel list and marked it unread again, erasing the first loss."""
+        for name, key in (('Keeper', 'k.test'), ('First Gone', 'a.test'),
+                          ('Second Gone', 'b.test')):
+            self._channel(name, key)
+        no_guard = {'sync': {'epg_collapse_threshold_percent': 0}}
+        everything = _schedule('k.test', REAL) + _schedule('a.test', REAL) + \
+            _schedule('b.test', REAL)
+        import_source(self.src, _xmltv(everything), epg_days=3, cfg=no_guard)
+        import_source(self.src, _xmltv(_schedule('k.test', REAL) + _schedule('b.test', REAL)),
+                      epg_days=3, cfg=no_guard)
+        import_source(self.src, _xmltv(_schedule('k.test', REAL)), epg_days=3, cfg=no_guard)
+        db.session.expire_all()
+        rows = Alert.query.filter_by(alert_type='EPG_SOURCE_COVERAGE_LOST',
+                                     dismissed_at=None).order_by(Alert.id).all()
+        self.assertEqual(2, len(rows))
+        self.assertIn('First Gone', rows[0].body)
+        self.assertIn('Second Gone', rows[1].body)
+
+
+class CoverageLostThresholdTests(_Fixture):
+    """dev/changelog/1360: a provider dropping 95 of ~6,950 guided channels - the 2-3% churn
+    its guide shows on most syncs - raised a WARN alert every time. A loss under
+    sync.epg_coverage_lost_alert_percent is named on the sync log and nowhere on Alerts;
+    at or past it the alert fires as before."""
+
+    _coverage_alert = CoverageLostTests._coverage_alert
+
+    def _import_dropping(self, n_total, n_dropped, alert_pct, notes=None):
+        ids = [f'c{i}.test' for i in range(n_total)]
+        for i, xml_id in enumerate(ids):
+            self._channel(f'Chan {i:02d}', xml_id)
+        cfg = {'sync': {'epg_collapse_threshold_percent': 0,
+                        'epg_coverage_lost_alert_percent': alert_pct}}
+        import_source(self.src, _xmltv(sum((_schedule(x, REAL) for x in ids), [])),
+                      epg_days=3, cfg=cfg)
+        kept = ids[n_dropped:]
+        import_source(self.src, _xmltv(sum((_schedule(x, REAL) for x in kept), [])),
+                      epg_days=3, cfg=cfg, notes=notes)
+        db.session.expire_all()
+
+    def test_a_loss_under_the_threshold_raises_no_alert_but_is_noted(self):
+        notes = []
+        self._import_dropping(20, 1, alert_pct=10, notes=notes)
+        self.assertIsNone(self._coverage_alert())
+        self.assertEqual(len(notes), 1)
+        self.assertIn('1 channel(s) lost their guide (5.0% of the 20 that had one)', notes[0])
+        self.assertIn('Chan 00', notes[0])
+
+    def test_a_loss_at_the_threshold_alerts_and_is_still_noted(self):
+        notes = []
+        self._import_dropping(20, 2, alert_pct=10, notes=notes)
+        alert = self._coverage_alert()
+        self.assertIsNotNone(alert)
+        self.assertIsNone(alert.dismissed_at)
+        self.assertIn('10.0% of the 20', alert.body)
+        self.assertEqual(len(notes), 1)
+
+    def test_zero_means_every_loss_alerts(self):
+        self._import_dropping(20, 1, alert_pct=0)
+        self.assertIsNotNone(self._coverage_alert())
+
+    def test_a_loss_under_the_threshold_leaves_a_standing_alert(self):
+        """The earlier loss is still a loss; only the user dismisses it (dev/changelog/1361)."""
+        self._import_dropping(20, 1, alert_pct=0)
+        self.assertIsNone(self._coverage_alert().dismissed_at)
+        cfg = {'sync': {'epg_collapse_threshold_percent': 0,
+                        'epg_coverage_lost_alert_percent': 10}}
+        kept = [f'c{i}.test' for i in range(2, 20)]
+        import_source(self.src, _xmltv(sum((_schedule(x, REAL) for x in kept), [])),
+                      epg_days=3, cfg=cfg)
+        db.session.expire_all()
+        self.assertIsNone(self._coverage_alert().dismissed_at)
+        self.assertEqual(1, Alert.query.filter_by(alert_type='EPG_SOURCE_COVERAGE_LOST').count(),
+                         'a loss under the threshold still raises nothing of its own')
+
+    def test_a_sync_writes_the_note_to_its_log_and_stays_a_success(self):
+        acct = XtreamAccount(name='X', base_url='http://xt.test', username='u',
+                             password='p', status='OK')
+        db.session.add(acct)
+        db.session.commit()
+        note = 'EPG source "X provider guide": 3 channel(s) lost their guide (1.0% of the 300 that had one): A, B, C.'
+
+        def _refresh(*_a, notes=None, **_kw):
+            notes.append(note)
+            return 0, None
+
+        with mock.patch('app.xtream_client._fetch_and_classify_xtream_streams',
+                        return_value=([], None, 0, None)), \
+             mock.patch('app.xtream_client.XtreamClient.check_auth', return_value={}), \
+             mock.patch('app.accounts.refresh_source', side_effect=_refresh):
+            _do_sync(acct.id, threading.Event())
+        db.session.expire_all()
+        row = AccountSyncLog.query.filter_by(account_id=acct.id).one()
+        self.assertEqual(row.status, SYNC_LOG_SUCCESS)
+        self.assertIn(note, row.error_message or '')
 
 
 class TeardownTests(_Fixture):
@@ -361,7 +466,7 @@ class XtreamProviderSourceTests(unittest.TestCase):
         db.session.add(acct)
         db.session.commit()
         with mock.patch('app.xtream_client._fetch_and_classify_xtream_streams',
-                        return_value=([], None, 0)), \
+                        return_value=([], None, 0, None)), \
              mock.patch('app.xtream_client.XtreamClient.check_auth', return_value={}), \
              mock.patch('app.accounts.refresh_source', return_value=(0, None)) as refresh:
             _do_sync(acct.id, threading.Event())

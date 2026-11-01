@@ -5,6 +5,7 @@ import json
 import os
 import shutil
 import socket
+import socketserver
 import struct
 import subprocess
 import sys
@@ -20,6 +21,7 @@ import requests
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from sim import Simulator, build_world, load_world, serve_for_test  # noqa: E402
+from sim import server  # noqa: E402
 from sim.server import THREAD_PREFIX  # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -200,6 +202,35 @@ class LedgerTests(_Served):
         rows = self.sim.ledger.entries()
         self.assertEqual([(r.path, r.status) for r in rows], [('/logos/abc.png', 200)])
         self.assertEqual(rows[0].bytes, len(body))
+
+    def test_a_body_whose_write_times_out_records_only_what_went_out(self):
+        """Guards dev/docs/BUGS.md 2026-11-01 08:55 AM: a client that stops reading a playlist
+        mid-body makes the handler's write time out, and the row kept the whole planned body
+        as sent. Write `n` raises as the socket's timeout would; the first write is the
+        headers."""
+        for n, sent in ((2, 0), (3, server._CHUNK)):
+            with self.subTest(failing_write=n):
+                self.sim.ledger.clear()
+                self._playlist_with_failing_write(n)
+                row = self.sim.ledger.entries(path='/get.php')[0]
+                self.assertEqual(row.bytes, sent)
+                self.assertIn('client went away (TimeoutError)', row.note)
+
+    def _playlist_with_failing_write(self, n):
+        a = self.sim.account('harbor-tv')
+        q = {'username': a.username, 'password': a.password, 'type': 'm3u_plus'}
+        writes = []
+        real_write = socketserver._SocketWriter.write
+
+        def timing_out(writer, data):
+            writes.append(len(data))
+            if len(writes) == n:
+                raise TimeoutError('timed out')
+            return real_write(writer, data)
+
+        with mock.patch.object(socketserver._SocketWriter, 'write', timing_out):
+            with self.assertRaises(requests.RequestException):
+                self.get('harbor-tv', '/get.php', params=q).content
 
 
 class LifecycleTests(unittest.TestCase):

@@ -47,6 +47,7 @@ It's actually been really fun using the search and surfacing channels that I did
 - [Moving to another machine](#moving-to-another-machine)
 - [Versioning and upgrades](#versioning-and-upgrades)
 - [Home Assistant integration](#home-assistant-integration)
+- [Output feed for an IPTV app](#output-feed-for-an-iptv-app)
 - [Troubleshooting a provider sync](#troubleshooting-a-provider-sync)
 - [How I use AI on this project](#how-i-use-ai-on-this-project)
 - [Feedback and contributions](#feedback-and-contributions)
@@ -107,6 +108,9 @@ and hands them to whatever you already use to watch them.
 
 - Health checks that connect to a channel, measure resolution and bitrate against configurable
   thresholds, capture screenshots, and record the result.
+- An output feed: ChannelBin as an Xtream Codes source an IPTV app adds as an account, serving
+  exactly the TV Guide's channels and groups with the guide's listings, a group playing as one
+  channel with failover. Off by default.
 - A live preview: watch or listen to a channel's actual stream from its page, to confirm it is
   the right channel and that it plays before a recording relies on it. The stream is copied
   into a short HLS window, never re-encoded, and a preview gives its connection up to any
@@ -193,8 +197,8 @@ The container writes to the mounts as `PUID:PGID` (default `1000:1000`) rather t
 your recordings are owned by a real account on the host. Set them to your own `id -u` / `id -g`.
 The `/config` volume is chowned to match at every start; `/dvr` deliberately is not (it is
 routinely a large share). ChannelBin checks every folder it is configured to write to - recordings,
-thumbnails, screenshots, backups - and one it cannot write shows up in the Readiness check on
-Maintenance and as an alert, with the uid it was checked as.
+thumbnails, screenshots, backups - and one it cannot write shows up in the Readiness check and
+as an alert, with the uid it was checked as.
 
 `TZ` sets the container's clock. It does **not** set the app's display timezone - that is
 `display.timezone` in `config.yaml`, so scheduled times mean the same thing either way.
@@ -308,8 +312,8 @@ default.
 ## First run
 
 A new install opens on the Dashboard with a **Get started** banner that walks you through four
-steps: add your IPTV account, confirm the machine can record, put the channels you watch in the
-TV Guide, and record something. No IPTV provider yet? Get started can load free example
+steps: add your IPTV account, set up the machine to record, add a channel to the TV Guide, and
+record something. No IPTV provider yet? Get started can load free example
 channels so you can try it first.
 
 - **[Quick start](docs/QUICK-START.md)** - those four steps in detail, from a new install to a
@@ -602,6 +606,41 @@ This half is done in ChannelBin, before you add anything in Home Assistant. Go t
 
 Both are required. The status API rejects a request unless the switch is on and the key matches,
 and it answers the same way in either case, so a switch left off looks exactly like a wrong key.
+
+---
+
+## Output feed for an IPTV app
+
+ChannelBin can be an Xtream Codes source itself. Turn the output feed on and an IPTV app such as
+TiviMate adds ChannelBin as an account the way it adds a provider - and then sees exactly the
+TV Guide: every channel and group in it, in the guide's order, with the guide's own listings,
+instead of the provider's twenty-thousand-channel list. A group plays as one channel, from the
+member ChannelBin would record from right now, and moves to another member mid-stream if that
+one dies.
+
+Go to **Settings > Integrations**:
+
+1. Give the feed a username and password. They are typed on a remote, so short is fine; the
+   feed is only as reachable as this server is.
+2. Turn the **Output feed for an IPTV app** switch on.
+3. In the IPTV app, add an Xtream Codes account with the server set to the address shown beside
+   the switch (the one you opened Settings on) and that username and password.
+
+Two ways the stream can reach the IPTV app, chosen by **How the IPTV app gets the stream**:
+
+- **Proxy** (the default): ChannelBin plays the channel through itself. It holds a provider
+  connection for the IPTV app, buffers a few seconds behind live so a dropout or a failover plays
+  through, and can say why a play stopped. A recording always wins: an IPTV app holding the connection a
+  recording needs is cut, and the Alerts page names the recording that took it.
+- **Redirect**: the IPTV app is sent straight to the provider's stream for the member chosen at that
+  moment. No failover mid-stream, the provider's credentials reach the IPTV app, and ChannelBin never
+  sees when the play ends - so a recording that then needs the connection is refused by the
+  provider rather than warned about here. **Seats kept free for the IPTV app** tells the recorder how
+  many connections to leave alone on an account in this mode.
+
+The Dashboard's **Watching now** section lists each IPTV app playing and how the last sessions ended,
+and the Readiness check says whether the feed can serve. The feed is off by default
+and nothing of it runs while it is off.
 
 ---
 

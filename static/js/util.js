@@ -162,21 +162,124 @@ function dateToTzInputValue(date, tz) {
   return `${p.year}-${p.month}-${p.day}T${h}:${p.minute}`;
 }
 
-// Reverse of dateToTzInputValue: a `datetime-local` value ('YYYY-MM-DDTHH:MM') meant as a
-// wall-clock time in `tz` -> the real Date instant it refers to.
-function tzInputValueToDate(value, tz) {
-  const [datePart, timePart] = value.split('T');
-  const [y, mo, d] = datePart.split('-').map(Number);
-  const [h, mi] = timePart.split(':').map(Number);
-  const guess = new Date(Date.UTC(y, mo - 1, d, h, mi, 0));
+// `tz`'s offset from UTC at instant `ms`, in ms (EDT is -4h).
+function tzOffsetMs(ms, tz) {
   const p = {};
   new Intl.DateTimeFormat('en-US', {
     timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit',
     hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false,
-  }).formatToParts(guess).forEach(({ type, value }) => { p[type] = value; });
+  }).formatToParts(new Date(ms)).forEach(({ type, value }) => { p[type] = value; });
   const hh = p.hour === '24' ? 0 : parseInt(p.hour, 10);
-  const asIfLocal = Date.UTC(+p.year, +p.month - 1, +p.day, hh, +p.minute, +p.second);
-  return new Date(guess.getTime() - (asIfLocal - guess.getTime()));
+  const whole = Math.floor(ms / 1000) * 1000;
+  return Date.UTC(+p.year, +p.month - 1, +p.day, hh, +p.minute, +p.second) - whole;
+}
+
+// Every instant a `datetime-local` value ('YYYY-MM-DDTHH:MM') can mean as a wall-clock time
+// in `tz`. `first` is the reading app/tz_utils.py::parse_local_to_utc gives (Python's fold=0:
+// the offset in force before a change), so the browser and the server always agree on bare
+// wall text. `second` is the later pass of an hour a fall-back repeats, else null; `skipped`
+// is a time a spring-forward never shows, which `first` reads with the old offset (2:30 AM
+// lands at 3:30 AM). The offset is read either side of the wall time, never at the wall time
+// taken as UTC: that point is hours from the real instant, so on a change day it picked up
+// the wrong offset (dev/docs/BUGS.md 2026-10-31 @ 11:27:30 PM ET).
+function tzWallInstants(value, tz) {
+  const [datePart, timePart] = value.split('T');
+  const [y, mo, d] = datePart.split('-').map(Number);
+  const [h, mi] = timePart.split(':').map(Number);
+  const wall = Date.UTC(y, mo - 1, d, h, mi, 0);
+  const DAY = 86400000;
+  const before = tzOffsetMs(wall - DAY, tz);
+  const after = tzOffsetMs(wall + DAY, tz);
+  const fits = (off) => tzOffsetMs(wall - off, tz) === off;
+  const readings = [...new Set([before, after])].filter(fits).map((off) => wall - off)
+    .sort((a, b) => a - b);
+  if (!readings.length) return { first: new Date(wall - before), second: null, skipped: true };
+  return {
+    first: new Date(readings[0]),
+    second: readings.length > 1 ? new Date(readings[1]) : null,
+    skipped: false,
+  };
+}
+
+// Reverse of dateToTzInputValue: a `datetime-local` value meant as a wall-clock time in `tz`
+// -> the real Date instant it refers to (the first, for a repeated time).
+function tzInputValueToDate(value, tz) {
+  return tzWallInstants(value, tz).first;
+}
+
+// A `datetime-local` field that keeps the instant it holds, in the display timezone. Wall
+// text cannot say which pass of an hour a DST fall-back repeats it means, so a field filled
+// from a known instant (a program's start, a recording's stop) keeps that instant and mirrors
+// it into `hidden` as ISO UTC, which app/tz_utils.py::parse_form_time prefers over the text.
+// Typing into the field forgets it. A time a change repeats or skips gets a line in `note`
+// naming the instant it stands for, with a switch to the other pass of a repeated one, so the
+// choice is never made in silence (dev/docs/BUGS.md 2026-10-31 @ 11:27:31 PM ET). `onPick`
+// runs when the user switches pass, which is an edit of the field like typing is.
+function wallTimeField(input, { hidden = null, note = null, onPick = null } = {}) {
+  const tz = displayTz();
+  let held = null;
+  const zoneName = (d) => {
+    const part = tzFormatter({ hour: 'numeric', timeZoneName: 'short' }).formatToParts(d)
+      .find((p) => p.type === 'timeZoneName');
+    return part ? part.value : tz;
+  };
+  const instant = () => {
+    if (!input.value) return null;
+    if (held && dateToTzInputValue(held, tz) === input.value) return held;
+    return tzInputValueToDate(input.value, tz);
+  };
+  const choose = (d) => {
+    held = d;
+    if (hidden) hidden.value = d ? d.toISOString() : '';
+    render();
+  };
+  function render() {
+    if (!note) return;
+    const r = input.value ? tzWallInstants(input.value, tz) : null;
+    note.textContent = '';
+    if (!r || (!r.second && !r.skipped)) {
+      note.style.display = 'none';
+      return;
+    }
+    const day = fmtDateTz(r.first, { weekday: 'short', month: 'short', day: 'numeric' });
+    if (r.skipped) {
+      note.textContent = `${fmtHhmm(input.value.split('T')[1])} does not happen on ${day}: `
+        + `the clocks go forward an hour. This is read as ${fmtTimeTz(r.first)} `
+        + `(${zoneName(r.first)}).`;
+    } else {
+      const at = instant();
+      const isSecond = at.getTime() === r.second.getTime();
+      const other = isSecond ? r.first : r.second;
+      note.append(`${fmtTimeTz(r.first)} happens twice on ${day}: the clocks go back an hour. `
+        + `This is the ${isSecond ? 'second' : 'first'} one (${zoneName(at)}). `);
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'btn btn-sm';
+      btn.textContent = `Use the ${isSecond ? 'first' : 'second'} one (${zoneName(other)})`;
+      btn.addEventListener('click', () => {
+        choose(other);
+        if (onPick) onPick();
+      });
+      note.append(btn);
+    }
+    note.style.display = '';
+  }
+  input.addEventListener('input', () => choose(null));
+  return {
+    // Fill the field from an instant (a Date), which it then keeps.
+    set(date) {
+      input.value = dateToTzInputValue(date, tz);
+      choose(date);
+    },
+    // The instant the field stands for: the kept one while the text still shows it, else
+    // the first reading of the text; null when empty.
+    instant,
+    // That instant as ISO UTC for a JSON or form body, '' when empty.
+    utc() {
+      const at = instant();
+      return at ? at.toISOString() : '';
+    },
+  };
 }
 
 // ── Display timezone and clock format ────────────────────────────────────────
@@ -448,14 +551,21 @@ function tzDayKey(date) {
 // a column of times reading as one run of numbers.
 //
 // The comparison clock is read fresh on every call, never captured: these pages are
-// long-lived, and a row that said 'Today' at 11pm must not still say it at 1am.
+// long-lived, and a row that said 'Today' at 11pm must not still say it at 1am. The
+// neighboring days are today's date stepped by one, never now +/- 24 hours: on a day a DST
+// change makes 25 hours long, now + 24h is still today, and tomorrow went unnamed
+// (dev/docs/BUGS.md 2026-11-01 @ 12:18:05 AM ET).
 function tzDayLabel(date, opts) {
   if (!date) return '';
-  const now = new Date();
+  const today = tzDayKey(new Date());
+  const step = (days) => {
+    const [y, m, d] = today.split('-').map(Number);
+    return new Date(Date.UTC(y, m - 1, d + days)).toISOString().slice(0, 10);
+  };
   const key = tzDayKey(date);
-  if (key === tzDayKey(now)) return 'Today';
-  if (key === tzDayKey(new Date(now.getTime() + 86400000))) return 'Tomorrow';
-  if (key === tzDayKey(new Date(now.getTime() - 86400000))) return 'Yesterday';
+  if (key === today) return 'Today';
+  if (key === step(1)) return 'Tomorrow';
+  if (key === step(-1)) return 'Yesterday';
   return fmtDateTz(date, opts || { weekday: 'short', month: 'short', day: 'numeric' });
 }
 

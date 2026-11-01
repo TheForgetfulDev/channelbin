@@ -940,6 +940,20 @@ def _apply_failing_alert(rec, name: str, reason: Optional[str], source: str, is_
         body=(f'{label} "{name}" backing scheduled recording "{rec.name}" '
               f'(starts {format_local(rec.start_time)}) is failing: {reason}.'),
         source=source, recording_id=rec.id)
+    # Read again after the raise, not before: a start landing between the caller's
+    # SCHEDULED read and this write runs its dismiss first and finds nothing, and the
+    # warning then stood over a recording already finished, in a card with no Dismiss
+    # (dev/changelog/1361). A start after this read finds the row and clears it itself.
+    from .database import REC_STATUS_SCHEDULED
+    if _recording_status(rec.id) != REC_STATUS_SCHEDULED:
+        dismiss_open_alerts('RECORDING_CHANNEL_FAILING', source)
+
+
+def _recording_status(recording_id: int) -> Optional[str]:
+    """The recording's committed status, read past the session's identity map."""
+    from . import db
+    from .database import Recording
+    return db.session.query(Recording.status).filter(Recording.id == recording_id).scalar()
 
 
 def _group_failing_reason(group, cfg) -> Optional[str]:
@@ -1055,3 +1069,39 @@ def dismiss_recording_failing_alerts(recording_id: int):
         Alert.source.like(f'{prefix}%'),
         Alert.dismissed_at.is_(None)).all())
     db.session.commit()
+
+
+def reconcile_recording_failing_alerts() -> int:
+    """Clear every open RECORDING_CHANNEL_FAILING whose recording is no longer SCHEDULED,
+    and return how many. Called at startup.
+
+    The warning is about a recording that has not started, so once it has started, ended or
+    gone the row describes nothing - yet the inline clears run once, at the moment the
+    recording leaves SCHEDULED, and a raise that landed after that moment stood in Active
+    alerts for six weeks over a COMPLETED recording (dev/changelog/1361). Deciding from the
+    recording's own status closes every such gap, whatever opened it.
+    """
+    from . import db
+    from .alerts import mark_cleared
+    from .database import Alert, Recording, REC_STATUS_SCHEDULED
+
+    @retry_on_locked()
+    def _clear_and_commit():
+        rows = Alert.query.filter(Alert.alert_type == 'RECORDING_CHANNEL_FAILING',
+                                  Alert.dismissed_at.is_(None)).all()
+        if not rows:
+            return []
+        status_by_id = dict(db.session.query(Recording.id, Recording.status).filter(
+            Recording.id.in_({a.recording_id for a in rows if a.recording_id is not None})))
+        stale = [a for a in rows if status_by_id.get(a.recording_id) != REC_STATUS_SCHEDULED]
+        cleared = [(a.id, a.recording_id, status_by_id.get(a.recording_id, 'gone'))
+                   for a in stale]
+        if mark_cleared(stale):
+            db.session.commit()
+        return cleared
+
+    cleared = _clear_and_commit()
+    for alert_id, recording_id, status in cleared:
+        log.warning('Alert %d (RECORDING_CHANNEL_FAILING, recording %s) is about a recording '
+                    'that is %s - clearing it', alert_id, recording_id, status)
+    return len(cleared)

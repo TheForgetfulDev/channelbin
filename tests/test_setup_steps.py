@@ -7,8 +7,9 @@ the design rests on:
   * A step is done because the thing exists now, never because something was stored - so
     deleting the only account brings its step back by itself, while the recording it made
     still counts.
-  * The banner leads with a step that needs the user before the next one in order, so a
-    machine that cannot record is said even though the account step comes first.
+  * The banner leads with the first step not done, in step order, and names a later step's
+    problem on a line of its own, so leading in order never hides a machine that cannot
+    record (dev/changelog/1367).
   * The account step asks whether anything has synced, not whether every account is
     current: a stale sync on a working install is the Readiness check's to report, and
     must not bring the setup banner back.
@@ -78,15 +79,45 @@ class StepStateTests(_Case):
         self.assertEqual((setup['done'], setup['total']), (1, 4))
         self.assertFalse(setup['finished'])
 
-    def test_a_machine_that_cannot_record_outranks_the_next_step(self):
-        """The mockup's "brand new, and ffmpeg is missing": the problem leads, not the
-        account step that comes first in order."""
+    def test_a_machine_that_cannot_record_waits_its_turn_but_is_still_named(self):
+        """The banner led with step 2 while Get started lists the account as step 1
+        (dev/changelog/1367). It goes in order, and the problem rides along."""
         setup = self.evaluate(ffmpeg=result(readiness.PROBLEM, 'It could not be run at ffmpeg'))
+        self.assertEqual(setup['lead']['id'], 'account')
+        self.assertEqual(setup['lead_word'], 'Next')
+        self.assertEqual([s['id'] for s in setup['also']], ['machine'])
+        machine = setup['steps'][1]
+        self.assertIn('It could not be run at ffmpeg', machine['short'])
+        self.assertEqual(machine['link']['url'], '/settings?q=ffmpeg.path')
+        self.assertEqual(setup['done'], 0)
+
+    def test_once_the_account_is_done_the_machine_problem_leads(self):
+        self.synced_account()
+        db.session.commit()
+        setup = self.evaluate(storage_dvr=result(readiness.PROBLEM, '/dvr is read-only'))
         self.assertEqual(setup['lead']['id'], 'machine')
         self.assertEqual(setup['lead_word'], 'Needs you')
-        self.assertIn('It could not be run at ffmpeg', setup['lead']['short'])
-        self.assertEqual(setup['lead']['link']['label'], 'Settings')
-        self.assertEqual(setup['done'], 0)
+        self.assertEqual(setup['lead']['title'], 'Set up this machine to record')
+        self.assertEqual(setup['also'], [])
+        self.assertEqual(setup['lead']['link']['url'], '/settings?q=recording.dvr_output_dir')
+
+    def test_the_recording_folder_problem_says_it_cannot_write_and_to_reload(self):
+        setup = self.evaluate(storage_dvr=result(readiness.PROBLEM, '/dvr is read-only'))
+        self.assertEqual(setup['steps'][1]['body'],
+                         "Any recording that starts now fails immediately because it can't "
+                         "write. Reload this page to check the recording folder again after "
+                         "you've fixed the issue.")
+
+    def test_a_machine_problem_leads_a_trial_over_its_deferred_account_step(self):
+        """The examples' account step is deferred (dev/changelog/1288): in order, the
+        machine problem is the first step there is to act on."""
+        ex = make_account(name='Example channels (M3UPT)', is_example=True,
+                          last_sync_at=datetime.utcnow(), channel_count=900)
+        make_channel(ex, name='BBC News', in_guide=True)
+        db.session.commit()
+        setup = self.evaluate(timezone=result(readiness.PROBLEM, 'none'))
+        self.assertEqual(setup['lead']['id'], 'machine')
+        self.assertEqual(setup['also'], [])
 
     def test_a_machine_check_that_could_not_answer_is_not_a_pass(self):
         setup = self.evaluate(storage_space=result(readiness.UNKNOWN, 'no honest answer'))
@@ -143,7 +174,7 @@ class StepStateTests(_Case):
                                               setup_steps.TODO, setup_steps.BLOCKED])
         self.assertEqual(setup['lead']['id'], 'guide')
         self.assertIn('48 channels came in', setup['lead']['short'])
-        self.assertEqual(setup['lead']['link']['label'], 'Channel Search')
+        self.assertEqual(setup['lead']['link']['label'], 'Search')
 
     def test_a_channel_in_the_guide_leads_with_recording_something(self):
         acc = self.synced_account()
@@ -197,6 +228,14 @@ class DashboardBannerTests(_Case):
     def get_dashboard(self, **answers):
         with patched(**{**MACHINE_READY, **answers}):
             return self.t.app.test_client().get('/').get_data(as_text=True)
+
+    def test_a_later_steps_problem_gets_its_own_line_under_the_lead(self):
+        html = self.get_dashboard(storage_dvr=result(readiness.PROBLEM, '/dvr is read-only'))
+        banner = html[html.index('<div id="dash-setup">'):html.index('class="dash-pulse"')]
+        self.assertIn('Next: Add your IPTV account(s)', banner)
+        self.assertIn('<div class="gs-b-also">Also needs you: step 2, Set up this machine to '
+                      'record.</div>', banner)
+        self.assertNotIn('gs-b-also', self.get_dashboard())
 
     def test_a_new_install_gets_the_banner_above_the_tiles(self):
         html = self.get_dashboard()
@@ -326,11 +365,11 @@ class OptionalStepTests(_Case):
         self.assertEqual(step['status'], setup_steps.DONE)
         self.assertIn('Classic Movies East', step['state'])
 
-    def test_a_service_that_is_on_finishes_the_notify_step(self):
+    def test_an_enabled_service_finishes_the_notify_step(self):
         from types import SimpleNamespace
         step = setup_steps._notify_step(SimpleNamespace(notify_enabled=['pushover', 'discord']))
         self.assertEqual(step['status'], setup_steps.DONE)
-        self.assertEqual(step['state'], 'Pushover and Discord are on.')
+        self.assertEqual(step['state'], 'Pushover and Discord are enabled.')
 
     def test_optional_steps_never_count_toward_the_four(self):
         setup = self.page()
@@ -346,12 +385,19 @@ class OptionalStepTests(_Case):
         self.assertEqual(looks, ['done', 'done', 'now', 'later'])
         self.assertNotIn('now', [s['display'] for s in setup['optional']])
 
-    def test_no_step_is_accented_while_a_core_step_needs_the_user(self):
-        """A problem carries its own color; a second accented step would be a second
-        answer to "what now"."""
+    def test_the_accent_follows_the_banners_lead(self):
+        """The banner names step 1 while step 2 has a problem, so the page accents step 1
+        too: one answer to "what now" (dev/changelog/1367)."""
         setup = self.page(ffmpeg=result(readiness.PROBLEM, 'missing'))
         looks = [s['display'] for s in setup['steps']]
-        self.assertEqual(looks, ['todo', 'problem', 'later', 'later'])
+        self.assertEqual(looks, ['now', 'problem', 'later', 'later'])
+
+    def test_nothing_is_accented_while_the_lead_needs_the_user(self):
+        self.synced_account()
+        db.session.commit()
+        setup = self.page(ffmpeg=result(readiness.PROBLEM, 'missing'))
+        looks = [s['display'] for s in setup['steps']]
+        self.assertEqual(looks, ['done', 'problem', 'todo', 'later'])
 
     def test_the_finish_card_names_what_the_maintenance_numbers_count(self):
         readiness_part = self.page()['readiness']
@@ -423,10 +469,17 @@ class GetStartedPageTests(_Case):
         self.assertIn('id="gs-search"', html)
         self.assertIn('could not be read', '\n'.join(logs.output))
 
-    def test_the_readiness_card_links_back_here(self):
-        html = self.get('/maintenance')
-        card = html[html.index('id="m-readiness"'):html.index('id="m-storage"')]
-        self.assertIn('href="/get-started">Get started <span class="arw">', card)
+    def test_the_readiness_page_links_back_here(self):
+        html = self.get('/readiness')
+        head = html[html.index('<div id="readiness">'):html.index('id="rd-content"')]
+        self.assertIn('href="/get-started">Get started <span class="arw">', head)
+
+    def test_the_hand_off_points_at_the_readiness_page(self):
+        """The Readiness check left Maintenance for its own page (dev/changelog/1366)."""
+        html = self.get('/get-started')
+        finish = html[html.index('id="gs-finish"'):]
+        self.assertIn('href="/readiness">Readiness check', finish)
+        self.assertNotIn('/maintenance', finish)
 
 
 class MenuLinkTests(_Case):
@@ -467,12 +520,14 @@ class MenuLinkTests(_Case):
         for selector, body in rules:
             self.assertNotIn('background', body, selector.strip())
 
-    def test_the_link_sits_first_under_setup(self):
+    def test_the_link_heads_the_menu(self):
+        """First of all, above Dashboard, while it shows (DESIGN.md 2, amended 2026-10-31)."""
         self.nav_status()
         html = self.t.app.test_client().get('/tags').get_data(as_text=True)
-        setup = html.index('<span class="nav-t">Setup</span>')
-        self.assertLess(setup, html.index('nav-gs'))
-        self.assertLess(html.index('nav-gs'), html.index('href="/accounts"', setup))
+        sidebar = html.split('<aside class="sidebar">')[1]
+        first = sidebar.index('class="nav-link')
+        self.assertEqual(first, sidebar.index('class="nav-link nav-gs'))
+        self.assertLess(sidebar.index('nav-gs'), sidebar.index('>Dashboard</span>'))
 
     def test_a_new_recording_throws_the_cached_count_away(self):
         """A first recording scheduled from another page must not leave "1 left" in the
@@ -513,5 +568,46 @@ class MenuLinkTests(_Case):
         self.assertEqual(resp.get_json()['setup'], {'left': 0, 'total': 0})
 
 
+class SettingsLinkTests(_Case):
+    """A Readiness check's Settings link opens Settings searched to its own setting
+    (dev/changelog/1367). The search is matched against each row's data-hay, so a renamed
+    setting would leave a link that lands on "Nothing matches"."""
+
+    def settings_rows(self):
+        html = self.t.app.test_client().get('/settings').get_data(as_text=True)
+        rows = dict(re.findall(r'data-path="([^"]+)"[^>]*data-hay="([^"]*)"', html))
+        self.assertGreater(len(rows), 100)
+        return rows
+
+    def test_every_settings_search_lands_on_its_own_setting(self):
+        """Each check about one setting searches for that setting's own key."""
+        rows = self.settings_rows()
+        searched = [c for c in readiness.CHECKS
+                    if c.link and c.link.endpoint == 'settings.settings']
+        self.assertGreaterEqual(len(searched), 10)
+        for check in searched:
+            self.assertIsNotNone(check.link.q, f'{check.id}: a Settings link with no search')
+            if check.id == 'storage_dirs':
+                continue
+            self.assertTrue(any(p.startswith(check.link.q) for p in rows),
+                            f'{check.id}: "{check.link.q}" is no setting on Settings')
+
+    def test_the_other_folders_search_finds_every_folder_setting_it_covers(self):
+        """storage_dirs is one check over many folders, so its search is a word every one
+        of their rows carries, never a key that misses some."""
+        rows = self.settings_rows()
+        q = readiness.CHECKS_BY_ID['storage_dirs'].link.q
+        for path in ('recording.move_on_complete.destination', 'recording.images_dir',
+                     'channel_testing.capture_scratch_dir', 'config_backup.backup_dir'):
+            self.assertIn(q, rows[path], f'"{q}" misses {path}')
+
+    def test_the_search_rides_on_the_readiness_rows_link(self):
+        with patched(**MACHINE_READY):
+            rows = {r['id']: r for r in readiness.evaluate()['checks']}
+        self.assertEqual(rows['storage_dvr']['link']['url'], '/settings?q=recording.dvr_output_dir')
+        self.assertEqual(rows['account_sync']['link']['url'], '/accounts')
+
+
 if __name__ == '__main__':
     unittest.main()
+

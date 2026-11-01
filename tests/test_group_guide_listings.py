@@ -227,5 +227,40 @@ class GuideListingsRouteTests(_GroupFixture):
                          self.long.id)
 
 
+class GuideListingsPinOnChannelDeleteTests(_GroupFixture):
+    """dev/docs/BUGS.md 2026-10-31 08:23 PM: neither channel delete path cleared a group's
+    pin on the channel it deleted, and channel ids are re-issued, so the stale pin could
+    re-attach to an unrelated feed that later joined the group."""
+
+    def _assert_cleared_with_reason(self):
+        db.session.expire_all()
+        self.assertIsNone(db.session.get(ChannelGroup, self.gid).guide_listings_channel_id)
+        last = self._events()[-1]
+        self.assertEqual(json.loads(last.extra_data)['reason'], 'channel_deleted')
+        self.assertIn('"Long Feed" was deleted', last.detail)
+
+    def test_missing_channel_delete_clears_the_pin_and_says_why(self):
+        self._pin(self.long.id)
+        now = datetime.utcnow()
+        self.long.last_seen_at = now - timedelta(days=30)
+        self.acc.last_sync_at = now - timedelta(days=1)
+        db.session.commit()
+        r = self.client.post('/channels/missing-delete',
+                             json={'group_id': self.gid, 'channel_ids': [self.long.id]})
+        self.assertEqual(r.status_code, 200, r.get_data(as_text=True))
+        self.assertEqual(r.get_json()['deleted_count'], 1)
+        self._assert_cleared_with_reason()
+
+    def test_account_delete_clears_a_pin_on_one_of_its_channels(self):
+        other = seed.make_account(name='Other')
+        db.session.commit()
+        self.long.account_id = other.id
+        db.session.commit()
+        self._pin(self.long.id)
+        r = self.client.delete(f'/api/accounts/{other.id}')
+        self.assertEqual(r.status_code, 200, r.get_data(as_text=True))
+        self._assert_cleared_with_reason()
+
+
 if __name__ == '__main__':
     unittest.main()

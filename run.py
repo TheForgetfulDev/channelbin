@@ -8,6 +8,7 @@ from app.recorder import kill_all_active
 from app.postprocessor import kill_active_conversions
 from app.concatenator import kill_active_joins
 from app.preview import kill_all_previews
+from app.output_feed import kill_all_viewers
 from app.scheduler import release_pidfile
 
 app = create_app()
@@ -26,11 +27,13 @@ def _handle_shutdown(signum, frame):
     # `_2` name (dev/changelog/986).
     #
     # A live preview is killed on the same terms: its ffmpeg holds a provider connection
-    # open for a viewer this process can no longer serve (dev/changelog/1018).
+    # open for a viewer this process can no longer serve (dev/changelog/1018). The output
+    # feed's relays are the same thing for an IPTV app.
     kill_all_active()
     kill_active_conversions()
     kill_active_joins()
     kill_all_previews()
+    kill_all_viewers()
     release_pidfile()
     sys.exit(0)
 

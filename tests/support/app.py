@@ -303,6 +303,24 @@ def stop_preview_sessions():
     return f'{found} was still going when its test ended; teardown stopped it'
 
 
+def stop_viewer_sessions():
+    """Stop every output-feed relay and wait for its reaper to exit - the preview's
+    contract above, for the IPTV app's session: a relay's ffmpeg holds a seat and reads its
+    source until stopped."""
+    import app.output_feed as output_feed
+
+    live = output_feed.live_sessions()
+    if not live:
+        output_feed.wait_for_reaper(_TEARDOWN_DRAIN_SECONDS)
+        return None
+    found = (f'{len(live)} live output-feed relay(s) (first: session={live[0].id}, '
+             f'{live[0].label}, state={live[0].state})')
+    output_feed.stop_all(output_feed.REASON_SHUTDOWN)
+    if not output_feed.wait_for_reaper(_TEARDOWN_DRAIN_SECONDS):
+        return f'{found} still going when the test ended and the reaper did not exit'
+    return f'{found} still going when the test ended; teardown stopped it'
+
+
 def _assert_nothing_outlived_the_test(leftovers):
     """Fail the test that leaked background work, rather than cleaning up quietly.
 
@@ -348,6 +366,7 @@ def reset_module_globals():
     import app.concatenator as concatenator
     import app.config as config
     import app.fs_utils as fs_utils
+    import app.output_feed as output_feed
     import app.postprocessor as postprocessor
     import app.preview as preview
     import app.probe as probe
@@ -382,6 +401,9 @@ def reset_module_globals():
     # seed will reuse, so its first recording or test is refused at the limit. Stopped
     # (ffmpeg killed, slot released) and forgotten, never just cleared.
     preview.reset_for_tests()
+    # The output feed's relays hold a seat the same way, and its redirect history would
+    # otherwise show one module's plays on the next module's dashboard.
+    output_feed.reset_for_tests()
     # A roll attempt recorded by one module's stall test puts the next module's roll inside
     # the cooldown, so its resolution failure rolls nothing.
     account_links._last_roll_attempt.clear()
@@ -786,6 +808,7 @@ class TestApp:
         scheduler = self._stop_scheduler_dispatch()
         return [msg for msg in (stop_channel_tester_run(),
                                 stop_preview_sessions(),
+                                stop_viewer_sessions(),
                                 self._drain_scheduler_jobs(scheduler)) if msg]
 
     @staticmethod

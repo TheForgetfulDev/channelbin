@@ -26,7 +26,8 @@ from ..accounts import (
     missing_channels_query, next_sync_map, repoint_candidates_for_channels,
     transfer_channel_state,
 )
-from ..channel_groups import group_channel_ids, report_orphaned_guide_groups
+from ..channel_groups import (clear_guide_listings_pins_on, group_channel_ids,
+                              report_orphaned_guide_groups)
 from .. import channel_hiding, duplicate_streams
 from ..config import load_config
 from ..db_utils import chunked, retry_on_locked
@@ -1346,6 +1347,8 @@ def missing_delete():
             touched_group_ids.update(
                 gid for (gid,) in db.session.query(ChannelGroupMember.group_id)
                 .filter(ChannelGroupMember.channel_id.in_(chunk)).distinct().all())
+
+        clear_guide_listings_pins_on(ids)
 
         unlinked_recordings = 0
         for chunk in chunked(ids, _DELETE_CHUNK_SIZE):

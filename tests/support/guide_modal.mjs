@@ -26,13 +26,14 @@ const PAGE = fs.readFileSync(`${DIR}/page.html`, 'utf8');
 
 const JS = ['util.js', 'guide.js'].map((f) => fs.readFileSync(`${REPO}/static/js/${f}`, 'utf8'));
 
-function boot() {
+function boot({ tz = null } = {}) {
   const errors = [];
   const vc = new VirtualConsole();
   vc.on('jsdomError', (e) => errors.push(`jsdomError: ${e.message}`));
   vc.on('error', (...a) => errors.push(`console.error: ${a.join(' ')}`));
 
   const nameRequests = [];
+  const editPosts = [];
   const fetchStub = (target, init) => {
     const href = String(target);
     let payload = href.includes('/api/guide/epg') ? { channels: [] } : [];
@@ -43,9 +44,18 @@ function boot() {
       nameRequests.push(body);
       payload = { success: true, name: `Renamed for ${body.profile_id}` };
     }
+    // An edit save always answers as one made after the recording moved, the window it is
+    // on now riding along (app/routes/recordings.py::_window_moved_response).
+    let status = 200;
+    if (href.includes('/edit-json')) {
+      editPosts.push(Object.fromEntries(new URLSearchParams(String(init.body))));
+      status = 409;
+      payload = { error: 'This recording was moved since this dialog opened.',
+                  start_time: '2026-08-10T21:00:00', stop_time: '2026-08-10T22:00:00' };
+    }
     return Promise.resolve({
-      ok: true,
-      status: 200,
+      ok: status < 300,
+      status,
       headers: { get: () => 'application/json' },
       json: () => Promise.resolve(payload),
       text: () => Promise.resolve(JSON.stringify(payload)),
@@ -76,6 +86,9 @@ function boot() {
   const { window } = dom;
   const { document } = window;
   window.scrollTo = () => {};
+  // A named display timezone for the DST scenarios: the meta tag is read once, when
+  // util.js's displayTz() first runs during the eval below.
+  if (tz) document.querySelector('meta[name="display-tz"]').content = tz;
 
   // One eval call, not one per file: guide.js's top-level `let PIXELS_PER_MINUTE = ...`
   // reads util.js's top-level `const PX_PER_MIN_DESKTOP` at eval time, and separate
@@ -94,7 +107,7 @@ function boot() {
   const change = (el, v) => { el.value = v; el.dispatchEvent(new window.Event('change', { bubbles: true })); };
 
   return {
-    window, document, errors, $, nameRequests,
+    window, document, errors, $, nameRequests, editPosts,
     typeName: (v) => type($('#modal-name'), v),
     nameValue: () => $('#modal-name').value,
     openModal: (prog, ch, opts) => window.openModal(prog, ch, opts),
@@ -107,6 +120,18 @@ function boot() {
     noteVisible: () => $('#modal-padding-note').style.display !== 'none',
     lateText: () => (($('#modal-late-note') || {}).textContent || '').trim(),
     lateVisible: () => Boolean($('#modal-late-note')) && $('#modal-late-note').style.display !== 'none',
+    dst: (which) => {
+      const note = $(`#modal-${which}-dst`);
+      const btn = note.querySelector('button');
+      return { visible: note.style.display !== 'none', text: note.textContent.trim(),
+               button: btn ? btn.textContent.trim() : null,
+               utc: $(`#modal-${which}-utc`).value };
+    },
+    clickDst: (which) => $(`#modal-${which}-dst button`).click(),
+    opened: () => [$('#modal-opened-start').value, $('#modal-opened-stop').value],
+    submit: () => $('#modal-form').dispatchEvent(
+      new window.Event('submit', { bubbles: true, cancelable: true })),
+    errorText: () => $('#modal-error').textContent.trim(),
     labels: () => ({ title: $('#modal-title').textContent.trim(),
                      submit: $('#modal-submit').textContent.trim() }),
   };
@@ -343,6 +368,69 @@ await record('start_followup', async () => {
   };
   return { now: await run(ON_NOW),
            later: await run({ ...PROG, id: 604, start_time: isoAgo(-30), stop_time: isoAgo(-90) }) };
+});
+
+/* ── DST: which 1:30 AM a field means (dev/docs/BUGS.md 2026-10-31 @ 11:27:31 PM ET) ────
+   2027-11-07 is the US fall-back: 1:00-1:59 AM happens at 05:xx and again at 06:xx UTC. */
+const NY = 'America/New_York';
+const SECOND_PASS = { ...PROG, id: 701, start_time: '2027-11-07T06:30:00',
+                      stop_time: '2027-11-07T07:30:00' };
+
+await record('dst_program_in_second_pass', async () => {
+  const c = boot({ tz: NY });
+  c.openModal(SECOND_PASS, CH);
+  return { errors: c.errors, start: c.startValue(), stop: c.stopValue(),
+           startDst: c.dst('start'), stopDst: c.dst('stop') };
+});
+
+await record('dst_typed_repeated_then_switched', async () => {
+  const c = boot({ tz: NY });
+  c.openModal(PROG, CH);
+  c.typeStart('2027-11-07T01:30');
+  const typed = c.dst('start');
+  c.clickDst('start');
+  const switched = c.dst('start');
+  c.clickDst('start');
+  return { errors: c.errors, typed, switched, back: c.dst('start') };
+});
+
+await record('dst_typed_skipped', async () => {
+  const c = boot({ tz: NY });
+  c.openModal(PROG, CH);
+  c.typeStart('2027-03-14T02:30');
+  const skipped = c.dst('start');
+  c.typeStart('2027-03-14T04:30');
+  return { errors: c.errors, skipped, ordinary: c.dst('start') };
+});
+
+/* ── The window an edit opened on goes back with the save, and a 409 shows the new one ──
+   dev/docs/BUGS.md 2026-10-31 @ 11:27:32 PM ET. */
+const EDIT = { ...PROG, has_recording: true, recording_id: 79, recording_status: 'SCHEDULED',
+               recording_start_time: PROG.start_time, recording_stop_time: PROG.stop_time,
+               recording_profile_id: null };
+
+await record('edit_opened_window', async () => {
+  const c = boot({ tz: NY });
+  c.openModal(EDIT, CH);
+  const edit = c.opened();
+  c.openModal(PROG, CH);
+  const fresh = c.opened();
+  c.openModal(EDIT, CH, { replaceRecId: 79 });
+  return { errors: c.errors, edit, fresh, replace: c.opened() };
+});
+
+await record('edit_moved_refills', async () => {
+  const c = boot({ tz: NY });
+  c.openModal(EDIT, CH);
+  c.typeStop('2026-08-10T23:45');
+  const typedStop = c.stopValue();
+  c.submit();
+  await settle(c.window);
+  await settle(c.window);
+  return { errors: c.errors, posted: c.editPosts[0] || null, typedStop,
+           start: c.startValue(), stop: c.stopValue(), startUtc: c.dst('start').utc,
+           opened: c.opened(), errorText: c.errorText(),
+           modalOpen: c.$('#record-modal').style.display !== 'none' };
 });
 
 console.log(JSON.stringify(out));

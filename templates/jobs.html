@@ -1,4 +1,5 @@
 {% extends "base.html" %}
+{% from "_macros.html" import page_about %}
 {% import "_macros.html" as m %}
 {% block title %}Scheduled Jobs - ChannelBin{% endblock %}
 
@@ -53,6 +54,11 @@
 
 .jb-name { display: flex; align-items: center; gap: 8px; font-weight: 500; }
 .jb-rel, .jb-stop { font-size: var(--fs-xs); color: var(--text-muted); margin-top: 2px; }
+/* The last-run line under the estimate: a failed run is said in the bad tone, a partial,
+   skipped or cancelled one in the warning tone, so a job that keeps failing reads as such
+   where its schedule is (dev/changelog/1351). */
+.jb-last.bad { color: var(--bad); }
+.jb-last.warn { color: var(--warn); }
 /* What the job does, under its name. Indented past the dot so the names stay one column. */
 .jb-what { font-size: var(--fs-xs); color: var(--text-muted); margin: 2px 0 0 17px; }
 
@@ -68,8 +74,8 @@
     <span class="sub" id="jb-count">{{ jobs | length }} job{{ '' if jobs | length == 1 else 's' }}</span>
   </h1>
 </div>
-<p class="page-sub">Everything the scheduler will do on its own, read from its live state rather
-  than from a stored list - so what is here is what will run.</p>
+{% call page_about() %}Everything the scheduler will do on its own, read from its live state rather
+  than from a stored list - so what is here is what will run.{% endcall %}
 
 {# The one region static/js/jobs.js swaps for a fresh render (dev/changelog/1164). It holds
    the empty state too, so a page that opened with no jobs picks up the first one. #}
@@ -80,6 +86,7 @@
 <div class="jb-legend">
   The dot beside each job says how close its next run is to another job's; red and yellow also mark the row's edge.
   Neither is a problem on its own: jobs that would slow each other down take turns, and a recording never waits for one.
+  Quick checks that run every few minutes are left out of the comparison.
   <span><span class="jb-dot red"></span> Same time as another job</span>
   <span><span class="jb-dot yellow"></span> Within 5 minutes of one</span>
   <span><span class="jb-dot green"></span> Nothing nearby</span>
@@ -90,7 +97,7 @@
     <table class="tbl tbl-cards">
       <thead>
         <tr>
-          <th>Job</th>
+          <th>Job name</th>
           <th>Type</th>
           <th>Next run</th>
           <th>Schedule</th>
@@ -100,10 +107,10 @@
       <tbody>
         {% for job in jobs %}
         <tr data-overlap="{{ job.overlap }}">
-          <td data-label="Job">
+          <td data-label="Job name">
             <div class="jb-name">
               <span class="jb-dot {{ job.overlap }} tip-plain"
-                    data-tip="{% if job.overlap == 'red' %}Overlaps another job&#10;This job runs at the same time as at least one other.{% elif job.overlap == 'yellow' %}Runs close to another job&#10;Another job starts within 5 minutes of this one.{% else %}No conflict&#10;Nothing else is scheduled near this job.{% endif %}"></span>
+                    data-tip="{% if job.get('overlap_probe') %}Not compared&#10;A quick check that takes a moment and never gets in another job's way.{% elif job.overlap == 'red' %}Overlaps another job&#10;This job runs at the same time as at least one other.{% elif job.overlap == 'yellow' %}Runs close to another job&#10;Another job starts within 5 minutes of this one.{% else %}No conflict&#10;Nothing else is scheduled near this job.{% endif %}"></span>
               {{ job.display_name }}
             </div>
             {% if job.get('what') %}<div class="jb-what">{{ job.what }}</div>{% endif %}
@@ -132,6 +139,9 @@
             {{ job.schedule_description or '-' }}
             {% if job.get('duration_line') %}
             <div class="jb-rel">{{ job.duration_line }}</div>
+            {% endif %}
+            {% if job.get('last_run_line') %}
+            <div class="jb-rel jb-last {{ job.last_run_tone or '' }}">{{ job.last_run_line }}</div>
             {% endif %}
           </td>
           <td style="text-align:right;">

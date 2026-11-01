@@ -1,4 +1,5 @@
 {% extends "base.html" %}
+{% from "_macros.html" import page_about %}
 {% import '_macros.html' as m %}
 {% import '_account_stats.html' as st %}
 {% import '_account_providers.html' as pv %}
@@ -89,10 +90,10 @@ Sync cancelled before it finished.
   </h1>
   <a href="{{ url_for('accounts.new_account') }}" class="btn btn-primary">+ Add Account</a>
 </div>
-<p class="page-sub">
+{% call page_about() %}
   An account is one IPTV provider connection. ChannelBin syncs its channel list and guide data
   on a schedule, and every channel, recording and guide row in the app traces back to one.
-</p>
+{% endcall %}
 
 {# The live region. accounts.js swaps it, and #acct-total above, for a fresh render once
    /api/nav-status's account_sync signature stops matching the one these rows were read at,

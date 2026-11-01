@@ -25,13 +25,18 @@ from sim import answer_key as ak
 
 from .support import CAPTURE_LOOPS, CHANNEL_LOOP, CaptureCase
 
+# The provider behavior the world below triggers with no inject(), read by
+# dev/tools/testbench.py's scenario list (dev/changelog/1388).
+PROVIDER_BEHAVIORS = ('kick_oldest',)
+
 # One backend behind two panels and one login valid on both, counting its single seat once:
 # the shape of real accounts 1 and 4 (dev/sim/worlds/fullstack.yaml's harbor).
 SHARED_LOGIN_WORLD = {
     'seed': 29,
     'backends': [
         {'name': 'cove', 'channels': 8, 'content': CHANNEL_LOOP, 'burst_seconds': 4.0,
-         'radio_share': 0.0, 'no_id_share': 0.0},
+         'radio_share': 0.0, 'no_id_share': 0.0,
+         'over_limit': {'policy': PROVIDER_BEHAVIORS[0]}},
     ],
     'panels': [
         {'name': 'cove-tv', 'backend': 'cove', 'url_shape': {'bare': 1.0}},

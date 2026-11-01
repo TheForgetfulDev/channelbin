@@ -29,7 +29,7 @@ from .database import (
     RECORDING_URL_RERESOLVED, RECORDING_RESUME_REFUSED,
     RECORDING_FAILED, RECORDING_START_DEFERRED, RECORDING_ABORTED, RECORDING_PAUSED,
     REC_STATUS_SCHEDULED, REC_STATUS_IN_PROGRESS, REC_STATUS_PAUSED, REC_STATUS_RETRYING,
-    REC_STATUS_FAILED, REC_STATUS_ABORTED, WINDOW_OPEN_STATUSES,
+    REC_STATUS_FAILED, REC_STATUS_ABORTED, WINDOW_OPEN_STATUSES, REC_ENDED_STATUSES,
     FAILURE_CONVERSION_COLLISION, FAILURE_CONNECTION_SLOT_TIMEOUT, FAILURE_DVR_DIR_UNUSABLE,
     FAILURE_LAUNCH_FAILED, FAILURE_ACCOUNT_BLOCKED,
     CANCEL_DURING_CAPTURE,
@@ -1301,6 +1301,46 @@ def close_open_segment_after_unclean_stop(recording_id: int) -> OpenSegmentClose
         recording_id, seg_id, seg_num,
         detail=f'Segment {seg_num} closed at service restart (capture had already stopped)')
     return OpenSegmentClose(OPEN_SEG_CLOSED, seg_num, stopped_at)
+
+
+def close_segments_left_open_on_ended_recordings() -> list:
+    """Close every segment row left open on a recording whose capture is over, at startup.
+
+    Every terminal path closes its segment, in a commit after the one that ends the
+    recording; this is the net for a process that died between the two, or a path that
+    someday forgets: nothing else would ever close it, the detail page would count it up as
+    still capturing, and the usage ledger would be held behind it for an hour. The file is not
+    read - a finished recording's storage may be asleep, and its segments are usually gone
+    after the join - so when capture stopped is unknown: the row is closed at its own start,
+    credits no capture time, and its event and the WARNING say so (dev/changelog/1374).
+    Returns the (recording id, segment number) pairs it closed. Requires an app context."""
+    @retry_on_locked()
+    def _close_and_commit():
+        rows = (RecordingSegment.query
+                .join(Recording, Recording.id == RecordingSegment.recording_id)
+                .filter(RecordingSegment.ended_at.is_(None),
+                        Recording.status.in_(REC_ENDED_STATUSES))
+                .order_by(RecordingSegment.id).all())
+        for seg in rows:
+            seg.ended_at = seg.started_at
+            seg.exit_reason = 'LEFT_OPEN'
+            add_recording_event(
+                seg.recording_id, SEGMENT_ENDED, segment_number=seg.segment_number,
+                detail=(f'Segment {seg.segment_number} was still marked as capturing after the '
+                        f'recording had ended, so it was closed at service restart. When it '
+                        f'really stopped is unknown, so it shows no duration and adds no '
+                        f'recorded time'))
+        closed = [(seg.recording_id, seg.segment_number) for seg in rows]
+        if rows:
+            db.session.commit()
+        return closed
+
+    closed = _close_and_commit()
+    for recording_id, seg_num in closed:
+        log.warning('Recording %d: segment %d was left open after the recording ended - '
+                    'closed at startup with no duration', recording_id, seg_num,
+                    extra={'recording_id': recording_id})
+    return closed
 
 
 def resume_recording(app, recording_id: int):
@@ -2600,9 +2640,10 @@ def _try_acquire_slot_with_preemption(app, recording_id: int, account_id: int,
     passes connection_limits.move_seat so the seat it already holds on the old account is
     given up in the same step the new one is taken (dev/changelog/1242).
 
-    Recordings still always win over the two actors that do not hold a stream open on
-    the user's behalf: an in-flight sync on this account is cancelled, and a running
-    channel test is preempted so the recording can take its slot. What this will NOT do
+    Recordings still always win over the actors that do not hold a stream open on the
+    user's behalf: an in-flight sync on this account is canceled, and an IPTV app on
+    the output feed, then a live preview, then a running channel test are preempted so
+    the recording can take the slot, in that order. What this will NOT do
     is exceed the account's limit. When every slot is held by another *recording*, it
     returns False and the caller waits for one to free
     (dev/docs/DESIGN-concurrency.md 1 doctrine 1, amended - dev/changelog/854).
@@ -2621,7 +2662,22 @@ def _try_acquire_slot_with_preemption(app, recording_id: int, account_id: int,
             return connlim.try_acquire(account_id, 'recording', recording_id)
     if acquire():
         return True
-    # A live preview yields first: someone looking at a channel is worth less than a
+    # An IPTV app on the output feed yields first of all: it is entertainment that resumes
+    # on its own, below the operator's own look and the measurement feeding the health
+    # score (DESIGN-output-feed.md 4.4). The viewer is told why - the session ends by name
+    # and an alert names this recording.
+    viewers = connlim.preempt_viewers_for_slot(account_id)
+    if viewers:
+        from . import output_feed
+        for holder_account_id in dict.fromkeys(a for _, a in viewers):
+            output_feed.preempt_for_account(app, holder_account_id, recording_id)
+            log.warning('Recording %d: preempted an IPTV app on account %d%s',
+                        recording_id, holder_account_id,
+                        '' if holder_account_id == account_id
+                        else f' (sharing a login with account {account_id})')
+        if acquire():
+            return True
+    # A live preview yields next: someone looking at a channel is worth less than a
     # measurement feeding its health score, and far less than the recording itself.
     # Both strips follow the POOL, not the account: a login shared across accounts is one
     # seat set, so the preview or test holding its seat may have come through the sibling

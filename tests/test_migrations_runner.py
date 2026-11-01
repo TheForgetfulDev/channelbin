@@ -2522,6 +2522,7 @@ class ChildTablesAutoincrementMigrationTests(unittest.TestCase):
     STEPS = (
         ('channel_tests', 77, '_m077_channel_tests_autoincrement', 'ChannelTest'),
         ('channel_events', 78, '_m078_channel_events_autoincrement', 'ChannelEvent'),
+        ('accounts', 107, '_m107_accounts_autoincrement', 'Account'),
     )
 
     @staticmethod
@@ -2567,6 +2568,9 @@ class ChildTablesAutoincrementMigrationTests(unittest.TestCase):
         if table == 'channel_tests':
             cur.execute("INSERT INTO channel_tests (id, channel_id, test_started_at, status) "
                         "VALUES (?, 1, '2026-09-01 00:00:00', 'COMPLETED')", (row_id,))
+        elif table == 'accounts':
+            cur.execute("INSERT INTO accounts (id, name, base_url, username, password, status, "
+                        "color) VALUES (?, 'A', '', '', '', 'OK', '#000')", (row_id,))
         else:
             cur.execute("INSERT INTO channel_events (id, channel_id, timestamp, event_type) "
                         "VALUES (?, 1, '2026-09-01 00:00:00', 'CHANNEL_FAILOVER')", (row_id,))
@@ -2608,7 +2612,8 @@ class ChildTablesAutoincrementMigrationTests(unittest.TestCase):
                 conn, cur = self._scratch(td, table, model_name)
                 rows_before = cur.execute(f'SELECT * FROM {table} ORDER BY id').fetchall()
                 indexes_before = self._indexes(cur, table)
-                self.assertTrue(indexes_before, 'fixture must carry the model\'s indexes')
+                self.assertEqual(len(indexes_before), len(self._index_ddl(self._model(model_name))),
+                                 'fixture must carry the model\'s indexes')
                 getattr(M, step)(conn, cur)
                 conn.commit()
                 self.assertEqual(cur.execute(f'SELECT * FROM {table} ORDER BY id').fetchall(),
@@ -2701,6 +2706,58 @@ class ChildTablesAutoincrementMigrationTests(unittest.TestCase):
                     self._model(model_name).__table__.dialect_options['sqlite']['autoincrement'],
                     f'{model_name} lost sqlite_autoincrement - a fresh install would re-issue '
                     f'deleted {table} ids again')
+
+
+class AccountsPrimaryKeyLastMigrationTests(unittest.TestCase):
+    """Migration 107 on the shape every real install stores for `accounts`: created before
+    the provider_id foreign key existed, so PRIMARY KEY (id) is the table's last clause and
+    the columns added since sit before it. The shared rewrite knew only the shape where
+    another clause follows the key, and refusing would abort startup on every upgrade
+    (BUGS.md 2026-10-31 08:14 PM)."""
+
+    @staticmethod
+    def _legacy_ddl():
+        from sqlalchemy.schema import CreateTable
+        from sqlalchemy.dialects import sqlite as sqlite_dialect
+        from app.database import Account
+        ddl = str(CreateTable(Account.__table__).compile(dialect=sqlite_dialect.dialect())).strip()
+        ddl = ddl.replace(M._PK_COLUMN_NEW, M._PK_COLUMN_OLD, 1)
+        fk = ', \n\tFOREIGN KEY(provider_id) REFERENCES providers (id)\n)'
+        assert ddl.endswith(fk), f'Account no longer ends on the provider_id key:\n{ddl}'
+        ddl = ddl[:-len(fk)] + M._PK_TABLE_CONSTRAINT_LAST
+        assert ddl.endswith(M._PK_TABLE_CONSTRAINT_LAST) and M._PK_TABLE_CONSTRAINT not in ddl
+        return ddl
+
+    def test_rebuilds_carries_every_row_and_retires_a_deleted_id(self):
+        import sqlite3
+        with tempfile.TemporaryDirectory() as td:
+            conn = sqlite3.connect(os.path.join(td, 'accounts.db'))
+            cur = conn.cursor()
+            cur.execute(self._legacy_ddl())
+            insert = ("INSERT INTO accounts (name, base_url, username, password, status, color) "
+                      "VALUES ('A', '', '', '', 'OK', '#000')")
+            for _ in range(3):
+                cur.execute(insert)
+            conn.commit()
+            rows_before = cur.execute('SELECT * FROM accounts ORDER BY id').fetchall()
+
+            M._m107_accounts_autoincrement(conn, cur)
+            conn.commit()
+            ddl = cur.execute("SELECT sql FROM sqlite_master WHERE name='accounts'").fetchone()[0]
+            self.assertIn('AUTOINCREMENT', ddl)
+            self.assertNotIn('PRIMARY KEY (id)', ddl)
+            self.assertTrue(ddl.endswith('\n)'), ddl)
+            self.assertEqual(cur.execute('SELECT * FROM accounts ORDER BY id').fetchall(),
+                             rows_before)
+
+            cur.execute('DELETE FROM accounts WHERE id = 3')
+            cur.execute(insert)
+            self.assertEqual(cur.lastrowid, 4, 'a deleted account id was handed to the next row')
+            M._m107_accounts_autoincrement(conn, cur)
+            self.assertEqual(cur.execute("SELECT sql FROM sqlite_master WHERE name='accounts'")
+                             .fetchone()[0], ddl, 'a second run rebuilt the table')
+            conn.close()
+
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

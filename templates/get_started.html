@@ -1,10 +1,11 @@
 {% extends "base.html" %}
+{% from "_macros.html" import page_about %}
 {% block title %}Get started - ChannelBin{% endblock %}
 
 {#  Get started (dev/mockups/44-first-run-setup.html, approved at round 3, dev/changelog/1278;
     built in dev/changelog/1280). Every step's state comes from app/setup_steps.py::page(),
     read fresh on each load and stored nowhere, which is why nothing here can be dismissed or
-    ticked off by hand. #gs-live is swapped by static/js/get-started.js when the nav poll's
+    marked done by hand. #gs-live is swapped by static/js/get-started.js when the nav poll's
     sync or recording signature moves, so a first sync or a first recording moves the page on
     without a reload. #}
 
@@ -20,8 +21,11 @@
       {% if s.link %}
       <div class="gs-acts">
         <a class="btn{% if s.display in ('now', 'problem', 'wait') %} btn-primary{% endif %}" href="{{ s.link.url }}">{{ s.link.label }} <span class="arw">{{ icon('forward') }}</span></a>
-        {%- if s.keep_examples %}
+        {#- Hidden while a load runs, as the Example channels card's pair is: the server
+            refuses both until the load finishes. -#}
+        {%- if s.keep_examples and not (setup.examples and setup.examples.loading) %}
         <button type="button" class="btn" data-examples-keep>Keep the examples</button>
+        <button type="button" class="btn btn-danger" data-examples-remove>Delete the examples</button>
         {%- endif %}
         {%- if open %}{% for m in s.more %}
         <a class="btn" href="{{ m.url }}">{{ m.label }} <span class="arw">{{ icon('forward') }}</span></a>
@@ -41,9 +45,11 @@
   <div class="gs-try" id="gs-try">
     <div class="gs-try-head">No IPTV provider yet?</div>
     <p>Try ChannelBin first with free, legal channels from
-      <a href="{{ o.site_url }}" target="_blank" rel="noopener">M3UPT</a> (opens in a new tab), a
-      public list of channels the broadcasters themselves stream online.</p>
-    <div class="gs-acts"><button type="button" class="btn" data-examples-load>Try it with example channels</button></div>
+      <a href="{{ o.site_url }}" target="_blank" rel="noopener">M3UPT</a>. M3UPT is a public list
+      of free and open channels that the broadcasters themselves stream online. Note that
+      ChannelBin doesn't control these channels or this playlist... hopefully it doesn't break
+      and create issues in the future. :)</p>
+    <div class="gs-acts"><button type="button" class="btn btn-primary" data-examples-load>Try it with example channels</button></div>
     <p>The button adds:</p>
     <ul>
       <li>An account named "{{ o.account_name }}" that reads M3UPT's playlist and program
@@ -54,10 +60,10 @@
         program listing, which is what a channel group is for.</li>
       <li>A health check on {{ o.test_channel }}.</li>
     </ul>
-    <p>Everything it adds is marked as an example. Delete the examples takes it all out again in
-      one step, including an example channel you later put in the guide yourself; your
-      recordings stay. If M3UPT turns out to be all you want, Keep the examples makes
-      them your own instead.</p>
+    <p>Everything it adds is marked as an example. After they're added you'll have an option to
+      delete the examples which cleans everything up and takes it all out in one step. If M3UPT
+      turns out to be all you want, you will also have an option to keep the examples if it
+      turns out you want to keep the M3UPT items that are added.</p>
   </div>
 {%- endmacro %}
 
@@ -85,8 +91,8 @@
       <p>Delete the examples takes out the example account and everything on its channels,
         including an example channel you put in the guide or tested yourself. Your recordings
         stay, those made from an example channel included, and so does everything on your own
-        accounts. Keep the examples makes them an ordinary account and channel group instead,
-        if M3UPT is all you want.</p>
+        accounts. Keep the examples removes the "example" flag from the M3UPT account and
+        channel group, and Get started counts the account as yours.</p>
     </div>
   </div>
 {%- endmacro %}
@@ -96,10 +102,9 @@
     {% if setup %}<span class="sub" id="gs-sub">{% if setup.finished %}all {{ setup.total }} steps done{% else %}{{ setup.done }} of {{ setup.total }} steps done{% endif %}</span>{% endif %}
   </h1>
 </div>
-<p class="page-intro">The four steps that take a new install to its first recording, in order,
+{% call page_about() %}The four steps that take a new install to its first recording, in order,
   and a few more worth doing after. Each one is checked against what is actually set up every
-  time this page loads, so it ticks itself off when the thing exists, and comes back if you
-  undo it.</p>
+  time this page loads.{% endcall %}
 
 {#- data-waiting asks get-started.js for the minute tick as well, so "first sync starts in
     4m" keeps counting down while nothing else changes. -#}
@@ -108,13 +113,13 @@
                        or (setup.examples and setup.examples.loading)) %} data-waiting="1"{% endif %}>
 {% if not setup %}
   <div class="notice notice-warn gs-done-note">The setup steps could not be read just now, so
-    this page cannot say what is done. The reason is in the log. The Readiness check on
-    <a href="{{ url_for('system.maintenance') }}">Maintenance</a> checks the same things.</div>
+    this page cannot say what is done. The reason is in the log. The
+    <a href="{{ url_for('system.readiness_page') }}">Readiness check</a> checks the same things.</div>
 {% else %}
   {% if setup.finished %}
   <div class="notice notice-info gs-done-note">ChannelBin is set up. The steps under it are
     optional. The dashboard banner and this page's menu link are gone now; the Readiness check
-    on Maintenance links back here.</div>
+    links back here.</div>
   {% endif %}
   <ol class="gs-steps">
     {% for s in setup.steps %}{{ step_item(s) }}{% endfor %}
@@ -130,7 +135,7 @@
   <div class="card gs-card" id="gs-search">
     <div class="card-head"><h2>Finding things: two kinds of search</h2></div>
     <div class="card-body">
-      <p>Channel Search asks first what you want to search, and the two answers find different
+      <p>Search asks first what you want to search, and the two answers find different
         things.</p>
       <div class="gs-pair">
         <div class="gs-half">
@@ -162,13 +167,13 @@
 {% if setup %}
   <div class="card gs-card gs-finish" id="gs-finish">
     <div class="card-head"><h2>Then: the Readiness check</h2>
-      <div class="card-head-actions"><a class="btn btn-sm" href="{{ url_for('system.maintenance') }}">Readiness check <span class="arw">{{ icon('forward') }}</span></a></div>
+      <div class="card-head-actions"><a class="btn btn-sm" href="{{ url_for('system.readiness_page') }}">Readiness check <span class="arw">{{ icon('forward') }}</span></a></div>
     </div>
     <div class="card-body">
-      <p>The steps above are what you have to do. The Readiness check on Maintenance tests the
+      <p>The steps above are what you have to do. The Readiness check tests the
         rest: that each login still works, that every folder ChannelBin writes to is writable,
         that search is indexed, and that a notification actually arrives.</p>
-      <p>The numbers beside Maintenance in the menu come from it.{% if setup.readiness.clears_some %}
+      <p>The numbers beside Readiness in the menu come from it.{% if setup.readiness.clears_some %}
         On a new install most of them clear by themselves once an account is added and the
         guide has channels in it. While an account's first sync runs, one or two more can show
         for a minute or so, until the sync and the search index catch up.{% endif %}

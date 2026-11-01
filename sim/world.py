@@ -43,11 +43,13 @@ LOGO_HOST = 'logos'
 CONTENT_CALIBRATED = 'calibrated'
 # What a backend does when a login opens more connections than it allows. kick_oldest is what
 # a real provider did, seen once (DESIGN-simulator.md §3.10, dev/changelog/1220); refuse and
-# allow_then_ban are assumed.
+# allow_then_ban are assumed - sim/faults.py OVER_LIMIT_BASIS holds each one's basis.
 OVER_LIMIT_POLICIES = ('refuse', 'kick_oldest', 'allow_then_ban')
 
 _NAME_RX = re.compile(r'^[a-z0-9][a-z0-9-]{0,40}$')
-_CRED_RX = re.compile(r'^[A-Za-z0-9]{3,40}$')
+# One character is allowed on purpose: a world a person types into a TV remote wants the
+# shortest login that works (dev/tools/tivimate_capture.py), and no provider rule forbids it.
+_CRED_RX = re.compile(r'^[A-Za-z0-9]{1,40}$')
 _OFFSET_RX = re.compile(r'^[+-]\d{4}$')
 
 
@@ -390,7 +392,7 @@ def _login(d, i, seed, backends, panels) -> LoginSpec:
     password = v['password'] or _invented_credential(seed, 'pass', i)
     for label, cred in (('username', username), ('password', password)):
         if not isinstance(cred, str) or not _CRED_RX.match(cred):
-            raise WorldError(f'{where}.{label} must be 3 to 40 letters and digits')
+            raise WorldError(f'{where}.{label} must be 1 to 40 letters and digits')
     on = v['panels'] or [p.name for p in panels.values() if p.backend == v['backend']]
     for p in on:
         if p not in panels:

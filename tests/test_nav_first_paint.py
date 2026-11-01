@@ -54,7 +54,7 @@ FREE = 15_170_000_000_000
 TOTAL = 20_000_000_000_000
 
 NAV = {'blocked': 1, 'degraded': 2,
-       'blocked_labels': ['Record a program right now'],
+       'blocked_labels': ['Record a program'],
        'degraded_labels': ['See what is on', 'Search your channels and programs quickly']}
 
 

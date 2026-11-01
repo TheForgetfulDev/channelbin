@@ -255,6 +255,25 @@ integrations:
   home_assistant:
     enabled: false
     api_key_hash: ''
+  # The output feed: ChannelBin as an Xtream Codes source an IPTV app (TiviMate and the like)
+  # adds as an account. The app then sees exactly the TV Guide - every channel and group in
+  # it, with the guide's listings - and a group plays as one channel with failover. Off by
+  # default; turn it on from Settings > Integrations, where every key below is explained.
+  # No restart needed for any of these.
+  output_feed:
+    enabled: false
+    username: ''
+    password: ''            # stored as typed, not hashed: the IPTV app sends it on every request
+    mode: proxy             # proxy (relayed through ChannelBin, with failover and a held seat)
+                            # or redirect (the IPTV app plays straight from the provider)
+    accounts: []            # account ids the feed may play from; empty = all
+    held_seats: {}          # redirect mode: account id -> seats kept free for the IPTV app
+    buffer_mb: 16           # proxy mode: the in-memory ring per IPTV app
+    reserve_seconds: 3      # proxy mode: how far behind live the IPTV app plays; 0 = pass-through
+    max_viewers: 3          # proxy mode: streams relayed at once
+    idle_seconds: 30        # proxy mode: an IPTV app that read nothing for this long is gone
+    max_session_hours: 12   # proxy mode: the hard cap on one play
+    xmltv_days: 3           # listings depth in xmltv.php
 
 database:
   # path and logging.file default to repo-relative locations (dvr.db beside the app,
@@ -392,6 +411,10 @@ sync:
   # Refuse an EPG import when it would land below this percent of the previous sync's entry
   # count, so one bad XMLTV fetch cannot wipe your future guide. 0 = disabled.
   epg_collapse_threshold_percent: 20
+  # Alert when one EPG refresh leaves at least this percent of the channels that had a guide
+  # with none. A smaller loss is normal provider churn and is noted on the account's
+  # Activity instead. 0 = alert on every loss.
+  epg_coverage_lost_alert_percent: 10
   # Refuse to apply the provider's live-channel list when doing so would cut the account
   # below this percent of its previous channel count. The playlist is then imported
   # unfiltered and an alert is raised instead. 0 = disabled.

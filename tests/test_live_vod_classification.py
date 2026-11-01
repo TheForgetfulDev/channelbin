@@ -313,7 +313,7 @@ class CatalogOnlyProviderTests(unittest.TestCase):
         db.session.commit()
         client = FileXtreamClient(os.path.join(FIXTURES, 'catalog_only'),
                                   acct.base_url, acct.username, acct.password)
-        streams, outcome, constructed = _fetch_and_classify_xtream_streams(
+        streams, outcome, constructed, _note = _fetch_and_classify_xtream_streams(
             acct, client, {'sync': {}})
         result = (*_upsert_channels(acct, streams, {'sync': {}}), outcome, constructed)
         db.session.commit()
@@ -351,7 +351,7 @@ class CatalogOnlyProviderTests(unittest.TestCase):
         db.session.commit()
         client = FileXtreamClient(os.path.join(FIXTURES, 'mixed_cuid'),
                                   acct.base_url, acct.username, acct.password)
-        streams, outcome, constructed = _fetch_and_classify_xtream_streams(
+        streams, outcome, constructed, _note = _fetch_and_classify_xtream_streams(
             acct, client, {'sync': {}})
         _upsert_channels(acct, streams, {'sync': {}})
         self.assertEqual(outcome, CLASSIFY_APPLIED)

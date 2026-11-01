@@ -5,7 +5,7 @@
 //   { testUrlEndpoint, newRecordingUrl, recDetailUrlBase }
 // and may optionally set window.onManualRecordSaved() to run after a successful save.
 // Depends on util.js (buildModal, jsonFetch, showConflictError, recordingWarningsHtml,
-// dateToTzInputValue, tzInputValueToDate, displayTz, escHtml).
+// wallTimeField, displayTz, escHtml).
 
 function openManualRecordModal() {
   const existing = document.getElementById('manual-record-modal');
@@ -48,7 +48,9 @@ function openManualRecordModal() {
         <label for="manual-modal-stop">Stop Time <span class="tz-label">${escHtml(tz)}</span></label>
         <input type="datetime-local" id="manual-modal-stop" class="form-control" required>
       </div>
-    </div>`;
+    </div>
+    <div id="manual-modal-start-dst" class="notice notice-warn" style="display:none"></div>
+    <div id="manual-modal-stop-dst" class="notice notice-warn" style="display:none"></div>`;
 
   function submit(close) {
     document.getElementById('manual-modal-error').style.display = 'none';
@@ -57,6 +59,8 @@ function openManualRecordModal() {
       url: document.getElementById('manual-modal-url').value.trim(),
       start_time: document.getElementById('manual-modal-start').value,
       stop_time: document.getElementById('manual-modal-stop').value,
+      start_time_utc: startField.utc(),
+      stop_time_utc: stopField.utc(),
     });
     submitManualRecord(payload, close);
   }
@@ -104,20 +108,22 @@ function openManualRecordModal() {
   });
   modal.id = 'manual-record-modal';
 
-  document.getElementById('manual-modal-start').value = dateToTzInputValue(now, tz);
-  document.getElementById('manual-modal-stop').value = dateToTzInputValue(stop, tz);
+  const field = (id) => wallTimeField(document.getElementById(id),
+    { note: document.getElementById(`${id}-dst`) });
+  const startField = field('manual-modal-start');
+  const stopField = field('manual-modal-stop');
+  startField.set(now);
+  stopField.set(stop);
 
   document.getElementById('manual-test-btn').addEventListener('click', runManualUrlTest);
   document.getElementById('manual-modal-start').addEventListener('change', () => {
-    const startInput = document.getElementById('manual-modal-start');
-    const stopInput = document.getElementById('manual-modal-stop');
-    const start = tzInputValueToDate(startInput.value, tz);
-    if (!stopInput.value || tzInputValueToDate(stopInput.value, tz) <= start) {
-      const newStop = new Date(start.getTime() + 60 * 60 * 1000);
-      stopInput.value = dateToTzInputValue(newStop, tz);
-    }
+    const start = startField.instant();
+    if (!start) return;
+    const stopAt = stopField.instant();
+    if (!stopAt || stopAt <= start) stopField.set(new Date(start.getTime() + 60 * 60 * 1000));
   });
 }
+
 
 function hideManualTestResult() {
   const el = document.getElementById('manual-test-result');

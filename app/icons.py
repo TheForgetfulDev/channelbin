@@ -62,6 +62,7 @@ ICONS = {
     'stats': 'chart-bar',
     'bottom': 'arrow-collapse-down',
     'repoint': 'swap-horizontal',
+    'about': 'information-outline',
 
     # Status marks.
     'ok': 'check',
@@ -96,6 +97,7 @@ ICONS = {
     'nav-jobs': 'timer-cog-outline',
     'nav-alerts': 'bell-outline',
     'nav-logs': 'text-box-outline',
+    'nav-readiness': 'clipboard-check-outline',
     'nav-maintenance': 'wrench-outline',
     'nav-settings': 'cog-outline',
 }

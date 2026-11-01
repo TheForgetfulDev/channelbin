@@ -146,10 +146,15 @@ class _Handler(BaseHTTPRequestHandler):
                 if drip is not None:
                     self._write_drip(body, drip.params['chunk_bytes'],
                                      drip.params['gap_seconds'], sim._stopping)
-                elif body:
-                    self.wfile.write(body)
-                    self._sent = len(body)
-        except (BrokenPipeError, ConnectionResetError) as exc:
+                else:
+                    # In pieces, so a write that times out leaves `bytes` at what went out.
+                    for i in range(0, len(body), _CHUNK):
+                        self.wfile.write(body[i:i + _CHUNK])
+                        self._sent += len(body[i:i + _CHUNK])
+        except (BrokenPipeError, ConnectionResetError, TimeoutError) as exc:
+            # A TimeoutError is the handler's own `timeout` on a client that stopped reading;
+            # left to http.server it would close the connection without amending the row.
+            self.close_connection = True
             note = f'{note}; client went away ({type(exc).__name__})'.lstrip('; ')
         sim.ledger.amend(row, bytes=self._sent, seconds=round(time.monotonic() - started, 6),
                          note=note)

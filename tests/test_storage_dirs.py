@@ -201,28 +201,62 @@ class ReadinessStorageDirsTests(unittest.TestCase):
         self.ctx.pop()
         self.t.cleanup()
 
-    def _checks(self):
+    def _evaluate(self):
         from app import readiness
-        return {row['id']: row for row in readiness.evaluate(ignored=set())['checks']}
+        return readiness.evaluate(ignored=set())
 
-    def test_an_unusable_folder_is_attention_and_names_its_role_and_path(self):
+    def _checks(self):
+        return {row['id']: row for row in self._evaluate()['checks']}
+
+    def _writable(self, **over):
+        cfg = {'recording': {'dvr_output_dir': self.dvr,
+                             'images_dir': os.path.join(self.t._tmpdir, 'img'),
+                             'live_thumbnail': {'enabled': True}},
+               'database': {'backup_dir': os.path.join(self.t._tmpdir, 'dbb')},
+               'config_backup': {'backup_dir': os.path.join(self.t._tmpdir, 'cfgb')}}
+        for key, value in over.items():
+            cfg[key].update(value)
+        return cfg
+
+    def test_an_unusable_image_folder_is_attention_and_names_its_role_and_path(self):
+        """The screenshots capability answers for its own folders (dev/changelog/1366)."""
         thumbs = os.path.join(self.parent, 'thumbnails')
-        self.t.sandbox_config({'recording': {'dvr_output_dir': self.dvr,
-                                             'images_dir': self.parent,
-                                             'live_thumbnail': {'enabled': True}}})
-        row = self._checks()['storage_dirs']
-        self.assertEqual('attention', row['status'])
-        self.assertIn('Live thumbnail directory', row['found'])
-        self.assertIn(thumbs, row['found'])
+        self.t.sandbox_config(self._writable(recording={'images_dir': self.parent}))
+        rows = self._checks()
+        self.assertEqual('attention', rows['storage_images']['status'])
+        self.assertIn('Live thumbnail directory', rows['storage_images']['found'])
+        self.assertIn(thumbs, rows['storage_images']['found'])
+        self.assertNotIn(thumbs, rows['storage_dirs']['found'],
+                         'one folder is probed once and answers for one check')
+        caps = {c['id']: c for c in self._evaluate()['capabilities']}
+        self.assertIn('storage_images', caps['shots']['degraded'])
+        self.assertIn('storage_images', caps['files']['degraded'])
+
+    def test_an_unusable_backup_folder_does_not_touch_screenshots(self):
+        """A broken backup folder says nothing about whether a screenshot can be saved
+        (dev/changelog/1366)."""
+        backups = os.path.join(self.parent, 'dbb')
+        self.t.sandbox_config(self._writable(database={'backup_dir': backups}))
+        rows = self._checks()
+        self.assertEqual('attention', rows['storage_dirs']['status'])
+        self.assertIn(backups, rows['storage_dirs']['found'])
+        self.assertEqual('ready', rows['storage_images']['status'])
+        caps = {c['id']: c for c in self._evaluate()['capabilities']}
+        self.assertNotIn('storage_dirs', caps['shots']['needs'])
+        self.assertEqual([], caps['shots']['degraded'])
+        self.assertIn('storage_dirs', caps['files']['degraded'])
+
+    def test_image_folders_switched_off_have_nothing_to_check(self):
+        cfg = self._writable(recording={'live_thumbnail': {'enabled': False}})
+        cfg['channel_testing'] = {'screenshots_enabled': False}
+        self.t.sandbox_config(cfg)
+        self.assertEqual('nothing', self._checks()['storage_images']['status'])
 
     def test_every_folder_writable_is_ready(self):
-        self.t.sandbox_config({'recording': {
-            'dvr_output_dir': self.dvr,
-            'images_dir': os.path.join(self.t._tmpdir, 'img'),
-            'live_thumbnail': {'enabled': True}},
-            'database': {'backup_dir': os.path.join(self.t._tmpdir, 'dbb')},
-            'config_backup': {'backup_dir': os.path.join(self.t._tmpdir, 'cfgb')}})
-        self.assertEqual('ready', self._checks()['storage_dirs']['status'])
+        self.t.sandbox_config(self._writable())
+        rows = self._checks()
+        self.assertEqual('ready', rows['storage_dirs']['status'])
+        self.assertEqual('ready', rows['storage_images']['status'])
 
     def test_a_dvr_dir_that_cannot_be_written_blocks_recording(self):
         """It used to be os.access() on an existing path only; a missing DVR folder under

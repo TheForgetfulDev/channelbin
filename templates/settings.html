@@ -357,7 +357,7 @@
            'Every re-encode brings a recording to its own biggest picture: one that changed from 720p to 1080p partway through comes out 1080p from start to finish. This caps that size, and it only ever lowers it - a recording smaller than the cap is never upscaled past its own biggest size, so a 720p-only recording stays 720p under any setting.', pp.get('max_height', 0),
            [(0,'No limit'), (2160,'2160p (4K)'), (1080,'1080p'), (720,'720p')], gated_by=['recording.post_process.enabled', 'recording.post_process.format!=mkv', 'recording.post_process.reencode_mode!=never'], tier='advanced') }}
         {{ field_select('recording.post_process.video_encoder', 'Video encoder',
-           'What does the video re-encode. Software is libx264 on the CPU, which is slow and not recommended for long recordings. GPU (VAAPI) sends it to an Intel Quick Sync or AMD GPU through the device below, which cuts the CPU time of a re-encode by about five times and makes HEVC available. Decoding stays on the CPU unless GPU decoding is turned on below, and a lossless copy never touches the GPU. In Docker the device has to be passed as a device (--device /dev/dri), and it is only available on a Linux host. If the GPU is missing or fails, the conversion still finishes with libx264 and the recording event log says so. Maintenance > Readiness tests the device on demand.', pp.get('video_encoder', 'software'),
+           'What does the video re-encode. Software is libx264 on the CPU, which is slow and not recommended for long recordings. GPU (VAAPI) sends it to an Intel Quick Sync or AMD GPU through the device below, which cuts the CPU time of a re-encode by about five times and makes HEVC available. Decoding stays on the CPU unless GPU decoding is turned on below, and a lossless copy never touches the GPU. In Docker the device has to be passed as a device (--device /dev/dri), and it is only available on a Linux host. If the GPU is missing or fails, the conversion still finishes with libx264 and the recording event log says so. The Readiness check tests the device on demand.', pp.get('video_encoder', 'software'),
            [('software','Software (libx264 on the CPU)'), ('vaapi','GPU (VAAPI: Intel Quick Sync, AMD)')], gated_by=['recording.post_process.enabled', 'recording.post_process.format!=mkv', 'recording.post_process.reencode_mode!=never'], tier='advanced') }}
         {{ field_select('recording.post_process.video_codec', 'Video codec',
            'H.264 plays everywhere. HEVC makes a re-encoded file about two thirds the size of the source at the same picture quality, and keeps an HDR10 recording as HDR10 where H.264 tone-maps it to SDR. Recommended on a machine with a GPU; Plex played it cleanly on Android TV, 4K HDR10 included. HEVC is only encoded on the GPU: with a GPU that cannot encode it, re-encodes are H.264 and the recording event log says so.', pp.get('video_codec', 'h264'),
@@ -547,6 +547,8 @@
            'Require exact-case match between channel EPG IDs and XMLTV channel ids. When off, case-variant EPG IDs (e.g. FoxSports1.us vs foxsports1.us) are treated as the same channel; when a file lists both, a channel reads the one spelled like its own ID.', sync_cfg.get('epg_case_sensitive_matching', False), tier='advanced') }}
         {{ field_number('sync.epg_collapse_threshold_percent', 'EPG collapse guard threshold (%)',
            'Refuse an EPG import when the new data has fewer than this percent of the previous sync\'s entry count (protects against a transient empty/garbage feed wiping the guide). 0 = disabled.', sync_cfg.get('epg_collapse_threshold_percent', 20), tier='advanced') }}
+        {{ field_number('sync.epg_coverage_lost_alert_percent', 'Lost-guide alert threshold (%)',
+           'Raise an alert when one EPG refresh leaves at least this percent of the channels that had a guide with none. A smaller loss is normal provider churn and is noted on the account\'s Activity instead. 0 = alert on every loss.', sync_cfg.get('epg_coverage_lost_alert_percent', 10), tier='advanced') }}
       </div>
       <div data-sub="stream-urls">
         <div class="sec-sub"><strong>Stream URLs</strong></div>
@@ -765,6 +767,58 @@
         <button type="button" class="btn btn-sm" id="ha-generate-key-btn">{{ 'Regenerate key' if ha_has_key else 'Generate key' }}</button>
       </div>
       </div>
+
+      {#- The output feed (app/output_feed.py, DESIGN-output-feed.md 9): one switch, and the
+          rest only reads while it is on. The switch is disabled until a credential exists -
+          the route refuses it too. The help text says what is served and that a recording
+          always wins a seat; in redirect mode it says ChannelBin cannot see the IPTV app. -#}
+      {% set feedcfg = cfg.get('integrations', {}).get('output_feed', {}) %}
+      {% call field_shell('integrations.output_feed.enabled', 'Output feed for an IPTV app',
+         'When enabled, an IPTV app such as TiviMate can connect to ChannelBin via an Xtream account and gets exactly the TV Guide: every channel and group in it, in the guide\'s order, with the guide\'s own listings. A group plays as one channel from the member ChannelBin would record from, and moves to another member if that one dies. A recording always wins: an IPTV app holding the connection a recording needs is cut, and told why on the Alerts page. Needs the username and password below.', false, false, 'output feed tivimate xtream m3u xmltv iptv app client', tier='basic') %}
+      <label class="switch{{ ' tip-plain' if not feed_credentials_set else '' }}"{% if not feed_credentials_set %} data-tip="Set a username and password below first"{% endif %}>
+        <input type="checkbox" data-setting-path="integrations.output_feed.enabled"{{ ' checked' if feedcfg.get('enabled') else '' }}{{ ' disabled' if not feed_credentials_set else '' }}>
+        <span class="knob"></span>
+      </label>
+      {% endcall %}
+      {% call field_shell('', 'Address for the IPTV app', 'What to type as the server when adding the account - the address this page was opened on. Behind a reverse proxy, turn on flask.behind_proxy so it is the outside address. The feed\'s username and password are the ones below, and the login gate is not asked of the IPTV app.', false, false, 'output feed url server address', tier='basic') %}
+      <input type="text" value="{{ feed_url }}" readonly>
+      {% endcall %}
+      {{ field_text('integrations.output_feed.username', 'Feed username',
+         'The username the IPTV app sends on every request. Short is fine - it is typed on a remote, and the feed is only as reachable as this server is.', feedcfg.get('username', ''), tier='basic') }}
+      {% call field_shell('integrations.output_feed.password', 'Feed password',
+         'Sent on every request, including the one that starts each play, so it is stored as typed rather than hashed - the eye shows it back, which is what retyping it into an IPTV app needs.', false, false, 'output feed password secret', tier='basic') %}
+      <div class="secret-field">
+        <input type="text" data-setting-path="integrations.output_feed.password" value="{{ feedcfg.get('password', '') }}" autocomplete="off">
+        {% if feedcfg.get('password') %}{{ secret_reveal_btn('integrations.output_feed.password') }}{% endif %}
+      </div>
+      {% endcall %}
+      {{ field_select('integrations.output_feed.mode', 'How the IPTV app gets the stream',
+         'Proxy: ChannelBin plays the channel through itself, so it can hold a seat for the IPTV app, move a group to another member mid-stream and say why a play stopped. Redirect: the IPTV app is sent straight to the provider\'s stream for the member chosen at that moment - no failover, the provider\'s credentials reach the IPTV app, and ChannelBin never sees when the play ends, so a recording that then needs the connection is refused by the provider rather than warned about here.',
+         feedcfg.get('mode', 'proxy'), [('proxy', 'Proxy - relayed through ChannelBin'), ('redirect', 'Redirect - played straight from the provider')], tier='basic', gated_by=['integrations.output_feed.enabled']) }}
+      {{ field_list('integrations.output_feed.accounts', 'Accounts the feed may play from',
+         'Account ids, one per line (the number in an account page\'s address). Empty means every account. A group member on any other account is skipped before the format lock, and a channel on one is not served at all.',
+         feedcfg.get('accounts', []), tier='advanced', gated_by=['integrations.output_feed.enabled']) }}
+      {{ field_list('integrations.output_feed.held_seats', 'Seats kept free for the IPTV app',
+         'Redirect mode only. One "account id: seats" pair per line, like "2: 1". ChannelBin subtracts that many from its own connection limit on the account, so a recording never plans on a seat the IPTV app may be holding; a recording that then waits says so. Ignored in proxy mode, where the IPTV app holds a visible seat and yields it.',
+         feed_held_seats_lines, tier='advanced', gated_by=['integrations.output_feed.enabled', 'integrations.output_feed.mode!=proxy']) }}
+      {{ field_number('integrations.output_feed.reserve_seconds', 'Seconds behind live',
+         'Proxy mode. How much of the stream ChannelBin holds in memory before the IPTV app gets it. A dropout, a reconnect or a group failover shorter than this plays through without the picture freezing - but the seconds the provider never sent are still missing, so the picture skips forward by that much instead. 0 passes bytes straight through. About 1 MB of memory per second per IPTV app.',
+         feedcfg.get('reserve_seconds', 3), tier='advanced', gated_by=['integrations.output_feed.enabled', 'integrations.output_feed.mode!=redirect']) }}
+      {{ field_number('integrations.output_feed.buffer_mb', 'Buffer per IPTV app (MB)',
+         'Proxy mode. The fixed-size memory ring each IPTV app plays from; it never grows with watch time. Must hold the seconds behind live with room to spare - the save refuses a pair that does not fit. An IPTV app that falls further behind than this is cut and told so.',
+         feedcfg.get('buffer_mb', 16), tier='advanced', gated_by=['integrations.output_feed.enabled', 'integrations.output_feed.mode!=redirect']) }}
+      {{ field_number('integrations.output_feed.max_viewers', 'IPTV apps at once',
+         'Proxy mode. The most streams ChannelBin relays at the same time; one more is refused with a message naming the cap. Each one is an ffmpeg process, a provider connection and a buffer.',
+         feedcfg.get('max_viewers', 3), tier='advanced', gated_by=['integrations.output_feed.enabled', 'integrations.output_feed.mode!=redirect']) }}
+      {{ field_number('integrations.output_feed.idle_seconds', 'Idle cut (seconds)',
+         'Proxy mode. An IPTV app that has read nothing for this long is treated as gone and its stream ended, so a device switched off at the wall does not hold a provider connection.',
+         feedcfg.get('idle_seconds', 30), tier='advanced', gated_by=['integrations.output_feed.enabled', 'integrations.output_feed.mode!=redirect']) }}
+      {{ field_number('integrations.output_feed.max_session_hours', 'Longest session (hours)',
+         'Proxy mode. The hard cap on one play, so an IPTV app left on a channel for a week does not hold a provider connection for a week. The app tunes in again and gets a fresh session.',
+         feedcfg.get('max_session_hours', 12), tier='advanced', gated_by=['integrations.output_feed.enabled', 'integrations.output_feed.mode!=redirect']) }}
+      {{ field_number('integrations.output_feed.xmltv_days', 'Guide depth (days)',
+         'How many days of listings xmltv.php carries. The TV Guide\'s own depth is 3.',
+         feedcfg.get('xmltv_days', 3), tier='advanced', gated_by=['integrations.output_feed.enabled']) }}
     {% endcall %}
 
     {% call section('system', 'System') %}
@@ -779,7 +833,7 @@
          'Listening on every network address (' ~ (fsk.get('host') or '0.0.0.0') ~ '), so every device on your LAN can reach this app - ' ~
          ('and the login gate below is on, but it is a shared password, not per-user auth.' if auth_has_password and authcfg.get('enabled')
           else 'and it has no authentication (see the Security section above to turn on the password gate).') ~
-         ' If your reverse proxy runs on this same machine, you can set flask.host: 127.0.0.1 in the config.yaml tab to make the raw port unreachable except from the proxy. Do not do this if the proxy (or the devices you browse from) run on a different host - it will break access.', false, false, 'network exposure bind reachable lan security host', true, 'warn') %}{% endcall %}
+         ' If your reverse proxy runs on this same machine, you can set flask.host: 127.0.0.1 in the config.yaml tab to make the raw port unreachable except from the proxy. Do not do this if the proxy (or the devices you browse from) run on a different host - it will break access.', false, false, 'network exposure bind reachable lan security host', true, 'warn', tier='advanced') %}{% endcall %}
       {% endif %}
       {{ field_readonly('flask.behind_proxy', 'Behind a reverse proxy',
          'Trust the X-Forwarded-* headers, so the app sees the real client IP and the real scheme (https) instead of the proxy\'s. Turn this on only when a reverse proxy actually fronts the app - with it off, an HTTPS visitor still looks like plain HTTP to the app, and the login page warns that the connection is unencrypted when it is not. Your proxy must append to X-Forwarded-For rather than pass the client\'s own copy through (nginx: $proxy_add_x_forwarded_for), or a caller can present a fresh IP per attempt and never trip the login lockout. Edit in the config.yaml tab; restart required.',

@@ -248,6 +248,14 @@ def fmt_job_duration_line(avg_seconds, runs: int) -> str:
     return f'Usually takes {fmt_duration_phrase(avg_seconds)} ({basis}).'
 
 
+def fmt_job_last_run_line(when_et: str, phrase: str) -> str:
+    """The Scheduled Jobs page's last-run line for one job, under its estimate: when the
+    newest recorded run ended and how it went ('finished in about 2 minutes', 'failed:
+    <reason>'). The phrase is the caller's, built from the job's own outcome vocabulary;
+    this only fixes the sentence shape so every history table words it once."""
+    return f'Last run {when_et}: {phrase}.'
+
+
 def join_labels(labels) -> str:
     """'a', 'a and b', 'a, b and c' - the one list sentence (dev/changelog/1244). Repeats
     are dropped, order kept; empty in, empty string out."""

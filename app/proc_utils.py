@@ -95,6 +95,27 @@ def build_preview_cmd(cfg: dict, url: str, out_dir: str, *, segment_seconds: int
     return cmd
 
 
+def build_relay_cmd(cfg: dict, url: str, *, pace_realtime: bool = False) -> list:
+    """ffmpeg "connect + stream-copy to MPEG-TS on stdout" command for the output feed's
+    relay (app/output_feed.py, dev/docs/DESIGN-output-feed.md section 4.1). The input half is
+    input_args(), the same connect behavior every capture and preview gets, so a provider
+    sees an IPTV app exactly as it sees a recording.
+
+    The output is a stream copy for the reason build_preview_cmd's is: a re-encode measured
+    347% of this box's CPU, and a viewer must never be able to starve the capture it sits
+    beside. Video and audio are copied as they are - the IPTV app decodes whatever the provider
+    sends, unlike a browser - and subtitle and data tracks are dropped so a teletext PID
+    cannot upset the IPTV app's demuxer. One continuous TS on pipe:1 gives one shape for every
+    provider (an HLS source and a TS source both come out as TS), which is what an Xtream
+    client expects from `/live/<u>/<p>/<id>.ts` anyway. The caller's reader thread is the
+    one drain of that pipe (CLAUDE.md, subprocess discipline)."""
+    cmd = [resolve_ffmpeg_path(cfg['ffmpeg']['path'])]
+    cmd += input_args(cfg, url, pace_realtime=pace_realtime)
+    cmd += ['-map', '0:v:0?', '-map', '0:a:0?', '-sn', '-dn', '-c', 'copy',
+            '-f', 'mpegts', 'pipe:1']
+    return cmd
+
+
 #: How much of a recording's file build_file_playback_cmd reads ahead before pacing to real
 #: time, so the player has a buffer at once instead of waiting a segment per segment.
 FILE_PLAYBACK_BURST_SECONDS = 10

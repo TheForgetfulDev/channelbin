@@ -80,14 +80,21 @@ DASHBOARD_SECTIONS = {
     'health': {'label': 'Channel health check',
                'hint': 'Progress of a running health check run.',
                'to': 'Groups', 'endpoint': 'channel_groups.groups_page'},
+    # Only while the output feed is on: the view leaves it out of the defs it renders and
+    # offers in Customize otherwise, so a module that is off has no card and no toggle
+    # (DESIGN-output-feed.md 12).
+    'viewers': {'label': 'Watching now',
+                'hint': 'IPTV apps playing through the output feed, and how the last sessions ended.',
+                'to': 'Settings', 'endpoint': 'settings.settings'},
 }
+DASHBOARD_FEED_SECTION = 'viewers'
 
 # `upcoming` starts OFF because the timeline above it already answers "what is booked and
 # when" - leaving both on ships the same recordings twice. One toggle in Customize brings
 # it back. Everything else is on.
-DASHBOARD_SECTION_ORDER = ['timeline', 'live', 'upcoming', 'accounts', 'health']
+DASHBOARD_SECTION_ORDER = ['timeline', 'live', 'upcoming', 'accounts', 'health', 'viewers']
 DASHBOARD_SECTION_ON = {'timeline': True, 'live': True, 'upcoming': False,
-                        'accounts': True, 'health': True}
+                        'accounts': True, 'health': True, 'viewers': True}
 
 # Every status the Dashboard's two recording sections render - which is every status that is
 # not an outcome. recording_signature() reads the same set, so the page and the signature it
@@ -383,7 +390,7 @@ def _timeline_payload(recordings, accounts, now, finished=()):
     job with no run history arrives with `est_seconds: None` and draws as an outline with
     no length, never a number invented to make the bar legible.
     """
-    from .jobs import _build_job_list
+    from .jobs import _build_job_list, TIMELINE_HORIZON_HOURS
 
     account_color = {a.id: a.color for a in accounts}
 
@@ -443,23 +450,35 @@ def _timeline_payload(recordings, accounts, now, finished=()):
         # _build_job_list later appears here rather than being silently missing.
         if job['id'].startswith(('start_', 'active_')):
             continue
-        jobs.append({
-            'id': job['id'],
-            'name': job['display_name'],
-            'start': _ms(datetime.fromisoformat(job['next_run_utc'])),
-            'est_seconds': job['est_seconds'],
-            # /jobs' own sentence, so the tooltip and the table word it once.
-            'duration_line': job.get('duration_line'),
-            # None for a job no recording can defer - only those with one are eligible to
-            # be marked (16.4).
-            'guard': job.get('recording_guard'),
-            'url': '/jobs',
-        })
+        # One mark per occurrence inside the window, not one per job: a 6-hour sync fires
+        # twice in 12 hours and a recording booked over the second run deferred it with
+        # nothing on the axis saying so (dev/changelog/1354). The later runs are the
+        # trigger's own, listed by _build_job_list for recording-guarded jobs only - the
+        # 5-minute probes would put 144 marks a day on the rail.
+        occurrences = [job['next_run_utc']] + list(job.get('later_runs_utc') or [])
+        for n, when in enumerate(occurrences):
+            jobs.append({
+                'id': job['id'],
+                'name': job['display_name'],
+                'start': _ms(datetime.fromisoformat(when)),
+                # 0 is the next run; a later one says "runs again" in its tooltip.
+                'occurrence': n,
+                'est_seconds': job['est_seconds'],
+                # /jobs' own sentence, so the tooltip and the table word it once.
+                'duration_line': job.get('duration_line'),
+                # None for a job no recording can defer - only those with one are eligible
+                # to be marked (16.4).
+                'guard': job.get('recording_guard'),
+                'url': '/jobs',
+            })
 
     return {
         'now': _ms(now),
         'recordings': rows,
         'jobs': jobs,
+        # The axis's forward reach, so the client draws the window the occurrences above
+        # were listed for rather than a constant of its own.
+        'horizon_hours': TIMELINE_HORIZON_HOURS,
     }
 
 
@@ -591,11 +610,23 @@ def dashboard():
     upcoming = [r for r in active if r.status == REC_STATUS_SCHEDULED]
 
     order, enabled = _section_state()
+    from .. import output_feed
+    feed_cfg = output_feed.feed_config(cfg)
+    section_defs = dict(DASHBOARD_SECTIONS)
+    if output_feed.is_enabled(feed_cfg):
+        feed = {'mode': output_feed.mode_of(feed_cfg),
+                'live': [s.to_dict() for s in output_feed.live_sessions()],
+                'ended': [s.to_dict() for s in output_feed.recent_ended()][:5],
+                'redirects': output_feed.recent_redirects()[:5]}
+    else:
+        feed = None
+        section_defs.pop(DASHBOARD_FEED_SECTION, None)
+        order = [k for k in order if k != DASHBOARD_FEED_SECTION]
 
     return render_template(
         'dashboard.html',
         recordings=active, accounts=accounts, health_check=health_check,
-        guide_check=guide_check,
+        guide_check=guide_check, feed=feed,
         acct_stats=acct_stats,
         next_sync=next_sync_map(accounts),
         live=live, upcoming=upcoming, now=now, live_stats=_live_row_stats(live, now),
@@ -608,7 +639,7 @@ def dashboard():
             r.status, waiting=bool(r.postprocess_waiting_since))[3] for r in active},
         rec_waiting_ids={r.id for r in active
                          if rec_is_waiting(r.status, r.postprocess_waiting_since)},
-        section_defs=DASHBOARD_SECTIONS, section_order=order, section_on=enabled,
+        section_defs=section_defs, section_order=order, section_on=enabled,
         section_pref_key=DASHBOARD_SECTIONS_PREF,
         # The signals dashboard.js swaps its self-refreshing regions on. Each signature is the
         # same one /api/nav-status carries, so the comparison is between two readings of one
@@ -904,51 +935,62 @@ def _activity_status_dict():
     bg_active = bool(bg_tasks)
 
     # Dim state: a background job scheduled to start within the next hour. Bounded
-    # deliberately - account sync and the daily config backup run on multi-hour/daily
-    # cadences, so an unbounded "any future job" check would leave this chip dim
-    # almost permanently, defeating the point of a "something's imminent" signal
-    # (decided 2026-08-05).
+    # deliberately - an unbounded "any future job" check would leave this chip dim almost
+    # permanently, defeating the point of a "something's imminent" signal (decided
+    # 2026-08-05). Which jobs count is routes/jobs.py::dims_background_chip's call, by
+    # cadence: a job that recurs within the hour is always imminent and so never news,
+    # while a daily or multi-hour one is (dev/changelog/1353).
     _BG_DIM_WINDOW = timedelta(minutes=60)
     next_bg_job = None
     future_jobs = []
     try:
         from ..scheduler import get_scheduler, scheduler_is_live
+        from .jobs import RECURRING_META, dims_background_chip, retry_base_job_id
         scheduler = get_scheduler()
         # A dead loop's registered jobs are not upcoming; readiness says why the chip is
         # gone (dev/changelog/1114).
         if scheduler and scheduler_is_live():
             # label, and the page that job's kind is managed from - the tooltip row is a
             # link like every other one, so each entry owns its own destination rather
-            # than every scheduled job landing on the same generic list.
-            _BG_SYSTEM_NAMES = {
-                'config_backup_daily': ('Config Backup', url_for('system.maintenance')),
-            }
+            # than every scheduled job landing on the same generic list. System jobs are
+            # named from the table /jobs names them from.
             from ..database import OnDemandTestJob
             sys_job = OnDemandTestJob.query.filter_by(is_system=True).first()
-            if sys_job:
-                _BG_SYSTEM_NAMES[f'od_job_{sys_job.id}'] = (
-                    sys_job.name, url_for('jobs.jobs_page'))
+            jobs_url = url_for('jobs.jobs_page')
 
             def _bg_label(job_id):
-                if job_id in _BG_SYSTEM_NAMES:
-                    return _BG_SYSTEM_NAMES[job_id]
+                base = retry_base_job_id(job_id) or job_id
+                if base in RECURRING_META:
+                    name, edit_url, _what = RECURRING_META[base]
+                    return (name, edit_url or jobs_url)
                 # Real job id is per-account (`account_sync_<id>`, or its deferred-retry
                 # sibling `account_sync_retry_<id>`) - there is no single global sync job.
-                if job_id.startswith('account_sync_'):
+                if base.startswith('account_sync_'):
                     return ('Account / EPG Sync', url_for('accounts.accounts_list'))
-                return None
+                if base.startswith('epg_source_refresh_'):
+                    return ('EPG refresh', jobs_url)
+                if sys_job is not None and base == f'od_job_{sys_job.id}':
+                    return (sys_job.name, jobs_url)
+                if base.startswith('od_job_'):
+                    return ('Health check', jobs_url)
+                return (base, jobs_url)
 
             cutoff = now + _BG_DIM_WINDOW
-            for j in scheduler.get_jobs():
+            # One get_jobs() read, and a retry's base job resolved from it: the
+            # scheduler's get_job() is a SELECT on the jobstore, and this runs on every
+            # nav-status poll of every open tab.
+            all_jobs = scheduler.get_jobs()
+            by_id = {j.id: j for j in all_jobs}
+            for j in all_jobs:
                 if j.next_run_time is None:
-                    continue
-                named = _bg_label(j.id)
-                if named is None:
                     continue
                 nrt_utc = to_naive_utc(j.next_run_time)
                 if nrt_utc > cutoff:
                     continue
-                future_jobs.append((nrt_utc, named[0], named[1]))
+                if not dims_background_chip(j, by_id.get):
+                    continue
+                label, href = _bg_label(j.id)
+                future_jobs.append((nrt_utc, label, href))
             if future_jobs:
                 future_jobs.sort(key=lambda t: t[0])
                 nrt_utc, label, href = future_jobs[0]
@@ -1069,7 +1111,7 @@ def nav_status():
     payload['setup'] = setup_steps.nav_summary(sync_sig, recordings_total)
     # Cached for 30s inside nav_summary(), and never able to run an on-demand check - a poll
     # that spawned a process or opened a provider connection would be the exact thing the
-    # Readiness card refuses to do on page load (dev/changelog/950).
+    # Readiness page refuses to do on page load (dev/changelog/950).
     payload['readiness'] = nav_summary()
     return jsonify(**payload)
 

@@ -13,6 +13,7 @@ import threading
 from datetime import datetime, timedelta
 
 from sqlalchemy import create_engine
+from sqlalchemy.exc import SQLAlchemyError
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.schedulers.base import STATE_STOPPED
 from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
@@ -604,7 +605,8 @@ def resume_in_progress_recordings(app):
             SYNC_LOG_CANCELLED,
         )
         from .recorder import (start_recording, resume_recording, stop_recording,
-                               close_open_segment_after_unclean_stop, OPEN_SEG_REFUSED)
+                               close_open_segment_after_unclean_stop, OPEN_SEG_REFUSED,
+                               close_segments_left_open_on_ended_recordings)
         from .concatenator import do_concatenation, run_postprocess_claimed
         from .accounts import finalize_sync_state
         import threading
@@ -636,6 +638,12 @@ def resume_in_progress_recordings(app):
                 db.session.commit()
 
         _reset_stuck_accounts()
+        # A safety net for rows nothing else would close; failing it must not stop the
+        # crashed captures below from being resumed.
+        try:
+            close_segments_left_open_on_ended_recordings()
+        except SQLAlchemyError:
+            log.exception('Could not close segments left open on ended recordings at startup')
 
         @retry_on_locked()
         def _clear_stale_source_refreshes():
@@ -902,6 +910,8 @@ def resume_in_progress_recordings(app):
         # than COMPLETED, and so the two that give up above keep the alert they just raised.
         from .postprocessor import reconcile_failure_alerts
         reconcile_failure_alerts()
+        from .health_score import reconcile_recording_failing_alerts
+        reconcile_recording_failing_alerts()
 
         # Case 2a: SCHEDULED but entirely missed (past stop_time) → mark FAILED
         import threading as _t
@@ -2096,7 +2106,7 @@ HIDE_MATERIALIZE_RETRY_JOB_ID = 'channel_hide_materialize_retry'
 def _hide_materialize_retry_job(reason: str = None):
     """Re-apply the channel hide rules after a pass was refused for database contention.
 
-    `reason` is never read here - it rides in the job's own kwargs so the Hide Rules page
+    `reason` is never read here - it rides in the job's own kwargs so the Hide Channels page
     can name what blocked the pass for as long as the retry is pending, which is what
     pending_hide_materialize() reads back.
     """
@@ -2113,7 +2123,7 @@ def defer_hide_materialize(reason: str, retry_minutes: int = 15) -> None:
     The rules themselves are already committed, so nothing is lost - what is stale is
     `Channel.hidden`, the answer every browse surface reads. A person who just saved a rule
     and sees nothing change is owed the reason, which is why this alerts rather than logging
-    quietly - the Hide Rules page reads that reason back off the queued retry - and owed the
+    quietly - the Hide Channels page reads that reason back off the queued retry - and owed the
     work actually happening, which is why it retries rather than waiting for the next sync to
     pick it up by accident.
 

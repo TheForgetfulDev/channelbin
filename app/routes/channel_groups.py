@@ -1471,7 +1471,7 @@ def build_group_detail_context(group):
     # What the page may SAY it is. A recording and a guide row both start from
     # recording_members(), so a group with none records nothing whatever its format
     # strategy says, and must not describe itself as a recording source - "a group with no
-    # member enabled for recording is simply a health check" is the Groups list page's
+    # channels enabled for recording is simply a health check" is the Groups list page's
     # own sentence for that state. The same fact participation_is_recording() reads
     # (dev/changelog/1077); spelled through it so the two cannot drift apart again.
     records = participation_is_recording(group)

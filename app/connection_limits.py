@@ -37,7 +37,7 @@ _lock = threading.Lock()
 # pool -> list of (holder_kind, holder_id) currently holding a seat in it.
 #   pool: the account id itself (int) for an account with no logins - its one pool, as
 #         it always was - or ('login', login_id) for each login the account holds.
-#   holder_kind: 'recording' | 'test' | 'preview'
+#   holder_kind: 'recording' | 'test' | 'preview' | 'viewer'
 _holders: dict = defaultdict(list)
 # (holder_kind, holder_id) -> (account_id, pool): where each holder was counted, written at
 # acquire and read at release, so the pool never has to be re-derived from a list that may
@@ -49,6 +49,7 @@ HOLDER_LABELS = {
     'recording': 'a recording',
     'test': 'a channel test',
     'preview': 'a live preview',
+    'viewer': 'an IPTV app',
 }
 
 
@@ -75,7 +76,7 @@ def limits_for_accounts(accounts, default_max_connections: int) -> dict:
     return {a.id: limit_for_account(a, default_max_connections, seats.get(a.id)) for a in rows}
 
 
-def _pool_taken_now(account_ids, seats: dict) -> dict:
+def _pool_taken_now(account_ids, seats: dict, cfg=None) -> dict:
     """{pool: slots a block takes right now} for the pools of `account_ids` (`seats`, their
     login rows) - read BEFORE _lock is taken, since it is a query and the lock guards only
     the in-memory holder list. A block on an account sharing one of their logins counts on
@@ -88,6 +89,14 @@ def _pool_taken_now(account_ids, seats: dict) -> dict:
     if any(seats.get(a) for a in ids):
         wider |= {other for found in login_siblings(ids).values() for other in found}
     merged = blocked_slots(blocks_at(account_ids=wider))
+    # Seats the output feed keeps free for an IPTV app in redirect mode are subtracted exactly
+    # where a block's are: ChannelBin cannot see the IPTV app's connection in that mode, so the
+    # recorder must never plan on a seat the IPTV app may be using (DESIGN-output-feed.md 5.3).
+    from .output_feed import held_seats_now
+    for account_id, held in held_seats_now(wider, cfg).items():
+        if merged.get(account_id, 0) is None:
+            continue
+        merged[account_id] = merged.get(account_id, 0) + held
     if not merged:
         return {}
     missing = set(merged) - set(seats)
@@ -155,7 +164,7 @@ def try_acquire(account_id: int, holder_kind: str, holder_id) -> bool:
     cooldown = refusal_cooldown(cfg)
     all_seats = _seats_now([account_id])
     seats = all_seats.get(account_id, [])
-    taken = _pool_taken_now([account_id], all_seats)
+    taken = _pool_taken_now([account_id], all_seats, cfg)
     with _lock:
         account = db.session.get(Account, account_id)
         if account is None:
@@ -206,7 +215,7 @@ def move_seat(holder_kind: str, holder_id, from_account_id: int, to_account_id: 
     cooldown = refusal_cooldown(cfg)
     all_seats = _seats_now([to_account_id])
     seats = all_seats.get(to_account_id, [])
-    taken = _pool_taken_now([to_account_id], all_seats)
+    taken = _pool_taken_now([to_account_id], all_seats, cfg)
     key = (holder_kind, holder_id)
     with _lock:
         account = db.session.get(Account, to_account_id)
@@ -253,7 +262,7 @@ def reseat_if_refused(account_id: int, holder_kind: str, holder_id) -> Optional[
     cooldown = refusal_cooldown(cfg)
     all_seats = _seats_now([account_id])
     seats = all_seats.get(account_id, [])
-    taken = _pool_taken_now([account_id], all_seats)
+    taken = _pool_taken_now([account_id], all_seats, cfg)
     with _lock:
         seated = _seat_of.get(key)
         if seated is None or not isinstance(seated[1], tuple):
@@ -303,10 +312,11 @@ def at_limit(account_id: int) -> bool:
     from . import db
     from .config import load_config
     from .database import Account
-    default_max_connections = load_config().get('accounts', {}).get('default_max_connections', 1)
+    cfg = load_config()
+    default_max_connections = cfg.get('accounts', {}).get('default_max_connections', 1)
     all_seats = _seats_now([account_id])
     seats = all_seats.get(account_id, [])
-    taken = _pool_taken_now([account_id], all_seats)
+    taken = _pool_taken_now([account_id], all_seats, cfg)
     with _lock:
         account = db.session.get(Account, account_id)
         if account is None:
@@ -340,9 +350,10 @@ def accounts_without_free_recording_slot(account_ids, exclude_holder=None) -> se
     ids = {a for a in account_ids if a is not None}
     if not ids:
         return set()
-    default_max_connections = load_config().get('accounts', {}).get('default_max_connections', 1)
+    cfg = load_config()
+    default_max_connections = cfg.get('accounts', {}).get('default_max_connections', 1)
     seats = _seats_now(ids)
-    taken = _pool_taken_now(ids, seats)
+    taken = _pool_taken_now(ids, seats, cfg)
     pools_by_account = {a.id: _usable_limits(a, default_max_connections, taken, seats.get(a.id, []))
                         for a in Account.query.filter(Account.id.in_(ids)).all()}
     full = set()
@@ -372,12 +383,13 @@ def must_yield_to_block(account_id: int, recording_id: int) -> bool:
     from . import db
     from .config import load_config
     from .database import Account
+    cfg = load_config()
     all_seats = _seats_now([account_id])
     seats = all_seats.get(account_id, [])
-    taken = _pool_taken_now([account_id], all_seats)
+    taken = _pool_taken_now([account_id], all_seats, cfg)
     if not taken:
         return False
-    default_max_connections = load_config().get('accounts', {}).get('default_max_connections', 1)
+    default_max_connections = cfg.get('accounts', {}).get('default_max_connections', 1)
     account = db.session.get(Account, account_id)
     if account is None:
         return False
@@ -523,6 +535,15 @@ def preempt_tests_for_slot(account_id: int) -> List[tuple]:
     this is the mechanism that enforces it.
     """
     return _strip_kind(account_id, 'test')
+
+
+def preempt_viewers_for_slot(account_id: int) -> List[tuple]:
+    """Release every 'viewer'-kind holder a recording on account_id needs the seat of and
+    return (relay session id, account the viewer came through) pairs, so recorder.py can
+    end the session through app/output_feed.py. An IPTV app is lowest in the order: the
+    recorder asks this before the preview strip, since a viewer can resume on its own and
+    a recording is what the app is for (DESIGN-output-feed.md 4.4)."""
+    return _strip_kind(account_id, 'viewer')
 
 
 def preempt_previews_for_slot(account_id: int) -> List[tuple]:

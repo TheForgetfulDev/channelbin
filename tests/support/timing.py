@@ -316,11 +316,20 @@ class _Tee:
 
 
 def _cpu_snapshot():
-    """`(whole-box busy CPU seconds, this process tree's CPU seconds)`, or None.
+    """`(whole-box busy CPU seconds, this process tree's CPU seconds, stolen seconds)`, or None.
 
-    The two are read together because only their difference means anything: subtracting our
-    own consumption from the box's leaves the CPU that went to something else, which is the
-    one term in a run's wall clock that nothing has ever recorded.
+    The first two are read together because only their difference means anything: subtracting
+    our own consumption from the box's leaves the CPU that went to something else, which is the
+    one term in a run's wall clock that nothing had ever recorded.
+
+    The third is `/proc/stat`'s steal column on its own: time the hypervisor ran something
+    other than this guest while the guest wanted the core. It is kept separate because the
+    busy-minus-own difference cannot see it. This box's kernel accounts a task's CPU from the
+    scheduler clock (`CONFIG_PARAVIRT_TIME_ACCOUNTING` unset), so a stolen tick is charged to
+    whatever process was on the core as if it had run - it lands in `own` and in `busy` alike
+    and cancels out of "foreign". Measured on 2026-10-30: sar read 15-19% steal through a suite
+    run whose record said 7-9% foreign CPU (dev/changelog/1350). A box with no steal column
+    (bare metal, an old kernel) reports 0.0, which is what it has.
 
     `RUSAGE_CHILDREN` accumulates a descendant's CPU into ours as each level reaps it, so a
     worker's ffmpeg and node children are counted as ours rather than as foreign - provided
@@ -339,11 +348,12 @@ def _cpu_snapshot():
     if len(fields) < 5 or not hz:
         return None
     idle = fields[3] + fields[4]          # idle + iowait
+    steal = fields[7] if len(fields) > 7 else 0
     own = 0.0
     for who in (resource.RUSAGE_SELF, resource.RUSAGE_CHILDREN):
         ru = resource.getrusage(who)
         own += ru.ru_utime + ru.ru_stime
-    return (sum(fields) - idle) / hz, own
+    return (sum(fields) - idle) / hz, own, steal / hz
 
 
 def _foreign_cpu(before, after, wall):
@@ -357,6 +367,23 @@ def _foreign_cpu(before, after, wall):
     if before is None or after is None or not wall or wall <= 0:
         return None
     seconds = max(0.0, (after[0] - before[0]) - (after[1] - before[1]))
+    cores = os.cpu_count() or 1
+    return seconds, min(1.0, seconds / (wall * cores))
+
+
+def _stolen_cpu(before, after, wall):
+    """`(seconds, share of the box)` the hypervisor took from this guest, or None.
+
+    Read from the steal column `_cpu_snapshot` carries as its third element, against the same
+    `wall * cpu_count` denominator as the foreign share, so the two read side by side: "this
+    fraction went to other work on the box, and this fraction the box never had". A snapshot
+    without the column (one taken before it existed) answers None, never zero.
+    """
+    if before is None or after is None or not wall or wall <= 0:
+        return None
+    if len(before) < 3 or len(after) < 3:
+        return None
+    seconds = max(0.0, after[2] - before[2])
     cores = os.cpu_count() or 1
     return seconds, min(1.0, seconds / (wall * cores))
 
@@ -557,6 +584,12 @@ def _status_line(record, prior_passing):
     facts = ([f'{per_test:.1f}ms/test'] if per_test is not None else [])
     if share is not None:
         facts.append(f'{share * 100:.0f}% foreign CPU')
+    # The hypervisor's share rides next to it: it is the term foreign CPU cannot see on this
+    # kernel (see _cpu_snapshot), and the 2026-10-29 step from 76 to 89 ms/test at one commit
+    # was entirely this figure going from 1% to 17% (dev/changelog/1350).
+    stolen = record.get('steal_cpu_share')
+    if stolen is not None:
+        facts.append(f'{stolen * 100:.0f}% stolen by the host')
     # A skip counts as a pass, so a suite that silently shrank reads OK with a normal-looking
     # test count. Naming the skips on every line is what makes that visible even when a
     # future gate lands without a run_tests.sh guard behind it (dev/changelog/1135). Records
@@ -875,7 +908,9 @@ def _run_capture(args):
             if log_fh is not None:
                 log_fh.close()
         wall = time.perf_counter() - t0
-        foreign = _foreign_cpu(cpu_before, _cpu_snapshot(), wall)
+        cpu_after = _cpu_snapshot()
+        foreign = _foreign_cpu(cpu_before, cpu_after, wall)
+        stolen = _stolen_cpu(cpu_before, cpu_after, wall)
         commit, dirty = _git_info()
         failed_ids = _failed_ids(result)
         record = {
@@ -892,6 +927,9 @@ def _run_capture(args):
             record['cpu_count'] = os.cpu_count() or 1
             record['foreign_cpu_s'] = round(foreign[0], 2)
             record['foreign_cpu_share'] = round(foreign[1], 4)
+        if stolen is not None:
+            record['steal_cpu_s'] = round(stolen[0], 2)
+            record['steal_cpu_share'] = round(stolen[1], 4)
         if failed_ids:
             record['failed_ids'] = _history_safe_ids(failed_ids)[:MAX_FAILED_IDS]
         prior = _passing_same_tier(_load_history(CAPTURE_HISTORY_PATH), tier, 1)
@@ -1003,7 +1041,9 @@ def main(argv=None):
         merged = _run_sharded(shards, log_dir)
         jobs = len(shards)
 
-    foreign = _foreign_cpu(cpu_before, _cpu_snapshot(), merged['total_wall'])
+    cpu_after = _cpu_snapshot()
+    foreign = _foreign_cpu(cpu_before, cpu_after, merged['total_wall'])
+    stolen = _stolen_cpu(cpu_before, cpu_after, merged['total_wall'])
     per_module = {k: round(v, 2) for k, v in merged['per_module'].items()}
     per_fixture = {k: round(v, 2) for k, v in merged['fixtures'].items()}
     commit, dirty = _git_info()
@@ -1037,6 +1077,9 @@ def main(argv=None):
         record['cpu_count'] = os.cpu_count() or 1
         record['foreign_cpu_s'] = round(foreign[0], 2)
         record['foreign_cpu_share'] = round(foreign[1], 4)
+    if stolen is not None:
+        record['steal_cpu_s'] = round(stolen[0], 2)
+        record['steal_cpu_share'] = round(stolen[1], 4)
     failed_ids = merged.get('failed_ids', [])
     if failed_ids:
         # Written only on a red run, so `grep failed_ids` over the history file lists every

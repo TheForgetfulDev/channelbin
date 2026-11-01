@@ -32,6 +32,7 @@ from tests.support.timing import (  # noqa: E402
     CEILINGS_MS_PER_TEST, DRIFT_MIN_PRIOR, DRIFT_RECENT, MAX_LOG_RUNS, STATUS_PREFIX, _Tee,
     _assert_no_module_was_dropped, _charged, _cpu_snapshot, _discover_modules, _failed_ids,
     _foreign_cpu, _history_safe_ids, _module_weights, _ms_per_test, _open_log, _pack_shards,
+    _stolen_cpu,
     _passing_same_tier, _per_module, _per_test_drift, _prepare_log_dir, _pump, _status_line,
     _TimingResult,
 )
@@ -445,6 +446,49 @@ class ForeignCpuTests(unittest.TestCase):
         prior = [dict(record, failures=0, errors=0) for _ in range(10)]
 
         self.assertNotIn('foreign CPU', _status_line(record, prior))
+
+    def test_stolen_is_the_steal_column_on_its_own(self):
+        """dev/changelog/1350: on a kernel that charges a stolen tick to the task that was on
+        the core, busy minus own cancels the steal away - a suite run sar read at 15-19% steal
+        recorded 7-9% foreign CPU. So the figure is read from the column, never derived."""
+        before, after = (100.0, 40.0, 5.0), (160.0, 90.0, 17.0)
+
+        seconds, share = _stolen_cpu(before, after, wall=30.0)
+
+        self.assertAlmostEqual(seconds, 12.0)
+        self.assertAlmostEqual(share, 12.0 / (30.0 * (os.cpu_count() or 1)))
+
+    def test_a_snapshot_without_the_steal_column_yields_no_figure(self):
+        """A two-element snapshot predates the column; absent must not read as zero."""
+        self.assertIsNone(_stolen_cpu((1.0, 1.0), (2.0, 2.0), wall=30.0))
+        self.assertIsNone(_stolen_cpu(None, (1.0, 1.0, 0.0), wall=30.0))
+        self.assertIsNone(_stolen_cpu((1.0, 1.0, 0.0), (2.0, 2.0, 1.0), wall=0.0))
+        self.assertEqual(_stolen_cpu((0.0, 0.0, 5.0), (1.0, 1.0, 4.0), wall=30.0)[0], 0.0)
+
+    def test_a_snapshot_on_this_box_carries_the_steal_column(self):
+        snap = _cpu_snapshot()
+        if snap is None:
+            self.skipTest('no /proc/stat on this platform')
+        self.assertEqual(len(snap), 3)
+        self.assertGreaterEqual(snap[2], 0.0)
+
+    def test_the_status_line_names_what_the_host_took(self):
+        record = {'tier': '0-2', 'jobs': 4, 'total_wall': 900.0, 'test_count': 10000,
+                  'per_module': {'A': 1.0}, 'per_module_fixture': {},
+                  'foreign_cpu_share': 0.07, 'steal_cpu_share': 0.17}
+        prior = [dict(record, failures=0, errors=0) for _ in range(10)]
+
+        line = _status_line(record, prior)
+        self.assertIn('7% foreign CPU', line)
+        self.assertIn('17% stolen by the host', line)
+
+    def test_a_run_with_no_steal_figure_says_nothing_about_it(self):
+        record = {'tier': '0-2', 'jobs': 4, 'total_wall': 900.0, 'test_count': 10000,
+                  'per_module': {'A': 1.0}, 'per_module_fixture': {},
+                  'foreign_cpu_share': 0.07}
+        prior = [dict(record, failures=0, errors=0) for _ in range(10)]
+
+        self.assertNotIn('stolen', _status_line(record, prior))
 
     def test_the_status_line_names_the_skip_count(self):
         """A skip counts as a pass, so a suite that shrank reads OK unless the line says so.

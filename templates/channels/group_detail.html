@@ -70,8 +70,8 @@
     </div>
     {# What this group IS, in the model's one noun. `records` leads because it is the
        flag that says whether anything comes out of this group; a group with no member
-       enabled for recording is a health check, which is the sentence the Groups list
-       page already uses for the same state. The system group is the terminal branch
+       enabled for recording is a health check, which is what the Groups list page's
+       intro says of the same state. The system group is the terminal branch
        because `is_stored` is exactly `not is_system` - there is no third state to fall
        through to. #}
     <p class="gd-sub-lead">
@@ -85,8 +85,8 @@
       {% else %}
       {{ system_check_sentence }} Its list follows your <a href="{{ url_for('guide.guide') }}">TV Guide</a>
       by itself{% if not payload.total %}, so there is nothing to test until you add a channel from
-      <a href="{{ url_for('channels.channel_browser') }}">Channel Search</a>{% else %} - add or remove
-      channels from <a href="{{ url_for('channels.channel_browser') }}">Channel Search</a>{% endif %}.
+      <a href="{{ url_for('channels.channel_browser') }}">Search</a>{% else %} - add or remove
+      channels from <a href="{{ url_for('channels.channel_browser') }}">Search</a>{% endif %}.
       {% endif %}
     </p>
   </div>

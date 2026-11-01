@@ -21,7 +21,8 @@ from sim import Library, serve_for_test  # noqa: E402
 from sim import ts as sim_ts  # noqa: E402
 from sim.mp3 import Mp3Loop  # noqa: E402
 from sim.server import THREAD_PREFIX  # noqa: E402
-from sim.streams import ChannelClock, Feed, TsConnection  # noqa: E402
+from sim.streams import (ChannelClock, ClipConnection, Feed, Mp3Connection,  # noqa: E402
+                         TsConnection)
 
 from tests.support.sim_streams import (first_pcr_seconds, library, live_ids, origin,  # noqa: E402
                                        read_for, stream_world, video_seconds, wait_until,
@@ -339,6 +340,58 @@ class ChannelTimeTests(unittest.TestCase):
         other = next(TsConnection(loop, Feed('cove', '1235', 'test_tiny', 5), clock,
                                   4.0).pieces(stop))
         self.assertNotEqual(a, other)
+
+
+class OfferedCountsWrittenPiecesTests(unittest.TestCase):
+    """A piece counts as offered only once the server has written it: the server's write
+    raising closes the generator at its `yield`, and nothing it claimed for that piece may
+    stand (dev/docs/BUGS.md 2026-11-01 08:55 AM)."""
+
+    def setUp(self):
+        self.stop = threading.Event()
+        self.addCleanup(self.stop.set)
+
+    def test_a_ts_piece_whose_write_failed_is_not_offered(self):
+        loop = library().load('test_tiny')
+        conn = TsConnection(loop, Feed('cove', '1234', 'test_tiny', 5),
+                            ChannelTimeTests.Held(1_790_000_000 * 10 ** 9), 4.0)
+        gen = conn.pieces(self.stop)
+        next(gen)
+        gen.close()                     # what the server's raising write does to it
+        self.assertIsNone(conn.offered())
+        self.assertEqual(conn.sent, 0)
+
+    def test_a_ts_connection_offers_through_its_last_written_piece(self):
+        loop = library().load('test_tiny')
+        clock = ChannelTimeTests.Held(1_790_000_000 * 10 ** 9)
+        conn = TsConnection(loop, Feed('cove', '1234', 'test_tiny', 5), clock, 4.0)
+        gen = conn.pieces(self.stop)
+        first = next(gen)
+        clock.ns += 2 * 10 ** 9
+        next(gen)                       # the first piece was written; the second was not
+        last = conn.first + len(first) // sim_ts.TS - 1
+        expected = round(conn.timing.channel_seconds(loop.send_time(last)), 6)
+        self.assertEqual(conn.offered()[1], expected)
+        gen.close()
+        self.assertEqual(conn.offered()[1], expected)
+        self.assertEqual(conn.sent, len(first))
+
+    def test_an_mp3_frame_run_whose_write_failed_is_not_offered(self):
+        loop = library().load('radio_mp3')
+        conn = Mp3Connection(loop, Feed('cove', '1234', 'radio_mp3', 5),
+                             ChannelTimeTests.Held(1_790_000_000 * 10 ** 9))
+        gen = conn.pieces(self.stop)
+        next(gen)
+        gen.close()
+        self.assertIsNone(conn.offered())
+
+    def test_a_clip_piece_whose_write_failed_adds_no_content(self):
+        loop = library().load('test_tiny')
+        conn = ClipConnection(loop, 5, 'cove', clip_seconds=30.0, speed=1000.0)
+        gen = conn.pieces(self.stop)
+        next(gen)
+        gen.close()
+        self.assertEqual(conn.content_seconds(), 0)
 
 
 if __name__ == '__main__':

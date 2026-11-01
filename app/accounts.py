@@ -1371,6 +1371,9 @@ def _do_sync(account_id: int, stop_event: threading.Event, use_dump: bool = Fals
         # consult, so it stays None and raises no alert - that is normal operation for the
         # account type, not a degradation (§4.2).
         classify_outcome: str | None = None
+        # The sentence naming what the provider sent when classification did not apply, for
+        # the sync log and the alert (dev/changelog/1359). None while it applied.
+        classify_note: str | None = None
         # How many channels ended up with a stream URL we constructed rather than one the
         # provider supplied (DESIGN-live-vod.md §4.3). M3U accounts always get real URLs
         # from their playlist, so this stays 0 for them.
@@ -1451,7 +1454,7 @@ def _do_sync(account_id: int, stop_event: threading.Event, use_dump: bool = Fals
 
             # Fetched and classified OUTSIDE the closure below - three provider API calls
             # that must not be re-issued on a lock retry; see the m3u branch above.
-            xtream_streams, classify_outcome, constructed_urls = (
+            xtream_streams, classify_outcome, constructed_urls, classify_note = (
                 _fetch_and_classify_xtream_streams(account, client, cfg, stream_origin_used))
             _raise_if_cancelled(stop_event, _CANCEL_LEFT_NOTHING)   # see the m3u branch
 
@@ -1490,6 +1493,10 @@ def _do_sync(account_id: int, stop_event: threading.Event, use_dump: bool = Fals
         # sync log so the 0 it contributed has a reason, but not a degradation - nothing
         # about the guide is wrong, so the sync does not finish PARTIAL over it.
         skipped: list[str] = []
+        # Channels a source's import left with no guide. Named here on every sync, since
+        # only a loss past sync.epg_coverage_lost_alert_percent raises the alert; not a
+        # degradation either way, as the import itself worked.
+        coverage_notes: list[str] = []
         for source in sources_refreshed_by_sync(account_id):
             if use_dump and source.kind == EPG_SOURCE_PROVIDER:
                 xmltv_path = os.path.join(dump_dir, 'xmltv.xml')
@@ -1500,18 +1507,18 @@ def _do_sync(account_id: int, stop_event: threading.Event, use_dump: bool = Fals
                 with open(xmltv_path, 'rb') as f:
                     synced, reason = import_source(
                         source, f.read(), epg_days, case_sensitive, cfg, force_epg_resync,
-                        stop_event=stop_event)
+                        stop_event=stop_event, notes=coverage_notes)
             else:
                 synced, reason = refresh_source(
                     source, timeout, epg_days, cfg, force_epg_resync=force_epg_resync,
-                    stop_event=stop_event)
+                    stop_event=stop_event, notes=coverage_notes)
             epg_synced += synced
             if reason and reason.startswith(REFRESH_SKIPPED):
                 skipped.append(f'EPG source "{source.name}": {reason}')
             elif reason:
                 degraded.append(f'EPG source "{source.name}": {reason}')
         epg_degradation_reason = ' '.join(degraded) or None
-        epg_log_notes = ' '.join(degraded + skipped) or None
+        epg_log_notes = ' '.join(degraded + skipped + coverage_notes) or None
 
         # "Removed this sync" = the immediate per-sync diff (channels the previous sync
         # touched that this one didn't) - not _raise_channel_lifecycle_alerts's delayed
@@ -1576,9 +1583,13 @@ def _do_sync(account_id: int, stop_event: threading.Event, use_dump: bool = Fals
 
             # PARTIAL (not plain SUCCESS) whenever the EPG fetch/import degraded - a sync
             # that "succeeded" with a silently-empty EPG must be distinguishable from a
-            # fully-healthy one (DESIGN-sync-resilience.md §2). account.status stays OK:
-            # it's a control value the scheduler/route guards key off, not a display concern.
-            sync_log.status = SYNC_LOG_PARTIAL if epg_degradation_reason else SYNC_LOG_SUCCESS
+            # fully-healthy one (DESIGN-sync-resilience.md §2) - and whenever the live
+            # channel filter could not run, which raises its own WARN alert: a sync row
+            # reading plain Success beside that alert left nothing on the account page to
+            # explain it (dev/changelog/1359). account.status stays OK: it's a control value
+            # the scheduler/route guards key off, not a display concern.
+            degraded_sync = bool(epg_degradation_reason or classify_note)
+            sync_log.status = SYNC_LOG_PARTIAL if degraded_sync else SYNC_LOG_SUCCESS
             sync_log.completed_at = now
             sync_log.channels_synced = channels_synced
             sync_log.epg_entries_synced = epg_synced
@@ -1588,9 +1599,10 @@ def _do_sync(account_id: int, stop_event: threading.Event, use_dump: bool = Fals
             sync_log.categories_removed = categories_removed_json
             sync_log.skipped_malformed_urls = skipped_malformed
             sync_log.skipped_duplicate_stream_ids = skipped_duplicate
-            # On a SUCCESS this carries only the refresh-skipped notes, which the account
-            # page's log line shows beside the counts.
-            sync_log.error_message = epg_log_notes
+            # On a SUCCESS this carries only the refresh-skipped and lost-guide notes, which
+            # the account page's log line shows beside the counts. The channel-side note goes first, in
+            # the order the sync ran.
+            sync_log.error_message = ' '.join(n for n in (classify_note, epg_log_notes) if n) or None
             db.session.commit()
 
         _mark_success_and_commit()
@@ -1618,30 +1630,36 @@ def _do_sync(account_id: int, stop_event: threading.Event, use_dump: bool = Fals
         # An M3U account leaves classify_outcome None, which resolves both and alerts on
         # neither - it has no catalog to consult and that is not a fault (§4.2).
         from .xtream_client import CLASSIFY_REFUSED, CLASSIFY_UNAVAILABLE
+        unavailable = classify_outcome == CLASSIFY_UNAVAILABLE
+        refused = classify_outcome == CLASSIFY_REFUSED
         _raise_or_resolve_standing_alert(
             'SYNC_LIVE_CLASSIFY_UNAVAILABLE',
             source=f'account:{account_id}:live-classify',
-            active=classify_outcome == CLASSIFY_UNAVAILABLE,
+            active=unavailable,
             title=f'{account.name}: could not tell live channels from VOD',
-            body=(
-                'The provider\'s live-channel catalog could not be read this sync, so the '
-                'playlist was imported without it. Entries on an unambiguous movie or '
-                'series path were still excluded, but other on-demand content may have '
-                'been imported as channels. No channels were removed.'
-            ),
+            body=_classify_alert_body(
+                classify_note, len(new_channel_ids),
+                'ChannelBin asks the provider for its list of live channels on every sync and '
+                'keeps only the playlist entries on it, which is how movies and series are '
+                'left out. Entries on a movie or series path were still left out, and no '
+                'channels were removed.',
+                'If it keeps coming back, the provider is not answering that request, and '
+                'it is on their side: check that their own app still lists live channels, '
+                'and contact them if it does not.') if unavailable else '',
         )
         _raise_or_resolve_standing_alert(
             'SYNC_LIVE_CLASSIFY_REFUSED',
             source=f'account:{account_id}:live-classify-collapse',
-            active=classify_outcome == CLASSIFY_REFUSED,
+            active=refused,
             title=f'{account.name}: live-channel filtering refused (collapse guard)',
-            body=(
-                'The provider\'s live-channel catalog would have cut this account to a small '
-                'fraction of its previous channel count, which usually means the catalog came '
-                'back truncated rather than that the channels are gone. The playlist was '
-                'imported unfiltered instead, so some on-demand content may have been '
-                'imported as channels. No channels were removed.'
-            ),
+            body=_classify_alert_body(
+                classify_note, len(new_channel_ids),
+                'Filtering by that list would have cut this account to a small fraction of '
+                'its channels, which usually means the list came back cut short rather than '
+                'that the channels are gone. No channels were removed.',
+                'If it keeps coming back, the provider\'s live channel list is coming back '
+                'short on every sync: check that their own app lists all your live channels, '
+                'and contact them if it does not.') if refused else '',
         )
 
         # Constructed stream URLs are not alerted: the count is on the account row
@@ -1950,6 +1968,26 @@ def _epg_degradation_alert_type(reason: str | None) -> str | None:
     return 'EPG_SOURCE_FETCH_FAILED'
 
 
+def _classify_alert_body(note: str | None, added: int, why_it_matters: str,
+                         if_it_repeats: str) -> str:
+    """The body of a live-classification alert: what the provider sent, why that matters,
+    what came in because of it, and what to try (dev/changelog/1359). The first sentence is
+    the sync log's own note, so the alert and the account page's sync row say the same."""
+    if added:
+        came_in = (f'This sync added {added:,} new channel{"" if added == 1 else "s"}. If '
+                   'any of them are movies or series, this is why; the account page\'s '
+                   'Activity line links them.')
+    else:
+        came_in = 'This sync added no new channels, so nothing extra came in.'
+    # Paragraphs, not one run of sentences: the details dialog and the Alerts page both
+    # keep the line breaks (white-space: pre-wrap).
+    return '\n\n'.join([
+        note or 'The provider\'s live channel list could not be used this sync.',
+        f'{why_it_matters} {came_in}',
+        'What to try: run Sync now on the account page. This alert clears itself on the '
+        f'first sync that can use the list. {if_it_repeats}'])
+
+
 def _raise_or_resolve_standing_alert(alert_type: str, source: str, active: bool,
                                      title: str = '', body: str = '') -> None:
     """The shared shape behind every SYNC_* degradation alert (DESIGN-sync-resilience.md
@@ -2126,6 +2164,18 @@ def get_sync_duration_estimates(account_ids) -> dict:
 def get_sync_duration_estimate(account_id: int):
     """get_sync_duration_estimates() for one account: (avg_seconds, run_count), or (None, 0)."""
     return get_sync_duration_estimates([account_id]).get(account_id, (None, 0))
+
+
+def get_sync_last_runs(account_ids) -> dict:
+    """{account_id: (started_at, completed_at, status, error_message)} - each account's
+    newest finished sync row, in every status but IN_PROGRESS: an ERROR, a CANCELLED or a
+    SKIPPED row is exactly what the Scheduled Jobs page's "last run" line is for, where the
+    duration estimate above deliberately reads only the imported ones."""
+    from .database import latest_run_per_key
+    return latest_run_per_key(
+        AccountSyncLog.account_id, AccountSyncLog.id, AccountSyncLog.started_at,
+        AccountSyncLog.completed_at, AccountSyncLog.status, AccountSyncLog.error_message,
+        account_ids, AccountSyncLog.status != SYNC_LOG_IN_PROGRESS)
 
 
 def lifecycle_states_for_channels(channels, cfg, accounts_by_id=None) -> dict:
@@ -2797,11 +2847,12 @@ def _source_fetch_url(source: EpgSource) -> str:
 def refresh_source(source: EpgSource, timeout: int, epg_days: int, cfg: dict | None = None,
                    force_epg_resync: bool = False,
                    stop_event: threading.Event | None = None,
-                   track_progress: bool = True) -> tuple[int, str | None]:
+                   track_progress: bool = True,
+                   notes: list | None = None) -> tuple[int, str | None]:
     """Refresh one source, one at a time per source, with `refresh_started_at` set for as
     long as it runs so the restart guard can see it. A source already being refreshed by
     another path is skipped, not queued behind it: that refresh is fetching the same file.
-    See _refresh_source for the return value."""
+    See _refresh_source for the return value and import_source for `notes`."""
     source_id = source.id
     lock = _get_source_lock(source_id)
     if not lock.acquire(blocking=False):
@@ -2817,7 +2868,7 @@ def refresh_source(source: EpgSource, timeout: int, epg_days: int, cfg: dict | N
         _set_refreshing(source_id, True)
         try:
             return _refresh_source(source, timeout, epg_days, cfg, force_epg_resync,
-                                   stop_event, track_progress)
+                                   stop_event, track_progress, notes)
         finally:
             _set_refreshing(source_id, False)
     finally:
@@ -2837,8 +2888,7 @@ def _set_refreshing(source_id: int, on: bool) -> None:
 
 #: Every standing alert a source can hold, by the key suffix it is raised under.
 _SOURCE_ALERTS = (('EPG_SOURCE_FETCH_FAILED', 'fetch'), ('EPG_SOURCE_COLLAPSE_REFUSED', 'collapse'),
-                  ('EPG_SOURCE_IMPORT_TRUNCATED', 'truncated'),
-                  ('EPG_SOURCE_COVERAGE_LOST', 'coverage'), ('EPG_SOURCE_STALE', 'stale'))
+                  ('EPG_SOURCE_IMPORT_TRUNCATED', 'truncated'), ('EPG_SOURCE_STALE', 'stale'))
 
 
 def start_source_refresh(app, source_id: int) -> tuple[bool, str]:
@@ -2959,7 +3009,7 @@ def report_source_removed(source_id: int, source_name: str, cause: str, readers,
 
 def _refresh_source(source: EpgSource, timeout: int, epg_days: int, cfg: dict | None,
                     force_epg_resync: bool, stop_event: threading.Event | None,
-                    track_progress: bool) -> tuple[int, str | None]:
+                    track_progress: bool, notes: list | None = None) -> tuple[int, str | None]:
     """Fetch one EPG source's XMLTV and import it (DESIGN-epg-sources.md §8).
 
     Returns (entries_imported, degradation_reason). `degradation_reason` is None on a
@@ -3001,7 +3051,7 @@ def _refresh_source(source: EpgSource, timeout: int, epg_days: int, cfg: dict | 
     _raise_if_cancelled(stop_event, _cancel_kept_source(source_name))
     case_sensitive = case_sensitive_matching(cfg)
     return import_source(source, xml_bytes, epg_days, case_sensitive, cfg, force_epg_resync,
-                         stop_event=stop_event, track_progress=track_progress)
+                         stop_event=stop_event, track_progress=track_progress, notes=notes)
 
 
 def _program_window(elem, window_start: datetime, window_end: datetime):
@@ -3236,13 +3286,17 @@ class _ImportResult(NamedTuple):
     # None = the import never reached resolution (refused, undecodable), so coverage was
     # not re-evaluated and a standing coverage alert must be left as it is.
     lost_channel_ids: list | None
+    # Visible channels the import resolved that had a guide from any source before it: the
+    # denominator of the coverage-loss share the alert threshold is measured against.
+    guided_before: int = 0
 
 
 def import_source(source: EpgSource, xml_bytes: bytes, epg_days: int,
                   case_sensitive: bool = False, cfg: dict | None = None,
                   force_epg_resync: bool = False,
                   stop_event: threading.Event | None = None,
-                  track_progress: bool = True) -> tuple[int, str | None]:
+                  track_progress: bool = True,
+                  notes: list | None = None) -> tuple[int, str | None]:
     """Import one EPG source's XMLTV payload for every account subscribed to it
     (DESIGN-epg-sources.md §8.2), write the source's status and raise or clear its alerts.
 
@@ -3255,12 +3309,19 @@ def import_source(source: EpgSource, xml_bytes: bytes, epg_days: int,
 
     Accepts gzipped XMLTV, decompressed here so the Xtream dump path gets it too and the
     scan pass reads the same bytes the import loop does.
+
+    `notes`, when given, receives the sentence saying how many channels this import left
+    with no guide, so a sync can put it on its log row whether or not it was big enough to
+    alert on.
     """
     began_at = datetime.utcnow()
     source_id = source.id
     result = _import_source(source, xml_bytes, epg_days, case_sensitive, cfg,
                             force_epg_resync, stop_event, track_progress)
-    _report_source_outcome(source_id, result.reason, result.lost_channel_ids, began_at)
+    note = _report_source_outcome(source_id, result.reason, result.lost_channel_ids, began_at,
+                                  guided_before=result.guided_before, cfg=cfg)
+    if note and notes is not None:
+        notes.append(note)
     # Every import that wrote to the guide asks the auto-record rules to look again
     # (DESIGN-autoschedule.md §4.1). `lost_channel_ids` is set exactly when the import
     # reached resolution - a refused, undecodable or channel-less import wrote nothing.
@@ -3434,6 +3495,7 @@ def _import_source(source: EpgSource, xml_bytes: bytes, epg_days: int, case_sens
             winners[ch_id] = old
     lost = [c.id for c in channels if not c.hidden and c.id in changes
             and changes[c.id] == (c.epg_source_id, None) and c.epg_source_id is not None]
+    guided_before = sum(1 for c in channels if not c.hidden and c.epg_source_id is not None)
 
     # A change of winner is a move between the two tables, never a re-fetch (§5.4). Done
     # before the delete and the inserts, so a cancel partway through the inserts leaves no
@@ -3590,7 +3652,7 @@ def _import_source(source: EpgSource, xml_bytes: bytes, epg_days: int, case_sens
     if progress_id is not None:
         _set_sync_progress(progress_id, 'epg', synced, None)
     log.info('Imported %d EPG entries from EPG source %d (%s)', synced, source_id, source_name)
-    return _ImportResult(synced, truncated_reason, lost)
+    return _ImportResult(synced, truncated_reason, lost, guided_before)
 
 
 def report_refresh_interrupted(source_id: int) -> None:
@@ -3609,13 +3671,20 @@ def report_refresh_interrupted(source_id: int) -> None:
 
 def _report_source_outcome(source_id: int, reason: str | None,
                            lost_channel_ids: list | None,
-                           began_at: datetime | None = None) -> None:
+                           began_at: datetime | None = None, guided_before: int = 0,
+                           cfg: dict | None = None) -> str | None:
     """Write one refresh's outcome onto the source and raise or clear its alerts
     (DESIGN-epg-sources.md §9.1). The three refresh types are evaluated on every refresh, so
     whichever one is not this refresh's reason is auto-resolved if it was standing from an
     earlier one. The coverage alert is evaluated only when the import got as far as
     resolving winners (`lost_channel_ids` is not None): a refused or failed refresh changed
-    no channel's guide, so it can neither raise nor clear it."""
+    no channel's guide, so it can neither raise nor clear it.
+
+    Returns the sentence naming the channels left with no guide, or None when there were
+    none. Every loss gets the sentence; only a loss of at least
+    `sync.epg_coverage_lost_alert_percent` of `guided_before` raises the alert, because a
+    few channels dropping out of a provider's guide is routine churn - 2-3% per sync is
+    what prod's providers do (dev/changelog/1360)."""
     alert_type = _epg_degradation_alert_type(reason)
     now = datetime.utcnow()
 
@@ -3637,7 +3706,7 @@ def _report_source_outcome(source_id: int, reason: str | None,
 
     name = _record_status_and_commit()
     if name is None:
-        return
+        return None
 
     fetch_failed = alert_type == 'EPG_SOURCE_FETCH_FAILED'
     refused = alert_type == 'EPG_SOURCE_COLLAPSE_REFUSED'
@@ -3658,16 +3727,31 @@ def _report_source_outcome(source_id: int, reason: str | None,
         body=reason if truncated else '')
 
     if lost_channel_ids is None:
-        return
-    lost_body = ''
-    if lost_channel_ids:
-        lost_body = (f'{len(lost_channel_ids):,} channel(s) that had a guide from EPG source '
-                     f'"{name}" have none from any source now: {_named_sample(lost_channel_ids)}.')
-    _raise_or_resolve_standing_alert(
-        'EPG_SOURCE_COVERAGE_LOST', source=f'epg-source:{source_id}:coverage',
-        active=bool(lost_channel_ids),
-        title=f'EPG source "{name}": {len(lost_channel_ids):,} channel(s) lost their guide',
-        body=lost_body)
+        return None
+    n_lost = len(lost_channel_ids)
+    alert_pct = (cfg or {}).get('sync', {}).get(
+        'epg_coverage_lost_alert_percent', config_default('sync.epg_coverage_lost_alert_percent'))
+    alerting = bool(n_lost) and (alert_pct <= 0 or n_lost * 100 >= alert_pct * guided_before)
+    note = None
+    if n_lost:
+        share = f'{n_lost * 100 / guided_before:.1f}%' if guided_before else 'all'
+        note = (f'EPG source "{name}": {n_lost:,} channel(s) lost their guide ({share} of the '
+                f'{guided_before:,} that had one): {_named_sample(lost_channel_ids)}.')
+        log.log(logging.WARNING if alerting else logging.INFO, '%s', note)
+    if alerting:
+        from .alerts import create_alert
+        threshold = (f'at or above the {alert_pct}% alert threshold' if alert_pct > 0
+                     else 'and the alert threshold is 0, so every loss alerts')
+        # A new row per lossy import rather than one refreshed in place: a second loss
+        # rewriting the first's channel list would erase a loss nobody had read yet.
+        create_alert(
+            'EPG_SOURCE_COVERAGE_LOST',
+            title=f'EPG source "{name}": {n_lost:,} channel(s) lost their guide',
+            body=(f'{n_lost:,} channel(s) that had a guide from EPG source "{name}" have '
+                  f'none from any source now, {share} of the {guided_before:,} that had '
+                  f'one - {threshold}: {_named_sample(lost_channel_ids)}.'),
+            source=f'epg-source:{source_id}:coverage')
+    return note
 
 
 #: How many channel names EPG_SOURCE_COVERAGE_LOST spells out before "and N more".

@@ -201,6 +201,14 @@ NETWORK_FILESYSTEMS = frozenset((
 _last_logged_outcome: dict = {}
 
 
+def forget_dir_outcome(path) -> None:
+    """Drop what log_dir_outcome_change remembers about `path`, so the next probe of it is
+    a transition again. For a path whose standing alert was taken down for leaving the
+    configuration: were it configured again while still broken, a remembered "unusable"
+    would read as no change and the alert would never come back (dev/changelog/1361)."""
+    _last_logged_outcome.pop(path, None)
+
+
 def filesystem_type(path):
     """The filesystem type `path` sits on, read from /proc/mounts, or None.
 

@@ -1,4 +1,5 @@
 {% extends "base.html" %}
+{% from "_macros.html" import page_about %}
 {% block title %}Alerts - ChannelBin{% endblock %}
 
 {#  Alert center (dev/changelog/446).
@@ -96,7 +97,7 @@
     </span>
   </div>
 </div>
-<p class="page-sub">Active alerts are problems that are still true right now. Each one clears
+{% call page_about() %}Active alerts are problems that are still true right now. Each one clears
   itself once it is fixed, so it has no Dismiss. Some wait a little to be sure the fix holds:
   a recording's "not capturing" alert stays until its stream has kept coming for
   {{ early_fail_window }} s, which is how ChannelBin tells the channel from a provider's short
@@ -104,7 +105,7 @@
   so one that came and went while you were away is still here to read.
   Past alerts already happened and stay until you dismiss them. Things only worth knowing, like a group's format moving or a provider adding
   channels, are shown on that group or account instead. Dismissing an alert only hides it here -
-  it is never what deletes a recording or a log line.</p>
+  it is never what deletes a recording or a log line.{% endcall %}
 
 {# `link` is passed in rather than read from `alert_links`: a Jinja macro does not see the
    template's render context, so reaching for it here would resolve to Undefined and every

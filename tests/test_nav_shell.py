@@ -1,4 +1,4 @@
-"""The app shell's nav: collapsed rail, chip group, and the retired Setup flyout.
+"""The app shell's nav: collapsed rail, folding sections, chip group, the retired Setup flyout.
 
 Guards the production port of mockups 09 (desktop, round 7) and 10 (mobile, round 4)
 - see dev/changelog/383. Each assertion is a thing that broke, or would silently
@@ -13,10 +13,12 @@ break, if the port is edited carelessly:
   * No `setup-flyout` / `setup-trigger` / `setup_flyout` token survives anywhere.
     Teardown releases everything the create path acquired: markup, CSS and script.
   * Both shells render the same icon set from one definition, and the sidebar
-    renders exactly the production destinations in order, under the section
-    headings of DESIGN.md §2 with Dashboard above all of them - no Health Checks
-    row, which lives on the Channel Groups tab (DESIGN.md §14.1) even though both
-    mockups drew it.
+    renders exactly the production destinations in order: the everyday pages, then
+    the three sections of DESIGN.md §2 (amended 2026-10-31): Channels & guide plain,
+    Setup and System folding, each with a hint line held to its links and folded on every
+    page load except the one holding the page being shown (dev/changelog/1372) - no
+    Health Checks row, which lives on the Channel Groups tab (DESIGN.md §14.1) even
+    though both mockups drew it.
   * The sys-stats block is in the sidebar and NOT in the mobile drawer (it is the
     top bar's stats chip there, DESIGN.md 9.7 amended 2026-07-29).
   * The desktop `.topbar` renders inside `.colmain` with the `<aside>` outside it -
@@ -45,27 +47,54 @@ from app.database import UserPref  # noqa: E402
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-# The 16 destinations the production sidebar renders, in order. Health Checks is
-# deliberately absent (DESIGN.md §14.1); EPG Browser was retired (dev/changelog/631).
-# Maintenance sits second to last, between Logs and Settings (DESIGN.md §16.1,
-# dev/changelog/444) - the slot is part of the approved design, so the order here is
-# an assertion and not just a list. Hide Rules closes Setup rather than sitting on the
-# Channels hub, whose tabs are on their way out (dev/changelog/782). Dashboard leads
-# with no section heading above it and the former Channels section is gone, its two
-# destinations folded into Library under their full names (DESIGN.md §2,
-# dev/changelog/900). Auto-record, the auto-record rules pages, follows Recordings
-# (dev/changelog/1186; named Auto-record in dev/changelog/1189).
+# The destinations the production sidebar renders, in order (DESIGN.md §2, amended
+# 2026-10-31, mockup 48, dev/changelog/1363): the everyday pages with no heading above them,
+# then three folding sections. Health Checks is deliberately absent (DESIGN.md §14.1); EPG
+# Browser was retired (dev/changelog/631). Maintenance sits second to last, between Logs and
+# Settings (DESIGN.md §16.1, dev/changelog/444); Readiness sits beside Alerts, the other link
+# carrying red and amber counts (dev/changelog/1366). Auto-record is set up once and left to run,
+# so it is in Setup, and the Recordings header links to it.
 NAV_LABELS = [
-    'Dashboard',
-    'Recordings', 'Auto-record', 'TV Guide', 'EPG Manager', 'Channel Search', 'Channel Groups',
     # Always in the markup, hidden once setup is done (dev/changelog/1280).
     'Get started',
-    'Accounts', 'Recording Profiles', 'Health Check Profiles', 'Tags', 'Hide Rules',
-    'Jobs', 'Alerts', 'Logs', 'Maintenance', 'Settings',
+    'Dashboard', 'TV Guide', 'Search', 'Recordings',
+    'Channel Groups', 'Hide Channels', 'Tags', 'EPG Manager',
+    'Accounts', 'Auto-record', 'Recording Profiles', 'Health Check Profiles',
+    'Alerts', 'Readiness', 'Jobs', 'Logs', 'Maintenance', 'Settings',
 ]
 
-# The section headings, in order. Dashboard sits above all three (DESIGN.md §2).
-NAV_SECTIONS = ['Library', 'Setup', 'System']
+# The folding sections, in order: (key, heading, the labels of the links inside).
+NAV_SECTIONS = [
+    ('setup', 'Setup', ['Accounts', 'Auto-record', 'Recording Profiles', 'Health Check Profiles']),
+    ('system', 'System', ['Alerts', 'Readiness', 'Jobs', 'Logs', 'Maintenance', 'Settings']),
+]
+# The one section that does not fold (dev/changelog/1372).
+PLAIN_SECTION = ('Channels &amp; guide', ['Channel Groups', 'Hide Channels', 'Tags', 'EPG Manager'])
+
+_SEC_RE = re.compile(
+    r'<div class="nav-sec( is-folded)?" data-fold="(\w+)">\s*'
+    r'<button type="button" class="nav-section nav-fold" aria-expanded="(\w+)">'
+    r'<span class="nav-fh"><span class="nav-t">([^<]+)</span>.*?<span class="nav-hint">(.*?)</span></button>'
+    r'\s*<div class="nav-sec-body">(.*?)</div>\s*</div>', re.S)
+
+_PLAIN_RE = re.compile(
+    r'<div class="nav-sec">\s*<div class="nav-section"><span class="nav-t">([^<]+)</span></div>'
+    r'(.*?)</div>\s*<div class="nav-sec', re.S)
+
+
+def _sections(shell):
+    """[{key, head, folded, expanded, hint, links}] for one shell's folding sections."""
+    return [{'key': m.group(2), 'head': m.group(4), 'folded': bool(m.group(1)),
+             'expanded': m.group(3),
+             'hint': re.findall(r'<span class="nav-hn">([^<]+)</span>', m.group(5)),
+             'links': re.findall(r'<span class="nav-t">([^<]+)</span>', m.group(6))}
+            for m in _SEC_RE.finditer(shell)]
+
+
+def _plain_sections(shell):
+    """[(heading, links)] for one shell's sections that do not fold."""
+    return [(m.group(1), re.findall(r'<span class="nav-t">([^<]+)</span>', m.group(2)))
+            for m in _PLAIN_RE.finditer(shell)]
 
 
 def _read(rel):
@@ -125,6 +154,103 @@ class NavCollapsedRendersServerSideTests(unittest.TestCase):
         self.assertIn('class="nav-min"', self._body_tag())
 
 
+class NavFoldsRenderServerSideTests(unittest.TestCase):
+    """Setup and System are folded on every page load except the one holding the page being
+    shown, and nothing remembers a fold or an open (DESIGN.md §2, amended 2026-10-31,
+    dev/changelog/1372): a new user who walked through setup must not be left with both
+    sections open for good."""
+
+    def setUp(self):
+        self.t = make_test_app(csrf=False)
+
+    def tearDown(self):
+        self.t.cleanup()
+
+    def _state(self, path='/'):
+        html = self.t.client.get(path).get_data(as_text=True)
+        sidebar = _slice(html, '<aside class="sidebar">', '</aside>')
+        return {s['key']: s['folded'] for s in _sections(sidebar)}
+
+    def test_every_page_load_starts_folded(self):
+        self.assertEqual(self._state(), {'setup': True, 'system': True})
+
+    def test_the_page_being_shown_opens_its_section_on_that_page_only(self):
+        self.assertEqual(self._state('/settings'), {'setup': True, 'system': False})
+        self.assertEqual(self._state('/rules'), {'setup': False, 'system': True})
+        self.assertEqual(self._state('/'), {'setup': True, 'system': True})
+
+    def test_a_stored_fold_pref_changes_nothing(self):
+        """An install that ran the remembered folds has a `nav_folds` row, possibly saved
+        open by the walkthrough and carrying the retired `chan` key. It is ignored."""
+        db.session.add(UserPref(key='nav_folds', value=json.dumps(
+            {'chan': True, 'setup': False, 'system': False})))
+        db.session.commit()
+        html = self.t.client.get('/').get_data(as_text=True)
+        sidebar = _slice(html, '<aside class="sidebar">', '</aside>')
+        self.assertEqual({s['key']: s['folded'] for s in _sections(sidebar)},
+                         {'setup': True, 'system': True})
+        self.assertEqual(_plain_sections(sidebar), [PLAIN_SECTION])
+
+    def test_a_shortcut_is_lit_on_its_own_page(self):
+        for path, lit in (('/guide', '/guide'), ('/channels', '/channels'), ('/tags', None)):
+            bar = _slice(self.t.client.get(path).get_data(as_text=True), '<nav class="topnav">', '</nav>')
+            active = re.findall(r'<a class="topnav-sc active" href="([^"]+)"', bar)
+            self.assertEqual(active, [lit] if lit else [], path)
+
+
+class SearchPageNameTests(unittest.TestCase):
+    """Channel Search is Search, in the menu and on the page (dev/changelog/1363)."""
+
+    def test_the_page_is_called_search(self):
+        t = make_test_app()
+        try:
+            html = t.client.get('/channels').get_data(as_text=True)
+        finally:
+            t.cleanup()
+        self.assertIn('<title>Search - ChannelBin</title>', html)
+        self.assertEqual(re.findall(r'<h1>([^<]*)</h1>', html), ['Search'])
+        self.assertNotIn('Channel Search<', html)
+
+
+class RecordingsHeaderTests(unittest.TestCase):
+    """The Recordings header, the same at every width (DESIGN.md §9.3, amended 2026-10-31):
+    "Auto-record ->" and "Schedule recording" with a caret, both primary. The phone's
+    "TV Guide ->" stand-in is gone; the top bar's TV Guide shortcut covers it."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.t = make_test_app()
+        cls.html = cls.t.client.get('/recordings').get_data(as_text=True)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.t.cleanup()
+
+    def _head(self):
+        return _slice(self.html, '<div class="page-head">', '<div class="empty-state">')
+
+    def test_auto_record_is_a_primary_link_to_the_rules(self):
+        self.assertRegex(self._head(), r'<a href="/rules" class="btn btn-primary">Auto-record '
+                                       r'<span class="arw"><svg class="icon" data-icon="forward"')
+
+    def test_schedule_recording_is_a_primary_menu_with_a_caret_and_no_plus(self):
+        head = self._head()
+        self.assertRegex(head, r'<button type="button" class="btn btn-primary" data-menu data-sched-menu'
+                               r'[^>]*>Schedule recording <svg class="icon btn-caret" data-icon="dropdown"')
+        menu = _slice(head, '<div class="menu">', '</div>')
+        self.assertEqual(re.findall(r'<a href="([^"]+)">.*?</svg> ([^<]+)</a>', menu),
+                         [('/guide', 'From the TV Guide'),
+                          ('/channels?grain=airings', 'From a search'),
+                          ('/recordings/new', 'Manual recording')])
+        self.assertNotIn('+ Schedule', self.html)
+
+    def test_the_phone_swap_is_gone(self):
+        css = _read('static/css/style.css')
+        for token in ('head-action-guide', 'head-action-schedule'):
+            self.assertNotIn(token, self.html)
+            self.assertNotIn(token, css)
+
+
 class RenderedShellTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -145,11 +271,25 @@ class RenderedShellTests(unittest.TestCase):
         for token in ('activity-dot', 'rec-dot', 'bg-dot', 'dot-breathe'):
             self.assertNotIn(token, self.html, f'{token} still rendered')
 
-    def test_setup_links_render_inline_in_both_shells(self):
+    def test_every_section_renders_in_both_shells_with_its_links(self):
         for shell in (self._sidebar(), self._drawer()):
-            for label in ('Accounts', 'Recording Profiles', 'Health Check Profiles', 'Tags',
-                          'Hide Rules'):
-                self.assertIn(f'>{label}</span>', shell)
+            got = [(sec['key'], sec['head'], sec['links']) for sec in _sections(shell)]
+            self.assertEqual(got, NAV_SECTIONS)
+
+    def test_channels_and_guide_is_a_plain_section_that_does_not_fold(self):
+        """dev/changelog/1372: a heading over its four pages, with no fold button, chevron
+        or hint line, in both shells, and ahead of the two that fold."""
+        for shell in (self._sidebar(), self._drawer()):
+            self.assertEqual(_plain_sections(shell), [PLAIN_SECTION])
+            self.assertEqual(shell.count('class="nav-section nav-fold"'), len(NAV_SECTIONS))
+            self.assertLess(shell.index('Channels &amp; guide'), shell.index('data-fold="setup"'))
+        self.assertNotIn('data-fold="chan"', self.html)
+
+    def test_each_folded_hint_names_its_sections_links_in_order(self):
+        """The hint is a second list of the same names, so it is held to the links."""
+        for shell in (self._sidebar(), self._drawer()):
+            for sec in _sections(shell):
+                self.assertEqual(sec['hint'], sec['links'], sec['key'])
 
     def _sidebar(self):
         return _slice(self.html, '<aside class="sidebar">', '</aside>')
@@ -157,21 +297,35 @@ class RenderedShellTests(unittest.TestCase):
     def _drawer(self):
         return _slice(self.html, 'id="topnav-menu"', '</div>\n\n  <div class="shell">')
 
-    def test_sidebar_renders_exactly_the_16_production_destinations(self):
+    def test_sidebar_renders_exactly_the_production_destinations(self):
         labels = re.findall(r'<span class="nav-t">([^<]+)</span>', self._sidebar())
         # brand + 3 section headings + the destinations
         self.assertEqual([l for l in labels if l in NAV_LABELS], NAV_LABELS)
         self.assertNotIn('Health Checks<', self._sidebar())
+        for retired in ('Channel Search', 'Hide Rules', 'Library'):
+            self.assertNotIn(f'>{retired}<', self.html)
 
-    def test_dashboard_leads_the_nav_above_every_section_heading(self):
-        """DESIGN.md §2: Dashboard is the landing page, so it is the one destination
-        that is not a category of anything and sits above the first heading. Both
-        shells, since nav_sections() renders both (§9.7)."""
+    def test_the_everyday_pages_lead_above_every_section(self):
+        """DESIGN.md §2, amended 2026-10-31: Get started, Dashboard, TV Guide, Search and
+        Recordings sit above the first heading. Both shells, since nav_sections() renders
+        both (§9.7)."""
         for shell in (self._sidebar(), self._drawer()):
-            headings = re.findall(r'<div class="nav-section"><span class="nav-t">([^<]+)</span>',
-                                  shell)
-            self.assertEqual(headings, NAV_SECTIONS)
-            self.assertLess(shell.index('>Dashboard</span>'), shell.index('class="nav-section"'))
+            first = shell.index('class="nav-sec')
+            for label in NAV_LABELS[:5]:
+                self.assertLess(shell.index(f'>{label}</span>'), first, label)
+
+    def test_sections_start_folded_where_the_design_put_them(self):
+        """Setup and System folded in both shells. The Dashboard is in no section, so none
+        is opened for it."""
+        for shell in (self._sidebar(), self._drawer()):
+            got = {s['key']: (s['folded'], s['expanded']) for s in _sections(shell)}
+            self.assertEqual(got, {'setup': (True, 'false'), 'system': (True, 'false')})
+
+    def test_the_phone_bar_has_the_guide_and_search_shortcuts(self):
+        bar = _slice(self.html, '<nav class="topnav">', '</nav>')
+        self.assertEqual(re.findall(r'<a class="topnav-sc" href="([^"]+)" aria-label="([^"]+)">', bar),
+                         [('/guide', 'TV Guide'), ('/channels', 'Search')])
+        self.assertLess(bar.index('class="topnav-sc"'), bar.index('class="nav-indicators"'))
 
     def test_both_shells_render_the_same_icon_set(self):
         # Every destination draws its registry icon with icon(name, 'nav-i') (app/icons.py).

@@ -1957,6 +1957,7 @@ def _m054_drop_guide_check_retarget_announcement(conn, cur):
 #: sqlite_autoincrement, and the inline form it emits with it. AUTOINCREMENT is only legal on
 #: the inline spelling, so the rebuild below has to move the clause, not just append a keyword.
 _PK_TABLE_CONSTRAINT = '\n\tPRIMARY KEY (id), '
+_PK_TABLE_CONSTRAINT_LAST = ', \n\tPRIMARY KEY (id)\n)'
 _PK_COLUMN_OLD = 'id INTEGER NOT NULL,'
 _PK_COLUMN_NEW = 'id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,'
 
@@ -1975,14 +1976,19 @@ def _autoincrement_ddl(old_sql: str, table: str, new_name: str) -> str:
     presence passed, which is the silent half-success this app refuses on principle.
     """
     header = f'CREATE TABLE {table} ('
+    # The primary key is the last clause when the table had no constraint after it at its
+    # creation (`accounts` on every install that predates its provider_id foreign key).
+    pk_last = old_sql.endswith(_PK_TABLE_CONSTRAINT_LAST)
     if (not old_sql.startswith(header) or _PK_COLUMN_OLD not in old_sql
-            or _PK_TABLE_CONSTRAINT not in old_sql):
+            or not (pk_last or _PK_TABLE_CONSTRAINT in old_sql)):
         raise RuntimeError(
             f'Cannot rebuild the {table} table with AUTOINCREMENT: its stored CREATE TABLE '
             f'does not carry the expected header and primary key clauses ({header!r}, '
             f'{_PK_COLUMN_OLD!r} and {_PK_TABLE_CONSTRAINT.strip()!r}). Stored DDL:\n{old_sql}')
     new_sql = f'CREATE TABLE {new_name} (' + old_sql[len(header):]
     new_sql = new_sql.replace(_PK_COLUMN_OLD, _PK_COLUMN_NEW, 1)
+    if pk_last:
+        return new_sql[:-len(_PK_TABLE_CONSTRAINT_LAST)] + '\n)'
     return new_sql.replace(_PK_TABLE_CONSTRAINT, '', 1)
 
 
@@ -3357,6 +3363,23 @@ def _m106_epg_scans(conn, cur):
     conn.commit()
 
 
+def _m107_accounts_autoincrement(conn, cur):
+    """Rebuild `accounts` with AUTOINCREMENT (dev/changelog/1373).
+
+    Account usage day rows, blocks, hosts and logins all name an account by id, and SQLite
+    handed a deleted account's id to the next account created when it had been the newest. The
+    ledger fold could write a day row for an account in the moment after its delete, which a
+    re-issued id then credited to the new account as usage it never produced. The fold now
+    refuses a gone account in the statement that writes; this closes the reuse itself, for
+    every stored account id, the same way migrations 55, 77 and 78 did for recordings, tests
+    and events.
+
+    Every install that predates the provider_id foreign key stores the primary key as the
+    table's last clause, which `_autoincrement_ddl` handles beside the usual shape. The table
+    carries no indexes of its own today; any it gains are carried across. Idempotent."""
+    _rebuild_with_autoincrement(conn, cur, 'accounts')
+
+
 def _m081_account_blocks(conn, cur):
     """account_blocks: the stretches of time the user has told ChannelBin to keep off an
     account (app/account_blocks.py, dev/changelog/1151).
@@ -3713,6 +3736,8 @@ SCHEMA_MIGRATIONS = [
      'segment was carrying a while after it opened', _m105_segment_settled_probe),
     (106, 'epg_scans + epg_scan_schedules + epg_scan_schedule_channels + epg_scan_links: '
      'the EPG similarity scan\'s last result', _m106_epg_scans),
+    (107, 'accounts: rebuild with AUTOINCREMENT so a deleted account\'s id is never re-issued',
+     _m107_accounts_autoincrement),
 ]
 
 CURRENT_SCHEMA_VERSION = SCHEMA_MIGRATIONS[-1][0]

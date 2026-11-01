@@ -47,6 +47,17 @@
 
   backupSel.addEventListener('change', updateBackupButtons);
 
+  // The list is re-read on a slow tick so the nightly backup, or one taken from another
+  // tab, turns up without a reload (dev/changelog/1356). There is no nav-status signal
+  // for it, so a timer rather than a hook. loadBackups() rebuilds the <select>, which
+  // would drop a backup the user has picked but not yet applied - so the tick holds while
+  // one is selected, and in a hidden tab, where nobody is reading it.
+  const BACKUP_LIST_MS = 60 * 1000;
+  setInterval(() => {
+    if (document.hidden || backupSel.value !== '') return;
+    loadBackups();
+  }, BACKUP_LIST_MS);
+
   (() => {
     const { hour, enabled } = BOOT.backup;
     const label = $('#backup-schedule-label');

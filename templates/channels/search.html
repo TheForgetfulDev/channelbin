@@ -3,10 +3,10 @@
 {# _record_modal.html calls csrf_field() unqualified, so it has to be in this
    template's namespace too - `m.csrf_field` is not the same name to an include. #}
 {% from '_macros.html' import csrf_field %}
-{% block title %}Channel Search - ChannelBin{% endblock %}
+{% block title %}Search - ChannelBin{% endblock %}
 
 {#
-  The channel search (Channel Search in the sidebar). Approved design:
+  The channel search (Search in the menu, dev/changelog/1363). Approved design:
   dev/mockups/21-channel-search-desktop.html. Contract, registries and response
   envelope: dev/docs/DESIGN-channel-search.md - read that before changing a
   parameter name, because once other pages link in here the URL is an API.
@@ -33,7 +33,7 @@
    which is what 3.10 expects of a page whose actions all live in its own toolbar
    (dev/changelog/810, 811). #}
 <div class="page-head">
-  <h1>Channel Search</h1>
+  <h1>Search</h1>
   {# Phone only (CSS): the two whole-database cleanups below are page-level actions
      rather than search controls, so at 375 they are overflow behind this rather than
      two danger buttons competing with the search box for the top of the screen

@@ -127,9 +127,13 @@ class HideRulesPageTests(unittest.TestCase):
         # BOTH copies must carry the active state - a glyph or state that differed between
         # the two shells is a defect (DESIGN.md 2 / 9.7).
         links = re.findall(r'<a class="nav-link([^"]*)" href="/channels/hide-rules"', self.html)
-        self.assertEqual(len(links), 2, f'expected both nav shells to link Hide Rules, got {links}')
+        self.assertEqual(len(links), 2, f'expected both nav shells to link Hide Channels, got {links}')
         for cls in links:
             self.assertIn('active', cls)
+        # Named for what it does, in the menu and on the page (dev/changelog/1363).
+        self.assertIn('<title>Hide Channels - ChannelBin</title>', self.html)
+        self.assertRegex(self.html, r'<h1>Hide Channels\s*<span class="sub">')
+        self.assertNotIn('>Hide Rules<', self.html)
         # Setup, not Channels, and never a hub tab: a tab would be a destination with no
         # menu entry (dev/changelog/782). The Channels tab strip itself is gone
         # (dev/changelog/1277), so no page may include it again.

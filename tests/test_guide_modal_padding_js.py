@@ -318,3 +318,94 @@ class EditOfAScheduledRecordingHasNoLateNoteTests(_Base, unittest.TestCase):
     def test_an_edit_opened_after_a_late_schedule_does_not_carry_the_note_over(self):
         self.assertTrue(self.obs['before'])
         self.assertFalse(self.obs['visible'])
+
+
+class SecondPassProgramTests(_Base, unittest.TestCase):
+    """A program in the second 1 AM hour of the US fall-back keeps its instant: the field
+    shows 1:30 and the form carries 06:30 UTC beside it, with a line saying which 1:30 it
+    is (dev/docs/BUGS.md 2026-10-31 @ 11:27:31 PM ET)."""
+    SCENARIO = 'dst_program_in_second_pass'
+
+    def test_the_form_carries_the_instants(self):
+        self.assertEqual((self.obs['start'], self.obs['stop']),
+                         ('2027-11-07T01:30', '2027-11-07T02:30'))
+        self.assertEqual(self.obs['startDst']['utc'], '2027-11-07T06:30:00.000Z')
+        self.assertEqual(self.obs['stopDst']['utc'], '2027-11-07T07:30:00.000Z')
+
+    def test_the_repeated_start_says_which_one_it_is(self):
+        dst = self.obs['startDst']
+        self.assertTrue(dst['visible'])
+        self.assertIn('1:30 AM happens twice on Sun, Nov 7', dst['text'])
+        self.assertIn('This is the second one (EST)', dst['text'])
+        self.assertEqual(dst['button'], 'Use the first one (EDT)')
+
+    def test_an_ordinary_stop_says_nothing(self):
+        self.assertFalse(self.obs['stopDst']['visible'])
+
+
+class TypedRepeatedTimeTests(_Base, unittest.TestCase):
+    """A typed 1:30 AM on the fall-back night is read as the first one, says so, and can be
+    switched to the second, which the form then carries."""
+    SCENARIO = 'dst_typed_repeated_then_switched'
+
+    def test_typed_reads_as_the_first_and_says_so(self):
+        typed = self.obs['typed']
+        self.assertEqual(typed['utc'], '')
+        self.assertIn('This is the first one (EDT)', typed['text'])
+        self.assertEqual(typed['button'], 'Use the second one (EST)')
+
+    def test_the_switch_carries_the_second_and_back(self):
+        self.assertEqual(self.obs['switched']['utc'], '2027-11-07T06:30:00.000Z')
+        self.assertIn('This is the second one (EST)', self.obs['switched']['text'])
+        self.assertEqual(self.obs['back']['utc'], '2027-11-07T05:30:00.000Z')
+        self.assertIn('This is the first one (EDT)', self.obs['back']['text'])
+
+
+class TypedSkippedTimeTests(_Base, unittest.TestCase):
+    SCENARIO = 'dst_typed_skipped'
+
+    def test_a_time_the_spring_change_skips_says_what_it_is_read_as(self):
+        skipped = self.obs['skipped']
+        self.assertTrue(skipped['visible'])
+        self.assertIn('2:30 AM does not happen on Sun, Mar 14', skipped['text'])
+        self.assertIn('This is read as 3:30 AM (EDT)', skipped['text'])
+        self.assertIsNone(skipped['button'])
+
+    def test_an_ordinary_time_clears_it(self):
+        self.assertFalse(self.obs['ordinary']['visible'])
+
+
+class EditOpenedWindowTests(_Base, unittest.TestCase):
+    """An edit sends back the window it opened on; a new recording and a replace send none
+    (dev/docs/BUGS.md 2026-10-31 @ 11:27:32 PM ET)."""
+    SCENARIO = 'edit_opened_window'
+
+    def test_only_an_edit_carries_it(self):
+        self.assertEqual(self.obs['edit'], ['2026-08-10T20:00:00Z', '2026-08-10T21:00:00Z'])
+        self.assertEqual(self.obs['fresh'], ['', ''])
+        self.assertEqual(self.obs['replace'], ['', ''])
+
+
+class EditMovedRefillsTests(_Base, unittest.TestCase):
+    """A 409 for a moved recording puts its current window in every field the user did not
+    type into, keeps the one they did, and makes the next Save a decision on those times."""
+    SCENARIO = 'edit_moved_refills'
+
+    def test_the_save_posted_the_opened_window(self):
+        posted = self.obs['posted']
+        self.assertEqual((posted['opened_start_utc'], posted['opened_stop_utc']),
+                         ('2026-08-10T20:00:00Z', '2026-08-10T21:00:00Z'))
+
+    def test_the_untouched_start_shows_where_it_is_now(self):
+        self.assertEqual(self.obs['start'], '2026-08-10T17:00')
+        self.assertEqual(self.obs['startUtc'], '2026-08-10T21:00:00.000Z')
+
+    def test_the_typed_stop_is_kept(self):
+        self.assertEqual(self.obs['stop'], self.obs['typedStop'])
+
+    def test_the_next_save_is_against_the_new_window(self):
+        self.assertEqual(self.obs['opened'], ['2026-08-10T21:00:00Z', '2026-08-10T22:00:00Z'])
+
+    def test_it_says_why_and_stays_open(self):
+        self.assertIn('moved since this dialog opened', self.obs['errorText'])
+        self.assertTrue(self.obs['modalOpen'])

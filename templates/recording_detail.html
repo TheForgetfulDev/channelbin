@@ -1100,6 +1100,7 @@
   'MANUAL_STOP':              ('na',   'The recording was stopped manually.'),
   'MANUAL_PAUSE':             ('na',   'The recording was paused.'),
   'SERVICE_RESTART':          ('na',   'The segment was closed because the service restarted.'),
+  'LEFT_OPEN':                ('warn', 'This segment was still marked as capturing after its recording had ended, so ChannelBin closed it at the next service restart. When it really stopped is unknown, so it shows no duration and adds no recorded time to its account.'),
   'TEARDOWN_RACE':            ('na',   'This segment was starting at the exact moment the recording was torn down, so it captured nothing. Its file was deleted and the row was closed rather than left open.'),
   'ACCOUNT_BLOCKED':          ('na',   'You blocked the account this segment was on, so the recording moved to a member on another account and this segment was closed there. Nothing was wrong with the feed, and it was not scored for the move.'),
   'CHANNEL_SWITCHED':         ('na',   'You switched the recording to another channel in the group, so this segment was closed here. Nothing was wrong with the feed, and it was not scored for the move.'),
@@ -1365,7 +1366,7 @@ window.onScheduleSaved = () => window.location.reload();
 <script>
 (() => {
   const RID = {{ rec.id }};
-  const STOP_LOCAL = {{ stop_local_input | tojson }};  // 'YYYY-MM-DDTHH:MM' in display tz
+  const STOP_UTC = {{ stop_utc_iso | tojson }};
 
   // ── Header/kebab actions: delegated on document so they survive the 15s
   //    auto-refresh swap of #detail-head-slot (DESIGN.md section 4 confirms).
@@ -1442,14 +1443,15 @@ window.onScheduleSaved = () => window.location.reload();
     extend: {
       confirm: false,
       run: () => {
-        // +30 min on the current stop time, in the display timezone's wall clock
-        const [d, t] = STOP_LOCAL.split('T');
-        const [y, mo, da] = d.split('-').map(Number);
-        const [h, mi] = t.split(':').map(Number);
-        const dt = new Date(y, mo - 1, da, h, mi + 30);
-        const pad = (n) => String(n).padStart(2, '0');
-        const stop = `${dt.getFullYear()}-${pad(dt.getMonth() + 1)}-${pad(dt.getDate())}T${pad(dt.getHours())}:${pad(dt.getMinutes())}`;
-        return jsonFetch(`/recordings/${RID}/adjust-stop`, { method: 'POST', body: JSON.stringify({ stop_time: stop }) });
+        // +30 min on the stop instant, never on its wall text: across a DST change the two
+        // differ by an hour (dev/docs/BUGS.md 2026-10-31 @ 11:27:31 PM ET).
+        const stop = new Date(new Date(STOP_UTC).getTime() + 30 * 60 * 1000);
+        return jsonFetch(`/recordings/${RID}/adjust-stop`, {
+          method: 'POST',
+          body: JSON.stringify({
+            stop_time: dateToTzInputValue(stop, displayTz()), stop_time_utc: stop.toISOString(),
+          }),
+        });
       },
     },
   };

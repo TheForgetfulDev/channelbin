@@ -27,6 +27,29 @@
   const recSub = () => document.getElementById('rec-sub');
   const recList = () => document.querySelector('.rec-list');
 
+  /* Schedule recording asks how (DESIGN.md 9.3, amended 2026-10-31). A desktop opens the
+     button's own .menu through util.js; a phone gets the same three links as big tiles in
+     the bottom sheet, built from that menu so the two can never offer different choices.
+     On the button itself, so it runs before util.js's document-level menu toggle. Bound
+     before the empty-page return below: the empty page has the button too. */
+  document.querySelectorAll('[data-sched-menu]').forEach((btn) => {
+    btn.addEventListener('click', (e) => {
+      if (!isPhone()) return;
+      e.preventDefault();
+      e.stopPropagation();
+      closeMenus();
+      const items = [...btn.closest('.menu-wrap').querySelectorAll('.menu a')].map((a) => ({
+        href: a.getAttribute('href'),
+        icon: a.querySelector('.icon').dataset.icon,
+        label: a.textContent.trim(),
+      }));
+      openMenuSheet(items, {
+        title: 'Schedule a recording', tiles: true,
+        note: 'Manual records a channel at a time you choose, with no program attached.',
+      });
+    });
+  });
+
   /* The empty page has no toolbar and no list, so there is no user state to keep and no
      region to swap into: a recording arriving reloads it, deliberately. The reverse -
      the last recording going - is handled in refresh() below. */
