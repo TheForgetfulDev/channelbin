@@ -9,8 +9,6 @@ size: the clusters to show are chosen in SQL, and only that page's schedules, ch
 and links are loaded.
 """
 import json
-import threading
-from datetime import datetime
 
 from flask import Blueprint, abort, current_app, jsonify, render_template, request, url_for
 from sqlalchemy import func, or_
@@ -18,7 +16,7 @@ from sqlalchemy import func, or_
 from .. import db
 from ..database import (Channel, ChannelGroup, ChannelGroupMember, EpgScan, EpgScanLink,
                         EpgScanSchedule, EpgScanScheduleChannel, EpgSource, EPG_SCAN_FAILED,
-                        EPG_SCAN_RUNNING, EPG_SCAN_SUCCESS)
+                        EPG_SCAN_RUNNING)
 from ..epg_similarity import latest_result, latest_scan, start_scan
 from ..epg_sources import (CMP_DESCRIPTIONS, CMP_IDENTICAL, CMP_MOSTLY, CMP_NO_OVERLAP,
                            CMP_SHIFTED, CMP_UNRELATED)
@@ -290,7 +288,3 @@ def _link_summary(x, only_me, only_other):
         parts.append(f'{only_other} only there')
     return (f'{x.same + x.moved:,} of {counted(x.compared, "program")} match'
             + (': ' + ', '.join(parts) if parts else '') + '.')
-
-
-# Referenced so a template can name the kind and status words from the one declaration.
-__all__ = ['epg_manager_bp', 'EPG_SCAN_SUCCESS', 'threading', 'datetime']

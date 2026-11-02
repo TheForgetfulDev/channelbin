@@ -165,7 +165,7 @@ def partial_note(rec):
     return ' '.join(parts) or None
 
 
-def _http_answer(causes):
+def http_answer(causes):
     """'HTTP 405 Method Not Allowed' / 'an HTTP 4xx error' from ffmpeg's error lines, or None."""
     http = next((m for m in (_HTTP_SPECIFIC.search(c) for c in causes) if m), None)
     if http:
@@ -195,7 +195,7 @@ def plain_cause(cause):
     from .watchdog import PLACEHOLDER_CAUSE
     if cause == PLACEHOLDER_CAUSE:
         return cause
-    answer = _http_answer([cause])
+    answer = http_answer([cause])
     if answer:
         return f'the provider\'s server answered {answer}'
     unreachable = _unreachable([cause])
@@ -234,7 +234,7 @@ def fault_sentence(causes, placeholder=False, login_refused=False):
                 'place of the channel, so the channel was down at the provider\'s end.')
     if login_refused:
         return 'The provider refused the account\'s login.'
-    answer = _http_answer(causes)
+    answer = http_answer(causes)
     if answer:
         return (f'Where ChannelBin could see a reason, the provider\'s server answered the '
                 f'stream request with {answer}.')

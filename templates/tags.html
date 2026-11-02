@@ -22,13 +22,16 @@
   <button class="btn btn-primary" id="tag-add">+ Add Tag</button>
 </div>
 {% call page_about() %}
-  Tags find the little markers IPTV providers put in program titles, like the tiny
-  <code class="tag-pat">ᴸᶦᵛᵉ</code> and <code class="tag-pat">ᴺᵉʷ</code>. In the TV Guide and in
-  program searches, a tag highlights the programs that carry its marker and lets you filter
-  on them. In a recording's file name, <code>{tag:live}</code> writes "live" when the program
-  has that marker and nothing when it does not, and the file name settings can remove or
-  replace the marker itself. ChannelBin starts with two, live and new, for the markers most
-  providers use; edit or delete them like any other.
+  Tags can be used to match items in various searches throughout ChannelBin, and can be used
+  as a find/replace option in the file name template. Use tags to easily match on the little
+  markers IPTV providers put in program titles like <code class="tag-pat">ᴸᶦᵛᵉ</code> and
+  <code class="tag-pat">ᴺᵉʷ</code>, without having to type those things manually. You can also
+  use tags to save terms that you commonly search for. In the TV Guide and in program
+  searches, a tag highlights the programs that carry its marker and lets you filter on them.
+  In a recording's file name, <code>{tag:live}</code> replaces <code class="tag-pat">ᴸᶦᵛᵉ</code>
+  with "live" when it's found in the program name, or it can be used to remove any instance
+  of <code class="tag-pat">ᴸᶦᵛᵉ</code> that it finds. Some commonly used tags are included out
+  of the box. You can edit or delete them if you wish.
 {% endcall %}
 
 {% if not tags %}

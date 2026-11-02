@@ -358,6 +358,7 @@ def reset_module_globals():
     """
     import app.account_links as account_links
     import app.account_stats as account_stats
+    import app.accounts as accounts
     import app.connection_limits as connection_limits
     import app.admission as admission
     import app.auth as auth
@@ -447,6 +448,10 @@ def reset_module_globals():
     # A load the previous module started (or a test left marked running) would refuse every
     # later load and removal as "still loading".
     examples.reset_for_tests()
+    # Only sync_account's thread wrapper pops a sync's progress; a test that drives _do_sync
+    # or an import directly leaves it set, and account ids restart at 1 in every temp DB, so
+    # the next module's account 1 read a phantom "Reading program listings" sync.
+    accounts._sync_progress.clear()
     # save_config() latches this for any RESTART_REQUIRED_KEYS write, so one module's
     # settings save leaves the next module's pages rendering a restart-required banner.
     config._restart_needed = False

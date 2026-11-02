@@ -151,6 +151,14 @@ class SuggestMarksProviderRemovedTests(unittest.TestCase):
         self.assertEqual(by_id[gone.id]['lifecycle_date'],
                          gone.last_seen_at.strftime('%Y-%m-%d'))
 
+    def test_no_candidate_carries_its_stream_url(self):
+        """dev/docs/BUGS.md 2026-11-01 - the payload shipped each candidate's raw,
+        credential-bearing stream URL, which the group modal never reads."""
+        _gone, _live, by_id = self._suggest()
+        self.assertTrue(by_id)
+        for row in by_id.values():
+            self.assertNotIn('stream_url', row)
+
     def test_a_removed_candidate_is_still_listed_and_selectable(self):
         """Marked, never filtered: whether a dropped feed is still wanted is the user's call."""
         gone, _live, by_id = self._suggest()

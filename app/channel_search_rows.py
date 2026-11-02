@@ -76,6 +76,7 @@ from .database import (Channel, ChannelGroup, ChannelGroupMember, EPGEntry, Prov
                        REC_STATUS_CONCATENATING, REC_STATUS_ANALYZING, REC_STATUS_CONVERTING,
                        REC_STATUS_COMPLETED,
                        REC_STATUS_ABORTED, REC_STATUS_FAILED)
+from .fmt_utils import iso_seconds_or_none
 from .recording_match import build_rec_indexes, candidate_recs, match_recording
 from .recording_story import partial_note, stopped_early_note
 from .url_utils import mask_creds
@@ -374,8 +375,8 @@ def _airing_rows(result, state, ctx) -> list:
             'rating': entry.rating or '',
             # Naive-UTC ISO, the shape every other JSON surface in this app sends; the page
             # converts to the display timezone.
-            'start_time': _iso(entry.start_time),
-            'stop_time': _iso(entry.stop_time),
+            'start_time': iso_seconds_or_none(entry.start_time),
+            'stop_time': iso_seconds_or_none(entry.stop_time),
             'on_now': bool(entry.start_time and entry.stop_time
                            and entry.start_time <= ctx.now < entry.stop_time),
             'ended': bool(entry.stop_time and entry.stop_time <= ctx.now),
@@ -383,8 +384,8 @@ def _airing_rows(result, state, ctx) -> list:
             'recording': None if rec is None else {
                 'id': rec.id,
                 'status': rec.status,
-                'start_time': _iso(rec.start_time),
-                'stop_time': _iso(rec.stop_time),
+                'start_time': iso_seconds_or_none(rec.start_time),
+                'stop_time': iso_seconds_or_none(rec.stop_time),
                 # Why a finished recording is not the whole showing, or None - the badge
                 # says Partial rather than Recorded then, as the guide does
                 # (dev/changelog/1270).
@@ -485,11 +486,6 @@ def label_group_id(group_ids, groups_by_id):
     return min(group_ids, key=rank)
 
 
-def _iso(value):
-    # duplicated from app/fmt_utils.py::iso_or_none - the row payload deliberately drops
-    # microseconds, so a showing's time is the same string whether it came from the
-    # importer or from a stored recording.
-    return value.strftime('%Y-%m-%dT%H:%M:%S') if value else None
 
 
 def _record_state(entry, rec, ctx) -> str:

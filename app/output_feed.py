@@ -78,6 +78,7 @@ STATES = (STATE_STARTING, STATE_STREAMING, STATE_STOPPED)
 # session's history while the session goes on.
 REASON_CLIENT_GONE = 'client_gone'
 REASON_CLIENT_TOO_SLOW = 'client_too_slow'
+REASON_BUFFER_TOO_SMALL = 'buffer_too_small'
 REASON_IDLE = 'idle'
 REASON_MAX_DURATION = 'max_duration'
 REASON_PREEMPTED = 'preempted'
@@ -92,6 +93,8 @@ REASON_DISABLED = 'disabled'
 REASON_TEXT = {
     REASON_CLIENT_GONE: 'The IPTV app stopped watching.',
     REASON_CLIENT_TOO_SLOW: 'Cut - the IPTV app fell further behind than the buffer holds.',
+    REASON_BUFFER_TOO_SMALL: ('Cut - the stream arrived faster than the buffer can hold for this '
+                              'reserve. Lower reserve_seconds or raise buffer_mb in Settings.'),
     REASON_IDLE: 'Cut - the IPTV app read nothing for a while.',
     REASON_MAX_DURATION: 'Cut - a session runs for a limited time. The IPTV app can tune in again.',
     REASON_PREEMPTED: 'Cut - a recording needed this connection.',
@@ -560,7 +563,13 @@ class Ring:
     are dropped and `dropped` counts the bytes, which is how an IPTV app that stopped reading is
     noticed (REASON_CLIENT_TOO_SLOW) rather than queued for. `take()` hands the consumer
     the oldest chunk once it has aged `reserve` seconds, so the viewer plays that far behind
-    live and a gap shorter than it plays through (section 4.3)."""
+    live and a gap shorter than it plays through (section 4.3).
+
+    `dropped_unripe` is the part of `dropped` that was evicted before it had aged the
+    reserve - bytes the viewer could not have taken yet. Those say the ring is too small for
+    the reserve at the stream's real bitrate (REASON_BUFFER_TOO_SMALL), not that the viewer
+    is slow: the settings validation assumes RESERVE_BYTES_PER_SECOND, and a stream above it
+    fills the ring before its head is ever releasable, so the viewer gets nothing at all."""
 
     def __init__(self, capacity: int, reserve: float):
         self.capacity = max(int(capacity), READ_CHUNK)
@@ -568,6 +577,7 @@ class Ring:
         self._chunks: deque = deque()
         self.size = 0
         self.dropped = 0
+        self.dropped_unripe = 0
         self.total_in = 0
         self._cv = threading.Condition()
 
@@ -578,9 +588,11 @@ class Ring:
             self.size += len(data)
             self.total_in += len(data)
             while self.size > self.capacity and len(self._chunks) > 1:
-                _, old = self._chunks.popleft()
+                arrived, old = self._chunks.popleft()
                 self.size -= len(old)
                 self.dropped += len(old)
+                if arrived + self.reserve > now:
+                    self.dropped_unripe += len(old)
             self._cv.notify_all()
 
     def take(self, timeout: float, now: Optional[float] = None) -> Optional[bytes]:
@@ -1053,7 +1065,16 @@ def _check(session: RelaySession) -> None:
         _finish(session, REASON_PREEMPTED,
                 detail=f'recording {session.preempted_by} took the connection')
         return
-    if failing_over:
+    if proc is None or failing_over:
+        # No process to judge: the session is inside its launch window (start_session()
+        # registers it before _launch() adopts the ffmpeg, so a reaper another viewer keeps
+        # running sees it with launched_mono still 0.0) or between members on a failover.
+        # The launch ends it itself when the seat or the spawn fails.
+        return
+    if session.ring.dropped_unripe:
+        _finish(session, REASON_BUFFER_TOO_SMALL,
+                detail=f'{fmt_bytes(session.ring.dropped_unripe)} arrived faster than the '
+                       f'buffer holds for a {session.ring.reserve:g}s reserve')
         return
     if session.ring.dropped:
         _finish(session, REASON_CLIENT_TOO_SLOW,

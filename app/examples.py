@@ -27,7 +27,14 @@ example channel refuses the removal and is named, rather than being cancelled fo
 **Keeping them** (`keep()`) is for a user who wants M3UPT as their provider: it clears both
 markers, after which the account and group are ordinary ones that Delete the examples no longer
 touches and that finish Get started's account step (dev/changelog/1288).
+
+**The load is shown, not hidden** (dev/changelog/1396). Each of its five steps records its
+state and a one-line result as it goes, and `progress()` turns that into Get started's progress
+card: live while the load runs, then its report until the examples are deleted, a new load
+starts, or the process restarts. A step that did not happen says why on its own line, in
+addition to the EXAMPLES_INCOMPLETE alert.
 """
+import copy
 import logging
 import threading
 import time
@@ -35,7 +42,7 @@ from datetime import datetime
 
 from . import db
 from .db_utils import retry_on_locked
-from .fmt_utils import counted, join_labels
+from .fmt_utils import counted, first_line, join_labels
 
 log = logging.getLogger(__name__)
 
@@ -66,10 +73,42 @@ _SYNC_POLL_SECONDS = 5
 #: How many blocking recordings a refusal names.
 _BLOCKERS_SHOWN = 5
 
+#: The load's steps, in the order it runs them. Get started shows them as a checklist that
+#: moves while the load runs and stays as its report once it is done (see `progress()`).
+STEP_ACCOUNT = 'account'
+STEP_SYNC = 'sync'
+STEP_GUIDE = 'guide'
+STEP_GROUP = 'group'
+STEP_TEST = 'test'
+STEPS = (STEP_ACCOUNT, STEP_SYNC, STEP_GUIDE, STEP_GROUP, STEP_TEST)
+STEP_LABELS = {
+    STEP_ACCOUNT: 'Add the example account',
+    STEP_SYNC: "Sync M3UPT's channels and program listings",
+    STEP_GUIDE: f'Add {len(GUIDE_CHANNELS)} channels to the TV Guide',
+    STEP_GROUP: 'Make an example channel group',
+    STEP_TEST: f'Run a health check on {TEST_CHANNEL}',
+}
+
+#: A step's state. SKIPPED is a step an earlier failure stopped.
+STEP_PENDING = 'pending'
+STEP_RUNNING = 'running'
+STEP_DONE = 'done'
+STEP_PROBLEM = 'problem'
+STEP_SKIPPED = 'skipped'
+#: The mark each state draws (an `app/icons.py` meaning); RUNNING draws the spinner instead.
+STEP_ICONS = {STEP_PENDING: 'inactive', STEP_RUNNING: None, STEP_DONE: 'ok',
+              STEP_PROBLEM: 'warning', STEP_SKIPPED: 'not-set-up'}
+_FINISHED_STATES = (STEP_DONE, STEP_PROBLEM, STEP_SKIPPED)
+
+_ERROR_CHARS = 160
+
 _lock = threading.Lock()
-#: The load in progress, if any: {'account_id', 'started_at', 'step'}. In memory on purpose -
-#: it describes a thread in this process, and a restart ends the thread.
+#: The load in progress, if any: {'account_id', 'started_at', 'steps', 'refs'}. In memory on
+#: purpose - it describes a thread in this process, and a restart ends the thread.
 _loading: dict = {}
+#: The last load's record once it has finished, the same shape plus 'finished_at': what the
+#: progress card reports until the examples are deleted, a new load starts, or a restart.
+_last: dict = {}
 
 
 def loading() -> dict | None:
@@ -77,15 +116,35 @@ def loading() -> dict | None:
         return dict(_loading) if _loading else None
 
 
-def _set_step(step):
+def _new_steps() -> dict:
+    return {s: {'state': STEP_PENDING, 'detail': ''} for s in STEPS}
+
+
+def _set(step, state, detail=''):
     with _lock:
         if _loading:
-            _loading['step'] = step
+            _loading.setdefault('steps', _new_steps())[step] = {'state': state,
+                                                                 'detail': detail}
+
+
+def _skip_rest(why):
+    with _lock:
+        steps = _loading.get('steps') if _loading else None
+        for s in STEPS if steps else ():
+            if steps[s]['state'] in (STEP_PENDING, STEP_RUNNING):
+                steps[s] = {'state': STEP_SKIPPED, 'detail': why}
+
+
+def _ref(**refs):
+    with _lock:
+        if _loading:
+            _loading.setdefault('refs', {}).update(refs)
 
 
 def reset_for_tests():
     with _lock:
         _loading.clear()
+        _last.clear()
 
 
 # ── Loading ──────────────────────────────────────────────────────────────────
@@ -100,8 +159,10 @@ def start(app) -> tuple[bool, str]:
     with _lock:
         if _loading:
             return False, 'The example channels are already loading.'
+        steps = _new_steps()
+        steps[STEP_ACCOUNT]['state'] = STEP_RUNNING
         _loading.update({'account_id': None, 'started_at': datetime.utcnow(),
-                         'step': 'Adding the example account.'})
+                         'steps': steps, 'refs': {}})
     try:
         if Account.query.filter_by(is_example=True).first() is not None:
             with _lock:
@@ -129,6 +190,9 @@ def start(app) -> tuple[bool, str]:
         raise
     with _lock:
         _loading['account_id'] = account_id
+        _last.clear()
+    _set(STEP_ACCOUNT, STEP_DONE, f'Added "{ACCOUNT_NAME}".')
+    _set(STEP_SYNC, STEP_RUNNING)
     schedule_account_sync(app, account_id)
     threading.Thread(target=_load, args=(app, account_id), daemon=True,
                      name='examples-load').start()
@@ -145,36 +209,120 @@ def _load(app, account_id):
     from .channel_tester import run_single_channel_test
 
     problems = []
+    # A load whose account was deleted under it leaves no report: nothing it made is left.
+    keep_record = True
     try:
-        _set_step("Fetching M3UPT's channels and listings.")
         run_manual_sync(app, account_id, restart_schedule=True)
         with app.app_context():
             synced, why = _wait_for_sync(account_id)
             if not synced:
-                if why is not None:
-                    problems.append(why)
-                    _report(problems)
+                if why is None:
+                    keep_record = False
+                    return
+                problems.append(why)
+                _set(STEP_SYNC, STEP_PROBLEM, why)
+                _skip_rest('Not done, because the sync did not succeed.')
+                _report(problems)
                 return
-            _set_step('Putting the example channels in the TV Guide.')
+            _set(STEP_SYNC, STEP_DONE, _synced_detail(account_id))
+            _set(STEP_GUIDE, STEP_RUNNING)
             test = _place(account_id, problems)
         if test is not None:
-            test_id, test_name = test
-            _set_step(f'Running a health check on {test_name}.')
-            if run_single_channel_test(app, test_id) is None:
-                problems.append(f'The health check on {test_name} did not run: another '
-                                'health check or a recording was using the tester or the '
-                                "account's connections. Test now on the channel's page runs "
-                                'it.')
+            channel_id, test_name = test
+            _ref(test_channel_id=channel_id)
+            _set(STEP_TEST, STEP_RUNNING, 'Watching the stream and measuring what arrives: '
+                                          'picture, sound, bitrate and stalls.')
+            test_id = run_single_channel_test(app, channel_id)
+            if test_id is None:
+                why = (f'The health check on {test_name} did not run: another health check '
+                       "or a recording was using the tester or the account's connections. "
+                       "Test now on the channel's page runs it.")
+                problems.append(why)
+                _set(STEP_TEST, STEP_PROBLEM, why)
+            else:
+                _ref(test_id=test_id)
+                with app.app_context():
+                    _set(STEP_TEST, *_test_outcome(test_id))
         with app.app_context():
             _report(problems)
     except Exception as exc:
         log.exception('Example channels: the load failed')
-        problems.append(f'The load stopped with an error: {exc}')
+        why = f'The load stopped with an error: {exc}'
+        problems.append(why)
+        _fail_running(why)
         with app.app_context():
             _report(problems)
     finally:
         with _lock:
+            if keep_record and _loading:
+                _last.clear()
+                _last.update(_loading, finished_at=datetime.utcnow())
             _loading.clear()
+
+
+def _fail_running(why):
+    """The step under way when the load raised is the problem; the rest did not happen."""
+    with _lock:
+        steps = _loading.get('steps') if _loading else None
+        if steps:
+            stopped = next((s for s in STEPS if steps[s]['state'] == STEP_RUNNING),
+                           next((s for s in STEPS if steps[s]['state'] == STEP_PENDING), None))
+            if stopped is not None:
+                steps[stopped] = {'state': STEP_PROBLEM, 'detail': why}
+    _skip_rest('Not done, because the load stopped.')
+
+
+def _synced_detail(account_id):
+    """The sync's result line. The live line counted playlist entries, so the entries the
+    sync left out are named here, or the two numbers would disagree with no reason given."""
+    from .database import Account, AccountSyncLog
+    account = db.session.get(Account, account_id)
+    line = (f'Added {account.channel_count or 0:,} channels and synced '
+            f'{account.epg_entry_count or 0:,} EPG entries.')
+    log_row = (AccountSyncLog.query.filter_by(account_id=account_id)
+               .order_by(AccountSyncLog.id.desc()).first())
+    dupes = (log_row.skipped_duplicate_stream_ids or 0) if log_row else 0
+    unusable = (log_row.skipped_malformed_urls or 0) if log_row else 0
+    left_out = []
+    if dupes:
+        left_out.append(counted(dupes, 'duplicate'))
+    if unusable:
+        left_out.append(f'{unusable:,} with no usable stream address')
+    if left_out:
+        line += (f" {counted(dupes + unusable, 'playlist entry', 'playlist entries')} "
+                 f'left out: {join_labels(left_out)}.')
+    return line
+
+
+def _test_outcome(test_id) -> tuple[str, str]:
+    """(state, detail) for the load's health check, read from its ChannelTest row: the
+    verdict, the score it left the channel at, and what the stream measured."""
+    from .database import ChannelTest
+    from .routes.channel_tests import _test_status_label
+    t = db.session.get(ChannelTest, test_id)
+    if t is None:
+        return STEP_PROBLEM, 'The health check ran, but its result is gone.'
+    label = _test_status_label(t)
+    score = t.lifetime_score_after if t.lifetime_score_after is not None else t.quality_score
+    scored = f' with a health score of {score}' if score is not None else ''
+    measured = []
+    if t.resolution:
+        measured.append(t.resolution + (f' at {round(t.fps, 2):g} fps' if t.fps else ''))
+    if t.bitrate_kbps:
+        measured.append(f'{t.bitrate_kbps:,.0f} kbps')
+    if t.video_codec:
+        measured.append(f'{t.video_codec.upper()} video')
+    if t.audio_codec:
+        measured.append(f'{t.audio_codec.upper()} audio')
+    stream = f' {", ".join(measured)}.' if measured else ''
+    if label == 'PASS':
+        return STEP_DONE, f'Passed{scored}.{stream}'
+    if label == 'WARN':
+        return STEP_PROBLEM, (f'Played{scored}, with a warning: '
+                              f'{first_line(t.error_detail, _ERROR_CHARS).rstrip(".")}.{stream}')
+    if label in ('FAIL', 'CANCELLED'):
+        return STEP_PROBLEM, f'Did not pass{scored}: {first_line(t.error_detail, _ERROR_CHARS)}'
+    raise ValueError(f'health check {test_id}: unhandled label {label}')
 
 
 def _wait_for_sync(account_id) -> tuple[bool, str | None]:
@@ -245,16 +393,36 @@ def _place(account_id, problems) -> tuple[int, str] | None:
     if missing:
         problems.append(f"M3UPT's list no longer carries {join_labels(missing)}, so "
                         f"{'it was' if len(missing) == 1 else 'they were'} left out.")
+    placed = [n for n in GUIDE_CHANNELS if n not in missing]
+    gone = [n for n in GUIDE_CHANNELS if n in missing]
+    if not gone:
+        _set(STEP_GUIDE, STEP_DONE, f'Added {join_labels(placed)}.')
+    else:
+        added = f'Added {join_labels(placed)}. ' if placed else ''
+        _set(STEP_GUIDE, STEP_PROBLEM,
+             f"{added}M3UPT's list no longer carries {join_labels(gone)}, so "
+             f"{'it was' if len(gone) == 1 else 'they were'} left out.")
+    _set(STEP_GROUP, STEP_RUNNING)
     if group_id is not None:
+        _ref(group_id=group_id)
         evaluate_and_reconcile_group(db.session.get(ChannelGroup, group_id))
+        _set(STEP_GROUP, STEP_DONE, f'Made "{GROUP_NAME}": two Bloomberg TV feeds that share '
+                                    'one program listing.')
     elif not any(n in missing for n in GROUP_CHANNELS):
-        problems.append(f'A channel group named "{GROUP_NAME}" already exists, so the example '
-                        'group was not made.')
-    elif len(missing) < len(GUIDE_CHANNELS + GROUP_CHANNELS):
-        problems.append('The example channel group was not made, since it needs both Bloomberg '
-                        'TV feeds.')
+        why = (f'A channel group named "{GROUP_NAME}" already exists, so the example group was '
+               'not made.')
+        problems.append(why)
+        _set(STEP_GROUP, STEP_PROBLEM, why)
+    else:
+        why = 'The example channel group was not made, since it needs both Bloomberg TV feeds.'
+        # The list carrying none of the channels is already named above.
+        if len(missing) < len(GUIDE_CHANNELS + GROUP_CHANNELS):
+            problems.append(why)
+        _set(STEP_GROUP, STEP_PROBLEM, why)
     if test is None:
-        problems.append('No example channel was left to run the health check on.')
+        why = 'No example channel was left to run the health check on.'
+        problems.append(why)
+        _set(STEP_TEST, STEP_PROBLEM, why)
     return test
 
 
@@ -266,6 +434,85 @@ def _report(problems):
     log.warning('Example channels: loaded in part - %s', ' '.join(problems))
     create_alert('EXAMPLES_INCOMPLETE', 'The example channels loaded only in part',
                  '\n'.join(problems), source='examples')
+
+
+def _sync_detail(account_id) -> tuple[str, float]:
+    """What the running sync is doing right now, from its own live progress, and how far
+    through the sync step that is (0 to 1) for the progress bar."""
+    from .accounts import get_sync_progress
+    from .search_index import rebuild_in_progress
+    p = get_sync_progress(account_id) if account_id is not None else None
+    # The sync's closing index rebuild runs while its progress still reads the listings
+    # phase it finished on.
+    if (p is None or p['phase'] == 'epg') and rebuild_in_progress():
+        return 'Indexing the channels and listings for search.', .9
+    if p and p['phase'] == 'channels':
+        total = p['total']
+        # Playlist entries, not channels: the sync leaves some out, which the done line says.
+        if total:
+            return (f"Reading M3UPT's playlist: {p['done']:,} of {total:,} entries.",
+                    .1 + .4 * p['done'] / total)
+        return f"Reading M3UPT's playlist: {p['done']:,} entries so far.", .3
+    if p and p['phase'] == 'epg':
+        return f"Reading program listings: {p['done']:,} so far.", .7
+    return "Downloading M3UPT's playlist. The whole sync takes a minute or two.", .05
+
+
+def progress() -> dict | None:
+    """The load's checklist for Get started's progress card: the load under way, or the
+    last one's report once it has finished, or None. The running sync's line is read live;
+    each step that made something links to it. A fixed handful of lookups, never per row,
+    and it builds URLs, so it runs inside a request."""
+    from flask import url_for
+    from .database import Account, Channel, ChannelGroup
+    from .fmt_utils import fmt_duration
+    from .routes.channels import account_channels_url, airing_search_url
+    with _lock:
+        run = copy.deepcopy(_loading or _last)
+    if not run:
+        return None
+    account_id = run.get('account_id')
+    if account_id is not None and db.session.get(Account, account_id) is None:
+        return None
+    finished = 'finished_at' in run
+    steps = run.get('steps') or _new_steps()
+    refs = run.get('refs') or {}
+
+    links = {STEP_GUIDE: ('Open the TV Guide', url_for('guide.guide'))}
+    if account_id is not None:
+        links[STEP_ACCOUNT] = ('View the account',
+                               url_for('accounts.account_detail', account_id=account_id))
+        links[STEP_SYNC] = ('View the channels', account_channels_url(account_id))
+    if refs.get('group_id') and db.session.get(ChannelGroup, refs['group_id']) is not None:
+        links[STEP_GROUP] = ('View the group',
+                             url_for('channel_groups.group_detail', group_id=refs['group_id']))
+    if (refs.get('test_id') and refs.get('test_channel_id')
+            and db.session.get(Channel, refs['test_channel_id']) is not None):
+        links[STEP_TEST] = ('View the result', url_for(
+            'channels.channel_detail', channel_id=refs['test_channel_id']) + '#cd-tests')
+
+    view, partial = [], 0.0
+    for s in STEPS:
+        state, detail = steps[s]['state'], steps[s]['detail']
+        if s == STEP_SYNC and state == STEP_RUNNING and not finished:
+            detail, partial = _sync_detail(account_id)
+        link = links.get(s) if state in (STEP_DONE, STEP_PROBLEM) else None
+        view.append({'id': s, 'label': STEP_LABELS[s], 'state': state,
+                     'icon': STEP_ICONS[state], 'spinning': state == STEP_RUNNING,
+                     'detail': detail,
+                     'link': {'label': link[0], 'url': link[1]} if link else None})
+    over = sum(1 for s in STEPS if steps[s]['state'] in _FINISHED_STATES)
+    clean = all(steps[s]['state'] == STEP_DONE for s in STEPS)
+    end = run.get('finished_at') or datetime.utcnow()
+    return {
+        'steps': view,
+        'finished': finished,
+        'clean': finished and clean,
+        'elapsed': fmt_duration((end - run['started_at']).total_seconds(), with_seconds=True),
+        'pct': 100 if finished else round(100 * (over + partial) / len(STEPS)),
+        'sig': ' '.join(f"{s}:{steps[s]['state']}" for s in STEPS) + (' finished' if finished else ''),
+        'search_url': airing_search_url(),
+    }
 
 
 def offer() -> dict:
@@ -446,6 +693,8 @@ def remove() -> tuple[bool, str]:
             return False, f'The examples were removed only in part. {name_or_reason}{done}'
         if name_or_reason:
             removed.append(f'"{name_or_reason}"')
+    with _lock:
+        _last.clear()
     log.info('Example channels: removed %s, %d group(s) dissolved, %d kept',
              join_labels(removed) or 'no account', len(p['dissolve']), len(p['keep']))
     kept = join_labels(f'"{g["name"]}"' for g in p['keep'])

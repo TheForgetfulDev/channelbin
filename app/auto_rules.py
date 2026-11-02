@@ -46,6 +46,7 @@ from .database import (
     add_recording_event, detach_recording_references,
 )
 from .db_utils import retry_on_locked
+from .fmt_utils import iso_seconds_or_none
 from .program_titles import title_key
 
 log = logging.getLogger(__name__)
@@ -70,6 +71,7 @@ _NEVER_STARTED = (CANCEL_BEFORE_START, CANCEL_GROUP_CHANGE)
 
 TRIGGER_IMPORT = 'guide import'
 TRIGGER_SAVE = 'rule saved'
+TRIGGER_CHECK = 'check now'
 TRIGGER_SWEEP = 'periodic sweep'
 TRIGGER_QUEUED = 'queued'
 
@@ -110,7 +112,8 @@ def clean_search(raw_params: str):
     """(state, params_text) for a search a person is saving as a rule, or RuleError.
 
     The page-only parts are dropped and the result re-serialized through to_params(), so what
-    is stored is the canonical spelling. The four refusals of §3.1 come with a sentence each,
+    is stored is the canonical spelling - explicit, so the rule's fields and standing options
+    are its own and not whatever the defaults are when it runs. The four refusals of §3.1 come with a sentence each,
     and so does a When, Day of week, Time of day or Program length value that does not parse
     - it would match nothing or stop the rule, which is the one outcome a rule running with
     nobody watching must never be allowed."""
@@ -170,7 +173,7 @@ def clean_search(raw_params: str):
     state = replace(state, sort=DEFAULT_SORT_BY_GRAIN[GRAIN_AIRINGS], sort_desc=False, page=1,
                     page_size=DEFAULT_PAGE_SIZE, facets=None, add_to_group=None,
                     replace_rec=None, rule=None)
-    return state, urlencode(state.to_params())
+    return state, urlencode(state.to_params(explicit=True))
 
 
 # ---------------------------------------------------------------------------
@@ -310,7 +313,8 @@ def rename_in_rules(dimension: str, old: str, new: str) -> int:
                 changed = True
             filters.append(f)
         if changed:
-            rule.search_params = urlencode(replace(state, filters=tuple(filters)).to_params())
+            rule.search_params = urlencode(
+                replace(state, filters=tuple(filters)).to_params(explicit=True))
             rewritten += 1
     return rewritten
 
@@ -1919,10 +1923,10 @@ def _move_recording(m, rec, showing, rule_name, run, now) -> dict:
                 f'{_local(old_stop, run)} is now {_local(start, run)} to '
                 f'{_local(stop, run)}.{renamed}'),
         extra={'rule_id': m.rule_id, 'rule_name': rule_name,
-               'old_program_start': _iso(old_air[0]), 'old_program_stop': _iso(old_air[1]),
-               'new_program_start': _iso(showing.start), 'new_program_stop': _iso(showing.stop),
-               'old_start': _iso(old_start), 'old_stop': _iso(old_stop),
-               'new_start': _iso(start), 'new_stop': _iso(stop),
+               'old_program_start': iso_seconds_or_none(old_air[0]), 'old_program_stop': iso_seconds_or_none(old_air[1]),
+               'new_program_start': iso_seconds_or_none(showing.start), 'new_program_stop': iso_seconds_or_none(showing.stop),
+               'old_start': iso_seconds_or_none(old_start), 'old_stop': iso_seconds_or_none(old_stop),
+               'new_start': iso_seconds_or_none(start), 'new_stop': iso_seconds_or_none(stop),
                'old_name': old_name if renamed else None,
                'new_name': rec.name if renamed else None})
     return {'kind': _FOLLOW_MOVED, 'recording_id': rec.id, 'row_id': m.id, 'start': start,
@@ -2002,12 +2006,8 @@ def _move_anchor(m, rec, showing, rule_name, run) -> dict:
 def _moved_extra(m, rule_name, reason, old_start, old_stop, showing) -> dict:
     """RECORDING_RULE_PROGRAM_MOVED's extra: why the recording stayed, and both air times."""
     return {'rule_id': m.rule_id, 'rule_name': rule_name, 'reason': reason,
-            'old_program_start': _iso(old_start), 'old_program_stop': _iso(old_stop),
-            'new_program_start': _iso(showing.start), 'new_program_stop': _iso(showing.stop)}
-
-
-def _iso(dt):
-    return dt.strftime('%Y-%m-%dT%H:%M:%S') if dt else None
+            'old_program_start': iso_seconds_or_none(old_start), 'old_program_stop': iso_seconds_or_none(old_stop),
+            'new_program_start': iso_seconds_or_none(showing.start), 'new_program_stop': iso_seconds_or_none(showing.stop)}
 
 
 def _rendered_name(showing, profile, run):
@@ -2165,10 +2165,11 @@ def queue_evaluation(reason: str = '', delay_seconds: int = 30) -> bool:
     return queue_auto_rule_evaluation(delay_seconds=delay_seconds, reason=reason)
 
 
-def evaluate_now(rule_id: int) -> dict:
-    """The save and resume path: evaluate one rule in the request (§4.1). When admission
-    refuses, queue it and say what it waits behind."""
-    outcome = run_evaluation(TRIGGER_SAVE, [rule_id])
+def evaluate_now(rule_id: int, trigger: str = TRIGGER_SAVE) -> dict:
+    """The save, resume and Check now path: evaluate one rule in the request (§4.1). When
+    admission refuses, queue it and say what it waits behind. `trigger` names which of the
+    three asked, for the admission label and the log line."""
+    outcome = run_evaluation(trigger, [rule_id])
     if isinstance(outcome, admission.Refusal):
         queue_evaluation(f'rule #{rule_id} saved, {waiting_phrase(outcome)}')
         return {'queued': True, 'waiting_for': outcome.reason}

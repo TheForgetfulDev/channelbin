@@ -6,7 +6,8 @@ from flask import (Blueprint, render_template, request, redirect, url_for, flash
                    abort, jsonify)
 
 from .. import channel_hiding, db, duplicate_streams
-from ..accounts import (NORM_DISABLED, NORM_MODES, coerce_normalization_mode,
+from ..accounts import (NORM_DISABLED, NORM_HLS, NORM_MODES, NORM_MPEGTS, NORM_MPEGTS_LIVE,
+                        coerce_normalization_mode, global_normalization_mode,
                         norm_mode_example, norm_mode_label, normalize_url_with_mode,
                         resolve_normalization_mode, url_provider_stream_id,
                         finalize_sync_state,
@@ -79,18 +80,28 @@ _SYNC_STOP_TIMEOUT_SECONDS = 5.0
 # so the layout follows the user across browsers (DESIGN.md §3.11).
 _SECTIONS_PREF_KEY = 'account_detail_sections'
 
-# ('' = defer to the global default) + the four modes. The example strings are rendered
-# live under the dropdown so the mode names are unambiguous - see changelog/258 Spec §1.
-_NORM_OPTIONS = [('', 'Use global default', '')] + [
-    (value, label, example) for value, label, example in NORM_MODES
+def _norm_options(cfg: dict) -> list[tuple[str, str, str]]:
+    """('' = defer to the global default, labeled with the mode that default is now) + the
+    four modes. The example strings are rendered under the dropdown so the mode names are
+    unambiguous - see changelog/258 Spec §1."""
+    current = norm_mode_label(global_normalization_mode(cfg))
+    return [('', f'Use global default ({current})', '')] + [
+        (value, label, example) for value, label, example in NORM_MODES
+    ]
+
+
+# What each mode does to a URL spelled some other way, for the Add Account page's table.
+# The "after" column is the real normalizer's output, so the table cannot drift from what
+# a sync does.
+_NORM_TABLE_BEFORE = {
+    NORM_MPEGTS: 'http://example.com/live/AAA/BBB/1.m3u8',
+    NORM_MPEGTS_LIVE: 'http://example.com/AAA/BBB/1',
+    NORM_HLS: 'http://example.com/AAA/BBB/1',
+}
+_NORM_TABLE = [
+    (label, _NORM_TABLE_BEFORE[value], normalize_url_with_mode(_NORM_TABLE_BEFORE[value], value))
+    for value, label, _example in NORM_MODES if value in _NORM_TABLE_BEFORE
 ]
-
-
-def _norm_example(mode_value: str) -> str:
-    """Example URL for the currently-selected mode, so the hint under the dropdown is
-    already correct server-side and JS only has to keep it in step. '' (defer to the
-    global default) has no example of its own and correctly falls through to ''."""
-    return norm_mode_example(mode_value)
 
 
 def _recent_logs_by_account(account_ids, limit=5):
@@ -465,7 +476,7 @@ def account_detail(account_id):
         account_type=(account.account_type or 'm3u'),
         preset_colors=PRESET_COLORS,
         default_color=DEFAULT_COLOR,
-        norm_options=_NORM_OPTIONS,
+        norm_options=_norm_options(cfg),
         sync_hours_choices=_SYNC_HOURS_CHOICES,
         sections=ACCOUNT_SECTIONS,
         section_pref=_section_pref(),
@@ -501,9 +512,9 @@ def new_account():
                 account=None,
                 form=request.form,
                 preset_colors=PRESET_COLORS,
-        default_color=DEFAULT_COLOR,
-                norm_options=_NORM_OPTIONS,
-                norm_example=_norm_example(request.form.get('url_normalization', '')),
+                default_color=DEFAULT_COLOR,
+                norm_options=_norm_options(cfg),
+                norm_table=_NORM_TABLE,
                 global_sync_hours=global_sync_hours,
                 global_max_connections=global_max_connections,
             )
@@ -562,8 +573,8 @@ def new_account():
         form={'sync_enabled': True},
         preset_colors=PRESET_COLORS,
         default_color=DEFAULT_COLOR,
-        norm_options=_NORM_OPTIONS,
-        norm_example=_norm_example(''),
+        norm_options=_norm_options(cfg),
+        norm_table=_NORM_TABLE,
         global_sync_hours=global_sync_hours,
         global_max_connections=global_max_connections,
     )
@@ -977,7 +988,7 @@ def account_settings_api(account_id):
             'xtream_debug_override': bool(account.xtream_debug_override),
         },
         'norm_options': [{'value': v, 'label': label, 'example': example}
-                         for v, label, example in _NORM_OPTIONS],
+                         for v, label, example in _norm_options(cfg)],
         'sync_hours_choices': _SYNC_HOURS_CHOICES,
         'preset_colors': [{'hex': hexval, 'label': label} for hexval, label in PRESET_COLORS],
         'default_color': DEFAULT_COLOR,

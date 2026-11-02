@@ -1593,6 +1593,38 @@ async function navClickScenario() {
   return obs;
 }
 
+/* The rail's + Create tag / + Create group open a NEW TAB, so the search on screen survives,
+   and the first return to this tab re-fetches the catalog so what was made there shows up
+   (dev/changelog/1393). */
+async function createLinkScenario() {
+  const c = boot();
+  await c.settle();
+  const opened = [];
+  c.window.open = (u, target) => { opened.push({ url: u, target }); return null; };
+  const before = c.window.location.href;
+  const catalogs = () => c.sent.filter((s) => s.url.includes('/catalog')).length;
+  const press = (key) => {
+    const b = c.$(`#rail [data-make="${key}"]`);
+    if (b) b.dispatchEvent(new c.window.MouseEvent('click', { bubbles: true, cancelable: true }));
+    return !!b;
+  };
+  const obs = { found: { tag: press('tag'), group: press('group') } };
+  obs.opened = opened.slice();
+  obs.location_kept = c.window.location.href === before;
+  obs.facet_still_open = !!c.$('#rail [data-fac="tag"].open');
+  const catalogsBefore = catalogs();
+  Object.defineProperty(c.document, 'visibilityState', { value: 'visible', configurable: true });
+  c.document.dispatchEvent(new c.window.Event('visibilitychange'));
+  await c.settle();
+  obs.catalog_refetched = catalogs() - catalogsBefore;
+  c.document.dispatchEvent(new c.window.Event('visibilitychange'));
+  await c.settle();
+  obs.catalog_refetched_again = catalogs() - catalogsBefore;
+  obs.cfg = { tag: c.window.CHANNEL_SEARCH_CONFIG.newTagUrl, group: c.window.CHANNEL_SEARCH_CONFIG.groupsUrl };
+  obs.errors = c.errors;
+  return obs;
+}
+
 /* ── 9. A `when` filter, and what parking one does to it ───────────────── */
 async function whenScenario() {
   const obs = {};
@@ -1698,7 +1730,10 @@ async function dayTimeScenario() {
   obs.tod_sent_at_boot = c.params()['f.tod'] || [];
   obs.tod_fill_on = !!(fac('tod') && fac('tod').querySelector('.when-fill.on'));
   obs.tod_value_rows = c.$$('#rail [data-fac="tod"] .prow[data-value]').map((r) => r.dataset.value);
-  obs.tod_fill_label = ((fac('tod') && fac('tod').querySelector('.wf-l')) || {}).textContent || '';
+  // The range's own words are its value row's: the control's heading is a fixed name
+  // (dev/changelog/1393), and the row is what says what is being filtered on.
+  const todRowLabel = () => ((fac('tod') && fac('tod').querySelector('.prow[data-value^="tod:"] .pv')) || {}).textContent || '';
+  obs.tod_fill_label = todRowLabel();
 
   // Retyping the end REPLACES the one range rather than adding a second. While the box has
   // focus the rail is not redrawn under it at all - the SAME node, not a new one given the
@@ -1708,7 +1743,7 @@ async function dayTimeScenario() {
   obs.tod_after_retype = c.params()['f.tod'] || [];
   obs.tod_box_kept_focus = c.document.activeElement === box('to');
   obs.tod_box_same_node_while_focused = !!toBefore && box('to') === toBefore;
-  obs.tod_label_while_focused = ((fac('tod') && fac('tod').querySelector('.wf-l')) || {}).textContent || '';
+  obs.tod_label_while_focused = todRowLabel();
   // The catch-up runs on a 0 ms timer after the focusout, which four pooled scenarios in
   // one event loop can hold off for longer than any flat sleep allows (dev/docs/BUGS.md
   // 2026-10-26): polled, with the cap saying "never" apart from "late".
@@ -1717,7 +1752,7 @@ async function dayTimeScenario() {
     obs.tod_redraw_waited_ms = await c.waitUntil(() => box('to') !== toBefore && !!box('to'));
   }
   obs.tod_box_redrawn_after_blur = !!toBefore && box('to') !== toBefore && !!box('to');
-  obs.tod_label_after_retype = ((fac('tod') && fac('tod').querySelector('.wf-l')) || {}).textContent || '';
+  obs.tod_label_after_retype = todRowLabel();
 
   // The usual way out of the box is a press on something else in the rail. Mousedown moves
   // focus before mouseup, so a redraw at the focusout would detach the pressed button and
@@ -2270,6 +2305,7 @@ const run = async () => {
     ['mobile_sheets', mobileSheetsScenario],
     ['airing', airingScenario],
     ['nav_click', navClickScenario],
+    ['create_link', createLinkScenario],
     ['when', whenScenario],
     ['day_time', dayTimeScenario],
     ['airing_mobile', airingMobileScenario],

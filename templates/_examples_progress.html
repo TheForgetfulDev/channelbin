@@ -1,0 +1,46 @@
+{#- The example channels' progress card (app/examples.py::progress(), dev/changelog/1396).
+    Drawn on Get started and alone by /get-started/activity, which static/js/get-started.js
+    polls while data-running is set. The slot is drawn even when empty, so a load started
+    from the page has somewhere to land. -#}
+<div id="gs-activity" class="gs-activity" tabindex="-1"
+     {%- if activity %} data-sig="{{ activity.sig }}"{% if not activity.finished %} data-running="1"{% endif %}{% endif %}>
+{%- if activity %}
+  <div class="card gs-card gs-run">
+    <div class="card-head"><h2>
+      {%- if not activity.finished %}Setting up the example channels
+      {%- elif activity.clean %}The example channels are ready
+      {%- else %}The example channels loaded in part{% endif %}</h2>
+      <div class="card-head-actions"><span class="gs-run-time">{% if activity.finished %}Took {% endif %}{{ activity.elapsed }}</span></div>
+    </div>
+    <div class="card-body">
+      <div class="hero-progress" role="progressbar" aria-label="Example channels setup"
+           aria-valuemin="0" aria-valuemax="100" aria-valuenow="{{ activity.pct }}">
+        <div class="hero-progress-bar" style="width: {{ activity.pct }}%"></div></div>
+      <ol class="gs-run-steps">
+        {%- for s in activity.steps %}
+        <li class="gs-run-step {{ s.state }}" data-run-step="{{ s.id }}">
+          <span class="gs-run-mark">{% if s.spinning %}<span class="spinner gs-run-spin"></span>{% else %}{{ icon(s.icon) }}{% endif %}</span>
+          <div>
+            <div class="gs-run-label">{{ s.label }}</div>
+            {%- if s.detail %}<div class="gs-run-detail">{{ s.detail }}</div>{% endif %}
+          </div>
+          {%- if s.link %}
+          <a class="btn btn-sm" href="{{ s.link.url }}">{{ s.link.label }} <span class="arw">{{ icon('forward') }}</span></a>
+          {%- endif %}
+        </li>
+        {%- endfor %}
+      </ol>
+      {% if not activity.finished %}
+      <p class="gs-run-note">You can leave this page. The setup carries on by itself, and this
+        card says how it went when you come back.</p>
+      {% else %}
+      <p class="gs-run-note">{% if activity.clean %}Everything above is ready to look at.{% else %}What
+        did not work is said on its step above.{% endif %} Search Programs (EPG) finds what is on
+        the example channels and when. When you have decided, Keep the examples or Delete the
+        examples is further down this page.</p>
+      <div class="gs-acts"><a class="btn" href="{{ activity.search_url }}">Search Programs (EPG) <span class="arw">{{ icon('forward') }}</span></a></div>
+      {% endif %}
+    </div>
+  </div>
+{%- endif %}
+</div>

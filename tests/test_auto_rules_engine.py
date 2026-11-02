@@ -1712,6 +1712,20 @@ class EnvelopeTests(_EngineCase):
         self.assertEqual(AutoRule.query.count(), 1)
         queued.assert_called_once()
 
+    def test_check_now_runs_under_its_own_trigger(self):
+        """Check now is neither a save nor a resume; its admission label and log line must
+        say so rather than "rule saved" (dev/docs/BUGS.md 2026-11-01)."""
+        rid = self.rule('grain=airings&q=Cup+Race')
+        with patch('app.auto_rules.run_evaluation',
+                   return_value={rid: auto_rules.RuleOutcome(rule_id=rid)}) as run:
+            resp = self.t.client.post(f'/api/auto-rules/{rid}/check')
+        self.assertEqual(resp.status_code, 200, resp.get_json())
+        run.assert_called_once_with(auto_rules.TRIGGER_CHECK, [rid])
+        with patch('app.auto_rules.run_evaluation',
+                   return_value={rid: auto_rules.RuleOutcome(rule_id=rid)}) as run:
+            self.t.client.post(f'/api/auto-rules/{rid}/resume')
+        run.assert_called_once_with(auto_rules.TRIGGER_SAVE, [rid])
+
     def test_an_unknown_rule_is_404_with_an_error(self):
         for method, url, body in (('put', '/api/auto-rules/999', {'name': 'x'}),
                                   ('post', '/api/auto-rules/999/pause', None),

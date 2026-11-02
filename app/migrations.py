@@ -3380,6 +3380,75 @@ def _m107_accounts_autoincrement(conn, cur):
     _rebuild_with_autoincrement(conn, cur, 'accounts')
 
 
+#: What a Programs search meant by an absent `in` / `standing` before dev/changelog/1394, spelled
+#: out rather than imported so this step keeps doing what it did when it shipped.
+_M108_AIRING_FIELDS = ('epg-title', 'epg-sub', 'epg-desc')
+_M108_AIRING_STANDING = ('grpdedup', 'shownoepg', 'showuntested')
+#: The parameters to_params() writes after `standing`, so a written-in standing set lands where
+#: the engine's own spelling puts it.
+_M108_AFTER_STANDING = ('sort', 'page', 'per_page', 'grain', 'facets', 'add_to_group',
+                        'replace_rec', 'rule')
+
+
+def _m108_spell_out(params_text):
+    """`params_text` with an absent `in` and `standing` written in as the old airing defaults,
+    or None when it is not a Programs search or already names both."""
+    from urllib.parse import parse_qsl, urlencode
+
+    pairs = parse_qsl(params_text or '', keep_blank_values=True)
+    keys = {k for k, _v in pairs}
+    if ('grain', 'airings') not in pairs or ('in' in keys and 'standing' in keys):
+        return None
+    if 'in' not in keys:
+        at = next((i + 1 for i, (k, _v) in enumerate(pairs) if k == 'q'), 0)
+        pairs[at:at] = [('in', f) for f in _M108_AIRING_FIELDS]
+    if 'standing' not in keys:
+        at = next((i for i, (k, _v) in enumerate(pairs) if k in _M108_AFTER_STANDING), len(pairs))
+        pairs[at:at] = [('standing', s) for s in _M108_AIRING_STANDING]
+    return urlencode(pairs)
+
+
+def _m108_stored_searches_explicit(conn, cur):
+    """Every stored Programs search names its search fields and standing options
+    (dev/changelog/1394). An auto-record rule was stored without whichever of them sat at the
+    grain's default, so it meant "whatever the default is when the rule runs" - and the
+    airing grain's default fields gained the channel name in this same release, which would
+    have widened every such rule with nobody looking. This writes the old defaults into each
+    rule, so it keeps matching what it matched; rules are stored explicitly from now on.
+
+    Saved searches on the Search page get the same treatment, though the page has always
+    written both parameters, so only a hand-made one could be missing them. A value that does
+    not parse as the list of records the page writes is left alone - the page already treats
+    it as nothing saved. Re-runnable from the top: a spelling that names both is untouched."""
+    import json
+
+    for rule_id, params in cur.execute('SELECT id, search_params FROM auto_rules').fetchall():
+        spelled = _m108_spell_out(params)
+        if spelled is not None:
+            cur.execute('UPDATE auto_rules SET search_params = ? WHERE id = ?', (spelled, rule_id))
+            log.info('Auto-record rule %d: wrote its search fields and standing options into '
+                     'its stored search, as the defaults it has been running with', rule_id)
+
+    row = cur.execute("SELECT value FROM user_prefs WHERE key = 'channel_search_saved'").fetchone()
+    try:
+        saved = json.loads(row[0]) if row and row[0] else None
+    except ValueError:
+        saved = None
+    if not isinstance(saved, list):
+        return
+    changed = 0
+    for rec in saved:
+        if isinstance(rec, dict) and isinstance(rec.get('params'), str):
+            spelled = _m108_spell_out(rec['params'])
+            if spelled is not None:
+                rec['params'] = spelled
+                changed += 1
+    if changed:
+        cur.execute("UPDATE user_prefs SET value = ? WHERE key = 'channel_search_saved'",
+                    (json.dumps(saved),))
+        log.info('Wrote the search fields and standing options into %d saved search(es)', changed)
+
+
 def _m081_account_blocks(conn, cur):
     """account_blocks: the stretches of time the user has told ChannelBin to keep off an
     account (app/account_blocks.py, dev/changelog/1151).
@@ -3520,8 +3589,37 @@ def _m098_default_hide_rules(conn, cur):
         log.info('Added %d default hide rule(s) for provider divider rows', added)
 
 
+def _m109_default_4k_tag(conn, cur):
+    """tags: the built-in 4k tag, matching the superscript ᵁᴴᴰ and ᴴᴰᴿ markers, on an install
+    whose tags table predates it (dev/changelog/1395). A new tags table gets the same tag from
+    create_app()'s seed; this step runs once, so a 4k tag the user deletes stays deleted.
+
+    The patterns are spelled out rather than read from database.FOUR_K_TAG_PATTERNS, so this
+    step keeps writing what it wrote when it shipped. Skipped when the user already has a tag
+    named 4k (any case) or a tag carrying either marker - a second tag for the same marker
+    would only paint every UHD program twice. Matching is done at read time, so inserting the
+    rows is the whole job."""
+    if not cur.execute('PRAGMA table_info(tags)').fetchall():
+        return
+    # duplicated from app/database.py::FOUR_K_TAG_PATTERNS - a shipped step freezes its data
+    patterns = ('ᵁᴴᴰ', 'ᴴᴰᴿ')
+    if cur.execute("SELECT 1 FROM tags WHERE LOWER(name) = '4k'").fetchone():
+        return
+    marks = ','.join('?' * len(patterns))
+    if cur.execute(f'SELECT 1 FROM tag_patterns WHERE pattern IN ({marks})',
+                   patterns).fetchone():
+        log.info('Did not add the built-in 4k tag: a tag already matches its markers')
+        return
+    cur.execute('INSERT INTO tags (name, color, created_at) VALUES (?, ?, ?)',
+                ('4k', '#e8b4fb', _utc_stamp()))
+    tag_id = cur.lastrowid
+    cur.executemany('INSERT INTO tag_patterns (tag_id, pattern) VALUES (?, ?)',
+                    [(tag_id, p) for p in patterns])
+    log.info('Added the built-in 4k tag')
+
+
 SCHEMA_MIGRATIONS = [
-    (1, 'baseline: pre-versioning additive migrations + backfills', _m001_baseline),
+    (1,'baseline: pre-versioning additive migrations + backfills', _m001_baseline),
     (2, 'recordings: program_title/program_sub_title snapshot columns + backfill', _m002_program_title),
     (3, 'channels/recordings: group_id columns for manual channel grouping', _m003_channel_group_columns),
     (4, 'unify guide health checks: system on-demand job row + guide-test backfill', _m004_unify_guide_health_checks),
@@ -3738,6 +3836,9 @@ SCHEMA_MIGRATIONS = [
      'the EPG similarity scan\'s last result', _m106_epg_scans),
     (107, 'accounts: rebuild with AUTOINCREMENT so a deleted account\'s id is never re-issued',
      _m107_accounts_autoincrement),
+    (108, 'auto_rules + saved searches: a stored Programs search names its search fields and '
+     'standing options, so a changed default cannot change it', _m108_stored_searches_explicit),
+    (109, 'tags: the built-in 4k tag for the UHD and HDR title markers', _m109_default_4k_tag),
 ]
 
 CURRENT_SCHEMA_VERSION = SCHEMA_MIGRATIONS[-1][0]

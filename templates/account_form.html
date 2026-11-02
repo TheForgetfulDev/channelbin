@@ -19,16 +19,20 @@
   <h1>Add Account</h1>
 </div>
 {% call page_about() %}
-  An account is one IPTV provider connection. ChannelBin syncs its channel list and guide
-  data on a schedule, and the first sync starts about a minute after you add it.
+  Add your IPTV account(s) here. ChannelBin syncs each account's channel list and guide data
+  on a schedule. Once synced, you'll be able to start testing your channels, recording
+  programs, creating channel groups, etc. If you have multiple different credentials for the
+  same backend provider, or multiple different EPG sources that you want to use for one
+  account, you can add those details to this account after it has been created.
 {% endcall %}
 
-<div class="form-card">
+<div class="form-card acct-add">
   <form method="post">
       {{ csrf_field() }}
 
     {# Xtream first and by default: a provider's welcome message is almost always a server,
        a username and a password, which is an Xtream Codes login (dev/changelog/1272). #}
+    <div class="form-row">
     <div class="form-group">
       <label>Account Type <span class="required">*</span></label>
       <select name="account_type" id="account-type" class="form-control">
@@ -51,6 +55,7 @@
              value="{{ form.get('name', '') }}"
              placeholder="e.g. My IPTV Provider">
       <span class="form-hint">A friendly label shown in the UI to identify this account.</span>
+    </div>
     </div>
 
     {# ── M3U fields ── #}
@@ -87,10 +92,6 @@
                    autocomplete="new-password" placeholder="Password">
             {{ secret_reveal_btn(local=true) }}
           </div>
-          <span class="form-hint">
-            ChannelBin never shows a stored password back to you - the eye only reveals what
-            you type here.
-          </span>
         </div>
       </div>
     </div>
@@ -105,36 +106,54 @@
              placeholder="http://example.com/guide.xml.gz">
       <span class="form-hint">
         The EPG is the program guide: what is on each channel and when. An Xtream account
-        brings its provider's guide with it, so leave this empty unless that guide is missing
-        channels. For an M3U playlist, paste the guide link your provider gave you (an XMLTV
-        file, plain or <code>.gz</code>). It is fetched right away, and you can change or
-        remove it later under EPG sources on the account page.
+        typically includes its provider's guide automatically, so you can usually leave this
+        empty. For an M3U playlist, paste the guide link your provider gave you (an XMLTV
+        file - plain XML or a <code>.gz</code> file both work). You can change or remove it
+        later under EPG sources on the account page.
       </span>
     </div>
 
     <div class="form-group">
-      <label>URL Normalization <span class="form-hint-inline">(most people leave this as it is)</span></label>
+      <label>URL Normalization <span class="form-hint-inline">(change stream format)</span></label>
       <select name="url_normalization" class="form-control" id="url-norm-select">
         {% for val, label, example in norm_options %}
-        <option value="{{ val }}" data-example="{{ example }}"
+        <option value="{{ val }}"
                 {% if form.get('url_normalization', '') == val %}selected{% endif %}>{{ label }}</option>
         {% endfor %}
       </select>
       <span class="form-hint">
         Rewrites every stream URL into one consistent form. Only the URL's shape changes -
-        the address and credentials the provider supplied are always kept as-is, and a URL
-        that has no <code>user/password/id</code> in it is left untouched. Change it only if
-        channels will not play. The default is in
-        <a href="{{ url_for('settings.settings', q='sync.url_normalization') }}">Settings</a>.
+        the address and credentials the provider supplied are always kept as-is. Typically
+        you would only change this if you know what you're doing, or if you're having
+        trouble with channels not playing. The global default can be changed in
+        <a href="{{ url_for('settings.settings', q='sync.url_normalization') }}" target="_blank" rel="noopener">Settings</a>.
       </span>
-      {# Server-rendered to match the current selection, so the "nothing active" state is
-         already correct before any JS runs (CLAUDE.md Frontend rendering). #}
-      <div class="form-hint" id="url-norm-example"
-           style="margin-top:.35rem;{% if not norm_example %}display:none;{% endif %}">
-        Example: <code id="url-norm-example-url">{{ norm_example }}</code>
+      {# What each mode does to a URL spelled another way; built by
+         routes/accounts.py::_NORM_TABLE from the real normalizer. Its two unbreakable URL
+         columns need about 630px, 10px more than the form has at 961px, so it takes the
+         card form under 900 like the other narrow-column tables (dev/changelog/1398). #}
+      <div class="table-scroll norm-table">
+        <table class="tbl tbl-cards cards-under-900">
+          <thead><tr><th>Mode</th><th>Before</th><th>After</th></tr></thead>
+          <tbody>
+            <tr>
+              <td data-label="Mode">Disabled</td>
+              <td data-label="Before">Any stream URL</td>
+              <td data-label="After">Left exactly as the provider sent it</td>
+            </tr>
+            {% for label, before, after in norm_table %}
+            <tr>
+              <td data-label="Mode">{{ label }}</td>
+              <td data-label="Before"><code>{{ before }}</code></td>
+              <td data-label="After"><code>{{ after }}</code></td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
       </div>
     </div>
 
+    <div class="form-row">
     <div class="form-group">
       <label>Sync Interval</label>
       <select name="sync_interval_hours" class="form-control">
@@ -148,9 +167,9 @@
         {% endfor %}
       </select>
       <span class="form-hint">
-        How often to refresh this account's channels and guide. Most people leave this as it
-        is; "Default" follows the sync interval in
-        <a href="{{ url_for('settings.settings', q='sync.sync_interval_hours') }}">Settings</a>.
+        How often to refresh this account's channels and guide. "Default" follows the sync
+        interval in
+        <a href="{{ url_for('settings.settings', q='sync.sync_interval_hours') }}" target="_blank" rel="noopener">Settings</a>.
       </span>
     </div>
 
@@ -160,13 +179,12 @@
              value="{{ form.get('max_connections', '') }}"
              placeholder="Default ({{ global_max_connections }})">
       <span class="form-hint">
-        How many streams ChannelBin may open on this account at once - recordings, health
-        checks and previews together (a sync does not count). Set it to your plan's limit,
-        often 1 or 2; the account page shows the limit your provider reports after the first
-        sync. Leave it blank to use the default in
-        <a href="{{ url_for('settings.settings', q='accounts.default_max_connections') }}">Settings</a>
-        ({{ global_max_connections }}).
+        How many streams ChannelBin may open on this account at once for things like
+        recordings, health checks, and channel previews. Set it to your plan's limit (often
+        1). Leave it blank to use the default in
+        <a href="{{ url_for('settings.settings', q='accounts.default_max_connections') }}" target="_blank" rel="noopener">Settings</a>.
       </span>
+    </div>
     </div>
 
     <div class="form-group">
@@ -205,7 +223,11 @@
                  placeholder="#rrggbb">
         </div>
       </div>
-      <span class="form-hint">Color used to identify this account's channels in the TV guide.</span>
+      <span class="form-hint">
+        The color is used to identify this account's channels throughout ChannelBin. It's
+        recommended to avoid typical alert colors (red, orange, yellow, green, and blue) to
+        avoid confusion.
+      </span>
     </div>
 
     <div class="form-actions">
@@ -221,6 +243,12 @@
 /* The colour picker's own rules moved to style.css when tag_form.html was deleted and the
    tag modal became a second caller (dev/changelog/448) - a class styled in one page's
    block may not be borrowed by another. What is left here is scoped to this page. */
+.norm-table { margin-top: .5rem; }
+/* Side-by-side pairs above the mobile breakpoint only; .form-row itself holds two
+   columns down to 480px, which leaves a landscape phone two cramped halves. */
+@media (max-width: 960px) {
+  .acct-add .form-row { grid-template-columns: 1fr; gap: 0; }
+}
 .form-hint-inline {
   font-size: var(--fs-sm);
   color: var(--text-muted);
@@ -258,19 +286,5 @@ switchType(typeSelect.value);
 document.getElementById('color-custom-input').addEventListener('input', () => {
   document.querySelectorAll('.color-radio').forEach((r) => { r.checked = false; });
 });
-
-// Live example under the URL-normalization dropdown. Purely an upgrade of an already
-// correct server-rendered state - it never has to calm anything down.
-const normSelect = document.getElementById('url-norm-select');
-const normBox = document.getElementById('url-norm-example');
-const normUrl = document.getElementById('url-norm-example-url');
-if (normSelect && normBox && normUrl) {
-  const showNormExample = () => {
-    const example = normSelect.selectedOptions[0]?.dataset.example || '';
-    normUrl.textContent = example;
-    normBox.style.display = example ? '' : 'none';
-  };
-  normSelect.addEventListener('change', showNormExample);
-}
 </script>
 {% endblock %}

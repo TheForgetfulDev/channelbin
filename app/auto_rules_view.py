@@ -30,6 +30,7 @@ from .database import (
     RULE_MATCH_SKIPPED_EXISTING, RULE_MATCH_SKIPPED_LIMIT, RULE_MATCH_SKIPPED_REPEAT,
     RULE_MATCH_USER_MODIFIED, Recording, RecordingProfile, RuleMatch,
 )
+from .fmt_utils import counted
 
 log = logging.getLogger(__name__)
 
@@ -97,10 +98,6 @@ def first_check_wait():
         if kind in blockers:
             return f'{admission.KIND_LABELS[kind]} is running' + (f' ({label})' if label else '')
     return None
-
-
-def _plural(n, one, many=None):
-    return f'{n:,} {one if n == 1 else (many or one + "s")}'
 
 
 def _cap_of(rule, default_cap):
@@ -318,7 +315,7 @@ def search_urls(rule_id, search_params):
     except SearchStateError:
         state = SearchState(grain=GRAIN_AIRINGS)
     return (f'{base}?{search_params}',
-            f'{base}?{urlencode(replace(state, rule=str(rule_id)).to_params())}')
+            f'{base}?{urlencode(replace(state, rule=str(rule_id)).to_params(explicit=True))}')
 
 
 def dialog_data(rule, described, edit_search_url) -> dict:
@@ -369,7 +366,7 @@ def guide_strip(now, tz, h24) -> dict:
     if sync_on == 0:
         sync = (f'automatic sync is off on {"the only account" if total == 1 else f"all {total:,} accounts"}')
     else:
-        sync = f'{sync_on:,} of {_plural(total, "account")} sync automatically'
+        sync = f'{sync_on:,} of {counted(total, "account")} sync automatically'
     last = f' The last refresh was {ago(last_sync, now)}.' if last_sync else ''
     if reach is None:
         return {'tone': 'warn', 'title': 'The guide is empty, so no rule can schedule anything.',
@@ -403,8 +400,8 @@ def _state_tip(state, rule, scheduled, cap, waiting, wait, now):
         return ('On.\nChecks the guide every hour and after every guide refresh. Last checked '
                 f'{ago(rule.last_evaluated_at, now)}.')
     if state == STATE_CAP:
-        return (f'At its cap.\n{_plural(scheduled, "recording")} scheduled, the most this rule '
-                f'may have at once ({cap:,}). {_plural(waiting, "showing waits", "showings wait")} '
+        return (f'At its cap.\n{counted(scheduled, "recording")} scheduled, the most this rule '
+                f'may have at once ({cap:,}). {counted(waiting, "showing waits", "showings wait")} '
                 'until one of them is over.')
     if state == STATE_BROKEN:
         return (f'Not running.\n{rule.last_error}\nIt schedules nothing new until this is fixed. '
@@ -519,7 +516,7 @@ def _lead(rule, profile):
             else 'Repeats are recorded too. ')
     if rule.limit_count and rule.limit_window_hours:
         out += (f'It takes at most {rule.limit_count:,} within any '
-                f'{_plural(rule.limit_window_hours, "hour")}. ')
+                f'{counted(rule.limit_window_hours, "hour")}. ')
     return out + ('Recordings it makes are ordinary recordings: they fail over, wait for a '
                   'connection and show up in Recordings like any other.')
 
@@ -530,7 +527,7 @@ def settings_items(rule, profile, default_cap) -> list:
     cap = _cap_of(rule, default_cap)
     cap_text = (f'{cap:,} scheduled at once' if cap else 'No cap') \
         + (' (the default)' if rule.max_upcoming is None else '')
-    limit = (f'At most {rule.limit_count:,} within {_plural(rule.limit_window_hours, "hour")}'
+    limit = (f'At most {rule.limit_count:,} within {counted(rule.limit_window_hours, "hour")}'
              if rule.limit_count and rule.limit_window_hours else 'None')
     return [
         {'focus': 'profile', 'label': 'Recording profile',
@@ -553,11 +550,11 @@ def settings_items(rule, profile, default_cap) -> list:
 def _action_message(state, scheduled, cap, cap_waiting, nxt):
     if state == STATE_ON:
         if nxt is not None:
-            return f'{_plural(scheduled, "recording")} scheduled. The next is {nxt}.'
+            return f'{counted(scheduled, "recording")} scheduled. The next is {nxt}.'
         return 'Nothing scheduled: nothing it matches is in the guide yet.'
     if state == STATE_CAP:
-        return (f'{_plural(scheduled, "recording")} scheduled; its cap is {cap:,}. '
-                f'{_plural(cap_waiting, "showing is", "showings are")} waiting for room.')
+        return (f'{counted(scheduled, "recording")} scheduled; its cap is {cap:,}. '
+                f'{counted(cap_waiting, "showing is", "showings are")} waiting for room.')
     if state == STATE_BROKEN:
         return 'Not running. It schedules nothing new until this is fixed.'
     if state == STATE_PAUSED:
@@ -580,7 +577,7 @@ def _notices(state, rule, scheduled, cap, cap_waiting, wait, now, tz, h24, sync_
         out.append(('warn', 'Its last check could not schedule everything it found.',
                     f'{rule.last_problems} The next check tries again.', ''))
     if state == STATE_CAP:
-        out.append(('warn', f'{_plural(cap_waiting, "showing is", "showings are")} waiting for '
+        out.append(('warn', f'{counted(cap_waiting, "showing is", "showings are")} waiting for '
                             'room under the cap.',
                     f'This rule may have {cap:,} recordings scheduled at once and has '
                     f'{scheduled:,}. The rest are scheduled as earlier ones finish, if they have '
@@ -589,7 +586,7 @@ def _notices(state, rule, scheduled, cap, cap_waiting, wait, now, tz, h24, sync_
     if state == STATE_PAUSED:
         out.append(('info', 'Paused.',
                     'It schedules nothing new.'
-                    + (f' The {_plural(scheduled, "recording")} it already scheduled still '
+                    + (f' The {counted(scheduled, "recording")} it already scheduled still '
                        'record.' if scheduled else '')
                     + ' Resuming checks the guide at once.', 'resume'))
     if state == STATE_NEW:

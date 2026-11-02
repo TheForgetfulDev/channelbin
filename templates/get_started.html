@@ -7,7 +7,8 @@
     read fresh on each load and stored nowhere, which is why nothing here can be dismissed or
     marked done by hand. #gs-live is swapped by static/js/get-started.js when the nav poll's
     sync or recording signature moves, so a first sync or a first recording moves the page on
-    without a reload. #}
+    without a reload. #gs-activity, the example channels' progress card, is its own region
+    (dev/changelog/1396). #}
 
 {% block content %}
 {% macro step_item(s) -%}
@@ -76,11 +77,6 @@
       {%- endif %}
     </div>
     <div class="card-body">
-      {% if ex.loading %}
-      <p><b>Loading.</b> {{ ex.loading.step }} The first sync fetches about a thousand channels
-        and their listings from M3UPT, which takes a minute or two. This page moves on by
-        itself.</p>
-      {% endif %}
       <p>These came from <a href="{{ ex.site_url }}" target="_blank" rel="noopener">M3UPT</a>, a
         public list of free channels the broadcasters themselves stream online.
         {% for a in ex.accounts %}<a href="{{ url_for('accounts.account_detail', account_id=a.id) }}">{{ a.name }}</a>
@@ -105,6 +101,9 @@
 {% call page_about() %}The four steps that take a new install to its first recording, in order,
   and a few more worth doing after. Each one is checked against what is actually set up every
   time this page loads.{% endcall %}
+
+{#- Outside #gs-live: get-started.js updates it from its own cheap poll while a load runs. -#}
+{% include "_examples_progress.html" %}
 
 {#- data-waiting asks get-started.js for the minute tick as well, so "first sync starts in
     4m" keeps counting down while nothing else changes. -#}

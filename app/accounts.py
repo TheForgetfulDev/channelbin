@@ -415,11 +415,14 @@ def resolve_normalization_mode(account: Account, cfg: dict = None) -> str:
     via render_filename_template on the same routes)."""
     mode = coerce_normalization_mode(getattr(account, 'url_normalization', None))
     if mode is None:
-        if cfg is None:
-            cfg = load_config()
-        mode = coerce_normalization_mode(
-            cfg.get('sync', {}).get('url_normalization')) or NORM_DISABLED
+        mode = global_normalization_mode(load_config() if cfg is None else cfg)
     return mode
+
+
+def global_normalization_mode(cfg: dict) -> str:
+    """The mode an account that sets none of its own follows: sync.url_normalization."""
+    return coerce_normalization_mode(
+        cfg.get('sync', {}).get('url_normalization')) or NORM_DISABLED
 
 
 class StreamUrlConstructionBlocked(Exception):
@@ -3255,6 +3258,26 @@ def _maybe_gunzip(xml_bytes: bytes) -> tuple[bytes, str | None]:
     return plain, None
 
 
+# Enough of the head for _looks_like_m3u's line scan; the rest of a 42 KB playlist is never
+# decoded.
+_PLAYLIST_SNIFF_BYTES = 8192
+
+
+def _playlist_in_place_of_guide(xml_bytes: bytes) -> str | None:
+    """The refusal for a guide URL that answered with an M3U playlist, or None.
+
+    Without it the playlist went to the XMLTV parser and was refused as a malformed or
+    empty feed, which sends the user looking for a truncated download rather than at the
+    guide URL itself - account 2's xmltv.php served a 42 KB `#EXTM3U` playlist of another
+    provider's public streams on 2026-09-26 (dev/changelog/1139, dev/changelog/1397)."""
+    head = xml_bytes[:_PLAYLIST_SNIFF_BYTES].decode('utf-8', errors='replace')
+    if not _looks_like_m3u(head):
+        return None
+    return (f'fetch failed: the guide URL answered with an M3U playlist '
+            f'({fmt_bytes(len(xml_bytes))}, starting #EXTM3U), not an XMLTV guide - the '
+            f'provider is serving a channel list where its guide should be')
+
+
 def _visible_source_baseline(source_id: int) -> int:
     """The collapse guard's baseline for one source: the rows it holds, in both tables, on
     channels that are NOT hidden (DESIGN-epg-sources.md §8.2).
@@ -3344,6 +3367,11 @@ def _import_source(source: EpgSource, xml_bytes: bytes, epg_days: int, case_sens
     xml_bytes, gzip_reason = _maybe_gunzip(xml_bytes)
     if gzip_reason:
         return _ImportResult(0, gzip_reason, None)
+    playlist_reason = _playlist_in_place_of_guide(xml_bytes)
+    if playlist_reason:
+        log.warning('EPG source %d (%s): %s - listings kept', source_id, source_name,
+                    playlist_reason)
+        return _ImportResult(0, playlist_reason, None)
 
     now = datetime.utcnow()
     window_start = now - timedelta(hours=1)

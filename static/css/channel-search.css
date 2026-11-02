@@ -817,17 +817,20 @@
    says so in the place the tick would have been. */
 .a-nosel { color: var(--text-faint); text-align: center; cursor: help; user-select: none; }
 
-/* ── The two `when` values you fill in ───────────────────────────────
-   Each sits UNDER the value it belongs to, indented so the pairing is visible
-   without a connector. Dimmed until it holds something, because an empty control is
-   not a window and its row is not filtering. */
-.when-fill { display: flex; flex-direction: column; gap: 3px; padding: 3px 4px 6px 10px;
-  border-left: 2px solid var(--border); margin: 0 0 2px 6px; opacity: .72; }
-.when-fill.on { opacity: 1; border-left-color: var(--accent); }
-.wf-l { font-size: var(--fs-xs); color: var(--text-faint); text-transform: uppercase; letter-spacing: .05em; }
+/* ── The values you fill in (`when`'s two, Time of day, Program length) ──
+   Each is its own control under its own heading, divided from the value list above it.
+   An indented, dimmed, uppercase-labelled block read as a child of the value row it sat
+   under ("Within the next" looked like part of Tomorrow), which it never was. The
+   heading lights once the control holds a value. */
+.when-fill { display: flex; flex-direction: column; gap: 4px; padding: 8px 2px 4px;
+  margin-top: 6px; border-top: 1px solid var(--border-soft); }
+.wf-l { font-size: var(--fs-sm); font-weight: 600; color: var(--text-muted); }
+.when-fill.on .wf-l { color: var(--accent-text); }
 .wf-c { display: flex; gap: 4px; align-items: center; }
-/* Border, text color and focus come from style.css's shared text-input recipe. */
-.wf-c input, .wf-c select { background: var(--bg0); font-family: inherit; font-size: var(--fs-sm); padding: 3px 5px; min-width: 0; }
+/* Border, text color and focus come from style.css's shared text-input recipe; the height
+   is the rail's find box's, so every control on the rail is one size. */
+.wf-c input, .wf-c select { background: var(--bg0); font-family: inherit; font-size: var(--fs-sm);
+  height: 26px; padding: 0 6px; min-width: 0; }
 .wf-n { width: 58px; }
 .wf-u { flex: 1; }
 .wf-range { flex-direction: column; align-items: stretch; }
@@ -965,7 +968,7 @@
   /* 16px is the floor that stops iOS Safari zooming the viewport on focus, and a
      search box that zooms the page is worse than one a pixel off the scale. */
   .sbox input { font-size: 16px; height: auto; padding: 7px 0; min-width: 0; }
-  .rsearch, .pop-search { font-size: 16px; height: var(--ctl-h); }
+  .rsearch, .pop-search, .wf-c input, .wf-c select { font-size: 16px; height: var(--ctl-h); }
 
   /* ── The chip row: every entry point on one line (DESIGN.md 9.4) ──
      It replaces the toolbar rather than joining it: Saved, Clear all and the

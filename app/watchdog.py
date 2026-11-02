@@ -479,6 +479,9 @@ class WatchdogThread(threading.Thread):
                         member_fast_delivery_strikes = 0
                         member_fast_delivery_channel_id = None
                         early_fail_times.clear()
+                        # Both helpers launched the next segment before returning; the
+                        # wait for its first byte is downtime (dev/changelog/1242).
+                        failover_gap_start = time.monotonic()
                         break
 
                     try:
@@ -654,6 +657,9 @@ class WatchdogThread(threading.Thread):
                                     member_fast_delivery_strikes = 0
                                     member_fast_delivery_channel_id = None
                                     early_fail_times.clear()
+                                    # The wait for the new member's first byte is downtime
+                                    # here as on every other move (dev/changelog/1242).
+                                    failover_gap_start = time.monotonic()
                                     _launch_segment(self.app, self.recording_id, seg_num + 1)
                                     break
                                 action = 'stay'

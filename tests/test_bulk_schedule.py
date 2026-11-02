@@ -252,6 +252,25 @@ class PartialFailureTests(_BulkCase):
         self.assertIn('disk on fire', data['failed'][0]['error'])
         self.assertEqual(Recording.query.count(), 2)
 
+    def test_a_database_error_never_shows_the_stream_url(self):
+        """dev/docs/BUGS.md 2026-11-01 - a StatementError's text appends the INSERT's
+        parameters, so echoing str(exc) put the credential-bearing stream URL in the modal."""
+        from sqlalchemy.exc import OperationalError
+        a = seed.make_epg_entry(self.ch1, title='First', offset_minutes=60)
+        db.session.commit()
+        from app.routes import recordings as rr
+        exc = OperationalError('INSERT INTO recordings (url) VALUES (?)',
+                               ('http://h.test/u/p/1.ts',),
+                               Exception('database is locked'))
+        with mock.patch.object(rr, '_create_scheduled_recording', side_effect=exc):
+            resp = self._post('bulk-schedule', self._items(a))
+        body = resp.get_data(as_text=True)
+        self.assertNotIn('/u/p/', body)
+        self.assertNotIn('INSERT INTO', body)
+        error = resp.get_json()['failed'][0]['error']
+        self.assertIn('OperationalError', error)
+        self.assertIn('database is locked', error)
+
 
 class BadInputTests(_BulkCase):
     def test_bad_bodies_are_400(self):

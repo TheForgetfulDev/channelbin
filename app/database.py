@@ -3053,8 +3053,9 @@ class AutoRule(db.Model):
     """A standing intent to record whatever a saved Programs search finds
     (app/auto_rules.py, DESIGN-autoschedule.md §2).
 
-    The criteria ARE the search: `search_params` is the query string SearchState.to_params()
-    writes, re-parsed through SearchState.from_params() at every evaluation and never
+    The criteria ARE the search: `search_params` is the query string
+    SearchState.to_params(explicit=True) writes - fields and standing set spelled out, so a
+    changed default cannot change a rule (dev/changelog/1394) - re-parsed through SearchState.from_params() at every evaluation and never
     string-edited, so the search page is an exact preview of what the rule matches."""
     __tablename__ = 'auto_rules'
     # AUTOINCREMENT for the reason Recording carries it: alert sources name a rule by id
@@ -3161,6 +3162,10 @@ class Tag(db.Model):
 
     patterns = db.relationship('TagPattern', backref='tag', lazy=True,
                                cascade='all, delete-orphan')
+
+
+#: The 4k tag's patterns: the superscript UHD and HDR markers providers put in titles.
+FOUR_K_TAG_PATTERNS = ('ᵁᴴᴰ', 'ᴴᴰᴿ')
 
 
 class TagPattern(db.Model):

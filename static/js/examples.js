@@ -23,14 +23,21 @@
     });
     if (!ok) return;
     hold(btn);
-    // No toast on success: the reloaded page shows the load's progress itself, and a toast
-    // sat on top of exactly that text (dev/changelog/1288).
+    // No toast on success: Get started's progress card shows the load itself, and a toast
+    // sat on top of exactly that (dev/changelog/1288, 1396).
     try {
       await jsonFetch('/api/examples', { method: 'POST' });
-      window.location.reload();
     } catch (err) {
       showToast(err.message, { type: 'error', durationMs: 9000 });
       release(btn);
+      return;
+    }
+    if (typeof window.__examplesStarted !== 'function') { window.location.reload(); return; }
+    try {
+      await window.__examplesStarted();
+    } catch (err) {
+      console.warn('Could not draw the progress card in place; reloading.', err);
+      window.location.reload();
     }
   }
 

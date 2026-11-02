@@ -5,6 +5,57 @@ Notable changes to ChannelBin, newest first. This project follows
 release is tagged `v<version>` in git, and the version the app is running is shown in the
 page footer.
 
+## 0.37.0 - 2026-11-01
+
+Clearer first steps for new users.
+
+**Added**
+
+- Try it with example channels shows the load as it happens. A progress card at the top of Get
+  started follows each step with a progress bar, counts the channels and guide entries as they
+  arrive, and gives the health check's verdict. When it finishes, each line links to what it
+  made.
+- A built-in 4k tag for the UHD and HDR title markers, beside live and new. An upgraded install
+  gets it unless it already has a tag of that name or marker.
+- Add Account shows what each URL normalization mode does, with a before-and-after table, and
+  names the mode Settings currently uses.
+
+**Changed**
+
+- Search Programs (EPG) matches the channel's name by default, as well as the program's title,
+  subtitle and description, so a sport whose channels are named for it is found. Auto-record
+  rules and saved searches now store their search settings, and existing ones keep matching
+  what they matched.
+- The Search page has an About this page and a banner when no account exists yet, and the main
+  menu starts collapsed there. The When, Time of day and Program length controls are clearer,
+  the Channel group filter is now called Group, and Create tag and Create group open in a new
+  tab so the search on screen survives.
+- The Add Account form is wider, with fields side by side on desktop, and its Settings links
+  open in a new tab.
+- Account and tag color presets no longer include red, orange, yellow, green or blue, so a
+  color never reads as an alert. A fresh install's live and new tags are fuchsia and teal.
+- An open About this page panel is as wide as the page's content.
+
+**Fixed**
+
+- A bulk schedule that hits a database error no longer shows the stream URL and login.
+- The support bundle no longer carries your OS user name in home-folder paths, and the group
+  suggestions API no longer returns raw stream URLs.
+- A live preview that ends leads with the provider's answer instead of an ffmpeg exit code.
+- A guide URL that serves an M3U playlist is called a playlist, not a truncated or malformed
+  XMLTV feed.
+- A refused login's note no longer promises another login on an account that has only one.
+- Output feed: a second tune-in while another viewer is watching is no longer killed as it
+  starts. A stream too big for the buffer at the chosen reserve now says so and names the
+  setting to change, instead of blaming the IPTV app.
+- A recording that moves to another group member because its video stopped, because of Switch
+  channel, or because its account was blocked now counts the reconnect wait as downtime.
+- With health data off, the recording page's analysis strip numbers its passes in the order
+  they run.
+- Check now on an auto-record rule is logged as a check, not as the rule being saved.
+- The clock icons on the Search page's Time of day boxes are visible on the dark field.
+- The color picker's dot shows only the custom color, and hides when the box is empty.
+
 ## 0.36.0 - 2026-11-01
 
 Watch your TV Guide in an IPTV app.

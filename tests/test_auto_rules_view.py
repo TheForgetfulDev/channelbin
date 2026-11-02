@@ -51,8 +51,16 @@ class DescribeStateTests(unittest.TestCase):
     def test_the_default_scope_is_listed_but_not_repeated_in_the_summary(self):
         d = describe_state(state('grain=airings&q=cup'), tz=NY, h24=False)
         self.assertEqual(d['lines'][1]['values'][0]['text'],
-                         'Program title, Episode / subtitle, Description')
+                         'Channel name, Program title, Episode / subtitle, Description')
         self.assertEqual(d['summary'], 'cup')
+
+    def test_a_rule_kept_on_the_old_default_says_where_it_searches(self):
+        """A rule migration 108 spelled out on the three program fields is no longer at the
+        default (dev/changelog/1394), so its summary names them rather than reading as if it
+        matched what a new search does."""
+        d = describe_state(state('grain=airings&q=cup&in=epg-title&in=epg-sub&in=epg-desc'),
+                           tz=NY, h24=False)
+        self.assertEqual(d['summary'], 'cup in Program title, Episode / subtitle, Description')
 
     def test_match_any_is_said(self):
         d = describe_state(state('grain=airings&q=cup+race&match=any'), tz=NY, h24=False)
@@ -65,18 +73,18 @@ class DescribeStateTests(unittest.TestCase):
             account_names={3: 'Main'}, channel_names={9: 'NBC East'}, tz=NY, h24=False)
         self.assertEqual(lines(d), [
             ('When', False, [('Next 7 days', False)]),
-            ('Day of week', False, [('Saturday', False), ('Sunday', False)]),
             ('Time of day', False, [('6:00 PM or later', False)]),
+            ('Day of week', False, [('Saturday', False), ('Sunday', False)]),
             ('Program length', False, [('Longer than 2 hours', False)]),
             ('Tag', False, [('live', False)]),
             ('Account', False, [('Main', False)]),
             ('Health', False, [('Good', False)]),
-            ('Channel group', True, [('CW', False)]),
+            ('Group', True, [('CW', False)]),
             ('Status', False, [('In your guide', False)]),
             ('Channel', False, [('NBC East', False)])])
-        self.assertEqual(d['summary'], 'next 7 days, Saturday or Sunday, 6:00 PM or later, '
+        self.assertEqual(d['summary'], 'next 7 days, 6:00 PM or later, Saturday or Sunday, '
                                        'longer than 2 hours, tag live, account Main, '
-                                       'health Good, not channel group CW, in your guide, '
+                                       'health Good, not group CW, in your guide, '
                                        'channel NBC East')
 
     def test_a_value_that_no_longer_exists_is_marked(self):

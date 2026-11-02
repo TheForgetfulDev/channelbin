@@ -3047,14 +3047,18 @@ def bulk_schedule_json():
         if plan['verdict'] == BULK_SKIP or args is None:
             continue
         # Broad on purpose, and logged with its traceback: whatever stops one showing, the
-        # ones already created stay created and this one is named in the response.
+        # ones already created stay created and this one is named in the response. The
+        # response text goes through describe_error(): a database error's own text carries
+        # the INSERT's parameters, the stream URL and its login among them.
         try:
             rec = _create_scheduled_recording(cfg, **args)
         except Exception as exc:
+            from ..auto_rules import describe_error
             db.session.rollback()
             log.exception('Bulk schedule: could not create "%s" (showing %s)',
                           plan.get('name'), plan['epg_id'])
-            failed.append({**bulk_plan_payload(plan), 'error': str(exc) or type(exc).__name__})
+            failed.append({**bulk_plan_payload(plan),
+                           'error': f'The recording could not be saved: {describe_error(exc)}'})
             continue
         created.append({**bulk_plan_payload(plan), 'recording_id': rec.id})
 

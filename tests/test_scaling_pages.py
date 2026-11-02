@@ -1175,6 +1175,10 @@ NOT_ROW_SCALING = {
     'accounts.new_account': (
         'A blank account form. Renders no collection at all - the only variable-length thing '
         'on it is the fixed PRESET_COLORS/NORM_MODES vocabulary, which is a module constant.'),
+    'setup.examples_activity': (
+        "The example channels' progress card: the load's five fixed steps from memory, plus "
+        'one get() each for the account, the group and the tested channel. Nothing on it is '
+        'a list of rows.'),
     'auth.login': (
         'The login form. Renders no collection, and reaches the database for nothing - the '
         'gate reads app.config["AUTH"] and the in-memory lockout table.'),

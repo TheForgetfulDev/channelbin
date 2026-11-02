@@ -226,7 +226,7 @@ code { font-family: var(--font-mono); background: var(--bg3); padding: 1px 5px; 
    (DESIGN.md 3.2). */
 
 /* ── Forms ─────────────────────────────────────────────────────────── */
-.form-card { background: var(--bg2); border: 1px solid var(--border); border-radius: var(--radius); padding: 1.5rem; max-width: 700px; }
+.form-card { background: var(--bg2); border: 1px solid var(--border); border-radius: var(--radius); padding: 1.5rem; max-width: 1200px; }
 .form-group { margin-bottom: 1rem; }
 .form-row { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
 label { display: block; font-size: var(--fs-md); font-weight: 600; margin-bottom: 0.3rem; }
@@ -269,7 +269,9 @@ label { display: block; font-size: var(--fs-md); font-weight: 600; margin-bottom
 .form-actions { display: flex; align-items: center; gap: 0.75rem; margin-top: 1.25rem; }
 .required { color: var(--bad); }
 .tz-label { font-size: var(--fs-xs); font-weight: normal; color: var(--text-muted); }
-input[type="datetime-local"] { color-scheme: dark; }
+/* Every native date/time picker, not only the ones a page remembered to scope: an unscoped
+   time box drew its clock icon black on the dark field (the search page's Time of day). */
+input[type="datetime-local"], input[type="date"], input[type="time"] { color-scheme: dark; }
 textarea.form-control { resize: vertical; }
 
 /* ── Empty state ───────────────────────────────────────────────────── */
@@ -1047,8 +1049,8 @@ body.scroll-locked { position: fixed; left: 0; right: 0; width: 100%; overflow: 
 .pickbar.on { border-color: var(--accent); }
 .pickbar.on .pb-cur { color: var(--accent-text); }
 /* What a page is for (DESIGN.md 3.21, the page_about() macro): one line under the header,
-   closed by default, the text in a panel once opened. Measured rather than free: 76ch is
-   where a line stops being comfortably readable at this size. */
+   closed by default, the text in a panel once opened. The panel spans the content column
+   like the table under it - no max-width (dev/changelog/1395). */
 .page-about { margin-bottom: 2px; }
 .page-about > summary { display: inline-flex; align-items: center; gap: 6px; padding: 5px 0;
   font-size: var(--fs-md); color: var(--text-muted); cursor: pointer; list-style: none; user-select: none; }
@@ -1056,7 +1058,7 @@ body.scroll-locked { position: fixed; left: 0; right: 0; width: 100%; overflow: 
 .page-about > summary:hover { color: var(--accent-text); }
 .page-about .pa-caret { transition: transform .15s; }
 .page-about[open] .pa-caret { transform: rotate(90deg); }
-.page-about-body { font-size: var(--fs-md); color: var(--text-muted); line-height: 1.5; max-width: 76ch;
+.page-about-body { font-size: var(--fs-md); color: var(--text-muted); line-height: 1.5;
   margin: 2px 0 8px; padding: 10px 14px; background: var(--bg1); border: 1px solid var(--border);
   border-radius: var(--radius); }
 .back { display: inline-flex; align-items: center; gap: 6px; font-size: var(--fs-md); color: var(--text-muted); margin-bottom: 14px; }
@@ -3444,7 +3446,8 @@ a.shot-link { display: block; width: fit-content; cursor: zoom-in; }
    so it comes from a fallback that ships no bold face and the browser has nothing
    to synthesize from. Size and -webkit-text-stroke are the two levers that do
    work, so both are used. Do not "tidy" this back to font-weight (16.6). */
-.sec-head .sec-actions .btn .arw, .gs-banner .btn .arw, .gs-acts .btn .arw, .gs-half .btn .arw {
+.sec-head .sec-actions .btn .arw, .gs-banner .btn .arw, .gs-acts .btn .arw, .gs-half .btn .arw,
+.gs-run-step .btn .arw {
   margin-left: 2px; font-size: 1.25em; line-height: 1;
   opacity: 1; -webkit-text-stroke: .6px currentColor;
   /* The glyph sits high in its em box; this drops it onto the text baseline. */
@@ -3553,6 +3556,24 @@ a.shot-link { display: block; width: fit-content; cursor: zoom-in; }
 .gs-try p, .gs-try ul { font-size: var(--fs-md); line-height: 1.55; margin: 6px 0 0; }
 .gs-try ul { padding-left: 18px; }
 .gs-try .gs-acts { margin-top: 10px; }
+/* The example channels' progress card (dev/changelog/1396): a checklist that moves while
+   the load runs and stays as its report. The page scrolls to it when a load starts. */
+.gs-activity { scroll-margin-top: 16px; outline: none; }
+.gs-run-time { font-size: var(--fs-sm); color: var(--text-muted); font-variant-numeric: tabular-nums; }
+.gs-run .hero-progress { margin: 0 0 14px; }
+.gs-run-steps { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 12px; }
+.gs-run-step { display: grid; grid-template-columns: 24px minmax(0, 1fr) auto; gap: 0 12px; align-items: start; }
+.gs-run-mark { width: 24px; height: 24px; border-radius: 999px; display: flex; align-items: center; justify-content: center; color: var(--text-faint); }
+.gs-run-step.done .gs-run-mark { background: var(--ok-soft); color: var(--ok-text); }
+.gs-run-step.problem .gs-run-mark { background: var(--warn-soft); color: var(--warn-text); }
+.gs-run-spin { width: 18px; height: 18px; }
+.gs-run-label { font-size: var(--fs-md); font-weight: 600; line-height: 24px; color: var(--text); }
+.gs-run-step.pending .gs-run-label, .gs-run-step.skipped .gs-run-label { font-weight: 500; color: var(--text-muted); }
+.gs-run-detail { font-size: var(--fs-md); line-height: 1.45; color: var(--text-muted); max-width: 72ch; }
+.gs-run-step.problem .gs-run-detail { color: var(--warn-text); }
+.gs-run-step .btn { align-self: center; }
+.gs-run .gs-acts { margin-top: 14px; }
+.gs-run .gs-run-note { margin-top: 14px; }
 
 /* ── The Get started menu link: first under Setup, louder than its neighbors, and not
    drawn once the four steps are done (base.html, from setup_steps' cached count). No tint
@@ -3860,6 +3881,9 @@ a.shot-link { display: block; width: fit-content; cursor: zoom-in; }
   .gs-b-acts { flex: 1 1 100%; }
   .gs-step { padding: 12px 14px; gap: 0 12px; }
   .gs-pair { grid-template-columns: minmax(0, 1fr); }
+  .gs-activity { scroll-margin-top: calc(var(--topnav-h) + 12px); }
+  .gs-run-step { grid-template-columns: 24px minmax(0, 1fr); }
+  .gs-run-step .btn { grid-column: 2; justify-self: start; margin-top: 6px; }
   .mtile { padding: 9px 11px 9px calc(11px + var(--edge-w)); }
   .mtile .m-v { font-size: var(--fs-2xl); }
 

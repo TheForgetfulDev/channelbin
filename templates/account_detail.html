@@ -417,7 +417,7 @@
       </div>
     </div>
     <div class="card-body" id="acct-logins-body">
-      <p class="card-note">{% if logins %}Recordings, health checks and previews take a seat on the first login with one free. A login the server refuses is skipped for a while, and an alert says so.{% else %}Add another login to run more streams at once or keep a spare.{% endif %}</p>
+      <p class="card-note">{% if logins %}Recordings, health checks and previews take a seat on the first login with one free. {% if logins | length > 1 %}A login the server refuses is skipped for a while, and an alert says so.{% else %}If the server refuses it, an alert says so, and with no other login to take over, captures keep trying it.{% endif %}{% else %}Add another login to run more streams at once or keep a spare.{% endif %}</p>
       <div class="table-scroll">
         <table class="tbl tbl-cards">
           <thead><tr><th>Login</th><th>Seats</th><th>Refused</th><th></th></tr></thead>
@@ -427,7 +427,7 @@
             <td data-label="Login"><strong>{{ lg.name }}</strong><div class="text-faint small"><code>{{ lg.username }}</code></div>{% if lg.shared_with %}<div class="small">Shared with {{ lg.shared_with | join(', ') }}</div>{% endif %}{% if own_login and own_login.same_as == lg.id %}<div class="text-faint small">The account's own login, also used by syncs</div>{% endif %}</td>
             <td data-label="Seats">{{ lg.held }} of {{ lg.max_connections }} in use{% if lg.holders %}<div class="text-faint small">{{ lg.holders }}</div>{% endif %}</td>
             <td data-label="Refused">
-              {% if lg.refused %}{{ m.status_badge('b-fail', 'Yes') }}<div class="small">{{ lg.last_refused_at | local_time }}: {{ lg.last_refused_detail }}</div><div class="text-faint small">Skipped while another login has a free seat.</div>
+              {% if lg.refused %}{{ m.status_badge('b-fail', 'Yes') }}<div class="small">{{ lg.last_refused_at | local_time }}: {{ lg.last_refused_detail }}</div><div class="text-faint small">{% if logins | length > 1 %}Skipped while another login has a free seat.{% else %}Still used: it is this account's only login, so captures keep trying it.{% endif %}</div>
               {% elif lg.last_refused_at %}<span class="text-faint">Not lately</span><div class="text-faint small">last refused {{ lg.last_refused_at | local_time }}</div>
               {% else %}<span class="text-faint">Never</span>
               {% endif %}</td>

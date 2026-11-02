@@ -185,32 +185,32 @@ class GrainScopingTests(_AiringTestCase):
             self.assertEqual(hiding, expect, grain)
         self.assertEqual(DEFAULT_SORT_BY_GRAIN[GRAIN_CHANNELS], 'name')
         self.assertEqual(DEFAULT_SORT_BY_GRAIN[GRAIN_AIRINGS], 'when')
-        # `fields` is a per-grain default too (dev/changelog/860), and each grain's scope is
-        # its OWN primary field: neither grain reaches across into the other's by default.
+        # `fields` is a per-grain default too (dev/changelog/860). The channel grain's is the
+        # name alone; the airing grain's is the program's own text plus the channel's name
+        # (dev/changelog/1394).
         self.assertEqual(default_fields_for(GRAIN_CHANNELS), ('name',))
         self.assertEqual(default_fields_for(GRAIN_AIRINGS),
-                         ('epg-title', 'epg-sub', 'epg-desc'))
+                         ('name', 'epg-title', 'epg-sub', 'epg-desc'))
 
-    def test_the_default_scope_on_this_grain_is_the_programs_own_text(self):
-        """dev/changelog/899. A row on this grain IS a showing, so the three program fields
-        are the whole default: with `name` in it, a typed word dragged in every showing on a
-        channel whose NAME carried it - `BBC News` returning its entire schedule for a word
-        that appears in no program on it. The channel name is one tick away in the Search in
-        pane, and it is what the CHANNEL grain defaults to.
+    def test_the_default_scope_on_this_grain_includes_the_channel_name(self):
+        """dev/changelog/1394, reversing 899. A search for a sport whose channels are named for
+        it found nothing on Search Programs, because the default matched only the program's
+        own text - read as the guide having nothing on. `BBC News` matches on its channel name
+        while none of its showings mention the word, so it is the exact shape the default must
+        now include.
 
         Both directions, because either alone would pass on a broken build: the
-        channel-name-only hit must be absent by default AND present once `name` is ticked
-        on. Both index states, because the FTS and LIKE paths build the scope separately.
+        channel-name-only hit is present by default AND absent once the scope is the three
+        program fields. Both index states, because the FTS and LIKE paths build the scope
+        separately.
         """
         for indexed in (False, True):
             with self.subTest(indexed=indexed):
                 if indexed:
                     rebuild_search_indexes('test')
-                self.assertEqual(self.titles(q='bbc'), [])
+                self.assertEqual(self.titles(q='bbc'), ['Nightly News', 'Wembley Highlights'])
                 self.assertEqual(
-                    self.titles(q='bbc',
-                                fields=default_fields_for(GRAIN_AIRINGS) + ('name',)),
-                    ['Nightly News', 'Wembley Highlights'])
+                    self.titles(q='bbc', fields=('epg-title', 'epg-sub', 'epg-desc')), [])
 
     def test_an_out_of_grain_sort_is_a_400_but_an_out_of_grain_filter_is_ignored(self):
         """The asymmetry is deliberate and is what makes a parked chip survive a reload
@@ -1189,7 +1189,8 @@ class ApiTests(_AiringTestCase):
         self.assertIn('when', airings['sorts'])
         # The scope the page opens on, which is where the grain's default reaches the client
         # at all - `channel-search.js::defaultFieldsFor` reads exactly this key.
-        self.assertEqual(airings['default_fields'], ['epg-title', 'epg-sub', 'epg-desc'])
+        self.assertEqual(airings['default_fields'],
+                         ['name', 'epg-title', 'epg-sub', 'epg-desc'])
         # The channel grain's own keys stay where every existing caller reads them.
         self.assertEqual(payload['default_sort'], 'name')
         self.assertEqual(payload['by_grain']['channels']['default_fields'], ['name'])

@@ -77,6 +77,7 @@ from .channel_groups import guide_scope_channel_ids, guide_scope_group_member_id
 from .duplicate_streams import effective_health, in_any_group_expr  # noqa: F401 - re-exported: the search's callers read them here
 from .database import (Account, AccountSyncLog, Channel, ChannelGroup,
                        ChannelGroupMember, EPGEntry, Tag, SYNC_LOG_IMPORTED, SYNC_LOG_SKIPPED)
+from .fmt_utils import lower_first
 from .search_index import (AIRING_PROBE_MAX_ROWS, SEARCH_INDEX_CHANNELS, SEARCH_INDEX_NAMES,
                            SEARCH_INDEX_PROGRAMS, TRIGRAM_MIN_CHARS,
                            airing_narrowing_channel_ids, airing_probe_count, fts_match_term,
@@ -231,10 +232,13 @@ def field_examples() -> dict:
 #: row IS a channel, so the name is the whole default: adding `epg-title` there made a typed
 #: word match channels whose only connection to it was a program on tonight, which reads as
 #: the search being wrong rather than as a wider net. On the airing grain a row IS a program,
-#: so all three program fields lead and the channel's name is one tick away in the scope pane.
+#: so all three program fields lead - and the channel's name joins them, because a search for
+#: a sport whose channels are named for it found nothing when the name was left out, which
+#: read as the guide having nothing on (dev/changelog/1394, reversing 899). A stored rule
+#: spells its fields out (`to_params(explicit=True)`), so moving this never moves a rule.
 DEFAULT_FIELDS_BY_GRAIN = {
     GRAIN_CHANNELS: ('name',),
-    GRAIN_AIRINGS: ('epg-title', 'epg-sub', 'epg-desc'),
+    GRAIN_AIRINGS: ('name', 'epg-title', 'epg-sub', 'epg-desc'),
 }
 #: The channel grain's, under the name every existing caller already imports.
 DEFAULT_FIELDS = DEFAULT_FIELDS_BY_GRAIN[GRAIN_CHANNELS]
@@ -335,6 +339,16 @@ DIMENSIONS = (
                    '"any of these", so that is not a conflict.\n\n'
                    'There is deliberately no default window. With nothing picked you get '
                    'every future showing, earliest first.'),
+    # Directly under When, so the rail's two ranges - When's date and time range and this
+    # clock time range - sit side by side and read as the two different things they are
+    # (dev/changelog/1393).
+    Dimension('tod', 'Time of day', multi=True, grain=GRAIN_AIRINGS,
+              help='The clock time a showing STARTS at, in the display timezone, on any '
+                   'day - it follows the clock across a daylight saving change, so 7 PM is '
+                   '7 PM on both sides of it.\n\n'
+                   'Both ends are included. An end earlier than the start runs past '
+                   'midnight: 10 PM to 2 AM. You do not have to set both ends: set only '
+                   '"from" for "at or after", or only "to" for "at or before".'),
     Dimension('dow', 'Day of week', multi=True, grain=GRAIN_AIRINGS,
               help='The day a showing STARTS on, in the display timezone. A showing that '
                    'begins at 11:30 PM Saturday and runs past midnight is a Saturday '
@@ -343,33 +357,26 @@ DIMENSIONS = (
                    'next Sunday. Pick Saturday and Sunday for weekends, and add Time of day '
                    'for "weekend evenings".\n\n'
                    'A day the guide does not reach yet counts zero.'),
-    Dimension('tod', 'Time of day', multi=True, grain=GRAIN_AIRINGS,
-              help='The clock time a showing STARTS at, in the display timezone, on any '
-                   'day - it follows the clock across a daylight saving change, so 7 PM is '
-                   '7 PM on both sides of it.\n\n'
-                   'Both ends are included. An end earlier than the start runs past '
-                   'midnight: 10 PM to 2 AM. Either end alone is a real filter: set only '
-                   '"from" for "at or after", or only "to" for "at or before".'),
     Dimension('duration', 'Program length', multi=True, grain=GRAIN_AIRINGS,
               help='How long a showing runs. Only on the Airings grain - a channel has no '
                    'length of its own, only a showing does.\n\n'
-                   'Either bound alone is a real filter: set only "at least" for "longer '
+                   'You do not have to set both: set only "at least" for "longer '
                    'than X", or only "at most" for "shorter than X".'),
     Dimension('tag', 'Tag', multi=True,
               help="A label of yours, not the provider's, so it survives a sync. A tag is "
                    "a set of literal patterns, not a column: a channel carries the tag when "
                    "its name, or something it is airing, contains one of that tag's "
                    "patterns.\n\n"
-                   'ChannelBin starts you with two, live and new. They find the small raised '
-                   '"Live" and "New" marks some providers put in channel names and program '
-                   'titles. Change or delete them on the Tags page.\n\n'
+                   'ChannelBin starts you with three: live, new and 4k. They find the small '
+                   'raised "Live", "New", "UHD" and "HDR" marks some providers put in channel '
+                   'names and program titles. Change or delete them on the Tags page.\n\n'
                    'On Search Channels "something it is airing" means the program on RIGHT NOW - '
                    'the one in the Now airing column - so the tag beside a row always '
                    'describes what that row is showing. On Search Programs (EPG) each showing '
                    'answers for itself.'),
     Dimension('acct', 'Account'),
     Dimension('health', 'Health'),
-    Dimension('group', 'Channel group', multi=True,
+    Dimension('group', 'Group', multi=True,
               help='A named set of channels carrying the same feed, so a recording can '
                    'fail over between them. Exclude "Any group" to find every channel '
                    'that is in no group at all.'),
@@ -1093,21 +1100,26 @@ class SearchState:
             rule=rule_context_value(one('rule')),
         )
 
-    def to_params(self) -> list:
+    def to_params(self, explicit: bool = False) -> list:
         """(key, value) pairs, repeated for multi-valued keys - what a link into this search
         is built from. Round-trips through from_params(); anything at its default is left
-        out, so a plain link stays short."""
+        out, so a plain link stays short.
+
+        `explicit` writes the search fields and the standing set even at their defaults. A
+        STORED search (an auto-record rule) is spelled this way: left out, they would mean
+        "whatever the default is on the day the rule runs", so moving a grain's default would
+        quietly change what every rule records (dev/changelog/1394)."""
         out = []
         if self.q:
             out.append(('q', self.q))
-        if tuple(self.fields) != default_fields_for(self.grain):
+        if explicit or tuple(self.fields) != default_fields_for(self.grain):
             out.extend(('in', k) for k in self.fields)
         if not self.match_all:
             out.append(('match', 'any'))
         for f in self.filters:
             out.extend((f'f.{f.key}', v) for v in f.values)
             out.extend((f'x.{f.key}', v) for v in f.ex)
-        if self.standing != default_standing_for(self.grain):
+        if explicit or self.standing != default_standing_for(self.grain):
             # An empty standing set still has to be written, or from_params reads its absence
             # as "use the defaults" and turns two options back on. One empty value says
             # "present, and none of them".
@@ -1154,10 +1166,6 @@ def rule_context_value(value):
 # ---------------------------------------------------------------------------
 # A search in words
 # ---------------------------------------------------------------------------
-
-def _lower_first(text: str) -> str:
-    return text[:1].lower() + text[1:]
-
 
 def _plural_unit(n: int, unit: str) -> str:
     return f'{n} {unit[:-1] if n == 1 else unit}'
@@ -1267,20 +1275,20 @@ def describe_state(state, *, account_names=None, channel_names=None, gone=None, 
             if dim.key in ('other', 'when', 'duration'):
                 # Their words are phrases ("In your guide", "Next 7 days") that read
                 # mid-sentence once lowered; a day or a date stays as it is.
-                said = ' or '.join(t if v.startswith(WHEN_CUSTOM_PREFIX) else _lower_first(t)
+                said = ' or '.join(t if v.startswith(WHEN_CUSTOM_PREFIX) else lower_first(t)
                                    for v, t in texts)
                 noun = ''
             elif dim.key in ('dow', 'tod'):
                 noun = ''
             else:
-                noun = f'{_lower_first(dim.label)} '
+                noun = f'{lower_first(dim.label)} '
             summary.append(f'{"not " if neg else ""}{noun}{said}')
     defaults = default_standing_for(state.grain)
     for opt in standing_options_for(state.grain):
         on = opt.key in state.standing
         if on != (opt.key in defaults):
             line(opt.label, [(None, 'On' if on else 'Off')])
-            summary.append(f'{_lower_first(opt.label)} {"on" if on else "off"}')
+            summary.append(f'{lower_first(opt.label)} {"on" if on else "off"}')
     if not lines:
         everything = 'Every upcoming showing' if state.grain == GRAIN_AIRINGS else 'Every channel'
         line('Search', [(None, everything)])

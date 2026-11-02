@@ -1144,11 +1144,37 @@ class PresetColorTests(unittest.TestCase):
             gap = abs(self._hue(a) - self._hue(b))
             self.assertGreaterEqual(min(gap, 360 - gap), 15, f'{la} {a} and {lb} {b}')
 
-    def test_orange_sits_between_red_and_yellow(self):
+    def test_no_vivid_swatch_shares_a_hue_with_a_status_color(self):
+        """An account or tag color sits beside status badges and alerts everywhere, so a
+        red, orange, yellow, green or blue swatch reads as a warning or an OK. A muted
+        swatch (dark, or nearly gray) reads as brown or gray whatever its hue."""
         from app.ui_constants import PRESET_COLORS
-        hue = {label: self._hue(h) for h, label in PRESET_COLORS}
-        self.assertLess(hue['Red'], hue['Orange'])
-        self.assertLess(hue['Orange'], hue['Yellow'])
+        with open(os.path.join(REPO, 'static', 'css', 'style.css'), encoding='utf-8') as f:
+            css = f.read()
+        status = {}
+        for token in ('ok', 'bad', 'warn', 'accent', 'band-good', 'band-fair'):
+            status[token] = re.search(rf'--{token}:\s*(#[0-9a-fA-F]{{6}})', css).group(1)
+        for hexval, label in PRESET_COLORS:
+            r, g, b = (int(hexval[i:i + 2], 16) / 255 for i in (1, 3, 5))
+            _h, sat, val = colorsys.rgb_to_hsv(r, g, b)
+            if sat < 0.2 or val < 0.6:
+                continue
+            for token, tok_hex in status.items():
+                gap = abs(self._hue(hexval) - self._hue(tok_hex))
+                self.assertGreaterEqual(min(gap, 360 - gap), 20,
+                                        f'{label} {hexval} reads as --{token} {tok_hex}')
+
+    def test_the_built_in_tags_are_not_status_colored(self):
+        """The seeded live and new tags shipped red and green."""
+        from app.ui_constants import PRESET_COLORS
+        with open(os.path.join(REPO, 'app', '__init__.py'), encoding='utf-8') as f:
+            src = f.read()
+        seed_fn = src[src.index('def _seed_default_tags'):]
+        seed_fn = seed_fn[:seed_fn.index('\ndef ')]
+        self.assertNotIn('#f85149', seed_fn)
+        self.assertNotIn('#3fb950', seed_fn)
+        for label in re.findall(r"preset_color\('(\w+)'\)", seed_fn):
+            self.assertIn(label, [name for _h, name in PRESET_COLORS])
 
 
 class AddFirstAccountTests(unittest.TestCase):
@@ -1199,9 +1225,52 @@ class AddFirstAccountTests(unittest.TestCase):
     def test_the_form_explains_epg_and_what_can_be_left_alone(self):
         html = self._form()
         self.assertIn('The EPG is the program guide', html)
-        self.assertIn('URL Normalization <span class="form-hint-inline">(most people leave this as it is)', html)
+        self.assertIn('URL Normalization <span class="form-hint-inline">(change stream format)', html)
         self.assertNotIn('nothing is fetched until you sync it', html,
                          'the first sync is scheduled a minute after the add')
+
+    def test_the_normalization_field_names_the_global_default_and_shows_every_mode(self):
+        """The "Use global default" choice said nothing about which mode that is, and the
+        only example appeared after picking a mode."""
+        html = self._form()
+        self.assertIn('<option value=""', html)
+        self.assertRegex(html, r'Use global default \((Disabled|MPEG-TS without live|'
+                               r'MPEG-TS with live|HLS)\)')
+        flat = ' '.join(html.split())
+        for label, before, after in (
+                ('MPEG-TS without live', 'http://example.com/live/AAA/BBB/1.m3u8',
+                 'http://example.com/AAA/BBB/1'),
+                ('MPEG-TS with live', 'http://example.com/AAA/BBB/1',
+                 'http://example.com/live/AAA/BBB/1.ts'),
+                ('HLS', 'http://example.com/AAA/BBB/1',
+                 'http://example.com/live/AAA/BBB/1.m3u8')):
+            self.assertIn(f'<td data-label="Mode">{label}</td> '
+                          f'<td data-label="Before"><code>{before}</code></td> '
+                          f'<td data-label="After"><code>{after}</code></td>', flat)
+
+    def test_the_normalization_table_turns_to_cards_in_a_narrow_column(self):
+        """dev/docs/BUGS.md 2026-11-01 05:44:42 PM. Its URL columns cannot wrap, and at 961px
+        the form is 10px too narrow for them. The width itself is the browser suite's
+        961px check; this holds the opt-in that answers it."""
+        html = self._form()
+        table = re.search(r'<div class="table-scroll norm-table">\s*<table class="([^"]*)"', html)
+        self.assertIsNotNone(table)
+        self.assertIn('cards-under-900', table.group(1).split())
+
+    def test_the_global_default_label_follows_the_setting(self):
+        from app.routes.accounts import _norm_options
+        self.assertEqual(_norm_options({'sync': {'url_normalization': 'hls'}})[0],
+                         ('', 'Use global default (HLS)', ''))
+        self.assertEqual(_norm_options({})[0][1], 'Use global default (Disabled)')
+
+    def test_settings_links_open_in_a_new_tab(self):
+        """Following one from a half-filled form threw away everything typed."""
+        html = self._form()
+        links = re.findall(r'<a href="/settings[^"]*"[^>]*>', html)
+        self.assertEqual(len(links), 3)
+        for link in links:
+            self.assertIn('target="_blank"', link)
+            self.assertIn('rel="noopener"', link)
 
     def test_an_xtream_account_needs_a_password_to_be_added(self):
         """dev/docs/BUGS.md 2026-10-22 10:19:01 PM."""

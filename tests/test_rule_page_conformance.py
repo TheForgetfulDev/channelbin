@@ -534,7 +534,7 @@ class CheckNowTests(_Base):
         with patch('app.auto_rules.evaluate_now', return_value={'queued': False, 'scheduled': 2}) as ev:
             resp = self.client.post(f'/api/auto-rules/{rid}/check')
         self.assertEqual(resp.status_code, 200)
-        ev.assert_called_once_with(rid)
+        ev.assert_called_once_with(rid, trigger=auto_rules.TRIGGER_CHECK)
         body = resp.get_json()
         self.assertTrue(body['success'])
         self.assertEqual(body['evaluation'], {'queued': False, 'scheduled': 2})

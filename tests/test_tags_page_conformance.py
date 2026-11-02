@@ -286,7 +286,8 @@ class ApiTests(_Base):
 
     def test_a_missing_colour_falls_back_to_the_default(self):
         self.client.post('/api/tags', json={'name': 'live', 'patterns': ['X']})
-        self.assertEqual(Tag.query.one().color, '#58a6ff')
+        from app.ui_constants import DEFAULT_COLOR
+        self.assertEqual(Tag.query.one().color, DEFAULT_COLOR)
 
     def test_update_replaces_the_pattern_set(self):
         tag = self.make_tag(patterns=('LIVE', 'OLD'))

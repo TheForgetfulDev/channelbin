@@ -280,7 +280,27 @@ def counted(n, one, many=None) -> str:
 
 def iso_or_none(value):
     """`value.isoformat()`, or None for a None value - the JSON payload spelling of an
-    optional datetime. app/channel_search_rows.py keeps its own second-precision variant
-    for the row payload, and app/health_score.py its str() fallback for a breakdown that
-    may hold a non-datetime; both say so at the definition."""
+    optional datetime. iso_seconds_or_none() below is the second-precision form;
+    app/health_score.py keeps its own str() fallback for a breakdown that may hold a
+    non-datetime, and says so at the definition."""
     return value.isoformat() if value else None
+
+
+def iso_seconds_or_none(value):
+    """iso_or_none() with the microseconds dropped - for a payload where the same instant
+    must read the same whether it came from the importer or from a stored row (the search
+    row payload, a rule's retrack event, a schedule comparison). None for None."""
+    return value.strftime('%Y-%m-%dT%H:%M:%S') if value else None
+
+
+def first_line(text, limit, fallback='no reason given'):
+    """The first line of a stored error, cut to `limit` characters with an ellipsis, or
+    `fallback` for empty text - what a one-line status says about a failure."""
+    lines = (text or '').strip().splitlines()
+    line = lines[0] if lines else fallback
+    return line if len(line) <= limit else line[:limit - 3].rstrip() + '...'
+
+
+def lower_first(text):
+    """A label lowered for use mid-sentence: 'Channel name' -> 'channel name'."""
+    return text[:1].lower() + text[1:]

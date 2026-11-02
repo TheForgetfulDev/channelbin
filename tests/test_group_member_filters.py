@@ -71,14 +71,12 @@ class MemberTagPayloadTests(unittest.TestCase):
         self.app = self.t.app
         self.client = self.app.test_client()
         with self.app.app_context():
-            tag = Tag(name='4k', color='#58a6ff')
-            db.session.add(tag)
-            db.session.flush()
-            # Two patterns on one tag, matching the live "4k" tag: the tag is carried when
-            # EITHER appears, which is the OR the filter bar cannot express between values
-            # and does not need to.
-            db.session.add(TagPattern(tag_id=tag.id, pattern='ᵁᴴᴰ'))
-            db.session.add(TagPattern(tag_id=tag.id, pattern='ᴴᴰᴿ'))
+            # The built-in 4k tag (dev/changelog/1395) has two patterns: the tag is carried
+            # when EITHER appears, which is the OR the filter bar cannot express between
+            # values and does not need to.
+            tag = Tag.query.filter_by(name='4k').one()
+            self.assertEqual(sorted(p.pattern for p in tag.patterns), ['ᴴᴰᴿ', 'ᵁᴴᴰ'])
+            tag.color = '#58a6ff'
             other = Tag(name='Live', color='#3fb950')
             db.session.add(other)
             db.session.flush()

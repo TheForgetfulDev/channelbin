@@ -303,6 +303,15 @@ def airing_search_url(query='', fields=None, replace_rec=None, **state_kwargs):
     return f'{base}?{params}' if params else base
 
 
+def account_channels_url(account_id):
+    """A link into Search Channels showing one account's channels, spelled once for
+    airing_search_url's reason."""
+    from ..channel_search import DimensionFilter, SearchState
+
+    state = SearchState(filters=(DimensionFilter('acct', (str(account_id),), ()),))
+    return f"{url_for('channels.channel_browser')}?{urlencode(state.to_params())}"
+
+
 def _replace_rec_context():
     """The recording a `replace_rec=` visit came here to replace, or None.
 
@@ -405,6 +414,9 @@ def _channel_search_page_context():
     intro_pref = db.session.get(UserPref, GROUP_INTRO_SEEN_PREF)
 
     return {
+        # Zero accounts is the one reason an empty search is not the search's fault, so the
+        # page says so above the box rather than leaving an empty list to explain itself.
+        'has_accounts': db.session.query(Account.id).first() is not None,
         'window_label': format_window_label(cfg.get('channel_testing', {})),
         'group_intro_seen_version': _pref(intro_pref) or 0,
         'missing_count': missing_count,

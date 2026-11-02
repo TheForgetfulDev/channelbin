@@ -26,7 +26,8 @@ By default account and channel names are replaced with stable pseudonyms - and a
 names are additionally swept out of every other string in the bundle, because ~20 alert
 types title themselves f'{account.name}: ...'. A user who does not consider that
 identity sensitive can opt in to real names (include_names=True); meta.json always
-states which mode produced the bundle and what the residual limits are.
+states which mode produced the bundle and what the residual limits are. The OS username
+in a home-directory path is swept in both modes (dev/changelog/1397).
 
 How much a table ships is decided by what its size tracks (dev/changelog/841). A table
 that grows with the user's own activity ships whole - every row of it is something that
@@ -236,6 +237,19 @@ def _json_value(value):
     return value
 
 
+# The user's name in a home-directory path: `/home/<name>` on Linux, `/Users/<name>` on
+# macOS. An install under a home directory carries it into config.yaml's paths, dvr.log and
+# every traceback, and it is as much the user's identity as an account name is
+# (DESIGN-secrets.md §7, dev/changelog/1397). Only the one path segment goes, so the path
+# still says where a file lives. Unanchored on purpose: a home under /srv/home is a home
+# too, and sweeping a folder that merely happens to be called `home` costs one path segment.
+# A container's /config, /dvr and /app have no home segment, so the sweep finds nothing
+# there. `<` cannot start a name, so the pseudonym is never matched again.
+HOME_USER_PSEUDONYM = '<user>'
+_HOME_DIR_RE = re.compile(r'(/home|/Users)/(?!' + re.escape(HOME_USER_PSEUDONYM)
+                          + r')([^/\s\'"<>()\[\]:,;]+)')
+
+
 class _Sanitizer:
     """The one text transform every string in the bundle passes through: URL redaction,
     plus - unless the user opted into real names - substitution of every account name
@@ -265,6 +279,7 @@ class _Sanitizer:
         self.include_names = include_names
         self.swept = 0
         self.skipped_short = 0
+        self.home_dirs_swept = 0
         self._pseudonyms = {}
         pairs = []
         for acct in accounts:
@@ -286,10 +301,18 @@ class _Sanitizer:
             acct.id, f'account {acct.id}')
 
     def text(self, value):
-        """Redact URLs, then sweep account names. Safe to run twice: both halves are
-        idempotent, so the belt-and-braces pass over serialized output is a no-op."""
+        """Redact URLs, sweep home-directory usernames, then sweep account names. Safe to
+        run twice: every step is idempotent, so the belt-and-braces pass over serialized
+        output is a no-op.
+
+        The home-directory sweep runs in both modes. The names opt-in is for the provider's
+        identity, which can matter to a diagnosis; the OS username never does."""
         out = redact_urls_in_text(value)
-        if self.include_names or not out:
+        if not out:
+            return out
+        out, count = _HOME_DIR_RE.subn(r'\1/' + HOME_USER_PSEUDONYM, out)
+        self.home_dirs_swept += count
+        if self.include_names:
             return out
         for pattern, pseudo in self._pairs:
             out, count = pattern.subn(lambda m, p=pseudo: p, out)
@@ -676,11 +699,18 @@ def _redaction_disclosure(sanitizer):
     pseudonymized rather than empty, and a reader who trusts the sweep needs to know
     where it stops.
     """
+    home = {
+        'home_directory_usernames_swept': sanitizer.home_dirs_swept,
+        'home_directory_note': (
+            f'The user name in every /home/<name> or /Users/<name> path is replaced with '
+            f'{HOME_USER_PSEUDONYM}, in both modes. The rest of each path is kept.'),
+    }
     if sanitizer.include_names:
         return {
             'mode': 'names included at the user\'s request',
             'note': ('Real account and channel names are present in this bundle because '
                      'the user explicitly opted in. Every URL is still redacted.'),
+            **home,
         }
     return {
         'mode': 'names pseudonymized',
@@ -697,6 +727,7 @@ def _redaction_disclosure(sanitizer):
             'a substring sweep would corrupt the text it was meant to protect. A channel '
             'or group name the user typed into a recording title can therefore still '
             'appear here.'),
+        **home,
     }
 
 

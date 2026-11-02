@@ -14,7 +14,21 @@ import re
 import unittest
 from datetime import datetime
 
-from app.fmt_utils import counted, iso_or_none, join_labels, plural
+from app.fmt_utils import (counted, first_line, iso_or_none, iso_seconds_or_none,
+                           join_labels, lower_first, plural)
+
+#: The helpers a module used to write for itself. Any `def` of one of these names under app/
+#: is a second spelling (dev/changelog/1402: four more had grown in a month after the first
+#: sweep, two of them byte for byte). app/health_score.py's _iso is the one marked variant.
+_LOCAL_COPIES = ('def _plural(', 'def _iso(', 'def _first_line(', 'def _lower_first(')
+_MARKED_VARIANTS = {('app/health_score.py', 'def _iso(')}
+
+
+def _app_files():
+    for dirpath, _dirs, files in os.walk(os.path.join(ROOT, 'app')):
+        for name in files:
+            if name.endswith('.py') and name != 'fmt_utils.py':
+                yield os.path.relpath(os.path.join(dirpath, name), ROOT)
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -57,9 +71,28 @@ class PluralTests(unittest.TestCase):
         self.assertEqual(counted(1234, 'program'), '1,234 programs')
         self.assertEqual(counted(2, 'has', 'have'), '2 have')
 
-    def test_no_module_defines_its_own_plural_any_more(self):
-        for rel in ('app/readiness.py', 'app/routes/channels.py'):
-            self.assertNotIn('def _plural(', _read(rel), rel)
+    def test_no_module_defines_its_own_copy_of_a_shared_helper(self):
+        """Whole-tree, not two named files: auto_rules_view._plural, auto_rules._iso,
+        routes/guide._iso, examples._first_line and setup_steps._first_line all passed the
+        two-file check this replaced."""
+        bad = [f'{rel}: {needle}' for rel in _app_files() for needle in _LOCAL_COPIES
+               if needle in _read(rel) and (rel, needle) not in _MARKED_VARIANTS]
+        self.assertEqual(bad, [], 'use the fmt_utils helper')
+
+
+class FirstLineTests(unittest.TestCase):
+    def test_first_line_cut_and_fallback(self):
+        self.assertEqual(first_line('Boom\nmore', 40), 'Boom')
+        self.assertEqual(first_line('  \n', 40), 'no reason given')
+        self.assertEqual(first_line(None, 40, fallback='-'), '-')
+        self.assertEqual(first_line('a' * 50, 10), 'aaaaaaa...')
+
+
+class LowerFirstTests(unittest.TestCase):
+    def test_only_the_first_character_moves(self):
+        self.assertEqual(lower_first('Channel name'), 'channel name')
+        self.assertEqual(lower_first('EPG id'), 'ePG id')
+        self.assertEqual(lower_first(''), '')
 
 
 class IsoOrNoneTests(unittest.TestCase):
@@ -67,10 +100,14 @@ class IsoOrNoneTests(unittest.TestCase):
         self.assertEqual(iso_or_none(datetime(2026, 10, 20, 9, 5, 1)), '2026-10-20T09:05:01')
         self.assertIsNone(iso_or_none(None))
 
+    def test_the_seconds_form_drops_microseconds(self):
+        self.assertEqual(iso_seconds_or_none(datetime(2026, 10, 20, 9, 5, 1, 123456)),
+                         '2026-10-20T09:05:01')
+        self.assertIsNone(iso_seconds_or_none(None))
+
     def test_the_inline_spelling_is_gone_from_the_payload_builders(self):
-        """The two documented variants (channel_search_rows drops microseconds,
-        health_score accepts a non-datetime) stay and are marked at the definition;
-        everything else uses the one helper."""
+        """The one documented variant (health_score accepts a non-datetime) stays and is
+        marked at the definition; everything else uses one of the two helpers."""
         pattern = re.compile(r'(\w[\w.]*)\.isoformat\(\) if \1 else None')
         bad = []
         for dirpath, _dirs, files in os.walk(os.path.join(ROOT, 'app')):
@@ -82,7 +119,7 @@ class IsoOrNoneTests(unittest.TestCase):
                     bad.append(f'{rel}: {m.group(0)}')
         self.assertEqual(bad, [], 'use fmt_utils.iso_or_none()')
         self.assertIn('duplicated from app/fmt_utils.py::iso_or_none',
-                      _read('app/channel_search_rows.py'))
+                      _read('app/health_score.py'))
         self.assertIn('duplicated from app/fmt_utils.py::iso_or_none',
                       _read('app/health_score.py'))
 
