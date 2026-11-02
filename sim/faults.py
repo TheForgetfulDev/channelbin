@@ -788,6 +788,18 @@ def _answer_auth_as_playlist(provider, ask, f):
             'application/octet-stream')
 
 
+# Another provider's public channels, the shape account 2's xmltv.php answered with on
+# 2026-09-26: a playlist, not this panel's own and not a guide.
+_FOREIGN_PLAYLIST = ('#EXTM3U\n'
+                     + ''.join(f'#EXTINF:-1 tvg-id="public{i}" group-title="Public",Public {i}\n'
+                               f'https://public-streams.example/live/{i}/index.m3u8\n'
+                               for i in range(1, 41))).encode('ascii')
+
+
+def _answer_guide_as_playlist(provider, ask, f):
+    return (200, _FOREIGN_PLAYLIST, 'audio/x-mpegurl')
+
+
 def _answer_user_agent(provider, ask, f):
     s = f.params['status']
     return (s, nginx_page(s, _REASONS.get(s, 'Forbidden')), _HTML)
@@ -1006,6 +1018,12 @@ _KINDS = (
           'BUGS.md 2026-08-09 12:08 PM names it as a case, not a sighting',
           'gzip that stops halfway, sent as a file or as Content-Encoding',
           {'delivery': ('file', _choice('file', 'encoding'))}, apply=_bytes_gzip_corrupt),
+    _kind('guide_as_playlist', SCOPE_PANEL, LAYER_ANSWER, (EP_GUIDE,), OBSERVED,
+          'dev/changelog/1139, dev/changelog/1397, BUGS.md 2026-11-01; account 2\'s xmltv.php '
+          'answered a 42 KB #EXTM3U playlist of another provider\'s public streams on '
+          '2026-09-26, fetched from the dev box',
+          'the guide URL answers with an M3U playlist instead of XMLTV',
+          apply=_answer_guide_as_playlist),
     _kind('xmltv_truncated', SCOPE_PANEL, LAYER_BYTES, (EP_GUIDE,), REPRODUCED,
           'dev/changelog/719, BUGS.md 2026-08-17 08:02 PM; built from a synthetic cut, the real '
           'cause is the truncated chunked body',

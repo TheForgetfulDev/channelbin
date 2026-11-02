@@ -578,6 +578,9 @@ class ReadinessReportTests(_BundleTestCase):
 
         def body(text):
             return [line for line in text.splitlines() if not line.startswith('Generated ')]
+        # The report text itself, through the one sanitizer every bundle file passes - which
+        # takes the username out of a home-directory path like the ffmpeg one it names.
+        expected = sb._Sanitizer([], include_names=True).text(expected)
         self.assertEqual(body(shipped), body(expected))
 
     def test_building_a_bundle_never_runs_an_ondemand_check(self):
@@ -939,6 +942,60 @@ class NameSanitizationTests(_BundleTestCase):
 
         content = _all_decompressed_content(sb.build_support_bundle(include_names=True))
         self.assertNotIn(b'opt-in-probe-host.test', content)
+
+
+class HomeDirectorySweepTests(_BundleTestCase):
+    """dev/docs/BUGS.md 2026-11-01 - the bundle pseudonymized account names on the ground
+    that they carry identity and still shipped the OS username verbatim through every
+    /home/<user> path in config.yaml, dvr.log and tracebacks (DESIGN-secrets.md §7)."""
+
+    USER = 'zephyrowner'
+
+    def _write_log(self):
+        with open(self.log_path, 'w') as fh:
+            fh.write('2026-11-01 09:00:00 ERROR [app.recorder] boom\n'
+                     'Traceback (most recent call last):\n'
+                     f'  File "/home/{self.USER}/channelbin/app/recorder.py", line 12, in x\n'
+                     'OSError: [Errno 2] No such file or directory: '
+                     f"'/Users/{self.USER}/dvr/show.ts'\n"
+                     '2026-11-01 09:00:01 INFO [app.recorder] wrote /dvr/show.ts and '
+                     'read /config/config.yaml\n')
+
+    def _bundle(self, include_names=False):
+        self.set_config({'ffmpeg': {'path': f'/home/{self.USER}/opt/ffmpeg-7.1/bin/ffmpeg'}})
+        self._write_log()
+        return sb.build_support_bundle(include_names=include_names)
+
+    def test_the_username_in_a_home_path_never_ships(self):
+        for include_names in (False, True):
+            with self.subTest(include_names=include_names):
+                content = _all_decompressed_content(self._bundle(include_names))
+                self.assertNotIn(self.USER.encode(), content)
+
+    def test_the_rest_of_the_path_survives(self):
+        zf = _unzip(self._bundle())
+        config = json.loads(zf.read('config.yaml'))
+        self.assertEqual(config['ffmpeg']['path'], '/home/<user>/opt/ffmpeg-7.1/bin/ffmpeg')
+        tail = zf.read('dvr.log').decode()
+        self.assertIn('File "/home/<user>/channelbin/app/recorder.py", line 12', tail)
+        self.assertIn("'/Users/<user>/dvr/show.ts'", tail)
+
+    def test_container_paths_are_left_alone(self):
+        tail = _unzip(self._bundle()).read('dvr.log').decode()
+        self.assertIn('wrote /dvr/show.ts and read /config/config.yaml', tail)
+
+    def test_meta_counts_the_sweep_in_both_modes(self):
+        for include_names in (False, True):
+            with self.subTest(include_names=include_names):
+                meta = json.loads(_unzip(self._bundle(include_names)).read('meta.json'))
+                self.assertGreaterEqual(meta['redactions']['home_directory_usernames_swept'], 3)
+                self.assertIn('<user>', meta['redactions']['home_directory_note'])
+
+    def test_the_sweep_is_idempotent(self):
+        s = sb._Sanitizer([], include_names=False)
+        once = s.text(f'/home/{self.USER}/x')
+        self.assertEqual(s.text(once), once)
+        self.assertEqual(s.home_dirs_swept, 1)
 
 
 class PartialFailureTests(_BundleTestCase):

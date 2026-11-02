@@ -192,6 +192,67 @@ class ConnectTimeoutTests(unittest.TestCase):
         self.assertFalse(os.path.exists(d))
 
 
+# ffmpeg 7.1's own lines for a refused stream request (app/proc_utils.py::stderr_cause and
+# app/account_links.py::CREDENTIAL_REFUSAL_MARKERS carry the measurements).
+_STDERR_405 = ('[http @ 0x55d0] HTTP error 405 Method Not Allowed\n'
+               '[in#0 @ 0x55d1] Error opening input: Server returned 4XX Client Error, '
+               'but not one of 40{0,1,3,4}')
+_STDERR_403 = ('[http @ 0x55d0] HTTP error 403 Forbidden\n'
+               '[in#0 @ 0x55d1] Error opening input: Server returned 403 Forbidden '
+               '(access denied)')
+
+
+class StopDetailTests(unittest.TestCase):
+    """A preview that ends names the provider's answer before ffmpeg's exit code and log
+    (dev/changelog/1397): the user read "ffmpeg exited with code 8" over a raw log and had
+    to find the HTTP 405 in it themselves."""
+
+    class _Exited:
+        def __init__(self, rc):
+            self.rc = rc
+
+        def poll(self):
+            return self.rc
+
+    def _ended(self, stderr, rc=8):
+        d = tempfile.mkdtemp(prefix='cb-preview-test-')
+        self.addCleanup(shutil.rmtree, d, True)
+        path = os.path.join(d, 'ffmpeg.stderr')
+        with open(path, 'w', encoding='utf-8') as fh:
+            fh.write(stderr)
+        s = preview.PreviewSession(
+            id='t', channel_id=1, channel_name='c', account_id=1, dir=d, stderr_path=path,
+            transcode_audio=False, idle_timeout=15, max_seconds=600, connect_timeout=10,
+            proc=self._Exited(rc), started_mono=time.monotonic())
+        with mock.patch.object(preview, 'terminate_or_kill'), \
+                mock.patch.object(preview, '_roll_if_unresolved'):
+            preview._check(s)
+        self.assertEqual(s.reason, preview.REASON_FFMPEG_EXITED)
+        return s.detail
+
+    def test_a_refused_channel_leads_with_the_providers_answer(self):
+        detail = self._ended(_STDERR_405)
+        first, rest = detail.split('\n', 1)
+        self.assertEqual(first, "The provider's server answered HTTP 405 Method Not Allowed.")
+        self.assertTrue(rest.startswith('ffmpeg exited with code 8: '), rest)
+        self.assertIn('HTTP error 405', rest)
+
+    def test_a_refused_login_is_named_as_the_login(self):
+        detail = self._ended(_STDERR_403, rc=1)
+        self.assertTrue(detail.startswith('The provider refused the login (HTTP 403 Forbidden).\n'),
+                        detail)
+
+    def test_an_end_with_no_recognizable_cause_is_the_log_alone(self):
+        self.assertEqual(self._ended('', rc=0), 'ffmpeg exited with code 0')
+        self.assertEqual(self._ended('frame=  10 fps=0.0', rc=0),
+                         'ffmpeg exited with code 0: frame=  10 fps=0.0')
+
+    def test_a_connect_timeout_leads_with_the_cause_too(self):
+        self.assertEqual(preview.stream_stop_detail(_STDERR_405).split('\n')[0],
+                         "The provider's server answered HTTP 405 Method Not Allowed.")
+        self.assertEqual(preview.stream_stop_detail(''), '')
+
+
 class VendoredPlayerTests(unittest.TestCase):
     """hls.js ships in the repo under its own license; the notice must describe the file
     that is actually there, or the license compliance it documents is fiction."""

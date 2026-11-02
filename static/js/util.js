@@ -1599,14 +1599,23 @@ function colorPickerHtml(idPrefix, color, defaultColor, presets) {
   return '<div class="color-picker">' + swatches +
     `<div class="color-custom"><label for="${idPrefix}color-custom">Custom:</label>` +
     `<input type="text" id="${idPrefix}color-custom" value="${escHtml(custom)}" placeholder="#rrggbb">` +
-    `<span class="color-dot color-dot-lg" id="${idPrefix}color-preview" style="background: ${escHtml(current)}"></span>` +
+    `<span class="color-dot color-dot-lg" id="${idPrefix}color-preview"` +
+    (isHexColor(custom) ? ` style="background: ${escHtml(custom)}"` : ' hidden') + '></span>' +
     '</div></div>';
+}
+
+// duplicated from static/js/tag-modal.js::tagValidate - that file is evaluated without util.js
+// in tests/test_tag_modal_js.py. Both mirror app/routes/tags.py::_HEX_RE.
+function isHexColor(s) {
+  return /^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/.test(String(s || '').trim());
 }
 
 // Wires the read/preview/mutual-clear behavior for a colorPickerHtml() control already
 // rendered under `body`. Returns readColor(), the current-value getter callers use at submit
 // time. The custom box and the swatches are one control with two faces, so each clears the
-// other - leaving both populated makes "which did I pick" unanswerable by looking.
+// other - leaving both populated makes "which did I pick" unanswerable by looking. The dot
+// beside the custom box previews the custom box only: a swatch already shows its own color,
+// and a dot that followed the swatch read as the custom entry being ignored.
 function wireColorPicker(body, idPrefix, defaultColor) {
   const customInput = body.querySelector(`#${idPrefix}color-custom`);
   const preview = body.querySelector(`#${idPrefix}color-preview`);
@@ -1616,7 +1625,11 @@ function wireColorPicker(body, idPrefix, defaultColor) {
     const picked = body.querySelector('.color-radio:checked');
     return picked ? picked.value : defaultColor;
   };
-  const syncPreview = () => { preview.style.background = readColor(); };
+  const syncPreview = () => {
+    const typed = customInput.value.trim();
+    preview.hidden = !isHexColor(typed);
+    preview.style.background = preview.hidden ? '' : typed;
+  };
   customInput.addEventListener('input', () => {
     if (customInput.value.trim()) {
       body.querySelectorAll('.color-radio').forEach((r) => { r.checked = false; });

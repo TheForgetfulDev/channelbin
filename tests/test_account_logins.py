@@ -514,6 +514,33 @@ class RouteAndPageTests(_Case):
         self.assertNotIn('harbor-secret-one', html)
         self.assertNotIn('harbor-secret-two', html)
 
+    def test_a_refused_only_login_says_it_is_still_used(self):
+        """dev/docs/BUGS.md 2026-11-01 - the note under a refused login said it was skipped
+        while another login had a free seat on an account with no other login, where
+        connection_limits.try_acquire() goes on seating captures on it."""
+        only, = self._list(('main', 'main', 'pw1', 1))
+        self._stamp_refused(only)
+        self.assertTrue(connlim.try_acquire(self.acc_id, 'recording', 11))
+        self.assertEqual(self._pool(only), [('recording', 11)])
+        card = self._card()
+        self.assertNotIn('Skipped while another login', card)
+        self.assertNotIn('is skipped for a while', card)
+        self.assertIn("Still used: it is this account's only login", card)
+
+    def test_a_shared_login_alone_on_an_account_is_still_its_only_one(self):
+        other = seed.make_account(name='harbor-panel-two', max_connections=1)
+        db.session.commit()
+        links.create_provider('harbor', (self.acc_id, other.id))
+        shared, = self._list(('main', 'main', 'pw1', 1))
+        links.share_login(shared, other.id)
+        db.session.expire_all()
+        self._stamp_refused(shared)
+        self.acc_id = other.id
+        card = self._card()
+        self.assertIn('Shared with', card)
+        self.assertNotIn('Skipped while another login', card)
+        self.assertIn("Still used: it is this account's only login", card)
+
     def _card(self):
         html = self.client.get(f'/accounts/{self.acc_id}').get_data(as_text=True)
         return html.split('data-section="logins"')[1].split('data-section="content"')[0]

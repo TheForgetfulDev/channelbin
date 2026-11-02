@@ -720,25 +720,31 @@ def _ensure_system_health_job():
 
 
 def _seed_default_tags():
-    """One-time seed of the two built-in tags on first creation of the tags table.
+    """One-time seed of the built-in tags on first creation of the tags table. An older
+    install got 4k from migration 109 instead (dev/changelog/1395).
 
     Only runs when the tags table itself didn't exist before this startup's db.create_all()
-    - never re-seeds just because the table is empty, so a user who deletes both built-ins
+    - never re-seeds just because the table is empty, so a user who deletes the built-ins
     on purpose doesn't get them back on the next restart.
 
     Startup-only commits (here and in _migrate_db) are deliberately outside
     retry_on_locked: they run single-threaded before any concurrent writer exists.
     """
-    from .database import Tag, TagPattern
+    from .database import FOUR_K_TAG_PATTERNS, Tag, TagPattern
+    from .ui_constants import preset_color
     log = logging.getLogger(__name__)
-    live = Tag(name='live', color='#f85149')
+    live = Tag(name='live', color=preset_color('Fuchsia'))
     live.patterns.append(TagPattern(pattern='ᴸᶦᵛᵉ'))
-    new = Tag(name='new', color='#3fb950')
+    new = Tag(name='new', color=preset_color('Teal'))
     new.patterns.append(TagPattern(pattern='ᴺᵉʷ'))
+    uhd = Tag(name='4k', color='#e8b4fb')
+    for pattern in FOUR_K_TAG_PATTERNS:
+        uhd.patterns.append(TagPattern(pattern=pattern))
     db.session.add(live)
     db.session.add(new)
+    db.session.add(uhd)
     db.session.commit()
-    log.info('Seeded default tags: live, new')
+    log.info('Seeded default tags: live, new, 4k')
 
 
 def _seed_default_hide_rules():

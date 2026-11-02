@@ -33,7 +33,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from tests.support.app import make_test_app  # noqa: E402
 from tests.support import seed  # noqa: E402
 from app import db  # noqa: E402
-from app.database import UserPref  # noqa: E402
+from app.database import Account, Channel, UserPref  # noqa: E402
 from app.routes.channels import CHANNEL_SEARCH_SAVED_PREF  # noqa: E402
 
 PAGE_URL = '/channels'
@@ -67,6 +67,48 @@ class _PageTestCase(unittest.TestCase):
     def save_raw(self, value):
         db.session.add(UserPref(key=CHANNEL_SEARCH_SAVED_PREF, value=value))
         db.session.commit()
+
+
+class PageChromeTests(_PageTestCase):
+    """What the page says about itself before anything is searched (dev/changelog/1393):
+    an About this page like every other page's, and - with no account at all - the reason
+    there is nothing to find, said above the box rather than left to an empty list."""
+
+    def body(self):
+        return self.t.client.get(PAGE_URL).get_data(as_text=True)
+
+    def test_it_has_an_about_this_page(self):
+        self.assertIn('class="page-about"', self.body())
+
+    def test_no_account_banner_is_absent_while_there_is_an_account(self):
+        self.assertNotIn('id="cs-no-accounts"', self.body())
+
+    def test_with_no_accounts_the_banner_says_so_and_links_to_accounts(self):
+        db.session.query(Channel).delete()
+        db.session.query(Account).delete()
+        db.session.commit()
+        html = self.body()
+        self.assertIn('id="cs-no-accounts"', html)
+        banner = html[html.index('id="cs-no-accounts"'):]
+        banner = banner[:banner.index('</a>')]
+        self.assertIn('There are no accounts yet', banner)
+        self.assertIn('href="/accounts"', banner)
+
+
+class NativePickerSchemeTests(unittest.TestCase):
+    """dev/docs/BUGS.md 2026-11-01: the rail's Time of day boxes drew their clock icon black
+    on the dark field, because only datetime-local had an unscoped `color-scheme: dark`. Every
+    native date/time picker type gets it from one unscoped rule in style.css."""
+
+    def test_every_picker_type_is_dark_without_a_scope(self):
+        path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                            'static', 'css', 'style.css')
+        with open(path, encoding='utf-8') as fh:
+            css = fh.read()
+        for kind in ('datetime-local', 'date', 'time'):
+            rule = re.search(r'(?m)^([^{}\n]*input\[type="%s"\][^{}\n]*)\{([^}]*)\}' % kind, css)
+            self.assertIsNotNone(rule, f'no unscoped rule for input[type="{kind}"]')
+            self.assertIn('color-scheme: dark', rule.group(2))
 
 
 class DefaultSavedSearchTests(_PageTestCase):

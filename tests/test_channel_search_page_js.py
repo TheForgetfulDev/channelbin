@@ -1431,7 +1431,7 @@ class DayTimeDimensionTests(_PageJs, unittest.TestCase):
     SCENARIO = 'day_time'
 
     def test_both_cards_follow_when_on_the_airing_rail(self):
-        self.assertEqual(self.obs['rail_facets'][:4], ['when', 'dow', 'tod', 'duration'])
+        self.assertEqual(self.obs['rail_facets'][:4], ['when', 'tod', 'dow', 'duration'])
 
     def test_the_whole_week_shows_monday_first_with_no_find_box(self):
         """Seven values is one past the rail's cutoff of six, which would put Sunday behind
@@ -1684,6 +1684,31 @@ class CountsSplitChannelGrainTests(_PageJs, unittest.TestCase):
         # groups" is a real, complete answer that happens to contain the same character,
         # so the assertion names the pending shape rather than the character.
         self.assertNotRegex(self.obs['head_count'], r'\d\+')
+
+
+class CreateLinkTests(_PageJs, unittest.TestCase):
+    """The rail's + Create tag and + Create group open in a new tab, so the search on screen
+    is not thrown away, and coming back re-fetches the catalog once so what was made there
+    is on the rail (dev/changelog/1393). Before, each assigned location.href in this tab."""
+
+    SCENARIO = 'create_link'
+
+    def test_both_buttons_are_on_the_rail(self):
+        self.assertEqual(self.obs['found'], {'tag': True, 'group': True})
+
+    def test_each_opens_its_page_in_a_new_tab(self):
+        self.assertEqual(self.obs['opened'], [
+            {'url': self.obs['cfg']['tag'], 'target': '_blank'},
+            {'url': self.obs['cfg']['group'], 'target': '_blank'}])
+
+    def test_this_tab_stays_where_it_was(self):
+        self.assertTrue(self.obs['location_kept'])
+        self.assertTrue(self.obs['facet_still_open'],
+                        'pressing Create must not also collapse its facet')
+
+    def test_coming_back_refetches_the_catalog_once(self):
+        self.assertEqual(self.obs['catalog_refetched'], 1)
+        self.assertEqual(self.obs['catalog_refetched_again'], 1)
 
 
 class NavClickTests(_PageJs, unittest.TestCase):

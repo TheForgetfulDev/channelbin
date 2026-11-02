@@ -4,6 +4,8 @@
    template's namespace too - `m.csrf_field` is not the same name to an include. #}
 {% from '_macros.html' import csrf_field %}
 {% block title %}Search - ChannelBin{% endblock %}
+{# The rail and the results table need the width more than the menu does (base.html). #}
+{% block nav_min %}1{% endblock %}
 
 {#
   The channel search (Search in the menu, dev/changelog/1363). Approved design:
@@ -44,6 +46,25 @@
           aria-label="Channel list actions">{{ icon('more') }}</button>
   {% endif %}
 </div>
+{% call m.page_about() %}
+  Search through your channels, or through your TV Guide for the programs on them: Search
+  Channels lists channels, and Search Programs (EPG) lists each showing. From here you can add
+  channels to your TV Guide, put them in a group or run a health check on them, or schedule
+  recordings directly without doing any of that. Use the filters to narrow the list down, and
+  use Search in to change what your text is matched against.
+{% endcall %}
+
+{% if not has_accounts %}
+{# The same strip Auto-record rules shows when there is nothing to work from. #}
+<div class="notice-banner notice-banner-warn" id="cs-no-accounts">
+  <div class="notice-banner-body">
+    <div class="notice-banner-title">There are no accounts yet, so there is nothing to search.</div>
+    <div class="notice-banner-sub">Search looks through the channels and guide listings your IPTV
+      accounts bring in. Add an account, and its channels appear here after its first sync.</div>
+  </div>
+  <a class="btn btn-sm" href="{{ url_for('accounts.accounts_list') }}">Accounts {{ icon('forward') }}</a>
+</div>
+{% endif %}
 
 {# NO TAB STRIP. Browse and Groups both duplicated links the sidebar already carries,
    and the strip sat between this page's title and its own controls saying nothing about

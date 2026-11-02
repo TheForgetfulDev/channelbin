@@ -27,7 +27,7 @@ import threading
 from datetime import datetime
 
 from . import examples, readiness
-from .fmt_utils import join_labels, plural
+from .fmt_utils import first_line, join_labels, lower_first, plural
 from .tz_utils import ago
 
 log = logging.getLogger(__name__)
@@ -84,15 +84,6 @@ def _step(step_id, title, status, state, short=None, link=None, body=None, more=
 def _link(label, endpoint, **values):
     from flask import url_for
     return {'label': label, 'url': url_for(endpoint, **values)}
-
-
-def _first_line(text):
-    line = (text or '').strip().splitlines()[0] if (text or '').strip() else 'no reason given'
-    return line if len(line) <= _ERROR_CHARS else line[:_ERROR_CHARS - 3].rstrip() + '...'
-
-
-def _lower_first(text):
-    return text[:1].lower() + text[1:]
 
 
 # ── The four core steps ─────────────────────────────────────────────────────────
@@ -157,7 +148,7 @@ def _first_sync_step(title, accounts):
     if failed:
         a = failed[0]
         return _step('account', title, PROBLEM,
-                     f"{a.name}'s first sync failed: {_first_line(a.last_error)}",
+                     f"{a.name}'s first sync failed: {first_line(a.last_error, _ERROR_CHARS)}",
                      link=_link(a.name, 'accounts.account_detail', account_id=a.id),
                      body="Check the server, username and password on the account page, where "
                           "the provider's own answer is shown too. ChannelBin tries again at "
@@ -204,7 +195,7 @@ def _machine_step(rows):
                      body=f"{first['without']} Reload this page to check {first['short']} again "
                           "after you've fixed the issue.")
     return _step('machine', title, DONE,
-                 f"ffmpeg {_lower_first(rows['ffmpeg']['found'])}. Recording folder: "
+                 f"ffmpeg {lower_first(rows['ffmpeg']['found'])}. Recording folder: "
                  f"{rows['storage_dvr']['found']}. Times show in {rows['timezone']['found']}.",
                  link=_link('Settings', 'settings.settings'))
 

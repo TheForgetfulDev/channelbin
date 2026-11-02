@@ -413,6 +413,19 @@ class WatchdogVideoArrivalTests(unittest.TestCase):
                       self._events(CAPTURE_VIDEO_STOPPED)[0].detail)
         self.assertEqual(self._events(STALL_DETECTED), [])
 
+    def test_the_wait_for_the_new_member_after_a_video_stop_move_is_downtime(self):
+        """dev/docs/BUGS.md 2026-11-01 07:05:29 PM: the dead-feed failovers charged the
+        reconnect wait to total_downtime_seconds and this move did not. The relaunched
+        stand-in keeps its video for the rest of the run, so the new segment's first byte
+        is what banks the gap."""
+        db.session.get(Recording, self.rid).group_id = seed.make_group(members=[self.ch]).id
+        db.session.commit()
+        seg = self._run(video_s=0.5, freeze_s=-1, grow=1, budget=0, failover=True,
+                        relaunch=(60, -1), seconds=4)
+        self.assertEqual(seg.exit_reason, 'VIDEO_STOPPED')
+        self.assertEqual(self.launched, [1])
+        self.assertGreater(db.session.get(Recording, self.rid).total_downtime_seconds or 0, 0)
+
     def test_a_move_nobody_can_take_keeps_the_sound(self):
         db.session.get(Recording, self.rid).group_id = seed.make_group(members=[self.ch]).id
         db.session.commit()

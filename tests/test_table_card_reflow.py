@@ -49,6 +49,8 @@ REFLOWING_PAGES = {
     # fixture's channel holds the same program from two sources, so a stored scan of it
     # is a two-copy cluster.
     '/epg-manager': 1,
+    # Add Account's table of what each URL normalization mode does (dev/changelog/1392).
+    '/accounts/new': 1,
 }
 
 # Tables built in JavaScript, so no server render contains them. The source file is what
@@ -304,7 +306,7 @@ class OptInTests(unittest.TestCase):
         registered = {'templates/tags.html', 'templates/jobs.html', 'templates/rule_detail.html',
                       'templates/recording_detail.html',
                       'templates/channels/detail.html', 'templates/_account_stats.html',
-                      'templates/account_detail.html',
+                      'templates/account_detail.html', 'templates/account_form.html',
                       'templates/epg_source_review.html',
                       'templates/channels/guide_compare.html',
                       'templates/epg_manager.html'} | {p for p, _b, _n in REFLOWING_JS}

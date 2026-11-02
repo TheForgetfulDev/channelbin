@@ -3101,7 +3101,6 @@ def suggest():
             'effective_score': effective_score(ch),
             'health_score': ch.health_score,
             'in_guide': ch.in_guide,
-            'stream_url': ch.stream_url,
         })
     results.sort(key=lambda r: (FORMAT_STATUS_STRENGTH[r['format_status']],
                                 MATCH_REASON_STRENGTH[r['reason']], -r['effective_score']))

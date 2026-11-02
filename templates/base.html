@@ -47,8 +47,14 @@
    themselves to `body.<class>`. Anything that only affects the content column
    belongs in `main_class` below, not here. #}
 {% set page_body_class %}{% block body_class %}{% endblock %}{% endset %}
-{% set body_classes = (('nav-min' if nav_collapsed else '') ~ ' ' ~ page_body_class) | trim %}
-<body{% if body_classes %} class="{{ body_classes }}"{% endif %}>
+{# A page that needs every pixel of width (Search) opens with the menu collapsed whatever the
+   saved preference says, and the toggle there is for that visit only - it never writes the
+   preference, so the page's choice cannot leak onto every other page. #}
+{% set page_nav_min %}{% block nav_min %}{% endblock %}{% endset %}
+{% set page_nav_min = page_nav_min | trim | length > 0 %}
+{% set nav_min = nav_collapsed or page_nav_min %}
+{% set body_classes = (('nav-min' if nav_min else '') ~ ' ' ~ page_body_class) | trim %}
+<body{% if body_classes %} class="{{ body_classes }}"{% endif %}{% if page_nav_min %} data-page-nav-min{% endif %}>
   {# One nav definition rendered twice (sidebar + mobile menu) - classes only,
      no ids, so the two copies can't collide. #}
 
@@ -206,8 +212,8 @@
         <a class="brand" href="{{ url_for('dashboard.dashboard') }}"><img src="{{ url_for('static', filename='img/logo/channelbin-logo.png') }}" alt="" width="22" height="22"><span class="nav-t">ChannelBin</span></a>
         <hr class="brand-rule">
         <button class="navcollapse" type="button"
-                aria-label="{% if nav_collapsed %}Expand the main menu{% else %}Collapse the main menu{% endif %}"
-                data-tip="{% if nav_collapsed %}Show the main menu again{% else %}Shrink the main menu to icons and give the page the extra width{% endif %}">{{ icon('menu-expand' if nav_collapsed else 'menu-collapse', 'ncx') }}</button>
+                aria-label="{% if nav_min %}Expand the main menu{% else %}Collapse the main menu{% endif %}"
+                data-tip="{% if nav_min %}Show the main menu again{% else %}Shrink the main menu to icons and give the page the extra width{% endif %}">{{ icon('menu-expand' if nav_min else 'menu-collapse', 'ncx') }}</button>
       </div>
       {{ nav_sections() }}
       {{ sys_mini() }}
@@ -407,8 +413,8 @@
   </script>
   <script>
     // The collapsed rail (DESIGN.md 2, amended 2026-07-29). ONE writer for
-    // body.nav-min: the class is server-rendered from the nav_collapsed pref so
-    // there is no flash of the expanded sidebar, and only setNavMin changes it after.
+    // body.nav-min: the class is server-rendered from the nav_collapsed pref (or a page's
+    // nav_min block) so there is no flash of the expanded sidebar, and only setNavMin changes it after.
     (function() {
       const btn = document.querySelector('.navcollapse');
       if (!btn) return;
@@ -456,6 +462,7 @@
       btn.addEventListener('click', () => {
         const on = !document.body.classList.contains('nav-min');
         setNavMin(on);
+        if (document.body.hasAttribute('data-page-nav-min')) return;
         // Server-side, not localStorage: the template needs it at first paint.
         jsonFetch('/api/user-prefs/nav_collapsed', {
           method: 'POST', body: JSON.stringify({ value: on }),

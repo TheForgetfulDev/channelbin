@@ -26,6 +26,7 @@ from ..channel_groups import (effective_score, rank_members, member_channels,
 from ..epg_sources import (Listing, listing_agreement, keys_read, case_sensitive_matching,
                            AGREE_DOUBLED, AGREE_PAST, AGREE_REFERENCE, COMPARE_VERDICTS)
 from .. import channel_hiding
+from ..fmt_utils import iso_seconds_or_none
 from ..recording_story import partial_note, stopped_early_note
 from ..config import load_config
 from ..db_utils import retry_on_locked
@@ -358,10 +359,6 @@ def _one_group_row(group, streak_threshold):
     return ([('group', group, ranked[0])] if ranked else []), False
 
 
-def _iso(dt):
-    return dt.strftime('%Y-%m-%dT%H:%M:%S') if dt is not None else None
-
-
 def _schedules_payload(group, row, ref_entries, lead_channel_id, cell, entries_by_channel,
                        cfg, records, source_names):
     """The What's On card's schedules for `group` (dev/changelog/1324): every distinct
@@ -415,8 +412,8 @@ def _schedules_payload(group, row, ref_entries, lead_channel_id, cell, entries_b
             p['on_schedule'] = True
             p['agreement'] = a.kind
             p['gap'] = a.gap
-            p['partner'] = ({'title': a.partner.title, 'start_time': _iso(a.partner.start),
-                             'stop_time': _iso(a.partner.stop)} if a.partner else None)
+            p['partner'] = ({'title': a.partner.title, 'start_time': iso_seconds_or_none(a.partner.start),
+                             'stop_time': iso_seconds_or_none(a.partner.stop)} if a.partner else None)
             programs.append(p)
         key = f'{s.source_id or 0}:{s.file_id}'
         if s.split:
@@ -434,10 +431,10 @@ def _schedules_payload(group, row, ref_entries, lead_channel_id, cell, entries_b
                        'only_here': cmp.only_other, 'doubled': cmp.doubled_other,
                        'largest_move_min': (int(cmp.largest_move.total_seconds() // 60)
                                             if cmp.largest_move else None)},
-            'ends': _iso(max((e.stop_time for e in entries), default=None)),
+            'ends': iso_seconds_or_none(max((e.stop_time for e in entries), default=None)),
             'members': [member(ch) for ch in s.channels],
             'programs': programs,
-            'missing': [{'title': x.title, 'start_time': _iso(x.start), 'stop_time': _iso(x.stop)}
+            'missing': [{'title': x.title, 'start_time': iso_seconds_or_none(x.start), 'stop_time': iso_seconds_or_none(x.stop)}
                         for x in lacking],
         })
     rows.sort(key=lambda r: (not r['lead'], verdict_order[r['verdict']], r['epg_id'].lower()))

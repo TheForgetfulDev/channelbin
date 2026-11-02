@@ -62,7 +62,8 @@ from .account_links import (is_credential_refusal, is_resolution_failure,
                             note_refusal_for_holder, render_held_login,
                             roll_host_for_channel)
 from .proc_utils import (PREVIEW_PLAYLIST, PREVIEW_SEGMENT_RE, build_file_playback_cmd,
-                         build_preview_cmd, read_stderr_tail, terminate_or_kill)
+                         build_preview_cmd, read_stderr_tail, stderr_cause, terminate_or_kill)
+from .recording_story import http_answer, plain_cause
 from .url_utils import mask_creds_in_text
 
 log = logging.getLogger(__name__)
@@ -745,6 +746,26 @@ def capture_frame(channel_id: int, output_path: str, ffmpeg_path: str) -> str:
 _EXTINF_RE = re.compile(r'^#EXTINF:(\d+(?:\.\d+)?)', re.M)
 
 
+def stream_stop_detail(tail: str, exit_note: str = '') -> str:
+    """A channel preview's stop detail: the recognizable cause in plain words first, then
+    ffmpeg's own words behind it, so a provider's refusal is not left for the user to find
+    in the log. The cause comes from the readers a recording's story uses
+    (recording_story.plain_cause and http_answer) and the login-refusal classifier the
+    capture uses, never a matcher of this module's own. `tail` is already masked."""
+    tail = tail or ''
+    first = stderr_cause(tail)
+    cause = plain_cause(first)
+    if is_credential_refusal(tail):
+        answer = http_answer([first]) if first else None
+        lead = 'The provider refused the login' + (f' ({answer}).' if answer else '.')
+    elif cause:
+        lead = cause[0].upper() + cause[1:] + '.'
+    else:
+        lead = ''
+    log_part = exit_note + (f': {tail}' if exit_note and tail else tail)
+    return '\n'.join(p for p in (lead, log_part) if p)
+
+
 def _playlist_is_playable(path: str) -> bool:
     """The playlist lists a segment with something in it. A seek past the end of a file
     makes ffmpeg exit 0 having written one segment of 0.000 s (measured, dev/changelog/1314),
@@ -767,7 +788,7 @@ def _check(session: PreviewSession):
     if rc is not None:
         tail = mask_creds_in_text(read_stderr_tail(session.stderr_path))
         _finish(session, REASON_FFMPEG_EXITED,
-                detail=f'ffmpeg exited with code {rc}' + (f': {tail}' if tail else ''))
+                detail=stream_stop_detail(tail, f'ffmpeg exited with code {rc}'))
         _roll_if_unresolved(session, tail)
         return
     if session.state == STATE_STARTING:
@@ -775,7 +796,7 @@ def _check(session: PreviewSession):
             _mark_ready(session, now)
         elif now - session.started_mono > session.connect_timeout:
             tail = mask_creds_in_text(read_stderr_tail(session.stderr_path))
-            _finish(session, REASON_CONNECT_TIMEOUT, detail=tail)
+            _finish(session, REASON_CONNECT_TIMEOUT, detail=stream_stop_detail(tail))
             _roll_if_unresolved(session, tail)
             return
     if session.state == STATE_READY and session.last_seen_mono is not None:

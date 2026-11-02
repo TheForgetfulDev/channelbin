@@ -146,13 +146,15 @@
 </div>
 
 {% call page_about() %}
-  Take channels out of your way without deleting them - a blanket rule over a provider
-  category or a channel name, on top of hiding one channel at a time from its own page.
-  A hidden channel leaves search, the pickers and the counts, keeps its detail page, and
-  stops having EPG imported for it. A channel in your TV Guide or a channel group stays
-  visible until you remove it from there, no matter what a rule says. ChannelBin starts with
-  five channel name rules that hide the divider rows providers list between sections, such
-  as <code>#### US CLASSIC ####</code>; edit or delete them like any other.
+  Hide channels or entire categories from appearing anywhere. Hide specific categories, or
+  match them with a pattern. For channels you can hide them using a pattern here, or you can
+  go to a channel's page to hide a specific channel. Hide rules can apply to all accounts or
+  only select ones. Hiding channels will speed up your searches and reduce the size of the
+  EPG database. If you hide a channel that already exists in your TV Guide or a channel
+  group, it will stay visible until you remove it from there. Some commonly used filters
+  (ones that hide the divider rows providers list between sections, such as
+  <code>#### US CLASSIC ####</code>) are included out of the box. You can edit, disable, or
+  delete them if you wish.
 {% endcall %}
 
 {# Saved-but-not-applied. A refused pass leaves the rules committed and `Channel.hidden`

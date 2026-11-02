@@ -207,7 +207,10 @@ IPTV provider yet?** Its button, **Try it with example channels**, asks once and
   program listing, which shows what a channel group is for, and
 - a health check on BBC News.
 
-The first sync takes a minute or two and Get started moves on by itself. You can then record,
+A card at the top of Get started then shows each part as it happens: the channels and EPG
+entries the first sync brought in, the channels placed in the guide, the group, and the health
+check's result with its score, resolution and bitrate. The first sync takes a minute or two,
+and when everything is done each line links to what it made. You can then record,
 preview and test with them like any other channels. The example channels count as a trial: the
 account step stays open until you add an account of your own or keep the examples.
 

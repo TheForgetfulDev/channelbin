@@ -102,6 +102,26 @@ class GuideFetchFaultTests(_GuideCase):
                 self.assertEqual(self.entry_count(aid), held)
                 self.sim.clear(fault)
 
+    def test_a_guide_url_answering_a_playlist_is_named_as_a_playlist(self):
+        """Guards dev/docs/BUGS.md 2026-11-01: a guide URL serving an #EXTM3U playlist is
+        refused as a playlist - not as a malformed or empty feed - and the listings are
+        kept, on a provider guide and on an M3U account's URL source alike."""
+        for add, panel in ((self.add_xtream, 'north-tv'), (self.add_m3u, 'vale-m3u')):
+            with self.subTest(panel=panel):
+                aid = add()
+                self.synced(aid)
+                held = self.entry_count(aid)
+                fault = self.sim.inject('guide_as_playlist', panel, endpoints=['guide'])
+                log = self.sync(aid)
+                self.assertEqual(log.status, 'PARTIAL')
+                self.assertIn('the guide URL answered with an M3U playlist', log.error_message)
+                self.assertNotIn('import refused', log.error_message)
+                alert = self.assertAlert('EPG_SOURCE_FETCH_FAILED',
+                                         f'epg-source:{self.source_id(aid)}:fetch')
+                self.assertIn('M3U playlist', alert.body)
+                self.assertEqual(self.entry_count(aid), held)
+                self.sim.clear(fault)
+
     def test_a_url_guide_source_fails_the_same_way(self):
         """Characterization: an M3U account's guide is a URL source, refreshed and alerted
         under its own key like a provider guide."""

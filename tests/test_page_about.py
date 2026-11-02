@@ -69,6 +69,24 @@ class NoBareIntroUnderAPageHeadTests(unittest.TestCase):
         self.assertNotRegex(_after_page_head(new), _BARE_INTRO_RE)
 
 
+class PanelWidthTests(unittest.TestCase):
+    def test_no_rule_narrows_the_panel(self):
+        """The open panel spans the content column like the table under it. It shipped
+        capped at 76ch, about a third of a desktop page beside a full-width table
+        (dev/changelog/1395)."""
+        rule_re = re.compile(r'\.page-about[^{]*\{[^}]*\}', re.S)
+        sources = [os.path.join(REPO, 'static', 'css', 'style.css')]
+        for root, _dirs, files in os.walk(TPL_DIR):
+            sources += [os.path.join(root, n) for n in files if n.endswith('.html')]
+        offenders = []
+        for path in sources:
+            with open(path, encoding='utf-8') as fh:
+                for m in rule_re.finditer(fh.read()):
+                    if 'max-width' in m.group(0):
+                        offenders.append(f'{os.path.relpath(path, REPO)}: {m.group(0)[:60]}')
+        self.assertEqual(offenders, [])
+
+
 class RenderedPanelTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -100,7 +118,7 @@ class RenderedPanelTests(unittest.TestCase):
 
     def test_the_intro_text_is_inside_the_panel(self):
         self.assertIn('A channel group holds one or more channels', self._panel('/channel-groups'))
-        self.assertIn('Tags find the little markers', self._panel('/tags'))
+        self.assertIn('Tags can be used to match items', self._panel('/tags'))
 
     def test_one_panel_per_page(self):
         for url, html in self.pages.items():

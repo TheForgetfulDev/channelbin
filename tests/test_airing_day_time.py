@@ -391,7 +391,7 @@ class DayTimeContractTests(_DayTimeCase):
     def test_both_are_airing_dimensions_only(self):
         airing_keys = [d.key for d in visible_dimensions_for(GRAIN_AIRINGS)]
         channel_keys = [d.key for d in visible_dimensions_for(GRAIN_CHANNELS)]
-        self.assertEqual(airing_keys[:4], ['when', 'dow', 'tod', 'duration'])
+        self.assertEqual(airing_keys[:4], ['when', 'tod', 'dow', 'duration'])
         self.assertNotIn('dow', channel_keys)
         self.assertNotIn('tod', channel_keys)
 

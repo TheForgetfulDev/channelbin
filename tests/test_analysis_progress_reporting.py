@@ -39,6 +39,7 @@ from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import app.config as cfgmod  # noqa: E402
 import app.postprocessor as ppmod  # noqa: E402
 import app.probe as probemod  # noqa: E402
 from app import db  # noqa: E402
@@ -79,9 +80,17 @@ class AnalysisPassPlanTests(unittest.TestCase):
 
     def test_health_data_off_leaves_only_the_scan_the_reencode_decision_needs(self):
         """do_postprocess still scans in that case, or turning health data off would
-        silently disable damage repair - so the phase has one pass, not zero."""
+        silently disable damage repair - so the phase has one pass, not zero. The scan is
+        LAST: with health data off it runs from the re-encode decision, after the survey,
+        and a plan that listed it first numbered the survey "2 of 2" before any "1 of 2"
+        (dev/docs/BUGS.md 2026-11-01 07:05:29 PM)."""
         self.assertEqual(ppmod.analysis_pass_plan(_cfg(gather=False), _pp()),
-                         [ppmod.ANALYSIS_PASS_TIMELINE, ppmod.ANALYSIS_PASS_FORMATS])
+                         [ppmod.ANALYSIS_PASS_FORMATS, ppmod.ANALYSIS_PASS_TIMELINE])
+
+    def test_health_data_off_with_leveling_runs_the_scan_after_both_format_reads(self):
+        self.assertEqual(ppmod.analysis_pass_plan(_cfg(gather=False), _pp(loudness=True)),
+                         [ppmod.ANALYSIS_PASS_FORMATS, ppmod.ANALYSIS_PASS_LOUDNESS,
+                          ppmod.ANALYSIS_PASS_TIMELINE])
 
     def test_health_data_off_and_reencode_always_reads_only_the_formats(self):
         """reencode_mode 'always' does not ask whether the file is damaged, so there is no
@@ -365,6 +374,44 @@ class AnalysisWiringTests(unittest.TestCase):
             ppmod._scan_recording_timeline(self.rid, self.path)
 
         self.assertIsNone(seen.get('during'))
+
+    def test_with_health_data_off_the_survey_is_handed_the_plan(self):
+        """dev/docs/BUGS.md 2026-11-01 07:05:29 PM: with health data off the survey runs
+        first and the damage scan last, from the re-encode decision, and the plan listed
+        them the other way round - so the strip read "format survey (2 of 2)" and then
+        "damage scan (1 of 2)". Every survey call of the run (the resume path's fallback
+        included) is handed the plan, and the plan names the survey first."""
+        rec = db.session.get(Recording, self.rid)
+        rec.status = 'CONCATENATING'
+        rec.output_path = self.path
+        db.session.commit()
+        cfg = cfgmod._deep_merge(cfgmod.load_config(), {'recording': {
+            'gather_health_data': False,
+            'move_on_complete': {'enabled': False}, 'post_script': {'enabled': False},
+            'post_process': {'enabled': True, 'format': 'mp4', 'reencode_mode': 'damaged',
+                             'delete_source': False, 'loudness_normalize': False}}})
+        plan = ppmod.analysis_pass_plan(cfg, cfg['recording']['post_process'])
+        survey = mock.Mock(return_value=None)
+        try:
+            with mock.patch.object(cfgmod, 'load_config', return_value=cfg), \
+                 mock.patch.object(ppmod, '_survey_recording', survey), \
+                 mock.patch.object(ppmod, '_scan_recording_timeline',
+                                   return_value=(False, {}, 'clean')), \
+                 mock.patch.object(probemod, 'parse_ffprobe', return_value={}), \
+                 mock.patch.object(probemod, 'nominal_video_rate', return_value=None), \
+                 mock.patch.object(ppmod, 'run_conversion_supervised',
+                                   return_value=ppmod.ConversionResult(True, 'success')):
+                ppmod.do_postprocess(self.t.app, self.rid, self.path)
+        finally:
+            with ppmod._active_lock:
+                ppmod._active_conversions.clear()
+                ppmod._cancel_requested.clear()
+        self.assertEqual(plan, [ppmod.ANALYSIS_PASS_FORMATS, ppmod.ANALYSIS_PASS_TIMELINE])
+        self.assertTrue(survey.called)
+        # The stub answers None, which is what sends the re-encode decision to its fallback
+        # survey as well - so both call sites are seen here.
+        self.assertEqual([c.kwargs.get('analysis_plan') for c in survey.call_args_list],
+                         [plan] * len(survey.call_args_list))
 
 
 class AnalysisSurfaceTests(unittest.TestCase):

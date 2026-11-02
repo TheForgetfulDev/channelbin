@@ -303,7 +303,8 @@ sections; edit or delete them like any other. An account's "hidden" count links 
 **Tags** find the little markers providers put in program titles, such as a tiny ᴸᶦᵛᵉ or ᴺᵉʷ. A
 tag highlights the programs that carry its marker in the TV Guide and in program searches, and
 lets you filter on them. In a filename template, `{tag:live}` writes "live" when the program has
-that marker and nothing when it does not. ChannelBin starts with two, live and new.
+that marker and nothing when it does not. ChannelBin starts with three: live, new, and 4k (the
+superscript ᵁᴴᴰ and ᴴᴰᴿ markers).
 
 ## Readiness, Maintenance, Jobs and Logs
 

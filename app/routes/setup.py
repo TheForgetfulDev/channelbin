@@ -28,11 +28,19 @@ def get_started():
     return render_template(
         'get_started.html',
         setup=setup,
+        activity=examples.progress(),
         rec_sig=rec_sig,
         sync_sig=sync_sig,
         search_channels_url=url_for('channels.channel_browser'),
         search_programs_url=airing_search_url(),
     )
+
+
+@setup_bp.route('/get-started/activity')
+def examples_activity():
+    """The example channels' progress card on its own, which static/js/get-started.js polls
+    while a load runs: a few lookups, where the whole page re-runs every Readiness check."""
+    return render_template('_examples_progress.html', activity=examples.progress())
 
 
 @setup_bp.route('/api/examples', methods=['POST'])

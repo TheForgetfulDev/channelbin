@@ -441,6 +441,77 @@ class RingTests(unittest.TestCase):
         ring.append(b'a')
         self.assertEqual(ring.take(timeout=0.1), b'a')
 
+    def test_a_chunk_evicted_before_its_reserve_is_counted_apart_from_one_the_viewer_left(self):
+        """A reserve the ring cannot hold at the stream's bitrate evicts chunks the viewer
+        could never have taken; those must not read as the viewer being slow
+        (dev/docs/BUGS.md 2026-11-01)."""
+        unripe = feed.Ring(capacity=feed.READ_CHUNK * 2, reserve=100.0)
+        for t in (0.0, 0.1, 0.2):
+            unripe.append(b'x' * feed.READ_CHUNK, now=t)
+        self.assertEqual(unripe.dropped, feed.READ_CHUNK)
+        self.assertEqual(unripe.dropped_unripe, feed.READ_CHUNK)
+        ripe = feed.Ring(capacity=feed.READ_CHUNK * 2, reserve=1.0)
+        for t in (0.0, 0.1, 5.0):
+            ripe.append(b'x' * feed.READ_CHUNK, now=t)
+        self.assertEqual(ripe.dropped, feed.READ_CHUNK)
+        self.assertEqual(ripe.dropped_unripe, 0)
+
+
+class ReaperJudgementTests(_FeedCase):
+    """_check() over sessions built by hand, with no ffmpeg: what the reaper may and may not
+    conclude about a session from its state alone."""
+
+    def _session(self, proc=None, ring=None):
+        session = feed.RelaySession(
+            id=f's{id(self)}{feed.live_sessions().__len__()}', feed_id=2, label='channel 1 (One)',
+            client='10.0.0.2', group_id=None, channel_id=1, channel_name='One',
+            account_id=self.account.id, ring=ring or feed.Ring(feed.READ_CHUNK * 2, 0),
+            started_mono=time.monotonic(), proc=proc)
+        with feed._lock:
+            feed._sessions[session.id] = session
+        return session
+
+    def test_a_session_inside_its_launch_window_is_not_judged(self):
+        """start_session() registers the session before _launch() adopts the ffmpeg, and
+        launched_mono is still 0.0 then; a reaper another viewer keeps running must not read
+        that as a connect timeout and kill the tune-in (dev/docs/BUGS.md 2026-11-01)."""
+        session = self._session()
+        self.assertIsNone(session.proc)
+        feed._check(session)
+        self.assertTrue(session.live)
+        self.assertIsNone(session.reason)
+
+    def test_drops_the_viewer_could_not_have_taken_name_the_buffer_not_the_viewer(self):
+        """dev/docs/BUGS.md 2026-11-01: a chunk evicted before it aged the reserve was never
+        releasable, so cutting the session as "the IPTV app fell behind" blamed the wrong
+        party."""
+        from unittest import mock
+        proc = mock.Mock()
+        proc.poll.return_value = None
+        ring = feed.Ring(capacity=feed.READ_CHUNK * 2, reserve=100.0)
+        for t in (0.0, 0.1, 0.2):
+            ring.append(b'x' * feed.READ_CHUNK, now=t)
+        session = self._session(proc=proc, ring=ring)
+        session.launched_mono = time.monotonic()
+        with mock.patch('app.output_feed.terminate_or_kill'):
+            feed._check(session)
+        self.assertFalse(session.live)
+        self.assertEqual(session.reason, feed.REASON_BUFFER_TOO_SMALL)
+        self.assertIn('reserve', session.detail)
+
+    def test_drops_the_viewer_left_behind_still_name_the_viewer(self):
+        from unittest import mock
+        proc = mock.Mock()
+        proc.poll.return_value = None
+        ring = feed.Ring(capacity=feed.READ_CHUNK * 2, reserve=0)
+        for _ in range(3):
+            ring.append(b'x' * feed.READ_CHUNK)
+        session = self._session(proc=proc, ring=ring)
+        session.launched_mono = time.monotonic()
+        with mock.patch('app.output_feed.terminate_or_kill'):
+            feed._check(session)
+        self.assertEqual(session.reason, feed.REASON_CLIENT_TOO_SLOW)
+
 
 class ReasonVocabularyTests(unittest.TestCase):
     def test_every_reason_has_user_facing_text(self):

@@ -36,9 +36,10 @@ from unittest import mock
 from app import db, examples, readiness, setup_steps
 from app import migrations as M
 from app.database import (ACCOUNT_STATUS_ERROR, ACCOUNT_STATUS_OK, ACCOUNT_STATUS_UNSYNCED,
-                          CHANNEL_ADDED_TO_GUIDE, GROUP_EXAMPLE_KEPT, Account, Alert, Channel,
-                          ChannelEvent, ChannelGroup, ChannelGroupEvent, EpgSource,
-                          EpgSourceSubscription, Recording)
+                          CHANNEL_ADDED_TO_GUIDE, GROUP_EXAMPLE_KEPT, TEST_STATUS_COMPLETED,
+                          TEST_STATUS_FAILED, Account, Alert, Channel, ChannelEvent,
+                          ChannelGroup, ChannelGroupEvent, EpgSource, EpgSourceSubscription,
+                          Recording)
 from tests.support.app import make_test_app
 from tests.support.readiness import patched, result
 from tests.support.seed import (make_account, make_channel, make_channel_test, make_group,
@@ -118,7 +119,11 @@ class LoadStartTests(_Case):
 class LoadThreadTests(_Case):
     """examples._load with the sync and the health check stubbed."""
 
-    def run_load(self, names=ALL_NAMES, status=ACCOUNT_STATUS_OK, error=None, tested=7):
+    def run_load(self, names=ALL_NAMES, status=ACCOUNT_STATUS_OK, error=None, tested=7,
+                 test_row=None, counts=(0, 0)):
+        """`test_row`: the ChannelTest columns the stubbed health check writes, in place of
+        returning the bare id `tested`. `counts`: the channel and EPG entry counts the
+        stubbed sync leaves on the account."""
         acc = make_account(name=examples.ACCOUNT_NAME, is_example=True)
         acc.status = ACCOUNT_STATUS_UNSYNCED  # make_account() always seeds OK
         db.session.commit()
@@ -130,17 +135,122 @@ class LoadThreadTests(_Case):
                 a.status = status
                 a.last_error = error
                 a.last_sync_at = datetime.utcnow() if status == ACCOUNT_STATUS_OK else None
+                a.channel_count, a.epg_entry_count = counts
                 for n in (names if status == ACCOUNT_STATUS_OK else ()):
                     make_channel(a, name=n)
                 db.session.commit()
 
         tests = []
+
+        def fake_test(app, cid):
+            tests.append(cid)
+            if test_row is None:
+                return tested
+            with app.app_context():
+                row = make_channel_test(db.session.get(Channel, cid), all_null=False,
+                                        **test_row)
+                db.session.commit()
+                return row.id
+
+        # What start() leaves for the thread it starts.
+        steps = examples._new_steps()
+        steps[examples.STEP_ACCOUNT]['state'] = examples.STEP_DONE
+        steps[examples.STEP_SYNC]['state'] = examples.STEP_RUNNING
+        with examples._lock:
+            examples._loading.update({'account_id': acc_id, 'started_at': datetime.utcnow(),
+                                      'steps': steps, 'refs': {}})
         with mock.patch('app.accounts.run_manual_sync', side_effect=fake_sync), \
-                mock.patch('app.channel_tester.run_single_channel_test',
-                           side_effect=lambda app, cid: tests.append(cid) or tested):
+                mock.patch('app.channel_tester.run_single_channel_test', side_effect=fake_test):
             examples._load(self.t.app, acc_id)
         db.session.expire_all()
         return acc_id, tests
+
+    def report(self):
+        """The finished load's checklist as Get started's progress card reads it."""
+        db.session.remove()
+        p = examples.progress()
+        self.assertIsNotNone(p, 'the finished load left no report')
+        return {s['id']: s for s in p['steps']}, p
+
+    def test_the_report_names_what_each_step_did_with_its_numbers(self):
+        """dev/changelog/1396: the load's background work is shown, not hidden - the counts
+        the sync brought in, the channels placed, the group, and the health check's verdict,
+        score and what the stream measured, each with a link to go and look."""
+        acc_id, _ = self.run_load(counts=(1043, 23456), test_row=dict(
+            status=TEST_STATUS_COMPLETED, connected=True, resolution='1920x1080', fps=25.0,
+            bitrate_kbps=4210.4, video_codec='h264', audio_codec='aac',
+            lifetime_score_after=92))
+        steps, p = self.report()
+        self.assertTrue(p['finished'])
+        self.assertTrue(p['clean'])
+        self.assertEqual(p['pct'], 100)
+        self.assertEqual({s['state'] for s in steps.values()}, {examples.STEP_DONE})
+        self.assertIn('Added 1,043 channels and synced 23,456 EPG entries',
+                      steps[examples.STEP_SYNC]['detail'])
+        for name in examples.GUIDE_CHANNELS:
+            self.assertIn(name, steps[examples.STEP_GUIDE]['detail'])
+        self.assertIn(examples.GROUP_NAME, steps[examples.STEP_GROUP]['detail'])
+        test = steps[examples.STEP_TEST]['detail']
+        for part in ('Passed with a health score of 92', '1920x1080 at 25 fps', '4,210 kbps',
+                     'H264 video', 'AAC audio'):
+            self.assertIn(part, test)
+        group = ChannelGroup.query.filter_by(name=examples.GROUP_NAME).one()
+        bbc = Channel.query.filter_by(account_id=acc_id, name=examples.TEST_CHANNEL).one()
+        links = {k: s['link']['url'] for k, s in steps.items()}
+        self.assertEqual(links[examples.STEP_ACCOUNT], f'/accounts/{acc_id}')
+        self.assertIn(f'f.acct={acc_id}', links[examples.STEP_SYNC])
+        self.assertEqual(links[examples.STEP_GUIDE], '/guide')
+        self.assertEqual(links[examples.STEP_GROUP], f'/channel-groups/{group.id}')
+        self.assertEqual(links[examples.STEP_TEST], f'/channels/{bbc.id}#cd-tests')
+
+    def test_the_sync_line_names_the_playlist_entries_it_left_out(self):
+        """A browser run read "932 of 932" while syncing and then "Added 926 channels" with
+        nothing saying why; the left-out entries are named from the sync's own log
+        (dev/changelog/1396)."""
+        from app.database import AccountSyncLog
+        acc = self.example_account(names=('BBC News',))
+        db.session.add(AccountSyncLog(account_id=acc.id, status='SUCCESS', channels_synced=926,
+                                      skipped_duplicate_stream_ids=4, skipped_malformed_urls=2))
+        db.session.commit()
+        line = examples._synced_detail(acc.id)
+        self.assertIn('6 playlist entries left out: 4 duplicates and 2 with no usable stream '
+                      'address.', line)
+        clean = self.example_account(names=('BBC News',))
+        self.assertNotIn('left out', examples._synced_detail(clean.id))
+
+    def test_a_failed_sync_is_the_problem_and_the_rest_say_they_did_not_happen(self):
+        self.run_load(status=ACCOUNT_STATUS_ERROR, error='HTTP 503 from m3upt.com')
+        steps, p = self.report()
+        self.assertFalse(p['clean'])
+        self.assertEqual(steps[examples.STEP_SYNC]['state'], examples.STEP_PROBLEM)
+        self.assertIn('HTTP 503 from m3upt.com', steps[examples.STEP_SYNC]['detail'])
+        for s in (examples.STEP_GUIDE, examples.STEP_GROUP, examples.STEP_TEST):
+            self.assertEqual(steps[s]['state'], examples.STEP_SKIPPED)
+            self.assertIsNone(steps[s]['link'])
+
+    def test_a_health_check_that_did_not_pass_says_why_on_its_step(self):
+        self.run_load(test_row=dict(status=TEST_STATUS_FAILED, connected=False,
+                                    error_detail='Connection refused\nmore'))
+        steps, p = self.report()
+        self.assertFalse(p['clean'])
+        self.assertEqual(steps[examples.STEP_TEST]['state'], examples.STEP_PROBLEM)
+        self.assertIn('Did not pass: Connection refused', steps[examples.STEP_TEST]['detail'])
+        self.assertNotIn('more', steps[examples.STEP_TEST]['detail'])
+
+    def test_a_channel_gone_from_the_list_is_named_on_the_guide_step(self):
+        self.run_load(names=tuple(n for n in ALL_NAMES if n != 'PBS America'))
+        steps, _ = self.report()
+        self.assertEqual(steps[examples.STEP_GUIDE]['state'], examples.STEP_PROBLEM)
+        self.assertIn('PBS America', steps[examples.STEP_GUIDE]['detail'])
+        self.assertIn('BBC News', steps[examples.STEP_GUIDE]['detail'])
+
+    def test_the_report_goes_with_the_examples(self):
+        self.run_load()
+        self.report()
+        removed, message = examples.remove()
+        self.assertTrue(removed, message)
+        db.session.remove()
+        self.assertIsNone(examples.progress())
 
     def test_a_clean_load_places_every_channel_makes_the_group_and_tests_one(self):
         acc_id, tests = self.run_load()
@@ -443,12 +553,65 @@ class PageTests(_Case):
         html = self.get()
         self.assertLess(html.index('data-examples-load'), html.index('The button adds:'))
 
-    def test_the_loading_card_says_how_long_without_a_toast(self):
-        self.example_account()
+    def running(self, acc, at, done=()):
+        """A load in progress on `acc`, with `done` finished and `at` under way."""
+        steps = examples._new_steps()
+        for s in done:
+            steps[s] = {'state': examples.STEP_DONE, 'detail': f'{s} did its thing.'}
+        steps[at]['state'] = examples.STEP_RUNNING
         with examples._lock:
-            examples._loading.update({'account_id': 1, 'started_at': datetime.utcnow(),
-                                      'step': "Fetching M3UPT's channels and listings."})
+            examples._loading.update({'account_id': acc.id, 'started_at': datetime.utcnow(),
+                                      'steps': steps, 'refs': {}})
+
+    def test_the_loading_card_says_how_long_without_a_toast(self):
+        acc = self.example_account()
+        self.running(acc, examples.STEP_SYNC, done=(examples.STEP_ACCOUNT,))
         self.assertIn('a minute or two', self.get())
+
+    def test_the_progress_card_comes_first_and_follows_the_live_sync(self):
+        """dev/changelog/1396: the card the page brings into view when a load starts sits
+        above the steps, and the running sync's line is its live progress."""
+        from app import accounts
+        acc = self.example_account()
+        self.running(acc, examples.STEP_SYNC, done=(examples.STEP_ACCOUNT,))
+        with mock.patch.object(accounts, 'get_sync_progress',
+                               return_value={'phase': 'channels', 'done': 512, 'total': 1043}):
+            html = self.get()
+            alone = self.get('/get-started/activity')
+        self.assertLess(html.index('id="gs-activity"'), html.index('id="gs-live"'))
+        for page in (html, alone):
+            self.assertIn('data-running="1"', page)
+            self.assertIn("Reading M3UPT&#39;s playlist: 512 of 1,043 entries.", page)
+            self.assertIn('class="spinner gs-run-spin"', page)
+            self.assertIn('account did its thing.', page)
+        self.assertNotIn('<html', alone)
+
+    def test_the_running_sync_line_follows_each_phase(self):
+        """The index rebuild that closes a sync runs while the sync's progress still reads
+        the listings phase, so it must win over that phase's line (dev/changelog/1396)."""
+        from app import accounts, search_index
+        cases = (
+            (None, False, "Downloading M3UPT's playlist"),
+            ({'phase': 'channels', 'done': 10, 'total': 40}, False,
+             "Reading M3UPT's playlist: 10 of 40 entries."),
+            ({'phase': 'epg', 'done': 2500, 'total': None}, False,
+             'Reading program listings: 2,500 so far.'),
+            ({'phase': 'epg', 'done': 2500, 'total': None}, True, 'Indexing'),
+            (None, True, 'Indexing'),
+        )
+        for prog, rebuilding, expected in cases:
+            with mock.patch.object(accounts, 'get_sync_progress', return_value=prog), \
+                    mock.patch.object(search_index, 'rebuild_in_progress',
+                                      return_value=rebuilding):
+                line, part = examples._sync_detail(1)
+            self.assertIn(expected, line, (prog, rebuilding))
+            self.assertTrue(0 < part < 1)
+
+    def test_with_no_load_the_slot_is_drawn_empty_and_not_polled(self):
+        html = self.get('/get-started/activity')
+        self.assertIn('id="gs-activity"', html)
+        self.assertNotIn('data-running', html)
+        self.assertNotIn('gs-run-step', html)
 
     def test_the_empty_guide_offers_the_examples_with_no_account(self):
         html = self.get('/guide')
@@ -459,12 +622,11 @@ class PageTests(_Case):
         self.assertNotIn('/get-started#gs-try', self.get('/guide'))
 
     def test_a_running_load_shows_its_step_and_asks_for_the_minute_tick(self):
-        self.example_account()
-        with examples._lock:
-            examples._loading.update({'account_id': 1, 'started_at': datetime.utcnow(),
-                                      'step': 'Running a health check on BBC News.'})
+        acc = self.example_account()
+        self.running(acc, examples.STEP_TEST, done=examples.STEPS[:-1])
         html = self.get()
-        self.assertIn('Running a health check on BBC News.', html)
+        self.assertRegex(html, r'gs-run-step running" data-run-step="test">\s*<span '
+                               r'class="gs-run-mark"><span class="spinner')
         self.assertIn('data-waiting="1"', html)
         self.assertNotIn('data-examples-remove', html)
 

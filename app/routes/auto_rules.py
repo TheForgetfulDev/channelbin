@@ -55,9 +55,11 @@ def _evaluate(rule_id, saved=True):
     """evaluate_now() for a rule, after a save, a resume or a Check now. The rule is saved
     whatever its check does, so a check that raises must not turn the answer into a 500 the
     dialog reads as "not saved" - inviting a second, identical rule. It answers what happened
-    instead, and queues the check to run again."""
+    instead, and queues the check to run again. `saved` is False for Check now, which is
+    neither a save nor a resume and is labeled as its own trigger."""
     try:
-        return auto_rules.evaluate_now(rule_id)
+        return auto_rules.evaluate_now(
+            rule_id, trigger=auto_rules.TRIGGER_SAVE if saved else auto_rules.TRIGGER_CHECK)
     except Exception as exc:
         db.session.rollback()
         log.exception('Auto-record rule #%d: a check asked for by hand failed', rule_id)

@@ -154,6 +154,46 @@ class NavCollapsedRendersServerSideTests(unittest.TestCase):
         self.assertIn('class="nav-min"', self._body_tag())
 
 
+class PageForcedNavMinTests(unittest.TestCase):
+    """Search opens with the menu collapsed whatever the pref says, and marks itself so its
+    toggle is for that visit only (DESIGN.md §2, amended 2026-11-01, dev/changelog/1393).
+    Asserted from the served page, so it fails if the block is dropped from search.html or
+    the class stops being derived from it in base.html."""
+
+    def setUp(self):
+        self.t = make_test_app()
+
+    def tearDown(self):
+        self.t.cleanup()
+
+    def _body_tag(self, path):
+        html = self.t.client.get(path).get_data(as_text=True)
+        return re.search(r'<body[^>]*>', html).group(0)
+
+    def test_search_opens_collapsed_with_the_pref_off(self):
+        db.session.add(UserPref(key='nav_collapsed', value=json.dumps(False)))
+        db.session.commit()
+        tag = self._body_tag('/channels')
+        self.assertIn('nav-min', tag)
+        self.assertIn('data-page-nav-min', tag)
+
+    def test_the_toggle_on_that_page_says_expand(self):
+        html = self.t.client.get('/channels').get_data(as_text=True)
+        self.assertIn('aria-label="Expand the main menu"', html)
+
+    def test_every_other_page_still_follows_the_pref(self):
+        tag = self._body_tag('/')
+        self.assertNotIn('nav-min', tag)
+        self.assertNotIn('data-page-nav-min', tag)
+
+    def test_the_toggle_skips_the_save_on_such_a_page(self):
+        script = _read('templates/base.html')
+        click = script[script.index("btn.addEventListener('click'"):]
+        click = click[:click.index('});')]
+        self.assertLess(click.index("hasAttribute('data-page-nav-min')"),
+                        click.index("/api/user-prefs/nav_collapsed"))
+
+
 class NavFoldsRenderServerSideTests(unittest.TestCase):
     """Setup and System are folded on every page load except the one holding the page being
     shown, and nothing remembers a fold or an open (DESIGN.md §2, amended 2026-10-31,

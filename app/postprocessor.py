@@ -99,17 +99,23 @@ def analysis_pass_plan(cfg, pp) -> list:
     re-encodes its audio and needs the widest layout in the file; the loudness pass runs only
     when leveling is on. A plan of zero passes is the honest answer for a configuration whose
     analysis reads nothing, and the surfaces show no progress rather than an empty bar.
+
+    The order is the order do_postprocess runs them, because _start_analysis_pass numbers a
+    pass by its place here: with health data on, the health pass and the damage scan come
+    before the format reads; with it off, the damage scan runs last, from inside the
+    re-encode decision, after the survey and the loudness pass it reads with.
     """
     plan = []
     mp4 = pp.get('enabled') and pp.get('format', 'mp4').lower().lstrip('.') == 'mp4'
-    if cfg['recording'].get('gather_health_data', True):
+    gather = cfg['recording'].get('gather_health_data', True)
+    if gather:
         plan += [ANALYSIS_PASS_HEALTH, ANALYSIS_PASS_TIMELINE]
-    elif mp4 and pp.get('reencode_mode', 'damaged') == 'damaged':
-        plan.append(ANALYSIS_PASS_TIMELINE)
     if mp4:
         plan.append(ANALYSIS_PASS_FORMATS)
         if pp.get('loudness_normalize'):
             plan.append(ANALYSIS_PASS_LOUDNESS)
+        if not gather and pp.get('reencode_mode', 'damaged') == 'damaged':
+            plan.append(ANALYSIS_PASS_TIMELINE)
     return plan
 
 
@@ -2291,7 +2297,9 @@ def do_postprocess(app, recording_id: int, ts_path: str):
             src = None
             if fmt == 'mp4':
                 if survey is None:
-                    survey = _survey_recording(recording_id, ts_path)
+                    # Still the ANALYZING phase, so the read is a numbered pass on the strip
+                    # like the damage scan below it.
+                    survey = _survey_recording(recording_id, ts_path, analysis_plan=analysis_plan)
                 from .probe import nominal_video_rate, parse_ffprobe
                 header = dict(parse_ffprobe(ts_path, count_packets=False) or {})
                 header['r_frame_rate'] = nominal_video_rate(ts_path)
@@ -2301,7 +2309,8 @@ def do_postprocess(app, recording_id: int, ts_path: str):
                     _loud = _recorded_diagnostic(recording_id, 'loudness_measured')
                     if _loud is None:
                         loudness_lufs = _measure_recording_loudness(
-                            recording_id, ts_path, resolve_ffmpeg_path(cfg['ffmpeg']['path']))
+                            recording_id, ts_path, resolve_ffmpeg_path(cfg['ffmpeg']['path']),
+                            analysis_plan=analysis_plan)
                     else:
                         loudness_lufs = _loud.get('lufs')
 

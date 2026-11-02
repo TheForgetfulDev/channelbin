@@ -3612,12 +3612,12 @@
      and not "Next ..." - a chip has to be readable without opening the facet that made it.
      Singular when n is 1, because "Next 1 days" makes a page look unfinished. */
   const relLabel = () => {
-    if (!relSet()) return 'Next ...';
+    if (!relSet()) return 'Within the next ...';
     const n = Number(whenRel.n);
     return `Next ${n} ${n === 1 ? whenRel.unit.slice(0, -1) : whenRel.unit}`;
   };
   const customLabel = () => (customSet()
-    ? `${whenCustom.from || 'any time'} to ${whenCustom.to || 'any time'}` : 'Custom range');
+    ? `${whenCustom.from || 'any time'} to ${whenCustom.to || 'any time'}` : 'Date and time range');
 
   function dimValues(key) {
     if (!CAT) return [];
@@ -3682,18 +3682,34 @@
     return (found && found.tip) || null;
   }
 
-  // Where to go to make one of these. A page action, so it is not in the catalog.
+  // Where to go to make one of these. A page action, so it is not in the catalog. Each opens
+  // in a NEW TAB: following it in this one threw away the search that was on screen, and
+  // there is no return-address parameter that would bring it back.
+  //
+  // What was made in that tab is not in this page's catalog, so the first return to this tab
+  // fetches the catalog again; without it the tag you just made is missing from the rail with
+  // nothing saying why.
+  let catalogStale = false;
+  const openCreate = (url) => { catalogStale = true; window.open(url, '_blank', 'noopener'); };
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState !== 'visible' || !catalogStale || !CAT) return;
+    catalogStale = false;
+    jsonFetch(CFG.catalogUrl)
+      .then((data) => { CAT = data; applyNow(false); renderOpenSheet(); })
+      .catch((e) => {
+        showToast(`Could not refresh the filter list: ${e.message || 'request failed'}. `
+                  + 'Reload the page to see a tag or group you just made.', { type: 'error' });
+      });
+  });
   const DIM_CREATE = {
-    // Plain navigation to the tag list with its create modal open (?new=1). Creating a
-    // tag leaves you on that list rather than back here - there is no return-address
-    // parameter, so linking one would promise a return that does not happen.
-    tag: { label: '+ Create tag', run: () => { location.href = CFG.newTagUrl; } },  // nav-ok: menu item
+    // The tag list with its create modal open (?new=1).
+    tag: { label: '+ Create tag', run: () => openCreate(CFG.newTagUrl) },
     // Groups are made FROM channels - there is no blank-group screen, and
     // create-group-modal.js clones an existing health check rather than starting
     // empty. So this goes to the Groups page. B5 should point it at the same
     // "Group selected" modal the selection bar uses once a selection exists,
     // which is the flow that actually creates one from here.
-    group: { label: '+ Create group', run: () => { location.href = CFG.groupsUrl; } },  // nav-ok: menu item
+    group: { label: '+ Create group', run: () => openCreate(CFG.groupsUrl) },
   };
 
   /* ── Filter state helpers ────────────────────────────────────────────
@@ -3855,8 +3871,9 @@
     ? '' : '<div class="fac-none">no value matches that</div>');
 
   /* ── The two `when` values you fill in ───────────────────────────────
-     EACH CONTROL SITS UNDER THE VALUE THAT OWNS IT (mockup 25 round 5: "Under each
-     value. Final answer."), and the rule that goes with it: until a control holds a
+     Each control is its own headed block below the value list, never drawn as a child of
+     the value above it - "Within the next" sitting indented under Tomorrow read as part of
+     Tomorrow. The rule that goes with it: until a control holds a
      value, its row counts n/a and can be neither included nor excluded. That is why the
      tri-state buttons are only drawn once the value exists - dimValues() leaves it out
      of the list entirely until then, so this block draws the row's controls and the
@@ -3868,7 +3885,7 @@
      about when evening starts, and any such rule is somebody's wrong. */
   function whenControlsHtml() {
     return `<div class="when-fill${relSet() ? ' on' : ''}">
-        <span class="wf-l">${esc(relSet() ? relLabel() : 'Next ...')}</span>
+        <span class="wf-l">Within the next</span>
         <span class="wf-c">
           <input class="wf-n" type="number" min="1" step="1" inputmode="numeric"
             data-whenrel="n" value="${esc(whenRel.n)}" placeholder="n"
@@ -3879,16 +3896,16 @@
         </span>
       </div>
       <div class="when-fill${customSet() ? ' on' : ''}">
-        <span class="wf-l">${esc(customSet() ? customLabel() : 'Custom range')}</span>
+        <span class="wf-l">Date and time range</span>
         <span class="wf-c wf-range">
           <input type="datetime-local" data-whencustom="from" value="${esc(whenCustom.from)}"
             aria-label="From" data-tip="Showings that START at or after this. Leave it empty for no lower bound.">
           <input type="datetime-local" data-whencustom="to" value="${esc(whenCustom.to)}"
             aria-label="To" data-tip="Showings that START at or before this. Leave it empty for no upper bound.">
         </span>
-      </div>
-      <div class="fac-note">Both are shown in ${esc(displayTz())}, the display timezone. One bound on its
-        own is a real window.</div>`;
+        <div class="fac-note">A specific start and end, dates included. Range is based on your
+          configured timezone (${esc(displayTz())}). You don't have to set a start and end.</div>
+      </div>`;
   }
 
   /* One control, not two - a duration bound has no `when`-style relative half, it is just a
@@ -3897,8 +3914,8 @@
      different one). */
   function durationControlsHtml() {
     return `<div class="when-fill${durationSet() ? ' on' : ''}">
-        <span class="wf-l">${esc(durationSet() ? durationLabel() : 'Length...')}</span>
-        <span class="wf-c wf-range">
+        <span class="wf-l">Length</span>
+        <span class="wf-c">
           <input class="wf-n" type="number" min="0" step="1" inputmode="numeric"
             data-durrange="min" value="${esc(durationRange.min)}" placeholder="min"
             aria-label="At least" data-tip="Showings running at least this long. Leave it empty for no lower bound.">
@@ -3909,24 +3926,24 @@
             ${DUR_UNITS.map((u) => `<option value="${u}"${durationRange.unit === u ? ' selected' : ''}>${u}</option>`).join('')}
           </select>
         </span>
-      </div>
-      <div class="fac-note">Either bound alone is a real filter.</div>`;
+        <div class="fac-note">You don't have to set a min and max.</div>
+      </div>`;
   }
 
   /* Two time boxes, wired like Program length's range. The note names the timezone for the
      same reason `when`'s does: "6 PM" means nothing until you know whose clock it is. */
   function todControlsHtml() {
     return `<div class="when-fill${todSet() ? ' on' : ''}">
-        <span class="wf-l">${esc(todSet() ? todLabel() : 'Starts between...')}</span>
+        <span class="wf-l">Clock time range</span>
         <span class="wf-c wf-range">
           <input type="time" data-todrange="from" value="${esc(todRange.from)}"
             aria-label="From" data-tip="Showings that START at or after this time. Leave it empty for no lower bound.">
           <input type="time" data-todrange="to" value="${esc(todRange.to)}"
             aria-label="To" data-tip="Showings that START at or before this time. Earlier than From means the range runs past midnight. Leave it empty for no upper bound.">
         </span>
-      </div>
-      <div class="fac-note">On the clock in ${esc(displayTz())}, the display timezone, on any day.
-        Either end alone is a real filter.</div>`;
+        <div class="fac-note">Just a time, no date. Based on your configured timezone
+          (${esc(displayTz())}) on any day of the week. You don't have to set a start and end.</div>
+      </div>`;
   }
 
   /* Editing a control REPLACES the value it owns rather than adding a second one: there

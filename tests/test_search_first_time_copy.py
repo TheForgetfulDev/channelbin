@@ -41,9 +41,9 @@ class InfoMarkerTests(unittest.TestCase):
 
 class FilterWordingTests(unittest.TestCase):
 
-    def test_the_tag_help_owns_up_to_the_two_it_ships_with(self):
+    def test_the_tag_help_owns_up_to_the_ones_it_ships_with(self):
         help_text = DIMENSION_BY_KEY['tag'].help
-        self.assertIn('live and new', help_text)
+        self.assertIn('live, new and 4k', help_text)
         self.assertIn('Tags page', help_text)
         self.assertNotIn('you put on a channel yourself', help_text)
 
