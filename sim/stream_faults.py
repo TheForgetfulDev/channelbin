@@ -59,9 +59,11 @@ class OpenPlan:
     delay: float = 0.0              # seconds before the first byte
     placeholder: object = None      # the placeholder fault, when the clip is served
     profile: str | None = None      # another loop for the channel
+    no_video: bool = False          # the stream declares no video at all
     silent_after: int | None = None
     hold_silence: float = 0.0
     close_after: int | None = None
+    close_by: str = 'close_mid_stream'
     range_start: int = 0            # the request's Range, which only the placeholder honors
     names: list = field(default_factory=list)
 
@@ -94,10 +96,12 @@ def plan_open(taken) -> OpenPlan:
             plan.placeholder = a
         elif name in _SWAPS and plan.profile is None:
             plan.profile = p['profile']
+        elif name == 'no_video_track':
+            plan.no_video = True
         elif name == 'silent_socket' and plan.silent_after is None:
             plan.silent_after, plan.hold_silence = p['after_bytes'], p['hold_seconds']
-        elif name == 'close_mid_stream' and plan.close_after is None:
-            plan.close_after = p['after_bytes']
+        elif name in ('close_mid_stream', 'keeps_dropping') and plan.close_after is None:
+            plan.close_after, plan.close_by = p['after_bytes'], name
     return plan
 
 

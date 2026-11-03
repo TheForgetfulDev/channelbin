@@ -2237,6 +2237,71 @@ class SimDoesNotImportAppTests(unittest.TestCase):
             "__import__('app')"])
 
 
+def _undeclared_loops(source, always):
+    """(class, line, loop) for each `.inject(..., profile='<loop>')` in a class that neither
+    `always` nor that class's `extra`, or an `extra` it inherits from this source, names."""
+    classes = [n for n in ast.parse(source).body if isinstance(n, ast.ClassDef)]
+    by_name = {c.name: c for c in classes}
+
+    def declared(cls):
+        names = set()
+        for stmt in cls.body:
+            if (isinstance(stmt, ast.Assign) and isinstance(stmt.value, ast.Tuple)
+                    and any(isinstance(t, ast.Name) and t.id == 'extra' for t in stmt.targets)):
+                names |= {e.value for e in stmt.value.elts if isinstance(e, ast.Constant)}
+        for base in cls.bases:
+            if isinstance(base, ast.Name) and base.id in by_name:
+                names |= declared(by_name[base.id])
+        return names
+
+    found = []
+    for cls in classes:
+        known = set(always) | declared(cls)
+        for node in ast.walk(cls):
+            if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                    and node.func.attr == 'inject'):
+                continue
+            for kw in node.keywords:
+                if (kw.arg == 'profile' and isinstance(kw.value, ast.Constant)
+                        and kw.value.value not in known):
+                    found.append((cls.name, node.lineno, kw.value.value))
+    return found
+
+
+class SimLoopDeclaredTests(unittest.TestCase):
+    """A test class that injects a fault naming a loop declares that loop (BUGS.md 2026-11-03).
+    One rendered for another class, or already in this machine's cache, is absent on a fresh
+    checkout whenever the shard split parts the two: the simulator answers 503 and the capture
+    exits 8."""
+
+    def test_every_injected_loop_is_declared_by_its_class(self):
+        from tests.support.sim_streams import TEST_PROFILES
+        offenders = []
+        for path in _walk(TESTS_DIR, '.py'):
+            if os.path.basename(path).startswith('test_'):
+                offenders += [f'{_rel(path)}:{line}: {cls} injects {loop!r}'
+                              for cls, line, loop in _undeclared_loops(_read(path), TEST_PROFILES)]
+        self.assertEqual(offenders, [],
+                         'Name the loop in the class\'s `extra`, or it renders only if something '
+                         'else got there first:\n' + '\n'.join(offenders))
+
+    def test_the_scan_sees_a_loop_the_class_does_not_declare(self):
+        planted = textwrap.dedent("""
+            class Base:
+                extra = ('inherited',)
+            class Sound(Base):
+                extra = ('own',)
+                def test_a(self):
+                    self.sim.inject('picture', self.label, profile='own')
+                    self.sim.inject('picture', self.label, profile='inherited')
+                    self.sim.inject('picture', self.label, profile='always')
+            class Missing:
+                def test_b(self):
+                    self.sim.inject('placeholder', self.label, profile='own', clip_seconds=60)
+        """)
+        self.assertEqual(_undeclared_loops(planted, ('always',)), [('Missing', 12, 'own')])
+
+
 class BareExceptTests(unittest.TestCase):
     """No broad `except Exception:` / bare `except:` whose entire body is `pass` - a silent
     swallow (CLAUDE.md Error handling). Narrow guards (`except OSError: pass`) are allowed."""

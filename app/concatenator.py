@@ -11,6 +11,8 @@ from collections import namedtuple
 from datetime import datetime
 
 from .fmt_utils import fmt_bytes as _fmt_bytes, fmt_duration
+from .join_layout import (LAYOUT_REMUX_SUFFIX, concat_stream_lines, describe as describe_layout,
+                          join_input_args, plan_layouts, remux_args)
 from .proc_utils import delivery_ratio, supervise_ffmpeg, terminate_or_kill, write_concat_list
 
 log = logging.getLogger(__name__)
@@ -25,6 +27,9 @@ _concat_lock = threading.Lock()
 # bound the join (ffmpeg.concat_pre_output_timeout_seconds / concat_stall_seconds)
 # are both minutes-scale, so nothing about this number is worth tuning.
 CONCAT_POLL_INTERVAL_SECONDS = 5
+
+#: extra_data['kind'] of the DIAGNOSTICS event a join writes when segments disagreed on layout.
+JOIN_LAYOUT_DIAGNOSTIC = 'join_layout'
 
 # ── Live concat registry ──────────────────────────────────────────────────────
 # recording_id -> time.monotonic() when its chain claimed it. Mirrors
@@ -485,6 +490,148 @@ def _delivery_rate_reported_segments(recording_id: int):
     return reported
 
 
+def _reported_reconnect_holes(recording_id: int):
+    """({segment number: [hole seconds]} the captures reported, {segment numbers the join
+    already looked at}) - one query for the recording, never one per segment.
+
+    The second set is read from the join's own event rather than inferred from the file: a
+    Retry join re-enters from the top, and a segment whose holes were closed shows no jump
+    to find, which would otherwise read as "reported but not found" every time
+    (CLAUDE.md, "already done" is a fact you recorded)."""
+    from .database import RecordingEvent, DIAGNOSTICS
+    from .hole_repair import DIAGNOSTIC_KIND
+
+    reported, done = {}, set()
+    rows = RecordingEvent.query.filter_by(
+        recording_id=recording_id, event_type=DIAGNOSTICS).all()
+    for row in rows:
+        if not row.extra_data or row.segment_number is None:
+            continue
+        try:
+            extra = json.loads(row.extra_data)
+        except (ValueError, TypeError):
+            continue  # a malformed row names no hole and records no repair
+        if not isinstance(extra, dict):
+            continue
+        if extra.get('kind') == 'capture_stderr' and extra.get('reconnect_hole_seconds'):
+            reported[row.segment_number] = list(extra['reconnect_hole_seconds'])
+        elif extra.get('kind') == DIAGNOSTIC_KIND and extra.get('outcome') != 'error':
+            # A repair that failed (no disk, a killed remux) is tried again on a Retry
+            # join, as the concat's own "free space and retry" advice promises.
+            done.add(row.segment_number)
+    return reported, done
+
+
+def _close_reconnect_holes(recording_id: int, valid_segments, cfg):
+    """Close, in place, the holes each segment's capture reported ffmpeg's reconnect repair
+    left in its timeline (hole_repair.py), before anything measures the file.
+
+    Here rather than at capture time because no capture flag prevents them, and before the
+    content-duration probe so a segment's stored duration is the file the join reads. One
+    event per segment looked at, written whether the holes closed or not: a hole that stays
+    is a hole the timeline scan will report, and the user should know the join tried. Never
+    raises and never fails the join - a segment it could not repair is joined as it is."""
+    from .config import resolve_ffmpeg_path
+
+    try:
+        reported, done = _reported_reconnect_holes(recording_id)
+        ffmpeg_path = resolve_ffmpeg_path(cfg['ffmpeg']['path']) if reported else None
+    except Exception as exc:
+        log.warning('Recording %d: could not read which segments reported a hole, so none '
+                    'is repaired: %s', recording_id, exc)
+        return
+    for seg in valid_segments:
+        holes = reported.get(seg.segment_number)
+        if not holes or seg.segment_number in done:
+            continue
+        try:
+            _close_segment_holes(recording_id, seg, holes, cfg, ffmpeg_path)
+        except Exception as exc:
+            # A diagnostic must never be able to fail the join it runs inside of.
+            log.warning('Recording %d seg %s: hole repair raised, segment joined as it is: %s',
+                        recording_id, seg.segment_number, exc)
+
+
+def _note_segment_track_ends(recording_id, valid_segments):
+    from .track_ends import note_track_ends
+    try:
+        note_track_ends(recording_id, [(s.segment_number, s.file_path) for s in valid_segments],
+                        'segments' if len(valid_segments) > 1 else 'capture')
+    except Exception as exc:
+        # A diagnostic must never be able to fail the join it runs inside of.
+        log.warning('Recording %d: could not compare where the picture and sound end: %s',
+                    recording_id, exc)
+
+
+def _close_segment_holes(recording_id, seg, holes, cfg, ffmpeg_path):
+    """One segment's repair and its event (_close_reconnect_holes)."""
+    from . import db
+    from .database import add_recording_event, DIAGNOSTICS
+    from .db_utils import retry_on_locked
+    from .fmt_utils import SECONDS_LIST_SHOWN, counted, seconds_list
+    from .hole_repair import HOLE_REMUX_SUFFIX, DIAGNOSTIC_KIND, close_reconnect_holes
+
+    dest = f'{seg.file_path}{HOLE_REMUX_SUFFIX}'
+    try:
+        free = shutil.disk_usage(os.path.dirname(seg.file_path) or '.').free
+        size = os.path.getsize(seg.file_path)
+    except OSError as exc:
+        log.warning('Recording %d seg %s: could not size for the hole repair: %s',
+                    recording_id, seg.segment_number, exc)
+        return
+    label = f'Recording {recording_id} segment {seg.segment_number} hole repair'
+    if free < size:
+        repair = None
+        error = (f'not enough disk space for the rewrite - need {_fmt_bytes(size)}, '
+                 f'only {_fmt_bytes(free)} free')
+    else:
+        try:
+            repair = close_reconnect_holes(
+                seg.file_path, holes, ffmpeg_path=ffmpeg_path,
+                pre_output_timeout=cfg['ffmpeg']['concat_pre_output_timeout_seconds'],
+                stall_seconds=cfg['ffmpeg']['concat_stall_seconds'],
+                on_spawn=lambda proc: _track_join_child(recording_id, proc, dest),
+                label=label)
+            error = repair.error
+        except Exception as exc:
+            repair, error = None, str(exc)
+        finally:
+            _untrack_join_child(recording_id)
+    closed = list(repair.closed) if repair else []
+    left = list(repair.left) if repair else [(h, 'the rewrite did not run') for h in holes]
+    what = (f'{counted(len(holes), "hole")} of about {seconds_list(holes, limit=SECONDS_LIST_SHOWN)} that ffmpeg\'s '
+            f'reconnect repair left in the file\'s timeline')
+    if error is not None:
+        detail = (f'Segment {seg.segment_number}: the join could not close the {what} '
+                  f'({error}) - the file is left as it was')
+        log.warning('Recording %d seg %s: hole repair failed: %s', recording_id,
+                    seg.segment_number, error)
+    elif closed:
+        detail = (f'Segment {seg.segment_number}: the join closed the '
+                  f'{counted(len(closed), "hole")} of about {seconds_list(closed, limit=SECONDS_LIST_SHOWN)} that '
+                  f'ffmpeg\'s reconnect repair left in the file\'s timeline, with no '
+                  f'content missing on either side - the file is {sum(closed):.1f} s '
+                  f'shorter and plays straight through')
+        log.info('Recording %d seg %s: closed %d hole(s), %.1f s', recording_id,
+                 seg.segment_number, len(closed), sum(closed))
+    else:
+        detail = f'Segment {seg.segment_number}: the join looked for the {what}'
+    for hole, why in left:
+        detail += f'; a hole of about {hole:.1f} s was reported but {why}, so it stays'
+
+    @retry_on_locked()
+    def _note_and_commit():
+        add_recording_event(recording_id, DIAGNOSTICS, detail=detail,
+                            segment_number=seg.segment_number,
+                            extra={'kind': DIAGNOSTIC_KIND, 'closed_seconds': closed,
+                                   'left_seconds': [h for h, _why in left],
+                                   'outcome': ('error' if error is not None else
+                                               'closed' if closed else 'not_found')})
+        db.session.commit()
+
+    _note_and_commit()
+
+
 def _measure_segment_content_durations(recording_id: int, valid_segments):
     """ffprobe each segment's finished file and store its content length on the row.
 
@@ -577,12 +724,96 @@ def _measure_segment_content_durations(recording_id: int, valid_segments):
                     finding.wall_seconds, finding.surplus_seconds, finding.ratio)
 
 
+def _plan_join_layout(recording_id: int, segments):
+    """(plan, {plan index: path} of the segments it keeps out). Plan indexes are positions in
+    `segments`.
+
+    Reads each closed file's streams. Never raises and never fails the join: a segment it
+    could not read goes through as it is (join_layout.plan_layouts)."""
+    from .probe import stream_layout
+    layouts = [stream_layout(s.file_path) for s in segments]
+    sizes = []
+    for s in segments:
+        try:
+            sizes.append(os.path.getsize(s.file_path))
+        except OSError as exc:
+            log.warning('Recording %d seg %s: could not size for the layout plan: %s',
+                        recording_id, s.segment_number, exc)
+            sizes.append(0)
+    plan = plan_layouts(layouts, sizes)
+    if plan.tracks:
+        log.warning('Recording %d: its segments do not share a stream layout (%s); joining by '
+                    'track', recording_id, layouts)
+    return plan, {i: segments[i].file_path for i in plan.set_aside}
+
+
+def _remux_for_join(recording_id, segments, plan, kept_paths, scratch, ffmpeg_path,
+                    pre_output_timeout, stall_seconds):
+    """{plan index: path to join} for `segments`, the plan's own list, in order.
+
+    A segment whose rewrite fails is added to `kept_paths`: left on disk and named, never joined
+    into the wrong track and never a reason to lose the rest of the recording. `scratch` gets
+    each file written, as it is started, for the caller's cleanup. The rewrite's ffmpeg is
+    tracked like the join's, so a shutdown can reach it and takes its partial with it."""
+    paths = {}
+    for i, seg in enumerate(segments):
+        if i in kept_paths:
+            continue
+        kinds = plan.remux.get(i)
+        if kinds is None:
+            paths[i] = seg.file_path
+            continue
+        dest = f'{seg.file_path}{LAYOUT_REMUX_SUFFIX}'
+        scratch.append(dest)
+        try:
+            run = supervise_ffmpeg(
+                [ffmpeg_path, *remux_args(kinds, seg.file_path, dest)], dest,
+                scratch_prefix='concat', scratch_key=recording_id,
+                interval=CONCAT_POLL_INTERVAL_SECONDS,
+                pre_output_timeout=pre_output_timeout, stall_seconds=stall_seconds,
+                progress_signal='size', noun='concat',
+                on_spawn=lambda proc, d=dest: _track_join_child(recording_id, proc, d),
+                label=f'Recording {recording_id} segment {seg.segment_number} layout')
+            error = None if run.success else run.error_msg
+        except Exception as exc:
+            error = str(exc)
+        finally:
+            _untrack_join_child(recording_id)
+        if error is None:
+            paths[i] = dest
+        else:
+            log.warning('Recording %d: could not rewrite segment %s for the join, so it is kept '
+                        'out and left on disk: %s', recording_id, seg.segment_number, error)
+            kept_paths[i] = seg.file_path
+    return paths
+
+
+def join_kept_out_segments(events) -> set:
+    """The segment ids a finished join left on disk, from its own diagnostic. For a page
+    that may not stat them: a join consumes every other segment. Reads an already-loaded
+    event list."""
+    from .database import DIAGNOSTICS
+    ids = set()
+    for evt in events:
+        if evt.event_type != DIAGNOSTICS or not evt.extra_data:
+            continue
+        try:
+            extra = json.loads(evt.extra_data)
+        except ValueError as exc:
+            log.warning('Recording %s: unreadable diagnostic: %s', evt.recording_id, exc)
+            continue
+        if isinstance(extra, dict) and extra.get('kind') == JOIN_LAYOUT_DIAGNOSTIC:
+            ids.update(extra.get('kept_out') or ())
+    return ids
+
+
 def _run_concatenation(app, recording_id: int, *, reason: str):
     from . import db
-    from .config import load_config
+    from .config import load_config, resolve_ffmpeg_path
     from .database import (
         Recording, RecordingSegment, add_recording_event, preserve_cancelled_status,
         CAPTURE_COMPLETE, CONCATENATION_STARTED, CONCATENATION_DONE, CONCATENATION_FAILED,
+        DIAGNOSTICS,
         REC_STATUS_ANALYZING, REC_STATUS_CONCATENATING, REC_STATUS_FAILED, REC_STATUS_PAUSED,
         FAILURE_ALL_SEGMENTS_PLACEHOLDER, FAILURE_SEGMENT_FILES_MISSING, FAILURE_NO_VALID_SEGMENTS,
         FAILURE_PAUSED_NOTHING_CAPTURED, FAILURE_INSUFFICIENT_DISK_SPACE, FAILURE_CONCAT_ERROR,
@@ -741,7 +972,12 @@ def _run_concatenation(app, recording_id: int, *, reason: str):
                     return True
 
                 if _mark_no_segments_failed_and_commit():
-                    if not stream_delivered:
+                    if rec.gave_up_reason:
+                        # The stream's failure is what ended this capture, whatever became of
+                        # its files, and a Retry join can re-enter here: the idempotent call.
+                        from .health_score import apply_capture_phase_health_observation
+                        apply_capture_phase_health_observation(app, recording_id)
+                    elif not stream_delivered:
                         from .health_score import apply_recording_health_observation
                         apply_recording_health_observation(app, recording_id, 'failed')
                     # `status` is not optional on a frame that moves a row: dashboard.js
@@ -772,9 +1008,23 @@ def _run_concatenation(app, recording_id: int, *, reason: str):
             from .health_score import apply_capture_phase_health_observation
             apply_capture_phase_health_observation(app, recording_id)
 
+            # Before anything measures a segment: a hole closed here is a file the probe
+            # below and the join both read.
+            _close_reconnect_holes(recording_id, valid_segments, cfg)
+
+            # While each segment is still its own file: the join starts every segment's tracks
+            # together, which hides a distance from anything that reads the joined file.
+            _note_segment_track_ends(recording_id, valid_segments)
+
             # Before concat, while each segment is still its own closed file - afterwards
             # the joined .ts reports one duration and the per-segment answer is gone.
             _measure_segment_content_durations(recording_id, valid_segments)
+
+            # Before the sizes below, since a segment set aside here is not part of the join.
+            # planned_segments is the list the plan's indexes are into.
+            planned_segments = valid_segments
+            layout_plan, kept_paths = _plan_join_layout(recording_id, planned_segments)
+            valid_segments = [s for i, s in enumerate(planned_segments) if i not in kept_paths]
 
             # Stat'ed once and kept: the total is the disk-space check's, and the individual
             # sizes are what the progress registry turns into "joined x of y".
@@ -827,10 +1077,22 @@ def _run_concatenation(app, recording_id: int, *, reason: str):
             # success, ffmpeg failure, an exception, a Retry that re-enters this function -
             # leaves nothing behind claiming a join is running (CLAUDE.md, teardown releases
             # everything the create path acquired). A queued concat has not reached this
-            # point and correctly has no entry.
-            _start_concat_progress(recording_id, total_bytes=total_seg_bytes,
-                                   sizes=seg_sizes)
+            # point and correctly has no entry. The same finally takes the layout rewrites.
+            layout_scratch = []
             try:
+                join_paths = {}
+                if len(valid_segments) > 1 and layout_plan.remux:
+                    join_paths = _remux_for_join(
+                        recording_id, planned_segments, layout_plan, kept_paths, layout_scratch,
+                        resolve_ffmpeg_path(cfg['ffmpeg']['path']),
+                        concat_pre_output_timeout, concat_stall_seconds)
+                    if len(join_paths) != len(valid_segments):
+                        valid_segments = [s for i, s in enumerate(planned_segments)
+                                          if i not in kept_paths]
+                        seg_sizes = [os.path.getsize(s.file_path) for s in valid_segments]
+                        total_seg_bytes = sum(seg_sizes)
+                _start_concat_progress(recording_id, total_bytes=total_seg_bytes,
+                                       sizes=seg_sizes)
                 if len(valid_segments) == 1:
                     # Only one segment - just rename it
                     seg_path = valid_segments[0].file_path
@@ -843,8 +1105,12 @@ def _run_concatenation(app, recording_id: int, *, reason: str):
                         error_msg = str(exc)
                 else:
                     # Write concat.txt and run ffmpeg concat
-                    concat_txt = write_concat_list([seg.file_path for seg in valid_segments],
-                                                   prefix=f'dvr_{recording_id}_concat_')
+                    concat_txt = write_concat_list(
+                        [join_paths[i] for i in sorted(join_paths)] if join_paths
+                        else [seg.file_path for seg in valid_segments],
+                        prefix=f'dvr_{recording_id}_concat_',
+                        header=(concat_stream_lines(layout_plan.tracks)
+                                if layout_plan.tracks else ''))
 
                     @retry_on_locked()
                     def _mark_concat_started_and_commit():
@@ -854,12 +1120,12 @@ def _run_concatenation(app, recording_id: int, *, reason: str):
 
                     _mark_concat_started_and_commit()
 
-                    from .config import resolve_ffmpeg_path
                     ffmpeg_path = resolve_ffmpeg_path(cfg['ffmpeg']['path'])
                     cmd = [
                         ffmpeg_path,
                         '-err_detect', 'ignore_err',
                         '-fflags', '+genpts+discardcorrupt',
+                        *join_input_args(layout_plan),
                         '-f', 'concat',
                         '-safe', '0',
                         '-i', concat_txt,
@@ -915,6 +1181,11 @@ def _run_concatenation(app, recording_id: int, *, reason: str):
                             pass  # best-effort concat.txt cleanup
             finally:
                 _clear_concat_progress(recording_id)
+                for scratch in layout_scratch:
+                    try:
+                        os.unlink(scratch)
+                    except OSError:
+                        pass  # best-effort, and a rewrite that failed may have written nothing
 
             if success:
                 final_size = os.path.getsize(output_path) if os.path.exists(output_path) else 0
@@ -929,6 +1200,16 @@ def _run_concatenation(app, recording_id: int, *, reason: str):
                     # A file that landed under a different name than the recording is called
                     # has to be explainable afterwards, so the rename is named here rather
                     # than left for the user to notice in the output path.
+                    layout_note = describe_layout(
+                        layout_plan, {i: s.segment_number for i, s in enumerate(planned_segments)},
+                        kept_paths)
+                    if layout_note:
+                        add_recording_event(
+                            recording_id, DIAGNOSTICS, detail=layout_note,
+                            extra={'kind': JOIN_LAYOUT_DIAGNOSTIC,
+                                   'tracks': list(layout_plan.tracks),
+                                   'kept_out': sorted(planned_segments[i].id
+                                                      for i in kept_paths)})
                     add_recording_event(recording_id, CONCATENATION_DONE,
                                         detail=f'Concat complete: {output_path} ({_fmt_bytes(final_size)})'
                                                + (f' - renamed, {renamed_from} was already taken'

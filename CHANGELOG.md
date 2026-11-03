@@ -5,6 +5,57 @@ Notable changes to ChannelBin, newest first. This project follows
 release is tagged `v<version>` in git, and the version the app is running is shown in the
 page footer.
 
+## 0.38.0 - 2026-11-03
+
+Improved A/V sync with dropping streams, and reconnects now impact the health score.
+
+**Added**
+
+- A recording that runs out of things to try keeps what it captured. A stream that uses up its
+  retries, keeps failing restarts or keeps arriving faster than live with nowhere to move now
+  ends the capture and joins what it holds into a playable file. The recording says it gave up
+  on its list row, its page and the guide, and an alert stays until dismissed. A capture holding
+  nothing still fails.
+- Picture and sound are compared on every recording, on each segment before the join and on the
+  converted file after it. If they end more than 2 seconds apart, the recording gets an alert
+  and a note on its page, and its source file is kept.
+
+**Changed**
+
+- The health score counts reconnects inside a running capture, so a channel that reconnects
+  often will see its score fall from now on. It also takes 80 off the correction for a recording
+  out of step, and a bad correction now weighs what the recording weighs. Two new settings
+  control the penalties, `reconnect_penalty_per_hr` and `out_of_step_penalty`.
+- Real-time pacing no longer turns itself on. On a feed that keeps dropping it loses video at
+  each reconnect. It stays available as a default and per channel.
+- A stream that offers several qualities records only the highest resolution, instead of
+  fetching and writing all of them. The recording's events say which one.
+- A sync writes only the search index rows that changed instead of rebuilding the whole index,
+  so search spends far less time on its slower fallback.
+- Sorting Search Programs by category, channel or EPG id is about five times faster, and the
+  group counts are about 2.5 times faster.
+- A finished recording's page no longer wakes sleeping storage to check its files. Clicking Play
+  or Download is what finds out if a file has gone.
+
+**Fixed**
+
+- A provider resending its buffer after a reconnect no longer counts as fast delivery, so it no
+  longer stops a healthy capture.
+- A feed whose video stopped for more than 10 seconds while its sound ran on no longer plays out
+  of step for the rest of the file. The gap stays in the file, where the timeline scan reports
+  it and the conversion fills it in step.
+- A hole left by a reconnect, with nothing actually missing on either side, is closed at the join
+  so the file plays straight through. The recording's events say what was closed.
+- A segment that declared no video no longer has its sound written into the finished file's video
+  track, which left the file short of that sound.
+- An HDR recording on the software path is copied rather than re-encoded to 8-bit H.264 that
+  still carried HDR tags, which looked banded or washed out.
+- A showing across midnight reads "YESTERDAY TO TODAY" in Search Programs, instead of looking as
+  if it had already ended.
+- A recording with many reconnects no longer stores an event line half a megabyte long.
+- A "Retry conversion" menu item that could never work is gone from finished `.ts` recordings.
+- Three recording events that claimed more than was measured now say only what was checked.
+
 ## 0.37.0 - 2026-11-01
 
 Clearer first steps for new users.

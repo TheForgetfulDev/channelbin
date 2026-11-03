@@ -474,7 +474,7 @@ class RebuildWiringTests(unittest.TestCase):
     def test_a_rebuild_registers_so_maintenance_can_yield_to_it(self):
         seen = {}
 
-        def _one(name, reason):
+        def _one(name, reason, only_changes=False):
             seen['kinds'] = admission.active_kinds()
             return True
 

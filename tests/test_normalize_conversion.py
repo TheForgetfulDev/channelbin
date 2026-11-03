@@ -25,6 +25,7 @@ import app.postprocessor as ppmod  # noqa: E402
 from app import db, toolchain  # noqa: E402
 from app.alerts import GPU_ENCODER_UNAVAILABLE  # noqa: E402
 from app.database import (Alert, Recording, RecordingEvent, RecordingSegment, CONVERSION_DONE,  # noqa: E402
+                          CONVERSION_RESTARTED, SEEK_DAMAGE_DETECTED,
                           DIAGNOSTICS)
 from app.postprocessor import ConversionResult, do_postprocess  # noqa: E402
 from tests.support import clips, seed  # noqa: E402
@@ -170,12 +171,15 @@ class _NormalizeCase(unittest.TestCase):
                 content_duration_seconds=2.0))
         db.session.commit()
 
-    def _convert(self, cfg, trial=None):
-        """Run do_postprocess with the encode stubbed; return every command it would run."""
+    def _convert(self, cfg, trial=None, deaths=()):
+        """Run do_postprocess with the encode stubbed; return every command it would run.
+        `deaths` are results the first attempts return before one succeeds."""
+        deaths = iter(deaths)
+
         def attempt(app, rid, cmd, part_file, **kw):
             with open(part_file, 'wb') as fh:
                 fh.write(b'p' * 64)
-            return ConversionResult(True, 'success', out_time=4.0)
+            return next(deaths, None) or ConversionResult(True, 'success', out_time=4.0)
 
         def join(parts, output_path, *a, **k):
             with open(output_path, 'wb') as fh:
@@ -352,11 +356,29 @@ class PictureTests(_NormalizeCase):
         self.assertEqual((st['width'], st['height']), (1920, 1080))
         self.assertEqual(st.get('sample_aspect_ratio'), '1:1')
 
-    def test_an_hdr_source_is_not_normalized_in_software_and_says_why(self):
+    def test_an_hdr_source_is_copied_in_software_and_says_why(self):
+        """BUGS.md 2026-11-02: libx264 wrote 8-bit H.264 still tagged PQ/BT.2020."""
         self._use('hdrmixed.ts', [('1280x720', 25.0, 2, False), ('1920x1080', 50.0, 2, False)])
         cmd = self._convert(_config(reencode_mode='always'))[0]
         self.assertNotIn('-vf', cmd)
-        self.assertEqual(len(self._events(DIAGNOSTICS, 'normalize_skipped_hdr')), 1)
+        self.assertEqual(self._arg(cmd, '-c:v'), 'copy')
+        self.assertNotIn('libx264', cmd)
+        said = self._events(DIAGNOSTICS, 'hdr_reencode_skipped')
+        self.assertEqual(len(said), 1)
+        self.assertIn('copied as it is', said[0].detail)
+
+    def test_a_damaged_hdr_source_is_not_promised_a_re_encode(self):
+        """Found by review: the damage event, written first, said the re-encode was coming."""
+        self._use('hdrmixed.ts', [('1280x720', 25.0, 2, False), ('1920x1080', 25.0, 2, False)])
+        scan = (True, {'max_gap_seconds': 0.0}, '3 gaps')
+        with mock.patch.object(ppmod, '_scan_recording_timeline', return_value=scan):
+            cmd = self._convert(_config())[0]
+        self.assertEqual(self._arg(cmd, '-c:v'), 'copy')
+        said = self._events(SEEK_DAMAGE_DETECTED)[0].detail
+        self.assertIn('3 gaps', said)
+        self.assertNotIn('re-encode', said)
+        note = self._events(DIAGNOSTICS, 'hdr_reencode_skipped')[0].detail
+        self.assertIn('damage in it stays in the file', note)
 
     def test_an_hdr_source_alone_is_never_a_normalize_trigger_in_software(self):
         self._use('hdrmixed.ts', [('1280x720', 25.0, 2, False), ('1920x1080', 25.0, 2, False)])
@@ -366,6 +388,35 @@ class PictureTests(_NormalizeCase):
 
 class GpuCommandTests(_NormalizeCase):
     """argv only: VAAPI cannot run here."""
+
+    def test_an_hdr_source_whose_gpu_dies_is_copied_not_handed_to_libx264(self):
+        """BUGS.md 2026-11-02: the step back to the CPU is the other way to reach 8-bit H.264
+        tagged as HDR."""
+        self._use('hdrmixed.ts', [('1280x720', 25.0, 2, False), ('1920x1080', 50.0, 2, False)])
+        dead = ConversionResult(False, 'died', 'No VA display found', out_time=2.0,
+                                gpu_error='No VA display found')
+        first, second = self._convert(_config(video_encoder='vaapi', reencode_mode='always'),
+                                      deaths=[dead])
+        self.assertEqual(self._arg(first, '-c:v'), 'h264_vaapi')
+        self.assertEqual(self._arg(second, '-c:v'), 'copy')
+        self.assertNotIn('libx264', second)
+        said = [e.detail for e in self._events(CONVERSION_RESTARTED)]
+        self.assertTrue(any('copied as it is' in d for d in said), said)
+        self.assertEqual(db.session.get(Recording, self.rid).status, 'COMPLETED')
+
+    def test_an_sdr_source_whose_gpu_dies_still_falls_back_to_libx264(self):
+        self._use('mixed.ts', MIXED_ROWS)
+        dead = ConversionResult(False, 'died', 'No VA display found', out_time=2.0,
+                                gpu_error='No VA display found')
+        _first, second = self._convert(_config(video_encoder='vaapi', reencode_mode='always'),
+                                       deaths=[dead])
+        self.assertEqual(self._arg(second, '-c:v'), 'libx264')
+
+    def test_an_hdr_source_with_a_working_gpu_is_still_re_encoded(self):
+        self._use('hdrmixed.ts', [('1280x720', 25.0, 2, False), ('1920x1080', 50.0, 2, False)])
+        cmd = self._convert(_config(video_encoder='vaapi', reencode_mode='always'))[0]
+        self.assertEqual(self._arg(cmd, '-c:v'), 'h264_vaapi')
+        self.assertEqual(self._events(DIAGNOSTICS, 'hdr_reencode_skipped'), [])
 
     def test_a_mixed_recording_on_the_gpu_scales_before_the_upload(self):
         self._use('mixed.ts', MIXED_ROWS)

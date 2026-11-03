@@ -102,4 +102,23 @@ fi
 
 [ -z "$refused" ] || exit 1
 
+# requirements.txt is unpinned, so CI and the image take whatever is newest while a dev box
+# stays where it was last installed. Three simulator tests passed here on urllib3 2.0.7 and
+# failed a release's CI on 2.8.0 (dev/changelog/1240, dev/changelog/1405). Name what this run
+# measured, the way the ffmpeg note above does; `pip install --user --upgrade --upgrade-strategy
+# eager -r requirements.txt` closes a gap.
+python3 - <<'PY' >&2 || true
+import re
+from importlib import metadata
+names = [re.split(r'[<>=!~;\[ ]', line.strip())[0]
+         for line in open('requirements.txt') if line.strip() and line[0] != '#'] + ['urllib3']
+found = []
+for name in names:
+    try:
+        found.append(f'{name} {metadata.version(name)}')
+    except metadata.PackageNotFoundError:
+        found.append(f'{name} MISSING')
+print('run_tests.sh: python packages -', ', '.join(found))
+PY
+
 exec python3 -m tests.support.timing "$@"

@@ -31,7 +31,7 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 UTIL_JS = os.path.join(REPO, 'static', 'js', 'util.js')
 
 _EXPORTS = ('displayTz, displayHour12, tzFormatter, fmtTimeTz, fmtDateTz, '
-            'tzDayKey, tzDayLabel, utcIsoToDate, fmtHhmm')
+            'tzDayKey, tzDayLabel, tzDaySpanLabel, utcIsoToDate, fmtHhmm')
 
 # argv: [util.js path, tz meta content or '', hour12 meta content or '', expression]
 # A '' content stands for "the tag is absent", which is what a page outside base.html
@@ -295,6 +295,56 @@ class TzDayLabelTests(_Base, unittest.TestCase):
         bucket against the display timezone rather than the browser's."""
         got = self.evaluate('tzDayLabel(new Date())', tz=LONDON)
         self.assertEqual(got, 'Today')
+
+
+class TzDaySpanLabelTests(_Base, unittest.TestCase):
+    """dev/docs/BUGS.md 2026-11-02: a showing on now read "YESTERDAY 3:00 PM to 7:59 PM"."""
+
+    def _span(self, now_ms, start, stop):
+        return self.evaluate(
+            '(() => { const R = Date; const NOW = ' + now_ms + '; '
+            'class F extends R { constructor(...a) { if (a.length) super(...a); else super(NOW); } '
+            'static now() { return NOW; } } globalThis.Date = F; '
+            'try { return tzDaySpanLabel(new R(' + start + '), new R(' + stop + ')); } '
+            'finally { globalThis.Date = R; } })()')
+
+    # New York is UTC-5 here, so 05:00 UTC is midnight.
+    NOW = 'Date.UTC(2026, 0, 15, 17, 0)'
+
+    def test_a_showing_within_one_day_names_one_day(self):
+        self.assertEqual(self._span(self.NOW, 'Date.UTC(2026, 0, 15, 15, 0)',
+                                    'Date.UTC(2026, 0, 15, 19, 0)'), 'Today')
+
+    def test_a_showing_on_now_that_started_yesterday_names_both_days(self):
+        self.assertEqual(self._span(self.NOW, 'Date.UTC(2026, 0, 15, 2, 0)',
+                                    'Date.UTC(2026, 0, 15, 19, 0)'), 'Yesterday to Today')
+
+    def test_a_showing_crossing_tonights_midnight_names_both_days(self):
+        self.assertEqual(self._span(self.NOW, 'Date.UTC(2026, 0, 16, 4, 0)',
+                                    'Date.UTC(2026, 0, 16, 6, 0)'), 'Today to Tomorrow')
+
+    def test_ending_exactly_at_midnight_stays_on_its_own_day(self):
+        self.assertEqual(self._span(self.NOW, 'Date.UTC(2026, 0, 16, 3, 0)',
+                                    'Date.UTC(2026, 0, 16, 5, 0)'), 'Today')
+
+    def test_the_days_are_the_display_timezones(self):
+        """The same three hours cross midnight in New York and not in London, which is why
+        the comparison reads the display timezone rather than UTC or the browser's."""
+        span = 'tzDaySpanLabel(new Date(Date.UTC(2020, 0, 15, 3)), new Date(Date.UTC(2020, 0, 15, 7)))'
+        self.assertEqual(self.evaluate(span, tz=LONDON), 'Wed, Jan 15')
+        self.assertEqual(self.evaluate(span), 'Tue, Jan 14 to Wed, Jan 15')
+
+    def test_a_zero_length_or_backwards_listing_at_midnight_names_one_day(self):
+        midnight = 'Date.UTC(2026, 0, 16, 5, 0)'
+        self.assertEqual(self._span(self.NOW, midnight, midnight), 'Tomorrow')
+        self.assertEqual(self._span(self.NOW, midnight, 'Date.UTC(2026, 0, 15, 22, 0)'),
+                         'Tomorrow')
+
+    def test_a_missing_stop_falls_back_to_the_start_day(self):
+        self.assertEqual(self.evaluate('tzDaySpanLabel(new Date(), null)'), 'Today')
+
+    def test_a_missing_start_is_empty_not_a_crash(self):
+        self.assertEqual(self.evaluate('tzDaySpanLabel(null, new Date())'), '')
 
 
 class UtcIsoToDateTests(_Base, unittest.TestCase):

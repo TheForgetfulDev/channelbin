@@ -38,7 +38,8 @@ from app import connection_limits as connlim  # noqa: E402
 from app import recorder  # noqa: E402
 import app.config as cfgmod  # noqa: E402
 from app.database import (  # noqa: E402
-    RECORDING_FAILED, Recording, RecordingSegment, RecordingEvent, Alert, ChannelTest,
+    CAPTURE_GAVE_UP, RECORDING_FAILED, Recording, RecordingSegment, RecordingEvent, Alert,
+    ChannelTest,
 )
 from app import scheduler as sched_mod  # noqa: E402
 from app.scheduler import schedule_recording, get_scheduler  # noqa: E402
@@ -424,6 +425,7 @@ class WatchdogGiveUpReleasesEverythingTests(_ConnectionReleaseHarness):
         return glob.glob(os.path.join(log_dir, f'.cap-stderr-{self.rid}-*.log'))
 
     def test_a_give_up_releases_the_process_thread_state_and_spool(self):
+        self._nothing_captured()
         # 2, not 1: at 1 the very first stall gives up before any restart, and the stall
         # handling has already killed the process by then - so the give-up's own kill is
         # a no-op and this test would pass against a give-up that released nothing. The
@@ -453,6 +455,27 @@ class WatchdogGiveUpReleasesEverythingTests(_ConnectionReleaseHarness):
                          'the give-up left a capture stderr spool on disk')
         self.assertTrue(os.path.exists(self.seg_path),
                         'the give-up deleted the segment it was supposed to salvage')
+
+    def test_a_give_up_holding_data_releases_the_same_things_and_keeps_its_segment(self):
+        """The give-up that joins what it captured (dev/changelog/1404) owes every release
+        the FAILED one does, and reaches them through stop_recording rather than
+        _mark_recording_failed."""
+        self._extra_watchdog_cfg = {'max_consecutive_failures': 2}
+        self.state.process = sleeper()
+        self.relaunched.append(self.state.process)
+        path, fh = recorder._open_segment_stderr_spool(self.t.app, self.rid, 0)
+        self.state.stderr_path, self.state.stderr_fh = path, fh
+
+        with mock.patch('app.concatenator.do_concatenation'):
+            self._run_until_give_up(CAPTURE_GAVE_UP)
+
+        self.assertIsNotNone(db.session.get(Recording, self.rid).gave_up_reason)
+        self.assertTrue(self.relaunched, 'precondition: no restart was ever attempted')
+        self.assertIsNotNone(self.relaunched[-1].poll(), 'the give-up abandoned a live child')
+        self.assertFalse(self.wd.is_alive())
+        self.assertIsNone(recorder.get_state(self.rid))
+        self.assertEqual(self._spools_on_disk(), [])
+        self.assertTrue(os.path.exists(self.seg_path))
 
 
 def _sigterm_ignoring_child():

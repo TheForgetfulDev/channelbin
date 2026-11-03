@@ -77,6 +77,11 @@ class WatchdogHarness(unittest.TestCase):
             recorder._active.pop(self.rid, None)
         self.t.cleanup()
 
+    def _nothing_captured(self):
+        """Empty the rig's segment file. A give-up on a capture holding data ends it and joins
+        what it holds (dev/changelog/1404), so a test of the FAILED path starts here."""
+        open(self.seg_path, 'wb').close()
+
     def _exited_capture(self, code=1, stderr_text='Connection reset by peer\n'):
         """An ffmpeg stand-in that has ALREADY exited, spooling stderr the way the real
         capture does, so the exit code and tail this path records are real values."""

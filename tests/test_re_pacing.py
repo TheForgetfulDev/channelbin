@@ -153,39 +153,6 @@ class RecorderPacingTests(unittest.TestCase):
         self.assertIn('-re', argv)
         self.assertIn('-t', argv)
 
-    def test_automatic_pacing_reaches_the_next_launch(self):
-        """The watchdog's per-run choice lands on the relaunched segment, and the segment's
-        start event says why it is paced."""
-        from app import recorder
-        from app.database import RecordingEvent, SEGMENT_STARTED
-        state = recorder.RecordingState()
-        state.auto_paced_channel_ids.add(self.channel.id)
-        with recorder._lock:
-            recorder._active[self.rec.id] = state
-        try:
-            # The launch itself is what is under test, not the watchdog it would start.
-            # A set stop_event is no longer a way to skip the thread: the launch reads it
-            # as a teardown in progress and abandons the segment (dev/changelog/1242).
-            with mock.patch('app.watchdog.WatchdogThread') as thread_cls:
-                thread_cls.return_value.is_alive.return_value = False
-                argv = self._argv(0)
-        finally:
-            recorder._discard_stderr_spool(state.stderr_path, state.stderr_fh)
-            state.stderr_path, state.stderr_fh = None, None
-            with recorder._lock:
-                recorder._active.pop(self.rec.id, None)
-        self.assertIn('-re', argv)
-        self.assertTrue(state.current_segment_paced)
-        ev = RecordingEvent.query.filter_by(recording_id=self.rec.id,
-                                            event_type=SEGMENT_STARTED).one()
-        self.assertIn('real-time speed', ev.detail)
-        self.assertIn('automatically', ev.detail)
-
-    def test_automatic_pacing_does_not_override_channel_off(self):
-        from app.recorder import resolve_capture_pacing, PACING_CHANNEL_OFF
-        self.assertEqual(resolve_capture_pacing({'ffmpeg': {}}, False, 0, True),
-                         (False, PACING_CHANNEL_OFF))
-
 
 class PacingResolutionTests(unittest.TestCase):
     """recorder.resolve_capture_pacing, every source named."""
@@ -194,13 +161,12 @@ class PacingResolutionTests(unittest.TestCase):
         from app import recorder as r
         on, off = {'ffmpeg': {'pace_realtime': True}}, {'ffmpeg': {'pace_realtime': False}}
         cases = [
-            ((off, False, 600, False), (True, r.PACING_BOUNDED)),
-            ((off, True, 0, False), (True, r.PACING_CHANNEL_ON)),
-            ((on, False, 0, True), (False, r.PACING_CHANNEL_OFF)),
-            ((on, None, 0, False), (True, r.PACING_DEFAULT_ON)),
-            ((off, None, 0, True), (True, r.PACING_AUTOMATIC)),
-            ((off, None, 0, False), (False, r.PACING_DEFAULT_OFF)),
-            (({}, None, 0, False), (False, r.PACING_DEFAULT_OFF)),
+            ((off, False, 600), (True, r.PACING_BOUNDED)),
+            ((off, True, 0), (True, r.PACING_CHANNEL_ON)),
+            ((on, False, 0), (False, r.PACING_CHANNEL_OFF)),
+            ((on, None, 0), (True, r.PACING_DEFAULT_ON)),
+            ((off, None, 0), (False, r.PACING_DEFAULT_OFF)),
+            (({}, None, 0), (False, r.PACING_DEFAULT_OFF)),
         ]
         for args, expected in cases:
             self.assertEqual(r.resolve_capture_pacing(*args), expected, args)

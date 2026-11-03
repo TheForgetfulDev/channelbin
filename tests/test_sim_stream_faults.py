@@ -200,6 +200,15 @@ class ConnectionFaultTests(_Faulted):
         self.assertTrue(sim_ts.check(r['data']).clean)
         self.noted(f'closed after {150_000 // 188 * 188} bytes by close_mid_stream')
 
+    def test_keeps_dropping_closes_every_connection(self):
+        """Recording 32 dropped 40 times (dev/docs/BUGS.md 2026-11-03): unlike close_mid_stream
+        with times=1, the next connection drops as well."""
+        self.sim.inject('keeps_dropping', self.label, after_bytes=150_000)
+        for _ in range(2):
+            r = read_stream(self.url, 3)
+            self.assertEqual((r['status'], r['ended']), (200, 'eof'))
+            self.assertEqual(len(r['data']), 150_000 // 188 * 188)
+
     def test_slow_first_byte_holds_the_answer_back(self):
         """dev/changelog/958 measured 0.25 to 1.26 s; the 302 is answered at once."""
         self.sim.inject('slow_first_byte', self.label, seconds=1.0)
@@ -234,6 +243,8 @@ class ConnectionFaultTests(_Faulted):
 # --- what a connection is answered with ------------------------------------------------------
 
 class OpenFaultTests(_Faulted):
+    extra = ('test_tiny_black',)
+
     def test_refuse_at_open_answers_every_attempt_with_405(self):
         """dev/changelog/436: 405 at input open on every attempt, the zero-byte death spiral -
         and 105's dead stream that reconnects and dies is the same answer, again and again."""
@@ -433,6 +444,17 @@ class TimelineFaultTests(_Faulted):
         self.assertIn(0x1B, streams.values(), 'the PMT still declares the video')
         self.free()
         self.assertTrue(wait_until(lambda: 'video_stops' in self.served()[-1].faults))
+
+    def test_no_video_track_answers_a_stream_that_declares_none(self):
+        """dev/changelog/1410: not video_stops, whose PMT goes on declaring a track it leaves
+        empty. A connection already open keeps its own stream."""
+        self.sim.inject('no_video_track', self.label, start=at(-1), end=at(60))
+        _, data = read_for(self.url, 0.5)
+        self.assertEqual(pes_dts(data, VIDEO_PID), [])
+        self.assertGreater(span(pes_dts(data, AUDIO_PID)), 1)
+        streams, pcr_pid, _ = sim_ts.programs(data)
+        self.assertEqual(list(streams), [AUDIO_PID], 'the PMT declares the audio alone')
+        self.assertEqual(pcr_pid, AUDIO_PID, 'and the clock moved with it')
 
     def test_connecting_while_the_video_is_out_gets_audio_only(self):
         """dev/changelog/1210: a restart that lands during the outage."""

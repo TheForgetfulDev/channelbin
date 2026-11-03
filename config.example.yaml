@@ -212,10 +212,9 @@ ffmpeg:
   # open - so a provider slower than this to send its first byte fails rather than waiting.
   read_timeout_seconds: 20              # 0 disables; above a 5s chunk gap (dev/changelog/998)
   # Read recordings at real-time speed (-re) by default. Each channel can override it. Most
-  # feeds record identically either way; it helps a provider that answers every reconnect by
-  # re-sending its buffered video, which an unpaced read keeps triggering by racing to the
-  # live edge and timing out there. A recording also turns it on for one channel by itself
-  # when a fast-delivery stop follows in-process reconnects.
+  # feeds record identically either way, and on a feed that keeps dropping it loses video at
+  # each reconnect, so leave it off unless a provider needs it. It can help one that sends
+  # the same buffered video again after an unpaced read times out at the live edge.
   pace_realtime: false
   extra_input_args: []                  # e.g. ['-timeout', '5000000']
   extra_output_args: []
@@ -484,6 +483,7 @@ channel_testing:
   # against recordings - it divides both, so their ratio is unchanged.
   reference_minutes: 0.5
   instability_penalty_per_hr: 2.0
+  reconnect_penalty_per_hr: 1.0
   health_score_test_fail_floor: 10
   health_score_warn_penalty: 10
   # Where each health band starts. A 0-100 score is shown as one of four bands everywhere
@@ -503,6 +503,7 @@ channel_testing:
     near_empty_min_span_seconds: 30
     damage_penalty_per_pct_missing: 3
     near_empty_penalty_per_pct: 2
+    out_of_step_penalty: 80
     capture_quality_source_weight: 1.0
   pre_check:
     # Optionally health-check a recording's channel shortly before it starts. Off by

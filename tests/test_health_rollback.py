@@ -207,6 +207,18 @@ class RecordingObservationOrderTests(_Base):
                                  SOURCE_CAPTURE_CORRECTION])
         self._assert_replay_matches_stored()
 
+    def test_a_correction_at_full_weight_sinks_the_score_and_replays(self):
+        """Recording 32 (dev/docs/BUGS.md 2026-11-03): at weight 1 a recording 112 s out of step
+        would still have read 86, and the replay has to use the weight the blend ran with."""
+        self._blended_test(frame_pct=100.0, minutes_ago=600)
+        rec = self._recording()
+        rec.track_end_gap_seconds = 112.0
+        db.session.commit()
+        self._observe_recording_with_a_test_in_between(rec)
+        db.session.expire_all()
+        self.assertLess(db.session.get(Channel, self.channel.id).health_score, 50)
+        self._assert_replay_matches_stored()
+
     def test_a_recording_that_was_the_first_observation_stays_first(self):
         """The first-ever blend stores its instant too, or a later health check would
         replay ahead of it and become the observation the score was set from."""

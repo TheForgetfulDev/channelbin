@@ -101,6 +101,60 @@ def programs(data) -> tuple[dict, int | None, int | None]:
     return {}, None, pmt_pid
 
 
+def _crc32_mpeg(data: bytes) -> int:
+    crc = 0xFFFFFFFF
+    for byte in data:
+        crc ^= byte << 24
+        for _ in range(8):
+            crc = ((crc << 1) ^ 0x04C11DB7 if crc & 0x80000000 else crc << 1) & 0xFFFFFFFF
+    return crc
+
+
+def _pmt_without(packet: bytes, gone: int) -> bytes:
+    """One PMT packet with stream `gone` removed from its list and the clock moved to what is
+    left. A section this short fits one packet, which is what programs() also assumes."""
+    afc = (packet[3] >> 4) & 3
+    p = 4 + (1 + packet[4] if afc & 2 else 0)
+    start = p + 1 + packet[p]
+    length = ((packet[start + 1] & 0x0F) << 8) | packet[start + 2]
+    section = packet[start:start + 3 + length]
+    info = ((section[10] & 0x0F) << 8) | section[11]
+    e = 12 + info
+    entries, first = [], None
+    while e + 5 <= len(section) - 4:
+        es_info = ((section[e + 3] & 0x0F) << 8) | section[e + 4]
+        pid = ((section[e + 1] & 0x1F) << 8) | section[e + 2]
+        if pid != gone:
+            entries.append(section[e:e + 5 + es_info])
+            first = pid if first is None else first
+        e += 5 + es_info
+    body = bytearray(section[:12 + info]) + b''.join(entries)
+    size = len(body) + 4 - 3
+    body[1] = (body[1] & 0xF0) | (size >> 8)
+    body[2] = size & 0xFF
+    if first is not None:
+        body[8] = (body[8] & 0xE0) | (first >> 8)
+        body[9] = first & 0xFF
+    body += _crc32_mpeg(bytes(body)).to_bytes(4, 'big')
+    head = packet[:start]
+    return (head + bytes(body)).ljust(TS, b'\xff')
+
+
+def without_video_track(data: bytes, video_pid: int, pmt_pid: int) -> bytes:
+    """A stretch of whole packets as a stream that declares no video: its packets gone and its
+    PMT no longer listing it. Not the same as withholding them under a PMT that still does,
+    which a capture keeps as an empty track (dev/changelog/1210)."""
+    out = []
+    for o in range(0, len(data) - TS + 1, TS):
+        packet = data[o:o + TS]
+        pid = ((packet[1] & 0x1F) << 8) | packet[2]
+        if pid == video_pid:
+            continue
+        out.append(_pmt_without(packet, video_pid)
+                   if pid == pmt_pid and packet[1] & 0x40 else packet)
+    return b''.join(out)
+
+
 class Loop:
     """One rendered loop, indexed once and shared by every connection that serves it.
 

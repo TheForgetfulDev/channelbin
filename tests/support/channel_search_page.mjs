@@ -1455,6 +1455,9 @@ async function airingScenario() {
   obs.row_count = rows.length;
   obs.rows_are_airing_rows = rows.length === c.$$('#ch-list .arow').length;
   obs.first_row_has_when = !!c.$('#ch-list .arow-air .a-when');
+  obs.spanning_showing_day_word = (c.$$('#ch-list .arow-air')
+    .find((r) => r.textContent.includes('Marathon Across Midnight'))
+    ?.querySelector('.aw-day') || {}).textContent || '';
   obs.first_row_title = (c.$('#ch-list .arow-air .a-ptitle') || {}).textContent;
   // The checkbox carries BOTH ids: the selection is a set of channels on both grains.
   const cb = c.$('#ch-list .arow-air input[type=checkbox]');

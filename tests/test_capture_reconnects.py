@@ -27,7 +27,8 @@ from app import db  # noqa: E402
 from app import recorder  # noqa: E402
 from app.database import DIAGNOSTICS, Recording, RecordingEvent, RecordingSegment  # noqa: E402
 from app.proc_utils import (RECONNECT_MARKER, ReconnectJumps,  # noqa: E402
-                            count_stderr_matches, read_reconnect_jumps, read_stderr_tail)
+                            count_stderr_matches, read_reconnect_jumps, read_stderr_tail,
+                            UNBOUNDED_JUMPS_KEPT)
 
 # One real line as ffmpeg 7.1 writes it on this box, from the loopback capture in
 # dev/changelog/958. The byte offset, the delay and the error text all vary run to run,
@@ -103,14 +104,53 @@ class ReadReconnectJumpsTests(unittest.TestCase):
         path = self._spool(_JUMP_RESIDUAL)
         self.assertEqual(read_reconnect_jumps(path), ReconnectJumps((4.972,), (), True))
 
-    def test_a_jump_before_any_reconnect_is_not_attributed_to_one(self):
-        """A provider's own timestamp jump, closed with no reconnect, is not a replay."""
+    def test_a_jump_before_any_reconnect_is_a_reset_not_a_replay(self):
+        """A provider's own backward timestamp jump, closed with no reconnect, is not a
+        replay: it is the provider's clock going back (dev/changelog/1415)."""
         jump = _JUMP_SINGLE.split('\n', 1)[1]
         path = self._spool(jump + _PROGRESS_LINE + _JUMP_SINGLE)
-        self.assertEqual(read_reconnect_jumps(path), ReconnectJumps((4.471,), (), True))
+        self.assertEqual(read_reconnect_jumps(path),
+                         ReconnectJumps((4.471,), (), True, (), (4.471,)))
 
-    def test_a_forward_jump_is_not_a_replay(self):
+    def test_a_forward_jump_is_a_closed_gap_not_a_replay(self):
+        """A forward jump ffmpeg closed is content the provider never sent, inside a
+        reconnect's block or not; it is never a replay and never a hole."""
         path = self._spool(_RECONNECT_LINE + _FORWARD_JUMP)
+        self.assertEqual(read_reconnect_jumps(path),
+                         ReconnectJumps((), (), True, (12.0,), ()))
+        path = self._spool(_FORWARD_JUMP + _PROGRESS_LINE + _JUMP_SINGLE + _FORWARD_JUMP)
+        self.assertEqual(read_reconnect_jumps(path),
+                         ReconnectJumps((4.471,), (), True, (12.0, 12.0), ()))
+
+    def test_streams_stuck_apart_are_a_count_not_a_list(self):
+        """Recording 32 (dev/docs/BUGS.md 2026-11-03): ffmpeg's offset moved back and forth on
+        every packet pair for hours, and each move was stored as a hole, 81,510 of them."""
+        flip = ''.join(
+            f'[vist#0:0/h264 @ 0x1] timestamp discontinuity (stream id=256): -{111745645 + i}, '
+            f'new offset= 5672478\n'
+            f'[aist#0:1/aac @ 0x2] timestamp discontinuity (stream id=257): {111745645 + i}, '
+            f'new offset= -106073167\n'
+            for i in range(5000))
+        jumps = read_reconnect_jumps(self._spool(_RECONNECT_LINE + flip))
+        self.assertEqual(jumps.replays, (111.746,))
+        self.assertEqual(jumps.holes, (111.746,))
+        self.assertEqual(jumps.closed_gaps, (111.746,))
+        self.assertEqual(jumps.repeats, 9997)
+        self.assertEqual(jumps.repeat_seconds, 111.751)
+
+    def test_a_flip_with_no_reconnect_keeps_a_bounded_list(self):
+        flip = ''.join(
+            '[vist#0:0/h264 @ 0x1] timestamp discontinuity (stream id=256): -700000000, '
+            'new offset= 1\n'
+            '[aist#0:1/aac @ 0x2] timestamp discontinuity (stream id=257): 700000000, '
+            'new offset= 2\n'
+            for _ in range(5000))
+        jumps = read_reconnect_jumps(self._spool(flip))
+        self.assertEqual(len(jumps.resets), UNBOUNDED_JUMPS_KEPT)
+        self.assertEqual(len(jumps.closed_gaps), UNBOUNDED_JUMPS_KEPT)
+
+    def test_a_clean_spool_reports_nothing_at_all(self):
+        path = self._spool(_PROGRESS_LINE * 20)
         self.assertEqual(read_reconnect_jumps(path), ReconnectJumps((), (), True))
 
     def test_a_reconnect_that_closed_no_jump_contributes_nothing(self):
@@ -313,6 +353,31 @@ class ReconnectDisclosureTests(unittest.TestCase):
         db.session.commit()
         self.assertNotIn('reconnect', self._events()[0].detail)
 
+    # A gap ffmpeg closed up and a clock reset are said with or without a reconnect
+    # (dev/changelog/1415): the stretch is not in the file, and nothing else says so.
+    def test_a_closed_gap_breaks_the_quiet_exit_silence_and_is_said(self):
+        self._record(-15, '', (0, True), jumps=ReconnectJumps((), (), True, (720.5,), ()))
+        events = self._events()
+        self.assertEqual(len(events), 1)
+        self.assertIn('closed up 1 forward timestamp jump of 720.5 s', events[0].detail)
+        self.assertIn('content the provider never sent', events[0].detail)
+        self.assertNotIn('reconnected', events[0].detail)
+        self.assertEqual(json.loads(events[0].extra_data)['closed_gap_seconds'], [720.5])
+
+    def test_a_reset_is_said_as_the_clock_going_back(self):
+        self._record(4, '', (0, True), jumps=ReconnectJumps((), (), True, (), (30.0, 31.5)))
+        detail = self._events()[0].detail
+        self.assertIn('closed 2 backward timestamp jumps of 30.0 and 31.5 s with no reconnect',
+                      detail)
+        self.assertIn("the provider's clock went back", detail)
+        self.assertEqual(json.loads(self._events()[0].extra_data)['reset_seconds'], [30.0, 31.5])
+
+    def test_many_closed_gaps_are_listed_in_part(self):
+        self._record(4, '', (0, True), jumps=ReconnectJumps((), (), True, (12.0,) * 9, ()))
+        detail = self._events()[0].detail
+        self.assertIn('9 forward timestamp jumps of 12.0, 12.0, 12.0, 12.0 and 12.0 s and more',
+                      detail)
+
     # The count's column (dev/changelog/1306): the Stats card and the Recordings list sum it,
     # where the detail string above is one line per segment in the activity log.
     def test_the_count_is_written_to_the_segment_row(self):
@@ -347,12 +412,34 @@ class ReconnectDisclosureTests(unittest.TestCase):
         self.assertIn('4.0, 5.1, 5.4 and 5.8 s, 20.3 s in all', detail)
         self.assertNotIn('hole', detail)
 
-    def test_a_hole_is_named_with_its_size_and_that_nothing_is_missing(self):
+    def test_a_hole_is_named_with_its_size_and_never_promises_nothing_is_missing(self):
+        """The read behind it may have skipped video: dev/docs/BUGS.md 2026-11-03."""
         self._record(-15, '', (4, True), ReconnectJumps((4.0, 5.1, 5.4, 5.8), (5.1, 5.8), True))
         detail = self._events()[0].detail
         self.assertIn('at 2 of them ffmpeg closed the timestamp jump once per stream', detail)
         self.assertIn('hole of about 5.1 and 5.8 s', detail)
-        self.assertIn('no content missing', detail)
+        self.assertNotIn('no content missing', detail)
+
+    def test_streams_stuck_apart_are_said_in_one_short_sentence(self):
+        """The event stored 562,558 characters for recording 32 (dev/docs/BUGS.md 2026-11-03)."""
+        replays = tuple(float(n) for n in range(1, 36))
+        self._record(-15, '', (37, True),
+                     ReconnectJumps(replays, replays, True, (), (), 81510, 111.7))
+        event = self._events()[0]
+        self.assertLess(len(event.detail), 800)
+        self.assertIn('81,510 times', event.detail)
+        self.assertIn('about 112 s apart', event.detail)
+        self.assertIn('and 23 more s', event.detail)
+        self.assertNotIn('hole', event.detail)
+        extra = json.loads(event.extra_data)
+        self.assertEqual(extra['timestamp_repeat_closures'], 81510)
+        self.assertEqual(extra['streams_apart_seconds'], 111.7)
+
+    def test_a_few_repeat_closures_are_a_late_packet_and_stay_quiet(self):
+        self._record(-15, '', (1, True), ReconnectJumps((4.0,), (4.0,), True, (), (), 2, 4.0))
+        detail = self._events()[0].detail
+        self.assertNotIn('without settling', detail)
+        self.assertIn('hole of about 4.0 s', detail)
 
     def test_one_replay_reads_as_one(self):
         self._record(-15, '', (1, True), ReconnectJumps((4.5,), (), True))

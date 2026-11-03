@@ -71,7 +71,7 @@
         tip: 'The recording profile pre-selected when you schedule this channel from the guide. It can still be changed per recording.' },
       { focus: 'pace', label: 'Read at play speed', value: paceValue(),
         note: 'Record no faster than the stream plays',
-        tip: 'Whether recordings read this stream at real-time speed, the way a video player does. Helps a provider that re-sends its buffered video on every reconnect.' },
+        tip: 'Whether recordings read this stream at real-time speed, the way a video player does. Can help a provider that sends the same buffered video again after a read timeout, but when a feed keeps dropping it loses video at each reconnect.' },
       { focus: 'health', label: 'Score adjustment',
         value: state.adjustment ? (state.adjustment > 0 ? `+${state.adjustment}` : String(state.adjustment)) : 'None',
         note: 'Nudges the computed score',

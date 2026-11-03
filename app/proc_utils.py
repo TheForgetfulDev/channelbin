@@ -9,10 +9,11 @@ import tempfile
 import threading
 import time
 import uuid
-from typing import NamedTuple
+from typing import NamedTuple, Optional
 from urllib.parse import urlsplit
 
 from .config import resolve_ffmpeg_path
+from .url_utils import mask_creds_in_text
 
 log = logging.getLogger(__name__)
 
@@ -29,8 +30,79 @@ def is_hls_url(url: str) -> bool:
     return urlsplit(url).path.lower().endswith('.m3u8')
 
 
+class HlsVariant(NamedTuple):
+    """One quality of an HLS master playlist. `program` is its position in the playlist, which
+    is the program number ffmpeg's HLS demuxer gives it (measured on 7.1, dev/changelog/1408)."""
+    program: int
+    offered: int
+    label: Optional[str]
+
+
+_HLS_RESOLUTION_RE = re.compile(r'RESOLUTION=(\d+)x(\d+)')
+_HLS_BANDWIDTH_RE = re.compile(r'[:,]BANDWIDTH=(\d+)')
+
+#: A playlist is a few lines; anything this long is not one.
+_HLS_PLAYLIST_MAX_BYTES = 256 * 1024
+_HLS_PLAYLIST_TIMEOUT_SECONDS = 5
+
+
+def best_hls_variant(playlist_text: str) -> Optional[HlsVariant]:
+    """The highest resolution a master playlist offers, then the highest bandwidth - the
+    picture ffmpeg's default selection takes in a test capture, so a recording holds the
+    format its channel's health check measured. None when `playlist_text` is a media playlist,
+    which has no choice to make."""
+    variants = [line for line in playlist_text.splitlines()
+                if line.startswith('#EXT-X-STREAM-INF:')]
+    if not variants:
+        return None
+
+    def rank(index):
+        size = _HLS_RESOLUTION_RE.search(variants[index])
+        rate = _HLS_BANDWIDTH_RE.search(variants[index])
+        return (int(size.group(1)) * int(size.group(2)) if size else 0,
+                int(rate.group(1)) if rate else 0)
+
+    best = max(range(len(variants)), key=rank)
+    size = _HLS_RESOLUTION_RE.search(variants[best])
+    return HlsVariant(best, len(variants), f'{size.group(1)}x{size.group(2)}' if size else None)
+
+
+def pick_hls_variant(cfg: dict, url: str) -> Optional[HlsVariant]:
+    """Read `url` once and choose its best quality; None for a media playlist, which has no
+    choice to make. A read that failed answers program 0 with `offered` 0: one picture either
+    way, and ffmpeg's own open is what decides whether the channel is up.
+
+    Only for a stream with no provider login in its URL: this is a connection of its own, and
+    on a single-seat login it could cost the capture it is choosing for (dev/changelog/1408).
+    The caller is launching a capture, so the read has one deadline for the whole of it. A
+    socket timeout alone does not bound a server trickling bytes, which is why it runs on a
+    thread that is left to its own timeout rather than waited for."""
+    import requests
+    headers = {'User-Agent': cfg.get('http', {}).get('user_agent', 'ChannelBin')}
+    answer = {}
+
+    def _read():
+        try:
+            with requests.get(url, headers=headers, stream=True,
+                              timeout=_HLS_PLAYLIST_TIMEOUT_SECONDS) as resp:
+                resp.raise_for_status()
+                answer['body'] = next(resp.iter_content(_HLS_PLAYLIST_MAX_BYTES), b'')
+        except requests.RequestException as exc:
+            answer['error'] = mask_creds_in_text(str(exc))
+
+    reader = threading.Thread(target=_read, name='hls-playlist-read', daemon=True)
+    reader.start()
+    reader.join(_HLS_PLAYLIST_TIMEOUT_SECONDS)
+    if 'body' not in answer:
+        log.warning('Could not read the HLS playlist to choose a quality, so the first one '
+                    'listed will be recorded: %s', answer.get('error', 'no answer in time'))
+        return HlsVariant(0, 0, None)
+    return best_hls_variant(answer['body'].decode('utf-8', 'replace'))
+
+
 def build_capture_cmd(cfg: dict, url: str, output_path: str, duration_seconds: int = 0,
-                      *, pace_realtime: bool = True, keep_video_track: bool = False) -> list:
+                      *, pace_realtime: bool = True, keep_video_track: bool = False,
+                      hls_program: int = 0) -> list:
     """ffmpeg "connect + stream-copy to file" command, shared by the recorder,
     channel tester, and manual URL test. Every http(s) input is identified with
     http.user_agent; continuous ones also get reconnect flags so all three behave the
@@ -51,14 +123,20 @@ def build_capture_cmd(cfg: dict, url: str, output_path: str, duration_seconds: i
     that segment's audio into the joined file's video track. A recording passes it; a test
     capture does not, because there an audio-only output is how a missing picture is
     reported. Skipped when extra_output_args carries its own -map, since ffmpeg adds maps
-    together rather than letting the last one win."""
+    together rather than letting the last one win.
+
+    An HLS input maps one program, `hls_program` from pick_hls_variant(): against a master
+    playlist `0:v?` takes every quality it offers, which fetched them all and wrote a segment
+    holding every picture. Every HLS input has a program 0, a media playlist included
+    (measured on 7.1, dev/changelog/1408)."""
     cmd = [resolve_ffmpeg_path(cfg['ffmpeg']['path'])]
     cmd += input_args(cfg, url, pace_realtime=pace_realtime)
     if duration_seconds and duration_seconds > 0:
         cmd += ['-t', str(duration_seconds)]
     extra_output = cfg['ffmpeg'].get('extra_output_args', [])
     if keep_video_track and '-map' not in extra_output:
-        cmd += ['-map', '0:v?', '-map', '0:a?']
+        source = f'0:p:{hls_program}:' if is_hls_url(url) else '0:'
+        cmd += ['-map', f'{source}v?', '-map', f'{source}a?']
     cmd += extra_output
     cmd += ['-c', 'copy', '-y', output_path]
     return cmd
@@ -200,6 +278,16 @@ PREVIEW_SEGMENT_PATTERN = 'seg%05d.ts'
 PREVIEW_SEGMENT_RE = re.compile(r'^seg\d{5}\.ts$')
 
 
+#: How long a forward timestamp jump a capture, a preview and a conversion keep as a gap
+#: in the file, in seconds; anything longer ffmpeg closes up as it always did. Ten minutes:
+#: well past the ~35 s a video-only outage can last inside one segment before the
+#: watchdog's frame check restarts the capture, long enough that an audio-only outage
+#: (which nothing restarts) stays a silence in step with the picture, and short enough
+#: that a provider clock jumping hours ahead is still closed up rather than held as hours
+#: of one frame (dev/changelog/1415).
+TIMELINE_GAP_KEEP_SECONDS = 600
+
+
 def input_args(cfg: dict, url: str, *, pace_realtime: bool) -> list:
     """The "how to connect to this URL" half of every ffmpeg command this app runs against
     a stream: user agent, read timeout, the user's extra input args, reconnect flags for a
@@ -259,6 +347,19 @@ def input_args(cfg: dict, url: str, *, pace_realtime: bool) -> list:
         read_timeout = cfg['ffmpeg'].get('read_timeout_seconds', 0)
         if read_timeout and read_timeout > 0:
             cmd += ['-rw_timeout', str(int(read_timeout * 1_000_000))]
+    # Keep a forward timestamp jump in the file up to TIMELINE_GAP_KEEP_SECONDS instead of
+    # closing it up. ffmpeg closes any forward jump over -dts_delta_threshold (10 s by
+    # default) per stream, and reading an MPEG-TS or HLS input it does so on every packet
+    # pair for the rest of the file: a feed whose video stopped for 12 s while its audio
+    # ran on was written with the video pulled back 12 s, in step with nothing, and no scan
+    # could see it afterwards because the gap was gone (measured on 7.1 with a stream copy:
+    # video to 53.36 s, audio to 65.46 s, 290 closures; dev/changelog/1199, 1415). Kept, the
+    # gap is a hole the timeline scan reports and the conversion holds a picture across,
+    # in sync (postprocessor reads the same constant). Bounded rather than unlimited so a
+    # provider's clock jumping hours ahead is still closed up - a hole that long would be
+    # hours of a held frame - and read_reconnect_jumps() reports the closure. Emitted
+    # BEFORE extra_input_args for the reason -user_agent is: a user's own value still wins.
+    cmd += ['-dts_delta_threshold', str(TIMELINE_GAP_KEEP_SECONDS)]
     cmd += cfg['ffmpeg'].get('extra_input_args', [])
     if url.startswith(('http://', 'https://')) and not is_hls_url(url):
         cmd += ['-reconnect', '1', '-reconnect_streamed', '1',
@@ -280,6 +381,11 @@ def input_args(cfg: dict, url: str, *, pace_realtime: bool) -> list:
     # growth over the segment. So it is dropped as an unexplained day-one hardcode that
     # ffmpeg's own docs advise against on live input - NOT because it was doing damage.
     # It is specifically not the cause of the stall-and-restart mode in changelog 429/436.
+    #
+    # On a feed that DROPS it is not inert, which is why nothing turns it on by itself any
+    # more. The reader sits behind the live edge, so a reconnect lands past video it never
+    # read: 78 s lost of 466 s against none of 480 s unpaced, on a loopback server dropping
+    # every 25 s and answering from recording 32's replay sizes (dev/changelog/1422, 1423).
     if pace_realtime:
         cmd += ['-re']
     cmd += ['-i', url]
@@ -497,6 +603,14 @@ _RECONNECT_OR_JUMP_RE = re.compile(
 # seconds long (4 s simulated, 13 to 29 s on the real accounts).
 REPLAY_MIN_SECONDS = 1.0
 
+# How many repeat closures read as streams stuck apart rather than a late packet: a clean
+# replay measured at most 4 closures, the stuck state 294 in 25 s (dev/changelog/1422).
+REPEAT_CLOSURES_STUCK = 10
+
+# The lists no reconnect bounds. A closure that fires per packet pair would otherwise put
+# hundreds of thousands of numbers on one event.
+UNBOUNDED_JUMPS_KEPT = 200
+
 
 class ReconnectJumps(NamedTuple):
     """What ffmpeg's timestamp repair says each in-process reconnect did to the file
@@ -511,10 +625,27 @@ class ReconnectJumps(NamedTuple):
     then twice the replay and the file's timeline is left with a hole as long as the
     replay, with no content missing on either side of it. `holes` is that second closure
     per reconnect it happened at. `complete` is False when the scan hit its byte cap.
+
+    Two more closures are not a reconnect's doing and are reported apart from them
+    (dev/changelog/1415). `closed_gaps` is every forward jump ffmpeg closed up, in seconds:
+    a jump past TIMELINE_GAP_KEEP_SECONDS, which is content the provider never sent or its
+    clock moving ahead, and the file's timeline then runs on as if the stretch were not
+    there. `resets` is a backward jump closed with no reconnect behind it: the provider's
+    clock went back, and the file's timeline runs on from where it was.
+
+    `repeats` counts closures past a reconnect's replay and hole. A few are a late packet.
+    Thousands mean ffmpeg's one timestamp offset is being moved back and forth between the
+    streams on every packet pair, because they sit further apart than its threshold:
+    each stream reads as continuous, and they stay `repeat_seconds` apart in the file
+    (recording 32: 81,510 of them at 111.7 s, dev/changelog/1422).
     """
     replays: tuple
     holes: tuple
     complete: bool
+    closed_gaps: tuple = ()
+    resets: tuple = ()
+    repeats: int = 0
+    repeat_seconds: float = 0.0
 
 
 def read_reconnect_jumps(path, max_bytes: int = STDERR_SCAN_MAX_BYTES,
@@ -522,9 +653,9 @@ def read_reconnect_jumps(path, max_bytes: int = STDERR_SCAN_MAX_BYTES,
     """The ReconnectJumps a child's whole stderr spool records; empty if unreadable.
 
     Reads the whole spool, bounded like count_stderr_matches() and for the same reason: it
-    runs between a dead ffmpeg and its relaunch. A jump logged before the first reconnect is
-    not attributed to one and is left out, as is a forward jump (content the provider
-    skipped, which is a different disclosure). Never raises.
+    runs between a dead ffmpeg and its relaunch. A backward jump logged before the first
+    reconnect is not attributed to one: it is a reset. A forward jump is never a replay,
+    wherever it is logged: it is a closed gap. Never raises.
     """
     if not path:
         return ReconnectJumps((), (), True)
@@ -534,22 +665,35 @@ def read_reconnect_jumps(path, max_bytes: int = STDERR_SCAN_MAX_BYTES,
             complete = not fh.read(1)
     except OSError:
         return ReconnectJumps((), (), True)
-    replays, holes, in_block, first = [], [], False, True
+    replays, holes, closed_gaps, resets = [], [], [], []
+    repeats, repeat_seconds = 0, 0.0
+    in_block, first, block_hole = False, True, None
     for m in _RECONNECT_OR_JUMP_RE.finditer(raw):
         if m.group(1):
-            in_block, first = True, True
-            continue
-        if not in_block:
+            in_block, first, block_hole = True, True, None
             continue
         seconds = -int(m.group(2)) / 1_000_000
+        if seconds <= -min_seconds:
+            if block_hole is not None and abs(-seconds - block_hole) < 1.0:
+                repeats, repeat_seconds = repeats + 1, round(-seconds, 3)
+            elif len(closed_gaps) < UNBOUNDED_JUMPS_KEPT:
+                closed_gaps.append(round(-seconds, 3))
+            continue
         if seconds < min_seconds:
             continue
-        if first:
+        if not in_block:
+            if len(resets) < UNBOUNDED_JUMPS_KEPT:
+                resets.append(round(seconds, 3))
+        elif first:
             replays.append(round(seconds, 3))
             first = False
-        else:
+        elif block_hole is None:
             holes.append(round(seconds, 3))
-    return ReconnectJumps(tuple(replays), tuple(holes), complete)
+            block_hole = seconds
+        else:
+            repeats, repeat_seconds = repeats + 1, round(seconds, 3)
+    return ReconnectJumps(tuple(replays), tuple(holes), complete, tuple(closed_gaps),
+                          tuple(resets), repeats, repeat_seconds)
 
 
 # What `-loglevel level+info` makes ffmpeg write on every line: its own severity, after any
@@ -755,6 +899,41 @@ class GrowthMonitor:
 _TIME_RE = re.compile(r'time=(\d+):([0-5]\d):([0-5]\d(?:\.\d+)?)')
 
 
+# Enough for a delivery window's worth of progress lines and closures: at most a few per
+# second for fast_delivery_window_seconds. Bounded because it runs on the watchdog's tick.
+REPLAY_SCAN_MAX_BYTES = 1024 * 1024
+
+_POSITION_OR_RECONNECT_OR_JUMP_RE = re.compile(
+    rb'time=(\d+):([0-5]\d):([0-5]\d(?:\.\d+)?)|(Will reconnect at)'
+    rb'|timestamp discontinuity \(stream id=\d+\): (-?\d+), new offset=')
+
+
+def read_replay_seconds_since(path, content_position, max_bytes: int = REPLAY_SCAN_MAX_BYTES,
+                              min_seconds: float = REPLAY_MIN_SECONDS) -> float:
+    """Seconds of a live spool's content position past `content_position` that reconnects
+    added rather than the feed: each reconnect's replay and, when ffmpeg closed it twice,
+    the hole. Both move ffmpeg's time= forward with nothing new delivered, which is how 73 s
+    of replay read as 1.61x in recording 32 (dev/changelog/1423).
+
+    A jump is placed by the time= line before it. 0.0 when the spool cannot be read."""
+    raw = _read_spool_end(path, max_bytes)
+    if raw is None:
+        return 0.0
+    position, closures_left, total = None, 0, 0.0
+    for m in _POSITION_OR_RECONNECT_OR_JUMP_RE.finditer(raw):
+        if m.group(1):
+            position = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))
+        elif m.group(4):
+            closures_left = 2
+        else:
+            seconds = -int(m.group(5)) / 1_000_000
+            if (seconds >= min_seconds and closures_left and position is not None
+                    and position >= content_position):
+                total += seconds
+                closures_left -= 1
+    return total
+
+
 def read_capture_content_position(path, max_bytes: int = STDERR_TAIL_MAX_BYTES):
     """Seconds of content ffmpeg has written so far, read from its LIVE stderr spool;
     None when the spool cannot be read or has not reported a position yet.
@@ -914,6 +1093,20 @@ class DeliveryRateMonitor:
             return None
         return delivery_ratio(content_seconds - anchor_content, elapsed)
 
+    def anchor_position(self):
+        """The content position the window is measured from; None with no samples."""
+        return self._samples[0][1] if self._samples else None
+
+    def ratio_without(self, replayed_seconds):
+        """The ratio over the window with `replayed_seconds` of its content taken out; None
+        until two samples exist."""
+        if len(self._samples) < 2:
+            return None
+        anchor_time, anchor_content = self._samples[0]
+        now, content_seconds = self._samples[-1]
+        return delivery_ratio(max(0.0, content_seconds - anchor_content - replayed_seconds),
+                              now - anchor_time)
+
     def reset(self):
         """Forget every sample - the window has to refill from scratch.
 
@@ -992,13 +1185,14 @@ def concat_list_line(path: str) -> str:
     return "file '" + path.replace("'", "'\\''") + "'\n"
 
 
-def write_concat_list(paths, *, prefix: str) -> str:
+def write_concat_list(paths, *, prefix: str, header: str = '') -> str:
     """Write a concat-demuxer list naming `paths`, in order, to a fresh temp file and
     return its path. The caller unlinks it when the run is over. One writer for the join
     and the part assembly, so the quoting above cannot be right in one and wrong in the
-    other."""
+    other. `header` goes first, for the directives join_layout.concat_stream_lines() writes."""
     fd, list_path = tempfile.mkstemp(prefix=prefix, suffix='.txt')
     with os.fdopen(fd, 'w') as fh:
+        fh.write(header)
         for p in paths:
             fh.write(concat_list_line(p))
     return list_path

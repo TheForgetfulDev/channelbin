@@ -244,6 +244,10 @@ ALERT_TYPES = {
     RECORDING_RETRYING: {
         'label': 'Recording Not Capturing (Retrying A Dead Stream)', 'severity': 'ERROR',
         'self_clearing': True},
+    # The watchdog ran out of things to try before the stop time and ended the capture, which is
+    # joined. ERROR: the rest of the window is lost. Not self-clearing, since nothing brings that
+    # back; a record of the loss, cleared by the user (dev/changelog/1404).
+    'RECORDING_GAVE_UP': {'label': 'Recording Ended Early', 'severity': 'ERROR'},
     'SEARCH_INDEX_REBUILD_FAILED': {
         'label': 'Search Index Rebuild Failed', 'severity': 'ERROR', 'self_clearing': True},
     'CONVERSION_FAILED': {
@@ -294,6 +298,10 @@ ALERT_TYPES = {
     # accepts the damaged file, since an Active alert offers no Dismiss.
     'CONVERTED_FILE_GAPS': {
         'label': 'Converted File Has Gaps', 'severity': 'WARN', 'self_clearing': True},
+    # The picture and sound end apart (app/track_ends.py). No self-clearing path: nothing
+    # re-captures the recording, so what clears it is a person who has looked.
+    'RECORDING_OUT_OF_STEP': {
+        'label': 'Picture and Sound Out of Step', 'severity': 'WARN'},
     # Unlike the two above, this one has no self-clearing path and is not expected to grow
     # one: nothing re-runs a concatenation that found nothing to concatenate, so it is a
     # record of a loss and is cleared only by deleting the recording.

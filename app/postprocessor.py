@@ -1,6 +1,5 @@
 """Post-processing after concatenation: health data, format conversion and/or file move."""
 import logging
-import math
 import os
 import re
 import shutil
@@ -14,8 +13,8 @@ from datetime import datetime
 from .db_utils import retry_on_locked
 from .fmt_utils import fmt_bytes as _fmt_bytes, fmt_duration
 from .fs_utils import ensure_dir
-from .proc_utils import (iter_stderr_error_lines, supervise_ffmpeg, terminate_or_kill,
-                         write_concat_list)
+from .proc_utils import (TIMELINE_GAP_KEEP_SECONDS, iter_stderr_error_lines, supervise_ffmpeg,
+                         terminate_or_kill, write_concat_list)
 from .version import __version__
 
 log = logging.getLogger(__name__)
@@ -645,20 +644,19 @@ FFMPEG_DTS_DELTA_DEFAULT = 10.0
 END_PAD_MIN_SECONDS = 1.0
 
 
-def dts_delta_threshold(max_gap_seconds):
-    """The -dts_delta_threshold that keeps every video gap the source's own timeline scan
-    measured, as an argv value, or None when ffmpeg's default already keeps them all - so a
-    recording with no long gap keeps exactly the command it always had.
+def dts_delta_threshold() -> str:
+    """The -dts_delta_threshold every conversion carries, as an argv value: the capture's
+    own (proc_utils.TIMELINE_GAP_KEEP_SECONDS), so the converter keeps exactly the gaps the
+    capture kept, on every stream.
 
-    Kept, a gap is filled by -fps_mode cfr with the picture before it and stays in sync with
-    the audio. Derived from the scan rather than set to some large fixed value so that the
-    converter holds a picture across exactly the gaps the recording already reports as
-    damage, and no further: one bad far-future timestamp would otherwise become hours of a
-    repeated frame. The scan measures DTS steps, which are a frame longer than the delta
-    ffmpeg compares, so the scan's figure plus a second is always enough."""
-    if not max_gap_seconds or max_gap_seconds + 1 <= FFMPEG_DTS_DELTA_DEFAULT:
-        return None
-    return str(math.ceil(max_gap_seconds) + 1)
+    Kept, a video gap is filled by -fps_mode cfr with the picture before it and stays in
+    sync with the audio; a kept audio gap is one long sample in the mp4, which plays as
+    silence in step with the picture (measured on 7.1: a 12 s audio-only gap converts to a
+    12.14 s sample and both tracks end at 64 s). Once derived from the video scan's largest
+    gap (dev/changelog/1199), which could not see an audio-only gap at all and so let the
+    conversion pull a kept one shut; and the capture's own bound already keeps a clock
+    jumping hours ahead from becoming hours of a held frame (dev/changelog/1415)."""
+    return str(TIMELINE_GAP_KEEP_SECONDS)
 
 
 def video_end_pad(ts_path):
@@ -1685,6 +1683,7 @@ SOURCE_KEPT_GAPS = 'converted_file_gaps'
 SOURCE_KEPT_UNCHECKED = 'converted_file_unchecked'
 SOURCE_KEPT_SETTING = 'delete_source_off'
 SOURCE_KEPT_UNLINK_FAILED = 'unlink_failed'
+SOURCE_KEPT_OUT_OF_STEP = 'picture_sound_apart'
 
 
 def check_converted_output(output_path, *, reencoded, source_metrics, on_progress=None):
@@ -1757,9 +1756,11 @@ def _dispose_of_source(recording_id, ts_path, output_check, delete_wanted):
     Kept whatever post_process.delete_source says when the check found video the conversion
     lost, or could not tell: the source is the only thing a Retry can rebuild the file from,
     and recording 16 lost its holes for good because it was deleted unchecked
-    (dev/changelog/1200). output_check is check_converted_output()'s result."""
+    (dev/changelog/1200). Kept too when the picture and sound end apart: recording 32 had
+    its source deleted as clean with them 112 s apart, and the source is the evidence
+    (dev/changelog/1424). output_check is check_converted_output()'s result."""
     from . import db
-    from .database import add_recording_event, SOURCE_DELETED, SOURCE_KEPT
+    from .database import add_recording_event, Recording, SOURCE_DELETED, SOURCE_KEPT
 
     try:
         size_note = f' ({_fmt_bytes(os.path.getsize(ts_path))})'
@@ -1768,7 +1769,15 @@ def _dispose_of_source(recording_id, ts_path, output_check, delete_wanted):
     name = os.path.basename(ts_path)
     lost = output_check['lost_seconds'] if output_check else None
     event_type, reason, error = SOURCE_KEPT, None, None
-    if lost:
+    rec = db.session.get(Recording, recording_id)
+    apart = rec.picture_sound_apart_seconds if rec is not None else None
+    measured = rec is not None and rec.track_end_gap_seconds is not None
+    if apart is not None:
+        reason = SOURCE_KEPT_OUT_OF_STEP
+        detail = (f'Kept the source {name}{size_note}: the picture and sound end '
+                  f'{fmt_duration(apart, with_seconds=True)} apart, so this recording did not '
+                  f'check clean. Deleting the recording removes it.')
+    elif lost:
         reason = SOURCE_KEPT_GAPS
         detail = (f'Kept the source {name}{size_note}: the converted file is missing video '
                   f'it has. Retry conversion converts it again; deleting the recording '
@@ -1790,8 +1799,9 @@ def _dispose_of_source(recording_id, ts_path, output_check, delete_wanted):
             detail = f'Could not delete the source {name}{size_note}, so it is still on disk: {exc}'
         else:
             event_type = SOURCE_DELETED
-            detail = (f'Deleted the source {name}{size_note} - the converted file checked '
-                      f'clean against it.')
+            detail = (f'Deleted the source {name}{size_note} - the converted file has no '
+                      f'video gaps against it'
+                      f'{", and its picture and sound end together" if measured else ""}.')
             log.info('Recording %d: deleted source %s', recording_id, ts_path)
     extra = {'path': ts_path}
     if reason:
@@ -1831,12 +1841,27 @@ def _kept_source_paths(recording_ids):
     return paths
 
 
-def kept_source_path(recording_id):
-    """The .ts the newest SOURCE_KEPT event names, if it is still on disk, else None.
+def _hdr_copy_note(transfer, damage_summary):
+    """What the recording says when its HDR picture is copied because no GPU can re-encode it."""
+    return (f'This recording is HDR ({transfer}), so its picture is copied as it is rather than '
+            f're-encoded on the CPU, which would leave 8-bit H.264 still tagged as HDR. '
+            + ('The damage in it stays in the file. ' if damage_summary else '')
+            + 'The GPU encoder re-encodes HDR, keeping it as HDR10 with HEVC or tone-mapping '
+              'it to SDR with H.264.')
+
+
+def recorded_kept_source(recording_id):
+    """The .ts the newest SOURCE_KEPT event names, not checked against the disk: what a page
+    may offer without waking the storage under a finished recording.
 
     Read from the event because nothing else remembers it: output_path names the converted
     file once a conversion finishes, and a move can put that file in another folder."""
-    path = _kept_source_paths([recording_id]).get(recording_id)
+    return _kept_source_paths([recording_id]).get(recording_id)
+
+
+def kept_source_path(recording_id):
+    """recorded_kept_source(), if it is still on disk, else None."""
+    path = recorded_kept_source(recording_id)
     return path if path and os.path.exists(path) else None
 
 
@@ -2377,6 +2402,9 @@ def do_postprocess(app, recording_id: int, ts_path: str):
                     reencode = True
                     normalize_reasons = trigger_plan.reasons
 
+            # On the CPU an HDR picture is copied however this turns out (hdr_reencode_skipped
+            # below), so the events ahead of that note must not promise the re-encode.
+            hdr_needs_gpu = src is not None and bool(src.hdr_transfer) and not wants_gpu
             if damage_summary:
                 @retry_on_locked()
                 def _commit_damage_detected():
@@ -2384,7 +2412,8 @@ def do_postprocess(app, recording_id: int, ts_path: str):
                         recording_id=recording_id,
                         event_type=SEEK_DAMAGE_DETECTED,
                         detail=f'Timeline damage in capture: {damage_summary}. '
-                               f'Converting with full video re-encode so the file seeks cleanly.',
+                               + ('' if hdr_needs_gpu else 'Converting with full video re-encode '
+                                  'so the file seeks cleanly.'),
                     ))
                     db.session.commit()
 
@@ -2396,9 +2425,10 @@ def do_postprocess(app, recording_id: int, ts_path: str):
                         recording_id=recording_id,
                         event_type=MIXED_FRAME_RATE_DETECTED,
                         detail=f'Capture frame rate changed mid-recording: '
-                               f'{mixed_rate_summary}. The timeline is intact - converting '
-                               f'with full video re-encode to normalize it to one constant '
-                               f'frame rate, not to repair damage.',
+                               f'{mixed_rate_summary}. The timeline is intact'
+                               + ('.' if hdr_needs_gpu else ' - converting '
+                                  'with full video re-encode to normalize it to one constant '
+                                  'frame rate, not to repair damage.'),
                     ))
                     db.session.commit()
 
@@ -2476,6 +2506,9 @@ def do_postprocess(app, recording_id: int, ts_path: str):
                 want_codec = (nz.VIDEO_CODEC_HEVC if video_codec == nz.VIDEO_CODEC_HEVC
                               else nz.VIDEO_CODEC_H264)
                 trial = check_gpu_encoder(ffmpeg_path, vaapi_device, want_codec)
+                on_the_cpu = ('copies the picture instead, this source being HDR'
+                              if src is not None and src.hdr_transfer
+                              else 're-encodes with libx264 on the CPU instead')
                 if trial.ok:
                     use_gpu, gpu_codec = True, want_codec
                 elif want_codec == nz.VIDEO_CODEC_HEVC:
@@ -2489,16 +2522,16 @@ def do_postprocess(app, recording_id: int, ts_path: str):
                         f'HEVC on the GPU was asked for but a one-second HEVC test encode '
                         f'through {vaapi_device} failed, so this conversion '
                         + ('encodes H.264 on the GPU instead.' if h264.ok else
-                           f'encodes H.264 with libx264 on the CPU instead - an H.264 test '
-                           f'encode on the GPU failed too ({h264.error}).')
+                           f'{on_the_cpu} - an H.264 test encode on the GPU failed too '
+                           f'({h264.error}).')
                         + f' ffmpeg reported: {trial.error}',
                         {'kind': 'conversion_hevc_unavailable', 'device': vaapi_device,
                          'error': trial.error, 'gpu_h264': h264.ok}))
                 else:
                     encoder_events.append((
                         f'The GPU encoder was asked for but a one-second test encode '
-                        f'through {vaapi_device} failed, so this conversion re-encodes with '
-                        f'libx264 on the CPU instead. ffmpeg reported: {trial.error}',
+                        f'through {vaapi_device} failed, so this conversion {on_the_cpu}. '
+                        f'ffmpeg reported: {trial.error}',
                         {'kind': 'conversion_gpu_unavailable', 'device': vaapi_device,
                          'error': trial.error}))
             elif (fmt == 'mp4' and reencode
@@ -2524,13 +2557,28 @@ def do_postprocess(app, recording_id: int, ts_path: str):
                     'encoder is set to software. Re-encoding as H.264 with libx264.',
                     {'kind': 'conversion_hevc_needs_gpu'}))
 
+            if fmt == 'mp4' and reencode and not use_gpu and src is not None and src.hdr_transfer:
+                # libx264 here writes 8-bit H.264 that keeps the source's HDR tags: banding on
+                # an HDR display and a washed-out grey picture on anything else. Measured on
+                # the shipped image at 4K50, tone-mapping costs about 46 CPU-seconds per second
+                # and 10-bit libx265 7.4, at 2.5 times real time on 20 threads, slower than
+                # the half real time that keeps software HEVC off the settings page
+                # (dev/changelog/1183, 1412). So the picture is copied, whatever asked for the
+                # re-encode, and says so. Recorded whichever way it came about: software by
+                # setting, or a GPU that was asked for and is not working.
+                reencode = False
+                encoder_events.append((_hdr_copy_note(src.hdr_transfer, damage_summary),
+                                       {'kind': 'hdr_reencode_skipped',
+                                        'transfer': src.hdr_transfer,
+                                        'damaged': bool(damage_summary)}))
+
             # Where the converter holds a picture rather than leaving a hole. Inside one run
             # -fps_mode cfr fills a video gap, but only one ffmpeg keeps as a gap
             # (dts_delta_threshold), and never past the last frame - so a video that stops
             # before its audio is padded to it by measurement (dev/changelog/1199).
             source_max_gap = (timeline_scan[1] or {}).get('max_gap_seconds') if timeline_scan else None
-            dts_threshold = dts_delta_threshold(source_max_gap)
-            if dts_threshold:
+            dts_threshold = dts_delta_threshold()
+            if source_max_gap and source_max_gap > FFMPEG_DTS_DELTA_DEFAULT:
                 log.info('Recording %d: the source has a %.1fs video gap - converting with '
                          '-dts_delta_threshold %s so it is held as a picture, not closed up '
                          'out of sync with the audio', recording_id, source_max_gap,
@@ -2565,18 +2613,6 @@ def do_postprocess(app, recording_id: int, ts_path: str):
 
             def _current_plan():
                 return gpu_plan if use_gpu else sw_plan
-
-            if (fmt == 'mp4' and reencode and src is not None and src.hdr_transfer
-                    and not use_gpu):
-                # Recorded whichever way it came about - software by setting, or a GPU that
-                # was asked for and is not working.
-                encoder_events.append((
-                    f'This recording is HDR ({src.hdr_transfer}). It is not normalized in '
-                    f'software: tone-mapping HDR on the CPU costs about 46 CPU-seconds per '
-                    f'second of 4K, so its picture is re-encoded at its own size and rate, '
-                    f'as it always was. The GPU encoder normalizes HDR - keeping it as HDR10 '
-                    f'with HEVC, or tone-mapping it to SDR with H.264.',
-                    {'kind': 'normalize_skipped_hdr', 'transfer': src.hdr_transfer}))
 
             def _encoder_name():
                 if not use_gpu:
@@ -2698,10 +2734,9 @@ def do_postprocess(app, recording_id: int, ts_path: str):
                 plan = _current_plan()
                 c = [ffmpeg_path, '-err_detect', 'ignore_err', '-fflags', '+genpts+discardcorrupt',
                      '-max_error_rate', '1.0']
-                if dts_threshold:
-                    # Every path, the stream copies included: a copy closes a long video
-                    # gap out of sync exactly as a re-encode does (dev/changelog/1199).
-                    c += ['-dts_delta_threshold', dts_threshold]
+                # Every path, the stream copies included: a copy closes a long video gap
+                # out of sync exactly as a re-encode does (dev/changelog/1199).
+                c += ['-dts_delta_threshold', dts_threshold]
                 gpu_reencode = use_gpu and fmt == 'mp4' and reencode
                 if gpu_reencode and hw_decode:
                     # The decoded frames stay on the device; -hwaccel_device opens it for the
@@ -3079,6 +3114,10 @@ def do_postprocess(app, recording_id: int, ts_path: str):
                     parts_done = 0
                     source_covered = 0.0
                     source_complete = False
+                    copy_hdr_instead = not use_gpu and src is not None and bool(src.hdr_transfer)
+                    if copy_hdr_instead:
+                        # The same answer the planning above gives an HDR source with no GPU.
+                        reencode, resumable, signature = False, False, None
                     if resumable:
                         signature = parts_signature(
                             _build_cmd(audio_copy=audio_copy_fallback), output_path)
@@ -3087,14 +3126,16 @@ def do_postprocess(app, recording_id: int, ts_path: str):
                                 'attempt spent): %s',
                                 recording_id, 'decoder' if dropped_decode else 'encoder',
                                 fmt_duration(result.out_time or 0, with_seconds=True),
-                                'with CPU decoding' if dropped_decode else 'with libx264 on the CPU',
+                                ('with CPU decoding' if dropped_decode
+                                 else 'as a stream copy, this source being HDR' if copy_hdr_instead
+                                 else 'with libx264 on the CPU'),
                                 parts_discarded, last_error)
 
                     @retry_on_locked()
                     def _commit_gpu_fallback_event(where=result.out_time or 0,
                                                    dropped=parts_discarded, sig=signature,
                                                    err=last_error, decode=dropped_decode,
-                                                   evidence=final_death):
+                                                   evidence=final_death, copy=copy_hdr_instead):
                         r = db.session.get(Recording, recording_id)
                         # Registered before this attempt writes a part, for the reason the
                         # audio fallback's commit gives.
@@ -3104,6 +3145,10 @@ def do_postprocess(app, recording_id: int, ts_path: str):
                                     f'{fmt_duration(where, with_seconds=True)} into the '
                                     f'source. Retrying with the decoding on the CPU and the '
                                     f'encoding still on the GPU.')
+                        elif copy:
+                            what = (f'The GPU encoder failed '
+                                    f'{fmt_duration(where, with_seconds=True)} into the '
+                                    f'source. ' + _hdr_copy_note(src.hdr_transfer, damage_summary))
                         else:
                             what = (f'The GPU encoder failed '
                                     f'{fmt_duration(where, with_seconds=True)} into the '
@@ -3543,7 +3588,7 @@ def do_postprocess(app, recording_id: int, ts_path: str):
                         elif lost:
                             verdict = 'the conversion lost video the source has'
                         elif reencode:
-                            verdict = 'nothing lost'
+                            verdict = 'the conversion lost nothing the source has'
                         else:
                             verdict = 'no more than the source itself has'
                         detail = f'Checked the converted file: {found} - {verdict}.'
@@ -3679,6 +3724,14 @@ def do_postprocess(app, recording_id: int, ts_path: str):
                     )
                 elif output_check and output_check['lost_seconds'] == 0:
                     alerts.dismiss_open_alerts_for_recording(recording_id, 'CONVERTED_FILE_GAPS')
+
+                try:
+                    from .track_ends import note_track_ends
+                    note_track_ends(recording_id, [(None, output_path)], 'converted file')
+                except Exception as exc:
+                    # A diagnostic must never be able to fail the conversion it checks.
+                    log.warning('Recording %d: could not compare where the picture and sound '
+                                'end in the converted file: %s', recording_id, exc)
 
                 if ts_path != output_path and os.path.exists(ts_path):
                     _dispose_of_source(recording_id, ts_path, output_check,

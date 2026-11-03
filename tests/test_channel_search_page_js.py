@@ -29,6 +29,7 @@ expensive part, and it is the same page each time.
 """
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -128,6 +129,10 @@ def _seed_corpus():
         channel_id=discovery.id, title='Tomorrow Final', sub_title='Live',
         start_time=now + timedelta(days=1), stop_time=now + timedelta(days=1, hours=2))
     db.session.add(upcoming)
+    # Thirty hours either side of now, which is on two calendar days in every timezone.
+    db.session.add(EPGEntry(
+        channel_id=discovery.id, title='Marathon Across Midnight',
+        start_time=now - timedelta(hours=30), stop_time=now + timedelta(hours=30)))
     db.session.flush()
     # A SCHEDULED recording overlapping that one, so `record_state` is 'scheduled' on it
     # and 'none' on its two neighbours - the per-showing distinction the payload exists
@@ -1278,6 +1283,19 @@ class AiringGrainTests(_PageJs, unittest.TestCase):
         self.assertTrue(self.obs['first_row_has_when'])
         self.assertTrue(self.obs['first_row_title'])
 
+
+    def test_a_showing_across_midnight_names_both_days(self):
+        """dev/docs/BUGS.md 2026-11-02: the cell carried the start's day beside the whole time
+        range, so a showing on now could read as having ended yesterday."""
+        self.assertIn(' to ', self.obs['spanning_showing_day_word'])
+
+    def test_no_label_prints_a_start_day_beside_a_whole_time_range(self):
+        """The cell, its tooltip, the row sheet and the bulk modal all carried that shape, and
+        only the cell is drawn by the harness."""
+        with open(os.path.join(REPO, 'static', 'js', 'channel-search.js'), encoding='utf-8') as f:
+            source = f.read()
+        self.assertEqual(re.findall(r'dayLabel\([^\n]*\n?[^\n]*timeRange\(', source), [])
+        self.assertGreaterEqual(source.count('showingDays('), 4)
     def test_the_checkbox_carries_both_ids(self):
         """The tick selects the SHOWING and carries its CHANNEL into the channel actions,
         so both ids have to be on the element (dev/changelog/1157)."""

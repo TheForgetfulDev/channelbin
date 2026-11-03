@@ -3278,6 +3278,29 @@ def _m105_segment_settled_probe(conn, cur):
     conn.commit()
 
 
+def _m110_recording_gave_up_reason(conn, cur):
+    """recordings: gave_up_reason, one of GAVE_UP_REASONS (dev/changelog/1404).
+
+    No backfill: every give-up before this column left a FAILED row carrying the same reason
+    in failure_reason, and that row is still what happened to it."""
+    cols = {r[1] for r in cur.execute('PRAGMA table_info(recordings)').fetchall()}
+    if cols and 'gave_up_reason' not in cols:
+        cur.execute('ALTER TABLE recordings ADD COLUMN gave_up_reason VARCHAR(64)')
+    conn.commit()
+
+
+def _m111_recording_track_end_gap(conn, cur):
+    """recordings: track_end_gap_seconds, how far apart the picture and sound end
+    (dev/changelog/1424).
+
+    No backfill: measuring a finished recording means waking its file, which nothing may do
+    but a user's click. NULL is "not measured"."""
+    cols = {r[1] for r in cur.execute('PRAGMA table_info(recordings)').fetchall()}
+    if cols and 'track_end_gap_seconds' not in cols:
+        cur.execute('ALTER TABLE recordings ADD COLUMN track_end_gap_seconds FLOAT')
+    conn.commit()
+
+
 def _m106_epg_scans(conn, cur):
     """The EPG similarity scan's result tables (app/epg_similarity.py, dev/changelog/1325).
 
@@ -3839,6 +3862,10 @@ SCHEMA_MIGRATIONS = [
     (108, 'auto_rules + saved searches: a stored Programs search names its search fields and '
      'standing options, so a changed default cannot change it', _m108_stored_searches_explicit),
     (109, 'tags: the built-in 4k tag for the UHD and HDR title markers', _m109_default_4k_tag),
+    (110, 'recordings: gave_up_reason, why a capture ended before its stop time and joined '
+     'what it held', _m110_recording_gave_up_reason),
+    (111, 'recordings: track_end_gap_seconds, how far apart the picture and sound end',
+     _m111_recording_track_end_gap),
 ]
 
 CURRENT_SCHEMA_VERSION = SCHEMA_MIGRATIONS[-1][0]

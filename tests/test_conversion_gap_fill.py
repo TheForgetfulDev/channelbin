@@ -25,6 +25,7 @@ import app.postprocessor as ppmod  # noqa: E402
 from app import db, toolchain  # noqa: E402
 from app.database import Recording, RecordingEvent, RecordingSegment, DIAGNOSTICS  # noqa: E402
 from app.postprocessor import ConversionResult, do_postprocess  # noqa: E402
+from app.proc_utils import TIMELINE_GAP_KEEP_SECONDS  # noqa: E402
 from tests.support import clips, seed  # noqa: E402
 from tests.support.app import make_test_app  # noqa: E402
 
@@ -185,12 +186,14 @@ class LongVideoGapTests(_GapCase):
         self.assertAlmostEqual(ends['video'][0], ends['audio'][0], delta=0.5)
         self.assertGreater(ends['video'][0], 44.0, 'not collapsed to 30s')
 
-    def test_the_command_keeps_exactly_the_gap_the_scan_measured(self):
+    def test_the_command_keeps_what_the_capture_keeps(self):
+        """The capture's own bound (dev/changelog/1415), on every stream: derived from the
+        video scan it could not see an audio-only gap, and the conversion pulled one shut."""
         self._use('seam.ts')
         cmd = self._convert(_config())
         gap = db.session.get(Recording, self.rid).timeline_max_gap_seconds
         self.assertAlmostEqual(gap, 15.0, delta=0.1)
-        self.assertEqual(self._arg(cmd, '-dts_delta_threshold'), '16', 'the scan\'s gap, plus 1')
+        self.assertEqual(self._arg(cmd, '-dts_delta_threshold'), str(TIMELINE_GAP_KEEP_SECONDS))
         self.assertLess(cmd.index('-dts_delta_threshold'), cmd.index('-i'))
 
     def test_a_stream_copy_keeps_the_gap_in_sync_too(self):
@@ -199,19 +202,14 @@ class LongVideoGapTests(_GapCase):
         cfg['recording']['gather_health_data'] = True
         cmd = self._convert(cfg)
         self.assertEqual(self._arg(cmd, '-c:v'), 'copy')
-        self.assertEqual(self._arg(cmd, '-dts_delta_threshold'), '16')
+        self.assertEqual(self._arg(cmd, '-dts_delta_threshold'), str(TIMELINE_GAP_KEEP_SECONDS))
         from app.probe import stream_ends
         ends = stream_ends(self._execute(cmd))
         self.assertAlmostEqual(ends['video'][0], ends['audio'][0], delta=0.5)
 
-    def test_the_threshold_is_only_raised_past_ffmpegs_own(self):
-        f = ppmod.dts_delta_threshold
-        self.assertIsNone(f(None))
-        self.assertIsNone(f(0.0))
-        self.assertIsNone(f(8.1), "recording 4's 8.1s gap is already kept by the default")
-        self.assertIsNone(f(9.0))
-        self.assertEqual(f(9.5), '11')
-        self.assertEqual(f(15.004), '17')
+    def test_the_threshold_is_the_captures_own(self):
+        self.assertEqual(ppmod.dts_delta_threshold(), str(TIMELINE_GAP_KEEP_SECONDS))
+        self.assertGreater(TIMELINE_GAP_KEEP_SECONDS, ppmod.FFMPEG_DTS_DELTA_DEFAULT)
 
 
 class EndPadTests(_GapCase):
@@ -236,12 +234,12 @@ class EndPadTests(_GapCase):
         self.assertIn('ends 15s before the audio (video to 10s, audio to 25s)', evs[0].detail)
 
     def test_a_clean_recording_keeps_its_command(self):
-        """Characterization: a file with no long gap and tracks ending together gets neither
-        flag, so its command is the one it always had."""
+        """Characterization: a file with no long gap and tracks ending together is not
+        padded, and carries the same gap bound every conversion does."""
         self._use('clean.ts')
         cmd = self._convert(_config(reencode_mode='always'))
         self.assertNotIn('-vf', cmd)
-        self.assertNotIn('-dts_delta_threshold', cmd)
+        self.assertEqual(self._arg(cmd, '-dts_delta_threshold'), str(TIMELINE_GAP_KEEP_SECONDS))
         self.assertEqual(self._events('conversion_end_padded'), [])
 
     def test_the_end_of_a_ts_is_read_where_its_header_says_nothing(self):

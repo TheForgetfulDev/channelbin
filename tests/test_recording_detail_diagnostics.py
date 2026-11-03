@@ -80,6 +80,17 @@ class DiagViewFilterTests(unittest.TestCase):
         self.assertEqual(view['title'], 'Slate scan details')
         self.assertEqual(view['rows'], [('Black frame count', 12)])
 
+    def test_an_absurdly_long_value_is_cut_for_the_page(self):
+        """Recording 32's stored event (dev/docs/BUGS.md 2026-11-03)."""
+        view = diag_view_filter(json.dumps({'kind': 'capture_stderr',
+                                            'reconnect_hole_seconds': [111.744] * 81510,
+                                            'reconnect_replay_seconds': [9.5, 10.0]}))
+        rows = dict(view['rows'])
+        cut = rows['Reconnect hole (s)']
+        self.assertLess(len(cut), 4100)
+        self.assertIn('more characters not shown', cut)
+        self.assertEqual(rows['Reconnect replay (s)'], [9.5, 10.0])
+
     def test_none_when_nothing_to_show(self):
         for raw in (None, '', '{}', json.dumps({'kind': 'timeline_scan'})):
             self.assertIsNone(diag_view_filter(raw), raw)
@@ -129,6 +140,16 @@ class DiagnosticsRenderTests(unittest.TestCase):
         self.assertNotIn('<details class="ev-extra" open>', html)
         self.assertIn('Backward DTS steps', html)
         self.assertIn('89412', html)
+
+    def test_a_stored_event_of_half_a_megabyte_does_not_reach_the_page(self):
+        """Recording 32's event, as it is stored on prod (dev/docs/BUGS.md 2026-11-03)."""
+        self._add_event(json.dumps({'kind': 'capture_stderr',
+                                    'reconnect_hole_seconds': [111.744] * 81510}),
+                        detail='Segment 2 capture ended; ' + '111.7, ' * 80000)
+        html = self._page()
+        self.assertIn('more characters not shown', html)
+        self.assertNotIn('111.7, ' * 1000, html)
+        self.assertNotIn('111.744, ' * 1000, html)
 
     def test_event_li_carries_db_id(self):
         """The disclosure re-apply keys on the DB id; without it the swap loses state."""

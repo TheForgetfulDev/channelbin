@@ -26,10 +26,15 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from app import channel_search as cs  # noqa: E402
+from sqlalchemy import event  # noqa: E402
+from sqlalchemy.engine import Engine  # noqa: E402
+
+from app import channel_search as cs, db  # noqa: E402
 from app.channel_search import (  # noqa: E402
     DOW_VALUES, GRAIN_AIRINGS, GRAIN_CHANNELS, SearchState, compute_facets, split_predicates,
 )
+from app.database import ChannelGroupMember  # noqa: E402
+from tests.support import seed  # noqa: E402
 from tests.support.search import only_hiding  # noqa: E402
 from tests.test_airing_search import TEST_CFG, _AiringTestCase  # noqa: E402
 
@@ -202,6 +207,61 @@ class GroupAnyFacetTests(_AiringTestCase):
     def test_a_named_group_filter_still_counts(self):
         facets = self._facets((self.group.name,), cs.default_standing_for(GRAIN_AIRINGS))
         self.assertTrue(sum(facets['acct'].values()))
+
+
+class AnyGroupCountTests(_AiringTestCase):
+    """The "Any group" count answers one question two ways and has to stay one number.
+
+    It was a COUNT(DISTINCT) over every membership's showings, nearly the whole cost of this
+    facet (dev/changelog/1418). Without the DISTINCT a channel in two groups is the case that
+    breaks, so these seed exactly that and compare the count to the list it promises.
+    """
+
+    def _seed(self):
+        super()._seed()
+        seed.make_group(name='Also ESPN', members=[self.espn])
+        db.session.commit()
+
+    def _any_count(self, grain, **kw):
+        state = SearchState(grain=grain, facets=('group',), standing=only_hiding(), **kw)
+        return compute_facets(state, cs.SearchContext.build(TEST_CFG))['group'][cs.GROUP_ANY]
+
+    def _listed(self, grain):
+        # Airing grain only: the channel grain's total also carries a row per group.
+        state = SearchState(grain=grain, facets=(), standing=only_hiding(),
+                            filters=(cs.DimensionFilter('group', (cs.GROUP_ANY,), ()),))
+        return cs.search(state, cs.SearchContext.build(TEST_CFG)).total
+
+    def test_a_channel_in_two_groups_counts_once_on_either_grain(self):
+        self.assertEqual(self._any_count(GRAIN_CHANNELS), 2)
+        self.assertEqual(self._any_count(GRAIN_AIRINGS), self._listed(GRAIN_AIRINGS))
+        self.assertEqual(self._listed(GRAIN_AIRINGS), 3,
+                         'ESPN has two showings and Sky one, and ESPN is in two groups')
+
+    def test_the_count_matches_the_list_with_a_narrowing_filter(self):
+        narrow = (cs.DimensionFilter('cat', ('Sports',), ()),)
+        state = SearchState(grain=GRAIN_AIRINGS, facets=(), standing=only_hiding(),
+                            filters=narrow + (cs.DimensionFilter('group', (cs.GROUP_ANY,), ()),))
+        self.assertEqual(self._any_count(GRAIN_AIRINGS, filters=narrow),
+                         cs.search(state, cs.SearchContext.build(TEST_CFG)).total)
+
+    def test_no_memberships_counts_zero(self):
+        ChannelGroupMember.query.delete()
+        db.session.commit()
+        self.assertEqual(self._any_count(GRAIN_AIRINGS), 0)
+
+    def test_the_count_does_not_go_back_to_a_distinct_over_showings(self):
+        statements = []
+
+        def capture(_conn, _cursor, statement, *_rest):
+            statements.append(statement)
+
+        event.listen(Engine, 'before_cursor_execute', capture)
+        try:
+            self._any_count(GRAIN_AIRINGS)
+        finally:
+            event.remove(Engine, 'before_cursor_execute', capture)
+        self.assertEqual([s for s in statements if 'count(distinct' in s.lower()], [])
 
 
 if __name__ == '__main__':

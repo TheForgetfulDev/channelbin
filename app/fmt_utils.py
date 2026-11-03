@@ -267,6 +267,22 @@ def join_labels(labels) -> str:
     return ', '.join(labels[:-1]) + ' and ' + labels[-1]
 
 
+# How many durations an event's sentence names before the rest becomes a count.
+SECONDS_LIST_SHOWN = 12
+
+
+def seconds_list(values, limit=None) -> str:
+    """'4.0, 5.1 and 5.8 s' - a few durations, read in one breath. Unlike join_labels, a
+    repeated value stays: three 12.0 s gaps are three gaps. Past `limit` the rest is a
+    count: '4.0, 5.1 and 12 more s'."""
+    parts = [f'{v:.1f}' for v in values]
+    if limit is not None and len(parts) > limit:
+        return f'{", ".join(parts[:limit])} and {len(parts) - limit} more s'
+    if len(parts) <= 1:
+        return f'{parts[0] if parts else ""} s'
+    return f'{", ".join(parts[:-1])} and {parts[-1]} s'
+
+
 def plural(n, one, many=None) -> str:
     """The word alone: plural(1, 'folder') -> 'folder', plural(2, 'folder') -> 'folders',
     plural(2, 'is', 'are') -> 'are'. counted() is the form that carries the number."""

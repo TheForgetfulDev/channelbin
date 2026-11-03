@@ -12,11 +12,14 @@ channel search 89ms -> 4-10ms, EPG deep search 1.3-1.6s -> 15-250ms (dev/changel
 
 Two things about these indexes that are easy to get wrong:
 
-**They are rebuilt wholesale, never maintained with triggers.** EPG sync mass-deletes and
-bulk re-inserts 270k-410k rows about six times a day. Trigger-maintained FTS turns that
+**They are refreshed after the write, never maintained with triggers.** EPG sync mass-deletes
+and bulk re-inserts 270k-410k rows about six times a day. Trigger-maintained FTS turns that
 1.16M-row rewrite from 31.2s into 314.8s on insert and 6.1s into 89.1s on delete - a 10x
-write penalty holding SQLite's single write lock the whole time. A wholesale rebuild after
-the sync costs ~40s instead. Do not add triggers here later "for freshness".
+write penalty holding SQLite's single write lock the whole time. Do not add triggers here
+later "for freshness". A sync close-out compares the programs index against epg_entries and
+writes only the difference, which ends at the same rows a full rebuild would; everything else
+rebuilds wholesale, and the daily EPG cleanup's full rebuild is also what compacts the
+segments the incremental passes leave behind (dev/changelog/1416).
 
 **The programs rebuild is chunked, and that is a correctness constraint, not a tuning
 choice.** SQLite has one write lock and a 10s busy_timeout; populating chan_prog_fts in a
@@ -41,15 +44,17 @@ ORM model, so that table alone comes from create_all().
 """
 import hashlib
 import logging
+import sqlite3
 import threading
 import time
 from datetime import datetime
+from itertools import groupby
 
 from sqlalchemy import Integer, column, func, or_, select, table, text
 
 from . import admission, db
 from .database import Channel, EPGEntry, SearchIndexState
-from .db_utils import current_wal_size_bytes, retry_on_locked
+from .db_utils import chunked, current_wal_size_bytes, retry_on_locked
 from .fmt_utils import fmt_bytes
 
 log = logging.getLogger(__name__)
@@ -90,6 +95,21 @@ STATUS_BUILDING = 'BUILDING'
 # section 5 recommends 25,000 for the (larger, unbuilt) epg_fts index; on this table that
 # measures 6.16s, thinner headroom for no gain.
 FTS_CHUNK_ROWS = 10_000
+
+# Rows per transaction when a sync applies only what changed. Smaller than the full rebuild's
+# chunk because one row here costs an FTS delete or an FTS insert on an index with live
+# segments: 3,000 rows measured under 1s held, against 1.5s for 10,000 inserts into an empty
+# index. An automerge that lands inside a chunk is not bounded by this either way - the worst
+# measured was 8.1s at 3,000 rows and 9.7s at 10,000, against 7.6-30s for the 'delete-all' every
+# full rebuild takes.
+DIFF_CHUNK_ROWS = 5_000
+
+# Past this many differing rows the comparison stops and the full rebuild runs instead. This
+# bounds memory and nothing else, since the rows to add are held until the write phase: holding
+# this many measures 124MB. Writing the difference is still the faster path at the cap, 25.7s
+# for 297,364 rows against 55.0s for the rebuild it replaced. Twelve hours of production syncs,
+# all accounts together, differed by about 220,000 rows.
+DIFF_MAX_CHANGED_ROWS = 300_000
 
 # Minimum query length the trigram tokenizer can answer at all. Below three characters an
 # FTS MATCH returns *zero rows* rather than erroring, so every caller must fall back to LIKE
@@ -165,6 +185,8 @@ SEARCH_INDEX_DDL = (
 # `datetime('now')` rather than a bound cutoff so this stays parameter-free. It returns UTC
 # to the second, and stop_time is stored as naive-UTC text with microseconds, so the string
 # comparison is correct (a same-second row sorts after the cutoff and is kept).
+_CHAN_PROG_WINDOW = "stop_time >= datetime('now')"
+
 REBUILD_SQL = {
     # One statement, and no equivalent trick is available: this holds the write lock for its
     # whole duration, measured 5.7s warm and 9.8s on a cold page cache against 136k channels.
@@ -174,11 +196,11 @@ REBUILD_SQL = {
         ("INSERT INTO ch_fts(ch_fts) VALUES('rebuild')",),
     ),
     SEARCH_INDEX_PROGRAMS: (
-        # Clearing is its own unit because it is the one part that cannot be chunked - but
-        # unlike epg_fts, where clearing 517MB costs ~30s and is the whole problem
-        # (DESIGN-search-indexes.md section 5), delete-all on this 260MB index measures
-        # 2.71s, comfortably inside busy_timeout. Measured 2026-07-30, so section 5's
-        # chunked-clear machinery is genuinely not needed here.
+        # Clearing is its own unit because it is the one part that cannot be chunked. Measured
+        # 2.71s on a 260MB index in 2026-07, and 7.6-30s on 367MB in 2026-11 on a slower box, which
+        # can exceed busy_timeout. Since dev/changelog/1416 a healthy install pays this once a
+        # day rather than once per sync. Whether it needs section 5's chunked clear is tracked
+        # in the backlog.
         ("INSERT INTO chan_prog_fts(chan_prog_fts) VALUES('delete-all')",),
         (
             # IF EXISTS, not a bare DROP: a retry re-enters here with the temp table
@@ -186,7 +208,7 @@ REBUILD_SQL = {
             'DROP TABLE IF EXISTS temp.chan_prog_stage',
             'CREATE TEMP TABLE chan_prog_stage AS '
             'SELECT DISTINCT channel_id, title, sub_title, description FROM epg_entries '
-            "WHERE stop_time >= datetime('now')",
+            f'WHERE {_CHAN_PROG_WINDOW}',
             'DELETE FROM chan_prog',
             'INSERT INTO chan_prog (channel_id, title, sub_title, description) '
             'SELECT channel_id, title, sub_title, description FROM chan_prog_stage',
@@ -215,7 +237,8 @@ def rebuild_units(name: str, scalar):
 
     The chunks walk id ranges rather than LIMIT/OFFSET so each one is an index seek on the
     primary key instead of a re-scan of everything before it. chan_prog was emptied and
-    repopulated by the unit above, so its ids start at 1 and are contiguous.
+    repopulated by the unit above, so its ids start at 1 and are contiguous - which is only
+    true here. Between full rebuilds _apply_program_changes() leaves gaps.
     """
     for unit in REBUILD_SQL[name]:
         yield unit
@@ -228,6 +251,128 @@ def rebuild_units(name: str, scalar):
             'SELECT id, title, sub_title, description FROM chan_prog '
             f'WHERE id > {lo} AND id <= {lo + FTS_CHUNK_ROWS}',
         )
+
+
+def _diff_program_rows(want, have, max_changed: int):
+    """(chan_prog ids to remove, rows to add) to turn `have` into `want`, or None past the cap.
+
+    Both are streams ordered by channel_id: `want` yields (channel_id, title, sub_title,
+    description) and may repeat a row, `have` yields (id, channel_id, title, sub_title,
+    description). Compared one channel at a time so only one channel's rows are in memory
+    beyond the differences themselves. A row repeated in `have` keeps one copy, so the result
+    is the same distinct set the full rebuild's SELECT DISTINCT produces.
+
+    Compared in Python rather than SQL because SQL needs both sides staged on one connection
+    and was slower for it: NOT EXISTS both ways measured 54s on 494,000 rows, this 5-24s.
+    """
+    remove, add = [], []
+    wanted = groupby(want, key=lambda row: row[0])
+    held = groupby(have, key=lambda row: row[1])
+    next_want, next_have = next(wanted, None), next(held, None)
+    while next_want is not None or next_have is not None:
+        if next_have is None or (next_want is not None and next_want[0] < next_have[0]):
+            add.extend(set(next_want[1]))
+            next_want = next(wanted, None)
+        elif next_want is None or next_have[0] < next_want[0]:
+            remove.extend(row[0] for row in next_have[1])
+            next_have = next(held, None)
+        else:
+            missing = set(next_want[1])
+            kept = set()
+            for row in next_have[1]:
+                key = row[1:]
+                if key in missing and key not in kept:
+                    kept.add(key)
+                else:
+                    remove.append(row[0])
+            add.extend(missing - kept)
+            next_want, next_have = next(wanted, None), next(held, None)
+        if len(remove) + len(add) > max_changed:
+            return None
+    return remove, add
+
+
+def _program_changes(max_changed: int):
+    """Read what the programs index has to change, or None past the cap. Writes nothing.
+
+    Raw cursors because SQLite streams them, and this reads the whole of both tables. Two
+    statements live on one connection share one read transaction, so the two sides are the
+    same snapshot.
+    """
+    raw = db.session.connection().connection
+    want, have = raw.cursor(), raw.cursor()
+    try:
+        want.execute('SELECT channel_id, title, sub_title, description FROM epg_entries '
+                     f'WHERE {_CHAN_PROG_WINDOW} ORDER BY channel_id')
+        have.execute('SELECT id, channel_id, title, sub_title, description FROM chan_prog '
+                     'ORDER BY channel_id')
+        return _diff_program_rows(want, have, max_changed)
+    finally:
+        want.close()
+        have.close()
+        db.session.rollback()
+
+
+def _apply_program_changes(remove_ids: list, add_rows: list):
+    """Write the difference, in chunks that each leave chan_prog and its FTS index agreeing.
+
+    FTS5's 'delete' needs the row's old text, so it runs while the chan_prog row still exists,
+    in the same transaction as the row's delete. The caller holds STATUS_BUILDING across this:
+    between chunks the index is consistent but only partly updated.
+    """
+    @retry_on_locked()
+    def _remove_chunk_and_commit(ids):
+        # Literal integers this module read from the table: the list appears twice, and bound it
+        # would count double against SQLite's variable limit.
+        id_list = ','.join(str(int(row_id)) for row_id in ids)
+        db.session.execute(text(
+            "INSERT INTO chan_prog_fts(chan_prog_fts, rowid, title, sub_title, description) "
+            f"SELECT 'delete', id, title, sub_title, description FROM chan_prog "
+            f"WHERE id IN ({id_list})"))
+        db.session.execute(text(f'DELETE FROM chan_prog WHERE id IN ({id_list})'))
+        db.session.commit()
+
+    @retry_on_locked()
+    def _add_chunk_and_commit(params):
+        db.session.execute(text(
+            'INSERT INTO chan_prog (id, channel_id, title, sub_title, description) '
+            'VALUES (:id, :channel_id, :title, :sub_title, :description)'), params)
+        db.session.execute(text(
+            'INSERT INTO chan_prog_fts(rowid, title, sub_title, description) '
+            'VALUES (:id, :title, :sub_title, :description)'), params)
+        db.session.commit()
+
+    for ids in chunked(remove_ids, DIFF_CHUNK_ROWS):
+        _remove_chunk_and_commit(ids)
+    next_id = (db.session.execute(text('SELECT MAX(id) FROM chan_prog')).scalar() or 0) + 1
+    db.session.rollback()
+    for start in range(0, len(add_rows), DIFF_CHUNK_ROWS):
+        _add_chunk_and_commit([
+            {'id': next_id + start + offset, 'channel_id': row[0], 'title': row[1],
+             'sub_title': row[2], 'description': row[3]}
+            for offset, row in enumerate(add_rows[start:start + DIFF_CHUNK_ROWS])])
+
+
+def _why_programs_need_a_full_rebuild() -> str | None:
+    """Why the programs index cannot be updated in place, or None when it can.
+
+    Must be read before this rebuild marks the index BUILDING. A comparison only sees chan_prog,
+    so it would find nothing to do on an index whose content table is complete and whose FTS
+    side never got populated: a full rebuild that died after 'delete-all' leaves exactly that,
+    and the result would be STATUS_OK on an index that matches nothing. STATUS_OK is the
+    recorded fact that the last rebuild finished; the row counts catch anything else that
+    separated the two tables.
+    """
+    state = SearchIndexState.query.filter_by(name=SEARCH_INDEX_PROGRAMS).first()
+    if state is None or state.status != STATUS_OK:
+        return f'the last rebuild left it {state.status if state else "never built"}'
+    rows = db.session.execute(text('SELECT COUNT(*) FROM chan_prog')).scalar()
+    if not rows:
+        return 'it is empty'
+    documents = db.session.execute(text('SELECT COUNT(*) FROM chan_prog_fts_docsize')).scalar()
+    if documents != rows:
+        return f'chan_prog holds {rows} rows and its FTS index {documents}'
+    return None
 
 
 _ROW_COUNT_SQL = {
@@ -392,8 +537,15 @@ def rebuilding_index_names() -> list:
     return [s.name for s in SearchIndexState.query.filter_by(status=STATUS_BUILDING).all()]
 
 
-def rebuild_search_indexes(reason: str, names=SEARCH_INDEX_NAMES, refusable: bool = False) -> dict:
+def rebuild_search_indexes(reason: str, names=SEARCH_INDEX_NAMES, refusable: bool = False,
+                           only_changes: bool = False) -> dict:
     """Rebuild the named indexes and record the outcome. Returns {name: bool succeeded}.
+
+    `only_changes=True` lets the programs index write just the rows that differ from
+    epg_entries, when it can (see _why_programs_need_a_full_rebuild), and otherwise rebuilds it
+    in full and logs why. The sync close-out asks for it because its cost is what grows with
+    the install. Every other caller stays full on purpose: a manual rebuild and the janitor are
+    repairs, and the daily EPG cleanup compacts the index.
 
     Never raises: a rebuild failure must not turn an otherwise-successful sync into an
     ERROR, because the sync's own work is already committed and correct. Instead the index
@@ -430,7 +582,7 @@ def rebuild_search_indexes(reason: str, names=SEARCH_INDEX_NAMES, refusable: boo
             try:
                 results = {}
                 for name in names:
-                    results[name] = _rebuild_one(name, reason)
+                    results[name] = _rebuild_one(name, reason, only_changes)
                 return results
             finally:
                 _rebuilding = False
@@ -438,7 +590,7 @@ def rebuild_search_indexes(reason: str, names=SEARCH_INDEX_NAMES, refusable: boo
         admission.release(ticket)
 
 
-def _rebuild_one(name: str, reason: str) -> bool:
+def _rebuild_one(name: str, reason: str, only_changes: bool = False) -> bool:
     @retry_on_locked()
     def _run_unit_and_commit(statements):
         for stmt in statements:
@@ -455,14 +607,31 @@ def _rebuild_one(name: str, reason: str) -> bool:
         # actually contain and would read as fresh forever. Reading first can only err the
         # safe way - the index looks stale one rebuild longer than it strictly had to.
         watermark = source_watermark(name)
+        in_place = only_changes and name == SEARCH_INDEX_PROGRAMS
+        why_full = _why_programs_need_a_full_rebuild() if in_place else None
+        changes = None
         # BUILDING before the first unit, not after it. The very first unit empties the FTS
         # index while its content table still holds the old rows, so from that commit until
         # the last chunk lands, any reader that trusted this index would get zero matches
         # with no error. That window is the reason this status exists; a rebuild that dies
         # mid-way leaves it set, which reads as "not usable" and sends search to LIKE.
         _record_state(name, STATUS_BUILDING, None, None, None, watermark)
-        for statements in rebuild_units(name, _scalar):
-            _run_unit_and_commit(statements)
+        if in_place and why_full is None:
+            try:
+                changes = _program_changes(DIFF_MAX_CHANGED_ROWS)
+            except sqlite3.Error as exc:
+                why_full = f'comparing it failed: {exc}'
+            else:
+                if changes is None:
+                    why_full = f'more than {DIFF_MAX_CHANGED_ROWS} rows differ'
+        if changes is not None:
+            remove_ids, add_rows = changes
+            _apply_program_changes(remove_ids, add_rows)
+            how = f'{len(add_rows)} rows added and {len(remove_ids)} removed'
+        else:
+            for statements in rebuild_units(name, _scalar):
+                _run_unit_and_commit(statements)
+            how = f'full, because {why_full}' if why_full else 'full'
         row_count = _scalar(_ROW_COUNT_SQL[name])
     except Exception as exc:
         duration_ms = int((time.monotonic() - started) * 1000)
@@ -479,8 +648,8 @@ def _rebuild_one(name: str, reason: str) -> bool:
     # rows across ~40 transactions, and any reader holding a snapshot across that window
     # stops every checkpoint from rewinding the file. The daily maintenance reading says
     # which DAY the WAL grew; this says whether it was this. See dev/changelog/424.
-    log.info('Search index %r rebuilt in %dms (%d rows, %s) - WAL now %s',
-             name, duration_ms, row_count or 0, reason,
+    log.info('Search index %r rebuilt in %dms (%d rows, %s) - %s, WAL now %s',
+             name, duration_ms, row_count or 0, reason, how,
              fmt_bytes(current_wal_size_bytes()))
     _record_state(name, STATUS_OK, duration_ms, row_count, None, watermark)
     _alert_rebuild_failed(name, '', active=False)
