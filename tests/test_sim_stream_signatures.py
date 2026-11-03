@@ -94,6 +94,8 @@ class _Capture(unittest.TestCase):
 
 
 class OpenSignatureTests(_Capture):
+    extra = ('test_tiny_black',)
+
     def test_405_at_open_ends_the_capture_with_nothing(self):
         """dev/changelog/436: `HTTP error 405 Method Not Allowed` at input open, exit 8, zero
         bytes, on every attempt."""

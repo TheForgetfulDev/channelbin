@@ -243,6 +243,8 @@ class ConnectionFaultTests(_Faulted):
 # --- what a connection is answered with ------------------------------------------------------
 
 class OpenFaultTests(_Faulted):
+    extra = ('test_tiny_black',)
+
     def test_refuse_at_open_answers_every_attempt_with_405(self):
         """dev/changelog/436: 405 at input open on every attempt, the zero-byte death spiral -
         and 105's dead stream that reconnects and dies is the same answer, again and again."""
