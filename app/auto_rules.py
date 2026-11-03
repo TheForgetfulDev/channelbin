@@ -38,6 +38,7 @@ from .database import (
     AutoRule, CANCEL_BEFORE_START, CANCEL_DURING_ANALYSIS, CANCEL_DURING_CAPTURE,
     CANCEL_DURING_CONVERSION, CANCEL_GROUP_CHANGE, Channel, ChannelGroup, EPGEntry,
     REC_STATUS_ABORTED, REC_STATUS_FAILED, REC_STATUS_SCHEDULED, RECORDING_RULE_PROGRAM_MOVED,
+    rule_status,
     RECORDING_RULE_RELEASED, RECORDING_RULE_RETRACKED, RECORDING_RULE_SCHEDULED,
     RECORDING_START_NOT_ARMED, Recording,
     RecordingProfile, RULE_MATCH_SCHEDULED,
@@ -438,8 +439,10 @@ def _library(extra_ids) -> list:
         Recording.id, Recording.name, Recording.status, Recording.cancel_reason,
         Recording.program_title, Recording.program_sub_title, Recording.program_start_time,
         Recording.program_stop_time, Recording.channel_id, Recording.group_id,
-        Recording.start_time, Recording.stop_time, Recording.rule_id).filter(clause).all()
-    return [_Lib(id=r.id, name=r.name, status=r.status, cancel_reason=r.cancel_reason,
+        Recording.start_time, Recording.stop_time, Recording.rule_id,
+        Recording.gave_up_reason).filter(clause).all()
+    return [_Lib(id=r.id, name=r.name, status=rule_status(r.status, r.gave_up_reason),
+                 cancel_reason=r.cancel_reason,
                  title_key=title_key(r.program_title) if r.program_title else '',
                  episode_raw=title_key(r.program_sub_title),
                  program_start=r.program_start_time, program_stop=r.program_stop_time,
@@ -1856,7 +1859,8 @@ def _follow(rule_id, revision, row, showing, run):
             return None
         rec = (db.session.get(Recording, m.recording_id, populate_existing=True)
                if m.recording_id is not None else None)
-        status = rec.status if rec is not None else m.removed_status
+        status = (rule_status(rec.status, rec.gave_up_reason) if rec is not None
+                  else m.removed_status)
         if status == REC_STATUS_FAILED:
             db.session.rollback()
             return None

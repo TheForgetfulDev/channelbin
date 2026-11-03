@@ -13,8 +13,8 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from app.proc_utils import (build_capture_cmd, is_hls_url,  # noqa: E402
-                            read_timeout_is_inert)
+from app.proc_utils import (TIMELINE_GAP_KEEP_SECONDS, build_capture_cmd,  # noqa: E402
+                            build_preview_cmd, is_hls_url, read_timeout_is_inert)
 
 _RECONNECT_FLAGS = ('-reconnect', '-reconnect_streamed', '-reconnect_at_eof',
                     '-reconnect_delay_max')
@@ -195,6 +195,37 @@ class ReadTimeoutFlagTests(unittest.TestCase):
     def test_fractional_seconds_round_to_whole_microseconds(self):
         cmd = build_capture_cmd(_cfg(read_timeout=2.5), 'http://h/live/1', '/out.ts')
         self.assertEqual(cmd[cmd.index('-rw_timeout') + 1], '2500000')
+
+
+class KeptGapFlagTests(unittest.TestCase):
+    """-dts_delta_threshold on every capture and preview, so a video-only or audio-only gap
+    over ffmpeg's 10 s default stays a gap in the file instead of one stream being pulled
+    back out of step with the other for the rest of the segment (dev/docs/BUGS.md
+    2026-11-02, the kept gap; dev/changelog/1415)."""
+
+    def test_the_bound_is_minutes_not_ffmpegs_seconds(self):
+        self.assertGreaterEqual(TIMELINE_GAP_KEEP_SECONDS, 60)
+
+    def test_every_capture_carries_it_before_the_input(self):
+        for url in ('http://h/live/1', 'https://h/live/1', 'http://h/a.m3u8', 'rtsp://h/x'):
+            with self.subTest(url=url):
+                cmd = build_capture_cmd(_cfg(), url, '/out.ts')
+                self.assertEqual(cmd[cmd.index('-dts_delta_threshold') + 1],
+                                 str(TIMELINE_GAP_KEEP_SECONDS))
+                self.assertLess(cmd.index('-dts_delta_threshold'), cmd.index('-i'))
+
+    def test_a_preview_carries_the_same_bound(self):
+        cmd = build_preview_cmd(_cfg(), 'http://h/live/1', '/tmp/preview')
+        self.assertEqual(cmd[cmd.index('-dts_delta_threshold') + 1],
+                         str(TIMELINE_GAP_KEEP_SECONDS))
+
+    def test_user_extra_input_args_can_override_it(self):
+        cmd = build_capture_cmd(_cfg(extra_input=['-dts_delta_threshold', '10']),
+                                'http://h/live/1', '/out.ts')
+        occurrences = [i for i, a in enumerate(cmd) if a == '-dts_delta_threshold']
+        self.assertEqual(len(occurrences), 2)
+        self.assertEqual(cmd[occurrences[0] + 1], str(TIMELINE_GAP_KEEP_SECONDS))
+        self.assertEqual(cmd[occurrences[1] + 1], '10')
 
 
 class ReadTimeoutInertTests(unittest.TestCase):

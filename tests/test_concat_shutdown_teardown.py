@@ -141,6 +141,8 @@ class _ConcatCase(unittest.TestCase):
             mock.patch('app.recorder.persist_poster_frame'),
             mock.patch('app.health_score.apply_capture_phase_health_observation'),
             mock.patch.object(catmod, '_measure_segment_content_durations'),
+            mock.patch.object(catmod, '_note_segment_track_ends'),
+            mock.patch('app.probe.stream_layout', return_value=None),
         )
 
 
@@ -401,6 +403,8 @@ class SupervisedJoinShutdownTests(_ConcatCase):
                  mock.patch('app.recorder.persist_poster_frame'), \
                  mock.patch('app.health_score.apply_capture_phase_health_observation'), \
                  mock.patch.object(catmod, '_measure_segment_content_durations'), \
+                 mock.patch.object(catmod, '_note_segment_track_ends'), \
+                 mock.patch('app.probe.stream_layout', return_value=None), \
                  mock.patch.object(pumod.subprocess, 'Popen', side_effect=_fake_popen):
                 catmod._run_concatenation(self.t.app, self.rid, reason='test')
 

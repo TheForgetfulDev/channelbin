@@ -569,6 +569,19 @@ function tzDayLabel(date, opts) {
   return fmtDateTz(date, opts || { weekday: 'short', month: 'short', day: 'numeric' });
 }
 
+// The day words for something that runs from `start` to `stop`: 'Today', or 'Yesterday to
+// Today' when it crosses midnight in the display timezone. The start's day alone beside a time
+// range reads as ending that day, so a showing on now could read as over. Stepped back one
+// millisecond because something ending exactly at midnight ended on the day it started. A stop
+// at or before the start names the start's day: stepping back from a zero-length listing at
+// midnight would otherwise read 'Today to Yesterday'.
+function tzDaySpanLabel(start, stop, opts) {
+  const first = tzDayLabel(start, opts);
+  if (!start || !stop || stop <= start) return first;
+  const last = new Date(stop.getTime() - 1);
+  return tzDayKey(last) === tzDayKey(start) ? first : `${first} to ${tzDayLabel(last, opts)}`;
+}
+
 // A naive-UTC timestamp from the API -> the real instant. The app stores naive UTC
 // everywhere and JavaScript reads an unsuffixed string as browser-LOCAL, so the `Z` has to
 // go back on - the single most-repeated line in the code this replaced. Tolerates a string

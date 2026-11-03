@@ -229,16 +229,17 @@ def observation_ledger(channel_id, cfg) -> List[Observation]:
                 (SOURCE_RECORDING, r.id) in excluded))
         correction = _loads(r.capture_quality_breakdown)
         if correction.get('final') is not None:
-            # The correction stores no blend_breakdown, so its weight is the config constant
-            # it was read from. Its instant is stored in its own breakdown; a row that predates
-            # that falls back to analysis_completed_at, taken just before the blend ran.
+            # The correction stores no blend_breakdown; its weight is in its own breakdown, or
+            # for a row that predates that, the config constant it was read from. Its instant
+            # is stored there too; an older row falls back to analysis_completed_at, taken just
+            # before the blend ran.
             rs_cfg = cfg.get('channel_testing', {}).get('recording_score', {})
             correction_at = _stored_instant(
                 correction, r.analysis_completed_at or column_instant)
             obs.append(Observation(
                 SOURCE_CAPTURE_CORRECTION, r.id, correction_at,
                 correction['final'],
-                float(rs_cfg.get('capture_quality_source_weight', 1.0)),
+                _stored_weight(correction, float(rs_cfg.get('capture_quality_source_weight', 1.0))),
                 f'Post-process check of recording "{r.name}" on {format_local(correction_at)} '
                 f'(scored {correction["final"]}/100)',
                 (SOURCE_CAPTURE_CORRECTION, r.id) in excluded))

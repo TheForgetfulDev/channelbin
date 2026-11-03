@@ -320,6 +320,23 @@ def exact_frame_seconds(duration: float) -> float:
     return duration
 
 
+def stream_layout(filepath: str, timeout: int = 30):
+    """[(kind, pid), ...] for a closed file's streams, in order, kind being ffprobe's
+    codec_type; None when it could not be read. Header-only, like the join's other per-segment
+    probe (concatenator._measure_segment_content_durations)."""
+    cmd = [resolve_ffprobe_path(), '-v', 'error', '-show_entries', 'stream=codec_type,id',
+           '-of', 'json', filepath]
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        streams = json.loads(out.stdout).get('streams') if out.returncode == 0 else None
+        if streams is None:
+            return None
+        return [(s.get('codec_type'), int(s.get('id') or '0', 16)) for s in streams]
+    except (OSError, subprocess.SubprocessError, ValueError) as exc:
+        log.warning('Could not read the stream layout of %s: %s', filepath, exc)
+        return None
+
+
 def parse_ffprobe(filepath: str, count_packets: bool = True, timeout: int = 60,
                   stall_timeout: int = 60, on_progress=None, skip_bytes: int = 0) -> dict:
     """Return dict with video/audio stream metadata and format info.
@@ -1319,6 +1336,92 @@ def scan_video_timeline(filepath: str, gap_threshold: float = 0.25, timeout: int
     except Exception as exc:
         log.warning('Timeline scan failed for %s: %s', filepath, exc)
         return {}
+
+
+# How many forward jumps a stream's list keeps before it stops growing. A file with more
+# is damaged in a way no reconnect explains, and the matcher reads the list in file order,
+# so the first ones are the ones that matter.
+TIMELINE_JUMPS_MAX = 200
+
+
+def scan_timeline_jumps(filepath: str, min_jump: float = 0.5, timeout: int = 600,
+                        max_jumps: int = TIMELINE_JUMPS_MAX, on_progress=None) -> dict:
+    """Every stream's forward DTS jumps over `min_jump` seconds, in file order, with what
+    the stream was stepping by just before each one.
+
+        {stream index: {'packets': n, 'first_dts': s, 'last_dts': s, 'truncated': bool,
+                        'jumps': [(prev_dts, dts, prev_step), ...]}}
+
+    `prev_step` is the stream's own cadence at the jump - the duration ffprobe printed for
+    the packet before it, or the step that packet made - so a caller can tell the jump's
+    excess over an ordinary step. Every stream, not only the video: a hole ffmpeg's
+    reconnect repair left (hole_repair.py) lands on each stream's next packet, and closing
+    one stream without the other desyncs the file. Reads the whole file once, under
+    scan_video_timeline's inactivity timeout and progress sampling.
+
+    Returns {} on any error (missing file, ffprobe failure), never raises.
+    """
+    if not filepath or not os.path.exists(filepath):
+        return {}
+    ffprobe_path = resolve_ffprobe_path()
+    # ffprobe prints a section's fields in its own order: stream_index, dts_time,
+    # duration_time (show_entries' order is not kept).
+    cmd = [ffprobe_path, '-v', 'error', '-show_entries',
+           'packet=stream_index,dts_time,duration_time', '-of', 'csv=p=0', filepath]
+    streams = {}
+
+    def _on_line(line):
+        fields = line.strip().rstrip(',').split(',')
+        if len(fields) < 2:
+            return
+        try:
+            index = int(fields[0])
+        except ValueError:
+            return
+        dts = _packet_time(fields[1])
+        if dts is None:
+            return
+        duration = _packet_time(fields[2]) if len(fields) > 2 else None
+        st = streams.get(index)
+        if st is None:
+            st = streams[index] = {'packets': 0, 'first_dts': dts, 'last_dts': dts,
+                                   'truncated': False, 'jumps': [],
+                                   '_prev': None, '_prev_step': None, '_prev_dur': None}
+        st['packets'] += 1
+        prev = st['_prev']
+        if prev is not None:
+            step = dts - prev
+            if step > min_jump:
+                cadence = st['_prev_dur']
+                if cadence is None or not 0.0 < cadence < 1.0:
+                    cadence = st['_prev_step']
+                if len(st['jumps']) < max_jumps:
+                    st['jumps'].append((prev, dts, cadence))
+                else:
+                    st['truncated'] = True
+            elif step > 0:
+                st['_prev_step'] = step
+            if dts > st['last_dts']:
+                st['last_dts'] = dts
+            if dts < st['first_dts']:
+                st['first_dts'] = dts
+        st['_prev'] = dts
+        st['_prev_dur'] = duration if duration is not None and 0.0 < duration < 1.0 else None
+
+    try:
+        returncode = _stream_probe_lines(cmd, _on_line, timeout=timeout, on_progress=on_progress)
+    except OSError as exc:
+        _report_ffprobe_unusable(ffprobe_path, exc, os.path.basename(filepath))
+        return {}
+    except Exception as exc:
+        log.warning('Timeline jump scan failed for %s: %s', filepath, exc)
+        return {}
+    if returncode != 0:
+        return {}
+    for st in streams.values():
+        for key in ('_prev', '_prev_step', '_prev_dur'):
+            st.pop(key, None)
+    return streams
 
 
 def assess_seek_damage(filepath: str, *, joined_segments: int = 1, segment_rates=None,

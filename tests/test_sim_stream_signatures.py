@@ -176,6 +176,14 @@ class StreamSignatureTests(_Capture):
                       text)
         self.assertIn(f'Will reconnect at {sent} in 0 second(s), error=Input/output error', text)
 
+    def test_a_feed_that_keeps_dropping_reconnects_inside_one_capture(self):
+        """Recording 32's capture (dev/docs/BUGS.md 2026-11-03): several drops in one ffmpeg, each
+        answered from the buffer, which ffmpeg logs as a closed backward jump."""
+        self.sim.inject('keeps_dropping', self.label, after_bytes=250_000)
+        _, text, _, _ = self.capture(stop_after=15.0)
+        self.assertGreater(text.count('Will reconnect at'), 1, text[-1500:])
+        self.assertIn('timestamp discontinuity', text)
+
     def test_hls_with_the_raw_stream_reconnect_flags_spins_on_the_playlist(self):
         """dev/changelog/195: a playlist answers EOF on every GET, so -reconnect_at_eof re-fetches
         it in a tight loop and nothing is written. The shipped argv leaves the flags off HLS."""

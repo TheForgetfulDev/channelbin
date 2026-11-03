@@ -114,7 +114,7 @@ def _never_started(cancel_reason) -> bool:
 
 def ledger_entry(m, rec, names, *, now, tz, h24) -> dict:
     """One ledger row as the page shows it. `m` is a RuleMatch row (columns only), `rec` the
-    recording it names - (id, name, status, cancel_reason) - or None, `names` is
+    recording it names - (id, name, status, cancel_reason, gave_up_reason) - or None, `names` is
     {'channels': {id: name}, 'groups': {id: name}}.
 
     `bucket` is which History filter the row falls in, or None for a row only All shows (a
@@ -128,7 +128,10 @@ def ledger_entry(m, rec, names, *, now, tz, h24) -> dict:
         if rec is not None:
             _section, _edge, cls, label, pulse = rec_status_display(rec.status)
             badge = (cls, label)
-            if rec.status == REC_STATUS_COMPLETED:
+            if rec.status == REC_STATUS_COMPLETED and rec.gave_up_reason:
+                bucket = 'bad'
+                fate = 'The capture ended early, so a later airing of it is not a repeat.'
+            elif rec.status == REC_STATUS_COMPLETED:
                 bucket = 'rec'
             elif rec.status == REC_STATUS_FAILED:
                 bucket = 'bad'
@@ -235,7 +238,8 @@ def _ledger_rows(rule_ids):
     ).filter(RuleMatch.rule_id.in_(sorted(rule_ids))).all()
     rec_ids = sorted({r.recording_id for r in rows if r.recording_id is not None})
     recs = {r.id: r for r in db.session.query(
-        Recording.id, Recording.name, Recording.status, Recording.cancel_reason
+        Recording.id, Recording.name, Recording.status, Recording.cancel_reason,
+        Recording.gave_up_reason
     ).filter(Recording.id.in_(rec_ids))} if rec_ids else {}
     channel_ids = sorted({r.channel_id for r in rows if r.channel_id is not None})
     group_ids = sorted({r.group_id for r in rows if r.group_id is not None})

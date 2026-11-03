@@ -1778,6 +1778,7 @@
   const utcDate = utcIsoToDate;
   const dayKey = tzDayKey;
   const dayLabel = tzDayLabel;
+  const showingDays = (row) => tzDaySpanLabel(utcDate(row.start_time), utcDate(row.stop_time));
 
   /* How long until it starts, in the app's own words. Only rendered while it is
      short enough to be useful - "in 3 days" is what the day label already said. */
@@ -1913,9 +1914,9 @@
         const mins = start && stop ? Math.round((stop - start) / 60000) : 0;
         return {
           html: `<span class="a-when${row.on_now ? ' on-now' : ''}${row.ended ? ' is-past' : ''}"
-            ><span class="aw-day">${esc(dayLabel(start))}</span><span class="aw-time">${esc(timeRange(row))}</span>${
+            ><span class="aw-day">${esc(showingDays(row))}</span><span class="aw-time">${esc(timeRange(row))}</span>${
             rel ? `<span class="aw-rel${row.on_now ? ' now' : ''}">${esc(rel)}</span>` : ''}</span>`,
-          tip: `${dayLabel(start)}, ${timeRange(row)}\n${mins} minutes`
+          tip: `${showingDays(row)}, ${timeRange(row)}\n${mins} minutes`
              + `\n\nShown in ${displayTz()}, the display timezone. Stored naive UTC.`,
         };
       }
@@ -3009,7 +3010,7 @@
     const sel = air ? selectedAirings.has(air.id) : selected.has(ch.id);
     return `${rowRecordSheetHtml(air)}
       ${air ? `<div class="sh-note" style="padding:2px 0 8px">On <b>${esc(ch.name)}</b>, ${
-        esc(dayLabel(utcDate(air.start_time)))} ${esc(timeRange(air))}.</div>` : ''}
+        esc(showingDays(air))} ${esc(timeRange(air))}.</div>` : ''}
       ${rowSheetChannelRows(ch, sel, air)}`;
   }
 
@@ -5856,7 +5857,7 @@
       profiles: recordModalProfiles(),
       previewUrl: CFG.bulkPreviewUrl,
       scheduleUrl: CFG.bulkScheduleUrl,
-      when: (plan) => `${dayLabel(utcDate(plan.start_time))} ${timeRange(plan)}`,
+      when: (plan) => `${showingDays(plan)} ${timeRange(plan)}`,
       onDone: (res) => {
         [...(res.created || []), ...(res.skipped || [])]
           .forEach((p) => setAiringSelected(p.epg_id, false));

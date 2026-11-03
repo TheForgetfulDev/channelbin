@@ -330,6 +330,7 @@ class RetryingAlertTests(_RetryHarness):
 class RetryBudgetExhaustedFallsThroughTests(_RetryHarness):
 
     def test_cap_already_reached_gives_up_immediately_instead_of_retrying_again(self):
+        self._nothing_captured()
         self._extra_watchdog_cfg = {'early_fail_abort_count': 1,
                                     'dead_stream_max_retry_attempts': 2}
         rec = db.session.get(Recording, self.rid)
@@ -355,6 +356,7 @@ class RetryBudgetExhaustedFallsThroughTests(_RetryHarness):
 class WindowExhaustedFallsThroughTests(_RetryHarness):
 
     def test_window_already_over_gives_up_immediately_even_with_retry_budget_left(self):
+        self._nothing_captured()
         self._extra_watchdog_cfg = {'early_fail_abort_count': 1,
                                     'dead_stream_max_retry_attempts': 10}
         rec = db.session.get(Recording, self.rid)
@@ -377,6 +379,7 @@ class WindowExhaustedFallsThroughTests(_RetryHarness):
 class ZeroCapDisablesRetryTests(_RetryHarness):
 
     def test_max_retry_attempts_zero_behaves_like_before_the_feature(self):
+        self._nothing_captured()
         self._extra_watchdog_cfg = {'early_fail_abort_count': 1,
                                     'dead_stream_max_retry_attempts': 0}
         self.state.process = sleeper()

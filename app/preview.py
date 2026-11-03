@@ -356,7 +356,7 @@ def _launch(channel_id: int, purpose: str) -> PreviewSession:
         transcode_audio = False
     # The channel's own pacing answer, then the Settings default - the same resolution a
     # recording's unbounded segment gets, so a channel that needs -re to play gets it here too.
-    pace, _source = resolve_capture_pacing(cfg, channel.pace_realtime, 0, False)
+    pace, _source = resolve_capture_pacing(cfg, channel.pace_realtime, 0)
 
     if purpose == PURPOSE_WATCH:
         watched = live_session(PURPOSE_WATCH)

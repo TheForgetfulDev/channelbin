@@ -16,7 +16,8 @@ from ..database import (
     Recording, Channel, ChannelGroup, Account, EPGEntry, RecordingEvent, RecordingSegment,
     RECORDING_CREATED_AFTER_EVENT_START, RECORDING_EDITED, RECORDING_STOP_TIME_ADJUSTED,
     RECORDING_REPLACED_OTHER, RESTART_BLOCKING_STATUSES, RECORDING_ABORTED,
-    DIAGNOSTICS, RESTART_ATTEMPTED, RESTART_FAILED, RESTART_SUCCEEDED, STALL_DETECTED,
+    DIAGNOSTICS, METADATA_SIDECAR_WRITTEN, RESTART_ATTEMPTED, RESTART_FAILED, RESTART_SUCCEEDED,
+    STALL_DETECTED,
     FAST_DELIVERY_DETECTED, RECORDING_RESUMED, GROUP_FAILOVER, SEGMENT_ENDED,
     add_recording_event, detach_recording_references,
     group_event_channel_links,
@@ -1219,6 +1220,12 @@ def _index_row(rec, now, tz, thumb_ids, live_seg_bytes=0, file_formats=None,
                   'tip': (f'{len(rec.segments)} segments · {stalls} stalls · '
                           f'{fmt_utils.counted(rec.consecutive_failures or 0, "consecutive failed restart")}. '
                           f'{kept}{missing}{reconnect_tail}{spanned}{format_tail}')}
+    elif rec.gave_up_reason:
+        # Ahead of the stall branch, which says "recovered automatically": this one did not.
+        health = {'cls': 'bad', 'icon': 'warning', 'label': f'{stalls}' if stalls else '',
+                  'text': 'gave up',
+                  'tip': (f'{recording_story.gave_up_clause(rec)} {len(rec.segments)} segments · '
+                          f'{stalls} stalls.{missing}{reconnect_tail}{spanned}{format_tail}')}
     elif stalls > 0:
         downtime = (f' {fmt_utils.fmt_duration(rec.total_downtime_seconds, with_seconds=True)} '
                     f'with nothing being written.') if rec.total_downtime_seconds else ''
@@ -1577,22 +1584,36 @@ def recording_detail(recording_id):
         return redirect(url_for('recordings.index'))
     state = get_state(recording_id)
     is_active = state is not None
-    ts_source_available = _kept_ts_on_disk(rec)
-    # What a failed recording still has to work with. The two are not the same thing and a
-    # FAILED page used to claim both at once: a successful concat consumes its segments, so
-    # "segments kept on disk" is false for exactly the recordings that do have a recoverable
-    # .ts. Stat'ed here rather than in the template, which cannot reach the filesystem.
-    segment_files_on_disk = any(
-        s.file_path and os.path.exists(s.file_path) and os.path.getsize(s.file_path) > 0
-        for s in rec.segments
-    )
-    # Which rows' files are gone, said on the Segments table once capture is over: a join
-    # deletes them, and a table still listing "segment_001.ts" under an event log saying the
-    # .ts was deleted read as the log being wrong (dev/changelog/1287). Not asked while
-    # capturing, when every file is there and the page is swapped every 15 s.
-    seg_files_gone = (set() if rec.status in WINDOW_OPEN_STATUSES else
-                      {s.id for s in rec.segments
-                       if s.file_path and not os.path.exists(s.file_path)})
+    if rec.status == REC_STATUS_COMPLETED:
+        # A finished recording's storage may be asleep and a stat wakes it, so this page reads
+        # the row and leaves the disk to the click, whose route still says when a file is gone
+        # (DESIGN-playback.md §4, dev/changelog/1406). A COMPLETED row got there through the
+        # join, which consumes its segments but for any it names as kept out, and retry_convert
+        # refuses one without gaps, so no .ts is offered as a source here; gaps_retry below is
+        # the one that can work.
+        ts_source_available = False
+        segment_files_on_disk = False
+        from ..concatenator import join_kept_out_segments
+        kept_out = join_kept_out_segments(rec.events)
+        seg_files_gone = {s.id for s in rec.segments if s.file_path and s.id not in kept_out}
+    else:
+        ts_source_available = _kept_ts_on_disk(rec)
+        # What a failed recording still has to work with. The two are not the same thing and a
+        # FAILED page used to claim both at once: a successful concat consumes its segments, so
+        # "segments kept on disk" is false for exactly the recordings that do have a recoverable
+        # .ts. Stat'ed here rather than in the template, which cannot reach the filesystem. A
+        # FAILED or ABORTED row keeps the stat: which recovery to offer turns on what survived.
+        segment_files_on_disk = any(
+            s.file_path and os.path.exists(s.file_path) and os.path.getsize(s.file_path) > 0
+            for s in rec.segments
+        )
+        # Which rows' files are gone, said on the Segments table once capture is over: a join
+        # deletes them, and a table still listing "segment_001.ts" under an event log saying the
+        # .ts was deleted read as the log being wrong (dev/changelog/1287). Not asked while
+        # capturing, when every file is there and the page is swapped every 15 s.
+        seg_files_gone = (set() if rec.status in WINDOW_OPEN_STATUSES else
+                          {s.id for s in rec.segments
+                           if s.file_path and not os.path.exists(s.file_path)})
     # The one answer to "what recovers this finished-badly recording", read by the header, the
     # mobile action bar and the status strip alike. Placeholder segments are on disk but a Retry
     # join refuses them again for the same reason, so they recover nothing (dev/changelog/990).
@@ -1615,8 +1636,8 @@ def recording_detail(recording_id):
     # the retry deletes the converted file first and the confirm has to say so.
     gaps_retry = False
     if rec.status == REC_STATUS_COMPLETED and (rec.converted_gap_seconds or 0) > 0:
-        from ..postprocessor import kept_source_path
-        gaps_retry = kept_source_path(rec.id) is not None
+        from ..postprocessor import recorded_kept_source
+        gaps_retry = recorded_kept_source(rec.id) is not None
     # Play and Download, decided from the row's columns alone - a finished file is touched
     # only when the user clicks one of them (app/playback.py, dev/changelog/1312).
     play_offer = _play_offer(rec, ts_source_available)
@@ -1868,7 +1889,10 @@ def _metadata_panel(rec, cfg):
         'sidecar_global': globally_enabled(cfg),
         'profile_name': rec.profile.name if rec.profile else None,
         'nfo_name': os.path.basename(nfo_path) if nfo_path else None,
-        'nfo_exists': bool(nfo_path and os.path.exists(nfo_path)),
+        # From the event the write logged, never a stat: the file sits beside the recording
+        # and this panel renders on every load (dev/changelog/1406).
+        'nfo_exists': bool(nfo_path and RecordingEvent.query.filter_by(
+            recording_id=rec.id, event_type=METADATA_SIDECAR_WRITTEN).first()),
         'phase': _metadata_phase(rec),
         'limits': dict(MAX_LENGTHS),
     }
@@ -3538,8 +3562,13 @@ def retry_convert(recording_id):
     # its source has: the source was kept for exactly this (dev/changelog/1200).
     gaps_source = None
     if rec.status == REC_STATUS_COMPLETED and (rec.converted_gap_seconds or 0) > 0:
-        from ..postprocessor import kept_source_path
+        from ..postprocessor import kept_source_path, recorded_kept_source
         gaps_source = kept_source_path(recording_id)
+        if gaps_source is None and recorded_kept_source(recording_id):
+            # The page offers this from the event alone, so the click is what finds out.
+            flash(f'The source kept for this recording is no longer on disk: '
+                  f'{recorded_kept_source(recording_id)}', 'error')
+            return redirect(url_for('recordings.recording_detail', recording_id=recording_id))
     if gaps_source is None and rec.status not in (
             REC_STATUS_FAILED, REC_STATUS_ANALYZING, REC_STATUS_CONVERTING, REC_STATUS_ABORTED):
         flash('Conversion retry is only available for failed, cancelled, or stalled recordings, '
@@ -3882,6 +3911,21 @@ def _diag_label(key):
     return key.replace('_', ' ').capitalize()
 
 
+# Far past any sentence the app writes and past a capture's stderr tail. Recording 32's event
+# stored 562,558 characters before read_reconnect_jumps() was bounded, and stored rows stay as
+# written (dev/changelog/1422).
+EVENT_TEXT_SHOWN = 4000
+
+
+@recordings_bp.app_template_filter('event_detail_clip')
+def event_detail_clip_filter(text):
+    """An event's stored text, cut down for the page if it is absurdly long. Pure: it runs
+    per row inside the event-log {% for %}."""
+    if not isinstance(text, str) or len(text) <= EVENT_TEXT_SHOWN:
+        return text
+    return f'{text[:EVENT_TEXT_SHOWN]} ... ({len(text) - EVENT_TEXT_SHOWN:,} more characters not shown)'
+
+
 @recordings_bp.app_template_filter('diag_view')
 def diag_view_filter(raw):
     """Render a RecordingEvent.extra_data JSON string as {'title', 'rows'}, or None.
@@ -3913,6 +3957,8 @@ def diag_view_filter(raw):
             shown = 'yes' if value else 'no'
         else:
             shown = value
+            if isinstance(value, (str, list, dict)) and len(str(value)) > EVENT_TEXT_SHOWN:
+                shown = event_detail_clip_filter(str(value))
         rows.append((_diag_label(key), shown))
     if not rows:
         return None

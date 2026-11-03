@@ -10,7 +10,8 @@ from datetime import datetime, timedelta
 from typing import NamedTuple
 
 from .database import (
-    add_recording_event, REC_STATUS_FAILED, REC_STATUS_RETRYING,
+    add_recording_event, CAPTURE_GAVE_UP, REC_STATUS_FAILED, REC_STATUS_RETRYING,
+    WINDOW_OPEN_STATUSES,
     FAILURE_MAX_CONSECUTIVE_FAILURES, FAILURE_DEAD_STREAM_DETECTED, FAILURE_FAST_DELIVERY_DETECTED,
 )
 from .db_utils import retry_on_locked
@@ -19,6 +20,7 @@ from .account_links import (is_credential_refusal, is_resolution_failure,
 from .probe import parse_ffprobe
 from .proc_utils import (DeliveryRateMonitor, GrowthMonitor, VideoArrivalMonitor,
                          read_capture_content_position, read_capture_frame_count,
+                         read_replay_seconds_since,
                          stderr_cause, terminate_or_kill, wait_for_file_data)
 
 log = logging.getLogger(__name__)
@@ -363,6 +365,7 @@ class WatchdogThread(threading.Thread):
             # meaning).
             member_fast_delivery_strikes = 0
             member_fast_delivery_channel_id = None
+            replay_explained_segments = set()
             # Restarts for video that stopped while the audio flowed (dev/changelog/1210),
             # member-keyed like the two above, and a third list rather than a share of
             # either: that feed has neither stalled nor raced ahead.
@@ -592,8 +595,21 @@ class WatchdogThread(threading.Thread):
                         observed = delivery.update(
                             read_capture_content_position(self.state.stderr_path))
                         if observed is not None and observed >= fast_delivery_ratio:
-                            fast_delivery = FastDeliveryVerdict(
-                                observed, fast_delivery_window)
+                            # A reconnect's replay moves the position with nothing new
+                            # delivered. Only what is left after it is the feed's own speed
+                            # (recording 32: 1.61x, 1.0x without its 73 s of replay,
+                            # dev/changelog/1423).
+                            replayed = read_replay_seconds_since(
+                                self.state.stderr_path, delivery.anchor_position())
+                            own = delivery.ratio_without(replayed) if replayed else observed
+                            if own is not None and own >= fast_delivery_ratio:
+                                fast_delivery = FastDeliveryVerdict(own, fast_delivery_window)
+                            elif seg_num not in replay_explained_segments:
+                                replay_explained_segments.add(seg_num)
+                                log.info('Recording %d: seg %d read %.2fx real time, %.2fx '
+                                         'without %.1fs of reconnect replay - not fast delivery',
+                                         self.recording_id, seg_num, observed, own or 0.0,
+                                         replayed)
 
                     # Is VIDEO still arriving? A feed whose video stops while its audio
                     # flows grows the file one 256 KiB block at a time, often enough that
@@ -1132,17 +1148,26 @@ class WatchdogThread(threading.Thread):
                                 # it is deliberate: the alternative measured 31.9 GB of one
                                 # repeated lap reported as a success (dev/changelog/964). The
                                 # dead-stream retry cadence is NOT reused - it exists for a
-                                # stream that is not there, and this one is.
+                                # stream that is not there, and this one is. What came before
+                                # the replay is real, so the capture is still joined; the
+                                # join's fast-delivery findings name the flagged segments.
+                                if self._end_capture_gave_up(
+                                        FAILURE_FAST_DELIVERY_DETECTED,
+                                        f'The feed delivered video at '
+                                        f'{fast_delivery.ratio:.2f}x real time for '
+                                        f'{fast_delivery.window_seconds:.0f}s straight on '
+                                        f'{member_fast_delivery_strikes} attempt(s), and there '
+                                        f'is no other channel in this group to record from '
+                                        f'instead',
+                                        cause=stderr_cause(stderr_tail)):
+                                    return
                                 self._give_up(lambda: self._fail_recording_fast_delivery(
                                     rec, member_fast_delivery_strikes, fast_delivery.ratio,
                                     fast_delivery.window_seconds,
                                     cause=stderr_cause(stderr_tail)))
                                 return
                             # Strikes left: fall through to the ordinary restart below and
-                            # try this member again on a fresh connection - paced, when the
-                            # segment's own reconnects are the likely cause of the replay.
-                            self._auto_pace_after_fast_delivery(seg_num, seg_channel_id,
-                                                                reconnects)
+                            # try this member again on a fresh connection.
 
                         # Dead-stream fast-fail: independent trip-wire, checked before the
                         # normal max_consecutive_failures path since it's meant to catch
@@ -1205,6 +1230,14 @@ class WatchdogThread(threading.Thread):
                                     window_note=(f', and the window ends in {minutes_left} '
                                                  f'min, before another retry could come')))
                                 return
+                            tried = (f'after {rec.dead_stream_retry_count} retry attempt(s)'
+                                     if rec.dead_stream_retry_count else 'with no retry left')
+                            if self._end_capture_gave_up(
+                                    FAILURE_DEAD_STREAM_DETECTED,
+                                    f'{streak} consecutive early failures within '
+                                    f'{early_fail_abort_window}s - stream appears dead, {tried}',
+                                    cause=cause):
+                                return
                             self._give_up(lambda: self._fail_recording_dead_stream(
                                 rec, streak, early_fail_abort_window, cause=cause))
                             return
@@ -1220,6 +1253,11 @@ class WatchdogThread(threading.Thread):
                             # Same reasoning as the dead-stream give-up above: pass the
                             # already-collected cause through rather than rely on _give_up's
                             # redundant (and by now empty) re-collection.
+                            if self._end_capture_gave_up(
+                                    FAILURE_MAX_CONSECUTIVE_FAILURES,
+                                    f'{max_failures} consecutive restarts got no data',
+                                    cause=stderr_cause(stderr_tail)):
+                                return
                             self._give_up(lambda: self._fail_recording(
                                 rec, max_failures, cause=stderr_cause(stderr_tail)))
                             return
@@ -1464,6 +1502,11 @@ class WatchdogThread(threading.Thread):
                                 from .recorder import _close_active_segment
                                 tail = _close_active_segment(self.app, self.recording_id,
                                                              exit_reason='ERROR')
+                                if self._end_capture_gave_up(
+                                        FAILURE_MAX_CONSECUTIVE_FAILURES,
+                                        f'{max_failures} consecutive restarts got no data',
+                                        cause=stderr_cause(tail)):
+                                    return
                                 self._give_up(lambda: self._fail_recording(
                                     rec2, max_failures, cause=stderr_cause(tail)))
                                 return
@@ -2054,6 +2097,76 @@ class WatchdogThread(threading.Thread):
                        join_reason=f'{why}. Ending the capture now and joining what was '
                                    f'captured')
 
+    def _end_capture_gave_up(self, gave_up_reason: str, why: str, cause=None) -> bool:
+        """Give up on a capture that holds data: end it now and join what it holds, as
+        principle 2 asks, and say so on the row, on the timeline and in an alert, as principle
+        1 asks. False when it holds nothing, which leaves the caller's FAILED path to run.
+
+        The row ends COMPLETED if the join works, so everything FAILED used to say has its own
+        home: gave_up_reason is what the Recordings list, the recording page and an auto-record
+        rule read, and the concat boundary's observation scores it 'failed'
+        (health_score.apply_capture_phase_health_observation). stop_recording() does the rest
+        of what _give_up does: clearing the retry alert, and the join takes the final thumbnail.
+
+        The stop time moves back to now, as a manual Stop's does, and scheduled_stop_time keeps
+        what was asked for. Left where it was, every program in the rest of the window reads
+        as recorded on the guide and in search, with no Record to offer (dev/changelog/1404).
+        """
+        from . import db
+        from . import events as ev
+        from .alerts import create_alert
+        from .concatenator import joinable_segments
+        from .database import Recording, RecordingSegment
+        from .recorder import _capture_produced_data, stop_recording
+        if not _capture_produced_data(self.recording_id):
+            return False
+        reason = f'{why} - {cause}' if cause else why
+
+        # The window is already over, so nothing ended early: only a stop job that has not
+        # fired yet stands between this and the ordinary end.
+        if db.session.get(Recording, self.recording_id).stop_time <= datetime.utcnow():
+            self._end_capture_no_retry_left(reason)
+            return True
+
+        # The stop event is how a Stop, a Pause, an abort or a shutdown says it already owns
+        # this capture, and they pop the live state before their own status write, so an open
+        # status alone cannot tell. _handle_launch_failure's FAILED is what the status catches.
+        @retry_on_locked()
+        def _record_give_up_and_commit():
+            r = db.session.get(Recording, self.recording_id)
+            if self.state.stop_event.is_set() or r.status not in WINDOW_OPEN_STATUSES:
+                return None
+            r.gave_up_reason = gave_up_reason
+            r.stop_time = datetime.utcnow()
+            add_recording_event(self.recording_id, CAPTURE_GAVE_UP, detail=reason)
+            db.session.commit()
+            return r
+
+        rec = _record_give_up_and_commit()
+        if rec is None:
+            log.warning('Recording %d already ended - not giving up on it again (%s)',
+                        self.recording_id, gave_up_reason)
+            return True
+        ev.publish(self.recording_id, CAPTURE_GAVE_UP, {'gave_up_reason': gave_up_reason})
+
+        # Nothing joinable means every segment was a placeholder or went missing, and the join
+        # raises its own alert for that: one failure, one alert (dev/changelog/930).
+        segments = RecordingSegment.query.filter_by(recording_id=self.recording_id).all()
+        will_join = bool(joinable_segments(segments))
+        log.error('Recording "%s" (#%d): %s - ending the capture and joining what was captured',
+                  rec.name, self.recording_id, reason,
+                  extra={'recording_id': self.recording_id, 'already_alerted': True})
+        # The join first: telling the user about the give-up must never cost them the file.
+        stop_recording(self.app, self.recording_id, reason='CAPTURE_GAVE_UP',
+                       join_reason=f'{reason}. Ending the capture now and joining what was '
+                                   f'captured')
+        if will_join:
+            create_alert('RECORDING_GAVE_UP', f'Recording ended early: {rec.name}',
+                         body=(f'{reason}. ChannelBin ended the capture before its stop time '
+                               f'and is joining what it captured.'),
+                         source='watchdog', recording_id=self.recording_id)
+        return True
+
     def _fail_recording_dead_stream(self, rec, streak, window_seconds, cause=None,
                                     window_note=''):
         from .database import RECORDING_FAILED_DEAD_STREAM
@@ -2084,64 +2197,6 @@ class WatchdogThread(threading.Thread):
         if rec.channel_id and rec.channel:
             connlim.release(rec.channel.account_id, 'recording', self.recording_id)
         return marked
-
-    def _auto_pace_after_fast_delivery(self, seg_num, channel_id, reconnects) -> bool:
-        """Turn on real-time pacing for this channel for the rest of the recording, when a
-        segment stopped for fast delivery had also reconnected in-process. True if it did.
-
-        Why the reconnects are the condition: some providers answer every new connection by
-        re-sending their whole back-buffer. An unpaced read drains that burst, waits at the
-        live edge, ffmpeg's read timeout fires, and the reconnect is answered with the same
-        buffer again - measured on a real capture as 65% of the file being byte-identical
-        repeats while the channel itself advanced at 1x (dev/changelog/997). A paced read
-        stays behind the live edge the way a player does, so the timeout never fires. Without
-        reconnects the replay is not ours, and pacing would only hide it from the detector.
-
-        Changes only how the next segment is launched. The detection, its strike and its
-        score hit are untouched, and Channel.pace_realtime is never written: an explicit
-        False there is the user's answer and suppresses this.
-        """
-        from . import db
-        from . import events as ev
-        from .database import Channel, CAPTURE_PACING_ENABLED
-        reconnect_count, reconnects_complete = reconnects
-        if (channel_id is None or not reconnect_count or self.state.current_segment_paced
-                or channel_id in self.state.auto_paced_channel_ids):
-            return False
-        channel = db.session.get(Channel, channel_id)
-        if channel is not None and channel.pace_realtime is False:
-            log.warning('Recording %d: seg %d reconnected %d time(s) before its fast-delivery '
-                        'stop, but channel %d is set to never read at real-time speed - '
-                        'restarting it unpaced', self.recording_id, seg_num, reconnect_count,
-                        channel_id)
-            return False
-        self.state.auto_paced_channel_ids.add(channel_id)
-        howmany = reconnect_count if reconnects_complete else f'at least {reconnect_count}'
-        times = 'time' if reconnect_count == 1 and reconnects_complete else 'times'
-        detail = (f'Reading this channel at real-time speed for the rest of the recording: '
-                  f'segment {seg_num} was stopped for fast delivery, and ffmpeg had reconnected '
-                  f'{howmany} {times} inside it. Some providers answer a reconnect by sending '
-                  f'their buffered video again, so a read that races to the live edge and '
-                  f'times out can replay the same stretch; a paced read stays behind the live '
-                  f'edge instead. Change it for good under the channel\'s Settings.')
-
-        @retry_on_locked()
-        def _record_pacing_and_commit():
-            add_recording_event(self.recording_id, CAPTURE_PACING_ENABLED, detail=detail,
-                                segment_number=seg_num,
-                                extra={'reconnects': reconnect_count,
-                                       'reconnects_complete': reconnects_complete})
-            db.session.commit()
-
-        _record_pacing_and_commit()
-        log.warning('Recording %d: seg %d was stopped for fast delivery after %s in-process '
-                    'reconnect(s) - reading channel %d at real-time speed from the next '
-                    'segment', self.recording_id, seg_num, howmany, channel_id)
-        ev.publish(self.recording_id, CAPTURE_PACING_ENABLED, {
-            'segment_number': seg_num, 'channel_id': channel_id,
-            'reconnects': reconnect_count,
-        })
-        return True
 
     def _fail_recording_fast_delivery(self, rec, strikes, ratio, window_seconds, cause=None):
         """Give up after a feed kept delivering faster than real time on every attempt and

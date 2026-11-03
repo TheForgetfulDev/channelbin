@@ -18,6 +18,7 @@ temp dir (tests/support/netguard.py would refuse otherwise).
 import os
 import subprocess
 import sys
+import tempfile
 import time
 import unittest
 from datetime import datetime, timedelta
@@ -34,6 +35,7 @@ from app.database import (  # noqa: E402
 )
 from app.proc_utils import (  # noqa: E402
     DeliveryRateMonitor, delivery_ratio, read_capture_content_position,
+    read_replay_seconds_since,
 )
 from app.recorder import RecordingState  # noqa: E402
 from app.watchdog import WatchdogThread  # noqa: E402
@@ -240,16 +242,68 @@ _FAKE_CAPTURE = (
     'for _ in range(int(sys.argv[2]) if len(sys.argv) > 2 else 0):\n'
     '    sys.stderr.write("[http @ 0x1] Will reconnect at 22474200 in 0 second(s), '
     'error=Connection timed out.\\n")\n'
+    'replay = len(sys.argv) > 3\n'
     'step = 0.1\n'
     'content = 0.0\n'
+    'tick = 0\n'
     'while True:\n'
     '    content += step * rate\n'
+    '    tick += 1\n'
     '    h, rem = divmod(content, 3600)\n'
     '    m, s = divmod(rem, 60)\n'
     '    sys.stderr.write("frame=1 time=%02d:%02d:%05.2f speed=%.2fx    \\r" % (h, m, s, rate))\n'
+    '    if replay and tick % 5 == 0:\n'
+    '        sys.stderr.write("[http @ 0x1] Will reconnect at 1 in 0 second(s), '
+    'error=Input/output error.\\n[vist#0:0/h264 @ 0x2] timestamp discontinuity (stream id=256): '
+    '%d, new offset= 1\\n" % -int(5 * step * (rate - 1) * 1000000))\n'
     '    sys.stderr.flush()\n'
     '    time.sleep(step)\n'
 )
+
+# Recording 32's segment 1 as ffmpeg wrote it: position, then a reconnect, then its closure.
+_REPLAY_SPOOL = (
+    b'frame=1 time=00:01:00.00 speed=1.6x\r'
+    b'[http @ 0x1] Will reconnect at 58732392 in 0 second(s), error=Input/output error.\n'
+    b'[vist#0:0/h264 @ 0x2] timestamp discontinuity (stream id=256): -23290000, new offset= 1\n'
+    b'frame=1 time=00:03:43.16 speed=1.6x\r'
+    b'[http @ 0x1] Will reconnect at 58732392 in 0 second(s), error=Input/output error.\n'
+    b'[vist#0:0/h264 @ 0x2] timestamp discontinuity (stream id=256): -25074678, new offset= 2\n'
+    b'[aist#0:1/aac @ 0x3] timestamp discontinuity (stream id=257): -25000000, new offset= 3\n'
+    b'[aist#0:1/aac @ 0x3] timestamp discontinuity (stream id=257): -24000000, new offset= 4\n'
+    b'frame=1 time=00:03:50.00 speed=1.6x\r')
+
+
+class ReplaySecondsTests(unittest.TestCase):
+    """What the delivery window leaves out (dev/docs/BUGS.md 2026-11-03)."""
+
+    def _spool(self, raw):
+        fd, path = tempfile.mkstemp()
+        with os.fdopen(fd, 'wb') as fh:
+            fh.write(raw)
+        self.addCleanup(os.unlink, path)
+        return path
+
+    def test_a_replay_and_its_hole_count_and_only_inside_the_window(self):
+        path = self._spool(_REPLAY_SPOOL)
+        self.assertAlmostEqual(read_replay_seconds_since(path, 30.0), 23.29 + 25.075 + 25.0, 3)
+        self.assertAlmostEqual(read_replay_seconds_since(path, 200.0), 25.075 + 25.0, 3)
+
+    def test_a_closure_with_no_reconnect_is_not_a_replay(self):
+        """A provider's clock going back is not this app's reconnect, and a feed looping that
+        way is what the detector is for."""
+        path = self._spool(b'frame=1 time=00:01:00.00\r[vist#0:0/h264 @ 0x2] timestamp '
+                           b'discontinuity (stream id=256): -23290000, new offset= 1\n')
+        self.assertEqual(read_replay_seconds_since(path, 0.0), 0.0)
+
+    def test_an_unreadable_spool_explains_nothing(self):
+        self.assertEqual(read_replay_seconds_since('/nonexistent/spool', 0.0), 0.0)
+
+    def test_recording_32s_window_reads_as_real_time_without_its_replay(self):
+        m = DeliveryRateMonitor(120)
+        m.update(0.0, now=1000.0)
+        self.assertAlmostEqual(m.update(193.2, now=1120.0), 1.61, 2)
+        self.assertEqual(m.anchor_position(), 0.0)
+        self.assertAlmostEqual(m.ratio_without(73.2), 1.0, 2)
 
 
 class WatchdogFastDeliveryTests(unittest.TestCase):
@@ -263,6 +317,7 @@ class WatchdogFastDeliveryTests(unittest.TestCase):
         self.launched = []
         self.failovers = []
         self.failover_result = False
+        self.captured = mock.Mock(return_value=True)
         self.state = RecordingState(current_segment_num=0)
         now = datetime.utcnow()
         self.account = seed.make_account()
@@ -294,10 +349,11 @@ class WatchdogFastDeliveryTests(unittest.TestCase):
             recorder._active.pop(self.rid, None)
         self.t.cleanup()
 
-    def _start_fake_capture(self, rate, reconnects=0):
+    def _start_fake_capture(self, rate, reconnects=0, replays=False):
         path, fh = recorder._open_segment_stderr_spool(self.t.app, self.rid, 0)
         self.state.stderr_path, self.state.stderr_fh = path, fh
-        proc = subprocess.Popen([sys.executable, '-c', _FAKE_CAPTURE, str(rate), str(reconnects)],
+        args = [str(rate), str(reconnects)] + (['replays'] if replays else [])
+        proc = subprocess.Popen([sys.executable, '-c', _FAKE_CAPTURE, *args],
                                 stdout=subprocess.DEVNULL,
                                 stderr=(fh or subprocess.DEVNULL))
         self.state.process = proc
@@ -320,7 +376,7 @@ class WatchdogFastDeliveryTests(unittest.TestCase):
         }})
 
     def _run(self, rate=5.0, ratio=1.5, window=1.0, strikes=3, early_fail=99, timeout=30,
-             reconnects=0, on_deadline=None):
+             reconnects=0, on_deadline=None, replays=False):
         def _stub_launch(app, recording_id, seg_num):
             self.launched.append(seg_num)
 
@@ -328,7 +384,7 @@ class WatchdogFastDeliveryTests(unittest.TestCase):
             self.failovers.append((reason, demote, score_departure))
             return self.failover_result
 
-        self._start_fake_capture(rate, reconnects)
+        self._start_fake_capture(rate, reconnects, replays)
         # The replacement segment is never really launched here, so the reconnect wait is
         # answered rather than left to time out against a row that will never exist. Without
         # it the stub turns every retry into a failed restart, which is the harness's
@@ -337,7 +393,9 @@ class WatchdogFastDeliveryTests(unittest.TestCase):
                                return_value=self._cfg(ratio, window, strikes, early_fail)), \
              mock.patch('app.watchdog.wait_for_file_data', return_value=True), \
              mock.patch.object(recorder, '_launch_segment', _stub_launch), \
-             mock.patch.object(recorder, 'failover_group_member', _stub_failover):
+             mock.patch.object(recorder, 'failover_group_member', _stub_failover), \
+             mock.patch.object(recorder, '_capture_produced_data', self.captured), \
+             mock.patch('app.concatenator.do_concatenation'):
             self.wd = WatchdogThread(self.rid, self.state, self.t.app)
             self.wd.start()
             deadline = time.monotonic() + timeout
@@ -349,7 +407,8 @@ class WatchdogFastDeliveryTests(unittest.TestCase):
                 # Closing the segment is only the first half. Waiting for the branch that
                 # follows it to reach a decision as well is what keeps stop_event from
                 # landing mid-restart and being read as "the recording was stopped".
-                resolved = bool(self.launched or self.failovers) or rec.status == 'FAILED'
+                resolved = (bool(self.launched or self.failovers) or rec.status == 'FAILED'
+                            or rec.gave_up_reason is not None)
                 if seg.ended_at is not None and resolved:
                     break
                 time.sleep(0.1)
@@ -392,7 +451,6 @@ class WatchdogFastDeliveryTests(unittest.TestCase):
                 'status': rec.status,
                 'pacing_events': RecordingEvent.query.filter_by(
                     recording_id=self.rid, event_type=CAPTURE_PACING_ENABLED).count(),
-                'auto_paced': set(self.state.auto_paced_channel_ids),
             }
         return WatchdogFastDeliveryTests._default_run
 
@@ -503,11 +561,21 @@ class WatchdogFastDeliveryTests(unittest.TestCase):
         # add a second one for the same departure.
         self.assertFalse(score_departure)
 
-    def test_nowhere_to_go_stops_the_recording_and_names_why(self):
-        """The one place this app stops a capture that is still receiving data. Its own
-        failure_reason: nothing failed in the sense that word carries elsewhere - the
-        connection held, the bytes flowed, every restart succeeded."""
+    def test_nowhere_to_go_stops_the_recording_and_joins_what_it_holds(self):
+        """The one place this app stops a capture that is still receiving data, and what came
+        before the replay is real, so it is joined (dev/changelog/1404). The reason is its own:
+        nothing failed in the sense that word carries elsewhere - the connection held, the
+        bytes flowed, every restart succeeded."""
         self.failover_result = False
+        self._run(rate=5.0, strikes=1)
+        db.session.expire_all()
+        rec = db.session.get(Recording, self.rid)
+        self.assertEqual(rec.gave_up_reason, 'FAST_DELIVERY_DETECTED')
+        self.assertIsNone(rec.failure_reason)
+
+    def test_nowhere_to_go_with_nothing_captured_fails_and_names_why(self):
+        self.failover_result = False
+        self.captured = mock.Mock(return_value=False)
         self._run(rate=5.0, strikes=1)
         db.session.expire_all()
         rec = db.session.get(Recording, self.rid)
@@ -538,62 +606,34 @@ class WatchdogFastDeliveryTests(unittest.TestCase):
             recording_id=self.rid, event_type='RECORDING_FAILED_DEAD_STREAM').count(), 0)
 
 
-    # ── Automatic real-time pacing (dev/changelog/997) ───────────────────────────────
-    # A fast-delivery stop on a segment that reconnected in-process turns on -re for that
-    # member for the rest of the recording. The detection itself is untouched; only the
-    # relaunch changes. Guards dev/docs/BUGS.md 2026-09-16 @ 12:44:22 PM "An unpaced capture replays a
-    # provider's back-buffer on every read-timeout reconnect".
+    # ── A reconnect's replay is not fast delivery (dev/docs/BUGS.md 2026-11-03) ───────────
 
-    def _pacing_events(self):
-        return RecordingEvent.query.filter_by(
-            recording_id=self.rid, event_type=CAPTURE_PACING_ENABLED).all()
+    def test_a_feed_fast_only_by_its_replays_is_left_alone(self):
+        """Recording 32: 1.61x, all of it replay, and the capture it stopped had lost nothing."""
+        seg, samples = self._run_left_alone(rate=5.0, replays=True, timeout=6)
+        self.assertIsNone(seg.ended_at)
+        self.assertEqual(RecordingEvent.query.filter_by(
+            recording_id=self.rid, event_type=FAST_DELIVERY_DETECTED).count(), 0)
+        self.assertEqual(ChannelEvent.query.filter_by(
+            channel_id=self.ch.id,
+            event_type=CHANNEL_FAST_DELIVERY_HEALTH_OBSERVATION).count(), 0)
+        seen = [p for p in samples if p is not None]
+        self.assertGreater(seen[-1] / 6, 1.5, 'the stand-in never read as fast')
 
-    def test_reconnects_before_a_fast_delivery_stop_turn_on_pacing(self):
+    def test_reconnects_without_replay_are_still_fast_delivery(self):
+        """A reconnect with no closure behind it explains nothing about the speed."""
         self._run(rate=5.0, reconnects=3)
-        events = self._pacing_events()
-        self.assertEqual(len(events), 1)
-        self.assertEqual(events[0].segment_number, 0)
-        self.assertIn('reconnected 3 times', events[0].detail)
-        self.assertIn(self.ch.id, self.state.auto_paced_channel_ids)
-        # The detection and its ordinary restart still happened exactly as before.
         self.assertEqual(RecordingEvent.query.filter_by(
             recording_id=self.rid, event_type=FAST_DELIVERY_DETECTED).count(), 1)
         self.assertEqual(self.launched, [1])
 
-    def test_automatic_pacing_never_writes_the_channel_setting(self):
-        """Channel.pace_realtime is the user's answer - the participation-switch rule."""
-        self._run(rate=5.0, reconnects=2)
+    def test_a_fast_delivery_stop_never_turns_on_pacing(self):
+        """On a feed that keeps dropping -re loses video at every reconnect."""
+        self._run(rate=5.0, reconnects=3)
+        self.assertEqual(RecordingEvent.query.filter_by(
+            recording_id=self.rid, event_type=CAPTURE_PACING_ENABLED).count(), 0)
         db.session.expire_all()
         self.assertIsNone(db.session.get(Channel, self.ch.id).pace_realtime)
-
-    def test_no_reconnects_means_no_pacing(self):
-        """Without an in-process reconnect the replay is not ours to cause, and pacing
-        would only hide it from the detector."""
-        run = self._default_detection()
-        self.assertEqual(run['pacing_events'], 0)
-        self.assertEqual(run['auto_paced'], set())
-
-    def test_an_explicit_off_on_the_channel_suppresses_it(self):
-        ch = db.session.get(Channel, self.ch.id)
-        ch.pace_realtime = False
-        db.session.commit()
-        self._run(rate=5.0, reconnects=3)
-        self.assertEqual(self._pacing_events(), [])
-        self.assertEqual(self.state.auto_paced_channel_ids, set())
-
-    def test_an_already_paced_segment_is_not_escalated_again(self):
-        self.state.current_segment_paced = True
-        self._run(rate=5.0, reconnects=3)
-        self.assertEqual(self._pacing_events(), [])
-
-    def test_the_last_strike_still_gives_up_rather_than_pacing(self):
-        """The strike ladder is unchanged: out of strikes with nowhere to go, the recording
-        stops as it always did."""
-        self.failover_result = False
-        self._run(rate=5.0, strikes=1, reconnects=3)
-        db.session.expire_all()
-        self.assertEqual(db.session.get(Recording, self.rid).status, 'FAILED')
-        self.assertEqual(self._pacing_events(), [])
 
 
 if __name__ == '__main__':

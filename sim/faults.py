@@ -1096,6 +1096,14 @@ _KINDS = (
           'and 1.7% of dev\'s; observed in prod',
           'after `after_bytes`, the server closes the connection as if the stream had ended',
           {'after_bytes': (1_048_576, _count(0))}, forms=(FORM_TS,)),
+    _kind('keeps_dropping', SCOPE_CONNECTION, LAYER_STREAM, (EP_STREAM,), MEASURED,
+          'BUGS.md 2026-11-03, dev/changelog/1422: recording 32 on a real channel, 40 reconnects '
+          'in 5 hours and 3 in its first 146 s, each answered with 23.3 to 25.1 s of buffer. That '
+          'read as 1.61x delivery, the capture was stopped and read at real time, and the '
+          'recording played with its sound 1:52 ahead of its picture and scored 99',
+          'every connection opened while the fault holds is closed after `after_bytes`, buffer '
+          'included, so the feed keeps dropping and each reconnect gets the buffer again',
+          {'after_bytes': (15_000_000, _count(0))}, forms=(FORM_TS,)),
     _kind('slow_first_byte', SCOPE_CONNECTION, LAYER_OPEN, (EP_STREAM,), MEASURED,
           'dev/changelog/958: time to first byte 0.25 to 1.26 s on four accounts',
           'the answer waits `seconds` before its first byte',
@@ -1139,6 +1147,13 @@ _KINDS = (
           'a connection opened while the fault holds gets `profile`, stereo to 5.1 or back',
           {'profile': ('h264_1080p5994_ac3_51', _ts_profile)},
           forms=(FORM_TS, FORM_HLS_PLAYLIST)),
+    _kind('no_video_track', SCOPE_CHANNEL, LAYER_OPEN, (EP_STREAM,), ASSUMED,
+          'dev/changelog/1210 (a segment with no video track measured through the join), 1410; '
+          'never yet seen on a real feed, and the shape a failover to an audio-only member or '
+          'a provider swapping its stream would take',
+          'a connection opened while the fault holds gets a stream whose PMT declares no video '
+          'and which carries none, where `video_stops` leaves a declared track empty',
+          forms=(FORM_TS,)),
     _kind('picture', SCOPE_CHANNEL, LAYER_OPEN, (EP_STREAM,), OBSERVED,
           'black and solid pictures in 1.2% of prod\'s health checks and 3.2% of dev\'s '
           '(BUGS.md 2026-06-27 06:15 PM, app/channel_tester.py _check_screenshot_uniform); '

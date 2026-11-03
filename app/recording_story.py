@@ -19,8 +19,9 @@ import re
 
 from . import fmt_utils
 from .database import (
-    GROUP_FAILOVER, REC_STATUS_COMPLETED, RECORDING_LOGIN_REFUSED, RECORDING_RETRY_SCHEDULED,
-    RECORDING_STOPPED_EARLY,
+    FAILURE_DEAD_STREAM_DETECTED, FAILURE_FAST_DELIVERY_DETECTED, FAILURE_MAX_CONSECUTIVE_FAILURES,
+    GROUP_FAILOVER, REC_STATUS_COMPLETED, REC_STATUS_FAILED, RECORDING_LOGIN_REFUSED,
+    RECORDING_RETRY_SCHEDULED, RECORDING_STOPPED_EARLY,
 )
 from .proc_utils import stderr_cause
 
@@ -126,6 +127,33 @@ def trouble_clauses(rec):
     return [text for text, _ in _trouble_clauses(rec)]
 
 
+def gave_up_clause(rec):
+    """Why ChannelBin ended this capture before its stop time, or '' when it did not. The one
+    wording, on the Recordings list, the recording page and the guide's recorded mark."""
+    reason = rec.gave_up_reason
+    if not reason:
+        return ''
+    if reason == FAILURE_DEAD_STREAM_DETECTED:
+        retries = rec.dead_stream_retry_count or 0
+        why = ('The stream kept failing right after each reconnect, and '
+               + (f'{fmt_utils.counted(retries, "retry", "retries")} did not bring it back' if retries
+                  else 'there was no retry left to try'))
+    elif reason == FAILURE_MAX_CONSECUTIVE_FAILURES:
+        why = (f'{fmt_utils.counted(rec.consecutive_failures_peak or 0, "restart")} in a row got '
+               f'no data')
+    elif reason == FAILURE_FAST_DELIVERY_DETECTED:
+        why = ('The feed kept delivering video faster than real time, which means it was not '
+               'showing live content, and there was no other channel to record from')
+    else:
+        raise ValueError(f'unknown gave_up_reason {reason!r}')
+    # A FAILED row is one whose join then failed or found only placeholder clips, so nothing
+    # was kept into a file, and its own strip says what is left.
+    if rec.status == REC_STATUS_FAILED:
+        return f'{why}, so ChannelBin stopped trying before the stop time.'
+    return (f'{why}, so ChannelBin stopped trying before the stop time and kept what it had '
+            f'captured.')
+
+
 def stopped_early_note(rec):
     """'You stopped it after 2m 35s of 8m scheduled.' when the user's own Stop is the whole
     reason a COMPLETED recording is short of its schedule, else None.
@@ -154,7 +182,7 @@ def partial_note(rec):
     partial file from a whole one should too."""
     if rec.status != REC_STATUS_COMPLETED or stopped_early_note(rec):
         return None
-    parts = []
+    parts = [gave_up_clause(rec)] if rec.gave_up_reason else []
     short = short_capture(rec)
     if short:
         parts.append(f'{fmt_utils.fmt_duration(short[0])} captured of '
@@ -332,6 +360,10 @@ def what_happened(rec, restart_attempts=0, stderr_tails=None, open_segment_bytes
     for text, lost in _trouble_clauses(rec):
         lines.append(text)
         trouble = trouble or lost
+
+    if rec.gave_up_reason:
+        trouble = True
+        lines.append(gave_up_clause(rec))
 
     # The early stop pulls stop_time back to the moment of the stop, and scheduled_stop_time
     # keeps what was asked for, so the difference is how early.

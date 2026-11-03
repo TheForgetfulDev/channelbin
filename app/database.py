@@ -32,6 +32,10 @@ RECORDING_FAILED_DEAD_STREAM        = 'RECORDING_FAILED_DEAD_STREAM'
 # immediate RECORDING_FAILED_DEAD_STREAM. See app/watchdog.py's dead-stream give-up branch and
 # Product Principle 2 ("complete the recording at almost all costs").
 RECORDING_RETRY_SCHEDULED           = 'RECORDING_RETRY_SCHEDULED'
+# The capture ran out of things to try before its stop time, holding data, so it ended there and
+# what it holds is joined (Recording.gave_up_reason, dev/changelog/1404). A capture that holds
+# nothing is still RECORDING_FAILED / RECORDING_FAILED_DEAD_STREAM.
+CAPTURE_GAVE_UP                     = 'CAPTURE_GAVE_UP'
 RECORDING_RESUMED                   = 'RECORDING_RESUMED'
 # resume_recording() found an "open" (ended_at=None) segment whose file was still growing
 # on disk - a live process almost certainly already owns this recording. Refused to close
@@ -195,6 +199,7 @@ FAST_DELIVERY_DETECTED = 'FAST_DELIVERY_DETECTED'
 # over; pacing keeps the read behind the live edge the way a player does (dev/changelog/997).
 # Its own type because the app acted - and it never writes Channel.pace_realtime, which is
 # the user's answer and not the engine's.
+# Written until dev/changelog/1423 and still on older recordings' event logs.
 CAPTURE_PACING_ENABLED = 'CAPTURE_PACING_ENABLED'
 # ffmpeg's video frame count stopped moving while the segment file kept growing - the feed's
 # video stopped and something else, most likely its audio, is still being recorded. A
@@ -455,6 +460,7 @@ EVENT_LABELS = {
     RECORDING_FAILED: 'Recording failed',
     RECORDING_FAILED_DEAD_STREAM: 'Failed: the stream sent nothing',
     RECORDING_RETRY_SCHEDULED: 'Will try the stream again',
+    CAPTURE_GAVE_UP: 'Stopped trying the stream, keeping what was captured',
     RECORDING_RESUMED: 'Picked back up',
     RECORDING_RESUME_REFUSED: 'Not picked back up: a capture is already running',
     CAPTURE_LOST_TO_OUTAGE: 'Capture lost while ChannelBin was down',
@@ -700,6 +706,17 @@ FAILURE_CONCAT_ERROR             = 'CONCAT_ERROR'
 FAILURE_SOURCE_MISSING           = 'SOURCE_MISSING'
 FAILURE_CONVERSION_FAILED        = 'CONVERSION_FAILED'
 
+# How far apart a recording's video and audio may end before it is called out of step. Twelve
+# recordings on prod's disk: eleven at 0.03 to 0.24 s, and recording 32 at 112 s, sound ahead of
+# picture from 8 minutes in (dev/changelog/1422, 1424).
+TRACK_END_GAP_OUT_OF_STEP_SECONDS = 2.0
+
+# Recording.gave_up_reason vocabulary: the three give-ups above, on a capture that held data
+# when it happened. A different column from failure_reason because the row is not FAILED: its
+# capture ended before the stop time and what it holds is joined (dev/changelog/1404).
+GAVE_UP_REASONS = (FAILURE_MAX_CONSECUTIVE_FAILURES, FAILURE_DEAD_STREAM_DETECTED,
+                   FAILURE_FAST_DELIVERY_DETECTED)
+
 FAILURE_REASONS = (
     FAILURE_MAX_CONSECUTIVE_FAILURES, FAILURE_DEAD_STREAM_DETECTED,
     FAILURE_FAST_DELIVERY_DETECTED, FAILURE_LAUNCH_FAILED,
@@ -912,6 +929,12 @@ class Recording(db.Model):
     # One of FAILURE_REASONS - set by every writer of REC_STATUS_FAILED, cleared when a Retry
     # takes the row out of FAILED (dev/changelog/990)
     failure_reason           = db.Column(db.String(64))
+    # One of GAVE_UP_REASONS when the watchdog ended this capture before its stop time with
+    # nothing left to try and joined what it held; NULL otherwise. Never cleared: a Retry join
+    # does not change how the capture ended. Scores the capture 'failed' and keeps a later
+    # airing from reading as a repeat (health_score.apply_capture_phase_health_observation,
+    # rule_status below).
+    gave_up_reason           = db.Column(db.String(64))
     # One of CANCEL_REASONS - set by every writer of REC_STATUS_ABORTED, cleared when a Retry
     # takes the row out of ABORTED (dev/changelog/1054)
     cancel_reason            = db.Column(db.String(64))
@@ -1038,6 +1061,10 @@ class Recording(db.Model):
     # the source was kept, and the Recordings list badges the row. A column because that
     # badge displays it per row.
     converted_gap_seconds    = db.Column(db.Float)
+    # The worst distance between where the video and the audio end, across the segments and
+    # the final file (app/track_ends.py). NULL = not measured. Keeps the worst seen: a clean
+    # reading of a later stage does not undo a segment that was out of step.
+    track_end_gap_seconds    = db.Column(db.Float)
 
     # ── Near-empty/slate segment detection (app/postprocessor.py::_detect_near_empty_segments) ──
     # A segment can be timeline-clean (frames present, evenly spaced) and still be a
@@ -1226,6 +1253,12 @@ class Recording(db.Model):
         order_by='RecordingSegment.segment_number',
         cascade='all, delete-orphan',
     )
+
+    @property
+    def picture_sound_apart_seconds(self):
+        """The measured distance when it is past what a healthy recording shows, else None."""
+        gap = self.track_end_gap_seconds
+        return gap if gap is not None and gap >= TRACK_END_GAP_OUT_OF_STEP_SECONDS else None
 
     @property
     def duration_seconds(self):
@@ -1439,6 +1472,16 @@ class RecordingEvent(db.Model):
     extra_data     = db.Column(db.Text)   # JSON blob
 
 
+def rule_status(status, gave_up_reason):
+    """The status an auto-record rule reads a recording by. A capture that gave up is a failed
+    pick whatever its join became: the file is kept, but a later airing is not a repeat of a
+    program it holds only part of, and the rule's limit still counts it. A person's cancel
+    keeps its own answer."""
+    if gave_up_reason and status != REC_STATUS_ABORTED:
+        return REC_STATUS_FAILED
+    return status
+
+
 def add_recording_event(recording_id, event_type, detail=None, segment_number=None, extra=None):
     """Insert a RecordingEvent into the session without committing - caller owns the commit.
 
@@ -1513,7 +1556,8 @@ def detach_recording_references(recording_id: int):
     rec = db.session.get(Recording, recording_id)
     RuleMatch.query.filter_by(recording_id=recording_id).update(
         {'recording_id': None,
-         'removed_status': rec.status if rec is not None else None,
+         'removed_status': (rule_status(rec.status, rec.gave_up_reason)
+                            if rec is not None else None),
          'removed_cancel_reason': rec.cancel_reason if rec is not None else None},
         synchronize_session=False)
     ChannelTest.query.filter_by(pre_check_recording_id=recording_id).update(
@@ -2251,9 +2295,8 @@ class Channel(db.Model):
     notes            = db.Column(db.Text)
     # Whether recordings of this channel read the stream at real-time speed (ffmpeg -re):
     # NULL = follow ffmpeg.pace_realtime in Settings, True/False = this channel's own answer.
-    # A user's answer to a judgment call, so the participation-switch rule applies - the
-    # watchdog's automatic pacing (CAPTURE_PACING_ENABLED) lives on the running recording's
-    # state and never writes here, and an explicit False is what stops it (dev/changelog/997).
+    # A user's answer to a judgment call, so the participation-switch rule applies. Nothing
+    # else turns pacing on (dev/changelog/1423).
     pace_realtime    = db.Column(db.Boolean)
     # When the channel page's "Capture screenshot" last saved a frame (naive UTC). The file
     # is storage_dirs.manual_screenshot_path(); NULL means none has been taken. Not a health

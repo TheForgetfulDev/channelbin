@@ -17,6 +17,7 @@ No ffmpeg, no network, no /dvr - files are written under the test's own sandboxe
 folder, which is what the route's runtime load_config() reads.
 """
 import builtins
+import datetime
 import errno
 import os
 import re
@@ -28,6 +29,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from tests.support.app import make_test_app  # noqa: E402
 from tests.support import seed  # noqa: E402
+from tests.support.csrf import csrf_token  # noqa: E402
 from app import db, database, playback  # noqa: E402
 
 PAYLOAD = bytes(range(256)) * 64   # 16 KiB with a recognizable byte at every offset
@@ -157,9 +159,7 @@ class PageTests(_Rig):
         return bar[:menu_at], bar[menu_at:]
 
     def test_page_load_never_touches_a_finished_recordings_file(self):
-        """The storage under a finished recording may be asleep; only a click may wake it.
-        Scoped to the recording's own file: the page's older probes of files beside it (the
-        metadata sidecar, the segment files) are a separate backlog question."""
+        """The storage under a finished recording may be asleep; only a click may wake it."""
         out = os.path.join(self.dvr, 'sleeping', 'race.mp4')
         rec = self._rec(output_path=out)
         touched = []
@@ -177,6 +177,103 @@ class PageTests(_Rig):
         self.assertEqual(touched, [])
         self.assertIn('data-act="play"', html)
         self.assertIn('data-act="download"', html)
+
+    def _watch_dvr(self):
+        """Every stat, lstat or open of a path under the recording folder, while in force."""
+        touched = []
+        real_stat, real_lstat, real_open = os.stat, os.lstat, builtins.open
+
+        def watch(real):
+            def wrapper(path, *a, **k):
+                if isinstance(path, (str, bytes, os.PathLike)) \
+                        and os.fsdecode(path).startswith(self.dvr):
+                    touched.append(os.fsdecode(path))
+                return real(path, *a, **k)
+            return wrapper
+        return touched, (mock.patch('os.stat', watch(real_stat)),
+                         mock.patch('os.lstat', watch(real_lstat)),
+                         mock.patch.object(builtins, 'open', watch(real_open)))
+
+    @staticmethod
+    def _segment(rec, path):
+        now = datetime.datetime(2026, 11, 2, 12, 0)
+        seg = seed.make_segment(rec, None, now, now + datetime.timedelta(minutes=5))
+        seg.file_path = path
+        return seg
+
+    def _finished_with_everything_beside_it(self):
+        """A COMPLETED row whose page used to stat five things beside its file."""
+        rec = self._rec(output_path=self._file('Race day.mp4'))
+        self._file('Race day.nfo')
+        rec.converted_gap_seconds = 30.0
+        seg = self._segment(rec, self._file('segment_001.ts'))
+        database.add_recording_event(rec.id, database.METADATA_SIDECAR_WRITTEN, detail='written')
+        database.add_recording_event(rec.id, database.SOURCE_KEPT, detail='kept',
+                                     extra={'path': self._file('Race day.ts')})
+        db.session.commit()
+        return rec, seg
+
+    def test_page_load_touches_nothing_beside_a_finished_recording(self):
+        """BUGS.md 2026-11-02: the .nfo, the segment files, a kept source. Viewing the page
+        must not wake the drive under any of them."""
+        rec, _seg = self._finished_with_everything_beside_it()
+        touched, patches = self._watch_dvr()
+        with patches[0], patches[1], patches[2]:
+            html = self._page(rec)
+        self.assertEqual(touched, [])
+        self.assertIn('data-act="retry-convert-gaps"', html)
+
+    def test_list_page_touches_nothing_beside_a_finished_recording(self):
+        self._finished_with_everything_beside_it()
+        touched, patches = self._watch_dvr()
+        with patches[0], patches[1], patches[2]:
+            resp = self.t.client.get('/recordings')
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(touched, [])
+
+    def test_a_finished_rows_segments_read_as_gone_from_the_row(self):
+        """The join consumed them, so the table says so without asking the disk."""
+        rec, seg = self._finished_with_everything_beside_it()
+        self.assertTrue(os.path.exists(seg.file_path), 'the page must not be asking the disk')
+        self.assertIn('no longer on disk', self._page(rec))
+
+    def test_metadata_panel_says_a_sidecar_exists_from_its_event(self):
+        from app.routes.recordings import _metadata_panel
+        from app.config import load_config
+        rec = self._rec(output_path=os.path.join(self.dvr, 'nowhere.mp4'))
+        self.assertFalse(_metadata_panel(rec, load_config())['nfo_exists'])
+        database.add_recording_event(rec.id, database.METADATA_SIDECAR_WRITTEN, detail='written')
+        db.session.commit()
+        self.assertTrue(_metadata_panel(rec, load_config())['nfo_exists'],
+                        'the event is the answer; the file is not looked for')
+
+    def test_a_failed_row_still_asks_the_disk_what_it_can_recover(self):
+        """Which recovery to offer turns on what survived, so the stat stays here."""
+        with_files = self._rec(status='FAILED', output_path=None)
+        self._segment(with_files, self._file('kept_001.ts'))
+        without = self._rec(status='FAILED', output_path=None)
+        self._segment(without, os.path.join(self.dvr, 'gone_001.ts'))
+        db.session.commit()
+        self.assertIn('data-act="retry-concat"', self._page(with_files))
+        self.assertNotIn('class="btn btn-primary" data-act="retry-concat"', self._page(without))
+
+    def test_retry_conversion_on_a_kept_source_that_is_gone_says_so_on_the_click(self):
+        """The page offered it from the event alone, so the route is what reports the file."""
+        rec, _seg = self._finished_with_everything_beside_it()
+        source = os.path.join(self.dvr, 'Race day.ts')
+        os.unlink(source)
+        html = self._page(rec)
+        self.assertIn('data-act="retry-convert-gaps"', html)
+        resp = self.t.client.post(f'/recordings/{rec.id}/retry-convert',
+                                  data={'csrf_token': csrf_token(self.t.client)},
+                                  follow_redirects=True)
+        self.assertIn('no longer on disk', resp.get_data(as_text=True))
+        self.assertIn('Race day.ts', resp.get_data(as_text=True))
+
+    def test_a_finished_ts_offers_no_retry_conversion_the_route_would_refuse(self):
+        """BUGS.md 2026-11-02: the menu offered it and the click bounced back with an error."""
+        html = self._page(self._rec(output_path=self._file('kept.ts')))
+        self.assertNotIn('data-act="retry-convert"', html)
 
     def test_phone_bar_on_a_finished_recording_is_play_and_delete(self):
         html = self._page(self._rec(output_path=os.path.join(self.dvr, 'a.mp4')))

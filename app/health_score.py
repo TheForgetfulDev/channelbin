@@ -125,6 +125,7 @@ def score_recording_success_quality(recording, cfg: dict) -> Tuple[int, dict]:
         recording.total_restart_count or 0,
         recording.duration_seconds or 0,
         cfg,
+        reconnect_count=recording.reconnect_count,
     )
 
 
@@ -150,7 +151,8 @@ def observation_weight(duration_seconds: float, cfg: dict) -> float:
 
 
 def score_recording_metrics_quality(downtime_seconds: float, restart_count: int,
-                                    duration_seconds: float, cfg: dict) -> Tuple[int, dict]:
+                                    duration_seconds: float, cfg: dict,
+                                    reconnect_count: int = 0) -> Tuple[int, dict]:
     """0-100 quality score for a set of recording metrics (time lost + restart frequency
     over a duration). Factored out of score_recording_success_quality so the same formula
     scores either a whole recording or one group member's share of it, and is reused
@@ -167,6 +169,10 @@ def score_recording_metrics_quality(downtime_seconds: float, restart_count: int,
     comes back and the file is complete, and a line calling that time lost beside a file
     longer than its window was a number nobody could explain (dev/changelog/1305).
 
+    A reconnect inside a running capture costs less than a restart, which also opens a gap,
+    but it is the feed dropping all the same: recording 32 dropped 40 times in 5 hours and
+    scored 99 with none of them counted (dev/changelog/1425).
+
     Returns (score, breakdown) - see score_test_quality for the shared breakdown shape.
     """
     window = max(duration_seconds or 0, 1.0)
@@ -175,6 +181,8 @@ def score_recording_metrics_quality(downtime_seconds: float, restart_count: int,
     base = 100.0 * (1 - affected_fraction)
     instability_per_hr = cfg.get('channel_testing', {}).get('instability_penalty_per_hr', 2.0)
     instability = (restart_count or 0) / hours * instability_per_hr
+    reconnect_per_hr = cfg.get('channel_testing', {}).get('reconnect_penalty_per_hr', 1.0)
+    reconnect_penalty = (reconnect_count or 0) / hours * reconnect_per_hr
 
     penalties = []
     if downtime_seconds:
@@ -186,8 +194,13 @@ def score_recording_metrics_quality(downtime_seconds: float, restart_count: int,
         penalties.append({'reason': 'instability',
                            'detail': f'{restart_count} restarts / {hours:.2f}h × {instability_per_hr}/hr',
                            'amount': -instability})
+    if reconnect_count:
+        penalties.append({'reason': 'reconnects',
+                          'detail': f'{reconnect_count} reconnects / {hours:.2f}h × '
+                                    f'{reconnect_per_hr}/hr',
+                          'amount': -reconnect_penalty})
 
-    final = round(_clamp(base - instability))
+    final = round(_clamp(base - instability - reconnect_penalty))
     breakdown = {'base': round(base, 1), 'fail_floor_applied': False, 'penalties': penalties, 'final': final}
     return final, breakdown
 
@@ -644,10 +657,14 @@ def _final_member_success_quality(recording, cfg: dict) -> Tuple[int, dict]:
         end = recording.completed_at or datetime.utcnow()
         duration = max((end - last.timestamp).total_seconds(), 0)
 
-    quality, breakdown = score_recording_metrics_quality(downtime, restarts, duration, cfg)
+    reconnects = sum(s.reconnect_count or 0 for s in recording.segments
+                     if last.timestamp is None or s.started_at is None
+                     or s.started_at >= last.timestamp)
+    quality, breakdown = score_recording_metrics_quality(downtime, restarts, duration, cfg,
+                                                         reconnect_count=reconnects)
     breakdown['member_share'] = {
         'reason': 'group failover - final member share only',
-        'downtime_seconds': round(downtime), 'restarts': restarts,
+        'downtime_seconds': round(downtime), 'restarts': restarts, 'reconnects': reconnects,
         'duration_seconds': round(duration),
     }
     return quality, breakdown
@@ -679,10 +696,14 @@ def apply_recording_health_observation(app, recording_id: int, outcome: str):
         rs_cfg = cfg.get('channel_testing', {}).get('recording_score', {})
         observed_at = recording.completed_at or datetime.utcnow()
         fail_floor = rs_cfg.get('fail_floor', RECORDING_FAIL_FLOOR_DEFAULT)
+        # A give-up pulled stop_time back to the moment it happened. It weighs what the whole
+        # window would have, or a stream that died sooner would count for less.
+        window_seconds = ((recording.scheduled_duration_seconds if recording.gave_up_reason
+                           else recording.duration_seconds) or 0)
 
         # ── Channel-level observation: the feed the recording ended on ──
         if recording.channel_id is not None:
-            channel_duration = recording.duration_seconds or 0
+            channel_duration = window_seconds
             if outcome == 'success':
                 quality, quality_breakdown = _final_member_success_quality(recording, cfg)
                 member_share = quality_breakdown.get('member_share')
@@ -723,7 +744,7 @@ def apply_recording_health_observation(app, recording_id: int, outcome: str):
                 group_quality, _ = score_recording_success_quality(recording, cfg)
             else:
                 group_quality = fail_floor
-            group_weight = observation_weight(recording.duration_seconds or 0, cfg)
+            group_weight = observation_weight(window_seconds, cfg)
 
             @retry_on_locked()
             def _blend_group_and_commit():
@@ -756,6 +777,11 @@ def apply_capture_phase_health_observation(app, recording_id: int):
 
     Deliberately NOT reached by a user-aborted capture: abort_recording never concatenates,
     so ABORTED stays excluded exactly as before.
+
+    A capture the watchdog gave up on scores 'failed' even though its join goes on to finish:
+    the success formula divides downtime by the window and sees nothing of the hours after the
+    give-up, so a stream dead for three of four hours would come out looking healthy.
+    gave_up_reason is the recorded fact, so a restart before this point scores it the same.
     """
     with app.app_context():
         from . import db
@@ -768,15 +794,25 @@ def apply_capture_phase_health_observation(app, recording_id: int):
             log.debug('Recording %d already carries a health observation - not re-blending',
                       recording_id)
             return
+        outcome = 'failed' if recording.gave_up_reason else 'success'
 
-    apply_recording_health_observation(app, recording_id, 'success')
+    apply_recording_health_observation(app, recording_id, outcome)
+
+
+# Below this the correction weighs what the recording weighs. At its fixed weight of 1 it could
+# not move a score that a 5 hour recording had just set at weight 24.5: recording 32's picture
+# and sound were 112 s apart and it would still have read 86 (dev/changelog/1425).
+CAPTURE_CORRECTION_FULL_WEIGHT_BELOW = 90
 
 
 def score_capture_quality_correction(timeline_deficit_seconds: float, near_empty_seconds: float,
-                                     span_seconds: float, cfg: dict) -> Tuple[int, dict]:
+                                     span_seconds: float, cfg: dict,
+                                     picture_sound_apart_seconds: float = None
+                                     ) -> Tuple[int, dict]:
     """Pure: 0-100 quality for the postprocess damage/near-empty correction bolt-on.
 
-    Deliberately scoped to ONLY timeline_deficit_seconds and near_empty_seconds - never
+    Deliberately scoped to what the file shows (timeline_deficit_seconds, near_empty_seconds,
+    how far apart the picture and sound end) - never
     total_downtime_seconds or restart counts, which the primary capture-phase observation
     (apply_recording_health_observation) already fully accounts for. Re-reading those here
     would double-count the same lost time under a different name; this formula only ever
@@ -789,7 +825,9 @@ def score_capture_quality_correction(timeline_deficit_seconds: float, near_empty
     near_empty_pct = (near_empty_seconds or 0) / span * 100 if span else 0.0
     damage_penalty = missing_pct * rs_cfg.get('damage_penalty_per_pct_missing', 3)
     near_empty_penalty = near_empty_pct * rs_cfg.get('near_empty_penalty_per_pct', 2)
-    quality = round(_clamp(100 - damage_penalty - near_empty_penalty))
+    # Flat, not per second: a recording out of step by 10 s is unwatchable already.
+    apart_penalty = rs_cfg.get('out_of_step_penalty', 80) if picture_sound_apart_seconds else 0
+    quality = round(_clamp(100 - damage_penalty - near_empty_penalty - apart_penalty))
     breakdown = {
         'base': 100, 'fail_floor_applied': False, 'final': quality,
         'penalties': [
@@ -800,6 +838,9 @@ def score_capture_quality_correction(timeline_deficit_seconds: float, near_empty
                 {'reason': 'near_empty',
                  'detail': f'{near_empty_seconds or 0:.0f}s near-empty of {span:.0f}s '
                            f'({near_empty_pct:.1f}%)', 'amount': -near_empty_penalty} if near_empty_pct else None,
+                {'reason': 'out_of_step',
+                 'detail': f'picture and sound end {picture_sound_apart_seconds or 0:.0f}s apart',
+                 'amount': -apart_penalty} if apart_penalty else None,
             ] if p is not None
         ],
     }
@@ -850,9 +891,12 @@ def apply_capture_quality_correction(app, recording_id: int, analysis_completed_
         rs_cfg = cfg.get('channel_testing', {}).get('recording_score', {})
         quality, breakdown = score_capture_quality_correction(
             recording.timeline_deficit_seconds, recording.near_empty_seconds,
-            recording.duration_seconds, cfg)
+            recording.duration_seconds, cfg,
+            picture_sound_apart_seconds=recording.picture_sound_apart_seconds)
 
         weight = rs_cfg.get('capture_quality_source_weight', 1.0)
+        if quality < CAPTURE_CORRECTION_FULL_WEIGHT_BELOW:
+            weight = max(weight, observation_weight(recording.duration_seconds, cfg))
         observed_at = datetime.utcnow()
         new_score, new_count, new_updated_at, _ = blend_health_score(
             channel, quality, observed_at, weight, cfg
@@ -860,6 +904,7 @@ def apply_capture_quality_correction(app, recording_id: int, analysis_completed_
         # The blend instant is not otherwise on the row, and a replay has to place this
         # observation where it actually ran (app/health_recompute.py::observation_ledger).
         breakdown['observed_at'] = _iso(observed_at)
+        breakdown['source_weight'] = weight
         channel.health_score = new_score
         channel.health_score_sample_count = new_count
         channel.health_score_updated_at = new_updated_at

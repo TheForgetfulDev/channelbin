@@ -410,21 +410,27 @@ class CaptureCase(unittest.TestCase):
         kw.setdefault('window', self.window(rid))
         return ak.check(self.sim, paths, **kw)
 
-    def answer_joined(self, rid: int, **kw) -> ak.Answer:
-        """The answer key's reading of the joined file - what the user was handed - as one
-        segment."""
+    def joined_path(self, rid: int) -> str:
+        """The kept copy of the joined .ts - what the user was handed. A segment's own
+        name, and a rewrite of one the join made beside it (`seg_001.ts.holes.ts`), are
+        not it."""
         rec = self.fresh(Recording, rid)
+        stem = os.path.splitext(os.path.basename(rec.output_path or ''))[0] or '\0'
         joined = [p for name, p in list(self.keeper.kept.items())
-                  if name.endswith('.ts') and not _SEGMENT.search(name)
-                  and name.startswith(os.path.splitext(os.path.basename(
-                      rec.output_path or ''))[0] or '\0')]
+                  if name.endswith('.ts') and '_seg_' not in name and name.startswith(stem)]
         if len(joined) != 1:
             raise AssertionError(f'expected one joined .ts kept for recording {rid}, found '
                                  f'{joined} (output_path {rec.output_path})')
+        return joined[0]
+
+    def answer_joined(self, rid: int, **kw) -> ak.Answer:
+        """The answer key's reading of the joined file - what the user was handed - as one
+        segment."""
+        joined = self.joined_path(rid)
         kw.setdefault('serving', self.serving(rid))
         kw.setdefault('min_gap', MIN_GAP)
         kw.setdefault('window', self.window(rid))
-        return ak.check(self.sim, joined, **kw)
+        return ak.check(self.sim, [joined], **kw)
 
     def claims(self, rid: int) -> dict:
         """What ChannelBin says about the recording, in the answer key's terms - only the

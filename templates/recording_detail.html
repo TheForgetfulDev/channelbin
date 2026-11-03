@@ -481,6 +481,10 @@
   <span class="sep-dot">·</span>
   <span>finished <span class="mono">{{ rec.completed_at | local_time_sec }}</span></span>
   {% endif %}
+  {% if rec.picture_sound_apart_seconds %}
+  <span class="sep-dot">·</span>
+  <span class="gaps-note">the picture and sound end <b>{{ rec.picture_sound_apart_seconds | duration(true) }}</b> apart, so expect them out of step</span>
+  {% endif %}
   {% if (rec.converted_gap_seconds or 0) > 0 %}
   <span class="sep-dot">·</span>
   <span class="gaps-note">the converted file is <b>missing {{ rec.converted_gap_seconds | duration(true) }}</b> of video the recording has
@@ -597,6 +601,7 @@
   'RECORDING_FAILED': 'Recording FAILED',
   'RECORDING_FAILED_DEAD_STREAM': 'Dead stream detected',
   'RECORDING_RETRY_SCHEDULED': 'Retrying after dead stream',
+  'CAPTURE_GAVE_UP': 'Stopped trying the stream',
   'RECORDING_ABORTED': 'Cancelled',
   'RECORDING_MANUALLY_STOPPED': 'Manually stopped',
   'RECORDING_PAUSED': 'Paused',
@@ -622,6 +627,7 @@
   'RECORDING_FAILED': 'fail',
   'RECORDING_FAILED_DEAD_STREAM': 'fail',
   'RECORDING_RETRY_SCHEDULED': 'stall',
+  'CAPTURE_GAVE_UP': 'fail',
   'RECORDING_ABORTED': 'stop',
   'RECORDING_PAUSED': 'paused',
   'RECORDING_MANUALLY_STOPPED': 'stop',
@@ -1257,7 +1263,7 @@
   'FILE_MOVED': 'ok', 'SCRIPT_EXECUTED': 'ok', 'METADATA_SIDECAR_WRITTEN': 'ok',
   'METADATA_SIDECAR_FAILED': 'warn', 'CONVERTED_FILE_GAPS': 'warn', 'FILE_MOVE_FAILED': 'bad',
   'SOURCE_DELETED': 'info', 'SOURCE_KEPT': 'info',
-  'RECORDING_FAILED': 'bad', 'RECORDING_FAILED_DEAD_STREAM': 'bad',
+  'RECORDING_FAILED': 'bad', 'RECORDING_FAILED_DEAD_STREAM': 'bad', 'CAPTURE_GAVE_UP': 'bad',
   'CONCATENATION_FAILED': 'bad', 'CONVERSION_FAILED': 'bad',
   'RECORDING_START_NOT_ARMED': 'bad',
   'RECORDING_RESUME_REFUSED': 'bad', 'GROUP_FAILOVER': 'warn', 'PRE_CHECK_FAILED': 'warn',
@@ -1284,7 +1290,7 @@
           {% if evt.segment_number is not none %}<span class="ev-seg">seg {{ evt.segment_number + seg_offset }}</span>{% endif %}
           <span class="ev-code">{{ evt.event_type }}</span>
         </div>
-        {% if evt.detail %}<div class="ev-detail">{{ evt.detail }}</div>{% endif %}
+        {% if evt.detail %}<div class="ev-detail">{{ evt.detail | event_detail_clip }}</div>{% endif %}
         {% set links = event_channel_links.get(evt.id) %}
         {% if links %}
         <div class="ev-detail muted" style="font-size:var(--fs-sm)">

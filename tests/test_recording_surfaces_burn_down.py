@@ -486,10 +486,11 @@ class CancelledRetryPromotionTests(unittest.TestCase):
         self.assertNotIn('data-act="retry-convert"', html)
         self.assertIn('<button class="btn btn-danger" data-act="delete">Delete</button>', html)
 
-    def test_a_completed_row_with_a_ts_keeps_the_kebab_item(self):
+    def test_a_completed_row_with_a_ts_offers_no_retry_the_route_would_refuse(self):
+        """BUGS.md 2026-11-02: retry_convert refuses a COMPLETED row with no gaps, so the kebab
+        item this once kept could only bounce."""
         html = self._page(REC_STATUS_COMPLETED, with_ts=True)
-        self.assertNotIn('<button class="btn btn-primary" data-act="retry-convert">', html)
-        self.assertIn('<button class="menu-item" data-act="retry-convert">', html)
+        self.assertNotIn('data-act="retry-convert"', html)
 
 
 # ── Near-empty scan key ─────────────────────────────────────────────────────

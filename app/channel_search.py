@@ -69,7 +69,7 @@ import time
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 
-from sqlalchemy import (String, and_, case, cast, func, literal_column, not_, or_, select,
+from sqlalchemy import (Integer, String, and_, case, cast, func, literal_column, not_, or_, select,
                         union)
 
 from . import db, health_bands
@@ -3698,6 +3698,34 @@ def _airing_query():
     return EPGEntry.query.join(Channel, Channel.id == EPGEntry.channel_id)
 
 
+#: The airing sorts that read `channels` first (see _airing_rows_query). Each is led by a channel
+#: column with an index behind it, and measured 0.57-0.60s -> 0.10-0.13s on the production
+#: database. Not the rest, and each is measured: `account`'s leading value holds so many showings
+#: that descending got slower (0.63s -> 1.03s); `health`, `sid` and `url` have no index to walk
+#: in order and gain nothing; `when` and `title` are led by a column of the showing
+#: (dev/changelog/1419).
+_CHANNEL_LED_SORTS = frozenset({'category', 'channel', 'tvg'})
+
+
+def _airing_rows_query(state: SearchState, text_preds: list):
+    """`_airing_query()`, read from `channels` first when the sort is led by a channel column.
+
+    Left to itself the planner reads the showings first and looks each one's channel up, then
+    sorts every survivor to return one page. Channel first it walks the channels in sort order,
+    seeks each one's showings, and stops as soon as a page is full. `+` is the same trick as
+    `_unindexed()`: it stops the join being answered from `channels`' primary key, which leaves
+    the planner one way to run it. Same rows and same order, because ORDER BY decides that.
+
+    Never for a typed query or a tag filter. Both narrow from the search index to a handful of
+    showings, and walking every channel to find them cost 0.01s -> 0.35s on a tag filter.
+    """
+    if (state.sort in _CHANNEL_LED_SORTS and not text_preds
+            and state.filter_for('tag') is None):
+        return EPGEntry.query.join(
+            Channel, literal_column('+channels.id', Integer) == EPGEntry.channel_id)
+    return _airing_query()
+
+
 def _search_airings(state: SearchState, ctx: SearchContext,
                     want_counts: bool = True,
                     want_facets: bool = True) -> SearchResult:
@@ -3710,7 +3738,7 @@ def _search_airings(state: SearchState, ctx: SearchContext,
     else:
         hidden, total, pages, matched = None, None, None, None
 
-    query = _airing_query().filter(*narrowing, *kept)
+    query = _airing_rows_query(state, text_preds).filter(*narrowing, *kept)
     order = list(SORTS_AIRINGS[state.sort]())
     if state.sort_desc:
         order = [o.desc() for o in order]
@@ -4422,30 +4450,29 @@ def _facet_counts(dim: Dimension, state: SearchState, ctx: SearchContext,
         return dict(zip(OTHER_VALUES, [n or 0 for n in row]))
 
     if dim.key == 'group':
-        # Driven from the membership table, not from channels. There are 97 membership rows
-        # against 136,130 channels, so starting at the small end is the whole game: written
+        # Driven from the membership table, not from channels. Measured with 97 membership rows
+        # against 136,130 channels, where starting at the small end is the whole game: written
         # the other way round - `select_from(Channel).join(members)` - the planner scans
         # every channel and this facet costs 88ms instead of 1.4ms. The airing grain hangs
         # epg_entries off the same small end rather than reversing it.
-        def grouped(*cols):
-            query = (db.session.query(*cols)
-                     .select_from(ChannelGroupMember)
-                     .join(Channel, Channel.id == ChannelGroupMember.channel_id))
-            if airings:
-                query = query.join(EPGEntry, EPGEntry.channel_id == Channel.id)
-            return query
-
-        tally = counted if airings else func.distinct(Channel.id)
-        rows = (grouped(ChannelGroup.name, func.count(tally))
-                .join(ChannelGroup, ChannelGroup.id == ChannelGroupMember.group_id)
+        query = (db.session.query(ChannelGroup.name,
+                                  func.count(counted if airings else func.distinct(Channel.id)))
+                 .select_from(ChannelGroupMember)
+                 .join(Channel, Channel.id == ChannelGroupMember.channel_id))
+        if airings:
+            query = query.join(EPGEntry, EPGEntry.channel_id == Channel.id)
+        rows = (query.join(ChannelGroup, ChannelGroup.id == ChannelGroupMember.group_id)
                 .filter(*preds).group_by(ChannelGroup.name).all())
         counts = {name: n for name, n in rows}
-        # DISTINCT here and not above: "in any group at all" spans every membership a row
-        # has, so a channel in two groups would otherwise count its showings twice. Within
-        # one group name the (group_id, channel_id) uniqueness constraint already guarantees
-        # one membership row, so the per-group counts need no distinct pass.
-        counts[GROUP_ANY] = (grouped(func.count(func.distinct(counted)))
-                             .filter(*preds).scalar() or 0)
+        # "In any group at all" spans every membership a row has, so a channel in two groups
+        # must count once. IN asks that with no COUNT(DISTINCT) over every membership's showings,
+        # which took the whole facet from 0.47s to 0.19s on the production database, with the
+        # same counts (dev/changelog/1418). Within one group name the (group_id, channel_id)
+        # uniqueness constraint already guarantees one membership row.
+        counts[GROUP_ANY] = (over(func.count(counted))
+                             .filter(*preds,
+                                     Channel.id.in_(select(ChannelGroupMember.channel_id)))
+                             .scalar() or 0)
         return counts
 
     if dim.key == 'tag':

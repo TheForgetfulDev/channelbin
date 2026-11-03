@@ -54,7 +54,7 @@ from .lineup import KIND_NO_ID, KIND_RADIO, channel_label
 from .mp3 import SAMPLES_PER_FRAME
 from .rand import derive
 from .stream_faults import OpenPlan, LiveFaults, epoch_ns, plan_open, shape
-from .ts import CLOCK_HZ, PTS_HZ, PTS_WRAP, TS
+from .ts import CLOCK_HZ, PTS_HZ, PTS_WRAP, TS, without_video_track
 from .world import CONTENT_CALIBRATED
 
 TICK_SECONDS = 0.02
@@ -162,6 +162,8 @@ class TsConnection:
         plan = plan or OpenPlan()
         self.silent_after, self.hold_silence = plan.silent_after, plan.hold_silence
         self.close_after = plan.close_after
+        self.close_by = plan.close_by
+        self.no_video = plan.no_video
         start = self.timing.send_time(clock.now_ns()) - int(burst_seconds * CLOCK_HZ)
         self.g = self.first = loop.cut_packet(max(loop.cuts_through(start) - 1, 0))
         self.ended = ''
@@ -221,7 +223,7 @@ class TsConnection:
                 return
             fault = self._connection_fault()
             if fault == 'close':
-                self.ended = f'closed after {self.sent} bytes by close_mid_stream'
+                self.ended = f'closed after {self.sent} bytes by {self.close_by}'
                 return
             if fault == 'silent':
                 self._silence(stopping)
@@ -244,6 +246,8 @@ class TsConnection:
                 if left is not None:
                     g1 = min(g1, self.g + left)
                 piece = shape(timing, self.g, g1, live)
+                if self.no_video:
+                    piece = without_video_track(piece, loop.video_pid, loop.pmt_pid)
                 yield piece
                 # After the yield: a write that raised closes the generator here, so `offered()`
                 # never counts a piece the server did not write (dev/changelog/1385).

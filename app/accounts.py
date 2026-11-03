@@ -1805,7 +1805,7 @@ def _do_sync(account_id: int, stop_event: threading.Event, use_dump: bool = Fals
         # exception the except block above just handled.
         if rebuild_needed:
             from .search_index import rebuild_search_indexes
-            rebuild_search_indexes(f'account {account_id} sync')
+            rebuild_search_indexes(f'account {account_id} sync', only_changes=True)
 
 
 # How far into a playlist to look for the #EXTM3U header before giving up. Real providers
@@ -3802,42 +3802,44 @@ _EPG_STATUS_BY_ALERT = {
 
 
 def cleanup_old_epg_entries(app):
-    """Delete EPG entries, active and alternate, older than sync.epg_keep_days. 0 = keep
-    forever."""
+    """Delete EPG entries, active and alternate, older than sync.epg_keep_days (0 = keep
+    forever), then rebuild the program index in full."""
     with app.app_context():
         cfg = load_config()
         keep_days = cfg.get('sync', {}).get('epg_keep_days', 1)
-        if keep_days <= 0:
-            return
-        cutoff = datetime.utcnow() - timedelta(days=keep_days)
+        if keep_days > 0:
+            cutoff = datetime.utcnow() - timedelta(days=keep_days)
 
-        @retry_on_locked()
-        def _delete_and_commit():
-            n = EPGEntry.query.filter(EPGEntry.stop_time < cutoff).delete(synchronize_session=False)
-            # Same cutoff for the alternates (DESIGN-epg-sources.md §4), so the comparison
-            # view never shows a source's past that the guide itself has already dropped.
-            n_alt = EpgAlternateEntry.query.filter(
-                EpgAlternateEntry.stop_time < cutoff).delete(synchronize_session=False)
-            if n or n_alt:
-                # The delete is global, so any stored count may now be stale. Recompute in
-                # the same transaction (COUNT sees the pending delete) so the stored value
-                # doesn't drift until the next full sync. Only a handful of accounts and
-                # sources, once daily - not a per-row hot loop.
-                for account in Account.query.all():
-                    account.epg_entry_count = EPGEntry.query.join(Channel).filter(
-                        Channel.account_id == account.id
-                    ).count()
-                for (source_id,) in db.session.query(EpgSource.id).all():
-                    refresh_source_counts(source_id)
-            db.session.commit()
-            return n
+            @retry_on_locked()
+            def _delete_and_commit():
+                n = EPGEntry.query.filter(EPGEntry.stop_time < cutoff).delete(
+                    synchronize_session=False)
+                # Same cutoff for the alternates (DESIGN-epg-sources.md §4), so the comparison
+                # view never shows a source's past that the guide itself has already dropped.
+                n_alt = EpgAlternateEntry.query.filter(
+                    EpgAlternateEntry.stop_time < cutoff).delete(synchronize_session=False)
+                if n or n_alt:
+                    # The delete is global, so any stored count may now be stale. Recompute in
+                    # the same transaction (COUNT sees the pending delete) so the stored value
+                    # doesn't drift until the next full sync. Only a handful of accounts and
+                    # sources, once daily - not a per-row hot loop.
+                    for account in Account.query.all():
+                        account.epg_entry_count = EPGEntry.query.join(Channel).filter(
+                            Channel.account_id == account.id
+                        ).count()
+                    for (source_id,) in db.session.query(EpgSource.id).all():
+                        refresh_source_counts(source_id)
+                db.session.commit()
+                return n
 
-        deleted = _delete_and_commit()
-        if deleted:
-            log.info('EPG cleanup: deleted %d entries older than %d day(s)', deleted, keep_days)
-            # chan_prog holds what was in the *future* when it was last built, and this
-            # delete takes rows out from under exactly those that have since aged into the
-            # past. Rebuilding only the program index - channels are untouched here, and a
-            # channel rebuild is several seconds of held write lock for nothing.
-            from .search_index import rebuild_search_indexes, SEARCH_INDEX_PROGRAMS
-            rebuild_search_indexes('EPG cleanup', names=(SEARCH_INDEX_PROGRAMS,))
+            deleted = _delete_and_commit()
+            if deleted:
+                log.info('EPG cleanup: deleted %d entries older than %d day(s)', deleted,
+                         keep_days)
+        # Every day, whatever was deleted and whatever epg_keep_days says: this is the one full
+        # rebuild a healthy install gets, because a sync only writes what changed. It is what
+        # compacts the segments those syncs leave behind and what repairs any drift a row count
+        # cannot see (dev/changelog/1416). Only the program index - channels are untouched here,
+        # and a channel rebuild is several seconds of held write lock for nothing.
+        from .search_index import rebuild_search_indexes, SEARCH_INDEX_PROGRAMS
+        rebuild_search_indexes('EPG cleanup', names=(SEARCH_INDEX_PROGRAMS,))

@@ -170,6 +170,28 @@ class RecordingMetricsQualityTests(unittest.TestCase):
         self.assertNotIn('lost', lost['detail'])
         self.assertAlmostEqual(lost['amount'], -4.554, places=2)
 
+    def test_reconnects_are_charged_and_named(self):
+        """Recording 32: 40 reconnects in 5 hours, charged nothing (dev/docs/BUGS.md 2026-11-03)."""
+        without, _ = score_recording_metrics_quality(32, 1, 18000, _CFG)
+        score, bd = score_recording_metrics_quality(32, 1, 18000, _CFG, reconnect_count=40)
+        self.assertEqual(without, 99)
+        self.assertEqual(score, 91)
+        self.assertEqual(bd['penalties'][-1]['reason'], 'reconnects')
+        self.assertIn('40 reconnects', bd['penalties'][-1]['detail'])
+
+    def test_a_reconnect_costs_less_than_a_restart(self):
+        restart, _ = score_recording_metrics_quality(0, 4, 3600, _CFG)
+        reconnect, _ = score_recording_metrics_quality(0, 0, 3600, _CFG, reconnect_count=4)
+        self.assertGreater(reconnect, restart)
+
+    def test_picture_and_sound_apart_sinks_the_correction(self):
+        quality, bd = score_capture_quality_correction(119, 0, 18000, _CFG,
+                                                       picture_sound_apart_seconds=112.0)
+        self.assertLess(quality, 20)
+        self.assertEqual(bd['penalties'][-1]['reason'], 'out_of_step')
+        clean, _ = score_capture_quality_correction(119, 0, 18000, _CFG)
+        self.assertEqual(clean, 98)
+
     def test_restarts_penalized_by_instability_rate(self):
         # 0 downtime, 2 restarts in 1 hour x 2.0/hr = -4 -> 96
         score, _ = score_recording_metrics_quality(0, 2, 3600, _CFG)

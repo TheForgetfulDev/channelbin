@@ -852,6 +852,7 @@ _DEFAULTS = {
         # default went 120s -> 30s and left every check at half weight (dev/changelog/1016).
         'reference_minutes': 0.5,
         'instability_penalty_per_hr': 2.0,           # per restart/drop-per-hour, on top of proportional time-lost
+        'reconnect_penalty_per_hr': 1.0,             # per in-process reconnect-per-hour; less than a restart, which also opens a gap
         'health_score_test_fail_floor': 10,         # quality score for a FAILED test
         'health_score_warn_penalty': 10,            # any WARN on an otherwise-COMPLETED test
         # Where the four health bands start (app/health_bands.py). Poor is always 0 - a band
@@ -879,6 +880,7 @@ _DEFAULTS = {
             'near_empty_min_span_seconds': 30,        # segments shorter than this are never flagged (avoid noise)
             'damage_penalty_per_pct_missing': 3,      # capture-quality correction: per % of window timeline-damaged
             'near_empty_penalty_per_pct': 2,          # capture-quality correction: per % of window near-empty/slate
+            'out_of_step_penalty': 80,                # capture-quality correction: flat, when the picture and sound end apart
             'capture_quality_source_weight': 1.0,     # fixed weight for the capture-quality correction bolt-on (not duration-scaled)
         },
         # Pre-recording health check (DESIGN-prerecord-checks.md §3): optionally test a

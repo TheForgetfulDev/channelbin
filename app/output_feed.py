@@ -767,7 +767,7 @@ def start_session(feed_id: int, client: str, cfg=None) -> RelaySession:
 
     member = play.member
     cap = int(fcfg.get('max_viewers') or 1)
-    pace, _source = resolve_capture_pacing(cfg, member.pace_realtime, 0, False)
+    pace, _source = resolve_capture_pacing(cfg, member.pace_realtime, 0)
     session = RelaySession(
         id=secrets.token_urlsafe(12), feed_id=feed_id, label=play.label, client=client,
         group_id=play.group.id if play.group is not None else None,

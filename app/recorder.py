@@ -38,10 +38,13 @@ from .channel_groups import (effective_score, pick_best_member, recording_member
                              format_eligible_members, format_key, format_label,
                              segment_pin_format_key, DEFAULT_FAILING_STREAK_THRESHOLD)
 from .db_utils import retry_on_locked
+from .fmt_utils import SECONDS_LIST_SHOWN, counted, seconds_list
 from .fs_utils import PATH_OK, describe_dir_problem, probe_dir
+from .hole_repair import HOLE_REMUX_SUFFIX
+from .join_layout import LAYOUT_REMUX_SUFFIX
 from .proc_utils import (SCRATCH_PREFIXES, build_capture_cmd, count_stderr_matches,
-                         read_reconnect_jumps, read_stderr_tail, scratch_file_paths,
-                         terminate_or_kill)
+                         is_hls_url, pick_hls_variant, read_reconnect_jumps, read_stderr_tail,
+                         REPEAT_CLOSURES_STUCK, scratch_file_paths, terminate_or_kill)
 from .url_utils import mask_creds, mask_creds_in_text
 from . import events as ev
 
@@ -108,13 +111,10 @@ class RecordingState:
     # move rides a segment boundary that was happening anyway (and skips the restart
     # delay, making it ~30s cheaper than staying put).
     stall_moves: int = 0
-    # Channels this recording has switched to real-time pacing on its own, because a segment
-    # on them was stopped for fast delivery after in-process reconnects (dev/changelog/997).
-    # Keyed on the member, so a failover does not carry it to a feed that never showed the
-    # problem. In-memory by design: it is a recovery for this run, never a stored setting -
-    # Channel.pace_realtime is the user's answer and nothing here writes it. A pause/resume
-    # or service restart forgets it, costing at most one more fast-delivery kill to re-learn.
-    auto_paced_channel_ids: set = field(default_factory=set)
+    # The quality each master playlist's first read chose, by URL, so a restart stays on it: a
+    # read that failed at the restart would otherwise drop the rest of the run to the first
+    # one listed, and a recording does not change format mid-run (dev/changelog/1408).
+    hls_variants: dict = field(default_factory=dict)
     # Whether the segment now running was launched with -re, so the watchdog can tell a
     # paced capture that still misbehaved (pacing is not the fix) from an unpaced one.
     current_segment_paced: bool = False
@@ -148,23 +148,21 @@ PACING_CHANNEL_ON = 'channel_on'     # Channel.pace_realtime is True
 PACING_CHANNEL_OFF = 'channel_off'   # Channel.pace_realtime is False
 PACING_DEFAULT_ON = 'default_on'     # the channel follows ffmpeg.pace_realtime, which is on
 PACING_DEFAULT_OFF = 'default_off'   # the channel follows ffmpeg.pace_realtime, which is off
-PACING_AUTOMATIC = 'automatic'       # the watchdog turned it on for this channel this run
 
 _PACING_NOTES = {
     PACING_BOUNDED: 'required by the configured segment length',
     PACING_CHANNEL_ON: "this channel's setting",
     PACING_DEFAULT_ON: 'the default in Settings',
-    PACING_AUTOMATIC: 'turned on automatically earlier in this recording',
 }
 
 
-def resolve_capture_pacing(cfg: dict, channel_pace, segment_duration, auto_paced: bool):
+def resolve_capture_pacing(cfg: dict, channel_pace, segment_duration):
     """(pace, source) for one recording segment's -re flag.
 
     Order matters. A bounded segment is always paced, because -t without -re is satisfied
     from a provider's backlog in seconds (dev/changelog/437). An explicit per-channel answer
-    beats everything else, including the watchdog's automatic pacing - the user said no.
-    Automatic pacing only ever turns pacing ON for a channel following the default.
+    beats the default. Nothing turns it on by itself: on a feed that keeps dropping it costs
+    video (dev/changelog/1423).
     """
     if segment_duration:
         return True, PACING_BOUNDED
@@ -174,8 +172,6 @@ def resolve_capture_pacing(cfg: dict, channel_pace, segment_duration, auto_paced
         return False, PACING_CHANNEL_OFF
     if cfg.get('ffmpeg', {}).get('pace_realtime', False):
         return True, PACING_DEFAULT_ON
-    if auto_paced:
-        return True, PACING_AUTOMATIC
     return False, PACING_DEFAULT_OFF
 
 
@@ -270,6 +266,10 @@ def recording_disk_paths(recording_id: int, cfg: dict = None) -> list:
     for seg in RecordingSegment.query.filter_by(recording_id=recording_id).all():
         if seg.file_path:
             paths.append(seg.file_path)
+            # A rewrite for the join that a killed process left behind: every other exit from
+            # the join deletes its own (concatenator._remux_for_join, hole_repair).
+            paths.append(f'{seg.file_path}{LAYOUT_REMUX_SUFFIX}')
+            paths.append(f'{seg.file_path}{HOLE_REMUX_SUFFIX}')
     paths.extend(recording_image_paths(recording_id, cfg))
     return list(dict.fromkeys(paths))
 
@@ -1676,21 +1676,16 @@ def collect_segment_diagnostics(recording_id: int):
         # cannot touch the capture it is describing, and count_stderr_matches is bounded so
         # it cannot delay the restart.
         reconnects = count_stderr_matches(path)
-        if reconnects[0]:
-            jumps = read_reconnect_jumps(path)
+        # Read whether or not it reconnected: a closed gap or a clock reset is logged with
+        # no reconnect behind it (dev/changelog/1415).
+        jumps = read_reconnect_jumps(path)
+        if not any(jumps[:2] + jumps[3:]):
+            jumps = None
         try:
             os.unlink(path)
         except OSError:
             pass  # best-effort; the glob reap in _open_segment_stderr_spool collects strays
     return exit_code, tail, reconnects, spool_missing, jumps
-
-
-def _seconds_list(values) -> str:
-    """'4.0, 5.1 and 5.8 s' - the seconds of a few reconnects, read in one breath."""
-    parts = [f'{v:.1f}' for v in values]
-    if len(parts) == 1:
-        return f'{parts[0]} s'
-    return f'{", ".join(parts[:-1])} and {parts[-1]} s'
 
 
 def record_segment_diagnostics(recording_id: int, seg, exit_code, tail, reconnects=(0, True),
@@ -1729,7 +1724,7 @@ def record_segment_diagnostics(recording_id: int, seg, exit_code, tail, reconnec
         # and the list row read (dev/changelog/1306).
         seg.reconnect_count = reconnect_count
         seg.reconnects_truncated = not reconnects_complete
-    if (not tail and not reconnect_count and not spool_missing
+    if (not tail and not reconnect_count and not spool_missing and jumps is None
             and not (exit_code is not None and exit_code > 0)):
         return
     seg_num = seg.segment_number if seg is not None else None
@@ -1773,14 +1768,42 @@ def record_segment_diagnostics(recording_id: int, seg, exit_code, tail, reconnec
         # in the timeline, with the content on both sides of it intact (dev/changelog/1237).
         detail += (f'; each reconnect was answered from the provider\'s buffer again, so the '
                    f'file holds the seconds before each drop twice: '
-                   f'{_seconds_list(jumps.replays)}, {sum(jumps.replays):.1f} s in all')
-        if jumps.holes:
+                   f'{seconds_list(jumps.replays, limit=SECONDS_LIST_SHOWN)}, '
+                   f'{sum(jumps.replays):.1f} s in all')
+        if jumps.repeats >= REPEAT_CLOSURES_STUCK:
+            # The replay figures above are then the streams' distance as much as any replay,
+            # and a hole sentence would promise a repair that cannot match one stream's jump.
+            detail += (f'; ffmpeg then corrected the video and audio against each other '
+                       f'{jumps.repeats:,} times without settling, which means the picture and '
+                       f'sound were about {jumps.repeat_seconds:.0f} s apart in this segment by '
+                       f'its end')
+            extra['timestamp_repeat_closures'] = jumps.repeats
+            extra['streams_apart_seconds'] = jumps.repeat_seconds
+        elif jumps.holes:
             n = len(jumps.holes)
             detail += (f'; at {n} of them ffmpeg closed the timestamp jump once per stream, '
-                       f'which leaves a hole of about {_seconds_list(jumps.holes)} in the '
-                       f'file\'s timeline with no content missing on either side of it')
+                       f'which leaves a hole of about '
+                       f'{seconds_list(jumps.holes, limit=SECONDS_LIST_SHOWN)} in the '
+                       f'file\'s timeline, which the join tries to close')
         extra['reconnect_replay_seconds'] = list(jumps.replays)
         extra['reconnect_hole_seconds'] = list(jumps.holes)
+    if jumps is not None and jumps.closed_gaps:
+        # A forward jump past what the capture keeps as a gap (TIMELINE_GAP_KEEP_SECONDS):
+        # the stretch is not in the file, and its timeline runs on as if it never was.
+        n = len(jumps.closed_gaps)
+        detail += (f'; ffmpeg closed up {counted(n, "forward timestamp jump")} of '
+                   f'{seconds_list(jumps.closed_gaps[:5])}'
+                   f'{" and more" if n > 5 else ""} - content the provider never sent, or '
+                   f'its clock moving ahead - so the file\'s timeline runs on as if that '
+                   f'stretch were not there')
+        extra['closed_gap_seconds'] = list(jumps.closed_gaps)
+    if jumps is not None and jumps.resets:
+        n = len(jumps.resets)
+        detail += (f'; ffmpeg closed {counted(n, "backward timestamp jump")} of '
+                   f'{seconds_list(jumps.resets[:5])}{" and more" if n > 5 else ""} with no '
+                   f'reconnect behind it - the provider\'s clock went back - so the file\'s '
+                   f'timeline runs on from where it was')
+        extra['reset_seconds'] = list(jumps.resets)
     if spool_missing:
         detail += ('; ffmpeg\'s output was not captured for this segment - another process '
                    'deleted the file it was being written to, so there is no record of what '
@@ -1789,6 +1812,23 @@ def record_segment_diagnostics(recording_id: int, seg, exit_code, tail, reconnec
         extra['stderr_tail'] = tail
     add_recording_event(recording_id, DIAGNOSTICS, detail=detail, segment_number=seg_num,
                         extra=extra)
+
+
+def _hls_variant_for(state, url: str, cfg: dict):
+    """The HlsVariant a segment of `url` should map, or None for a stream with no choice to
+    make. A URL with a provider login in it never gets the playlist read (pick_hls_variant)."""
+    if not is_hls_url(url):
+        return None
+    from .accounts import parse_stream_url_parts
+    if parse_stream_url_parts(url) is not None:
+        return None
+    known = state.hls_variants.get(url) if state is not None else None
+    if known is not None:
+        return known
+    variant = pick_hls_variant(cfg, url)
+    if state is not None and variant is not None and variant.offered:
+        state.hls_variants[url] = variant
+    return variant
 
 
 def _launch_segment(app, recording_id: int, seg_num: int) -> str:
@@ -1825,14 +1865,11 @@ def _launch_segment(app, recording_id: int, seg_num: int) -> str:
 
         # -re is mandatory when segment_duration_seconds bounds this segment (-t is a
         # content-time limit, dev/changelog/437); otherwise it is the channel's setting, the
-        # Settings default, or the watchdog's automatic pacing for this run - see
-        # resolve_capture_pacing and dev/changelog/997.
+        # Settings default - see resolve_capture_pacing.
         segment_duration = cfg['recording']['segment_duration_seconds']
-        pace_state = get_state(recording_id)
         channel = rec.channel if rec.channel_id else None
         pace, pace_source = resolve_capture_pacing(
-            cfg, channel.pace_realtime if channel is not None else None, segment_duration,
-            pace_state is not None and rec.channel_id in pace_state.auto_paced_channel_ids)
+            cfg, channel.pace_realtime if channel is not None else None, segment_duration)
         # The recording's seat may be on one of the account's listed logins: if the server
         # refused that login since the last segment, the seat moves to another login with
         # a free one, and either way this segment is launched with the seated login's
@@ -1847,8 +1884,10 @@ def _launch_segment(app, recording_id: int, seg_num: int) -> str:
             connlim.reseat_if_refused(channel.account_id, 'recording', recording_id)
             launch_url, _login_id = render_held_login(rec.url, channel.account_id,
                                                       'recording', recording_id)
+        hls_variant = _hls_variant_for(get_state(recording_id), launch_url, cfg)
         cmd = build_capture_cmd(cfg, launch_url, seg_path, segment_duration,
-                                pace_realtime=pace, keep_video_track=True)
+                                pace_realtime=pace, keep_video_track=True,
+                                hls_program=hls_variant.program if hls_variant else 0)
         log.info('Recording %d seg %d: %s', recording_id, seg_num,
                  mask_creds_in_text(' '.join(cmd)))
 
@@ -1917,6 +1956,12 @@ def _launch_segment(app, recording_id: int, seg_num: int) -> str:
             if pace:
                 detail += (f', reading the stream at real-time speed '
                            f'({_PACING_NOTES[pace_source]})')
+            if hls_variant and hls_variant.offered > 1:
+                detail += (f', recording {hls_variant.label or "the best"} of the '
+                           f'{hls_variant.offered} qualities its playlist offers')
+            elif hls_variant and not hls_variant.offered:
+                detail += (', recording the first quality its playlist lists, since the '
+                           'playlist could not be read to choose one')
             # The version that captured it, which a support bundle built after an upgrade
             # cannot tell from its own. Segment 1 only: every extra_data renders as a
             # disclosure in the event log, and one per reconnect is clutter

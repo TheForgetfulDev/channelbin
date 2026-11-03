@@ -36,7 +36,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import app.recorder as recorder  # noqa: E402
 from app import db  # noqa: E402
 from app.database import (  # noqa: E402
-    RECORDING_FAILED, RECORDING_FAILED_DEAD_STREAM, Recording, RecordingEvent,
+    Alert, CAPTURE_GAVE_UP, RECORDING_FAILED, RECORDING_FAILED_DEAD_STREAM, Recording,
+    RecordingEvent,
 )
 from tests.support import seed  # noqa: E402
 from tests.support.watchdog import RestartHarness  # noqa: E402
@@ -97,6 +98,7 @@ class _FailureCauseHarness(RestartHarness):
 class DeadStreamAbortNamesCauseTests(_FailureCauseHarness):
 
     def test_dead_stream_abort_detail_quotes_the_ffmpeg_error(self):
+        self._nothing_captured()
         # dead_stream_max_retry_attempts=0: keep this test on the immediate give-up path -
         # the retry path is exercised separately in tests/test_dead_stream_retry.py.
         self._extra_watchdog_cfg = {'early_fail_abort_count': 1, 'dead_stream_max_retry_attempts': 0}
@@ -114,6 +116,7 @@ class DeadStreamAbortNamesCauseTests(_FailureCauseHarness):
             f'the ERROR log (source of the alert body) named no cause: {logs.output!r}')
 
     def test_dead_stream_abort_masks_credentials_in_the_quoted_cause(self):
+        self._nothing_captured()
         # dead_stream_max_retry_attempts=0: keep this test on the immediate give-up path -
         # the retry path is exercised separately in tests/test_dead_stream_retry.py.
         self._extra_watchdog_cfg = {'early_fail_abort_count': 1, 'dead_stream_max_retry_attempts': 0}
@@ -135,6 +138,7 @@ class DeadStreamAbortNamesCauseTests(_FailureCauseHarness):
 class MaxConsecutiveFailuresAbortNamesCauseTests(_FailureCauseHarness):
 
     def test_max_consecutive_failures_abort_detail_quotes_the_ffmpeg_error(self):
+        self._nothing_captured()
         self._extra_watchdog_cfg = {'max_consecutive_failures': 1}
         self._exited_capture(code=8, stderr_text='[http @ 0x1] HTTP error 405 Method Not Allowed\n')
         with mock.patch.object(recorder, 'failover_group_member', return_value=False), \
@@ -148,6 +152,36 @@ class MaxConsecutiveFailuresAbortNamesCauseTests(_FailureCauseHarness):
         self.assertTrue(
             any('HTTP error 405 Method Not Allowed' in line for line in logs.output),
             f'the ERROR log (source of the alert body) named no cause: {logs.output!r}')
+
+
+class GiveUpHoldingDataNamesCauseTests(_FailureCauseHarness):
+    """The same promise on the give-up that keeps what was captured (dev/changelog/1404): the
+    row, the log line and the alert all carry ffmpeg's reason, masked."""
+
+    def _give_up(self):
+        self._extra_watchdog_cfg = {'early_fail_abort_count': 1,
+                                    'dead_stream_max_retry_attempts': 0}
+        with mock.patch.object(recorder, 'failover_group_member', return_value=False), \
+             mock.patch('app.concatenator.do_concatenation'):
+            self._run_until_event(CAPTURE_GAVE_UP, stall_timeout=1, restart_delay=0,
+                                  produces_data=False)
+        return self._terminal_event(CAPTURE_GAVE_UP)
+
+    def test_it_quotes_the_ffmpeg_error(self):
+        self._exited_capture(code=8, stderr_text='[http @ 0x1] HTTP error 405 Method Not Allowed\n')
+        self.assertIn('HTTP error 405 Method Not Allowed', self._give_up().detail)
+
+    def test_it_masks_credentials_in_the_quoted_cause(self):
+        self._exited_capture_with_stderr_file(
+            code=8,
+            stderr_text=('[http @ 0x1] Error opening input file '
+                         'http://host.example/live/realuser/realpass/2077000\n'))
+        evt = self._give_up()
+        self.assertIn('/live/***/***/2077000', evt.detail)
+        for row in [evt] + Alert.query.filter_by(recording_id=self.rid).all():
+            text = getattr(row, 'detail', None) or getattr(row, 'body', None)
+            self.assertNotIn('realuser', text)
+            self.assertNotIn('realpass', text)
 
 
 if __name__ == '__main__':

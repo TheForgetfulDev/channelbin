@@ -21,6 +21,8 @@ import re
 import unittest
 
 from app.database import DIAGNOSTICS, REC_STATUS_COMPLETED
+from app.hole_repair import DIAGNOSTIC_KIND
+from app.probe import scan_timeline_jumps
 from sim import answer_key as ak
 
 from .support import CAPTURE_LOOPS, CHANNEL_LOOP, CaptureCase
@@ -103,6 +105,23 @@ class SharedLoginCutoffScenario(CaptureCase):
                                        delta=0.1 * reconnects + 0.3,
                                        msg=f'{event.detail}\n{answer.describe()}')
                 self.assertIn(f'{sum(replays):.1f} s in all', event.detail)
+
+                # About one reconnect in three cuts inside a frame of both streams and
+                # leaves a hole as long as the replay (dev/changelog/1407). Whether this
+                # run drew one or not, the file the user gets plays straight through: a
+                # reported hole is closed by the join and said, and the joined file's
+                # video never jumps by more than a frame or two.
+                holes = extra.get('reconnect_hole_seconds') or []
+                repaired = [e for e in self.events(rid, DIAGNOSTICS)
+                            if json.loads(e.extra_data or '{}').get('kind') == DIAGNOSTIC_KIND]
+                if holes:
+                    self.assertEqual(len(repaired), 1, self.event_types(rid))
+                    closed = json.loads(repaired[0].extra_data)['closed_seconds']
+                    self.assertEqual(len(closed), len(holes), repaired[0].detail)
+                else:
+                    self.assertEqual(repaired, [])
+                video = scan_timeline_jumps(self.joined_path(rid)).get(0, {})
+                self.assertEqual(video.get('jumps'), [], f'{holes} {video}')
 
 
 if __name__ == '__main__':

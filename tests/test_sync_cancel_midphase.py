@@ -414,6 +414,16 @@ class DoSyncCancelTests(unittest.TestCase):
                                      _xmltv([('ch1.test', 60, 30)]))
         rebuild.assert_not_called()
 
+    def test_a_finished_sync_asks_for_only_what_changed(self):
+        # dev/changelog/1416: a full rebuild per sync is the cost that grows with the install.
+        with mock.patch('app.search_index.rebuild_search_indexes') as rebuild, \
+                mock.patch('app.accounts.requests.get',
+                           side_effect=_fake_get_factory(_playlist(3),
+                                                         _xmltv([('ch1.test', 60, 30)]))):
+            _do_sync(self.account_id, threading.Event())
+        rebuild.assert_called_once()
+        self.assertIs(rebuild.call_args.kwargs.get('only_changes'), True)
+
     def test_uncancelled_sync_still_finishes_success(self):
         with mock.patch('app.accounts.requests.get',
                         side_effect=_fake_get_factory(_playlist(3),

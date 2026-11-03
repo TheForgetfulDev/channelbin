@@ -92,10 +92,10 @@ class ManualRebuildRouteTests(unittest.TestCase):
         release = threading.Event()
         original = SI._rebuild_one
 
-        def _blocking(name, reason):
+        def _blocking(name, reason, only_changes=False):
             started.set()
             release.wait(10)
-            return original(name, reason)
+            return original(name, reason, only_changes)
 
         SI._rebuild_one = _blocking
         try:
@@ -242,7 +242,7 @@ class ConcurrentRebuildTests(unittest.TestCase):
         state = {'active': 0, 'overlapped': False}
         original = SI._rebuild_one
 
-        def _watched(name, reason):
+        def _watched(name, reason, only_changes=False):
             with counter_lock:
                 state['active'] += 1
                 if state['active'] > 1:
@@ -250,7 +250,7 @@ class ConcurrentRebuildTests(unittest.TestCase):
             # Wide enough that an unserialized second caller lands inside this window.
             time.sleep(0.05)
             try:
-                return original(name, reason)
+                return original(name, reason, only_changes)
             finally:
                 with counter_lock:
                     state['active'] -= 1
@@ -281,9 +281,9 @@ class ConcurrentRebuildTests(unittest.TestCase):
         seen = []
         original = SI._rebuild_one
 
-        def _watched(name, reason):
+        def _watched(name, reason, only_changes=False):
             seen.append(SI.rebuild_in_progress())
-            return original(name, reason)
+            return original(name, reason, only_changes)
 
         _seed_searchable()
         SI._rebuild_one = _watched

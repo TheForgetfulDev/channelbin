@@ -176,13 +176,14 @@ class RecordingDiagnosticsTests(unittest.TestCase):
         """gather_health_data is the measure gate: with it off, nothing is measured for its
         own sake. A stream copy's source is still scanned, because whether that source may
         be deleted is decided against it (dev/changelog/1200), the same way damage repair
-        has always run its own scan regardless of the gate."""
+        has always run its own scan regardless of the gate. So are its track ends, for the
+        same reason (dev/changelog/1424)."""
         self._run(self._ts(self.clean_src),
                   self._config(convert=True, fmt='mkv', gather_health_data=False))
 
         kinds = sorted(json.loads(e.extra_data or '{}').get('kind')
                        for e in self._events(DIAGNOSTICS))
-        self.assertEqual(kinds, ['output_timeline_scan', 'timeline_scan'])
+        self.assertEqual(kinds, ['output_timeline_scan', 'timeline_scan', 'track_ends'])
 
     def test_damage_repair_survives_health_gathering_being_off(self):
         """The act path has always run its own scan regardless of gather_health_data;
