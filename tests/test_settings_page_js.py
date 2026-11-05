@@ -3,7 +3,7 @@
 The view, the query and the changed-from-default chip are three inputs to one filter
 function in static/js/settings.js (DESIGN.md 15.9, dev/changelog/1005 and 1006), which also
 dims a row whose gate is off from the gating controls' live values (1007). The server
-renders all 146 rows either way, so what Basic hides, what a filter in Basic brings back,
+renders every row either way, so what Basic hides, what a filter in Basic brings back,
 how it says so, and what gets saved are all browser behavior - none of it is visible from a
 response body.
 
@@ -28,6 +28,9 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from tests.support.app import make_test_app  # noqa: E402
+from tests.support.settings_page import (  # noqa: E402
+    BASIC_SETTINGS, card_paths, declared_setting_paths, page_cards,
+)
 from app.routes.settings import SETTINGS_VIEW_PREF  # noqa: E402
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -36,7 +39,9 @@ JSDOM = os.path.join(REPO, 'node_modules', 'jsdom')
 
 # The cards with no Basic field (DESIGN.md 15.9). System is not here: its LAN-exposure
 # warning has no tier and shows whenever the bind address is open.
-EMPTY_IN_BASIC = {'watchdog': 12, 'http': 1, 'logging': 2, 'backups': 4, 'debug': 2}
+EMPTY_IN_BASIC = ('watchdog', 'http', 'logging', 'backups', 'debug')
+
+ALL_SETTINGS = declared_setting_paths()
 
 _RESULT = None
 
@@ -58,10 +63,12 @@ def _observe():
             resp = client.get('/settings')
             if resp.status_code != 200:
                 raise AssertionError(f'/settings answered {resp.status_code} for {name}')
+            html = resp.get_data(as_text=True)
             with open(os.path.join(tmp, f'{name}.html'), 'w', encoding='utf-8') as f:
-                f.write(resp.get_data(as_text=True))
+                f.write(html)
+            return html
 
-        snapshot('plain')
+        cards = page_cards(snapshot('plain'))
         # One Basic field (Recording) and two Advanced ones (Watchdog, Sync), saved the way
         # the page saves them.
         for path, value in (('recording.retention_days', 30),
@@ -78,7 +85,7 @@ def _observe():
                               capture_output=True, text=True, timeout=120, cwd=REPO)
         if proc.returncode != 0:
             raise AssertionError(f'harness failed:\n{proc.stdout[-2000:]}\n{proc.stderr[-4000:]}')
-        _RESULT = json.loads(proc.stdout)
+        _RESULT = {**json.loads(proc.stdout), '_cards': cards}
         return _RESULT
     finally:
         t.cleanup()
@@ -93,6 +100,7 @@ class _Base:
     @classmethod
     def setUpClass(cls):
         cls.obs = _observe()[cls.SCENARIO]
+        cls.cards = _observe()['_cards']
         if 'error' in cls.obs:
             raise AssertionError(f'{cls.SCENARIO} threw in the page:\n{cls.obs["error"]}')
 
@@ -105,7 +113,7 @@ class NeverChosenOpensInBasicTests(_Base, unittest.TestCase):
 
     def test_only_the_basic_fields_show(self):
         self.assertEqual(self.obs['view'], 'basic')
-        self.assertEqual(len(self.obs['shownPaths']), 28)
+        self.assertCountEqual(self.obs['shownPaths'], BASIC_SETTINGS)
         self.assertEqual(self.obs['checked'], ['basic'])
         self.assertEqual(self.obs['on'], ['basic'])
 
@@ -116,8 +124,9 @@ class NeverChosenOpensInBasicTests(_Base, unittest.TestCase):
         self.assertEqual(self.obs['posts'], [])
 
     def test_a_card_with_nothing_basic_collapses_with_its_count_and_stays_on_the_rail(self):
-        for sec, n in EMPTY_IN_BASIC.items():
+        for sec in EMPTY_IN_BASIC:
             with self.subTest(sec=sec):
+                n = len(card_paths(self.cards, sec))
                 s = self.obs['sections'][sec]
                 self.assertTrue(s['collapsed'])
                 self.assertEqual(s['head'], f"{n} advanced setting{'' if n == 1 else 's'}")
@@ -127,10 +136,13 @@ class NeverChosenOpensInBasicTests(_Base, unittest.TestCase):
     def test_a_split_card_says_how_many_more_are_in_advanced(self):
         rec = self.obs['sections']['recording']
         self.assertFalse(rec['collapsed'])
-        self.assertEqual(rec['rail'], '13')
-        self.assertEqual(rec['more'], '27 more in Advanced Show Advanced')
+        rows = card_paths(self.cards, 'recording')
+        basic = BASIC_SETTINGS.intersection(rows)
+        self.assertEqual(rec['rail'], str(len(basic)))
+        self.assertEqual(rec['more'], f'{len(rows) - len(basic)} more in Advanced Show Advanced')
+        rows = card_paths(self.cards, 'integrations')
         self.assertEqual(self.obs['sections']['integrations']['more'],
-                         '8 more in Advanced Show Advanced')
+                         f'{len(rows) - len(BASIC_SETTINGS.intersection(rows))} more in Advanced Show Advanced')
 
     def test_a_group_with_nothing_basic_hides_its_heading(self):
         self.assertEqual(self.obs['sections']['recording']['hiddenGroups'],
@@ -141,7 +153,8 @@ class NeverChosenOpensInBasicTests(_Base, unittest.TestCase):
         self.assertEqual(self.obs['sections']['integrations']['hiddenUnits'], 0)
 
     def test_the_search_box_counts_every_setting_because_search_reaches_all_of_them(self):
-        self.assertEqual(self.obs['placeholder'], 'Search 146 settings by name, description or key')
+        self.assertEqual(self.obs['placeholder'],
+                         f'Search {len(ALL_SETTINGS)} settings by name, description or key')
 
 
 class SearchInBasicTests(_Base, unittest.TestCase):
@@ -163,13 +176,13 @@ class SearchInBasicTests(_Base, unittest.TestCase):
 
     def test_counts_are_matches_and_spelled_right(self):
         during = self.obs['during']
-        self.assertEqual(during['chip'], '11 of 146 settings')
+        self.assertEqual(during['chip'], f'11 of {len(ALL_SETTINGS)} settings')
         self.assertEqual(during['sections']['watchdog']['head'], '5 matches')
         self.assertIsNone(during['sections']['recording']['more'])
 
     def test_clearing_the_search_goes_back_to_basic_and_saves_nothing(self):
         cleared = self.obs['cleared']
-        self.assertEqual(len(cleared['shownPaths']), 28)
+        self.assertCountEqual(cleared['shownPaths'], BASIC_SETTINGS)
         self.assertIsNone(cleared['notice'])
         self.assertEqual(self.obs['posts'], [])
 
@@ -182,7 +195,7 @@ class NoticeSwitchTests(_Base, unittest.TestCase):
         self.assertIsNone(self.obs['after']['notice'])
         self.assertEqual(self.obs['posts'],
                          [{'path': f'/api/user-prefs/{SETTINGS_VIEW_PREF}', 'body': {'value': True}}])
-        self.assertEqual(len(self.obs['cleared']['shownPaths']), 146)
+        self.assertCountEqual(self.obs['cleared']['shownPaths'], ALL_SETTINGS)
 
 
 class FooterSwitchTests(_Base, unittest.TestCase):
@@ -190,7 +203,7 @@ class FooterSwitchTests(_Base, unittest.TestCase):
 
     def test_a_card_footer_switches_the_whole_page_and_saves_it(self):
         self.assertEqual(self.obs['view'], 'advanced')
-        self.assertEqual(len(self.obs['shownPaths']), 146)
+        self.assertCountEqual(self.obs['shownPaths'], ALL_SETTINGS)
         self.assertEqual(self.obs['posts'],
                          [{'path': f'/api/user-prefs/{SETTINGS_VIEW_PREF}', 'body': {'value': True}}])
 
@@ -202,12 +215,12 @@ class SavedAdvancedTests(_Base, unittest.TestCase):
         opened = self.obs['opened']
         self.assertEqual(opened['view'], 'advanced')
         self.assertEqual(opened['checked'], ['advanced'])
-        self.assertEqual(len(opened['shownPaths']), 146)
+        self.assertCountEqual(opened['shownPaths'], ALL_SETTINGS)
         self.assertFalse(any(s['collapsed'] for s in opened['sections'].values()))
         self.assertFalse(any(s['more'] for s in opened['sections'].values()))
 
     def test_switching_back_saves_basic_once(self):
-        self.assertEqual(len(self.obs['switched']['shownPaths']), 28)
+        self.assertCountEqual(self.obs['switched']['shownPaths'], BASIC_SETTINGS)
         self.assertEqual(self.obs['posts'],
                          [{'path': f'/api/user-prefs/{SETTINGS_VIEW_PREF}', 'body': {'value': False}}])
 
@@ -244,7 +257,7 @@ class ChangedChipTests(_Base, unittest.TestCase):
 
     def test_the_counts_say_changed(self):
         on = self.obs['on']
-        self.assertEqual(on['chip'], '3 of 146 settings')
+        self.assertEqual(on['chip'], f'3 of {len(ALL_SETTINGS)} settings')
         self.assertEqual(on['sections']['recording']['head'], '1 changed')
         self.assertEqual(on['sections']['watchdog']['head'], '1 changed')
         self.assertFalse(on['sections']['watchdog']['collapsed'])
@@ -273,7 +286,7 @@ class ChangedChipTests(_Base, unittest.TestCase):
 
     def test_turning_it_off_goes_back_to_basic_and_saves_nothing(self):
         off = self.obs['off']
-        self.assertEqual(len(off['shownPaths']), 28)
+        self.assertCountEqual(off['shownPaths'], BASIC_SETTINGS)
         self.assertIsNone(off['notice'])
         self.assertEqual(off['changedChip']['active'], False)
         self.assertEqual(self.obs['posts'], [])
@@ -307,7 +320,7 @@ class NothingChangedTests(_Base, unittest.TestCase):
                          {'active': False, 'pressed': 'false', 'disabled': True, 'count': '0'})
 
     def test_a_disabled_chip_does_nothing(self):
-        self.assertEqual(len(self.obs['clicked']['shownPaths']), 28)
+        self.assertCountEqual(self.obs['clicked']['shownPaths'], BASIC_SETTINGS)
         self.assertIsNone(self.obs['clicked']['verdict'] or None)
 
 
@@ -319,7 +332,7 @@ class NothingChangedReloadTests(_Base, unittest.TestCase):
         self.assertEqual(opened['verdict'],
                          'No setting on this page is changed from its default. Show all settings')
         self.assertEqual(opened['changedChip']['disabled'], False)
-        self.assertEqual(len(self.obs['cleared']['shownPaths']), 28)
+        self.assertCountEqual(self.obs['cleared']['shownPaths'], BASIC_SETTINGS)
         self.assertIsNone(self.obs['cleared']['verdict'] or None)
 
 

@@ -238,6 +238,10 @@
          freezeNameCol() in channel-search.js before touching the tracks. #}
       <div class="atable" id="atable">
         <div class="arow-head" id="ahead"></div>
+        {# Programs only, written by renderNameNotice() in channel-search.js, which moves it
+           above #all-empty when there are no rows. Served hidden, the nothing-active state.
+           Outside #ch-list so it does not scroll sideways with the rows. dev/changelog/1437 #}
+        <div class="notice-banner notice-banner-ok cs-name-notice" id="cs-name-notice" style="display:none" role="status"></div>
         <div id="ch-list"></div>
       </div>
       <div class="empty-state cs-empty" id="all-empty" style="display:none"></div>

@@ -14,6 +14,9 @@ What this file pins, and why each matters:
     anywhere, which is why each input gets its own test.
   - WhereTheFoldIsOffTests: the group picker and the airing grain keep provider duplicates
     on screen and still fold URL duplicates.
+  - FoldFollowsTheResultsTests, FoldFollowsTheResultsOnAiringsTests,
+    AddBackRespectsGroupCollapseTests, FacetsAgreeWithTheirFilterTests: a duplicate is hidden only while its kept copy is in the
+    results, and the count line and the facets say the same (dev/docs/BUGS.md 2026-11-04).
 
 URL-key flagging itself is tests/test_duplicate_flag_recompute.py. No network, no ffmpeg.
 Run standalone:
@@ -30,11 +33,13 @@ from app import db, duplicate_streams  # noqa: E402
 from app import account_links as links  # noqa: E402
 from app import channel_hiding  # noqa: E402
 from app.channel_search import (  # noqa: E402
-    GRAIN_AIRINGS, OTHER_DUP_URL, OTHER_PROVIDER, DimensionFilter, SearchContext,
-    SearchState, search)
+    GRAIN_AIRINGS, GRAIN_CHANNELS, GROUP_ANY, OTHER_DUP_URL, OTHER_PROVIDER, DimensionFilter,
+    SearchContext, SearchState, search, search_counts, search_facets)
 from app.channel_search_rows import (  # noqa: E402
     KEEP_REASON_HEALTH, KEEP_REASON_ID, KEEP_REASON_IN_FEED, build_rows)
-from app.database import Channel, ChannelGroupMember  # noqa: E402
+from app.accounts import NORM_DISABLED, NORM_MPEGTS  # noqa: E402
+from app.database import (  # noqa: E402
+    Account, Channel, ChannelGroupMember, EPGEntry, Tag, TagPattern)
 from tests.support import make_test_app  # noqa: E402
 from tests.support import seed  # noqa: E402
 from tests.support.search import only_hiding  # noqa: E402
@@ -453,6 +458,411 @@ class WhereTheFoldIsOffTests(_Case):
         self.assertEqual(resp.status_code, 200, resp.get_data(as_text=True))
         names = sorted(r['name'] for r in resp.get_json()['rows'] if r['kind'] == 'channel')
         self.assertEqual(names, ['provider copy', 'provider kept', 'url kept'])
+
+
+def _cat(*values):
+    return (DimensionFilter('cat', tuple(values)),)
+
+
+class FoldFollowsTheResultsTests(_Case):
+    """dev/docs/BUGS.md 2026-11-04. The provider listed NHL Network twice at one URL: the guide
+    copy was kept across the whole table, a category filter removed it, and the other copy was
+    still hidden, so the channel appeared in neither."""
+
+    def setUp(self):
+        super().setUp()
+        self.kept = self.channel(self.other, 1, host='shared.example', name='NHL Network',
+                                 category_name='TV Guide', in_guide=True)
+        self.copy = self.channel(self.other, 1, host='shared.example', name='US NHL Network',
+                                 category_name='NHL Package')
+        self.bystander = self.channel(self.other, 2, name='Hockey Night',
+                                      category_name='NHL Package')
+        self.fold()
+
+    def result(self, **kw):
+        kw.setdefault('standing', only_hiding('showdup'))
+        kw.setdefault('facets', ())
+        return search(SearchState(**kw), SearchContext.build())
+
+    def test_a_filter_that_removes_the_kept_copy_brings_the_other_back(self):
+        self.assertEqual(self.names(filters=_cat('NHL Package')),
+                         ['Hockey Night', 'US NHL Network'])
+
+    def test_the_count_line_follows_the_rows(self):
+        """"1 duplicates" beside a list that does not show the kept copy is the reported bug."""
+        result = self.result(filters=_cat('NHL Package'))
+        self.assertEqual(result.total, 2)
+        self.assertEqual(result.standing_hidden, {})
+
+    def test_with_the_kept_copy_out_every_other_copy_shows(self):
+        """None of them was the one chosen, so none of them folds into another."""
+        self.channel(self.other, 1, host='shared.example', name='Third copy',
+                     category_name='NHL Package')
+        self.fold()
+        result = self.result(filters=_cat('NHL Package'))
+        self.assertEqual(sorted(r.name for r in result.rows),
+                         ['Hockey Night', 'Third copy', 'US NHL Network'])
+        self.assertEqual(result.standing_hidden, {})
+
+    def test_the_kept_copy_in_the_results_still_folds_the_other(self):
+        result = self.result()
+        self.assertEqual(sorted(r.name for r in result.rows), ['Hockey Night', 'NHL Network'])
+        self.assertEqual(result.standing_hidden, {'showdup': 1})
+
+    def test_a_filter_both_copies_pass_still_folds(self):
+        self.copy.category_name = 'TV Guide'
+        db.session.commit()
+        self.assertEqual(self.names(filters=_cat('TV Guide')), ['NHL Network'])
+
+    def test_an_account_filter_that_removes_the_kept_copy_brings_the_other_back(self):
+        self.link(self.curated, self.direct)
+        self.channel(self.curated, 7, name='Curated copy', in_guide=True)
+        self.channel(self.direct, 7, name='Direct copy')
+        self.fold()
+        by_account = (DimensionFilter('acct', (str(self.direct.id),)),)
+        self.assertEqual(self.names(filters=by_account), ['Direct copy'])
+
+    def test_typed_text_that_misses_the_kept_copy_brings_the_other_back(self):
+        """Names differ on most hidden copies on the production database, so a search for one
+        found nothing and reported a duplicate of something it did not show."""
+        self.assertEqual(self.names(q='"US NHL"'), ['US NHL Network'])
+
+    def test_typed_text_matching_both_copies_still_folds(self):
+        result = self.result(q='Network')
+        self.assertEqual([r.name for r in result.rows], ['NHL Network'])
+        self.assertEqual(result.standing_hidden, {'showdup': 1})
+
+    def test_which_copy_is_kept_does_not_move(self):
+        self.names(filters=_cat('NHL Package'))
+        self.assertEqual(self.losers(), ['US NHL Network'])
+        result = self.result(filters=_cat('NHL Package'))
+        self.assertEqual(result.kept_ids, frozenset())
+
+    def test_a_standing_option_that_removes_the_kept_copy_brings_the_other_back(self):
+        """"Show channels with no EPG data" off takes out a kept copy with no guide. Hiding its
+        duplicate as well, which has one, would lose the channel."""
+        seed.make_epg_entry(self.copy, title='Hockey')
+        db.session.commit()
+        names = self.names(standing=only_hiding('showdup', 'shownoepg'))
+        self.assertEqual(names, ['US NHL Network'])
+
+    def test_not_normalized_takes_a_kept_copy_only_where_accounts_differ(self):
+        """One account normalizes and one does not, so the option can take the kept copy and leave
+        the other. Where both do, it takes the pair, which the unfiltered page relies on to skip
+        the check."""
+        hiding = only_hiding('showdup', 'shownotnorm')
+        normalizes = seed.make_account(name='normalizes', url_normalization=NORM_MPEGTS,
+                                       last_sync_at=self.now)
+        leaves_alone = seed.make_account(name='leaves-alone', url_normalization=NORM_DISABLED,
+                                         last_sync_at=self.now)
+        db.session.commit()
+        kept = self.channel(normalizes, 9, host='raw.example', name='Raw kept', in_guide=True,
+                            url_normalizable=False)
+        copy = self.channel(leaves_alone, 9, host='raw.example', name='Raw copy',
+                            url_normalizable=False)
+        kept.provider_stream_id = copy.provider_stream_id = None
+        self.fold()
+        self.assertEqual(self.losers().count('Raw copy'), 1)
+        self.assertIn('Raw copy', self.names(standing=hiding))
+
+        Account.query.update({'url_normalization': NORM_MPEGTS})
+        db.session.commit()
+        names = self.names(standing=hiding)
+        self.assertNotIn('Raw copy', names)
+        self.assertNotIn('Raw kept', names)
+
+    def test_a_kept_copy_folded_into_its_group_is_still_there(self):
+        """The group's row stands for it, so its duplicate stays hidden."""
+        seed.make_group(name='NHL', members=[self.kept])
+        self.kept.in_guide = False
+        db.session.commit()
+        self.fold()
+        names = self.names(standing=only_hiding('showdup', 'showmembers'))
+        self.assertEqual(names, ['Hockey Night'])
+
+    def test_show_duplicates_ticked_shows_every_copy_as_before(self):
+        self.assertEqual(self.names(standing=only_hiding()),
+                         ['Hockey Night', 'NHL Network', 'US NHL Network'])
+
+    def test_the_row_says_why_it_is_on_the_page(self):
+        """Principle 1: a copy the option would normally hide says why it is here. The kept copy
+        leads `others`, which is what the tooltip names."""
+        state = SearchState(standing=only_hiding('showdup'), facets=(), filters=_cat('NHL Package'))
+        ctx = SearchContext.build()
+        rows = {r['name']: r for r in build_rows(search(state, ctx), state, ctx)}
+        dup = rows['US NHL Network']['dup']
+        self.assertTrue(dup['kept_absent'])
+        self.assertEqual(dup['others'][0]['id'], self.kept.id)
+        self.assertEqual(dup['kept_id'], self.kept.id)
+
+    def test_the_row_makes_no_such_claim_when_nothing_is_being_hidden(self):
+        state = SearchState(standing=only_hiding(), facets=())
+        ctx = SearchContext.build()
+        rows = {r['name']: r for r in build_rows(search(state, ctx), state, ctx)}
+        self.assertFalse(rows['US NHL Network']['dup']['kept_absent'])
+        self.assertFalse(rows['NHL Network']['dup']['kept_absent'])
+
+    def test_the_row_makes_no_such_claim_for_a_provider_copy_left_unfolded(self):
+        """The airing grain never hides these, so being there says nothing about the kept copy."""
+        self.link(self.curated, self.direct)
+        kept = self.channel(self.curated, 7, name='Curated copy', in_guide=True)
+        copy = self.channel(self.direct, 7, name='Direct copy')
+        self.fold()
+        seed.make_epg_entry(kept, title='Show')
+        seed.make_epg_entry(copy, title='Show')
+        db.session.commit()
+        state = SearchState(grain=GRAIN_AIRINGS, standing=only_hiding('showdup'), facets=())
+        ctx = SearchContext.build()
+        rows = build_rows(search(state, ctx), state, ctx)
+        dups = {r['channel']['name']: r['channel']['dup'] for r in rows
+                if r['channel']['name'] in ('Curated copy', 'Direct copy')}
+        self.assertEqual(sorted(dups), ['Curated copy', 'Direct copy'])
+        self.assertFalse(dups['Direct copy']['kept_absent'])
+
+
+class FoldFollowsTheResultsOnAiringsTests(_Case):
+    """The same rule on Programs, where being in the results means having a showing in them."""
+
+    def setUp(self):
+        super().setUp()
+        self.kept = self.channel(self.other, 1, host='shared.example', name='NHL Network',
+                                 category_name='TV Guide', in_guide=True)
+        self.copy = self.channel(self.other, 1, host='shared.example', name='NHL Network copy',
+                                 category_name='NHL Package')
+        self.fold()
+
+    def rows(self, **kw):
+        kw.setdefault('standing', only_hiding('showdup'))
+        kw.setdefault('facets', ())
+        state = SearchState(grain=GRAIN_AIRINGS, **kw)
+        result = search(state, SearchContext.build())
+        return result, sorted((e.channel_id, e.title) for e in result.rows)
+
+    def both_carry(self, title='Flyers at Penguins'):
+        seed.make_epg_entry(self.kept, title=title)
+        seed.make_epg_entry(self.copy, title=title)
+        db.session.commit()
+
+    def test_a_listing_on_both_copies_is_found_with_the_kept_copy_filtered_out(self):
+        """The reported search: the listing exists twice and appeared on neither."""
+        self.both_carry()
+        result, rows = self.rows(filters=_cat('NHL Package'))
+        self.assertEqual(rows, [(self.copy.id, 'Flyers at Penguins')])
+        self.assertEqual(result.total, 1)
+        self.assertEqual(result.channels_matched, 1)
+        self.assertEqual(result.standing_hidden, {})
+
+    def test_a_listing_on_both_copies_shows_once_with_no_filter(self):
+        self.both_carry()
+        result, rows = self.rows()
+        self.assertEqual(rows, [(self.kept.id, 'Flyers at Penguins')])
+        self.assertEqual(result.standing_hidden, {'showdup': 1})
+
+    def test_a_kept_copy_with_no_guide_does_not_hide_the_one_with_a_guide(self):
+        """Nothing filtered at all. 96 of the channels this grain folds are in this shape on the
+        production database, which hid 4,424 listings."""
+        seed.make_epg_entry(self.copy, title='Only here')
+        db.session.commit()
+        result, rows = self.rows()
+        self.assertEqual(rows, [(self.copy.id, 'Only here')])
+        self.assertEqual(result.standing_hidden, {})
+
+    def test_a_kept_copy_whose_showings_have_all_ended_does_not_hide_the_other(self):
+        seed.make_epg_entry(self.kept, title='Earlier', offset_minutes=-300)
+        seed.make_epg_entry(self.copy, title='Later', offset_minutes=60)
+        db.session.commit()
+        _result, rows = self.rows(standing=only_hiding('showdup', 'showpast'))
+        self.assertEqual(rows, [(self.copy.id, 'Later')])
+
+    def test_typed_text_only_the_other_copy_matches_is_found(self):
+        seed.make_epg_entry(self.kept, title='Something else')
+        seed.make_epg_entry(self.copy, title='Flyers at Penguins')
+        db.session.commit()
+        _result, rows = self.rows(q='Flyers')
+        self.assertEqual(rows, [(self.copy.id, 'Flyers at Penguins')])
+
+    def test_the_counts_only_endpoint_says_the_same_as_the_rows(self):
+        self.both_carry()
+        state = SearchState(grain=GRAIN_AIRINGS, standing=only_hiding('showdup'),
+                            filters=_cat('NHL Package'))
+        hidden, total, _pages, _groups, matched = search_counts(state, SearchContext.build())
+        self.assertEqual((hidden, total, matched), ({}, 1, 1))
+
+
+class AddBackRespectsGroupCollapseTests(_Case):
+    """A copy added back to a facet count still has to survive "Collapse channel groups". With a
+    filter on another dimension the collapse ranks over the same rows either way, so the facet
+    can be held to the list's own total."""
+
+    def setUp(self):
+        super().setUp()
+        kept = self.channel(self.other, 1, host='a.example', name='Kept', category_name='Guide',
+                            in_guide=True)
+        self.copy = self.channel(self.other, 1, host='a.example', name='Copy',
+                                 category_name='Package', health_score=30.0)
+        self.member = self.channel(self.other, 2, name='Member', category_name='Package',
+                                   health_score=60.0)
+        seed.make_group(name='Feeds', members=[self.copy, self.member])
+        db.session.commit()
+        self.fold()
+        for ch in (kept, self.copy, self.member):
+            seed.make_epg_entry(ch, title='The game', start_time=self.now + timedelta(hours=1))
+        db.session.commit()
+
+    def counts(self):
+        state = SearchState(grain=GRAIN_AIRINGS, filters=_cat('Package'),
+                            standing=only_hiding('showdup', 'grpdedup'))
+        ctx = SearchContext.build()
+        result = search(state, ctx)
+        return result.total, sum(search_facets(state, SearchContext.build())['acct'].values())
+
+    def test_a_copy_the_collapse_folds_is_not_added_back(self):
+        total, facet = self.counts()
+        self.assertEqual(total, 1)
+        self.assertEqual(facet, 1)
+
+    def test_a_copy_the_collapse_keeps_is_added_back(self):
+        self.copy.health_score = 90.0
+        db.session.commit()
+        self.fold()
+        total, facet = self.counts()
+        self.assertEqual(total, 1)
+        self.assertEqual(facet, 1)
+        state = SearchState(grain=GRAIN_AIRINGS, filters=_cat('Package'),
+                            standing=only_hiding('showdup', 'grpdedup'))
+        rows = search(state, SearchContext.build()).rows
+        self.assertEqual([e.channel_id for e in rows], [self.copy.id])
+
+
+class FacetsAgreeWithTheirFilterTests(_Case):
+    """A facet count says what picking that value gives. On the production database the obvious
+    count read 11,925 for an account whose filter returned 14,285 (dev/docs/BUGS.md 2026-11-04)."""
+
+    GRAIN_DIMENSIONS = {
+        GRAIN_CHANNELS: ('acct', 'cat', 'health', 'other', 'group', 'tag'),
+        GRAIN_AIRINGS: ('acct', 'cat', 'health', 'other', 'group', 'tag', 'when', 'dow'),
+    }
+
+    def setUp(self):
+        super().setUp()
+        self.link(self.curated, self.direct)
+        make = self.channel
+        # A URL pair split across categories and health bands.
+        make(self.other, 1, host='a.example', name='Hockey kept', category_name='Guide',
+             in_guide=True, health_score=95.0)
+        copy = make(self.other, 1, host='a.example', name='Hockey copy', category_name='Package',
+                    health_score=30.0)
+        # A URL pair in one category, which folds whichever way it is filtered.
+        make(self.other, 2, host='b.example', name='Soccer kept', category_name='Package',
+             in_guide=True, health_score=90.0)
+        make(self.other, 2, host='b.example', name='Soccer copy', category_name='Package',
+             health_score=90.0)
+        # A pair across two accounts, keyed by the provider, whose kept copy is in a group its
+        # duplicate is not, and the reverse.
+        linked_kept = make(self.curated, 7, name='Linked kept', category_name='Guide',
+                           in_guide=True)
+        linked_copy = make(self.direct, 7, name='Linked copy', category_name='Other')
+        grouped_kept = make(self.curated, 8, name='Grouped kept', category_name='Guide',
+                            in_guide=True)
+        grouped_copy = make(self.direct, 8, name='Grouped copy', category_name='Guide')
+        # A copy missing from the feed, so the Status facet has a value only it carries.
+        missing_kept = make(self.other, 3, host='c.example', name='Fading kept',
+                            category_name='Package')
+        make(self.other, 3, host='c.example', name='Fading copy', category_name='Package',
+             last_seen_at=self.now - timedelta(days=30))
+        make(self.other, 4, name='Alone', category_name='Package', health_score=60.0)
+        seed.make_group(name='Both', members=[grouped_kept, grouped_copy])
+        seed.make_group(name='Only copy', members=[copy, linked_copy])
+        seed.make_group(name='Only kept', members=[linked_kept], in_guide=False)
+        tag = Tag(name='hockey-tag')
+        db.session.add(tag)
+        db.session.flush()
+        db.session.add(TagPattern(tag_id=tag.id, pattern='Hockey'))
+        db.session.commit()
+        self.fold()
+        for ch in Channel.query.all():
+            title = f'Hockey on {ch.name}' if 'Linked' in ch.name else f'Show on {ch.name}'
+            seed.make_epg_entry(ch, title=title, offset_minutes=-10)
+            seed.make_epg_entry(ch, title=title, offset_minutes=120)
+        # The kept copy of this cluster has no guide at all.
+        EPGEntry.query.filter_by(channel_id=missing_kept.id).delete()
+        db.session.commit()
+
+    def total_for(self, state, key, value):
+        narrowed = [f for f in state.filters if f.key != key] + [DimensionFilter(key, (value,))]
+        picked = SearchState(grain=state.grain, q=state.q, standing=state.standing,
+                             filters=tuple(narrowed), facets=())
+        return search(picked, SearchContext.build()).channel_total
+
+    def assert_facets_agree(self, **kw):
+        kw.setdefault('standing', only_hiding('showdup'))
+        grain = kw.setdefault('grain', GRAIN_CHANNELS)
+        state = SearchState(**kw)
+        facets = search_facets(state, SearchContext.build())
+        checked = 0
+        for key in self.GRAIN_DIMENSIONS[grain]:
+            for value, count in facets[key].items():
+                with self.subTest(grain=grain, dimension=key, value=value):
+                    self.assertEqual(count, self.total_for(state, key, value))
+                checked += 1
+        self.assertGreater(checked, 10)
+
+    def test_the_channel_facets_equal_what_picking_the_value_gives(self):
+        self.assert_facets_agree()
+
+    def test_the_airing_facets_equal_what_picking_the_value_gives(self):
+        self.assert_facets_agree(grain=GRAIN_AIRINGS)
+
+    def test_they_agree_with_a_filter_on_another_dimension(self):
+        self.assert_facets_agree(filters=(DimensionFilter('health', ('untested',)),))
+
+    def test_they_agree_with_a_filter_on_their_own_dimension(self):
+        self.assert_facets_agree(filters=_cat('Package'))
+
+    def test_they_agree_on_airings_with_the_past_hidden(self):
+        self.assert_facets_agree(grain=GRAIN_AIRINGS, standing=only_hiding('showdup', 'showpast'))
+
+    def test_they_agree_on_the_airing_grain_with_a_filter(self):
+        self.assert_facets_agree(grain=GRAIN_AIRINGS, filters=_cat('Guide'))
+
+    def test_they_agree_with_typed_text(self):
+        self.assert_facets_agree(q='copy')
+
+    def test_they_agree_on_airings_with_typed_text(self):
+        self.assert_facets_agree(grain=GRAIN_AIRINGS, q='Hockey')
+
+    def test_they_agree_with_another_option_hiding_rows(self):
+        self.assert_facets_agree(standing=only_hiding('showdup', 'showuntested'))
+
+    def test_the_any_group_count_is_there_and_is_not_a_group_named_any(self):
+        facets = search_facets(SearchState(standing=only_hiding('showdup')),
+                               SearchContext.build())['group']
+        self.assertEqual(facets[GROUP_ANY], self.total_for(
+            SearchState(standing=only_hiding('showdup')), 'group', GROUP_ANY))
+        self.assertGreater(facets[GROUP_ANY], 0)
+
+    def test_a_blank_category_is_not_a_facet_value(self):
+        """The plain counts drop it, so the add-back has to as well."""
+        Channel.query.filter_by(name='Hockey copy').update({'category_name': ''})
+        db.session.commit()
+        facets = search_facets(SearchState(standing=only_hiding('showdup')),
+                               SearchContext.build())
+        self.assertNotIn('', facets['cat'])
+
+    def test_a_time_of_day_or_length_count_includes_a_copy_with_no_kept_guide(self):
+        """These two count only the value in the state, so the sweep above never reaches them.
+        Fading copy's kept copy has no guide, so its showings count."""
+        for key, value in (('tod', 'tod:00:00..23:59'), ('duration', 'dur:30..')):
+            with self.subTest(dimension=key):
+                state = SearchState(grain=GRAIN_AIRINGS, standing=only_hiding('showdup'),
+                                    filters=(DimensionFilter(key, (value,)),))
+                facets = search_facets(state, SearchContext.build())
+                self.assertEqual(facets[key][value], self.total_for(state, key, value))
+
+    def test_show_duplicates_ticked_adds_nothing_back(self):
+        """The counts are of every copy already, so adding the hidden ones back would double them."""
+        facets = search_facets(SearchState(standing=only_hiding()), SearchContext.build())
+        self.assertEqual(sum(facets['cat'].values()), Channel.query.count())
 
 
 if __name__ == '__main__':

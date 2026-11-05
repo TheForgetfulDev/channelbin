@@ -16,6 +16,7 @@ from flask import Blueprint, render_template, jsonify, current_app, request
 
 log = logging.getLogger(__name__)
 
+from ..fmt_utils import counted
 from ..tz_utils import to_naive_utc, is_24h, format_local, relative
 
 jobs_bp = Blueprint('jobs', __name__)
@@ -66,9 +67,9 @@ RECURRING_META = {
                          'Saves channel logos locally, so pages do not load them from '
                          'the provider.'),
     'search_index_janitor': ('Search Index Repair',
-                             '/settings?q=index_janitor_grace_minutes',
-                             'Rebuilds a search index that has stayed broken, if nothing '
-                             'else has.'),
+                             '/maintenance#m-index',
+                             'Checks every 10 minutes for a search index that is stale or '
+                             'broken, and repairs it if nothing else is.'),
     'storage_dirs_check': ('Storage Folder Check', '/readiness',
                            'Checks that the folders recordings are saved to can still be '
                            'written.'),
@@ -79,6 +80,11 @@ RECURRING_META = {
                            'found.'),
     'auto_rule_sweep': ('Auto-record Rules', '/rules',
                         'Schedules what your auto-record rules match.'),
+    'sports_worker': ('Sports Schedules', '/sports',
+                      'Keeps the schedules of the leagues you follow up to date, one call at a '
+                      'time. Only here while something is followed.'),
+    'account_sync_queue': ('Account Sync Queue', '/readiness',
+                           'Syncs the accounts you asked for, one at a time.'),
     # The one-shot a guide import (or a refused run) queues: one evaluation of every
     # enabled rule, coalesced on this id (app/scheduler.py::queue_auto_rule_evaluation).
     'auto_rules_evaluate': ('Auto-record Rules check', '/rules',
@@ -714,9 +720,8 @@ def _build_job_list():
             'offered, because running it by hand would stop checks that are mid-run.'
         ),
         'search_index_janitor': (
-            'Search Index Repair rebuilds a search index that has been unusable for longer '
-            'than its grace window with nothing else repairing it. To rebuild right now, use '
-            'Maintenance -> Search index -> Rebuild now.'
+            'Search Index Repair repairs a search index that is unusable with nothing else '
+            'repairing it. To rebuild right now, use Maintenance -> Search index -> Rebuild now.'
         ),
     }
 
@@ -851,8 +856,12 @@ def _build_job_list():
             continue
 
         display_name, edit_url, what = RECURRING_META.get(job.id, (job.id, None, None))
-        if job.id == 'auto_rules_evaluate':
-            reason = (job.kwargs or {}).get('reason')
+        if job.id in ('auto_rules_evaluate', 'account_sync_queue'):
+            if job.id == 'account_sync_queue':
+                left = len((job.kwargs or {}).get('pending') or [])
+                reason = f'{counted(left, "account")} left to sync, one at a time'
+            else:
+                reason = (job.kwargs or {}).get('reason')
             items.append({
                 '_start_utc': next_run_utc,
                 '_end_utc': next_run_utc,

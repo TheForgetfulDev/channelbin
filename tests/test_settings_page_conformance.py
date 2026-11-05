@@ -13,10 +13,10 @@ import json
 import os
 import re
 import unittest
-from html.parser import HTMLParser
 
 from tests.support.app import make_test_app
 from tests.support.config_sandbox import ConfigSandbox
+from tests.support.settings_page import BASIC_SETTINGS, declared_setting_paths, page_cards
 
 
 class SettingsPageConformanceTests(unittest.TestCase):
@@ -353,67 +353,6 @@ class DefaultLineTests(unittest.TestCase):
             config.default_display('no.such.key')
 
 
-class _GroupParser(HTMLParser):
-    """Reads the Settings page into {card id: [(group id, heading, [row paths])]}.
-
-    Rows outside any group are listed under group id None, so a row that escapes its
-    group is visible to the assertions rather than silently skipped.
-    """
-
-    def __init__(self):
-        super().__init__()
-        self.cards = {}
-        self._stack = []   # (tag, kind) for every open section/div
-        self._card = None
-        self._group = None
-        self._in_heading = False
-
-    def handle_starttag(self, tag, attrs):
-        if tag not in ('section', 'div', 'strong'):
-            return
-        a = dict(attrs)
-        if tag == 'strong':
-            if self._stack and self._stack[-1][1] == 'heading':
-                self._in_heading = True
-            return
-        kind = None
-        if tag == 'section' and 'data-sec' in a:
-            kind = 'card'
-            self._card = a['data-sec']
-            self.cards[self._card] = []
-        elif 'data-sub' in a and self._card:
-            kind = 'group'
-            self._group = [a['data-sub'], '', []]
-            self.cards[self._card].append(self._group)
-        elif 'sec-sub' in (a.get('class') or '').split() and self._group:
-            kind = 'heading'
-        elif a.get('data-path') and self._card:
-            groups = self.cards[self._card]
-            if self._group is None:
-                if not groups or groups[-1][0] is not None:
-                    groups.append([None, '', []])
-                groups[-1][2].append(a['data-path'])
-            else:
-                self._group[2].append(a['data-path'])
-        self._stack.append((tag, kind))
-
-    def handle_endtag(self, tag):
-        if tag == 'strong':
-            self._in_heading = False
-            return
-        if tag not in ('section', 'div') or not self._stack:
-            return
-        _, kind = self._stack.pop()
-        if kind == 'group':
-            self._group = None
-        elif kind == 'card':
-            self._card = None
-
-    def handle_data(self, data):
-        if self._in_heading and self._group is not None:
-            self._group[1] += data.strip()
-
-
 class SubGroupTests(unittest.TestCase):
     """DESIGN.md 15: each card is ordered into groups of fields that share a reader,
     each group a `[data-sub]` wrapper with its own heading, and a field that only
@@ -461,9 +400,7 @@ class SubGroupTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.t = make_test_app()
-        parser = _GroupParser()
-        parser.feed(cls.t.app.test_client().get('/settings').get_data(as_text=True))
-        cls.cards = parser.cards
+        cls.cards = page_cards(cls.t.app.test_client().get('/settings').get_data(as_text=True))
 
     @classmethod
     def tearDownClass(cls):
@@ -539,21 +476,6 @@ class ConversionRestartDescriptionTests(unittest.TestCase):
 class TierTests(unittest.TestCase):
     """DESIGN.md 15.9: the Basic/Advanced view (dev/changelog/1005)."""
 
-    BASIC = {
-        'display.timezone', 'display.time_format', 'display.guide_collapse_gaps',
-        'recording.dvr_output_dir', 'recording.images_dir', 'recording.filename_template', 'recording.retention_days',
-        'recording.retention_delete_file', 'recording.post_process.enabled',
-        'recording.post_process.format', 'recording.post_process.reencode_mode',
-        'recording.move_on_complete.enabled', 'recording.move_on_complete.destination',
-        'recording.metadata_sidecar.enabled',
-        'recording.live_thumbnail.enabled', 'recording.logo_cache.enabled', 'ffmpeg.path',
-        'sync.sync_interval_hours', 'sync.epg_days_ahead', 'channel_testing.screenshots_enabled',
-        'channel_testing.window.start', 'channel_testing.window.end', 'auth.enabled',
-        'integrations.home_assistant.enabled',
-        'integrations.output_feed.enabled', 'integrations.output_feed.username',
-        'integrations.output_feed.password', 'integrations.output_feed.mode',
-    }
-
     @classmethod
     def setUpClass(cls):
         from app.routes.settings import SETTINGS_VIEW_PREF
@@ -575,19 +497,23 @@ class TierTests(unittest.TestCase):
     def _tiers(html):
         return dict(re.findall(r'data-path="([^"]+)" data-tier="([^"]*)"', html))
 
+    def test_the_page_renders_every_row_the_template_declares_once_and_in_order(self):
+        rendered = re.findall(r'data-path="([^"]+)" data-tier=', self.basic_html)
+        self.assertEqual(rendered, declared_setting_paths())
+
     def test_the_basic_set_is_exactly_the_approved_one(self):
         tiers = self._tiers(self.basic_html)
-        self.assertEqual(len(tiers), 146)
-        self.assertEqual({p for p, t in tiers.items() if t == 'basic'}, self.BASIC)
+        self.assertEqual(len(tiers), len(declared_setting_paths()))
+        self.assertEqual({p for p, t in tiers.items() if t == 'basic'}, BASIC_SETTINGS)
         self.assertEqual({t for t in tiers.values()}, {'basic', 'advanced'})
 
     def test_every_advanced_row_carries_its_badge_and_no_basic_row_does(self):
         rows = re.findall(r'data-path="([^"]+)" data-tier="[^"]*".*?<div class="fl-label">(.*?)</div>',
                           self.basic_html, re.S)
-        self.assertEqual(len(rows), 146)
+        self.assertEqual(len(rows), len(declared_setting_paths()))
         for path, badge in rows:
             with self.subTest(path=path):
-                self.assertEqual('tier-badge' in badge, path not in self.BASIC)
+                self.assertEqual('tier-badge' in badge, path not in BASIC_SETTINGS)
 
     def test_the_forms_filter_as_basic_units(self):
         self.assertEqual(self.basic_html.count('<div data-tier="basic">'), 2)
@@ -665,7 +591,8 @@ class ChangedFromDefaultTests(unittest.TestCase):
 
     def test_every_setting_row_carries_the_mark_and_the_attribute_turns_it_on(self):
         html = self._page()
-        self.assertEqual(html.count('<div class="fr-changed">Changed from default</div>'), 146)
+        self.assertEqual(html.count('<div class="fr-changed">Changed from default</div>'),
+                         len(declared_setting_paths()))
         self.assertIn('.frow[data-changed] .fr-changed { display: inline-flex; }', self._css())
 
     def test_a_value_saved_equal_to_its_default_is_not_a_change(self):
@@ -764,6 +691,7 @@ class GatingAndOverrideTests(unittest.TestCase):
         'recording.live_thumbnail.auto_refresh_seconds': ['recording.live_thumbnail.enabled'],
         'recording.live_thumbnail.finished_image': ['recording.live_thumbnail.enabled'],
         'recording.live_thumbnail.poster_frame_offset_seconds': ['recording.live_thumbnail.enabled'],
+        'recording.live_thumbnail.poster_frame_retry_step_seconds': ['recording.live_thumbnail.enabled'],
         'auth.session_timeout_minutes': ['auth.enabled'],
         'config_backup.backup_hour_et': ['config_backup.enabled'],
         # The output feed (dev/changelog/1365): everything reads only while it is on; the

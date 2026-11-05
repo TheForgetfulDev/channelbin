@@ -33,6 +33,17 @@ KEYFRAME_ONLY_ARGS = ['-skip_frame', 'nokey']
 WIDEN_SSEOF_SECONDS = 9.0
 
 
+# A frame counts as black when under BLACK_FRAME_MAX_BRIGHT_PERCENT of its pixels are brighter
+# than BLACK_FRAME_LUMA. Counted at full size, because any downscale averages a small bright
+# thing away or spreads it, and that is what makes a contrast figure the wrong test: over 1,362
+# real frames, _check_screenshot_uniform() in channel_tester.py called 3 frames with people in
+# them black, while a station logo alone on black reads as not black to it. Under this rule the
+# darkest real picture scored 6.2%, credits and slates on black 1.2% to 3.7%, and what fell
+# under 1% was pure black, a logo on near-black and one credit name (dev/changelog/1433).
+BLACK_FRAME_LUMA = 32
+BLACK_FRAME_MAX_BRIGHT_PERCENT = 1.0
+_BRIGHT_PIXEL_TABLE = bytes(0 if luma <= BLACK_FRAME_LUMA else 1 for luma in range(256))
+
 # What ffprobe prints for a colorspace field a stream never stated. It emits the key either
 # way, so these read as absent rather than as a value.
 UNSPECIFIED_COLOR = ('', 'unknown', 'unspecified', 'reserved')
@@ -75,6 +86,30 @@ def hdr_input_params(probe: Optional[dict]) -> Optional[str]:
     rng = _stated((probe or {}).get('color_range')) or HDR_DEFAULT_RANGE
     return (f'setparams=color_trc={transfer}:color_primaries={primaries}'
             f':colorspace={matrix}:range={rng}')
+
+
+def frame_bright_percent(filepath: str, ffmpeg_path: str, timeout: int = 10) -> Optional[float]:
+    """The share of this image's pixels brighter than BLACK_FRAME_LUMA, or None when it could
+    not be measured. Reads a file already on disk and spawns one short ffmpeg."""
+    cmd = [ffmpeg_path, '-v', 'error', '-i', filepath, '-vf', 'format=gray',
+           '-frames:v', '1', '-f', 'rawvideo', 'pipe:1']
+    try:
+        result = subprocess.run(cmd, capture_output=True, timeout=timeout)
+    except (OSError, subprocess.SubprocessError) as exc:
+        log.warning('Could not measure the brightness of %s: %s', filepath, exc)
+        return None
+    if result.returncode != 0 or not result.stdout:
+        log.warning('Could not measure the brightness of %s: ffmpeg exited %s',
+                    filepath, result.returncode)
+        return None
+    pixels = result.stdout
+    return pixels.translate(_BRIGHT_PIXEL_TABLE).count(1) / len(pixels) * 100
+
+
+def is_black_frame(bright_percent: Optional[float]) -> bool:
+    """Whether frame_bright_percent()'s answer means a black frame. An unmeasured frame is not
+    called black: throwing away a picture on no evidence is the worse mistake."""
+    return bright_percent is not None and bright_percent < BLACK_FRAME_MAX_BRIGHT_PERCENT
 
 
 def seek_args_for_clip(duration: Optional[float]) -> list:

@@ -88,7 +88,19 @@ Sync cancelled before it finished.
   <h1>Accounts
     <span class="sub" id="acct-total">{{ accounts | length }} account{{ 's' if accounts | length != 1 else '' }}{% if total_channels %} &middot; {{ '{:,}'.format(total_channels) }} channels{% if total_hidden_channels %} ({{ '{:,}'.format(total_hidden_channels) }} hidden){% endif %}{% endif %}</span>
   </h1>
-  <a href="{{ url_for('accounts.new_account') }}" class="btn btn-primary">+ Add Account</a>
+  <div class="card-head-actions">
+    {# A live region (accounts.js), so a first account brings the button with it and the label
+       follows a running queue. It is always a button: while a queue runs, the click is where
+       to see it and stop it. #}
+    <span id="acct-sync-all">
+      {% if accounts %}
+      <button type="button" class="btn" data-sync-all data-url="{{ url_for('accounts.sync_queue_api') }}"{% if sync_queue %} data-queue-running{% endif %}>
+        {%- if sync_queue %}Syncing: {{ sync_queue.done }} of {{ sync_queue.total }} done{% else %}Sync All{% endif -%}
+      </button>
+      {% endif %}
+    </span>
+    <a href="{{ url_for('accounts.new_account') }}" class="btn btn-primary">+ Add Account</a>
+  </div>
 </div>
 {% call page_about() %}
   An account is one IPTV provider connection. ChannelBin syncs its channel list and guide data
@@ -206,6 +218,7 @@ Sync cancelled before it finished.
 {% block scripts %}
 <script src="{{ url_for('static', filename='js/account-modal.js') }}"></script>
 <script src="{{ url_for('static', filename='js/account-actions.js') }}"></script>
+<script src="{{ url_for('static', filename='js/sync-queue.js') }}"></script>
 <script src="{{ url_for('static', filename='js/accounts.js') }}"></script>
 {% if accounts | selectattr('is_example') | list %}<script src="{{ url_for('static', filename='js/examples.js') }}"></script>{% endif %}
 <script src="{{ url_for('static', filename='js/account-providers.js') }}"></script>

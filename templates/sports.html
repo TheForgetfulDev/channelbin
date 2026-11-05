@@ -1,0 +1,121 @@
+{% extends "base.html" %}
+{% from "_macros.html" import page_about %}
+{% block title %}Sports Schedules - ChannelBin{% endblock %}
+
+{#  Sports Schedules (dev/docs/DESIGN-sports-data.md 11, mockup 50). The Auto-record list's own
+    anatomy: a row opens its league's page, and its status is a badge and an edge, with the reason
+    on that page. Every value comes from sports_view.list_context(), a fixed number of queries.
+
+    `.page-head` and #sports-body are the regions static/js/sports.js swaps after an action. #}
+
+{% block content %}
+<div class="page-head">
+  <h1>Sports Schedules
+    {% if rows %}<span class="sub">{{ followed }} followed{% if not_followed %}, {{ not_followed }} not followed{% endif %} &middot; {{ upcoming_total }} upcoming</span>{% endif %}
+  </h1>
+  <button type="button" class="btn btn-primary" id="sp-add">{{ icon('add') }} Add a league</button>
+</div>
+{% call page_about() %}
+  ChannelBin can keep the real schedule of the leagues and teams you follow, from TheSportsDB: who
+  is playing, where, and when. Nothing is fetched for anything you have not followed. The schedule
+  is not matched to your guide listings yet, so for now it is something to read. A recording never
+  waits on any of this. How far apart calls are, how far ahead a schedule reaches and how long past
+  games are kept are in <a href="{{ url_for('settings.settings', q='sports_data') }}">Settings</a>.
+{% endcall %}
+
+<div id="sports-body">
+{% if banner %}
+  {% if banner.tone == 'bad' %}
+  <div class="notice notice-bad"><div><strong>{{ banner.title }}</strong> {{ banner.sub }}</div></div>
+  {% else %}
+  <div class="notice-banner{% if banner.tone == 'warn' %} notice-banner-warn{% elif banner.tone == 'ok' %} notice-banner-ok{% endif %}">
+    <div class="notice-banner-body">
+      <div class="notice-banner-title">{{ banner.title }}</div>
+      <div class="notice-banner-sub">{{ banner.sub }}</div>
+    </div>
+    {% if banner.settings %}
+    <a class="btn btn-sm" href="{{ url_for('settings.settings', q='sports_data') }}"
+       data-tip="How far apart calls are, how far ahead a schedule reaches and how long past games are kept.">Settings {{ icon('forward') }}</a>
+    {% endif %}
+  </div>
+  {% endif %}
+{% endif %}
+
+{% if not rows %}
+<div class="empty-state">
+  <p><strong>No leagues followed</strong></p>
+  <p class="text-muted small">ChannelBin is making no calls to TheSportsDB. Add a league to see who is playing, where and when.</p>
+</div>
+{% else %}
+<div class="menu-wrap sort-chip-wrap sp-sort">
+  <button class="chip" id="sp-sort-chip" data-menu>Sort: Next game {{ icon('dropdown') }}</button>
+  <div class="menu" id="sp-sort-menu">
+    <div class="pop-title">Sort by</div>
+    <button class="menu-item" data-sortfield="name">League</button>
+    <button class="menu-item" data-sortfield="status">Status</button>
+    <button class="menu-item" data-sortfield="next">Next game</button>
+    <button class="menu-item" data-sortfield="count">Upcoming</button>
+    <button class="menu-item" data-sortfield="updated">Updated</button>
+  </div>
+</div>
+<div class="rl-list sp-list">
+  <div class="list-head" id="sp-head">
+    <span class="sortable" data-sort="name">League<span class="sort-ind"></span></span>
+    <span class="sortable" data-sort="status">Status<span class="sort-ind"></span></span>
+    <span class="sortable" data-sort="next">Next game<span class="sort-ind"></span></span>
+    <span class="sortable num" data-sort="count">Upcoming<span class="sort-ind"></span></span>
+    <span class="sortable" data-sort="updated">Updated<span class="sort-ind"></span></span>
+    <span></span>
+  </div>
+  <div class="rows" id="sp-rows">
+    {% for r in rows %}
+    <div class="row {{ r.edge }}" data-league="{{ r.id }}" data-href="{{ url_for('sports.league_page', league_id=r.id) }}"
+         data-name="{{ r.name | lower }}" data-status="{{ r.rank }}" data-next="{{ r.next_sort }}"
+         data-count="{{ r.count }}" data-updated="{{ r.updated_sort }}"
+         data-dialog="{{ r.dialog | tojson | forceescape }}">
+      <span class="rl-title">
+        <a class="rl-name" href="{{ url_for('sports.league_page', league_id=r.id) }}">{{ r.name }}</a>
+        <span class="rl-sum">{{ r.summary }}</span>
+      </span>
+      <span class="rl-status"><span class="badge {{ r.badge }} tip-plain" data-tip="{{ r.tip }}">{{ r.label }}</span></span>
+      <span class="rl-cell rl-next">
+        {% if r.followed and r.next %}
+        <span class="day">{{ r.next.day }}</span> {{ r.next.time or 'time not listed' }}
+        <span class="game">{{ r.next.game }}</span>
+        {% if r.next.where %}<span class="sub">{{ r.next.where }}</span>{% endif %}
+        {% else %}
+        {{ r.no_game[0] }}<span class="sub">{{ r.no_game[1] }}</span>
+        {% endif %}
+      </span>
+      <span class="rl-meta">
+        <span class="rl-num"><span class="rl-k">Upcoming</span>{% if r.count %}{{ r.count }}{% else %}<span class="zero">0</span>{% endif %}</span>
+        <span class="rl-cell"{% if r.updated_at %} data-tip="Last updated {{ r.updated_at }}."{% endif %}><span class="rl-k">Updated</span>{{ r.updated }}</span>
+      </span>
+      <span class="c-actions">
+        <span class="menu-wrap">
+          <button class="btn btn-sm btn-icon" data-menu aria-label="Actions for {{ r.name }}">{{ icon('more') }}</button>
+          <div class="menu pop-left">
+            {% if r.followed %}
+            {% if r.has_teams %}<button class="menu-item" data-act="teams">Change teams&hellip;</button>{% endif %}
+            <button class="menu-item" data-act="stop">Stop following</button>
+            {% else %}
+            <button class="menu-item" data-act="refollow">Follow again</button>
+            {% endif %}
+            <div class="sep"></div>
+            <button class="menu-item danger" data-act="delete">Delete league</button>
+          </div>
+        </span>
+      </span>
+    </div>
+    {% endfor %}
+  </div>
+</div>
+{% endif %}
+</div>
+<div class="sp-credit">Schedule data from <a href="https://www.thesportsdb.com/" target="_blank" rel="noopener">TheSportsDB</a>.</div>
+{% endblock %}
+
+{% block scripts %}
+<script type="application/json" id="sports-boot">{{ add_config | tojson }}</script>
+<script src="{{ url_for('static', filename='js/sports.js') }}"></script>
+{% endblock %}

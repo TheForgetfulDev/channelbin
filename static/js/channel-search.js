@@ -97,7 +97,7 @@
      order in `by_grain` is NOT the registry's: a dimension that exists only on
      the grain you just switched into LEADS, since it is the reason you switched
      (mockup 25, P9). `when` is therefore first on the airing rail and the channel
-     rail is unchanged, having no grain-scoped dimension. */
+     rail is unchanged, its one grain-scoped dimension being a hidden one. */
   function dimsFor(g) {
     if (!CAT) return [];
     const bg = byGrain(g);
@@ -427,7 +427,7 @@
      Everything explicit, defaults included: this is what goes to the server,
      not what goes in the address bar. The short form comes back as
      `query_string` in the response. */
-  function toParams({ facets: facetDims, counts, seq } = {}) {
+  function toParams({ facets: facetDims, counts, seq, from = state } = {}) {
     const p = new URLSearchParams();
     /* Who is asking and which of their requests this is, so the server can drop the work
        when a newer one arrives. Built HERE with everything else the server gets, rather
@@ -442,25 +442,25 @@
     // Only when it is not the default, so the channel grain's URLs are byte-identical
     // to what they were before this parameter existed and every link already stored
     // still opens the search it named.
-    if (state.grain !== GRAIN_CHANNELS) p.append('grain', state.grain);
-    if (state.q) p.append('q', state.q);
-    state.fields.forEach((k) => p.append('in', k));
-    if (!state.matchAll) p.append('match', 'any');
-    state.filters.forEach((f) => {
+    if (from.grain !== GRAIN_CHANNELS) p.append('grain', from.grain);
+    if (from.q) p.append('q', from.q);
+    from.fields.forEach((k) => p.append('in', k));
+    if (!from.matchAll) p.append('match', 'any');
+    from.filters.forEach((f) => {
       f.values.forEach((v) => p.append(`f.${f.key}`, v));
       f.ex.forEach((v) => p.append(`x.${f.key}`, v));
     });
     // One empty value when the set is empty, or the server reads the parameter's
     // absence as "use the defaults" and two hiders come back on.
-    const standing = Array.from(state.standing).sort();
+    const standing = Array.from(from.standing).sort();
     if (standing.length) standing.forEach((k) => p.append('standing', k));
     else p.append('standing', '');
-    p.append('sort', (state.sortDesc ? '-' : '') + state.sort);
-    p.append('page', String(state.page));
-    p.append('per_page', String(state.pageSize));
-    if (state.addToGroup !== null) p.append('add_to_group', String(state.addToGroup));
-    if (state.replaceRec !== null) p.append('replace_rec', String(state.replaceRec));
-    if (state.rule !== null) p.append('rule', state.rule);
+    p.append('sort', (from.sortDesc ? '-' : '') + from.sort);
+    p.append('page', String(from.page));
+    p.append('per_page', String(from.pageSize));
+    if (from.addToGroup !== null) p.append('add_to_group', String(from.addToGroup));
+    if (from.replaceRec !== null) p.append('replace_rec', String(from.replaceRec));
+    if (from.rule !== null) p.append('rule', from.rule);
     if (facetDims) facetDims.forEach((k) => p.append('facets', k));
     else if (facetDims !== undefined) p.append('facets', '');   // count none
     // Absent means "compute it inline" (every caller before this parameter existed, and
@@ -562,6 +562,20 @@
   // Which dimensions this grain can actually evaluate. A chip on anything else is parked.
   const dimInGrain = (key, g) => dimsFor(g).some((d) => d.key === key);
 
+  /* WHAT A FLIP TO `g` WOULD SEARCH, answered without flipping. setGrain() applies these and
+     the Programs notice counts against them (nameNoticeSearch()), so the number it shows and
+     the rows its button lands on cannot be two readings of one rule. */
+  const parkedBackIn = (g) => parked[g].filter((f) => dimInGrain(f.key, g) && !findF(f.key));
+  const filtersIn = (g) => state.filters.filter((f) => dimInGrain(f.key, g)).concat(parkedBackIn(g));
+  const fieldsIn = (g) => (state.fieldsExplicit ? state.fields : defaultFieldsFor(g).slice());
+  function standingIn(g) {
+    if (!state.standingExplicit) return new Set(defaultStandingFor(g));
+    // Drop the options the target grain does not offer, so the request cannot carry
+    // a key the engine will reject.
+    const offered = new Set(standingFor(g).map((s) => s.key));
+    return new Set(Array.from(state.standing).filter((k) => offered.has(k)));
+  }
+
   function setGrain(g) {
     if (g === state.grain || !GRAIN_UI[g] || !grainKeys().includes(g)) return;
     const from = state.grain;
@@ -585,8 +599,7 @@
        putting back a filter on a dimension that no longer exists would be a chip
        nothing can evaluate. */
     if (parked[g].length) {
-      const back = parked[g].filter(
-        (f) => dimInGrain(f.key, g) && !findF(f.key));
+      const back = parkedBackIn(g);
       parked[g] = [];
       if (back.length) state.filters = state.filters.concat(back);
     }
@@ -643,15 +656,8 @@
        Airings would search program titles for a channel's name and come back empty while
        looking like a working search (dev/changelog/860). One the user DID pick crosses
        unchanged - every field is valid on both grains, since an airing is on a channel. */
-    if (!state.fieldsExplicit) state.fields = defaultFieldsFor(g).slice();
-
-    if (!state.standingExplicit) state.standing = new Set(defaultStandingFor(g));
-    else {
-      // Drop the options the target grain does not offer, so the request cannot carry
-      // a key the engine will reject.
-      const offered = new Set(standingFor(g).map((s) => s.key));
-      state.standing = new Set(Array.from(state.standing).filter((k) => offered.has(k)));
-    }
+    state.fields = fieldsIn(g);
+    state.standing = standingIn(g);
 
     state.page = 1;
     /* The picker lists whichever grain's registry is active, so it is rebuilt HERE.
@@ -789,6 +795,8 @@
         clearTimeout(slowTimer);
         $('#sbox').classList.remove('loading');
       });
+    // After the rows have gone out, so an optional number can never hold a scan slot ahead of them.
+    refreshNameNotice(seq);
   }
 
   /* The trailing request for whatever fetchRows() just skipped: total, pages, and the
@@ -1394,17 +1402,26 @@
 
   // The badge always carries the cluster size: that is what tells a stray pair
   // apart from the six-copy cluster, which is what the user is looking for.
+  /* Why a copy "Show duplicates" would hide is on the page anyway, naming the copy that was kept.
+     A KEPT copy leads `others`, so it is always among the names the row carries. */
+  const keptAbsentNote = (d) => {
+    if (!d.kept_absent) return '';
+    const kept = (d.others || []).find((o) => o.id === d.kept_id);
+    return `Shown because the copy kept${kept ? `, ${kept.name},` : ''} is not in these results.`;
+  };
   function dupBadge(row) {
     if (!row.dup) return '';
     const d = row.dup;
     const shown = (d.others || []).slice(0, 4);
     const more = (d.others || []).length > shown.length
       ? `\n  + ${d.others.length - shown.length} more` : '';
-    const hidden = d.others_hidden
+    // A copy shown because its kept copy is absent has no copies hidden: none of them folds.
+    const hidden = d.others_hidden && !d.kept_absent
       ? '\n\nSome of them are hidden right now because "Show duplicates" is off.' : '';
     const tip = `Duplicate stream.\n${d.count} channels ${dupKeyClause(d)}. The other` +
       `${d.count === 2 ? '' : 's'}:\n` +
       shown.map((c) => `  ${c.name}   (${c.category || 'no category'})`).join('\n') + more + hidden +
+      (d.kept_absent ? `\n\n${keptAbsentNote(d)}` : '') +
       '\n\nClick to see just that cluster. A "Your search" button appears so you can return.';
     return `<span class="badge b-warn" data-act="dup-badge" data-id="${row.id}" data-tip="${tipAttr(tip)}">DUP &times;${d.count}</span>`;  // icon-ok: a multiplication sign, not an icon
   }
@@ -2187,7 +2204,8 @@
           ? '<u id="es-scope">Search in</u>.'
           : '<b>Search in</b> - click into the search box.'}`
                 : 'No search text - your filters exclude everything.'}${
-        standingHiddenTotal() ? ` &middot; ${nf(standingHiddenTotal())} hidden by your standing options` : ''}</div>`;
+        standingHiddenTotal() ? ` &middot; ${nf(standingHiddenTotal())} hidden by your standing options` : ''}</div>${
+        endedHint()}`;
     } else {
       empty.style.display = 'none';
       $('#atable').style.display = '';
@@ -2225,6 +2243,116 @@
     updateSelectionUI();
     renderReplaceBar();
     renderRuleBar();
+    renderNameNotice();
+  }
+
+  /* ── The notice for channels that match by name and have nothing scheduled ──────
+     Every row on Programs is a listing, so a channel with none cannot be a row, and a game
+     that exists only in a channel's name reads as "no matches" (dev/changelog/1437). This
+     says so and links to them. It is not a row: the count line, paging, sorting and rules
+     never see it.
+
+     THE NUMBER IS THE DESTINATION'S OWN TOTAL. It is the counts endpoint's answer for exactly
+     the search the button opens, so what it says and what you land on cannot differ. A count
+     the server declined or could not answer draws nothing: the rows are still right, and a
+     degraded search already has its own bar saying numbers may be missing. */
+  let nameNoticeCount = 0;
+  let nameNoticeKey = '';
+  let nameNoticeAbort = null;
+  let nameNoticeHtml = '';
+
+  const nameNoticeApplies = () => isAirings() && state.fields.includes('name')
+    && parseQuery(state.q).inc.length > 0;
+
+  /* The search the notice's button opens: this one flipped to Channels, plus the filter. */
+  function nameNoticeSearch() {
+    const g = GRAIN_CHANNELS;
+    const listings = { key: 'listings', values: [CAT.listings_values[0].value], ex: [] };
+    return {
+      ...state,
+      grain: g,
+      filters: filtersIn(g).filter((f) => f.key !== listings.key).concat(listings),
+      fields: fieldsIn(g),
+      standing: standingIn(g),
+      sort: defaultSortFor(g),
+      sortDesc: false,
+      page: 1,
+    };
+  }
+
+  function refreshNameNotice(seq) {
+    if (nameNoticeAbort) nameNoticeAbort.abort();
+    nameNoticeAbort = null;
+    if (!CAT || !nameNoticeApplies()) {
+      nameNoticeCount = 0;
+      nameNoticeKey = '';
+      return;
+    }
+    const destination = nameNoticeSearch();
+    const key = toParams({ from: destination }).toString();
+    // A different search's number is not this search's, even for the moment until it lands.
+    // The same search keeps its number on screen while it is asked again.
+    if (key !== nameNoticeKey) nameNoticeCount = 0;
+    nameNoticeKey = key;
+    nameNoticeAbort = new AbortController();
+    /* The ROW request's seq, as fetchCounts() sends it: the server cannot see an abort, so this
+       is what stops it working on a search nobody is waiting for (dev/changelog/678). */
+    jsonFetch(`${CFG.countsUrl}?${toParams({ from: destination, seq }).toString()}`,
+              { signal: nameNoticeAbort.signal })
+      .then((data) => {
+        if (key !== nameNoticeKey) return;
+        nameNoticeCount = (data.declined || []).includes('counts') ? 0 : (data.total || 0);
+        renderNameNotice();
+      })
+      .catch((e) => {
+        if (e && e.name === 'AbortError') return;
+        console.warn('The Programs notice could not count its channels:', e);
+        if (key !== nameNoticeKey) return;
+        nameNoticeCount = 0;
+        renderNameNotice();
+      });
+  }
+
+  function nameNoticeBodyHtml(n, listingsBelow, inRule) {
+    const one = n === 1;
+    const who = one ? 'this channel' : 'one of these channels';
+    const see = one ? 'Take a look at it' : n === 2 ? 'Take a look at both' : `Take a look at all ${nf(n)}`;
+    const lead = listingsBelow
+      ? `If you can't find what you're looking for below, you may be looking for ${who}.`
+      : `You may be looking for ${who}.`;
+    return `<div class="notice-banner-body">
+        <div class="notice-banner-title">${nf(n)} channel${one ? ' matches' : 's match'} your search but ${
+    one ? 'has' : 'have'} no scheduled listings.</div>
+        <div class="notice-banner-sub">This can happen when a provider puts the program in the channel `
+      + `name instead of the guide, which is common with live sports. ${lead} ${see} in the Channel Search.${
+        inRule ? ` A rule records listings, so it will not record ${one ? 'this channel' : 'these channels'}.` : ''}</div>
+      </div>
+      <button class="btn btn-sm" type="button" data-name-notice-go>Search Channels ${icon('forward')}</button>`;
+  }
+
+  /* The first row, under the column headers. With no rows the table is hidden, so it leads
+     the no-matches message instead. */
+  function renderNameNotice() {
+    const el = $('#cs-name-notice');
+    if (!el) return;
+    if (resultsPending || loadFailed || !nameNoticeCount || !nameNoticeApplies()) {
+      el.style.display = 'none';
+      return;
+    }
+    const listingsBelow = last.rows.length > 0;
+    const anchor = $(listingsBelow ? '#ch-list' : '#all-empty');
+    if (el.nextElementSibling !== anchor) anchor.parentNode.insertBefore(el, anchor);
+    el.classList.toggle('cs-name-notice-alone', !listingsBelow);
+    const html = nameNoticeBodyHtml(nameNoticeCount, listingsBelow, !!ruleMode());
+    // Written only when it differs: replacing the button under a pointer loses the click.
+    if (html !== nameNoticeHtml) { el.innerHTML = html; nameNoticeHtml = html; }
+    el.style.display = '';
+  }
+
+  function openNameNoticeChannels() {
+    const f = nameNoticeSearch().filters.find((x) => x.key === 'listings');
+    parked[GRAIN_CHANNELS] = parked[GRAIN_CHANNELS].filter((x) => x.key !== f.key).concat(f);
+    setGrain(GRAIN_CHANNELS);
   }
 
   /* ── The replace action context ──────────────────────────────────────
@@ -2548,6 +2676,15 @@
     });
   }
 
+  /* Ended airings carry no count (dev/changelog/1439), so an empty result is where the page
+     says they were left out: "no airings match" is otherwise false when every match has ended.
+     It claims none exist, which is what lets it ask for no extra scan. */
+  const endedHint = () => {
+    const past = standingOpts().find((s) => s.key === 'showpast');
+    return past && standingApplied(past)
+      ? `<div class="es-hint">Ended airings aren't included. <u data-standing-off="${past.key}">${esc(past.label)}</u></div>`
+      : '';
+  };
   const standingHiddenTotal = () =>
     Object.values(last.standingHidden || {}).reduce((a, b) => a + b, 0);
   const fieldLabels = () =>
@@ -2705,7 +2842,8 @@
        says so BY NAME with its own count, and clicking it puts those rows back.
        One entry per option, never a merged "N hidden" - a lump sum tells you
        something vanished but not what to do about it. This is the whole reason
-       an option that hides by default is allowed to exist.
+       an option that hides by default is allowed to exist. Ended airings are the
+       one exception, carrying no count: see endedHint().
 
        BY NAME is the option's own noun, not the word "hidden" (dev/changelog/778).
        Repeating one verb made the line carry no information the moment a second
@@ -2786,6 +2924,10 @@
      turning on a program field while a sync is running has to warn immediately rather
      than at the next poll tick. dev/changelog/427. */
   let readiness = null;
+  let degradedHtml = '';   // what #cs-degraded holds, compared as written
+  const REBUILD_ASKING = 'asking';
+  const REBUILD_ANSWERED = 'answered';
+  let rebuildAsk = '';     // '', REBUILD_ASKING or REBUILD_ANSWERED
 
   /* Which of the server's two answers applies to what is currently being searched.
      MIRRORS app/channel_search.py::_index_names(): any field sourced from a program
@@ -2806,7 +2948,12 @@
     const el = $('#cs-degraded');
     if (!el) return;
     const answer = readinessNow();
-    if (!answer || answer.ready) { el.style.display = 'none'; el.innerHTML = ''; return; }
+    if (!answer || answer.ready) {
+      el.style.display = 'none';
+      el.innerHTML = '';
+      degradedHtml = '';
+      return;
+    }
     /* Only claims what is still true (dev/changelog/676, 678, 681). Rows are the one thing
        still guaranteed the same - the unindexed path is slower but correct. Totals and
        filter counts are NOT: a degraded search now declines them rather than paying for
@@ -2822,19 +2969,52 @@
        would put a false statement on screen for the other three, so the headline states
        only what is true in all four, and the reason line below names which one it is - the
        same server-supplied-reason pattern the count line and facet rail use for a decline. */
-    el.innerHTML = `${icon('warning')} Searches are running without their index right now. Rows that `
+    const refused = rebuildAsk ? '' : (answer.rebuild_refused || '');
+    const action = rebuildAsk
+      ? '<button class="btn btn-sm" type="button" disabled>Rebuilding...</button>'
+      : refused ? '' : '<button class="btn btn-sm" type="button" data-rebuild-index>Rebuild now</button>';
+    const html = `<div class="csd-text">${icon('warning')} Searches are running without their index right now. Rows that `
       + `come back are complete and correct, but totals and filter counts may not be `
       + `available, and a search can be slower than usual or fail to complete. This clears `
       + `once the index next rebuilds - normally at the end of an account sync, or `
       + `automatically otherwise.`
-      + `<span class="csd-why">${esc(answer.reason || '')}</span>`;
+      + `<span class="csd-why">${esc(answer.reason || '')}</span>`
+      + (refused ? `<span class="csd-why">${esc(refused)}</span>` : '')
+      + `</div>${action}`;
+    /* Written only when it differs: every nav poll lands here, and replacing the button under
+       a pointer between press and release loses the click. */
+    if (html !== degradedHtml) { el.innerHTML = html; degradedHtml = html; }
     el.style.display = '';
   }
 
   window.__applySearchReadiness = (payload) => {
     readiness = payload || null;
+    // The first poll after the server took the request hands the button back to the server's
+    // answer, so a rebuild that ended early can never leave it stuck on "Rebuilding...".
+    if (rebuildAsk === REBUILD_ANSWERED) rebuildAsk = '';
     renderSearchReadiness();
   };
+
+  const degradedBar = $('#cs-degraded');
+  if (degradedBar) {
+    // On the bar, because renderSearchReadiness() replaces the button itself.
+    degradedBar.addEventListener('click', (e) => {
+      if (!e.target.closest('[data-rebuild-index]')) return;
+      rebuildAsk = REBUILD_ASKING;
+      renderSearchReadiness();
+      jsonFetch('/api/settings/search-index/rebuild', { method: 'POST' })
+        .then(() => {
+          rebuildAsk = REBUILD_ANSWERED;
+          showToast('Rebuilding the search indexes - this can take a couple of minutes.');
+        })
+        .catch((err) => {
+          // A 409 carries the server's reason: a sync is running, or a rebuild already is.
+          rebuildAsk = '';
+          renderSearchReadiness();
+          showToast(err.message || 'Could not start the rebuild.', { type: 'error' });
+        });
+    });
+  }
 
   /* ── Row actions ─────────────────────────────────────────────────────
      Everything here reuses what ships today rather than adding an endpoint:
@@ -3221,7 +3401,7 @@
           <span class="hint">${esc(o.category || 'no category')}</span></div>`).join('')}${more}
         <div class="psep"></div>
         <div class="sh-note" style="padding-top:0">The one kept is ${esc(d.kept_reason)}.
-          ${esc(KEEP_RULE)}</div>
+          ${esc(KEEP_RULE)} ${esc(keptAbsentNote(d))}</div>
         <div style="padding:4px 0 6px"><button class="btn btn-primary" data-dupdrill="${row.id}"
           style="width:100%;justify-content:center">Show just these ${nf(d.count)} channels</button></div>`,
     });
@@ -3655,6 +3835,7 @@
       case 'acct':   return (CAT.accounts.find((a) => String(a.id) === value) || {}).name || value;
       case 'health': return byValue(CAT.health_values) || value;
       case 'other':  return byValue(CAT.other_values) || value;
+      case 'listings': return byValue(CAT.listings_values) || value;
       case 'group':  return value === CAT.group_any ? 'Any group' : value;
       case WHEN_KEY: {
         if (String(value).startsWith(WHEN_NEXT_PREFIX)) return relLabel();
@@ -5977,6 +6158,12 @@
   // The empty state's "widen it" hint, which is a control only at phone width.
   $('#all-empty').addEventListener('click', (e) => {
     if (e.target.closest('#es-scope')) openScopeSheet();
+    const off = e.target.closest('[data-standing-off]');
+    if (off) toggleStanding(off.dataset.standingOff);
+  });
+
+  $('#cs-name-notice').addEventListener('click', (e) => {
+    if (e.target.closest('[data-name-notice-go]')) openNameNoticeChannels();
   });
 
   // Changes this search only - the stored default is Settings' alone. The address bar

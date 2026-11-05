@@ -2226,7 +2226,7 @@ class Channel(db.Model):
     # same stream as this one (same provider + stream id for an account on a provider, same
     # stream_url otherwise), NULL when there is no other. is_duplicate_loser is True on
     # every member of a cluster except the copy the keep rule kept; "Show duplicates" off
-    # is this column.
+    # hides these while that copy is in the results (channel_search._fold_reject).
     duplicate_cluster_id = db.Column(db.Integer)
     is_duplicate_loser   = db.Column(db.Boolean, nullable=False, default=False,
                                      server_default=db.text('0'))
@@ -3090,6 +3090,131 @@ class EpgScanLink(db.Model):
         db.Index('ix_epg_scan_links_a', 'scan_id', 'a_id'),
         db.Index('ix_epg_scan_links_b', 'scan_id', 'b_id'),
     )
+
+
+# What one call to TheSportsDB came back with (dev/docs/DESIGN-sports-data.md 4.4). A refusal or a
+# smaller answer is never read as "no games", which is why each has its own word.
+SPORTS_FETCH_OK = 'ok'
+SPORTS_FETCH_EMPTY = 'empty'
+SPORTS_FETCH_RATE_LIMITED = 'rate_limited'
+SPORTS_FETCH_REFUSED = 'refused'
+SPORTS_FETCH_SHRUNK = 'shrunk'
+
+# What a row in the queue asks for. Every one is one call.
+SPORTS_KIND_LEAGUE = 'league'
+SPORTS_KIND_NEXT = 'next'
+SPORTS_KIND_ROUND = 'round'
+SPORTS_KIND_TEAM = 'team'
+
+
+class SportsLeague(db.Model):
+    """A league someone added (app/sports_data.py, DESIGN-sports-data.md 9). Kept after its last
+    follow goes, because it holds what the user typed; only removing the league deletes it."""
+    __tablename__ = 'sports_leagues'
+    id             = db.Column(db.Integer, primary_key=True)
+    tsdb_id        = db.Column(db.Integer, nullable=False, unique=True)
+    name           = db.Column(db.String(255), nullable=False)
+    sport          = db.Column(db.String(64))
+    current_season = db.Column(db.String(32))
+    # The words in guide text that mean this league, a JSON list (5.1). Seeded when it is added.
+    match_terms    = db.Column(db.Text, nullable=False, default='[]')
+    created_at     = db.Column(db.DateTime, default=datetime.utcnow)
+
+
+class SportsFollow(db.Model):
+    """What is followed in a league. Neither id column is nullable, because SQLite treats NULLs
+    as distinct and the UNIQUE would stop meaning anything: team 0 is the whole league, and rule 0
+    is a person's own follow."""
+    __tablename__ = 'sports_follows'
+    __table_args__ = (db.UniqueConstraint('league_id', 'team_tsdb_id', 'rule_id',
+                                          name='uq_sports_follow'),)
+    id           = db.Column(db.Integer, primary_key=True)
+    league_id    = db.Column(db.Integer, db.ForeignKey('sports_leagues.id'), nullable=False)
+    team_tsdb_id = db.Column(db.Integer, nullable=False, default=0)
+    rule_id      = db.Column(db.Integer, nullable=False, default=0)
+    created_at   = db.Column(db.DateTime, default=datetime.utcnow)
+
+
+class SportsTeam(db.Model):
+    """A team's names, read once a season (6.2). No league column: a team can be in more than one
+    competition, and which league it plays in is read from its events."""
+    __tablename__ = 'sports_teams'
+    id             = db.Column(db.Integer, primary_key=True)
+    tsdb_id        = db.Column(db.Integer, nullable=False, unique=True)
+    full_name      = db.Column(db.String(255), nullable=False)
+    names          = db.Column(db.Text, nullable=False, default='[]')
+    city           = db.Column(db.String(255))
+    last_looked_up = db.Column(db.DateTime)
+
+
+class SportsFetch(db.Model):
+    """One thing the worker fetches, which is the queue itself (4). A first fill is a set of these
+    written before the first call, so what is left to do is recorded rather than inferred and a
+    restart resumes it. NULL last_at means it has never run; NULL next_due_at means nothing is left
+    to ask, such as a round whose games have all been played."""
+    __tablename__ = 'sports_fetches'
+    id             = db.Column(db.Integer, primary_key=True)
+    target         = db.Column(db.String(64), nullable=False, unique=True)
+    kind           = db.Column(db.String(16), nullable=False)
+    league_id      = db.Column(db.Integer, db.ForeignKey('sports_leagues.id'), nullable=False, index=True)
+    next_due_at    = db.Column(db.DateTime, index=True)
+    last_at        = db.Column(db.DateTime)
+    outcome        = db.Column(db.String(16))
+    reason         = db.Column(db.Text)
+    row_count      = db.Column(db.Integer)
+    prev_row_count = db.Column(db.Integer)
+    # Rows the last answer carried that failed validation at import, named on the league's page.
+    dropped_count  = db.Column(db.Integer, nullable=False, default=0)
+    # When this row started failing; NULL when its last answer was good. It is what lets a page say
+    # "since Nov 3" instead of only "just now".
+    failing_since  = db.Column(db.DateTime)
+
+
+class SportsState(db.Model):
+    """The worker's one row: stored so that a restart cannot burst."""
+    __tablename__ = 'sports_state'
+    id                   = db.Column(db.Integer, primary_key=True)
+    next_call_at         = db.Column(db.DateTime)
+    last_call_at         = db.Column(db.DateTime)
+    # Seconds between calls while backing off a 429; 0 when not backing off.
+    backoff_seconds      = db.Column(db.Integer, nullable=False, default=0)
+    clean_calls          = db.Column(db.Integer, nullable=False, default=0)
+    # This install's own time of day for its daily round, so installs do not all call at once.
+    daily_offset_seconds = db.Column(db.Integer, nullable=False, default=0)
+    last_pruned_at       = db.Column(db.DateTime)
+
+
+class SportsEvent(db.Model):
+    """A real event as TheSportsDB lists it. `start_at` is stored as given, naive UTC and NULL when
+    absent, and judged when read (DESIGN-sports-data.md 7): 00:00 is a real 7pm ET in one league and
+    a placeholder in another. It is a fourth time, never written into a Recording's own."""
+    __tablename__ = 'sports_events'
+    __table_args__ = (db.Index('ix_sports_events_league_start', 'league_id', 'start_at'),)
+    id               = db.Column(db.Integer, primary_key=True)
+    tsdb_id          = db.Column(db.Integer, nullable=False, unique=True)
+    league_id        = db.Column(db.Integer, db.ForeignKey('sports_leagues.id'), nullable=False)
+    season           = db.Column(db.String(32))
+    round            = db.Column(db.Integer)
+    name             = db.Column(db.String(255), nullable=False)
+    # 0 on both is a field event such as a race: no teams at all (6.1).
+    home_team_id     = db.Column(db.Integer, nullable=False, default=0)
+    away_team_id     = db.Column(db.Integer, nullable=False, default=0)
+    home_name        = db.Column(db.String(255))
+    away_name        = db.Column(db.String(255))
+    venue            = db.Column(db.String(255))
+    city             = db.Column(db.String(255))
+    start_at         = db.Column(db.DateTime)
+    local_date       = db.Column(db.Date)
+    status           = db.Column(db.String(16))
+    postponed        = db.Column(db.Boolean, nullable=False, default=False)
+    poster_url       = db.Column(db.Text)
+    thumb_url        = db.Column(db.Text)
+    first_seen       = db.Column(db.DateTime, default=datetime.utcnow)
+    last_seen        = db.Column(db.DateTime, default=datetime.utcnow)
+    # A stored event missing from a good answer: kept 7 days, since it may have moved rounds.
+    missing_since    = db.Column(db.DateTime)
+    previous_start   = db.Column(db.DateTime)
+    start_changed_at = db.Column(db.DateTime)
 
 
 class AutoRule(db.Model):

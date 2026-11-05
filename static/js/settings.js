@@ -124,6 +124,8 @@
         if (d.gpu_trial) {
           showToast(`Saved. ${d.gpu_trial.message}`,
             { type: d.gpu_trial.ok ? 'success' : 'error', durationMs: d.gpu_trial.ok ? 5000 : 15000 });
+        } else if (d.notice) {
+          showToast(`Saved. ${d.notice}`, { type: 'success', durationMs: 8000 });
         } else toast('Saved');
         markChanged(path, d.changed_from_default);
         if (d.restart_required && typeof checkRestartStatus === 'function') checkRestartStatus();

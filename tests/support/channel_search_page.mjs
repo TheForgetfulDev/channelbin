@@ -73,7 +73,8 @@ const JS = ['util.js', 'auto-rule-modal.js', 'channel-search.js'].map(
 function boot({ rows = ROWS, saved = null, url = 'http://localhost:5000/channels',
                 width = 1280, hold = null, holdCounts = false, declineWhy = null,
                 pinnedWidth = null, catalog = CATALOG, uncounted = null,
-                ruleCtx = undefined, ruleAnswers = null, listRoom = null } = {}) {
+                ruleCtx = undefined, ruleAnswers = null, listRoom = null,
+                rebuildAnswer = null, listingsTotal = 0 } = {}) {
   const held = [];
   // Mutable, so a scenario can boot normally and start parking only once it is about
   // to do the thing it cares about - the grain flip needs channel rows on screen first.
@@ -98,7 +99,9 @@ function boot({ rows = ROWS, saved = null, url = 'http://localhost:5000/channels
     let payload = { success: true };
     let status = 200;
     let park = false;
-    if (href.includes('/api/auto-rules') && method === 'PUT' && ruleAnswers && ruleAnswers.length) {
+    if (href.includes('/api/settings/search-index/rebuild') && rebuildAnswer) {
+      ({ status, payload } = rebuildAnswer);
+    } else if (href.includes('/api/auto-rules') && method === 'PUT' && ruleAnswers && ruleAnswers.length) {
       // A scenario's own answers to Save to rule, in order - the 409 that names the
       // recordings a new search no longer matches, then the save (dev/changelog/1203).
       ({ status, payload } = ruleAnswers.shift());
@@ -133,6 +136,8 @@ function boot({ rows = ROWS, saved = null, url = 'http://localhost:5000/channels
       const qs = new URLSearchParams(href.split('?')[1] || '');
       const empty = (qs.get('q') || '').startsWith('zzz-');
       const base = qs.get('grain') === 'airings' ? ROWS_AIRINGS : rows;
+      // The Programs notice asks for the Channels search its button opens.
+      const listings = qs.getAll('f.listings').length > 0;
       /* `channels_matched` rides with them, and it is null/0 wherever the total is: the two
          come off one query on the server, so no scenario may show one arriving without the
          other (dev/changelog/1080). */
@@ -140,7 +145,10 @@ function boot({ rows = ROWS, saved = null, url = 'http://localhost:5000/channels
         ? { success: true, total: null, pages: null, standing_hidden: null,
             channels_matched: null, declined: ['counts'], declined_reason: declineWhy }
         : empty
+          && !listings
           ? { success: true, total: 0, pages: 1, standing_hidden: {}, channels_matched: 0 }
+          : listings
+          ? { success: true, total: listingsTotal, pages: 1, standing_hidden: {}, channels_matched: null }
           : { success: true, total: base.total, pages: base.pages,
               standing_hidden: base.standing_hidden,
               channels_matched: base.channels_matched };
@@ -688,6 +696,17 @@ async function tableScenario() {
       obs.back_button_after_use = !!c.$('#cs-back');
     }
   }
+
+  /* A copy the fold would hide, on the page because its kept copy is not in the results
+     (dev/changelog/1435). The server decides that; the tooltip only says it. */
+  const keptAbsent = boot({ rows: { ...ROWS_DUP, rows: ROWS_DUP.rows.map((r) => (
+    r.dup && r.dup.kept_id !== r.id
+      ? { ...r, dup: { ...r.dup, kept_absent: true, others_hidden: 3 } } : r)) } });
+  await keptAbsent.settle();
+  const copyRow = ROWS_DUP.rows.find((r) => r.dup && r.dup.kept_id !== r.id);
+  const copyBadge = keptAbsent.$(`#ch-list [data-act="dup-badge"][data-id="${copyRow.id}"]`);
+  obs.kept_absent_tip = copyBadge ? copyBadge.getAttribute('data-tip') : '';
+  obs.kept_absent_kept_name = (copyRow.dup.others.find((o) => o.id === copyRow.dup.kept_id) || {}).name;
 
   /* The third guide state (dev/changelog/759). `discovery` is a member of the in-guide
      group "Fox" with no guide row of its own, so it is the row whose every control used
@@ -1406,6 +1425,141 @@ async function mobileSheetsScenario() {
   return obs;
 }
 
+/* ── The Programs notice for channels that match by name (dev/changelog/1437) ───── */
+async function nameNoticeScenario() {
+  const obs = {};
+  const AIR = 'http://localhost:5000/channels?grain=airings';
+  const noticeOf = (c) => {
+    const el = c.$('#cs-name-notice');
+    return {
+      shown: el.style.display !== 'none',
+      title: (el.querySelector('.notice-banner-title') || {}).textContent,
+      sub: (el.querySelector('.notice-banner-sub') || {}).textContent,
+      button: (el.querySelector('[data-name-notice-go]') || {}).textContent,
+      bold_in_sub: !!el.querySelector('.notice-banner-sub b, .notice-banner-sub strong'),
+      after: el.previousElementSibling ? el.previousElementSibling.id : '',
+      before: el.nextElementSibling ? el.nextElementSibling.id : '',
+    };
+  };
+  const noticeRequests = (c) => c.sent.filter((s) => s.url.includes('/search/counts')
+    && s.url.includes('f.listings'));
+  // The search it asked about, without the request bookkeeping the address bar never carries.
+  const asked = (c) => noticeRequests(c).map((s) => {
+    const p = new URLSearchParams(s.url.split('?')[1]);
+    p.delete('sid');
+    p.delete('seq');
+    return Object.fromEntries([...new Set(p.keys())].map((k) => [k, p.getAll(k)]));
+  });
+
+  const c = boot({ url: `${AIR}&q=wembley`, listingsTotal: 21 });
+  await c.settle();
+  obs.listings_on_screen = c.rowCount();
+  obs.with_rows = noticeOf(c);
+  obs.destination = asked(c).pop();
+  {
+    const last = noticeRequests(c).pop();
+    const qs = new URLSearchParams(last.url.split('?')[1]);
+    const rowsAt = c.sent.findIndex((s) => s.url.includes('/api/channels/search?'));
+    obs.request = {
+      seq: qs.get('seq'),
+      row_seq: c.lastSearch().get('seq'),
+      has_sid: !!qs.get('sid'),
+      after_the_rows: rowsAt >= 0 && rowsAt < c.sent.indexOf(noticeRequests(c)[0]),
+    };
+  }
+  obs.count_line_mentions_it = c.$('#cs-count').textContent.includes('21');
+
+  c.click(c.$('[data-name-notice-go]'));
+  await c.settle();
+  obs.after_click = {
+    grain: c.params().grain || [],
+    q: c.params().q,
+    fields: c.params().in,
+    listings: c.params()['f.listings'],
+    standing: c.params().standing,
+    chip: c.$('#cs-well, .cs-well') ? c.$('#cs-well, .cs-well').textContent : '',
+    notice: noticeOf(c).shown,
+    asked_again: asked(c).length,
+    errors: c.errors,
+  };
+  obs.after_click.same_search_as_counted = JSON.stringify(obs.destination)
+    === JSON.stringify(Object.fromEntries(Object.keys(obs.destination).map(
+      (k) => [k, c.params()[k]])));
+
+  c.click(c.$('#grainslot-panel [data-grain="airings"]'));
+  await c.settle();
+  obs.back_on_programs = { notice: noticeOf(c), listings_sent: c.params()['f.listings'] || [] };
+  c.click(c.$('#grainslot-panel [data-grain="channels"]'));
+  await c.settle();
+  obs.channels_again_listings = c.params()['f.listings'];
+
+  const none = boot({ url: `${AIR}&q=zzz-nothing`, listingsTotal: 3 });
+  await none.settle();
+  obs.no_rows = noticeOf(none);
+  obs.no_rows_empty_state = none.emptyShown();
+
+  const one = boot({ url: `${AIR}&q=zzz-one`, listingsTotal: 1 });
+  await one.settle();
+  obs.one = noticeOf(one);
+  const oneBelow = boot({ url: `${AIR}&q=wembley`, listingsTotal: 1 });
+  await oneBelow.settle();
+  obs.one_below = noticeOf(oneBelow);
+  const two = boot({ url: `${AIR}&q=wembley`, listingsTotal: 2 });
+  await two.settle();
+  obs.two = noticeOf(two);
+  const many = boot({ url: `${AIR}&q=wembley`, listingsTotal: 4260 });
+  await many.settle();
+  obs.many = noticeOf(many);
+
+  const zero = boot({ url: `${AIR}&q=wembley`, listingsTotal: 0 });
+  await zero.settle();
+  obs.zero = noticeOf(zero).shown;
+
+  const silent = async (url, opts = {}) => {
+    const s = boot({ url, listingsTotal: 21, ...opts });
+    await s.settle();
+    return { shown: noticeOf(s).shown, asked: asked(s).length };
+  };
+  obs.nothing_typed = await silent(AIR);
+  obs.only_excluded = await silent(`${AIR}&q=-flyers`);
+  obs.quoted_excluded = await silent(`${AIR}&q=${encodeURIComponent('-"a b"')}`);
+  obs.name_unticked = await silent(`${AIR}&q=wembley&in=epg-title`);
+  obs.channels_tab = await silent('http://localhost:5000/channels?q=wembley');
+  obs.declined = await silent(`${AIR}&q=wembley`, { declineWhy: 'too expensive' });
+
+  const scope = boot({ url: `${AIR}&q=wembley&in=name&in=cat`, listingsTotal: 21 });
+  await scope.settle();
+  obs.chosen_scope_crosses = (asked(scope).pop() || {}).in;
+
+  const when = boot({ url: `${AIR}&q=wembley&f.when=today`, listingsTotal: 21 });
+  await when.settle();
+  obs.when = { notice: noticeOf(when), destination_has_when: !!(asked(when).pop() || {})['f.when'] };
+
+  // The set the page itself sends once "Show airings that have ended" is ticked.
+  const past = boot({ url: `${AIR}&q=wembley&standing=grpdedup&standing=shownoepg&standing=showpast`
+    + '&standing=showuntested', listingsTotal: 21 });
+  await past.settle();
+  obs.past = { notice: noticeOf(past).shown, standing: (asked(past).pop() || {}).standing };
+
+  const held = boot({ url: `${AIR}&q=wembley`, listingsTotal: 21, holdCounts: true });
+  await held.settle();
+  obs.while_counting = noticeOf(held).shown;
+  held.setHoldCounts(false);
+  held.release();
+  await held.settle();
+  obs.after_counting = noticeOf(held).shown;
+
+  const rule = boot({ url: `${AIR}&q=wembley&rule=new`, listingsTotal: 21, ruleCtx: { mode: 'new', value: 'new' } });
+  await rule.settle();
+  obs.rule = noticeOf(rule);
+
+  const phone = boot({ url: `${AIR}&q=wembley`, listingsTotal: 21, width: 375 });
+  await phone.settle();
+  obs.phone = { notice: noticeOf(phone), cards: phone.$$('#ch-list .acard').length, errors: phone.errors };
+  obs.errors = c.errors;
+  return obs;
+}
+
 /* ── 8. The AIRING grain: the toggle, and what a showing draws ─────────── */
 async function airingScenario() {
   const obs = {};
@@ -2003,6 +2157,28 @@ async function loadingFlipScenario() {
   return obs;
 }
 
+/* ── An empty result says ended airings were left out ─ */
+async function endedHintScenario() {
+  const obs = {};
+  const AIR = 'http://localhost:5000/channels?grain=airings';
+
+  const none = boot({ url: `${AIR}&q=zzz-nothing` });
+  await none.settle();
+  obs.empty_text = none.$('#all-empty').textContent;
+  obs.standing_before = (none.params().standing || []).slice();
+  const hint = none.$('#all-empty [data-standing-off="showpast"]');
+  if (hint) { none.click(hint); await none.settle(); }
+  obs.standing_after = (none.params().standing || []).slice();
+  obs.empty_text_after = none.$('#all-empty').textContent;
+
+  const channels = boot({ url: 'http://localhost:5000/channels?q=zzz-nothing' });
+  await channels.settle();
+  obs.channels_empty_text = channels.$('#all-empty').textContent;
+
+  obs.errors = [...none.errors, ...channels.errors];
+  return obs;
+}
+
 /* ── 13. A request that never answers must not spin forever ────────────── */
 async function loadingFailScenario() {
   const obs = {};
@@ -2148,6 +2324,78 @@ async function readinessScenario() {
   obs.count_html = c.$('#cs-count').innerHTML;
   obs.errors = c.errors;
   obs.toasts = c.toasts;
+  return obs;
+}
+
+/* ── The notice's Rebuild now button (dev/changelog/1430) ───────────────
+   Both answers are unusable, so the notice is up whichever fields are in scope. */
+async function readinessRebuildScenario() {
+  const obs = {};
+  const rebuildPosts = (c) => c.sent.filter(
+    (s) => s.url.includes('/api/settings/search-index/rebuild') && s.method === 'POST');
+  const STALE = (refused = '') => ({
+    channels: { ready: false, reason: 'the channels search index is stale', rebuild_refused: refused },
+    programs: { ready: false, reason: 'the channels search index is stale', rebuild_refused: refused },
+  });
+  const READY = {
+    channels: { ready: true, reason: '', rebuild_refused: '' },
+    programs: { ready: true, reason: '', rebuild_refused: '' },
+  };
+
+  const c = boot();
+  await c.settle();
+  const bar = () => c.$('#cs-degraded');
+  const button = () => c.$('#cs-degraded button');
+  const apply = (p) => c.window.__applySearchReadiness(p);
+
+  apply(STALE());
+  const first = button();
+  obs.offered_text = first ? first.textContent : null;
+  apply(STALE());
+  obs.same_node_after_an_identical_poll = button() === first;
+
+  c.click(first);
+  obs.posts_on_click = rebuildPosts(c).length;
+  obs.disabled_while_asking = !!button() && button().disabled;
+  obs.text_while_asking = button() ? button().textContent : null;
+  // A poll that lands before the server has answered must not hand the button back.
+  apply(STALE());
+  obs.still_disabled_after_a_poll_mid_request = !!button() && button().disabled;
+  await c.settle();
+  obs.toast_after_success = c.toasts.slice();
+  obs.disabled_until_the_next_poll = !!button() && button().disabled;
+
+  const refusal = 'A search index rebuild is already running.';
+  apply(STALE(refusal));
+  obs.button_while_refused = button();
+  obs.bar_while_refused = bar().innerHTML;
+  apply(READY);
+  obs.hidden_once_ready = bar().style.display === 'none';
+  apply(STALE());
+  obs.offered_again_on_a_later_stale = !!button() && !button().disabled;
+  obs.posts_total = rebuildPosts(c).length;
+  obs.errors = c.errors;
+
+  // A rebuild that ended before any poll saw it: the next poll still frees the button.
+  const quick = boot();
+  await quick.settle();
+  quick.window.__applySearchReadiness(STALE());
+  quick.click(quick.$('#cs-degraded button'));
+  await quick.settle();
+  quick.window.__applySearchReadiness(STALE());
+  const freed = quick.$('#cs-degraded button');
+  obs.freed_by_the_next_poll = !!freed && !freed.disabled;
+
+  // The server turns it down: its reason is the toast, and the button comes back.
+  const sync = '"Provider Two" is syncing right now.';
+  const turned = boot({ rebuildAnswer: { status: 409, payload: { error: sync } } });
+  await turned.settle();
+  turned.window.__applySearchReadiness(STALE());
+  turned.click(turned.$('#cs-degraded button'));
+  await turned.settle();
+  obs.toast_on_refusal = turned.toasts.slice();
+  const back = turned.$('#cs-degraded button');
+  obs.enabled_after_refusal = !!back && !back.disabled;
   return obs;
 }
 
@@ -2315,6 +2563,7 @@ const run = async () => {
     ['declined_numbers', declinedNumbersScenario],
     ['served_numbers', servedNumbersScenario],
     ['standing_inversion', standingInversionScenario],
+    ['ended_hint', endedHintScenario],
     ['tucked', tuckedScenario],
   ];
   const ALONE = [
@@ -2323,9 +2572,11 @@ const run = async () => {
     ['loading_fail', loadingFailScenario],
     ['superseded', supersededScenario],
     ['readiness', readinessScenario],
+    ['readiness_rebuild', readinessRebuildScenario],
     ['counts_split', countsSplitScenario],
     ['counts_split_channels', countsSplitChannelGrainScenario],
     ['suggestion_count', suggestionCountScenario],
+    ['name_notice', nameNoticeScenario],
   ];
   const POOL_SIZE = 4;
   const queue = POOLED.slice();

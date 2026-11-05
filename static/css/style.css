@@ -171,6 +171,7 @@ code { font-family: var(--font-mono); background: var(--bg3); padding: 1px 5px; 
 
 /* ── Restart-required banner ───────────────────────────────────────── */
 .restart-banner {
+  display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 0.5rem 1rem;
   background: var(--warn-soft);
   border: 1px solid rgba(var(--warn-rgb), .4);
   color: var(--warn);
@@ -179,6 +180,7 @@ code { font-family: var(--font-mono); background: var(--bg3); padding: 1px 5px; 
   font-size: var(--fs-md);
   margin-bottom: 0.75rem;
 }
+.restart-banner-text { flex: 1 1 16rem; min-width: 0; }
 
 /* Server flash messages have no CSS of their own: base.html replays them
    through showToast() (DESIGN.md 3.15), so .toast is their only styling. */
@@ -385,6 +387,15 @@ body.scroll-locked { position: fixed; left: 0; right: 0; width: 100%; overflow: 
   border-color: rgba(var(--warn-rgb), .45);
   background: var(--warn-soft);
 }
+.notice-banner-ok {
+  border-color: rgba(var(--ok-rgb), .6);
+  background: var(--ok-soft);
+  box-shadow: inset 3px 0 0 var(--ok);
+}
+.notice-banner-ok .notice-banner-title { color: var(--ok-text); }
+.notice-banner-ok .notice-banner-sub { color: var(--text); }
+.notice-banner-ok .btn { background: var(--ok); border-color: var(--ok); color: var(--accent-contrast); }
+.notice-banner-ok .btn:hover { background: var(--ok); filter: brightness(1.1); }
 .notice-banner-muted {
   padding: 0.4rem 0.7rem;
   font-size: var(--fs-sm);
@@ -4780,6 +4791,46 @@ a.shot-link { display: block; width: fit-content; cursor: zoom-in; }
   .rl-list .rl-meta > * { text-align: left; }
   .rl-list .rl-k { display: inline; color: var(--text-faint); margin-right: 5px; }
 }
+
+/* == Sports Schedules (templates/sports.html, sports_league.html, mockup 50) ===============
+   The list is the Auto-record list above and the league page is its rule page. These are only
+   what those two pages add. */
+.sp-credit { font-size: var(--fs-sm); color: var(--text-faint); margin-top: 16px; }
+.sp-sort { margin-bottom: 8px; }
+/* The Auto-record list's tracks, with room for this list's longest badge and for the next game's
+   teams, which are the point of a row. Above the width where its rows turn into cards, so this
+   cannot undo that. */
+@container rl-list (min-width: 901px) {
+  .rl-list.sp-list .list-head,
+  .rl-list.sp-list .rows .row { grid-template-columns: minmax(170px, 1.5fr) 148px minmax(300px, 2.6fr) 84px 112px 44px; }
+}
+.sp-list .rl-next .sub { white-space: normal; }
+.sp-list .rl-next .game { display: block; color: var(--text); font-size: var(--fs-md); }
+/* A word in a statlist value, where the mono numeric face would read as a measurement. */
+.statlist .sv.sp-plain { font-family: inherit; font-weight: 500; }
+.sp-note { display: block; color: var(--warn); font-size: var(--fs-sm); }
+.sp-pick-list { display: flex; flex-direction: column; gap: 2px; margin-top: 10px; }
+.sp-pick {
+  display: flex; align-items: baseline; justify-content: space-between; gap: 12px; width: 100%;
+  background: none; border: 1px solid transparent; border-radius: var(--radius-sm); padding: 7px 8px;
+  color: var(--text); font: inherit; font-size: var(--fs-md); text-align: left; cursor: pointer;
+}
+.sp-pick:hover { background: var(--bg2); border-color: var(--border-soft); }
+.sp-pick[disabled] { cursor: default; color: var(--text-muted); }
+.sp-pick[disabled]:hover { background: none; border-color: transparent; }
+.sp-pick .meta { color: var(--text-muted); font-size: var(--fs-sm); flex: none; }
+.sp-lookup { margin-top: 10px; }
+.sp-entry-group { margin-bottom: 0; }
+.sp-follow-group { margin-top: 14px; }
+.sp-msg { font-size: var(--fs-md); margin-top: 10px; line-height: 1.45; }
+.sp-msg.bad { color: var(--bad); }
+.sp-msg.warn { color: var(--warn); }
+.sp-confirm-name { font-size: var(--fs-lg); font-weight: 600; }
+.sp-confirm-sub { font-size: var(--fs-sm); color: var(--text-muted); margin-top: 2px; }
+.sp-teams-note { margin-bottom: 8px; }
+.sp-team-filter { margin-top: 6px; }
+.sp-teams { max-height: 260px; overflow-y: auto; margin-top: 8px; padding-right: 4px; }
+.sp-radio { display: flex; align-items: center; gap: .5rem; min-height: var(--ctl-h); font-size: var(--fs-md); }
 
 /* What it searches for: one row per part of the search, one column, because a value is a
    phrase rather than a number - so the statlist's two-column border rule is undone. */

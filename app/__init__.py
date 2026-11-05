@@ -400,6 +400,7 @@ def create_app(config_overrides=None, start_scheduler=True):
         return {
             'app_version': __version__,
             'restart_needed': is_restart_needed(),
+            'in_docker': bool(os.environ.get('CHANNELBIN_DOCKER')),
             'display_timezone': get_display_tz_name(),
             # Resolved once here off the config this processor has already loaded, so every
             # template and every row inside it bands from the same list without a second

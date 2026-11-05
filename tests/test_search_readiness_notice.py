@@ -16,6 +16,7 @@ new payload key.
 import os
 import sys
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -24,7 +25,7 @@ from tests.support import seed  # noqa: E402
 from app import db  # noqa: E402
 from app import search_index as SI  # noqa: E402
 from app.channel_search import SearchContext  # noqa: E402
-from app.database import SearchIndexState  # noqa: E402
+from app.database import ACCOUNT_STATUS_SYNCING, SearchIndexState  # noqa: E402
 
 NAV_URL = '/api/nav-status'
 
@@ -78,7 +79,8 @@ class NavStatusPayloadTests(unittest.TestCase):
         payload = self._search()
         self.assertEqual(set(payload), {'channels', 'programs'})
         for key, answer in payload.items():
-            self.assertEqual(set(answer), {'ready', 'reason'}, f'{key} has the wrong shape')
+            self.assertEqual(set(answer), {'ready', 'reason', 'rebuild_refused'},
+                             f'{key} has the wrong shape')
             self.assertIsInstance(answer['ready'], bool)
             self.assertIsInstance(answer['reason'], str)
 
@@ -108,6 +110,58 @@ class NavStatusPayloadTests(unittest.TestCase):
         payload = self._search()
         self.assertFalse(payload['channels']['ready'])
         self.assertFalse(payload['programs']['ready'])
+
+
+class RebuildRefusedTests(unittest.TestCase):
+    """What the search page's notice is told about offering a rebuild (dev/changelog/1430). The
+    notice shows the button only when this is empty, so it has to agree with the route that
+    would turn the click down."""
+
+    def setUp(self):
+        self.t = make_test_app(csrf=False)
+        self.client = self.t.client
+        _seed_searchable()
+        _mark(SI.SEARCH_INDEX_CHANNELS)
+        _mark(SI.SEARCH_INDEX_PROGRAMS, watermark='moved-since')
+
+    def tearDown(self):
+        SI._rebuilding = False
+        self.t.cleanup()
+
+    def _answer(self):
+        return self.client.get(NAV_URL).get_json()['search']['programs']
+
+    def test_an_unusable_index_with_nothing_running_may_be_rebuilt(self):
+        answer = self._answer()
+        self.assertFalse(answer['ready'])
+        self.assertEqual(answer['rebuild_refused'], '')
+
+    def test_a_running_rebuild_says_so_in_the_words_the_route_refuses_with(self):
+        SI._rebuilding = True
+        answer = self._answer()
+        self.assertIn('already running', answer['rebuild_refused'])
+        resp = self.client.post('/api/settings/search-index/rebuild')
+        self.assertEqual(resp.status_code, 409)
+        self.assertEqual(resp.get_json()['error'], answer['rebuild_refused'])
+
+    def test_a_syncing_account_is_named_in_the_words_the_route_refuses_with(self):
+        acct = seed.make_account(name='Provider Two')
+        acct.status = ACCOUNT_STATUS_SYNCING
+        db.session.commit()
+        answer = self._answer()
+        self.assertIn('Provider Two', answer['rebuild_refused'])
+        resp = self.client.post('/api/settings/search-index/rebuild')
+        self.assertEqual(resp.status_code, 409)
+        self.assertEqual(resp.get_json()['error'], answer['rebuild_refused'])
+
+    def test_a_healthy_poll_does_not_ask(self):
+        """Every page polls this, so a healthy poll pays nothing for a notice nobody sees."""
+        _mark(SI.SEARCH_INDEX_PROGRAMS)
+        with mock.patch.object(SI, 'manual_rebuild_refusal') as asked:
+            answer = self._answer()
+        self.assertTrue(answer['ready'])
+        self.assertEqual(answer['rebuild_refused'], '')
+        asked.assert_not_called()
 
 
 class DegradedStateTests(unittest.TestCase):

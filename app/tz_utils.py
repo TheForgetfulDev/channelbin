@@ -217,18 +217,23 @@ def day_label(dt_utc: datetime, now: datetime, tz: ZoneInfo) -> str:
     """'Today' / 'Tomorrow' / 'Yesterday', else 'Sun Oct 18' (with the year when it is not
     this year), for a naive-UTC instant in the display timezone. The one spelling of a day
     heading beside a clock time - the recordings list and the Rules pages both use it."""
-    local = to_local(dt_utc, tz)
+    return date_label(to_local(dt_utc, tz).date(), now, tz)
+
+
+def date_label(day, now: datetime, tz: ZoneInfo) -> str:
+    """day_label() for a calendar date with no instant behind it, such as a sports event's own
+    local date."""
     today = to_local(now, tz).date()
-    delta = (local.date() - today).days
+    delta = (day - today).days
     if delta == 0:
         return 'Today'
     if delta == 1:
         return 'Tomorrow'
     if delta == -1:
         return 'Yesterday'
-    if local.year == today.year:
-        return local.strftime('%a %b ') + str(local.day)
-    return local.strftime('%b ') + f'{local.day}, {local.year}'
+    if day.year == today.year:
+        return day.strftime('%a %b ') + str(day.day)
+    return day.strftime('%b ') + f'{day.day}, {day.year}'
 
 
 def ago(when: datetime, now: datetime, none_value: str = 'never') -> str:

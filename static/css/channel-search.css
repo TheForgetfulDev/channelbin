@@ -442,9 +442,11 @@
    would teach the user to distrust results that are correct. Flows to two lines at phone
    width rather than truncating - the engine's own reason sentence is the useful half and
    must not be the half that gets cut. dev/changelog/427, 681. */
-.cs-degraded-bar { margin-bottom: 1rem; padding: .55rem .75rem; border-radius: var(--radius-sm);
+.cs-degraded-bar { display: flex; align-items: center; gap: .6rem .9rem; flex-wrap: wrap;
+  margin-bottom: 1rem; padding: .55rem .75rem; border-radius: var(--radius-sm);
   border: 1px solid var(--warn); background: var(--warn-soft);
   font-size: var(--fs-md); color: var(--text); line-height: 1.45; }
+.cs-degraded-bar .csd-text { flex: 1 1 20rem; min-width: 0; }
 .cs-degraded-bar .csd-why { display: block; margin-top: .2rem;
   color: var(--text-muted); font-size: var(--fs-sm); overflow-wrap: anywhere; }
 
@@ -493,6 +495,11 @@
    own width clips instead of stretching the page; channel-search.js mirrors #ch-list's
    scrollLeft onto it so the header still tracks the rows horizontally. */
 #ch-list { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+/* A row among rows, until there are no rows and it stands on its own above the empty state. */
+.cs-name-notice { border-radius: 0; border-width: 0 0 1px; margin-bottom: 0; }
+.cs-name-notice .notice-banner-sub { margin-top: 4px; line-height: 1.45; }
+.cs-name-notice .btn { flex: none; }
+.cs-name-notice-alone { border-radius: var(--radius); border-width: 1px; margin-bottom: .75rem; }
 /* The row's gap and padding are tokens because channel-search.js budgets against them:
    freezeNameCol() has to know how much of the list's width the tracks it is NOT sizing
    have already claimed, and a second hand-written copy of either number is the coupled-
@@ -1189,6 +1196,7 @@
 
 @media (max-width: 480px) {
   .cb-all { padding: .6rem; }
+  .cs-name-notice .btn { width: 100%; justify-content: center; }
   /* The label track is measured against the longest short label ("Health"), so it
      shrinks with the page rather than eating the value's width. */
   .cc-rows { grid-template-columns: 52px minmax(0,1fr); }

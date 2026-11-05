@@ -49,7 +49,8 @@ from ..channel_search import (DEFAULT_FIELDS, DEFAULT_PAGE_SIZE, DEFAULT_SORT,
                               DOW_LABELS, DOW_VALUES,
                               FIELD_GROUPS, FIELDS, GRAIN_CHANNELS,
                               GROUP_ANY, HEALTH_UNTESTED,
-                              HEALTH_UNTESTED_LABEL, IMPLEMENTED_GRAINS, MAX_PAGE_SIZE,
+                              HEALTH_UNTESTED_LABEL, IMPLEMENTED_GRAINS, LISTINGS_LABELS,
+                              MAX_PAGE_SIZE,
                               OTHER_LABELS, OTHER_NEW, OTHER_VALUES, SORTS, SORTS_BY_GRAIN,
                               STANDING_OPTIONS, WHEN_STATIC_LABELS, WHEN_STATIC_VALUES,
                               SearchContext, SearchState, SearchStateError,
@@ -848,6 +849,7 @@ def channel_search_catalog_api():
         # no fixed values at all: like Program length, the page builds its one value from its
         # own controls.
         'dow_values': [{'value': v, 'label': DOW_LABELS[v]} for v in DOW_VALUES],
+        'listings_values': [{'value': v, 'label': label} for v, label in LISTINGS_LABELS.items()],
         # `page_size` is what the ENGINE means by a URL with no `per_page`; `opening_page_size`
         # is what the page opens with instead, from Settings. Two keys because they are two
         # facts: the page writes `per_page` into its own address bar whenever it differs from

@@ -164,7 +164,7 @@ def _age_phrase(started_at, now):
     return f'{seconds // 60}m'
 
 
-def try_start(kind: str, label: str = '', force: bool = False):
+def try_start(kind: str, label: str = '', force: bool = False, ignoring: tuple = ()):
     """Ask permission to start `kind`, and register it in the same breath.
 
     Returns a `Ticket` (`.granted` True) or a `Refusal` (`.granted` False). Check
@@ -176,6 +176,8 @@ def try_start(kind: str, label: str = '', force: bool = False):
     and never refuses: it is for actions a present user has already been warned about and
     chosen to take (the manual sync and manual rebuild override paths,
     `DESIGN-concurrency.md` §5.4), and for work that is the tail of an already-admitted run.
+    `ignoring` waves through only the named kinds, for a caller the user has told to run
+    alongside one blocker but which must still yield to the others (app/sync_queue.py).
 
     Callers must apply their recording guards *before* calling this - recordings are not
     clients of this registry (see the module docstring).
@@ -191,7 +193,7 @@ def try_start(kind: str, label: str = '', force: bool = False):
         blocker = None
         if not force:
             for held in _active.values():
-                if held.kind in blockers:
+                if held.kind in blockers and held.kind not in ignoring:
                     blocker = held
                     break
         if blocker is None:

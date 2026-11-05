@@ -571,6 +571,7 @@ class AccountPageTests(unittest.TestCase):
         known = {
             'new_account': '+ Add Account, the one account action that stays a page (17.1)',
             'account_detail': 'the row itself, and its name, link to the account page',
+            'sync_queue_api': 'Sync All, through the JSON API like every other action',
         }
         src = open(os.path.join(REPO, 'templates', 'accounts.html')).read()
         today = set(re.findall(r"url_for\('accounts\.(\w+)'", src))

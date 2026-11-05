@@ -23,6 +23,7 @@ from .preview import preview_bp
 from .auto_rules import auto_rules_bp
 from .setup import setup_bp
 from .epg_manager import epg_manager_bp
+from .sports import sports_bp
 
 
 def register_blueprints(app):
@@ -43,6 +44,7 @@ def register_blueprints(app):
     app.register_blueprint(health_check_profiles_bp)
     app.register_blueprint(tags_bp)
     app.register_blueprint(auto_rules_bp)
+    app.register_blueprint(sports_bp)
     app.register_blueprint(channel_groups_bp)
     app.register_blueprint(channel_search_bp)
     app.register_blueprint(channel_hide_rules_bp)

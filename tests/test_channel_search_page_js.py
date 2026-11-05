@@ -205,6 +205,124 @@ class _PageJs:
         self.assertEqual(self.obs['errors'], [])
 
 
+class NameNoticeTests(_PageJs, unittest.TestCase):
+    """The Programs notice for channels that match by name and have nothing scheduled
+    (dev/changelog/1437). Its number is the answer for the search its button opens."""
+
+    SCENARIO = 'name_notice'
+    LINE = ("If you can't find what you're looking for below, you may be looking for one of "
+            'these channels. Take a look at all 21 in the Channel Search.')
+
+    def test_it_is_the_first_row_under_the_column_headers(self):
+        self.assertGreater(self.obs['listings_on_screen'], 0)
+        notice = self.obs['with_rows']
+        self.assertTrue(notice['shown'])
+        self.assertEqual((notice['after'], notice['before']), ('ahead', 'ch-list'))
+
+    def test_it_says_the_agreed_words_with_only_the_first_line_bold(self):
+        notice = self.obs['with_rows']
+        self.assertEqual(notice['title'],
+                         '21 channels match your search but have no scheduled listings.')
+        self.assertIn('which is common with live sports.', notice['sub'])
+        self.assertIn(self.LINE, notice['sub'])
+        self.assertFalse(notice['bold_in_sub'])
+        self.assertEqual(notice['button'].strip(), 'Search Channels')
+
+    def test_it_stays_out_of_the_count_line(self):
+        self.assertFalse(self.obs['count_line_mentions_it'])
+
+    def test_it_counts_the_channels_search_the_flip_would_run(self):
+        asked = self.obs['destination']
+        self.assertNotIn('grain', asked)
+        self.assertEqual(asked['f.listings'], ['none'])
+        self.assertEqual(asked['in'], ['name'])
+        self.assertEqual(asked['sort'], [self.obs_catalog_channels()['default_sort']])
+        self.assertEqual(asked['standing'], sorted(self.obs_catalog_channels()['default_standing']))
+
+    def test_it_is_cancellable_and_goes_out_behind_the_rows(self):
+        request = self.obs['request']
+        self.assertTrue(request['has_sid'])
+        self.assertEqual(request['seq'], request['row_seq'])
+        self.assertTrue(request['after_the_rows'])
+
+    def obs_catalog_channels(self):
+        return _observations()['catalog_by_grain']['channels']
+
+    def test_the_button_lands_on_exactly_what_was_counted(self):
+        after = self.obs['after_click']
+        self.assertEqual(after['errors'], [])
+        self.assertEqual(after['grain'], [])
+        self.assertEqual(after['listings'], ['none'])
+        self.assertTrue(after['same_search_as_counted'])
+        self.assertFalse(after['notice'])
+
+    def test_the_filter_stays_behind_on_programs_and_comes_back_with_channels(self):
+        back = self.obs['back_on_programs']
+        self.assertEqual(back['listings_sent'], [])
+        self.assertTrue(back['notice']['shown'])
+        self.assertEqual(self.obs['channels_again_listings'], ['none'])
+
+    def test_with_no_listings_it_leads_the_empty_state_and_does_not_say_below(self):
+        notice = self.obs['no_rows']
+        self.assertTrue(self.obs['no_rows_empty_state'])
+        self.assertEqual(notice['before'], 'all-empty')
+        self.assertIn('You may be looking for one of these channels. Take a look at all 3 in '
+                      'the Channel Search.', notice['sub'])
+        self.assertNotIn('below', notice['sub'])
+
+    def test_one_channel_reads_as_one(self):
+        self.assertEqual(self.obs['one']['title'],
+                         '1 channel matches your search but has no scheduled listings.')
+        self.assertIn('You may be looking for this channel. Take a look at it in the Channel '
+                      'Search.', self.obs['one']['sub'])
+        self.assertIn("If you can't find what you're looking for below, you may be looking for "
+                      'this channel.', self.obs['one_below']['sub'])
+
+    def test_two_channels_read_as_both_and_many_are_formatted(self):
+        self.assertIn('Take a look at both in the Channel Search.', self.obs['two']['sub'])
+        self.assertIn('4,260 channels match', self.obs['many']['title'])
+        self.assertIn('all 4,260', self.obs['many']['sub'])
+
+    def test_it_is_silent_when_nothing_matches_by_name(self):
+        self.assertFalse(self.obs['zero'])
+
+    def test_it_does_not_even_ask_when_it_could_not_apply(self):
+        for case in ('nothing_typed', 'only_excluded', 'quoted_excluded', 'name_unticked',
+                     'channels_tab'):
+            with self.subTest(case):
+                self.assertEqual(self.obs[case], {'shown': False, 'asked': 0})
+
+    def test_a_declined_count_draws_nothing(self):
+        self.assertEqual(self.obs['declined'], {'shown': False, 'asked': 1})
+
+    def test_it_waits_for_its_number(self):
+        self.assertFalse(self.obs['while_counting'])
+        self.assertTrue(self.obs['after_counting'])
+
+    def test_a_scope_you_chose_crosses_like_the_tab_switch_carries_it(self):
+        self.assertEqual(self.obs['chosen_scope_crosses'], ['name', 'cat'])
+
+    def test_a_programs_only_filter_does_not_change_the_number(self):
+        self.assertTrue(self.obs['when']['notice']['shown'])
+        self.assertFalse(self.obs['when']['destination_has_when'])
+
+    def test_the_ended_option_does_not_change_the_number(self):
+        self.assertTrue(self.obs['past']['notice'])
+        self.assertEqual(self.obs['past']['standing'], ['shownoepg', 'showuntested'])
+
+    def test_a_rule_preview_says_a_rule_will_not_record_them(self):
+        self.assertIn('A rule records listings, so it will not record these channels.',
+                      self.obs['rule']['sub'])
+        self.assertNotIn('A rule records', self.obs['with_rows']['sub'])
+
+    def test_a_phone_gets_the_same_notice_above_its_cards(self):
+        phone = self.obs['phone']
+        self.assertEqual(phone['errors'], [])
+        self.assertGreater(phone['cards'], 0)
+        self.assertIn(self.LINE, phone['notice']['sub'])
+        self.assertEqual(phone['notice']['before'], 'ch-list')
+
+
 class BootTests(_PageJs, unittest.TestCase):
     """First paint, once the JS has actually run."""
 
@@ -464,6 +582,15 @@ class TableTests(_PageJs, unittest.TestCase):
         the row's `dup.key` rather than assuming a shared URL. This corpus's cluster is a
         URL one; the provider wording is the same function's other branch."""
         self.assertIn('3 channels share this stream URL', self.obs['dup_badge_tip'])
+
+    def test_a_copy_on_the_page_because_its_kept_copy_is_not_says_so(self):
+        """dev/docs/BUGS.md 2026-11-04: it carries the DUP badge with "Show duplicates" off,
+        which needs explaining, and only when the server says that is why it is there."""
+        tip = self.obs['kept_absent_tip']
+        self.assertIn(f"the copy kept, {self.obs['kept_absent_kept_name']}, is not in these results",
+                      tip)
+        self.assertNotIn('is not in these results', self.obs['dup_badge_tip'])
+        self.assertNotIn('hidden right now', tip)
 
     def test_the_drill_in_turns_show_duplicates_on(self):
         """Otherwise the copies it just went to look at are the very rows that are hidden
@@ -2063,6 +2190,52 @@ class SearchReadinessNoticeTests(_PageJs, unittest.TestCase):
         self.assertEqual(self.obs['toasts'], [])
 
 
+class ReadinessRebuildTests(_PageJs, unittest.TestCase):
+    """The notice's Rebuild now button (dev/changelog/1430). jsdom computes no layout, so this
+    speaks to what the button does and when it is there, never how the bar arranges it."""
+
+    SCENARIO = 'readiness_rebuild'
+
+    def test_an_unusable_index_offers_the_rebuild(self):
+        self.assertEqual(self.obs['offered_text'], 'Rebuild now')
+
+    def test_a_poll_with_nothing_new_leaves_the_button_in_place(self):
+        """Replacing it between press and release would lose the click."""
+        self.assertTrue(self.obs['same_node_after_an_identical_poll'])
+
+    def test_a_click_posts_once_and_disables_it(self):
+        self.assertEqual(self.obs['posts_on_click'], 1)
+        self.assertTrue(self.obs['disabled_while_asking'])
+        self.assertEqual(self.obs['text_while_asking'], 'Rebuilding...')
+        self.assertEqual(self.obs['posts_total'], 1)
+
+    def test_a_poll_mid_request_does_not_hand_it_back(self):
+        self.assertTrue(self.obs['still_disabled_after_a_poll_mid_request'])
+
+    def test_success_is_toasted_and_holds_until_the_next_poll(self):
+        self.assertEqual(self.obs['toast_after_success'],
+                         ['Rebuilding the search indexes - this can take a couple of minutes.'])
+        self.assertTrue(self.obs['disabled_until_the_next_poll'])
+
+    def test_while_refused_the_reason_shows_instead_of_the_button(self):
+        self.assertIsNone(self.obs['button_while_refused'])
+        self.assertIn('already running', self.obs['bar_while_refused'])
+
+    def test_it_goes_away_with_the_notice_and_returns_with_it(self):
+        self.assertTrue(self.obs['hidden_once_ready'])
+        self.assertTrue(self.obs['offered_again_on_a_later_stale'])
+
+    def test_the_next_poll_frees_a_button_whose_rebuild_ended_early(self):
+        self.assertTrue(self.obs['freed_by_the_next_poll'])
+
+    def test_a_refused_click_toasts_the_servers_reason_and_gives_the_button_back(self):
+        self.assertEqual(self.obs['toast_on_refusal'], ['"Provider Two" is syncing right now.'])
+        self.assertTrue(self.obs['enabled_after_refusal'])
+
+    def test_nothing_threw(self):
+        self.assertEqual(self.obs['errors'], [])
+
+
 class DeclinedNumbersTests(_PageJs, unittest.TestCase):
     """When the server declines the numbers, the page says so IN THE SERVER'S WORDS.
 
@@ -2127,6 +2300,30 @@ class ServedNumbersTests(_PageJs, unittest.TestCase):
 
     def test_no_uncounted_marker_when_the_total_was_served(self):
         self.assertFalse(self.obs['count_uncounted_present'])
+
+
+class EndedHintTests(_PageJs, unittest.TestCase):
+    """BUGS.md 2026-11-04: a search whose every match had ended said only that nothing matched.
+    Ended airings carry no count, so an empty result says they were left out."""
+
+    SCENARIO = 'ended_hint'
+
+    def test_an_empty_result_says_ended_airings_are_left_out(self):
+        self.assertIn("Ended airings aren't included.", self.obs['empty_text'])
+        self.assertIn('Show airings that have ended', self.obs['empty_text'])
+
+    def test_clicking_it_turns_the_option_on(self):
+        self.assertNotIn('showpast', self.obs['standing_before'])
+        self.assertIn('showpast', self.obs['standing_after'])
+
+    def test_the_hint_goes_once_ended_airings_are_included(self):
+        self.assertNotIn('Ended airings', self.obs['empty_text_after'])
+
+    def test_the_channel_grain_never_carries_it(self):
+        self.assertNotIn('Ended airings', self.obs['channels_empty_text'])
+
+    def test_no_script_errors(self):
+        self.assertEqual(self.obs['errors'], [])
 
 
 class StandingInversionTests(_PageJs, unittest.TestCase):

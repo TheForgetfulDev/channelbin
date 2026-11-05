@@ -160,7 +160,7 @@ class CheckBusyTests(unittest.TestCase):
     def test_a_syncing_account_blocks_and_is_named(self):
         """Advisory-only when it was added (dev/changelog/680), blocking since
         dev/changelog/732: "safely cancellable" is an argument about corruption, not about
-        waste, and a restart mid-sync still costs the provider fetch plus up to ~25 minutes
+        waste, and a restart mid-sync still costs the provider fetch plus up to 10 minutes
         of degraded search before the index janitor repairs it."""
         db.session.add(M3uAccount(name='Provider Two', status='SYNCING',
                                   m3u_url='http://provider.test/playlist.m3u8'))

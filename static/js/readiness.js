@@ -342,6 +342,27 @@ affects the verdict or the count beside Readiness in the menu.">Ignore this</but
     // arrived with the payload so a silenced check stops counting on the click.
     if (window.__applyReadiness) window.__applyReadiness(payload.nav);
     render();
+    followSyncQueue(payload.sync_queue_active);
+  }
+
+  /* While a sync queue runs, the page re-reads itself so the row follows it, and says when it
+     ends. A re-read waits out a drag-select, because render() would wipe it. */
+  const QUEUE_POLL_MS = 10000;
+  let queueTimer = null;
+  let queueWasActive = false;
+
+  function followSyncQueue(active) {
+    clearTimeout(queueTimer);
+    if (queueWasActive && !active) {
+      showToast('The account syncs have finished. The check below shows how they went.');
+    }
+    queueWasActive = !!active;
+    if (active) queueTimer = setTimeout(rereadForQueue, QUEUE_POLL_MS);
+  }
+
+  function rereadForQueue() {
+    if (hasSelectionIn(root)) queueTimer = setTimeout(rereadForQueue, QUEUE_POLL_MS);
+    else load();
   }
 
   function load() {
@@ -389,19 +410,28 @@ affects the verdict or the count beside Readiness in the menu.">Ignore this</but
     });
   }
 
-  /* A one-click fix is a POST to the endpoint that already owns it - the account sync,
-     the index rebuild, the notification test. Several URLs is still one click: "sync the
-     2 stale accounts" is one button. */
+  /* A one-click fix is a POST to the endpoint that already owns it - the index rebuild, the
+     notification test, stopping the sync queue. */
   function applyFix(id) {
     const row = byId(id);
     if (!row || !row.action) return;
+    if (row.action.accounts) {
+      confirmSyncQueue({
+        url: row.action.urls[0],
+        label: row.action.label,
+        accounts: row.action.accounts,
+        onStart: () => { state.busy.add(id); render(); },
+        onSettled: () => { state.busy.delete(id); load(); },
+      });
+      return;
+    }
     state.busy.add(id);
     render();
     row.action.urls.reduce(
       (chain, url) => chain.then(() => jsonFetch(url, { method: 'POST' })),
       Promise.resolve(),
-    ).then(() => {
-      showToast(`${row.action.label} - done. Re-checking.`);
+    ).then((res) => {
+      showToast((res && res.message) || `${row.action.label} - done. Re-checking.`);
     }).catch((e) => {
       showToast(`${row.action.label} failed: ${e.message}`, { type: 'error' });
     }).finally(() => {

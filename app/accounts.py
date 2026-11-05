@@ -923,7 +923,7 @@ def render_filename_template(template: str, program: dict, tag_cleanup: list = N
 # ── Account sync ──────────────────────────────────────────────────────────────
 
 def sync_account(app, account_id: int, use_dump: bool = False, force_epg_resync: bool = False,
-                 force_admission: bool = False):
+                 force_admission: bool = False, admission_ignoring: tuple = ()):
     """Sync channels and EPG data for one account (M3U or Xtream).
 
     Safe to call from a background thread or APScheduler job.
@@ -944,7 +944,7 @@ def sync_account(app, account_id: int, use_dump: bool = False, force_epg_resync:
     and None otherwise, including when the per-account lock was already held.
     `force_admission=True` registers without asking: manual sync is a present user's call
     after the warn-and-override flow (§5.4), and it still registers so everything that
-    yields to a sync can see it.
+    yields to a sync can see it. `admission_ignoring` is admission's `ignoring`.
     """
     lock = _get_sync_lock(account_id)
     if not lock.acquire(blocking=False):
@@ -954,7 +954,7 @@ def sync_account(app, account_id: int, use_dump: bool = False, force_epg_resync:
     ticket = None
     try:
         ticket = admission.try_start(admission.KIND_SYNC, f'account {account_id}',
-                                     force=force_admission)
+                                     force=force_admission, ignoring=admission_ignoring)
         if not ticket.granted:
             return ticket
 
@@ -988,24 +988,30 @@ def manual_sync_restarts_schedule(cfg: dict) -> bool:
 
 
 def run_manual_sync(app, account_id: int, *, force_epg_resync: bool = False,
-                    restart_schedule: bool = False):
-    """The thread body of every manual sync. `restart_schedule` lets the run stand in for the
+                    restart_schedule: bool = False, force_admission: bool = True,
+                    admission_ignoring: tuple = ()):
+    """The body of every manual sync. `restart_schedule` lets the run stand in for the
     account's next scheduled sync; the schedule moves after the sync has run, and only if it
-    succeeded (scheduler.restart_schedule_after_manual_sync, dev/changelog/1134).
+    succeeded (scheduler.restart_schedule_after_manual_sync, dev/changelog/1134). Returns what
+    sync_account() returned: an `admission.Refusal` when it did not run.
 
     force_admission: a manual sync is a present user's call, already past the sync_conflicts
     warn-and-override flow (DESIGN-concurrency.md §5.4). It still registers, so everything
-    that yields to a sync can see it."""
+    that yields to a sync can see it. The sync queue turns it off, because the one thing it
+    must never do is overlap another sync (app/sync_queue.py)."""
     from .scheduler import restart_schedule_after_manual_sync
 
     ran_at = datetime.utcnow()
-    sync_account(app, account_id, force_epg_resync=force_epg_resync, force_admission=True)
+    outcome = sync_account(app, account_id, force_epg_resync=force_epg_resync,
+                           force_admission=force_admission,
+                           admission_ignoring=admission_ignoring)
     if restart_schedule:
         with app.app_context():
             restart_schedule_after_manual_sync(account_id, ran_at)
+    return outcome
 
 
-def sync_conflicts(account_id: int) -> list[str]:
+def sync_conflicts(account_id: int | None, *, other_syncs: bool = True) -> list[str]:
     """Reasons a manual sync for this account is a bad idea right now, as user-facing prose.
 
     Empty list = no conflict. This is the ONE implementation of the check shared by both
@@ -1017,6 +1023,9 @@ def sync_conflicts(account_id: int) -> list[str]:
 
     Each string names the conflict AND its consequence: the user is being asked to decide,
     so "a recording is in progress" alone does not tell them what they are risking.
+
+    `other_syncs=False` leaves out another account's sync: the sync queue waits its turn
+    behind one, so to the queue it is not a clash anyone has to decide about.
     """
     # Re-imported locally, not taken from the module-top binding, so tests can patch
     # app.config.load_config and have it reach this function (CLAUDE.md Testing).
@@ -1055,7 +1064,7 @@ def sync_conflicts(account_id: int) -> list[str]:
 
     # Advisory only, which is what active_kinds() is for - the manual sync goes ahead
     # regardless once the user confirms, so there is no decision here to race.
-    if admission.KIND_SYNC in admission.active_kinds():
+    if other_syncs and admission.KIND_SYNC in admission.active_kinds():
         conflicts.append(
             'Another account is already syncing - two syncs write the same database at '
             'once, so both will be slower.'

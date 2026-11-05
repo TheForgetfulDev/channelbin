@@ -10,15 +10,16 @@ committed its channel upserts at 15:23:06 UTC, the process was restarted at 15:2
 for 6.5 hours (worst case ~22, the sync interval) with every EPG search running the LIKE
 fallback over 2.2M rows.
 
+A 15-minute grace window kept the job from acting on its first look until dev/changelog/1431,
+when a 96-row EPG key edit left program search unindexed for 27 minutes.
+
 What is asserted, in order:
 
-  1. **The grace window is real in both directions** - a freshly-stale index is left alone
-     for the owner that should fix it, and one nobody fixed is repaired.
+  1. **It repairs on its first look**, and leaves a healthy index alone.
   2. **It asks admission rather than reading it.** A janitor that checks who is running and
      then starts has rebuilt the exact check-then-act race dev/changelog/679 closed, so the
      refusal path is asserted through a really-held ticket, not a mocked predicate.
-  3. **A failing index is throttled to one attempt per grace window**, not one per tick -
-     a programs rebuild is ~76s of CPU and a tick is 10 minutes.
+  3. **An attempt that failed or was refused is tried again on the next tick.**
   4. **An index someone else is already rebuilding is not "stale with no owner"**, and a
      tick that does nothing is not recorded as a job run.
 
@@ -29,7 +30,7 @@ Run standalone:
 import os
 import sys
 import unittest
-from datetime import datetime, timedelta
+from datetime import datetime
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -38,10 +39,9 @@ from app import admission, db  # noqa: E402
 from app import scheduler as sched  # noqa: E402
 from app import search_index as SI  # noqa: E402
 from app.accounts import _upsert_channels  # noqa: E402
-from app.database import JobRun, M3uAccount, SearchIndexState  # noqa: E402
-from tests.support import make_test_app  # noqa: E402
-
-GRACE = 15
+from app.config import _DEFAULTS, _cfg_m008_drop_index_janitor_grace  # noqa: E402
+from app.database import Channel, JobRun, M3uAccount, SearchIndexState  # noqa: E402
+from tests.support import make_test_app, seed  # noqa: E402
 
 
 def _stream(sid, **overrides):
@@ -89,11 +89,9 @@ class _JanitorCase(unittest.TestCase):
         _upsert_channels(self.account, self.streams)
         db.session.commit()
         SI.rebuild_search_indexes('test setup')
-        SI._stale_since.clear()
 
     def tearDown(self):
         admission.reset_for_tests()
-        SI._stale_since.clear()
         self.t.cleanup()
 
     def _make_stale(self):
@@ -104,85 +102,78 @@ class _JanitorCase(unittest.TestCase):
         db.session.expire_all()
         self.assertFalse(SI.search_index_readiness(SI.SEARCH_INDEX_CHANNELS)[0])
 
-    def _backdate(self, minutes, name=SI.SEARCH_INDEX_CHANNELS):
-        """Pretend the clock entry was written `minutes` ago."""
-        SI._stale_since[name] = datetime.utcnow() - timedelta(minutes=minutes)
-
     def _ready(self, name=SI.SEARCH_INDEX_CHANNELS):
         return SI.search_index_readiness(name)[0]
 
 
-class GraceWindowTests(_JanitorCase):
-    def test_a_fresh_index_is_left_alone_and_keeps_no_clock(self):
+class FirstLookTests(_JanitorCase):
+    def test_a_fresh_index_is_left_alone(self):
         with mock.patch.object(SI, 'rebuild_search_indexes') as rebuild:
-            outcome = SI.run_index_janitor(GRACE)
+            outcome = SI.run_index_janitor()
         rebuild.assert_not_called()
         self.assertEqual(outcome['due'], [])
-        self.assertNotIn(SI.SEARCH_INDEX_CHANNELS, SI._stale_since)
 
-    def test_the_first_tick_starts_the_clock_and_rebuilds_nothing(self):
-        """The owner that should repair this - a sync's own close-out rebuild - has not had
-        its chance yet. Repairing on sight would race every ordinary sync."""
+    def test_the_first_look_at_a_stale_index_repairs_it(self):
+        """The headline. A tick that finds a stale index with nobody on it does the repair
+        there and then, rather than noting it and waiting for a later tick."""
         self._make_stale()
-        with mock.patch.object(SI, 'rebuild_search_indexes') as rebuild:
-            SI.run_index_janitor(GRACE)
-        rebuild.assert_not_called()
-        self.assertIn(SI.SEARCH_INDEX_CHANNELS, SI._stale_since)
-
-    def test_consecutive_ticks_inside_the_grace_window_rebuild_nothing(self):
-        """No backdating here on purpose: this is the real cadence, several ticks arriving
-        while the window is still open, and it is what proves the clock is compared against
-        rather than merely written."""
-        self._make_stale()
-        with mock.patch.object(SI, 'rebuild_search_indexes') as rebuild:
-            for _ in range(4):
-                SI.run_index_janitor(GRACE)
-        rebuild.assert_not_called()
-
-    def test_a_tick_one_minute_short_of_the_window_rebuilds_nothing(self):
-        self._make_stale()
-        SI.run_index_janitor(GRACE)
-        self._backdate(GRACE - 1)
-        with mock.patch.object(SI, 'rebuild_search_indexes') as rebuild:
-            SI.run_index_janitor(GRACE)
-        rebuild.assert_not_called()
-
-    def test_an_index_stale_past_the_grace_window_is_rebuilt(self):
-        """The headline: nobody came, so the janitor does it."""
-        self._make_stale()
-        SI.run_index_janitor(GRACE)
-        self._backdate(GRACE)
-        outcome = SI.run_index_janitor(GRACE)
+        outcome = SI.run_index_janitor()
         self.assertEqual(outcome['due'], [SI.SEARCH_INDEX_CHANNELS])
         self.assertTrue(outcome['results'][SI.SEARCH_INDEX_CHANNELS])
         self.assertTrue(self._ready(), 'the degraded window must actually be closed')
 
-    def test_a_repaired_index_drops_its_clock_entry(self):
+    def test_the_tick_after_a_repair_finds_nothing_to_do(self):
         self._make_stale()
-        SI.run_index_janitor(GRACE)
-        self._backdate(GRACE)
-        SI.run_index_janitor(GRACE)
-        SI.run_index_janitor(GRACE)
-        self.assertNotIn(SI.SEARCH_INDEX_CHANNELS, SI._stale_since)
-
-    def test_an_index_repaired_by_somebody_else_drops_its_clock_entry(self):
-        """A sync arriving mid-grace is the expected outcome, not an edge case - the clock
-        has to reset, or the next staleness inherits a window that already elapsed."""
-        self._make_stale()
-        SI.run_index_janitor(GRACE)
-        SI.rebuild_search_indexes('a sync close-out')
+        SI.run_index_janitor()
         with mock.patch.object(SI, 'rebuild_search_indexes') as rebuild:
-            SI.run_index_janitor(GRACE)
-        rebuild.assert_not_called()
-        self.assertNotIn(SI.SEARCH_INDEX_CHANNELS, SI._stale_since)
-
-    def test_a_grace_of_zero_disables_the_janitor(self):
-        self._make_stale()
-        self._backdate(600)
-        with mock.patch.object(SI, 'rebuild_search_indexes') as rebuild:
-            outcome = SI.run_index_janitor(0)
+            outcome = SI.run_index_janitor()
         rebuild.assert_not_called()
         self.assertEqual(outcome['due'], [])
+
+    def test_an_index_repaired_by_somebody_else_is_left_alone(self):
+        self._make_stale()
+        SI.rebuild_search_indexes('a sync close-out')
+        with mock.patch.object(SI, 'rebuild_search_indexes') as rebuild:
+            SI.run_index_janitor()
+        rebuild.assert_not_called()
+
+
+class KeyEditRepairTests(_JanitorCase):
+    """What an EPG key edit leaves behind: a few new epg_entries rows and an index that is
+    otherwise right (dev/changelog/1431)."""
+
+    def setUp(self):
+        super().setUp()
+        self.channel = Channel.query.filter_by(account_id=self.account.id).first()
+        seed.make_epg_entry(self.channel, title='Already indexed')
+        db.session.commit()
+        SI.rebuild_search_indexes('test setup')
+
+    def _chan_prog_titles(self):
+        return {row[0] for row in db.session.execute(db.text('SELECT title FROM chan_prog'))}
+
+    def test_it_writes_only_the_rows_that_differ(self):
+        seed.make_epg_entry(self.channel, title='Copied by the key edit')
+        db.session.commit()
+        db.session.expire_all()
+        self.assertFalse(self._ready(SI.SEARCH_INDEX_PROGRAMS))
+        with self.assertLogs('app.search_index', level='INFO') as logs:
+            outcome = SI.run_index_janitor()
+        self.assertEqual(outcome['due'], [SI.SEARCH_INDEX_PROGRAMS])
+        self.assertIn('1 rows added and 0 removed', '\n'.join(logs.output))
+        self.assertTrue(self._ready(SI.SEARCH_INDEX_PROGRAMS))
+        self.assertEqual(self._chan_prog_titles(), {'Already indexed', 'Copied by the key edit'})
+
+    def test_a_failed_index_is_still_rebuilt_in_full(self):
+        """Comparing rows cannot see an FTS side the failed rebuild never populated, so
+        `only_changes` must not turn this repair into a no-op."""
+        state = SearchIndexState.query.filter_by(name=SI.SEARCH_INDEX_PROGRAMS).first()
+        state.status = SI.STATUS_FAILED
+        db.session.commit()
+        with self.assertLogs('app.search_index', level='INFO') as logs:
+            SI.run_index_janitor()
+        self.assertIn('full, because', '\n'.join(logs.output))
+        self.assertTrue(self._ready(SI.SEARCH_INDEX_PROGRAMS))
 
 
 class AdmissionTests(_JanitorCase):
@@ -190,82 +181,63 @@ class AdmissionTests(_JanitorCase):
     Every assertion here holds a REAL ticket, because a stubbed "is anything running?" check
     would pass just as happily against the check-then-act shape dev/changelog/679 removed."""
 
-    def _due(self):
-        self._make_stale()
-        SI.run_index_janitor(GRACE)
-        self._backdate(GRACE)
-
     def test_a_running_sync_refuses_the_janitor(self):
-        self._due()
+        self._make_stale()
         with _Held(admission.KIND_SYNC, 'account 2'):
-            outcome = SI.run_index_janitor(GRACE)
+            outcome = SI.run_index_janitor()
         self.assertTrue(outcome['refused'])
         self.assertEqual(outcome['results'], {})
         self.assertFalse(self._ready(), 'a refused janitor must not look like a rebuild')
 
     def test_a_running_rebuild_refuses_the_janitor(self):
-        self._due()
+        self._make_stale()
         with _Held(admission.KIND_REBUILD, 'manual rebuild from Maintenance'):
-            outcome = SI.run_index_janitor(GRACE)
+            outcome = SI.run_index_janitor()
         self.assertTrue(outcome['refused'])
         self.assertEqual(outcome['results'], {})
 
     def test_maintenance_does_not_refuse_the_janitor(self):
         """Maintenance yields to a rebuild, not the other way round - a janitor that stood
         down for the nightly prune would be blocked at exactly the wrong time."""
-        self._due()
+        self._make_stale()
         with _Held(admission.KIND_MAINTENANCE, 'database maintenance'):
-            outcome = SI.run_index_janitor(GRACE)
+            outcome = SI.run_index_janitor()
         self.assertFalse(outcome['refused'])
         self.assertTrue(self._ready())
 
     def test_it_asks_refusably_rather_than_forcing(self):
-        self._due()
+        self._make_stale()
         with mock.patch.object(SI, 'rebuild_search_indexes', return_value={}) as rebuild:
-            SI.run_index_janitor(GRACE)
+            SI.run_index_janitor()
         self.assertTrue(rebuild.call_args.kwargs['refusable'])
 
     def test_a_refusal_leaves_no_ticket_behind(self):
         """A leaked ticket blocks its dependents for the life of the process."""
-        self._due()
+        self._make_stale()
         with _Held(admission.KIND_SYNC, 'account 2'):
-            SI.run_index_janitor(GRACE)
+            SI.run_index_janitor()
         self.assertEqual(admission.active_kinds(), set())
 
     def test_a_completed_rebuild_leaves_no_ticket_behind(self):
-        self._due()
-        SI.run_index_janitor(GRACE)
+        self._make_stale()
+        SI.run_index_janitor()
         self.assertEqual(admission.active_kinds(), set())
 
 
-class ThrottleTests(_JanitorCase):
-    def test_a_failing_index_is_retried_once_per_grace_window_not_once_per_tick(self):
-        """A programs rebuild is ~76s of CPU; retrying it every 10-minute tick because it
-        keeps failing would be worse than the staleness it is trying to repair."""
+class RetryTests(_JanitorCase):
+    def test_a_failing_index_is_retried_on_the_next_tick(self):
         self._make_stale()
-        SI.run_index_janitor(GRACE)
-        self._backdate(GRACE)
         failed = {SI.SEARCH_INDEX_CHANNELS: False}
         with mock.patch.object(SI, 'rebuild_search_indexes', return_value=failed) as rebuild:
-            SI.run_index_janitor(GRACE)
-            self.assertEqual(rebuild.call_count, 1)
-            SI.run_index_janitor(GRACE)
-            SI.run_index_janitor(GRACE)
-            self.assertEqual(rebuild.call_count, 1, 'the clock must restart after an attempt')
-            self._backdate(GRACE)
-            SI.run_index_janitor(GRACE)
-            self.assertEqual(rebuild.call_count, 2)
+            SI.run_index_janitor()
+            SI.run_index_janitor()
+        self.assertEqual(rebuild.call_count, 2)
 
     def test_a_refused_attempt_is_retried_on_the_next_tick(self):
-        """A refusal is different from a failure: nothing ran, the blocker may be gone a
-        tick later, and waiting another full grace window would extend the very window this
-        job exists to cap."""
         self._make_stale()
-        SI.run_index_janitor(GRACE)
-        self._backdate(GRACE)
         with _Held(admission.KIND_SYNC, 'account 2'):
-            SI.run_index_janitor(GRACE)
-        outcome = SI.run_index_janitor(GRACE)
+            SI.run_index_janitor()
+        outcome = SI.run_index_janitor()
         self.assertEqual(outcome['due'], [SI.SEARCH_INDEX_CHANNELS])
         self.assertTrue(self._ready())
 
@@ -279,18 +251,15 @@ class JanitorScopeTests(_JanitorCase):
         state.status = SI.STATUS_BUILDING
         db.session.commit()
         with mock.patch.object(SI, 'rebuild_search_indexes') as rebuild:
-            SI.run_index_janitor(GRACE)
+            SI.run_index_janitor()
         rebuild.assert_not_called()
-        self.assertNotIn(SI.SEARCH_INDEX_CHANNELS, SI._stale_since)
 
     def test_only_the_ownerless_index_is_rebuilt(self):
         """The programs index is fresh here, and rebuilding it anyway would spend ~76s
         re-deriving an index that was already correct."""
         self._make_stale()
-        SI.run_index_janitor(GRACE)
-        self._backdate(GRACE)
         with mock.patch.object(SI, 'rebuild_search_indexes', return_value={}) as rebuild:
-            SI.run_index_janitor(GRACE)
+            SI.run_index_janitor()
         self.assertEqual(tuple(rebuild.call_args.kwargs['names']), (SI.SEARCH_INDEX_CHANNELS,))
 
     def test_a_never_built_index_is_repaired_like_any_other(self):
@@ -300,18 +269,14 @@ class JanitorScopeTests(_JanitorCase):
         db.session.commit()
         self.assertIn('never been built',
                       SI.search_index_readiness(SI.SEARCH_INDEX_CHANNELS)[1])
-        SI.run_index_janitor(GRACE)
-        self._backdate(GRACE)
-        SI.run_index_janitor(GRACE)
+        SI.run_index_janitor()
         self.assertTrue(self._ready())
 
     def test_the_reason_reaches_the_log(self):
         """Product principle 1: a rebuild nobody asked for has to say what it was for."""
         self._make_stale()
-        SI.run_index_janitor(GRACE)
-        self._backdate(GRACE)
         with self.assertLogs('app.search_index', level='INFO') as logs:
-            SI.run_index_janitor(GRACE)
+            SI.run_index_janitor()
         line = '\n'.join(logs.output)
         self.assertIn('janitor', line)
         self.assertIn(SI.SEARCH_INDEX_CHANNELS, line)
@@ -319,7 +284,7 @@ class JanitorScopeTests(_JanitorCase):
 
 
 class SchedulerWiringTests(_JanitorCase):
-    """The job exists, fires on an interval, and reads its grace at run time."""
+    """The job exists, fires on an interval, and records only the ticks that repaired."""
 
     def test_the_job_is_registered_on_an_interval(self):
         self.assertIn('schedule_index_janitor', dir(sched))
@@ -352,24 +317,28 @@ class SchedulerWiringTests(_JanitorCase):
         self._make_stale()
         with mock.patch.object(sched, '_app', self.t.app):
             sched._index_janitor_job()
-            SI._stale_since[SI.SEARCH_INDEX_CHANNELS] = (
-                datetime.utcnow() - timedelta(minutes=600))
-            sched._index_janitor_job()
         runs = JobRun.query.filter_by(job_id='search_index_janitor').all()
         self.assertEqual(len(runs), 1)
         self.assertEqual(runs[0].outcome, 'SUCCESS')
         self.assertTrue(self._ready())
 
-    def test_the_grace_is_read_at_run_time(self):
-        """Registered unconditionally, so turning it off in Settings has to take effect on
-        the next tick rather than at the next restart."""
-        self._make_stale()
-        cfg = {'search': {'index_janitor_grace_minutes': 0}}
-        with mock.patch.object(sched, '_app', self.t.app), \
-                mock.patch('app.config.load_config', return_value=cfg), \
-                mock.patch.object(SI, 'rebuild_search_indexes') as rebuild:
-            sched._index_janitor_job()
-        rebuild.assert_not_called()
+
+class RetiredSettingTests(unittest.TestCase):
+    """search.index_janitor_grace_minutes went with the wait it set (dev/changelog/1431)."""
+
+    def test_the_migration_drops_it_and_says_what_it_was(self):
+        cfg = {'search': {'page_size': 50, 'index_janitor_grace_minutes': 0}}
+        with self.assertLogs('app.config', level='WARNING') as logs:
+            out = _cfg_m008_drop_index_janitor_grace(cfg)
+        self.assertEqual(out, {'search': {'page_size': 50}})
+        self.assertIn('was 0', '\n'.join(logs.output))
+
+    def test_a_config_that_never_set_it_is_untouched(self):
+        cfg = {'search': {'page_size': 50}}
+        self.assertEqual(_cfg_m008_drop_index_janitor_grace(cfg), {'search': {'page_size': 50}})
+
+    def test_it_is_no_longer_a_default(self):
+        self.assertNotIn('index_janitor_grace_minutes', _DEFAULTS['search'])
 
 
 if __name__ == '__main__':

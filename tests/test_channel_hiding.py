@@ -274,7 +274,7 @@ class DuplicateKeepCascadeTests(_HidingTestCase):
         self._hide(self.first)
         db.session.expire_all()
         rows = Channel.query.order_by(Channel.id).all()
-        cluster = _duplicate_clusters(rows, SearchContext.build({}))[self.second.id]
+        cluster = _duplicate_clusters(rows, SearchContext.build({}), SearchState())[self.second.id]
         self.assertEqual(cluster['kept_id'], self.second.id)
         self.assertEqual(cluster['kept_reason'], KEEP_REASON_NOT_HIDDEN)
 

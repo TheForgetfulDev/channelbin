@@ -44,9 +44,11 @@ def _loop(path):
     """A synthetic channel: picture and sound, one keyframe a second, B-frames so the video
     PES order is a real encoder's. Noise rather than a tone, so each AAC frame is a real
     frame's size and its PES spans more than one TS packet, as a channel's does - a cut can
-    only land inside a PES that has a second packet."""
+    only land inside a PES that has a second packet. The seed is fixed because the noise decides
+    where the cut lands: unseeded, 8 of 360 builds cut where ffmpeg leaves a second audio jump
+    and the fixture was not the one hole these tests are about (dev/docs/BUGS.md 2026-11-04)."""
     _ffmpeg('-f', 'lavfi', '-i', f'testsrc2=size=192x108:rate=25:duration={SECONDS}',
-            '-f', 'lavfi', '-i', f'anoisesrc=amplitude=0.5:duration={SECONDS}',
+            '-f', 'lavfi', '-i', f'anoisesrc=amplitude=0.5:duration={SECONDS}:seed=1437',
             '-c:v', 'libx264', '-preset', 'veryfast', '-g', '25', '-bf', '2',
             '-c:a', 'aac', '-f', 'mpegts', path)
 

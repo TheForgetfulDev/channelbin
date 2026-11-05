@@ -3301,6 +3301,91 @@ def _m111_recording_track_end_gap(conn, cur):
     conn.commit()
 
 
+def _m112_sports_schedule(conn, cur):
+    """The local schedule from TheSportsDB (app/sports_data.py, dev/docs/DESIGN-sports-data.md 9).
+    Additive: nothing here is read until someone follows a league."""
+    cur.executescript("""
+        CREATE TABLE IF NOT EXISTS sports_leagues (
+            id INTEGER NOT NULL PRIMARY KEY,
+            tsdb_id INTEGER NOT NULL UNIQUE,
+            name VARCHAR(255) NOT NULL,
+            sport VARCHAR(64),
+            current_season VARCHAR(32),
+            match_terms TEXT NOT NULL DEFAULT '[]',
+            created_at DATETIME
+        );
+        CREATE TABLE IF NOT EXISTS sports_follows (
+            id INTEGER NOT NULL PRIMARY KEY,
+            league_id INTEGER NOT NULL REFERENCES sports_leagues (id),
+            team_tsdb_id INTEGER NOT NULL DEFAULT 0,
+            rule_id INTEGER NOT NULL DEFAULT 0,
+            created_at DATETIME,
+            CONSTRAINT uq_sports_follow UNIQUE (league_id, team_tsdb_id, rule_id)
+        );
+        CREATE TABLE IF NOT EXISTS sports_teams (
+            id INTEGER NOT NULL PRIMARY KEY,
+            tsdb_id INTEGER NOT NULL UNIQUE,
+            full_name VARCHAR(255) NOT NULL,
+            names TEXT NOT NULL DEFAULT '[]',
+            city VARCHAR(255),
+            last_looked_up DATETIME
+        );
+        CREATE TABLE IF NOT EXISTS sports_fetches (
+            id INTEGER NOT NULL PRIMARY KEY,
+            target VARCHAR(64) NOT NULL UNIQUE,
+            kind VARCHAR(16) NOT NULL,
+            league_id INTEGER NOT NULL REFERENCES sports_leagues (id),
+            next_due_at DATETIME,
+            last_at DATETIME,
+            outcome VARCHAR(16),
+            reason TEXT,
+            row_count INTEGER,
+            prev_row_count INTEGER,
+            dropped_count INTEGER NOT NULL DEFAULT 0,
+            failing_since DATETIME
+        );
+        CREATE INDEX IF NOT EXISTS ix_sports_fetches_league_id ON sports_fetches (league_id);
+        CREATE INDEX IF NOT EXISTS ix_sports_fetches_next_due_at ON sports_fetches (next_due_at);
+        CREATE TABLE IF NOT EXISTS sports_state (
+            id INTEGER NOT NULL PRIMARY KEY,
+            next_call_at DATETIME,
+            last_call_at DATETIME,
+            backoff_seconds INTEGER NOT NULL DEFAULT 0,
+            clean_calls INTEGER NOT NULL DEFAULT 0,
+            daily_offset_seconds INTEGER NOT NULL DEFAULT 0,
+            last_pruned_at DATETIME
+        );
+        CREATE TABLE IF NOT EXISTS sports_events (
+            id INTEGER NOT NULL PRIMARY KEY,
+            tsdb_id INTEGER NOT NULL UNIQUE,
+            league_id INTEGER NOT NULL REFERENCES sports_leagues (id),
+            season VARCHAR(32),
+            round INTEGER,
+            name VARCHAR(255) NOT NULL,
+            home_team_id INTEGER NOT NULL DEFAULT 0,
+            away_team_id INTEGER NOT NULL DEFAULT 0,
+            home_name VARCHAR(255),
+            away_name VARCHAR(255),
+            venue VARCHAR(255),
+            city VARCHAR(255),
+            start_at DATETIME,
+            local_date DATE,
+            status VARCHAR(16),
+            postponed BOOLEAN NOT NULL DEFAULT 0,
+            poster_url TEXT,
+            thumb_url TEXT,
+            first_seen DATETIME,
+            last_seen DATETIME,
+            missing_since DATETIME,
+            previous_start DATETIME,
+            start_changed_at DATETIME
+        );
+        CREATE INDEX IF NOT EXISTS ix_sports_events_league_start
+            ON sports_events (league_id, start_at);
+    """)
+    conn.commit()
+
+
 def _m106_epg_scans(conn, cur):
     """The EPG similarity scan's result tables (app/epg_similarity.py, dev/changelog/1325).
 
@@ -3866,6 +3951,8 @@ SCHEMA_MIGRATIONS = [
      'what it held', _m110_recording_gave_up_reason),
     (111, 'recordings: track_end_gap_seconds, how far apart the picture and sound end',
      _m111_recording_track_end_gap),
+    (112, 'sports_leagues + sports_follows + sports_teams + sports_fetches + sports_state + '
+     'sports_events: the local schedule from TheSportsDB', _m112_sports_schedule),
 ]
 
 CURRENT_SCHEMA_VERSION = SCHEMA_MIGRATIONS[-1][0]

@@ -11,6 +11,7 @@ route reaches it through a module-top import, so an unsandboxed run would rewrit
 repo-root config.yaml (tests/support/config_sandbox.py explains why patching load_config is
 not enough).
 """
+import re
 import unittest
 
 import yaml
@@ -172,6 +173,70 @@ class SettingsSystemCardTests(ConfigSandbox):
     def test_it_renders_the_live_value(self):
         row = self.html.split('data-path="flask.behind_proxy"', 1)[1].split('</div>\n</div>', 1)[0]
         self.assertIn('value="true"', row)
+
+
+class SettingsBadgeTruthTests(unittest.TestCase):
+    """dev/docs/BUGS.md 2026-11-05 @ 06:50:40 AM: sync.sync_interval_hours wore a "restart
+    required" badge while the save applied it live and raised no banner, so the page's two
+    answers contradicted each other. The badge and RESTART_REQUIRED_KEYS are one fact."""
+
+    def setUp(self):
+        self.t = make_test_app()
+
+    def tearDown(self):
+        self.t.cleanup()
+
+    def _rows(self):
+        html = self.t.client.get('/settings').get_data(as_text=True)
+        chunks = re.split(r'(?=data-path=")', html)
+        return {m.group(1): chunk for chunk in chunks
+                for m in [re.match(r'data-path="([^"]+)"', chunk)] if m}
+
+    def test_every_badge_is_a_restart_key_and_every_editable_restart_key_has_a_badge(self):
+        rows = self._rows()
+        self.assertGreater(len(rows), 50)
+        badged = {path for path, chunk in rows.items() if 'restart required</span>' in chunk}
+        self.assertTrue(badged)
+        self.assertEqual(badged - RESTART_REQUIRED_KEYS, set())
+        readonly = {path for path, chunk in rows.items() if 'read-only - edit in' in chunk}
+        self.assertEqual((set(rows) & RESTART_REQUIRED_KEYS) - badged - readonly, set())
+
+    def test_the_sync_interval_applies_live_so_it_wears_no_badge(self):
+        self.assertNotIn('restart required</span>', self._rows()['sync.sync_interval_hours'])
+        self.assertNotIn('sync.sync_interval_hours', RESTART_REQUIRED_KEYS)
+
+
+class RestartBannerButtonTests(unittest.TestCase):
+    """dev/docs/BUGS.md 2026-11-05 @ 06:50:41 AM: the banner told the user to go and find the
+    Maintenance page. It carries the restart itself now, on every page."""
+
+    def setUp(self):
+        set_restart_needed(False)
+        self.t = make_test_app()
+
+    def tearDown(self):
+        set_restart_needed(False)
+        self.t.cleanup()
+
+    def _banner(self, html):
+        return re.search(r'<div id="restart-banner"[^>]*>(.*?)</div>', html, re.S).group(1)
+
+    def test_a_pending_restart_shows_the_button_on_any_page(self):
+        set_restart_needed(True)
+        for path in ('/readiness', '/settings', '/alerts'):
+            with self.subTest(path=path):
+                html = self.t.client.get(path).get_data(as_text=True)
+                banner = self._banner(html)
+                self.assertIn('Restart required', banner)
+                self.assertIn('data-restart-service', banner)
+                self.assertIn('Restart now', banner)
+                self.assertIn('js/restart-service.js', html)
+
+    def test_the_banner_a_save_writes_in_gets_the_button_too(self):
+        html = self.t.client.get('/settings').get_data(as_text=True)
+        self.assertEqual(self._banner(html).strip(), '')
+        template = re.search(r'<template id="restart-banner-msg">(.*?)</template>', html, re.S)
+        self.assertIn('data-restart-service', template.group(1))
 
 
 if __name__ == '__main__':
